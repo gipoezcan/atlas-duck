@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Atlas Duck
+Exec=atlas-duck-app
+Icon=atlas-duck-app
+Terminal=false
+Categories=Utility;
