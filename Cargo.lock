@@ -78,12 +78,14 @@ dependencies = [
  "atlas-duck-ipc",
  "atlas-duck-sandbox-worker",
  "filetime",
+ "libc",
  "serde_json",
  "tauri",
  "tauri-build",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -238,3 +238,19 @@ fn sandbox_has_8_mib_stack_reserve_and_console_bins_are_console() {
         "the /STACK arg must apply to the sandbox bin only"
     );
 }
+
+/// T09 / §2.5 Scope: the early-argv modes are dispatched before the crash settings, so they keep
+/// their stdio. If `apply_process_crash_settings` ran first, stderr would be the null device.
+#[test]
+fn early_argv_modes_keep_their_stdio() {
+    let cli = run_with_timeout(cmd(APP, &["__cli", "bogus"]), Duration::from_secs(5));
+    assert_eq!(cli.status.code(), Some(2));
+    assert_usage_envelope(&cli.stdout);
+
+    let verify = run_with_timeout(cmd(APP, &["__verify-export", "x"]), Duration::from_secs(5));
+    assert_eq!(verify.status.code(), Some(22));
+    assert!(
+        !verify.stderr.is_empty(),
+        "the verify-export stub's stderr line must reach the parent, not the null device"
+    );
+}

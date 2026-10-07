@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 
 use atlas_duck_app_lib::early_argv::{EarlyMode, classify_argv, verify_export_stub};
+use atlas_duck_app_lib::startup::crash::apply_process_crash_settings;
 
 fn main() {
     // §12.1 / §2.5 Scope: the early-argv modes run first, before the Tauri builder, the
@@ -14,6 +15,11 @@ fn main() {
     match classify_argv(&args) {
         EarlyMode::Cli(rest) => std::process::exit(atlas_duck_cli::run(rest)),
         EarlyMode::VerifyExport(rest) => std::process::exit(verify_export_stub(rest)),
-        EarlyMode::Gui { background } => atlas_duck_app_lib::run_gui(background),
+        EarlyMode::Gui { background } => {
+            // §2.5 Crash artifacts: GUI and `--background` launches only, before any webview.
+            // The report is kept for later logging (`applied_report`); no failure blocks startup.
+            let _ = apply_process_crash_settings();
+            atlas_duck_app_lib::run_gui(background)
+        }
     }
 }

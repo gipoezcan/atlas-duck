@@ -2,6 +2,7 @@
 
 pub mod diag;
 pub mod early_argv;
+pub mod startup;
 
 /// Runs the tray app for a GUI or `--background` launch (§2.5 Scope). Never returns.
 ///

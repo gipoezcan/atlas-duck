@@ -97,6 +97,9 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+        env:
+          # T09: the only job allowed to write the WER registry values (no-op off Windows).
+          ATLAS_DUCK_RUN_WER_TEST: "1"
 
       - name: Record host name sources and pinned-file base folders (§15 V28)
         run: |
