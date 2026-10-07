@@ -24,6 +24,11 @@ publish = false
 # pins it needs; workspace-internal crates are declared as path dependencies in
 # each member's own Cargo.toml so `default-features = false` keeps its meaning.
 [workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+# Tauri 2.x only (Tauri 3 is alpha; research A0). Nothing but app/src-tauri depends on it (§2.2).
+tauri = { version = "=2.12.1", features = ["tray-icon"] }
+tauri-build = "=2.7.1"
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.

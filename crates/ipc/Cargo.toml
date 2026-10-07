@@ -10,3 +10,7 @@ default = ["async"]
 # Gates the tokio-based codecs (Task 13 attaches tokio-util). The sandbox worker
 # depends on this crate with default-features = false and stays tokio-free.
 async = []
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
