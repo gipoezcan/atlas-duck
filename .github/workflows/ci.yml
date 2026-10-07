@@ -101,6 +101,17 @@ jobs:
           # T09: the only job allowed to write the WER registry values (no-op off Windows).
           ATLAS_DUCK_RUN_WER_TEST: "1"
 
+      - name: Linux spawn routine (T16, §3.4)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          if grep -rnE 'Command::new|use std::process' crates/sandbox-host/src/linux; then
+            echo "::error::crates/sandbox-host/src/linux must fork and execve itself, not use std::process::Command (§3.4)"
+            exit 1
+          fi
+          cargo test -p atlas-duck-sandbox-host --lib --locked -- linux::
+          cargo test -p atlas-duck-app --test probes_linux --locked -- --nocapture
+
       - name: Tray smoke (--background stays up 10 s; startup_state=ready; Linux tray_host=missing) (§2.5, §15 V33)
         run: |
           set -euo pipefail
