@@ -1,7 +1,7 @@
 # atlas-duck — Design Spec
 
 **Date:** 2026-10-07
-**Status:** Draft for review (rev 2 — after adversarial review)
+**Status:** Draft for review (after three adversarial review passes: multi-lens, local security, consistency)
 **Author:** Yavuz Ege Özcan (with Claude)
 
 atlas-duck is a cross-platform desktop application that acts as a **human-in-the-loop security proxy** between AI agents and self-hosted Atlassian **Jira Data Center** and **Confluence Data Center**. It holds the user's Personal Access Tokens, executes typed operations on behalf of agents, requires the user's approval before any write is executed and before any read result is released, and records every read and write in an encrypted, tamper-evident audit log retained for at least three months.
@@ -295,7 +295,8 @@ Every invocation prints exactly one JSON envelope to stdout (in `--output json`)
 | `cancelled` | 7 | cancelled by agent or app quit | null |
 | `failed` | 1 | `internal`, `audit_failure`, `audit_storage_low`, `protocol_error` | null |
 | `failed` | 2 | `usage`, `validation`, `op_unsupported_by_instance`, `unknown_request` (nothing queued) | null |
-| `failed` | 5 | `unreachable` (`details.reason`: `not_running`, `launch_timeout`, `no_gui_session`, `app_upgraded`, `connection_lost`), `server_identity`, `protocol_mismatch`. For `connection_lost` after submission the envelope carries the non-null `request_id` and status `pending` with the hint "use `await <id>`; the request may be `abandoned`". | null |
+| `failed` | 5 | `unreachable` (`details.reason`: `not_running`, `launch_timeout`, `no_gui_session`, `app_upgraded`), `server_identity`, `protocol_mismatch` — nothing was queued | null |
+| `pending` | 5 | `unreachable` with `details.reason = connection_lost`: the connection dropped **after** submission (e.g. app crash); the envelope carries the non-null `request_id` and the hint "use `await <id>`; the request may be `abandoned`" | null |
 | `failed` | 6 | `upstream_http` (write failed after approval, or released upstream-error details — see §11.2), `upstream_network`, `result_too_large`; batch partial failure (`data.chunks`) | null / `{chunks}` |
 | `failed` | 8 | `script_syntax`, `script_limit` (data-free failures only, §9.5), `sandbox_unavailable` | null |
 | `failed` | 9 | `locked`, `not_configured`, `needs_token` | null |
