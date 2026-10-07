@@ -50,7 +50,7 @@ Atlassian Cloud; auto-approve rules/policies; per-agent authentication; auto-upd
 1. An agent with only the CLI (or MCP) can search Jira, read an issue, read a Confluence page, run a multi-call read script, and create/update issues and pages — and it receives **no Atlassian-derived bytes** the user did not explicitly release (residual channels are enumerated in §10.2), and **no write** happens that the user did not explicitly approve, byte for byte (§5.1 inv. 3).
 2. Every fetched, released, denied, edited, delivered and executed payload is retrievable (decrypted) from the audit log for the retention period, and the log's integrity — including truncation at either end — can be verified.
 3. A reviewer can decide on a typical approval in under ~10 s thanks to the preview.
-4. No PAT ever appears in IPC traffic, diagnostic logs, audit payloads, the UI webview, or the sandbox; no Atlassian content ever appears in diagnostic logs.
+4. No PAT ever appears in IPC traffic, diagnostic logs, audit payloads, or the sandbox; in the UI it exists only transiently in the dedicated credential-entry window (§10.3) and is never displayed or returned to any webview afterwards; no Atlassian content ever appears in diagnostic logs.
 
 ---
 
@@ -60,7 +60,7 @@ Atlassian Cloud; auto-approve rules/policies; per-agent authentication; auto-upd
 
 | Process | Role | Secrets |
 |---|---|---|
-| **`atlas-duck-app`** (Tauri 2 tray app) | Trust core: IPC server, request broker & approval state machine, Jira/Confluence HTTP clients, preview generation, audit store, UI windows. | PATs, audit KEK, checkpoint signing key, head anchor — in the OS keychain (or the passphrase vault, §8.6), read only by this process. |
+| **`atlas-duck-app`** (Tauri 2 tray app) | Trust core: IPC server, request broker & approval state machine, Jira/Confluence HTTP clients, preview generation, audit store, UI windows. | PATs, audit KEK, checkpoint signing key, head anchor — in the OS keychain; in passphrase mode (§8.6) PATs and the signing key are in the KEK-wrapped vault, the KEK is unwrapped from `recovery`, and the head anchor is the MAC'd file `<data>/anchor`. Read only by this process. |
 | **`atlas-duck`** (CLI; also hosts `atlas-duck mcp`) | Thin client used by agents. Sends typed requests over IPC, blocks for decisions, prints JSON. Launches the app if it is not running (§4.7). | None. Never touches keychain or DB. Reads only the non-secret `cli.toml`/`paths.toml` and the `endpoint` file (§7.7, §3.1). |
 | **`atlas-duck-sandbox`** (one process per script run) | Executes one agent script in QuickJS. All `atlas.*` calls are forwarded to the app via its stdin/stdout. | None. No HTTP client, keychain, or DB code linked. OS resource limits + best-effort OS confinement (§9.4). |
 
@@ -122,10 +122,10 @@ struct OperationSpec {
 
 - Any process running as the same OS user can reach the IPC endpoint (per the "no agent auth" decision). OS-level restrictions only exclude other users and remote hosts.
 - Agent identity is informational: self-declared name + OS-derived peer pid/exe, shown and logged as **unverified**. PID→exe lookups are racy and are not an authentication signal.
-- A `request_id` is an unguessable capability (§4.2): anyone same-user who holds it may `await` it. Deliveries are logged with the recipient (§8.3 `DELIVERED`).
+- Request ids are **not access control**: any same-user process can enumerate them (`requests list`) and `await` any of them. Ids are random only so they cannot collide or be predicted across restarts. Every delivery is logged with the recipient (§8.3 `DELIVERED`) and multi-recipient deliveries are highlighted in the Audit window.
 - **The human approval step is the security control.** DC PATs cannot be scoped; the operation registry is the only least-privilege layer.
 - Approval decisions are enforced in Rust. The UI submits `{request_id, decision, candidate_rev, edits?, redactions?, reason?}`; `candidate_rev` = revision counter + hash of the exact candidate, issued by Rust with each preview it delivers. Rust rejects decisions whose `candidate_rev` is not current (`DECISION_STALE`, logged, no state change), and re-validates edits/redactions. The "opened in this revision" state (§5.6) is tracked in Rust (Rust records delivery of the preview for a given rev to the approvals window), not in UI state.
-- **The approvals webview is part of the trusted computing base**: code execution in it is equivalent to approval authority for every pending item. Consequently: frontend dependencies are minimal, lockfile with integrity hashes, installed with `--ignore-scripts`, no runtime remote loads; strict rendering rules (§6.4, §10.3); the Tauri isolation hook enforces a per-window command allowlist and argument schemas — it cannot establish user intent; batch approvals require a confirmation dialog drawn natively by Rust (§5.6), the one measure that holds against a compromised webview.
+- **The approvals webview is part of the trusted computing base**: code execution in it is equivalent to approval authority for every pending item. Consequently: frontend dependencies are minimal, lockfile with integrity hashes, installed with `--ignore-scripts`, no runtime remote loads; strict rendering rules (§6.4, §10.3); the Tauri isolation hook enforces a per-window command allowlist and argument schemas — it cannot establish user intent. Rust-drawn native confirmations (batch approvals §5.6, security-weakening settings §10.3) and the separate credential-entry window (§10.3) are the measures that hold against a compromised approvals webview.
 - Same-user malware can also read the OS keychain; the audit encryption protects against offline theft and casual tampering, not against a compromised user session (§8.9).
 
 ### 2.5 Application lifecycle
@@ -133,7 +133,7 @@ struct OperationSpec {
 - Tray-only app; autostart at login (`tauri-plugin-autostart`, `--background`), single instance (`tauri-plugin-single-instance` — used only to focus the existing instance, never as agent transport).
 - Closing windows hides them; exit only via tray **Quit** (pending requests are cancelled and logged).
 - macOS: `ActivationPolicy::Accessory` (menu-bar app). Linux: tray **menu** items (no click events on Linux trays), including "Open approvals (N)" and "Unlock…"; if no tray host is available, the approvals window opens directly on new requests.
-- If the app starts **locked** (passphrase mode, §8.6), the unlock window opens immediately (also under `--background`) and again whenever a request arrives while locked.
+- If the app starts **locked** (passphrase mode, §8.6), the credential-entry window (§10.3) opens for unlock immediately (also under `--background`) and again whenever a request arrives while locked.
 - **Startup hardening** (however the app was launched), before any webview is created:
   - Release builds disable devtools and remote debugging.
   - Remove debug-channel and loader-injection variables from the app's own environment and log a warning: `--remote-debugging*` inside `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, `WEBVIEW2_USER_DATA_FOLDER`, `WEBKIT_INSPECTOR_SERVER`, `WEBKIT_INSPECTOR_HTTP_SERVER`, `LD_PRELOAD`, `GTK_MODULES`, `GIO_EXTRA_MODULES`. (`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` is kept for fixed-version enterprise deployments.)
@@ -152,7 +152,7 @@ struct OperationSpec {
 
 **Single instance.** The app holds an exclusive lock on `instance.lock` in the **data dir** (next to the audit DB) for its whole lifetime (`flock(LOCK_EX|LOCK_NB)` on Unix; `CreateFileW` with share mode 0 on Windows), taken before the IPC server binds and before the audit store or keychain anchor is touched. The audit store's `open()` requires the lock handle (type-enforced). A second app instance exits immediately. The data-dir path never depends on per-session environment variables (§7.7).
 
-**Endpoint discovery.** One shared function in the `ipc` crate, used by both CLI and app, computes the endpoint; the app additionally writes the actual endpoint name to `<data>/endpoint` (user-only ACL / 0600), which the CLI reads first.
+**Endpoint discovery.** One shared function in the `ipc` crate, used by both CLI and app, computes the endpoint location (Unix: socket path; Windows: pipe-name prefix). At bind the app writes `<data>/endpoint` (user-only ACL / 0600) containing the actual endpoint name plus its own identity record: canonical exe path, `APPIMAGE` (if set), and the exe's file identity (device/inode or file index, size, mtime) at start. On Windows the CLI must read this file; a missing file, or a pipe name that does not start with the user's SID-derived prefix, means "not running".
 
 **Windows** — named pipe `\\.\pipe\atlas-duck-<first 16 hex of SHA-256(user SID)>-<128-bit random>`; the random suffix is regenerated on each start (and on bind failure), so the name cannot be pre-squatted:
 - Every pipe instance is created with the **same** security descriptor: protected DACL granting only the current user SID read/write data rights (`FILE_GENERIC_READ | FILE_WRITE_DATA | SYNCHRONIZE`-class; explicitly **not** `FILE_CREATE_PIPE_INSTANCE`; no Everyone/Anonymous ACEs). Exact mask verified against `winnt.h` (§15).
@@ -164,7 +164,7 @@ struct OperationSpec {
 **macOS** — Unix socket in `confstr(_CS_DARWIN_USER_TEMP_DIR)/atlas-duck/` (never `$TMPDIR` or `/tmp`); length checked < 104 bytes, fallback `~/Library/Caches/atlas-duck/`.
 - Directory created `0700`; before binding (app) and before connecting (CLI), `lstat` verifies owner == euid, mode == 0700, not a symlink.
 - Stale-socket handling: the app holds `instance.lock`, so a socket file without a live app is unlinked before binding. No `try_overwrite`.
-- On accept: `peer_cred().uid() == geteuid()` or reject. pid → exe via `/proc/<pid>/exe` (Linux) / `proc_pidpath` (macOS) for display/audit only.
+- On accept: `peer_cred().uid() == geteuid()` or reject. pid → exe via `/proc/<pid>/exe` (Linux; the CLI is dumpable) / `proc_pidpath` (macOS) for display/audit only.
 - Socket touched periodically / sticky bit set to survive runtime-dir cleanup.
 
 ### 3.2 Anti-squatting (client side)
@@ -175,8 +175,9 @@ Before sending any byte, on every connection (including MCP reconnects), the CLI
 
 **(b) Executable identity.** The server pid is resolved to an executable path; both that path and the expected path are **canonicalized** (realpath) before comparison:
 - Expected path: the `atlas-duck-app` next to the CLI's own canonical location; if not present (e.g. CLI symlinked into `~/.local/bin`), the `app_path` from `cli.toml` (written by "Install CLI to PATH", §12.3).
-- **Linux upgrade**: if `/proc/<pid>/exe` ends in ` (deleted)` and the stripped path matches, the CLI exits 5 with "atlas-duck was upgraded; restart the app" (not a security warning).
-- **AppImage**: identity is the AppImage file, not the mount path. The CLI's canonical `$APPIMAGE` must equal the server's `APPIMAGE` (from `/proc/<pid>/environ`, readable at same uid), **and** the server's `/proc/<pid>/exe` must equal `$APPDIR/usr/bin/atlas-duck-app` of that server. The AppImage wrapper (§12.3) embeds the absolute AppImage path.
+- **Linux**: the app is non-dumpable (§2.5), so `/proc/<pid>/exe` and `/proc/<pid>/environ` are not readable by the CLI. The CLI instead compares the identity record in `<data>/endpoint` (written by the app, §3.1) with the expected path; the **authenticating controls on Linux are the 0700 directory check and the `SO_PEERCRED` uid** — the identity record catches stale/foreign installs, not same-user forgery. **Upgrade**: if the recorded exe file identity differs from the current file at that path, the CLI exits 5 with `unreachable`/`app_upgraded`: "atlas-duck was upgraded; restart the app" (not a security warning).
+- **AppImage**: identity is the AppImage file, not the mount path: the CLI's canonical `$APPIMAGE` must equal the `APPIMAGE` in the endpoint identity record. The AppImage wrapper (§12.3) embeds the absolute AppImage path.
+- **macOS**: `proc_pidpath` of the peer pid.
 - **Windows**: in release builds, the server binary must carry a valid Authenticode signature from the same publisher as the CLI (skipped only in dev builds behind a compile-time feature).
 
 On any mismatch the CLI sends nothing and exits 5 with `error.code = "server_identity"`.
@@ -192,7 +193,7 @@ On any mismatch the CLI sends nothing and exits 5 with `error.code = "server_ide
 - **Agent-supplied display strings** (`agent_name`, `reason`, MCP `clientInfo.name`) are normalized in Rust at `hello`/submit: C0/C1 controls (except newlines in `reason`), bidi embedding/override/isolate characters (U+202A–202E, U+2066–2069) and zero-width characters are removed, and an "unusual characters" flag is set if anything was removed; `agent_name` ≤ 64 chars, `reason` ≤ 1 000 chars. The raw originals are kept in the audit payload.
 - `instances.list` returns `{alias, product, is_default, state}` only — never URLs, usernames or tokens.
 - Limits (fairness, not security — the key is spoofable): max 64 concurrent connections (MCP connections are long-lived) and 16 per peer exe; max 32 pending requests per agent key (`agent_name`, falling back to `peer_exe`); max 256 pending total. When a limit is reached the server still accepts the connection and answers `busy`: envelope `status: failed`, `error: {code: "busy", retryable: true, details: {retry_after_s}}`, exit 11; nothing is queued. The approvals UI offers "Deny all pending from this agent".
-- Frame-size or JSON errors produce a JSON-RPC error (exit 1, logged), never a silent drop.
+- Frame-size or JSON errors, `hello` timeouts and ordering violations produce a JSON-RPC error (`protocol_error`, exit 1) where possible, never a silent drop; they are recorded in the diagnostic log (metadata only: connection id, peer pid/exe, reason).
 
 ### 3.4 Sandbox channel
 
@@ -271,13 +272,14 @@ Every invocation prints exactly one JSON envelope to stdout (in `--output json`)
 ```
 
 - `request_id` — opaque string; `req_` + ≥ 122 bits of CSPRNG randomness (not time-ordered, not monotonic); unique across restarts.
-- `error` — `null` or `{code: string, retryable: bool, message: string, details?: object}`. Codes (stable, machine-readable) include: `usage`, `validation`, `op_unsupported_by_instance`, `internal`, `audit_failure`, `audit_storage_low`, `busy`, `unreachable`, `server_identity`, `protocol_mismatch`, `upstream_http`, `upstream_network`, `upstream_unknown_outcome`, `result_too_large`, `needs_token`, `locked`, `not_configured`, `script_syntax`, `script_limit`, `script_runtime`, `sandbox_unavailable`, `result_evicted`, `abandoned`, `unknown_request`.
+- `error` — `null` or `{code: string, retryable: bool, message: string, details?: object}`. Codes (stable, machine-readable) include: `usage`, `validation`, `op_unsupported_by_instance`, `internal`, `audit_failure`, `audit_storage_low`, `busy`, `unreachable`, `server_identity`, `protocol_mismatch`, `upstream_http`, `upstream_network`, `upstream_unknown_outcome`, `result_too_large`, `needs_token`, `locked`, `not_configured`, `script_syntax`, `script_limit`, `sandbox_unavailable`, `result_evicted`, `abandoned`, `unknown_request`, `protocol_error`. (Runtime errors of scripts are never an `error.code`; they reach the agent only as released `data.script_error`, §9.5.)
 - `meta` — for released reads: `{fetched_at, released_at, page?: {start, returned, total|null, truncated, next_start|null}, redactions?: {items_dropped, fields_dropped: [names], spans_masked}, conversion?: {lossy, lost: {macros, images, links, layouts}}}`. Redaction metadata is counts and field names only — never positions or values.
 
 **`data` shape.**
 - **Reads**: `data = {result}`, where `result` is the Atlassian DC response **with field names and nesting unchanged**, pruned to the op's allowed fields, after redaction. Exceptions are documented per op (e.g. `confluence.page.get` with `format=markdown` replaces `body` with `{format: "markdown", value}`). Server-reported totals are passed through unchanged; `meta.page` and `meta.redactions` explain gaps.
 - **Writes**: `data = {receipt, executed_params?, chunks?}`. `receipt` is the op's static `result_projection` of the server response (Jira: `id`, `key`, `self`; Confluence: `id`, `type`, `status`, `version.number`, `_links.webui`; labels: only the labels the agent supplied; 204 → `{}`). `executed_params` appears only when `edited: true` and contains **only the agent's own param keys** with the user's edits applied — never app-filled values (kept title/body, resolved ids, version numbers). The full server response is audit-only. `chunks` for batch ops (§5.4).
-- **Script results**: `data = {result}` (the JSON returned by the script, after redaction) or, for released error details, `data = {script_error: {class, message, stack, logs?}}`.
+- **Write with unknown outcome**: `data = {target, chunks?}`.
+- **Script results**: `data = {result}` (the JSON returned by the script, after redaction) or, for released error details, `data = {script_error: {class, message, stack, elapsed, logs?}}`.
 
 ### 4.3 Status ↔ exit code matrix (normative)
 
@@ -285,20 +287,20 @@ Every invocation prints exactly one JSON envelope to stdout (in `--output json`)
 |---|---|---|---|
 | `pending` | 4 | not yet decided; `--timeout` elapsed or `--timeout 0` | null |
 | `executing` | 4 | write approved, still executing when the wait ended | null |
-| `succeeded` | 0 | write executed | `{receipt, executed_params?}` |
+| `succeeded` | 0 | write executed | `{receipt, executed_params?, chunks?}` |
 | `released` | 0 | read / script result released (possibly redacted) | `{result}` |
 | `released` | 8 | script **error details** released | `{script_error}` |
-| `denied` | 3 | user denied (`message` = reason) | null |
+| `denied` | 3 | user denied (`message` = reason); if the user attached enrichment-error details (§5.4 step 2): `error = {code: "upstream_http", retryable: false, details: {status, error_messages}}` | null |
 | `expired` | 7 | pending request expired | null |
 | `cancelled` | 7 | cancelled by agent or app quit | null |
-| `failed` | 1 | `internal`, `audit_failure`, `audit_storage_low` | null |
+| `failed` | 1 | `internal`, `audit_failure`, `audit_storage_low`, `protocol_error` | null |
 | `failed` | 2 | `usage`, `validation`, `op_unsupported_by_instance`, `unknown_request` (nothing queued) | null |
-| `failed` | 5 | `unreachable`, `server_identity`, `protocol_mismatch` | null |
+| `failed` | 5 | `unreachable` (`details.reason`: `not_running`, `launch_timeout`, `no_gui_session`, `app_upgraded`, `connection_lost`), `server_identity`, `protocol_mismatch`. For `connection_lost` after submission the envelope carries the non-null `request_id` and status `pending` with the hint "use `await <id>`; the request may be `abandoned`". | null |
 | `failed` | 6 | `upstream_http` (write failed after approval, or released upstream-error details — see §11.2), `upstream_network`, `result_too_large`; batch partial failure (`data.chunks`) | null / `{chunks}` |
 | `failed` | 8 | `script_syntax`, `script_limit` (data-free failures only, §9.5), `sandbox_unavailable` | null |
 | `failed` | 9 | `locked`, `not_configured`, `needs_token` | null |
-| `outcome_unknown` | 6 | write sent but outcome unknown (timeout/reset after send, 5xx, crash mid-execution) — **check the target before retrying** | `{target}` |
-| `abandoned` | 7 | request was pending when the app crashed/was killed | null |
+| `outcome_unknown` | 6 | `upstream_unknown_outcome`: write sent but outcome unknown (timeout/reset after send, 5xx, crash mid-execution) — **check the target before retrying** | `{target, chunks?}` |
+| `abandoned` | 7 | `abandoned`: request was pending when the app crashed/was killed | null |
 | *(any terminal)* | 10 | outcome known, but result data no longer available (`error.code = result_evicted`) | null |
 | `failed` | 11 | `busy` — nothing queued; retry after `retry_after_s` | null |
 
@@ -314,7 +316,7 @@ Every invocation prints exactly one JSON envelope to stdout (in `--output json`)
 
 ### 4.5 Agent-visible state (opacity rule)
 
-Before a decision, the agent can observe only `pending` (and, after approval of a write, `executing`). `status`, `await`, `request.progress` and MCP progress notifications carry only `{request_id, status}` and are emitted **only when the agent-visible status changes**, plus content-free heartbeats on a fixed timer (§4.6). Internal states (Fetching, AwaitingRelease, Running, Enriching, Stale), counts, sizes, durations, warnings, titles and staleness are never exposed. A re-approval after staleness is invisible to the agent. The remaining channel is the moment of the human decision itself (§10.2).
+Before a decision, the agent can observe only `pending`. `executing` is emitted when a write's stale check passes and execution begins; once emitted, the agent-visible status stays `executing` until a terminal state — including across a version-conflict return to AwaitingApproval (§5.4 step 6). A failed pre-execution stale check happens while the status is still `pending`. Re-approvals after staleness are therefore invisible to the agent. `status`, `await`, `request.progress` and MCP progress notifications carry only `{request_id, status}` and are emitted **only when the agent-visible status changes**, plus content-free heartbeats on a fixed timer (§4.6). Internal states (Fetching, AwaitingRelease, Running, Enriching, Stale), counts, sizes, durations, warnings, titles and staleness are never exposed. The remaining channels are enumerated in §10.2.
 
 ### 4.6 MCP server
 
@@ -331,8 +333,8 @@ Before a decision, the agent can observe only `pending` (and, after approval of 
 
 ### 4.7 App launch and `doctor`
 
-- **When to launch**: only when the endpoint does not exist (Windows `ERROR_FILE_NOT_FOUND`; Unix `ENOENT`, or `ECONNREFUSED` on a stale socket). On `ERROR_PIPE_BUSY` the CLI uses `WaitNamedPipe` for up to 5 s, then exits 11 (`busy`) — never launches. The CLI does not launch when there is no interactive GUI session (Linux: neither `DISPLAY` nor `WAYLAND_DISPLAY`; Windows: non-interactive session/session 0; macOS: no Aqua session) and exits 5 with a hint to start the app from the desktop. Concurrent launches are serialized via a launch lock file in the data dir.
-- **How to launch** (hygiene): by the canonical absolute path verified as in §3.2, passing only `--background` (agent argv never forwarded); no inherited handles; stdin/stdout/stderr on the null device (keeps MCP stdout clean); working directory = install dir (Windows) or `/`; **detached from the caller's process tree and job** so killing the agent never kills the app — Windows `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB` (falling back to `ShellExecute` if breakaway is denied), macOS LaunchServices `open -n -g -a <app> --args --background`, Linux double-fork + `setsid`. The environment is rebuilt from an allowlist (display/session variables, `HOME`/`USERPROFILE`, locale, temp, `SystemRoot`, system `PATH`).
+- **When to launch**: only when the endpoint does not exist (Windows: endpoint file missing, or the named pipe returns `ERROR_FILE_NOT_FOUND`; Unix `ENOENT`, or `ECONNREFUSED` on a stale socket). On `ERROR_PIPE_BUSY` the CLI uses `WaitNamedPipe` for up to 5 s, then exits 11 (`busy`) — never launches. The CLI does not launch when there is no interactive GUI session (Linux: neither `DISPLAY` nor `WAYLAND_DISPLAY`; Windows: non-interactive session/session 0; macOS: no Aqua session) and exits 5 with a hint to start the app from the desktop. Concurrent launches are serialized via a launch lock file in the data dir.
+- **How to launch** (hygiene): by the canonical absolute path verified as in §3.2, passing only `--background` (agent argv never forwarded); no inherited handles; stdin/stdout/stderr on the null device (keeps MCP stdout clean); working directory = install dir (Windows) or `/`; **detached from the caller's process tree and job** so killing the agent never kills the app — Windows `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB` (falling back to `ShellExecute` if breakaway is denied), macOS LaunchServices `open -n -g -a <app> --args --background`, Linux double-fork + `setsid`. The environment is rebuilt from an explicit allowlist: `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `HOME`/`USERPROFILE`, `LANG`/`LC_*`, `TMP`/`TEMP`/`TMPDIR`, `SystemRoot`, a system `PATH`, and `HTTP(S)_PROXY`/`NO_PROXY` (so a CLI-launched app behaves like a login-started one).
 - After launching, the CLI polls the endpoint for up to 20 s, then exits 5.
 - `doctor` reports per instance alias only `{configured, reachable, needs_token, locked, tls_error, version_supported}` plus local install checks (PATH, app path, IPC endpoint). No usernames, URLs, server titles or version strings.
 
@@ -345,20 +347,23 @@ Before a decision, the agent can observe only `pending` (and, after approval of 
 ```
 Received ─validate(static)─▶ Validated            (validation failure → Rejected, exit 2)
   Read:   Validated → Fetching → AwaitingRelease(result | upstream-error) → {Released | ReleasedRedacted | Denied} → Delivered*
-  Write:  Validated → Enriching → AwaitingApproval(preview | enrichment-error) → {Approved | ApprovedEdited} → StaleCheck
+          Fetching → Failed (READ_FAILED: result_too_large, needs_token, upstream_network)
+  Write:  Validated → Enriching → AwaitingApproval(preview | enrichment-error | collision) → {Approved | ApprovedEdited} → StaleCheck
               StaleCheck → Executing → {Succeeded | Failed | OutcomeUnknown}
               StaleCheck → Stale → AwaitingApproval (candidate_rev++)
+              Executing → Stale → AwaitingApproval (version conflict 409/400, §5.4 step 6; candidate_rev++)
+          Enriching → Failed (REQUEST_FAILED: needs_token, upstream_network)
           AwaitingApproval → Denied
   Script: Validated → Running → AwaitingRelease(result | error-details) → {Released | ReleasedRedacted | Denied} → Delivered*
-          Running → Failed (data-free failures only, §9.5)
+          Running → Failed (data-free failures only, §9.5; or audit_failure)
   Any pending state → Expired | Cancelled
-  Infrastructure failures (audit append, internal) → Failed
+  Infrastructure failures (audit append, internal) → Failed (REQUEST_FAILED, or the phase-specific *_FAILED event)
 ```
 
 Invariants (enforced in code and property-tested):
 
 1. **Audit-before-effect.** Each of the following side effects happens only after its audit record is durably committed: any upstream HTTP call (`REQUEST_RECEIVED` / `SCRIPT_STARTED` with full params, committed before the first call), handing a host-call response to the sandbox (`SCRIPT_CALL`), release to the agent (`READ_RELEASED`/`SCRIPT_RELEASED`), each delivery (`DELIVERED`), and execution of a write (`WRITE_APPROVED`). If the append fails, the transition fails closed (no call, no release, no execution) and the request goes to `Failed` (`audit_failure`, exit 1).
-2. **No unreleased delivery.** A delivery carrying data exists only if a `READ_RELEASED`/`SCRIPT_RELEASED` record exists for that request id whose released-payload hash equals the delivered bytes' hash. Write deliveries contain only the `result_projection` of the logged `WRITE_EXECUTED` response plus the agent's own (possibly edited) params.
+2. **No unreleased delivery.** A delivery carrying data exists only if a `READ_RELEASED`/`SCRIPT_RELEASED` record exists for that request id whose released-payload hash equals the delivered bytes' hash. Write deliveries contain only the `result_projection` of the logged `WRITE_EXECUTED` response plus the agent's own (possibly edited) params; for a failed approved write, the Atlassian `errorMessages`/`errors` of the logged `WRITE_FAILED` response (capped 2 KiB, §11.2; listed in §10.2).
 3. **Approval binds the wire.** A `WRITE_APPROVED` record stores `request_set_hash` = SHA-256 over the canonical, ordered list of exact HTTP requests (method, resolved URL, body bytes — after conversion and enrichment, chunked as they will be sent), i.e. exactly what the Raw tab showed. The executor sends only requests from that list, in order, checking each against it. Only the latest approval counts, and only if no `WRITE_EDITED`/`WRITE_STALE` follows it.
    Outside approved write execution, the HTTP client permits only `GET` plus a closed, code-level allowlist of side-effect-free POSTs: **`POST /rest/api/2/search`**. Enrichment and stale checks are GET-only.
 4. **Raw = released/sent.** The Raw tab shows exactly the bytes that will be released or sent. The rendered Preview may summarize, but displays a "hidden in preview: N bytes" indicator for any collapsed, truncated or placeholder region (§6.1).
@@ -366,10 +371,10 @@ Invariants (enforced in code and property-tested):
 
 ### 5.2 Reads
 
-1. Validate (static schema + field rules + caps + instance version gate). Failure → `REQUEST_REJECTED`, exit 2, nothing queued.
-2. Commit `REQUEST_RECEIVED`, then fetch. Paginated ops page internally up to `max` (clamped to the op's hard cap), using server-returned page sizes; total fetched bytes per read ≤ 50 MiB.
+1. Commit `REQUEST_RECEIVED` (full params), then validate (static schema + field rules + caps + instance version gate). Failure → `REQUEST_REJECTED`, exit 2, nothing queued. (Same order for writes, §5.4 step 1, and scripts, §9.1 step 2.)
+2. Fetch. Paginated ops page internally up to `max` (clamped to the op's hard cap), using server-returned page sizes; total fetched bytes per read ≤ 50 MiB (exceeding it → `READ_FAILED {reason: result_too_large}`).
 3. Log `READ_FETCHED` (full response, or upstream error).
-4. Normalize into the release candidate (§5.3 rules), compute `meta.page`, apply the **release cap: 16 MiB** serialized JSON. Over the cap → `READ_FAILED {reason: result_too_large, size}`, exit 6 with a hint to narrow `fields`/`max`/`expand` (the error carries only sizes, no content).
+4. Normalize into the release candidate (§5.3 rules), compute `meta.page`, apply the **release cap: 16 MiB** serialized JSON. Over the cap → `READ_FAILED {reason: result_too_large, size}`, exit 6 with a hint to narrow `fields`/`max`/`expand`. The agent-visible error carries no size and no content (the size is in the audit record and the UI only); the fact that a cap was exceeded is a listed residual channel (§10.2).
 5. Build preview; enqueue → `AwaitingRelease`.
 6. **Upstream errors** (any HTTP status ≥ 400 except 401) are release candidates too: the preview shows status + capped error body; the user may release (redaction allowed) or deny. Until then the agent sees `pending`. A released upstream error is delivered as `status: failed`, exit 6, `error = {code: "upstream_http", details: {status, error_messages}}` (after redaction). Directly returned without release: 401 (→ `needs_token`, exit 9) and network/TLS errors without a response body (exit 6, `upstream_network`).
 7. User: **Release**, **Release with redactions**, or **Deny (reason)** → `READ_RELEASED` (released bytes + redaction operations) or `READ_DENIED`.
@@ -381,14 +386,14 @@ Operates on the structured release candidate:
 - **Drop fields** (per item or across all items).
 - **Mask text** → replaced with `[REDACTED]`. By default masking replaces **every occurrence** of the selected string across all string values of the candidate (HTML-escaped variants included); an option restricts it to the selected occurrence.
 
-Per-op `redaction_rules` ensure copies go too. For Jira: dropping field X also drops `renderedFields.X`, `names.X`, `schema.X`, `editmeta.fields.X`, and changelog items whose `field`/`fieldId` is X. After item drops, `total`/`maxResults` and nested `comment.total`/`worklog.total` are set to the released counts. Before release, the preview lists "also appears in: …" for selected values, and **release is blocked if a masked string still occurs anywhere** in the candidate (substring check).
+Per-op `redaction_rules` ensure copies go too. For Jira: dropping field X also drops `renderedFields.X`, `names.X`, `schema.X`, `editmeta.fields.X`, and changelog items whose `field`/`fieldId` is X. After item drops, `total`/`maxResults` and nested `comment.total`/`worklog.total` are set to the released counts. Before release, the preview lists "also appears in: …" for selected values. **Release is blocked if a string masked in every-occurrence mode still occurs anywhere** in the candidate (substring check, including HTML-escaped variants). For single-occurrence masks, the preview shows "N other occurrences remain" and release requires an explicit confirmation.
 
 The agent receives `redacted: true`, `meta.redactions` (counts + dropped field names), and the optional note. The audit record stores the original fetch (`READ_FETCHED`), the redaction operations, and the released bytes.
 
 ### 5.4 Writes
 
-1. **Validate** (static). Body formats converted to the native format here (Markdown → wiki markup / storage XHTML, §7.6).
-2. **Enrich** (GET only; logged as `PREVIEW_FETCH`; never released to the agent): resolve names (project, issue type, transition, user, parent page), createmeta required fields, current state for diffs (fields / current storage body), current version numbers, Confluence duplicate-title check, attachment filename collision, sprint state, and lossy-conversion detection (§7.6). Enrichment results also form the **stale-check baseline**.
+1. Commit `REQUEST_RECEIVED`, then **validate** (static). Body formats converted to the native format here (Markdown → wiki markup / storage XHTML, §7.6).
+2. **Enrich** (GET only; logged as `PREVIEW_FETCH {purpose}`; never released to the agent): resolve names (project, issue type, transition, user, parent page), createmeta required fields, current state for diffs (fields / current storage body), current version numbers, Confluence duplicate-title check, attachment filename collision, sprint state, and lossy-conversion detection (§7.6). Enrichment results also form the **stale-check baseline**.
    An enrichment fetch that returns an upstream error puts the request in `AwaitingApproval` with an "enrichment failed" preview: Approve is disabled; the user may deny (reason), optionally attaching the (redactable) error details, which the agent then receives as `denied`, exit 3, `error.details`.
 3. **Enqueue** → `AwaitingApproval`.
 4. User: **Approve**, **Edit & approve**, or **Deny (reason)**.
@@ -401,12 +406,12 @@ The agent receives `redacted: true`, `meta.redactions` (counts + dropped field n
    | `jira.issue.edit` | current values of exactly the edited fields equal the "before" values shown in the diff |
    | `jira.issue.assign` | current assignee equals the previewed one |
    | `jira.issue.transition` | current `status.id` equals the previewed from-status **and** the transition is still listed |
-   | `jira.sprint.move_issues` / `backlog.move_issues` | target sprint `state` still `future` or `active` |
+   | `jira.sprint.move_issues` | target sprint `state` still `future` or `active` |
    | `confluence.page.update`, `confluence.page.move` | `version.number` unchanged |
    | `confluence.attachment.upload` with `replace` | attachment `version.number` unchanged |
-   | additive ops (`jira.comment.add`, `jira.worklog.add`, `jira.issuelink.create`, `jira.issue.create`, `confluence.comment.add`, `confluence.label.*`, `confluence.page.create`, plain attachment upload) | none — a vanished target surfaces as the write's own error |
+   | additive / idempotent ops (`jira.comment.add`, `jira.worklog.add`, `jira.issuelink.create`, `jira.issue.create`, `jira.backlog.move_issues`, `confluence.comment.add`, `confluence.label.add`, `confluence.label.remove`, `confluence.page.create`, plain attachment upload) | none — a vanished target surfaces as the write's own error |
 
-   If stale → `WRITE_STALE`, back to `AwaitingApproval` flagged **"Changed since you reviewed"** with refreshed enrichment and diff (`candidate_rev++`, "opened" flag cleared). Never auto-retried.
+   Stale-check and refresh fetches are logged as `PREVIEW_FETCH {purpose: stale_check|refresh}`. If stale → `WRITE_STALE`, back to `AwaitingApproval` flagged **"Changed since you reviewed"** with refreshed enrichment and diff (`candidate_rev++`, "opened" flag cleared). Never auto-retried.
 6. **Execute** the approved request list:
    - Success → `WRITE_EXECUTED` (full response; audit only).
    - Server error response (4xx) → `WRITE_FAILED`. A Confluence `409`, or a `400` signalling a version conflict, is recorded as `WRITE_STALE` instead and returns to `AwaitingApproval`.
@@ -425,7 +430,7 @@ See §9. Internal reads are executed without prompts and logged individually; on
   - *Structured* — item/field tree with redaction controls (reads) or the edit form (writes).
   - *Raw* — exact bytes to be released, or the exact HTTP request list to be sent.
   - *Request* — params, agent `--reason`, instance, connection info (client kind, agent name + source, peer pid, peer exe), timestamps.
-- **"Opened"** = the user explicitly navigated to the item (click or next/prev keys while the window has focus). Auto-display on a new request never selects or opens an item. Any candidate change clears the flag.
+- **"Opened"** = Rust has delivered the preview of the item's current revision to the Approvals window in response to a `preview fetch` command. The UI issues that command only on explicit user navigation (click or next/prev keys while the window has focus); auto-display on a new request renders the queue list only and never fetches a preview. Any candidate change (new revision) clears the flag. This guards against blind or accidental approvals, not against a compromised webview (§2.4).
 - **Keyboard**: approve/deny/next are modifier chords (e.g. Ctrl/Cmd+Enter), never single keys. Approve/release controls and shortcuts are inert for 1 s after the window gains focus or the displayed candidate changes.
 - **Batch**: batch deny is always available. **Batch approve/release is enabled only when every selected item has been opened** in its current revision (checked in Rust); items flagged "possible duplicate" must be selected individually; the request carries each item's `candidate_rev`; mismatches are skipped and reported. Rust shows a **native confirmation dialog** (count, op ids, targets, instance) before applying a batch approval. Each item is logged individually with `batch: true`.
 - New request → OS toast (attention only; not actionable), approvals window shown + focused (setting: "focus" | "badge only"), tray badge/tooltip with pending count. **Toast and tray text is app-generated only** (class, op id, pending count) and never interpolates agent-supplied strings.
@@ -435,7 +440,7 @@ See §9. Internal reads are executed without prompts and logged individually; on
 
 ### 5.7 Other windows
 
-**Settings** (instances, limits, retention/legal hold, focus behaviour, CLI install, recovery/backup, external anchor, confinement status), **Audit** (§8.10), **Running scripts** (§9.6), **Agent onboarding** (§12.4), **Unlock** (§8.6).
+**Settings** (instances, limits, retention/legal hold, focus behaviour, CLI install, recovery/backup, external anchor, confinement status), **Audit** (§8.10), **Running scripts** (§9.6), **Agent onboarding** (§12.4), **Credential entry** (PATs, passphrases, unlock; §10.3).
 
 ---
 
@@ -488,7 +493,7 @@ See §9. Internal reads are executed without prompts and logged individually; on
 ### 7.1 Instances and setup
 
 - Multiple instances per product, each with an alias; one default per product. Instance config (non-secret) in `config.toml` (§7.7); PAT in the keychain under `atlas-duck/<instance-id>` (Windows persistence = Local) or in the vault (§8.6).
-- Base URL includes the context path (e.g. `https://wiki.corp/confluence`). Each stored PAT is bound to a hash of its normalized base URL (stored beside the secret). Changing an instance's scheme, host, port or context path — in the UI or by editing `config.toml` — deletes/invalidates the PAT, sets the instance to `needs_token`, and requires re-entry plus a passing connection test (logged `CONFIG_CHANGED` + `CREDENTIAL_CHANGED`); the loader refuses to use a PAT whose URL hash does not match.
+- Base URL includes the context path (e.g. `https://wiki.corp/confluence`). Each stored PAT is bound to a hash of its normalized base URL (stored beside the secret). Changing an instance's scheme, host, port or context path — in the UI or by editing `config.toml` — deletes/invalidates the PAT, sets the instance to `needs_token`, and requires re-entry plus a passing connection test (logged `CONFIG_CHANGED` + `CREDENTIAL_CHANGED`); the loader refuses to use a PAT whose URL hash does not match. The per-instance custom CA (stored as a fingerprint) and proxy settings are authoritative in the audit DB like the audit policy (§8.8): a differing value in `config.toml` is logged as `CONFIG_CHANGED {source: file}` and not applied until confirmed in the UI (Rust-drawn confirmation, §10.3).
 - Connection test:
   - Jira: `GET /rest/api/2/myself` (identity: `name`, `key`) + `GET /rest/api/2/serverInfo` (version).
   - Confluence: `GET /rest/api/user/current` must be 200 **and** `type == "known"` (anonymous access also returns 200); version from `GET /rest/applinks/1.0/manifest` (`version`, `buildNumber`; present on all DC versions), cross-checked with `GET /rest/api/server-information` on 10.x. A working PAT implies ≥ 7.9.
@@ -565,7 +570,7 @@ Users: write payloads use `name`; previews and audit record both `name` and `key
 | `confluence.comment.add` | W | `POST /rest/api/content` `{type:"comment", container:{id, type:<page\|blogpost from enrichment>}, ancestors?:[{id: reply_to}], body:{storage:{value, representation:"storage"}}}` | params `{content_id, body, body_format, reply_to?}` |
 | `confluence.label.add` | W | `POST /rest/api/content/{id}/label` | |
 | `confluence.label.remove` | W | `DELETE /rest/api/content/{id}/label/{label}` | |
-| `confluence.attachment.upload` | W | new: `POST /rest/api/content/{id}/child/attachment` (multipart `file`, `allowDuplicated=false`); `replace=true`: `POST /rest/api/content/{id}/child/attachment/{attachmentId}/data` | enrichment: filename collision check — collision without `replace` → exit 2 before queueing; max 10 MiB |
+| `confluence.attachment.upload` | W | new: `POST /rest/api/content/{id}/child/attachment` (multipart `file`, `allowDuplicated=false`); `replace=true`: `POST /rest/api/content/{id}/child/attachment/{attachmentId}/data` | enrichment: filename collision check — a collision without `replace` puts the request in `AwaitingApproval` with an "attachment already exists" preview and Approve disabled (handled like an enrichment failure, §5.4 step 2); max 10 MiB |
 
 ### 7.5 Pagination for agents
 
@@ -620,14 +625,14 @@ Query texts (JQL/CQL), titles and bodies live only in the encrypted payload. Pay
 
 ### 8.3 Event types
 
-- **Lifecycle**: `REQUEST_RECEIVED`, `REQUEST_REJECTED` (terminal), `PREVIEW_FETCH`, `DELIVERED` `{connection_id, client_kind, agent_name(+source), peer_pid, peer_exe, payload_sha256}` (on every hand-off: submit-wait, `await`, MCP).
+- **Lifecycle**: `REQUEST_RECEIVED`, `REQUEST_REJECTED` (terminal), `REQUEST_FAILED {code}` (terminal; enrichment-phase failures such as `needs_token`/`upstream_network`, and `internal` errors), `PREVIEW_FETCH {purpose: enrich|stale_check|refresh|resolve}` (every app-initiated GET that is not released: enrichment, stale checks, name/user/field resolution), `DECISION_STALE {submitted_rev, current_rev, decision, batch}` (non-terminal; a rejected decision or a skipped batch item), `DELIVERED` `{connection_id, client_kind, agent_name(+source), peer_pid, peer_exe, payload_sha256}` (on every hand-off: submit-wait, `await`, MCP).
 - **Reads**: `READ_FETCHED`, `READ_RELEASED`, `READ_DENIED`, `READ_FAILED` (terminal; e.g. `result_too_large`, network).
 - **Writes**: `WRITE_EDITED`, `WRITE_APPROVED`, `WRITE_DENIED`, `WRITE_STALE`, `WRITE_EXECUTED`, `WRITE_FAILED`, `WRITE_OUTCOME_UNKNOWN` (chunk events carry `{chunk_index, chunk_count}`).
-- **Scripts**: `SCRIPT_STARTED` (source + args + limits), `SCRIPT_CALL` (each internal read: op, params, instance, full response), `SCRIPT_FINISHED`, `SCRIPT_FAILED` (reason incl. `killed_by_user`, `audit_failure`), `SCRIPT_RELEASED`, `SCRIPT_DENIED`.
+- **Scripts**: `SCRIPT_STARTED` (source + args + limits), `SCRIPT_CALL` (each internal read: op, params, instance, full response), `SCRIPT_FINISHED`, `SCRIPT_FAILED {reason, data_free: bool}` (reasons incl. `killed_by_user`, `protocol_violation`, `audit_failure`, limit names), `SCRIPT_RELEASED`, `SCRIPT_DENIED`.
 - **Terminal**: `EXPIRED`, `CANCELLED`, `ABANDONED`.
 - **System**: `GENESIS`, `APP_START` (incl. sandbox confinement status), `APP_STOP`, `CONFIG_CHANGED` (`source: app|file`), `INSTANCE_STATE_CHANGED`, `CREDENTIAL_CHANGED` (PAT or recovery-passphrase change; never the secret), `CHECKPOINT`, `PRUNE`, `EXPORT`, `BACKUP`, `RESTORE`, `KEY_ROTATED`, `VERIFY`, `INTEGRITY_ACK`, `LEGAL_HOLD_CHANGED`, `CLOCK_ANOMALY`.
 
-A request is **terminal** after any of: `REQUEST_REJECTED`, `READ_RELEASED`, `READ_DENIED`, `READ_FAILED`, `WRITE_EXECUTED` (final chunk), `WRITE_FAILED`, `WRITE_OUTCOME_UNKNOWN`, `WRITE_DENIED`, `SCRIPT_RELEASED`, `SCRIPT_DENIED`, `SCRIPT_FAILED` (data-free), `EXPIRED`, `CANCELLED`, `ABANDONED`.
+A request is **terminal** after any of: `REQUEST_REJECTED`, `REQUEST_FAILED`, `READ_RELEASED`, `READ_DENIED`, `READ_FAILED`, `WRITE_EXECUTED` (final chunk), `WRITE_FAILED`, `WRITE_OUTCOME_UNKNOWN`, `WRITE_DENIED`, `SCRIPT_RELEASED`, `SCRIPT_DENIED`, `SCRIPT_FAILED` (where `data_free = true` or `reason = audit_failure`), `EXPIRED`, `CANCELLED`, `ABANDONED`.
 
 ### 8.4 Canonical encoding and hash chain
 
@@ -650,7 +655,7 @@ A request is **terminal** after any of: `REQUEST_REJECTED`, `READ_RELEASED`, `RE
 - **Recovery passphrase** (mandatory at first run; min 12 chars, strength meter): a second copy of the KEK is wrapped with Argon2id (m = 64 MiB, t = 3, p = 4, 16-byte salt) in table `recovery`. Changing it re-wraps (logged `CREDENTIAL_CHANGED`).
 - Random 96-bit nonces only; keys in `Zeroizing<[u8; 32]>`.
 - Startup self-test: write/read/delete a keychain canary entry. Never a silent fallback to an insecure store.
-- **Passphrase mode** (Linux without a usable Secret Service default collection): the app starts **locked** (exit 9 for requests; unlock window, §2.5). The KEK is unwrapped from `recovery` with the passphrase. PATs and the Ed25519 private key are stored AES-GCM-wrapped under the KEK in table `vault`. The head anchor is a file `<data>/anchor` (0600, fsync + atomic rename) MAC'd with an HKDF-derived key from the KEK; a missing anchor file after first run is a verification failure. **Limitation (stated in Settings and §8.9):** a local anchor detects truncation of the DB alone but not a coordinated rollback of DB + anchor file; only external anchoring protects against that, so passphrase mode without an external anchor directory requires explicit confirmation and shows a persistent warning.
+- **Passphrase mode** (Linux without a usable Secret Service default collection): the app starts **locked** (exit 9 for requests; unlock via the credential-entry window, §2.5). The KEK is unwrapped from `recovery` with the passphrase. PATs and the Ed25519 private key are stored AES-GCM-wrapped under the KEK in table `vault`. The head anchor is a file `<data>/anchor` (0600, fsync + atomic rename) MAC'd with an HKDF-derived key from the KEK; a missing anchor file after first run is a verification failure. **Limitation (stated in Settings and §8.9):** a local anchor detects truncation of the DB alone but not a coordinated rollback of DB + anchor file; only external anchoring protects against that, so passphrase mode without an external anchor directory requires explicit confirmation and shows a persistent warning.
 
 ### 8.7 Verification
 
@@ -702,7 +707,7 @@ The audit log contains personal data of Atlassian users (names, comments, worklo
 ### 9.1 Flow
 
 1. `atlas-duck script run file.js|- [--args JSON] [--limits JSON]` — the CLI sends **source + args**, never a path.
-2. App validates (source ≤ 256 KiB, args ≤ 1 MiB JSON, limits keys/values §9.4), commits `SCRIPT_STARTED`.
+2. App commits `REQUEST_RECEIVED`, validates (source ≤ 256 KiB, args ≤ 1 MiB JSON, limits keys/values §9.4; failure → `REQUEST_REJECTED`, exit 2), then commits `SCRIPT_STARTED`.
 3. App spawns `atlas-duck-sandbox` with OS limits and confinement (§9.4) and sends `{source, args, limits}` over stdin.
 4. Each `atlas.*` call → `host.call` → the app validates (**Read class only**, schema, field rules, caps, instance), executes via the shared client/limiter, commits `SCRIPT_CALL` (full response), **then** returns the result to the worker. If the append fails, the script is killed (`SCRIPT_FAILED {audit_failure}`), nothing is released.
 5. Worker returns `script.result` (JSON) or `script.error`; the app also observes limits and process exit.
@@ -752,22 +757,22 @@ Defaults configurable in Settings. Agents may request **lower** values via `--li
 **OS confinement of the worker** (best effort beyond a mandatory floor):
 - **Linux** — applied by the worker to itself after its single JS thread exists and before it reads stdin: `PR_SET_NO_NEW_PRIVS`; Landlock handling all filesystem rights the kernel's ABI supports with no rules (plus ABI ≥ 4 network rules and ABI ≥ 6 scopes when available); **seccomp-bpf in default-kill mode with an enumerated allowlist** kept in one reviewed file (read on fd 0, write on fds 1/2, memory management, futex, clocks, `getrandom`, signal return/mask, exit). After setup `clone3` returns `ENOSYS` and `clone` is denied; excluded among others: `execve(at)`, `socket(pair)`, `open*`, `io_uring_*`, `ptrace`, `process_vm_*`, `bpf`, keyring calls, `unshare`/`setns`. The parent sets `PR_SET_PDEATHSIG(SIGKILL)` and rlimits (`AS`, `NOFILE`, `CORE=0`) before exec. Network blocking relies on seccomp, not Landlock.
 - **macOS** — the worker calls `sandbox_init` with an embedded deny-by-default SBPL profile: no network, no file access after startup, no fork/exec, no `mach-lookup` (blocks securityd/keychain and pasteboard). This calling mode is deprecated and undocumented, so it is verified by probes (below) and listed in §15. Memory via the host-side watchdog.
-- **Windows** — the worker runs in an **AppContainer** with zero capabilities (Less-Privileged AppContainer where all needed ACEs exist), so it has no network access and only explicitly granted file access; the installer grants (L)PAC read+execute on the worker binary and every DLL it loads. Job object: `ACTIVE_PROCESS=1`, `KILL_ON_JOB_CLOSE`, `DIE_ON_UNHANDLED_EXCEPTION`, process memory limit, `JOB_OBJECT_UILIMIT_ALL`. If AppContainer creation fails (e.g. per-user install without the ACEs), fallback: lockdown token (restricting SID = NULL SID, untrusted integrity, applied after startup) + job object — **degraded**: file reads and network may not be blocked, and Settings says so.
+- **Windows** — the worker runs in an **AppContainer** with zero capabilities (Less-Privileged AppContainer where all needed ACEs exist), so it has no network access and only explicitly granted file access; the installer grants (L)PAC read+execute on the worker binary and every DLL it loads. Job object: `ACTIVE_PROCESS=1`, `KILL_ON_JOB_CLOSE`, `DIE_ON_UNHANDLED_EXCEPTION`, process memory limit, `JOB_OBJECT_UILIMIT_ALL`. If AppContainer creation fails (e.g. per-user install without the ACEs), the only available configuration is a lockdown token (restricting SID = NULL SID, untrusted integrity, applied after startup) + job object, in which file reads and network may not be blocked — this is **below the floor** (degraded).
 
-**Mandatory floor and probes.** Per OS floor: Linux `no_new_privs` + seccomp; macOS seatbelt profile + watchdog; Windows AppContainer or lockdown token + job object. On each app start, and before the first script, the host runs a **probe worker** that attempts: opening a file in the user profile, `socket()`/`connect()` to 127.0.0.1 and a public IP, spawning a process (incl. raw `clone`/`clone3` on Linux), reading the app's memory, and (Windows) `CredReadW`/`OpenClipboard`, (macOS) a securityd `mach-lookup`. Results are recorded in `APP_START` and shown in Settings. **If the floor cannot be applied and verified, scripts are disabled** (`failed`, exit 8, `error.code = sandbox_unavailable`). An explicit Settings toggle "Allow scripts with degraded confinement" re-enables them with a persistent warning and is audit-logged (`CONFIG_CHANGED`). Missing extra layers (e.g. Landlock on older kernels) are reported but do not disable scripts. Under degraded confinement, a worker compromise is equivalent to same-user code execution (§8.9).
+**Mandatory floor and probes.** Per OS floor: Linux `no_new_privs` + seccomp; macOS seatbelt profile + watchdog; Windows AppContainer + job object. On each app start, and before the first script, the host runs a **probe worker** that attempts: opening a file in the user profile, `socket()`/`connect()` to 127.0.0.1 and a public IP, spawning a process (incl. raw `clone`/`clone3` on Linux), reading the app's memory, and (Windows) `CredReadW`/`OpenClipboard`, (macOS) a securityd `mach-lookup`. Results are recorded in `APP_START` and shown in Settings. **If the floor cannot be applied and verified, scripts are disabled** (`failed`, exit 8, `error.code = sandbox_unavailable`). An explicit Settings toggle "Allow scripts with degraded confinement" re-enables them with a persistent warning and is audit-logged (`CONFIG_CHANGED`). Missing extra layers (e.g. Landlock on older kernels) are reported but do not disable scripts. Under degraded confinement, a worker compromise is equivalent to same-user code execution (§8.9).
 
 ### 9.5 Outcome classification and leak prevention
 
 Classification is by **data exposure**, not by error type, and is decided **only by the host from its own state**: `script_syntax` only for a compile-phase failure before the host delivered any host-call result; `script_limit` only for limits the host itself measured (its timer and counters, the job-object/rlimit/watchdog kill reason, host-decided OOM); everything else is a runtime outcome. The worker's self-reported class and message are untrusted payload, stored only for the release preview.
 
-- A run is **data-free** if no host-call result was delivered to the worker. Data-free failures — compile/syntax errors raised before `main` runs, and limits hit before the first host-call result — are returned directly: `failed`, exit 8, `error.code = script_syntax | script_limit` (syntax errors include line/column/message).
-- **Every other termination** — success, runtime error (including a `SyntaxError` from `JSON.parse`/`eval` of fetched text), any limit (timeout, OOM, budgets, size), user kill, worker crash — becomes a single `AwaitingRelease` item. The candidate is the result, or the error details `{class, message, stack, elapsed, logs}`. Until the decision, the agent sees only `pending` (§4.5): no error class, no timing, no Running/AwaitingRelease distinction.
+- A run is **data-free** if no `SCRIPT_CALL` was committed for it (every host call that reached Atlassian — successful, upstream-error rejection, or `result_too_large` rejection — commits a `SCRIPT_CALL` before anything is returned to the worker). Data-free failures — compile/syntax errors raised before `main` runs, and limits hit before the first host-call result — are returned directly: `failed`, exit 8, `error.code = script_syntax | script_limit` (syntax errors include line/column/message).
+- **Every other termination** — success, runtime error (including a `SyntaxError` from `JSON.parse`/`eval` of fetched text), any limit (timeout, OOM, budgets, size), user kill, worker crash, protocol violation — becomes a single `AwaitingRelease` item. **Exception**: an audit append failure always ends the run as `failed`, `audit_failure`, exit 1 (§5.1 inv. 1), with nothing released. The candidate is the result, or the error details `{class, message, stack, elapsed, logs}`. Until the decision, the agent sees only `pending` (§4.5): no error class, no timing, no Running/AwaitingRelease distinction.
 - On release of a result: `released`, exit 0. On release of error details: `released`, exit 8, `data.script_error`. On deny: `denied`, exit 3.
 - `atlas.log` output and captured stderr never reach the agent unless the user includes them in a release.
 
 ### 9.6 Running-scripts UI
 
-Live list: agent, instance(s), started, elapsed, host calls, bytes fetched; per-script kill button (→ the run becomes an AwaitingRelease item per §9.5 if data was delivered, with reason `killed_by_user`).
+Live list: agent, instance(s), started, elapsed, host calls, bytes fetched; per-script kill button (→ the run becomes an AwaitingRelease item per §9.5, with reason `killed_by_user`).
 
 ---
 
@@ -795,7 +800,9 @@ Live list: agent, instance(s), started, elapsed, host calls, bytes fetched; per-
 - **Decision timing**: when the agent's call returns reveals when the human decided (and that a decision was approve/deny). This is chosen by the user, not by data.
 - **Data-free failures**: validation errors (static), 401/needs-token state, network/TLS errors without a body, and data-free script failures reveal no Atlassian content.
 - **Busy/queue signals**: reveal only queue load.
-- **Same-user processes** can `await` any request whose id they know; ids are unguessable and deliveries are logged.
+- **Content-size outcomes**: `result_too_large` (release cap or 50 MiB fetch cap) and read time-budget expiry are returned without release and reveal that a result exceeded a cap or took too long (no size, no content).
+- **Write error text**: after an approved write fails with 4xx, the Atlassian `errorMessages`/`errors` (≤ 2 KiB) are returned without a separate release; they describe the approved payload but may quote server state.
+- **Same-user processes** can list and `await` any request (including released data within the 1 h window); every delivery is logged with the recipient and highlighted in the Audit window.
 
 ### 10.3 Frontend lockdown
 
@@ -805,13 +812,14 @@ Live list: agent, instance(s), started, elapsed, host calls, bytes fetched; per-
   |---|---|
   | Approvals | queue list/get, preview fetch for a rev, approve/deny/edit/redact, batch request (Rust confirms natively) |
   | Audit | read-only queries and payload view; export/backup/verify **triggers** (no path arguments) |
-  | Settings | settings, instance setup, credential entry, CLI install, retention/legal hold, confinement toggle |
+  | Settings | settings, instance setup, **credential-entry trigger** (opens the credential window), CLI install, retention/legal hold, confinement toggle |
+  | Credential entry | `submit_secret` only (PAT, recovery passphrase, unlock passphrase) |
   | Running scripts | list, kill |
   | Onboarding | read-only registry/onboarding text |
-  | Unlock | unlock |
 
   No window gets shell, fs, http, opener, clipboard-read or remote-URL capabilities. Decision commands exist only in the Approvals window; credential commands only in Settings. The Audit window is a separate webview whose capability file grants no decision commands; it renders decrypted payloads through the same sanitized, sandboxed-iframe path as §6.4.
 - **Navigation**: every webview registers an `on_navigation` handler that allows only the app's own origin (`tauri://localhost` / `http://tauri.localhost`); `window.open`/new-window requests are denied. No external-link opener in v1 — URLs are copyable text. No clipboard-read; copy is write-only on a user gesture.
+- **Secrets** (PATs, recovery passphrase, unlock passphrase) are entered only in a dedicated, Rust-opened **credential-entry window**: a separate webview with a static bundled page, no untrusted content, and a single write-only `submit_secret` command (it is also used for first-run and unlock). Secrets are never sent to, displayed in, or returned to any webview after entry; other windows can only trigger the credential window.
 - **Paths and certificates** for export, backup, restore, external anchor directory and custom-CA import are chosen in a **native dialog opened by Rust**; no command accepts a filesystem path or certificate bytes from the webview. A custom CA shows its fingerprint and subject in the Rust-drawn dialog.
 - **Security-weakening settings** (restore backup, add custom CA, lift legal hold, lower retention, raise limits, enable degraded script confinement, switch focus to "badge only", passphrase mode without external anchor) require a Rust-drawn native confirmation and are logged as `CONFIG_CHANGED` with old and new values.
 
@@ -824,15 +832,15 @@ Live list: agent, instance(s), started, elapsed, host calls, bytes fetched; per-
 - Audit append failure → no upstream call / release / execution; request `Failed`, `audit_failure`, exit 1; UI banner.
 - Low audit storage → new requests refused (`audit_storage_low`, exit 1).
 - Keychain unavailable / passphrase mode locked → all requests rejected, exit 9.
-- Validation failure → exit 2, nothing queued, logged `REQUEST_RECEIVED` + `REQUEST_REJECTED`.
+- Validation failure → exit 2, nothing queued, logged `REQUEST_RECEIVED` (committed before validation) + `REQUEST_REJECTED`.
 
 ### 11.2 Upstream errors
 
 - **Reads / script calls / enrichment**: HTTP status ≥ 400 (except 401) is content — release-gated (§5.2 step 6, §5.4 step 2, §9.5). For scripts, an upstream error is returned to the script as a rejected promise (it is fetched data; the run is no longer data-free).
-- **401** → instance `needs_token`, exit 9 (directly).
+- **401** → instance `needs_token` (logged `INSTANCE_STATE_CHANGED`). Direct reads (`READ_FAILED`) and enrichment (`REQUEST_FAILED`): `failed`, exit 9, directly. Script host calls: the call rejects inside the script with `needs_token` (run outcome per §9.5). Write execution: `WRITE_FAILED`, `failed`, exit 9 `needs_token`.
 - **429** → bounded retry (§7.2), then the same as other upstream errors.
-- **Network/TLS errors without a response** → exit 6 `upstream_network` with a clear message (e.g. "certificate not trusted — add a custom CA in Settings").
-- **Writes after approval**: 4xx → `WRITE_FAILED`, the Atlassian `errorMessages`/`errors` (capped 2 KiB) returned with exit 6 (the user approved this write; the error describes the agent's own payload). Version conflicts → `WRITE_STALE` (§5.4). Timeout/reset after send/5xx → `outcome_unknown`.
+- **Network/TLS errors without a response**, and read time-budget expiry (§7.2) → direct reads and enrichment: exit 6 `upstream_network` with a clear message (e.g. "certificate not trusted — add a custom CA in Settings"); script host calls: the call rejects inside the script; sent writes: `outcome_unknown` (§5.4 step 6).
+- **Writes after approval**: 4xx (other than 401) → `WRITE_FAILED`, the Atlassian `errorMessages`/`errors` (capped 2 KiB) returned with exit 6 (the user approved this write; the error describes the agent's own payload — a listed residual channel, §10.2). Version conflicts → `WRITE_STALE` (§5.4). Timeout/reset after send/5xx → `outcome_unknown`.
 
 ### 11.3 Crash / restart reconciliation
 
@@ -882,7 +890,7 @@ A Settings page generates copy-paste instructions (for CLAUDE.md / AGENTS.md / M
 |---|---|
 | Unit | State machine property tests (proptest): invariants §5.1 under random event sequences, including candidate_rev races, stale loops, chunk failures. Method guard: no Read/enrichment/script path can emit a non-GET outside the allowlist; Write execution sends exactly the approved request set. Audit: tamper tests (modify/delete/reorder/truncate tail/truncate head/ciphertext-swap/checkpoint deletion → verify fails), canonical-encoding golden vectors, crypto round-trips, prune keeps verifiability, clock jumps (forward/backward) never over-prune, restore segments and fork detection, anchor rules after crash, integrity incident persistence. Converters: golden files (storage→md incl. CDATA, macros, entities, user mentions; md→wiki and md→storage incl. escaping of raw HTML/wiki specials; wiki→html). Redaction engine incl. copies and mask-everywhere. Params validation, field rules, CLI flag binding. |
 | Integration | Mock Jira/Confluence DC (`wiremock`) with fixtures modelled on Jira 9.12/10.x and Confluence 8.5/9.x; full CLI → IPC → core → mock → audit flows using a headless **scripted approver** in place of the UI; MCP front end via an MCP test client (heartbeats, timeout result, cancel semantics). Opacity tests: agent-visible status/progress streams are identical for released vs denied-later vs upstream-error vs script-limit-after-data cases until the decision. CLI killed mid-wait → request survives, id on stderr, `requests list` finds it. |
-| Security | IPC: other-user connection rejected (Linux CI with a second user); a second Windows account pre-creating a pipe name → CLI exits 5 without sending; Windows pipe DACL and client SQOS level inspected; `hello` deadline/ordering; busy handling never triggers a launch; AppImage and deb-upgrade anti-squatting cases; two app instances with different environments cannot both open the audit store. Launch: the app survives killing the launching CLI/MCP process tree and job; `atlas-duck mcp` stdout carries only JSON-RPC when it auto-launches the app; no debug port opens when WebView2/WebKit inspector variables are set. Process hardening: a child cannot read the app's memory. Frontend: injection payloads (`<script>`, `onerror`, `javascript:`) in every field of every tab and the Audit window do not execute; commands outside a window's capability grant are rejected; navigation to foreign origins is blocked. Sandbox channel fuzzing: malformed, oversize and out-of-order frames, log floods and host-call floods stay within caps and end in `protocol_violation`; the worker sees no descriptors/handles other than its three pipes and an empty environment. Sandbox: scripts attempting fs/net/`import`/infinite loops/memory bombs/deep recursion/write ops/error-message leaks/data-dependent limit errors → contained, and data-dependent failures yield `pending`; OS confinement probes per OS. Preview: HTML with remote images/scripts neutralized; invisible characters marked; raw-only diff changes flagged. Diagnostic logs contain no content (grep test over a full integration run). |
+| Security | IPC: other-user connection rejected (Linux CI with a second user); a second Windows account that creates a pipe with the name written in the endpoint file (simulated) → CLI exits 5 without sending; Windows pipe DACL and client SQOS level inspected; `hello` deadline/ordering; busy handling never triggers a launch; AppImage and deb-upgrade anti-squatting cases; two app instances with different environments cannot both open the audit store. Launch: the app survives killing the launching CLI/MCP process tree and job; `atlas-duck mcp` stdout carries only JSON-RPC when it auto-launches the app; no debug port opens when WebView2/WebKit inspector variables are set. Process hardening: a child cannot read the app's memory. Frontend: injection payloads (`<script>`, `onerror`, `javascript:`) in every field of every tab and the Audit window do not execute; commands outside a window's capability grant are rejected; navigation to foreign origins is blocked. Sandbox channel fuzzing: malformed, oversize and out-of-order frames, log floods and host-call floods stay within caps and end in `protocol_violation`; the worker sees no descriptors/handles other than its three pipes and an empty environment. Sandbox: scripts attempting fs/net/`import`/infinite loops/memory bombs/deep recursion/write ops/error-message leaks/data-dependent limit errors → contained, and data-dependent failures yield `pending`; OS confinement probes per OS. Preview: HTML with remote images/scripts neutralized; invisible characters marked; raw-only diff changes flagged. Diagnostic logs contain no content (grep test over a full integration run). |
 | UI | Vitest + Testing Library component tests (opened-flag, focus delay, batch rules, read-only target fields); `tauri-driver` WebDriver smoke tests on Windows and Linux. |
 | Live (opt-in) | Env-gated tests against real DC instances (e.g. Atlassian trial Docker images), covering the §15 verification items. |
 | CI | Matrix: Windows (MSVC), macOS (arm64), Ubuntu 22.04; `cargo test`, `clippy -D warnings`, `cargo-deny`, `cargo-audit`, UI tests, bundle build. |
@@ -896,7 +904,7 @@ A Settings page generates copy-paste instructions (for CLAUDE.md / AGENTS.md / M
 3. **IPC + CLI skeleton**: transports per OS with peer checks and anti-squatting, handshake, envelope + status/exit matrix, submission notice, `ops list/describe`, `await/status/cancel/requests list`, app auto-launch, `doctor`.
 4. **Core lifecycle**: registry, state machine + invariants, method guard, queue + limits, opacity rule, headless scripted approver, redaction/edit engine, credential provider + keychain storage, headless instance setup for tests.
 5. **Jira adapter + previews** (core then extended ops), wiki/markdown converters, stale rules, chunked batches.
-6. **Approvals UI**: queue, previews, raw diffs, redaction/edit, opened-flag/focus/batch rules, notifications/tray badge, settings, instance setup, first-run wizard, unlock window.
+6. **Approvals UI**: queue, previews, raw diffs, redaction/edit, opened-flag/focus/batch rules, notifications/tray badge, settings, instance setup, first-run wizard, credential-entry window (incl. unlock).
 7. **Confluence adapter + previews** (core then extended ops), storage converters, lossy-update detection, user resolution.
 8. **Script sandbox**: worker, host bridge, limits, OS confinement, outcome classification, running-scripts UI.
 9. **MCP front end** (full/generic tools, heartbeats).
