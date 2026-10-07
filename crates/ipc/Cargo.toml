@@ -7,14 +7,15 @@ publish.workspace = true
 
 [features]
 default = ["async"]
-# Gates the tokio-based codecs (Task 13 attaches tokio-util). The sandbox worker
+# Gates the tokio-based codecs. The sandbox worker
 # depends on this crate with default-features = false and stays tokio-free.
-async = []
+async = ["dep:tokio-util"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml_edit = { workspace = true }
+tokio-util = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

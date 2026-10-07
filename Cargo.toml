@@ -26,6 +26,7 @@ publish = false
 [workspace.dependencies]
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+tokio-util = { version = "=0.7.19", default-features = false, features = ["codec"] }
 # Tauri 2.x only (Tauri 3 is alpha; research A0). Nothing but app/src-tauri depends on it (§2.2).
 tauri = { version = "=2.12.1", features = ["tray-icon"] }
 tauri-build = "=2.7.1"
