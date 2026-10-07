@@ -283,14 +283,14 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $unc = '\localhost\C$'
+          $unc = '\\localhost\C$'
           net use Y: $unc /persistent:no
           if ($LASTEXITCODE -ne 0) {
             Write-Host "net use $unc failed ($LASTEXITCODE); falling back to a local SMB share"
             $shareDir = Join-Path $env:RUNNER_TEMP 'atlas-smb'
             New-Item -ItemType Directory -Force $shareDir | Out-Null
             New-SmbShare -Name atlasduck -Path $shareDir -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
-            $unc = '\localhost\atlasduck'
+            $unc = '\\localhost\atlasduck'
             net use Y: $unc /persistent:no
             if ($LASTEXITCODE -ne 0) { throw "net use $unc failed ($LASTEXITCODE)" }
           }
