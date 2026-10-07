@@ -87,11 +87,25 @@ jobs:
           node-version: "22"
           package-manager-cache: false
 
+      - name: Build the UI (tauri::generate_context! reads app/ui/dist)
+        run: |
+          npm --prefix app/ui ci --ignore-scripts
+          npm --prefix app/ui run build
+
       - name: Clippy (-D warnings; unwrap_used/expect_used deny in core and atlassian)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Bin linkage (§2.1) - CLI and sandbox link no webview/TLS/DB/keyring libraries (Linux, macOS)
+        if: runner.os != 'Windows'
+        run: bash ci/check-bin-linkage.sh target/debug
+
+      - name: Bin linkage (§2.1) - CLI and sandbox import no webview/TLS/DB/keyring DLLs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/check-bin-linkage.ps1 -BinDir target/debug
 
       - name: Workspace dependency rule (§2.2)
         run: node ci/check-workspace.mjs
@@ -145,6 +159,17 @@ jobs:
         with:
           key: x86_64-apple-darwin-rosetta
           save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Build the UI (tauri::generate_context! reads app/ui/dist)
+        run: |
+          npm --prefix app/ui ci --ignore-scripts
+          npm --prefix app/ui run build
 
       - name: Test x86_64-apple-darwin (test binaries run under Rosetta)
         run: cargo test --workspace --locked --target x86_64-apple-darwin
