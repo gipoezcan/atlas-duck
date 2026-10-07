@@ -27,6 +27,7 @@ system-configuration-sys = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

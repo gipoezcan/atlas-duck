@@ -208,6 +208,105 @@ jobs:
           fi
           echo "x86_64 test executables: $(wc -l < "$RUNNER_TEMP/executables.txt")"
 
+  locality-mounts:
+    name: locality-mounts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    env:
+      # An unset ATLAS_DUCK_TEST_* variable fails the test instead of skipping it.
+      ATLAS_DUCK_REQUIRE_MOUNT_TESTS: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: locality-mounts-${{ matrix.os }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Loopback NFS and SMB mounts (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            nfs-kernel-server samba cifs-utils
+          # The runner's cloud kernel may ship the cifs module only in
+          # linux-modules-extra; install that package when modprobe fails.
+          if ! sudo modprobe cifs; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe cifs
+          fi
+          # NFS: export a local dir to 127.0.0.1 and mount it back.
+          sudo mkdir -p /srv/atlas-nfs /mnt/nfs
+          sudo chown "$(id -u):$(id -g)" /srv/atlas-nfs
+          echo "/srv/atlas-nfs 127.0.0.1(rw,sync,no_subtree_check,insecure)" | sudo tee /etc/exports
+          sudo exportfs -ra
+          sudo systemctl restart nfs-kernel-server
+          sudo mount -t nfs -o vers=4.2 127.0.0.1:/srv/atlas-nfs /mnt/nfs
+          mkdir -p /mnt/nfs/data
+          stat -f -c 'V29 nfs f_type=0x%t (%T)' /mnt/nfs/data
+          # SMB: share a local dir with Samba and mount it through cifs.
+          SMB_PASS="$(openssl rand -hex 16)"
+          sudo mkdir -p /srv/atlas-smb /mnt/smb
+          sudo chown "$(id -u):$(id -g)" /srv/atlas-smb
+          printf '[atlas]\n   path = /srv/atlas-smb\n   read only = no\n   valid users = %s\n' "$USER" | sudo tee -a /etc/samba/smb.conf > /dev/null
+          printf '%s\n%s\n' "$SMB_PASS" "$SMB_PASS" | sudo smbpasswd -a -s "$USER"
+          sudo systemctl restart smbd
+          sudo mount -t cifs //127.0.0.1/atlas /mnt/smb -o "username=$USER,password=$SMB_PASS,uid=$(id -u),gid=$(id -g),vers=3.0"
+          mkdir -p /mnt/smb/data
+          stat -f -c 'V29 cifs f_type=0x%t (%T)' /mnt/smb/data
+          echo "ATLAS_DUCK_TEST_NFS_DIR=/mnt/nfs/data" >> "$GITHUB_ENV"
+          echo "ATLAS_DUCK_TEST_SMB_DIR=/mnt/smb/data" >> "$GITHUB_ENV"
+
+      - name: Locality tests against the mounts (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p atlas-duck-ipc --test locality --locked -- --nocapture
+
+      # Drive mappings are per logon session, so mapping, subst and the
+      # test run share one step.
+      - name: Mapped, subst and UNC-symlink drives + locality tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $unc = '\localhost\C$'
+          net use Y: $unc /persistent:no
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "net use $unc failed ($LASTEXITCODE); falling back to a local SMB share"
+            $shareDir = Join-Path $env:RUNNER_TEMP 'atlas-smb'
+            New-Item -ItemType Directory -Force $shareDir | Out-Null
+            New-SmbShare -Name atlasduck -Path $shareDir -FullAccess "$env:USERDOMAIN\$env:USERNAME" | Out-Null
+            $unc = '\localhost\atlasduck'
+            net use Y: $unc /persistent:no
+            if ($LASTEXITCODE -ne 0) { throw "net use $unc failed ($LASTEXITCODE)" }
+          }
+          $substDir = Join-Path $env:RUNNER_TEMP 'atlas-subst'
+          New-Item -ItemType Directory -Force $substDir | Out-Null
+          subst X: $substDir
+          if ($LASTEXITCODE -ne 0) { throw "subst X: failed ($LASTEXITCODE)" }
+          $link = Join-Path $env:RUNNER_TEMP 'atlas-unc-link'
+          New-Item -ItemType SymbolicLink -Path $link -Target $unc | Out-Null
+          Write-Host "V29 mapped Y: -> $unc; subst X: -> $substDir; symlink $link -> $unc"
+          $env:ATLAS_DUCK_TEST_MAPPED_DRIVE = 'Y:\'
+          $env:ATLAS_DUCK_TEST_SUBST_DRIVE = 'X:\'
+          $env:ATLAS_DUCK_TEST_UNC_SYMLINK = $link
+          cargo test -p atlas-duck-ipc --test locality --locked -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   supply-chain:
     name: supply-chain (cargo-deny, cargo-audit)
     runs-on: ubuntu-22.04
