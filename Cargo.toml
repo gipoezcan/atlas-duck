@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/registry",
+    "crates/core",
+    "crates/atlassian",
+    "crates/convert",
+    "crates/preview",
+    "crates/audit",
+    "crates/ipc",
+    "crates/sandbox-host",
+    "crates/sandbox-worker",
+    "crates/cli",
+    # "app/src-tauri",  # package atlas-duck-app, enabled by Task 4
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+publish = false
+
+# Exact pins for external crates (`name = "=x.y.z"`). Each later task adds the
+# pins it needs; workspace-internal crates are declared as path dependencies in
+# each member's own Cargo.toml so `default-features = false` keeps its meaning.
+[workspace.dependencies]
+
+# §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
+# covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.
+[profile.release]
+panic = "abort"
