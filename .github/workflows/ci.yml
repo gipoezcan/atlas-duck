@@ -98,6 +98,23 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Record host name sources and pinned-file base folders (§15 V28)
+        run: |
+          cargo test -p atlas-duck-ipc --locked --test paths -- --exact --nocapture host_name_is_the_sanitized_raw_name
+          case "$RUNNER_OS" in
+            macOS)
+              echo "scutil LocalHostName: $(scutil --get LocalHostName 2>&1 || true)"
+              echo "gethostname (hostname): $(hostname)"
+              ;;
+            Linux)
+              echo "/etc/hostname: $(cat /etc/hostname 2>&1 || true)"
+              echo "gethostname (hostname): $(hostname)"
+              ;;
+            Windows)
+              echo "COMPUTERNAME: ${COMPUTERNAME:-unset}"
+              ;;
+          esac
+
       - name: Bin linkage (§2.1) - CLI and sandbox link no webview/TLS/DB/keyring libraries (Linux, macOS)
         if: runner.os != 'Windows'
         run: bash ci/check-bin-linkage.sh target/debug

@@ -5,3 +5,4 @@
 
 pub mod build_info;
 pub mod envelope;
+pub mod paths;
