@@ -485,7 +485,8 @@ impl WorkerProcess for LinuxProcess {
     /// thread is needed on Linux. A partial frame stays buffered across a
     /// `TimedOut`.
     fn read_frame_timeout(&mut self, max: usize, d: Duration) -> io::Result<Option<Vec<u8>>> {
-        let deadline = Instant::now() + d;
+        let deadline = deadline_after(d);
+        let mut read_once = false;
         loop {
             if let Some(frame) = self.take_frame(max)? {
                 return Ok(Some(frame));
@@ -501,6 +502,15 @@ impl WorkerProcess for LinuxProcess {
                 };
             }
             let left = deadline.saturating_duration_since(Instant::now());
+            // `poll` with 0 ms still reports waiting bytes, so a worker that
+            // trickles bytes would hold the host past `d`: once the deadline
+            // has passed and this call has read at least once, stop.
+            if read_once && left.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "no complete frame from the worker in time",
+                ));
+            }
             if !poll_readable(self.stdout.as_raw_fd(), left)? {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -508,6 +518,7 @@ impl WorkerProcess for LinuxProcess {
                 ));
             }
             let mut chunk = [0u8; 8192];
+            read_once = true;
             match self.stdout.read(&mut chunk) {
                 Ok(0) => self.eof = true,
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
@@ -525,7 +536,7 @@ impl WorkerProcess for LinuxProcess {
         if let Some(exit) = self.exit {
             return Ok(Some(exit));
         }
-        let deadline = Instant::now() + d;
+        let deadline = deadline_after(d);
         loop {
             if let Some(exit) = self.try_reap()? {
                 return Ok(Some(exit));
@@ -565,10 +576,17 @@ impl Drop for LinuxProcess {
     }
 }
 
+/// `now + d`, saturating: an `Instant` overflow means "far in the future".
+fn deadline_after(d: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(d)
+        .unwrap_or_else(|| now + Duration::from_secs(60 * 60 * 24 * 365))
+}
+
 /// `poll(2)` for `POLLIN` with a timeout rounded up to whole milliseconds.
 /// `POLLHUP` and errors count as readable: the following `read` reports them.
 fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_after(timeout);
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         let millis = left.as_millis() + u128::from(!left.subsec_nanos().is_multiple_of(1_000_000));
@@ -796,6 +814,27 @@ mod tests {
             p.read_frame_timeout(1024, Duration::from_secs(5))
                 .expect("frame"),
             Some(b"abcd".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_worker_that_trickles_bytes_cannot_hold_the_host_past_the_deadline() {
+        let spawner = LinuxSpawner::start().expect("start");
+        let mut p = spawner.spawn_process(&spec(SH)).expect("spawn");
+        // A header announcing 65535 bytes, then one byte every 10 ms: the
+        // frame never completes within the deadline.
+        p.stdin()
+            .write_all(b"printf '\\0\\0\\377\\377'\nwhile :; do printf x; sleep 0.01; done\n")
+            .expect("script");
+        let start = Instant::now();
+        let err = p
+            .read_frame_timeout(1 << 20, Duration::from_millis(200))
+            .expect_err("incomplete frame");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
         );
     }
 
