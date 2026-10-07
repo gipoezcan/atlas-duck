@@ -1,0 +1,41 @@
+# Linux-only GitLab mirror of the jobs in .github/workflows/ci.yml (unverified:
+# written without runner access). Windows, macOS and Rosetta legs exist only in
+# the GitHub workflow.
+stages: [check, supply-chain]
+
+default:
+  image: rust:1.95
+
+variables:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
+
+rust:test:
+  stage: check
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev dbus-x11 xvfb
+    - rustup toolchain install
+  script:
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+    - cargo test --workspace --locked
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths: [.cargo-home/registry, target]
+
+node:ci-checks:
+  stage: check
+  image: node:22
+  script:
+    - node ci/check-workspace.mjs
+    - node --test "ci/*.test.mjs"
+
+supply-chain:
+  stage: supply-chain
+  before_script:
+    - rustup toolchain install
+    - cargo install --locked cargo-deny@0.20.2 cargo-audit@0.22.2
+  script:
+    - cargo deny --locked check
+    - cargo audit

@@ -1,0 +1,194 @@
+# Base CI for atlas-duck (spec §13 CI row, §10.1 supply chain).
+# Jobs: rust (3-OS matrix), rust-macos-x86_64-rosetta, supply-chain.
+# Later M1 tasks add steps or jobs to this file.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rust:
+    name: rust (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux system packages (Tauri, tray, D-Bus, Xvfb)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            dbus-x11 \
+            xvfb
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          active="$(rustup show active-toolchain)"
+          echo "$active"
+          case "$active" in
+            *rust-toolchain.toml*) ;;
+            *) echo "::error::active toolchain does not come from rust-toolchain.toml"; exit 1 ;;
+          esac
+          rustc -vV
+          cargo clippy --version
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "$host" != "${{ matrix.target }}" ]; then
+            echo "::error::rustc host is $host, expected ${{ matrix.target }}"
+            exit 1
+          fi
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Clippy (-D warnings; unwrap_used/expect_used deny in core and atlassian)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Workspace dependency rule (§2.2)
+        run: node ci/check-workspace.mjs
+
+      - name: CI script tests
+        run: node --test "ci/*.test.mjs"
+
+  rust-macos-x86_64-rosetta:
+    name: rust (x86_64-apple-darwin under Rosetta)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rosetta 2 and fail loudly if it does not work (§15 V32)
+        run: |
+          set -euo pipefail
+          machine="$(uname -m)"
+          if [ "$machine" != "arm64" ]; then
+            echo "::error::runner hardware is $machine, expected arm64"
+            exit 1
+          fi
+          if ! sudo softwareupdate --install-rosetta --agree-to-license; then
+            echo "::error::softwareupdate could not install Rosetta 2"
+            exit 1
+          fi
+          if ! arch -x86_64 /usr/bin/true; then
+            echo "::error::Rosetta 2 is installed but cannot run x86_64 code"
+            exit 1
+          fi
+          translated="$(arch -x86_64 /usr/sbin/sysctl -n sysctl.proc_translated)"
+          echo "sysctl.proc_translated under arch -x86_64: $translated"
+          if [ "$translated" != "1" ]; then
+            echo "::error::x86_64 process is not translated by Rosetta"
+            exit 1
+          fi
+
+      - name: Install the pinned Rust toolchain and the x86_64-apple-darwin target
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+          rustup target add x86_64-apple-darwin
+          rustup target list --installed
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-apple-darwin-rosetta
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Test x86_64-apple-darwin (test binaries run under Rosetta)
+        run: cargo test --workspace --locked --target x86_64-apple-darwin
+
+      - name: Show that the test binaries are x86_64
+        run: |
+          set -euo pipefail
+          file target/x86_64-apple-darwin/debug/deps/* | tee "$RUNNER_TEMP/file-report.txt"
+          grep 'Mach-O 64-bit executable' "$RUNNER_TEMP/file-report.txt" > "$RUNNER_TEMP/executables.txt" || true
+          if [ ! -s "$RUNNER_TEMP/executables.txt" ]; then
+            echo "::error::no Mach-O test executables in target/x86_64-apple-darwin/debug/deps"
+            exit 1
+          fi
+          # Every line starts with the path ".../x86_64-apple-darwin/...", so match
+          # the architecture that `file` prints at the end of the line.
+          if grep -v 'executable x86_64$' "$RUNNER_TEMP/executables.txt"; then
+            echo "::error::a test executable in the x86_64 target dir is not x86_64"
+            exit 1
+          fi
+          echo "x86_64 test executables: $(wc -l < "$RUNNER_TEMP/executables.txt")"
+
+  supply-chain:
+    name: supply-chain (cargo-deny, cargo-audit)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Install cargo-deny and cargo-audit
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+
+      - name: cargo deny check (advisories, bans, licenses, sources)
+        run: cargo deny --locked check
+
+      - name: cargo audit
+        run: cargo audit

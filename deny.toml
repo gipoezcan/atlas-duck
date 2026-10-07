@@ -1,0 +1,66 @@
+# cargo-deny policy for atlas-duck (spec §10.1: "`cargo-deny`, `cargo-audit`,
+# `npm audit` in CI"). Checked by the `supply-chain` job in
+# .github/workflows/ci.yml with cargo-deny 0.20.2.
+
+[graph]
+# Only the targets atlas-duck ships (§12.2). Dependencies that exist only for
+# other targets (Android, iOS, BSD, ...) are not part of the shipped graph.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]
+all-features = false
+no-default-features = false
+
+[advisories]
+# Vulnerabilities and unsound advisories fail on any crate in the graph
+# (cargo-deny defaults). Unmaintained advisories fail only for direct
+# dependencies of workspace crates: a transitive unmaintained crate (for
+# example proc-macro-error under gtk-rs 0.18, pulled in by Tauri on Linux)
+# cannot be replaced by this project. cargo-audit still prints it as a warning.
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+# Plan choice (spec silent on the list).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+]
+confidence-threshold = 0.93
+# Allowed licenses that no crate uses yet are not an error.
+unused-allowed-license = "allow"
+exceptions = []
+
+[licenses.private]
+# Workspace crates are `publish = false` and carry no license field.
+ignore = true
+registries = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies are not wildcards because no crate is published.
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# crates.io only: no other registry, no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
