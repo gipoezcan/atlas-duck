@@ -1,2 +1,6 @@
-//! SQLite store, crypto (envelope), hash chain, anchors, prune log,
-//! retention, export (§2.2). M1 adds the instance lock (Task 10).
+//! atlas-duck audit crate.
+//!
+//! M1 holds only `instance.lock` (§3.1). The M2 audit store's `open()` takes an
+//! [`lock::InstanceLock`], so the store cannot be opened without the lock (type-enforced).
+
+pub mod lock;

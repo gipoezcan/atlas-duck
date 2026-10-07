@@ -29,6 +29,7 @@ serde_json = "=1.0.151"
 # Tauri 2.x only (Tauri 3 is alpha; research A0). Nothing but app/src-tauri depends on it (§2.2).
 tauri = { version = "=2.12.1", features = ["tray-icon"] }
 tauri-build = "=2.7.1"
+tauri-plugin-dialog = "=2.8.1"
 libc = "=0.2.190"
 windows-sys = "=0.61.2"
 tempfile = "=3.27.0"
