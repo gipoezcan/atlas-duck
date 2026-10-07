@@ -1,0 +1,6 @@
+# Written by a hypothetical newer atlas-duck using syntax this binary cannot parse.
+schema_version = 7
+written_by = "9.9.9"
+
+[future_table
+added_in_v7 = "the header above is not closed"

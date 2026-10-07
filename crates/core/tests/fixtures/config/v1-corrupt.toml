@@ -1,0 +1,4 @@
+# Same-version file damaged in place (truncated write or bad merge).
+schema_version = 1
+written_by = "0.0.1"
+note = "unterminated

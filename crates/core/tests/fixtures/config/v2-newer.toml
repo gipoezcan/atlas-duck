@@ -1,0 +1,10 @@
+# Written by a hypothetical newer atlas-duck (schema 2).
+schema_version = 2
+written_by = "9.9.9"
+future_flag = true
+
+[fixture]
+note = "keep me"
+
+[future_table]
+added_in_v2 = "unknown to this binary"

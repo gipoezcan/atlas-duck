@@ -115,6 +115,8 @@ dependencies = [
  "atlas-duck-ipc",
  "atlas-duck-preview",
  "atlas-duck-registry",
+ "tempfile",
+ "toml_edit 0.25.15+spec-1.1.0",
 ]
 
 [[package]]

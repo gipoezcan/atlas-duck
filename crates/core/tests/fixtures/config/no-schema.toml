@@ -1,0 +1,5 @@
+# Valid TOML without a schema_version key.
+written_by = "0.0.1"
+
+[fixture]
+note = "keep me"

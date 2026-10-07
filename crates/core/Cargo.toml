@@ -12,6 +12,10 @@ atlas-duck-convert = { path = "../convert" }
 atlas-duck-preview = { path = "../preview" }
 atlas-duck-audit = { path = "../audit" }
 atlas-duck-ipc = { path = "../ipc" }
+toml_edit = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 # §7.7 / §13: unwrap_used and expect_used are errors in core and atlassian.
 [lints.clippy]

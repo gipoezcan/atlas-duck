@@ -1,0 +1,15 @@
+# atlas-duck config fixture: schema 1 (the M1 head). Every comment must survive a write.
+schema_version = 1 # head in M1
+written_by = "0.0.1"
+
+# Neutral keys only: instances, UI preferences and limits get typed keys in M3/M6.
+[fixture]
+note = "keep me" # trailing comment
+numbers = [1, 2, 3]
+inline = { a = 1, b = "two" }
+
+[[fixture.items]]
+name = "first"
+
+[[fixture.items]]
+name = "second"
