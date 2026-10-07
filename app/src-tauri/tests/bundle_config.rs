@@ -202,7 +202,10 @@ mod t12 {
     fn macos_hardened_runtime_entitlements_and_ad_hoc_identity() {
         let c = conf();
         assert_eq!(at(&c, "/bundle/macOS/hardenedRuntime"), &Value::Bool(true));
-        assert_eq!(string_at(&c, "/bundle/macOS/entitlements"), "entitlements.plist");
+        assert_eq!(
+            string_at(&c, "/bundle/macOS/entitlements"),
+            "entitlements.plist"
+        );
         assert_eq!(string_at(&c, "/bundle/macOS/signingIdentity"), "-");
         assert_eq!(string_at(&c, "/bundle/macOS/minimumSystemVersion"), "13.0");
     }
@@ -210,8 +213,14 @@ mod t12 {
     #[test]
     fn entitlements_plist_has_no_get_task_allow() {
         let plist = read_text("entitlements.plist");
-        assert!(plist.contains("<plist"), "entitlements.plist is not a plist");
-        assert!(plist.contains("<dict"), "entitlements.plist has no top-level dict");
+        assert!(
+            plist.contains("<plist"),
+            "entitlements.plist is not a plist"
+        );
+        assert!(
+            plist.contains("<dict"),
+            "entitlements.plist has no top-level dict"
+        );
         assert!(
             !plist.contains("com.apple.security.get-task-allow"),
             "entitlements.plist must not grant com.apple.security.get-task-allow (§2.5)"
@@ -221,8 +230,14 @@ mod t12 {
     #[test]
     fn deb_and_rpm_render_the_atlas_duck_launcher_template() {
         let c = conf();
-        assert_eq!(string_at(&c, "/bundle/linux/deb/desktopTemplate"), LAUNCHER_TEMPLATE);
-        assert_eq!(string_at(&c, "/bundle/linux/rpm/desktopTemplate"), LAUNCHER_TEMPLATE);
+        assert_eq!(
+            string_at(&c, "/bundle/linux/deb/desktopTemplate"),
+            LAUNCHER_TEMPLATE
+        );
+        assert_eq!(
+            string_at(&c, "/bundle/linux/rpm/desktopTemplate"),
+            LAUNCHER_TEMPLATE
+        );
     }
 
     #[test]
@@ -230,10 +245,21 @@ mod t12 {
         let text = read_text(LAUNCHER_TEMPLATE);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.first().copied(), Some("[Desktop Entry]"));
-        let exec: Vec<&str> = lines.iter().copied().filter(|l| l.starts_with("Exec=")).collect();
-        assert_eq!(exec, ["Exec=atlas-duck-app"], "Exec must start the app with no arguments");
+        let exec: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("Exec="))
+            .collect();
+        assert_eq!(
+            exec,
+            ["Exec=atlas-duck-app"],
+            "Exec must start the app with no arguments"
+        );
         assert!(lines.contains(&"Type=Application"));
-        assert!(!lines.contains(&"NoDisplay=true"), "the launcher must be visible");
+        assert!(
+            !lines.contains(&"NoDisplay=true"),
+            "the launcher must be visible"
+        );
         assert!(
             !text.contains("{{"),
             "the template is literal, so the shipped file equals the repository file"
@@ -267,9 +293,15 @@ mod t12 {
         // (bundle/linux/freedesktop/mod.rs), so only a Linux productName of
         // `atlas-duck` yields /usr/share/applications/atlas-duck.desktop (§12.2).
         let linux = json("tauri.linux.conf.json");
-        let obj = linux.as_object().expect("tauri.linux.conf.json is an object");
+        let obj = linux
+            .as_object()
+            .expect("tauri.linux.conf.json is an object");
         let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["productName"], "the Linux override changes nothing else");
+        assert_eq!(
+            keys,
+            ["productName"],
+            "the Linux override changes nothing else"
+        );
         assert_eq!(obj["productName"], LINUX_PRODUCT_NAME);
         assert_eq!(format!("{LINUX_PRODUCT_NAME}.desktop"), LAUNCHER_FILE_NAME);
     }
@@ -279,11 +311,18 @@ mod t12 {
         // A Windows override of productName to "atlas-duck" could move the per-user NSIS dir
         // (%LOCALAPPDATA%\Programs\<productName> for installMode both, %LOCALAPPDATA%\<productName>
         // for single-mode currentUser) onto the data dir %LOCALAPPDATA%\atlas-duck.
-        for name in ["tauri.windows.conf.json", "tauri.windows.conf.json5", "Tauri.windows.toml"] {
+        for name in [
+            "tauri.windows.conf.json",
+            "tauri.windows.conf.json5",
+            "Tauri.windows.toml",
+        ] {
             assert!(!src_tauri().join(name).exists(), "{name} must not exist");
         }
         let product = string_at(&conf(), "/productName");
-        assert!(!product.eq_ignore_ascii_case("atlas-duck"), "base productName is {product}");
+        assert!(
+            !product.eq_ignore_ascii_case("atlas-duck"),
+            "base productName is {product}"
+        );
         assert_eq!(string_at(&conf(), "/mainBinaryName"), "atlas-duck-app");
     }
 
@@ -297,14 +336,20 @@ mod t12 {
             "icons/icon.icns",
             "icons/icon.ico",
         ] {
-            assert!(icons.iter().any(|i| i == required), "bundle.icon lacks {required}");
+            assert!(
+                icons.iter().any(|i| i == required),
+                "bundle.icon lacks {required}"
+            );
         }
         for icon in &icons {
             let bytes = read_bytes(icon);
             if icon.ends_with(".png") {
-                let (w, h) = png_dimensions(&bytes)
-                    .unwrap_or_else(|| panic!("{icon} is not a PNG"));
-                assert_eq!(w, h, "{icon} is {w}x{h}; the AppImage bundler needs square icons");
+                let (w, h) =
+                    png_dimensions(&bytes).unwrap_or_else(|| panic!("{icon} is not a PNG"));
+                assert_eq!(
+                    w, h,
+                    "{icon} is {w}x{h}; the AppImage bundler needs square icons"
+                );
             } else if icon.ends_with(".icns") {
                 assert_eq!(&bytes[..4], b"icns", "{icon} is not an icns file");
             } else if icon.ends_with(".ico") {
