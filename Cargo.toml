@@ -11,7 +11,7 @@ members = [
     "crates/sandbox-host",
     "crates/sandbox-worker",
     "crates/cli",
-    # "app/src-tauri",  # package atlas-duck-app, enabled by Task 4
+    "app/src-tauri",
 ]
 
 [workspace.package]
