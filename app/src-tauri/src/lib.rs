@@ -5,6 +5,8 @@ pub mod diag;
 pub mod early_argv;
 pub mod startup;
 pub mod state;
+pub mod tray;
+pub mod tray_host;
 
 use tauri::Manager;
 
@@ -22,11 +24,27 @@ pub fn run_gui(background: bool) -> ! {
     // M6 decides what a cold start without `--background` opens; M1 opens no window.
     let _ = background;
 
-    let app = match tauri::Builder::default()
+    // single-instance first (research A0/F18), then autostart; the dialog plugin after them.
+    let app = match tray::register_plugins(tauri::Builder::default())
         // The dialog plugin serves Rust-side error dialogs only. The capability set is
         // empty (§10.3), so no webview can call its commands.
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
+            // macOS menu-bar app, no Dock icon (§2.5).
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+            // CI-only autostart probe (§15 V14), before the startup gate so it needs no pinned
+            // paths file. Linux and CI=true only; `ci/appimage-smoke.sh` is the caller.
+            #[cfg(target_os = "linux")]
+            {
+                let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+                let ci = std::env::var_os("CI");
+                if tray::autostart_probe_requested(&argv, ci.as_deref()) {
+                    std::process::exit(tray::run_autostart_probe(app.handle()));
+                }
+            }
+
             // After tauri-plugin-single-instance had its chance to forward a same-host
             // relaunch (T11 registers it before this plugin): only a launch that was not
             // forwarded reaches the lock.
@@ -44,12 +62,25 @@ pub fn run_gui(background: bool) -> ! {
                 }
                 return Ok(());
             }
+            // The tray text, taken before the `Ready` arm below moves the state.
+            let tray_status = tray::tray_status_text(&state);
+
+            // Linux tray-host check (bounded by TRAY_HOST_TIMEOUT); the allowlist must know the
+            // field before the line is written.
+            diag.extend_allowed_fields(tray::LOG_FIELDS);
+            let tray_host = tray_host::check_tray_host();
+            tray_host::log_tray_host(tray_host);
+
             if let Some(summary) = state.summary() {
-                app.manage(AppState { startup: summary });
+                app.manage(AppState::new(summary, tray_host));
             }
             if let StartupState::Ready { data, lock } = state {
                 app.manage(DataDirHold::new(data, lock));
             }
+
+            // The tray is built in every startup state; in the four error states it also shows
+            // the startup message (§7.7). A failure is logged and startup continues (§15 V33).
+            tray::build_tray_or_log(app.handle(), tray_status.as_deref());
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -61,6 +92,8 @@ pub fn run_gui(background: bool) -> ! {
             std::process::exit(1);
         }
     };
-    app.run(|_handle, _event| {});
+    // An exit request without a code (last window closed, OS) is prevented; Quit calls
+    // `app.exit(0)`, which carries a code and is honoured.
+    app.run(tray::on_run_event);
     std::process::exit(0)
 }

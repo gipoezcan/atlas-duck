@@ -101,6 +101,60 @@ jobs:
           # T09: the only job allowed to write the WER registry values (no-op off Windows).
           ATLAS_DUCK_RUN_WER_TEST: "1"
 
+      - name: Tray smoke (--background stays up 10 s; startup_state=ready; Linux tray_host=missing) (§2.5, §15 V33)
+        run: |
+          set -euo pipefail
+          cargo build -p atlas-duck-app --bin atlas-duck-app --locked
+          if [ "$RUNNER_OS" = Windows ]; then
+            exe="target/debug/atlas-duck-app.exe"
+            data_dir="$(pwsh -NoProfile -File ci/pinned-fixture.ps1 | tr -d '\r')"
+            log="$(cygpath -u "$data_dir")/logs/diag.log"
+          else
+            exe="target/debug/atlas-duck-app"
+            data_dir="$(bash ci/pinned-fixture.sh)"
+            log="$data_dir/logs/diag.log"
+          fi
+          echo "data dir: $data_dir"
+          if [ "$RUNNER_OS" = Linux ]; then
+            # A fresh session bus that has no org.kde.StatusNotifierWatcher owner.
+            xvfb-run -a dbus-run-session -- "$exe" --background &
+          else
+            "$exe" --background &
+          fi
+          pid=$!
+          cleanup() {
+            kill "$pid" 2>/dev/null || true
+            if [ "$RUNNER_OS" = Windows ]; then
+              taskkill //F //IM atlas-duck-app.exe >/dev/null 2>&1 || true
+            else
+              pkill -x atlas-duck-app || true
+            fi
+          }
+          trap cleanup EXIT
+          sleep 10
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "::error::atlas-duck-app --background exited within 10 s"
+            cat "$log" 2>/dev/null || true
+            exit 1
+          fi
+          # The log file is written as lines arrive; allow a few seconds for the first flush.
+          for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if [ -f "$log" ] && grep -q 'startup_state=ready' "$log"; then break; fi
+            sleep 1
+          done
+          echo "--- $log"
+          cat "$log" || true
+          grep -q 'startup_state=ready' "$log" || { echo "::error::no startup_state=ready in the log"; exit 1; }
+          if [ "$RUNNER_OS" = Linux ]; then
+            grep -q 'tray_host=missing' "$log" || { echo "::error::no tray_host=missing in the log"; exit 1; }
+          else
+            if grep -q 'tray_host=' "$log"; then echo "::error::tray_host must not be logged off Linux"; exit 1; fi
+          fi
+          if grep -q 'tray_build_failed' "$log"; then
+            echo "::warning::tray creation failed on this runner (startup continued); record it in docs/m1/go-no-go.md (V33)"
+          fi
+          kill -0 "$pid" 2>/dev/null || { echo "::error::app died while the log was being checked"; exit 1; }
+
       - name: Record host name sources and pinned-file base folders (§15 V28)
         run: |
           cargo test -p atlas-duck-ipc --locked --test paths -- --exact --nocapture host_name_is_the_sanitized_raw_name
