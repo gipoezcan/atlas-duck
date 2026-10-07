@@ -36,6 +36,7 @@ tauri = { workspace = true }
 atlas-duck-cli = { path = "../../crates/cli" }
 atlas-duck-sandbox-worker = { path = "../../crates/sandbox-worker" }
 atlas-duck-ipc = { path = "../../crates/ipc" }
+atlas-duck-sandbox-host = { path = "../../crates/sandbox-host" }
 atlas-duck-audit = { path = "../../crates/audit" }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }

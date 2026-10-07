@@ -214,6 +214,7 @@ dependencies = [
  "atlas-duck-audit",
  "atlas-duck-cli",
  "atlas-duck-ipc",
+ "atlas-duck-sandbox-host",
  "atlas-duck-sandbox-worker",
  "filetime",
  "libc",
@@ -300,6 +301,9 @@ name = "atlas-duck-sandbox-host"
 version = "0.1.0"
 dependencies = [
  "atlas-duck-ipc",
+ "serde",
+ "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
