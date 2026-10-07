@@ -5,7 +5,7 @@
 //! The worker is `CARGO_BIN_EXE_atlas-duck-sandbox`, or the binary named by
 //! `ATLAS_DUCK_SANDBOX_BIN` (T21 points it at an installed package).
 //! Run with `-- --nocapture`: the `META`, `PROBE`, `TASKFORPID_CONTROL`,
-//! `FLOOR_SCOPE` and `V10` lines are the evidence T22 copies into the go/no-go
+//! `FLOOR`, `FLOOR_INCONCLUSIVE`, `FLOOR_SCOPE` and `V10` lines are the evidence T22 copies into the go/no-go
 //! record.
 //!
 //! `task_for_pid` is only informative when an unconfined process can obtain the
@@ -180,7 +180,7 @@ fn report() -> &'static ProbeReport {
                 r.probe, r.outcome, r.evidence
             );
         }
-        println!("FLOOR {:?}", report.floor);
+        println!("FLOOR_RAW {:?}", report.floor);
         println!("{report:#?}");
         report
     })
@@ -397,6 +397,17 @@ fn floor_probes_are_blocked_under_the_seatbelt_profile() {
     // seatbelt (the unconfined control is refused too), so this test accepts
     // `NotMet { failed: [TaskForPid] }` there and only there. T21 asserts
     // Blocked with the hardened bundled app as the target.
+    // `FLOOR <verdict>` is printed here, next to the control result, so that a
+    // bare `FLOOR Met` never appears without `task_for_pid_informative=`.
+    println!(
+        "FLOOR {:?} task_for_pid_informative={informative}",
+        report.floor
+    );
+    if !informative {
+        println!(
+            "FLOOR_INCONCLUSIVE TaskForPid unconfined_kr={control_kr}: the unconfined control is refused too, so no evidence for the task-port probe (T21 asserts it with the hardened app)"
+        );
+    }
     println!(
         "FLOOR_SCOPE seatbelt_probes=5 task_for_pid_informative={informative} watchdog=M8 (macOS floor Met here means the seatbelt only; the memory watchdog is not wired yet)"
     );

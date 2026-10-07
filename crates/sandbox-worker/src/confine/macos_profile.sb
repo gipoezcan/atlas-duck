@@ -12,8 +12,10 @@
 ; those descriptors are not mediated by this profile.
 ;
 ; Add an allow rule below this line only when a failing probe proves that the
-; running worker needs it (brief step 16). Put a comment directly above the
+; running worker needs it. Put a comment directly above the
 ; rule that names the caller and the evidence. No rule is allowed yet: every
 ; operation the worker performs after init is a read or write on an already
-; open descriptor, a memory operation, or a computation.
+; open descriptor, a memory operation, or a computation. That is an
+; expectation, not a result: the profile's first real execution is the CI run
+; of the macOS probe jobs.
 (deny default)
