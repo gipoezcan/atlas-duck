@@ -56,6 +56,20 @@ pub fn result(
     }
 }
 
+/// Linux: names on stderr the forbidden syscall that the next statement
+/// attempts. Under the seccomp default-kill filter the attempt ends the worker
+/// with SIGSYS and no result frame, and the host scores that as `Blocked`. A
+/// worker that dies earlier, because the allowlist lacks a syscall that the
+/// start-up or the probe code needs, would look the same; the host-side test
+/// therefore requires this line in the worker's stderr head next to the SIGSYS
+/// (preflight C7). `write` to fd 2 is on the allowlist, and the line only
+/// names a syscall: no path, address or value.
+#[cfg(target_os = "linux")]
+pub(crate) fn announce_attempt(syscall: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(format!("probe-attempt: {syscall}\n").as_bytes());
+}
+
 /// The raw OS error code of an I/O error as the wire type.
 pub fn os_code(e: &io::Error) -> Option<i64> {
     e.raw_os_error().map(i64::from)
@@ -184,6 +198,8 @@ fn connect(probe: ProbeId, addr: &str) -> ProbeResultMsg {
     let Ok(sock) = addr.parse::<SocketAddr>() else {
         return result(probe, ProbeOutcome::Error, None, "invalid probe address");
     };
+    #[cfg(target_os = "linux")]
+    announce_attempt("socket");
     match TcpStream::connect_timeout(&sock, CONNECT_DEADLINE) {
         Ok(_) => result(probe, ProbeOutcome::Allowed, None, "connected"),
         Err(e) => {

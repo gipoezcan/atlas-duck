@@ -52,6 +52,8 @@ pub fn classify_connect(errno: i64) -> ProbeOutcome {
 /// `clone`/`execve` kills the worker with SIGSYS (scored by the host).
 pub fn spawn_process() -> ProbeResultMsg {
     let probe = ProbeId::SpawnProcess;
+    #[cfg(target_os = "linux")]
+    super::announce_attempt("clone");
     match Command::new("/bin/sh").args(["-c", "exit 0"]).status() {
         Ok(status) if status.success() => {
             result(probe, ProbeOutcome::Allowed, None, "child process ran")

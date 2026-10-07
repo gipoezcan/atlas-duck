@@ -188,6 +188,133 @@ mod linux {
         assert_allowed(&run(ProbeId::MemReadProcMem, child.pid()));
     }
 
+    const TOPOLOGY_CHILD_ENV: &str = "ATLAS_DUCK_PROBE_TOPOLOGY_CHILD";
+    const TOPOLOGY_CHILD_TEST: &str =
+        "linux::mem_reads_of_the_parent_follow_yama_in_the_worker_topology";
+    /// `PR_SET_PTRACER` and its "any process" argument (`<sys/prctl.h>`).
+    const PR_SET_PTRACER: libc::c_int = 0x5961_6d61;
+    const PR_SET_PTRACER_ANY: libc::c_ulong = !0;
+
+    /// `kernel.yama.ptrace_scope`, or `None` without the Yama module.
+    fn ptrace_scope() -> Option<u32> {
+        std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Runs this test binary as a child that probes its PARENT (the real
+    /// topology: the worker's target is the app that spawned it, which is not
+    /// a descendant of the worker). Returns `(process_vm, proc_mem)` as
+    /// `(outcome, os_error)`.
+    fn parent_probes_from_a_child() -> [(ProbeOutcome, Option<i64>); 2] {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                TOPOLOGY_CHILD_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(TOPOLOGY_CHILD_ENV, "1")
+            .output()
+            .expect("run the child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("topology "))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no topology line in:
+{stdout}"
+                )
+            });
+        let cell = |name: &str| -> (ProbeOutcome, Option<i64>) {
+            let word = line
+                .split_whitespace()
+                .find_map(|w| w.strip_prefix(name))
+                .unwrap_or_else(|| panic!("no `{name}` in `{line}`"));
+            let (outcome, errno) = word.split_once('/').expect("outcome/errno");
+            let outcome = match outcome {
+                "Allowed" => ProbeOutcome::Allowed,
+                "Blocked" => ProbeOutcome::Blocked,
+                _ => ProbeOutcome::Error,
+            };
+            (outcome, errno.parse().ok())
+        };
+        [cell("vm="), cell("mem=")]
+    }
+
+    /// Control with the real topology (preflight carry-forward): the probes
+    /// read the PARENT, as the confined worker reads the app. Under Yama
+    /// `ptrace_scope = 1` the unconfined child is refused (EPERM/EACCES) until
+    /// the parent declares it with `PR_SET_PTRACER`, so a `Blocked` of the two
+    /// memory probes proves the sandbox only where this control is `Allowed`.
+    /// The real app is non-dumpable on top of that (§2.5): the confined host
+    /// test therefore reads the SIGSYS death at `process_vm_readv` and the
+    /// `probe-attempt` line, not the errno.
+    #[test]
+    fn mem_reads_of_the_parent_follow_yama_in_the_worker_topology() {
+        if std::env::var_os(TOPOLOGY_CHILD_ENV).is_some() {
+            // SAFETY: getppid takes no arguments.
+            let parent = unsafe { libc::getppid() } as u32;
+            let vm = run(ProbeId::MemReadProcessVm, parent);
+            let mem = run(ProbeId::MemReadProcMem, parent);
+            println!(
+                "
+topology vm={:?}/{} mem={:?}/{}",
+                vm.outcome,
+                vm.os_error.map_or("none".to_owned(), |e| e.to_string()),
+                mem.outcome,
+                mem.os_error.map_or("none".to_owned(), |e| e.to_string()),
+            );
+            return;
+        }
+        let scope = ptrace_scope();
+        eprintln!("yama ptrace_scope = {scope:?}");
+
+        // Without a declared tracer: Allowed where Yama is absent or 0,
+        // refused with a denial code where it is 1 or higher.
+        for (name, (outcome, errno)) in ["process_vm", "proc_mem"]
+            .into_iter()
+            .zip(parent_probes_from_a_child())
+        {
+            match scope {
+                None | Some(0) => assert_eq!(outcome, ProbeOutcome::Allowed, "{name}"),
+                Some(_) => {
+                    assert_eq!(outcome, ProbeOutcome::Blocked, "{name}: Yama refuses");
+                    assert!(
+                        [libc::EPERM, libc::EACCES]
+                            .iter()
+                            .any(|e| errno == Some(i64::from(*e))),
+                        "{name}: {errno:?}"
+                    );
+                }
+            }
+        }
+
+        // With the parent naming any process as its tracer, scope 1 allows the
+        // read. Scope 2 (admin only) and 3 (no attach) cannot be lifted by the
+        // parent: the control does not exist there, say so instead of passing.
+        if matches!(scope, Some(2..)) {
+            eprintln!("SKIP the Allowed control: ptrace_scope {scope:?} cannot be lifted");
+            return;
+        }
+        // SAFETY: prctl(PR_SET_PTRACER, pid) takes no pointers. A failure
+        // (kernel without Yama) is fine: the control then holds without it.
+        unsafe { libc::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) };
+        for (name, (outcome, errno)) in ["process_vm", "proc_mem"]
+            .into_iter()
+            .zip(parent_probes_from_a_child())
+        {
+            assert_eq!(
+                outcome,
+                ProbeOutcome::Allowed,
+                "{name} of the parent, unconfined, tracer declared (errno {errno:?})"
+            );
+        }
+    }
+
     #[test]
     fn process_vm_readv_of_a_missing_process_is_an_error_not_blocked() {
         // The first PID above `pid_max` (2^22 on 64-bit Linux) cannot exist.

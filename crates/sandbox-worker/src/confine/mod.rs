@@ -1,7 +1,13 @@
-//! OS confinement of the worker (§9.4). T14 only fixes the entry point; the
-//! per-OS bodies arrive in T17 (Linux), T18 (macOS) and T19 (Windows).
+//! OS confinement of the worker (§9.4). `apply` is called by `run()` on the
+//! worker's main thread before the first stdin read. T17 fills Linux; T18
+//! (macOS) and T19 (Windows) add their arms.
 
 use atlas_duck_ipc::sandbox::probe::ConfinementReport;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub mod seccomp_allowlist;
 
 /// Why confinement could not be applied. The worker still answers
 /// `probe.ready`, with `applied: false`, so the host scores the floor as not met.
@@ -39,7 +45,19 @@ pub fn unconfined() -> ConfinementReport {
 }
 
 /// Applies the OS confinement to the calling (main, single) thread, before the
-/// first stdin read. T14: applies nothing on any OS.
+/// first stdin read.
+///
+/// Linux (T17): `tzset`, `PR_SET_NO_NEW_PRIVS`, Landlock, seccomp. A failed step
+/// comes back as `Ok` with `applied: false` and the partial evidence in the
+/// report, so the worker still sends `probe.ready`. macOS (T18) and Windows
+/// (T19) still apply nothing.
 pub fn apply() -> Result<ConfinementReport, ConfineError> {
-    Ok(unconfined())
+    #[cfg(target_os = "linux")]
+    {
+        Ok(linux::apply())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(unconfined())
+    }
 }

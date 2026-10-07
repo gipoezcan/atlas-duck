@@ -310,3 +310,367 @@ fn platform_spawner_is_the_linux_spawner() {
     assert_eq!(method, M_PROBE_READY);
     // Dropping the box kills and reaps the worker.
 }
+
+// ---------------------------------------------------------------- T17
+//
+// The §9.4 Linux confinement of the real worker, observed through the T15
+// probe runner and the T16 spawner. The module has its own imports and
+// helpers so that it does not touch the tests above.
+//
+// CI: the `rust` job leg `ubuntu-22.04` runs these in the step "Linux
+// confinement probes (T17, §9.4)" (`--nocapture` prints the probe table and
+// the Landlock ABI). The step "Fedora 40 probes (glibc 2.39, §15 V11)" runs
+// the same test executable inside `fedora:40` through
+// `ATLAS_DUCK_SANDBOX_BIN`.
+
+mod confinement {
+    use std::path::PathBuf;
+    use std::sync::{Once, OnceLock};
+    use std::time::Duration;
+
+    use atlas_duck_app_lib::startup::crash::set_non_dumpable;
+    use atlas_duck_ipc::sandbox::WORKER_FRAME_MAX_BYTES;
+    use atlas_duck_ipc::sandbox::frame::write_frame;
+    use atlas_duck_ipc::sandbox::probe::{
+        LOOPBACK_PROBE_ADDR, M_PROBE_READY, M_PROBE_RUN, PUBLIC_PROBE_ADDR, ProbeId, ProbeOutcome,
+        ProbeReady, ProbeRequest, decode_notification, encode_notification,
+    };
+    use atlas_duck_sandbox_host::linux::{LinuxSpawner, ProcTaskStatusHook};
+    use atlas_duck_sandbox_host::probe::{
+        Evidence, FloorVerdict, ProbeConfig, ProbeReport, run_probes,
+    };
+    use atlas_duck_sandbox_host::spawn::{
+        DEFAULT_PROCESS_MB, ExitKind, SpawnHook, SpawnSpec, WorkerProcess, WorkerSpawner,
+    };
+
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn worker() -> PathBuf {
+        std::env::var_os("ATLAS_DUCK_SANDBOX_BIN").map_or_else(
+            || PathBuf::from(env!("CARGO_BIN_EXE_atlas-duck-sandbox")),
+            PathBuf::from,
+        )
+    }
+
+    /// The test process plays "the app": non-dumpable, like a GUI launch (§2.5).
+    fn act_as_the_app() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| set_non_dumpable().expect("PR_SET_DUMPABLE 0"));
+    }
+
+    fn home() -> PathBuf {
+        PathBuf::from(std::env::var_os("HOME").expect("HOME is set"))
+    }
+
+    /// One full probe run, shared by the tests of this module.
+    fn report() -> &'static ProbeReport {
+        static REPORT: OnceLock<ProbeReport> = OnceLock::new();
+        REPORT.get_or_init(|| {
+            act_as_the_app();
+            let spawner = LinuxSpawner::start().expect("start the spawner thread");
+            let cfg = ProbeConfig::new(worker(), std::process::id(), home());
+            run_probes(&spawner, Some(&ProcTaskStatusHook), &cfg)
+        })
+    }
+
+    /// `Seccomp_filters:` of `/proc/<pid>/status`, when the kernel has the line.
+    fn seccomp_filters(pid: &str) -> Option<u32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Seccomp_filters:"))
+            .and_then(|rest| rest.trim().parse().ok())
+    }
+
+    fn record(probe: ProbeId) -> (ProbeOutcome, Evidence) {
+        let r = report()
+            .records
+            .iter()
+            .find(|r| r.probe == probe)
+            .unwrap_or_else(|| panic!("no record for {probe:?}"));
+        (r.outcome, r.evidence)
+    }
+
+    fn reported(os_error: i64) -> Evidence {
+        Evidence::Reported {
+            os_error: Some(os_error),
+        }
+    }
+
+    #[test]
+    fn control_the_profile_directory_the_probe_targets_is_readable_unconfined() {
+        // Without this, a Blocked FileInProfile could be a typo in the path.
+        std::fs::read_dir(home()).expect("the test process can read HOME");
+    }
+
+    #[test]
+    fn every_linux_floor_probe_is_blocked_and_the_floor_is_met() {
+        let report = report();
+        println!("{:#?}", report.records);
+        let eacces = i64::from(libc::EACCES);
+        let enosys = i64::from(libc::ENOSYS);
+        let expected = [
+            (ProbeId::FileInProfile, reported(eacces)),
+            (ProbeId::ConnectLoopback, Evidence::KilledBySigsys),
+            (ProbeId::ConnectPublic, Evidence::KilledBySigsys),
+            (ProbeId::SpawnProcess, Evidence::KilledBySigsys),
+            (ProbeId::RawClone, Evidence::KilledBySigsys),
+            (ProbeId::Clone3, reported(enosys)),
+            (ProbeId::MemReadProcessVm, Evidence::KilledBySigsys),
+            (ProbeId::MemReadProcMem, reported(eacces)),
+        ];
+        // The expectation table is the T13 Linux floor list, nothing more.
+        let floor: Vec<ProbeId> = expected.iter().map(|(p, _)| *p).collect();
+        assert_eq!(floor, ProbeId::floor_probes_for_current_os());
+        for (probe, evidence) in expected {
+            assert_eq!(
+                record(probe),
+                (ProbeOutcome::Blocked, evidence),
+                "{probe:?}"
+            );
+        }
+        assert!(
+            matches!(report.floor, FloorVerdict::Met),
+            "floor not met: {report:#?}"
+        );
+    }
+
+    #[test]
+    fn the_worker_reports_applied_seccomp_and_no_new_privs() {
+        let conf = report().confinement.as_ref().expect("probe.ready was read");
+        assert!(conf.applied, "{conf:?}");
+        assert_eq!(conf.no_new_privs, Some(true));
+        assert_eq!(conf.seccomp, Some(true));
+        assert_eq!(conf.os_error, None);
+    }
+
+    #[test]
+    fn every_thread_of_the_worker_is_confined() {
+        act_as_the_app();
+        let spawner = LinuxSpawner::start().expect("start the spawner thread");
+        let spec = SpawnSpec {
+            exe: worker(),
+            process_mb: DEFAULT_PROCESS_MB,
+        };
+        let mut process = spawner.spawn(&spec).expect("spawn the worker");
+        let frame = process
+            .read_frame_timeout(WORKER_FRAME_MAX_BYTES, WAIT)
+            .expect("probe.ready")
+            .expect("worker closed stdout before probe.ready");
+        let (method, _) = decode_notification(&frame).expect("a notification");
+        assert_eq!(method, M_PROBE_READY);
+
+        let threads = ProcTaskStatusHook
+            .after_ready(process.pid())
+            .expect("/proc/<worker>/task is readable");
+        assert_eq!(threads.tasks, 1, "§9.3: the worker creates no thread");
+        assert!(threads.all_seccomp_2, "{threads:?}");
+        assert!(threads.all_no_new_privs_1, "{threads:?}");
+
+        // Inside a container Docker's own profile already gives every process
+        // `Seccomp: 2`, so the check above proves nothing there. The worker must
+        // carry more filters than this test process (Linux >= 5.9 prints the
+        // count as `Seccomp_filters`).
+        match (
+            seccomp_filters("self"),
+            seccomp_filters(&process.pid().to_string()),
+        ) {
+            (Some(own), Some(worker_filters)) => assert!(
+                worker_filters > own,
+                "worker has {worker_filters} seccomp filters, the test process {own}"
+            ),
+            _ => println!("Seccomp_filters is not in /proc/<pid>/status on this kernel"),
+        }
+
+        // The report of the whole probe run agrees.
+        let merged = report().threads.expect("the hook ran in every probe");
+        assert!(
+            merged.all_seccomp_2 && merged.all_no_new_privs_1,
+            "{merged:?}"
+        );
+    }
+
+    #[test]
+    fn engine_self_test_passes_under_the_filter_without_a_kill_v11() {
+        // §15 V11: the full JS self-test (local-time Date methods, toLocale*String
+        // with TZ=UTC0, Promise jobs, JSON, Map/Set, RegExp) runs under the
+        // filter and hits no KILL rule.
+        assert_eq!(
+            record(ProbeId::EngineSelfTest),
+            (ProbeOutcome::Allowed, reported_none()),
+        );
+    }
+
+    fn reported_none() -> Evidence {
+        Evidence::Reported { os_error: None }
+    }
+
+    #[test]
+    fn env_names_probe_still_answers_under_the_filter() {
+        assert_eq!(
+            record(ProbeId::EnvNames),
+            (ProbeOutcome::Allowed, reported_none())
+        );
+    }
+
+    #[test]
+    fn confined_worker_exits_zero_on_stdin_eof() {
+        // A clean exit runs Rust std's `rt::cleanup`; a missing allowlist entry
+        // would end the worker with SIGSYS here instead of exit code 0.
+        act_as_the_app();
+        let spawner = LinuxSpawner::start().expect("start the spawner thread");
+        let spec = SpawnSpec {
+            exe: worker(),
+            process_mb: DEFAULT_PROCESS_MB,
+        };
+        let mut process = spawner.spawn(&spec).expect("spawn the worker");
+        let frame = process
+            .read_frame_timeout(WORKER_FRAME_MAX_BYTES, WAIT)
+            .expect("probe.ready")
+            .expect("worker closed stdout before probe.ready");
+        let ready: ProbeReady =
+            serde_json::from_value(decode_notification(&frame).expect("a notification").1)
+                .expect("ProbeReady params");
+        assert!(ready.confinement.applied, "{:?}", ready.confinement);
+
+        process.close_stdin();
+        assert_eq!(
+            process.wait_timeout(Duration::from_secs(5)).expect("wait"),
+            Some(ExitKind::Code(0))
+        );
+    }
+
+    #[test]
+    fn landlock_is_an_extra_layer_that_never_changes_the_floor() {
+        let report = report();
+        let conf = report.confinement.as_ref().expect("probe.ready was read");
+        println!(
+            "landlock_abi={:?} mechanism={}",
+            conf.landlock_abi, conf.mechanism
+        );
+        match conf.landlock_abi {
+            Some(abi) => {
+                assert!(abi >= 1);
+                assert_eq!(conf.mechanism, "seccomp+landlock");
+            }
+            None => assert_eq!(conf.mechanism, "seccomp"),
+        }
+        assert_eq!(
+            report.extra_layers,
+            vec![("landlock".to_string(), conf.landlock_abi.is_some())]
+        );
+        // Either way the floor stands (it is asserted Met above); a missing
+        // Landlock must not be a reason for NotMet.
+        assert!(matches!(report.floor, FloorVerdict::Met), "{report:#?}");
+    }
+
+    /// The last line the worker wrote to stderr, once the drain thread has seen
+    /// the end of the pipe (the worker is dead by then).
+    fn last_stderr_line(process: &atlas_duck_sandbox_host::linux::LinuxProcess) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let head = String::from_utf8_lossy(&process.stderr_head()).into_owned();
+            let last = head.lines().last().unwrap_or_default().to_owned();
+            if last.starts_with("probe-attempt: ") || std::time::Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Preflight C7: a SIGSYS death scores `Blocked` for any floor probe, so a
+    /// syscall missing from the allowlist BEFORE the probe's forbidden call
+    /// would meet the floor for the wrong reason. The worker names the syscall
+    /// it is about to attempt as the last line of its stderr
+    /// (`announce_attempt` in the worker's `probe` module), and under the filter
+    /// the process dies by SIGSYS right after that line, without a result
+    /// frame. The line proves the death happened at the attempt and not in the
+    /// start-up or in the probe's set-up. It cannot tell which syscall the
+    /// kernel killed: between the line and the forbidden call std and glibc
+    /// make only allowed calls (`rt_sigprocmask`, `mmap`, `brk`) and
+    /// `clone3`, which the filter answers with `ENOSYS`.
+    #[test]
+    fn every_sigsys_death_happens_at_the_announced_attempt_not_before_it() {
+        act_as_the_app();
+        let spawner = LinuxSpawner::start().expect("start the spawner thread");
+        let spec = SpawnSpec {
+            exe: worker(),
+            process_mb: DEFAULT_PROCESS_MB,
+        };
+        let attempts = [
+            (ProbeId::ConnectLoopback, "socket"),
+            (ProbeId::ConnectPublic, "socket"),
+            (ProbeId::SpawnProcess, "clone"),
+            (ProbeId::RawClone, "clone"),
+            (ProbeId::MemReadProcessVm, "process_vm_readv"),
+        ];
+        for (probe, syscall) in attempts {
+            let mut process = spawner.spawn_process(&spec).expect("spawn the worker");
+            let frame = process
+                .read_frame_timeout(WORKER_FRAME_MAX_BYTES, WAIT)
+                .expect("probe.ready")
+                .expect("worker closed stdout before probe.ready");
+            let (method, params) = decode_notification(&frame).expect("a notification");
+            assert_eq!(method, M_PROBE_READY);
+            let ready: ProbeReady = serde_json::from_value(params).expect("ProbeReady params");
+            assert!(
+                ready.confinement.applied,
+                "{probe:?}: {:?}",
+                ready.confinement
+            );
+
+            let request = ProbeRequest {
+                probe,
+                app_pid: std::process::id(),
+                profile_path: home().to_string_lossy().into_owned(),
+                public_addr: PUBLIC_PROBE_ADDR.to_string(),
+                loopback_addr: LOOPBACK_PROBE_ADDR.to_string(),
+                handle_value: None,
+            };
+            write_frame(
+                &mut process.stdin(),
+                &encode_notification(M_PROBE_RUN, &request),
+            )
+            .expect("write probe.run");
+            process.close_stdin();
+
+            // No result frame: stdout reaches EOF when the worker dies.
+            let next = process
+                .read_frame_timeout(WORKER_FRAME_MAX_BYTES, WAIT)
+                .expect("read after probe.run");
+            assert_eq!(next, None, "{probe:?}: the worker answered");
+            assert_eq!(
+                process.wait_timeout(Duration::from_secs(5)).expect("wait"),
+                Some(ExitKind::Signal(31)),
+                "{probe:?}: not killed by SIGSYS"
+            );
+            assert_eq!(
+                last_stderr_line(&process),
+                format!("probe-attempt: {syscall}"),
+                "{probe:?}: the worker died before it reached the announced syscall"
+            );
+        }
+    }
+
+    #[test]
+    fn the_memory_probes_do_not_rest_on_the_errno_alone_because_of_yama() {
+        // The app is non-dumpable and Yama may refuse a non-descendant reader,
+        // so an unconfined worker would be refused here as well. The confined
+        // run therefore must not rely on the errno of `MemReadProcMem` alone:
+        // `ProcessVm` is a SIGSYS death at the announced `process_vm_readv`
+        // (test above), `FileInProfile` shows the seccomp `EACCES` on `open*`.
+        // The unconfined control with the worker's topology is
+        // `mem_reads_of_the_parent_follow_yama_in_the_worker_topology` in
+        // `crates/sandbox-worker/tests/probe_negative_control.rs`.
+        let scope = std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope").ok();
+        println!("yama ptrace_scope={:?}", scope.as_deref().map(str::trim));
+        assert_eq!(
+            record(ProbeId::MemReadProcessVm),
+            (ProbeOutcome::Blocked, Evidence::KilledBySigsys)
+        );
+        assert_eq!(
+            record(ProbeId::FileInProfile),
+            (ProbeOutcome::Blocked, reported(i64::from(libc::EACCES)))
+        );
+    }
+}

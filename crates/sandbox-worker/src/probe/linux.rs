@@ -63,6 +63,7 @@ fn reap(pid: libc::pid_t) {
 /// fork). The child does nothing but `_exit(0)`.
 pub fn raw_clone() -> ProbeResultMsg {
     let probe = ProbeId::RawClone;
+    super::announce_attempt("clone");
     // SAFETY: a fork-equivalent `clone` (flags = SIGCHLD, no shared memory, no
     // new stack). The child path below only calls the async-signal-safe `_exit`.
     let rc = unsafe {
@@ -114,6 +115,7 @@ struct CloneArgsV0 {
 /// `Clone3`: the `clone3` syscall as a fork. The child does nothing but `_exit(0)`.
 pub fn clone3() -> ProbeResultMsg {
     let probe = ProbeId::Clone3;
+    super::announce_attempt("clone3");
     let args = CloneArgsV0 {
         flags: 0,
         pidfd: 0,
@@ -152,8 +154,19 @@ pub fn clone3() -> ProbeResultMsg {
 
 /// `MemReadProcessVm`: `process_vm_readv` of one byte at
 /// [`UNMAPPED_REMOTE_ADDR`] in the app (`app_pid`).
+///
+/// Yama dependency: an `EPERM` here does not always come from the sandbox.
+/// With `kernel.yama.ptrace_scope >= 1` the kernel refuses a read of a process
+/// that is not a descendant of the reader unless the target declared the
+/// reader with `PR_SET_PTRACER`, and a non-dumpable app (§2.5) is refused as
+/// well. The worker's target is its parent, so on such a host the unconfined
+/// worker also scores `Blocked`. Under the real filter the evidence is the
+/// SIGSYS death at `process_vm_readv` (the host test requires the
+/// `probe-attempt` line next to it); `tests/probe_negative_control.rs` has the
+/// control with the parent/child topology.
 pub fn mem_read_process_vm(app_pid: u32) -> ProbeResultMsg {
     let probe = ProbeId::MemReadProcessVm;
+    super::announce_attempt("process_vm_readv");
     let mut buf = [0u8; 1];
     let local = libc::iovec {
         iov_base: buf.as_mut_ptr().cast::<c_void>(),
@@ -177,7 +190,9 @@ pub fn mem_read_process_vm(app_pid: u32) -> ProbeResultMsg {
     let errno = last_errno();
     let detail = match classify_process_vm(errno) {
         ProbeOutcome::Allowed => "process_vm_readv passed the access check",
-        ProbeOutcome::Blocked => "process_vm_readv refused",
+        ProbeOutcome::Blocked => {
+            "process_vm_readv refused (sandbox, Yama ptrace_scope or non-dumpable target)"
+        }
         ProbeOutcome::Error => "process_vm_readv failed unexpectedly",
     };
     result(probe, classify_process_vm(errno), Some(errno), detail)
@@ -185,7 +200,10 @@ pub fn mem_read_process_vm(app_pid: u32) -> ProbeResultMsg {
 
 /// `MemReadProcMem`: open `/proc/<app pid>/mem` for reading. The kernel does
 /// its ptrace access check at `open`, so a successful open already proves
-/// read access. Under seccomp `open*` returns `EACCES` first.
+/// read access. Under seccomp `open*` returns `EACCES` first. Like
+/// [`mem_read_process_vm`] this depends on Yama `ptrace_scope` and the app's
+/// dumpable flag: an `EACCES` can come from them instead of the filter, so the
+/// confined run reads it together with the `FileInProfile` denial.
 pub fn mem_read_proc_mem(app_pid: u32) -> ProbeResultMsg {
     let probe = ProbeId::MemReadProcMem;
     match std::fs::File::open(format!("/proc/{app_pid}/mem")) {
@@ -199,7 +217,12 @@ pub fn mem_read_proc_mem(app_pid: u32) -> ProbeResultMsg {
                     ProbeOutcome::Error
                 }
             });
-            result(probe, outcome, code, "/proc/<pid>/mem not opened")
+            result(
+                probe,
+                outcome,
+                code,
+                "/proc/<pid>/mem not opened (sandbox, Yama ptrace_scope or non-dumpable target)",
+            )
         }
     }
 }

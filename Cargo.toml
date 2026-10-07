@@ -35,6 +35,9 @@ tauri-plugin-single-instance = "=2.5.2"
 tauri-plugin-autostart = "=2.7.0"
 zbus = "=5.19.0"
 libc = "=0.2.190"
+landlock = "=0.4.7"
+seccompiler = "=0.5.0"
+syscalls = { version = "=0.8.1", default-features = false, features = ["x86_64", "aarch64"] }
 windows-sys = "=0.61.2"
 rquickjs = { version = "=0.14.0", default-features = false, features = ["macro"] }
 tempfile = "=3.27.0"

@@ -112,6 +112,49 @@ jobs:
           cargo test -p atlas-duck-sandbox-host --lib --locked -- linux::
           cargo test -p atlas-duck-app --test probes_linux --locked -- --nocapture
 
+      - name: Linux confinement probes (T17, §9.4)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-sandbox-worker --lib --locked -- confine::
+          cargo test -p atlas-duck-sandbox-worker --test confined_workload --locked
+          cargo test -p atlas-duck-sandbox-worker --test probe_negative_control --locked -- --nocapture mem_reads_of_the_parent
+          cargo test -p atlas-duck-app --test probes_linux --locked -- --nocapture confinement:: | tee "$RUNNER_TEMP/confinement.log"
+          {
+            echo '### Linux confinement probes (ubuntu-22.04)'
+            echo '```'
+            grep -E 'landlock_abi=|yama ptrace_scope|^test result' "$RUNNER_TEMP/confinement.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fedora 40 probes (glibc 2.39, §15 V11)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # The test executable of the app package links WebKitGTK; the
+          # container installs the Fedora packages (ci/fedora-probes.sh).
+          exe="$(cargo test -p atlas-duck-app --test probes_linux --no-run --locked --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "probes_linux" and .executable != null) | .executable' \
+            | tail -n 1)"
+          test -x "$exe"
+          dir="$RUNNER_TEMP/fedora-probe"
+          mkdir -p "$dir"
+          cp "$exe" "$dir/probes_linux"
+          cp target/debug/atlas-duck-sandbox "$dir/atlas-duck-sandbox"
+          cp ci/fedora-probes.sh "$dir/fedora-probes.sh"
+          log="$RUNNER_TEMP/fedora-probes.log"
+          set +e
+          docker run --rm -v "$dir:/probe:ro" fedora:40 bash /probe/fedora-probes.sh /probe 2>&1 | tee "$log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          {
+            echo '### Fedora 40 probes (glibc 2.39)'
+            echo '```'
+            grep -E '^== |landlock_abi=|^test result' "$log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
       - name: Tray smoke (--background stays up 10 s; startup_state=ready; Linux tray_host=missing) (§2.5, §15 V33)
         run: |
           set -euo pipefail
