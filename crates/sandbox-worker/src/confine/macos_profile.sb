@@ -1,0 +1,19 @@
+(version 1)
+
+; atlas-duck sandbox worker profile (spec 9.4, macOS).
+;
+; The worker applies this to itself with sandbox_init(profile, 0, &err) before
+; it reads its first request. That calling mode is deprecated and undocumented,
+; so the probes in app/src-tauri/tests/probes_macos.rs are the verification.
+;
+; Deny by default: no network, no file access after startup, no fork or exec,
+; no mach lookups (securityd, keychain, pasteboard) and no task ports. The
+; worker is already running with fd 0, 1 and 2 open, and reads and writes on
+; those descriptors are not mediated by this profile.
+;
+; Add an allow rule below this line only when a failing probe proves that the
+; running worker needs it (brief step 16). Put a comment directly above the
+; rule that names the caller and the evidence. No rule is allowed yet: every
+; operation the worker performs after init is a read or write on an already
+; open descriptor, a memory operation, or a computation.
+(deny default)

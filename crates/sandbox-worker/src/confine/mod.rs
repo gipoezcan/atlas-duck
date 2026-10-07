@@ -6,6 +6,7 @@ use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 
 #[cfg(target_os = "linux")]
 mod linux;
+pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod seccomp_allowlist;
 
@@ -49,14 +50,20 @@ pub fn unconfined() -> ConfinementReport {
 ///
 /// Linux (T17): `tzset`, `PR_SET_NO_NEW_PRIVS`, Landlock, seccomp. A failed step
 /// comes back as `Ok` with `applied: false` and the partial evidence in the
-/// report, so the worker still sends `probe.ready`. macOS (T18) and Windows
-/// (T19) still apply nothing.
+/// report, so the worker still sends `probe.ready`. macOS (T18): `tzset`, then
+/// `sandbox_init` with the embedded SBPL profile, with the same `Ok` /
+/// `applied: false` treatment of a refusal. Windows (T19) still applies nothing.
 pub fn apply() -> Result<ConfinementReport, ConfineError> {
     #[cfg(target_os = "linux")]
     {
         Ok(linux::apply())
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // §9.4 macOS: sandbox_init with the embedded SBPL profile.
+        Ok(macos::apply())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         Ok(unconfined())
     }

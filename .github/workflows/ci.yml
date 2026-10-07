@@ -95,6 +95,20 @@ jobs:
       - name: Clippy (-D warnings; unwrap_used/expect_used deny in core and atlassian)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: macOS seatbelt probes (§9.4, §15 V10), evidence for the go/no-go
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -m
+          cargo test -p atlas-duck-app --locked --test probes_macos -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/probes-macos.log"
+          {
+            echo "### macOS seatbelt probes (aarch64-apple-darwin)"
+            echo '```'
+            grep -E '^(META|CONFINEMENT|PROBE|FLOOR|FLOOR_SCOPE|HYGIENE|ENV_NAMES|ENGINE_SELFTEST|TASKFORPID_CONTROL|V10) |^TaskForPid ' "$RUNNER_TEMP/probes-macos.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Test
         run: cargo test --workspace --locked
         env:
@@ -241,6 +255,11 @@ jobs:
       - name: CI script tests
         run: node --test "ci/*.test.mjs"
 
+      - name: macOS sandbox denials from the unified log (diagnostics only)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          sudo log show --last 20m --style compact             --predicate 'eventMessage CONTAINS "deny(" AND (eventMessage CONTAINS "atlas-duck-sand" OR eventMessage CONTAINS "atlas_duck_sand" OR eventMessage CONTAINS "probes_macos")'             2>&1 | tail -n 200 || true
+
   rust-macos-x86_64-rosetta:
     name: rust (x86_64-apple-darwin under Rosetta)
     runs-on: macos-15
@@ -299,6 +318,23 @@ jobs:
           npm --prefix app/ui ci --ignore-scripts
           npm --prefix app/ui run build
 
+      - name: macOS seatbelt probes under Rosetta (§9.4, §15 V10, §15 V32)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          sw_vers
+          cargo test -p atlas-duck-app --locked --target x86_64-apple-darwin --test probes_macos -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/probes-rosetta.log"
+          file target/x86_64-apple-darwin/debug/atlas-duck-sandbox | tee "$RUNNER_TEMP/worker-file.txt"
+          grep -q 'x86_64' "$RUNNER_TEMP/worker-file.txt" || { echo "::error::the sandbox worker is not an x86_64 binary"; exit 1; }
+          grep -q '^META arch=x86_64 .* translated=1 ' "$RUNNER_TEMP/probes-rosetta.log" || { echo "::error::the probes did not run translated by Rosetta"; exit 1; }
+          {
+            echo "### macOS seatbelt probes (x86_64-apple-darwin under Rosetta)"
+            echo '```'
+            grep -E '^(META|CONFINEMENT|PROBE|FLOOR|FLOOR_SCOPE|HYGIENE|ENV_NAMES|ENGINE_SELFTEST|TASKFORPID_CONTROL|V10) |^TaskForPid ' "$RUNNER_TEMP/probes-rosetta.log" || true
+            echo '```'
+            echo "Comparison with a native Intel run (§15 V32): open, the spec gives no milestone."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Test x86_64-apple-darwin (test binaries run under Rosetta)
         run: cargo test --workspace --locked --target x86_64-apple-darwin
 
@@ -318,6 +354,11 @@ jobs:
             exit 1
           fi
           echo "x86_64 test executables: $(wc -l < "$RUNNER_TEMP/executables.txt")"
+
+      - name: macOS sandbox denials from the unified log (diagnostics only)
+        if: failure() && runner.os == 'macOS'
+        run: |
+          sudo log show --last 20m --style compact             --predicate 'eventMessage CONTAINS "deny(" AND (eventMessage CONTAINS "atlas-duck-sand" OR eventMessage CONTAINS "atlas_duck_sand" OR eventMessage CONTAINS "probes_macos")'             2>&1 | tail -n 200 || true
 
   locality-mounts:
     name: locality-mounts (${{ matrix.os }})
