@@ -187,6 +187,9 @@ struct Inner {
     /// Fault points of the startup steps (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
     hooks: Hooks,
+    /// `read_payload` calls (feature `testing`): header queries must never raise it.
+    #[cfg(any(test, feature = "testing"))]
+    payload_reads: std::sync::atomic::AtomicU64,
 }
 
 impl Inner {
@@ -337,6 +340,8 @@ impl Store {
                 free_space: cfg.free_space.unwrap_or_else(|| Arc::new(OsFreeSpace)),
                 #[cfg(any(test, feature = "testing"))]
                 hooks,
+                #[cfg(any(test, feature = "testing"))]
+                payload_reads: std::sync::atomic::AtomicU64::new(0),
             }),
         })
     }
@@ -403,6 +408,8 @@ impl Store {
     /// checked against `payload_sha256`. It does not check `record_hash`/`prev_hash`: chain
     /// verification is `full_verify`/startup (T09). After `shutdown()` it returns `Closed`.
     pub fn read_payload(&self, seq: u64) -> Result<Zeroizing<Vec<u8>>, AuditError> {
+        #[cfg(any(test, feature = "testing"))]
+        self.inner.payload_reads.fetch_add(1, Ordering::Relaxed);
         let sealed = self.read_sealed(seq)?;
         let decrypt = AuditError::Decrypt { seq };
         let cached = lock(&self.inner.shared.dek_cache)
@@ -433,6 +440,32 @@ impl Store {
             return Err(AuditError::PayloadHash { seq });
         }
         Ok(plain)
+    }
+
+    /// Runs `f` on the read-only connection (opened on first use) while holding the reader
+    /// lock; `Closed` after `shutdown()`. `f` must not call back into a `Store` read.
+    pub(crate) fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T, AuditError>,
+    ) -> Result<T, AuditError> {
+        let mut guard = lock(&self.inner.shared.reader);
+        if lock(&self.inner.tx).is_none() {
+            return Err(AuditError::Closed);
+        }
+        if guard.is_none() {
+            *guard = Some(
+                schema::open_ro(&self.inner.db_path).map_err(|e| AuditError::Io(e.to_string()))?,
+            );
+        }
+        let Some(conn) = guard.as_ref() else {
+            return Err(AuditError::Closed);
+        };
+        f(conn)
+    }
+
+    /// The store's wall clock (`recent_headers` window).
+    pub(crate) fn now_utc(&self) -> UtcInstant {
+        self.inner.clock.now_utc()
     }
 
     /// Copies what decryption needs out of the database; the reader lock is held only here,
@@ -1199,6 +1232,12 @@ impl Store {
     #[cfg(any(test, feature = "testing"))]
     pub fn testing_dek_cached(&self, key_id: u64) -> bool {
         lock(&self.inner.shared.dek_cache).contains_key(&key_id)
+    }
+
+    /// How many times `read_payload` ran on this store (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_payload_reads(&self) -> u64 {
+        self.inner.payload_reads.load(Ordering::Relaxed)
     }
 
     /// `observe_server_date` calls dropped on a full queue (feature `testing`).

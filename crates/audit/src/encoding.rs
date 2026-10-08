@@ -404,3 +404,50 @@ pub fn os_path_bytes(p: &std::path::Path) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
     p.as_os_str().as_bytes().to_vec()
 }
+
+/// Inverse of [`os_path_bytes`]: Windows reads the (generalized) WTF-8 back into UTF-16 units.
+#[cfg(windows)]
+pub fn os_path_from_bytes(b: &[u8]) -> Result<std::path::PathBuf, AuditError> {
+    use std::os::windows::ffi::OsStringExt;
+    let bad = || AuditError::Invalid("events path column is not WTF-8");
+    let mut units: Vec<u16> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let lead = b[i];
+        let (len, init) = match lead {
+            0x00..=0x7F => (1, u32::from(lead)),
+            0xC0..=0xDF => (2, u32::from(lead & 0x1F)),
+            0xE0..=0xEF => (3, u32::from(lead & 0x0F)),
+            0xF0..=0xF7 => (4, u32::from(lead & 0x07)),
+            _ => return Err(bad()),
+        };
+        let tail = b.get(i + 1..i + len).ok_or_else(bad)?;
+        let mut cp = init;
+        for c in tail {
+            if c & 0xC0 != 0x80 {
+                return Err(bad());
+            }
+            cp = (cp << 6) | u32::from(c & 0x3F);
+        }
+        let min = [0, 0, 0x80, 0x800, 0x10000][len];
+        if cp < min || cp > 0x10FFFF {
+            return Err(bad());
+        }
+        if cp >= 0x10000 {
+            let v = cp - 0x10000;
+            units.push(0xD800 + (v >> 10) as u16);
+            units.push(0xDC00 + (v & 0x3FF) as u16);
+        } else {
+            units.push(cp as u16);
+        }
+        i += len;
+    }
+    Ok(std::ffi::OsString::from_wide(&units).into())
+}
+
+/// Unix: the raw path bytes back.
+#[cfg(unix)]
+pub fn os_path_from_bytes(b: &[u8]) -> Result<std::path::PathBuf, AuditError> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b)))
+}

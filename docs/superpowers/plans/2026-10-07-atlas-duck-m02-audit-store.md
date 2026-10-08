@@ -1927,6 +1927,14 @@ pub struct ReconciledWrite { pub request_id: String, pub op_id: Option<String>, 
 
 Run: `cargo test -p atlas-duck-audit --test requests --locked` → all pass.
 
+**[T17 as built] (2026-10-08):**
+- `crates/audit/src/requests.rs` (re-exported at the crate root): `is_terminal`, `ScriptFailedFlags`, `ReconcileReport` (`Default`), `ReconciledWrite`, and on `Store` `headers_for_request`, `recent_headers`, `script_failed_flags`, `reconcile_after_crash`. `EventHeader` already existed in `types.rs`; header queries select the plaintext columns only (`peer_exe`/`peer_origin_exe` are read back with the new `encoding::os_path_from_bytes`, the WTF-8 inverse of `os_path_bytes`).
+- `recent_headers`: `ts_utc >= now - min(since, 24 h)` by text comparison (fixed-width UTC text), seq order; there is no `ts_utc` index, so it is a scan of `events` (a clock anomaly can put an old `ts_utc` on a later seq, so no early stop on seq).
+- `script_failed_flags(seq)` refuses a row that is not `SCRIPT_FAILED` (`Invalid`), opens exactly that row, and needs boolean `direct` and string `reason` at the payload's top level (`Invalid` otherwise).
+- `reconcile_after_crash`: one scan of `(request_id, seq, event_type)`; requests closed by a type-decided terminal event are dropped, `SCRIPT_FAILED` rows of the rest are opened (stopping at the first terminal one). A write outcome (`WRITE_EXECUTED|FAILED|OUTCOME_UNKNOWN`) only counts when it follows the latest `WRITE_APPROVED`; an older one does not end the request (fails closed to `WRITE_OUTCOME_UNKNOWN`). Reports and appends are ordered by each request's first record; one `append_batch`, unknowns first. `WRITE_OUTCOME_UNKNOWN` copies `op_id`, `op_class`, `instance_id`, `target` of the latest `WRITE_APPROVED`; `ABANDONED` payload is `{"reason":"crash"}`.
+- Fail closed: an unreadable/odd `SCRIPT_FAILED` or `WRITE_APPROVED` (`requests` not an array, `requests[0].index` not an integer) makes the call return `Err` and append nothing (`requests` absent or empty: index 0). M3 treats that like an integrity problem at startup.
+- Feature `testing`: `Store::testing_payload_reads()` counts `read_payload` calls.
+
 - [ ] **Step 3: Clippy, commit** (`feat(audit): terminal predicate, §11.3 crash reconciliation, header queries for core`).
 
 ---
