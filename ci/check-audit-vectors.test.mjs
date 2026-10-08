@@ -37,7 +37,10 @@ function flipHexAt(s, pos) {
 test("the committed vectors pass", () => {
   const res = run();
   assert.equal(res.status, 0, res.stdout + res.stderr);
-  assert.match(res.stderr, /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs\)$/m);
+  assert.match(
+    res.stderr,
+    /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout\)$/m,
+  );
   assert.deepEqual(checkVectors(load()), []);
 });
 
@@ -83,6 +86,23 @@ test("tampering with a column, the ciphertext or a hash is caught", () => {
     [(d) => (d.prune_rows[0].cutoff_epoch = "2026-01-09"), /prune_rows\[0\]: row_hash differs/],
     [(d) => (d.jcs[1].output = d.jcs[1].output.replace('"1":"One",', "")), /jcs\[1\]: output differs/],
     [(d) => (d.jcs = []), /jcs must be a non-empty array/],
+    // F.4: the AAD binds key_id and month (NULL ≠ "").
+    [(d) => (d.dek_wraps[1].key_id = 3), /dek_wraps\[1\]: .*(unsupported state|authenticate)/],
+    [(d) => (d.dek_wraps[1].month = "2026-11"), /dek_wraps\[1\]: .*(unsupported state|authenticate)/],
+    [(d) => (d.dek_wraps[0].month = ""), /dek_wraps\[0\]: .*(unsupported state|authenticate)/],
+    [(d) => (d.dek_wraps[2].dek = flipHexAt(d.dek_wraps[2].dek, 0)), /dek_wraps\[2\]: unwrapped DEK differs/],
+    [(d) => (d.dek_wraps[2].nonce = flipHexAt(d.dek_wraps[2].nonce, 0)), /dek_wraps\[2\]: nonce differs/],
+    [(d) => (d.dek_wraps = []), /dek_wraps must be a non-empty array/],
+    // F.7: trim and NFC are part of the tag; the prefix names the kind; the key is the KEK's.
+    [(d) => (d.query_tags[2].query = d.query_tags[2].query + "."), /query_tags\[2\]: tag differs/],
+    [(d) => (d.query_tags[0].kind = "cql"), /query_tags\[0\]: tag differs/],
+    [(d) => (d.query_tags[0].kek = d.query_tags[6].kek), /query_tags\[0\]: k_q differs/],
+    [(d) => (d.query_tags[4].tag = flipHexAt(d.query_tags[4].tag, 10)), /query_tags\[4\]: tag differs/],
+    // F.5 layout.
+    [(d) => (d.recovery.blob = "02" + d.recovery.blob.slice(2)), /recovery: layout byte must be 1/],
+    [(d) => (d.recovery.blob = d.recovery.blob.slice(0, 36) + "02" + d.recovery.blob.slice(38)), /recovery: argon2 parameters/],
+    [(d) => (d.recovery.blob = d.recovery.blob.slice(2)), /recovery: blob must be 89 bytes/],
+    [(d) => delete d.recovery, /recovery must be an object/],
   ];
   for (const [mutate, want] of cases) {
     const doc = load();

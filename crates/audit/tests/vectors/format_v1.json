@@ -1,4 +1,30 @@
 {
+  "dek_wraps": [
+    {
+      "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "key_id": 1,
+      "month": null,
+      "nonce": "b0b1b2b3b4b5b6b7b8b9babb",
+      "wrapped": "b0b1b2b3b4b5b6b7b8b9babbad9139e96ce2f5809baf91b6e21ec77114e06f192d292c59d3d231278d12bca48f9e50e55689c74cf2d9d1028b858cb7"
+    },
+    {
+      "dek": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "key_id": 2,
+      "month": "2026-10",
+      "nonce": "808182838485868788898a8b",
+      "wrapped": "808182838485868788898a8b85215f5ee69a9030393c8779a9e32ce7eb6a6be4ed21ba51aa3bbebe31883e394fa9eda92803af290dc0c9baaa708d7a"
+    },
+    {
+      "dek": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "key_id": 7,
+      "month": "2027-03",
+      "nonce": "d0d1d2d3d4d5d6d7d8d9dadb",
+      "wrapped": "d0d1d2d3d4d5d6d7d8d9dadb96f0928fa10f1c6d4178bcfbd4bd8624f5acd110f67260194ab1d7b6d5c2e2876c6acbb2e196928f2164c45d1a988d38"
+    }
+  ],
   "format_version": 1,
   "jcs": [
     {
@@ -51,6 +77,64 @@
       "row_hash": "f4e58bdbf491f2957e04e6139ad9f411346a8a5e0b84431879d28b4a140e4d34"
     }
   ],
+  "query_tags": [
+    {
+      "k_q": "ee10db62d323d502fcef9dd20038636be48d79a84d3adddb365615590f6d20a2",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "kind": "jql",
+      "query": "project = ABC",
+      "tag": "jql:84ccaade2f97e3fd52feacd949ad45a43efc82ff9f3cb1f4edd479d0d3c3a594"
+    },
+    {
+      "k_q": "ee10db62d323d502fcef9dd20038636be48d79a84d3adddb365615590f6d20a2",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "kind": "jql",
+      "query": "  project = ABC \n",
+      "tag": "jql:84ccaade2f97e3fd52feacd949ad45a43efc82ff9f3cb1f4edd479d0d3c3a594"
+    },
+    {
+      "k_q": "ee10db62d323d502fcef9dd20038636be48d79a84d3adddb365615590f6d20a2",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "kind": "jql",
+      "query": "assignee = \"Müller\" ORDER BY created DESC",
+      "tag": "jql:c007620acfb59762fcbf15886d75fbe2450c723b33b2a16b4018400aaeffbc18"
+    },
+    {
+      "k_q": "ee10db62d323d502fcef9dd20038636be48d79a84d3adddb365615590f6d20a2",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "kind": "jql",
+      "query": "\tassignee = \"Müller\" ORDER BY created DESC\r\n",
+      "tag": "jql:c007620acfb59762fcbf15886d75fbe2450c723b33b2a16b4018400aaeffbc18"
+    },
+    {
+      "k_q": "ee10db62d323d502fcef9dd20038636be48d79a84d3adddb365615590f6d20a2",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "kind": "cql",
+      "query": "space = DOC AND text ~ \"Grüße 😀\"",
+      "tag": "cql:3b7c690fed601e4a3cc9d878051428b3507090c1e0a0bdacdeec8d5b09795dfc"
+    },
+    {
+      "k_q": "ee10db62d323d502fcef9dd20038636be48d79a84d3adddb365615590f6d20a2",
+      "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+      "kind": "cql",
+      "query": " \n",
+      "tag": "cql:b5d55a438b5ba02a744f6df91e03e9e6cd41c0acb254716e298811d9fa29e35a"
+    },
+    {
+      "k_q": "3a7f30ba882ac8cd1ec54cd19021574f0f569aa0becec2ce3ee0e3a4e5127f0c",
+      "kek": "3c3d3e3f38393a3b34353637303132332c2d2e2f28292a2b2425262720212223",
+      "kind": "jql",
+      "query": "project = ABC",
+      "tag": "jql:be7d0484dabf3e99955ccdba6da4ba3bcda1d3696b1f4c178e3d4549f019af42"
+    }
+  ],
+  "recovery": {
+    "blob": "01303132333435363738393a3b3c3d3e3f000100000000000300000004505152535455565758595a5be71dd87dd21e834104ed7992a4ff74c4558caf84bc48a893b34a7540cc5f141842c17e577b362d74692e0f96a584b48a",
+    "kek": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "nonce": "505152535455565758595a5b",
+    "passphrase": "correct horse battery",
+    "salt": "303132333435363738393a3b3c3d3e3f"
+  },
   "request_sets": [
     {
       "hash": "3ed7fdcfa00463dfaaf6dcd8956064b42e0b31a641b4280e195c5820c0d8822f",

@@ -1,19 +1,25 @@
 //! Golden vectors for `FIELD_LIST[1]`, `record_hash`, AAD, the payload envelope, the request
-//! set hash, the prune-log row hash and JCS (§8.4, §13 "canonical-encoding golden vectors").
+//! set hash, the prune-log row hash and JCS (§8.4, §13 "canonical-encoding golden vectors"),
+//! plus DEK wrapping, the recovery blob and the query tag (§8.6, L38; plan F.4, F.5, F.7).
 //!
 //! `golden_vectors_match` rebuilds `tests/vectors/format_v1.json` from the inputs below and
 //! compares it with the committed file. With `ATLAS_DUCK_REGEN_VECTORS=1` it writes the file
 //! instead. The file is frozen after M2: a diff here is a format break, not a test update.
-//! `ci/check-audit-vectors.mjs` recomputes the same file independently with Node's crypto.
+//! `ci/check-audit-vectors.mjs` recomputes the same file independently with Node's crypto,
+//! except `recovery` (Node 22 has no Argon2), which only Rust checks.
 
-use aes_gcm::Aes256Gcm;
-use aes_gcm::aead::{Aead, KeyInit, Nonce, Payload};
+use atlas_duck_audit::crypto::{
+    self, Dek, Kek, query_key, query_tag, unwrap_dek, wrap_dek_with_nonce,
+};
 use atlas_duck_audit::encoding::{
     RowFields, ZERO_HASH, aad, canonical_bytes, prune_row_hash, record_hash,
 };
+use atlas_duck_audit::recovery::{open_recovery, seal_recovery_with};
 use atlas_duck_audit::request_set::requests_to_json;
+use atlas_duck_audit::types::QueryKind;
 use atlas_duck_audit::{RequestRecord, request_set_hash};
 use atlas_duck_ipc::jcs::to_jcs_vec;
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -303,16 +309,7 @@ fn build_row(
         prev_hash,
     };
     let aad_bytes = aad(&f).unwrap();
-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
-    let ct = cipher
-        .encrypt(
-            &Nonce::<Aes256Gcm>::from(n),
-            Payload {
-                msg: &z,
-                aad: &aad_bytes,
-            },
-        )
-        .unwrap();
+    let ct = crypto::seal(&Dek::from_bytes(&key), &n, &aad_bytes, &z).unwrap();
     f.payload_ct = &ct;
     let canonical = canonical_bytes(&f).unwrap();
     let rh = record_hash(1, prev_hash, &canonical);
@@ -442,6 +439,114 @@ const JCS_INPUTS: [&str; 5] = [
     r#"{"b":[true,false,null,{"y":"\u001f\"\\/\b\f\n\r\t","x":"\u2028\u007f"}],"a":{},"c":[]}"#,
 ];
 
+/// The fixed KEK of the `dek_wraps`, `recovery` and `query_tags` vectors.
+fn vector_kek_bytes(base: u8) -> [u8; 32] {
+    std::array::from_fn(|i| base ^ i as u8)
+}
+
+fn kek(bytes: &[u8; 32]) -> Kek {
+    let mut entry = vec![1u8];
+    entry.extend_from_slice(bytes);
+    Kek::from_entry_bytes(&entry).unwrap()
+}
+
+/// F.4: the three DEKs of `rows`, wrapped under the vector KEK with their key_id and month.
+fn dek_wraps() -> Value {
+    let kek_bytes = vector_kek_bytes(0xC0);
+    let entries = [(1u64, None), (2, Some("2026-10")), (7, Some("2027-03"))];
+    let out = entries
+        .iter()
+        .map(|&(key_id, month)| {
+            let n: [u8; 12] = std::array::from_fn(|i| 0xA0 ^ (key_id as u8) << 4 ^ i as u8);
+            let wrapped = wrap_dek_with_nonce(
+                &kek(&kek_bytes),
+                key_id,
+                month,
+                &Dek::from_bytes(&dek(key_id)),
+                &n,
+            )
+            .unwrap();
+            json!({
+                "kek": hex::encode(kek_bytes),
+                "key_id": key_id,
+                "month": month,
+                "dek": hex::encode(dek(key_id)),
+                "nonce": hex::encode(n),
+                "wrapped": hex::encode(wrapped),
+            })
+        })
+        .collect();
+    Value::Array(out)
+}
+
+const RECOVERY_PASSPHRASE: &str = "correct horse battery";
+
+/// F.5, Rust-only (Node 22 has no Argon2): Argon2id at the real layout-1 parameters.
+fn recovery_vector() -> Value {
+    let kek_bytes = vector_kek_bytes(0xC0);
+    let salt: [u8; 16] = std::array::from_fn(|i| 0x30 + i as u8);
+    let n: [u8; 12] = std::array::from_fn(|i| 0x50 + i as u8);
+    let blob = seal_recovery_with(
+        &SecretString::from(RECOVERY_PASSPHRASE),
+        &kek(&kek_bytes),
+        &salt,
+        &n,
+    )
+    .unwrap();
+    json!({
+        "passphrase": RECOVERY_PASSPHRASE,
+        "salt": hex::encode(salt),
+        "nonce": hex::encode(n),
+        "kek": hex::encode(kek_bytes),
+        "blob": hex::encode(blob),
+    })
+}
+
+/// F.7 inputs: (KEK base, kind, query). Queries are surrounded only by ASCII spaces, tabs and
+/// newlines: JavaScript's `trim()` also strips U+FEFF, Rust's `str::trim` does not, so a
+/// U+FEFF here would make the Node checker disagree for a reason outside the format.
+/// Entries 0/1 and 2/3 must give the same tag (trim; NFC of a decomposed `Müller`).
+const QUERY_TAG_INPUTS: [(u8, QueryKind, &str); 7] = [
+    (0xC0, QueryKind::Jql, "project = ABC"),
+    (0xC0, QueryKind::Jql, "  project = ABC \n"),
+    (
+        0xC0,
+        QueryKind::Jql,
+        "assignee = \"M\u{FC}ller\" ORDER BY created DESC",
+    ),
+    (
+        0xC0,
+        QueryKind::Jql,
+        "\tassignee = \"Mu\u{308}ller\" ORDER BY created DESC\r\n",
+    ),
+    (
+        0xC0,
+        QueryKind::Cql,
+        "space = DOC AND text ~ \"Grüße \u{1F600}\"",
+    ),
+    (0xC0, QueryKind::Cql, " \n"),
+    // Another KEK: another tag for the same query.
+    (0x3C, QueryKind::Jql, "project = ABC"),
+];
+
+fn query_tags() -> Value {
+    let out = QUERY_TAG_INPUTS
+        .iter()
+        .map(|&(base, kind, query)| {
+            let kek_bytes = vector_kek_bytes(base);
+            let k_q = query_key(&kek(&kek_bytes));
+            json!({
+                "kek": hex::encode(kek_bytes),
+                "k_q": hex::encode(*k_q),
+                "kind": match kind { QueryKind::Jql => "jql", QueryKind::Cql => "cql" },
+                "query": query,
+                "tag": query_tag(&k_q, kind, query),
+            })
+        })
+        .collect();
+    Value::Array(out)
+}
+
 fn build(compressed: &dyn Fn(&str, &[u8]) -> Vec<u8>) -> Value {
     let mut prev = ZERO_HASH;
     let mut rows = Vec::new();
@@ -482,11 +587,14 @@ fn build(compressed: &dyn Fn(&str, &[u8]) -> Vec<u8>) -> Value {
         "request_sets": sets,
         "prune_rows": prune_rows(),
         "jcs": jcs,
+        "dek_wraps": dek_wraps(),
+        "recovery": recovery_vector(),
+        "query_tags": query_tags(),
     })
 }
 
 fn zstd3(plain: &[u8]) -> Vec<u8> {
-    zstd::bulk::compress(plain, 3).unwrap()
+    crypto::compress(plain).unwrap()
 }
 
 fn regen() -> bool {
@@ -602,4 +710,95 @@ fn vectors_cover_the_brief() {
     assert_eq!(rows[2]["fields"]["decision"], "approve_edited");
     let p = rows[3]["plaintext_jcs"].as_str().unwrap();
     assert!(p.find('\u{1F600}').unwrap() < p.find('\u{FB33}').unwrap());
+}
+
+/// T02 froze the row ciphertexts before `crypto` existed; the store's own envelope functions
+/// must reproduce them from the vector inputs (F.3).
+#[test]
+fn crypto_reproduces_row_envelopes() {
+    if regen() {
+        return;
+    }
+    let file = load();
+    for row in file["rows"].as_array().unwrap() {
+        let name = row["name"].as_str().unwrap();
+        let hexf = |v: &Value| hex::decode(v.as_str().unwrap()).unwrap();
+        let plain = row["plaintext_jcs"].as_str().unwrap().as_bytes();
+        let compressed = hexf(&row["compressed"]);
+        let key: [u8; 32] = hexf(&row["dek"]).try_into().unwrap();
+        let n: [u8; 12] = hexf(&row["fields"]["nonce"]).try_into().unwrap();
+        let aad_bytes = hexf(&row["aad"]);
+        let seq = row["fields"]["seq"].as_u64().unwrap();
+        let dek = Dek::from_bytes(&key);
+
+        assert_eq!(crypto::compress(plain).unwrap(), compressed, "{name}");
+        let ct = crypto::seal(&dek, &n, &aad_bytes, &compressed).unwrap();
+        assert_eq!(hex::encode(&ct), row["fields"]["payload_ct"], "{name}");
+        assert_eq!(
+            crypto::open(&dek, &n, &aad_bytes, &ct, seq).unwrap(),
+            compressed
+        );
+        let payload_len = row["fields"]["payload_len"].as_u64().unwrap();
+        assert_eq!(
+            crypto::decompress(&compressed, payload_len).unwrap(),
+            plain,
+            "{name}"
+        );
+        let sha: [u8; 32] = Sha256::digest(plain).into();
+        assert_eq!(hex::encode(sha), row["fields"]["payload_sha256"], "{name}");
+    }
+}
+
+#[test]
+fn key_vectors_open() {
+    if regen() {
+        return;
+    }
+    let file = load();
+    for w in file["dek_wraps"].as_array().unwrap() {
+        let kek_bytes: [u8; 32] = hex::decode(w["kek"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let dek_bytes: [u8; 32] = hex::decode(w["dek"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let wrapped = hex::decode(w["wrapped"].as_str().unwrap()).unwrap();
+        assert_eq!(wrapped.len(), 60);
+        assert_eq!(hex::encode(&wrapped[..12]), w["nonce"]);
+        let month = w["month"].as_str();
+        let key_id = w["key_id"].as_u64().unwrap();
+        assert_eq!(
+            unwrap_dek(&kek(&kek_bytes), key_id, month, &wrapped).unwrap(),
+            Dek::from_bytes(&dek_bytes)
+        );
+    }
+    assert!(file["dek_wraps"][0]["month"].is_null());
+
+    let r = &file["recovery"];
+    let blob = hex::decode(r["blob"].as_str().unwrap()).unwrap();
+    assert_eq!(blob.len(), 89);
+    assert_eq!(blob[0], 1);
+    assert_eq!(hex::encode(&blob[1..17]), r["salt"]);
+    assert_eq!(
+        blob[17..29],
+        [0, 1, 0, 0, 0, 0, 0, 3, 0, 0, 0, 4],
+        "m = 65536 KiB, t = 3, p = 4"
+    );
+    assert_eq!(hex::encode(&blob[29..41]), r["nonce"]);
+    let kek_bytes: [u8; 32] = hex::decode(r["kek"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let pass = SecretString::from(r["passphrase"].as_str().unwrap());
+    assert_eq!(open_recovery(&pass, &blob).unwrap(), kek(&kek_bytes));
+
+    let tags = file["query_tags"].as_array().unwrap();
+    assert_eq!(tags[0]["tag"], tags[1]["tag"], "trim");
+    assert_eq!(tags[2]["tag"], tags[3]["tag"], "NFC");
+    assert_ne!(tags[0]["query"], tags[1]["query"]);
+    assert_ne!(tags[2]["query"], tags[3]["query"]);
+    assert_ne!(tags[0]["tag"], tags[6]["tag"], "another KEK");
+    assert!(tags[4]["tag"].as_str().unwrap().starts_with("cql:"));
 }

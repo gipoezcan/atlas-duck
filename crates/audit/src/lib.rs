@@ -6,9 +6,11 @@
 pub mod lock;
 
 pub mod clock;
+pub mod crypto;
 pub mod encoding;
 pub mod error;
 pub mod keystore;
+pub mod recovery;
 pub mod request_set;
 pub mod types;
 

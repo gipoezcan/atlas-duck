@@ -1,18 +1,22 @@
 #!/usr/bin/env node
-// Independent cross-check of the audit golden vectors (§8.4, §13 "canonical-encoding golden
-// vectors"; plan M2 F.2, F.3, F.8, F.9). Re-implements, from the format description and not
-// from the Rust code: the field frame, the 29-field canonical bytes of FIELD_LIST[1],
-// record_hash, the AES-GCM AAD, request_set_hash, the prune-log row hash and RFC 8785 JCS
-// (keys sorted by UTF-16 code units, numbers printed by ECMAScript), then checks every entry
-// of crates/audit/tests/vectors/format_v1.json: AES-256-GCM decryption of payload_ct with the
-// row's DEK, nonce and recomputed AAD must yield `compressed`, SHA-256 of plaintext_jcs must
-// equal payload_sha256, and plaintext_jcs must be its own JCS form.
+// Independent cross-check of the audit golden vectors (§8.4, §8.6, §13 "canonical-encoding
+// golden vectors", L38; plan M2 F.2–F.5, F.7–F.9). Re-implements, from the format description
+// and not from the Rust code: the field frame, the 29-field canonical bytes of FIELD_LIST[1],
+// record_hash, the AES-GCM AAD, request_set_hash, the prune-log row hash, RFC 8785 JCS (keys
+// sorted by UTF-16 code units, numbers printed by ECMAScript), the DEK-wrap AAD and the keyed
+// query tag, then checks every entry of crates/audit/tests/vectors/format_v1.json:
+// AES-256-GCM decryption of payload_ct with the row's DEK, nonce and recomputed AAD must
+// yield `compressed`, SHA-256 of plaintext_jcs must equal payload_sha256, plaintext_jcs must
+// be its own JCS form, each wrapped DEK must decrypt under its KEK, key_id and month to its
+// DEK, and each query tag must equal HMAC-SHA256(HKDF-SHA256(KEK), NFC(query).trim()). The
+// recovery blob (Argon2id, which node:crypto 22 lacks) is checked for its layout only; Rust
+// checks it in full (crates/audit/tests/golden.rs).
 //
 // Usage: node ci/check-audit-vectors.mjs [vectors.json]
 // Exit 0 = ok (summary on stderr). Exit 1 = mismatches (one per line on stdout).
 // No npm dependencies: node:crypto, node:fs, node:path, node:url, node:zlib only.
 
-import { createDecipheriv, createHash } from "node:crypto";
+import { createDecipheriv, createHash, createHmac, hkdfSync } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -181,7 +185,7 @@ export function canonicalize(v) {
 }
 
 function decryptGcm(key, nonce, aadBytes, ctAndTag) {
-  if (ctAndTag.length < 16) throw new Error("payload_ct shorter than the GCM tag");
+  if (ctAndTag.length < 16) throw new Error("ciphertext shorter than the GCM tag");
   const d = createDecipheriv("aes-256-gcm", key, nonce);
   d.setAAD(aadBytes);
   d.setAuthTag(ctAndTag.subarray(ctAndTag.length - 16));
@@ -189,6 +193,57 @@ function decryptGcm(key, nonce, aadBytes, ctAndTag) {
 }
 
 const ZERO_HASH = "0".repeat(64);
+
+/** F.4: AAD of a wrapped DEK = "atlas-duck/dek/v1" ‖ frame(int key_id) ‖ frame(month or NULL). */
+export function dekWrapAad(keyId, month) {
+  return Buffer.concat([ascii("atlas-duck/dek/v1"), frame("int", keyId, "key_id"), frame("text", month, "month")]);
+}
+
+/** F.4: wrapped = nonce(12) ‖ ct(32) ‖ tag(16); returns the DEK. */
+export function unwrapDek(kek, keyId, month, wrapped) {
+  if (wrapped.length !== 60) throw new Error("wrapped DEK must be 60 bytes");
+  return decryptGcm(kek, wrapped.subarray(0, 12), dekWrapAad(keyId, month), wrapped.subarray(12));
+}
+
+/**
+ * F.7: K_q = HKDF-SHA256(salt none, ikm KEK, info "atlas-duck/query-tag/v1", 32). An empty
+ * salt equals "no salt" (RFC 5869: HMAC zero-pads the key to the block size either way).
+ */
+export function queryKey(kek) {
+  return Buffer.from(hkdfSync("sha256", kek, Buffer.alloc(0), "atlas-duck/query-tag/v1", 32));
+}
+
+/**
+ * F.7: `<kind>:` + hex(HMAC-SHA256(K_q, NFC(query).trim())). JS `trim()` also strips U+FEFF,
+ * which Rust's `str::trim` keeps; the vectors use only ASCII spaces, tabs and newlines around
+ * queries, where both agree.
+ */
+export function queryTag(kek, kind, query) {
+  if (kind !== "jql" && kind !== "cql") throw new Error(`unknown query kind ${kind}`);
+  const mac = createHmac("sha256", queryKey(kek));
+  mac.update(Buffer.from(query.normalize("NFC").trim(), "utf8"));
+  return `${kind}:${mac.digest("hex")}`;
+}
+
+/** F.5 layout only (no Argon2 in node:crypto 22): 0x01 ‖ salt ‖ m ‖ t ‖ p ‖ nonce ‖ ct(48). */
+function checkRecovery(r, out) {
+  const fail = (m) => out.push(`recovery: ${m}`);
+  try {
+    const blob = hexBytes(r.blob, "blob");
+    if (blob.length !== 89) return fail("blob must be 89 bytes");
+    if (blob[0] !== 1) fail("layout byte must be 1");
+    if (blob.subarray(1, 17).toString("hex") !== r.salt) fail("salt differs from blob[1..17]");
+    const [m, t, p] = [17, 21, 25].map((o) => blob.readUInt32BE(o));
+    if (m !== 65536 || t !== 3 || p !== 4) fail(`argon2 parameters must be m=65536 t=3 p=4, got m=${m} t=${t} p=${p}`);
+    if (blob.subarray(29, 41).toString("hex") !== r.nonce) fail("nonce differs from blob[29..41]");
+    if (typeof r.passphrase !== "string" || [...r.passphrase.normalize("NFC")].length < 12) {
+      fail("passphrase must be at least 12 characters");
+    }
+    if (hexBytes(r.kek, "kek").length !== 32) fail("kek must be 32 bytes");
+  } catch (e) {
+    fail(e.message);
+  }
+}
 
 /** `prev`: {chain_id, seq, record_hash} of the previous row, or null. */
 function checkRow(row, i, prev, out, notes) {
@@ -245,8 +300,11 @@ function checkRow(row, i, prev, out, notes) {
 export function checkVectors(doc, notes = new Set()) {
   const out = [];
   if (doc.format_version !== 1) out.push("format_version must be 1");
-  for (const k of ["rows", "request_sets", "prune_rows", "jcs"]) {
+  for (const k of ["rows", "request_sets", "prune_rows", "jcs", "dek_wraps", "query_tags"]) {
     if (!Array.isArray(doc[k]) || doc[k].length === 0) out.push(`${k} must be a non-empty array`);
+  }
+  if (doc.recovery === null || typeof doc.recovery !== "object" || Array.isArray(doc.recovery)) {
+    out.push("recovery must be an object");
   }
   if (out.length > 0) return out;
 
@@ -283,6 +341,33 @@ export function checkVectors(doc, notes = new Set()) {
       out.push(`jcs[${i}]: ${e.message}`);
     }
   });
+
+  doc.dek_wraps.forEach((w, i) => {
+    try {
+      const kek = hexBytes(w.kek, "kek");
+      if (kek.length !== 32) throw new Error("kek must be 32 bytes");
+      const wrapped = hexBytes(w.wrapped, "wrapped");
+      if (wrapped.subarray(0, 12).toString("hex") !== w.nonce) out.push(`dek_wraps[${i}]: nonce differs from wrapped[0..12]`);
+      if (unwrapDek(kek, w.key_id, w.month, wrapped).toString("hex") !== w.dek) {
+        out.push(`dek_wraps[${i}]: unwrapped DEK differs`);
+      }
+    } catch (e) {
+      out.push(`dek_wraps[${i}]: ${e.message}`);
+    }
+  });
+
+  doc.query_tags.forEach((q, i) => {
+    try {
+      const kek = hexBytes(q.kek, "kek");
+      if (kek.length !== 32) throw new Error("kek must be 32 bytes");
+      if (queryKey(kek).toString("hex") !== q.k_q) out.push(`query_tags[${i}]: k_q differs`);
+      if (queryTag(kek, q.kind, q.query) !== q.tag) out.push(`query_tags[${i}]: tag differs`);
+    } catch (e) {
+      out.push(`query_tags[${i}]: ${e.message}`);
+    }
+  });
+
+  checkRecovery(doc.recovery, out);
   return out;
 }
 
@@ -302,7 +387,8 @@ export function main(argv = process.argv.slice(2)) {
   if (mismatches.length > 0) return 1;
   console.error(
     `check-audit-vectors: ok (${doc.rows.length} rows, ${doc.request_sets.length} request sets, ` +
-      `${doc.prune_rows.length} prune rows, ${doc.jcs.length} jcs)`,
+      `${doc.prune_rows.length} prune rows, ${doc.jcs.length} jcs, ${doc.dek_wraps.length} dek wraps, ` +
+      `${doc.query_tags.length} query tags, recovery layout)`,
   );
   return 0;
 }
