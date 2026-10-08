@@ -4,83 +4,23 @@
 //! first corroboration of the process and after a commit whose `epoch` date moved on), a manual
 //! run comes through [`crate::Store::prune`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{Days, NaiveDate};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::anchors::{Barrier, FirstRetainedAnchor};
 use crate::clock::{UtcInstant, date_of, epoch_text, month_text, parse_epoch};
 use crate::encoding::{self, ZERO_HASH};
 use crate::error::AuditError;
+use crate::settings::RETENTION_MIN;
 use crate::types::{Confirmed, EventFlags, EventType};
 use crate::writer::{PreparedEvent, Writer, int, lock, sql, ts_text};
 
-/// `retention_days` default and minimum (§8.8, L09).
-pub const RETENTION_DEFAULT: u32 = 100;
-pub const RETENTION_MIN: u32 = 92;
-
 /// A cutoff may advance at most this many epochs past its baseline without a confirmation (L37).
 const MAX_ADVANCE_DAYS: u64 = 2;
-
-/// One instance's audit-authoritative policy (C.3). T12 fills the view.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InstancePolicy {
-    pub origin: Option<String>,
-    pub ca_fingerprint: Option<String>,
-    pub proxy: Option<String>,
-}
-
-/// The audit-authoritative settings (C.3 `Settings`). Minimal until T12 builds the view from
-/// `PRUNE` snapshots and `CONFIG_CHANGED`/`LEGAL_HOLD_CHANGED`; prune embeds [`Settings::to_json`]
-/// in every `PRUNE` so verification judges each prune by the settings in force (L52).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Settings {
-    pub retention_days: u32,
-    pub legal_hold: bool,
-    pub anchor_dir: Option<String>,
-    pub instances: BTreeMap<String, InstancePolicy>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Settings {
-            retention_days: RETENTION_DEFAULT,
-            legal_hold: false,
-            anchor_dir: None,
-            instances: BTreeMap::new(),
-        }
-    }
-}
-
-impl Settings {
-    /// `{anchor_dir, instances: {<id>: {ca_fingerprint, origin, proxy}}, legal_hold,
-    /// retention_days}` (JCS sorts the keys).
-    pub fn to_json(&self) -> Value {
-        let instances: serde_json::Map<String, Value> = self
-            .instances
-            .iter()
-            .map(|(id, p)| {
-                (
-                    id.clone(),
-                    json!({
-                        "ca_fingerprint": p.ca_fingerprint,
-                        "origin": p.origin,
-                        "proxy": p.proxy,
-                    }),
-                )
-            })
-            .collect();
-        json!({
-            "anchor_dir": self.anchor_dir,
-            "instances": instances,
-            "legal_hold": self.legal_hold,
-            "retention_days": self.retention_days,
-        })
-    }
-}
 
 /// What one prune run did (C.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -361,6 +301,11 @@ impl Writer {
         confirm: Option<&Confirmed>,
     ) -> Result<PruneOutcome, AuditError> {
         use PruneOutcome::Skipped;
+        if !self.st.settings_trusted {
+            return Err(bad(
+                "the settings view could not be rebuilt from the audit log".into(),
+            ));
+        }
         if !self.st.config_reconciled {
             return Ok(Skipped(PruneSkip::ConfigNotReconciled));
         }

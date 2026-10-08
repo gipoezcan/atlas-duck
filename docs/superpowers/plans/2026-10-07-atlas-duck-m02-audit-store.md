@@ -1674,6 +1674,8 @@ impl Store {
 
 Run: `cargo test -p atlas-duck-audit --test settings --test prune --locked` → all pass.
 
+**As built (T12):** `NeedsConfirmation` names are `retention_days`, `legal_hold`, `anchor_dir`, `instance_origin`, `instance_ca_fingerprint`. A change that leaves the value as it is is `Invalid` (nothing logged). The file reconcile compares the clamped value (a file value below 92 that clamps to the value in force is no difference) and writes all its rows in one transaction. `Store::append` refuses a `CONFIG_CHANGED` whose `key` is a policy key (`Invalid`). A settings row that cannot be read at open (`PRUNE` snapshot, `LEGAL_HOLD_CHANGED`, any `CONFIG_CHANGED`) makes the view untrusted: `StoreHealth::settings_unreadable`, and prune, `apply_setting` and the reconcile return `Err`. `testing_set_settings` stays as a no-log shortcut for prune tests with exact seqs; `testing_set_config_reconciled` is gone (tests call the real reconcile).
+
 - [ ] **Step 3: Clippy, commit** (`feat(audit): audit-authoritative settings view with prune snapshots, confirmation rules, config-file reconcile`).
 
 ---

@@ -12,7 +12,9 @@ use atlas_duck_audit::request_set::{RequestRecord, request_set_hash, requests_to
 use atlas_duck_audit::schema::DB_FILE;
 use atlas_duck_audit::testing::{FakeClock, MemKeyStore, MemKeyring};
 use atlas_duck_audit::types::{Actor, EventType, NewEvent};
-use atlas_duck_audit::{FirstRunInput, OpenConfig, Settings, Store, create_new_store, new_ids};
+use atlas_duck_audit::{
+    FilePolicy, FirstRunInput, OpenConfig, Settings, Store, create_new_store, new_ids,
+};
 use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
 use rusqlite::Connection;
 use secrecy::SecretString;
@@ -150,7 +152,8 @@ pub fn corroborate_now(store: &Store, clock: &FakeClock) {
     );
 }
 
-/// What prune needs that T12 provides: the retention in force and the config file reconciled.
+/// What prune needs: the retention in force (set without a log row, so seqs stay exact) and
+/// the config file reconciled (an empty file policy).
 pub fn prune_ready(store: &Store, retention_days: u32) {
     store
         .testing_set_settings(Settings {
@@ -159,7 +162,7 @@ pub fn prune_ready(store: &Store, retention_days: u32) {
         })
         .expect("settings");
     store
-        .testing_set_config_reconciled()
+        .reconcile_config_file(&FilePolicy::default())
         .expect("config reconciled");
 }
 

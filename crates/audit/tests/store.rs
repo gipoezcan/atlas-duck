@@ -579,7 +579,7 @@ fn store_owned_event_types_are_refused() {
     ]);
     assert!(matches!(r, Err(AuditError::Invalid(_))), "{r:?}");
     assert_eq!(row_count(&f), 1);
-    // CONFIG_CHANGED stays appendable by core (T12 gates the policy keys).
+    // CONFIG_CHANGED stays appendable by core, except with a policy key (settings tests).
     store
         .append(ev(EventType::CONFIG_CHANGED, None, json!({"key": "proxy"})))
         .expect("CONFIG_CHANGED");
@@ -898,7 +898,7 @@ fn admission_storage_low() {
         .append(ev(
             EventType::CONFIG_CHANGED,
             None,
-            json!({"key": "retention_days"}),
+            json!({"key": "attention_mode"}),
         ))
         .expect("system event");
     stub.set(3 * GIB);

@@ -29,8 +29,9 @@ use crate::clock::{
 use crate::crypto::{self, Dek, Kek, MAX_PAYLOAD_LEN};
 use crate::encoding::{self, FIELD_LIST, FORMAT_VERSION, RowFields, ZERO_HASH};
 use crate::error::{AuditError, OpenError};
-use crate::prune::{CHECKPOINT_RETRY_IDLE, PruneOutcome, PruneSkip, Settings};
+use crate::prune::{CHECKPOINT_RETRY_IDLE, PruneOutcome, PruneSkip};
 use crate::schema;
+use crate::settings::{self, FilePolicy, SettingChange, Settings};
 use crate::store::Hooks;
 use crate::types::{Committed, Confirmed, EventFlags, EventType, NewEvent};
 
@@ -41,7 +42,7 @@ pub(crate) const CHANNEL_BOUND: usize = 64;
 /// bookkeeping or confirmation (C.3, §8.3): chain start, `prune_log`, segment boundary,
 /// incidents and acks, migrations, key recovery/rotation (a DEK in the same transaction),
 /// clock episodes, the legal hold (Rust-drawn confirmation, §8.8), backup and export receipts.
-/// `append` refuses them. `CONFIG_CHANGED` stays appendable by `core` (T12 gates policy keys).
+/// `append` refuses them. `CONFIG_CHANGED` stays appendable by `core`, except with a policy key (`settings.rs`).
 const STORE_OWNED: [EventType; 12] = [
     EventType::GENESIS,
     EventType::PRUNE,
@@ -134,6 +135,17 @@ impl PreparedEvent {
         if STORE_OWNED.contains(&ev.event_type) {
             return Err(AuditError::Invalid(
                 "this event type is written by the store only",
+            ));
+        }
+        if ev.event_type == EventType::CONFIG_CHANGED
+            && ev
+                .payload
+                .get("key")
+                .and_then(Value::as_str)
+                .is_some_and(settings::is_policy_key)
+        {
+            return Err(AuditError::Invalid(
+                "policy settings change through apply_setting and reconcile_config_file only",
             ));
         }
         PreparedEvent::build(ev)
@@ -254,6 +266,10 @@ pub(crate) struct Shared {
     /// The error of the latest prune run, cleared by the next run that does not fail (the
     /// crate has no logger; automatic runs have no caller to return it to).
     pub(crate) last_prune_error: Mutex<Option<String>>,
+    /// The settings view (T12), published after every commit that changes it.
+    pub(crate) settings: Mutex<Settings>,
+    /// The view could not be rebuilt from the log (an unreadable settings row).
+    pub(crate) settings_unreadable: AtomicBool,
 }
 
 impl Shared {
@@ -271,6 +287,8 @@ impl Shared {
             prune_backlog_days: AtomicU32::new(0),
             checkpoint_pending: AtomicBool::new(false),
             last_prune_error: Mutex::new(None),
+            settings: Mutex::new(Settings::default()),
+            settings_unreadable: AtomicBool::new(false),
         })
     }
 }
@@ -311,15 +329,22 @@ pub(crate) enum Cmd {
         confirm: Option<Confirmed>,
         reply: SyncSender<Result<PruneOutcome, AuditError>>,
     },
-    /// The settings prune uses until T12's view (feature `testing`).
+    /// `Store::apply_setting` (T12).
+    ApplySetting {
+        change: SettingChange,
+        confirmed: Option<Confirmed>,
+        reply: SyncSender<Result<Committed, AuditError>>,
+    },
+    /// `Store::reconcile_config_file` (T12).
+    Reconcile {
+        file: FilePolicy,
+        reply: SyncSender<Result<Vec<Committed>, AuditError>>,
+    },
+    /// Replaces the view without logging anything (feature `testing`): for tests that need
+    /// exact seqs; the settings tests use the real calls.
     #[cfg(any(test, feature = "testing"))]
     SetSettings {
         settings: Settings,
-        reply: SyncSender<Result<(), AuditError>>,
-    },
-    /// What `reconcile_config_file` (T12) records: prune may run in this process.
-    #[cfg(any(test, feature = "testing"))]
-    SetConfigReconciled {
         reply: SyncSender<Result<(), AuditError>>,
     },
     #[cfg(any(test, feature = "testing"))]
@@ -349,8 +374,11 @@ pub(crate) struct WriterState {
     /// `GENESIS`'s `record_hash` (the first-retained anchor names it); `None`: unknown, and
     /// prune fails closed.
     pub(crate) genesis_hash: Option<[u8; 32]>,
-    /// The settings in force (T12 replaces this with its view).
+    /// The settings view (see `settings.rs`), the writer's copy of `Shared::settings`.
     pub(crate) settings: Settings,
+    /// The view was rebuilt from every settings row; `false`: a row was unreadable, and no
+    /// prune, setting change or reconcile runs.
+    pub(crate) settings_trusted: bool,
     /// The config file was reconciled in this process (T12): until then no prune runs.
     pub(crate) config_reconciled: bool,
     /// An automatic prune attempt is queued; it runs between commands.
@@ -380,6 +408,7 @@ impl WriterState {
             hooks: parts.hooks,
             genesis_hash: parts.genesis_hash,
             settings: Settings::default(),
+            settings_trusted: true,
             config_reconciled: false,
             prune_due: false,
             skips_logged: BTreeSet::new(),
@@ -775,7 +804,14 @@ impl Writer {
             hash,
             chain_id,
         };
-        let st = WriterState::new(parts, ClockState::from_head(epoch, ts, flags), head);
+        let (view, trusted) = settings::load_view(&conn, &parts.kek)?;
+        let mut st = WriterState::new(parts, ClockState::from_head(epoch, ts, flags), head);
+        st.settings = view.clone();
+        st.settings_trusted = trusted;
+        *lock(&st.shared.settings) = view;
+        st.shared
+            .settings_unreadable
+            .store(!trusted, std::sync::atomic::Ordering::Relaxed);
         *lock(&st.shared.head) = HeadView {
             seq,
             hash,
@@ -1136,18 +1172,25 @@ impl Writer {
                     let r = schema::set_written_by(&self.conn).map_err(sql_open);
                     let _ = reply.send(r);
                 }
+                Cmd::ApplySetting {
+                    change,
+                    confirmed,
+                    reply,
+                } => {
+                    let r = self.apply_setting_run(change, confirmed);
+                    let _ = reply.send(r);
+                }
+                Cmd::Reconcile { file, reply } => {
+                    let r = self.reconcile_run(&file);
+                    let _ = reply.send(r);
+                }
                 Cmd::Prune { confirm, reply } => {
                     let r = self.prune_recorded(confirm.as_ref());
                     let _ = reply.send(r);
                 }
                 #[cfg(any(test, feature = "testing"))]
                 Cmd::SetSettings { settings, reply } => {
-                    self.st.settings = settings;
-                    let _ = reply.send(Ok(()));
-                }
-                #[cfg(any(test, feature = "testing"))]
-                Cmd::SetConfigReconciled { reply } => {
-                    self.st.config_reconciled = true;
+                    self.set_view(settings);
                     let _ = reply.send(Ok(()));
                 }
                 #[cfg(any(test, feature = "testing"))]

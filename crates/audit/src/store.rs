@@ -27,6 +27,7 @@ use crate::error::{AuditError, OpenError};
 use crate::keystore::KeyStore;
 use crate::prune::PruneOutcome;
 use crate::schema;
+use crate::settings::{FilePolicy, SettingChange, Settings};
 use crate::types::{Committed, Confirmed, EventFlags, EventType, NewEvent, QueryKind};
 use crate::verify::{
     self, FindingKind, KeychainAnchors, StartupVerdict, VerifyFinding, VerifyOutcome,
@@ -152,6 +153,9 @@ pub struct StoreHealth {
     pub shred_checkpoint_pending: bool,
     /// The error of the latest prune run (automatic or not), `None` once one runs without.
     pub last_prune_error: Option<String>,
+    /// A settings row of the log could not be read: the settings view is not trusted, and no
+    /// prune, setting change or config reconcile runs until the store is repaired or restored.
+    pub settings_unreadable: bool,
 }
 
 /// One row's ciphertext and what opening it needs. No `Debug`: it holds a wrapped key.
@@ -583,7 +587,56 @@ impl Store {
             prune_backlog_days: self.inner.shared.prune_backlog_days.load(Ordering::Relaxed),
             shred_checkpoint_pending: self.inner.shared.checkpoint_pending.load(Ordering::Relaxed),
             last_prune_error: lock(&self.inner.shared.last_prune_error).clone(),
+            settings_unreadable: self
+                .inner
+                .shared
+                .settings_unreadable
+                .load(Ordering::Relaxed),
         }
+    }
+
+    /// The audit-authoritative settings (C.3): retention, legal hold, anchor directory and the
+    /// per-instance policy, from the log (see `settings.rs`). A store exists only with its KEK,
+    /// so nothing reads them while locked.
+    pub fn settings(&self) -> Settings {
+        lock(&self.inner.shared.settings).clone()
+    }
+
+    /// One settings change (C.3, §8.8, §10.3), logged as `CONFIG_CHANGED` /
+    /// `LEGAL_HOLD_CHANGED {source: "app"}` with the confirmation's dialog hash. Needs
+    /// `Some(Confirmed)`: a lower retention, lifting the legal hold, any anchor directory or
+    /// instance origin change, setting or changing a CA fingerprint. Without it:
+    /// `NeedsConfirmation(<what>)` and nothing is logged. `Invalid`: retention below 92, an
+    /// empty value, or a value the setting already has.
+    pub fn apply_setting(
+        &self,
+        change: SettingChange,
+        confirmed: Option<Confirmed>,
+    ) -> Result<Committed, AuditError> {
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::ApplySetting {
+                change,
+                confirmed,
+                reply,
+            })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// X-01 (§8.8): logs every config-file value that differs from the settings in force
+    /// (`source: "file"`), in one transaction, and only then allows prune in this process.
+    /// `core` calls it in `Core::start`. Returns the rows written. On `Err` nothing is
+    /// written and prune stays blocked.
+    pub fn reconcile_config_file(&self, file: &FilePolicy) -> Result<Vec<Committed>, AuditError> {
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::Reconcile {
+                file: file.clone(),
+                reply,
+            })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
     }
 
     /// One prune run now (C.3, §8.8), on the writer between commands; the writer also runs
@@ -896,27 +949,16 @@ impl Store {
         rx.recv().map_err(|_| AuditError::Closed)?
     }
 
-    /// The settings prune uses until T12's view exists (feature `testing`); retention below the
-    /// 92-day minimum is refused.
+    /// Replaces the settings view without logging anything (feature `testing`), for tests that
+    /// need exact seqs; retention below the 92-day minimum is refused.
     #[cfg(any(test, feature = "testing"))]
-    pub fn testing_set_settings(&self, settings: crate::prune::Settings) -> Result<(), AuditError> {
-        if settings.retention_days < crate::prune::RETENTION_MIN {
+    pub fn testing_set_settings(&self, settings: Settings) -> Result<(), AuditError> {
+        if settings.retention_days < crate::settings::RETENTION_MIN {
             return Err(AuditError::Invalid("retention below the 92-day minimum"));
         }
         let (reply, rx) = sync_channel(1);
         self.sender()?
             .send(Cmd::SetSettings { settings, reply })
-            .map_err(|_| AuditError::Closed)?;
-        rx.recv().map_err(|_| AuditError::Closed)?
-    }
-
-    /// What `reconcile_config_file` (T12) records: prune may run in this process (feature
-    /// `testing`). A deferred automatic attempt runs right after.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn testing_set_config_reconciled(&self) -> Result<(), AuditError> {
-        let (reply, rx) = sync_channel(1);
-        self.sender()?
-            .send(Cmd::SetConfigReconciled { reply })
             .map_err(|_| AuditError::Closed)?;
         rx.recv().map_err(|_| AuditError::Closed)?
     }

@@ -18,6 +18,7 @@ mod prune;
 pub mod recovery;
 pub mod request_set;
 pub mod schema;
+mod settings;
 pub mod store;
 pub mod types;
 // Production builds export only the C.3 result types (re-exported below); the verdict
@@ -33,10 +34,11 @@ pub use open::{
     ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
     keychain_retry_schedule, new_ids, open, read_store_install_id,
 };
-pub use prune::{
-    InstancePolicy, PruneOutcome, PruneSkip, RETENTION_DEFAULT, RETENTION_MIN, Settings,
-};
+pub use prune::{PruneOutcome, PruneSkip};
 pub use request_set::{RequestRecord, request_set_hash};
+pub use settings::{
+    FilePolicy, InstancePolicy, RETENTION_DEFAULT, RETENTION_MIN, SettingChange, Settings,
+};
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
 
