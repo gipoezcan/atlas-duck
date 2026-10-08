@@ -129,6 +129,9 @@ export const REQUIRED_WORKFLOWS = {
   ],
 };
 
+/** The dev-build control line a macOS GO row with an `inconclusive` task_for_pid cell must quote. */
+export const INCONCLUSIVE_CONTROL_LINE = "FLOOR_INCONCLUSIVE TaskForPid";
+
 /** Files a commit after the recorded commit may change (the T22 commit). */
 export const ALLOWED_AFTER_RECORD = [
   "docs/m1/go-no-go.md",
@@ -301,12 +304,14 @@ function checkTarget(id, os, sec, recorded, out) {
   }
 
   const seen = new Map();
+  const rowEvidence = new Map();
   for (const row of tableRows(sec)) {
     const probe = unquote(row[0] ?? "");
     const outcome = unquote(row[1] ?? "");
     const evidence = (row[2] ?? "").trim();
     if (seen.has(probe)) out.push(`${at}: probe ${probe} is listed twice`);
     seen.set(probe, outcome);
+    rowEvidence.set(probe, evidence);
     if (!FLOOR_PROBES[os].includes(probe) && !DIAGNOSTIC_PROBES.includes(probe)) out.push(`${at}: unknown probe '${probe}' for ${os}`);
     if (!OUTCOMES.includes(outcome)) out.push(`${at}: probe ${probe} outcome '${outcome}' is not one of ${OUTCOMES.join(", ")}`);
     if (evidence === "") out.push(`${at}: probe ${probe} has no evidence`);
@@ -318,7 +323,20 @@ function checkTarget(id, os, sec, recorded, out) {
   }
   if (verdict === "GO") {
     for (const probe of FLOOR_PROBES[os]) {
-      if (seen.has(probe) && seen.get(probe) !== "blocked") out.push(`${at}: GO but floor probe ${probe} is ${seen.get(probe)}`);
+      if (!seen.has(probe) || seen.get(probe) === "blocked") continue;
+      if (probe === "task_for_pid" && seen.get(probe) === "inconclusive" && os === "macos") {
+        // Decision 2026-10-08 (go-no-go.md, "Decisions taken"): task_for_pid cannot be proven
+        // independently on hosted runners, so an `inconclusive` cell may sit in a macOS GO row,
+        // but only with the control line, a floor=met installed package and the stated caveat.
+        const evidence = rowEvidence.get(probe) ?? "";
+        const installMet = lines.some((l) => l.includes("event=sandbox_probe") && /(^|\s)floor=met(\s|$)/.test(l));
+        if (!evidence.includes(INCONCLUSIVE_CONTROL_LINE)) out.push(`${at}: GO with an inconclusive task_for_pid needs the control line '${INCONCLUSIVE_CONTROL_LINE}' in the cell's evidence`);
+        if (!installMet) out.push(`${at}: GO with an inconclusive task_for_pid needs an installed-package line with floor=met`);
+        if (!/task_for_pid/.test(one(kv, "reason")) || !/caveat/i.test(one(kv, "reason")))
+          out.push(`${at}: GO with an inconclusive task_for_pid needs a 'reason' that states the task_for_pid caveat`);
+        continue;
+      }
+      out.push(`${at}: GO but floor probe ${probe} is ${seen.get(probe)}`);
     }
   }
 }

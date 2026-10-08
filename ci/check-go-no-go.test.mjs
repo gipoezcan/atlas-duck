@@ -260,7 +260,7 @@ test("an UNVERIFIED row may carry a dev-build probe table, which is still valida
   assert.deepEqual(check(good), []);
 });
 
-test("a macOS task_for_pid cell that is inconclusive or unverified is accepted, but cannot be in a GO row", () => {
+test("a macOS task_for_pid cell that is inconclusive or unverified is accepted, but cannot be in a GO row without the control line", () => {
   for (const outcome of ["inconclusive", "unverified"]) {
     const noGo = validDoc({
       verdicts: { "macos-arm64": "NO-GO" },
@@ -269,8 +269,54 @@ test("a macOS task_for_pid cell that is inconclusive or unverified is accepted, 
     });
     assert.deepEqual(check(noGo), [], outcome);
     const go = validDoc({ outcomes: { "macos-arm64:task_for_pid": outcome } });
-    assert.ok(check(go).some((v) => v.includes(`GO but floor probe task_for_pid is ${outcome}`)), outcome);
+    const expected = outcome === "unverified" ? `GO but floor probe task_for_pid is ${outcome}` : "needs the control line";
+    assert.ok(check(go).some((v) => v.includes(expected)), outcome);
   }
+});
+
+// ---- the inconclusive-task_for_pid rule (decision 2026-10-08)
+
+const CAVEAT = "task_for_pid cannot be independently proven on hosted runners; caveat: revisit with a signed hardened build in M10";
+const CONTROL = "printed blocked; TASKFORPID_CONTROL unconfined_kr=5; FLOOR_INCONCLUSIVE TaskForPid unconfined_kr=5";
+
+/** A GO document whose macos-arm64 task_for_pid cell is inconclusive; `edit` rewrites the doc. */
+function inconclusiveGo(edit = (t) => t, over = {}) {
+  const base = validDoc({ outcomes: { "macos-arm64:task_for_pid": "inconclusive" }, reasons: { "macos-arm64": CAVEAT }, ...over });
+  const withControl = base.replace(
+    /(### macos-arm64[\s\S]*?\| task_for_pid \| inconclusive \| )[^\n]*/,
+    `$1${CONTROL} |`,
+  );
+  return edit(withControl);
+}
+
+test("task_for_pid inconclusive in a macOS GO row: accepted with the control line, floor=met and the caveat", () => {
+  assert.deepEqual(check(inconclusiveGo()), []);
+});
+
+test("task_for_pid inconclusive in a GO row: rejected without the control line", () => {
+  const doc = inconclusiveGo((t) => t.replace("FLOOR_INCONCLUSIVE TaskForPid", "FLOOR_SOMETHING_ELSE"));
+  assert.ok(check(doc).some((v) => v.includes("needs the control line 'FLOOR_INCONCLUSIVE TaskForPid'")));
+});
+
+test("task_for_pid inconclusive in a GO row: rejected without the caveat in the reason", () => {
+  const doc = inconclusiveGo((t) => t, { reasons: { "macos-arm64": "looks fine" } });
+  assert.ok(check(doc).some((v) => v.includes("states the task_for_pid caveat")));
+});
+
+test("task_for_pid inconclusive in a GO row: rejected when the install line is not floor=met", () => {
+  const doc = inconclusiveGo((t) => t.replace(/(### macos-arm64[\s\S]*?event=sandbox_probe )floor=met/, "$1floor=not_met"));
+  const v = check(doc);
+  assert.ok(v.some((x) => x.includes("GO but install line is not floor=met")));
+  assert.ok(v.some((x) => x.includes("needs an installed-package line with floor=met")));
+});
+
+test("an inconclusive cell is still rejected in a GO row for any other probe or any non-macOS row", () => {
+  const other = inconclusiveGo((t) => t.replace(/(### macos-arm64[\s\S]*?\| connect_loopback \| )blocked/, "$1inconclusive"));
+  assert.ok(check(other).some((v) => v.includes("GO but floor probe connect_loopback is inconclusive")));
+  const linux = validDoc({ outcomes: { "ubuntu-22.04:raw_clone": "inconclusive" } });
+  assert.ok(check(linux).some((v) => v.includes("GO but floor probe raw_clone is inconclusive")));
+  const win = validDoc({ outcomes: { "windows-per-user:cred_read": "inconclusive" }, reasons: { "windows-per-user": CAVEAT } });
+  assert.ok(check(win).some((v) => v.includes("GO but floor probe cred_read is inconclusive")));
 });
 
 test("`recorded on` must be a date", () => {
