@@ -5,6 +5,28 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# §13: plain http to the mock only through this test-only feature; `lib.rs` refuses
+# to compile it into a release build. Task 9 extends `testing` with the wiremock harness.
+insecure-test-http = []
+testing = ["insecure-test-http"]
+
+[dependencies]
+url = { workspace = true }
+sha2 = { workspace = true }
+secrecy = { workspace = true }
+zeroize = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+icu_normalizer = { workspace = true }
+icu_casemap = { workspace = true }
+percent-encoding = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde = { workspace = true }
+
 # §7.7 / §13: unwrap_used and expect_used are errors in core and atlassian.
 [lints.clippy]
 unwrap_used = "deny"
