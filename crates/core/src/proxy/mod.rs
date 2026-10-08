@@ -91,7 +91,9 @@ fn split_host_port(s: &str) -> Option<(String, u16)> {
         None if h.contains(':') => return None,
         None => h,
     };
-    if host.is_empty() || host.contains(['[', ']']) {
+    // Also the gate for OS-supplied values: no userinfo, scheme, path or whitespace in a host.
+    let bad = |c: char| c.is_whitespace() || matches!(c, '[' | ']' | '@' | '/' | '\\' | '?' | '#');
+    if host.is_empty() || host.contains(bad) {
         return None;
     }
     Some((host.to_owned(), port))
@@ -111,6 +113,10 @@ pub struct OsProxy {
     pub https: Option<(String, u16)>,
     pub bypass: Vec<String>,
     pub pac_configured: bool,
+    /// The reading failed (a timeout, no session bus, no store): `https` and `bypass` may be
+    /// incomplete, so the reading is not cached and the result says so. The spec defines no
+    /// stricter behaviour; the connection still goes direct, and the caller can surface it.
+    pub read_failed: bool,
 }
 
 pub trait OsProxySource: Send + Sync {
@@ -155,18 +161,25 @@ impl Default for SystemProxySource {
 
 impl OsProxySource for SystemProxySource {
     fn read(&self) -> OsProxy {
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((at, v)) = cache.as_ref()
+        if let Some((at, v)) = self.lock().as_ref()
             && at.elapsed() < self.ttl
         {
             return v.clone();
         }
+        // Not under the lock: a reading can block for seconds (gsettings).
         let v = (self.reader)();
-        *cache = Some((Instant::now(), v.clone()));
+        if !v.read_failed {
+            *self.lock() = Some((Instant::now(), v.clone()));
+        }
         v
+    }
+}
+
+impl SystemProxySource {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<(Instant, OsProxy)>> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -189,6 +202,12 @@ fn platform_read() -> OsProxy {
 pub struct ResolvedProxy {
     pub choice: ProxyChoice,
     pub pac_configured: bool,
+    /// The instance followed the OS setting. `PAC_HINT` belongs on a connection failure only
+    /// when this and `pac_configured` are both set (§7.2: an own proxy or `direct` already is
+    /// what the hint asks for).
+    pub uses_os: bool,
+    /// `os.read_failed` while following the OS setting.
+    pub os_read_failed: bool,
     /// `"host:port"` or `"direct"`, for `APP_START` / `CONFIG_CHANGED`.
     pub effective: String,
 }
@@ -214,9 +233,12 @@ pub fn resolve_proxy(setting: &ProxySetting, host: &str, os: &OsProxy) -> Resolv
             _ => (ProxyChoice::Direct, "direct".to_owned()),
         },
     };
+    let uses_os = matches!(setting, ProxySetting::Os);
     ResolvedProxy {
         choice,
         pac_configured: os.pac_configured,
+        uses_os,
+        os_read_failed: uses_os && os.read_failed,
         effective,
     }
 }
@@ -226,6 +248,11 @@ pub fn resolve_proxy(setting: &ProxySetting, host: &str, os: &OsProxy) -> Resolv
 /// wildcards are not supported and never match.
 pub fn bypass_matches(host: &str, entry: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
+    // `url` writes an IPv6 host as `[::1]`; entries come bare (`::1`) or bracketed with a port.
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_owned();
     let mut e = entry.trim().to_ascii_lowercase();
     if e == "<local>" {
         return !host.contains('.');
@@ -236,9 +263,14 @@ pub fn bypass_matches(host: &str, entry: &str) -> bool {
     {
         e = stripped.to_owned();
     }
-    if let Some((h, port)) = e.rsplit_once(':')
+    if let Some(rest) = e.strip_prefix('[') {
+        e = rest
+            .split_once(']')
+            .map_or(rest, |(inner, _)| inner)
+            .to_owned();
+    } else if e.matches(':').count() == 1
+        && let Some((h, port)) = e.rsplit_once(':')
         && port.chars().all(|c| c.is_ascii_digit())
-        && !h.contains(']')
     {
         e = h.to_owned();
     }

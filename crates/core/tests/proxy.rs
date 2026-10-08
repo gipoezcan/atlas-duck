@@ -29,6 +29,7 @@ fn os_proxy() -> OsProxy {
         https: Some(("os.proxy".to_owned(), 8080)),
         bypass: vec![],
         pac_configured: false,
+        read_failed: false,
     }
 }
 
@@ -56,6 +57,10 @@ fn l42_bypass_matching_table() {
         ("xn--mnchen-3ya.de", "xn--mnchen-3ya.de", true),
         ("jira.corp.", "jira.corp", true),
         ("jira.corp", "https://jira.corp", true),
+        ("[::1]", "::1", true),
+        ("[::1]", "[::1]", true),
+        ("[::1]", "[::1]:8080", true),
+        ("[::2]", "::1", false),
     ];
     for (host, entry, want) in table {
         assert_eq!(bypass_matches(host, entry), want, "{host} vs {entry}");
@@ -103,10 +108,14 @@ fn l42_pac_ignored_reports_pac_configured() {
         https: None,
         bypass: vec![],
         pac_configured: true,
+        read_failed: false,
     };
     let r = resolve_proxy(&ProxySetting::Os, "jira.example", &os);
     assert_eq!(r.choice, ProxyChoice::Direct);
-    assert!(r.pac_configured);
+    assert!(r.pac_configured && r.uses_os);
+    // An instance with its own proxy or `direct` already did what the hint asks for.
+    let own = resolve_proxy(&ProxySetting::Direct, "jira.example", &os);
+    assert!(own.pac_configured && !own.uses_os);
     assert_eq!(
         atlas_duck_core::proxy::PAC_HINT,
         "your system uses a proxy auto-config script, which atlas-duck does not evaluate: set this instance's proxy (host:port or direct) in Settings"
@@ -186,6 +195,7 @@ async fn factory_applies_resolved_proxy_and_reports_it() -> TestResult {
         https: Some(("127.0.0.1".to_owned(), fake.addr().port())),
         bypass: vec![],
         pac_configured: true,
+        read_failed: false,
     };
     let factory = HttpFactory::new(
         Arc::new(FakeOsProxy(os)),
@@ -219,4 +229,43 @@ async fn factory_applies_resolved_proxy_and_reports_it() -> TestResult {
     assert_eq!(fake.connections(), 1);
     assert!(dc.received().await.is_empty());
     Ok(())
+}
+
+#[test]
+fn os_read_failure_is_reported_and_not_cached() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = n.clone();
+    let src = SystemProxySource::with_reader(Box::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        OsProxy {
+            read_failed: true,
+            ..OsProxy::default()
+        }
+    }));
+    let os = src.read();
+    src.read();
+    assert_eq!(n.load(Ordering::SeqCst), 2);
+    let r = resolve_proxy(&ProxySetting::Os, "jira.example", &os);
+    assert!(r.os_read_failed);
+    assert_eq!(r.choice, ProxyChoice::Direct);
+    assert!(!resolve_proxy(&ProxySetting::Direct, "jira.example", &os).os_read_failed);
+}
+
+#[test]
+#[cfg(feature = "testing")]
+fn cache_expires_after_ttl() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    let n = Arc::new(AtomicUsize::new(0));
+    let counter = n.clone();
+    let src = SystemProxySource::with_reader(Box::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+        OsProxy::default()
+    }))
+    .with_ttl(Duration::from_millis(30));
+    src.read();
+    std::thread::sleep(Duration::from_millis(60));
+    src.read();
+    assert_eq!(n.load(Ordering::SeqCst), 2);
 }

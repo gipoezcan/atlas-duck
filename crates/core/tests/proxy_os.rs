@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use atlas_duck_core::proxy::OsProxy;
 use atlas_duck_core::proxy::os_linux::{
-    Gsettings, parse_gvariant_strings, parse_kioslaverc, read_with,
+    GsOutcome, Gsettings, child_env, gsettings_command, parse_gvariant_strings, parse_kioslaverc,
+    read_with,
 };
 use atlas_duck_core::proxy::os_macos::{MacSettings, from_settings};
 use atlas_duck_core::proxy::os_windows::{
@@ -109,11 +110,14 @@ fn v17_macos_scdynamicstore_reader() {
 struct FakeGsettings(HashMap<(&'static str, &'static str), &'static str>);
 
 impl Gsettings for FakeGsettings {
-    fn get(&self, schema: &str, key: &str) -> Option<String> {
+    fn get(&self, schema: &str, key: &str) -> GsOutcome {
         self.0
             .iter()
             .find(|((s, k), _)| *s == schema && *k == key)
-            .map(|(_, v)| (*v).to_owned())
+            .map_or(GsOutcome::Missing, |(_, v)| match *v {
+                "FAIL" => GsOutcome::Failed,
+                v => GsOutcome::Value(v.to_owned()),
+            })
     }
 }
 
@@ -169,4 +173,90 @@ fn v17_linux_gnome_kde_reader() -> TestResult {
     let absent = dir.path().join("absent");
     assert_eq!(read_with(&none, Some(&absent)), OsProxy::default());
     Ok(())
+}
+
+#[test]
+fn v17_gsettings_child_env_uses_passwd_home() {
+    use std::ffi::OsString;
+    use std::path::Path;
+    let ambient = |k: &str| match k {
+        "HOME" => Some(OsString::from("/tmp/agent-home")),
+        "DBUS_SESSION_BUS_ADDRESS" => Some(OsString::from("unix:path=/run/bus")),
+        "XDG_RUNTIME_DIR" => Some(OsString::from("/run/user/1000")),
+        "XDG_CONFIG_HOME" => Some(OsString::from("/tmp/agent-cfg")),
+        "HTTPS_PROXY" => Some(OsString::from("http://agent:1")),
+        _ => None,
+    };
+    let home = Path::new("/home/real");
+    let env = child_env(home, &ambient);
+    let names: Vec<&str> = env.iter().map(|(k, _)| *k).collect();
+    assert_eq!(
+        names,
+        ["HOME", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]
+    );
+    assert_eq!(env[0].1, OsString::from("/home/real"));
+
+    let cmd = gsettings_command(Path::new("/usr/bin/gsettings"), home, &ambient, "s", "k");
+    let set: Vec<(String, String)> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_str()?.to_owned(), v?.to_str()?.to_owned())))
+        .collect();
+    assert_eq!(set.len(), 3);
+    assert!(set.contains(&("HOME".to_owned(), "/home/real".to_owned())));
+    let args: Vec<_> = cmd.get_args().collect();
+    assert_eq!(args, ["get", "s", "k"]);
+}
+
+#[test]
+fn v17_failed_gsettings_is_flagged_not_cached_as_no_proxy() -> TestResult {
+    // A timed-out `mode` read leaves nothing configured: flagged, so it is not cached.
+    let failing = FakeGsettings(HashMap::from([(
+        ("org.gnome.system.proxy", "mode"),
+        "FAIL",
+    )]));
+    let r = read_with(&failing, None);
+    assert!(r.read_failed);
+    assert_eq!(r.https, None);
+    // A missing schema is a clean "not configured".
+    let r = read_with(&FakeGsettings(HashMap::new()), None);
+    assert!(!r.read_failed);
+    // A failed read does not hide a proxy that KDE did give.
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("kioslaverc");
+    std::fs::write(
+        &path,
+        "[Proxy Settings]\nProxyType=1\nhttpsProxy=k.corp:1\n",
+    )?;
+    let r = read_with(&failing, Some(&path));
+    assert!(!r.read_failed);
+    assert_eq!(r.https, Some(("k.corp".to_owned(), 1)));
+    Ok(())
+}
+
+#[test]
+fn v17_kde_kiosk_markers_and_hostile_hosts() {
+    let r = parse_kioslaverc(
+        "[Proxy Settings][$i]\nProxyType[$i]=1\nhttpsProxy[$i]=http://k.corp:8080\n",
+    );
+    assert_eq!(r.https, Some(("k.corp".to_owned(), 8080)));
+    // Userinfo or a path in an OS-supplied host is refused, not passed on.
+    let r = parse_kioslaverc("[Proxy Settings]\nProxyType=1\nhttpsProxy=u@k.corp:8080\n");
+    assert_eq!(r.https, None);
+    assert_eq!(
+        atlas_duck_core::proxy::os_windows::parse_proxy_server("user@p:8080"),
+        None
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn v17_macos_scdynamicstore_reader_runs() {
+    use atlas_duck_core::proxy::{OsProxySource, SystemProxySource, os_macos};
+    // Read-only smoke: the FFI returns and the result is internally consistent. It asserts no
+    // machine configuration.
+    for r in [os_macos::read(), SystemProxySource::new().read()] {
+        if let Some((host, port)) = r.https {
+            assert!(!host.is_empty() && port != 0);
+        }
+    }
 }

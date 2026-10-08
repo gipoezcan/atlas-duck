@@ -40,8 +40,8 @@ impl os_windows::RegistryReader for EmptyRegistry {
 struct NoGsettings;
 
 impl os_linux::Gsettings for NoGsettings {
-    fn get(&self, _: &str, _: &str) -> Option<String> {
-        None
+    fn get(&self, _: &str, _: &str) -> os_linux::GsOutcome {
+        os_linux::GsOutcome::Missing
     }
 }
 

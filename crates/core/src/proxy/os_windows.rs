@@ -43,6 +43,7 @@ pub fn read_with(reg: &dyn RegistryReader) -> OsProxy {
         https,
         bypass,
         pac_configured: auto_url || flags & (FLAG_AUTO_DETECT | FLAG_AUTO_SCRIPT) != 0,
+        read_failed: false,
     }
 }
 
@@ -145,9 +146,10 @@ impl RegistryReader for WinInetRegistry {
     }
 
     fn string(&self, subkey: &str, name: &str) -> Option<String> {
-        // REG_SZ only: expanding `REG_EXPAND_SZ` would consult the process environment.
-        use windows_sys::Win32::System::Registry::RRF_RT_REG_SZ;
-        let b = self.raw(subkey, name, RRF_RT_REG_SZ)?;
+        // RRF_NOEXPAND: a `REG_EXPAND_SZ` value is refused instead of being expanded from the
+        // process environment (I-20).
+        use windows_sys::Win32::System::Registry::{RRF_NOEXPAND, RRF_RT_REG_SZ};
+        let b = self.raw(subkey, name, RRF_RT_REG_SZ | RRF_NOEXPAND)?;
         let units: Vec<u16> = b
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))

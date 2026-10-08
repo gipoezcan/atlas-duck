@@ -32,10 +32,13 @@ pub fn from_settings(s: &MacSettings) -> OsProxy {
         https,
         bypass,
         pac_configured: s.auto_config_enable || s.auto_discovery_enable,
+        read_failed: false,
     }
 }
 
-/// An unavailable store reads as no proxy.
+/// A NULL answer from the store is `read_failed`. Ownership: the dictionary comes from a
+/// `Copy` function (create rule, released once by the wrapper); the exceptions array is
+/// borrowed from it through a retained `CFType` clone (get rule), after a type-id check.
 #[cfg(target_os = "macos")]
 pub fn read() -> OsProxy {
     use core_foundation::array::CFArray;
@@ -49,7 +52,11 @@ pub fn read() -> OsProxy {
     // The call returns NULL or a dictionary the caller owns (Copy rule).
     let raw: CFDictionaryRef = unsafe { SCDynamicStoreCopyProxies(std::ptr::null()) };
     if raw.is_null() {
-        return OsProxy::default();
+        // NULL means the store could not be read, not "no proxies".
+        return OsProxy {
+            read_failed: true,
+            ..OsProxy::default()
+        };
     }
     // SAFETY: `raw` is non-null and owned by us; the wrapper releases it once.
     let dict: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(raw) };
