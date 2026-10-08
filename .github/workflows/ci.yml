@@ -517,7 +517,23 @@ jobs:
           sudo chown "$(id -u):$(id -g)" /srv/atlas-smb
           printf '[atlas]\n   path = /srv/atlas-smb\n   read only = no\n   valid users = %s\n' "$USER" | sudo tee -a /etc/samba/smb.conf > /dev/null
           printf '%s\n%s\n' "$SMB_PASS" "$SMB_PASS" | sudo smbpasswd -a -s "$USER"
+          sudo testparm -s > /dev/null
           sudo systemctl restart smbd
+          # CI run 1: the mount came right after the restart and failed with
+          # "mount error(111): could not connect to 127.0.0.1" (nothing was
+          # listening yet, or smbd had not started). Wait for port 445 and
+          # show why when it never opens.
+          for _ in $(seq 1 30); do
+            if ss -ltn | grep -q ':445 '; then break; fi
+            sleep 1
+          done
+          if ! ss -ltn | grep -q ':445 '; then
+            sudo systemctl status smbd --no-pager || true
+            sudo journalctl -u smbd --no-pager -n 50 || true
+            ss -ltnp || true
+            echo "::error::smbd is not listening on 127.0.0.1:445"
+            exit 1
+          fi
           sudo mount -t cifs //127.0.0.1/atlas /mnt/smb -o "username=$USER,password=$SMB_PASS,uid=$(id -u),gid=$(id -g),vers=3.0"
           mkdir -p /mnt/smb/data
           stat -f -c 'V29 cifs f_type=0x%t (%T)' /mnt/smb/data
