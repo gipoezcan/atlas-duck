@@ -235,12 +235,19 @@ impl TestCa {
 pub struct TestTlsServer {
     addr: SocketAddr,
     ca_pem: String,
+    accepted: Arc<AtomicUsize>,
     handshakes: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
 
 impl TestTlsServer {
     pub async fn start() -> io::Result<TestTlsServer> {
+        Self::start_dropping_first(0).await
+    }
+
+    /// Closes the first `drop` connections right after accepting them, before any TLS byte: the
+    /// client sees a handshake failure, a connection-level (pre-send) error.
+    pub async fn start_dropping_first(drop: usize) -> io::Result<TestTlsServer> {
         crate::client::ensure_provider();
         let ca = TestCa::generate("atlas-duck test CA")?;
         let leaf_key = rcgen::KeyPair::generate().map_err(rc)?;
@@ -272,10 +279,15 @@ impl TestTlsServer {
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
+        let accepted = Arc::new(AtomicUsize::new(0));
         let handshakes = Arc::new(AtomicUsize::new(0));
-        let h = handshakes.clone();
+        let (a, h) = (accepted.clone(), handshakes.clone());
         let task = tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
+                if a.fetch_add(1, Ordering::SeqCst) < drop {
+                    std::mem::drop(sock);
+                    continue;
+                }
                 let (acceptor, h) = (acceptor.clone(), h.clone());
                 tokio::spawn(async move {
                     let Ok(mut tls) = acceptor.accept(sock).await else {
@@ -298,6 +310,7 @@ impl TestTlsServer {
         Ok(TestTlsServer {
             addr,
             ca_pem: ca.cert_pem,
+            accepted,
             handshakes,
             task,
         })
@@ -315,6 +328,11 @@ impl TestTlsServer {
 
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    /// TCP connections accepted, dropped ones included.
+    pub fn connections(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
     }
 
     /// Completed TLS handshakes.

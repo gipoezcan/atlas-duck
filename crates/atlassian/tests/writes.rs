@@ -278,6 +278,14 @@ async fn mismatch_is_not_sent() -> TestResult {
         spec("PO ST", &good, Some("application/json"), b"{}"),
         spec("POST", &good, Some("application/json\r\nX-Evil: 1"), b"{}"),
         spec("POST", "not a url", Some("application/json"), b"{}"),
+        // Userinfo parses and serializes unchanged, but reqwest moves it into a Basic
+        // `Authorization` header and out of the URL, so the request is not the listed one.
+        spec(
+            "POST",
+            &good.replacen("http://", "http://u:p@", 1),
+            Some("application/json"),
+            b"{}",
+        ),
     ]);
     for s in cases {
         let s = HttpRequestSpec { index: 7, ..s };
@@ -610,17 +618,188 @@ async fn write_400_other_failed4xx() -> TestResult {
             other => return Err(format!("{status} {body}: {other:?}").into()),
         }
     }
+    Ok(())
+}
 
-    // A non-JSON 401 is a refusal by the server, not a token verdict.
+/// Pins the outcome the Task 22 handoff relies on: a non-JSON 401 (an SSO page) on a write is
+/// `Failed4xx` with the page as its body; core maps it to `upstream_unavailable` (§11.2) and
+/// keeps the body out of the agent's view.
+#[tokio::test]
+async fn write_non_json_401_is_failed4xx() -> TestResult {
     let dc = MockDc::start(Product::Confluence, "").await;
     dc.html("/rest/api/content/65537", 401).await;
     let t = test_client(dc.client_config())?;
-    assert!(matches!(
+    assert_eq!(
         t.client
-            .send_approved(&cover, &json_op(page_update(&dc)?))
+            .send_approved(&test_cover()?, &json_op(page_update(&dc)?))
             .await,
-        WriteOutcome::Failed4xx { .. }
-    ));
+        WriteOutcome::Failed4xx {
+            response: UpstreamResponse {
+                status: 401,
+                content_type: Some("text/html; charset=UTF-8".into()),
+                body: b"<html><body>Please log in</body></html>".to_vec(),
+            },
+            request_index: 0,
+        }
+    );
+    Ok(())
+}
+
+/// What `outcome_bodies_stay_in_the_control` sends: one write answered by `answer`.
+async fn write_answered(
+    product: Product,
+    answer: ResponseTemplate,
+    op: fn(HttpRequestSpec) -> ApprovedWrite,
+) -> Result<(WriteOutcome, Vec<u8>), Box<dyn std::error::Error>> {
+    let dc = MockDc::start(product, "").await;
+    Mock::given(path("/rest/api/x"))
+        .respond_with(answer)
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let s = spec(
+        "POST",
+        &url_for(&dc, "/rest/api/x", json!({}))?,
+        Some("application/json"),
+        b"{}",
+    );
+    let ctl = FetchControl::new();
+    let out = t
+        .client
+        .send_approved_ctl(&test_cover()?, &op(s), &ctl)
+        .await;
+    Ok((out, ctl.take_captured().partial))
+}
+
+fn empty_201(s: HttpRequestSpec) -> ApprovedWrite {
+    empty_op(s, 201)
+}
+
+/// Review I-1: outcomes without a response field leave the answer's bytes in the control, where
+/// core takes them for the outcome event (§7.2: such bodies are audit-only); the two outcomes
+/// that carry the response take it out of the control.
+#[tokio::test]
+async fn outcome_bodies_stay_in_the_control() -> TestResult {
+    const HTML: &[u8] = b"<html><body>Please log in</body></html>";
+    let jdoe = |status: u16| ResponseTemplate::new(status).insert_header("X-AUSERNAME", "jdoe");
+
+    // Undeclared 2xx: an HTML 201 on an `Empty` op.
+    let answer = jdoe(201).set_body_raw(HTML, "text/html");
+    let (out, kept) = write_answered(Product::Jira, answer, empty_201).await?;
+    assert_eq!(out, unknown(UnknownReason::UndeclaredSuccess));
+    assert_eq!(kept, HTML);
+
+    // 5xx.
+    let answer =
+        ResponseTemplate::new(503).set_body_raw(r#"{"message":"down"}"#, "application/json");
+    let (out, kept) = write_answered(Product::Confluence, answer, json_op).await?;
+    assert_eq!(out, unknown(UnknownReason::ServerError5xx));
+    assert_eq!(kept, br#"{"message":"down"}"#);
+
+    // A Jira 201 attributed to another user: the created issue is named only here.
+    let answer = ResponseTemplate::new(201)
+        .insert_header("X-AUSERNAME", "bob")
+        .set_body_raw(JIRA_ISSUE_CREATED, "application/json");
+    let (out, kept) = write_answered(Product::Jira, answer, json_op).await?;
+    assert_eq!(
+        out,
+        unknown(UnknownReason::IdentityMismatch {
+            server_user: Some("bob".into())
+        })
+    );
+    assert_eq!(kept, JIRA_ISSUE_CREATED.as_bytes());
+
+    // JSON 401.
+    let answer =
+        ResponseTemplate::new(401).set_body_raw(r#"{"statusCode":401}"#, "application/json");
+    let (out, kept) = write_answered(Product::Confluence, answer, json_op).await?;
+    assert_eq!(out, WriteOutcome::NeedsToken);
+    assert_eq!(kept, br#"{"statusCode":401}"#);
+
+    // 3xx: the body is read for the audit record; the redirect is never followed.
+    let answer = ResponseTemplate::new(302)
+        .insert_header("Location", "/login.jsp")
+        .set_body_raw("<html>moved</html>", "text/html");
+    let (out, kept) = write_answered(Product::Confluence, answer, json_op).await?;
+    assert_eq!(out, WriteOutcome::Unavailable3xx { request_index: 0 });
+    assert_eq!(kept, b"<html>moved</html>");
+
+    // The control: `Executed` and `Failed4xx` carry the body and leave the control empty.
+    let answer = jdoe(201).set_body_raw(JIRA_ISSUE_CREATED, "application/json");
+    let (out, kept) = write_answered(Product::Jira, answer, json_op).await?;
+    match out {
+        WriteOutcome::Executed { response, .. } => {
+            assert_eq!(response.body, JIRA_ISSUE_CREATED.as_bytes());
+        }
+        other => return Err(format!("{other:?}").into()),
+    }
+    assert!(kept.is_empty());
+    let answer = ResponseTemplate::new(400).set_body_raw(CONFLUENCE_ERROR_400, "application/json");
+    let (out, kept) = write_answered(Product::Confluence, answer, json_op).await?;
+    match out {
+        WriteOutcome::Failed4xx { response, .. } => {
+            assert_eq!(response.body, CONFLUENCE_ERROR_400.as_bytes());
+        }
+        other => return Err(format!("{other:?}").into()),
+    }
+    assert!(kept.is_empty());
+    Ok(())
+}
+
+/// A cancel while the answer's body arrives: the request was sent, so the outcome is unknown,
+/// and the bytes received so far stay in the control.
+#[tokio::test]
+async fn write_cancelled_during_the_response_body_is_unknown() -> TestResult {
+    const PARTIAL: &[u8] = br#"{"id":"1","#;
+    let mut head =
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n"
+            .to_vec();
+    head.extend_from_slice(PARTIAL);
+    let server = RawHttpServer::serve(vec![
+        RawStep::Send(head),
+        RawStep::Sleep(10_000),
+        RawStep::Close,
+    ])
+    .await?;
+    let t = test_client(test_config(Product::Confluence, &server.base_url())?)?;
+    let url = format!("{}/rest/api/content/1", server.base_url());
+    let w = json_op(spec("PUT", &url, Some("application/json"), b"{}"));
+    let ctl = FetchControl::new();
+    let task = {
+        let (client, cover, ctl) = (t.client.clone(), test_cover()?, ctl.clone());
+        tokio::spawn(async move { client.send_approved_ctl(&cover, &w, &ctl).await })
+    };
+    let mut arrived = false;
+    for _ in 0..500 {
+        if ctl.take_captured().partial == PARTIAL {
+            arrived = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(arrived, "the partial body never arrived");
+    ctl.cancel();
+    assert_eq!(task.await?, unknown(UnknownReason::Cancelled));
+    let snap = ctl.take_captured();
+    assert!(snap.sent);
+    assert_eq!(snap.partial, PARTIAL);
+    Ok(())
+}
+
+/// §5.4 step 6: the one pre-send retry, when it succeeds, writes the request exactly once.
+#[tokio::test]
+async fn write_presend_retry_succeeds() -> TestResult {
+    // The first connection is closed before the TLS handshake (a connection-level failure).
+    let tls = TestTlsServer::start_dropping_first(1).await?;
+    let mut cfg = test_config(Product::Confluence, &tls.base_url())?;
+    cfg.custom_ca_pem = Some(tls.ca_pem().as_bytes().to_vec());
+    let t = test_client(cfg)?;
+    let url = format!("{}/rest/api/content/1", tls.base_url());
+    let w = json_op(spec("PUT", &url, Some("application/json"), b"{}"));
+    let out = t.client.send_approved(&test_cover()?, &w).await;
+    assert!(matches!(out, WriteOutcome::Executed { .. }), "{out:?}");
+    assert_eq!(tls.connections(), 2);
+    assert_eq!(tls.handshakes(), 1);
     Ok(())
 }
 

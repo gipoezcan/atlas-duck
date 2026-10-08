@@ -92,13 +92,17 @@ impl InstanceClient {
             request_index,
         };
 
-        // Redirects are never followed and never a success (§7.2).
+        // Only `Executed` and `Failed4xx` carry the response. On every other answered outcome
+        // the body stays in the control for the outcome event (§7.2: such bodies are audit-only;
+        // core reads them with `take_captured().partial`).
+        let read = read_body(resp, ctl, deadline, MAX_RESPONSE_BYTES).await;
+        drop(permit);
+
+        // Redirects are never followed and never a success (§7.2); the body was read (capped,
+        // read errors ignored) for the audit record only.
         if (300..400).contains(&status) {
             return WriteOutcome::Unavailable3xx { request_index };
         }
-
-        let read = read_body(resp, ctl, deadline, MAX_RESPONSE_BYTES).await;
-        drop(permit);
         let client_error = (400..500).contains(&status);
         match read {
             BodyRead::Complete => {}
@@ -111,10 +115,11 @@ impl InstanceClient {
             BodyRead::Error => return unknown(UnknownReason::ResetAfterSend),
             BodyRead::OverCap => return unknown(UnknownReason::UndeclaredSuccess),
         }
+        // A copy: the two outcomes that carry it clear the control when they return.
         let response = UpstreamResponse {
             status,
             content_type,
-            body: ctl.take_partial(),
+            body: ctl.snapshot_partial(),
         };
 
         // Decided before any JSON parse: a declared empty success may carry any content type,
@@ -149,6 +154,7 @@ impl InstanceClient {
         }
 
         if declared {
+            ctl.clear_partial();
             return WriteOutcome::Executed {
                 server_user: match auser.as_slice() {
                     [one] => Some(one.clone()),
@@ -168,6 +174,7 @@ impl InstanceClient {
             return WriteOutcome::VersionConflict { request_index };
         }
         if client_error {
+            ctl.clear_partial();
             return WriteOutcome::Failed4xx {
                 response,
                 request_index,
