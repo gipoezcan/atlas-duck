@@ -142,6 +142,21 @@ pub enum DecisionColumn {
 }
 
 impl DecisionColumn {
+    pub const ALL: [DecisionColumn; 8] = [
+        DecisionColumn::Approve,
+        DecisionColumn::ApproveEdited,
+        DecisionColumn::Release,
+        DecisionColumn::ReleaseRedacted,
+        DecisionColumn::Deny,
+        DecisionColumn::Expire,
+        DecisionColumn::Cancel,
+        DecisionColumn::Reject,
+    ];
+
+    pub fn parse(s: &str) -> Option<DecisionColumn> {
+        DecisionColumn::ALL.into_iter().find(|d| d.as_str() == s)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             DecisionColumn::Approve => "approve",

@@ -472,19 +472,15 @@ impl Store {
     /// not across decryption and decompression.
     fn read_sealed(&self, seq: u64) -> Result<Sealed, AuditError> {
         let seq_i = i64::try_from(seq).map_err(|_| AuditError::NotFound { seq })?;
+        self.with_reader(|conn| Self::read_sealed_on(conn, seq, seq_i))
+    }
+
+    fn read_sealed_on(
+        conn: &rusqlite::Connection,
+        seq: u64,
+        seq_i: i64,
+    ) -> Result<Sealed, AuditError> {
         let io = |e: rusqlite::Error| AuditError::Io(e.to_string());
-        let mut guard = lock(&self.inner.shared.reader);
-        if lock(&self.inner.tx).is_none() {
-            return Err(AuditError::Closed);
-        }
-        if guard.is_none() {
-            *guard = Some(
-                schema::open_ro(&self.inner.db_path).map_err(|e| AuditError::Io(e.to_string()))?,
-            );
-        }
-        let Some(conn) = guard.as_ref() else {
-            return Err(AuditError::Closed);
-        };
         let sql = format!(
             "SELECT {} FROM events WHERE seq = ?1",
             FIELD_LIST.join(", ")

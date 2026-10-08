@@ -98,22 +98,6 @@ fn db_path(row: &Row<'_>, i: usize) -> Result<Option<std::path::PathBuf>, AuditE
     b.as_deref().map(os_path_from_bytes).transpose()
 }
 
-fn decision_of(s: &str) -> Option<DecisionColumn> {
-    use DecisionColumn as D;
-    [
-        D::Approve,
-        D::ApproveEdited,
-        D::Release,
-        D::ReleaseRedacted,
-        D::Deny,
-        D::Expire,
-        D::Cancel,
-        D::Reject,
-    ]
-    .into_iter()
-    .find(|d| d.as_str() == s)
-}
-
 fn header_from_row(row: &Row<'_>) -> Result<EventHeader, AuditError> {
     let text = |i: usize| -> Result<Option<String>, AuditError> { row.get(i).map_err(io) };
     let event_type = text(4)?
@@ -122,9 +106,10 @@ fn header_from_row(row: &Row<'_>) -> Result<EventHeader, AuditError> {
         .ok_or(AuditError::Invalid("events row has an unknown event_type"))?;
     let decision = match text(10)? {
         None => None,
-        Some(d) => {
-            Some(decision_of(&d).ok_or(AuditError::Invalid("events row has an unknown decision"))?)
-        }
+        Some(d) => Some(
+            DecisionColumn::parse(&d)
+                .ok_or(AuditError::Invalid("events row has an unknown decision"))?,
+        ),
     };
     let req = |v: Option<String>, what: &'static str| v.ok_or(AuditError::Invalid(what));
     Ok(EventHeader {
@@ -186,6 +171,13 @@ struct Group {
 }
 
 impl Group {
+    /// Only `DELIVERED` records survive of this request: they trail a terminal event (every
+    /// hand-off is logged, also long after the outcome), so a prune that cut through the
+    /// request removed its terminal event. Never invent a terminal state for it.
+    fn is_pruned_tail(&self) -> bool {
+        self.events.iter().all(|e| e.1 == EventType::DELIVERED)
+    }
+
     fn first_seq(&self) -> u64 {
         self.events.first().map_or(0, |e| e.0)
     }
@@ -226,22 +218,24 @@ impl Group {
 
 /// `requests[0].index` of a `WRITE_APPROVED` payload (every v1 write is one request); 0 when
 /// the payload has no (or an empty) `requests`.
-fn request_index(payload: &Value) -> Result<u64, AuditError> {
+fn request_index(seq: u64, payload: &Value) -> Result<u64, AuditError> {
     let Some(requests) = payload.get("requests") else {
         return Ok(0);
     };
-    let items = requests.as_array().ok_or(AuditError::Invalid(
-        "WRITE_APPROVED requests is not an array",
-    ))?;
+    let items = requests.as_array().ok_or(AuditError::InvalidRecord {
+        seq,
+        what: "WRITE_APPROVED requests is not an array",
+    })?;
     let Some(first) = items.first() else {
         return Ok(0);
     };
     first
         .get("index")
         .and_then(Value::as_u64)
-        .ok_or(AuditError::Invalid(
-            "WRITE_APPROVED requests[0].index is not an integer",
-        ))
+        .ok_or(AuditError::InvalidRecord {
+            seq,
+            what: "WRITE_APPROVED requests[0].index is not an integer",
+        })
 }
 
 fn system_event(t: EventType, request_id: &str, payload: Value) -> NewEvent {
@@ -287,21 +281,30 @@ impl Store {
     /// `Invalid` if the row is another event type or the payload lacks either field.
     pub fn script_failed_flags(&self, seq: u64) -> Result<ScriptFailedFlags, AuditError> {
         if self.header_at(seq)?.event_type != EventType::SCRIPT_FAILED {
-            return Err(AuditError::Invalid("record is not a SCRIPT_FAILED"));
+            return Err(AuditError::InvalidRecord {
+                seq,
+                what: "record is not a SCRIPT_FAILED",
+            });
         }
         let plain = self.read_payload(seq)?;
-        let p: Value = serde_json::from_slice(&plain)
-            .map_err(|_| AuditError::Invalid("SCRIPT_FAILED payload is not JSON"))?;
+        let p: Value = serde_json::from_slice(&plain).map_err(|_| AuditError::InvalidRecord {
+            seq,
+            what: "SCRIPT_FAILED payload is not JSON",
+        })?;
         let direct = p
             .get("direct")
             .and_then(Value::as_bool)
-            .ok_or(AuditError::Invalid(
-                "SCRIPT_FAILED payload has no direct flag",
-            ))?;
+            .ok_or(AuditError::InvalidRecord {
+                seq,
+                what: "SCRIPT_FAILED payload has no direct flag",
+            })?;
         let reason = p
             .get("reason")
             .and_then(Value::as_str)
-            .ok_or(AuditError::Invalid("SCRIPT_FAILED payload has no reason"))?;
+            .ok_or(AuditError::InvalidRecord {
+                seq,
+                what: "SCRIPT_FAILED payload has no reason",
+            })?;
         Ok(ScriptFailedFlags {
             direct,
             reason: reason.to_string(),
@@ -337,7 +340,10 @@ impl Store {
                 let t = EventType::parse(&t)
                     .ok_or(AuditError::Invalid("events row has an unknown event_type"))?;
                 if cur.as_ref().is_none_or(|g| g.request_id != rid) {
-                    out.extend(cur.take().filter(|g| !g.terminal_by_type()));
+                    out.extend(
+                        cur.take()
+                            .filter(|g| !g.is_pruned_tail() && !g.terminal_by_type()),
+                    );
                     cur = Some(Group {
                         request_id: rid,
                         events: Vec::new(),
@@ -347,7 +353,10 @@ impl Store {
                     g.events.push((seq, t));
                 }
             }
-            out.extend(cur.take().filter(|g| !g.terminal_by_type()));
+            out.extend(
+                cur.take()
+                    .filter(|g| !g.is_pruned_tail() && !g.terminal_by_type()),
+            );
             Ok(out)
         })?;
 
@@ -377,9 +386,12 @@ impl Store {
                 Some(approved) => {
                     let h = self.header_at(approved)?;
                     let plain = self.read_payload(approved)?;
-                    let p: Value = serde_json::from_slice(&plain)
-                        .map_err(|_| AuditError::Invalid("WRITE_APPROVED payload is not JSON"))?;
-                    let request_index = request_index(&p)?;
+                    let p: Value =
+                        serde_json::from_slice(&plain).map_err(|_| AuditError::InvalidRecord {
+                            seq: approved,
+                            what: "WRITE_APPROVED payload is not JSON",
+                        })?;
+                    let request_index = request_index(approved, &p)?;
                     let mut e = system_event(
                         EventType::WRITE_OUTCOME_UNKNOWN,
                         &g.request_id,

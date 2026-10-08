@@ -152,6 +152,11 @@ pub enum AuditError {
     },
     NeedsConfirmation(&'static str),
     Invalid(&'static str),
+    /// A stored record whose payload or columns have an unexpected shape.
+    InvalidRecord {
+        seq: u64,
+        what: &'static str,
+    },
     KeyStore(KeyStoreError),
     Restore(RestoreError),
     Io(String),
@@ -175,6 +180,9 @@ impl fmt::Display for AuditError {
             AuditError::NotFound { seq } => write!(f, "record {seq} not found"),
             AuditError::NeedsConfirmation(what) => write!(f, "{what} needs confirmation"),
             AuditError::Invalid(what) => write!(f, "invalid input: {what}"),
+            AuditError::InvalidRecord { seq, what } => {
+                write!(f, "record {seq} is unusable: {what}")
+            }
             AuditError::KeyStore(e) => write!(f, "{e}"),
             AuditError::Restore(e) => write!(f, "{e}"),
             AuditError::Io(m) => write!(f, "i/o error: {m}"),

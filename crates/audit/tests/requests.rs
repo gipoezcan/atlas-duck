@@ -135,7 +135,7 @@ fn script_failed_flags_reads_exactly_one_row() {
     assert_eq!(s.testing_payload_reads() - before, 2);
     assert!(matches!(
         s.script_failed_flags(other),
-        Err(AuditError::Invalid(_))
+        Err(AuditError::InvalidRecord { .. })
     ));
     assert!(matches!(
         s.script_failed_flags(9999),
@@ -156,7 +156,10 @@ fn script_failed_flags_rejects_unreadable_payload() {
     );
     for seq in [no_direct, no_reason, bad] {
         assert!(
-            matches!(s.script_failed_flags(seq), Err(AuditError::Invalid(_))),
+            matches!(
+                s.script_failed_flags(seq),
+                Err(AuditError::InvalidRecord { .. })
+            ),
             "{seq}"
         );
     }
@@ -235,7 +238,7 @@ fn reconcile_write_malformed_requests_fails_closed() {
     let head = s.head().0;
     assert!(matches!(
         s.reconcile_after_crash(),
-        Err(AuditError::Invalid(_))
+        Err(AuditError::InvalidRecord { .. })
     ));
     assert_eq!(s.head().0, head, "nothing is appended on error");
 }
@@ -382,6 +385,25 @@ fn reconcile_leaves_terminal_requests() {
     let report = s.reconcile_after_crash().unwrap();
     assert_eq!(report, ReconcileReport::default());
     assert_eq!(s.head().0, head);
+}
+
+#[test]
+fn reconcile_skips_groups_whose_terminal_event_was_pruned() {
+    // Only post-terminal DELIVERED records survive of these requests.
+    let (s, _f) = store();
+    put(&s, T::DELIVERED, "tail1", json!({}));
+    put(&s, T::DELIVERED, "tail2", json!({}));
+    put(&s, T::DELIVERED, "tail2", json!({}));
+    let head = s.head().0;
+    assert_eq!(
+        s.reconcile_after_crash().unwrap(),
+        ReconcileReport::default()
+    );
+    assert_eq!(s.head().0, head);
+    // A pending request that was also delivered is still reconciled.
+    put(&s, T::REQUEST_RECEIVED, "live", json!({}));
+    put(&s, T::DELIVERED, "live", json!({}));
+    assert_eq!(s.reconcile_after_crash().unwrap().abandoned, ["live"]);
 }
 
 #[test]
