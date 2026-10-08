@@ -856,10 +856,10 @@ impl Store {
         Ok((v, k))
     }
 
-    /// "Recover this log" step 4 (§8.7), after the KEK was re-sealed: writes the first-retained
-    /// anchor, then the head anchor at the committed head, both on the anchor thread behind a
-    /// restore-type barrier (nothing else may write the head meanwhile), then enables anchor
-    /// writes. On `Err` anchor writes stay disabled.
+    /// "Recover this log" step 4 (§8.7), after `KEY_RECOVERED` committed: writes the
+    /// first-retained anchor, then the head anchor at the committed head, both on the anchor
+    /// thread behind a restore-type barrier (nothing else may write the head meanwhile). Anchor
+    /// writes stay disabled: the caller enables them once the KEK is re-sealed.
     pub(crate) fn rebuild_anchors(
         &self,
         first_retained: FirstRetainedAnchor,
@@ -875,7 +875,6 @@ impl Store {
             first_retained,
         )?;
         guard.complete();
-        self.enable_anchors();
         Ok(())
     }
 

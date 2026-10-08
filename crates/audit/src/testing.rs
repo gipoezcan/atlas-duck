@@ -267,6 +267,9 @@ pub enum FaultPoint {
     /// before the KEK is re-sealed and the anchors are rebuilt. An armed failure ends the
     /// recovery there.
     AfterKeyRecoveredAppend,
+    /// "Recover this log": both anchors were rebuilt, the KEK is not re-sealed yet (a crash
+    /// there leaves the keychain lost). An armed failure ends the recovery there.
+    AfterRecoveryAnchors,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

@@ -1,6 +1,9 @@
 //! Real OS keychain. Every test is `#[ignore]`d: run with `-- --ignored --test-threads=1`.
 //! Each test uses a fresh random install id (`test-<random>`) and a guard that deletes all
-//! entries on drop, so a failure (or panic) leaves nothing behind.
+//! entries on drop, so a failure (or panic) leaves nothing behind. The one exception is U-18
+//! (module `u18`): `create_new_store` accepts only a 32-hex install id, so it uses
+//! `7e57` ("test") followed by `0000` and 24 random hex digits, which a sweep of leftover test
+//! entries can match as `atlas-duck/7e570000*`.
 
 use atlas_duck_audit::keystore::{EntryName, KeyStore, OsKeyStore, canary_self_test};
 
@@ -162,7 +165,8 @@ fn os_secret_service_attributes() {
 
 /// U-18 per OS (§13): a store on the real keychain, the keychain wiped (its five entries
 /// deleted), `keychain_lost`, then "Recover this log" on the same chain. `create_new_store`
-/// needs a real install id (32 hex), so this guard deletes everything of that random id.
+/// needs a 32-hex install id: `7e570000` + random (see the file header), and this guard deletes
+/// everything the flow creates under it.
 mod u18 {
     use std::sync::Arc;
 
@@ -174,6 +178,12 @@ mod u18 {
         LockedReason, OpenConfig, RecoveryOffer, SettingChange, StartupOutcome, create_new_store,
         new_ids, open, recover_this_log,
     };
+
+    /// `7e570000` ("test") + 24 random hex digits: a valid install id that is visibly a test's.
+    fn test_install_id() -> String {
+        let (random, _) = new_ids().expect("ids");
+        format!("7e570000{}", &random[8..])
+    }
     use secrecy::SecretString;
 
     #[path = "../common/mod.rs"]
@@ -213,7 +223,8 @@ mod u18 {
     #[test]
     #[ignore = "touches the OS keychain; run in the CI keychain step"]
     fn os_u18_keychain_wiped() {
-        let (install_id, chain_id) = new_ids().expect("ids");
+        let install_id = test_install_id();
+        let (_, chain_id) = new_ids().expect("ids");
         let ks = Arc::new(OsKeyStore::new(&install_id).expect("os keystore"));
         let guard = Wipe(ks.clone());
         let (_dir, data, lock) = tmp_data_dir();

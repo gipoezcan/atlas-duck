@@ -296,8 +296,9 @@ fn recover_no_anchor_write_before_rebuild() {
     let kek = pos(&EntryName::Kek).expect("Set(Kek)");
     let head = pos(&EntryName::HeadAnchor).expect("Set(HeadAnchor)");
     let first = pos(&EntryName::FirstRetainedAnchor).expect("Set(FirstRetainedAnchor)");
-    assert!(kek < first && kek < head, "{ops:?}");
-    assert!(head > at_hit.len() - baseline && first > at_hit.len() - baseline);
+    // Step 4: the anchors first, the KEK last (a crash in between leaves the keychain lost).
+    assert!(first < head && head < kek, "{ops:?}");
+    assert!(first >= at_hit.len() - baseline, "{ops:?}");
     assert!(keychain_head(&f).expect("head").seq >= report.key_recovered_seq);
     store.shutdown();
 }
@@ -388,9 +389,9 @@ fn recover_corrupt_kek_entry_deletes_surviving_pats() {
 
 #[test]
 fn recover_anchor_write_failure_leaves_keychain_lost() {
-    // The rebuild of the first-retained anchor fails: the re-sealed KEK is deleted again, so
-    // the next start is keychain_lost (and recovery can run again), never a store that opens
-    // with its anchors missing.
+    // The rebuild of the first-retained anchor fails: the KEK (written last) was never
+    // re-sealed, so the next start is keychain_lost (and recovery can run again), never a
+    // store that opens with its anchors missing.
     let f = closed_store(4);
     f.ring.wipe_install(&f.install_id);
     f.ring.fail_next(
@@ -425,6 +426,68 @@ fn recover_anchor_write_failure_leaves_keychain_lost() {
     let (store, verify) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
     assert!(verify.findings.is_empty(), "{:?}", verify.findings);
     store.shutdown();
+}
+
+/// After a recovery stopped between the anchor rebuild and the KEK re-seal: the anchors match
+/// the DB, the KEK is absent. The next start is keychain_lost, and a second recovery verifies
+/// those anchors cleanly (no finding beyond the lost KEK) and completes.
+fn rerun_after_anchors_without_kek(f: &Fixture, first_verify: u64) {
+    assert!(raw_entry(f, "kek").is_none());
+    let head = keychain_head(f).expect("head anchor rebuilt");
+    assert_eq!(head.seq, first_verify + 1, "at KEY_RECOVERED");
+    assert!(keychain_first_retained(f).is_some());
+    assert_eq!(
+        locked(open(&f.data, &f.lock, f.config()).expect("open")),
+        LOST
+    );
+
+    let (store, report) = recover(f, f.config(), PASSPHRASE).expect("second recovery");
+    assert_eq!(report.verify_seq, first_verify + 2);
+    let v = payload(&store, report.verify_seq);
+    assert_eq!(kinds(&v), vec!["anchor_missing".to_string()], "{v}");
+    assert_eq!(
+        v["findings"][0]["detail"],
+        "the keychain KEK of this install was lost"
+    );
+    assert_eq!(
+        store.open_incidents(),
+        vec![first_verify, report.verify_seq]
+    );
+    store.shutdown();
+    let (store, verify) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
+    assert!(verify.findings.is_empty(), "{:?}", verify.findings);
+    store.shutdown();
+}
+
+#[test]
+fn recover_crash_after_anchors_before_kek_reseal() {
+    let f = closed_store(6);
+    let h = dump_rows(&f).last().expect("rows").seq;
+    f.ring.wipe_install(&f.install_id);
+    let faults = Faults::new();
+    faults.fail(FaultPoint::AfterRecoveryAnchors, 1);
+    let mut cfg = f.config();
+    cfg.hooks.faults = Some(faults);
+    assert!(recover(&f, cfg, PASSPHRASE).is_err(), "simulated crash");
+    rerun_after_anchors_without_kek(&f, h + 1);
+}
+
+#[test]
+fn recover_kek_reseal_failure_keeps_the_rebuilt_anchors() {
+    let f = closed_store(6);
+    let h = dump_rows(&f).last().expect("rows").seq;
+    f.ring.wipe_install(&f.install_id);
+    f.ring.fail_next(
+        KeyOpKind::Set,
+        Some(EntryName::Kek),
+        KeyStoreError::Unavailable,
+        1,
+    );
+    match recover(&f, f.config(), PASSPHRASE) {
+        Err(OpenError::KeyStore(KeyStoreError::Unavailable)) => {}
+        other => panic!("expected KeyStore(Unavailable), got {other:?}"),
+    }
+    rerun_after_anchors_without_kek(&f, h + 1);
 }
 
 #[test]
@@ -506,7 +569,8 @@ fn recover_swapped_recovery_blob_is_refused() {
 
 #[test]
 fn recover_refused_for_another_install_id() {
-    // A keystore of another install (a wrong pinned id) never gets this store's KEK.
+    // A keystore of another install (a wrong pinned id) never gets this store's KEK, nor a
+    // single keyring call (not even the canary) in its namespace.
     let f = closed_store(4);
     f.ring.wipe_install(&f.install_id);
     let (other, _) = new_ids().expect("ids");
@@ -518,11 +582,8 @@ fn recover_refused_for_another_install_id() {
         other => panic!("expected Invalid, got {other:?}"),
     }
     assert_eq!(db_files(f.dir.path()), files);
-    assert!(
-        !f.ring.ops()[baseline..]
-            .iter()
-            .any(|o| is_kek_or_anchor_set(o, &other) || is_kek_or_anchor_set(o, &f.install_id))
-    );
+    let ops = f.ring.ops()[baseline..].to_vec();
+    assert!(ops.is_empty(), "no keyring access: {ops:?}");
 }
 
 #[test]
@@ -734,6 +795,38 @@ fn archive_refuses_unusable_chain_id() {
     }
     assert_eq!(db_files(f.dir.path()), before);
     assert!(!f.dir.path().join("archived").exists());
+}
+
+#[test]
+fn archive_failure_after_the_rename_moves_the_store_back() {
+    // `audit.db-shm` cannot be deleted (it is a directory here): a step after the rename fails,
+    // so the store is moved back and stays openable. The caller never sees "no audit.db" without
+    // the ArchivedDb that names it.
+    let f = closed_store(2);
+    assert!(
+        !f.dir.path().join("audit.db-wal").exists(),
+        "no WAL: a plain peek"
+    );
+    let shm = f.dir.path().join("audit.db-shm");
+    std::fs::create_dir(&shm).expect("blocking -shm");
+    let before = db_files(f.dir.path());
+    match archive_and_start_fresh(&f.data, &f.lock, confirmed()) {
+        Err(OpenError::Io(_)) => {}
+        other => panic!("expected Io, got {other:?}"),
+    }
+    assert_eq!(
+        db_files(f.dir.path()),
+        before,
+        "audit.db is back, unchanged"
+    );
+    let archived: Vec<String> = entries(&f.dir.path().join("archived"))
+        .into_iter()
+        .filter(|n| n.contains(".db"))
+        .collect();
+    assert!(archived.is_empty(), "{archived:?}");
+    std::fs::remove_dir(&shm).expect("remove blocker");
+    let (store, _) = ready(open(&f.data, &f.lock, f.config()).expect("open"));
+    store.shutdown();
 }
 
 #[test]

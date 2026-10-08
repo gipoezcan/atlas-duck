@@ -165,31 +165,31 @@ fn recovery_findings(found: Vec<VerifyFinding>) -> Vec<VerifyFinding> {
 /// "Recover this log" (§8.7, C.3) for a store whose keychain is lost, with the store's
 /// recovery passphrase. In order:
 ///
-/// 1. leftover staging files are deleted; `audit.db` must exist (`Io(NotFound)`); the version
-///    gate (`NewerStore`); keyring locality (`KeyStore(NotLocal | Unavailable)`, no keyring
-///    access);
+/// 1. leftover staging files are deleted (never a store, as in `open`; the only file change
+///    before the passphrase is checked); `audit.db` must exist (`Io(NotFound)`); the version gate
+///    (`NewerStore`); keyring locality (`KeyStore(NotLocal | Unavailable)`, no keyring access);
 /// 2. the KEK is unwrapped from the `recovery` row before any keychain call: a wrong passphrase
-///    is `WrongPassphrase` and nothing was written, in the DB or the keychain; then the canary;
-///    the keychain must really be lost (`Invalid` if its KEK opens the store, `Integrity` if it
-///    equals the recovered KEK); a keystore of another install than the store names is
-///    `Invalid`; an unfinished `RESTORE` of this install is `Invalid` (its
-///    "Finish restore" is restore's); the recovered KEK must unwrap a data key (`Integrity`
-///    otherwise: a swapped recovery row);
+///    is `WrongPassphrase` and the DB and the keychain are untouched. Still before the first
+///    keychain call: a keystore of another install than the store names is `Invalid`; an
+///    unfinished `RESTORE` of this install is `Invalid` (its "Finish restore" is restore's); the
+///    recovered KEK must unwrap a data key (`Integrity` otherwise: a swapped recovery row). Then
+///    the canary, and the keychain must really be lost (`Invalid` if its KEK opens the store,
+///    `Integrity` if it equals the recovered KEK);
 /// 3. full verification of the chain from the first retained record, the `prune_log` and the
 ///    anchor dir, with whatever anchor entries survived;
 /// 4. the writer starts (anchor writes disabled), runs the migrations (`SCHEMA_MIGRATED`), then
 ///    commits `VERIFY {scope: "recover", result: "anchor_missing"}` (flag `integrity_incident`,
 ///    every finding of step 3 included) together with `KEY_RECOVERED`;
 /// 5. this install's `pat/<instance-id>` entries are deleted for every instance of the settings
-///    view (every instance needs its token: L53), then the KEK is re-sealed, then both anchors
-///    are rebuilt from the DB (first-retained, then head at the `KEY_RECOVERED` head), and only
-///    then are anchor writes enabled.
+///    view (every instance needs its token: L53); both anchors are rebuilt from the DB
+///    (first-retained, then head at the `KEY_RECOVERED` head); the KEK is re-sealed **last**;
+///    only then are anchor writes enabled.
 ///
 /// The `chain_id` is unchanged: recovery is not a segment boundary. Any failure after the writer
-/// started shuts it down and returns the error; a failed re-seal or anchor rebuild deletes the
-/// KEK entry again (best effort). The keychain then stays lost and a retry runs as a new
-/// recovery (its own `VERIFY` and `KEY_RECOVERED`); the PATs are deleted before the re-seal,
-/// so a failed recovery never leaves a store that opens with them.
+/// started shuts it down and returns the error. Because the KEK is written last, a failure or a
+/// crash anywhere before it leaves the keychain lost (anchors, if written, match the DB) and
+/// recovery simply runs again, with its own `VERIFY` and `KEY_RECOVERED`; the PATs go first, so
+/// a store never opens again with them.
 pub fn recover_this_log(
     data: &LocalDataDir,
     lock: &InstanceLock,
@@ -212,8 +212,6 @@ pub fn recover_this_log(
     }
     let ro = schema::open_peek(&db)?;
     let kek = recovered_kek(&ro, passphrase)?;
-    canary_self_test(&*cfg.keys)?;
-    check_keychain_lost(&ro, &*cfg.keys, &kek)?;
     // The KEK is re-sealed under the keystore's install_id: it must be the store's own
     // (§8.6; unknown only when no retained record names one).
     if verify::store_install_id(&ro)
@@ -234,6 +232,8 @@ pub fn recover_this_log(
             "the recovered KEK opens none of the store's data keys".into(),
         ));
     }
+    canary_self_test(&*cfg.keys)?;
+    check_keychain_lost(&ro, &*cfg.keys, &kek)?;
 
     // Verification (§8.7 step 2), as `preflight` reads the anchor dir.
     let anchors = surviving_anchors(&*cfg.keys)?;
@@ -257,13 +257,17 @@ pub fn recover_this_log(
         .optional()
         .map_err(sql)?;
     // `genesis_hash` is informational once `GENESIS` is pruned (plan decision): a surviving
-    // first-retained anchor of this chain keeps its value, else 32 zero bytes.
+    // first-retained anchor of this chain that verification did not flag keeps its value,
+    // else 32 zero bytes.
+    let first_retained_flagged = findings
+        .iter()
+        .any(|f| f.kind == FindingKind::FirstRetainedMismatch);
     let genesis_hash = match verify::retained_genesis_hash(&ro).map_err(sql)? {
         Some(g) => g,
         None => anchors
             .first_retained
             .as_ref()
-            .filter(|f| Some(&f.chain_id) == head_chain.as_ref())
+            .filter(|f| !first_retained_flagged && Some(&f.chain_id) == head_chain.as_ref())
             .map_or(ZERO_HASH, |f| f.genesis_hash),
     };
     let (first_retained_seq, first_retained_prev_hash) =
@@ -271,6 +275,8 @@ pub fn recover_this_log(
     drop(ro);
 
     let keys = cfg.keys.clone();
+    #[cfg(any(test, feature = "testing"))]
+    let hooks = cfg.hooks.clone();
     let kek_entry = kek.to_entry_bytes();
     let store = start_existing(data, cfg, kek, Some(genesis_hash))?;
     let finish = || -> Result<RecoverReport, OpenError> {
@@ -280,26 +286,22 @@ pub fn recover_this_log(
             keys.delete(&EntryName::Pat(id.clone()))?;
         }
         let (_, _, chain_id) = store.head();
-        let resealed = keys
-            .set(&EntryName::Kek, &kek_entry)
-            .map_err(OpenError::from)
-            .and_then(|()| {
-                store
-                    .rebuild_anchors(FirstRetainedAnchor {
-                        chain_id,
-                        genesis_hash,
-                        first_retained_seq,
-                        first_retained_prev_hash,
-                    })
-                    .map_err(audit_err)
-            });
-        if let Err(e) = resealed {
-            // Back to a lost keychain (best effort), so the next start offers recovery again
-            // instead of serving the store with its anchors missing.
-            let _ = keys.delete(&EntryName::Kek);
-            return Err(e);
-        }
-        store.update_written_by()?;
+        store
+            .rebuild_anchors(FirstRetainedAnchor {
+                chain_id,
+                genesis_hash,
+                first_retained_seq,
+                first_retained_prev_hash,
+            })
+            .map_err(audit_err)?;
+        #[cfg(any(test, feature = "testing"))]
+        hooks
+            .fault(crate::testing::FaultPoint::AfterRecoveryAnchors)
+            .map_err(audit_err)?;
+        keys.set(&EntryName::Kek, &kek_entry)?;
+        store.enable_anchors();
+        // Advisory (§8.13): the recovery itself is complete, its report must reach the caller.
+        let _ = store.update_written_by();
         Ok(RecoverReport {
             verify_seq: verify.seq,
             key_recovered_seq: recovered.seq,
@@ -389,17 +391,23 @@ fn file_len(p: &Path) -> io::Result<Option<u64>> {
 /// caller then runs `create_new_store` with the returned [`ArchivedDb`] (and new ids). No
 /// store of this data dir may be running.
 ///
+/// It does not check that the keychain is lost: the caller decides when it is offered
+/// (`keychain_lost`, or after recovery refused with `Integrity`).
+///
 /// The old DB is moved, never deleted or opened read-write: its plaintext head is read on a
 /// read-only connection (closed again), `audit.db` is renamed to
 /// `archived/audit-<chain_id>-<head_seq>-<UTC stamp>.db` first, then `audit.db-wal` (if any)
 /// beside it (a crash in between leaves `audit.db-wal` without `audit.db`, which `open` and
-/// `create_new_store` refuse, rather than a DB without its WAL), `audit.db-shm` is deleted and
-/// the dirs are synced. Afterwards the archived file must report the same head and sizes;
-/// otherwise both files are moved back (best effort) and the result is `Integrity`.
+/// `create_new_store` refuse, rather than a DB without its WAL; the repair is manual: move the
+/// WAL next to the archived file). Then `audit.db-shm` is deleted, the dirs are synced and the
+/// archived file must report the same head and sizes. If any step after the renames fails,
+/// both files are moved back and its error is returned.
 ///
 /// `Io(NotFound)` without `audit.db`; `NewerStore` for a store of a newer build (nothing is
-/// moved: upgrading opens it); `Integrity` for a `chain_id` that is not 32 lowercase hex (it
-/// names the file); `AlreadyExists` if the archive name is taken (never overwritten).
+/// moved: upgrading opens it; the gate is this build's schema head, without test migrations);
+/// `Integrity` for a `chain_id` that is not 32 lowercase hex (it names the file);
+/// `AlreadyExists` if the archive name is taken. That check precedes the rename (which would
+/// replace a file); the instance lock and the millisecond stamp leave no realistic race.
 pub fn archive_and_start_fresh(
     data: &LocalDataDir,
     lock: &InstanceLock,
@@ -440,26 +448,39 @@ pub fn archive_and_start_fresh(
         let _ = std::fs::rename(&target, &db);
         return Err(e.into());
     }
-    remove_if_present(&with_suffix(&db, "-shm"))?;
-    sync_dir(&dir)?;
-    sync_dir(data.path())?;
 
-    // The archived store is still the old one: same sizes, same head (its WAL included).
-    let check = (|| -> Result<bool, OpenError> {
+    // Everything after both renames is checked: a failure moves both files back, so the caller
+    // never ends up without `audit.db` and without the `ArchivedDb` that names it.
+    let finish = || -> Result<(), OpenError> {
+        remove_if_present(&with_suffix(&db, "-shm"))?;
+        sync_dir(&dir)?;
+        sync_dir(data.path())?;
+        // The archived store is still the old one: same sizes, same head (its WAL included).
         let same_sizes = (file_len(&target)?, file_len(&target_wal)?) == sizes;
-        let after = plaintext_head(&target)?;
-        Ok(same_sizes && after.0 == head_seq && after.1 == head_hash && after.2 == chain_id)
-    })();
-    // A read-only open of a store with a WAL may have created `-shm`; it is derived state.
-    let _ = remove_if_present(&with_suffix(&target, "-shm"));
-    if !matches!(check, Ok(true)) {
-        let _ = std::fs::rename(&target, &db);
-        if sizes.1.is_some() {
-            let _ = std::fs::rename(&target_wal, &wal);
+        let after = plaintext_head(&target);
+        // A read-only open of a store with a WAL may have created `-shm`; it is derived state.
+        let _ = remove_if_present(&with_suffix(&target, "-shm"));
+        let after = after?;
+        if !(same_sizes && after.0 == head_seq && after.1 == head_hash && after.2 == chain_id) {
+            return Err(OpenError::Integrity(
+                "the archived store does not match the store that was moved".into(),
+            ));
         }
-        return Err(OpenError::Integrity(
-            "the archived store does not match the store that was moved".into(),
-        ));
+        Ok(())
+    };
+    if let Err(e) = finish() {
+        let back = std::fs::rename(&target, &db).and_then(|()| match sizes.1 {
+            Some(_) => std::fs::rename(&target_wal, &wal),
+            None => Ok(()),
+        });
+        if back.is_err() {
+            // Both faults: say where the old store is, so it can be moved back by hand.
+            return Err(OpenError::Integrity(format!(
+                "archiving failed ({e}) and the store could not be moved back from {ARCHIVE_DIR}/{name}"
+            )));
+        }
+        let _ = sync_dir(data.path());
+        return Err(e);
     }
     Ok(ArchivedDb {
         file: format!("{ARCHIVE_DIR}/{name}"),
