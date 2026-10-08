@@ -448,6 +448,7 @@ dependencies = [
  "atlas-duck-preview",
  "atlas-duck-registry",
  "core-foundation",
+ "proptest",
  "serde_json",
  "system-configuration-sys",
  "tempfile",

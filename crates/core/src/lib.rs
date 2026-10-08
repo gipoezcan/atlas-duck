@@ -9,5 +9,7 @@ pub mod config;
 
 /// Per-instance HTTP client construction (§7.2, V17).
 pub mod http_factory;
+/// Request lifecycle: the pure §5.1 state machine model.
+pub mod lifecycle;
 /// Proxy resolution (L42) and the per-OS static proxy readers (V17).
 pub mod proxy;

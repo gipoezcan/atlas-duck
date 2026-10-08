@@ -27,6 +27,7 @@ testing = []
 
 [dev-dependencies]
 atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }
+proptest = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
