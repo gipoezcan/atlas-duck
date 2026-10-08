@@ -6,7 +6,7 @@
 
 **Architecture:** A Rust workspace of ten crates plus a Tauri 2 package (`app/src-tauri`, three `[[bin]]`s: `atlas-duck-app`, `atlas-duck`, `atlas-duck-sandbox`) and a React + TypeScript UI (`app/ui`). `atlas-duck-app` is the only process that holds secrets, opens the audit DB and talks to Atlassian; the CLI/MCP front end is a thin same-user IPC client, and each agent script runs in a separate confined QuickJS process whose `atlas.*` calls the app answers. Approval decisions, approvability, opened-flag and revision binding are enforced in Rust (`core`), never in the webview; every effect is preceded by a durably committed audit record.
 
-**Tech Stack:** Rust 1.95.0 (pinned in `rust-toolchain.toml`; `rust-version = "1.90"`, edition 2024), Tauri 2.12.1 (+ `tauri-plugin-single-instance` 2.5.2, `tauri-plugin-autostart` 2.7.0, `tauri-plugin-notification` 2.5.1, `tauri-plugin-dialog` 2.8.1), `rquickjs` =0.14.0 (QuickJS-NG 0.16.2, pinned exact), `rusqlite` 0.40.2 (`bundled`), `reqwest` 0.13.5 (rustls), `tokio` 1.53.2, `tokio-util` 0.7.19, `windows-sys` 0.61.2, `keyring` 4.2.0 / `keyring-core` 1.0.0 (+ per-OS store crates, Windows persistence set to Local explicitly), `aes-gcm` 0.11.1 + `sha2` 0.11.0 + `argon2` 0.6.0 (pinned together), `zstd` 0.14.0, `ammonia` 4.2.1, `quick-xml` 0.42.0, `htmd` 0.5.5, `html5ever` 0.40.1, `wiremock` and `proptest` (tests), Node 22.13 / npm 11.6, Vite + React + TypeScript + Vitest + Testing Library (UI). The spec pins none of these; they are plan choices taken from `research.json` (verified 2026-10-07). **Unverified, to be pinned by the milestone plan that first uses them:** `rmcp` (M9), `pulldown-cmark` (M5), the argv parser (M4), React/Vite exact versions (M1), the Unicode-property crates for `preview::invisible` (M3, §15 item V31), the JSON-Schema crate (M3), an RFC 8785 (JCS) crate for `params_sha256` and the audit payload bytes (M2/M3), Unicode NFC and simple case-folding crates for the username comparison and the canonical match form (M3), `secrecy` and `zeroize` (M2/M3), `async-trait` for the dyn-used async traits of the contracts (M3).
+**Tech Stack:** Rust 1.95.0 (pinned in `rust-toolchain.toml`; `rust-version = "1.90"`, edition 2024), Tauri 2.12.1 (+ `tauri-plugin-single-instance` 2.5.2, `tauri-plugin-autostart` 2.7.0, `tauri-plugin-notification` 2.5.1, `tauri-plugin-dialog` 2.8.1), `rquickjs` =0.14.0 (QuickJS-NG 0.16.2, pinned exact), `rusqlite` 0.40.2 (`bundled`), `reqwest` 0.13.5 (rustls), `tokio` 1.53.2, `tokio-util` 0.7.19, `windows-sys` 0.61.2, `keyring-core` 1.0.0 + `windows-native-keyring-store` 1.1.0 / `apple-native-keyring-store` 1.0.2 (`keychain`) / `zbus-secret-service-keyring-store` 1.0.1 (`crypto-rust`) (no `keyring` umbrella crate, M2 plan decision 2; Windows persistence set to Local explicitly), `serde_jcs` =0.2.0 (in `ipc`, `ipc::jcs`), `aes-gcm` 0.11.1 + `sha2` 0.11.0 + `argon2` 0.6.0 (pinned together), `zstd` 0.14.0, `ammonia` 4.2.1, `quick-xml` 0.42.0, `htmd` 0.5.5, `html5ever` 0.40.1, `wiremock` and `proptest` (tests), Node 22.13 / npm 11.6, Vite + React + TypeScript + Vitest + Testing Library (UI). The spec pins none of these; they are plan choices taken from `research.json` (verified 2026-10-07). **Unverified, to be pinned by the milestone plan that first uses them:** `rmcp` (M9), `pulldown-cmark` (M5), the argv parser (M4), React/Vite exact versions (M1), the Unicode-property crates for `preview::invisible` (M3, §15 item V31), the JSON-Schema crate (M3), an RFC 8785 (JCS) crate for `params_sha256` and the audit payload bytes (M2/M3), Unicode NFC and simple case-folding crates for the username comparison and the canonical match form (M3), `secrecy` and `zeroize` (M2/M3), `async-trait` for the dyn-used async traits of the contracts (M3).
 
 **Spec:** `docs/superpowers/specs/2026-10-07-atlas-duck-design.md` (+ ledger `docs/superpowers/specs/2026-10-07-atlas-duck-review-ledger.md`)
 
@@ -160,6 +160,9 @@ Only the surface that another crate, another milestone or the app consumes. Rust
 // id, product, class, params_schema, cli: CliBinding, target_params, target_display, similarity,
 // field_rules, caps, min_version, paginated, result_projection, success, redaction_rules,
 // result_example, result_example_sparse, result_schema
+// [2026-10-08 M3 PD-26] `params_schema`, `result_schema`, `result_example`, `result_example_sparse` are `&'static str` JSON text (a `serde_json::Value` cannot be a `const`) read through
+// `*_json() -> serde_json::Value` accessors; additive fields `endpoint: Endpoint`, `alt_endpoint: Option<AltEndpoint>`, `conflict_baselines`, `write_guidance` (the template/body/query data `core` hands to `atlassian`);
+// plan-named supporting types `Method`, `Endpoint`, `QueryParam`, `QueryValue`, `BodySource`, `AltEndpoint`, `CliBinding`/`FlagBinding`/`FlagKind`, `TargetDisplay`, `FieldRules`, `Caps`/`MaxCap`, `Projection` (the M3 plan lists their shapes).
 pub enum Product { Jira, Confluence }                         // [spec]
 pub enum OpClass { Read, Write }                              // [spec]
 pub enum Similarity { Target, Create, MoveIssues, None }      // [spec]
@@ -200,11 +203,14 @@ pub const SCRIPT_RUN: &ScriptRunSpec;                // op id "script.run": NOT 
 //      CliToml {app_path}, read_cli_toml, write_cli_toml, PinnedError, Locality, NotLocalKind, check_locality, classify_linux_f_type,
 //      classify_windows_drive_type, LocalDataDir /* no public ctor */, DataDirResolution {BeforeFirstRun, Missing, NotLocal, Local(LocalDataDir)},
 //      resolve_data_dir(Option<&PinnedPaths>), check_data_dir(&Path), REASON_DATA_DIR_MISSING, REASON_DATA_DIR_NOT_LOCAL}
+// [M2] atlas_duck_ipc::jcs::{to_jcs_vec(&serde_json::Value) -> Result<Vec<u8>, JcsError>, JcsError { IntegerOutOfRange, Serialize(String) }, MAX_SAFE_INTEGER: i64 = 2^53 − 1}   // RFC 8785 over `serde_jcs =0.2.0`; the one JCS implementation (audit payload bytes, `request_set_hash`, `params_sha256`); integers beyond ±(2^53 − 1) are rejected
+//      Dependency consequence: `serde_jcs` (+ `ryu-js`, `serde_json`) sits in `ipc`, so it is in the normal-dependency closure of `cli` and `sandbox-worker`; none of them is on `ci/check-workspace.mjs` `BANNED_IN_CLI_AND_WORKER`, so the rule stays green (the M2 plan runs the checker after adding the pins).
+//      The same list must also gain `keyring-core`, `windows-native-keyring-store`, `apple-native-keyring-store` and `zbus-secret-service-keyring-store` (the audit-only keychain crates replace the dropped `keyring` umbrella, which the list names today) with a case in `ci/check-workspace.test.mjs`; the M2 plan does not schedule this yet, so it is an M2 Task 1 addition.
 // [M1] atlas_duck_ipc::sandbox::{MAX_FRAME_BYTES = 24 MiB, WORKER_FRAME_MAX_BYTES = 1 MiB,
 //      frame::{write_frame, read_frame, FrameError, codec()  /* feature "async" */}, probe::{ProbeId, ProbeRequest, ConfinementReport, ProbeReady, ProbeOutcome, ProbeResultMsg, M_PROBE_*}}
 ```
 
-M3 adds `atlas_duck_ipc::proto` (types only; `core` depends on it):
+M3 adds `atlas_duck_ipc::proto` (types only; `core` depends on it) and, in `atlas_duck_ipc::sandbox`, `ScriptLimits` plus `HostCall`/`HostCallResult` (moved forward from M8, C.8; the worker needs them in M8 and `core::HostCalls` names them in M3):
 
 ```rust
 pub enum ClientKind { Cli, Mcp }                                                       // wire "cli" | "mcp"
@@ -225,7 +231,7 @@ pub struct Meta { pub fetched_at: Option<String>, pub released_at: Option<String
                   pub conversion: Option<serde_json::Value>, pub dry_run: Option<serde_json::Value> }   // field names and inner shapes §4.2/§7.5; a None field is omitted on the wire
 pub enum ListState { Pending, Recent }                                                  // `requests list`: pending, or decided within 24 h (§4.4)
 pub struct MatchParams { pub op_id: String, pub params: serde_json::Value, pub instance: Option<String> }   // `--match-params-file` (§4.4)
-pub fn params_sha256(op_id: &str, instance_id: Option<&str>, params: &serde_json::Value) -> [u8; 32];  // JCS (RFC 8785)
+pub fn params_sha256(op_id: &str, instance_id: Option<&str>, params: &serde_json::Value) -> Result<[u8; 32], jcs::JcsError>;  // JCS (RFC 8785) via `ipc::jcs` [2026-10-08 M3 PD-27: fallible, an integer beyond ±(2^53 − 1) is `validation`, exit 2, nothing logged]; `params_sha256_hex` likewise returns `Result<String, JcsError>`
 pub fn new_request_id() -> String;                                                      // "req_" + ≥ 122 bits CSPRNG
 pub struct ScriptLimits { pub timeout_s: u32, pub heap_mb: u32, pub process_mb: u32, pub max_calls: u32, pub max_fetch_mb: u32,
                           pub max_call_result_mb: u32, pub max_result_mb: u32, pub max_concurrent_calls: u32 }   // [spec §9.4 keys] in `ipc::sandbox`; `Default` = 120/256/512/200/50/16/16/4; deny_unknown_fields; used by `core::validate` (M3), `ops describe` and `script run --limits` (M4), the worker (M8)
@@ -307,13 +313,14 @@ impl Store {
     pub fn recent_headers(&self, since: std::time::Duration) -> Result<Vec<EventHeader>, AuditError>; // ≤ 24 h, no decrypt
     pub fn reconcile_after_crash(&self) -> Result<ReconcileReport, AuditError>;        // §11.3; run at startup step 5, before APP_START
     pub fn observe_server_date(&self, instance_id: &str, server_date: std::time::SystemTime, at: std::time::Instant);
-    pub fn settings(&self) -> Settings;                                                // retention_days, legal_hold, anchor_dir, per-instance origin/CA fingerprint/proxy (view over the latest CONFIG_CHANGED/LEGAL_HOLD_CHANGED per key; the spec says these are "stored authoritatively in the audit DB" but names no table, closed this way. Being derived from encrypted events it is readable only after the KEK is obtained (§8.7 step 2), so nothing may read retention or instance origins while the app is locked; a plaintext `settings` table outside the chain is the alternative the M2 plan may choose, trading tamper-evidence for readability while locked)
+    pub fn settings(&self) -> Settings;                                                // retention_days, legal_hold, anchor_dir, per-instance origin/CA fingerprint/proxy (view over the latest CONFIG_CHANGED/LEGAL_HOLD_CHANGED per key; the spec says these are "stored authoritatively in the audit DB" but names no table, closed this way. Being derived from encrypted events it is readable only after the KEK is obtained (§8.7 step 2), so nothing may read retention or instance origins while the app is locked; a plaintext `settings` table outside the chain is the alternative the M2 plan may choose, trading tamper-evidence for readability while locked; M2 settled it as the view, with a settings snapshot embedded in every `PRUNE` payload so the settings survive prune. Shape: `Settings { retention_days, legal_hold, anchor_dir, instances: BTreeMap<instance_id, InstancePolicy { origin: Option<String> /* Some = confirmed origin */, ca_fingerprint: Option<String>, proxy: Option<String> /* None = OS static proxy, Some("direct"), Some("host:port") */ }> }`; `SettingChange { RetentionDays, LegalHold, AnchorDir, InstanceOrigin { instance_id, origin }, InstanceCaFingerprint { instance_id, fingerprint }, InstanceProxy { instance_id, proxy } }`; `Store::reconcile_config_file(&FilePolicy)` covers retention, legal hold and anchor dir only and `core` calls it first in `Core::start`; file-side instance edits are logged by `core` as `CONFIG_CHANGED {source: "file", applied: false}`)
     pub fn apply_setting(&self, change: SettingChange, confirmed: Option<Confirmed>) -> Result<Committed, AuditError>;
     pub fn prune(&self, confirm_large_advance: Option<Confirmed>) -> Result<PruneOutcome, AuditError>;
     pub fn full_verify(&self) -> Vec<VerifyFinding>;  pub fn open_incidents(&self) -> Vec<u64>;
     pub fn acknowledge_incident(&self, verify_seq: u64, os_user: &str, note: &str) -> Result<Committed, AuditError>;
     pub fn backup(&self, out: RustChosenPath) -> Result<BackupReceipt, AuditError>;     // v1 has no `vault` (L39); the snapshot is re-vacuumed, manifest last
     pub fn restore(&self, bundle: RustChosenPath, passphrase: &secrecy::SecretString, confirm_rollback: Option<Confirmed>) -> Result<RestoreReport, AuditError>; // §8.11 as specified (L40); drops any `vault` rows of a crafted snapshot
+    // [2026-10-08 spec fix L53, L54] "Restore backup" is a §10.3 security-weakening setting, but `restore` has no general confirmation parameter (only the rollback one): the caller (M10) asks the native `NativeConfirmer` confirmation first and calls `restore` only on Ok. `restore` and "Recover this log" delete this install's `pat/<instance_id>` keychain entries and report their ids (`RestoreReport.pats_deleted`, `RecoverReport.pats_deleted`); `core` then logs `INSTANCE_STATE_CHANGED {needs_token}` for each.
     pub fn export(&self, range: TimeRange, out: RustChosenPath) -> Result<ExportReceipt, AuditError>;  // M10; full-range decrypted export as specified (L41)
     pub fn flush_head_anchor(&self) -> Result<(), AuditError>;                          // on APP_STOP
 }
@@ -368,21 +375,28 @@ pub enum ExpectedBody { Json, Empty }
 pub struct SuccessExpectation { pub statuses: Option<Vec<u16>> /* None = any 2xx */, pub body: ExpectedBody }   // `core` copies it from the registry `SuccessShape`; `atlassian` has no `registry` edge
 pub struct ApprovedWrite { pub requests: Vec<HttpRequestSpec>, pub success: SuccessExpectation }   // no hash here: `atlassian` cannot depend on `audit`; `core` recomputes `audit::request_set_hash` from this list and compares it with the `WRITE_APPROVED` value immediately before `send_approved`
 pub struct GetCall { pub endpoint_template: String, pub params: serde_json::Value }              // `core` copies the template string from `registry` data
-pub struct PagedCall { pub get: GetCall, pub items_key: String, pub offset_param: String, pub limit_param: String, pub page_size: u32 }   // items_key and param names from `registry::PageSpec`
+pub struct PagedCall { pub get: GetCall, pub items_key: String, pub offset_param: String, pub limit_param: String, pub page_size: u32, pub start: u64 }   // items_key and param names from `registry::PageSpec`; `start` = the agent's `start` [2026-10-08 M3 PD-07]
+pub struct PagedOutcome { pub pages: Vec<UpstreamResponse> /* every complete page, in order */, pub items_fetched: u64, pub end: PageEnd, pub failure: Option<FetchFailure> /* ended paging early; its bytes inside */, pub next_start: Option<u64> /* §7.5 server arithmetic */, pub server_total: Option<u64> }   // [M3 PD-07] named but undefined before
+pub enum PageEnd { ResultsEnded, MaxReached, FetchCap50MiB, ReadBudget120s, Failed }
+pub struct FetchControl { /* cancel token + shared capture; Clone */ }   // [M3 PD-07] `new()`, `cancel()` (never awaits), `take_captured() -> Captured { sent: bool, pages: Vec<UpstreamResponse>, partial: Vec<u8> }`
+// Every fetch/send method above also exists as a `_ctl` variant taking `&FetchControl` (`get_ctl`, `post_search_ctl`, `read_paginated_ctl(.., max_items, ctl)`, `read_paginated_search_ctl`, `send_approved_ctl`); the signatures above stay as thin wrappers with a fresh control.
 pub struct SearchCall { pub endpoint_template: String, pub body: serde_json::Value }            // the `jira.search` request body
 pub struct ReadBudget { pub total: std::time::Duration /* 120 s */, pub max_bytes: u64 /* 50 MiB */, pub max_response_bytes: u64 /* 32 MiB */ }
 pub struct UpstreamResponse { pub status: u16, pub content_type: Option<String>, pub body: Vec<u8> }   // redacting Debug; `atlassian` consumes `Retry-After`, `Date` and `X-AUSERNAME` itself and drops other headers
 pub enum FetchOutcome { Response(UpstreamResponse), Failed(FetchFailure) }
 pub enum FetchFailure {                                           // the §7.2 / §11.2 classes; core maps them per path (read, enrichment, stale check, script call, write)
-    PreSendConnection(ConnClass /* Dns | Connect | ConnectTimeout | TlsHandshake | ProxyConnect407 */),
-    StatusHeaderDecided(UnavailableReason /* Redirect3xx | NonJson2xx | NonJson401 | IdentityHeaderMissing | IdentityHeaderMismatch */),
-    BodyDecided(BodyFailure /* ParseFailure | ReadError */),
-    PostSend(PostSendKind /* PerCallTimeout | NetworkError | ResponseCap32MiB | FetchCap50MiB | ReadBudget120s */),
-    OriginGuardRefused, IdentityCheckFailed { observed: IdentityObserved }, RetryExhausted429, CancelledInFlight { bytes_received: Vec<u8> },
+    // [2026-10-08 M3 PD-07] §5.2 step 3 / §5.4 step 2 put every received byte into `READ_FETCHED`/`PREVIEW_FETCH` for outcome items, so the failure variants carry them:
+    PreSendConnection(ConnClass /* 8 variants: Dns | Connect | ConnectTimeout | TlsHandshake | TlsUnknownIssuer | TlsCertificate | ProxyConnect | ProxyConnect407 */),
+    StatusHeaderDecided { reason: UnavailableReason /* Redirect3xx | NonJson2xx | NonJson401 | IdentityHeaderMissing | IdentityHeaderMismatch */, response: UpstreamResponse /* audit-only body */ },
+    BodyDecided { kind: BodyFailure /* ParseFailure | ReadError */, response: UpstreamResponse /* status, content type, partial body */ },
+    PostSend { kind: PostSendKind /* PerCallTimeout | NetworkError | ResponseCap32MiB | FetchCap50MiB | ReadBudget120s */, received: Vec<u8> },
+    OriginGuardRefused, IdentityCheckFailed { observed: IdentityObserved, response: UpstreamResponse }, CancelledInFlight { bytes_received: Vec<u8> },
+    CancelledBeforeSend, NeedsToken, MethodGuardRefused,           // additive; `RetryExhausted429` is removed: after the third retry the 429 is returned as `FetchOutcome::Response` (reads, an upstream-error card) or `WriteOutcome::Failed4xx` (writes)
 }
 pub enum WriteOutcome { Executed { response: UpstreamResponse, server_user: Option<String>, request_index: u32 },
     Failed4xx { response: UpstreamResponse, request_index: u32 }, Unavailable3xx { request_index: u32 },
-    VersionConflict { request_index: u32 }, OutcomeUnknown { reason: UnknownReason, request_index: u32 }, NeedsToken, OriginGuardRefused }
+    VersionConflict { request_index: u32 }, OutcomeUnknown { reason: UnknownReason, request_index: u32 }, NeedsToken, OriginGuardRefused,
+    RefusedMismatch { request_index: u32 }, NotSent { class: ConnClass } }   // additive [M3 PD-07]: an outgoing request differed from its list entry (nothing written); the failure happened before any byte of a request left
 ```
 `atlassian` is a leaf: it has no workspace dependency at all (not `audit`, `core`, `ipc` and not `registry`). Endpoint templates, param schemas, `success` shapes and `result_projection` are registry data that only `core` reads: `core` hands `atlassian` the endpoint template string inside `GetCall`/`PagedCall`/`SearchCall` and the expected success shape inside `ApprovedWrite`, and applies `result_projection` to the returned `UpstreamResponse`; `atlassian` builds the URL from the template under the configured base URL including its context path and never follows `_links.next`. `core` recomputes `audit::request_set_hash` over the `HttpRequestSpec` list immediately before `send_approved` and refuses to send if it differs from the hash stored in `WRITE_APPROVED`; `atlassian` only guarantees that what it writes equals the list it was given.
 
@@ -399,6 +413,7 @@ pub fn lossy_update(current_storage: &str, outgoing_storage: &str) -> LostCounts
 pub fn wiki_to_preview_html(wiki: &str) -> String;
 
 // preview
+pub struct CandidateRev { pub counter: u64, pub candidate_hash: [u8; 32] }   // [2026-10-08 M3 PD-06] defined here, because `Preview` carries it and `preview` cannot depend on `core`; `core` re-exports it (`pub use atlas_duck_preview::CandidateRev`), same shape as in C.7
 pub struct Preview { pub candidate_rev: CandidateRev, pub approvable: bool, pub header: PreviewHeader, pub warnings: Vec<Warning>,
                      pub body: PreviewBody, pub raw: RawPager, pub also_appears_in: Vec<String>, pub preview_builder_version: String }   // [spec §2.3] name `Preview`
 pub enum Level { Caution, Info }   pub struct Warning { pub id: WarningId, pub level: Level, pub text: String }   // exactly one level per id (§13)
@@ -420,12 +435,15 @@ pub fn iframe_document(body_html: &str, platform: Platform) -> String; // meta C
 pub trait NativeConfirmer: Send + Sync { fn confirm(&self, text: &str) -> Confirm; }   // [spec §2.2] `confirm(text) -> Ok | Cancel`; trait name [spec], enum name [named-by-plan]
 pub enum Confirm { Ok, Cancel }
 
-pub struct OpImpl { pub executor: ExecutorFn, pub previewer: PreviewerFn, pub stale_check: Option<StaleCheckFn> }   // [spec §2.3]
+pub struct OpImpl { pub executor: ExecutorFn, pub previewer: PreviewerFn, pub stale_check: Option<StaleCheckFn>,
+                    pub enrich: Option<EnrichFn>, pub enrich_keys: &'static [&'static str] }   // [spec §2.3] first three fields; `enrich` (post-send enrichment for the previewer, re-run on edits of an `enrich_keys` field) and `enrich_keys` added by M3 PD-26 [2026-10-08]
 pub fn op_table() -> &'static std::collections::BTreeMap<&'static str, OpImpl>;     // one entry per registry id (46), coverage test in M3
 // ExecutorFn: params + enrichment → Vec<HttpRequestSpec> (writes) or a read plan (template, pagination, normalization); PreviewerFn → preview::Preview; the identity call before every write is NOT a stale_check (it runs for every write incl. rule "none")
 
 pub struct CoreDeps { pub audit: audit::Store, pub clock: Arc<dyn audit::Clock>, pub credentials: Arc<dyn atlassian::CredentialProvider>,
-    pub confirmer: Arc<dyn NativeConfirmer>, pub ui: Arc<dyn UiSink>, pub scripts: Arc<dyn ScriptRunner>, pub config: ConfigState, pub http: HttpFactory }
+    pub confirmer: Arc<dyn NativeConfirmer>, pub ui: Arc<dyn UiSink>, pub scripts: Arc<dyn ScriptRunner>, pub config: ConfigState, pub http: HttpFactory,
+    pub app_start_extra: serde_json::Map<String, serde_json::Value> /* the app's `tray_host`, probe report, `engine_version`, sandbox identity; merged into the APP_START payload (M3 PD-21) */,
+    pub pats_deleted: Vec<String> /* instance ids from the RestoreReport/RecoverReport that ran while the gate handler was served; Core::start logs INSTANCE_STATE_CHANGED {needs_token} for each after APP_START (M3 PD-28, L53) */ }   // [2026-10-08 additions]
 // `HttpFactory` (builds one `atlassian::InstanceClient` per instance from the audit-authoritative origin, CA fingerprint and proxy settings; tests inject a factory that points at wiremock) and `QueueItem` (the row `queue_list` returns) are core-internal; their fields are named by the M3 plan.
 pub struct Core;  impl Core {
     pub async fn start(deps: CoreDeps) -> Result<Core, StartError>;                  // needs a Ready store; runs reconcile_after_crash, appends APP_START, seeds the similarity index. Without a store the app serves `gate_handler` instead (below)
@@ -445,10 +463,12 @@ pub enum GateState {
 pub fn gate_handler(state: GateState, ui: Arc<dyn UiSink>) -> Arc<dyn ipc::proto::RequestHandler>;
 
 // Decision contract [spec §2.4 field names]
-pub struct CandidateRev { pub counter: u64, pub candidate_hash: [u8; 32] }           // hash = SHA-256 (spec-silent → plan)
+pub use atlas_duck_preview::CandidateRev;   // { counter: u64, candidate_hash: [u8; 32] }, hash = SHA-256 (spec-silent → plan); defined in `preview` (C.6, M3 PD-06)
 pub enum DecisionKind { Approve, ApproveEdited, Release, ReleaseRedacted, Deny }     // maps to audit `decision` values
 pub struct Decision { pub request_id: String, pub decision: DecisionKind, pub candidate_rev: CandidateRev, pub edits: Option<Edits>,
-                      pub redactions: Option<Vec<RedactionOp>>, pub reason: Option<String> }
+                      pub redactions: Option<Vec<RedactionOp>>, pub reason: Option<String>, pub deny_details: Option<DenyDetails> }
+// [2026-10-08 M3 PD-20] Edit-then-approve shape: a `Decision` with `edits: Some(..)` applies the edit and returns the NEW revision (`DecisionOutcome.status = pending`); it never approves in the same call, because approval is enabled only on a valid, freshly rendered, opened preview (§5.4 step 4). The approval that follows is a second `decide` on the new `candidate_rev`; an approval of a request that was ever edited is logged with decision column `approve_edited`.
+pub enum DenyDetails { UpstreamHttp { include_messages: bool }, OutcomeHint, ResolutionFailed { include_candidates: bool }, MissingFields { include_allowed_values: bool } /* M5 */ }   // the deny-hint choices of §5.4/§6.3/§11.2; `RedactionOp::MaskText` also gains `at: Option<String>` (JSON path of the selected occurrence for single-occurrence masks)
 pub enum DropScope { PerItem, AllItems }
 pub struct Edits { pub set: serde_json::Map<String, serde_json::Value> /* agent param name or `fields.<id>` -> new value */, pub remove: Vec<String> /* removed keys are absent from the executed params, never `null` (§13 "Edited writes") */ }
 pub struct SessionKey { pub agent_name: Option<String>, pub peer_origin_exe: Option<std::path::PathBuf>, pub connection_id: Option<String> /* MCP only */, pub cwd_basename: String }   // §5.6: `agent_name` + `peer_origin_exe` (MCP: `connection_id`) + `cwd_basename`
@@ -460,7 +480,7 @@ pub struct RawPage { pub page: u64, pub page_count: u64, pub total_bytes: u64, p
 pub enum AttentionKind { New, Stale, Failed, OutcomeUnknown }
 pub enum UiEvent { QueueChanged { request_ids: Vec<String> }, Attention { kind: AttentionKind, count: u32 }, StatusBanner { line_ids: Vec<String> },
                    NeedsAttentionChanged { count: u32 }, RunningScriptsChanged, CredentialContextChanged }   // one-to-one with the C.10 Tauri events
-pub enum RedactionOp { DropItem { array_path: String, key: String, value: serde_json::Value }, DropField { path: String, scope: DropScope }, MaskText { text: String, every_occurrence: bool }, UrlField { mode: UrlMode /* ReplaceWhole | Drop */ }, Preset(RedactionPreset /* StatusOnly | ErrorClassOnly */) }
+pub enum RedactionOp { DropItem { array_path: String, key: String, value: serde_json::Value }, DropField { path: String, scope: DropScope }, MaskText { text: String, every_occurrence: bool, at: Option<String> }, UrlField { mode: UrlMode /* ReplaceWhole | Drop */ }, Preset(RedactionPreset /* StatusOnly | ErrorClassOnly */) }
 pub trait DecisionApi: Send + Sync {
     fn queue_list(&self) -> Vec<QueueItem>;  fn queue_get(&self, request_id: &str) -> Option<QueueItem>;
     fn preview_fetch(&self, request_id: &str, rev: Option<CandidateRev>) -> Result<PreviewDelivery, DecisionError>;   // commits PREVIEW_SHOWN before delivery; this is "opened"
@@ -497,9 +517,11 @@ pub mod testing { /* scripted approver over DecisionApi, StubConfirmer (queue of
 // [M1] atlas_duck_sandbox_host::spawn::{SpawnSpec, ExitKind, WorkerProcess, WorkerSpawner, SpawnHook, ThreadConfinement}; ::identity::{FileId, SandboxBinaryIdentity, file_identity};
 //      ::probe::{ProbeConfig, Evidence, ProbeRecord, FloorVerdict {Met, NotMet{failed}}, ProbeReport, score, run_probes}; ::platform_spawner()
 // [M1] atlas_duck_sandbox_worker::run() -> i32     // the atlas-duck-sandbox thin main calls it
-// M8 adds to ipc::sandbox (ScriptLimits is already there from M3):
+// M8 adds to ipc::sandbox (ScriptLimits, HostCall and HostCallResult are already there from M3, 2026-10-08 M3 PD-08, because C.7's `HostCalls` names them):
 pub struct WorkerInit { pub source: String, pub args: serde_json::Value, pub limits: ScriptLimits, pub read_op_ids: Vec<String> }   // [spec §9.1 step 3]; compile-only flag and init method name [named-by-plan] (spec silent)
-pub struct HostCall { pub id: u64, pub op_id: String, pub params: serde_json::Value, pub instance: Option<String>, pub all: bool }   // `all` [named-by-plan]: false for `atlas.call`, true for `atlas.all`, which §9.2 makes a single `host.call` that the host pages internally (§3.4 names no other discriminator); `all = true` is accepted only for ops whose registry entry has `paginated: Some(PageSpec)`  pub enum HostCallResult { Ok(serde_json::Value), Rejected { class: String, details: serde_json::Value } }
+// M3 (`ipc::sandbox`, no feature gate; `HostCallResult` serializes as {"ok": value} / {"rejected": {"class", "details"}}):
+pub struct HostCall { pub id: u64, pub op_id: String, pub params: serde_json::Value, pub instance: Option<String>, pub all: bool }   // `all` [named-by-plan]: false for `atlas.call`, true for `atlas.all`, which §9.2 makes a single `host.call` that the host pages internally (§3.4 names no other discriminator); `all = true` is accepted only for ops whose registry entry has `paginated: Some(PageSpec)`
+pub enum HostCallResult { Ok(serde_json::Value), Rejected { class: String, details: serde_json::Value } }
 // sandbox-host (M8): host bridge — always-drain reader, separate writer, counting of outstanding calls, kill paths, binary identity re-check at submit and before every spawn
 #[async_trait::async_trait]
 pub trait HostCallSink: Send + Sync { async fn call(&self, run_id: &str, c: HostCall) -> HostCallResult; fn log(&self, run_id: &str, line: &str); }
@@ -552,7 +574,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Exit criterion:** `cargo test -p atlas-duck-audit --locked` green on the three legs, covering the §13 Unit clauses U-06 (except the anchor-dir writer clauses), U-07 to U-22, X-01, X-02, X-03 (store half), RF-1a, RF-1b, RF-3a; the Integration clauses I-43 (shared-home keyring half), I-44 (keyring locality, refused NFS mount, shared local keyring) and I-46 (credential-free backups); a `backup_restore_roundtrip` test (bundle = snapshot + recovery blob + manifest restores and the restored chain verifies); per-OS keychain tests (Windows Credential Manager with `Persist == CRED_PERSIST_LOCAL_MACHINE`, macOS Keychain, Linux file-backed Secret Service); the golden vector file committed.
 - **§15 resolved:** V08 (KEK/anchor half; exact per-OS store crates and the Windows persistence setting), V22, V27, V29 (keyring-directory half).
 - **Ledger:** L09, L10, L23, L24, L27, L32, L34, L36 (RF-1a uncorroborated epoch), L37 (RF-1b prune cadence/baseline/clamp), L38 (keyed `target` tag, no search or erasure), L39 (keychain mode only; I-46 re-targeted to keychain-mode backups plus a crafted snapshot with `vault` rows), L40 (restore as specified), L41 (`EXPORT {manifest_sha256}` unchanged). All blockers resolved 2026-10-08 (spec §8.2, §8.6, §8.8, §8.12 amended; see "Decisions this plan depends on").
-- **Status:** plans being written 2026-10-08
+- **Status:** detailed plan: 2026-10-07-atlas-duck-m02-audit-store.md
 
 ### M3 — Core lifecycle (in-process, no IPC)
 
@@ -562,7 +584,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Exit criterion:** `cargo test -p atlas-duck-registry -p atlas-duck-preview -p atlas-duck-atlassian -p atlas-duck-core --locked` green incl. the in-process integration suite against wiremock (https base URLs, or the test-only cargo feature that release builds do not compile) with `core::testing` (scripted approver, stub `NativeConfirmer`): U-01, U-03, U-04, U-05 (U-05 CLI half is M4; U-02 is M5), U-26, U-28 (fixture), U-29, U-30 (core half), U-32 (audit property half), U-33 (params validation and field rules; CLI flag binding is M4), S-13, S-15 (reconciliation half); I-01, I-02, I-06 (M3 cases), I-07, I-08, I-09, I-10 (non-script cases), I-11, I-12, I-19, I-20, I-23 to I-32, I-37, I-38, I-40 (tray/OS/installer variants complete in M6/M10), I-43 (PAT keychain-entry half); X-03 (admission), X-04 (reads/writes), X-06 (audit-API half), X-10 (connection test); CI-02 (the Fedora job runs this suite); RF-2a, RF-2b, RF-3a (PAT entry), RF-4 (index seeding); S-16 (capture-hook half: the hook compiles and records every command response and event payload); the gate-handler tests, on which U-20 and UI-04 depend: for each `GateState`, the envelope `status`, exit code and `details` (`Locked(passphrase | keychain_unavailable | keychain_lost | keyring_not_local)` → exit 9 `locked` with `details.reason`; `StoreNewer` → exit 5 `unreachable`, `details.reason = store_newer`; `ShuttingDown` → exit 5 `unreachable`, `details.reason = app_shutting_down`; `NotConfigured(data_dir_missing | data_dir_not_local | config_unreadable)` → exit 9 `not_configured` with `details.reason`; `FirstRun` → exit 9 `not_configured`, `details.reason = first_run`, `retryable: true`, L46), `hello`, local `ops.list`/`ops.describe` and `doctor` answered in every state, `request.status`, `requests.list`, `instances.list` and `ops.*` with `--instance` answered with the state's envelope, nothing queued, and the refused-request counter incrementing once per refused `submit`/`submit_script`/`await`/`cancel` only; the batch-seam tests of L43 (Cancel logs nothing; an item expiring during the dialog rejects the whole batch; an injected append failure on the combined `BATCH_CONFIRMED` transaction decides nothing); proxy resolution per L42 (per-instance `host:port`/`direct`, OS static with bypass list through an injectable OS-settings source, PAC ignored with `pac_configured`, process proxy env never read).
 - **§15 resolved:** V08 (PAT half), V17, V20 (shutdown-path part), V23, V25 (check and comparison, Jira half), V31; the design halves of V04 (applinks-manifest in the connection test) and V23 (classification of 3xx, HTML-200 and HTML-401 answers) against wiremock only, because both need a live DC: their live answers come from the env-gated L-01 tests in M5/M7.
 - **Ledger:** L01, L02, L05, L06, L08, L12, L13, L14 (registry examples), L15, L17, L18, L19, L20, L21, L22, L24, L25, L26, L29, L30, L31, L32, L33, L38 (`core` puts `Store::query_tag(..)` in `target` for `jira.search`/`confluence.search`), L39 (`KeychainCredentials` only), L42 (proxy resolution), L43 (batch seam), L44 (RF-2: residual, constant `retry_after_s`), L45 (RF-4: index seeding), L46 (G1). All blockers resolved 2026-10-08 (spec §1.3, §2.5, §3.3, §4.3, §5.6, §7.2, §10.2 amended).
-- **Status:** plans being written 2026-10-08
+- **Status:** detailed plan: 2026-10-07-atlas-duck-m03-core-lifecycle.md
 
 ### M4 — IPC + CLI
 
@@ -895,6 +917,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - P16 Startup hardening (§2.5) is owned by M6 (`app::startup::hardening`, Placements (7)), because M6 creates the first webview; M10 re-runs S-04 on installed packages → M6, M10.
 - P17 States without a store are served by `core::gate_handler` through a swappable `ipc::server::HandlerCell` (C.2, C.7) → M3, M4, M6.
 - P18 `atlassian` is a workspace leaf: `core` passes endpoint templates and the expected success shape, and recomputes `audit::request_set_hash` before `send_approved` (C.4) → M3, M5, M7.
+- P19 (2026-10-08, from the detailed M2 and M3 plans; ledger L47–L58) The M2 and M3 plans amended C.1–C.4, C.6–C.8 (marked `[2026-10-08 …]` in place) and the spec (nine M2 defects L47–L55, `no_instance` L56, RGI L57); `keyring` 4.2.0 is replaced by `keyring-core` plus the three per-OS store crates, `serde_jcs` lives in `ipc`; later milestone plans read the amended contracts → M2, M3, M4, M8, M10.
 
 ---
 
