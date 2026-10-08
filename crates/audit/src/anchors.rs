@@ -155,34 +155,47 @@ pub(crate) enum AnchorLoadError {
     KeyStore(KeyStoreError),
 }
 
+fn read_entry<T>(
+    keys: &dyn KeyStore,
+    e: EntryName,
+    parse: fn(&[u8]) -> Result<T, AnchorEntryError>,
+) -> Result<Option<T>, AnchorLoadError> {
+    match keys.get(&e).map_err(AnchorLoadError::KeyStore)? {
+        None => Ok(None),
+        Some(b) => match parse(&b) {
+            Ok(a) => Ok(Some(a)),
+            Err(AnchorEntryError::NewerLayout(n)) => Err(AnchorLoadError::Newer(n)),
+            Err(AnchorEntryError::Malformed) => Ok(None),
+        },
+    }
+}
+
+/// The head anchor entry; absent or malformed is `None` (verification reports it missing).
+pub(crate) fn load_head(keys: &dyn KeyStore) -> Result<Option<HeadAnchor>, AnchorLoadError> {
+    read_entry(keys, EntryName::HeadAnchor, HeadAnchor::from_entry)
+}
+
+/// The first-retained anchor entry; absent or malformed is `None`.
+pub(crate) fn load_first_retained(
+    keys: &dyn KeyStore,
+) -> Result<Option<FirstRetainedAnchor>, AnchorLoadError> {
+    read_entry(
+        keys,
+        EntryName::FirstRetainedAnchor,
+        FirstRetainedAnchor::from_entry,
+    )
+}
+
 /// Reads the head anchor, then the first-retained anchor. That order matters while the store
 /// runs: the anchor thread writes first-retained before head, so a head read first never
 /// names a `PRUNE` whose first-retained update the second read cannot see. An absent or
 /// malformed entry is `None` (verification reports it as missing).
+#[allow(dead_code)] // called by `open()` (T10) and the `testing` shim
 pub(crate) fn load_anchors(
     keys: &dyn KeyStore,
 ) -> Result<(Option<HeadAnchor>, Option<FirstRetainedAnchor>), AnchorLoadError> {
-    fn read<T>(
-        keys: &dyn KeyStore,
-        e: EntryName,
-        parse: fn(&[u8]) -> Result<T, AnchorEntryError>,
-    ) -> Result<Option<T>, AnchorLoadError> {
-        match keys.get(&e).map_err(AnchorLoadError::KeyStore)? {
-            None => Ok(None),
-            Some(b) => match parse(&b) {
-                Ok(a) => Ok(Some(a)),
-                Err(AnchorEntryError::NewerLayout(n)) => Err(AnchorLoadError::Newer(n)),
-                Err(AnchorEntryError::Malformed) => Ok(None),
-            },
-        }
-    }
-    let head = read(keys, EntryName::HeadAnchor, HeadAnchor::from_entry)?;
-    let first = read(
-        keys,
-        EntryName::FirstRetainedAnchor,
-        FirstRetainedAnchor::from_entry,
-    )?;
-    Ok((head, first))
+    let head = load_head(keys)?;
+    Ok((head, load_first_retained(keys)?))
 }
 
 /// The head anchor trails the newest commit by at most this long; commits inside one window

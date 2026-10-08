@@ -19,7 +19,12 @@ pub mod request_set;
 pub mod schema;
 pub mod store;
 pub mod types;
+// Production builds export only the C.3 result types (re-exported below); the verdict
+// internals are public for the `testing` shim and integration tests.
+#[cfg(any(test, feature = "testing"))]
 pub mod verify;
+#[cfg(not(any(test, feature = "testing")))]
+mod verify;
 mod writer;
 
 pub use admission::FreeSpaceProbe;

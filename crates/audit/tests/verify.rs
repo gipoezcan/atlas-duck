@@ -11,7 +11,7 @@ use atlas_duck_audit::anchors::{FirstRetainedAnchor, HeadAnchor};
 use atlas_duck_audit::crypto::{self, Kek};
 use atlas_duck_audit::encoding::{self, FIELD_LIST, ZERO_HASH};
 use atlas_duck_audit::error::{AuditError, OpenError};
-use atlas_duck_audit::keystore::{EntryName, KeyStore, service_name};
+use atlas_duck_audit::keystore::{EntryName, KeyStore, KeyStoreError, service_name};
 use atlas_duck_audit::request_set::{RequestRecord, request_set_hash, requests_to_json};
 use atlas_duck_audit::schema::DB_FILE;
 use atlas_duck_audit::testing::{self, FakePrune, Faults, KeyOpKind, MemKeyring};
@@ -833,6 +833,16 @@ fn tamper_prune_log_alter_cutoff() {
         "{:?}",
         kinds(&fs)
     );
+    // The latest PRUNE is reported once, not by both the latest-PRUNE check and the walk.
+    let at_p2 = fs
+        .iter()
+        .filter(|x| {
+            x.kind == FindingKind::PruneLogRowMismatch
+                && x.observed_seq == Some(p2)
+                && x.detail.contains("prune_log_row_hash")
+        })
+        .count();
+    assert_eq!(at_p2, 1, "{fs:?}");
     assert!(has(
         &verdict(&f).findings,
         FindingKind::PruneLogRowMismatch,
@@ -1036,11 +1046,15 @@ fn findings_are_capped_per_kind() {
         .filter(|x| x.kind == FindingKind::DecryptFailed)
         .count();
     assert_eq!(n, atlas_duck_audit::verify::MAX_FINDINGS_PER_KIND + 1);
+    let summary = fs.last().expect("summary");
     assert!(
-        fs.last()
-            .expect("summary")
-            .detail
-            .contains("30 further findings")
+        summary.detail.contains("30 further findings"),
+        "{summary:?}"
+    );
+    // Rows 2..=101 are listed; the omitted ones are 102..=131.
+    assert_eq!(
+        (summary.expected_seq, summary.observed_seq),
+        (Some(102), Some(131))
     );
 }
 
@@ -1665,7 +1679,21 @@ fn newer_anchor_layout_mid_process_is_not_skipped() {
         .expect("head anchor");
     e[0] = 2;
     f.keys().set(&EntryName::HeadAnchor, &e).expect("set");
+    // The first-retained anchor is still checked although the head entry is unreadable.
+    let mut fr = keychain_first_retained(&f);
+    fr.first_retained_seq = 7;
+    f.keys()
+        .set(
+            &EntryName::FirstRetainedAnchor,
+            &fr.to_entry().expect("encode"),
+        )
+        .expect("set");
     let o = store.try_full_verify().expect("runs");
+    assert!(
+        has_kind(&o.findings, FindingKind::FirstRetainedMismatch),
+        "{:?}",
+        o.findings
+    );
     assert!(
         o.findings
             .iter()
@@ -1679,14 +1707,63 @@ fn newer_anchor_layout_mid_process_is_not_skipped() {
 }
 
 #[test]
-fn keychain_unavailable_skips_anchor_checks_without_incident() {
+fn keychain_unavailable_full_verify_does_not_complete() {
+    // Without the anchor checks a run is not a pass: no `VERIFY {result: ok}` is appended,
+    // and no incident either (an unavailable keychain is never one, §8.8).
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
     append_mixed(&store, 4);
     store.shutdown();
     let store = reopen(&f);
+    let head = store.head().0;
     f.ring.set_unavailable(true);
+    assert_eq!(
+        store.try_full_verify(),
+        Err(AuditError::KeyStore(KeyStoreError::Unavailable))
+    );
     let fs = store.full_verify();
     f.ring.set_unavailable(false);
+    assert_eq!(kinds(&fs), vec![FindingKind::ChainBroken]);
+    assert!(fs[0].detail.contains("did not complete"), "{fs:?}");
+    assert_eq!(store.head().0, head, "no VERIFY appended");
+    assert!(store.open_incidents().is_empty());
     store.shutdown();
-    assert!(fs.is_empty(), "{fs:?}");
+}
+
+#[test]
+fn u22_latest_prune_that_does_not_decrypt_is_not_reconciled() {
+    // (c) needs the latest PRUNE to verify: with its DEK destroyed its row hash is unchecked.
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    corroborate(&store);
+    append_mixed(&store, 10);
+    anchor_head(&store);
+    store.testing_pause_anchors();
+    let prune = fake_prune(&store, 6, false);
+    store.shutdown();
+    assert!(
+        !verdict(&f).has_incident(),
+        "reconciles before the DEK is destroyed"
+    );
+    raw_conn(&f)
+        .execute(
+            "UPDATE keys SET wrapped_dek = NULL, destroyed_at = '2026-10-08T12:00:00.000Z' \
+             WHERE key_id = (SELECT key_id FROM events WHERE seq = ?1)",
+            [prune as i64],
+        )
+        .expect("destroy");
+    let v = verdict(&f);
+    assert!(
+        has(&v.findings, FindingKind::DestroyedKeyReferenced, prune),
+        "{:?}",
+        v.findings
+    );
+    assert!(
+        has_kind(&v.findings, FindingKind::FirstRetainedMismatch),
+        "{:?}",
+        v.findings
+    );
+    assert!(!has_kind(
+        &v.findings,
+        FindingKind::InterruptedPruneReconciled
+    ));
+    assert!(v.anchor_actions.set_first_retained.is_none());
 }

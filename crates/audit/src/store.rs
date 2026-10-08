@@ -546,12 +546,14 @@ impl Store {
     /// its own settings snapshot, `RESTORE` boundaries and the keychain anchors; then one
     /// `VERIFY {scope: "full"}` (`result: "ok"` and no `integrity_incident` flag when clean).
     ///
-    /// A run that cannot complete is never reported as a pass: when the store is closed or
-    /// the database unreadable it returns one `ChainBroken` finding whose `detail` says the
-    /// run did not complete; when only the `VERIFY` append fails, that finding follows the
-    /// findings of the run. [`Store::try_full_verify`] returns the error instead. A keychain
-    /// anchor with a newer layout byte (the startup gate admitted the current one) is an
-    /// `AnchorMismatch`.
+    /// A run that cannot complete is never reported as a pass, and appends no `VERIFY`
+    /// claiming one. This `Vec` API (C.3) has no error channel, so non-completion is reported
+    /// as a `ChainBroken` finding whose `detail` starts "verification did not complete": the
+    /// only finding when the store is closed, the keychain does not answer (the anchor checks
+    /// cannot run) or the database is unreadable; after the run's findings when only the
+    /// `VERIFY` append fails. Callers that show the result (M6 `verify_now`) use
+    /// [`Store::try_full_verify`], which returns the error instead. A keychain anchor with a
+    /// newer layout byte (the startup gate admitted the current one) is an `AnchorMismatch`.
     pub fn full_verify(&self) -> Vec<VerifyFinding> {
         let incomplete = |e: AuditError| {
             VerifyFinding::new(
@@ -573,8 +575,9 @@ impl Store {
     /// `full_verify` with its errors. Runs on its own read-only connection on the calling
     /// thread (one read transaction); only the final `VERIFY` append goes through the writer.
     /// The keychain is read before the snapshot is taken, head anchor first, so an anchor
-    /// never names a record the snapshot lacks; a keychain that does not answer skips the
-    /// anchor checks for this run (never an incident, §8.8).
+    /// never names a record the snapshot lacks. A keychain that does not answer ends the run
+    /// with `Err(KeyStore)` and no `VERIFY` (an unavailable keychain is never an incident,
+    /// §8.8, but a run without the anchor checks is not a pass either).
     pub fn try_full_verify(&self) -> Result<VerifyOutcome, AuditError> {
         let findings = self.run_full_verify()?;
         let c = self.append_verify("full", &findings, None)?;
@@ -588,30 +591,30 @@ impl Store {
     /// The findings of a full verification, without the `VERIFY` append.
     fn run_full_verify(&self) -> Result<Vec<VerifyFinding>, AuditError> {
         self.sender()?;
-        let mut newer_layout = None;
-        let anchors = match anchors::load_anchors(&*self.inner.keys) {
-            Ok((head, first_retained)) => Some(KeychainAnchors {
-                head,
-                first_retained,
-            }),
-            Err(AnchorLoadError::KeyStore(_)) => None,
-            // The startup gate admitted this layout; a newer one appearing since is damage.
-            Err(AnchorLoadError::Newer(n)) => {
-                newer_layout = Some(n);
-                None
+        // A keychain that does not answer ends the run (no "ok" without the anchor checks);
+        // a newer layout byte in one entry (the startup gate admitted the current one) is a
+        // finding, and the other entry is still checked.
+        fn split<T>(
+            r: Result<Option<T>, AnchorLoadError>,
+        ) -> Result<(Option<T>, Option<u8>), AuditError> {
+            match r {
+                Ok(a) => Ok((a, None)),
+                Err(AnchorLoadError::Newer(n)) => Ok((None, Some(n))),
+                Err(AnchorLoadError::KeyStore(e)) => Err(AuditError::KeyStore(e)),
             }
+        }
+        let (head, head_newer) = split(anchors::load_head(&*self.inner.keys))?;
+        let (first_retained, first_retained_newer) =
+            split(anchors::load_first_retained(&*self.inner.keys))?;
+        let k = KeychainAnchors {
+            head,
+            first_retained,
+            head_newer,
+            first_retained_newer,
         };
         let conn =
             schema::open_ro(&self.inner.db_path).map_err(|e| AuditError::Io(e.to_string()))?;
-        let mut findings = verify::full(&conn, &self.inner.kek, anchors.as_ref())?;
-        drop(conn);
-        if let Some(n) = newer_layout {
-            findings.push(VerifyFinding::new(
-                FindingKind::AnchorMismatch,
-                format!("a keychain anchor has the newer layout {n}"),
-            ));
-        }
-        Ok(findings)
+        verify::full(&conn, &self.inner.kek, &k)
     }
 
     /// Seqs of the integrity-incident `VERIFY` records without a later `INTEGRITY_ACK` (C.3),

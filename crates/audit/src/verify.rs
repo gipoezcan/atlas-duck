@@ -231,6 +231,7 @@ pub struct StartupVerdict {
 }
 
 impl StartupVerdict {
+    #[allow(dead_code)] // `open()` (T10) decides on it; tests use it today
     pub fn has_incident(&self) -> bool {
         self.findings.iter().any(|f| f.kind.is_incident())
     }
@@ -253,41 +254,61 @@ pub(crate) struct StartupInputs<'a> {
 #[derive(Default)]
 struct Findings {
     list: Vec<VerifyFinding>,
-    /// Count per kind in order of first appearance.
-    counts: Vec<(FindingKind, usize)>,
+    /// Per kind in order of first appearance.
+    counts: Vec<KindCount>,
+}
+
+struct KindCount {
+    kind: FindingKind,
+    n: usize,
+    /// Lowest and highest seq named by an omitted finding.
+    first_omitted: Option<u64>,
+    last_omitted: Option<u64>,
 }
 
 impl Findings {
     fn push(&mut self, f: VerifyFinding) {
-        let n = match self.counts.iter_mut().find(|(k, _)| *k == f.kind) {
-            Some((_, n)) => {
-                *n += 1;
-                *n
-            }
+        let idx = match self.counts.iter().position(|c| c.kind == f.kind) {
+            Some(i) => i,
             None => {
-                self.counts.push((f.kind, 1));
-                1
+                self.counts.push(KindCount {
+                    kind: f.kind,
+                    n: 0,
+                    first_omitted: None,
+                    last_omitted: None,
+                });
+                self.counts.len() - 1
             }
         };
-        if n <= MAX_FINDINGS_PER_KIND {
+        let c = &mut self.counts[idx];
+        c.n += 1;
+        if c.n <= MAX_FINDINGS_PER_KIND {
             self.list.push(f);
+        } else if let Some(seq) = f.observed_seq.or(f.expected_seq) {
+            c.first_omitted = Some(c.first_omitted.map_or(seq, |s| s.min(seq)));
+            c.last_omitted = Some(c.last_omitted.map_or(seq, |s| s.max(seq)));
         }
     }
 
     fn any_of(&self, kinds: &[FindingKind]) -> bool {
-        self.counts.iter().any(|(k, _)| kinds.contains(k))
+        self.counts.iter().any(|c| kinds.contains(&c.kind))
     }
 
+    /// The listed findings, then one summary per capped kind naming how many were omitted
+    /// and the lowest (`expected_seq`) and highest (`observed_seq`) seq among them.
     fn finish(mut self) -> Vec<VerifyFinding> {
-        for (kind, n) in &self.counts {
-            if *n > MAX_FINDINGS_PER_KIND {
-                self.list.push(VerifyFinding::new(
-                    *kind,
+        for c in &self.counts {
+            if c.n > MAX_FINDINGS_PER_KIND {
+                let mut s = VerifyFinding::new(
+                    c.kind,
                     format!(
                         "{} further findings of this kind omitted",
-                        n - MAX_FINDINGS_PER_KIND
+                        c.n - MAX_FINDINGS_PER_KIND
                     ),
-                ));
+                );
+                s.expected_seq = c.first_omitted;
+                s.observed_seq = c.last_omitted;
+                self.list.push(s);
             }
         }
         self.list
@@ -1059,6 +1080,12 @@ struct AnchorCheck<'a> {
     mode: Mode,
     head_anchor: Option<&'a HeadAnchor>,
     first_retained: Option<&'a FirstRetainedAnchor>,
+    /// The entry exists but has a newer layout byte (only at runtime: the startup gate
+    /// refuses it). It is an `AnchorMismatch`, never "absent".
+    head_newer: Option<u8>,
+    first_retained_newer: Option<u8>,
+    /// The latest `PRUNE` exists, decrypts and carries its row's hash (§8.7 (c)).
+    latest_prune_ok: bool,
     head: Option<&'a RowHead>,
     first: Option<u64>,
     scope_start: Option<u64>,
@@ -1086,7 +1113,7 @@ fn interrupted_restore(
     let Some(head) = c.head else {
         return Ok(None);
     };
-    if !c.clean || c.scope_start != Some(r) {
+    if !c.clean || c.scope_start != Some(r) || c.head_newer.is_some() {
         return Ok(None);
     }
     let before = match r.checked_sub(1) {
@@ -1189,10 +1216,13 @@ fn check_anchors(
     // Head anchor.
     let mut anchor_ok_seq: Option<u64> = None;
     match (c.head_anchor, c.head) {
-        (None, _) => out.push(VerifyFinding::new(
-            FindingKind::AnchorMissing,
-            "the head anchor is missing",
-        )),
+        (None, _) => out.push(match c.head_newer {
+            Some(n) => VerifyFinding::new(
+                FindingKind::AnchorMismatch,
+                format!("the head anchor has the newer layout {n}"),
+            ),
+            None => VerifyFinding::new(FindingKind::AnchorMissing, "the head anchor is missing"),
+        }),
         (Some(a), None) => out.push(
             VerifyFinding::new(FindingKind::AnchorAhead, "the store has no records")
                 .expected(Some(a.seq), Some(a.record_hash)),
@@ -1255,10 +1285,16 @@ fn check_anchors(
 
     // First-retained anchor.
     let Some(fr) = c.first_retained else {
-        out.push(VerifyFinding::new(
-            FindingKind::AnchorMissing,
-            "the first-retained anchor is missing",
-        ));
+        out.push(match c.first_retained_newer {
+            Some(n) => VerifyFinding::new(
+                FindingKind::AnchorMismatch,
+                format!("the first-retained anchor has the newer layout {n}"),
+            ),
+            None => VerifyFinding::new(
+                FindingKind::AnchorMissing,
+                "the first-retained anchor is missing",
+            ),
+        });
         return Ok(res);
     };
     let head_chain = c.head.and_then(|h| h.chain_id.as_deref());
@@ -1293,7 +1329,7 @@ fn check_anchors(
         fr.first_retained_seq == pf                                     // (a)
             && ct_eq(&fr.first_retained_prev_hash, &pl)
             && latest.range_start == fr.first_retained_seq              // (b)
-            && c.clean                                                  // (c)
+            && c.clean && c.latest_prune_ok                             // (c)
             && anchor_ok_seq.is_some_and(|a| latest.prune_seq >= a) // (d)
     });
     let prune_hash = match reconciles {
@@ -1364,7 +1400,7 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
     check_prune_log(&log, &mut out);
     check_first_retained(conn, first, &log, &mut out)?;
     // 4. The latest PRUNE carries the latest row's hash.
-    check_latest_prune(conn, &mut deks, &log, &mut out)?;
+    let latest_prune_ok = check_latest_prune(conn, &mut deks, &log, &mut out)?;
     // 5. Chain from the scope start (and the anchored record and latest PRUNE, if earlier).
     let scope_start = latest_of(conn, "'PRUNE', 'RESTORE', 'APP_START'")?.or(first);
     if let (Some(first), Some(head)) = (first, head) {
@@ -1416,6 +1452,9 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
             mode: Mode::Startup,
             head_anchor: inp.head_anchor.as_ref(),
             first_retained: inp.first_retained.as_ref(),
+            head_newer: None,
+            first_retained_newer: None,
+            latest_prune_ok,
             head: head_row.as_ref(),
             first,
             scope_start,
@@ -1435,11 +1474,14 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
 // ---------------------------------------------------------------------------------------
 // Full verification (§8.7 "Full verification")
 
-/// What the keychain anchors were when full verification started; `None` = the keychain did
-/// not answer (never an incident, §8.8): the anchor checks are skipped for this run.
+/// The keychain anchors as read when full verification started (head first). An entry that
+/// is absent is `None`; one with a newer layout byte is `None` with its `*_newer` set. A
+/// keychain that did not answer never gets here: the run does not complete.
 pub(crate) struct KeychainAnchors {
     pub(crate) head: Option<HeadAnchor>,
     pub(crate) first_retained: Option<FirstRetainedAnchor>,
+    pub(crate) head_newer: Option<u8>,
+    pub(crate) first_retained_newer: Option<u8>,
 }
 
 /// A `PRUNE` judged by the retention and legal hold of its own settings snapshot (L52).
@@ -1490,7 +1532,7 @@ fn judge_prune(out: &mut Findings, seq: u64, epoch: NaiveDate, payload: &Value) 
 pub(crate) fn full(
     conn: &Connection,
     kek: &Kek,
-    anchors: Option<&KeychainAnchors>,
+    anchors: &KeychainAnchors,
 ) -> Result<Vec<VerifyFinding>, AuditError> {
     run_full(conn, kek, anchors).map_err(|e| AuditError::Io(e.to_string()))
 }
@@ -1498,7 +1540,7 @@ pub(crate) fn full(
 fn run_full(
     conn: &Connection,
     kek: &Kek,
-    anchors: Option<&KeychainAnchors>,
+    k: &KeychainAnchors,
 ) -> rusqlite::Result<Vec<VerifyFinding>> {
     let tx = conn.unchecked_transaction()?;
     let conn: &Connection = &tx;
@@ -1509,7 +1551,9 @@ fn run_full(
     let log = load_prune_log(conn, &mut out)?;
     check_prune_log(&log, &mut out);
     check_first_retained(conn, first, &log, &mut out)?;
-    check_latest_prune(conn, &mut deks, &log, &mut out)?;
+    // Only its verdict: the walk below reports every PRUNE (the latest included) and every
+    // row without its PRUNE, so its findings would be duplicates here.
+    let latest_prune_ok = check_latest_prune(conn, &mut deks, &log, &mut Findings::default())?;
     let by_seq: HashMap<u64, &PruneLogRow> = log.iter().map(|r| (r.prune_seq, r)).collect();
 
     // Key errors are reported once per key_id, not once per row.
@@ -1626,28 +1670,29 @@ fn run_full(
             );
         }
     }
-    if let Some(k) = anchors {
-        let head_row = match head {
-            Some(h) => row_head(conn, h)?,
-            None => None,
-        };
-        let clean = !out.any_of(&CHAIN_KINDS);
-        check_anchors(
-            conn,
-            &mut deks,
-            &AnchorCheck {
-                mode: Mode::Full,
-                head_anchor: k.head.as_ref(),
-                first_retained: k.first_retained.as_ref(),
-                head: head_row.as_ref(),
-                first,
-                scope_start: latest_of(conn, "'PRUNE', 'RESTORE', 'APP_START'")?.or(first),
-                log: &log,
-                clean,
-            },
-            &mut out,
-        )?;
-    }
+    let head_row = match head {
+        Some(h) => row_head(conn, h)?,
+        None => None,
+    };
+    let clean = !out.any_of(&CHAIN_KINDS);
+    check_anchors(
+        conn,
+        &mut deks,
+        &AnchorCheck {
+            mode: Mode::Full,
+            head_anchor: k.head.as_ref(),
+            first_retained: k.first_retained.as_ref(),
+            head_newer: k.head_newer,
+            first_retained_newer: k.first_retained_newer,
+            latest_prune_ok,
+            head: head_row.as_ref(),
+            first,
+            scope_start: latest_of(conn, "'PRUNE', 'RESTORE', 'APP_START'")?.or(first),
+            log: &log,
+            clean,
+        },
+        &mut out,
+    )?;
     // Anchor-dir checks (AnchorDirMismatch, AnchoredRecordPrunedEarly) join in T14.
     drop(tx);
     Ok(out.finish())
