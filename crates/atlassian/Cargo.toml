@@ -7,9 +7,18 @@ publish.workspace = true
 
 [features]
 # §13: plain http to the mock only through this test-only feature; `lib.rs` refuses
-# to compile it into a release build. Task 9 extends `testing` with the wiremock harness.
+# to compile it into a release build.
 insecure-test-http = []
-testing = ["insecure-test-http"]
+# The wiremock / raw-socket / local-TLS harness in `src/testing/`.
+testing = [
+    "insecure-test-http",
+    "dep:wiremock",
+    "dep:rcgen",
+    "dep:tokio-rustls",
+    "tokio/net",
+    "tokio/io-util",
+    "tokio/rt",
+]
 
 [dependencies]
 url = { workspace = true }
@@ -22,9 +31,30 @@ serde_json = { workspace = true }
 icu_normalizer = { workspace = true }
 icu_casemap = { workspace = true }
 percent-encoding = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+httpdate = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "macros"] }
+tokio-util = { workspace = true }
+wiremock = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util"] }
+
+[[test]]
+name = "client"
+required-features = ["testing"]
+
+[[test]]
+name = "tls_ca"
+required-features = ["testing"]
+
+[[test]]
+name = "proxy_env"
+required-features = ["testing"]
 
 # §7.7 / §13: unwrap_used and expect_used are errors in core and atlassian.
 [lints.clippy]

@@ -7,6 +7,7 @@
 #[cfg(all(feature = "insecure-test-http", not(debug_assertions)))]
 compile_error!("insecure-test-http must never reach a release build");
 
+pub mod client;
 pub mod cover;
 pub mod credentials;
 pub mod guard;
@@ -15,6 +16,13 @@ pub mod origin;
 pub mod types;
 pub mod url;
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
+pub use client::{
+    BuildError, Captured, ClientConfig, FetchControl, InstanceClient, Product, ProxyChoice,
+    Timeouts,
+};
 pub use cover::{AuditCover, CommitProbe, CoverIssuer, DateObserver, NotCommitted};
 pub use credentials::{
     CredentialError, CredentialProvider, PatSecret, StoredCredential, StoredIdentity,

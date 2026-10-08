@@ -8,7 +8,7 @@ use crate::types::ApprovedWrite;
 /// The only `POST` that is not an approved write (`jira.search`).
 pub const ALLOWED_READ_POSTS: &[&str] = &["/rest/api/2/search"];
 
-// The variants and the guard are used by the client (Tasks 9 and 10).
+// `ApprovedWrite` is constructed by the write path (Task 10).
 #[allow(dead_code)]
 pub(crate) enum SendMode<'a> {
     Read,
@@ -28,7 +28,6 @@ impl fmt::Display for MethodRefused {
 
 impl std::error::Error for MethodRefused {}
 
-#[allow(dead_code)]
 pub(crate) fn method_guard(
     mode: &SendMode<'_>,
     method: &str,

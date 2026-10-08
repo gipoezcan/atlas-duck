@@ -83,6 +83,15 @@ emojis = "=0.9.0"
 url = "=2.5.8"
 icu_casemap = "=2.3.0"
 percent-encoding = "=2.3.2"
+# M3 atlassian HTTP client (Task 9). No default features: they would bring `system-proxy`
+# (reads OS/env proxies, L42), http2, charset and the aws-lc-rs provider (licence not allowed).
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+httpdate = "=1.0.3"
+# Test harness of `atlassian::testing` (§13: plain-HTTP mock, local TLS server with a generated CA).
+wiremock = "=0.6.5"
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.

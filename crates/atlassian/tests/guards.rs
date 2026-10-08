@@ -180,6 +180,7 @@ fn debug_is_redacted() {
     let get = GetCall {
         endpoint_template: "/rest/api/2/issue/{key}".into(),
         params: json!({"jql": "canary"}),
+        query: vec![("jql".into(), "canary".into())],
     };
     let s = format!("{get:?}");
     assert!(!s.contains("canary"), "{s}");

@@ -51,7 +51,10 @@ pub struct ApprovedWrite {
 #[derive(Clone, PartialEq)]
 pub struct GetCall {
     pub endpoint_template: String,
+    /// Values for the template's `{name}` placeholders only (`build_url`).
     pub params: serde_json::Value,
+    /// Query pairs in send order (Task 9 addition, Δ C.4); pagination appends its own.
+    pub query: Vec<(String, String)>,
 }
 
 impl fmt::Debug for GetCall {
