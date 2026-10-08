@@ -240,7 +240,7 @@ cleanup() {
     sleep 0.5
   done
   pkill -KILL -u "$(id -u)" -x atlas-duck-app 2>/dev/null
-  pkill -KILL -u "$(id -u)" -x atlas-duck-sandbox 2>/dev/null
+  pkill -KILL -u "$(id -u)" -x atlas-duck-sand 2>/dev/null
   if [ -n "$DATA_DIR" ] && [ -f "$DATA_DIR/logs/diag.log" ]; then
     cp "$DATA_DIR/logs/diag.log" "$evidence/diag.log"
   fi
