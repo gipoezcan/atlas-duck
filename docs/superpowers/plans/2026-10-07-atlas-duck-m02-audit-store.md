@@ -1612,6 +1612,9 @@ Run: `cargo test -p atlas-duck-audit --test prune --locked` → all pass; re-run
 ```rust
 pub struct Settings { pub retention_days: u32, pub legal_hold: bool, pub anchor_dir: Option<String>, pub instances: BTreeMap<String, InstancePolicy> }   // C.3 `Settings`
 pub struct InstancePolicy { pub origin: Option<String>, pub ca_fingerprint: Option<String>, pub proxy: Option<String> }
+// keyed by instance_id (never alias). origin Some = confirmed origin (L32; None = unconfirmed/removed).
+// proxy: None = no per-instance setting (OS static proxy applies, L42); Some("direct") = direct; Some("host:port") = explicit proxy.
+// The audit store stores these strings verbatim; validation and normalisation are core's (M3).
 pub enum SettingChange { RetentionDays(u32), LegalHold(bool), AnchorDir(Option<String>),
     InstanceOrigin { instance_id: String, origin: Option<String> }, InstanceCaFingerprint { instance_id: String, fingerprint: Option<String> },
     InstanceProxy { instance_id: String, proxy: Option<String> } }
