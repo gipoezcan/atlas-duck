@@ -14,6 +14,7 @@ pub mod error;
 mod incidents;
 pub mod keystore;
 pub mod open;
+mod prune;
 pub mod recovery;
 pub mod request_set;
 pub mod schema;
@@ -31,6 +32,9 @@ pub use admission::FreeSpaceProbe;
 pub use open::{
     ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
     keychain_retry_schedule, new_ids, open, read_store_install_id,
+};
+pub use prune::{
+    InstancePolicy, PruneOutcome, PruneSkip, RETENTION_DEFAULT, RETENTION_MIN, Settings,
 };
 pub use request_set::{RequestRecord, request_set_hash};
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};

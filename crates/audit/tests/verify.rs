@@ -773,6 +773,75 @@ fn tamper_prune_log_alter_cutoff() {
     ));
 }
 
+/// Two real prunes (T11): 94 simulated days at retention 92, both first-retained updates done.
+fn store_with_two_real_prunes() -> (Store, Fixture, u64, u64) {
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.hooks.synchronous_normal = true;
+    });
+    prune_ready(&store, 92);
+    corroborate_now(&store, &f.clock);
+    append_mixed(&store, 6);
+    for _ in 0..94 {
+        day(&store, &f.clock, 2);
+    }
+    let seqs: Vec<u64> = raw_conn(&f)
+        .prepare("SELECT prune_seq FROM prune_log ORDER BY prune_seq")
+        .expect("prepare")
+        .query_map([], |r| r.get::<_, i64>(0))
+        .expect("query")
+        .map(|r| r.expect("row") as u64)
+        .collect();
+    assert_eq!(seqs.len(), 2);
+    (store, f, seqs[0], seqs[1])
+}
+
+#[test]
+fn clean_store_with_real_prunes_verifies() {
+    let (store, f, _, p2) = store_with_two_real_prunes();
+    assert!(store.full_verify().is_empty());
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let v = verdict(&f);
+    assert!(v.findings.is_empty(), "{:?}", kinds(&v.findings));
+    assert!(full_verify_fresh(&f).is_empty());
+    assert!(keychain_first_retained(&f).first_retained_seq < p2);
+}
+
+#[test]
+fn tamper_real_prune_log_delete_row() {
+    let (store, f, p1, _) = store_with_two_real_prunes();
+    store.shutdown();
+    raw_conn(&f)
+        .execute("DELETE FROM prune_log WHERE prune_seq = ?1", [p1 as i64])
+        .expect("delete row");
+    let fs = full_verify_fresh(&f);
+    assert!(
+        has_kind(&fs, FindingKind::PruneLogNotContiguous)
+            || has_kind(&fs, FindingKind::PruneLogBroken),
+        "{:?}",
+        kinds(&fs)
+    );
+}
+
+#[test]
+fn tamper_real_prune_log_alter_cutoff() {
+    let (store, f, p1, _) = store_with_two_real_prunes();
+    store.shutdown();
+    raw_conn(&f)
+        .execute(
+            "UPDATE prune_log SET cutoff_epoch = '2026-07-30' WHERE prune_seq = ?1",
+            [p1 as i64],
+        )
+        .expect("tamper");
+    let fs = full_verify_fresh(&f);
+    assert!(
+        has_kind(&fs, FindingKind::PruneLogBroken),
+        "{:?}",
+        kinds(&fs)
+    );
+    assert!(verdict(&f).has_incident());
+}
+
 #[test]
 fn tamper_unknown_flag_bit() {
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());

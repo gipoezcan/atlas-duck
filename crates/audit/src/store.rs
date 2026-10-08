@@ -25,8 +25,9 @@ use crate::crypto::{self, Kek};
 use crate::encoding::{self, FIELD_LIST, RowFields};
 use crate::error::{AuditError, OpenError};
 use crate::keystore::KeyStore;
+use crate::prune::PruneOutcome;
 use crate::schema;
-use crate::types::{Committed, EventFlags, EventType, NewEvent, QueryKind};
+use crate::types::{Committed, Confirmed, EventFlags, EventType, NewEvent, QueryKind};
 use crate::verify::{
     self, FindingKind, KeychainAnchors, StartupVerdict, VerifyFinding, VerifyOutcome,
 };
@@ -133,7 +134,7 @@ impl fmt::Debug for QueryKey {
     }
 }
 
-/// Store state for Settings/tray (T09 fills the incidents, T11 prune).
+/// Store state for Settings/tray.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoreHealth {
     pub anchor_write_failing: bool,
@@ -238,6 +239,9 @@ pub(crate) struct AnchorInit {
     pub(crate) enabled: bool,
     /// The keychain already holds the head the writer starts with (first run).
     pub(crate) head_anchored: bool,
+    /// `GENESIS`'s `record_hash` as the first-retained anchor names it (prune writes it into
+    /// the next first-retained anchor once `GENESIS` itself is pruned).
+    pub(crate) genesis_hash: Option<[u8; 32]>,
 }
 
 impl Store {
@@ -262,6 +266,7 @@ impl Store {
             kek: kek.clone(),
             shared: shared.clone(),
             hooks: cfg.hooks.clone(),
+            genesis_hash: anchors.genesis_hash,
         };
         let (tx, thread) = writer::spawn(move || init(parts))?;
         let h = lock(&shared.head).clone();
@@ -535,20 +540,20 @@ impl Store {
     /// Holds the head anchor back (prune/restore). The guard releases the barrier when
     /// dropped unless `complete()` was called; an error path therefore cannot leave the anchors
     /// blocked. Install it BEFORE the `PRUNE`/`RESTORE` commit becomes visible. A second barrier
-    /// is refused.
-    #[allow(dead_code)] // called by prune/restore (T11)
+    /// is refused. (Prune reserves its slot on the writer thread instead.)
+    #[allow(dead_code)] // called by restore (T16)
     pub(crate) fn install_barrier(&self, b: Barrier) -> Result<BarrierGuard, AuditError> {
         self.inner.shared.anchors.install_barrier(b)
     }
 
     /// Lifts the barrier explicitly.
-    #[allow(dead_code)] // called by prune/restore (T11)
+    #[allow(dead_code)] // called by restore (T16)
     pub(crate) fn clear_barrier(&self) {
         self.inner.shared.anchors.clear_barrier();
     }
 
     /// The restore completion step: writes both anchors and lifts the restore barrier.
-    #[allow(dead_code)] // called by restore (T11)
+    #[allow(dead_code)] // called by restore (T16)
     pub(crate) fn complete_restore_anchors(
         &self,
         head: HeadAnchor,
@@ -569,8 +574,29 @@ impl Store {
             anchor_thread_dead: a.thread_dead,
             storage_low: self.admission_check().is_err(),
             open_incidents: lock(&self.inner.shared.incidents).len(),
-            ..StoreHealth::default()
+            prune_backlog_days: self.inner.shared.prune_backlog_days.load(Ordering::Relaxed),
         }
+    }
+
+    /// One prune run now (C.3, §8.8), on the writer between commands; the writer also runs
+    /// them on its own (after the first corroboration of the process and whenever the head's
+    /// `epoch` date advances). `Some(confirmed)` ("Prune backlog now", after the Rust-drawn
+    /// confirmation) lifts the 2-epoch clamp and the once-per-epoch-day cadence for this run;
+    /// every other guard applies. `Err` when a guard could not be evaluated or the run failed
+    /// (nothing written), or when an anchor barrier is still installed (the previous prune's
+    /// first-retained update is pending).
+    pub fn prune(
+        &self,
+        confirm_large_advance: Option<Confirmed>,
+    ) -> Result<PruneOutcome, AuditError> {
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::Prune {
+                confirm: confirm_large_advance,
+                reply,
+            })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
     }
 
     /// Full verification (C.3, §8.7): the whole chain, `prune_log`, a decrypt pass, every
@@ -860,6 +886,37 @@ impl Store {
             .send(Cmd::Pragma { name, reply })
             .map_err(|_| AuditError::Closed)?;
         rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// The settings prune uses until T12's view exists (feature `testing`); retention below the
+    /// 92-day minimum is refused.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_set_settings(&self, settings: crate::prune::Settings) -> Result<(), AuditError> {
+        if settings.retention_days < crate::prune::RETENTION_MIN {
+            return Err(AuditError::Invalid("retention below the 92-day minimum"));
+        }
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::SetSettings { settings, reply })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// What `reconcile_config_file` (T12) records: prune may run in this process (feature
+    /// `testing`). A deferred automatic attempt runs right after.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_set_config_reconciled(&self) -> Result<(), AuditError> {
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::SetConfigReconciled { reply })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// Whether DEK `key_id` is in the shared cache (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_dek_cached(&self, key_id: u64) -> bool {
+        lock(&self.inner.shared.dek_cache).contains_key(&key_id)
     }
 
     /// `observe_server_date` calls dropped on a full queue (feature `testing`).

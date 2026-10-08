@@ -5,14 +5,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use atlas_duck_audit::clock::UtcInstant;
+use atlas_duck_audit::clock::{Clock, UtcInstant};
 use atlas_duck_audit::encoding::{FIELD_LIST, RowFields, ZERO_HASH};
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::request_set::{RequestRecord, request_set_hash, requests_to_json};
 use atlas_duck_audit::schema::DB_FILE;
 use atlas_duck_audit::testing::{FakeClock, MemKeyStore, MemKeyring};
 use atlas_duck_audit::types::{Actor, EventType, NewEvent};
-use atlas_duck_audit::{FirstRunInput, OpenConfig, Store, create_new_store, new_ids};
+use atlas_duck_audit::{FirstRunInput, OpenConfig, Settings, Store, create_new_store, new_ids};
 use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
 use rusqlite::Connection;
 use secrecy::SecretString;
@@ -136,6 +136,57 @@ pub fn server_time(ts: &str) -> SystemTime {
 /// The next records get a non-NULL epoch (the server agrees with the local clock).
 pub fn corroborate(store: &Store) {
     store.observe_server_date("i1", server_time(START), Instant::now());
+}
+
+pub const DAY: Duration = Duration::from_secs(86_400);
+
+/// A server `Date` equal to the fake wall clock now (the local clock is right).
+pub fn corroborate_now(store: &Store, clock: &FakeClock) {
+    let now = clock.now_utc();
+    store.observe_server_date(
+        "i1",
+        UNIX_EPOCH + Duration::from_millis(now.0 as u64),
+        Instant::now(),
+    );
+}
+
+/// What prune needs that T12 provides: the retention in force and the config file reconciled.
+pub fn prune_ready(store: &Store, retention_days: u32) {
+    store
+        .testing_set_settings(Settings {
+            retention_days,
+            ..Settings::default()
+        })
+        .expect("settings");
+    store
+        .testing_set_config_reconciled()
+        .expect("config reconciled");
+}
+
+/// Returns once the writer handled every command queued so far and the prune attempt they
+/// queued (attempts run on the writer between commands).
+pub fn sync_writer(store: &Store) {
+    store
+        .testing_pragma("user_version")
+        .expect("writer round-trip");
+}
+
+pub fn day_events(n: usize) -> Vec<NewEvent> {
+    (0..n)
+        .map(|i| ev(EventType::APP_START, None, json!({ "i": i })))
+        .collect()
+}
+
+/// One simulated day: wall and monotonic clock +24 h, a server `Date` agreeing with the local
+/// clock, `n` events, the prune attempt they queued, then both anchors written.
+pub fn day(store: &Store, clock: &FakeClock, n: usize) {
+    clock.advance(DAY);
+    corroborate_now(store, clock);
+    if n > 0 {
+        store.append_batch(day_events(n)).expect("append_batch");
+    }
+    sync_writer(store);
+    store.flush_head_anchor().expect("flush");
 }
 
 /// `n` events of several kinds and column shapes (no store-owned type).

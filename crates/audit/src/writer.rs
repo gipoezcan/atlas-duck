@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -29,9 +29,10 @@ use crate::clock::{
 use crate::crypto::{self, Dek, Kek, MAX_PAYLOAD_LEN};
 use crate::encoding::{self, FIELD_LIST, FORMAT_VERSION, RowFields, ZERO_HASH};
 use crate::error::{AuditError, OpenError};
+use crate::prune::{PruneOutcome, PruneSkip, Settings};
 use crate::schema;
 use crate::store::Hooks;
-use crate::types::{Committed, EventFlags, EventType, NewEvent};
+use crate::types::{Committed, Confirmed, EventFlags, EventType, NewEvent};
 
 /// Bound of the command channel (plan decision).
 pub(crate) const CHANNEL_BOUND: usize = 64;
@@ -66,11 +67,11 @@ macro_rules! fault {
     };
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-fn sql(e: rusqlite::Error) -> AuditError {
+pub(crate) fn sql(e: rusqlite::Error) -> AuditError {
     AuditError::AppendFailed(format!("database error: {e}"))
 }
 
@@ -78,12 +79,12 @@ fn sql_open(e: rusqlite::Error) -> OpenError {
     OpenError::Sqlite(e.to_string())
 }
 
-fn int(v: u64) -> Result<i64, AuditError> {
+pub(crate) fn int(v: u64) -> Result<i64, AuditError> {
     i64::try_from(v).map_err(|_| AuditError::AppendFailed("integer column above 2^63".into()))
 }
 
 /// `ts_utc` / `created_at` text; an instant outside years 0000..=9999 fails closed.
-fn ts_text(t: UtcInstant) -> Result<String, AuditError> {
+pub(crate) fn ts_text(t: UtcInstant) -> Result<String, AuditError> {
     t.try_to_rfc3339_ms()
         .ok_or_else(|| AuditError::AppendFailed("wall clock outside years 0000..=9999".into()))
 }
@@ -213,7 +214,7 @@ impl PreparedEvent {
 
 /// How a committed row changes the open-incident set.
 #[derive(Clone, Copy)]
-enum IncidentChange {
+pub(crate) enum IncidentChange {
     Opened(u64),
     Acknowledged(u64),
 }
@@ -246,6 +247,8 @@ pub(crate) struct Shared {
     /// Seqs of open integrity incidents (T09): loaded at open, updated after every commit of
     /// a flagged `VERIFY` or an `INTEGRITY_ACK`.
     pub(crate) incidents: Mutex<BTreeSet<u64>>,
+    /// Days the cutoff of the latest prune run stayed behind its unclamped value (L37).
+    pub(crate) prune_backlog_days: AtomicU32,
 }
 
 impl Shared {
@@ -260,6 +263,7 @@ impl Shared {
             dropped_observations: AtomicU64::new(0),
             anchors: Arc::new(AnchorShared::new()),
             incidents: Mutex::new(BTreeSet::new()),
+            prune_backlog_days: AtomicU32::new(0),
         })
     }
 }
@@ -270,6 +274,9 @@ pub(crate) struct WriterParts {
     pub(crate) kek: Kek,
     pub(crate) shared: Arc<Shared>,
     pub(crate) hooks: Hooks,
+    /// `GENESIS`'s `record_hash` from the first-retained anchor, for a store whose `GENESIS`
+    /// is already pruned (a retained `GENESIS` row wins).
+    pub(crate) genesis_hash: Option<[u8; 32]>,
 }
 
 pub(crate) type AppendReply = SyncSender<Result<Vec<Committed>, AuditError>>;
@@ -292,13 +299,29 @@ pub(crate) enum Cmd {
     SetWrittenBy {
         reply: SyncSender<Result<(), OpenError>>,
     },
+    /// A prune run (C.3 `Store::prune`); `confirm` lifts the clamp and the cadence check.
+    Prune {
+        confirm: Option<Confirmed>,
+        reply: SyncSender<Result<PruneOutcome, AuditError>>,
+    },
+    /// The settings prune uses until T12's view (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    SetSettings {
+        settings: Settings,
+        reply: SyncSender<Result<(), AuditError>>,
+    },
+    /// What `reconcile_config_file` (T12) records: prune may run in this process.
+    #[cfg(any(test, feature = "testing"))]
+    SetConfigReconciled {
+        reply: SyncSender<Result<(), AuditError>>,
+    },
     #[cfg(any(test, feature = "testing"))]
     Pragma {
         name: &'static str,
         reply: SyncSender<Result<i64, AuditError>>,
     },
-    /// `testing::insert_fake_prune`: a `prune_log` row and its `PRUNE` record (T11 replaces
-    /// it with the real prune). `anchor` = `(chain_id, genesis_hash)` installs the prune
+    /// `testing::insert_fake_prune`: a `prune_log` row and its `PRUNE` record at a chosen
+    /// seq, without the prune rules. `anchor` = `(chain_id, genesis_hash)` installs the prune
     /// barrier for the first-retained update.
     #[cfg(any(test, feature = "testing"))]
     FakePrune {
@@ -309,18 +332,67 @@ pub(crate) enum Cmd {
     Shutdown,
 }
 
-struct WriterState {
-    clock: Arc<dyn crate::clock::Clock>,
-    clock_state: ClockState,
-    head: Head,
+pub(crate) struct WriterState {
+    pub(crate) clock: Arc<dyn crate::clock::Clock>,
+    pub(crate) clock_state: ClockState,
+    pub(crate) head: Head,
     kek: Kek,
-    shared: Arc<Shared>,
-    hooks: Hooks,
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) hooks: Hooks,
+    /// `GENESIS`'s `record_hash` (the first-retained anchor names it); `None`: unknown, and
+    /// prune fails closed.
+    pub(crate) genesis_hash: Option<[u8; 32]>,
+    /// The settings in force (T12 replaces this with its view).
+    pub(crate) settings: Settings,
+    /// The config file was reconciled in this process (T12): until then no prune runs.
+    pub(crate) config_reconciled: bool,
+    /// An automatic prune attempt is queued; it runs between commands.
+    pub(crate) prune_due: bool,
+    /// The head epoch at the last published commit (an advance queues an attempt).
+    published_epoch: Option<NaiveDate>,
+    /// Reasons a prune-skip `CLOCK_ANOMALY` was logged for in this process.
+    pub(crate) skips_logged: BTreeSet<&'static str>,
+    /// The head `ts_utc` a `ClockBeforeHead` skip was measured against: its own anomaly row
+    /// (stamped with the earlier `now`) must not disarm the guard.
+    pub(crate) clock_floor: Option<UtcInstant>,
+    /// A fault point simulated a crash: the writer stops (feature `testing`).
+    pub(crate) crashed: bool,
+}
+
+impl WriterState {
+    fn new(parts: WriterParts, clock_state: ClockState, head: Head) -> WriterState {
+        WriterState {
+            clock: parts.clock,
+            published_epoch: clock_state.prev_epoch,
+            clock_state,
+            head,
+            kek: parts.kek,
+            shared: parts.shared,
+            hooks: parts.hooks,
+            genesis_hash: parts.genesis_hash,
+            settings: Settings::default(),
+            config_reconciled: false,
+            prune_due: false,
+            skips_logged: BTreeSet::new(),
+            clock_floor: None,
+            crashed: false,
+        }
+    }
+
+    fn into_parts(self) -> WriterParts {
+        WriterParts {
+            clock: self.clock,
+            kek: self.kek,
+            shared: self.shared,
+            hooks: self.hooks,
+            genesis_hash: self.genesis_hash,
+        }
+    }
 }
 
 pub(crate) struct Writer {
-    conn: Connection,
-    st: WriterState,
+    pub(crate) conn: Connection,
+    pub(crate) st: WriterState,
 }
 
 /// `(seq, record_hash, chain_id, epoch, ts_utc, flags)` of the head row, as stored.
@@ -544,10 +616,32 @@ impl WriterState {
         Ok(out)
     }
 
+    /// One store-written row, stamped now, inside the caller's transaction. No clock-episode
+    /// row goes before it (callers bind the row's seq in advance); the episode is logged with
+    /// the next append.
+    pub(crate) fn append_in_tx(
+        &mut self,
+        tx: &Transaction<'_>,
+        p: &PreparedEvent,
+        new_keys: &mut HashMap<u64, Dek>,
+    ) -> Result<Committed, AuditError> {
+        let mono = self.clock.suspend_aware_elapsed();
+        let stamp = self.clock_state.stamp(self.clock.now_utc(), mono);
+        self.insert_one(tx, &stamp, p, mono, new_keys)
+    }
+
     /// After `COMMIT` returned: publish the head and the new keys, and hand the head to the
-    /// anchor thread (never blocks on the keychain). T11 queues a prune attempt here when the
-    /// head's epoch date advanced.
-    fn post_commit(&mut self, new_keys: HashMap<u64, Dek>, incidents: &[IncidentChange]) {
+    /// anchor thread (never blocks on the keychain). A head whose epoch date advanced queues
+    /// a prune attempt (L37 cadence).
+    pub(crate) fn post_commit(
+        &mut self,
+        new_keys: HashMap<u64, Dek>,
+        incidents: &[IncidentChange],
+    ) {
+        if self.clock_state.prev_epoch > self.published_epoch {
+            self.prune_due = true;
+        }
+        self.published_epoch = self.clock_state.prev_epoch;
         lock(&self.shared.dek_cache).extend(new_keys);
         if !incidents.is_empty() {
             let mut open = lock(&self.shared.incidents);
@@ -605,20 +699,14 @@ impl Writer {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             &parts.hooks,
         )?;
+        let head = Head {
+            seq: 0,
+            hash: ZERO_HASH,
+            chain_id: chain_id.to_string(),
+        };
         Ok(Writer {
             conn,
-            st: WriterState {
-                clock: parts.clock,
-                clock_state: ClockState::default(),
-                head: Head {
-                    seq: 0,
-                    hash: ZERO_HASH,
-                    chain_id: chain_id.to_string(),
-                },
-                kek: parts.kek,
-                shared: parts.shared,
-                hooks: parts.hooks,
-            },
+            st: WriterState::new(parts, ClockState::default(), head),
         })
     }
 
@@ -660,18 +748,24 @@ impl Writer {
         let ts = UtcInstant::parse_rfc3339_ms(&ts).ok_or_else(|| bad("ts_utc"))?;
         let flags = EventFlags::from_bits(u64::try_from(flags).map_err(|_| bad("flags"))?);
         *lock(&parts.shared.incidents) = crate::incidents::load_open(&conn, &parts.kek)?;
-        let st = WriterState {
-            clock: parts.clock,
-            clock_state: ClockState::from_head(epoch, ts, flags),
-            head: Head {
-                seq,
-                hash,
-                chain_id,
-            },
-            kek: parts.kek,
-            shared: parts.shared,
-            hooks: parts.hooks,
+        let genesis: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT record_hash FROM events WHERE seq = 1 AND event_type = 'GENESIS'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(sql_open)?;
+        let mut parts = parts;
+        if let Some(g) = genesis {
+            parts.genesis_hash = Some(g.try_into().map_err(|_| bad("GENESIS record_hash"))?);
+        }
+        let head = Head {
+            seq,
+            hash,
+            chain_id,
         };
+        let st = WriterState::new(parts, ClockState::from_head(epoch, ts, flags), head);
         *lock(&st.shared.head) = HeadView {
             seq,
             hash,
@@ -721,6 +815,7 @@ impl Writer {
         let mut new_keys = HashMap::new();
         let c = st.insert_one(&tx, &stamp, &p, mono, &mut new_keys)?;
         tx.commit().map_err(sql)?;
+        st.genesis_hash = Some(c.record_hash);
         st.post_commit(new_keys, &[]);
         Ok(c)
     }
@@ -752,17 +847,15 @@ impl Writer {
             .write(true)
             .open(path)?
             .sync_all()?;
-        Ok(WriterParts {
-            clock: st.clock,
-            kek: st.kek,
-            shared: st.shared,
-            hooks: st.hooks,
-        })
+        Ok(st.into_parts())
     }
 
     /// One append command: one transaction, all or nothing. On any error the transaction rolls
     /// back and the in-memory clock state and head are restored to their values before it.
-    fn append_tx(&mut self, evs: Vec<PreparedEvent>) -> Result<Vec<Committed>, AuditError> {
+    pub(crate) fn append_tx(
+        &mut self,
+        evs: Vec<PreparedEvent>,
+    ) -> Result<Vec<Committed>, AuditError> {
         {
             let open = lock(&self.st.shared.incidents);
             if evs
@@ -814,14 +907,24 @@ impl Writer {
     /// A server `Date` (§8.8 source (a)). A local-ahead episode start is logged as its own
     /// `CLOCK_ANOMALY` row; if that append fails the corroboration is forgotten too (it is
     /// repeated on the next response), so the episode is not silently marked as logged.
+    /// The first corroboration of the process queues a prune attempt (L37 cadence).
     fn observe(&mut self, server: UtcInstant, local: UtcInstant, mono_at: Duration) {
         let before = self.st.clock_state.clone();
         if let Some(a) = self.st.clock_state.observe(server, local, mono_at) {
             let logged = PreparedEvent::clock_anomaly(&a).and_then(|row| self.append_tx(vec![row]));
             if logged.is_err() {
-                self.st.clock_state = before;
+                self.st.clock_state = before.clone();
             }
         }
+        if !before.is_corroborated() && self.st.clock_state.is_corroborated() {
+            self.st.prune_due = true;
+        }
+    }
+
+    /// A queued automatic attempt. One deferred by the unreconciled config file stays queued.
+    fn run_queued_prune(&mut self) {
+        let r = self.prune_run(None);
+        self.st.prune_due = matches!(r, Ok(PruneOutcome::Skipped(PruneSkip::ConfigNotReconciled)));
     }
 
     /// Every pending migration step in one transaction, each followed by its
@@ -838,9 +941,7 @@ impl Writer {
                 EventType::SCHEMA_MIGRATED,
                 &json!({ "from": from, "to": to, "app_version": APP_VERSION }),
             )?;
-            let mono = st.clock.suspend_aware_elapsed();
-            let stamp = st.clock_state.stamp(st.clock.now_utc(), mono);
-            st.insert_one(tx, &stamp, &p, mono, &mut new_keys)?;
+            st.append_in_tx(tx, &p, &mut new_keys)?;
             Ok(())
         });
         match &result {
@@ -944,9 +1045,7 @@ impl Writer {
                     "settings": p.settings,
                 }),
             )?;
-            let mono = st.clock.suspend_aware_elapsed();
-            let stamp = st.clock_state.stamp(st.clock.now_utc(), mono);
-            let c = st.insert_one(&tx, &stamp, &ev, mono, &mut new_keys)?;
+            let c = st.append_in_tx(&tx, &ev, &mut new_keys)?;
             if c.seq != prune_seq {
                 return Err(AuditError::AppendFailed(
                     "PRUNE did not get the expected seq".into(),
@@ -1004,6 +1103,20 @@ impl Writer {
                     let r = schema::set_written_by(&self.conn).map_err(sql_open);
                     let _ = reply.send(r);
                 }
+                Cmd::Prune { confirm, reply } => {
+                    let r = self.prune_run(confirm.as_ref());
+                    let _ = reply.send(r);
+                }
+                #[cfg(any(test, feature = "testing"))]
+                Cmd::SetSettings { settings, reply } => {
+                    self.st.settings = settings;
+                    let _ = reply.send(Ok(()));
+                }
+                #[cfg(any(test, feature = "testing"))]
+                Cmd::SetConfigReconciled { reply } => {
+                    self.st.config_reconciled = true;
+                    let _ = reply.send(Ok(()));
+                }
                 #[cfg(any(test, feature = "testing"))]
                 Cmd::Pragma { name, reply } => {
                     let r = self
@@ -1022,6 +1135,12 @@ impl Writer {
                     let _ = reply.send(r);
                 }
                 Cmd::Shutdown => break,
+            }
+            if !self.st.crashed && self.st.prune_due {
+                self.run_queued_prune();
+            }
+            if self.st.crashed {
+                break;
             }
         }
     }

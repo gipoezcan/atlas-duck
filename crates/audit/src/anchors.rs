@@ -223,7 +223,7 @@ pub(crate) fn backoff(failures: u32) -> Duration {
 
 /// What holds the head anchor back.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // constructed by prune/restore (T11); tests construct it today
+#[allow(dead_code)] // `Restore` is constructed by restore (T16); tests construct it today
 pub(crate) enum Barrier {
     /// The head anchor may reach `seq` (the `PRUNE` record) but not beyond until the
     /// first-retained entry holds `first_retained` (§8.7 (d)).
@@ -235,12 +235,16 @@ pub(crate) enum Barrier {
     /// No head write at all until the restore completion step wrote both entries: an anchor
     /// from before the `RESTORE` would describe the replaced DB.
     Restore { seq: u64 },
+    /// A prune is about to commit: the slot is taken so its `Prune` barrier can be set right
+    /// after the commit and before the new head is published. Caps and writes nothing (nothing
+    /// past the current head is published meanwhile).
+    PruneReserved,
 }
 
 impl Barrier {
     fn kind(&self) -> BarrierKind {
         match self {
-            Barrier::Prune { .. } => BarrierKind::Prune,
+            Barrier::Prune { .. } | Barrier::PruneReserved => BarrierKind::Prune,
             Barrier::Restore { .. } => BarrierKind::Restore,
         }
     }
@@ -328,7 +332,7 @@ impl AnchorState {
                     h.clone()
                 }
             }),
-            None => self.head.clone(),
+            Some(Barrier::PruneReserved) | None => self.head.clone(),
         }
     }
 
@@ -448,6 +452,14 @@ impl BarrierGuard {
     pub fn complete(mut self) {
         self.shared = None;
     }
+
+    /// Replaces the reserved slot of [`AnchorShared::reserve_prune_barrier`] with `b`.
+    pub(crate) fn arm(&self, b: Barrier) -> Result<(), AuditError> {
+        match &self.shared {
+            Some(s) => s.arm_reserved(b),
+            None => Err(AuditError::Invalid("the barrier guard was completed")),
+        }
+    }
 }
 
 impl Drop for BarrierGuard {
@@ -509,8 +521,7 @@ impl AnchorShared {
     }
 
     /// Anchor writes stop again until the next `enable` (tests hold the keychain at an older
-    /// head with it).
-    #[cfg(any(test, feature = "testing"))]
+    /// head with it; prune when it could not set its barrier).
     pub(crate) fn disable(&self) {
         lock(&self.state).enabled = false;
     }
@@ -538,6 +549,43 @@ impl AnchorShared {
         Ok(BarrierGuard {
             shared: Some(self.clone()),
         })
+    }
+
+    /// Takes the barrier slot for a prune before its transaction (see
+    /// [`Barrier::PruneReserved`]); refused like a second barrier. The guard releases it.
+    pub(crate) fn reserve_prune_barrier(self: &Arc<Self>) -> Result<BarrierGuard, AuditError> {
+        {
+            let mut st = lock(&self.state);
+            if st.stop || st.dead {
+                return Err(st.unusable());
+            }
+            if st.barrier.is_some() {
+                return Err(AuditError::Invalid(
+                    "an anchor barrier is already installed",
+                ));
+            }
+            st.barrier = Some(Barrier::PruneReserved);
+        }
+        Ok(BarrierGuard {
+            shared: Some(self.clone()),
+        })
+    }
+
+    /// The reserved (or released) slot becomes `b`; another barrier is never replaced.
+    fn arm_reserved(&self, b: Barrier) -> Result<(), AuditError> {
+        {
+            let mut st = lock(&self.state);
+            match st.barrier {
+                None | Some(Barrier::PruneReserved) => {}
+                Some(_) => {
+                    return Err(AuditError::Invalid("another anchor barrier is installed"));
+                }
+            }
+            st.barrier = Some(b);
+            st.clear_failure();
+        }
+        self.cv.notify_all();
+        Ok(())
     }
 
     /// Lifts any barrier (error paths of prune/restore) and resets the retry state.

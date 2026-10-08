@@ -15,6 +15,8 @@ use crate::clock::{Clock, UtcInstant};
 use crate::error::AuditError;
 use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, service_name};
 
+pub use crate::prune::{PruneRow, effective_epochs, guarded_effective_epochs, prunable_prefix_len};
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -256,6 +258,11 @@ pub enum FaultPoint {
     /// Anchor writes are enabled (startup step 4, or `testing_enable_anchors`). Observation
     /// only: an armed failure is ignored.
     AnchorsEnabled,
+    /// Inside the prune transaction, after the `PRUNE` row, before `COMMIT`.
+    AfterPruneTxBeforeCommit,
+    /// Right after the prune `COMMIT`: an armed failure stops the writer there (a simulated
+    /// crash: no prune barrier, the new head is never published).
+    AfterPruneCommit,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).
@@ -397,8 +404,8 @@ impl FreeSpaceProbe for FreeSpaceStub {
     }
 }
 
-/// Input of [`insert_fake_prune`]: the store-level effect of a prune without its rules (T11
-/// brings the real `Store::prune`).
+/// Input of [`insert_fake_prune`]: the store-level effect of a prune without its rules, for
+/// tamper tests that need prunes at chosen seqs (`Store::prune` is the real one).
 #[derive(Debug, Clone)]
 pub struct FakePrune {
     /// Records below it are deleted; the next `prune_log` row's range ends here.
@@ -468,7 +475,11 @@ pub fn open_existing(
         ));
     }
     let kek = kek_from(&*cfg.keys)?;
-    crate::open::start_existing(data, cfg, kek)
+    let genesis_hash = crate::anchors::load_first_retained(&*cfg.keys)
+        .ok()
+        .flatten()
+        .map(|f| f.genesis_hash);
+    crate::open::start_existing(data, cfg, kek, genesis_hash)
 }
 
 /// `open()` step 4 for a verdict: its `VERIFY`, the anchor actions, then anchors enabled.

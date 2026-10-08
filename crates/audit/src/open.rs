@@ -261,11 +261,13 @@ impl FirstRun {
 /// Starts the writer on an existing `audit.db` (it runs the version gate on its own
 /// connection and loads the head and the open incidents). Anchor writes start disabled, as
 /// `open()` requires until the startup `VERIFY` is committed (§8.7); `Store::apply_startup`
-/// enables them. The store's `install_id` is the keystore's.
+/// enables them. The store's `install_id` is the keystore's. `genesis_hash` is the
+/// first-retained anchor's (a retained `GENESIS` row wins).
 pub(crate) fn start_existing(
     data: &LocalDataDir,
     cfg: OpenConfig,
     kek: Kek,
+    genesis_hash: Option<[u8; 32]>,
 ) -> Result<Store, OpenError> {
     let db = schema::db_path(data);
     if !db.try_exists()? {
@@ -278,6 +280,7 @@ pub(crate) fn start_existing(
     let anchors = AnchorInit {
         enabled: false,
         head_anchored: false,
+        genesis_hash,
     };
     Store::start(data, cfg, kek, install_id, anchors, move |parts| {
         Writer::open(&db, parts)
@@ -416,6 +419,8 @@ pub(crate) enum Preflight {
     Verified {
         kek: Kek,
         verdict: Box<StartupVerdict>,
+        /// The first-retained anchor's `genesis_hash`, if the entry exists.
+        genesis_hash: Option<[u8; 32]>,
     },
 }
 
@@ -483,6 +488,7 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
         Err(AnchorLoadError::KeyStore(e)) => return locked(keyring_reason(&e)),
     };
     let store_install_id = verify::store_install_id(&ro).map_err(sql)?;
+    let genesis_hash = first_retained.as_ref().map(|f| f.genesis_hash);
     let verdict = verify::startup(&StartupInputs {
         conn: &ro,
         kek: &kek,
@@ -494,6 +500,7 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
     Ok(Preflight::Verified {
         kek,
         verdict: Box::new(verdict),
+        genesis_hash,
     })
 }
 
@@ -517,11 +524,15 @@ pub fn open(
         return Err(OpenError::Invalid("instance.lock of another data dir"));
     }
     remove_staging_leftovers(data)?;
-    let (kek, verdict) = match preflight(data, &cfg)? {
+    let (kek, verdict, genesis_hash) = match preflight(data, &cfg)? {
         Preflight::Stop(outcome) => return Ok(outcome),
-        Preflight::Verified { kek, verdict } => (kek, verdict),
+        Preflight::Verified {
+            kek,
+            verdict,
+            genesis_hash,
+        } => (kek, verdict, genesis_hash),
     };
-    let store = match start_existing(data, cfg, kek) {
+    let store = match start_existing(data, cfg, kek, genesis_hash) {
         Ok(s) => s,
         // The writer's WAL-aware re-check of the gate. Not write-free like the step-1 gate:
         // the writer's read-write connection was opened and closed (a close may checkpoint).
@@ -661,6 +672,7 @@ pub fn create_new_store(
     let anchors = AnchorInit {
         enabled: true,
         head_anchored: true,
+        genesis_hash: None,
     };
     match Store::start(data, cfg, kek, input.install_id, anchors, move |parts| {
         first_run.run(parts)
