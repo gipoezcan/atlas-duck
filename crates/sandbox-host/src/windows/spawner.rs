@@ -19,14 +19,16 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, HANDLE, TRUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
+use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -147,7 +149,18 @@ impl WindowsSpawner {
             )
         };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            // Which call failed is invisible in a bare `SpawnFailed(87)`: the
+            // first CI run (windows-2022) failed here with 87 and nothing else.
+            let err = io::Error::last_os_error();
+            let mut in_job = 0;
+            // SAFETY: the pseudo handle of this process and a valid out pointer.
+            unsafe { IsProcessInJob(GetCurrentProcess(), null_mut(), &mut in_job) };
+            eprintln!(
+                "CreateProcessW failed: {err}; lpac={lpac}, flags={WORKER_CREATION_FLAGS:#x}, host_in_job={}, exe={}",
+                in_job != 0,
+                exe.display()
+            );
+            return Err(err);
         }
         // SAFETY: both handles were just returned to us.
         let process = unsafe { OwnedHandle::from_raw_handle(pi.hProcess as RawHandle) };
@@ -406,34 +419,40 @@ impl ProcAttrs {
             _policy: Box::new(PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT),
         };
         let list = me.list();
-        let update = |attr: u32, value: *const c_void, size: usize| -> io::Result<()> {
+        let update = |name: &str, attr: u32, value: *const c_void, size: usize| -> io::Result<()> {
             // SAFETY: `list` was initialised above; `value` points at `size`
             // bytes owned by `me`, which outlives the CreateProcessW call.
             if unsafe {
                 UpdateProcThreadAttribute(list, 0, attr as usize, value, size, null_mut(), null())
             } == 0
             {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                eprintln!("UpdateProcThreadAttribute({name}) failed: {err}");
+                return Err(err);
             }
             Ok(())
         };
         update(
+            "HANDLE_LIST",
             PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
             me._handles.as_ptr().cast(),
             std::mem::size_of::<[HANDLE; 3]>(),
         )?;
         update(
+            "SECURITY_CAPABILITIES",
             PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
             (&*me._caps as *const SECURITY_CAPABILITIES).cast(),
             std::mem::size_of::<SECURITY_CAPABILITIES>(),
         )?;
         update(
+            "JOB_LIST",
             PROC_THREAD_ATTRIBUTE_JOB_LIST,
             me._jobs.as_ptr().cast(),
             std::mem::size_of::<[HANDLE; 1]>(),
         )?;
         if lpac {
             update(
+                "ALL_APPLICATION_PACKAGES_POLICY",
                 PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
                 (&*me._policy as *const u32).cast(),
                 std::mem::size_of::<u32>(),
