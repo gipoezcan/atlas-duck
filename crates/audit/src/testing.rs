@@ -1,14 +1,18 @@
 #![cfg(any(test, feature = "testing"))]
-//! Test doubles: a controllable clock and an in-memory keyring with fault points.
+//! Test doubles: a controllable clock, an in-memory keyring with fault points, store fault
+//! points and a free-space stub.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use crate::admission::FreeSpaceProbe;
 use crate::clock::{Clock, UtcInstant};
+use crate::error::AuditError;
 use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, service_name};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -227,5 +231,139 @@ impl KeyStore for MemKeyStore {
 
     fn locality(&self) -> KeyringLocality {
         lock(&self.ring.locality).clone()
+    }
+}
+
+/// Where the store consults [`Faults`] (feature `testing` only; release builds have no hooks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FaultPoint {
+    /// Inside the append transaction, after every row was inserted, before `COMMIT`.
+    WriterBeforeCommit,
+    /// Inside the append transaction, after each inserted row.
+    WriterAfterRow,
+    /// At the top of every writer command: blocks while [`Faults::pause_writer`] is in force.
+    WriterPause,
+    /// First run: after `GENESIS` committed and both anchors were written, before the rename.
+    FirstRunBeforeRename,
+}
+
+#[derive(Default)]
+struct PauseState {
+    requested: bool,
+    paused: bool,
+}
+
+/// Injected failures and a writer pause, shared between a test and the store's [`crate::store::Hooks`].
+pub struct Faults {
+    armed: Mutex<HashMap<FaultPoint, (u32, u32)>>,
+    pause: Mutex<PauseState>,
+    cv: Condvar,
+}
+
+impl Faults {
+    pub fn new() -> Arc<Faults> {
+        Arc::new(Faults {
+            armed: Mutex::new(HashMap::new()),
+            pause: Mutex::new(PauseState::default()),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// The next `times` hits of `p` fail.
+    pub fn fail(&self, p: FaultPoint, times: u32) {
+        self.fail_after(p, 0, times);
+    }
+
+    /// The `skip` next hits of `p` pass, then `times` hits fail.
+    pub fn fail_after(&self, p: FaultPoint, skip: u32, times: u32) {
+        lock(&self.armed).insert(p, (skip, times));
+    }
+
+    /// From the next command on, the writer blocks at [`FaultPoint::WriterPause`].
+    pub fn pause_writer(&self) {
+        lock(&self.pause).requested = true;
+    }
+
+    /// Whether the writer is blocked in the pause within `timeout`.
+    pub fn wait_writer_paused(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut st = lock(&self.pause);
+        while !st.paused {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            st = self
+                .cv
+                .wait_timeout(st, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
+    }
+
+    pub fn resume_writer(&self) {
+        lock(&self.pause).requested = false;
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn hit(&self, p: FaultPoint) -> Result<(), AuditError> {
+        if p == FaultPoint::WriterPause {
+            let mut st = lock(&self.pause);
+            if st.requested {
+                st.paused = true;
+                self.cv.notify_all();
+                while st.requested {
+                    st = self.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                }
+                st.paused = false;
+            }
+            return Ok(());
+        }
+        let mut armed = lock(&self.armed);
+        match armed.get_mut(&p) {
+            Some((skip, _)) if *skip > 0 => {
+                *skip -= 1;
+                Ok(())
+            }
+            Some((_, times)) if *times > 0 => {
+                *times -= 1;
+                Err(AuditError::AppendFailed(format!("injected fault at {p:?}")))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// A [`FreeSpaceProbe`] reporting a settable number of bytes, or an error.
+pub struct FreeSpaceStub {
+    bytes: AtomicU64,
+    fail: AtomicBool,
+}
+
+impl FreeSpaceStub {
+    pub fn new(bytes: u64) -> Arc<FreeSpaceStub> {
+        Arc::new(FreeSpaceStub {
+            bytes: AtomicU64::new(bytes),
+            fail: AtomicBool::new(false),
+        })
+    }
+
+    pub fn set(&self, bytes: u64) {
+        self.bytes.store(bytes, Ordering::SeqCst);
+    }
+
+    /// While set, every probe returns an I/O error.
+    pub fn set_failing(&self, v: bool) {
+        self.fail.store(v, Ordering::SeqCst);
+    }
+}
+
+impl FreeSpaceProbe for FreeSpaceStub {
+    fn free_bytes(&self, _path: &Path) -> std::io::Result<u64> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("injected free-space probe failure"));
+        }
+        Ok(self.bytes.load(Ordering::SeqCst))
     }
 }

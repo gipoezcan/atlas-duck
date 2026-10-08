@@ -60,6 +60,9 @@ pub enum OpenError {
     WrongPassphrase,
     Integrity(String),
     Restore(RestoreError),
+    /// A caller-supplied first-run input is unusable (e.g. an `install_id` that differs from
+    /// the keystore's).
+    Invalid(&'static str),
 }
 
 impl fmt::Display for OpenError {
@@ -81,6 +84,7 @@ impl fmt::Display for OpenError {
             OpenError::WrongPassphrase => f.write_str("wrong recovery passphrase"),
             OpenError::Integrity(m) => write!(f, "integrity failure: {m}"),
             OpenError::Restore(e) => write!(f, "{e}"),
+            OpenError::Invalid(what) => write!(f, "invalid input: {what}"),
         }
     }
 }

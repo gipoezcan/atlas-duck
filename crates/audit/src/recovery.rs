@@ -123,11 +123,21 @@ pub fn seal_recovery(pass: &SecretString, kek: &Kek) -> Result<Vec<u8>, OpenErro
     let mut nonce = [0u8; 12];
     fill_random(&mut salt).map_err(|_| os_err("OS random source failed"))?;
     fill_random(&mut nonce).map_err(|_| os_err("OS random source failed"))?;
-    seal_recovery_with(pass, kek, &salt, &nonce)
+    seal_with(pass, kek, &salt, &nonce)
 }
 
-/// `seal_recovery` with a given salt and nonce, for the golden vectors.
+/// `seal_recovery` with a given salt and nonce, for the golden vectors (test builds only).
+#[cfg(any(test, feature = "testing"))]
 pub fn seal_recovery_with(
+    pass: &SecretString,
+    kek: &Kek,
+    salt: &[u8; 16],
+    nonce: &[u8; 12],
+) -> Result<Vec<u8>, OpenError> {
+    seal_with(pass, kek, salt, nonce)
+}
+
+fn seal_with(
     pass: &SecretString,
     kek: &Kek,
     salt: &[u8; 16],
@@ -197,6 +207,29 @@ pub fn open_recovery(pass: &SecretString, blob: &[u8]) -> Result<Kek, RecoveryEr
     }
     k.copy_from_slice(&plain);
     Ok(Kek::from_key(k))
+}
+
+/// The pure part of the first-run rules, checked before any keychain access: the length rule
+/// on the first entry, then the two entries equal after NFC. `new_recovery_blob` still seals,
+/// reopens with the second entry and compares the KEK (§8.6).
+pub(crate) fn check_new_passphrase(
+    first: &SecretString,
+    second: &SecretString,
+) -> Result<(), OpenError> {
+    let a = nfc(first);
+    if a.chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(OpenError::PassphraseTooShort);
+    }
+    let b = nfc(second);
+    let same = a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0;
+    if !same {
+        return Err(OpenError::PassphraseMismatch);
+    }
+    Ok(())
 }
 
 /// First run and passphrase change (§8.6): enforce the length rule on the first entry, seal

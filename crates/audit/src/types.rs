@@ -193,6 +193,26 @@ pub struct Committed {
     pub record_hash: [u8; 32],
 }
 
+/// The plaintext columns of one `events` row (C.3 header queries, T17); never decrypts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventHeader {
+    pub seq: u64,
+    pub ts_utc: String,
+    pub epoch: Option<String>,
+    pub chain_id: String,
+    pub event_type: EventType,
+    pub request_id: Option<String>,
+    pub op_id: Option<String>,
+    pub op_class: Option<String>,
+    pub instance_id: Option<String>,
+    pub target: Option<String>,
+    pub decision: Option<DecisionColumn>,
+    pub flags: EventFlags,
+    pub actor: Actor,
+    pub payload_len: u64,
+    pub key_id: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueryKind {
     Jql,

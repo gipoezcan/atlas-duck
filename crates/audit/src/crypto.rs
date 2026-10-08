@@ -245,11 +245,23 @@ pub fn wrap_dek(
     month: Option<&str>,
     dek: &Dek,
 ) -> Result<Vec<u8>, AuditError> {
-    wrap_dek_with_nonce(kek, key_id, month, dek, &random_nonce()?)
+    wrap_with(kek, key_id, month, dek, &random_nonce()?)
 }
 
-/// `wrap_dek` with a given nonce, for the golden vectors. The store always calls `wrap_dek`.
+/// `wrap_dek` with a given nonce, for the golden vectors (test builds only). The store always
+/// calls `wrap_dek`.
+#[cfg(any(test, feature = "testing"))]
 pub fn wrap_dek_with_nonce(
+    kek: &Kek,
+    key_id: u64,
+    month: Option<&str>,
+    dek: &Dek,
+    nonce: &[u8; 12],
+) -> Result<Vec<u8>, AuditError> {
+    wrap_with(kek, key_id, month, dek, nonce)
+}
+
+fn wrap_with(
     kek: &Kek,
     key_id: u64,
     month: Option<&str>,
