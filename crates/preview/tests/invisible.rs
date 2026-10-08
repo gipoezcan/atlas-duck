@@ -5,8 +5,8 @@ use atlas_duck_preview::invisible::{
     MAX_RGI_EMOJI_CHARS, count, escape_for_display, flags, is_bidi_control, is_flagged, strip,
 };
 use atlas_duck_preview::mixed_script::is_mixed_script;
-use icu_properties::CodePointMapData;
-use icu_properties::props::Script;
+use icu_properties::props::{DefaultIgnorableCodePoint, GeneralCategory, Script};
+use icu_properties::{CodePointMapData, CodePointSetData};
 
 /// §13 S-13 input: ESC, NEL, U+3164, U+E0041, U+202E, the ZWJ sequence 👩‍🚀 and ❤️ (U+FE0F).
 const S13: &str = "a\u{1B}b\u{85}c\u{3164}d\u{E0041}e\u{202E}f👩\u{200D}🚀g❤\u{FE0F}h";
@@ -142,6 +142,57 @@ fn rgi_emoji_sequences_unflag_only_zwj_and_variation_selectors() {
         escape_for_display("12👩\u{200D}🚀3\u{200D}"),
         "12👩\u{200D}🚀3⟨U+200D⟩"
     );
+}
+
+#[test]
+fn only_fully_qualified_emoji_exempt_zwj_and_vs16() {
+    // Ruling (L57): RGI = fully-qualified. 👁️‍🗨️ is 1F441 FE0F 200D 1F5E8 FE0F.
+    let fq = "👁\u{FE0F}\u{200D}🗨\u{FE0F}";
+    assert_eq!(count(fq), (0, 0));
+    // Unqualified spelling: the ZWJ joins no fully-qualified sequence.
+    assert_eq!(flags("👁\u{200D}🗨"), [false, true, false]);
+    // Minimally-qualified spelling: the ZWJ stays flagged; the trailing 🗨️ is fully qualified.
+    assert_eq!(flags("👁\u{200D}🗨\u{FE0F}"), [false, true, false, false]);
+    // Unqualified rainbow flag (no FE0F after 🏳).
+    assert_eq!(flags("🏳\u{200D}🌈"), [false, true, false]);
+    // Unqualified keycap (no FE0F): nothing to exempt, and `#` alone is not flagged.
+    assert_eq!(count("#\u{20E3}"), (0, 0));
+}
+
+#[test]
+fn every_format_character_is_flagged() {
+    // Ruling: fail closed on all of General_Category=Cf, not only Default_Ignorable ones.
+    // These are Cf but not Default_Ignorable_Code_Point.
+    let cf_not_di: Vec<char> = (0x0600..=0x0605)
+        .chain([0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2, 0x110BD, 0x110CD])
+        .chain(0xFFF9..=0xFFFB)
+        .chain(0x13430..=0x1343F)
+        .filter_map(char::from_u32)
+        .collect();
+    for &c in &cf_not_di {
+        assert_eq!(
+            CodePointMapData::<GeneralCategory>::new().get(c),
+            GeneralCategory::Format,
+            "U+{:04X}",
+            c as u32
+        );
+        assert!(
+            !CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(c),
+            "U+{:04X}",
+            c as u32
+        );
+        assert!(is_flagged(c), "U+{:04X}", c as u32);
+    }
+    assert_eq!(count("x\u{0600}y\u{FFF9}z"), (0, 2));
+    assert_eq!(escape_for_display("\u{06DD}1"), "⟨U+06DD⟩1");
+    // The whole category, from the linked ICU data.
+    let unflagged_cf: Vec<u32> = (0..=0x10FFFFu32)
+        .filter_map(char::from_u32)
+        .filter(|&c| CodePointMapData::<GeneralCategory>::new().get(c) == GeneralCategory::Format)
+        .filter(|&c| !is_flagged(c))
+        .map(|c| c as u32)
+        .collect();
+    assert!(unflagged_cf.is_empty(), "{unflagged_cf:X?}");
 }
 
 #[test]

@@ -18,14 +18,19 @@ const VS16: char = '\u{FE0F}';
 /// it equal to the table's maximum.
 pub const MAX_RGI_EMOJI_CHARS: usize = 10;
 
-/// §6.4: Default_Ignorable_Code_Point ∪ (Cc minus \t \n \r) ∪ Zl ∪ Zp. Context-free.
+/// §6.4: Default_Ignorable_Code_Point ∪ Cf ∪ (Cc minus \t \n \r) ∪ Zl ∪ Zp. Context-free.
+/// Cf is listed explicitly (lead ruling 2026-10-08, fail closed): §6.4 says the set "covers Cf",
+/// but some Cf code points (U+0600–0605, U+06DD, U+070F, U+FFF9–FFFB, U+13430–1343F, …) are not
+/// Default_Ignorable.
 pub fn is_flagged(c: char) -> bool {
     if CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(c) {
         return true;
     }
     match CodePointMapData::<GeneralCategory>::new().get(c) {
         GeneralCategory::Control => !matches!(c, '\t' | '\n' | '\r'),
-        GeneralCategory::LineSeparator | GeneralCategory::ParagraphSeparator => true,
+        GeneralCategory::Format
+        | GeneralCategory::LineSeparator
+        | GeneralCategory::ParagraphSeparator => true,
         _ => false,
     }
 }
@@ -37,9 +42,10 @@ pub fn is_bidi_control(c: char) -> bool {
 
 /// Per-char flags for `s` (in `char_indices` order): `is_flagged`, except U+FE0E, U+FE0F and
 /// U+200D inside an RGI emoji sequence. Sequences are found leftmost-longest within each maximal
-/// run of emoji-sequence characters; a candidate counts when `emojis::get` knows it (the table is
-/// the fully-qualified emoji of emoji-test.txt; `get` also maps minimally-qualified and
-/// unqualified spellings to them).
+/// run of emoji-sequence characters; a candidate counts only when it is spelled exactly as a
+/// fully-qualified emoji of emoji-test.txt (§6.4, L57). `emojis::get` also maps
+/// minimally-qualified and unqualified spellings to their fully-qualified entry, so the match
+/// compares `as_str()`. U+FE0E is never part of a fully-qualified emoji and so is never exempt.
 pub fn flags(s: &str) -> Vec<bool> {
     let chars: Vec<char> = s.chars().collect();
     let mut out: Vec<bool> = chars.iter().map(|&c| is_flagged(c)).collect();
@@ -65,7 +71,7 @@ pub fn flags(s: &str) -> Vec<bool> {
             let mut matched = None;
             for end in (j + 1..=i.min(j + MAX_RGI_EMOJI_CHARS)).rev() {
                 let candidate: String = chars[j..end].iter().collect();
-                if emojis::get(&candidate).is_some() {
+                if emojis::get(&candidate).is_some_and(|e| e.as_str() == candidate) {
                     matched = Some(end);
                     break;
                 }
