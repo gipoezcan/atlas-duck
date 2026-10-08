@@ -347,6 +347,9 @@ impl Store {
     }
 
     fn sender(&self) -> Result<SyncSender<Cmd>, AuditError> {
+        if self.inner.shared.stopped.load(Ordering::SeqCst) {
+            return Err(AuditError::Closed);
+        }
         lock(&self.inner.tx).clone().ok_or(AuditError::Closed)
     }
 
@@ -449,7 +452,7 @@ impl Store {
         f: impl FnOnce(&rusqlite::Connection) -> Result<T, AuditError>,
     ) -> Result<T, AuditError> {
         let mut guard = lock(&self.inner.shared.reader);
-        if lock(&self.inner.tx).is_none() {
+        if lock(&self.inner.tx).is_none() || self.inner.shared.stopped.load(Ordering::SeqCst) {
             return Err(AuditError::Closed);
         }
         if guard.is_none() {
@@ -1043,7 +1046,7 @@ impl Store {
     ///
     /// `Err(Restore(CommittedIncomplete { restore_seq, .. }))`: the restore committed but a
     /// later step (PAT deletion, KEK re-seal, the writer's start over) failed; this handle is
-    /// stopped (`Closed`) and the next start completes the restore (`open`, or "Finish
+    /// stopped (`Closed` for writes and reads) and the next start completes the restore (`open`, or "Finish
     /// restore" when the KEK was not re-sealed). Every other `Err` means nothing changed
     /// (`Restore(..)` for the source, `KeyStore`, `Io`), so a retry is safe. A failed anchor
     /// reset is not an error (retried, shown in `health()`). The confirmation is not bound to

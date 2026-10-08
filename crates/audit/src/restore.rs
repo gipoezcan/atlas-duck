@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_duck_ipc::paths::LocalDataDir;
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
@@ -217,6 +218,8 @@ fn open_untrusted(path: &Path) -> rusqlite::Result<Connection> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
     Ok(conn)
 }
@@ -313,15 +316,28 @@ fn stage(
     remove_db_files(&staging.path).map_err(io_err)?;
     // An archived store's WAL is read with it; a bundle never has one.
     copy_source(&snapshot, &staging.path)?;
-    // 2. Versions (§8.13): a snapshot of a newer build is refused before anything else.
-    let versions = schema::read_versions(&staging.path).map_err(open_to_audit)?;
+    // 2. Versions (§8.13), the schema version first: it is in the file header, so reading it
+    // evaluates nothing of the copy. A newer one is refused, as is one below the first.
+    let conn = open_untrusted(&staging.path).map_err(source_err)?;
+    let user_version = schema::user_version(&conn).map_err(source_err)?;
+    if user_version > schema_head {
+        return Err(restore_err(RestoreError::SnapshotNewer {
+            found: format!("user_version {user_version}"),
+        }));
+    }
+    if user_version < schema::TABLES_V1_VERSION {
+        return Err(restore_err(RestoreError::ChainBroken(format!(
+            "unknown schema version {user_version}"
+        ))));
+    }
+    // The copy's schema is the store schema, nothing more (a crafted bundle's triggers, views
+    // or tables never reach the live store), checked before any query reads a table of it:
+    // an `events` view could otherwise run forever or lie.
+    check_schema(&conn, user_version, hooks)?;
+    let versions = schema::versions_from(&conn).map_err(open_to_audit)?;
     if let Err(found) = schema::gate_up_to(&versions, schema_head) {
         return Err(restore_err(RestoreError::SnapshotNewer { found }));
     }
-    // The copy's schema is the store schema, nothing more (a crafted bundle's triggers, views
-    // or tables never reach the live store).
-    let conn = open_untrusted(&staging.path).map_err(sql)?;
-    check_schema(&conn, versions.user_version, hooks)?;
     // 3. The chain, plaintext only.
     let findings = verify::snapshot_chain(&conn).map_err(sql)?;
     if !findings.is_empty() {
@@ -645,6 +661,23 @@ fn commit_swap(
                     ))));
                 }
             }
+            // Windows: a handle without delete sharing (SQLite's own, a scanner's) would refuse
+            // the rename below, and then also the removal of the link made before it. Refuse
+            // now instead, while nothing was created.
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                const DELETE: u32 = 0x0001_0000;
+                std::fs::OpenOptions::new()
+                    .access_mode(DELETE)
+                    .share_mode(0)
+                    .open(&db)
+                    .map_err(|e| {
+                        SwapError::Before(AuditError::Io(format!(
+                            "audit.db is open in another process: {e}"
+                        )))
+                    })?;
+            }
             std::fs::hard_link(&db, &target).map_err(before)?;
             linked = Some(target);
             if let Err(e) = sync_dir(&dir) {
@@ -661,10 +694,15 @@ fn commit_swap(
         }
     }
     if let Err(e) = std::fs::rename(staging, &db) {
-        if let Some(t) = &linked {
-            let _ = std::fs::remove_file(t);
+        let mut msg = e.to_string();
+        if let Some((t, r)) = linked.as_ref().zip(replaced)
+            && std::fs::remove_file(t).is_err()
+        {
+            // The same handle that refused the rename refuses this: a second name of the live
+            // file stays (harmless, M-1).
+            msg.push_str(&format!("; {} could not be removed", r.file));
         }
-        return Err(before(e));
+        return Err(SwapError::Before(AuditError::Io(msg)));
     }
     // Committed: whatever fails from here on, `audit.db` is the restored store.
     crash!(hooks, CommitDirSync)
@@ -772,10 +810,20 @@ impl Drop for HeldBarrier<'_> {
 }
 
 impl Writer {
+    /// The writer ends and the handle reads nothing more: `audit.db` may no longer be the store
+    /// its state describes.
+    fn stop_after_commit(&mut self) {
+        self.st.crashed = true;
+        self.st
+            .shared
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// `Store::restore` (C.3, §8.11) on the writer thread, so no append interleaves; see the
     /// module doc for the steps. Before the commit rename every error leaves the live store,
-    /// the keychain (but deleted PAT entries) and the anchor barrier as they were. After it a
-    /// simulated crash or a failed KEK re-seal stops the writer (the next start completes the
+    /// the keychain and the anchor barrier as they were. After it every failure stops the
+    /// writer and the handle's reads (`CommittedIncomplete`; the next start completes the
     /// restore); a failed anchor reset is retried in the background.
     pub(crate) fn restore_run(&mut self, req: RestoreRequest) -> Result<RestoreReport, AuditError> {
         let staged = stage(&req.data_dir, &req.source, &req.passphrase, &self.st.hooks)?;
@@ -837,14 +885,14 @@ impl Writer {
             Err(SwapError::Before(e)) => {
                 // Nothing was replaced: the writer goes on with the live store.
                 if self.reopen_live(&db).is_err() {
-                    self.st.crashed = true;
+                    self.stop_after_commit();
                 }
                 return Err(e);
             }
             Err(SwapError::After(e)) => {
                 // Committed: the writer must not go on with the replaced store's state.
                 held.keep();
-                self.st.crashed = true;
+                self.stop_after_commit();
                 return Err(committed(restore_seq, e));
             }
         }
@@ -865,7 +913,7 @@ impl Writer {
         let pats = match finish(self) {
             Ok(p) => p,
             Err(e) => {
-                self.st.crashed = true;
+                self.stop_after_commit();
                 return Err(committed(restore_seq, e));
             }
         };
@@ -877,7 +925,7 @@ impl Writer {
             .arm_restore_reset(restore_seq, reset)
             .map(|rx| shared.anchors.wait_reset(rx));
         if let Err(e) = armed {
-            self.st.crashed = true;
+            self.stop_after_commit();
             return Err(committed(restore_seq, e));
         }
         drop(held);

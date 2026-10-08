@@ -13,6 +13,12 @@ use crate::error::{AuditError, OpenError};
 use crate::recovery::{RECOVERY_LAYOUT, recovery_layout};
 
 pub const SCHEMA_HEAD: u32 = 1;
+
+/// The `user_version` `TABLES_V1` describes: the base every migration chain starts from, also
+/// once `SCHEMA_HEAD` has moved on. Restore compares a snapshot's schema with `TABLES_V1` plus
+/// the migration steps byte for byte, so the DDL text of both is part of the restore contract:
+/// never reformat it.
+pub(crate) const TABLES_V1_VERSION: u32 = 1;
 pub const DB_FILE: &str = "audit.db";
 
 /// Key of the plaintext, advisory `meta` row (§8.13 message only, never a security decision).
@@ -262,7 +268,7 @@ pub(crate) fn expected_objects(
 ) -> Result<Vec<SchemaObject>, OpenError> {
     let mut mem = Connection::open_in_memory().map_err(sqlite)?;
     mem.execute_batch(TABLES_V1).map_err(sqlite)?;
-    let steps: Vec<Migration> = pending_steps(SCHEMA_HEAD, migrations)?
+    let steps: Vec<Migration> = pending_steps(TABLES_V1_VERSION, migrations)?
         .into_iter()
         .filter(|m| m.to <= user_version)
         .collect();
@@ -321,7 +327,7 @@ fn uri_for_text(raw: &str) -> String {
     out
 }
 
-fn versions_from(conn: &Connection) -> Result<StoreVersions, OpenError> {
+pub(crate) fn versions_from(conn: &Connection) -> Result<StoreVersions, OpenError> {
     let user_version = user_version(conn).map_err(sqlite)?;
     let head_format_version = conn
         .query_row(

@@ -2042,25 +2042,32 @@ fn pats_are_deleted_after_the_commit_and_by_finish_restore() {
     }
 }
 
-/// M-2 on Windows: a reader holding `audit.db` open makes the commit rename fail; that is
-/// refused before the commit, so the tokens and the live store are untouched.
+/// M-2/N-4 on Windows: another process holding `audit.db` open without delete sharing (as
+/// SQLite and some scanners do) would make the commit rename fail, and the hard link made
+/// before it could not be removed either. The restore checks for that before it links, so it
+/// is refused before the commit: tokens, live store and `archived/` are untouched.
 #[cfg(windows)]
 #[test]
 fn rename_refused_by_an_open_reader_changes_nothing() {
+    use std::os::windows::fs::OpenOptionsExt;
     let (a, _fa) = machine_a();
     let out = tempfile::tempdir().expect("out dir");
     let bundle = backup_into(&a, out.path());
     let faults = Faults::new();
     let (b, fb) = machine_b(4, &faults);
-    let reader = ro(&fb.db_path());
-    let _: i64 = reader
-        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
-        .expect("read");
+    const FILE_SHARE_READ: u32 = 1;
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | 2)
+        .open(fb.db_path())
+        .expect("a handle without delete sharing");
     let head = b.head();
     let e = b
         .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
         .expect_err("rename refused");
     assert_eq!(committed_incomplete(&e), None, "{e:?}");
+    // Refused by the check before the link, not by the rename after it.
+    assert!(e.to_string().contains("open in another process"), "{e}");
     drop(reader);
     assert!(raw_entry(&fb.ring, &fb.install_id, "pat/i3").is_some());
     assert_eq!(b.head(), head);
@@ -2071,4 +2078,144 @@ fn rename_refused_by_an_open_reader_changes_nothing() {
         .map(|d| d.count())
         .unwrap_or(0);
     assert_eq!(stray, 0, "no stray archive link");
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 2
+
+/// N-1: a same-machine restore re-uses the keychain KEK, so after a stop between its commit
+/// and its PAT deletion the next `open()` serves the store: the reconciliation deletes the
+/// restored view's tokens first, and a keychain that refuses that keeps the store locked.
+#[test]
+fn same_kek_restore_stopped_before_its_pat_deletion_opens_without_tokens() {
+    let faults = Faults::new();
+    let (a, fa) = new_store_with(fake_clock(START), MemKeyring::new(), |cfg| {
+        cfg.hooks.faults = Some(faults.clone());
+    });
+    a.apply_setting(
+        SettingChange::InstanceOrigin {
+            instance_id: "i1".into(),
+            origin: Some("https://i1.example".into()),
+        },
+        Some(confirmed()),
+    )
+    .expect("origin");
+    a.append_batch(mixed(5)).expect("append_batch");
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    fa.keys()
+        .set(&EntryName::Pat("i1".into()), b"token")
+        .expect("pat");
+    a.flush_head_anchor().expect("flush");
+    faults.fail(FaultPoint::AfterRestoreCommit, 1);
+    let e = a
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            Some(confirmed()),
+        )
+        .expect_err("stop after the commit");
+    assert!(committed_incomplete(&e).is_some(), "{e:?}");
+    drop(a);
+    assert!(raw_entry(&fa.ring, &fa.install_id, "pat/i1").is_some());
+    let rows_before = dump_rows(&fa).len();
+
+    // The keychain refuses the deletion: locked, nothing written, the token still there.
+    fa.ring.fail_next(
+        KeyOpKind::Delete,
+        Some(EntryName::Pat("i1".into())),
+        KeyStoreError::Unavailable,
+        1,
+    );
+    match open(&fa.data, &fa.lock, fa.config()).expect("open") {
+        StartupOutcome::Locked(LockedReason::KeychainUnavailable) => {}
+        other => panic!("expected Locked(KeychainUnavailable), got {other:?}"),
+    }
+    assert_eq!(dump_rows(&fa).len(), rows_before);
+
+    let (s, v) = ready(open(&fa.data, &fa.lock, fa.config()).expect("open"));
+    assert_eq!(
+        kinds(&v.findings),
+        vec![FindingKind::InterruptedRestoreReconciled]
+    );
+    assert_eq!(raw_entry(&fa.ring, &fa.install_id, "pat/i1"), None);
+    assert_eq!(s.full_verify(), vec![]);
+}
+
+/// N-2: a schema version below the first is never adopted.
+#[test]
+fn snapshot_below_the_first_schema_version_is_refused() {
+    let (a, _fa) = store_with(5);
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    craft_snapshot(&bundle.bundle_dir, "PRAGMA user_version = 0;");
+    let mut m = read_manifest(&bundle.bundle_dir);
+    m["user_version"] = json!(0);
+    write_manifest(&bundle.bundle_dir, &m);
+    let fc = fixture(fake_clock(START), MemKeyring::new());
+    match restore_on(&fc, fc.config(), &bundle.bundle_dir, PASSPHRASE) {
+        Err(OpenError::Restore(RestoreError::ChainBroken(m))) => {
+            assert!(m.contains("schema version 0"), "{m}")
+        }
+        other => panic!("expected ChainBroken, got {other:?}"),
+    }
+    assert!(!fc.db_path().exists());
+}
+
+/// N-3: nothing of the copy is queried before its schema is checked: an `events` view over
+/// an endless recursive CTE is refused at once, not evaluated.
+#[test]
+fn endless_events_view_is_refused_without_evaluating_it() {
+    let (a, _fa) = store_with(5);
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    craft_snapshot(
+        &bundle.bundle_dir,
+        "ALTER TABLE events RENAME TO events_t; \
+         CREATE VIEW events AS WITH RECURSIVE c(x) AS \
+         (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+         SELECT x AS seq, 1 AS format_version, '' AS chain_id FROM c;",
+    );
+    let dir = bundle.bundle_dir.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let fc = fixture(fake_clock(START), MemKeyring::new());
+        let r = restore_on(&fc, fc.config(), &dir, PASSPHRASE).map(|_| ());
+        let _ = tx.send((r, fc.db_path().exists()));
+    });
+    let (r, db_exists) = rx
+        .recv_timeout(Duration::from_secs(120))
+        .expect("the restore must not evaluate the crafted view");
+    match r {
+        Err(OpenError::Restore(RestoreError::ChainBroken(m))) => {
+            assert!(m.contains("events"), "{m}")
+        }
+        other => panic!("expected ChainBroken, got {other:?}"),
+    }
+    assert!(!db_exists);
+}
+
+/// N-8: after `CommittedIncomplete` the handle reads nothing either (it would read the
+/// restored file with the replaced store's keys and head).
+#[test]
+fn committed_incomplete_handle_reads_nothing() {
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, _fb) = machine_b(4, &faults);
+    faults.fail(FaultPoint::AfterKekReseal, 1);
+    let e = b
+        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .expect_err("stop");
+    assert!(committed_incomplete(&e).is_some(), "{e:?}");
+    assert_eq!(b.read_payload(2), Err(AuditError::Closed));
+    assert_eq!(
+        b.append(ev(EventType::APP_START, None, json!({}))),
+        Err(AuditError::Closed)
+    );
+    match b.try_full_verify() {
+        Err(AuditError::Closed) => {}
+        other => panic!("expected Closed, got {other:?}"),
+    }
 }

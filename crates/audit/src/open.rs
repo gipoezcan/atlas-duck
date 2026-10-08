@@ -457,6 +457,9 @@ pub(crate) enum Preflight {
         verdict: Box<StartupVerdict>,
         /// The first-retained anchor's `genesis_hash`, if the entry exists.
         genesis_hash: Option<[u8; 32]>,
+        /// The instance ids of the settings view when the verdict is an unfinished restore
+        /// (reconciled or deferred): their PAT entries are deleted before the store is served.
+        restore_pats: Vec<String>,
     },
 }
 
@@ -531,6 +534,7 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
         AnchorDirLines::note_setting_unreadable(&mut anchor_lines);
     }
     let genesis_hash = first_retained.as_ref().map(|f| f.genesis_hash);
+    let instances: Vec<String> = view.instances.keys().cloned().collect();
     let verdict = verify::startup(&StartupInputs {
         conn: &ro,
         kek: &kek,
@@ -540,10 +544,17 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
         pinned_install_id: cfg.pinned_install_id.clone(),
         anchor_lines,
     })?;
+    let a = &verdict.anchor_actions;
+    let restore_pats = if a.complete_restore.is_some() || a.defer_restore.is_some() {
+        instances
+    } else {
+        Vec::new()
+    };
     Ok(Preflight::Verified {
         kek,
         verdict: Box::new(verdict),
         genesis_hash,
+        restore_pats,
     })
 }
 
@@ -567,14 +578,24 @@ pub fn open(
         return Err(OpenError::Invalid("instance.lock of another data dir"));
     }
     remove_staging_leftovers(data)?;
-    let (kek, verdict, genesis_hash) = match preflight(data, &cfg)? {
+    let (kek, verdict, genesis_hash, restore_pats) = match preflight(data, &cfg)? {
         Preflight::Stop(outcome) => return Ok(outcome),
         Preflight::Verified {
             kek,
             verdict,
             genesis_hash,
-        } => (kek, verdict, genesis_hash),
+            restore_pats,
+        } => (kek, verdict, genesis_hash, restore_pats),
     };
+    // An unfinished restore deletes its restored view's tokens before re-sealing the KEK, but a
+    // restore of a store under the same KEK (a same-machine restore) opens here even when it
+    // stopped between its commit and that deletion: the tokens go now, before anything is
+    // served (L53), idempotently. A keychain that refuses keeps the store locked (retried).
+    for id in restore_pats {
+        if let Err(e) = cfg.keys.delete(&EntryName::Pat(id)) {
+            return Ok(StartupOutcome::Locked(keyring_reason(&e)));
+        }
+    }
     let store = match start_existing(data, cfg, kek, genesis_hash) {
         Ok(s) => s,
         // The writer's WAL-aware re-check of the gate. Not write-free like the step-1 gate:

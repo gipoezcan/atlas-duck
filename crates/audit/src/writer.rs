@@ -288,6 +288,10 @@ pub(crate) struct Shared {
     pub(crate) reader: Mutex<Option<Connection>>,
     /// Counts the store files the writer served: a restore that replaced `audit.db` bumps it.
     pub(crate) generation: AtomicU64,
+    /// The writer stopped after a restore committed but did not complete: `audit.db` is no
+    /// longer the store this handle's keys, head and caches describe, so it reads nothing
+    /// either (`Closed`).
+    pub(crate) stopped: AtomicBool,
 }
 
 /// The KEK and `K_q` (F.7, derived once per KEK). No `Debug`: both are keys.
@@ -312,6 +316,7 @@ impl Shared {
             keys: Mutex::new(StoreKeys::new(kek)),
             reader: Mutex::new(None),
             generation: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
             head: Mutex::new(HeadView {
                 seq: 0,
                 hash: ZERO_HASH,
