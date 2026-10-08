@@ -166,6 +166,9 @@ pub struct Model {
     approvable: bool,
     executing_emitted: bool,
     approved_unreturned: bool,
+    /// `Some(hold before the refresh)` while `Enriching` is a refresh of a queued write (§5.4
+    /// step 5), `None` for the initial enrichment and an edit's re-enrichment (§5.4 steps 2, 4).
+    refresh_from: Option<Hold>,
 }
 
 impl Model {
@@ -178,7 +181,12 @@ impl Model {
             approvable: false,
             executing_emitted: false,
             approved_unreturned: false,
+            refresh_from: None,
         }
+    }
+    /// Whether the current `Enriching` is a refresh (its failures return to the queue).
+    pub fn refreshing(&self) -> bool {
+        self.refresh_from.is_some()
     }
     pub fn phase(&self) -> Phase {
         self.phase
@@ -274,9 +282,29 @@ pub fn step(m: &mut Model, e: Event) -> Result<Applied, Rejection> {
 
         (P::Enriching, E::Enriched(hold)) => {
             m.phase = P::AwaitingApproval(hold);
+            m.refresh_from = None;
             m.bump();
         }
-        (P::Enriching, E::EnrichFailedDirect) => done(m, Terminal::Failed),
+        // Data-free direct failure (§5.4 step 2) of an initial or edit-triggered enrichment only.
+        (P::Enriching, E::EnrichFailedDirect) if m.refresh_from.is_none() => {
+            done(m, Terminal::Failed)
+        }
+        // A refresh fetch that is not a parsed 2xx JSON (`recheck_failed`) or not an identity
+        // match (`identity_mismatch`) returns the write to the queue (§5.4 step 5, Task 26):
+        // `WRITE_STALE`, new revision, the previous hold kept (an identity mismatch sets its own).
+        (P::Enriching, E::Stale(reason))
+            if reason != StaleReason::Changed && m.refresh_from.is_some() =>
+        {
+            let hold = if reason == StaleReason::IdentityMismatch {
+                Hold::IdentityMismatch
+            } else {
+                // `is_some` above; the fallback is a never-approvable hold.
+                m.refresh_from.unwrap_or(Hold::EnrichmentError)
+            };
+            m.phase = P::AwaitingApproval(hold);
+            m.refresh_from = None;
+            m.bump();
+        }
 
         (P::Compiling, E::CompileOk) => m.phase = P::SlotWait,
         (P::Compiling, E::CompileFailed) => done(m, Terminal::Failed),
@@ -382,7 +410,8 @@ pub fn step(m: &mut Model, e: Event) -> Result<Applied, Rejection> {
         // is an enrichment verdict and stays until a refresh (`Enriched`) re-decides it (inv. 6).
         (P::AwaitingApproval(_), E::Instance(_)) => m.bump(),
         // Refresh (§5.4 step 5, §7.1): re-enrichment of a queued write; the rev bumps at `Enriched`.
-        (P::AwaitingApproval(_), E::EnrichStarted) if m.kind == Kind::Write => {
+        (P::AwaitingApproval(hold), E::EnrichStarted) if m.kind == Kind::Write => {
+            m.refresh_from = Some(hold);
             m.phase = P::Enriching;
             m.opened = false;
             m.approvable = false;
@@ -666,6 +695,7 @@ mod tests {
         approvable: bool,
         executing_emitted: bool,
         approved_unreturned: bool,
+        refresh_from: Option<Hold>,
         status: Status,
     }
 
@@ -678,6 +708,7 @@ mod tests {
             approvable: m.approvable(),
             executing_emitted: m.executing_emitted,
             approved_unreturned: m.approved_unreturned(),
+            refresh_from: m.refresh_from,
             status: agent_status(m),
         }
     }
@@ -769,6 +800,8 @@ mod tests {
         steps: Vec<S>,
         /// `executing` was emitted on the way (a write back in the queue after `StalePassed`).
         emitted: bool,
+        /// `Enriching` is a refresh of a write that was queued with this hold.
+        refresh: Option<Hold>,
     }
 
     fn tg(kind: Kind, phase: Phase, steps: Vec<S>) -> Target {
@@ -777,6 +810,7 @@ mod tests {
             phase,
             steps,
             emitted: false,
+            refresh: None,
         }
     }
 
@@ -796,6 +830,15 @@ mod tests {
         t.push(tg(Kind::Write, P::Enriching, vec![vp, V(E::EnrichStarted)]));
         for h in HOLDS {
             t.push(tg(Kind::Write, P::AwaitingApproval(h), open(write_to(h))));
+            // Refresh of a queued write (§5.4 step 5).
+            t.push(Target {
+                refresh: Some(h),
+                ..tg(
+                    Kind::Write,
+                    P::Enriching,
+                    with(open(write_to(h)), &[V(E::EnrichStarted)]),
+                )
+            });
         }
         t.push(tg(Kind::Write, P::StaleCheck, to_stale_check()));
         t.push(Target {
@@ -838,12 +881,17 @@ mod tests {
             ],
         );
         let re_approved = with(not_sent.clone(), &[V(E::Approve { rev: 2 })]);
-        for (phase, steps) in [
-            (P::AwaitingApproval(Hold::Conflict), conflict.clone()),
-            (P::AwaitingApproval(Hold::Preview), not_sent.clone()),
-            (P::Enriching, with(conflict, &[V(E::EnrichStarted)])),
+        for (phase, refresh, steps) in [
+            (P::AwaitingApproval(Hold::Conflict), None, conflict.clone()),
+            (P::AwaitingApproval(Hold::Preview), None, not_sent.clone()),
             (
                 P::Enriching,
+                Some(Hold::Conflict),
+                with(conflict, &[V(E::EnrichStarted)]),
+            ),
+            (
+                P::Enriching,
+                None,
                 with(
                     not_sent,
                     &[V(E::Edit {
@@ -853,11 +901,12 @@ mod tests {
                     })],
                 ),
             ),
-            (P::StaleCheck, re_approved.clone()),
-            (P::Executing, with(re_approved, &[V(E::StalePassed)])),
+            (P::StaleCheck, None, re_approved.clone()),
+            (P::Executing, None, with(re_approved, &[V(E::StalePassed)])),
         ] {
             t.push(Target {
                 emitted: true,
+                refresh,
                 ..tg(Kind::Write, phase, steps)
             });
         }
@@ -984,7 +1033,20 @@ mod tests {
             (P::Fetching, E::FetchFailedDirect) => done(Terminal::Failed),
             // Write: Enriching → AwaitingApproval(any hold) | Failed.
             (P::Enriching, E::Enriched(h)) => bump(P::AwaitingApproval(h)),
-            (P::Enriching, E::EnrichFailedDirect) => done(Terminal::Failed),
+            // Initial / edit enrichment fails directly (§5.4 step 2); a refresh never does: its
+            // failures are `WRITE_STALE {recheck_failed | identity_mismatch}` (§5.4 step 5, T26).
+            (P::Enriching, E::EnrichFailedDirect) => match t.refresh {
+                None => done(Terminal::Failed),
+                Some(_) => Err(Rejection::Illegal),
+            },
+            (P::Enriching, E::Stale(StaleReason::RecheckFailed)) => match t.refresh {
+                Some(prior) => bump(P::AwaitingApproval(prior)),
+                None => Err(Rejection::Illegal),
+            },
+            (P::Enriching, E::Stale(StaleReason::IdentityMismatch)) => match t.refresh {
+                Some(_) => bump(P::AwaitingApproval(Hold::IdentityMismatch)),
+                None => Err(Rejection::Illegal),
+            },
             // Script: Compiling → SlotWait → Running → AwaitingRelease(result | error-details).
             (P::Compiling, E::CompileOk) => to(P::SlotWait),
             (P::Compiling, E::CompileFailed) => done(Terminal::Failed),
@@ -1104,7 +1166,8 @@ mod tests {
         for t in &targets {
             let (kind, phase) = (t.kind, t.phase);
             let m = run(kind, &t.steps)?;
-            if m.phase() != phase || m.executing_emitted != t.emitted {
+            if m.phase() != phase || m.executing_emitted != t.emitted || m.refresh_from != t.refresh
+            {
                 failures.push(format!(
                     "{kind:?} path ends in {:?} (emitted {}), not {phase:?}",
                     m.phase(),
@@ -1420,6 +1483,47 @@ mod tests {
             (m.phase(), m.rev()),
             (P::AwaitingApproval(Hold::Preview), 3)
         );
+        assert!(!m.refreshing());
+
+        // A failed refresh fetch returns the write to the queue (§5.4 step 5): recheck_failed
+        // keeps the previous hold, identity_mismatch sets its own; never a direct failure.
+        let mut m = run(Kind::Write, &to_executing())?;
+        ok(&mut m, E::VersionConflict)?;
+        ok(&mut m, E::EnrichStarted)?;
+        assert!(m.refreshing());
+        rejects(&mut m, E::EnrichFailedDirect, Rejection::Illegal)?;
+        rejects(&mut m, E::Stale(StaleReason::Changed), Rejection::Illegal)?;
+        let a = ok(&mut m, E::Stale(StaleReason::RecheckFailed))?;
+        assert!(a.rev_bumped);
+        assert_eq!(
+            (m.phase(), m.rev(), m.refreshing()),
+            (P::AwaitingApproval(Hold::Conflict), 3, false)
+        );
+        assert_eq!(agent_status(&m), Status::Executing);
+        let mut m = run(Kind::Write, &open(write_to(Hold::Preview)))?;
+        ok(&mut m, E::EnrichStarted)?;
+        ok(&mut m, E::Stale(StaleReason::IdentityMismatch))?;
+        assert_eq!(
+            (m.phase(), m.rev()),
+            (P::AwaitingApproval(Hold::IdentityMismatch), 2)
+        );
+        assert_eq!(agent_status(&m), Status::Pending);
+        // An edit's re-enrichment is enrichment (§5.4 step 4 → step 2): direct failures end it.
+        let mut m = run(Kind::Write, &open(write_to(Hold::Preview)))?;
+        let rerun = E::Edit {
+            rev: 1,
+            target_or_baseline_changed: false,
+            rerun_enrichment: true,
+        };
+        ok(&mut m, rerun)?;
+        assert!(!m.refreshing());
+        rejects(
+            &mut m,
+            E::Stale(StaleReason::RecheckFailed),
+            Rejection::Illegal,
+        )?;
+        ok(&mut m, E::EnrichFailedDirect)?;
+        assert_eq!(m.phase(), P::Done(Terminal::Failed));
         Ok(())
     }
 
@@ -1898,8 +2002,17 @@ mod tests {
                         Kind::DryRun => E::DryRunStarted,
                     },
                     P::Fetching => E::Fetched(READ_ITEMS[c % 3]),
-                    P::Enriching if c % 2 == 0 => E::Enriched(Hold::Preview),
-                    P::Enriching => E::Enriched(HOLDS[c % 6]),
+                    // Probe the sticky `executing` (§4.5) where it matters.
+                    P::AwaitingApproval(_) | P::Enriching if m.executing_emitted && c % 7 == 6 => {
+                        E::Cancel(CancelReason::ByClient)
+                    }
+                    P::Enriching => match c % 8 {
+                        0..=3 => E::Enriched(Hold::Preview),
+                        4 => E::Stale(StaleReason::RecheckFailed),
+                        5 => E::Stale(StaleReason::IdentityMismatch),
+                        _ => E::Enriched(HOLDS[c % 6]),
+                    },
+                    P::AwaitingApproval(_) if c % 5 == 4 => E::EnrichStarted,
                     P::Compiling => E::CompileOk,
                     P::SlotWait => E::SlotAcquired,
                     P::Running => E::RunEnded {
@@ -1981,6 +2094,8 @@ mod tests {
         stale_passed: bool,
         /// An accepted `Approve` exists with no later return to the queue or terminal decision.
         approved_live: bool,
+        /// The current `Enriching` was entered by a refresh from this hold.
+        refreshing: Option<Hold>,
     }
 
     fn may_bump(e: Event) -> bool {
@@ -2000,7 +2115,7 @@ mod tests {
         )
     }
 
-    /// The U-01 invariants for one step: (1)–(7) from plan Task 12 Step 1, (8)–(9) from its review.
+    /// The U-01 invariants for one step: (1)–(7) from plan Task 12 Step 1, (8)–(10) from its review.
     fn check(
         b: &Snap,
         a: &Snap,
@@ -2060,6 +2175,28 @@ mod tests {
         if a.phase == P::StaleCheck && b.phase != P::StaleCheck {
             prop_assert!(matches!(e, E::Approve { .. }), "{:?} entered StaleCheck", e);
             prop_assert_eq!(b.phase, P::AwaitingApproval(Hold::Preview));
+        }
+        // (10) A refresh never fails directly; its failures return to the queue with the prior hold
+        // (`recheck_failed`) or `IdentityMismatch`, and only a refresh returns that way (§5.4 step 5).
+        if b.phase == P::Enriching {
+            match e {
+                E::EnrichFailedDirect => prop_assert!(sh.refreshing.is_none()),
+                E::Stale(r) => {
+                    prop_assert!(sh.refreshing.is_some(), "{:?} outside a refresh", e);
+                    let want = match (r, sh.refreshing) {
+                        (StaleReason::RecheckFailed, Some(prior)) => prior,
+                        _ => Hold::IdentityMismatch,
+                    };
+                    prop_assert_eq!(a.phase, P::AwaitingApproval(want));
+                }
+                _ => {}
+            }
+        }
+        if a.phase == P::Enriching && b.phase != P::Enriching {
+            sh.refreshing = match (b.phase, e) {
+                (P::AwaitingApproval(h), E::EnrichStarted) => Some(h),
+                _ => None,
+            };
         }
         // (8) A hold is an enrichment verdict: set only by `Enriched`, a stale return or a version
         // conflict; instance events, edits and candidate changes in the queue keep it (inv. 6).
@@ -2123,6 +2260,7 @@ mod tests {
             opened_at: None,
             stale_passed: false,
             approved_live: false,
+            refreshing: None,
         };
         for &(toggle, t) in seq {
             if let Some(v) = toggle {
@@ -2157,6 +2295,7 @@ mod tests {
         let mut accepted = [false; EVENT_VARIANTS];
         let mut crash_unknown = false;
         let mut hold_kept = false;
+        let mut refresh_returned = false;
         let mut queued_executing_cancel_refused = false;
         for _ in 0..4096 {
             let (kind, seq) = strategy
@@ -2172,6 +2311,7 @@ mod tests {
                 if res.is_ok() {
                     accepted[event_index(e)] = true;
                     crash_unknown |= e == E::Crash && a.phase == P::Done(Terminal::OutcomeUnknown);
+                    refresh_returned |= b.phase == P::Enriching && matches!(e, E::Stale(_));
                     hold_kept |= matches!(e, E::Instance(_))
                         && b.phase != P::AwaitingApproval(Hold::Preview)
                         && matches!(b.phase, P::AwaitingApproval(_));
@@ -2191,6 +2331,7 @@ mod tests {
         assert!(accepted.iter().all(|&b| b), "never accepted: {accepted:?}");
         assert!(crash_unknown, "no crash after an approval");
         assert!(hold_kept, "no instance event on a non-preview hold");
+        assert!(refresh_returned, "no failed refresh");
         assert!(
             queued_executing_cancel_refused,
             "no client cancel of a queued write after `executing`"
