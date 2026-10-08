@@ -99,3 +99,19 @@ fn registry_lookups_agree_with_all() {
         all().iter().filter(|s| s.class == OpClass::Read).count()
     );
 }
+
+#[test]
+fn write_class_gets_the_guidance_even_without_the_flag() {
+    let spec = OperationSpec {
+        class: OpClass::Write,
+        write_guidance: false,
+        ..READ
+    };
+    let out = describe(&spec, &env());
+    assert!(
+        out["description"]
+            .as_str()
+            .unwrap_or("")
+            .contains(WRITE_GUIDANCE)
+    );
+}

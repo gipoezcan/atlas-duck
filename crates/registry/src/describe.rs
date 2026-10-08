@@ -68,7 +68,7 @@ pub fn describe(spec: &OperationSpec, env: &DescribeEnv) -> Value {
         "examples".into(),
         json!({
             "cli": cli_example(spec, &minimal),
-            "call": format!("atlas-duck call {} --params '{}'", spec.id, minimal),
+            "call": format!("atlas-duck call {} --params {}", spec.id, shell_word(&minimal.to_string())),
         }),
     );
     out.insert(
@@ -86,7 +86,7 @@ pub fn describe(spec: &OperationSpec, env: &DescribeEnv) -> Value {
 
 fn description(spec: &OperationSpec) -> String {
     let mut parts = Vec::new();
-    if spec.write_guidance {
+    if spec.write_guidance || spec.class == OpClass::Write {
         parts.push(WRITE_GUIDANCE.to_string());
     }
     if spec.paginated.is_some() {

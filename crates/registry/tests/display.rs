@@ -97,3 +97,56 @@ fn script_run_counts_lines() {
     );
     assert_eq!(SCRIPT_RUN.id, "script.run");
 }
+
+#[test]
+fn agent_text_is_filtered_and_bounded_in_every_variant() {
+    let evil = "A-1\nFAKE LINE\u{202E}\u{200B}\ttail";
+    let clean = "A-1 FAKE LINE tail";
+    let param = with_display(TargetDisplay::Param("k"));
+    assert_eq!(target_display(&param, &json!({ "k": evil })), clean);
+    let create = with_display(TargetDisplay::CreateIn("k"));
+    assert_eq!(target_display(&create, &json!({ "k": evil })), clean);
+    let query = with_display(TargetDisplay::Query { param: "k" });
+    assert_eq!(target_display(&query, &json!({ "k": evil })), clean);
+    let pair = with_display(TargetDisplay::Pair("a", "b"));
+    assert_eq!(
+        target_display(&pair, &json!({"a": evil, "b": "x\r\ny"})),
+        format!("{clean} → x y")
+    );
+    let sprint = with_display(TargetDisplay::MoveInto {
+        sprint_param: Some("s"),
+        issues_param: "i",
+    });
+    assert_eq!(
+        target_display(&sprint, &json!({"s": evil, "i": []})),
+        format!("sprint {clean} · 0 issues")
+    );
+}
+
+#[test]
+fn huge_values_are_cut() {
+    let big = "k".repeat(10_000);
+    let expected = format!("{}…", "k".repeat(80));
+    let param = with_display(TargetDisplay::Param("k"));
+    assert_eq!(target_display(&param, &json!({ "k": big })), expected);
+    assert_eq!(
+        target_display(&param, &json!({ "k": [big] }))
+            .chars()
+            .count(),
+        81
+    );
+}
+
+#[test]
+fn missing_and_structured_values() {
+    let pair = with_display(TargetDisplay::Pair("a", "b"));
+    assert_eq!(target_display(&pair, &json!({})), "? → ?");
+    let mv = with_display(TargetDisplay::MoveInto {
+        sprint_param: Some("s"),
+        issues_param: "i",
+    });
+    assert_eq!(target_display(&mv, &json!({})), "sprint ? · ? issues");
+    let param = with_display(TargetDisplay::Param("k"));
+    assert_eq!(target_display(&param, &json!({"k": true})), "true");
+    assert_eq!(script_target_display(&json!({})), "script · ? lines");
+}
