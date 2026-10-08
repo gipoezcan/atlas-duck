@@ -160,6 +160,21 @@ impl PreviewBody {
     }
 }
 
+impl PreviewBody {
+    /// `EnrichmentError` with the text capped like `UpstreamError` (§6.3).
+    pub fn enrichment_error(
+        status: Option<u16>,
+        text: &str,
+        outcome: Option<OutcomeKind>,
+    ) -> PreviewBody {
+        PreviewBody::EnrichmentError {
+            status,
+            text: cap_error_text(text),
+            outcome,
+        }
+    }
+}
+
 /// Cuts `s` to at most [`ERROR_TEXT_CAP_BYTES`] bytes at a char boundary; a cut text ends in `…`.
 pub fn cap_error_text(s: &str) -> String {
     if s.len() <= ERROR_TEXT_CAP_BYTES {

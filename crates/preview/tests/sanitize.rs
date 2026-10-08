@@ -16,22 +16,23 @@ fn sanitize_strips_script_style_class_remote_images() {
     );
     let out = sanitize_html(&input);
     for bad in [
-        "script",
+        "<script",
         "onerror",
         "onclick",
         "style",
         "class=",
         "id=",
         "https://evil",
-        "javascript:",
-        "alert",
         "<a",
         "href",
     ] {
         assert!(!out.contains(bad), "{bad} in {out}");
     }
     assert!(out.contains("hi"));
-    assert!(out.contains("link text"), "link text kept: {out}");
+    assert!(
+        out.contains("link text (javascript:alert(1))"),
+        "link text and URL as text: {out}"
+    );
     assert!(out.contains(PNG), "data image kept: {out}");
 }
 
@@ -98,11 +99,96 @@ fn sanitize_hostile_inputs() {
 }
 
 #[test]
-fn sanitize_drops_generic_attributes() {
-    let out = sanitize_html(
-        "<div style=\"position:fixed\" CLASS=\"y\" ID=\"z\" TITLE=\"t\" LANG=\"x\" DIR=\"rtl\">d</div>",
-    );
-    assert_eq!(out, "<div>d</div>");
+fn sanitize_exact_outputs_for_hiding_and_sizing_markup() {
+    let cases = [
+        ("<bdo dir=\"rtl\">x</bdo>", "x"),
+        (
+            "<p dir=\"rtl\" lang=\"x\" title=\"t\" id=\"i\">x</p>",
+            "<p>x</p>",
+        ),
+        ("<details><summary>s</summary>h</details>", "sh"),
+        ("<ruby>a<rp>h</rp><rt>b</rt></ruby>", "ahb"),
+        (
+            "<img src=\"data:image/png;base64,AAAA\" width=\"1\" height=\"1\" align=\"left\" alt=\"a\">",
+            "<img src=\"data:image/png;base64,AAAA\" alt=\"a\">",
+        ),
+        ("<hr size=\"1\" width=\"1\" align=\"left\">", "<hr>"),
+        (
+            "<table align=\"right\"><tr><td align=\"left\" colspan=\"2\" width=\"1\">c</td></tr></table>",
+            "<table><tbody><tr><td colspan=\"2\">c</td></tr></tbody></table>",
+        ),
+        ("<small><sub><sup><small>t</small></sup></sub></small>", "t"),
+        (
+            "<blockquote cite=\"https://evil\">q</blockquote>",
+            "<blockquote>q</blockquote>",
+        ),
+        (
+            "<q cite=\"https://evil\">q</q><del cite=\"https://evil\">d</del>",
+            "q<del>d</del>",
+        ),
+        (
+            "<center><font size=\"1\" color=\"red\">c</font></center>",
+            "c",
+        ),
+        (
+            "<ol start=\"3\" type=\"a\"><li>x</li></ol>",
+            "<ol start=\"3\"><li>x</li></ol>",
+        ),
+        ("<bdi>x</bdi>", "<bdi>x</bdi>"),
+        (
+            "<img src=\"DATA:image/PNG;base64,AAAA\">",
+            "<img src=\"DATA:image/PNG;base64,AAAA\">",
+        ),
+        ("<img src=\"&#100;ata:image/svg+xml;base64,AAAA\">", "<img>"),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(sanitize_html(input), expected, "{input}");
+    }
+}
+
+#[test]
+fn links_become_text_with_visible_url() {
+    let cases = [
+        (
+            "<a href=\"http://example.com/x\">t</a>",
+            "t (http://example.com/x)",
+        ),
+        (
+            "<a href=\"https://example.com/x?a=1&b=2\">t</a>",
+            "t (https://example.com/x?a=1&amp;b=2)",
+        ),
+        ("<a href=\"/rel/path\">t</a>", "t (/rel/path)"),
+        (
+            "<a href=\"javascript:alert(1)\">t</a>",
+            "t (javascript:alert(1))",
+        ),
+        ("<a href=\"mailto:a@b.c\">t</a>", "t (mailto:a@b.c)"),
+        ("<a href=\"\">t</a>", "t"),
+        ("<a>t</a>", "t"),
+        ("<a href=\"https://x/\">https://x/</a>", "https://x/"),
+        (
+            "<a href=\"https://x/\">a <b>bold</b> <i>it</i></a>",
+            "a <b>bold</b> <i>it</i> (https://x/)",
+        ),
+        (
+            "<a href=\"data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;\">d</a>",
+            "d (data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;)",
+        ),
+        (
+            "<a href=\"x&quot;&gt;&lt;img src=y\">t</a>",
+            "t (x\"&gt;&lt;img src=y)",
+        ),
+        (
+            "<abbr>a</abbr><a href=\"u\">1</a><a href=\"v\">2</a>",
+            "a1 (u)2 (v)",
+        ),
+    ];
+    for (input, expected) in cases {
+        let out = sanitize_html(input);
+        assert_eq!(out, expected, "{input}");
+        assert_eq!(sanitize_html(&out), out, "idempotent: {input}");
+        assert!(!out.contains("<a"), "{out}");
+    }
 }
 
 #[test]
