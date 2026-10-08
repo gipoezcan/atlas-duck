@@ -760,7 +760,9 @@ fn a_plain_appcontainer_connect_never_reaches_a_listening_loopback_socket() {
     let (_, params) = decode_notification(&frame).expect("notification");
     let msg: ProbeResultMsg = serde_json::from_value(params).expect("params");
     let arrived = accept_within(&listener, Duration::from_millis(500));
-    println!("T19 loopback listener {addr}: worker result {msg:?}; connection arrived: {arrived}");
+    println!(
+        "T19 loopback_listener_saw_connect={arrived} (listener {addr}, worker result {msg:?})"
+    );
     assert!(!arrived, "the confined worker reached a loopback listener");
 }
 

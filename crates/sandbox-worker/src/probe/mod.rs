@@ -208,7 +208,7 @@ fn connect(probe: ProbeId, addr: &str) -> ProbeResultMsg {
             probe,
             ProbeOutcome::Error,
             Some(code),
-            "WSAStartup failed, no connect attempted",
+            "winsock init failed under LPAC (WSAStartup), no connect attempted",
         );
     }
     match TcpStream::connect_timeout(&sock, CONNECT_DEADLINE) {
