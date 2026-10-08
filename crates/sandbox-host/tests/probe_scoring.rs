@@ -954,3 +954,24 @@ fn the_report_identity_takes_the_embedded_version_from_probe_ready() {
     assert_eq!(identity.mtime, mtime);
     assert_eq!(identity.embedded_version, WORKER_VERSION);
 }
+
+/// A profile path that is not valid UTF-8 cannot travel in `probe.run`; it must
+/// fail closed instead of being converted lossily to another path (T19, A24).
+#[cfg(windows)]
+#[test]
+fn a_profile_path_that_is_not_utf8_fails_every_probe_and_spawns_nothing() {
+    use std::os::windows::ffi::OsStringExt;
+
+    let mut cfg = config(worker_file(), Duration::from_secs(5));
+    cfg.profile_path = PathBuf::from(std::ffi::OsString::from_wide(&[0x43, 0x3A, 0x5C, 0xD800]));
+    let spawner = FakeSpawner::all_blocked();
+    let report = run_probes(&spawner, None, &cfg);
+    assert!(spawner.log().requests.is_empty());
+    assert!(
+        report
+            .records
+            .iter()
+            .all(|r| r.evidence == Evidence::SpawnFailed(-1))
+    );
+    assert!(matches!(report.floor, FloorVerdict::NotMet { .. }));
+}

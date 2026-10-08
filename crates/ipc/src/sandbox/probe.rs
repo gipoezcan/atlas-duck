@@ -129,7 +129,8 @@ pub struct ProbeRequest {
     pub probe: ProbeId,
     /// The app's pid, target of the memory-read probes.
     pub app_pid: u32,
-    /// A file in the user profile that the `FileInProfile` probe tries to open.
+    /// The user's profile directory, which the `FileInProfile` probe tries to
+    /// open (a directory, not a file; Windows opens it with backup semantics).
     pub profile_path: String,
     /// Normally [`PUBLIC_PROBE_ADDR`].
     pub public_addr: String,

@@ -57,7 +57,11 @@ pub struct ProbeConfig {
     pub worker: PathBuf,
     /// The app's pid, target of the memory-read probes.
     pub app_pid: u32,
-    /// A file in the user profile, target of `FileInProfile`.
+    /// The user's profile directory, target of `FileInProfile` (the worker
+    /// opens it, with `FILE_FLAG_BACKUP_SEMANTICS` on Windows; it does not
+    /// list it). It travels in `probe.run` as a JSON string, so it must be
+    /// valid UTF-8: a path that is not makes every probe `SpawnFailed(-1)`
+    /// rather than being converted lossily to a different path.
     pub profile_path: PathBuf,
     /// Upper bound for the whole of one probe (ready frame, result frame and
     /// exit share one deadline); 10 s by default.
@@ -216,18 +220,24 @@ pub fn run_probes(
         .collect();
 
     let file_id = file_identity(&cfg.worker);
-    let runs: Vec<ProbeRun> = match &file_id {
+    let runs: Vec<ProbeRun> = match (&file_id, cfg.profile_path.to_str()) {
+        // A profile path that cannot be sent as a JSON string would be
+        // altered by a lossy conversion and the probe would test another path.
+        (_, None) => order
+            .iter()
+            .map(|&probe| ProbeRun::failed(probe, -1))
+            .collect(),
         // No binary, nothing to spawn: fail fast so startup is never held up.
-        Err(e) => {
+        (Err(e), Some(_)) => {
             let code = os_error_code(e);
             order
                 .iter()
                 .map(|&probe| ProbeRun::failed(probe, code))
                 .collect()
         }
-        Ok(_) => order
+        (Ok(_), Some(profile_path)) => order
             .iter()
-            .map(|&probe| run_one(spawner, hook, cfg, probe))
+            .map(|&probe| run_one(spawner, hook, cfg, profile_path, probe))
             .collect(),
     };
 
@@ -322,6 +332,7 @@ fn run_one(
     spawner: &dyn WorkerSpawner,
     hook: Option<&dyn SpawnHook>,
     cfg: &ProbeConfig,
+    profile_path: &str,
     probe: ProbeId,
 ) -> ProbeRun {
     let spec = SpawnSpec {
@@ -356,7 +367,7 @@ fn run_one(
     let request = ProbeRequest {
         probe,
         app_pid: cfg.app_pid,
-        profile_path: cfg.profile_path.to_string_lossy().into_owned(),
+        profile_path: profile_path.to_owned(),
         public_addr: PUBLIC_PROBE_ADDR.to_string(),
         loopback_addr: LOOPBACK_PROBE_ADDR.to_string(),
         handle_value: None,
