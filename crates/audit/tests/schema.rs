@@ -314,3 +314,185 @@ fn gate_refuses_newer() {
     );
     assert_eq!(gate(&versions(1, 1, 1)), Ok(()));
 }
+
+fn listing(dir: &Path) -> Vec<(String, Vec<u8>, std::time::SystemTime)> {
+    let mut v: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            let (h, m) = snapshot(&p).unwrap();
+            (name, h, m)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn seed(c: &Connection) {
+    create_v1(c).unwrap();
+    c.execute(
+        "INSERT INTO recovery(id, blob, created_at) VALUES (1, x'0100', 't')",
+        [],
+    )
+    .unwrap();
+}
+
+#[test]
+fn read_versions_leaves_directory_untouched_when_clean() {
+    let (d, path) = new_db();
+    {
+        let c = Connection::open(&path).unwrap();
+        seed(&c);
+    }
+    let before = listing(d.path());
+    assert!(before.iter().all(|(n, _, _)| n == DB_FILE), "{before:?}");
+    read_versions(&path).unwrap();
+    assert_eq!(listing(d.path()), before);
+}
+
+#[test]
+fn read_versions_leaves_live_wal_untouched() {
+    let (d, path) = new_db();
+    let c = Connection::open(&path).unwrap();
+    c.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    seed(&c);
+    c.execute("INSERT INTO meta(key, value) VALUES ('x', 'y')", [])
+        .unwrap();
+    let wal = d.path().join(format!("{DB_FILE}-wal"));
+    let (db_before, wal_before) = (snapshot(&path), snapshot(&wal));
+    assert!(wal_before.is_some(), "writer should hold a live -wal");
+    let v = read_versions(&path).unwrap();
+    assert_eq!(v.recovery_layout, Some(1), "reader must see WAL content");
+    assert_eq!(snapshot(&path), db_before);
+    assert_eq!(snapshot(&wal), wal_before);
+    drop(c);
+}
+
+#[test]
+fn gate_open_connection_sees_newer_version_only_in_wal() {
+    let (d, path) = new_db();
+    let w = Connection::open(&path).unwrap();
+    w.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    seed(&w);
+    w.pragma_update(None, "user_version", 2).unwrap();
+    let wal = d.path().join(format!("{DB_FILE}-wal"));
+    assert!(
+        wal.metadata().unwrap().len() > 0,
+        "version must sit in the WAL"
+    );
+
+    let conn = open_rw(&path).unwrap();
+    assert!(matches!(
+        atlas_duck_audit::schema::gate_open_connection(&conn),
+        Err(OpenError::NewerStore(f)) if f == "user_version 2"
+    ));
+    // The read-only peek also sees it because a -wal exists.
+    assert_eq!(read_versions(&path).unwrap().user_version, 2);
+    drop((conn, w));
+}
+
+#[test]
+fn gate_ok_for_current_store() {
+    let (_d, path) = new_db();
+    {
+        let c = Connection::open(&path).unwrap();
+        seed(&c);
+    }
+    let conn = open_rw(&path).unwrap();
+    atlas_duck_audit::schema::gate_open_connection(&conn).unwrap();
+}
+
+#[test]
+fn gate_accepts_zero_and_absent() {
+    let v = StoreVersions {
+        user_version: 0,
+        head_format_version: None,
+        recovery_layout: None,
+        written_by: None,
+    };
+    assert_eq!(gate(&v), Ok(()));
+}
+
+#[test]
+fn read_versions_missing_path_creates_nothing() {
+    let (d, path) = new_db();
+    assert!(read_versions(&path).is_err());
+    assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn read_versions_handles_awkward_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = dir.path().join("a b#c%d&e");
+    std::fs::create_dir(&sub).unwrap();
+    let path = sub.join(DB_FILE);
+    {
+        let c = Connection::open(&path).unwrap();
+        seed(&c);
+    }
+    assert_eq!(read_versions(&path).unwrap().user_version, 1);
+}
+
+#[test]
+fn open_rw_keeps_wal_mode() {
+    let (_d, path) = new_db();
+    {
+        let c = Connection::open(&path).unwrap();
+        seed(&c);
+    }
+    let conn = open_rw(&path).unwrap();
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn create_v1_refuses_existing_database() {
+    let (_d, path) = new_db();
+    let c = Connection::open(&path).unwrap();
+    create_v1(&c).unwrap();
+    assert!(create_v1(&c).is_err());
+    let (_d2, path2) = new_db();
+    let c2 = Connection::open(&path2).unwrap();
+    c2.execute_batch("CREATE TABLE foreign_t(x)").unwrap();
+    assert!(create_v1(&c2).is_err());
+}
+
+fn mig(from: u32, to: u32) -> Migration {
+    Migration {
+        from,
+        to,
+        apply: noop,
+    }
+}
+
+#[test]
+fn run_migrations_refuses_bad_tables() {
+    let (_d, path) = new_db();
+    let mut conn = Connection::open(&path).unwrap();
+    seed(&conn);
+    // Non-increasing step.
+    for table in [[mig(1, 1)], [mig(1, 0)]] {
+        let err = run_migrations(&mut conn, &table, &mut |_, _, _| Ok(())).unwrap_err();
+        assert!(matches!(err, OpenError::MigrationFailed { .. }), "{err:?}");
+    }
+    // Gap: nothing starts at 1 but a step starts at 3.
+    let err = run_migrations(&mut conn, &[mig(3, 4)], &mut |_, _, _| Ok(())).unwrap_err();
+    assert!(
+        matches!(err, OpenError::MigrationFailed { from: 1, to: 3, .. }),
+        "{err:?}"
+    );
+    // Gap after a valid step: nothing is applied.
+    let err =
+        run_migrations(&mut conn, &[mig(1, 2), mig(3, 4)], &mut |_, _, _| Ok(())).unwrap_err();
+    assert!(
+        matches!(err, OpenError::MigrationFailed { from: 2, to: 3, .. }),
+        "{err:?}"
+    );
+    assert_eq!(pragma_i64(&conn, "user_version"), 1);
+    // Contiguous chain applies end to end in one run.
+    let span = run_migrations(&mut conn, &[mig(2, 3), mig(1, 2)], &mut |_, _, _| Ok(())).unwrap();
+    assert_eq!(span, Some((1, 3)));
+}

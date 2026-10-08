@@ -45,8 +45,14 @@ impl std::error::Error for RestoreError {}
 pub enum OpenError {
     Io(std::io::Error),
     Sqlite(String),
-    MigrationFailed { from: u32, to: u32, message: String },
+    MigrationFailed {
+        from: u32,
+        to: u32,
+        message: String,
+    },
     AlreadyExists,
+    /// The store was written by a newer build (version gate); carries what was found.
+    NewerStore(String),
     NotFirstRun,
     PassphraseTooShort,
     PassphraseMismatch,
@@ -65,6 +71,9 @@ impl fmt::Display for OpenError {
                 write!(f, "migration from schema {from} to {to} failed: {message}")
             }
             OpenError::AlreadyExists => f.write_str("an audit store already exists"),
+            OpenError::NewerStore(found) => {
+                write!(f, "the audit store is newer than this build ({found})")
+            }
             OpenError::NotFirstRun => f.write_str("not a first run"),
             OpenError::PassphraseTooShort => f.write_str("recovery passphrase is too short"),
             OpenError::PassphraseMismatch => f.write_str("recovery passphrases do not match"),

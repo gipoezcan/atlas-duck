@@ -93,17 +93,26 @@ CREATE TABLE meta (
 );
 ";
 
+fn other_err(msg: String) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(msg)))
+}
+
 /// Creates schema v1 on a new, empty database file: page size and auto-vacuum first (they only
 /// take effect before the first table), then WAL, then the tables, `user_version = 1` and
 /// `meta.written_by`. The caller owns the connection and applies [`apply_connection_pragmas`].
+/// Refuses a file that already holds any schema object or a non-zero `user_version`.
 pub fn create_v1(conn: &Connection) -> rusqlite::Result<()> {
+    let objects: i64 = conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+    if objects != 0 || user_version(conn)? != 0 {
+        return Err(other_err(
+            "create_v1 needs a new, empty database file".into(),
+        ));
+    }
     conn.pragma_update(None, "page_size", 8192)?;
     conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
     let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
-        return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
-            std::io::Error::other(format!("journal_mode WAL refused, got {mode}")),
-        )));
+        return Err(other_err(format!("journal_mode WAL refused, got {mode}")));
     }
     conn.execute_batch(&format!(
         "BEGIN IMMEDIATE;{TABLES_V1}PRAGMA user_version = {SCHEMA_HEAD};COMMIT;"
@@ -111,8 +120,9 @@ pub fn create_v1(conn: &Connection) -> rusqlite::Result<()> {
     set_written_by(conn)
 }
 
-/// Records the version of the binary that opened the store read-write (advisory).
-pub fn set_written_by(conn: &Connection) -> rusqlite::Result<()> {
+/// Records the version of the binary that opened the store read-write (advisory). The writer
+/// calls it only after the open has been verified (T07/T10).
+pub(crate) fn set_written_by(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO meta(key, value) VALUES (?1, ?2) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -169,28 +179,52 @@ fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
 /// Applies every pending step in one transaction: for each step `apply`, then
 /// `PRAGMA user_version = to` (transactional under WAL, V22), then `on_step` (the caller appends
 /// `SCHEMA_MIGRATED` there). Any error rolls everything back and returns `MigrationFailed`.
-/// Returns the `(from, to)` span that was applied, or `None` when nothing was pending.
+/// A step with `to <= from`, or a gap (a step starting above the reached version but none starting
+/// at it), is refused before anything is changed. Returns the `(from, to)` span that was applied,
+/// or `None` when nothing was pending.
+///
+/// Call only after the store has been verified (T10). The table is a parameter so tests can
+/// exercise the runner; production passes [`MIGRATIONS`].
+#[doc(hidden)]
 pub fn run_migrations(
     conn: &mut Connection,
     migrations: &[Migration],
     on_step: &mut dyn FnMut(&Transaction, u32, u32) -> Result<(), AuditError>,
 ) -> Result<Option<(u32, u32)>, OpenError> {
     let start = user_version(conn).map_err(sqlite)?;
-    if !migrations.iter().any(|m| m.from == start) {
-        return Ok(None);
-    }
     let fail =
         |from: u32, to: u32, message: String| OpenError::MigrationFailed { from, to, message };
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|e| fail(start, start, e.to_string()))?;
+    if let Some(m) = migrations.iter().find(|m| m.to <= m.from) {
+        return Err(fail(
+            m.from,
+            m.to,
+            "migration does not increase the version".into(),
+        ));
+    }
+    let mut steps: Vec<&Migration> = Vec::new();
     let mut cur = start;
     while let Some(m) = migrations.iter().find(|m| m.from == cur) {
+        steps.push(m);
+        cur = m.to;
+    }
+    if let Some(next) = migrations.iter().map(|m| m.from).filter(|&f| f > cur).min() {
+        return Err(fail(
+            cur,
+            next,
+            format!("no migration step from version {cur}"),
+        ));
+    }
+    if steps.is_empty() {
+        return Ok(None);
+    }
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|e| fail(start, cur, e.to_string()))?;
+    for m in steps {
         (m.apply)(&tx).map_err(|e| fail(m.from, m.to, e.to_string()))?;
         tx.pragma_update(None, "user_version", m.to)
             .map_err(|e| fail(m.from, m.to, e.to_string()))?;
         on_step(&tx, m.from, m.to).map_err(|e| fail(m.from, m.to, e.to_string()))?;
-        cur = m.to;
     }
     tx.commit().map_err(|e| fail(start, cur, e.to_string()))?;
     Ok(Some((start, cur)))
@@ -205,14 +239,29 @@ pub struct StoreVersions {
     pub written_by: Option<String>,
 }
 
-/// Opens read-only, reads the versions and closes. Writes nothing and sets no pragmas.
-pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(sqlite)?;
-    let user_version = user_version(&conn).map_err(sqlite)?;
+fn uri_for(path: &Path) -> Result<String, OpenError> {
+    let p = path
+        .to_str()
+        .ok_or_else(|| OpenError::Io(std::io::Error::other("database path is not UTF-8")))?
+        .replace('\\', "/");
+    let mut out = String::from("file:");
+    if !p.starts_with('/') {
+        out.push('/');
+    }
+    for b in p.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out.push_str("?mode=ro&immutable=1");
+    Ok(out)
+}
+
+fn versions_from(conn: &Connection) -> Result<StoreVersions, OpenError> {
+    let user_version = user_version(conn).map_err(sqlite)?;
     let head_format_version = conn
         .query_row(
             "SELECT format_version FROM events ORDER BY seq DESC LIMIT 1",
@@ -243,6 +292,40 @@ pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
         recovery_layout,
         written_by,
     })
+}
+
+/// Opens read-only, reads the versions and closes. Writes nothing and sets no pragmas.
+///
+/// A plain read-only connection to a WAL database creates (and cannot remove) `-wal`/`-shm`
+/// sidecars, so when no `-wal` file exists the database is opened `immutable=1` (no sidecars;
+/// with no WAL there is nothing it could miss). When a `-wal` exists (a crash left one, or a
+/// writer is live) a normal read-only connection is used so the WAL content is seen; the `-wal`
+/// is neither modified nor removed and only `-shm` may change. The normal open path additionally
+/// re-checks through its own WAL-aware connection with [`gate_open_connection`].
+pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let conn = if Path::new(&wal).exists() {
+        Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+    } else {
+        Connection::open_with_flags(
+            uri_for(path)?,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI,
+        )
+    }
+    .map_err(sqlite)?;
+    versions_from(&conn)
+}
+
+/// The version gate on an already open, WAL-aware connection (T10 runs it right after
+/// [`open_rw`], before touching anything): `NewerStore(found)` for a newer store.
+pub fn gate_open_connection(conn: &Connection) -> Result<(), OpenError> {
+    gate(&versions_from(conn)?).map_err(OpenError::NewerStore)
 }
 
 /// Refuses a store newer than this binary. `Err` carries what was found, e.g. `"user_version 2"`.
