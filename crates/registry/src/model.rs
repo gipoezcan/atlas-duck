@@ -37,10 +37,20 @@ pub enum StatusSet {
 }
 
 /// §5.3: dropping field X also drops these locations.
+///
+/// Path convention (one for the whole crate; `core::redact` resolves it): `copies` and `mirrors`
+/// are **item-relative**. The item root is the element of `paginated.items_key` for a paged op
+/// and the document root otherwise, and a dropped path `fields.<X>` under that item root selects
+/// the copies under the same root. Only `RootPath` and `url_fields` are document-absolute.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyRule {
-    /// `"renderedFields.{field}"`, `"names.{field}"`, `"schema.{field}"`, `"editmeta.fields.{field}"`.
+    /// Item-relative: `"renderedFields.{field}"`, `"names.{field}"`, `"schema.{field}"`,
+    /// `"editmeta.fields.{field}"`.
     Path(&'static str),
+    /// Document-root location of a paged response, not under any item (e.g. the `names` and
+    /// `schema` maps of a `jira.search` response). Removed on a whole-field (`AllItems`) drop of
+    /// `{field}` in any item.
+    RootPath(&'static str),
     ChangelogItems {
         items_path: &'static str,
         /// `"field"`, `"fieldId"`.
@@ -71,8 +81,12 @@ pub struct Mirror {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedactionRules {
+    /// Item-relative (see [`CopyRule`]).
     pub copies: &'static [CopyRule],
+    /// `src`/`dst` are item-relative, like `copies`.
     pub mirrors: &'static [Mirror],
+    /// Document-absolute patterns: `*` one key, `[]` every element; a leading `[]` segment
+    /// addresses the elements of a root array (`[].self`).
     pub url_fields: &'static [&'static str],
 }
 
@@ -182,6 +196,8 @@ pub struct FieldRules {
     pub fields_map_param: Option<&'static str>,
     pub expand_param: Option<&'static str>,
     pub expand_allow: &'static [&'static str],
+    /// The `fields` applied when the agent sends none (documented by `describe`); `&[]` = none.
+    pub default_fields: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

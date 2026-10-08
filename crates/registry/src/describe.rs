@@ -222,14 +222,10 @@ fn defaults(spec: &OperationSpec) -> Value {
         out.insert(max.param.into(), json!(max.default));
     }
     // §7.3: the `fields` applied when the agent sends none.
-    match spec.id {
-        "jira.issue.get" => {
-            out.insert("fields".into(), json!(crate::ISSUE_GET_DEFAULT_FIELDS));
-        }
-        "jira.search" => {
-            out.insert("fields".into(), json!(crate::SEARCH_DEFAULT_FIELDS));
-        }
-        _ => {}
+    if let Some(rules) = spec.field_rules
+        && !rules.default_fields.is_empty()
+    {
+        out.insert("fields".into(), json!(rules.default_fields));
     }
     Value::Object(out)
 }

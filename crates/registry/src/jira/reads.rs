@@ -1,8 +1,8 @@
 //! The 19 Jira read specs (§7.3), in table order.
 
 use super::{
-    DEFAULT_SUCCESS, EXPAND_ALLOW, ISSUE_COPIES, ISSUE_MIRRORS, NO_CAPS, NO_REDACTION,
-    SEARCH_COPIES, SEARCH_MIRRORS, schemas,
+    DEFAULT_SUCCESS, EXPAND_ALLOW, ISSUE_COPIES, ISSUE_GET_DEFAULT_FIELDS, ISSUE_MIRRORS, NO_CAPS,
+    NO_REDACTION, SEARCH_COPIES, SEARCH_DEFAULT_FIELDS, SEARCH_MIRRORS, schemas,
 };
 use crate::RELEASE_CAP_BYTES;
 use crate::model::*;
@@ -48,6 +48,7 @@ const SEARCH_FIELD_RULES: FieldRules = FieldRules {
     fields_map_param: None,
     expand_param: Some("expand"),
     expand_allow: EXPAND_ALLOW,
+    default_fields: SEARCH_DEFAULT_FIELDS,
 };
 
 const AGILE_FIELD_RULES: FieldRules = FieldRules {
@@ -55,6 +56,7 @@ const AGILE_FIELD_RULES: FieldRules = FieldRules {
     fields_map_param: None,
     expand_param: None,
     expand_allow: &[],
+    default_fields: &[],
 };
 
 const AGILE_PAGE: PageSpec = PageSpec {
@@ -117,7 +119,11 @@ pub(crate) const MYSELF: OperationSpec = OperationSpec {
     paginated: None,
     result_projection: Projection::Empty,
     success: DEFAULT_SUCCESS,
-    redaction_rules: NO_REDACTION,
+    redaction_rules: RedactionRules {
+        copies: &[],
+        mirrors: &[],
+        url_fields: &["self"],
+    },
     result_example: schemas::MYSELF_EXAMPLE,
     result_example_sparse: schemas::MYSELF_EXAMPLE_SPARSE,
     result_schema: schemas::MYSELF_RESULT,
@@ -131,6 +137,11 @@ pub(crate) const PROJECT_LIST: OperationSpec = OperationSpec {
         noun_path: &["jira", "project", "list"],
         positional: None,
         flags: &[],
+    },
+    redaction_rules: RedactionRules {
+        copies: &[],
+        mirrors: &[],
+        url_fields: &["[].self"],
     },
     result_example: schemas::PROJECT_LIST_EXAMPLE,
     result_example_sparse: schemas::PROJECT_LIST_EXAMPLE_SPARSE,
@@ -150,6 +161,11 @@ pub(crate) const PROJECT_GET: OperationSpec = OperationSpec {
     target_params: &["key"],
     target_display: TargetDisplay::Param("key"),
     similarity: Similarity::Target,
+    redaction_rules: RedactionRules {
+        copies: &[],
+        mirrors: &[],
+        url_fields: &["self", "lead.self"],
+    },
     result_example: schemas::PROJECT_GET_EXAMPLE,
     result_example_sparse: schemas::PROJECT_GET_EXAMPLE_SPARSE,
     result_schema: schemas::PROJECT_GET_RESULT,
@@ -211,6 +227,7 @@ pub(crate) const ISSUE_GET: OperationSpec = OperationSpec {
         fields_map_param: None,
         expand_param: Some("expand"),
         expand_allow: EXPAND_ALLOW,
+        default_fields: ISSUE_GET_DEFAULT_FIELDS,
     }),
     caps: Caps {
         max: None,
@@ -231,6 +248,8 @@ pub(crate) const ISSUE_GET: OperationSpec = OperationSpec {
             "fields.*.self",
             "fields.attachment[].content",
             "fields.attachment[].thumbnail",
+            "renderedFields.attachment[].content",
+            "renderedFields.attachment[].thumbnail",
         ],
     },
     result_example: schemas::ISSUE_GET_EXAMPLE,
@@ -269,6 +288,8 @@ pub(crate) const SEARCH: OperationSpec = OperationSpec {
             "issues[].fields.*.self",
             "issues[].fields.attachment[].content",
             "issues[].fields.attachment[].thumbnail",
+            "issues[].renderedFields.attachment[].content",
+            "issues[].renderedFields.attachment[].thumbnail",
         ],
     },
     result_example: schemas::SEARCH_EXAMPLE,
@@ -314,7 +335,11 @@ pub(crate) const COMMENT_LIST: OperationSpec = OperationSpec {
     redaction_rules: RedactionRules {
         copies: &[],
         mirrors: &[],
-        url_fields: &["comments[].self"],
+        url_fields: &[
+            "comments[].self",
+            "comments[].author.self",
+            "comments[].updateAuthor.self",
+        ],
     },
     result_example: schemas::COMMENT_LIST_EXAMPLE,
     result_example_sparse: schemas::COMMENT_LIST_EXAMPLE_SPARSE,
@@ -337,7 +362,11 @@ pub(crate) const WORKLOG_LIST: OperationSpec = OperationSpec {
     redaction_rules: RedactionRules {
         copies: &[],
         mirrors: &[],
-        url_fields: &["worklogs[].self"],
+        url_fields: &[
+            "worklogs[].self",
+            "worklogs[].author.self",
+            "worklogs[].updateAuthor.self",
+        ],
     },
     result_example: schemas::WORKLOG_LIST_EXAMPLE,
     result_example_sparse: schemas::WORKLOG_LIST_EXAMPLE_SPARSE,
@@ -365,6 +394,7 @@ pub(crate) const TRANSITION_LIST: OperationSpec = OperationSpec {
     target_params: &["key"],
     target_display: TargetDisplay::Param("key"),
     similarity: Similarity::Target,
+    redaction_rules: NO_REDACTION,
     result_example: schemas::TRANSITION_LIST_EXAMPLE,
     result_example_sparse: schemas::TRANSITION_LIST_EXAMPLE_SPARSE,
     result_schema: schemas::TRANSITION_LIST_RESULT,
@@ -383,6 +413,7 @@ pub(crate) const ISSUE_EDITMETA: OperationSpec = OperationSpec {
     target_params: &["key"],
     target_display: TargetDisplay::Param("key"),
     similarity: Similarity::Target,
+    redaction_rules: NO_REDACTION,
     result_example: schemas::EDITMETA_EXAMPLE,
     result_example_sparse: schemas::EDITMETA_EXAMPLE_SPARSE,
     result_schema: schemas::EDITMETA_RESULT,
@@ -402,6 +433,11 @@ pub(crate) const CREATEMETA_ISSUETYPES: OperationSpec = OperationSpec {
     target_display: TargetDisplay::Param("project"),
     similarity: Similarity::Target,
     min_version: Some(MIN_8_4),
+    redaction_rules: RedactionRules {
+        copies: &[],
+        mirrors: &[],
+        url_fields: &["values[].self", "values[].iconUrl"],
+    },
     result_example: schemas::CREATEMETA_ISSUETYPES_EXAMPLE,
     result_example_sparse: schemas::CREATEMETA_ISSUETYPES_EXAMPLE_SPARSE,
     result_schema: schemas::CREATEMETA_ISSUETYPES_RESULT,
@@ -426,6 +462,7 @@ pub(crate) const CREATEMETA_FIELDS: OperationSpec = OperationSpec {
     target_display: TargetDisplay::Pair("project", "typeId"),
     similarity: Similarity::Target,
     min_version: Some(MIN_8_4),
+    redaction_rules: NO_REDACTION,
     result_example: schemas::CREATEMETA_FIELDS_EXAMPLE,
     result_example_sparse: schemas::CREATEMETA_FIELDS_EXAMPLE_SPARSE,
     result_schema: schemas::CREATEMETA_FIELDS_RESULT,
@@ -440,6 +477,7 @@ pub(crate) const FIELD_LIST: OperationSpec = OperationSpec {
         positional: None,
         flags: &[],
     },
+    redaction_rules: NO_REDACTION,
     result_example: schemas::FIELD_LIST_EXAMPLE,
     result_example_sparse: schemas::FIELD_LIST_EXAMPLE_SPARSE,
     result_schema: schemas::FIELD_LIST_RESULT,
@@ -453,6 +491,11 @@ pub(crate) const ISSUELINKTYPE_LIST: OperationSpec = OperationSpec {
         noun_path: &["jira", "issuelinktype", "list"],
         positional: None,
         flags: &[],
+    },
+    redaction_rules: RedactionRules {
+        copies: &[],
+        mirrors: &[],
+        url_fields: &["issueLinkTypes[].self"],
     },
     result_example: schemas::ISSUELINKTYPE_LIST_EXAMPLE,
     result_example_sparse: schemas::ISSUELINKTYPE_LIST_EXAMPLE_SPARSE,
@@ -475,7 +518,7 @@ pub(crate) const ATTACHMENT_META: OperationSpec = OperationSpec {
     redaction_rules: RedactionRules {
         copies: &[],
         mirrors: &[],
-        url_fields: &["self", "content", "thumbnail"],
+        url_fields: &["self", "author.self", "content", "thumbnail"],
     },
     result_example: schemas::ATTACHMENT_META_EXAMPLE,
     result_example_sparse: schemas::ATTACHMENT_META_EXAMPLE_SPARSE,

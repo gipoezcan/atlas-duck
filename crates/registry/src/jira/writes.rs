@@ -96,6 +96,7 @@ pub(crate) const ISSUE_CREATE: OperationSpec = OperationSpec {
         fields_map_param: Some("fields"),
         expand_param: None,
         expand_allow: &[],
+        default_fields: &[],
     }),
     caps: NO_CAPS,
     min_version: None,
@@ -240,12 +241,7 @@ pub(crate) const WORKLOG_ADD: OperationSpec = OperationSpec {
                 kind: FlagKind::Str,
                 file_variant: false,
             },
-            FlagBinding {
-                param: "comment",
-                flag: "--comment",
-                kind: FlagKind::Str,
-                file_variant: true,
-            },
+            COMMENT_FLAG,
             FlagBinding {
                 param: "started",
                 flag: "--started",

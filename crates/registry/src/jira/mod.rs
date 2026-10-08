@@ -73,16 +73,17 @@ pub(crate) const ISSUE_COPIES: &[CopyRule] = &[
     },
 ];
 
-/// The same copies for each element of the `jira.search` `issues` array.
+/// `jira.search`: item-relative copies under each element of `issues`; Jira returns `names` and
+/// `schema` once at the top of the response, so those two are document-root copies.
 pub(crate) const SEARCH_COPIES: &[CopyRule] = &[
-    CopyRule::Path("issues[].renderedFields.{field}"),
-    CopyRule::Path("issues[].names.{field}"),
-    CopyRule::Path("issues[].schema.{field}"),
-    CopyRule::Path("issues[].editmeta.fields.{field}"),
+    CopyRule::Path("renderedFields.{field}"),
+    CopyRule::Path("editmeta.fields.{field}"),
     CopyRule::ChangelogItems {
-        items_path: "issues[].changelog.histories[].items",
+        items_path: "changelog.histories[].items",
         key_fields: &["field", "fieldId"],
     },
+    CopyRule::RootPath("names.{field}"),
+    CopyRule::RootPath("schema.{field}"),
 ];
 
 pub(crate) const ISSUE_MIRRORS: &[Mirror] = &[
@@ -96,20 +97,17 @@ pub(crate) const ISSUE_MIRRORS: &[Mirror] = &[
         dst: "renderedFields.worklog.worklogs",
         key: "id",
     },
+    // Over-redaction is the safe side: a missing rendered attachment mirror would leave names and
+    // URLs of a dropped attachment behind (fail closed when the field is absent).
+    Mirror {
+        src: "fields.attachment",
+        dst: "renderedFields.attachment",
+        key: "id",
+    },
 ];
 
-pub(crate) const SEARCH_MIRRORS: &[Mirror] = &[
-    Mirror {
-        src: "issues[].fields.comment.comments",
-        dst: "issues[].renderedFields.comment.comments",
-        key: "id",
-    },
-    Mirror {
-        src: "issues[].fields.worklog.worklogs",
-        dst: "issues[].renderedFields.worklog.worklogs",
-        key: "id",
-    },
-];
+/// Item-relative, so `jira.search` shares the mirrors of `jira.issue.get`.
+pub(crate) const SEARCH_MIRRORS: &[Mirror] = ISSUE_MIRRORS;
 
 /// `expand` values allowed for `jira.issue.get` and `jira.search`.
 pub(crate) const EXPAND_ALLOW: &[&str] = &["renderedFields", "changelog", "names", "schema"];

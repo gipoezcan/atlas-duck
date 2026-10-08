@@ -41,71 +41,6 @@ fn jira() -> Vec<&'static OperationSpec> {
         .collect()
 }
 
-/// A small structural validator (type, required, properties, items, enum): enough to prove the
-/// shipped examples fit their schemas without a schema-validation dependency.
-fn check(schema: &Value, value: &Value, path: &str) -> Result<(), String> {
-    if let Some(t) = schema.get("type") {
-        let names: Vec<&str> = match t {
-            Value::String(s) => vec![s.as_str()],
-            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
-            _ => vec![],
-        };
-        let ok = names.iter().any(|n| match *n {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "integer" => value.is_i64() || value.is_u64(),
-            "number" => value.is_number(),
-            "boolean" => value.is_boolean(),
-            "null" => value.is_null(),
-            _ => false,
-        });
-        if !ok {
-            return Err(format!("{path}: {value} is not of type {t}"));
-        }
-    }
-    if let Some(Value::Array(options)) = schema.get("enum")
-        && !options.contains(value)
-    {
-        return Err(format!("{path}: {value} not in enum"));
-    }
-    if let Some(obj) = value.as_object() {
-        let props = schema.get("properties").and_then(Value::as_object);
-        if let Some(Value::Array(req)) = schema.get("required") {
-            for r in req.iter().filter_map(Value::as_str) {
-                if !obj.contains_key(r) {
-                    return Err(format!("{path}: missing required {r}"));
-                }
-            }
-        }
-        if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
-            for k in obj.keys() {
-                if !props.is_some_and(|p| p.contains_key(k)) {
-                    return Err(format!("{path}: unexpected property {k}"));
-                }
-            }
-        }
-        if let Some(max) = schema.get("maxProperties").and_then(Value::as_u64)
-            && obj.len() as u64 > max
-        {
-            return Err(format!("{path}: too many properties"));
-        }
-        if let Some(props) = props {
-            for (k, sub) in props {
-                if let Some(v) = obj.get(k) {
-                    check(sub, v, &format!("{path}.{k}"))?;
-                }
-            }
-        }
-    }
-    if let (Some(items), Some(arr)) = (schema.get("items"), value.as_array()) {
-        for (i, v) in arr.iter().enumerate() {
-            check(items, v, &format!("{path}[{i}]"))?;
-        }
-    }
-    Ok(())
-}
-
 #[test]
 fn jira_catalog_has_28_specs_in_table_order() {
     let ids: Vec<&str> = jira().iter().map(|s| s.id).collect();
@@ -126,7 +61,7 @@ fn jira_specs_look_up_and_ids_are_unique() {
 }
 
 #[test]
-fn jira_json_text_parses_and_examples_fit_schemas() -> Result<(), String> {
+fn jira_json_text_parses_and_hosts_are_reserved() {
     for spec in jira() {
         let id = spec.id;
         let params = spec.params_schema_json();
@@ -135,25 +70,25 @@ fn jira_json_text_parses_and_examples_fit_schemas() -> Result<(), String> {
             "{id}"
         );
         assert_eq!(params["additionalProperties"], false, "{id}");
-        let example = params["examples"][0].clone();
-        assert!(example.is_object(), "{id}: examples[0]");
-        check(&params, &example, id)?;
+        assert!(params["examples"][0].is_object(), "{id}: examples[0]");
 
         let result = spec.result_schema_json();
         assert!(result.is_object(), "{id}: result_schema parses");
-        for (name, v) in [
-            ("example", spec.result_example_json()),
-            ("sparse", spec.result_example_sparse_json()),
-        ] {
-            check(&result, &v, &format!("{id} {name}"))?;
+        // Schema fit is proven by `catalog.rs` (U-05); here every URL must be an https
+        // `example.invalid` host, in the full and the sparse example alike.
+        for text in [spec.result_example, spec.result_example_sparse] {
+            for url in text.split("http").skip(1) {
+                assert!(
+                    url.starts_with("s://")
+                        && url[4..]
+                            .split('/')
+                            .next()
+                            .is_some_and(|h| h.ends_with(".example.invalid")),
+                    "{id}: URL host must be *.example.invalid"
+                );
+            }
         }
-        assert!(
-            spec.result_example.contains("example.invalid")
-                || !spec.result_example.contains("http"),
-            "{id}: hosts must be example.invalid"
-        );
     }
-    Ok(())
 }
 
 #[test]
@@ -282,6 +217,10 @@ fn describe_documents_default_fields_and_move_limit() {
     );
     let search = describe(get("jira.search").expect("op"), &env);
     assert_eq!(search["defaults"]["max"], 50);
+    assert_eq!(
+        search["defaults"]["fields"],
+        serde_json::json!(SEARCH_DEFAULT_FIELDS)
+    );
     assert_eq!(search["items_key"], "issues");
     let mv = describe(get("jira.sprint.move_issues").expect("op"), &env);
     assert_eq!(mv["caps"]["move_limit"], 50);

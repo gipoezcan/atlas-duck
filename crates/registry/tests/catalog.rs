@@ -441,3 +441,121 @@ fn confluence_table_rules_hold() {
         TargetDisplay::Query { param: "cql" }
     );
 }
+
+/// Does `pattern` (`*` one key, `name[]` every element, a leading `[]` the root array) address
+/// `path` (object keys; array elements are the marker `[]`)?
+fn pattern_matches(pattern: &str, path: &[String]) -> bool {
+    let mut want: Vec<String> = Vec::new();
+    for seg in pattern.split('.') {
+        match seg.strip_suffix("[]") {
+            Some("") => want.push("[]".into()),
+            Some(name) => {
+                want.push(name.into());
+                want.push("[]".into());
+            }
+            None => want.push(seg.into()),
+        }
+    }
+    want.len() == path.len() && want.iter().zip(path).all(|(w, p)| w == "*" || w == p)
+}
+
+fn walk_urls(value: &Value, path: &mut Vec<String>, found: &mut Vec<Vec<String>>) {
+    match value {
+        Value::String(s) if s.starts_with("https://") => found.push(path.clone()),
+        Value::Object(map) => {
+            for (k, v) in map {
+                path.push(k.clone());
+                walk_urls(v, path, found);
+                path.pop();
+            }
+        }
+        Value::Array(items) => {
+            for v in items {
+                path.push("[]".into());
+                walk_urls(v, path, found);
+                path.pop();
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn every_absolute_url_in_a_read_example_is_a_declared_url_field() {
+    for spec in all().iter().filter(|s| s.class == OpClass::Read) {
+        let mut found = Vec::new();
+        walk_urls(&spec.result_example_json(), &mut Vec::new(), &mut found);
+        for path in found {
+            assert!(
+                spec.redaction_rules
+                    .url_fields
+                    .iter()
+                    .any(|p| pattern_matches(p, &path)),
+                "{}: URL at {} is not a declared url_field",
+                spec.id,
+                path.join(".")
+            );
+        }
+    }
+}
+
+#[test]
+fn copies_and_mirrors_are_item_relative() {
+    for spec in all() {
+        let items_key = spec.paginated.map(|p| p.items_key);
+        let mut paths: Vec<&str> = Vec::new();
+        for c in spec.redaction_rules.copies {
+            match c {
+                CopyRule::Path(p) => paths.push(p),
+                CopyRule::ChangelogItems { items_path, .. } => paths.push(items_path),
+                CopyRule::RootPath(p) => {
+                    assert!(
+                        items_key.is_some(),
+                        "{}: RootPath on a non-paged op",
+                        spec.id
+                    );
+                    assert!(!p.contains("[]"), "{}: {p}", spec.id);
+                }
+            }
+        }
+        for m in spec.redaction_rules.mirrors {
+            paths.push(m.src);
+            paths.push(m.dst);
+        }
+        for p in paths {
+            assert!(
+                !p.contains("issues[]"),
+                "{}: {p} is not item-relative",
+                spec.id
+            );
+            if let Some(k) = items_key {
+                assert!(!p.starts_with(&format!("{k}[]")), "{}: {p}", spec.id);
+            }
+        }
+    }
+    let search = get("jira.search").expect("jira.search");
+    let root: Vec<_> = search
+        .redaction_rules
+        .copies
+        .iter()
+        .filter_map(|c| match c {
+            CopyRule::RootPath(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(root, ["names.{field}", "schema.{field}"]);
+    assert_eq!(
+        search.redaction_rules.mirrors,
+        get("jira.issue.get")
+            .expect("jira.issue.get")
+            .redaction_rules
+            .mirrors
+    );
+    assert!(
+        search
+            .redaction_rules
+            .mirrors
+            .iter()
+            .any(|m| m.dst == "renderedFields.attachment")
+    );
+}
