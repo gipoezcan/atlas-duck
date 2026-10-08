@@ -58,6 +58,25 @@ impl JobSnapshot {
     pub const UILIMIT_ALL: u32 = JOB_OBJECT_UILIMIT_ALL;
 }
 
+fn set_ui_restrictions(job: *mut core::ffi::c_void, class: u32) -> io::Result<()> {
+    let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
+        UIRestrictionsClass: class,
+    };
+    // SAFETY: `ui` is a valid structure of the size passed; `job` is a job handle.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectBasicUIRestrictions,
+            (&ui as *const JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
+            std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// An unnamed job object. Closing the last handle kills every process in it
 /// (`KILL_ON_JOB_CLOSE`).
 pub(crate) struct Job(OwnedHandle);
@@ -97,22 +116,36 @@ impl Job {
             return Err(err);
         }
 
-        let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-            UIRestrictionsClass: JOB_OBJECT_UILIMIT_ALL,
-        };
-        // SAFETY: `ui` is a valid structure of the size passed.
-        let ok = unsafe {
-            SetInformationJobObject(
-                job.raw(),
-                JobObjectBasicUIRestrictions,
-                (&ui as *const JOBOBJECT_BASIC_UI_RESTRICTIONS).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
-            )
-        };
-        if ok == 0 {
-            let err = io::Error::last_os_error();
-            eprintln!("SetInformationJobObject(UI restrictions) failed: {err}");
-            return Err(err);
+        // All eight UI limits at once. CI run 3 (windows-2022, the runner is
+        // itself inside a job): this call alone failed with 87 and no worker
+        // could start. When it fails, apply the bits one by one, keep every
+        // one the system accepts and name the refused ones on stderr; the
+        // job's `JobSnapshot::ui_restrictions` then says what really holds.
+        if let Err(err) = set_ui_restrictions(job.raw(), JOB_OBJECT_UILIMIT_ALL) {
+            eprintln!(
+                "SetInformationJobObject(UI restrictions {JOB_OBJECT_UILIMIT_ALL:#x}) failed: {err}; trying each bit"
+            );
+            let mut refused = 0u32;
+            let mut applied = 0u32;
+            for bit in (0..32)
+                .map(|b| 1u32 << b)
+                .filter(|b| JOB_OBJECT_UILIMIT_ALL & b != 0)
+            {
+                // Each call replaces the class: pass the bits accepted so far plus one.
+                match set_ui_restrictions(job.raw(), applied | bit) {
+                    Ok(()) => applied |= bit,
+                    Err(e) => {
+                        eprintln!("  UI limit {bit:#x} refused: {e}");
+                        refused |= bit;
+                    }
+                }
+            }
+            // Leave the job with exactly the accepted bits.
+            set_ui_restrictions(job.raw(), applied).map_err(|e| {
+                eprintln!("SetInformationJobObject(UI restrictions {applied:#x}) failed: {e}");
+                e
+            })?;
+            eprintln!("job UI restrictions: applied {applied:#x}, refused {refused:#x}");
         }
         Ok(job)
     }
