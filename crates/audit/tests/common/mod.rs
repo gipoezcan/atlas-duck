@@ -1,11 +1,12 @@
 //! Helpers shared by the store-level integration tests.
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use atlas_duck_audit::clock::{Clock, UtcInstant};
+use atlas_duck_audit::clock::{Clock, UtcInstant, parse_epoch};
 use atlas_duck_audit::encoding::{FIELD_LIST, RowFields, ZERO_HASH};
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::request_set::{RequestRecord, request_set_hash, requests_to_json};
@@ -13,12 +14,14 @@ use atlas_duck_audit::schema::DB_FILE;
 use atlas_duck_audit::testing::{FakeClock, MemKeyStore, MemKeyring};
 use atlas_duck_audit::types::{Actor, EventType, NewEvent};
 use atlas_duck_audit::{
-    FilePolicy, FirstRunInput, OpenConfig, Settings, Store, create_new_store, new_ids,
+    FilePolicy, FirstRunInput, Hooks, OpenConfig, Settings, StartupOutcome, Store,
+    create_new_store, new_ids, open,
 };
 use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
+use chrono::{Datelike, NaiveDate};
 use rusqlite::Connection;
 use secrecy::SecretString;
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// 21 characters: above the 12-character minimum.
@@ -427,4 +430,271 @@ pub fn key_rows(f: &Fixture) -> Vec<(u64, Option<String>, String)> {
     .expect("query")
     .map(|r| r.expect("row"))
     .collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// The clock scenario driver (T13)
+
+/// A store living through simulated months. `real` is the true time; the fake clock's wall
+/// time is `real + offset` (a wrong local clock) and its monotonic time moves with `real`
+/// except during a suspend. The server `Date` is always `real`.
+///
+/// After every operation the driver reads the database and remembers, per record, the real
+/// time it first appeared, which rows disappeared (and when), the anomaly payloads, and any
+/// `epoch` or DEK month ahead of the real date at the time it was written.
+pub struct Sim {
+    pub store: Store,
+    pub f: Fixture,
+    hooks: Hooks,
+    pub retention: u32,
+    pub real: UtcInstant,
+    offset_ms: i64,
+    /// `seq` -> real instant first seen.
+    written: BTreeMap<u64, UtcInstant>,
+    /// `(seq, written, deleted by a prune at)`.
+    deleted: Vec<(u64, UtcInstant, UtcInstant)>,
+    keys_seen: BTreeSet<u64>,
+    anomalies: Vec<Value>,
+    violations: Vec<String>,
+}
+
+impl Sim {
+    /// A first run at real time `real_start` whose local clock is `wall_offset_days` off,
+    /// prune-ready (retention in force, config file reconciled), nothing corroborated yet.
+    /// Runs with `synchronous=NORMAL`.
+    pub fn new(real_start: &str, retention: u32, wall_offset_days: i64) -> Sim {
+        let real = at(real_start);
+        let offset_ms = wall_offset_days * 86_400_000;
+        let mut hooks = Hooks::default();
+        let (store, f) = new_store_with(
+            fake_clock(&UtcInstant(real.0 + offset_ms).to_rfc3339_ms()),
+            MemKeyring::new(),
+            |cfg| {
+                cfg.hooks.synchronous_normal = true;
+                hooks = cfg.hooks.clone();
+            },
+        );
+        prune_ready(&store, retention);
+        let mut sim = Sim {
+            store,
+            f,
+            hooks,
+            retention,
+            real,
+            offset_ms,
+            written: BTreeMap::new(),
+            deleted: Vec::new(),
+            keys_seen: BTreeSet::new(),
+            anomalies: Vec::new(),
+            violations: Vec::new(),
+        };
+        sim.track();
+        sim
+    }
+
+    pub fn real_date(&self) -> NaiveDate {
+        self.real.date()
+    }
+
+    pub fn wall_date(&self) -> NaiveDate {
+        self.f.clock.now_utc().date()
+    }
+
+    fn sync_wall(&self) {
+        self.f
+            .clock
+            .set_wall(UtcInstant(self.real.0 + self.offset_ms));
+    }
+
+    /// Real time +`d`; the wall clock follows (with its offset), the monotonic clock only
+    /// when `mono` is set.
+    fn advance(&mut self, d: Duration, mono: bool) {
+        self.real.0 += d.as_millis() as i64;
+        self.sync_wall();
+        if mono {
+            self.f.clock.advance_mono_only(d);
+        }
+    }
+
+    /// One real day passes (all clocks), without a server response or records.
+    pub fn tick(&mut self) {
+        self.advance(DAY, true);
+    }
+
+    /// The local clock is wrong by `days` from now on (0 corrects it).
+    pub fn set_wall_offset_days(&mut self, days: i64) {
+        self.offset_ms = days * 86_400_000;
+        self.sync_wall();
+    }
+
+    /// A successful response with a `Date` header of the real time.
+    pub fn server_date(&self) {
+        self.store.observe_server_date(
+            "i1",
+            server_time(&self.real.to_rfc3339_ms()),
+            Instant::now(),
+        );
+    }
+
+    /// `n` events now, the prune attempt they queued, both anchors, then the bookkeeping.
+    pub fn append(&mut self, n: usize) {
+        if n > 0 {
+            self.store
+                .append_batch(day_events(n))
+                .expect("append_batch");
+        }
+        self.settle();
+    }
+
+    pub fn settle(&mut self) {
+        sync_writer(&self.store);
+        self.store.flush_head_anchor().expect("flush");
+        self.track();
+    }
+
+    /// One simulated day: real +24 h on every clock, a server response, `n` events.
+    pub fn day(&mut self, n: usize) {
+        self.tick();
+        self.server_date();
+        self.append(n);
+    }
+
+    pub fn days(&mut self, k: usize, n: usize) {
+        for _ in 0..k {
+            self.day(n);
+        }
+    }
+
+    /// The machine sleeps: real and wall time advance, the monotonic clock does not, no
+    /// server response arrives.
+    pub fn suspend(&mut self, d: Duration) {
+        self.advance(d, false);
+    }
+
+    fn reopen(&mut self) {
+        let mut cfg = self.f.config();
+        cfg.hooks = self.hooks.clone();
+        match open(&self.f.data, &self.f.lock, cfg).expect("open") {
+            StartupOutcome::Ready { store, .. } => self.store = store,
+            other => panic!("not ready: {other:?}"),
+        }
+        prune_ready(&self.store, self.retention);
+    }
+
+    /// Shutdown and start again at the same time (nothing corroborated yet).
+    pub fn restart(&mut self) {
+        self.store.shutdown();
+        self.reopen();
+        self.settle();
+    }
+
+    /// The app is not running for `days`: every clock advances, then it starts again and
+    /// reconciles its config file.
+    pub fn off(&mut self, days: u64) {
+        self.store.shutdown();
+        self.advance(DAY * days as u32, true);
+        self.reopen();
+        self.settle();
+    }
+
+    /// Reads the database after an operation. A row seen for the first time was written at
+    /// `real`; a row that disappeared was deleted by a prune at `real`.
+    fn track(&mut self) {
+        let c = raw_conn(&self.f);
+        let mut st = c
+            .prepare("SELECT seq, epoch, event_type FROM events ORDER BY seq")
+            .expect("prepare");
+        let rows: Vec<(u64, Option<String>, String)> = st
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get(1)?, r.get(2)?))
+            })
+            .expect("query")
+            .map(|r| r.expect("row"))
+            .collect();
+        let now: BTreeSet<u64> = rows.iter().map(|r| r.0).collect();
+        let gone: Vec<u64> = self
+            .written
+            .keys()
+            .filter(|s| !now.contains(s))
+            .copied()
+            .collect();
+        for seq in gone {
+            let w = self.written.remove(&seq).expect("tracked");
+            self.deleted.push((seq, w, self.real));
+        }
+        for (seq, epoch, event_type) in rows {
+            if self.written.contains_key(&seq) {
+                continue;
+            }
+            self.written.insert(seq, self.real);
+            if let Some(e) = epoch
+                && parse_epoch(&e).expect("epoch text") > self.real_date()
+            {
+                self.violations.push(format!(
+                    "seq {seq} has epoch {e} on real {}",
+                    self.real_date()
+                ));
+            }
+            if event_type == "CLOCK_ANOMALY" {
+                let p = self.store.read_payload(seq).expect("read_payload");
+                self.anomalies
+                    .push(serde_json::from_slice(&p).expect("json"));
+            }
+        }
+        let today = self.real_date();
+        for (key_id, month, _) in key_rows(&self.f) {
+            if !self.keys_seen.insert(key_id) {
+                continue;
+            }
+            if let Some(m) = month {
+                let (y, mo) = m.split_once('-').expect("YYYY-MM");
+                let key = (
+                    y.parse::<i32>().expect("year"),
+                    mo.parse::<u32>().expect("month"),
+                );
+                if key > (today.year(), today.month()) {
+                    self.violations
+                        .push(format!("key {key_id} for month {m} on real {today}"));
+                }
+            }
+        }
+    }
+
+    /// Every row deleted so far was written at least `retention` real days (by date) before
+    /// the real time of the prune that deleted it.
+    pub fn assert_no_early_prune(&self, retention: u32) {
+        for (seq, written, deleted_at) in &self.deleted {
+            let age = (deleted_at.date() - written.date()).num_days();
+            assert!(
+                age >= i64::from(retention),
+                "seq {seq} written {} was pruned {} ({age} real days)",
+                written.date(),
+                deleted_at.date()
+            );
+        }
+    }
+
+    /// No `epoch` and no DEK month was ever ahead of the real date of the time it appeared.
+    pub fn assert_no_future_epoch_or_dek(&self) {
+        assert!(self.violations.is_empty(), "{:?}", self.violations);
+    }
+
+    /// How many rows were deleted so far.
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.len()
+    }
+
+    /// The payload of every `CLOCK_ANOMALY` row seen so far (also the pruned ones).
+    pub fn anomalies(&self) -> Vec<Value> {
+        self.anomalies.clone()
+    }
+
+    /// The `local_ahead` / `local_behind` anomalies (not the `prune_skipped` ones).
+    pub fn episode_anomalies(&self, kind: &str) -> Vec<Value> {
+        self.anomalies
+            .iter()
+            .filter(|a| a["kind"] == kind)
+            .cloned()
+            .collect()
+    }
 }
