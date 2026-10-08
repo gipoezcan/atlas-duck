@@ -47,39 +47,48 @@ pub fn is_bidi_control(c: char) -> bool {
 /// minimally-qualified and unqualified spellings to their fully-qualified entry, so the match
 /// compares `as_str()`. U+FE0E is never part of a fully-qualified emoji and so is never exempt.
 pub fn flags(s: &str) -> Vec<bool> {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out: Vec<bool> = chars.iter().map(|&c| is_flagged(c)).collect();
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    // Byte offset where char `k` starts (`s.len()` past the end): candidates are slices of `s`.
+    let byte_at = |k: usize| chars.get(k).map_or(s.len(), |&(b, _)| b);
+    let mut out: Vec<bool> = chars.iter().map(|&(_, c)| is_flagged(c)).collect();
     let mut i = 0;
     while i < chars.len() {
-        if !is_emoji_seq_char(chars[i]) {
+        if !is_emoji_seq_char(chars[i].1) {
             i += 1;
             continue;
         }
         let start = i;
-        while i < chars.len() && is_emoji_seq_char(chars[i]) {
+        while i < chars.len() && is_emoji_seq_char(chars[i].1) {
             i += 1;
         }
         // Only ZWJ and the variation selectors can be unflagged; skip runs without them.
         if !chars[start..i]
             .iter()
-            .any(|&c| matches!(c, ZWJ | VS15 | VS16))
+            .any(|&(_, c)| matches!(c, ZWJ | VS15 | VS16))
         {
             continue;
         }
         let mut j = start;
         while j < i {
             let mut matched = None;
-            for end in (j + 1..=i.min(j + MAX_RGI_EMOJI_CHARS)).rev() {
-                let candidate: String = chars[j..end].iter().collect();
-                if emojis::get(&candidate).is_some_and(|e| e.as_str() == candidate) {
-                    matched = Some(end);
-                    break;
+            // No table emoji starts with a joiner/modifier/tag or ends with ZWJ (tested), so
+            // those lookups are skipped.
+            if can_start_emoji(chars[j].1) {
+                for end in (j + 1..=i.min(j + MAX_RGI_EMOJI_CHARS)).rev() {
+                    if chars[end - 1].1 == ZWJ {
+                        continue;
+                    }
+                    let candidate = &s[byte_at(j)..byte_at(end)];
+                    if emojis::get(candidate).is_some_and(|e| e.as_str() == candidate) {
+                        matched = Some(end);
+                        break;
+                    }
                 }
             }
             match matched {
                 Some(end) => {
                     for k in j..end {
-                        if matches!(chars[k], ZWJ | VS15 | VS16) {
+                        if matches!(chars[k].1, ZWJ | VS15 | VS16) {
                             out[k] = false;
                         }
                     }
@@ -90,6 +99,12 @@ pub fn flags(s: &str) -> Vec<bool> {
         }
     }
     out
+}
+
+fn can_start_emoji(c: char) -> bool {
+    !(matches!(c, ZWJ | VS15 | VS16 | '\u{20E3}')
+        || ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+        || ('\u{E0020}'..='\u{E007F}').contains(&c))
 }
 
 fn is_emoji_seq_char(c: char) -> bool {
@@ -116,11 +131,15 @@ pub fn count(s: &str) -> (u64, u64) {
     (bidi, other)
 }
 
-/// Flagged characters as `⟨U+XXXX⟩` (at least 4 hex digits, upper case).
+/// Flagged characters as `⟨U+XXXX⟩` (at least 4 hex digits, upper case). The delimiters
+/// themselves (U+27E8 `⟨`, U+27E9 `⟩`) are escaped the same way when they occur in `s`, so the
+/// encoding is injective: every `⟨` in the output starts an escape and literal text can never
+/// pass for one. They are display escapes only; `count` and `strip` ignore them. C.6 shape: a
+/// plain `String`.
 pub fn escape_for_display(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for (c, flagged) in s.chars().zip(flags(s)) {
-        if flagged {
+        if flagged || matches!(c, '⟨' | '⟩') {
             out.push_str(&format!("⟨U+{:04X}⟩", c as u32))
         } else {
             out.push(c)

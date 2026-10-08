@@ -219,13 +219,15 @@ fn max_rgi_emoji_chars_bounds_the_table() {
 #[test]
 fn long_emoji_runs_stay_linear() {
     // Digits, `#` and `*` are emoji-sequence characters: one huge run must not go quadratic.
-    let digits = "7".repeat(200_000);
-    let zwj_run = "1\u{200D}".repeat(100_000);
+    // 4 MiB of digit + ZWJ is the costliest shape (a lookahead at every digit). The bound is
+    // generous for debug builds; a quadratic implementation would take hours.
+    let digits = "7".repeat(4 << 20);
+    let zwj_run = "1\u{200D}".repeat(1 << 20);
     let start = Instant::now();
     assert_eq!(count(&digits), (0, 0));
-    assert_eq!(count(&zwj_run), (0, 100_000));
+    assert_eq!(count(&zwj_run), (0, 1 << 20));
     assert!(
-        start.elapsed() < Duration::from_secs(20),
+        start.elapsed() < Duration::from_secs(120),
         "{:?}",
         start.elapsed()
     );
@@ -254,10 +256,134 @@ fn v31_builder_version_matches_the_linked_tables() {
         PREVIEW_BUILDER_VERSION.ends_with(&emoji),
         "{PREVIEW_BUILDER_VERSION}"
     );
-    // ICU data is Unicode 17.0: U+10940 (Sidetic, new in 17.0) is assigned to its script.
+    // ICU data is Unicode 17.0. Lower bound from the data: U+10940 (Sidetic, new in 17.0) is
+    // assigned to its script. Exact version: the locked data crates are the ones whose README
+    // was read for `icu-17.0` (ICU release-78.1rc) and `emoji-17.0`; any bump fails here.
     assert!(PREVIEW_BUILDER_VERSION.contains(";icu-17.0;"));
     assert_eq!(
         CodePointMapData::<Script>::new().get('\u{10940}'),
         Script::Sidetic
     );
+    let lock = include_str!("../../../Cargo.lock");
+    for (name, version) in [
+        ("icu_properties", "2.3.0"),
+        ("icu_properties_data", "2.3.0"),
+        ("emojis", "0.9.0"),
+    ] {
+        assert_eq!(
+            locked_versions(lock, name),
+            [version],
+            "{name} changed: re-read its Unicode/emoji version and update PREVIEW_BUILDER_VERSION"
+        );
+    }
+}
+
+/// Every `version` Cargo.lock records for package `name`.
+fn locked_versions<'a>(lock: &'a str, name: &str) -> Vec<&'a str> {
+    let wanted = format!("name = \"{name}\"");
+    let lines: Vec<&str> = lock.lines().map(str::trim_end).collect();
+    lines
+        .windows(2)
+        .filter(|w| w[0] == wanted)
+        .filter_map(|w| w[1].strip_prefix("version = \""))
+        .filter_map(|v| v.strip_suffix('"'))
+        .collect()
+}
+
+/// Every emoji of the `emojis` table, with all skin-tone variants.
+fn emoji_table() -> Vec<&'static emojis::Emoji> {
+    emojis::iter()
+        .flat_map(|e| {
+            let tones: Vec<&emojis::Emoji> =
+                e.skin_tones().map(|t| t.collect()).unwrap_or_default();
+            std::iter::once(e).chain(tones)
+        })
+        .collect()
+}
+
+fn is_tag(c: char) -> bool {
+    ('\u{E0020}'..='\u{E007F}').contains(&c)
+}
+
+#[test]
+fn whole_emoji_table_is_unflagged_except_tags() {
+    let table = emoji_table();
+    assert!(table.len() > 4000, "{}", table.len());
+    for e in table {
+        let s = e.as_str();
+        let tags = s.chars().filter(|&c| is_tag(c)).count() as u64;
+        assert_eq!(count(s), (0, tags), "{s:?}");
+        // Back to back and glued to digits (which are emoji-sequence characters too).
+        let glued = format!("1{s}{s}2");
+        assert_eq!(count(&glued), (0, 2 * tags), "{glued:?}");
+    }
+}
+
+#[test]
+fn no_table_emoji_starts_with_a_joiner_or_ends_with_zwj() {
+    // `flags` skips lookups that start at these characters or end at a ZWJ; this keeps that
+    // shortcut result-neutral for the linked table.
+    for e in emoji_table() {
+        let s = e.as_str();
+        let first = s.chars().next().unwrap_or('a');
+        assert!(
+            !matches!(first, '\u{200D}' | '\u{FE0E}' | '\u{FE0F}' | '\u{20E3}')
+                && !('\u{1F3FB}'..='\u{1F3FF}').contains(&first)
+                && !is_tag(first),
+            "{s:?}"
+        );
+        assert!(!s.ends_with('\u{200D}'), "{s:?}");
+    }
+}
+
+/// Inverse of `escape_for_display`; `None` when the text is not a valid escaping.
+fn unescape(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        match c {
+            '⟨' => {
+                let close = rest.find('⟩')?;
+                let hex = rest[..close].strip_prefix("⟨U+")?;
+                out.push(char::from_u32(u32::from_str_radix(hex, 16).ok()?)?);
+                rest = &rest[close + '⟩'.len_utf8()..];
+            }
+            '⟩' => return None,
+            _ => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    Some(out)
+}
+
+#[test]
+fn escape_for_display_is_injective() {
+    // A literal marker in the source must not look like a real escape.
+    assert_ne!(
+        escape_for_display("⟨U+202E⟩"),
+        escape_for_display("\u{202E}")
+    );
+    assert_eq!(escape_for_display("⟨U+202E⟩"), "⟨U+27E8⟩U+202E⟨U+27E9⟩");
+    assert_eq!(escape_for_display("⟩⟨"), "⟨U+27E9⟩⟨U+27E8⟩");
+    for s in [
+        S13,
+        "⟨U+202E⟩",
+        "\u{202E}",
+        "⟨\u{202E}⟩",
+        "⟨U+27E8⟩",
+        "a⟩b⟨c",
+        "👩\u{200D}🚀⟨⟩\u{200D}",
+        "",
+    ] {
+        assert_eq!(
+            unescape(&escape_for_display(s)).as_deref(),
+            Some(s),
+            "{s:?}"
+        );
+    }
+    // The delimiters are display escapes only: not counted, not stripped.
+    assert_eq!(count("⟨⟩"), (0, 0));
+    assert_eq!(strip("⟨⟩", false), ("⟨⟩".to_string(), false));
 }
