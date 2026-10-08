@@ -5,7 +5,7 @@
 //! only after `COMMIT` returned (`synchronous=FULL`, §5.1 inv. 1).
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 use crate::anchors::{AnchorShared, HeadAnchor};
 #[cfg(any(test, feature = "testing"))]
 use crate::anchors::{Barrier, FirstRetainedAnchor};
+use crate::backup::BackupReceipt;
 use crate::clock::{
     AnomalyKind, ClockAnomaly, ClockState, Stamp, UtcInstant, epoch_text, month_text, parse_epoch,
 };
@@ -343,6 +344,12 @@ pub(crate) enum Cmd {
     Reconcile {
         file: FilePolicy,
         reply: SyncSender<Result<Vec<Committed>, AuditError>>,
+    },
+    /// `Store::backup` (§8.10): the bundle is written between commands.
+    Backup {
+        out: PathBuf,
+        install_id: String,
+        reply: SyncSender<Result<BackupReceipt, AuditError>>,
     },
     /// Replaces the view without logging anything (feature `testing`): for tests that need
     /// exact seqs; the settings tests use the real calls.
@@ -1191,6 +1198,14 @@ impl Writer {
                 }
                 Cmd::Reconcile { file, reply } => {
                     let r = self.reconcile_run(&file);
+                    let _ = reply.send(r);
+                }
+                Cmd::Backup {
+                    out,
+                    install_id,
+                    reply,
+                } => {
+                    let r = self.backup_run(&out, &install_id);
                     let _ = reply.send(r);
                 }
                 Cmd::Prune { confirm, reply } => {

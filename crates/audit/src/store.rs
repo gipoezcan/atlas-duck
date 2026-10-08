@@ -21,6 +21,7 @@ use crate::anchor_dir::{self, AnchorDirLines};
 use crate::anchors::{
     self, AnchorLoadError, Barrier, BarrierGuard, BarrierKind, FirstRetainedAnchor, HeadAnchor,
 };
+use crate::backup::BackupReceipt;
 use crate::clock::{Clock, UtcInstant};
 use crate::crypto::{self, Kek};
 use crate::encoding::{self, FIELD_LIST, RowFields};
@@ -29,7 +30,9 @@ use crate::keystore::KeyStore;
 use crate::prune::PruneOutcome;
 use crate::schema;
 use crate::settings::{FilePolicy, SettingChange, Settings};
-use crate::types::{Committed, Confirmed, EventFlags, EventType, NewEvent, QueryKind};
+use crate::types::{
+    Committed, Confirmed, EventFlags, EventType, NewEvent, QueryKind, RustChosenPath,
+};
 use crate::verify::{
     self, FindingKind, KeychainAnchors, StartupVerdict, VerifyFinding, VerifyOutcome,
 };
@@ -641,6 +644,24 @@ impl Store {
         self.sender()?
             .send(Cmd::Reconcile {
                 file: file.clone(),
+                reply,
+            })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    /// Full backup (C.3, §8.10) into a new bundle directory inside `out`
+    /// (`atlas-duck-backup-<UTC stamp>-<chain_id[0..8]>`): the `VACUUM INTO` snapshot without
+    /// any `vault` table, `recovery.bin` and `manifest.json` (written last) naming the snapshot
+    /// head; then `BACKUP` is appended after that head. It runs on the writer, so no append
+    /// interleaves. On `Err` the partial bundle is removed and nothing is logged. The bundle is
+    /// outside retention and crypto-shredding: its lifecycle is the operator's.
+    pub fn backup(&self, out: RustChosenPath) -> Result<BackupReceipt, AuditError> {
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::Backup {
+                out: out.path().to_path_buf(),
+                install_id: self.inner.install_id.clone(),
                 reply,
             })
             .map_err(|_| AuditError::Closed)?;

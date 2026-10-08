@@ -8,6 +8,7 @@ pub mod lock;
 pub mod admission;
 pub mod anchor_dir;
 pub mod anchors;
+mod backup;
 pub mod clock;
 pub mod crypto;
 pub mod encoding;
@@ -33,6 +34,7 @@ mod writer;
 
 pub use admission::FreeSpaceProbe;
 pub use anchor_dir::{AnchorLine, AnchorLineError};
+pub use backup::BackupReceipt;
 pub use open::{
     ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
     keychain_retry_schedule, new_ids, open, read_store_install_id,
