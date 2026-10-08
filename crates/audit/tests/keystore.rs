@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 
 use atlas_duck_audit::keystore::{
-    EntryName, KeyStore, KeyStoreError, KeyringLocality, MappedError, canary_self_test,
-    keyring_dirs, keyring_locality, map_keyring_error, service_name,
+    DirsOs, EntryName, KeyStore, KeyStoreError, KeyringLocality, MappedError, Probe,
+    canary_self_test, keyring_dirs, keyring_dirs_for, keyring_locality, keyring_locality_with,
+    map_keyring_error, service_name,
 };
 use atlas_duck_audit::testing::{MemKeyStore, MemKeyring};
 use keyring_core::Error as E;
@@ -152,14 +153,17 @@ fn locality_nfs_from_env() {
 #[cfg(windows)]
 #[test]
 fn keyring_dirs_per_os() {
-    assert!(keyring_dirs().is_empty());
+    assert!(keyring_dirs().unwrap().is_empty());
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn keyring_dirs_per_os() {
     let home = atlas_duck_ipc::paths::base_dirs().unwrap().home;
-    assert_eq!(keyring_dirs(), vec![home.join("Library").join("Keychains")]);
+    assert_eq!(
+        keyring_dirs().unwrap(),
+        vec![home.join("Library").join("Keychains")]
+    );
 }
 
 /// Linux: the env is set in a child process (this test binary re-run with a filter), so parallel
@@ -206,7 +210,7 @@ fn keyring_dirs_child() {
         .join(".local")
         .join("share");
     let tail = vec![share.join("keyrings"), share.join("kwalletd")];
-    let got = keyring_dirs();
+    let got = keyring_dirs().unwrap();
     match std::env::var("XDG_DATA_HOME").as_deref() {
         Ok("/xdg-data") => {
             let mut want = vec![
@@ -218,4 +222,107 @@ fn keyring_dirs_child() {
         }
         _ => assert_eq!(got, tail),
     }
+}
+
+fn home_fails() -> std::io::Result<PathBuf> {
+    Err(std::io::Error::other("getpwuid_r failed"))
+}
+
+#[test]
+fn dirs_fail_closed_when_home_unresolvable() {
+    let no_home: &dyn Fn() -> std::io::Result<PathBuf> = &home_fails;
+    assert!(keyring_dirs_for(DirsOs::Macos, None, no_home).is_err());
+    assert!(keyring_dirs_for(DirsOs::Linux, None, no_home).is_err());
+    // An absolute XDG dir alone is not enough: the ~/.local/share variant cannot be checked.
+    assert!(keyring_dirs_for(DirsOs::Linux, Some("/xdg".into()), no_home).is_err());
+    // Windows has no keyring dirs and needs no home.
+    assert_eq!(
+        keyring_dirs_for(DirsOs::Windows, None, no_home).unwrap(),
+        Vec::<PathBuf>::new()
+    );
+}
+
+#[test]
+fn dirs_resolve_per_os_with_injected_home() {
+    let home: &dyn Fn() -> std::io::Result<PathBuf> = &|| Ok(PathBuf::from("/home/u"));
+    assert_eq!(
+        keyring_dirs_for(DirsOs::Macos, None, home).unwrap(),
+        vec![PathBuf::from("/home/u").join("Library").join("Keychains")]
+    );
+    let share = PathBuf::from("/home/u").join(".local").join("share");
+    let tail = vec![share.join("keyrings"), share.join("kwalletd")];
+    assert_eq!(keyring_dirs_for(DirsOs::Linux, None, home).unwrap(), tail);
+    let abs = if cfg!(windows) { "C:/xdg" } else { "/xdg" };
+    let mut want = vec![
+        PathBuf::from(abs).join("keyrings"),
+        PathBuf::from(abs).join("kwalletd"),
+    ];
+    want.extend(tail.clone());
+    assert_eq!(
+        keyring_dirs_for(DirsOs::Linux, Some(abs.into()), home).unwrap(),
+        want
+    );
+    // A relative XDG_DATA_HOME is ignored.
+    assert_eq!(
+        keyring_dirs_for(DirsOs::Linux, Some("rel/xdg".into()), home).unwrap(),
+        tail
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn empty_dir_list_is_unknown_outside_windows() {
+    assert!(matches!(
+        keyring_locality(&[]),
+        KeyringLocality::Unknown { .. }
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn empty_dir_list_is_local_on_windows() {
+    assert_eq!(keyring_locality(&[]), KeyringLocality::Local);
+}
+
+#[test]
+fn probe_error_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let denied = |_: &std::path::Path| -> std::io::Result<Probe> {
+        Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+    };
+    assert!(matches!(
+        keyring_locality_with(&[tmp.path().join("keyrings")], &denied),
+        KeyringLocality::Unknown { .. }
+    ));
+}
+
+#[test]
+fn dangling_link_probe_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dangling = |_: &std::path::Path| -> std::io::Result<Probe> { Ok(Probe::DanglingLink) };
+    assert!(matches!(
+        keyring_locality_with(&[tmp.path().join("keyrings")], &dangling),
+        KeyringLocality::Unknown { .. }
+    ));
+}
+
+#[test]
+fn missing_everywhere_is_unknown() {
+    let missing = |_: &std::path::Path| -> std::io::Result<Probe> { Ok(Probe::Missing) };
+    assert!(matches!(
+        keyring_locality_with(&[PathBuf::from("keyrings")], &missing),
+        KeyringLocality::Unknown { .. }
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn real_dangling_symlink_is_unknown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("keyrings");
+    std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+    assert!(matches!(
+        keyring_locality(&[link]),
+        KeyringLocality::Unknown { .. }
+    ));
 }

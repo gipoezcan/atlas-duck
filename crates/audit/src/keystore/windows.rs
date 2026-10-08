@@ -35,3 +35,56 @@ pub fn credential_persist(target: &str) -> Result<Option<u32>, KeyStoreError> {
     };
     Ok(Some(persist))
 }
+
+/// The set-time check: `persist` is the readback of the credential just written. Anything but
+/// `Some(Local)` runs `cleanup` (which deletes the credential) and fails.
+pub(super) fn verify_local(
+    persist: Result<Option<u32>, KeyStoreError>,
+    cleanup: impl FnOnce(),
+) -> Result<(), KeyStoreError> {
+    match persist {
+        Ok(Some(PERSIST_LOCAL)) => Ok(()),
+        Ok(Some(_)) => {
+            cleanup();
+            Err(KeyStoreError::NotLocal)
+        }
+        Ok(None) => {
+            cleanup();
+            Err(KeyStoreError::Other(
+                "credential missing after write".into(),
+            ))
+        }
+        Err(e) => {
+            cleanup();
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn run(p: Result<Option<u32>, KeyStoreError>) -> (Result<(), KeyStoreError>, bool) {
+        let cleaned = Cell::new(false);
+        let r = verify_local(p, || cleaned.set(true));
+        (r, cleaned.get())
+    }
+
+    #[test]
+    fn local_persistence_is_kept() {
+        assert_eq!(run(Ok(Some(2))), (Ok(()), false));
+    }
+
+    #[test]
+    fn non_local_or_unreadable_persistence_deletes_the_credential() {
+        assert_eq!(run(Ok(Some(3))), (Err(KeyStoreError::NotLocal), true));
+        assert_eq!(run(Ok(Some(1))), (Err(KeyStoreError::NotLocal), true));
+        assert_eq!(
+            run(Err(KeyStoreError::Other("x".into()))),
+            (Err(KeyStoreError::Other("x".into())), true)
+        );
+        assert!(run(Ok(None)).1);
+    }
+}

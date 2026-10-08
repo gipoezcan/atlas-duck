@@ -48,19 +48,31 @@ pub struct OsKeyStore {
     install_id: String,
     service: String,
     store: Arc<CredentialStore>,
-    dirs: Vec<PathBuf>,
+    /// `Err`: the real dirs could not be resolved; `locality()` then reports `Unknown`.
+    dirs: Result<Vec<PathBuf>, String>,
 }
 
 impl OsKeyStore {
-    /// Uses the real keyring dirs of this OS for the locality check. Does not touch the keyring.
+    /// Uses the real keyring dirs of this OS for the locality check; if they cannot be resolved,
+    /// `locality()` reports `Unknown` (fail closed). Creating the platform store does not read
+    /// or write entries, but on Linux it may connect to the Secret Service bus and fail
+    /// (`Unavailable`).
     pub fn new(install_id: &str) -> Result<OsKeyStore, KeyStoreError> {
-        Self::with_keyring_dirs(install_id, keyring_dirs())
+        Self::build(install_id, keyring_dirs().map_err(|e| e.to_string()))
     }
 
-    /// Tests and the I-44 phase pass their own dirs. Does not touch the keyring.
+    /// Tests and the I-44 phase pass their own dirs (same store creation as `new`). An empty
+    /// list is `Unknown` outside Windows.
     pub fn with_keyring_dirs(
         install_id: &str,
         dirs: Vec<PathBuf>,
+    ) -> Result<OsKeyStore, KeyStoreError> {
+        Self::build(install_id, Ok(dirs))
+    }
+
+    fn build(
+        install_id: &str,
+        dirs: Result<Vec<PathBuf>, String>,
     ) -> Result<OsKeyStore, KeyStoreError> {
         Ok(OsKeyStore {
             install_id: install_id.to_string(),
@@ -134,13 +146,12 @@ impl KeyStore for OsKeyStore {
         self.entry(e)?.set_secret(v).map_err(map_err)?;
         #[cfg(windows)]
         {
-            // Fail closed instead of trusting the modifier.
+            // Fail closed instead of trusting the modifier; a credential that is not Local is
+            // removed again so nothing roaming is left behind.
             let full = e.full_name(&self.install_id);
-            if super::windows::credential_persist(&full)? != Some(super::windows::PERSIST_LOCAL) {
-                return Err(KeyStoreError::Other(
-                    "credential persistence is not local".into(),
-                ));
-            }
+            super::windows::verify_local(super::windows::credential_persist(&full), || {
+                let _ = self.delete(e);
+            })?;
         }
         Ok(())
     }
@@ -156,6 +167,11 @@ impl KeyStore for OsKeyStore {
     }
 
     fn locality(&self) -> KeyringLocality {
-        keyring_locality(&self.dirs)
+        match &self.dirs {
+            Ok(d) => keyring_locality(d),
+            Err(reason) => KeyringLocality::Unknown {
+                reason: reason.clone(),
+            },
+        }
     }
 }

@@ -12,7 +12,10 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-pub use locality::{keyring_dirs, keyring_locality};
+pub use locality::{
+    DirsOs, Probe, keyring_dirs, keyring_dirs_for, keyring_locality, keyring_locality_with,
+    probe_fs,
+};
 pub use os::{MappedError, OsKeyStore, map_keyring_error};
 #[cfg(windows)]
 pub use windows::credential_persist;
@@ -85,6 +88,8 @@ pub trait KeyStore: Send + Sync {
     fn set(&self, e: &EntryName, v: &[u8]) -> Result<(), KeyStoreError>;
     /// Absent entry: `Ok(())`.
     fn delete(&self, e: &EntryName) -> Result<(), KeyStoreError>;
+    /// NOTE: the default is `Local` (no check), which is fail-open for a future impl that
+    /// forgets to override it. Every real store (`OsKeyStore`) overrides it.
     fn locality(&self) -> KeyringLocality {
         KeyringLocality::Local
     }
