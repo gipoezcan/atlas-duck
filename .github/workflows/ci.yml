@@ -95,6 +95,15 @@ jobs:
       - name: Clippy (-D warnings; unwrap_used/expect_used deny in core and atlassian)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: macOS spawn routine (§3.4)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          if grep -rnE 'Command::new|use std::process' crates/sandbox-host/src/macos; then
+            echo "::error::crates/sandbox-host/src/macos must posix_spawn itself, not use std::process::Command (§3.4)"
+            exit 1
+          fi
+
       - name: macOS seatbelt probes (§9.4, §15 V10), evidence for the go/no-go
         if: runner.os == 'macOS'
         run: |
