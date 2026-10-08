@@ -674,6 +674,57 @@ mod t21 {
     }
 
     #[test]
+    fn install_probes_workflow_cross_checks_the_manual_inputs_against_the_bundle_run() {
+        // A manual run names bundle_run_id and bundle_sha separately; every job checks the pair
+        // against the API before it checks out or downloads anything.
+        let text = workflow();
+        assert_eq!(
+            text.matches("- name: Cross-check bundle_run_id and bundle_sha").count(),
+            7,
+            "one cross-check per job"
+        );
+        for needle in [
+            "actions/runs/$BUNDLE_RUN_ID",
+            "BUNDLE_RUN_ID: ${{ inputs.bundle_run_id }}",
+            "BUNDLE_SHA: ${{ inputs.bundle_sha }}",
+            "GH_TOKEN: ${{ github.token }}",
+            "=~ ^[0-9]+$",
+            "=~ ^[0-9a-f]{40}$",
+            "\"$name\" != \"bundle\"",
+            "\"$conclusion\" != \"success\"",
+            "\"$head_sha\" != \"$BUNDLE_SHA\"",
+        ] {
+            assert_eq!(
+                text.matches(needle).count(),
+                7,
+                "{needle} must appear once per job"
+            );
+        }
+        // the inputs reach the shell through env only, and the check never runs for workflow_run
+        let run_blocks: String = text
+            .lines()
+            .filter(|l| l.contains("inputs.") && !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for line in run_blocks.lines() {
+            assert!(
+                line.contains("BUNDLE_RUN_ID: ${{")
+                    || line.contains("BUNDLE_SHA: ${{")
+                    || line.contains("ref: ${{")
+                    || line.contains("run-id: ${{")
+                    || line.contains("bundle_sha:")
+                    || line.contains("bundle_run_id:"),
+                "an input is interpolated outside env, ref or run-id: {line}"
+            );
+        }
+        assert_eq!(
+            text.matches("if: github.event_name == 'workflow_dispatch'\n        shell: bash")
+                .count(),
+            7
+        );
+    }
+
+    #[test]
     fn probe_scripts_poll_the_diag_log_for_the_sandbox_probe_line() {
         for name in [
             "install-probe-windows.ps1",
