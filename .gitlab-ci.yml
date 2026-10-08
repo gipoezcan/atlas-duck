@@ -17,7 +17,12 @@ variables:
   CARGO_INCREMENTAL: "0"
   # The shared runners OOM-kill (exit 137) a full-parallel Tauri build: cap rustc parallelism
   # and drop debuginfo to keep peak memory low.
-  CARGO_BUILD_JOBS: "2"
+  CARGO_BUILD_JOBS: "1"
+  # Kubernetes runners: ask for more memory (honoured only if the runner allows the overwrite),
+  # the default container limit OOM-killed both the Tauri build and the cache-restore helper.
+  KUBERNETES_MEMORY_REQUEST: "6Gi"
+  KUBERNETES_MEMORY_LIMIT: "8Gi"
+  KUBERNETES_HELPER_MEMORY_LIMIT: "2Gi"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
@@ -48,9 +53,6 @@ rust:test:
   script:
     - cargo clippy --workspace --all-targets --locked -- -D warnings
     - cargo test --workspace --locked
-  cache:
-    key: cargo-$CI_COMMIT_REF_SLUG
-    paths: [.cargo-home/registry, target]
 
 node:ci-checks:
   stage: check
@@ -66,9 +68,6 @@ node:ci-checks:
   script:
     - node ci/check-workspace.mjs
     - node --test "ci/*.test.mjs"
-  cache:
-    key: cargo-metadata-$CI_COMMIT_REF_SLUG
-    paths: [.cargo-home/registry]
 
 supply-chain:
   stage: supply-chain
