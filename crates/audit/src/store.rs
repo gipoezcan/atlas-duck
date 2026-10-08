@@ -704,8 +704,8 @@ impl Store {
         };
         match self.run_full_verify() {
             Err(e) => vec![incomplete(e)],
-            Ok(mut findings) => {
-                if let Err(e) = self.append_verify("full", &findings, None) {
+            Ok((mut findings, generation)) => {
+                if let Err(e) = self.append_full_verify(&findings, generation) {
                     findings.push(incomplete(e));
                 }
                 findings
@@ -720,8 +720,8 @@ impl Store {
     /// with `Err(KeyStore)` and no `VERIFY` (an unavailable keychain is never an incident,
     /// §8.8, but a run without the anchor checks is not a pass either).
     pub fn try_full_verify(&self) -> Result<VerifyOutcome, AuditError> {
-        let findings = self.run_full_verify()?;
-        let c = self.append_verify("full", &findings, None)?;
+        let (findings, generation) = self.run_full_verify()?;
+        let c = self.append_full_verify(&findings, generation)?;
         Ok(VerifyOutcome {
             findings,
             unanchored_tail: 0,
@@ -729,9 +729,26 @@ impl Store {
         })
     }
 
-    /// The findings of a full verification, without the `VERIFY` append.
-    fn run_full_verify(&self) -> Result<Vec<VerifyFinding>, AuditError> {
+    /// The `VERIFY {scope: "full"}` of a run over store file `generation`: refused (nothing
+    /// appended) if a restore replaced that file meanwhile, so its findings, about the old
+    /// file and the old anchors, never land in the restored chain.
+    fn append_full_verify(
+        &self,
+        findings: &[VerifyFinding],
+        generation: u64,
+    ) -> Result<Committed, AuditError> {
+        let mut p = self.verify_event("full", findings, None)?;
+        p.for_generation = Some(generation);
+        self.send_append(vec![p])?
+            .pop()
+            .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
+    }
+
+    /// The findings of a full verification, without the `VERIFY` append, and the store file
+    /// generation they are about (read before anything else).
+    fn run_full_verify(&self) -> Result<(Vec<VerifyFinding>, u64), AuditError> {
         self.sender()?;
+        let generation = self.inner.shared.generation.load(Ordering::SeqCst);
         // A keychain that does not answer ends the run (no "ok" without the anchor checks);
         // a newer layout byte in one entry (the startup gate admitted the current one) is a
         // finding, and the other entry is still checked.
@@ -771,7 +788,7 @@ impl Store {
             AnchorDirLines::note_setting_unreadable(&mut lines);
         }
         let kek = lock(&self.inner.shared.keys).kek.clone();
-        verify::full(&conn, &kek, &k, lines.as_ref())
+        Ok((verify::full(&conn, &kek, &k, lines.as_ref())?, generation))
     }
 
     /// Seqs of the integrity-incident `VERIFY` records without a later `INTEGRITY_ACK` (C.3),
@@ -1055,6 +1072,23 @@ impl Store {
     pub fn shutdown(&self) {
         self.inner.stop();
         *lock(&self.inner.shared.reader) = None;
+    }
+
+    /// `full_verify` in its two halves (feature `testing`): the run, returning its findings
+    /// and the store file generation they are about, then the `VERIFY` append for them.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_full_verify_run(&self) -> Result<(Vec<VerifyFinding>, u64), AuditError> {
+        self.run_full_verify()
+    }
+
+    /// The `VERIFY` half of `testing_full_verify_run` (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_full_verify_append(
+        &self,
+        findings: &[VerifyFinding],
+        generation: u64,
+    ) -> Result<Committed, AuditError> {
+        self.append_full_verify(findings, generation)
     }
 
     /// `enable_anchors` for integration tests (feature `testing`).

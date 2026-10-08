@@ -118,6 +118,10 @@ pub(crate) struct PreparedEvent {
     /// `INTEGRITY_ACK` only: the open incident it closes. The writer refuses the append when
     /// that incident is not open (checked on the writer thread, so two acks cannot race).
     pub(crate) ack_of: Option<u64>,
+    /// The store file the payload was computed from ([`Shared::generation`]): the writer
+    /// refuses the append once a restore replaced that file, so e.g. a full verification
+    /// that raced a restore never lands its `VERIFY` in the restored chain.
+    pub(crate) for_generation: Option<u64>,
     pub(crate) payload_len: u64,
     pub(crate) payload_sha256: [u8; 32],
     pub(crate) compressed: Zeroizing<Vec<u8>>,
@@ -186,6 +190,7 @@ impl PreparedEvent {
             flags: ev.flags & EventFlags::CALLER_SETTABLE,
             store_flags: EventFlags::default(),
             ack_of: None,
+            for_generation: None,
             payload_len,
             payload_sha256,
             compressed,
@@ -281,6 +286,8 @@ pub(crate) struct Shared {
     /// The cached read-only connection of `read_payload`; a restore closes it before the
     /// store file is replaced and holds the lock until the writer reopened.
     pub(crate) reader: Mutex<Option<Connection>>,
+    /// Counts the store files the writer served: a restore that replaced `audit.db` bumps it.
+    pub(crate) generation: AtomicU64,
 }
 
 /// The KEK and `K_q` (F.7, derived once per KEK). No `Debug`: both are keys.
@@ -304,6 +311,7 @@ impl Shared {
         Arc::new(Shared {
             keys: Mutex::new(StoreKeys::new(kek)),
             reader: Mutex::new(None),
+            generation: AtomicU64::new(0),
             head: Mutex::new(HeadView {
                 seq: 0,
                 hash: ZERO_HASH,
@@ -1051,6 +1059,9 @@ impl Writer {
         genesis_hash: Option<[u8; 32]>,
     ) -> Result<(), OpenError> {
         let shared = self.st.shared.clone();
+        shared
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         lock(&shared.dek_cache).clear();
         *lock(&shared.keys) = StoreKeys::new(&kek);
         shared
@@ -1115,6 +1126,19 @@ impl Writer {
             {
                 return Err(AuditError::Invalid("not an open integrity incident"));
             }
+        }
+        let generation = self
+            .st
+            .shared
+            .generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if evs
+            .iter()
+            .any(|p| p.for_generation.is_some_and(|g| g != generation))
+        {
+            return Err(AuditError::Invalid(
+                "the store was restored while this record was prepared",
+            ));
         }
         let effects: Vec<(bool, Option<u64>)> = evs
             .iter()

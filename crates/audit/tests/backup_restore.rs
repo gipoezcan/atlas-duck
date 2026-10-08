@@ -657,6 +657,24 @@ fn backup_restore_roundtrip() {
     assert_eq!(b.full_verify(), vec![]);
     b.flush_head_anchor().expect("flush");
     b.shutdown();
+    // The restored file is laid out as F.10 requires (prune's incremental vacuum needs it).
+    {
+        let c = ro(&fb.db_path());
+        let pragma = |name: &str| -> String {
+            c.query_row(&format!("PRAGMA {name}"), [], |r| {
+                r.get::<_, rusqlite::types::Value>(0)
+            })
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                other => format!("{other:?}"),
+            })
+            .expect("pragma")
+        };
+        assert_eq!(pragma("journal_mode"), "wal");
+        assert_eq!(pragma("page_size"), "8192");
+        assert_eq!(pragma("auto_vacuum"), "2", "incremental");
+    }
     let (b, v) = ready(open(&fb.data, &fb.lock, fb.config()).expect("open"));
     assert_eq!(v.findings, vec![]);
     assert_eq!(b.head().2, rep.new_chain_id);
@@ -1686,4 +1704,34 @@ fn superseded_chain_lines_are_accounted_for_by_records_lost() {
         kinds(&s.full_verify()).contains(&FindingKind::AnchorDirMismatch),
         "a line past the prior anchor is not accounted for"
     );
+}
+
+#[test]
+fn full_verify_that_raced_a_restore_appends_nothing() {
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, fb) = machine_b(5, &faults);
+    // The run reads the old store; the restore replaces it before the VERIFY is appended.
+    let (findings, generation) = b.testing_full_verify_run().expect("run");
+    assert_eq!(findings, vec![]);
+    let rep = b
+        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .expect("restore");
+    let head = b.head();
+    match b.testing_full_verify_append(&findings, generation) {
+        Err(AuditError::Invalid(_)) => {}
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(b.head(), head, "nothing appended to the restored chain");
+    assert!(
+        dump_rows(&fb)
+            .iter()
+            .all(|r| r.seq <= rep.restore_seq || r.event_type != "VERIFY")
+    );
+    // A run over the restored store appends as usual.
+    let (findings, generation) = b.testing_full_verify_run().expect("run");
+    b.testing_full_verify_append(&findings, generation)
+        .expect("append");
 }
