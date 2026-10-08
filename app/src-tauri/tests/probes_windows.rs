@@ -417,7 +417,7 @@ fn blocked_for_a_real_reason(evidence: Evidence) -> bool {
         Evidence::StackUnavailable {
             os_error,
             control_ok: true,
-        } => [WSASYSCALLFAILURE, 10106, RPC_S_INVALID_BINDING, 1722].contains(&os_error),
+        } => [WSASYSCALLFAILURE, RPC_S_INVALID_BINDING].contains(&os_error),
         _ => false,
     }
 }

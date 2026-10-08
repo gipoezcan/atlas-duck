@@ -50,6 +50,10 @@ struct Behaviour {
     control_cred: i64,
     /// The unconfined worker connects to the listener.
     control_connects: bool,
+    /// The control worker cannot start from the second control run on (the
+    /// post-run control).
+    control_fails_after: bool,
+    control_cred_after: i64,
 }
 
 impl Behaviour {
@@ -61,6 +65,8 @@ impl Behaviour {
             control_available: true,
             control_cred: 1168,
             control_connects: true,
+            control_fails_after: false,
+            control_cred_after: 1168,
         }
     }
 
@@ -74,7 +80,7 @@ impl Behaviour {
     }
 }
 
-struct Fake(Behaviour);
+struct Fake(Behaviour, std::sync::atomic::AtomicUsize);
 
 impl WorkerSpawner for Fake {
     fn spawn(&self, _spec: &SpawnSpec) -> io::Result<Box<dyn WorkerProcess>> {
@@ -82,8 +88,13 @@ impl WorkerSpawner for Fake {
     }
 
     fn spawn_control(&self, _spec: &SpawnSpec) -> io::Result<Box<dyn WorkerProcess>> {
-        if self.0.control_available {
-            Ok(Box::new(Proc::new(Role::Control, self.0)))
+        let n = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut b = self.0;
+        if n > 0 {
+            b.control_cred = b.control_cred_after;
+        }
+        if self.0.control_available && !(n > 0 && self.0.control_fails_after) {
+            Ok(Box::new(Proc::new(Role::Control, b)))
         } else {
             Err(io::Error::from(io::ErrorKind::Unsupported))
         }
@@ -243,7 +254,7 @@ fn run(b: Behaviour) -> ProbeReport {
     let mut cfg = ProbeConfig::new(worker, 4242, PathBuf::from("profile"));
     cfg.windows_controls = true;
     cfg.per_probe_timeout = Duration::from_secs(5);
-    run_probes(&Fake(b), None, &cfg)
+    run_probes(&Fake(b, Default::default()), None, &cfg)
 }
 
 /// Probes of the fixed list that exist on this OS's floor (`CredRead` is
@@ -389,7 +400,7 @@ fn without_windows_controls_the_workers_own_scoring_stands() {
     std::fs::write(&worker, b"fake worker").expect("write");
     let mut cfg = ProbeConfig::new(worker, 4242, PathBuf::from("profile"));
     cfg.windows_controls = false;
-    let report = run_probes(&Fake(Behaviour::lpac()), None, &cfg);
+    let report = run_probes(&Fake(Behaviour::lpac(), Default::default()), None, &cfg);
     assert!(report.control.is_none());
     assert_eq!(
         rec(&report, ProbeId::ConnectLoopback).0,
@@ -399,4 +410,55 @@ fn without_windows_controls_the_workers_own_scoring_stands() {
         rec(&report, ProbeId::ConnectLoopback).1,
         Evidence::Reported { .. }
     ));
+}
+
+#[test]
+fn a_control_that_fails_after_the_probes_fails_the_verdict() {
+    // The control held at the start but not after the confined probes: the
+    // Blocked scores that depended on it become Error.
+    let report = run(Behaviour {
+        control_fails_after: true,
+        ..Behaviour::plain()
+    });
+    let control = report.control.expect("control ran");
+    assert!(!control.winsock && !control.ok(), "{control:?}");
+    let (outcome, evidence) = rec(&report, ProbeId::ConnectLoopback);
+    assert_eq!(outcome, ProbeOutcome::Error);
+    assert!(matches!(
+        evidence,
+        Evidence::ListenerArrival {
+            arrived: false,
+            control_ok: false,
+            ..
+        }
+    ));
+    assert_ne!(
+        report.floor,
+        atlas_duck_sandbox_host::probe::FloorVerdict::Met
+    );
+
+    let report = run(Behaviour {
+        control_fails_after: true,
+        ..Behaviour::lpac()
+    });
+    for (probe, _) in on_this_floor(&[
+        (ProbeId::ConnectLoopback, 0),
+        (ProbeId::ConnectPublic, 0),
+        (ProbeId::CredRead, 0),
+    ]) {
+        assert_eq!(rec(&report, probe).0, ProbeOutcome::Error, "{probe:?}");
+    }
+
+    // only the credential fact drifts: the network probes keep their Blocked
+    let report = run(Behaviour {
+        control_cred_after: 1234,
+        ..Behaviour::lpac()
+    });
+    assert_eq!(
+        rec(&report, ProbeId::ConnectPublic).0,
+        ProbeOutcome::Blocked
+    );
+    if cfg!(windows) {
+        assert_eq!(rec(&report, ProbeId::CredRead).0, ProbeOutcome::Error);
+    }
 }

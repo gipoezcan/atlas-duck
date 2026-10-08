@@ -277,10 +277,24 @@ pub fn run_probes(
                     listener: listener.as_ref(),
                 }
             });
-            order
+            let mut runs: Vec<ProbeRun> = order
                 .iter()
                 .map(|&probe| run_one(spawner, hook, cfg, profile_path, probe, scoring.as_ref()))
-                .collect()
+                .collect();
+            // The control must hold again after the confined probes: a control
+            // that held only at the start proves nothing about the probes that
+            // ran later (a firewall rule, a service restart, ...). Each fact
+            // is the AND of both runs; probes scored on a fact that failed the
+            // second time become `Error`.
+            if let Some(before) = control {
+                let after = run_control(spawner, cfg, profile_path, listener.as_ref());
+                let both = before.and(&after);
+                control = Some(both);
+                for run in &mut runs {
+                    invalidate_uncontrolled(&mut run.record, &both);
+                }
+            }
+            runs
         }
     };
 
@@ -349,6 +363,28 @@ pub fn run_probes_with_fallback(
         second
     } else {
         first
+    }
+}
+
+/// Turns a control-scored `Blocked` into `Error` when its fact is not (or no
+/// longer) controlled. Records scored from the worker's own report are untouched.
+fn invalidate_uncontrolled(record: &mut ProbeRecord, control: &WindowsControl) {
+    let controlled = match record.evidence {
+        Evidence::ListenerArrival { .. } => control.net_ok(),
+        Evidence::StackUnavailable { .. } if record.probe == ProbeId::CredRead => control.cred,
+        Evidence::StackUnavailable { .. } => control.net_ok(),
+        _ => return,
+    };
+    if controlled {
+        return;
+    }
+    if record.outcome == ProbeOutcome::Blocked {
+        record.outcome = ProbeOutcome::Error;
+    }
+    match &mut record.evidence {
+        Evidence::ListenerArrival { control_ok, .. }
+        | Evidence::StackUnavailable { control_ok, .. } => *control_ok = false,
+        _ => {}
     }
 }
 

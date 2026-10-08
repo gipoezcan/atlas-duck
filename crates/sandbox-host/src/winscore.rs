@@ -30,22 +30,21 @@ use serde::Serialize;
 use crate::probe::Evidence;
 
 /// `WSASYSCALLFAILURE`: `WSAStartup` under LPAC on Windows 11 (measured on the
-/// dev box, build 26200).
+/// dev box, build 26200, and on windows-2022).
 pub const WSASYSCALLFAILURE: i64 = 10107;
-/// `WSAEPROVIDERFAILEDINIT`: a Winsock provider failed to initialise. Not
-/// measured here; it is the other documented way a restricted token cannot
-/// bring the stack up.
-pub const WSAEPROVIDERFAILEDINIT: i64 = 10106;
 /// `WSAStartup` failure codes that mean "this process has no network stack".
-pub const LPAC_STACK_CODES: [i64; 2] = [WSASYSCALLFAILURE, WSAEPROVIDERFAILEDINIT];
+/// Only codes measured on a real machine are accepted.
+pub const LPAC_STACK_CODES: [i64; 1] = [WSASYSCALLFAILURE];
 
 /// `RPC_S_INVALID_BINDING`: `CredReadW` under LPAC on Windows 11 (measured).
 pub const RPC_S_INVALID_BINDING: i64 = 1702;
-/// `RPC_S_SERVER_UNAVAILABLE`: the same "credential service unreachable" fact
-/// with another spelling. Not measured here.
-pub const RPC_S_SERVER_UNAVAILABLE: i64 = 1722;
 /// `CredReadW` failure codes that mean "the credential service is unreachable".
-pub const LPAC_CRED_CODES: [i64; 2] = [RPC_S_INVALID_BINDING, RPC_S_SERVER_UNAVAILABLE];
+/// Only codes measured on a real machine are accepted.
+pub const LPAC_CRED_CODES: [i64; 1] = [RPC_S_INVALID_BINDING];
+
+/// `WSAETIMEDOUT`: the only error code a dropped (never answered) connect may
+/// carry. Any other Winsock error means the network stack answered.
+pub const WSAETIMEDOUT: i64 = 10060;
 
 /// `ERROR_NOT_FOUND`: what an unconfined `CredReadW` of the probe's
 /// nonexistent target returns.
@@ -71,6 +70,15 @@ impl WindowsControl {
         winsock: false,
         cred: false,
     };
+
+    /// Each fact holds only if it held in both.
+    pub fn and(&self, other: &WindowsControl) -> WindowsControl {
+        WindowsControl {
+            listener: self.listener && other.listener,
+            winsock: self.winsock && other.winsock,
+            cred: self.cred && other.cred,
+        }
+    }
 
     /// The network facts are controlled.
     pub fn net_ok(&self) -> bool {
@@ -147,7 +155,12 @@ pub fn rescore(
             // explicit denial (`Blocked`) and a success (`Allowed`, "connected")
             // keep the worker's own scoring; an `Error` (invalid address,
             // unknown code) stays an `Error`.
-            if msg.outcome == ProbeOutcome::Allowed && detail == DETAIL_CONNECT_REACHED {
+            // Only a drop (no code, or WSAETIMEDOUT) is "nothing answered"; a
+            // refusal (10061), reset (10054), abort (10053), unreachable
+            // (10051/10065) or in-progress code means the stack answered, which
+            // is not a block.
+            let dropped = code.is_none() || code == Some(WSAETIMEDOUT);
+            if msg.outcome == ProbeOutcome::Allowed && detail == DETAIL_CONNECT_REACHED && dropped {
                 Some((
                     controlled(control.net_ok()),
                     Evidence::ListenerArrival {
@@ -515,6 +528,37 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_stack_answer_is_not_a_drop_even_without_arrival() {
+        for code in [10061, 10054, 10053, 10051, 10065, 10035, 10036] {
+            let m = msg(
+                ProbeId::ConnectLoopback,
+                ProbeOutcome::Allowed,
+                Some(code),
+                DETAIL_CONNECT_REACHED,
+            );
+            assert!(
+                rescore(
+                    ProbeId::ConnectLoopback,
+                    &m,
+                    &ctx(false, Some(GOOD), Some(false))
+                )
+                .is_none(),
+                "{code} must keep the worker's Allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn only_measured_codes_are_accepted() {
+        assert_eq!(LPAC_STACK_CODES, [10107]);
+        assert_eq!(LPAC_CRED_CODES, [1702]);
+        let m = wsa(ProbeId::ConnectPublic, 10106);
+        assert!(rescore(ProbeId::ConnectPublic, &m, &ctx(true, Some(GOOD), None)).is_none());
+        let c = msg(ProbeId::CredRead, ProbeOutcome::Error, Some(1722), "x");
+        assert!(rescore(ProbeId::CredRead, &c, &ctx(true, Some(GOOD), None)).is_none());
     }
 
     #[test]
