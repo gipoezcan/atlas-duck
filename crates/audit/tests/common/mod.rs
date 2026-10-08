@@ -6,8 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use atlas_duck_audit::anchors::HeadAnchor;
 use atlas_duck_audit::clock::{Clock, UtcInstant, parse_epoch};
 use atlas_duck_audit::encoding::{FIELD_LIST, RowFields, ZERO_HASH};
+use atlas_duck_audit::keystore::{EntryName, KeyStore};
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::request_set::{RequestRecord, request_set_hash, requests_to_json};
 use atlas_duck_audit::schema::DB_FILE;
@@ -430,6 +432,91 @@ pub fn key_rows(f: &Fixture) -> Vec<(u64, Option<String>, String)> {
     .expect("query")
     .map(|r| r.expect("row"))
     .collect()
+}
+
+// ---------------------------------------------------------------------------------------
+// Tampering (what an attacker without the KEK can do)
+
+pub fn set_keychain_head(f: &Fixture, a: &HeadAnchor) {
+    f.keys()
+        .set(&EntryName::HeadAnchor, &a.to_entry().expect("encode"))
+        .expect("set head anchor");
+}
+
+/// Rewrites every column of `r.seq`, `record_hash` included (binds TEXT vs BLOB as the
+/// writer does).
+pub fn write_row(c: &Connection, r: &RawRow) {
+    let sets: Vec<String> = FIELD_LIST
+        .iter()
+        .chain(std::iter::once(&"record_hash"))
+        .enumerate()
+        .skip(1)
+        .map(|(i, col)| format!("{col} = ?{}", i + 1))
+        .collect();
+    let sql = format!("UPDATE events SET {} WHERE seq = ?1", sets.join(", "));
+    let n = c
+        .execute(&sql, rusqlite::params_from_iter(row_params(r)))
+        .expect("update row");
+    assert_eq!(n, 1, "row {} exists", r.seq);
+}
+
+pub fn row_params(r: &RawRow) -> Vec<Box<dyn rusqlite::ToSql + '_>> {
+    vec![
+        Box::new(r.seq as i64),
+        Box::new(r.format_version as i64),
+        Box::new(r.chain_id.as_str()),
+        Box::new(r.ts_utc.as_str()),
+        Box::new(r.epoch.as_deref()),
+        Box::new(r.request_id.as_deref()),
+        Box::new(r.event_type.as_str()),
+        Box::new(r.op_id.as_deref()),
+        Box::new(r.op_class.as_deref()),
+        Box::new(r.instance_id.as_deref()),
+        Box::new(r.target.as_deref()),
+        Box::new(r.agent_name.as_deref()),
+        Box::new(r.agent_name_source.as_deref()),
+        Box::new(r.client_kind.as_deref()),
+        Box::new(r.connection_id.as_deref()),
+        Box::new(r.peer_pid.map(|p| p as i64)),
+        Box::new(r.peer_exe.as_deref()),
+        Box::new(r.peer_origin_exe.as_deref()),
+        Box::new(r.os_user.as_deref()),
+        Box::new(r.atlassian_user.as_deref()),
+        Box::new(r.atlassian_user_key.as_deref()),
+        Box::new(r.decision.as_deref()),
+        Box::new(r.flags as i64),
+        Box::new(r.payload_len as i64),
+        Box::new(&r.payload_sha256[..]),
+        Box::new(r.key_id as i64),
+        Box::new(&r.nonce[..]),
+        Box::new(r.payload_ct.as_slice()),
+        Box::new(&r.prev_hash[..]),
+        Box::new(&r.record_hash[..]),
+    ]
+}
+
+/// What an attacker without the KEK can do: recompute every `prev_hash`/`record_hash` from
+/// `from` to the head with the T02 functions. Returns the new head anchor.
+pub fn rehash_from(f: &Fixture, from: u64) -> HeadAnchor {
+    let c = raw_conn(f);
+    let rows = dump_conn(&c);
+    let mut prev: Option<[u8; 32]> = None;
+    for mut r in rows {
+        if r.seq >= from {
+            if let Some(p) = prev {
+                r.prev_hash = p;
+            }
+            r.record_hash = r.recompute();
+            write_row(&c, &r);
+        }
+        prev = Some(r.record_hash);
+    }
+    let last = dump_conn(&c).pop().expect("rows");
+    HeadAnchor {
+        chain_id: last.chain_id,
+        seq: last.seq,
+        record_hash: last.record_hash,
+    }
 }
 
 // ---------------------------------------------------------------------------------------

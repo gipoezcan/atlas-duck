@@ -15,6 +15,7 @@ use rusqlite::{Connection, OptionalExtension};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
+use crate::anchor_dir::{self, AnchorDirLines};
 use crate::anchors::{self, AnchorLoadError, FirstRetainedAnchor, HeadAnchor};
 use crate::crypto::{self, Kek, KekEntryError, fill_random};
 use crate::encoding::ZERO_HASH;
@@ -23,6 +24,7 @@ use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, canar
 use crate::lock::InstanceLock;
 use crate::recovery::{check_new_passphrase, new_recovery_blob};
 use crate::schema::{self, StoreVersions};
+use crate::settings;
 use crate::store::{AnchorInit, OpenConfig, Store};
 use crate::verify::{self, StartupInputs, StartupVerdict, VerifyOutcome};
 use crate::writer::{Writer, WriterParts};
@@ -480,14 +482,20 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
     if !kek_opens_store(&ro, &kek)? {
         return lost(&ro);
     }
-    // 3. Anchors, head first, then the verification of the pre-migration store (§8.7). The
-    // anchor-dir lines (`cfg.anchor_dir`) join the inputs with T14.
+    // 3. Anchors, head first, then the anchor-dir lines (the dir the store's setting names,
+    // else `cfg.anchor_dir`), then the verification of the pre-migration store (§8.7).
     let (head_anchor, first_retained) = match anchors::load_anchors(&*cfg.keys) {
         Ok(a) => a,
         Err(AnchorLoadError::Newer(n)) => return newer(format!("keychain anchor layout {n}")),
         Err(AnchorLoadError::KeyStore(e)) => return locked(keyring_reason(&e)),
     };
     let store_install_id = verify::store_install_id(&ro).map_err(sql)?;
+    let (view, view_trusted) = settings::load_view(&ro, &kek)?;
+    let dir = anchor_dir::resolve(view.anchor_dir.as_deref(), cfg.anchor_dir.as_deref());
+    let mut anchor_lines = anchor_dir::load(dir.as_deref(), &ro)?;
+    if !view_trusted {
+        AnchorDirLines::note_setting_unreadable(&mut anchor_lines);
+    }
     let genesis_hash = first_retained.as_ref().map(|f| f.genesis_hash);
     let verdict = verify::startup(&StartupInputs {
         conn: &ro,
@@ -496,6 +504,7 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
         first_retained,
         store_install_id,
         pinned_install_id: cfg.pinned_install_id.clone(),
+        anchor_lines,
     })?;
     Ok(Preflight::Verified {
         kek,

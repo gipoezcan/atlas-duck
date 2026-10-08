@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::admission::{self, DEFAULT_MIN_FREE_BYTES, FreeSpaceProbe, OsFreeSpace};
+use crate::anchor_dir::{self, AnchorDirLines};
 use crate::anchors::{
     self, AnchorLoadError, Barrier, BarrierGuard, BarrierKind, FirstRetainedAnchor, HeadAnchor,
 };
@@ -183,6 +184,9 @@ struct Inner {
     clock: Arc<dyn Clock>,
     db_path: PathBuf,
     data_dir: PathBuf,
+    /// `OpenConfig.anchor_dir`: verification reads it only while the store's own
+    /// `anchor_dir` setting names none.
+    anchor_dir: Option<PathBuf>,
     min_free_bytes: u64,
     free_space: Arc<dyn FreeSpaceProbe>,
     reader: Mutex<Option<Connection>>,
@@ -336,6 +340,7 @@ impl Store {
                 clock: cfg.clock,
                 db_path: schema::db_path(data),
                 data_dir: data.path().to_path_buf(),
+                anchor_dir: cfg.anchor_dir,
                 min_free_bytes: cfg.min_free_bytes,
                 free_space: cfg.free_space.unwrap_or_else(|| Arc::new(OsFreeSpace)),
                 reader: Mutex::new(None),
@@ -666,8 +671,10 @@ impl Store {
 
     /// Full verification (C.3, §8.7): the whole chain, `prune_log`, a decrypt pass, every
     /// `WRITE_APPROVED`'s `request_set_hash`, DEK references, every retained `PRUNE` judged by
-    /// its own settings snapshot, `RESTORE` boundaries and the keychain anchors; then one
+    /// its own settings snapshot, `RESTORE` boundaries, the keychain anchors and the anchor
+    /// dir (the store's `anchor_dir` setting, else `OpenConfig.anchor_dir`); then one
     /// `VERIFY {scope: "full"}` (`result: "ok"` and no `integrity_incident` flag when clean).
+    /// An anchor dir that cannot be read is an `AnchorDirMismatch`, never a clean pass.
     ///
     /// A run that cannot complete is never reported as a pass, and appends no `VERIFY`
     /// claiming one. This `Vec` API (C.3) has no error channel, so non-completion is reported
@@ -737,7 +744,22 @@ impl Store {
         };
         let conn =
             schema::open_ro(&self.inner.db_path).map_err(|e| AuditError::Io(e.to_string()))?;
-        verify::full(&conn, &self.inner.kek, &k)
+        // The anchor-dir lines, like the keychain anchors, before the snapshot is taken.
+        let dir = anchor_dir::resolve(
+            self.settings().anchor_dir.as_deref(),
+            self.inner.anchor_dir.as_deref(),
+        );
+        let mut lines =
+            anchor_dir::load(dir.as_deref(), &conn).map_err(|e| AuditError::Io(e.to_string()))?;
+        if self
+            .inner
+            .shared
+            .settings_unreadable
+            .load(Ordering::Relaxed)
+        {
+            AnchorDirLines::note_setting_unreadable(&mut lines);
+        }
+        verify::full(&conn, &self.inner.kek, &k, lines.as_ref())
     }
 
     /// Seqs of the integrity-incident `VERIFY` records without a later `INTEGRITY_ACK` (C.3),

@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::anchor_dir::{self, AnchorDirLines, VerifyCtx};
 use crate::anchors::{FirstRetainedAnchor, HeadAnchor};
 use crate::clock::parse_epoch;
 use crate::crypto::{self, Dek, Kek, ct_eq};
@@ -104,9 +105,9 @@ impl FindingKind {
     }
 }
 
-/// Findings about the chain itself; an interrupted prune or restore is reconciled only when
-/// none of them was found.
-const CHAIN_KINDS: [FindingKind; 11] = [
+/// Findings about the chain itself or against the anchor dir; an interrupted prune or restore
+/// is reconciled only when none of them was found.
+const CHAIN_KINDS: [FindingKind; 13] = [
     FindingKind::ChainBroken,
     FindingKind::SeqGap,
     FindingKind::UnknownFlagBits,
@@ -118,6 +119,8 @@ const CHAIN_KINDS: [FindingKind; 11] = [
     FindingKind::DecryptFailed,
     FindingKind::PayloadHashMismatch,
     FindingKind::RestoreBoundaryMismatch,
+    FindingKind::AnchorDirMismatch,
+    FindingKind::AnchoredRecordPrunedEarly,
 ];
 
 /// One finding (F.11 `findings[]`). The hashes are chain hashes (not secret).
@@ -143,13 +146,13 @@ impl VerifyFinding {
         }
     }
 
-    fn expected(mut self, seq: Option<u64>, hash: Option<[u8; 32]>) -> VerifyFinding {
+    pub(crate) fn expected(mut self, seq: Option<u64>, hash: Option<[u8; 32]>) -> VerifyFinding {
         self.expected_seq = seq;
         self.expected_hash = hash;
         self
     }
 
-    fn observed(mut self, seq: Option<u64>, hash: Option<[u8; 32]>) -> VerifyFinding {
+    pub(crate) fn observed(mut self, seq: Option<u64>, hash: Option<[u8; 32]>) -> VerifyFinding {
         self.observed_seq = seq;
         self.observed_hash = hash;
         self
@@ -238,7 +241,7 @@ impl StartupVerdict {
     }
 }
 
-/// What startup verification is given (§8.7 step 3). The anchor-dir lines join in T14.
+/// What startup verification is given (§8.7 step 3).
 pub(crate) struct StartupInputs<'a> {
     pub(crate) conn: &'a Connection,
     pub(crate) kek: &'a Kek,
@@ -246,6 +249,8 @@ pub(crate) struct StartupInputs<'a> {
     pub(crate) first_retained: Option<FirstRetainedAnchor>,
     pub(crate) store_install_id: Option<String>,
     pub(crate) pinned_install_id: Option<String>,
+    /// The anchor dir as read (`None`: none configured).
+    pub(crate) anchor_lines: Option<AnchorDirLines>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -344,7 +349,7 @@ fn text_of(v: ValueRef<'_>) -> Option<String> {
 }
 
 /// Lowercase hex of exactly 32 bytes.
-fn hex32(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn hex32(s: &str) -> Option<[u8; 32]> {
     if s.bytes().any(|c| c.is_ascii_uppercase()) {
         return None;
     }
@@ -721,12 +726,12 @@ fn walk(
 // ---------------------------------------------------------------------------------------
 // prune_log (§8.5, F.9)
 
-struct PruneLogRow {
-    prune_seq: u64,
-    range_start: u64,
-    cutoff_epoch: String,
-    last_pruned: [u8; 32],
-    first_retained_seq: u64,
+pub(crate) struct PruneLogRow {
+    pub(crate) prune_seq: u64,
+    pub(crate) range_start: u64,
+    pub(crate) cutoff_epoch: String,
+    pub(crate) last_pruned: [u8; 32],
+    pub(crate) first_retained_seq: u64,
     prev_row_hash: [u8; 32],
     row_hash: [u8; 32],
 }
@@ -1377,6 +1382,29 @@ fn check_anchors(
     Ok(res)
 }
 
+/// The anchor-dir checks (§8.7) against the latest `prune_log` row, through the per-kind cap.
+fn check_anchor_dir(
+    conn: &Connection,
+    lines: Option<&AnchorDirLines>,
+    log: &[PruneLogRow],
+    head: Option<u64>,
+    out: &mut Findings,
+) -> rusqlite::Result<()> {
+    let Some(lines) = lines else {
+        return Ok(());
+    };
+    let ctx = VerifyCtx {
+        conn,
+        first_retained_seq: latest_values(log).0,
+        head,
+        prune_log: log,
+    };
+    for f in anchor_dir::check(lines, &ctx)? {
+        out.push(f);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------
 // Startup (§8.7 step 3)
 
@@ -1437,6 +1465,8 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
             format!("the store's install_id {store_id} is not the pinned install_id {pinned}"),
         ));
     }
+    // The anchor dir, when configured; its findings block the reconciliations below.
+    check_anchor_dir(conn, inp.anchor_lines.as_ref(), &log, head, &mut out)?;
     // 8.–9. Anchor rule, interrupted prune and restore.
     let head_row = match head {
         Some(h) => row_head(conn, h)?,
@@ -1527,18 +1557,22 @@ fn judge_prune(out: &mut Findings, seq: u64, epoch: NaiveDate, payload: &Value) 
 /// Full verification on a read-only connection: one read transaction, so a concurrent
 /// writer is not seen half-way. The caller read the keychain anchors (head first, then
 /// first-retained) before calling, so they never name a record newer than this snapshot.
+/// The anchor-dir lines were likewise read before the snapshot, so none names a record the
+/// snapshot lacks (M10 writes a line only after its record committed).
 pub(crate) fn full(
     conn: &Connection,
     kek: &Kek,
     anchors: &KeychainAnchors,
+    anchor_lines: Option<&AnchorDirLines>,
 ) -> Result<Vec<VerifyFinding>, AuditError> {
-    run_full(conn, kek, anchors).map_err(|e| AuditError::Io(e.to_string()))
+    run_full(conn, kek, anchors, anchor_lines).map_err(|e| AuditError::Io(e.to_string()))
 }
 
 fn run_full(
     conn: &Connection,
     kek: &Kek,
     k: &KeychainAnchors,
+    anchor_lines: Option<&AnchorDirLines>,
 ) -> rusqlite::Result<Vec<VerifyFinding>> {
     let tx = conn.unchecked_transaction()?;
     let conn: &Connection = &tx;
@@ -1668,6 +1702,7 @@ fn run_full(
             );
         }
     }
+    check_anchor_dir(conn, anchor_lines, &log, head, &mut out)?;
     let head_row = match head {
         Some(h) => row_head(conn, h)?,
         None => None,
@@ -1691,7 +1726,6 @@ fn run_full(
         },
         &mut out,
     )?;
-    // Anchor-dir checks (AnchorDirMismatch, AnchoredRecordPrunedEarly) join in T14.
     drop(tx);
     Ok(out.finish())
 }
