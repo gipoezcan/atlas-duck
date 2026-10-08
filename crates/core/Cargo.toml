@@ -14,8 +14,22 @@ atlas-duck-audit = { path = "../audit" }
 atlas-duck-ipc = { path = "../ipc" }
 toml_edit = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { workspace = true }
+system-configuration-sys = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Registry"] }
+
+[features]
+# `HttpFactory::with_timeouts` for tests that need short budgets.
+testing = []
+
 [dev-dependencies]
+atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 # §7.7 / §13: unwrap_used and expect_used are errors in core and atlassian.
 [lints.clippy]

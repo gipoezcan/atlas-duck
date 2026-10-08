@@ -6,3 +6,8 @@
 
 /// `config.toml` loading, saving and cross-version rules (§7.7, §8.13).
 pub mod config;
+
+/// Per-instance HTTP client construction (§7.2, V17).
+pub mod http_factory;
+/// Proxy resolution (L42) and the per-OS static proxy readers (V17).
+pub mod proxy;

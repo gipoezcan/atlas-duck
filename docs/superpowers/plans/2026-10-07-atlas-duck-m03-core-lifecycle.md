@@ -1282,6 +1282,8 @@ pub fn bypass_matches(host: &str, entry: &str) -> bool {
 - [ ] **Step 2: Implement; run** `cargo test -p atlas-duck-core --locked --test proxy --test proxy_os` (core dev-depends on `atlas-duck-atlassian` with `testing`) → pass on the local OS; CI runs the other two.
 - [ ] **Step 3: Commit** `feat(core): proxy resolution per L42 with per-OS static proxy readers; HttpFactory` (+ trailer).
 
+**As built (Task 11):** the per-OS readers are split into a pure part and a machine part so every parser is tested on every OS without touching the machine: `os_windows::{RegistryReader, read_with, parse_proxy_server, parse_proxy_override}` (real `WinInetRegistry` reads `REG_SZ` only, never expands environment strings), `os_linux::{Gsettings, read_with, parse_gvariant_strings, parse_kioslaverc}` (real `GsettingsBinary` runs a fixed absolute path with a cleared environment), `os_macos::{MacSettings, from_settings}` (CoreFoundation extraction is macOS-only and compiled only in CI). `SystemProxySource::with_reader` injects a reader; tests (including `i20_env_proxy_never_used`) never call the real readers, so the V17 "reader succeeds on this machine" assertions are replaced by fake-registry/fake-gsettings runs. WinHTTP's machine setting is not read (documented in `os_windows.rs`). `ProxySetting::parse` is case-insensitive for `direct`, accepts `[v6]:port`, and rejects scheme, path and whitespace. `HttpFactory::with_timeouts` exists under core's `testing` feature.
+
 ---
 
 ### Task 12: Pure state machine model with transition table, agent-visible status, invariants (U-01)
