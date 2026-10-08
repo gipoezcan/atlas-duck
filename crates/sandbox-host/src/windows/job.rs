@@ -67,7 +67,9 @@ impl Job {
         // SAFETY: no security attributes, no name.
         let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if h.is_null() {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            eprintln!("CreateJobObjectW failed: {err}");
+            return Err(err);
         }
         // SAFETY: `h` is a fresh, owned job handle.
         let job = Self(unsafe { OwnedHandle::from_raw_handle(h as RawHandle) });
@@ -90,7 +92,9 @@ impl Job {
             )
         };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            eprintln!("SetInformationJobObject(extended limits) failed: {err}");
+            return Err(err);
         }
 
         let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
@@ -106,7 +110,9 @@ impl Job {
             )
         };
         if ok == 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            eprintln!("SetInformationJobObject(UI restrictions) failed: {err}");
+            return Err(err);
         }
         Ok(job)
     }

@@ -48,6 +48,16 @@ use crate::spawn::{ExitKind, SpawnSpec, WorkerProcess, WorkerSpawner};
 const WORKER_CREATION_FLAGS: u32 =
     EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS;
 
+/// Names the spawn stage that failed on stderr and passes the error on
+/// unchanged (the raw OS code is what the probes report). The first CI run
+/// (windows-2022) failed every spawn with a bare 87.
+fn stage(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
+    move |e| {
+        eprintln!("spawn stage `{name}` failed: {e}");
+        e
+    }
+}
+
 /// Held from the moment the worker's three pipe ends are made inheritable
 /// until they are closed again, so that two worker spawns of ours cannot hand
 /// each other's pipe ends to a worker. Every handle is created non-inheritable
@@ -88,13 +98,13 @@ impl WindowsSpawner {
                 "process_mb must be greater than 0",
             ));
         }
-        let exe = std::path::absolute(&spec.exe)?;
+        let exe = std::path::absolute(&spec.exe).map_err(stage("absolute exe"))?;
 
         // 1. ACEs: a plain AppContainer needs S-1-15-2-1 on every file; LPAC
         //    additionally S-1-15-2-2. Without them the worker would not load,
         //    so fail here instead of falling back to anything weaker.
-        let files = worker_ace_files_for_exe(&exe)?;
-        let lpac = match check_aces(&files)? {
+        let files = worker_ace_files_for_exe(&exe).map_err(stage("worker_ace_files_for_exe"))?;
+        let lpac = match check_aces(&files).map_err(stage("check_aces"))? {
             AceStatus::AllPresent { lpac_ready } => lpac_ready,
             AceStatus::Missing(_) => {
                 return Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
@@ -102,19 +112,22 @@ impl WindowsSpawner {
         };
 
         // 2. job, run directory
-        let job = Job::create(JobLimits::from_process_mb(spec.process_mb))?;
-        let run_dir = RunDir::create(self.container.run_root())?;
+        let job = Job::create(JobLimits::from_process_mb(spec.process_mb))
+            .map_err(stage("Job::create"))?;
+        let run_dir = RunDir::create(self.container.run_root()).map_err(stage("RunDir::create"))?;
 
         // 3. pipes, attribute list, environment, command line
         let _guard = SPAWN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let (host, child) = create_stdio_pipes()?;
+        let (host, child) = create_stdio_pipes().map_err(stage("create_stdio_pipes"))?;
         let handles: [HANDLE; 3] = [
             child.stdin.as_raw_handle().cast(),
             child.stdout.as_raw_handle().cast(),
             child.stderr.as_raw_handle().cast(),
         ];
-        let mut attrs = ProcAttrs::new(handles, self.container.sid(), job.raw(), lpac)?;
-        let env = environment_block(self.container.local_app_data())?;
+        let mut attrs = ProcAttrs::new(handles, self.container.sid(), job.raw(), lpac)
+            .map_err(stage("ProcAttrs::new"))?;
+        let env = environment_block(self.container.local_app_data())
+            .map_err(stage("environment_block"))?;
         let mut cmdline = wide(OsStr::new(&format!("\"{}\"", exe.display())));
         let exe_w = wide(exe.as_os_str());
         let cwd_w = wide(run_dir.path().as_os_str());
