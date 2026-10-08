@@ -27,7 +27,7 @@ env:
 
 jobs:
   bundle-windows:
-    name: bundle (x86_64-pc-windows-msvc, NSIS)
+    name: bundle-windows (x86_64-pc-windows-msvc, NSIS)
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -102,7 +102,7 @@ jobs:
           retention-days: 14
 
   bundle-macos-arm64:
-    name: bundle (aarch64-apple-darwin, app + dmg)
+    name: bundle-macos-arm64 (aarch64-apple-darwin, app + dmg)
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -172,7 +172,7 @@ jobs:
           retention-days: 14
 
   bundle-macos-x86_64:
-    name: bundle (x86_64-apple-darwin on the arm64 runner, app + dmg)
+    name: bundle-macos-x86_64 (x86_64-apple-darwin on the arm64 runner, app + dmg)
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -267,7 +267,7 @@ jobs:
           retention-days: 14
 
   bundle-linux:
-    name: bundle (x86_64-unknown-linux-gnu, deb + rpm + AppImage)
+    name: bundle-linux (x86_64-unknown-linux-gnu, deb + rpm + AppImage)
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:

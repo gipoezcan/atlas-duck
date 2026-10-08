@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import {
   REQUIRED_WORKFLOWS,
   TARGET_OS,
   check,
+  jobKey,
   verifyGit,
   verifyRuns,
 } from "./check-go-no-go.mjs";
@@ -372,4 +373,77 @@ test("verifyGit: ancestor with only the T22 files changed is fine; another chang
 test("docs/m1/go-no-go.md is valid", () => {
   const r = run(join(REPO, "docs", "m1", "go-no-go.md"));
   assert.equal(r.status, 0, r.stdout + r.stderr);
+});
+
+// ---------------------------------------------- job names as GitHub reports them
+
+/** The `name:` values of the workflows with matrix expressions expanded (what the jobs API returns). */
+const REAL_JOB_NAMES = {
+  "ci.yml": [
+    "rust (x86_64-pc-windows-msvc)",
+    "rust (aarch64-apple-darwin)",
+    "rust (x86_64-unknown-linux-gnu)",
+    "rust (x86_64-apple-darwin under Rosetta)",
+    "supply-chain (cargo-deny, cargo-audit)",
+    "ui (Vite + React shell, spec §2.4, §6.4)",
+    "locality-mounts (ubuntu-22.04)",
+    "locality-mounts (windows-2022)",
+    "probe-evidence-fedora (§9.4 probes on Fedora 40, glibc 2.39)",
+  ],
+  "bundle.yml": [
+    "bundle-windows (x86_64-pc-windows-msvc, NSIS)",
+    "bundle-macos-arm64 (aarch64-apple-darwin, app + dmg)",
+    "bundle-macos-x86_64 (x86_64-apple-darwin on the arm64 runner, app + dmg)",
+    "bundle-linux (x86_64-unknown-linux-gnu, deb + rpm + AppImage)",
+    "fedora-rpm (fedora:40 container, install the rpm)",
+    "appimage-smoke (ubuntu-22.04, FUSE mount)",
+  ],
+  "install-probes.yml": [
+    "windows-per-user (NSIS /CurrentUser on windows-2022)",
+    "windows-per-machine (NSIS /AllUsers on windows-2022)",
+    "macos-arm64 (dmg on macos-15)",
+    "macos-x86_64-rosetta (x86_64 dmg under Rosetta 2 on macos-15)",
+    "ubuntu-deb (apt install on ubuntu-22.04)",
+    "ubuntu-appimage (FUSE runtime on ubuntu-22.04)",
+    "fedora-rpm (dnf install in a fedora:40 container)",
+  ],
+};
+
+test("jobKey: the name up to the first ' (' , trimmed", () => {
+  assert.equal(jobKey("ui (Vite + React shell, spec §2.4)"), "ui");
+  assert.equal(jobKey("bundle-windows (x86_64-pc-windows-msvc, NSIS)"), "bundle-windows");
+  assert.equal(jobKey("probe-evidence-fedora"), "probe-evidence-fedora");
+  assert.equal(jobKey("rust (x86_64-apple-darwin under Rosetta)"), "rust");
+});
+
+test("verifyRuns: a fully green run with the real workflow job names passes against the document's job ids", () => {
+  assert.deepEqual(verifyRuns(validDoc(), fakeGithub({ jobs: REAL_JOB_NAMES })), []);
+});
+
+test("verifyRuns: a real-named run still reports a missing, an extra and a failed job", () => {
+  const without = { ...REAL_JOB_NAMES, "bundle.yml": REAL_JOB_NAMES["bundle.yml"].filter((n) => !n.startsWith("bundle-linux")) };
+  assert.ok(verifyRuns(validDoc(), fakeGithub({ jobs: without })).some((v) => v.includes("lists job 'bundle-linux', the run has no such job")));
+  const extra = { ...REAL_JOB_NAMES, "bundle.yml": [...REAL_JOB_NAMES["bundle.yml"], "mystery (x)"] };
+  assert.ok(verifyRuns(validDoc(), fakeGithub({ jobs: extra })).some((v) => v.includes("has job 'mystery (x)', the document does not list it")));
+  const fail = { ...REAL_JOB_NAMES, fail: "ui (Vite + React shell, spec §2.4, §6.4)" };
+  assert.ok(verifyRuns(validDoc(), fakeGithub({ jobs: fail })).some((v) => v.includes("concluded failure")));
+});
+
+test("the workflows' job names begin with the ids REQUIRED_WORKFLOWS lists", () => {
+  for (const [file, required] of Object.entries(REQUIRED_WORKFLOWS)) {
+    const text = readFileSync(join(REPO, ".github", "workflows", file), "utf8");
+    // `name:` of a job is the only 4-space-indented `name:` line under `jobs:`.
+    const names = [...text.slice(text.indexOf("\njobs:")).matchAll(/^ {4}name: (.+?)\s*$/gm)].map((m) => m[1]);
+    assert.ok(names.length > 0, `${file}: no job names found`);
+    for (const prefix of required) {
+      const base = jobKey(prefix);
+      assert.ok(
+        names.some((n) => (n.includes("${{") ? jobKey(n) === base : n.startsWith(prefix))),
+        `${file}: no job name starts with '${prefix}' (names: ${names.join(" | ")})`,
+      );
+    }
+    for (const name of names) {
+      assert.ok(required.some((p) => name.startsWith(jobKey(p))), `${file}: job name '${name}' starts with no required job id`);
+    }
+  }
 });

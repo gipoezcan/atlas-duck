@@ -422,6 +422,22 @@ function recordedFacts(text) {
 }
 
 /**
+ * The job key of a GitHub job name: the name up to the first " (", trimmed. Every workflow
+ * names its jobs `<job id>` or `<job id> (<description>)`, so the key is the id. The
+ * document lists a job either by that key (`ui`, `bundle-windows`) or, for the matrix and
+ * Rosetta legs whose ids repeat (`rust (...)`, `locality-mounts (...)`), by the exact name.
+ */
+export function jobKey(name) {
+  const i = String(name).indexOf(" (");
+  return (i < 0 ? String(name) : String(name).slice(0, i)).trim();
+}
+
+/** True iff the document entry `listed` stands for the GitHub job name `name`. */
+function jobMatches(listed, name) {
+  return listed === name || listed === jobKey(name);
+}
+
+/**
  * M1 exit criterion: no row is UNVERIFIED; on the recorded commit every listed workflow run is
  * completed and successful, ran that commit, ran exactly the listed jobs, and every job
  * succeeded. `fetchJson(endpoint)` is `gh api <endpoint>` in the CLI.
@@ -453,9 +469,9 @@ export function verifyRuns(text, fetchJson) {
       const ok = j.conclusion === "success" || (j.conclusion === "skipped" && !required);
       if (!ok) out.push(`runs ${file}: job '${j.name}' concluded ${j.conclusion}`);
     }
-    const actual = new Set(jobs.map((j) => j.name));
-    for (const name of listed) if (!actual.has(name)) out.push(`runs ${file}: the document lists job '${name}', the run has no such job`);
-    for (const name of actual) if (!listed.includes(name)) out.push(`runs ${file}: the run has job '${name}', the document does not list it`);
+    const names = jobs.map((j) => j.name);
+    for (const entry of listed) if (!names.some((n) => jobMatches(entry, n))) out.push(`runs ${file}: the document lists job '${entry}', the run has no such job`);
+    for (const name of names) if (!listed.some((e) => jobMatches(e, name))) out.push(`runs ${file}: the run has job '${name}', the document does not list it`);
   }
   const probes = runIds["install-probes.yml"];
   for (const [id, run] of Object.entries(rows)) {
