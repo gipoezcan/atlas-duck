@@ -5,13 +5,44 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Test doubles (FakeClock, MemKeyStore, fault points). Never enabled by a release build.
+testing = []
+
 [dependencies]
 atlas-duck-ipc = { path = "../ipc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
+hkdf = { workspace = true }
+argon2 = { workspace = true }
+zstd = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+unicode-normalization = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+keyring-core = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = { workspace = true }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { workspace = true }
+
 [dev-dependencies]
+atlas-duck-audit = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
+proptest = { workspace = true }

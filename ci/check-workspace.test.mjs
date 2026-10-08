@@ -213,7 +213,19 @@ test("atlas-duck-app may depend on tauri", () => {
   assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), []);
 });
 
-const BANNED = ["reqwest", "hyper", "rusqlite", "libsqlite3-sys", "keyring", "secret-service", "security-framework"];
+const BANNED = [
+  "reqwest",
+  "hyper",
+  "rusqlite",
+  "libsqlite3-sys",
+  "keyring",
+  "keyring-core",
+  "windows-native-keyring-store",
+  "apple-native-keyring-store",
+  "zbus-secret-service-keyring-store",
+  "secret-service",
+  "security-framework",
+];
 for (const pkg of ["atlas-duck-cli", "atlas-duck-sandbox-worker"]) {
   for (const banned of BANNED) {
     test(`${pkg} with ${banned} in its closure (transitively) is a violation`, () => {
@@ -238,6 +250,14 @@ test("banned crates are allowed outside cli and sandbox-worker", () => {
   const e = baseEdges();
   e["atlas-duck-audit"].push("rusqlite");
   e["atlas-duck-atlassian"].push("reqwest");
+  e["atlas-duck-audit"].push("keyring-core", "windows-native-keyring-store", "apple-native-keyring-store", "zbus-secret-service-keyring-store");
+  assert.deepEqual(graph(e), []);
+});
+
+test("serde_jcs is allowed in the closure of cli and sandbox-worker", () => {
+  const e = baseEdges();
+  e["atlas-duck-ipc"].push("serde_jcs");
+  e["serde_jcs"] = ["ryu-js"];
   assert.deepEqual(graph(e), []);
 });
 

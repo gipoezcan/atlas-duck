@@ -45,12 +45,18 @@ export const TAURI_CRATES = ["tauri", "wry"];
 
 // §2.1: sandbox "No HTTP client, keychain, or DB code linked"; CLI "Never
 // touches keychain or DB" (HTTP client ban for the CLI is a plan addition).
+// Names match exactly, so the keyring-core store crates that `audit` links are
+// listed next to the `keyring` umbrella.
 export const BANNED_IN_CLI_AND_WORKER = [
   "reqwest",
   "hyper",
   "rusqlite",
   "libsqlite3-sys",
   "keyring",
+  "keyring-core",
+  "windows-native-keyring-store",
+  "apple-native-keyring-store",
+  "zbus-secret-service-keyring-store",
   "secret-service",
   "security-framework",
   "tauri",

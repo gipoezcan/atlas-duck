@@ -47,8 +47,35 @@ tracing-subscriber = { version = "=0.3.23", default-features = false, features =
 toml_edit = { version = "=0.25.15", default-features = false, features = ["parse", "display"] }
 core-foundation = "=0.10.1"
 system-configuration-sys = "=0.6.0"
+# M2 audit store (plan "Dependency pins").
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
+sha2 = "=0.11.0"
+hmac = "=0.13.0"
+hkdf = "=0.13.0"
+argon2 = { version = "=0.6.0", default-features = false, features = ["alloc", "zeroize"] }
+zstd = { version = "=0.14.0", default-features = false }
+getrandom = "=0.4.3"
+zeroize = "=1.9.0"
+secrecy = "=0.10.3"
+serde_jcs = "=0.2.0"
+unicode-normalization = "=0.1.25"
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+base64 = "=0.22.1"
+hex = "=0.4.3"
+keyring-core = "=1.0.0"
+windows-native-keyring-store = "=1.1.0"
+apple-native-keyring-store = { version = "=1.0.2", default-features = false, features = ["keychain"] }
+zbus-secret-service-keyring-store = { version = "=1.0.1", default-features = false, features = ["crypto-rust"] }
+proptest = "=1.11.0"
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.
 [profile.release]
 panic = "abort"
+
+# Argon2id with 64 MiB takes tens of seconds unoptimized; tests inherit the dev profile.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

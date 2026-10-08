@@ -4,3 +4,11 @@
 //! [`lock::InstanceLock`], so the store cannot be opened without the lock (type-enforced).
 
 pub mod lock;
+
+pub mod clock;
+pub mod error;
+pub mod keystore;
+pub mod types;
+
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
