@@ -1002,12 +1002,20 @@ fn fixture_dir() -> PathBuf {
 }
 
 #[test]
-#[ignore = "regenerates the committed schema-v1 fixture"]
+#[ignore = "regenerates the committed schema-v1 fixture (ATLAS_DUCK_REGEN_FIXTURE=1)"]
 fn generate_v1_fixture() {
-    // Frozen like the golden vectors: CI only ever checks it, never rewrites it.
+    // Frozen like the golden vectors (their SHA-256 is pinned in tests/golden.rs and
+    // ci/check-audit-vectors.mjs): only an explicit local dev flag rewrites it, never CI and
+    // never a plain `--ignored` run.
+    if std::env::var_os("ATLAS_DUCK_REGEN_FIXTURE").is_none_or(|v| v != "1") {
+        eprintln!("generate_v1_fixture: set ATLAS_DUCK_REGEN_FIXTURE=1 to rewrite the fixture");
+        return;
+    }
     assert!(
-        std::env::var_os("CI").is_none(),
-        "generate_v1_fixture is refused when CI is set: the schema-v1 fixture is frozen"
+        ["CI", "GITHUB_ACTIONS", "GITLAB_CI"]
+            .iter()
+            .all(|v| std::env::var_os(v).is_none()),
+        "generate_v1_fixture is refused under CI: the schema-v1 fixture is frozen"
     );
     let ring = MemKeyring::new();
     let clock = fake_clock("2026-10-08T09:00:00.000Z");

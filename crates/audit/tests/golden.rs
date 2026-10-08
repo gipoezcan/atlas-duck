@@ -3,10 +3,13 @@
 //! plus DEK wrapping, the recovery blob and the query tag (§8.6, L38; plan F.4, F.5, F.7).
 //!
 //! `golden_vectors_match` rebuilds `tests/vectors/format_v1.json` from the inputs below and
-//! compares it with the committed file. With `ATLAS_DUCK_REGEN_VECTORS=1` it writes the file
-//! instead. The file is frozen after M2: a diff here is a format break, not a test update.
-//! `ci/check-audit-vectors.mjs` recomputes the same file independently with Node's crypto,
-//! except `recovery` (Node 22 has no Argon2), which only Rust checks.
+//! compares it with the committed file. With `ATLAS_DUCK_REGEN_VECTORS=1` (a local dev flag,
+//! refused under CI) it writes the file instead. The file is frozen after M2: a diff here is a
+//! format break, not a test update. `frozen_files_match_their_pinned_sha256` pins the bytes of
+//! the file and of the schema-v1 fixture (`tests/fixtures/schema/`), so a regenerated file
+//! fails until [`FROZEN`] (and the same table in `ci/check-audit-vectors.mjs`) is edited on
+//! purpose. `ci/check-audit-vectors.mjs` recomputes the same file independently with Node's
+//! crypto, except `recovery` (Node 22 has no Argon2), which only Rust checks.
 
 use atlas_duck_audit::crypto::{
     self, Dek, Kek, query_key, query_tag, unwrap_dek, wrap_dek_with_nonce,
@@ -597,20 +600,54 @@ fn zstd3(plain: &[u8]) -> Vec<u8> {
     crypto::compress(plain).unwrap()
 }
 
+/// Set by GitHub Actions (`CI`, `GITHUB_ACTIONS`) and GitLab CI (`CI`, `GITLAB_CI`).
+const CI_VARS: [&str; 3] = ["CI", "GITHUB_ACTIONS", "GITLAB_CI"];
+
 fn regen() -> bool {
     let on = std::env::var_os("ATLAS_DUCK_REGEN_VECTORS").is_some_and(|v| v == "1");
     // The vectors are frozen: CI must only ever check them, never rewrite them.
     assert!(
-        !(on && std::env::var_os("CI").is_some()),
-        "ATLAS_DUCK_REGEN_VECTORS=1 is refused when CI is set: format_v1.json is frozen"
+        !(on && CI_VARS.iter().any(|v| std::env::var_os(v).is_some())),
+        "ATLAS_DUCK_REGEN_VECTORS=1 is refused under CI: format_v1.json is frozen"
     );
     on
 }
 
 fn load() -> Value {
     let text = std::fs::read_to_string(vectors_path())
-        .expect("tests/vectors/format_v1.json missing: run with ATLAS_DUCK_REGEN_VECTORS=1 once");
+        .expect("tests/vectors/format_v1.json missing: it is frozen, restore it from git");
     serde_json::from_str(&text).unwrap()
+}
+
+/// SHA-256 of the frozen files as committed (LF line endings, `.gitattributes`). Changing one
+/// is a format change after M2's freeze: it needs a deliberate edit here and in
+/// `FROZEN_SHA256` of `ci/check-audit-vectors.mjs`, never a regeneration alone.
+const FROZEN: [(&str, &str); 3] = [
+    (
+        "tests/vectors/format_v1.json",
+        "13fdb8203185676d94fac5d43b3ccf097938b63afe57894c0f9a12b05498502a",
+    ),
+    (
+        "tests/fixtures/schema/v1.db",
+        "ac6b4fc3bc163ac5502387db4014c3702bd2ca722cb2d08de276c8ee4e58df65",
+    ),
+    (
+        "tests/fixtures/schema/v1.keyring.json",
+        "be7e54c8b7073edd587f98099dd342826f86359b67d79c59d1052caf605dbd78",
+    ),
+];
+
+#[test]
+fn frozen_files_match_their_pinned_sha256() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for (file, want) in FROZEN {
+        let bytes = std::fs::read(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+        assert_eq!(
+            hex::encode(sha256(&bytes)),
+            want,
+            "{file} changed: it is frozen (M2); a format change needs a new version, not a new file"
+        );
+    }
 }
 
 #[test]

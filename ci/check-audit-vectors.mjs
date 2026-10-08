@@ -12,6 +12,10 @@
 // recovery blob (Argon2id, which node:crypto 22 lacks) is checked for its layout only; Rust
 // checks it in full (crates/audit/tests/golden.rs).
 //
+// Without an argument it also checks the pinned SHA-256 of the frozen files (FROZEN_SHA256:
+// the vectors and the schema-v1 fixture): a regenerated file fails until the pin is edited on
+// purpose, here and in crates/audit/tests/golden.rs.
+//
 // Usage: node ci/check-audit-vectors.mjs [vectors.json]
 // Exit 0 = ok (summary on stderr). Exit 1 = mismatches (one per line on stdout).
 // No npm dependencies: node:crypto, node:fs, node:path, node:url, node:zlib only.
@@ -22,15 +26,43 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as zlib from "node:zlib";
 
+export const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
 export const DEFAULT_VECTORS = join(
-  dirname(fileURLToPath(import.meta.url)),
-  "..",
+  REPO_ROOT,
   "crates",
   "audit",
   "tests",
   "vectors",
   "format_v1.json",
 );
+
+// SHA-256 of the files frozen at the end of M2, as committed (LF, .gitattributes). Same table
+// as FROZEN in crates/audit/tests/golden.rs.
+export const FROZEN_SHA256 = {
+  "crates/audit/tests/vectors/format_v1.json":
+    "13fdb8203185676d94fac5d43b3ccf097938b63afe57894c0f9a12b05498502a",
+  "crates/audit/tests/fixtures/schema/v1.db":
+    "ac6b4fc3bc163ac5502387db4014c3702bd2ca722cb2d08de276c8ee4e58df65",
+  "crates/audit/tests/fixtures/schema/v1.keyring.json":
+    "be7e54c8b7073edd587f98099dd342826f86359b67d79c59d1052caf605dbd78",
+};
+
+/** One line per frozen file under `root` that is missing or whose bytes changed. */
+export function checkFrozen(root = REPO_ROOT) {
+  const out = [];
+  for (const [rel, want] of Object.entries(FROZEN_SHA256)) {
+    let got;
+    try {
+      got = createHash("sha256").update(readFileSync(join(root, ...rel.split("/")))).digest("hex");
+    } catch (err) {
+      out.push(`${rel}: cannot read (${err.code ?? err.message})`);
+      continue;
+    }
+    if (got !== want) out.push(`${rel}: sha256 ${got} is not the pinned ${want} (the file is frozen)`);
+  }
+  return out;
+}
 
 // F.2: every `events` column except record_hash, in order, with its encoding kind.
 export const COLUMNS = [
@@ -382,6 +414,7 @@ export function main(argv = process.argv.slice(2)) {
   }
   const notes = new Set();
   const mismatches = checkVectors(doc, notes);
+  if (argv[0] === undefined) mismatches.push(...checkFrozen());
   for (const n of notes) console.error(n);
   for (const m of mismatches) console.log(m);
   if (mismatches.length > 0) return 1;

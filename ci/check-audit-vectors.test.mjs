@@ -2,11 +2,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DEFAULT_VECTORS, canonicalize, checkVectors, frame } from "./check-audit-vectors.mjs";
+import {
+  DEFAULT_VECTORS,
+  FROZEN_SHA256,
+  REPO_ROOT,
+  canonicalize,
+  checkFrozen,
+  checkVectors,
+  frame,
+} from "./check-audit-vectors.mjs";
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "check-audit-vectors.mjs");
 const load = () => JSON.parse(readFileSync(DEFAULT_VECTORS, "utf8"));
@@ -42,6 +50,33 @@ test("the committed vectors pass", () => {
     /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs, 3 dek wraps, 7 query tags, recovery layout\)$/m,
   );
   assert.deepEqual(checkVectors(load()), []);
+});
+
+test("the frozen files match their pinned sha256", () => {
+  assert.deepEqual(checkFrozen(), []);
+});
+
+test("one changed byte of a frozen file breaks its pin", () => {
+  const root = mkdtempSync(join(tmpdir(), "audit-frozen-"));
+  try {
+    for (const rel of Object.keys(FROZEN_SHA256)) {
+      const to = join(root, ...rel.split("/"));
+      mkdirSync(dirname(to), { recursive: true });
+      copyFileSync(join(REPO_ROOT, ...rel.split("/")), to);
+    }
+    assert.deepEqual(checkFrozen(root), []);
+    const victim = join(root, "crates", "audit", "tests", "fixtures", "schema", "v1.keyring.json");
+    const bytes = readFileSync(victim);
+    bytes[bytes.length - 2] ^= 1;
+    writeFileSync(victim, bytes);
+    const out = checkFrozen(root);
+    assert.equal(out.length, 1, JSON.stringify(out));
+    assert.match(out[0], /^crates\/audit\/tests\/fixtures\/schema\/v1\.keyring\.json: sha256 [0-9a-f]{64} is not the pinned/);
+    rmSync(victim);
+    assert.match(checkFrozen(root)[0], /v1\.keyring\.json: cannot read/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a flipped hex digit in canonical fails", () => {

@@ -143,7 +143,7 @@ docs/m2/verify-items.md            # V08, V22, V27, V29 (keyring half) findings 
 
 ## Formats (F.1–F.12)
 
-Everything here is frozen by the golden vectors of T02 at the end of M2. Changing any byte afterwards is a `format_version` bump (rows) or a layout-version bump (blobs).
+Everything here is frozen by the golden vectors of T02 at the end of M2. Changing any byte afterwards is a `format_version` bump (rows) or a layout-version bump (blobs). **As built (final review I-5):** the freeze is enforced, not only reviewed: the SHA-256 of `tests/vectors/format_v1.json`, `tests/fixtures/schema/v1.db` and `v1.keyring.json` is pinned in `tests/golden.rs` (`FROZEN`, test `frozen_files_match_their_pinned_sha256`) and in `ci/check-audit-vectors.mjs` (`FROZEN_SHA256`, checked on every run without an argument); `ATLAS_DUCK_REGEN_VECTORS=1` and `ATLAS_DUCK_REGEN_FIXTURE=1` (with `--ignored`) are local dev flags refused when `CI`, `GITHUB_ACTIONS` or `GITLAB_CI` is set, and a regenerated file fails both pins until they are edited on purpose.
 
 ### F.1 Identifiers, time and file names
 
