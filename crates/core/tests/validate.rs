@@ -544,3 +544,48 @@ fn script_submit_limits() -> TestResult {
     assert!(!serde_json::to_string(&e)?.contains("secret_key_name"));
     Ok(())
 }
+
+#[test]
+fn script_limits_process_must_hold_the_heap() -> TestResult {
+    let args = json!({});
+    // heap 256 (default) + 88 = 344 <= 512: ok; lowering process below that is not.
+    assert!(validate_script_submit("1", &args, &json!({"process_mb": 344}))?.process_mb == 344);
+    let e = validate_script_submit("1", &args, &json!({"process_mb": 343}))
+        .err()
+        .ok_or("accepted")?;
+    assert_eq!(param(&e), Some("limits.process_mb"));
+    // Lowering heap together with process is fine; heap alone only helps.
+    assert!(
+        validate_script_submit("1", &args, &json!({"heap_mb": 64, "process_mb": 152}))?.heap_mb
+            == 64
+    );
+    let e = validate_script_submit("1", &args, &json!({"heap_mb": 64, "process_mb": 151}))
+        .err()
+        .ok_or("accepted")?;
+    assert_eq!(param(&e), Some("limits.process_mb"));
+    Ok(())
+}
+
+#[test]
+fn create_without_a_body_needs_no_body_format() -> TestResult {
+    assert!(
+        check(
+            "jira.issue.create",
+            json!({"project": "ABC", "issuetype": "Bug", "summary": "s"})
+        )?
+        .is_ok()
+    );
+    let e = rejected(check(
+        "jira.issue.create",
+        json!({"project": "ABC", "issuetype": "Bug", "summary": "s", "description": "d"}),
+    )?)?;
+    assert_eq!(param(&e), Some("body_format"));
+    Ok(())
+}
+
+#[test]
+fn edit_fields_map_comes_from_the_registry() -> TestResult {
+    let rules = op("jira.issue.edit")?.field_rules.ok_or("no field_rules")?;
+    assert_eq!(rules.fields_map_param, Some("fields"));
+    Ok(())
+}

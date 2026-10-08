@@ -72,7 +72,6 @@ pub(super) fn check(spec: &OperationSpec, params: &Value) -> Result<(), Validati
         check_rules(spec, rules, params)?;
     }
     if spec.conflict_baselines.contains(&"expected") {
-        check_map_keys("fields", params, false)?;
         check_map_keys("expected", params, false)?;
     }
     Ok(())

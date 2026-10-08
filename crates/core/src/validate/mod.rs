@@ -32,6 +32,9 @@ pub const MAX_SCRIPT_SOURCE_BYTES: usize = 256 * 1024;
 /// §9.1 step 2: the largest `--args` JSON (compact form).
 pub const MAX_SCRIPT_ARGS_BYTES: usize = 1024 * 1024;
 
+/// §9.4: `process_mb >= heap_mb + 24 MiB (host frame) + 64 MiB margin`.
+const PROCESS_OVER_HEAP_MB: u64 = 88;
+
 /// At most this many characters of an agent string are echoed in an error.
 const ECHO_MAX_CHARS: usize = 64;
 
@@ -236,6 +239,10 @@ fn check_body_format(
     if spec.class != atlas_duck_registry::OpClass::Write || !compiled.has_body_format {
         return Ok(());
     }
+    // Nothing to convert without a body (create without `description`).
+    if params.get("body").is_none() && params.get("description").is_none() {
+        return Ok(());
+    }
     let markdown = match params.get("body_format") {
         None => true,
         Some(value) => value.as_str() == Some("markdown"),
@@ -322,6 +329,15 @@ pub fn validate_script_limits(
             return Err(invalid(&param, "agents may only lower limits", None));
         }
         *slot = u32::try_from(wanted).unwrap_or(max);
+    }
+    // §9.4 memory invariant 2: the process must hold the heap, one host frame (24 MiB) and a
+    // 64 MiB margin. (Invariant 1, `heap_mb >= k x max_call_result_mb`, waits for M8's `k`.)
+    if u64::from(out.process_mb) < u64::from(out.heap_mb) + PROCESS_OVER_HEAP_MB {
+        return Err(invalid(
+            "limits.process_mb",
+            "process_mb must be at least heap_mb + 88",
+            None,
+        ));
     }
     Ok(out)
 }
