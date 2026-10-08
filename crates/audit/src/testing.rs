@@ -372,3 +372,92 @@ impl FreeSpaceProbe for FreeSpaceStub {
         Ok(self.bytes.load(Ordering::SeqCst))
     }
 }
+
+/// Input of [`insert_fake_prune`]: the store-level effect of a prune without its rules (T11
+/// brings the real `Store::prune`).
+#[derive(Debug, Clone)]
+pub struct FakePrune {
+    /// Records below it are deleted; the next `prune_log` row's range ends here.
+    pub first_retained_seq: u64,
+    /// `YYYY-MM-DD`.
+    pub cutoff: String,
+    /// The `PRUNE` payload's settings snapshot, e.g. `{"retention_days": 92, "legal_hold": false}`.
+    pub settings: serde_json::Value,
+    /// Install the prune barrier, so the anchor thread writes the first-retained anchor before
+    /// the head passes the `PRUNE` (a real prune); `false` leaves the keychain untouched (a
+    /// crash right after the commit).
+    pub update_first_retained: bool,
+}
+
+/// One `prune_log` row and its `PRUNE` record in one transaction (crate-internal writer
+/// command); no DEK is destroyed.
+pub fn insert_fake_prune(
+    store: &crate::store::Store,
+    prune: FakePrune,
+) -> Result<crate::types::Committed, AuditError> {
+    store.testing_fake_prune(prune)
+}
+
+fn kek_from(keys: &dyn KeyStore) -> Result<crate::crypto::Kek, crate::error::OpenError> {
+    use crate::error::OpenError;
+    let b = keys
+        .get(&EntryName::Kek)?
+        .ok_or(OpenError::Invalid("the keychain holds no KEK"))?;
+    crate::crypto::Kek::from_entry_bytes(&b)
+        .map_err(|_| OpenError::Invalid("the keychain KEK is malformed"))
+}
+
+/// Stand-in for `open()` steps 1–3 until T10: the read-only version gate, the KEK, the
+/// keychain anchors (head first) and `verify::startup` on a read-only connection. Writes
+/// nothing.
+pub fn startup_verdict(
+    data: &atlas_duck_ipc::paths::LocalDataDir,
+    cfg: &crate::store::OpenConfig,
+) -> Result<crate::verify::StartupVerdict, crate::error::OpenError> {
+    use crate::anchors::{AnchorLoadError, load_anchors};
+    use crate::error::OpenError;
+    use crate::{schema, verify};
+
+    let db = schema::db_path(data);
+    schema::gate(&schema::read_versions(&db)?).map_err(OpenError::NewerStore)?;
+    let kek = kek_from(&*cfg.keys)?;
+    let (head_anchor, first_retained) = load_anchors(&*cfg.keys).map_err(|e| match e {
+        AnchorLoadError::Newer(n) => OpenError::NewerStore(format!("keychain anchor layout {n}")),
+        AnchorLoadError::KeyStore(k) => OpenError::KeyStore(k),
+    })?;
+    let conn = schema::open_ro(&db)?;
+    let store_install_id =
+        verify::store_install_id(&conn).map_err(|e| OpenError::Sqlite(e.to_string()))?;
+    verify::startup(&verify::StartupInputs {
+        conn: &conn,
+        kek: &kek,
+        head_anchor,
+        first_retained,
+        store_install_id,
+        pinned_install_id: cfg.pinned_install_id.clone(),
+    })
+}
+
+/// A store handle on an existing `audit.db` until T10's `open()`: KEK from the keychain,
+/// writer started, anchor writes disabled until [`apply_startup`].
+pub fn open_existing(
+    data: &atlas_duck_ipc::paths::LocalDataDir,
+    lock: &crate::lock::InstanceLock,
+    cfg: crate::store::OpenConfig,
+) -> Result<crate::store::Store, crate::error::OpenError> {
+    if lock.path().parent() != Some(data.path()) {
+        return Err(crate::error::OpenError::Invalid(
+            "instance.lock of another data dir",
+        ));
+    }
+    let kek = kek_from(&*cfg.keys)?;
+    crate::open::start_existing(data, cfg, kek)
+}
+
+/// `open()` step 4 for a verdict: its `VERIFY`, the anchor actions, then anchors enabled.
+pub fn apply_startup(
+    store: &crate::store::Store,
+    verdict: &crate::verify::StartupVerdict,
+) -> Result<crate::verify::VerifyOutcome, AuditError> {
+    store.apply_startup(verdict)
+}

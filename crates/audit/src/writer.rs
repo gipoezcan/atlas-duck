@@ -4,7 +4,7 @@
 //! encrypts, hashes and commits one `BEGIN IMMEDIATE` transaction per command, and replies
 //! only after `COMMIT` returned (`synchronous=FULL`, §5.1 inv. 1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::anchors::{AnchorShared, HeadAnchor};
+#[cfg(any(test, feature = "testing"))]
+use crate::anchors::{Barrier, FirstRetainedAnchor};
 use crate::clock::{
     AnomalyKind, ClockAnomaly, ClockState, Stamp, UtcInstant, epoch_text, month_text, parse_epoch,
 };
@@ -109,6 +111,9 @@ pub(crate) struct PreparedEvent {
     pub(crate) flags: EventFlags,
     /// Store-managed non-clock flags (`integrity_incident` on `VERIFY` only).
     pub(crate) store_flags: EventFlags,
+    /// `INTEGRITY_ACK` only: the open incident it closes. The writer refuses the append when
+    /// that incident is not open (checked on the writer thread, so two acks cannot race).
+    pub(crate) ack_of: Option<u64>,
     pub(crate) payload_len: u64,
     pub(crate) payload_sha256: [u8; 32],
     pub(crate) compressed: Zeroizing<Vec<u8>>,
@@ -161,6 +166,7 @@ impl PreparedEvent {
             decision: ev.decision.map(|d| d.as_str()),
             flags: ev.flags & EventFlags::CALLER_SETTABLE,
             store_flags: EventFlags::default(),
+            ack_of: None,
             payload_len,
             payload_sha256,
             compressed,
@@ -204,6 +210,13 @@ impl PreparedEvent {
     }
 }
 
+/// How a committed row changes the open-incident set.
+#[derive(Clone, Copy)]
+enum IncidentChange {
+    Opened(u64),
+    Acknowledged(u64),
+}
+
 /// The chain head as the writer sees it.
 #[derive(Clone)]
 pub(crate) struct Head {
@@ -229,6 +242,9 @@ pub(crate) struct Shared {
     pub(crate) dropped_observations: AtomicU64,
     /// The head handed to the anchor thread after every commit (T08).
     pub(crate) anchors: Arc<AnchorShared>,
+    /// Seqs of open integrity incidents (T09): loaded at open, updated after every commit of
+    /// a flagged `VERIFY` or an `INTEGRITY_ACK`.
+    pub(crate) incidents: Mutex<BTreeSet<u64>>,
 }
 
 impl Shared {
@@ -242,6 +258,7 @@ impl Shared {
             dek_cache: Mutex::new(HashMap::new()),
             dropped_observations: AtomicU64::new(0),
             anchors: Arc::new(AnchorShared::new()),
+            incidents: Mutex::new(BTreeSet::new()),
         })
     }
 }
@@ -270,6 +287,15 @@ pub(crate) enum Cmd {
     Pragma {
         name: &'static str,
         reply: SyncSender<Result<i64, AuditError>>,
+    },
+    /// `testing::insert_fake_prune`: a `prune_log` row and its `PRUNE` record (T11 replaces
+    /// it with the real prune). `anchor` = `(chain_id, genesis_hash)` installs the prune
+    /// barrier for the first-retained update.
+    #[cfg(any(test, feature = "testing"))]
+    FakePrune {
+        prune: crate::testing::FakePrune,
+        anchor: Option<(String, [u8; 32])>,
+        reply: SyncSender<Result<Committed, AuditError>>,
     },
     Shutdown,
 }
@@ -512,8 +538,17 @@ impl WriterState {
     /// After `COMMIT` returned: publish the head and the new keys, and hand the head to the
     /// anchor thread (never blocks on the keychain). T11 queues a prune attempt here when the
     /// head's epoch date advanced.
-    fn post_commit(&mut self, new_keys: HashMap<u64, Dek>) {
+    fn post_commit(&mut self, new_keys: HashMap<u64, Dek>, incidents: &[IncidentChange]) {
         lock(&self.shared.dek_cache).extend(new_keys);
+        if !incidents.is_empty() {
+            let mut open = lock(&self.shared.incidents);
+            for c in incidents {
+                match *c {
+                    IncidentChange::Opened(seq) => open.insert(seq),
+                    IncidentChange::Acknowledged(seq) => open.remove(&seq),
+                };
+            }
+        }
         *lock(&self.shared.head) = HeadView {
             seq: self.head.seq,
             hash: self.head.hash,
@@ -615,6 +650,7 @@ impl Writer {
             .transpose()?;
         let ts = UtcInstant::parse_rfc3339_ms(&ts).ok_or_else(|| bad("ts_utc"))?;
         let flags = EventFlags::from_bits(u64::try_from(flags).map_err(|_| bad("flags"))?);
+        *lock(&parts.shared.incidents) = crate::incidents::load_open(&conn, &parts.kek)?;
         let st = WriterState {
             clock: parts.clock,
             clock_state: ClockState::from_head(epoch, ts, flags),
@@ -676,7 +712,7 @@ impl Writer {
         let mut new_keys = HashMap::new();
         let c = st.insert_one(&tx, &stamp, &p, mono, &mut new_keys)?;
         tx.commit().map_err(sql)?;
-        st.post_commit(new_keys);
+        st.post_commit(new_keys, &[]);
         Ok(c)
     }
 
@@ -718,6 +754,23 @@ impl Writer {
     /// One append command: one transaction, all or nothing. On any error the transaction rolls
     /// back and the in-memory clock state and head are restored to their values before it.
     fn append_tx(&mut self, evs: Vec<PreparedEvent>) -> Result<Vec<Committed>, AuditError> {
+        {
+            let open = lock(&self.st.shared.incidents);
+            if evs
+                .iter()
+                .any(|p| p.ack_of.is_some_and(|v| !open.contains(&v)))
+            {
+                return Err(AuditError::Invalid("not an open integrity incident"));
+            }
+        }
+        let effects: Vec<(bool, Option<u64>)> = evs
+            .iter()
+            .map(|p| {
+                let opens = p.event_type == EventType::VERIFY
+                    && p.store_flags.contains(EventFlags::INTEGRITY_INCIDENT);
+                (opens, p.ack_of)
+            })
+            .collect();
         let snapshot = (self.st.clock_state.clone(), self.st.head.clone());
         let mut new_keys = HashMap::new();
         let st = &mut self.st;
@@ -732,7 +785,18 @@ impl Writer {
             Ok(out)
         })();
         match &result {
-            Ok(_) => self.st.post_commit(new_keys),
+            Ok(out) => {
+                let mut changes = Vec::new();
+                for (c, (opens, ack)) in out.iter().zip(&effects) {
+                    if *opens {
+                        changes.push(IncidentChange::Opened(c.seq));
+                    }
+                    if let Some(v) = ack {
+                        changes.push(IncidentChange::Acknowledged(*v));
+                    }
+                }
+                self.st.post_commit(new_keys, &changes);
+            }
             Err(_) => (self.st.clock_state, self.st.head) = snapshot,
         }
         result
@@ -747,6 +811,137 @@ impl Writer {
             let logged = PreparedEvent::clock_anomaly(&a).and_then(|row| self.append_tx(vec![row]));
             if logged.is_err() {
                 self.st.clock_state = before;
+            }
+        }
+    }
+
+    /// Deletes `seq < first_retained_seq`, writes the next `prune_log` row and its `PRUNE`
+    /// in one transaction (no DEK destruction, no clock or cadence rules).
+    #[cfg(any(test, feature = "testing"))]
+    fn fake_prune(
+        &mut self,
+        p: &crate::testing::FakePrune,
+        anchor: Option<(String, [u8; 32])>,
+    ) -> Result<Committed, AuditError> {
+        let snapshot = (self.st.clock_state.clone(), self.st.head.clone());
+        let mut new_keys = HashMap::new();
+        let st = &mut self.st;
+        let to32 = |v: Vec<u8>| {
+            <[u8; 32]>::try_from(v).map_err(|_| AuditError::Invalid("hash is not 32 bytes"))
+        };
+        let result = (|| -> Result<(Committed, u64, [u8; 32]), AuditError> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sql)?;
+            let latest: Option<(i64, Vec<u8>, Vec<u8>)> = tx
+                .query_row(
+                    "SELECT first_retained_seq, last_pruned_record_hash, row_hash FROM prune_log \
+                     ORDER BY prune_seq DESC LIMIT 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .map_err(sql)?;
+            let (range_start, carried, prev_row_hash) = match latest {
+                Some((f, l, h)) => (
+                    u64::try_from(f).map_err(|_| AuditError::Invalid("negative seq"))?,
+                    to32(l)?,
+                    to32(h)?,
+                ),
+                None => (1, ZERO_HASH, ZERO_HASH),
+            };
+            let frs = p.first_retained_seq;
+            let prune_seq = st.head.seq + 1;
+            if frs < range_start || frs > prune_seq {
+                return Err(AuditError::Invalid(
+                    "first_retained_seq outside the prunable range",
+                ));
+            }
+            let last_pruned = if frs > range_start {
+                to32(
+                    tx.query_row(
+                        "SELECT record_hash FROM events WHERE seq = ?1",
+                        [int(frs - 1)?],
+                        |r| r.get(0),
+                    )
+                    .map_err(sql)?,
+                )?
+            } else {
+                carried
+            };
+            tx.execute("DELETE FROM events WHERE seq < ?1", [int(frs)?])
+                .map_err(sql)?;
+            let row_hash = encoding::prune_row_hash(
+                &prev_row_hash,
+                prune_seq,
+                range_start,
+                &p.cutoff,
+                &last_pruned,
+                frs,
+            );
+            tx.execute(
+                "INSERT INTO prune_log (prune_seq, range_start, cutoff_epoch, \
+                 last_pruned_record_hash, first_retained_seq, prev_row_hash, row_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    int(prune_seq)?,
+                    int(range_start)?,
+                    p.cutoff,
+                    &last_pruned[..],
+                    int(frs)?,
+                    &prev_row_hash[..],
+                    &row_hash[..],
+                ],
+            )
+            .map_err(sql)?;
+            let ev = PreparedEvent::system(
+                EventType::PRUNE,
+                &json!({
+                    "range": [range_start, frs],
+                    "count": frs - range_start,
+                    "cutoff": p.cutoff,
+                    "clamped": false,
+                    "baseline": p.cutoff,
+                    "destroyed_key_ids": [],
+                    "prune_log_row_hash": hex::encode(row_hash),
+                    "settings": p.settings,
+                }),
+            )?;
+            let mono = st.clock.suspend_aware_elapsed();
+            let stamp = st.clock_state.stamp(st.clock.now_utc(), mono);
+            let c = st.insert_one(&tx, &stamp, &ev, mono, &mut new_keys)?;
+            if c.seq != prune_seq {
+                return Err(AuditError::AppendFailed(
+                    "PRUNE did not get the expected seq".into(),
+                ));
+            }
+            tx.commit().map_err(sql)?;
+            Ok((c, frs, last_pruned))
+        })();
+        match result {
+            Ok((c, frs, last_pruned)) => {
+                // Before the head is published, as a real prune does (T08 handoff).
+                if let Some((chain_id, genesis_hash)) = anchor
+                    && let Ok(g) = self.st.shared.anchors.install_barrier(Barrier::Prune {
+                        seq: c.seq,
+                        record_hash: c.record_hash,
+                        first_retained: FirstRetainedAnchor {
+                            chain_id,
+                            genesis_hash,
+                            first_retained_seq: frs,
+                            first_retained_prev_hash: last_pruned,
+                        },
+                    })
+                {
+                    g.complete();
+                }
+                self.st.post_commit(new_keys, &[]);
+                Ok(c)
+            }
+            Err(e) => {
+                (self.st.clock_state, self.st.head) = snapshot;
+                Err(e)
             }
         }
     }
@@ -771,6 +966,15 @@ impl Writer {
                         .conn
                         .pragma_query_value(None, name, |r| r.get::<_, i64>(0))
                         .map_err(|e| AuditError::Io(e.to_string()));
+                    let _ = reply.send(r);
+                }
+                #[cfg(any(test, feature = "testing"))]
+                Cmd::FakePrune {
+                    prune,
+                    anchor,
+                    reply,
+                } => {
+                    let r = self.fake_prune(&prune, anchor);
                     let _ = reply.send(r);
                 }
                 Cmd::Shutdown => break,

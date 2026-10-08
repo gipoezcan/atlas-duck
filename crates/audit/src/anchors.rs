@@ -147,6 +147,44 @@ impl FirstRetainedAnchor {
     }
 }
 
+/// The keychain anchors could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AnchorLoadError {
+    /// A layout byte newer than this build (§8.13 version gate).
+    Newer(u8),
+    KeyStore(KeyStoreError),
+}
+
+/// Reads the head anchor, then the first-retained anchor. That order matters while the store
+/// runs: the anchor thread writes first-retained before head, so a head read first never
+/// names a `PRUNE` whose first-retained update the second read cannot see. An absent or
+/// malformed entry is `None` (verification reports it as missing).
+pub(crate) fn load_anchors(
+    keys: &dyn KeyStore,
+) -> Result<(Option<HeadAnchor>, Option<FirstRetainedAnchor>), AnchorLoadError> {
+    fn read<T>(
+        keys: &dyn KeyStore,
+        e: EntryName,
+        parse: fn(&[u8]) -> Result<T, AnchorEntryError>,
+    ) -> Result<Option<T>, AnchorLoadError> {
+        match keys.get(&e).map_err(AnchorLoadError::KeyStore)? {
+            None => Ok(None),
+            Some(b) => match parse(&b) {
+                Ok(a) => Ok(Some(a)),
+                Err(AnchorEntryError::NewerLayout(n)) => Err(AnchorLoadError::Newer(n)),
+                Err(AnchorEntryError::Malformed) => Ok(None),
+            },
+        }
+    }
+    let head = read(keys, EntryName::HeadAnchor, HeadAnchor::from_entry)?;
+    let first = read(
+        keys,
+        EntryName::FirstRetainedAnchor,
+        FirstRetainedAnchor::from_entry,
+    )?;
+    Ok((head, first))
+}
+
 /// The head anchor trails the newest commit by at most this long; commits inside one window
 /// share one keychain write.
 pub(crate) const BATCH_WINDOW: Duration = Duration::from_millis(900);
@@ -456,6 +494,13 @@ impl AnchorShared {
         }
         drop(st);
         self.cv.notify_all();
+    }
+
+    /// Anchor writes stop again until the next `enable` (tests hold the keychain at an older
+    /// head with it).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn disable(&self) {
+        lock(&self.state).enabled = false;
     }
 
     /// Installs the one barrier; a second one is refused (it would silently lift the first).

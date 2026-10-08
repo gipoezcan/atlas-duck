@@ -171,6 +171,33 @@ impl FirstRun {
     }
 }
 
+/// Starts the writer on an existing `audit.db` (it runs the version gate on its own
+/// connection and loads the head and the open incidents). Anchor writes start disabled, as
+/// `open()` requires until the startup `VERIFY` is committed (§8.7); `Store::apply_startup`
+/// enables them. The store's `install_id` is the keystore's.
+#[allow(dead_code)] // called by `open()` (T10) and the `testing` shim
+pub(crate) fn start_existing(
+    data: &LocalDataDir,
+    cfg: OpenConfig,
+    kek: Kek,
+) -> Result<Store, OpenError> {
+    let db = schema::db_path(data);
+    if !db.try_exists()? {
+        return Err(OpenError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "audit.db does not exist",
+        )));
+    }
+    let install_id = cfg.keys.install_id().to_string();
+    let anchors = AnchorInit {
+        enabled: false,
+        head_anchored: false,
+    };
+    Store::start(data, cfg, kek, install_id, anchors, move |parts| {
+        Writer::open(&db, parts)
+    })
+}
+
 /// Wizard step (1b): a new store with `GENESIS` (C.3). In order: refuse an existing DB →
 /// `install_id` must be the keystore's → the passphrase rules (pure, before any keychain
 /// access) → keyring locality (no keyring call unless `Local`) → canary → no `kek`/anchor

@@ -11,6 +11,7 @@ pub mod clock;
 pub mod crypto;
 pub mod encoding;
 pub mod error;
+mod incidents;
 pub mod keystore;
 pub mod open;
 pub mod recovery;
@@ -18,12 +19,14 @@ pub mod request_set;
 pub mod schema;
 pub mod store;
 pub mod types;
+pub mod verify;
 mod writer;
 
 pub use admission::FreeSpaceProbe;
 pub use open::{ArchivedDb, FirstRunInput, create_new_store, new_ids};
 pub use request_set::{RequestRecord, request_set_hash};
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
+pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -36,8 +36,8 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> Result<(), AuditError> {
     getrandom::fill(buf).map_err(|_| AuditError::Io("OS random source failed".into()))
 }
 
-/// Constant-time equality of two keys (no early exit on the first differing byte).
-fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+/// Constant-time equality of two keys or hashes (no early exit on the first differing byte).
+pub(crate) fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let diff = a
         .iter()
         .zip(b.iter())

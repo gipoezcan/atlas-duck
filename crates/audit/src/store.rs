@@ -12,6 +12,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use atlas_duck_ipc::paths::LocalDataDir;
 use rusqlite::{Connection, OptionalExtension};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -23,7 +24,10 @@ use crate::encoding::{self, FIELD_LIST, RowFields};
 use crate::error::{AuditError, OpenError};
 use crate::keystore::KeyStore;
 use crate::schema;
-use crate::types::{Committed, NewEvent, QueryKind};
+use crate::types::{Committed, EventFlags, EventType, NewEvent, QueryKind};
+use crate::verify::{
+    self, FindingKind, KeychainAnchors, StartupVerdict, VerifyFinding, VerifyOutcome,
+};
 use crate::writer::{self, Cmd, PreparedEvent, Shared, Writer, WriterParts};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -138,6 +142,8 @@ struct Inner {
     anchor_thread: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<Shared>,
     install_id: String,
+    /// Read by `full_verify` for the anchors; only the anchor thread writes them.
+    keys: Arc<dyn KeyStore>,
     kek: Kek,
     query_key: QueryKey,
     clock: Arc<dyn Clock>,
@@ -281,6 +287,7 @@ impl Store {
                 anchor_thread: Mutex::new(Some(anchor_thread)),
                 shared,
                 install_id,
+                keys: cfg.keys,
                 query_key: QueryKey(crypto::query_key(&kek)),
                 kek,
                 clock: cfg.clock,
@@ -380,7 +387,7 @@ impl Store {
             crypto::decompress(&compressed, sealed.payload_len).map_err(|_| decrypt)?,
         );
         let digest: [u8; 32] = Sha256::digest(plain.as_slice()).into();
-        if digest != sealed.payload_sha256 {
+        if !crypto::ct_eq(&digest, &sealed.payload_sha256) {
             return Err(AuditError::PayloadHash { seq });
         }
         Ok(plain)
@@ -527,8 +534,146 @@ impl Store {
             anchors_blocked: a.blocked,
             anchor_thread_dead: a.thread_dead,
             storage_low: self.admission_check().is_err(),
+            open_incidents: lock(&self.inner.shared.incidents).len(),
             ..StoreHealth::default()
         }
+    }
+
+    /// Full verification (C.3, §8.7): the whole chain, `prune_log`, a decrypt pass, every
+    /// `WRITE_APPROVED`'s `request_set_hash`, DEK references, every retained `PRUNE` judged by
+    /// its own settings snapshot, `RESTORE` boundaries and the keychain anchors; then one
+    /// `VERIFY {scope: "full"}` (`result: "ok"` and no `integrity_incident` flag when clean).
+    ///
+    /// A run that cannot complete (store closed, database unreadable, the `VERIFY` append
+    /// failing) is never reported as a pass: it returns one `ChainBroken` finding whose
+    /// `detail` says the run did not complete. [`Store::try_full_verify`] tells the two apart.
+    pub fn full_verify(&self) -> Vec<VerifyFinding> {
+        match self.try_full_verify() {
+            Ok(o) => o.findings,
+            Err(e) => vec![VerifyFinding::new(
+                FindingKind::ChainBroken,
+                format!("verification did not complete: {e}"),
+            )],
+        }
+    }
+
+    /// `full_verify` with its errors. Runs on its own read-only connection on the calling
+    /// thread (one read transaction); only the final `VERIFY` append goes through the writer.
+    /// The keychain is read before the snapshot is taken, head anchor first, so an anchor
+    /// never names a record the snapshot lacks; a keychain that does not answer skips the
+    /// anchor checks for this run (never an incident, §8.8).
+    pub fn try_full_verify(&self) -> Result<VerifyOutcome, AuditError> {
+        self.sender()?;
+        let anchors =
+            anchors::load_anchors(&*self.inner.keys)
+                .ok()
+                .map(|(head, first_retained)| KeychainAnchors {
+                    head,
+                    first_retained,
+                });
+        let conn =
+            schema::open_ro(&self.inner.db_path).map_err(|e| AuditError::Io(e.to_string()))?;
+        let findings = verify::full(&conn, &self.inner.kek, anchors.as_ref())?;
+        drop(conn);
+        let c = self.append_verify("full", &findings, None)?;
+        Ok(VerifyOutcome {
+            findings,
+            unanchored_tail: 0,
+            verify_seq: Some(c.seq),
+        })
+    }
+
+    /// Seqs of the integrity-incident `VERIFY` records without a later `INTEGRITY_ACK` (C.3),
+    /// ascending.
+    pub fn open_incidents(&self) -> Vec<u64> {
+        lock(&self.inner.shared.incidents).iter().copied().collect()
+    }
+
+    /// "Acknowledge integrity incident" (§8.7): appends `INTEGRITY_ACK {verify_seq, os_user,
+    /// note}` with the plaintext `os_user`. `Invalid` if `verify_seq` is not an open incident
+    /// (checked again on the writer thread, so a second ack of the same run is refused).
+    pub fn acknowledge_incident(
+        &self,
+        verify_seq: u64,
+        os_user: &str,
+        note: &str,
+    ) -> Result<Committed, AuditError> {
+        if os_user.is_empty() {
+            return Err(AuditError::Invalid("os_user is empty"));
+        }
+        if !lock(&self.inner.shared.incidents).contains(&verify_seq) {
+            return Err(AuditError::Invalid("not an open integrity incident"));
+        }
+        let mut p = PreparedEvent::system(
+            EventType::INTEGRITY_ACK,
+            &json!({ "verify_seq": verify_seq, "os_user": os_user, "note": note }),
+        )?;
+        p.os_user = Some(os_user.to_string());
+        p.ack_of = Some(verify_seq);
+        self.send_append(vec![p])?
+            .pop()
+            .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
+    }
+
+    /// One `VERIFY` record for a run (F.11), flagged `integrity_incident` iff any finding is
+    /// an incident kind.
+    pub(crate) fn append_verify(
+        &self,
+        scope: &str,
+        findings: &[VerifyFinding],
+        unanchored_tail: Option<u64>,
+    ) -> Result<Committed, AuditError> {
+        let detected_at = self
+            .inner
+            .clock
+            .now_utc()
+            .try_to_rfc3339_ms()
+            .ok_or_else(|| {
+                AuditError::AppendFailed("wall clock outside years 0000..=9999".into())
+            })?;
+        let payload = verify::verify_payload(scope, findings, &detected_at, unanchored_tail);
+        let mut p = PreparedEvent::system(EventType::VERIFY, &payload)?;
+        if findings.iter().any(|f| f.kind.is_incident()) {
+            p.store_flags = EventFlags::INTEGRITY_INCIDENT;
+        }
+        self.send_append(vec![p])?
+            .pop()
+            .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
+    }
+
+    /// Startup step 4 after migrations (§8.7): appends the verdict's `VERIFY` (none when it
+    /// has no finding), then the anchor actions, then enables anchor writes. An interrupted
+    /// prune gets its prune barrier (first-retained written before the head passes the
+    /// `PRUNE`); an interrupted restore gets a restore barrier, which only the restore
+    /// completion (T16) lifts. If the `VERIFY` append fails, anchors stay disabled.
+    #[allow(dead_code)] // called by `open()` (T10); tests use `testing::apply_startup`
+    pub(crate) fn apply_startup(&self, v: &StartupVerdict) -> Result<VerifyOutcome, AuditError> {
+        let verify_seq = if v.findings.is_empty() {
+            None
+        } else {
+            let tail = (v.unanchored_tail > 0).then_some(v.unanchored_tail);
+            Some(self.append_verify("startup", &v.findings, tail)?.seq)
+        };
+        let a = &v.anchor_actions;
+        if let Some(rc) = &a.complete_restore {
+            self.install_barrier(Barrier::Restore {
+                seq: rc.restore_seq,
+            })?
+            .complete();
+        } else if let (Some(fr), Some(p)) = (&a.set_first_retained, &a.prune_record) {
+            self.install_barrier(Barrier::Prune {
+                seq: p.seq,
+                record_hash: p.record_hash,
+                first_retained: fr.clone(),
+            })?
+            .complete();
+        }
+        self.enable_anchors();
+        Ok(VerifyOutcome {
+            findings: v.findings.clone(),
+            unanchored_tail: v.unanchored_tail,
+            verify_seq,
+        })
     }
 
     /// Stops the writer after the commands already queued; later calls get `Closed`. Never
@@ -542,6 +687,38 @@ impl Store {
     #[cfg(any(test, feature = "testing"))]
     pub fn testing_enable_anchors(&self) {
         self.enable_anchors();
+    }
+
+    /// No anchor write until `testing_enable_anchors` (feature `testing`): the keychain keeps
+    /// the anchors it holds now.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_pause_anchors(&self) {
+        self.inner.shared.anchors.disable();
+    }
+
+    /// `testing::insert_fake_prune` (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn testing_fake_prune(
+        &self,
+        prune: crate::testing::FakePrune,
+    ) -> Result<Committed, AuditError> {
+        let anchor = if prune.update_first_retained {
+            let (_, fr) = anchors::load_anchors(&*self.inner.keys)
+                .map_err(|_| AuditError::Invalid("keychain anchors unreadable"))?;
+            let fr = fr.ok_or(AuditError::Invalid("first-retained anchor missing"))?;
+            Some((fr.chain_id, fr.genesis_hash))
+        } else {
+            None
+        };
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::FakePrune {
+                prune,
+                anchor,
+                reply,
+            })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
     }
 
     /// A prune barrier at `seq` (feature `testing`).
