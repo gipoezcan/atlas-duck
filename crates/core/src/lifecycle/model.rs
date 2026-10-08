@@ -42,8 +42,9 @@ pub enum CancelReason {
 pub enum Terminal {
     Rejected,
     Failed,
-    Released,
-    ReleasedRedacted,
+    /// The released item decides the agent-visible status (§4.3).
+    Released(ReleaseItem),
+    ReleasedRedacted(ReleaseItem),
     Denied,
     Succeeded,
     OutcomeUnknown,
@@ -159,7 +160,7 @@ pub struct Applied {
 
 #[derive(Debug, Clone)]
 pub struct Model {
-    pub kind: Kind,
+    kind: Kind,
     phase: Phase,
     rev: u64,
     opened: bool,
@@ -187,6 +188,9 @@ impl Model {
     /// Whether the current `Enriching` is a refresh (its failures return to the queue).
     pub fn refreshing(&self) -> bool {
         self.refresh_from.is_some()
+    }
+    pub fn kind(&self) -> Kind {
+        self.kind
     }
     pub fn phase(&self) -> Phase {
         self.phase
@@ -225,7 +229,14 @@ pub fn agent_status(m: &Model) -> Status {
     match m.phase {
         Phase::Done(t) => match t {
             Terminal::Rejected | Terminal::Failed => Status::Failed,
-            Terminal::Released | Terminal::ReleasedRedacted => Status::Released,
+            // A released upstream error or outcome item is delivered as `failed`, exit 6 (§5.2
+            // step 6); results and script error details as `released` (exit 0 / 8).
+            Terminal::Released(i) | Terminal::ReleasedRedacted(i) => match i {
+                ReleaseItem::UpstreamError | ReleaseItem::Outcome => Status::Failed,
+                ReleaseItem::Result
+                | ReleaseItem::ScriptResult
+                | ReleaseItem::ScriptErrorDetails => Status::Released,
+            },
             Terminal::Denied => Status::Denied,
             Terminal::Succeeded => Status::Succeeded,
             Terminal::OutcomeUnknown => Status::OutcomeUnknown,
@@ -358,9 +369,9 @@ pub fn step(m: &mut Model, e: Event) -> Result<Applied, Rejection> {
             done(
                 m,
                 if redacted {
-                    Terminal::ReleasedRedacted
+                    Terminal::ReleasedRedacted(item)
                 } else {
-                    Terminal::Released
+                    Terminal::Released(item)
                 },
             );
         }
@@ -416,10 +427,6 @@ pub fn step(m: &mut Model, e: Event) -> Result<Applied, Rejection> {
             m.opened = false;
             m.approvable = false;
         }
-        (
-            P::AwaitingRelease(ReleaseItem::ScriptResult | ReleaseItem::ScriptErrorDetails),
-            E::Instance(_),
-        ) => m.bump(),
 
         (P::StaleCheck, E::StalePassed) => {
             m.phase = P::Executing;
@@ -543,11 +550,19 @@ mod tests {
         InstanceEvt::InstanceChanged,
         InstanceEvt::UserRenamed,
     ];
-    const TERMINALS: [Terminal; 12] = [
+    /// Every reachable terminal state (an outcome item cannot be released redacted).
+    const TERMINALS: [Terminal; 19] = [
         Terminal::Rejected,
         Terminal::Failed,
-        Terminal::Released,
-        Terminal::ReleasedRedacted,
+        Terminal::Released(ReleaseItem::Result),
+        Terminal::Released(ReleaseItem::UpstreamError),
+        Terminal::Released(ReleaseItem::Outcome),
+        Terminal::Released(ReleaseItem::ScriptResult),
+        Terminal::Released(ReleaseItem::ScriptErrorDetails),
+        Terminal::ReleasedRedacted(ReleaseItem::Result),
+        Terminal::ReleasedRedacted(ReleaseItem::UpstreamError),
+        Terminal::ReleasedRedacted(ReleaseItem::ScriptResult),
+        Terminal::ReleasedRedacted(ReleaseItem::ScriptErrorDetails),
         Terminal::Denied,
         Terminal::Succeeded,
         Terminal::OutcomeUnknown,
@@ -616,7 +631,7 @@ mod tests {
     }
     const PHASE_VARIANTS: usize = 13;
 
-    /// Every phase with every sub-state (33).
+    /// Every reachable phase with every sub-state (40).
     fn all_phases() -> Vec<Phase> {
         let mut v = vec![P::Received, P::Validated, P::Fetching];
         v.extend(ITEMS.map(P::AwaitingRelease));
@@ -701,7 +716,7 @@ mod tests {
 
     fn snap(m: &Model) -> Snap {
         Snap {
-            kind: m.kind,
+            kind: m.kind(),
             phase: m.phase(),
             rev: m.rev(),
             opened: m.opened(),
@@ -923,28 +938,25 @@ mod tests {
             done(Terminal::Failed),
             vec![vp, V(E::FetchStarted), V(E::FetchFailedDirect)],
         ));
-        t.push(tg(
-            Kind::Read,
-            done(Terminal::Released),
-            with(
-                released.clone(),
-                &[V(E::Release {
-                    rev: 1,
-                    redacted: false,
-                })],
-            ),
-        ));
-        t.push(tg(
-            Kind::Read,
-            done(Terminal::ReleasedRedacted),
-            with(
-                released.clone(),
-                &[V(E::Release {
-                    rev: 1,
-                    redacted: true,
-                })],
-            ),
-        ));
+        for i in ITEMS {
+            let (kind, to) = if READ_ITEMS.contains(&i) {
+                (Kind::Read, open(read_to(i)))
+            } else {
+                (Kind::Script, open(script_to(i)))
+            };
+            for redacted in [false, true] {
+                if redacted && i == ReleaseItem::Outcome {
+                    continue; // an outcome item cannot be redacted
+                }
+                let term = if redacted {
+                    Terminal::ReleasedRedacted(i)
+                } else {
+                    Terminal::Released(i)
+                };
+                let release = V(E::Release { rev: 1, redacted });
+                t.push(tg(kind, done(term), with(to.clone(), &[release])));
+            }
+        }
         t.push(tg(
             Kind::Read,
             done(Terminal::Denied),
@@ -1072,13 +1084,13 @@ mod tests {
                 Err(Rejection::Illegal)
             }
             (
-                P::AwaitingRelease(_),
+                P::AwaitingRelease(i),
                 E::Release {
                     redacted: false, ..
                 },
-            ) => done(Terminal::Released),
-            (P::AwaitingRelease(_), E::Release { redacted: true, .. }) => {
-                done(Terminal::ReleasedRedacted)
+            ) => done(Terminal::Released(i)),
+            (P::AwaitingRelease(i), E::Release { redacted: true, .. }) => {
+                done(Terminal::ReleasedRedacted(i))
             }
             // Only AwaitingApproval(preview) is approvable (inv. 6).
             (P::AwaitingApproval(Hold::Preview), E::Approve { .. }) => to(P::StaleCheck),
@@ -1101,9 +1113,6 @@ mod tests {
             // Instance events never re-decide the hold (inv. 6); a refresh does.
             (P::AwaitingApproval(_), E::Instance(_)) => bump(phase),
             (P::AwaitingApproval(_), E::EnrichStarted) if kind == Kind::Write => to(P::Enriching),
-            (P::AwaitingRelease(I::ScriptResult | I::ScriptErrorDetails), E::Instance(_)) => {
-                bump(phase)
-            }
 
             // StaleCheck → Executing | Stale → AwaitingApproval (§5.4 step 5).
             (P::StaleCheck, E::StalePassed) => to(P::Executing),
@@ -1148,7 +1157,7 @@ mod tests {
             phases.iter().all(|&b| b),
             "all_phases misses a variant: {phases:?}"
         );
-        assert_eq!(all_phases().len(), 33);
+        assert_eq!(all_phases().len(), 40);
         Ok(())
     }
 
@@ -1232,7 +1241,7 @@ mod tests {
                 became_terminal: true
             }
         );
-        assert_eq!(m.phase(), P::Done(Terminal::Released));
+        assert_eq!(m.phase(), P::Done(Terminal::Released(ReleaseItem::Result)));
         assert_eq!(agent_status(&m), Status::Released);
 
         // Release with redactions.
@@ -1244,10 +1253,14 @@ mod tests {
                 redacted: true,
             },
         )?;
-        assert_eq!(m.phase(), P::Done(Terminal::ReleasedRedacted));
+        assert_eq!(
+            m.phase(),
+            P::Done(Terminal::ReleasedRedacted(ReleaseItem::Result))
+        );
         assert_eq!(agent_status(&m), Status::Released);
 
-        // Upstream-error card: release (status only is a redaction) or deny.
+        // Upstream-error card: release (status only is a redaction) or deny. A released upstream
+        // error is delivered as `failed`, exit 6 (§5.2 step 6, §4.3).
         let mut m = run(Kind::Read, &open(read_to(ReleaseItem::UpstreamError)))?;
         ok(
             &mut m,
@@ -1256,7 +1269,11 @@ mod tests {
                 redacted: true,
             },
         )?;
-        assert_eq!(m.phase(), P::Done(Terminal::ReleasedRedacted));
+        assert_eq!(
+            m.phase(),
+            P::Done(Terminal::ReleasedRedacted(ReleaseItem::UpstreamError))
+        );
+        assert_eq!(agent_status(&m), Status::Failed);
         let mut m = run(Kind::Read, &read_to(ReleaseItem::UpstreamError))?;
         ok(&mut m, E::Deny { rev: 1 })?; // deny needs no opened preview
         assert_eq!(m.phase(), P::Done(Terminal::Denied));
@@ -1279,7 +1296,8 @@ mod tests {
                 redacted: false,
             },
         )?;
-        assert_eq!(m.phase(), P::Done(Terminal::Released));
+        assert_eq!(m.phase(), P::Done(Terminal::Released(ReleaseItem::Outcome)));
+        assert_eq!(agent_status(&m), Status::Failed);
 
         // Data-free direct failure, validation failure.
         let mut m = run(Kind::Read, &[V(E::ValidationPassed), V(E::FetchStarted)])?;
@@ -1569,12 +1587,27 @@ mod tests {
                 redacted: true,
             },
         )?;
-        assert_eq!(m.phase(), P::Done(Terminal::ReleasedRedacted));
+        assert_eq!(
+            m.phase(),
+            P::Done(Terminal::ReleasedRedacted(ReleaseItem::ScriptResult))
+        );
+        assert_eq!(agent_status(&m), Status::Released);
 
-        // Error details go through the release flow too.
+        // Error details go through the release flow too (released: `released`, exit 8).
         let mut m = run(Kind::Script, &script_to(ReleaseItem::ScriptErrorDetails))?;
+        let mut n = m.clone();
         ok(&mut m, E::Deny { rev: 1 })?;
         assert_eq!(m.phase(), P::Done(Terminal::Denied));
+        ok(&mut n, E::PreviewShown { rev: 1 })?;
+        n.set_approvable(true);
+        ok(
+            &mut n,
+            E::Release {
+                rev: 1,
+                redacted: false,
+            },
+        )?;
+        assert_eq!(agent_status(&n), Status::Released);
 
         // Only a direct SCRIPT_FAILED is returned without release; compile errors too.
         let running = [
@@ -1603,9 +1636,15 @@ mod tests {
             P::Done(Terminal::Cancelled(CancelReason::ByClient))
         );
 
-        // Instance events invalidate a script candidate (new revision).
+        // A credential or base-URL change invalidates a script candidate through
+        // `CandidateChanged` (Task 25); instance events themselves are for writes only.
         let mut m = run(Kind::Script, &open(script_to(ReleaseItem::ScriptResult)))?;
-        ok(&mut m, E::Instance(InstanceEvt::CredentialChanged))?;
+        rejects(
+            &mut m,
+            E::Instance(InstanceEvt::CredentialChanged),
+            Rejection::Illegal,
+        )?;
+        ok(&mut m, E::CandidateChanged)?;
         assert_eq!((m.rev(), m.opened()), (2, false));
         rejects(
             &mut m,
@@ -1995,7 +2034,7 @@ mod tests {
                 let c = usize::from(c);
                 match m.phase() {
                     P::Received => E::ValidationPassed,
-                    P::Validated => match m.kind {
+                    P::Validated => match m.kind() {
                         Kind::Read => E::FetchStarted,
                         Kind::Write => E::EnrichStarted,
                         Kind::Script => E::CompileStarted,
@@ -2235,6 +2274,11 @@ mod tests {
         }
         if is_pending(a.phase) {
             prop_assert_eq!(a.approved_unreturned, sh.approved_live);
+            // The flag is exactly "in the approved stretch" (review M-7).
+            prop_assert_eq!(
+                a.approved_unreturned,
+                matches!(a.phase, P::StaleCheck | P::Executing)
+            );
         }
         // (5) `pending` before the first accepted StalePassed, never `pending` after it.
         if e == E::StalePassed {
