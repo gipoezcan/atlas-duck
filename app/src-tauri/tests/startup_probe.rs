@@ -83,6 +83,9 @@ fn assert_windows_floor_evidence(label: &str, report: &ProbeReport) {
     }
     if expect_floor_met() {
         assert!(matches!(report.floor, FloorVerdict::Met), "{report:#?}");
+        // pinned to LPAC: a silent regression that the plain-AppContainer fallback hides is red
+        assert_eq!(confinement.lpac, Some(true), "{label}: {confinement:?}");
+        assert_eq!(report.lpac_failed, None, "{label}");
     }
 }
 

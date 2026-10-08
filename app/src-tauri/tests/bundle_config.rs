@@ -730,7 +730,10 @@ mod t21 {
         );
         assert!(text.contains("-ne 'met'"), "floor=met is not asserted");
         assert!(text.contains("-ne 'none'"), "failed=none is not asserted");
-        assert!(text.contains("appcontainer_mode"));
+        assert!(
+            text.contains("-ne 'lpac'") && text.contains("lpac_failed"),
+            "the LPAC mode is not pinned"
+        );
         assert!(text.contains("control_ok"));
         assert!(text.contains("PROBE_RECORD"));
         assert!(text.contains("EVIDENCE_JSON"));

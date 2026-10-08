@@ -91,11 +91,14 @@ function Get-ProbeLines([string]$LogPath) {
     return $found
 }
 
-# Asserts floor=met failed=none and the expected ace=.
+# Asserts floor=met failed=none, appcontainer_mode=lpac lpac_failed=n/a (a silent LPAC regression that
+# the plain-AppContainer fallback hides must turn the leg red) and the expected ace=.
 function Assert-ProbeFields($Fields, [string]$ExpectedAce) {
     $summary = ($Fields.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '
     if ($Fields['floor'] -ne 'met') { Fail "floor is not met (failed=$($Fields['failed'])): $summary" }
     if ($Fields['failed'] -ne 'none') { Fail "failed probes reported although floor=met: $summary" }
+    if ($Fields['appcontainer_mode'] -ne 'lpac') { Fail "appcontainer_mode=$($Fields['appcontainer_mode']), expected lpac: $summary" }
+    if ($Fields['lpac_failed'] -ne 'n/a') { Fail "lpac_failed=$($Fields['lpac_failed']), expected n/a (LPAC floor met without fallback): $summary" }
     if ($Fields['ace'] -ne $ExpectedAce) { Fail "ace=$($Fields['ace']), expected ${ExpectedAce}: $summary" }
 }
 
@@ -258,6 +261,8 @@ function Invoke-SelfTest {
     Assert-Throws { Assert-ProbeFields $f 'reapplied' } 'Assert-ProbeFields with the wrong ace'
     # a not_met floor fails whatever the ace is
     Assert-Throws { Assert-ProbeFields $g 'missing_no_write_dac' } 'Assert-ProbeFields on a not_met line with its own ace'
+    $fallback = ConvertFrom-ProbeLine ($met -replace 'appcontainer_mode=lpac', 'appcontainer_mode=appcontainer' -replace 'lpac_failed=n/a', 'lpac_failed=cred_read')
+    Assert-Throws { Assert-ProbeFields $fallback 'present' } 'Assert-ProbeFields on a floor=met line that fell back to plain AppContainer'
     $metFailed = ConvertFrom-ProbeLine ($met -replace 'failed=none', 'failed=cred_read')
     Assert-Throws { Assert-ProbeFields $metFailed 'present' } 'Assert-ProbeFields on floor=met with failed probes'
 
