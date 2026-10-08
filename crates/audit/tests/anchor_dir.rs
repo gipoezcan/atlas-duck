@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use atlas_duck_audit::anchor_dir::{AnchorLine, AnchorLineError, file_name, parse_line, to_line};
+use atlas_duck_audit::anchors::{FirstRetainedAnchor, HeadAnchor};
+use atlas_duck_audit::keystore::service_name;
 use atlas_duck_audit::testing::{self, FakePrune, MemKeyring};
 use atlas_duck_audit::types::{Confirmed, EventFlags, EventType};
 use atlas_duck_audit::{
@@ -629,6 +631,24 @@ fn header_must_name_the_chain_and_come_first() {
     );
     let fs = full_verify_fresh(&f);
     assert!(has_kind(&fs, FindingKind::AnchorDirMismatch), "{fs:?}");
+
+    // A second header later in the file.
+    write_lines(
+        dir.path(),
+        &f.chain_id,
+        &[header(&f), record_line(&rows[0]), header(&f)],
+    );
+    let fs = full_verify_fresh(&f);
+    assert!(
+        fs.iter()
+            .any(|x| x.detail.contains("header line after line 1")),
+        "{fs:?}"
+    );
+
+    // An empty file has no header either.
+    write_lines(dir.path(), &f.chain_id, &[]);
+    let fs = full_verify_fresh(&f);
+    assert!(fs.iter().any(|x| x.detail.contains("is empty")), "{fs:?}");
 }
 
 // ---------------------------------------------------------------------------------------
@@ -692,16 +712,16 @@ fn unreadable_anchor_dir_setting_is_a_finding() {
     assert!(unknown(&fs), "{fs:?}");
 }
 
-#[test]
-fn anchor_dir_finding_blocks_interrupted_prune_reconciliation() {
+/// A store whose last `PRUNE` (first retained seq 6) committed but whose first-retained
+/// update did not happen (a crash right after the commit): the head anchor is before it.
+fn interrupted_prune() -> (Fixture, TempDir, u64) {
     let (store, f, dir) = anchored_store();
     corroborate(&store);
     store.append_batch(mixed(10)).expect("append");
     store.testing_enable_anchors();
     store.flush_head_anchor().expect("flush");
     store.testing_pause_anchors();
-    // Crash right after the PRUNE commit: no first-retained update, head anchor before it.
-    testing::insert_fake_prune(
+    let prune = testing::insert_fake_prune(
         &store,
         FakePrune {
             first_retained_seq: 6,
@@ -710,8 +730,26 @@ fn anchor_dir_finding_blocks_interrupted_prune_reconciliation() {
             update_first_retained: false,
         },
     )
-    .expect("fake prune");
+    .expect("fake prune")
+    .seq;
     store.shutdown();
+    (f, dir, prune)
+}
+
+fn keychain_anchor(f: &Fixture, entry: &str) -> Option<Vec<u8>> {
+    f.ring.raw_get(&service_name(&f.install_id), entry)
+}
+
+fn open_ready(f: &Fixture) -> (Store, Vec<VerifyFinding>) {
+    match open(&f.data, &f.lock, f.config()).expect("open") {
+        StartupOutcome::Ready { store, verify } => (store, verify.findings),
+        other => panic!("not ready: {other:?}"),
+    }
+}
+
+#[test]
+fn contradicting_anchor_line_blocks_interrupted_prune_reconciliation() {
+    let (f, dir, _) = interrupted_prune();
     let v = testing::startup_verdict(&f.data, &f.config()).expect("verdict");
     assert!(
         has_kind(&v.findings, FindingKind::InterruptedPruneReconciled),
@@ -719,8 +757,13 @@ fn anchor_dir_finding_blocks_interrupted_prune_reconciliation() {
     );
     assert!(v.anchor_actions.set_first_retained.is_some());
 
-    // The same with an anchor dir that cannot be read: not reconciled.
-    dir.close().expect("remove anchor dir");
+    // A readable line that contradicts the store: not reconciled.
+    let rows = dump_rows(&f);
+    let mut wrong = record_line(rows.last().expect("rows"));
+    if let AnchorLine::Record { record_hash, .. } = &mut wrong {
+        record_hash[0] ^= 1;
+    }
+    write_lines(dir.path(), &f.chain_id, &[header(&f), wrong]);
     let v = testing::startup_verdict(&f.data, &f.config()).expect("verdict");
     assert!(
         has_kind(&v.findings, FindingKind::AnchorDirMismatch),
@@ -731,6 +774,114 @@ fn anchor_dir_finding_blocks_interrupted_prune_reconciliation() {
         "{v:?}"
     );
     assert!(v.anchor_actions.set_first_retained.is_none());
+    assert!(v.anchor_actions.defer_prune.is_none());
+}
+
+#[test]
+fn unreadable_anchor_dir_defers_interrupted_prune_reconciliation() {
+    let (f, dir, prune) = interrupted_prune();
+    let path = dir.path().to_path_buf();
+    dir.close().expect("remove anchor dir");
+
+    // Started while the share is offline: an incident for the unreadable dir, but neither a
+    // FirstRetainedMismatch nor a reconciliation; the head anchor stays at or before the PRUNE.
+    let (store, findings) = open_ready(&f);
+    assert!(
+        has_kind(&findings, FindingKind::AnchorDirMismatch),
+        "{findings:?}"
+    );
+    assert!(
+        !has_kind(&findings, FindingKind::FirstRetainedMismatch),
+        "{findings:?}"
+    );
+    assert!(
+        !has_kind(&findings, FindingKind::InterruptedPruneReconciled),
+        "{findings:?}"
+    );
+    assert_eq!(
+        store.health().anchors_blocked,
+        Some(atlas_duck_audit::anchors::BarrierKind::Prune)
+    );
+    assert!(store.health().first_retained_update_pending);
+    store.append_batch(mixed(4)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    let head =
+        HeadAnchor::from_entry(&keychain_anchor(&f, "head_anchor").expect("head")).expect("layout");
+    assert!(
+        head.seq <= prune,
+        "head anchor {} passed PRUNE {prune}",
+        head.seq
+    );
+    store.shutdown();
+    let first = keychain_anchor(&f, "first_retained_anchor").expect("first-retained");
+    assert_eq!(
+        FirstRetainedAnchor::from_entry(&first)
+            .expect("layout")
+            .first_retained_seq,
+        1
+    );
+
+    // The share is back: the next start reconciles the prune without an incident.
+    std::fs::create_dir(&path).expect("restore anchor dir");
+    let (store, findings) = open_ready(&f);
+    assert!(
+        has_kind(&findings, FindingKind::InterruptedPruneReconciled),
+        "{findings:?}"
+    );
+    assert!(
+        findings.iter().all(|x| !x.kind.is_incident()),
+        "{findings:?}"
+    );
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let first = keychain_anchor(&f, "first_retained_anchor").expect("first-retained");
+    assert_eq!(
+        FirstRetainedAnchor::from_entry(&first)
+            .expect("layout")
+            .first_retained_seq,
+        6
+    );
+}
+
+#[test]
+fn anchor_file_of_newlines_is_bounded() {
+    let (store, f, dir) = anchored_store();
+    store.shutdown();
+    std::fs::write(
+        dir.path().join(file_name(&f.chain_id)),
+        vec![b'\n'; 1 << 20],
+    )
+    .expect("write");
+    let started = Instant::now();
+    let fs = full_verify_fresh(&f);
+    let mismatches = fs
+        .iter()
+        .filter(|x| x.kind == FindingKind::AnchorDirMismatch)
+        .count();
+    assert!(mismatches <= 20, "{mismatches} findings");
+    let summaries = fs
+        .iter()
+        .filter(|x| x.detail.contains("more lines are not valid anchor lines"))
+        .count();
+    assert_eq!(summaries, 1, "{fs:?}");
+    assert!(
+        fs.iter()
+            .any(|x| x.detail.contains("more than 1000000 lines")),
+        "{fs:?}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(60));
+}
+
+#[test]
+fn relative_anchor_dir_is_a_finding() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    store.shutdown();
+    let fs = full_verify_with(&f, |cfg| cfg.anchor_dir = Some(PathBuf::from("anchors")));
+    assert!(
+        fs.iter().any(|x| x.kind == FindingKind::AnchorDirMismatch
+            && x.detail.contains("not an absolute path")),
+        "{fs:?}"
+    );
 }
 
 #[test]

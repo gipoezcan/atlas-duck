@@ -40,6 +40,13 @@ pub const MAX_LINE_BYTES: usize = 4096;
 /// far below it.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Lines read per file; the rest is not read (a finding). It bounds the per-line lookups a
+/// verification run makes (decades of daily and immediate lines stay far below it).
+pub const MAX_LINES: usize = 1_000_000;
+
+/// Unparseable lines reported one by one per file; the rest is counted in one summary.
+pub const MAX_BAD_LINES_REPORTED: usize = 16;
+
 /// The event types written as immediate lines (§8.5).
 const IMMEDIATE_TYPES: [&str; 6] = [
     "PRUNE",
@@ -401,8 +408,12 @@ pub(crate) struct AnchorDirLines {
     /// Per `chain_id`, the parsed lines of `<chain_id>.jsonl` with their 1-based line numbers.
     pub(crate) chains: BTreeMap<String, Vec<(usize, AnchorLine)>>,
     /// What could not be read: the dir, a file, a line. Each is an `AnchorDirMismatch`, never
-    /// a clean pass.
+    /// a clean pass, but none contradicts the store (it defers, not refuses, a reconciliation).
+    /// Bounded: at most a few per file.
     pub(crate) problems: Vec<VerifyFinding>,
+    /// Store `chain_id`s that are not valid ids (their files were not read): a store defect,
+    /// reported by [`check`].
+    pub(crate) invalid_chain_ids: usize,
 }
 
 impl AnchorDirLines {
@@ -433,7 +444,8 @@ fn problem(detail: impl Into<String>) -> VerifyFinding {
 /// The chains whose records the store holds: the first and the newest record's, and each
 /// `RESTORE`'s and its predecessor's (`chain_id` changes only at a `RESTORE`, §8.11, which
 /// the chain walk checks). Uses the `event_type` index rather than a table scan.
-fn store_chains(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
+/// A `chain_id` that is not text reads as `None`.
+fn store_chains(conn: &Connection) -> rusqlite::Result<BTreeSet<Option<String>>> {
     let mut stmt = conn.prepare(
         "SELECT chain_id FROM events WHERE seq = (SELECT min(seq) FROM events) \
          UNION SELECT chain_id FROM events WHERE seq = (SELECT max(seq) FROM events) \
@@ -444,17 +456,19 @@ fn store_chains(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
     let mut rows = stmt.query([])?;
     let mut out = BTreeSet::new();
     while let Some(r) = rows.next()? {
-        if let ValueRef::Text(t) = r.get_ref(0)? {
-            out.insert(String::from_utf8_lossy(t).into_owned());
-        }
+        out.insert(match r.get_ref(0)? {
+            ValueRef::Text(t) => Some(String::from_utf8_lossy(t).into_owned()),
+            _ => None,
+        });
     }
     Ok(out)
 }
 
 /// Reads `<chain_id>.jsonl` for every chain of the store from `dir` (`None`: no anchor dir is
-/// configured, nothing to compare). A dir that cannot be read, a file that cannot be read and
-/// a line that does not parse are problems (findings). A missing file is not: nothing writes
-/// one before M10. Only a database error is an `Err`.
+/// configured, nothing to compare). A dir that is not absolute or cannot be read, a file that
+/// cannot be read, is empty or too long, and a line that does not parse are problems
+/// (findings). A missing file is not: nothing writes one before M10. Only a database error is
+/// an `Err`.
 pub(crate) fn load(
     dir: Option<&Path>,
     conn: &Connection,
@@ -464,6 +478,12 @@ pub(crate) fn load(
     };
     let chains = store_chains(conn).map_err(|e| OpenError::Sqlite(e.to_string()))?;
     let mut out = AnchorDirLines::default();
+    if !dir.is_absolute() {
+        // It would resolve against the working directory of the process.
+        out.problems
+            .push(problem("the anchor directory is not an absolute path"));
+        return Ok(Some(out));
+    }
     match std::fs::metadata(dir) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => {
@@ -480,16 +500,18 @@ pub(crate) fn load(
         }
     }
     for chain in chains {
-        if !is_id(&chain) {
-            // Never a path component: a tampered chain_id could name another file.
-            out.problems.push(problem(
-                "a chain_id of the store is not a valid id; its anchor file was not read",
-            ));
+        // Never a path component unless it is an id: a tampered one could name another file.
+        let Some(chain) = chain.filter(|c| is_id(c)) else {
+            out.invalid_chain_ids += 1;
             continue;
-        }
+        };
         let name = file_name(&chain);
         match read_file(&dir.join(&name)) {
             Ok(None) => {}
+            Ok(Some(bytes)) if bytes.is_empty() => {
+                out.problems
+                    .push(problem(format!("{name} is empty: it has no header line")));
+            }
             Ok(Some(bytes)) => {
                 let lines = parse_file(&name, &bytes, &mut out.problems);
                 out.chains.insert(chain, lines);
@@ -524,29 +546,46 @@ fn read_file(path: &Path) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(bytes))
 }
 
-/// Lines separated by `\n`; the empty remainder after a final newline is not a line. Every
-/// other line must parse (an empty one does not).
+/// Lines separated by `\n`, split lazily; the empty remainder after a final newline is not a
+/// line. Every other line must parse (an empty one does not). At most
+/// [`MAX_BAD_LINES_REPORTED`] bad lines are reported one by one, the rest in one summary, and
+/// at most [`MAX_LINES`] lines are read, so a file of garbage costs bounded memory and time.
 fn parse_file(
     name: &str,
     bytes: &[u8],
     problems: &mut Vec<VerifyFinding>,
 ) -> Vec<(usize, AnchorLine)> {
     let mut lines = Vec::new();
-    let mut parts: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-    if parts.last().is_some_and(|p| p.is_empty()) {
-        parts.pop();
-    }
-    for (i, raw) in parts.into_iter().enumerate() {
+    let body = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let mut bad = 0usize;
+    for (i, raw) in body.split(|b| *b == b'\n').enumerate() {
         let n = i + 1;
+        if n > MAX_LINES {
+            problems.push(problem(format!(
+                "{name} has more than {MAX_LINES} lines; the rest was not read"
+            )));
+            break;
+        }
         let parsed = std::str::from_utf8(raw)
             .map_err(|_| AnchorLineError::NotJson)
             .and_then(parse_line);
         match parsed {
             Ok(l) => lines.push((n, l)),
-            Err(e) => problems.push(problem(format!(
-                "{name} line {n} is not a valid anchor line: {e}"
-            ))),
+            Err(e) => {
+                bad += 1;
+                if bad <= MAX_BAD_LINES_REPORTED {
+                    problems.push(problem(format!(
+                        "{name} line {n} is not a valid anchor line: {e}"
+                    )));
+                }
+            }
         }
+    }
+    if bad > MAX_BAD_LINES_REPORTED {
+        problems.push(problem(format!(
+            "{name}: {} more lines are not valid anchor lines",
+            bad - MAX_BAD_LINES_REPORTED
+        )));
     }
     lines
 }
@@ -652,12 +691,19 @@ fn named(l: &AnchorLine) -> Option<Named<'_>> {
 /// `first_retained_seq`) must match that record (`AnchorDirMismatch`); a line naming a pruned
 /// seq is judged against the `prune_log` row whose range covers it
 /// (`AnchoredRecordPrunedEarly`); a `Prune` line must match a `prune_log` row; a header must
-/// open its file and name its chain. Returns the load problems first.
+/// open its file and name its chain. Every finding is a line contradicting the store (or an
+/// invalid store `chain_id`); the load problems in `lines.problems` are not repeated.
 pub(crate) fn check(
     lines: &AnchorDirLines,
     ctx: &VerifyCtx<'_>,
 ) -> rusqlite::Result<Vec<VerifyFinding>> {
-    let mut out = lines.problems.clone();
+    let mut out = Vec::new();
+    if lines.invalid_chain_ids > 0 {
+        out.push(problem(format!(
+            "{} chain_id(s) of the store are not valid ids; their anchor files were not read",
+            lines.invalid_chain_ids
+        )));
+    }
     for (chain, file) in &lines.chains {
         let name = file_name(chain);
         // `Record` lines without `clock_behind`: the witnesses of the clock_behind rule.
@@ -672,8 +718,9 @@ pub(crate) fn check(
                 _ => None,
             })
             .collect();
-        if let Some((n, l)) = file.first()
-            && (*n != 1 || !matches!(l, AnchorLine::Header { .. }))
+        // An unreadable line 1 is already a load problem.
+        if let Some((1, l)) = file.first()
+            && !matches!(l, AnchorLine::Header { .. })
         {
             out.push(problem(format!("{name} does not start with a header line")));
         }
@@ -681,7 +728,9 @@ pub(crate) fn check(
             let at = |what: &str| format!("{name} line {n}: {what}");
             match l {
                 AnchorLine::Header { chain_id, .. } => {
-                    if chain_id != chain {
+                    if *n != 1 {
+                        out.push(problem(at("a header line after line 1")));
+                    } else if chain_id != chain {
                         out.push(problem(at("the header names another chain")));
                     }
                 }
@@ -793,7 +842,8 @@ fn check_retained(
 ///   judgement ("while that record is retained", §8.7); if it is retained and its
 ///   `date(ts_utc)` is not older than the cutoff, the prune was early. No such line: no
 ///   judgement.
-/// - `epoch: null` (L36): the effective epoch is not known from the line; no judgement.
+/// - `epoch: null` (L36): the effective epoch is not known from the line, so the epoch rule
+///   does not apply (a `clock_behind` line is still judged by its witness).
 fn check_pruned(
     ctx: &VerifyCtx<'_>,
     l: &AnchorLine,

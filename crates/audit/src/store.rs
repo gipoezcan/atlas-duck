@@ -824,7 +824,10 @@ impl Store {
     /// has no finding), then the anchor actions, then enables anchor writes. An interrupted
     /// prune gets its prune barrier (first-retained written before the head passes the
     /// `PRUNE`); an interrupted restore gets a restore barrier, which only the restore
-    /// completion (T16) lifts. If the `VERIFY` append fails, anchors stay disabled.
+    /// completion (T16) lifts. A reconciliation deferred because the anchor dir could not be
+    /// read keeps the head anchor at or before its `PRUNE`/`RESTORE` for this process (a hold
+    /// or restore barrier nothing lifts), so the next start can reconcile it. If the `VERIFY`
+    /// append fails, anchors stay disabled.
     pub(crate) fn apply_startup(&self, v: &StartupVerdict) -> Result<VerifyOutcome, AuditError> {
         let verify_seq = if v.findings.is_empty() {
             None
@@ -847,6 +850,14 @@ impl Store {
                 seq: p.seq,
                 record_hash: p.record_hash,
                 first_retained: fr.clone(),
+            })?
+            .complete();
+        } else if let Some(seq) = a.defer_restore {
+            self.install_barrier(Barrier::Restore { seq })?.complete();
+        } else if let Some(p) = &a.defer_prune {
+            self.install_barrier(Barrier::Hold {
+                seq: p.seq,
+                record_hash: p.record_hash,
             })?
             .complete();
         }

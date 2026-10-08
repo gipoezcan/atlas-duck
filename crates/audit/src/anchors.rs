@@ -235,6 +235,10 @@ pub(crate) enum Barrier {
     /// No head write at all until the restore completion step wrote both entries: an anchor
     /// from before the `RESTORE` would describe the replaced DB.
     Restore { seq: u64 },
+    /// Like `Prune` but nothing lifts it in this process: an interrupted prune whose startup
+    /// reconciliation was deferred because the anchor dir could not be read. The head anchor
+    /// stays at or before the `PRUNE`, so the next start can still reconcile it (§8.7 (d)).
+    Hold { seq: u64, record_hash: [u8; 32] },
     /// A prune is about to commit: the slot is taken so its `Prune` barrier can be set right
     /// after the commit and before the new head is published. Caps and writes nothing (nothing
     /// past the current head is published meanwhile).
@@ -244,7 +248,9 @@ pub(crate) enum Barrier {
 impl Barrier {
     fn kind(&self) -> BarrierKind {
         match self {
-            Barrier::Prune { .. } | Barrier::PruneReserved => BarrierKind::Prune,
+            Barrier::Prune { .. } | Barrier::Hold { .. } | Barrier::PruneReserved => {
+                BarrierKind::Prune
+            }
             Barrier::Restore { .. } => BarrierKind::Restore,
         }
     }
@@ -319,9 +325,12 @@ impl AnchorState {
         }
         match &self.barrier {
             Some(Barrier::Restore { .. }) => None,
-            Some(Barrier::Prune {
-                seq, record_hash, ..
-            }) => self.head.as_ref().map(|h| {
+            Some(
+                Barrier::Prune {
+                    seq, record_hash, ..
+                }
+                | Barrier::Hold { seq, record_hash },
+            ) => self.head.as_ref().map(|h| {
                 if h.seq > *seq {
                     HeadAnchor {
                         chain_id: h.chain_id.clone(),
@@ -674,7 +683,10 @@ impl AnchorShared {
         let st = lock(&self.state);
         AnchorHealth {
             write_failing: st.failures > 0 || st.dead,
-            first_retained_pending: matches!(st.barrier, Some(Barrier::Prune { .. })),
+            first_retained_pending: matches!(
+                st.barrier,
+                Some(Barrier::Prune { .. } | Barrier::Hold { .. })
+            ),
             blocked: st.barrier.as_ref().map(Barrier::kind),
             thread_dead: st.dead,
         }

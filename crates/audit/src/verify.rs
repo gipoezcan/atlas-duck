@@ -105,9 +105,9 @@ impl FindingKind {
     }
 }
 
-/// Findings about the chain itself or against the anchor dir; an interrupted prune or restore
-/// is reconciled only when none of them was found.
-const CHAIN_KINDS: [FindingKind; 13] = [
+/// Findings about the chain itself; an interrupted prune or restore is reconciled only when
+/// none of them (and no anchor-dir line contradicting the store) was found.
+const CHAIN_KINDS: [FindingKind; 11] = [
     FindingKind::ChainBroken,
     FindingKind::SeqGap,
     FindingKind::UnknownFlagBits,
@@ -119,8 +119,6 @@ const CHAIN_KINDS: [FindingKind; 13] = [
     FindingKind::DecryptFailed,
     FindingKind::PayloadHashMismatch,
     FindingKind::RestoreBoundaryMismatch,
-    FindingKind::AnchorDirMismatch,
-    FindingKind::AnchoredRecordPrunedEarly,
 ];
 
 /// One finding (F.11 `findings[]`). The hashes are chain hashes (not secret).
@@ -223,6 +221,12 @@ pub struct AnchorActions {
     pub prune_record: Option<HeadAnchor>,
     /// Interrupted restore: the reset to complete (T16).
     pub complete_restore: Option<RestoreCompletion>,
+    /// An interrupted prune that would be reconciled, but the anchor dir could not be read: the
+    /// head anchor stays capped at this `PRUNE` for the whole process (no first-retained
+    /// write), so the next start, with the dir readable, can still reconcile it.
+    pub defer_prune: Option<HeadAnchor>,
+    /// The same for an interrupted restore: the `RESTORE` seq; no head anchor is written.
+    pub defer_restore: Option<u64>,
 }
 
 /// The startup verdict (§8.7 step 3), held in memory until step 4 appends its `VERIFY`.
@@ -1094,8 +1098,12 @@ struct AnchorCheck<'a> {
     first: Option<u64>,
     scope_start: Option<u64>,
     log: &'a [PruneLogRow],
-    /// No chain, prune-log, first-retained or decrypt finding so far.
+    /// No chain, prune-log, first-retained or decrypt finding so far, and no anchor-dir line
+    /// that contradicts the store.
     clean: bool,
+    /// The anchor dir (or a file or line of it) could not be read: a reconciliation is
+    /// deferred to a start that can read it rather than refused.
+    anchor_dir_unread: bool,
 }
 
 struct AnchorResult {
@@ -1204,7 +1212,9 @@ fn check_anchors(
         (None, _, _) => false,
     };
     if let Some(rc) = interrupted_restore(conn, deks, c)? {
-        if c.mode == Mode::Startup {
+        if c.mode == Mode::Startup && c.anchor_dir_unread {
+            res.actions.defer_restore = Some(rc.restore_seq);
+        } else if c.mode == Mode::Startup {
             out.push(
                 VerifyFinding::new(
                     FindingKind::InterruptedRestoreReconciled,
@@ -1342,7 +1352,13 @@ fn check_anchors(
     };
     match (reconciles, prune_hash, head_chain) {
         (Some(latest), Some(prune_hash), Some(chain)) => {
-            if c.mode == Mode::Startup {
+            if c.mode == Mode::Startup && c.anchor_dir_unread {
+                res.actions.defer_prune = Some(HeadAnchor {
+                    chain_id: chain.to_owned(),
+                    seq: latest.prune_seq,
+                    record_hash: prune_hash,
+                });
+            } else if c.mode == Mode::Startup {
                 out.push(
                     VerifyFinding::new(
                         FindingKind::InterruptedPruneReconciled,
@@ -1382,6 +1398,15 @@ fn check_anchors(
     Ok(res)
 }
 
+/// What the anchor-dir checks found: a line contradicting the store (it blocks the
+/// interrupted-prune/restore reconciliation like a chain finding), and whether something
+/// could not be read (the reconciliation is deferred instead).
+#[derive(Default)]
+struct AnchorDirState {
+    contradicted: bool,
+    unread: bool,
+}
+
 /// The anchor-dir checks (§8.7) against the latest `prune_log` row, through the per-kind cap.
 fn check_anchor_dir(
     conn: &Connection,
@@ -1389,20 +1414,28 @@ fn check_anchor_dir(
     log: &[PruneLogRow],
     head: Option<u64>,
     out: &mut Findings,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<AnchorDirState> {
     let Some(lines) = lines else {
-        return Ok(());
+        return Ok(AnchorDirState::default());
     };
+    for p in &lines.problems {
+        out.push(p.clone());
+    }
     let ctx = VerifyCtx {
         conn,
         first_retained_seq: latest_values(log).0,
         head,
         prune_log: log,
     };
-    for f in anchor_dir::check(lines, &ctx)? {
+    let found = anchor_dir::check(lines, &ctx)?;
+    let state = AnchorDirState {
+        contradicted: !found.is_empty(),
+        unread: !lines.problems.is_empty(),
+    };
+    for f in found {
         out.push(f);
     }
-    Ok(())
+    Ok(state)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1465,14 +1498,15 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
             format!("the store's install_id {store_id} is not the pinned install_id {pinned}"),
         ));
     }
-    // The anchor dir, when configured; its findings block the reconciliations below.
-    check_anchor_dir(conn, inp.anchor_lines.as_ref(), &log, head, &mut out)?;
+    // The anchor dir, when configured: a contradicting line blocks the reconciliations below,
+    // a dir that cannot be read defers them (the head anchor stays capped).
+    let dir = check_anchor_dir(conn, inp.anchor_lines.as_ref(), &log, head, &mut out)?;
     // 8.–9. Anchor rule, interrupted prune and restore.
     let head_row = match head {
         Some(h) => row_head(conn, h)?,
         None => None,
     };
-    let clean = !out.any_of(&CHAIN_KINDS);
+    let clean = !out.any_of(&CHAIN_KINDS) && !dir.contradicted;
     let anchors = check_anchors(
         conn,
         &mut deks,
@@ -1488,6 +1522,7 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
             scope_start,
             log: &log,
             clean,
+            anchor_dir_unread: dir.unread,
         },
         &mut out,
     )?;
@@ -1702,12 +1737,12 @@ fn run_full(
             );
         }
     }
-    check_anchor_dir(conn, anchor_lines, &log, head, &mut out)?;
+    let dir = check_anchor_dir(conn, anchor_lines, &log, head, &mut out)?;
     let head_row = match head {
         Some(h) => row_head(conn, h)?,
         None => None,
     };
-    let clean = !out.any_of(&CHAIN_KINDS);
+    let clean = !out.any_of(&CHAIN_KINDS) && !dir.contradicted;
     check_anchors(
         conn,
         &mut deks,
@@ -1723,6 +1758,7 @@ fn run_full(
             scope_start: latest_of(conn, "'PRUNE', 'RESTORE', 'APP_START'")?.or(first),
             log: &log,
             clean,
+            anchor_dir_unread: dir.unread,
         },
         &mut out,
     )?;
