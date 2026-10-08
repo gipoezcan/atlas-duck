@@ -709,8 +709,15 @@ mod tests {
         let leak = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         assert!(leak > 2, "test setup: the leak fd is {leak}");
 
-        let w = spawn_cat();
+        let mut w = spawn_cat();
         let pid = w.pid() as libc::c_int;
+        // Look only once the worker has run its own code: right after the
+        // spawn a translated worker (CI, x86_64 under Rosetta) still holds a
+        // start-up descriptor 3 of the translator ("left: [0, 1, 2, 3]" in CI
+        // run 1); the echo of one frame proves the start-up is over.
+        assert!(w.stdin().write_all(&[0, 0, 0, 1, 0x5A]).is_ok());
+        assert!(w.stdin().flush().is_ok());
+        assert_eq!(w.read_frame_timeout(MAX, LONG).ok(), Some(Some(vec![0x5A])));
 
         let entry = std::mem::size_of::<libc::proc_fdinfo>();
         let mut buf = vec![0u8; entry * 256];

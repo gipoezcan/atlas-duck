@@ -329,7 +329,9 @@ mod seatbelt_child_tests {
 
         let lines: Vec<&str> = stdout
             .lines()
-            .filter_map(|l| l.strip_prefix("SEATBELT_CHILD "))
+            // libtest prints `test <name> ... ` before the child's first line,
+            // so the marker is not at the start of that line.
+            .filter_map(|l| l.split_once("SEATBELT_CHILD ").map(|(_, v)| v))
             .collect();
         assert!(
             out.status.success(),
