@@ -6,9 +6,13 @@
 pub mod lock;
 
 pub mod clock;
+pub mod encoding;
 pub mod error;
 pub mod keystore;
+pub mod request_set;
 pub mod types;
+
+pub use request_set::{RequestRecord, request_set_hash};
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

@@ -320,6 +320,9 @@ jobs:
       - name: CI script tests
         run: node --test "ci/*.test.mjs"
 
+      - name: Audit golden vectors (independent Node check, §8.4)
+        run: node ci/check-audit-vectors.mjs
+
       - name: M1 go/no-go record (T22)
         run: node ci/check-go-no-go.mjs docs/m1/go-no-go.md
 

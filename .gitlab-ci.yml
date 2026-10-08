@@ -71,6 +71,7 @@ node:ci-checks:
   script:
     - node ci/check-workspace.mjs
     - node --test "ci/*.test.mjs"
+    - node ci/check-audit-vectors.mjs
 
 supply-chain:
   stage: supply-chain
