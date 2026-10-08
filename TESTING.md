@@ -82,7 +82,7 @@ Data directories after pinning: `%LOCALAPPDATA%\atlas-duck-data`, `~/Library/App
    - `event=startup startup_state=...` (`ready` when the data dir is fine)
    - `event=sandbox_probe floor=met|not_met failed=... extra_layers=... engine_version=... worker_version=...`
    The log holds no secrets, paths or Jira data.
-4. **The `sandbox_probe` line.** The app starts a confined helper process and checks that the sandbox really blocks file access, network, process spawning and similar. `floor=met` means every check was blocked. `floor=not_met` means at least one was not; `failed=` names which. **Windows is expected to say `floor=not_met failed=connect_loopback+connect_public+cred_read`.** That is a known open item. M1 has no script feature, so nothing is exposed because of it; when scripts arrive they stay disabled on Windows until the floor is met. Linux and macOS are expected to say `floor=met failed=none`.
+4. **The `sandbox_probe` line.** The app starts a confined helper process and checks that the sandbox really blocks file access, network, process spawning and similar. `floor=met` means every check was blocked. `floor=not_met` means at least one was not; `failed=` names which. **All three OSes are expected to say `floor=met failed=none`.** On Windows the line also carries `appcontainer_mode=lpac control_ok=true`: the restricted AppContainer gives the helper no network stack or credential service, which the app checks against an unconfined control run. If you see `floor=not_met`, please report it.
 5. **CLI.** The command-line tool prints exactly one JSON error envelope and exits with code 2 for an unknown command:
    - Windows (PowerShell, in the install folder): `.\atlas-duck.exe bogus; $LASTEXITCODE`
      or `.\atlas-duck-app.exe __cli bogus; $LASTEXITCODE`
@@ -105,7 +105,7 @@ Send us:
 - Builds are unsigned: SmartScreen on Windows, Gatekeeper on macOS.
 - Icons are placeholders.
 - Startup dialog texts are placeholders and will change (`data directory <path> is not on a local filesystem`, `atlas-duck path settings <path> could not be read`, `data directory <path> could not be opened`).
-- Windows reports `floor=not_met`; scripts would be disabled there. There is no script engine in M1.
+- The sandbox check on Windows rests on a restricted token that has no network stack (verified against a control), not on a refused connection attempt; macOS carries a `task_for_pid` caveat. See docs/m1/go-no-go.md.
 - macOS `task_for_pid` confinement cannot be proven independently on CI; it is accepted for M1 with that caveat.
 - No auto-update.
 - Uninstalling keeps your data directory and the pinned file.
