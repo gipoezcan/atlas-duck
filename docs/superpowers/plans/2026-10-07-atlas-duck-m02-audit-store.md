@@ -2050,6 +2050,31 @@ exec dbus-run-session -- bash -euo pipefail -c '
 - **M6 (T15)**: a store whose KEK opens it but whose first-retained or head anchor entry is missing (deleted by a user, a crashed keychain write outside recovery) gets `AnchorMissing` at every start until the next prune, and neither recovery (refused: the KEK opens the store) nor open repairs it: M6 adds an explicit, confirmed "re-anchor" action that logs its own incident `VERIFY` and rewrites both anchors from the verified DB. A crash between the two archive renames leaves `audit.db-wal` without `audit.db` (refused by `open`/`create_new_store`, nothing lost): M6's message for that error points at `archived/` and the manual repair (move the WAL next to the archived `.db` as `<name>.db-wal`). After `archive_and_start_fresh` the wizard calls `new_ids()` (the old install's entries are kept as evidence for the archived DB; a "forget install" cleanup is M6's) and may log the archive confirmation's `dialog_text_sha256` once the new store exists.
 - **M10**: anchor-dir writer uses `anchor_dir::to_line`/`file_name`; export and `verify_export` reuse `encoding`, `request_set_hash`, `prune_row_hash`, `anchor_dir::check`; grep check that only native-dialog code constructs `RustChosenPath`/`Confirmed`.
 
+**Added by the M2 final review (2026-10-08).** Each item is also in the target plan: M3 items as "Handoff from M2:" bullets in the named M3 tasks, M4/M6/M10 items in the master plan's milestone entries (to be carried into those plans' "Consumes" when they are written).
+
+- **M3**
+  - (T12) While `health().settings_unreadable`, every instance is unconfirmed (`settings().instances` is then empty) and no stored token is used; the config loader normalises empty strings to `None` before building `FilePolicy`; core diffs against `settings()` before `apply_setting` (an unchanged value is `Invalid`). → M3 T25.
+  - (T16) After an in-process `Store::restore` (M10's restore UI while `Core` runs), `reconcile_config_file` must run again (prune stays blocked: `config_reconciled = false`), and the caller logs `RestoreReport.pats_deleted` as `INSTANCE_STATE_CHANGED {needs_token}` (PD-28 covers only reports from before `Core::start`). → M3 T28 (hook for M10).
+  - (T17) `reconcile_after_crash` `Err` (`InvalidRecord`, `Decrypt`, `Io`) at startup is an integrity problem: `StartError`, no `APP_START`; the call is startup-only (it races live appends). → M3 T28.
+  - (T17) `recent_headers` is a full table scan (no `ts_utc` index in v1): `requests_list` and similarity seeding cache it or budget for it. → M3 T19, T23.
+  - (T11) `PruneSkip::ClockBehind` is a variant beyond C.3 (match arms; M6 UI text). → M3 T25, M6.
+  - (I-1) `StartupOutcome::Ready.pats_deleted` and the third element of `finish_restore`'s result feed `CoreDeps.pats_deleted`. → M3 PD-28 (done in its text). Residual: a restore stopped between its commit and its PAT deletion is completed at the next start for the restored view's instances only; tokens of instances that only the replaced store's view knew stay in the keychain, so core uses a token only for an instance whose origin the current view confirms. → M3 T25.
+  - (I-2) `read_payload` returns `Zeroizing<Vec<u8>>`, whose `Debug` prints the bytes: never `Debug`-format it (`NewEvent`'s `Debug` already redacts the payload). → M3 T17.
+  - (M-1) `crates/audit/src` joins the panic-macro scan (excluding `src/testing.rs`); the audit lib itself already denies `clippy::{unwrap_used, expect_used, panic, unreachable, todo, unimplemented}` outside `cfg(test)`. → M3 T30.
+- **M4**
+  - (T10) An `open()` `Err` (a tampered newest key row; `Integrity("audit.db-wal exists without audit.db")`; `MigrationFailed`) is a startup error with an evidence-preserving message (nothing is deleted or archived, the files stay for inspection), never `FirstRun` and never a new store. Only `Locked(KeychainUnavailable)` is retried.
+- **M6**
+  - (T07, T10, T15 (d)) The wizard calls `new_ids()` before **every** `create_new_store` attempt, not only after `archive_and_start_fresh`: a failed attempt can leave keychain entries under its ids, and retrying with them is `Invalid("keychain entries already exist for this install_id")`. Recovery of a KEK the keychain reports as ambiguous and the cleanup of orphan entries of failed attempts ("forget install") are M6's.
+  - (T16 M-4) A live DB that cannot be read blocks `restore_from_source`: offer "archive and start fresh" first.
+  - (T16 M-3) The rollback `Confirmed` is not bound to `records_lost`: ask again if the head moved between the question and the call (also M10's restore UI).
+  - (T16 M-10, review M-6) `Store::restore` and `Store::backup` run Argon2id (64 MiB), `VACUUM INTO`, the chain walk and the decrypt pass on the writer thread: every `append` blocks meanwhile and `observe_server_date` observations are dropped. Show progress and warn that requests wait (also M10).
+  - (T16 M-7) A missing head anchor reads as an interrupted restore until the first `PRUNE`: the Settings/health text must not call it a failed restore.
+  - (T16) "Verify now" racing a restore gets `Err(Invalid("the store was restored while this record was prepared"))` from `try_full_verify`: show "verification did not complete", not an error dialog.
+- **M10**
+  - (T14, T16) The anchor-dir writer writes the first unflagged `Record` line after any `clock_behind` lines (the verifier judges pruned `clock_behind` lines by it), writes header lines, tolerates a torn last line and a missing current-chain file, and writes the `RESTORE` lines of a restore.
+  - (M-7) `EXPORT` and `KEY_ROTATED` are store-owned (`append` refuses them): `Store::export` and any key-rotation or passphrase-change method are added inside `audit`.
+  - (M-2) `sync_dir` is a no-op on Windows: the restore commit, first-run and archive renames are not flushed before the KEK re-seal, so after a power loss the replaced `audit.db` can reappear next to the restored KEK (recoverable with "Recover this log" and the old passphrase). Before release: rename with `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` or `FlushFileBuffers` on a directory handle (`FILE_FLAG_BACKUP_SEMANTICS`), with a test.
+
 ---
 
 ## Plan decisions needing the user's eye (spec silent)
