@@ -133,13 +133,13 @@ pub fn new_ids() -> Result<(String, String), OpenError> {
     Ok((random_id()?, random_id()?))
 }
 
-fn is_id(s: &str) -> bool {
+pub(crate) fn is_id(s: &str) -> bool {
     s.len() == 32
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     let mut s = p.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
@@ -169,13 +169,13 @@ pub(crate) fn remove_new_leftovers(data: &LocalDataDir) -> io::Result<()> {
 
 /// Deletes the staging files a crashed first run or restore left (never `audit.db`): neither
 /// ever counts as a store.
-fn remove_staging_leftovers(data: &LocalDataDir) -> io::Result<()> {
+pub(crate) fn remove_staging_leftovers(data: &LocalDataDir) -> io::Result<()> {
     remove_new_leftovers(data)?;
     remove_with_side_files(data, RESTORING_DB_FILE)
 }
 
 /// Makes a rename inside `dir` durable (Unix); NTFS journals the rename itself.
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]
@@ -183,7 +183,7 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn audit_err(e: AuditError) -> OpenError {
+pub(crate) fn audit_err(e: AuditError) -> OpenError {
     match e {
         AuditError::KeyStore(k) => OpenError::KeyStore(k),
         other => OpenError::Io(io::Error::other(other.to_string())),
@@ -289,13 +289,13 @@ pub(crate) fn start_existing(
     })
 }
 
-fn sql(e: rusqlite::Error) -> OpenError {
+pub(crate) fn sql(e: rusqlite::Error) -> OpenError {
     OpenError::Sqlite(e.to_string())
 }
 
 /// `meta.written_by` is plaintext and outside the chain: shown only if it looks like a
 /// version string, never as arbitrary text.
-fn with_written_by(found: String, v: &StoreVersions) -> String {
+pub(crate) fn with_written_by(found: String, v: &StoreVersions) -> String {
     let plausible = |w: &str| {
         !w.is_empty()
             && w.len() <= 64
@@ -327,7 +327,10 @@ fn text(v: ValueRef<'_>) -> Option<String> {
 
 /// `FinishRestore` iff the newest record is a `RESTORE` naming this install in its plaintext
 /// `target` (§8.7 interrupted restore before the KEK re-seal).
-fn recovery_offer(conn: &Connection, install_id: &str) -> Result<RecoveryOffer, OpenError> {
+pub(crate) fn recovery_offer(
+    conn: &Connection,
+    install_id: &str,
+) -> Result<RecoveryOffer, OpenError> {
     let newest: Option<(Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT event_type, target FROM events ORDER BY seq DESC LIMIT 1",
@@ -384,7 +387,7 @@ impl KeyRow {
 /// a wrapped key unwraps either: a tampered newest key row next to keys that open is not a
 /// lost keychain but an incident, which verification reports. A missing, destroyed or
 /// unreadable key row of the newest record is left to verification as well.
-fn kek_opens_store(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
+pub(crate) fn kek_opens_store(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
     let newest: Option<(bool, KeyRow)> = conn
         .query_row(
             "SELECT k.key_id IS NOT NULL, e.key_id, k.month, k.wrapped_dek FROM events e              LEFT JOIN keys k ON k.key_id = e.key_id ORDER BY e.seq DESC LIMIT 1",
@@ -408,6 +411,24 @@ fn kek_opens_store(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
     while let Some(r) = rows.next().map_err(sql)? {
         let k = KeyRow::read(r, 0).map_err(sql)?;
         if k.key_id != newest.key_id && k.unwraps(kek) == Some(true) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `kek` unwraps at least one of the store's data keys: positive evidence that a KEK
+/// from outside the keychain (the recovery blob) belongs to this store.
+pub(crate) fn kek_unwraps_a_key(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
+    let mut st = conn
+        .prepare(
+            "SELECT key_id, month, wrapped_dek FROM keys WHERE wrapped_dek IS NOT NULL \
+             ORDER BY key_id DESC",
+        )
+        .map_err(sql)?;
+    let mut rows = st.query([]).map_err(sql)?;
+    while let Some(r) = rows.next().map_err(sql)? {
+        if KeyRow::read(r, 0).map_err(sql)?.unwraps(kek) == Some(true) {
             return Ok(true);
         }
     }

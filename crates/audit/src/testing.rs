@@ -263,6 +263,10 @@ pub enum FaultPoint {
     /// Right after the prune `COMMIT`: an armed failure stops the writer there (a simulated
     /// crash: no prune barrier, the new head is never published).
     AfterPruneCommit,
+    /// "Recover this log": right after the recovery `VERIFY` and `KEY_RECOVERED` committed,
+    /// before the KEK is re-sealed and the anchors are rebuilt. An armed failure ends the
+    /// recovery there.
+    AfterKeyRecoveredAppend,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

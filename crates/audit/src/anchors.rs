@@ -223,7 +223,6 @@ pub(crate) fn backoff(failures: u32) -> Duration {
 
 /// What holds the head anchor back.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // `Restore` is constructed by restore (T16); tests construct it today
 pub(crate) enum Barrier {
     /// The head anchor may reach `seq` (the `PRUNE` record) but not beyond until the
     /// first-retained entry holds `first_retained` (§8.7 (d)).

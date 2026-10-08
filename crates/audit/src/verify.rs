@@ -1765,3 +1765,20 @@ fn run_full(
     drop(tx);
     Ok(out.finish())
 }
+
+// ---------------------------------------------------------------------------------------
+// Anchor rebuild ("Recover this log", §8.7 step 4)
+
+/// The retained `GENESIS`'s `record_hash` (record 1 of type `GENESIS`), if any.
+pub(crate) fn retained_genesis_hash(conn: &Connection) -> rusqlite::Result<Option<[u8; 32]>> {
+    Ok(row_head(conn, 1)?
+        .filter(|g| g.event_type.as_deref() == Some("GENESIS"))
+        .and_then(|g| g.record_hash))
+}
+
+/// `(first_retained_seq, last_pruned_record_hash)` of the latest readable `prune_log` row, else
+/// `GENESIS`'s values: what startup verification compares the first-retained anchor with.
+pub(crate) fn latest_prune_values(conn: &Connection) -> rusqlite::Result<(u64, [u8; 32])> {
+    let log = load_prune_log(conn, &mut Findings::default())?;
+    Ok(latest_values(&log))
+}

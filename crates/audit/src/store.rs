@@ -556,7 +556,6 @@ impl Store {
     /// dropped unless `complete()` was called; an error path therefore cannot leave the anchors
     /// blocked. Install it BEFORE the `PRUNE`/`RESTORE` commit becomes visible. A second barrier
     /// is refused. (Prune reserves its slot on the writer thread instead.)
-    #[allow(dead_code)] // called by restore (T16)
     pub(crate) fn install_barrier(&self, b: Barrier) -> Result<BarrierGuard, AuditError> {
         self.inner.shared.anchors.install_barrier(b)
     }
@@ -567,8 +566,8 @@ impl Store {
         self.inner.shared.anchors.clear_barrier();
     }
 
-    /// The restore completion step: writes both anchors and lifts the restore barrier.
-    #[allow(dead_code)] // called by restore (T16)
+    /// The restore completion step: writes both anchors and lifts the restore barrier (also
+    /// the anchor rebuild of "Recover this log").
     pub(crate) fn complete_restore_anchors(
         &self,
         head: HeadAnchor,
@@ -794,14 +793,14 @@ impl Store {
             .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
     }
 
-    /// One `VERIFY` record for a run (F.11), flagged `integrity_incident` iff any finding is
-    /// an incident kind.
-    pub(crate) fn append_verify(
+    /// The `VERIFY` record of a run (F.11), flagged `integrity_incident` iff any finding is an
+    /// incident kind.
+    fn verify_event(
         &self,
         scope: &str,
         findings: &[VerifyFinding],
         unanchored_tail: Option<u64>,
-    ) -> Result<Committed, AuditError> {
+    ) -> Result<PreparedEvent, AuditError> {
         let detected_at = self
             .inner
             .clock
@@ -815,9 +814,69 @@ impl Store {
         if findings.iter().any(|f| f.kind.is_incident()) {
             p.store_flags = EventFlags::INTEGRITY_INCIDENT;
         }
+        Ok(p)
+    }
+
+    /// One `VERIFY` record for a run (see `verify_event`).
+    pub(crate) fn append_verify(
+        &self,
+        scope: &str,
+        findings: &[VerifyFinding],
+        unanchored_tail: Option<u64>,
+    ) -> Result<Committed, AuditError> {
+        let p = self.verify_event(scope, findings, unanchored_tail)?;
         self.send_append(vec![p])?
             .pop()
             .ok_or_else(|| AuditError::AppendFailed("the writer returned no row".into()))
+    }
+
+    /// "Recover this log" step 3 after the migrations (§8.7): `VERIFY {scope: "recover"}` and
+    /// `KEY_RECOVERED {what: [kek, head_anchor, first_retained_anchor, pats_lost]}` in one
+    /// transaction, so neither is ever logged without the other. Anchor writes must still be
+    /// disabled. Returns `(verify, key_recovered)`.
+    pub(crate) fn append_recovery(
+        &self,
+        findings: &[VerifyFinding],
+    ) -> Result<(Committed, Committed), AuditError> {
+        let verify = self.verify_event("recover", findings, None)?;
+        let recovered = PreparedEvent::system(
+            EventType::KEY_RECOVERED,
+            &json!({ "what": ["kek", "head_anchor", "first_retained_anchor", "pats_lost"] }),
+        )?;
+        let mut out = self.send_append(vec![verify, recovered])?.into_iter();
+        let (Some(v), Some(k), None) = (out.next(), out.next(), out.next()) else {
+            return Err(AuditError::AppendFailed(
+                "the writer returned another row count".into(),
+            ));
+        };
+        #[cfg(any(test, feature = "testing"))]
+        self.inner
+            .hooks
+            .fault(crate::testing::FaultPoint::AfterKeyRecoveredAppend)?;
+        Ok((v, k))
+    }
+
+    /// "Recover this log" step 4 (§8.7), after the KEK was re-sealed: writes the first-retained
+    /// anchor, then the head anchor at the committed head, both on the anchor thread behind a
+    /// restore-type barrier (nothing else may write the head meanwhile), then enables anchor
+    /// writes. On `Err` anchor writes stay disabled.
+    pub(crate) fn rebuild_anchors(
+        &self,
+        first_retained: FirstRetainedAnchor,
+    ) -> Result<(), AuditError> {
+        let (seq, record_hash, chain_id) = self.head();
+        let guard = self.install_barrier(Barrier::Restore { seq })?;
+        self.complete_restore_anchors(
+            HeadAnchor {
+                chain_id,
+                seq,
+                record_hash,
+            },
+            first_retained,
+        )?;
+        guard.complete();
+        self.enable_anchors();
+        Ok(())
     }
 
     /// Startup step 4 after migrations (§8.7): appends the verdict's `VERIFY` (none when it

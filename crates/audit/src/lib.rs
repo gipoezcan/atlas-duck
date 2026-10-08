@@ -16,6 +16,7 @@ mod incidents;
 pub mod keystore;
 pub mod open;
 mod prune;
+pub mod recover;
 pub mod recovery;
 pub mod request_set;
 pub mod schema;
@@ -37,6 +38,7 @@ pub use open::{
     keychain_retry_schedule, new_ids, open, read_store_install_id,
 };
 pub use prune::{PruneOutcome, PruneSkip};
+pub use recover::{RecoverReport, archive_and_start_fresh, recover_this_log};
 pub use request_set::{RequestRecord, request_set_hash};
 pub use settings::{
     FilePolicy, InstancePolicy, RETENTION_DEFAULT, RETENTION_MIN, SettingChange, Settings,

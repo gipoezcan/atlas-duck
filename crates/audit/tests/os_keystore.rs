@@ -160,6 +160,140 @@ fn os_secret_service_attributes() {
     }
 }
 
+/// U-18 per OS (§13): a store on the real keychain, the keychain wiped (its five entries
+/// deleted), `keychain_lost`, then "Recover this log" on the same chain. `create_new_store`
+/// needs a real install id (32 hex), so this guard deletes everything of that random id.
+mod u18 {
+    use std::sync::Arc;
+
+    use atlas_duck_audit::anchors::HeadAnchor;
+    use atlas_duck_audit::error::OpenError;
+    use atlas_duck_audit::keystore::{EntryName, KeyStore, OsKeyStore};
+    use atlas_duck_audit::types::Confirmed;
+    use atlas_duck_audit::{
+        LockedReason, OpenConfig, RecoveryOffer, SettingChange, StartupOutcome, create_new_store,
+        new_ids, open, recover_this_log,
+    };
+    use secrecy::SecretString;
+
+    #[path = "../common/mod.rs"]
+    mod common;
+    use common::*;
+
+    const INSTANCE: &str = "ci";
+
+    fn entries() -> Vec<EntryName> {
+        vec![
+            EntryName::Kek,
+            EntryName::HeadAnchor,
+            EntryName::FirstRetainedAnchor,
+            EntryName::Canary,
+            EntryName::Pat(INSTANCE.into()),
+        ]
+    }
+
+    struct Wipe(Arc<OsKeyStore>);
+
+    impl Wipe {
+        fn now(&self) {
+            for e in entries() {
+                self.0.delete(&e).expect("delete entry");
+            }
+        }
+    }
+
+    impl Drop for Wipe {
+        fn drop(&mut self) {
+            for e in entries() {
+                let _ = self.0.delete(&e);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "touches the OS keychain; run in the CI keychain step"]
+    fn os_u18_keychain_wiped() {
+        let (install_id, chain_id) = new_ids().expect("ids");
+        let ks = Arc::new(OsKeyStore::new(&install_id).expect("os keystore"));
+        let guard = Wipe(ks.clone());
+        let (_dir, data, lock) = tmp_data_dir();
+        let clock = fake_clock(START);
+        let cfg = || OpenConfig::new(clock.clone(), ks.clone());
+
+        let store = create_new_store(
+            &data,
+            &lock,
+            cfg(),
+            input(&install_id, &chain_id, PASSPHRASE, PASSPHRASE),
+        )
+        .expect("create_new_store");
+        store
+            .apply_setting(
+                SettingChange::InstanceOrigin {
+                    instance_id: INSTANCE.into(),
+                    origin: Some("https://jira.example".into()),
+                },
+                Some(Confirmed {
+                    dialog_text_sha256: [7; 32],
+                }),
+            )
+            .expect("origin");
+        ks.set(&EntryName::Pat(INSTANCE.into()), b"token")
+            .expect("pat");
+        store.append_batch(mixed(12)).expect("append");
+        store.flush_head_anchor().expect("flush");
+        let (h, _, _) = store.head();
+        store.shutdown();
+
+        guard.now();
+        match open(&data, &lock, cfg()).expect("open") {
+            StartupOutcome::Locked(r) => assert_eq!(
+                r,
+                LockedReason::KeychainLost {
+                    offer: RecoveryOffer::RecoverThisLog
+                }
+            ),
+            other => panic!("expected Locked, got {other:?}"),
+        }
+        let wrong = SecretString::from("not the passphrase at all".to_string());
+        assert!(matches!(
+            recover_this_log(&data, &lock, cfg(), &wrong),
+            Err(OpenError::WrongPassphrase)
+        ));
+        assert_eq!(ks.get(&EntryName::Kek).expect("get"), None);
+
+        let right = SecretString::from(PASSPHRASE.to_string());
+        let (store, report) = recover_this_log(&data, &lock, cfg(), &right).expect("recover");
+        assert_eq!(store.head().2, chain_id);
+        assert_eq!(report.verify_seq, h + 1);
+        assert_eq!(report.key_recovered_seq, h + 2);
+        assert_eq!(report.pats_deleted, vec![INSTANCE.to_string()]);
+        assert!(ks.get(&EntryName::Kek).expect("get").is_some());
+        let head = ks
+            .get(&EntryName::HeadAnchor)
+            .expect("get")
+            .map(|b| HeadAnchor::from_entry(&b).expect("head anchor"))
+            .expect("head anchor rebuilt");
+        assert_eq!(head.seq, h + 2);
+        assert!(
+            ks.get(&EntryName::FirstRetainedAnchor)
+                .expect("get")
+                .is_some()
+        );
+        assert_eq!(ks.get(&EntryName::Pat(INSTANCE.into())).expect("get"), None);
+        store.shutdown();
+
+        match open(&data, &lock, cfg()).expect("open") {
+            StartupOutcome::Ready { store, verify } => {
+                assert!(verify.findings.is_empty(), "{:?}", verify.findings);
+                assert_eq!(store.open_incidents(), vec![h + 1]);
+                store.shutdown();
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use super::*;
