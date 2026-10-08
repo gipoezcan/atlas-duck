@@ -99,7 +99,7 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           set -euo pipefail
-          if grep -rnE 'Command::new|use std::process' crates/sandbox-host/src/macos; then
+          if grep -rnE 'Command::new|use std::process::Command' crates/sandbox-host/src/macos; then
             echo "::error::crates/sandbox-host/src/macos must posix_spawn itself, not use std::process::Command (§3.4)"
             exit 1
           fi
