@@ -750,6 +750,24 @@ fn clock_guards_skip_and_log_once() {
 }
 
 #[test]
+fn clock_floor_ends_with_the_next_record() {
+    let sim = sim_with_due_prune();
+    let now = sim.f.clock.now_utc();
+    sim.f.clock.set_wall(UtcInstant(now.0 - 10 * 60_000));
+    assert_eq!(
+        sim.store.prune(None),
+        Ok(PruneOutcome::Skipped(PruneSkip::ClockBeforeHead))
+    );
+    // A record written with the corrected (here: unchanged) clock is the head now: the guard
+    // compares with its ts_utc again, not with the head the skip was measured against.
+    sim.store.append_batch(day_events(1)).expect("append");
+    sync_writer(&sim.store);
+    let runs = prune_log(&sim.f).len();
+    pruned(sim.store.prune(None).expect("prune"));
+    assert_eq!(prune_log(&sim.f).len(), runs + 1);
+}
+
+#[test]
 fn clock_guard_before_last_prune() {
     let sim = Sim::new(RETENTION);
     sim.events(2);
@@ -989,6 +1007,41 @@ fn post_prune_vacuum_and_checkpoint() {
 }
 
 #[test]
+fn blocked_checkpoint_is_retried_and_shown() {
+    let sim = Sim::new(RETENTION);
+    sim.events(4);
+    sim.days(92, 1);
+    let mut wal = sim.f.db_path().into_os_string();
+    wal.push("-wal");
+    let wal_len = || std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    // A reader holding a snapshot from before the prune keeps TRUNCATE from completing.
+    let reader = raw_conn(&sim.f);
+    reader.execute_batch("BEGIN").expect("begin");
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+        .expect("snapshot");
+    sim.day(1);
+    assert_eq!(prune_log(&sim.f).len(), 1);
+    let h = sim.store.health();
+    assert!(h.shred_checkpoint_pending);
+    assert_eq!(h.last_prune_error, None, "the prune itself succeeded");
+    assert!(wal_len() > 0);
+    // Released: an idle writer turn retries and truncates.
+    reader.execute_batch("COMMIT").expect("commit");
+    drop(reader);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sim.store.health().shred_checkpoint_pending {
+        assert!(
+            Instant::now() < deadline,
+            "the checkpoint was never retried"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(wal_len(), 0);
+    assert_eq!(sim.store.testing_pragma("busy_timeout"), Ok(5000));
+}
+
+#[test]
 fn prune_payload_and_settings_snapshot() {
     let sim = Sim::new(RETENTION);
     sim.events(3);
@@ -1136,6 +1189,12 @@ fn prune_rolls_back_before_commit() {
     let before = (rows(&sim.f), keys(&sim.f), sim.store.head());
     sim.day(2); // the automatic run fails inside its transaction
     assert!(prune_log(&sim.f).is_empty());
+    let err = sim
+        .store
+        .health()
+        .last_prune_error
+        .expect("the failure is shown");
+    assert!(err.contains("AfterPruneTxBeforeCommit"), "{err}");
     let after = rows(&sim.f);
     assert!(before.0.keys().all(|s| after.contains_key(s)));
     assert_eq!(keys(&sim.f), before.1);
@@ -1144,6 +1203,7 @@ fn prune_rolls_back_before_commit() {
     let (prune_seq, range_start, ..) = pruned(sim.store.prune(Some(confirmed())).expect("retry"));
     assert_eq!(prune_seq, sim.store.head().0);
     assert_eq!(range_start, 1);
+    assert_eq!(sim.store.health().last_prune_error, None);
     sim.store.flush_head_anchor().expect("flush");
     assert!(sim.store.full_verify().is_empty());
 }

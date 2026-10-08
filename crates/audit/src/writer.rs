@@ -6,8 +6,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use crate::clock::{
 use crate::crypto::{self, Dek, Kek, MAX_PAYLOAD_LEN};
 use crate::encoding::{self, FIELD_LIST, FORMAT_VERSION, RowFields, ZERO_HASH};
 use crate::error::{AuditError, OpenError};
-use crate::prune::{PruneOutcome, PruneSkip, Settings};
+use crate::prune::{CHECKPOINT_RETRY_IDLE, PruneOutcome, PruneSkip, Settings};
 use crate::schema;
 use crate::store::Hooks;
 use crate::types::{Committed, Confirmed, EventFlags, EventType, NewEvent};
@@ -249,6 +249,11 @@ pub(crate) struct Shared {
     pub(crate) incidents: Mutex<BTreeSet<u64>>,
     /// Days the cutoff of the latest prune run stayed behind its unclamped value (L37).
     pub(crate) prune_backlog_days: AtomicU32,
+    /// The latest post-prune vacuum/checkpoint did not complete (§8.1).
+    pub(crate) checkpoint_pending: AtomicBool,
+    /// The error of the latest prune run, cleared by the next run that does not fail (the
+    /// crate has no logger; automatic runs have no caller to return it to).
+    pub(crate) last_prune_error: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -264,6 +269,8 @@ impl Shared {
             anchors: Arc::new(AnchorShared::new()),
             incidents: Mutex::new(BTreeSet::new()),
             prune_backlog_days: AtomicU32::new(0),
+            checkpoint_pending: AtomicBool::new(false),
+            last_prune_error: Mutex::new(None),
         })
     }
 }
@@ -352,9 +359,11 @@ pub(crate) struct WriterState {
     published_epoch: Option<NaiveDate>,
     /// Reasons a prune-skip `CLOCK_ANOMALY` was logged for in this process.
     pub(crate) skips_logged: BTreeSet<&'static str>,
-    /// The head `ts_utc` a `ClockBeforeHead` skip was measured against: its own anomaly row
-    /// (stamped with the earlier `now`) must not disarm the guard.
-    pub(crate) clock_floor: Option<UtcInstant>,
+    /// The head `ts_utc` a `ClockBeforeHead` skip was measured against and the seq of the
+    /// head after its anomaly row: while that row is the head, it must not disarm the guard.
+    pub(crate) clock_floor: Option<(UtcInstant, u64)>,
+    /// Idle-turn retries left for a post-prune checkpoint that did not complete.
+    pub(crate) checkpoint_retries: u32,
     /// A fault point simulated a crash: the writer stops (feature `testing`).
     pub(crate) crashed: bool,
 }
@@ -375,6 +384,7 @@ impl WriterState {
             prune_due: false,
             skips_logged: BTreeSet::new(),
             clock_floor: None,
+            checkpoint_retries: 0,
             crashed: false,
         }
     }
@@ -923,8 +933,15 @@ impl Writer {
 
     /// A queued automatic attempt. One deferred by the unreconciled config file stays queued.
     fn run_queued_prune(&mut self) {
-        let r = self.prune_run(None);
+        let r = self.prune_recorded(None);
         self.st.prune_due = matches!(r, Ok(PruneOutcome::Skipped(PruneSkip::ConfigNotReconciled)));
+    }
+
+    /// A prune run whose error (or success) is kept for `StoreHealth::last_prune_error`.
+    fn prune_recorded(&mut self, confirm: Option<&Confirmed>) -> Result<PruneOutcome, AuditError> {
+        let r = self.prune_run(confirm);
+        *lock(&self.st.shared.last_prune_error) = r.as_ref().err().map(|e| e.to_string());
+        r
     }
 
     /// Every pending migration step in one transaction, each followed by its
@@ -1082,7 +1099,23 @@ impl Writer {
     }
 
     fn run(mut self, rx: Receiver<Cmd>) {
-        while let Ok(cmd) = rx.recv() {
+        loop {
+            // A blocked post-prune checkpoint is retried whenever the writer is idle.
+            let cmd = if self.st.checkpoint_retries > 0 {
+                match rx.recv_timeout(CHECKPOINT_RETRY_IDLE) {
+                    Ok(c) => c,
+                    Err(RecvTimeoutError::Timeout) => {
+                        self.retry_checkpoint();
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match rx.recv() {
+                    Ok(c) => c,
+                    Err(_) => break,
+                }
+            };
             #[cfg(any(test, feature = "testing"))]
             let _ = self.st.hooks.fault(crate::testing::FaultPoint::WriterPause);
             match cmd {
@@ -1104,7 +1137,7 @@ impl Writer {
                     let _ = reply.send(r);
                 }
                 Cmd::Prune { confirm, reply } => {
-                    let r = self.prune_run(confirm.as_ref());
+                    let r = self.prune_recorded(confirm.as_ref());
                     let _ = reply.send(r);
                 }
                 #[cfg(any(test, feature = "testing"))]

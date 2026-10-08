@@ -146,6 +146,12 @@ pub struct StoreHealth {
     pub anchors_blocked: Option<BarrierKind>,
     /// The anchor thread panicked: no anchor is written until restart.
     pub anchor_thread_dead: bool,
+    /// The latest post-prune vacuum/checkpoint did not complete (a reader blocked the WAL
+    /// truncation): freed pages, wrapped DEKs of destroyed keys among them, may remain in the
+    /// WAL until a retry succeeds (§8.1).
+    pub shred_checkpoint_pending: bool,
+    /// The error of the latest prune run (automatic or not), `None` once one runs without.
+    pub last_prune_error: Option<String>,
 }
 
 /// One row's ciphertext and what opening it needs. No `Debug`: it holds a wrapped key.
@@ -575,6 +581,8 @@ impl Store {
             storage_low: self.admission_check().is_err(),
             open_incidents: lock(&self.inner.shared.incidents).len(),
             prune_backlog_days: self.inner.shared.prune_backlog_days.load(Ordering::Relaxed),
+            shred_checkpoint_pending: self.inner.shared.checkpoint_pending.load(Ordering::Relaxed),
+            last_prune_error: lock(&self.inner.shared.last_prune_error).clone(),
         }
     }
 

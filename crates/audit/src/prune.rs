@@ -5,6 +5,7 @@
 //! run comes through [`crate::Store::prune`].
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use chrono::{Days, NaiveDate};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -326,15 +327,27 @@ fn unreferenced_keys(conn: &Connection, keep: &[u64]) -> Result<Vec<u64>, AuditE
     Ok(out)
 }
 
+/// Idle writer turns on which a blocked post-prune checkpoint is retried (one per
+/// [`CHECKPOINT_RETRY_IDLE`] without commands); then it waits for the next prune.
+pub(crate) const CHECKPOINT_RETRIES: u32 = 30;
+pub(crate) const CHECKPOINT_RETRY_IDLE: Duration = Duration::from_secs(1);
+/// A retry waits this long for readers instead of the connection's 5 s.
+const CHECKPOINT_RETRY_BUSY: Duration = Duration::from_millis(200);
+const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
+
 /// §8.1: after each prune, every free page back to the file system, then the WAL truncated.
-/// `incremental_vacuum` frees one page per step, so it is stepped to the end.
-fn vacuum_and_checkpoint(conn: &Connection) -> rusqlite::Result<()> {
+/// `incremental_vacuum` frees one page per step, so it is stepped to the end. `Ok(false)`: a
+/// reader kept the checkpoint from truncating the WAL (`busy` in its result row, which is not
+/// an error), so the WAL may still hold pre-prune pages, wrapped DEKs of destroyed keys among
+/// them.
+fn vacuum_and_checkpoint(conn: &Connection) -> rusqlite::Result<bool> {
     {
         let mut st = conn.prepare("PRAGMA incremental_vacuum")?;
         let mut rows = st.query([])?;
         while rows.next()?.is_some() {}
     }
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    Ok(busy == 0)
 }
 
 impl Writer {
@@ -381,11 +394,15 @@ impl Writer {
             .clock_state
             .prev_ts
             .ok_or_else(|| bad("the head record has no ts_utc".into()))?;
-        // The guard's own anomaly row (stamped `now`) must not disarm it.
-        let floor = self.st.clock_floor.map_or(head_ts, |f| f.max(head_ts));
+        // The guard's own anomaly row (stamped `now`) must not disarm it: while that row is
+        // the head, the head it replaced is the reference. Any later record ends that.
+        let floor = match self.st.clock_floor {
+            Some((f, seq)) if seq == self.st.head.seq => f.max(head_ts),
+            _ => head_ts,
+        };
         if now < floor {
-            self.st.clock_floor = Some(floor);
             self.log_prune_skip_once("now_before_head", now, mono)?;
+            self.st.clock_floor = Some((floor, self.st.head.seq));
             return Ok(Skipped(PruneSkip::ClockBeforeHead));
         }
         if let Some(t) = latest_prune_ts(&self.conn)?
@@ -593,8 +610,7 @@ impl Writer {
         // guard must not release a barrier it did not set.
         guard.complete();
         self.st.post_commit(new_keys, &[]);
-        // Failures leave free pages or a WAL behind, nothing else; the next prune retries.
-        let _ = vacuum_and_checkpoint(&self.conn);
+        self.vacuum_and_checkpoint(BUSY_TIMEOUT);
         armed?;
         Ok(PruneOutcome::Pruned {
             prune_seq: committed.seq,
@@ -608,13 +624,45 @@ impl Writer {
         })
     }
 
+    /// Vacuum and checkpoint after a prune, or a retry of them. One that did not complete (an
+    /// error, or a reader blocking the truncation) is retried on idle writer turns, at most
+    /// [`CHECKPOINT_RETRIES`] times, and shown as `StoreHealth::shred_checkpoint_pending`
+    /// until one completes. Nothing else depends on it: the prune itself is committed.
+    pub(crate) fn vacuum_and_checkpoint(&mut self, busy: Duration) {
+        let set_busy = |d: Duration| self.conn.busy_timeout(d).is_ok();
+        let done = if busy == BUSY_TIMEOUT || set_busy(busy) {
+            let r = vacuum_and_checkpoint(&self.conn);
+            if busy != BUSY_TIMEOUT && !set_busy(BUSY_TIMEOUT) {
+                // The connection would keep the short timeout: never leave it that way.
+                let _ = self.conn.execute_batch("PRAGMA busy_timeout = 5000;");
+            }
+            matches!(r, Ok(true))
+        } else {
+            false
+        };
+        self.st
+            .shared
+            .checkpoint_pending
+            .store(!done, std::sync::atomic::Ordering::Relaxed);
+        self.st.checkpoint_retries = match (done, busy == BUSY_TIMEOUT) {
+            (true, _) => 0,
+            (false, true) => CHECKPOINT_RETRIES,
+            (false, false) => self.st.checkpoint_retries.saturating_sub(1),
+        };
+    }
+
+    /// A pending checkpoint retried on an idle writer turn (short wait for readers).
+    pub(crate) fn retry_checkpoint(&mut self) {
+        self.vacuum_and_checkpoint(CHECKPOINT_RETRY_BUSY);
+    }
+
     /// `CLOCK_ANOMALY {kind: "prune_skipped", local, server, reason}` at most once per reason
     /// per process (plan decision); not marked logged if the append fails.
     fn log_prune_skip_once(
         &mut self,
         reason: &'static str,
         now: UtcInstant,
-        mono: std::time::Duration,
+        mono: Duration,
     ) -> Result<(), AuditError> {
         if self.st.skips_logged.contains(reason) {
             return Ok(());
