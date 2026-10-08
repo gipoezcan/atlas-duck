@@ -110,6 +110,11 @@ export function frame(kind, value, what = kind) {
     data = Buffer.from(value, "utf8");
   } else if (kind === "blob") data = hexBytes(value, what);
   else throw new Error(`unknown kind ${kind}`);
+  if (data.length > 0xffffffff) {
+    // Unreachable for real data (24 MiB frame cap); Rust's request-set/prune hashes would use
+    // the 0x02 long frame of F.8/F.9 (L60), which this checker does not implement.
+    throw new Error(`${what} is longer than u32::MAX bytes: 0x02 long frames are not supported`);
+  }
   return Buffer.concat([Buffer.from([1]), u32be(data.length), data]);
 }
 
@@ -185,7 +190,8 @@ function decryptGcm(key, nonce, aadBytes, ctAndTag) {
 
 const ZERO_HASH = "0".repeat(64);
 
-function checkRow(row, i, prevRecordHash, out) {
+/** `prev`: {chain_id, seq, record_hash} of the previous row, or null. */
+function checkRow(row, i, prev, out, notes) {
   const name = `rows[${i}] ${row.name}`;
   const fail = (m) => out.push(`${name}: ${m}`);
   const f = row.fields;
@@ -202,7 +208,12 @@ function checkRow(row, i, prevRecordHash, out) {
   if (aadBytes.toString("hex") !== row.aad) fail("aad differs");
   const rh = recordHash(f.format_version, hexBytes(f.prev_hash, "prev_hash"), canonical).toString("hex");
   if (rh !== row.record_hash) fail("record_hash differs");
-  if (f.prev_hash !== prevRecordHash) fail("prev_hash does not link to the previous row's record_hash");
+  // GENESIS (seq 1) has a zero prev_hash; a row following the previous one in the same chain
+  // links to it; a row of another chain (or after a gap) is checked on its own.
+  if (f.seq === 1 && f.prev_hash !== ZERO_HASH) fail("seq 1 must have a zero prev_hash");
+  if (prev && prev.chain_id === f.chain_id && prev.seq + 1 === f.seq && f.prev_hash !== prev.record_hash) {
+    fail("prev_hash does not link to the previous row's record_hash");
+  }
 
   const plain = Buffer.from(row.plaintext_jcs, "utf8");
   if (sha256(plain).toString("hex") !== f.payload_sha256) fail("SHA-256(plaintext_jcs) != payload_sha256");
@@ -221,6 +232,8 @@ function checkRow(row, i, prevRecordHash, out) {
     // zstd is in node:zlib from Node 22.15/23.8 on; older Node checks the ciphertext only.
     if (typeof zlib.zstdDecompressSync === "function") {
       if (!zlib.zstdDecompressSync(compressed).equals(plain)) fail("zstd(compressed) != plaintext_jcs");
+    } else {
+      notes.add(`note: node ${process.version} has no zstd (needs >= 22.15): compressed checked by AES-GCM only`);
     }
   } catch (e) {
     fail(`AES-256-GCM: ${e.message}`);
@@ -229,7 +242,7 @@ function checkRow(row, i, prevRecordHash, out) {
 }
 
 /** Returns the list of mismatches (empty = ok). */
-export function checkVectors(doc) {
+export function checkVectors(doc, notes = new Set()) {
   const out = [];
   if (doc.format_version !== 1) out.push("format_version must be 1");
   for (const k of ["rows", "request_sets", "prune_rows", "jcs"]) {
@@ -237,9 +250,10 @@ export function checkVectors(doc) {
   }
   if (out.length > 0) return out;
 
-  let prev = ZERO_HASH;
+  let prev = null;
   doc.rows.forEach((row, i) => {
-    prev = checkRow(row, i, prev, out) ?? prev;
+    const rh = checkRow(row, i, prev, out, notes);
+    prev = rh ? { chain_id: row.fields.chain_id, seq: row.fields.seq, record_hash: rh } : null;
   });
 
   doc.request_sets.forEach((set, i) => {
@@ -281,7 +295,9 @@ export function main(argv = process.argv.slice(2)) {
     console.log(`check-audit-vectors: cannot read ${path}: ${err.message}`);
     return 1;
   }
-  const mismatches = checkVectors(doc);
+  const notes = new Set();
+  const mismatches = checkVectors(doc, notes);
+  for (const n of notes) console.error(n);
   for (const m of mismatches) console.log(m);
   if (mismatches.length > 0) return 1;
   console.error(

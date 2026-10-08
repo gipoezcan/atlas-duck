@@ -103,16 +103,22 @@ fn record_from_json(v: &Value) -> Result<RequestRecord, AuditError> {
             "request must have exactly index, method, url, content_type, body_b64",
         ));
     }
+    let field = |k: &str| {
+        o.get(k).ok_or(AuditError::Invalid(
+            "request must have exactly index, method, url, content_type, body_b64",
+        ))
+    };
     let string = |k: &str| {
-        o[k].as_str()
+        field(k)?
+            .as_str()
             .map(str::to_owned)
             .ok_or(AuditError::Invalid("request field is not a string"))
     };
-    let index = o["index"]
+    let index = field("index")?
         .as_u64()
         .and_then(|i| u32::try_from(i).ok())
         .ok_or(AuditError::Invalid("request index is not a u32"))?;
-    let content_type = match &o["content_type"] {
+    let content_type = match field("content_type")? {
         Value::Null => None,
         Value::String(s) => Some(s.clone()),
         _ => {

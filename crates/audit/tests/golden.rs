@@ -21,6 +21,10 @@ use std::path::PathBuf;
 const INSTALL_ID: &str = "5e0c7a1f9b3d4e2a8c6b0d1f3e5a7c9b";
 const CHAIN_ID: &str = "a4c1e9d27b3f4056b8e1c3a5d7f90b2e";
 const REQUEST_ID: &str = "0192f1a4-7c2e-7b3d-9a10-6f5e4d3c2b1a";
+/// A second, long-running chain for the row with a seq above 2^32.
+const CHAIN_ID_2: &str = "e7d3b1a9c5f24068aa1c3e5f7b9d0c2e";
+/// 0x0000_0123_4567_89AB: between 2^32 and 2^53, every high byte of the u64 frame distinct.
+const LARGE_SEQ: u64 = 0x0123_4567_89AB;
 
 fn vectors_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vectors/format_v1.json")
@@ -30,9 +34,15 @@ fn sha256(b: &[u8]) -> [u8; 32] {
     Sha256::digest(b).into()
 }
 
-/// DEK of `key_id` 1 (the uncorroborated DEK, month NULL) and 2 (month 2026-10).
+/// DEK of `key_id` 1 (the uncorroborated DEK, month NULL), 2 (month 2026-10) and 7 (month
+/// 2027-03 of the second chain).
 fn dek(key_id: u64) -> [u8; 32] {
-    let base: u8 = if key_id == 1 { 0x00 } else { 0x80 };
+    let base: u8 = match key_id {
+        1 => 0x00,
+        2 => 0x80,
+        7 => 0x40,
+        _ => panic!("no test DEK {key_id}"),
+    };
     std::array::from_fn(|i| base + i as u8)
 }
 
@@ -44,6 +54,9 @@ fn nonce(seq: u64) -> [u8; 12] {
 struct Spec {
     name: &'static str,
     seq: u64,
+    chain_id: &'static str,
+    /// `None`: the previous row's `record_hash` (the rows of `CHAIN_ID` form one chain).
+    prev_hash: Option<[u8; 32]>,
     ts_utc: &'static str,
     epoch: Option<&'static str>,
     request_id: Option<&'static str>,
@@ -73,6 +86,8 @@ impl Spec {
         Spec {
             name,
             seq,
+            chain_id: CHAIN_ID,
+            prev_hash: None,
             ts_utc,
             epoch: None,
             request_id: None,
@@ -211,6 +226,28 @@ fn row_specs() -> Vec<Spec> {
                 "SCRIPT_FINISHED",
             )
         },
+        // A seq above 2^32 (pins the high bytes of u64 frames) on another chain, and peer_exe
+        // bytes that are not UTF-8: a Unix 0xFF byte and the WTF-8 of a lone surrogate D800.
+        Spec {
+            chain_id: CHAIN_ID_2,
+            prev_hash: Some(sha256(b"record 1250999896490")),
+            epoch: Some("2027-03-01"),
+            request_id: Some("0192f1a4-7c2e-7b3d-9a10-6f5e4d3c2b1c"),
+            agent_name: Some("codex"),
+            agent_name_source: Some("client_info"),
+            client_kind: Some("mcp"),
+            connection_id: Some("conn-0002"),
+            peer_pid: Some(4242),
+            peer_exe: Some(b"/tmp/\xff\xed\xa0\x80agent"),
+            key_id: 7,
+            payload: json!({"client_kind": "mcp", "connection_id": "conn-0002", "peer_pid": 4242}),
+            ..Spec::empty(
+                "large_seq_non_utf8_path",
+                LARGE_SEQ,
+                "2027-03-01T08:00:00.000Z",
+                "DELIVERED",
+            )
+        },
     ]
 }
 
@@ -237,7 +274,7 @@ fn build_row(
     let mut f = RowFields {
         seq: s.seq,
         format_version: 1,
-        chain_id: CHAIN_ID,
+        chain_id: s.chain_id,
         ts_utc: s.ts_utc,
         epoch: s.epoch,
         request_id: s.request_id,
@@ -279,6 +316,7 @@ fn build_row(
     f.payload_ct = &ct;
     let canonical = canonical_bytes(&f).unwrap();
     let rh = record_hash(1, prev_hash, &canonical);
+    assert_eq!(f.record_hash().unwrap(), rh);
 
     let fields = json!({
         "seq": f.seq,
@@ -408,7 +446,7 @@ fn build(compressed: &dyn Fn(&str, &[u8]) -> Vec<u8>) -> Value {
     let mut prev = ZERO_HASH;
     let mut rows = Vec::new();
     for s in row_specs() {
-        let (entry, rh) = build_row(&s, &prev, compressed);
+        let (entry, rh) = build_row(&s, &s.prev_hash.unwrap_or(prev), compressed);
         rows.push(entry);
         prev = rh;
     }
@@ -452,7 +490,13 @@ fn zstd3(plain: &[u8]) -> Vec<u8> {
 }
 
 fn regen() -> bool {
-    std::env::var_os("ATLAS_DUCK_REGEN_VECTORS").is_some_and(|v| v == "1")
+    let on = std::env::var_os("ATLAS_DUCK_REGEN_VECTORS").is_some_and(|v| v == "1");
+    // The vectors are frozen: CI must only ever check them, never rewrite them.
+    assert!(
+        !(on && std::env::var_os("CI").is_some()),
+        "ATLAS_DUCK_REGEN_VECTORS=1 is refused when CI is set: format_v1.json is frozen"
+    );
+    on
 }
 
 fn load() -> Value {
@@ -539,7 +583,8 @@ fn vectors_cover_the_brief() {
             "genesis_null_epoch",
             "request_received_all_columns",
             "decision_and_flags",
-            "utf16_order_payload"
+            "utf16_order_payload",
+            "large_seq_non_utf8_path"
         ]
     );
     assert!(rows[0]["fields"]["epoch"].is_null());

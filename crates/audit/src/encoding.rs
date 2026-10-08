@@ -91,9 +91,10 @@ pub fn push_frame(out: &mut Vec<u8>, f: &Field<'_>) -> Result<(), AuditError> {
 
 /// Frames `f` straight into a hasher, for the hashes whose signatures are infallible
 /// (`request_set_hash` is fixed by C.3). A field longer than `u32::MAX` bytes cannot occur
-/// (request bodies are bounded upstream, §5.2/§7.2; prune-row fields are tiny); should one
-/// appear it is framed as `0x02 ‖ u64 BE length ‖ bytes`, which no regular frame starts
-/// with, so the encoding stays injective instead of truncating the length.
+/// (request bodies are bounded upstream by the 24 MiB frame cap, §3.3/§5.2; prune-row fields
+/// are tiny); should one appear it is framed as `0x02 ‖ u64 BE length ‖ bytes` (F.8/F.9,
+/// L60), which no regular frame starts with, so the encoding stays injective instead of
+/// truncating the length.
 pub(crate) fn hash_frame(h: &mut Sha256, f: &Field<'_>) {
     match f {
         Field::Null => h.update(NULL_FRAME),
@@ -117,6 +118,11 @@ pub(crate) fn hash_frame(h: &mut Sha256, f: &Field<'_>) {
     }
 }
 
+/// `"atlas-duck/audit/v<format_version>"`, no length or terminator (L60). The domains of v1
+/// and v10 are prefixes of each other; the inputs stay distinct only while every format's
+/// canonical bytes start with a non-`0x00` byte (v1 starts with the NOT NULL `seq` frame
+/// `0x01 00 …`, so a one-byte shift lands on `0x00`). A future format must keep a non-`0x00`
+/// leading frame.
 pub fn record_domain(format_version: u64) -> Vec<u8> {
     format!("{RECORD_DOMAIN_PREFIX}{format_version}").into_bytes()
 }
@@ -132,6 +138,9 @@ pub fn record_hash(format_version: u64, prev_hash: &[u8; 32], canonical: &[u8]) 
 
 /// The 29 column values of one `events` row, borrowed. Built by the writer before insert and
 /// by the verifier from a stored row (`from_row`). No `Debug`: it holds ciphertext.
+///
+/// The u64 fields are SQLite INTEGER (i64) columns: the writer must never store a value
+/// >= 2^63, which SQLite would hold as a negative number (`from_row` rejects negatives).
 #[derive(Clone, Copy)]
 pub struct RowFields<'a> {
     pub seq: u64,
@@ -201,9 +210,18 @@ impl<'a> RowFields<'a> {
         ]
     }
 
+    /// `record_hash` of this row: `record_hash(format_version, prev_hash, canonical_bytes)`.
+    pub fn record_hash(&self) -> Result<[u8; 32], AuditError> {
+        Ok(record_hash(
+            self.format_version,
+            self.prev_hash,
+            &canonical_bytes(self)?,
+        ))
+    }
+
     /// Reads a row selected with the columns of `FIELD_LIST` in that order (indices 0..=28;
     /// anything after them, e.g. `record_hash`, is the caller's). A value of the wrong SQLite
-    /// type, a negative integer, non-UTF-8 text or a hash/nonce of the wrong length is
+    /// type, a negative integer (an i64 >= 2^63 written by mistake), non-UTF-8 text or a hash/nonce of the wrong length is
     /// `Invalid` (a verification finding, never a panic).
     pub fn from_row(row: &'a rusqlite::Row<'_>) -> Result<RowFields<'a>, AuditError> {
         use rusqlite::types::ValueRef;

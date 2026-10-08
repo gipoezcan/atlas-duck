@@ -319,9 +319,11 @@ request_set_hash = SHA-256( b"atlas-duck/request-set/v1"
 ```
 `WRITE_APPROVED` payload (written by M3) stores `requests` as `[{"index":0,"method":"POST","url":"https://…","content_type":"application/json"|null,"body_b64":"<RFC 4648 base64, padded>"}]`. M2 parses exactly this shape in `full_verify` (T09) and fails the finding `request_set_hash_mismatch` when the recomputed hash differs from the payload's `request_set_hash` (lowercase hex). **Plan decision (spec silent):** layout and JSON field names.
 
+Long frame (F.8 and F.9 only, L60): `request_set_hash` and `prune_row_hash` are infallible (C.3), so a field longer than `u32::MAX` bytes, unreachable because every request body is bounded by the 24 MiB frame cap (§3.3, §5.2), is framed `0x02 ‖ u64 BE length ‖ bytes` instead of failing; no regular frame starts with `0x02`, so the encoding stays injective. A count above `u32::MAX` saturates; the records are self-delimiting frames, so the count is redundant. `canonical_bytes` and `aad` keep the strict 0/1 presence byte of §8.4 and return `Invalid` instead.
+
 ### F.9 `prune_log` row hash
 
-`row_hash = SHA-256(b"atlas-duck/prune-log/v1" ‖ prev_row_hash ‖ frame(Int prune_seq) ‖ frame(Int range_start) ‖ frame(cutoff_epoch) ‖ frame(last_pruned_record_hash) ‖ frame(Int first_retained_seq))`, `prev_row_hash` of the first row = 32 zero bytes. Every `PRUNE` payload carries its row's `row_hash`. **Plan decision (spec silent):** U-06 requires that deleting *or altering* any `prune_log` row fails verification, but old `PRUNE` records are themselves pruned; chaining the rows and binding the latest row hash into the always-retained latest `PRUNE` record makes any alteration detectable.
+`row_hash = SHA-256(b"atlas-duck/prune-log/v1" ‖ prev_row_hash ‖ frame(Int prune_seq) ‖ frame(Int range_start) ‖ frame(cutoff_epoch) ‖ frame(last_pruned_record_hash) ‖ frame(Int first_retained_seq))`, `prev_row_hash` of the first row = 32 zero bytes; frames as in F.8, including the unreachable `0x02` long frame. Every `PRUNE` payload carries its row's `row_hash`. **Plan decision (spec silent):** U-06 requires that deleting *or altering* any `prune_log` row fails verification, but old `PRUNE` records are themselves pruned; chaining the rows and binding the latest row hash into the always-retained latest `PRUNE` record makes any alteration detectable.
 
 ### F.10 Schema v1 (`PRAGMA user_version = 1`)
 

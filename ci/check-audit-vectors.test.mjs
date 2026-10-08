@@ -37,7 +37,7 @@ function flipHexAt(s, pos) {
 test("the committed vectors pass", () => {
   const res = run();
   assert.equal(res.status, 0, res.stdout + res.stderr);
-  assert.match(res.stderr, /^check-audit-vectors: ok \(4 rows, 4 request sets, 3 prune rows, 5 jcs\)/);
+  assert.match(res.stderr, /^check-audit-vectors: ok \(5 rows, 4 request sets, 3 prune rows, 5 jcs\)$/m);
   assert.deepEqual(checkVectors(load()), []);
 });
 
