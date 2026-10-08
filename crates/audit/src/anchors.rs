@@ -1,13 +1,22 @@
-//! Keychain anchor layouts (§8.5, F.6): `0x01 ‖ JCS(object)`. T07 writes both entries once at
-//! first run; the anchor thread, batching and barriers come with T08.
+//! Keychain anchors (§8.5, F.6): the entry layouts `0x01 ‖ JCS(object)`, and the `audit-anchor`
+//! thread, the only writer of the two entries after first run (T07 writes them once at first
+//! run). The writer thread publishes each committed head into [`AnchorShared`]; this thread
+//! batches them (one keychain write per [`BATCH_WINDOW`] of dirtiness at most), honours the
+//! prune/restore barriers and writes nothing until startup verification called `enable`. A
+//! failing keychain never touches the chain: it is retried with backoff and shown in
+//! `StoreHealth`, never an incident (§8.8).
 
 use std::fmt;
+use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use atlas_duck_ipc::jcs::to_jcs_vec;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::AuditError;
+use crate::keystore::{EntryName, KeyStore, KeyStoreError};
 
 /// Leading layout byte of the `head_anchor` and `first_retained_anchor` entries (F.6).
 pub const ANCHOR_LAYOUT: u8 = 1;
@@ -135,5 +144,506 @@ impl FirstRetainedAnchor {
             Ok(e) if e == b => Ok(a),
             _ => Err(AnchorEntryError::Malformed),
         }
+    }
+}
+
+/// The head anchor trails the newest commit by at most this long; commits inside one window
+/// share one keychain write.
+pub(crate) const BATCH_WINDOW: Duration = Duration::from_millis(900);
+
+/// Longest idle wait of the anchor thread.
+const MAX_WAIT: Duration = Duration::from_secs(1);
+
+/// Retry delay after the `failures`-th consecutive failure: 1, 2, 4, 8, 16, 32, 60, 60 … s.
+pub(crate) fn backoff(failures: u32) -> Duration {
+    Duration::from_secs(match failures {
+        0 | 1 => 1,
+        2 => 2,
+        3 => 4,
+        4 => 8,
+        5 => 16,
+        6 => 32,
+        _ => 60,
+    })
+}
+
+/// What holds the head anchor back.
+#[derive(Debug, Clone)]
+pub(crate) enum Barrier {
+    /// The head anchor may reach `seq` (the `PRUNE` record) but not beyond until the
+    /// first-retained entry holds `first_retained` (§8.7 (d)).
+    Prune {
+        seq: u64,
+        record_hash: [u8; 32],
+        first_retained: FirstRetainedAnchor,
+    },
+    /// No head write at all until the restore completion step wrote both entries: an anchor
+    /// from before the `RESTORE` would describe the replaced DB.
+    Restore { seq: u64 },
+}
+
+struct RestoreJob {
+    head: HeadAnchor,
+    first_retained: FirstRetainedAnchor,
+    reply: SyncSender<Result<(), AuditError>>,
+}
+
+type FlushReply = SyncSender<Result<(), KeyStoreError>>;
+
+pub(crate) struct AnchorState {
+    enabled: bool,
+    head: Option<HeadAnchor>,
+    written_head: Option<HeadAnchor>,
+    barrier: Option<Barrier>,
+    dirty_since: Option<Instant>,
+    flush_requested: bool,
+    stop: bool,
+    failures: u32,
+    next_retry: Option<Instant>,
+    last_error: Option<KeyStoreError>,
+    waiters: Vec<FlushReply>,
+    restore_job: Option<RestoreJob>,
+}
+
+impl AnchorState {
+    fn new() -> AnchorState {
+        AnchorState {
+            enabled: false,
+            head: None,
+            written_head: None,
+            barrier: None,
+            dirty_since: None,
+            flush_requested: false,
+            stop: false,
+            failures: 0,
+            next_retry: None,
+            last_error: None,
+            waiters: Vec::new(),
+            restore_job: None,
+        }
+    }
+
+    /// The head anchor to write now: the head, capped at an open prune barrier, nothing while
+    /// disabled or behind a restore barrier.
+    fn flush_target(&self) -> Option<HeadAnchor> {
+        if !self.enabled {
+            return None;
+        }
+        match &self.barrier {
+            Some(Barrier::Restore { .. }) => None,
+            Some(Barrier::Prune {
+                seq, record_hash, ..
+            }) => self.head.as_ref().map(|h| {
+                if h.seq > *seq {
+                    HeadAnchor {
+                        chain_id: h.chain_id.clone(),
+                        seq: *seq,
+                        record_hash: *record_hash,
+                    }
+                } else {
+                    h.clone()
+                }
+            }),
+            None => self.head.clone(),
+        }
+    }
+
+    fn prune_pending(&self) -> bool {
+        self.enabled && matches!(self.barrier, Some(Barrier::Prune { .. }))
+    }
+
+    fn retry_ok(&self, now: Instant) -> bool {
+        self.next_retry.is_none_or(|t| now >= t)
+    }
+
+    fn retry_in(&self, now: Instant) -> Duration {
+        self.next_retry
+            .map_or(Duration::ZERO, |t| t.saturating_duration_since(now))
+    }
+
+    fn dirty_for(&self, now: Instant) -> Duration {
+        self.dirty_since
+            .map_or(Duration::ZERO, |d| now.saturating_duration_since(d))
+    }
+
+    /// The target, if it differs from what the keychain holds.
+    fn head_stale(&self) -> Option<HeadAnchor> {
+        self.flush_target()
+            .filter(|t| self.written_head.as_ref() != Some(t))
+    }
+
+    fn head_due(&self, now: Instant) -> bool {
+        self.head_stale().is_some() && self.dirty_for(now) >= BATCH_WINDOW && self.retry_ok(now)
+    }
+
+    pub(crate) fn work_due(&self, now: Instant) -> bool {
+        self.stop
+            || self.flush_requested
+            || self.restore_job.is_some()
+            || (self.prune_pending() && self.retry_ok(now))
+            || self.head_due(now)
+    }
+
+    pub(crate) fn next_wakeup(&self, now: Instant) -> Duration {
+        if self.stop || self.flush_requested || self.restore_job.is_some() {
+            return Duration::ZERO;
+        }
+        let mut w = MAX_WAIT;
+        if self.prune_pending() {
+            w = w.min(self.retry_in(now));
+        }
+        if let (Some(d), Some(_)) = (self.dirty_since, self.head_stale()) {
+            let window = (d + BATCH_WINDOW).saturating_duration_since(now);
+            w = w.min(window.max(self.retry_in(now)));
+        }
+        w
+    }
+
+    fn schedule_retry(&mut self, e: KeyStoreError, now: Instant, scale_div: u32) {
+        self.failures = self.failures.saturating_add(1);
+        self.next_retry = Some(now + backoff(self.failures) / scale_div.max(1));
+        self.last_error = Some(e);
+    }
+
+    fn clear_failure(&mut self) {
+        self.failures = 0;
+        self.next_retry = None;
+        self.last_error = None;
+    }
+}
+
+/// The anchor state shared between the writer thread, the `Store` handles and the anchor
+/// thread. The keychain is only ever called with the state lock released, so keychain latency
+/// never blocks `append`.
+pub(crate) struct AnchorShared {
+    state: Mutex<AnchorState>,
+    cv: Condvar,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// What `Store::health` reports about the anchors.
+pub(crate) struct AnchorHealth {
+    pub(crate) write_failing: bool,
+    pub(crate) first_retained_pending: bool,
+}
+
+impl AnchorShared {
+    pub(crate) fn new() -> AnchorShared {
+        AnchorShared {
+            state: Mutex::new(AnchorState::new()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Start state once the writer is ready: the head as the writer loaded it, and whether the
+    /// keychain already holds it (first run) or not.
+    pub(crate) fn init(&self, enabled: bool, head: HeadAnchor, anchored: bool) {
+        let mut st = lock(&self.state);
+        st.enabled = enabled;
+        st.written_head = anchored.then(|| head.clone());
+        st.head = Some(head);
+        st.dirty_since = None;
+    }
+
+    /// After a commit, from the writer thread. Only the first unflushed commit opens the
+    /// batch window (and wakes the thread to time it).
+    pub(crate) fn publish_head(&self, h: HeadAnchor) {
+        let mut st = lock(&self.state);
+        st.head = Some(h);
+        if st.dirty_since.is_none() {
+            st.dirty_since = Some(Instant::now());
+            drop(st);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Startup verification passed: anchor writes may begin.
+    pub(crate) fn enable(&self) {
+        let mut st = lock(&self.state);
+        st.enabled = true;
+        if st.dirty_since.is_none() && st.head_stale().is_some() {
+            st.dirty_since = Some(Instant::now());
+        }
+        drop(st);
+        self.cv.notify_all();
+    }
+
+    pub(crate) fn set_barrier(&self, b: Barrier) {
+        lock(&self.state).barrier = Some(b);
+        self.cv.notify_all();
+    }
+
+    /// Synchronous flush (C.3): the keychain error of the attempt, if any. `Ok` when there is
+    /// nothing to write (disabled, behind a restore barrier, already current).
+    pub(crate) fn flush(&self) -> Result<(), AuditError> {
+        let (tx, rx) = sync_channel(1);
+        {
+            let mut st = lock(&self.state);
+            if st.stop {
+                return Err(AuditError::Closed);
+            }
+            st.waiters.push(tx);
+            st.flush_requested = true;
+        }
+        self.cv.notify_all();
+        match rx.recv() {
+            Ok(r) => r.map_err(AuditError::KeyStore),
+            Err(_) => Err(AuditError::Closed),
+        }
+    }
+
+    /// The restore completion step: writes both entries (on the anchor thread) and lifts the
+    /// restore barrier. `head` must be at or past the barrier's `RESTORE` record.
+    pub(crate) fn complete_restore(
+        &self,
+        head: HeadAnchor,
+        first_retained: FirstRetainedAnchor,
+    ) -> Result<(), AuditError> {
+        let (reply, rx) = sync_channel(1);
+        {
+            let mut st = lock(&self.state);
+            if st.stop {
+                return Err(AuditError::Closed);
+            }
+            match &st.barrier {
+                Some(Barrier::Restore { seq }) if head.seq >= *seq => {}
+                _ => {
+                    return Err(AuditError::Invalid(
+                        "no restore barrier for this head anchor",
+                    ));
+                }
+            }
+            if st.restore_job.is_some() {
+                return Err(AuditError::Invalid("a restore completion is in progress"));
+            }
+            st.restore_job = Some(RestoreJob {
+                head,
+                first_retained,
+                reply,
+            });
+        }
+        self.cv.notify_all();
+        rx.recv().map_err(|_| AuditError::Closed)?
+    }
+
+    pub(crate) fn health(&self) -> AnchorHealth {
+        let st = lock(&self.state);
+        AnchorHealth {
+            write_failing: st.failures > 0,
+            first_retained_pending: matches!(st.barrier, Some(Barrier::Prune { .. })),
+        }
+    }
+
+    /// Stops the thread without a write; waiting callers get `Closed`.
+    pub(crate) fn stop(&self) {
+        lock(&self.state).stop = true;
+        self.cv.notify_all();
+    }
+}
+
+fn encode_err(_: AuditError) -> KeyStoreError {
+    KeyStoreError::Other("anchor is not encodable".into())
+}
+
+fn set_head(keys: &dyn KeyStore, h: &HeadAnchor) -> Result<(), KeyStoreError> {
+    keys.set(&EntryName::HeadAnchor, &h.to_entry().map_err(encode_err)?)
+}
+
+fn set_first_retained(keys: &dyn KeyStore, f: &FirstRetainedAnchor) -> Result<(), KeyStoreError> {
+    keys.set(
+        &EntryName::FirstRetainedAnchor,
+        &f.to_entry().map_err(encode_err)?,
+    )
+}
+
+fn answer(waiters: Vec<FlushReply>, r: &Result<(), KeyStoreError>) {
+    for w in waiters {
+        let _ = w.send(r.clone());
+    }
+}
+
+/// The `audit-anchor` thread. `scale_div` shortens the retry backoff (tests only).
+pub(crate) fn run(shared: Arc<AnchorShared>, keys: Arc<dyn KeyStore>, scale_div: u32) {
+    let mut st = lock(&shared.state);
+    loop {
+        let now = Instant::now();
+        if !st.work_due(now) {
+            let w = st.next_wakeup(now);
+            st = shared
+                .cv
+                .wait_timeout(st, w)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+            continue;
+        }
+        if st.stop {
+            // Never a write on the way out; `flush` callers learn the store closed.
+            st.waiters.clear();
+            st.restore_job = None;
+            break;
+        }
+        // A restore completion writes both entries on its own.
+        if let Some(job) = st.restore_job.take() {
+            drop(st);
+            let r = set_first_retained(&*keys, &job.first_retained)
+                .and_then(|()| set_head(&*keys, &job.head));
+            st = lock(&shared.state);
+            let reply = match r {
+                Ok(()) => {
+                    st.barrier = None;
+                    st.head = Some(job.head.clone());
+                    st.written_head = Some(job.head);
+                    st.dirty_since = None;
+                    st.clear_failure();
+                    Ok(())
+                }
+                Err(e) => {
+                    st.failures = st.failures.saturating_add(1);
+                    st.last_error = Some(e.clone());
+                    Err(AuditError::KeyStore(e))
+                }
+            };
+            let _ = job.reply.send(reply);
+            continue;
+        }
+        let flushing = st.flush_requested;
+        st.flush_requested = false;
+        let waiters = std::mem::take(&mut st.waiters);
+        if !st.enabled {
+            answer(waiters, &Ok(()));
+            continue;
+        }
+        let mut result: Result<(), KeyStoreError> = Ok(());
+        // 1. A pending first-retained update (prune) comes first.
+        if let Some(Barrier::Prune { first_retained, .. }) = st.barrier.clone()
+            && (flushing || st.retry_ok(Instant::now()))
+        {
+            drop(st);
+            let r = set_first_retained(&*keys, &first_retained);
+            st = lock(&shared.state);
+            match r {
+                Ok(()) => {
+                    st.barrier = None;
+                    st.clear_failure();
+                }
+                Err(e) => {
+                    st.schedule_retry(e.clone(), Instant::now(), scale_div);
+                    answer(waiters, &Err(e));
+                    continue;
+                }
+            }
+        }
+        // 2. The head anchor up to the barrier-capped target, at most once per window.
+        let now = Instant::now();
+        if let Some(target) = st.head_stale()
+            && (flushing || (st.dirty_for(now) >= BATCH_WINDOW && st.retry_ok(now)))
+        {
+            drop(st);
+            let r = set_head(&*keys, &target);
+            st = lock(&shared.state);
+            match r {
+                Ok(()) => {
+                    st.written_head = Some(target);
+                    st.clear_failure();
+                    // Commits during the write kept the window open: it restarts only if
+                    // something newer than the written anchor remains.
+                    st.dirty_since = st.head_stale().map(|_| Instant::now());
+                }
+                Err(e) => {
+                    st.schedule_retry(e.clone(), Instant::now(), scale_div);
+                    result = Err(e);
+                }
+            }
+        }
+        answer(waiters, &result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(seq: u64) -> HeadAnchor {
+        HeadAnchor {
+            chain_id: "c".into(),
+            seq,
+            record_hash: [seq as u8; 32],
+        }
+    }
+
+    fn fr() -> FirstRetainedAnchor {
+        FirstRetainedAnchor {
+            chain_id: "c".into(),
+            genesis_hash: [9; 32],
+            first_retained_seq: 5,
+            first_retained_prev_hash: [4; 32],
+        }
+    }
+
+    fn state(enabled: bool, written: u64, head_seq: u64, dirty: Option<Instant>) -> AnchorState {
+        let mut s = AnchorState::new();
+        s.enabled = enabled;
+        s.written_head = Some(head(written));
+        s.head = Some(head(head_seq));
+        s.dirty_since = dirty;
+        s
+    }
+
+    #[test]
+    fn backoff_sequence() {
+        let v: Vec<u64> = (1..=9).map(|n| backoff(n).as_secs()).collect();
+        assert_eq!(v, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
+    }
+
+    #[test]
+    fn batch_window_gates_the_write() {
+        let t0 = Instant::now();
+        let s = state(true, 1, 7, Some(t0));
+        assert!(!s.work_due(t0 + Duration::from_millis(899)));
+        assert!(s.work_due(t0 + BATCH_WINDOW));
+        assert_eq!(
+            s.next_wakeup(t0 + Duration::from_millis(400)).as_millis(),
+            500
+        );
+    }
+
+    #[test]
+    fn disabled_state_is_never_due() {
+        let t0 = Instant::now();
+        let s = state(false, 1, 7, Some(t0));
+        assert!(s.flush_target().is_none());
+        assert!(!s.work_due(t0 + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn prune_barrier_caps_the_target_and_restore_blocks_it() {
+        let t0 = Instant::now();
+        let mut s = state(true, 1, 9, Some(t0));
+        s.barrier = Some(Barrier::Prune {
+            seq: 5,
+            record_hash: [5; 32],
+            first_retained: fr(),
+        });
+        assert_eq!(s.flush_target(), Some(head(5)));
+        s.head = Some(head(4));
+        assert_eq!(s.flush_target(), Some(head(4)));
+        s.barrier = Some(Barrier::Restore { seq: 5 });
+        assert_eq!(s.flush_target(), None);
+        assert!(!s.head_due(t0 + Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn retry_time_defers_work_but_not_a_flush() {
+        let t0 = Instant::now();
+        let mut s = state(true, 1, 7, Some(t0));
+        s.schedule_retry(KeyStoreError::Unavailable, t0 + BATCH_WINDOW, 1);
+        let now = t0 + BATCH_WINDOW;
+        assert!(!s.work_due(now));
+        assert!(s.work_due(now + Duration::from_secs(1)));
+        s.flush_requested = true;
+        assert!(s.work_due(now));
     }
 }

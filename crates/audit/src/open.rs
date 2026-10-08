@@ -18,7 +18,7 @@ use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, canar
 use crate::lock::InstanceLock;
 use crate::recovery::{check_new_passphrase, new_recovery_blob};
 use crate::schema;
-use crate::store::{OpenConfig, Store};
+use crate::store::{AnchorInit, OpenConfig, Store};
 use crate::writer::{Writer, WriterParts};
 
 /// First-run staging file: the new DB is renamed to `audit.db` only once `GENESIS` committed
@@ -255,7 +255,12 @@ pub fn create_new_store(
         archived_db,
         renamed: renamed.clone(),
     };
-    match Store::start(data, cfg, kek, input.install_id, move |parts| {
+    // First run wrote both anchors itself; there is no earlier state to verify.
+    let anchors = AnchorInit {
+        enabled: true,
+        head_anchored: true,
+    };
+    match Store::start(data, cfg, kek, input.install_id, anchors, move |parts| {
         first_run.run(parts)
     }) {
         Ok(store) => Ok(store),

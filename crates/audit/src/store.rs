@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::admission::{self, DEFAULT_MIN_FREE_BYTES, FreeSpaceProbe, OsFreeSpace};
+use crate::anchors::{self, Barrier, FirstRetainedAnchor, HeadAnchor};
 use crate::clock::{Clock, UtcInstant};
 use crate::crypto::{self, Kek};
 use crate::encoding::{self, FIELD_LIST, RowFields};
@@ -65,6 +66,13 @@ pub struct Hooks {
     /// Writer connection runs `synchronous=NORMAL` (long scenario tests only, T13).
     #[cfg(any(test, feature = "testing"))]
     pub synchronous_normal: bool,
+    /// The store starts with anchor writes disabled, as `open()` does until startup
+    /// verification passed; `Store::testing_enable_anchors` lifts it.
+    #[cfg(any(test, feature = "testing"))]
+    pub anchors_disabled: bool,
+    /// The anchor retry backoff runs ten times faster.
+    #[cfg(any(test, feature = "testing"))]
+    pub fast_anchor_backoff: bool,
 }
 
 impl Hooks {
@@ -92,7 +100,7 @@ impl fmt::Debug for QueryKey {
     }
 }
 
-/// Store state for Settings/tray (T08 fills the anchor fields, T09 incidents, T11 prune).
+/// Store state for Settings/tray (T09 fills the incidents, T11 prune).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoreHealth {
     pub anchor_write_failing: bool,
@@ -117,6 +125,7 @@ struct Sealed {
 struct Inner {
     tx: Mutex<Option<SyncSender<Cmd>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    anchor_thread: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<Shared>,
     install_id: String,
     kek: Kek,
@@ -130,12 +139,17 @@ struct Inner {
 }
 
 impl Inner {
-    /// Stops the writer after the commands already queued; never writes an anchor.
+    /// Stops the writer after the commands already queued, then the anchor thread; never
+    /// writes an anchor.
     fn stop(&self) {
         if let Some(tx) = lock(&self.tx).take() {
             let _ = tx.send(Cmd::Shutdown);
         }
         if let Some(h) = lock(&self.thread).take() {
+            let _ = h.join();
+        }
+        self.shared.anchors.stop();
+        if let Some(h) = lock(&self.anchor_thread).take() {
             let _ = h.join();
         }
     }
@@ -172,13 +186,24 @@ fn system_to_utc(t: SystemTime) -> Option<UtcInstant> {
     u.try_to_rfc3339_ms().map(|_| u)
 }
 
+/// How the anchor state starts.
+pub(crate) struct AnchorInit {
+    /// Anchor writes allowed from the start (first run); `open()` starts disabled until the
+    /// startup verification passed (§8.7).
+    pub(crate) enabled: bool,
+    /// The keychain already holds the head the writer starts with (first run).
+    pub(crate) head_anchored: bool,
+}
+
 impl Store {
-    /// Spawns the writer; `init` runs on the writer thread and returns the ready writer.
+    /// Spawns the writer and the anchor thread; `init` runs on the writer thread and returns
+    /// the ready writer.
     pub(crate) fn start<F>(
         data: &LocalDataDir,
         cfg: OpenConfig,
         kek: Kek,
         install_id: String,
+        anchors: AnchorInit,
         init: F,
     ) -> Result<Store, OpenError>
     where
@@ -192,10 +217,47 @@ impl Store {
             hooks: cfg.hooks.clone(),
         };
         let (tx, thread) = writer::spawn(move || init(parts))?;
+        let h = lock(&shared.head).clone();
+        #[allow(unused_mut)]
+        let mut enabled = anchors.enabled;
+        #[allow(unused_mut)]
+        let mut scale_div = 1;
+        #[cfg(any(test, feature = "testing"))]
+        {
+            enabled &= !cfg.hooks.anchors_disabled;
+            if cfg.hooks.fast_anchor_backoff {
+                scale_div = 10;
+            }
+        }
+        shared.anchors.init(
+            enabled,
+            HeadAnchor {
+                chain_id: h.chain_id,
+                seq: h.seq,
+                record_hash: h.hash,
+            },
+            anchors.head_anchored,
+        );
+        let spawned = {
+            let shared = shared.anchors.clone();
+            let keys = cfg.keys.clone();
+            std::thread::Builder::new()
+                .name("audit-anchor".into())
+                .spawn(move || anchors::run(shared, keys, scale_div))
+        };
+        let anchor_thread = match spawned {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = tx.send(Cmd::Shutdown);
+                let _ = thread.join();
+                return Err(e.into());
+            }
+        };
         Ok(Store {
             inner: Arc::new(Inner {
                 tx: Mutex::new(Some(tx)),
                 thread: Mutex::new(Some(thread)),
+                anchor_thread: Mutex::new(Some(anchor_thread)),
                 shared,
                 install_id,
                 query_key: QueryKey(crypto::query_key(&kek)),
@@ -393,8 +455,45 @@ impl Store {
         &self.inner.install_id
     }
 
+    /// Writes the head anchor now (C.3), e.g. after `APP_STOP`. Returns the keychain error of
+    /// the attempt, if any. `Ok(())` and no write while anchors are disabled (before startup
+    /// verification) or held back by a restore barrier; behind a prune barrier it writes the
+    /// capped head. Never an incident: a failure is also in `health()`.
+    pub fn flush_head_anchor(&self) -> Result<(), AuditError> {
+        self.inner.shared.anchors.flush()
+    }
+
+    /// Startup verification passed: the anchor thread may write (§8.7 "no anchor writes
+    /// before verification").
+    #[allow(dead_code)] // called by `open()` (T10)
+    pub(crate) fn enable_anchors(&self) {
+        self.inner.shared.anchors.enable();
+    }
+
+    /// Holds the head anchor back (prune/restore); lifted by the anchor thread.
+    #[allow(dead_code)] // called by prune/restore (T11)
+    pub(crate) fn install_barrier(&self, b: Barrier) {
+        self.inner.shared.anchors.set_barrier(b);
+    }
+
+    /// The restore completion step: writes both anchors and lifts the restore barrier.
+    #[allow(dead_code)] // called by restore (T11)
+    pub(crate) fn complete_restore_anchors(
+        &self,
+        head: HeadAnchor,
+        first_retained: FirstRetainedAnchor,
+    ) -> Result<(), AuditError> {
+        self.inner
+            .shared
+            .anchors
+            .complete_restore(head, first_retained)
+    }
+
     pub fn health(&self) -> StoreHealth {
+        let a = self.inner.shared.anchors.health();
         StoreHealth {
+            anchor_write_failing: a.write_failing,
+            first_retained_update_pending: a.first_retained_pending,
             storage_low: self.admission_check().is_err(),
             ..StoreHealth::default()
         }
@@ -405,6 +504,43 @@ impl Store {
     pub fn shutdown(&self) {
         self.inner.stop();
         *lock(&self.inner.reader) = None;
+    }
+
+    /// `enable_anchors` for integration tests (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_enable_anchors(&self) {
+        self.enable_anchors();
+    }
+
+    /// A prune barrier at `seq` (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_prune_barrier(
+        &self,
+        seq: u64,
+        record_hash: [u8; 32],
+        first_retained: FirstRetainedAnchor,
+    ) {
+        self.install_barrier(Barrier::Prune {
+            seq,
+            record_hash,
+            first_retained,
+        });
+    }
+
+    /// A restore barrier at `seq` (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_restore_barrier(&self, seq: u64) {
+        self.install_barrier(Barrier::Restore { seq });
+    }
+
+    /// `complete_restore_anchors` for integration tests (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_complete_restore_anchors(
+        &self,
+        head: HeadAnchor,
+        first_retained: FirstRetainedAnchor,
+    ) -> Result<(), AuditError> {
+        self.complete_restore_anchors(head, first_retained)
     }
 
     /// A pragma as the writer connection reports it (feature `testing`).

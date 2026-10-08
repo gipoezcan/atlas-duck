@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+use crate::anchors::{AnchorShared, HeadAnchor};
 use crate::clock::{
     AnomalyKind, ClockAnomaly, ClockState, Stamp, UtcInstant, epoch_text, month_text, parse_epoch,
 };
@@ -226,6 +227,8 @@ pub(crate) struct Shared {
     pub(crate) dek_cache: Mutex<HashMap<u64, Dek>>,
     /// `observe_server_date` calls dropped because the channel was full.
     pub(crate) dropped_observations: AtomicU64,
+    /// The head handed to the anchor thread after every commit (T08).
+    pub(crate) anchors: Arc<AnchorShared>,
 }
 
 impl Shared {
@@ -238,6 +241,7 @@ impl Shared {
             }),
             dek_cache: Mutex::new(HashMap::new()),
             dropped_observations: AtomicU64::new(0),
+            anchors: Arc::new(AnchorShared::new()),
         })
     }
 }
@@ -505,8 +509,9 @@ impl WriterState {
         Ok(out)
     }
 
-    /// After `COMMIT` returned: publish the head and the new keys. (T08 hands the head to the
-    /// anchor state here; T11 queues a prune attempt when the head's epoch date advanced.)
+    /// After `COMMIT` returned: publish the head and the new keys, and hand the head to the
+    /// anchor thread (never blocks on the keychain). T11 queues a prune attempt here when the
+    /// head's epoch date advanced.
     fn post_commit(&mut self, new_keys: HashMap<u64, Dek>) {
         lock(&self.shared.dek_cache).extend(new_keys);
         *lock(&self.shared.head) = HeadView {
@@ -514,6 +519,11 @@ impl WriterState {
             hash: self.head.hash,
             chain_id: self.head.chain_id.clone(),
         };
+        self.shared.anchors.publish_head(HeadAnchor {
+            chain_id: self.head.chain_id.clone(),
+            seq: self.head.seq,
+            record_hash: self.head.hash,
+        });
     }
 }
 
