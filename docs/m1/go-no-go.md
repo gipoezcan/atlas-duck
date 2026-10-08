@@ -2,7 +2,7 @@
 
 Spec §14 M1 ends with "a recorded go/no-go per OS". This file is that record. The spec does not say where to record it (plan gap G2); the plan chose this file. `node ci/check-go-no-go.mjs docs/m1/go-no-go.md` checks its shape and runs in the `rust` job. `node ci/check-go-no-go.mjs docs/m1/go-no-go.md --verify-git --verify-runs` checks it against git and GitHub (the M1 exit criterion).
 
-**Summary: the M1 exit criterion is NOT met, and this record is not a go.** No row is GO and none is a measured NO-GO from CI. All six rows are UNVERIFIED because nothing could run in CI: the project remote is a private GitLab project with Linux-only shared runners, nothing has been pushed, and the plan's workflows are GitHub Actions. The only live measurement is the Windows 11 dev box (build 26200). On that box the Windows floor is not met on the dev build (details in the two Windows rows and in finding V09). Linux and macOS code has never run anywhere, not even a compile check against those targets.
+**Summary: the M1 exit criterion is NOT met, and this record is not a go.** No row is GO and none is a measured NO-GO from CI. All six rows are UNVERIFIED because nothing could run in CI: the project remote is a private GitLab project with Linux-only shared runners, nothing has been pushed, and the plan's workflows are GitHub Actions. The only live measurement is the Windows 11 dev box (build 26200). On that box the Windows floor is not met on the dev build (details in the two Windows rows and in finding V09). Linux and macOS code has never run anywhere. Compile status on Linux and macOS: the final reviewer ran `cargo check --all-targets` and `cargo clippy -D warnings` on `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin` for `atlas-duck-ipc`, `atlas-duck-audit`, `atlas-duck-sandbox-host` and the worker's confine and probe sources, through a scratch copy with `engine.rs` stubbed. The rquickjs engine path and the whole `atlas-duck-app` crate were never compiled on Linux or macOS. No test has run on either OS.
 
 ## How to read a verdict
 
@@ -73,6 +73,8 @@ None. Nothing has been pushed to a GitHub remote and no GitHub Actions run exist
 - extra layers: none
 - evidence source: local run on the Windows dev box, not CI (same commands and run as the windows-per-user row). No install-probes.yml job exists.
 
+Dev-build run identical to windows-per-user; not a separate per-machine measurement.
+
 | probe | outcome | evidence |
 |---|---|---|
 | file_in_profile | blocked | Reported { os_error: Some(5) } |
@@ -90,7 +92,7 @@ None. Nothing has been pushed to a GitHub remote and no GitHub Actions run exist
 - commit: `3acf91e12fca13c76ae90530d87078f0737a628f`
 - run: none (no CI run available; no macOS runner)
 - verdict: UNVERIFIED
-- reason: the macOS probe code (`sandbox_init` with the embedded SBPL profile, the seatbelt probes, `RLIMIT_AS`) has never been compiled or executed on any macOS. There is no macOS runner (GitLab shared runners are Linux-only) and nothing was pushed. Even in a future CI run the floor will not be proven by the dev-build leg alone: `task_for_pid` is `allowed` or `inconclusive` there because the test binary is not hardened, and the hardened-app evidence from T21 does not prove it independently (T18 and T21 rulings: macOS `task_for_pid` is NOT independently proven, even if CI prints `proven`).
+- reason: the macOS probe code (`sandbox_init` with the embedded SBPL profile, the seatbelt probes, `RLIMIT_AS`) has never been executed on any macOS, and only part of it was type-checked (see the summary for exactly which crates; the `atlas-duck-app` crate, which holds the probe tests, was never compiled for macOS). There is no macOS runner (GitLab shared runners are Linux-only) and nothing was pushed. Even in a future CI run the floor will not be proven by the dev-build leg alone: `task_for_pid` is `allowed` or `inconclusive` there because the test binary is not hardened, and the hardened-app evidence from T21 does not prove it independently (T18 and T21 rulings: macOS `task_for_pid` is NOT independently proven, even if CI prints `proven`).
 - extra layers: unknown (never ran)
 - evidence source: none. The expected source is ci.yml job `rust (aarch64-apple-darwin)` (step `Probe evidence`) and install-probes.yml job `macos-arm64`; neither ran.
 
@@ -108,7 +110,7 @@ None. Nothing has been pushed to a GitHub remote and no GitHub Actions run exist
 - commit: `3acf91e12fca13c76ae90530d87078f0737a628f`
 - run: none (no CI run available; nothing pushed)
 - verdict: UNVERIFIED
-- reason: the Linux confinement (`PR_SET_NO_NEW_PRIVS`, Landlock, the seccomp default-kill allowlist, the memory-read probes) and the Linux probe tests have never been executed anywhere, nor type-checked against a Linux target on this box (the rquickjs C build needs a Linux cc). Nothing has been pushed and the GitLab pipeline (`.gitlab-ci.yml`) has no sandbox-probe job. Caveats that hold for any future result: SIGSYS attribution is by announcement only (the kernel gives the host only SIGSYS, so a death after the announced attempt proves the worker died at or after it, not on which syscall; T17 ruling), and the memory-read probes can score `blocked` through Yama `ptrace_scope` even unconfined (T14 ruling; T17 records the Yama value as a `RUNNER_FACT`).
+- reason: the Linux confinement (`PR_SET_NO_NEW_PRIVS`, Landlock, the seccomp default-kill allowlist, the memory-read probes) and the Linux probe tests have never been executed anywhere, and the rquickjs engine path and the `atlas-duck-app` crate were never compiled for a Linux target (the rquickjs C build needs a Linux cc; the sandbox-host and worker confine and probe sources were checked with `engine.rs` stubbed, see the summary). Nothing has been pushed and the GitLab pipeline (`.gitlab-ci.yml`) has no sandbox-probe job. Caveats that hold for any future result: SIGSYS attribution is by announcement only (the kernel gives the host only SIGSYS, so a death after the announced attempt proves the worker died at or after it, not on which syscall; T17 ruling), and the memory-read probes can score `blocked` through Yama `ptrace_scope` even unconfined (T14 ruling; T17 records the Yama value as a `RUNNER_FACT`). Also, on Linux `mem_read_process_vm` and `mem_read_proc_mem` can score `blocked` from the app's own `PR_SET_DUMPABLE=0` (T09) rather than from seccomp, so an installed-package `floor=met` does not attest those two probes (see the comments in `crates/sandbox-worker/src/probe/linux.rs`).
 - extra layers: unknown (never ran)
 - evidence source: none. The expected source is ci.yml job `rust (x86_64-unknown-linux-gnu)` (step `Probe evidence`) and install-probes.yml jobs `ubuntu-deb` and `ubuntu-appimage`; none ran.
 
@@ -117,7 +119,7 @@ None. Nothing has been pushed to a GitHub remote and no GitHub Actions run exist
 - commit: `3acf91e12fca13c76ae90530d87078f0737a628f`
 - run: none (no CI run available; nothing pushed)
 - verdict: UNVERIFIED
-- reason: never executed. The plan's Fedora evidence is the `probe-evidence-fedora` job (a binary built on ubuntu-22.04, glibc 2.35, run inside `fedora:40`, glibc 2.39, with Docker's default seccomp profile on the runner's Ubuntu kernel, so at best it shows the glibc half of V11, not a Fedora kernel) plus the installed rpm (`fedora-rpm`). Neither ran, and the Fedora and rpm steps need Docker, which subagents may not run here.
+- reason: never executed. The plan's Fedora evidence is the `probe-evidence-fedora` job (a binary built on ubuntu-22.04, glibc 2.35, run inside `fedora:40`, glibc 2.39, with Docker's default seccomp profile on the runner's Ubuntu kernel, so at best it shows the glibc half of V11, not a Fedora kernel) plus the installed rpm (`fedora-rpm`). Neither ran, and the Fedora and rpm steps need Docker, which is not available on this machine.
 - extra layers: unknown (never ran)
 - evidence source: none. The expected source is ci.yml job `probe-evidence-fedora` and install-probes.yml job `fedora-rpm`; neither ran.
 
@@ -163,7 +165,7 @@ Each finding answers the §15 verify item it names. The V numbers count the bull
 
 - question: does `sandbox_init` with the embedded SBPL profile confine the worker on the CI macOS image, and is `RLIMIT_AS` a no-op there?
 - status: open
-- evidence: none. The macOS probe code (T14 `macos.rs` FFI, T18 profile and `probes_macos`) has never been compiled or run; no macOS runner exists. Known design limits: the bare "deny default" profile may need allow rules the first run will reveal (T18 minor), and on the dev-build leg `task_for_pid` will be `allowed` or `inconclusive` because the test binary is not hardened.
+- evidence: none. The macOS probe code (T14 `macos.rs` FFI, T18 profile and `probes_macos`) has never been run; no macOS runner exists, and the `atlas-duck-app` crate (the `probes_macos` tests) was never compiled for macOS (the sandbox-host and worker sources were only checked and linted, see the summary). Known design limits: the bare "deny default" profile may need allow rules the first run will reveal (T18 minor), and on the dev-build leg `task_for_pid` will be `allowed` or `inconclusive` because the test binary is not hardened.
 - re-verify: the profile is undocumented and deprecated, so §15 asks for a re-run on each new macOS major. No macOS version has been verified.
 - unverified: everything.
 
@@ -171,7 +173,7 @@ Each finding answers the §15 verify item it names. The V numbers count the bull
 
 - question: does the worker, under the seccomp allowlist, run the full engine self-test (local-time `Date`, `toLocale*String`, `TZ=UTC0`) on each supported glibc without hitting a KILL rule; is every worker thread confined; does the worker outlive a short-lived host thread (`PR_SET_PDEATHSIG`)?
 - status: open
-- evidence: none. The Linux confinement and its tests (T16, T17) have never run, not even a compile check against a Linux target on this box. Whether the allowlist covers what glibc 2.35 (Ubuntu 22.04) and glibc 2.39 (Fedora 40) call during the self-test is unknown until a run; the first run may need allowlist additions.
+- evidence: none. The Linux confinement and its tests (T16, T17) have never run. The confine and probe sources and `atlas-duck-sandbox-host` were checked and linted for `x86_64-unknown-linux-gnu` (see the summary), but the rquickjs engine path and the `atlas-duck-app` crate were never compiled for Linux. Whether the allowlist covers what glibc 2.35 (Ubuntu 22.04) and glibc 2.39 (Fedora 40) call during the self-test is unknown until a run; the first run may need allowlist additions.
 - allowlist changes: none (the allowlist has not been exercised; `git log` of `seccomp_allowlist.rs` shows only its creation in `1cbf9e3`).
 - caveats carried from T17: SIGSYS attribution is by announcement only (the host cannot learn which syscall killed the worker); `abort`, OOM and stack overflow also end in SIGSYS because `tgkill`, `gettid` and `rt_sigaction` are not allowed, so the host reads them as sandbox violations (M8 note below); Landlock errors silently yield no layer; `restart_syscall` is not allowed and `mmap` with `PROT_EXEC` is unrestricted.
 - not covered: musl (no musl target ships) and aarch64 Linux (not built).
