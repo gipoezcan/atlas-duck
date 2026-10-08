@@ -515,6 +515,8 @@ pub mod testing { /* scripted approver over DecisionApi, StubConfirmer (queue of
 
 `DecisionError::EditRejected`: the spec lists no `DECISION_INVALID` reason for an edit that fails static re-validation (§8.3 names the four `DECISION_INVALID` reasons `target_param_edit`, `not_opened`, `not_approvable`, `batch_item_flagged`; §5.1 inv. 5 names only three of them). It is returned to the caller as the static validation error, the request stays in `AwaitingApproval` with `candidate_rev` unchanged, and no new audit reason is invented; if the M3 plan wants it logged, it first adds a reason to §5.1/§8.3 and the ledger.
 
+[as built in M3, Task 12 review, ruled 2026-10-09; M3 plan PD-19, PD-29] `DecisionError` gains the additive variant **`NotDecidable`**: `preview_fetch`/`raw_page` for a request that is not waiting for a decision (`Enriching` incl. a refresh, `StaleCheck`, `Executing`, or terminal) is refused with nothing logged and no `PREVIEW_SHOWN` (the single-item twin of `BatchFailure::NotPending`). A *decision* (`approve`/`release`/`deny`/`edit`) on a request that is still pending but in such a phase is not `NotDecidable`: it is logged `DECISION_STALE {submitted_rev, current_rev, decision}` and answered `Stale { current }`, with no state change. This is what gives §11.3/§5.4 step 5 their post-approval `DECISION_STALE` records.
+
 ### C.8 `sandbox-host`, `sandbox-worker`
 
 ```rust
