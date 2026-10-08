@@ -378,10 +378,9 @@ pub fn step(m: &mut Model, e: Event) -> Result<Applied, Rejection> {
                 m.bump();
             }
         }
-        (P::AwaitingApproval(_), E::Instance(_)) => {
-            m.phase = P::AwaitingApproval(Hold::Preview);
-            m.bump();
-        }
+        // credential_changed / instance_changed / user_renamed (§5.1): a new revision, but the hold
+        // is an enrichment verdict and stays until a refresh (`Enriched`) re-decides it (inv. 6).
+        (P::AwaitingApproval(_), E::Instance(_)) => m.bump(),
         // Refresh (§5.4 step 5, §7.1): re-enrichment of a queued write; the rev bumps at `Enriched`.
         (P::AwaitingApproval(_), E::EnrichStarted) if m.kind == Kind::Write => {
             m.phase = P::Enriching;
@@ -439,6 +438,11 @@ pub fn step(m: &mut Model, e: Event) -> Result<Applied, Rejection> {
         // Cancel / expiry (§4.4, §2.5): never from StaleCheck/Executing except shutdown from StaleCheck.
         (P::Executing, E::Cancel(_)) => return Err(Rejection::NotCancellable),
         (P::StaleCheck, E::Cancel(CancelReason::ByClient)) => {
+            return Err(Rejection::NotCancellable);
+        }
+        // Once `executing` was emitted the agent keeps seeing it until terminal (§4.5): a write
+        // returned to the queue answers a client cancel like one still executing (§4.4).
+        (_, E::Cancel(CancelReason::ByClient)) if m.executing_emitted => {
             return Err(Rejection::NotCancellable);
         }
         (P::StaleCheck, E::Cancel(r)) => done(m, Terminal::Cancelled(r)),
@@ -758,51 +762,119 @@ mod tests {
         with(to_stale_check(), &[V(E::StalePassed)])
     }
 
-    /// A path to every phase (per kind where the entry depends on it).
-    fn targets() -> Vec<(Kind, Phase, Vec<S>)> {
+    /// A path to a reachable state, plus what the path did that the phase alone does not show.
+    struct Target {
+        kind: Kind,
+        phase: Phase,
+        steps: Vec<S>,
+        /// `executing` was emitted on the way (a write back in the queue after `StalePassed`).
+        emitted: bool,
+    }
+
+    fn tg(kind: Kind, phase: Phase, steps: Vec<S>) -> Target {
+        Target {
+            kind,
+            phase,
+            steps,
+            emitted: false,
+        }
+    }
+
+    /// A path to every phase (per kind where the entry depends on it), plus the write states
+    /// reached again after `executing` was emitted.
+    fn targets() -> Vec<Target> {
         let vp = V(E::ValidationPassed);
         let mut t = Vec::new();
         for k in KINDS {
-            t.push((k, P::Received, vec![]));
-            t.push((k, P::Validated, vec![vp]));
+            t.push(tg(k, P::Received, vec![]));
+            t.push(tg(k, P::Validated, vec![vp]));
         }
-        t.push((Kind::Read, P::Fetching, vec![vp, V(E::FetchStarted)]));
+        t.push(tg(Kind::Read, P::Fetching, vec![vp, V(E::FetchStarted)]));
         for i in READ_ITEMS {
-            t.push((Kind::Read, P::AwaitingRelease(i), open(read_to(i))));
+            t.push(tg(Kind::Read, P::AwaitingRelease(i), open(read_to(i))));
         }
-        t.push((Kind::Write, P::Enriching, vec![vp, V(E::EnrichStarted)]));
+        t.push(tg(Kind::Write, P::Enriching, vec![vp, V(E::EnrichStarted)]));
         for h in HOLDS {
-            t.push((Kind::Write, P::AwaitingApproval(h), open(write_to(h))));
+            t.push(tg(Kind::Write, P::AwaitingApproval(h), open(write_to(h))));
         }
-        t.push((Kind::Write, P::StaleCheck, to_stale_check()));
-        t.push((Kind::Write, P::Executing, to_executing()));
+        t.push(tg(Kind::Write, P::StaleCheck, to_stale_check()));
+        t.push(Target {
+            emitted: true,
+            ..tg(Kind::Write, P::Executing, to_executing())
+        });
         let compiling = vec![vp, V(E::CompileStarted)];
-        t.push((Kind::Script, P::Compiling, compiling.clone()));
+        t.push(tg(Kind::Script, P::Compiling, compiling.clone()));
         let slot_wait = with(compiling, &[V(E::CompileOk)]);
-        t.push((Kind::Script, P::SlotWait, slot_wait.clone()));
-        t.push((
+        t.push(tg(Kind::Script, P::SlotWait, slot_wait.clone()));
+        t.push(tg(
             Kind::Script,
             P::Running,
             with(slot_wait, &[V(E::SlotAcquired)]),
         ));
         for i in SCRIPT_ITEMS {
-            t.push((Kind::Script, P::AwaitingRelease(i), open(script_to(i))));
+            t.push(tg(Kind::Script, P::AwaitingRelease(i), open(script_to(i))));
         }
-        t.push((Kind::DryRun, P::DryRunning, vec![vp, V(E::DryRunStarted)]));
+        t.push(tg(
+            Kind::DryRun,
+            P::DryRunning,
+            vec![vp, V(E::DryRunStarted)],
+        ));
+
+        // Back in the queue after `executing` was emitted (§4.5: the status stays `executing`).
+        let conflict = with(
+            to_executing(),
+            &[
+                V(E::VersionConflict),
+                V(E::PreviewShown { rev: 2 }),
+                A(true),
+            ],
+        );
+        let not_sent = with(
+            to_executing(),
+            &[
+                V(E::Stale(StaleReason::RecheckFailed)),
+                V(E::PreviewShown { rev: 2 }),
+                A(true),
+            ],
+        );
+        let re_approved = with(not_sent.clone(), &[V(E::Approve { rev: 2 })]);
+        for (phase, steps) in [
+            (P::AwaitingApproval(Hold::Conflict), conflict.clone()),
+            (P::AwaitingApproval(Hold::Preview), not_sent.clone()),
+            (P::Enriching, with(conflict, &[V(E::EnrichStarted)])),
+            (
+                P::Enriching,
+                with(
+                    not_sent,
+                    &[V(E::Edit {
+                        rev: 2,
+                        target_or_baseline_changed: false,
+                        rerun_enrichment: true,
+                    })],
+                ),
+            ),
+            (P::StaleCheck, re_approved.clone()),
+            (P::Executing, with(re_approved, &[V(E::StalePassed)])),
+        ] {
+            t.push(Target {
+                emitted: true,
+                ..tg(Kind::Write, phase, steps)
+            });
+        }
 
         let released = open(read_to(ReleaseItem::Result));
         let done = |t: Terminal| P::Done(t);
-        t.push((
+        t.push(tg(
             Kind::Read,
             done(Terminal::Rejected),
             vec![V(E::ValidationFailed)],
         ));
-        t.push((
+        t.push(tg(
             Kind::Read,
             done(Terminal::Failed),
             vec![vp, V(E::FetchStarted), V(E::FetchFailedDirect)],
         ));
-        t.push((
+        t.push(tg(
             Kind::Read,
             done(Terminal::Released),
             with(
@@ -813,7 +885,7 @@ mod tests {
                 })],
             ),
         ));
-        t.push((
+        t.push(tg(
             Kind::Read,
             done(Terminal::ReleasedRedacted),
             with(
@@ -824,33 +896,40 @@ mod tests {
                 })],
             ),
         ));
-        t.push((
+        t.push(tg(
             Kind::Read,
             done(Terminal::Denied),
             with(released, &[V(E::Deny { rev: 1 })]),
         ));
-        t.push((
+        t.push(tg(
             Kind::DryRun,
             done(Terminal::Succeeded),
             vec![vp, V(E::DryRunStarted), V(E::DryRunEnded { ok: true })],
         ));
-        t.push((
-            Kind::Write,
-            done(Terminal::OutcomeUnknown),
-            with(
-                to_executing(),
-                &[V(E::Executed(ExecOutcome::OutcomeUnknown))],
-            ),
-        ));
-        t.push((Kind::Read, done(Terminal::Expired), vec![V(E::Expire)]));
+        t.push(Target {
+            emitted: true,
+            ..tg(
+                Kind::Write,
+                done(Terminal::OutcomeUnknown),
+                with(
+                    to_executing(),
+                    &[V(E::Executed(ExecOutcome::OutcomeUnknown))],
+                ),
+            )
+        });
+        t.push(tg(Kind::Read, done(Terminal::Expired), vec![V(E::Expire)]));
         for r in REASONS {
-            t.push((
+            t.push(tg(
                 Kind::Script,
                 done(Terminal::Cancelled(r)),
                 vec![V(E::Cancel(r))],
             ));
         }
-        t.push((Kind::Write, done(Terminal::Abandoned), vec![V(E::Crash)]));
+        t.push(tg(
+            Kind::Write,
+            done(Terminal::Abandoned),
+            vec![V(E::Crash)],
+        ));
         t
     }
 
@@ -858,8 +937,9 @@ mod tests {
     /// (current revision opened and approvable, events carrying the current revision). Written
     /// row by row from the spec diagram and the plan decisions; everything unlisted is `Illegal`.
     /// `Ok((next phase, rev bumped))`.
-    fn expected(kind: Kind, phase: Phase, e: Event) -> Result<(Phase, bool), Rejection> {
+    fn expected(t: &Target, e: Event) -> Result<(Phase, bool), Rejection> {
         use ReleaseItem as I;
+        let (kind, phase) = (t.kind, t.phase);
         let to = |p: Phase| -> Result<(Phase, bool), Rejection> { Ok((p, false)) };
         let bump = |p: Phase| -> Result<(Phase, bool), Rejection> { Ok((p, true)) };
         let done = |t: Terminal| -> Result<(Phase, bool), Rejection> { Ok((P::Done(t), false)) };
@@ -876,9 +956,11 @@ mod tests {
             // §5.1 "Infrastructure failures → Failed"; plan: sent but unlogged → outcome_unknown.
             (P::Executing, E::AuditFailure) => done(Terminal::OutcomeUnknown),
             (_, E::AuditFailure) => done(Terminal::Failed),
-            // §4.4, §2.5: StaleCheck only via the shutdown path, Executing never.
+            // §4.4, §2.5: StaleCheck only via the shutdown path, Executing never; once
+            // `executing` was shown the client cannot cancel (§4.5), only the shutdown path can.
             (P::Executing, E::Cancel(_)) => Err(Rejection::NotCancellable),
             (P::StaleCheck, E::Cancel(CancelReason::ByClient)) => Err(Rejection::NotCancellable),
+            (_, E::Cancel(CancelReason::ByClient)) if t.emitted => Err(Rejection::NotCancellable),
             (_, E::Cancel(r)) => done(Terminal::Cancelled(r)),
             // Plan: phases bounded by their own budgets ignore expiry.
             (P::StaleCheck | P::Executing | P::Running | P::DryRunning, E::Expire) => {
@@ -954,7 +1036,8 @@ mod tests {
                 },
             ) => to(P::Enriching),
             (P::AwaitingApproval(_), E::Edit { .. }) => bump(phase),
-            (P::AwaitingApproval(_), E::Instance(_)) => bump(P::AwaitingApproval(Hold::Preview)),
+            // Instance events never re-decide the hold (inv. 6); a refresh does.
+            (P::AwaitingApproval(_), E::Instance(_)) => bump(phase),
             (P::AwaitingApproval(_), E::EnrichStarted) if kind == Kind::Write => to(P::Enriching),
             (P::AwaitingRelease(I::ScriptResult | I::ScriptErrorDetails), E::Instance(_)) => {
                 bump(phase)
@@ -1013,17 +1096,19 @@ mod tests {
         let targets = targets();
         let mut failures = Vec::new();
         for p in all_phases() {
-            if !targets.iter().any(|(_, q, _)| *q == p) {
+            if !targets.iter().any(|t| t.phase == p) {
                 failures.push(format!("no target reaches {p:?}"));
             }
         }
         let mut pairs = 0usize;
-        for (kind, phase, steps) in &targets {
-            let m = run(*kind, steps)?;
-            if m.phase() != *phase {
+        for t in &targets {
+            let (kind, phase) = (t.kind, t.phase);
+            let m = run(kind, &t.steps)?;
+            if m.phase() != phase || m.executing_emitted != t.emitted {
                 failures.push(format!(
-                    "{kind:?} path ends in {:?}, not {phase:?}",
-                    m.phase()
+                    "{kind:?} path ends in {:?} (emitted {}), not {phase:?}",
+                    m.phase(),
+                    m.executing_emitted
                 ));
                 continue;
             }
@@ -1033,7 +1118,7 @@ mod tests {
                 let before = snap(&n);
                 let got = step(&mut n, e);
                 let after = snap(&n);
-                let want = expected(*kind, *phase, e);
+                let want = expected(t, e);
                 let fine = match (got, want) {
                     (Ok(a), Ok((next, bumped))) => {
                         after.phase == next
@@ -1308,11 +1393,32 @@ mod tests {
         let mut m = run(Kind::Write, &open(write_to(Hold::IdentityMismatch)))?;
         ok(&mut m, E::EnrichStarted)?;
         assert_eq!((m.phase(), m.rev(), m.opened()), (P::Enriching, 1, false));
-        let mut m = run(Kind::Write, &open(write_to(Hold::IdentityMismatch)))?;
-        ok(&mut m, E::Instance(InstanceEvt::UserRenamed))?;
+        // Instance events bump the revision but never re-decide the hold (inv. 6): only the
+        // refresh's `Enriched` does.
+        for h in HOLDS {
+            for ev in INSTANCE {
+                let mut m = run(Kind::Write, &open(write_to(h)))?;
+                let a = ok(&mut m, E::Instance(ev))?;
+                assert!(a.rev_bumped);
+                assert_eq!(
+                    (m.phase(), m.rev(), m.opened(), m.approvable()),
+                    (P::AwaitingApproval(h), 2, false, false),
+                    "{h:?} + {ev:?}"
+                );
+            }
+        }
+        // The lost-update case: a conflict hold survives a token change even if the engine
+        // wrongly marks the new revision approvable; a refresh decides it again.
+        let mut m = run(Kind::Write, &open(write_to(Hold::Conflict)))?;
+        ok(&mut m, E::Instance(InstanceEvt::CredentialChanged))?;
+        ok(&mut m, E::PreviewShown { rev: 2 })?;
+        m.set_approvable(true);
+        rejects(&mut m, E::Approve { rev: 2 }, Rejection::NotApprovable)?;
+        ok(&mut m, E::EnrichStarted)?;
+        ok(&mut m, E::Enriched(Hold::Preview))?;
         assert_eq!(
-            (m.phase(), m.rev(), m.opened()),
-            (P::AwaitingApproval(Hold::Preview), 2, false)
+            (m.phase(), m.rev()),
+            (P::AwaitingApproval(Hold::Preview), 3)
         );
         Ok(())
     }
@@ -1514,7 +1620,10 @@ mod tests {
         )?;
 
         // Every rev-carrying decision with a wrong revision, in every decidable state.
-        for (kind, phase, steps) in targets() {
+        for Target {
+            kind, phase, steps, ..
+        } in targets()
+        {
             if !matches!(phase, P::AwaitingRelease(_) | P::AwaitingApproval(_)) {
                 continue;
             }
@@ -1558,9 +1667,17 @@ mod tests {
 
     #[test]
     fn cancel_rules() -> TestResult {
-        for (kind, phase, steps) in targets() {
+        for Target {
+            kind,
+            phase,
+            steps,
+            emitted,
+            ..
+        } in targets()
+        {
             for r in REASONS {
                 let mut m = run(kind, &steps)?;
+                let before = agent_status(&m);
                 match phase {
                     P::Done(_) | P::Executing => {
                         rejects(&mut m, E::Cancel(r), Rejection::NotCancellable)?
@@ -1568,6 +1685,13 @@ mod tests {
                     P::StaleCheck if r == CancelReason::ByClient => {
                         rejects(&mut m, E::Cancel(r), Rejection::NotCancellable)?;
                         assert_eq!(m.phase(), P::StaleCheck);
+                    }
+                    // After `executing` was emitted the client cancel answers `executing`, like a
+                    // write still on the wire (§4.4, §4.5); the shutdown path still cancels.
+                    _ if emitted && r == CancelReason::ByClient => {
+                        rejects(&mut m, E::Cancel(r), Rejection::NotCancellable)?;
+                        assert_eq!(before, Status::Executing);
+                        assert_eq!(agent_status(&m), Status::Executing, "{phase:?}");
                     }
                     _ => {
                         let a = ok(&mut m, E::Cancel(r))?;
@@ -1588,10 +1712,25 @@ mod tests {
                 }
             }
         }
-        // A stale return does not make the request cancellable by the agent while re-checking.
+        // A pre-execution stale return is invisible (still `pending`), so the agent may cancel it.
         let mut m = run(Kind::Write, &to_stale_check())?;
         ok(&mut m, E::Stale(StaleReason::Changed))?;
         ok(&mut m, E::Cancel(CancelReason::ByClient))?;
+        assert_eq!(agent_status(&m), Status::Cancelled);
+        // After a version conflict the queued write stays `executing` for every client cancel,
+        // and the user's deny or the expiry still end it (plan decision, spec silent).
+        let mut m = run(Kind::Write, &to_executing())?;
+        ok(&mut m, E::VersionConflict)?;
+        rejects(
+            &mut m,
+            E::Cancel(CancelReason::ByClient),
+            Rejection::NotCancellable,
+        )?;
+        assert_eq!(agent_status(&m), Status::Executing);
+        let mut n = m.clone();
+        ok(&mut n, E::Expire)?;
+        assert_eq!(agent_status(&n), Status::Expired);
+        ok(&mut m, E::Cancel(CancelReason::OsShutdown))?;
         assert_eq!(agent_status(&m), Status::Cancelled);
         Ok(())
     }
@@ -1637,7 +1776,10 @@ mod tests {
         assert_eq!(m.phase(), P::Done(Terminal::OutcomeUnknown));
 
         // Never approved → abandoned, in every pending phase of every kind.
-        for (kind, phase, steps) in targets() {
+        for Target {
+            kind, phase, steps, ..
+        } in targets()
+        {
             let mut m = run(kind, &steps)?;
             match phase {
                 P::Done(_) => rejects(&mut m, E::Crash, Rejection::Illegal)?,
@@ -1858,7 +2000,7 @@ mod tests {
         )
     }
 
-    /// The seven U-01 invariants for one step (plan Task 12, Step 1).
+    /// The U-01 invariants for one step: (1)–(7) from plan Task 12 Step 1, (8)–(9) from its review.
     fn check(
         b: &Snap,
         a: &Snap,
@@ -1870,6 +2012,10 @@ mod tests {
         if !is_pending(b.phase) {
             prop_assert!(res.is_err(), "{:?} accepted in {:?}", e, b.phase);
             prop_assert_eq!(a.phase, b.phase);
+        }
+        // (9) once `executing` was emitted, a client cancel is never accepted (§4.4, §4.5).
+        if sh.stale_passed && e == E::Cancel(CancelReason::ByClient) {
+            prop_assert!(res.is_err(), "client cancel accepted in {:?}", b.phase);
         }
         let applied = match res {
             Err(_) => {
@@ -1915,6 +2061,20 @@ mod tests {
             prop_assert!(matches!(e, E::Approve { .. }), "{:?} entered StaleCheck", e);
             prop_assert_eq!(b.phase, P::AwaitingApproval(Hold::Preview));
         }
+        // (8) A hold is an enrichment verdict: set only by `Enriched`, a stale return or a version
+        // conflict; instance events, edits and candidate changes in the queue keep it (inv. 6).
+        if let (P::AwaitingApproval(h0), P::AwaitingApproval(h1)) = (b.phase, a.phase) {
+            prop_assert_eq!(h0, h1, "{:?} changed the hold", e);
+        }
+        if matches!(a.phase, P::AwaitingApproval(_)) && !matches!(b.phase, P::AwaitingApproval(_)) {
+            prop_assert!(
+                matches!(e, E::Enriched(_) | E::Stale(_) | E::VersionConflict)
+                    || (b.phase == P::StaleCheck && matches!(e, E::Instance(_))),
+                "{:?} entered {:?}",
+                e,
+                a.phase
+            );
+        }
         // (7) Crash → outcome_unknown iff approved and not returned.
         match e {
             E::Approve { .. } => sh.approved_live = true,
@@ -1951,7 +2111,7 @@ mod tests {
         Ok(())
     }
 
-    type Visit<'a> = &'a mut dyn FnMut(Phase, Event, Result<Applied, Rejection>, Phase);
+    type Visit<'a> = &'a mut dyn FnMut(&Snap, Event, Result<Applied, Rejection>, &Snap);
 
     fn replay(
         kind: Kind,
@@ -1972,7 +2132,7 @@ mod tests {
             let b = snap(&m);
             let res = step(&mut m, e);
             let a = snap(&m);
-            visit(b.phase, e, res, a.phase);
+            visit(&b, e, res, &a);
             check(&b, &a, e, res, &mut sh)?;
         }
         Ok(())
@@ -1996,20 +2156,29 @@ mod tests {
         let mut seen: Vec<Phase> = Vec::new();
         let mut accepted = [false; EVENT_VARIANTS];
         let mut crash_unknown = false;
+        let mut hold_kept = false;
+        let mut queued_executing_cancel_refused = false;
         for _ in 0..4096 {
             let (kind, seq) = strategy
                 .new_tree(&mut runner)
                 .map_err(|r| format!("{r:?}"))?
                 .current();
             replay(kind, &seq, &mut |b, e, res, a| {
-                for p in [b, a] {
+                for p in [b.phase, a.phase] {
                     if !seen.contains(&p) {
                         seen.push(p);
                     }
                 }
                 if res.is_ok() {
                     accepted[event_index(e)] = true;
-                    crash_unknown |= e == E::Crash && a == P::Done(Terminal::OutcomeUnknown);
+                    crash_unknown |= e == E::Crash && a.phase == P::Done(Terminal::OutcomeUnknown);
+                    hold_kept |= matches!(e, E::Instance(_))
+                        && b.phase != P::AwaitingApproval(Hold::Preview)
+                        && matches!(b.phase, P::AwaitingApproval(_));
+                } else {
+                    queued_executing_cancel_refused |= e == E::Cancel(CancelReason::ByClient)
+                        && b.executing_emitted
+                        && matches!(b.phase, P::AwaitingApproval(_) | P::Enriching);
                 }
             })
             .map_err(|e| format!("{e:?}"))?;
@@ -2021,6 +2190,11 @@ mod tests {
         assert!(missing.is_empty(), "never visited: {missing:?}");
         assert!(accepted.iter().all(|&b| b), "never accepted: {accepted:?}");
         assert!(crash_unknown, "no crash after an approval");
+        assert!(hold_kept, "no instance event on a non-preview hold");
+        assert!(
+            queued_executing_cancel_refused,
+            "no client cancel of a queued write after `executing`"
+        );
         Ok(())
     }
 }
