@@ -247,6 +247,11 @@ cleanup() {
   exit "$status"
 }
 trap cleanup EXIT
+# CI run 3: all three Linux legs exited 1 right after the probe line with no message (a bare
+# `set -e` exit). Name the command that failed and show what the app said.
+set -E
+trap 'status=$?; printf "install-probe-linux: command failed (status %s) at line %s: %s
+" "$status" "$LINENO" "$BASH_COMMAND" >&2; dump_log "${LOG:-/nonexistent}"; if [ -s "$APP_OUT" ]; then sed "s/^/app: /" "$APP_OUT" | tail -n 40 >&2; fi' ERR
 
 info "pinned fixture (a local temp data dir)"
 DATA_DIR="$("$here/pinned-fixture.sh")"
@@ -261,6 +266,7 @@ SAMPLE_FILE="$evidence/worker-paths.txt"
 : >"$SAMPLE_FILE"
 (
   set +e
+  trap - ERR
   while :; do
     for d in /proc/[0-9]*; do
       case "$(cat "$d/comm" 2>/dev/null)" in
@@ -284,7 +290,8 @@ assert_probe_line "$line" 'n/a'
 # The real app process: for an AppImage the runtime and AppRun come first.
 app_pid="$(pgrep -u "$(id -u)" -x atlas-duck-app | head -n 1 || true)"
 [ -n "$app_pid" ] || die "no atlas-duck-app process although it logged sandbox_probe"
-app_exe="$(readlink -f "/proc/$app_pid/exe")"
+app_exe="$(readlink -f "/proc/$app_pid/exe" || true)"
+[ -n "$app_exe" ] || die "cannot read /proc/$app_pid/exe: the app process is gone (it exited right after its sandbox_probe line)"
 info "app pid $app_pid runs $app_exe"
 app_dir="$(dirname "$app_exe")"
 [ -x "$app_dir/atlas-duck-sandbox" ] || die "no atlas-duck-sandbox next to the app in $app_dir"
