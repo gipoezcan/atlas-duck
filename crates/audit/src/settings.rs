@@ -206,7 +206,8 @@ fn parse_key(key: &str) -> Option<PolicyKey<'_>> {
     None
 }
 
-/// Whether `key` names a policy value (callers may not append such a `CONFIG_CHANGED`).
+/// Whether `key` names a policy value (callers may append such a `CONFIG_CHANGED` only as a
+/// record of a file difference that was not applied: `source: "file"`, `applied: false`).
 pub(crate) fn is_policy_key(key: &str) -> bool {
     parse_key(key).is_some()
 }
@@ -228,6 +229,16 @@ pub(crate) fn apply_event(
     event_type: EventType,
     p: &Value,
 ) -> Result<(), AuditError> {
+    // A `CONFIG_CHANGED` a caller appended may have any payload shape: without a policy key
+    // it is not the view's business and must never poison it.
+    if event_type == EventType::CONFIG_CHANGED
+        && p.get("key")
+            .and_then(Value::as_str)
+            .and_then(parse_key)
+            .is_none()
+    {
+        return Ok(());
+    }
     let o = p.as_object().ok_or(BAD_SNAPSHOT)?;
     match event_type {
         EventType::LEGAL_HOLD_CHANGED => {
@@ -571,7 +582,8 @@ impl Writer {
         let mut planned: Vec<Planned> = Vec::new();
         if let Some(requested) = file.retention_days {
             let new = requested.max(RETENTION_MIN);
-            if new != s.retention_days {
+            // The file value itself is compared: a lowering the clamp hides is still logged.
+            if requested != s.retention_days {
                 planned.push(Planned {
                     event_type: EventType::CONFIG_CHANGED,
                     key: Some("retention_days".into()),

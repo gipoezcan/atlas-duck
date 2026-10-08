@@ -598,6 +598,10 @@ impl Store {
     /// The audit-authoritative settings (C.3): retention, legal hold, anchor directory and the
     /// per-instance policy, from the log (see `settings.rs`). A store exists only with its KEK,
     /// so nothing reads them while locked.
+    ///
+    /// While `health().settings_unreadable` is set (a settings row of the log could not be
+    /// read) the instance policy is withheld (`instances` empty: nothing is confirmed) and the
+    /// rest is best effort; prune and setting changes are refused then.
     pub fn settings(&self) -> Settings {
         lock(&self.inner.shared.settings).clone()
     }

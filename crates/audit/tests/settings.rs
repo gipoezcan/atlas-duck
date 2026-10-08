@@ -66,7 +66,10 @@ fn config(f: &Fixture) -> OpenConfig {
 fn reopen(store: &Store, f: &Fixture) -> Store {
     store.shutdown();
     match open(&f.data, &f.lock, config(f)).expect("open") {
-        StartupOutcome::Ready { store, .. } => store,
+        StartupOutcome::Ready { store, .. } => {
+            assert!(!store.health().settings_unreadable);
+            store
+        }
         other => panic!("not ready: {other:?}"),
     }
 }
@@ -210,7 +213,7 @@ fn x01_file_below_minimum_raised_and_logged() {
         .expect("reconcile");
     assert!(rows.is_empty());
     assert_eq!(head_seq(&store), head);
-    // A file value below the minimum that clamps to the value in force is no difference either.
+    // A lowering the clamp hides is still logged: the file asked for 50, 92 is in force.
     let (store, _f) = reconciled();
     store
         .apply_setting(SettingChange::RetentionDays(92), Some(confirmed()))
@@ -221,7 +224,15 @@ fn x01_file_below_minimum_raised_and_logged() {
             ..FilePolicy::default()
         })
         .expect("reconcile");
-    assert!(rows.is_empty());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        payload(&store, rows[0].seq),
+        json!({
+            "source": "file", "key": "retention_days", "old": 92, "requested": 50,
+            "new": 92, "applied": false, "confirmed": null,
+        })
+    );
+    assert_eq!(store.settings().retention_days, 92);
 }
 
 #[test]
@@ -649,6 +660,65 @@ fn non_policy_config_changed_ignored() {
 }
 
 #[test]
+fn odd_config_changed_payloads_never_poison_the_view() {
+    let (store, f) = reconciled();
+    for payload in [
+        json!(null),
+        json!([1]),
+        json!("x"),
+        json!(7),
+        json!({"key": 5}),
+    ] {
+        store
+            .append(ev(EventType::CONFIG_CHANGED, None, payload))
+            .expect("appendable");
+    }
+    let store = reopen(&store, &f);
+    assert!(!store.health().settings_unreadable);
+    assert_eq!(store.settings(), Settings::default());
+    store
+        .reconcile_config_file(&FilePolicy::default())
+        .expect("reconcile");
+    store
+        .apply_setting(SettingChange::RetentionDays(150), None)
+        .expect("apply");
+    assert_eq!(store.settings().retention_days, 150);
+}
+
+#[test]
+fn file_difference_records_are_appendable_but_never_applied() {
+    let (store, f) = reconciled();
+    // Spec §7.1: a file value that differs from the stored instance policy is logged, not applied.
+    for key in ["retention_days", "instance.i1.origin", "instance.i1.proxy"] {
+        store
+            .append(ev(
+                EventType::CONFIG_CHANGED,
+                None,
+                json!({"source": "file", "key": key, "old": null, "new": "x", "applied": false}),
+            ))
+            .expect("a not-applied file record");
+    }
+    // Any other combination that could change state stays refused.
+    for p in [
+        json!({"source": "file", "key": "anchor_dir", "new": "x", "applied": true}),
+        json!({"source": "app", "key": "anchor_dir", "new": "x", "applied": false}),
+        json!({"source": "file", "key": "anchor_dir", "new": "x"}),
+        json!({"source": "file", "key": "anchor_dir", "new": "x", "applied": "false"}),
+    ] {
+        assert!(
+            matches!(
+                store.append(ev(EventType::CONFIG_CHANGED, None, p.clone())),
+                Err(AuditError::Invalid(_))
+            ),
+            "{p}"
+        );
+    }
+    assert_eq!(store.settings(), Settings::default());
+    let store = reopen(&store, &f);
+    assert_eq!(store.settings(), Settings::default());
+}
+
+#[test]
 fn policy_key_cannot_be_appended() {
     let (store, f) = reconciled();
     let before = head_seq(&store);
@@ -687,6 +757,9 @@ fn policy_key_cannot_be_appended() {
 #[test]
 fn unreadable_settings_row_blocks_prune_and_changes() {
     let (store, f) = reconciled();
+    store
+        .apply_setting(origin("i1", Some("https://a.example")), Some(confirmed()))
+        .expect("origin");
     let c = store
         .apply_setting(SettingChange::LegalHold(true), None)
         .expect("hold");
@@ -700,14 +773,11 @@ fn unreadable_settings_row_blocks_prune_and_changes() {
         .expect("tamper");
     let store = match open(&f.data, &f.lock, config(&f)) {
         Ok(StartupOutcome::Ready { store, .. }) => store,
-        other => {
-            // The startup verification may refuse the store outright; then there is no view
-            // to read, which is the fail-closed outcome too.
-            eprintln!("open refused the damaged store: {other:?}");
-            return;
-        }
+        other => panic!("not ready: {other:?}"),
     };
     assert!(store.health().settings_unreadable);
+    // Instance policy is withheld while the view is untrusted: nothing counts as confirmed.
+    assert!(store.settings().instances.is_empty());
     assert!(store.prune(None).is_err());
     assert!(
         store

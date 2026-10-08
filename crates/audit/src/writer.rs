@@ -143,6 +143,10 @@ impl PreparedEvent {
                 .get("key")
                 .and_then(Value::as_str)
                 .is_some_and(settings::is_policy_key)
+            // A policy row that can never change the view: a file difference not applied
+            // (spec §7.1). `apply_event` ignores every row with `applied: false`.
+            && !(ev.payload.get("applied") == Some(&Value::Bool(false))
+                && ev.payload.get("source").and_then(Value::as_str) == Some("file"))
         {
             return Err(AuditError::Invalid(
                 "policy settings change through apply_setting and reconcile_config_file only",
@@ -808,7 +812,12 @@ impl Writer {
         let mut st = WriterState::new(parts, ClockState::from_head(epoch, ts, flags), head);
         st.settings = view.clone();
         st.settings_trusted = trusted;
-        *lock(&st.shared.settings) = view;
+        // An untrusted view is published without instance policy: nothing counts as confirmed.
+        let mut published = view.clone();
+        if !trusted {
+            published.instances.clear();
+        }
+        *lock(&st.shared.settings) = published;
         st.shared
             .settings_unreadable
             .store(!trusted, std::sync::atomic::Ordering::Relaxed);
