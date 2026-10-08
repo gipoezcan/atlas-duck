@@ -232,6 +232,7 @@ DATA_DIR=""
 cleanup() {
   local status=$?
   set +e
+  trap - ERR   # the exit status is the verdict's: no ERR trap (and no variable of its) in here
   if [ -n "$SAMPLER_PID" ]; then kill "$SAMPLER_PID" 2>/dev/null; fi
   pkill -TERM -u "$(id -u)" -x atlas-duck-app 2>/dev/null
   if [ -n "$APP_PID" ]; then kill -TERM "$APP_PID" 2>/dev/null; fi
@@ -250,8 +251,8 @@ trap cleanup EXIT
 # CI run 3: all three Linux legs exited 1 right after the probe line with no message (a bare
 # `set -e` exit). Name the command that failed and show what the app said.
 set -E
-trap 'status=$?; printf "install-probe-linux: command failed (status %s) at line %s: %s
-" "$status" "$LINENO" "$BASH_COMMAND" >&2; dump_log "${LOG:-/nonexistent}"; if [ -s "$APP_OUT" ]; then sed "s/^/app: /" "$APP_OUT" | tail -n 40 >&2; fi' ERR
+trap 'rc=$?; printf "install-probe-linux: command failed (status %s) at line %s: %s
+" "$rc" "$LINENO" "$BASH_COMMAND" >&2; dump_log "${LOG:-/nonexistent}"; if [ -s "$APP_OUT" ]; then sed "s/^/app: /" "$APP_OUT" | tail -n 40 >&2; fi' ERR
 
 info "pinned fixture (a local temp data dir)"
 DATA_DIR="$("$here/pinned-fixture.sh")"
@@ -299,21 +300,31 @@ kill -0 "$app_pid" 2>/dev/null || die "the app process $app_pid is gone (it exit
 app_exe="$(tr '\0' '\n' <"/proc/$app_pid/cmdline" | head -n 1 || true)"
 [ -n "$app_exe" ] || die "cannot read /proc/$app_pid/cmdline"
 info "app pid $app_pid runs $app_exe"
-app_dir="$(dirname "$app_exe")"
-[ -x "$app_dir/atlas-duck-sandbox" ] || die "no atlas-duck-sandbox next to the app in $app_dir"
 case "$package" in
   deb | rpm)
     [ "$app_exe" = "/usr/bin/atlas-duck-app" ] || die "the installed app runs $app_exe, expected /usr/bin/atlas-duck-app"
-    expected_worker_dir="/usr/bin"
+    app_dir="/usr/bin"
     ;;
   appimage)
-    case "$app_exe" in
-      "${TMPDIR:-/tmp}"/.mount_*/usr/bin/atlas-duck-app) ;;
-      *) die "the AppImage app runs $app_exe, expected ${TMPDIR:-/tmp}/.mount_*/usr/bin/atlas-duck-app (its own mount)" ;;
-    esac
-    expected_worker_dir="$app_dir"
+    # The runtime execs the app inside its FUSE mount, so argv[0] is a bare name, and the app is
+    # non-dumpable (no /proc/<pid>/exe, cwd or maps). Find the mount instead: exactly one
+    # ${TMPDIR:-/tmp}/.mount_* directory that holds usr/bin/atlas-duck-app and is a fuse mount in
+    # /proc/self/mountinfo.
+    [ "$(basename "$app_exe")" = "atlas-duck-app" ] || die "the AppImage app has argv[0] $app_exe, expected atlas-duck-app"
+    mounts=()
+    for m in "${TMPDIR:-/tmp}"/.mount_*; do
+      [ -x "$m/usr/bin/atlas-duck-app" ] || continue
+      grep -qE "^[0-9]+ [0-9]+ [0-9:]+ [^ ]+ $m .* - fuse[. ]" /proc/self/mountinfo ||
+        die "$m holds the app but is not a fuse mount in /proc/self/mountinfo"
+      mounts+=("$m")
+    done
+    [ "${#mounts[@]}" -eq 1 ] || die "expected exactly one ${TMPDIR:-/tmp}/.mount_* with usr/bin/atlas-duck-app, found ${#mounts[@]}"
+    app_dir="${mounts[0]}/usr/bin"
+    info "the AppImage runs from its own mount ${mounts[0]}"
     ;;
 esac
+[ -x "$app_dir/atlas-duck-sandbox" ] || die "no atlas-duck-sandbox next to the app in $app_dir"
+expected_worker_dir="$app_dir"
 sleep 1   # let the sampler see the last probe workers
 if [ -s "$SAMPLE_FILE" ]; then
   sort -u "$SAMPLE_FILE" | while IFS= read -r seen; do
