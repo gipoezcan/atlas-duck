@@ -8,8 +8,7 @@ use crate::types::ApprovedWrite;
 /// The only `POST` that is not an approved write (`jira.search`).
 pub const ALLOWED_READ_POSTS: &[&str] = &["/rest/api/2/search"];
 
-// `ApprovedWrite` is constructed by the write path (Task 10).
-#[allow(dead_code)]
+#[expect(dead_code, reason = "constructed by the write path (Task 10)")]
 pub(crate) enum SendMode<'a> {
     Read,
     /// The write path compares every request byte for byte with its entry in the approved
@@ -52,8 +51,10 @@ mod tests {
     use super::*;
     use crate::types::{ExpectedBody, SuccessExpectation};
 
-    /// Every registry endpoint path template (read and write), copied as constants: `atlassian`
-    /// has no `registry` edge.
+    /// The distinct endpoint path templates of `registry` (jira/reads.rs, jira/writes.rs,
+    /// confluence/reads.rs, confluence/writes.rs; the 46 registry entries share some paths),
+    /// copied by hand because `atlassian` has no `registry` edge. When an endpoint is added
+    /// there, add its path here.
     const REGISTRY_PATHS: &[&str] = &[
         "/rest/api/2/myself",
         "/rest/api/2/project",

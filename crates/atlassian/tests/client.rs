@@ -131,6 +131,32 @@ async fn no_cover_no_request() -> TestResult {
     Ok(())
 }
 
+/// A template or parameter that cannot be built into a URL under the base is refused as
+/// `OriginGuardRefused` (documented in `send.rs`): no request leaves, the PAT stays home.
+#[tokio::test]
+async fn unbuildable_url_is_refused_without_a_request() -> TestResult {
+    let dc = MockDc::start(Product::Jira, "/jira").await;
+    dc.jira_myself("jdoe", TEST_USER_KEY, XAuser::Same).await;
+    let t = test_client(dc.client_config())?;
+    let cover = test_cover()?;
+    let traversal = GetCall {
+        endpoint_template: "/rest/api/2/issue/{key}".into(),
+        params: json!({"key": ".."}),
+        query: vec![],
+    };
+    assert_eq!(
+        failure(t.client.get(&cover, &traversal).await)?,
+        FetchFailure::OriginGuardRefused
+    );
+    assert_eq!(
+        failure(t.client.get(&cover, &call("https://evil.example/x")).await)?,
+        FetchFailure::OriginGuardRefused
+    );
+    let received = dc.received().await;
+    assert!(received.is_empty());
+    Ok(())
+}
+
 #[tokio::test]
 async fn status_header_decided_classes() -> TestResult {
     let dc = MockDc::start(Product::Jira, "").await;

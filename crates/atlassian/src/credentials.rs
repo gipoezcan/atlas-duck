@@ -4,6 +4,7 @@ use std::fmt;
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::types::redacted_name;
 use crate::url::UrlHash;
 
 /// A personal access token. Not `Serialize`, not `Clone`, `Debug` is redacted;
@@ -40,10 +41,22 @@ impl From<SecretString> for PatSecret {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredIdentity {
     pub atlassian_user: String,
     pub atlassian_user_key: String,
+}
+
+impl fmt::Debug for StoredIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredIdentity")
+            .field("atlassian_user", &redacted_name(&self.atlassian_user))
+            .field(
+                "atlassian_user_key",
+                &redacted_name(&self.atlassian_user_key),
+            )
+            .finish()
+    }
 }
 
 pub struct StoredCredential {

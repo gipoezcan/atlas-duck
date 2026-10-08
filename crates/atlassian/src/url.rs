@@ -111,6 +111,9 @@ pub fn normalize_base_url(raw: &str) -> Result<NormalizedBaseUrl, BaseUrlError> 
 pub enum TemplateError {
     MissingParam(String),
     BadParam(String),
+    /// The template itself is malformed (not rooted at `/`, query, fragment, unbalanced braces,
+    /// a dot segment) or does not build a URL under the base. Never caused by a parameter value.
+    BadTemplate,
 }
 
 impl fmt::Display for TemplateError {
@@ -118,6 +121,7 @@ impl fmt::Display for TemplateError {
         match self {
             TemplateError::MissingParam(n) => write!(f, "missing path parameter `{n}`"),
             TemplateError::BadParam(n) => write!(f, "bad path parameter `{n}`"),
+            TemplateError::BadTemplate => f.write_str("malformed endpoint template"),
         }
     }
 }
@@ -142,20 +146,20 @@ pub fn build_url(
 ) -> Result<url::Url, TemplateError> {
     if !template.starts_with('/') || template.starts_with("//") || template.contains(['?', '#', BS])
     {
-        return Err(TemplateError::BadParam("template".to_owned()));
+        return Err(TemplateError::BadTemplate);
     }
     let mut path = String::from(base.context_path());
     let mut rest = template;
     while let Some(open) = rest.find(['{', '}']) {
         if rest.as_bytes()[open] == b'}' {
-            return Err(TemplateError::BadParam("template".to_owned()));
+            return Err(TemplateError::BadTemplate);
         }
         path.push_str(&rest[..open]);
         let after = &rest[open + 1..];
         let close = after
             .find(['{', '}'])
             .filter(|&i| after.as_bytes()[i] == b'}')
-            .ok_or_else(|| TemplateError::BadParam("template".to_owned()))?;
+            .ok_or(TemplateError::BadTemplate)?;
         let name = &after[..close];
         let value = match params.get(name) {
             None | Some(serde_json::Value::Null) => {
@@ -178,13 +182,13 @@ pub fn build_url(
     path.push_str(rest);
     // Literal template text is registry data, but a dot segment must never leave this function.
     if has_dot_segment(&path) {
-        return Err(TemplateError::BadParam("template".to_owned()));
+        return Err(TemplateError::BadTemplate);
     }
     let mut u = url::Url::parse(&format!("{}{}", base.origin_str(), path))
-        .map_err(|_| TemplateError::BadParam("template".to_owned()))?;
+        .map_err(|_| TemplateError::BadTemplate)?;
     // The parser must not have rewritten the path (dot segments, backslashes).
     if u.path() != path {
-        return Err(TemplateError::BadParam("template".to_owned()));
+        return Err(TemplateError::BadTemplate);
     }
     if !query.is_empty() {
         u.query_pairs_mut()

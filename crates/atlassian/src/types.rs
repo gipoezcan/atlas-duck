@@ -133,11 +133,30 @@ pub enum FetchOutcome {
 }
 
 /// What an unauthorised or unusable answer looked like (§7.2 identity check).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum IdentityObserved {
     Missing,
     Anonymous,
     Other(String),
+}
+
+/// A server-supplied username never appears in `Debug` output (§7.7); only its length does.
+pub(crate) fn redacted_name(name: &str) -> String {
+    format!("<redacted:{} chars>", name.chars().count())
+}
+
+fn redacted_opt(name: &Option<String>) -> Option<String> {
+    name.as_deref().map(redacted_name)
+}
+
+impl fmt::Debug for IdentityObserved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IdentityObserved::Missing => f.write_str("Missing"),
+            IdentityObserved::Anonymous => f.write_str("Anonymous"),
+            IdentityObserved::Other(n) => write!(f, "Other({})", redacted_name(n)),
+        }
+    }
 }
 
 /// Failed before any byte of the request left (§11.2 picks the hint from the class).
@@ -246,7 +265,7 @@ impl fmt::Debug for FetchFailure {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum UnknownReason {
     Timeout,
     ResetAfterSend,
@@ -255,7 +274,22 @@ pub enum UnknownReason {
     IdentityMismatch { server_user: Option<String> },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl fmt::Debug for UnknownReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnknownReason::Timeout => f.write_str("Timeout"),
+            UnknownReason::ResetAfterSend => f.write_str("ResetAfterSend"),
+            UnknownReason::ServerError5xx => f.write_str("ServerError5xx"),
+            UnknownReason::UndeclaredSuccess => f.write_str("UndeclaredSuccess"),
+            UnknownReason::IdentityMismatch { server_user } => f
+                .debug_struct("IdentityMismatch")
+                .field("server_user", &redacted_opt(server_user))
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub enum WriteOutcome {
     Executed {
         response: UpstreamResponse,
@@ -286,4 +320,54 @@ pub enum WriteOutcome {
     NotSent {
         class: ConnClass,
     },
+}
+
+impl fmt::Debug for WriteOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WriteOutcome::Executed {
+                response,
+                server_user,
+                request_index,
+            } => f
+                .debug_struct("Executed")
+                .field("response", response)
+                .field("server_user", &redacted_opt(server_user))
+                .field("request_index", request_index)
+                .finish(),
+            WriteOutcome::Failed4xx {
+                response,
+                request_index,
+            } => f
+                .debug_struct("Failed4xx")
+                .field("response", response)
+                .field("request_index", request_index)
+                .finish(),
+            WriteOutcome::Unavailable3xx { request_index } => f
+                .debug_struct("Unavailable3xx")
+                .field("request_index", request_index)
+                .finish(),
+            WriteOutcome::VersionConflict { request_index } => f
+                .debug_struct("VersionConflict")
+                .field("request_index", request_index)
+                .finish(),
+            WriteOutcome::OutcomeUnknown {
+                reason,
+                request_index,
+            } => f
+                .debug_struct("OutcomeUnknown")
+                .field("reason", reason)
+                .field("request_index", request_index)
+                .finish(),
+            WriteOutcome::NeedsToken => f.write_str("NeedsToken"),
+            WriteOutcome::OriginGuardRefused => f.write_str("OriginGuardRefused"),
+            WriteOutcome::RefusedMismatch { request_index } => f
+                .debug_struct("RefusedMismatch")
+                .field("request_index", request_index)
+                .finish(),
+            WriteOutcome::NotSent { class } => {
+                f.debug_struct("NotSent").field("class", class).finish()
+            }
+        }
+    }
 }
