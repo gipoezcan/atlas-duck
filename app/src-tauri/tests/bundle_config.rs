@@ -360,3 +360,179 @@ mod t12 {
         }
     }
 }
+
+// T21: installer hook and install-probe wiring (spec §9.4 Windows, §12.2, §13 scripts-enabled
+// matrix). Appended to the file T12 created; T12's own tests live in `mod t12`. These tests read
+// the files from disk at run time, so a missing file is a readable test failure.
+mod t21 {
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    const HOOKS_PATH: &str = "windows/hooks.nsh";
+    const WORKER_EXE: &str = "atlas-duck-sandbox.exe";
+    const SID_ALL_APP_PACKAGES: &str = "S-1-15-2-1";
+    const SID_ALL_RESTRICTED_APP_PACKAGES: &str = "S-1-15-2-2";
+    const DATA_DIR_NAME: &str = "atlas-duck";
+
+    fn src_tauri() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn read_text(path: &Path) -> String {
+        std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+    }
+
+    fn conf() -> Value {
+        let text = read_text(&src_tauri().join("tauri.conf.json"));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("tauri.conf.json is not JSON: {e}"))
+    }
+
+    fn hooks() -> String {
+        read_text(&src_tauri().join(HOOKS_PATH))
+    }
+
+    /// The hook file without NSIS comment lines (`;` or `#` first), so a comment that names a
+    /// SID or a macro cannot satisfy a test.
+    fn hooks_code() -> String {
+        hooks()
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with(';') && !t.starts_with('#')
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tauri_conf_references_the_windows_hooks_file() {
+        let c = conf();
+        let hooks_ref = c
+            .pointer("/bundle/windows/nsis/installerHooks")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("tauri.conf.json has no bundle.windows.nsis.installerHooks"));
+        assert_eq!(hooks_ref, HOOKS_PATH);
+        assert!(
+            src_tauri().join(hooks_ref).is_file(),
+            "{hooks_ref} does not exist next to tauri.conf.json"
+        );
+        // T12's install mode stays: both NSIS modes need the hook (§12.2).
+        assert_eq!(
+            c.pointer("/bundle/windows/nsis/installMode").and_then(Value::as_str),
+            Some("both")
+        );
+    }
+
+    #[test]
+    fn hooks_define_the_post_install_macro_with_both_sids_read_execute() {
+        let code = hooks_code();
+        assert!(
+            code.contains("!macro NSIS_HOOK_POSTINSTALL"),
+            "hooks.nsh does not define NSIS_HOOK_POSTINSTALL"
+        );
+        for sid in [SID_ALL_APP_PACKAGES, SID_ALL_RESTRICTED_APP_PACKAGES] {
+            let grant = format!("*{sid}:(RX)");
+            assert!(code.contains(&grant), "hooks.nsh has no grant {grant}");
+        }
+    }
+
+    #[test]
+    fn hooks_name_exactly_the_two_package_sids_and_only_read_execute() {
+        let code = hooks_code();
+        // every SID literal in the code
+        let mut sids = BTreeSet::new();
+        let mut rest = code.as_str();
+        while let Some(at) = rest.find("S-1-") {
+            let tail = &rest[at..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_digit() || c == '-' || c == 'S'))
+                .unwrap_or(tail.len());
+            sids.insert(tail[..end].to_owned());
+            rest = &tail[end..];
+        }
+        let expected: BTreeSet<String> = [SID_ALL_APP_PACKAGES, SID_ALL_RESTRICTED_APP_PACKAGES]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(sids, expected, "hooks.nsh must name exactly the two (L)PAC group SIDs");
+        // every permission group is (RX): never write, modify, full or delete
+        let mut rest = code.as_str();
+        let mut groups = 0;
+        while let Some(at) = rest.find(":(") {
+            let tail = &rest[at + 1..];
+            assert!(tail.starts_with("(RX)"), "hooks.nsh grants something other than (RX): {tail:.12}");
+            groups += 1;
+            rest = &tail[4..];
+        }
+        assert_eq!(groups, 2, "expected one (RX) group per SID");
+    }
+
+    #[test]
+    fn hooks_cover_the_worker_and_the_dlls_next_to_it() {
+        let code = hooks_code();
+        assert!(code.contains(WORKER_EXE), "hooks.nsh does not name {WORKER_EXE}");
+        assert!(code.contains("*.dll"), "hooks.nsh does not walk the DLLs in $INSTDIR");
+        assert!(code.contains("$INSTDIR"), "hooks.nsh must act on the install directory");
+    }
+
+    #[test]
+    fn hooks_define_only_the_post_install_hook() {
+        // The upgrade drain and the uninstall rules are M10 (§14); defining their macros here
+        // would silently take them over.
+        let code = hooks_code();
+        for macro_name in [
+            "NSIS_HOOK_PREINSTALL",
+            "NSIS_HOOK_PREUNINSTALL",
+            "NSIS_HOOK_POSTUNINSTALL",
+        ] {
+            assert!(
+                !code.contains(&format!("!macro {macro_name}")),
+                "hooks.nsh defines {macro_name}, which is M10's"
+            );
+        }
+    }
+
+    #[test]
+    fn hooks_worker_name_is_the_wer_excluded_sandbox_exe() {
+        // T09 excludes the same executable names from WER; the hook and the exclusion must
+        // talk about the one worker binary.
+        assert!(
+            atlas_duck_app_lib::startup::crash::WER_EXCLUDED_EXES.contains(&WORKER_EXE),
+            "WER_EXCLUDED_EXES {:?} does not list {WORKER_EXE}",
+            atlas_duck_app_lib::startup::crash::WER_EXCLUDED_EXES
+        );
+    }
+
+    #[test]
+    fn per_user_install_dir_never_lands_on_the_data_dir() {
+        // %LOCALAPPDATA%\atlas-duck is the data dir and the pinned-file dir (§7.7). The NSIS
+        // per-user install dir is %LOCALAPPDATA%\Programs\<productName> (installMode "both",
+        // MultiUser.nsh) or %LOCALAPPDATA%\<productName> (installMode "currentUser"); neither
+        // may resolve to the data dir, whichever the bundler picks.
+        let c = conf();
+        let product = c
+            .pointer("/productName")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("tauri.conf.json has no productName"));
+        let identifier = c
+            .pointer("/identifier")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("tauri.conf.json has no identifier"));
+        assert!(
+            !product.eq_ignore_ascii_case(DATA_DIR_NAME),
+            "productName {product} equals the data dir folder name"
+        );
+        assert!(
+            !identifier.eq_ignore_ascii_case(DATA_DIR_NAME),
+            "identifier {identifier} equals the data dir folder name"
+        );
+        for candidate in [format!("Programs\\{product}"), product.to_owned()] {
+            assert!(
+                !candidate.eq_ignore_ascii_case(DATA_DIR_NAME),
+                "per-user install dir %LOCALAPPDATA%\\{candidate} equals the data dir"
+            );
+        }
+    }
+}
