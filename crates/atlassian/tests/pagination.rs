@@ -416,13 +416,14 @@ async fn fetch_cap_50mib() -> TestResult {
 async fn read_budget_120s_is_configurable_in_tests() -> TestResult {
     let dc = MockDc::start(Product::Confluence, "").await;
     let pages = space_pages(&dc, 1000, 0);
+    // Page 1 ends at ~1 s, inside the 1.5 s budget; page 2 cannot end before ~2 s.
     Mock::given(path("/rest/api/space"))
-        .respond_with(move |req: &Request| pages(req).set_delay(Duration::from_millis(400)))
+        .respond_with(move |req: &Request| pages(req).set_delay(Duration::from_millis(1000)))
         .mount(dc.server())
         .await;
     let t = test_client(dc.client_config())?;
     let budget = ReadBudget {
-        total: Duration::from_millis(600),
+        total: Duration::from_millis(1500),
         ..ReadBudget::default()
     };
     let out = t
