@@ -9,6 +9,8 @@ mod linux;
 pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod seccomp_allowlist;
+#[cfg(windows)]
+mod windows;
 
 /// Why confinement could not be applied. The worker still answers
 /// `probe.ready`, with `applied: false`, so the host scores the floor as not met.
@@ -52,7 +54,10 @@ pub fn unconfined() -> ConfinementReport {
 /// comes back as `Ok` with `applied: false` and the partial evidence in the
 /// report, so the worker still sends `probe.ready`. macOS (T18): `tzset`, then
 /// `sandbox_init` with the embedded SBPL profile, with the same `Ok` /
-/// `applied: false` treatment of a refusal. Windows (T19) still applies nothing.
+/// `applied: false` treatment of a refusal. Windows (T19): the host confines the
+/// worker at spawn (AppContainer, job object), so the worker applies nothing; it
+/// reports what its own token and job membership say, which is `applied: false`
+/// for a worker that was started without the AppContainer.
 pub fn apply() -> Result<ConfinementReport, ConfineError> {
     #[cfg(target_os = "linux")]
     {
@@ -63,7 +68,11 @@ pub fn apply() -> Result<ConfinementReport, ConfineError> {
         // §9.4 macOS: sandbox_init with the embedded SBPL profile.
         Ok(macos::apply())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Ok(windows::apply())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Ok(unconfined())
     }

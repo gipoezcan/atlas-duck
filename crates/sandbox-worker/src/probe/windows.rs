@@ -111,6 +111,7 @@ mod calls {
 
     use atlas_duck_ipc::sandbox::probe::{ProbeId, ProbeOutcome, ProbeResultMsg};
     use windows_sys::Win32::Foundation::{CloseHandle, GetHandleInformation, GetLastError};
+    use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
     use windows_sys::Win32::Security::Credentials::{
         CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
     };
@@ -126,6 +127,18 @@ mod calls {
     fn last_error() -> i64 {
         // SAFETY: `GetLastError` has no preconditions.
         i64::from(unsafe { GetLastError() })
+    }
+
+    /// `WSAStartup(2.2)`, the call Rust's std makes before the first socket and
+    /// asserts on. Under LPAC it fails (`WSASYSCALLFAILURE`, 10107, measured on
+    /// Windows 11), and without this call that would be a panic with no
+    /// evidence. `Err` is the Winsock error code; it is never a denial.
+    pub fn wsa_startup() -> Result<(), i64> {
+        // SAFETY: an all-zero WSADATA is a valid out-structure.
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: `data` is a valid out pointer; 0x0202 is version 2.2.
+        let rc = unsafe { WSAStartup(0x0202, &mut data) };
+        if rc == 0 { Ok(()) } else { Err(i64::from(rc)) }
     }
 
     /// `OpenProcessVmRead`: `OpenProcess(PROCESS_VM_READ, FALSE, app_pid)`.
@@ -279,4 +292,6 @@ mod calls {
 }
 
 #[cfg(windows)]
-pub use calls::{cred_read, handle_sentinel, open_clipboard, open_process_vm_read, spawn_process};
+pub use calls::{
+    cred_read, handle_sentinel, open_clipboard, open_process_vm_read, spawn_process, wsa_startup,
+};
