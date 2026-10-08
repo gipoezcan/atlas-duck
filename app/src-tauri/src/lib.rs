@@ -3,6 +3,7 @@
 
 pub mod diag;
 pub mod early_argv;
+pub mod sandbox_probe;
 pub mod startup;
 pub mod state;
 pub mod tray;
@@ -77,6 +78,13 @@ pub fn run_gui(background: bool) -> ! {
             if let StartupState::Ready { data, lock } = state {
                 app.manage(DataDirHold::new(data, lock));
             }
+
+            // T20: the §9.4 probe runs on its own thread, in every startup state that reaches
+            // this point (AlreadyRunning returned above). It needs no data dir; its log line
+            // waits in the diagnostic log's memory buffer until `Diag::attach_dir` runs. The
+            // allowlist must know the six fields before the line is written.
+            diag.extend_allowed_fields(sandbox_probe::PROBE_LOG_FIELDS);
+            sandbox_probe::spawn_startup_probe(app.handle());
 
             // The tray is built in every startup state; in the four error states it also shows
             // the startup message (§7.7). A failure is logged and startup continues (§15 V33).

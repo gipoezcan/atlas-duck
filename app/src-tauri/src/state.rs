@@ -1,7 +1,10 @@
 //! App-wide state managed by Tauri (`app.manage`). Later milestones read it and add fields.
 
+use std::sync::OnceLock;
+
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::LocalDataDir;
+use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 
 use crate::tray_host::TrayHost;
 
@@ -45,15 +48,32 @@ pub struct AppState {
     /// Linux: the §2.5 startup check (`present|missing`); `None` elsewhere. M2 records it
     /// in `APP_START`, M4 reports it in `doctor` (§4.7).
     tray_host: Option<TrayHost>,
+    /// The §9.4 probe report; set once by the `atlas-duck-probe` thread.
+    pub probe: OnceLock<ProbeReport>,
 }
 
 impl AppState {
     pub fn new(startup: StartupSummary, tray_host: Option<TrayHost>) -> AppState {
-        AppState { startup, tray_host }
+        AppState {
+            startup,
+            tray_host,
+            probe: OnceLock::new(),
+        }
     }
 
     pub fn tray_host(&self) -> Option<TrayHost> {
         self.tray_host
+    }
+
+    /// `None` until the startup probe has finished.
+    pub fn probe_report(&self) -> Option<&ProbeReport> {
+        self.probe.get()
+    }
+
+    /// False until a report with `FloorVerdict::Met` exists (§9.4: if the
+    /// floor cannot be applied and verified, scripts are disabled).
+    pub fn scripts_floor_met(&self) -> bool {
+        matches!(self.probe.get().map(|r| &r.floor), Some(FloorVerdict::Met))
     }
 }
 

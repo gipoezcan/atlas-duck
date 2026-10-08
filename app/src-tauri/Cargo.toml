@@ -60,6 +60,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# `test` is dev-only: release builds never compile the mock runtime (T20).
+tauri = { workspace = true, features = ["test"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 filetime = { workspace = true }
