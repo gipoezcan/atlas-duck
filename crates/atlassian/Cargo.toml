@@ -56,6 +56,18 @@ required-features = ["testing"]
 name = "proxy_env"
 required-features = ["testing"]
 
+[[test]]
+name = "pagination"
+required-features = ["testing"]
+
+[[test]]
+name = "writes"
+required-features = ["testing"]
+
+[[test]]
+name = "fixtures"
+required-features = ["testing"]
+
 # §7.7 / §13: unwrap_used and expect_used are errors in core and atlassian.
 [lints.clippy]
 unwrap_used = "deny"

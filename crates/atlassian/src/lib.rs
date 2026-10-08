@@ -32,8 +32,9 @@ pub use identity::username_matches;
 pub use origin::{OriginRefused, origin_guard};
 pub use types::{
     ApprovedWrite, BodyFailure, ConnClass, ExpectedBody, FetchFailure, FetchOutcome, GetCall,
-    HttpRequestSpec, IdentityObserved, PagedCall, PostSendKind, ReadBudget, SearchCall,
-    SuccessExpectation, UnavailableReason, UnknownReason, UpstreamResponse, WriteOutcome,
+    HttpRequestSpec, IdentityObserved, NotSentReason, PageEnd, PagedCall, PagedOutcome,
+    PostSendKind, ReadBudget, SearchCall, SuccessExpectation, UnavailableReason, UnknownReason,
+    UpstreamResponse, WriteOutcome,
 };
 pub use url::{
     BaseUrlError, NormalizedBaseUrl, TemplateError, UrlHash, build_url, normalize_base_url,

@@ -274,13 +274,61 @@ impl fmt::Debug for FetchFailure {
     }
 }
 
+/// How a paginated read ended (§7.2, §7.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageEnd {
+    /// The server reported the end of the results (`next_start` is `None`).
+    ResultsEnded,
+    /// `max_items` reached before the results ended.
+    MaxReached,
+    /// The 50 MiB fetch cap (`ReadBudget.max_bytes`) was exceeded during a page.
+    FetchCap50MiB,
+    /// The read budget (`ReadBudget.total`, all pages and 429 waits) ran out.
+    ReadBudget120s,
+    /// Any other end: `failure` holds the failure, or, when `failure` is `None`, the last entry
+    /// of `pages` is the non-2xx response (an upstream error, a final 429) that ended paging.
+    Failed,
+}
+
+/// Every page a paginated read fetched (Task 10). `next_start` is the server-arithmetic
+/// continuation (§7.5): `None` only when the server reported the end of the results.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PagedOutcome {
+    /// Every complete page, in order (for `READ_FETCHED`); see `PageEnd::Failed`.
+    pub pages: Vec<UpstreamResponse>,
+    /// Items across the 2xx pages, before redaction.
+    pub items_fetched: u64,
+    pub end: PageEnd,
+    /// The failure that ended paging early, if any, with its received bytes inside.
+    pub failure: Option<FetchFailure>,
+    pub next_start: Option<u64>,
+    /// `total` (Jira) or `totalSize` (Confluence search) of the last 2xx page, if reported.
+    pub server_total: Option<u64>,
+}
+
+/// Why nothing of an approved write left (Δ C.4, Task 10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotSentReason {
+    /// A connection-level failure before any byte was written, after the one retry (§5.4 step 6).
+    Connection(ConnClass),
+    /// The 60 s write budget ran out in the limiter or rate-limit wait.
+    BudgetExpired,
+    /// The control was cancelled before the request was handed to the connection.
+    Cancelled,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum UnknownReason {
     Timeout,
     ResetAfterSend,
     ServerError5xx,
     UndeclaredSuccess,
-    IdentityMismatch { server_user: Option<String> },
+    IdentityMismatch {
+        server_user: Option<String>,
+    },
+    /// The control was cancelled after the request was handed to the connection (additive,
+    /// Task 10).
+    Cancelled,
 }
 
 impl fmt::Debug for UnknownReason {
@@ -294,6 +342,7 @@ impl fmt::Debug for UnknownReason {
                 .debug_struct("IdentityMismatch")
                 .field("server_user", &redacted_opt(server_user))
                 .finish(),
+            UnknownReason::Cancelled => f.write_str("Cancelled"),
         }
     }
 }
@@ -325,9 +374,9 @@ pub enum WriteOutcome {
     RefusedMismatch {
         request_index: u32,
     },
-    /// The failure happened before any byte of a request left.
+    /// Nothing of the request left (Δ C.4, Task 10: the reason replaces the bare `ConnClass`).
     NotSent {
-        class: ConnClass,
+        reason: NotSentReason,
     },
 }
 
@@ -374,8 +423,8 @@ impl fmt::Debug for WriteOutcome {
                 .debug_struct("RefusedMismatch")
                 .field("request_index", request_index)
                 .finish(),
-            WriteOutcome::NotSent { class } => {
-                f.debug_struct("NotSent").field("class", class).finish()
+            WriteOutcome::NotSent { reason } => {
+                f.debug_struct("NotSent").field("reason", reason).finish()
             }
         }
     }

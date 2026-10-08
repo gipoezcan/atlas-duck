@@ -4,8 +4,10 @@
 
 mod classify;
 mod limiter;
+mod paginate;
 mod send;
 mod tls;
+mod write;
 
 #[cfg(feature = "testing")]
 pub(crate) use tls::ensure_provider;
@@ -19,8 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cover::{AuditCover, DateObserver};
 use crate::credentials::CredentialProvider;
-use crate::guard::SendMode;
-use crate::types::{FetchFailure, FetchOutcome, GetCall, SearchCall, UpstreamResponse};
+use crate::types::{
+    FetchFailure, FetchOutcome, GetCall, PostSendKind, SearchCall, UpstreamResponse,
+};
 use crate::url::NormalizedBaseUrl;
 
 /// `atlassian`'s own product tag (no `registry` edge); only Jira responses are identity-checked.
@@ -183,6 +186,11 @@ impl FetchControl {
         std::mem::take(&mut self.state().partial)
     }
 
+    /// A completed page of a paginated read (kept for `take_captured`).
+    pub(crate) fn push_page(&self, page: UpstreamResponse) {
+        self.state().pages.push(page);
+    }
+
     /// Never held across an `.await`: every caller above locks, mutates and drops in one statement.
     fn state(&self) -> MutexGuard<'_, CaptureState> {
         self.inner
@@ -275,14 +283,16 @@ impl InstanceClient {
         ctl: &FetchControl,
     ) -> FetchOutcome {
         let req = send::OneRequest {
-            method: reqwest::Method::GET,
-            template: &call.endpoint_template,
-            params: &call.params,
-            query: &call.query,
-            json_body: None,
-            mode: SendMode::Read,
+            target: send::Target::Template {
+                method: reqwest::Method::GET,
+                template: &call.endpoint_template,
+                params: &call.params,
+                query: &call.query,
+                json_body: None,
+            },
             overall: None,
             max_response_bytes: send::MAX_RESPONSE_BYTES,
+            cap_kind: PostSendKind::ResponseCap32MiB,
         };
         self.send_one(cover, req, ctl).await
     }
@@ -303,14 +313,16 @@ impl InstanceClient {
             return FetchOutcome::Failed(FetchFailure::MethodGuardRefused);
         };
         let req = send::OneRequest {
-            method: reqwest::Method::POST,
-            template: &call.endpoint_template,
-            params: &serde_json::Value::Null,
-            query: &[],
-            json_body: Some(body),
-            mode: SendMode::Read,
+            target: send::Target::Template {
+                method: reqwest::Method::POST,
+                template: &call.endpoint_template,
+                params: &serde_json::Value::Null,
+                query: &[],
+                json_body: Some(body),
+            },
             overall: None,
             max_response_bytes: send::MAX_RESPONSE_BYTES,
+            cap_kind: PostSendKind::ResponseCap32MiB,
         };
         self.send_one(cover, req, ctl).await
     }

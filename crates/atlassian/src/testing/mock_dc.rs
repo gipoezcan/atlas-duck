@@ -159,6 +159,34 @@ impl MockDc {
         self.mount_get("/rest/applinks/1.0/manifest", t).await;
     }
 
+    /// The I-01 fixture set of one product version: Jira `myself`, `serverInfo`, issue `ABC-1`
+    /// and a search page (`/rest/api/2/search`, any method); Confluence `user/current` (known),
+    /// the applinks manifest, page `65537` and a search page (`/rest/api/search`).
+    pub async fn mount_fixture_set(&self, version: &str) {
+        match self.product {
+            Product::Jira => {
+                let user = self.user.clone();
+                self.jira_myself(&user, super::TEST_USER_KEY, XAuser::Same)
+                    .await;
+                self.jira_server_info(version).await;
+                self.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+                    .await;
+                self.json("/rest/api/2/search", 200, fixtures::JIRA_SEARCH_PAGE)
+                    .await;
+            }
+            Product::Confluence => {
+                let user = self.user.clone();
+                self.confluence_user_current(UserKind::Known, &user, "8a7f808a1")
+                    .await;
+                self.applinks_manifest(version).await;
+                self.json("/rest/api/content/65537", 200, fixtures::CONFLUENCE_PAGE)
+                    .await;
+                self.json("/rest/api/search", 200, fixtures::CONFLUENCE_SEARCH_PAGE)
+                    .await;
+            }
+        }
+    }
+
     /// Any method on `p`: `status` with a JSON body.
     pub async fn json(&self, p: &str, status: u16, body: &str) {
         let t = self.response(status).set_body_raw(body, "application/json");

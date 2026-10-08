@@ -28,6 +28,7 @@ struct Stats {
     max_active: AtomicUsize,
     closed: AtomicUsize,
     heads: Mutex<Vec<Vec<u8>>>,
+    bodies: Mutex<Vec<Vec<u8>>>,
 }
 
 /// Each accepted connection: read the request head (and a `Content-Length` body), then run the
@@ -39,25 +40,40 @@ pub struct RawHttpServer {
 }
 
 impl RawHttpServer {
+    /// The same script for every connection.
     pub async fn serve(script: Vec<RawStep>) -> io::Result<RawHttpServer> {
+        Self::serve_sequence(vec![script]).await
+    }
+
+    /// Connection `i` runs `scripts[i]`; connections after the last script run the last one again
+    /// (multi-page reads: one connection per page when every answer says `Connection: close`).
+    pub async fn serve_sequence(scripts: Vec<Vec<RawStep>>) -> io::Result<RawHttpServer> {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
         let stats = Arc::new(Stats::default());
         let s = stats.clone();
-        let script = Arc::new(script);
+        let scripts: Arc<Vec<Vec<RawStep>>> = Arc::new(scripts);
         let task = tokio::spawn(async move {
             while let Ok((mut sock, _)) = listener.accept().await {
-                s.accepted.fetch_add(1, Ordering::SeqCst);
+                let n = s.accepted.fetch_add(1, Ordering::SeqCst);
                 let now = s.active.fetch_add(1, Ordering::SeqCst) + 1;
                 s.max_active.fetch_max(now, Ordering::SeqCst);
-                let (s, script) = (s.clone(), script.clone());
+                let (s, scripts) = (s.clone(), scripts.clone());
                 tokio::spawn(async move {
-                    if let Ok(head) = read_request(&mut sock).await {
+                    let script = scripts
+                        .get(n)
+                        .or_else(|| scripts.last())
+                        .map_or(&[][..], Vec::as_slice);
+                    if let Ok((head, body)) = read_request(&mut sock).await {
                         s.heads
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .push(head);
-                        run_script(&mut sock, &script).await;
+                        s.bodies
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(body);
+                        run_script(&mut sock, script).await;
                     }
                     let _ = sock.shutdown().await;
                     drop(sock);
@@ -101,6 +117,15 @@ impl RawHttpServer {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
+
+    /// The `Content-Length` bodies of the requests, in the order of `request_heads`.
+    pub fn request_bodies(&self) -> Vec<Vec<u8>> {
+        self.stats
+            .bodies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 impl Drop for RawHttpServer {
@@ -124,8 +149,8 @@ async fn run_script<S: AsyncWrite + Unpin>(sock: &mut S, script: &[RawStep]) {
 }
 
 /// Reads up to the end of the head and then the `Content-Length` body, so closing the socket
-/// never resets a connection with unread request bytes.
-async fn read_request<S: AsyncRead + Unpin>(sock: &mut S) -> io::Result<Vec<u8>> {
+/// never resets a connection with unread request bytes. Returns the head and the body.
+async fn read_request<S: AsyncRead + Unpin>(sock: &mut S) -> io::Result<(Vec<u8>, Vec<u8>)> {
     const MAX_HEAD: usize = 64 * 1024;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 4096];
@@ -149,15 +174,15 @@ async fn read_request<S: AsyncRead + Unpin>(sock: &mut S) -> io::Result<Vec<u8>>
         .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
-    let mut have = buf.len() - head_end;
-    while have < body_len {
+    let mut body = buf[head_end..].to_vec();
+    while body.len() < body_len {
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
             break;
         }
-        have += n;
+        body.extend_from_slice(&tmp[..n]);
     }
-    Ok(head)
+    Ok((head, body))
 }
 
 /// A self-signed CA certificate (PEM) that signs nothing: the "wrong CA" for TLS tests.

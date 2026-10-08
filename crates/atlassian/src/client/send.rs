@@ -1,23 +1,28 @@
 //! One request (§7.2, plan Task 9 "Classification algorithm"; the step numbers below are the
 //! plan's): guards, limiter, `429` retries, deadlines, classification, body reading with the
 //! per-response cap and cancel capture, `Date` reporting and the Jira identity check.
+//!
+//! Steps 1 to 5 (`exchange`) are shared by reads and approved writes; steps 6 to 10 (`finish`)
+//! classify a read response, `write.rs` classifies a write response.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, HeaderMap, HeaderValue, RETRY_AFTER};
+use tokio::sync::SemaphorePermit;
 use tokio::time::{Instant, sleep_until};
 use zeroize::Zeroizing;
 
 use super::classify::{ConnFlags, execute_error_class, is_json_content_type, retry_after_wait};
 use super::limiter::Acquired;
-use super::{FetchControl, InstanceClient, Product};
+use super::{FetchControl, InstanceClient, Product, Timeouts};
 use crate::cover::AuditCover;
 use crate::credentials::{PatSecret, StoredCredential};
-use crate::guard::{SendMode, method_guard};
+use crate::guard::{Outgoing, SendMode, method_guard};
 use crate::identity::check_jira_header;
 use crate::origin::origin_guard;
 use crate::types::{
-    BodyFailure, FetchFailure, FetchOutcome, PostSendKind, UnavailableReason, UpstreamResponse,
+    BodyFailure, FetchFailure, FetchOutcome, HttpRequestSpec, PostSendKind, UnavailableReason,
+    UpstreamResponse,
 };
 use crate::url::build_url;
 
@@ -26,21 +31,63 @@ pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 /// §7.2: at most 3 retries of a `429`.
 const MAX_429_RETRIES: u32 = 3;
 
-pub(crate) struct OneRequest<'a> {
-    pub(crate) method: reqwest::Method,
-    pub(crate) template: &'a str,
-    pub(crate) params: &'a serde_json::Value,
-    pub(crate) query: &'a [(String, String)],
-    /// Sent with `Content-Type: application/json`.
-    pub(crate) json_body: Option<Vec<u8>>,
-    pub(crate) mode: SendMode<'a>,
-    /// The call's overall budget and the class its expiry gets (Task 10 threads the 120 s read
-    /// budget through here); `None` = only the per-call deadline of each attempt.
-    pub(crate) overall: Option<(Instant, PostSendKind)>,
-    pub(crate) max_response_bytes: u64,
+/// What one call writes.
+pub(crate) enum Target<'a> {
+    /// A read: `GET`, or the allowlisted search `POST`, built from an endpoint template under the
+    /// base URL.
+    Template {
+        method: reqwest::Method,
+        template: &'a str,
+        params: &'a serde_json::Value,
+        query: &'a [(String, String)],
+        /// Sent with `Content-Type: application/json`.
+        json_body: Option<Vec<u8>>,
+    },
+    /// One approved write request, written exactly as listed (§5.1 invariant 3).
+    Approved(&'a HttpRequestSpec),
 }
 
-enum BodyRead {
+impl Target<'_> {
+    fn mode(&self) -> SendMode<'_> {
+        match self {
+            Target::Template { template, .. } => SendMode::Read {
+                path_template: template,
+            },
+            Target::Approved(spec) => SendMode::ApprovedWrite(spec),
+        }
+    }
+
+    /// §7.2: 30 s per HTTP call, 60 s per write.
+    fn per_call(&self, t: &Timeouts) -> Duration {
+        match self {
+            Target::Template { .. } => t.per_call,
+            Target::Approved(_) => t.write,
+        }
+    }
+}
+
+pub(crate) struct OneRequest<'a> {
+    pub(crate) target: Target<'a>,
+    /// The call's overall budget and the class its expiry gets (the 120 s read budget, the 60 s
+    /// write budget); `None` = only the per-call deadline of each attempt.
+    pub(crate) overall: Option<(Instant, PostSendKind)>,
+    pub(crate) max_response_bytes: u64,
+    /// The class of a body over `max_response_bytes`: `ResponseCap32MiB`, or `FetchCap50MiB`
+    /// when the rest of a paginated read's fetch budget is the smaller limit.
+    pub(crate) cap_kind: PostSendKind,
+}
+
+/// A response whose status and headers arrived, before its body was read (steps 1 to 5 done).
+pub(crate) struct Exchange<'c> {
+    pub(crate) resp: reqwest::Response,
+    /// Held until the body has been read.
+    pub(crate) permit: SemaphorePermit<'c>,
+    pub(crate) cred: StoredCredential,
+    pub(crate) deadline: Instant,
+    pub(crate) deadline_kind: PostSendKind,
+}
+
+pub(crate) enum BodyRead {
     Complete,
     Cancelled,
     Deadline,
@@ -52,26 +99,28 @@ fn failed(f: FetchFailure) -> FetchOutcome {
     FetchOutcome::Failed(f)
 }
 
-/// §5.2 step 3: before `sent` nothing left; after it, whatever arrived so far is reported.
-fn cancelled(ctl: &FetchControl) -> FetchOutcome {
-    if ctl.is_sent() {
-        failed(FetchFailure::CancelledInFlight {
+/// §5.2 step 3: before this call handed a request to the connection nothing left; after it,
+/// whatever arrived so far is reported. `sent` is this call's own flag: the control's flag is
+/// sticky across calls (and stays set after a pre-send connection failure).
+pub(crate) fn cancelled(ctl: &FetchControl, sent: bool) -> FetchFailure {
+    if sent {
+        FetchFailure::CancelledInFlight {
             bytes_received: ctl.snapshot_partial(),
-        })
+        }
     } else {
-        failed(FetchFailure::CancelledBeforeSend)
+        FetchFailure::CancelledBeforeSend
     }
 }
 
-/// The overall budget ran out before this attempt was handed to the connection. If an earlier
-/// attempt of the call was sent (a retried 429), the expiry is post-send.
-fn budget_expired(ctl: &FetchControl, req: &OneRequest<'_>) -> FetchOutcome {
-    match req.overall {
-        Some((_, kind)) if ctl.is_sent() => failed(FetchFailure::PostSend {
+/// The overall budget ran out before an attempt was handed to the connection. If an earlier
+/// attempt of this call was sent (a retried 429), the expiry is post-send.
+fn budget_expired(sent: bool, overall: Option<(Instant, PostSendKind)>) -> FetchFailure {
+    match overall {
+        Some((_, kind)) if sent => FetchFailure::PostSend {
             kind,
             received: Vec::new(),
-        }),
-        _ => failed(FetchFailure::BudgetExpiredBeforeSend),
+        },
+        _ => FetchFailure::BudgetExpiredBeforeSend,
     }
 }
 
@@ -83,9 +132,40 @@ fn bearer(pat: &PatSecret) -> Option<HeaderValue> {
     Some(v)
 }
 
-fn header_text(headers: &HeaderMap, name: impl reqwest::header::AsHeaderName) -> Option<&str> {
+pub(crate) fn header_text(
+    headers: &HeaderMap,
+    name: impl reqwest::header::AsHeaderName,
+) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
+
+/// Every `X-AUSERNAME` value (lossy UTF-8), in order.
+pub(crate) fn ausernames(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all("x-ausername")
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect()
+}
+
+/// The method guard (§5.1 invariant 3) on the request exactly as it will be written.
+fn guard(mode: &SendMode<'_>, request: &reqwest::Request) -> Result<(), FetchFailure> {
+    let content_types: Vec<&[u8]> = request
+        .headers()
+        .get_all(CONTENT_TYPE)
+        .iter()
+        .map(HeaderValue::as_bytes)
+        .collect();
+    let out = Outgoing {
+        method: request.method().as_str(),
+        url: request.url().as_str(),
+        content_types: &content_types,
+        body: request.body().and_then(reqwest::Body::as_bytes),
+    };
+    method_guard(mode, &out).map_err(|_| FetchFailure::MethodGuardRefused)
+}
+
+const X_ATLASSIAN_TOKEN: &str = "X-Atlassian-Token";
 
 impl InstanceClient {
     pub(crate) async fn send_one(
@@ -94,29 +174,103 @@ impl InstanceClient {
         req: OneRequest<'_>,
         ctl: &FetchControl,
     ) -> FetchOutcome {
+        let ex = match self.exchange(cover, &req, ctl).await {
+            Ok(ex) => ex,
+            Err(f) => return failed(f),
+        };
+        let Exchange {
+            resp,
+            permit,
+            cred,
+            deadline,
+            deadline_kind,
+        } = ex;
+        let outcome = self
+            .finish(resp, &req, &cred, ctl, deadline, deadline_kind)
+            .await;
+        drop(permit);
+        outcome
+    }
+
+    /// The request exactly as it will be written, without `Authorization` (added per attempt
+    /// once the origin guard passed).
+    fn build_request(&self, target: &Target<'_>) -> Result<reqwest::Request, FetchFailure> {
+        match target {
+            Target::Template {
+                method,
+                template,
+                params,
+                query,
+                json_body,
+            } => {
+                // A URL that cannot be built under the base is refused like an origin mismatch.
+                fn refused<E>(_: E) -> FetchFailure {
+                    FetchFailure::OriginGuardRefused
+                }
+                let url = build_url(&self.cfg.base, template, params, query).map_err(refused)?;
+                let mut b = self.http.request(method.clone(), url);
+                if *method != reqwest::Method::GET {
+                    b = b.header(X_ATLASSIAN_TOKEN, "no-check");
+                }
+                if let Some(body) = json_body {
+                    b = b
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(body.clone());
+                }
+                b.build().map_err(refused)
+            }
+            Target::Approved(spec) => {
+                // Whatever cannot be written exactly as listed is a mismatch; nothing leaves.
+                fn refused<E>(_: E) -> FetchFailure {
+                    FetchFailure::MethodGuardRefused
+                }
+                let method =
+                    reqwest::Method::from_bytes(spec.method.as_bytes()).map_err(refused)?;
+                let url = url::Url::parse(&spec.resolved_url).map_err(refused)?;
+                let mut b = self.http.request(method.clone(), url);
+                if method != reqwest::Method::GET {
+                    b = b.header(X_ATLASSIAN_TOKEN, "no-check");
+                }
+                if let Some(ct) = &spec.content_type {
+                    b = b.header(CONTENT_TYPE, HeaderValue::from_str(ct).map_err(refused)?);
+                }
+                // Always a body, an empty one included, so the guard compares bytes, not presence.
+                b.body(spec.body.clone()).build().map_err(refused)
+            }
+        }
+    }
+
+    /// Steps 1 to 5: guards, limiter, send, `Date`, `429` retries. Every `Err` is a complete
+    /// failure; `Ok` holds the response that is not retried, its body unread.
+    pub(crate) async fn exchange(
+        &self,
+        cover: &AuditCover,
+        req: &OneRequest<'_>,
+        ctl: &FetchControl,
+    ) -> Result<Exchange<'_>, FetchFailure> {
         // Holding a cover is the proof of a committed start record (§5.1 inv. 1).
         let _ = cover;
+        let mode = req.target.mode();
 
-        // Step 1: URL, method guard, credential, origin guard. Nothing leaves on a refusal. A URL
-        // that cannot be built under the base is refused like an origin mismatch.
-        let Ok(url) = build_url(&self.cfg.base, req.template, req.params, req.query) else {
-            return failed(FetchFailure::OriginGuardRefused);
-        };
-        if method_guard(&req.mode, req.method.as_str(), req.template).is_err() {
-            return failed(FetchFailure::MethodGuardRefused);
-        }
+        // Step 1: the request as it will be written, the method guard on it, the credential, the
+        // origin guard. Nothing leaves on a refusal.
+        let prepared = self.build_request(&req.target)?;
+        guard(&mode, &prepared)?;
         // A keychain error fails closed as well; its state is `core`'s concern.
         let Ok(Some(cred)) = self.creds.load(&self.cfg.instance_id) else {
-            return failed(FetchFailure::NeedsToken);
+            return Err(FetchFailure::NeedsToken);
         };
-        if origin_guard(&url, &self.cfg.base, &cred.base_url_hash).is_err() {
-            return failed(FetchFailure::OriginGuardRefused);
+        if origin_guard(prepared.url(), &self.cfg.base, &cred.base_url_hash).is_err() {
+            return Err(FetchFailure::OriginGuardRefused);
         }
         // A stored PAT that cannot be a header value is unusable.
         let Some(auth) = bearer(&cred.pat) else {
-            return failed(FetchFailure::NeedsToken);
+            return Err(FetchFailure::NeedsToken);
         };
+        let per_call = req.target.per_call(&self.cfg.timeouts);
 
+        // Whether this call handed a request to the connection.
+        let mut sent = false;
         let mut retries = 0;
         loop {
             // Step 2: limiter permit (cancel-aware, bounded by the overall budget).
@@ -126,47 +280,40 @@ impl InstanceClient {
                 .await
             {
                 Acquired::Permit(p) => p,
-                Acquired::Cancelled => return cancelled(ctl),
-                Acquired::Expired => return budget_expired(ctl, &req),
+                Acquired::Cancelled => return Err(cancelled(ctl, sent)),
+                Acquired::Expired => return Err(budget_expired(sent, req.overall)),
             };
             let now = Instant::now();
-            let mut deadline = now + self.cfg.timeouts.per_call;
+            let mut deadline = now + per_call;
             let mut deadline_kind = PostSendKind::PerCallTimeout;
             if let Some((end, kind)) = req.overall {
                 if now >= end {
-                    return budget_expired(ctl, &req);
+                    return Err(budget_expired(sent, req.overall));
                 }
                 if end < deadline {
                     deadline = end;
                     deadline_kind = kind;
                 }
             }
-            // The Authorization header exists only on this one request (never a default header).
-            let mut b = self
-                .http
-                .request(req.method.clone(), url.clone())
-                .header(AUTHORIZATION, auth.clone());
-            if req.method != reqwest::Method::GET {
-                b = b.header("X-Atlassian-Token", "no-check");
-            }
-            if let Some(body) = &req.json_body {
-                b = b
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(body.clone());
-            }
-            let Ok(request) = b.build() else {
-                return failed(FetchFailure::OriginGuardRefused);
+            // Every attempt writes a copy of the guarded request; the Authorization header
+            // exists only on it (never a default header), and the guard runs again on the very
+            // request handed to the connection.
+            let Some(mut request) = prepared.try_clone() else {
+                return Err(FetchFailure::MethodGuardRefused);
             };
+            request.headers_mut().insert(AUTHORIZATION, auth.clone());
+            guard(&mode, &request)?;
 
             // Step 3: from here on the request counts as sent (a cancel during connect reports an
             // empty in-flight capture, the safe over-report direction).
             ctl.clear_partial();
             ctl.mark_sent();
+            sent = true;
             let executed = tokio::select! {
                 biased;
-                () = ctl.cancelled() => return cancelled(ctl),
+                () = ctl.cancelled() => return Err(cancelled(ctl, sent)),
                 () = sleep_until(deadline) => {
-                    return failed(FetchFailure::PostSend { kind: deadline_kind, received: Vec::new() });
+                    return Err(FetchFailure::PostSend { kind: deadline_kind, received: Vec::new() });
                 }
                 r = self.http.execute(request) => r,
             };
@@ -179,7 +326,7 @@ impl InstanceClient {
                         timeout: e.is_timeout(),
                         dns: e.is_dns(),
                     };
-                    return failed(match execute_error_class(&e, e.is_connect(), flags) {
+                    return Err(match execute_error_class(&e, e.is_connect(), flags) {
                         Some(class) => FetchFailure::PreSendConnection(class),
                         None => FetchFailure::PostSend {
                             kind: PostSendKind::NetworkError,
@@ -203,18 +350,20 @@ impl InstanceClient {
                     retries += 1;
                     tokio::select! {
                         biased;
-                        () = ctl.cancelled() => return cancelled(ctl),
+                        () = ctl.cancelled() => return Err(cancelled(ctl, sent)),
                         () = sleep_until(until) => {}
                     }
                     continue;
                 }
             }
 
-            let outcome = self
-                .finish(resp, &req, &cred, ctl, deadline, deadline_kind)
-                .await;
-            drop(permit);
-            return outcome;
+            return Ok(Exchange {
+                resp,
+                permit,
+                cred,
+                deadline,
+                deadline_kind,
+            });
         }
     }
 
@@ -228,7 +377,7 @@ impl InstanceClient {
         self.limiter.observe(headers);
     }
 
-    /// Steps 6 to 10 for the response that is not retried.
+    /// Steps 6 to 10 for the read response that is not retried.
     async fn finish(
         &self,
         resp: reqwest::Response,
@@ -242,12 +391,7 @@ impl InstanceClient {
         let content_type = header_text(resp.headers(), CONTENT_TYPE).map(str::to_owned);
         let json = is_json_content_type(content_type.as_deref());
         let success = (200..300).contains(&status);
-        let auser: Vec<String> = resp
-            .headers()
-            .get_all("x-ausername")
-            .iter()
-            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
-            .collect();
+        let auser = ausernames(resp.headers());
         let response = |body: Vec<u8>| UpstreamResponse {
             status,
             content_type: content_type.clone(),
@@ -270,7 +414,7 @@ impl InstanceClient {
         let read = read_body(resp, ctl, deadline, req.max_response_bytes).await;
         if let Some(reason) = header_decided {
             return match read {
-                BodyRead::Cancelled => cancelled(ctl),
+                BodyRead::Cancelled => failed(cancelled(ctl, true)),
                 _ => failed(FetchFailure::StatusHeaderDecided {
                     reason,
                     response: response(ctl.take_partial()),
@@ -279,7 +423,7 @@ impl InstanceClient {
         }
         match read {
             BodyRead::Complete => {}
-            BodyRead::Cancelled => return cancelled(ctl),
+            BodyRead::Cancelled => return failed(cancelled(ctl, true)),
             BodyRead::Deadline => {
                 return failed(FetchFailure::PostSend {
                     kind: deadline_kind,
@@ -288,7 +432,7 @@ impl InstanceClient {
             }
             BodyRead::OverCap => {
                 return failed(FetchFailure::PostSend {
-                    kind: PostSendKind::ResponseCap32MiB,
+                    kind: req.cap_kind,
                     received: ctl.take_partial(),
                 });
             }
@@ -334,7 +478,7 @@ impl InstanceClient {
 
 /// Appends every chunk to the control's shared buffer until the end, the cap, the deadline, a
 /// read error or a cancel; the bytes stay in the control.
-async fn read_body(
+pub(crate) async fn read_body(
     mut resp: reqwest::Response,
     ctl: &FetchControl,
     deadline: Instant,
@@ -364,35 +508,35 @@ async fn read_body(
 mod tests {
     use super::*;
 
-    fn with_budget(overall: Option<(Instant, PostSendKind)>) -> OneRequest<'static> {
-        OneRequest {
-            method: reqwest::Method::GET,
-            template: "/rest/api/2/myself",
-            params: &serde_json::Value::Null,
-            query: &[],
-            json_body: None,
-            mode: SendMode::Read,
-            overall,
-            max_response_bytes: MAX_RESPONSE_BYTES,
-        }
+    #[test]
+    fn budget_expiry_before_send_is_presend() {
+        let overall = Some((Instant::now(), PostSendKind::ReadBudget120s));
+        assert_eq!(
+            budget_expired(false, overall),
+            FetchFailure::BudgetExpiredBeforeSend
+        );
+        // An earlier attempt of the call (a retried 429) was sent: post-send.
+        assert_eq!(
+            budget_expired(true, overall),
+            FetchFailure::PostSend {
+                kind: PostSendKind::ReadBudget120s,
+                received: Vec::new(),
+            }
+        );
     }
 
     #[test]
-    fn budget_expiry_before_send_is_presend() {
-        let req = with_budget(Some((Instant::now(), PostSendKind::ReadBudget120s)));
+    fn cancel_before_this_call_sent_is_presend() {
+        // The control's flag may be set by an earlier call; only this call's flag decides.
         let ctl = FetchControl::new();
-        assert_eq!(
-            budget_expired(&ctl, &req),
-            FetchOutcome::Failed(FetchFailure::BudgetExpiredBeforeSend)
-        );
-        // An earlier attempt of the call (a retried 429) was sent: post-send.
         ctl.mark_sent();
+        assert_eq!(cancelled(&ctl, false), FetchFailure::CancelledBeforeSend);
+        ctl.append_partial(b"ab");
         assert_eq!(
-            budget_expired(&ctl, &req),
-            FetchOutcome::Failed(FetchFailure::PostSend {
-                kind: PostSendKind::ReadBudget120s,
-                received: Vec::new(),
-            })
+            cancelled(&ctl, true),
+            FetchFailure::CancelledInFlight {
+                bytes_received: b"ab".to_vec()
+            }
         );
     }
 }

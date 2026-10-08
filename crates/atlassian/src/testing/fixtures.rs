@@ -103,6 +103,112 @@ pub const CONFLUENCE_PAGE: &str = r#"{"id":"65537","type":"page","status":"curre
 
 pub const CONFLUENCE_SEARCH_PAGE: &str = r#"{"results":[{"content":{"id":"65537","type":"page","status":"current","title":"Release checklist","_links":{"webui":"/display/DOC/Release+checklist","self":"https://wiki.corp.example/rest/api/content/65537"}},"title":"Release checklist","excerpt":"","url":"/display/DOC/Release+checklist","resultGlobalContainer":{"title":"Documentation","displayUrl":"/display/DOC"},"entityType":"content","lastModified":"2026-10-06T14:00:00.000+02:00"}],"start":0,"limit":25,"size":1,"totalSize":1,"cqlQuery":"type = page","searchDuration":12,"_links":{"base":"https://wiki.corp.example","context":""}}"#;
 
+// Paged fixtures (Task 10). Item ids count from the page's offset, so a test can tell pages apart.
+
+/// One `POST /rest/api/2/search` page: `count` issues from `start_at` (`ABC-<start_at + 1>`, ...).
+pub fn jira_search_page(start_at: u64, max_results: u64, total: u64, count: u64) -> String {
+    let issues: Vec<serde_json::Value> = (start_at..start_at + count)
+        .map(|i| {
+            serde_json::json!({
+                "id": (10_001 + i).to_string(),
+                "key": format!("ABC-{}", i + 1),
+                "self": format!("https://jira.corp.example/rest/api/2/issue/{}", 10_001 + i),
+                "fields": {"summary": format!("Issue {}", i + 1)}
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "expand": "schema,names",
+        "startAt": start_at,
+        "maxResults": max_results,
+        "total": total,
+        "issues": issues
+    })
+    .to_string()
+}
+
+/// One Jira Agile page (`/rest/agile/1.0/board`): `values` and `isLast`, no `total` when `None`.
+pub fn jira_board_page(start_at: u64, max_results: u64, total: Option<u64>, count: u64) -> String {
+    let values: Vec<serde_json::Value> = (start_at..start_at + count)
+        .map(|i| serde_json::json!({"id": i + 1, "name": format!("Board {}", i + 1), "type": "scrum"}))
+        .collect();
+    let mut page = serde_json::json!({
+        "maxResults": max_results,
+        "startAt": start_at,
+        "isLast": total.is_some_and(|t| start_at + count >= t),
+        "values": values
+    });
+    if let (Some(t), Some(obj)) = (total, page.as_object_mut()) {
+        obj.insert("total".to_owned(), t.into());
+    }
+    page.to_string()
+}
+
+/// One `GET /rest/api/space` page: `size` spaces from `start`; `next` is the origin-relative
+/// `_links.next` Confluence DC sends (without the context path), absent on the last page.
+pub fn confluence_space_page(start: u64, limit: u64, size: u64, next: Option<&str>) -> String {
+    confluence_space_page_padded(start, limit, size, next, 0)
+}
+
+/// `confluence_space_page` with a `padding` string of `pad` bytes (cap tests).
+pub fn confluence_space_page_padded(
+    start: u64,
+    limit: u64,
+    size: u64,
+    next: Option<&str>,
+    pad: usize,
+) -> String {
+    let results: Vec<serde_json::Value> = (start..start + size)
+        .map(|i| {
+            serde_json::json!({
+                "id": 98_305 + i,
+                "key": format!("S{}", i + 1),
+                "name": format!("Space {}", i + 1),
+                "type": "global"
+            })
+        })
+        .collect();
+    let mut links = serde_json::json!({
+        "base": "https://wiki.corp.example",
+        "context": "",
+        "self": "https://wiki.corp.example/rest/api/space"
+    });
+    if let (Some(n), Some(obj)) = (next, links.as_object_mut()) {
+        obj.insert("next".to_owned(), n.into());
+    }
+    serde_json::json!({
+        "results": results,
+        "start": start,
+        "limit": limit,
+        "size": size,
+        "padding": " ".repeat(pad),
+        "_links": links
+    })
+    .to_string()
+}
+
+// Write responses (Task 10, I-25).
+
+/// `POST /rest/api/2/issue` → 201.
+pub const JIRA_ISSUE_CREATED: &str =
+    r#"{"id":"10003","key":"ABC-3","self":"https://jira.corp.example/rest/api/2/issue/10003"}"#;
+
+/// A Jira 400 validation error.
+pub const JIRA_ERROR_400: &str =
+    r#"{"errorMessages":[],"errors":{"summary":"You must specify a summary of the issue."}}"#;
+
+/// `PUT /rest/api/content/{id}` → 200 (the updated page, version 8).
+pub const CONFLUENCE_PAGE_UPDATED: &str = r#"{"id":"65537","type":"page","status":"current","title":"Release checklist","version":{"by":{"type":"known","username":"jdoe","userKey":"8a7f808a1","displayName":"Jane Doe"},"when":"2026-10-07T10:00:00.000+02:00","number":8,"minorEdit":false},"_links":{"webui":"/display/DOC/Release+checklist","base":"https://wiki.corp.example","context":"","self":"https://wiki.corp.example/rest/api/content/65537"}}"#;
+
+/// Confluence DC's answer to a stale `version.number` (409).
+pub const CONFLUENCE_VERSION_CONFLICT_409: &str = r#"{"statusCode":409,"data":{"authorized":false,"valid":true,"errors":[],"successful":false},"message":"Version must be incremented on update. Current version is: 8"}"#;
+
+/// The 400 form of a version conflict (V04/V06 confirm the exact text in M7).
+pub const CONFLUENCE_VERSION_CONFLICT_400: &str = r#"{"statusCode":400,"data":{"authorized":false,"valid":true,"errors":[],"successful":false},"message":"Version must be incremented on update. Current version is: 8"}"#;
+
+/// A Confluence 400 that is not about versions.
+pub const CONFLUENCE_ERROR_400: &str = r#"{"statusCode":400,"data":{"authorized":false,"valid":true,"errors":[],"successful":false},"message":"A page with this title already exists in this space"}"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +222,11 @@ mod tests {
             confluence_user_current("jdoe", "8a7f808a1"),
             applinks_manifest(CONFLUENCE_8_5_VERSION),
             applinks_manifest(CONFLUENCE_9_VERSION),
+            jira_search_page(50, 50, 120, 50),
+            jira_board_page(0, 50, Some(3), 3),
+            jira_board_page(0, 50, None, 3),
+            confluence_space_page(0, 25, 25, Some("/rest/api/space?limit=25&start=25")),
+            confluence_space_page_padded(25, 25, 10, None, 16),
         ];
         let fixed = [
             JIRA_MYSELF,
@@ -127,6 +238,12 @@ mod tests {
             CONFLUENCE_USER_ANONYMOUS,
             CONFLUENCE_PAGE,
             CONFLUENCE_SEARCH_PAGE,
+            JIRA_ISSUE_CREATED,
+            JIRA_ERROR_400,
+            CONFLUENCE_PAGE_UPDATED,
+            CONFLUENCE_VERSION_CONFLICT_409,
+            CONFLUENCE_VERSION_CONFLICT_400,
+            CONFLUENCE_ERROR_400,
         ];
         for body in owned.iter().map(String::as_str).chain(fixed) {
             assert!(
