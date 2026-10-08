@@ -106,6 +106,8 @@ fn config(worker: PathBuf, timeout: Duration) -> ProbeConfig {
         app_pid: APP_PID,
         profile_path: PathBuf::from("/home/someone/.profile-probe-target"),
         per_probe_timeout: timeout,
+        // the fake spawner has no unconfined control; Windows scoring has its own tests
+        windows_controls: false,
     }
 }
 

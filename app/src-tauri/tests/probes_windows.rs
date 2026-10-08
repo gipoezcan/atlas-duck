@@ -28,9 +28,11 @@ use atlas_duck_ipc::sandbox::probe::{
     encode_notification,
 };
 use atlas_duck_sandbox_host::probe::{
-    Evidence, FloorVerdict, ProbeConfig, ProbeReport, run_probes,
+    Evidence, FloorVerdict, ProbeConfig, ProbeReport, run_probes, run_probes_with_fallback,
 };
-use atlas_duck_sandbox_host::spawn::{DEFAULT_PROCESS_MB, ExitKind, SpawnSpec, WorkerProcess};
+use atlas_duck_sandbox_host::spawn::{
+    DEFAULT_PROCESS_MB, ExitKind, SpawnSpec, WorkerProcess, WorkerSpawner,
+};
 use atlas_duck_sandbox_host::windows::{
     APPCONTAINER_NAME, AceStatus, JobSnapshot, WORKER_ENV_OBSERVED, WindowsProcess, WindowsSpawner,
     check_aces, grant_aces, pe_import_names, worker_ace_files_for_exe,
@@ -384,9 +386,40 @@ fn assert_reported(report: &ProbeReport, probe: ProbeId, outcome: ProbeOutcome, 
 /// Set locally (`ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_DEVBOX=1`) to also pin the
 /// exact verdicts measured on the development machine (Windows 11 build 26200
 /// with WithSecure). CI leaves it unset: another Windows image may differ in
-/// Winsock under LPAC, CredRead or security-software hooks.
+/// the exact Winsock / CredRead failure codes under LPAC.
 fn expect_devbox() -> bool {
     std::env::var_os("ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_DEVBOX").is_some_and(|v| v == "1")
+}
+
+/// `ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET=1` (CI's windows-2022 jobs, and the dev
+/// box): the floor must be `Met`, in LPAC and in plain AppContainer mode. Unset,
+/// only the machine-independent invariants hold and the verdict is printed.
+fn expect_floor_met() -> bool {
+    std::env::var_os("ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET").is_some_and(|v| v == "1")
+}
+
+/// Why a `Blocked` record is legitimate: an explicit denial the worker saw, or
+/// a host-scored absence that carries its control (`control_ok`).
+fn blocked_for_a_real_reason(evidence: Evidence) -> bool {
+    match evidence {
+        Evidence::Reported { os_error: Some(c) } => {
+            [ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_QUOTA, WSAEACCES].contains(&c)
+        }
+        // no connection reached the host's listener, and the listener was
+        // proven reachable (host self-check + unconfined worker)
+        Evidence::ListenerArrival {
+            arrived: false,
+            control_ok: true,
+            ..
+        } => true,
+        // the stack / credential service does not exist for the worker, and an
+        // unconfined worker proved that it exists outside the sandbox
+        Evidence::StackUnavailable {
+            os_error,
+            control_ok: true,
+        } => [WSASYSCALLFAILURE, 10106, RPC_S_INVALID_BINDING, 1722].contains(&os_error),
+        _ => false,
+    }
 }
 
 /// What must hold on every Windows machine, whatever the floor verdict is: the
@@ -409,17 +442,24 @@ fn assert_floor_invariants(label: &str, report: &ProbeReport, lpac: bool) {
     assert!(confinement.applied, "{confinement:?}");
     assert_eq!(confinement.mechanism, "appcontainer");
     assert_eq!(confinement.lpac, Some(lpac), "{confinement:?}");
+    let control = report.control.expect("the Windows controls ran");
+    println!(
+        "T19 {label}: control_ok={} (listener={} winsock={} cred={})",
+        control.ok(),
+        control.listener,
+        control.winsock,
+        control.cred
+    );
     for probe in WINDOWS_FLOOR {
         let (outcome, evidence) = record(report, probe);
         if outcome == ProbeOutcome::Blocked {
             assert!(
-                matches!(
-                    evidence,
-                    Evidence::Reported { os_error: Some(c) }
-                        if [ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_QUOTA, WSAEACCES].contains(&c)
-                ),
+                blocked_for_a_real_reason(evidence),
                 "{probe:?} is Blocked for the wrong reason: {evidence:?}"
             );
+        }
+        if let Evidence::ListenerArrival { arrived, .. } = evidence {
+            println!("T19 {label}: loopback_listener_saw_connect={arrived}");
         }
     }
     if report.floor == FloorVerdict::Met {
@@ -427,15 +467,20 @@ fn assert_floor_invariants(label: &str, report: &ProbeReport, lpac: bool) {
             assert_eq!(record(report, probe).0, ProbeOutcome::Blocked, "{probe:?}");
         }
     }
+    if expect_floor_met() {
+        assert_eq!(report.floor, FloorVerdict::Met, "{label}: {report:#?}");
+    }
 }
 
 #[test]
 fn the_lpac_floor_scores_only_real_denials_as_blocked() {
     // Measured on the dev box (see `expect_devbox`), every file with both
-    // (L)PAC ACEs, the worker running as LPAC: FileInProfile,
-    // OpenProcessVmRead and OpenClipboard 5; SpawnProcess 1816; ConnectLoopback
-    // and ConnectPublic Error 10107 (WSAStartup fails, no connect attempted);
-    // CredRead Error 1702 (RPC_S_INVALID_BINDING). Floor NotMet.
+    // (L)PAC ACEs, the worker running as LPAC: FileInProfile, OpenProcessVmRead
+    // and OpenClipboard 5; SpawnProcess 1816; ConnectLoopback and ConnectPublic
+    // report 10107 (WSAStartup fails, no connect attempted); CredRead reports
+    // 1702 (RPC_S_INVALID_BINDING). The host scores the last three Blocked only
+    // because an unconfined worker initialises Winsock and reads the credential
+    // store normally (`control_ok`).
     let spawner = spawner();
     let report = run_probes(&spawner, None, &config_for(&worker_exe()));
     assert_floor_invariants("floor (LPAC)", &report, true);
@@ -464,34 +509,24 @@ fn the_lpac_floor_scores_only_real_denials_as_blocked() {
             ProbeOutcome::Blocked,
             ERROR_NOT_ENOUGH_QUOTA,
         );
-        assert_reported(
-            &report,
-            ProbeId::ConnectLoopback,
-            ProbeOutcome::Error,
-            WSASYSCALLFAILURE,
-        );
-        assert_reported(
-            &report,
-            ProbeId::ConnectPublic,
-            ProbeOutcome::Error,
-            WSASYSCALLFAILURE,
-        );
-        assert_reported(
-            &report,
-            ProbeId::CredRead,
-            ProbeOutcome::Error,
-            RPC_S_INVALID_BINDING,
-        );
-        assert_eq!(
-            report.floor,
-            FloorVerdict::NotMet {
-                failed: vec![
-                    ProbeId::ConnectLoopback,
-                    ProbeId::ConnectPublic,
-                    ProbeId::CredRead
-                ]
-            }
-        );
+        for (probe, code) in [
+            (ProbeId::ConnectLoopback, WSASYSCALLFAILURE),
+            (ProbeId::ConnectPublic, WSASYSCALLFAILURE),
+            (ProbeId::CredRead, RPC_S_INVALID_BINDING),
+        ] {
+            assert_eq!(
+                record(&report, probe),
+                (
+                    ProbeOutcome::Blocked,
+                    Evidence::StackUnavailable {
+                        os_error: code,
+                        control_ok: true
+                    }
+                ),
+                "{probe:?}"
+            );
+        }
+        assert_eq!(report.floor, FloorVerdict::Met);
     }
 }
 
@@ -680,13 +715,12 @@ fn without_the_restricted_ace_the_worker_is_a_plain_appcontainer() {
     // worker is a plain AppContainer and reports lpac = false. Measured on
     // Windows 11 (build 26200): every floor probe is Blocked with the expected
     // denial (5, 1816, 10013) except ConnectLoopback, whose connect to the
-    // closed port 127.0.0.1:9 hangs until the worker's 2 s deadline and is
-    // therefore scored Allowed by the platform-neutral "timeout = reached the
-    // stack" rule. The unconfined control hangs the same way on this machine,
-    // so that timeout is no evidence either way: the probe cannot tell an
-    // AppContainer drop from a filtered port. The test
-    // `a_plain_appcontainer_connect_never_reaches_a_listening_loopback_socket`
-    // gets the real evidence from a listening socket.
+    // host's listener hangs until the worker's 2 s deadline (no WSAEACCES). The
+    // worker scores that timeout Allowed (the platform-neutral rule), which says
+    // nothing by itself: an unconfined connect to a closed port hangs on this
+    // machine too. The host therefore scores it from its own listener: no
+    // connection arrived, and the controls proved the listener reachable
+    // (the host's own connect, and an unconfined worker's connect).
     let copy = plain_appcontainer_copy("plainac");
 
     let spawner = WindowsSpawner::new().expect("AppContainer profile");
@@ -731,14 +765,139 @@ fn without_the_restricted_ace_the_worker_is_a_plain_appcontainer() {
         );
         assert_eq!(
             record(&report, ProbeId::ConnectLoopback),
-            (ProbeOutcome::Allowed, Evidence::Reported { os_error: None })
+            (
+                ProbeOutcome::Blocked,
+                Evidence::ListenerArrival {
+                    os_error: None,
+                    arrived: false,
+                    control_ok: true
+                }
+            )
         );
-        assert_eq!(
-            report.floor,
-            FloorVerdict::NotMet {
-                failed: vec![ProbeId::ConnectLoopback]
+        assert_eq!(report.floor, FloorVerdict::Met);
+    }
+}
+
+/// A spawner whose unconfined control cannot start: every confined probe still
+/// runs, but nothing proves that the listener, Winsock or the credential store
+/// work outside the sandbox.
+struct NoControl(WindowsSpawner);
+
+impl WorkerSpawner for NoControl {
+    fn spawn(&self, spec: &SpawnSpec) -> std::io::Result<Box<dyn WorkerProcess>> {
+        self.0.spawn(spec)
+    }
+}
+
+#[test]
+fn without_the_unconfined_control_the_lpac_floor_fails_closed() {
+    // The rules of B and A need a control. If it cannot run, the worker's
+    // 10107 / 1702 stay Error (never Blocked) and the floor is not met.
+    grant_built_worker();
+    let spawner = NoControl(WindowsSpawner::new().expect("AppContainer profile"));
+    let report = run_probes(&spawner, None, &config_for(&worker_exe()));
+    print_report("no control (LPAC)", &report);
+    let control = report.control.expect("control attempted");
+    assert!(
+        !control.winsock && !control.cred && !control.ok(),
+        "{control:?}"
+    );
+    for (probe, code) in [
+        (ProbeId::ConnectLoopback, WSASYSCALLFAILURE),
+        (ProbeId::ConnectPublic, WSASYSCALLFAILURE),
+        (ProbeId::CredRead, RPC_S_INVALID_BINDING),
+    ] {
+        let (outcome, evidence) = record(&report, probe);
+        assert_eq!(outcome, ProbeOutcome::Error, "{probe:?}");
+        assert!(
+            matches!(evidence, Evidence::StackUnavailable { os_error, control_ok: false } if os_error == code),
+            "{probe:?}: {evidence:?}"
+        );
+    }
+    assert_eq!(
+        report.floor,
+        FloorVerdict::NotMet {
+            failed: vec![
+                ProbeId::ConnectLoopback,
+                ProbeId::ConnectPublic,
+                ProbeId::CredRead
+            ]
+        }
+    );
+}
+
+#[test]
+fn without_the_unconfined_control_a_plain_appcontainer_timeout_is_not_blocked() {
+    let copy = plain_appcontainer_copy("nocontrol");
+    let spawner = NoControl(WindowsSpawner::new().expect("AppContainer profile"));
+    let report = run_probes(&spawner, None, &config_for(&copy.exe));
+    print_report("no control (plain AppContainer)", &report);
+    // the host's own listener self-check still ran, but the unconfined worker
+    // did not, so a connect that timed out is an Error, not a Blocked
+    let (outcome, evidence) = record(&report, ProbeId::ConnectLoopback);
+    assert_eq!(outcome, ProbeOutcome::Error);
+    assert!(
+        matches!(
+            evidence,
+            Evidence::ListenerArrival {
+                arrived: false,
+                control_ok: false,
+                ..
             }
-        );
+        ),
+        "{evidence:?}"
+    );
+    assert_eq!(
+        report.floor,
+        FloorVerdict::NotMet {
+            failed: vec![ProbeId::ConnectLoopback]
+        }
+    );
+}
+
+#[test]
+fn a_failed_lpac_floor_is_rerun_as_a_plain_appcontainer_and_the_better_verdict_wins() {
+    // LPAC with a broken control is NotMet; the plain AppContainer rerun has a
+    // working control and is Met, so it is reported, with what failed under LPAC.
+    grant_built_worker();
+    let lpac = NoControl(WindowsSpawner::new().expect("AppContainer profile"));
+    let plain = || -> Option<Box<dyn WorkerSpawner>> {
+        Some(Box::new(
+            WindowsSpawner::new_plain().expect("AppContainer profile"),
+        ))
+    };
+    let report = run_probes_with_fallback(&lpac, &plain, None, &config_for(&worker_exe()));
+    print_report("fallback", &report);
+    assert_eq!(report.floor, FloorVerdict::Met, "{report:#?}");
+    assert_eq!(
+        report.confinement.as_ref().and_then(|c| c.lpac),
+        Some(false),
+        "the reported run is the plain AppContainer"
+    );
+    assert_eq!(
+        report.lpac_failed,
+        Some(vec![
+            ProbeId::ConnectLoopback,
+            ProbeId::ConnectPublic,
+            ProbeId::CredRead
+        ])
+    );
+    // a plain-AppContainer rerun that is not better changes nothing
+    let both_broken = || -> Option<Box<dyn WorkerSpawner>> {
+        Some(Box::new(NoControl(
+            WindowsSpawner::new_plain().expect("profile"),
+        )))
+    };
+    let report = run_probes_with_fallback(&lpac, &both_broken, None, &config_for(&worker_exe()));
+    assert_ne!(report.floor, FloorVerdict::Met);
+    assert_eq!(report.confinement.as_ref().and_then(|c| c.lpac), Some(true));
+    assert_eq!(report.lpac_failed, None);
+    // and an LPAC floor that is met is returned as it is
+    let good = spawner();
+    let report = run_probes_with_fallback(&good, &plain, None, &config_for(&worker_exe()));
+    assert_eq!(report.lpac_failed, None);
+    if expect_floor_met() {
+        assert_eq!(report.floor, FloorVerdict::Met);
     }
 }
 

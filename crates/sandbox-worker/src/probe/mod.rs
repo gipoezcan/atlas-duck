@@ -15,7 +15,9 @@ use std::io;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
-use atlas_duck_ipc::sandbox::probe::{ProbeId, ProbeOutcome, ProbeRequest, ProbeResultMsg};
+use atlas_duck_ipc::sandbox::probe::{
+    DETAIL_CONNECT_REACHED, DETAIL_CONNECTED, ProbeId, ProbeOutcome, ProbeRequest, ProbeResultMsg,
+};
 
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -209,17 +211,17 @@ fn connect(probe: ProbeId, addr: &str) -> ProbeResultMsg {
             probe,
             ProbeOutcome::Error,
             Some(code),
-            &format!("WSAStartup failed (code {code}), no connect attempted"),
+            &atlas_duck_ipc::sandbox::probe::wsastartup_failed_detail(code),
         );
     }
     match TcpStream::connect_timeout(&sock, CONNECT_DEADLINE) {
-        Ok(_) => result(probe, ProbeOutcome::Allowed, None, "connected"),
+        Ok(_) => result(probe, ProbeOutcome::Allowed, None, DETAIL_CONNECTED),
         Err(e) => {
             let code = os_code(&e);
             let outcome = classify_connect(code, e.kind());
             let detail = match outcome {
                 ProbeOutcome::Blocked => "connect denied",
-                ProbeOutcome::Allowed => "connect reached the network stack",
+                ProbeOutcome::Allowed => DETAIL_CONNECT_REACHED,
                 ProbeOutcome::Error => "connect failed unexpectedly",
             };
             result(probe, outcome, code, detail)

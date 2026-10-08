@@ -26,6 +26,21 @@ pub const PUBLIC_PROBE_ADDR: &str = "192.0.2.1:443";
 /// §9.4 "127.0.0.1"; port 9 (discard) is a plan choice.
 pub const LOOPBACK_PROBE_ADDR: &str = "127.0.0.1:9";
 
+/// `ProbeResultMsg::detail` of a connect probe whose `connect` succeeded. The
+/// host's Windows scoring tells it apart from [`DETAIL_CONNECT_REACHED`].
+pub const DETAIL_CONNECTED: &str = "connected";
+/// `ProbeResultMsg::detail` of a connect probe that failed after the sandbox
+/// check or timed out (no denial seen).
+pub const DETAIL_CONNECT_REACHED: &str = "connect reached the network stack";
+/// Start of the `detail` of a connect probe whose `WSAStartup` failed (Windows;
+/// no connect was attempted). [`wsastartup_failed_detail`] builds the full text.
+pub const DETAIL_WSASTARTUP_FAILED: &str = "WSAStartup failed";
+
+/// The `detail` of a connect probe whose `WSAStartup` returned `code`.
+pub fn wsastartup_failed_detail(code: i64) -> String {
+    format!("{DETAIL_WSASTARTUP_FAILED} (code {code}), no connect attempted")
+}
+
 /// One probe attempt. Serialized in snake_case (`file_in_profile`, `clone3`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -472,6 +487,14 @@ mod tests {
             serde_json::from_value::<ProbeResultMsg>(params).unwrap(),
             res
         );
+    }
+
+    #[test]
+    fn wsastartup_detail_has_the_shared_prefix() {
+        let d = wsastartup_failed_detail(10107);
+        assert!(d.starts_with(DETAIL_WSASTARTUP_FAILED), "{d}");
+        assert!(d.contains("10107"), "{d}");
+        assert_ne!(DETAIL_CONNECTED, DETAIL_CONNECT_REACHED);
     }
 
     #[test]

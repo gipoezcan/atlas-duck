@@ -86,6 +86,10 @@ fn print_probe_evidence() {
     println!("PROBE_EVIDENCE threads={:?}", report.threads);
     println!("PROBE_EVIDENCE extra_layers={:?}", report.extra_layers);
     println!("PROBE_EVIDENCE identity={:?}", report.identity);
+    println!(
+        "PROBE_EVIDENCE control={:?} lpac_failed={:?}",
+        report.control, report.lpac_failed
+    );
     for record in &report.records {
         println!(
             "PROBE_EVIDENCE probe={} outcome={} evidence={:?}",

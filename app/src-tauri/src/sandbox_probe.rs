@@ -11,9 +11,11 @@ use std::thread::JoinHandle;
 
 use atlas_duck_ipc::paths::base_dirs;
 use atlas_duck_ipc::sandbox::probe::ProbeId;
-use atlas_duck_sandbox_host::platform_spawner;
-use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeConfig, ProbeReport, run_probes};
+use atlas_duck_sandbox_host::probe::{
+    FloorVerdict, ProbeConfig, ProbeReport, run_probes, run_probes_with_fallback,
+};
 use atlas_duck_sandbox_host::spawn::{SpawnHook, SpawnSpec, WorkerProcess, WorkerSpawner};
+use atlas_duck_sandbox_host::{fallback_spawner, platform_spawner};
 use tauri::Manager;
 
 use crate::state::AppState;
@@ -30,6 +32,9 @@ pub const PROBE_LOG_FIELDS: &[&str] = &[
     "engine_version",
     "worker_version",
     "ace",
+    "appcontainer_mode",
+    "control_ok",
+    "lpac_failed",
 ];
 
 /// Name of the background thread (§9.4: the probe runs off the startup path).
@@ -169,8 +174,25 @@ fn run_with_platform_spawner(cfg: &ProbeConfig) -> ProbeReport {
     #[cfg(not(target_os = "linux"))]
     let hook: Option<&dyn SpawnHook> = None;
 
+    // No worker file, nothing to spawn: `run_probes` fails every record at once
+    // and never uses the spawner, so do not open the platform's profile (on
+    // Windows `CreateAppContainerProfile` has stalled for ~2.7 s, measured).
+    if std::fs::metadata(&cfg.worker).is_err() {
+        return run_probes(
+            &FailingSpawner {
+                kind: io::ErrorKind::NotFound,
+                raw: None,
+            },
+            hook,
+            cfg,
+        );
+    }
     match platform_spawner() {
-        Ok(spawner) => run_probes(spawner.as_ref(), hook, cfg),
+        Ok(spawner) => {
+            // Windows: the LPAC floor first; when it is not met, the plain
+            // AppContainer floor, and the better of the two is reported.
+            run_probes_with_fallback(spawner.as_ref(), &fallback_spawner, hook, cfg)
+        }
         Err(e) => run_probes(&FailingSpawner::from_error(&e), hook, cfg),
     }
 }
@@ -330,10 +352,46 @@ pub fn ace_label(ace: Option<&AceEnsure>) -> &'static str {
     }
 }
 
+/// `lpac` or `appcontainer`: what the worker's own token said (Windows), or
+/// `n/a` when no worker reported one (every other OS, or no `probe.ready`).
+pub fn mode_label(report: &ProbeReport) -> &'static str {
+    match report.confinement.as_ref().and_then(|c| c.lpac) {
+        Some(true) => "lpac",
+        Some(false) => "appcontainer",
+        None => "n/a",
+    }
+}
+
+/// `true` or `false`: whether the Windows unconfined control held for every
+/// fact (listener, Winsock, credential read); `n/a` where no control ran.
+pub fn control_label(report: &ProbeReport) -> &'static str {
+    match &report.control {
+        Some(c) if c.ok() => "true",
+        Some(_) => "false",
+        None => "n/a",
+    }
+}
+
+/// The probes that failed under LPAC when the plain AppContainer fallback
+/// replaced the report (`connect_loopback+cred_read`), `n/a` otherwise.
+pub fn lpac_failed_label(report: &ProbeReport) -> String {
+    match &report.lpac_failed {
+        None => "n/a".to_owned(),
+        Some(failed) if failed.is_empty() => LABEL_NONE.to_owned(),
+        Some(failed) => failed
+            .iter()
+            .map(|p| probe_id_name(*p))
+            .collect::<Vec<_>>()
+            .join("+"),
+    }
+}
+
 /// Writes the one summary line:
 /// `event=sandbox_probe floor=<met|not_met> failed=<ids|none>
 /// extra_layers=<…|none> engine_version=<v|unknown> worker_version=<v|unknown>
-/// ace=<present|reapplied|missing_no_write_dac|n/a> dropped_fields=<n>`
+/// ace=<present|reapplied|missing_no_write_dac|n/a>
+/// appcontainer_mode=<lpac|appcontainer|n/a> control_ok=<true|false|n/a>
+/// lpac_failed=<ids|n/a> dropped_fields=<n>`
 /// (`dropped_fields` is appended by the diagnostic log's allowlist layer, T08).
 /// It holds no path: not the install dir, the worker, the profile or the
 /// binary identity (§7.7 metadata only).
@@ -348,5 +406,8 @@ pub fn log_probe_report(report: &ProbeReport, ace: Option<&AceEnsure>) {
         engine_version = report.engine_version.as_deref().unwrap_or(LABEL_UNKNOWN),
         worker_version = report.worker_version.as_deref().unwrap_or(LABEL_UNKNOWN),
         ace = ace_label(ace),
+        appcontainer_mode = mode_label(report),
+        control_ok = control_label(report),
+        lpac_failed = lpac_failed_label(report).as_str(),
     );
 }

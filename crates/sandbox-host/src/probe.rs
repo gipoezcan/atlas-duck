@@ -17,15 +17,16 @@
 //!   `per_probe_timeout`.
 
 use std::io;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use atlas_duck_ipc::sandbox::WORKER_FRAME_MAX_BYTES;
 use atlas_duck_ipc::sandbox::frame::write_frame;
 use atlas_duck_ipc::sandbox::probe::{
-    ConfinementReport, LOOPBACK_PROBE_ADDR, M_PROBE_READY, M_PROBE_RESULT, M_PROBE_RUN,
-    PUBLIC_PROBE_ADDR, ProbeId, ProbeOutcome, ProbeReady, ProbeRequest, ProbeResultMsg,
-    decode_notification, encode_notification,
+    ConfinementReport, DETAIL_CONNECTED, LOOPBACK_PROBE_ADDR, M_PROBE_READY, M_PROBE_RESULT,
+    M_PROBE_RUN, PUBLIC_PROBE_ADDR, ProbeId, ProbeOutcome, ProbeReady, ProbeRequest,
+    ProbeResultMsg, decode_notification, encode_notification,
 };
 use serde::Serialize;
 
@@ -34,6 +35,7 @@ use crate::spawn::{
     DEFAULT_PROCESS_MB, ExitKind, SpawnHook, SpawnSpec, ThreadConfinement, WorkerProcess,
     WorkerSpawner,
 };
+use crate::winscore::{ERROR_NOT_FOUND, WindowsControl, WindowsScoringContext, rescore};
 
 /// Default `ProbeConfig::per_probe_timeout` (plan value; the spec gives none).
 pub const DEFAULT_PER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -66,6 +68,11 @@ pub struct ProbeConfig {
     /// Upper bound for the whole of one probe (ready frame, result frame and
     /// exit share one deadline); 10 s by default.
     pub per_probe_timeout: Duration,
+    /// Windows scoring (§9.4): run a loopback listener and the unconfined
+    /// control, and score the probes that need them from that evidence (see
+    /// [`crate::winscore`]). On by default on Windows only; other OSes keep
+    /// the worker's own scoring. Tests turn it on with a fake spawner.
+    pub windows_controls: bool,
 }
 
 impl ProbeConfig {
@@ -76,6 +83,7 @@ impl ProbeConfig {
             app_pid,
             profile_path,
             per_probe_timeout: DEFAULT_PER_PROBE_TIMEOUT,
+            windows_controls: cfg!(windows),
         }
     }
 }
@@ -98,6 +106,20 @@ pub enum Evidence {
     SpawnFailed(i64),
     /// The worker sent no valid `probe.ready` frame.
     NoReady,
+    /// Windows `ConnectLoopback`, scored from the host's listener: whether a
+    /// connection `arrived`, and whether the controls proved the listener
+    /// reachable (`control_ok`). `Blocked` needs `arrived == false` and
+    /// `control_ok == true`.
+    ListenerArrival {
+        os_error: Option<i64>,
+        arrived: bool,
+        control_ok: bool,
+    },
+    /// Windows LPAC: the worker reported that the network stack
+    /// (`WSAStartup`) or the credential service (RPC) is unreachable with
+    /// `os_error`; `Blocked` only with `control_ok`, the unconfined control
+    /// that shows the same call works outside the sandbox.
+    StackUnavailable { os_error: i64, control_ok: bool },
 }
 
 /// Outcome of one probe.
@@ -142,6 +164,11 @@ pub struct ProbeReport {
     pub floor: FloorVerdict,
     /// Extra layers (not floor), e.g. `("landlock", true)`.
     pub extra_layers: Vec<(String, bool)>,
+    /// Windows: what the unconfined control found; `None` when none ran.
+    pub control: Option<WindowsControl>,
+    /// Windows fallback: the floor probes that failed under LPAC when this
+    /// report is the plain-AppContainer rerun that replaced it; `None` otherwise.
+    pub lpac_failed: Option<Vec<ProbeId>>,
 }
 
 /// Scores one probe from its result frame and the worker's exit.
@@ -220,6 +247,7 @@ pub fn run_probes(
         .collect();
 
     let file_id = file_identity(&cfg.worker);
+    let mut control = None;
     let runs: Vec<ProbeRun> = match (&file_id, cfg.profile_path.to_str()) {
         // A profile path that cannot be sent as a JSON string would be
         // altered by a lossy conversion and the probe would test another path.
@@ -235,10 +263,25 @@ pub fn run_probes(
                 .map(|&probe| ProbeRun::failed(probe, code))
                 .collect()
         }
-        (Ok(_), Some(profile_path)) => order
-            .iter()
-            .map(|&probe| run_one(spawner, hook, cfg, profile_path, probe))
-            .collect(),
+        (Ok(_), Some(profile_path)) => {
+            let listener = if cfg.windows_controls {
+                LoopbackListener::bind().ok()
+            } else {
+                None
+            };
+            let scoring = cfg.windows_controls.then(|| {
+                let c = run_control(spawner, cfg, profile_path, listener.as_ref());
+                control = Some(c);
+                Scoring {
+                    control: c,
+                    listener: listener.as_ref(),
+                }
+            });
+            order
+                .iter()
+                .map(|&probe| run_one(spawner, hook, cfg, profile_path, probe, scoring.as_ref()))
+                .collect()
+        }
     };
 
     let first_ready = runs.iter().find_map(|r| r.ready.clone());
@@ -269,6 +312,199 @@ pub fn run_probes(
         records: runs.into_iter().map(|r| r.record).collect(),
         floor,
         extra_layers,
+        control,
+        lpac_failed: None,
+    }
+}
+
+/// [`run_probes`] with the Windows fallback (§9.4): the floor is first run with
+/// `spawner` (LPAC where every ACE exists). If that floor is `NotMet` and the
+/// worker really ran as LPAC, and `fallback` yields a spawner (plain
+/// AppContainer; it is only called then), the whole floor runs again with it. The rerun's report is returned
+/// when its floor is `Met` and its worker reported `lpac == false`; its
+/// `lpac_failed` then names what failed under LPAC. Otherwise the first report
+/// is returned unchanged, so the verdict is never weaker than the first run's.
+pub fn run_probes_with_fallback(
+    spawner: &dyn WorkerSpawner,
+    fallback: &dyn Fn() -> Option<Box<dyn WorkerSpawner>>,
+    hook: Option<&dyn SpawnHook>,
+    cfg: &ProbeConfig,
+) -> ProbeReport {
+    let first = run_probes(spawner, hook, cfg);
+    let lpac_failed = match &first.floor {
+        FloorVerdict::NotMet { failed }
+            if first.confinement.as_ref().and_then(|c| c.lpac) == Some(true) =>
+        {
+            failed.clone()
+        }
+        _ => return first,
+    };
+    let Some(fallback) = fallback() else {
+        return first;
+    };
+    let mut second = run_probes(fallback.as_ref(), hook, cfg);
+    let plain = second.confinement.as_ref().and_then(|c| c.lpac) == Some(false);
+    if second.floor == FloorVerdict::Met && plain {
+        second.lpac_failed = Some(lpac_failed);
+        second
+    } else {
+        first
+    }
+}
+
+/// How long the unconfined control may take in all (it runs two quick probes).
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the host looks for a late arrival after a loopback probe ended. The
+/// stack queues a completed handshake at once, so this only covers scheduling.
+const ARRIVAL_GRACE: Duration = Duration::from_millis(200);
+
+/// How long the host waits for a connection it expects at the listener.
+const ACCEPT_WAIT: Duration = Duration::from_secs(1);
+
+/// A loopback listener on an ephemeral port, owned by the host for one probe
+/// run. A connection that completes the TCP handshake is queued by the stack
+/// and shows up in [`LoopbackListener::drain`].
+struct LoopbackListener {
+    listener: TcpListener,
+    addr: SocketAddr,
+}
+
+impl LoopbackListener {
+    fn bind() -> io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        Ok(Self { listener, addr })
+    }
+
+    /// Accepts every queued connection and returns how many there were.
+    fn drain(&self) -> usize {
+        let mut n = 0;
+        while self.listener.accept().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    /// `drain() > 0`, waiting up to `wait` for the first connection.
+    fn arrived_within(&self, wait: Duration) -> bool {
+        let deadline = Instant::now() + wait;
+        loop {
+            if self.drain() > 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The host connects to its own listener and sees it accept: the proof
+    /// that "no connection arrived" can be observed at all.
+    fn self_check(&self) -> bool {
+        let _ = self.drain();
+        let Ok(_stream) = TcpStream::connect_timeout(&self.addr, Duration::from_secs(2)) else {
+            return false;
+        };
+        self.arrived_within(ACCEPT_WAIT)
+    }
+}
+
+/// The host's evidence for [`rescore`]: the control result and the listener.
+struct Scoring<'a> {
+    control: WindowsControl,
+    listener: Option<&'a LoopbackListener>,
+}
+
+/// The unconfined control (Windows): the same worker binary, started without
+/// any confinement, runs `ConnectLoopback` against the host listener and
+/// `CredRead` of the probe's nonexistent target. Winsock must initialise and
+/// the connection must arrive, and the credential read must give the normal
+/// `ERROR_NOT_FOUND`; each fact that holds is recorded. Anything else (no
+/// listener, no control spawn, a timeout, a wrong answer) leaves that fact
+/// `false`, which fails the probes that depend on it closed.
+fn run_control(
+    spawner: &dyn WorkerSpawner,
+    cfg: &ProbeConfig,
+    profile_path: &str,
+    listener: Option<&LoopbackListener>,
+) -> WindowsControl {
+    let Some(listener) = listener else {
+        return WindowsControl::FAILED;
+    };
+    let mut control = WindowsControl {
+        listener: listener.self_check(),
+        winsock: false,
+        cred: false,
+    };
+    let spec = SpawnSpec {
+        exe: cfg.worker.clone(),
+        process_mb: DEFAULT_PROCESS_MB,
+    };
+    let Ok(mut worker) = spawner.spawn_control(&spec) else {
+        return control;
+    };
+    let deadline = Instant::now() + CONTROL_TIMEOUT;
+    let ready = matches!(
+        worker.read_frame_timeout(WORKER_FRAME_MAX_BYTES, remaining(deadline)),
+        Ok(Some(bytes)) if parse_ready(&bytes).is_some()
+    );
+    if !ready {
+        kill_and_reap(worker.as_mut());
+        return control;
+    }
+    let _ = listener.drain();
+    let addr = listener.addr.to_string();
+    {
+        let mut stdin = worker.stdin();
+        for probe in [ProbeId::ConnectLoopback, ProbeId::CredRead] {
+            let payload =
+                encode_notification(M_PROBE_RUN, &request(cfg, profile_path, probe, &addr));
+            if write_frame(&mut stdin, &payload)
+                .and_then(|()| stdin.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    worker.close_stdin();
+    let mut results = Vec::new();
+    for probe in [ProbeId::ConnectLoopback, ProbeId::CredRead] {
+        match worker.read_frame_timeout(WORKER_FRAME_MAX_BYTES, remaining(deadline)) {
+            Ok(Some(bytes)) => results.push(parse_result(&bytes, probe)),
+            _ => break,
+        }
+    }
+    kill_and_reap(worker.as_mut());
+    if let Some(Some(net)) = results.first() {
+        let connected = net.outcome == ProbeOutcome::Allowed
+            && net.os_error.is_none()
+            && net.detail.as_deref() == Some(DETAIL_CONNECTED);
+        control.winsock = connected && listener.arrived_within(ACCEPT_WAIT);
+    }
+    if let Some(Some(cred)) = results.get(1) {
+        control.cred =
+            cred.outcome == ProbeOutcome::Allowed && cred.os_error == Some(ERROR_NOT_FOUND);
+    }
+    control
+}
+
+fn request(
+    cfg: &ProbeConfig,
+    profile_path: &str,
+    probe: ProbeId,
+    loopback_addr: &str,
+) -> ProbeRequest {
+    ProbeRequest {
+        probe,
+        app_pid: cfg.app_pid,
+        profile_path: profile_path.to_owned(),
+        public_addr: PUBLIC_PROBE_ADDR.to_string(),
+        loopback_addr: loopback_addr.to_owned(),
+        handle_value: None,
     }
 }
 
@@ -334,6 +570,7 @@ fn run_one(
     cfg: &ProbeConfig,
     profile_path: &str,
     probe: ProbeId,
+    scoring: Option<&Scoring<'_>>,
 ) -> ProbeRun {
     let spec = SpawnSpec {
         exe: cfg.worker.clone(),
@@ -364,14 +601,17 @@ fn run_one(
     let threads = hook.and_then(|h| h.after_ready(worker.pid()));
 
     // 3. probe.run, then EOF so the worker exits after answering
-    let request = ProbeRequest {
-        probe,
-        app_pid: cfg.app_pid,
-        profile_path: profile_path.to_owned(),
-        public_addr: PUBLIC_PROBE_ADDR.to_string(),
-        loopback_addr: LOOPBACK_PROBE_ADDR.to_string(),
-        handle_value: None,
-    };
+    // Windows: the loopback probe connects to the host's own listener, so that
+    // a connection that arrives (or does not) is evidence.
+    let listener = scoring
+        .and_then(|s| s.listener)
+        .filter(|_| probe == ProbeId::ConnectLoopback);
+    let loopback_addr =
+        listener.map_or_else(|| LOOPBACK_PROBE_ADDR.to_string(), |l| l.addr.to_string());
+    let request = request(cfg, profile_path, probe, &loopback_addr);
+    if let Some(l) = listener {
+        let _ = l.drain();
+    }
     let payload = encode_notification(M_PROBE_RUN, &request);
     {
         let mut stdin = worker.stdin();
@@ -403,7 +643,17 @@ fn run_one(
         }
     };
 
-    let (outcome, evidence) = score(probe, msg.as_ref(), exit);
+    let (mut outcome, mut evidence) = score(probe, msg.as_ref(), exit);
+    if let (Some(scoring), Some(m)) = (scoring, msg.as_ref()) {
+        let ctx = WindowsScoringContext {
+            lpac: ready.confinement.lpac,
+            control: Some(scoring.control),
+            loopback_arrived: listener.map(|l| l.arrived_within(ARRIVAL_GRACE)),
+        };
+        if let Some(scored) = rescore(probe, m, &ctx) {
+            (outcome, evidence) = scored;
+        }
+    }
     ProbeRun {
         record: ProbeRecord {
             probe,

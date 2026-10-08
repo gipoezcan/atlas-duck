@@ -719,11 +719,19 @@ mod t21 {
     }
 
     #[test]
-    fn windows_script_records_the_floor_instead_of_failing_on_not_met() {
-        // T19 measured the Windows floor as NotMet: the leg records floor=/failed= and asserts
-        // only what the installer owns (ACEs, location, ace=, WER).
+    fn windows_script_asserts_the_floor_is_met() {
+        // The Windows floor is met (host-scored LPAC controls, or the plain AppContainer
+        // fallback): the leg asserts floor=met failed=none next to what the installer owns
+        // (ACEs, location, ace=, WER), and records the mode and the control.
         let text = script("install-probe-windows.ps1");
-        assert!(text.contains("-RecordFloor"));
+        assert!(
+            !text.contains("-RecordFloor"),
+            "the Windows leg must not skip the floor assertion"
+        );
+        assert!(text.contains("-ne 'met'"), "floor=met is not asserted");
+        assert!(text.contains("-ne 'none'"), "failed=none is not asserted");
+        assert!(text.contains("appcontainer_mode"));
+        assert!(text.contains("control_ok"));
         assert!(text.contains("PROBE_RECORD"));
         assert!(text.contains("EVIDENCE_JSON"));
     }

@@ -15,10 +15,27 @@ pub mod probe;
 pub mod spawn;
 #[cfg(windows)]
 pub mod windows;
+pub mod winscore;
 
 use std::io;
 
 use crate::spawn::WorkerSpawner;
+
+/// The fallback spawner of §9.4, tried when the floor is not met with
+/// [`platform_spawner`]: Windows only, a plain AppContainer (never LPAC). `None`
+/// on every other OS, and when the profile cannot be opened.
+pub fn fallback_spawner() -> Option<Box<dyn WorkerSpawner>> {
+    #[cfg(windows)]
+    {
+        windows::WindowsSpawner::new_plain()
+            .ok()
+            .map(|s| Box::new(s) as Box<dyn WorkerSpawner>)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
 
 /// The spawner for the running OS (§3.4: a dedicated platform routine, never
 /// `std::process::Command`).

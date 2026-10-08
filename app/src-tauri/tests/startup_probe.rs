@@ -52,9 +52,9 @@ fn scratch_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
-/// Windows: `ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET=1` makes a `Met` floor mandatory. CI
-/// must not set it until a Windows floor is proven (T19 measured LPAC NotMet:
-/// WSAStartup and CredRead fail).
+/// Windows: `ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET=1` makes a `Met` floor mandatory. CI's
+/// windows-2022 jobs and the dev box set it: the host scores the LPAC Winsock / RPC
+/// failures and the loopback timeout from controls (sandbox-host `winscore`).
 #[cfg(windows)]
 fn expect_floor_met() -> bool {
     std::env::var_os("ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET").is_some_and(|v| v == "1")
@@ -107,6 +107,8 @@ fn empty_report(floor: FloorVerdict) -> ProbeReport {
         records: vec![],
         floor,
         extra_layers: vec![],
+        control: None,
+        lpac_failed: None,
     }
 }
 
@@ -504,7 +506,8 @@ fn the_log_line_has_exactly_the_planned_fields() {
         line.ends_with(
             "event=sandbox_probe floor=not_met failed=file_in_profile+mem_read_proc_mem \
              extra_layers=landlock:on engine_version=0.16.2 \
-             worker_version=0.1.0+abcdef123456 ace=n/a dropped_fields=0"
+             worker_version=0.1.0+abcdef123456 ace=n/a appcontainer_mode=n/a control_ok=n/a \
+             lpac_failed=n/a dropped_fields=0"
         ),
         "{line}"
     );
@@ -523,9 +526,58 @@ fn the_log_line_has_exactly_the_planned_fields() {
     assert!(
         met.trim_end().ends_with(
             "event=sandbox_probe floor=met failed=none extra_layers=none \
-             engine_version=unknown worker_version=unknown ace=n/a dropped_fields=0"
+             engine_version=unknown worker_version=unknown ace=n/a appcontainer_mode=n/a \
+             control_ok=n/a lpac_failed=n/a dropped_fields=0"
         ),
         "{met}"
+    );
+}
+
+#[test]
+fn the_log_line_names_the_windows_mode_control_and_lpac_fallback() {
+    use atlas_duck_ipc::sandbox::probe::ConfinementReport;
+    use atlas_duck_sandbox_host::winscore::WindowsControl;
+
+    fn confinement(lpac: bool) -> Option<ConfinementReport> {
+        Some(ConfinementReport {
+            applied: true,
+            mechanism: "appcontainer".to_owned(),
+            no_new_privs: None,
+            landlock_abi: None,
+            seccomp: None,
+            lpac: Some(lpac),
+            os_error: None,
+        })
+    }
+    let mut report = empty_report(FloorVerdict::Met);
+    report.confinement = confinement(false);
+    report.control = Some(WindowsControl {
+        listener: true,
+        winsock: true,
+        cred: true,
+    });
+    report.lpac_failed = Some(vec![ProbeId::ConnectLoopback, ProbeId::CredRead]);
+    let out = capture(|| log_probe_report(&report, None));
+    assert!(
+        out.trim_end().ends_with(
+            "ace=n/a appcontainer_mode=appcontainer control_ok=true \
+             lpac_failed=connect_loopback+cred_read dropped_fields=0"
+        ),
+        "{out}"
+    );
+
+    report.confinement = confinement(true);
+    report.lpac_failed = None;
+    report.control = Some(WindowsControl {
+        cred: false,
+        ..report.control.unwrap()
+    });
+    let out = capture(|| log_probe_report(&report, None));
+    assert!(
+        out.trim_end().ends_with(
+            "ace=n/a appcontainer_mode=lpac control_ok=false lpac_failed=n/a dropped_fields=0"
+        ),
+        "{out}"
     );
 }
 

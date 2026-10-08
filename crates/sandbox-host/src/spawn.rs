@@ -74,6 +74,15 @@ pub trait WorkerProcess {
 pub trait WorkerSpawner {
     /// Spawns one worker. An error means no process exists.
     fn spawn(&self, spec: &SpawnSpec) -> io::Result<Box<dyn WorkerProcess>>;
+
+    /// Windows scoring control (§9.4): the same worker started WITHOUT any
+    /// confinement. The probe runner uses it only to run a few probes whose
+    /// answer outside the sandbox is the control for the confined answer
+    /// (see [`crate::winscore`]); its `probe.ready` is not evidence of
+    /// anything. The default is `Unsupported`; only the Windows spawner has it.
+    fn spawn_control(&self, _spec: &SpawnSpec) -> io::Result<Box<dyn WorkerProcess>> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
 }
 
 /// Host-side check that runs after the worker sent `probe.ready` (so it has

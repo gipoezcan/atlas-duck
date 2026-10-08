@@ -69,9 +69,23 @@ fn stage(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// How a worker is started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Confinement {
+    /// AppContainer; LPAC when every file has the `S-1-15-2-2` ACE.
+    Default,
+    /// AppContainer, never LPAC (the fallback of section 9.4).
+    PlainAppContainer,
+    /// No AppContainer, no ACE check: the scoring control only (the probe
+    /// runner runs a few probes unconfined to see what a normal answer is). It
+    /// is still in its own job.
+    Unconfined,
+}
+
 /// Starts workers in the AppContainer `atlas-duck.sandbox`.
 pub struct WindowsSpawner {
     container: AppContainer,
+    plain: bool,
 }
 
 impl WindowsSpawner {
@@ -81,6 +95,17 @@ impl WindowsSpawner {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             container: AppContainer::open(APPCONTAINER_NAME)?,
+            plain: false,
+        })
+    }
+
+    /// Like [`WindowsSpawner::new`], but every worker is a plain AppContainer
+    /// (never LPAC), even when every file has the `S-1-15-2-2` ACE. This is the
+    /// fallback of section 9.4 when the LPAC floor is not met.
+    pub fn new_plain() -> io::Result<Self> {
+        Ok(Self {
+            plain: true,
+            ..Self::new()?
         })
     }
 
@@ -92,6 +117,21 @@ impl WindowsSpawner {
     /// Like [`WorkerSpawner::spawn`] but returns the concrete worker, which
     /// exposes the job and the LPAC decision (the T19 tests read them).
     pub fn spawn_process(&self, spec: &SpawnSpec) -> io::Result<WindowsProcess> {
+        let confinement = if self.plain {
+            Confinement::PlainAppContainer
+        } else {
+            Confinement::Default
+        };
+        self.spawn_with(spec, confinement)
+    }
+
+    /// The scoring control: the worker without AppContainer (see
+    /// [`Confinement::Unconfined`]).
+    pub fn spawn_unconfined(&self, spec: &SpawnSpec) -> io::Result<WindowsProcess> {
+        self.spawn_with(spec, Confinement::Unconfined)
+    }
+
+    fn spawn_with(&self, spec: &SpawnSpec, confinement: Confinement) -> io::Result<WindowsProcess> {
         if spec.process_mb == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -103,11 +143,18 @@ impl WindowsSpawner {
         // 1. ACEs: a plain AppContainer needs S-1-15-2-1 on every file; LPAC
         //    additionally S-1-15-2-2. Without them the worker would not load,
         //    so fail here instead of falling back to anything weaker.
-        let files = worker_ace_files_for_exe(&exe).map_err(stage("worker_ace_files_for_exe"))?;
-        let lpac = match check_aces(&files).map_err(stage("check_aces"))? {
-            AceStatus::AllPresent { lpac_ready } => lpac_ready,
-            AceStatus::Missing(_) => {
-                return Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+        let lpac = if confinement == Confinement::Unconfined {
+            false
+        } else {
+            let files =
+                worker_ace_files_for_exe(&exe).map_err(stage("worker_ace_files_for_exe"))?;
+            match check_aces(&files).map_err(stage("check_aces"))? {
+                AceStatus::AllPresent { lpac_ready } => {
+                    lpac_ready && confinement == Confinement::Default
+                }
+                AceStatus::Missing(_) => {
+                    return Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32));
+                }
             }
         };
 
@@ -124,8 +171,9 @@ impl WindowsSpawner {
             child.stdout.as_raw_handle().cast(),
             child.stderr.as_raw_handle().cast(),
         ];
-        let mut attrs = ProcAttrs::new(handles, self.container.sid(), job.raw(), lpac)
-            .map_err(stage("ProcAttrs::new"))?;
+        let sid = (confinement != Confinement::Unconfined).then(|| self.container.sid());
+        let mut attrs =
+            ProcAttrs::new(handles, sid, job.raw(), lpac).map_err(stage("ProcAttrs::new"))?;
         let env = environment_block(self.container.local_app_data())
             .map_err(stage("environment_block"))?;
         let mut cmdline = wide(OsStr::new(&format!("\"{}\"", exe.display())));
@@ -204,6 +252,10 @@ impl WindowsSpawner {
 impl WorkerSpawner for WindowsSpawner {
     fn spawn(&self, spec: &SpawnSpec) -> io::Result<Box<dyn WorkerProcess>> {
         Ok(Box::new(self.spawn_process(spec)?))
+    }
+
+    fn spawn_control(&self, spec: &SpawnSpec) -> io::Result<Box<dyn WorkerProcess>> {
+        Ok(Box::new(self.spawn_unconfined(spec)?))
     }
 }
 
@@ -399,13 +451,21 @@ struct ProcAttrs {
     buf: Vec<u64>,
     _handles: Box<[HANDLE; 3]>,
     _caps: Box<SECURITY_CAPABILITIES>,
+    with_caps: bool,
     _jobs: Box<[HANDLE; 1]>,
     _policy: Box<u32>,
 }
 
 impl ProcAttrs {
-    fn new(handles: [HANDLE; 3], sid: *mut c_void, job: HANDLE, lpac: bool) -> io::Result<Self> {
-        let count: u32 = if lpac { 4 } else { 3 };
+    /// `sid = None` leaves out `SECURITY_CAPABILITIES`: no AppContainer (the
+    /// unconfined scoring control); `lpac` is then `false`.
+    fn new(
+        handles: [HANDLE; 3],
+        sid: Option<*mut c_void>,
+        job: HANDLE,
+        lpac: bool,
+    ) -> io::Result<Self> {
+        let count: u32 = 2 + u32::from(sid.is_some()) + u32::from(lpac);
         let mut size = 0usize;
         // SAFETY: the documented size query: NULL list, valid size pointer.
         // The call fails with ERROR_INSUFFICIENT_BUFFER and sets `size`.
@@ -422,8 +482,9 @@ impl ProcAttrs {
         let mut me = Self {
             buf,
             _handles: Box::new(handles),
+            with_caps: sid.is_some(),
             _caps: Box::new(SECURITY_CAPABILITIES {
-                AppContainerSid: sid,
+                AppContainerSid: sid.unwrap_or(null_mut()),
                 Capabilities: null_mut(),
                 CapabilityCount: 0,
                 Reserved: 0,
@@ -451,12 +512,14 @@ impl ProcAttrs {
             me._handles.as_ptr().cast(),
             std::mem::size_of::<[HANDLE; 3]>(),
         )?;
-        update(
-            "SECURITY_CAPABILITIES",
-            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-            (&*me._caps as *const SECURITY_CAPABILITIES).cast(),
-            std::mem::size_of::<SECURITY_CAPABILITIES>(),
-        )?;
+        if me.with_caps {
+            update(
+                "SECURITY_CAPABILITIES",
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+                (&*me._caps as *const SECURITY_CAPABILITIES).cast(),
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+            )?;
+        }
         update(
             "JOB_LIST",
             PROC_THREAD_ATTRIBUTE_JOB_LIST,
