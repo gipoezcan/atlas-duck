@@ -13,5 +13,7 @@ pub mod http_factory;
 pub mod lifecycle;
 /// Proxy resolution (L42) and the per-OS static proxy readers (V17).
 pub mod proxy;
+/// Redaction engine: drops with copies and mirrors, masks in the canonical match form (§5.3).
+pub mod redact;
 /// Static params validation: schema, field rules, caps, move limit, `min_version` (§2.3, §5.2).
 pub mod validate;

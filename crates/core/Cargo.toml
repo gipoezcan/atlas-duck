@@ -14,6 +14,9 @@ atlas-duck-audit = { path = "../audit" }
 atlas-duck-ipc = { path = "../ipc" }
 toml_edit = { workspace = true }
 jsonschema = { workspace = true }
+html-escape = { workspace = true }
+icu_normalizer = { workspace = true }
+percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

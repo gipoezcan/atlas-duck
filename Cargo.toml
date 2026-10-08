@@ -83,6 +83,8 @@ emojis = "=0.9.0"
 url = "=2.5.8"
 icu_casemap = "=2.3.0"
 percent-encoding = "=2.3.2"
+# M3 redaction views (Task 14): HTML named/decimal/hex character references (§5.3 canonical match form).
+html-escape = "=0.2.15"
 # M3 atlassian HTTP client (Task 9). No default features: they would bring `system-proxy`
 # (reads OS/env proxies, L42), http2, charset and the aws-lc-rs provider (licence not allowed).
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider"] }
