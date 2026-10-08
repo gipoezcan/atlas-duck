@@ -379,6 +379,11 @@ mod t21 {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
+    /// `app/src-tauri` -> repository root.
+    fn repo_root() -> PathBuf {
+        src_tauri().join("..").join("..")
+    }
+
     fn read_text(path: &Path) -> String {
         std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
@@ -420,7 +425,8 @@ mod t21 {
         );
         // T12's install mode stays: both NSIS modes need the hook (§12.2).
         assert_eq!(
-            c.pointer("/bundle/windows/nsis/installMode").and_then(Value::as_str),
+            c.pointer("/bundle/windows/nsis/installMode")
+                .and_then(Value::as_str),
             Some("both")
         );
     }
@@ -456,13 +462,19 @@ mod t21 {
             .iter()
             .map(|s| (*s).to_owned())
             .collect();
-        assert_eq!(sids, expected, "hooks.nsh must name exactly the two (L)PAC group SIDs");
+        assert_eq!(
+            sids, expected,
+            "hooks.nsh must name exactly the two (L)PAC group SIDs"
+        );
         // every permission group is (RX): never write, modify, full or delete
         let mut rest = code.as_str();
         let mut groups = 0;
         while let Some(at) = rest.find(":(") {
             let tail = &rest[at + 1..];
-            assert!(tail.starts_with("(RX)"), "hooks.nsh grants something other than (RX): {tail:.12}");
+            assert!(
+                tail.starts_with("(RX)"),
+                "hooks.nsh grants something other than (RX): {tail:.12}"
+            );
             groups += 1;
             rest = &tail[4..];
         }
@@ -472,9 +484,18 @@ mod t21 {
     #[test]
     fn hooks_cover_the_worker_and_the_dlls_next_to_it() {
         let code = hooks_code();
-        assert!(code.contains(WORKER_EXE), "hooks.nsh does not name {WORKER_EXE}");
-        assert!(code.contains("*.dll"), "hooks.nsh does not walk the DLLs in $INSTDIR");
-        assert!(code.contains("$INSTDIR"), "hooks.nsh must act on the install directory");
+        assert!(
+            code.contains(WORKER_EXE),
+            "hooks.nsh does not name {WORKER_EXE}"
+        );
+        assert!(
+            code.contains("*.dll"),
+            "hooks.nsh does not walk the DLLs in $INSTDIR"
+        );
+        assert!(
+            code.contains("$INSTDIR"),
+            "hooks.nsh must act on the install directory"
+        );
     }
 
     #[test]
@@ -532,6 +553,195 @@ mod t21 {
             assert!(
                 !candidate.eq_ignore_ascii_case(DATA_DIR_NAME),
                 "per-user install dir %LOCALAPPDATA%\\{candidate} equals the data dir"
+            );
+        }
+    }
+
+    fn workflow() -> String {
+        read_text(
+            &repo_root()
+                .join(".github")
+                .join("workflows")
+                .join("install-probes.yml"),
+        )
+    }
+
+    fn script(name: &str) -> String {
+        read_text(&repo_root().join("ci").join(name))
+    }
+
+    #[test]
+    fn install_probes_workflow_defines_the_seven_jobs_in_order() {
+        let text = workflow();
+        let jobs: Vec<&str> = text
+            .lines()
+            .skip_while(|l| *l != "jobs:")
+            .skip(1)
+            .filter(|l| l.starts_with("  ") && !l.starts_with("   ") && l.trim_end().ends_with(':'))
+            .map(|l| l.trim().trim_end_matches(':'))
+            .collect();
+        assert_eq!(
+            jobs,
+            [
+                "windows-per-user",
+                "windows-per-machine",
+                "macos-arm64",
+                "macos-x86_64-rosetta",
+                "ubuntu-deb",
+                "ubuntu-appimage",
+                "fedora-rpm",
+            ]
+        );
+    }
+
+    #[test]
+    fn install_probes_workflow_consumes_the_bundle_workflow_artifacts() {
+        let text = workflow();
+        assert!(
+            text.contains("workflows: [bundle]"),
+            "the workflow must follow the bundle workflow"
+        );
+        for artifact in [
+            "bundle-x86_64-pc-windows-msvc",
+            "bundle-aarch64-apple-darwin",
+            "bundle-x86_64-apple-darwin",
+            "bundle-x86_64-unknown-linux-gnu",
+        ] {
+            assert!(
+                text.contains(&format!("name: {artifact}")),
+                "no download of {artifact}"
+            );
+        }
+        assert!(
+            text.contains("run-id:"),
+            "artifacts of another run need run-id"
+        );
+        assert!(
+            text.contains("actions: read"),
+            "downloading another run's artifacts needs actions: read"
+        );
+    }
+
+    #[test]
+    fn install_probes_workflow_runs_each_script_in_the_right_mode() {
+        let text = workflow();
+        for command in [
+            "./ci/install-probe-windows.ps1 -Mode CurrentUser -InstallerDir dist",
+            "./ci/install-probe-windows.ps1 -Mode AllUsers -InstallerDir dist",
+            "/bin/bash ci/install-probe-macos.sh dist arm64",
+            "/bin/bash ci/install-probe-macos.sh dist x86_64",
+            "bash ci/install-probe-linux.sh deb dist",
+            "bash ci/install-probe-linux.sh appimage dist",
+            "bash ci/install-probe-linux.sh rpm dist",
+        ] {
+            assert!(
+                text.contains(command),
+                "the workflow never runs `{command}`"
+            );
+        }
+        // the Fedora job is a container, and the fixture refuses to run without CI=true
+        assert!(text.contains("fedora:40"));
+        assert!(text.contains("--env CI=true"));
+    }
+
+    #[test]
+    fn install_probes_workflow_checks_out_the_bundled_commit_without_credentials_or_secrets() {
+        // C17: workflow_run executes the PR head's scripts with a token. The checkout is the
+        // bundled commit (A39: a manual run names it), credentials are not persisted, no secret
+        // is used, forks are skipped and the token is read-only.
+        let text = workflow();
+        let checkouts = text.matches("uses: actions/checkout@").count();
+        assert_eq!(checkouts, 7, "one checkout per job");
+        assert_eq!(
+            text.matches("ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}")
+                .count(),
+            7,
+            "every checkout must be pinned to the bundle run's head sha"
+        );
+        assert_eq!(text.matches("persist-credentials: false").count(), 7);
+        assert!(
+            text.contains("bundle_sha:"),
+            "a manual run must name the bundled commit"
+        );
+        assert!(!text.contains("secrets."), "the probes need no secret");
+        assert!(!text.contains("contents: write") && !text.contains("actions: write"));
+        assert!(
+            text.contains(
+                "github.event.workflow_run.head_repository.full_name == github.repository"
+            ),
+            "a workflow_run from a fork must not execute here"
+        );
+    }
+
+    #[test]
+    fn probe_scripts_poll_the_diag_log_for_the_sandbox_probe_line() {
+        for name in [
+            "install-probe-windows.ps1",
+            "install-probe-macos.sh",
+            "install-probe-linux.sh",
+        ] {
+            let text = script(name);
+            assert!(
+                text.contains("sandbox_probe"),
+                "{name} never looks for event=sandbox_probe"
+            );
+            assert!(text.contains("diag.log"), "{name} never reads diag.log");
+            assert!(text.contains("floor"), "{name} never checks the floor");
+            assert!(text.contains("60"), "{name} has no 60 s polling budget");
+            assert!(
+                text.contains("pinned-fixture"),
+                "{name} does not use the CI pinned fixture"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_script_covers_both_install_modes_the_aces_and_the_wer_exclusions() {
+        let text = script("install-probe-windows.ps1");
+        for needle in [
+            "'CurrentUser'",
+            "'AllUsers'",
+            "'/S'",
+            SID_ALL_APP_PACKAGES,
+            SID_ALL_RESTRICTED_APP_PACKAGES,
+            "'reapplied'",
+            "ExcludedApplications",
+            "atlas-duck-app.exe",
+            WORKER_EXE,
+        ] {
+            assert!(
+                text.contains(needle),
+                "install-probe-windows.ps1 lacks {needle}"
+            );
+        }
+        // the ACE check must not depend on localized icacls output
+        assert!(text.contains("SecurityIdentifier"));
+    }
+
+    #[test]
+    fn windows_script_records_the_floor_instead_of_failing_on_not_met() {
+        // T19 measured the Windows floor as NotMet: the leg records floor=/failed= and asserts
+        // only what the installer owns (ACEs, location, ace=, WER).
+        let text = script("install-probe-windows.ps1");
+        assert!(text.contains("-RecordFloor"));
+        assert!(text.contains("PROBE_RECORD"));
+        assert!(text.contains("EVIDENCE_JSON"));
+    }
+
+    #[test]
+    fn macos_script_never_treats_a_bare_floor_met_as_proof() {
+        // T18 ruling: floor=met proves the task-port probe only with an informative unconfined
+        // control; otherwise the leg reports FLOOR_INCONCLUSIVE.
+        let text = script("install-probe-macos.sh");
+        for needle in [
+            "task_for_pid_informative",
+            "FLOOR_INCONCLUSIVE",
+            "classify_verdict",
+            "unconfined_kr",
+        ] {
+            assert!(
+                text.contains(needle),
+                "install-probe-macos.sh lacks {needle}"
             );
         }
     }

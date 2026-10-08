@@ -1,0 +1,357 @@
+name: install-probes
+
+# Installed-package probes (spec 9.4, 12.2, 13 "Scripts-enabled matrix", 14 M1 spike): every
+# shipped package is installed fresh from the artifacts of the `bundle` workflow (T12), the
+# installed app is started with `--background` against a CI pinned-paths fixture, and its
+# `event=sandbox_probe` line in <data>/logs/diag.log is read.
+#
+#   windows-per-user      NSIS  setup.exe /S /CurrentUser   ACEs by the installer hook, re-apply, WER;
+#                                                           the floor verdict is RECORDED, not asserted
+#   windows-per-machine   NSIS  setup.exe /S /AllUsers      ACEs by the installer hook, WER; floor recorded
+#   macos-arm64           dmg -> /Applications, ad-hoc signed, hardened runtime
+#   macos-x86_64-rosetta  dmg (x86_64) -> /Applications, runs translated on the arm64 runner
+#   ubuntu-deb            apt install of the .deb
+#   ubuntu-appimage       the AppImage through the FUSE runtime
+#   fedora-rpm            dnf install of the .rpm in a fedora:40 container, tray_host=missing
+#
+# The record is the JOB LOG (T22 reads the logs): each probe step prints the full sandbox_probe
+# line and a final PROBE_RECORD line (Windows also EVIDENCE_JSON). The evidence directory is
+# uploaded as artifact install-probe-<job> as a copy.
+#
+# Result values. Windows: the floor is not met by measurement (T19), so the legs record floor= and
+# failed= and fail only on the installer's own duties (ACEs, location, ace=, WER). macOS: a bare
+# `floor=met` is no proof (T18); the leg passes as proven only with an informative unconfined
+# task_for_pid control, otherwise it prints FLOOR_INCONCLUSIVE and an INCONCLUSIVE line (the job
+# stays green, the log says it is not a proof). Linux: floor=met is asserted.
+#
+# The run of a script with "Allow scripts with degraded confinement" off is M8's half of the
+# matrix; the upgrade drain and the uninstall checks are M10.
+#
+# Security (workflow_run executes the scripts of the commit it follows): the token is read-only
+# (contents, actions), no secret is used, checkout does not persist credentials, the commit is the
+# bundle run's head sha, and a workflow_run from a fork is skipped.
+#
+# workflow_run only fires for the copy of this file on the default branch. Before it is merged,
+# start it by hand: gh workflow run install-probes.yml --ref <branch> -f bundle_run_id=<id of a
+# successful bundle run> -f bundle_sha=<head sha of that bundle run>. bundle_sha pins the checkout
+# to the commit that was bundled, so the scripts match the packages.
+
+on:
+  workflow_run:
+    workflows: [bundle]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      bundle_run_id:
+        description: "Id of a successful run of the bundle workflow whose bundle-* artifacts are probed"
+        required: true
+        type: string
+      bundle_sha:
+        description: "Head sha of that bundle run (the commit that was bundled; the checkout is pinned to it)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  windows-per-user:
+    name: windows-per-user (NSIS /CurrentUser on windows-2022)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-pc-windows-msvc
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-pc-windows-msvc
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the probe script
+        shell: pwsh
+        run: ./ci/install-probe-windows.ps1 -SelfTest
+
+      - name: Install per user, start the app, record the sandbox_probe line, re-apply a removed ACE
+        shell: pwsh
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}\install-probe-evidence
+        run: ./ci/install-probe-windows.ps1 -Mode CurrentUser -InstallerDir dist
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-probe-windows-per-user
+          path: ${{ runner.temp }}\install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  windows-per-machine:
+    name: windows-per-machine (NSIS /AllUsers on windows-2022)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-pc-windows-msvc
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-pc-windows-msvc
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the probe script
+        shell: pwsh
+        run: ./ci/install-probe-windows.ps1 -SelfTest
+
+      - name: Install per machine, start the app, record the sandbox_probe line
+        shell: pwsh
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}\install-probe-evidence
+        run: ./ci/install-probe-windows.ps1 -Mode AllUsers -InstallerDir dist
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-probe-windows-per-machine
+          path: ${{ runner.temp }}\install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos-arm64:
+    name: macos-arm64 (dmg on macos-15)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-aarch64-apple-darwin
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-aarch64-apple-darwin
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      # /bin/bash is the 3.2 that ships with macOS; the scripts are written for it.
+      - name: Self-test the probe script
+        run: /bin/bash ci/install-probe-macos.sh --self-test
+
+      - name: Install from the dmg, start the app, read the sandbox_probe line
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
+        run: /bin/bash ci/install-probe-macos.sh dist arm64
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-probe-macos-arm64
+          path: ${{ runner.temp }}/install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos-x86_64-rosetta:
+    name: macos-x86_64-rosetta (x86_64 dmg under Rosetta 2 on macos-15)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Install Rosetta 2 and fail loudly if it does not work (V32)
+        run: |
+          set -euo pipefail
+          machine="$(uname -m)"
+          if [ "$machine" != "arm64" ]; then
+            echo "::error::runner hardware is $machine, expected arm64"
+            exit 1
+          fi
+          if ! sudo softwareupdate --install-rosetta --agree-to-license; then
+            echo "::error::softwareupdate could not install Rosetta 2"
+            exit 1
+          fi
+          if ! arch -x86_64 /usr/bin/true; then
+            echo "::error::Rosetta 2 is installed but cannot run x86_64 code"
+            exit 1
+          fi
+          translated="$(arch -x86_64 /usr/sbin/sysctl -n sysctl.proc_translated)"
+          echo "sysctl.proc_translated under arch -x86_64: $translated"
+          if [ "$translated" != "1" ]; then
+            echo "::error::x86_64 process is not translated by Rosetta"
+            exit 1
+          fi
+
+      - name: Download bundle-x86_64-apple-darwin
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-apple-darwin
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the probe script
+        run: /bin/bash ci/install-probe-macos.sh --self-test
+
+      - name: Install from the dmg, start the translated app, read the sandbox_probe line
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
+        run: /bin/bash ci/install-probe-macos.sh dist x86_64
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-probe-macos-x86_64-rosetta
+          path: ${{ runner.temp }}/install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  ubuntu-deb:
+    name: ubuntu-deb (apt install on ubuntu-22.04)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-unknown-linux-gnu
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the probe script
+        run: bash ci/install-probe-linux.sh --self-test
+
+      - name: Install the deb, start the app under xvfb + dbus-run-session, read the sandbox_probe line
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
+        run: bash ci/install-probe-linux.sh deb dist
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-probe-ubuntu-deb
+          path: ${{ runner.temp }}/install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  ubuntu-appimage:
+    name: ubuntu-appimage (FUSE runtime on ubuntu-22.04)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-unknown-linux-gnu
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the probe script
+        run: bash ci/install-probe-linux.sh --self-test
+
+      - name: Run the AppImage under xvfb + dbus-run-session, read the sandbox_probe line
+        env:
+          INSTALL_PROBE_EVIDENCE: ${{ runner.temp }}/install-probe-evidence
+        run: bash ci/install-probe-linux.sh appimage dist
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-probe-ubuntu-appimage
+          path: ${{ runner.temp }}/install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  fedora-rpm:
+    name: fedora-rpm (dnf install in a fedora:40 container)
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the commit that was bundled
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || inputs.bundle_sha }}
+          persist-credentials: false
+
+      - name: Download bundle-x86_64-unknown-linux-gnu
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-x86_64-unknown-linux-gnu
+          path: dist
+          run-id: ${{ github.event.workflow_run.id || inputs.bundle_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Self-test the probe script
+        run: bash ci/install-probe-linux.sh --self-test
+
+      # A plain `docker run`, like the bundle workflow's fedora-rpm job: the stock fedora:40 image
+      # has no git or tar for the checkout and cache actions. CI=true is passed on because
+      # ci/pinned-fixture.sh refuses to run without it. The script installs xvfb and the session
+      # bus tools itself and re-executes under `dbus-run-session -- xvfb-run -a`.
+      - name: Install the rpm on Fedora 40, start the app, read the sandbox_probe line
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/install-probe-evidence"
+          mkdir -p "$evidence"
+          docker run --rm \
+            --env CI=true \
+            --env INSTALL_PROBE_EVIDENCE=/evidence \
+            --volume "$PWD:/work:ro" \
+            --volume "$evidence:/evidence" \
+            --workdir /work \
+            fedora:40 \
+            bash ci/install-probe-linux.sh rpm dist
+
+      - name: Upload the evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-probe-fedora-rpm
+          path: ${{ runner.temp }}/install-probe-evidence
+          if-no-files-found: warn
+          retention-days: 14
