@@ -54,8 +54,24 @@ rust:test:
     # The container's /tmp is an overlayfs whose layers are not visible inside the container; the data-dir
     # locality check fails closed on it, so tests that create data dirs need TMPDIR on the project volume.
     - mkdir -p "$CI_PROJECT_DIR/.tmp" && export TMPDIR="$CI_PROJECT_DIR/.tmp"
+    # Same for the keyring dir: the container's home is an overlayfs too (§8.6 locality).
+    - mkdir -p "$CI_PROJECT_DIR/.xdg" && export XDG_DATA_HOME="$CI_PROJECT_DIR/.xdg"
     - cargo clippy --workspace --all-targets --locked -- -D warnings
     - cargo test --workspace --locked
+
+rust:audit-keychain:
+  stage: check
+  needs: []
+  before_script:
+    - apt-get update
+    - apt-get install -y --no-install-recommends gnome-keyring dbus libsecret-tools
+    - rustup toolchain install
+  script:
+    # TMPDIR and XDG_DATA_HOME on the project volume: the overlayfs /tmp and $HOME fail the
+    # locality checks closed (see rust:test), the keychain tests would see keyring_not_local.
+    - export TMPDIR="$CI_PROJECT_DIR/.tmp" XDG_DATA_HOME="$CI_PROJECT_DIR/.xdg"
+    - mkdir -p "$TMPDIR" "$XDG_DATA_HOME"
+    - bash ci/keyring-ci.sh
 
 node:ci-checks:
   stage: check

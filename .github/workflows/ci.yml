@@ -55,7 +55,9 @@ jobs:
             librsvg2-dev \
             libdbus-1-dev \
             dbus-x11 \
-            xvfb
+            xvfb \
+            gnome-keyring \
+            libsecret-tools
 
       - name: Install the pinned Rust toolchain (rust-toolchain.toml)
         run: |
@@ -126,6 +128,18 @@ jobs:
           # §9.4: the Windows floor is met (LPAC, or the plain AppContainer fallback), with the
           # host-side controls of sandbox-host `winscore`. Ignored off Windows.
           ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET: "1"
+
+      - name: Audit OS keychain tests (Windows Credential Manager, RF-3a)
+        if: runner.os == 'Windows'
+        run: cargo test -p atlas-duck-audit --test os_keystore --locked -- --ignored --test-threads=1 --nocapture
+
+      - name: Audit OS keychain tests (macOS login keychain)
+        if: runner.os == 'macOS'
+        run: cargo test -p atlas-duck-audit --test os_keystore --locked -- --ignored --test-threads=1 --nocapture
+
+      - name: Audit OS keychain tests (Linux, file-backed Secret Service)
+        if: runner.os == 'Linux'
+        run: bash ci/keyring-ci.sh
 
       - name: Windows probes (T19, §9.4)
         if: runner.os == 'Windows'
@@ -411,6 +425,9 @@ jobs:
       - name: Test x86_64-apple-darwin (test binaries run under Rosetta)
         run: cargo test --workspace --locked --target x86_64-apple-darwin
 
+      - name: Audit OS keychain tests (macOS login keychain, x86_64 under Rosetta)
+        run: cargo test -p atlas-duck-audit --test os_keystore --locked --target x86_64-apple-darwin -- --ignored --test-threads=1 --nocapture
+
       - name: Probe evidence (§9.4, go/no-go record)
         run: |
           set -euo pipefail
@@ -481,7 +498,9 @@ jobs:
             librsvg2-dev \
             libdbus-1-dev \
             dbus-x11 \
-            xvfb
+            xvfb \
+            gnome-keyring \
+            libsecret-tools
 
       - name: Set up Node.js
         if: runner.os == 'Linux'
@@ -551,6 +570,18 @@ jobs:
       - name: Locality tests against the mounts (Linux)
         if: runner.os == 'Linux'
         run: cargo test -p atlas-duck-ipc --test locality --locked -- --nocapture
+
+      - name: Keyring locality against the NFS mount (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # The test classifies <nfs>/xdg/keyrings; the dir must exist for the probe.
+          mkdir -p "$ATLAS_DUCK_TEST_NFS_DIR/xdg/keyrings"
+          cargo test -p atlas-duck-audit --test keystore --locked -- --nocapture locality_nfs_from_env
+
+      - name: Shared keyring I-43/I-44 (§8.6)
+        if: runner.os == 'Linux'
+        run: ATLAS_DUCK_SHARED_STATE="$RUNNER_TEMP/shared" bash ci/shared-keyring.sh
 
       - name: Startup gate against the mounts (Linux)
         if: runner.os == 'Linux'
