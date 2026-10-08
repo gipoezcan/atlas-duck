@@ -533,3 +533,80 @@ fn hung_keychain_times_out_flush_and_does_not_hang_shutdown() {
     std::thread::sleep(Duration::from_millis(200));
     assert!(keychain_head(&f).seq <= 3);
 }
+
+fn restore_args(store: &Store) -> (HeadAnchor, FirstRetainedAnchor) {
+    let (seq, record_hash, chain_id) = store.head();
+    let fr = first_retained_for(store, 1, [0; 32]);
+    (
+        HeadAnchor {
+            chain_id,
+            seq,
+            record_hash,
+        },
+        fr,
+    )
+}
+
+#[test]
+fn restore_completion_timeout_takes_the_job_back() {
+    let (panic_set, block_set) = (Arc::new(AtomicBool::new(false)), Arc::default());
+    let (store, f) = new_store_with(
+        fake_clock(START),
+        MemKeyring::new(),
+        gated(&panic_set, &block_set),
+    );
+    // The anchor thread gets stuck in a head write (the flush that started it times out).
+    block_set.store(true, Ordering::SeqCst);
+    append_n(&store, 1);
+    assert_eq!(
+        store.flush_head_anchor(),
+        Err(AuditError::AnchorFlushTimeout)
+    );
+    let _guard = store.testing_restore_barrier(1).expect("barrier");
+    let (head, fr) = restore_args(&store);
+    // Not started: the job is taken back, nothing is written later, a retry is possible.
+    assert_eq!(
+        store.testing_complete_restore_anchors(head.clone(), fr.clone()),
+        Err(AuditError::AnchorFlushTimeout)
+    );
+    block_set.store(false, Ordering::SeqCst);
+    // A flush is served after the stuck write, i.e. after the thread would have run the job.
+    store
+        .flush_head_anchor()
+        .expect("flush behind the stuck write");
+    assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
+    assert_ne!(keychain_first_retained(&f), fr);
+    store
+        .testing_complete_restore_anchors(head.clone(), fr.clone())
+        .expect("retry");
+    assert_eq!(keychain_head(&f), head);
+    assert_eq!(keychain_first_retained(&f), fr);
+}
+
+#[test]
+fn restore_completion_timeout_while_writing_is_outcome_unknown() {
+    let (panic_set, block_set) = (Arc::new(AtomicBool::new(false)), Arc::default());
+    let (store, f) = new_store_with(
+        fake_clock(START),
+        MemKeyring::new(),
+        gated(&panic_set, &block_set),
+    );
+    let _guard = store.testing_restore_barrier(1).expect("barrier");
+    let (head, fr) = restore_args(&store);
+    block_set.store(true, Ordering::SeqCst);
+    // The thread takes the job and blocks inside its first keychain write.
+    assert_eq!(
+        store.testing_complete_restore_anchors(head.clone(), fr.clone()),
+        Err(AuditError::AnchorOutcomeUnknown)
+    );
+    // A retry does not see "in progress" (it queues behind the stuck write and times out).
+    assert!(!matches!(
+        store.testing_complete_restore_anchors(head.clone(), fr.clone()),
+        Err(AuditError::Invalid(_))
+    ));
+    block_set.store(false, Ordering::SeqCst);
+    assert!(wait_until(Duration::from_secs(10), || {
+        keychain_first_retained(&f) == fr && store.health().anchors_blocked.is_none()
+    }));
+    assert_eq!(keychain_head(&f), head);
+}

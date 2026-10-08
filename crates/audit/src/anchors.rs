@@ -609,7 +609,16 @@ impl AnchorShared {
         let wait = lock(&self.state).wait_timeout;
         match rx.recv_timeout(wait) {
             Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => Err(AuditError::AnchorFlushTimeout),
+            Err(RecvTimeoutError::Timeout) => {
+                // Take the job back if the thread never started it, so it cannot write and lift
+                // the barrier after the caller was told it failed. If the thread already took it,
+                // its write may still land: the outcome is unknown, and a retry sees no job.
+                if lock(&self.state).restore_job.take().is_some() {
+                    Err(AuditError::AnchorFlushTimeout)
+                } else {
+                    Err(AuditError::AnchorOutcomeUnknown)
+                }
+            }
             Err(RecvTimeoutError::Disconnected) => Err(self.after_disconnect()),
         }
     }
@@ -688,7 +697,9 @@ fn answer(waiters: Vec<FlushReply>, r: &Result<(), KeyStoreError>) {
 
 /// The `audit-anchor` thread. `scale_div` shortens the retry backoff (tests only). A panic in
 /// the loop (a misbehaving keychain backend) marks the state dead and releases every waiter, so
-/// callers get `AnchorThreadDead` and `health()` reports it instead of hanging.
+/// callers get `AnchorThreadDead` and `health()` reports it instead of hanging. Release builds
+/// use `panic = "abort"` (§7.7), where a panic ends the process: this is defence in depth for
+/// debug and test builds (unwinding) only.
 pub(crate) fn run(shared: Arc<AnchorShared>, keys: Arc<dyn KeyStore>, scale_div: u32) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_loop(&shared, &*keys, scale_div);

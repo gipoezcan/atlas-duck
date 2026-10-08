@@ -118,6 +118,9 @@ pub enum AuditError {
     AnchorThreadDead,
     /// The anchor thread did not answer in time (a hung keychain call).
     AnchorFlushTimeout,
+    /// A restore completion timed out while the anchor thread was already writing it: the
+    /// anchors and the barrier may or may not have been updated.
+    AnchorOutcomeUnknown,
     Decrypt {
         seq: u64,
     },
@@ -141,6 +144,9 @@ impl fmt::Display for AuditError {
             AuditError::StorageLow => f.write_str("audit storage is low"),
             AuditError::Closed => f.write_str("audit store is closed"),
             AuditError::AnchorThreadDead => f.write_str("the anchor thread stopped unexpectedly"),
+            AuditError::AnchorOutcomeUnknown => {
+                f.write_str("the restore anchors may or may not have been written")
+            }
             AuditError::AnchorFlushTimeout => {
                 f.write_str("the keychain did not answer in time to write the anchor")
             }

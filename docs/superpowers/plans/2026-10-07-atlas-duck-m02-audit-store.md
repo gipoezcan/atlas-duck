@@ -1493,6 +1493,8 @@ Run: `cargo test -p atlas-duck-audit --test open --locked` → all pass. Re-run 
 - Create: `crates/audit/src/prune.rs`, `crates/audit/tests/prune.rs`
 - Modify: `crates/audit/src/writer.rs` (cadence triggers, `append_in_tx` for the `PRUNE` row), `crates/audit/src/store.rs`
 
+**T08 notes:** release builds use `panic = "abort"` (§7.7), so `AuditError::AnchorThreadDead` (anchor thread caught a panic) is defence in depth for debug/test builds only. `complete_restore` timing out takes its job back (`AnchorFlushTimeout`, safe to retry) unless the thread already started it (`AnchorOutcomeUnknown`: re-read the keychain before retrying).
+
 **T08 handoff (barriers):** `Store::install_barrier(Barrier::Prune{..}) -> Result<BarrierGuard, AuditError>` must be called BEFORE the `PRUNE` commit becomes visible to the anchor thread (it can otherwise write a head above the PRUNE seq in the window between commit and install). Hold the guard across the whole prune; `guard.complete()` only after the work succeeded (the anchor thread lifts the barrier when the first-retained update succeeded), so every error path releases it by drop. Only one barrier can exist at a time (a second install is `Invalid`). `health().anchors_blocked` shows a leaked one.
 
 **Interfaces:**
