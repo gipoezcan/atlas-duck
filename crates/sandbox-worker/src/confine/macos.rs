@@ -17,13 +17,14 @@ pub const SBPL_PROFILE: &str = include_str!("macos_profile.sb");
 pub const MECHANISM: &str = "seatbelt";
 
 #[cfg(target_os = "macos")]
-pub use apply_impl::{SandboxInitError, apply, apply_profile};
+pub use apply_impl::{SandboxInitError, apply, apply_profile, spawn_target_present_at_startup};
 
 #[cfg(target_os = "macos")]
 mod apply_impl {
     use std::ffi::{CStr, CString, c_char, c_int};
     use std::io::{self, Write};
     use std::ptr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 
@@ -35,6 +36,18 @@ mod apply_impl {
         fn sandbox_init(profile: *const c_char, flags: u64, errorbuf: *mut *mut c_char) -> c_int;
         fn sandbox_free_error(errorbuf: *mut c_char);
         fn tzset();
+    }
+
+    /// Whether `/bin/sh` (the `SpawnProcess` probe's target) existed before the
+    /// profile was applied. Under the profile a refused exec of that path comes
+    /// back as `ENOENT`, not `EPERM` (CI run 1, macOS 15.7, `SpawnProcess ...
+    /// os_error: Some(2)`), and only this pre-profile fact tells a refusal from
+    /// a missing file.
+    static SPAWN_TARGET_PRESENT: AtomicBool = AtomicBool::new(false);
+
+    /// See [`SPAWN_TARGET_PRESENT`]; `false` until [`apply`] has run.
+    pub fn spawn_target_present_at_startup() -> bool {
+        SPAWN_TARGET_PRESENT.load(Ordering::Relaxed)
     }
 
     /// Why `sandbox_init` refused a profile.
@@ -105,6 +118,7 @@ mod apply_impl {
     /// `sandbox_init` error text goes to stderr, which the host keeps.
     pub fn apply() -> ConfinementReport {
         warm_time_zone();
+        SPAWN_TARGET_PRESENT.store(std::path::Path::new("/bin/sh").exists(), Ordering::Relaxed);
         match apply_profile(SBPL_PROFILE) {
             Ok(()) => report(true, None),
             Err(e) => {

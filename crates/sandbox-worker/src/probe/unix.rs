@@ -67,6 +67,22 @@ pub fn spawn_process() -> ProbeResultMsg {
         Err(e) => {
             let code = os_code(&e);
             let outcome = code.map_or(ProbeOutcome::Error, classify_denial);
+            // macOS reports a seatbelt-refused exec as ENOENT (CI run 1).
+            // That is a denial only because `/bin/sh` was seen to exist before
+            // the profile was applied; with no such evidence it stays `Error`.
+            #[cfg(target_os = "macos")]
+            {
+                if code == Some(i64::from(libc::ENOENT))
+                    && crate::confine::macos::spawn_target_present_at_startup()
+                {
+                    return result(
+                        probe,
+                        ProbeOutcome::Blocked,
+                        code,
+                        "exec of an existing /bin/sh refused (seatbelt reports ENOENT)",
+                    );
+                }
+            }
             result(probe, outcome, code, "child process not started")
         }
     }
