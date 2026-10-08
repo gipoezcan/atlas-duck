@@ -425,7 +425,8 @@ impl KeyRow {
 pub(crate) fn kek_opens_store(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
     let newest: Option<(bool, KeyRow)> = conn
         .query_row(
-            "SELECT k.key_id IS NOT NULL, e.key_id, k.month, k.wrapped_dek FROM events e              LEFT JOIN keys k ON k.key_id = e.key_id ORDER BY e.seq DESC LIMIT 1",
+            "SELECT k.key_id IS NOT NULL, e.key_id, k.month, k.wrapped_dek FROM events e \
+             LEFT JOIN keys k ON k.key_id = e.key_id ORDER BY e.seq DESC LIMIT 1",
             [],
             |r| Ok((r.get::<_, bool>(0)?, KeyRow::read(r, 1)?)),
         )
@@ -439,7 +440,8 @@ pub(crate) fn kek_opens_store(conn: &Connection, kek: &Kek) -> Result<bool, Open
     }
     let mut st = conn
         .prepare(
-            "SELECT key_id, month, wrapped_dek FROM keys WHERE wrapped_dek IS NOT NULL              ORDER BY key_id DESC",
+            "SELECT key_id, month, wrapped_dek FROM keys WHERE wrapped_dek IS NOT NULL \
+             ORDER BY key_id DESC",
         )
         .map_err(sql)?;
     let mut rows = st.query([]).map_err(sql)?;

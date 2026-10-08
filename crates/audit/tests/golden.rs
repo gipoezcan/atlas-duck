@@ -506,8 +506,9 @@ fn recovery_vector() -> Value {
 }
 
 /// F.7 inputs: (KEK base, kind, query). Queries are surrounded only by ASCII spaces, tabs and
-/// newlines: JavaScript's `trim()` also strips U+FEFF, Rust's `str::trim` does not, so a
-/// U+FEFF here would make the Node checker disagree for a reason outside the format.
+/// newlines: JavaScript's `trim()` also strips U+FEFF, Rust's `str::trim` does not, and Rust
+/// strips U+0085 (NEL), JavaScript does not, so either character here would make the Node
+/// checker disagree for a reason outside the format.
 /// Entries 0/1 and 2/3 must give the same tag (trim; NFC of a decomposed `Müller`).
 const QUERY_TAG_INPUTS: [(u8, QueryKind, &str); 7] = [
     (0xC0, QueryKind::Jql, "project = ABC"),

@@ -56,7 +56,10 @@ use crate::anchor_dir::{self, AnchorDirLines, LostSpan};
 use crate::anchors::{
     self, AnchorLoadError, Barrier, FirstRetainedAnchor, HeadAnchor, RestoreReset,
 };
-use crate::backup::{Manifest, RECOVERY_FILE, SNAPSHOT_FILE, file_sha256, sql_literal};
+use crate::backup::{
+    MANIFEST_FILE, MAX_MANIFEST_BYTES, Manifest, RECOVERY_FILE, SNAPSHOT_FILE, file_sha256,
+    sql_literal,
+};
 use crate::clock::Clock;
 use crate::crypto::{Kek, KekEntryError, ct_eq};
 use crate::encoding::ZERO_HASH;
@@ -287,6 +290,9 @@ fn stage(
     let schema_head = hooks.schema_head();
     // 1. The source: a bundle's files must be the manifest's.
     let (snapshot, manifest) = if source.is_dir() {
+        // A regular file first, as for the other two: opening a FIFO named `manifest.json`
+        // would block this (the writer) thread, and a symlink is never followed.
+        bundle_file(&source.join(MANIFEST_FILE), Some(MAX_MANIFEST_BYTES))?;
         let m = Manifest::read(source).map_err(restore_err)?;
         if m.user_version > schema_head {
             return Err(restore_err(RestoreError::SnapshotNewer {

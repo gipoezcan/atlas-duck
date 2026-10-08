@@ -1428,6 +1428,15 @@ fn bundle_tampering_is_refused() {
     expect(RestoreError::NotABundle);
     std::fs::remove_file(&mpath).expect("remove");
     expect(RestoreError::NotABundle);
+    // A symlink to a valid manifest is not followed (a FIFO there would block the writer).
+    #[cfg(unix)]
+    {
+        let elsewhere = out.path().join("manifest-elsewhere.json");
+        std::fs::write(&elsewhere, &morig).expect("write");
+        std::os::unix::fs::symlink(&elsewhere, &mpath).expect("symlink");
+        expect(RestoreError::NotABundle);
+        std::fs::remove_file(&mpath).expect("remove link");
+    }
     std::fs::write(&mpath, &morig).expect("write");
     // Not a database file.
     let junk = out.path().join("junk.db");

@@ -6,6 +6,21 @@
 //! The crate root re-exports the C.3 API (types, errors, keystore, clock) that `core` (M3),
 //! `app` (M4/M6) and M10 use; the modules stay public for the less common items.
 
+// No panicking shortcut in library code (plan "no unwrap/expect in audit", final review M-1):
+// the release profile aborts on panic. Unit tests (`cfg(test)`) are exempt; `testing` opts
+// out where it needs to.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
+
 pub mod lock;
 
 pub mod admission;

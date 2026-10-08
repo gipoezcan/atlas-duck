@@ -247,8 +247,8 @@ export function queryKey(kek) {
 
 /**
  * F.7: `<kind>:` + hex(HMAC-SHA256(K_q, NFC(query).trim())). JS `trim()` also strips U+FEFF,
- * which Rust's `str::trim` keeps; the vectors use only ASCII spaces, tabs and newlines around
- * queries, where both agree.
+ * which Rust's `str::trim` keeps, and keeps U+0085 (NEL), which Rust strips; the vectors use
+ * only ASCII spaces, tabs and newlines around queries, where both agree.
  */
 export function queryTag(kek, kind, query) {
   if (kind !== "jql" && kind !== "cql") throw new Error(`unknown query kind ${kind}`);

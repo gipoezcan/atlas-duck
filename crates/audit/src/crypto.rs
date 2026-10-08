@@ -322,18 +322,20 @@ pub fn query_key(kek: &Kek) -> Zeroizing<[u8; 32]> {
 /// `"jql:"`/`"cql:"` + lowercase hex of `HMAC-SHA256(K_q, NFC(query).trim())` (F.7, L38).
 ///
 /// `trim` is Rust's `str::trim` (Unicode `White_Space`), applied after NFC. JavaScript's
-/// `trim()` also strips U+FEFF, which Rust does not; the golden vectors therefore surround
-/// queries only with ASCII spaces, tabs and newlines (the Node checker relies on that).
+/// `trim()` also strips U+FEFF, which Rust does not, and Rust strips U+0085 (NEL), which
+/// JavaScript does not; the golden vectors therefore surround queries only with ASCII spaces,
+/// tabs and newlines (the Node checker relies on that).
 pub fn query_tag(k_q: &[u8; 32], kind: QueryKind, query: &str) -> String {
     use hmac::{Hmac, KeyInit, Mac};
     use unicode_normalization::UnicodeNormalization;
 
     let normalized: String = query.nfc().collect();
-    let mut mac = match <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(k_q) {
-        Ok(m) => m,
-        // HMAC accepts keys of any length.
-        Err(_) => unreachable!("HMAC-SHA256 rejected a 32-byte key"),
-    };
+    // HMAC pads a key shorter than its block with zeros (RFC 2104), so the zero-padded key
+    // gives the same MAC through the infallible block-size constructor (no error arm).
+    let mut key = hmac::digest::Key::<Hmac<sha2::Sha256>>::default();
+    key[..k_q.len()].copy_from_slice(k_q);
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new(&key);
+    zeroize::Zeroize::zeroize(&mut key[..]);
     mac.update(normalized.trim().as_bytes());
     let tag = hex::encode(mac.finalize().into_bytes());
     match kind {
