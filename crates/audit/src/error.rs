@@ -114,9 +114,19 @@ pub enum AuditError {
     AppendFailed(String),
     StorageLow,
     Closed,
-    Decrypt { seq: u64 },
-    PayloadHash { seq: u64 },
-    NotFound { seq: u64 },
+    /// The anchor thread panicked; no anchor will be written until restart.
+    AnchorThreadDead,
+    /// The anchor thread did not answer in time (a hung keychain call).
+    AnchorFlushTimeout,
+    Decrypt {
+        seq: u64,
+    },
+    PayloadHash {
+        seq: u64,
+    },
+    NotFound {
+        seq: u64,
+    },
     NeedsConfirmation(&'static str),
     Invalid(&'static str),
     KeyStore(KeyStoreError),
@@ -130,6 +140,10 @@ impl fmt::Display for AuditError {
             AuditError::AppendFailed(m) => write!(f, "append failed: {m}"),
             AuditError::StorageLow => f.write_str("audit storage is low"),
             AuditError::Closed => f.write_str("audit store is closed"),
+            AuditError::AnchorThreadDead => f.write_str("the anchor thread stopped unexpectedly"),
+            AuditError::AnchorFlushTimeout => {
+                f.write_str("the keychain did not answer in time to write the anchor")
+            }
             AuditError::Decrypt { seq } => write!(f, "cannot decrypt the payload of record {seq}"),
             AuditError::PayloadHash { seq } => write!(f, "payload hash mismatch on record {seq}"),
             AuditError::NotFound { seq } => write!(f, "record {seq} not found"),

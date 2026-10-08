@@ -7,7 +7,7 @@
 //! `StoreHealth`, never an incident (§8.8).
 
 use std::fmt;
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -151,6 +151,10 @@ impl FirstRetainedAnchor {
 /// share one keychain write.
 pub(crate) const BATCH_WINDOW: Duration = Duration::from_millis(900);
 
+/// How long `flush_head_anchor`, the restore completion and `shutdown` wait for the anchor
+/// thread (a hung keychain call must not hang the app).
+pub(crate) const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Longest idle wait of the anchor thread.
 const MAX_WAIT: Duration = Duration::from_secs(1);
 
@@ -169,6 +173,7 @@ pub(crate) fn backoff(failures: u32) -> Duration {
 
 /// What holds the head anchor back.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // constructed by prune/restore (T11); tests construct it today
 pub(crate) enum Barrier {
     /// The head anchor may reach `seq` (the `PRUNE` record) but not beyond until the
     /// first-retained entry holds `first_retained` (§8.7 (d)).
@@ -180,6 +185,24 @@ pub(crate) enum Barrier {
     /// No head write at all until the restore completion step wrote both entries: an anchor
     /// from before the `RESTORE` would describe the replaced DB.
     Restore { seq: u64 },
+}
+
+impl Barrier {
+    fn kind(&self) -> BarrierKind {
+        match self {
+            Barrier::Prune { .. } => BarrierKind::Prune,
+            Barrier::Restore { .. } => BarrierKind::Restore,
+        }
+    }
+}
+
+/// Which barrier holds the anchors back (for `StoreHealth`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierKind {
+    /// The first-retained update after a `PRUNE` is pending; the head anchor is capped.
+    Prune,
+    /// A `RESTORE` is not completed; no head anchor is written.
+    Restore,
 }
 
 struct RestoreJob {
@@ -203,11 +226,22 @@ pub(crate) struct AnchorState {
     last_error: Option<KeyStoreError>,
     waiters: Vec<FlushReply>,
     restore_job: Option<RestoreJob>,
+    /// The batch window (tests shorten or stretch it).
+    window: Duration,
+    wait_timeout: Duration,
+    /// The thread panicked: nothing will ever be written again.
+    dead: bool,
+    /// The thread left its loop (stop or panic).
+    exited: bool,
 }
 
 impl AnchorState {
     fn new() -> AnchorState {
         AnchorState {
+            window: BATCH_WINDOW,
+            wait_timeout: DEFAULT_WAIT_TIMEOUT,
+            dead: false,
+            exited: false,
             enabled: false,
             head: None,
             written_head: None,
@@ -267,13 +301,24 @@ impl AnchorState {
     }
 
     /// The target, if it differs from what the keychain holds.
+    /// A head of the same chain with a lower seq than the keychain's is never written.
     fn head_stale(&self) -> Option<HeadAnchor> {
-        self.flush_target()
-            .filter(|t| self.written_head.as_ref() != Some(t))
+        self.flush_target().filter(|t| {
+            self.written_head.as_ref() != Some(t)
+                && !matches!(&self.written_head, Some(w) if w.chain_id == t.chain_id && w.seq > t.seq)
+        })
+    }
+
+    /// A stale head always has an open batch window, whatever made it stale (barrier lifted,
+    /// restore head older than the published one).
+    fn touch(&mut self, now: Instant) {
+        if self.dirty_since.is_none() && self.head_stale().is_some() {
+            self.dirty_since = Some(now);
+        }
     }
 
     fn head_due(&self, now: Instant) -> bool {
-        self.head_stale().is_some() && self.dirty_for(now) >= BATCH_WINDOW && self.retry_ok(now)
+        self.head_stale().is_some() && self.dirty_for(now) >= self.window && self.retry_ok(now)
     }
 
     pub(crate) fn work_due(&self, now: Instant) -> bool {
@@ -293,7 +338,7 @@ impl AnchorState {
             w = w.min(self.retry_in(now));
         }
         if let (Some(d), Some(_)) = (self.dirty_since, self.head_stale()) {
-            let window = (d + BATCH_WINDOW).saturating_duration_since(now);
+            let window = (d + self.window).saturating_duration_since(now);
             w = w.min(window.max(self.retry_in(now)));
         }
         w
@@ -303,6 +348,15 @@ impl AnchorState {
         self.failures = self.failures.saturating_add(1);
         self.next_retry = Some(now + backoff(self.failures) / scale_div.max(1));
         self.last_error = Some(e);
+    }
+
+    /// Why `flush`/`complete_restore`/`install_barrier` cannot be served.
+    fn unusable(&self) -> AuditError {
+        if self.dead {
+            AuditError::AnchorThreadDead
+        } else {
+            AuditError::Closed
+        }
     }
 
     fn clear_failure(&mut self) {
@@ -328,6 +382,30 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct AnchorHealth {
     pub(crate) write_failing: bool,
     pub(crate) first_retained_pending: bool,
+    pub(crate) blocked: Option<BarrierKind>,
+    pub(crate) thread_dead: bool,
+}
+
+/// Releases an installed barrier when dropped, unless [`BarrierGuard::complete`] says the
+/// operation went through (the anchor thread, or the restore completion, lifts it then). Hold
+/// it across the `PRUNE`/`RESTORE` work so an error path cannot leave the anchors blocked.
+pub struct BarrierGuard {
+    shared: Option<Arc<AnchorShared>>,
+}
+
+impl BarrierGuard {
+    /// The operation succeeded: the barrier stays until its update/reset lifts it.
+    pub fn complete(mut self) {
+        self.shared = None;
+    }
+}
+
+impl Drop for BarrierGuard {
+    fn drop(&mut self) {
+        if let Some(s) = self.shared.take() {
+            s.clear_barrier();
+        }
+    }
 }
 
 impl AnchorShared {
@@ -340,8 +418,17 @@ impl AnchorShared {
 
     /// Start state once the writer is ready: the head as the writer loaded it, and whether the
     /// keychain already holds it (first run) or not.
-    pub(crate) fn init(&self, enabled: bool, head: HeadAnchor, anchored: bool) {
+    pub(crate) fn init(
+        &self,
+        enabled: bool,
+        head: HeadAnchor,
+        anchored: bool,
+        window: Duration,
+        wait_timeout: Duration,
+    ) {
         let mut st = lock(&self.state);
+        st.window = window;
+        st.wait_timeout = wait_timeout;
         st.enabled = enabled;
         st.written_head = anchored.then(|| head.clone());
         st.head = Some(head);
@@ -371,8 +458,38 @@ impl AnchorShared {
         self.cv.notify_all();
     }
 
-    pub(crate) fn set_barrier(&self, b: Barrier) {
-        lock(&self.state).barrier = Some(b);
+    /// Installs the one barrier; a second one is refused (it would silently lift the first).
+    /// Retry state of earlier failures is dropped so the new barrier is attempted at once.
+    pub(crate) fn install_barrier(
+        self: &Arc<Self>,
+        b: Barrier,
+    ) -> Result<BarrierGuard, AuditError> {
+        {
+            let mut st = lock(&self.state);
+            if st.stop || st.dead {
+                return Err(st.unusable());
+            }
+            if st.barrier.is_some() {
+                return Err(AuditError::Invalid(
+                    "an anchor barrier is already installed",
+                ));
+            }
+            st.barrier = Some(b);
+            st.clear_failure();
+        }
+        self.cv.notify_all();
+        Ok(BarrierGuard {
+            shared: Some(self.clone()),
+        })
+    }
+
+    /// Lifts any barrier (error paths of prune/restore) and resets the retry state.
+    pub(crate) fn clear_barrier(&self) {
+        {
+            let mut st = lock(&self.state);
+            st.barrier = None;
+            st.clear_failure();
+        }
         self.cv.notify_all();
     }
 
@@ -382,16 +499,18 @@ impl AnchorShared {
         let (tx, rx) = sync_channel(1);
         {
             let mut st = lock(&self.state);
-            if st.stop {
-                return Err(AuditError::Closed);
+            if st.stop || st.dead {
+                return Err(st.unusable());
             }
             st.waiters.push(tx);
             st.flush_requested = true;
         }
         self.cv.notify_all();
-        match rx.recv() {
+        let wait = lock(&self.state).wait_timeout;
+        match rx.recv_timeout(wait) {
             Ok(r) => r.map_err(AuditError::KeyStore),
-            Err(_) => Err(AuditError::Closed),
+            Err(RecvTimeoutError::Timeout) => Err(AuditError::AnchorFlushTimeout),
+            Err(RecvTimeoutError::Disconnected) => Err(self.after_disconnect()),
         }
     }
 
@@ -405,8 +524,11 @@ impl AnchorShared {
         let (reply, rx) = sync_channel(1);
         {
             let mut st = lock(&self.state);
-            if st.stop {
-                return Err(AuditError::Closed);
+            if st.stop || st.dead {
+                return Err(st.unusable());
+            }
+            if head.chain_id != first_retained.chain_id {
+                return Err(AuditError::Invalid("restore anchors name different chains"));
             }
             match &st.barrier {
                 Some(Barrier::Restore { seq }) if head.seq >= *seq => {}
@@ -426,21 +548,62 @@ impl AnchorShared {
             });
         }
         self.cv.notify_all();
-        rx.recv().map_err(|_| AuditError::Closed)?
+        let wait = lock(&self.state).wait_timeout;
+        match rx.recv_timeout(wait) {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => Err(AuditError::AnchorFlushTimeout),
+            Err(RecvTimeoutError::Disconnected) => Err(self.after_disconnect()),
+        }
     }
 
     pub(crate) fn health(&self) -> AnchorHealth {
         let st = lock(&self.state);
         AnchorHealth {
-            write_failing: st.failures > 0,
+            write_failing: st.failures > 0 || st.dead,
             first_retained_pending: matches!(st.barrier, Some(Barrier::Prune { .. })),
+            blocked: st.barrier.as_ref().map(Barrier::kind),
+            thread_dead: st.dead,
         }
     }
 
-    /// Stops the thread without a write; waiting callers get `Closed`.
-    pub(crate) fn stop(&self) {
-        lock(&self.state).stop = true;
+    /// The thread dropped our reply sender: it stopped or panicked. Wait until it left, so the
+    /// error says which.
+    fn after_disconnect(&self) -> AuditError {
+        let mut st = lock(&self.state);
+        let end = Instant::now() + st.wait_timeout;
+        while !st.exited {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            st = self
+                .cv
+                .wait_timeout(st, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        st.unusable()
+    }
+
+    /// Stops the thread without a write; waiting callers get `Closed`. Waits at most the wait
+    /// timeout for the thread to leave (a hung keychain call): `false` = it did not.
+    pub(crate) fn stop(&self) -> bool {
+        let mut st = lock(&self.state);
+        st.stop = true;
         self.cv.notify_all();
+        let end = Instant::now() + st.wait_timeout;
+        while !st.exited {
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            st = self
+                .cv
+                .wait_timeout(st, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        true
     }
 }
 
@@ -465,11 +628,29 @@ fn answer(waiters: Vec<FlushReply>, r: &Result<(), KeyStoreError>) {
     }
 }
 
-/// The `audit-anchor` thread. `scale_div` shortens the retry backoff (tests only).
+/// The `audit-anchor` thread. `scale_div` shortens the retry backoff (tests only). A panic in
+/// the loop (a misbehaving keychain backend) marks the state dead and releases every waiter, so
+/// callers get `AnchorThreadDead` and `health()` reports it instead of hanging.
 pub(crate) fn run(shared: Arc<AnchorShared>, keys: Arc<dyn KeyStore>, scale_div: u32) {
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_loop(&shared, &*keys, scale_div);
+    }));
+    let mut st = lock(&shared.state);
+    if r.is_err() {
+        st.dead = true;
+    }
+    st.waiters.clear();
+    st.restore_job = None;
+    st.exited = true;
+    drop(st);
+    shared.cv.notify_all();
+}
+
+fn run_loop(shared: &AnchorShared, keys: &dyn KeyStore, scale_div: u32) {
     let mut st = lock(&shared.state);
     loop {
         let now = Instant::now();
+        st.touch(now);
         if !st.work_due(now) {
             let w = st.next_wakeup(now);
             st = shared
@@ -481,20 +662,24 @@ pub(crate) fn run(shared: Arc<AnchorShared>, keys: Arc<dyn KeyStore>, scale_div:
         }
         if st.stop {
             // Never a write on the way out; `flush` callers learn the store closed.
-            st.waiters.clear();
-            st.restore_job = None;
             break;
         }
         // A restore completion writes both entries on its own.
         if let Some(job) = st.restore_job.take() {
             drop(st);
-            let r = set_first_retained(&*keys, &job.first_retained)
-                .and_then(|()| set_head(&*keys, &job.head));
+            let r = set_first_retained(keys, &job.first_retained)
+                .and_then(|()| set_head(keys, &job.head));
             st = lock(&shared.state);
             let reply = match r {
                 Ok(()) => {
                     st.barrier = None;
-                    st.head = Some(job.head.clone());
+                    // A published head newer than the restore head (same chain) stays the head
+                    // and is anchored next; the keychain now holds the restore head.
+                    let newer = matches!(&st.head, Some(h)
+                        if h.chain_id == job.head.chain_id && h.seq > job.head.seq);
+                    if !newer {
+                        st.head = Some(job.head.clone());
+                    }
                     st.written_head = Some(job.head);
                     st.dirty_since = None;
                     st.clear_failure();
@@ -518,15 +703,23 @@ pub(crate) fn run(shared: Arc<AnchorShared>, keys: Arc<dyn KeyStore>, scale_div:
         }
         let mut result: Result<(), KeyStoreError> = Ok(());
         // 1. A pending first-retained update (prune) comes first.
-        if let Some(Barrier::Prune { first_retained, .. }) = st.barrier.clone()
+        if let Some(Barrier::Prune {
+            seq: prune_seq,
+            first_retained,
+            ..
+        }) = st.barrier.clone()
             && (flushing || st.retry_ok(Instant::now()))
         {
             drop(st);
-            let r = set_first_retained(&*keys, &first_retained);
+            let r = set_first_retained(keys, &first_retained);
             st = lock(&shared.state);
             match r {
                 Ok(()) => {
-                    st.barrier = None;
+                    // Only the barrier this write belonged to; it may have been released.
+                    if matches!(&st.barrier, Some(Barrier::Prune { seq, .. }) if *seq == prune_seq)
+                    {
+                        st.barrier = None;
+                    }
                     st.clear_failure();
                 }
                 Err(e) => {
@@ -539,10 +732,10 @@ pub(crate) fn run(shared: Arc<AnchorShared>, keys: Arc<dyn KeyStore>, scale_div:
         // 2. The head anchor up to the barrier-capped target, at most once per window.
         let now = Instant::now();
         if let Some(target) = st.head_stale()
-            && (flushing || (st.dirty_for(now) >= BATCH_WINDOW && st.retry_ok(now)))
+            && (flushing || (st.dirty_for(now) >= st.window && st.retry_ok(now)))
         {
             drop(st);
-            let r = set_head(&*keys, &target);
+            let r = set_head(keys, &target);
             st = lock(&shared.state);
             match r {
                 Ok(()) => {
@@ -645,5 +838,111 @@ mod tests {
         assert!(s.work_due(now + Duration::from_secs(1)));
         s.flush_requested = true;
         assert!(s.work_due(now));
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    fn head(seq: u64) -> HeadAnchor {
+        HeadAnchor {
+            chain_id: "c".into(),
+            seq,
+            record_hash: [seq as u8; 32],
+        }
+    }
+
+    fn fr() -> FirstRetainedAnchor {
+        FirstRetainedAnchor {
+            chain_id: "c".into(),
+            genesis_hash: [9; 32],
+            first_retained_seq: 5,
+            first_retained_prev_hash: [4; 32],
+        }
+    }
+
+    fn shared(enabled: bool) -> Arc<AnchorShared> {
+        let a = Arc::new(AnchorShared::new());
+        a.init(enabled, head(1), true, BATCH_WINDOW, DEFAULT_WAIT_TIMEOUT);
+        a
+    }
+
+    #[test]
+    fn first_commit_opens_a_window_that_ends_within_the_batch_window() {
+        let a = shared(true);
+        for seq in 2..=51 {
+            a.publish_head(head(seq));
+        }
+        let st = lock(&a.state);
+        let now = Instant::now();
+        assert!(st.next_wakeup(now) <= BATCH_WINDOW);
+        assert_eq!(st.head_stale(), Some(head(51)));
+    }
+
+    #[test]
+    fn head_with_a_lower_seq_is_never_stale() {
+        let mut s = AnchorState::new();
+        s.enabled = true;
+        s.written_head = Some(head(9));
+        s.head = Some(head(4));
+        assert_eq!(s.head_stale(), None);
+        let other = HeadAnchor {
+            chain_id: "d".into(),
+            ..head(4)
+        };
+        s.head = Some(other.clone());
+        assert_eq!(s.head_stale(), Some(other));
+    }
+
+    #[test]
+    fn touch_opens_a_window_for_a_stale_head() {
+        let mut s = AnchorState::new();
+        s.enabled = true;
+        s.written_head = Some(head(1));
+        s.head = Some(head(3));
+        assert!(s.dirty_since.is_none());
+        let t0 = Instant::now();
+        s.touch(t0);
+        assert_eq!(s.dirty_since, Some(t0));
+    }
+
+    #[test]
+    fn a_second_barrier_is_refused_and_the_guard_releases() {
+        let a = shared(true);
+        let g = a
+            .install_barrier(Barrier::Restore { seq: 2 })
+            .expect("first barrier");
+        assert!(matches!(
+            a.install_barrier(Barrier::Prune {
+                seq: 3,
+                record_hash: [3; 32],
+                first_retained: fr(),
+            }),
+            Err(AuditError::Invalid(_))
+        ));
+        assert_eq!(a.health().blocked, Some(BarrierKind::Restore));
+        drop(g);
+        assert_eq!(a.health().blocked, None);
+        // Completed guards keep the barrier for the anchor thread to lift.
+        let g = a
+            .install_barrier(Barrier::Restore { seq: 2 })
+            .expect("again");
+        g.complete();
+        assert_eq!(a.health().blocked, Some(BarrierKind::Restore));
+    }
+
+    #[test]
+    fn installing_a_barrier_resets_stale_retry_state() {
+        let a = shared(true);
+        {
+            let mut st = lock(&a.state);
+            st.schedule_retry(KeyStoreError::Unavailable, Instant::now(), 1);
+        }
+        assert!(a.health().write_failing);
+        let _g = a
+            .install_barrier(Barrier::Restore { seq: 2 })
+            .expect("barrier");
+        assert!(!a.health().write_failing);
     }
 }

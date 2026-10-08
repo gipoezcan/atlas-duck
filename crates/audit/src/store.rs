@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::admission::{self, DEFAULT_MIN_FREE_BYTES, FreeSpaceProbe, OsFreeSpace};
-use crate::anchors::{self, Barrier, FirstRetainedAnchor, HeadAnchor};
+use crate::anchors::{self, Barrier, BarrierGuard, BarrierKind, FirstRetainedAnchor, HeadAnchor};
 use crate::clock::{Clock, UtcInstant};
 use crate::crypto::{self, Kek};
 use crate::encoding::{self, FIELD_LIST, RowFields};
@@ -73,6 +73,12 @@ pub struct Hooks {
     /// The anchor retry backoff runs ten times faster.
     #[cfg(any(test, feature = "testing"))]
     pub fast_anchor_backoff: bool,
+    /// Overrides the anchor batch window (default 900 ms).
+    #[cfg(any(test, feature = "testing"))]
+    pub anchor_batch_window: Option<std::time::Duration>,
+    /// Overrides the wait of `flush_head_anchor` and `shutdown` on the anchor thread (10 s).
+    #[cfg(any(test, feature = "testing"))]
+    pub anchor_wait_timeout: Option<std::time::Duration>,
 }
 
 impl Hooks {
@@ -108,6 +114,10 @@ pub struct StoreHealth {
     pub storage_low: bool,
     pub open_incidents: usize,
     pub prune_backlog_days: u32,
+    /// Anchor writes are held back by an unfinished prune or restore.
+    pub anchors_blocked: Option<BarrierKind>,
+    /// The anchor thread panicked: no anchor is written until restart.
+    pub anchor_thread_dead: bool,
 }
 
 /// One row's ciphertext and what opening it needs. No `Debug`: it holds a wrapped key.
@@ -148,9 +158,12 @@ impl Inner {
         if let Some(h) = lock(&self.thread).take() {
             let _ = h.join();
         }
-        self.shared.anchors.stop();
+        let exited = self.shared.anchors.stop();
         if let Some(h) = lock(&self.anchor_thread).take() {
-            let _ = h.join();
+            // A thread stuck in a keychain call is detached rather than waited for forever.
+            if exited {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -222,8 +235,14 @@ impl Store {
         let mut enabled = anchors.enabled;
         #[allow(unused_mut)]
         let mut scale_div = 1;
+        #[allow(unused_mut)]
+        let mut window = anchors::BATCH_WINDOW;
+        #[allow(unused_mut)]
+        let mut wait_timeout = anchors::DEFAULT_WAIT_TIMEOUT;
         #[cfg(any(test, feature = "testing"))]
         {
+            window = cfg.hooks.anchor_batch_window.unwrap_or(window);
+            wait_timeout = cfg.hooks.anchor_wait_timeout.unwrap_or(wait_timeout);
             enabled &= !cfg.hooks.anchors_disabled;
             if cfg.hooks.fast_anchor_backoff {
                 scale_div = 10;
@@ -237,6 +256,8 @@ impl Store {
                 record_hash: h.hash,
             },
             anchors.head_anchored,
+            window,
+            wait_timeout,
         );
         let spawned = {
             let shared = shared.anchors.clone();
@@ -470,10 +491,19 @@ impl Store {
         self.inner.shared.anchors.enable();
     }
 
-    /// Holds the head anchor back (prune/restore); lifted by the anchor thread.
+    /// Holds the head anchor back (prune/restore). The guard releases the barrier when
+    /// dropped unless `complete()` was called; an error path therefore cannot leave the anchors
+    /// blocked. Install it BEFORE the `PRUNE`/`RESTORE` commit becomes visible. A second barrier
+    /// is refused.
     #[allow(dead_code)] // called by prune/restore (T11)
-    pub(crate) fn install_barrier(&self, b: Barrier) {
-        self.inner.shared.anchors.set_barrier(b);
+    pub(crate) fn install_barrier(&self, b: Barrier) -> Result<BarrierGuard, AuditError> {
+        self.inner.shared.anchors.install_barrier(b)
+    }
+
+    /// Lifts the barrier explicitly.
+    #[allow(dead_code)] // called by prune/restore (T11)
+    pub(crate) fn clear_barrier(&self) {
+        self.inner.shared.anchors.clear_barrier();
     }
 
     /// The restore completion step: writes both anchors and lifts the restore barrier.
@@ -494,6 +524,8 @@ impl Store {
         StoreHealth {
             anchor_write_failing: a.write_failing,
             first_retained_update_pending: a.first_retained_pending,
+            anchors_blocked: a.blocked,
+            anchor_thread_dead: a.thread_dead,
             storage_low: self.admission_check().is_err(),
             ..StoreHealth::default()
         }
@@ -519,18 +551,24 @@ impl Store {
         seq: u64,
         record_hash: [u8; 32],
         first_retained: FirstRetainedAnchor,
-    ) {
+    ) -> Result<BarrierGuard, AuditError> {
         self.install_barrier(Barrier::Prune {
             seq,
             record_hash,
             first_retained,
-        });
+        })
     }
 
     /// A restore barrier at `seq` (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
-    pub fn testing_restore_barrier(&self, seq: u64) {
-        self.install_barrier(Barrier::Restore { seq });
+    pub fn testing_restore_barrier(&self, seq: u64) -> Result<BarrierGuard, AuditError> {
+        self.install_barrier(Barrier::Restore { seq })
+    }
+
+    /// `clear_barrier` for integration tests (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn testing_clear_barrier(&self) {
+        self.clear_barrier();
     }
 
     /// `complete_restore_anchors` for integration tests (feature `testing`).

@@ -1282,7 +1282,7 @@ fn flush_target(&self) -> Option<HeadAnchor> {
     }
 }
 ```
-`BATCH_WINDOW = 900 ms`. `work_due` is true when (a) a prune barrier's update is pending and the retry time (if any) has come, or (b) `flush_target()` differs from `written_head` and either `flush_requested` is set or `dirty_since` is older than `BATCH_WINDOW`, and the retry time (if any) has come. After each commit the writer sets `dirty_since = Some(now)` only if it was `None` (the first unflushed commit opens the window) and does **not** notify; the anchor thread's `wait_timeout` is computed from `dirty_since + BATCH_WINDOW`, so the head anchor trails the newest commit by ≤ 1 s and many commits share one keychain write. The writer notifies only for a new barrier, `enable_anchors`, `flush_head_anchor` (sets `flush_requested` and waits on a reply channel) and shutdown. `flush_requested` is cleared after the write attempt and the attempt's result is returned to the waiting `flush_head_anchor` call.
+`BATCH_WINDOW = 900 ms`. `work_due` is true when (a) a prune barrier's update is pending and the retry time (if any) has come, or (b) `flush_target()` differs from `written_head` and either `flush_requested` is set or `dirty_since` is older than `BATCH_WINDOW`, and the retry time (if any) has come. After each commit the writer sets `dirty_since = Some(now)` only if it was `None` (the first unflushed commit opens the window) and notifies only on that first commit of a window (so the idle thread starts timing it; later commits in the window do not notify); the anchor thread's `wait_timeout` is computed from `dirty_since + BATCH_WINDOW`, so the head anchor trails the newest commit by ≤ 1 s and many commits share one keychain write. Beyond the first commit of a window the writer notifies only for a new barrier, `enable_anchors`, `flush_head_anchor` (sets `flush_requested` and waits on a reply channel) and shutdown. `flush_requested` is cleared after the write attempt and the attempt's result is returned to the waiting `flush_head_anchor` call.
 
 Run: `cargo test -p atlas-duck-audit --test anchors --locked` → all pass.
 
@@ -1492,6 +1492,8 @@ Run: `cargo test -p atlas-duck-audit --test open --locked` → all pass. Re-run 
 **Files:**
 - Create: `crates/audit/src/prune.rs`, `crates/audit/tests/prune.rs`
 - Modify: `crates/audit/src/writer.rs` (cadence triggers, `append_in_tx` for the `PRUNE` row), `crates/audit/src/store.rs`
+
+**T08 handoff (barriers):** `Store::install_barrier(Barrier::Prune{..}) -> Result<BarrierGuard, AuditError>` must be called BEFORE the `PRUNE` commit becomes visible to the anchor thread (it can otherwise write a head above the PRUNE seq in the window between commit and install). Hold the guard across the whole prune; `guard.complete()` only after the work succeeded (the anchor thread lifts the barrier when the first-retained update succeeded), so every error path releases it by drop. Only one barrier can exist at a time (a second install is `Invalid`). `health().anchors_blocked` shows a leaked one.
 
 **Interfaces:**
 - Consumes: T06 `ClockState`, T07 writer, T08 `Barrier::Prune`, T09 (verification reused in tests), T12's `Settings` snapshot type (write a minimal `Settings { retention_days: 100, legal_hold: false, anchor_dir: None, instances: {} }` struct here; T12 fills the view).

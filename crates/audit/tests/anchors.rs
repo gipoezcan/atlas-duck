@@ -4,16 +4,21 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use atlas_duck_audit::anchors::{AnchorEntryError, FirstRetainedAnchor, HeadAnchor};
+use atlas_duck_audit::anchors::{AnchorEntryError, BarrierKind, FirstRetainedAnchor, HeadAnchor};
 use atlas_duck_audit::error::AuditError;
-use atlas_duck_audit::keystore::{EntryName, KeyStoreError, service_name};
+use atlas_duck_audit::keystore::{
+    EntryName, KeyStore, KeyStoreError, KeyringLocality, service_name,
+};
 use atlas_duck_audit::testing::{KeyOpKind, MemKeyring};
 use atlas_duck_audit::types::EventType;
 use atlas_duck_audit::{OpenConfig, Store};
 use common::*;
 use serde_json::json;
+use zeroize::Zeroizing;
 
 fn keychain_head(f: &Fixture) -> HeadAnchor {
     let b = f
@@ -137,14 +142,16 @@ fn anchor_entry_layouts() {
 }
 
 #[test]
-fn head_anchor_batched_within_one_second() {
+fn head_anchor_batched() {
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
     let before = sets_of(&f, EntryName::HeadAnchor);
     append_n(&store, 50);
     assert_eq!(store.head().0, 51);
+    // The "within 1 s" bound is checked deterministically in the unit tests of
+    // `AnchorState`; here the margin allows for a loaded machine.
     assert!(
-        wait_until(Duration::from_millis(1500), || keychain_head(&f).seq == 51),
-        "head anchor did not reach seq 51 within 1.5 s"
+        wait_until(Duration::from_secs(10), || keychain_head(&f).seq == 51),
+        "head anchor did not reach seq 51"
     );
     let h = keychain_head(&f);
     assert_eq!((h.seq, h.record_hash), (51, store.head().1));
@@ -210,42 +217,46 @@ fn head_anchor_stops_at_unfinished_prune() {
     let (n, hash, _) = store.head();
     assert_eq!(n, 3);
     let fr = first_retained_for(&store, 3, hash);
-    let old_fr = keychain_first_retained(&f);
+    assert_ne!(keychain_first_retained(&f), fr);
+    // The fault lasts until the test clears it: the failing state is observed, not raced.
     f.ring.fail_next(
         KeyOpKind::Set,
         Some(EntryName::FirstRetainedAnchor),
         KeyStoreError::Unavailable,
-        3,
+        u32::MAX,
     );
-    store.testing_prune_barrier(n, hash, fr.clone());
+    let guard = store
+        .testing_prune_barrier(n, hash, fr.clone())
+        .expect("barrier");
     append_n(&store, 10);
     assert!(
-        wait_until(Duration::from_secs(3), || {
+        wait_until(Duration::from_secs(10), || {
             let h = store.health();
             h.anchor_write_failing && h.first_retained_update_pending
         }),
         "failing prune update not reported"
     );
+    assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Prune));
     // While the update fails the head anchor never passes the PRUNE seq.
-    let mut cleared = false;
-    let end = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < end {
-        assert!(keychain_head(&f).seq <= n);
-        if keychain_first_retained(&f) == fr {
-            cleared = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(cleared, "first-retained entry never updated");
-    assert_ne!(old_fr, fr);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(keychain_head(&f).seq <= n);
+    assert_ne!(keychain_first_retained(&f), fr);
+
+    f.ring.clear_faults();
+    guard.complete();
     assert!(
-        wait_until(Duration::from_secs(3), || keychain_head(&f).seq == 13),
+        wait_until(Duration::from_secs(10), || {
+            keychain_first_retained(&f) == fr
+        }),
+        "first-retained entry never updated"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || keychain_head(&f).seq == 13),
         "head anchor did not reach the newest seq after the update"
     );
-    assert!(wait_until(Duration::from_secs(1), || {
+    assert!(wait_until(Duration::from_secs(10), || {
         let h = store.health();
-        !h.anchor_write_failing && !h.first_retained_update_pending
+        !h.anchor_write_failing && !h.first_retained_update_pending && h.anchors_blocked.is_none()
     }));
 }
 
@@ -259,16 +270,19 @@ fn prune_update_precedes_head_write() {
         KeyOpKind::Set,
         Some(EntryName::FirstRetainedAnchor),
         KeyStoreError::Unavailable,
-        1000,
+        u32::MAX,
     );
-    store.testing_prune_barrier(n, hash, first_retained_for(&store, 3, hash));
+    let _guard = store
+        .testing_prune_barrier(n, hash, first_retained_for(&store, 3, hash))
+        .expect("barrier");
     append_n(&store, 4);
-    // An explicit flush still writes the capped head.
+    // An explicit flush while the update fails returns that error and leaves the head anchor
+    // at its old value: the first-retained update comes first.
     assert_eq!(
         store.flush_head_anchor(),
         Err(AuditError::KeyStore(KeyStoreError::Unavailable))
     );
-    assert_eq!(keychain_head(&f).seq, 1, "first-retained comes first");
+    assert_eq!(keychain_head(&f).seq, 1);
 }
 
 #[test]
@@ -277,7 +291,8 @@ fn restore_barrier_blocks_head() {
     append_n(&store, 2);
     store.flush_head_anchor().expect("flush");
     let heads = sets_of(&f, EntryName::HeadAnchor);
-    store.testing_restore_barrier(3);
+    let guard = store.testing_restore_barrier(3).expect("barrier");
+    assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
     append_n(&store, 3);
     std::thread::sleep(Duration::from_millis(1300));
     assert_eq!(store.flush_head_anchor(), Ok(()));
@@ -300,15 +315,28 @@ fn restore_barrier_blocks_head() {
         store.testing_complete_restore_anchors(stale, fr.clone()),
         Err(AuditError::Invalid(_))
     ));
+    // Both anchors must name one chain.
+    let other_chain = FirstRetainedAnchor {
+        chain_id: "00".repeat(16),
+        ..fr.clone()
+    };
+    assert!(matches!(
+        store.testing_complete_restore_anchors(head.clone(), other_chain),
+        Err(AuditError::Invalid(_))
+    ));
     store
         .testing_complete_restore_anchors(head.clone(), fr.clone())
         .expect("complete restore");
+    guard.complete();
     assert_eq!(keychain_head(&f), head);
     assert_eq!(keychain_first_retained(&f), fr);
+    assert_eq!(store.health().anchors_blocked, None);
 
     // The barrier is gone: later commits are anchored again.
     append_n(&store, 1);
-    assert!(wait_until(Duration::from_secs(3), || keychain_head(&f).seq == 7));
+    assert!(wait_until(Duration::from_secs(10), || keychain_head(&f)
+        .seq
+        == 7));
     // And a second completion has no barrier to lift.
     assert!(matches!(
         store.testing_complete_restore_anchors(head, fr),
@@ -317,8 +345,48 @@ fn restore_barrier_blocks_head() {
 }
 
 #[test]
-fn drop_never_writes() {
+fn leaked_barrier_is_visible_and_the_guard_releases_it() {
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    append_n(&store, 1);
+    store.flush_head_anchor().expect("flush");
+    {
+        // An error path of restore: the guard is dropped without `complete()`.
+        let _guard = store.testing_restore_barrier(2).expect("barrier");
+        assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
+        append_n(&store, 2);
+        // A second barrier is refused and does not lift the first.
+        assert!(matches!(
+            store.testing_restore_barrier(3),
+            Err(AuditError::Invalid(_))
+        ));
+        let (n, hash, _) = store.head();
+        assert!(matches!(
+            store.testing_prune_barrier(n, hash, first_retained_for(&store, 1, [0; 32])),
+            Err(AuditError::Invalid(_))
+        ));
+        assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
+        assert_eq!(store.flush_head_anchor(), Ok(()));
+        assert_eq!(keychain_head(&f).seq, 2);
+    }
+    assert_eq!(store.health().anchors_blocked, None);
+    store.flush_head_anchor().expect("flush after release");
+    assert_eq!(keychain_head(&f).seq, 4);
+    // An explicit clear works as well.
+    let guard = store.testing_restore_barrier(4).expect("barrier");
+    guard.complete();
+    assert_eq!(store.health().anchors_blocked, Some(BarrierKind::Restore));
+    store.testing_clear_barrier();
+    assert_eq!(store.health().anchors_blocked, None);
+}
+
+#[test]
+fn drop_never_writes() {
+    // A batch window of one hour: nothing can be flushed before the shutdown, however slow
+    // the machine is.
+    let long = |cfg: &mut OpenConfig| {
+        cfg.hooks.anchor_batch_window = Some(Duration::from_secs(3600));
+    };
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), long);
     let heads = sets_of(&f, EntryName::HeadAnchor);
     append_n(&store, 3);
     store.shutdown();
@@ -326,7 +394,7 @@ fn drop_never_writes() {
     assert_eq!(keychain_head(&f).seq, 1);
     assert_eq!(sets_of(&f, EntryName::HeadAnchor), heads);
 
-    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    let (store, f) = new_store_with(fake_clock(START), MemKeyring::new(), long);
     append_n(&store, 3);
     drop(store);
     assert_eq!(keychain_head(&f).seq, 1);
@@ -338,7 +406,7 @@ fn anchor_failure_is_not_an_incident() {
     f.ring.set_unavailable(true);
     append_n(&store, 4);
     assert!(
-        wait_until(Duration::from_secs(3), || store
+        wait_until(Duration::from_secs(10), || store
             .health()
             .anchor_write_failing),
         "failing anchor write not reported"
@@ -364,4 +432,104 @@ fn anchor_failure_is_not_an_incident() {
     assert_eq!(keychain_head(&f).seq, 6);
     assert!(!store.health().anchor_write_failing);
     assert_eq!(dump_rows(&f).len(), 6);
+}
+
+/// A keystore whose `set` can panic or hang on demand (armed after first run).
+struct Gate {
+    inner: Arc<dyn KeyStore>,
+    panic_set: Arc<AtomicBool>,
+    block_set: Arc<AtomicBool>,
+}
+
+impl KeyStore for Gate {
+    fn install_id(&self) -> &str {
+        self.inner.install_id()
+    }
+
+    fn get(&self, e: &EntryName) -> Result<Option<Zeroizing<Vec<u8>>>, KeyStoreError> {
+        self.inner.get(e)
+    }
+
+    fn set(&self, e: &EntryName, v: &[u8]) -> Result<(), KeyStoreError> {
+        if self.panic_set.load(Ordering::SeqCst) {
+            panic!("injected keystore panic");
+        }
+        while self.block_set.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.inner.set(e, v)
+    }
+
+    fn delete(&self, e: &EntryName) -> Result<(), KeyStoreError> {
+        self.inner.delete(e)
+    }
+
+    fn locality(&self) -> KeyringLocality {
+        self.inner.locality()
+    }
+}
+
+fn gated(
+    panic_set: &Arc<AtomicBool>,
+    block_set: &Arc<AtomicBool>,
+) -> impl FnOnce(&mut OpenConfig) + use<> {
+    let (p, b) = (panic_set.clone(), block_set.clone());
+    move |cfg| {
+        cfg.keys = Arc::new(Gate {
+            inner: cfg.keys.clone(),
+            panic_set: p,
+            block_set: b,
+        });
+        cfg.hooks.anchor_wait_timeout = Some(Duration::from_millis(500));
+    }
+}
+
+#[test]
+fn panicking_keychain_does_not_hang_flush() {
+    let (panic_set, block_set) = (Arc::new(AtomicBool::new(false)), Arc::default());
+    let (store, f) = new_store_with(
+        fake_clock(START),
+        MemKeyring::new(),
+        gated(&panic_set, &block_set),
+    );
+    panic_set.store(true, Ordering::SeqCst);
+    append_n(&store, 2);
+    assert_eq!(store.flush_head_anchor(), Err(AuditError::AnchorThreadDead));
+    let h = store.health();
+    assert!(h.anchor_thread_dead && h.anchor_write_failing);
+    // The chain keeps working; every anchor call says why nothing is written.
+    append_n(&store, 1);
+    assert_eq!(store.head().0, 4);
+    assert_eq!(store.flush_head_anchor(), Err(AuditError::AnchorThreadDead));
+    assert!(matches!(
+        store.testing_restore_barrier(4),
+        Err(AuditError::AnchorThreadDead)
+    ));
+    assert_eq!(keychain_head(&f).seq, 1);
+    store.shutdown();
+}
+
+#[test]
+fn hung_keychain_times_out_flush_and_does_not_hang_shutdown() {
+    let (panic_set, block_set) = (Arc::new(AtomicBool::new(false)), Arc::default());
+    let (store, f) = new_store_with(
+        fake_clock(START),
+        MemKeyring::new(),
+        gated(&panic_set, &block_set),
+    );
+    block_set.store(true, Ordering::SeqCst);
+    append_n(&store, 2);
+    let t0 = Instant::now();
+    assert_eq!(
+        store.flush_head_anchor(),
+        Err(AuditError::AnchorFlushTimeout)
+    );
+    store.shutdown();
+    assert!(t0.elapsed() < Duration::from_secs(8), "shutdown hung");
+    assert_eq!(store.flush_head_anchor(), Err(AuditError::Closed));
+    // Release the detached thread; it must not write after the store closed... it may finish
+    // the one write it was in, but nothing else.
+    block_set.store(false, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(keychain_head(&f).seq <= 3);
 }

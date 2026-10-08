@@ -126,6 +126,11 @@ impl MemKeyring {
         });
     }
 
+    /// Drops every pending `fail_next` fault.
+    pub fn clear_faults(&self) {
+        lock(&self.faults).clear();
+    }
+
     /// Every operation fails with `Unavailable` while set.
     pub fn set_unavailable(&self, v: bool) {
         self.unavailable.store(v, Ordering::SeqCst);
