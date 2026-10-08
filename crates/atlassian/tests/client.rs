@@ -301,19 +301,6 @@ async fn post_send_timeout_and_cap() -> TestResult {
         other => return Err(format!("{other:?}").into()),
     }
 
-    // A stalled server before any header byte is a per-call timeout as well.
-    let silent = RawHttpServer::serve(vec![RawStep::Sleep(2000), RawStep::Close]).await?;
-    let mut cfg = test_config(Product::Confluence, &silent.base_url())?;
-    cfg.timeouts.per_call = Duration::from_millis(300);
-    let t = test_client(cfg)?;
-    assert_eq!(
-        failure(t.client.get(&test_cover()?, &call("/rest/api/space")).await)?,
-        FetchFailure::PostSend {
-            kind: PostSendKind::PerCallTimeout,
-            received: vec![],
-        }
-    );
-
     const MIB: usize = 1024 * 1024;
     let dc = MockDc::start(Product::Confluence, "").await;
     Mock::given(path("/rest/api/content"))
@@ -341,6 +328,34 @@ async fn post_send_timeout_and_cap() -> TestResult {
         }
         other => return Err(format!("{other:?}").into()),
     }
+    Ok(())
+}
+
+/// Task 9 review I-1: a server that accepted the connection and read the whole request, then
+/// stalls, may have acted on it, so the failure is post-send (never `PreSendConnection`).
+#[tokio::test]
+async fn stall_after_request_is_post_send() -> TestResult {
+    let silent = RawHttpServer::serve(vec![RawStep::Sleep(2000), RawStep::Close]).await?;
+    let mut cfg = test_config(Product::Confluence, &silent.base_url())?;
+    cfg.timeouts.per_call = Duration::from_millis(300);
+    let t = test_client(cfg)?;
+    let ctl = FetchControl::new();
+    assert_eq!(
+        failure(
+            t.client
+                .get_ctl(&test_cover()?, &call("/rest/api/space"), &ctl)
+                .await
+        )?,
+        FetchFailure::PostSend {
+            kind: PostSendKind::PerCallTimeout,
+            received: vec![],
+        }
+    );
+    assert!(ctl.take_captured().sent);
+    // The server had the full request head before the deadline.
+    let heads = silent.request_heads();
+    assert_eq!(heads.len(), 1);
+    assert!(heads[0].starts_with(b"GET /rest/api/space HTTP/1.1\r\n"));
     Ok(())
 }
 

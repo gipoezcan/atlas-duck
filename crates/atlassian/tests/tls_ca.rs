@@ -28,6 +28,12 @@ fn client(base: &str, ca: Option<&str>) -> Result<Arc<InstanceClient>, Box<dyn s
     Ok(test_client_with(cfg, creds)?.client)
 }
 
+/// What this proves: a configured custom CA is trusted, and a missing or wrong one is refused as
+/// `TlsUnknownIssuer`. The other half of Review Focus 1, "a public-CA server still connects when a
+/// custom CA is configured", is not exercised here: it needs a public host (network) or an OS trust
+/// store change, neither of which tests may do. It rests on reqwest 0.13.5 handing merged roots to
+/// `rustls_platform_verifier::Verifier::new_with_extra_roots` on all three OSes (see
+/// `client/tls.rs`).
 #[tokio::test]
 async fn custom_ca_merges_with_os_roots() -> TestResult {
     let server = TestTlsServer::start().await?;
@@ -47,8 +53,16 @@ async fn custom_ca_merges_with_os_roots() -> TestResult {
         FetchOutcome::Failed(FetchFailure::PreSendConnection(ConnClass::TlsUnknownIssuer))
     );
 
-    // C: some other CA merged with the OS roots.
+    // A bundle with an unrelated CA first and the server's CA second is merged whole.
     let other = generate_ca_pem()?;
+    let bundle = format!("{other}\n{}", server.ca_pem());
+    let d = client(&server.base_url(), Some(&bundle))?;
+    match d.get(&cover, &myself()).await {
+        FetchOutcome::Response(r) => assert_eq!(r.status, 200),
+        other => return Err(format!("client D: {other:?}").into()),
+    }
+
+    // C: some other CA merged with the OS roots.
     let c = client(&server.base_url(), Some(&other))?;
     assert_eq!(
         c.get(&cover, &myself()).await,

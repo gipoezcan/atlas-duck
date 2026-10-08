@@ -12,6 +12,21 @@ use super::classify::{MAX_WAIT, rate_limit_pause};
 
 pub(crate) const MAX_CONCURRENT: usize = 4;
 
+pub(crate) enum Acquired<'a> {
+    Permit(SemaphorePermit<'a>),
+    Cancelled,
+    /// The overall budget ran out while waiting; nothing of this attempt was sent.
+    Expired,
+}
+
+/// Never completes without a deadline.
+async fn until(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => sleep_until(d).await,
+        None => std::future::pending().await,
+    }
+}
+
 pub(crate) struct Limiter {
     permits: Semaphore,
     /// Set from a response with `X-RateLimit-Remaining: 0`; new permits wait until then.
@@ -26,21 +41,32 @@ impl Limiter {
         }
     }
 
-    /// A permit, after any rate-limit pause; `None` when `ctl` was cancelled while waiting.
-    pub(crate) async fn acquire(&self, ctl: &FetchControl) -> Option<SemaphorePermit<'_>> {
+    /// A permit, after any rate-limit pause. Both waits end early on a cancel or when the call's
+    /// overall budget (`deadline`) runs out.
+    pub(crate) async fn acquire(
+        &self,
+        ctl: &FetchControl,
+        deadline: Option<Instant>,
+    ) -> Acquired<'_> {
         let permit = tokio::select! {
             biased;
-            () = ctl.cancelled() => return None,
-            p = self.permits.acquire() => p.ok()?,
+            () = ctl.cancelled() => return Acquired::Cancelled,
+            () = until(deadline) => return Acquired::Expired,
+            p = self.permits.acquire() => match p {
+                Ok(p) => p,
+                // The semaphore is never closed.
+                Err(_) => return Acquired::Cancelled,
+            },
         };
-        if let Some(until) = self.pause_deadline() {
+        if let Some(pause) = self.pause_deadline() {
             tokio::select! {
                 biased;
-                () = ctl.cancelled() => return None,
-                () = sleep_until(until) => {}
+                () = ctl.cancelled() => return Acquired::Cancelled,
+                () = until(deadline) => return Acquired::Expired,
+                () = sleep_until(pause) => {}
             }
         }
-        Some(permit)
+        Acquired::Permit(permit)
     }
 
     /// Records the pacing headers of a response.
@@ -78,5 +104,52 @@ impl Limiter {
             }
             None => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[tokio::test]
+    async fn waits_end_on_budget_or_cancel() -> TestResult {
+        let l = Limiter::new();
+        let ctl = FetchControl::new();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONCURRENT {
+            match l.acquire(&ctl, None).await {
+                Acquired::Permit(p) => held.push(p),
+                _ => return Err("permit expected".into()),
+            }
+        }
+        let soon = Instant::now() + Duration::from_millis(50);
+        assert!(matches!(
+            l.acquire(&ctl, Some(soon)).await,
+            Acquired::Expired
+        ));
+        let cancelled = FetchControl::new();
+        cancelled.cancel();
+        assert!(matches!(
+            l.acquire(&cancelled, None).await,
+            Acquired::Cancelled
+        ));
+        drop(held);
+
+        // The rate-limit pause is bounded by the budget as well.
+        let paced = Limiter::new();
+        *paced
+            .pace_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some(Instant::now() + Duration::from_secs(10));
+        let soon = Instant::now() + Duration::from_millis(50);
+        assert!(matches!(
+            paced.acquire(&ctl, Some(soon)).await,
+            Acquired::Expired
+        ));
+        Ok(())
     }
 }

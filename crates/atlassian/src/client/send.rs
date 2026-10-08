@@ -8,7 +8,8 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, DATE, HeaderMap, HeaderValue,
 use tokio::time::{Instant, sleep_until};
 use zeroize::Zeroizing;
 
-use super::classify::{ConnFlags, classify_connect, is_json_content_type, retry_after_wait};
+use super::classify::{ConnFlags, execute_error_class, is_json_content_type, retry_after_wait};
+use super::limiter::Acquired;
 use super::{FetchControl, InstanceClient, Product};
 use crate::cover::AuditCover;
 use crate::credentials::{PatSecret, StoredCredential};
@@ -62,6 +63,18 @@ fn cancelled(ctl: &FetchControl) -> FetchOutcome {
     }
 }
 
+/// The overall budget ran out before this attempt was handed to the connection. If an earlier
+/// attempt of the call was sent (a retried 429), the expiry is post-send.
+fn budget_expired(ctl: &FetchControl, req: &OneRequest<'_>) -> FetchOutcome {
+    match req.overall {
+        Some((_, kind)) if ctl.is_sent() => failed(FetchFailure::PostSend {
+            kind,
+            received: Vec::new(),
+        }),
+        _ => failed(FetchFailure::BudgetExpiredBeforeSend),
+    }
+}
+
 /// The header value is marked sensitive; the formatted copy is zeroized.
 fn bearer(pat: &PatSecret) -> Option<HeaderValue> {
     let text = Zeroizing::new(format!("Bearer {}", pat.expose_secret()));
@@ -106,19 +119,22 @@ impl InstanceClient {
 
         let mut retries = 0;
         loop {
-            // Step 2: limiter permit (cancel-aware).
-            let Some(permit) = self.limiter.acquire(ctl).await else {
-                return cancelled(ctl);
+            // Step 2: limiter permit (cancel-aware, bounded by the overall budget).
+            let permit = match self
+                .limiter
+                .acquire(ctl, req.overall.map(|(end, _)| end))
+                .await
+            {
+                Acquired::Permit(p) => p,
+                Acquired::Cancelled => return cancelled(ctl),
+                Acquired::Expired => return budget_expired(ctl, &req),
             };
             let now = Instant::now();
             let mut deadline = now + self.cfg.timeouts.per_call;
             let mut deadline_kind = PostSendKind::PerCallTimeout;
             if let Some((end, kind)) = req.overall {
                 if now >= end {
-                    return failed(FetchFailure::PostSend {
-                        kind,
-                        received: Vec::new(),
-                    });
+                    return budget_expired(ctl, &req);
                 }
                 if end < deadline {
                     deadline = end;
@@ -156,18 +172,19 @@ impl InstanceClient {
             };
             let resp = match executed {
                 Ok(r) => r,
-                // No request-level timeout is configured, so a timeout here is the connect one.
-                Err(e) if e.is_connect() || e.is_timeout() => {
+                Err(e) => {
+                    // Only a connector error is pre-send; an I/O timeout after the request was
+                    // written (`is_timeout()` without `is_connect()`) may have reached the server.
                     let flags = ConnFlags {
                         timeout: e.is_timeout(),
                         dns: e.is_dns(),
                     };
-                    return failed(FetchFailure::PreSendConnection(classify_connect(&e, flags)));
-                }
-                Err(_) => {
-                    return failed(FetchFailure::PostSend {
-                        kind: PostSendKind::NetworkError,
-                        received: Vec::new(),
+                    return failed(match execute_error_class(&e, e.is_connect(), flags) {
+                        Some(class) => FetchFailure::PreSendConnection(class),
+                        None => FetchFailure::PostSend {
+                            kind: PostSendKind::NetworkError,
+                            received: Vec::new(),
+                        },
                     });
                 }
             };
@@ -340,5 +357,42 @@ async fn read_body(
             Ok(None) => return BodyRead::Complete,
             Err(_) => return BodyRead::Error,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_budget(overall: Option<(Instant, PostSendKind)>) -> OneRequest<'static> {
+        OneRequest {
+            method: reqwest::Method::GET,
+            template: "/rest/api/2/myself",
+            params: &serde_json::Value::Null,
+            query: &[],
+            json_body: None,
+            mode: SendMode::Read,
+            overall,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+        }
+    }
+
+    #[test]
+    fn budget_expiry_before_send_is_presend() {
+        let req = with_budget(Some((Instant::now(), PostSendKind::ReadBudget120s)));
+        let ctl = FetchControl::new();
+        assert_eq!(
+            budget_expired(&ctl, &req),
+            FetchOutcome::Failed(FetchFailure::BudgetExpiredBeforeSend)
+        );
+        // An earlier attempt of the call (a retried 429) was sent: post-send.
+        ctl.mark_sent();
+        assert_eq!(
+            budget_expired(&ctl, &req),
+            FetchOutcome::Failed(FetchFailure::PostSend {
+                kind: PostSendKind::ReadBudget120s,
+                received: Vec::new(),
+            })
+        );
     }
 }

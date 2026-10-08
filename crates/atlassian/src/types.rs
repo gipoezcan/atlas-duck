@@ -214,6 +214,9 @@ pub enum FetchFailure {
         received: Vec<u8>,
     },
     OriginGuardRefused,
+    /// Jira only (§7.2): checked on every JSON response, so `response.status` can be 401 (a JSON
+    /// 401 normally says `anonymous`) or 429. Core distinguishes a JSON 401 from a header
+    /// mismatch by the status before the §7.1 recheck branches.
     IdentityCheckFailed {
         observed: IdentityObserved,
         response: UpstreamResponse,
@@ -222,6 +225,11 @@ pub enum FetchFailure {
         bytes_received: Vec<u8>,
     },
     CancelledBeforeSend,
+    /// The call's overall budget (Task 10: read budget or write timeout) ran out in the limiter
+    /// or pacing wait before any request of the call was handed to the connection: nothing left,
+    /// data-free (Task 9 review, Δ C.4). Once a request of the call was sent, an expiry is
+    /// `PostSend` with the budget's kind.
+    BudgetExpiredBeforeSend,
     NeedsToken,
     MethodGuardRefused,
 }
@@ -259,6 +267,7 @@ impl fmt::Debug for FetchFailure {
                 .field("bytes_received", &format_args!("{}", len(bytes_received)))
                 .finish(),
             FetchFailure::CancelledBeforeSend => f.write_str("CancelledBeforeSend"),
+            FetchFailure::BudgetExpiredBeforeSend => f.write_str("BudgetExpiredBeforeSend"),
             FetchFailure::NeedsToken => f.write_str("NeedsToken"),
             FetchFailure::MethodGuardRefused => f.write_str("MethodGuardRefused"),
         }

@@ -95,6 +95,20 @@ pub(crate) struct ConnFlags {
     pub(crate) dns: bool,
 }
 
+/// Where a failed `execute` belongs (§5.2 step 6): `Some(class)` only for a connector error,
+/// which is pre-send. hyper-util tags every connector failure `ErrorKind::Connect`
+/// (`reqwest::Error::is_connect`), and reqwest's connect timeout is enforced inside the connector,
+/// so it is one of them. Every other error, including an I/O `TimedOut` after the request bytes
+/// were written (TCP user timeout, retransmission timeout; `is_timeout()` is true for those too),
+/// may have reached the server and is post-send (`None`).
+pub(crate) fn execute_error_class(
+    err: &(dyn Error + 'static),
+    is_connect: bool,
+    flags: ConnFlags,
+) -> Option<ConnClass> {
+    is_connect.then(|| classify_connect(err, flags))
+}
+
 /// The §11.2 class of a failure before any byte of the request was written. Walks the whole
 /// `source()` chain, looking inside `io::Error` wrappers too: `io::Error::source` skips the
 /// wrapped error, and reqwest 0.13 delivers a certificate failure as
@@ -103,6 +117,10 @@ pub(crate) struct ConnFlags {
 /// Proxy tunnel failures are matched on hyper-util's `TunnelError` text (no direct hyper-util
 /// dependency): `ProxyAuthRequired` displays as "tunnel error: proxy authorization required"
 /// (a 407 to CONNECT); every other tunnel failure starts with "tunnel error".
+///
+/// The matched texts ("tunnel error", "proxy authorization required", "dns error", "tcp ") are
+/// hyper-util 0.1.21's (`connect/proxy/tunnel.rs`, `connect/http.rs`). A lockfile guard test
+/// below fails when hyper-util moves, so the texts are re-checked on every update.
 pub(crate) fn classify_connect(err: &(dyn Error + 'static), flags: ConnFlags) -> ConnClass {
     let mut seen = Seen::default();
     let mut cur = Some(err);
@@ -410,6 +428,58 @@ mod tests {
             ConnClass::Dns
         );
         assert_eq!(class(&chain(&["something else"], None)), ConnClass::Connect);
+    }
+
+    #[test]
+    fn only_connector_errors_are_presend() {
+        let timed_out = chain(
+            &["connection error"],
+            Some(Box::new(io::Error::from(io::ErrorKind::TimedOut))),
+        );
+        let flags = ConnFlags {
+            timeout: true,
+            dns: false,
+        };
+        // An I/O timeout after the request was written: not a connector error, post-send.
+        assert_eq!(execute_error_class(&timed_out, false, flags), None);
+        assert_eq!(
+            execute_error_class(
+                &chain(&["connection reset"], None),
+                false,
+                ConnFlags::default()
+            ),
+            None
+        );
+        // reqwest's connect timeout comes from the connector.
+        assert_eq!(
+            execute_error_class(&timed_out, true, flags),
+            Some(ConnClass::ConnectTimeout)
+        );
+        let refused = chain(
+            &["tcp connect error"],
+            Some(Box::new(io::Error::from(io::ErrorKind::ConnectionRefused))),
+        );
+        assert_eq!(
+            execute_error_class(&refused, true, ConnFlags::default()),
+            Some(ConnClass::Connect)
+        );
+    }
+
+    /// The texts `Seen::inspect` matches are hyper-util 0.1.21's; re-check them before moving.
+    #[test]
+    fn hyper_util_texts_are_pinned_by_the_lockfile() {
+        // `lines()` also strips a trailing CR, so a CRLF checkout passes too.
+        let lock: Vec<&str> = include_str!("../../../../Cargo.lock").lines().collect();
+        let versions: Vec<&str> = lock
+            .windows(2)
+            .filter(|w| w[0] == "name = \"hyper-util\"")
+            .map(|w| w[1])
+            .collect();
+        assert_eq!(
+            versions,
+            ["version = \"0.1.21\""],
+            "hyper-util moved: re-check the error texts in classify_connect"
+        );
     }
 
     #[test]
