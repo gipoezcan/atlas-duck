@@ -13,6 +13,9 @@ atlas-duck-preview = { path = "../preview" }
 atlas-duck-audit = { path = "../audit" }
 atlas-duck-ipc = { path = "../ipc" }
 toml_edit = { workspace = true }
+jsonschema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { workspace = true }
@@ -28,7 +31,6 @@ testing = []
 [dev-dependencies]
 atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }
 proptest = { workspace = true }
-serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 

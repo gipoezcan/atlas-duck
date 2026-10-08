@@ -13,3 +13,5 @@ pub mod http_factory;
 pub mod lifecycle;
 /// Proxy resolution (L42) and the per-OS static proxy readers (V17).
 pub mod proxy;
+/// Static params validation: schema, field rules, caps, move limit, `min_version` (§2.3, §5.2).
+pub mod validate;

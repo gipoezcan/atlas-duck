@@ -1588,6 +1588,8 @@ pub const MOVE_LIMIT_HINT: &str = "split into requests of ≤ 50 issues; moves o
 - [ ] **Step 2: Implement; run** `cargo test -p atlas-duck-core --test validate --locked` → pass.
 - [ ] **Step 3: Commit** `feat(core): static params validation, field rules, caps, min_version gate` (+ trailer).
 
+**As built (Task 13):** `validate` checks, in order: move limit (before the schema so the §7.3 hint wins over `maxItems`), schema (first violation only, message `params/<path>: <keyword>`, `details.param` = first path segment, or the missing/unexpected property), `min_version`, field rules (`fields`/`expand`; `fields` and `expected` keys of every op with an `expected` baseline, i.e. `jira.issue.edit`; the duplicate rule only for create), PD-09 `body_format` (any write whose schema declares `body_format`), attachment size (decoded base64 length), `max` clamp. Every agent string echoed in an error (`details.value`, unknown or invalid keys) is cut to 64 chars and passed through `preview::invisible::escape_for_display`; the free-text params themselves (`summary`, `body`, ...) are not stripped or rejected for invisible characters (they are marked in the preview, §6.4). An absent `max` takes `min(op default, hard cap)` without `truncated_by_clamp`. `validate_script_limits(limits, &ceiling)` is the reusable half of `validate_script_submit` (configured defaults later); **deferred:** the §9.4 memory invariants (`heap_mb ≥ k × max_call_result_mb`, `process_mb ≥ heap_mb + 88`) are not enforced here because `k` is provisional until M8 and the plan's own test accepts `{"heap_mb": 64}`; M8 adds them to `validate_script_limits`.
+
 ---
 
 ### Task 14: `core::redact`: redaction engine, copies, mirrors, canonical match form (U-26, U-28, U-29 core half)
