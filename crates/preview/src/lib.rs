@@ -1,6 +1,8 @@
 //! Preview model builders per operation (§2.2).
 
+pub mod invisible;
 mod json_tree;
+pub mod mixed_script;
 mod model;
 mod sanitize;
 pub mod warning;

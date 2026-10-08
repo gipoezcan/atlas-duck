@@ -74,6 +74,11 @@ proptest = "=1.11.0"
 jsonschema = { version = "=0.58.6", default-features = false }
 # M3 preview sanitizer (§6.4).
 ammonia = "=4.2.1"
+# M3 invisible-character classifier, mixed-script check and NFC from one ICU data version (§6.4, V31).
+icu_properties = "=2.3.0"
+icu_normalizer = "=2.3.0"
+# RGI emoji sequences (fully-qualified emoji of emoji-test.txt); icu_properties has no RGI string set.
+emojis = "=0.9.0"
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.
