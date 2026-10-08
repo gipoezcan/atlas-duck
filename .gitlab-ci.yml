@@ -1,7 +1,13 @@
 # Linux-only GitLab mirror of the jobs in .github/workflows/ci.yml (unverified:
 # written without runner access). Windows, macOS and Rosetta legs exist only in
 # the GitHub workflow.
-stages: [check, supply-chain]
+#
+# Shape: the `rust:1.95` image has cargo but no Node, the `node:22` image has Node
+# but no cargo. So the UI is built in a Node job whose app/ui/dist is passed as an
+# artifact (tauri::generate_context! needs it at compile time, so clippy and the tests
+# cannot run without it), and the checks that need both (ci/check-workspace.mjs runs
+# `cargo metadata`) run in the Node job after installing a minimal rustup toolchain.
+stages: [ui, check, supply-chain]
 
 default:
   image: rust:1.95
@@ -11,8 +17,25 @@ variables:
   CARGO_INCREMENTAL: "0"
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
 
+ui:
+  stage: ui
+  image: node:22
+  script:
+    - cd app/ui
+    - npm ci --ignore-scripts
+    - npm run lint
+    - npm test
+    - npm run test:scripts
+    - npm run build
+  artifacts:
+    paths: [app/ui/dist]
+    expire_in: 1 day
+
 rust:test:
   stage: check
+  needs:
+    - job: ui
+      artifacts: true
   before_script:
     - apt-get update
     - apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev dbus-x11 xvfb
@@ -27,12 +50,24 @@ rust:test:
 node:ci-checks:
   stage: check
   image: node:22
+  needs: []
+  variables:
+    # The Node image ships no cargo: install the pinned toolchain (rust-toolchain.toml
+    # says 1.95.0) with the official rustup script. Only `cargo metadata` runs here.
+    RUSTUP_HOME: "$CI_PROJECT_DIR/.rustup-home"
+  before_script:
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95.0
+    - export PATH="$CARGO_HOME/bin:$PATH"  # before_script and script share one shell
   script:
     - node ci/check-workspace.mjs
     - node --test "ci/*.test.mjs"
+  cache:
+    key: cargo-metadata-$CI_COMMIT_REF_SLUG
+    paths: [.cargo-home/registry]
 
 supply-chain:
   stage: supply-chain
+  needs: []
   before_script:
     - rustup toolchain install
     - cargo install --locked cargo-deny@0.20.2 cargo-audit@0.22.2
