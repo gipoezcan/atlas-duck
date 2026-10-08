@@ -679,7 +679,8 @@ mod t21 {
         // against the API before it checks out or downloads anything.
         let text = workflow();
         assert_eq!(
-            text.matches("- name: Cross-check bundle_run_id and bundle_sha").count(),
+            text.matches("- name: Cross-check bundle_run_id and bundle_sha")
+                .count(),
             7,
             "one cross-check per job"
         );
