@@ -28,7 +28,7 @@ pub fn map_keyring_error(e: keyring_core::Error) -> MappedError {
         E::NoStorageAccess(_) => MappedError::Error(KeyStoreError::Locked),
         E::PlatformFailure(_) | E::NoDefaultStore => MappedError::Error(KeyStoreError::Unavailable),
         E::Ambiguous(_) => other("ambiguous entry".into()),
-        E::BadEncoding(_) | E::BadDataFormat(_, _) => other("bad data".into()),
+        E::BadEncoding(_) | E::BadDataFormat(_, _) => MappedError::Error(KeyStoreError::Corrupt),
         E::TooLong(a, n) => other(format!("{a} too long (max {n})")),
         E::Invalid(p, _) => other(format!("invalid {p}")),
         // BadStoreFormat, NotSupportedByStore and any future (non-exhaustive) variant.

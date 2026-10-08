@@ -98,13 +98,15 @@ fn error_mapping_table() {
         map_keyring_error(E::Ambiguous(Vec::new())),
         other("ambiguous entry")
     );
+    // Undecodable stored bytes are their own, deterministic kind (startup: keychain_lost on
+    // the KEK), and the bytes are dropped.
     assert_eq!(
         map_keyring_error(E::BadEncoding(vec![0xFF, 1])),
-        other("bad data")
+        MappedError::Error(KeyStoreError::Corrupt)
     );
     assert_eq!(
         map_keyring_error(E::BadDataFormat(vec![1, 2], pe())),
-        other("bad data")
+        MappedError::Error(KeyStoreError::Corrupt)
     );
     assert_eq!(
         map_keyring_error(E::TooLong("target".into(), 512)),

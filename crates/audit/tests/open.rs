@@ -283,14 +283,44 @@ fn startup_order_migration_then_verify() {
 
     let faults = Faults::new();
     let seen: Arc<Mutex<Option<Vec<KeyOp>>>> = Arc::new(Mutex::new(None));
+    // Structural order: (point, committed head in the DB at that moment).
+    let order: Arc<Mutex<Vec<(&'static str, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let db_head = {
+        let db = f.db_path();
+        move || -> u64 {
+            let c = rusqlite::Connection::open_with_flags(
+                &db,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .expect("reader");
+            c.query_row("SELECT max(seq) FROM events", [], |r| r.get::<_, i64>(0))
+                .expect("head") as u64
+        }
+    };
     {
         let ring = f.ring.clone();
         let seen = seen.clone();
+        let order = order.clone();
+        let db_head = db_head.clone();
         faults.on_hit(FaultPoint::AfterStartupVerifyAppend, move || {
-            // Many batch windows long: an anchor thread that was already enabled would have
-            // written by now.
+            order
+                .lock()
+                .expect("lock")
+                .push(("verify_appended", db_head()));
+            // Timing tripwire on top of the structural check below: many batch windows long,
+            // so an anchor thread that was already enabled would very likely have written by
+            // now (a loaded runner could still miss it; the hit order cannot).
             std::thread::sleep(Duration::from_millis(150));
             *seen.lock().expect("lock") = Some(ring.ops());
+        });
+    }
+    {
+        let order = order.clone();
+        faults.on_hit(FaultPoint::AnchorsEnabled, move || {
+            order
+                .lock()
+                .expect("lock")
+                .push(("anchors_enabled", db_head()));
         });
     }
     let mut cfg = f.config();
@@ -328,6 +358,11 @@ fn startup_order_migration_then_verify() {
     );
     assert_eq!(store.testing_pragma("user_version").expect("pragma"), 2);
 
+    // Anchors were enabled exactly once, after the migration and the VERIFY had committed.
+    assert_eq!(
+        *order.lock().expect("lock"),
+        vec![("verify_appended", h + 2), ("anchors_enabled", h + 2)]
+    );
     let at_verify = seen.lock().expect("lock").clone().expect("observer ran");
     let early_sets: Vec<_> = at_verify
         .iter()
@@ -337,7 +372,7 @@ fn startup_order_migration_then_verify() {
     assert!(early_sets.is_empty(), "{early_sets:?}");
 
     store.flush_head_anchor().expect("flush");
-    assert!(keychain_head(&f).is_some_and(|a| a.seq >= h + 2));
+    assert_eq!(keychain_head(&f).map(|a| a.seq), Some(h + 2));
     assert_eq!(store.open_incidents(), vec![h + 2]);
     store.shutdown();
 }
@@ -539,6 +574,171 @@ fn kek_undecryptable_is_lost() {
         );
     }
     assert_eq!(row_count(&f), rows, "no VERIFY");
+    assert_eq!(file_states(&f), before);
+}
+
+#[test]
+fn tampered_newest_key_row_is_an_incident_not_lost() {
+    // Two key rows (uncorroborated + month DEK); the newest record uses the month DEK. A
+    // corrupted wrapped key there must not read as a lost keychain: the other key opens, so
+    // the KEK is this store's and verification reports the tamper. (A lost-keychain outcome
+    // would lead to "Recover this log", which rebuilds the keychain anchors from the DB and
+    // so erases the anchor evidence.)
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    store.append_batch(mixed(3)).expect("append");
+    corroborate(&store);
+    store.append_batch(mixed(3)).expect("append");
+    store.flush_head_anchor().expect("flush");
+    store.shutdown();
+    let keys = key_rows(&f);
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    let newest_key = dump_rows(&f).last().expect("rows").key_id;
+    assert_eq!(newest_key, keys[1].0);
+    let c = raw_conn(&f);
+    let mut wrapped: Vec<u8> = c
+        .query_row(
+            "SELECT wrapped_dek FROM keys WHERE key_id = ?1",
+            [newest_key as i64],
+            |r| r.get(0),
+        )
+        .expect("wrapped");
+    wrapped[20] ^= 0x01;
+    c.execute(
+        "UPDATE keys SET wrapped_dek = ?1 WHERE key_id = ?2",
+        rusqlite::params![wrapped, newest_key as i64],
+    )
+    .expect("tamper");
+    drop(c);
+
+    let v = atlas_duck_audit::testing::startup_verdict(&f.data, &f.config())
+        .expect("verified, not locked");
+    assert!(
+        v.findings
+            .iter()
+            .any(|x| x.kind == FindingKind::DecryptFailed && x.kind.is_incident()),
+        "{:?}",
+        v.findings
+    );
+    // The incident VERIFY would be encrypted under the same (broken) month DEK, and the
+    // writer never creates a DEK for a month this process has not corroborated: startup fails
+    // closed with an error naming the key, appends nothing and leaves the anchors as they are.
+    let anchor = keychain_head(&f);
+    let rows = row_count(&f);
+    match open(&f.data, &f.lock, f.config()) {
+        Err(OpenError::Io(e)) => {
+            assert!(e.to_string().contains("data key 2 does not unwrap"), "{e}")
+        }
+        other => panic!("expected the VERIFY append to fail, got {other:?}"),
+    }
+    assert_eq!(keychain_head(&f), anchor);
+    assert_eq!(row_count(&f), rows);
+
+    // With the newest key the only one, a wrong KEK and a broken key row are
+    // indistinguishable: that stays keychain_lost (fail closed; recovery verifies again).
+    let g = closed_store(3);
+    assert_eq!(key_rows(&g).len(), 1);
+    raw_conn(&g)
+        .execute(
+            "UPDATE keys SET wrapped_dek = zeroblob(length(wrapped_dek)) WHERE key_id = 1",
+            [],
+        )
+        .expect("tamper");
+    assert_eq!(
+        locked(open_cfg(&g, g.config())),
+        LockedReason::KeychainLost {
+            offer: RecoveryOffer::RecoverThisLog
+        }
+    );
+}
+
+#[test]
+fn corrupt_kek_entry_is_lost_ambiguous_is_unavailable() {
+    let f = closed_store(3);
+    let before = file_states(&f);
+    // Undecodable stored bytes: deterministic, only recovery (a re-seal) clears it.
+    f.ring.fail_next(
+        KeyOpKind::Get,
+        Some(EntryName::Kek),
+        KeyStoreError::Corrupt,
+        1,
+    );
+    assert_eq!(
+        locked(open_cfg(&f, f.config())),
+        LockedReason::KeychainLost {
+            offer: RecoveryOffer::RecoverThisLog
+        }
+    );
+    // An ambiguous entry (several matching credentials) stays "unavailable": a re-seal would
+    // hit the same ambiguity.
+    f.ring.fail_next(
+        KeyOpKind::Get,
+        Some(EntryName::Kek),
+        KeyStoreError::Other("ambiguous entry".into()),
+        1,
+    );
+    assert_eq!(
+        locked(open_cfg(&f, f.config())),
+        LockedReason::KeychainUnavailable
+    );
+    assert_eq!(file_states(&f), before);
+    // A corrupt KEK of this install's interrupted restore offers "Finish restore".
+    insert_raw_restore(&f, &f.install_id);
+    f.ring.fail_next(
+        KeyOpKind::Get,
+        Some(EntryName::Kek),
+        KeyStoreError::Corrupt,
+        1,
+    );
+    assert_eq!(
+        locked(open_cfg(&f, f.config())),
+        LockedReason::KeychainLost {
+            offer: RecoveryOffer::FinishRestore
+        }
+    );
+}
+
+#[test]
+fn locked_outcomes_leave_a_persisted_wal_alone() {
+    // A crash left `audit.db-wal` behind and no other connection is open: the locked paths
+    // (which read the DB only through a read-only connection) neither checkpoint nor delete
+    // it.
+    let f = closed_store(3);
+    {
+        let c = raw_conn(&f);
+        c.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        )
+        .expect("no checkpoint on close");
+        c.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('written_by', '0.0.1')",
+            [],
+        )
+        .expect("write into the WAL");
+    }
+    let wal = f.dir.path().join("audit.db-wal");
+    assert!(
+        std::fs::metadata(&wal).is_ok_and(|m| m.len() > 0),
+        "WAL persisted"
+    );
+    let before = file_states(&f);
+
+    f.ring.set_unavailable(true);
+    assert_eq!(
+        locked(open_cfg(&f, f.config())),
+        LockedReason::KeychainUnavailable
+    );
+    assert_eq!(file_states(&f), before);
+    f.ring.set_unavailable(false);
+
+    // The lost path reads the DB (recovery offer) through the WAL-aware read-only reader.
+    f.ring.wipe_install(&f.install_id);
+    assert_eq!(
+        locked(open_cfg(&f, f.config())),
+        LockedReason::KeychainLost {
+            offer: RecoveryOffer::RecoverThisLog
+        }
+    );
     assert_eq!(file_states(&f), before);
 }
 
@@ -796,6 +996,11 @@ fn fixture_dir() -> PathBuf {
 #[test]
 #[ignore = "regenerates the committed schema-v1 fixture"]
 fn generate_v1_fixture() {
+    // Frozen like the golden vectors: CI only ever checks it, never rewrites it.
+    assert!(
+        std::env::var_os("CI").is_none(),
+        "generate_v1_fixture is refused when CI is set: the schema-v1 fixture is frozen"
+    );
     let ring = MemKeyring::new();
     let clock = fake_clock("2026-10-08T09:00:00.000Z");
     let (dir, data, lock) = tmp_data_dir();

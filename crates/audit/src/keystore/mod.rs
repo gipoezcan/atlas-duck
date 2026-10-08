@@ -58,6 +58,9 @@ pub enum KeyStoreError {
     Unavailable,
     Locked,
     NotLocal,
+    /// The entry exists but its stored bytes cannot be decoded (keyring-core `BadEncoding` /
+    /// `BadDataFormat`): deterministic, a retry never clears it.
+    Corrupt,
     Other(String),
 }
 
@@ -67,6 +70,7 @@ impl fmt::Display for KeyStoreError {
             KeyStoreError::Unavailable => f.write_str("keychain unavailable"),
             KeyStoreError::Locked => f.write_str("keychain locked"),
             KeyStoreError::NotLocal => f.write_str("keychain is not on a local disk"),
+            KeyStoreError::Corrupt => f.write_str("keychain entry is unreadable"),
             KeyStoreError::Other(m) => write!(f, "keychain error: {m}"),
         }
     }

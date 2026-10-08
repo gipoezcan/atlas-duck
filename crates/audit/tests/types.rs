@@ -157,4 +157,6 @@ fn errors_never_print_bytes() {
     assert!(longest_hex_run(&s) <= 8, "{s}");
     let s = format!("{}", KeyStoreError::Other("bad data".into()));
     assert!(longest_hex_run(&s) <= 8, "{s}");
+    let s = format!("{:?} {}", KeyStoreError::Corrupt, KeyStoreError::Corrupt);
+    assert!(longest_hex_run(&s) <= 8, "{s}");
 }

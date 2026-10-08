@@ -253,6 +253,9 @@ pub enum FaultPoint {
     /// `open()` step 4: right after the startup `VERIFY` committed (or was not needed), before
     /// any anchor action or anchor write is allowed.
     AfterStartupVerifyAppend,
+    /// Anchor writes are enabled (startup step 4, or `testing_enable_anchors`). Observation
+    /// only: an armed failure is ignored.
+    AnchorsEnabled,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

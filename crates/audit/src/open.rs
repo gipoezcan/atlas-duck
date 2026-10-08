@@ -339,46 +339,74 @@ fn recovery_offer(conn: &Connection, install_id: &str) -> Result<RecoveryOffer, 
     })
 }
 
-/// `(key_id, key row exists, month, wrapped_dek)` of the newest record; `None` where the
-/// stored value has the wrong type.
-type NewestKey = (Option<u64>, bool, Option<Option<String>>, Option<Vec<u8>>);
+/// One `keys` row as stored; `None` where a value has the wrong type.
+struct KeyRow {
+    key_id: Option<u64>,
+    month: Option<Option<String>>,
+    wrapped: Option<Vec<u8>>,
+}
 
-/// Whether `kek` opens the data key of the newest record. `false` only when that key exists
-/// and does not unwrap: the keychain KEK is not this store's (§8.7 "undecryptable"). A missing,
-/// destroyed or unreadable key row is left to verification, which reports it as an incident.
-fn newest_dek_unwraps(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
-    let row: Option<NewestKey> = conn
-        .query_row(
-            "SELECT e.key_id, k.key_id IS NOT NULL, k.month, k.wrapped_dek FROM events e \
-             LEFT JOIN keys k ON k.key_id = e.key_id ORDER BY e.seq DESC LIMIT 1",
-            [],
-            |r| {
-                let key_id = match r.get_ref(0)? {
-                    ValueRef::Integer(i) => u64::try_from(i).ok(),
-                    _ => None,
-                };
-                let month = match r.get_ref(2)? {
-                    ValueRef::Null => Some(None),
-                    v => text(v).map(Some),
-                };
-                let wrapped = match r.get_ref(3)? {
-                    ValueRef::Blob(b) => Some(b.to_vec()),
-                    _ => None,
-                };
-                Ok((key_id, r.get::<_, bool>(1)?, month, wrapped))
+impl KeyRow {
+    /// `key_id`, `month`, `wrapped_dek` from the columns `at..at + 3`.
+    fn read(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<KeyRow> {
+        Ok(KeyRow {
+            key_id: match r.get_ref(at)? {
+                ValueRef::Integer(i) => u64::try_from(i).ok(),
+                _ => None,
             },
+            month: match r.get_ref(at + 1)? {
+                ValueRef::Null => Some(None),
+                v => text(v).map(Some),
+            },
+            wrapped: match r.get_ref(at + 2)? {
+                ValueRef::Blob(b) => Some(b.to_vec()),
+                _ => None,
+            },
+        })
+    }
+
+    /// Whether `kek` unwraps this key; `None` when the row cannot be tried.
+    fn unwraps(&self, kek: &Kek) -> Option<bool> {
+        let (Some(id), Some(month), Some(w)) = (self.key_id, &self.month, &self.wrapped) else {
+            return None;
+        };
+        Some(crypto::unwrap_dek(kek, id, month.as_deref(), w).is_ok())
+    }
+}
+
+/// Whether `kek` is this store's KEK. `false` (§8.7 "undecryptable", `keychain_lost`) only
+/// when the newest record's data key exists and does not unwrap **and** no other key row with
+/// a wrapped key unwraps either: a tampered newest key row next to keys that open is not a
+/// lost keychain but an incident, which verification reports. A missing, destroyed or
+/// unreadable key row of the newest record is left to verification as well.
+fn kek_opens_store(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
+    let newest: Option<(bool, KeyRow)> = conn
+        .query_row(
+            "SELECT k.key_id IS NOT NULL, e.key_id, k.month, k.wrapped_dek FROM events e              LEFT JOIN keys k ON k.key_id = e.key_id ORDER BY e.seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, bool>(0)?, KeyRow::read(r, 1)?)),
         )
         .optional()
         .map_err(sql)?;
-    let Some((key_id, found, month, wrapped)) = row else {
+    let Some((found, newest)) = newest else {
         return Err(OpenError::Integrity("the store has no records".into()));
     };
-    Ok(match (key_id, found, month, wrapped) {
-        (Some(id), true, Some(month), Some(w)) => {
-            crypto::unwrap_dek(kek, id, month.as_deref(), &w).is_ok()
+    if !found || newest.unwraps(kek) != Some(false) {
+        return Ok(true);
+    }
+    let mut st = conn
+        .prepare(
+            "SELECT key_id, month, wrapped_dek FROM keys WHERE wrapped_dek IS NOT NULL              ORDER BY key_id DESC",
+        )
+        .map_err(sql)?;
+    let mut rows = st.query([]).map_err(sql)?;
+    while let Some(r) = rows.next().map_err(sql)? {
+        let k = KeyRow::read(r, 0).map_err(sql)?;
+        if k.key_id != newest.key_id && k.unwraps(kek) == Some(true) {
+            return Ok(true);
         }
-        _ => true,
-    })
+    }
+    Ok(false)
 }
 
 /// `open()` steps 1–3 (§8.7): an outcome that stops startup, or the KEK and the verdict held
@@ -432,6 +460,9 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
         locked(LockedReason::KeychainLost { offer })
     };
     let kek = match cfg.keys.get(&EntryName::Kek) {
+        // An entry whose bytes do not decode is "undecryptable" (§8.7): only recovery (a
+        // re-seal) clears it, never a retry.
+        Err(KeyStoreError::Corrupt) => return lost(&schema::open_peek(&db)?),
         Err(e) => return locked(keyring_reason(&e)),
         Ok(None) => return lost(&schema::open_peek(&db)?),
         Ok(Some(b)) => match Kek::from_entry_bytes(&b) {
@@ -441,7 +472,7 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
         },
     };
     let ro = schema::open_peek(&db)?;
-    if !newest_dek_unwraps(&ro, &kek)? {
+    if !kek_opens_store(&ro, &kek)? {
         return lost(&ro);
     }
     // 3. Anchors, head first, then the verification of the pre-migration store (§8.7). The
@@ -492,7 +523,9 @@ pub fn open(
     };
     let store = match start_existing(data, cfg, kek) {
         Ok(s) => s,
-        // The writer's WAL-aware re-check of the gate.
+        // The writer's WAL-aware re-check of the gate. Not write-free like the step-1 gate:
+        // the writer's read-write connection was opened and closed (a close may checkpoint).
+        // Practically unreachable, since step 1 read through the same WAL.
         Err(OpenError::NewerStore(found)) => {
             let found = match schema::read_versions(&schema::db_path(data)) {
                 Ok(v) => with_written_by(found, &v),

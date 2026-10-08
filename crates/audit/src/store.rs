@@ -524,6 +524,11 @@ impl Store {
     /// Startup verification passed: the anchor thread may write (§8.7 "no anchor writes
     /// before verification").
     pub(crate) fn enable_anchors(&self) {
+        #[cfg(any(test, feature = "testing"))]
+        let _ = self
+            .inner
+            .hooks
+            .fault(crate::testing::FaultPoint::AnchorsEnabled);
         self.inner.shared.anchors.enable();
     }
 
