@@ -23,6 +23,12 @@ impl NormalizedBaseUrl {
         )
     }
 
+    /// `scheme://host[:port]`, without the context path.
+    fn origin_str(&self) -> String {
+        let port = self.port.map(|p| format!(":{p}")).unwrap_or_default();
+        format!("{}://{}{}", self.scheme, self.host, port)
+    }
+
     pub fn host(&self) -> &str {
         &self.host
     }
@@ -99,6 +105,92 @@ pub fn normalize_base_url(raw: &str) -> Result<NormalizedBaseUrl, BaseUrlError> 
         port,
         context_path: path.to_owned(),
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TemplateError {
+    MissingParam(String),
+    BadParam(String),
+}
+
+impl fmt::Display for TemplateError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TemplateError::MissingParam(n) => write!(f, "missing path parameter `{n}`"),
+            TemplateError::BadParam(n) => write!(f, "bad path parameter `{n}`"),
+        }
+    }
+}
+
+impl std::error::Error for TemplateError {}
+
+/// Everything except ALPHA / DIGIT / `-` `.` `_` `~`.
+const PATH_VALUE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// Builds the request URL from an endpoint template (`/rest/api/2/issue/{key}`) under the base
+/// URL including its context path (§7.2). Never accepts a full URL and never reads `_links.next`.
+/// A placeholder value that is empty, `.`/`..` or would act as a dot segment is `BadParam`.
+pub fn build_url(
+    base: &NormalizedBaseUrl,
+    template: &str,
+    params: &serde_json::Value,
+    query: &[(String, String)],
+) -> Result<url::Url, TemplateError> {
+    if !template.starts_with('/') || template.starts_with("//") || template.contains(['?', '#', BS])
+    {
+        return Err(TemplateError::BadParam("template".to_owned()));
+    }
+    let mut path = String::from(base.context_path());
+    let mut rest = template;
+    while let Some(open) = rest.find(['{', '}']) {
+        if rest.as_bytes()[open] == b'}' {
+            return Err(TemplateError::BadParam("template".to_owned()));
+        }
+        path.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let close = after
+            .find(['{', '}'])
+            .filter(|&i| after.as_bytes()[i] == b'}')
+            .ok_or_else(|| TemplateError::BadParam("template".to_owned()))?;
+        let name = &after[..close];
+        let value = match params.get(name) {
+            None | Some(serde_json::Value::Null) => {
+                return Err(TemplateError::MissingParam(name.to_owned()));
+            }
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(serde_json::Value::Number(n)) => n
+                .as_i64()
+                .map(|i| i.to_string())
+                .or_else(|| n.as_u64().map(|u| u.to_string()))
+                .ok_or_else(|| TemplateError::BadParam(name.to_owned()))?,
+            Some(_) => return Err(TemplateError::BadParam(name.to_owned())),
+        };
+        if value.is_empty() || has_dot_segment(&value) {
+            return Err(TemplateError::BadParam(name.to_owned()));
+        }
+        path.extend(percent_encoding::utf8_percent_encode(&value, PATH_VALUE));
+        rest = &after[close + 1..];
+    }
+    path.push_str(rest);
+    // Literal template text is registry data, but a dot segment must never leave this function.
+    if has_dot_segment(&path) {
+        return Err(TemplateError::BadParam("template".to_owned()));
+    }
+    let mut u = url::Url::parse(&format!("{}{}", base.origin_str(), path))
+        .map_err(|_| TemplateError::BadParam("template".to_owned()))?;
+    // The parser must not have rewritten the path (dot segments, backslashes).
+    if u.path() != path {
+        return Err(TemplateError::BadParam("template".to_owned()));
+    }
+    if !query.is_empty() {
+        u.query_pairs_mut()
+            .extend_pairs(query.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    }
+    Ok(u)
 }
 
 /// SHA-256 over the domain-separated normalized base URL; the PAT is bound to it.
