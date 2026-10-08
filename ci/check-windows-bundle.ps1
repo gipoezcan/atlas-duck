@@ -5,7 +5,8 @@
 
 .DESCRIPTION
   Lists the installer with 7-Zip and asserts that the executables it installs are exactly
-  atlas-duck-app.exe, atlas-duck.exe and atlas-duck-sandbox.exe, all in the install root.
+  atlas-duck-app.exe, atlas-duck.exe and atlas-duck-sandbox.exe, all in the install root
+  (NSIS's own uninstall.exe is the installer's, not a payload executable, and is not counted).
   It then extracts those three and checks that each is a non-empty 64-bit x86 PE image
   (MZ header, machine 0x8664).
 
@@ -49,7 +50,7 @@ $entries = @($listing | Where-Object { $_ -like 'Path = *' } | ForEach-Object { 
 Write-Host "installer entries ($($entries.Count)):"
 $entries | ForEach-Object { Write-Host "  $_" }
 
-[string[]]$executables = @($entries | Where-Object { $_ -like '*.exe' -and $_ -notlike '$PLUGINSDIR*' })
+[string[]]$executables = @($entries | Where-Object { $_ -like '*.exe' -and $_ -notlike '$PLUGINSDIR*' -and $_ -ne 'uninstall.exe' })
 [Array]::Sort($executables, [System.StringComparer]::Ordinal)
 $failures = @()
 
