@@ -1652,3 +1652,41 @@ fn restore_with_another_prior_anchor_is_not_reconciled() {
     assert!(v.anchor_actions.complete_restore.is_none());
     assert!(has_kind(&v.findings, FindingKind::AnchorMissing));
 }
+
+#[test]
+fn newer_anchor_layout_mid_process_is_not_skipped() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    append_mixed(&store, 4);
+    store.shutdown();
+    let store = reopen(&f);
+    let mut e = f
+        .ring
+        .raw_get(&service_name(&f.install_id), "head_anchor")
+        .expect("head anchor");
+    e[0] = 2;
+    f.keys().set(&EntryName::HeadAnchor, &e).expect("set");
+    let o = store.try_full_verify().expect("runs");
+    assert!(
+        o.findings
+            .iter()
+            .any(|x| x.kind == FindingKind::AnchorMismatch && x.detail.contains("newer layout 2")),
+        "{:?}",
+        o.findings
+    );
+    let r = row(&f, o.verify_seq.expect("VERIFY"));
+    assert!(EventFlags::from_bits(r.flags).contains(EventFlags::INTEGRITY_INCIDENT));
+    store.shutdown();
+}
+
+#[test]
+fn keychain_unavailable_skips_anchor_checks_without_incident() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    append_mixed(&store, 4);
+    store.shutdown();
+    let store = reopen(&f);
+    f.ring.set_unavailable(true);
+    let fs = store.full_verify();
+    f.ring.set_unavailable(false);
+    store.shutdown();
+    assert!(fs.is_empty(), "{fs:?}");
+}
