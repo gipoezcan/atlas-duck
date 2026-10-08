@@ -203,3 +203,43 @@ fn c3_names_resolve_at_the_crate_root() {
         assert!(n.starts_with("atlas_duck_audit::") || n.starts_with("dyn atlas_duck_audit::"));
     }
 }
+
+/// Global constraint "secrets in errors/logs": `Debug` of an event shows its plaintext
+/// columns and never its payload, which holds fetched bodies, request bodies and the like.
+#[test]
+fn new_event_debug_never_prints_the_payload() {
+    use atlas_duck_audit::{Actor, NewEvent, RequestRecord};
+    let ev = NewEvent {
+        event_type: EventType::READ_FETCHED,
+        request_id: Some("req_1".into()),
+        op_id: Some("jira.issue.get".into()),
+        op_class: None,
+        instance_id: Some("ins_1".into()),
+        target: Some("PROJ-1".into()),
+        actor: Actor::default(),
+        decision: Some(DecisionColumn::Release),
+        flags: EventFlags::REDACTED,
+        payload: serde_json::json!({ "body": "s3cret-body-text", "n": 424242 }),
+    };
+    let s = format!("{ev:?} {ev:#?}");
+    for leak in ["s3cret-body-text", "424242", "body"] {
+        assert!(!s.contains(leak), "{s}");
+    }
+    for shown in [
+        "READ_FETCHED",
+        "req_1",
+        "jira.issue.get",
+        "PROJ-1",
+        "<redacted>",
+    ] {
+        assert!(s.contains(shown), "{s}");
+    }
+    let r = RequestRecord {
+        index: 0,
+        method: "POST".into(),
+        resolved_url: "https://x.example/rest".into(),
+        content_type: None,
+        body_bytes: b"s3cret-body-text".to_vec(),
+    };
+    assert!(!format!("{r:?}").contains("s3cret"));
+}

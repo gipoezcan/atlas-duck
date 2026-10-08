@@ -1,5 +1,6 @@
 //! Event vocabulary and the value types of the store's public API (C.3, §8.2, §8.3).
 
+use std::fmt;
 use std::ops::{BitAnd, BitOr, BitOrAssign};
 use std::path::{Path, PathBuf};
 
@@ -186,8 +187,9 @@ pub struct Actor {
     pub atlassian_user_key: Option<String>,
 }
 
-/// One event to append (C.3). The writer masks `flags` with `CALLER_SETTABLE`.
-#[derive(Debug, Clone)]
+/// One event to append (C.3). The writer masks `flags` with `CALLER_SETTABLE`. `Debug` prints
+/// the plaintext columns and never the payload (it holds fetched bodies and request bodies).
+#[derive(Clone)]
 pub struct NewEvent {
     pub event_type: EventType,
     pub request_id: Option<String>,
@@ -200,6 +202,23 @@ pub struct NewEvent {
     pub flags: EventFlags,
     /// Stored as RFC 8785 bytes; `payload_sha256` is taken over those bytes.
     pub payload: serde_json::Value,
+}
+
+impl fmt::Debug for NewEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NewEvent")
+            .field("event_type", &self.event_type)
+            .field("request_id", &self.request_id)
+            .field("op_id", &self.op_id)
+            .field("op_class", &self.op_class)
+            .field("instance_id", &self.instance_id)
+            .field("target", &self.target)
+            .field("actor", &self.actor)
+            .field("decision", &self.decision)
+            .field("flags", &self.flags)
+            .field("payload", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
