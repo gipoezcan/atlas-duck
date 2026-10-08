@@ -109,6 +109,11 @@ pub enum Method {
 pub enum QueryValue {
     Param(&'static str),
     Const(&'static str),
+    /// The param, or `default` when the agent sent none (a server default we must not inherit).
+    ParamOr {
+        param: &'static str,
+        default: &'static str,
+    },
     ParamBoolFlag {
         param: &'static str,
         value_if_true: &'static str,

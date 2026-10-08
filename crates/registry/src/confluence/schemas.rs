@@ -28,11 +28,9 @@ pub(crate) const STUB_LIST_RESULT: &str = r#"{"type":"object","required":["resul
 
 // ---- confluence.user.current / space.* --------------------------------------------------------
 
-pub(crate) const USER_CURRENT_EXAMPLE: &str =
-    r#"{"type":"known","username":"jdoe","userKey":"8a7f0c2e5d3b4a1f","displayName":"Jane Doe"}"#;
-pub(crate) const USER_CURRENT_EXAMPLE_SPARSE: &str =
-    r#"{"type":"known","username":"jdoe","userKey":"8a7f0c2e5d3b4a1f","displayName":"Jane Doe"}"#;
-pub(crate) const USER_CURRENT_RESULT: &str = r#"{"type":"object","required":["username","displayName"],"properties":{"type":{"type":"string"},"username":{"type":"string"},"userKey":{"type":"string"},"displayName":{"type":"string"}}}"#;
+pub(crate) const USER_CURRENT_EXAMPLE: &str = r#"{"type":"known","username":"jdoe","userKey":"8a7f0c2e5d3b4a1f","displayName":"Jane Doe","profilePicture":{"path":"/images/icons/profilepics/default.svg"},"_links":{"self":"https://confluence.example.invalid/rest/api/user?key=8a7f0c2e5d3b4a1f"}}"#;
+pub(crate) const USER_CURRENT_EXAMPLE_SPARSE: &str = r#"{"type":"known","username":"jdoe","userKey":"8a7f0c2e5d3b4a1f","displayName":"Jane Doe","profilePicture":{"path":"/images/icons/profilepics/default.svg"},"_links":{"self":"https://confluence.example.invalid/rest/api/user?key=8a7f0c2e5d3b4a1f"}}"#;
+pub(crate) const USER_CURRENT_RESULT: &str = r#"{"type":"object","required":["type"],"properties":{"type":{"type":"string","description":"`known`, or `anonymous` (then without username and userKey)."},"username":{"type":"string"},"userKey":{"type":"string"},"displayName":{"type":"string"},"profilePicture":{"type":"object","properties":{"path":{"type":"string"}}},"_links":{"type":"object"}}}"#;
 
 pub(crate) const SPACE_LIST_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
  "properties":{
@@ -45,7 +43,7 @@ pub(crate) const SPACE_LIST_EXAMPLE_SPARSE: &str =
     r#"{"results":[],"start":0,"limit":25,"size":0}"#;
 pub(crate) const SPACE_LIST_RESULT: &str = r#"{"type":"object","required":["results"],"properties":{"results":{"type":"array","items":{"type":"object","required":["key","name"],"properties":{"id":{"type":"integer"},"key":{"type":"string"},"name":{"type":"string"},"type":{"type":"string"},"_links":{"type":"object"}}}},"start":{"type":"integer"},"limit":{"type":"integer"},"size":{"type":"integer"}}}"#;
 
-pub(crate) const SPACE_GET_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["key"],"properties":{"key":{"type":"string","pattern":"^[A-Za-z0-9_~-]+$","maxLength":255}},"examples":[{"key":"ABC"}]}"#;
+pub(crate) const SPACE_GET_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,"required":["key"],"properties":{"key":{"type":"string","pattern":"^[A-Za-z0-9_~.@-]+$","maxLength":255,"not":{"enum":[".",".."]}}},"examples":[{"key":"ABC"}]}"#;
 pub(crate) const SPACE_GET_EXAMPLE: &str = r#"{"id":1,"key":"ABC","name":"Alpha Beta Cooperation","type":"global","description":{"plain":{"value":"Team space.","representation":"plain"}},"_links":{"webui":"/display/ABC","self":"https://confluence.example.invalid/rest/api/space/ABC"}}"#;
 pub(crate) const SPACE_GET_EXAMPLE_SPARSE: &str = r#"{"id":1,"key":"ABC","name":"Alpha Beta Cooperation","type":"global","description":null,"_links":{"webui":"/display/ABC","self":"https://confluence.example.invalid/rest/api/space/ABC"}}"#;
 pub(crate) const SPACE_GET_RESULT: &str = r#"{"type":"object","required":["key","name"],"properties":{"id":{"type":"integer"},"key":{"type":"string"},"name":{"type":"string"},"type":{"type":"string"},"description":{"type":["object","null"]},"_links":{"type":"object"}}}"#;
@@ -67,7 +65,7 @@ pub(crate) const PAGE_GET_RESULT: &str = r#"{"type":"object","required":["id","t
 pub(crate) const PAGE_FIND_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
  "required":["space","title"],
  "properties":{
-  "space":{"type":"string","pattern":"^[A-Za-z0-9_~-]+$","maxLength":255},
+  "space":{"type":"string","pattern":"^[A-Za-z0-9_~.@-]+$","maxLength":255,"not":{"enum":[".",".."]}},
   "title":{"type":"string","minLength":1,"maxLength":255}},
  "examples":[{"space":"ABC","title":"Release notes"}]}"#;
 
@@ -115,7 +113,7 @@ pub(crate) const PAGE_HISTORY_PARAMS: &str = r#"{"$schema":"https://json-schema.
   "format":{"type":"string","enum":["markdown","storage","view"],"default":"markdown"}},
  "examples":[{"id":"123456"}]}"#;
 pub(crate) const PAGE_HISTORY_EXAMPLE: &str = r#"{"latest":true,"createdBy":{"username":"jdoe","displayName":"Jane Doe"},"createdDate":"2026-08-20T10:00:00.000+0200","lastUpdated":{"by":{"username":"jdoe","displayName":"Jane Doe"},"when":"2026-09-03T14:02:10.000+0200","number":3},"previousVersion":{"number":2,"when":"2026-09-01T09:00:00.000+0200"},"contributors":{"publishers":{"users":[{"username":"jdoe","displayName":"Jane Doe"}]}},"_links":{"self":"https://confluence.example.invalid/rest/api/content/123456/history"}}"#;
-pub(crate) const PAGE_HISTORY_EXAMPLE_SPARSE: &str = r#"{"latest":true,"createdBy":{"username":"jdoe","displayName":"Jane Doe"},"createdDate":"2026-08-20T10:00:00.000+0200","lastUpdated":{"by":{"username":"jdoe","displayName":"Jane Doe"},"when":"2026-08-20T10:00:00.000+0200","number":1},"previousVersion":null,"contributors":{"publishers":{"users":[]}},"_links":{"self":"https://confluence.example.invalid/rest/api/content/123456/history"}}"#;
+pub(crate) const PAGE_HISTORY_EXAMPLE_SPARSE: &str = r#"{"latest":true,"createdBy":null,"createdDate":"2026-08-20T10:00:00.000+0200","lastUpdated":{"by":{"username":"jdoe","displayName":"Jane Doe"},"when":"2026-08-20T10:00:00.000+0200","number":1},"previousVersion":null,"contributors":{"publishers":{"users":[]}},"_links":{"self":"https://confluence.example.invalid/rest/api/content/123456/history"}}"#;
 /// The summary or, with `version`, a content object: only what both share is required.
 pub(crate) const PAGE_HISTORY_RESULT: &str = r#"{"type":"object","properties":{"latest":{"type":"boolean"},"createdBy":{"type":["object","null"]},"createdDate":{"type":"string"},"lastUpdated":{"type":"object"},"previousVersion":{"type":["object","null"]},"contributors":{"type":"object"},"id":{"type":"string"},"type":{"type":"string"},"status":{"type":"string"},"title":{"type":"string"},"version":{"type":"object"},"body":{"type":"object"},"_links":{"type":"object"}}}"#;
 
@@ -124,7 +122,7 @@ pub(crate) const PAGE_HISTORY_RESULT: &str = r#"{"type":"object","properties":{"
 pub(crate) const PAGE_CREATE_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
  "required":["space","title","body"],
  "properties":{
-  "space":{"type":"string","pattern":"^[A-Za-z0-9_~-]+$","maxLength":255},
+  "space":{"type":"string","pattern":"^[A-Za-z0-9_~.@-]+$","maxLength":255,"not":{"enum":[".",".."]}},
   "title":{"type":"string","minLength":1,"maxLength":255},
   "body":{"type":"string","maxLength":1048576},
   "body_format":{"type":"string","enum":["markdown","storage"],"default":"markdown"},

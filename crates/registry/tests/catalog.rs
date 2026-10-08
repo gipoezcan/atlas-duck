@@ -138,9 +138,10 @@ fn u05_examples_validate_against_result_schema() -> Result<(), String> {
 fn check_sparse(schema: &Value, full: &Value, sparse: &Value, path: &str) -> Result<(), String> {
     match (full, sparse) {
         (Value::Object(f), Value::Object(s)) => {
-            // A map with dynamic keys (no declared `properties`, e.g. editmeta `fields`) may be
-            // empty in the sparse form.
-            if schema.get("properties").is_none() {
+            // A real dynamic-key map (no declared `properties`, empty in the sparse form, e.g.
+            // editmeta `fields`) is the only exemption; every other object is compared and
+            // recursed into, declared in the schema or not.
+            if schema.get("properties").is_none() && s.is_empty() {
                 return Ok(());
             }
             let fk: BTreeSet<_> = f.keys().collect();
@@ -333,8 +334,26 @@ fn paths_and_methods() {
             }
         }
     }
-    let non_get_reads = ids_where(|s| s.class == OpClass::Read && s.endpoint.method != Method::Get);
+    // Every endpoint of a read counts, the alt endpoint included.
+    let non_get_reads = ids_where(|s| {
+        s.class == OpClass::Read
+            && std::iter::once(s.endpoint)
+                .chain(s.alt_endpoint.map(|a| a.endpoint))
+                .any(|e| e.method != Method::Get)
+    });
     assert_eq!(non_get_reads, set(&["jira.search"]));
+    for spec in all().iter().filter(|s| s.class == OpClass::Read) {
+        let body = if spec.id == "jira.search" {
+            BodySource::ParamsAsJson
+        } else {
+            BodySource::None
+        };
+        assert_eq!(spec.endpoint.body, body, "{}", spec.id);
+        assert!(
+            spec.alt_endpoint
+                .is_none_or(|a| a.endpoint.body == BodySource::None)
+        );
+    }
     let search = get("jira.search").expect("jira.search");
     assert_eq!(search.endpoint.method, Method::Post);
     assert_eq!(search.endpoint.path, "/rest/api/2/search");
@@ -557,5 +576,107 @@ fn copies_and_mirrors_are_item_relative() {
             .mirrors
             .iter()
             .any(|m| m.dst == "renderedFields.attachment")
+    );
+}
+
+#[test]
+fn param_names_resolve_against_the_params_schema() {
+    for spec in all() {
+        let id = spec.id;
+        let params = spec.params_schema_json();
+        let props = params["properties"].as_object().expect("properties");
+        let has = |name: &str, what: &str| {
+            assert!(
+                props.contains_key(name),
+                "{id}: {what} {name} is not a param"
+            );
+        };
+        for t in spec.target_params {
+            has(t, "target_params");
+        }
+        for b in spec.conflict_baselines {
+            has(b, "conflict_baselines");
+        }
+        for f in spec.cli.flags {
+            has(f.param, "cli flag");
+        }
+        if let Some(p) = spec.cli.positional {
+            has(p, "positional");
+        }
+        match spec.target_display {
+            TargetDisplay::Param(p) | TargetDisplay::CreateIn(p) => has(p, "target_display"),
+            TargetDisplay::Query { param } => has(param, "target_display"),
+            TargetDisplay::Pair(a, b) => {
+                has(a, "target_display");
+                has(b, "target_display");
+            }
+            TargetDisplay::MoveInto {
+                sprint_param,
+                issues_param,
+            } => {
+                has(issues_param, "target_display");
+                if let Some(p) = sprint_param {
+                    has(p, "target_display");
+                }
+            }
+            TargetDisplay::None => {}
+        }
+        let mut endpoints = vec![spec.endpoint];
+        if let Some(alt) = spec.alt_endpoint {
+            has(alt.when_param_present, "alt_endpoint trigger");
+            endpoints.push(alt.endpoint);
+        }
+        for ep in endpoints {
+            for q in ep.query {
+                match q.value {
+                    QueryValue::Param(p) | QueryValue::ParamOr { param: p, .. } => {
+                        has(p, "query");
+                    }
+                    QueryValue::ParamBoolFlag { param, .. } => has(param, "query"),
+                    QueryValue::Const(_) => {}
+                }
+            }
+        }
+        if let Some(max) = spec.caps.max {
+            has(max.param, "caps.max");
+        }
+        if let Some(rules) = spec.field_rules {
+            for p in [
+                rules.fields_param,
+                rules.fields_map_param,
+                rules.expand_param,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                has(p, "field_rules");
+            }
+        }
+    }
+}
+
+#[test]
+fn confluence_search_never_inherits_the_server_excerpt_default() {
+    let search = get("confluence.search").expect("confluence.search");
+    let excerpt = search
+        .endpoint
+        .query
+        .iter()
+        .find(|q| q.name == "excerpt")
+        .expect("excerpt query");
+    assert_eq!(
+        excerpt.value,
+        QueryValue::ParamOr {
+            param: "excerpt",
+            default: "none"
+        }
+    );
+    assert_eq!(
+        get("confluence.page.children")
+            .expect("op")
+            .caps
+            .max
+            .map(|m| (m.default, m.hard_cap_default)),
+        Some((25, 200))
     );
 }

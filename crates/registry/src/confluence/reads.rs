@@ -47,7 +47,7 @@ const fn max_caps(default: u32, hard_cap_default: u32) -> Caps {
 const ITEM_LINKS: RedactionRules = RedactionRules {
     copies: &[],
     mirrors: &[],
-    url_fields: &["results[]._links.*"],
+    url_fields: &["_links.*", "results[]._links.*"],
 };
 
 const EXPAND_PAGE: QueryParam = QueryParam {
@@ -86,7 +86,11 @@ pub(crate) const USER_CURRENT: OperationSpec = OperationSpec {
     paginated: None,
     result_projection: Projection::Empty,
     success: DEFAULT_SUCCESS,
-    redaction_rules: NO_REDACTION,
+    redaction_rules: RedactionRules {
+        copies: &[],
+        mirrors: &[],
+        url_fields: &["_links.*", "profilePicture.path"],
+    },
     result_example: schemas::USER_CURRENT_EXAMPLE,
     result_example_sparse: schemas::USER_CURRENT_EXAMPLE_SPARSE,
     result_schema: schemas::USER_CURRENT_RESULT,
@@ -237,9 +241,13 @@ pub(crate) const SEARCH: OperationSpec = OperationSpec {
                 name: "cql",
                 value: QueryValue::Param("cql"),
             },
+            // §7.4: `highlight` is never used; the server default would apply it.
             QueryParam {
                 name: "excerpt",
-                value: QueryValue::Param("excerpt"),
+                value: QueryValue::ParamOr {
+                    param: "excerpt",
+                    default: "none",
+                },
             },
         ],
         body: BodySource::None,
@@ -266,6 +274,7 @@ pub(crate) const SEARCH: OperationSpec = OperationSpec {
         copies: &[],
         mirrors: &[],
         url_fields: &[
+            "_links.*",
             "results[].url",
             "results[].content._links.*",
             "results[].resultGlobalContainer.displayUrl",
@@ -318,7 +327,11 @@ pub(crate) const COMMENT_LIST: OperationSpec = OperationSpec {
     redaction_rules: RedactionRules {
         copies: &[],
         mirrors: &[],
-        url_fields: &["results[]._links.*", "results[].ancestors[]._links.*"],
+        url_fields: &[
+            "_links.*",
+            "results[]._links.*",
+            "results[].ancestors[]._links.*",
+        ],
     },
     result_example: schemas::COMMENT_LIST_EXAMPLE,
     result_example_sparse: schemas::COMMENT_LIST_EXAMPLE_SPARSE,
