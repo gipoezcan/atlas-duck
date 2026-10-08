@@ -2,7 +2,7 @@
 //! Test doubles: a controllable clock and an in-memory keyring with fault points.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -89,6 +89,7 @@ pub struct MemKeyring {
     entries: Mutex<BTreeMap<(String, String), Vec<u8>>>,
     faults: Mutex<Vec<Fault>>,
     unavailable: AtomicBool,
+    corrupt_gets: AtomicU32,
     locality: Mutex<KeyringLocality>,
     log: Mutex<Vec<KeyOp>>,
 }
@@ -99,6 +100,7 @@ impl MemKeyring {
             entries: Mutex::new(BTreeMap::new()),
             faults: Mutex::new(Vec::new()),
             unavailable: AtomicBool::new(false),
+            corrupt_gets: AtomicU32::new(0),
             locality: Mutex::new(KeyringLocality::Local),
             log: Mutex::new(Vec::new()),
         })
@@ -123,6 +125,11 @@ impl MemKeyring {
     /// Every operation fails with `Unavailable` while set.
     pub fn set_unavailable(&self, v: bool) {
         self.unavailable.store(v, Ordering::SeqCst);
+    }
+
+    /// The next `times` successful `get`s of an existing entry return other bytes.
+    pub fn corrupt_next_gets(&self, times: u32) {
+        self.corrupt_gets.store(times, Ordering::SeqCst);
     }
 
     pub fn set_locality(&self, l: KeyringLocality) {
@@ -192,9 +199,18 @@ impl KeyStore for MemKeyStore {
 
     fn get(&self, e: &EntryName) -> Result<Option<Zeroizing<Vec<u8>>>, KeyStoreError> {
         self.ring.check(KeyOpKind::Get, &self.install_id, e)?;
-        Ok(lock(&self.ring.entries)
-            .get(&self.key(e))
-            .map(|v| Zeroizing::new(v.clone())))
+        let found = lock(&self.ring.entries).get(&self.key(e)).cloned();
+        Ok(found.map(|mut v| {
+            let corrupt = self
+                .ring
+                .corrupt_gets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if corrupt {
+                v.iter_mut().for_each(|b| *b ^= 0xA5);
+            }
+            Zeroizing::new(v)
+        }))
     }
 
     fn set(&self, e: &EntryName, v: &[u8]) -> Result<(), KeyStoreError> {

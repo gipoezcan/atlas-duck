@@ -1,10 +1,21 @@
-//! The keychain abstraction (C.3, F.6). `OsKeyStore`, locality detection and the canary
-//! self-test arrive in T05; this file holds the declarations the `testing` doubles need.
+//! The keychain abstraction (C.3, F.6): the `KeyStore` trait, entry naming, `OsKeyStore` over
+//! keyring-core with one store per OS, the keyring locality check (I-44) and the canary
+//! self-test (§8.6).
+
+mod locality;
+mod os;
+#[cfg(windows)]
+mod windows;
 
 use std::fmt;
 use std::path::PathBuf;
 
 use zeroize::Zeroizing;
+
+pub use locality::{keyring_dirs, keyring_locality};
+pub use os::{MappedError, OsKeyStore, map_keyring_error};
+#[cfg(windows)]
+pub use windows::credential_persist;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryName {
@@ -77,4 +88,22 @@ pub trait KeyStore: Send + Sync {
     fn locality(&self) -> KeyringLocality {
         KeyringLocality::Local
     }
+}
+
+/// §8.6 canary: write a random value to the `Canary` entry, read it back, compare, delete it.
+/// A mismatch is `Other` (never a silent fallback); the entry is removed on every path.
+pub fn canary_self_test(ks: &dyn KeyStore) -> Result<(), KeyStoreError> {
+    let mut want = Zeroizing::new([0u8; 32]);
+    getrandom::fill(&mut *want).map_err(|_| KeyStoreError::Other("no system randomness".into()))?;
+    let outcome =
+        ks.set(&EntryName::Canary, &*want)
+            .and_then(|()| match ks.get(&EntryName::Canary)? {
+                Some(got) if got.as_slice() == want.as_slice() => Ok(()),
+                Some(_) => Err(KeyStoreError::Other(
+                    "canary read back a different value".into(),
+                )),
+                None => Err(KeyStoreError::Other("canary missing after write".into())),
+            });
+    let cleanup = ks.delete(&EntryName::Canary);
+    outcome.and(cleanup)
 }
