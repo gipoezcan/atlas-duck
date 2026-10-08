@@ -51,6 +51,9 @@ rust:test:
     - apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev dbus-x11 xvfb
     - rustup toolchain install
   script:
+    # The container's /tmp is an overlayfs whose layers are not visible inside the container; the data-dir
+    # locality check fails closed on it, so tests that create data dirs need TMPDIR on the project volume.
+    - mkdir -p "$CI_PROJECT_DIR/.tmp" && export TMPDIR="$CI_PROJECT_DIR/.tmp"
     - cargo clippy --workspace --all-targets --locked -- -D warnings
     - cargo test --workspace --locked
 
