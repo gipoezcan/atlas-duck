@@ -251,6 +251,23 @@ jobs:
       - name: Show the cargo-tauri version
         run: cargo tauri --version
 
+      # Apple's linker signs (ad hoc) only the arm64 images it writes. The x86_64
+      # images from this arm64 runner come out unsigned, and Tauri then fails
+      # sealing the .app: "code object is not signed at all, in subcomponent
+      # .../Contents/MacOS/atlas-duck" (CI run 1). So: build, sign the three
+      # binaries ad hoc with the hardened runtime and the app's entitlements, then
+      # bundle (cargo finds everything up to date and does not relink).
+      - name: Build the x86_64 binaries and sign them ad hoc (hardened runtime)
+        working-directory: app/src-tauri
+        run: |
+          set -euo pipefail
+          cargo tauri build --ci --no-bundle --target "$TARGET" -- --locked
+          for bin in atlas-duck-app atlas-duck atlas-duck-sandbox; do
+            codesign --force --sign - --options runtime --entitlements entitlements.plist \
+              "../../target/$TARGET/release/$bin"
+            codesign -dv "../../target/$TARGET/release/$bin"
+          done
+
       - name: Build the .app and .dmg for x86_64 (ad-hoc signed, hardened runtime)
         working-directory: app/src-tauri
         run: cargo tauri build --ci --target "$TARGET" --bundles app,dmg -- --locked
