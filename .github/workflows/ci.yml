@@ -306,6 +306,9 @@ jobs:
       - name: CI script tests
         run: node --test "ci/*.test.mjs"
 
+      - name: M1 go/no-go record (T22)
+        run: node ci/check-go-no-go.mjs docs/m1/go-no-go.md
+
       - name: macOS sandbox denials from the unified log (diagnostics only)
         if: failure() && runner.os == 'macOS'
         run: |
