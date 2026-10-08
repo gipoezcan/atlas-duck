@@ -1,7 +1,12 @@
 //! Sandbox channel (spec §3.3, §3.4): framing limits, framing, probe-protocol types.
 
 pub mod frame;
+pub mod host_call;
+pub mod limits;
 pub mod probe;
+
+pub use host_call::{HostCall, HostCallResult};
+pub use limits::ScriptLimits;
 
 /// §3.3: "max frame 24 MiB" on the IPC and sandbox channels; also the §3.4
 /// host→worker cap. Counts payload bytes (the 4-byte header is not included).

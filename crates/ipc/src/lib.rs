@@ -7,4 +7,6 @@ pub mod build_info;
 pub mod envelope;
 pub mod jcs;
 pub mod paths;
+#[cfg(feature = "async")]
+pub mod proto;
 pub mod sandbox;
