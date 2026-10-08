@@ -165,11 +165,21 @@ pub fn autostart_plugin<R: Runtime>() -> TauriPlugin<R> {
         .build()
 }
 
+/// Second guard of the CI-only autostart probe: the scripts that call it export this as `1`.
+pub const ENV_AUTOSTART_PROBE: &str = "ATLAS_DUCK_TEST_AUTOSTART_PROBE";
+
 /// True iff `args` (argv, `args[0]` is the program) holds the exact `--autostart-probe`
-/// flag after the program name and `ci` (the `CI` environment variable) is `true`. The
-/// `CI` guard is the one `ci/pinned-fixture.sh` uses: a user-run binary never acts on it.
-pub fn autostart_probe_requested(args: &[OsString], ci: Option<&OsStr>) -> bool {
+/// flag after the program name, `ci` (the `CI` environment variable) is `true` and `gate`
+/// (`ATLAS_DUCK_TEST_AUTOSTART_PROBE`) is `1`. The `CI` guard is the one
+/// `ci/pinned-fixture.sh` uses; the second variable keeps a CI-hosted release binary from
+/// acting on the flag unless the probe script asked for it.
+pub fn autostart_probe_requested(
+    args: &[OsString],
+    ci: Option<&OsStr>,
+    gate: Option<&OsStr>,
+) -> bool {
     ci == Some(OsStr::new("true"))
+        && gate == Some(OsStr::new("1"))
         && args
             .iter()
             .skip(1)
@@ -317,7 +327,7 @@ mod tests {
     fn autostart_probe_needs_the_flag_and_ci_true() {
         let probe = |items: &[&str], ci: Option<&str>| {
             let argv: Vec<OsString> = items.iter().map(OsString::from).collect();
-            autostart_probe_requested(&argv, ci.map(OsStr::new))
+            autostart_probe_requested(&argv, ci.map(OsStr::new), Some(OsStr::new("1")))
         };
         assert_eq!(FLAG_AUTOSTART_PROBE, "--autostart-probe");
         assert!(probe(&["app", "--autostart-probe"], Some("true")));
@@ -332,5 +342,16 @@ mod tests {
         // argv[0] is the program, never a flag.
         assert!(!probe(&["--autostart-probe"], Some("true")));
         assert!(!probe(&[], Some("true")));
+        // The second guard: CI=true alone is not enough.
+        let argv = [OsString::from("app"), OsString::from("--autostart-probe")];
+        let ci = Some(OsStr::new("true"));
+        assert!(!autostart_probe_requested(&argv, ci, None));
+        assert!(!autostart_probe_requested(
+            &argv,
+            ci,
+            Some(OsStr::new("true"))
+        ));
+        assert!(!autostart_probe_requested(&argv, ci, Some(OsStr::new("0"))));
+        assert_eq!(ENV_AUTOSTART_PROBE, "ATLAS_DUCK_TEST_AUTOSTART_PROBE");
     }
 }

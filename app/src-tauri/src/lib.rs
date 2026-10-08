@@ -36,12 +36,13 @@ pub fn run_gui(background: bool) -> ! {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // CI-only autostart probe (§15 V14), before the startup gate so it needs no pinned
-            // paths file. Linux and CI=true only; `ci/appimage-smoke.sh` is the caller.
+            // paths file. Linux, CI=true and ATLAS_DUCK_TEST_AUTOSTART_PROBE=1 only; `ci/appimage-smoke.sh` is the caller.
             #[cfg(target_os = "linux")]
             {
                 let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
                 let ci = std::env::var_os("CI");
-                if tray::autostart_probe_requested(&argv, ci.as_deref()) {
+                let gate = std::env::var_os(tray::ENV_AUTOSTART_PROBE);
+                if tray::autostart_probe_requested(&argv, ci.as_deref(), gate.as_deref()) {
                     std::process::exit(tray::run_autostart_probe(app.handle()));
                 }
             }

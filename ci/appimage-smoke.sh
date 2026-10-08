@@ -8,7 +8,7 @@
 #   * the deb-installed `atlas-duck bogus` exits 2 with exactly one §4.2 usage envelope line
 #   * `<AppImage> __cli bogus`, run through the real type-2 runtime (FUSE mount, no display),
 #     reaches the cli crate (§12.1): same exit code and byte-identical stdout
-#   * (§15 V14) `<AppImage> --autostart-probe` (T11, Linux, CI=true) with a throw-away HOME
+#   * (§15 V14) `<AppImage> --autostart-probe` (T11, Linux, CI=true, ATLAS_DUCK_TEST_AUTOSTART_PROBE=1) with a throw-away HOME
 #     enables autostart; the generated ~/.config/autostart/atlas-duck.desktop has
 #     `Exec=<the AppImage path> --background`, never a /tmp/.mount_* path
 set -euo pipefail
@@ -85,7 +85,7 @@ probe_home="$work/probe-home"
 mkdir -p "$probe_home"
 set +e
 (cd "$work" && env -u DISPLAY -u WAYLAND_DISPLAY -u APPIMAGE_EXTRACT_AND_RUN \
-  HOME="$probe_home" XDG_CONFIG_HOME="$probe_home/.config" CI=true \
+  HOME="$probe_home" XDG_CONFIG_HOME="$probe_home/.config" CI=true ATLAS_DUCK_TEST_AUTOSTART_PROBE=1 \
   timeout 120 xvfb-run -a dbus-run-session -- "$appimage" --autostart-probe >"$work/probe.out" 2>&1)
 probe_code=$?
 set -e
