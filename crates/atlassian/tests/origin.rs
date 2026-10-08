@@ -38,17 +38,26 @@ fn normalize_shapes() -> R {
         normalize_base_url("ftp://x"),
         Err(BaseUrlError::Invalid(_))
     ));
-    // `url` resolves a literal `..`, so this is accepted as `/b` (documented).
-    assert_eq!(
-        normalize_base_url("https://x/a/../b")?.as_str(),
-        "https://x/b"
-    );
-    // WHATWG parsing also treats `%2e%2e` as a dot segment, so `url` resolves it to `/b`
-    // before the explicit dot-segment check (kept as defence in depth) can see it.
-    assert_eq!(
-        normalize_base_url("https://x/a/%2e%2e/b")?.as_str(),
-        "https://x/b"
-    );
+    // Traversal in any spelling is refused on the raw text, before `url` can resolve it.
+    for raw in [
+        "https://x/a/../b",
+        "https://x/a/%2e%2e/b",
+        "https://x/a/%2E/b",
+        "https://x/a/..;p=1/b",
+        "https://x/a/..%2Fb",
+        "https://x/a/..%5cb",
+        r"https://x/a\..\b",
+    ] {
+        assert!(
+            matches!(
+                normalize_base_url(raw),
+                Err(BaseUrlError::Invalid("dot segment"))
+            ),
+            "{raw}"
+        );
+    }
+    // Why the raw check matters: `url` itself silently resolves these.
+    assert_eq!(url::Url::parse("https://x/a/%2e%2e/b")?.path(), "/b");
     Ok(())
 }
 
@@ -97,6 +106,20 @@ fn refusal_kinds() -> R {
         g("https://wiki.corp:8443/confluence/x")?,
         Err(OriginRefused::OutsideBase)
     );
+    for traversal in [
+        "https://wiki.corp/confluence/..;x/y",
+        "https://wiki.corp/confluence/..%2Fy",
+        "https://wiki.corp/confluence/a/..%5cy",
+        "https://wiki.corp/confluence/%2e%2e%2fy",
+        "https://wiki.corp/confluence/.%3Bx/y",
+    ] {
+        assert_eq!(
+            g(traversal)?,
+            Err(OriginRefused::OutsideBase),
+            "{traversal}"
+        );
+    }
+    assert_eq!(g("https://wiki.corp/confluence/a;x=1/b")?, Ok(()));
     let other = url_hash(&normalize_base_url("https://other.corp")?);
     assert_eq!(
         origin_guard(
@@ -117,7 +140,7 @@ proptest! {
         host in "[a-z]{1,8}\\.(corp|example)",
         port in proptest::option::of(1024u16..9000),
         ctx in proptest::collection::vec("[a-z]{1,6}", 0..3),
-        kind in 0usize..8,
+        kind in 0usize..13,
         tail in "[a-z]{1,6}",
     ) {
         let fail = |e: &dyn std::fmt::Display| TestCaseError::fail(e.to_string());
@@ -144,7 +167,7 @@ proptest! {
             0 => (format!("{root}/rest/{tail}"), true, None),
             // Same host, sibling context ("/confluence2"); under an empty context it is simply under the base.
             1 => (format!("{origin}/{first}2/rest/{tail}"), ctx.is_empty(), None),
-            2 => (format!("{origin}/other/{tail}"), ctx.is_empty(), None),
+            2 => (format!("{origin}/other/{tail}"), ctx.is_empty() || ctx == ["other"], None),
             3 => (format!("https://{}{ctx_path}/rest/{tail}", authority(&format!("x{host}"))), false, None),
             4 => (format!("{}/rest/{tail}", root.replacen("https://", "http://", 1)), false, not_https),
             5 => (format!("{}/rest/{tail}", root.replacen("https://", "https://u:p@", 1)), false, Some(OriginRefused::Userinfo)),
@@ -155,6 +178,13 @@ proptest! {
                     .map_err(|e| fail(&e))?;
                 (joined.to_string(), ctx.is_empty(), None)
             }
+            // Path-parameter and encoded-separator traversal: never accepted.
+            8 => (format!("{root}/..;x/{tail}"), false, None),
+            9 => (format!("{root}/..%2F{tail}"), false, None),
+            10 => (format!("{root}/rest/..%5c..%5c{tail}"), false, None),
+            11 => (format!("{root}/%2e%2e%2f{tail}"), false, None),
+            // A path parameter on an ordinary segment is fine.
+            12 => (format!("{root}/rest;jsessionid=x/{tail}"), true, None),
             // `url` resolves `..` first: the second one climbs out of a non-empty context.
             _ => (format!("{root}/rest/../../{tail}"), ctx.is_empty(), None),
         };

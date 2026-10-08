@@ -66,7 +66,13 @@ impl fmt::Display for BaseUrlError {
 impl std::error::Error for BaseUrlError {}
 
 pub fn normalize_base_url(raw: &str) -> Result<NormalizedBaseUrl, BaseUrlError> {
-    let u = url::Url::parse(raw.trim()).map_err(|_| BaseUrlError::Invalid("unparsable"))?;
+    let raw = raw.trim();
+    // The `url` crate resolves `.`/`..`/`%2e%2e` while parsing, so the check has to see the raw
+    // text; a base URL that only works through traversal resolution is refused (plan decision).
+    if has_dot_segment(raw_path(raw)) {
+        return Err(BaseUrlError::Invalid("dot segment"));
+    }
+    let u = url::Url::parse(raw).map_err(|_| BaseUrlError::Invalid("unparsable"))?;
     match u.scheme() {
         "https" => {}
         #[cfg(feature = "insecure-test-http")]
@@ -87,14 +93,6 @@ pub fn normalize_base_url(raw: &str) -> Result<NormalizedBaseUrl, BaseUrlError> 
         .to_ascii_lowercase();
     let port = u.port(); // `url` already drops the scheme's default port
     let path = u.path().trim_end_matches('/');
-    if path.split('/').any(|seg| {
-        seg == "."
-            || seg == ".."
-            || seg.eq_ignore_ascii_case("%2e")
-            || seg.eq_ignore_ascii_case("%2e%2e")
-    }) {
-        return Err(BaseUrlError::Invalid("dot segment"));
-    }
     Ok(NormalizedBaseUrl {
         scheme: u.scheme().to_owned(),
         host,
@@ -150,3 +148,24 @@ pub fn url_hash(u: &NormalizedBaseUrl) -> UrlHash {
     h.update(u.as_str().as_bytes());
     UrlHash(h.finalize().into())
 }
+
+/// The path part of a raw `scheme://authority/path?query#fragment` string.
+fn raw_path(raw: &str) -> &str {
+    let rest = raw.split_once("://").map_or(raw, |(_, r)| r);
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    rest.find(['/', BS]).map_or("", |i| &rest[i..])
+}
+
+/// True if any path segment is `.` or `..` in any spelling a server or proxy may act on:
+/// percent-encoded (`%2e`, `%2F`, `%5c`), with a path parameter (`..;x`), or separated by a backslash.
+pub(crate) fn has_dot_segment(path: &str) -> bool {
+    path.split(['/', BS]).any(|seg| {
+        let decoded = percent_encoding::percent_decode_str(seg).decode_utf8_lossy();
+        let decoded = decoded.split(';').next().unwrap_or("");
+        decoded
+            .split(['/', BS])
+            .any(|piece| piece == "." || piece == "..")
+    })
+}
+
+const BS: char = '\\';

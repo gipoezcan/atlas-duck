@@ -52,7 +52,7 @@ Verified on 2026-10-08 against crates.io (`/api/v1/crates/<name>`) and docs.rs f
 | `proptest` | `=1.11.0` | — | T07 (dev) | atlassian, core, registry (dev) | §13 property tests |
 | `jsonschema` | `=0.58.6` | `default-features = false` | T04 (dev in registry), T13 (core) | registry tests (U-05), core::validate | defaults pull `resolve-http` → reqwest + aws-lc and `resolve-file`; off means no `$ref` I/O at all, which registry schemas never use |
 | `icu_properties` | `=2.3.0` | — (compiled data default) | T06 | preview | `DefaultIgnorableCodePoint`, `BidiControl`, `GeneralCategory`, `Script`/Script_Extensions, `ExtendedPictographic` from one Unicode data version (V31) |
-| `icu_normalizer` | `=2.3.0` | — | T06 | preview, atlassian (T07, username NFC; `atlassian` is a leaf and cannot borrow `preview`'s), core (T14, canonical match form) | NFC from the same ICU data version as the classifier |
+| `icu_normalizer` | `=2.3.0` | — | T06 (workspace pin only; no preview module uses NFC) | atlassian (T07, username NFC; `atlassian` is a leaf and cannot borrow `preview`'s), core (T14, canonical match form) | NFC from the same ICU data version as the classifier |
 | `icu_casemap` | `=2.3.0` | — | T07 | atlassian | Unicode **simple** case folding (`CaseMapper::simple_fold`) for `username_matches` |
 | `emojis` | `=0.9.0` | — | T06 | preview | RGI emoji sequence lookup (`emojis::get`); `icu_properties` 2.3 has `BasicEmoji` but no RGI_Emoji string set. License `(MIT OR Apache-2.0) AND Unicode-3.0`, all allowed |
 | `ammonia` | `=4.2.1` | — | T05 | preview | master-plan pin, §6.4 sanitizer |
@@ -61,7 +61,7 @@ Verified on 2026-10-08 against crates.io (`/api/v1/crates/<name>`) and docs.rs f
 | `secrecy` | `=0.10.3` | — | T07 | atlassian, core | §10.1 non-`Serialize` secret type |
 | `zeroize` | `=1.9.1` | `["zeroize_derive"]` not needed | T07 | atlassian, core | keychain blob buffers |
 | `lru` | `=0.18.5` | — | T20 | core | candidate LRU (byte-accounted by hand) |
-| `chrono` | `=0.4.45` | `default-features = false`, `["std", "serde"]` | T07 | atlassian (`StoredCredential::expires_at: NaiveDate`, C.4) | C.4 names `chrono::NaiveDate` |
+| `chrono` | `=0.4.45` | `default-features = false`, `["std"]` (T07: nothing serializes yet; the task that needs `serde` adds it) | T07 | atlassian (`StoredCredential::expires_at: NaiveDate`, C.4) | C.4 names `chrono::NaiveDate` |
 | `base64` | `=0.23.1` | — | T22 | core | `WRITE_APPROVED` multipart/binary bodies stored as base64 (§5.4 step 4) |
 
 Rules every task must follow when it adds a pin: run one unlocked `cargo build -p <crate>` (the MSRV-aware resolver locks to Rust 1.90-compatible versions), then `cargo build -p <crate> --locked`, then `cargo deny check` and `cargo tree -i aws-lc-sys` (must print `error: package ID specification ... did not match any packages`) — if `aws-lc-sys`, `openssl-sys` or `native-tls` appears, stop and report instead of adding an exception.
@@ -243,7 +243,7 @@ New and modified files per crate (Create = new file; Modify = existing M1 file).
 - Create `tests/catalog.rs`, `tests/display.rs`, `tests/describe.rs`.
 
 ### crates/preview
-- Modify `Cargo.toml` (deps `serde`, `serde_json`, `sha2`, `ammonia`, `icu_properties`, `icu_normalizer`, `emojis`).
+- Modify `Cargo.toml` (deps `serde`, `serde_json`, `sha2`, `ammonia`, `icu_properties`, `emojis`).
 - Modify `src/lib.rs`.
 - Create `src/model.rs` — `Preview`, `PreviewHeader`, `PreviewBody`, `RawPager`, `CandidateRev`, `PREVIEW_BUILDER_VERSION`.
 - Create `src/warning.rs` — `Level`, `WarningId`, `Warning`, `WarningId::level`, `WarningId::ALL`, Caution/Info text templates.
@@ -729,7 +729,7 @@ pub fn json_tree(v: &serde_json::Value) -> JsonNode;   // with sizes; strings > 
 ### Task 6: `preview::invisible` classifier, mixed-script check, S-13 golden test (V31)
 
 **Files:**
-- Modify: `crates/preview/Cargo.toml` (pins `icu_properties`, `icu_normalizer`, `emojis`), `src/lib.rs`, `src/model.rs` (`PREVIEW_BUILDER_VERSION`)
+- Modify: `Cargo.toml` (workspace pins `icu_properties`, `icu_normalizer`, `emojis`), `crates/preview/Cargo.toml` (`icu_properties`, `emojis`; `icu_normalizer` is pinned for T07/T14 but not a preview dependency), `src/lib.rs`, `src/model.rs` (`PREVIEW_BUILDER_VERSION`)
 - Create: `crates/preview/src/invisible.rs`, `crates/preview/src/mixed_script.rs`
 - Test: `crates/preview/tests/invisible.rs`
 
@@ -854,6 +854,10 @@ pub fn strip(s: &str, keep_newlines: bool) -> (String, bool) {
 **Plan decision (spec defect, V31):** §6.4 says "inside a well-formed (RGI) emoji sequence"; `icu_properties` has no RGI string set, so RGI membership comes from `emojis::get` (fully-qualified RGI emoji from emoji-test.txt). Tag characters stay flagged even inside an RGI subdivision flag, because §6.4 exempts only U+FE0E, U+FE0F and U+200D.
 
 **Rulings 2026-10-08 (lead, after implementation; supersede the code above where they differ):** (a) `emojis::get` also maps minimally-qualified and unqualified spellings to the fully-qualified entry, so a candidate counts only when `emojis::get(&candidate).is_some_and(|e| e.as_str() == candidate)`; a ZWJ or FE0F inside a non-fully-qualified spelling stays flagged. (b) U+FE0E never occurs in a fully-qualified emoji, so it is never exempt (documented, no code). (c) Spec wording gap: §6.4 says the set "covers Cf", but some Cf code points are not Default_Ignorable (U+0600–0605, U+06DD, U+070F, U+0890–0891, U+08E2, U+110BD, U+110CD, U+FFF9–FFFB, U+13430–1343F, …); fail closed: `is_flagged` = Default_Ignorable_Code_Point ∪ **Cf** ∪ (Cc − `\t\n\r`) ∪ Zl ∪ Zp. The S-13 golden expectation is unchanged by both. Implementation refinements: the RGI lookahead is bounded by the longest emoji in the table and runs without ZWJ/FE0E/FE0F are skipped (linear on digit runs); `is_mixed_script` uses the UTS #39 §5.1 augmented sets (Hanb/Jpan/Kore).
+
+**Review cleanup 2026-10-08 (T6 review minors, lead):** (1) `flags` looks candidates up as slices of the input (`&s[a..b]` from `char_indices`), no allocation per candidate, and skips lookups that start at ZWJ/FE0E/FE0F/U+20E3/skin tone/tag or end at ZWJ (no table emoji does; tested); results unchanged. (2) **`escape_for_display` is injective:** besides flagged characters it escapes the literal delimiters U+27E8 `⟨` and U+27E9 `⟩` as `⟨U+27E8⟩`/`⟨U+27E9⟩`, so every `⟨` in the output starts an escape and source text such as `⟨U+202E⟩` cannot pass for a real one (it becomes `⟨U+27E8⟩U+202E⟨U+27E9⟩`). The delimiters are display escapes only: `count` and `strip` ignore them. C.6 shape unchanged: `escape_for_display(s: &str) -> String` (string only, no segment type); a UI that wants to style escapes re-parses `⟨U+…⟩`, which is unambiguous. (3) A whole-table test checks every `emojis` entry and skin-tone variant (alone and glued `1{e}{e}2`). (4) The V31 version guard is two-sided: the data check (≥ 17.0) plus the exact locked versions of `icu_properties`, `icu_properties_data` and `emojis` read from `Cargo.lock`. (5) `icu_normalizer` dropped from `crates/preview/Cargo.toml` (workspace pin kept for T07/T14).
+
+**Cf ruling and proposed spec wording (for the ledger, next free L-id; the spec is not edited by T6):** the lead ruled to fail closed on all of General_Category=Cf. Proposed §6.4 text: "a character is flagged if it is `Default_Ignorable_Code_Point` ∪ `Cf` ∪ `Cc` except `\t`, `\n`, `\r` ∪ `Zl` ∪ `Zp`. Cf is named because some format characters are not Default_Ignorable (U+0600–0605, U+06DD, U+070F, U+0890–0891, U+08E2, U+110BD, U+110CD, U+FFF9–FFFB, U+13430–1343F). … Flagged characters, and the literal delimiters `⟨` `⟩`, are shown as `⟨U+XXXX⟩`."
 
 - [ ] **Step 1: Failing golden test** `s13_golden_classifier` in `tests/invisible.rs`, the §13 input exactly: `"a\u{1B}b\u{85}c\u{3164}d\u{E0041}e\u{202E}f👩\u{200D}🚀g❤\u{FE0F}h"` (ESC, NEL, U+3164, U+E0041, U+202E, the ZWJ sequence 👩‍🚀, and ❤️ with U+FE0F). Assert: `count` = `(1, 4)` (U+202E bidi; ESC, NEL, U+3164, U+E0041 other); `escape_for_display` = `"a⟨U+001B⟩b⟨U+0085⟩c⟨U+3164⟩d⟨U+E0041⟩e⟨U+202E⟩f👩\u{200D}🚀g❤\u{FE0F}h"`; `strip(input, false).0` = `"abcdef👩\u{200D}🚀g❤\u{FE0F}h"` and `.1 == true`; a lone `\u{200D}` between `a` and `b` is flagged; `\u{FE0F}` after `a` is flagged. `s13_mixed_script_identifiers`: `is_mixed_script("АBC-1")` (Cyrillic А) → true; `"ABC-1"` → false; host `"раypal.com"` (Cyrillic р, а) → true; host `"münchen.example"` → false; username `"jdoe@corp.example"` → false (digits, `@`, `.`, `-` are Common). The function is only ever called on identifiers (§6.4: "never on non-Latin prose" holds because callers never pass prose; Task 18's previewers are the only callers). `strip_keeps_newlines_for_reason`: `strip("a\nb\tc", true)` = `("a\nbc", true)`. `v31_builder_version_names_unicode_versions`: `PREVIEW_BUILDER_VERSION` contains `icu-` and `emoji-` followed by a digit.
 - [ ] **Step 2: Implement; run** `cargo test -p atlas-duck-preview --locked` → pass.
@@ -1898,6 +1902,11 @@ pub fn op_table() -> &'static BTreeMap<&'static str, OpImpl>;   // C.7
 ```
 
 **Spec:** §2.3 (OpImpl, coverage test), §5.1 inv. 3 (exact request list), §5.4 steps 2 and 5 (enrichment, conflict, unresolved names, stale rules table), §6.3 Fallback, §7.3/§7.4 endpoints, PD-09, PD-10.
+
+**Handoffs from Task 6 (review 2026-10-08; these override "over the whole serialized candidate" below):**
+- **Count over raw strings, not serialized JSON (serde_json escapes C0 controls).** `serde_json` writes U+0000–001F as `\u00XX`/`\b\f\n\r\t`, so `invisible::count` over the serialized candidate misses an ESC inside a string value (the S-13 case) while still counting DEL, C1, bidi controls. Take the header counts and the `bidi_controls`/`other_invisible` warnings by summing `invisible::count` over every decoded JSON string (object keys and values), not over the serialized text.
+- **IDNA-decode URL hosts before `is_mixed_script`.** A punycode host (`xn--…`) is all ASCII and never mixed; pass the Unicode form (`idna::domain_to_unicode`, already in the lock via `url`). Issue keys, space keys and usernames are passed as-is. `is_mixed_script` is a single-script check only (§6.4): an all-Cyrillic look-alike host is not flagged.
+- Display text built from agent or Atlassian strings goes through `invisible::escape_for_display` (injective; also escapes literal `⟨` `⟩`).
 
 **Content of the table:**
 - Every **read**: `executor = generic::read_executor` (builds `GetCall`/`PagedCall`/`SearchCall` from `spec.endpoint` + `alt_endpoint` + validated params; a `QueryValue::ParamOr { param, default }` query entry sends the param when present and `default` otherwise (`confluence.search` sends `excerpt=none` when the agent sent none, §7.4: `highlight` is never used; test `search_sends_excerpt_none_when_absent`); `jira.issue.get` maps `changelog`→`expand+=changelog`, `rendered`→`expand+=renderedFields`, default fields from `ISSUE_GET_DEFAULT_FIELDS`; the `comments: true` merge with the comment-list executor is M5: in M3 the flag is accepted and has no effect, a limitation recorded in PD-09), `previewer = generic::fallback_preview` (JSON tree, header counts via `invisible::count` over the whole serialized candidate, Caution `all_fields` when `fields` contains `*all`, `bidi_controls`/`other_invisible` when counts > 0, Info `truncated_by_cap`), `stale_check: None`, `enrich: None`.

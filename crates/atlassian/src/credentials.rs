@@ -9,13 +9,15 @@ use crate::url::UrlHash;
 /// A personal access token. Not `Serialize`, not `Clone`, `Debug` is redacted;
 /// memory is zeroized on drop (`secrecy`).
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn needs_ser<T: serde::Serialize>() {}
 /// needs_ser::<atlas_duck_atlassian::PatSecret>();
 /// ```
 pub struct PatSecret(SecretString);
 
 impl PatSecret {
+    /// Takes ownership of `token`. If the caller's `String` has spare capacity, a copy of the
+    /// token may remain in the freed allocation; build from a `SecretString` where possible.
     pub fn new(token: String) -> Self {
         PatSecret(SecretString::from(token))
     }
@@ -29,6 +31,12 @@ impl PatSecret {
 impl fmt::Debug for PatSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PatSecret([REDACTED])")
+    }
+}
+
+impl From<SecretString> for PatSecret {
+    fn from(s: SecretString) -> Self {
+        PatSecret(s)
     }
 }
 

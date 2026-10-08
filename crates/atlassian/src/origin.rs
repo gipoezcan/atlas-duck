@@ -1,7 +1,7 @@
 //! The origin guard (§7.2): no request, and so no PAT, leaves for a URL that is
 //! not https, not under the bound base URL, or carries userinfo.
 
-use crate::url::{NormalizedBaseUrl, UrlHash, url_hash};
+use crate::url::{NormalizedBaseUrl, UrlHash, has_dot_segment, url_hash};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OriginRefused {
@@ -39,7 +39,7 @@ pub fn origin_guard(
     let path = url.path();
     let ctx = base.context_path.as_str();
     let under = ctx.is_empty() || path == ctx || path.starts_with(&format!("{ctx}/"));
-    if !under || path.split('/').any(|s| s == "." || s == "..") {
+    if !under || has_dot_segment(path) {
         return Err(OriginRefused::OutsideBase);
     }
     Ok(())
