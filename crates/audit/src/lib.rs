@@ -12,6 +12,7 @@ pub mod error;
 pub mod keystore;
 pub mod recovery;
 pub mod request_set;
+pub mod schema;
 pub mod types;
 
 pub use request_set::{RequestRecord, request_set_hash};
