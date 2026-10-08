@@ -266,6 +266,40 @@ jobs:
         shell: pwsh
         run: ./ci/check-bin-linkage.ps1 -BinDir target/debug
 
+      - name: Probe evidence (§9.4, go/no-go record)
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            macOS)
+              echo "RUNNER_FACT macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion) machine $(uname -m)"
+              ;;
+            Linux)
+              echo "RUNNER_FACT kernel $(uname -r)"
+              echo "RUNNER_FACT $(ldd --version | head -n 1)"
+              echo "RUNNER_FACT yama ptrace_scope $(cat /proc/sys/kernel/yama/ptrace_scope 2>&1 || true)"
+              ;;
+            Windows)
+              echo "RUNNER_FACT $(cmd //c ver | tr -d '\r' | tr -s '\n' ' ')"
+              ;;
+          esac
+          cargo test -p atlas-duck-app --test probe_evidence --locked -- --nocapture --test-threads=1
+
+      - name: Show the printed probe-test evidence (V09, V10, V11 go/no-go record)
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Windows)
+              cargo test -p atlas-duck-sandbox-host --test aces_windows --locked -- --nocapture --test-threads=1
+              cargo test -p atlas-duck-app --test probes_windows --locked -- --nocapture --test-threads=1
+              ;;
+            macOS)
+              cargo test -p atlas-duck-app --test probes_macos --locked -- --nocapture --test-threads=1
+              ;;
+            Linux)
+              cargo test -p atlas-duck-app --test probes_linux --locked -- --nocapture --test-threads=1
+              ;;
+          esac
+
       - name: Workspace dependency rule (§2.2)
         run: node ci/check-workspace.mjs
 
@@ -356,6 +390,13 @@ jobs:
 
       - name: Test x86_64-apple-darwin (test binaries run under Rosetta)
         run: cargo test --workspace --locked --target x86_64-apple-darwin
+
+      - name: Probe evidence (§9.4, go/no-go record)
+        run: |
+          set -euo pipefail
+          echo "RUNNER_FACT macOS $(sw_vers -productVersion) build $(sw_vers -buildVersion) machine $(uname -m)"
+          cargo test -p atlas-duck-app --test probe_evidence --locked --target x86_64-apple-darwin -- --nocapture --test-threads=1
+          cargo test -p atlas-duck-app --test probes_macos --locked --target x86_64-apple-darwin -- --nocapture --test-threads=1
 
       - name: Show that the test binaries are x86_64
         run: |
@@ -509,6 +550,87 @@ jobs:
           $env:ATLAS_DUCK_TEST_UNC_SYMLINK = $link
           cargo test -p atlas-duck-ipc --test locality --locked -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  probe-evidence-fedora:
+    name: probe-evidence-fedora (§9.4 probes on Fedora 40, glibc 2.39)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux system packages (Tauri, tray, D-Bus, Xvfb)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            dbus-x11 \
+            xvfb
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: probe-evidence-fedora
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Build the UI (tauri::generate_context! reads app/ui/dist)
+        run: |
+          npm --prefix app/ui ci --ignore-scripts
+          npm --prefix app/ui run build
+
+      - name: Build the probe-evidence test binary and the sandbox worker on ubuntu-22.04
+        run: |
+          set -euo pipefail
+          cargo build -p atlas-duck-app --bin atlas-duck-sandbox --locked
+          cargo test -p atlas-duck-app --test probe_evidence --locked --no-run --message-format=json > "$RUNNER_TEMP/build.json"
+          exe="$(node -e '
+            const fs = require("fs");
+            let exe = "";
+            for (const line of fs.readFileSync(process.argv[1], "utf8").split("\n")) {
+              let m;
+              try { m = JSON.parse(line); } catch { continue; }
+              if (m.reason === "compiler-artifact" && m.executable && m.target && m.target.name === "probe_evidence") exe = m.executable;
+            }
+            console.log(exe);
+          ' "$RUNNER_TEMP/build.json")"
+          test -x "$exe"
+          mkdir -p "$RUNNER_TEMP/fedora"
+          cp "$exe" "$RUNNER_TEMP/fedora/probe_evidence"
+          cp target/debug/atlas-duck-sandbox "$RUNNER_TEMP/fedora/atlas-duck-sandbox"
+          ls -l "$RUNNER_TEMP/fedora"
+
+      - name: Probe evidence (§9.4, go/no-go record)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "$RUNNER_TEMP/fedora:/w:ro" \
+            -e ATLAS_DUCK_SANDBOX_BIN=/w/atlas-duck-sandbox \
+            fedora:40 sh -c '
+              set -e
+              echo "RUNNER_FACT $(rpm -q glibc) on kernel $(uname -r)"
+              if ! dnf install -y webkit2gtk4.1 libayatana-appindicator-gtk3 > /tmp/dnf.log 2>&1; then
+                cat /tmp/dnf.log
+                exit 1
+              fi
+              /w/probe_evidence --nocapture --test-threads=1
+            '
 
   supply-chain:
     name: supply-chain (cargo-deny, cargo-audit)
