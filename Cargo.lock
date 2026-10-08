@@ -382,6 +382,10 @@ version = "0.1.0"
 [[package]]
 name = "atlas-duck-registry"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "atlas-duck-sandbox-host"
