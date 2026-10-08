@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::jcs::{JcsError, to_jcs_vec};
 use chrono::{Datelike, NaiveDate};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
@@ -282,6 +283,14 @@ pub(crate) enum Cmd {
         server: UtcInstant,
         local: UtcInstant,
         mono_at: Duration,
+    },
+    /// Startup step 4 (§8.13): the pending migrations and their `SCHEMA_MIGRATED` rows.
+    Migrate {
+        reply: SyncSender<Result<Option<(u32, u32)>, OpenError>>,
+    },
+    /// `meta.written_by` = this build (after startup step 4, §8.13).
+    SetWrittenBy {
+        reply: SyncSender<Result<(), OpenError>>,
     },
     #[cfg(any(test, feature = "testing"))]
     Pragma {
@@ -621,7 +630,7 @@ impl Writer {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             &parts.hooks,
         )?;
-        schema::gate_open_connection(&conn)?;
+        schema::gate_open_connection_up_to(&conn, parts.hooks.schema_head())?;
         let row: Option<HeadRow> = conn
             .query_row(
                 "SELECT seq, record_hash, chain_id, epoch, ts_utc, flags FROM events \
@@ -815,6 +824,33 @@ impl Writer {
         }
     }
 
+    /// Every pending migration step in one transaction, each followed by its
+    /// `SCHEMA_MIGRATED {from, to, app_version}` row in that transaction (§8.13). On error
+    /// everything rolls back (`MigrationFailed`) and the in-memory clock state and head are
+    /// restored; a DEK created for a rolled-back row never reaches the cache.
+    fn migrate(&mut self) -> Result<Option<(u32, u32)>, OpenError> {
+        let migrations = self.st.hooks.migrations();
+        let snapshot = (self.st.clock_state.clone(), self.st.head.clone());
+        let mut new_keys = HashMap::new();
+        let st = &mut self.st;
+        let result = schema::run_migrations(&mut self.conn, &migrations, &mut |tx, from, to| {
+            let p = PreparedEvent::system(
+                EventType::SCHEMA_MIGRATED,
+                &json!({ "from": from, "to": to, "app_version": APP_VERSION }),
+            )?;
+            let mono = st.clock.suspend_aware_elapsed();
+            let stamp = st.clock_state.stamp(st.clock.now_utc(), mono);
+            st.insert_one(tx, &stamp, &p, mono, &mut new_keys)?;
+            Ok(())
+        });
+        match &result {
+            Ok(Some(_)) => self.st.post_commit(new_keys, &[]),
+            Ok(None) => {}
+            Err(_) => (self.st.clock_state, self.st.head) = snapshot,
+        }
+        result
+    }
+
     /// Deletes `seq < first_retained_seq`, writes the next `prune_log` row and its `PRUNE`
     /// in one transaction (no DEK destruction, no clock or cadence rules).
     #[cfg(any(test, feature = "testing"))]
@@ -960,6 +996,14 @@ impl Writer {
                     local,
                     mono_at,
                 } => self.observe(server, local, mono_at),
+                Cmd::Migrate { reply } => {
+                    let r = self.migrate();
+                    let _ = reply.send(r);
+                }
+                Cmd::SetWrittenBy { reply } => {
+                    let r = schema::set_written_by(&self.conn).map_err(sql_open);
+                    let _ = reply.send(r);
+                }
                 #[cfg(any(test, feature = "testing"))]
                 Cmd::Pragma { name, reply } => {
                     let r = self

@@ -250,7 +250,13 @@ pub enum FaultPoint {
     WriterPause,
     /// First run: after `GENESIS` committed and both anchors were written, before the rename.
     FirstRunBeforeRename,
+    /// `open()` step 4: right after the startup `VERIFY` committed (or was not needed), before
+    /// any anchor action or anchor write is allowed.
+    AfterStartupVerifyAppend,
 }
+
+/// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).
+type Observer = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct PauseState {
@@ -261,6 +267,7 @@ struct PauseState {
 /// Injected failures and a writer pause, shared between a test and the store's [`crate::store::Hooks`].
 pub struct Faults {
     armed: Mutex<HashMap<FaultPoint, (u32, u32)>>,
+    observers: Mutex<HashMap<FaultPoint, Vec<Observer>>>,
     pause: Mutex<PauseState>,
     cv: Condvar,
 }
@@ -269,6 +276,7 @@ impl Faults {
     pub fn new() -> Arc<Faults> {
         Arc::new(Faults {
             armed: Mutex::new(HashMap::new()),
+            observers: Mutex::new(HashMap::new()),
             pause: Mutex::new(PauseState::default()),
             cv: Condvar::new(),
         })
@@ -282,6 +290,15 @@ impl Faults {
     /// The `skip` next hits of `p` pass, then `times` hits fail.
     pub fn fail_after(&self, p: FaultPoint, skip: u32, times: u32) {
         lock(&self.armed).insert(p, (skip, times));
+    }
+
+    /// `f` runs every time `p` is reached, before an armed failure of `p` is applied (tests
+    /// snapshot state at that moment).
+    pub fn on_hit(&self, p: FaultPoint, f: impl Fn() + Send + Sync + 'static) {
+        lock(&self.observers)
+            .entry(p)
+            .or_default()
+            .push(Arc::new(f));
     }
 
     /// From the next command on, the writer blocks at [`FaultPoint::WriterPause`].
@@ -324,6 +341,10 @@ impl Faults {
                 st.paused = false;
             }
             return Ok(());
+        }
+        let observers = lock(&self.observers).get(&p).cloned().unwrap_or_default();
+        for f in observers {
+            f();
         }
         let mut armed = lock(&self.armed);
         match armed.get_mut(&p) {
@@ -407,39 +428,32 @@ fn kek_from(keys: &dyn KeyStore) -> Result<crate::crypto::Kek, crate::error::Ope
         .map_err(|_| OpenError::Invalid("the keychain KEK is malformed"))
 }
 
-/// Stand-in for `open()` steps 1–3 until T10: the read-only version gate, the KEK, the
-/// keychain anchors (head first) and `verify::startup` on a read-only connection. Writes
-/// nothing.
+/// `open()` steps 1–3 without step 4: the version gate, the keychain cases and the startup
+/// verdict, held in memory. Writes nothing but the keychain canary of the self-test. An outcome
+/// other than a verdict is an error: `StoreNewer` → `NewerStore(found)`, `Locked` →
+/// `KeyStore(Other(reason))`, no `audit.db` → `Io(NotFound)`.
 pub fn startup_verdict(
     data: &atlas_duck_ipc::paths::LocalDataDir,
     cfg: &crate::store::OpenConfig,
 ) -> Result<crate::verify::StartupVerdict, crate::error::OpenError> {
-    use crate::anchors::{AnchorLoadError, load_anchors};
     use crate::error::OpenError;
-    use crate::{schema, verify};
-
-    let db = schema::db_path(data);
-    schema::gate(&schema::read_versions(&db)?).map_err(OpenError::NewerStore)?;
-    let kek = kek_from(&*cfg.keys)?;
-    let (head_anchor, first_retained) = load_anchors(&*cfg.keys).map_err(|e| match e {
-        AnchorLoadError::Newer(n) => OpenError::NewerStore(format!("keychain anchor layout {n}")),
-        AnchorLoadError::KeyStore(k) => OpenError::KeyStore(k),
-    })?;
-    let conn = schema::open_ro(&db)?;
-    let store_install_id =
-        verify::store_install_id(&conn).map_err(|e| OpenError::Sqlite(e.to_string()))?;
-    verify::startup(&verify::StartupInputs {
-        conn: &conn,
-        kek: &kek,
-        head_anchor,
-        first_retained,
-        store_install_id,
-        pinned_install_id: cfg.pinned_install_id.clone(),
-    })
+    use crate::open::{Preflight, StartupOutcome};
+    match crate::open::preflight(data, cfg)? {
+        Preflight::Verified { verdict, .. } => Ok(*verdict),
+        Preflight::Stop(StartupOutcome::StoreNewer { found }) => Err(OpenError::NewerStore(found)),
+        Preflight::Stop(StartupOutcome::Locked(r)) => {
+            Err(OpenError::KeyStore(KeyStoreError::Other(r.as_str().into())))
+        }
+        Preflight::Stop(_) => Err(OpenError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "audit.db does not exist",
+        ))),
+    }
 }
 
-/// A store handle on an existing `audit.db` until T10's `open()`: KEK from the keychain,
-/// writer started, anchor writes disabled until [`apply_startup`].
+/// A store handle on an existing `audit.db` without startup verification (tamper tests that
+/// need a handle on a store `open()` would flag): KEK from the keychain, writer started,
+/// anchor writes disabled until [`apply_startup`].
 pub fn open_existing(
     data: &atlas_duck_ipc::paths::LocalDataDir,
     lock: &crate::lock::InstanceLock,

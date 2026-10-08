@@ -190,7 +190,6 @@ pub(crate) fn load_first_retained(
 /// runs: the anchor thread writes first-retained before head, so a head read first never
 /// names a `PRUNE` whose first-retained update the second read cannot see. An absent or
 /// malformed entry is `None` (verification reports it as missing).
-#[allow(dead_code)] // called by `open()` (T10) and the `testing` shim
 pub(crate) fn load_anchors(
     keys: &dyn KeyStore,
 ) -> Result<(Option<HeadAnchor>, Option<FirstRetainedAnchor>), AnchorLoadError> {

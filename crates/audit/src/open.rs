@@ -1,29 +1,104 @@
-//! First run (§2.5 step (1b), §8.4, §8.6): `create_new_store` writes a new store whose first
-//! record is `GENESIS`. `open()` of an existing store comes with T10.
+//! Startup (§8.7 steps 1–4) and first run (§2.5 step (1b), §8.4, §8.6). `open` runs the
+//! version gate, the keychain cases and the pre-migration verification of an existing store,
+//! then migrations, the startup `VERIFY` and only then anchor writes. `create_new_store` writes
+//! a new store whose first record is `GENESIS`.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use atlas_duck_ipc::paths::LocalDataDir;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OptionalExtension};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
-use crate::anchors::{FirstRetainedAnchor, HeadAnchor};
-use crate::crypto::{Kek, fill_random};
+use crate::anchors::{self, AnchorLoadError, FirstRetainedAnchor, HeadAnchor};
+use crate::crypto::{self, Kek, KekEntryError, fill_random};
 use crate::encoding::ZERO_HASH;
 use crate::error::{AuditError, OpenError};
 use crate::keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, canary_self_test};
 use crate::lock::InstanceLock;
 use crate::recovery::{check_new_passphrase, new_recovery_blob};
-use crate::schema;
+use crate::schema::{self, StoreVersions};
 use crate::store::{AnchorInit, OpenConfig, Store};
+use crate::verify::{self, StartupInputs, StartupVerdict, VerifyOutcome};
 use crate::writer::{Writer, WriterParts};
 
 /// First-run staging file: the new DB is renamed to `audit.db` only once `GENESIS` committed
 /// (plan decision), so a crash never leaves an `audit.db` without `GENESIS`.
 pub const NEW_DB_FILE: &str = "audit.db.new";
+
+/// Restore staging file (F.1); a leftover is deleted at the next start.
+pub const RESTORING_DB_FILE: &str = "audit.db.restoring";
+
+/// Why the store is not served (§4.3 `details.reason`, exit 9). While locked nothing after
+/// startup step 2 runs: no migration, no write (§8.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockedReason {
+    /// The keychain did not answer (or is locked): retry with [`keychain_retry_schedule`].
+    KeychainUnavailable,
+    /// This install's KEK is absent or does not open the store (§8.7 keychain cases).
+    KeychainLost { offer: RecoveryOffer },
+    /// The keyring's backing files are not on a local disk (§8.6); no keyring entry was read.
+    KeyringNotLocal,
+}
+
+impl LockedReason {
+    /// `keychain_unavailable` | `keychain_lost` | `keyring_not_local` (§4.3).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LockedReason::KeychainUnavailable => "keychain_unavailable",
+            LockedReason::KeychainLost { .. } => "keychain_lost",
+            LockedReason::KeyringNotLocal => "keyring_not_local",
+        }
+    }
+}
+
+/// Which credential-window purpose M6 shows for `keychain_lost` (§8.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryOffer {
+    /// "Recover this log" with the store's recovery passphrase.
+    RecoverThisLog,
+    /// The newest record is a `RESTORE` of this install whose KEK re-seal did not happen:
+    /// "Finish restore" with the restored store's recovery passphrase.
+    FinishRestore,
+}
+
+/// What `open` found (C.3).
+#[derive(Debug)]
+pub enum StartupOutcome {
+    /// Verified and serving; `verify` is the startup verification (its `VERIFY` row, if any).
+    Ready {
+        store: Store,
+        verify: VerifyOutcome,
+    },
+    /// No `audit.db` in the data dir (§2.5).
+    FirstRun,
+    Locked(LockedReason),
+    /// Written by a newer build (§8.13); nothing was written. `found` names what is newer and,
+    /// when recorded, the version that wrote the store.
+    StoreNewer {
+        found: String,
+    },
+}
+
+/// The delays between `open` attempts while it returns `Locked(KeychainUnavailable)`: 90 s in
+/// all, inside the 60–120 s window of §8.7 (plan decision). The app then stays locked and
+/// offers a manual retry.
+pub fn keychain_retry_schedule() -> &'static [Duration] {
+    const SCHEDULE: [Duration; 6] = [
+        Duration::from_secs(2),
+        Duration::from_secs(4),
+        Duration::from_secs(8),
+        Duration::from_secs(16),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    ];
+    &SCHEDULE
+}
 
 /// What the wizard collected (§2.5 step (1b)): ids from [`new_ids`], the recovery passphrase
 /// typed twice, and the archived DB when started fresh beside one (§8.7).
@@ -68,14 +143,14 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Deletes a leftover `audit.db.new` and its SQLite side files (never `audit.db`).
-pub(crate) fn remove_new_leftovers(data: &LocalDataDir) -> io::Result<()> {
-    let new = data.path().join(NEW_DB_FILE);
+/// Deletes `file` in the data dir and its SQLite side files.
+fn remove_with_side_files(data: &LocalDataDir, file: &str) -> io::Result<()> {
+    let path = data.path().join(file);
     for p in [
-        new.clone(),
-        with_suffix(&new, "-wal"),
-        with_suffix(&new, "-shm"),
-        with_suffix(&new, "-journal"),
+        path.clone(),
+        with_suffix(&path, "-wal"),
+        with_suffix(&path, "-shm"),
+        with_suffix(&path, "-journal"),
     ] {
         match std::fs::remove_file(&p) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -83,6 +158,18 @@ pub(crate) fn remove_new_leftovers(data: &LocalDataDir) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Deletes a leftover `audit.db.new` and its SQLite side files (never `audit.db`).
+pub(crate) fn remove_new_leftovers(data: &LocalDataDir) -> io::Result<()> {
+    remove_with_side_files(data, NEW_DB_FILE)
+}
+
+/// Deletes the staging files a crashed first run or restore left (never `audit.db`): neither
+/// ever counts as a store.
+fn remove_staging_leftovers(data: &LocalDataDir) -> io::Result<()> {
+    remove_new_leftovers(data)?;
+    remove_with_side_files(data, RESTORING_DB_FILE)
 }
 
 /// Makes a rename inside `dir` durable (Unix); NTFS journals the rename itself.
@@ -175,7 +262,6 @@ impl FirstRun {
 /// connection and loads the head and the open incidents). Anchor writes start disabled, as
 /// `open()` requires until the startup `VERIFY` is committed (§8.7); `Store::apply_startup`
 /// enables them. The store's `install_id` is the keystore's.
-#[allow(dead_code)] // called by `open()` (T10) and the `testing` shim
 pub(crate) fn start_existing(
     data: &LocalDataDir,
     cfg: OpenConfig,
@@ -196,6 +282,262 @@ pub(crate) fn start_existing(
     Store::start(data, cfg, kek, install_id, anchors, move |parts| {
         Writer::open(&db, parts)
     })
+}
+
+fn sql(e: rusqlite::Error) -> OpenError {
+    OpenError::Sqlite(e.to_string())
+}
+
+/// `meta.written_by` is plaintext and outside the chain: shown only if it looks like a
+/// version string, never as arbitrary text.
+fn with_written_by(found: String, v: &StoreVersions) -> String {
+    let plausible = |w: &str| {
+        !w.is_empty()
+            && w.len() <= 64
+            && w.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b))
+    };
+    match v.written_by.as_deref() {
+        Some(w) if plausible(w) => format!("{found}; written by atlas-duck {w}"),
+        Some(_) => format!("{found}; written by an unrecognised atlas-duck version"),
+        None => found,
+    }
+}
+
+/// A keychain error at startup: `NotLocal` keeps that reason, every other error is "not
+/// reachable (yet)" and is retried (§8.7).
+fn keyring_reason(e: &KeyStoreError) -> LockedReason {
+    match e {
+        KeyStoreError::NotLocal => LockedReason::KeyringNotLocal,
+        _ => LockedReason::KeychainUnavailable,
+    }
+}
+
+fn text(v: ValueRef<'_>) -> Option<String> {
+    match v {
+        ValueRef::Text(t) => std::str::from_utf8(t).ok().map(str::to_string),
+        _ => None,
+    }
+}
+
+/// `FinishRestore` iff the newest record is a `RESTORE` naming this install in its plaintext
+/// `target` (§8.7 interrupted restore before the KEK re-seal).
+fn recovery_offer(conn: &Connection, install_id: &str) -> Result<RecoveryOffer, OpenError> {
+    let newest: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT event_type, target FROM events ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((text(r.get_ref(0)?), text(r.get_ref(1)?))),
+        )
+        .optional()
+        .map_err(sql)?;
+    Ok(match newest {
+        Some((Some(t), Some(target))) if t == "RESTORE" && target == install_id => {
+            RecoveryOffer::FinishRestore
+        }
+        _ => RecoveryOffer::RecoverThisLog,
+    })
+}
+
+/// `(key_id, key row exists, month, wrapped_dek)` of the newest record; `None` where the
+/// stored value has the wrong type.
+type NewestKey = (Option<u64>, bool, Option<Option<String>>, Option<Vec<u8>>);
+
+/// Whether `kek` opens the data key of the newest record. `false` only when that key exists
+/// and does not unwrap: the keychain KEK is not this store's (§8.7 "undecryptable"). A missing,
+/// destroyed or unreadable key row is left to verification, which reports it as an incident.
+fn newest_dek_unwraps(conn: &Connection, kek: &Kek) -> Result<bool, OpenError> {
+    let row: Option<NewestKey> = conn
+        .query_row(
+            "SELECT e.key_id, k.key_id IS NOT NULL, k.month, k.wrapped_dek FROM events e \
+             LEFT JOIN keys k ON k.key_id = e.key_id ORDER BY e.seq DESC LIMIT 1",
+            [],
+            |r| {
+                let key_id = match r.get_ref(0)? {
+                    ValueRef::Integer(i) => u64::try_from(i).ok(),
+                    _ => None,
+                };
+                let month = match r.get_ref(2)? {
+                    ValueRef::Null => Some(None),
+                    v => text(v).map(Some),
+                };
+                let wrapped = match r.get_ref(3)? {
+                    ValueRef::Blob(b) => Some(b.to_vec()),
+                    _ => None,
+                };
+                Ok((key_id, r.get::<_, bool>(1)?, month, wrapped))
+            },
+        )
+        .optional()
+        .map_err(sql)?;
+    let Some((key_id, found, month, wrapped)) = row else {
+        return Err(OpenError::Integrity("the store has no records".into()));
+    };
+    Ok(match (key_id, found, month, wrapped) {
+        (Some(id), true, Some(month), Some(w)) => {
+            crypto::unwrap_dek(kek, id, month.as_deref(), &w).is_ok()
+        }
+        _ => true,
+    })
+}
+
+/// `open()` steps 1–3 (§8.7): an outcome that stops startup, or the KEK and the verdict held
+/// in memory for step 4.
+pub(crate) enum Preflight {
+    Stop(StartupOutcome),
+    Verified {
+        kek: Kek,
+        verdict: Box<StartupVerdict>,
+    },
+}
+
+/// Steps 1–3: the version gate (read-only, writes nothing), the keychain cases (locality before
+/// any keyring access, then the canary, then the KEK), the anchors and the pre-migration
+/// verification. Writes nothing but the canary of the self-test; the DB is opened only by
+/// sidecar-free readers (`schema::open_peek`), and only after the keychain answered.
+pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflight, OpenError> {
+    let db = schema::db_path(data);
+    if !db.try_exists()? {
+        if with_suffix(&db, "-wal").try_exists()? {
+            // As in `create_new_store`: a WAL without its DB is never a first run.
+            return Err(OpenError::Integrity(
+                "audit.db-wal exists without audit.db".into(),
+            ));
+        }
+        return Ok(Preflight::Stop(StartupOutcome::FirstRun));
+    }
+    let locked = |r: LockedReason| Ok(Preflight::Stop(StartupOutcome::Locked(r)));
+    // 1. Version gate (§8.13).
+    let versions = schema::read_versions(&db)?;
+    let newer = |found: String| {
+        Ok(Preflight::Stop(StartupOutcome::StoreNewer {
+            found: with_written_by(found, &versions),
+        }))
+    };
+    if let Err(found) = schema::gate_up_to(&versions, cfg.hooks.schema_head()) {
+        return newer(found);
+    }
+    // 2. KEK (§8.6, §8.7).
+    match cfg.keys.locality() {
+        KeyringLocality::Local => {}
+        KeyringLocality::NotLocal { .. } => return locked(LockedReason::KeyringNotLocal),
+        KeyringLocality::Unknown { .. } => return locked(LockedReason::KeychainUnavailable),
+    }
+    if let Err(e) = canary_self_test(&*cfg.keys) {
+        return locked(keyring_reason(&e));
+    }
+    let install_id = cfg.keys.install_id();
+    let lost = |conn: &Connection| {
+        let offer = recovery_offer(conn, install_id)?;
+        locked(LockedReason::KeychainLost { offer })
+    };
+    let kek = match cfg.keys.get(&EntryName::Kek) {
+        Err(e) => return locked(keyring_reason(&e)),
+        Ok(None) => return lost(&schema::open_peek(&db)?),
+        Ok(Some(b)) => match Kek::from_entry_bytes(&b) {
+            Ok(k) => k,
+            Err(KekEntryError::NewerLayout(n)) => return newer(format!("keychain kek layout {n}")),
+            Err(KekEntryError::Malformed) => return lost(&schema::open_peek(&db)?),
+        },
+    };
+    let ro = schema::open_peek(&db)?;
+    if !newest_dek_unwraps(&ro, &kek)? {
+        return lost(&ro);
+    }
+    // 3. Anchors, head first, then the verification of the pre-migration store (§8.7). The
+    // anchor-dir lines (`cfg.anchor_dir`) join the inputs with T14.
+    let (head_anchor, first_retained) = match anchors::load_anchors(&*cfg.keys) {
+        Ok(a) => a,
+        Err(AnchorLoadError::Newer(n)) => return newer(format!("keychain anchor layout {n}")),
+        Err(AnchorLoadError::KeyStore(e)) => return locked(keyring_reason(&e)),
+    };
+    let store_install_id = verify::store_install_id(&ro).map_err(sql)?;
+    let verdict = verify::startup(&StartupInputs {
+        conn: &ro,
+        kek: &kek,
+        head_anchor,
+        first_retained,
+        store_install_id,
+        pinned_install_id: cfg.pinned_install_id.clone(),
+    })?;
+    Ok(Preflight::Verified {
+        kek,
+        verdict: Box::new(verdict),
+    })
+}
+
+/// Startup (C.3, §8.7 steps 1–4) of the store in `data`. In order: leftover staging files are
+/// deleted → `FirstRun` iff there is no `audit.db` → 1. the version gate (`StoreNewer`, nothing
+/// written) → 2. keyring locality, canary and KEK (`Locked`, nothing written, no migration) →
+/// 3. the anchors and the pre-migration verification, held in memory → 4. the writer starts
+/// with anchor writes disabled, runs the migrations (`SCHEMA_MIGRATED` in the same
+/// transaction), appends the step-3 `VERIFY` (none for a clean start), and only then performs
+/// the anchor actions and enables anchor writes; `meta.written_by` is updated last.
+///
+/// A keychain that is unavailable, lost or not local is a `Locked` outcome, never `FirstRun`
+/// and never an `Err`. A failed migration rolls back and is `Err(MigrationFailed)` (not an
+/// incident; the store is shut down and the next `open` retries it).
+pub fn open(
+    data: &LocalDataDir,
+    lock: &InstanceLock,
+    cfg: OpenConfig,
+) -> Result<StartupOutcome, OpenError> {
+    if lock.path().parent() != Some(data.path()) {
+        return Err(OpenError::Invalid("instance.lock of another data dir"));
+    }
+    remove_staging_leftovers(data)?;
+    let (kek, verdict) = match preflight(data, &cfg)? {
+        Preflight::Stop(outcome) => return Ok(outcome),
+        Preflight::Verified { kek, verdict } => (kek, verdict),
+    };
+    let store = match start_existing(data, cfg, kek) {
+        Ok(s) => s,
+        // The writer's WAL-aware re-check of the gate.
+        Err(OpenError::NewerStore(found)) => {
+            let found = match schema::read_versions(&schema::db_path(data)) {
+                Ok(v) => with_written_by(found, &v),
+                Err(_) => found,
+            };
+            return Ok(StartupOutcome::StoreNewer { found });
+        }
+        Err(e) => return Err(e),
+    };
+    let step4 = || -> Result<VerifyOutcome, OpenError> {
+        store.run_migrations()?;
+        let verify = store.apply_startup(&verdict).map_err(audit_err)?;
+        store.update_written_by()?;
+        Ok(verify)
+    };
+    match step4() {
+        Ok(verify) => Ok(StartupOutcome::Ready { store, verify }),
+        Err(e) => {
+            store.shutdown();
+            Err(e)
+        }
+    }
+}
+
+/// The store's `install_id` (§8.6: the latest `RESTORE`, else `GENESIS`, else the newest
+/// retained `APP_START`), read from the plaintext `target` column without the KEK and without
+/// writing anything; for the wizard path (1a) that pins this host to an existing store (§2.5).
+/// `Ok(None)`: no record names one. `Err(Io(NotFound))`: there is no `audit.db`. A value that
+/// is not 32 lowercase hex characters is `Integrity` (it would name keychain entries).
+pub fn read_store_install_id(data: &LocalDataDir) -> Result<Option<String>, OpenError> {
+    let db = schema::db_path(data);
+    if !db.try_exists()? {
+        return Err(OpenError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "audit.db does not exist",
+        )));
+    }
+    let conn = schema::open_peek(&db)?;
+    match verify::store_install_id(&conn).map_err(sql)? {
+        Some(id) if is_id(&id) => Ok(Some(id)),
+        Some(_) => Err(OpenError::Integrity(
+            "the store's install_id is not 32 lowercase hex characters".into(),
+        )),
+        None => Ok(None),
+    }
 }
 
 /// Wizard step (1b): a new store with `GENESIS` (C.3). In order: refuse an existing DB →

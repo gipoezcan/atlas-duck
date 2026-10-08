@@ -1,21 +1,20 @@
 //! Verification (§8.7, §8.5, §8.11; U-06 tamper suite, U-17 incidents, U-22 prune half):
-//! startup verdict through the `testing::startup_verdict` shim (T10 brings `open()`), full
+//! startup verdict through `testing::startup_verdict` (`open()` steps 1–3), full
 //! verification on a fresh store handle, persistent incidents and acknowledgement.
 //! Tampering runs on a closed store through a raw SQLite connection.
 
 mod common;
 
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use atlas_duck_audit::anchors::{FirstRetainedAnchor, HeadAnchor};
 use atlas_duck_audit::crypto::{self, Kek};
 use atlas_duck_audit::encoding::{self, FIELD_LIST, ZERO_HASH};
 use atlas_duck_audit::error::{AuditError, OpenError};
 use atlas_duck_audit::keystore::{EntryName, KeyStore, KeyStoreError, service_name};
-use atlas_duck_audit::request_set::{RequestRecord, request_set_hash, requests_to_json};
 use atlas_duck_audit::schema::DB_FILE;
 use atlas_duck_audit::testing::{self, FakePrune, Faults, KeyOpKind, MemKeyring};
-use atlas_duck_audit::types::{Actor, EventFlags, EventType, NewEvent};
+use atlas_duck_audit::types::{EventFlags, EventType};
 use atlas_duck_audit::verify::StartupVerdict;
 use atlas_duck_audit::{FindingKind, OpenConfig, Store, VerifyFinding};
 use atlas_duck_ipc::jcs::to_jcs_vec;
@@ -26,15 +25,6 @@ use sha2::{Digest, Sha256};
 
 // ---------------------------------------------------------------------------------------
 // helpers
-
-fn server_time(ts: &str) -> SystemTime {
-    UNIX_EPOCH + Duration::from_millis(at(ts).0 as u64)
-}
-
-/// The next records get a non-NULL epoch (the server agrees with the local clock).
-fn corroborate(store: &Store) {
-    store.observe_server_date("i1", server_time(START), Instant::now());
-}
 
 fn settings(retention_days: u64, legal_hold: bool) -> Value {
     json!({ "retention_days": retention_days, "legal_hold": legal_hold })
@@ -62,73 +52,6 @@ fn fake_prune(store: &Store, first_retained_seq: u64, update_first_retained: boo
             settings: settings(92, false),
             update_first_retained,
         },
-    )
-}
-
-/// `n` events of several kinds and column shapes (no store-owned type).
-fn mixed(n: usize) -> Vec<NewEvent> {
-    (0..n)
-        .map(|i| {
-            let mut e = match i % 6 {
-                0 => ev(EventType::REQUEST_RECEIVED, Some("r1"), json!({ "i": i })),
-                1 => ev(
-                    EventType::READ_FETCHED,
-                    Some("r1"),
-                    json!({ "body": "x".repeat(i) }),
-                ),
-                2 => ev(
-                    EventType::DELIVERED,
-                    Some("r1"),
-                    json!({ "i": i, "ok": true }),
-                ),
-                3 => ev(
-                    EventType::CONFIG_CHANGED,
-                    None,
-                    json!({ "key": "k", "i": i }),
-                ),
-                4 => write_approved(i, true),
-                _ => ev(EventType::APP_START, None, json!({ "i": i })),
-            };
-            if i % 2 == 0 {
-                e.target = Some(format!("PROJ-{i}"));
-                e.actor = Actor {
-                    agent_name: Some("agent".into()),
-                    os_user: Some("alice".into()),
-                    peer_pid: Some(4242),
-                    ..Actor::default()
-                };
-            }
-            e
-        })
-        .collect()
-}
-
-fn requests(i: usize) -> Vec<RequestRecord> {
-    vec![RequestRecord {
-        index: 0,
-        method: "POST".into(),
-        resolved_url: format!("https://jira.example/rest/api/2/issue/{i}"),
-        content_type: Some("application/json".into()),
-        body_bytes: format!("{{\"n\":{i}}}").into_bytes(),
-    }]
-}
-
-/// A `WRITE_APPROVED` whose `request_set_hash` matches its `requests` (or not).
-fn write_approved(i: usize, correct: bool) -> NewEvent {
-    let reqs = requests(i);
-    let hash = if correct {
-        request_set_hash(&reqs)
-    } else {
-        request_set_hash(&requests(i + 1))
-    };
-    ev(
-        EventType::WRITE_APPROVED,
-        Some("w1"),
-        json!({
-            "candidate_rev": 1,
-            "request_set_hash": hex::encode(hash),
-            "requests": requests_to_json(&reqs),
-        }),
     )
 }
 
@@ -916,21 +839,23 @@ fn tamper_wrong_key() {
 }
 
 #[test]
-fn wrong_kek_fails_the_head_decrypt() {
+fn wrong_kek_is_keychain_lost_before_verification() {
+    // A KEK that does not open the newest record's data key is "undecryptable" (§8.7): startup
+    // stops at step 2 as `keychain_lost` instead of verifying (T10). The head-decrypt check of
+    // step 3 is covered by `tamper_missing_key_row`.
     let (store, f) = new_store(fake_clock(START), MemKeyring::new());
     append_mixed(&store, 6);
-    let head = store.head().0;
     store.shutdown();
     let other = Kek::generate().expect("kek");
     f.keys()
         .set(&EntryName::Kek, &other.to_entry_bytes())
         .expect("swap kek");
-    let v = verdict(&f);
-    assert!(
-        has(&v.findings, FindingKind::DecryptFailed, head),
-        "{:?}",
-        kinds(&v.findings)
-    );
+    match testing::startup_verdict(&f.data, &f.config()) {
+        Err(OpenError::KeyStore(KeyStoreError::Other(reason))) => {
+            assert_eq!(reason, "keychain_lost")
+        }
+        other => panic!("expected keychain_lost, got {other:?}"),
+    }
 }
 
 #[test]

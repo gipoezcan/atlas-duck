@@ -85,6 +85,10 @@ pub struct Hooks {
     /// Overrides the wait of `flush_head_anchor` and `shutdown` on the anchor thread (10 s).
     #[cfg(any(test, feature = "testing"))]
     pub anchor_wait_timeout: Option<std::time::Duration>,
+    /// Migrations run after [`schema::MIGRATIONS`]; their highest `to` is this build's schema
+    /// head for the version gate.
+    #[cfg(any(test, feature = "testing"))]
+    pub extra_migrations: Vec<schema::Migration>,
 }
 
 impl Hooks {
@@ -94,6 +98,23 @@ impl Hooks {
             Some(f) => f.hit(p),
             None => Ok(()),
         }
+    }
+
+    /// The migration table `open()` runs: [`schema::MIGRATIONS`] plus the test migrations.
+    pub(crate) fn migrations(&self) -> Vec<schema::Migration> {
+        #[allow(unused_mut)]
+        let mut all = schema::MIGRATIONS.to_vec();
+        #[cfg(any(test, feature = "testing"))]
+        all.extend_from_slice(&self.extra_migrations);
+        all
+    }
+
+    /// The newest `user_version` this build opens (the version gate).
+    pub(crate) fn schema_head(&self) -> u32 {
+        self.migrations()
+            .iter()
+            .map(|m| m.to)
+            .fold(schema::SCHEMA_HEAD, u32::max)
     }
 }
 
@@ -154,6 +175,9 @@ struct Inner {
     min_free_bytes: u64,
     free_space: Arc<dyn FreeSpaceProbe>,
     reader: Mutex<Option<Connection>>,
+    /// Fault points of the startup steps (feature `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    hooks: Hooks,
 }
 
 impl Inner {
@@ -231,6 +255,8 @@ impl Store {
         F: FnOnce(WriterParts) -> Result<Writer, OpenError> + Send + 'static,
     {
         let shared = Shared::new();
+        #[cfg(any(test, feature = "testing"))]
+        let hooks = cfg.hooks.clone();
         let parts = WriterParts {
             clock: cfg.clock.clone(),
             kek: kek.clone(),
@@ -298,6 +324,8 @@ impl Store {
                 min_free_bytes: cfg.min_free_bytes,
                 free_space: cfg.free_space.unwrap_or_else(|| Arc::new(OsFreeSpace)),
                 reader: Mutex::new(None),
+                #[cfg(any(test, feature = "testing"))]
+                hooks,
             }),
         })
     }
@@ -495,7 +523,6 @@ impl Store {
 
     /// Startup verification passed: the anchor thread may write (§8.7 "no anchor writes
     /// before verification").
-    #[allow(dead_code)] // called by `open()` (T10)
     pub(crate) fn enable_anchors(&self) {
         self.inner.shared.anchors.enable();
     }
@@ -680,7 +707,6 @@ impl Store {
     /// prune gets its prune barrier (first-retained written before the head passes the
     /// `PRUNE`); an interrupted restore gets a restore barrier, which only the restore
     /// completion (T16) lifts. If the `VERIFY` append fails, anchors stay disabled.
-    #[allow(dead_code)] // called by `open()` (T10); tests use `testing::apply_startup`
     pub(crate) fn apply_startup(&self, v: &StartupVerdict) -> Result<VerifyOutcome, AuditError> {
         let verify_seq = if v.findings.is_empty() {
             None
@@ -688,6 +714,10 @@ impl Store {
             let tail = (v.unanchored_tail > 0).then_some(v.unanchored_tail);
             Some(self.append_verify("startup", &v.findings, tail)?.seq)
         };
+        #[cfg(any(test, feature = "testing"))]
+        self.inner
+            .hooks
+            .fault(crate::testing::FaultPoint::AfterStartupVerifyAppend)?;
         let a = &v.anchor_actions;
         if let Some(rc) = &a.complete_restore {
             self.install_barrier(Barrier::Restore {
@@ -708,6 +738,31 @@ impl Store {
             unanchored_tail: v.unanchored_tail,
             verify_seq,
         })
+    }
+
+    /// Startup step 4 (§8.13): runs the pending migrations on the writer's connection, each
+    /// with its `SCHEMA_MIGRATED` row in the same transaction. Returns the `(from, to)` span,
+    /// `None` when nothing was pending. Call before the startup `VERIFY` and with anchor
+    /// writes disabled.
+    pub(crate) fn run_migrations(&self) -> Result<Option<(u32, u32)>, OpenError> {
+        let closed = || OpenError::Io(std::io::Error::other("the audit writer stopped"));
+        let (reply, rx) = sync_channel(1);
+        self.sender()
+            .map_err(|_| closed())?
+            .send(Cmd::Migrate { reply })
+            .map_err(|_| closed())?;
+        rx.recv().map_err(|_| closed())?
+    }
+
+    /// `meta.written_by` = this build (advisory, §8.13), after startup step 4.
+    pub(crate) fn update_written_by(&self) -> Result<(), OpenError> {
+        let closed = || OpenError::Io(std::io::Error::other("the audit writer stopped"));
+        let (reply, rx) = sync_channel(1);
+        self.sender()
+            .map_err(|_| closed())?
+            .send(Cmd::SetWrittenBy { reply })
+            .map_err(|_| closed())?;
+        rx.recv().map_err(|_| closed())?
     }
 
     /// Stops the writer after the commands already queued; later calls get `Closed`. Never

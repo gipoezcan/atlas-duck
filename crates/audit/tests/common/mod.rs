@@ -3,17 +3,20 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atlas_duck_audit::clock::UtcInstant;
 use atlas_duck_audit::encoding::{FIELD_LIST, RowFields, ZERO_HASH};
 use atlas_duck_audit::lock::InstanceLock;
+use atlas_duck_audit::request_set::{RequestRecord, request_set_hash, requests_to_json};
 use atlas_duck_audit::schema::DB_FILE;
 use atlas_duck_audit::testing::{FakeClock, MemKeyStore, MemKeyring};
-use atlas_duck_audit::types::{EventType, NewEvent};
+use atlas_duck_audit::types::{Actor, EventType, NewEvent};
 use atlas_duck_audit::{FirstRunInput, OpenConfig, Store, create_new_store, new_ids};
 use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
 use rusqlite::Connection;
 use secrecy::SecretString;
+use serde_json::json;
 use tempfile::TempDir;
 
 /// 21 characters: above the 12-character minimum.
@@ -124,6 +127,82 @@ pub fn ev(t: EventType, request_id: Option<&str>, payload: serde_json::Value) ->
         flags: Default::default(),
         payload,
     }
+}
+
+pub fn server_time(ts: &str) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(at(ts).0 as u64)
+}
+
+/// The next records get a non-NULL epoch (the server agrees with the local clock).
+pub fn corroborate(store: &Store) {
+    store.observe_server_date("i1", server_time(START), Instant::now());
+}
+
+/// `n` events of several kinds and column shapes (no store-owned type).
+pub fn mixed(n: usize) -> Vec<NewEvent> {
+    (0..n)
+        .map(|i| {
+            let mut e = match i % 6 {
+                0 => ev(EventType::REQUEST_RECEIVED, Some("r1"), json!({ "i": i })),
+                1 => ev(
+                    EventType::READ_FETCHED,
+                    Some("r1"),
+                    json!({ "body": "x".repeat(i) }),
+                ),
+                2 => ev(
+                    EventType::DELIVERED,
+                    Some("r1"),
+                    json!({ "i": i, "ok": true }),
+                ),
+                3 => ev(
+                    EventType::CONFIG_CHANGED,
+                    None,
+                    json!({ "key": "k", "i": i }),
+                ),
+                4 => write_approved(i, true),
+                _ => ev(EventType::APP_START, None, json!({ "i": i })),
+            };
+            if i % 2 == 0 {
+                e.target = Some(format!("PROJ-{i}"));
+                e.actor = Actor {
+                    agent_name: Some("agent".into()),
+                    os_user: Some("alice".into()),
+                    peer_pid: Some(4242),
+                    ..Actor::default()
+                };
+            }
+            e
+        })
+        .collect()
+}
+
+pub fn requests(i: usize) -> Vec<RequestRecord> {
+    vec![RequestRecord {
+        index: 0,
+        method: "POST".into(),
+        resolved_url: format!("https://jira.example/rest/api/2/issue/{i}"),
+        content_type: Some("application/json".into()),
+        body_bytes: format!("{{\"n\":{i}}}").into_bytes(),
+    }]
+}
+
+/// A `WRITE_APPROVED` whose `request_set_hash` matches its `requests` (or not).
+pub fn write_approved(i: usize, correct: bool) -> NewEvent {
+    let reqs = requests(i);
+    let hash = if correct {
+        request_set_hash(&reqs)
+    } else {
+        request_set_hash(&requests(i + 1))
+    };
+    ev(
+        EventType::WRITE_APPROVED,
+        Some("w1"),
+        json!({
+            "candidate_rev": 1,
+            "request_set_hash": hex::encode(hash),
+            "requests": requests_to_json(&reqs),
+        }),
+    )
 }
 
 /// A plain read-write connection for inspection and tampering.

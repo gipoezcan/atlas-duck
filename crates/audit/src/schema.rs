@@ -163,6 +163,7 @@ pub fn open_ro(path: &Path) -> Result<Connection, OpenError> {
     Ok(conn)
 }
 
+#[derive(Clone, Copy)]
 pub struct Migration {
     pub from: u32,
     pub to: u32,
@@ -294,18 +295,19 @@ fn versions_from(conn: &Connection) -> Result<StoreVersions, OpenError> {
     })
 }
 
-/// Opens read-only, reads the versions and closes. Writes nothing and sets no pragmas.
+/// A read-only connection that leaves the database files as they are (the version gate and
+/// everything `open()` reads before the writer starts).
 ///
 /// A plain read-only connection to a WAL database creates (and cannot remove) `-wal`/`-shm`
 /// sidecars, so when no `-wal` file exists the database is opened `immutable=1` (no sidecars;
 /// with no WAL there is nothing it could miss). When a `-wal` exists (a crash left one, or a
 /// writer is live) a normal read-only connection is used so the WAL content is seen; the `-wal`
-/// is neither modified nor removed and only `-shm` may change. The normal open path additionally
-/// re-checks through its own WAL-aware connection with [`gate_open_connection`].
-pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
+/// is neither modified nor removed (a read-only connection never checkpoints) and only `-shm`
+/// may change. Sets no pragmas.
+pub(crate) fn open_peek(path: &Path) -> Result<Connection, OpenError> {
     let mut wal = path.as_os_str().to_owned();
     wal.push("-wal");
-    let conn = if Path::new(&wal).exists() {
+    if Path::new(&wal).exists() {
         Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -318,19 +320,35 @@ pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
                 | OpenFlags::SQLITE_OPEN_URI,
         )
     }
-    .map_err(sqlite)?;
-    versions_from(&conn)
+    .map_err(sqlite)
 }
 
-/// The version gate on an already open, WAL-aware connection (T10 runs it right after
+/// Opens read-only (see `open_peek`), reads the versions and closes. Writes nothing and sets
+/// no pragmas. The normal open path additionally re-checks through its own WAL-aware
+/// connection with [`gate_open_connection`].
+pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
+    versions_from(&open_peek(path)?)
+}
+
+/// The version gate on an already open, WAL-aware connection (the writer runs it right after
 /// [`open_rw`], before touching anything): `NewerStore(found)` for a newer store.
 pub fn gate_open_connection(conn: &Connection) -> Result<(), OpenError> {
-    gate(&versions_from(conn)?).map_err(OpenError::NewerStore)
+    gate_open_connection_up_to(conn, SCHEMA_HEAD)
+}
+
+/// [`gate_open_connection`] for a binary whose schema head is `head` (test migrations raise it).
+pub(crate) fn gate_open_connection_up_to(conn: &Connection, head: u32) -> Result<(), OpenError> {
+    gate_up_to(&versions_from(conn)?, head).map_err(OpenError::NewerStore)
 }
 
 /// Refuses a store newer than this binary. `Err` carries what was found, e.g. `"user_version 2"`.
 pub fn gate(v: &StoreVersions) -> Result<(), String> {
-    if v.user_version > SCHEMA_HEAD {
+    gate_up_to(v, SCHEMA_HEAD)
+}
+
+/// [`gate`] for a binary whose schema head is `head`.
+pub(crate) fn gate_up_to(v: &StoreVersions, head: u32) -> Result<(), String> {
+    if v.user_version > head {
         return Err(format!("user_version {}", v.user_version));
     }
     if let Some(f) = v.head_format_version.filter(|&f| f > FORMAT_VERSION) {

@@ -28,7 +28,10 @@ mod verify;
 mod writer;
 
 pub use admission::FreeSpaceProbe;
-pub use open::{ArchivedDb, FirstRunInput, create_new_store, new_ids};
+pub use open::{
+    ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
+    keychain_retry_schedule, new_ids, open, read_store_install_id,
+};
 pub use request_set::{RequestRecord, request_set_hash};
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};

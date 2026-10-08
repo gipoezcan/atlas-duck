@@ -231,14 +231,14 @@ pub struct StartupVerdict {
 }
 
 impl StartupVerdict {
-    #[allow(dead_code)] // `open()` (T10) decides on it; tests use it today
+    /// For tests: `open()` passes every finding on to the `VERIFY` row.
+    #[cfg(any(test, feature = "testing"))]
     pub fn has_incident(&self) -> bool {
         self.findings.iter().any(|f| f.kind.is_incident())
     }
 }
 
 /// What startup verification is given (§8.7 step 3). The anchor-dir lines join in T14.
-#[allow(dead_code)] // built by `open()` (T10) and the `testing` shim
 pub(crate) struct StartupInputs<'a> {
     pub(crate) conn: &'a Connection,
     pub(crate) kek: &'a Kek,
@@ -426,7 +426,6 @@ fn with_row<T>(
 
 /// The store's `install_id` (§8.6): `target` of the latest `RESTORE`, else of `GENESIS`, else
 /// of the newest retained `APP_START` that carries one. Plaintext only.
-#[allow(dead_code)] // called by `open()` (T10) and the `testing` shim
 pub(crate) fn store_install_id(conn: &Connection) -> rusqlite::Result<Option<String>> {
     for sql in [
         "SELECT target FROM events WHERE event_type = 'RESTORE' ORDER BY seq DESC LIMIT 1",
@@ -1382,7 +1381,6 @@ fn check_anchors(
 // Startup (§8.7 step 3)
 
 /// Startup verification. Every step appends findings; only an I/O error returns early.
-#[allow(dead_code)] // called by `open()` (T10) and the `testing` shim
 pub(crate) fn startup(inp: &StartupInputs<'_>) -> Result<StartupVerdict, OpenError> {
     run_startup(inp).map_err(|e| OpenError::Sqlite(e.to_string()))
 }
