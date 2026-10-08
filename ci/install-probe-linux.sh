@@ -290,8 +290,14 @@ assert_probe_line "$line" 'n/a'
 # The real app process: for an AppImage the runtime and AppRun come first.
 app_pid="$(pgrep -u "$(id -u)" -x atlas-duck-app | head -n 1 || true)"
 [ -n "$app_pid" ] || die "no atlas-duck-app process although it logged sandbox_probe"
-app_exe="$(readlink -f "/proc/$app_pid/exe" || true)"
-[ -n "$app_exe" ] || die "cannot read /proc/$app_pid/exe: the app process is gone (it exited right after its sandbox_probe line)"
+# The app marks itself non-dumpable (PR_SET_DUMPABLE 0, spec §2.5), so /proc/<pid>/exe is not
+# readable for anyone without CAP_SYS_PTRACE, not even the same user (CI run 4: "cannot read
+# /proc/<pid>/exe" on all three legs while the app was alive). argv[0] in /proc/<pid>/cmdline
+# stays readable; the launchers (the shell for deb/rpm, AppRun for the AppImage) exec the
+# absolute path. Check the process is alive first so that a dead app is reported as such.
+kill -0 "$app_pid" 2>/dev/null || die "the app process $app_pid is gone (it exited right after its sandbox_probe line)"
+app_exe="$(tr '\0' '\n' <"/proc/$app_pid/cmdline" | head -n 1 || true)"
+[ -n "$app_exe" ] || die "cannot read /proc/$app_pid/cmdline"
 info "app pid $app_pid runs $app_exe"
 app_dir="$(dirname "$app_exe")"
 [ -x "$app_dir/atlas-duck-sandbox" ] || die "no atlas-duck-sandbox next to the app in $app_dir"
