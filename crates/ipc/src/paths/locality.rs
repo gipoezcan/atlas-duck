@@ -34,6 +34,10 @@ pub enum NotLocalKind {
     Fuse,
     /// macOS `statfs` without `MNT_LOCAL`.
     NotMntLocal,
+    /// Linux overlayfs whose layers could not be resolved through
+    /// `/proc/self/mountinfo` (unreadable, no matching mount, a layer that
+    /// cannot be examined or nesting that is too deep). Fail-closed.
+    OverlayUnresolved,
 }
 
 // Linux `f_type` magics, copied from include/uapi/linux/magic.h and statfs(2)
@@ -49,9 +53,19 @@ const AFS_FS_MAGIC: u64 = 0x6B41_4653; // kAFS
 const CEPH_SUPER_MAGIC: u64 = 0x00C3_6400;
 const LUSTRE_SUPER_MAGIC: u64 = 0x0BD0_0BD0;
 const V9FS_MAGIC: u64 = 0x0102_1997;
+const GFS2_MAGIC: u64 = 0x0116_1970;
+const OCFS2_SUPER_MAGIC: u64 = 0x7461_636F;
+const CODA_SUPER_MAGIC: u64 = 0x7375_7245;
+const NCP_SUPER_MAGIC: u64 = 0x564C;
+const PANFS_SUPER_MAGIC: u64 = 0xAAD7_AAEA;
+const VBOXSF_SUPER_MAGIC: u64 = 0x786F_4256;
+/// overlayfs: local only if every layer is (see [`overlay_layer_paths`]).
+pub const OVERLAYFS_SUPER_MAGIC: u64 = 0x794C_7630;
 
-/// The network filesystems of §15 ("at least NFS, SMB/CIFS/SMB2, AFS, Ceph,
-/// Lustre, 9p"). FUSE is handled separately (always non-local).
+/// The network and cluster filesystems of §15 ("at least NFS, SMB/CIFS/SMB2,
+/// AFS, Ceph, Lustre, 9p"), plus GFS2, OCFS2, Coda, NCP, PanFS and VirtualBox
+/// shared folders. FUSE is handled separately (always non-local; virtiofs
+/// reports the FUSE magic). overlayfs is resolved through its layers.
 const LINUX_NETWORK_F_TYPES: &[u64] = &[
     NFS_SUPER_MAGIC,
     SMB_SUPER_MAGIC,
@@ -62,11 +76,18 @@ const LINUX_NETWORK_F_TYPES: &[u64] = &[
     CEPH_SUPER_MAGIC,
     LUSTRE_SUPER_MAGIC,
     V9FS_MAGIC,
+    GFS2_MAGIC,
+    OCFS2_SUPER_MAGIC,
+    CODA_SUPER_MAGIC,
+    NCP_SUPER_MAGIC,
+    PANFS_SUPER_MAGIC,
+    VBOXSF_SUPER_MAGIC,
 ];
 
 /// Classifies a Linux `statfs` `f_type`. Only the low 32 bits are compared
 /// (on 32-bit targets `f_type` is a sign-extended `i32`). Unknown types are
-/// local (plan decision: the spec lists only network/FUSE types).
+/// local (plan decision: the spec lists only network/FUSE types). overlayfs is
+/// reported local here; `check_locality` then looks at its layers.
 pub fn classify_linux_f_type(f_type: u64) -> Locality {
     let magic = f_type & 0xFFFF_FFFF;
     if magic == FUSE_SUPER_MAGIC {
@@ -76,6 +97,99 @@ pub fn classify_linux_f_type(f_type: u64) -> Locality {
     } else {
         Locality::Local
     }
+}
+
+/// Linux: the layer directories of the overlayfs mount that contains `path`,
+/// read from the text of `/proc/self/mountinfo`. `path` must be absolute and
+/// canonical. The mount is the one with the longest mount point that is a
+/// path-prefix of `path` (the last such line wins, later mounts shadow
+/// earlier ones). Returns the `lowerdir`, `lowerdir+`, `datadir+` and
+/// `upperdir` entries of its super options, octal escapes decoded.
+///
+/// `None` when no mount covers `path`, the covering mount is not an overlay,
+/// or it names no layer: the caller treats that as not local (fail-closed).
+/// Pure text parsing, compiled and tested on every OS.
+pub fn overlay_layer_paths(mountinfo: &str, path: &str) -> Option<Vec<String>> {
+    let mut best: Option<(usize, Option<Vec<String>>)> = None;
+    for line in mountinfo.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        // id parent major:minor root mount_point options [optional...] - fstype source super_options
+        let Some(dash) = tokens.iter().skip(6).position(|t| *t == "-").map(|i| i + 6) else {
+            continue;
+        };
+        if tokens.len() < dash + 3 {
+            continue;
+        }
+        let mount_point = unescape_mountinfo(tokens[4]);
+        if !is_path_prefix(&mount_point, path) {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_some_and(|(len, _)| mount_point.len() < *len)
+        {
+            continue;
+        }
+        let layers =
+            (tokens[dash + 1] == "overlay").then(|| overlay_layers(&tokens[dash + 3..].join(" ")));
+        best = Some((mount_point.len(), layers));
+    }
+    best.and_then(|(_, layers)| layers)
+        .filter(|l| !l.is_empty())
+}
+
+/// `mount_point` is `path` or one of its ancestors (component-wise).
+fn is_path_prefix(mount_point: &str, path: &str) -> bool {
+    let mp = mount_point.trim_end_matches('/');
+    mp.is_empty()
+        || path == mp
+        || path
+            .strip_prefix(mp)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The layer directories named by overlay super options (`k=v,k=v,...`).
+fn overlay_layers(super_options: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for opt in super_options.split(',') {
+        let Some((key, value)) = opt.split_once('=') else {
+            continue;
+        };
+        if matches!(key, "lowerdir" | "lowerdir+" | "datadir+" | "upperdir") {
+            // `lowerdir=a:b:c`; `::` introduces data-only layers, so empty parts are skipped.
+            out.extend(
+                value
+                    .split(':')
+                    .filter(|p| !p.is_empty())
+                    .map(unescape_mountinfo),
+            );
+        }
+    }
+    out
+}
+
+/// Decodes the `\NNN` octal escapes (space, tab, newline, backslash, comma,
+/// equals) that the kernel writes into mountinfo and option values.
+fn unescape_mountinfo(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\'
+            && i + 3 < b.len()
+            && b[i + 1..i + 4].iter().all(|c| (b'0'..=b'7').contains(c))
+        {
+            let v = (u32::from(b[i + 1] - b'0') << 6)
+                | (u32::from(b[i + 2] - b'0') << 3)
+                | u32::from(b[i + 3] - b'0');
+            out.push((v & 0xFF) as u8);
+            i += 4;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// macOS `MNT_LOCAL` (sys/mount.h; `libc::MNT_LOCAL` = 0x0000_1000).
@@ -149,7 +263,9 @@ pub(crate) fn windows_prefix_refusal(_path: &Path) -> Option<NotLocalKind> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod os {
-    use super::{Locality, classify_linux_f_type};
+    use super::{
+        Locality, NotLocalKind, OVERLAYFS_SUPER_MAGIC, classify_linux_f_type, overlay_layer_paths,
+    };
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
@@ -161,7 +277,54 @@ mod os {
         // keep the low 32 bits, which hold the magic.
         #[allow(clippy::unnecessary_cast)]
         let f_type = (st.f_type as u64) & 0xFFFF_FFFF;
+        if f_type == OVERLAYFS_SUPER_MAGIC {
+            return Ok(check_overlay(path, 0));
+        }
         Ok(classify_linux_f_type(f_type))
+    }
+
+    /// Layers of an overlay can nest (an overlay used as a lower layer);
+    /// deeper than this is treated as unresolved.
+    const MAX_OVERLAY_DEPTH: u32 = 4;
+
+    fn f_type_of(path: &Path) -> io::Result<u64> {
+        let st = statfs(path)?;
+        #[allow(clippy::unnecessary_cast)]
+        Ok((st.f_type as u64) & 0xFFFF_FFFF)
+    }
+
+    /// overlayfs is local only if every layer is: any network or FUSE layer
+    /// makes it not local. Anything that cannot be resolved is not local.
+    fn check_overlay(path: &Path, depth: u32) -> Locality {
+        let unresolved = Locality::NotLocal(NotLocalKind::OverlayUnresolved);
+        if depth >= MAX_OVERLAY_DEPTH {
+            return unresolved;
+        }
+        let Some(canonical) = std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+        else {
+            return unresolved;
+        };
+        let Ok(mountinfo) = std::fs::read("/proc/self/mountinfo") else {
+            return unresolved;
+        };
+        let Some(layers) = overlay_layer_paths(&String::from_utf8_lossy(&mountinfo), &canonical)
+        else {
+            return unresolved;
+        };
+        for layer in layers {
+            let layer = Path::new(&layer);
+            let verdict = match f_type_of(layer) {
+                Ok(OVERLAYFS_SUPER_MAGIC) => check_overlay(layer, depth + 1),
+                Ok(f_type) => classify_linux_f_type(f_type),
+                Err(_) => unresolved,
+            };
+            if verdict != Locality::Local {
+                return verdict;
+            }
+        }
+        Locality::Local
     }
 
     fn statfs(path: &Path) -> io::Result<libc::statfs> {
@@ -300,5 +463,117 @@ mod os {
             io::ErrorKind::Unsupported,
             "local-filesystem check is not implemented on this OS",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MOUNTINFO: &str = r"
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+30 22 0:25 / /srv/nfs rw,relatime shared:5 - nfs4 srv:/export rw,vers=4.2
+41 22 0:40 / /var/lib/docker/overlay2/x/merged rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker/overlay2/l/A:/var/lib/docker/overlay2/l/B,upperdir=/var/lib/docker/overlay2/x/diff,workdir=/var/lib/docker/overlay2/x/work
+42 22 0:41 / /mnt/with\040space rw,relatime - overlay overlay rw,lowerdir=/srv/nfs/lower\040dir,upperdir=/mnt/up,workdir=/mnt/work
+43 22 0:42 / /mnt/new rw,relatime - overlay overlay rw,lowerdir+=/a,lowerdir+=/b,datadir+=/data,upperdir=/up
+44 22 0:43 / /mnt/dataonly rw,relatime - overlay overlay rw,lowerdir=/l1::/data1:/data2
+";
+
+    fn strings(v: &[&str]) -> Option<Vec<String>> {
+        Some(v.iter().map(|s| (*s).to_owned()).collect())
+    }
+
+    #[test]
+    fn overlay_layers_are_read_from_the_covering_mount() {
+        let want = strings(&[
+            "/var/lib/docker/overlay2/l/A",
+            "/var/lib/docker/overlay2/l/B",
+            "/var/lib/docker/overlay2/x/diff",
+        ]);
+        assert_eq!(
+            overlay_layer_paths(MOUNTINFO, "/var/lib/docker/overlay2/x/merged/some/dir"),
+            want
+        );
+        assert_eq!(
+            overlay_layer_paths(MOUNTINFO, "/var/lib/docker/overlay2/x/merged"),
+            want
+        );
+    }
+
+    #[test]
+    fn overlay_octal_escapes_are_decoded() {
+        assert_eq!(
+            overlay_layer_paths(MOUNTINFO, "/mnt/with space/x"),
+            strings(&["/srv/nfs/lower dir", "/mnt/up"])
+        );
+    }
+
+    #[test]
+    fn overlay_new_style_and_data_only_layers_are_all_listed() {
+        assert_eq!(
+            overlay_layer_paths(MOUNTINFO, "/mnt/new"),
+            strings(&["/a", "/b", "/data", "/up"])
+        );
+        assert_eq!(
+            overlay_layer_paths(MOUNTINFO, "/mnt/dataonly"),
+            strings(&["/l1", "/data1", "/data2"])
+        );
+    }
+
+    #[test]
+    fn overlay_lookup_fails_closed_when_it_cannot_resolve() {
+        // Covered by a non-overlay mount, by `/` only, or not at all.
+        assert_eq!(overlay_layer_paths(MOUNTINFO, "/srv/nfs/file"), None);
+        assert_eq!(overlay_layer_paths(MOUNTINFO, "/home/user"), None);
+        assert_eq!(overlay_layer_paths("", "/home/user"), None);
+        assert_eq!(
+            overlay_layer_paths("garbage line\nstill - garbage", "/x"),
+            None
+        );
+        // An overlay with no layer option names nothing to check.
+        let bare = "50 22 0:50 / /mnt/bare rw - overlay overlay rw\n";
+        assert_eq!(overlay_layer_paths(bare, "/mnt/bare/x"), None);
+    }
+
+    #[test]
+    fn mount_prefix_matches_whole_components_and_the_deepest_wins() {
+        // `/mnt/new` must not cover `/mnt/newer`.
+        assert_eq!(overlay_layer_paths(MOUNTINFO, "/mnt/newer"), None);
+        // A deeper non-overlay mount shadows the overlay.
+        let shadow = format!(
+            "{MOUNTINFO}60 41 8:2 / /var/lib/docker/overlay2/x/merged/data rw - ext4 /dev/sdb rw\n"
+        );
+        assert_eq!(
+            overlay_layer_paths(&shadow, "/var/lib/docker/overlay2/x/merged/data/f"),
+            None
+        );
+        assert!(overlay_layer_paths(&shadow, "/var/lib/docker/overlay2/x/merged/other").is_some());
+    }
+
+    #[test]
+    fn unescape_leaves_malformed_escapes_alone() {
+        assert_eq!(unescape_mountinfo(r"a\040b\134c\054d"), r"a b\c,d");
+        assert_eq!(unescape_mountinfo(r"a\9zb\04"), r"a\9zb\04");
+    }
+
+    #[test]
+    fn the_added_network_magics_are_not_local() {
+        for magic in [
+            0x0116_1970_u64,
+            0x7461_636F,
+            0x7375_7245,
+            0x564C,
+            0xAAD7_AAEA,
+            0x786F_4256,
+        ] {
+            assert_eq!(
+                classify_linux_f_type(magic),
+                Locality::NotLocal(NotLocalKind::NetworkFs { f_type: magic })
+            );
+        }
+        assert_eq!(
+            classify_linux_f_type(OVERLAYFS_SUPER_MAGIC),
+            Locality::Local
+        );
     }
 }

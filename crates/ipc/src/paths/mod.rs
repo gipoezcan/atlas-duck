@@ -14,8 +14,9 @@ mod resolve;
 pub use base_dirs::{BaseDirs, FirstRunDefaults, base_dirs, first_run_defaults};
 pub use host::{MAX_HOST_COMPONENT_LEN, host_name, raw_host_name, sanitize_host_component};
 pub use locality::{
-    Locality, MACOS_MNT_LOCAL, NotLocalKind, check_locality, classify_linux_f_type,
-    classify_macos_mnt_flags, classify_windows_drive_type, win_drive_type,
+    Locality, MACOS_MNT_LOCAL, NotLocalKind, OVERLAYFS_SUPER_MAGIC, check_locality,
+    classify_linux_f_type, classify_macos_mnt_flags, classify_windows_drive_type,
+    overlay_layer_paths, win_drive_type,
 };
 pub use pinned::{
     CliToml, PinnedError, PinnedPaths, cli_file, paths_file, pinned_dir, read_cli_toml,
