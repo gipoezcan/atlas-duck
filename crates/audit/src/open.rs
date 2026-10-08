@@ -173,7 +173,8 @@ impl FirstRun {
 
 /// Wizard step (1b): a new store with `GENESIS` (C.3). In order: refuse an existing DB →
 /// `install_id` must be the keystore's → the passphrase rules (pure, before any keychain
-/// access) → keyring locality (no keyring call unless `Local`) → canary → KEK and the
+/// access) → keyring locality (no keyring call unless `Local`) → canary → no `kek`/anchor
+/// entry may exist yet under this `install_id` (`Invalid`, never overwritten) → KEK and the
 /// recovery blob (sealed, reopened with the second entry and compared) → KEK to the keychain
 /// → `GENESIS` under `audit.db.new` → anchors → rename. Any failure before the rename leaves
 /// no DB file and deletes the keychain entries it wrote (best effort).
@@ -214,6 +215,18 @@ pub fn create_new_store(
         KeyringLocality::Unknown { .. } => return Err(KeyStoreError::Unavailable.into()),
     }
     canary_self_test(&*cfg.keys)?;
+    // Never overwrite an existing install's entries (§8.6): a used install_id needs new ids.
+    for e in [
+        EntryName::Kek,
+        EntryName::HeadAnchor,
+        EntryName::FirstRetainedAnchor,
+    ] {
+        if cfg.keys.get(&e)?.is_some() {
+            return Err(OpenError::Invalid(
+                "keychain entries already exist for this install_id",
+            ));
+        }
+    }
     let kek = Kek::generate().map_err(audit_err)?;
     let recovery_blob = new_recovery_blob(&input.passphrase, &input.passphrase_confirm, &kek)?;
     if let Err(e) = cfg.keys.set(&EntryName::Kek, &kek.to_entry_bytes()) {

@@ -102,6 +102,18 @@ pub struct StoreHealth {
     pub prune_backlog_days: u32,
 }
 
+/// One row's ciphertext and what opening it needs. No `Debug`: it holds a wrapped key.
+struct Sealed {
+    aad: Vec<u8>,
+    key_id: u64,
+    month: Option<String>,
+    wrapped_dek: Vec<u8>,
+    nonce: [u8; 12],
+    payload_ct: Vec<u8>,
+    payload_len: u64,
+    payload_sha256: [u8; 32],
+}
+
 struct Inner {
     tx: Mutex<Option<SyncSender<Cmd>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -255,11 +267,51 @@ impl Store {
         crypto::query_tag(&self.inner.query_key.0, kind, query)
     }
 
-    /// The JCS payload bytes of record `seq`, decrypted and checked against `payload_sha256`.
+    /// The JCS payload bytes of record `seq`, decrypted (AES-GCM over the row's AAD, F.3) and
+    /// checked against `payload_sha256`. It does not check `record_hash`/`prev_hash`: chain
+    /// verification is `full_verify`/startup (T09). After `shutdown()` it returns `Closed`.
     pub fn read_payload(&self, seq: u64) -> Result<Zeroizing<Vec<u8>>, AuditError> {
+        let sealed = self.read_sealed(seq)?;
+        let decrypt = AuditError::Decrypt { seq };
+        let cached = lock(&self.inner.shared.dek_cache)
+            .get(&sealed.key_id)
+            .cloned();
+        let dek = match cached {
+            Some(d) => d,
+            None => crypto::unwrap_dek(
+                &self.inner.kek,
+                sealed.key_id,
+                sealed.month.as_deref(),
+                &sealed.wrapped_dek,
+            )
+            .map_err(|_| decrypt.clone())?,
+        };
+        let compressed = Zeroizing::new(crypto::open(
+            &dek,
+            &sealed.nonce,
+            &sealed.aad,
+            &sealed.payload_ct,
+            seq,
+        )?);
+        let plain = Zeroizing::new(
+            crypto::decompress(&compressed, sealed.payload_len).map_err(|_| decrypt)?,
+        );
+        let digest: [u8; 32] = Sha256::digest(plain.as_slice()).into();
+        if digest != sealed.payload_sha256 {
+            return Err(AuditError::PayloadHash { seq });
+        }
+        Ok(plain)
+    }
+
+    /// Copies what decryption needs out of the database; the reader lock is held only here,
+    /// not across decryption and decompression.
+    fn read_sealed(&self, seq: u64) -> Result<Sealed, AuditError> {
         let seq_i = i64::try_from(seq).map_err(|_| AuditError::NotFound { seq })?;
         let io = |e: rusqlite::Error| AuditError::Io(e.to_string());
         let mut guard = lock(&self.inner.reader);
+        if lock(&self.inner.tx).is_none() {
+            return Err(AuditError::Closed);
+        }
         if guard.is_none() {
             *guard = Some(
                 schema::open_ro(&self.inner.db_path).map_err(|e| AuditError::Io(e.to_string()))?,
@@ -287,25 +339,19 @@ impl Store {
             )
             .optional()
             .map_err(io)?;
-        let Some((month, Some(wrapped))) = key else {
+        let Some((month, Some(wrapped_dek))) = key else {
             return Err(decrypt);
         };
-        let cached = lock(&self.inner.shared.dek_cache).get(&f.key_id).cloned();
-        let dek = match cached {
-            Some(d) => d,
-            None => crypto::unwrap_dek(&self.inner.kek, f.key_id, month.as_deref(), &wrapped)
-                .map_err(|_| decrypt.clone())?,
-        };
-        let aad = encoding::aad(&f).map_err(|_| decrypt.clone())?;
-        let compressed = Zeroizing::new(crypto::open(&dek, f.nonce, &aad, f.payload_ct, seq)?);
-        let plain = Zeroizing::new(
-            crypto::decompress(&compressed, f.payload_len).map_err(|_| decrypt.clone())?,
-        );
-        let digest: [u8; 32] = Sha256::digest(plain.as_slice()).into();
-        if &digest != f.payload_sha256 {
-            return Err(AuditError::PayloadHash { seq });
-        }
-        Ok(plain)
+        Ok(Sealed {
+            aad: encoding::aad(&f).map_err(|_| decrypt)?,
+            key_id: f.key_id,
+            month,
+            wrapped_dek,
+            nonce: *f.nonce,
+            payload_ct: f.payload_ct.to_vec(),
+            payload_len: f.payload_len,
+            payload_sha256: *f.payload_sha256,
+        })
     }
 
     /// A server `Date` header seen at `at` (§8.8 source (a)). Never blocks on the writer: if

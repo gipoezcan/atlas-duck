@@ -557,7 +557,11 @@ fn store_owned_event_types_are_refused() {
         EventType::INTEGRITY_ACK,
         EventType::SCHEMA_MIGRATED,
         EventType::KEY_RECOVERED,
+        EventType::KEY_ROTATED,
         EventType::CLOCK_ANOMALY,
+        EventType::LEGAL_HOLD_CHANGED,
+        EventType::BACKUP,
+        EventType::EXPORT,
     ] {
         assert!(
             matches!(
@@ -568,6 +572,67 @@ fn store_owned_event_types_are_refused() {
         );
     }
     assert_eq!(row_count(&f), 1);
+    // Also inside a batch: the whole batch is refused.
+    let r = store.append_batch(vec![
+        ev(EventType::APP_START, None, json!({})),
+        ev(EventType::LEGAL_HOLD_CHANGED, None, json!({"new": false})),
+    ]);
+    assert!(matches!(r, Err(AuditError::Invalid(_))), "{r:?}");
+    assert_eq!(row_count(&f), 1);
+    // CONFIG_CHANGED stays appendable by core (T12 gates the policy keys).
+    store
+        .append(ev(EventType::CONFIG_CHANGED, None, json!({"key": "proxy"})))
+        .expect("CONFIG_CHANGED");
+}
+
+#[test]
+fn read_payload_after_shutdown_is_closed() {
+    let (store, _f) = new_store(fake_clock(START), MemKeyring::new());
+    store.read_payload(1).expect("open store reads");
+    store.shutdown();
+    assert_eq!(store.read_payload(1), Err(AuditError::Closed));
+    assert_eq!(store.clone().read_payload(1), Err(AuditError::Closed));
+}
+
+#[test]
+fn first_run_refuses_existing_keychain_entries() {
+    for entry in [
+        EntryName::Kek,
+        EntryName::HeadAnchor,
+        EntryName::FirstRetainedAnchor,
+    ] {
+        let ring = MemKeyring::new();
+        let f = fixture(fake_clock(START), ring.clone());
+        let ks = MemKeyStore::new(ring.clone(), &f.install_id);
+        atlas_duck_audit::keystore::KeyStore::set(&ks, &entry, b"another install's value")
+            .expect("seed");
+        let sets_before = ring
+            .ops()
+            .iter()
+            .filter(|o| o.kind == KeyOpKind::Set)
+            .count();
+        let r = create_new_store(
+            &f.data,
+            &f.lock,
+            f.config(),
+            input(&f.install_id, &f.chain_id, PASSPHRASE, PASSPHRASE),
+        );
+        assert!(matches!(r, Err(OpenError::Invalid(_))), "{entry:?}: {r:?}");
+        assert_eq!(
+            ring.raw_get(&service_name(&f.install_id), &entry.account()),
+            Some(b"another install's value".to_vec()),
+            "{entry:?} overwritten or deleted"
+        );
+        // Only the canary was written; no kek or anchor set.
+        let sets: Vec<_> = ring
+            .ops()
+            .into_iter()
+            .filter(|o| o.kind == KeyOpKind::Set)
+            .collect();
+        assert_eq!(sets.len(), sets_before + 1, "{sets:?}");
+        assert!(sets.last().expect("set").full_name.ends_with("/canary"));
+        assert_eq!(files_in(&f), vec!["instance.lock".to_string()]);
+    }
 }
 
 #[test]

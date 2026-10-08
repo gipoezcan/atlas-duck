@@ -32,9 +32,12 @@ use crate::types::{Committed, EventFlags, EventType, NewEvent};
 /// Bound of the command channel (plan decision).
 pub(crate) const CHANNEL_BOUND: usize = 64;
 
-/// Event types only the store itself writes, each with its own bookkeeping (chain start,
-/// `prune_log`, segment boundary, incidents, clock episodes). `append` refuses them.
-const STORE_OWNED: [EventType; 8] = [
+/// Event types only the store itself writes, each through a `Store` method with its own
+/// bookkeeping or confirmation (C.3, §8.3): chain start, `prune_log`, segment boundary,
+/// incidents and acks, migrations, key recovery/rotation (a DEK in the same transaction),
+/// clock episodes, the legal hold (Rust-drawn confirmation, §8.8), backup and export receipts.
+/// `append` refuses them. `CONFIG_CHANGED` stays appendable by `core` (T12 gates policy keys).
+const STORE_OWNED: [EventType; 12] = [
     EventType::GENESIS,
     EventType::PRUNE,
     EventType::RESTORE,
@@ -42,7 +45,11 @@ const STORE_OWNED: [EventType; 8] = [
     EventType::INTEGRITY_ACK,
     EventType::SCHEMA_MIGRATED,
     EventType::KEY_RECOVERED,
+    EventType::KEY_ROTATED,
     EventType::CLOCK_ANOMALY,
+    EventType::LEGAL_HOLD_CHANGED,
+    EventType::BACKUP,
+    EventType::EXPORT,
 ];
 
 /// Runs a fault point of the `testing` hooks; compiles to nothing in release builds.
