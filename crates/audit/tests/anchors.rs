@@ -494,6 +494,17 @@ fn panicking_keychain_does_not_hang_flush() {
     );
     panic_set.store(true, Ordering::SeqCst);
     append_n(&store, 2);
+    // The thread is marked dead only after the panic hook has run and the unwind reached
+    // `catch_unwind`; on a slow runner (backtrace symbolisation) that can outlast the flush
+    // timeout, which then reports `AnchorFlushTimeout`. Wait for the state, then assert.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !store.health().anchor_thread_dead {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the anchor thread never reported dead"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(store.flush_head_anchor(), Err(AuditError::AnchorThreadDead));
     let h = store.health();
     assert!(h.anchor_thread_dead && h.anchor_write_failing);

@@ -7,6 +7,9 @@
 
 use atlas_duck_audit::keystore::{EntryName, KeyStore, OsKeyStore, canary_self_test};
 
+// Top level, so the path is `tests/common/mod.rs` (an inline `mod` would look under `tests/u18/`).
+mod common;
+
 const IGNORE: &str = "touches the OS keychain; run in the CI keychain step";
 
 fn kinds() -> Vec<EntryName> {
@@ -186,9 +189,7 @@ mod u18 {
     }
     use secrecy::SecretString;
 
-    #[path = "../common/mod.rs"]
-    mod common;
-    use common::*;
+    use super::common::*;
 
     const INSTANCE: &str = "ci";
 
