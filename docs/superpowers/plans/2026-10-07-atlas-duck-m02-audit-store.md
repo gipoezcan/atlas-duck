@@ -485,6 +485,7 @@ All commands run from `C:/Code/atlas-duck` (Git Bash or PowerShell). On the Wind
 - Modify: `crates/audit/Cargo.toml`, `crates/ipc/Cargo.toml`
 - Create: `crates/ipc/src/jcs.rs`; modify `crates/ipc/src/lib.rs` (`pub mod jcs;`)
 - Create: `crates/audit/src/{types.rs, error.rs, clock.rs (trait + UtcInstant only), keystore/mod.rs (trait + EntryName + errors only), testing.rs}`; modify `crates/audit/src/lib.rs`
+- Modify: `ci/check-workspace.mjs`, `ci/check-workspace.test.mjs` (Step 1b)
 - Test: `crates/ipc/tests/jcs.rs`, `crates/audit/tests/types.rs`
 
 **Interfaces:**
@@ -571,6 +572,17 @@ Expected: compiles (empty modules are fine). Then `cargo tree -p atlas-duck-audi
 
 Run: `cargo deny --locked check licenses bans sources` if `cargo-deny` is installed locally; otherwise push and read the `supply-chain` job. Expected: `licenses ok`. If a license outside the allow list is reported, STOP and report the crate and license (do not edit `deny.toml`).
 
+- [ ] **Step 1b: Extend the CLI/worker closure ban (`ci/check-workspace.mjs`)**
+
+The checker matches crate names exactly (`closure.has(b)`), so the new keyring crates are not caught by the existing `"keyring"` entry. `audit` links them, and `atlas-duck-cli` and `atlas-duck-sandbox-worker` must never reach them (§2.1: no keychain or DB code linked).
+
+1. First write the failing tests in `ci/check-workspace.test.mjs`: change the `BANNED` array (line 216) to `["reqwest", "hyper", "rusqlite", "libsqlite3-sys", "keyring", "keyring-core", "windows-native-keyring-store", "apple-native-keyring-store", "zbus-secret-service-keyring-store", "secret-service", "security-framework"]`. The existing loop then generates, for both `atlas-duck-cli` and `atlas-duck-sandbox-worker`, the case "with <crate> in its closure (transitively) is a violation" (cli/worker → `some-wrapper` → crate) and expects exactly `` `${pkg}: banned crate ${banned} in normal-dependency closure (§2.1)` ``: 8 new cases (4 crates x 2 packages). Add two more tests after the "banned crates are allowed outside cli and sandbox-worker" test:
+   - `serde_jcs is allowed in the closure of cli and sandbox-worker` (JCS lives in `ipc`, which both crates may depend on): `e = baseEdges(); e["atlas-duck-ipc"].push("serde_jcs"); e["serde_jcs"] = ["ryu-js"];` then `assert.deepEqual(graph(e), [])`.
+   - extend "banned crates are allowed outside cli and sandbox-worker" with `e["atlas-duck-audit"].push("keyring-core", "windows-native-keyring-store", "apple-native-keyring-store", "zbus-secret-service-keyring-store");` before the `deepEqual(graph(e), [])`, so `audit` (and through it `core`, which is not cli/worker) stays legal.
+2. Run `node --test ci/check-workspace.test.mjs` → Expected: the 8 new ban cases FAIL (no violation reported), the two allow tests pass.
+3. In `ci/check-workspace.mjs` add `"keyring-core"`, `"windows-native-keyring-store"`, `"apple-native-keyring-store"` and `"zbus-secret-service-keyring-store"` to `BANNED_IN_CLI_AND_WORKER` right after `"keyring"` (keep `"keyring"`, `"secret-service"`, `"security-framework"`); update the comment above it to mention the keyring-core store crates. Do NOT add `serde_jcs` or `ryu-js` (it does no I/O, §2.1 does not forbid it).
+4. Run `node --test "ci/*.test.mjs"` → all pass. Run `node ci/check-workspace.mjs` after Step 1's `cargo check` → `check-workspace: ok (11 workspace members)`; if it reports a banned crate for cli or worker, a dependency edge was added wrongly: STOP and report it.
+
 - [ ] **Step 2: Write the failing JCS tests** (`crates/ipc/tests/jcs.rs`)
 
 Each test parses an input with `serde_json::from_str` and compares `to_jcs_vec` output as UTF-8 text:
@@ -646,7 +658,7 @@ Run: `node ci/check-workspace.mjs` → Expected: `check-workspace: ok (11 worksp
 - [ ] **Step 8: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/ipc crates/audit
+git add Cargo.toml Cargo.lock ci crates/ipc crates/audit
 git commit -m "feat(audit): M2 pins, core types, ipc::jcs (RFC 8785) and the testing doubles
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
@@ -705,7 +717,7 @@ The file `tests/vectors/format_v1.json` holds (all bytes lowercase hex):
 }
 ```
 Rows (deterministic: fixed DEK, fixed nonce, payload sealed with an internal `crypto::seal_with_nonce`; T03 provides crypto, so in this task the `compressed`/`payload_ct` are produced with the plain `aes-gcm` and `zstd` calls inline in the test and T03 later asserts it reproduces them):
-1. `genesis_null_epoch`: `seq 1`, `epoch null`, `event_type "GENESIS"`, `flags 64` (clock_behind), `target` = an install id, payload `{"archived_db":null,"chain_id":"…","created_at":"…","install_id":"…","previous_chain_id":null,"previous_last_anchor":null}`, `prev_hash` zero.
+1. `genesis_null_epoch`: `seq 1`, `epoch null`, `event_type "GENESIS"`, `flags 0`, `target` = an install id, payload `{"archived_db":null,"chain_id":"…","created_at":"…","install_id":"…","previous_chain_id":null,"previous_last_anchor":null}`, `prev_hash` zero.
 2. `request_received_all_columns`: every column present, `agent_name ""` (present-empty), `peer_exe` with non-ASCII bytes (`/home/jürgen/bin/agent` as UTF-8), `peer_pid 4294967295`.
 3. `decision_and_flags`: `decision "approve_edited"`, `flags 1|4|16` = 21, `epoch "2026-10-08"`.
 4. `utf16_order_payload`: payload with keys `"😀"` and `"דּ"` (pins the JCS order inside a hashed record).
@@ -972,24 +984,25 @@ Run: `cargo test -p atlas-duck-audit --test keystore --locked` → all pass on W
   - `clock::{ClockState, Corroboration, Stamp, ClockAnomaly { kind: AnomalyKind /* LocalAhead | LocalBehind */, local: UtcInstant, server: UtcInstant }}` with the code below.
   - `clock::{date_of(UtcInstant) -> NaiveDate, epoch_text(NaiveDate) -> String, month_text(NaiveDate) -> String, parse_epoch(&str) -> Option<NaiveDate>}`.
 
-**Spec:** §8.2 `epoch` + L36, §8.8 corroborated date, local ahead, local behind, `clock_behind` (a)(b)(c), `clock_backwards` (> 5 s), §15 V27.
+**Spec:** §8.2 `epoch` + L36, §8.8 corroborated date, local ahead, local behind, `clock_behind` (a)(b) [L47: the old GENESIS rule is gone, old (c) is now (b)], `clock_backwards` (> 5 s), §15 V27.
 
 **Plan decisions (spec silent):**
 - "More than 1 day ahead/behind" is evaluated on UTC **dates**, the same predicate §8.8 states for `clock_behind` (a): behind ⇔ `today < corroborated_date − 1 day`; ahead ⇔ `today > header_date + 1 day`; an episode ends when the predicate is false at the next evaluation.
 - A new `Date` header replaces the corroboration only if it is not older than the current extrapolation (`corroborated date` is the *newest* confirmed date, §8.8).
 - `ClockState` is per store per process; episodes reset at every open (so `CLOCK_ANOMALY` is logged at most once per episode per process).
-- `clock_behind` (b) is applied literally: under L36 every `GENESIS` is written before any corroboration, so every `GENESIS` carries `clock_behind`, and rule (c) propagates the flag to every record of the first process until the first corroboration. This only lengthens retention (the safe direction); it is listed under "Spec defects" for the user.
+- `clock_behind` follows §8.8 as amended by L47: rule (a) (corroborated and `today < corroborated_date − 1 day`) and rule (b) (before the first corroboration in this process: `date(ts_utc)` earlier than the predecessor's `epoch`, or the predecessor carries `clock_behind`). A `GENESIS` has a NULL `epoch` and no predecessor, so it is never flagged; a wrong clock at first run is handled by the effective epoch (§8.2) alone. `stamp` takes no `is_genesis` argument.
 
 - [ ] **Step 1: Write the failing tests** (`tests/clock.rs`; all drive `ClockState` directly with explicit instants)
-1. `genesis_is_null_and_behind`: fresh state, `stamp(now, mono, true)` → `epoch None`, flags = `CLOCK_BEHIND`.
-2. `uncorroborated_records_stay_null_and_propagate_behind`: 3 more stamps → `epoch None`, each `CLOCK_BEHIND`.
-3. `first_corroboration_sets_min_today_corroborated`: wall 2027-10-08 (clock 1 year ahead), `observe(server = 2026-10-08T10:00Z)` → anomaly `LocalAhead` once; next stamp → `epoch 2026-10-08`, flags `CLOCK_FORWARD` (no `CLOCK_BEHIND`: (a) is false, and after corroboration (c) no longer applies).
+1. `genesis_is_null_and_unflagged`: fresh state, `stamp(now, mono)` → `epoch None`, flags empty (no `CLOCK_BEHIND`).
+2. `uncorroborated_records_stay_null_and_unflagged`: 3 more stamps → `epoch None`, none carries `CLOCK_BEHIND` (rule (b) needs a non-NULL predecessor epoch or a flagged predecessor).
+3. `first_corroboration_sets_min_today_corroborated`: wall 2027-10-08 (clock 1 year ahead), `observe(server = 2026-10-08T10:00Z)` → anomaly `LocalAhead` once; next stamp → `epoch 2026-10-08`, flags `CLOCK_FORWARD` (no `CLOCK_BEHIND`: (a) is false, and after corroboration (b) no longer applies).
 4. `extrapolation_caps_epoch`: after `observe(2026-10-08T23:00Z)` with mono advancing 2 h and wall correct, stamp → `epoch 2026-10-09`.
 5. `mono_undercount_holds_epoch_back`: mono frozen for 14 days, wall correct (+14 d) → `epoch` stays at the corroboration date, flags empty, no anomaly (U-13 unit half).
 6. `backward_clock_sets_behind_once`: corroborated 2026-10-08, wall set back 60 days → stamp flags `CLOCK_BEHIND`, `behind_transition` returns `Some(LocalBehind)` once, `None` on the next 100 calls; epoch stays at `prev_epoch` (non-decreasing); wall corrected → flag off, episode ends; a new backward step → a second anomaly (new episode).
 7. `ten_day_backward_variant`: same with 10 days.
 8. `clock_backwards_step_flag`: `ts` 6 s earlier than predecessor → `CLOCK_BACKWARDS`; 5 s earlier → no flag.
-9. `cmos_reset_before_corroboration`: prev_epoch 2026-10-08 (from a previous process), new process (no corroboration), wall 2000-01-01 → `CLOCK_BEHIND` via (c), epoch stays 2026-10-08.
+9. `cmos_reset_before_corroboration`: prev_epoch 2026-10-08 (from a previous process), new process (no corroboration), wall 2000-01-01 → `CLOCK_BEHIND` via (b), epoch stays 2026-10-08; the next uncorroborated stamp stays flagged (predecessor flagged).
+13. `genesis_with_wrong_clock_not_flagged`: fresh state, wall 2000-01-01: `GENESIS` and 2 more stamps → `epoch None`, flags empty; then `observe(server = 2026-10-08T10:00Z)` with wall still 2000 → the next stamp carries `CLOCK_BEHIND` via (a) and `behind_transition` returns `Some(LocalBehind)`.
 10. `epoch_never_decreases_and_never_exceeds_corroborated`: proptest over random sequences of `observe`/`stamp`/wall jumps (±5 years)/mono advances: every non-NULL epoch ≥ the previous non-NULL epoch and ≤ the newest corroborated date at that moment; once non-NULL, never NULL again.
 11. `ahead_episode_ends_when_header_agrees`: ahead → `CLOCK_FORWARD` on stamps; a later `observe` within 1 day → no flag on later stamps.
 12. `system_clock_monotonic` (real `SystemClock`): two reads 50 ms apart; `suspend_aware_elapsed` increases by ≥ 40 ms; `now_utc` within 5 s of `SystemTime::now()`.
@@ -1037,7 +1050,7 @@ impl ClockState {
     }
 
     /// Stamps one record, in seq order. Mutates the "previous record" view.
-    pub fn stamp(&mut self, now: UtcInstant, mono_now: Duration, is_genesis: bool) -> Stamp {
+    pub fn stamp(&mut self, now: UtcInstant, mono_now: Duration) -> Stamp {
         let today = date_of(now);
         let cd = self.corroborated_date(mono_now);
         let epoch = match cd {
@@ -1051,7 +1064,7 @@ impl ClockState {
             Some(cd) => if today < cd - Days::new(1) { flags |= EventFlags::CLOCK_BEHIND },          // (a)
             None => {
                 let cmos = matches!(self.prev_epoch, Some(pe) if today < pe);
-                if is_genesis || self.prev_flags.contains(EventFlags::CLOCK_BEHIND) || cmos { flags |= EventFlags::CLOCK_BEHIND } // (b), (c)
+                if self.prev_flags.contains(EventFlags::CLOCK_BEHIND) || cmos { flags |= EventFlags::CLOCK_BEHIND } // (b) (L47: no GENESIS clause)
             }
         }
         self.prev_epoch = epoch; self.prev_ts = Some(now); self.prev_flags = flags;
@@ -1120,12 +1133,12 @@ pub struct EventHeader { pub seq: u64, pub ts_utc: String, pub epoch: Option<Str
 - First run writes the new DB under `<data>/audit.db.new` and renames it to `audit.db` only after `GENESIS` committed and the file was closed and fsynced, so a crash during first run never leaves a DB without `GENESIS` (a leftover `.new` is deleted by the next `open`/`create_new_store`).
 - `create_new_store` order: refuse an existing `audit.db` → `cfg.keys.install_id() == input.install_id` (else `Invalid`) → keyring locality (`NotLocal` → `KeyStore(NotLocal)` with no keyring call) → canary self-test under the new `install_id` (§8.6 "before first run, a canary named with the `install_id` about to be generated") → passphrase rules and `new_recovery_blob` (compare) → KEK to the keychain → DB under `audit.db.new` → `GENESIS` → rename → both anchors.
 - KEK is written to the keychain **before** the DB is created (if the keychain write fails, nothing exists on disk); if the write itself returns an error after storing something (Windows: the post-write `CredReadW` check reports a persistence other than Local) or DB creation then fails, the KEK entry is deleted best-effort before the error is returned.
-- `GENESIS` gets `seq = 1`, `key_id = 1` (uncorroborated DEK, `month` NULL), `target = install_id`, `flags = clock_behind` (T06 rule (b)), payload per F.11.
+- `GENESIS` gets `seq = 1`, `key_id = 1` (uncorroborated DEK, `month` NULL), `target = install_id`, `flags = 0` (L47: a NULL-epoch `GENESIS` is never `clock_behind`, T06), payload per F.11.
 
 - [ ] **Step 1: Test helpers** (`tests/common/mod.rs`): `tmp_data_dir() -> (TempDir, LocalDataDir, InstanceLock)` (via `ipc::paths::check_data_dir` on a fresh temp dir and `InstanceLock::acquire`); `new_store(clock, ring) -> (Store, Fixture)` running `create_new_store` with a fixed 12-char passphrase; `ev(EventType, Option<&str> request_id, serde_json::Value)` builder; `raw_conn(&Fixture) -> rusqlite::Connection` for tamper tests; `dump_rows(&Fixture) -> Vec<RawRow>`.
 
 - [ ] **Step 2: Write the failing tests** (`tests/store.rs`)
-- `first_run_creates_genesis`: after `create_new_store`: `audit.db` exists, no `audit.db.new`; one row: `seq 1`, `GENESIS`, `epoch NULL`, `flags 64`, `target = install_id`, `prev_hash` zero, `key_id 1`; `keys` has one row (`key_id 1`, `month NULL`); `recovery` has one 89-byte blob that `open_recovery(passphrase)` opens to the keychain KEK; `read_payload(1)` JCS contains `chain_id`, `install_id`, `created_at`, `archived_db: null`; MemKeyring holds `kek`, `head_anchor` (seq 1), `first_retained_anchor` (seq 1, prev zero, `genesis_hash` = row 1 hash).
+- `first_run_creates_genesis`: after `create_new_store`: `audit.db` exists, no `audit.db.new`; one row: `seq 1`, `GENESIS`, `epoch NULL`, `flags 0`, `target = install_id`, `prev_hash` zero, `key_id 1`; `keys` has one row (`key_id 1`, `month NULL`); `recovery` has one 89-byte blob that `open_recovery(passphrase)` opens to the keychain KEK; `read_payload(1)` JCS contains `chain_id`, `install_id`, `created_at`, `archived_db: null`; MemKeyring holds `kek`, `head_anchor` (seq 1), `first_retained_anchor` (seq 1, prev zero, `genesis_hash` = row 1 hash).
 - `first_run_refuses_existing_db`: second `create_new_store` on the same dir → `AlreadyExists`, DB byte-identical, no keychain op (MemKeyring `ops()` empty for the second install id).
 - `first_run_passphrase_rules`: short → `PassphraseTooShort`, mismatch → `PassphraseMismatch`; in both cases no file in the data dir besides `instance.lock` and no keychain write.
 - `first_run_keychain_failure_leaves_nothing`: MemKeyring fault on `Set(Kek)` → `KeyStore(Unavailable)`, no DB file.
@@ -1160,7 +1173,7 @@ fn append_tx(&mut self, evs: Vec<PreparedEvent>) -> Result<Vec<Committed>, Audit
         rows.extend(evs);
         for p in rows {
             let now = self.clock.now_utc();
-            let st = self.clock_state.stamp(now, mono, p.event_type == EventType::GENESIS);
+            let st = self.clock_state.stamp(now, mono);
             let (key_id, dek) = self.dek_for(&tx, st.epoch, &st.ts_utc)?;          // creates the month DEK row if missing
             let seq = self.head.seq + 1;
             let flags = (p.flags & EventFlags::CALLER_SETTABLE) | st.clock_flags | p.store_flags; // store_flags: integrity_incident on VERIFY only
@@ -1673,7 +1686,7 @@ Run: `cargo test -p atlas-duck-audit --test settings --test prune --locked` → 
 6. `u12_restart_across_month_boundary_before_corroboration`: last record 2026-07-31; restart on 2026-08-01 before corroboration → records keep `epoch` 2026-07-31 and the July DEK; no August DEK until corroboration.
 7. `u13_suspend_14_days` and `u13_suspend_2_5_days`: corroborated in process, then `suspend(14)` (resp. 2.5 days), then releases/denials appended **before** the next server response → no `clock_forward` flag, no `CLOCK_ANOMALY`; each such record survives ≥ 92 real days (`assert_no_early_prune`).
 8. `u14_backward_60_days_mid_life` and `u14_backward_10_days_mid_life`: corroborated history, then local clock −60 (−10) days for 60 real days, then corrected → episode records carry `clock_behind`, exactly one `CLOCK_ANOMALY {local_behind}` per episode, `assert_no_early_prune(92)`.
-9. `u14_backward_first_run_variant`: first run with the local clock −60 days (`GENESIS` with the clock behind) and no server traffic for 2 days, then traffic, corrected after 60 days → same assertions; `GENESIS` carries `clock_behind`.
+9. `u14_backward_first_run_variant`: first run with the local clock −60 days (`GENESIS` with the clock behind) and no server traffic for 2 days, then traffic, corrected after 60 days → same assertions; `GENESIS` and the records before the first corroboration carry no `clock_behind` (L47: they hold a NULL epoch resolved by the effective epoch), the records after the first corroboration while the clock is still behind carry it via (a).
 10. `rf1a_first_run_forward_clock` (RF-1a): first run with the local clock +1 year; instance added; traffic → no non-NULL `epoch`, month DEK or `keys.month` later than the corroborated (real) date ever; `CLOCK_ANOMALY` exactly once; clock corrected on day 5; 200 days later `assert_no_early_prune(retention)` holds for retention 100.
 11. `rf1b_prune_after_long_gap_no_baseline` (RF-1b): (a) store whose first-ever prune comes after the app was off for 3 days past day 95; (b) separately a 30-day gap after a steady state → no `NeedsConfirmation`/dialog path is ever taken (automatic runs only), every run advances the cutoff by ≤ 2 epochs beyond its baseline, the backlog shrinks by a net one day per day (`health().prune_backlog_days` decreases by 1 per simulated day), `assert_no_early_prune(92)`.
 
@@ -1975,11 +1988,11 @@ exec dbus-run-session -- bash -euo pipefail -c '
 7. **CI keychains**: GNOME Keyring under `dbus-run-session` (GitHub and GitLab), `XDG_DATA_HOME`/`TMPDIR` on the project volume in containers, the macOS runner keychain as is (fallback temp keychain documented).
 8. **JCS in `ipc`** and integers limited to ±(2^53 − 1) in payloads.
 9. **U-19 scope at M2**: only schema v1 exists, so "every released schema" = the committed v1 fixture plus a test-only 1→2 migration that exercises the runner.
-10. **`clock_behind` on every `GENESIS`** (literal §8.8 (b) under L36), see spec defects.
+10. **No `clock_behind` on `GENESIS`** (§8.8 as amended by L47): `ClockState::stamp` has no genesis special case; the old rule (c) is the only pre-corroboration rule.
 
 ## Spec defects found while planning (for spec + ledger, not fixed here)
 
-1. §8.8 `clock_behind` (b) "a `GENESIS` written before any corroboration" is now always true (L36 makes every `GENESIS` uncorroborated), so every `GENESIS` and, through (c), every record of the first process before the first corroboration is flagged `clock_behind`. Safe (holds longer) but noisy in the Audit window; the spec should say whether (b) still applies under L36.
+1. (Resolved by L47: §8.8 `clock_behind` no longer flags a `GENESIS` written before any corroboration; decision 10 follows the amended text.)
 2. §8.8/L37 baseline: the baseline moves only with a `prune_log` row, and the spec does not say whether a run that deletes nothing writes `PRUNE`; if it does not, the clamp freezes after any stretch without records. This plan logs empty-range prunes (decision 5); the spec should say so.
 3. §8.13 UI text "audit data was written by atlas-duck vX" has no plaintext source for `vX` before the KEK (all app versions are in encrypted payloads); the plan adds `meta.written_by`.
 4. §8.11 step 1 says an older snapshot is migrated "before the anchors are reset", and the verifier requires `RESTORE.source_head_*` to be the record right before `RESTORE`; a `SCHEMA_MIGRATED` appended before `RESTORE` would break that. The spec should state that `SCHEMA_MIGRATED` follows `RESTORE`.
