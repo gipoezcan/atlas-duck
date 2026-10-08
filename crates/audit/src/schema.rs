@@ -192,7 +192,6 @@ pub(crate) fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
 ///
 /// Call only after the store has been verified (T10). The table is a parameter so tests can
 /// exercise the runner; production passes [`MIGRATIONS`].
-#[doc(hidden)]
 pub fn run_migrations(
     conn: &mut Connection,
     migrations: &[Migration],
@@ -397,7 +396,9 @@ pub fn read_versions(path: &Path) -> Result<StoreVersions, OpenError> {
 }
 
 /// The version gate on an already open, WAL-aware connection (the writer runs it right after
-/// [`open_rw`], before touching anything): `NewerStore(found)` for a newer store.
+/// [`open_rw`], before touching anything): `NewerStore(found)` for a newer store. Tests only;
+/// the writer uses [`gate_open_connection_up_to`].
+#[cfg(any(test, feature = "testing"))]
 pub fn gate_open_connection(conn: &Connection) -> Result<(), OpenError> {
     gate_open_connection_up_to(conn, SCHEMA_HEAD)
 }

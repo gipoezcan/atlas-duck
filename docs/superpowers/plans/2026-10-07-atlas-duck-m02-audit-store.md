@@ -918,7 +918,7 @@ pub trait KeyStore: Send + Sync {                       // C.3 + two added metho
     fn get(&self, e: &EntryName) -> Result<Option<Zeroizing<Vec<u8>>>, KeyStoreError>;   // absent → Ok(None)
     fn set(&self, e: &EntryName, v: &[u8]) -> Result<(), KeyStoreError>;
     fn delete(&self, e: &EntryName) -> Result<(), KeyStoreError>;                       // absent → Ok(())
-    fn locality(&self) -> KeyringLocality { KeyringLocality::Local }
+    fn locality(&self) -> KeyringLocality;   // as built (final review I-4): required, no default (an impl that cannot tell reports Unknown)
 }
 pub enum EntryName { Kek, HeadAnchor, FirstRetainedAnchor, Canary, Pat(String) }      // C.3
 impl EntryName { pub fn account(&self) -> String; pub fn full_name(&self, install_id: &str) -> String; }

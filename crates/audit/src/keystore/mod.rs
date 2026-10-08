@@ -92,11 +92,9 @@ pub trait KeyStore: Send + Sync {
     fn set(&self, e: &EntryName, v: &[u8]) -> Result<(), KeyStoreError>;
     /// Absent entry: `Ok(())`.
     fn delete(&self, e: &EntryName) -> Result<(), KeyStoreError>;
-    /// NOTE: the default is `Local` (no check), which is fail-open for a future impl that
-    /// forgets to override it. Every real store (`OsKeyStore`) overrides it.
-    fn locality(&self) -> KeyringLocality {
-        KeyringLocality::Local
-    }
+    /// Where the entries live (§8.6, I-44). Required, with no default: an impl that has no
+    /// way to tell reports `Unknown`, which keeps the store locked (fail closed).
+    fn locality(&self) -> KeyringLocality;
 }
 
 /// §8.6 canary: write a random value to the `Canary` entry, read it back, compare, delete it.

@@ -62,7 +62,9 @@ impl OsKeyStore {
     }
 
     /// Tests and the I-44 phase pass their own dirs (same store creation as `new`). An empty
-    /// list is `Unknown` outside Windows.
+    /// list is `Unknown` outside Windows. Feature `testing` only: production code never picks
+    /// the dirs its locality is judged by (I-4).
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_keyring_dirs(
         install_id: &str,
         dirs: Vec<PathBuf>,
