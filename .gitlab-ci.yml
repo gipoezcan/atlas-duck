@@ -15,6 +15,11 @@ default:
 variables:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # The shared runners OOM-kill (exit 137) a full-parallel Tauri build: cap rustc parallelism
+  # and drop debuginfo to keep peak memory low.
+  CARGO_BUILD_JOBS: "2"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   CARGO_HOME: "$CI_PROJECT_DIR/.cargo-home"
 
 ui:
