@@ -160,3 +160,46 @@ fn errors_never_print_bytes() {
     let s = format!("{:?} {}", KeyStoreError::Corrupt, KeyStoreError::Corrupt);
     assert!(longest_hex_run(&s) <= 8, "{s}");
 }
+
+/// The names the M3 plan imports from the crate root (C.3) resolve there.
+#[test]
+fn c3_names_resolve_at_the_crate_root() {
+    #[allow(unused_imports)]
+    use atlas_duck_audit::testing::*;
+    use atlas_duck_audit::{
+        Actor, AuditError, Clock, Committed, Confirmed, DecisionColumn, EntryName, EventFlags,
+        EventHeader, EventType, KeyStore, KeyStoreError, KeyringLocality, NewEvent, OpenError,
+        OsKeyStore, QueryKind, RestoreError, RustChosenPath, Store, SystemClock, UtcInstant,
+        create_new_store,
+    };
+    fn named<T: ?Sized>() -> &'static str {
+        std::any::type_name::<T>()
+    }
+    let _ = create_new_store;
+    for n in [
+        named::<Actor>(),
+        named::<AuditError>(),
+        named::<dyn Clock>(),
+        named::<Committed>(),
+        named::<Confirmed>(),
+        named::<DecisionColumn>(),
+        named::<EntryName>(),
+        named::<EventFlags>(),
+        named::<EventHeader>(),
+        named::<EventType>(),
+        named::<dyn KeyStore>(),
+        named::<KeyStoreError>(),
+        named::<KeyringLocality>(),
+        named::<NewEvent>(),
+        named::<OpenError>(),
+        named::<OsKeyStore>(),
+        named::<QueryKind>(),
+        named::<RestoreError>(),
+        named::<RustChosenPath>(),
+        named::<Store>(),
+        named::<SystemClock>(),
+        named::<UtcInstant>(),
+    ] {
+        assert!(n.starts_with("atlas_duck_audit::") || n.starts_with("dyn atlas_duck_audit::"));
+    }
+}

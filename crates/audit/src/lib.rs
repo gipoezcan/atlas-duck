@@ -2,6 +2,9 @@
 //!
 //! M1 holds only `instance.lock` (§3.1). The M2 audit store's `open()` takes an
 //! [`lock::InstanceLock`], so the store cannot be opened without the lock (type-enforced).
+//!
+//! The crate root re-exports the C.3 API (types, errors, keystore, clock) that `core` (M3),
+//! `app` (M4/M6) and M10 use; the modules stay public for the less common items.
 
 pub mod lock;
 
@@ -36,7 +39,11 @@ mod writer;
 
 pub use admission::FreeSpaceProbe;
 pub use anchor_dir::{AnchorLine, AnchorLineError};
+pub use anchors::BarrierKind;
 pub use backup::BackupReceipt;
+pub use clock::{Clock, SystemClock};
+pub use error::{AuditError, OpenError, RestoreError};
+pub use keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore};
 pub use open::{
     ArchivedDb, FirstRunInput, LockedReason, RecoveryOffer, StartupOutcome, create_new_store,
     keychain_retry_schedule, new_ids, open, read_store_install_id,
@@ -50,6 +57,10 @@ pub use settings::{
     FilePolicy, InstancePolicy, RETENTION_DEFAULT, RETENTION_MIN, SettingChange, Settings,
 };
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
+pub use types::{
+    Actor, Committed, Confirmed, DecisionColumn, EventFlags, EventHeader, EventType, NewEvent,
+    QueryKind, RustChosenPath, UtcInstant,
+};
 pub use verify::{FindingKind, VerifyFinding, VerifyOutcome};
 
 #[cfg(any(test, feature = "testing"))]

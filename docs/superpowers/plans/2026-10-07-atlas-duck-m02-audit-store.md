@@ -431,16 +431,43 @@ Backup `manifest.json` (written last, JCS, **Plan decision (spec silent)**): `{"
 
 ### F.12 Locked reasons, outcomes, errors (names; C.3 types made concrete)
 
+**As built (M2 final review, I-3):** this block lists the shipped API; the source of truth is `crates/audit/src/{open,error,keystore/mod,store,prune,restore,recover}.rs`. Everything below is re-exported at the crate root (`atlas_duck_audit::{..}`), together with `types::{Actor, Committed, Confirmed, DecisionColumn, EventFlags, EventHeader, EventType, NewEvent, QueryKind, RustChosenPath, UtcInstant}`, `clock::{Clock, SystemClock}` and `keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore}`.
+
 ```rust
 pub enum LockedReason { KeychainUnavailable, KeychainLost { offer: RecoveryOffer }, KeyringNotLocal }  // §4.3 strings: keychain_unavailable | keychain_lost | keyring_not_local
 pub enum RecoveryOffer { RecoverThisLog, FinishRestore }                                              // which credential-window purpose M6 shows
 pub enum StartupOutcome { Ready { store: Store, verify: VerifyOutcome }, FirstRun, Locked(LockedReason), StoreNewer { found: String } }  // C.3
-pub enum OpenError { Io(std::io::Error), Sqlite(String), MigrationFailed { from: u32, to: u32, message: String }, AlreadyExists, NotFirstRun,
-                     PassphraseTooShort, PassphraseMismatch, KeyStore(KeyStoreError), WrongPassphrase, Integrity(String), Restore(RestoreError) }
-pub enum AuditError { AppendFailed(String), StorageLow, Closed, Decrypt { seq: u64 }, PayloadHash { seq: u64 }, NotFound { seq: u64 },
-                      NeedsConfirmation(&'static str), Invalid(&'static str), KeyStore(KeyStoreError), Restore(RestoreError), Io(String) }
+pub fn new_ids() -> Result<(String /* install_id */, String /* chain_id */), OpenError>;   // Err only if the OS random source fails
+pub enum OpenError { Io(std::io::Error), Sqlite(String), MigrationFailed { from: u32, to: u32, message: String }, AlreadyExists,
+                     NewerStore(String) /* version gate inside restore/finish/recover */, NotFirstRun, PassphraseTooShort, PassphraseMismatch,
+                     KeyStore(KeyStoreError), WrongPassphrase, Integrity(String), Restore(RestoreError), Invalid(&'static str) /* caller input */ }
+pub enum AuditError { AppendFailed(String), StorageLow, Closed, AnchorThreadDead, AnchorFlushTimeout, AnchorOutcomeUnknown,
+                      Decrypt { seq: u64 }, PayloadHash { seq: u64 }, NotFound { seq: u64 }, NeedsConfirmation(&'static str), Invalid(&'static str),
+                      InvalidRecord { seq: u64, what: &'static str }, KeyStore(KeyStoreError), Restore(RestoreError), Io(String) }
 pub enum RestoreError { SnapshotNewer { found: String }, NotABundle, ManifestMismatch, ChainBroken(String), WrongPassphrase,
-                        RollbackNeedsConfirmation { records_lost: u64 }, AnchorDirMismatch(String) }
+                        RollbackNeedsConfirmation { records_lost: u64 }, AnchorDirMismatch(String),
+                        CommittedIncomplete { restore_seq: u64, reason: String } /* committed; the store handle is stopped, the next start completes it */ }
+pub enum KeyStoreError { Unavailable, Locked, NotLocal, Corrupt /* entry bytes undecodable: deterministic, never retried */, Other(String) }
+pub trait KeyStore: Send + Sync { fn install_id(&self) -> &str; fn get(..); fn set(..); fn delete(..); fn locality(&self) -> KeyringLocality; }
+pub struct StoreHealth { pub anchor_write_failing: bool, pub first_retained_update_pending: bool, pub storage_low: bool, pub open_incidents: usize,
+                         pub prune_backlog_days: u32, pub anchors_blocked: Option<BarrierKind>, pub anchor_thread_dead: bool,
+                         pub shred_checkpoint_pending: bool, pub last_prune_error: Option<String>, pub settings_unreadable: bool }
+pub enum PruneSkip { NotCorroborated, HeadEpochNull, LegalHold, AlreadyRanThisEpoch, ClockBeforeHead, ClockBeforeLastPrune, NothingToAdvance,
+                     ConfigNotReconciled, ClockBehind }
+impl Store {   // beyond C.3
+    pub fn try_full_verify(&self) -> Result<VerifyOutcome, AuditError>;   // M6 verify_now; Err = "verification did not complete"
+    pub fn head(&self) -> (u64, [u8; 32], String /* chain_id */);
+    pub fn install_id(&self) -> &str;
+    pub fn health(&self) -> StoreHealth;
+    pub fn reconcile_config_file(&self, file: &FilePolicy) -> Result<Vec<Committed>, AuditError>;
+    pub fn script_failed_flags(&self, seq: u64) -> Result<ScriptFailedFlags, AuditError>;
+    pub fn shutdown(&self);
+}
+pub fn restore_from_source(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, source: RustChosenPath, passphrase: &SecretString,
+                           confirm_rollback: Option<Confirmed>) -> Result<(Store, RestoreReport), OpenError>;
+pub fn finish_restore(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, passphrase: &SecretString) -> Result<(Store, VerifyOutcome), OpenError>;
+pub fn recover_this_log(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, passphrase: &SecretString) -> Result<(Store, RecoverReport), OpenError>;
+pub fn archive_and_start_fresh(data: &LocalDataDir, lock: &InstanceLock, confirmed: Confirmed) -> Result<ArchivedDb, OpenError>;
 pub struct Confirmed { pub dialog_text_sha256: [u8; 32] }   // built by core after NativeConfirmer::confirm == Ok (M3); recorded in CONFIG_CHANGED
 pub struct RustChosenPath(std::path::PathBuf);              // pub fn from_native_dialog(p: PathBuf) -> Self; pub fn path(&self) -> &Path
 ```
@@ -894,7 +921,7 @@ pub trait KeyStore: Send + Sync {                       // C.3 + two added metho
 pub enum EntryName { Kek, HeadAnchor, FirstRetainedAnchor, Canary, Pat(String) }      // C.3
 impl EntryName { pub fn account(&self) -> String; pub fn full_name(&self, install_id: &str) -> String; }
 pub fn service_name(install_id: &str) -> String;                                       // "atlas-duck/<install_id>"
-pub enum KeyStoreError { Unavailable, Locked, NotLocal, Other(String) }                // C.3
+pub enum KeyStoreError { Unavailable, Locked, NotLocal, Other(String) }                // C.3; as built + Corrupt (F.12)
 pub enum KeyringLocality { Local, NotLocal { dir: PathBuf }, Unknown { reason: String } }
 pub fn canary_self_test(ks: &dyn KeyStore) -> Result<(), KeyStoreError>;               // §8.6
 pub struct OsKeyStore;  impl OsKeyStore {
@@ -1002,7 +1029,7 @@ Run: `cargo test -p atlas-duck-audit --test keystore --locked` → all pass on W
 5. `mono_undercount_holds_epoch_back`: mono frozen for 14 days, wall correct (+14 d) → `epoch` stays at the corroboration date, flags empty, no anomaly (U-13 unit half).
 6. `backward_clock_sets_behind_once`: corroborated 2026-10-08, wall set back 60 days → stamp flags `CLOCK_BEHIND`, `behind_transition` returns `Some(LocalBehind)` once, `None` on the next 100 calls; epoch stays at `prev_epoch` (non-decreasing); wall corrected → flag off, episode ends; a new backward step → a second anomaly (new episode).
 7. `ten_day_backward_variant`: same with 10 days.
-8. `clock_backwards_step_flag`: `ts` 6 s earlier than predecessor → `CLOCK_BACKWARDS`; 5 s earlier → no flag.
+8. `clock_backwards_step_flag`: `ts` 6 s earlier than predecessor → `EventFlags::BACKWARDS` (`clock_backwards`); 5 s earlier → no flag.
 9. `cmos_reset_before_corroboration`: prev_epoch 2026-10-08 (from a previous process), new process (no corroboration), wall 2000-01-01 → `CLOCK_BEHIND` via (b), epoch stays 2026-10-08; the next uncorroborated stamp stays flagged (predecessor flagged).
 13. `genesis_with_wrong_clock_not_flagged`: fresh state, wall 2000-01-01: `GENESIS` and 2 more stamps → `epoch None`, flags empty; then `observe(server = 2026-10-08T10:00Z)` with wall still 2000 → the next stamp carries `CLOCK_BEHIND` via (a) and `behind_transition` returns `Some(LocalBehind)`.
 10. `epoch_never_decreases_and_never_exceeds_corroborated`: proptest over random sequences of `observe`/`stamp`/wall jumps (±5 years)/mono advances: every non-NULL epoch ≥ the previous non-NULL epoch and ≤ the newest corroborated date at that moment; once non-NULL, never NULL again.
@@ -1060,7 +1087,7 @@ impl ClockState {
             None => self.prev_epoch,
         };
         let mut flags = EventFlags::default();
-        if let Some(p) = self.prev_ts { if now.0 < p.0 - 5_000 { flags |= EventFlags::CLOCK_BACKWARDS } }
+        if let Some(p) = self.prev_ts { if now.0 < p.0 - 5_000 { flags |= EventFlags::BACKWARDS } }
         if self.ahead_episode { flags |= EventFlags::CLOCK_FORWARD }
         match cd {
             Some(cd) => if today < cd - Days::new(1) { flags |= EventFlags::CLOCK_BEHIND },          // (a)
@@ -1105,7 +1132,7 @@ impl OpenConfig { pub fn new(clock: Arc<dyn Clock>, keys: Arc<dyn KeyStore>) -> 
 pub trait FreeSpaceProbe: Send + Sync { fn free_bytes(&self, path: &Path) -> std::io::Result<u64>; }
 pub struct FirstRunInput { pub install_id: String, pub chain_id: String, pub passphrase: SecretString, pub passphrase_confirm: SecretString, pub archived_db: Option<ArchivedDb> }
 pub struct ArchivedDb { pub file: String /* relative to the data dir, '/' separators */, pub chain_id: String, pub head_seq: u64, pub head_hash: [u8; 32] }
-pub fn new_ids() -> (String /* install_id */, String /* chain_id */);
+pub fn new_ids() -> Result<(String /* install_id */, String /* chain_id */), OpenError>;   // as built (F.12)
 pub fn create_new_store(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, input: FirstRunInput) -> Result<Store, OpenError>;   // C.3
 #[derive(Clone)] pub struct Store { /* Arc<Inner> */ }
 impl Store {
@@ -1224,7 +1251,7 @@ impl HeadAnchor { pub fn to_entry(&self) -> Vec<u8>; pub fn from_entry(&[u8]) ->
 pub(crate) enum Barrier { Prune { seq: u64, record_hash: [u8; 32], first_retained: FirstRetainedAnchor }, Restore { seq: u64 } }
 pub(crate) struct AnchorState { enabled: bool, head: Option<HeadAnchor>, written_head: Option<HeadAnchor>, barrier: Option<Barrier>,
                                 dirty_since: Option<Instant>, flush_requested: bool, stop: bool, failures: u32, next_retry: Option<Instant>, last_error: Option<KeyStoreError> }
-pub struct StoreHealth { pub anchor_write_failing: bool, pub first_retained_update_pending: bool, pub storage_low: bool, pub open_incidents: usize, pub prune_backlog_days: u32 }
+pub struct StoreHealth { pub anchor_write_failing: bool, pub first_retained_update_pending: bool, pub storage_low: bool, pub open_incidents: usize, pub prune_backlog_days: u32 }   // as built: 10 fields (F.12)
 impl Store { pub fn flush_head_anchor(&self) -> Result<(), AuditError>; /* C.3 */ }
 ```
 
