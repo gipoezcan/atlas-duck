@@ -221,6 +221,16 @@ fn defaults(spec: &OperationSpec) -> Value {
     if let Some(max) = spec.caps.max {
         out.insert(max.param.into(), json!(max.default));
     }
+    // §7.3: the `fields` applied when the agent sends none.
+    match spec.id {
+        "jira.issue.get" => {
+            out.insert("fields".into(), json!(crate::ISSUE_GET_DEFAULT_FIELDS));
+        }
+        "jira.search" => {
+            out.insert("fields".into(), json!(crate::SEARCH_DEFAULT_FIELDS));
+        }
+        _ => {}
+    }
     Value::Object(out)
 }
 

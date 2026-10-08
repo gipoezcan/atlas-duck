@@ -12,6 +12,7 @@ mod script;
 
 pub use describe::{DescribeEnv, LimitsSource, describe};
 pub use display::target_display;
+pub use jira::{ISSUE_GET_DEFAULT_FIELDS, SEARCH_DEFAULT_FIELDS};
 pub use model::*;
 pub use script::{SCRIPT_RUN, ScriptRunSpec, script_target_display};
 
@@ -27,7 +28,36 @@ pub const PAGINATION_GUIDANCE: &str = "continue only from meta.page.next_start";
 
 /// Jira then Confluence, each in §7.3/§7.4 table order. Each spec is a `pub(crate) const` in its
 /// product module, listed here once (compile time, no allocation).
-static ALL: &[OperationSpec] = &[];
+static ALL: &[OperationSpec] = &[
+    jira::reads::MYSELF,
+    jira::reads::PROJECT_LIST,
+    jira::reads::PROJECT_GET,
+    jira::reads::ISSUE_GET,
+    jira::reads::SEARCH,
+    jira::reads::COMMENT_LIST,
+    jira::reads::WORKLOG_LIST,
+    jira::reads::TRANSITION_LIST,
+    jira::reads::ISSUE_EDITMETA,
+    jira::reads::CREATEMETA_ISSUETYPES,
+    jira::reads::CREATEMETA_FIELDS,
+    jira::reads::FIELD_LIST,
+    jira::reads::ISSUELINKTYPE_LIST,
+    jira::reads::ATTACHMENT_META,
+    jira::reads::USER_ASSIGNABLE,
+    jira::reads::BOARD_LIST,
+    jira::reads::SPRINT_LIST,
+    jira::reads::SPRINT_ISSUES,
+    jira::reads::BACKLOG_ISSUES,
+    jira::writes::ISSUE_CREATE,
+    jira::writes::ISSUE_EDIT,
+    jira::writes::COMMENT_ADD,
+    jira::writes::ISSUE_TRANSITION,
+    jira::writes::ISSUE_ASSIGN,
+    jira::writes::WORKLOG_ADD,
+    jira::writes::ISSUELINK_CREATE,
+    jira::writes::SPRINT_MOVE_ISSUES,
+    jira::writes::BACKLOG_MOVE_ISSUES,
+];
 
 /// Every registry operation (46 once the catalogs are in: 28 Jira, 18 Confluence).
 pub fn all() -> &'static [OperationSpec] {
