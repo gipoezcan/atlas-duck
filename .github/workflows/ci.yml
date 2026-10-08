@@ -115,6 +115,23 @@ jobs:
           # T09: the only job allowed to write the WER registry values (no-op off Windows).
           ATLAS_DUCK_RUN_WER_TEST: "1"
 
+      - name: Windows probes (T19, §9.4)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          if grep -rnE 'Command::new|use std::process::Command' crates/sandbox-host/src/windows; then
+            echo "::error::crates/sandbox-host/src/windows must call CreateProcessW itself, not std::process::Command (§3.4)"
+            exit 1
+          fi
+          cargo test -p atlas-duck-sandbox-host --test aces_windows --locked
+          cargo test -p atlas-duck-app --test probes_windows --locked -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/probes-windows.log"
+          {
+            echo "### Windows probes (x86_64-pc-windows-msvc)"
+            echo '```'
+            grep -E '^T19 |^test result' "$RUNNER_TEMP/probes-windows.log" | cut -c1-400 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Linux spawn routine (T16, §3.4)
         if: runner.os == 'Linux'
         run: |

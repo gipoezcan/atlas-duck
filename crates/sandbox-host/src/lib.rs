@@ -3,8 +3,8 @@
 //!
 //! M1 holds the OS-independent probe runner, its scoring rules and the
 //! sandbox binary identity (T15), and the per-OS spawn routines: Linux (T16,
-//! module `linux`), macOS (T18, module `macos`) and Windows (T19). [`platform_spawner`]
-//! returns the one for the running OS.
+//! module `linux`), macOS (T18, module `macos`) and Windows (T19, module
+//! `windows`). [`platform_spawner`] returns the one for the running OS.
 
 pub mod identity;
 #[cfg(target_os = "linux")]
@@ -13,6 +13,8 @@ pub mod linux;
 pub mod macos;
 pub mod probe;
 pub mod spawn;
+#[cfg(windows)]
+pub mod windows;
 
 use std::io;
 
@@ -22,8 +24,11 @@ use crate::spawn::WorkerSpawner;
 /// `std::process::Command`).
 ///
 /// Linux: [`linux::LinuxSpawner`] (T16). macOS: [`macos::MacSpawner`] (T18).
-/// Windows (T19) adds its own `#[cfg(target_os = ...)]` arm; until then it gets
-/// `ErrorKind::Unsupported`.
+/// Windows: [`windows::WindowsSpawner`] (T19); it creates (or opens) the
+/// AppContainer profile, so it fails when profile creation is blocked. A caller
+/// that gets the error can still produce a report with a spawner whose `spawn`
+/// returns that error: every record is then `SpawnFailed` and the floor is
+/// `NotMet`.
 pub fn platform_spawner() -> io::Result<Box<dyn WorkerSpawner>> {
     #[cfg(target_os = "linux")]
     {
@@ -33,11 +38,15 @@ pub fn platform_spawner() -> io::Result<Box<dyn WorkerSpawner>> {
     {
         Ok(Box::new(macos::MacSpawner::new()))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Ok(Box::new(windows::WindowsSpawner::new()?))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "no sandbox worker spawn routine for this OS yet",
+            "no sandbox worker spawn routine for this OS",
         ))
     }
 }
