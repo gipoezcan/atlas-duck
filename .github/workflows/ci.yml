@@ -123,9 +123,14 @@ jobs:
         env:
           # T09: the only job allowed to write the WER registry values (no-op off Windows).
           ATLAS_DUCK_RUN_WER_TEST: "1"
+          # §9.4: the Windows floor is met (LPAC, or the plain AppContainer fallback), with the
+          # host-side controls of sandbox-host `winscore`. Ignored off Windows.
+          ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET: "1"
 
       - name: Windows probes (T19, §9.4)
         if: runner.os == 'Windows'
+        env:
+          ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET: "1"
         run: |
           set -euo pipefail
           if grep -rnE 'Command::new|use std::process::Command' crates/sandbox-host/src/windows; then

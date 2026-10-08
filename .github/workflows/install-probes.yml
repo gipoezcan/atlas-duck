@@ -6,8 +6,8 @@ name: install-probes
 # `event=sandbox_probe` line in <data>/logs/diag.log is read.
 #
 #   windows-per-user      NSIS  setup.exe /S /CurrentUser   ACEs by the installer hook, re-apply, WER;
-#                                                           the floor verdict is RECORDED, not asserted
-#   windows-per-machine   NSIS  setup.exe /S /AllUsers      ACEs by the installer hook, WER; floor recorded
+#                                                           floor=met failed=none is asserted
+#   windows-per-machine   NSIS  setup.exe /S /AllUsers      ACEs by the installer hook, WER; floor=met asserted
 #   macos-arm64           dmg -> /Applications, ad-hoc signed, hardened runtime
 #   macos-x86_64-rosetta  dmg (x86_64) -> /Applications, runs translated on the arm64 runner
 #   ubuntu-deb            apt install of the .deb
@@ -18,8 +18,10 @@ name: install-probes
 # line and a final PROBE_RECORD line (Windows also EVIDENCE_JSON). The evidence directory is
 # uploaded as artifact install-probe-<job> as a copy.
 #
-# Result values. Windows: the floor is not met by measurement (T19), so the legs record floor= and
-# failed= and fail only on the installer's own duties (ACEs, location, ace=, WER). macOS: a bare
+# Result values. Windows: floor=met failed=none is asserted (the host scores the LPAC Winsock / RPC
+# failures and the loopback timeout from unconfined controls, or falls back to the plain
+# AppContainer; the line carries appcontainer_mode= and control_ok=), next to the installer's own
+# duties (ACEs, location, ace=, WER). macOS: a bare
 # `floor=met` is no proof (T18); the leg passes as proven only with an informative unconfined
 # task_for_pid control, otherwise it prints FLOOR_INCONCLUSIVE and an INCONCLUSIVE line (the job
 # stays green, the log says it is not a proof). Linux: floor=met is asserted.

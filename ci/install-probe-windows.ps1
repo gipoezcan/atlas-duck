@@ -15,14 +15,17 @@
 # Steps: install -> resolve the install dir from the uninstall registry key -> assert the dir
 # is not the data dir, holds the three exes, and both (L)PAC SIDs have read+execute on the worker
 # and every DLL -> pinned fixture (local temp data dir) -> start `atlas-duck-app.exe --background`
-# -> poll <data>\logs\diag.log up to 60 s for `event=sandbox_probe` -> RECORD the floor verdict
-# and assert ace=present -> WER exclusions -> (CurrentUser only) remove the S-1-15-2-2 ACE,
+# -> poll <data>\logs\diag.log up to 60 s for `event=sandbox_probe` -> ASSERT floor=met
+# failed=none and ace=present -> WER exclusions -> (CurrentUser only) remove the S-1-15-2-2 ACE,
 # restart, assert ace=reapplied and the ACE is back -> kill the app.
 #
-# The Windows floor is NOT_MET by measurement (T19), so this leg records floor= and failed= in the
-# evidence and the job log and never fails on floor=not_met. What it asserts is what the installer
-# is responsible for: the ACEs, the install location, the ace= re-apply outcome and the WER
-# exclusions. The job log is the record (T22 reads it); the evidence directory is uploaded too.
+# The Windows floor is MET on the installed package (sec. 9.4): the host scores the LPAC Winsock /
+# credential-service failures and the loopback timeout from unconfined controls, or falls back to a
+# plain AppContainer. The line says which one ran (appcontainer_mode=lpac|appcontainer) and whether
+# the controls held (control_ok=true); both are recorded. Besides the floor this leg asserts what
+# the installer is responsible for: the ACEs, the install location, the ace= re-apply outcome and
+# the WER exclusions. The job log is the record (T22 reads it); the evidence directory is uploaded
+# too.
 #
 # ACEs are read through Get-Acl and SecurityIdentifier values, never from icacls text: icacls
 # prints localized account names. The icacls text is only logged as evidence.
@@ -88,14 +91,11 @@ function Get-ProbeLines([string]$LogPath) {
     return $found
 }
 
-# -RecordFloor: only ace= is asserted; floor= and failed= are recorded by the caller (the Windows
-# floor is NOT_MET by measurement, T19).
-function Assert-ProbeFields($Fields, [string]$ExpectedAce, [switch]$RecordFloor) {
+# Asserts floor=met failed=none and the expected ace=.
+function Assert-ProbeFields($Fields, [string]$ExpectedAce) {
     $summary = ($Fields.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '
-    if (-not $RecordFloor) {
-        if ($Fields['floor'] -ne 'met') { Fail "floor is not met (failed=$($Fields['failed'])): $summary" }
-        if ($Fields['failed'] -ne 'none') { Fail "failed probes reported although floor=met: $summary" }
-    }
+    if ($Fields['floor'] -ne 'met') { Fail "floor is not met (failed=$($Fields['failed'])): $summary" }
+    if ($Fields['failed'] -ne 'none') { Fail "failed probes reported although floor=met: $summary" }
     if ($Fields['ace'] -ne $ExpectedAce) { Fail "ace=$($Fields['ace']), expected ${ExpectedAce}: $summary" }
 }
 
@@ -236,8 +236,8 @@ function Assert-Throws([scriptblock]$Block, [string]$What) {
 }
 
 function Invoke-SelfTest {
-    $met = '2026-10-07T10:00:00.123Z INFO atlas_duck_app_lib::sandbox_probe src/sandbox_probe.rs:301 event=sandbox_probe floor=met failed=none extra_layers=none engine_version=0.16.2 worker_version=0.1.0+0123456789ab ace=present dropped_fields=0'
-    $notMet = '2026-10-07T10:00:00.123Z INFO atlas_duck_app_lib::sandbox_probe src/sandbox_probe.rs:301 event=sandbox_probe floor=not_met failed=file_in_profile+task_for_pid extra_layers=landlock:on engine_version=unknown worker_version=unknown ace=missing_no_write_dac dropped_fields=0'
+    $met = '2026-10-07T10:00:00.123Z INFO atlas_duck_app_lib::sandbox_probe src/sandbox_probe.rs:301 event=sandbox_probe floor=met failed=none extra_layers=none engine_version=0.16.2 worker_version=0.1.0+0123456789ab ace=present appcontainer_mode=lpac control_ok=true lpac_failed=n/a dropped_fields=0'
+    $notMet = '2026-10-07T10:00:00.123Z INFO atlas_duck_app_lib::sandbox_probe src/sandbox_probe.rs:301 event=sandbox_probe floor=not_met failed=file_in_profile+task_for_pid extra_layers=landlock:on engine_version=unknown worker_version=unknown ace=missing_no_write_dac appcontainer_mode=appcontainer control_ok=false lpac_failed=n/a dropped_fields=0'
     $warn = '2026-10-07T10:00:00.123Z WARN atlas_duck_app_lib::sandbox_probe src/sandbox_probe.rs:99 event=sandbox_probe reason=install_dir_unknown dropped_fields=0'
     $other = '2026-10-07T10:00:00.123Z INFO atlas_duck_app_lib::tray_host src/tray_host.rs:58 event=tray_host_checked tray_host=missing dropped_fields=0'
 
@@ -245,6 +245,8 @@ function Invoke-SelfTest {
     Assert-Equal $f['floor'] 'met' 'floor of the met line'
     Assert-Equal $f['ace'] 'present' 'ace of the met line'
     Assert-Equal $f['failed'] 'none' 'failed of the met line'
+    Assert-Equal $f['appcontainer_mode'] 'lpac' 'appcontainer_mode of the met line'
+    Assert-Equal $f['control_ok'] 'true' 'control_ok of the met line'
     $g = ConvertFrom-ProbeLine $notMet
     Assert-Equal $g['failed'] 'file_in_profile+task_for_pid' 'failed of the not_met line'
     Assert-Equal $g['ace'] 'missing_no_write_dac' 'ace of the not_met line'
@@ -254,9 +256,10 @@ function Invoke-SelfTest {
     Assert-ProbeFields $f 'present'
     Assert-Throws { Assert-ProbeFields $g 'present' } 'Assert-ProbeFields on a not_met line'
     Assert-Throws { Assert-ProbeFields $f 'reapplied' } 'Assert-ProbeFields with the wrong ace'
-    # -RecordFloor: a not_met floor is recorded, not failed; the ace is still asserted.
-    Assert-ProbeFields $g 'missing_no_write_dac' -RecordFloor
-    Assert-Throws { Assert-ProbeFields $g 'present' -RecordFloor } 'Assert-ProbeFields -RecordFloor with the wrong ace'
+    # a not_met floor fails whatever the ace is
+    Assert-Throws { Assert-ProbeFields $g 'missing_no_write_dac' } 'Assert-ProbeFields on a not_met line with its own ace'
+    $metFailed = ConvertFrom-ProbeLine ($met -replace 'failed=none', 'failed=cred_read')
+    Assert-Throws { Assert-ProbeFields $metFailed 'present' } 'Assert-ProbeFields on floor=met with failed probes'
 
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ('atlas-duck-t21-selftest-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $dir | Out-Null
@@ -406,11 +409,13 @@ try {
     $app = Start-App $installDir
     $line = Wait-ProbeLine $logPath $app 0 $TimeoutSeconds
     $evidence['probe_line_1'] = $line
-    # The floor is recorded, not asserted (NOT_MET on Windows by measurement, T19); ace= is asserted.
-    Assert-ProbeFields $line 'present' -RecordFloor
+    # floor=met failed=none and ace= are asserted; the mode and the control are recorded.
+    Assert-ProbeFields $line 'present'
     $evidence['floor'] = $line['floor']
     $evidence['failed'] = $line['failed']
-    Write-Host "PROBE_RECORD mode=$Mode floor=$($line['floor']) failed=$($line['failed']) ace=$($line['ace']) extra_layers=$($line['extra_layers']) engine_version=$($line['engine_version']) worker_version=$($line['worker_version'])"
+    $evidence['appcontainer_mode'] = $line['appcontainer_mode']
+    $evidence['control_ok'] = $line['control_ok']
+    Write-Host "PROBE_RECORD mode=$Mode floor=$($line['floor']) failed=$($line['failed']) appcontainer_mode=$($line['appcontainer_mode']) control_ok=$($line['control_ok']) lpac_failed=$($line['lpac_failed']) ace=$($line['ace']) extra_layers=$($line['extra_layers']) engine_version=$($line['engine_version']) worker_version=$($line['worker_version'])"
     foreach ($file in $aceFiles) { Assert-PackageSids $file }
 
     Write-Step 'WER exclusions (spec sec. 2.5, sec. 15 V30): HKCU ...\ExcludedApplications'
@@ -430,9 +435,9 @@ try {
         $app = Start-App $installDir
         $line = Wait-ProbeLine $logPath $app $known $TimeoutSeconds
         $evidence['probe_line_2'] = $line
-        Assert-ProbeFields $line 'reapplied' -RecordFloor
+        Assert-ProbeFields $line 'reapplied'
         Assert-PackageSids $worker
-        Write-Host "ok: ace=reapplied, S-1-15-2-2 is back on the worker (floor=$($line['floor']) recorded)"
+        Write-Host "ok: ace=reapplied, S-1-15-2-2 is back on the worker (floor=$($line['floor']) asserted)"
 
         Write-Step 'a third start finds everything in place'
         Stop-App $app
@@ -441,14 +446,14 @@ try {
         $app = Start-App $installDir
         $line = Wait-ProbeLine $logPath $app $known $TimeoutSeconds
         $evidence['probe_line_3'] = $line
-        Assert-ProbeFields $line 'present' -RecordFloor
-        Write-Host "ok: ace=present (floor=$($line['floor']) recorded)"
+        Assert-ProbeFields $line 'present'
+        Write-Host "ok: ace=present (floor=$($line['floor']) asserted)"
     } else {
         Write-Host 'per-machine: the re-apply path needs WRITE_DAC and an admin runner always has it; the MissingNoWriteDac outcome is covered by the T20 unit test (can_write_dac forced false)'
     }
 
     $evidence['result'] = 'ok'
-    Write-Host "OK: $Mode install, ACEs granted by the installer, WER exclusions set, floor=$($evidence['floor']) failed=$($evidence['failed']) recorded (not asserted)"
+    Write-Host "OK: $Mode install, ACEs granted by the installer, WER exclusions set, floor=$($evidence['floor']) failed=$($evidence['failed']) appcontainer_mode=$($evidence['appcontainer_mode']) control_ok=$($evidence['control_ok'])"
 } finally {
     Stop-App $app
     if ($null -ne $logPath -and (Test-Path -LiteralPath $logPath)) {
