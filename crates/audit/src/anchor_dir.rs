@@ -602,6 +602,47 @@ pub(crate) struct VerifyCtx<'a> {
     pub(crate) head: Option<u64>,
     /// The readable `prune_log` rows by `prune_seq`.
     pub(crate) prune_log: &'a [PruneLogRow],
+    /// Seqs of superseded chains that same-machine rollbacks gave up.
+    pub(crate) lost: &'a [LostSpan],
+}
+
+/// Records of a superseded chain that an authorised same-machine rollback gave up (§8.11:
+/// "anchored lines of the source chain beyond `source_head_seq` must be accounted for by
+/// `records_lost`"): seqs `after + 1 ..= up_to` of `chain_id`. A line of that chain's file
+/// naming one of them, where the store now holds a record of another chain or nothing, is
+/// accounted for instead of contradicting the store. Nothing else is relaxed: the rest of
+/// that file is checked as before, and a line beyond `up_to` is still a contradiction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LostSpan {
+    pub(crate) chain_id: String,
+    pub(crate) after: u64,
+    pub(crate) up_to: u64,
+}
+
+impl LostSpan {
+    /// The span a `RESTORE` accounts for: only a same-machine rollback, i.e. its
+    /// `prior_keychain_anchor` names its source chain beyond its source head, with
+    /// `records_lost > 0`; bounded by both the prior anchor's seq and `records_lost`.
+    pub(crate) fn of(
+        source_chain_id: &str,
+        source_head_seq: u64,
+        prior: Option<(&str, u64)>,
+        records_lost: u64,
+    ) -> Option<LostSpan> {
+        let (chain, prior_seq) = prior?;
+        if records_lost == 0 || chain != source_chain_id || prior_seq <= source_head_seq {
+            return None;
+        }
+        Some(LostSpan {
+            chain_id: source_chain_id.to_owned(),
+            after: source_head_seq,
+            up_to: prior_seq.min(source_head_seq.saturating_add(records_lost)),
+        })
+    }
+
+    fn covers(&self, chain: &str, seq: u64) -> bool {
+        self.chain_id == chain && seq > self.after && seq <= self.up_to
+    }
 }
 
 /// One retained record as the checks see it; a malformed column reads as `None`.
@@ -782,7 +823,11 @@ fn check_retained(
             .expected(Some(nl.seq), Some(*nl.record_hash))
             .observed(Some(nl.seq), observed)
     };
+    let lost = ctx.lost.iter().any(|s| s.covers(chain, nl.seq));
     let Some(r) = row(ctx.conn, nl.seq)? else {
+        if lost {
+            return Ok(());
+        }
         out.push(if ctx.head.is_none_or(|h| nl.seq > h) {
             mismatch("the anchored seq is beyond the store's head", None)
         } else {
@@ -792,6 +837,9 @@ fn check_retained(
     };
     let observed = r.record_hash;
     if r.chain_id.as_deref() != Some(chain) {
+        if lost {
+            return Ok(());
+        }
         out.push(mismatch(
             "the anchored record belongs to another chain",
             observed,

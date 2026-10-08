@@ -1606,3 +1606,84 @@ fn refused_restore_puts_back_the_barrier_it_held() {
     assert!(newest > 1);
     assert_eq!(a.full_verify(), vec![]);
 }
+
+// ---------------------------------------------------------------------------------------
+// Anchor-dir lines of a superseded chain (§8.11: accounted for by `records_lost`)
+
+fn record_line(r: &RawRow) -> atlas_duck_audit::AnchorLine {
+    atlas_duck_audit::AnchorLine::Record {
+        seq: r.seq,
+        record_hash: r.record_hash,
+        epoch: r.epoch.clone(),
+        clock_behind: false,
+    }
+}
+
+fn write_anchor_lines(dir: &Path, chain_id: &str, lines: &[atlas_duck_audit::AnchorLine]) {
+    let text: String = lines
+        .iter()
+        .map(|l| atlas_duck_audit::anchor_dir::to_line(l) + "\n")
+        .collect();
+    std::fs::write(dir.join(format!("{chain_id}.jsonl")), text).expect("anchor file");
+}
+
+#[test]
+fn superseded_chain_lines_are_accounted_for_by_records_lost() {
+    let (a, fa) = store_with(0);
+    let dir = tempfile::tempdir().expect("anchor dir");
+    a.apply_setting(
+        SettingChange::AnchorDir(Some(dir.path().to_string_lossy().into_owned())),
+        Some(confirmed()),
+    )
+    .expect("anchor dir");
+    a.append_batch(mixed(20)).expect("append_batch");
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    a.append_batch(mixed(10)).expect("append_batch");
+    a.flush_head_anchor().expect("flush");
+    let rows = dump_rows(&fa);
+    let (h, head) = (bundle.head_seq, a.head().0);
+    let row = |seq: u64| &rows[seq as usize - 1];
+    // What M10 wrote for chain A: a record the snapshot keeps and two the rollback gives up.
+    let header = atlas_duck_audit::AnchorLine::Header {
+        chain_id: fa.chain_id.clone(),
+        install_id: fa.install_id.clone(),
+        host: "testhost".into(),
+        os_user: "alice".into(),
+        created_at: START.into(),
+    };
+    let mut lines = vec![
+        header,
+        record_line(row(6)),
+        record_line(row(h + 2)),
+        record_line(row(head)),
+    ];
+    write_anchor_lines(dir.path(), &fa.chain_id, &lines);
+
+    let rep = a
+        .restore(
+            chosen(&bundle.bundle_dir),
+            &pass(PASSPHRASE),
+            Some(confirmed()),
+        )
+        .expect("restore");
+    assert_eq!(rep.records_lost, head - h);
+    assert_eq!(a.full_verify(), vec![]);
+    a.flush_head_anchor().expect("flush");
+    a.shutdown();
+    let (s, v) = ready(open(&fa.data, &fa.lock, fa.config()).expect("open"));
+    assert_eq!(v.findings, vec![]);
+
+    // A line of chain A beyond what the rollback gave up is still a contradiction.
+    lines.push(atlas_duck_audit::AnchorLine::Record {
+        seq: head + 3,
+        record_hash: [7; 32],
+        epoch: None,
+        clock_behind: false,
+    });
+    write_anchor_lines(dir.path(), &fa.chain_id, &lines);
+    assert!(
+        kinds(&s.full_verify()).contains(&FindingKind::AnchorDirMismatch),
+        "a line past the prior anchor is not accounted for"
+    );
+}

@@ -46,7 +46,7 @@ use rusqlite::OptionalExtension;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
-use crate::anchor_dir::{self, AnchorDirLines};
+use crate::anchor_dir::{self, AnchorDirLines, LostSpan};
 use crate::anchors::{
     self, AnchorLoadError, Barrier, FirstRetainedAnchor, HeadAnchor, RestoreReset,
 };
@@ -363,10 +363,24 @@ fn records_lost(
 }
 
 /// Step 6: the snapshot against the anchor dir's lines for its chains, when one is configured.
-fn check_anchor_dir(staged: &Staged, dir: Option<&Path>) -> Result<(), AuditError> {
+/// Lines of the snapshot's chain for the records a confirmed rollback gives up are accounted
+/// for exactly as the `RESTORE` will record them (`prior`, `records_lost`).
+fn check_anchor_dir(
+    staged: &Staged,
+    dir: Option<&Path>,
+    prior: Option<&HeadAnchor>,
+    records_lost: u64,
+) -> Result<(), AuditError> {
     let conn = schema::open_peek(&staged.staging.path).map_err(open_to_audit)?;
     let lines: Option<AnchorDirLines> = anchor_dir::load(dir, &conn).map_err(open_to_audit)?;
-    let found = verify::snapshot_anchor_dir(&conn, lines.as_ref()).map_err(sql)?;
+    let rollback = LostSpan::of(
+        &staged.chain_id,
+        staged.head_seq,
+        prior.map(|a| (a.chain_id.as_str(), a.seq)),
+        records_lost,
+    );
+    let found =
+        verify::snapshot_anchor_dir(&conn, &staged.kek, lines.as_ref(), rollback).map_err(sql)?;
     if !found.is_empty() {
         return Err(restore_err(RestoreError::AnchorDirMismatch(summary(
             &found,
@@ -679,7 +693,7 @@ impl Writer {
             self.st.settings.anchor_dir.as_deref(),
             req.anchor_dir.as_deref(),
         );
-        check_anchor_dir(&staged, dir.as_deref())?;
+        check_anchor_dir(&staged, dir.as_deref(), prior.as_ref(), lost)?;
         let plan = Plan {
             install_id: req.install_id.clone(),
             new_chain_id: random_id().map_err(open_to_audit)?,
@@ -842,7 +856,8 @@ pub fn restore_from_source(
         live.as_ref(),
         confirm_rollback.as_ref(),
     )?;
-    check_anchor_dir(&staged, cfg.anchor_dir.as_deref()).map_err(audit_to_open)?;
+    check_anchor_dir(&staged, cfg.anchor_dir.as_deref(), prior.as_ref(), lost)
+        .map_err(audit_to_open)?;
     let plan = Plan {
         install_id: cfg.keys.install_id().to_string(),
         new_chain_id: random_id()?,

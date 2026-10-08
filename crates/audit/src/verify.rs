@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::anchor_dir::{self, AnchorDirLines, VerifyCtx};
+use crate::anchor_dir::{self, AnchorDirLines, LostSpan, VerifyCtx};
 use crate::anchors::{FirstRetainedAnchor, HeadAnchor};
 use crate::clock::parse_epoch;
 use crate::crypto::{self, Dek, Kek, ct_eq};
@@ -1416,12 +1416,54 @@ struct AnchorDirState {
     unread: bool,
 }
 
+/// The spans of superseded chains that the retained `RESTORE`s account for (see
+/// [`LostSpan`]). A `RESTORE` that does not decrypt or parse accounts for nothing (fail
+/// closed: its file's lines are then compared as usual).
+fn lost_spans(conn: &Connection, deks: &mut Deks<'_>) -> rusqlite::Result<Vec<LostSpan>> {
+    let seqs: Vec<u64> = {
+        let mut st = conn.prepare("SELECT seq FROM events WHERE event_type = 'RESTORE'")?;
+        let rows = st.query_map([], |r| Ok(u64_of(r.get_ref(0)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    let mut out = Vec::new();
+    for seq in seqs {
+        let span = with_row(conn, seq, |parsed| {
+            let Ok((f, _)) = parsed else {
+                return Ok(None);
+            };
+            let Ok(Some(p)) = deks.decrypt_json(conn, &f)? else {
+                return Ok(None);
+            };
+            let (Some(chain), Some(head), Some(lost), Ok(prior)) = (
+                p.get("source_chain_id").and_then(Value::as_str),
+                p.get("source_head_seq").and_then(Value::as_u64),
+                p.get("records_lost").and_then(Value::as_u64),
+                prior_anchor(&p),
+            ) else {
+                return Ok(None);
+            };
+            Ok(LostSpan::of(
+                chain,
+                head,
+                prior.as_ref().map(|a| (a.chain_id.as_str(), a.seq)),
+                lost,
+            ))
+        })?;
+        out.extend(span.flatten());
+    }
+    Ok(out)
+}
+
 /// The anchor-dir checks (§8.7) against the latest `prune_log` row, through the per-kind cap.
 fn check_anchor_dir(
     conn: &Connection,
     lines: Option<&AnchorDirLines>,
     log: &[PruneLogRow],
     head: Option<u64>,
+    lost: &[LostSpan],
     out: &mut Findings,
 ) -> rusqlite::Result<AnchorDirState> {
     let Some(lines) = lines else {
@@ -1435,6 +1477,7 @@ fn check_anchor_dir(
         first_retained_seq: latest_values(log).0,
         head,
         prune_log: log,
+        lost,
     };
     let found = anchor_dir::check(lines, &ctx)?;
     let state = AnchorDirState {
@@ -1522,7 +1565,11 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
     }
     // The anchor dir, when configured: a contradicting line blocks the reconciliations below,
     // a dir that cannot be read defers them (the head anchor stays capped).
-    let dir = check_anchor_dir(conn, inp.anchor_lines.as_ref(), &log, head, &mut out)?;
+    let lost = match &inp.anchor_lines {
+        Some(_) => lost_spans(conn, &mut deks)?,
+        None => Vec::new(),
+    };
+    let dir = check_anchor_dir(conn, inp.anchor_lines.as_ref(), &log, head, &lost, &mut out)?;
     // 8.–9. Anchor rule, interrupted prune and restore.
     let head_row = match head {
         Some(h) => row_head(conn, h)?,
@@ -1758,7 +1805,11 @@ fn run_full(
             );
         }
     }
-    let dir = check_anchor_dir(conn, anchor_lines, &log, head, &mut out)?;
+    let lost = match anchor_lines {
+        Some(_) => lost_spans(conn, &mut deks)?,
+        None => Vec::new(),
+    };
+    let dir = check_anchor_dir(conn, anchor_lines, &log, head, &lost, &mut out)?;
     let head_row = match head {
         Some(h) => row_head(conn, h)?,
         None => None,
@@ -1895,17 +1946,26 @@ pub(crate) fn snapshot_keyed(conn: &Connection, kek: &Kek) -> rusqlite::Result<V
 
 /// The anchor-dir checks (§8.11 step 1: "against the anchor directory's lines for that
 /// `chain_id`") of a restore source. Every finding, a dir that cannot be read included, is
-/// one: a restore is never verified against a dir it could not read.
+/// one: a restore is never verified against a dir it could not read. `rollback` is the span
+/// of the snapshot's own chain the restore being made gives up (a confirmed same-machine
+/// rollback), as its `RESTORE` will record it.
 pub(crate) fn snapshot_anchor_dir(
     conn: &Connection,
+    kek: &Kek,
     lines: Option<&AnchorDirLines>,
+    rollback: Option<LostSpan>,
 ) -> rusqlite::Result<Vec<VerifyFinding>> {
     let tx = conn.unchecked_transaction()?;
     let conn: &Connection = &tx;
     let mut out = Findings::default();
     let (_, head) = bounds(conn)?;
     let log = load_prune_log(conn, &mut Findings::default())?;
-    check_anchor_dir(conn, lines, &log, head, &mut out)?;
+    let mut lost = match lines {
+        Some(_) => lost_spans(conn, &mut Deks::new(kek))?,
+        None => Vec::new(),
+    };
+    lost.extend(rollback);
+    check_anchor_dir(conn, lines, &log, head, &lost, &mut out)?;
     drop(tx);
     Ok(out.finish())
 }
