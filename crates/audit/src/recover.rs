@@ -171,7 +171,8 @@ fn recovery_findings(found: Vec<VerifyFinding>) -> Vec<VerifyFinding> {
 /// 2. the KEK is unwrapped from the `recovery` row before any keychain call: a wrong passphrase
 ///    is `WrongPassphrase` and nothing was written, in the DB or the keychain; then the canary;
 ///    the keychain must really be lost (`Invalid` if its KEK opens the store, `Integrity` if it
-///    equals the recovered KEK); an unfinished `RESTORE` of this install is `Invalid` (its
+///    equals the recovered KEK); a keystore of another install than the store names is
+///    `Invalid`; an unfinished `RESTORE` of this install is `Invalid` (its
 ///    "Finish restore" is restore's); the recovered KEK must unwrap a data key (`Integrity`
 ///    otherwise: a swapped recovery row);
 /// 3. full verification of the chain from the first retained record, the `prune_log` and the
@@ -213,6 +214,16 @@ pub fn recover_this_log(
     let kek = recovered_kek(&ro, passphrase)?;
     canary_self_test(&*cfg.keys)?;
     check_keychain_lost(&ro, &*cfg.keys, &kek)?;
+    // The KEK is re-sealed under the keystore's install_id: it must be the store's own
+    // (§8.6; unknown only when no retained record names one).
+    if verify::store_install_id(&ro)
+        .map_err(sql)?
+        .is_some_and(|id| id != cfg.keys.install_id())
+    {
+        return Err(OpenError::Invalid(
+            "the keystore's install_id is not the store's install_id",
+        ));
+    }
     if recovery_offer(&ro, cfg.keys.install_id())? == RecoveryOffer::FinishRestore {
         return Err(OpenError::Invalid(
             "the newest record is an unfinished RESTORE: finish the restore instead",

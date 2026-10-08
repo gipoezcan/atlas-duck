@@ -505,6 +505,27 @@ fn recover_swapped_recovery_blob_is_refused() {
 }
 
 #[test]
+fn recover_refused_for_another_install_id() {
+    // A keystore of another install (a wrong pinned id) never gets this store's KEK.
+    let f = closed_store(4);
+    f.ring.wipe_install(&f.install_id);
+    let (other, _) = new_ids().expect("ids");
+    let keys = Arc::new(MemKeyStore::new(f.ring.clone(), &other));
+    let files = db_files(f.dir.path());
+    let baseline = f.ring.ops().len();
+    match recover(&f, OpenConfig::new(f.clock.clone(), keys), PASSPHRASE) {
+        Err(OpenError::Invalid(m)) => assert!(m.contains("install_id"), "{m}"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(db_files(f.dir.path()), files);
+    assert!(
+        !f.ring.ops()[baseline..]
+            .iter()
+            .any(|o| is_kek_or_anchor_set(o, &other) || is_kek_or_anchor_set(o, &f.install_id))
+    );
+}
+
+#[test]
 fn recover_keyring_not_local_reads_nothing() {
     let f = closed_store(2);
     f.ring.wipe_install(&f.install_id);
