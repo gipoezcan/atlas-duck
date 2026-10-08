@@ -4,6 +4,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
@@ -42,6 +43,9 @@ pub fn delete_appcontainer_profile(name: &str) -> io::Result<()> {
     }
 }
 
+/// Serialises profile creation inside this process.
+static OPEN_LOCK: Mutex<()> = Mutex::new(());
+
 /// The container's SID and its storage folder.
 pub(crate) struct AppContainer {
     sid: PSID,
@@ -60,6 +64,10 @@ impl AppContainer {
     /// after the first), derives its SID. Fails when profile creation is
     /// blocked (policy): there is no weaker fallback here (M8).
     pub(crate) fn open(name: &str) -> io::Result<Self> {
+        // Measured: two threads creating the profile at the same time (first
+        // start, nothing exists yet) make some `CreateAppContainerProfile`
+        // calls fail with an error other than ALREADY_EXISTS. One at a time.
+        let _guard = OPEN_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let wname = wide(OsStr::new(name));
         let mut sid: PSID = null_mut();
         // SAFETY: `wname` is NUL-terminated; zero capabilities are given as

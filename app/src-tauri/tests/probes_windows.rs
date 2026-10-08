@@ -381,80 +381,118 @@ fn assert_reported(report: &ProbeReport, probe: ProbeId, outcome: ProbeOutcome, 
     );
 }
 
-#[test]
-fn the_lpac_floor_blocks_file_spawn_memory_and_clipboard_and_names_its_gaps() {
-    // Measured on Windows 11 (build 26200), every file with both (L)PAC ACEs:
-    // the worker runs as LPAC, and
-    // - FileInProfile, OpenProcessVmRead, OpenClipboard: ERROR_ACCESS_DENIED;
-    // - SpawnProcess: ERROR_NOT_ENOUGH_QUOTA (the job's ActiveProcessLimit = 1);
-    // - ConnectLoopback, ConnectPublic: `WSAStartup` itself fails with
-    //   WSASYSCALLFAILURE (10107), so no connect is ever attempted: LPAC with
-    //   zero capabilities cannot initialise Winsock. That is no denial of the
-    //   right kind, so the probe is an Error, not Blocked;
-    // - CredRead: RPC_S_INVALID_BINDING (1702), no access check reached: Error.
-    // The floor is therefore NotMet under LPAC on this machine. This test pins
-    // exactly that, so a change in either direction is noticed; the ruling
-    // between LPAC and a plain AppContainer is the spec owner's (see the
-    // plain-AppContainer test below).
-    let spawner = spawner();
-    let report = run_probes(&spawner, None, &config_for(&worker_exe()));
-    print_report("floor (LPAC)", &report);
-    print_controls();
+/// Set locally (`ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_DEVBOX=1`) to also pin the
+/// exact verdicts measured on the development machine (Windows 11 build 26200
+/// with WithSecure). CI leaves it unset: another Windows image may differ in
+/// Winsock under LPAC, CredRead or security-software hooks.
+fn expect_devbox() -> bool {
+    std::env::var_os("ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_DEVBOX").is_some_and(|v| v == "1")
+}
 
-    assert_eq!(ProbeId::floor_probes_for_current_os(), WINDOWS_FLOOR);
-    assert_eq!(report.confinement.as_ref().and_then(|c| c.lpac), Some(true));
-    assert_reported(
-        &report,
-        ProbeId::FileInProfile,
-        ProbeOutcome::Blocked,
-        ERROR_ACCESS_DENIED,
-    );
-    assert_reported(
-        &report,
-        ProbeId::OpenProcessVmRead,
-        ProbeOutcome::Blocked,
-        ERROR_ACCESS_DENIED,
-    );
-    assert_reported(
-        &report,
-        ProbeId::OpenClipboard,
-        ProbeOutcome::Blocked,
-        ERROR_ACCESS_DENIED,
-    );
-    assert_reported(
-        &report,
-        ProbeId::SpawnProcess,
-        ProbeOutcome::Blocked,
-        ERROR_NOT_ENOUGH_QUOTA,
-    );
-    assert_reported(
-        &report,
-        ProbeId::ConnectLoopback,
-        ProbeOutcome::Error,
-        WSASYSCALLFAILURE,
-    );
-    assert_reported(
-        &report,
-        ProbeId::ConnectPublic,
-        ProbeOutcome::Error,
-        WSASYSCALLFAILURE,
-    );
-    assert_reported(
-        &report,
-        ProbeId::CredRead,
-        ProbeOutcome::Error,
-        RPC_S_INVALID_BINDING,
-    );
-    assert_eq!(
-        report.floor,
-        FloorVerdict::NotMet {
-            failed: vec![
-                ProbeId::ConnectLoopback,
-                ProbeId::ConnectPublic,
-                ProbeId::CredRead
-            ]
+/// What must hold on every Windows machine, whatever the floor verdict is: the
+/// worker started confined, every floor probe has a record, and a probe scores
+/// `Blocked` only for a real denial reported by the worker (ERROR_ACCESS_DENIED,
+/// the job's ERROR_NOT_ENOUGH_QUOTA or WSAEACCES), never for a crash, a timeout
+/// or an unexpected code. Prints the measured verdict as evidence.
+fn assert_floor_invariants(label: &str, report: &ProbeReport, lpac: bool) {
+    print_report(label, report);
+    print_controls();
+    println!(
+        "T19 {label}: verdict = {}",
+        match &report.floor {
+            FloorVerdict::Met => "Met".to_string(),
+            FloorVerdict::NotMet { failed } => format!("NotMet {failed:?}"),
         }
     );
+    assert_eq!(ProbeId::floor_probes_for_current_os(), WINDOWS_FLOOR);
+    let confinement = report.confinement.clone().expect("a probe.ready arrived");
+    assert!(confinement.applied, "{confinement:?}");
+    assert_eq!(confinement.mechanism, "appcontainer");
+    assert_eq!(confinement.lpac, Some(lpac), "{confinement:?}");
+    for probe in WINDOWS_FLOOR {
+        let (outcome, evidence) = record(report, probe);
+        if outcome == ProbeOutcome::Blocked {
+            assert!(
+                matches!(
+                    evidence,
+                    Evidence::Reported { os_error: Some(c) }
+                        if [ERROR_ACCESS_DENIED, ERROR_NOT_ENOUGH_QUOTA, WSAEACCES].contains(&c)
+                ),
+                "{probe:?} is Blocked for the wrong reason: {evidence:?}"
+            );
+        }
+    }
+    if report.floor == FloorVerdict::Met {
+        for probe in WINDOWS_FLOOR {
+            assert_eq!(record(report, probe).0, ProbeOutcome::Blocked, "{probe:?}");
+        }
+    }
+}
+
+#[test]
+fn the_lpac_floor_scores_only_real_denials_as_blocked() {
+    // Measured on the dev box (see `expect_devbox`), every file with both
+    // (L)PAC ACEs, the worker running as LPAC: FileInProfile,
+    // OpenProcessVmRead and OpenClipboard 5; SpawnProcess 1816; ConnectLoopback
+    // and ConnectPublic Error 10107 (WSAStartup fails, no connect attempted);
+    // CredRead Error 1702 (RPC_S_INVALID_BINDING). Floor NotMet.
+    let spawner = spawner();
+    let report = run_probes(&spawner, None, &config_for(&worker_exe()));
+    assert_floor_invariants("floor (LPAC)", &report, true);
+    if expect_devbox() {
+        assert_reported(
+            &report,
+            ProbeId::FileInProfile,
+            ProbeOutcome::Blocked,
+            ERROR_ACCESS_DENIED,
+        );
+        assert_reported(
+            &report,
+            ProbeId::OpenProcessVmRead,
+            ProbeOutcome::Blocked,
+            ERROR_ACCESS_DENIED,
+        );
+        assert_reported(
+            &report,
+            ProbeId::OpenClipboard,
+            ProbeOutcome::Blocked,
+            ERROR_ACCESS_DENIED,
+        );
+        assert_reported(
+            &report,
+            ProbeId::SpawnProcess,
+            ProbeOutcome::Blocked,
+            ERROR_NOT_ENOUGH_QUOTA,
+        );
+        assert_reported(
+            &report,
+            ProbeId::ConnectLoopback,
+            ProbeOutcome::Error,
+            WSASYSCALLFAILURE,
+        );
+        assert_reported(
+            &report,
+            ProbeId::ConnectPublic,
+            ProbeOutcome::Error,
+            WSASYSCALLFAILURE,
+        );
+        assert_reported(
+            &report,
+            ProbeId::CredRead,
+            ProbeOutcome::Error,
+            RPC_S_INVALID_BINDING,
+        );
+        assert_eq!(
+            report.floor,
+            FloorVerdict::NotMet {
+                failed: vec![
+                    ProbeId::ConnectLoopback,
+                    ProbeId::ConnectPublic,
+                    ProbeId::CredRead
+                ]
+            }
+        );
+    }
 }
 
 #[test]
@@ -637,7 +675,7 @@ fn a_worker_without_aces_cannot_start_and_the_floor_is_never_met() {
 }
 
 #[test]
-fn without_the_restricted_ace_the_worker_is_a_plain_appcontainer_with_one_floor_gap() {
+fn without_the_restricted_ace_the_worker_is_a_plain_appcontainer() {
     // Section 9.4: LPAC "where all needed ACEs exist". With S-1-15-2-1 alone the
     // worker is a plain AppContainer and reports lpac = false. Measured on
     // Windows 11 (build 26200): every floor probe is Blocked with the expected
@@ -653,57 +691,55 @@ fn without_the_restricted_ace_the_worker_is_a_plain_appcontainer_with_one_floor_
 
     let spawner = WindowsSpawner::new().expect("AppContainer profile");
     let report = run_probes(&spawner, None, &config_for(&copy.exe));
-    print_report("plain AppContainer", &report);
-    print_controls();
-    let confinement = report.confinement.clone().expect("a probe.ready arrived");
-    assert!(confinement.applied, "{confinement:?}");
-    assert_eq!(confinement.lpac, Some(false), "{confinement:?}");
-    assert_reported(
-        &report,
-        ProbeId::FileInProfile,
-        ProbeOutcome::Blocked,
-        ERROR_ACCESS_DENIED,
-    );
-    assert_reported(
-        &report,
-        ProbeId::OpenProcessVmRead,
-        ProbeOutcome::Blocked,
-        ERROR_ACCESS_DENIED,
-    );
-    assert_reported(
-        &report,
-        ProbeId::CredRead,
-        ProbeOutcome::Blocked,
-        ERROR_ACCESS_DENIED,
-    );
-    assert_reported(
-        &report,
-        ProbeId::OpenClipboard,
-        ProbeOutcome::Blocked,
-        ERROR_ACCESS_DENIED,
-    );
-    assert_reported(
-        &report,
-        ProbeId::SpawnProcess,
-        ProbeOutcome::Blocked,
-        ERROR_NOT_ENOUGH_QUOTA,
-    );
-    assert_reported(
-        &report,
-        ProbeId::ConnectPublic,
-        ProbeOutcome::Blocked,
-        WSAEACCES,
-    );
-    assert_eq!(
-        record(&report, ProbeId::ConnectLoopback),
-        (ProbeOutcome::Allowed, Evidence::Reported { os_error: None })
-    );
-    assert_eq!(
-        report.floor,
-        FloorVerdict::NotMet {
-            failed: vec![ProbeId::ConnectLoopback]
-        }
-    );
+    assert_floor_invariants("floor (plain AppContainer)", &report, false);
+    if expect_devbox() {
+        assert_reported(
+            &report,
+            ProbeId::FileInProfile,
+            ProbeOutcome::Blocked,
+            ERROR_ACCESS_DENIED,
+        );
+        assert_reported(
+            &report,
+            ProbeId::OpenProcessVmRead,
+            ProbeOutcome::Blocked,
+            ERROR_ACCESS_DENIED,
+        );
+        assert_reported(
+            &report,
+            ProbeId::CredRead,
+            ProbeOutcome::Blocked,
+            ERROR_ACCESS_DENIED,
+        );
+        assert_reported(
+            &report,
+            ProbeId::OpenClipboard,
+            ProbeOutcome::Blocked,
+            ERROR_ACCESS_DENIED,
+        );
+        assert_reported(
+            &report,
+            ProbeId::SpawnProcess,
+            ProbeOutcome::Blocked,
+            ERROR_NOT_ENOUGH_QUOTA,
+        );
+        assert_reported(
+            &report,
+            ProbeId::ConnectPublic,
+            ProbeOutcome::Blocked,
+            WSAEACCES,
+        );
+        assert_eq!(
+            record(&report, ProbeId::ConnectLoopback),
+            (ProbeOutcome::Allowed, Evidence::Reported { os_error: None })
+        );
+        assert_eq!(
+            report.floor,
+            FloorVerdict::NotMet {
+                failed: vec![ProbeId::ConnectLoopback]
+            }
+        );
+    }
 }
 
 fn accept_within(listener: &std::net::TcpListener, wait: Duration) -> bool {

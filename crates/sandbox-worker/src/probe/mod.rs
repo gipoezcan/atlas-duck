@@ -200,15 +200,16 @@ fn connect(probe: ProbeId, addr: &str) -> ProbeResultMsg {
     };
     #[cfg(target_os = "linux")]
     announce_attempt("socket");
-    // Windows: std asserts on `WSAStartup`, which fails under LPAC. Record the
-    // failure as evidence (an `Error`, never `Blocked`) instead of panicking.
+    // Windows: std asserts on `WSAStartup`, which can fail (measured: under
+    // LPAC). Record the failure as evidence (an `Error`, never `Blocked`, and
+    // with no claim about the cause) instead of panicking.
     #[cfg(windows)]
     if let Err(code) = windows::wsa_startup() {
         return result(
             probe,
             ProbeOutcome::Error,
             Some(code),
-            "winsock init failed under LPAC (WSAStartup), no connect attempted",
+            &format!("WSAStartup failed (code {code}), no connect attempted"),
         );
     }
     match TcpStream::connect_timeout(&sock, CONNECT_DEADLINE) {

@@ -7,6 +7,7 @@
 
 use std::ffi::{OsStr, c_void};
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
@@ -347,16 +348,21 @@ fn environment_block(local_app_data: &Path) -> io::Result<Vec<u16>> {
     if n >= buf.len() {
         return Err(io::Error::other("the Windows directory path is too long"));
     }
-    let root = String::from_utf16_lossy(&buf[..n]);
-    let mut block = Vec::new();
-    for entry in [
-        format!("{}={}", WORKER_ENV_OS_REQUIRED, local_app_data.display()),
-        format!("{}={}", WORKER_ENV_NAMES[0], root),
-        format!("{}=UTC0", WORKER_ENV_NAMES[1]),
-    ] {
-        block.extend(entry.encode_utf16());
+    // UTF-16 all the way: no lossy conversion of either path.
+    let mut block: Vec<u16> = Vec::new();
+    let mut entry = |name: &str, value: &[u16]| {
+        block.extend(name.encode_utf16());
+        block.push(u16::from(b'='));
+        block.extend_from_slice(value);
         block.push(0);
-    }
+    };
+    let lad: Vec<u16> = local_app_data.as_os_str().encode_wide().collect();
+    entry(WORKER_ENV_OS_REQUIRED, &lad);
+    entry(WORKER_ENV_NAMES[0], &buf[..n]);
+    entry(
+        WORKER_ENV_NAMES[1],
+        &"UTC0".encode_utf16().collect::<Vec<u16>>(),
+    );
     block.push(0);
     Ok(block)
 }
