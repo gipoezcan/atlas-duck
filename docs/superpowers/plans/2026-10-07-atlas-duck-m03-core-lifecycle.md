@@ -1750,6 +1750,9 @@ pub fn apply_edits(spec: &OperationSpec, agent_params: &Value, current_params: &
 - [ ] **Step 2: Implement; run** `cargo test -p atlas-duck-core --test edit --locked` → pass.
 - [ ] **Step 3: Commit** `feat(core): edit engine with immutable targets and baselines (U-30 core half)` (+ trailer).
 
+
+**Task 15 as built (2026-10-09):** `Edits { set: Map, remove: Vec<String> }` (C.7) is defined in `core::edit` (it did not exist elsewhere; `Serialize`/`Deserialize`, `Debug` prints key names only). Map params are `field_rules.fields_map_param` plus `expected` when it is a conflict baseline; `<map>.<sub>` addresses one sub-key (no further dots, non-empty), anything else with a dot, an empty key, or a map name the op lacks is `BadKey`. `remove` wins over `set` for the same key. The target/baseline check runs before `validate` and compares `current_params` with the edited params (whole `expected` map, so any `expected.*` change is `TargetParamEdit`). `executed_params` narrows only map params to the sub-keys the agent sent; `edited_keys` expands map sub-keys on both sides. **Task 22 handoff:** pass the agent's original params as `agent_params` and the entry's current candidate params as `current_params`; keys the enrichment added to `current_params` outside the agent's keys show up as `added` in `edited_keys` only if they are in the params, so Task 22 must keep enrichment output out of `params`.
+
 ---
 
 ### Task 16: `core::gate`: `GateState`, `gate_handler`, the shared `hello` check (gate tests; L46)

@@ -7,6 +7,8 @@
 /// `config.toml` loading, saving and cross-version rules (§7.7, §8.13).
 pub mod config;
 
+/// Edit engine: immutable targets and baselines, `executed_params`, `edited_keys` (§5.4 step 4).
+pub mod edit;
 /// Per-instance HTTP client construction (§7.2, V17).
 pub mod http_factory;
 /// Request lifecycle: the pure §5.1 state machine model.
