@@ -72,6 +72,8 @@ zbus-secret-service-keyring-store = { version = "=1.0.1", default-features = fal
 proptest = "=1.11.0"
 # M3 catalog tests (U-05) and core::validate: no `$ref` I/O (plan "Dependency pins").
 jsonschema = { version = "=0.58.6", default-features = false }
+# M3 preview sanitizer (§6.4).
+ammonia = "=4.2.1"
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.
