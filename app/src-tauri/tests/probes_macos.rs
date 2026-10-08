@@ -150,7 +150,9 @@ fn task_for_pid_control() -> i64 {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     stdout
         .lines()
-        .find_map(|l| l.strip_prefix("TFP_CONTROL kr="))
+        // libtest prints `test <name> ... ` before the first captured-off
+        // line of a test, so the marker is not at the start of the line.
+        .find_map(|l| l.split_once("TFP_CONTROL kr=").map(|(_, v)| v))
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or_else(|| {
             panic!(
@@ -512,6 +514,12 @@ fn the_worker_environment_is_exactly_tz() {
         .expect("EnvNames returns env_names");
     names.sort();
     println!("ENV_NAMES {names:?}");
+    // The host passes exactly `TZ`. libSystem adds `__CF_USER_TEXT_ENCODING`
+    // to every process on macOS before `main` (CI run 1: ["TZ",
+    // "__CF_USER_TEXT_ENCODING"] from a worker spawned with envp = [TZ]); it
+    // carries no host data (a locale/encoding code), so it is the only name
+    // allowed beyond `TZ`.
+    names.retain(|n| n != "__CF_USER_TEXT_ENCODING");
     assert_eq!(names, vec!["TZ".to_string()]);
 }
 
@@ -569,7 +577,8 @@ fn rlimit_as_is_not_enforced_on_this_macos_image() {
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let line = stdout
         .lines()
-        .find(|l| l.starts_with("V10 "))
+        // Not at the start of the line: libtest prefixes `test <name> ... `.
+        .find_map(|l| l.find("V10 ").map(|i| &l[i..]))
         .unwrap_or("V10 (no line)");
     println!("{line}");
     assert!(
