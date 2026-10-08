@@ -441,6 +441,7 @@ version = "0.1.0"
 name = "atlas-duck-core"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "atlas-duck-atlassian",
  "atlas-duck-audit",
  "atlas-duck-convert",

@@ -12,6 +12,7 @@ atlas-duck-convert = { path = "../convert" }
 atlas-duck-preview = { path = "../preview" }
 atlas-duck-audit = { path = "../audit" }
 atlas-duck-ipc = { path = "../ipc" }
+async-trait = { workspace = true }
 toml_edit = { workspace = true }
 jsonschema = { workspace = true }
 html-escape = { workspace = true }

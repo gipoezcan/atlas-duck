@@ -9,6 +9,8 @@ pub mod config;
 
 /// Edit engine: immutable targets and baselines, `executed_params`, `edited_keys` (§5.4 step 4).
 pub mod edit;
+/// Serving without a store: `GateState`, `gate_handler`, the shared `hello` check (§2.5, L46).
+pub mod gate;
 /// Per-instance HTTP client construction (§7.2, V17).
 pub mod http_factory;
 /// Request lifecycle: the pure §5.1 state machine model.
@@ -19,3 +21,8 @@ pub mod proxy;
 pub mod redact;
 /// Static params validation: schema, field rules, caps, move limit, `min_version` (§2.3, §5.2).
 pub mod validate;
+
+pub use gate::{
+    AttentionKind, GateHandler, GateState, MSG_FIRST_RUN, UiEvent, UiSink, gate_handler,
+    hello_check, ops_describe_local, ops_list_local,
+};
