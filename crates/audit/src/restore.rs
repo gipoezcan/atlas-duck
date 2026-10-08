@@ -14,8 +14,10 @@
 //!
 //! In order (`restore_core` steps; the plan's 12 steps with the anchor-dir check after the
 //! rollback check, which bounds it):
-//!  1. stage: bundle files checked against the manifest (`ManifestMismatch`), `VACUUM INTO`
-//!  2. the staging copy's versions (`SnapshotNewer`)
+//!  1. stage: bundle files (bounded regular files) checked against the manifest
+//!     (`ManifestMismatch`), `VACUUM INTO` from a plain read-only open of the source
+//!  2. the staging copy's versions (`SnapshotNewer`), then its schema: exactly the store schema
+//!     of its `user_version` (a `vault` table aside), `quick_check` ok (`ChainBroken`)
 //!  3. its chain and `prune_log` from the first retained record; a bundle's head must be the
 //!     manifest's (`ChainBroken`)
 //!  4. its KEK from its `recovery` row (`WrongPassphrase`), the latest `PRUNE`, the head and
@@ -26,12 +28,15 @@
 //!  6. the anchor-dir lines of the snapshot's chains (`AnchorDirMismatch`)
 //!  7. on the staging copy, one transaction: `vault` dropped, migrations, a new DEK,
 //!     `RESTORE`, `SCHEMA_MIGRATED`; vacuumed, back in WAL mode, closed with no `-wal`
-//!  8. this install's PAT entries deleted for every instance of the live and the restored
-//!     settings views (stored tokens are never restored, L53): before the commit, so no
-//!     restored store ever opens next to a token of its instance ids
-//!  9. the live store's connections closed, `archived/<name>` hard-linked to it, the staging
-//!     file renamed over `audit.db` ← the `RESTORE` commit
-//! 10. the KEK re-sealed (a failure stops a live store: the next start offers "Finish restore")
+//!  8. the live store's connections closed, `archived/<name>` hard-linked to it, the staging
+//!     file renamed over `audit.db` ← the `RESTORE` commit. Every error before the rename
+//!     leaves the live store and the keychain as they were; every error after it is
+//!     `CommittedIncomplete` (the store handle stops, the next start completes the restore)
+//!  9. this install's PAT entries deleted for every instance of the live and the restored
+//!     settings views (stored tokens are never restored, L53): before the re-seal, so no
+//!     restored store ever opens next to a token of its instance ids ("Finish restore" deletes
+//!     the restored view's again before it re-seals)
+//! 10. the KEK re-sealed
 //! 11. the writer starts over on the restored store; the restore barrier is armed with the
 //!     anchor reset (first-retained, then head, new `chain_id`), which the anchor thread
 //!     retries with backoff (§8.11 step 5: never an incident)
@@ -42,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atlas_duck_ipc::paths::LocalDataDir;
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
@@ -182,13 +187,101 @@ struct LiveHead {
     chain_id: String,
 }
 
+/// `recovery.bin` holds an 89-byte blob (F.5); anything much larger is not one this build wrote.
+const MAX_RECOVERY_FILE: u64 = 4096;
+
+/// A bundle file must be a regular file (never followed through a link to a device or another
+/// file) of at most `max` bytes.
+fn bundle_file(path: &Path, max: Option<u64>) -> Result<(), AuditError> {
+    let m = std::fs::symlink_metadata(path).map_err(|_| restore_err(RestoreError::NotABundle))?;
+    if !m.file_type().is_file() || max.is_some_and(|max| m.len() > max) {
+        return Err(restore_err(RestoreError::NotABundle));
+    }
+    Ok(())
+}
+
+/// A database error of a restore source: "not a database" is `NotABundle`, anything else (a
+/// path that cannot be opened, an I/O error) is reported as it is.
+fn source_err(e: rusqlite::Error) -> AuditError {
+    match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::NotADatabase) => restore_err(RestoreError::NotABundle),
+        _ => AuditError::Io(format!("the restore source cannot be read: {e}")),
+    }
+}
+
+/// A read-only connection to a file this module did not write, opened by its plain path (no
+/// `file:` URI, so UNC and `\\?\` paths work), with `trusted_schema` off: no function of the
+/// file's schema runs with side effects.
+fn open_untrusted(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
+    Ok(conn)
+}
+
+/// Step 1's copy: `VACUUM INTO` the staging file from a read-only connection on the source.
+/// The sidecars SQLite may create beside a WAL-mode source (`-wal`, `-shm`; a read-only
+/// connection writes no frame) are removed again, so the source dir ends as it was.
+fn copy_source(source: &Path, staging: &Path) -> Result<(), AuditError> {
+    let sides = [with_suffix(source, "-wal"), with_suffix(source, "-shm")];
+    let existed: Vec<bool> = sides.iter().map(|p| p.exists()).collect();
+    let copied = (|| {
+        let src = open_untrusted(source).map_err(source_err)?;
+        src.execute_batch(&format!("VACUUM INTO {}", sql_literal(staging)?))
+            .map_err(source_err)?;
+        src.close().map_err(|(_, e)| source_err(e))
+    })();
+    for (p, existed) in sides.iter().zip(existed) {
+        if !existed {
+            let _ = remove_if_present(p);
+        }
+    }
+    copied
+}
+
+/// The staged copy's schema must be exactly the store schema of its `user_version` (schema v1
+/// and the migrations up to it); a `vault` table and its indexes are allowed, since step 7
+/// drops them. Anything else, e.g. a trigger that swallows inserts or a view, is refused: the
+/// schema is outside the hash chain, so a crafted bundle with a valid chain could carry it.
+fn check_schema(conn: &Connection, user_version: u32, hooks: &Hooks) -> Result<(), AuditError> {
+    let broken = |m: String| restore_err(RestoreError::ChainBroken(m));
+    let ok: String = conn
+        .query_row("PRAGMA quick_check(1)", [], |r| r.get(0))
+        .map_err(sql)?;
+    if ok != "ok" {
+        return Err(broken(format!("the backup database is damaged: {ok}")));
+    }
+    let expected =
+        schema::expected_objects(user_version, &hooks.migrations()).map_err(open_to_audit)?;
+    let actual = schema::schema_objects(conn).map_err(sql)?;
+    let vault = |o: &schema::SchemaObject| {
+        (o.0 == "table" && o.1 == "vault") || (o.0 == "index" && o.2 == "vault")
+    };
+    if let Some(o) = actual.iter().find(|o| !vault(o) && !expected.contains(o)) {
+        return Err(broken(format!(
+            "the backup holds an unexpected schema object: {} {} on {}",
+            o.0, o.1, o.2
+        )));
+    }
+    if let Some(o) = expected.iter().find(|o| !actual.contains(o)) {
+        return Err(broken(format!(
+            "the backup lacks the schema object {} {}",
+            o.0, o.1
+        )));
+    }
+    Ok(())
+}
+
 /// Steps 1–4. Writes nothing but the staging file, which every error path deletes.
 fn stage(
     data_dir: &Path,
     source: &Path,
     passphrase: &SecretString,
-    schema_head: u32,
+    hooks: &Hooks,
 ) -> Result<Staged, AuditError> {
+    let schema_head = hooks.schema_head();
     // 1. The source: a bundle's files must be the manifest's.
     let (snapshot, manifest) = if source.is_dir() {
         let m = Manifest::read(source).map_err(restore_err)?;
@@ -198,6 +291,8 @@ fn stage(
             }));
         }
         let snapshot = source.join(SNAPSHOT_FILE);
+        bundle_file(&snapshot, None)?;
+        bundle_file(&source.join(RECOVERY_FILE), Some(MAX_RECOVERY_FILE))?;
         let matches =
             |file: &Path, want: &[u8; 32]| file_sha256(file).is_ok_and(|h| ct_eq(&h, want));
         if !matches(&snapshot, &m.snapshot_sha256)
@@ -207,6 +302,7 @@ fn stage(
         }
         (snapshot, Some(m))
     } else if source.is_file() {
+        bundle_file(source, None)?;
         (source.to_path_buf(), None)
     } else {
         return Err(restore_err(RestoreError::NotABundle));
@@ -215,24 +311,18 @@ fn stage(
         path: data_dir.join(RESTORING_DB_FILE),
     };
     remove_db_files(&staging.path).map_err(io_err)?;
-    {
-        // Read-only and sidecar-free when the source has no WAL (a bundle never has one); an
-        // archived store's WAL is read with it.
-        let not_a_db = |_| restore_err(RestoreError::NotABundle);
-        let src = schema::open_peek(&snapshot).map_err(not_a_db)?;
-        src.execute_batch(&format!("VACUUM INTO {}", sql_literal(&staging.path)?))
-            .map_err(|e| match e.sqlite_error_code() {
-                Some(rusqlite::ErrorCode::NotADatabase) => restore_err(RestoreError::NotABundle),
-                _ => sql(e),
-            })?;
-    }
+    // An archived store's WAL is read with it; a bundle never has one.
+    copy_source(&snapshot, &staging.path)?;
     // 2. Versions (§8.13): a snapshot of a newer build is refused before anything else.
     let versions = schema::read_versions(&staging.path).map_err(open_to_audit)?;
     if let Err(found) = schema::gate_up_to(&versions, schema_head) {
         return Err(restore_err(RestoreError::SnapshotNewer { found }));
     }
+    // The copy's schema is the store schema, nothing more (a crafted bundle's triggers, views
+    // or tables never reach the live store).
+    let conn = open_untrusted(&staging.path).map_err(sql)?;
+    check_schema(&conn, versions.user_version, hooks)?;
     // 3. The chain, plaintext only.
-    let conn = schema::open_peek(&staging.path).map_err(open_to_audit)?;
     let findings = verify::snapshot_chain(&conn).map_err(sql)?;
     if !findings.is_empty() {
         return Err(restore_err(RestoreError::ChainBroken(summary(&findings))));
@@ -371,7 +461,7 @@ fn check_anchor_dir(
     prior: Option<&HeadAnchor>,
     records_lost: u64,
 ) -> Result<(), AuditError> {
-    let conn = schema::open_peek(&staged.staging.path).map_err(open_to_audit)?;
+    let conn = open_untrusted(&staged.staging.path).map_err(sql)?;
     let lines: Option<AnchorDirLines> = anchor_dir::load(dir, &conn).map_err(open_to_audit)?;
     let rollback = LostSpan::of(
         &staged.chain_id,
@@ -492,70 +582,11 @@ fn delete_pats(keys: &dyn KeyStore, ids: &BTreeSet<String>) -> Result<Vec<String
     Ok(ids.iter().cloned().collect())
 }
 
-/// Step 9, every connection to `audit.db` closed: the replaced store becomes
-/// `archived/<name>` (a hard link, so `audit.db` stays the live store until the rename), then
-/// the staging file is renamed over `audit.db` (atomic) ← the `RESTORE` commit. A WAL that
-/// still holds frames refuses (renaming it with the store is not atomic, and it must never
-/// meet the restored file). Before the rename every error leaves the live store as it was.
-fn commit_swap(
-    data_dir: &Path,
-    staging: &Path,
-    replaced: Option<&ArchivedDb>,
-) -> Result<(), AuditError> {
-    let db = data_dir.join(DB_FILE);
-    let wal = with_suffix(&db, "-wal");
-    let mut linked: Option<PathBuf> = None;
-    match replaced {
-        Some(r) => {
-            if file_len(&wal).map_err(io_err)?.is_some_and(|n| n > 0) {
-                return Err(AuditError::Io(
-                    "the live store's write-ahead log is not empty (is it still open?)".into(),
-                ));
-            }
-            remove_if_present(&wal).map_err(io_err)?;
-            remove_if_present(&with_suffix(&db, "-shm")).map_err(io_err)?;
-            let dir = data_dir.join(ARCHIVE_DIR);
-            std::fs::create_dir_all(&dir).map_err(io_err)?;
-            let target = data_dir.join(&r.file);
-            for p in [
-                &target,
-                &with_suffix(&target, "-wal"),
-                &with_suffix(&target, "-shm"),
-            ] {
-                if p.try_exists().map_err(io_err)? {
-                    return Err(AuditError::Io(format!("{} already exists", r.file)));
-                }
-            }
-            std::fs::hard_link(&db, &target).map_err(io_err)?;
-            linked = Some(target);
-            if let Err(e) = sync_dir(&dir) {
-                let _ = linked.as_deref().map(std::fs::remove_file);
-                return Err(io_err(e));
-            }
-        }
-        None => {
-            if db.try_exists().map_err(io_err)? || wal.try_exists().map_err(io_err)? {
-                return Err(AuditError::Io(
-                    "audit.db appeared during the restore".into(),
-                ));
-            }
-        }
-    }
-    if let Err(e) = std::fs::rename(staging, &db) {
-        if let Some(t) = &linked {
-            let _ = std::fs::remove_file(t);
-        }
-        return Err(io_err(e));
-    }
-    // From here on the restored store is the store; a failed dir sync is not undone.
-    sync_dir(data_dir).map_err(io_err)
-}
-
 /// A fault point of the `testing` hooks (a simulated crash); `Ok` in release builds.
 macro_rules! crash {
     ($hooks:expr, $point:ident) => {{
         #[cfg(any(test, feature = "testing"))]
-        let r = $hooks.fault(crate::testing::FaultPoint::$point);
+        let r = ($hooks).fault(crate::testing::FaultPoint::$point);
         #[cfg(not(any(test, feature = "testing")))]
         let r: Result<(), AuditError> = {
             let _ = &$hooks;
@@ -563,6 +594,82 @@ macro_rules! crash {
         };
         r
     }};
+}
+
+/// Why the commit did not go through: `Before` the rename nothing was replaced (the live store
+/// is as it was); `After` it `audit.db` is the restored store, which must never be treated as
+/// the old one.
+enum SwapError {
+    Before(AuditError),
+    After(AuditError),
+}
+
+/// Step 9, every connection to `audit.db` closed: the replaced store becomes
+/// `archived/<name>` (a hard link, so `audit.db` stays the live store until the rename), then
+/// the staging file is renamed over `audit.db` (atomic) ← the `RESTORE` commit. A WAL that
+/// still holds frames refuses (renaming it with the store is not atomic, and it must never
+/// meet the restored file). A crash between the link and the rename leaves `archived/<name>`
+/// as a second name of the live file (harmless, never deleted; it changes with the live store
+/// until the next restore replaces `audit.db`).
+fn commit_swap(
+    data_dir: &Path,
+    staging: &Path,
+    replaced: Option<&ArchivedDb>,
+    hooks: &Hooks,
+) -> Result<(), SwapError> {
+    let db = data_dir.join(DB_FILE);
+    let wal = with_suffix(&db, "-wal");
+    let before = |e: io::Error| SwapError::Before(io_err(e));
+    let mut linked: Option<PathBuf> = None;
+    match replaced {
+        Some(r) => {
+            if file_len(&wal).map_err(before)?.is_some_and(|n| n > 0) {
+                return Err(SwapError::Before(AuditError::Io(
+                    "the live store's write-ahead log is not empty (is it still open?)".into(),
+                )));
+            }
+            remove_if_present(&wal).map_err(before)?;
+            remove_if_present(&with_suffix(&db, "-shm")).map_err(before)?;
+            let dir = data_dir.join(ARCHIVE_DIR);
+            std::fs::create_dir_all(&dir).map_err(before)?;
+            let target = data_dir.join(&r.file);
+            for p in [
+                &target,
+                &with_suffix(&target, "-wal"),
+                &with_suffix(&target, "-shm"),
+            ] {
+                if p.try_exists().map_err(before)? {
+                    return Err(SwapError::Before(AuditError::Io(format!(
+                        "{} already exists",
+                        r.file
+                    ))));
+                }
+            }
+            std::fs::hard_link(&db, &target).map_err(before)?;
+            linked = Some(target);
+            if let Err(e) = sync_dir(&dir) {
+                let _ = linked.as_deref().map(std::fs::remove_file);
+                return Err(before(e));
+            }
+        }
+        None => {
+            if db.try_exists().map_err(before)? || wal.try_exists().map_err(before)? {
+                return Err(SwapError::Before(AuditError::Io(
+                    "audit.db appeared during the restore".into(),
+                )));
+            }
+        }
+    }
+    if let Err(e) = std::fs::rename(staging, &db) {
+        if let Some(t) = &linked {
+            let _ = std::fs::remove_file(t);
+        }
+        return Err(before(e));
+    }
+    // Committed: whatever fails from here on, `audit.db` is the restored store.
+    crash!(hooks, CommitDirSync)
+        .and_then(|()| sync_dir(data_dir).map_err(io_err))
+        .map_err(SwapError::After)
 }
 
 /// The anchors the reset writes for the restored store (§8.11 step 5).
@@ -579,6 +686,17 @@ fn reset_for(staged: &Staged, plan: &Plan, written: &Written) -> RestoreReset {
             first_retained_seq: staged.first_retained.0,
             first_retained_prev_hash: staged.first_retained.1,
         },
+    }
+}
+
+/// A step after the commit failed (I-3): the restore is committed, not undone.
+fn committed(restore_seq: u64, e: AuditError) -> AuditError {
+    match e {
+        AuditError::Restore(RestoreError::CommittedIncomplete { .. }) => e,
+        other => restore_err(RestoreError::CommittedIncomplete {
+            restore_seq,
+            reason: other.to_string(),
+        }),
     }
 }
 
@@ -660,12 +778,7 @@ impl Writer {
     /// simulated crash or a failed KEK re-seal stops the writer (the next start completes the
     /// restore); a failed anchor reset is retried in the background.
     pub(crate) fn restore_run(&mut self, req: RestoreRequest) -> Result<RestoreReport, AuditError> {
-        let staged = stage(
-            &req.data_dir,
-            &req.source,
-            &req.passphrase,
-            self.st.hooks.schema_head(),
-        )?;
+        let staged = stage(&req.data_dir, &req.source, &req.passphrase, &self.st.hooks)?;
         let shared = self.st.shared.clone();
         // The keychain names the live head where it can (best effort), so the rollback check
         // counts what the store holds; then the anchor thread is held still while the anchor
@@ -704,50 +817,69 @@ impl Writer {
         let written = write_staging(&staged, &plan, self.st.clock.clone(), &self.st.hooks)?;
         let mut ids: BTreeSet<String> = self.st.settings.instances.keys().cloned().collect();
         ids.extend(written.instances.iter().cloned());
-        let pats = delete_pats(&*req.keys, &ids)?;
 
         // The commit: no connection to `audit.db` may stay open (the reader is held closed).
         let db = req.data_dir.join(DB_FILE);
+        let hooks = self.st.hooks.clone();
         let mut reader = lock(&shared.reader);
         *reader = None;
-        let swapped = self.close_live().and_then(|()| {
+        let swapped = self.close_live().map_err(SwapError::Before).and_then(|()| {
             commit_swap(
                 &req.data_dir,
                 &staged.staging.path,
                 plan.replaced_db.as_ref(),
+                &hooks,
             )
         });
-        if let Err(e) = swapped {
-            // Nothing was replaced: the writer goes on with the live store.
-            if self.reopen_live(&db).is_err() {
+        let restore_seq = written.restore.seq;
+        match swapped {
+            Ok(()) => held.keep(),
+            Err(SwapError::Before(e)) => {
+                // Nothing was replaced: the writer goes on with the live store.
+                if self.reopen_live(&db).is_err() {
+                    self.st.crashed = true;
+                }
+                return Err(e);
+            }
+            Err(SwapError::After(e)) => {
+                // Committed: the writer must not go on with the replaced store's state.
+                held.keep();
                 self.st.crashed = true;
+                return Err(committed(restore_seq, e));
             }
-            return Err(e);
         }
-        held.keep();
-        let after_commit = |w: &mut Writer, r: Result<(), AuditError>| {
-            if r.is_err() {
-                w.st.crashed = true;
-            }
-            r
+        // After the commit every failure stops the writer; the next start completes it.
+        let finish = |w: &mut Writer| -> Result<Vec<String>, AuditError> {
+            crash!(&hooks, AfterRestoreCommit)?;
+            // Tokens go before the KEK: until it is re-sealed the store does not open, and
+            // "Finish restore" deletes the restored view's tokens before it re-seals.
+            let pats = delete_pats(&*req.keys, &ids)?;
+            req.keys
+                .set(&EntryName::Kek, &staged.kek.to_entry_bytes())
+                .map_err(AuditError::KeyStore)?;
+            crash!(&hooks, AfterKekReseal)?;
+            w.reopen_on(&db, staged.kek.clone(), Some(staged.genesis_hash))
+                .map_err(open_to_audit)?;
+            Ok(pats)
         };
-        let hooks = self.st.hooks.clone();
-        after_commit(self, crash!(&hooks, AfterRestoreCommit))?;
-        let sealed = req
-            .keys
-            .set(&EntryName::Kek, &staged.kek.to_entry_bytes())
-            .map_err(AuditError::KeyStore);
-        after_commit(self, sealed)?;
-        after_commit(self, crash!(&hooks, AfterKekReseal))?;
-        let reopened = self
-            .reopen_on(&db, staged.kek.clone(), Some(staged.genesis_hash))
-            .map_err(open_to_audit);
-        after_commit(self, reopened)?;
+        let pats = match finish(self) {
+            Ok(p) => p,
+            Err(e) => {
+                self.st.crashed = true;
+                return Err(committed(restore_seq, e));
+            }
+        };
         drop(reader);
         let reset = reset_for(&staged, &plan, &written);
         shared.anchors.publish_head(reset.head.clone());
-        let rx = shared.anchors.arm_restore_reset(restore_seq, reset)?;
-        let _ = shared.anchors.wait_reset(rx);
+        let armed = shared
+            .anchors
+            .arm_restore_reset(restore_seq, reset)
+            .map(|rx| shared.anchors.wait_reset(rx));
+        if let Err(e) = armed {
+            self.st.crashed = true;
+            return Err(committed(restore_seq, e));
+        }
         drop(held);
         Ok(report(&staged, plan, &written, pats))
     }
@@ -808,10 +940,10 @@ fn checkpoint_closed(db: &Path) -> Result<(), OpenError> {
 /// under `cfg.keys`' install, which the restored store keeps (`RESTORE.install_id`). Returns the
 /// running store (anchor writes enabled, the reset armed) and the report.
 ///
-/// Errors before the commit leave the data dir and the keychain as they were (but deleted PAT
-/// entries): `Restore(..)` for the source, `KeyStore` for the keychain, `Invalid` for a lock of
-/// another data dir. After the commit, an `Err` means the restore must be completed by the
-/// next start (`open`: interrupted restore, or "Finish restore").
+/// Errors before the commit leave the data dir and the keychain as they were: `Restore(..)` for
+/// the source, `KeyStore` for the keychain, `Invalid` for a lock of another data dir. After the
+/// commit every error is `Restore(CommittedIncomplete { .. })`: the restore must be completed
+/// by the next start (`open`: interrupted restore, or "Finish restore").
 pub fn restore_from_source(
     data: &LocalDataDir,
     lock: &InstanceLock,
@@ -841,13 +973,8 @@ pub fn restore_from_source(
         None
     };
     require_local(&*cfg.keys)?;
-    let staged = stage(
-        data.path(),
-        source.path(),
-        passphrase,
-        cfg.hooks.schema_head(),
-    )
-    .map_err(audit_to_open)?;
+    let staged =
+        stage(data.path(), source.path(), passphrase, &cfg.hooks).map_err(audit_to_open)?;
     canary_self_test(&*cfg.keys)?;
     let prior = read_prior(&*cfg.keys).map_err(audit_to_open)?;
     let lost = records_lost(
@@ -875,21 +1002,34 @@ pub fn restore_from_source(
     if live.is_some() {
         ids.extend(live_instances(&db, &*cfg.keys));
     }
-    let pats = delete_pats(&*cfg.keys, &ids).map_err(audit_to_open)?;
     if live.is_some() {
         checkpoint_closed(&db)?;
     }
-    commit_swap(data.path(), &staged.staging.path, plan.replaced_db.as_ref())
-        .map_err(audit_to_open)?;
-    crash!(&cfg.hooks, AfterRestoreCommit).map_err(audit_to_open)?;
+    let restore_seq = written.restore.seq;
+    match commit_swap(
+        data.path(),
+        &staged.staging.path,
+        plan.replaced_db.as_ref(),
+        &cfg.hooks,
+    ) {
+        Ok(()) => {}
+        Err(SwapError::Before(e)) => return Err(audit_to_open(e)),
+        Err(SwapError::After(e)) => return Err(audit_to_open(committed(restore_seq, e))),
+    }
+    // After the commit every failure is `CommittedIncomplete`; the next start completes it.
+    let incomplete = |e: AuditError| audit_to_open(committed(restore_seq, e));
+    crash!(&cfg.hooks, AfterRestoreCommit).map_err(incomplete)?;
+    let pats = delete_pats(&*cfg.keys, &ids).map_err(incomplete)?;
     cfg.keys
-        .set(&EntryName::Kek, &staged.kek.to_entry_bytes())?;
-    crash!(&cfg.hooks, AfterKekReseal).map_err(audit_to_open)?;
-    let store = start_existing(data, cfg, staged.kek.clone(), Some(staged.genesis_hash))?;
+        .set(&EntryName::Kek, &staged.kek.to_entry_bytes())
+        .map_err(|e| incomplete(AuditError::KeyStore(e)))?;
+    crash!(&cfg.hooks, AfterKekReseal).map_err(incomplete)?;
+    let store = start_existing(data, cfg, staged.kek.clone(), Some(staged.genesis_hash))
+        .map_err(|e| incomplete(open_to_audit(e)))?;
     let reset = reset_for(&staged, &plan, &written);
-    if let Err(e) = store.start_restore_reset(written.restore.seq, reset) {
+    if let Err(e) = store.start_restore_reset(restore_seq, reset) {
         store.shutdown();
-        return Err(audit_err(e));
+        return Err(incomplete(e));
     }
     // Advisory (§8.13): the restore itself is complete, its report must reach the caller.
     let _ = store.update_written_by();
@@ -991,6 +1131,11 @@ pub fn finish_restore(
             },
         ));
     };
+    // The restored view's tokens go before the KEK (a restore that crashed right after its
+    // commit had not deleted them yet; deleting an absent entry is fine).
+    for id in view.instances.keys() {
+        cfg.keys.delete(&EntryName::Pat(id.clone()))?;
+    }
     // Re-seal first: a VERIFY appended before a failed re-seal would make the newest record
     // not the RESTORE, and the next start would offer "Recover this log" instead.
     cfg.keys.set(&EntryName::Kek, &kek.to_entry_bytes())?;

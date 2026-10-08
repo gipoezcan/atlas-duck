@@ -244,6 +244,36 @@ pub(crate) fn pending_steps(
     Ok(steps)
 }
 
+/// One `sqlite_master` object: `(type, name, tbl_name, sql)`.
+pub(crate) type SchemaObject = (String, String, String, Option<String>);
+
+/// Every `sqlite_master` object of the database on `conn`.
+pub(crate) fn schema_objects(conn: &Connection) -> rusqlite::Result<Vec<SchemaObject>> {
+    let mut st = conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+    rows.collect()
+}
+
+/// The `sqlite_master` objects a store of `user_version` has: schema v1 as `create_v1` makes
+/// it, then each migration step up to `user_version`, built on an in-memory database.
+pub(crate) fn expected_objects(
+    user_version: u32,
+    migrations: &[Migration],
+) -> Result<Vec<SchemaObject>, OpenError> {
+    let mut mem = Connection::open_in_memory().map_err(sqlite)?;
+    mem.execute_batch(TABLES_V1).map_err(sqlite)?;
+    let steps: Vec<Migration> = pending_steps(SCHEMA_HEAD, migrations)?
+        .into_iter()
+        .filter(|m| m.to <= user_version)
+        .collect();
+    let tx = mem.transaction().map_err(sqlite)?;
+    for m in &steps {
+        (m.apply)(&tx).map_err(sqlite)?;
+    }
+    tx.commit().map_err(sqlite)?;
+    schema_objects(&mem).map_err(sqlite)
+}
+
 /// What a read-only peek at a store reports for the version gate (§8.13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreVersions {
@@ -256,10 +286,27 @@ pub struct StoreVersions {
 fn uri_for(path: &Path) -> Result<String, OpenError> {
     let p = path
         .to_str()
-        .ok_or_else(|| OpenError::Io(std::io::Error::other("database path is not UTF-8")))?
-        .replace('\\', "/");
+        .ok_or_else(|| OpenError::Io(std::io::Error::other("database path is not UTF-8")))?;
+    Ok(uri_for_text(p))
+}
+
+/// The `file:` URI of a path (RFC 8089 as SQLite reads it): Windows `\\?\` prefixes dropped,
+/// `\` turned into `/`, a UNC path `\\server\share\…` written `file:////server/share/…`
+/// (an empty authority; SQLite refuses any authority but `localhost`), every byte outside the
+/// unreserved set percent-encoded.
+fn uri_for_text(raw: &str) -> String {
+    let p = if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.to_string()
+    }
+    .replace('\\', "/");
     let mut out = String::from("file:");
-    if !p.starts_with('/') {
+    if p.starts_with("//") {
+        out.push_str("//");
+    } else if !p.starts_with('/') {
         out.push('/');
     }
     for b in p.bytes() {
@@ -271,7 +318,7 @@ fn uri_for(path: &Path) -> Result<String, OpenError> {
         }
     }
     out.push_str("?mode=ro&immutable=1");
-    Ok(out)
+    out
 }
 
 fn versions_from(conn: &Connection) -> Result<StoreVersions, OpenError> {
@@ -371,4 +418,45 @@ pub(crate) fn gate_up_to(v: &StoreVersions, head: u32) -> Result<(), String> {
         return Err(format!("recovery layout {l}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod uri_tests {
+    use super::uri_for_text;
+
+    #[test]
+    fn drive_path() {
+        assert_eq!(
+            uri_for_text(r"C:\data dir\audit.db"),
+            "file:/C:/data%20dir/audit.db?mode=ro&immutable=1"
+        );
+    }
+
+    #[test]
+    fn unc_path_has_an_empty_authority() {
+        assert_eq!(
+            uri_for_text(r"\\server\share\b\audit.db"),
+            "file:////server/share/b/audit.db?mode=ro&immutable=1"
+        );
+    }
+
+    #[test]
+    fn extended_length_paths() {
+        assert_eq!(
+            uri_for_text(r"\\?\C:\d\audit.db"),
+            "file:/C:/d/audit.db?mode=ro&immutable=1"
+        );
+        assert_eq!(
+            uri_for_text(r"\\?\UNC\server\share\audit.db"),
+            "file:////server/share/audit.db?mode=ro&immutable=1"
+        );
+    }
+
+    #[test]
+    fn unix_path_and_reserved_bytes() {
+        assert_eq!(
+            uri_for_text("/tmp/it's #1?.db"),
+            "file:/tmp/it%27s%20%231%3F.db?mode=ro&immutable=1"
+        );
+    }
 }

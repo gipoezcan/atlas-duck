@@ -7,13 +7,25 @@ use crate::keystore::KeyStoreError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RestoreError {
-    SnapshotNewer { found: String },
+    SnapshotNewer {
+        found: String,
+    },
     NotABundle,
     ManifestMismatch,
     ChainBroken(String),
     WrongPassphrase,
-    RollbackNeedsConfirmation { records_lost: u64 },
+    RollbackNeedsConfirmation {
+        records_lost: u64,
+    },
     AnchorDirMismatch(String),
+    /// The restore committed (`audit.db` is the restored store, ending with its `RESTORE` at
+    /// `restore_seq`) but a later step did not complete; the store handle is stopped. The next
+    /// start completes it: `open` (interrupted restore) or "Finish restore". Every other
+    /// restore error means nothing was committed.
+    CommittedIncomplete {
+        restore_seq: u64,
+        reason: String,
+    },
 }
 
 impl fmt::Display for RestoreError {
@@ -35,6 +47,14 @@ impl fmt::Display for RestoreError {
                 )
             }
             RestoreError::AnchorDirMismatch(m) => write!(f, "anchor directory mismatch: {m}"),
+            RestoreError::CommittedIncomplete {
+                restore_seq,
+                reason,
+            } => write!(
+                f,
+                "the restore committed (RESTORE at seq {restore_seq}) but did not complete \
+                 ({reason}); restart to finish it"
+            ),
         }
     }
 }

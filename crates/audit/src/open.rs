@@ -325,25 +325,38 @@ fn text(v: ValueRef<'_>) -> Option<String> {
     }
 }
 
-/// `FinishRestore` iff the newest record is a `RESTORE` naming this install in its plaintext
-/// `target` (§8.7 interrupted restore before the KEK re-seal).
+/// `FinishRestore` iff the newest records are a `RESTORE` naming this install in its plaintext
+/// `target`, followed by nothing but its own `SCHEMA_MIGRATED` rows (L50: a restore of an
+/// older snapshot appends them after the `RESTORE` in the same transaction) — §8.7 interrupted
+/// restore before the KEK re-seal.
 pub(crate) fn recovery_offer(
     conn: &Connection,
     install_id: &str,
 ) -> Result<RecoveryOffer, OpenError> {
-    let newest: Option<(Option<String>, Option<String>)> = conn
+    let latest: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT event_type, target FROM events ORDER BY seq DESC LIMIT 1",
+            "SELECT seq, target FROM events WHERE event_type = 'RESTORE' \
+             ORDER BY seq DESC LIMIT 1",
             [],
-            |r| Ok((text(r.get_ref(0)?), text(r.get_ref(1)?))),
+            |r| Ok((r.get(0)?, text(r.get_ref(1)?))),
         )
         .optional()
         .map_err(sql)?;
-    Ok(match newest {
-        Some((Some(t), Some(target))) if t == "RESTORE" && target == install_id => {
-            RecoveryOffer::FinishRestore
-        }
-        _ => RecoveryOffer::RecoverThisLog,
+    let Some((seq, Some(target))) = latest else {
+        return Ok(RecoveryOffer::RecoverThisLog);
+    };
+    let others_after: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM events WHERE seq > ?1 \
+             AND event_type IS NOT 'SCHEMA_MIGRATED'",
+            [seq],
+            |r| r.get(0),
+        )
+        .map_err(sql)?;
+    Ok(if others_after == 0 && target == install_id {
+        RecoveryOffer::FinishRestore
+    } else {
+        RecoveryOffer::RecoverThisLog
     })
 }
 

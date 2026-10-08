@@ -1012,11 +1012,16 @@ impl Store {
     /// (`RollbackNeedsConfirmation { records_lost }` otherwise, nothing changed). The §10.3
     /// "restore backup" confirmation is the caller's.
     ///
-    /// `Err` before the commit: nothing changed but deleted PAT entries (`Restore(..)` for the
-    /// source, `KeyStore`, `Io`). A failed KEK re-seal after the commit stops the store
-    /// (`KeyStore`); the next start offers "Finish restore". A failed anchor reset is not an
-    /// error (retried, shown in `health()`). The config file must be reconciled again
-    /// (`reconcile_config_file`) before prune runs on the restored store.
+    /// `Err(Restore(CommittedIncomplete { restore_seq, .. }))`: the restore committed but a
+    /// later step (PAT deletion, KEK re-seal, the writer's start over) failed; this handle is
+    /// stopped (`Closed`) and the next start completes the restore (`open`, or "Finish
+    /// restore" when the KEK was not re-sealed). Every other `Err` means nothing changed
+    /// (`Restore(..)` for the source, `KeyStore`, `Io`), so a retry is safe. A failed anchor
+    /// reset is not an error (retried, shown in `health()`). The confirmation is not bound to
+    /// a count: the caller shows `records_lost` from `RollbackNeedsConfirmation` and the
+    /// `RESTORE` records the count at the commit, which can be higher if records were appended
+    /// in between. The config file must be reconciled again (`reconcile_config_file`) before
+    /// prune runs on the restored store.
     pub fn restore(
         &self,
         source: RustChosenPath,

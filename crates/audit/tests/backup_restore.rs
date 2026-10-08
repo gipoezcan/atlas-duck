@@ -821,10 +821,10 @@ fn u16_cross_machine_restore_crash_between_reseal_and_anchor_reset() {
     let (b_seq, b_hash, b_chain) = b.head();
     let b_anchor = keychain_head(&fb.ring, &fb.install_id).expect("head anchor");
     faults.fail(FaultPoint::AfterKekReseal, 1);
-    assert!(
-        b.restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
-            .is_err()
-    );
+    let e = b
+        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .expect_err("crash");
+    assert_eq!(committed_incomplete(&e), Some(bundle.head_seq + 1), "{e:?}");
     drop(b);
     // The crash: A's KEK sealed, the anchors still B's.
     assert_eq!(
@@ -1734,4 +1734,341 @@ fn full_verify_that_raced_a_restore_appends_nothing() {
     let (findings, generation) = b.testing_full_verify_run().expect("run");
     b.testing_full_verify_append(&findings, generation)
         .expect("append");
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 1
+
+fn committed_incomplete(e: &AuditError) -> Option<u64> {
+    match e {
+        AuditError::Restore(RestoreError::CommittedIncomplete { restore_seq, .. }) => {
+            Some(*restore_seq)
+        }
+        _ => None,
+    }
+}
+
+/// I-1/I-3: a failure after the commit rename is a committed restore that did not complete:
+/// the writer stops (it never goes on with the replaced store's state on the restored file),
+/// and the next start finishes it.
+#[test]
+fn failure_after_the_commit_rename_is_committed_incomplete() {
+    let (a, fa) = machine_a();
+    let a_kek = raw_entry(&fa.ring, &fa.install_id, "kek").expect("kek");
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, fb) = machine_b(9, &faults);
+    faults.fail(FaultPoint::CommitDirSync, 1);
+    let e = b
+        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .expect_err("dir sync fails");
+    assert_eq!(committed_incomplete(&e), Some(bundle.head_seq + 1), "{e:?}");
+    // The handle does not go on: no append lands anywhere.
+    assert_eq!(
+        b.append(ev(EventType::APP_START, None, json!({}))),
+        Err(AuditError::Closed)
+    );
+    drop(b);
+    // audit.db is the restored store; the next start finishes it.
+    let (seq, _, chain) = file_head(&fb.db_path());
+    assert_eq!(seq, bundle.head_seq + 1);
+    assert_ne!(chain, fa.chain_id);
+    match open(&fb.data, &fb.lock, fb.config()).expect("open") {
+        StartupOutcome::Locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::FinishRestore,
+        }) => {}
+        other => panic!("expected FinishRestore, got {other:?}"),
+    }
+    let (s, v) =
+        finish_restore(&fb.data, &fb.lock, fb.config(), &pass(PASSPHRASE)).expect("finish");
+    assert_eq!(
+        kinds(&v.findings),
+        vec![FindingKind::InterruptedRestoreReconciled]
+    );
+    assert_eq!(
+        raw_entry(&fb.ring, &fb.install_id, "kek").as_deref(),
+        Some(a_kek.as_slice())
+    );
+    assert_eq!(s.full_verify(), vec![]);
+}
+
+#[test]
+fn restore_from_source_reports_a_committed_restore() {
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let fb = fixture(fake_clock(START), MemKeyring::new());
+    let faults = Faults::new();
+    let mut cfg = fb.config();
+    cfg.hooks.faults = Some(faults.clone());
+    faults.fail(FaultPoint::AfterKekReseal, 1);
+    match restore_on(&fb, cfg, &bundle.bundle_dir, PASSPHRASE) {
+        Err(OpenError::Restore(RestoreError::CommittedIncomplete { restore_seq, .. })) => {
+            assert_eq!(restore_seq, bundle.head_seq + 1)
+        }
+        other => panic!("expected CommittedIncomplete, got {other:?}"),
+    }
+    // Refused before the commit: nothing changed, and the error says nothing was committed.
+    let fc = fixture(fake_clock(START), MemKeyring::new());
+    match restore_on(&fc, fc.config(), &bundle.bundle_dir, "a wrong passphrase") {
+        Err(OpenError::Restore(RestoreError::WrongPassphrase)) => {}
+        other => panic!("expected WrongPassphrase, got {other:?}"),
+    }
+}
+
+/// Adds `sql` to a bundle's snapshot and fixes the manifest hash (an attacker can).
+fn craft_snapshot(bundle: &Path, sql: &str) {
+    let snapshot = bundle.join("audit.db");
+    Connection::open(&snapshot)
+        .expect("snapshot")
+        .execute_batch(sql)
+        .expect("craft");
+    let mut m = read_manifest(bundle);
+    m["snapshot_sha256"] = json!(hex::encode(sha(&std::fs::read(&snapshot).expect("read"))));
+    write_manifest(bundle, &m);
+}
+
+/// I-2: a crafted snapshot's schema objects never become part of the live store.
+#[test]
+fn crafted_schema_objects_are_refused() {
+    let crafted = [
+        (
+            "drop_requests",
+            "CREATE TRIGGER drop_requests BEFORE INSERT ON events \
+             BEGIN SELECT RAISE(IGNORE); END;",
+        ),
+        (
+            "flood",
+            "CREATE TRIGGER flood AFTER INSERT ON keys BEGIN DELETE FROM keys; END;",
+        ),
+        (
+            "events_view",
+            "CREATE VIEW events_view AS SELECT seq FROM events;",
+        ),
+        ("extra", "CREATE TABLE extra (x);"),
+        (
+            "events_extra",
+            "CREATE INDEX events_extra ON events(agent_name);",
+        ),
+        (
+            "vault",
+            "CREATE VIEW vault AS SELECT 1 AS instance_id, x'00' AS ct;",
+        ),
+    ];
+    for (name, sql) in crafted {
+        let (a, _fa) = store_with(5);
+        let out = tempfile::tempdir().expect("out dir");
+        let bundle = backup_into(&a, out.path());
+        craft_snapshot(&bundle.bundle_dir, sql);
+        let fc = fixture(fake_clock(START), MemKeyring::new());
+        match restore_on(&fc, fc.config(), &bundle.bundle_dir, PASSPHRASE) {
+            Err(OpenError::Restore(RestoreError::ChainBroken(m))) => {
+                assert!(m.contains(name), "{name}: {m}")
+            }
+            other => panic!("{name}: expected ChainBroken, got {other:?}"),
+        }
+        assert!(!fc.db_path().exists());
+        assert!(!fc.dir.path().join("audit.db.restoring").exists());
+        assert!(fc.ring.ops().is_empty(), "{name}: no keychain access");
+    }
+    // A vault table (and its index) is what restore drops itself.
+    let (a, _fa) = store_with(5);
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    craft_snapshot(
+        &bundle.bundle_dir,
+        "CREATE TABLE vault (instance_id TEXT, ct BLOB); \
+         CREATE INDEX vault_i ON vault(instance_id);",
+    );
+    let fc = fixture(fake_clock(START), MemKeyring::new());
+    let (s, _) = restore_on(&fc, fc.config(), &bundle.bundle_dir, PASSPHRASE).expect("restore");
+    s.shutdown();
+    assert!(!tables(&ro(&fc.db_path())).contains("vault"));
+}
+
+/// I-2, defence in depth: the writer checks that each record really was stored.
+#[test]
+fn an_insert_that_stores_nothing_fails_the_append() {
+    let (a, fa) = store_with(3);
+    let head = a.head();
+    raw_conn(&fa)
+        .execute_batch(
+            "CREATE TRIGGER swallow BEFORE INSERT ON events BEGIN SELECT RAISE(IGNORE); END;",
+        )
+        .expect("trigger");
+    match a.append(ev(EventType::APP_START, None, json!({}))) {
+        Err(AuditError::AppendFailed(_)) => {}
+        other => panic!("expected AppendFailed, got {other:?}"),
+    }
+    assert_eq!(a.head(), head);
+}
+
+/// I-4: a restore that migrated an older snapshot ends with `SCHEMA_MIGRATED` after its
+/// `RESTORE` (L50); a crash before the re-seal still offers "Finish restore".
+#[test]
+fn migrated_restore_crash_before_reseal_offers_finish_restore() {
+    let src = tempfile::tempdir().expect("source dir");
+    let old = src.path().join("old.db");
+    std::fs::copy(schema_fixture(), &old).expect("copy fixture");
+    let (old_head, _, _) = file_head(&old);
+    let fb = fixture(fake_clock("2026-10-09T08:00:00.000Z"), MemKeyring::new());
+    let faults = Faults::new();
+    let mut cfg = fb.config();
+    with_migration(&mut cfg);
+    cfg.hooks.faults = Some(faults.clone());
+    faults.fail(FaultPoint::AfterRestoreCommit, 1);
+    assert!(restore_on(&fb, cfg, &old, PASSPHRASE).is_err());
+    let rows = dump_rows(&fb);
+    assert_eq!(
+        rows.last().map(|r| (r.seq, r.event_type.clone())),
+        Some((old_head + 2, "SCHEMA_MIGRATED".to_string()))
+    );
+    let mut cfg = fb.config();
+    with_migration(&mut cfg);
+    match open(&fb.data, &fb.lock, cfg).expect("open") {
+        StartupOutcome::Locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::FinishRestore,
+        }) => {}
+        other => panic!("expected FinishRestore, got {other:?}"),
+    }
+    let mut cfg = fb.config();
+    with_migration(&mut cfg);
+    let (s, v) = finish_restore(&fb.data, &fb.lock, cfg, &pass(PASSPHRASE)).expect("finish");
+    assert_eq!(
+        kinds(&v.findings),
+        vec![FindingKind::InterruptedRestoreReconciled]
+    );
+    assert_eq!(s.full_verify(), vec![]);
+}
+
+/// I-5: the source is opened as a plain read-only file: a path that is no valid URI path
+/// works, and nothing is created beside the source.
+#[test]
+fn restore_from_a_path_with_unusual_characters() {
+    let (a, _fa) = machine_a();
+    let parent = tempfile::tempdir().expect("out dir");
+    let out = parent.path().join("it's #1 %20 ü dir");
+    std::fs::create_dir(&out).expect("odd dir");
+    let bundle = backup_into(&a, &out);
+    let before = files_in(&bundle.bundle_dir);
+    let fb = fixture(fake_clock(START), MemKeyring::new());
+    let (s, _) = restore_on(&fb, fb.config(), &bundle.bundle_dir, PASSPHRASE).expect("restore");
+    assert_eq!(s.full_verify(), vec![]);
+    assert_eq!(
+        files_in(&bundle.bundle_dir),
+        before,
+        "no sidecar beside the source"
+    );
+
+    // An archived store (WAL mode, no -wal) is read without leaving sidecars either.
+    let (x, fx) = store_with(5);
+    x.shutdown();
+    let archived = archive_and_start_fresh(&fx.data, &fx.lock, confirmed()).expect("archive");
+    let archived_dir = fx.dir.path().join("archived");
+    let before = files_in(&archived_dir);
+    let fc = fixture(fake_clock(START), MemKeyring::new());
+    restore_on(
+        &fc,
+        fc.config(),
+        &fx.dir.path().join(&archived.file),
+        PASSPHRASE,
+    )
+    .expect("restore");
+    assert_eq!(files_in(&archived_dir), before);
+}
+
+/// M-6: bundle files are bounded regular files.
+#[test]
+fn oversized_recovery_file_is_refused() {
+    let (a, _fa) = store_with(3);
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let rec = bundle.bundle_dir.join("recovery.bin");
+    let big = vec![1u8; 1 << 20];
+    std::fs::write(&rec, &big).expect("write");
+    let mut m = read_manifest(&bundle.bundle_dir);
+    m["recovery_sha256"] = json!(hex::encode(sha(&big)));
+    write_manifest(&bundle.bundle_dir, &m);
+    let fc = fixture(fake_clock(START), MemKeyring::new());
+    match restore_on(&fc, fc.config(), &bundle.bundle_dir, PASSPHRASE) {
+        Err(OpenError::Restore(RestoreError::NotABundle)) => {}
+        other => panic!("expected NotABundle, got {other:?}"),
+    }
+    assert!(!fc.db_path().exists());
+}
+
+/// M-2: the PAT entries go only once the restore has committed; "Finish restore" deletes those
+/// of the restored view before it re-seals the KEK.
+#[test]
+fn pats_are_deleted_after_the_commit_and_by_finish_restore() {
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, fb) = machine_b(4, &faults);
+    for id in ["i1", "i2"] {
+        fb.keys()
+            .set(&EntryName::Pat(id.into()), b"token")
+            .expect("pat");
+    }
+    // Refused before the commit: every token is still there.
+    match b.restore(
+        chosen(&bundle.bundle_dir),
+        &pass("not the right passphrase"),
+        None,
+    ) {
+        Err(AuditError::Restore(RestoreError::WrongPassphrase)) => {}
+        other => panic!("expected WrongPassphrase, got {other:?}"),
+    }
+    for id in ["i1", "i2", "i3"] {
+        assert!(raw_entry(&fb.ring, &fb.install_id, &format!("pat/{id}")).is_some());
+    }
+    // A crash right after the commit: the tokens are still there, but the store does not
+    // open without "Finish restore", which deletes the restored view's tokens first.
+    faults.fail(FaultPoint::AfterRestoreCommit, 1);
+    let e = b
+        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .expect_err("crash");
+    assert!(committed_incomplete(&e).is_some(), "{e:?}");
+    drop(b);
+    let (_s, _v) =
+        finish_restore(&fb.data, &fb.lock, fb.config(), &pass(PASSPHRASE)).expect("finish");
+    for id in ["i1", "i2"] {
+        assert_eq!(
+            raw_entry(&fb.ring, &fb.install_id, &format!("pat/{id}")),
+            None
+        );
+    }
+}
+
+/// M-2 on Windows: a reader holding `audit.db` open makes the commit rename fail; that is
+/// refused before the commit, so the tokens and the live store are untouched.
+#[cfg(windows)]
+#[test]
+fn rename_refused_by_an_open_reader_changes_nothing() {
+    let (a, _fa) = machine_a();
+    let out = tempfile::tempdir().expect("out dir");
+    let bundle = backup_into(&a, out.path());
+    let faults = Faults::new();
+    let (b, fb) = machine_b(4, &faults);
+    let reader = ro(&fb.db_path());
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+        .expect("read");
+    let head = b.head();
+    let e = b
+        .restore(chosen(&bundle.bundle_dir), &pass(PASSPHRASE), None)
+        .expect_err("rename refused");
+    assert_eq!(committed_incomplete(&e), None, "{e:?}");
+    drop(reader);
+    assert!(raw_entry(&fb.ring, &fb.install_id, "pat/i3").is_some());
+    assert_eq!(b.head(), head);
+    b.append(ev(EventType::APP_START, None, json!({})))
+        .expect("still serving the live store");
+    assert_eq!(b.head().2, head.2);
+    let stray = std::fs::read_dir(fb.dir.path().join("archived"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(stray, 0, "no stray archive link");
 }

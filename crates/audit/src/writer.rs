@@ -508,39 +508,45 @@ fn insert_row(
 ) -> Result<(), AuditError> {
     let peer_pid = f.peer_pid.map(int).transpose()?;
     let mut st = tx.prepare_cached(insert_sql()).map_err(sql)?;
-    st.execute(rusqlite::params![
-        int(f.seq)?,
-        int(f.format_version)?,
-        f.chain_id,
-        f.ts_utc,
-        f.epoch,
-        f.request_id,
-        f.event_type,
-        f.op_id,
-        f.op_class,
-        f.instance_id,
-        f.target,
-        f.agent_name,
-        f.agent_name_source,
-        f.client_kind,
-        f.connection_id,
-        peer_pid,
-        f.peer_exe,
-        f.peer_origin_exe,
-        f.os_user,
-        f.atlassian_user,
-        f.atlassian_user_key,
-        f.decision,
-        int(f.flags)?,
-        int(f.payload_len)?,
-        &f.payload_sha256[..],
-        int(f.key_id)?,
-        &f.nonce[..],
-        f.payload_ct,
-        &f.prev_hash[..],
-        &record_hash[..],
-    ])
-    .map_err(sql)?;
+    let n = st
+        .execute(rusqlite::params![
+            int(f.seq)?,
+            int(f.format_version)?,
+            f.chain_id,
+            f.ts_utc,
+            f.epoch,
+            f.request_id,
+            f.event_type,
+            f.op_id,
+            f.op_class,
+            f.instance_id,
+            f.target,
+            f.agent_name,
+            f.agent_name_source,
+            f.client_kind,
+            f.connection_id,
+            peer_pid,
+            f.peer_exe,
+            f.peer_origin_exe,
+            f.os_user,
+            f.atlassian_user,
+            f.atlassian_user_key,
+            f.decision,
+            int(f.flags)?,
+            int(f.payload_len)?,
+            &f.payload_sha256[..],
+            int(f.key_id)?,
+            &f.nonce[..],
+            f.payload_ct,
+            &f.prev_hash[..],
+            &record_hash[..],
+        ])
+        .map_err(sql)?;
+    // A schema object that swallows the insert (a crafted trigger) must never let the head move
+    // past a record that is not there.
+    if n != 1 {
+        return Err(AuditError::AppendFailed("the record was not stored".into()));
+    }
     Ok(())
 }
 
