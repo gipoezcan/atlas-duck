@@ -1097,15 +1097,18 @@ pub fn restore_from_source(
 /// (`Integrity`); the canary; a keychain KEK that already opens the store is `Invalid` (`open`
 /// completes that restore); the startup verification must reconcile the interrupted restore
 /// (`Integrity` otherwise, also while the anchor dir cannot be read: finish once it can). Then
-/// the KEK is re-sealed, the writer starts, pending migrations run, `VERIFY {result:
-/// interrupted_restore_reconciled}` is appended and the anchor reset armed (as `open` does).
-/// The PAT entries were deleted before the restore committed.
+/// the restored view's PAT entries are deleted, the KEK is re-sealed, the writer starts,
+/// pending migrations run, `VERIFY {result: interrupted_restore_reconciled}` is appended and
+/// the anchor reset armed (as `open` does). Returns the running store, the verification and
+/// the instance ids whose `pat/<id>` entries were deleted (absent entries included; the
+/// restore may have deleted them before it stopped): M3 logs `INSTANCE_STATE_CHANGED
+/// {needs_token}` for each (PD-28).
 pub fn finish_restore(
     data: &LocalDataDir,
     lock: &InstanceLock,
     cfg: OpenConfig,
     passphrase: &SecretString,
-) -> Result<(Store, VerifyOutcome), OpenError> {
+) -> Result<(Store, VerifyOutcome, Vec<String>), OpenError> {
     if lock.path().parent() != Some(data.path()) {
         return Err(OpenError::Invalid("instance.lock of another data dir"));
     }
@@ -1180,8 +1183,11 @@ pub fn finish_restore(
         ));
     };
     // The restored view's tokens go before the KEK (a restore that crashed right after its
-    // commit had not deleted them yet; deleting an absent entry is fine).
-    for id in view.instances.keys() {
+    // commit had not deleted them yet; deleting an absent entry is fine). `FinishRestore`
+    // means nothing but `SCHEMA_MIGRATED` follows the `RESTORE`, so no token entered after a
+    // completed restore is among them.
+    let pats_deleted: Vec<String> = view.instances.keys().cloned().collect();
+    for id in &pats_deleted {
         cfg.keys.delete(&EntryName::Pat(id.clone()))?;
     }
     // Re-seal first: a VERIFY appended before a failed re-seal would make the newest record
@@ -1195,7 +1201,7 @@ pub fn finish_restore(
         Ok(verify)
     };
     match finish() {
-        Ok(verify) => Ok((store, verify)),
+        Ok(verify) => Ok((store, verify, pats_deleted)),
         Err(e) => {
             store.shutdown();
             Err(e)

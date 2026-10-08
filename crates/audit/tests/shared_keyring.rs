@@ -122,7 +122,7 @@ impl Install {
 
     fn open_ready(&self) -> Store {
         match open(&self.data, &self.lock, config(&self.ks, &self.id)).expect("open") {
-            StartupOutcome::Ready { store, verify } => {
+            StartupOutcome::Ready { store, verify, .. } => {
                 assert!(verify.findings.is_empty(), "{:?}", verify.findings);
                 assert!(store.open_incidents().is_empty(), "VERIFY incident");
                 store

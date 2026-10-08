@@ -300,6 +300,10 @@ pub enum StartupOutcome {
     Locked(LockedReason),                                          // keychain_unavailable | keychain_lost | keyring_not_local (`passphrase` is v1.1, L39)
     StoreNewer { found: String },
 }
+// [as built in M2, final review I-1/I-3] `Ready` also carries `pats_deleted: Vec<String>` (tokens an interrupted restore's startup
+// completion deleted); `new_ids()` is fallible; KeyStore gains `install_id()`/`locality()`, KeyStoreError gains `Corrupt`; the full
+// as-built error/outcome list (AuditError, OpenError, RestoreError, StoreHealth, PruneSkip, restore/recover entry points) is M2 plan F.12;
+// everything is re-exported at the `atlas_duck_audit` crate root.
 pub fn create_new_store(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, input: FirstRunInput) -> Result<Store, OpenError>;  // wizard 1b: install_id, chain_id, recovery passphrase (confirmed), GENESIS
 
 #[derive(Clone)] pub struct Store { /* single writer thread inside */ }

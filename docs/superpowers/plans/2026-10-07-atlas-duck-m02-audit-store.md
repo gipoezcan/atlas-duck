@@ -436,7 +436,9 @@ Backup `manifest.json` (written last, JCS, **Plan decision (spec silent)**): `{"
 ```rust
 pub enum LockedReason { KeychainUnavailable, KeychainLost { offer: RecoveryOffer }, KeyringNotLocal }  // §4.3 strings: keychain_unavailable | keychain_lost | keyring_not_local
 pub enum RecoveryOffer { RecoverThisLog, FinishRestore }                                              // which credential-window purpose M6 shows
-pub enum StartupOutcome { Ready { store: Store, verify: VerifyOutcome }, FirstRun, Locked(LockedReason), StoreNewer { found: String } }  // C.3
+pub enum StartupOutcome { Ready { store: Store, verify: VerifyOutcome, pats_deleted: Vec<String> }, FirstRun, Locked(LockedReason), StoreNewer { found: String } }
+    // C.3 + pats_deleted (final review I-1): the tokens an unfinished restore's completion deleted at this start (only while its RESTORE
+    // is still the newest record but for SCHEMA_MIGRATED, so a deferred/failing reset never deletes re-entered tokens on later starts)
 pub fn new_ids() -> Result<(String /* install_id */, String /* chain_id */), OpenError>;   // Err only if the OS random source fails
 pub enum OpenError { Io(std::io::Error), Sqlite(String), MigrationFailed { from: u32, to: u32, message: String }, AlreadyExists,
                      NewerStore(String) /* version gate inside restore/finish/recover */, NotFirstRun, PassphraseTooShort, PassphraseMismatch,
@@ -465,7 +467,7 @@ impl Store {   // beyond C.3
 }
 pub fn restore_from_source(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, source: RustChosenPath, passphrase: &SecretString,
                            confirm_rollback: Option<Confirmed>) -> Result<(Store, RestoreReport), OpenError>;
-pub fn finish_restore(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, passphrase: &SecretString) -> Result<(Store, VerifyOutcome), OpenError>;
+pub fn finish_restore(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, passphrase: &SecretString) -> Result<(Store, VerifyOutcome, Vec<String> /* pats_deleted */), OpenError>;
 pub fn recover_this_log(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, passphrase: &SecretString) -> Result<(Store, RecoverReport), OpenError>;
 pub fn archive_and_start_fresh(data: &LocalDataDir, lock: &InstanceLock, confirmed: Confirmed) -> Result<ArchivedDb, OpenError>;
 pub struct Confirmed { pub dialog_text_sha256: [u8; 32] }   // built by core after NativeConfirmer::confirm == Ok (M3); recorded in CONFIG_CHANGED
@@ -1846,7 +1848,7 @@ pub struct RestoreReport { pub restore_seq: u64, pub new_chain_id: String, pub s
                            pub replaced_db: Option<ArchivedDb>, pub records_lost: u64, pub pats_lost: bool, pub pats_deleted: Vec<String> }
 pub fn restore_from_source(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, source: RustChosenPath, passphrase: &SecretString,
                            confirm_rollback: Option<Confirmed>) -> Result<(Store, RestoreReport), OpenError>;   // no live Store: new machine (FirstRun) or a locked live DB
-pub fn finish_restore(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, passphrase: &SecretString) -> Result<(Store, VerifyOutcome), OpenError>;  // RecoveryOffer::FinishRestore
+pub fn finish_restore(data: &LocalDataDir, lock: &InstanceLock, cfg: OpenConfig, passphrase: &SecretString) -> Result<(Store, VerifyOutcome, Vec<String> /* pats_deleted */), OpenError>;  // RecoveryOffer::FinishRestore
 ```
 `RustChosenPath` for restore is either a bundle directory (contains `manifest.json`) or a single DB file (an `archived/` DB); for backup it is the directory in which the bundle directory is created.
 
@@ -2042,7 +2044,7 @@ exec dbus-run-session -- bash -euo pipefail -c '
 
 ## Handoff to later milestones (what M2 leaves for M3/M4/M6/M10)
 
-- **M3 (`Core::start`)**: call `store.reconcile_config_file(&file_policy)` first (prune stays blocked until then), then `reconcile_after_crash()`, then append `APP_START` (payload per §8.3, `target` = `store.install_id()`); feed every successful, parsed, TLS-verified Atlassian response's `Date` into `observe_server_date`; put `store.query_tag(..)` in `NewEvent.target` for `jira.search`/`confluence.search`; after a restore or recovery, log `INSTANCE_STATE_CHANGED {needs_token}` for `RestoreReport.pats_deleted`/`RecoverReport.pats_deleted`; build `Confirmed` only from `NativeConfirmer::confirm == Ok`; payload integers stay within ±(2^53 − 1) (`ipc::jcs`); `WRITE_APPROVED.requests` uses the F.8 JSON shape; `params_sha256` uses `ipc::jcs::to_jcs_vec`.
+- **M3 (`Core::start`)**: call `store.reconcile_config_file(&file_policy)` first (prune stays blocked until then), then `reconcile_after_crash()`, then append `APP_START` (payload per §8.3, `target` = `store.install_id()`); feed every successful, parsed, TLS-verified Atlassian response's `Date` into `observe_server_date`; put `store.query_tag(..)` in `NewEvent.target` for `jira.search`/`confluence.search`; after a restore or recovery, log `INSTANCE_STATE_CHANGED {needs_token}` for `RestoreReport.pats_deleted`/`RecoverReport.pats_deleted` and also for `StartupOutcome::Ready.pats_deleted` and the third element of `finish_restore`'s result (an interrupted restore completed at startup, final review I-1); build `Confirmed` only from `NativeConfirmer::confirm == Ok`; payload integers stay within ±(2^53 − 1) (`ipc::jcs`); `WRITE_APPROVED.requests` uses the F.8 JSON shape; `params_sha256` uses `ipc::jcs::to_jcs_vec`.
 - **M4**: the app's startup loop retries `open` on `Locked(KeychainUnavailable)` with `keychain_retry_schedule()`; `LockedReason::as_str()` gives the `details.reason`; `doctor` `keyring_local` uses `OsKeyStore::new(id).locality()`.
 - **M6**: wizard (1a) uses `read_store_install_id`; (1b) `new_ids()` → passphrase → `create_new_store`; credential window purposes from `RecoveryOffer`; Settings/tray read `Store::health()` (anchor failures, prune backlog) and offer "Prune backlog now" → `prune(Some(confirmed))`; `verify_now` → `try_full_verify()` (T09): its `Err` (store closed, keychain not answering, DB unreadable) is shown as "verification did not complete", never as a pass; the C.3 `full_verify()` `Vec` API has no error channel and reports the same non-completion as a `ChainBroken` finding whose `detail` starts "verification did not complete".
 - **M6 (T15)**: a store whose KEK opens it but whose first-retained or head anchor entry is missing (deleted by a user, a crashed keychain write outside recovery) gets `AnchorMissing` at every start until the next prune, and neither recovery (refused: the KEK opens the store) nor open repairs it: M6 adds an explicit, confirmed "re-anchor" action that logs its own incident `VERIFY` and rewrites both anchors from the verified DB. A crash between the two archive renames leaves `audit.db-wal` without `audit.db` (refused by `open`/`create_new_store`, nothing lost): M6's message for that error points at `archived/` and the manual repair (move the WAL next to the archived `.db` as `<name>.db-wal`). After `archive_and_start_fresh` the wizard calls `new_ids()` (the old install's entries are kept as evidence for the archived DB; a "forget install" cleanup is M6's) and may log the archive confirmation's `dialog_text_sha256` once the new store exists.

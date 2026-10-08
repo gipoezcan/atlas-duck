@@ -391,9 +391,25 @@ fn db_files(dir: &Path) -> Vec<Option<Vec<u8>>> {
 
 fn ready(o: StartupOutcome) -> (Store, VerifyOutcome) {
     match o {
-        StartupOutcome::Ready { store, verify } => (store, verify),
+        StartupOutcome::Ready { store, verify, .. } => (store, verify),
         other => panic!("expected Ready, got {other:?}"),
     }
+}
+
+/// `ready` plus the instance ids whose tokens the start deleted.
+fn ready_pats(o: StartupOutcome) -> (Store, VerifyOutcome, Vec<String>) {
+    match o {
+        StartupOutcome::Ready {
+            store,
+            verify,
+            pats_deleted,
+        } => (store, verify, pats_deleted),
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
+
+fn restored_instances() -> Vec<String> {
+    INSTANCES.map(String::from).to_vec()
 }
 
 fn kinds(f: &[VerifyFinding]) -> Vec<FindingKind> {
@@ -992,7 +1008,7 @@ fn finish_restore_after_crash_before_reseal() {
     assert_eq!(db_files(fb.dir.path()), files);
     assert_eq!(writes_since(&fb.ring, baseline), Vec::<String>::new());
 
-    let (s, v) =
+    let (s, v, _) =
         finish_restore(&fb.data, &fb.lock, fb.config(), &pass(PASSPHRASE)).expect("finish");
     assert_eq!(
         kinds(&v.findings),
@@ -1484,25 +1500,37 @@ fn interrupted_restore_reconciles_after_a_session_whose_completion_failed() {
         KeyStoreError::Unavailable,
         u32::MAX,
     );
-    let (s, v) = ready(open(&fb.data, &fb.lock, fb.config()).expect("open"));
+    let (s, v, deleted) = ready_pats(open(&fb.data, &fb.lock, fb.config()).expect("open"));
     assert_eq!(
         kinds(&v.findings),
         vec![FindingKind::InterruptedRestoreReconciled]
     );
+    // The `RESTORE` was the newest record: its view's tokens are (again) deleted and reported.
+    assert_eq!(deleted, restored_instances());
     assert!(s.health().anchor_write_failing);
     assert_eq!(s.health().anchors_blocked, Some(BarrierKind::Restore));
-    // M3 appends APP_START and the session goes on.
+    // M3 appends APP_START, the user enters a token again, and the session goes on.
     s.append(ev(EventType::APP_START, None, json!({})))
         .expect("append");
+    fb.keys()
+        .set(&EntryName::Pat("i1".into()), b"entered again")
+        .expect("pat");
     s.append_batch(mixed(3)).expect("append_batch");
     s.shutdown();
     assert_eq!(keychain_head(&fb.ring, &fb.install_id), Some(b_anchor));
 
+    // Still unfinished at the next start, but records follow the `RESTORE`: the token entered
+    // since is kept and nothing is reported.
     fb.ring.clear_faults();
-    let (s, v) = ready(open(&fb.data, &fb.lock, fb.config()).expect("open"));
+    let (s, v, deleted) = ready_pats(open(&fb.data, &fb.lock, fb.config()).expect("open"));
     assert_eq!(
         kinds(&v.findings),
         vec![FindingKind::InterruptedRestoreReconciled]
+    );
+    assert_eq!(deleted, Vec::<String>::new());
+    assert_eq!(
+        raw_entry(&fb.ring, &fb.install_id, "pat/i1").as_deref(),
+        Some(b"entered again".as_slice())
     );
     assert_eq!(incident_rows_after(&fb, 0), Vec::<u64>::new());
     assert_eq!(
@@ -1531,7 +1559,7 @@ fn deferred_restore_reconciles_at_a_later_start() {
     let anchor_dir = fb.dir.path().join("anchors");
     let mut cfg = fb.config();
     cfg.anchor_dir = Some(anchor_dir.clone());
-    let (s, v) = ready(open(&fb.data, &fb.lock, cfg).expect("open"));
+    let (s, v, deleted) = ready_pats(open(&fb.data, &fb.lock, cfg).expect("open"));
     let found = kinds(&v.findings);
     assert!(
         !found.contains(&FindingKind::InterruptedRestoreReconciled),
@@ -1539,22 +1567,40 @@ fn deferred_restore_reconciles_at_a_later_start() {
     );
     assert!(found.contains(&FindingKind::AnchorDirMismatch), "{found:?}");
     assert_eq!(s.health().anchors_blocked, Some(BarrierKind::Restore));
-    let before = incident_rows_after(&fb, 0);
+    assert_eq!(deleted, restored_instances());
     s.append(ev(EventType::APP_START, None, json!({})))
         .expect("append");
+    fb.keys()
+        .set(&EntryName::Pat("i2".into()), b"entered again")
+        .expect("pat");
     s.flush_head_anchor().expect("nothing to write");
     s.shutdown();
     assert_eq!(keychain_head(&fb.ring, &fb.install_id), Some(b_anchor));
 
-    // Readable again: reconciled at the next start, without a new incident.
+    // Still offline: deferred again, and the token entered in the last session is kept.
+    let mut cfg = fb.config();
+    cfg.anchor_dir = Some(anchor_dir.clone());
+    let (s, v, deleted) = ready_pats(open(&fb.data, &fb.lock, cfg).expect("open"));
+    assert!(kinds(&v.findings).contains(&FindingKind::AnchorDirMismatch));
+    assert_eq!(s.health().anchors_blocked, Some(BarrierKind::Restore));
+    assert_eq!(deleted, Vec::<String>::new());
+    assert!(raw_entry(&fb.ring, &fb.install_id, "pat/i2").is_some());
+    let before = incident_rows_after(&fb, 0);
+    s.append(ev(EventType::APP_START, None, json!({})))
+        .expect("append");
+    s.shutdown();
+
+    // Readable again: reconciled at the next start, without a new incident or deletion.
     std::fs::create_dir(&anchor_dir).expect("anchor dir");
     let mut cfg = fb.config();
     cfg.anchor_dir = Some(anchor_dir);
-    let (s, v) = ready(open(&fb.data, &fb.lock, cfg).expect("open"));
+    let (s, v, deleted) = ready_pats(open(&fb.data, &fb.lock, cfg).expect("open"));
     assert_eq!(
         kinds(&v.findings),
         vec![FindingKind::InterruptedRestoreReconciled]
     );
+    assert_eq!(deleted, Vec::<String>::new());
+    assert!(raw_entry(&fb.ring, &fb.install_id, "pat/i2").is_some());
     assert_eq!(incident_rows_after(&fb, 0), before);
     assert_eq!(
         keychain_head(&fb.ring, &fb.install_id).map(|a| a.chain_id),
@@ -1780,7 +1826,7 @@ fn failure_after_the_commit_rename_is_committed_incomplete() {
         }) => {}
         other => panic!("expected FinishRestore, got {other:?}"),
     }
-    let (s, v) =
+    let (s, v, _) =
         finish_restore(&fb.data, &fb.lock, fb.config(), &pass(PASSPHRASE)).expect("finish");
     assert_eq!(
         kinds(&v.findings),
@@ -1934,7 +1980,7 @@ fn migrated_restore_crash_before_reseal_offers_finish_restore() {
     }
     let mut cfg = fb.config();
     with_migration(&mut cfg);
-    let (s, v) = finish_restore(&fb.data, &fb.lock, cfg, &pass(PASSPHRASE)).expect("finish");
+    let (s, v, _) = finish_restore(&fb.data, &fb.lock, cfg, &pass(PASSPHRASE)).expect("finish");
     assert_eq!(
         kinds(&v.findings),
         vec![FindingKind::InterruptedRestoreReconciled]
@@ -2032,8 +2078,10 @@ fn pats_are_deleted_after_the_commit_and_by_finish_restore() {
         .expect_err("crash");
     assert!(committed_incomplete(&e).is_some(), "{e:?}");
     drop(b);
-    let (_s, _v) =
+    let (_s, _v, deleted) =
         finish_restore(&fb.data, &fb.lock, fb.config(), &pass(PASSPHRASE)).expect("finish");
+    // Reported for M3's `INSTANCE_STATE_CHANGED {needs_token}` (PD-28).
+    assert_eq!(deleted, INSTANCES.map(String::from).to_vec());
     for id in ["i1", "i2"] {
         assert_eq!(
             raw_entry(&fb.ring, &fb.install_id, &format!("pat/{id}")),
@@ -2133,12 +2181,13 @@ fn same_kek_restore_stopped_before_its_pat_deletion_opens_without_tokens() {
     }
     assert_eq!(dump_rows(&fa).len(), rows_before);
 
-    let (s, v) = ready(open(&fa.data, &fa.lock, fa.config()).expect("open"));
+    let (s, v, deleted) = ready_pats(open(&fa.data, &fa.lock, fa.config()).expect("open"));
     assert_eq!(
         kinds(&v.findings),
         vec![FindingKind::InterruptedRestoreReconciled]
     );
     assert_eq!(raw_entry(&fa.ring, &fa.install_id, "pat/i1"), None);
+    assert_eq!(deleted, vec!["i1".to_string()]);
     assert_eq!(s.full_verify(), vec![]);
 }
 

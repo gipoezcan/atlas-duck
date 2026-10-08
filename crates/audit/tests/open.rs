@@ -52,9 +52,17 @@ fn open_cfg(f: &Fixture, cfg: OpenConfig) -> StartupOutcome {
     open(&f.data, &f.lock, cfg).expect("open")
 }
 
+/// No start in this file completes a restore, so none deletes a token.
 fn ready(o: StartupOutcome) -> (Store, VerifyOutcome) {
     match o {
-        StartupOutcome::Ready { store, verify } => (store, verify),
+        StartupOutcome::Ready {
+            store,
+            verify,
+            pats_deleted,
+        } => {
+            assert_eq!(pats_deleted, Vec::<String>::new());
+            (store, verify)
+        }
         other => panic!("expected Ready, got {other:?}"),
     }
 }

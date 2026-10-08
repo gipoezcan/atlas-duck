@@ -482,7 +482,7 @@ fn startup_compares_anchor_dir() {
     set_keychain_head(&f, &head);
 
     let (store, verify) = match open(&f.data, &f.lock, f.config()).expect("open") {
-        StartupOutcome::Ready { store, verify } => (store, verify),
+        StartupOutcome::Ready { store, verify, .. } => (store, verify),
         other => panic!("not ready: {other:?}"),
     };
     assert!(
@@ -742,7 +742,7 @@ fn keychain_anchor(f: &Fixture, entry: &str) -> Option<Vec<u8>> {
 
 fn open_ready(f: &Fixture) -> (Store, Vec<VerifyFinding>) {
     match open(&f.data, &f.lock, f.config()).expect("open") {
-        StartupOutcome::Ready { store, verify } => (store, verify.findings),
+        StartupOutcome::Ready { store, verify, .. } => (store, verify.findings),
         other => panic!("not ready: {other:?}"),
     }
 }

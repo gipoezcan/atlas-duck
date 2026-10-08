@@ -73,9 +73,14 @@ pub enum RecoveryOffer {
 #[derive(Debug)]
 pub enum StartupOutcome {
     /// Verified and serving; `verify` is the startup verification (its `VERIFY` row, if any).
+    /// `pats_deleted`: the instance ids whose `pat/<id>` entries this start deleted because it
+    /// completed (or deferred) an unfinished restore whose `RESTORE` is still the newest record
+    /// (L53); every one needs its token again, and M3 logs `INSTANCE_STATE_CHANGED
+    /// {needs_token}` for each (PD-28). Empty on every other start.
     Ready {
         store: Store,
         verify: VerifyOutcome,
+        pats_deleted: Vec<String>,
     },
     /// No `audit.db` in the data dir (§2.5).
     FirstRun,
@@ -325,14 +330,17 @@ fn text(v: ValueRef<'_>) -> Option<String> {
     }
 }
 
-/// `FinishRestore` iff the newest records are a `RESTORE` naming this install in its plaintext
-/// `target`, followed by nothing but its own `SCHEMA_MIGRATED` rows (L50: a restore of an
-/// older snapshot appends them after the `RESTORE` in the same transaction) — §8.7 interrupted
-/// restore before the KEK re-seal.
-pub(crate) fn recovery_offer(
-    conn: &Connection,
-    install_id: &str,
-) -> Result<RecoveryOffer, OpenError> {
+/// The latest `RESTORE` record, as far as an unfinished restore needs it.
+pub(crate) struct LatestRestore {
+    /// Its plaintext `target` (the install it was restored for).
+    pub(crate) target: Option<String>,
+    /// Nothing but its own `SCHEMA_MIGRATED` rows follows it (L50: a restore of an older
+    /// snapshot appends them after the `RESTORE` in the same transaction).
+    pub(crate) newest: bool,
+}
+
+/// The latest `RESTORE`, if any (plaintext columns only).
+pub(crate) fn latest_restore(conn: &Connection) -> Result<Option<LatestRestore>, OpenError> {
     let latest: Option<(i64, Option<String>)> = conn
         .query_row(
             "SELECT seq, target FROM events WHERE event_type = 'RESTORE' \
@@ -342,8 +350,8 @@ pub(crate) fn recovery_offer(
         )
         .optional()
         .map_err(sql)?;
-    let Some((seq, Some(target))) = latest else {
-        return Ok(RecoveryOffer::RecoverThisLog);
+    let Some((seq, target)) = latest else {
+        return Ok(None);
     };
     let others_after: i64 = conn
         .query_row(
@@ -353,10 +361,24 @@ pub(crate) fn recovery_offer(
             |r| r.get(0),
         )
         .map_err(sql)?;
-    Ok(if others_after == 0 && target == install_id {
-        RecoveryOffer::FinishRestore
-    } else {
-        RecoveryOffer::RecoverThisLog
+    Ok(Some(LatestRestore {
+        target,
+        newest: others_after == 0,
+    }))
+}
+
+/// `FinishRestore` iff the newest records are a `RESTORE` naming this install in its plaintext
+/// `target`, followed by nothing but its own `SCHEMA_MIGRATED` rows — §8.7 interrupted
+/// restore before the KEK re-seal.
+pub(crate) fn recovery_offer(
+    conn: &Connection,
+    install_id: &str,
+) -> Result<RecoveryOffer, OpenError> {
+    Ok(match latest_restore(conn)? {
+        Some(r) if r.newest && r.target.as_deref() == Some(install_id) => {
+            RecoveryOffer::FinishRestore
+        }
+        _ => RecoveryOffer::RecoverThisLog,
     })
 }
 
@@ -458,7 +480,8 @@ pub(crate) enum Preflight {
         /// The first-retained anchor's `genesis_hash`, if the entry exists.
         genesis_hash: Option<[u8; 32]>,
         /// The instance ids of the settings view when the verdict is an unfinished restore
-        /// (reconciled or deferred): their PAT entries are deleted before the store is served.
+        /// (reconciled or deferred) whose `RESTORE` is still the newest record: their PAT
+        /// entries are deleted before the store is served.
         restore_pats: Vec<String>,
     },
 }
@@ -545,7 +568,13 @@ pub(crate) fn preflight(data: &LocalDataDir, cfg: &OpenConfig) -> Result<Preflig
         anchor_lines,
     })?;
     let a = &verdict.anchor_actions;
-    let restore_pats = if a.complete_restore.is_some() || a.defer_restore.is_some() {
+    // Only while nothing but `SCHEMA_MIGRATED` follows the `RESTORE`: every completion that
+    // appends anything after it (the restore itself, "Finish restore", this start) deleted the
+    // tokens first, and a failure after the commit stops the writer before any append. So a
+    // later start whose reset is still deferred or failing never deletes the tokens the user
+    // entered again since.
+    let unfinished = a.complete_restore.is_some() || a.defer_restore.is_some();
+    let restore_pats = if unfinished && latest_restore(&ro)?.is_some_and(|r| r.newest) {
         instances
     } else {
         Vec::new()
@@ -590,9 +619,10 @@ pub fn open(
     // An unfinished restore deletes its restored view's tokens before re-sealing the KEK, but a
     // restore of a store under the same KEK (a same-machine restore) opens here even when it
     // stopped between its commit and that deletion: the tokens go now, before anything is
-    // served (L53), idempotently. A keychain that refuses keeps the store locked (retried).
-    for id in restore_pats {
-        if let Err(e) = cfg.keys.delete(&EntryName::Pat(id)) {
+    // served (L53), idempotently, and are reported. A keychain that refuses keeps the store
+    // locked (retried).
+    for id in &restore_pats {
+        if let Err(e) = cfg.keys.delete(&EntryName::Pat(id.clone())) {
             return Ok(StartupOutcome::Locked(keyring_reason(&e)));
         }
     }
@@ -617,7 +647,11 @@ pub fn open(
         Ok(verify)
     };
     match step4() {
-        Ok(verify) => Ok(StartupOutcome::Ready { store, verify }),
+        Ok(verify) => Ok(StartupOutcome::Ready {
+            store,
+            verify,
+            pats_deleted: restore_pats,
+        }),
         Err(e) => {
             store.shutdown();
             Err(e)

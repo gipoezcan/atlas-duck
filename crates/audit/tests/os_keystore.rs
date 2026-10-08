@@ -296,7 +296,7 @@ mod u18 {
         store.shutdown();
 
         match open(&data, &lock, cfg()).expect("open") {
-            StartupOutcome::Ready { store, verify } => {
+            StartupOutcome::Ready { store, verify, .. } => {
                 assert!(verify.findings.is_empty(), "{:?}", verify.findings);
                 assert_eq!(store.open_incidents(), vec![h + 1]);
                 store.shutdown();

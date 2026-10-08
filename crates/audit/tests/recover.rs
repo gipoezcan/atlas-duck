@@ -90,7 +90,7 @@ fn locked(o: StartupOutcome) -> LockedReason {
 
 fn ready(o: StartupOutcome) -> (Store, atlas_duck_audit::VerifyOutcome) {
     match o {
-        StartupOutcome::Ready { store, verify } => (store, verify),
+        StartupOutcome::Ready { store, verify, .. } => (store, verify),
         other => panic!("expected Ready, got {other:?}"),
     }
 }

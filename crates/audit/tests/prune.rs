@@ -255,7 +255,7 @@ impl Sim {
 
 fn open_ready(f: &Fixture, cfg: OpenConfig) -> (Store, VerifyOutcome) {
     match open(&f.data, &f.lock, cfg).expect("open") {
-        StartupOutcome::Ready { store, verify } => (store, verify),
+        StartupOutcome::Ready { store, verify, .. } => (store, verify),
         other => panic!("not ready: {other:?}"),
     }
 }
