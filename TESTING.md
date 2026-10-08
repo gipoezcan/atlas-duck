@@ -43,7 +43,7 @@ Windows (PowerShell):
 
 ```powershell
 $data = "$env:LOCALAPPDATA\atlas-duck-data"
-New-Item -ItemType Directory -Force $data, "$env:LOCALAPPDATAtlas-duck" | Out-Null
+New-Item -ItemType Directory -Force $data, "$env:LOCALAPPDATA\atlas-duck" | Out-Null
 $toml = "schema_version = 1`ndata_dir = '$data'`nconfig_dir = '$data'`n"
 Set-Content -Path "$env:LOCALAPPDATA\atlas-duck\paths.toml" -Value $toml -Encoding ascii
 ```
