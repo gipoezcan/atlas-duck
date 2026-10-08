@@ -338,7 +338,10 @@ jobs:
           set -euo pipefail
           evidence="$RUNNER_TEMP/install-probe-evidence"
           mkdir -p "$evidence"
+          # --tmpfs: the container's own /tmp is an overlayfs whose layers live outside the container,
+          # so the data-dir locality check (which fails closed on an unresolvable overlay) rejects it.
           docker run --rm \
+            --tmpfs /tmp:rw,exec \
             --env CI=true \
             --env INSTALL_PROBE_EVIDENCE=/evidence \
             --volume "$PWD:/work:ro" \
