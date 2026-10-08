@@ -57,9 +57,27 @@ static ALL: &[OperationSpec] = &[
     jira::writes::ISSUELINK_CREATE,
     jira::writes::SPRINT_MOVE_ISSUES,
     jira::writes::BACKLOG_MOVE_ISSUES,
+    confluence::reads::USER_CURRENT,
+    confluence::reads::SPACE_LIST,
+    confluence::reads::SPACE_GET,
+    confluence::reads::PAGE_GET,
+    confluence::reads::PAGE_FIND,
+    confluence::reads::SEARCH,
+    confluence::reads::PAGE_CHILDREN,
+    confluence::reads::COMMENT_LIST,
+    confluence::reads::LABEL_LIST,
+    confluence::reads::ATTACHMENT_LIST,
+    confluence::reads::PAGE_HISTORY,
+    confluence::writes::PAGE_CREATE,
+    confluence::writes::PAGE_UPDATE,
+    confluence::writes::PAGE_MOVE,
+    confluence::writes::COMMENT_ADD,
+    confluence::writes::LABEL_ADD,
+    confluence::writes::LABEL_REMOVE,
+    confluence::writes::ATTACHMENT_UPLOAD,
 ];
 
-/// Every registry operation (46 once the catalogs are in: 28 Jira, 18 Confluence).
+/// Every registry operation (46: 28 Jira, 18 Confluence).
 pub fn all() -> &'static [OperationSpec] {
     ALL
 }

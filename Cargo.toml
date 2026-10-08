@@ -70,6 +70,8 @@ windows-native-keyring-store = "=1.1.0"
 apple-native-keyring-store = { version = "=1.0.2", default-features = false, features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "=1.0.1", default-features = false, features = ["crypto-rust"] }
 proptest = "=1.11.0"
+# M3 catalog tests (U-05) and core::validate: no `$ref` I/O (plan "Dependency pins").
+jsonschema = { version = "=0.58.6", default-features = false }
 
 # §7.7: release builds use panic = "abort". Profiles are workspace-wide, so this
 # covers atlas-duck-app, atlas-duck and atlas-duck-sandbox.
