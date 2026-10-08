@@ -20,6 +20,7 @@ mod prune;
 pub mod recover;
 pub mod recovery;
 pub mod request_set;
+mod restore;
 pub mod schema;
 mod settings;
 pub mod store;
@@ -42,6 +43,7 @@ pub use open::{
 pub use prune::{PruneOutcome, PruneSkip};
 pub use recover::{RecoverReport, archive_and_start_fresh, recover_this_log};
 pub use request_set::{RequestRecord, request_set_hash};
+pub use restore::{RestoreReport, finish_restore, restore_from_source};
 pub use settings::{
     FilePolicy, InstancePolicy, RETENTION_DEFAULT, RETENTION_MIN, SettingChange, Settings,
 };

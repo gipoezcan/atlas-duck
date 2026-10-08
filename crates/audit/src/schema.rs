@@ -173,7 +173,7 @@ pub struct Migration {
 /// No migrations exist in v1.
 pub const MIGRATIONS: &[Migration] = &[];
 
-fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
+pub(crate) fn user_version(conn: &Connection) -> rusqlite::Result<u32> {
     conn.pragma_query_value(None, "user_version", |r| r.get(0))
 }
 
@@ -195,29 +195,10 @@ pub fn run_migrations(
     let start = user_version(conn).map_err(sqlite)?;
     let fail =
         |from: u32, to: u32, message: String| OpenError::MigrationFailed { from, to, message };
-    if let Some(m) = migrations.iter().find(|m| m.to <= m.from) {
-        return Err(fail(
-            m.from,
-            m.to,
-            "migration does not increase the version".into(),
-        ));
-    }
-    let mut steps: Vec<&Migration> = Vec::new();
-    let mut cur = start;
-    while let Some(m) = migrations.iter().find(|m| m.from == cur) {
-        steps.push(m);
-        cur = m.to;
-    }
-    if let Some(next) = migrations.iter().map(|m| m.from).filter(|&f| f > cur).min() {
-        return Err(fail(
-            cur,
-            next,
-            format!("no migration step from version {cur}"),
-        ));
-    }
-    if steps.is_empty() {
+    let steps = pending_steps(start, migrations)?;
+    let Some(cur) = steps.last().map(|m| m.to) else {
         return Ok(None);
-    }
+    };
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|e| fail(start, cur, e.to_string()))?;
@@ -229,6 +210,38 @@ pub fn run_migrations(
     }
     tx.commit().map_err(|e| fail(start, cur, e.to_string()))?;
     Ok(Some((start, cur)))
+}
+
+/// The steps from `start` to the newest version, in order (empty when nothing is pending). A
+/// step with `to <= from`, or a gap (a step starting above the reached version but none
+/// starting at it), is `MigrationFailed`.
+pub(crate) fn pending_steps(
+    start: u32,
+    migrations: &[Migration],
+) -> Result<Vec<Migration>, OpenError> {
+    let fail =
+        |from: u32, to: u32, message: String| OpenError::MigrationFailed { from, to, message };
+    if let Some(m) = migrations.iter().find(|m| m.to <= m.from) {
+        return Err(fail(
+            m.from,
+            m.to,
+            "migration does not increase the version".into(),
+        ));
+    }
+    let mut steps: Vec<Migration> = Vec::new();
+    let mut cur = start;
+    while let Some(m) = migrations.iter().find(|m| m.from == cur) {
+        steps.push(*m);
+        cur = m.to;
+    }
+    if let Some(next) = migrations.iter().map(|m| m.from).filter(|&f| f > cur).min() {
+        return Err(fail(
+            cur,
+            next,
+            format!("no migration step from version {cur}"),
+        ));
+    }
+    Ok(steps)
 }
 
 /// What a read-only peek at a store reports for the version gate (§8.13).

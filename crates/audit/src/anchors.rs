@@ -232,16 +232,37 @@ pub(crate) enum Barrier {
         first_retained: FirstRetainedAnchor,
     },
     /// No head write at all until the restore completion step wrote both entries: an anchor
-    /// from before the `RESTORE` would describe the replaced DB.
-    Restore { seq: u64 },
+    /// from before the `RESTORE` would describe the replaced DB. `reset` is the completion
+    /// (the anchors of the restored store): once set, the anchor thread writes it, retrying with
+    /// backoff like a prune's first-retained update, and lifts the barrier on success (§8.11
+    /// step 5). `None` while the restore is still running (or for "Recover this log", whose
+    /// one-shot `complete_restore` writes the anchors).
+    Restore {
+        seq: u64,
+        reset: Option<RestoreReset>,
+    },
+    /// Like `Restore` but nothing lifts it in this process: an interrupted restore whose
+    /// startup reconciliation was deferred because the anchor dir could not be read. Neither
+    /// `complete_restore` nor a reset applies to it, so the head anchor keeps naming the
+    /// `prior_keychain_anchor` and the next start can still reconcile it (§8.7).
+    RestoreHold,
     /// Like `Prune` but nothing lifts it in this process: an interrupted prune whose startup
     /// reconciliation was deferred because the anchor dir could not be read. The head anchor
     /// stays at or before the `PRUNE`, so the next start can still reconcile it (§8.7 (d)).
+    /// Only a restore replaces it (`swap_barrier`): the store it belongs to is replaced, and
+    /// it comes back if the restore fails before its commit. The same holds for `RestoreHold`.
     Hold { seq: u64, record_hash: [u8; 32] },
     /// A prune is about to commit: the slot is taken so its `Prune` barrier can be set right
     /// after the commit and before the new head is published. Caps and writes nothing (nothing
     /// past the current head is published meanwhile).
     PruneReserved,
+}
+
+/// The anchors a restore completion writes: first-retained, then head (§8.11 step 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RestoreReset {
+    pub(crate) head: HeadAnchor,
+    pub(crate) first_retained: FirstRetainedAnchor,
 }
 
 impl Barrier {
@@ -250,7 +271,7 @@ impl Barrier {
             Barrier::Prune { .. } | Barrier::Hold { .. } | Barrier::PruneReserved => {
                 BarrierKind::Prune
             }
-            Barrier::Restore { .. } => BarrierKind::Restore,
+            Barrier::Restore { .. } | Barrier::RestoreHold => BarrierKind::Restore,
         }
     }
 }
@@ -285,6 +306,8 @@ pub(crate) struct AnchorState {
     last_error: Option<KeyStoreError>,
     waiters: Vec<FlushReply>,
     restore_job: Option<RestoreJob>,
+    /// Told the outcome of the next restore-reset attempt.
+    reset_waiters: Vec<FlushReply>,
     /// The batch window (tests shorten or stretch it).
     window: Duration,
     wait_timeout: Duration,
@@ -313,6 +336,7 @@ impl AnchorState {
             last_error: None,
             waiters: Vec::new(),
             restore_job: None,
+            reset_waiters: Vec::new(),
         }
     }
 
@@ -323,7 +347,7 @@ impl AnchorState {
             return None;
         }
         match &self.barrier {
-            Some(Barrier::Restore { .. }) => None,
+            Some(Barrier::Restore { .. } | Barrier::RestoreHold) => None,
             Some(
                 Barrier::Prune {
                     seq, record_hash, ..
@@ -346,6 +370,12 @@ impl AnchorState {
 
     fn prune_pending(&self) -> bool {
         self.enabled && matches!(self.barrier, Some(Barrier::Prune { .. }))
+    }
+
+    /// A restore completion is armed and not yet written. Like the restore job it does not
+    /// wait for `enable`: it is armed only after the verification it completes.
+    fn reset_pending(&self) -> bool {
+        matches!(self.barrier, Some(Barrier::Restore { reset: Some(_), .. }))
     }
 
     fn retry_ok(&self, now: Instant) -> bool {
@@ -387,7 +417,7 @@ impl AnchorState {
         self.stop
             || self.flush_requested
             || self.restore_job.is_some()
-            || (self.prune_pending() && self.retry_ok(now))
+            || ((self.prune_pending() || self.reset_pending()) && self.retry_ok(now))
             || self.head_due(now)
     }
 
@@ -396,7 +426,7 @@ impl AnchorState {
             return Duration::ZERO;
         }
         let mut w = MAX_WAIT;
-        if self.prune_pending() {
+        if self.prune_pending() || self.reset_pending() {
             w = w.min(self.retry_in(now));
         }
         if let (Some(d), Some(_)) = (self.dirty_since, self.head_stale()) {
@@ -596,7 +626,107 @@ impl AnchorShared {
         Ok(())
     }
 
-    /// Lifts any barrier (error paths of prune/restore) and resets the retry state.
+    /// Replaces whatever barrier is installed with `b` and returns the old one, so a restore
+    /// can hold the head anchor still while it reads the keychain and put the old barrier back
+    /// if it fails before its commit (a prune's pending first-retained update, a deferred
+    /// reconciliation): the restore replaces the store those barriers belong to (N-6, owned
+    /// deliberately). Waits until a keychain write already in flight has returned, so the
+    /// keychain does not change behind the caller once this returns `Ok`.
+    pub(crate) fn swap_barrier(&self, b: Option<Barrier>) -> Result<Option<Barrier>, AuditError> {
+        let old = {
+            let mut st = lock(&self.state);
+            if st.stop || st.dead {
+                return Err(st.unusable());
+            }
+            let old = std::mem::replace(&mut st.barrier, b);
+            st.clear_failure();
+            old
+        };
+        self.cv.notify_all();
+        // A flush is answered by the thread's next turn, i.e. after any write in flight.
+        let (tx, rx) = sync_channel(1);
+        {
+            let mut st = lock(&self.state);
+            st.waiters.push(tx);
+            st.flush_requested = true;
+        }
+        self.cv.notify_all();
+        let wait = lock(&self.state).wait_timeout;
+        let quiet = match rx.recv_timeout(wait) {
+            Ok(_) => Ok(()),
+            Err(RecvTimeoutError::Timeout) => Err(AuditError::AnchorFlushTimeout),
+            Err(RecvTimeoutError::Disconnected) => Err(self.after_disconnect()),
+        };
+        match quiet {
+            Ok(()) => Ok(old),
+            Err(e) => {
+                // The caller gives up: the barrier it replaced comes back.
+                self.restore_barrier(old);
+                Err(e)
+            }
+        }
+    }
+
+    /// Puts back a barrier taken by [`AnchorShared::swap_barrier`] (error paths before the
+    /// restore commit).
+    pub(crate) fn restore_barrier(&self, old: Option<Barrier>) {
+        {
+            let mut st = lock(&self.state);
+            st.barrier = old;
+            st.clear_failure();
+        }
+        self.cv.notify_all();
+    }
+
+    /// Arms the completion of the restore barrier at `seq` (installed and not yet armed): the
+    /// anchor thread writes `reset` (first-retained, then head), retries it with backoff and
+    /// lifts the barrier once it succeeded. The receiver gets the outcome of the first attempt.
+    pub(crate) fn arm_restore_reset(
+        &self,
+        seq: u64,
+        reset: RestoreReset,
+    ) -> Result<std::sync::mpsc::Receiver<Result<(), KeyStoreError>>, AuditError> {
+        let (tx, rx) = sync_channel(1);
+        {
+            let mut st = lock(&self.state);
+            if st.stop || st.dead {
+                return Err(st.unusable());
+            }
+            if reset.head.chain_id != reset.first_retained.chain_id || reset.head.seq < seq {
+                return Err(AuditError::Invalid(
+                    "restore anchors do not fit the RESTORE",
+                ));
+            }
+            match &mut st.barrier {
+                Some(Barrier::Restore { seq: s, reset: r }) if *s == seq && r.is_none() => {
+                    *r = Some(reset);
+                }
+                _ => {
+                    return Err(AuditError::Invalid(
+                        "no unarmed restore barrier for this RESTORE",
+                    ));
+                }
+            }
+            st.clear_failure();
+            st.reset_waiters.push(tx);
+        }
+        self.cv.notify_all();
+        Ok(rx)
+    }
+
+    /// Waits (at most the wait timeout) for the outcome of the first reset attempt armed by
+    /// [`AnchorShared::arm_restore_reset`]. A failure or a timeout is not the restore's error:
+    /// the thread keeps retrying, and `health()` shows it (§8.11 step 5).
+    pub(crate) fn wait_reset(
+        &self,
+        rx: std::sync::mpsc::Receiver<Result<(), KeyStoreError>>,
+    ) -> Option<Result<(), KeyStoreError>> {
+        let wait = lock(&self.state).wait_timeout;
+        rx.recv_timeout(wait).ok()
+    }
+
+    /// Lifts any barrier and resets the retry state: a [`BarrierGuard`] releasing its own
+    /// barrier, and the `testing` hook.
     pub(crate) fn clear_barrier(&self) {
         {
             let mut st = lock(&self.state);
@@ -644,7 +774,7 @@ impl AnchorShared {
                 return Err(AuditError::Invalid("restore anchors name different chains"));
             }
             match &st.barrier {
-                Some(Barrier::Restore { seq }) if head.seq >= *seq => {}
+                Some(Barrier::Restore { seq, reset: None }) if head.seq >= *seq => {}
                 _ => {
                     return Err(AuditError::Invalid(
                         "no restore barrier for this head anchor",
@@ -767,6 +897,7 @@ pub(crate) fn run(shared: Arc<AnchorShared>, keys: Arc<dyn KeyStore>, scale_div:
         st.dead = true;
     }
     st.waiters.clear();
+    st.reset_waiters.clear();
     st.restore_job = None;
     st.exited = true;
     drop(st);
@@ -819,6 +950,48 @@ fn run_loop(shared: &AnchorShared, keys: &dyn KeyStore, scale_div: u32) {
                 }
             };
             let _ = job.reply.send(reply);
+            continue;
+        }
+        // An armed restore completion: both entries, retried with backoff until it lands.
+        if let Some(Barrier::Restore {
+            seq: restore_seq,
+            reset: Some(reset),
+        }) = st.barrier.clone()
+            && (st.flush_requested || st.retry_ok(Instant::now()))
+        {
+            drop(st);
+            let r = set_first_retained(keys, &reset.first_retained)
+                .and_then(|()| set_head(keys, &reset.head));
+            st = lock(&shared.state);
+            match &r {
+                Ok(()) => {
+                    // Only the barrier this write belonged to; it may have been replaced.
+                    if matches!(&st.barrier, Some(Barrier::Restore { seq, reset: Some(_) })
+                        if *seq == restore_seq)
+                    {
+                        st.barrier = None;
+                    }
+                    // As for the restore job: a newer head of the restored chain stays the
+                    // head and is anchored next.
+                    let newer = matches!(&st.head, Some(h)
+                        if h.chain_id == reset.head.chain_id && h.seq > reset.head.seq);
+                    if !newer {
+                        st.head = Some(reset.head.clone());
+                    }
+                    st.written_head = Some(reset.head);
+                    st.dirty_since = None;
+                    st.clear_failure();
+                }
+                Err(e) => st.schedule_retry(e.clone(), Instant::now(), scale_div),
+            }
+            for w in std::mem::take(&mut st.reset_waiters) {
+                let _ = w.send(r.clone());
+            }
+            if let Err(e) = r {
+                // A flush behind a pending reset reports why the anchors are not written.
+                st.flush_requested = false;
+                answer(std::mem::take(&mut st.waiters), &Err(e));
+            }
             continue;
         }
         let flushing = st.flush_requested;
@@ -950,7 +1123,10 @@ mod tests {
         assert_eq!(s.flush_target(), Some(head(5)));
         s.head = Some(head(4));
         assert_eq!(s.flush_target(), Some(head(4)));
-        s.barrier = Some(Barrier::Restore { seq: 5 });
+        s.barrier = Some(Barrier::Restore {
+            seq: 5,
+            reset: None,
+        });
         assert_eq!(s.flush_target(), None);
         assert!(!s.head_due(t0 + Duration::from_secs(5)));
     }
@@ -1038,7 +1214,10 @@ mod more_tests {
     fn a_second_barrier_is_refused_and_the_guard_releases() {
         let a = shared(true);
         let g = a
-            .install_barrier(Barrier::Restore { seq: 2 })
+            .install_barrier(Barrier::Restore {
+                seq: 2,
+                reset: None,
+            })
             .expect("first barrier");
         assert!(matches!(
             a.install_barrier(Barrier::Prune {
@@ -1053,7 +1232,10 @@ mod more_tests {
         assert_eq!(a.health().blocked, None);
         // Completed guards keep the barrier for the anchor thread to lift.
         let g = a
-            .install_barrier(Barrier::Restore { seq: 2 })
+            .install_barrier(Barrier::Restore {
+                seq: 2,
+                reset: None,
+            })
             .expect("again");
         g.complete();
         assert_eq!(a.health().blocked, Some(BarrierKind::Restore));
@@ -1068,7 +1250,10 @@ mod more_tests {
         }
         assert!(a.health().write_failing);
         let _g = a
-            .install_barrier(Barrier::Restore { seq: 2 })
+            .install_barrier(Barrier::Restore {
+                seq: 2,
+                reset: None,
+            })
             .expect("barrier");
         assert!(!a.health().write_failing);
     }

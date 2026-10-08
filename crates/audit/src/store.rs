@@ -11,7 +11,8 @@ use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use atlas_duck_ipc::paths::LocalDataDir;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::OptionalExtension;
+use secrecy::SecretString;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -20,6 +21,7 @@ use crate::admission::{self, DEFAULT_MIN_FREE_BYTES, FreeSpaceProbe, OsFreeSpace
 use crate::anchor_dir::{self, AnchorDirLines};
 use crate::anchors::{
     self, AnchorLoadError, Barrier, BarrierGuard, BarrierKind, FirstRetainedAnchor, HeadAnchor,
+    RestoreReset,
 };
 use crate::backup::BackupReceipt;
 use crate::clock::{Clock, UtcInstant};
@@ -28,6 +30,7 @@ use crate::encoding::{self, FIELD_LIST, RowFields};
 use crate::error::{AuditError, OpenError};
 use crate::keystore::KeyStore;
 use crate::prune::PruneOutcome;
+use crate::restore::{RestoreReport, RestoreRequest};
 use crate::schema;
 use crate::settings::{FilePolicy, SettingChange, Settings};
 use crate::types::{
@@ -130,15 +133,6 @@ impl fmt::Debug for Hooks {
     }
 }
 
-/// `K_q` of the query tag (F.7), derived once at open. Never printed.
-struct QueryKey(Zeroizing<[u8; 32]>);
-
-impl fmt::Debug for QueryKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("QueryKey([REDACTED])")
-    }
-}
-
 /// Store state for Settings/tray.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StoreHealth {
@@ -182,8 +176,6 @@ struct Inner {
     install_id: String,
     /// Read by `full_verify` for the anchors; only the anchor thread writes them.
     keys: Arc<dyn KeyStore>,
-    kek: Kek,
-    query_key: QueryKey,
     clock: Arc<dyn Clock>,
     db_path: PathBuf,
     data_dir: PathBuf,
@@ -192,7 +184,6 @@ struct Inner {
     anchor_dir: Option<PathBuf>,
     min_free_bytes: u64,
     free_space: Arc<dyn FreeSpaceProbe>,
-    reader: Mutex<Option<Connection>>,
     /// Fault points of the startup steps (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
     hooks: Hooks,
@@ -275,12 +266,12 @@ impl Store {
     where
         F: FnOnce(WriterParts) -> Result<Writer, OpenError> + Send + 'static,
     {
-        let shared = Shared::new();
+        let shared = Shared::new(&kek);
         #[cfg(any(test, feature = "testing"))]
         let hooks = cfg.hooks.clone();
         let parts = WriterParts {
             clock: cfg.clock.clone(),
-            kek: kek.clone(),
+            kek,
             shared: shared.clone(),
             hooks: cfg.hooks.clone(),
             genesis_hash: anchors.genesis_hash,
@@ -338,15 +329,12 @@ impl Store {
                 shared,
                 install_id,
                 keys: cfg.keys,
-                query_key: QueryKey(crypto::query_key(&kek)),
-                kek,
                 clock: cfg.clock,
                 db_path: schema::db_path(data),
                 data_dir: data.path().to_path_buf(),
                 anchor_dir: cfg.anchor_dir,
                 min_free_bytes: cfg.min_free_bytes,
                 free_space: cfg.free_space.unwrap_or_else(|| Arc::new(OsFreeSpace)),
-                reader: Mutex::new(None),
                 #[cfg(any(test, feature = "testing"))]
                 hooks,
             }),
@@ -407,7 +395,8 @@ impl Store {
 
     /// `"jql:<hex>"` / `"cql:<hex>"` (F.7, L38).
     pub fn query_tag(&self, kind: QueryKind, query: &str) -> String {
-        crypto::query_tag(&self.inner.query_key.0, kind, query)
+        let k_q = lock(&self.inner.shared.keys).query_key.clone();
+        crypto::query_tag(&k_q, kind, query)
     }
 
     /// The JCS payload bytes of record `seq`, decrypted (AES-GCM over the row's AAD, F.3) and
@@ -422,7 +411,7 @@ impl Store {
         let dek = match cached {
             Some(d) => d,
             None => crypto::unwrap_dek(
-                &self.inner.kek,
+                &lock(&self.inner.shared.keys).kek.clone(),
                 sealed.key_id,
                 sealed.month.as_deref(),
                 &sealed.wrapped_dek,
@@ -451,7 +440,7 @@ impl Store {
     fn read_sealed(&self, seq: u64) -> Result<Sealed, AuditError> {
         let seq_i = i64::try_from(seq).map_err(|_| AuditError::NotFound { seq })?;
         let io = |e: rusqlite::Error| AuditError::Io(e.to_string());
-        let mut guard = lock(&self.inner.reader);
+        let mut guard = lock(&self.inner.shared.reader);
         if lock(&self.inner.tx).is_none() {
             return Err(AuditError::Closed);
         }
@@ -563,8 +552,10 @@ impl Store {
         self.inner.shared.anchors.install_barrier(b)
     }
 
-    /// Lifts the barrier explicitly.
-    #[allow(dead_code)] // called by restore (T16)
+    /// Lifts whatever barrier is installed (tests only). Production paths never lift a
+    /// barrier they do not own (T14 N-6): a guard releases its own, and a restore puts back
+    /// the one it replaced.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn clear_barrier(&self) {
         self.inner.shared.anchors.clear_barrier();
     }
@@ -779,7 +770,8 @@ impl Store {
         {
             AnchorDirLines::note_setting_unreadable(&mut lines);
         }
-        verify::full(&conn, &self.inner.kek, &k, lines.as_ref())
+        let kek = lock(&self.inner.shared.keys).kek.clone();
+        verify::full(&conn, &kek, &k, lines.as_ref())
     }
 
     /// Seqs of the integrity-incident `VERIFY` records without a later `INTEGRITY_ACK` (C.3),
@@ -886,7 +878,7 @@ impl Store {
         first_retained: FirstRetainedAnchor,
     ) -> Result<(), AuditError> {
         let (seq, record_hash, chain_id) = self.head();
-        let guard = self.install_barrier(Barrier::Restore { seq })?;
+        let guard = self.install_barrier(Barrier::Restore { seq, reset: None })?;
         self.complete_restore_anchors(
             HeadAnchor {
                 chain_id,
@@ -902,11 +894,13 @@ impl Store {
     /// Startup step 4 after migrations (§8.7): appends the verdict's `VERIFY` (none when it
     /// has no finding), then the anchor actions, then enables anchor writes. An interrupted
     /// prune gets its prune barrier (first-retained written before the head passes the
-    /// `PRUNE`); an interrupted restore gets a restore barrier, which only the restore
-    /// completion (T16) lifts. A reconciliation deferred because the anchor dir could not be
-    /// read keeps the head anchor at or before its `PRUNE`/`RESTORE` for this process (a hold
-    /// or restore barrier nothing lifts), so the next start can reconcile it. If the `VERIFY`
-    /// append fails, anchors stay disabled.
+    /// `PRUNE`). An interrupted restore gets a restore barrier armed with its completion (the
+    /// restored chain's anchors at the current head, §8.11 step 5): the anchor thread writes
+    /// it, retrying with backoff, and only then lifts the barrier; `open` waits for the first
+    /// attempt, whose failure is not an error (`health()` shows it). A reconciliation deferred
+    /// because the anchor dir could not be read keeps the head anchor at or before its
+    /// `PRUNE`/`RESTORE` for this process (a hold barrier nothing lifts), so the next start can
+    /// reconcile it. If the `VERIFY` append fails, anchors stay disabled.
     pub(crate) fn apply_startup(&self, v: &StartupVerdict) -> Result<VerifyOutcome, AuditError> {
         let verify_seq = if v.findings.is_empty() {
             None
@@ -918,21 +912,42 @@ impl Store {
         self.inner
             .hooks
             .fault(crate::testing::FaultPoint::AfterStartupVerifyAppend)?;
+        let outcome = VerifyOutcome {
+            findings: v.findings.clone(),
+            unanchored_tail: v.unanchored_tail,
+            verify_seq,
+        };
         let a = &v.anchor_actions;
         if let Some(rc) = &a.complete_restore {
-            self.install_barrier(Barrier::Restore {
-                seq: rc.restore_seq,
-            })?
-            .complete();
-        } else if let (Some(fr), Some(p)) = (&a.set_first_retained, &a.prune_record) {
+            // The head now (the startup VERIFY or SCHEMA_MIGRATED after it) is of the same chain.
+            let (seq, record_hash, chain_id) = self.head();
+            let head = if chain_id == rc.head.chain_id && seq >= rc.head.seq {
+                HeadAnchor {
+                    chain_id,
+                    seq,
+                    record_hash,
+                }
+            } else {
+                rc.head.clone()
+            };
+            self.start_restore_reset(
+                rc.restore_seq,
+                RestoreReset {
+                    head,
+                    first_retained: rc.first_retained.clone(),
+                },
+            )?;
+            return Ok(outcome);
+        }
+        if let (Some(fr), Some(p)) = (&a.set_first_retained, &a.prune_record) {
             self.install_barrier(Barrier::Prune {
                 seq: p.seq,
                 record_hash: p.record_hash,
                 first_retained: fr.clone(),
             })?
             .complete();
-        } else if let Some(seq) = a.defer_restore {
-            self.install_barrier(Barrier::Restore { seq })?.complete();
+        } else if a.defer_restore.is_some() {
+            self.install_barrier(Barrier::RestoreHold)?.complete();
         } else if let Some(p) = &a.defer_prune {
             self.install_barrier(Barrier::Hold {
                 seq: p.seq,
@@ -941,11 +956,73 @@ impl Store {
             .complete();
         }
         self.enable_anchors();
-        Ok(VerifyOutcome {
-            findings: v.findings.clone(),
-            unanchored_tail: v.unanchored_tail,
-            verify_seq,
-        })
+        Ok(outcome)
+    }
+
+    /// The restore completion (§8.11 step 5) after the KEK is re-sealed: a restore barrier at
+    /// `restore_seq` armed with `reset`, then anchor writes enabled. The anchor thread writes
+    /// the reset (first-retained, then head), retrying with backoff, and lifts the barrier on
+    /// success; this waits for the first attempt only, whose failure is not an error
+    /// (`health().anchor_write_failing` shows it, never an incident).
+    pub(crate) fn start_restore_reset(
+        &self,
+        restore_seq: u64,
+        reset: RestoreReset,
+    ) -> Result<(), AuditError> {
+        self.install_barrier(Barrier::Restore {
+            seq: restore_seq,
+            reset: None,
+        })?
+        .complete();
+        let rx = self
+            .inner
+            .shared
+            .anchors
+            .arm_restore_reset(restore_seq, reset)?;
+        self.enable_anchors();
+        let _ = self.inner.shared.anchors.wait_reset(rx);
+        Ok(())
+    }
+
+    /// Restore-as-continuation (C.3, §8.11) from `source`: a backup bundle directory (with
+    /// `manifest.json`) or a single DB file (an `archived/` store), with the backup's recovery
+    /// passphrase. Runs on the writer, so no append interleaves. The live store is replaced by
+    /// the restored one (kept as `archived/…`, `replaced_db`), which continues with a new
+    /// `chain_id`, this install's `install_id`, the backup's KEK (re-sealed into this
+    /// install's keychain entries) and recovery passphrase; this handle serves it from then
+    /// on. A snapshot of this store's chain behind this install's head anchor (or the live
+    /// head) is a same-machine rollback and needs `confirm_rollback`
+    /// (`RollbackNeedsConfirmation { records_lost }` otherwise, nothing changed). The §10.3
+    /// "restore backup" confirmation is the caller's.
+    ///
+    /// `Err` before the commit: nothing changed but deleted PAT entries (`Restore(..)` for the
+    /// source, `KeyStore`, `Io`). A failed KEK re-seal after the commit stops the store
+    /// (`KeyStore`); the next start offers "Finish restore". A failed anchor reset is not an
+    /// error (retried, shown in `health()`). The config file must be reconciled again
+    /// (`reconcile_config_file`) before prune runs on the restored store.
+    pub fn restore(
+        &self,
+        source: RustChosenPath,
+        passphrase: &SecretString,
+        confirm_rollback: Option<Confirmed>,
+    ) -> Result<RestoreReport, AuditError> {
+        let req = RestoreRequest::new(
+            &source,
+            passphrase,
+            confirm_rollback,
+            self.inner.keys.clone(),
+            self.inner.data_dir.clone(),
+            self.inner.anchor_dir.clone(),
+            self.inner.install_id.clone(),
+        );
+        let (reply, rx) = sync_channel(1);
+        self.sender()?
+            .send(Cmd::Restore {
+                req: Box::new(req),
+                reply,
+            })
+            .map_err(|_| AuditError::Closed)?;
+        rx.recv().map_err(|_| AuditError::Closed)?
     }
 
     /// Startup step 4 (§8.13): runs the pending migrations on the writer's connection, each
@@ -977,7 +1054,7 @@ impl Store {
     /// writes an anchor.
     pub fn shutdown(&self) {
         self.inner.stop();
-        *lock(&self.inner.reader) = None;
+        *lock(&self.inner.shared.reader) = None;
     }
 
     /// `enable_anchors` for integration tests (feature `testing`).
@@ -1036,7 +1113,7 @@ impl Store {
     /// A restore barrier at `seq` (feature `testing`).
     #[cfg(any(test, feature = "testing"))]
     pub fn testing_restore_barrier(&self, seq: u64) -> Result<BarrierGuard, AuditError> {
-        self.install_barrier(Barrier::Restore { seq })
+        self.install_barrier(Barrier::Restore { seq, reset: None })
     }
 
     /// `clear_barrier` for integration tests (feature `testing`).

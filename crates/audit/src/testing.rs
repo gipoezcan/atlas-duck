@@ -270,6 +270,13 @@ pub enum FaultPoint {
     /// "Recover this log": both anchors were rebuilt, the KEK is not re-sealed yet (a crash
     /// there leaves the keychain lost). An armed failure ends the recovery there.
     AfterRecoveryAnchors,
+    /// Restore: right after the "RESTORE commit" (the staging file renamed to `audit.db`),
+    /// before the KEK is re-sealed. An armed failure is a crash there: the restore stops and a
+    /// live store's writer stops with it.
+    AfterRestoreCommit,
+    /// Restore: the KEK is re-sealed, the anchors are not reset yet. An armed failure is a
+    /// crash there, as for `AfterRestoreCommit`.
+    AfterKekReseal,
 }
 
 /// Runs when a [`FaultPoint`] is reached (see [`Faults::on_hit`]).

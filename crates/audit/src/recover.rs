@@ -54,7 +54,7 @@ fn not_found() -> OpenError {
 }
 
 /// `audit.db` must exist; a WAL without it is never treated as a missing store.
-fn existing_db(data: &LocalDataDir) -> Result<PathBuf, OpenError> {
+pub(crate) fn existing_db(data: &LocalDataDir) -> Result<PathBuf, OpenError> {
     let db = schema::db_path(data);
     if !db.try_exists()? {
         if with_suffix(&db, "-wal").try_exists()? {
@@ -68,7 +68,10 @@ fn existing_db(data: &LocalDataDir) -> Result<PathBuf, OpenError> {
 }
 
 /// The KEK sealed in the store's `recovery` row (§8.7 step 1).
-fn recovered_kek(conn: &Connection, passphrase: &SecretString) -> Result<Kek, OpenError> {
+pub(crate) fn recovered_kek(
+    conn: &Connection,
+    passphrase: &SecretString,
+) -> Result<Kek, OpenError> {
     let blob: Option<Vec<u8>> = conn
         .query_row("SELECT blob FROM recovery WHERE id = 1", [], |r| r.get(0))
         .optional()
@@ -322,7 +325,7 @@ pub fn recover_this_log(
 
 /// The plaintext head of a store: `(seq, record_hash, chain_id)`, read on a sidecar-free
 /// read-only connection that is closed again before returning.
-fn plaintext_head(db: &Path) -> Result<(u64, [u8; 32], String), OpenError> {
+pub(crate) fn plaintext_head(db: &Path) -> Result<(u64, [u8; 32], String), OpenError> {
     let conn = schema::open_peek(db)?;
     let head = conn
         .query_row(
@@ -358,7 +361,7 @@ fn plaintext_head(db: &Path) -> Result<(u64, [u8; 32], String), OpenError> {
 
 /// `YYYYMMDDTHHMMSSmmmZ` of the wall clock: an RFC 3339 instant without its separators (`:` is
 /// not allowed in Windows file names).
-fn file_stamp() -> Result<String, OpenError> {
+pub(crate) fn file_stamp() -> Result<String, OpenError> {
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
@@ -371,14 +374,14 @@ fn file_stamp() -> Result<String, OpenError> {
         .collect())
 }
 
-fn remove_if_present(p: &Path) -> io::Result<()> {
+pub(crate) fn remove_if_present(p: &Path) -> io::Result<()> {
     match std::fs::remove_file(p) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }
 }
 
-fn file_len(p: &Path) -> io::Result<Option<u64>> {
+pub(crate) fn file_len(p: &Path) -> io::Result<Option<u64>> {
     match std::fs::metadata(p) {
         Ok(m) => Ok(Some(m.len())),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),

@@ -1477,15 +1477,23 @@ fn interrupted_restore_predicate() {
     assert_eq!(rc.first_retained.first_retained_seq, 1);
     assert!(full_verify_fresh(&f).is_empty());
 
-    // Applied: the restore barrier keeps the head anchor where it is until T16's reset.
+    // Applied (T16): the restore barrier is armed with the reset, which writes both anchors of
+    // the restored chain and lifts it; the head anchor never named anything in between.
     let store = reopen(&f);
-    testing::apply_startup(&store, &v).expect("apply");
-    assert_eq!(
-        store.health().anchors_blocked,
-        Some(atlas_duck_audit::anchors::BarrierKind::Restore)
-    );
-    store.flush_head_anchor().expect("flush");
     assert_eq!(keychain_head(&f), Some(prior));
+    testing::apply_startup(&store, &v).expect("apply");
+    assert_eq!(store.health().anchors_blocked, None);
+    store.flush_head_anchor().expect("flush");
+    let (seq, record_hash, chain_id) = store.head();
+    assert_eq!(chain_id, new_chain);
+    assert_eq!(
+        keychain_head(&f),
+        Some(HeadAnchor {
+            chain_id,
+            seq,
+            record_hash
+        })
+    );
     store.shutdown();
 }
 

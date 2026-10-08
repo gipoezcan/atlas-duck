@@ -122,7 +122,7 @@ pub struct ArchivedDb {
     pub head_hash: [u8; 32],
 }
 
-fn random_id() -> Result<String, OpenError> {
+pub(crate) fn random_id() -> Result<String, OpenError> {
     let mut b = [0u8; 16];
     fill_random(&mut b).map_err(|_| OpenError::Io(io::Error::other("OS random source failed")))?;
     Ok(hex::encode(b))

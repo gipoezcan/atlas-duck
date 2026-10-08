@@ -275,11 +275,35 @@ pub(crate) struct Shared {
     pub(crate) settings: Mutex<Settings>,
     /// The view could not be rebuilt from the log (an unreadable settings row).
     pub(crate) settings_unreadable: AtomicBool,
+    /// The store's KEK and its query-tag key (F.7), for the reads on the callers' threads.
+    /// Only a restore replaces them (the restored store's KEK, §8.11).
+    pub(crate) keys: Mutex<StoreKeys>,
+    /// The cached read-only connection of `read_payload`; a restore closes it before the
+    /// store file is replaced and holds the lock until the writer reopened.
+    pub(crate) reader: Mutex<Option<Connection>>,
+}
+
+/// The KEK and `K_q` (F.7, derived once per KEK). No `Debug`: both are keys.
+#[derive(Clone)]
+pub(crate) struct StoreKeys {
+    pub(crate) kek: Kek,
+    pub(crate) query_key: Zeroizing<[u8; 32]>,
+}
+
+impl StoreKeys {
+    pub(crate) fn new(kek: &Kek) -> StoreKeys {
+        StoreKeys {
+            kek: kek.clone(),
+            query_key: crypto::query_key(kek),
+        }
+    }
 }
 
 impl Shared {
-    pub(crate) fn new() -> Arc<Shared> {
+    pub(crate) fn new(kek: &Kek) -> Arc<Shared> {
         Arc::new(Shared {
+            keys: Mutex::new(StoreKeys::new(kek)),
+            reader: Mutex::new(None),
             head: Mutex::new(HeadView {
                 seq: 0,
                 hash: ZERO_HASH,
@@ -344,6 +368,11 @@ pub(crate) enum Cmd {
     Reconcile {
         file: FilePolicy,
         reply: SyncSender<Result<Vec<Committed>, AuditError>>,
+    },
+    /// `Store::restore` (§8.11): staged, verified and committed between commands.
+    Restore {
+        req: Box<crate::restore::RestoreRequest>,
+        reply: SyncSender<Result<crate::restore::RestoreReport, AuditError>>,
     },
     /// `Store::backup` (§8.10): the bundle is written between commands.
     Backup {
@@ -882,6 +911,166 @@ impl Writer {
         Ok(c)
     }
 
+    /// The restore transaction on a staging copy (§8.11 steps 3 and 5; plan order): any
+    /// `vault` table dropped, the pending migrations applied, a new DEK for the month of the
+    /// head's `epoch` (`month` NULL for a NULL epoch) wrapped under this writer's KEK (the
+    /// restored store's), `RESTORE` chained to the head with the `chain_id` column set to
+    /// `new_chain_id` and `target` = `install_id`, then one `SCHEMA_MIGRATED` per step, so
+    /// `RESTORE.source_head_*` name the record right before it (L50). One transaction, in
+    /// memory-journal mode: a staging file is disposable, and no rollback journal ever holds
+    /// a copy of a dropped `vault` page. Returns `(RESTORE, new head)`.
+    pub(crate) fn write_restore(
+        &mut self,
+        payload: &Value,
+        install_id: &str,
+        new_chain_id: &str,
+        steps: &[schema::Migration],
+    ) -> Result<(Committed, Committed), AuditError> {
+        let mode: String = self
+            .conn
+            .pragma_update_and_check(None, "journal_mode", "MEMORY", |r| r.get(0))
+            .map_err(sql)?;
+        if !mode.eq_ignore_ascii_case("memory") {
+            return Err(AuditError::AppendFailed(format!(
+                "staging journal_mode {mode}"
+            )));
+        }
+        let source_head = self.st.head.seq;
+        let st = &mut self.st;
+        let mut new_keys = HashMap::new();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql)?;
+        tx.execute_batch("DROP TABLE IF EXISTS vault")
+            .map_err(sql)?;
+        for m in steps {
+            (m.apply)(&tx).map_err(|e| {
+                AuditError::AppendFailed(format!("migration {} to {} failed: {e}", m.from, m.to))
+            })?;
+            tx.pragma_update(None, "user_version", m.to).map_err(sql)?;
+        }
+        // The new DEK (§8.6, §8.11 step 3), created explicitly: `dek_for` never creates a
+        // month key without a corroboration in this process. The RESTORE row is stamped with
+        // the head's epoch (nothing is corroborated here), so it selects this key.
+        let ts = ts_text(st.clock.now_utc())?;
+        let month = st.clock_state.prev_epoch.map(month_text);
+        let next: i64 = tx
+            .query_row("SELECT COALESCE(MAX(key_id), 0) + 1 FROM keys", [], |r| {
+                r.get(0)
+            })
+            .map_err(sql)?;
+        let key_id =
+            u64::try_from(next).map_err(|_| AuditError::AppendFailed("negative key_id".into()))?;
+        let dek = Dek::generate()?;
+        let wrapped = crypto::wrap_dek(&st.kek, key_id, month.as_deref(), &dek)?;
+        tx.execute(
+            "INSERT INTO keys(key_id, month, wrapped_dek, created_at) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![next, month, wrapped, ts],
+        )
+        .map_err(sql)?;
+        new_keys.insert(key_id, dek);
+        st.head.chain_id = new_chain_id.to_string();
+        let mut p = PreparedEvent::system(EventType::RESTORE, payload)?;
+        p.target = Some(install_id.to_string());
+        let restore = st.append_in_tx(&tx, &p, &mut new_keys)?;
+        if restore.seq != source_head + 1 {
+            return Err(AuditError::AppendFailed(
+                "RESTORE did not follow the snapshot head".into(),
+            ));
+        }
+        let mut head = restore;
+        for m in steps {
+            let p = PreparedEvent::system(
+                EventType::SCHEMA_MIGRATED,
+                &json!({ "from": m.from, "to": m.to, "app_version": APP_VERSION }),
+            )?;
+            head = st.append_in_tx(&tx, &p, &mut new_keys)?;
+        }
+        tx.commit().map_err(sql)?;
+        Ok((restore, head))
+    }
+
+    /// The staging copy after its restore transaction (§8.10's credential rule applied to a
+    /// restore): vacuumed with `secure_delete` on (no freed page of a dropped `vault` table
+    /// survives), page size and incremental auto-vacuum as F.10 requires, back in WAL mode,
+    /// then checkpointed, closed and fsynced with no `-wal` left (`close_for_rename`).
+    pub(crate) fn finish_staging(self, path: &Path) -> Result<(), AuditError> {
+        self.conn
+            .execute_batch(
+                "PRAGMA secure_delete = ON; PRAGMA page_size = 8192; \
+                 PRAGMA auto_vacuum = INCREMENTAL; VACUUM;",
+            )
+            .map_err(sql)?;
+        let mode: String = self
+            .conn
+            .pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))
+            .map_err(sql)?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(AuditError::AppendFailed(format!(
+                "journal_mode WAL refused, got {mode}"
+            )));
+        }
+        self.close_for_rename(path)
+            .map(|_| ())
+            .map_err(|e| AuditError::Io(e.to_string()))
+    }
+
+    /// Closes the read-write connection of the live store (a restore is about to replace the
+    /// file; Windows refuses that while a handle is open). Closing the last connection
+    /// checkpoints the WAL. The writer holds an in-memory placeholder until
+    /// [`Writer::reopen_live`] or [`Writer::reopen_on`].
+    pub(crate) fn close_live(&mut self) -> Result<(), AuditError> {
+        let placeholder = Connection::open_in_memory().map_err(sql)?;
+        std::mem::replace(&mut self.conn, placeholder)
+            .close()
+            .map_err(|(_, e)| sql(e))
+    }
+
+    /// Reopens the live store after [`Writer::close_live`] when the restore did not commit:
+    /// the file is unchanged, so the writer state stays as it was.
+    pub(crate) fn reopen_live(&mut self, path: &Path) -> Result<(), OpenError> {
+        self.conn = open_conn(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            &self.st.hooks,
+        )?;
+        Ok(())
+    }
+
+    /// The writer starts over on a restored store at `path` (§8.11): its KEK, `genesis_hash`
+    /// (a retained `GENESIS` wins), head, `ClockState` from its newest record, settings view,
+    /// open incidents; the DEK cache, the per-process prune state (`clock_floor`,
+    /// `skips_logged`, the backlog, a pending checkpoint, the last prune error) and
+    /// `config_reconciled` start fresh (the restored view must be reconciled with the config
+    /// file again before any prune).
+    pub(crate) fn reopen_on(
+        &mut self,
+        path: &Path,
+        kek: Kek,
+        genesis_hash: Option<[u8; 32]>,
+    ) -> Result<(), OpenError> {
+        let shared = self.st.shared.clone();
+        lock(&shared.dek_cache).clear();
+        *lock(&shared.keys) = StoreKeys::new(&kek);
+        shared
+            .prune_backlog_days
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .checkpoint_pending
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        *lock(&shared.last_prune_error) = None;
+        let parts = WriterParts {
+            clock: self.st.clock.clone(),
+            kek,
+            shared,
+            hooks: self.st.hooks.clone(),
+            genesis_hash,
+        };
+        *self = Writer::open(path, parts)?;
+        Ok(())
+    }
+
     /// Checkpoints and closes the connection so the file can be renamed, then fsyncs it. Fails
     /// if SQLite left a non-empty `-wal` behind (renaming only the main file would lose it).
     pub(crate) fn close_for_rename(self, path: &Path) -> Result<WriterParts, OpenError> {
@@ -1198,6 +1387,10 @@ impl Writer {
                 }
                 Cmd::Reconcile { file, reply } => {
                     let r = self.reconcile_run(&file);
+                    let _ = reply.send(r);
+                }
+                Cmd::Restore { req, reply } => {
+                    let r = self.restore_run(*req);
                     let _ = reply.send(r);
                 }
                 Cmd::Backup {

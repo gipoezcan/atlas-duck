@@ -33,7 +33,6 @@ pub(crate) const BUNDLE_FORMAT_PREFIX: &str = "atlas-duck-backup/v";
 pub(crate) const BUNDLE_FORMAT_VERSION: u64 = 1;
 
 /// A manifest larger than this is not one this build wrote.
-#[allow(dead_code)] // read by restore (next commit)
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 
 /// What a backup produced (C.3).
@@ -67,7 +66,6 @@ pub(crate) struct Manifest {
     pub(crate) recovery_sha256: [u8; 32],
 }
 
-#[allow(dead_code)] // `parse`/`read` are restore's (next commit)
 impl Manifest {
     fn to_json(&self) -> Value {
         json!({

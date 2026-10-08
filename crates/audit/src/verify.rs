@@ -1096,7 +1096,6 @@ struct AnchorCheck<'a> {
     latest_prune_ok: bool,
     head: Option<&'a RowHead>,
     first: Option<u64>,
-    scope_start: Option<u64>,
     log: &'a [PruneLogRow],
     /// No chain, prune-log, first-retained or decrypt finding so far, and no anchor-dir line
     /// that contradicts the store.
@@ -1111,9 +1110,11 @@ struct AnchorResult {
     unanchored_tail: u64,
 }
 
-/// The interrupted-restore rule (§8.7): the latest `RESTORE` is the scope start and a valid
-/// segment boundary, the chain is clean, and the head anchor still names the
-/// `prior_keychain_anchor` (or is absent while that is null).
+/// The interrupted-restore rule (§8.7): the latest `RESTORE` verifies as the latest segment
+/// boundary (a valid boundary with no `PRUNE` after it; records of any other type may follow,
+/// e.g. the `APP_START` of a session whose completion failed or was deferred), the chain is
+/// clean, and the head anchor still names the `prior_keychain_anchor` (or is absent while that
+/// is null).
 fn interrupted_restore(
     conn: &Connection,
     deks: &mut Deks<'_>,
@@ -1125,7 +1126,9 @@ fn interrupted_restore(
     let Some(head) = c.head else {
         return Ok(None);
     };
-    if !c.clean || c.scope_start != Some(r) || c.head_newer.is_some() {
+    // A `PRUNE` after it would be a later boundary: the restore barrier keeps prune from
+    // running before the completion, so one there was not written by an unfinished restore.
+    if !c.clean || c.head_newer.is_some() || latest_of(conn, "'PRUNE'")? > Some(r) {
         return Ok(None);
     }
     let before = match r.checked_sub(1) {
@@ -1169,11 +1172,17 @@ fn interrupted_restore(
     let (Some(head_hash), (frs, last)) = (head.record_hash, latest_values(c.log)) else {
         return Ok(None);
     };
+    // The retained `GENESIS`, else the value of a first-retained anchor the interrupted reset
+    // already wrote for the restored chain, else zero (informational once `GENESIS` is
+    // pruned). Never the replaced chain's value the keychain may still hold.
     let genesis_hash = match c.first {
         Some(1) => row_head(conn, 1)?.and_then(|g| g.record_hash),
         _ => None,
     }
-    .or(c.first_retained.map(|f| f.genesis_hash))
+    .or(c
+        .first_retained
+        .filter(|f| f.chain_id == new_chain)
+        .map(|f| f.genesis_hash))
     .unwrap_or(ZERO_HASH);
     Ok(Some(RestoreCompletion {
         restore_seq: r,
@@ -1461,13 +1470,26 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
     // 4. The latest PRUNE carries the latest row's hash.
     let latest_prune_ok = check_latest_prune(conn, &mut deks, &log, &mut out)?;
     // 5. Chain from the scope start (and the anchored record and latest PRUNE, if earlier).
+    // While the head anchor is absent or names another chain than the head record (only an
+    // unfinished restore leaves it so, unless something is wrong), the latest RESTORE is
+    // walked through too: the interrupted-restore rule needs it verified even when later
+    // records (an APP_START of a session whose completion failed) moved the scope start on.
     let scope_start = latest_of(conn, "'PRUNE', 'RESTORE', 'APP_START'")?.or(first);
+    let head_chain = match head {
+        Some(h) => row_head(conn, h)?.and_then(|r| r.chain_id),
+        None => None,
+    };
+    let unfinished_restore = match &inp.head_anchor {
+        Some(a) if head_chain.as_deref() == Some(a.chain_id.as_str()) => None,
+        _ => latest_of(conn, "'RESTORE'")?,
+    };
     if let (Some(first), Some(head)) = (first, head) {
         let in_store = |s: &u64| *s >= first && *s <= head;
         let lo = [
             scope_start,
             inp.head_anchor.as_ref().map(|a| a.seq),
             log.last().map(|r| r.prune_seq),
+            unfinished_restore,
         ]
         .into_iter()
         .flatten()
@@ -1519,7 +1541,6 @@ fn run_startup(inp: &StartupInputs<'_>) -> rusqlite::Result<StartupVerdict> {
             latest_prune_ok,
             head: head_row.as_ref(),
             first,
-            scope_start,
             log: &log,
             clean,
             anchor_dir_unread: dir.unread,
@@ -1755,7 +1776,6 @@ fn run_full(
             latest_prune_ok,
             head: head_row.as_ref(),
             first,
-            scope_start: latest_of(conn, "'PRUNE', 'RESTORE', 'APP_START'")?.or(first),
             log: &log,
             clean,
             anchor_dir_unread: dir.unread,
@@ -1781,4 +1801,111 @@ pub(crate) fn retained_genesis_hash(conn: &Connection) -> rusqlite::Result<Optio
 pub(crate) fn latest_prune_values(conn: &Connection) -> rusqlite::Result<(u64, [u8; 32])> {
     let log = load_prune_log(conn, &mut Findings::default())?;
     Ok(latest_values(&log))
+}
+
+// ---------------------------------------------------------------------------------------
+// Restore source (§8.11 step 1)
+
+/// The plaintext checks of a restore source before its passphrase is asked for (§8.11 step
+/// 1): the `prune_log` chain and contiguity, the first retained record against its latest
+/// row, and the chain from there to the head (hashes, links, seqs, `chain_id` changing only at
+/// a `RESTORE`). Every finding is an incident kind.
+pub(crate) fn snapshot_chain(conn: &Connection) -> rusqlite::Result<Vec<VerifyFinding>> {
+    let tx = conn.unchecked_transaction()?;
+    let conn: &Connection = &tx;
+    let mut out = Findings::default();
+    let (first, _) = bounds(conn)?;
+    let log = load_prune_log(conn, &mut out)?;
+    check_prune_log(&log, &mut out);
+    check_first_retained(conn, first, &log, &mut out)?;
+    if let Some(first) = first {
+        walk(conn, first, &mut out, |_, _, _, _| Ok(()))?;
+    }
+    drop(tx);
+    Ok(out.finish())
+}
+
+/// The checks of a restore source that need its KEK (after the passphrase): the latest `PRUNE`
+/// decrypts and carries its row's hash, the head record decrypts, and every `RESTORE` is a
+/// valid segment boundary (§8.11).
+pub(crate) fn snapshot_keyed(conn: &Connection, kek: &Kek) -> rusqlite::Result<Vec<VerifyFinding>> {
+    let tx = conn.unchecked_transaction()?;
+    let conn: &Connection = &tx;
+    let mut out = Findings::default();
+    let mut deks = Deks::new(kek);
+    let (first, head) = bounds(conn)?;
+    let log = load_prune_log(conn, &mut Findings::default())?;
+    check_latest_prune(conn, &mut deks, &log, &mut out)?;
+    if let Some(h) = head {
+        with_row(conn, h, |parsed| {
+            match parsed {
+                Ok((f, _)) => {
+                    if let Err(e) = deks.decrypt(conn, &f)? {
+                        out.push(decrypt_finding(h, &e));
+                    }
+                }
+                Err(e) => out.push(
+                    VerifyFinding::new(FindingKind::ChainBroken, format!("unreadable row: {e}"))
+                        .observed(Some(h), None),
+                ),
+            }
+            Ok(())
+        })?;
+    }
+    let restores: Vec<u64> = {
+        let mut st = conn.prepare("SELECT seq FROM events WHERE event_type = 'RESTORE'")?;
+        let rows = st.query_map([], |r| Ok(u64_of(r.get_ref(0)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    for seq in restores {
+        let prev = match seq.checked_sub(1) {
+            Some(s) if first.is_some_and(|f| s >= f) => row_head(conn, s)?.and_then(|b| {
+                Some(Prev {
+                    seq: b.seq,
+                    record_hash: b.record_hash?,
+                    chain_id: b.chain_id?,
+                })
+            }),
+            _ => None,
+        };
+        with_row(conn, seq, |parsed| {
+            let Ok((f, _)) = parsed else {
+                return Ok(());
+            };
+            match deks.decrypt_json(conn, &f)? {
+                Ok(payload) => {
+                    for p in restore_problems(&f, payload.as_ref(), prev.as_ref()) {
+                        out.push(
+                            VerifyFinding::new(FindingKind::RestoreBoundaryMismatch, p)
+                                .observed(Some(seq), None),
+                        );
+                    }
+                }
+                Err(e) => out.push(decrypt_finding(seq, &e)),
+            }
+            Ok(())
+        })?;
+    }
+    drop(tx);
+    Ok(out.finish())
+}
+
+/// The anchor-dir checks (§8.11 step 1: "against the anchor directory's lines for that
+/// `chain_id`") of a restore source. Every finding, a dir that cannot be read included, is
+/// one: a restore is never verified against a dir it could not read.
+pub(crate) fn snapshot_anchor_dir(
+    conn: &Connection,
+    lines: Option<&AnchorDirLines>,
+) -> rusqlite::Result<Vec<VerifyFinding>> {
+    let tx = conn.unchecked_transaction()?;
+    let conn: &Connection = &tx;
+    let mut out = Findings::default();
+    let (_, head) = bounds(conn)?;
+    let log = load_prune_log(conn, &mut Findings::default())?;
+    check_anchor_dir(conn, lines, &log, head, &mut out)?;
+    drop(tx);
+    Ok(out.finish())
 }
