@@ -17,6 +17,7 @@ toml_edit = { workspace = true }
 jsonschema = { workspace = true }
 html-escape = { workspace = true }
 icu_normalizer = { workspace = true }
+idna = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

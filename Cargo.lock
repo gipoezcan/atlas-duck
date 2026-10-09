@@ -454,6 +454,7 @@ dependencies = [
  "hex",
  "html-escape",
  "icu_normalizer",
+ "idna",
  "jsonschema",
  "percent-encoding",
  "proptest",

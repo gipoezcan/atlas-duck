@@ -22,6 +22,9 @@ pub mod ids;
 pub mod lifecycle;
 /// Agent-string normalization at `hello`/submit (§3.3, C.0).
 pub mod normalize;
+/// The op table: an `OpImpl` per registry id, read plans, write executors, enrichment and stale
+/// rules, previewers (§2.3, PD-09, PD-10).
+pub mod ops;
 /// §8.3 payload builders.
 pub mod payloads;
 /// Proxy resolution (L42) and the per-OS static proxy readers (V17).
