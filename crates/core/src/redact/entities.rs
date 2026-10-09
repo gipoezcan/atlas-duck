@@ -4,6 +4,11 @@
 //! lenient view (plan addition) looks them up here first. Generated from
 //! <https://html.spec.whatwg.org/entities.json> (entries with a `;` and more than one code
 //! point), sorted by name for binary search.
+//!
+//! Provenance: WHATWG HTML Living Standard, named character references (entities.json,
+//! fetched 2026-10-09; the named-reference list is frozen by the standard). Copyright © WHATWG
+//! (Apple, Google, Mozilla, Microsoft), licensed under CC BY 4.0
+//! (<https://creativecommons.org/licenses/by/4.0/>). This is a factual 93-row table.
 
 pub(crate) static MULTI_CODE_POINT: [(&[u8], &str); 93] = [
     (b"NotEqualTilde", "\u{2242}\u{0338}"),
@@ -144,5 +149,24 @@ mod tests {
     fn table_is_sorted_and_every_entry_has_two_code_points() {
         assert!(MULTI_CODE_POINT.windows(2).all(|w| w[0].0 < w[1].0));
         assert!(MULTI_CODE_POINT.iter().all(|(_, s)| s.chars().count() == 2));
+    }
+
+    /// Consistency with html-escape, whose table lists every entity name: each name exists there
+    /// and the library's (truncated) value is our first code point.
+    #[test]
+    fn names_and_first_code_points_match_html_escape() {
+        for (name, full) in MULTI_CODE_POINT {
+            let lib = html_escape::NAMED_ENTITIES
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| *v);
+            let first = full.chars().next().map(String::from);
+            assert_eq!(
+                lib.map(str::to_owned),
+                first,
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 }

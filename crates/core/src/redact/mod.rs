@@ -132,7 +132,8 @@ pub struct RedactionMeta {
     /// holds an every-occurrence mask string (or cannot be inspected) is `[REDACTED]` instead:
     /// this list reaches the agent.
     pub fields_dropped: Vec<String>,
-    /// Masked spans (a URL value replaced whole counts one).
+    /// Masked spans (a URL value replaced whole counts one, so does a dropped name withheld as
+    /// `[REDACTED]`).
     pub spans_masked: u64,
 }
 

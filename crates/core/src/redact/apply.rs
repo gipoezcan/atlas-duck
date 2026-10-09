@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::mirror::{self, Counterpart, DroppedOnEntry};
 use super::path::{self, Loc, Pattern, Step};
-use super::views::{Masked, Needle, TextInfo, inspect, mask_value};
+use super::views::{Budget, Masked, Needle, TextInfo, inspect, mask_value};
 use super::{
     BlockReason, DropScope, REDACTED, RedactionMeta, RedactionOp, RedactionOutcome,
     RedactionPreset, UrlMode,
@@ -37,6 +37,7 @@ pub fn apply(
         also: Vec::new(),
         dropped_on_entries: Vec::new(),
         dirty: HashSet::new(),
+        budget: Budget::for_apply(text_bytes(candidate)),
         url_patterns: rules
             .url_fields
             .iter()
@@ -81,7 +82,7 @@ pub fn apply(
     }
 
     // One inspection per text after the drops; reused wherever the text did not change.
-    let pre = Scan::new(&r.doc, &needles, None);
+    let pre = Scan::new(&r.doc, &needles, None, &r.budget);
     for i in 0..needles.len() {
         for (key, info) in pre.iter() {
             if info.hits[i] {
@@ -96,7 +97,7 @@ pub fn apply(
         r.mask_single(&needles, i, at, url_mode, &pre);
     }
     mirror::check(&r.doc, rules.mirrors, &r.dropped_on_entries, &mut r.blocked);
-    let post = Scan::new(&r.doc, &needles, Some((&pre, &r.dirty)));
+    let post = Scan::new(&r.doc, &needles, Some((&pre, &r.dirty)), &r.budget);
     r.redact_dropped_names(&needles, &every);
     if !needles.is_empty() {
         r.final_pass(&post, &every);
@@ -128,11 +129,16 @@ pub fn also_appears_in(candidate: &Value, needle: &str) -> Vec<String> {
         return Vec::new();
     };
     let needles = [n];
-    Scan::new(candidate, &needles, None)
-        .iter()
-        .filter(|(_, info)| info.hits[0])
-        .map(|(key, _)| path::display(&key.1))
-        .collect()
+    Scan::new(
+        candidate,
+        &needles,
+        None,
+        &Budget::for_apply(text_bytes(candidate)),
+    )
+    .iter()
+    .filter(|(_, info)| info.hits[0])
+    .map(|(key, _)| path::display(&key.1))
+    .collect()
 }
 
 fn dedup<T: Clone + Eq + Hash>(v: Vec<T>) -> Vec<T> {
@@ -163,6 +169,13 @@ fn texts(doc: &Value, f: &mut impl FnMut(Kind, &[Step], &str)) {
     });
 }
 
+/// Bytes of every string value, number text and key: what the work budget is relative to.
+fn text_bytes(doc: &Value) -> usize {
+    let mut n = 0usize;
+    texts(doc, &mut |_, _, s| n = n.saturating_add(s.len()));
+    n
+}
+
 fn text_at(doc: &Value, key: &TextKey) -> Option<String> {
     match key.0 {
         Kind::Value => match path::get(doc, &key.1)? {
@@ -185,7 +198,12 @@ struct Scan {
 
 impl Scan {
     /// With `prev`, texts at a location that was not rewritten reuse the earlier inspection.
-    fn new(doc: &Value, needles: &[Needle], prev: Option<(&Scan, &HashSet<Loc>)>) -> Scan {
+    fn new(
+        doc: &Value,
+        needles: &[Needle],
+        prev: Option<(&Scan, &HashSet<Loc>)>,
+        budget: &Budget,
+    ) -> Scan {
         let mut order = Vec::new();
         let mut info = HashMap::new();
         if needles.is_empty() {
@@ -198,7 +216,10 @@ impl Scan {
                     .then(|| p.info.get(&key).cloned())
                     .flatten()
             });
-            info.insert(key.clone(), reuse.unwrap_or_else(|| inspect(s, needles)));
+            info.insert(
+                key.clone(),
+                reuse.unwrap_or_else(|| inspect(s, needles, budget)),
+            );
             order.push(key);
         });
         Scan { order, info }
@@ -226,6 +247,8 @@ struct Redactor<'a> {
     dropped_on_entries: Vec<DroppedOnEntry>,
     /// String values rewritten or removed by a mask.
     dirty: HashSet<Loc>,
+    /// The canonical-form work budget of this call (shared by every text).
+    budget: Budget,
     url_patterns: Vec<Pattern>,
 }
 
@@ -474,7 +497,7 @@ impl Redactor<'_> {
         n: &Needle,
         first_only: bool,
     ) -> (String, bool) {
-        match mask_value(&value, n, first_only) {
+        match mask_value(&value, n, first_only, &self.budget) {
             Masked::NoHit => (value, false),
             Masked::Done { value, spans } => {
                 self.meta.spans_masked += spans;
@@ -494,7 +517,7 @@ impl Redactor<'_> {
     fn hit_now(&self, loc: &[Step], s: &str, needles: &[Needle], i: usize, pre: &Scan) -> bool {
         match pre.get(Kind::Value, loc) {
             Some(info) if !self.dirty.contains(loc) => info.hits[i],
-            _ => inspect(s, std::slice::from_ref(&needles[i])).hits[0],
+            _ => inspect(s, std::slice::from_ref(&needles[i]), &self.budget).hits[0],
         }
     }
 
@@ -574,7 +597,7 @@ impl Redactor<'_> {
             return;
         }
         for name in &mut self.meta.fields_dropped {
-            let info = inspect(name, needles);
+            let info = inspect(name, needles, &self.budget);
             let hit = every.iter().any(|&i| info.hits[i]);
             if hit || info.over_budget || (info.unstable && !every.is_empty()) {
                 *name = REDACTED.to_owned();
@@ -618,13 +641,13 @@ impl Redactor<'_> {
             .iter()
             .filter(|(_, info)| info.hits[i])
             .filter_map(|(key, _)| text_at(&self.doc, key))
-            .map(|s| n.count(&s).max(1))
+            .map(|s| n.count(&s, &self.budget).max(1))
             .sum();
         let in_names: u64 = self
             .meta
             .fields_dropped
             .iter()
-            .map(|name| n.count(name))
+            .map(|name| n.count(name, &self.budget))
             .sum();
         in_doc + in_names
     }

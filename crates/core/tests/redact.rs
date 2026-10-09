@@ -1048,7 +1048,7 @@ proptest! {
     /// matches is ever released unblocked.
     #[test]
     fn mask_every_occurrence_is_sound(
-        needle in "[a-zäöü][a-zäöü +]{1,6}[a-zäöü]",
+        needle in r"[a-zäöü][a-zäöü +%&\[\]]{1,6}[a-zäöü]",
         parts in prop::collection::vec(("[a-z ]{0,4}", any::<u8>(), "[a-z ]{0,4}"), 1..5),
     ) {
         let mut doc = Map::new();
@@ -1209,15 +1209,21 @@ fn i3_needle_across_a_placeholder() -> TestResult {
     ));
     assert_eq!(out.also_appears_in, vec!["a", "b", "c"]);
 
-    // A partial overlap with the placeholder.
+    // A partial overlap takes the whole placeholder with it: no `[REDACT` fragment is left as
+    // text (review N-3), so a codename mask on the same value still converges.
+    for ops in [vec![mask("ED] y")], vec![mask("RED"), mask("ED] y")]] {
+        let out = apply(&json!({"v": "x [REDACTED] y"}), &NO_RULES, None, &ops);
+        assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+        assert_eq!(out.released["v"], "x [REDACTED]");
+    }
     let out = apply(
-        &json!({"v": "x [REDACTED] y"}),
+        &json!({"v": "[REDACTED]x and [REDACTED][REDACTED]x"}),
         &NO_RULES,
         None,
-        &[mask("ED] y")],
+        &[mask("RED"), mask("]x")],
     );
     assert!(out.blocked.is_empty(), "{:?}", out.blocked);
-    assert_eq!(out.released["v"], "x [REDACT[REDACTED]");
+    assert_eq!(out.released["v"], "[REDACTED] and [REDACTED][REDACTED]");
 
     // Single occurrence: the first one, the other is counted.
     let out = apply(
@@ -1493,6 +1499,65 @@ proptest! {
         for f in fields.iter().filter(|f| !dropped.contains(f)) {
             prop_assert_eq!(&rel["fields"][f], &doc["fields"][f]);
             prop_assert_eq!(&rel["renderedFields"][f], &doc["renderedFields"][f]);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// Masks mixed with drops on issue-shaped candidates: dropped fields and their copies are
+    /// gone whatever the masks do; a release that is not blocked has no hit of a masked string
+    /// anywhere (values, keys, dropped names); nulls of untouched fields stay.
+    #[test]
+    fn u29_masks_mixed_with_drops(
+        (doc, fields, _comments) in arb_issue(),
+        drops in prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 0..3),
+        masks in prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 1..3),
+    ) {
+        let r = rules("jira.issue.get").map_err(TestCaseError::fail)?;
+        let mut ops = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        for (ix, all) in &drops {
+            let f = ix.get(&fields).clone();
+            let scope = if *all { DropScope::AllItems } else { DropScope::PerItem };
+            ops.push(drop_field(&format!("fields.{f}"), scope));
+            dropped.push(f);
+        }
+        let mut needles: Vec<String> = Vec::new();
+        for (ix, every) in &masks {
+            let f = ix.get(&fields);
+            let Some(text) = doc["fields"][f].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            needles.push(text.to_owned());
+            ops.push(RedactionOp::MaskText {
+                text: text.to_owned(),
+                every_occurrence: *every,
+                at: None,
+            });
+            if !*every {
+                needles.pop();
+            }
+        }
+        let out = apply(&doc, r, None, &ops);
+        let rel = &out.released;
+        for f in &dropped {
+            for copy in ["fields", "renderedFields", "names", "schema"] {
+                prop_assert!(rel[copy].get(f).is_none(), "{}.{} left", copy, f);
+            }
+        }
+        if out.blocked.is_empty() {
+            for s in strings(rel).iter().chain(&out.meta.fields_dropped) {
+                for n in &needles {
+                    prop_assert!(!canonical_hit(s, n), "{:?} still holds {:?}", s, n);
+                }
+            }
+        }
+        for f in fields.iter().filter(|f| !dropped.contains(f)) {
+            if doc["fields"][f].is_null() {
+                prop_assert_eq!(&rel["fields"][f], &Value::Null);
+            }
         }
     }
 }
