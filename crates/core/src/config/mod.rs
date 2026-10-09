@@ -15,6 +15,7 @@
 //! * `written_by` records the app version of the last writer, so the M6
 //!   banners "config written by vX ..." have a source (plan-added key).
 
+pub mod instances;
 mod migrate;
 
 use std::ffi::OsString;
