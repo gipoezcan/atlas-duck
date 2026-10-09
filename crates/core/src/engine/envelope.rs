@@ -94,18 +94,19 @@ fn details(pairs: &[(&str, Value)]) -> Map<String, Value> {
         .collect()
 }
 
-/// §4.5: `{request_id, op_id, instance, status}`; every other field null/false.
+/// §4.5: `{request_id, op_id, instance, status}`; every other field null/false. `instance` is
+/// `None` only for a request answered from the log whose instance is no longer configured.
 pub fn pending_envelope(
     request_id: &str,
-    op_id: &str,
-    instance: &str,
+    op_id: Option<&str>,
+    instance: Option<&str>,
     status: OpenStatus,
 ) -> Envelope {
     let status = match status {
         OpenStatus::Pending => Status::Pending,
         OpenStatus::Executing => Status::Executing,
     };
-    base(Some(request_id), Some(op_id), Some(instance), status)
+    base(Some(request_id), op_id, instance, status)
 }
 
 /// `failed` for a request that was never queued (`request_id: null`, §4.2).
@@ -269,38 +270,44 @@ pub struct RecordStatus {
     pub error: Option<RecordError>,
 }
 
-fn record_base(rs: &RecordStatus) -> Envelope {
-    base(
+/// The envelope of a request as its records say: an open one is the pending envelope, a
+/// terminal one carries its routing fields, status and `err` of its error.
+fn record_envelope(rs: &RecordStatus, err: impl FnOnce(&RecordError) -> EnvelopeError) -> Envelope {
+    if let Some(open) = OpenStatus::of(rs.status) {
+        return pending_envelope(
+            &rs.request_id,
+            rs.op_id.as_deref(),
+            rs.instance.as_deref(),
+            open,
+        );
+    }
+    let mut env = base(
         Some(&rs.request_id),
         rs.op_id.as_deref(),
         rs.instance.as_deref(),
         rs.status,
-    )
-}
-
-/// §4.4 `status`: routing fields and status; a terminal non-success error reduced to
-/// `{code, retryable}` with the fixed message and no details. Never data, never `meta`.
-pub fn status_envelope(rs: &RecordStatus) -> Envelope {
-    let mut env = record_base(rs);
-    env.error = rs
-        .error
-        .as_ref()
-        .map(|e| error(e.code, e.retryable, MSG_USE_AWAIT, None));
+    );
+    env.error = rs.error.as_ref().map(err);
     env
 }
 
-/// `await` of a terminal request answered from the records (Task 21 adds data delivery and
+/// §4.4 `status`: routing fields and status; a terminal non-success error reduced to
+/// `{code, retryable}` with the fixed message and no details. Never data, never `meta`. A
+/// request the log shows as still open (no terminal record yet) gets the pending envelope.
+pub fn status_envelope(rs: &RecordStatus) -> Envelope {
+    record_envelope(rs, |e| error(e.code, e.retryable, MSG_USE_AWAIT, None))
+}
+
+/// `await` of a request answered from the records (Task 21 adds data delivery and
 /// `DELIVERED`).
 pub fn await_envelope(rs: &RecordStatus) -> Envelope {
-    let mut env = record_base(rs);
-    env.error = rs.error.as_ref().map(|e| {
+    record_envelope(rs, |e| {
         let message = e
             .message
             .clone()
             .unwrap_or_else(|| default_message(e.code).to_owned());
         error(e.code, e.retryable, &message, e.details.clone())
-    });
-    env
+    })
 }
 
 /// The same view of a terminal state only memory knows (an append failure).

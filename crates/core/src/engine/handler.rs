@@ -189,7 +189,7 @@ impl CoreHandler {
             Err(_) => {
                 // The log knows the request but not its end: keep the failure in memory.
                 let retryable = audit_failure_retryable(kind);
-                let mut model = new.model.clone();
+                let mut model = Model::new(kind);
                 let _ = step(&mut model, Event::AuditFailure);
                 self.engine.insert(NewEntry {
                     model,
@@ -224,8 +224,8 @@ impl CoreHandler {
         if let Some(open) = OpenStatus::of(status) {
             return envelope::pending_envelope(
                 &entry.head.request_id,
-                &entry.head.op_id,
-                &entry.head.instance,
+                Some(&entry.head.op_id),
+                Some(&entry.head.instance),
                 open,
             );
         }
@@ -616,8 +616,8 @@ impl RequestHandler for CoreHandler {
         // 10. §4.5: nothing but the four routing fields.
         envelope::pending_envelope(
             &entry.head.request_id,
-            &entry.head.op_id,
-            &entry.head.instance,
+            Some(&entry.head.op_id),
+            Some(&entry.head.instance),
             OpenStatus::Pending,
         )
     }

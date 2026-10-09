@@ -836,3 +836,45 @@ async fn await_unknown_and_restarted_ids_from_the_log() -> TestResult {
     assert_eq!(detail(&env, "param"), json!("key"));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_request_known_only_to_the_log_is_pending_with_four_fields() -> TestResult {
+    use atlas_duck_core::payloads::{EventCtx, request_received};
+    // E.g. a request of an earlier run before crash reconciliation (Task 28) ended it.
+    let h = Harness::jira().await?;
+    let instance_id = h.instance("jira-main").ok_or("instance")?.id.clone();
+    let id = "req_0123456789abcdef0123456789abcdef".to_owned();
+    let ctx = EventCtx {
+        request_id: Some(id.clone()),
+        op_id: Some("jira.issue.get".into()),
+        op_class: Some("read".into()),
+        instance_id: Some(instance_id),
+        target: Some("ABC-1".into()),
+        actor: Default::default(),
+    };
+    let hello = Hello {
+        build_id: BUILD_ID.into(),
+        client_kind: ClientKind::Cli,
+        agent_name: None,
+        agent_name_source: AgentNameSource::None,
+        cwd_basename: "w".into(),
+    };
+    let ev = request_received(
+        &ctx,
+        &issue_get("ABC-1"),
+        &[0; 32],
+        &hello,
+        h.default_conn(),
+        None,
+    );
+    let store = h.store();
+    tokio::task::spawn_blocking(move || store.append(ev)).await??;
+    for env in [h.status(&id).await, h.await_(&id, 10).await] {
+        assert_eq!(env.status, Status::Pending);
+        let v = json(&env)?;
+        assert!(only_routing_fields(&v), "{v}");
+        assert_eq!(v["instance"], "jira-main");
+        assert_eq!(v["op_id"], "jira.issue.get");
+    }
+    Ok(())
+}
