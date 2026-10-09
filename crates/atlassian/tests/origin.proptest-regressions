@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 5eea1810f501fa9d066bf2c5e9133879e759d2eb9ac6cdf2f77f2ac3d9c06302 # shrinks to host = "a.corp", port = None, ctx = [], kind = 4, tail = "a"
+cc c1ee2645b27e75fef598f406d8a83cf7102e2810fbf94a3926e1ad0b2bdfe832 # shrinks to host = "a.corp", port = None, ctx = ["s"], kind = 7, tail = "s"

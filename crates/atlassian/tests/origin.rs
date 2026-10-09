@@ -132,16 +132,66 @@ fn refusal_kinds() -> R {
     Ok(())
 }
 
+/// The proptest's former oracle mistakes, pinned: the guard judges the parsed URL, whose literal
+/// `..` the `url` crate has already resolved, so the resolved path decides.
+#[test]
+fn guard_judges_the_resolved_path() -> R {
+    let base = normalize_base_url("https://a.corp/k")?;
+    let bound = url_hash(&base);
+    let g = |u: &str| -> Result<Result<(), OriginRefused>, url::ParseError> {
+        Ok(origin_guard(&url::Url::parse(u)?, &base, &bound))
+    };
+    // `/k/rest/../../k` is `/k`: the context path itself.
+    assert_eq!(
+        url::Url::parse("https://a.corp/k/rest/../../k")?.path(),
+        "/k"
+    );
+    assert_eq!(g("https://a.corp/k/rest/../../k")?, Ok(()));
+    assert_eq!(
+        g("https://a.corp/k/rest/../../j")?,
+        Err(OriginRefused::OutsideBase)
+    );
+    // A context named like an endpoint segment: an origin-relative `/rest/..` is under it.
+    let rest = normalize_base_url("https://a.corp/rest")?;
+    let joined = url::Url::parse("https://a.corp/rest/rest/x")?.join("/rest/y")?;
+    assert_eq!(origin_guard(&joined, &rest, &url_hash(&rest)), Ok(()));
+    Ok(())
+}
+
+/// Whether a path whose segments are `segs` lies under the context path `ctx`, segment-wise.
+fn under(ctx: &[String], segs: &[&str]) -> bool {
+    segs.len() >= ctx.len() && ctx.iter().zip(segs).all(|(c, s)| c == s)
+}
+
+/// A path segment: random, or one of the names the candidates use, so that collisions with the
+/// context path (`/rest` as a context, a tail equal to the context) are actually drawn.
+fn segment() -> impl Strategy<Value = String> {
+    prop_oneof![
+        3 => "[a-z]{1,6}",
+        1 => Just("rest".to_owned()),
+        1 => Just("other".to_owned()),
+        1 => Just("k".to_owned()),
+    ]
+}
+
+/// 512 cases by default; `PROPTEST_CASES` raises it for a local deep run.
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(512)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
     fn u04_no_pat_outside_bound_base_url(
         host in "[a-z]{1,8}\\.(corp|example)",
         port in proptest::option::of(1024u16..9000),
-        ctx in proptest::collection::vec("[a-z]{1,6}", 0..3),
+        ctx in proptest::collection::vec(segment(), 0..3),
         kind in 0usize..13,
-        tail in "[a-z]{1,6}",
+        tail in segment(),
     ) {
         let fail = |e: &dyn std::fmt::Display| TestCaseError::fail(e.to_string());
         let authority = |h: &str| match port {
@@ -160,35 +210,60 @@ proptest! {
             Some(OriginRefused::NotHttps)
         };
         let first = ctx.first().map(String::as_str).unwrap_or("");
+        let in_ctx = |rest: &[&str]| -> Vec<String> {
+            ctx.iter().cloned().chain(rest.iter().map(|s| (*s).to_owned())).collect()
+        };
 
-        // (candidate, must the guard accept it with the right hash, expected refusal otherwise
-        // with a wrong hash when not decided earlier)
-        let (candidate, accepted, early) = match kind {
-            0 => (format!("{root}/rest/{tail}"), true, None),
-            // Same host, sibling context ("/confluence2"); under an empty context it is simply under the base.
-            1 => (format!("{origin}/{first}2/rest/{tail}"), ctx.is_empty(), None),
-            2 => (format!("{origin}/other/{tail}"), ctx.is_empty() || ctx == ["other"], None),
-            3 => (format!("https://{}{ctx_path}/rest/{tail}", authority(&format!("x{host}"))), false, None),
-            4 => (format!("{}/rest/{tail}", root.replacen("https://", "http://", 1)), false, not_https),
-            5 => (format!("{}/rest/{tail}", root.replacen("https://", "https://u:p@", 1)), false, Some(OriginRefused::Userinfo)),
+        // (candidate, the path segments the parsed URL must have (`None`: never accepted,
+        // whatever the path), expected refusal with a wrong hash when decided before the hash)
+        let (candidate, segments, early): (String, Option<Vec<String>>, _) = match kind {
+            0 => (format!("{root}/rest/{tail}"), Some(in_ctx(&["rest", &tail])), None),
+            // Same host, sibling context ("/confluence2"); under an empty context it is simply
+            // under the base.
+            1 => (
+                format!("{origin}/{first}2/rest/{tail}"),
+                Some(vec![format!("{first}2"), "rest".to_owned(), tail.clone()]),
+                None,
+            ),
+            2 => (format!("{origin}/other/{tail}"), Some(vec!["other".to_owned(), tail.clone()]), None),
+            3 => (format!("https://{}{ctx_path}/rest/{tail}", authority(&format!("x{host}"))), None, None),
+            4 => (format!("{}/rest/{tail}", root.replacen("https://", "http://", 1)), None, not_https),
+            5 => (format!("{}/rest/{tail}", root.replacen("https://", "https://u:p@", 1)), None, Some(OriginRefused::Userinfo)),
             6 => {
                 // `_links.next`-style origin-relative path: `join` drops the context path.
                 let joined = url::Url::parse(&format!("{root}/rest/x"))
                     .and_then(|u| u.join(&format!("/rest/{tail}")))
                     .map_err(|e| fail(&e))?;
-                (joined.to_string(), ctx.is_empty(), None)
+                (joined.to_string(), Some(vec!["rest".to_owned(), tail.clone()]), None)
             }
-            // Path-parameter and encoded-separator traversal: never accepted.
-            8 => (format!("{root}/..;x/{tail}"), false, None),
-            9 => (format!("{root}/..%2F{tail}"), false, None),
-            10 => (format!("{root}/rest/..%5c..%5c{tail}"), false, None),
-            11 => (format!("{root}/%2e%2e%2f{tail}"), false, None),
+            // Path-parameter and encoded-separator traversal: `url` keeps these segments, the
+            // guard refuses every dot-segment spelling.
+            8 => (format!("{root}/..;x/{tail}"), None, None),
+            9 => (format!("{root}/..%2F{tail}"), None, None),
+            10 => (format!("{root}/rest/..%5c..%5c{tail}"), None, None),
+            11 => (format!("{root}/%2e%2e%2f{tail}"), None, None),
             // A path parameter on an ordinary segment is fine.
-            12 => (format!("{root}/rest;jsessionid=x/{tail}"), true, None),
-            // `url` resolves `..` first: the second one climbs out of a non-empty context.
-            _ => (format!("{root}/rest/../../{tail}"), ctx.is_empty(), None),
+            12 => (format!("{root}/rest;jsessionid=x/{tail}"), Some(in_ctx(&["rest;jsessionid=x", &tail])), None),
+            // Literal `..` never reaches the guard: `url` resolves it while parsing (and
+            // `build_url` refuses it before that). The guard judges the resolved path: the second
+            // `..` removes the last context segment, so the result is under the context only when
+            // the context is empty or the tail puts that segment back.
+            _ => {
+                let mut segs: Vec<String> = ctx.iter().take(ctx.len().saturating_sub(1)).cloned().collect();
+                segs.push(tail.clone());
+                (format!("{root}/rest/../../{tail}"), Some(segs), None)
+            }
         };
         let url = url::Url::parse(&candidate).map_err(|e| fail(&e))?;
+        if let Some(want) = &segments {
+            // The oracle's path is the parsed one, no dot segment left.
+            let got: Vec<&str> = url.path().trim_start_matches('/').split('/').collect();
+            prop_assert_eq!(&got, want, "candidate {}", candidate);
+        }
+        let accepted = segments.as_ref().is_some_and(|s| {
+            let segs: Vec<&str> = s.iter().map(String::as_str).collect();
+            under(&ctx, &segs)
+        });
         let got = origin_guard(&url, &base, &bound);
         prop_assert_eq!(got.is_ok(), accepted, "candidate {} got {:?}", candidate, got);
 
