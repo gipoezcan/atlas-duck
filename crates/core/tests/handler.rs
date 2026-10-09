@@ -878,3 +878,44 @@ async fn open_request_known_only_to_the_log_is_pending_with_four_fields() -> Tes
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dry_call_enrichment_required_passes_and_op_checks_reject() -> TestResult {
+    let h = Harness::both().await?;
+    // Writes that need enrichment before they can render: `EnrichmentRequired` passes.
+    for (op, params) in [
+        (
+            "jira.issue.create",
+            json!({ "project": "ABC", "issuetype": "Bug", "summary": "s" }),
+        ),
+        (
+            "jira.issue.transition",
+            json!({ "key": "ABC-1", "transition": "Done" }),
+        ),
+        (
+            "confluence.page.update",
+            json!({ "id": "65537", "base_version": 5, "body": "<p>x</p>", "body_format": "storage" }),
+        ),
+    ] {
+        let env = h.submit(op, params).await;
+        assert_eq!(env.status, Status::Pending, "{op}: {}", env.to_json_line());
+        assert_eq!(
+            h.event_types(&request_id(&env)?).await?,
+            [EventType::REQUEST_RECEIVED]
+        );
+    }
+    // An op-owned static check (the executor as validator hook): edit with nothing to edit.
+    let env = h
+        .submit(
+            "jira.issue.edit",
+            json!({ "key": "ABC-1", "expected": { "summary": "Old" } }),
+        )
+        .await;
+    assert_eq!(code(&env), "validation", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 2);
+    assert_eq!(
+        h.event_types(&request_id(&env)?).await?,
+        [EventType::REQUEST_RECEIVED, EventType::REQUEST_REJECTED]
+    );
+    Ok(())
+}
