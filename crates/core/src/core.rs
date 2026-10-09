@@ -90,10 +90,42 @@ pub enum HookPoint {
     AfterAppend(atlas_duck_audit::EventType),
 }
 
-/// Test-only behaviour installed by `Core::start_with_port` (Task 28 acts on it).
+/// A point where a test holds a flow: the flow signals `reached`, then waits for `release`.
 #[cfg(feature = "testing")]
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Default)]
+pub struct Pause {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "testing")]
+impl std::fmt::Debug for Pause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pause")
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Pause {
+    pub fn new() -> Arc<Pause> {
+        Arc::new(Pause::default())
+    }
+
+    /// Signal `reached`, then wait for `release`.
+    pub(crate) async fn hold(&self) {
+        self.reached.notify_one();
+        self.release.notified().await;
+    }
+}
+
+/// Test-only behaviour installed by `Core::start_with_port` before anything runs (Task 28 acts
+/// on `freeze_at` and `panic_on_jql`).
+#[cfg(feature = "testing")]
+#[derive(Debug, Clone, Default)]
 pub struct TestHooks {
+    /// `submit` holds right after its `REQUEST_RECEIVED` committed (I-3: a caller dropped there
+    /// must not leave the request unapplied).
+    pub pause_after_received: Option<Arc<Pause>>,
     pub freeze_at: Option<HookPoint>,
     /// A read whose JQL contains this text panics after `REQUEST_RECEIVED` (S-15).
     pub panic_on_jql: Option<String>,
@@ -121,7 +153,7 @@ impl Core {
     /// Needs a `Ready` store; without one the app serves `gate_handler` instead (C.7).
     pub async fn start(deps: CoreDeps) -> Result<Core, StartError> {
         let port: Arc<dyn AuditPort> = Arc::new(deps.audit.clone());
-        Core::start_inner(deps, port, None).await
+        Core::start_inner(deps, port, StartOptions::default()).await
     }
 
     /// `start` with the audit port replaced (e.g. `FaultyAudit::wrap(..)`) and test hooks
@@ -132,16 +164,19 @@ impl Core {
         port: Arc<dyn AuditPort>,
         hooks: TestHooks,
     ) -> Result<Core, StartError> {
-        let core = Core::start_inner(deps, port, hooks.limits).await?;
-        core.engine.set_hooks(hooks);
-        Ok(core)
+        let opts = StartOptions {
+            limits: hooks.limits,
+            hooks,
+        };
+        Core::start_inner(deps, port, opts).await
     }
 
     async fn start_inner(
         deps: CoreDeps,
         port: Arc<dyn AuditPort>,
-        limits: Option<Limits>,
+        opts: StartOptions,
     ) -> Result<Core, StartError> {
+        let limits = opts.limits;
         let config = match &deps.config_path {
             Some(path) => assign_ids(path.clone(), deps.config).await,
             None => deps.config,
@@ -166,6 +201,8 @@ impl Core {
             ui: deps.ui,
             instances: InstanceTable::from_config(&config),
             limits,
+            #[cfg(feature = "testing")]
+            hooks: opts.hooks,
         }));
         Ok(Core {
             handler: Arc::new(CoreHandler::new(engine.clone())),
@@ -189,6 +226,8 @@ impl Core {
         self.instances.clone()
     }
 
+    /// Tests only: the engine's internals (audit port, covers) are not part of the app surface.
+    #[cfg(feature = "testing")]
     pub fn engine(&self) -> &Arc<Engine> {
         &self.engine
     }
@@ -201,6 +240,14 @@ impl Core {
     }
 }
 
+/// What `start` and `start_with_port` differ in.
+#[derive(Default)]
+struct StartOptions {
+    limits: Option<Limits>,
+    #[cfg(feature = "testing")]
+    hooks: TestHooks,
+}
+
 /// PD-04: write ids for hand-written instances when the file is writable, then read it again.
 /// A failed write or re-read keeps the loaded state: those instances stay unconfirmed.
 async fn assign_ids(path: PathBuf, config: ConfigState) -> ConfigState {
@@ -209,7 +256,7 @@ async fn assign_ids(path: PathBuf, config: ConfigState) -> ConfigState {
     }
     let fallback = config.clone();
     tokio::task::spawn_blocking(move || {
-        ensure_ids(&path, &config)
+        ensure_ids(&path)
             .and_then(|()| load_config(&path))
             .unwrap_or(config)
     })

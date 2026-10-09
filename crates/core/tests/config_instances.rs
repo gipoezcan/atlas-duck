@@ -137,6 +137,10 @@ fn malformed_entries_fail_the_list_without_echoing_values() -> TestResult {
             InstancesError::DuplicateAlias { index: 1 },
         ),
         (
+            "[[instances]]\nid = \"ins_0123456789abcdef0123456789abcdef\"\nalias = \"a\"\nproduct = \"jira\"\nbase_url = \"https://x\"\n[[instances]]\nid = \"ins_0123456789abcdef0123456789abcdef\"\nalias = \"b\"\nproduct = \"jira\"\nbase_url = \"https://y\"",
+            InstancesError::DuplicateId { index: 1 },
+        ),
+        (
             "[[instances]]\nalias = \"a\"\nproduct = \"jira\"\nbase_url = \"https://x\"\ndefault = true\n[[instances]]\nalias = \"b\"\nproduct = \"jira\"\nbase_url = \"https://y\"\ndefault = true",
             InstancesError::DuplicateDefault { index: 1 },
         ),
@@ -162,7 +166,7 @@ fn ensure_ids_writes_ids_only_when_writable() -> TestResult {
         dir.path(),
         &format!("# keep me\nschema_version = 1\n{body}"),
     )?;
-    ensure_ids(&path, &load_config(&path)?)?;
+    ensure_ids(&path)?;
     let list = instances(&load_config(&path)?)?;
     let id = list
         .first()
@@ -173,7 +177,7 @@ fn ensure_ids_writes_ids_only_when_writable() -> TestResult {
 
     // Idempotent: a second run leaves the file byte-identical.
     let before = fs::read(&path)?;
-    ensure_ids(&path, &load_config(&path)?)?;
+    ensure_ids(&path)?;
     assert_eq!(fs::read(&path)?, before);
 
     // A newer (read-only) file is never written.
@@ -181,7 +185,7 @@ fn ensure_ids_writes_ids_only_when_writable() -> TestResult {
     let before = fs::read(&newer)?;
     let state = load_config(&newer)?;
     assert!(matches!(state, ConfigState::ReadOnly { .. }));
-    ensure_ids(&newer, &state)?;
+    ensure_ids(&newer)?;
     assert_eq!(fs::read(&newer)?, before);
     assert_eq!(instances(&state)?.first().map(|i| i.id.clone()), Some(None));
     Ok(())
@@ -287,5 +291,26 @@ fn routing_default_single_and_wrong_product() -> TestResult {
         t.resolve(Product::Jira, None).err(),
         Some(RouteError::ConfigUnreadable)
     );
+    Ok(())
+}
+
+#[test]
+fn ensure_ids_reads_the_file_again_and_leaves_a_malformed_list_alone() -> TestResult {
+    let dir = tempfile::tempdir()?;
+    let body = "[[instances]]\nalias = \"a\"\nproduct = \"jira\"\nbase_url = \"https://x\"\n";
+    let path = write(dir.path(), &format!("schema_version = 1\n{body}"))?;
+    // An edit made after the caller loaded the file is kept (no lost update).
+    let _stale = load_config(&path)?;
+    write(dir.path(), &format!("schema_version = 1\n# edited\n{body}"))?;
+    ensure_ids(&path)?;
+    let text = fs::read_to_string(&path)?;
+    assert!(text.contains("# edited"), "{text}");
+    assert!(text.contains("id = \"ins_"), "{text}");
+    // A list refused as a whole gets no ids written into it.
+    let bad = format!("schema_version = 1\n{body}{body}");
+    write(dir.path(), &bad)?;
+    let before = fs::read(&path)?;
+    ensure_ids(&path)?;
+    assert_eq!(fs::read(&path)?, before);
     Ok(())
 }

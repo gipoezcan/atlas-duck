@@ -105,8 +105,9 @@ impl ProgressSink for CapturingSink<'_> {
 impl RequestHandler for CapturingHandler {
     async fn hello(&self, conn: &ConnectionMeta, h: Hello) -> Result<HelloReply, Envelope> {
         let r = self.inner.hello(conn, h).await;
-        if let Err(e) = &r {
-            self.cap.record(Channel::Envelope, e);
+        match &r {
+            Ok(reply) => self.cap.record(Channel::Envelope, reply),
+            Err(e) => self.cap.record(Channel::Envelope, e),
         }
         r
     }

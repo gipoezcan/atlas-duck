@@ -4,11 +4,13 @@
 //! (PD-01…PD-03), admission (low space, pending limits, `max_pending_bytes`), `params_sha256` (PD-27), `REQUEST_RECEIVED` through
 //! `commit_request_received` (§5.1 inv. 1), static validation and the dry executor call (PD-09),
 //! then the pending envelope. Everything refused before `REQUEST_RECEIVED` is answered with
-//! `request_id: null` and logs nothing. Dispatch to the read/write/script flows is Tasks
-//! 21/22/27.
+//! `request_id: null` and logs nothing. From the `REQUEST_RECEIVED` commit on, `submit` runs in
+//! its own task, so a dropped caller future (a client that went away) cannot leave a committed
+//! request unapplied: it is validated and either queued or rejected in the log regardless.
+//! Dispatch to the read/write/script flows is Tasks 21/22/27.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
 use atlas_duck_audit::{AuditError, EventHeader, EventType, QueryKind, is_terminal};
@@ -25,17 +27,17 @@ use atlas_duck_registry::{
 use serde_json::{Map, Value, json};
 
 use super::envelope::{self, OpenStatus};
-use super::queue::{AgentKey, Reservation};
+use super::queue::{AgentKey, Reservation, Ticket};
 use super::{
-    Engine, NewEntry, RequestEntry, RequestHead, Session, TerminalError, TransitionError,
-    audit_failure_retryable, class_str, kind_of, payload_json,
+    Engine, NewEntry, RequestEntry, RequestHead, Session, TerminalError, audit_failure_retryable,
+    class_str, kind_of, payload_json,
 };
 use crate::audit_port::commit_request_received;
 use crate::config::instances::product_str;
 use crate::gate::{GateState, hello_check, ops_describe_local, ops_list_local};
 use crate::ids::RequestId;
 use crate::instances::{InstanceRuntime, InstanceState, RouteError};
-use crate::lifecycle::model::{Event, Model, Rejection, step};
+use crate::lifecycle::model::{Event, Kind, Model, step};
 use crate::normalize::{normalize_agent_name, normalize_hello, normalize_reason};
 use crate::ops::{ExecCtx, ExecError, NOT_IN_THIS_BUILD_MESSAGE, op_table};
 use crate::payloads::{self, EventCtx};
@@ -43,8 +45,10 @@ use crate::validate::{EffectiveCaps, ValidateCtx, ValidationError, validate};
 
 /// §4.1: the CLI's default wait, used when an `await` names none.
 pub const DEFAULT_AWAIT_MS: u64 = 100_000;
-/// How much of a normalized `reason` a queue row shows (plan decision).
-const REASON_EXCERPT_CHARS: usize = 120;
+/// §5.6: the queue row shows "the first ~60 characters of the agent's reason".
+const REASON_EXCERPT_CHARS: usize = 60;
+/// The longest `await` the server honours: the longest a request can stay pending (§4.4, 7 d).
+pub const MAX_AWAIT_MS: u64 = 7 * 24 * 3600 * 1000;
 /// `requests list` looks back this far (§4.4).
 const RECENT_WINDOW: Duration = Duration::from_secs(24 * 3600);
 
@@ -55,6 +59,153 @@ pub struct CoreHandler {
 impl CoreHandler {
     pub fn new(engine: Arc<Engine>) -> CoreHandler {
         CoreHandler { engine }
+    }
+}
+
+/// What `submit` hands its task: everything the request needs from the commit on, owned (the
+/// task outlives the caller's future).
+struct Received {
+    spec: &'static OperationSpec,
+    routed: Routed,
+    sha: [u8; 32],
+    request_id: RequestId,
+    kind: Kind,
+    params: Value,
+    reason: Option<String>,
+    session: Session,
+    conn: ConnectionMeta,
+    ticket: Ticket,
+}
+
+/// `submit` steps 6–10 from the `REQUEST_RECEIVED` commit (§5.1 inv. 1) to the pending
+/// envelope: validation, the dry executor call, then the map or a `REQUEST_REJECTED`.
+async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
+    let spec = j.spec;
+    let ctx = EventCtx {
+        request_id: Some(j.request_id.0.clone()),
+        op_id: Some(spec.id.to_owned()),
+        op_class: Some(class_str(spec).to_owned()),
+        instance_id: Some(j.routed.id.clone()),
+        target: None,
+        actor: Default::default(),
+    };
+    let committed = {
+        let (mut ctx, params, hello, conn, reason, set, sha) = (
+            ctx,
+            j.params.clone(),
+            j.session.hello.clone(),
+            j.conn.clone(),
+            j.reason.clone(),
+            engine.committed().clone(),
+            j.sha,
+        );
+        engine
+            .blocking(move |port| {
+                ctx.target = target_column(port, spec, &params);
+                let ev = payloads::request_received(
+                    &ctx,
+                    &params,
+                    &sha,
+                    &hello,
+                    &conn,
+                    reason.as_deref(),
+                );
+                commit_request_received(port, &set, ev).map(|_| ctx)
+            })
+            .await
+    };
+    let ctx = match committed {
+        Ok(ctx) => ctx,
+        Err(_) => return envelope::audit_failure(audit_failure_retryable(j.kind)),
+    };
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks().pause_after_received.clone() {
+        pause.hold().await;
+    }
+    let head = RequestHead {
+        request_id: j.request_id.0.clone(),
+        op_id: spec.id.to_owned(),
+        instance: j.routed.alias.clone(),
+    };
+    let (reason_excerpt, reason_unusual) = match j.reason.as_deref().map(normalize_reason) {
+        Some((r, u)) => ((!r.is_empty()).then(|| excerpt(&r)), u),
+        None => (None, false),
+    };
+    let mut new = NewEntry {
+        head,
+        spec,
+        instance_id: j.routed.id.clone(),
+        params_sha256: hex::encode(j.sha),
+        target_display: target_display(spec, &j.params),
+        agent_name: j.session.normalized.agent_name.clone(),
+        reason_excerpt,
+        unusual: j.session.normalized.unusual || reason_unusual,
+        session: j.session.key(&j.conn),
+        validated: None,
+        ctx,
+        model: Model::new(j.kind),
+        unlogged_terminal: None,
+        ticket: Some(j.ticket),
+    };
+    // 7. Static validation (T13).
+    let vctx = ValidateCtx {
+        instance_version: j.routed.version,
+        caps: &EffectiveCaps::default(),
+        for_script: false,
+    };
+    let validated = match validate(spec, &j.params, &vctx) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = step(&mut new.model, Event::ValidationFailed);
+            return CoreHandler::reject(&engine, new, err).await;
+        }
+    };
+    // 8. The dry executor call: op-owned static checks (CQL, edit with nothing to edit) and
+    // PD-09; `EnrichmentRequired` passes (T18).
+    let dry = match op_table().get(spec.id) {
+        Some(op) => (op.executor)(&ExecCtx {
+            spec,
+            params: &validated.params,
+            base: &j.routed.base,
+            enrichment: None,
+            effective_max: validated.effective_max,
+        })
+        .map(|_| ()),
+        None => Err(ExecError::NotInThisBuild),
+    };
+    let refusal = match dry {
+        Ok(()) | Err(ExecError::EnrichmentRequired) => None,
+        Err(ExecError::NotInThisBuild) => Some(internal_error(NOT_IN_THIS_BUILD_MESSAGE)),
+        Err(ExecError::Invalid(err)) => Some(err),
+    };
+    // 9. Into the map, then dispatch (Tasks 21/22/27; the request waits in `Validated`). A
+    // model that refuses `ValidationPassed` would be a bug: rejected in the log, never orphaned.
+    let refusal = refusal.or_else(|| {
+        step(&mut new.model, Event::ValidationPassed)
+            .is_err()
+            .then(|| internal_error("request state error"))
+    });
+    if let Some(err) = refusal {
+        new.model = Model::new(j.kind);
+        let _ = step(&mut new.model, Event::ValidationFailed);
+        return CoreHandler::reject(&engine, new, err).await;
+    }
+    new.validated = Some(validated);
+    let entry = engine.insert(new);
+    // 10. §4.5: nothing but the four routing fields.
+    envelope::pending_envelope(
+        &entry.head.request_id,
+        Some(&entry.head.op_id),
+        Some(&entry.head.instance),
+        OpenStatus::Pending,
+    )
+}
+
+fn internal_error(message: &str) -> ValidationError {
+    ValidationError {
+        code: ErrorCode::Internal,
+        message: message.to_owned(),
+        details: Map::new(),
     }
 }
 
@@ -141,7 +292,8 @@ fn describe_env(available: bool) -> DescribeEnv {
 }
 
 /// One `requests list` row with the fields the filters need.
-struct ListRow {
+#[derive(Debug, Clone)]
+pub(crate) struct ListRow {
     row: RequestRow,
     agent_name: Option<String>,
     instance_id: Option<String>,
@@ -172,7 +324,7 @@ impl CoreHandler {
 
     /// Steps 7–8 failure: `REQUEST_REJECTED {code, message, details}` (decision `reject`), then
     /// `failed` with the request id. The id is never cover-ready again.
-    async fn reject(&self, new: NewEntry, err: ValidationError) -> Envelope {
+    async fn reject(engine: &Engine, new: NewEntry, err: ValidationError) -> Envelope {
         let ev = payloads::request_rejected(
             &new.ctx,
             err.code,
@@ -181,8 +333,8 @@ impl CoreHandler {
         );
         let head = new.head.clone();
         let kind = kind_of(new.spec);
-        let appended = self.engine.blocking(move |p| p.append(ev)).await;
-        self.engine.committed().forget_request(&head.request_id);
+        let appended = engine.blocking(move |p| p.append(ev)).await;
+        engine.committed().forget_request(&head.request_id);
         match appended {
             Ok(_) => {
                 envelope::failed_request(&head, err.code, false, &err.message, Some(err.details))
@@ -192,7 +344,7 @@ impl CoreHandler {
                 let retryable = audit_failure_retryable(kind);
                 let mut model = Model::new(kind);
                 let _ = step(&mut model, Event::AuditFailure);
-                self.engine.insert(NewEntry {
+                engine.insert(NewEntry {
                     model,
                     // Terminal: the admission place goes back now, not with the entry.
                     ticket: None,
@@ -289,6 +441,14 @@ impl CoreHandler {
             .iter()
             .filter_map(|i| Some((i.id.clone()?, i.alias.clone())))
             .collect();
+        let memo = self.engine.terminal_rows().clone();
+        let passes =
+            move |agent_name: Option<&String>, op_id: Option<&String>, inst: Option<&String>| {
+                agent.as_ref().is_none_or(|a| agent_name == Some(a))
+                    && matcher
+                        .as_ref()
+                        .is_none_or(|(op, i)| op_id == Some(op) && inst == Some(i))
+            };
         self.engine
             .blocking(move |p| {
                 let headers = p.recent_headers(RECENT_WINDOW)?;
@@ -301,6 +461,22 @@ impl CoreHandler {
                 let mut rows = Vec::new();
                 for (id, hs) in by_request {
                     if skip.contains(&id) {
+                        continue;
+                    }
+                    // A recorded terminal's row never changes: build it (decrypt) once.
+                    let hit = memo.lock().unwrap_or_else(PoisonError::into_inner).get(&id);
+                    if let Some(mut r) = hit {
+                        if passes(
+                            r.agent_name.as_ref(),
+                            Some(&r.row.op_id),
+                            r.instance_id.as_ref(),
+                        ) {
+                            r.row.instance = r
+                                .instance_id
+                                .as_ref()
+                                .and_then(|i| alias_of.get(i).cloned());
+                            rows.push(r);
+                        }
                         continue;
                     }
                     let Some(terminal) = hs.iter().find(|h| {
@@ -338,15 +514,11 @@ impl CoreHandler {
                             None => continue,
                         },
                     };
-                    if let Some(a) = &agent
-                        && start.actor.agent_name.as_ref() != Some(a)
-                    {
-                        continue;
-                    }
-                    if let Some((op_id, instance_id)) = &matcher
-                        && (start.op_id.as_ref() != Some(op_id)
-                            || start.instance_id.as_ref() != Some(instance_id))
-                    {
+                    if !passes(
+                        start.actor.agent_name.as_ref(),
+                        start.op_id.as_ref(),
+                        start.instance_id.as_ref(),
+                    ) {
                         continue;
                     }
                     let payload = payload_json(p, start.seq);
@@ -369,9 +541,9 @@ impl CoreHandler {
                         None,
                         start.op_class.as_deref(),
                     );
-                    rows.push(ListRow {
+                    let row = ListRow {
                         row: RequestRow {
-                            request_id: id,
+                            request_id: id.clone(),
                             op_id,
                             instance: start
                                 .instance_id
@@ -384,7 +556,11 @@ impl CoreHandler {
                         },
                         agent_name: start.actor.agent_name.clone(),
                         instance_id: start.instance_id.clone(),
-                    });
+                    };
+                    memo.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(&id, row.clone());
+                    rows.push(row);
                 }
                 Ok(rows)
             })
@@ -519,128 +695,30 @@ impl RequestHandler for CoreHandler {
             Ok(t) => t,
             Err(busy) => return busy.envelope(),
         };
-        // 6. `params_sha256` (PD-27), the id, `REQUEST_RECEIVED` (§5.1 inv. 1).
+        // 6. `params_sha256` (PD-27) and the id; nothing is logged before this point.
         let Ok(sha) = params_sha256(spec.id, Some(&routed.id), &p.params) else {
             return envelope::integer_out_of_range();
         };
         let Ok(request_id) = RequestId::new() else {
             return envelope::internal("no request id could be generated");
         };
-        let ctx = EventCtx {
-            request_id: Some(request_id.0.clone()),
-            op_id: Some(spec.id.to_owned()),
-            op_class: Some(class_str(spec).to_owned()),
-            instance_id: Some(routed.id.clone()),
-            target: None,
-            actor: Default::default(),
-        };
-        let committed = {
-            let (mut ctx, params, hello, conn2, reason, set) = (
-                ctx.clone(),
-                p.params.clone(),
-                session.hello.clone(),
-                conn.clone(),
-                p.reason.clone(),
-                engine.committed().clone(),
-            );
-            engine
-                .blocking(move |port| {
-                    ctx.target = target_column(port, spec, &params);
-                    let ev = payloads::request_received(
-                        &ctx,
-                        &params,
-                        &sha,
-                        &hello,
-                        &conn2,
-                        reason.as_deref(),
-                    );
-                    commit_request_received(port, &set, ev).map(|_| ctx)
-                })
-                .await
-        };
-        let ctx = match committed {
-            Ok(ctx) => ctx,
-            Err(_) => return envelope::audit_failure(audit_failure_retryable(kind)),
-        };
-        let head = RequestHead {
-            request_id: request_id.0.clone(),
-            op_id: spec.id.to_owned(),
-            instance: routed.alias.clone(),
-        };
-        let (reason_excerpt, reason_unusual) = match p.reason.as_deref().map(normalize_reason) {
-            Some((r, u)) => ((!r.is_empty()).then(|| excerpt(&r)), u),
-            None => (None, false),
-        };
-        let mut new = NewEntry {
-            head,
+        // From the `REQUEST_RECEIVED` commit on, in its own task, driven to completion even if
+        // this future is dropped (a pending request is independent of its connection, §4.4).
+        let job = Received {
             spec,
-            instance_id: routed.id.clone(),
-            params_sha256: hex::encode(sha),
-            target_display: target_display(spec, &p.params),
-            agent_name: session.normalized.agent_name.clone(),
-            reason_excerpt,
-            unusual: session.normalized.unusual || reason_unusual,
-            session: session.key(conn),
-            validated: None,
-            ctx,
-            model: Model::new(kind),
-            unlogged_terminal: None,
-            ticket: Some(ticket),
+            routed,
+            sha,
+            request_id,
+            kind,
+            params: p.params,
+            reason: p.reason,
+            session,
+            conn: conn.clone(),
+            ticket,
         };
-        // 7. Static validation (T13).
-        let vctx = ValidateCtx {
-            instance_version: routed.version,
-            caps: &EffectiveCaps::default(),
-            for_script: false,
-        };
-        let validated = match validate(spec, &p.params, &vctx) {
-            Ok(v) => v,
-            Err(err) => {
-                let _ = step(&mut new.model, Event::ValidationFailed);
-                return self.reject(new, err).await;
-            }
-        };
-        // 8. The dry executor call: op-owned static checks (CQL) and PD-09.
-        let dry = match op_table().get(spec.id) {
-            Some(op) => (op.executor)(&ExecCtx {
-                spec,
-                params: &validated.params,
-                base: &routed.base,
-                enrichment: None,
-                effective_max: validated.effective_max,
-            })
-            .map(|_| ()),
-            None => Err(ExecError::NotInThisBuild),
-        };
-        match dry {
-            Ok(()) | Err(ExecError::EnrichmentRequired) => {}
-            Err(ExecError::NotInThisBuild) => {
-                let _ = step(&mut new.model, Event::ValidationFailed);
-                let err = ValidationError {
-                    code: ErrorCode::Internal,
-                    message: NOT_IN_THIS_BUILD_MESSAGE.to_owned(),
-                    details: Map::new(),
-                };
-                return self.reject(new, err).await;
-            }
-            Err(ExecError::Invalid(err)) => {
-                let _ = step(&mut new.model, Event::ValidationFailed);
-                return self.reject(new, err).await;
-            }
-        }
-        // 9. Into the map, then dispatch (Tasks 21/22/27; the request waits in `Validated`).
-        if step(&mut new.model, Event::ValidationPassed).is_err() {
-            return envelope::internal("request state error");
-        }
-        new.validated = Some(validated);
-        let entry = engine.insert(new);
-        // 10. §4.5: nothing but the four routing fields.
-        envelope::pending_envelope(
-            &entry.head.request_id,
-            Some(&entry.head.op_id),
-            Some(&entry.head.instance),
-            OpenStatus::Pending,
-        )
+        tokio::spawn(record_and_validate(engine.clone(), job))
+            .await
+            .unwrap_or_else(|_| envelope::internal("the request task failed"))
     }
 
     async fn submit_script(&self, _conn: &ConnectionMeta, _p: SubmitParams) -> Envelope {
@@ -661,7 +739,8 @@ impl RequestHandler for CoreHandler {
             // After a restart (or once terminal): from the records (Task 21 adds delivery).
             return self.records_answer(&a.request_id, false).await;
         };
-        let wait = Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_AWAIT_MS));
+        let wait =
+            Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_AWAIT_MS).min(MAX_AWAIT_MS));
         let deadline = tokio::time::Instant::now() + wait;
         let mut rx = entry.subscribe();
         let mut last = *rx.borrow_and_update();
@@ -692,16 +771,16 @@ impl RequestHandler for CoreHandler {
     }
 
     async fn cancel(&self, request_id: &str) -> Envelope {
-        match self.engine.cancel_by_client(request_id).await {
-            None => self.records_answer(request_id, false).await,
-            Some(Ok(_)) => self.records_answer(request_id, false).await,
-            Some(Err(TransitionError::Rejected(Rejection::NotCancellable)))
-            | Some(Err(TransitionError::Raced(_)))
-            | Some(Err(TransitionError::Rejected(_)))
-            | Some(Err(TransitionError::Audit(_))) => match self.engine.entry(request_id) {
-                Some(entry) => self.entry_answer(&entry, false).await,
-                None => self.records_answer(request_id, false).await,
-            },
+        // §4.4/§4.5: a cancel never says more than `status` would, apart from its own outcome;
+        // deny reasons and error details come only from `await`.
+        let Some(entry) = self.engine.entry(request_id) else {
+            return self.records_answer(request_id, true).await;
+        };
+        match self.engine.cancel_by_client(&entry).await {
+            Ok(_) => envelope::cancelled_by_client(&entry.head),
+            // Not cancellable (executing, already terminal) or the append failed: the current
+            // status.
+            Err(_) => self.entry_answer(&entry, true).await,
         }
     }
 
@@ -789,7 +868,7 @@ impl RequestHandler for CoreHandler {
                     "config_error": config_error,
                     "reachable": null,
                     "needs_token": i.state == InstanceState::NeedsToken,
-                    "locked": false,
+                    "locked": null,
                     "tls_error": null,
                     "proxy_error": null,
                     "identity_header": identity_header,

@@ -118,6 +118,13 @@ async fn s16_capture_records_every_channel() -> TestResult {
         records.iter().all(|r| !r.json.is_empty()),
         "every record serialized"
     );
+    // A successful `hello` is captured too.
+    assert!(
+        h.capture()
+            .on(Channel::Envelope)
+            .iter()
+            .any(|r| r.json.contains("\"build_id\""))
+    );
     Ok(())
 }
 

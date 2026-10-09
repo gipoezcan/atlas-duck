@@ -158,6 +158,24 @@ pub fn unknown_request() -> Envelope {
     failed_direct(ErrorCode::UnknownRequest, false, MSG_UNKNOWN_REQUEST, None)
 }
 
+/// §4.3/§4.4: the answer to a successful client `cancel`, the same whatever the request's
+/// internal state was: `cancelled`, exit 7, `details.reason = by_client`, `retryable: false`.
+pub fn cancelled_by_client(head: &RequestHead) -> Envelope {
+    let mut env = base(
+        Some(&head.request_id),
+        Some(&head.op_id),
+        Some(&head.instance),
+        Status::Cancelled,
+    );
+    env.error = Some(error(
+        ErrorCode::Cancelled,
+        false,
+        MSG_CANCELLED,
+        Some(details(&[("reason", json!("by_client"))])),
+    ));
+    env
+}
+
 /// An unknown op id: `usage`, `details {op_id}` (bounded, display-escaped), nothing logged.
 pub fn unknown_op(op_id: &str) -> Envelope {
     failed_direct(

@@ -275,7 +275,7 @@ async fn status_never_blocks_never_delivers() -> TestResult {
     let id = request_id(&h.submit("jira.issue.get", issue_get("ABC-1")).await)?;
     let st = tokio::time::timeout(Duration::from_secs(2), h.status(&id)).await?;
     assert_eq!(st.status, Status::Pending);
-    assert_eq!(exit(&st), 4);
+    // (`status` exits 0 for any known id, §4.4: the CLI's override, M4; not the matrix.)
     assert!(only_routing_fields(&json(&st)?));
     assert_eq!(h.event_types(&id).await?, [EventType::REQUEST_RECEIVED]);
     Ok(())
@@ -347,7 +347,6 @@ async fn await_times_out_pending_then_wakes_on_expiry() -> TestResult {
     let st = h.status(&id).await;
     assert_eq!(st.status, Status::Expired);
     assert_eq!(code(&st), "expired");
-    assert_eq!(exit(&st), 7);
     Ok(())
 }
 
@@ -809,6 +808,7 @@ async fn doctor_reports_per_alias_without_urls() -> TestResult {
     assert_eq!(jira["configured"], true);
     assert_eq!(jira["config_error"], Value::Null);
     assert_eq!(jira["needs_token"], false);
+    assert_eq!(jira["locked"], Value::Null, "unknown until Task 25");
     assert!(d["instances"]["wiki"].is_object());
     Ok(())
 }
@@ -917,5 +917,178 @@ async fn dry_call_enrichment_required_passes_and_op_checks_reject() -> TestResul
         h.event_types(&request_id(&env)?).await?,
         [EventType::REQUEST_RECEIVED, EventType::REQUEST_REJECTED]
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_of_a_decided_request_says_no_more_than_status() -> TestResult {
+    let h = Harness::jira().await?;
+    let id = request_id(&h.submit("jira.issue.get", json!({})).await)?;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Failed);
+    assert_eq!(code(&env), "validation");
+    assert_eq!(
+        env.error.as_ref().map(|e| e.message.as_str()),
+        Some("use await for details")
+    );
+    assert_eq!(env.error.as_ref().and_then(|e| e.details.clone()), None);
+    assert_eq!(env.data, None);
+    assert_eq!(env.to_json_line(), h.status(&id).await.to_json_line());
+    // A cancelled request cancelled again: the status form, no `details`.
+    let id = request_id(&h.submit("jira.issue.get", issue_get("ABC-1")).await)?;
+    let first = h.handler().cancel(&id).await;
+    assert_eq!(detail(&first, "reason"), json!("by_client"));
+    let again = h.handler().cancel(&id).await;
+    assert_eq!(again.status, Status::Cancelled);
+    assert_eq!(again.error.as_ref().and_then(|e| e.details.clone()), None);
+    assert_eq!(h.event_types(&id).await?.len(), 2);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_terminal_events_commit_one_terminal_record() -> TestResult {
+    let h = Harness::jira().await?;
+    let terminal = |t: &EventType| matches!(t, EventType::CANCELLED | EventType::EXPIRED);
+    for round in 0..10 {
+        // Two cancels.
+        let id = request_id(&h.submit("jira.issue.get", issue_get("ABC-1")).await)?;
+        let handler = h.handler();
+        let (a, b) = tokio::join!(handler.cancel(&id), handler.cancel(&id));
+        assert_eq!(
+            (a.status, b.status),
+            (Status::Cancelled, Status::Cancelled),
+            "{round}"
+        );
+        let types = h.event_types(&id).await?;
+        assert_eq!(types.iter().filter(|t| terminal(t)).count(), 1, "{types:?}");
+        // Exactly one of them is the cancel that happened.
+        let by_client = [&a, &b]
+            .iter()
+            .filter(|e| detail(e, "reason") == json!("by_client"))
+            .count();
+        assert_eq!(by_client, 1);
+        assert!(h.engine().entry(&id).is_none(), "memory follows the log");
+        // A cancel against an expiry.
+        let id = request_id(&h.submit("jira.issue.get", issue_get("ABC-2")).await)?;
+        let (c, expired) = tokio::join!(handler.cancel(&id), h.expire_now(&id));
+        let types = h.event_types(&id).await?;
+        assert_eq!(types.iter().filter(|t| terminal(t)).count(), 1, "{types:?}");
+        let logged = if types.contains(&EventType::CANCELLED) {
+            Status::Cancelled
+        } else {
+            Status::Expired
+        };
+        assert_eq!(h.status(&id).await.status, logged);
+        assert_eq!(c.status, logged);
+        assert_eq!(expired, logged == Status::Expired);
+    }
+    assert_eq!(
+        h.engine().admission().pending_total(),
+        0,
+        "every place given back once"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submit_dropped_after_the_commit_still_lands() -> TestResult {
+    use atlas_duck_core::{Pause, TestHooks};
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_after_received: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let before = h.event_count().await?;
+    {
+        let submit = h.submit("jira.issue.get", issue_get("ABC-1"));
+        tokio::select! {
+            _ = submit => return Err("submit finished while paused".into()),
+            _ = pause.reached.notified() => {}
+        }
+        // `submit` is dropped here, right after `REQUEST_RECEIVED` committed.
+    }
+    assert_eq!(h.event_count().await?, before + 1);
+    pause.release.notify_one();
+    let mut entries = Vec::new();
+    for _ in 0..200 {
+        entries = h.engine().pending_entries();
+        if !entries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let entry = entries
+        .first()
+        .ok_or("the committed request never reached memory")?;
+    assert_eq!(entry.agent_status(), Status::Pending);
+    let id = entry.head.request_id.clone();
+    assert!(h.engine().committed().request_committed(&id));
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    // A dropped submit whose request is rejected still logs the rejection.
+    let submit = h.submit("jira.issue.get", json!({}));
+    tokio::select! {
+        _ = submit => return Err("submit finished while paused".into()),
+        _ = pause.reached.notified() => {}
+    }
+    pause.release.notify_one();
+    for _ in 0..200 {
+        if h.event_count().await? == before + 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        h.event_count().await?,
+        before + 3,
+        "REQUEST_RECEIVED + REQUEST_REJECTED"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn await_bound_is_capped_and_the_reason_excerpt_short() -> TestResult {
+    let h = Harness::jira().await?;
+    let reason = "r".repeat(300);
+    let env = h
+        .handler()
+        .submit(
+            h.default_conn(),
+            SubmitParams {
+                op_id: "jira.issue.get".into(),
+                params: issue_get("ABC-1"),
+                instance: None,
+                reason: Some(reason),
+            },
+        )
+        .await;
+    let id = request_id(&env)?;
+    let entry = h.engine().entry(&id).ok_or("entry")?;
+    let excerpt = entry.reason_excerpt.clone().ok_or("excerpt")?;
+    assert_eq!(
+        excerpt.chars().count(),
+        61,
+        "60 characters and the ellipsis"
+    );
+    // An absurd bound does not overflow; the wait still ends with the request.
+    let handler = h.handler();
+    let conn = h.default_conn().clone();
+    let waiting = handler.await_request(
+        &conn,
+        AwaitParams {
+            request_id: id.clone(),
+            timeout_ms: Some(u64::MAX),
+        },
+        &NoProgress,
+    );
+    let expire = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.expire_now(&id).await
+    };
+    let (env, _) = tokio::join!(waiting, expire);
+    assert_eq!(env.status, Status::Expired);
     Ok(())
 }

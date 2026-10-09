@@ -48,7 +48,7 @@ pub mod testing;
 
 pub use crate::core::{Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, StartError};
 #[cfg(feature = "testing")]
-pub use crate::core::{HookPoint, TestHooks};
+pub use crate::core::{HookPoint, Pause, TestHooks};
 pub use atlas_duck_preview::CandidateRev;
 pub use decision::{
     BatchFailure, BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionKind,

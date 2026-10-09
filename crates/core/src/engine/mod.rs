@@ -9,6 +9,12 @@
 //! The one exception is a terminal state the store could not record (an append failure, §11.1):
 //! the entry stays in memory with its error, since the log cannot say it.
 //!
+//! Record-bearing transitions of one request are serialized by the entry's transition gate (an
+//! async mutex held across clone-step, append and apply), so two racing terminal events (two
+//! cancels, cancel against expiry, a decision against a cancel) never both commit. Each
+//! transition runs in its own task: a caller whose future is dropped (a client that went away)
+//! cannot leave a committed record unapplied to memory.
+//!
 //! Admission (Task 20, `queue`): an entry holds its admission [`Ticket`] from insertion until it
 //! is terminal; `Engine::after_change` drops it there (every terminal path, logged or not, goes
 //! through it) together with the cached candidate (`cache`).
@@ -18,7 +24,7 @@ pub mod envelope;
 pub mod handler;
 pub mod queue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
@@ -48,7 +54,7 @@ use crate::redact::RedactionOp;
 use crate::validate::Validated;
 
 use cache::{Candidate, CandidateCache, RebuildError};
-use envelope::RecordStatus;
+use envelope::{OpenStatus, RecordStatus};
 use queue::{Admission, Limits, Ticket};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -120,6 +126,8 @@ pub struct RequestEntry {
     status: watch::Sender<Status>,
     /// The admission place (§3.3, §5.2), held until terminal.
     ticket: Mutex<Option<Ticket>>,
+    /// Serializes record-bearing transitions (held across the append; never the state lock).
+    gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// The parts of a new entry the handler fills in.
@@ -172,6 +180,7 @@ impl RequestEntry {
             }),
             status,
             ticket: Mutex::new(ticket),
+            gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -289,14 +298,59 @@ pub struct EngineDeps {
     pub ui: Arc<dyn UiSink>,
     pub instances: InstanceTable,
     pub limits: Limits,
+    #[cfg(feature = "testing")]
+    pub hooks: crate::core::TestHooks,
 }
+
+/// Terminal answers are immutable once recorded: a bounded memo of them keeps polling and
+/// listing from decrypting the same records again (insertion order, oldest out first).
+pub(crate) struct Recent<V> {
+    cap: usize,
+    map: HashMap<String, V>,
+    order: VecDeque<String>,
+}
+
+impl<V: Clone> Recent<V> {
+    pub(crate) fn new(cap: usize) -> Recent<V> {
+        Recent {
+            cap,
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<V> {
+        self.map.get(key).cloned()
+    }
+
+    pub(crate) fn insert(&mut self, key: &str, v: V) {
+        if self.map.insert(key.to_owned(), v).is_none() {
+            self.order.push_back(key.to_owned());
+        }
+        while self.map.len() > self.cap {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.map.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+/// How many terminal answers / list rows are memoized.
+const RECENT_MEMO: usize = 4096;
 
 pub struct Engine {
     port: Arc<dyn AuditPort>,
     committed: Arc<CommittedSet>,
+    // Read from Task 21 on (covered sends, credentials, native confirmations).
+    #[allow(dead_code)]
     covers: CoverIssuer,
     http: Arc<HttpFactory>,
+    #[allow(dead_code)]
     credentials: Arc<dyn CredentialProvider>,
+    #[allow(dead_code)]
     confirmer: Arc<dyn NativeConfirmer>,
     clock: Arc<dyn Clock>,
     ui: Arc<dyn UiSink>,
@@ -310,8 +364,12 @@ pub struct Engine {
     /// §5.2: at most `limits.fetching` direct reads in `Fetching` (Task 21 acquires).
     fetch_slots: Arc<Semaphore>,
     candidates: CandidateCache,
+    /// Recorded terminal statuses (with the start record's instance id).
+    terminal_status: Mutex<Recent<(RecordStatus, Option<String>)>>,
+    /// `requests list` rows of recorded terminals.
+    terminal_rows: Arc<Mutex<Recent<handler::ListRow>>>,
     #[cfg(feature = "testing")]
-    hooks: Mutex<crate::core::TestHooks>,
+    hooks: crate::core::TestHooks,
 }
 
 impl Engine {
@@ -334,12 +392,15 @@ impl Engine {
                 d.limits.fetching.min(Semaphore::MAX_PERMITS),
             )),
             candidates: CandidateCache::new(d.limits.candidate_cache_bytes),
+            terminal_status: Mutex::new(Recent::new(RECENT_MEMO)),
+            terminal_rows: Arc::new(Mutex::new(Recent::new(RECENT_MEMO))),
             #[cfg(feature = "testing")]
-            hooks: Mutex::new(crate::core::TestHooks::none()),
+            hooks: d.hooks,
         }
     }
 
-    pub fn port(&self) -> &Arc<dyn AuditPort> {
+    #[allow(dead_code)] // used from Task 21 on
+    pub(crate) fn port(&self) -> &Arc<dyn AuditPort> {
         &self.port
     }
 
@@ -348,7 +409,8 @@ impl Engine {
     }
 
     /// Covers only for ids whose start record committed (§5.1 inv. 1).
-    pub fn covers(&self) -> &CoverIssuer {
+    #[allow(dead_code)] // used from Task 21 on
+    pub(crate) fn covers(&self) -> &CoverIssuer {
         &self.covers
     }
 
@@ -356,11 +418,13 @@ impl Engine {
         &self.http
     }
 
-    pub fn credentials(&self) -> &Arc<dyn CredentialProvider> {
+    #[allow(dead_code)] // used from Task 21 on
+    pub(crate) fn credentials(&self) -> &Arc<dyn CredentialProvider> {
         &self.credentials
     }
 
-    pub fn confirmer(&self) -> &Arc<dyn NativeConfirmer> {
+    #[allow(dead_code)] // used from Task 21 on
+    pub(crate) fn confirmer(&self) -> &Arc<dyn NativeConfirmer> {
         &self.confirmer
     }
 
@@ -398,13 +462,12 @@ impl Engine {
     }
 
     #[cfg(feature = "testing")]
-    pub(crate) fn set_hooks(&self, hooks: crate::core::TestHooks) {
-        *lock(&self.hooks) = hooks;
+    pub fn hooks(&self) -> &crate::core::TestHooks {
+        &self.hooks
     }
 
-    #[cfg(feature = "testing")]
-    pub fn hooks(&self) -> crate::core::TestHooks {
-        lock(&self.hooks).clone()
+    pub(crate) fn terminal_rows(&self) -> &Arc<Mutex<Recent<handler::ListRow>>> {
+        &self.terminal_rows
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -468,7 +531,31 @@ impl Engine {
     /// from the clone, then replace the model if nothing changed meanwhile, else re-step the
     /// current model with the same event. An append failure takes the request to `Failed`
     /// (`OutcomeUnknown` from `Executing`, M-8). Watchers wake on every agent-visible change.
+    ///
+    /// The entry's transition gate is held from the clone step through the apply, so a second
+    /// transition sees the first one's result (e.g. a second cancel finds the request terminal
+    /// and logs nothing); the re-step branch is then only a defence. The whole sequence runs in
+    /// its own task and is driven to completion even if the caller's future is dropped.
     pub async fn transition<R>(
+        self: &Arc<Self>,
+        entry: &Arc<RequestEntry>,
+        event: Event,
+        record: R,
+    ) -> Result<Applied, TransitionError>
+    where
+        R: FnOnce(&Model) -> NewEvent + Send + 'static,
+    {
+        let (engine, entry) = (self.clone(), entry.clone());
+        tokio::spawn(async move { engine.transition_gated(&entry, event, record).await })
+            .await
+            .unwrap_or_else(|_| {
+                Err(TransitionError::Audit(AuditError::AppendFailed(
+                    "transition task failed".into(),
+                )))
+            })
+    }
+
+    async fn transition_gated<R>(
         &self,
         entry: &Arc<RequestEntry>,
         event: Event,
@@ -477,6 +564,7 @@ impl Engine {
     where
         R: FnOnce(&Model) -> NewEvent,
     {
+        let _gate = entry.gate.clone().lock_owned().await;
         let (clone, applied, rev, phase) = {
             let st = entry.state();
             let mut m = st.model.clone();
@@ -607,45 +695,55 @@ impl Engine {
 
     /// PD-14: the expiry path (the timer arrives with Task 24, which replaces this with
     /// `cancel_now(.., Expiry)` and its in-flight capture). `false` if the id is not pending here.
-    pub async fn expire_now(&self, request_id: &str) -> bool {
+    pub async fn expire_now(self: &Arc<Self>, request_id: &str) -> bool {
         let Some(entry) = self.entry(request_id) else {
             return false;
         };
         let ctx = entry.ctx.clone();
-        self.transition(&entry, Event::Expire, |_| payloads::expired(&ctx))
+        self.transition(&entry, Event::Expire, move |_| payloads::expired(&ctx))
             .await
             .is_ok()
     }
 
     /// `cancel` by the client (§4.4) for the phases Task 19 reaches; Task 24 replaces it with the
-    /// synchronous `cancel_now` and its in-flight records. `None` if the id is not in memory.
+    /// synchronous `cancel_now` and its in-flight records (and must keep the transition gate).
     pub(crate) async fn cancel_by_client(
-        &self,
-        request_id: &str,
-    ) -> Option<Result<Applied, TransitionError>> {
-        let entry = self.entry(request_id)?;
+        self: &Arc<Self>,
+        entry: &Arc<RequestEntry>,
+    ) -> Result<Applied, TransitionError> {
         let ctx = entry.ctx.clone();
-        Some(
-            self.transition(&entry, Event::Cancel(CancelReason::ByClient), |_| {
-                payloads::cancelled(&ctx, CancelReason::ByClient)
-            })
-            .await,
-        )
+        self.transition(entry, Event::Cancel(CancelReason::ByClient), move |_| {
+            payloads::cancelled(&ctx, CancelReason::ByClient)
+        })
+        .await
     }
 
     /// The request's status as its committed records say (§4.4): `None` for an id the log does
-    /// not know. Decrypts only the rows whose meaning depends on their payload.
+    /// not know. Decrypts only the rows whose meaning depends on their payload, and a recorded
+    /// terminal only once (memoized: it can no longer change).
     pub async fn status_from_records(
         &self,
         request_id: &str,
     ) -> Result<Option<RecordStatus>, AuditError> {
-        let id = request_id.to_owned();
-        let found = self
-            .blocking(move |p| {
-                let headers = p.headers_for_request(&id)?;
-                records_status(p, &headers)
-            })
-            .await?;
+        let memo = lock(&self.terminal_status).get(request_id);
+        let found = match memo {
+            Some(hit) => Some(hit),
+            None => {
+                let id = request_id.to_owned();
+                let found = self
+                    .blocking(move |p| {
+                        let headers = p.headers_for_request(&id)?;
+                        records_status(p, &headers)
+                    })
+                    .await?;
+                if let Some(rs) = &found
+                    && OpenStatus::of(rs.0.status).is_none()
+                {
+                    lock(&self.terminal_status).insert(request_id, rs.clone());
+                }
+                found
+            }
+        };
         Ok(found.map(|(rs, instance_id)| {
             let alias = instance_id
                 .as_deref()

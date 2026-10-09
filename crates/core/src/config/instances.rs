@@ -234,13 +234,18 @@ fn write_error(e: ConfigWriteError) -> io::Error {
 }
 
 /// PD-04: give every `[[instances]]` table without an `id` a fresh one and write the file back,
-/// only when the config is `Writable` (a read-only or unreadable file is never written, §7.7).
-/// Nothing is written when every table already has an id.
-pub fn ensure_ids(path: &Path, cfg: &ConfigState) -> io::Result<()> {
-    let ConfigState::Writable(config) = cfg else {
+/// only when the file on disk is `Writable` (a read-only or unreadable file is never written,
+/// §7.7). The file is read again here, so an edit made since the caller loaded it is kept, and
+/// a malformed `[[instances]]` list is left alone (it is refused as a whole). Nothing is written
+/// when every table already has an id.
+pub fn ensure_ids(path: &Path) -> io::Result<()> {
+    let state = load_config(path)?;
+    if instances(&state).is_err() {
+        return Ok(());
+    }
+    let ConfigState::Writable(mut config) = state else {
         return Ok(());
     };
-    let mut config = config.clone();
     let Some(aot) = config
         .doc
         .get_mut(KEY_INSTANCES)

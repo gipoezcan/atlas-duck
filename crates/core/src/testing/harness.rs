@@ -75,6 +75,7 @@ pub struct HarnessBuilder {
     extra_config: String,
     omit_ids: bool,
     limits: Option<Limits>,
+    hooks: TestHooks,
 }
 
 impl HarnessBuilder {
@@ -132,6 +133,12 @@ impl HarnessBuilder {
     /// Appended to the generated `config.toml` (e.g. a `[limits]` table).
     pub fn extra_config(mut self, text: &str) -> Self {
         self.extra_config.push_str(text);
+        self
+    }
+
+    /// Test hooks installed before the core serves anything (`limits` is set by `limits`).
+    pub fn hooks(mut self, hooks: TestHooks) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -207,7 +214,7 @@ impl HarnessBuilder {
         };
         let hooks = TestHooks {
             limits: self.limits,
-            ..TestHooks::none()
+            ..self.hooks
         };
         let core = Core::start_with_port(deps, port.clone(), hooks).await?;
         let handler = CapturingHandler::wrap(core.handler(), capture.clone());
@@ -296,6 +303,7 @@ impl Harness {
             extra_config: String::new(),
             omit_ids: false,
             limits: None,
+            hooks: TestHooks::none(),
         }
     }
 
