@@ -174,6 +174,17 @@ pub fn agent_actor(hello: &Hello, conn: &ConnectionMeta) -> Actor {
     }
 }
 
+/// The agent columns of `hello`/`conn` over `ctx.actor`'s approver fields.
+fn with_agent(mut ev: NewEvent, hello: &Hello, conn: &ConnectionMeta) -> NewEvent {
+    ev.actor = Actor {
+        os_user: ev.actor.os_user,
+        atlassian_user: ev.actor.atlassian_user,
+        atlassian_user_key: ev.actor.atlassian_user_key,
+        ..agent_actor(hello, conn)
+    };
+    ev
+}
+
 // ---- Lifecycle -------------------------------------------------------------------------------
 
 /// `REQUEST_RECEIVED`: full params, `params_sha256`, the connection with raw agent strings, the
@@ -192,7 +203,7 @@ pub fn request_received(
         Some((r, u)) => (Some(r), u),
         None => (None, false),
     };
-    let mut ev = event(
+    let ev = event(
         ctx,
         EventType::REQUEST_RECEIVED,
         json!({
@@ -208,14 +219,7 @@ pub fn request_received(
             },
         }),
     );
-    let agent = agent_actor(hello, conn);
-    ev.actor = Actor {
-        os_user: ev.actor.os_user,
-        atlassian_user: ev.actor.atlassian_user,
-        atlassian_user_key: ev.actor.atlassian_user_key,
-        ..agent
-    };
-    ev
+    with_agent(ev, hello, conn)
 }
 
 /// `REQUEST_REJECTED` (terminal), decision `reject`.
@@ -471,7 +475,9 @@ pub fn batch_confirmed(
 }
 
 /// `DELIVERED {connection_id, client_kind, agent_name(+source), cwd_basename, peer_pid,
-/// peer_exe, peer_chain, payload_sha256}` (PD-23) for the connection it was handed to.
+/// peer_exe, peer_chain, payload_sha256}` (PD-23) for the connection it was handed to, which
+/// may differ from the submitter's: the agent columns come from `hello`/`conn`, as in
+/// `request_received`.
 pub fn delivered(
     ctx: &EventCtx,
     hello: &Hello,
@@ -483,7 +489,11 @@ pub fn delivered(
         "payload_sha256".into(),
         Value::String(hex::encode(payload_sha256)),
     );
-    event(ctx, EventType::DELIVERED, Value::Object(m))
+    with_agent(
+        event(ctx, EventType::DELIVERED, Value::Object(m)),
+        hello,
+        conn,
+    )
 }
 
 // ---- Reads -----------------------------------------------------------------------------------
@@ -1103,6 +1113,38 @@ mod tests {
         assert!(ev.flags.contains(EventFlags::BATCH));
         assert_eq!(ev.payload["batch_id"], "bat_1");
         assert_eq!(ev.decision, Some(DecisionColumn::Deny));
+    }
+
+    #[test]
+    fn delivered_names_the_awaiting_connection() {
+        let hello = Hello {
+            build_id: "b".into(),
+            client_kind: ClientKind::Mcp,
+            agent_name: Some("waiter\u{202E}".into()),
+            agent_name_source: AgentNameSource::McpClientInfo,
+            cwd_basename: "w".into(),
+        };
+        let conn = ConnectionMeta {
+            connection_id: "conn_await".into(),
+            peer: Default::default(),
+        };
+        let ctx = EventCtx {
+            request_id: Some("req_1".into()),
+            actor: Actor {
+                agent_name: Some("submitter".into()),
+                connection_id: Some("conn_submit".into()),
+                os_user: Some("jdoe".into()),
+                ..Actor::default()
+            },
+            ..EventCtx::default()
+        };
+        let ev = delivered(&ctx, &hello, &conn, &[0; 32]);
+        assert_eq!(ev.actor.agent_name.as_deref(), Some("waiter"));
+        assert_eq!(ev.actor.connection_id.as_deref(), Some("conn_await"));
+        assert_eq!(ev.actor.client_kind.as_deref(), Some("mcp"));
+        assert_eq!(ev.actor.os_user.as_deref(), Some("jdoe"));
+        assert_eq!(ev.payload["agent_name"], "waiter\u{202E}");
+        assert_eq!(ev.payload["agent_name_source"], "mcp-clientInfo");
     }
 
     #[test]
