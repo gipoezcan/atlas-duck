@@ -2094,6 +2094,16 @@ pub fn op_table() -> &'static BTreeMap<&'static str, OpImpl>;   // C.7
 - [ ] **Step 2: Implement; un-ignore Task 20's two rebuild tests; run** `cargo test -p atlas-duck-core --features testing --locked` → pass.
 - [ ] **Step 3: Commit** `feat(core): read lifecycle, read decisions, PREVIEW_SHOWN, raw pages and await delivery` (+ trailer).
 
+**As built (Task 21 + review fixes; reports `task-21-report.md`, `task-21-review.md`):**
+- **Δ C.7 (accepted): redaction revisions through `decide`.** A `Release`/`ReleaseRedacted` decision whose `redactions` differ from the current revision's ops applies them to the normalized body as a new revision (`CandidateChanged`, inv. 5; no record), answers `pending`, and must be opened and then released with the same ops (or `None`). Ops that block (§5.3) or a redacted candidate over the 16 MiB release cap are `DECISION_INVALID {not_approvable}`, no new revision. Both the new revision and every rebuild are built by `cache::build_redacted`.
+- **M6 owns `DecisionApi::redaction_preview(request_id, rev, ops)`** (Δ C.7, UI-only, no record): block reasons, "N other occurrences remain", "also appears in" before the user submits ops.
+- **Ruling 2:** a stale `preview_fetch` is logged `DECISION_STALE {decision: "preview"}` (payload value only; the `decision` column is untouched). Only the first open of a revision commits `PREVIEW_SHOWN` (§5.6).
+- **Ruling 3:** the 1 h delivery window evicts released data and released upstream-error details (`result_evicted`, exit 10); an outcome answer `{code, hint}` is fixed text and stays deliverable.
+- **Ruling 4 and its carve-out (Δ against §4.3 l.341 wording, recorded here):** a direct `READ_FAILED` keeps its connection `class` / status-header `reason` in the record only (envelope: code, fixed message); the one exception is `details.reason` = `identity_header_missing` / `identity_header_mismatch`, which §4.3 names in the direct `upstream_unavailable` envelope.
+- **Ruling 5 widened (review I-1):** after a first page, every direct class (connection, status/header-decided, `needs_token`/origin guard, identity check) is a gated outcome item (`network` → `upstream_network`, else `unparsable` → `upstream_unavailable`; card `LaterPageRefused` for the non-network ones), the class/reason in the `READ_FETCHED` payload. A 2xx JSON body the client accepts but the candidate cannot be built from (e.g. nested deeper than `serde_json::Value`'s 128) is an `unparsable` outcome, never a direct `internal` (review I-2).
+- The human deny reason is stripped with `invisible::strip(reason, true)` before `READ_DENIED` (review M-1 ruling).
+- The synchronous `DecisionApi` (`Engine::run_sync`) waits through `block_in_place`; the core must run on a multi-thread runtime and `DecisionApi` is never called from a `LocalSet` (M4/M6 contract).
+
 ---
 
 ### Task 22: Write lifecycle: enrichment and its failure split, approve/edit/deny, `WRITE_APPROVED`, identity call + stale check, execution, outcomes (I-06 single-item, I-12, I-23/I-24 write paths, U-03/U-30 end-to-end)
@@ -2221,6 +2231,8 @@ fn decide_batch(&self, items: Vec<BatchItem>) -> Result<BatchOutcome, DecisionEr
 - Produces: `Engine::cancel_now(&self, id: &RequestId, reason: CancelCause) -> Envelope` — a **synchronous** function (no `async`, no `.await` inside, holds only `std::sync` locks); `CancelCause::{Client, Expiry, Shutdown(CancelReason)}`; the async `RequestHandler::cancel` calls it directly. Expiry timer per pending request (`tokio::time::sleep_until(submitted_at + expiry)`; `config.toml` `[requests] expiry_hours` 1–168, default 24) → `cancel_now(.., Expiry)`.
 
 **Spec:** §4.4 cancel and expiry rules (identical envelope, never waits on network, aborted connection or reap), §5.2 step 3, §5.4 step 2 cancelled in flight, §2.5 step 2, §8.3 `READ_FETCHED`/`PREVIEW_FETCH {cancelled_in_flight}`, L19, L26, §13 I-09/I-10/I-11.
+
+- **Handoff from Task 21 (binding):** cancel `RequestEntry::fetch_control()` **only while holding the entry's transition gate**, inside `cancel_now`'s gated section that takes the captured bytes and commits `[READ_FETCHED {cancelled_in_flight}, CANCELLED|EXPIRED]`. The read task answers `CancelledInFlight`/`CancelledBeforeSend` with a gated `FetchFailedDirect` (`READ_FAILED {internal}` "the read was aborted"), which is refused once `cancel_now` made the request terminal; a control cancelled outside the gate lets the read end the request `internal` first. The read stores its control **before** minting its cover (`read.rs::fetch`): a cancel before that point has forgotten the id (no cover), one after it finds the control. Shutdown/abandon (§2.5 step 2, Task 28) uses the same path. The fetch-slot wait already ends on a terminal status.
 
 **`cancel_now` algorithm:**
 1. Entry not in memory → answer from headers (`status`-like but full `await` semantics are not needed: return the current status envelope, never `DELIVERED`); unknown → `unknown_request`, exit 2.
