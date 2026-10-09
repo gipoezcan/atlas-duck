@@ -109,8 +109,8 @@ fn decompress_bounds() {
     assert!(decompress(&z, 3).is_err());
     // Rejected before any allocation.
     assert_eq!(
-        decompress(&z, 64 * 1024 * 1024 + 1),
-        Err(AuditError::Invalid("payload_len above 64 MiB"))
+        decompress(&z, 96 * 1024 * 1024 + 1),
+        Err(AuditError::Invalid("payload above 96 MiB"))
     );
     assert!(decompress(b"not a zstd frame", 2).is_err());
 }

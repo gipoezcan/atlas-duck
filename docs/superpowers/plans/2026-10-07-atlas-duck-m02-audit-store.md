@@ -851,7 +851,7 @@ pub fn query_tag(k_q: &[u8; 32], kind: QueryKind, query: &str) -> String {
     match kind { QueryKind::Jql => format!("jql:{tag}"), QueryKind::Cql => format!("cql:{tag}") }
 }
 ```
-Argon2: `argon2::Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(65536, 3, 4, Some(32))?)` then `hash_password_into(pass_bytes, &salt, key.as_mut())`; keep the derived key in `Zeroizing`. `decompress` uses `zstd::bulk::decompress(c, payload_len as usize)` and rejects `payload_len > 64 MiB` (`Invalid`) before allocating.
+Argon2: `argon2::Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::new(65536, 3, 4, Some(32))?)` then `hash_password_into(pass_bytes, &salt, key.as_mut())`; keep the derived key in `Zeroizing`. `decompress` uses `zstd::bulk::decompress(c, payload_len as usize)` and rejects `payload_len > 64 MiB` (`Invalid`) before allocating (raised to 96 MiB, `MAX_PAYLOAD_LEN`, by M3 Task 17's review I-3: a `READ_FETCHED` at the 50 MiB fetch cap; see the M3 plan, Task 17 "Payload size budget").
 
 - [ ] **Step 3: Extend the golden vectors** with `dek_wraps` (fixed KEK, key_id, month incl. `null`, DEK, nonce → wrapped), `recovery` (fixed passphrase `"correct horse battery"`, salt, nonce, KEK → blob), `query_tags` (fixed KEK, kind, query incl. a decomposed `Müller` and surrounding whitespace → tag). Regenerate with `ATLAS_DUCK_REGEN_VECTORS=1`, re-run without it, extend the Node checker for `dek_wraps` (AES-GCM decrypt) and `query_tags` (`crypto.hkdfSync('sha256', kek, Buffer.alloc(0), 'atlas-duck/query-tag/v1', 32)`, `createHmac`, `String.prototype.normalize('NFC')` then `.trim()`). Also assert in `golden.rs` that `crypto::seal` reproduces the T02 row ciphertexts with the vectors' DEK/nonce.
 

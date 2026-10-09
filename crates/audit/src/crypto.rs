@@ -19,10 +19,16 @@ use crate::types::QueryKind;
 pub const KEK_ENTRY_LAYOUT: u8 = 1;
 /// zstd level of the payload envelope (§8.2).
 pub const ZSTD_LEVEL: i32 = 3;
-/// Upper bound on a stored `payload_len` that `decompress` accepts. Payloads are bounded
-/// upstream far below this (§5.2: 24 MiB frame cap); a larger value is a corrupt or crafted
-/// row, rejected before the output buffer is allocated.
-pub const MAX_PAYLOAD_LEN: u64 = 64 * 1024 * 1024;
+/// Upper bound on a payload's JCS plaintext: the writer refuses a larger append (`Invalid`) and
+/// `decompress` rejects a larger stored `payload_len` (a corrupt or crafted row) before the
+/// output buffer is allocated. Sized for the largest record M3 writes (M3 Task 17 review I-3):
+/// a `READ_FETCHED` holds every byte of a read up to the 50 MiB fetch cap (+ the chunk that
+/// crossed it), each body encoded in at most 4/3 of its size + 4 bytes (`core::payloads`), so
+/// ≈ 68 MiB of bodies plus per-page framing; 96 MiB leaves room for that framing and for a
+/// `REQUEST_RECEIVED` of a 24 MiB frame whose JCS re-encoding expands number literals.
+pub const MAX_PAYLOAD_LEN: u64 = 96 * 1024 * 1024;
+/// The `Invalid` text for a payload above [`MAX_PAYLOAD_LEN`].
+pub const PAYLOAD_TOO_LARGE: &str = "payload above 96 MiB";
 /// AAD domain of a wrapped DEK (F.4).
 pub const DEK_WRAP_DOMAIN: &[u8] = b"atlas-duck/dek/v1";
 /// HKDF info of the query-tag key (F.7, L38).
@@ -186,7 +192,7 @@ pub fn compress(plain: &[u8]) -> Result<Vec<u8>, AuditError> {
 /// `SHA-256(plain) == payload_sha256` (F.3).
 pub fn decompress(compressed: &[u8], payload_len: u64) -> Result<Vec<u8>, AuditError> {
     if payload_len > MAX_PAYLOAD_LEN {
-        return Err(AuditError::Invalid("payload_len above 64 MiB"));
+        return Err(AuditError::Invalid(PAYLOAD_TOO_LARGE));
     }
     // Lossless: bounded by MAX_PAYLOAD_LEN above.
     let len = payload_len as usize;

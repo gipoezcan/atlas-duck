@@ -71,6 +71,7 @@ pub use anchor_dir::{AnchorLine, AnchorLineError};
 pub use anchors::BarrierKind;
 pub use backup::BackupReceipt;
 pub use clock::{Clock, SystemClock};
+pub use crypto::MAX_PAYLOAD_LEN;
 pub use error::{AuditError, OpenError, RestoreError};
 pub use keystore::{EntryName, KeyStore, KeyStoreError, KeyringLocality, OsKeyStore};
 pub use open::{

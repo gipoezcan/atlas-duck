@@ -164,7 +164,7 @@ impl PreparedEvent {
         let plain = Zeroizing::new(to_jcs_vec(&ev.payload).map_err(jcs_error)?);
         let payload_len = plain.len() as u64;
         if payload_len > MAX_PAYLOAD_LEN {
-            return Err(AuditError::Invalid("payload above 64 MiB"));
+            return Err(AuditError::Invalid(crypto::PAYLOAD_TOO_LARGE));
         }
         let payload_sha256: [u8; 32] = Sha256::digest(plain.as_slice()).into();
         let compressed = Zeroizing::new(crypto::compress(&plain)?);

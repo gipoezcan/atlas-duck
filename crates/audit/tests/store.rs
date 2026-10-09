@@ -1025,3 +1025,37 @@ fn store_debug_redacts_keys() {
     let k_q = query_key(&kek_of(&f));
     assert!(!text.contains(&format!("{:?}", &k_q[..4])));
 }
+
+/// The payload limit is 96 MiB of JCS plaintext (M3 Task 17 review I-3: a `READ_FETCHED` at the
+/// 50 MiB fetch cap encodes to ≈ 68 MiB plus framing): a payload above the old 64 MiB limit
+/// commits and decrypts; one above 96 MiB is refused and nothing is appended.
+#[test]
+fn payload_limit_fits_a_read_at_the_fetch_cap() {
+    let (store, _f) = new_store(fake_clock(START), MemKeyring::new());
+    assert_eq!(atlas_duck_audit::MAX_PAYLOAD_LEN, 96 * 1024 * 1024);
+    let mib = 1024 * 1024;
+    let big = "x".repeat(70 * mib);
+    let c = store
+        .append(ev(
+            EventType::READ_FETCHED,
+            Some("req_big"),
+            json!({ "body": big }),
+        ))
+        .expect("70 MiB payload commits");
+    let back = store.read_payload(c.seq).expect("decrypts");
+    assert_eq!(back.len(), 70 * mib + r#"{"body":""}"#.len());
+
+    let head = store.head().0;
+    let too_big = "x".repeat(96 * mib);
+    assert_eq!(
+        store
+            .append(ev(
+                EventType::READ_FETCHED,
+                Some("req_big"),
+                json!({ "body": too_big })
+            ))
+            .err(),
+        Some(AuditError::Invalid("payload above 96 MiB"))
+    );
+    assert_eq!(store.head().0, head);
+}
