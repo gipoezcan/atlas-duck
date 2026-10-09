@@ -814,18 +814,25 @@ async fn approve_racing_refresh_logged_stale() -> TestResult {
         stale.first().map(|s| s["reason"].clone()),
         Some(json!("changed"))
     );
-    let current = {
-        let entry = h.engine().entry(&id).ok_or("not in memory")?;
-        let st = entry.state();
-        assert_eq!(
-            st.model.phase(),
-            atlas_duck_core::lifecycle::model::Phase::Enriching
-        );
-        CandidateRev {
-            counter: st.model.rev(),
-            candidate_hash: st.candidate_hash,
+    // The record is visible a moment before its transition applies (and steps the refresh).
+    let entry = h.engine().entry(&id).ok_or("not in memory")?;
+    let mut current = None;
+    for _ in 0..300 {
+        current = {
+            let st = entry.state();
+            (st.model.phase() == atlas_duck_core::lifecycle::model::Phase::Enriching).then(|| {
+                CandidateRev {
+                    counter: st.model.rev(),
+                    candidate_hash: st.candidate_hash,
+                }
+            })
+        };
+        if current.is_some() {
+            break;
         }
-    };
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let current = current.ok_or("the refresh never started")?;
     let approve = Decision {
         decision: DecisionKind::Approve,
         ..release(&id, current)

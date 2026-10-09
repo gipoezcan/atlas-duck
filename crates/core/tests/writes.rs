@@ -16,7 +16,7 @@ use atlas_duck_audit::EventType;
 use atlas_duck_audit::request_set::requests_from_json;
 use atlas_duck_audit::request_set_hash;
 use atlas_duck_core::payloads::InvalidReason;
-use atlas_duck_core::testing::{Harness, InstanceAt};
+use atlas_duck_core::testing::{FaultPlan, Harness, InstanceAt};
 use atlas_duck_core::{DecisionError, DenyDetails, Edits};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::proto::{AwaitParams, ProgressNotification, ProgressSink};
@@ -913,5 +913,44 @@ async fn receipt_delivery_hash_and_window() -> TestResult {
     assert_eq!((code(&env), exit(&env)), ("result_evicted".to_owned(), 10));
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
     assert_eq!(env.data, None);
+    Ok(())
+}
+
+/// §5.1 inv. 1: an approval whose `WRITE_APPROVED` does not commit executes nothing (no
+/// identity call, no write) and fails the request `audit_failure`, not retryable for a write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_approved_append_failure_sends_nothing() -> TestResult {
+    let plan = FaultPlan::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    identity_ok(mock).await;
+    mount(
+        mock,
+        "POST",
+        "/rest/api/2/issue/ABC-1/comment",
+        mock.response(201)
+            .set_body_raw(fixtures::JIRA_COMMENT, "application/json"),
+    )
+    .await;
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    plan.fail_nth(EventType::WRITE_APPROVED, 1);
+    let res = h.approver().approve(&id);
+    assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
+    let env = h.await_(&id, 5000).await;
+    assert_eq!((env.status, exit(&env)), (Status::Failed, 1));
+    assert_eq!(code(&env), "audit_failure");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(mock.received().await.is_empty(), "nothing was sent");
+    assert!(
+        records(&h, &id, EventType::WRITE_APPROVED)
+            .await?
+            .is_empty()
+    );
+    assert!(records(&h, &id, EventType::PREVIEW_FETCH).await?.is_empty());
     Ok(())
 }
