@@ -23,16 +23,46 @@ use std::ops::Range;
 use atlas_duck_preview::invisible;
 use percent_encoding::percent_decode_str;
 
-use super::REDACTED;
+use super::{REDACTED, entities};
 
 const MAX_ROUNDS: usize = 3;
 /// Bound on nested mask passes over one part of a value (each pass masks every match of one view).
 const MAX_MASK_DEPTH: usize = 16;
+/// Work budget of one `views`/span-mapped expansion: the bytes of all forms kept (pieces count
+/// at their size) may reach `BUDGET_FACTOR` times the value, at least `BUDGET_FLOOR`, at most
+/// `BUDGET_CEIL`, and at most `MAX_FORMS` forms. Crafted content can otherwise multiply a value
+/// into hundreds of copies (review T14 I-1). Over budget fails closed.
+const BUDGET_FACTOR: usize = 32;
+const BUDGET_FLOOR: usize = 1 << 20;
+const BUDGET_CEIL: usize = 256 << 20;
+const MAX_FORMS: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+fn budget(len: usize) -> usize {
+    len.saturating_mul(BUDGET_FACTOR)
+        .clamp(BUDGET_FLOOR, BUDGET_CEIL)
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct Views {
     pub forms: Vec<String>,
+    /// Still changing after round 3, or `over_budget`.
     pub unstable: bool,
+    /// Plan addition: the expansion hit the work budget, so `forms` is incomplete. Any mask
+    /// blocks such a value (`UnstableEncoding`).
+    pub over_budget: bool,
+}
+
+/// Redacting `Debug` (§7.7): the forms are decoded content.
+impl std::fmt::Debug for Views {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Views {{ forms: <{} forms>, unstable: {}, over_budget: {} }}",
+            self.forms.len(),
+            self.unstable,
+            self.over_budget
+        )
+    }
 }
 
 pub(crate) fn nfc(s: &str) -> String {
@@ -96,17 +126,21 @@ fn is_plain(s: &str) -> bool {
 }
 
 /// Raw form, every decoded view and their NFC forms, iterated to a fixpoint for at most 3 rounds.
-/// `unstable` = some view still changes under a decoder after round 3 (fail closed, §5.3).
+/// `unstable` = some view still changes under a decoder after round 3 (fail closed, §5.3), or
+/// the expansion went over its work budget (`over_budget`, plan addition).
 pub fn views(raw: &str) -> Views {
     if is_plain(raw) {
         return Views {
             forms: vec![raw.to_owned()],
             unstable: false,
+            over_budget: false,
         };
     }
+    let budget = budget(raw.len());
     let mut seen: BTreeSet<String> = BTreeSet::new();
     seen.insert(raw.to_owned());
     seen.insert(nfc(raw));
+    let mut bytes: usize = seen.iter().map(String::len).sum();
     let mut frontier: Vec<String> = seen.iter().cloned().collect();
     for _round in 0..MAX_ROUNDS {
         let mut next = Vec::new();
@@ -114,7 +148,16 @@ pub fn views(raw: &str) -> Views {
             for d in decoders(v) {
                 if d != *v {
                     for x in [nfc(&d), d] {
-                        if seen.insert(x.clone()) {
+                        if !seen.contains(&x) {
+                            bytes = bytes.saturating_add(x.len());
+                            if bytes > budget || seen.len() >= MAX_FORMS {
+                                return Views {
+                                    forms: seen.into_iter().collect(),
+                                    unstable: true,
+                                    over_budget: true,
+                                };
+                            }
+                            seen.insert(x.clone());
                             next.push(x);
                         }
                     }
@@ -125,6 +168,7 @@ pub fn views(raw: &str) -> Views {
             return Views {
                 forms: seen.into_iter().collect(),
                 unstable: false,
+                over_budget: false,
             };
         }
         frontier = next;
@@ -133,6 +177,7 @@ pub fn views(raw: &str) -> Views {
     Views {
         forms: seen.into_iter().collect(),
         unstable,
+        over_budget: false,
     }
 }
 
@@ -169,47 +214,114 @@ impl Needle {
 
     /// `views` must be `views(value)`.
     fn hit(&self, value: &str, views: &Views) -> bool {
-        self.forms.iter().any(|n| value.contains(n.as_str()))
-            || views
-                .forms
-                .iter()
-                .any(|f| self.forms.iter().any(|n| f.contains(n.as_str())))
+        any_in(&self.forms, value, views)
     }
 
-    /// A hit in any part of the value between placeholders (see [`Segments`]).
-    pub(crate) fn hit_in(&self, segs: &Segments<'_>) -> bool {
-        segs.0.iter().any(|(s, v)| self.hit(s, v))
+    /// Forms that can match across a placeholder edge: they hold a bracket and are not part of
+    /// the placeholder text themselves (`x [REDACTED] y`, `ED] y`).
+    fn crossing_forms(&self) -> Vec<String> {
+        self.forms
+            .iter()
+            .filter(|f| f.contains(['[', ']']) && !REDACTED.contains(f.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// Occurrences in one value: per part between placeholders, the raw matches of the first
-    /// form that has any, else 1 for a canonical hit.
+    /// form that has any, else 1 for a canonical hit; plus raw matches across a placeholder.
     pub(crate) fn count(&self, value: &str) -> u64 {
-        Segments::of(value)
-            .0
-            .iter()
-            .map(|(s, v)| {
+        let parts: u64 = value
+            .split(REDACTED)
+            .map(|s| {
                 self.forms
                     .iter()
                     .map(|n| s.matches(n.as_str()).count() as u64)
                     .find(|&c| c > 0)
-                    .unwrap_or_else(|| u64::from(self.hit(s, v)))
+                    .unwrap_or_else(|| u64::from(self.hit(s, &views(s))))
             })
-            .sum()
+            .sum();
+        parts + crossing_matches(value, &self.crossing_forms()).len() as u64
     }
 }
 
-/// The parts of a value between `[REDACTED]` placeholders, each with its views. The placeholder
-/// text is public, so a needle inside it (a codename `RED`) is no hit and a mask converges.
-pub(crate) struct Segments<'a>(Vec<(&'a str, Views)>);
+fn any_in(forms: &[String], value: &str, views: &Views) -> bool {
+    forms.iter().any(|n| value.contains(n.as_str()))
+        || views
+            .forms
+            .iter()
+            .any(|f| forms.iter().any(|n| f.contains(n.as_str())))
+}
 
-impl<'a> Segments<'a> {
-    pub(crate) fn of(value: &'a str) -> Segments<'a> {
-        Segments(value.split(REDACTED).map(|s| (s, views(s))).collect())
-    }
+/// What the engine needs to know about one text (a string value, a number's text, an object
+/// key, a dropped field name), for every needle at once.
+///
+/// A value is matched part by part between `[REDACTED]` placeholders: the placeholder text is
+/// public, so a needle inside it (a codename `RED`) is no hit and a mask converges. A needle
+/// that holds a bracket is also matched against the whole value, so a match across a
+/// placeholder (`x [REDACTED] y`) is a hit (review T14 I-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TextInfo {
+    /// Per needle, in the order given.
+    pub(crate) hits: Vec<bool>,
+    pub(crate) unstable: bool,
+    pub(crate) over_budget: bool,
+}
 
-    pub(crate) fn unstable(&self) -> bool {
-        self.0.iter().any(|(_, v)| v.unstable)
+pub(crate) fn inspect(text: &str, needles: &[Needle]) -> TextInfo {
+    let mut info = TextInfo {
+        hits: vec![false; needles.len()],
+        unstable: false,
+        over_budget: false,
+    };
+    for part in text.split(REDACTED) {
+        let v = views(part);
+        info.unstable |= v.unstable;
+        info.over_budget |= v.over_budget;
+        for (h, n) in info.hits.iter_mut().zip(needles) {
+            *h = *h || n.hit(part, &v);
+        }
     }
+    if text.contains(REDACTED) {
+        let crossing: Vec<Vec<String>> = needles.iter().map(Needle::crossing_forms).collect();
+        if crossing
+            .iter()
+            .zip(&info.hits)
+            .any(|(c, h)| !c.is_empty() && !h)
+        {
+            let whole = views(text);
+            info.unstable |= whole.over_budget;
+            info.over_budget |= whole.over_budget;
+            for (h, c) in info.hits.iter_mut().zip(&crossing) {
+                *h = *h || (!c.is_empty() && any_in(c, text, &whole));
+            }
+        }
+    }
+    info
+}
+
+/// Raw matches of `forms` in `value` that overlap a placeholder, non-overlapping, in order.
+fn crossing_matches(value: &str, forms: &[String]) -> Vec<Range<usize>> {
+    let placeholders: Vec<Range<usize>> = value
+        .match_indices(REDACTED)
+        .map(|(i, s)| i..i + s.len())
+        .collect();
+    if placeholders.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<Range<usize>> = Vec::new();
+    for f in forms {
+        for (i, s) in value.match_indices(f.as_str()) {
+            let r = i..i + s.len();
+            let crosses = placeholders
+                .iter()
+                .any(|p| p.start < r.end && r.start < p.end);
+            if crosses && !out.iter().any(|o| o.start < r.end && r.start < o.end) {
+                out.push(r);
+            }
+        }
+    }
+    out.sort_by_key(|r| r.start);
+    out
 }
 
 // ---- span-mapped views ----
@@ -269,13 +381,14 @@ fn html_tokens(v: &str, lenient: bool) -> Vec<Tok> {
 }
 
 /// html-escape 0.2.15 keeps only the first code point of the WHATWG entities that expand to two
-/// (`&fjlig;` gives `f`, not `fj`). The lenient view decodes the one of them whose expansion is
-/// plain text as browsers do; the others add a combining mark to a symbol.
+/// (`&fjlig;` gives `f`, not `fj`); the lenient view decodes all of them as browsers do.
 fn named_entity_lenient(name: &[u8]) -> Option<&'static str> {
-    if name == b"fjlig" {
-        return Some("fj");
-    }
-    named_entity(name)
+    entities::MULTI_CODE_POINT
+        .binary_search_by(|(n, _)| (*n).cmp(name))
+        .ok()
+        .and_then(|i| entities::MULTI_CODE_POINT.get(i))
+        .map(|(_, s)| *s)
+        .or_else(|| named_entity(name))
 }
 
 fn named_entity(name: &[u8]) -> Option<&'static str> {
@@ -323,7 +436,11 @@ fn html_ref_at(v: &str, amp: usize, lenient: bool) -> Option<(usize, String)> {
             return None;
         }
         let n = u32::from_str_radix(&v[digits..p], if hex { 16 } else { 10 }).ok()?;
-        let c = numeric_char(n)?;
+        // Lenient: the WHATWG windows-1252 remap of 0x80..0x9F (`&#146;` is `’`).
+        let c = match entities::c1_remap(n) {
+            Some(c) if lenient => c,
+            _ => numeric_char(n)?,
+        };
         return Some((if semi { p + 1 } else { p }, c.to_string()));
     }
     let name = p;
@@ -598,18 +715,40 @@ impl Mapped {
 }
 
 /// The mapped views of `raw` in the order of `views` (raw, NFC, then per round each decoder
-/// and its NFC), visited until `f` returns a result.
+/// and its NFC), visited until `f` returns a result. `None` also when the expansion goes over
+/// the work budget (the caller then treats the value as not maskable: fail closed).
 fn first_mapped<T>(raw: &str, mut f: impl FnMut(&Mapped) -> Option<T>) -> Option<T> {
+    let budget = budget(raw.len());
+    let mut used: usize = 0;
+    let mut kept: usize = 0;
+    // Text held twice (view + `seen`) plus the piece map.
+    let mut admit = |m: &Mapped| {
+        used = used.saturating_add(
+            m.text
+                .len()
+                .saturating_mul(2)
+                .saturating_add(m.pieces.len().saturating_mul(size_of::<Piece>())),
+        );
+        kept += 1;
+        used <= budget && kept <= MAX_FORMS
+    };
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let root = Mapped::root(raw);
+    if !admit(&root) {
+        return None;
+    }
     seen.insert(root.text.clone());
     if let Some(t) = f(&root) {
         return Some(t);
     }
     let mut frontier = vec![root.clone()];
     if let Some(n) = root.then(Xform::Nfc)
-        && seen.insert(n.text.clone())
+        && !seen.contains(&n.text)
     {
+        if !admit(&n) {
+            return None;
+        }
+        seen.insert(n.text.clone());
         if let Some(t) = f(&n) {
             return Some(t);
         }
@@ -624,12 +763,17 @@ fn first_mapped<T>(raw: &str, mut f: impl FnMut(&Mapped) -> Option<T>) -> Option
                 };
                 let n = m.then(Xform::Nfc);
                 for x in [Some(m), n].into_iter().flatten() {
-                    if seen.insert(x.text.clone()) {
-                        if let Some(t) = f(&x) {
-                            return Some(t);
-                        }
-                        next.push(x);
+                    if seen.contains(&x.text) {
+                        continue;
                     }
+                    if !admit(&x) {
+                        return None;
+                    }
+                    seen.insert(x.text.clone());
+                    if let Some(t) = f(&x) {
+                        return Some(t);
+                    }
+                    next.push(x);
                 }
             }
         }
@@ -701,10 +845,30 @@ pub(crate) enum Masked {
     Ambiguous { value: String, spans: u64 },
 }
 
-/// §5.3 rule 2/3 for one non-URL string value.
+/// §5.3 rule 2/3 for one non-URL string value. A raw match across a placeholder
+/// (`x [REDACTED] y`) is replaced whole first; an encoded one stays a hit, so the caller's final
+/// pass blocks it.
 pub(crate) fn mask_value(value: &str, needle: &Needle, first_only: bool) -> Masked {
     let mut spans = 0;
     let mut ambiguous = false;
+    let mut value = value.to_owned();
+    let crossing = crossing_matches(&value, &needle.crossing_forms());
+    if !crossing.is_empty() {
+        let take = if first_only { 1 } else { crossing.len() };
+        let mut out = String::with_capacity(value.len());
+        let mut o = 0;
+        for r in crossing.iter().take(take) {
+            out.push_str(&value[o..r.start]);
+            out.push_str(REDACTED);
+            o = r.end;
+            spans += 1;
+        }
+        out.push_str(&value[o..]);
+        value = out;
+        if first_only {
+            return Masked::Done { value, spans };
+        }
+    }
     let mut parts = Vec::new();
     for seg in value.split(REDACTED) {
         if first_only && (spans > 0 || ambiguous) {
@@ -727,11 +891,17 @@ pub(crate) fn mask_value(value: &str, needle: &Needle, first_only: bool) -> Mask
 }
 
 /// One part between placeholders: mask the first view that maps, then each new part again.
-/// Returns (value, spans, a hit remains that no view could mask).
+/// Returns (value, spans, a hit remains that no view could mask). A part whose views go over the
+/// work budget is not masked at all (its hits cannot be known).
 fn mask_segment(seg: &str, needle: &Needle, first_only: bool, depth: usize) -> (String, u64, bool) {
-    if !needle.hit(seg, &views(seg)) {
+    let v = views(seg);
+    if v.over_budget {
+        return (seg.to_owned(), 0, true);
+    }
+    if !needle.hit(seg, &v) {
         return (seg.to_owned(), 0, false);
     }
+    drop(v);
     if depth == 0 {
         return (seg.to_owned(), 0, true);
     }

@@ -11,6 +11,7 @@
 //! every-occurrence pass. "Also appears in" is computed after the drops, before any mask.
 
 mod apply;
+mod entities;
 mod mirror;
 mod path;
 pub mod views;
@@ -30,8 +31,9 @@ pub const REDACTED: &str = "[REDACTED]";
 pub enum DropScope {
     /// The path as given.
     PerItem,
-    /// Every `[3]`/`[key=value]` selector of the path widened to `[]`; also removes the
-    /// document-root copies (`CopyRule::RootPath`).
+    /// Every `[3]`/`[key=value]` selector before the last segment widened to `[]` (the last keeps
+    /// its own: `issues[key=A]` is still one issue); also removes the document-root copies
+    /// (`CopyRule::RootPath`).
     AllItems,
 }
 
@@ -45,13 +47,16 @@ pub enum UrlMode {
     Drop,
 }
 
-/// C.7 one-click presets, both allowlists (anything unexpected in the candidate goes too).
+/// C.7 one-click presets, both allowlists (anything unexpected in the candidate goes too). They
+/// expect the candidate shapes named below at the root; a candidate without them blocks
+/// (`OpTargetMissing`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RedactionPreset {
     /// §5.2 step 6: of the upstream-error candidate `{status, error_messages}` keep `status`.
     StatusOnly,
-    /// §9.5: of `script_error` keep `class`.
+    /// §9.5: of `{script_error: {class, message, stack, logs, elapsed, stderr}}` keep
+    /// `script_error.class` (and nothing else at the root).
     ErrorClassOnly,
 }
 
@@ -123,7 +128,9 @@ pub struct RedactionMeta {
     /// items fetched); for an op without one, elements removed by `DropItem` (and element
     /// `DropField`s) themselves. Mirrored entries and emptied changelog histories never count.
     pub items_dropped: u64,
-    /// Last key of every dropped location that existed, first occurrence first.
+    /// Last key of every dropped location that existed, first occurrence first. A name that
+    /// holds an every-occurrence mask string (or cannot be inspected) is `[REDACTED]` instead:
+    /// this list reaches the agent.
     pub fields_dropped: Vec<String>,
     /// Masked spans (a URL value replaced whole counts one).
     pub spans_masked: u64,
@@ -137,7 +144,8 @@ pub enum BlockReason {
     /// text or an object key; keys are never rewritten), or a single-occurrence selection in a
     /// URL field without a `UrlField` choice.
     MaskStillOccurs { path: String },
-    /// Still changing after 3 decode rounds while an every-occurrence mask is active.
+    /// Still changing after 3 decode rounds while an every-occurrence mask is active, or (any
+    /// mask active) over the work budget of the canonical match form.
     UnstableEncoding { path: String },
     /// A hit no view could mask and re-encode cleanly.
     ReencodeAmbiguous { path: String },
@@ -146,9 +154,10 @@ pub enum BlockReason {
     MirrorOrphan { path: String },
     /// A keyless mirror entry in arrays of different lengths.
     MirrorUnmatchable { path: String },
-    /// Plan addition: an op whose path does not parse, or a single-occurrence mask whose `at`
-    /// location holds no occurrence of the text.
-    MaskTargetMissing { path: String },
+    /// Plan addition: an op that names nothing in the candidate. A drop path that does not
+    /// parse or matches nothing (a key holding `.`, `[` or `]` cannot be addressed), a preset
+    /// whose container is missing, or a single-occurrence `at` without an occurrence.
+    OpTargetMissing { path: String },
 }
 
 impl BlockReason {
@@ -159,7 +168,7 @@ impl BlockReason {
             | Self::ReencodeAmbiguous { path }
             | Self::MirrorOrphan { path }
             | Self::MirrorUnmatchable { path }
-            | Self::MaskTargetMissing { path } => path,
+            | Self::OpTargetMissing { path } => path,
         }
     }
 
@@ -170,7 +179,7 @@ impl BlockReason {
             Self::ReencodeAmbiguous { .. } => "ReencodeAmbiguous",
             Self::MirrorOrphan { .. } => "MirrorOrphan",
             Self::MirrorUnmatchable { .. } => "MirrorUnmatchable",
-            Self::MaskTargetMissing { .. } => "MaskTargetMissing",
+            Self::OpTargetMissing { .. } => "OpTargetMissing",
         }
     }
 }
@@ -212,4 +221,24 @@ impl fmt::Debug for RedactionOutcome {
             .field("also_appears_in", &self.also_appears_in.len())
             .finish_non_exhaustive()
     }
+}
+
+/// The `url_fields`, copy and mirror paths of `rules` that do not parse in the redaction path
+/// grammar (a malformed one would be ignored silently by [`apply`]).
+pub fn invalid_rule_paths(rules: &atlas_duck_registry::RedactionRules) -> Vec<&'static str> {
+    use atlas_duck_registry::CopyRule;
+    let mut paths: Vec<&'static str> = rules.url_fields.to_vec();
+    for c in rules.copies {
+        paths.push(match c {
+            CopyRule::Path(p) | CopyRule::RootPath(p) => p,
+            CopyRule::ChangelogItems { items_path, .. } => items_path,
+        });
+    }
+    for m in rules.mirrors {
+        paths.extend([m.src, m.dst, m.key]);
+    }
+    paths
+        .into_iter()
+        .filter(|p| path::parse(p).is_none())
+        .collect()
 }

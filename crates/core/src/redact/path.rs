@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use serde_json::Value;
 
 /// One step of a concrete location.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Step {
     Key(String),
     Index(usize),

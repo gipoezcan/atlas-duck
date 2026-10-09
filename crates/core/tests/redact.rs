@@ -3,8 +3,8 @@
 
 use atlas_duck_core::redact::views::{canonical_hit, views};
 use atlas_duck_core::redact::{
-    BlockReason, DropScope, RedactionOp, RedactionOutcome, RedactionPreset, UrlMode,
-    also_appears_in, apply,
+    BlockReason, DropScope, REDACTED, RedactionOp, RedactionOutcome, RedactionPreset, UrlMode,
+    also_appears_in, apply, invalid_rule_paths,
 };
 use atlas_duck_registry::RedactionRules;
 use proptest::prelude::*;
@@ -339,7 +339,7 @@ fn u26_single_occurrence_mask_needs_confirmation() -> TestResult {
     let out = apply(&candidate, &NO_RULES, None, &[single(Some("d[0]"))]);
     assert!(has_block(
         &out,
-        &BlockReason::MaskTargetMissing {
+        &BlockReason::OpTargetMissing {
             path: "d[0]".into()
         }
     ));
@@ -747,26 +747,38 @@ fn presets_status_only_and_error_class_only() -> TestResult {
 fn debug_is_redacted() -> TestResult {
     const S: &str = "SENTINEL-4711";
     let ops = vec![
-        RedactionOp::MaskText {
-            text: S.into(),
-            every_occurrence: true,
-            at: Some(S.into()),
-        },
-        RedactionOp::DropItem {
-            array_path: S.into(),
-            key: S.into(),
-            value: json!(S),
-        },
+        mask(S),
         RedactionOp::DropField {
-            path: S.into(),
+            path: format!("p.{S}"),
             scope: DropScope::PerItem,
         },
+        RedactionOp::DropItem {
+            array_path: "b".into(),
+            key: "id".into(),
+            value: json!(S),
+        },
+        RedactionOp::MaskText {
+            text: S.into(),
+            every_occurrence: false,
+            at: Some(format!("o.{S}")),
+        },
     ];
-    let out = apply(&json!({"a": S, "b": [S]}), &NO_RULES, None, &[]);
+    let candidate = json!({
+        "a": format!("x {S}"),
+        "b": [{"id": S}, {"id": "2", "v": S}],
+        "o": {S: 1},
+        "p": {S: 2}
+    });
+    let out = apply(&candidate, &NO_RULES, None, &ops);
+    // The secret key under `o` blocks (keys are never rewritten); the dropped one is withheld.
+    assert!(!out.blocked.is_empty());
+    assert_eq!(out.meta.fields_dropped, vec![REDACTED.to_owned()]);
     let dumps = [
         format!("{ops:?}"),
         format!("{out:?}"),
         format!("{:?}", out.meta),
+        format!("{:?}", out.blocked),
+        format!("{:?}", views(&format!("a%20{S}"))),
     ];
     for d in dumps {
         assert!(!d.contains(S), "{d}");
@@ -975,7 +987,14 @@ fn needle_inside_the_placeholder_converges() -> TestResult {
 /// One encoding of `s` a value may carry it in.
 fn encode(s: &str, how: u8) -> String {
     let bytes = |f: &dyn Fn(u8) -> String| s.bytes().map(f).collect::<String>();
-    match how % 9 {
+    let pct = |c: char| {
+        let mut b = [0u8; 4];
+        c.encode_utf8(&mut b)
+            .bytes()
+            .map(|x| format!("%{x:02X}"))
+            .collect::<String>()
+    };
+    match how % 11 {
         0 => s.to_owned(),
         1 => bytes(&|b| format!("%{b:02X}")),
         2 => bytes(&|b| format!("%{b:02x}")),
@@ -997,7 +1016,28 @@ fn encode(s: &str, how: u8) -> String {
             .trim_end_matches('\u{200B}')
             .to_owned(),
         7 => bytes(&|b| format!("%25{b:02X}")),
-        _ => bytes(&|b| format!("&#37;{b:02X}")),
+        8 => bytes(&|b| format!("&#37;{b:02X}")),
+        // Form encoding: spaces as `+`, everything but ASCII alphanumerics escaped.
+        9 => s
+            .chars()
+            .map(|c| match c {
+                ' ' => "+".to_owned(),
+                c if c.is_ascii_alphanumeric() => c.to_string(),
+                c => pct(c),
+            })
+            .collect(),
+        // Mixed inside one needle: every other character percent-encoded, the rest as entities.
+        _ => s
+            .chars()
+            .enumerate()
+            .map(|(i, c)| {
+                if i % 2 == 0 {
+                    pct(c)
+                } else {
+                    format!("&#{};", c as u32)
+                }
+            })
+            .collect(),
     }
 }
 
@@ -1008,7 +1048,7 @@ proptest! {
     /// matches is ever released unblocked.
     #[test]
     fn mask_every_occurrence_is_sound(
-        needle in "[a-zäöü]{3,8}",
+        needle in "[a-zäöü][a-zäöü +]{1,6}[a-zäöü]",
         parts in prop::collection::vec(("[a-z ]{0,4}", any::<u8>(), "[a-z ]{0,4}"), 1..5),
     ) {
         let mut doc = Map::new();
@@ -1067,4 +1107,392 @@ fn all_items_widens_only_the_items_before_the_field() -> TestResult {
     assert_eq!(out.meta.items_dropped, 1);
     assert!(out.blocked.is_empty(), "{:?}", out.blocked);
     Ok(())
+}
+
+/// The 64-byte unit from the T14 review that expands to about 112 forms per `views` call.
+const BLOWUP: &str = "%E2%80%8B&&amp%253B%%32%35u\u{308}\u{200b}&uuml&amp;%41+&#43;&#x200B;&uuml";
+
+#[test]
+fn i1_crafted_expansion_is_bounded_and_blocks() -> TestResult {
+    // One unit alone is fine.
+    assert!(!views(BLOWUP).over_budget);
+    let big = BLOWUP.repeat(4096);
+    let started = std::time::Instant::now();
+    let v = views(&big);
+    assert!(v.over_budget && v.unstable);
+    let held: usize = v.forms.iter().map(String::len).sum();
+    assert!(
+        held <= 32 * big.len(),
+        "{held} bytes held for {} bytes",
+        big.len()
+    );
+    let candidate = json!({"v": big, "w": "fine"});
+    for op in [
+        mask("zzz"),
+        RedactionOp::MaskText {
+            text: "zzz".into(),
+            every_occurrence: false,
+            at: None,
+        },
+    ] {
+        let out = apply(&candidate, &NO_RULES, None, &[op]);
+        assert!(has_block(
+            &out,
+            &BlockReason::UnstableEncoding { path: "v".into() }
+        ));
+        assert_eq!(out.released["v"], candidate["v"]);
+    }
+    // Generous: the budget bounds the work, this only catches a lost bound.
+    assert!(started.elapsed() < std::time::Duration::from_secs(120));
+    Ok(())
+}
+
+#[test]
+fn i2_dropped_key_name_is_withheld() -> TestResult {
+    let candidate = json!({"o": {"ACME-SECRET": 3, "other": 1}, "p": {"x ACME%2DSECRET": 1}});
+    // A key hit alone blocks: keys are never rewritten.
+    let out = apply(&candidate, &NO_RULES, None, &[mask("ACME-SECRET")]);
+    assert!(has_block(
+        &out,
+        &BlockReason::MaskStillOccurs {
+            path: "o.ACME-SECRET".into()
+        }
+    ));
+    // The remedy is to drop it; its name then reaches the agent only as a placeholder.
+    let out = apply(
+        &candidate,
+        &NO_RULES,
+        None,
+        &[
+            drop_field("o.ACME-SECRET", DropScope::PerItem),
+            drop_field("p.x ACME%2DSECRET", DropScope::PerItem),
+            mask("ACME-SECRET"),
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(out.meta.fields_dropped, vec![REDACTED.to_owned(); 2]);
+    assert!(!serde_json::to_string(&out.meta)?.contains("ACME"));
+    assert_eq!(out.released["o"], json!({"other": 1}));
+    // A single-occurrence mask counts a dropped name among the others that remain.
+    let out = apply(
+        &json!({"a": "ACME-SECRET", "o": {"ACME-SECRET": 3}}),
+        &NO_RULES,
+        None,
+        &[
+            drop_field("o.ACME-SECRET", DropScope::PerItem),
+            RedactionOp::MaskText {
+                text: "ACME-SECRET".into(),
+                every_occurrence: false,
+                at: None,
+            },
+        ],
+    );
+    assert_eq!(out.needs_confirmation, vec!["1 other occurrence remains"]);
+    Ok(())
+}
+
+#[test]
+fn i3_needle_across_a_placeholder() -> TestResult {
+    let needle = "x [REDACTED] y";
+    let candidate = json!({
+        "a": "pre x [REDACTED] y post",
+        "b": "x%20[REDACTED]%20y",
+        "c": "x [REDACTED] y"
+    });
+    let out = apply(&candidate, &NO_RULES, None, &[mask(needle)]);
+    assert_eq!(out.released["a"], "pre [REDACTED] post");
+    assert_eq!(out.released["c"], "[REDACTED]");
+    // Encoded across a placeholder: not maskable in place, so it blocks.
+    assert!(has_block(
+        &out,
+        &BlockReason::MaskStillOccurs { path: "b".into() }
+    ));
+    assert_eq!(out.also_appears_in, vec!["a", "b", "c"]);
+
+    // A partial overlap with the placeholder.
+    let out = apply(
+        &json!({"v": "x [REDACTED] y"}),
+        &NO_RULES,
+        None,
+        &[mask("ED] y")],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(out.released["v"], "x [REDACT[REDACTED]");
+
+    // Single occurrence: the first one, the other is counted.
+    let out = apply(
+        &json!({"a": "x [REDACTED] y", "b": "x [REDACTED] y"}),
+        &NO_RULES,
+        None,
+        &[RedactionOp::MaskText {
+            text: needle.into(),
+            every_occurrence: false,
+            at: None,
+        }],
+    );
+    assert_eq!(out.released["a"], "[REDACTED]");
+    assert_eq!(out.needs_confirmation, vec!["1 other occurrence remains"]);
+    Ok(())
+}
+
+#[test]
+fn ops_that_match_nothing_block() -> TestResult {
+    let candidate = json!({"user.email": "a@b", "items": [{"id": "1"}]});
+    // A key holding `.` cannot be addressed: the drop must not pass silently.
+    let out = apply(
+        &candidate,
+        &NO_RULES,
+        None,
+        &[drop_field("user.email", DropScope::PerItem)],
+    );
+    assert!(has_block(
+        &out,
+        &BlockReason::OpTargetMissing {
+            path: "user.email".into()
+        }
+    ));
+    assert_eq!(out.released["user.email"], "a@b");
+    let out = apply(
+        &candidate,
+        &NO_RULES,
+        None,
+        &[RedactionOp::DropItem {
+            array_path: "items".into(),
+            key: "id".into(),
+            value: json!("9"),
+        }],
+    );
+    assert!(has_block(
+        &out,
+        &BlockReason::OpTargetMissing {
+            path: "items".into()
+        }
+    ));
+    // Presets on a candidate of another shape.
+    let out = apply(
+        &json!({"class": "TypeError", "message": "m"}),
+        &NO_RULES,
+        None,
+        &[RedactionOp::Preset(RedactionPreset::ErrorClassOnly)],
+    );
+    assert!(has_block(
+        &out,
+        &BlockReason::OpTargetMissing {
+            path: "script_error.class".into()
+        }
+    ));
+    let out = apply(
+        &json!({"error_messages": ["x"]}),
+        &NO_RULES,
+        None,
+        &[RedactionOp::Preset(RedactionPreset::StatusOnly)],
+    );
+    assert!(has_block(
+        &out,
+        &BlockReason::OpTargetMissing {
+            path: "status".into()
+        }
+    ));
+    // "Keep error class only" keeps nothing else at the root either.
+    let out = apply(
+        &json!({"script_error": {"class": "E", "message": "m"}, "logs": ["l"]}),
+        &NO_RULES,
+        None,
+        &[RedactionOp::Preset(RedactionPreset::ErrorClassOnly)],
+    );
+    assert_eq!(out.released, json!({"script_error": {"class": "E"}}));
+    assert_eq!(out.meta.fields_dropped, vec!["logs", "message"]);
+    assert!(out.blocked.is_empty());
+    // Removed by an earlier op of the same set: not a mismatch.
+    let out = apply(
+        &search_fixture(),
+        rules("jira.search")?,
+        Some("issues"),
+        &[
+            RedactionOp::DropItem {
+                array_path: "issues".into(),
+                key: "key".into(),
+                value: json!("ABC-1"),
+            },
+            drop_field("issues[key=ABC-1].fields.customfield_1", DropScope::PerItem),
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    Ok(())
+}
+
+#[test]
+fn whatwg_reference_details() -> TestResult {
+    // windows-1252 remap of numeric references 0x80-0x9F.
+    assert!(canonical_hit("O&#146;Brien", "O\u{2019}Brien"));
+    assert!(canonical_hit("&#x80;100", "\u{20AC}100"));
+    // Entities that expand to two code points (html-escape keeps only the first).
+    assert!(canonical_hit("a&nvlt;b", "a<\u{20D2}b"));
+    assert!(canonical_hit("x&ThickSpace;y", "x\u{205F}\u{200A}y"));
+    let out = apply(
+        &json!({"v": "Mr O&#146;Brien said"}),
+        &NO_RULES,
+        None,
+        &[mask("O\u{2019}Brien")],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(out.released["v"], "Mr [REDACTED] said");
+    Ok(())
+}
+
+#[test]
+fn plus_encoded_needle_in_a_plain_field() -> TestResult {
+    let out = apply(
+        &json!({"q": "search?q=Falcon+M%C3%BCller+Plan&x=1"}),
+        &NO_RULES,
+        None,
+        &[mask("Falcon Müller Plan")],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(out.released["q"], "search?q=[REDACTED]&x=1");
+    Ok(())
+}
+
+#[test]
+fn registry_rule_paths_parse() -> TestResult {
+    for op in atlas_duck_registry::all() {
+        let bad = invalid_rule_paths(&op.redaction_rules);
+        assert!(bad.is_empty(), "{}: {bad:?}", op.id);
+    }
+    Ok(())
+}
+
+fn keyed<T>(keys: &[String], f: impl Fn(&str) -> T) -> Map<String, Value>
+where
+    T: Into<Value>,
+{
+    keys.iter().map(|k| (k.clone(), f(k).into())).collect()
+}
+
+/// An issue-shaped candidate with every copy and the comment mirror, consistent by construction.
+fn arb_issue() -> impl Strategy<Value = (Value, Vec<String>, Vec<String>)> {
+    let field_value = prop_oneof![
+        Just(Value::Null),
+        Just(json!("")),
+        "[a-z]{1,5}".prop_map(Value::from)
+    ];
+    (
+        prop::collection::btree_map("customfield_[1-5]", field_value, 1..5),
+        prop::collection::btree_set("[1-6]", 0..4),
+        any::<bool>(),
+    )
+        .prop_map(|(fields, comment_ids, changelog)| {
+            let names: Vec<String> = fields.keys().cloned().collect();
+            let ids: Vec<String> = comment_ids.into_iter().collect();
+            let comments = |body: &str| -> Value {
+                let list: Vec<Value> = ids
+                    .iter()
+                    .map(|id| json!({"id": id, "body": body}))
+                    .collect();
+                json!({ "comments": list })
+            };
+            let mut f: Map<String, Value> = fields.clone().into_iter().collect();
+            f.insert("comment".into(), comments("c"));
+            let mut rf: Map<String, Value> = fields
+                .iter()
+                .map(|(k, v)| {
+                    let r = match v {
+                        Value::String(s) => json!(format!("<p>{s}</p>")),
+                        other => other.clone(),
+                    };
+                    (k.clone(), r)
+                })
+                .collect();
+            rf.insert("comment".into(), comments("<p>c</p>"));
+            let mut histories: Vec<Value> = Vec::new();
+            if changelog {
+                for (i, k) in names.iter().enumerate() {
+                    histories.push(
+                        json!({"id": i.to_string(), "items": [{"fieldId": k, "toString": "x"}]}),
+                    );
+                }
+                let both: Vec<Value> = names
+                    .iter()
+                    .take(2)
+                    .map(|k| json!({"field": k, "toString": "y"}))
+                    .collect();
+                histories.push(json!({"id": "both", "items": both}));
+            }
+            let doc = json!({
+                "key": "ABC-1",
+                "fields": f,
+                "renderedFields": rf,
+                "names": keyed(&names, |k| format!("Name {k}")),
+                "schema": keyed(&names, |_| json!({"type": "string"})),
+                "editmeta": {"fields": keyed(&names, |_| json!({"required": false}))},
+                "changelog": {"histories": histories}
+            });
+            (doc, names, ids)
+        })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+    /// U-29 with the `jira.issue.get` rules: copies, changelog items and the comment mirror go
+    /// with every drop, nothing left behind looks empty, untouched fields (and their `null`s)
+    /// stay as they were.
+    #[test]
+    fn u29_drops_with_issue_rules(
+        (doc, fields, comments) in arb_issue(),
+        picks in prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 1..3),
+        comment_picks in prop::collection::vec(any::<prop::sample::Index>(), 0..3),
+    ) {
+        let r = rules("jira.issue.get").map_err(TestCaseError::fail)?;
+        let mut ops = Vec::new();
+        let mut dropped: Vec<String> = Vec::new();
+        for (ix, all) in &picks {
+            let f = ix.get(&fields).clone();
+            let scope = if *all { DropScope::AllItems } else { DropScope::PerItem };
+            ops.push(drop_field(&format!("fields.{f}"), scope));
+            dropped.push(f);
+        }
+        let mut gone_comments: Vec<String> = Vec::new();
+        if !comments.is_empty() {
+            for ix in &comment_picks {
+                let id = ix.get(&comments).clone();
+                ops.push(RedactionOp::DropItem {
+                    array_path: "fields.comment.comments".into(),
+                    key: "id".into(),
+                    value: json!(id),
+                });
+                gone_comments.push(id);
+            }
+        }
+        let out = apply(&doc, r, None, &ops);
+        prop_assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+        let rel = &out.released;
+        for f in &dropped {
+            for copy in ["fields", "renderedFields", "names", "schema"] {
+                prop_assert!(rel[copy].get(f).is_none(), "{}.{} left", copy, f);
+            }
+            prop_assert!(rel["editmeta"]["fields"].get(f).is_none());
+        }
+        for h in rel["changelog"]["histories"].as_array().into_iter().flatten() {
+            let items = h["items"].as_array().ok_or_else(|| TestCaseError::fail("items"))?;
+            prop_assert!(!items.is_empty(), "emptied history {}", h);
+            for it in items {
+                for k in ["field", "fieldId"] {
+                    if let Some(v) = it.get(k).and_then(Value::as_str) {
+                        prop_assert!(!dropped.iter().any(|d| d == v), "changelog item for {}", v);
+                    }
+                }
+            }
+        }
+        for side in ["fields", "renderedFields"] {
+            for c in rel[side]["comment"]["comments"].as_array().into_iter().flatten() {
+                let id = c["id"].as_str().unwrap_or_default();
+                prop_assert!(!gone_comments.iter().any(|g| g == id), "{} comment {} left", side, id);
+            }
+        }
+        for f in fields.iter().filter(|f| !dropped.contains(f)) {
+            prop_assert_eq!(&rel["fields"][f], &doc["fields"][f]);
+            prop_assert_eq!(&rel["renderedFields"][f], &doc["renderedFields"][f]);
+        }
+    }
 }
