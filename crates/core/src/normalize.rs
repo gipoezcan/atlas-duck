@@ -23,11 +23,21 @@ pub struct NormalizedHello {
     pub unusual: bool,
 }
 
+/// Strip, cut, then strip again until nothing is removed: a cut can split an RGI sequence and
+/// leave a lone ZWJ, variation selector or tag character that the classifier then flags. The
+/// result is a fixpoint, so normalizing it again changes nothing.
 fn normalize(s: &str, keep_newlines: bool, max_chars: usize) -> (String, bool) {
-    let (stripped, removed) = invisible::strip(s, keep_newlines);
-    match stripped.char_indices().nth(max_chars) {
-        Some((cut, _)) => (stripped[..cut].to_owned(), true),
-        None => (stripped, removed),
+    let (mut out, removed) = invisible::strip(s, keep_newlines);
+    let Some((cut, _)) = out.char_indices().nth(max_chars) else {
+        return (out, removed);
+    };
+    out.truncate(cut);
+    loop {
+        let (again, removed) = invisible::strip(&out, keep_newlines);
+        if !removed {
+            return (out, true);
+        }
+        out = again;
     }
 }
 
@@ -47,10 +57,11 @@ pub fn normalize_reason(s: &str) -> (String, bool) {
 }
 
 pub fn normalize_hello(h: &Hello) -> NormalizedHello {
+    // A name made only of removed characters is no name (shown and bucketed as unnamed).
     let (agent_name, name_unusual) = match h.agent_name.as_deref() {
         Some(n) => {
             let (n, unusual) = normalize_agent_name(n);
-            (Some(n), unusual)
+            ((!n.is_empty()).then_some(n), unusual)
         }
         None => (None, false),
     };

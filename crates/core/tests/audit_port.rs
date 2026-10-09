@@ -433,6 +433,11 @@ fn request_received_payload_and_columns() -> TestResult {
         p["connection"]["peer_chain"][0]["start_time"],
         u64::MAX.to_string()
     );
+    assert_eq!(p["connection"]["peer_origin_exe"], "/usr/bin/bash");
+    assert_eq!(
+        p["connection"]["peer_origin_start_time"],
+        u64::MAX.to_string()
+    );
     assert_eq!(
         p["normalized"],
         json!({
@@ -660,7 +665,13 @@ fn builders_append_with_their_columns() -> TestResult {
             EventFlags::default(),
         ),
         (
-            payloads::credential_changed("ins_1", Some("k1"), Some("k2"), Some("2027-01-31")),
+            payloads::credential_changed(
+                "ins_1",
+                CredentialChange::Replaced,
+                Some("k1"),
+                Some("k2"),
+                Some("2027-01-31"),
+            ),
             None,
             EventFlags::default(),
         ),
@@ -724,5 +735,55 @@ fn builders_append_with_their_columns() -> TestResult {
         json!({"counter": 3, "candidate_hash": hex::encode([0xab; 32])})
     );
     assert!(ts.store().full_verify().is_empty());
+    Ok(())
+}
+
+/// A read at the 50 MiB fetch cap commits its `READ_FETCHED` with every byte (§5.2 step 3/6),
+/// even for quote-dense, multibyte content whose partial page is cut inside a character
+/// (Task 17 review I-3): bodies never encode larger than base64, and the store's limit fits.
+#[test]
+fn read_fetched_at_the_fetch_cap_commits() -> TestResult {
+    let ts = TempStore::new()?;
+    let port = ts.port();
+    let mib = 1024 * 1024;
+    // Quote-dense JSON with umlauts (escaped longer than raw, shorter than base64).
+    let unit = r#"{"name":"Müller Straße","note":"lorem ipsum dolor"},"#;
+    let fill = |n: usize| -> Vec<u8> {
+        let mut v = unit.repeat(n / unit.len() + 1).into_bytes();
+        v.truncate(n);
+        v
+    };
+    let page = UpstreamResponse {
+        status: 200,
+        content_type: Some("application/json".into()),
+        body: fill(18 * mib),
+    };
+    // 32 MiB + 1 chunk, cut after the first byte of a 2-byte `ü`.
+    let mut partial = fill(32 * mib + 64 * 1024);
+    while std::str::from_utf8(&partial).is_ok() {
+        partial.pop();
+    }
+    let size = (page.body.len() + partial.len()) as u64;
+    assert!(size > 50 * 1024 * 1024);
+    let ev = payloads::read_fetched(
+        &ctx("req_cap"),
+        &ReadFetched::Outcome {
+            outcome: OutcomeKind::TooLarge,
+            cap_or_budget: Some(CapOrBudget::FetchCap50MiB),
+            responses: std::slice::from_ref(&page),
+            partial: &partial,
+            size,
+        },
+        None,
+    );
+    let c = port.append(ev)?;
+    let p = payload_of(&*port, &c)?;
+    assert_eq!(
+        payloads::body_from_json(&p["responses"][0]["body"]),
+        Some(page.body.clone())
+    );
+    assert_eq!(payloads::body_from_json(&p["partial"]), Some(partial));
+    assert!(p["partial"]["tail_b64"].is_string());
+    assert_eq!(p["size"], size);
     Ok(())
 }

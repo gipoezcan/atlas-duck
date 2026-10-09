@@ -2,8 +2,9 @@
 //! plaintext columns filled (decision column and caller-settable flags included) and a JSON
 //! payload with the §8.3 field names. `SCRIPT_*` builders are Task 27's.
 //!
-//! Plan decisions (spec silent): every hash is lowercase hex; a body is `{"text": "<utf8>"}`
-//! when it is valid UTF-8, else `{"b64": "<padded RFC 4648 base64>"}`; an upstream response is
+//! Plan decisions (spec silent): every hash is lowercase hex; a body is stored losslessly as
+//! `{"text"}`, `{"text", "tail_b64"}` or `{"b64"}` (padded RFC 4648), never larger than
+//! base64 of the whole body (`body_json`; Task 17 review I-3); an upstream response is
 //! `{status, content_type, body}`; process start times are decimal strings (a Windows FILETIME
 //! exceeds the ±(2^53−1) integers JCS accepts); paths are lossy UTF-8.
 //!
@@ -79,13 +80,83 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// `{"text": ..}` for UTF-8 bytes, else `{"b64": ..}`.
+/// The bytes of `s` inside a JCS string literal (RFC 8785, as ECMAScript `JSON.stringify`),
+/// quotes excluded: `"`, `\` and `\b \t \n \f \r` take 2, other controls below U+0020 take 6.
+pub fn jcs_escaped_len(s: &str) -> u64 {
+    s.bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | 0x08 | 0x09 | 0x0A | 0x0C | 0x0D => 2,
+            0x00..=0x1F => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Padded base64 length of `n` bytes.
+pub const fn b64_len(n: u64) -> u64 {
+    n.div_ceil(3) * 4
+}
+
+/// Upper bound on the JCS bytes of `body_json` of `n` bytes: never more than base64 of the
+/// whole body plus the object's keys and the rounding of a text/tail split.
+pub const fn body_json_bound(n: u64) -> u64 {
+    b64_len(n) + 32
+}
+
+/// A body (§8.3 "full response", "every byte received"), losslessly and within
+/// `body_json_bound`: `{"text": ..}` for UTF-8; for bytes that stop being UTF-8 (a body cut
+/// inside a multibyte character, binary content) `{"text": <valid prefix>, "tail_b64": <rest>}`;
+/// `{"b64": ..}` when JSON escaping would make the text longer than its base64.
 pub fn body_json(bytes: &[u8]) -> Value {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => json!({ "text": s }),
-        Err(_) => json!({ "b64": STANDARD.encode(bytes) }),
+    let (prefix, tail) = match std::str::from_utf8(bytes) {
+        Ok(s) => (s, &[][..]),
+        Err(e) => {
+            let (head, tail) = bytes.split_at(e.valid_up_to());
+            match std::str::from_utf8(head) {
+                Ok(s) => (s, tail),
+                Err(_) => ("", bytes),
+            }
+        }
+    };
+    let n = u64::try_from(prefix.len()).unwrap_or(u64::MAX);
+    if (prefix.is_empty() && !tail.is_empty()) || jcs_escaped_len(prefix) > b64_len(n) {
+        json!({ "b64": STANDARD.encode(bytes) })
+    } else if tail.is_empty() {
+        json!({ "text": prefix })
+    } else {
+        json!({ "text": prefix, "tail_b64": STANDARD.encode(tail) })
     }
 }
+
+/// The bytes `body_json` stored (rebuild, M10 export); `None` for any other shape.
+pub fn body_from_json(v: &Value) -> Option<Vec<u8>> {
+    let o = v.as_object()?;
+    let decode = |k: &str| STANDARD.decode(o.get(k)?.as_str()?).ok();
+    let text = || o.get("text")?.as_str().map(|s| s.as_bytes().to_vec());
+    match o.len() {
+        1 if o.contains_key("b64") => decode("b64"),
+        1 => text(),
+        2 => {
+            let mut out = text()?;
+            out.extend(decode("tail_b64")?);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// The bytes one `READ_FETCHED` can carry: the 50 MiB fetch cap (§5.2 step 2) plus the chunk
+/// that crossed it (a cap is noticed after a chunk was buffered; 1 MiB is generous).
+pub const READ_FETCHED_MAX_BODY_BYTES: u64 = 51 * 1024 * 1024;
+/// Framing allowance of one `READ_FETCHED` beside its bodies (per page `{status, content_type}`
+/// and keys, `user_resolutions`).
+pub const READ_FETCHED_FRAMING_BYTES: u64 = 16 * 1024 * 1024;
+
+// The largest record core writes fits the store's payload limit (Task 17 review I-3).
+const _: () = assert!(
+    body_json_bound(READ_FETCHED_MAX_BODY_BYTES) + READ_FETCHED_FRAMING_BYTES
+        <= atlas_duck_audit::MAX_PAYLOAD_LEN
+);
 
 /// `{status, content_type, body}`.
 pub fn response_json(r: &UpstreamResponse) -> Value {
@@ -155,6 +226,14 @@ fn connection_json(hello: &Hello, conn: &ConnectionMeta) -> Map<String, Value> {
     m.insert("peer_pid".into(), json!(conn.peer.peer_pid));
     m.insert("peer_exe".into(), path_json(conn.peer.peer_exe.as_deref()));
     m.insert("peer_chain".into(), Value::Array(chain));
+    m.insert(
+        "peer_origin_exe".into(),
+        path_json(conn.peer.peer_origin_exe.as_deref()),
+    );
+    m.insert(
+        "peer_origin_start_time".into(),
+        json!(conn.peer.peer_origin_start_time.map(|t| t.to_string())),
+    );
     m.insert("connection_id".into(), conn.connection_id.clone().into());
     m
 }
@@ -975,24 +1054,39 @@ pub fn instance_state_changed(
     )
 }
 
+/// What happened to a stored PAT (§7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialChange {
+    Added,
+    Replaced,
+    Deleted,
+}
+
+impl CredentialChange {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Replaced => "replaced",
+            Self::Deleted => "deleted",
+        }
+    }
+}
+
 /// `CREDENTIAL_CHANGED {change: added|replaced|deleted, old_user_key, new_user_key, expires_at}`
-/// for a PAT (§7.1); never the secret. `expires_at` is `YYYY-MM-DD`.
+/// for a PAT (§7.1); never the secret. `expires_at` is `YYYY-MM-DD`. The keys are data; the
+/// caller names the operation (a deletion may not know the old key).
 pub fn credential_changed(
     instance_id: &str,
+    change: CredentialChange,
     old_user_key: Option<&str>,
     new_user_key: Option<&str>,
     expires_at: Option<&str>,
 ) -> NewEvent {
-    let change = match (old_user_key, new_user_key) {
-        (None, _) => "added",
-        (Some(_), None) => "deleted",
-        (Some(_), Some(_)) => "replaced",
-    };
     event(
         &instance_ctx(instance_id),
         EventType::CREDENTIAL_CHANGED,
         json!({
-            "change": change,
+            "change": change.as_str(),
             "old_user_key": old_user_key,
             "new_user_key": new_user_key,
             "expires_at": expires_at,
@@ -1090,6 +1184,38 @@ mod tests {
         assert_eq!(body_json(b"{\"a\":1}"), json!({ "text": "{\"a\":1}" }));
         assert_eq!(body_json(&[0xff, 0x00]), json!({ "b64": "/wA=" }));
         assert_eq!(body_json(b""), json!({ "text": "" }));
+        // Cut inside a multibyte character: the valid prefix stays text.
+        assert_eq!(
+            body_json("Müller".as_bytes().split_at(2).0),
+            json!({ "text": "M", "tail_b64": "ww==" })
+        );
+        // Control-heavy text is longer escaped than as base64.
+        assert_eq!(body_json(&[1, 2, 3]), json!({ "b64": "AQID" }));
+    }
+
+    fn jcs_len(v: &Value) -> u64 {
+        atlas_duck_ipc::jcs::to_jcs_vec(v).map_or(u64::MAX, |b| b.len() as u64)
+    }
+
+    proptest::proptest! {
+        /// Lossless, within the bound, and the escape estimate equals what JCS writes.
+        #[test]
+        fn body_json_roundtrips_within_bound(
+            bytes in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::prelude::any::<u8>(),
+                    proptest::sample::select(vec![b'"', b'\\', b'\n', 0x01, b'a', 0xC3, 0xBC]),
+                ],
+                0..300,
+            )
+        ) {
+            let v = body_json(&bytes);
+            proptest::prop_assert_eq!(body_from_json(&v), Some(bytes.clone()));
+            proptest::prop_assert!(jcs_len(&v) <= body_json_bound(bytes.len() as u64));
+            if let Ok(s) = std::str::from_utf8(&bytes) {
+                proptest::prop_assert_eq!(jcs_len(&json!(s)), jcs_escaped_len(s) + 2);
+            }
+        }
     }
 
     /// Type-level: no builder has a PAT parameter, so none can put our token into a record

@@ -4,6 +4,9 @@
 //! `atlassian::CoverIssuer` from it, so no PAT-bearing request is sent before that commit.
 //! An id enters the set only through `commit_request_received` / `commit_system_fetch_start`,
 //! and only after `AuditPort::append` returned `Ok`; an `Err` marks nothing (fail closed).
+//! "`Ok`" means "durably committed" only for the real `Store` port: the composition root
+//! (`core.rs`) wires `StoreProbe` over the set that the `Store` port commits to, and Task 30's
+//! scanner keeps other `AuditPort`/`CommitProbe` impls and `CoverIssuer::new` calls in tests.
 //!
 //! If M2's store API changes, adapt this file and `testing/store.rs` only.
 
@@ -121,18 +124,22 @@ fn write(l: &RwLock<HashSet<String>>) -> RwLockWriteGuard<'_, HashSet<String>> {
 }
 
 impl CommittedSet {
-    /// Only with the `Ok` of the append that committed `REQUEST_RECEIVED` / `SCRIPT_STARTED`
-    /// (crate-internal: `commit_request_received` is the one caller).
-    pub(crate) fn mark_request(&self, request_id: &str) {
+    /// Only with the `Ok` of the append that committed `REQUEST_RECEIVED` / `SCRIPT_STARTED`.
+    /// Private to this module: `commit_request_received` is the one caller, so no other core
+    /// code can mark an id (compile-time).
+    fn mark_request(&self, request_id: &str) {
         write(&self.requests).insert(request_id.to_owned());
     }
 
-    /// Only with the `Ok` of the append that committed `SYSTEM_FETCH {phase: start}`.
-    pub(crate) fn mark_fetch(&self, fetch_id: &str) {
+    /// Only with the `Ok` of the append that committed `SYSTEM_FETCH {phase: start}`; private,
+    /// like `mark_request` (`commit_system_fetch_start` is the one caller).
+    fn mark_fetch(&self, fetch_id: &str) {
         write(&self.fetches).insert(fetch_id.to_owned());
     }
 
-    /// At terminal: no further request is sent under this id.
+    /// At terminal: no further request is sent under this id. Call it only after
+    /// `commit_request_received` returned (a `forget` racing the append-to-mark window would
+    /// leave the id marked).
     pub fn forget_request(&self, request_id: &str) {
         write(&self.requests).remove(request_id);
     }

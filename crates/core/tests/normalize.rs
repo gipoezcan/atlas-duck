@@ -2,10 +2,11 @@
 
 use atlas_duck_core::normalize::{
     MAX_AGENT_NAME_CHARS, MAX_CWD_BASENAME_CHARS, MAX_REASON_CHARS, normalize_agent_name,
-    normalize_hello, normalize_reason,
+    normalize_cwd_basename, normalize_hello, normalize_reason,
 };
 use atlas_duck_ipc::proto::{AgentNameSource, ClientKind, Hello};
 use atlas_duck_preview::invisible::strip;
+use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -101,4 +102,92 @@ fn limits_truncate_and_flag() -> TestResult {
     assert_eq!(name, "b".repeat(64));
     assert!(unusual);
     Ok(())
+}
+
+/// A cut through an RGI sequence must not leave a character the classifier flags (§3.3).
+#[test]
+fn cut_never_leaves_a_flagged_char() -> TestResult {
+    let zwj = format!("{}👩\u{200D}🚀", "a".repeat(62));
+    let (out, unusual) = normalize_agent_name(&zwj);
+    assert_eq!(out, format!("{}👩", "a".repeat(62)));
+    assert!(unusual);
+    assert!(!strip(&out, false).1);
+    assert_eq!(normalize_agent_name(&out), (out.clone(), false));
+
+    // A five-scalar ZWJ family sequence across the cut, at every offset.
+    let family = "👨\u{200D}👩\u{200D}👧";
+    assert!(!strip(family, false).1);
+    for pad in 60..64 {
+        let input = format!("{}{family}", "a".repeat(pad));
+        let (out, unusual) = normalize_cwd_basename(&input);
+        assert!(!strip(&out, false).1, "pad {pad}: {out:?}");
+        assert!(out.chars().count() <= 64);
+        assert!(unusual);
+        assert_eq!(normalize_cwd_basename(&out), (out.clone(), false));
+    }
+
+    // A keycap sequence across the reason limit.
+    let input = format!("{}1\u{FE0F}\u{20E3}", "r".repeat(999));
+    let (out, unusual) = normalize_reason(&input);
+    assert!(!strip(&out, true).1);
+    assert!(unusual);
+    Ok(())
+}
+
+#[test]
+fn name_of_only_removed_chars_is_none() -> TestResult {
+    let n = normalize_hello(&hello(Some("\u{202E}\u{200B}"), "x"));
+    assert_eq!(n.agent_name, None);
+    assert!(n.unusual);
+    Ok(())
+}
+
+fn agent_string() -> impl Strategy<Value = String> {
+    // Whole RGI sequences (so cuts land inside them) and single flagged or plain characters.
+    let tokens = prop::sample::select(vec![
+        "👩\u{200D}🚀",
+        "👨\u{200D}👩\u{200D}👧",
+        "❤\u{FE0F}",
+        "1\u{FE0F}\u{20E3}",
+        "👍\u{1F3FD}",
+        "a",
+        "ü",
+        " ",
+        "\n",
+        "\t",
+        "\r",
+        "\u{1B}",
+        "\u{85}",
+        "\u{200B}",
+        "\u{200D}",
+        "\u{202E}",
+        "\u{FE0F}",
+        "\u{E0067}",
+        "\u{3164}",
+    ]);
+    // A run of plain characters puts the random tail around the 64-scalar cut.
+    (0usize..70, prop::collection::vec(tokens, 0..16))
+        .prop_map(|(pad, v)| "a".repeat(pad) + &v.concat())
+}
+
+type Normalizer = fn(&str) -> (String, bool);
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// Normalized output keeps no flagged character, fits its limit and is a fixpoint.
+    #[test]
+    fn normalization_is_idempotent(s in agent_string()) {
+        let cases: [(Normalizer, bool, usize); 3] = [
+            (normalize_agent_name, false, MAX_AGENT_NAME_CHARS),
+            (normalize_cwd_basename, false, MAX_CWD_BASENAME_CHARS),
+            (normalize_reason, true, MAX_REASON_CHARS),
+        ];
+        for (f, keep_newlines, max) in cases {
+            let (out, _) = f(&s);
+            prop_assert!(!strip(&out, keep_newlines).1, "flagged char left in {:?}", out);
+            prop_assert!(out.chars().count() <= max);
+            prop_assert_eq!(f(&out), (out.clone(), false));
+        }
+    }
 }
