@@ -7,8 +7,8 @@ use atlas_duck_preview::warning::{Warning, WarningId};
 use serde_json::{Map, Value, json};
 
 use super::{
-    EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan, generic,
-    get_call, json_request, str_param,
+    EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
+    cap_diff_text, generic, get_call, json_request, resolve_url, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
@@ -143,6 +143,10 @@ fn create_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
 
 /// `POST /rest/api/2/issue` `{"fields": {project, issuetype: {id}, summary, description?, ..}}`.
 pub fn issue_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    // Path checks first, so the validation dry call reports a bad placeholder (exit 2) even
+    // before enrichment: the write URL and the createmeta lookup.
+    resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
+    resolve_url(ctx.base, CREATEMETA_ISSUETYPES_PATH, ctx.params, &[])?;
     let issuetype = resolved_id(ctx, "issuetype")?;
     let mut fields = ctx
         .params
@@ -234,17 +238,17 @@ fn edit_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
     }
     let mut verdict = EnrichVerdict::preview(Value::Object(baseline), Map::new());
     if !changed.is_empty() {
+        // Same shape as the Confluence text (`warning::conflict`): "conflict: <what> changed …".
         let summary = escape_for_display(&format!(
-            "fields changed since the agent read it: {}",
+            "conflict: fields changed since the agent read it: {}",
             changed.join(", ")
         ));
         verdict.hold = Hold::Conflict;
-        verdict.warnings.push(Warning::new(
-            WarningId::Conflict,
-            format!("conflict: {summary}"),
-        ));
+        verdict
+            .warnings
+            .push(Warning::new(WarningId::Conflict, summary.clone()));
         verdict.conflict = Some(summary);
-        verdict.diff_text = escape_for_display(&diff);
+        verdict.diff_text = cap_diff_text(&escape_for_display(&diff));
     }
     verdict
 }
@@ -338,6 +342,7 @@ fn transition_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
 /// `POST /rest/api/2/issue/{key}/transitions`
 /// `{"transition": {"id"}, "fields"?, "update"?: {"comment": [{"add": {"body"}}]}}`.
 pub fn issue_transition_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
     let id = resolved_id(ctx, "transition")?;
     let mut body = Map::new();
     body.insert("transition".to_owned(), json!({"id": id}));

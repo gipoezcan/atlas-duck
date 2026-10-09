@@ -440,6 +440,12 @@ static ENTRIES: &[(&str, OpImpl)] = &[
     ("confluence.attachment.upload", LATER_WRITE),
 ];
 
+/// The rows of the explicit table before deduplication: U-05 checks it equals `op_table().len()`,
+/// so a duplicated id cannot silently shadow another row.
+pub fn entry_count() -> usize {
+    ENTRIES.len()
+}
+
 /// C.7: one entry per registry id (46).
 pub fn op_table() -> &'static BTreeMap<&'static str, OpImpl> {
     static TABLE: OnceLock<BTreeMap<&'static str, OpImpl>> = OnceLock::new();
@@ -537,6 +543,21 @@ pub(crate) fn json_request(ctx: &ExecCtx<'_>, body: &Value) -> Result<ExecPlan, 
         content_type: Some("application/json".to_owned()),
         body,
     }]))
+}
+
+/// The largest `EnrichVerdict::diff_text` (bytes, including the trailing ellipsis).
+pub const DIFF_TEXT_CAP_BYTES: usize = 16 * 1024;
+
+/// Cuts a conflict diff to [`DIFF_TEXT_CAP_BYTES`] at a char boundary; a cut text ends in `…`.
+pub(crate) fn cap_diff_text(s: &str) -> String {
+    if s.len() <= DIFF_TEXT_CAP_BYTES {
+        return s.to_owned();
+    }
+    let mut end = DIFF_TEXT_CAP_BYTES - '…'.len_utf8();
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 /// A string param, or `""`.

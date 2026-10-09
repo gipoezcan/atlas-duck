@@ -9,13 +9,14 @@ use atlas_duck_atlassian::{
 };
 use atlas_duck_core::lifecycle::model::Hold;
 use atlas_duck_core::ops::{
-    EnrichCtx, EnrichFailure, EnrichPurpose, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, StaleCtx, StaleVerdict, WriteView,
-    confluence, generic, op_table,
+    DIFF_TEXT_CAP_BYTES, EnrichCtx, EnrichFailure, EnrichPurpose, EnrichVerdict, ExecCtx,
+    ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, StaleCtx,
+    StaleVerdict, WriteView, confluence, entry_count, generic, op_table,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::{BodyView, ItemCount, PreviewBody, WarningId};
-use atlas_duck_registry::{OpClass, OperationSpec, SCRIPT_RUN};
+use atlas_duck_registry::{BodySource, Method, OpClass, OperationSpec, SCRIPT_RUN};
+use proptest::prelude::*;
 use serde_json::{Map, Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -156,6 +157,8 @@ fn u05_op_table_covers_registry_exactly() {
     let registry: BTreeSet<&str> = atlas_duck_registry::all().iter().map(|s| s.id).collect();
     assert_eq!(table, registry);
     assert_eq!(op_table().len(), 46);
+    // A duplicated row would shadow another one and still give 46 keys.
+    assert_eq!(entry_count(), op_table().len());
     assert!(!op_table().contains_key(SCRIPT_RUN.id));
 }
 
@@ -212,6 +215,15 @@ fn read_methods_are_get_or_search() -> TestResult {
         .iter()
         .filter(|s| s.class == OpClass::Read)
     {
+        // The plan follows the body source; a read declared POST without one would hide.
+        let endpoints = [Some(spec.endpoint), spec.alt_endpoint.map(|a| a.endpoint)];
+        for e in endpoints.into_iter().flatten() {
+            assert!(
+                e.method == Method::Get || e.body == BodySource::ParamsAsJson,
+                "{}",
+                spec.id
+            );
+        }
         let params = example(spec);
         let plan = read_plan(spec.id, &params, spec.caps.max.map(|m| m.default))?;
         match plan {
@@ -485,6 +497,16 @@ fn cql_order_by_inside_parens_or_twice_rejected() -> TestResult {
         "ORDER BY created AND space = DOC",
         "order by title",
         "space = DOC ORDER BY created OR (type = space)",
+        // Mid-query ORDER BY at depth 0: WHERE content after the sort clause.
+        "space = DOC ORDER BY created AND label = x",
+        "space = A ORDER BY title AND type = space",
+        "space = A ORDER BY created OR type = space",
+        "space = A ORDER BY title = 'x'",
+        "space = A ORDER BY NOT title",
+        "space = A ORDER BY",
+        "space = A ORDER BY title,",
+        "space = A ORDER BY title desc asc",
+        "space = A ORDER BY , title",
     ] {
         let e = rejected_cql(cql)?;
         assert_eq!(e.code, ErrorCode::Validation, "{cql}");
@@ -554,6 +576,16 @@ fn cql_quoted_parens_and_order_by_are_text() -> TestResult {
     assert_eq!(
         confluence::effective_cql("title ~ \"say \\\"hi\\\" (\" and text ~ 'it\\'s )'")?,
         format!("(title ~ \"say \\\"hi\\\" (\" and text ~ 'it\\'s )') AND {TYPES}")
+    );
+    // Sort keys: words or quoted names, an optional direction, comma-separated.
+    assert_eq!(
+        confluence::effective_cql("space = A order by title ASC, lastmodified desc,\"created\"")?,
+        format!("(space = A) AND {TYPES} order by title ASC, lastmodified desc,\"created\"")
+    );
+    // ORDER BY inside a string is text, also with AND after it.
+    assert_eq!(
+        confluence::effective_cql("title ~ \"a ORDER BY b AND c\" ORDER BY created")?,
+        format!("(title ~ \"a ORDER BY b AND c\") AND {TYPES} ORDER BY created")
     );
     // `ORDER` alone (a value) and `ordered` are not ORDER BY.
     assert_eq!(
@@ -859,7 +891,7 @@ fn edit_conflict_and_stale_rule() -> TestResult {
     assert_eq!(v.hold, Hold::Conflict);
     assert_eq!(
         v.conflict.as_deref(),
-        Some("fields changed since the agent read it: summary")
+        Some("conflict: fields changed since the agent read it: summary")
     );
     assert!(v.warnings.iter().any(|w| w.id == WarningId::Conflict));
 
@@ -933,6 +965,53 @@ fn transition_resolution_and_stale_rule() -> TestResult {
 
 fn v_baseline() -> Value {
     json!({"status_id": "3", "transition_id": "31"})
+}
+
+#[test]
+fn edit_conflict_diff_is_capped() -> TestResult {
+    let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+    issue["fields"]["description"] = json!("é".repeat(40 * 1024));
+    let params =
+        json!({"key": "ABC-1", "fields": {"description": "x"}, "expected": {"description": "y"}});
+    let (_, v) = enrich("jira.issue.edit", &params, &[issue])?;
+    assert_eq!(v.hold, Hold::Conflict);
+    assert!(v.diff_text.len() <= DIFF_TEXT_CAP_BYTES);
+    assert!(v.diff_text.ends_with('…'));
+    Ok(())
+}
+
+#[test]
+fn page_update_refuses_non_page_content() -> TestResult {
+    let mut post: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE)?;
+    post["type"] = json!("blogpost");
+    let params = json!({"id": "65537", "base_version": 7, "body": "b", "body_format": "storage"});
+    let (_, v) = enrich("confluence.page.update", &params, &[post])?;
+    assert_eq!(v.hold, Hold::EnrichmentError);
+    Ok(())
+}
+
+#[test]
+fn dry_call_checks_write_paths_before_enrichment() -> TestResult {
+    // `project` has no schema pattern; a dot segment is caught by the dry call, not at the
+    // enrichment GET.
+    let r = exec(
+        "jira.issue.create",
+        &json!({"project": "..", "issuetype": "Bug", "summary": "S"}),
+        None,
+        None,
+    )?;
+    assert!(matches!(r, Err(ExecError::Invalid(e))
+        if e.code == ErrorCode::Validation && e.details.get("param") == Some(&json!("project"))));
+    Ok(())
+}
+
+proptest! {
+    #[test]
+    fn cql_never_panics(cql in "[a-zA-Z0-9 ()'\"\\\\=~,<>!é😀\u{202E}]{0,40}") {
+        if let Ok(q) = confluence::effective_cql(&cql) {
+            prop_assert!(q.contains(") AND type in (page,blogpost,comment,attachment)"));
+        }
+    }
 }
 
 #[test]

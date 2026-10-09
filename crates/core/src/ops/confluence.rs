@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan, PreviewCtx,
-    PreviewModel, generic, get_call, json_request, str_param,
+    PreviewModel, generic, get_call, json_request, resolve_url, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::{ValidationError, invalid};
@@ -29,8 +29,11 @@ enum Tok {
     },
     Open,
     Close,
-    /// A quoted string or an operator character.
-    Other,
+    /// A quoted string (`'…'`, `"…"`).
+    Str,
+    Comma,
+    /// An operator character (`=`, `!`, `~`, `<`, `>`).
+    Op,
 }
 
 /// Fixed rejection texts: an error never echoes the CQL (§7.4 "rejected locally").
@@ -67,7 +70,7 @@ fn tokenize(cql: &str) -> Result<Vec<(Tok, u32)>, ValidationError> {
                         Some(_) => j += 1,
                     }
                 }
-                out.push((Tok::Other, depth));
+                out.push((Tok::Str, depth));
                 i = j + 1;
             }
             b'\\' => return Err(cql_error(MSG_BACKSLASH)),
@@ -82,8 +85,12 @@ fn tokenize(cql: &str) -> Result<Vec<(Tok, u32)>, ValidationError> {
                 i += 1;
             }
             _ if b.is_ascii_whitespace() => i += 1,
-            b'=' | b'!' | b'~' | b'<' | b'>' | b',' => {
-                out.push((Tok::Other, depth));
+            b',' => {
+                out.push((Tok::Comma, depth));
+                i += 1;
+            }
+            b'=' | b'!' | b'~' | b'<' | b'>' => {
+                out.push((Tok::Op, depth));
                 i += 1;
             }
             _ => {
@@ -139,14 +146,10 @@ pub fn effective_cql(cql: &str) -> Result<String, ValidationError> {
     let (rest, clause) = match order_by.as_slice() {
         [] => (cql, None),
         [at] => {
-            let (tok, depth) = tokens[*at];
-            let clause_has_parens = tokens[*at..]
-                .iter()
-                .any(|(t, _)| matches!(t, Tok::Open | Tok::Close));
-            let Tok::Word { start, .. } = tok else {
+            let (Tok::Word { start, .. }, 0) = tokens[*at] else {
                 return Err(cql_error(MSG_ORDER_BY));
             };
-            if depth != 0 || clause_has_parens {
+            if !is_sort_clause(&tokens[*at + 2..], word) {
                 return Err(cql_error(MSG_ORDER_BY));
             }
             (&cql[..start], Some(cql[start..].trim_end()))
@@ -161,6 +164,42 @@ pub fn effective_cql(cql: &str) -> Result<String, ValidationError> {
         Some(clause) => format!("({rest}) AND {CQL_TYPE_FILTER} {clause}"),
         None => format!("({rest}) AND {CQL_TYPE_FILTER}"),
     })
+}
+
+/// The tokens after `ORDER BY`: `key [asc|desc] (, key [asc|desc])*`, a key being a field word or
+/// a quoted name. An operator, a parenthesis or an `AND`/`OR`/`NOT` word means WHERE content after
+/// the sort clause (a mid-query `ORDER BY`, §7.4): rejected.
+fn is_sort_clause<'q>(tokens: &[(Tok, u32)], word: impl Fn(&Tok) -> Option<&'q str>) -> bool {
+    #[derive(PartialEq)]
+    enum Want {
+        Key,
+        DirOrComma,
+        Comma,
+    }
+    let mut want = Want::Key;
+    for (tok, _) in tokens {
+        let text = word(tok);
+        if text.is_some_and(|w| {
+            ["and", "or", "not"]
+                .iter()
+                .any(|k| w.eq_ignore_ascii_case(k))
+        }) {
+            return false;
+        }
+        want = match (want, tok) {
+            (Want::Key, Tok::Word { .. } | Tok::Str) => Want::DirOrComma,
+            (Want::DirOrComma, Tok::Word { .. })
+                if text.is_some_and(|w| {
+                    w.eq_ignore_ascii_case("asc") || w.eq_ignore_ascii_case("desc")
+                }) =>
+            {
+                Want::Comma
+            }
+            (Want::DirOrComma | Want::Comma, Tok::Comma) => Want::Key,
+            _ => return false,
+        };
+    }
+    want != Want::Key
 }
 
 /// The generic read plan with the rewritten CQL; a CQL the rewrite refuses is `Invalid` before
@@ -220,6 +259,10 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
     let (Some(current), Some(title), Some(space_key)) = facts else {
         return EnrichVerdict::unusable();
     };
+    // The op sends `"type": "page"`: a blog post or comment id is not this op's target.
+    if page.get("type").and_then(Value::as_str) != Some("page") {
+        return EnrichVerdict::unusable();
+    }
     let mut resolved = Map::new();
     resolved.insert("title".to_owned(), Value::from(title));
     resolved.insert("space_key".to_owned(), Value::from(space_key));
@@ -244,6 +287,8 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
 /// `PUT /rest/api/content/{id}` with `version.number = base_version + 1` (§7.4), the current
 /// title unless one is given, and the storage body (PD-09: `body_format = storage` only).
 pub fn page_update_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    // Path check first, so the validation dry call reports a bad placeholder before enrichment.
+    resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
     let verdict = ctx
         .enrichment
         .filter(|v| v.hold == Hold::Preview)
