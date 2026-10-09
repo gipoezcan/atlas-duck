@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY};
 use atlas_duck_atlassian::url_hash;
-use atlas_duck_audit::testing::FakeClock;
+use atlas_duck_audit::testing::{FakeClock, FreeSpaceStub};
 use atlas_duck_audit::{EventType, Store};
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::Envelope;
@@ -38,6 +38,7 @@ use crate::core::{Confirm, Core, CoreDeps, TestHooks};
 use crate::decision::DecisionApi;
 use crate::engine::Engine;
 use crate::engine::payload_json;
+use crate::engine::queue::Limits;
 use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
 use crate::ids::InstanceId;
@@ -71,7 +72,9 @@ pub struct HarnessBuilder {
     pat: String,
     answers: Vec<Confirm>,
     config_text: Option<String>,
+    extra_config: String,
     omit_ids: bool,
+    limits: Option<Limits>,
 }
 
 impl HarnessBuilder {
@@ -126,6 +129,18 @@ impl HarnessBuilder {
         self
     }
 
+    /// Appended to the generated `config.toml` (e.g. a `[limits]` table).
+    pub fn extra_config(mut self, text: &str) -> Self {
+        self.extra_config.push_str(text);
+        self
+    }
+
+    /// Replaces the limits the core would read from `config.toml` (scaled limit tests).
+    pub fn limits(mut self, limits: Limits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
     pub async fn start(self) -> Result<Harness, TestError> {
         let store = TempStore::new()?;
         let capture = Capture::new();
@@ -159,10 +174,12 @@ impl HarnessBuilder {
         }
         let config_dir = tempfile::tempdir()?;
         let config_path = config_dir.path().join(CONFIG_FILE_NAME);
-        let text = match self.config_text {
+        let mut text = match self.config_text {
             Some(t) => t,
             None => config_toml(&instances, !self.omit_ids),
         };
+        text.push('\n');
+        text.push_str(&self.extra_config);
         std::fs::write(&config_path, text)?;
         let config = load_config(&config_path)?;
 
@@ -188,7 +205,11 @@ impl HarnessBuilder {
             app_start_extra: Map::new(),
             pats_deleted: Vec::new(),
         };
-        let core = Core::start_with_port(deps, port.clone(), TestHooks::none()).await?;
+        let hooks = TestHooks {
+            limits: self.limits,
+            ..TestHooks::none()
+        };
+        let core = Core::start_with_port(deps, port.clone(), hooks).await?;
         let handler = CapturingHandler::wrap(core.handler(), capture.clone());
         let decisions = CapturingDecisions::wrap(core.decisions(), capture.clone());
         let instances_api = CapturingInstances::wrap(core.instances(), capture.clone());
@@ -272,7 +293,9 @@ impl Harness {
             pat: TEST_PAT.to_owned(),
             answers: Vec::new(),
             config_text: None,
+            extra_config: String::new(),
             omit_ids: false,
+            limits: None,
         }
     }
 
@@ -473,5 +496,28 @@ impl Harness {
     /// PD-14: runs the expiry path now; `false` if the request is not pending.
     pub async fn expire_now(&self, request_id: &str) -> bool {
         self.core.engine().expire_now(request_id).await
+    }
+
+    /// Free bytes the store's low-space admission check sees (§8.1; `set(0)` → `StorageLow`).
+    pub fn free_space(&self) -> &Arc<FreeSpaceStub> {
+        self.store.free_space()
+    }
+
+    /// Drops the request's cached candidate: the next use rebuilds it from the log (§5.2).
+    pub fn evict_candidate(&self, request_id: &str) {
+        self.core.engine().candidates().remove(request_id);
+    }
+
+    /// Flips the current revision's candidate hash and evicts the candidate, so the next rebuild
+    /// mismatches (I-37); `false` if the request is not in memory.
+    pub fn corrupt_candidate_hash(&self, request_id: &str) -> bool {
+        let Some(entry) = self.core.engine().entry(request_id) else {
+            return false;
+        };
+        for b in entry.state().candidate_hash.iter_mut() {
+            *b = !*b;
+        }
+        self.evict_candidate(request_id);
+        true
     }
 }

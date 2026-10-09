@@ -16,6 +16,7 @@
 //!   banners "config written by vX ..." have a source (plan-added key).
 
 pub mod instances;
+pub mod limits;
 mod migrate;
 
 use std::ffi::OsString;

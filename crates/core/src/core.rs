@@ -16,9 +16,11 @@ use serde_json::{Map, Value};
 use crate::audit_port::{AuditPort, CommittedSet, StoreProbe};
 use crate::config::ConfigState;
 use crate::config::instances::ensure_ids;
+use crate::config::limits::limits_config;
 use crate::config::load_config;
 use crate::decision::{CoreDecisions, DecisionApi};
 use crate::engine::handler::CoreHandler;
+use crate::engine::queue::Limits;
 use crate::engine::{Engine, EngineDeps};
 use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
@@ -95,6 +97,8 @@ pub struct TestHooks {
     pub freeze_at: Option<HookPoint>,
     /// A read whose JQL contains this text panics after `REQUEST_RECEIVED` (S-15).
     pub panic_on_jql: Option<String>,
+    /// Replaces the limits read from `config.toml` (scaled limit tests, Task 20).
+    pub limits: Option<Limits>,
 }
 
 #[cfg(feature = "testing")]
@@ -117,7 +121,7 @@ impl Core {
     /// Needs a `Ready` store; without one the app serves `gate_handler` instead (C.7).
     pub async fn start(deps: CoreDeps) -> Result<Core, StartError> {
         let port: Arc<dyn AuditPort> = Arc::new(deps.audit.clone());
-        Core::start_inner(deps, port).await
+        Core::start_inner(deps, port, None).await
     }
 
     /// `start` with the audit port replaced (e.g. `FaultyAudit::wrap(..)`) and test hooks
@@ -128,16 +132,26 @@ impl Core {
         port: Arc<dyn AuditPort>,
         hooks: TestHooks,
     ) -> Result<Core, StartError> {
-        let core = Core::start_inner(deps, port).await?;
+        let core = Core::start_inner(deps, port, hooks.limits).await?;
         core.engine.set_hooks(hooks);
         Ok(core)
     }
 
-    async fn start_inner(deps: CoreDeps, port: Arc<dyn AuditPort>) -> Result<Core, StartError> {
+    async fn start_inner(
+        deps: CoreDeps,
+        port: Arc<dyn AuditPort>,
+        limits: Option<Limits>,
+    ) -> Result<Core, StartError> {
         let config = match &deps.config_path {
             Some(path) => assign_ids(path.clone(), deps.config).await,
             None => deps.config,
         };
+        // §5.2 Settings keys; a malformed `[limits]` table runs with the spec's defaults.
+        let limits = limits.unwrap_or_else(|| {
+            limits_config(&config)
+                .map(|c| Limits::from_config(&c))
+                .unwrap_or_default()
+        });
         let committed = Arc::new(CommittedSet::default());
         // The composition root's one cover issuer: covers only for ids the port committed.
         let covers = CoverIssuer::new(Arc::new(StoreProbe(committed.clone())));
@@ -151,6 +165,7 @@ impl Core {
             clock: deps.clock,
             ui: deps.ui,
             instances: InstanceTable::from_config(&config),
+            limits,
         }));
         Ok(Core {
             handler: Arc::new(CoreHandler::new(engine.clone())),

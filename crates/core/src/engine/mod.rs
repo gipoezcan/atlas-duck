@@ -8,9 +8,15 @@
 //! Terminal answers then come from the committed records (`status`, `await`, `requests list`).
 //! The one exception is a terminal state the store could not record (an append failure, §11.1):
 //! the entry stays in memory with its error, since the log cannot say it.
+//!
+//! Admission (Task 20, `queue`): an entry holds its admission [`Ticket`] from insertion until it
+//! is terminal; `Engine::after_change` drops it there (every terminal path, logged or not, goes
+//! through it) together with the cached candidate (`cache`).
 
+pub mod cache;
 pub mod envelope;
 pub mod handler;
+pub mod queue;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +30,7 @@ use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_ipc::proto::{ClientKind, Hello};
 use atlas_duck_registry::{OpClass, OperationSpec};
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use crate::audit_port::{AuditPort, CommittedSet};
 use crate::core::NativeConfirmer;
@@ -38,9 +44,12 @@ use crate::lifecycle::model::{
 };
 use crate::normalize::NormalizedHello;
 use crate::payloads::{self, EventCtx};
+use crate::redact::RedactionOp;
 use crate::validate::Validated;
 
+use cache::{Candidate, CandidateCache, RebuildError};
 use envelope::RecordStatus;
+use queue::{Admission, Limits, Ticket};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -74,6 +83,12 @@ pub struct EntryState {
     pub stale: bool,
     /// Caution warnings of the current revision (Tasks 21/22).
     pub caution_count: u32,
+    /// The redaction ops of the current revision (§5.2 queue metadata; Task 21 sets them): a
+    /// rebuild re-applies them.
+    pub redaction_ops: Vec<RedactionOp>,
+    /// A rebuild of the current revision failed for good (§5.2): Release stays disabled with the
+    /// `internal` banner; only Deny remains.
+    pub rebuild_failed: bool,
     /// `Some` only for a terminal state the store does not know (append failure).
     pub unlogged_terminal: Option<TerminalError>,
 }
@@ -103,6 +118,8 @@ pub struct RequestEntry {
     pub ctx: EventCtx,
     state: Mutex<EntryState>,
     status: watch::Sender<Status>,
+    /// The admission place (§3.3, §5.2), held until terminal.
+    ticket: Mutex<Option<Ticket>>,
 }
 
 /// The parts of a new entry the handler fills in.
@@ -120,11 +137,15 @@ pub struct NewEntry {
     pub ctx: EventCtx,
     pub model: Model,
     pub unlogged_terminal: Option<TerminalError>,
+    /// From `Admission::admit`; an entry created terminal never keeps it.
+    pub ticket: Option<Ticket>,
 }
 
 impl RequestEntry {
     fn new(n: NewEntry, clock: Arc<dyn Clock>) -> RequestEntry {
         let (status, _) = watch::channel(agent_status(&n.model));
+        // A request inserted already terminal (an unlogged rejection) is pending no more.
+        let ticket = n.ticket.filter(|_| is_pending(n.model.phase()));
         RequestEntry {
             head: n.head,
             spec: n.spec,
@@ -145,9 +166,12 @@ impl RequestEntry {
                 candidate_hash: [0; 32],
                 stale: false,
                 caution_count: 0,
+                redaction_ops: Vec::new(),
+                rebuild_failed: false,
                 unlogged_terminal: n.unlogged_terminal,
             }),
             status,
+            ticket: Mutex::new(ticket),
         }
     }
 
@@ -180,6 +204,17 @@ impl RequestEntry {
     /// Wakes on every agent-visible status change.
     pub fn subscribe(&self) -> watch::Receiver<Status> {
         self.status.subscribe()
+    }
+
+    /// Gives the admission place back; idempotent (the ticket is taken once).
+    fn release_ticket(&self) {
+        let ticket = lock(&self.ticket).take();
+        drop(ticket);
+    }
+
+    /// Whether the entry still holds its admission place.
+    pub fn holds_ticket(&self) -> bool {
+        lock(&self.ticket).is_some()
     }
 
     fn publish(&self) {
@@ -253,6 +288,7 @@ pub struct EngineDeps {
     pub clock: Arc<dyn Clock>,
     pub ui: Arc<dyn UiSink>,
     pub instances: InstanceTable,
+    pub limits: Limits,
 }
 
 pub struct Engine {
@@ -270,6 +306,10 @@ pub struct Engine {
     sessions: Mutex<HashMap<String, Session>>,
     entries: RwLock<HashMap<String, Arc<RequestEntry>>>,
     shutting_down: AtomicBool,
+    admission: Admission,
+    /// §5.2: at most `limits.fetching` direct reads in `Fetching` (Task 21 acquires).
+    fetch_slots: Arc<Semaphore>,
+    candidates: CandidateCache,
     #[cfg(feature = "testing")]
     hooks: Mutex<crate::core::TestHooks>,
 }
@@ -289,6 +329,11 @@ impl Engine {
             sessions: Mutex::new(HashMap::new()),
             entries: RwLock::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            admission: Admission::new(d.limits),
+            fetch_slots: Arc::new(Semaphore::new(
+                d.limits.fetching.min(Semaphore::MAX_PERMITS),
+            )),
+            candidates: CandidateCache::new(d.limits.candidate_cache_bytes),
             #[cfg(feature = "testing")]
             hooks: Mutex::new(crate::core::TestHooks::none()),
         }
@@ -331,6 +376,25 @@ impl Engine {
         self.instances
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn limits(&self) -> &Limits {
+        self.admission.limits()
+    }
+
+    /// The pending counts and reservations (§3.3, §5.2).
+    pub fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
+    /// §5.2: a read holds a permit while it is in `Fetching`.
+    pub fn fetch_slots(&self) -> &Arc<Semaphore> {
+        &self.fetch_slots
+    }
+
+    /// The candidate LRU (§5.2).
+    pub fn candidates(&self) -> &CandidateCache {
+        &self.candidates
     }
 
     #[cfg(feature = "testing")]
@@ -461,8 +525,9 @@ impl Engine {
         self.after_change(entry);
     }
 
-    /// Wake the watchers; at a terminal state no further request is sent under this id, and a
-    /// recorded terminal is answered from the log from now on.
+    /// Wake the watchers; at a terminal state no further request is sent under this id, the
+    /// admission place and the cached candidate are given back, and a recorded terminal is
+    /// answered from the log from now on. Every path that makes a request terminal ends here.
     fn after_change(&self, entry: &Arc<RequestEntry>) {
         entry.publish();
         let (terminal, logged) = {
@@ -474,11 +539,68 @@ impl Engine {
         };
         if terminal {
             self.committed.forget_request(&entry.head.request_id);
+            entry.release_ticket();
+            self.candidates.remove(&entry.head.request_id);
             if logged {
                 self.entries
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&entry.head.request_id);
+            }
+        }
+    }
+
+    /// The current revision's candidate: from the cache if it holds this revision's bytes, else
+    /// rebuilt from the committed record off the runtime (§5.2) and cached. `normalize` is the
+    /// op's normalization of the record (see `cache`'s Task 21 contract). A permanent failure
+    /// (hash mismatch, malformed record, a stored op that no longer applies) disables Release for
+    /// this revision; an unreadable store fails only this call.
+    pub async fn candidate<N>(
+        &self,
+        entry: &Arc<RequestEntry>,
+        normalize: N,
+    ) -> Result<Arc<Candidate>, RebuildError>
+    where
+        N: FnOnce(&Value) -> Result<Value, RebuildError> + Send + 'static,
+    {
+        let id = entry.head.request_id.clone();
+        let (expected, ops) = {
+            let st = entry.state();
+            (st.candidate_hash, st.redaction_ops.clone())
+        };
+        match self.candidates.get(&id) {
+            Some(c) if c.hash == expected => return Ok(c),
+            Some(_) => self.candidates.remove(&id),
+            None => {}
+        }
+        let spec = entry.spec;
+        let rid = id.clone();
+        let rebuilt = self
+            .blocking(move |p| Ok(cache::rebuild(p, &rid, spec, &ops, &expected, normalize)))
+            .await
+            .unwrap_or_else(|e| Err(RebuildError::Audit(e)));
+        match rebuilt {
+            Ok(c) => {
+                let c = Arc::new(c);
+                // A newer revision or a terminal state meanwhile: do not cache stale bytes.
+                // Under the entry lock, so a terminal step cannot slip between the check and the
+                // insert (`after_change` removes the candidate after the model turned terminal).
+                let st = entry.state();
+                if st.candidate_hash == c.hash && is_pending(st.model.phase()) {
+                    self.candidates.insert(&id, c.clone());
+                }
+                drop(st);
+                Ok(c)
+            }
+            Err(e) => {
+                if e.disables_release() {
+                    let mut st = entry.state();
+                    if st.candidate_hash == expected {
+                        st.rebuild_failed = true;
+                        st.model.set_approvable(false);
+                    }
+                }
+                Err(e)
             }
         }
     }

@@ -1,7 +1,7 @@
 //! The core's `RequestHandler` (C.2, C.7): what `IpcServer` serves once a store is open.
 //!
 //! `submit` (§5.2 step 1 / §5.4 step 1): shutdown check, hello session, op lookup, routing
-//! (PD-01…PD-03), admission (Task 20), `params_sha256` (PD-27), `REQUEST_RECEIVED` through
+//! (PD-01…PD-03), admission (low space, pending limits, `max_pending_bytes`), `params_sha256` (PD-27), `REQUEST_RECEIVED` through
 //! `commit_request_received` (§5.1 inv. 1), static validation and the dry executor call (PD-09),
 //! then the pending envelope. Everything refused before `REQUEST_RECEIVED` is answered with
 //! `request_id: null` and logs nothing. Dispatch to the read/write/script flows is Tasks
@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use atlas_duck_audit::{EventHeader, EventType, QueryKind, is_terminal};
+use atlas_duck_audit::{AuditError, EventHeader, EventType, QueryKind, is_terminal};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use atlas_duck_ipc::proto::{
     AwaitParams, ConnectionMeta, Hello, HelloReply, ListState, MatchParams, ProgressNotification,
@@ -25,6 +25,7 @@ use atlas_duck_registry::{
 use serde_json::{Map, Value, json};
 
 use super::envelope::{self, OpenStatus};
+use super::queue::{AgentKey, Reservation};
 use super::{
     Engine, NewEntry, RequestEntry, RequestHead, Session, TerminalError, TransitionError,
     audit_failure_retryable, class_str, kind_of, payload_json,
@@ -193,6 +194,8 @@ impl CoreHandler {
                 let _ = step(&mut model, Event::AuditFailure);
                 self.engine.insert(NewEntry {
                     model,
+                    // Terminal: the admission place goes back now, not with the entry.
+                    ticket: None,
                     unlogged_terminal: Some(TerminalError {
                         code: ErrorCode::AuditFailure,
                         retryable,
@@ -497,7 +500,25 @@ impl RequestHandler for CoreHandler {
             Ok(r) => r,
             Err(env) => return *env,
         };
-        // 5. Admission: Task 20 (storage-low, pending limits, `max_pending_bytes`).
+        // 5. Admission, nothing queued or logged on a refusal: low space (§8.1, X-03), then the
+        // pending limits and `max_pending_bytes` (§3.3, §5.2) in one count. The ticket is given
+        // back by every return below until the entry holds it, then at terminal.
+        let kind = kind_of(spec);
+        match engine.blocking(|p| p.admission_check()).await {
+            Ok(()) => {}
+            Err(AuditError::StorageLow) => return envelope::audit_storage_low(),
+            // Never admit on an unanswered check.
+            Err(_) => return envelope::audit_failure(audit_failure_retryable(kind)),
+        }
+        let agent = AgentKey::new(
+            session.normalized.agent_name.as_deref(),
+            session.hello.client_kind,
+            conn,
+        );
+        let ticket = match engine.admission().admit(agent, Reservation::for_op(spec)) {
+            Ok(t) => t,
+            Err(busy) => return busy.envelope(),
+        };
         // 6. `params_sha256` (PD-27), the id, `REQUEST_RECEIVED` (§5.1 inv. 1).
         let Ok(sha) = params_sha256(spec.id, Some(&routed.id), &p.params) else {
             return envelope::integer_out_of_range();
@@ -505,7 +526,6 @@ impl RequestHandler for CoreHandler {
         let Ok(request_id) = RequestId::new() else {
             return envelope::internal("no request id could be generated");
         };
-        let kind = kind_of(spec);
         let ctx = EventCtx {
             request_id: Some(request_id.0.clone()),
             op_id: Some(spec.id.to_owned()),
@@ -565,6 +585,7 @@ impl RequestHandler for CoreHandler {
             ctx,
             model: Model::new(kind),
             unlogged_terminal: None,
+            ticket: Some(ticket),
         };
         // 7. Static validation (T13).
         let vctx = ValidateCtx {

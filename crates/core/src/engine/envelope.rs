@@ -6,6 +6,7 @@
 
 use atlas_duck_audit::EventType;
 use atlas_duck_ipc::envelope::{Envelope, EnvelopeError, ErrorCode, Status};
+use atlas_duck_ipc::proto::{BUSY_RETRY_PENDING_S, busy_envelope};
 use atlas_duck_registry::Product;
 use serde_json::{Map, Value, json};
 
@@ -33,6 +34,7 @@ const MSG_EXPIRED: &str = "the request expired";
 const MSG_CANCELLED: &str = "the request was cancelled";
 const MSG_ABANDONED: &str = "the request was abandoned when atlas-duck stopped";
 const MSG_DENIED: &str = "denied";
+const MSG_STORAGE_LOW: &str = "the audit log volume is low on free space; nothing was queued";
 
 /// The only statuses a request shows before it is terminal (§4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +239,17 @@ pub fn integer_out_of_range() -> Envelope {
 /// §5.1 inv. 1: the start record did not commit, so nothing exists (`request_id: null`).
 pub fn audit_failure(retryable: bool) -> Envelope {
     failed_direct(ErrorCode::AuditFailure, retryable, MSG_AUDIT_FAILURE, None)
+}
+
+/// §8.1 low-space admission (X-03): exit 1, `retryable: true`, nothing queued, nothing logged.
+pub fn audit_storage_low() -> Envelope {
+    failed_direct(ErrorCode::AuditStorageLow, true, MSG_STORAGE_LOW, None)
+}
+
+/// §3.3 (L44): every pending-limit refusal (per agent key, total, `max_pending_bytes`) is this
+/// one envelope, byte for byte: nothing queued, `retry_after_s` 30 whatever the queue holds.
+pub fn busy() -> Envelope {
+    busy_envelope(BUSY_RETRY_PENDING_S)
 }
 
 /// `internal`, exit 1, `retryable: false`.
