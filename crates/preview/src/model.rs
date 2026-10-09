@@ -98,6 +98,10 @@ pub enum OutcomeKind {
     PerCallTimeout30,
     NetworkAfterSend,
     JsonBodyUnreadable,
+    /// A later page of a paginated read was refused or answered without usable JSON (redirect,
+    /// non-JSON, token or identity failure, connection failure): gated, because whether a
+    /// later page is requested depends on the results (Task 21 review I-1).
+    LaterPageRefused,
 }
 
 /// A request body as shown in the Request tab: text, or base64 for binary/multipart (§5.4 step 4).

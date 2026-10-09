@@ -22,14 +22,14 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use atlas_duck_atlassian::UpstreamResponse;
 use atlas_duck_audit::{AuditError, EventType};
-use atlas_duck_registry::OperationSpec;
+use atlas_duck_registry::{OperationSpec, RELEASE_CAP_BYTES};
 use lru::LruCache;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::audit_port::AuditPort;
 use crate::payloads::body_from_json;
-use crate::redact::{self, RedactionOp};
+use crate::redact::{self, RedactionMeta, RedactionOp};
 
 /// Estimated bytes of one map entry beside its key and value (allocator and tree overhead).
 const MAP_ENTRY_OVERHEAD: u64 = 32;
@@ -280,21 +280,48 @@ pub fn build_candidate(
     body: Value,
     ops: &[RedactionOp],
 ) -> Result<Candidate, RebuildError> {
-    let value = if ops.is_empty() {
-        body
-    } else {
-        let out = redact::apply(
-            &body,
-            &spec.redaction_rules,
-            spec.paginated.map(|p| p.items_key),
-            ops,
-        );
-        if !out.blocked.is_empty() {
-            return Err(RebuildError::Blocked);
-        }
-        out.released
+    build_redacted(spec, body, ops).map(|(c, _)| c)
+}
+
+/// What a revision's ops did besides its bytes (`meta.redactions`, "also appears in").
+#[derive(Clone)]
+pub struct RedactionReport {
+    pub meta: RedactionMeta,
+    pub also_appears_in: Vec<String>,
+}
+
+/// [`build_candidate`] with the report of the ops (`None` without ops); a new redacted revision
+/// is built through this, so it hashes exactly as its rebuild will. Ops that block (§5.3), or a
+/// redacted candidate over the 16 MiB release cap (every-occurrence masks can grow a body: each
+/// match becomes `[REDACTED]`; §5.2 step 4, and with it the 24 MiB IPC frame), are `Blocked`.
+pub fn build_redacted(
+    spec: &OperationSpec,
+    body: Value,
+    ops: &[RedactionOp],
+) -> Result<(Candidate, Option<RedactionReport>), RebuildError> {
+    if ops.is_empty() {
+        let c = Candidate::from_value(body).map_err(|_| RebuildError::Malformed)?;
+        return Ok((c, None));
+    }
+    let out = redact::apply(
+        &body,
+        &spec.redaction_rules,
+        spec.paginated.map(|p| p.items_key),
+        ops,
+    );
+    drop(body);
+    if !out.blocked.is_empty() {
+        return Err(RebuildError::Blocked);
+    }
+    let c = Candidate::from_value(out.released).map_err(|_| RebuildError::Malformed)?;
+    if len_u64(c.bytes().len()) > RELEASE_CAP_BYTES {
+        return Err(RebuildError::Blocked);
+    }
+    let report = RedactionReport {
+        meta: out.meta,
+        also_appears_in: out.also_appears_in,
     };
-    Candidate::from_value(value).map_err(|_| RebuildError::Malformed)
+    Ok((c, Some(report)))
 }
 
 /// Rebuilds `request_id`'s candidate from its last committed candidate record (blocking: call it

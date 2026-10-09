@@ -214,3 +214,87 @@ async fn rf2a_intermediary_conditioned_status() -> TestResult {
     }
     Ok(())
 }
+
+/// Review I-1: a later page answered with a redirect is gated (whether a page 2 is requested
+/// depends on the results), never a direct failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_later_page_redirect_is_gated() -> TestResult {
+    let page1 = fixtures::jira_board_page(0, 50, Some(1000), 50);
+    let mut first = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-AUSERNAME: {TEST_USER}\r\nConnection: close\r\n\r\n",
+        page1.len()
+    )
+    .into_bytes();
+    first.extend_from_slice(page1.as_bytes());
+    let html = "<html>session expired</html>";
+    let second = format!(
+        "HTTP/1.1 302 Found\r\nLocation: https://sso.corp.example/login\r\nContent-Type: text/html\r\nContent-Length: {}\r\nX-AUSERNAME: {TEST_USER}\r\nConnection: close\r\n\r\n{html}",
+        html.len()
+    )
+    .into_bytes();
+    let server = RawHttpServer::serve_sequence(vec![
+        vec![RawStep::Send(first)],
+        vec![RawStep::Send(second)],
+    ])
+    .await?;
+    let h = Harness::builder()
+        .instance_at(
+            "jira-main",
+            Product::Jira,
+            InstanceAt {
+                base_url: server.base_url(),
+                ..InstanceAt::default()
+            },
+        )
+        .start()
+        .await?;
+    let id = request_id(&h.submit("jira.board.list", json!({ "max": 100 })).await)?;
+    h.queued(&id, 10_000).await.ok_or("never queued")?;
+    assert_eq!(server.connections(), 2);
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    match h.approver().open(&id).map_err(de)?.preview.body {
+        PreviewBody::Outcome { outcome, .. } => {
+            assert_eq!(outcome, atlas_duck_preview::OutcomeKind::LaterPageRefused)
+        }
+        other => return Err(format!("not an outcome card: {other:?}").into()),
+    }
+    let fetched = h
+        .events(&id)
+        .await?
+        .into_iter()
+        .find(|(t, _)| *t == EventType::READ_FETCHED)
+        .map(|(_, p)| p)
+        .ok_or("no READ_FETCHED")?;
+    assert_eq!(fetched["reason"], "redirect_3xx");
+    assert!(fetched.to_string().contains("session expired"));
+    h.approver().release_unopened(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!((env.status, exit(&env)), (Status::Failed, 6));
+    assert_eq!(code(&env), "upstream_unavailable");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert!(env.error.as_ref().is_some_and(|e| e.details.is_none()));
+    Ok(())
+}
+
+/// Review I-2: a 2xx JSON body the client accepts but `serde_json::Value` cannot hold (nested
+/// deeper than 128) is gated like any unreadable JSON body, never a direct `internal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i24_deeply_nested_json_is_gated() -> TestResult {
+    let h = Harness::jira().await?;
+    let body = format!("{{\"a\":{}{}}}", "[".repeat(200), "]".repeat(200));
+    jira(&h)?.json("/rest/api/2/issue/DEEP-1", 200, &body).await;
+    let id = request_id(&h.submit(ISSUE, json!({ "key": "DEEP-1" })).await)?;
+    h.queued(&id, 10_000).await.ok_or("never queued")?;
+    match h.approver().open(&id).map_err(de)?.preview.body {
+        PreviewBody::Outcome { outcome, .. } => {
+            assert_eq!(outcome, atlas_duck_preview::OutcomeKind::JsonBodyUnreadable)
+        }
+        other => return Err(format!("not an outcome card: {other:?}").into()),
+    }
+    h.approver().release_unopened(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!((env.status, exit(&env)), (Status::Failed, 6));
+    assert_eq!(code(&env), "upstream_unavailable");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    Ok(())
+}

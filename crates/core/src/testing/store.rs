@@ -145,6 +145,9 @@ pub struct FaultPlan {
     nth: Mutex<HashMap<EventType, BTreeSet<u32>>>,
     seen: Mutex<HashMap<EventType, u32>>,
     fail_all: AtomicBool,
+    /// Event types whose committed payloads read back tampered (`tamper_released_text`).
+    tamper: Mutex<BTreeSet<EventType>>,
+    tampered_seqs: Mutex<BTreeSet<u64>>,
 }
 
 impl FaultPlan {
@@ -165,6 +168,48 @@ impl FaultPlan {
     /// Append attempts of `t` seen so far.
     pub fn attempts(&self, t: EventType) -> u32 {
         lock(&self.seen).get(&t).copied().unwrap_or(0)
+    }
+
+    /// Records of `t` committed from now on read back with one letter of their
+    /// `released.text` changed (a record altered after commit; inv. 2 at delivery). The stored
+    /// record is untouched; only `read_payload` through this port sees the change.
+    pub fn tamper_released_text(&self, t: EventType) {
+        lock(&self.tamper).insert(t);
+    }
+
+    fn note_committed(&self, t: EventType, seq: u64) {
+        if lock(&self.tamper).contains(&t) {
+            lock(&self.tampered_seqs).insert(seq);
+        }
+    }
+
+    /// The payload as a tampering reader would see it.
+    fn tampered(&self, seq: u64, bytes: Zeroizing<Vec<u8>>) -> Zeroizing<Vec<u8>> {
+        if !lock(&self.tampered_seqs).contains(&seq) {
+            return bytes;
+        }
+        let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return bytes;
+        };
+        if let Some(text) = v.pointer_mut("/released/text")
+            && let Some(s) = text.as_str()
+        {
+            let changed: String = {
+                let mut done = false;
+                s.chars()
+                    .map(|c| {
+                        if !done && c.is_ascii_lowercase() {
+                            done = true;
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        }
+                    })
+                    .collect()
+            };
+            *text = serde_json::Value::String(changed);
+        }
+        Zeroizing::new(serde_json::to_vec(&v).unwrap_or_default())
     }
 
     /// Counts the attempts and decides before anything reaches the store.
@@ -216,12 +261,20 @@ impl FaultyAudit {
 impl AuditPort for FaultyAudit {
     fn append(&self, ev: NewEvent) -> Result<Committed, AuditError> {
         self.plan.check([&ev])?;
-        self.inner.append(ev)
+        let t = ev.event_type;
+        let c = self.inner.append(ev)?;
+        self.plan.note_committed(t, c.seq);
+        Ok(c)
     }
 
     fn append_batch(&self, evs: Vec<NewEvent>) -> Result<Vec<Committed>, AuditError> {
         self.plan.check(&evs)?;
-        self.inner.append_batch(evs)
+        let types: Vec<EventType> = evs.iter().map(|e| e.event_type).collect();
+        let cs = self.inner.append_batch(evs)?;
+        for (t, c) in types.iter().zip(&cs) {
+            self.plan.note_committed(*t, c.seq);
+        }
+        Ok(cs)
     }
 
     fn admission_check(&self) -> Result<(), AuditError> {
@@ -233,7 +286,9 @@ impl AuditPort for FaultyAudit {
     }
 
     fn read_payload(&self, seq: u64) -> Result<Zeroizing<Vec<u8>>, AuditError> {
-        self.inner.read_payload(seq)
+        self.inner
+            .read_payload(seq)
+            .map(|b| self.plan.tampered(seq, b))
     }
 
     fn headers_for_request(&self, request_id: &str) -> Result<Vec<EventHeader>, AuditError> {

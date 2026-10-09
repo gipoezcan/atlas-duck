@@ -129,9 +129,18 @@ impl fmt::Debug for ReadState {
 
 // ---- the flow ---------------------------------------------------------------------------------
 
-/// Starts the read of a request that just entered the map in `Validated` (Task 19 step 9).
+/// Starts the read of a request that just entered the map in `Validated` (Task 19 step 9). A
+/// read task that panics fails its request `internal` (gated like every record-bearing end),
+/// instead of leaving it in `Fetching` with its admission place until expiry.
 pub(crate) fn dispatch(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
-    tokio::spawn(run(engine.clone(), entry.clone()));
+    let (engine, entry) = (engine.clone(), entry.clone());
+    let read = tokio::spawn(run(engine.clone(), entry.clone()));
+    tokio::spawn(async move {
+        if read.await.is_err() {
+            let d = Direct::internal(MSG_INTERNAL, Vec::new());
+            direct(&engine, &entry, d).await;
+        }
+    });
 }
 
 async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
@@ -201,13 +210,15 @@ async fn fetch(
     let Ok(ExecPlan::Read(plan)) = plan else {
         return Err(MSG_INTERNAL);
     };
+    // The control first, then the cover: a cancel that ran before this point has forgotten the
+    // id (no cover is minted); one that runs after it finds the control (review M-5).
+    let ctl = FetchControl::new();
+    entry.set_fetch_control(Some(ctl.clone()));
     // §5.1 inv. 1: only an id whose `REQUEST_RECEIVED` committed gets a cover.
     let cover = engine
         .covers()
         .for_request(&entry.head.request_id)
         .map_err(|_| MSG_INTERNAL)?;
-    let ctl = FetchControl::new();
-    entry.set_fetch_control(Some(ctl.clone()));
     let budget = engine.read_budget();
     let start = validated
         .params
@@ -264,6 +275,9 @@ struct OutcomeFacts {
     card: CardKind,
     /// Bytes of the response being read when it stopped.
     partial: Vec<u8>,
+    /// The diagnosis of a later-page failure that is gated instead of direct (`class` or
+    /// `reason`), kept in the record only.
+    cause: Option<(&'static str, &'static str)>,
 }
 
 /// A data-free direct failure (§5.2 step 6 "directly returned without release").
@@ -272,6 +286,9 @@ pub(crate) struct Direct {
     message: String,
     /// `("class", ..)` or `("reason", ..)` in the record.
     cause: Option<(&'static str, &'static str)>,
+    /// `details.reason` in the envelope: only the §4.3 identity-header states (ruling 4
+    /// carve-out); every other class or reason stays in the record.
+    reason_detail: Option<&'static str>,
     /// Responses received before the failure was decided (audit-only, RF-2a).
     responses: Vec<UpstreamResponse>,
 }
@@ -282,6 +299,7 @@ impl Direct {
             code: ErrorCode::Internal,
             message: message.to_owned(),
             cause: None,
+            reason_detail: None,
             responses,
         }
     }
@@ -314,7 +332,14 @@ impl ItemRecord {
                 responses: &self.responses,
             },
         };
-        payloads::read_fetched(ctx, &fetched, None)
+        let mut ev = payloads::read_fetched(ctx, &fetched, None);
+        if let (Some((k, v)), Some(o)) = (
+            self.outcome.as_ref().and_then(|o| o.cause),
+            ev.payload.as_object_mut(),
+        ) {
+            o.insert(k.into(), v.into());
+        }
+        ev
     }
 
     fn outcome(
@@ -332,6 +357,7 @@ impl ItemRecord {
                 cap,
                 card,
                 partial,
+                cause: None,
             }),
             page: None,
             server_total: None,
@@ -408,8 +434,46 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
     }
 }
 
-/// A failure, with the complete responses received before it (earlier pages).
+/// A failure, with the complete responses received before it (earlier pages). §5.2 step 6
+/// returns a failure directly only when nothing about it depends on what the query selected;
+/// whether a later page is requested at all does, so after a first page every direct class
+/// (connection, status/header-decided, token, identity) becomes a gated outcome item and
+/// "there was a page 2" never reaches the agent without a release (review I-1). An `internal`
+/// failure (a bug, not data) stays direct.
 fn classify_failure(
+    f: FetchFailure,
+    responses: Vec<UpstreamResponse>,
+    proxy: &ResolvedProxy,
+) -> Classified {
+    let later_page = !responses.is_empty();
+    match classify_one(f, responses, proxy) {
+        Classified::Direct(d) if later_page && d.code != ErrorCode::Internal => {
+            Classified::Item(gated(d))
+        }
+        c => c,
+    }
+}
+
+/// A direct failure on a later page as an outcome item: `upstream_network` for a connection
+/// class, `upstream_unavailable` for the rest; the class or reason stays in the record.
+fn gated(d: Direct) -> ItemRecord {
+    let (kind, card) = if d.code == ErrorCode::UpstreamNetwork {
+        (OutcomeKind::Network, CardKind::NetworkAfterSend)
+    } else {
+        (OutcomeKind::Unparsable, CardKind::LaterPageRefused)
+    };
+    let cause = d.cause.or(match d.code {
+        ErrorCode::NeedsToken => Some(("reason", "needs_token")),
+        _ => None,
+    });
+    let mut rec = ItemRecord::outcome(d.responses, kind, None, card, Vec::new());
+    if let Some(o) = rec.outcome.as_mut() {
+        o.cause = cause;
+    }
+    rec
+}
+
+fn classify_one(
     f: FetchFailure,
     mut responses: Vec<UpstreamResponse>,
     proxy: &ResolvedProxy,
@@ -423,15 +487,24 @@ fn classify_failure(
             code: ErrorCode::UpstreamNetwork,
             message: connection_message(class, proxy),
             cause: Some(("class", class_name(class))),
+            reason_detail: None,
             responses,
         }),
         // Decided from status and headers alone (§7.2, L44): direct, the body audit-only (RF-2a).
         FetchFailure::StatusHeaderDecided { reason, response } => {
             responses.push(response);
+            // §4.3: the identity-header states name their reason (instance-level, data-free).
+            let reason_detail = matches!(
+                reason,
+                UnavailableReason::IdentityHeaderMissing
+                    | UnavailableReason::IdentityHeaderMismatch
+            )
+            .then(|| unavailable_name(reason));
             Classified::Direct(Direct {
                 code: ErrorCode::UpstreamUnavailable,
                 message: unavailable_message(reason).to_owned(),
                 cause: Some(("reason", unavailable_name(reason))),
+                reason_detail,
                 responses,
             })
         }
@@ -491,6 +564,7 @@ fn classify_failure(
             code: ErrorCode::NeedsToken,
             message: MSG_NEEDS_TOKEN.to_owned(),
             cause: None,
+            reason_detail: None,
             responses,
         }),
         // Task 26 runs `token_recheck` here; until then `upstream_unavailable`, body audit-only.
@@ -500,6 +574,7 @@ fn classify_failure(
                 code: ErrorCode::UpstreamUnavailable,
                 message: MSG_IDENTITY.to_owned(),
                 cause: Some(("reason", "identity_check")),
+                reason_detail: None,
                 responses,
             })
         }
@@ -616,7 +691,19 @@ async fn settle(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, classified: Cla
                     params: &params,
                     target_display: &target,
                 };
-                build_item(&cx, &ctx, rec, clamped)
+                // A 2xx body the client accepted that the candidate cannot be built from (e.g.
+                // JSON nested deeper than `serde_json::Value` parses) depends on the content:
+                // gated as an unparsable outcome, never a direct failure (review I-2).
+                build_item(&cx, &ctx, rec, clamped).or_else(|responses| {
+                    let rec = ItemRecord::outcome(
+                        responses,
+                        OutcomeKind::Unparsable,
+                        None,
+                        CardKind::JsonBodyUnreadable,
+                        Vec::new(),
+                    );
+                    build_item(&cx, &ctx, rec, clamped)
+                })
             })
             .await;
             match built {
@@ -650,11 +737,15 @@ async fn direct(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, d: Direct) {
                 None,
             ));
         }
+        let mut details = Map::new();
+        if let Some(r) = d.reason_detail {
+            details.insert("reason".into(), r.into());
+        }
         evs.push(payloads::read_failed(
             &ctx,
             d.code,
             &d.message,
-            &Value::Object(Map::new()),
+            &Value::Object(details),
             d.cause,
         ));
         evs
@@ -1034,6 +1125,101 @@ mod tests {
         assert_eq!(error_text(br#"{"statusCode":400,"message":"dup"}"#), "dup");
         let long = format!(r#"{{"errorMessages":["{}"]}}"#, "x".repeat(5000));
         assert!(error_text(long.as_bytes()).len() <= atlas_duck_preview::ERROR_TEXT_CAP_BYTES);
+        Ok(())
+    }
+
+    fn direct_proxy() -> ResolvedProxy {
+        ResolvedProxy {
+            choice: atlas_duck_atlassian::ProxyChoice::Direct,
+            pac_configured: false,
+            uses_os: false,
+            os_read_failed: false,
+            effective: "direct".to_owned(),
+        }
+    }
+
+    fn answer(status: u16, ct: &str) -> UpstreamResponse {
+        UpstreamResponse {
+            status,
+            content_type: Some(ct.to_owned()),
+            body: b"<html>x</html>".to_vec(),
+        }
+    }
+
+    /// Ruling 4 carve-out: only the §4.3 identity-header reasons reach the envelope's details.
+    #[test]
+    fn identity_header_reason_is_the_only_detail() -> TestResult {
+        let f = |reason| FetchFailure::StatusHeaderDecided {
+            reason,
+            response: answer(200, "text/html"),
+        };
+        for (reason, detail) in [
+            (
+                UnavailableReason::IdentityHeaderMissing,
+                Some("identity_header_missing"),
+            ),
+            (
+                UnavailableReason::IdentityHeaderMismatch,
+                Some("identity_header_mismatch"),
+            ),
+            (UnavailableReason::Redirect3xx, None),
+            (UnavailableReason::NonJson2xx, None),
+        ] {
+            match classify_failure(f(reason), Vec::new(), &direct_proxy()) {
+                Classified::Direct(d) => assert_eq!(d.reason_detail, detail, "{reason:?}"),
+                _ => return Err(format!("{reason:?} not direct").into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Review I-1: after a first page, no failure class is direct.
+    #[test]
+    fn later_page_failures_are_gated() -> TestResult {
+        let page1 = || vec![answer(200, "application/json")];
+        let cases = [
+            (
+                FetchFailure::PreSendConnection(ConnClass::Dns),
+                OutcomeKind::Network,
+                ("class", "dns"),
+            ),
+            (
+                FetchFailure::StatusHeaderDecided {
+                    reason: UnavailableReason::Redirect3xx,
+                    response: answer(302, "text/html"),
+                },
+                OutcomeKind::Unparsable,
+                ("reason", "redirect_3xx"),
+            ),
+            (
+                FetchFailure::NeedsToken,
+                OutcomeKind::Unparsable,
+                ("reason", "needs_token"),
+            ),
+            (
+                FetchFailure::IdentityCheckFailed {
+                    observed: atlas_duck_atlassian::IdentityObserved::Missing,
+                    response: answer(200, "application/json"),
+                },
+                OutcomeKind::Unparsable,
+                ("reason", "identity_check"),
+            ),
+        ];
+        for (f, kind, cause) in cases {
+            match classify_failure(f, page1(), &direct_proxy()) {
+                Classified::Item(rec) => {
+                    assert_eq!(rec.item, ReleaseItem::Outcome);
+                    let o = rec.outcome.as_ref().ok_or("no outcome")?;
+                    assert_eq!((o.kind, o.cause), (kind, Some(cause)));
+                }
+                _ => return Err(format!("{cause:?} not gated").into()),
+            }
+        }
+        // A bug is not data: the method guard stays direct.
+        assert!(matches!(
+            classify_failure(FetchFailure::MethodGuardRefused, page1(), &direct_proxy()),
+            Classified::Direct(_)
+        ));
         Ok(())
     }
 

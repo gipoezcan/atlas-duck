@@ -357,7 +357,8 @@ async fn i08_release_outcome_delivers_failed_exit6() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i08_deny_outcome_exit3() -> TestResult {
     let (h, id) = timeout_outcome().await?;
-    h.approver().deny(&id, "not now").map_err(de)?;
+    // The human reason reaches the agent with flagged characters stripped (M-1 ruling).
+    h.approver().deny(&id, "not\u{202E} now").map_err(de)?;
     let env = h.await_(&id, 5000).await;
     assert_eq!(env.status, Status::Denied);
     assert_eq!(exit(&env), 3);
@@ -701,5 +702,87 @@ async fn search_results_without_content_dropped() -> TestResult {
         env.data.as_ref().map(|d| d["result"]["totalSize"].clone()),
         Some(json!(3))
     );
+    Ok(())
+}
+
+/// §5.1 inv. 1 at `await`: a `DELIVERED` that does not commit hands nothing over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivered_append_failure_hands_over_nothing() -> TestResult {
+    let plan = atlas_duck_core::testing::FaultPlan::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    jira(&h)?
+        .json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let id = queued(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    h.approver().release(&id).map_err(de)?;
+    plan.fail_nth(EventType::DELIVERED, 1);
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(exit(&env), 1);
+    assert_eq!(code(&env), "audit_failure");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
+    assert_eq!((&env.data, &env.meta), (&None, &None));
+    assert!(!env.to_json_line().contains("ABC-1\""));
+    assert!(!types(&h, &id).await?.contains(&EventType::DELIVERED));
+    // The next `await` delivers (and logs it).
+    let again = h.await_(&id, 5000).await;
+    assert_eq!(again.status, Status::Released);
+    assert!(types(&h, &id).await?.contains(&EventType::DELIVERED));
+    Ok(())
+}
+
+/// §5.1 inv. 2 at `await`: released bytes that do not match their committed hash are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tampered_release_is_not_delivered() -> TestResult {
+    let plan = atlas_duck_core::testing::FaultPlan::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    jira(&h)?
+        .json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let id = queued(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    plan.tamper_released_text(EventType::READ_RELEASED);
+    h.approver().release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "internal");
+    assert_eq!(exit(&env), 1);
+    assert_eq!((&env.data, &env.meta), (&None, &None));
+    assert!(!env.to_json_line().contains("Login page"));
+    Ok(())
+}
+
+/// Ruling 3: an outcome answer is fixed text and stays deliverable after the hour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_window_keeps_outcome_answers() -> TestResult {
+    let (h, id) = timeout_outcome().await?;
+    h.approver().release(&id).map_err(de)?;
+    h.clock().advance(Duration::from_secs(61 * 60));
+    let env = h.await_(&id, 5000).await;
+    assert_outcome_delivery(&env, "upstream_network")?;
+    assert_eq!(exit(&env), 6);
+    Ok(())
+}
+
+/// Ruling 3: released upstream-error details are released data and leave after the hour.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_window_evicts_upstream_error_details() -> TestResult {
+    let (h, id) = not_found_item().await?;
+    h.approver().release(&id).map_err(de)?;
+    h.clock().advance(Duration::from_secs(61 * 60));
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "result_evicted");
+    assert_eq!(exit(&env), 10);
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
+    assert!(env.error.as_ref().is_some_and(|e| e.details.is_none()));
+    assert!(!env.to_json_line().contains("Issue does not exist"));
     Ok(())
 }

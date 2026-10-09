@@ -147,6 +147,10 @@ async fn per_agent_limit_32() -> TestResult {
         assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
         ids.push(request_id(&env)?);
     }
+    // Every read fetched (its `READ_FETCHED` is in), so the count below moves only by a submit.
+    for id in &ids {
+        h.queued(id, 10_000).await.ok_or("never queued")?;
+    }
     let before = h.event_count().await?;
     let env = h.submit_with(&a, ISSUE, issue("ABC-1"), None).await;
     assert_busy(&env)?;

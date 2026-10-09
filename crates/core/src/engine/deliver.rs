@@ -3,7 +3,8 @@
 //! Every answer comes from the committed records, never from memory: a released read is the
 //! `READ_RELEASED` payload decrypted for this delivery, its bytes checked against
 //! `released_sha256` (inv. 2), within 1 h of the decision; later the request's true status with
-//! `result_evicted` (exit 10). Each terminal envelope `await` returns is logged as `DELIVERED`
+//! `result_evicted` (exit 10; an outcome answer `{code, hint}` is fixed text and never
+//! evicted). Each terminal envelope `await` returns is logged as `DELIVERED`
 //! for the awaiting connection **before** it is handed over (inv. 1): if that append fails, the
 //! agent gets `audit_failure` and no data. Pending and executing envelopes are never logged.
 
@@ -11,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use atlas_duck_audit::{EventHeader, EventType, UtcInstant};
-use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
+use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::proto::{ConnectionMeta, Hello};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -133,8 +134,12 @@ fn deliver_from_records(
         &handoff.payload_sha256,
     )) {
         Ok(_) => handoff.env,
+        // Nothing handed over: `failed`, `audit_failure` (exit 1), whatever the request's status.
         Err(_) => envelope::record_failure(
-            &rs,
+            &RecordStatus {
+                status: Status::Failed,
+                ..rs
+            },
             ErrorCode::AuditFailure,
             audit_failure_retryable(kind),
             envelope::MSG_AUDIT_FAILURE,
@@ -152,6 +157,12 @@ fn released(
     now: UtcInstant,
     kind: Kind,
 ) -> Handoff {
+    // An outcome item: `{code, hint}`, fixed text and no data (§5.2 step 6), so it is answered
+    // whenever asked, like a deny reason (ruling 3: never evicted).
+    if payload.as_ref().is_some_and(|p| p.get("code").is_some()) {
+        return with_error_hash(envelope::await_envelope(rs));
+    }
+    // Released data and released upstream-error details: 1 h after the decision (§4.4).
     let decided = UtcInstant::parse_rfc3339_ms(&t.ts_utc);
     if decided.is_none_or(|d| now.0.saturating_sub(d.0) > DELIVERY_WINDOW_MS) {
         return with_error_hash(envelope::result_evicted(rs, audit_failure_retryable(kind)));
@@ -159,10 +170,6 @@ fn released(
     let Some(payload) = payload else {
         return with_error_hash(envelope::delivery_internal(rs));
     };
-    // An outcome item: `{code, hint}`, nothing else (§5.2 step 6).
-    if payload.get("code").is_some() {
-        return with_error_hash(envelope::await_envelope(rs));
-    }
     let bytes = payload.get("released").and_then(body_from_json);
     let expected = payload.get("released_sha256").and_then(Value::as_str);
     let (Some(bytes), Some(expected)) = (bytes, expected) else {

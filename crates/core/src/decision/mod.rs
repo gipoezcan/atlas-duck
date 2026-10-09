@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
+use atlas_duck_preview::invisible::strip;
 use atlas_duck_preview::{
     CandidateRev, PREVIEW_BUILDER_VERSION, Preview, RAW_PAGE_BYTES, RawPager,
 };
@@ -29,7 +30,7 @@ use serde::{Serialize, Serializer};
 use serde_json::Value;
 
 use crate::edit::Edits;
-use crate::engine::cache::{Candidate, RebuildError, source_body};
+use crate::engine::cache::{Candidate, RebuildError, build_redacted, source_body};
 use crate::engine::read::{
     OUTCOME_HINT, ReadContext, caution_count, normalizer, preview_model, release_meta,
 };
@@ -37,7 +38,7 @@ use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, Transition
 use crate::gate::UiEvent;
 use crate::lifecycle::model::{Event, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
-use crate::redact::{self, RedactionOp};
+use crate::redact::RedactionOp;
 use crate::validate::ValidationError;
 
 /// Maps to the audit `decision` values (C.7).
@@ -300,7 +301,9 @@ fn current_rev(st: &EntryState) -> CandidateRev {
 }
 
 fn task_failed() -> DecisionError {
-    DecisionError::Audit(AuditError::AppendFailed("the decision task failed".into()))
+    DecisionError::Audit(AuditError::AppendFailed(
+        "the decision could not run (no multi-thread core runtime, or its task died)".into(),
+    ))
 }
 
 /// What a decision is checked against, read under one lock.
@@ -701,7 +704,10 @@ async fn deny(
     if let Err(rej) = dry_step(entry, |_| event, Some(&rev)) {
         return Err(rejected(engine, entry, rej, rev.counter, dec).await);
     }
-    let record = payloads::read_denied(&entry.ctx, d.reason.as_deref());
+    // The human's reason reaches the agent: flagged characters are stripped as for the agent's
+    // own `reason` (§3.3 rule, newlines kept; review M-1 ruling).
+    let reason = d.reason.as_deref().map(|r| strip(r, true).0);
+    let record = payloads::read_denied(&entry.ctx, reason.as_deref());
     match engine.transition(entry, event, move |_| record).await {
         Ok(_) => {
             queue_changed(engine, entry);
@@ -709,17 +715,6 @@ async fn deny(
         }
         Err(e) => Err(transition_failed(engine, entry, e, rev.counter, dec).await),
     }
-}
-
-/// What a set of redaction ops gave.
-enum Redacted {
-    Blocked,
-    Applied {
-        c: Candidate,
-        meta: Option<crate::redact::RedactionMeta>,
-        also: Vec<String>,
-        ops: Vec<RedactionOp>,
-    },
 }
 
 /// A new set of redaction ops on the normalized body: a new revision (`CandidateChanged`, inv.
@@ -770,38 +765,17 @@ async fn redact(
             .await);
         }
     };
-    // T14 handoff: on the bare body, with the op's `items_key`; heavy for big candidates.
-    // The same steps as `cache::build_candidate` (the rebuild path), keeping the outcome's meta.
+    // T14 handoff: on the bare body, with the op's `items_key`; heavy for big candidates. The
+    // rebuild path's own function (`cache::build_redacted`), so a rebuild reproduces the hash.
     let applied = tokio::task::spawn_blocking(move || {
-        if ops.is_empty() {
-            return Candidate::from_value(base).map(|c| Redacted::Applied {
-                c,
-                meta: None,
-                also: Vec::new(),
-                ops,
-            });
-        }
-        let out = redact::apply(
-            &base,
-            &spec.redaction_rules,
-            spec.paginated.map(|p| p.items_key),
-            &ops,
-        );
-        if !out.blocked.is_empty() {
-            return Ok(Redacted::Blocked);
-        }
-        Candidate::from_value(out.released).map(|c| Redacted::Applied {
-            c,
-            meta: Some(out.meta),
-            also: out.also_appears_in,
-            ops,
-        })
+        build_redacted(spec, base, &ops).map(|(c, report)| (c, report, ops))
     })
     .await;
-    let (c, redaction_meta, also, ops) = match applied {
-        Ok(Ok(Redacted::Applied { c, meta, also, ops })) => (c, meta, also, ops),
-        // §5.3 checks failed (mirror, every-occurrence mask, encodings, missing targets).
-        Ok(Ok(Redacted::Blocked)) => {
+    let (c, report, ops) = match applied {
+        Ok(Ok(built)) => built,
+        // §5.3 checks failed (mirror, every-occurrence mask, encodings, missing targets), or the
+        // redacted candidate is over the 16 MiB release cap.
+        Ok(Err(RebuildError::Blocked)) => {
             return Err(rejected(
                 engine,
                 entry,
@@ -813,9 +787,13 @@ async fn redact(
         }
         _ => return Err(DecisionError::Audit(AuditError::Invalid("redaction"))),
     };
+    let (redaction_meta, also_appears_in) = match report {
+        Some(r) => (Some(r.meta), r.also_appears_in),
+        None => (None, Vec::new()),
+    };
     let new_read = crate::engine::read::ReadState {
         redaction_meta,
-        also_appears_in: also,
+        also_appears_in,
         ..read
     };
     let (_, cx) = read_context(entry);

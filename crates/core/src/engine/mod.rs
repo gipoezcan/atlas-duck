@@ -590,8 +590,14 @@ impl Engine {
     /// plain channel (PD-13). A caller on a multi-thread runtime's worker (or its `block_on`
     /// thread) waits through `block_in_place`, which hands the worker's queue to another thread,
     /// so the decision's own tasks still run even with every worker waiting. A caller on a
-    /// current-thread runtime is refused: blocking it could starve the very task it waits for.
-    /// `None` if refused or if the task died.
+    /// current-thread runtime is refused: blocking it could starve the very task it waits for
+    /// (this also refuses a `spawn_blocking` thread of a current-thread runtime, which could
+    /// block safely; the check cannot tell them apart). `None` if refused or if the task died.
+    ///
+    /// Contract for M4/M6 (review M-3): the core runs on a multi-thread runtime (with a
+    /// current-thread one every decision is refused), and `DecisionApi` is never called from a
+    /// `LocalSet` (`block_in_place` panics there). A refusal reaches the caller as
+    /// `DecisionError::Audit` with the message "the decision could not run".
     pub(crate) fn run_sync<T, F>(&self, fut: F) -> Option<T>
     where
         T: Send + 'static,

@@ -121,6 +121,9 @@ async fn stale_rev_release_rejected() -> TestResult {
         !serde_json::to_string(&shown.preview)?.contains("Login page times out"),
         "the preview shows the masked revision"
     );
+    // A redacted revision rebuilds to the same hash (T20 contract, review M-4): evicted, the
+    // release rebuilds it from the record and its ops and goes through.
+    h.evict_candidate(&id);
     h.decisions().decide(release(&id, rev2)).map_err(de)?;
     let env = h.await_(&id, 5000).await;
     assert_eq!(env.status, Status::Released);
@@ -288,5 +291,46 @@ async fn decisions_from_the_only_runtime_worker_complete() -> TestResult {
     let status = tokio::time::timeout(Duration::from_secs(30), task).await???;
     assert_eq!(status, Status::Released);
     assert_eq!(h.await_(&id, 5000).await.status, Status::Released);
+    Ok(())
+}
+
+/// Review I-3: a redacted revision stays under the 16 MiB release cap. Every-occurrence masks
+/// replace each match with `[REDACTED]`, so masking a short frequent string can grow the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redaction_over_release_cap_is_blocked() -> TestResult {
+    let h = Harness::jira().await?;
+    // ~15.5 MiB with about a million "ab": each becomes `[REDACTED]` (+8 bytes).
+    let unit = "abxxxxxxxxxxxxxx";
+    let summary = unit.repeat(15 * 1024 * 1024 / unit.len() + 30_000);
+    let body = json!({ "key": "ABC-1", "fields": { "summary": summary } }).to_string();
+    assert!(body.len() < 16 * 1024 * 1024);
+    jira(&h)?.json("/rest/api/2/issue/ABC-1", 200, &body).await;
+    let id = request_id(&h.submit(ISSUE, json!({ "key": "ABC-1" })).await)?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    h.approver().open(&id).map_err(de)?;
+    let res = h.approver().redact(
+        &id,
+        vec![RedactionOp::MaskText {
+            text: "ab".into(),
+            every_occurrence: true,
+            at: None,
+        }],
+    );
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let item = h.approver().item(&id).ok_or("left the queue")?;
+    assert_eq!(item.candidate_rev.counter, 1, "no new revision");
+    assert_eq!(
+        records(&h, &id, EventType::DECISION_INVALID)
+            .await?
+            .first()
+            .map(|r| r["reason"].clone()),
+        Some(json!("not_approvable"))
+    );
     Ok(())
 }
