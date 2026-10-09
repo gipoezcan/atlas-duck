@@ -647,10 +647,10 @@ async fn rebuild_from_committed_record() -> TestResult {
     }];
     let body: Value = serde_json::from_slice(&raw)?;
     let expected = build_candidate(spec, body, &ops).map_err(|e| format!("{e:?}"))?;
-    assert!(!String::from_utf8_lossy(&expected.bytes).contains("secret"));
+    assert!(!String::from_utf8_lossy(expected.bytes()).contains("secret"));
     {
         let mut st = entry.state();
-        st.candidate_hash = expected.hash;
+        st.candidate_hash = *expected.hash();
         st.redaction_ops = ops.clone();
     }
     let hits = h.mock("jira-main").ok_or("no mock")?.received().await.len();
@@ -662,8 +662,8 @@ async fn rebuild_from_committed_record() -> TestResult {
         .candidate(&entry, first_page)
         .await
         .map_err(|e| format!("{e:?}"))?;
-    assert_eq!(c.hash, expected.hash);
-    assert_eq!(&*c.bytes, &*expected.bytes);
+    assert_eq!(c.hash(), expected.hash());
+    assert_eq!(&**c.bytes(), &**expected.bytes());
     assert!(h.engine().candidates().contains(&id));
     // Cached now: the same `Arc`, no rebuild (a failing normalization is never called).
     let again = h
@@ -699,6 +699,13 @@ async fn rebuild_from_committed_record() -> TestResult {
     let other = h.engine().entry(&other).ok_or("not in memory")?;
     let res = h.engine().candidate(&other, first_page).await;
     assert!(matches!(res, Err(RebuildError::NoSource)), "{res:?}");
+    // No candidate yet (zero hash): nothing is disabled.
+    assert!(!other.state().rebuild_failed);
+    // A revision with a hash but no record: disabled.
+    other.state().candidate_hash = [7; 32];
+    let res = h.engine().candidate(&other, first_page).await;
+    assert!(matches!(res, Err(RebuildError::NoSource)), "{res:?}");
+    assert!(other.state().rebuild_failed);
     Ok(())
 }
 
@@ -870,10 +877,11 @@ async fn i37_await_delivers_committed_bytes() -> TestResult {
 fn rss_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        // `/proc/self/statm`: size resident shared ... in pages (4 KiB on the CI runners).
-        let s = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let pages: u64 = s.split_whitespace().nth(1)?.parse().ok()?;
-        Some(pages * 4096)
+        // `VmRSS:   12345 kB` (independent of the page size).
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = s.lines().find(|l| l.starts_with("VmRSS:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb * 1024)
     }
     #[cfg(windows)]
     {
@@ -908,8 +916,9 @@ fn rss_bytes() -> Option<u64> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "PD-15: full size, run with ATLAS_DUCK_BIG_TESTS=1 (one CI step, Task 30)"]
 async fn i37_rss_bounded_256_pending() -> TestResult {
+    // Run with `--ignored` but without the gate: fail loudly instead of passing vacuously.
     if std::env::var("ATLAS_DUCK_BIG_TESTS").as_deref() != Ok("1") {
-        return Ok(());
+        return Err("set ATLAS_DUCK_BIG_TESTS=1 to run the full-size memory test (PD-15)".into());
     }
     let h = Harness::jira().await?;
     let cache_mb = h.engine().limits().candidate_cache_bytes / MIB;
@@ -956,5 +965,73 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
             peak / MIB
         );
     }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rebuild_failure_survives_a_transition_replace() -> TestResult {
+    use atlas_duck_core::lifecycle::model::{Event, ReleaseItem, step};
+    use atlas_duck_core::payloads::preview_shown;
+    use atlas_duck_core::{Pause, TestHooks};
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_in_transition: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let id = request_id(&h.submit(ISSUE, issue("ABC-1")).await)?;
+    let entry = h.engine().entry(&id).ok_or("not in memory")?;
+    // As if the read had fetched (Task 21): an approvable release item with a candidate hash.
+    {
+        let mut st = entry.state();
+        let _ = step(&mut st.model, Event::FetchStarted);
+        let _ = step(&mut st.model, Event::Fetched(ReleaseItem::Result));
+        st.model.set_approvable(true);
+        st.candidate_hash = [9; 32];
+    }
+    let rev = entry.state().model.rev();
+    // An event that keeps rev and phase (`PreviewShown`) goes through `transition`; while its
+    // append is committed and the apply waits, a rebuild fails (no candidate record).
+    let ctx = entry.ctx.clone();
+    let engine = h.engine().clone();
+    let e2 = entry.clone();
+    let transition = tokio::spawn(async move {
+        engine
+            .transition(&e2, Event::PreviewShown { rev }, move |_| {
+                let r = CandidateRev {
+                    counter: rev,
+                    candidate_hash: [9; 32],
+                };
+                preview_shown(&ctx, &r, &[], "test")
+            })
+            .await
+    });
+    pause.reached.notified().await;
+    let res = h.engine().candidate(&entry, |v| Ok(v.clone())).await;
+    assert!(matches!(res, Err(RebuildError::NoSource)), "{res:?}");
+    assert!(entry.state().rebuild_failed);
+    assert!(!entry.state().model.approvable());
+    pause.release.notify_one();
+    assert!(transition.await?.is_ok());
+    let st = entry.state();
+    assert!(st.model.opened(), "the clone was applied");
+    assert!(
+        !st.model.approvable(),
+        "the rebuild failure survives the replace"
+    );
+    let mut m = st.model.clone();
+    assert!(
+        step(
+            &mut m,
+            Event::Release {
+                rev,
+                redacted: false
+            }
+        )
+        .is_err()
+    );
     Ok(())
 }

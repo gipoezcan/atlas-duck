@@ -577,10 +577,19 @@ impl Engine {
             self.fail_unlogged(entry);
             return Err(TransitionError::Audit(e));
         }
+        #[cfg(feature = "testing")]
+        if let Some(pause) = self.hooks.pause_in_transition.clone() {
+            pause.hold().await;
+        }
         let applied = {
             let mut st = entry.state();
             if st.model.rev() == rev && st.model.phase() == phase {
                 st.model = clone;
+                // A rebuild that failed meanwhile (`Engine::candidate`) disabled Release on this
+                // revision; the clone predates it and must not switch approval back on (T20 I-1).
+                if st.rebuild_failed {
+                    st.model.set_approvable(false);
+                }
                 Ok(applied)
             } else {
                 step(&mut st.model, event).map_err(TransitionError::Raced)
@@ -657,7 +666,7 @@ impl Engine {
             (st.candidate_hash, st.redaction_ops.clone())
         };
         match self.candidates.get(&id) {
-            Some(c) if c.hash == expected => return Ok(c),
+            Some(c) if c.hash() == &expected => return Ok(c),
             Some(_) => self.candidates.remove(&id),
             None => {}
         }
@@ -674,14 +683,15 @@ impl Engine {
                 // Under the entry lock, so a terminal step cannot slip between the check and the
                 // insert (`after_change` removes the candidate after the model turned terminal).
                 let st = entry.state();
-                if st.candidate_hash == c.hash && is_pending(st.model.phase()) {
+                if &st.candidate_hash == c.hash() && is_pending(st.model.phase()) {
                     self.candidates.insert(&id, c.clone());
                 }
                 drop(st);
                 Ok(c)
             }
             Err(e) => {
-                if e.disables_release() {
+                // No candidate yet (zero hash): nothing to disable; `NoSource` is expected then.
+                if e.disables_release() && expected != [0; 32] {
                     let mut st = entry.state();
                     if st.candidate_hash == expected {
                         st.rebuild_failed = true;

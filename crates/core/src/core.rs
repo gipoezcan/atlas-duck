@@ -126,6 +126,8 @@ pub struct TestHooks {
     /// `submit` holds right after its `REQUEST_RECEIVED` committed (I-3: a caller dropped there
     /// must not leave the request unapplied).
     pub pause_after_received: Option<Arc<Pause>>,
+    /// `Engine::transition` holds after its append committed, before it applies the model.
+    pub pause_in_transition: Option<Arc<Pause>>,
     pub freeze_at: Option<HookPoint>,
     /// A read whose JQL contains this text panics after `REQUEST_RECEIVED` (S-15).
     pub panic_on_jql: Option<String>,

@@ -37,9 +37,9 @@ const MAP_ENTRY_OVERHEAD: u64 = 32;
 /// A request's candidate: the exact bytes the approver sees and the agent may receive, their
 /// SHA-256 and the parsed tree the previewer reads.
 pub struct Candidate {
-    pub bytes: Arc<[u8]>,
-    pub hash: [u8; 32],
-    pub value: Arc<Value>,
+    bytes: Arc<[u8]>,
+    hash: [u8; 32],
+    value: Arc<Value>,
     charge: u64,
 }
 
@@ -54,6 +54,20 @@ impl Candidate {
             value: Arc::new(value),
             charge,
         })
+    }
+
+    /// The serialized candidate (what Raw pages slice and what is hashed).
+    pub fn bytes(&self) -> &Arc<[u8]> {
+        &self.bytes
+    }
+
+    /// SHA-256 of `bytes()`; the fields are private, so the pair cannot drift apart.
+    pub fn hash(&self) -> &[u8; 32] {
+        &self.hash
+    }
+
+    pub fn value(&self) -> &Arc<Value> {
+        &self.value
     }
 
     /// What the cache counts for this candidate: its bytes plus its tree.

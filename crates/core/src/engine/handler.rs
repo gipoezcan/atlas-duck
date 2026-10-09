@@ -1,8 +1,9 @@
 //! The core's `RequestHandler` (C.2, C.7): what `IpcServer` serves once a store is open.
 //!
 //! `submit` (§5.2 step 1 / §5.4 step 1): shutdown check, hello session, op lookup, routing
-//! (PD-01…PD-03), admission (low space, pending limits, `max_pending_bytes`), `params_sha256` (PD-27), `REQUEST_RECEIVED` through
-//! `commit_request_received` (§5.1 inv. 1), static validation and the dry executor call (PD-09),
+//! (PD-01…PD-03), admission (low space, pending limits, `max_pending_bytes`), `params_sha256`
+//! (PD-27), `REQUEST_RECEIVED` through `commit_request_received` (§5.1 inv. 1), static
+//! validation and the dry executor call (PD-09),
 //! then the pending envelope. Everything refused before `REQUEST_RECEIVED` is answered with
 //! `request_id: null` and logs nothing. From the `REQUEST_RECEIVED` commit on, `submit` runs in
 //! its own task, so a dropped caller future (a client that went away) cannot leave a committed
