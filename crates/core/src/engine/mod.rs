@@ -31,7 +31,7 @@ pub mod queue;
 pub mod read;
 pub mod write;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
@@ -50,7 +50,7 @@ use tokio::sync::{Semaphore, watch};
 use crate::audit_port::{AuditPort, CommittedSet};
 use crate::core::NativeConfirmer;
 use crate::decision::SessionKey;
-use crate::gate::UiSink;
+use crate::gate::{UiEvent, UiSink};
 use crate::http_factory::{HttpFactory, InstanceHttpSpec};
 use crate::instances::InstanceTable;
 use crate::lifecycle::model::{
@@ -61,6 +61,7 @@ use crate::normalize::NormalizedHello;
 use crate::payloads::{self, EventCtx};
 use crate::proxy::ResolvedProxy;
 use crate::redact::RedactionOp;
+use crate::similarity::{SimOutcome, SimRecord, SimilarityIndex, sim_key};
 use crate::validate::Validated;
 
 use cache::{Candidate, CandidateCache, RebuildError};
@@ -351,6 +352,89 @@ pub enum TransitionError {
     Audit(AuditError),
 }
 
+/// An event stepped on a clone of the model (PD-19), with the revision and phase it was
+/// stepped from, waiting for its record to commit.
+struct Prepared {
+    clone: Model,
+    applied: Applied,
+    rev: u64,
+    phase: Phase,
+}
+
+impl Prepared {
+    /// Steps a clone of `st.model`; nothing changes.
+    fn step(st: &EntryState, event: Event) -> Result<Prepared, Rejection> {
+        let mut clone = st.model.clone();
+        let applied = step(&mut clone, event)?;
+        Ok(Prepared {
+            clone,
+            applied,
+            rev: st.model.rev(),
+            phase: st.model.phase(),
+        })
+    }
+
+    /// After the record committed: replace the model with the clone if nothing changed since,
+    /// else re-step the current model with the same event (never overwrite a newer model);
+    /// `on_apply` runs under the state lock only when the event applied.
+    fn apply<A, G>(
+        self,
+        entry: &RequestEntry,
+        event: Event,
+        on_apply: A,
+        guard: G,
+    ) -> Result<Applied, TransitionError>
+    where
+        A: FnOnce(&mut EntryState),
+        G: Fn(&Model) -> bool,
+    {
+        let mut st = entry.state();
+        let applied = if st.model.rev() == self.rev && st.model.phase() == self.phase {
+            st.model = self.clone;
+            // A rebuild that failed meanwhile (`Engine::candidate`) disabled Release on this
+            // revision; the clone predates it and must not switch approval back on (T20 I-1).
+            if st.rebuild_failed {
+                st.model.set_approvable(false);
+            }
+            Ok(self.applied)
+        } else if !guard(&st.model) {
+            Err(TransitionError::Raced(Rejection::StaleRev {
+                current: st.model.rev(),
+            }))
+        } else {
+            step(&mut st.model, event).map_err(TransitionError::Raced)
+        };
+        if applied.is_ok() {
+            on_apply(&mut st);
+        }
+        applied
+    }
+}
+
+/// Held transition gates ([`Engine::lock_gates`]): proof for [`Engine::commit_batch`].
+pub(crate) struct Gates(#[allow(dead_code)] Vec<tokio::sync::OwnedMutexGuard<()>>);
+
+/// What an accepted event of a batch step brings to the entry state.
+pub(crate) type OnApply = Box<dyn FnOnce(&mut EntryState) + Send>;
+
+/// One request of a batch commit: its event, its record (already marked `with_batch`) and the
+/// state its accepted event brings.
+pub(crate) struct BatchStep {
+    pub entry: Arc<RequestEntry>,
+    pub event: Event,
+    pub record: NewEvent,
+    pub on_apply: OnApply,
+}
+
+/// Why [`Engine::commit_batch`] decided nothing.
+#[derive(Debug)]
+pub(crate) enum BatchCommitError {
+    /// Step `.0` was rejected on its clone: nothing was appended.
+    Rejected(usize, Rejection),
+    /// The one append failed: nothing committed.
+    Audit(AuditError),
+}
+
 pub struct EngineDeps {
     pub port: Arc<dyn AuditPort>,
     pub committed: Arc<CommittedSet>,
@@ -364,6 +448,8 @@ pub struct EngineDeps {
     pub limits: Limits,
     /// The runtime the synchronous `DecisionApi` runs its async part on (PD-13).
     pub runtime: tokio::runtime::Handle,
+    /// "Possible duplicate" / "similar request" (§5.6); Task 28 passes the seeded one.
+    pub similarity: SimilarityIndex,
     #[cfg(feature = "testing")]
     pub hooks: crate::core::TestHooks,
 }
@@ -435,6 +521,13 @@ pub struct Engine {
     /// Built on first use per instance id (Task 25 rebuilds them on configuration changes).
     clients: Mutex<HashMap<String, Arc<InstanceHttp>>>,
     runtime: tokio::runtime::Handle,
+    similarity: SimilarityIndex,
+    /// L43: one batch dialog at a time; a second `decide_batch` waits here. One `Core` per
+    /// process, so this is the process-wide gate PD-13 names.
+    batch_dialog: tokio::sync::Mutex<()>,
+    /// §5.6 "Needs attention": post-approval failures and unknown outcomes until acknowledged
+    /// (UI state, not audited, reset on restart).
+    needs_attention: Mutex<BTreeSet<String>>,
     #[cfg(feature = "testing")]
     hooks: crate::core::TestHooks,
 }
@@ -463,6 +556,9 @@ impl Engine {
             terminal_rows: Arc::new(Mutex::new(Recent::new(RECENT_MEMO))),
             clients: Mutex::new(HashMap::new()),
             runtime: d.runtime,
+            similarity: d.similarity,
+            batch_dialog: tokio::sync::Mutex::new(()),
+            needs_attention: Mutex::new(BTreeSet::new()),
             #[cfg(feature = "testing")]
             hooks: d.hooks,
         }
@@ -491,9 +587,56 @@ impl Engine {
         &self.credentials
     }
 
-    #[allow(dead_code)] // batch and instance dialogs (Tasks 23/25)
     pub(crate) fn confirmer(&self) -> &Arc<dyn NativeConfirmer> {
         &self.confirmer
+    }
+
+    /// The "possible duplicate" / "similar request" index (§5.6).
+    pub fn similarity(&self) -> &SimilarityIndex {
+        &self.similarity
+    }
+
+    /// L43: held for a whole `decide_batch`, dialog included.
+    pub(crate) fn batch_dialog(&self) -> &tokio::sync::Mutex<()> {
+        &self.batch_dialog
+    }
+
+    /// §5.6: a post-approval failure or unknown outcome stays under "Needs attention" until
+    /// acknowledged; the UI is told the new count.
+    pub(crate) fn flag_attention(&self, request_id: &str) {
+        let count = {
+            let mut set = lock(&self.needs_attention);
+            if !set.insert(request_id.to_owned()) {
+                return;
+            }
+            set.len()
+        };
+        self.ui.emit(UiEvent::NeedsAttentionChanged {
+            count: u32::try_from(count).unwrap_or(u32::MAX),
+        });
+    }
+
+    /// `DecisionApi::acknowledge_attention` (in memory, not audited).
+    pub(crate) fn acknowledge_attention(&self, request_ids: &[String]) {
+        let count = {
+            let mut set = lock(&self.needs_attention);
+            let before = set.len();
+            for id in request_ids {
+                set.remove(id);
+            }
+            if set.len() == before {
+                return;
+            }
+            set.len()
+        };
+        self.ui.emit(UiEvent::NeedsAttentionChanged {
+            count: u32::try_from(count).unwrap_or(u32::MAX),
+        });
+    }
+
+    /// The unacknowledged "Needs attention" ids (sorted).
+    pub fn needs_attention(&self) -> Vec<String> {
+        lock(&self.needs_attention).iter().cloned().collect()
     }
 
     pub fn clock(&self) -> &Arc<dyn Clock> {
@@ -666,6 +809,18 @@ impl Engine {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(entry.head.request_id.clone(), entry.clone());
+        // §5.6: a validated request is known to the duplicate and similarity flags from now on.
+        if let Some(v) = &entry.validated
+            && is_pending(entry.state().model.phase())
+        {
+            self.similarity.on_submit(SimRecord {
+                request_id: entry.head.request_id.clone(),
+                op_id: entry.head.op_id.clone(),
+                instance_id: entry.instance_id.clone(),
+                params_sha256: Some(entry.params_sha256.clone()),
+                key: sim_key(entry.spec, &v.params),
+            });
+        }
         entry
     }
 
@@ -778,19 +933,16 @@ impl Engine {
         G: Fn(&Model) -> bool,
     {
         let _gate = entry.gate.clone().lock_owned().await;
-        let (clone, applied, rev, phase) = {
+        let prepared = {
             let st = entry.state();
             if !guard(&st.model) {
                 return Err(TransitionError::Rejected(Rejection::StaleRev {
                     current: st.model.rev(),
                 }));
             }
-            let mut m = st.model.clone();
-            let applied = step(&mut m, event).map_err(TransitionError::Rejected)?;
-            let (rev, phase) = (st.model.rev(), st.model.phase());
-            (m, applied, rev, phase)
+            Prepared::step(&st, event).map_err(TransitionError::Rejected)?
         };
-        let mut evs = records(&clone);
+        let mut evs = records(&prepared.clone);
         let appended = if evs.len() == 1 {
             match evs.pop() {
                 Some(ev) => self.blocking(move |p| p.append(ev).map(|_| ())).await,
@@ -810,30 +962,53 @@ impl Engine {
         if let Some(pause) = self.hooks.pause_in_transition.clone() {
             pause.hold().await;
         }
-        let applied = {
-            let mut st = entry.state();
-            let applied = if st.model.rev() == rev && st.model.phase() == phase {
-                st.model = clone;
-                // A rebuild that failed meanwhile (`Engine::candidate`) disabled Release on this
-                // revision; the clone predates it and must not switch approval back on (T20 I-1).
-                if st.rebuild_failed {
-                    st.model.set_approvable(false);
-                }
-                Ok(applied)
-            } else if !guard(&st.model) {
-                Err(TransitionError::Raced(Rejection::StaleRev {
-                    current: st.model.rev(),
-                }))
-            } else {
-                step(&mut st.model, event).map_err(TransitionError::Raced)
-            };
-            if applied.is_ok() {
-                on_apply(&mut st);
-            }
-            applied
-        };
+        let applied = prepared.apply(entry, event, on_apply, guard);
         self.after_change(entry);
         applied
+    }
+
+    /// The transition gates of `entries`, taken in the order given (L43: `decide_batch` sorts
+    /// them by request id, so two batches never wait on each other crosswise). While they are
+    /// held no record-bearing transition of these requests can run.
+    pub(crate) async fn lock_gates(entries: &[Arc<RequestEntry>]) -> Gates {
+        let mut held = Vec::with_capacity(entries.len());
+        for e in entries {
+            held.push(e.gate.clone().lock_owned().await);
+        }
+        Gates(held)
+    }
+
+    /// L43 / §5.6 seam: `lead` (`BATCH_CONFIRMED`) and every step's record in **one**
+    /// `append_batch`, `lead` first, then each step's model event applied (PD-19 replace or
+    /// re-step) with its `on_apply`. Every step's event is stepped on a clone before anything
+    /// is appended: a rejection there (the request changed since the caller's check, e.g. a
+    /// rebuild failure cleared approvability) appends nothing and names the step. An append
+    /// failure decides nothing and leaves every request as it was (the batch failed, not the
+    /// requests). The caller holds every step's gate (`gates`), taken before its last check.
+    pub(crate) async fn commit_batch(
+        &self,
+        _gates: &Gates,
+        lead: NewEvent,
+        steps: Vec<BatchStep>,
+    ) -> Result<Vec<Result<Applied, TransitionError>>, BatchCommitError> {
+        let mut prepared = Vec::with_capacity(steps.len());
+        let mut evs = Vec::with_capacity(steps.len() + 1);
+        evs.push(lead);
+        for (i, s) in steps.into_iter().enumerate() {
+            let p = Prepared::step(&s.entry.state(), s.event)
+                .map_err(|r| BatchCommitError::Rejected(i, r))?;
+            evs.push(s.record);
+            prepared.push((s.entry, s.event, p, s.on_apply));
+        }
+        self.blocking(move |p| p.append_batch(evs).map(|_| ()))
+            .await
+            .map_err(BatchCommitError::Audit)?;
+        let mut out = Vec::with_capacity(prepared.len());
+        for (entry, event, p, on_apply) in prepared {
+            out.push(p.apply(&entry, event, on_apply, |_| true));
+            self.after_change(&entry);
+        }
+        Ok(out)
     }
 
     /// An event without an audit record (`FetchStarted`, `CandidateChanged`), under the
@@ -898,14 +1073,19 @@ impl Engine {
     /// answered from the log from now on. Every path that makes a request terminal ends here.
     fn after_change(&self, entry: &Arc<RequestEntry>) {
         entry.publish();
-        let (terminal, logged) = {
+        let (terminal, logged, outcome) = {
             let st = entry.state();
             (
                 !is_pending(st.model.phase()),
                 st.unlogged_terminal.is_none(),
+                sim_outcome(&st),
             )
         };
         if terminal {
+            if let Some(o) = outcome {
+                self.similarity
+                    .on_status(&entry.head.request_id, o, self.clock.now_utc());
+            }
             self.committed.forget_request(&entry.head.request_id);
             entry.release_ticket();
             entry.set_fetch_control(None);
@@ -1036,6 +1216,28 @@ impl Engine {
             }
         }))
     }
+}
+
+/// What a terminal state means for "similar request" (§5.6: decided or executed).
+fn sim_outcome(st: &EntryState) -> Option<SimOutcome> {
+    let Phase::Done(t) = st.model.phase() else {
+        return None;
+    };
+    Some(match t {
+        Terminal::Released(_) | Terminal::ReleasedRedacted(_) => SimOutcome::Released,
+        Terminal::Denied => SimOutcome::Denied,
+        Terminal::Succeeded => SimOutcome::Executed,
+        Terminal::OutcomeUnknown => SimOutcome::OutcomeUnknown,
+        // A write that failed after its approval was decided; any other failure was not.
+        Terminal::Failed if st.write.as_ref().is_some_and(|w| w.approved_hash.is_some()) => {
+            SimOutcome::Failed
+        }
+        Terminal::Failed
+        | Terminal::Rejected
+        | Terminal::Expired
+        | Terminal::Cancelled(_)
+        | Terminal::Abandoned => SimOutcome::Gone,
+    })
 }
 
 /// Decrypts one payload as JSON; `None` if it cannot be read or parsed.

@@ -39,6 +39,8 @@ pub mod payloads;
 pub mod proxy;
 /// Redaction engine: drops with copies and mirrors, masks in the canonical match form (§5.3).
 pub mod redact;
+/// The "possible duplicate" and "similar request" flags and their RF-4 seeding (§5.6, L45).
+pub mod similarity;
 /// Static params validation: schema, field rules, caps, move limit, `min_version` (§2.3, §5.2).
 pub mod validate;
 

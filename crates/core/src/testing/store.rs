@@ -12,8 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::testing::{FakeClock, Faults, FreeSpaceStub, MemKeyStore, MemKeyring};
 use atlas_duck_audit::{
-    AuditError, Committed, Confirmed, EventHeader, EventType, FirstRunInput, Hooks, NewEvent,
-    OpenConfig, QueryKind, ReconcileReport, SettingChange, Settings, Store, UtcInstant,
+    AuditError, Committed, Confirmed, EventFlags, EventHeader, EventType, FirstRunInput, Hooks,
+    NewEvent, OpenConfig, QueryKind, ReconcileReport, SettingChange, Settings, Store, UtcInstant,
     create_new_store, new_ids,
 };
 use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
@@ -148,6 +148,31 @@ pub struct FaultPlan {
     /// Event types whose committed payloads read back tampered (`tamper_released_text`).
     tamper: Mutex<BTreeSet<EventType>>,
     tampered_seqs: Mutex<BTreeSet<u64>>,
+    /// Committed rows whose payload this port cannot decrypt (`fail_read_payload`).
+    unreadable: Mutex<BTreeSet<u64>>,
+    /// While on, every committed `append`/`append_batch` call is kept (`appends`).
+    recording: AtomicBool,
+    calls: Mutex<Vec<Vec<RecordedEvent>>>,
+}
+
+/// One event of a committed `append`/`append_batch` call, as the port was handed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecordedEvent {
+    pub event_type: EventType,
+    pub request_id: Option<String>,
+    pub flags: EventFlags,
+    pub payload: serde_json::Value,
+}
+
+impl RecordedEvent {
+    fn of(ev: &NewEvent) -> RecordedEvent {
+        RecordedEvent {
+            event_type: ev.event_type,
+            request_id: ev.request_id.clone(),
+            flags: ev.flags,
+            payload: ev.payload.clone(),
+        }
+    }
 }
 
 impl FaultPlan {
@@ -168,6 +193,27 @@ impl FaultPlan {
     /// Append attempts of `t` seen so far.
     pub fn attempts(&self, t: EventType) -> u32 {
         lock(&self.seen).get(&t).copied().unwrap_or(0)
+    }
+
+    /// From now on, every committed `append` / `append_batch` call is kept with its events in
+    /// order (L43: "one audit transaction"). Off by default: payloads are cloned.
+    pub fn record_appends(&self, on: bool) {
+        self.recording.store(on, Ordering::SeqCst);
+    }
+
+    /// The committed calls recorded so far, oldest first; one `Vec` per call.
+    pub fn appends(&self) -> Vec<Vec<RecordedEvent>> {
+        lock(&self.calls).clone()
+    }
+
+    fn note_call(&self, evs: Vec<RecordedEvent>) {
+        lock(&self.calls).push(evs);
+    }
+
+    /// The payload of row `seq` can no longer be decrypted through this port
+    /// (`AuditError::Invalid`), as a corrupted row would fail (RF-4 seeding skips it).
+    pub fn fail_read_payload(&self, seq: u64) {
+        lock(&self.unreadable).insert(seq);
     }
 
     /// Records of `t` committed from now on read back with one letter of their
@@ -262,17 +308,33 @@ impl AuditPort for FaultyAudit {
     fn append(&self, ev: NewEvent) -> Result<Committed, AuditError> {
         self.plan.check([&ev])?;
         let t = ev.event_type;
+        let recorded = self
+            .plan
+            .recording
+            .load(Ordering::SeqCst)
+            .then(|| vec![RecordedEvent::of(&ev)]);
         let c = self.inner.append(ev)?;
         self.plan.note_committed(t, c.seq);
+        if let Some(r) = recorded {
+            self.plan.note_call(r);
+        }
         Ok(c)
     }
 
     fn append_batch(&self, evs: Vec<NewEvent>) -> Result<Vec<Committed>, AuditError> {
         self.plan.check(&evs)?;
         let types: Vec<EventType> = evs.iter().map(|e| e.event_type).collect();
+        let recorded = self
+            .plan
+            .recording
+            .load(Ordering::SeqCst)
+            .then(|| evs.iter().map(RecordedEvent::of).collect::<Vec<_>>());
         let cs = self.inner.append_batch(evs)?;
         for (t, c) in types.iter().zip(&cs) {
             self.plan.note_committed(*t, c.seq);
+        }
+        if let Some(r) = recorded {
+            self.plan.note_call(r);
         }
         Ok(cs)
     }
@@ -286,6 +348,11 @@ impl AuditPort for FaultyAudit {
     }
 
     fn read_payload(&self, seq: u64) -> Result<Zeroizing<Vec<u8>>, AuditError> {
+        if lock(&self.plan.unreadable).contains(&seq) {
+            return Err(AuditError::Invalid(
+                "payload cannot be decrypted (test hook)",
+            ));
+        }
         self.inner
             .read_payload(seq)
             .map(|b| self.plan.tampered(seq, b))

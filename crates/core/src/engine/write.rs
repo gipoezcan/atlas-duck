@@ -727,6 +727,10 @@ async fn finish(
     queue_changed(engine, entry);
     if let (Ok(_), Some(kind)) = (&applied, kind) {
         attention(engine, kind);
+        // §5.6: listed under "Needs attention" until acknowledged.
+        if matches!(kind, AttentionKind::Failed | AttentionKind::OutcomeUnknown) {
+            engine.flag_attention(&entry.head.request_id);
+        }
     }
     applied
 }

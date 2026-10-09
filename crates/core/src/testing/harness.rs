@@ -485,6 +485,11 @@ impl Harness {
         self.store.store()
     }
 
+    /// The core's audit port (the `FaultyAudit` over the store; the plan applies).
+    pub fn port(&self) -> Arc<dyn AuditPort> {
+        self.port.clone()
+    }
+
     pub fn instance(&self, alias: &str) -> Option<&HarnessInstance> {
         self.instances.iter().find(|i| i.alias == alias)
     }

@@ -3,7 +3,8 @@
 //!
 //! Task 19 declared the contract and the queue; Task 21 decides reads (preview, raw pages,
 //! release, release with redactions, deny); Task 22 writes (preview, approve, edit, deny with
-//! hints); batches are Task 23. Every return type is `Serialize` (PD-12: the capture hook
+//! hints); Task 23 batches (`batch`) and the "possible duplicate" / "similar request" flags of
+//! queue rows and previews (§5.6). Every return type is `Serialize` (PD-12: the capture hook
 //! records them).
 //!
 //! The trait is synchronous (PD-13): each call runs its async part on the core's runtime
@@ -17,12 +18,15 @@
 //! revision must be opened (`preview_fetch`) and then released with the same ops (or `None`).
 //! Ops that block (§5.3 checks, an outcome item) are `DECISION_INVALID {not_approvable}`.
 
+mod batch;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::invisible::strip;
+use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     CandidateRev, PREVIEW_BUILDER_VERSION, Preview, RAW_PAGE_BYTES, RawPager,
 };
@@ -42,6 +46,7 @@ use crate::lifecycle::model::{Event, Hold, Kind, Phase, Rejection, ReleaseItem, 
 use crate::ops::{ExecError, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
 use crate::redact::RedactionOp;
+use crate::similarity::SimHit;
 use crate::validate::{EffectiveCaps, ValidateCtx, ValidationError, echo};
 
 /// Maps to the audit `decision` values (C.7).
@@ -213,11 +218,13 @@ pub struct QueueItem {
     pub age_s: u64,
     /// The item returned to the queue after a stale check (§5.4 step 5; Task 22).
     pub stale: bool,
-    /// Caution-level warnings of the current revision (Tasks 21/22).
+    /// Caution-level warnings of the current revision (Tasks 21/22), the two flags below
+    /// included.
     pub caution_count: u32,
-    /// Task 23.
+    /// Another pending request with the same `params_sha256` (§5.6, regardless of session).
     pub possible_duplicate_of: Option<String>,
-    /// Task 23.
+    /// Another request of the same op and instance that matches under the op's `similarity`
+    /// rule and is pending or was decided in the last 24 h (§5.6).
     pub similar_to: Option<String>,
     pub session: SessionKey,
     pub opened: bool,
@@ -267,13 +274,61 @@ fn decidable(p: Phase) -> bool {
     matches!(p, Phase::AwaitingRelease(_) | Phase::AwaitingApproval(_))
 }
 
+/// §5.6 "possible duplicate" and "similar request" of a request, as of now: they change as the
+/// queue moves (another item arrives or is decided), so they are computed on every read and
+/// never stored with a revision. Both are Caution; neither disables Approve, both keep the item
+/// out of a batch approval.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Flags {
+    duplicate_of: Option<String>,
+    similar: Option<SimHit>,
+}
+
+impl Flags {
+    fn of(engine: &Engine, e: &RequestEntry) -> Flags {
+        let index = engine.similarity();
+        let duplicate_of = index
+            .duplicates(&e.params_sha256, &e.head.request_id)
+            .into_iter()
+            .next();
+        let similar = index
+            .record(&e.head.request_id)
+            .and_then(|r| index.similar_to(&r));
+        Flags {
+            duplicate_of,
+            similar,
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.duplicate_of.is_some() || self.similar.is_some()
+    }
+
+    /// The §6.2 Caution warnings.
+    fn warnings(&self) -> Vec<Warning> {
+        let mut w = Vec::new();
+        if let Some(other) = &self.duplicate_of {
+            w.push(Warning::new(
+                WarningId::PossibleDuplicate,
+                warning::possible_duplicate(other),
+            ));
+        }
+        if let Some(hit) = &self.similar {
+            w.push(Warning::new(WarningId::SimilarRequest, hit.text()));
+        }
+        w
+    }
+}
+
 /// The queue row of an entry that waits for a decision.
-fn in_queue(e: &RequestEntry) -> Option<QueueItem> {
+fn in_queue(engine: &Engine, e: &RequestEntry) -> Option<QueueItem> {
+    let flags = Flags::of(engine, e);
     let st = e.state();
     let m = &st.model;
     if !decidable(m.phase()) {
         return None;
     }
+    let flagged = u32::try_from(flags.warnings().len()).unwrap_or(u32::MAX);
     Some(QueueItem {
         request_id: e.head.request_id.clone(),
         op_id: e.head.op_id.clone(),
@@ -286,9 +341,9 @@ fn in_queue(e: &RequestEntry) -> Option<QueueItem> {
         unusual: e.unusual,
         age_s: e.age().as_secs(),
         stale: st.stale,
-        caution_count: st.caution_count,
-        possible_duplicate_of: None,
-        similar_to: None,
+        caution_count: st.caution_count.saturating_add(flagged),
+        possible_duplicate_of: flags.duplicate_of.clone(),
+        similar_to: flags.similar.as_ref().map(|h| h.request_id.clone()),
         session: e.session.clone(),
         opened: m.opened(),
         approvable: st.approvable(),
@@ -482,12 +537,14 @@ async fn read_preview(
     };
     let (_, cx) = read_context(entry);
     let model = preview_model(&cx, &read, &c);
+    let mut warnings = model.warnings;
+    warnings.extend(Flags::of(engine, entry).warnings());
     let preview = Preview {
         candidate_rev: shown,
         approvable,
         raw: RawPager::for_total(u64::try_from(c.bytes().len()).unwrap_or(u64::MAX)),
         header: model.header,
-        warnings: model.warnings,
+        warnings,
         body: model.body,
         also_appears_in: read.also_appears_in.clone(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
@@ -517,12 +574,14 @@ async fn write_preview(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, submitte
     let executes_as = identity.as_ref().map(|i| i.atlassian_user.as_str());
     let model = write::preview_model(entry.spec, &entry.head.instance, &w, hold, executes_as);
     let raw = write::raw_bytes(&w.requests);
+    let mut warnings = model.warnings;
+    warnings.extend(Flags::of(engine, entry).warnings());
     let preview = Preview {
         candidate_rev: shown,
         approvable,
         raw: RawPager::for_total(u64::try_from(raw.len()).unwrap_or(u64::MAX)),
         header: model.header,
-        warnings: model.warnings,
+        warnings,
         body: model.body,
         also_appears_in: Vec::new(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
@@ -719,6 +778,19 @@ async fn release(
         };
         return Err(rejected(engine, entry, (r, at), rev.counter, dec).await);
     }
+    let record = release_record(entry, &c)?;
+    match engine.transition(entry, event, move |_| record).await {
+        Ok(_) => {
+            queue_changed(engine, entry);
+            Ok(outcome(entry))
+        }
+        Err(e) => Err(transition_failed(engine, entry, e, rev.counter, dec).await),
+    }
+}
+
+/// `READ_RELEASED` of the current revision's exact candidate `c` with its redaction ops: the
+/// outcome answer `{code, hint}`, or the bytes with the `item` marker and `meta` (§5.2 step 8).
+fn release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, DecisionError> {
     let (read, ops) = {
         let st = entry.state();
         (st.read.clone(), st.redaction_ops.clone())
@@ -727,7 +799,7 @@ async fn release(
         return Err(DecisionError::NotDecidable);
     };
     let ctx = &entry.ctx;
-    let record = match read.item {
+    match read.item {
         ReleaseItem::Outcome => {
             let code = c
                 .value()
@@ -735,7 +807,7 @@ async fn release(
                 .cloned()
                 .and_then(|v| serde_json::from_value::<ErrorCode>(v).ok())
                 .ok_or(DecisionError::NotDecidable)?;
-            payloads::read_released_outcome(ctx, code, OUTCOME_HINT)
+            Ok(payloads::read_released_outcome(ctx, code, OUTCOME_HINT))
         }
         item => {
             let marker = if item == ReleaseItem::UpstreamError {
@@ -745,15 +817,8 @@ async fn release(
             };
             let meta = release_meta(entry.spec, &read, c.value());
             payloads::read_released_item(ctx, c.bytes(), &ops, marker, &meta)
-                .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))?
+                .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))
         }
-    };
-    match engine.transition(entry, event, move |_| record).await {
-        Ok(_) => {
-            queue_changed(engine, entry);
-            Ok(outcome(entry))
-        }
-        Err(e) => Err(transition_failed(engine, entry, e, rev.counter, dec).await),
     }
 }
 
@@ -1210,7 +1275,7 @@ impl DecisionApi for CoreDecisions {
             .engine
             .pending_entries()
             .iter()
-            .filter_map(|e| in_queue(e))
+            .filter_map(|e| in_queue(&self.engine, e))
             .collect();
         items.sort_by(|a, b| {
             b.age_s
@@ -1221,7 +1286,9 @@ impl DecisionApi for CoreDecisions {
     }
 
     fn queue_get(&self, request_id: &str) -> Option<QueueItem> {
-        self.engine.entry(request_id).and_then(|e| in_queue(&e))
+        self.engine
+            .entry(request_id)
+            .and_then(|e| in_queue(&self.engine, &e))
     }
 
     fn preview_fetch(
@@ -1255,21 +1322,25 @@ impl DecisionApi for CoreDecisions {
     }
 
     fn decide_batch(&self, items: Vec<BatchItem>) -> Result<BatchOutcome, DecisionError> {
-        Err(DecisionError::BatchRejected {
-            failed: items
-                .iter()
-                .map(|i| (i.request_id.clone(), BatchFailure::NotPending))
-                .collect(),
-        })
+        let engine = self.engine.clone();
+        self.engine
+            .run_sync(batch::decide_batch(engine, items))
+            .unwrap_or_else(|| Err(task_failed()))
     }
 
-    fn deny_batch(&self, _request_ids: &[String], _reason: &str) -> Result<usize, DecisionError> {
-        Ok(0)
+    fn deny_batch(&self, request_ids: &[String], reason: &str) -> Result<usize, DecisionError> {
+        let (engine, ids) = (self.engine.clone(), request_ids.to_vec());
+        self.engine
+            .run_sync(batch::deny_batch(engine, ids, reason.to_owned()))
+            .unwrap_or_else(|| Err(task_failed()))
     }
 
-    fn deny_session(&self, _session: SessionKey, _reason: &str) -> Result<usize, DecisionError> {
-        Ok(0)
+    fn deny_session(&self, session: SessionKey, reason: &str) -> Result<usize, DecisionError> {
+        let ids = batch::session_items(&self.engine, &session);
+        self.deny_batch(&ids, reason)
     }
 
-    fn acknowledge_attention(&self, _request_ids: &[String]) {}
+    fn acknowledge_attention(&self, request_ids: &[String]) {
+        self.engine.acknowledge_attention(request_ids);
+    }
 }

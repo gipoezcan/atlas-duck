@@ -454,6 +454,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hex",
  "html-escape",
+ "icu_casemap",
  "icu_normalizer",
  "idna",
  "jsonschema",

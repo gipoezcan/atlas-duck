@@ -25,6 +25,7 @@ use crate::engine::{Engine, EngineDeps};
 use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
 use crate::instances::{CoreInstances, InstanceAdmin, InstanceTable};
+use crate::similarity::SimilarityIndex;
 
 /// §2.2: the native confirmation dialog (`app`: Tauri; tests: `testing::StubConfirmer`).
 pub trait NativeConfirmer: Send + Sync {
@@ -196,6 +197,9 @@ impl Core {
         let committed = Arc::new(CommittedSet::default());
         // The composition root's one cover issuer: covers only for ids the port committed.
         let covers = CoverIssuer::new(Arc::new(StoreProbe(committed.clone())));
+        // Task 28 seeds it at startup step 5 (`SimilarityIndex::seed`, RF-4); until then the
+        // index starts empty and is kept current from submits and terminal states.
+        let similarity = SimilarityIndex::new(deps.clock.clone());
         let engine = Arc::new(Engine::new(EngineDeps {
             port,
             committed,
@@ -208,6 +212,7 @@ impl Core {
             instances: InstanceTable::from_config(&config),
             limits,
             runtime: tokio::runtime::Handle::current(),
+            similarity,
             #[cfg(feature = "testing")]
             hooks: opts.hooks,
         }));

@@ -17,6 +17,8 @@ toml_edit = { workspace = true }
 jsonschema = { workspace = true }
 html-escape = { workspace = true }
 icu_normalizer = { workspace = true }
+# §5.6 similarity: the normalized summary/title (Unicode full case folding).
+icu_casemap = { workspace = true }
 idna = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }
