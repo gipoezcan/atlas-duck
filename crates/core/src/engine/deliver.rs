@@ -10,16 +10,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use atlas_duck_audit::{EventHeader, EventType, UtcInstant, is_terminal};
+use atlas_duck_audit::{EventHeader, EventType, UtcInstant};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use atlas_duck_ipc::proto::{ConnectionMeta, Hello};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::envelope::{self, OpenStatus, RecordStatus};
-use super::{
-    Engine, audit_failure_retryable, kind_of, payload_json, records_status, terminal_flags,
-};
+use super::{Engine, audit_failure_retryable, kind_of, status_at, terminal_of, terminal_payload};
 use crate::audit_port::AuditPort;
 use crate::lifecycle::model::Kind;
 use crate::payloads::{self, EventCtx, body_from_json, sha256_hex};
@@ -95,21 +93,19 @@ fn deliver_from_records(
     let Some(start) = headers.first() else {
         return envelope::unknown_request();
     };
-    let rs = match records_status(p, &headers) {
-        Ok(Some((rs, instance_id))) => RecordStatus {
-            instance: instance_id.and_then(|i| aliases.get(&i).cloned()),
-            ..rs
-        },
-        Ok(None) => return envelope::unknown_request(),
-        Err(_) => return envelope::audit_unreadable(),
+    // One scan for the terminal record and one decrypt of its payload (the hot path of `await`).
+    let terminal = terminal_of(p, &headers);
+    let payload = terminal_payload(p, terminal);
+    let rs = RecordStatus {
+        instance: start
+            .instance_id
+            .as_ref()
+            .and_then(|i| aliases.get(i).cloned()),
+        ..status_at(start, terminal, payload.as_ref())
     };
     if OpenStatus::of(rs.status).is_some() {
         return envelope::await_envelope(&rs);
     }
-    let terminal = headers.iter().find(|h| {
-        let flags = terminal_flags(p, h);
-        is_terminal(h, flags.as_ref())
-    });
     let kind = start
         .op_id
         .as_deref()
@@ -117,7 +113,7 @@ fn deliver_from_records(
         .map_or(Kind::Read, kind_of);
     let handoff = match terminal {
         Some(t) if t.event_type == EventType::READ_RELEASED => {
-            released(p, &headers, t, &rs, now, kind)
+            released(&headers, t, payload, &rs, now, kind)
         }
         _ => with_error_hash(envelope::await_envelope(&rs)),
     };
@@ -149,9 +145,9 @@ fn deliver_from_records(
 /// A `READ_RELEASED` hand-off: the outcome-only answer, or the released bytes (checked against
 /// their committed hash) as data or as upstream-error details.
 fn released(
-    p: &dyn AuditPort,
     headers: &[EventHeader],
     t: &EventHeader,
+    payload: Option<Value>,
     rs: &RecordStatus,
     now: UtcInstant,
     kind: Kind,
@@ -160,7 +156,7 @@ fn released(
     if decided.is_none_or(|d| now.0.saturating_sub(d.0) > DELIVERY_WINDOW_MS) {
         return with_error_hash(envelope::result_evicted(rs, audit_failure_retryable(kind)));
     }
-    let Some(payload) = payload_json(p, t.seq) else {
+    let Some(payload) = payload else {
         return with_error_hash(envelope::delivery_internal(rs));
     };
     // An outcome item: `{code, hint}`, nothing else (§5.2 step 6).

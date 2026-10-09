@@ -55,6 +55,11 @@ const REASON_EXCERPT_CHARS: usize = 60;
 pub const MAX_AWAIT_MS: u64 = 7 * 24 * 3600 * 1000;
 /// `requests list` looks back this far (§4.4).
 const RECENT_WINDOW: Duration = Duration::from_secs(24 * 3600);
+/// A `READ_RELEASED` whose plaintext payload is larger than this is a data release: an
+/// upstream-error release (`{status, error_messages ≤ 2 KiB}` plus its ops and `meta`) or an
+/// outcome answer (`{code, hint}`) is far smaller. Larger rows read `released` in `requests
+/// list` without being decrypted; smaller ones are decrypted once to tell `failed` items apart.
+const RELEASED_STATUS_DECRYPT_MAX: u64 = 256 * 1024;
 
 pub struct CoreHandler {
     engine: Arc<Engine>,
@@ -457,8 +462,8 @@ impl CoreHandler {
     /// Requests decided within 24 h that memory no longer holds: one `recent_headers` scan (a
     /// full scan of `events`, M2 handoff), then per row only the start record is decrypted (its
     /// payload has `params_sha256` and the params `target_display` comes from). Cheap header
-    /// filters run first. Row status comes from the terminal record's type (a released outcome
-    /// item reads `released` here; `status` decrypts it, Task 21).
+    /// filters run first. Row status comes from the terminal record's type; a released upstream
+    /// error or outcome item is told apart by its small payload (`RELEASED_STATUS_DECRYPT_MAX`).
     async fn recent_rows(
         &self,
         skip: HashSet<String>,
@@ -568,8 +573,10 @@ impl CoreHandler {
                         _ => op_id.clone(),
                     };
                     // A released item's status depends on its payload (an upstream error or an
-                    // outcome is `failed`); the row is memoized, so it is decrypted once.
-                    let released = (terminal.event_type == EventType::READ_RELEASED)
+                    // outcome is `failed`); only small payloads can be one, and the row is
+                    // memoized, so each is decrypted once.
+                    let released = (terminal.event_type == EventType::READ_RELEASED
+                        && terminal.payload_len <= RELEASED_STATUS_DECRYPT_MAX)
                         .then(|| payload_json(p, terminal.seq))
                         .flatten();
                     let (status, _) = envelope::record_status(

@@ -247,7 +247,7 @@ pub trait DecisionApi: Send + Sync {
     fn acknowledge_attention(&self, request_ids: &[String]);
 }
 
-/// The core's `DecisionApi` (queue only until Task 21).
+/// The core's `DecisionApi` (reads from Task 21; writes Task 22, batches Task 23).
 pub struct CoreDecisions {
     engine: Arc<Engine>,
 }
@@ -303,27 +303,51 @@ fn task_failed() -> DecisionError {
     DecisionError::Audit(AuditError::AppendFailed("the decision task failed".into()))
 }
 
-/// Steps a clone with `event` (nothing changes). A submitted revision is current only if its
-/// counter **and** its hash are (inv. 5); approvability follows `EntryState::approvable`.
+/// What a decision is checked against, read under one lock.
+#[derive(Debug, Clone, Copy)]
+struct Snapshot {
+    current: CandidateRev,
+    phase: Phase,
+    /// The current revision carries redaction ops.
+    redacted: bool,
+}
+
+fn snapshot(st: &EntryState) -> Snapshot {
+    Snapshot {
+        current: current_rev(st),
+        phase: st.model.phase(),
+        redacted: !st.redaction_ops.is_empty(),
+    }
+}
+
+/// Steps a clone with the event `event` builds from the snapshot (nothing changes), under the
+/// lock the snapshot is taken in, so a rejection names the revision it was checked against. A
+/// submitted revision is current only if its counter **and** its hash are (inv. 5);
+/// approvability follows `EntryState::approvable`.
 fn dry_step(
     entry: &RequestEntry,
-    event: Event,
+    event: impl FnOnce(&Snapshot) -> Event,
     submitted: Option<&CandidateRev>,
-) -> Result<(), Rejection> {
+) -> Result<Snapshot, (Rejection, Snapshot)> {
     let st = entry.state();
+    let snap = snapshot(&st);
     if let Some(r) = submitted
         && r.counter == st.model.rev()
         && r.candidate_hash != st.candidate_hash
     {
-        return Err(Rejection::StaleRev {
+        let r = Rejection::StaleRev {
             current: st.model.rev(),
-        });
+        };
+        return Err((r, snap));
     }
     let mut m = st.model.clone();
     if st.rebuild_failed {
         m.set_approvable(false);
     }
-    step(&mut m, event).map(|_| ())
+    match step(&mut m, event(&snap)) {
+        Ok(_) => Ok(snap),
+        Err(r) => Err((r, snap)),
+    }
 }
 
 /// A rejected decision (PD-19): `StaleRev` → `DECISION_STALE`; `NotOpened` / `NotApprovable` /
@@ -331,18 +355,15 @@ fn dry_step(
 /// where no decision applies (`Validated`, `Fetching`, `Enriching`, `StaleCheck`, `Executing`)
 /// → `DECISION_STALE` (the M-3 exception); any other `Illegal` (a decision kind the item does
 /// not take, a terminal request) and every preview refusal but a stale one → nothing logged.
-/// Nothing else changes.
+/// Nothing else changes. The snapshot is the state the rejection was decided on.
 async fn rejected(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
-    r: Rejection,
+    (r, at): (Rejection, Snapshot),
     submitted: u64,
     decision: SubmittedDecision,
 ) -> DecisionError {
-    let (current, phase) = {
-        let st = entry.state();
-        (current_rev(&st), st.model.phase())
-    };
+    let (current, phase) = (at.current, at.phase);
     let ctx = &entry.ctx;
     let stale = || payloads::decision_stale(ctx, submitted, current.counter, decision, false);
     let invalid = |reason| payloads::decision_invalid(ctx, reason, submitted, decision, false);
@@ -384,7 +405,10 @@ async fn transition_failed(
     decision: SubmittedDecision,
 ) -> DecisionError {
     match e {
-        TransitionError::Rejected(r) => rejected(engine, entry, r, submitted, decision).await,
+        TransitionError::Rejected(r) => {
+            let at = snapshot(&entry.state());
+            rejected(engine, entry, (r, at), submitted, decision).await
+        }
         // The record committed for a revision that is no longer current (PD-19 re-step).
         TransitionError::Raced(_) => DecisionError::Stale {
             current: current_rev(&entry.state()),
@@ -437,8 +461,8 @@ async fn preview_fetch(
     }
     let submitted = rev.map_or_else(|| entry.state().model.rev(), |r| r.counter);
     let event = Event::PreviewShown { rev: submitted };
-    if let Err(r) = dry_step(&entry, event, rev.as_ref()) {
-        return Err(rejected(&engine, &entry, r, submitted, SubmittedDecision::Preview).await);
+    if let Err(rej) = dry_step(&entry, |_| event, rev.as_ref()) {
+        return Err(rejected(&engine, &entry, rej, submitted, SubmittedDecision::Preview).await);
     }
     let c = match candidate(&engine, &entry).await {
         Ok(c) => c,
@@ -457,10 +481,12 @@ async fn preview_fetch(
         }
     };
     let Some((read, shown, approvable, opened)) = built else {
+        let at = snapshot(&entry.state());
         let r = Rejection::StaleRev {
-            current: entry.state().model.rev(),
+            current: at.current.counter,
         };
-        return Err(rejected(&engine, &entry, r, submitted, SubmittedDecision::Preview).await);
+        let dec = SubmittedDecision::Preview;
+        return Err(rejected(&engine, &entry, (r, at), submitted, dec).await);
     };
     let (_, cx) = read_context(&entry);
     let model = preview_model(&cx, &read, &c);
@@ -601,27 +627,29 @@ async fn release(
     entry: &Arc<RequestEntry>,
     rev: CandidateRev,
 ) -> Result<DecisionOutcome, DecisionError> {
-    let redacted = !entry.state().redaction_ops.is_empty();
-    let event = Event::Release {
-        rev: rev.counter,
-        redacted,
-    };
     let dec = SubmittedDecision::Release;
-    if let Err(r) = dry_step(entry, event, Some(&rev)) {
-        return Err(rejected(engine, entry, r, rev.counter, dec).await);
-    }
+    let release = |snap: &Snapshot| Event::Release {
+        rev: rev.counter,
+        redacted: snap.redacted,
+    };
+    let event = match dry_step(entry, release, Some(&rev)) {
+        Ok(snap) => release(&snap),
+        Err(rej) => return Err(rejected(engine, entry, rej, rev.counter, dec).await),
+    };
     let c = match candidate(engine, entry).await {
         Ok(c) => c,
         Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => {
-            return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+            let rej = (Rejection::NotApprovable, snapshot(&entry.state()));
+            return Err(rejected(engine, entry, rej, rev.counter, dec).await);
         }
     };
     if c.hash() != &rev.candidate_hash {
+        let at = snapshot(&entry.state());
         let r = Rejection::StaleRev {
-            current: entry.state().model.rev(),
+            current: at.current.counter,
         };
-        return Err(rejected(engine, entry, r, rev.counter, dec).await);
+        return Err(rejected(engine, entry, (r, at), rev.counter, dec).await);
     }
     let (read, ops) = {
         let st = entry.state();
@@ -670,8 +698,8 @@ async fn deny(
     let rev = d.candidate_rev;
     let event = Event::Deny { rev: rev.counter };
     let dec = SubmittedDecision::Deny;
-    if let Err(r) = dry_step(entry, event, Some(&rev)) {
-        return Err(rejected(engine, entry, r, rev.counter, dec).await);
+    if let Err(rej) = dry_step(entry, |_| event, Some(&rev)) {
+        return Err(rejected(engine, entry, rej, rev.counter, dec).await);
     }
     let record = payloads::read_denied(&entry.ctx, d.reason.as_deref());
     match engine.transition(entry, event, move |_| record).await {
@@ -704,16 +732,24 @@ async fn redact(
     ops: Vec<RedactionOp>,
 ) -> Result<DecisionOutcome, DecisionError> {
     let dec = SubmittedDecision::Release;
-    if let Err(r) = dry_step(entry, Event::CandidateChanged, Some(&rev)) {
-        return Err(rejected(engine, entry, r, rev.counter, dec).await);
-    }
+    let at = match dry_step(entry, |_| Event::CandidateChanged, Some(&rev)) {
+        Ok(snap) => snap,
+        Err(rej) => return Err(rejected(engine, entry, rej, rev.counter, dec).await),
+    };
     let read = entry.state().read.clone();
     let Some(read) = read else {
         return Err(DecisionError::NotDecidable);
     };
     // An outcome item has no content to redact (§5.2 step 6: Release outcome or Deny).
     if read.item == ReleaseItem::Outcome {
-        return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+        return Err(rejected(
+            engine,
+            entry,
+            (Rejection::NotApprovable, at),
+            rev.counter,
+            dec,
+        )
+        .await);
     }
     let (spec, id) = (entry.spec, entry.head.request_id.clone());
     let base = engine
@@ -724,7 +760,14 @@ async fn redact(
         Ok(b) => b,
         Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => {
-            return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+            return Err(rejected(
+                engine,
+                entry,
+                (Rejection::NotApprovable, at),
+                rev.counter,
+                dec,
+            )
+            .await);
         }
     };
     // T14 handoff: on the bare body, with the op's `items_key`; heavy for big candidates.
@@ -759,7 +802,14 @@ async fn redact(
         Ok(Ok(Redacted::Applied { c, meta, also, ops })) => (c, meta, also, ops),
         // §5.3 checks failed (mirror, every-occurrence mask, encodings, missing targets).
         Ok(Ok(Redacted::Blocked)) => {
-            return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+            return Err(rejected(
+                engine,
+                entry,
+                (Rejection::NotApprovable, at),
+                rev.counter,
+                dec,
+            )
+            .await);
         }
         _ => return Err(DecisionError::Audit(AuditError::Invalid("redaction"))),
     };
@@ -793,7 +843,10 @@ async fn redact(
             queue_changed(engine, entry);
             Ok(outcome(entry))
         }
-        Err(r) => Err(rejected(engine, entry, r, rev.counter, dec).await),
+        Err(r) => {
+            let at = snapshot(&entry.state());
+            Err(rejected(engine, entry, (r, at), rev.counter, dec).await)
+        }
     }
 }
 

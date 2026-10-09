@@ -408,6 +408,12 @@ async fn assert_presend(h: &Harness, alias: &str, hint: Option<&str>) -> TestRes
     if let Some(hint) = hint {
         assert_eq!(message(&env), hint, "{alias}");
     }
+    // A fixed text: no host, port or URL of the instance (§4.5).
+    let msg = message(&env);
+    assert!(!msg.is_empty(), "{alias}");
+    for leak in ["127.0.0.1", "nonexistent", "http", "://"] {
+        assert!(!msg.contains(leak), "{alias}: {msg}");
+    }
     assert_eq!(env.data, None);
     assert_eq!(
         types(h, &id).await?,
@@ -674,7 +680,8 @@ async fn search_results_without_content_dropped() -> TestResult {
     // The approver sees the effective CQL (§6.3).
     let preview = h.approver().open(&id).map_err(de)?.preview;
     let q = preview.header.query.clone().ok_or("no query")?;
-    assert!(q.contains("space = DOC") && q.contains("type in"), "{q}");
+    assert!(q.contains("space = DOC"), "{q}");
+    assert!(q.contains("page,blogpost"), "{q}");
     h.approver().release_unopened(&id).map_err(de)?;
     let env = h.await_(&id, 5000).await;
     assert_eq!(env.status, Status::Released, "{}", env.to_json_line());

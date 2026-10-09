@@ -286,7 +286,7 @@ pub fn audit_unreadable() -> Envelope {
     internal(MSG_AUDIT_UNREADABLE)
 }
 
-/// A terminal error with the message and details `await` delivers (Task 21 adds data).
+/// A terminal error with the message and details `await` delivers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordError {
     pub code: ErrorCode,
@@ -335,8 +335,8 @@ pub fn status_envelope(rs: &RecordStatus) -> Envelope {
     record_envelope(rs, |e| error(e.code, e.retryable, MSG_USE_AWAIT, None))
 }
 
-/// `await` of a request answered from the records (Task 21 adds data delivery and
-/// `DELIVERED`).
+/// `await` of a request answered from the records, without data: the full error (message,
+/// details). Data deliveries are `Engine::deliver`'s, which also logs `DELIVERED`.
 pub fn await_envelope(rs: &RecordStatus) -> Envelope {
     record_envelope(rs, |e| {
         let message = e

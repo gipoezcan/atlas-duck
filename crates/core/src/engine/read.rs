@@ -53,11 +53,13 @@ use crate::redact::RedactionMeta;
 pub const OUTCOME_HINT: &str = "narrow fields, max or expand";
 /// §11.2 (verbatim): a connection failure on an unknown certificate issuer.
 pub const HINT_TLS_UNKNOWN_ISSUER: &str = "certificate not trusted — add a custom CA in Settings";
-/// §11.2 (verbatim, `<class>` = "invalid certificate": the client reports name mismatch,
-/// expiry and unsupported certificates as one class).
+/// §11.2 template "server certificate problem (<class>) — contact the server administrator",
+/// verbatim but for `<class>`, which is "invalid certificate" here: the client reports name
+/// mismatch, expiry and unsupported certificates as one `ConnClass::TlsCertificate`.
 pub const HINT_TLS_CERTIFICATE: &str =
     "server certificate problem (invalid certificate) — contact the server administrator";
-/// §11.2 (verbatim): proxy unreachable or 407.
+/// §11.2 (verbatim; the spec's code span around `doctor` is kept as backticks): proxy
+/// unreachable or 407.
 pub const HINT_PROXY: &str = "proxy error — see `doctor`";
 /// Plan wording: the other connection-level classes.
 const MSG_DNS: &str = "the server name could not be resolved";
@@ -72,6 +74,7 @@ const MSG_IDENTITY: &str = "the server's answer was not attributed to the token'
 const MSG_NEEDS_TOKEN: &str =
     "the instance needs a token: set it in the atlas-duck credential window";
 const MSG_INTERNAL: &str = "the read could not be run";
+const MSG_ABORTED: &str = "the read was aborted";
 
 /// The facts `meta.page` needs (§7.5), kept from the fetch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,7 +586,15 @@ pub(crate) struct ReadContext<'a> {
 /// Records the fetch and applies `Fetched(item)` (rev 1) or `FetchFailedDirect`.
 async fn settle(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, classified: Classified) {
     match classified {
-        Classified::Cancelled => {}
+        // Task 24 contract: the control is cancelled only inside `cancel_now`'s gated section,
+        // which records the bytes and the terminal event; by the time this transition gets the
+        // gate the request is terminal and nothing is recorded here. A request still pending
+        // then would never end otherwise: it fails `internal` (fail closed), with what arrived.
+        Classified::Cancelled => {
+            let captured = entry.fetch_control().map(|c| c.take_captured().pages);
+            let d = Direct::internal(MSG_ABORTED, captured.unwrap_or_default());
+            direct(engine, entry, d).await;
+        }
         Classified::Direct(d) => direct(engine, entry, d).await,
         Classified::Item(rec) => {
             let (spec, ctx) = (entry.spec, entry.ctx.clone());

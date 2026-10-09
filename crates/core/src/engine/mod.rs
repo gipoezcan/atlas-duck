@@ -481,12 +481,12 @@ impl Engine {
         &self.http
     }
 
-    #[allow(dead_code)] // used from Task 21 on
+    #[allow(dead_code)] // token recheck and connection tests (Tasks 25/26)
     pub(crate) fn credentials(&self) -> &Arc<dyn CredentialProvider> {
         &self.credentials
     }
 
-    #[allow(dead_code)] // used from Task 21 on
+    #[allow(dead_code)] // batch and instance dialogs (Tasks 23/25)
     pub(crate) fn confirmer(&self) -> &Arc<dyn NativeConfirmer> {
         &self.confirmer
     }
@@ -587,18 +587,31 @@ impl Engine {
     }
 
     /// The synchronous `DecisionApi` runs its async part on the core's runtime and waits on a
-    /// plain channel (PD-13: callers are never on a UI thread; a caller on the runtime's
-    /// `block_on` thread, as in tests, may wait too). `None` if the task died.
+    /// plain channel (PD-13). A caller on a multi-thread runtime's worker (or its `block_on`
+    /// thread) waits through `block_in_place`, which hands the worker's queue to another thread,
+    /// so the decision's own tasks still run even with every worker waiting. A caller on a
+    /// current-thread runtime is refused: blocking it could starve the very task it waits for.
+    /// `None` if refused or if the task died.
     pub(crate) fn run_sync<T, F>(&self, fut: F) -> Option<T>
     where
         T: Send + 'static,
         F: std::future::Future<Output = T> + Send + 'static,
     {
+        use tokio::runtime::{Handle, RuntimeFlavor};
+        let flavor = Handle::try_current().ok().map(|h| h.runtime_flavor());
+        let on_runtime = flavor.is_some();
+        if flavor.is_some_and(|f| f != RuntimeFlavor::MultiThread) {
+            return None;
+        }
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.runtime.spawn(async move {
             let _ = tx.send(fut.await);
         });
-        rx.recv().ok()
+        if on_runtime {
+            tokio::task::block_in_place(|| rx.recv().ok())
+        } else {
+            rx.recv().ok()
+        }
     }
 
     pub fn is_shutting_down(&self) -> bool {
@@ -1002,6 +1015,40 @@ fn terminal_flags(p: &dyn AuditPort, h: &EventHeader) -> Option<ScriptFailedFlag
     })
 }
 
+/// The first terminal record of `headers` (seq order).
+fn terminal_of<'a>(p: &dyn AuditPort, headers: &'a [EventHeader]) -> Option<&'a EventHeader> {
+    headers.iter().find(|h| {
+        let flags = terminal_flags(p, h);
+        is_terminal(h, flags.as_ref())
+    })
+}
+
+/// The terminal record's payload, decrypted only when its meaning needs it.
+fn terminal_payload(p: &dyn AuditPort, terminal: Option<&EventHeader>) -> Option<Value> {
+    terminal
+        .filter(|h| envelope::needs_payload(h.event_type))
+        .and_then(|h| payload_json(p, h.seq))
+}
+
+/// The status of the request `start` began, ended by `terminal` (with `payload`) or still open.
+fn status_at(
+    start: &EventHeader,
+    terminal: Option<&EventHeader>,
+    payload: Option<&Value>,
+) -> RecordStatus {
+    let (status, error) = match terminal {
+        None => (Status::Pending, None),
+        Some(h) => envelope::record_status(h.event_type, payload, start.op_class.as_deref()),
+    };
+    RecordStatus {
+        request_id: start.request_id.clone().unwrap_or_default(),
+        op_id: start.op_id.clone(),
+        instance: None,
+        status,
+        error,
+    }
+}
+
 /// The first terminal record of `headers` (seq order), with its payload when its meaning needs
 /// it, plus the start record's `instance_id` (mapped to an alias by the caller).
 #[allow(clippy::type_complexity)]
@@ -1012,27 +1059,10 @@ fn records_status(
     let Some(start) = headers.first() else {
         return Ok(None);
     };
-    let terminal = headers.iter().find(|h| {
-        let flags = terminal_flags(p, h);
-        is_terminal(h, flags.as_ref())
-    });
-    let (status, error) = match terminal {
-        None => (Status::Pending, None),
-        Some(h) => {
-            let payload = envelope::needs_payload(h.event_type)
-                .then(|| payload_json(p, h.seq))
-                .flatten();
-            envelope::record_status(h.event_type, payload.as_ref(), start.op_class.as_deref())
-        }
-    };
+    let terminal = terminal_of(p, headers);
+    let payload = terminal_payload(p, terminal);
     Ok(Some((
-        RecordStatus {
-            request_id: start.request_id.clone().unwrap_or_default(),
-            op_id: start.op_id.clone(),
-            instance: None,
-            status,
-            error,
-        },
+        status_at(start, terminal, payload.as_ref()),
         start.instance_id.clone(),
     )))
 }

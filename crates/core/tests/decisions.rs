@@ -271,3 +271,22 @@ async fn raw_pages_are_exact_slices() -> TestResult {
     assert!(h.decisions().raw_page(&id, stale, 0).is_err());
     Ok(())
 }
+
+/// PD-13: the synchronous API waits without starving the runtime, even when called from its
+/// only worker (the decision's own tasks still run).
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn decisions_from_the_only_runtime_worker_complete() -> TestResult {
+    let h = std::sync::Arc::new(Harness::jira().await?);
+    let id = issue_item(&h).await?;
+    let (h2, id2) = (h.clone(), id.clone());
+    let task = tokio::spawn(async move {
+        h2.approver()
+            .release(&id2)
+            .map(|o| o.status)
+            .map_err(|e| format!("{e:?}"))
+    });
+    let status = tokio::time::timeout(Duration::from_secs(30), task).await???;
+    assert_eq!(status, Status::Released);
+    assert_eq!(h.await_(&id, 5000).await.status, Status::Released);
+    Ok(())
+}
