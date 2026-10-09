@@ -427,6 +427,24 @@ pub(super) async fn decide_batch(
         .iter()
         .map(|c| step_of(c, batch_id.as_str()))
         .collect::<Result<Vec<_>, _>>()?;
+    // The flags come from the similarity index, which a submit updates without any request's
+    // gate: read them once more right before the append, with no await in between, so an item
+    // flagged during the re-check of the others is never batch-approved (§5.6).
+    let flagged: Vec<&Checked> = checked
+        .iter()
+        .filter(|c| Flags::of(&engine, &c.entry).any())
+        .collect();
+    if !flagged.is_empty() {
+        let mut bad = Vec::with_capacity(flagged.len());
+        for c in flagged {
+            let f = BatchFailure::Invalid(InvalidReason::BatchItemFlagged);
+            match failed(&engine, &c.entry, f, c.rev.counter).await {
+                Fail::Audit(e) => return Err(DecisionError::Audit(e)),
+                Fail::Item(f) => bad.push((c.entry.head.request_id.clone(), f)),
+            }
+        }
+        return Err(DecisionError::BatchRejected { failed: bad });
+    }
     match engine.commit_batch(&gates, lead, steps).await {
         Ok(_) => {}
         Err(BatchCommitError::Audit(e)) => return Err(DecisionError::Audit(e)),

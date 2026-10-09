@@ -411,7 +411,8 @@ impl Prepared {
     }
 }
 
-/// Held transition gates ([`Engine::lock_gates`]): proof for [`Engine::commit_batch`].
+/// Held transition gates ([`Engine::lock_gates`]): proof for [`Engine::commit_batch`]. The field
+/// is never read: holding the guards is its whole purpose (dropping `Gates` releases them).
 pub(crate) struct Gates(#[allow(dead_code)] Vec<tokio::sync::OwnedMutexGuard<()>>);
 
 /// What an accepted event of a batch step brings to the entry state.
@@ -1003,6 +1004,9 @@ impl Engine {
         self.blocking(move |p| p.append_batch(evs).map(|_| ()))
             .await
             .map_err(BatchCommitError::Audit)?;
+        // `after_change` with every item's gate held, as `transition_gated` runs it with its
+        // own: it wakes watchers (a non-blocking `watch` send) and drops per-request state
+        // (ticket, fetch control, cached candidate, map entry); nothing in it waits on a gate.
         let mut out = Vec::with_capacity(prepared.len());
         for (entry, event, p, on_apply) in prepared {
             out.push(p.apply(&entry, event, on_apply, |_| true));
