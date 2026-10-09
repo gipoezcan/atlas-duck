@@ -9,15 +9,23 @@
 pub mod audit_port;
 /// `config.toml` loading, saving and cross-version rules (§7.7, §8.13).
 pub mod config;
+/// The composition root: `CoreDeps`, `Core`, `NativeConfirmer` (C.7).
+mod core;
+/// The decision API (C.7, §5.6): queue rows, previews, decisions.
+pub mod decision;
 
 /// Edit engine: immutable targets and baselines, `executed_params`, `edited_keys` (§5.4 step 4).
 pub mod edit;
+/// The request broker: entries, sessions, the `RequestHandler` impl and its envelopes.
+pub mod engine;
 /// Serving without a store: `GateState`, `gate_handler`, the shared `hello` check (§2.5, L46).
 pub mod gate;
 /// Per-instance HTTP client construction (§7.2, V17).
 pub mod http_factory;
 /// Request, instance, batch and system-fetch ids.
 pub mod ids;
+/// The instance runtime table (routing, PD-01…PD-03) and `InstanceAdmin` (C.7).
+pub mod instances;
 /// Request lifecycle: the pure §5.1 state machine model.
 pub mod lifecycle;
 /// Agent-string normalization at `hello`/submit (§3.3, C.0).
@@ -38,7 +46,21 @@ pub mod validate;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+pub use crate::core::{Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, StartError};
+#[cfg(feature = "testing")]
+pub use crate::core::{HookPoint, TestHooks};
+pub use atlas_duck_preview::CandidateRev;
+pub use decision::{
+    BatchFailure, BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionKind,
+    DecisionOutcome, DenyDetails, PreviewDelivery, QueueItem, RawPage, SessionKey,
+};
+pub use edit::Edits;
 pub use gate::{
     AttentionKind, GateHandler, GateState, MSG_FIRST_RUN, UiEvent, UiSink, gate_handler,
     hello_check, ops_describe_local, ops_list_local,
 };
+pub use instances::{
+    AddInstance, AdminError, ConnectionFailure, ConnectionReport, InstanceAdmin, InstanceView,
+};
+pub use ops::{OpImpl, op_table};
+pub use redact::{DropScope, RedactionOp, RedactionPreset, UrlMode};

@@ -55,6 +55,12 @@ impl HttpFactory {
         self
     }
 
+    /// Whether the OS proxy setting uses a PAC script (never evaluated, L42; `doctor`, PD-11).
+    /// Reads the OS setting (cached 60 s), which can block: call it off the async runtime.
+    pub fn pac_configured(&self) -> bool {
+        self.os.read().pac_configured
+    }
+
     /// The client plus the proxy decision, which the caller records (`APP_START`,
     /// `CONFIG_CHANGED`) and surfaces (`pac_configured`).
     pub fn build(

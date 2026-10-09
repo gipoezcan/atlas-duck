@@ -25,6 +25,8 @@ getrandom = { workspace = true }
 sha2 = { workspace = true }
 zeroize = { workspace = true }
 secrecy = { workspace = true }
+# `InstanceAdmin::set_token`'s `expires_at` (C.4 `StoredCredential` uses `chrono::NaiveDate`).
+chrono = { workspace = true }
 hex = { workspace = true }
 # M2's pin, reused for `{"b64": ..}` bodies (§8.3 payloads).
 base64 = { workspace = true }

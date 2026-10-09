@@ -222,3 +222,70 @@ fn add_instance_and_set_base_url_roundtrip() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn routing_default_single_and_wrong_product() -> TestResult {
+    use atlas_duck_core::instances::{InstanceTable, RouteError};
+    let dir = tempfile::tempdir()?;
+    let entry = |alias: &str, product: &str, default: bool| {
+        format!(
+            "[[instances]]\nid = \"ins_{:0>32}\"\nalias = \"{alias}\"\nproduct = \"{product}\"\nbase_url = \"https://{alias}.example\"\ndefault = {default}\n",
+            alias.len()
+        )
+    };
+    let table = |body: String| -> Result<InstanceTable, Box<dyn std::error::Error>> {
+        let path = write(dir.path(), &format!("schema_version = 1\n{body}"))?;
+        Ok(InstanceTable::from_config(&load_config(&path)?))
+    };
+    // One Jira instance without `default`: it is the default (plan decision).
+    let t = table(entry("j", "jira", false))?;
+    assert_eq!(
+        t.resolve(Product::Jira, None).map(|i| i.alias.as_str()),
+        Ok("j")
+    );
+    assert_eq!(
+        t.resolve(Product::Confluence, None).err(),
+        Some(RouteError::NoInstance)
+    );
+    // Two without a default: none (PD-01); naming one works.
+    let t = table(format!(
+        "{}{}",
+        entry("j1", "jira", false),
+        entry("j22", "jira", false)
+    ))?;
+    assert_eq!(
+        t.resolve(Product::Jira, None).err(),
+        Some(RouteError::NoInstance)
+    );
+    assert_eq!(
+        t.resolve(Product::Jira, Some("j22"))
+            .map(|i| i.alias.as_str()),
+        Ok("j22")
+    );
+    // The marked default wins; a Confluence alias for a Jira op is refused.
+    let t = table(format!(
+        "{}{}{}",
+        entry("j1", "jira", false),
+        entry("j22", "jira", true),
+        entry("w", "confluence", false)
+    ))?;
+    assert_eq!(
+        t.resolve(Product::Jira, None).map(|i| i.alias.as_str()),
+        Ok("j22")
+    );
+    assert_eq!(
+        t.resolve(Product::Jira, Some("w")).err(),
+        Some(RouteError::WrongProduct)
+    );
+    assert_eq!(
+        t.resolve(Product::Jira, Some("x")).err(),
+        Some(RouteError::UnknownAlias)
+    );
+    // An unreadable list refuses everything.
+    let t = table("[[instances]]\nalias = \"bad alias\"\n".to_owned())?;
+    assert_eq!(
+        t.resolve(Product::Jira, None).err(),
+        Some(RouteError::ConfigUnreadable)
+    );
+    Ok(())
+}

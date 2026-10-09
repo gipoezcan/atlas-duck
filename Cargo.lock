@@ -449,6 +449,7 @@ dependencies = [
  "atlas-duck-preview",
  "atlas-duck-registry",
  "base64 0.22.1",
+ "chrono",
  "core-foundation",
  "getrandom 0.4.3",
  "hex",
