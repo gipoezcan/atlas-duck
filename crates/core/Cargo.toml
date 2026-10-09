@@ -20,6 +20,16 @@ icu_normalizer = { workspace = true }
 percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
+secrecy = { workspace = true }
+hex = { workspace = true }
+# M2's pin, reused for `{"b64": ..}` bodies (§8.3 payloads).
+base64 = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+tempfile = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { workspace = true }
@@ -29,15 +39,15 @@ system-configuration-sys = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Registry"] }
 
 [features]
-# `HttpFactory::with_timeouts` for tests that need short budgets.
-testing = []
+# `core::testing` (`TempStore`, `FaultyAudit`) over the wiremock harness and the audit doubles,
+# plus `HttpFactory::with_timeouts` for tests that need short budgets. Never a release build.
+testing = ["atlas-duck-atlassian/testing", "atlas-duck-audit/testing", "dep:tempfile"]
 
 [dev-dependencies]
 atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
-
 # §7.7 / §13: unwrap_used and expect_used are errors in core and atlassian.
 [lints.clippy]
 unwrap_used = "deny"
