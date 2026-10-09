@@ -12,3 +12,6 @@ hex = { workspace = true }
 ammonia = { workspace = true }
 icu_properties = { workspace = true }
 emojis = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

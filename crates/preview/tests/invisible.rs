@@ -1,5 +1,7 @@
 use std::time::{Duration, Instant};
 
+use proptest::prelude::*;
+
 use atlas_duck_preview::PREVIEW_BUILDER_VERSION;
 use atlas_duck_preview::invisible::{
     MAX_RGI_EMOJI_CHARS, count, escape_for_display, flags, is_bidi_control, is_flagged, strip,
@@ -386,4 +388,118 @@ fn escape_for_display_is_injective() {
     // The delimiters are display escapes only: not counted, not stripped.
     assert_eq!(count("⟨⟩"), (0, 0));
     assert_eq!(strip("⟨⟩", false), ("⟨⟩".to_string(), false));
+}
+
+#[test]
+fn subdivision_flags_lose_their_tags_under_strip() {
+    // L57: tag characters stay flagged even inside an RGI subdivision flag, so `strip` keeps
+    // only the black flag base (U+1F3F4) of England, Scotland and Wales.
+    for tags in ["gbeng", "gbsct", "gbwls"] {
+        let flag: String = std::iter::once('🏴')
+            .chain(
+                tags.chars()
+                    .map(|c| char::from_u32(0xE0000 + c as u32).unwrap_or('?')),
+            )
+            .chain(['\u{E007F}'])
+            .collect();
+        assert!(
+            emojis::get(&flag).is_some_and(|e| e.as_str() == flag),
+            "{flag:?}"
+        );
+        assert_eq!(count(&flag), (0, 6), "{flag:?}");
+        assert_eq!(strip(&flag, false), ("🏴".to_string(), true), "{flag:?}");
+    }
+}
+
+#[test]
+fn stray_tag_characters_are_stripped() {
+    assert_eq!(strip("\u{E0041}", false), (String::new(), true));
+    assert_eq!(
+        strip("a\u{E0067}\u{E0062}\u{E007F}b", false),
+        ("ab".to_string(), true)
+    );
+    // Tags after a non-flag emoji base.
+    assert_eq!(
+        strip("😀\u{E0067}\u{E007F}", false),
+        ("😀".to_string(), true)
+    );
+}
+
+#[test]
+fn fully_qualified_zwj_sequences_survive_strip() {
+    for e in [
+        "👩\u{200D}🚀",
+        "👨\u{200D}👩\u{200D}👧",
+        "🏳\u{FE0F}\u{200D}🌈",
+        "👁\u{FE0F}\u{200D}🗨\u{FE0F}",
+        "🧑🏽\u{200D}💻",
+    ] {
+        assert_eq!(strip(e, false), (e.to_string(), false), "{e:?}");
+        assert_eq!(
+            strip(&format!("x{e}y"), true),
+            (format!("x{e}y"), false),
+            "{e:?}"
+        );
+    }
+    // Not fully qualified: the joiner goes.
+    assert_eq!(strip("🏳\u{200D}🌈", false), ("🏳🌈".to_string(), true));
+}
+
+fn mixed_input() -> impl Strategy<Value = String> {
+    // Whole RGI sequences, their parts, tags, flagged and plain characters, and delimiters.
+    let tokens = prop::sample::select(vec![
+        "👩\u{200D}🚀",
+        "👨\u{200D}👩\u{200D}👧",
+        "❤\u{FE0F}",
+        "#\u{FE0F}\u{20E3}",
+        "👍\u{1F3FD}",
+        "🏴\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
+        "🏴",
+        "\u{E0067}",
+        "\u{E007F}",
+        "👩",
+        "🚀",
+        "\u{200D}",
+        "\u{FE0F}",
+        "\u{FE0E}",
+        "\u{1F3FD}",
+        "1",
+        "a",
+        "ü",
+        " ",
+        "\n",
+        "\t",
+        "\r",
+        "\u{1B}",
+        "\u{85}",
+        "\u{202E}",
+        "\u{3164}",
+        "\u{0600}",
+        "⟨",
+        "⟩",
+    ]);
+    prop::collection::vec(tokens, 0..24).prop_map(|v| v.concat())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// `strip` removes exactly what `flags` flags (plus `\t`, `\r`, `\n` unless kept) and is a
+    /// fixpoint: stripping its output again removes nothing.
+    #[test]
+    fn strip_is_idempotent_and_agrees_with_flags(s in mixed_input(), keep_newlines in any::<bool>()) {
+        let (once, removed) = strip(&s, keep_newlines);
+        let expected: String = s
+            .chars()
+            .zip(flags(&s))
+            .filter(|&(c, f)| !f && !matches!(c, '\t' | '\r') && (keep_newlines || c != '\n'))
+            .map(|(c, _)| c)
+            .collect();
+        prop_assert_eq!(&once, &expected);
+        prop_assert_eq!(removed, once != s);
+        let (twice, removed_again) = strip(&once, keep_newlines);
+        prop_assert_eq!(&twice, &once);
+        prop_assert!(!removed_again);
+        prop_assert_eq!(count(&once), (0, 0));
+    }
 }

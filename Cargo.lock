@@ -499,6 +499,7 @@ dependencies = [
  "emojis",
  "hex",
  "icu_properties",
+ "proptest",
  "serde",
  "serde_json",
 ]
