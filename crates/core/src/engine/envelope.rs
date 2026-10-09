@@ -35,6 +35,12 @@ const MSG_CANCELLED: &str = "the request was cancelled";
 const MSG_ABANDONED: &str = "the request was abandoned when atlas-duck stopped";
 const MSG_DENIED: &str = "denied";
 const MSG_STORAGE_LOW: &str = "the audit log volume is low on free space; nothing was queued";
+/// Plan wording: a released upstream error (§5.2 step 6; the details carry status and text).
+pub const MSG_UPSTREAM_HTTP: &str = "the Atlassian server answered with an error";
+/// Plan wording: the delivery window passed (§4.4).
+pub const MSG_RESULT_EVICTED: &str =
+    "the result is no longer available: it can be delivered for 1 h after the decision";
+const MSG_DELIVERY_INTEGRITY: &str = "the released result could not be delivered";
 
 /// The only statuses a request shows before it is terminal (§4.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +347,86 @@ pub fn await_envelope(rs: &RecordStatus) -> Envelope {
     })
 }
 
+/// A terminal request's routing fields and true status with another error (a failed delivery).
+pub fn record_failure(
+    rs: &RecordStatus,
+    code: ErrorCode,
+    retryable: bool,
+    message: &str,
+) -> Envelope {
+    let mut env = base(
+        Some(&rs.request_id),
+        rs.op_id.as_deref(),
+        rs.instance.as_deref(),
+        rs.status,
+    );
+    env.error = Some(error(code, retryable, message, None));
+    env
+}
+
+/// §4.3 exit 10: the outcome is known but its data is no longer deliverable (§4.4).
+pub fn result_evicted(rs: &RecordStatus, retryable: bool) -> Envelope {
+    record_failure(rs, ErrorCode::ResultEvicted, retryable, MSG_RESULT_EVICTED)
+}
+
+/// Inv. 2 failed (the committed bytes do not match their hash) or the record is unreadable:
+/// `failed`, `internal`, nothing delivered.
+pub fn delivery_internal(rs: &RecordStatus) -> Envelope {
+    let mut env = base(
+        Some(&rs.request_id),
+        rs.op_id.as_deref(),
+        rs.instance.as_deref(),
+        atlas_duck_ipc::envelope::Status::Failed,
+    );
+    env.error = Some(error(
+        ErrorCode::Internal,
+        false,
+        MSG_DELIVERY_INTEGRITY,
+        None,
+    ));
+    env
+}
+
+/// §4.2/§4.3 `released`, exit 0: `data {result}`, `redacted`, `meta {fetched_at, released_at,
+/// page?, redactions?}`, all from the committed `READ_RELEASED`.
+pub fn released_data(rs: &RecordStatus, result: Value, redacted: bool, meta: Value) -> Envelope {
+    let mut env = base(
+        Some(&rs.request_id),
+        rs.op_id.as_deref(),
+        rs.instance.as_deref(),
+        Status::Released,
+    );
+    env.data = Some(json!({ "result": result }));
+    env.redacted = redacted;
+    env.meta = Some(meta);
+    env
+}
+
+/// §5.2 step 6: a released upstream error is `failed`, exit 6, `upstream_http`, `details
+/// {status, error_messages}` (only `status` after "Release status only"), `retryable: false`.
+pub fn released_upstream_error(
+    rs: &RecordStatus,
+    details: Map<String, Value>,
+    redacted: bool,
+    meta: Value,
+) -> Envelope {
+    let mut env = base(
+        Some(&rs.request_id),
+        rs.op_id.as_deref(),
+        rs.instance.as_deref(),
+        Status::Failed,
+    );
+    env.error = Some(error(
+        ErrorCode::UpstreamHttp,
+        false,
+        MSG_UPSTREAM_HTTP,
+        Some(details),
+    ));
+    env.redacted = redacted;
+    env.meta = Some(meta);
+    env
+}
+
 /// The same view of a terminal state only memory knows (an append failure).
 pub fn unlogged_envelope(
     head: &RequestHead,
@@ -421,9 +507,9 @@ fn direct_retryable(code: ErrorCode, payload: Option<&Value>, op_class: Option<&
 
 /// The status a terminal record means (§4.4 mapping table; payload-dependent rows read
 /// `payload`). Plan notes: a `READ_RELEASED` of an outcome item (`{code, hint}`) is `failed` with
-/// that code, like `agent_status`; a released upstream-error item cannot be told from a data
-/// release by this payload yet (Task 21). `WRITE_FAILED` names its code by `class` when that is
-/// one, else `upstream_http` for an answered failure (Task 22).
+/// that code and the hint as message, like `agent_status`; one with `item: upstream_error` is
+/// `failed`, `upstream_http` (its details come only from `deliver`). `WRITE_FAILED` names its
+/// code by `class` when that is one, else `upstream_http` for an answered failure (Task 22).
 pub fn record_status(
     t: EventType,
     payload: Option<&Value>,
@@ -457,10 +543,22 @@ pub fn record_status(
         EventType::REQUEST_FAILED | EventType::READ_FAILED => {
             let code = code_of(payload.and_then(|p| p.get("code"))).unwrap_or(ErrorCode::Internal);
             let retryable = direct_retryable(code, payload, op_class);
-            (Status::Failed, fail(code, retryable, None, details))
+            (
+                Status::Failed,
+                fail(code, retryable, message("message"), details),
+            )
         }
         EventType::READ_RELEASED => match code_of(payload.and_then(|p| p.get("code"))) {
             Some(code) => (Status::Failed, fail(code, false, message("hint"), None)),
+            None if str_of(payload, "item") == Some("upstream_error") => (
+                Status::Failed,
+                fail(
+                    ErrorCode::UpstreamHttp,
+                    false,
+                    Some(MSG_UPSTREAM_HTTP.to_owned()),
+                    None,
+                ),
+            ),
             None => (Status::Released, None),
         },
         EventType::READ_DENIED | EventType::SCRIPT_DENIED => (

@@ -8,7 +8,10 @@
 //! `request_id: null` and logs nothing. From the `REQUEST_RECEIVED` commit on, `submit` runs in
 //! its own task, so a dropped caller future (a client that went away) cannot leave a committed
 //! request unapplied: it is validated and either queued or rejected in the log regardless.
-//! Dispatch to the read/write/script flows is Tasks 21/22/27.
+//! Reads are dispatched to the read flow (Task 21, `read`); writes and scripts are Tasks 22/27.
+//!
+//! `await` answers a terminal request through `Engine::deliver` (committed records only, with
+//! `DELIVERED`); `status` and `cancel` give the reduced form and never deliver.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, PoisonError};
@@ -31,7 +34,7 @@ use super::envelope::{self, OpenStatus};
 use super::queue::{AgentKey, Reservation, Ticket};
 use super::{
     Engine, NewEntry, RequestEntry, RequestHead, Session, TerminalError, audit_failure_retryable,
-    class_str, kind_of, payload_json,
+    class_str, kind_of, payload_json, read,
 };
 use crate::audit_port::commit_request_received;
 use crate::config::instances::product_str;
@@ -193,6 +196,9 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
     }
     new.validated = Some(validated);
     let entry = engine.insert(new);
+    if entry.kind() == Kind::Read {
+        read::dispatch(&engine, &entry);
+    }
     // 10. §4.5: nothing but the four routing fields.
     envelope::pending_envelope(
         &entry.head.request_id,
@@ -401,6 +407,30 @@ impl CoreHandler {
         }
     }
 
+    /// The `await` answer of an in-memory entry once its wait ended: open → pending/executing;
+    /// an unlogged terminal from memory (no data exists); a recorded terminal is delivered.
+    async fn await_answer(&self, entry: &Arc<RequestEntry>, conn: &ConnectionMeta) -> Envelope {
+        let (status, unlogged) = {
+            let st = entry.state();
+            (
+                crate::lifecycle::model::agent_status(&st.model),
+                st.unlogged_terminal.clone(),
+            )
+        };
+        if let Some(open) = OpenStatus::of(status) {
+            return envelope::pending_envelope(
+                &entry.head.request_id,
+                Some(&entry.head.op_id),
+                Some(&entry.head.instance),
+                open,
+            );
+        }
+        if let Some(e) = unlogged {
+            return envelope::unlogged_envelope(&entry.head, status, &e, false);
+        }
+        self.engine.deliver(&entry.head.request_id, conn).await
+    }
+
     fn pending_rows(&self) -> Vec<ListRow> {
         self.engine
             .pending_entries()
@@ -537,9 +567,14 @@ impl CoreHandler {
                         (Some(spec), Some(params)) => target_display(spec, params),
                         _ => op_id.clone(),
                     };
+                    // A released item's status depends on its payload (an upstream error or an
+                    // outcome is `failed`); the row is memoized, so it is decrypted once.
+                    let released = (terminal.event_type == EventType::READ_RELEASED)
+                        .then(|| payload_json(p, terminal.seq))
+                        .flatten();
                     let (status, _) = envelope::record_status(
                         terminal.event_type,
-                        None,
+                        released.as_ref(),
                         start.op_class.as_deref(),
                     );
                     let row = ListRow {
@@ -732,13 +767,13 @@ impl RequestHandler for CoreHandler {
 
     async fn await_request(
         &self,
-        _conn: &ConnectionMeta,
+        conn: &ConnectionMeta,
         a: AwaitParams,
         progress: &dyn ProgressSink,
     ) -> Envelope {
         let Some(entry) = self.engine.entry(&a.request_id) else {
-            // After a restart (or once terminal): from the records (Task 21 adds delivery).
-            return self.records_answer(&a.request_id, false).await;
+            // After a restart, or once terminal: delivered from the records.
+            return self.engine.deliver(&a.request_id, conn).await;
         };
         let wait =
             Duration::from_millis(a.timeout_ms.unwrap_or(DEFAULT_AWAIT_MS).min(MAX_AWAIT_MS));
@@ -761,7 +796,7 @@ impl RequestHandler for CoreHandler {
                 Ok(Err(_)) | Err(_) => break,
             }
         }
-        self.entry_answer(&entry, false).await
+        self.await_answer(&entry, conn).await
     }
 
     async fn status(&self, request_id: &str) -> Envelope {

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY};
-use atlas_duck_atlassian::url_hash;
+use atlas_duck_atlassian::{ReadBudget, Timeouts, normalize_base_url, url_hash};
 use atlas_duck_audit::testing::{FakeClock, FreeSpaceStub};
 use atlas_duck_audit::{EventType, Store};
 use atlas_duck_ipc::build_info::BUILD_ID;
@@ -25,6 +25,7 @@ use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 
+use super::approver::ScriptedApprover;
 use super::capture::{
     Capture, CapturingDecisions, CapturingHandler, CapturingInstances, CapturingUi, NullUi,
 };
@@ -35,7 +36,7 @@ use crate::audit_port::{AuditPort, DateBridge};
 use crate::config::instances::product_str;
 use crate::config::{CONFIG_FILE_NAME, load_config};
 use crate::core::{Confirm, Core, CoreDeps, TestHooks};
-use crate::decision::DecisionApi;
+use crate::decision::{DecisionApi, QueueItem};
 use crate::engine::Engine;
 use crate::engine::payload_json;
 use crate::engine::queue::Limits;
@@ -57,12 +58,29 @@ pub struct HarnessInstance {
     pub id: String,
     pub is_default: bool,
     pub mock: MockDc,
+    /// What `config.toml` names: the mock's URL unless the instance was configured with another
+    /// one (`HarnessBuilder::instance_at`; the mock then gets no traffic).
+    pub base_url: String,
+    proxy: Option<String>,
+    ca_bundle: Option<std::path::PathBuf>,
 }
 
 struct InstanceSpec {
     alias: String,
     product: Product,
     is_default: bool,
+    at: Option<InstanceAt>,
+}
+
+/// An instance at a base URL of the test's choosing (raw servers, TLS servers, unreachable
+/// hosts), optionally behind a proxy and with a custom CA bundle.
+#[derive(Debug, Clone, Default)]
+pub struct InstanceAt {
+    pub base_url: String,
+    /// `"host:port"` (the `config.toml` proxy setting).
+    pub proxy: Option<String>,
+    /// A PEM bundle written to a file the instance's `ca_bundle` names.
+    pub ca_pem: Option<String>,
 }
 
 /// Configures a `Harness` before it starts.
@@ -76,6 +94,7 @@ pub struct HarnessBuilder {
     omit_ids: bool,
     limits: Option<Limits>,
     hooks: TestHooks,
+    timeouts: Option<Timeouts>,
 }
 
 impl HarnessBuilder {
@@ -95,7 +114,32 @@ impl HarnessBuilder {
             alias: alias.to_owned(),
             product,
             is_default,
+            at: None,
         });
+        self
+    }
+
+    /// An instance at `at.base_url` instead of its mock (the PAT is bound to that URL).
+    pub fn instance_at(mut self, alias: &str, product: Product, at: InstanceAt) -> Self {
+        let is_default = !self.instances.iter().any(|i| i.product == product);
+        self.instances.push(InstanceSpec {
+            alias: alias.to_owned(),
+            product,
+            is_default,
+            at: Some(at),
+        });
+        self
+    }
+
+    /// Connect, per-call and write timeouts of every instance client (§7.2 defaults otherwise).
+    pub fn timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = Some(timeouts);
+        self
+    }
+
+    /// Replaces the §7.2 read budget (e.g. 300 ms for the read-budget outcome).
+    pub fn read_budget(mut self, budget: ReadBudget) -> Self {
+        self.hooks.read_budget = Some(budget);
         self
     }
 
@@ -152,8 +196,9 @@ impl HarnessBuilder {
         let store = TempStore::new()?;
         let capture = Capture::new();
         let credentials = Arc::new(InMemoryCredentials::new());
+        let config_dir = tempfile::tempdir()?;
         let mut instances = Vec::new();
-        for spec in &self.instances {
+        for (n, spec) in self.instances.iter().enumerate() {
             let context = match spec.product {
                 Product::Jira => "/jira",
                 Product::Confluence => "/wiki",
@@ -164,22 +209,33 @@ impl HarnessBuilder {
             };
             let mock = MockDc::start(product, context).await;
             let id = InstanceId::new()?.0;
-            credentials.put(
-                &id,
-                &self.pat,
-                url_hash(&mock.base()),
-                TEST_USER,
-                TEST_USER_KEY,
-            );
+            let (base_url, bound) = match &spec.at {
+                Some(at) => (
+                    at.base_url.clone(),
+                    url_hash(&normalize_base_url(&at.base_url).map_err(|e| format!("{e:?}"))?),
+                ),
+                None => (mock.base_url(), url_hash(&mock.base())),
+            };
+            credentials.put(&id, &self.pat, bound, TEST_USER, TEST_USER_KEY);
+            let ca_bundle = match spec.at.as_ref().and_then(|a| a.ca_pem.as_ref()) {
+                Some(pem) => {
+                    let path = config_dir.path().join(format!("ca-{n}.pem"));
+                    std::fs::write(&path, pem)?;
+                    Some(path)
+                }
+                None => None,
+            };
             instances.push(HarnessInstance {
                 alias: spec.alias.clone(),
                 product: spec.product,
                 id,
                 is_default: spec.is_default,
                 mock,
+                base_url,
+                proxy: spec.at.as_ref().and_then(|a| a.proxy.clone()),
+                ca_bundle,
             });
         }
-        let config_dir = tempfile::tempdir()?;
         let config_path = config_dir.path().join(CONFIG_FILE_NAME);
         let mut text = match self.config_text {
             Some(t) => t,
@@ -194,11 +250,14 @@ impl HarnessBuilder {
         let ui = CapturingUi::wrap(Arc::new(NullUi), capture.clone());
         let confirmer = Arc::new(StubConfirmer::new(self.answers));
         let no_os_proxy = SystemProxySource::with_reader(Box::new(OsProxy::default));
-        let http = HttpFactory::new(
+        let mut http = HttpFactory::new(
             Arc::new(no_os_proxy),
             credentials.clone(),
             Arc::new(DateBridge(port.clone())),
         );
+        if let Some(t) = self.timeouts {
+            http = http.with_timeouts(t);
+        }
         let clock: Arc<FakeClock> = store.clock().clone();
         let deps = CoreDeps {
             audit: store.store(),
@@ -259,9 +318,16 @@ fn config_toml(instances: &[HarnessInstance], with_ids: bool) -> String {
             id,
             i.alias,
             product_str(i.product),
-            i.mock.base_url(),
+            i.base_url,
             i.is_default
         );
+        if let Some(p) = &i.proxy {
+            let _ = writeln!(s, "proxy = \"{p}\"");
+        }
+        if let Some(path) = &i.ca_bundle {
+            // A TOML literal string: Windows paths carry backslashes.
+            let _ = writeln!(s, "ca_bundle = '{}'", path.display());
+        }
     }
     s
 }
@@ -304,6 +370,7 @@ impl Harness {
             omit_ids: false,
             limits: None,
             hooks: TestHooks::none(),
+            timeouts: None,
         }
     }
 
@@ -360,6 +427,44 @@ impl Harness {
 
     pub fn confirmer(&self) -> &Arc<StubConfirmer> {
         &self.confirmer
+    }
+
+    /// A scripted approver over the capturing decision API.
+    pub fn approver(&self) -> ScriptedApprover {
+        ScriptedApprover::new(self.decisions())
+    }
+
+    /// Waits until `request_id` is in the queue (its read fetched); `None` after `ms`.
+    pub async fn queued(&self, request_id: &str, ms: u64) -> Option<QueueItem> {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            if let Some(item) = self.decisions.queue_get(request_id) {
+                return Some(item);
+            }
+            if tokio::time::Instant::now() > deadline {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits until `request_id` is no longer pending in memory (terminal); `false` after `ms`.
+    pub async fn settled(&self, request_id: &str, ms: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(ms);
+        loop {
+            let open = self
+                .core
+                .engine()
+                .entry(request_id)
+                .is_some_and(|e| e.state().unlogged_terminal.is_none());
+            if !open {
+                return true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub fn credentials(&self) -> &Arc<InMemoryCredentials> {

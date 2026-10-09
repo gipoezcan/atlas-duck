@@ -311,6 +311,23 @@ pub fn rebuild<N>(
 where
     N: FnOnce(&Value) -> Result<Value, RebuildError>,
 {
+    let c = build_candidate(spec, source_body(port, request_id, normalize)?, ops)?;
+    if &c.hash != expected {
+        return Err(RebuildError::HashMismatch);
+    }
+    Ok(c)
+}
+
+/// The normalized body of `request_id`'s last committed candidate record, before any redaction
+/// op (blocking): what a new set of ops is applied to (§5.3, Task 21).
+pub fn source_body<N>(
+    port: &dyn AuditPort,
+    request_id: &str,
+    normalize: N,
+) -> Result<Value, RebuildError>
+where
+    N: FnOnce(&Value) -> Result<Value, RebuildError>,
+{
     let headers = port
         .headers_for_request(request_id)
         .map_err(RebuildError::Audit)?;
@@ -322,9 +339,5 @@ where
     let bytes = port.read_payload(source.seq).map_err(RebuildError::Audit)?;
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| RebuildError::Malformed)?;
     drop(bytes);
-    let c = build_candidate(spec, normalize(&payload)?, ops)?;
-    if &c.hash != expected {
-        return Err(RebuildError::HashMismatch);
-    }
-    Ok(c)
+    normalize(&payload)
 }

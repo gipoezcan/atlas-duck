@@ -602,7 +602,7 @@ fn builders_append_with_their_columns() -> TestResult {
             EventFlags::default(),
         ),
         (
-            payloads::read_failed(&c, ErrorCode::NeedsToken, &json!({})),
+            payloads::read_failed(&c, ErrorCode::NeedsToken, "needs token", &json!({}), None),
             None,
             EventFlags::default(),
         ),

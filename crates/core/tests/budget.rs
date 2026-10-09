@@ -4,9 +4,9 @@
 //! L44, RF-2b), reservations released at every terminal, the byte-bounded candidate LRU and its
 //! rebuild from the committed record (I-37 core half).
 //!
-//! Until Task 21 dispatches reads, a valid read waits in `Validated`, which is pending for the
-//! limits exactly like `Fetching` or `AwaitingRelease`; the fixtures are mounted anyway so the
-//! same tests hold the reads in `AwaitingRelease` once reads fetch.
+//! Reads fetch at once (Task 21) and wait in `AwaitingRelease`, which is pending for the limits
+//! exactly like `Validated` or `Fetching`. Tests that drive an entry's model by hand park the
+//! read in `Validated` with the `pause_before_fetch` hook instead.
 
 mod common;
 
@@ -624,7 +624,16 @@ fn first_page(payload: &Value) -> Result<Value, RebuildError> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rebuild_from_committed_record() -> TestResult {
-    let h = Harness::jira().await?;
+    // The reads stay in `Validated`: this test commits the record and sets the hash itself.
+    let parked = atlas_duck_core::Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(atlas_duck_core::TestHooks {
+            pause_before_fetch: Some(parked.clone()),
+            ..atlas_duck_core::TestHooks::none()
+        })
+        .start()
+        .await?;
     mount_issue(&h, "ABC-1", 64, 'n').await?;
     let id = request_id(&h.submit(ISSUE, issue("ABC-1")).await)?;
     let entry = h.engine().entry(&id).ok_or("not in memory")?;
@@ -776,7 +785,6 @@ async fn queued(h: &Harness, id: &str, ms: u64) -> Option<atlas_duck_core::Queue
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Task 21's read lifecycle and preview_fetch; Task 21 un-ignores it"]
 async fn i37_evicted_rebuild_no_mock_hit() -> TestResult {
     let h = Harness::jira().await?;
     mount_issue(&h, "ABC-1", 4096, 'r').await?;
@@ -807,7 +815,6 @@ async fn i37_evicted_rebuild_no_mock_hit() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "needs Task 21's read lifecycle, preview_fetch and release; Task 21 un-ignores it"]
 async fn i37_rebuild_hash_mismatch_disables_release() -> TestResult {
     let h = Harness::jira().await?;
     mount_issue(&h, "ABC-1", 4096, 'r').await?;
@@ -847,7 +854,6 @@ async fn i37_rebuild_hash_mismatch_disables_release() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "Task 21 (await delivery, step 9): delivered bytes come from READ_RELEASED, never memory"]
 async fn i37_await_delivers_committed_bytes() -> TestResult {
     let h = Harness::jira().await?;
     mount_issue(&h, "ABC-1", 4096, 'd').await?;
@@ -974,10 +980,13 @@ async fn rebuild_failure_survives_a_transition_replace() -> TestResult {
     use atlas_duck_core::payloads::preview_shown;
     use atlas_duck_core::{Pause, TestHooks};
     let pause = Pause::new();
+    let parked = Pause::new();
     let h = Harness::builder()
         .jira("jira-main")
         .hooks(TestHooks {
             pause_in_transition: Some(pause.clone()),
+            // The read stays in `Validated`: this test steps the model itself.
+            pause_before_fetch: Some(parked.clone()),
             ..TestHooks::none()
         })
         .start()

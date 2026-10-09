@@ -2,11 +2,14 @@
 //! `doctor` (PD-11) read. Built from `config.toml` at start (PD-22); Task 25 adds the audit-side
 //! derivation (confirmed origins, stored PATs, the identity-header states) and the clients.
 
+use std::path::PathBuf;
+
 use atlas_duck_atlassian::{BaseUrlError, NormalizedBaseUrl, normalize_base_url};
 use atlas_duck_registry::{Product, Version};
 
 use crate::config::ConfigState;
 use crate::config::instances::{InstanceConfig, instances};
+use crate::proxy::ProxySetting;
 
 /// C.2 `InstanceRow.state` (§3.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +50,11 @@ pub struct InstanceRuntime {
     /// The server version from the last connection test (Task 25); `None` = unknown, and an
     /// unknown version makes every op available (§7.1, `validate`).
     pub version: Option<Version>,
+    /// The instance's proxy setting (L42), resolved against the OS reading when its client is
+    /// built.
+    pub proxy: ProxySetting,
+    /// The custom CA bundle (PEM path, read by Rust only, §7.2).
+    pub ca_bundle: Option<PathBuf>,
 }
 
 impl InstanceRuntime {
@@ -67,6 +75,8 @@ impl InstanceRuntime {
             is_default: c.is_default,
             state,
             version: None,
+            proxy: c.proxy.clone(),
+            ca_bundle: c.ca_bundle.clone(),
         }
     }
 }

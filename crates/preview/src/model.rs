@@ -75,6 +75,9 @@ pub struct PreviewHeader {
     pub other_invisible: u64,
     pub executes_as: Option<String>,
     pub receipt_fields: Vec<String>,
+    /// The effective query as sent, display-escaped (§6.3: a Confluence search shows its CQL
+    /// after the §7.4 rewrite, `jira.search` its JQL); `None` for keyed ops.
+    pub query: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

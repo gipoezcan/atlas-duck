@@ -14,5 +14,7 @@ pub use approver::ScriptedApprover;
 pub use capture::{Capture, Captured, Channel};
 pub use confirmer::StubConfirmer;
 pub use credentials::InMemoryCredentials;
-pub use harness::{HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, NoProgress};
+pub use harness::{
+    HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, InstanceAt, NoProgress,
+};
 pub use store::{FaultPlan, FaultyAudit, TempStore};

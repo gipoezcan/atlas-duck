@@ -368,6 +368,7 @@ fn read_fallback(ctx: &PreviewCtx<'_>, view: &ReadView<'_>) -> PreviewModel {
         ));
     }
 
+    let query = query_display(spec, ctx.params);
     PreviewModel {
         header: PreviewHeader {
             instance_alias: ctx.instance_alias.to_owned(),
@@ -381,15 +382,16 @@ fn read_fallback(ctx: &PreviewCtx<'_>, view: &ReadView<'_>) -> PreviewModel {
             other_invisible: other,
             executes_as: None,
             receipt_fields: Vec::new(),
+            query: query.clone(),
         },
         body: PreviewBody::JsonTree { tree },
         warnings,
-        query: query_display(spec, ctx.params),
+        query,
     }
 }
 
 /// Searches show their query (§6.3); keyed ops none.
-fn query_display(spec: &OperationSpec, params: &Value) -> Option<String> {
+pub(crate) fn query_display(spec: &OperationSpec, params: &Value) -> Option<String> {
     match spec.target_display {
         TargetDisplay::Query { param } => params
             .get(param)
@@ -551,6 +553,7 @@ fn write_model(ctx: &PreviewCtx<'_>, view: &WriteView<'_>) -> PreviewModel {
             other_invisible: other,
             executes_as: None,
             receipt_fields: receipt_fields(spec),
+            query: None,
         },
         body,
         warnings,
@@ -605,7 +608,7 @@ fn count_body(body: &[u8]) -> (u64, u64) {
     }
 }
 
-fn invisible_warnings(warnings: &mut Vec<Warning>, bidi: u64, other: u64) {
+pub(crate) fn invisible_warnings(warnings: &mut Vec<Warning>, bidi: u64, other: u64) {
     if bidi > 0 {
         warnings.push(Warning::new(
             WarningId::BidiControls,

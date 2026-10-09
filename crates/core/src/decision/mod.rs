@@ -1,25 +1,43 @@
 //! The Rust decision API (C.7, §2.4, §5.6): the only way a human decision reaches the engine.
 //! The approvals UI (M6) and the scripted approver call it, nothing else.
 //!
-//! Task 19 declares the contract and answers the queue; the decisions are Tasks 21–23. Until
-//! then nothing ever waits for a decision (requests stop at `Validated`), so every
-//! preview/decision call is honestly `NotDecidable` and the deny calls deny nothing. Every
-//! return type is `Serialize` (PD-12: the capture hook records them).
+//! Task 19 declared the contract and the queue; Task 21 decides reads (preview, raw pages,
+//! release, release with redactions, deny); writes are Task 22, batches Task 23. Every return
+//! type is `Serialize` (PD-12: the capture hook records them).
+//!
+//! The trait is synchronous (PD-13): each call runs its async part on the core's runtime
+//! (`Engine::run_sync`). Every decision steps a clone of the model first (PD-19): a rejection is
+//! logged as `DECISION_STALE` / `DECISION_INVALID` where §8.3 says so and changes nothing; an
+//! accepted one commits its record through `Engine::transition` before anything else happens.
+//!
+//! **Redactions (plan decision, PD-20 analogue).** A `Release`/`ReleaseRedacted` decision whose
+//! `redactions` differ from the current revision's ops does not release: it applies the ops to
+//! the normalized body as a new revision (`CandidateChanged`, inv. 5) and answers `pending`; that
+//! revision must be opened (`preview_fetch`) and then released with the same ops (or `None`).
+//! Ops that block (§5.3 checks, an outcome item) are `DECISION_INVALID {not_approvable}`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use atlas_duck_audit::AuditError;
-use atlas_duck_ipc::envelope::Status;
-use atlas_duck_preview::{CandidateRev, Preview};
+use atlas_duck_audit::{AuditError, NewEvent};
+use atlas_duck_ipc::envelope::{ErrorCode, Status};
+use atlas_duck_preview::{
+    CandidateRev, PREVIEW_BUILDER_VERSION, Preview, RAW_PAGE_BYTES, RawPager,
+};
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
+use serde_json::Value;
 
 use crate::edit::Edits;
-use crate::engine::{Engine, RequestEntry};
-use crate::lifecycle::model::Phase;
-use crate::payloads::InvalidReason;
-use crate::redact::RedactionOp;
+use crate::engine::cache::{Candidate, RebuildError, source_body};
+use crate::engine::read::{
+    OUTCOME_HINT, ReadContext, caution_count, normalizer, preview_model, release_meta,
+};
+use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, TransitionError};
+use crate::gate::UiEvent;
+use crate::lifecycle::model::{Event, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
+use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
+use crate::redact::{self, RedactionOp};
 use crate::validate::ValidationError;
 
 /// Maps to the audit `decision` values (C.7).
@@ -241,13 +259,15 @@ impl CoreDecisions {
 }
 
 /// An item waits for a human only in `AwaitingRelease` / `AwaitingApproval` (§5.1).
+fn decidable(p: Phase) -> bool {
+    matches!(p, Phase::AwaitingRelease(_) | Phase::AwaitingApproval(_))
+}
+
+/// The queue row of an entry that waits for a decision.
 fn in_queue(e: &RequestEntry) -> Option<QueueItem> {
     let st = e.state();
     let m = &st.model;
-    if !matches!(
-        m.phase(),
-        Phase::AwaitingRelease(_) | Phase::AwaitingApproval(_)
-    ) {
+    if !decidable(m.phase()) {
         return None;
     }
     Some(QueueItem {
@@ -267,12 +287,514 @@ fn in_queue(e: &RequestEntry) -> Option<QueueItem> {
         similar_to: None,
         session: e.session.clone(),
         opened: m.opened(),
-        approvable: m.approvable(),
-        candidate_rev: CandidateRev {
-            counter: m.rev(),
-            candidate_hash: st.candidate_hash,
-        },
+        approvable: st.approvable(),
+        candidate_rev: current_rev(&st),
     })
+}
+
+fn current_rev(st: &EntryState) -> CandidateRev {
+    CandidateRev {
+        counter: st.model.rev(),
+        candidate_hash: st.candidate_hash,
+    }
+}
+
+fn task_failed() -> DecisionError {
+    DecisionError::Audit(AuditError::AppendFailed("the decision task failed".into()))
+}
+
+/// Steps a clone with `event` (nothing changes). A submitted revision is current only if its
+/// counter **and** its hash are (inv. 5); approvability follows `EntryState::approvable`.
+fn dry_step(
+    entry: &RequestEntry,
+    event: Event,
+    submitted: Option<&CandidateRev>,
+) -> Result<(), Rejection> {
+    let st = entry.state();
+    if let Some(r) = submitted
+        && r.counter == st.model.rev()
+        && r.candidate_hash != st.candidate_hash
+    {
+        return Err(Rejection::StaleRev {
+            current: st.model.rev(),
+        });
+    }
+    let mut m = st.model.clone();
+    if st.rebuild_failed {
+        m.set_approvable(false);
+    }
+    step(&mut m, event).map(|_| ())
+}
+
+/// A rejected decision (PD-19): `StaleRev` → `DECISION_STALE`; `NotOpened` / `NotApprovable` /
+/// `TargetParamEdit` → `DECISION_INVALID {reason}`; `Illegal` on a pending request in a phase
+/// where no decision applies (`Validated`, `Fetching`, `Enriching`, `StaleCheck`, `Executing`)
+/// → `DECISION_STALE` (the M-3 exception); any other `Illegal` (a decision kind the item does
+/// not take, a terminal request) and every preview refusal but a stale one → nothing logged.
+/// Nothing else changes.
+async fn rejected(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    r: Rejection,
+    submitted: u64,
+    decision: SubmittedDecision,
+) -> DecisionError {
+    let (current, phase) = {
+        let st = entry.state();
+        (current_rev(&st), st.model.phase())
+    };
+    let ctx = &entry.ctx;
+    let stale = || payloads::decision_stale(ctx, submitted, current.counter, decision, false);
+    let invalid = |reason| payloads::decision_invalid(ctx, reason, submitted, decision, false);
+    let (record, err): (Option<NewEvent>, DecisionError) = match r {
+        Rejection::StaleRev { .. } => (Some(stale()), DecisionError::Stale { current }),
+        Rejection::NotOpened if decision != SubmittedDecision::Preview => (
+            Some(invalid(InvalidReason::NotOpened)),
+            DecisionError::Invalid(InvalidReason::NotOpened),
+        ),
+        Rejection::NotApprovable if decision != SubmittedDecision::Preview => (
+            Some(invalid(InvalidReason::NotApprovable)),
+            DecisionError::Invalid(InvalidReason::NotApprovable),
+        ),
+        Rejection::TargetParamEdit => (
+            Some(invalid(InvalidReason::TargetParamEdit)),
+            DecisionError::Invalid(InvalidReason::TargetParamEdit),
+        ),
+        Rejection::Illegal
+            if decision != SubmittedDecision::Preview && is_pending(phase) && !decidable(phase) =>
+        {
+            (Some(stale()), DecisionError::Stale { current })
+        }
+        _ => (None, DecisionError::NotDecidable),
+    };
+    if let Some(ev) = record
+        && let Err(e) = engine.blocking(move |p| p.append(ev)).await
+    {
+        return DecisionError::Audit(e);
+    }
+    err
+}
+
+/// A transition error of an accepted dry step: the model moved on meanwhile.
+async fn transition_failed(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    e: TransitionError,
+    submitted: u64,
+    decision: SubmittedDecision,
+) -> DecisionError {
+    match e {
+        TransitionError::Rejected(r) => rejected(engine, entry, r, submitted, decision).await,
+        // The record committed for a revision that is no longer current (PD-19 re-step).
+        TransitionError::Raced(_) => DecisionError::Stale {
+            current: current_rev(&entry.state()),
+        },
+        TransitionError::Audit(e) => DecisionError::Audit(e),
+    }
+}
+
+/// The current candidate: cached, or rebuilt from the committed record (§5.2). A permanent
+/// rebuild failure has disabled Release (`rebuild_failed`).
+async fn candidate(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+) -> Result<Arc<Candidate>, RebuildError> {
+    engine.candidate(entry, normalizer(entry.spec)).await
+}
+
+fn read_context(entry: &RequestEntry) -> (&Value, ReadContext<'_>) {
+    let params = entry.validated.as_ref().map_or(&Value::Null, |v| &v.params);
+    (
+        params,
+        ReadContext {
+            spec: entry.spec,
+            alias: &entry.head.instance,
+            params,
+            target_display: &entry.target_display,
+        },
+    )
+}
+
+fn queue_changed(engine: &Engine, entry: &RequestEntry) {
+    engine.ui().emit(UiEvent::QueueChanged {
+        request_ids: vec![entry.head.request_id.clone()],
+    });
+}
+
+/// Step 6 (PD-19 order, PD-29): a dry step first, so no `PREVIEW_SHOWN` is ever committed for
+/// an event the model rejects; then the candidate (rebuilt if evicted) and the preview; then
+/// `PREVIEW_SHOWN` through `transition` (re-step, never overwrite). An append failure leaves
+/// the request as it was and "opened" clear (§5.6).
+async fn preview_fetch(
+    engine: Arc<Engine>,
+    id: String,
+    rev: Option<CandidateRev>,
+) -> Result<PreviewDelivery, DecisionError> {
+    let entry = engine.entry(&id).ok_or(DecisionError::NotDecidable)?;
+    if entry.kind() != Kind::Read {
+        // Task 22 previews writes.
+        return Err(DecisionError::NotDecidable);
+    }
+    let submitted = rev.map_or_else(|| entry.state().model.rev(), |r| r.counter);
+    let event = Event::PreviewShown { rev: submitted };
+    if let Err(r) = dry_step(&entry, event, rev.as_ref()) {
+        return Err(rejected(&engine, &entry, r, submitted, SubmittedDecision::Preview).await);
+    }
+    let c = match candidate(&engine, &entry).await {
+        Ok(c) => c,
+        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        // §5.2: the item failed closed; only Deny remains (M6 shows the `internal` banner).
+        Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
+    };
+    let built = {
+        let st = entry.state();
+        if st.model.rev() != submitted || &st.candidate_hash != c.hash() {
+            None
+        } else {
+            st.read
+                .clone()
+                .map(|read| (read, current_rev(&st), st.approvable(), st.model.opened()))
+        }
+    };
+    let Some((read, shown, approvable, opened)) = built else {
+        let r = Rejection::StaleRev {
+            current: entry.state().model.rev(),
+        };
+        return Err(rejected(&engine, &entry, r, submitted, SubmittedDecision::Preview).await);
+    };
+    let (_, cx) = read_context(&entry);
+    let model = preview_model(&cx, &read, &c);
+    let preview = Preview {
+        candidate_rev: shown,
+        approvable,
+        raw: RawPager::for_total(u64::try_from(c.bytes().len()).unwrap_or(u64::MAX)),
+        header: model.header,
+        warnings: model.warnings,
+        body: model.body,
+        also_appears_in: read.also_appears_in.clone(),
+        preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
+    };
+    // §5.6: only the first delivery of a revision commits `PREVIEW_SHOWN`.
+    if opened {
+        return Ok(PreviewDelivery { preview });
+    }
+    let warning_ids: Vec<String> = preview
+        .warnings
+        .iter()
+        .filter_map(|w| serde_json::to_value(w.id).ok())
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect();
+    let ctx = entry.ctx.clone();
+    let shown_rec = move |_: &crate::lifecycle::model::Model| {
+        vec![payloads::preview_shown(
+            &ctx,
+            &shown,
+            &warning_ids,
+            PREVIEW_BUILDER_VERSION,
+        )]
+    };
+    match engine
+        .transition_with(
+            &entry,
+            event,
+            shown_rec,
+            OnAuditFailure::KeepRequest,
+            |_| {},
+        )
+        .await
+    {
+        Ok(_) => Ok(PreviewDelivery { preview }),
+        Err(e) => {
+            Err(transition_failed(&engine, &entry, e, submitted, SubmittedDecision::Preview).await)
+        }
+    }
+}
+
+/// Step 7: an exact slice of the current, opened revision's bytes; no record.
+async fn raw_page(
+    engine: Arc<Engine>,
+    id: String,
+    rev: CandidateRev,
+    page: u64,
+) -> Result<RawPage, DecisionError> {
+    let entry = engine.entry(&id).ok_or(DecisionError::NotDecidable)?;
+    if entry.kind() != Kind::Read {
+        return Err(DecisionError::NotDecidable);
+    }
+    {
+        let st = entry.state();
+        if !decidable(st.model.phase()) {
+            return Err(DecisionError::NotDecidable);
+        }
+        if current_rev(&st) != rev {
+            return Err(DecisionError::Stale {
+                current: current_rev(&st),
+            });
+        }
+        if !st.model.opened() {
+            return Err(DecisionError::Invalid(InvalidReason::NotOpened));
+        }
+    }
+    let c = match candidate(&engine, &entry).await {
+        Ok(c) => c,
+        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
+    };
+    if c.hash() != &rev.candidate_hash {
+        return Err(DecisionError::Stale {
+            current: current_rev(&entry.state()),
+        });
+    }
+    let bytes = c.bytes();
+    let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let pager = RawPager::for_total(total);
+    let from = page.saturating_mul(RAW_PAGE_BYTES).min(total);
+    let to = from.saturating_add(RAW_PAGE_BYTES).min(total);
+    let slice = usize::try_from(from)
+        .ok()
+        .zip(usize::try_from(to).ok())
+        .and_then(|(a, b)| bytes.get(a..b))
+        .unwrap_or_default();
+    Ok(RawPage {
+        page,
+        page_count: pager.page_count,
+        total_bytes: total,
+        bytes: slice.to_vec(),
+    })
+}
+
+async fn decide(engine: Arc<Engine>, d: Decision) -> Result<DecisionOutcome, DecisionError> {
+    let entry = engine
+        .entry(&d.request_id)
+        .ok_or(DecisionError::NotDecidable)?;
+    if entry.kind() != Kind::Read {
+        // Task 22 decides writes.
+        return Err(DecisionError::NotDecidable);
+    }
+    match d.decision {
+        DecisionKind::Deny => deny(&engine, &entry, &d).await,
+        DecisionKind::Release | DecisionKind::ReleaseRedacted if d.edits.is_none() => {
+            let current_ops = entry.state().redaction_ops.clone();
+            match d.redactions {
+                Some(ops) if ops != current_ops => {
+                    redact(&engine, &entry, d.candidate_rev, ops).await
+                }
+                _ => release(&engine, &entry, d.candidate_rev).await,
+            }
+        }
+        // A read takes no approval and no edit.
+        _ => Err(DecisionError::NotDecidable),
+    }
+}
+
+fn outcome(entry: &RequestEntry) -> DecisionOutcome {
+    DecisionOutcome {
+        request_id: entry.head.request_id.clone(),
+        status: entry.agent_status(),
+    }
+}
+
+/// Step 8: `READ_RELEASED` with the exact candidate bytes (a rebuild first if evicted; a hash
+/// mismatch disables Release, §5.2), then `Release`; watchers wake.
+async fn release(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    rev: CandidateRev,
+) -> Result<DecisionOutcome, DecisionError> {
+    let redacted = !entry.state().redaction_ops.is_empty();
+    let event = Event::Release {
+        rev: rev.counter,
+        redacted,
+    };
+    let dec = SubmittedDecision::Release;
+    if let Err(r) = dry_step(entry, event, Some(&rev)) {
+        return Err(rejected(engine, entry, r, rev.counter, dec).await);
+    }
+    let c = match candidate(engine, entry).await {
+        Ok(c) => c,
+        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(_) => {
+            return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+        }
+    };
+    if c.hash() != &rev.candidate_hash {
+        let r = Rejection::StaleRev {
+            current: entry.state().model.rev(),
+        };
+        return Err(rejected(engine, entry, r, rev.counter, dec).await);
+    }
+    let (read, ops) = {
+        let st = entry.state();
+        (st.read.clone(), st.redaction_ops.clone())
+    };
+    let Some(read) = read else {
+        return Err(DecisionError::NotDecidable);
+    };
+    let ctx = &entry.ctx;
+    let record = match read.item {
+        ReleaseItem::Outcome => {
+            let code = c
+                .value()
+                .get("code")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<ErrorCode>(v).ok())
+                .ok_or(DecisionError::NotDecidable)?;
+            payloads::read_released_outcome(ctx, code, OUTCOME_HINT)
+        }
+        item => {
+            let marker = if item == ReleaseItem::UpstreamError {
+                ReleasedItem::UpstreamError
+            } else {
+                ReleasedItem::Result
+            };
+            let meta = release_meta(entry.spec, &read, c.value());
+            payloads::read_released_item(ctx, c.bytes(), &ops, marker, &meta)
+                .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))?
+        }
+    };
+    match engine.transition(entry, event, move |_| record).await {
+        Ok(_) => {
+            queue_changed(engine, entry);
+            Ok(outcome(entry))
+        }
+        Err(e) => Err(transition_failed(engine, entry, e, rev.counter, dec).await),
+    }
+}
+
+/// `READ_DENIED {reason}`, then `Deny` (`denied`, exit 3, the reason as message).
+async fn deny(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    d: &Decision,
+) -> Result<DecisionOutcome, DecisionError> {
+    let rev = d.candidate_rev;
+    let event = Event::Deny { rev: rev.counter };
+    let dec = SubmittedDecision::Deny;
+    if let Err(r) = dry_step(entry, event, Some(&rev)) {
+        return Err(rejected(engine, entry, r, rev.counter, dec).await);
+    }
+    let record = payloads::read_denied(&entry.ctx, d.reason.as_deref());
+    match engine.transition(entry, event, move |_| record).await {
+        Ok(_) => {
+            queue_changed(engine, entry);
+            Ok(outcome(entry))
+        }
+        Err(e) => Err(transition_failed(engine, entry, e, rev.counter, dec).await),
+    }
+}
+
+/// What a set of redaction ops gave.
+enum Redacted {
+    Blocked,
+    Applied {
+        c: Candidate,
+        meta: Option<crate::redact::RedactionMeta>,
+        also: Vec<String>,
+        ops: Vec<RedactionOp>,
+    },
+}
+
+/// A new set of redaction ops on the normalized body: a new revision (`CandidateChanged`, inv.
+/// 5) that must be opened before it can be released. No record: the ops are recorded with the
+/// release (`READ_RELEASED.redaction_ops`).
+async fn redact(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    rev: CandidateRev,
+    ops: Vec<RedactionOp>,
+) -> Result<DecisionOutcome, DecisionError> {
+    let dec = SubmittedDecision::Release;
+    if let Err(r) = dry_step(entry, Event::CandidateChanged, Some(&rev)) {
+        return Err(rejected(engine, entry, r, rev.counter, dec).await);
+    }
+    let read = entry.state().read.clone();
+    let Some(read) = read else {
+        return Err(DecisionError::NotDecidable);
+    };
+    // An outcome item has no content to redact (§5.2 step 6: Release outcome or Deny).
+    if read.item == ReleaseItem::Outcome {
+        return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+    }
+    let (spec, id) = (entry.spec, entry.head.request_id.clone());
+    let base = engine
+        .blocking(move |p| Ok(source_body(p, &id, normalizer(spec))))
+        .await
+        .map_err(DecisionError::Audit)?;
+    let base = match base {
+        Ok(b) => b,
+        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(_) => {
+            return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+        }
+    };
+    // T14 handoff: on the bare body, with the op's `items_key`; heavy for big candidates.
+    // The same steps as `cache::build_candidate` (the rebuild path), keeping the outcome's meta.
+    let applied = tokio::task::spawn_blocking(move || {
+        if ops.is_empty() {
+            return Candidate::from_value(base).map(|c| Redacted::Applied {
+                c,
+                meta: None,
+                also: Vec::new(),
+                ops,
+            });
+        }
+        let out = redact::apply(
+            &base,
+            &spec.redaction_rules,
+            spec.paginated.map(|p| p.items_key),
+            &ops,
+        );
+        if !out.blocked.is_empty() {
+            return Ok(Redacted::Blocked);
+        }
+        Candidate::from_value(out.released).map(|c| Redacted::Applied {
+            c,
+            meta: Some(out.meta),
+            also: out.also_appears_in,
+            ops,
+        })
+    })
+    .await;
+    let (c, redaction_meta, also, ops) = match applied {
+        Ok(Ok(Redacted::Applied { c, meta, also, ops })) => (c, meta, also, ops),
+        // §5.3 checks failed (mirror, every-occurrence mask, encodings, missing targets).
+        Ok(Ok(Redacted::Blocked)) => {
+            return Err(rejected(engine, entry, Rejection::NotApprovable, rev.counter, dec).await);
+        }
+        _ => return Err(DecisionError::Audit(AuditError::Invalid("redaction"))),
+    };
+    let new_read = crate::engine::read::ReadState {
+        redaction_meta,
+        also_appears_in: also,
+        ..read
+    };
+    let (_, cx) = read_context(entry);
+    let caution = caution_count(&preview_model(&cx, &new_read, &c));
+    let c = Arc::new(c);
+    let (cache, id) = (engine.clone(), entry.head.request_id.clone());
+    let applied = engine
+        .step_unlogged(
+            entry,
+            Event::CandidateChanged,
+            Some(rev.counter),
+            move |st| {
+                st.candidate_hash = *c.hash();
+                st.redaction_ops = ops;
+                st.rebuild_failed = false;
+                st.caution_count = caution;
+                st.read = Some(new_read);
+                st.model.set_approvable(true);
+                cache.candidates().insert(&id, c);
+            },
+        )
+        .await;
+    match applied {
+        Ok(_) => {
+            queue_changed(engine, entry);
+            Ok(outcome(entry))
+        }
+        Err(r) => Err(rejected(engine, entry, r, rev.counter, dec).await),
+    }
 }
 
 impl DecisionApi for CoreDecisions {
@@ -297,23 +819,32 @@ impl DecisionApi for CoreDecisions {
 
     fn preview_fetch(
         &self,
-        _request_id: &str,
-        _rev: Option<CandidateRev>,
+        request_id: &str,
+        rev: Option<CandidateRev>,
     ) -> Result<PreviewDelivery, DecisionError> {
-        Err(DecisionError::NotDecidable)
+        let (engine, id) = (self.engine.clone(), request_id.to_owned());
+        self.engine
+            .run_sync(preview_fetch(engine, id, rev))
+            .unwrap_or_else(|| Err(task_failed()))
     }
 
     fn raw_page(
         &self,
-        _request_id: &str,
-        _rev: CandidateRev,
-        _page: u64,
+        request_id: &str,
+        rev: CandidateRev,
+        page: u64,
     ) -> Result<RawPage, DecisionError> {
-        Err(DecisionError::NotDecidable)
+        let (engine, id) = (self.engine.clone(), request_id.to_owned());
+        self.engine
+            .run_sync(raw_page(engine, id, rev, page))
+            .unwrap_or_else(|| Err(task_failed()))
     }
 
-    fn decide(&self, _d: Decision) -> Result<DecisionOutcome, DecisionError> {
-        Err(DecisionError::NotDecidable)
+    fn decide(&self, d: Decision) -> Result<DecisionOutcome, DecisionError> {
+        let engine = self.engine.clone();
+        self.engine
+            .run_sync(decide(engine, d))
+            .unwrap_or_else(|| Err(task_failed()))
     }
 
     fn decide_batch(&self, items: Vec<BatchItem>) -> Result<BatchOutcome, DecisionError> {

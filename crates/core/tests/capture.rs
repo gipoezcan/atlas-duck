@@ -139,7 +139,29 @@ async fn s16_pat_canary_never_captured() -> TestResult {
     // The PAT is stored (the harness put it in the in-memory keychain).
     let id = h.instance("jira-main").ok_or("instance")?.id.clone();
     assert!(h.credentials().contains(&id));
-    exercise(&h).await?;
+    let mock = h.mock("jira-main").ok_or("mock")?;
+    mock.json(
+        "/rest/api/2/issue/ABC-1",
+        200,
+        atlas_duck_atlassian::testing::fixtures::JIRA_ISSUE,
+    )
+    .await;
+    let request = exercise(&h).await?;
+    // A read through release and delivery (Task 21): preview, decision, data hand-off.
+    h.queued(&request, 10_000).await.ok_or("never queued")?;
+    h.approver()
+        .release(&request)
+        .map_err(|e| format!("{e:?}"))?;
+    let env = h.await_(&request, 5000).await;
+    assert_eq!(env.status, atlas_duck_ipc::envelope::Status::Released);
+    // The PAT did go out, to the instance only (so the sweep below is not vacuous).
+    let sent = mock.received().await;
+    assert!(sent.iter().any(|r| {
+        r.headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v == format!("Bearer {canary}"))
+    }));
     let needles = needles(&canary);
     for r in h.capture().records() {
         for n in &needles {

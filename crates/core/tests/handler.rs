@@ -224,21 +224,21 @@ async fn valid_read_is_pending_with_four_fields() -> TestResult {
     assert_eq!(v["op_id"], "jira.issue.get");
     assert_eq!(v["instance"], "jira-main");
     let id = request_id(&env)?;
+    // The request is cover-ready (its start record committed); the read fetches at once.
+    assert!(h.engine().committed().request_committed(&id));
+    h.queued(&id, 5000).await.ok_or("never queued")?;
     let events = h.events(&id).await?;
-    assert_eq!(events.len(), 1);
     let (t, payload) = &events[0];
     assert_eq!(*t, EventType::REQUEST_RECEIVED);
     assert_eq!(payload["params"], issue_get("ABC-1"));
     assert_eq!(payload["connection"]["agent_name"], "test-agent");
-    // The request is cover-ready (its start record committed) and nothing was fetched yet.
-    assert!(h.engine().committed().request_committed(&id));
-    assert!(
-        h.mock("jira-main")
-            .ok_or("mock")?
-            .received()
-            .await
-            .is_empty()
+    assert_eq!(
+        events.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+        [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED]
     );
+    assert_eq!(h.mock("jira-main").ok_or("mock")?.received().await.len(), 1);
+    // Still only the four routing fields once the read waits for release (§4.5).
+    assert!(only_routing_fields(&json(&h.status(&id).await)?));
     Ok(())
 }
 
@@ -296,6 +296,8 @@ async fn status_unknown_id_exit_2() -> TestResult {
 async fn await_times_out_pending_then_wakes_on_expiry() -> TestResult {
     let h = Harness::jira().await?;
     let id = request_id(&h.submit("jira.issue.get", issue_get("ABC-1")).await)?;
+    // The read fetched (the unmounted path answers 404: an upstream-error item, still pending).
+    h.queued(&id, 5000).await.ok_or("never queued")?;
     // `0`: the current status at once.
     let now = tokio::time::timeout(Duration::from_secs(2), h.await_(&id, 0)).await?;
     assert_eq!(now.status, Status::Pending);
@@ -337,9 +339,15 @@ async fn await_times_out_pending_then_wakes_on_expiry() -> TestResult {
         .map(|v| v.iter().map(|n| n.status).collect())
         .unwrap_or_default();
     assert_eq!(seen, [Status::Expired]);
+    // The terminal answer `await` returned is logged (PD-23).
     assert_eq!(
         h.event_types(&id).await?,
-        [EventType::REQUEST_RECEIVED, EventType::EXPIRED]
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::READ_FETCHED,
+            EventType::EXPIRED,
+            EventType::DELIVERED
+        ]
     );
     // Gone from memory, answered from the log; the id is no longer cover-ready.
     assert!(h.engine().entry(&id).is_none());

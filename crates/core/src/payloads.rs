@@ -433,6 +433,9 @@ pub enum SubmittedDecision {
     Release,
     Deny,
     Edit,
+    /// Plan addition (Task 21 step 6): a `preview_fetch` of a revision that is no longer
+    /// current is recorded like a stale decision.
+    Preview,
 }
 
 impl SubmittedDecision {
@@ -442,6 +445,7 @@ impl SubmittedDecision {
             Self::Release => "release",
             Self::Deny => "deny",
             Self::Edit => "edit",
+            Self::Preview => "preview",
         }
     }
 }
@@ -630,6 +634,12 @@ pub enum ReadFetched<'a> {
     UpstreamError {
         responses: &'a [UpstreamResponse],
     },
+    /// A data-free direct failure that still received an answer (§7.2: status/header-decided,
+    /// or a failed identity check): the last response is that answer, audit-only (RF-2a).
+    Unavailable {
+        responses: &'a [UpstreamResponse],
+        reason: &'a str,
+    },
     Outcome {
         outcome: OutcomeKind,
         cap_or_budget: Option<CapOrBudget>,
@@ -664,6 +674,11 @@ pub fn read_fetched(
             m.insert("pages".into(), responses.len().into());
             m.insert("responses".into(), pages(responses).into());
             m.insert("upstream_error".into(), true.into());
+        }
+        ReadFetched::Unavailable { responses, reason } => {
+            m.insert("pages".into(), responses.len().into());
+            m.insert("responses".into(), pages(responses).into());
+            m.insert("unavailable".into(), (*reason).into());
         }
         ReadFetched::Outcome {
             outcome,
@@ -730,6 +745,41 @@ pub fn read_released(
     })
 }
 
+/// What a data `READ_RELEASED` hands over (§4.3): the result, or an upstream-error item's
+/// details (delivered as `failed`, `upstream_http`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedItem {
+    Result,
+    UpstreamError,
+}
+
+impl ReleasedItem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Result => "result",
+            Self::UpstreamError => "upstream_error",
+        }
+    }
+}
+
+/// `READ_RELEASED` of a release item with what its delivery needs from the record alone: the
+/// `item` marker (a released upstream error is told from a data release by it; no caller-settable
+/// flag is free for a plaintext marker) and `meta` (`page`, `redactions`; §4.2, §7.5).
+pub fn read_released_item(
+    ctx: &EventCtx,
+    released: &[u8],
+    redaction_ops: &[RedactionOp],
+    item: ReleasedItem,
+    meta: &Value,
+) -> Result<NewEvent, serde_json::Error> {
+    let mut ev = read_released(ctx, released, redaction_ops)?;
+    if let Some(o) = ev.payload.as_object_mut() {
+        o.insert("item".into(), item.as_str().into());
+        o.insert("meta".into(), meta.clone());
+    }
+    Ok(ev)
+}
+
 /// `READ_RELEASED` of an outcome item: the outcome-only payload `{code, hint}`.
 pub fn read_released_outcome(ctx: &EventCtx, code: ErrorCode, hint: &str) -> NewEvent {
     decided(
@@ -750,13 +800,24 @@ pub fn read_denied(ctx: &EventCtx, reason: Option<&str>) -> NewEvent {
     )
 }
 
-/// `READ_FAILED {code, details}` (terminal; data-free outcomes only, §5.2 step 6).
-pub fn read_failed(ctx: &EventCtx, code: ErrorCode, details: &Value) -> NewEvent {
-    event(
-        ctx,
-        EventType::READ_FAILED,
-        json!({ "code": code_json(code), "details": details }),
-    )
+/// `READ_FAILED {code, message, details}` (terminal; data-free outcomes only, §5.2 step 6) plus
+/// its cause (`class` of a connection-level failure, `reason` of a status/header-decided one).
+/// `message` and `details` are what `await` delivers; the cause stays in the record.
+pub fn read_failed(
+    ctx: &EventCtx,
+    code: ErrorCode,
+    message: &str,
+    details: &Value,
+    cause: Option<(&str, &str)>,
+) -> NewEvent {
+    let mut m = Map::new();
+    m.insert("code".into(), code_json(code));
+    m.insert("message".into(), message.into());
+    m.insert("details".into(), details.clone());
+    if let Some((k, v)) = cause {
+        m.insert(k.into(), v.into());
+    }
+    event(ctx, EventType::READ_FAILED, Value::Object(m))
 }
 
 // ---- Writes ----------------------------------------------------------------------------------

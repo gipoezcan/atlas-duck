@@ -219,6 +219,7 @@ pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model.query = effective_cql(str_param(ctx.params, "cql"))
         .ok()
         .map(|q| escape_for_display(&q));
+    model.header.query = model.query.clone();
     model
 }
 

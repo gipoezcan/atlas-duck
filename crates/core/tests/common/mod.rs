@@ -35,6 +35,19 @@ pub fn detail(env: &Envelope, key: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// A `DecisionError` (`Debug`, not `Error`) as a test error.
+pub fn de(e: atlas_duck_core::DecisionError) -> TestError {
+    format!("{e:?}").into()
+}
+
+/// `error.message`, or `""`.
+pub fn message(env: &Envelope) -> String {
+    env.error
+        .as_ref()
+        .map(|e| e.message.clone())
+        .unwrap_or_default()
+}
+
 /// The request id of a pending envelope.
 pub fn request_id(env: &Envelope) -> Result<String, TestError> {
     env.request_id

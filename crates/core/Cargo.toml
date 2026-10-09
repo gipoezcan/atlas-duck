@@ -53,6 +53,8 @@ atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# Read-flow tests mount their own answers (delays, body matchers) on `MockDc::server()`.
+wiremock = { workspace = true }
 
 # `budget.rs` :: `i37_rss_bounded_256_pending` reads the process working set (I-37, PD-15).
 [target.'cfg(windows)'.dev-dependencies]

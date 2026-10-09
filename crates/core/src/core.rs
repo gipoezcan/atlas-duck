@@ -133,6 +133,10 @@ pub struct TestHooks {
     pub panic_on_jql: Option<String>,
     /// Replaces the limits read from `config.toml` (scaled limit tests, Task 20).
     pub limits: Option<Limits>,
+    /// Replaces the §7.2 read budget (short budgets for the read-budget outcome, Task 21).
+    pub read_budget: Option<atlas_duck_atlassian::ReadBudget>,
+    /// A read holds before it asks for a fetch slot (it stays in `Validated`).
+    pub pause_before_fetch: Option<Arc<Pause>>,
 }
 
 #[cfg(feature = "testing")]
@@ -203,6 +207,7 @@ impl Core {
             ui: deps.ui,
             instances: InstanceTable::from_config(&config),
             limits,
+            runtime: tokio::runtime::Handle::current(),
             #[cfg(feature = "testing")]
             hooks: opts.hooks,
         }));
