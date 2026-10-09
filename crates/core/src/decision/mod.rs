@@ -898,6 +898,8 @@ async fn redact(
 /// Plan wording: a deny hint the current hold has no data for (the UI offers only the ones that
 /// apply; refused like a malformed edit, nothing logged).
 const MSG_HINT_NOT_APPLICABLE: &str = "these deny details do not apply to this request";
+/// Plan wording: redaction ops sent with a write decision (review M-6).
+const MSG_NO_WRITE_REDACTIONS: &str = "redactions do not apply to a write decision";
 /// Plan wording: an edit key that is not a param name or `<object param>.<sub>`.
 const MSG_BAD_EDIT_KEY: &str = "not an editable param";
 
@@ -908,6 +910,11 @@ async fn decide_write(
     entry: &Arc<RequestEntry>,
     d: Decision,
 ) -> Result<DecisionOutcome, DecisionError> {
+    // A write has no release candidate to redact; deny details are "redacted" only through the
+    // `DenyDetails` include toggles in v1 (M6 owns finer masking). Refused rather than dropped.
+    if d.redactions.as_ref().is_some_and(|ops| !ops.is_empty()) {
+        return Err(edit_refused(MSG_NO_WRITE_REDACTIONS, "redactions"));
+    }
     match (d.decision, d.edits) {
         (DecisionKind::Deny, _) => {
             deny_write(
@@ -971,7 +978,7 @@ async fn approve_write(
     {
         Ok(_) => {
             queue_changed(engine, entry);
-            write::start_stale_check(engine, entry);
+            write::start_stale_check(engine, entry, rev.counter);
             Ok(outcome(entry))
         }
         Err(e) => Err(transition_failed(engine, entry, e, rev.counter, dec).await),
@@ -1084,11 +1091,8 @@ async fn edit_write(
         target_or_baseline_changed: false,
         rerun_enrichment: rerun,
     };
-    let (ctx, original, edited) = (
-        entry.ctx.clone(),
-        snap.write.params.clone(),
-        result.params.clone(),
-    );
+    // §5.4 step 4 "original + edited params": the agent's params on every edit (lead ruling 4).
+    let (ctx, original, edited) = (entry.ctx.clone(), agent, result.params.clone());
     let record = move |_: &crate::lifecycle::model::Model| {
         vec![payloads::write_edited(&ctx, &original, &edited)]
     };
@@ -1096,14 +1100,7 @@ async fn edit_write(
         executed_params: result.executed_params,
         edited_keys: result.edited_keys,
     };
-    let apply = write::edit_apply(
-        spec,
-        entry.head.instance.clone(),
-        result.params,
-        view,
-        rendered,
-        pat,
-    );
+    let apply = write::edit_apply(engine.clone(), entry, result.params, view, rendered, pat);
     match engine
         .transition_with(entry, event, record, OnAuditFailure::FailRequest, apply)
         .await

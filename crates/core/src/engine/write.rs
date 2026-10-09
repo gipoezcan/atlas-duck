@@ -53,7 +53,8 @@ use crate::edit::EditedKeys;
 use crate::gate::{AttentionKind, UiEvent};
 use crate::instances::InstanceState;
 use crate::lifecycle::model::{
-    Applied, Event, ExecOutcome, Hold, InstanceEvt, Phase, StaleReason, is_pending, step,
+    Applied, Event, ExecOutcome, Hold, InstanceEvt, Model, Phase, Rejection, StaleReason,
+    is_pending, step,
 };
 use crate::ops::generic::write_preview;
 use crate::ops::{
@@ -263,6 +264,10 @@ pub(crate) fn render(
 /// delta"; §6.2 texts).
 fn returned_warning(r: &Returned, executes_as: Option<&str>) -> Option<Warning> {
     Some(match r {
+        Returned::Changed(delta) if delta.is_empty() => Warning::new(
+            WarningId::ChangedSinceReview,
+            warning::TEXT_CHANGED_SINCE_REVIEW,
+        ),
         Returned::Changed(delta) => Warning::new(
             WarningId::ChangedSinceReview,
             format!("{}: {delta}", warning::TEXT_CHANGED_SINCE_REVIEW),
@@ -343,11 +348,7 @@ pub(crate) async fn stored_identity(
     engine: &Engine,
     entry: &RequestEntry,
 ) -> Option<StoredIdentity> {
-    let ok = engine
-        .instances()
-        .by_id(&entry.instance_id)
-        .is_some_and(|i| i.state == InstanceState::Ok);
-    if !ok {
+    if !instance_ok(engine, &entry.instance_id) {
         return None;
     }
     let (creds, id) = (engine.credentials().clone(), entry.instance_id.clone());
@@ -359,6 +360,24 @@ pub(crate) async fn stored_identity(
         .map(|c| c.identity)
 }
 
+/// The in-memory half of "a usable PAT": the instance's state. Read again inside the critical
+/// sections that set approvability (review M-11), so an instance-state change between the
+/// keychain read and the apply is seen. Lock order: an entry's state lock, then the instance
+/// table's read lock; never take an entry's state lock while holding the table's write lock
+/// (Task 25).
+fn instance_ok(engine: &Engine, instance_id: &str) -> bool {
+    engine
+        .instances()
+        .by_id(instance_id)
+        .is_some_and(|i| i.state == InstanceState::Ok)
+}
+
+/// Approvability inside an apply: the stored credential read before (`credential`) and the
+/// instance state now.
+fn pat_now(engine: &Engine, instance_id: &str, credential: bool) -> bool {
+    credential && instance_ok(engine, instance_id)
+}
+
 // ---- engine plumbing -----------------------------------------------------------------------------
 
 /// Why a queued write is refreshed (§5.4 step 5, §7.1): Tasks 25–26 call [`Engine::refresh_write`].
@@ -366,8 +385,8 @@ pub(crate) async fn stored_identity(
 pub enum RefreshCause {
     /// A stale-check return (from `StaleCheck`); only `Changed` is refreshed.
     Stale(StaleReason),
-    /// `credential_changed`, `instance_changed` (refreshed when the new PAT is stored, Task 25)
-    /// or `user_renamed`.
+    /// `credential_changed`, `instance_changed` (refreshed when the new PAT is stored, Task 25:
+    /// [`Engine::start_refresh`]) or `user_renamed`.
     Instance(InstanceEvt),
 }
 
@@ -387,18 +406,48 @@ fn instance_reason(e: InstanceEvt) -> WriteStaleReason {
     }
 }
 
+/// One approval of a write (review I-1): the stale-check and execute task it spawned acts only
+/// while this approval is current, i.e. the model is still at the approved revision and in
+/// `StaleCheck`/`Executing`. Any return to the queue bumps the revision, so a superseded task
+/// can neither pass, fail nor execute a later approval, nor end a refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Approval {
+    rev: u64,
+}
+
+impl Approval {
+    /// The approval of revision `rev` (the `Approve {rev}` that committed `WRITE_APPROVED`).
+    pub(crate) fn of(rev: u64) -> Approval {
+        Approval { rev }
+    }
+
+    fn current(self, m: &Model) -> bool {
+        m.rev() == self.rev && matches!(m.phase(), Phase::StaleCheck | Phase::Executing)
+    }
+}
+
+/// The guard of a transition made by a task bound to `approval` (`None`: not bound).
+fn bound(approval: Option<Approval>) -> impl Fn(&Model) -> bool + Send + 'static {
+    move |m: &Model| approval.is_none_or(|a| a.current(m))
+}
+
 impl Engine {
-    /// Appends records of a request that is still pending, under its transition gate (a request
-    /// a cancel or expiry ended meanwhile gets nothing more). An append failure fails the request
-    /// (§11.1). `false` = nothing appended and the flow stops.
+    /// Appends records of a request that is still pending (and, for a task bound to an
+    /// approval, while that approval is current), under its transition gate: a request a
+    /// cancel, expiry or later approval superseded gets nothing more. An append failure fails
+    /// the request (§11.1). `false` = nothing appended and the flow stops.
     pub(crate) async fn append_pending(
         self: &Arc<Self>,
         entry: &Arc<RequestEntry>,
         mut evs: Vec<NewEvent>,
+        approval: Option<Approval>,
     ) -> bool {
         let _gate = entry.gate.clone().lock_owned().await;
-        if !is_pending(entry.state().model.phase()) {
-            return false;
+        {
+            let st = entry.state();
+            if !is_pending(st.model.phase()) || !bound(approval)(&st.model) {
+                return false;
+            }
         }
         let appended = if evs.len() == 1 {
             match evs.pop() {
@@ -419,7 +468,10 @@ impl Engine {
     /// Tasks 25–26 (T12 I-1b): logs `WRITE_STALE {reason}` and steps the matching event; a
     /// `Changed`, `credential_changed` or `user_renamed` return starts the refresh
     /// (`EnrichStarted`, `PREVIEW_FETCH {purpose: refresh}`) in the same entry critical section,
-    /// so no decision can interleave; `instance_changed` waits for the new PAT (Task 25).
+    /// so no decision can interleave. `instance_changed` does not refresh: the write stays not
+    /// approvable (§5.1 inv. 6) until Task 25 stores the new PAT and calls
+    /// [`Engine::start_refresh`]. From `StaleCheck` the running stale check is superseded (its
+    /// GET cancelled; it applies nothing more, review I-1).
     pub async fn refresh_write(
         self: &Arc<Self>,
         entry: &Arc<RequestEntry>,
@@ -445,14 +497,53 @@ impl Engine {
             ),
         };
         let record = payloads::write_stale(&ctx, reason, None);
-        stale_return(self, entry, event, vec![record], returned, refresh).await
+        stale_return(self, entry, event, vec![record], returned, refresh, None).await
+    }
+
+    /// Task 25 (T12 I-1b): the deferred refresh of a queued write, e.g. an `instance_changed`
+    /// write once the instance's new PAT is stored: `EnrichStarted` from `AwaitingApproval` in
+    /// one gated section (approvable stays false until the refresh's `Enriched`), then the
+    /// refresh GETs (`PREVIEW_FETCH {purpose: refresh}`) under the new PAT and base URL.
+    /// `Illegal` for a write that is not in the queue.
+    pub async fn start_refresh(
+        self: &Arc<Self>,
+        entry: &Arc<RequestEntry>,
+    ) -> Result<Applied, Rejection> {
+        let applied = {
+            let _gate = entry.gate.clone().lock_owned().await;
+            let applied = {
+                let mut st = entry.state();
+                match st.model.phase() {
+                    Phase::AwaitingApproval(_) => {
+                        let applied = step(&mut st.model, Event::EnrichStarted);
+                        st.model.set_approvable(false);
+                        applied
+                    }
+                    _ => Err(Rejection::Illegal),
+                }
+            };
+            self.after_change(entry);
+            applied
+        }?;
+        if let Some(c) = entry.fetch_control() {
+            c.cancel();
+        }
+        entry.set_fetch_control(None);
+        queue_changed(self, entry);
+        spawn_guarded(self, entry, None, enrich_task);
+        Ok(applied)
     }
 }
 
 /// Runs `f` in its own task; if that task panics, the request is ended or returned fail-closed
-/// for the phase it is in (never left in a phase without a driver).
-fn spawn_guarded<F, Fut>(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, f: F)
-where
+/// for the phase it is in (never left in a phase without a driver). A task bound to an approval
+/// acts only while that approval is current.
+fn spawn_guarded<F, Fut>(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    approval: Option<Approval>,
+    f: F,
+) where
     F: FnOnce(Arc<Engine>, Arc<RequestEntry>) -> Fut,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -460,15 +551,16 @@ where
     let task = tokio::spawn(f(engine.clone(), entry.clone()));
     tokio::spawn(async move {
         if task.await.is_err() {
-            fail_closed(&engine, &entry).await;
+            fail_closed(&engine, &entry, approval).await;
         }
     });
 }
 
-/// A write task that died: an initial enrichment fails `internal`; a refresh or a stale check
-/// returns the write to the queue (`recheck_failed`, nothing was sent); an execution that may
-/// have sent is `outcome_unknown` (never retried, §5.4 step 6).
-async fn fail_closed(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
+/// A write task that died (or found its state missing): an initial enrichment fails
+/// `internal`; a refresh or a stale check returns the write to the queue (`recheck_failed`,
+/// nothing was sent); an execution that may have sent is `outcome_unknown` (never retried,
+/// §5.4 step 6).
+async fn fail_closed(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: Option<Approval>) {
     let (phase, refreshing) = {
         let st = entry.state();
         (st.model.phase(), st.model.refreshing())
@@ -497,6 +589,7 @@ async fn fail_closed(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
                 vec![record],
                 Returned::RecheckFailed,
                 false,
+                approval,
             )
             .await;
         }
@@ -517,6 +610,7 @@ async fn fail_closed(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
                 Event::Executed(ExecOutcome::OutcomeUnknown),
                 record,
                 Some(AttentionKind::OutcomeUnknown),
+                approval,
             )
             .await;
         }
@@ -545,8 +639,11 @@ fn attention(engine: &Engine, kind: AttentionKind) {
 
 /// A return to the queue (`WRITE_STALE`, `VersionConflict` or an `Instance` change): the event
 /// with its records, then in the same critical section either the refresh `EnrichStarted` (T12
-/// I-1b; approvable stays false until its `Enriched`) or the approvability of the hold the write
-/// is back in (a failed re-check: "the user may approve again later", §5.4 step 5).
+/// I-1b) or, only for a failed re-check, the approvability of the hold the write is back in
+/// ("the user may approve again later", §5.4 step 5). Every other return stays not approvable
+/// (review I-2): a refresh decides at its `Enriched`, `instance_changed` waits for the new PAT,
+/// an identity mismatch for a matching identity call. The control of the GET or send it
+/// replaces is cancelled. `approval`: the stale-check task making the return (review I-1).
 async fn stale_return(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
@@ -554,11 +651,14 @@ async fn stale_return(
     records: Vec<NewEvent>,
     returned: Returned,
     refresh: bool,
+    approval: Option<Approval>,
 ) -> Result<Applied, TransitionError> {
-    let pat = stored_identity(engine, entry).await.is_some();
+    let credential = stored_identity(engine, entry).await.is_some();
     let (spec, alias) = (entry.spec, entry.head.instance.clone());
+    let (eng, id) = (engine.clone(), entry.instance_id.clone());
+    let recompute = returned == Returned::RecheckFailed && !refresh;
     let applied = engine
-        .transition_with(
+        .transition_guarded(
             entry,
             event,
             move |_| records,
@@ -570,21 +670,26 @@ async fn stale_return(
                     w.approved_hash = None;
                 }
                 let refreshing = refresh && step(&mut st.model, Event::EnrichStarted).is_ok();
+                let ok = !refreshing && recompute && approvable(st, pat_now(&eng, &id, credential));
+                st.model.set_approvable(ok);
                 if !refreshing {
-                    let ok = approvable(st, pat);
-                    st.model.set_approvable(ok);
                     refresh_caution(st, spec, &alias);
                 }
             },
+            bound(approval),
         )
         .await;
     if applied.is_ok() {
+        // The superseded GET or send stops at once (review I-1).
+        if let Some(c) = entry.fetch_control() {
+            c.cancel();
+        }
         entry.set_fetch_control(None);
         queue_changed(engine, entry);
         attention(engine, AttentionKind::Stale);
         let refreshing = entry.state().model.phase() == Phase::Enriching;
         if refresh && refreshing {
-            spawn_guarded(engine, entry, enrich_task);
+            spawn_guarded(engine, entry, None, enrich_task);
         }
     }
     applied
@@ -599,16 +704,26 @@ fn enrich_task(
     Box::pin(async move { enrich(&engine, &entry).await })
 }
 
-/// A terminal outcome of an execution: its record, then the UI's attention for a post-approval
-/// failure or unknown outcome (§5.6).
+/// A terminal outcome of an execution: its record (only while `approval` is current), then the
+/// UI's attention for a post-approval failure or unknown outcome (§5.6).
 async fn finish(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
     event: Event,
     record: NewEvent,
     kind: Option<AttentionKind>,
+    approval: Option<Approval>,
 ) -> Result<Applied, TransitionError> {
-    let applied = engine.transition(entry, event, move |_| record).await;
+    let applied = engine
+        .transition_guarded(
+            entry,
+            event,
+            move |_| vec![record],
+            OnAuditFailure::FailRequest,
+            |_| {},
+            bound(approval),
+        )
+        .await;
     queue_changed(engine, entry);
     if let (Ok(_), Some(kind)) = (&applied, kind) {
         attention(engine, kind);
@@ -625,7 +740,7 @@ pub(crate) fn dispatch(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         .as_ref()
         .map_or(Value::Null, |v| v.params.clone());
     entry.state().write = Some(WriteState::new(params));
-    spawn_guarded(engine, entry, |engine, entry| async move {
+    spawn_guarded(engine, entry, None, |engine, entry| async move {
         // Cancelled or expired meanwhile: the model refuses, nothing is sent.
         if engine
             .step_unlogged(&entry, Event::EnrichStarted, None, |_| {})
@@ -641,7 +756,7 @@ pub(crate) fn dispatch(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
 /// Re-enrichment after an edit that touched an enrichment-relevant key (`Edit {rerun}` moved the
 /// model to `Enriching`; `PREVIEW_FETCH {purpose: enrich}`, PD-24).
 pub(crate) fn rerun(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
-    spawn_guarded(engine, entry, |engine, entry| async move {
+    spawn_guarded(engine, entry, None, |engine, entry| async move {
         enrich(&engine, &entry).await;
     });
 }
@@ -961,20 +1076,24 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
             st.model.refreshing(),
         )
     };
+    // An enrichment that cannot run fails closed (never left without a driver, review M-3).
+    let internal = |message: &str| {
+        if refreshing {
+            Err(recheck_failed("internal"))
+        } else {
+            Ok(Effect::Direct(Direct::internal(message)))
+        }
+    };
     let (Some(params), Some(op)) = (params, op_table().get(entry.spec.id).copied()) else {
+        enrich_failed(engine, entry, None, internal(MSG_PREPARE_INTERNAL)).await;
         return;
     };
     let spec = entry.spec;
     let http = match engine.client(&entry.instance_id).await {
         Ok(h) => h,
         Err(_) => {
-            let fail = if refreshing {
-                Err(recheck_failed("internal"))
-            } else {
-                Ok(Effect::Direct(Direct::internal(
-                    "the instance's connection settings (custom CA or proxy) cannot be used",
-                )))
-            };
+            let fail =
+                internal("the instance's connection settings (custom CA or proxy) cannot be used");
             enrich_failed(engine, entry, None, fail).await;
             return;
         }
@@ -995,6 +1114,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         entry.set_fetch_control(Some(ctl.clone()));
         // §5.1 inv. 1: only an id whose `REQUEST_RECEIVED` committed gets a cover.
         let Ok(cover) = engine.covers().for_request(&entry.head.request_id) else {
+            enrich_failed(engine, entry, None, internal(MSG_PREPARE_INTERNAL)).await;
             return;
         };
         let n = calls.len();
@@ -1019,7 +1139,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
                 }
             }
             if i + 1 < n {
-                if !engine.append_pending(entry, vec![record]).await {
+                if !engine.append_pending(entry, vec![record], None).await {
                     return;
                 }
             } else {
@@ -1095,6 +1215,7 @@ async fn enrich_failed(
                 records,
                 returned,
                 false,
+                None,
             )
             .await;
         }
@@ -1152,7 +1273,8 @@ async fn enriched(
 ) {
     let hold = verdict.hold;
     let hash = list_hash(&requests);
-    let pat = stored_identity(engine, entry).await.is_some();
+    let credential = stored_identity(engine, entry).await.is_some();
+    let (eng, id) = (engine.clone(), entry.instance_id.clone());
     let (spec, alias) = (entry.spec, entry.head.instance.clone());
     let refresh = entry.state().model.refreshing();
     let apply = move |st: &mut EntryState| {
@@ -1162,7 +1284,7 @@ async fn enriched(
             w.failure = failure;
             w.requests = requests;
         }
-        let ok = approvable(st, pat);
+        let ok = approvable(st, pat_now(&eng, &id, credential));
         st.model.set_approvable(ok);
         refresh_caution(st, spec, &alias);
     };
@@ -1194,11 +1316,18 @@ async fn enriched(
 
 // ---- 4. stale check -------------------------------------------------------------------------------
 
-/// Starts the stale check of a write whose `WRITE_APPROVED` just committed (§5.4 step 5).
-pub(crate) fn start_stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
-    spawn_guarded(engine, entry, |engine, entry| async move {
-        stale_check(&engine, &entry).await;
-    });
+/// Starts the stale check of a write whose `WRITE_APPROVED` for revision `rev` just committed
+/// (§5.4 step 5). The task is bound to that approval (review I-1).
+pub(crate) fn start_stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, rev: u64) {
+    let approval = Approval::of(rev);
+    spawn_guarded(
+        engine,
+        entry,
+        Some(approval),
+        move |engine, entry| async move {
+            stale_check(&engine, &entry, approval).await;
+        },
+    );
 }
 
 /// §7.1 identity call: Jira `GET /rest/api/2/myself`, Confluence `GET /rest/api/user/current`.
@@ -1219,14 +1348,17 @@ fn identity_call(product: Product) -> GetCall {
 /// `type == "known"` and the stored `userKey`. A parsed answer that is not a match is
 /// `identity_mismatch`; anything else is `recheck_failed {class}`.
 fn identity_check(outcome: FetchOutcome, product: Product, user_key: &str) -> Result<(), Recheck> {
+    // §7.1: a match is a 200; another parsed 2xx JSON answer is not one (review M-4).
+    let ok_status = matches!(&outcome, FetchOutcome::Response(r) if r.status == 200);
     let v = recheck(outcome)?;
-    let matched = match product {
-        Product::Jira => v.get("key").and_then(Value::as_str) == Some(user_key),
-        Product::Confluence => {
-            v.get("type").and_then(Value::as_str) == Some("known")
-                && v.get("userKey").and_then(Value::as_str) == Some(user_key)
-        }
-    };
+    let matched = ok_status
+        && match product {
+            Product::Jira => v.get("key").and_then(Value::as_str) == Some(user_key),
+            Product::Confluence => {
+                v.get("type").and_then(Value::as_str) == Some("known")
+                    && v.get("userKey").and_then(Value::as_str) == Some(user_key)
+            }
+        };
     if matched {
         Ok(())
     } else {
@@ -1239,6 +1371,7 @@ fn identity_check(outcome: FetchOutcome, product: Product, user_key: &str) -> Re
 async fn stale_fail(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
+    approval: Approval,
     record: Option<NewEvent>,
     (reason, class): Recheck,
 ) {
@@ -1259,37 +1392,46 @@ async fn stale_fail(
         records,
         returned,
         false,
+        Some(approval),
     )
     .await;
 }
 
 /// §5.4 step 5: (a) the identity call, (b) the op's stale rule, (c) `StalePassed` (the agent
-/// sees `executing` from here on), then the execution.
-async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
+/// sees `executing` from here on), then the execution. Everything it applies is bound to
+/// `approval` (review I-1): once the write left that approval (an `Instance` return, a later
+/// approval) the task applies and sends nothing more.
+async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: Approval) {
     let state = {
         let st = entry.state();
+        if !approval.current(&st.model) {
+            return;
+        }
         st.write
             .as_ref()
             .map(|w| (w.params.clone(), w.verdict.baseline.clone()))
     };
     let (Some((params, baseline)), Some(op)) = (state, op_table().get(entry.spec.id).copied())
     else {
+        // Unreachable for a write in the map; never left without a driver (review M-3).
+        stale_fail(engine, entry, approval, None, recheck_failed("internal")).await;
         return;
     };
     let spec = entry.spec;
     let Ok(http) = engine.client(&entry.instance_id).await else {
-        stale_fail(engine, entry, None, recheck_failed("internal")).await;
+        stale_fail(engine, entry, approval, None, recheck_failed("internal")).await;
         return;
     };
     let Some(identity) = stored_identity(engine, entry).await else {
-        stale_fail(engine, entry, None, recheck_failed("needs_token")).await;
+        stale_fail(engine, entry, approval, None, recheck_failed("needs_token")).await;
+        return;
+    };
+    let Ok(cover) = engine.covers().for_request(&entry.head.request_id) else {
+        stale_fail(engine, entry, approval, None, recheck_failed("internal")).await;
         return;
     };
     let ctl = FetchControl::new();
     entry.set_fetch_control(Some(ctl.clone()));
-    let Ok(cover) = engine.covers().for_request(&entry.head.request_id) else {
-        return;
-    };
     let base = http.client.base();
     let purpose = PreviewFetchPurpose::StaleCheck;
 
@@ -1298,7 +1440,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
     let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
     let mut last = get_record(&entry.ctx, purpose, base, &call, &outcome);
     if let Err(fail) = identity_check(outcome, spec.product, &identity.atlassian_user_key) {
-        stale_fail(engine, entry, Some(last), fail).await;
+        stale_fail(engine, entry, approval, Some(last), fail).await;
         return;
     }
 
@@ -1311,7 +1453,10 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         };
         let mut bodies = Vec::new();
         for call in (rule.plan)(&ctx) {
-            if !engine.append_pending(entry, vec![last]).await {
+            if !engine
+                .append_pending(entry, vec![last], Some(approval))
+                .await
+            {
                 return;
             }
             let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
@@ -1319,7 +1464,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
             match recheck(outcome) {
                 Ok(v) => bodies.push(v),
                 Err(fail) => {
-                    stale_fail(engine, entry, Some(last), fail).await;
+                    stale_fail(engine, entry, approval, Some(last), fail).await;
                     return;
                 }
             }
@@ -1336,6 +1481,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
                 vec![last, stale],
                 Returned::Changed(delta),
                 true,
+                Some(approval),
             )
             .await;
             return;
@@ -1344,17 +1490,18 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
 
     // (c) Passed: `executing` from here on (§4.5). The write is sent right after this commit.
     let passed = engine
-        .transition_with(
+        .transition_guarded(
             entry,
             Event::StalePassed,
             move |_| vec![last],
             OnAuditFailure::FailRequest,
             |st| st.stale = false,
+            bound(Some(approval)),
         )
         .await;
     if passed.is_ok() {
         queue_changed(engine, entry);
-        execute(engine, entry, &http, &cover).await;
+        execute(engine, entry, &http, &cover, approval).await;
     }
 }
 
@@ -1367,16 +1514,19 @@ async fn execute(
     entry: &Arc<RequestEntry>,
     http: &InstanceHttp,
     cover: &atlas_duck_atlassian::AuditCover,
+    approval: Approval,
 ) {
     let held = {
         let st = entry.state();
+        if !approval.current(&st.model) {
+            return;
+        }
         st.write
             .as_ref()
             .map(|w| (w.requests.clone(), w.approved_hash, w.edit.clone()))
     };
-    let Some((requests, approved, edit)) = held else {
-        return;
-    };
+    // A write in `Executing` always has its state; a missing one fails closed (review M-3).
+    let (requests, approved, edit) = held.unwrap_or_default();
     let index = requests.first().map_or(0, |r| r.index);
     if approved.is_none() || approved != Some(list_hash(&requests)) {
         // Nothing was sent; still a terminal outcome event of an approved write (M-8: an append
@@ -1398,6 +1548,7 @@ async fn execute(
             Event::Executed(ExecOutcome::Failed),
             record,
             Some(AttentionKind::Failed),
+            Some(approval),
         )
         .await;
         return;
@@ -1408,10 +1559,14 @@ async fn execute(
         requests,
         success: expectation(entry.spec),
     };
+    // Review I-1 (c): the approval is checked once more right before the send.
+    if !approval.current(&entry.state().model) {
+        return;
+    }
     let outcome = http.client.send_approved_ctl(cover, &w, &ctl).await;
     // Bodies of the outcomes that do not carry their response (§7.2: audit-only, T10 handoff).
     let received = ctl.take_captured().partial;
-    settle_execution(engine, entry, outcome, &received, edit).await;
+    settle_execution(engine, entry, outcome, &received, edit, approval).await;
 }
 
 /// The single source of truth for a write's outcome (§5.4 step 6, §7.2, §11.2).
@@ -1421,6 +1576,7 @@ async fn settle_execution(
     outcome: WriteOutcome,
     received: &[u8],
     edit: Option<EditView>,
+    approval: Approval,
 ) {
     let ctx = entry.ctx.clone();
     let failed = |index: u32, code: ErrorCode, message: &str, class: &str| {
@@ -1554,6 +1710,7 @@ async fn settle_execution(
                 vec![stale],
                 Returned::VersionConflict,
                 true,
+                Some(approval),
             )
             .await;
             return;
@@ -1576,12 +1733,13 @@ async fn settle_execution(
                 vec![stale],
                 Returned::RecheckFailed,
                 false,
+                Some(approval),
             )
             .await;
             return;
         }
     };
-    let _ = finish(engine, entry, event, record, kind).await;
+    let _ = finish(engine, entry, event, record, kind, Some(approval)).await;
 }
 
 // ---- decisions -----------------------------------------------------------------------------------
@@ -1604,13 +1762,18 @@ pub(crate) fn snapshot(entry: &RequestEntry) -> Option<Snapshot> {
 /// The new revision of an edit that does not re-enrich, applied with the `Edit` event: the list
 /// rendered from the edited params and the latest verdict (§5.4 step 4, inv. 5).
 pub(crate) fn edit_apply(
-    spec: &'static OperationSpec,
-    alias: String,
+    engine: Arc<Engine>,
+    entry: &RequestEntry,
     params: Value,
     view: EditView,
     rendered: Option<Vec<HttpRequestSpec>>,
-    pat: bool,
+    credential: bool,
 ) -> impl FnOnce(&mut EntryState) + Send + 'static {
+    let (spec, alias, instance_id) = (
+        entry.spec,
+        entry.head.instance.clone(),
+        entry.instance_id.clone(),
+    );
     move |st: &mut EntryState| {
         if let Some(w) = st.write.as_mut() {
             w.params = params;
@@ -1625,7 +1788,7 @@ pub(crate) fn edit_apply(
         {
             st.candidate_hash = list_hash(&w.requests);
         }
-        let ok = approvable(st, pat);
+        let ok = approvable(st, pat_now(&engine, &instance_id, credential));
         st.model.set_approvable(ok);
         refresh_caution(st, spec, &alias);
     }

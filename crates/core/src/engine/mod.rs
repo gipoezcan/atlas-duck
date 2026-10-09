@@ -726,10 +726,33 @@ impl Engine {
         R: FnOnce(&Model) -> Vec<NewEvent> + Send + 'static,
         A: FnOnce(&mut EntryState) + Send + 'static,
     {
+        self.transition_guarded(entry, event, records, on_fail, on_apply, |_| true)
+            .await
+    }
+
+    /// [`Engine::transition_with`] that applies only while `guard` holds for the current model
+    /// (checked under the transition gate before anything is appended, and again on a re-step):
+    /// a task bound to one generation of a request (Task 22: a stale check bound to its
+    /// approval) never applies an event to a later one. A failed guard is
+    /// `Rejected(StaleRev)`, nothing logged.
+    pub(crate) async fn transition_guarded<R, A, G>(
+        self: &Arc<Self>,
+        entry: &Arc<RequestEntry>,
+        event: Event,
+        records: R,
+        on_fail: OnAuditFailure,
+        on_apply: A,
+        guard: G,
+    ) -> Result<Applied, TransitionError>
+    where
+        R: FnOnce(&Model) -> Vec<NewEvent> + Send + 'static,
+        A: FnOnce(&mut EntryState) + Send + 'static,
+        G: Fn(&Model) -> bool + Send + 'static,
+    {
         let (engine, entry) = (self.clone(), entry.clone());
         tokio::spawn(async move {
             engine
-                .transition_gated(&entry, event, records, on_fail, on_apply)
+                .transition_gated(&entry, event, records, on_fail, on_apply, guard)
                 .await
         })
         .await
@@ -740,21 +763,28 @@ impl Engine {
         })
     }
 
-    async fn transition_gated<R, A>(
+    async fn transition_gated<R, A, G>(
         &self,
         entry: &Arc<RequestEntry>,
         event: Event,
         records: R,
         on_fail: OnAuditFailure,
         on_apply: A,
+        guard: G,
     ) -> Result<Applied, TransitionError>
     where
         R: FnOnce(&Model) -> Vec<NewEvent>,
         A: FnOnce(&mut EntryState),
+        G: Fn(&Model) -> bool,
     {
         let _gate = entry.gate.clone().lock_owned().await;
         let (clone, applied, rev, phase) = {
             let st = entry.state();
+            if !guard(&st.model) {
+                return Err(TransitionError::Rejected(Rejection::StaleRev {
+                    current: st.model.rev(),
+                }));
+            }
             let mut m = st.model.clone();
             let applied = step(&mut m, event).map_err(TransitionError::Rejected)?;
             let (rev, phase) = (st.model.rev(), st.model.phase());
@@ -790,6 +820,10 @@ impl Engine {
                     st.model.set_approvable(false);
                 }
                 Ok(applied)
+            } else if !guard(&st.model) {
+                Err(TransitionError::Raced(Rejection::StaleRev {
+                    current: st.model.rev(),
+                }))
             } else {
                 step(&mut st.model, event).map_err(TransitionError::Raced)
             };

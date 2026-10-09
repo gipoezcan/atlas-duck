@@ -121,13 +121,15 @@ fn deliver_from_records(
         Some(t) if t.event_type == EventType::READ_RELEASED => {
             released(&headers, t, payload, &rs, now, kind)
         }
-        Some(t) if t.event_type == EventType::WRITE_EXECUTED => executed(p, start, t, &rs, now),
+        Some(t) if t.event_type == EventType::WRITE_EXECUTED => {
+            executed(p, start, t, write_decision(&headers, t), &rs, now)
+        }
         // The capped Atlassian error text of a refused write is deliverable for 1 h, like a
         // receipt (§4.4, §11.2); a failure without details is fixed text.
         Some(t)
             if t.event_type == EventType::WRITE_FAILED
                 && rs.error.as_ref().is_some_and(|e| e.details.is_some())
-                && !within_window(t, now) =>
+                && !within_window(write_decision(&headers, t), now) =>
         {
             with_error_hash(envelope::result_evicted(&rs, false))
         }
@@ -169,6 +171,15 @@ fn deliver_from_records(
     }
 }
 
+/// The decision a write's outcome `t` delivers under (§4.4 "1 h after the decision"): the
+/// latest `WRITE_APPROVED` before it (review M-8; `t` itself if the log has none).
+fn write_decision<'a>(headers: &'a [EventHeader], t: &'a EventHeader) -> &'a EventHeader {
+    headers
+        .iter()
+        .rfind(|h| h.seq < t.seq && h.event_type == EventType::WRITE_APPROVED)
+        .unwrap_or(t)
+}
+
 /// Within 1 h of the decision record `t` (§4.4).
 fn within_window(t: &EventHeader, now: UtcInstant) -> bool {
     UtcInstant::parse_rfc3339_ms(&t.ts_utc)
@@ -202,10 +213,11 @@ fn executed(
     p: &dyn AuditPort,
     start: &EventHeader,
     t: &EventHeader,
+    decided: &EventHeader,
     rs: &RecordStatus,
     now: UtcInstant,
 ) -> Handoff {
-    if !within_window(t, now) {
+    if !within_window(decided, now) {
         return with_error_hash(envelope::result_evicted(rs, false));
     }
     let spec = start.op_id.as_deref().and_then(atlas_duck_registry::get);

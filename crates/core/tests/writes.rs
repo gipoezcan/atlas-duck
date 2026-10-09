@@ -15,6 +15,8 @@ use atlas_duck_atlassian::testing::{
 use atlas_duck_audit::EventType;
 use atlas_duck_audit::request_set::requests_from_json;
 use atlas_duck_audit::request_set_hash;
+use atlas_duck_core::engine::write::RefreshCause;
+use atlas_duck_core::lifecycle::model::InstanceEvt;
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::{FaultPlan, Harness, InstanceAt};
 use atlas_duck_core::{DecisionError, DenyDetails, Edits};
@@ -952,5 +954,466 @@ async fn write_approved_append_failure_sends_nothing() -> TestResult {
             .is_empty()
     );
     assert!(records(&h, &id, EventType::PREVIEW_FETCH).await?.is_empty());
+    Ok(())
+}
+
+// ---- review fixes: approval-bound stale checks (I-1), instance changes (I-2), outcome arms ----
+
+/// `GET /rest/api/2/myself`: the first answer after `delay_ms` with `status`, later ones at once
+/// as the PAT's user.
+async fn myself_first_slow(mock: &MockDc, delay_ms: u64, status: u16) {
+    let first = if status == 200 {
+        mock.response(200).set_body_raw(
+            fixtures::jira_myself(TEST_USER, TEST_USER_KEY),
+            "application/json",
+        )
+    } else {
+        mock.response(status)
+            .set_body_raw("<html>maintenance</html>", "text/html")
+    };
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/myself")))
+        .respond_with(first.set_delay(Duration::from_millis(delay_ms)))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    identity_ok(mock).await;
+}
+
+async fn comment_ok(mock: &MockDc) {
+    mount(
+        mock,
+        "POST",
+        "/rest/api/2/issue/ABC-1/comment",
+        mock.response(201)
+            .set_body_raw(fixtures::JIRA_COMMENT, "application/json"),
+    )
+    .await;
+}
+
+fn entry_of(
+    h: &Harness,
+    id: &str,
+) -> Result<Arc<atlas_duck_core::engine::RequestEntry>, TestError> {
+    h.engine().entry(id).ok_or_else(|| "not in memory".into())
+}
+
+/// Waits until the queue row's revision is past `counter`.
+async fn rev_after(
+    h: &Harness,
+    id: &str,
+    counter: u64,
+) -> Result<atlas_duck_core::QueueItem, TestError> {
+    for _ in 0..500 {
+        if let Some(i) = h.approver().item(id)
+            && i.candidate_rev.counter > counter
+        {
+            return Ok(i);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("no new revision".into())
+}
+
+/// Review I-1 (a): a credential change during the stale check supersedes it; the re-approval
+/// runs its own identity call before its send, and the old check applies nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn superseded_stale_check_never_gates_a_later_approval() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    // The superseded identity call answers (a match) while the re-approval's own, slower one is
+    // still running: unbound, it would pass the re-approval's stale check and send early.
+    for (priority, delay) in [(1, 1200), (2, 3000)] {
+        Mock::given(method("GET"))
+            .and(path(mock.path("/rest/api/2/myself")))
+            .respond_with(
+                mock.response(200)
+                    .set_body_raw(
+                        fixtures::jira_myself(TEST_USER, TEST_USER_KEY),
+                        "application/json",
+                    )
+                    .set_delay(Duration::from_millis(delay)),
+            )
+            .up_to_n_times(1)
+            .with_priority(priority)
+            .mount(mock.server())
+            .await;
+    }
+    comment_ok(mock).await;
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    let rev1 = h.approver().rev(&id).map_err(de)?;
+    h.approver().approve(&id).map_err(de)?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.engine()
+        .refresh_write(
+            &entry_of(&h, &id)?,
+            RefreshCause::Instance(InstanceEvt::CredentialChanged),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let item = rev_after(&h, &id, rev1.counter + 1).await?;
+    assert!(item.approvable);
+    let reapproved = std::time::Instant::now();
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    // Sent only after the re-approval's own identity call (3 s) answered, not on the superseded
+    // one's answer (at 1.2 s).
+    assert!(
+        reapproved.elapsed() >= Duration::from_millis(2500),
+        "sent after {:?}",
+        reapproved.elapsed()
+    );
+    assert_eq!(
+        hits(mock, "POST", "/rest/api/2/issue/ABC-1/comment").await,
+        1
+    );
+    let stale = records(&h, &id, EventType::WRITE_STALE).await?;
+    assert_eq!(
+        stale
+            .iter()
+            .map(|s| s["reason"].clone())
+            .collect::<Vec<_>>(),
+        [json!("credential_changed")]
+    );
+    // Exactly one identity call between the second approval and the send, and none recorded
+    // for the superseded check.
+    let types = h.event_types(&id).await?;
+    let approved: Vec<usize> = types
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| **t == EventType::WRITE_APPROVED)
+        .map(|(i, _)| i)
+        .collect();
+    let executed = types
+        .iter()
+        .position(|t| *t == EventType::WRITE_EXECUTED)
+        .ok_or("no WRITE_EXECUTED")?;
+    assert_eq!(approved.len(), 2);
+    assert_eq!(
+        types[approved[1]..executed]
+            .iter()
+            .filter(|t| **t == EventType::PREVIEW_FETCH)
+            .count(),
+        1
+    );
+    assert_eq!(records(&h, &id, EventType::PREVIEW_FETCH).await?.len(), 1);
+    Ok(())
+}
+
+/// Review I-1 (b): a refresh running while the superseded stale check fails is not ended by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_survives_a_superseded_stale_fail() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    // The stale check's identity call would fail (503) after a while.
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/user/current")))
+        .respond_with(
+            mock.response(503)
+                .set_body_raw("<html>down</html>", "text/html")
+                .set_delay(Duration::from_millis(1000)),
+        )
+        .mount(mock.server())
+        .await;
+    let content = mock.path("/rest/api/content/65537");
+    let enrich_q = "body.storage,version,space";
+    Mock::given(method("GET"))
+        .and(path(content.clone()))
+        .and(query_param("expand", enrich_q))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(page_at(5), "application/json"),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    // The refresh is slow: it is still running when the superseded check would fail.
+    Mock::given(method("GET"))
+        .and(path(content))
+        .and(query_param("expand", enrich_q))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(page_at(5), "application/json")
+                .set_delay(Duration::from_millis(1500)),
+        )
+        .with_priority(2)
+        .mount(mock.server())
+        .await;
+    let params = json!({
+        "id": "65537", "base_version": 5, "body": "<p>x</p>", "body_format": "storage"
+    });
+    let id = queued(&h, "confluence.page.update", params).await?;
+    let rev1 = h.approver().rev(&id).map_err(de)?;
+    h.approver().approve(&id).map_err(de)?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    h.engine()
+        .refresh_write(
+            &entry_of(&h, &id)?,
+            RefreshCause::Instance(InstanceEvt::CredentialChanged),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    // The refresh lands with its own verdict: approvable, one `WRITE_STALE`, no re-check failure.
+    let item = rev_after(&h, &id, rev1.counter + 1).await?;
+    assert!(item.approvable && !item.opened);
+    let stale = records(&h, &id, EventType::WRITE_STALE).await?;
+    assert_eq!(
+        stale
+            .iter()
+            .map(|s| s["reason"].clone())
+            .collect::<Vec<_>>(),
+        [json!("credential_changed")]
+    );
+    let purposes: Vec<Value> = records(&h, &id, EventType::PREVIEW_FETCH)
+        .await?
+        .into_iter()
+        .map(|r| r["purpose"].clone())
+        .collect();
+    assert_eq!(purposes, ["enrich", "refresh"]);
+    assert_eq!(hits(mock, "PUT", "/rest/api/content/65537").await, 0);
+    Ok(())
+}
+
+/// Review I-2: `instance_changed` (here during the stale check) leaves the write not approvable
+/// until Task 25's deferred refresh (`Engine::start_refresh`) has run under the new PAT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn instance_changed_not_approvable_until_refreshed() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    myself_first_slow(mock, 1500, 200).await;
+    comment_ok(mock).await;
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    let rev1 = h.approver().rev(&id).map_err(de)?;
+    h.approver().approve(&id).map_err(de)?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let entry = entry_of(&h, &id)?;
+    h.engine()
+        .refresh_write(&entry, RefreshCause::Instance(InstanceEvt::InstanceChanged))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let item = rev_after(&h, &id, rev1.counter).await?;
+    assert!(!item.approvable && item.stale);
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert!(!preview.approvable);
+    let res = h.approver().approve_unopened(&id);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    // The superseded identity call answers meanwhile: nothing changes, nothing is sent.
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    let item = h.approver().item(&id).ok_or("left the queue")?;
+    assert!(!item.approvable);
+    assert_eq!(
+        hits(mock, "POST", "/rest/api/2/issue/ABC-1/comment").await,
+        0
+    );
+    // Task 25: the new PAT is stored, the deferred refresh runs; then it is approvable again.
+    let before = item.candidate_rev.counter;
+    h.engine()
+        .start_refresh(&entry)
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let item = rev_after(&h, &id, before).await?;
+    assert!(item.approvable);
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    assert_eq!(
+        hits(mock, "POST", "/rest/api/2/issue/ABC-1/comment").await,
+        1
+    );
+    let stale = records(&h, &id, EventType::WRITE_STALE).await?;
+    assert_eq!(
+        stale
+            .iter()
+            .map(|s| s["reason"].clone())
+            .collect::<Vec<_>>(),
+        [json!("instance_changed")]
+    );
+    // A write that is not in the queue takes no deferred refresh.
+    assert!(h.engine().start_refresh(&entry).await.is_err());
+    Ok(())
+}
+
+/// Approves a `jira.comment.add` on `ABC-1` whose POST answers `t`; returns the `await`.
+async fn executed_with(
+    answer: impl FnOnce(&MockDc) -> ResponseTemplate,
+) -> Result<(Harness, String, Envelope), TestError> {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    identity_ok(mock).await;
+    mount(
+        mock,
+        "POST",
+        "/rest/api/2/issue/ABC-1/comment",
+        answer(mock),
+    )
+    .await;
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    Ok((h, id, env))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_4xx_upstream_http_details_then_evicted() -> TestResult {
+    let (h, id, env) = executed_with(|m| {
+        m.response(400)
+            .set_body_raw(fixtures::JIRA_ERROR_400, "application/json")
+    })
+    .await?;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::Failed, 6),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(code(&env), "upstream_http");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert_eq!(common::detail(&env, "status"), json!(400));
+    assert_eq!(
+        common::detail(&env, "error_messages"),
+        json!("summary: You must specify a summary of the issue.")
+    );
+    // The failure stays; its Atlassian text is deliverable for 1 h after the decision (§4.4).
+    h.clock().advance(Duration::from_secs(61 * 60));
+    let env = h.await_(&id, 1000).await;
+    assert_eq!(env.status, Status::Failed);
+    assert_eq!((code(&env), exit(&env)), ("result_evicted".to_owned(), 10));
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert!(!env.to_json_line().contains("summary"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_non_json_401_is_upstream_unavailable() -> TestResult {
+    let (h, id, env) = executed_with(|m| {
+        m.response(401)
+            .set_body_raw("<html>SSO login SECRETPAGE</html>", "text/html")
+    })
+    .await?;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::Failed, 6),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(code(&env), "upstream_unavailable");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert!(env.error.as_ref().is_some_and(|e| e.details.is_none()));
+    assert!(!env.to_json_line().contains("SECRETPAGE"));
+    let failed = one(&h, &id, EventType::WRITE_FAILED).await?;
+    assert_eq!(failed["class"], "non_json_401");
+    assert!(failed["received"].to_string().contains("SECRETPAGE"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_5xx_is_outcome_unknown() -> TestResult {
+    let (h, id, env) = executed_with(|m| {
+        m.response(503)
+            .set_body_raw(r#"{"errorMessages":["SERVERBODY"]}"#, "application/json")
+    })
+    .await?;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::OutcomeUnknown, 6),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(env.data, Some(json!({ "target": "ABC-1" })));
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert!(!env.to_json_line().contains("SERVERBODY"));
+    let unknown = one(&h, &id, EventType::WRITE_OUTCOME_UNKNOWN).await?;
+    assert_eq!(unknown["reason"], "server_error_5xx");
+    Ok(())
+}
+
+/// A write whose request never left (`NotSent`, here the write budget ran out before the send):
+/// back in the queue, approvable again, the agent still sees `executing` and a cancel answers
+/// `executing` (§4.5, T12 I-3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_not_sent_returns_to_queue_still_executing() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .timeouts(Timeouts {
+            write: Duration::ZERO,
+            ..Timeouts::default()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    identity_ok(mock).await;
+    comment_ok(mock).await;
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    let rev1 = h.approver().rev(&id).map_err(de)?;
+    h.approver().approve(&id).map_err(de)?;
+    let item = rev_after(&h, &id, rev1.counter).await?;
+    assert!(item.approvable && !item.opened && item.stale);
+    let stale = one(&h, &id, EventType::WRITE_STALE).await?;
+    assert_eq!(
+        stale,
+        json!({ "reason": "recheck_failed", "class": "network" })
+    );
+    assert_eq!(
+        hits(mock, "POST", "/rest/api/2/issue/ABC-1/comment").await,
+        0
+    );
+    assert_eq!(h.status(&id).await.status, Status::Executing);
+    let env = h.handler().cancel(&id).await;
+    assert_eq!((env.status, exit(&env)), (Status::Executing, 4));
+    assert!(records(&h, &id, EventType::CANCELLED).await?.is_empty());
+    Ok(())
+}
+
+/// Lead ruling 4: `WRITE_EDITED.original` is the agent's params on every edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_edited_original_is_the_agents_params() -> TestResult {
+    let h = Harness::jira().await?;
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    for body in ["first edit", "second edit"] {
+        let mut set = Map::new();
+        set.insert("body".into(), json!(body));
+        h.approver()
+            .edit(
+                &id,
+                Edits {
+                    set,
+                    remove: Vec::new(),
+                },
+            )
+            .map_err(de)?;
+    }
+    let edited = records(&h, &id, EventType::WRITE_EDITED).await?;
+    assert_eq!(edited.len(), 2);
+    for (e, body) in edited.iter().zip(["first edit", "second edit"]) {
+        assert_eq!(e["original"], comment_params());
+        assert_eq!(e["edited"]["body"], body);
+    }
+    // Redactions do not apply to a write decision: refused, nothing logged.
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let res = h.decisions().decide(atlas_duck_core::Decision {
+        request_id: id.clone(),
+        decision: atlas_duck_core::DecisionKind::Deny,
+        candidate_rev: rev,
+        edits: None,
+        redactions: Some(vec![atlas_duck_core::RedactionOp::Preset(
+            atlas_duck_core::RedactionPreset::StatusOnly,
+        )]),
+        reason: Some("no".into()),
+        deny_details: None,
+    });
+    assert!(
+        matches!(res, Err(DecisionError::EditRejected(_))),
+        "{res:?}"
+    );
+    assert!(records(&h, &id, EventType::WRITE_DENIED).await?.is_empty());
     Ok(())
 }
