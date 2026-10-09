@@ -2,12 +2,14 @@
 //! Upstream availability on the read path (Task 21: I-23 and I-24 read halves, RF-2a). Answers
 //! decided from status and headers alone are direct (`failed`, exit 6, `retryable: true`) with
 //! the body in the audit record only; every failure after a JSON 2xx head is a release-gated
-//! outcome item (Review Focus 2). The write half is Task 22's.
+//! outcome item (Review Focus 2). The write half (Task 22): enrichment, stale check and execution.
 
 mod common;
 
 use atlas_duck_atlassian::CredentialProvider;
-use atlas_duck_atlassian::testing::{MockDc, RawHttpServer, RawStep, TEST_USER, fixtures};
+use atlas_duck_atlassian::testing::{
+    MockDc, RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, XAuser, fixtures,
+};
 use atlas_duck_audit::EventType;
 use atlas_duck_core::testing::{Channel, Harness, InstanceAt};
 use atlas_duck_ipc::envelope::Status;
@@ -296,5 +298,236 @@ async fn i24_deeply_nested_json_is_gated() -> TestResult {
     assert_eq!((env.status, exit(&env)), (Status::Failed, 6));
     assert_eq!(code(&env), "upstream_unavailable");
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    Ok(())
+}
+
+// ---- write half (Task 22) ---------------------------------------------------------------------
+
+const TRANSITION: &str = "jira.issue.transition";
+const COMMENT: &str = "jira.comment.add";
+
+async fn payloads_of(h: &Harness, id: &str, t: EventType) -> Result<Vec<Value>, TestError> {
+    Ok(h.events(id)
+        .await?
+        .into_iter()
+        .filter(|(e, _)| *e == t)
+        .map(|(_, p)| p)
+        .collect())
+}
+
+/// Requests other than `GET` the mock received.
+async fn writes_sent(mock: &MockDc) -> usize {
+    mock.received()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() != "GET")
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_enrichment_3xx_html_nonjson401_direct() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.redirect(
+        "/rest/api/2/issue/R-1/transitions",
+        "https://sso.corp.example/login",
+    )
+    .await;
+    mock.html("/rest/api/2/issue/H-1/transitions", 200).await;
+    mock.html("/rest/api/2/issue/U-1/transitions", 401).await;
+    for (key, reason) in [
+        ("R-1", "redirect_3xx"),
+        ("H-1", "non_json_2xx"),
+        ("U-1", "non_json_401"),
+    ] {
+        let env = h
+            .submit(TRANSITION, json!({ "key": key, "transition": "Done" }))
+            .await;
+        assert_eq!(env.status, Status::Pending);
+        let id = request_id(&env)?;
+        assert!(h.settled(&id, 10_000).await, "{key} never settled");
+        let env = h.await_(&id, 1000).await;
+        assert_eq!((env.status, exit(&env)), (Status::Failed, 6), "{key}");
+        assert_eq!(code(&env), "upstream_unavailable");
+        assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
+        assert!(env.error.as_ref().is_some_and(|e| e.details.is_none()));
+        assert!(
+            !env.to_json_line().contains("log in"),
+            "{key}: body is audit-only"
+        );
+        assert_eq!(
+            types(&h, &id).await?,
+            [
+                EventType::REQUEST_RECEIVED,
+                EventType::PREVIEW_FETCH,
+                EventType::REQUEST_FAILED,
+                EventType::DELIVERED
+            ]
+        );
+        let fetch = payloads_of(&h, &id, EventType::PREVIEW_FETCH).await?;
+        assert_eq!(fetch[0]["class"], reason, "{key}");
+        let failed = payloads_of(&h, &id, EventType::REQUEST_FAILED).await?;
+        assert_eq!(failed[0]["reason"], reason, "{key}");
+        assert!(h.approver().item(&id).is_none());
+    }
+    // Nothing about the token changed (§7.2: not a token failure).
+    let inst = h.instance("jira-main").ok_or("no instance")?;
+    assert!(h.credentials().load(&inst.id)?.is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_stale_check_503_recheck_failed() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.html("/rest/api/2/myself", 503).await;
+    let id = request_id(
+        &h.submit(
+            COMMENT,
+            json!({ "key": "ABC-1", "body": "Done.", "body_format": "wiki" }),
+        )
+        .await,
+    )?;
+    let before = h.queued(&id, 10_000).await.ok_or("never queued")?;
+    h.approver().approve(&id).map_err(de)?;
+    // Back in the queue: a new revision, not opened, approvable again later (§5.4 step 5).
+    let mut after = None;
+    for _ in 0..500 {
+        if let Some(i) = h.approver().item(&id)
+            && i.candidate_rev.counter > before.candidate_rev.counter
+        {
+            after = Some(i);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let after = after.ok_or("never back in the queue")?;
+    assert_eq!(
+        after.candidate_rev.counter,
+        before.candidate_rev.counter + 1
+    );
+    assert!(!after.opened && after.approvable && after.stale);
+    let stale = payloads_of(&h, &id, EventType::WRITE_STALE).await?;
+    assert_eq!(
+        stale,
+        [json!({ "reason": "recheck_failed", "class": "http_503" })]
+    );
+    let fetch = payloads_of(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(fetch.len(), 1);
+    assert_eq!(fetch[0]["purpose"], "stale_check");
+    assert_eq!(fetch[0]["status"], 503);
+    // Nothing was sent, and the agent still sees `pending` (§4.5).
+    assert_eq!(writes_sent(mock).await, 0);
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    match h.approver().open(&id).map_err(de)?.preview.warnings.first() {
+        Some(w) => assert_eq!(
+            w.id,
+            atlas_duck_preview::warning::WarningId::CouldNotRecheck
+        ),
+        None => return Err("the re-review does not lead with the re-check".into()),
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_write_3xx_failed_html200_outcome_unknown() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.redirect(
+        "/rest/api/2/issue/ABC-1/comment",
+        "https://sso.corp.example/login",
+    )
+    .await;
+    mock.html("/rest/api/2/issue/ABC-2/comment", 200).await;
+    let mut ids = Vec::new();
+    for key in ["ABC-1", "ABC-2"] {
+        let id = request_id(
+            &h.submit(
+                COMMENT,
+                json!({ "key": key, "body": "Done.", "body_format": "wiki" }),
+            )
+            .await,
+        )?;
+        h.queued(&id, 10_000).await.ok_or("never queued")?;
+        h.approver().approve(&id).map_err(de)?;
+        ids.push(id);
+    }
+    // A redirect is never followed and never a success: `failed`, exit 6.
+    let env = h.await_(&ids[0], 10_000).await;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::Failed, 6),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(code(&env), "upstream_unavailable");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert!(!env.to_json_line().contains("moved"));
+    // A 2xx HTML page on a JSON op is not the declared success: `outcome_unknown`.
+    let env = h.await_(&ids[1], 10_000).await;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::OutcomeUnknown, 6),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(code(&env), "upstream_unknown_outcome");
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert_eq!(env.data, Some(json!({ "target": "ABC-2" })));
+    assert!(!env.to_json_line().contains("log in"));
+    for id in &ids {
+        assert!(
+            payloads_of(&h, id, EventType::WRITE_EXECUTED)
+                .await?
+                .is_empty(),
+            "never WRITE_EXECUTED"
+        );
+    }
+    let unknown = payloads_of(&h, &ids[1], EventType::WRITE_OUTCOME_UNKNOWN).await?;
+    assert_eq!(unknown[0]["reason"], "undeclared_success");
+    // The page is in the record (audit-only).
+    assert!(unknown[0]["received"].to_string().contains("Please log in"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i24_truncated_json_body_enrichment_failed() -> TestResult {
+    let chunk = r#"{"expand":"transitions","transitions":[{"id":"21","#;
+    let mut answer = head("Transfer-Encoding: chunked\r\n").into_bytes();
+    answer.extend_from_slice(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes());
+    let server = RawHttpServer::serve(vec![RawStep::Send(answer), RawStep::Close]).await?;
+    let h = Harness::builder()
+        .instance_at(
+            "jira-main",
+            Product::Jira,
+            InstanceAt {
+                base_url: server.base_url(),
+                ..InstanceAt::default()
+            },
+        )
+        .start()
+        .await?;
+    let id = request_id(
+        &h.submit(TRANSITION, json!({ "key": "ABC-1", "transition": "Done" }))
+            .await,
+    )?;
+    // Gated: the "enrichment failed" hold, `pending` meanwhile, never a direct failure.
+    let item = h.queued(&id, 10_000).await.ok_or("never queued")?;
+    assert!(!item.approvable);
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    match h.approver().open(&id).map_err(de)?.preview.body {
+        PreviewBody::EnrichmentError { outcome, .. } => assert_eq!(
+            outcome,
+            Some(atlas_duck_preview::OutcomeKind::JsonBodyUnreadable)
+        ),
+        other => return Err(format!("not the enrichment-error card: {other:?}").into()),
+    }
+    assert!(
+        payloads_of(&h, &id, EventType::REQUEST_FAILED)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }

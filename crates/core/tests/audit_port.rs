@@ -632,7 +632,17 @@ fn builders_append_with_their_columns() -> TestResult {
             EventFlags::default(),
         ),
         (
-            payloads::write_failed(&c, 0, &WriteFailure::Class("upstream_unavailable")),
+            payloads::write_failed(
+                &c,
+                0,
+                ErrorCode::UpstreamUnavailable,
+                "redirect",
+                &WriteFailure::Class {
+                    class: "redirect",
+                    status: Some(302),
+                    received: b"<html>",
+                },
+            ),
             None,
             EventFlags::default(),
         ),

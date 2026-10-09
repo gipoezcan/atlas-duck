@@ -1,6 +1,6 @@
 //! `ScriptedApprover` (C.7 `core::testing`): a headless human over `DecisionApi`. Task 21 adds
 //! the read decisions (`open`, `release`, `release_redacted`, `release_status_only`, `deny`);
-//! Task 22 adds `approve`, `edit` and `deny_with`.
+//! Task 22 the write decisions (`approve`, `edit`, `deny_with`).
 //!
 //! Every decision opens the item's current revision first (`PREVIEW_SHOWN`, §5.6), as the
 //! approvals UI does, unless the method says `unopened`. The methods block (`DecisionApi` is
@@ -12,8 +12,10 @@ use std::sync::Arc;
 use atlas_duck_preview::CandidateRev;
 
 use crate::decision::{
-    Decision, DecisionApi, DecisionError, DecisionKind, DecisionOutcome, PreviewDelivery, QueueItem,
+    Decision, DecisionApi, DecisionError, DecisionKind, DecisionOutcome, DenyDetails,
+    PreviewDelivery, QueueItem,
 };
+use crate::edit::Edits;
 use crate::redact::{RedactionOp, RedactionPreset};
 
 pub struct ScriptedApprover {
@@ -122,6 +124,46 @@ impl ScriptedApprover {
         self.decisions.decide(Decision {
             reason: Some(reason.to_owned()),
             ..decision(request_id, DecisionKind::Deny, rev)
+        })
+    }
+
+    /// Opens and denies a write with an attached hint (§5.4 step 2, PD-20).
+    pub fn deny_with(
+        &self,
+        request_id: &str,
+        reason: &str,
+        details: DenyDetails,
+    ) -> Result<DecisionOutcome, DecisionError> {
+        self.open(request_id)?;
+        let rev = self.rev(request_id)?;
+        self.decisions.decide(Decision {
+            reason: Some(reason.to_owned()),
+            deny_details: Some(details),
+            ..decision(request_id, DecisionKind::Deny, rev)
+        })
+    }
+
+    /// Opens and approves a write's current revision (decision `approve`, or `approve_edited`
+    /// for a write that was edited).
+    pub fn approve(&self, request_id: &str) -> Result<DecisionOutcome, DecisionError> {
+        self.open(request_id)?;
+        self.approve_unopened(request_id)
+    }
+
+    /// Approves the current revision without opening it.
+    pub fn approve_unopened(&self, request_id: &str) -> Result<DecisionOutcome, DecisionError> {
+        let rev = self.rev(request_id)?;
+        self.decisions
+            .decide(decision(request_id, DecisionKind::Approve, rev))
+    }
+
+    /// Applies `edits` to the current revision ("Edit & approve" without the approve, PD-20):
+    /// the edit makes a new revision (or re-runs enrichment) that must be opened and approved.
+    pub fn edit(&self, request_id: &str, edits: Edits) -> Result<DecisionOutcome, DecisionError> {
+        let rev = self.rev(request_id)?;
+        self.decisions.decide(Decision {
+            edits: Some(edits),
+            ..decision(request_id, DecisionKind::ApproveEdited, rev)
         })
     }
 }

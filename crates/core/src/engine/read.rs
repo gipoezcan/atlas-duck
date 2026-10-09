@@ -70,8 +70,8 @@ const MSG_TLS_HANDSHAKE: &str = "the TLS handshake with the server failed";
 const MSG_REDIRECT: &str = "the server answered with a redirect";
 const MSG_NON_JSON: &str = "the server answered without JSON (e.g. a login or maintenance page)";
 const MSG_NON_JSON_401: &str = "the server answered 401 without JSON";
-const MSG_IDENTITY: &str = "the server's answer was not attributed to the token's user";
-const MSG_NEEDS_TOKEN: &str =
+pub(crate) const MSG_IDENTITY: &str = "the server's answer was not attributed to the token's user";
+pub(crate) const MSG_NEEDS_TOKEN: &str =
     "the instance needs a token: set it in the atlas-duck credential window";
 const MSG_INTERNAL: &str = "the read could not be run";
 const MSG_ABORTED: &str = "the read was aborted";
@@ -588,7 +588,7 @@ fn classify_one(
     }
 }
 
-fn connection_message(class: ConnClass, proxy: &ResolvedProxy) -> String {
+pub(crate) fn connection_message(class: ConnClass, proxy: &ResolvedProxy) -> String {
     let base = match class {
         ConnClass::TlsUnknownIssuer => HINT_TLS_UNKNOWN_ISSUER,
         ConnClass::TlsCertificate => HINT_TLS_CERTIFICATE,
@@ -606,7 +606,7 @@ fn connection_message(class: ConnClass, proxy: &ResolvedProxy) -> String {
     }
 }
 
-fn class_name(class: ConnClass) -> &'static str {
+pub(crate) fn class_name(class: ConnClass) -> &'static str {
     match class {
         ConnClass::Dns => "dns",
         ConnClass::Connect => "connect",
@@ -619,7 +619,7 @@ fn class_name(class: ConnClass) -> &'static str {
     }
 }
 
-fn unavailable_name(r: UnavailableReason) -> &'static str {
+pub(crate) fn unavailable_name(r: UnavailableReason) -> &'static str {
     match r {
         UnavailableReason::Redirect3xx => "redirect_3xx",
         UnavailableReason::NonJson2xx => "non_json_2xx",
@@ -629,7 +629,7 @@ fn unavailable_name(r: UnavailableReason) -> &'static str {
     }
 }
 
-fn unavailable_message(r: UnavailableReason) -> &'static str {
+pub(crate) fn unavailable_message(r: UnavailableReason) -> &'static str {
     match r {
         UnavailableReason::Redirect3xx => MSG_REDIRECT,
         UnavailableReason::NonJson2xx => MSG_NON_JSON,

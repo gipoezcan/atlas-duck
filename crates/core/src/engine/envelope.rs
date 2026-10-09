@@ -427,6 +427,29 @@ pub fn released_upstream_error(
     env
 }
 
+/// §4.2/§4.3 `succeeded`, exit 0: `data {receipt, executed_params?, edited_keys?}` from the
+/// committed `WRITE_EXECUTED`; `edited` for a write the human edited.
+pub fn write_succeeded(rs: &RecordStatus, data: Value, edited: bool) -> Envelope {
+    let mut env = base(
+        Some(&rs.request_id),
+        rs.op_id.as_deref(),
+        rs.instance.as_deref(),
+        Status::Succeeded,
+    );
+    env.data = Some(data);
+    env.edited = edited;
+    env
+}
+
+/// §4.2/§4.3 `outcome_unknown`, exit 6: the error with `data {target}` (the request's own
+/// target, never fetched data: "check the target before retrying").
+pub fn outcome_unknown(env: Envelope, target: &str) -> Envelope {
+    Envelope {
+        data: Some(json!({ "target": target })),
+        ..env
+    }
+}
+
 /// The same view of a terminal state only memory knows (an append failure).
 pub fn unlogged_envelope(
     head: &RequestHead,
@@ -508,8 +531,9 @@ fn direct_retryable(code: ErrorCode, payload: Option<&Value>, op_class: Option<&
 /// The status a terminal record means (§4.4 mapping table; payload-dependent rows read
 /// `payload`). Plan notes: a `READ_RELEASED` of an outcome item (`{code, hint}`) is `failed` with
 /// that code and the hint as message, like `agent_status`; one with `item: upstream_error` is
-/// `failed`, `upstream_http` (its details come only from `deliver`). `WRITE_FAILED` names its
-/// code by `class` when that is one, else `upstream_http` for an answered failure (Task 22).
+/// `failed`, `upstream_http` (its details come only from `deliver`). `WRITE_FAILED` carries its
+/// `code`, `message` and `details` (Task 22; older shapes: `class`, else `upstream_http` for an
+/// answered failure); `WRITE_DENIED` its attached hint.
 pub fn record_status(
     t: EventType,
     payload: Option<&Value>,
@@ -565,26 +589,39 @@ pub fn record_status(
             Status::Denied,
             fail(ErrorCode::Denied, false, message("reason"), None),
         ),
+        // §4.3: an attached hint names the code; its fixed message (outcome hints) replaces the
+        // reason, and its details (`upstream_http`, `resolution_failed`) are delivered.
         EventType::WRITE_DENIED => {
-            let code = code_of(
-                payload
-                    .and_then(|p| p.get("hint"))
-                    .and_then(|h| h.get("code")),
-            )
-            .unwrap_or(ErrorCode::Denied);
-            (Status::Denied, fail(code, false, message("reason"), None))
+            let hint = payload
+                .and_then(|p| p.get("hint"))
+                .filter(|h| h.is_object());
+            let code = code_of(hint.and_then(|h| h.get("code"))).unwrap_or(ErrorCode::Denied);
+            let text = hint
+                .and_then(|h| h.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| message("reason"));
+            let details = hint
+                .and_then(|h| h.get("details"))
+                .and_then(Value::as_object)
+                .cloned();
+            (Status::Denied, fail(code, false, text, details))
         }
         EventType::WRITE_EXECUTED | EventType::SCRIPT_DRY_RUN => (Status::Succeeded, None),
         EventType::SCRIPT_RELEASED => (Status::Released, None),
+        // §4.3: a write that reached execution is never retryable (`needs_token` included).
         EventType::WRITE_FAILED => {
-            let code = code_of(payload.and_then(|p| p.get("class"))).unwrap_or(
-                if payload.and_then(|p| p.get("response")).is_some() {
+            let code = code_of(payload.and_then(|p| p.get("code")))
+                .or_else(|| code_of(payload.and_then(|p| p.get("class"))))
+                .unwrap_or(if payload.and_then(|p| p.get("response")).is_some() {
                     ErrorCode::UpstreamHttp
                 } else {
                     ErrorCode::Internal
-                },
-            );
-            (Status::Failed, fail(code, false, None, None))
+                });
+            (
+                Status::Failed,
+                fail(code, false, message("message"), details),
+            )
         }
         EventType::WRITE_OUTCOME_UNKNOWN => (
             Status::OutcomeUnknown,

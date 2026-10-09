@@ -327,6 +327,28 @@ pub fn request_failed(ctx: &EventCtx, code: ErrorCode) -> NewEvent {
     )
 }
 
+/// `REQUEST_FAILED {code, message, details}` of a data-free direct enrichment failure (§5.4 step
+/// 2) plus its cause (`class` of a connection-level failure, `reason` of a status/header-decided
+/// one), like `read_failed`: `message` and `details` are what `await` delivers, the cause stays
+/// in the record.
+pub fn request_failed_direct(
+    ctx: &EventCtx,
+    code: ErrorCode,
+    message: &str,
+    details: &Value,
+    cause: Option<(&str, &str)>,
+) -> NewEvent {
+    let mut ev = request_failed(ctx, code);
+    if let Some(m) = ev.payload.as_object_mut() {
+        m.insert("message".into(), message.into());
+        m.insert("details".into(), details.clone());
+        if let Some((k, v)) = cause {
+            m.insert(k.into(), v.into());
+        }
+    }
+    ev
+}
+
 /// `PREVIEW_FETCH.purpose`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewFetchPurpose {
@@ -931,21 +953,50 @@ pub fn write_executed(
     )
 }
 
-/// What a failed write left: the answer, or the class of a failure without one.
+/// What a failed write left: the refusal with the details `await` delivers (§11.2: status and
+/// the capped `errorMessages`/`errors`), or the class of a failure without a usable answer and
+/// every byte received (audit-only, §7.2).
 #[derive(Debug, Clone, Copy)]
 pub enum WriteFailure<'a> {
-    Response(&'a UpstreamResponse),
-    Class(&'a str),
+    Response {
+        response: &'a UpstreamResponse,
+        details: &'a Value,
+    },
+    Class {
+        class: &'a str,
+        status: Option<u16>,
+        received: &'a [u8],
+    },
 }
 
-/// `WRITE_FAILED {request_index, response | class}`.
-pub fn write_failed(ctx: &EventCtx, request_index: u32, failure: &WriteFailure<'_>) -> NewEvent {
+/// `WRITE_FAILED {request_index, code, message, response + details | class, status, received}`:
+/// `code`, `message` and `details` are what `await` delivers (Task 22).
+pub fn write_failed(
+    ctx: &EventCtx,
+    request_index: u32,
+    code: ErrorCode,
+    message: &str,
+    failure: &WriteFailure<'_>,
+) -> NewEvent {
     let mut m = Map::new();
     m.insert("request_index".into(), request_index.into());
+    m.insert("code".into(), code_json(code));
+    m.insert("message".into(), message.into());
     match failure {
-        WriteFailure::Response(r) => m.insert("response".into(), response_json(r)),
-        WriteFailure::Class(c) => m.insert("class".into(), (*c).into()),
-    };
+        WriteFailure::Response { response, details } => {
+            m.insert("response".into(), response_json(response));
+            m.insert("details".into(), (*details).clone());
+        }
+        WriteFailure::Class {
+            class,
+            status,
+            received,
+        } => {
+            m.insert("class".into(), (*class).into());
+            m.insert("status".into(), json!(status));
+            m.insert("received".into(), body_json(received));
+        }
+    }
     event(ctx, EventType::WRITE_FAILED, Value::Object(m))
 }
 

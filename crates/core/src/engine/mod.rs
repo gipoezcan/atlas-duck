@@ -19,8 +19,9 @@
 //! is terminal; `Engine::after_change` drops it there (every terminal path, logged or not, goes
 //! through it) together with the cached candidate (`cache`).
 //!
-//! Reads (Task 21, `read`) are dispatched right after insertion; `await` hands terminal answers
-//! over through `deliver`, which reads the committed records only.
+//! Reads (Task 21, `read`) and writes (Task 22, `write`) are dispatched right after insertion;
+//! `await` hands terminal answers over through `deliver`, which reads the committed records
+//! only.
 
 pub mod cache;
 pub mod deliver;
@@ -28,6 +29,7 @@ pub mod envelope;
 pub mod handler;
 pub mod queue;
 pub mod read;
+pub mod write;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,6 +109,8 @@ pub struct EntryState {
     pub unlogged_terminal: Option<TerminalError>,
     /// A read's release item (set when `READ_FETCHED` committed; Task 21).
     pub read: Option<read::ReadState>,
+    /// A write's params, enrichment verdict and request list (Task 22).
+    pub write: Option<write::WriteState>,
 }
 
 impl EntryState {
@@ -199,6 +203,7 @@ impl RequestEntry {
                 rebuild_failed: false,
                 unlogged_terminal: n.unlogged_terminal,
                 read: None,
+                write: None,
             }),
             status,
             ticket: Mutex::new(ticket),

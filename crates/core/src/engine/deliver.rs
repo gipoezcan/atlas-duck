@@ -1,4 +1,6 @@
-//! `await` hands a terminal request over (§4.4, §5.1 inv. 1–2, PD-23).
+//! `await` hands a terminal request over (§4.4, §5.1 inv. 1–2, PD-23). Writes (Task 22): a
+//! receipt projected from the committed `WRITE_EXECUTED` response, a refused write's capped error
+//! (both within the same 1 h window), an unknown outcome with `data {target}`.
 //!
 //! Every answer comes from the committed records, never from memory: a released read is the
 //! `READ_RELEASED` payload decrypted for this delivery, its bytes checked against
@@ -18,7 +20,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::envelope::{self, OpenStatus, RecordStatus};
-use super::{Engine, audit_failure_retryable, kind_of, status_at, terminal_of, terminal_payload};
+use super::{
+    Engine, audit_failure_retryable, kind_of, payload_json, status_at, terminal_of,
+    terminal_payload,
+};
 use crate::audit_port::AuditPort;
 use crate::lifecycle::model::Kind;
 use crate::payloads::{self, EventCtx, body_from_json, sha256_hex};
@@ -116,6 +121,23 @@ fn deliver_from_records(
         Some(t) if t.event_type == EventType::READ_RELEASED => {
             released(&headers, t, payload, &rs, now, kind)
         }
+        Some(t) if t.event_type == EventType::WRITE_EXECUTED => executed(p, start, t, &rs, now),
+        // The capped Atlassian error text of a refused write is deliverable for 1 h, like a
+        // receipt (§4.4, §11.2); a failure without details is fixed text.
+        Some(t)
+            if t.event_type == EventType::WRITE_FAILED
+                && rs.error.as_ref().is_some_and(|e| e.details.is_some())
+                && !within_window(t, now) =>
+        {
+            with_error_hash(envelope::result_evicted(&rs, false))
+        }
+        Some(t) if t.event_type == EventType::WRITE_OUTCOME_UNKNOWN => {
+            let target = write_target(p, start);
+            with_error_hash(envelope::outcome_unknown(
+                envelope::await_envelope(&rs),
+                &target,
+            ))
+        }
         _ => with_error_hash(envelope::await_envelope(&rs)),
     };
     // §5.1 inv. 1: the hand-off happens only after its `DELIVERED` committed.
@@ -144,6 +166,90 @@ fn deliver_from_records(
             audit_failure_retryable(kind),
             envelope::MSG_AUDIT_FAILURE,
         ),
+    }
+}
+
+/// Within 1 h of the decision record `t` (§4.4).
+fn within_window(t: &EventHeader, now: UtcInstant) -> bool {
+    UtcInstant::parse_rfc3339_ms(&t.ts_utc)
+        .is_some_and(|d| now.0.saturating_sub(d.0) <= DELIVERY_WINDOW_MS)
+}
+
+/// The start record's params (decrypted), if it can be read.
+fn start_params(p: &dyn AuditPort, start: &EventHeader) -> Option<Value> {
+    payload_json(p, start.seq).and_then(|mut v| v.get_mut("params").map(Value::take))
+}
+
+/// `data.target` of an `outcome_unknown` write (§4.2): the request's own `target_display`, from
+/// the plaintext `target` column (keyed writes), else from its params.
+fn write_target(p: &dyn AuditPort, start: &EventHeader) -> String {
+    if let Some(t) = &start.target {
+        return t.clone();
+    }
+    let spec = start.op_id.as_deref().and_then(atlas_duck_registry::get);
+    match (spec, start_params(p, start)) {
+        (Some(spec), Some(params)) => atlas_duck_registry::target_display(spec, &params),
+        _ => start.op_id.clone().unwrap_or_default(),
+    }
+}
+
+/// A `WRITE_EXECUTED` hand-off (§4.2, inv. 2): `data {receipt, executed_params?, edited_keys?}`,
+/// the receipt projected from the recorded response (`result_projection`, `{}` for a declared
+/// empty success), the delivery view of an edited write as recorded with it; 1 h after the
+/// decision `result_evicted` (writes: `retryable: false`). Plan decision: `DELIVERED.payload_sha256`
+/// is the SHA-256 of the JCS bytes of the delivered `data` (no `*_RELEASED` record exists).
+fn executed(
+    p: &dyn AuditPort,
+    start: &EventHeader,
+    t: &EventHeader,
+    rs: &RecordStatus,
+    now: UtcInstant,
+) -> Handoff {
+    if !within_window(t, now) {
+        return with_error_hash(envelope::result_evicted(rs, false));
+    }
+    let spec = start.op_id.as_deref().and_then(atlas_duck_registry::get);
+    let (Some(spec), Some(payload)) = (spec, payload_json(p, t.seq)) else {
+        return with_error_hash(envelope::delivery_internal(rs));
+    };
+    let body = payload
+        .get("response")
+        .and_then(|r| r.get("body"))
+        .and_then(body_from_json)
+        .unwrap_or_default();
+    let response = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    let edited = payload.get("edited") == Some(&Value::Bool(true));
+    let executed_params = payload.get("executed_params").cloned();
+    // Only `AgentLabels` reads params: the labels the agent supplied (edited ones if edited).
+    let params = match (&spec.result_projection, &executed_params) {
+        (atlas_duck_registry::Projection::AgentLabels, Some(p)) => p.clone(),
+        (atlas_duck_registry::Projection::AgentLabels, None) => {
+            start_params(p, start).unwrap_or(Value::Null)
+        }
+        _ => Value::Null,
+    };
+    let mut data = serde_json::Map::new();
+    data.insert(
+        "receipt".into(),
+        crate::ops::generic::project_receipt(spec, &response, &params),
+    );
+    if edited {
+        data.insert(
+            "executed_params".into(),
+            executed_params.unwrap_or(Value::Object(serde_json::Map::new())),
+        );
+        data.insert(
+            "edited_keys".into(),
+            payload.get("edited_keys").cloned().unwrap_or(Value::Null),
+        );
+    }
+    let data = Value::Object(data);
+    let Ok(bytes) = atlas_duck_ipc::jcs::to_jcs_vec(&data) else {
+        return with_error_hash(envelope::delivery_internal(rs));
+    };
+    Handoff {
+        payload_sha256: Sha256::digest(&bytes).into(),
+        env: envelope::write_succeeded(rs, data, edited),
     }
 }
 

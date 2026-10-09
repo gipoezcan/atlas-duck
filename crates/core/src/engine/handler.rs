@@ -8,7 +8,8 @@
 //! `request_id: null` and logs nothing. From the `REQUEST_RECEIVED` commit on, `submit` runs in
 //! its own task, so a dropped caller future (a client that went away) cannot leave a committed
 //! request unapplied: it is validated and either queued or rejected in the log regardless.
-//! Reads are dispatched to the read flow (Task 21, `read`); writes and scripts are Tasks 22/27.
+//! Reads are dispatched to the read flow (Task 21, `read`), writes to the write flow (Task 22,
+//! `write`); scripts are Task 27.
 //!
 //! `await` answers a terminal request through `Engine::deliver` (committed records only, with
 //! `DELIVERED`); `status` and `cancel` give the reduced form and never deliver.
@@ -34,7 +35,7 @@ use super::envelope::{self, OpenStatus};
 use super::queue::{AgentKey, Reservation, Ticket};
 use super::{
     Engine, NewEntry, RequestEntry, RequestHead, Session, TerminalError, audit_failure_retryable,
-    class_str, kind_of, payload_json, read,
+    class_str, kind_of, payload_json, read, write,
 };
 use crate::audit_port::commit_request_received;
 use crate::config::instances::product_str;
@@ -201,8 +202,11 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
     }
     new.validated = Some(validated);
     let entry = engine.insert(new);
-    if entry.kind() == Kind::Read {
-        read::dispatch(&engine, &entry);
+    match entry.kind() {
+        Kind::Read => read::dispatch(&engine, &entry),
+        Kind::Write => write::dispatch(&engine, &entry),
+        // Task 27: scripts.
+        Kind::Script | Kind::DryRun => {}
     }
     // 10. §4.5: nothing but the four routing fields.
     envelope::pending_envelope(
@@ -431,7 +435,13 @@ impl CoreHandler {
             );
         }
         if let Some(e) = unlogged {
-            return envelope::unlogged_envelope(&entry.head, status, &e, false);
+            let env = envelope::unlogged_envelope(&entry.head, status, &e, false);
+            // §4.2: an unknown write outcome names its target (an execution whose outcome event
+            // could not be recorded, M-8).
+            if status == atlas_duck_ipc::envelope::Status::OutcomeUnknown {
+                return envelope::outcome_unknown(env, &entry.target_display);
+            }
+            return env;
         }
         self.engine.deliver(&entry.head.request_id, conn).await
     }
