@@ -59,7 +59,7 @@ pub fn file_policy(cfg: &ConfigState) -> FilePolicy {
     }
     if let Some(item) = table.get(KEY_ANCHOR_DIR) {
         match item.as_str() {
-            Some(dir) if dir.is_empty() => p.anchor_dir = Some(None),
+            Some("") => p.anchor_dir = Some(None),
             Some(dir) => p.anchor_dir = Some(Some(dir.to_owned())),
             None => tracing::warn!("config.toml: audit.anchor_dir is malformed; ignored"),
         }
