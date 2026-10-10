@@ -31,6 +31,7 @@ use atlas_duck_registry::{
 };
 use serde_json::{Map, Value, json};
 
+use super::cancel::{Attempt, CancelCause};
 use super::envelope::{self, OpenStatus};
 use super::queue::{AgentKey, Reservation, Ticket};
 use super::{
@@ -202,6 +203,7 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
     }
     new.validated = Some(validated);
     let entry = engine.insert(new);
+    engine.arm_expiry(&entry);
     match entry.kind() {
         Kind::Read => read::dispatch(&engine, &entry),
         Kind::Write => write::dispatch(&engine, &entry),
@@ -826,14 +828,16 @@ impl RequestHandler for CoreHandler {
     async fn cancel(&self, request_id: &str) -> Envelope {
         // §4.4/§4.5: a cancel never says more than `status` would, apart from its own outcome;
         // deny reasons and error details come only from `await`.
-        let Some(entry) = self.engine.entry(request_id) else {
-            return self.records_answer(request_id, true).await;
-        };
-        match self.engine.cancel_by_client(&entry).await {
-            Ok(_) => envelope::cancelled_by_client(&entry.head),
-            // Not cancellable (executing, already terminal) or the append failed: the current
+        match self
+            .engine
+            .cancel_awaited(request_id, CancelCause::Client)
+            .await
+        {
+            Attempt::Ended(env) => *env,
+            // Not cancellable (executing, already terminal), or the append failed: the current
             // status.
-            Err(_) => self.entry_answer(&entry, true).await,
+            Attempt::Unchanged(entry) => self.entry_answer(&entry, true).await,
+            Attempt::Gone | Attempt::Busy => self.records_answer(request_id, true).await,
         }
     }
 

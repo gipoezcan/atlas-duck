@@ -48,7 +48,9 @@ use super::read::{
     MSG_IDENTITY, MSG_NEEDS_TOKEN, class_name, connection_message, error_text, unavailable_message,
     unavailable_name,
 };
-use super::{Engine, EntryState, InstanceHttp, OnAuditFailure, RequestEntry, TransitionError};
+use super::{
+    Engine, EntryState, InFlight, InstanceHttp, OnAuditFailure, RequestEntry, TransitionError,
+};
 use crate::edit::EditedKeys;
 use crate::gate::{AttentionKind, UiEvent};
 use crate::instances::InstanceState;
@@ -1123,12 +1125,18 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         };
         let n = calls.len();
         for (i, (purpose, call)) in calls.into_iter().enumerate() {
-            let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
             let purpose = match (refreshing, purpose) {
                 (true, _) => PreviewFetchPurpose::Refresh,
                 (false, EnrichPurpose::Enrich) => PreviewFetchPurpose::Enrich,
                 (false, EnrichPurpose::Resolve) => PreviewFetchPurpose::Resolve,
             };
+            // A cancel while this GET is in flight records it (`cancelled_in_flight`, Task 24).
+            entry.set_in_flight(Some(InFlight {
+                purpose,
+                path: call_path(http.client.base(), &call),
+            }));
+            let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
+            entry.set_in_flight(None);
             let record = get_record(&entry.ctx, purpose, http.client.base(), &call, &outcome);
             let got = if refreshing {
                 recheck(outcome).map_err(Err)
@@ -1441,7 +1449,12 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
 
     // (a) The identity call, for every write op (§5.4 step 5).
     let call = identity_call(spec.product);
+    entry.set_in_flight(Some(InFlight {
+        purpose,
+        path: call_path(base, &call),
+    }));
     let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
+    entry.set_in_flight(None);
     let mut last = get_record(&entry.ctx, purpose, base, &call, &outcome);
     if let Err(fail) = identity_check(outcome, spec.product, &identity.atlassian_user_key) {
         stale_fail(engine, entry, approval, Some(last), fail).await;
@@ -1463,7 +1476,12 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
             {
                 return;
             }
+            entry.set_in_flight(Some(InFlight {
+                purpose,
+                path: call_path(base, &call),
+            }));
             let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
+            entry.set_in_flight(None);
             last = get_record(&entry.ctx, purpose, base, &call, &outcome);
             match recheck(outcome) {
                 Ok(v) => bodies.push(v),

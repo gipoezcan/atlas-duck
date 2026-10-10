@@ -138,6 +138,8 @@ pub struct TestHooks {
     pub read_budget: Option<atlas_duck_atlassian::ReadBudget>,
     /// A read holds before it asks for a fetch slot (it stays in `Validated`).
     pub pause_before_fetch: Option<Arc<Pause>>,
+    /// Replaces the request expiry (`[requests] expiry_hours`, default 24 h; Task 24).
+    pub expiry: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "testing")]
@@ -213,6 +215,7 @@ impl Core {
             limits,
             runtime: tokio::runtime::Handle::current(),
             similarity,
+            expiry: crate::config::requests::expiry(&config),
             #[cfg(feature = "testing")]
             hooks: opts.hooks,
         }));

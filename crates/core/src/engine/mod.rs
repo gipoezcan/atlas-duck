@@ -24,6 +24,7 @@
 //! only.
 
 pub mod cache;
+pub mod cancel;
 pub mod deliver;
 pub mod envelope;
 pub mod handler;
@@ -54,11 +55,10 @@ use crate::gate::{UiEvent, UiSink};
 use crate::http_factory::{HttpFactory, InstanceHttpSpec};
 use crate::instances::InstanceTable;
 use crate::lifecycle::model::{
-    Applied, CancelReason, Event, Kind, Model, Phase, Rejection, Terminal, agent_status,
-    is_pending, step,
+    Applied, Event, Kind, Model, Phase, Rejection, Terminal, agent_status, is_pending, step,
 };
 use crate::normalize::NormalizedHello;
-use crate::payloads::{self, EventCtx};
+use crate::payloads::{EventCtx, PreviewFetchPurpose};
 use crate::proxy::ResolvedProxy;
 use crate::redact::RedactionOp;
 use crate::similarity::{SimOutcome, SimRecord, SimilarityIndex, sim_key};
@@ -112,6 +112,10 @@ pub struct EntryState {
     pub read: Option<read::ReadState>,
     /// A write's params, enrichment verdict and request list (Task 22).
     pub write: Option<write::WriteState>,
+    /// The expiry timer fired while the model could not expire (`StaleCheck`, `Executing`,
+    /// `Running`, `DryRunning`; Task 12 review I-4): the request expires as soon as it is in a
+    /// phase that can ([`Engine::transition`] re-checks).
+    pub expiry_due: bool,
 }
 
 impl EntryState {
@@ -154,6 +158,16 @@ pub struct RequestEntry {
     /// The cancel handle and capture of the read in flight (Task 24 aborts through it); dropped
     /// once `READ_FETCHED` is committed and at terminal.
     fetch: Mutex<Option<FetchControl>>,
+    /// The app-initiated GET of a write in flight (purpose and resolved path): what a
+    /// `cancelled_in_flight` record of it names (Task 24).
+    in_flight: Mutex<Option<InFlight>>,
+}
+
+/// The GET a write's control is currently running (`PREVIEW_FETCH` `purpose` and `path`).
+#[derive(Debug, Clone)]
+pub(crate) struct InFlight {
+    pub purpose: PreviewFetchPurpose,
+    pub path: String,
 }
 
 /// The parts of a new entry the handler fills in.
@@ -205,11 +219,13 @@ impl RequestEntry {
                 unlogged_terminal: n.unlogged_terminal,
                 read: None,
                 write: None,
+                expiry_due: false,
             }),
             status,
             ticket: Mutex::new(ticket),
             gate: Arc::new(tokio::sync::Mutex::new(())),
             fetch: Mutex::new(None),
+            in_flight: Mutex::new(None),
         }
     }
 
@@ -261,7 +277,20 @@ impl RequestEntry {
     }
 
     fn set_fetch_control(&self, ctl: Option<FetchControl>) {
+        if ctl.is_none() {
+            *lock(&self.in_flight) = None;
+        }
         *lock(&self.fetch) = ctl;
+    }
+
+    /// A write's GET starts (`Some`) or ended (`None`): only a GET that is in flight gets a
+    /// `cancelled_in_flight` record.
+    pub(crate) fn set_in_flight(&self, f: Option<InFlight>) {
+        *lock(&self.in_flight) = f;
+    }
+
+    pub(crate) fn in_flight(&self) -> Option<InFlight> {
+        lock(&self.in_flight).clone()
     }
 
     fn publish(&self) {
@@ -411,6 +440,9 @@ impl Prepared {
     }
 }
 
+/// One entry's held transition gate: proof for the gated sections ([`Engine::cancel_locked`]).
+pub(crate) type GateGuard = tokio::sync::OwnedMutexGuard<()>;
+
 /// Held transition gates ([`Engine::lock_gates`]): proof for [`Engine::commit_batch`]. The field
 /// is never read: holding the guards is its whole purpose (dropping `Gates` releases them).
 pub(crate) struct Gates(#[allow(dead_code)] Vec<tokio::sync::OwnedMutexGuard<()>>);
@@ -451,6 +483,8 @@ pub struct EngineDeps {
     pub runtime: tokio::runtime::Handle,
     /// "Possible duplicate" / "similar request" (§5.6); Task 28 passes the seeded one.
     pub similarity: SimilarityIndex,
+    /// §4.4: how long a request may stay pending (`[requests] expiry_hours`, default 24 h).
+    pub expiry: Duration,
     #[cfg(feature = "testing")]
     pub hooks: crate::core::TestHooks,
 }
@@ -523,6 +557,7 @@ pub struct Engine {
     clients: Mutex<HashMap<String, Arc<InstanceHttp>>>,
     runtime: tokio::runtime::Handle,
     similarity: SimilarityIndex,
+    expiry: Duration,
     /// L43: one batch dialog at a time; a second `decide_batch` waits here. One `Core` per
     /// process, so this is the process-wide gate PD-13 names.
     batch_dialog: tokio::sync::Mutex<()>,
@@ -535,6 +570,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(d: EngineDeps) -> Engine {
+        #[cfg(feature = "testing")]
+        let expiry = d.hooks.expiry.unwrap_or(d.expiry);
+        #[cfg(not(feature = "testing"))]
+        let expiry = d.expiry;
         Engine {
             port: d.port,
             committed: d.committed,
@@ -558,6 +597,7 @@ impl Engine {
             clients: Mutex::new(HashMap::new()),
             runtime: d.runtime,
             similarity: d.similarity,
+            expiry,
             batch_dialog: tokio::sync::Mutex::new(()),
             needs_attention: Mutex::new(BTreeSet::new()),
             #[cfg(feature = "testing")]
@@ -652,6 +692,11 @@ impl Engine {
         self.instances
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// §4.4: how long a request may stay pending.
+    pub fn expiry(&self) -> Duration {
+        self.expiry
     }
 
     pub fn limits(&self) -> &Limits {
@@ -933,7 +978,7 @@ impl Engine {
         A: FnOnce(&mut EntryState),
         G: Fn(&Model) -> bool,
     {
-        let _gate = entry.gate.clone().lock_owned().await;
+        let gate = entry.gate.clone().lock_owned().await;
         let prepared = {
             let st = entry.state();
             if !guard(&st.model) {
@@ -965,6 +1010,12 @@ impl Engine {
         }
         let applied = prepared.apply(entry, event, on_apply, guard);
         self.after_change(entry);
+        // Task 12 review I-4: a request whose timer fired while its phase could not expire (or
+        // whose time is up) expires the moment it is back in a phase that can, under this same
+        // gate, so no decision can be taken on the new revision first.
+        if applied.is_ok() {
+            self.expire_if_due(entry, &gate);
+        }
         applied
     }
 
@@ -1159,31 +1210,6 @@ impl Engine {
         }
     }
 
-    /// PD-14: the expiry path (the timer arrives with Task 24, which replaces this with
-    /// `cancel_now(.., Expiry)` and its in-flight capture). `false` if the id is not pending here.
-    pub async fn expire_now(self: &Arc<Self>, request_id: &str) -> bool {
-        let Some(entry) = self.entry(request_id) else {
-            return false;
-        };
-        let ctx = entry.ctx.clone();
-        self.transition(&entry, Event::Expire, move |_| payloads::expired(&ctx))
-            .await
-            .is_ok()
-    }
-
-    /// `cancel` by the client (§4.4) for the phases Task 19 reaches; Task 24 replaces it with the
-    /// synchronous `cancel_now` and its in-flight records (and must keep the transition gate).
-    pub(crate) async fn cancel_by_client(
-        self: &Arc<Self>,
-        entry: &Arc<RequestEntry>,
-    ) -> Result<Applied, TransitionError> {
-        let ctx = entry.ctx.clone();
-        self.transition(entry, Event::Cancel(CancelReason::ByClient), move |_| {
-            payloads::cancelled(&ctx, CancelReason::ByClient)
-        })
-        .await
-    }
-
     /// The request's status as its committed records say (§4.4): `None` for an id the log does
     /// not know. Decrypts only the rows whose meaning depends on their payload, and a recorded
     /// terminal only once (memoized: it can no longer change).
@@ -1210,7 +1236,34 @@ impl Engine {
                 found
             }
         };
-        Ok(found.map(|(rs, instance_id)| {
+        Ok(self.with_alias(found))
+    }
+
+    /// [`Engine::status_from_records`] without an await, for the synchronous cancel path.
+    pub(crate) fn status_from_records_sync(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<RecordStatus>, AuditError> {
+        let memo = lock(&self.terminal_status).get(request_id);
+        let found = match memo {
+            Some(hit) => Some(hit),
+            None => {
+                let headers = self.port.headers_for_request(request_id)?;
+                let found = records_status(&*self.port, &headers)?;
+                if let Some(rs) = &found
+                    && OpenStatus::of(rs.0.status).is_none()
+                {
+                    lock(&self.terminal_status).insert(request_id, rs.clone());
+                }
+                found
+            }
+        };
+        Ok(self.with_alias(found))
+    }
+
+    /// The start record's instance id as the alias it still has.
+    fn with_alias(&self, found: Option<(RecordStatus, Option<String>)>) -> Option<RecordStatus> {
+        found.map(|(rs, instance_id)| {
             let alias = instance_id
                 .as_deref()
                 .and_then(|id| self.instances().by_id(id).map(|i| i.alias.clone()));
@@ -1218,7 +1271,7 @@ impl Engine {
                 instance: alias,
                 ..rs
             }
-        }))
+        })
     }
 }
 

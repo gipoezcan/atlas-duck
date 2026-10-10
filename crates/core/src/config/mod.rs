@@ -18,6 +18,7 @@
 pub mod instances;
 pub mod limits;
 mod migrate;
+pub mod requests;
 
 use std::ffi::OsString;
 use std::fmt;
