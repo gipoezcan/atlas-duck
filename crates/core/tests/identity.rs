@@ -5,7 +5,7 @@
 //! changes nothing the human saw.
 //!
 //! Identity checks (Task 26, I-23 JSON-401 case, I-28, I-29, I-30 later half, I-32): the
-//! per-response X-AUSERNAME check, 	oken_recheck, rename reconciliation, the identity-header
+//! per-response X-AUSERNAME check, `token_recheck`, rename reconciliation, the identity-header
 //! states and identity_mismatch writes.
 
 mod common;
