@@ -825,12 +825,14 @@ async fn i31_ca_swapped_after_start_uses_the_confirmed_bytes() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i31_ca_swapped_before_start_is_not_trusted() -> TestResult {
-    let (mut h, tls) = tls_harness(None).await?;
+    // The confirmed CA is some other one; the file is then swapped for the CA that WOULD make the
+    // handshake work. Trusting it would be the breach, so a handshake is the failure signal.
+    let (mut h, tls) = tls_harness(Some(generate_ca_pem()?)).await?;
     let id = instance_id(&h, "tls")?;
     let confirmed = setting_of(&h, &id)
         .and_then(|p| p.ca_fingerprint)
         .ok_or("no confirmed CA fingerprint")?;
-    let other = generate_ca_pem()?;
+    let other = tls.ca_pem().to_owned();
     std::fs::write(ca_path_in(&h.config_path())?, &other)?;
     h.restart().await?;
     read_settles(&h, &tls).await?;
@@ -873,14 +875,15 @@ async fn i31_ca_unreadable_at_start_is_never_trusted_later() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i31_file_side_ca_and_proxy_edits_not_applied() -> TestResult {
-    let (mut h, tls) = tls_harness(None).await?;
+    // Confirmed: some other CA; the file edit names the server's own (unconfirmed) one.
+    let (mut h, tls) = tls_harness(Some(generate_ca_pem()?)).await?;
     let id = instance_id(&h, "tls")?;
     let fp = setting_of(&h, &id)
         .and_then(|p| p.ca_fingerprint)
         .ok_or("no confirmed CA fingerprint")?;
     let config = h.config_path();
     let old_path = ca_path_in(&config)?;
-    let other = generate_ca_pem()?;
+    let other = tls.ca_pem().to_owned();
     let other_path = old_path.with_file_name("other.pem");
     std::fs::write(&other_path, &other)?;
     let text = std::fs::read_to_string(&config)?
