@@ -56,6 +56,7 @@ use crate::edit::EditedKeys;
 use crate::gate::{AttentionKind, UiEvent};
 use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
+use crate::instances::admin::shown;
 use crate::lifecycle::model::{
     Applied, Event, ExecOutcome, Hold, InstanceEvt, Model, Phase, Rejection, StaleReason,
     is_pending, step,
@@ -309,9 +310,11 @@ fn returned_warning(r: &Returned, executes_as: Option<&str>) -> Option<Warning> 
             WarningId::InstanceUrlChanged,
             warning::instance_url_changed(old, new),
         ),
-        Returned::UserRenamed { old, new } => {
-            Warning::new(WarningId::UserRenamed, warning::user_renamed(old, new))
-        }
+        // Server-supplied names reach the approver escaped and capped (review I-3).
+        Returned::UserRenamed { old, new } => Warning::new(
+            WarningId::UserRenamed,
+            warning::user_renamed(&shown(old), &shown(new)),
+        ),
         Returned::VersionConflict
         | Returned::Instance(InstanceEvt::InstanceChanged | InstanceEvt::UserRenamed) => {
             return None;
@@ -345,6 +348,9 @@ pub(crate) fn preview_model(
     hold: Hold,
     executes_as: Option<&str>,
 ) -> PreviewModel {
+    // The name comes from the server (a connection test, a rename): escaped for display (I-3).
+    let executes_as = executes_as.map(shown);
+    let executes_as = executes_as.as_deref();
     let previewer = op_table()
         .get(spec.id)
         .map_or(write_preview as crate::ops::PreviewerFn, |o| o.previewer);
@@ -2006,6 +2012,12 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
                 if let Err(fail) =
                     identity_check(outcome, spec.product, &identity.atlassian_user_key)
                 {
+                    // A parsed answer for another user (or an anonymous one) is the §7.1
+                    // trigger the identity call itself is the only place to notice for
+                    // Confluence: the token re-check runs and decides the instance state.
+                    if fail == (StaleReason::IdentityMismatch, None) {
+                        let _ = identity::recheck(engine, &entry.instance_id, seen).await;
+                    }
                     stale_fail(engine, entry, approval, Some(record), fail).await;
                     return;
                 }
@@ -2223,6 +2235,21 @@ async fn settle_execution(
             ..
         }
     );
+    // A write's JSON 401 is `needs_token` only when the token re-check fails too (§7.1, I-23);
+    // otherwise it is an ordinary upstream error. The write is terminal either way.
+    let needs_token = if matches!(outcome, WriteOutcome::NeedsToken) {
+        let result = identity::recheck(engine, &entry.instance_id, seen).await;
+        matches!(
+            identity::effect(
+                identity::Path::WriteResponse,
+                identity::Trigger::Json401,
+                &result
+            ),
+            identity::Effect::NeedsToken
+        )
+    } else {
+        false
+    };
     let failed = |index: u32, code: ErrorCode, message: &str, class: &str| {
         payloads::write_failed(
             &ctx,
@@ -2308,6 +2335,21 @@ async fn settle_execution(
                 ErrorCode::UpstreamUnavailable,
                 MSG_WRITE_REDIRECT,
                 "redirect",
+            ),
+            Some(AttentionKind::Failed),
+        ),
+        WriteOutcome::NeedsToken if !needs_token => (
+            Event::Executed(ExecOutcome::Failed),
+            payloads::write_failed(
+                &ctx,
+                index0,
+                ErrorCode::UpstreamHttp,
+                MSG_WRITE_REFUSED,
+                &WriteFailure::Class {
+                    class: "http_401",
+                    status: Some(401),
+                    received,
+                },
             ),
             Some(AttentionKind::Failed),
         ),

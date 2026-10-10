@@ -279,7 +279,7 @@ impl CoreInstances {
             product: i.product,
             origin: i.base.as_ref().map(NormalizedBaseUrl::as_str),
             state: i.state.as_str(),
-            executes_as: i.identity.as_ref().map(|id| id.atlassian_user.clone()),
+            executes_as: i.identity.as_ref().map(|id| shown(&id.atlassian_user)),
             expires_at: i.expires_at.map(|d| d.format("%Y-%m-%d").to_string()),
             pac_configured: resolved.uses_os && resolved.pac_configured,
             proxy_effective: Some(resolved.effective),

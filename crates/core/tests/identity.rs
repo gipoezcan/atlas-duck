@@ -1051,3 +1051,216 @@ async fn i32_base_url_change_restales_pending_update() -> TestResult {
     );
     Ok(())
 }
+
+// ---- Task 26 fix round -----------------------------------------------------------------------------
+
+/// Review I-1: a Confluence token that now answers `type: anonymous` fails the stale check's
+/// identity call; the token re-check follows and the instance needs its token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i28_confluence_stale_identity_failure_sets_needs_token() -> TestResult {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let mock = h.mock("wiki").ok_or("mock")?;
+    page_server(mock).await;
+    let params = json!({
+        "id": "65537", "base_version": 5, "body": "<p>New text.</p>", "body_format": "storage"
+    });
+    let id = request_id(&h.submit("confluence.page.update", params).await)?;
+    let item = h.queued(&id, 10_000).await.ok_or("never queued")?;
+    assert!(item.approvable);
+    h.approver().open(&id).map_err(de)?;
+    let rev = h.approver().rev(&id).map_err(de)?.counter;
+    // The token stopped resolving: the server now calls the caller anonymous.
+    mock.server().reset().await;
+    mock.confluence_user_current(atlas_duck_atlassian::testing::UserKind::Anonymous, "", "")
+        .await;
+    h.approver().approve(&id).map_err(de)?;
+    let after = item_after(&h, &id, rev).await?;
+    assert!(!after.approvable);
+    assert_eq!(stale_reasons(&h, &id).await?, [json!("identity_mismatch")]);
+    assert_eq!(puts(mock).await, 0, "nothing was sent");
+    assert_eq!(state_of(&h), "needs_token");
+    assert_eq!(rechecks(&h, "start").await?.len(), 1);
+    Ok(())
+}
+
+/// A POST that answers a JSON 401 for `comment`; `myself` answers as the user once (the stale
+/// check), then as `then`.
+async fn write_401(mock: &MockDc, then: XAuser) {
+    mock.server().reset().await;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/myself")))
+        .respond_with(
+            mock.response(200)
+                .insert_header("X-AUSERNAME", TEST_USER)
+                .set_body_raw(
+                    fixtures::jira_myself(TEST_USER, TEST_USER_KEY),
+                    "application/json",
+                ),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, then).await;
+    Mock::given(method("POST"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1/comment")))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("X-AUSERNAME", "anonymous")
+                .set_body_raw(
+                    r#"{"errorMessages":["You are not authenticated"],"errors":{}}"#,
+                    "application/json",
+                ),
+        )
+        .mount(mock.server())
+        .await;
+}
+
+async fn approve_with_401(h: &Harness, then: XAuser) -> Result<(i32, String), TestError> {
+    let mock = jira(h)?;
+    answers_as(mock, TEST_USER, TEST_USER_KEY).await;
+    let id = queued_comment(h).await?;
+    h.approver().open(&id).map_err(de)?;
+    write_401(mock, then).await;
+    h.approver().approve(&id).map_err(de)?;
+    assert!(h.settled(&id, 10_000).await, "never settled");
+    let env = h.await_(&id, 1000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    Ok((exit(&env), code(&env)))
+}
+
+/// Review I-2: a write's JSON 401 is `needs_token` only when the re-check fails too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_write_json401_with_a_failing_recheck_needs_token() -> TestResult {
+    let h = Harness::jira().await?;
+    let (exit, code) = approve_with_401(&h, XAuser::Anonymous).await?;
+    assert_eq!((exit, code.as_str()), (9, "needs_token"));
+    assert_eq!(state_of(&h), "needs_token");
+    assert_eq!(rechecks(&h, "start").await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_write_json401_with_a_passing_recheck_is_an_ordinary_error() -> TestResult {
+    let h = Harness::jira().await?;
+    let (_, code) = approve_with_401(&h, XAuser::Same).await?;
+    assert_ne!(code, "needs_token");
+    assert_eq!(state_of(&h), "ok");
+    assert_eq!(rechecks(&h, "start").await?.len(), 1);
+    let failed = h.events_of(EventType::WRITE_FAILED).await?;
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["status"], 401);
+    Ok(())
+}
+
+/// A username with a bidi override and a line break (the header carries the percent-encoded
+/// form, as Jira does for non-ASCII names).
+const EVIL: &str = "jd\u{202E}oe2\nTrusted";
+const EVIL_HEADER: &str = "jd%E2%80%AEoe2%0ATrusted";
+
+fn assert_plain(text: &str) {
+    assert!(
+        !text.contains('\u{202E}') && !text.contains('\n'),
+        "unescaped server name in {text:?}"
+    );
+}
+
+async fn myself_named(mock: &MockDc, name: &str, header: &str, key: &str) {
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/myself")))
+        .respond_with(
+            mock.response(200)
+                .insert_header("X-AUSERNAME", header)
+                .set_body_raw(fixtures::jira_myself(name, key), "application/json"),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/serverInfo")))
+        .respond_with(
+            mock.response(200)
+                .insert_header("X-AUSERNAME", header)
+                .set_body_raw(fixtures::jira_server_info("9.12.0"), "application/json"),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+}
+
+/// Review I-3: server-supplied names are escaped in the rename caution, "executes as" and the
+/// other-user note.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_names_are_escaped_in_approver_text() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    answers_as(mock, TEST_USER, TEST_USER_KEY).await;
+    let id = queued_comment(&h).await?;
+    h.approver().open(&id).map_err(de)?;
+    let before = h.approver().item(&id).ok_or("not queued")?;
+    myself_named(mock, EVIL, EVIL_HEADER, TEST_USER_KEY).await;
+    h.instances().retest_token("jira-main").await?;
+    item_after(&h, &id, before.candidate_rev.counter).await?;
+    wait_approvable(&h, &id).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let caution = preview
+        .warnings
+        .iter()
+        .find(|w| format!("{:?}", w.id) == "UserRenamed")
+        .ok_or("no user_renamed caution")?;
+    assert_plain(&caution.text);
+    assert_plain(preview.header.executes_as.as_deref().ok_or("executes as")?);
+    let view = h.instances().list().into_iter().next().ok_or("no view")?;
+    assert_plain(view.executes_as.as_deref().ok_or("view executes as")?);
+    // Another user's key: the note names the name the server sent.
+    mock.server().reset().await;
+    myself_named(mock, EVIL, EVIL_HEADER, "JIRAUSER9").await;
+    let res = h.instances().retest_token("jira-main").await;
+    assert!(matches!(res, Err(AdminError::ConnectionFailed(_))), "{res:?}");
+    let view = h.instances().list().into_iter().next().ok_or("no view")?;
+    let note = view.note.ok_or("no note")?;
+    assert!(note.contains("token now resolves to"), "{note}");
+    assert_plain(&note);
+    Ok(())
+}
+
+/// Review I-4: a rename judged on the old credential never labels another user's credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rename_does_not_label_a_replaced_credential() -> TestResult {
+    let h = Harness::jira().await?;
+    let sid = h.instance("jira-main").ok_or("instance")?.id.clone();
+    // The stored credential is JIRAUSER1/jdoe; the rename was judged for another key.
+    atlas_duck_core::identity::apply_rename(h.engine(), &sid, "bob", "bobby", "JIRAUSER9").await;
+    let stored = h.credentials().load(&sid)?.ok_or("no token")?;
+    assert_eq!(stored.identity.atlassian_user, TEST_USER);
+    let view = h.instances().list().into_iter().next().ok_or("no view")?;
+    assert_eq!(view.executes_as.as_deref(), Some(TEST_USER));
+    Ok(())
+}
+
+/// Review M-1: a keychain that cannot store the new name records the rename once, not once per
+/// answer, and the runtime keeps the stored name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_rename_store_records_once() -> TestResult {
+    let h = Harness::jira().await?;
+    renamed(jira(&h)?).await;
+    h.credentials().fail_store(true);
+    for _ in 0..3 {
+        let id = submit_read(&h).await?;
+        assert!(h.settled(&id, 10_000).await, "never settled");
+    }
+    let renames = state_changes(&h)
+        .await?
+        .into_iter()
+        .filter(|c| c["state"] == "user_renamed")
+        .count();
+    assert_eq!(renames, 1, "one record, not one per answer");
+    let view = h.instances().list().into_iter().next().ok_or("no view")?;
+    assert_eq!(view.executes_as.as_deref(), Some(TEST_USER));
+    assert!(view.note.is_some(), "the failure is surfaced");
+    Ok(())
+}

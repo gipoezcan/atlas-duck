@@ -301,6 +301,9 @@ struct Gate {
     /// The result that last bumped `epoch`, with the epoch it produced.
     last_change: Option<(u64, RecheckResult)>,
     in_flight: Option<Arc<OnceCell<RecheckResult>>>,
+    /// A rename (`user_key`, new name) that is recorded but could not be stored in the
+    /// keychain: the next answer under the new name does not record it again (review M-1).
+    unstored_rename: Option<(String, String)>,
 }
 
 /// The per-instance gates of [`recheck`].
@@ -312,6 +315,19 @@ pub(crate) struct Gates {
 impl Gates {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Gate>> {
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn unstored_rename(&self, instance_id: &str) -> Option<(String, String)> {
+        self.lock()
+            .get(instance_id)
+            .and_then(|g| g.unstored_rename.clone())
+    }
+
+    fn set_unstored_rename(&self, instance_id: &str, rename: Option<(String, String)>) {
+        self.lock()
+            .entry(instance_id.to_owned())
+            .or_default()
+            .unstored_rename = rename;
     }
 
     /// The instance's epoch: a caller reads it before its fetch and passes it to [`recheck`].
@@ -434,7 +450,12 @@ async fn run(engine: &Arc<Engine>, instance_id: &str) -> RecheckResult {
 
 /// The settings-window note of an instance that needs its token again.
 fn token_note(other_user: Option<&str>) -> Option<String> {
-    other_user.map(|u| format!("token now resolves to {u}"))
+    other_user.map(|u| {
+        format!(
+            "token now resolves to {}",
+            crate::instances::admin::shown(u)
+        )
+    })
 }
 
 /// Applies a re-check result to the instance (§7.1, §7.2): the `INSTANCE_STATE_CHANGED` record
@@ -503,10 +524,20 @@ async fn apply_state(
         .await;
 }
 
-/// `INSTANCE_STATE_CHANGED {user_renamed: {old, new, user_key}}` and, in the same step, the new
-/// name in the stored credential and the runtime table; then every queued write of the instance
+/// What became of the stored name of a rename.
+enum RenameStore {
+    Stored,
+    /// The stored credential belongs to another user key now: not ours to label (review I-4).
+    Replaced,
+    Failed,
+}
+
+/// `INSTANCE_STATE_CHANGED {user_renamed: {old, new, user_key}}` and, once the new name is
+/// stored in the credential, in the runtime table too; then every queued write of the instance
 /// is refreshed (`WRITE_STALE {user_renamed}`). Token and key are unchanged: no
-/// `CREDENTIAL_CHANGED`.
+/// `CREDENTIAL_CHANGED`. A name that cannot be stored (keychain failure) is recorded once, the
+/// runtime keeps the stored name, the instance carries a note, and the store is retried by the
+/// next rename answer; a credential of another user key is left alone.
 pub async fn apply_rename(
     engine: &Arc<Engine>,
     instance_id: &str,
@@ -514,36 +545,69 @@ pub async fn apply_rename(
     new: &str,
     user_key: &str,
 ) {
-    let mut details = Map::new();
-    details.insert("old".into(), old.into());
-    details.insert("new".into(), new.into());
-    details.insert("user_key".into(), user_key.into());
-    let record = payloads::instance_state_changed(instance_id, "user_renamed", &details);
-    if engine
-        .blocking(move |p| p.append(record).map(|_| ()))
-        .await
-        .is_err()
-    {
-        return;
+    let attempt = (user_key.to_owned(), new.to_owned());
+    let recorded = engine
+        .identity_gates()
+        .unstored_rename(instance_id)
+        .as_ref()
+        == Some(&attempt);
+    if !recorded {
+        let mut details = Map::new();
+        details.insert("old".into(), old.into());
+        details.insert("new".into(), new.into());
+        details.insert("user_key".into(), user_key.into());
+        let record = payloads::instance_state_changed(instance_id, "user_renamed", &details);
+        if engine
+            .blocking(move |p| p.append(record).map(|_| ()))
+            .await
+            .is_err()
+        {
+            return;
+        }
     }
-    let (creds, id, name) = (
+    let (creds, id, name, key) = (
         engine.credentials().clone(),
         instance_id.to_owned(),
         new.to_owned(),
+        user_key.to_owned(),
     );
-    // A keychain that cannot be written leaves the old name stored: the next answer under the
-    // new name runs the re-check again and lands here again.
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Ok(Some(mut cred)) = creds.load(&id) {
+    let stored = tokio::task::spawn_blocking(move || match creds.load(&id) {
+        Ok(Some(mut cred)) if cred.identity.atlassian_user_key == key => {
             cred.identity.atlassian_user = name;
-            let _ = creds.store(&id, cred);
+            match creds.store(&id, cred) {
+                Ok(()) => RenameStore::Stored,
+                Err(_) => RenameStore::Failed,
+            }
         }
+        Ok(_) => RenameStore::Replaced,
+        Err(_) => RenameStore::Failed,
     })
-    .await;
+    .await
+    .unwrap_or(RenameStore::Failed);
+    match stored {
+        RenameStore::Replaced => return,
+        RenameStore::Failed => {
+            engine
+                .identity_gates()
+                .set_unstored_rename(instance_id, Some(attempt));
+            engine.update_instance(instance_id, |rt| {
+                if rt.state == InstanceState::Ok {
+                    rt.note = Some(NOTE_RENAME_NOT_STORED.to_owned());
+                }
+            });
+            return;
+        }
+        RenameStore::Stored => engine
+            .identity_gates()
+            .set_unstored_rename(instance_id, None),
+    }
     let name = new.to_owned();
     engine.update_instance(instance_id, |rt| {
         if let Some(identity) = rt.identity.as_mut() {
             identity.atlassian_user = name;
+        }
+        if rt.note.as_deref() == Some(NOTE_RENAME_NOT_STORED) {
+            rt.note = None;
         }
     });
     engine
@@ -556,6 +620,9 @@ pub async fn apply_rename(
         )
         .await;
 }
+
+const NOTE_RENAME_NOT_STORED: &str =
+    "the new Atlassian username could not be saved to the keychain";
 
 #[cfg(test)]
 mod tests {
