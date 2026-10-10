@@ -84,6 +84,7 @@ pub fn app_start_event(
     cfg: &ConfigState,
     effective_proxy: Map<String, Value>,
     similarity_seed_skipped: u64,
+    similarity_seed_failed: bool,
     pats_deleted: &[String],
 ) -> NewEvent {
     let mut extra = extra.clone();
@@ -102,6 +103,9 @@ pub fn app_start_event(
             "similarity_seed_skipped".into(),
             json!(similarity_seed_skipped),
         );
+    }
+    if similarity_seed_failed {
+        extra.insert("similarity_seed_failed".into(), Value::Bool(true));
     }
     payloads::app_start(install_id, &extra)
 }

@@ -9,6 +9,7 @@
 //! (and only on this one). Writes that are `executing` are waited for (their own flow logs the
 //! outcome) for at most the 60 s that the write call is bounded by.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,29 +69,36 @@ async fn cancel_round(engine: &Arc<Engine>, cause: CancelCause) -> u32 {
     ended
 }
 
-/// §2.5 steps 2-4.
-pub(crate) async fn sweep(engine: &Arc<Engine>, why: CancelWhy, write_wait: Duration) -> Swept {
-    let cause = CancelCause::Shutdown(why);
-    let mut swept = Swept {
-        cancelled: cancel_round(engine, cause).await,
-        writes_waited: 0,
-    };
-    let mut waiting: Vec<_> = engine
+/// The writes that are `executing` now.
+fn executing(engine: &Arc<Engine>) -> Vec<Arc<crate::engine::RequestEntry>> {
+    engine
         .pending_entries()
         .into_iter()
         .filter(|e| phase_of(e) == Phase::Executing)
-        .collect();
-    swept.writes_waited = u32::try_from(waiting.len()).unwrap_or(u32::MAX);
+        .collect()
+}
+
+/// §2.5 steps 2-4. The waiting set is listed again on every poll: a write that a version
+/// conflict sent back to the queue and that was approved again can become `executing` during the
+/// wait, and is waited for like the others.
+pub(crate) async fn sweep(engine: &Arc<Engine>, why: CancelWhy, write_wait: Duration) -> Swept {
+    let cause = CancelCause::Shutdown(why);
+    let mut swept = Swept::default();
+    let mut seen: HashSet<String> = HashSet::new();
     let deadline = Instant::now() + write_wait;
-    while !waiting.is_empty() && Instant::now() < deadline {
-        waiting.retain(|e| phase_of(e) == Phase::Executing);
-        if !waiting.is_empty() {
-            tokio::time::sleep(POLL).await;
+    loop {
+        swept.cancelled += cancel_round(engine, cause).await;
+        let running = executing(engine);
+        seen.extend(running.iter().map(|e| e.head.request_id.clone()));
+        if running.is_empty() || Instant::now() >= deadline {
+            break;
         }
+        tokio::time::sleep(POLL).await;
     }
     // A write that came back to the queue (a version conflict) or a request that arrived while
     // the sweep ran is not executing any more: it ends here too.
     swept.cancelled += cancel_round(engine, cause).await;
+    swept.writes_waited = u32::try_from(seen.len()).unwrap_or(u32::MAX);
     swept
 }
 

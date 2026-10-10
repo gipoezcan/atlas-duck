@@ -1413,9 +1413,9 @@ pub(crate) async fn submit(
     conn: &ConnectionMeta,
     p: SubmitParams,
 ) -> Envelope {
-    if engine.is_shutting_down() {
+    let Some(gate) = engine.enter_submit().await else {
         return GateState::ShuttingDown.envelope();
-    }
+    };
     let Some(session) = engine.session(&conn.connection_id) else {
         return envelope::protocol_error();
     };
@@ -1454,6 +1454,7 @@ pub(crate) async fn submit(
         session,
         conn: conn.clone(),
         ticket,
+        gate,
     };
     tokio::spawn(record_and_validate(engine.clone(), job))
         .await
@@ -1468,6 +1469,9 @@ struct Received {
     session: super::Session,
     conn: ConnectionMeta,
     ticket: super::queue::Ticket,
+    /// Held until the request is registered (shutdown barrier, review I-1).
+    #[allow(dead_code)]
+    gate: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 /// The reservation needs the kind before validation: a lenient look at `dry_run`.
@@ -1541,6 +1545,10 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         target: Some(target.clone()),
         actor: Default::default(),
     };
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks().pause_before_received.clone() {
+        pause.hold().await;
+    }
     let committed = {
         let (ctx, params, hello, conn, reason, set, sha) = (
             ctx,

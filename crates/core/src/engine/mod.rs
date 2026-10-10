@@ -590,6 +590,9 @@ pub struct Engine {
     sessions: Mutex<HashMap<String, Session>>,
     entries: RwLock<HashMap<String, Arc<RequestEntry>>>,
     shutting_down: AtomicBool,
+    /// Submits hold the read side from their shutdown check until their request is registered;
+    /// `begin_shutdown` takes the write side (review I-1).
+    submit_gate: Arc<tokio::sync::RwLock<()>>,
     admission: Admission,
     /// §5.2: at most `limits.fetching` direct reads in `Fetching` (Task 21 acquires).
     fetch_slots: Arc<Semaphore>,
@@ -639,6 +642,7 @@ impl Engine {
             sessions: Mutex::new(HashMap::new()),
             entries: RwLock::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
+            submit_gate: Arc::new(tokio::sync::RwLock::new(())),
             admission: Admission::new(d.limits),
             fetch_slots: Arc::new(Semaphore::new(
                 d.limits.fetching.min(Semaphore::MAX_PERMITS),
@@ -934,9 +938,18 @@ impl Engine {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
-    /// `true` for the call that started the shutdown, `false` for every later one.
-    pub(crate) fn begin_shutdown(&self) -> bool {
-        !self.shutting_down.swap(true, Ordering::SeqCst)
+    /// §2.5 step 1: waits for the submits in flight to register their request, then refuses all
+    /// later ones. Idempotent.
+    pub(crate) async fn begin_shutdown(&self) {
+        let _exclusive = self.submit_gate.write().await;
+        self.shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// A submit's admission to the engine: `None` once the shutdown began. The guard is held until
+    /// the request is registered (or refused), so the sweep sees every `REQUEST_RECEIVED`.
+    pub(crate) async fn enter_submit(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let guard = self.submit_gate.clone().read_owned().await;
+        (!self.is_shutting_down()).then_some(guard)
     }
 
     pub(crate) fn remember_session(&self, connection_id: &str, session: Session) {

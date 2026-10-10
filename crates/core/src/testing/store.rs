@@ -169,6 +169,8 @@ pub struct FaultPlan {
     freeze: Mutex<Option<Arc<Freeze>>>,
     /// `reconcile_after_crash` fails (an integrity problem, Task 28).
     fail_crash_reconcile: AtomicBool,
+    /// `recent_headers` fails (the similarity seed, review M-3).
+    fail_recent_headers: AtomicBool,
 }
 
 /// A crash point (Task 28): right after the append of `after` commits, the wrapper that
@@ -278,6 +280,11 @@ impl FaultPlan {
     /// `reconcile_after_crash` answers an integrity error while on.
     pub fn fail_crash_reconcile(&self, on: bool) {
         self.fail_crash_reconcile.store(on, Ordering::SeqCst);
+    }
+
+    /// `recent_headers` through this port answers an error while on (the seed fails).
+    pub fn fail_recent_headers(&self, on: bool) {
+        self.fail_recent_headers.store(on, Ordering::SeqCst);
     }
 
     fn note_call(&self, evs: Vec<RecordedEvent>) {
@@ -481,6 +488,9 @@ impl AuditPort for FaultyAudit {
     }
 
     fn recent_headers(&self, since: Duration) -> Result<Vec<EventHeader>, AuditError> {
+        if self.plan.fail_recent_headers.load(Ordering::SeqCst) {
+            return Err(AuditError::Invalid("injected header scan failure (test hook)"));
+        }
         self.inner.recent_headers(since)
     }
 

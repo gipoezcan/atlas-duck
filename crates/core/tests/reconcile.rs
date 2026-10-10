@@ -10,6 +10,7 @@
 
 mod common;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
@@ -17,7 +18,10 @@ use atlas_duck_atlassian::CredentialProvider;
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_audit::{EventType, RestoreReport};
 use atlas_duck_core::payloads::{EventCtx, InvalidReason, SubmittedDecision, decision_invalid};
-use atlas_duck_core::testing::{Channel, FakeScriptRunner, FaultPlan, Freeze, Harness, ScriptPlan};
+use atlas_duck_core::testing::{
+    Channel, FakeScriptRunner, FaultPlan, Freeze, Harness, InstanceAt, ScriptPlan,
+};
+use atlas_duck_registry::Product;
 use atlas_duck_core::{Decision, DecisionKind, HookPoint, RunEnd, TestHooks};
 use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::envelope::{Envelope, Status};
@@ -163,8 +167,8 @@ async fn start_order_and_pats_deleted() -> TestResult {
     assert_eq!(
         plan.trail(),
         [
-            "reconcile_config_file",
             "reconcile_after_crash",
+            "reconcile_config_file",
             "append:APP_START",
             "append:INSTANCE_STATE_CHANGED",
             "append:INSTANCE_STATE_CHANGED",
@@ -193,6 +197,51 @@ async fn start_order_and_pats_deleted() -> TestResult {
     let states = h.events_of(EventType::INSTANCE_STATE_CHANGED).await?;
     assert_eq!(states.len(), 2);
     assert!(states.iter().all(|p| p["state"] == "needs_token"), "{states:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_start_effective_proxy_is_host_and_port_only() -> TestResult {
+    let h = Harness::builder()
+        .instance_at(
+            "jira-main",
+            Product::Jira,
+            InstanceAt {
+                base_url: "https://jira.corp.example".to_owned(),
+                proxy: Some("proxy.corp.example:3128".to_owned()),
+                ..InstanceAt::default()
+            },
+        )
+        .start()
+        .await?;
+    let starts = h.events_of(EventType::APP_START).await?;
+    let [p] = starts.as_slice() else {
+        return Err(format!("{} APP_START records", starts.len()).into());
+    };
+    assert_eq!(
+        p["effective_proxy"],
+        json!({ "jira-main": "proxy.corp.example:3128" })
+    );
+    // No credentials of any kind in the record.
+    assert!(!p.to_string().contains('@'), "{p}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_similarity_seed_is_recorded_in_app_start() -> TestResult {
+    let plan = FaultPlan::new();
+    plan.fail_recent_headers(true);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    plan.fail_recent_headers(false);
+    let starts = h.events_of(EventType::APP_START).await?;
+    let [p] = starts.as_slice() else {
+        return Err(format!("{} APP_START records", starts.len()).into());
+    };
+    assert_eq!(p["similarity_seed_failed"], true, "{p}");
     Ok(())
 }
 
@@ -262,10 +311,8 @@ async fn an_integrity_error_of_the_reconciliation_is_a_start_error_with_no_app_s
     };
     assert!(e.to_string().contains("audit store"), "{e}");
     // Nothing was appended after the failed reconciliation: no APP_START, no notices.
-    assert_eq!(
-        plan.trail(),
-        ["reconcile_config_file", "reconcile_after_crash"]
-    );
+    // The config reconcile, which unblocks the prune, never ran (review I-2).
+    assert_eq!(plan.trail(), ["reconcile_after_crash"]);
     Ok(())
 }
 
@@ -295,7 +342,11 @@ async fn the_config_file_policy_is_reconciled_before_app_start() -> TestResult {
     assert_eq!(h.store().settings().retention_days, 120);
     assert!(h.store().settings().legal_hold);
     let trail = plan.trail();
-    assert_eq!(trail.first().map(String::as_str), Some("reconcile_config_file"));
+    // After the crash reconciliation (review I-2), before anything else is appended.
+    assert_eq!(
+        trail.iter().take(2).map(String::as_str).collect::<Vec<_>>(),
+        ["reconcile_after_crash", "reconcile_config_file"]
+    );
     Ok(())
 }
 
@@ -447,14 +498,46 @@ async fn i26_crash_after_post_approval_decision_stale() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i26_crash_after_post_approval_decision_invalid() -> TestResult {
     let mut h = Harness::jira().await?;
-    let id = queued_transition(&h).await?;
-    let freeze = h.plan().freeze_after(EventType::DECISION_INVALID);
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    // The POST never answers in time: the write stays `executing`, so nothing ends the request
+    // while the record is appended.
+    Mock::given(method("POST"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1/comment")))
+        .respond_with(
+            mock.response(201)
+                .set_body_raw(fixtures::JIRA_COMMENT, "application/json")
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(mock.server())
+        .await;
+    let id = queued(
+        &h,
+        COMMENT,
+        json!({ "key": "ABC-1", "body": "Reproduced.", "body_format": "wiki" }),
+    )
+    .await?;
     h.approver().approve(&id).map_err(de)?;
+    for _ in 0..1000 {
+        let posts = jira(&h)?
+            .received()
+            .await
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .count();
+        if posts > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(h.status(&id).await.status, Status::Executing, "{:?}", types(&h, &id).await?);
+    let freeze = h.plan().freeze_after(EventType::DECISION_INVALID);
     // No decision call reaches `DECISION_INVALID` after an approval (they all answer stale in
     // `StaleCheck` / `Executing`); the record is appended as the store would see it.
     let ctx = EventCtx {
         request_id: Some(id.clone()),
-        op_id: Some(TRANSITION.to_owned()),
+        op_id: Some(COMMENT.to_owned()),
         op_class: Some("write".to_owned()),
         ..EventCtx::default()
     };
@@ -795,6 +878,22 @@ fn log_capture() -> &'static Arc<LogCapture> {
     })
 }
 
+/// Counts the panics of the S-15 hook (its payload is this text) without hiding any other.
+static HOOK_PANICS: AtomicUsize = AtomicUsize::new(0);
+
+fn count_hook_panics() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if info.payload().downcast_ref::<&str>() == Some(&"read task panic (test hook)") {
+                HOOK_PANICS.fetch_add(1, Ordering::SeqCst);
+            }
+            previous(info);
+        }));
+    });
+}
+
 fn files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> TestResult {
     for entry in std::fs::read_dir(dir)? {
         let p = entry?.path();
@@ -811,6 +910,8 @@ fn files_under(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Test
 async fn s15_panic_mid_search_reconciles_next_start() -> TestResult {
     const SENTINEL: &str = "SENTINEL-JQL-7f3a91c2";
     let logs = log_capture().clone();
+    count_hook_panics();
+    let panics_before = HOOK_PANICS.load(Ordering::SeqCst);
     let mut h = Harness::builder()
         .jira("jira-main")
         .hooks(TestHooks {
@@ -827,8 +928,16 @@ async fn s15_panic_mid_search_reconciles_next_start() -> TestResult {
         .await;
     let id = request_id(&env)?;
     tripped(&freeze).await?;
-    // Give the read task time to run into its panic.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The read task really ran into its panic.
+    for _ in 0..1000 {
+        if HOOK_PANICS.load(Ordering::SeqCst) > panics_before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(HOOK_PANICS.load(Ordering::SeqCst), panics_before + 1);
+    // Let the unwinding finish before the process "dies".
+    tokio::time::sleep(Duration::from_millis(100)).await;
     h.crash_and_restart().await?;
     let env = h.await_(&id, 10_000).await;
     assert_abandoned(&env);

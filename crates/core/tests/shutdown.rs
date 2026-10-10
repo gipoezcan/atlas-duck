@@ -12,8 +12,9 @@ use atlas_duck_atlassian::testing::{
     MockDc, RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, XAuser, fixtures,
 };
 use atlas_duck_audit::EventType;
-use atlas_duck_core::testing::{FakeScriptRunner, Harness, InstanceAt, ScriptPlan};
-use atlas_duck_core::{RunEnd, ShutdownReason, ShutdownReport, TestHooks};
+use atlas_duck_core::testing::{FakeScriptRunner, FaultPlan, Harness, InstanceAt, ScriptPlan};
+use atlas_duck_core::{Pause, RunEnd, ShutdownReason, ShutdownReport, TestHooks};
+use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_registry::Product;
 use common::{TestError, TestResult, code, de, detail, exit, request_id};
@@ -221,7 +222,8 @@ async fn i40_quit_refuses_cancels_finishes_write() -> TestResult {
         report,
         ShutdownReport {
             cancelled: 4,
-            writes_waited: 1
+            writes_waited: 1,
+            app_stop_logged: true
         }
     );
     // The read in the queue, the read in flight, the opened write and the script: cancelled.
@@ -343,9 +345,175 @@ async fn a_second_shutdown_changes_nothing() -> TestResult {
     let first = b.h.core().shutdown(ShutdownReason::Quit).await;
     assert_eq!(first.cancelled, 4);
     let second = b.h.core().shutdown(ShutdownReason::OsShutdown).await;
-    assert_eq!(second, ShutdownReport::default());
+    assert_eq!(second, first);
     assert_eq!(b.h.events_of(EventType::APP_STOP).await?.len(), 1);
     assert_eq!(app_stop_reason(&b.h).await?, "quit");
+    Ok(())
+}
+
+/// Review I-3: a second call while the first still waits for an executing write does not return
+/// before `APP_STOP` is in the log, and gets the first call's report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_concurrent_second_shutdown_waits_for_the_first() -> TestResult {
+    let b = busy(1_500, TestHooks::none()).await?;
+    let h = &b.h;
+    let (first, second) = tokio::join!(h.core().shutdown(ShutdownReason::Quit), async {
+        wait_for("the shutdown to start", || h.engine().is_shutting_down()).await?;
+        // The first call is in its wait for the executing write.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(h.events_of(EventType::APP_STOP).await?.is_empty());
+        let report = h.core().shutdown(ShutdownReason::OsShutdown).await;
+        // It returned: the first call's work is complete.
+        assert_eq!(last_event(h)?, EventType::APP_STOP);
+        Ok::<_, TestError>(report)
+    });
+    assert_eq!(second?, first);
+    assert!(first.app_stop_logged && first.writes_waited == 1, "{first:?}");
+    assert_eq!(h.events_of(EventType::APP_STOP).await?.len(), 1);
+    assert_eq!(app_stop_reason(h).await?, "quit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_app_stop_append_is_in_the_report() -> TestResult {
+    let plan = FaultPlan::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .start()
+        .await?;
+    plan.fail_nth(EventType::APP_STOP, 1);
+    let report = h.core().shutdown(ShutdownReason::Quit).await;
+    assert!(!report.app_stop_logged, "{report:?}");
+    assert!(h.events_of(EventType::APP_STOP).await?.is_empty());
+    Ok(())
+}
+
+// ---- review I-1: a submit racing the shutdown ----------------------------------------------
+
+/// The Jira read of ABC-9 never answers in time: a registered read stays in `Fetching`.
+async fn stalled_jira(h: &Harness) -> TestResult {
+    let mock = jira(h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    Mock::given(path(mock.path("/rest/api/2/issue/ABC-9")))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(fixtures::JIRA_ISSUE, "application/json")
+                .set_delay(Duration::from_secs(60)),
+        )
+        .mount(mock.server())
+        .await;
+    Ok(())
+}
+
+/// A submit paused after its shutdown check, before `REQUEST_RECEIVED`; the shutdown starts and
+/// must wait for it. Then the request is registered, swept, and `APP_STOP` is the last record.
+async fn racing_submit(
+    h: &Harness,
+    pause: &Pause,
+    submit: impl std::future::Future<Output = Envelope>,
+) -> TestResult {
+    tokio::pin!(submit);
+    tokio::select! {
+        _ = &mut submit => return Err("the submit finished while paused".into()),
+        _ = pause.reached.notified() => {}
+    }
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The shutdown waits for the submit: it has not refused anything yet, nor stopped.
+        assert!(!h.engine().is_shutting_down());
+        assert!(h.events_of(EventType::APP_STOP).await?.is_empty());
+        pause.release.notify_one();
+        Ok::<_, TestError>(())
+    };
+    let (report, released, env) =
+        tokio::join!(h.core().shutdown(ShutdownReason::Quit), release, &mut submit);
+    released?;
+    assert!(report.app_stop_logged, "{report:?}");
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    assert_cancelled(h, &id, "app_quit").await?;
+    // Nothing after `APP_STOP`, in particular no `REQUEST_RECEIVED`.
+    assert_eq!(last_event(h)?, EventType::APP_STOP);
+    assert_eq!(report.cancelled, 1);
+    // And now submits are refused.
+    let refused = h.submit(ISSUE, json!({ "key": "ABC-1" })).await;
+    assert_eq!(code(&refused), "unreachable");
+    assert_eq!(detail(&refused, "reason"), json!("app_shutting_down"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i1_a_submit_racing_the_shutdown_is_swept() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_before_received: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    stalled_jira(&h).await?;
+    racing_submit(&h, &pause, h.submit(ISSUE, json!({ "key": "ABC-9" }))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i1_a_script_submit_racing_the_shutdown_is_swept() -> TestResult {
+    let pause = Pause::new();
+    let runner = FakeScriptRunner::new(vec![
+        ScriptPlan::new(Vec::new(), RunEnd::Crashed).holding(60_000),
+    ]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner)
+        .hooks(TestHooks {
+            pause_before_received: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    racing_submit(&h, &pause, h.submit_script(json!({ "source": "return 1;" }))).await
+}
+
+// ---- a write in `StaleCheck` (only the shutdown path can cancel it) --------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_in_stale_check_is_cancelled_by_the_shutdown() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_after_get: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    jira(&h)?
+        .jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let id = queued(
+        &h,
+        COMMENT,
+        json!({ "key": "ABC-1", "body": "Reproduced.", "body_format": "wiki" }),
+    )
+    .await?;
+    h.approver().approve(&id).map_err(de)?;
+    pause.reached.notified().await;
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        pause.release.notify_one();
+    };
+    let (report, ()) = tokio::join!(h.core().shutdown(ShutdownReason::Quit), release);
+    assert_eq!(report.cancelled, 1, "{report:?}");
+    assert_cancelled(&h, &id, "app_quit").await?;
+    let t = types(&h, &id).await?;
+    let tail: Vec<_> = t.iter().rev().take(2).rev().copied().collect();
+    assert_eq!(tail, [EventType::PREVIEW_FETCH, EventType::CANCELLED], "{t:?}");
+    let fetch = record(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(fetch["purpose"], "stale_check");
+    assert_eq!(last_event(&h)?, EventType::APP_STOP);
     Ok(())
 }
 

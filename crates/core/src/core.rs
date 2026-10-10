@@ -133,6 +133,9 @@ pub struct TestHooks {
     /// `submit` holds right after its `REQUEST_RECEIVED` committed (I-3: a caller dropped there
     /// must not leave the request unapplied).
     pub pause_after_received: Option<Arc<Pause>>,
+    /// `submit` / `submit_script` hold after their shutdown check, before `REQUEST_RECEIVED`
+    /// is appended (review I-1).
+    pub pause_before_received: Option<Arc<Pause>>,
     /// `Engine::transition` holds after its append committed, before it applies the model.
     pub pause_in_transition: Option<Arc<Pause>>,
     pub freeze_at: Option<HookPoint>,
@@ -172,9 +175,14 @@ pub struct ShutdownReport {
     pub cancelled: u32,
     /// Writes that were `executing`, waited for until they logged their outcome.
     pub writes_waited: u32,
+    /// `APP_STOP` is in the log. `false`: the append failed; the next start reconciles whatever
+    /// is open like after a crash (M6 may warn).
+    pub app_stop_logged: bool,
 }
 
 pub struct Core {
+    /// The one shutdown: later calls wait for it and get its report (review I-3).
+    shutdown_done: tokio::sync::OnceCell<ShutdownReport>,
     notice: Vec<ReconciledWrite>,
     engine: Arc<Engine>,
     handler: Arc<CoreHandler>,
@@ -226,8 +234,18 @@ impl Core {
         #[cfg(not(feature = "testing"))]
         let allow_http = false;
         let install_id = deps.audit.install_id().to_owned();
+        // Step 1 (§11.3): close every request the last run left open. The predicate is the
+        // store's. An error is an integrity problem: no `APP_START`, nothing deleted.
+        let report = {
+            let port = port.clone();
+            tokio::task::spawn_blocking(move || port.reconcile_after_crash())
+                .await
+                .unwrap_or(Err(AuditError::Closed))
+                .map_err(StartError::Audit)?
+        };
         // Startup step 2 (X-01, §8.8): the audit policy the file asks for, logged before
-        // anything else appends; prune stays blocked until this ran.
+        // anything else appends. It runs after the crash reconciliation (review I-2): prune
+        // stays blocked until then, so a start that fails its integrity check deletes nothing.
         {
             let (port, cfg) = (port.clone(), config.clone());
             let _ = tokio::task::spawn_blocking(move || {
@@ -262,26 +280,18 @@ impl Core {
             // Best effort: a failed append must not stop the app from starting.
             let _ = tokio::task::spawn_blocking(move || port.append(ev)).await;
         }
-        // Step 4 (§11.3): close every request the last run left open. The predicate is the
-        // store's. An error is an integrity problem: no `APP_START`, nothing deleted.
-        let report = {
-            let port = port.clone();
-            tokio::task::spawn_blocking(move || port.reconcile_after_crash())
-                .await
-                .unwrap_or(Err(AuditError::Closed))
-                .map_err(StartError::Audit)?
-        };
         // Step 5 (L45, RF-4): the similarity index from the last 24 h of the log, after the
         // reconciliation (a write whose outcome is unknown is a hit "outcome unknown"). The flags
         // are advisory: a scan that fails starts the index empty.
-        let similarity = {
+        let seeded = {
             let (port, clock) = (port.clone(), deps.clock.clone());
             tokio::task::spawn_blocking(move || SimilarityIndex::seed(&*port, clock))
                 .await
                 .ok()
                 .and_then(|r| r.ok())
         };
-        let similarity = similarity.unwrap_or_else(|| {
+        let seed_failed = seeded.is_none();
+        let similarity = seeded.unwrap_or_else(|| {
             tracing::warn!("the similarity index could not be seeded; it starts empty");
             SimilarityIndex::new(deps.clock.clone())
         });
@@ -310,6 +320,7 @@ impl Core {
             hooks: opts.hooks,
         }));
         let core = Core {
+            shutdown_done: tokio::sync::OnceCell::new(),
             notice: report.outcome_unknown,
             handler: Arc::new(CoreHandler::new(engine.clone())),
             decisions: Arc::new(CoreDecisions::new(engine.clone())),
@@ -326,6 +337,7 @@ impl Core {
             &config,
             proxies,
             seed_skipped,
+            seed_failed,
             &pats_deleted,
         );
         core.engine
@@ -381,12 +393,21 @@ impl Core {
     /// refused `app_shutting_down` (other methods keep working until the app exits); (2, 3)
     /// every request that is not `executing` ends `cancelled` with the app's reason, a running
     /// script is killed first; (4) writes that are `executing` are waited for, at most 60 s;
-    /// (5) the head anchor is flushed and `APP_STOP` is appended. A second call changes nothing.
+    /// (5) the head anchor is flushed and `APP_STOP` is appended. A second (concurrent or later)
+    /// call changes nothing: it waits for the first to finish and returns the same report. M6
+    /// exits right after this returns (a write past its 60 s may still commit after `APP_STOP`).
     /// OS end-session blocking (`ShutdownBlockReasonCreate` etc.) is M6's.
     pub async fn shutdown(&self, reason: ShutdownReason) -> ShutdownReport {
-        if !self.engine.begin_shutdown() {
-            return ShutdownReport::default();
-        }
+        *self
+            .shutdown_done
+            .get_or_init(|| self.run_shutdown(reason))
+            .await
+    }
+
+    async fn run_shutdown(&self, reason: ShutdownReason) -> ShutdownReport {
+        // Waits for every submit that passed its check to register its request, then refuses
+        // all later ones (review I-1).
+        self.engine.begin_shutdown().await;
         let (why, stop) = match reason {
             ShutdownReason::Quit => (CancelWhy::AppQuit, AppStopReason::Quit),
             // The installer path cancels with the app's own reason (§8.3: `app_quit`).
@@ -402,12 +423,11 @@ impl Core {
         #[cfg(not(feature = "testing"))]
         let wait = crate::shutdown::WRITE_WAIT;
         let swept = crate::shutdown::sweep(&self.engine, why, wait).await;
-        // A failed `APP_STOP` append leaves the next start to reconcile; nothing else to do at
-        // exit.
-        let _ = crate::shutdown::stop(&self.engine, stop).await;
+        let app_stop_logged = crate::shutdown::stop(&self.engine, stop).await.is_ok();
         ShutdownReport {
             cancelled: swept.cancelled,
             writes_waited: swept.writes_waited,
+            app_stop_logged,
         }
     }
 

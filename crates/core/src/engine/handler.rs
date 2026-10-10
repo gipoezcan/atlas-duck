@@ -86,6 +86,9 @@ struct Received {
     session: Session,
     conn: ConnectionMeta,
     ticket: Ticket,
+    /// Held until the request is registered: the shutdown sweep waits for it (review I-1).
+    #[allow(dead_code)]
+    gate: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
 /// `submit` steps 6–10 from the `REQUEST_RECEIVED` commit (§5.1 inv. 1) to the pending
@@ -100,6 +103,10 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         target: None,
         actor: Default::default(),
     };
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks().pause_before_received.clone() {
+        pause.hold().await;
+    }
     let committed = {
         let (mut ctx, params, hello, conn, reason, set, sha) = (
             ctx,
@@ -715,9 +722,9 @@ impl RequestHandler for CoreHandler {
     async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
         let engine = &self.engine;
         // 1. §2.5 step 1.
-        if engine.is_shutting_down() {
+        let Some(gate) = engine.enter_submit().await else {
             return GateState::ShuttingDown.envelope();
-        }
+        };
         // 2. The hello of this connection.
         let Some(session) = engine.session(&conn.connection_id) else {
             return envelope::protocol_error();
@@ -770,6 +777,7 @@ impl RequestHandler for CoreHandler {
             session,
             conn: conn.clone(),
             ticket,
+            gate,
         };
         tokio::spawn(record_and_validate(engine.clone(), job))
             .await
