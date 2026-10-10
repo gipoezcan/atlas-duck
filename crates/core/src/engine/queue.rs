@@ -32,6 +32,10 @@ pub const PENDING_PER_AGENT: u32 = 32;
 pub const PENDING_TOTAL: u32 = 256;
 /// §5.2: direct reads in `Fetching` at once.
 pub const FETCH_SLOTS: usize = 8;
+/// §9.4: concurrent real script runs.
+pub const SCRIPT_SLOTS: usize = 2;
+/// §9.4: concurrent dry runs and submit-time compile checks.
+pub const DRY_SLOTS: usize = 2;
 /// §5.2: `candidate_cache_mb` default.
 pub const CANDIDATE_CACHE_MB: u64 = 512;
 

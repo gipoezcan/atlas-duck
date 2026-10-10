@@ -39,6 +39,7 @@ use crate::engine::cache::{Candidate, RebuildError, build_redacted, source_body}
 use crate::engine::read::{
     OUTCOME_HINT, ReadContext, caution_count, normalizer, preview_model, release_meta,
 };
+use crate::engine::script;
 use crate::engine::write;
 use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, TransitionError};
 use crate::gate::UiEvent;
@@ -486,7 +487,10 @@ async fn candidate(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
 ) -> Result<Arc<Candidate>, RebuildError> {
-    engine.candidate(entry, normalizer(entry.spec)).await
+    match entry.kind() {
+        Kind::Script | Kind::DryRun => engine.candidate(entry, script::normalizer()).await,
+        _ => engine.candidate(entry, normalizer(entry.spec)).await,
+    }
 }
 
 fn read_context(entry: &RequestEntry) -> (&Value, ReadContext<'_>) {
@@ -614,8 +618,9 @@ async fn preview_fetch(
     let built = match entry.kind() {
         Kind::Read => read_preview(&engine, &entry, submitted).await?,
         Kind::Write => write_preview(&engine, &entry, submitted).await,
-        // Task 27 previews scripts.
-        Kind::Script | Kind::DryRun => return Err(DecisionError::NotDecidable),
+        Kind::Script => script_preview(&engine, &entry, submitted).await?,
+        // A dry run is terminal at once: it never waits for a decision.
+        Kind::DryRun => return Err(DecisionError::NotDecidable),
     };
     let Some((preview, shown, opened)) = built else {
         let at = snapshot(&entry.state());
@@ -669,7 +674,7 @@ async fn raw_page(
     page: u64,
 ) -> Result<RawPage, DecisionError> {
     let entry = engine.entry(&id).ok_or(DecisionError::NotDecidable)?;
-    if !matches!(entry.kind(), Kind::Read | Kind::Write) {
+    if !matches!(entry.kind(), Kind::Read | Kind::Write | Kind::Script) {
         return Err(DecisionError::NotDecidable);
     }
     let write_raw = {
@@ -726,10 +731,9 @@ async fn decide(engine: Arc<Engine>, d: Decision) -> Result<DecisionOutcome, Dec
         .entry(&d.request_id)
         .ok_or(DecisionError::NotDecidable)?;
     match entry.kind() {
-        Kind::Read => {}
+        Kind::Read | Kind::Script => {}
         Kind::Write => return decide_write(&engine, &entry, d).await,
-        // Task 27 decides scripts.
-        Kind::Script | Kind::DryRun => return Err(DecisionError::NotDecidable),
+        Kind::DryRun => return Err(DecisionError::NotDecidable),
     }
     match d.decision {
         DecisionKind::Deny => deny(&engine, &entry, &d).await,
@@ -798,6 +802,9 @@ async fn release(
 /// `READ_RELEASED` of the current revision's exact candidate `c` with its redaction ops: the
 /// outcome answer `{code, hint}`, or the bytes with the `item` marker and `meta` (§5.2 step 8).
 fn release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, DecisionError> {
+    if entry.kind() == Kind::Script {
+        return script_release_record(entry, c);
+    }
     let (read, ops) = {
         let st = entry.state();
         (st.read.clone(), st.redaction_ops.clone())
@@ -844,7 +851,11 @@ async fn deny(
     // The human's reason reaches the agent: flagged characters are stripped as for the agent's
     // own `reason` (§3.3 rule, newlines kept; review M-1 ruling).
     let reason = d.reason.as_deref().map(|r| strip(r, true).0);
-    let record = payloads::read_denied(&entry.ctx, reason.as_deref());
+    let record = if entry.kind() == Kind::Script {
+        payloads::script_denied(&entry.ctx, reason.as_deref())
+    } else {
+        payloads::read_denied(&entry.ctx, reason.as_deref())
+    };
     match engine.transition(entry, event, move |_| record).await {
         Ok(_) => {
             queue_changed(engine, entry);
@@ -868,6 +879,9 @@ async fn redact(
         Ok(snap) => snap,
         Err(rej) => return Err(rejected(engine, entry, rej, rev.counter, dec).await),
     };
+    if entry.kind() == Kind::Script {
+        return redact_script(engine, entry, rev, ops, at).await;
+    }
     let read = entry.state().read.clone();
     let Some(read) = read else {
         return Err(DecisionError::NotDecidable);
@@ -948,6 +962,144 @@ async fn redact(
                 st.rebuild_failed = false;
                 st.caution_count = caution;
                 st.read = Some(new_read);
+                st.model.set_approvable(true);
+                cache.candidates().insert(&id, c);
+            },
+        )
+        .await;
+    match applied {
+        Ok(_) => {
+            queue_changed(engine, entry);
+            Ok(outcome(entry))
+        }
+        Err(r) => {
+            let at = snapshot(&entry.state());
+            Err(rejected(engine, entry, (r, at), rev.counter, dec).await)
+        }
+    }
+}
+
+// ---- scripts (Task 27) ---------------------------------------------------------------------------
+
+/// A script's preview: its candidate (`{result}` or `{script_error}`, rebuilt if evicted)
+/// through the fallback tree, led by the host-counted "lossy host calls" warning.
+async fn script_preview(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    submitted: u64,
+) -> Result<Built, DecisionError> {
+    let c = match candidate(engine, entry).await {
+        Ok(c) => c,
+        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
+    };
+    let built = {
+        let st = entry.state();
+        if st.model.rev() != submitted || &st.candidate_hash != c.hash() {
+            None
+        } else {
+            st.script
+                .clone()
+                .map(|s| (s, current_rev(&st), st.approvable(), st.model.opened()))
+        }
+    };
+    let Some((script, shown, approvable, opened)) = built else {
+        return Ok(None);
+    };
+    let model = script::preview_model(&script, &c);
+    let mut warnings = model.warnings;
+    warnings.extend(Flags::of(engine, entry).warnings());
+    let preview = Preview {
+        candidate_rev: shown,
+        approvable,
+        raw: RawPager::for_total(u64::try_from(c.bytes().len()).unwrap_or(u64::MAX)),
+        header: model.header,
+        warnings,
+        body: model.body,
+        also_appears_in: script.also_appears_in.clone(),
+        preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
+    };
+    Ok(Some((preview, shown, opened)))
+}
+
+/// `SCRIPT_RELEASED` of the current revision's exact candidate `c` with its redaction ops.
+fn script_release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, DecisionError> {
+    let (item, ops) = {
+        let st = entry.state();
+        (
+            st.script.as_ref().and_then(|s| s.item),
+            st.redaction_ops.clone(),
+        )
+    };
+    let item = match item {
+        Some(ReleaseItem::ScriptResult) => payloads::ScriptReleasedItem::Result,
+        Some(ReleaseItem::ScriptErrorDetails) => payloads::ScriptReleasedItem::Error,
+        _ => return Err(DecisionError::NotDecidable),
+    };
+    payloads::script_released(&entry.ctx, c.bytes(), &ops, item)
+        .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))
+}
+
+/// [`redact`] for a script's candidate: the same flow over `{result}` / `{script_error}`.
+async fn redact_script(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    rev: CandidateRev,
+    ops: Vec<RedactionOp>,
+    at: Snapshot,
+) -> Result<DecisionOutcome, DecisionError> {
+    let dec = SubmittedDecision::Release;
+    let Some(script) = entry.state().script.clone() else {
+        return Err(DecisionError::NotDecidable);
+    };
+    let (spec, id) = (entry.spec, entry.head.request_id.clone());
+    let base = engine
+        .blocking(move |p| Ok(source_body(p, &id, script::normalizer())))
+        .await
+        .map_err(DecisionError::Audit)?;
+    let base = match base {
+        Ok(b) => b,
+        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(_) => {
+            let rej = (Rejection::NotApprovable, at);
+            return Err(rejected(engine, entry, rej, rev.counter, dec).await);
+        }
+    };
+    let applied = tokio::task::spawn_blocking(move || {
+        build_redacted(spec, base, &ops).map(|(c, report)| (c, report, ops))
+    })
+    .await;
+    let (c, report, ops) = match applied {
+        Ok(Ok(built)) => built,
+        Ok(Err(RebuildError::Blocked)) => {
+            let rej = (Rejection::NotApprovable, at);
+            return Err(rejected(engine, entry, rej, rev.counter, dec).await);
+        }
+        _ => return Err(DecisionError::Audit(AuditError::Invalid("redaction"))),
+    };
+    let (redaction_meta, also_appears_in) = match report {
+        Some(r) => (Some(r.meta), r.also_appears_in),
+        None => (None, Vec::new()),
+    };
+    let new_script = script::ScriptState {
+        redaction_meta,
+        also_appears_in,
+        ..script
+    };
+    let caution = caution_count(&script::preview_model(&new_script, &c));
+    let c = Arc::new(c);
+    let (cache, id) = (engine.clone(), entry.head.request_id.clone());
+    let applied = engine
+        .step_unlogged(
+            entry,
+            Event::CandidateChanged,
+            Some(rev.counter),
+            move |st| {
+                st.candidate_hash = *c.hash();
+                st.redaction_ops = ops;
+                st.rebuild_failed = false;
+                st.caution_count = caution;
+                st.script = Some(new_script);
                 st.model.set_approvable(true);
                 cache.candidates().insert(&id, c);
             },

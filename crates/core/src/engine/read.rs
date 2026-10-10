@@ -241,7 +241,7 @@ async fn fetch_classified(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) -> Cl
 }
 
 /// The trigger of a read's fetch, if its answer failed the identity check or is a JSON 401.
-fn fetched_trigger(f: &Fetched) -> Option<identity::Trigger> {
+pub(super) fn fetched_trigger(f: &Fetched) -> Option<identity::Trigger> {
     match f {
         Fetched::Single(o) => identity::trigger(o),
         Fetched::Paged { outcome, .. } => match &outcome.failure {
@@ -257,7 +257,7 @@ fn fetched_trigger(f: &Fetched) -> Option<identity::Trigger> {
 }
 
 /// The fetch as the ordinary answer it is once the re-check passed on a JSON 401.
-fn ordinary(f: Fetched) -> Fetched {
+pub(super) fn ordinary(f: Fetched) -> Fetched {
     match f {
         Fetched::Single(o) => Fetched::Single(identity::as_response(o)),
         Fetched::Paged { mut outcome, start } => {
@@ -272,7 +272,7 @@ fn ordinary(f: Fetched) -> Fetched {
 }
 
 /// The complete responses before the triggering answer, and that answer.
-fn split_answer(f: Fetched) -> (Vec<UpstreamResponse>, Option<UpstreamResponse>) {
+pub(super) fn split_answer(f: Fetched) -> (Vec<UpstreamResponse>, Option<UpstreamResponse>) {
     match f {
         Fetched::Single(FetchOutcome::Failed(FetchFailure::IdentityCheckFailed {
             response,
@@ -296,7 +296,7 @@ fn split_answer(f: Fetched) -> (Vec<UpstreamResponse>, Option<UpstreamResponse>)
 /// identity-header states, or `upstream_unavailable` (retryable) for a passing or inconclusive
 /// re-check. The answer is audit-only (RF-2a); after a first page the failure is an outcome item
 /// like every direct class (review I-1).
-fn identity_classified(effect: identity::Effect, fetched: Fetched) -> Classified {
+pub(super) fn identity_classified(effect: identity::Effect, fetched: Fetched) -> Classified {
     let (mut responses, answer) = split_answer(fetched);
     let later_page = !responses.is_empty();
     responses.extend(answer);
@@ -408,21 +408,21 @@ pub(crate) enum Classified {
 
 /// A release item's `READ_FETCHED` content before it is recorded.
 pub(crate) struct ItemRecord {
-    item: ReleaseItem,
+    pub(super) item: ReleaseItem,
     /// Complete responses (pages, the upstream error, the response whose body failed).
-    responses: Vec<UpstreamResponse>,
-    outcome: Option<OutcomeFacts>,
-    page: Option<PageFacts>,
+    pub(super) responses: Vec<UpstreamResponse>,
+    pub(super) outcome: Option<OutcomeFacts>,
+    pub(super) page: Option<PageFacts>,
     server_total: Option<u64>,
     more_available: bool,
 }
 
-struct OutcomeFacts {
-    kind: OutcomeKind,
+pub(super) struct OutcomeFacts {
+    pub(super) kind: OutcomeKind,
     cap: Option<CapOrBudget>,
     card: CardKind,
     /// Bytes of the response being read when it stopped.
-    partial: Vec<u8>,
+    pub(super) partial: Vec<u8>,
     /// The diagnosis of a later-page failure that is gated instead of direct (`class` or
     /// `reason`), kept in the record only.
     cause: Option<(&'static str, &'static str)>,
@@ -430,15 +430,15 @@ struct OutcomeFacts {
 
 /// A data-free direct failure (§5.2 step 6 "directly returned without release").
 pub(crate) struct Direct {
-    code: ErrorCode,
-    message: String,
+    pub(super) code: ErrorCode,
+    pub(super) message: String,
     /// `("class", ..)` or `("reason", ..)` in the record.
-    cause: Option<(&'static str, &'static str)>,
+    pub(super) cause: Option<(&'static str, &'static str)>,
     /// `details.reason` in the envelope: only the §4.3 identity-header states (ruling 4
     /// carve-out); every other class or reason stays in the record.
-    reason_detail: Option<&'static str>,
+    pub(super) reason_detail: Option<&'static str>,
     /// Responses received before the failure was decided (audit-only, RF-2a).
-    responses: Vec<UpstreamResponse>,
+    pub(super) responses: Vec<UpstreamResponse>,
 }
 
 impl Direct {
@@ -477,7 +477,7 @@ impl Direct {
 }
 
 impl ItemRecord {
-    fn size(&self) -> u64 {
+    pub(super) fn size(&self) -> u64 {
         let partial = self.outcome.as_ref().map_or(0, |o| o.partial.len());
         self.responses
             .iter()
@@ -487,7 +487,7 @@ impl ItemRecord {
             .fold(0u64, u64::saturating_add)
     }
 
-    fn record(&self, ctx: &EventCtx) -> NewEvent {
+    pub(super) fn record(&self, ctx: &EventCtx) -> NewEvent {
         let fetched = match (&self.outcome, self.item) {
             (Some(o), _) => ReadFetched::Outcome {
                 outcome: o.kind,
@@ -1105,7 +1105,7 @@ fn outcome_code(outcome: &str) -> Option<ErrorCode> {
 /// The result: one response's JSON, or for a paged op the first page's object with the items of
 /// every page under `items_key` (server totals as sent, §4.2). `confluence.search` results
 /// without a `content` object are removed and counted (§7.4 defence in depth).
-fn result_body(
+pub(super) fn result_body(
     spec: &OperationSpec,
     responses: Vec<UpstreamResponse>,
 ) -> Result<(Value, u64), RebuildError> {

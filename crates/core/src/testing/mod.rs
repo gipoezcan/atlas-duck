@@ -8,6 +8,7 @@ pub mod capture;
 pub mod confirmer;
 pub mod credentials;
 pub mod harness;
+pub mod runner;
 pub mod store;
 
 pub use approver::ScriptedApprover;
@@ -17,4 +18,5 @@ pub use credentials::InMemoryCredentials;
 pub use harness::{
     HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, InstanceAt, NoProgress,
 };
+pub use runner::{FakeScriptRunner, ScriptPlan, host_call};
 pub use store::{FaultPlan, FaultyAudit, RecordedEvent, TempStore};

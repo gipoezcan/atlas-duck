@@ -21,6 +21,7 @@ use crate::config::load_config;
 use crate::decision::{CoreDecisions, DecisionApi};
 use crate::engine::handler::CoreHandler;
 use crate::engine::queue::Limits;
+use crate::engine::script::ScriptRunner;
 use crate::engine::{Engine, EngineDeps};
 use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
@@ -40,8 +41,7 @@ pub enum Confirm {
     Cancel,
 }
 
-/// What `Core::start` needs (C.7 + PD-21, PD-28). `scripts: Arc<dyn ScriptRunner>` joins with
-/// the `ScriptRunner` seam in Task 27.
+/// What `Core::start` needs (C.7 + PD-21, PD-28).
 pub struct CoreDeps {
     pub audit: Store,
     pub clock: Arc<dyn Clock>,
@@ -57,6 +57,9 @@ pub struct CoreDeps {
     pub app_start_extra: Map<String, Value>,
     /// Instance ids whose PAT a restore or recovery deleted (PD-28, Task 28).
     pub pats_deleted: Vec<String>,
+    /// The script worker glue (`app::script_glue`, M8). Additive Δ C.7: `None` (no sandbox in
+    /// this build) answers every script `failed`, `sandbox_unavailable` (§9.4), exit 8.
+    pub scripts: Option<Arc<dyn ScriptRunner>>,
 }
 
 /// Why `Core::start` refused.
@@ -256,6 +259,7 @@ impl Core {
             runtime: tokio::runtime::Handle::current(),
             similarity,
             expiry: crate::config::requests::expiry(&config),
+            scripts: deps.scripts,
             #[cfg(feature = "testing")]
             hooks: opts.hooks,
         }));

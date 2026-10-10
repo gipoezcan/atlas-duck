@@ -40,6 +40,11 @@ pub const MSG_UPSTREAM_HTTP: &str = "the Atlassian server answered with an error
 /// Plan wording: the delivery window passed (§4.4).
 pub const MSG_RESULT_EVICTED: &str =
     "the result is no longer available: it can be delivered for 1 h after the decision";
+/// Plan wording (§4.3 names the codes): the data-free direct script failures.
+pub(crate) const MSG_SCRIPT_SYNTAX: &str = "the script does not compile";
+pub(crate) const MSG_SCRIPT_LIMIT: &str = "the script hit a resource limit";
+pub(crate) const MSG_SANDBOX_UNAVAILABLE: &str =
+    "scripts are not available: the sandbox cannot be started on this system";
 const MSG_DELIVERY_INTEGRITY: &str = "the released result could not be delivered";
 
 /// The only statuses a request shows before it is terminal (§4.5).
@@ -140,7 +145,7 @@ pub fn failed_request(
     let mut env = base(
         Some(&head.request_id),
         Some(&head.op_id),
-        Some(&head.instance),
+        head.instance_opt(),
         Status::Failed,
     );
     env.error = Some(error(code, retryable, message, details));
@@ -170,7 +175,7 @@ pub fn cancelled_by_client(head: &RequestHead) -> Envelope {
     let mut env = base(
         Some(&head.request_id),
         Some(&head.op_id),
-        Some(&head.instance),
+        head.instance_opt(),
         Status::Cancelled,
     );
     env.error = Some(error(
@@ -402,6 +407,40 @@ pub fn released_data(rs: &RecordStatus, result: Value, redacted: bool, meta: Val
     env
 }
 
+/// §4.3 `released` of a script, exit 0 / 8: `data {result}` or `data {script_error}` (exit 8 by
+/// the key), from the committed `SCRIPT_RELEASED`.
+pub fn released_script(
+    rs: &RecordStatus,
+    released: Value,
+    redacted: bool,
+    meta: Value,
+) -> Envelope {
+    let mut env = base(
+        Some(&rs.request_id),
+        rs.op_id.as_deref(),
+        rs.instance.as_deref(),
+        Status::Released,
+    );
+    env.data = Some(released);
+    env.redacted = redacted;
+    env.meta = Some(meta);
+    env
+}
+
+/// §9.5 `succeeded` of a dry run: `meta.dry_run: true`, `data {result, logs}` (exit 0) or
+/// `data {script_error}` (exit 8).
+pub fn dry_run_succeeded(rs: &RecordStatus, data: Value) -> Envelope {
+    let mut env = base(
+        Some(&rs.request_id),
+        rs.op_id.as_deref(),
+        rs.instance.as_deref(),
+        Status::Succeeded,
+    );
+    env.data = Some(data);
+    env.meta = Some(json!({ "dry_run": true }));
+    env
+}
+
 /// §5.2 step 6: a released upstream error is `failed`, exit 6, `upstream_http`, `details
 /// {status, error_messages}` (only `status` after "Release status only"), `retryable: false`.
 pub fn released_upstream_error(
@@ -460,7 +499,7 @@ pub fn unlogged_envelope(
     let rs = RecordStatus {
         request_id: head.request_id.clone(),
         op_id: Some(head.op_id.clone()),
-        instance: Some(head.instance.clone()),
+        instance: head.instance_opt().map(str::to_owned),
         status,
         error: Some(RecordError {
             code: e.code,
@@ -502,6 +541,8 @@ pub fn needs_payload(t: EventType) -> bool {
             | EventType::WRITE_FAILED
             | EventType::CANCELLED
             | EventType::SCRIPT_FAILED
+            | EventType::SCRIPT_RELEASED
+            | EventType::SCRIPT_DRY_RUN
     )
 }
 
@@ -607,7 +648,30 @@ pub fn record_status(
                 .cloned();
             (Status::Denied, fail(code, false, text, details))
         }
-        EventType::WRITE_EXECUTED | EventType::SCRIPT_DRY_RUN => (Status::Succeeded, None),
+        EventType::WRITE_EXECUTED => (Status::Succeeded, None),
+        // §9.5 dry runs: a result or an error outcome is `succeeded` (an error carries
+        // `data.script_error`, exit 8); a compile error or a host-measured limit is `failed`.
+        EventType::SCRIPT_DRY_RUN => match str_of(payload, "outcome") {
+            Some("script_syntax") => (
+                Status::Failed,
+                fail(
+                    ErrorCode::ScriptSyntax,
+                    false,
+                    Some(MSG_SCRIPT_SYNTAX.to_owned()),
+                    details,
+                ),
+            ),
+            Some("script_limit") => (
+                Status::Failed,
+                fail(
+                    ErrorCode::ScriptLimit,
+                    false,
+                    Some(MSG_SCRIPT_LIMIT.to_owned()),
+                    details,
+                ),
+            ),
+            _ => (Status::Succeeded, None),
+        },
         EventType::SCRIPT_RELEASED => (Status::Released, None),
         // §4.3: a write that reached execution is never retryable (`needs_token` included).
         EventType::WRITE_FAILED => {
@@ -641,20 +705,42 @@ pub fn record_status(
             Status::Abandoned,
             fail(ErrorCode::Abandoned, true, None, None),
         ),
-        EventType::SCRIPT_FAILED => {
-            let reason = str_of(payload, "reason").unwrap_or_default();
-            if reason == "audit_failure" {
-                (
-                    Status::Failed,
-                    fail(ErrorCode::AuditFailure, true, None, None),
-                )
-            } else {
-                // Task 27 fixes the direct script failure codes (`script_syntax`, ...).
-                let code =
-                    code_of(payload.and_then(|p| p.get("reason"))).unwrap_or(ErrorCode::Internal);
-                (Status::Failed, fail(code, false, None, details))
-            }
-        }
+        // Terminal only when `direct` or `audit_failure` (§8.3, `terminal_flags`).
+        EventType::SCRIPT_FAILED => match str_of(payload, "reason").unwrap_or_default() {
+            "audit_failure" => (
+                Status::Failed,
+                fail(ErrorCode::AuditFailure, true, None, None),
+            ),
+            "script_syntax" => (
+                Status::Failed,
+                fail(
+                    ErrorCode::ScriptSyntax,
+                    false,
+                    Some(MSG_SCRIPT_SYNTAX.to_owned()),
+                    details,
+                ),
+            ),
+            "sandbox_unavailable" => (
+                Status::Failed,
+                fail(
+                    ErrorCode::SandboxUnavailable,
+                    false,
+                    Some(MSG_SANDBOX_UNAVAILABLE.to_owned()),
+                    None,
+                ),
+            ),
+            // Any other direct failure is a host-measured limit of a run that neither queued
+            // nor dispatched (§9.5); the limit's name stays in the record.
+            _ => (
+                Status::Failed,
+                fail(
+                    ErrorCode::ScriptLimit,
+                    false,
+                    Some(MSG_SCRIPT_LIMIT.to_owned()),
+                    None,
+                ),
+            ),
+        },
         _ => (Status::Pending, None),
     }
 }

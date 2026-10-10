@@ -36,7 +36,7 @@ use super::envelope::{self, OpenStatus};
 use super::queue::{AgentKey, Reservation, Ticket};
 use super::{
     Engine, NewEntry, RequestEntry, RequestHead, Session, TerminalError, audit_failure_retryable,
-    class_str, kind_of, payload_json, read, write,
+    class_str, kind_of, payload_json, read, script, write,
 };
 use crate::audit_port::commit_request_received;
 use crate::config::instances::product_str;
@@ -207,19 +207,19 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
     match entry.kind() {
         Kind::Read => read::dispatch(&engine, &entry),
         Kind::Write => write::dispatch(&engine, &entry),
-        // Task 27: scripts.
+        // Scripts are dispatched by `script::submit`, never through here.
         Kind::Script | Kind::DryRun => {}
     }
     // 10. §4.5: nothing but the four routing fields.
     envelope::pending_envelope(
         &entry.head.request_id,
         Some(&entry.head.op_id),
-        Some(&entry.head.instance),
+        entry.head.instance_opt(),
         OpenStatus::Pending,
     )
 }
 
-fn internal_error(message: &str) -> ValidationError {
+pub(super) fn internal_error(message: &str) -> ValidationError {
     ValidationError {
         code: ErrorCode::Internal,
         message: message.to_owned(),
@@ -284,7 +284,7 @@ fn target_column(
     }
 }
 
-fn excerpt(s: &str) -> String {
+pub(super) fn excerpt(s: &str) -> String {
     match s.char_indices().nth(REASON_EXCERPT_CHARS) {
         Some((cut, _)) => format!("{}…", &s[..cut]),
         None => s.to_owned(),
@@ -342,7 +342,7 @@ impl CoreHandler {
 
     /// Steps 7–8 failure: `REQUEST_REJECTED {code, message, details}` (decision `reject`), then
     /// `failed` with the request id. The id is never cover-ready again.
-    async fn reject(engine: &Engine, new: NewEntry, err: ValidationError) -> Envelope {
+    pub(super) async fn reject(engine: &Engine, new: NewEntry, err: ValidationError) -> Envelope {
         let ev = payloads::request_rejected(
             &new.ctx,
             err.code,
@@ -350,7 +350,7 @@ impl CoreHandler {
             &Value::Object(err.details.clone()),
         );
         let head = new.head.clone();
-        let kind = kind_of(new.spec);
+        let kind = new.model.kind();
         let appended = engine.blocking(move |p| p.append(ev)).await;
         engine.committed().forget_request(&head.request_id);
         match appended {
@@ -398,7 +398,7 @@ impl CoreHandler {
             return envelope::pending_envelope(
                 &entry.head.request_id,
                 Some(&entry.head.op_id),
-                Some(&entry.head.instance),
+                entry.head.instance_opt(),
                 open,
             );
         }
@@ -432,7 +432,7 @@ impl CoreHandler {
             return envelope::pending_envelope(
                 &entry.head.request_id,
                 Some(&entry.head.op_id),
-                Some(&entry.head.instance),
+                entry.head.instance_opt(),
                 open,
             );
         }
@@ -458,14 +458,14 @@ impl CoreHandler {
                     row: RequestRow {
                         request_id: e.head.request_id.clone(),
                         op_id: e.head.op_id.clone(),
-                        instance: Some(e.head.instance.clone()),
+                        instance: e.head.instance_opt().map(str::to_owned),
                         target_display: e.target_display.clone(),
                         params_sha256: e.params_sha256.clone(),
                         status: crate::lifecycle::model::agent_status(&st.model),
                         submitted_at: e.submitted_at.clone(),
                     },
                     agent_name: e.agent_name.clone(),
-                    instance_id: Some(e.instance_id.clone()),
+                    instance_id: (!e.instance_id.is_empty()).then(|| e.instance_id.clone()),
                 }
             })
             .collect()
@@ -776,12 +776,8 @@ impl RequestHandler for CoreHandler {
             .unwrap_or_else(|_| envelope::internal("the request task failed"))
     }
 
-    async fn submit_script(&self, _conn: &ConnectionMeta, _p: SubmitParams) -> Envelope {
-        if self.engine.is_shutting_down() {
-            return GateState::ShuttingDown.envelope();
-        }
-        // Task 27: the script lifecycle against the `ScriptRunner` seam.
-        envelope::internal(NOT_IN_THIS_BUILD_MESSAGE)
+    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
+        script::submit(&self.engine, conn, p).await
     }
 
     async fn await_request(

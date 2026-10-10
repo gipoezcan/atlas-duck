@@ -644,6 +644,17 @@ impl Engine {
         change: InstanceChange,
     ) {
         for entry in self.pending_entries() {
+            // Task 27: a script candidate that called the instance is invalidated when its
+            // PAT or origin changed (a new revision, opened again before it can be released).
+            if entry.kind() == crate::lifecycle::model::Kind::Script {
+                if matches!(
+                    change,
+                    InstanceChange::TokenReplaced | InstanceChange::OriginChanged { .. }
+                ) {
+                    super::script::on_instance_changed(self, &entry, instance_id).await;
+                }
+                continue;
+            }
             if entry.instance_id != instance_id {
                 continue;
             }
@@ -2544,6 +2555,7 @@ mod tests {
             unlogged_terminal: None,
             read: None,
             write: Some(WriteState::new(json!({}))),
+            script: None,
             expiry_due: false,
             instance_change_pending: None,
         })

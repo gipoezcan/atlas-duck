@@ -177,8 +177,8 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
     };
     let rev = item.candidate_rev;
     let kind = entry.kind();
-    // Task 27 adds scripts (released as `SCRIPT_RELEASED`).
-    if !matches!(kind, Kind::Read | Kind::Write) {
+    // A dry run is terminal at once; scripts release as `SCRIPT_RELEASED` (Task 27).
+    if !matches!(kind, Kind::Read | Kind::Write | Kind::Script) {
         return Err(Fail::Item(BatchFailure::NotPending));
     }
     let event_of = |s: &Snapshot| match kind {
@@ -254,11 +254,18 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
             if c.hash() != &rev.candidate_hash {
                 return Err(failed(engine, &entry, BatchFailure::Stale, rev.counter).await);
             }
-            let Some(read) = entry.state().read.clone() else {
-                return Err(Fail::Item(BatchFailure::NotPending));
+            let warnings = if kind == Kind::Script {
+                let Some(script) = entry.state().script.clone() else {
+                    return Err(Fail::Item(BatchFailure::NotPending));
+                };
+                crate::engine::script::preview_model(&script, &c).warnings
+            } else {
+                let Some(read) = entry.state().read.clone() else {
+                    return Err(Fail::Item(BatchFailure::NotPending));
+                };
+                let (_, cx) = read_context(&entry);
+                preview_model(&cx, &read, &c).warnings
             };
-            let (_, cx) = read_context(&entry);
-            let warnings = preview_model(&cx, &read, &c).warnings;
             (Natural::Release(c), warnings)
         }
     };
@@ -518,7 +525,7 @@ async fn deny_one(
             current_rev(&st)
         };
         let res = match entry.kind() {
-            Kind::Read => {
+            Kind::Read | Kind::Script => {
                 let d = Decision {
                     request_id: entry.head.request_id.clone(),
                     decision: DecisionKind::Deny,
@@ -531,8 +538,7 @@ async fn deny_one(
                 deny(engine, entry, &d).await
             }
             Kind::Write => deny_write(engine, entry, rev, Some(reason), None).await,
-            // Task 27 adds scripts.
-            Kind::Script | Kind::DryRun => return None,
+            Kind::DryRun => return None,
         };
         let retry = matches!(res, Err(DecisionError::Stale { .. }));
         last = Some(res);

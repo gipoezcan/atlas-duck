@@ -112,15 +112,25 @@ fn deliver_from_records(
     if OpenStatus::of(rs.status).is_some() {
         return envelope::await_envelope(&rs);
     }
-    let kind = start
-        .op_id
-        .as_deref()
-        .and_then(atlas_duck_registry::get)
-        .map_or(Kind::Read, kind_of);
+    let kind = if start.op_class.as_deref() == Some("script") {
+        Kind::Script
+    } else {
+        start
+            .op_id
+            .as_deref()
+            .and_then(atlas_duck_registry::get)
+            .map_or(Kind::Read, kind_of)
+    };
     let handoff = match terminal {
         Some(t) if t.event_type == EventType::READ_RELEASED => {
             released(&headers, t, payload, &rs, now, kind)
         }
+        Some(t) if t.event_type == EventType::SCRIPT_RELEASED => {
+            released(&headers, t, payload, &rs, now, kind)
+        }
+        // Data-free by construction (§9.5): the agent's own result or error, deliverable
+        // whenever asked; a compile error or a limit falls through to the error answer.
+        Some(t) if t.event_type == EventType::SCRIPT_DRY_RUN => dry_run(payload, &rs),
         Some(t) if t.event_type == EventType::WRITE_EXECUTED => {
             executed(p, start, t, write_decision(&headers, t), &rs, now)
         }
@@ -307,6 +317,7 @@ fn released(
         return with_error_hash(envelope::delivery_internal(rs));
     };
     drop(bytes);
+    let script = kind == Kind::Script;
     let redacted = payload
         .get("redaction_ops")
         .and_then(Value::as_array)
@@ -316,6 +327,26 @@ fn released(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    if script {
+        // §4.3: `data {result}` or `data {script_error}` (the candidate's own shape).
+        let finished_at = headers
+            .iter()
+            .rev()
+            .find(|h| {
+                matches!(
+                    h.event_type,
+                    EventType::SCRIPT_FINISHED | EventType::SCRIPT_FAILED
+                )
+            })
+            .map(|h| Value::String(h.ts_utc.clone()))
+            .unwrap_or(Value::Null);
+        meta.insert("finished_at".into(), finished_at);
+        meta.insert("released_at".into(), Value::String(t.ts_utc.clone()));
+        return Handoff {
+            env: envelope::released_script(rs, value, redacted, Value::Object(meta)),
+            payload_sha256,
+        };
+    }
     // The last one: a rename re-fetch (Task 26) records its audit-only first answer before it.
     let fetched_at = headers
         .iter()
@@ -337,5 +368,31 @@ fn released(
     Handoff {
         env,
         payload_sha256,
+    }
+}
+
+/// A dry run's hand-off (§9.5): `succeeded`, `meta.dry_run`, `data {result, logs}` or
+/// `data {script_error}`; compile errors and limits are the plain error answer. `DELIVERED`
+/// names the SHA-256 of the JCS bytes of the delivered `data`.
+fn dry_run(payload: Option<Value>, rs: &RecordStatus) -> Handoff {
+    let Some(payload) = payload else {
+        return with_error_hash(envelope::delivery_internal(rs));
+    };
+    let data = match payload.get("outcome").and_then(Value::as_str) {
+        Some("result") => serde_json::json!({
+            "result": payload.get("result").cloned().unwrap_or(Value::Null),
+            "logs": payload.get("logs").cloned().unwrap_or(Value::Null),
+        }),
+        Some("error") => serde_json::json!({
+            "script_error": payload.get("error").cloned().unwrap_or(Value::Null),
+        }),
+        _ => return with_error_hash(envelope::await_envelope(rs)),
+    };
+    let Ok(bytes) = atlas_duck_ipc::jcs::to_jcs_vec(&data) else {
+        return with_error_hash(envelope::delivery_internal(rs));
+    };
+    Handoff {
+        payload_sha256: Sha256::digest(&bytes).into(),
+        env: envelope::dry_run_succeeded(rs, data),
     }
 }

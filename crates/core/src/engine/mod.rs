@@ -30,6 +30,7 @@ pub mod envelope;
 pub mod handler;
 pub mod queue;
 pub mod read;
+pub mod script;
 pub mod write;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -78,8 +79,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct RequestHead {
     pub request_id: String,
     pub op_id: String,
-    /// The instance alias the request was routed to.
+    /// The instance alias the request was routed to; empty for a script (`instance: null` in
+    /// every envelope, §4.2).
     pub instance: String,
+}
+
+impl RequestHead {
+    /// The alias as an envelope shows it: `None` for a script.
+    pub fn instance_opt(&self) -> Option<&str> {
+        (!self.instance.is_empty()).then_some(self.instance.as_str())
+    }
 }
 
 /// The error a terminal state the store could not record carries (append failure, §11.1).
@@ -112,6 +121,8 @@ pub struct EntryState {
     pub read: Option<read::ReadState>,
     /// A write's params, enrichment verdict and request list (Task 22).
     pub write: Option<write::WriteState>,
+    /// A script's release item and run facts (Task 27).
+    pub script: Option<script::ScriptState>,
     /// The expiry timer fired while the model could not expire (`StaleCheck`, `Executing`,
     /// `Running`, `DryRunning`; Task 12 review I-4): the request expires as soon as it is in a
     /// phase that can ([`Engine::transition`] re-checks).
@@ -134,6 +145,8 @@ impl EntryState {
 pub struct RequestEntry {
     pub head: RequestHead,
     pub spec: &'static OperationSpec,
+    /// What the request is (a script's `spec` is [`script::SCRIPT_SPEC`]).
+    kind: Kind,
     pub instance_id: String,
     /// Lowercase hex (§4.4).
     pub params_sha256: String,
@@ -206,6 +219,7 @@ impl RequestEntry {
         RequestEntry {
             head: n.head,
             spec: n.spec,
+            kind: n.model.kind(),
             instance_id: n.instance_id,
             params_sha256: n.params_sha256,
             target_display: n.target_display,
@@ -228,6 +242,7 @@ impl RequestEntry {
                 unlogged_terminal: n.unlogged_terminal,
                 read: None,
                 write: None,
+                script: None,
                 expiry_due: false,
                 instance_change_pending: None,
             }),
@@ -246,12 +261,16 @@ impl RequestEntry {
     }
 
     pub fn kind(&self) -> Kind {
-        kind_of(self.spec)
+        self.kind
     }
 
-    /// `"read"` / `"write"`.
+    /// `"read"`, `"write"` or `"script"`.
     pub fn class(&self) -> &'static str {
-        class_str(self.spec)
+        match self.kind {
+            Kind::Read => "read",
+            Kind::Write => "write",
+            Kind::Script | Kind::DryRun => "script",
+        }
     }
 
     /// Since submission, on the suspend-aware clock.
@@ -511,6 +530,8 @@ pub struct EngineDeps {
     pub similarity: SimilarityIndex,
     /// §4.4: how long a request may stay pending (`[requests] expiry_hours`, default 24 h).
     pub expiry: Duration,
+    /// The script runner; `None` = no sandbox in this build (Task 27).
+    pub scripts: Option<Arc<dyn script::ScriptRunner>>,
     #[cfg(feature = "testing")]
     pub hooks: crate::core::TestHooks,
 }
@@ -590,6 +611,11 @@ pub struct Engine {
     /// §5.6 "Needs attention": post-approval failures and unknown outcomes until acknowledged
     /// (UI state, not audited, reset on restart).
     needs_attention: Mutex<BTreeSet<String>>,
+    scripts: Option<Arc<dyn script::ScriptRunner>>,
+    /// §9.4: concurrent real runs (2) and concurrent dry runs plus submit-time compile checks
+    /// (2, a separate pool real runs never occupy).
+    script_slots: Arc<Semaphore>,
+    dry_slots: Arc<Semaphore>,
     #[cfg(feature = "testing")]
     hooks: crate::core::TestHooks,
 }
@@ -627,6 +653,9 @@ impl Engine {
             expiry,
             batch_dialog: tokio::sync::Mutex::new(()),
             needs_attention: Mutex::new(BTreeSet::new()),
+            scripts: d.scripts,
+            script_slots: Arc::new(Semaphore::new(queue::SCRIPT_SLOTS)),
+            dry_slots: Arc::new(Semaphore::new(queue::DRY_SLOTS)),
             #[cfg(feature = "testing")]
             hooks: d.hooks,
         }
@@ -1232,6 +1261,11 @@ impl Engine {
             self.committed.forget_request(&entry.head.request_id);
             entry.release_ticket();
             entry.set_fetch_control(None);
+            // A request that ended while its worker lives (an append that failed, §11.1) takes
+            // the worker with it; a run that ended already is not killed again.
+            if let Some(shared) = entry.state().script.as_ref().and_then(|s| s.shared.clone()) {
+                shared.request_kill(script::KillReason::AuditFailure);
+            }
             self.candidates.remove(&entry.head.request_id);
             if logged {
                 self.entries

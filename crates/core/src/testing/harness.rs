@@ -42,6 +42,7 @@ use crate::decision::{DecisionApi, QueueItem};
 use crate::engine::Engine;
 use crate::engine::payload_json;
 use crate::engine::queue::Limits;
+use crate::engine::script::ScriptRunner;
 use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
 use crate::ids::InstanceId;
@@ -100,6 +101,7 @@ pub struct HarnessBuilder {
     timeouts: Option<Timeouts>,
     strict_https: bool,
     seed_origins: bool,
+    scripts: Option<Arc<dyn ScriptRunner>>,
 }
 
 impl HarnessBuilder {
@@ -212,6 +214,13 @@ impl HarnessBuilder {
         self
     }
 
+    /// The script runner of the core (`FakeScriptRunner`); without one, scripts answer
+    /// `sandbox_unavailable`.
+    pub fn scripts(mut self, runner: Arc<dyn ScriptRunner>) -> Self {
+        self.scripts = Some(runner);
+        self
+    }
+
     pub async fn start(self) -> Result<Harness, TestError> {
         let store = TempStore::new()?;
         let capture = Capture::new();
@@ -311,6 +320,7 @@ impl HarnessBuilder {
             http,
             app_start_extra: Map::new(),
             pats_deleted: Vec::new(),
+            scripts: self.scripts.clone(),
         };
         let hooks = TestHooks {
             limits: self.limits,
@@ -340,6 +350,7 @@ impl HarnessBuilder {
             },
             hooks,
             timeouts: self.timeouts,
+            scripts: self.scripts,
             _config_dir: config_dir,
             store,
         };
@@ -451,6 +462,7 @@ pub struct Harness {
     default_conn: ConnectionMeta,
     hooks: TestHooks,
     timeouts: Option<Timeouts>,
+    scripts: Option<Arc<dyn ScriptRunner>>,
     _config_dir: TempDir,
     /// Last: the core lets go of the store before the temp dir goes.
     store: TempStore,
@@ -471,6 +483,7 @@ impl Harness {
             timeouts: None,
             strict_https: false,
             seed_origins: true,
+            scripts: None,
         }
     }
 
@@ -527,6 +540,7 @@ impl Harness {
             http,
             app_start_extra: Map::new(),
             pats_deleted: Vec::new(),
+            scripts: self.scripts.clone(),
         };
         let core = Core::start_with_port(deps, self.port.clone(), self.hooks.clone()).await?;
         self.handler = CapturingHandler::wrap(core.handler(), self.capture.clone());
@@ -702,6 +716,25 @@ impl Harness {
                     op_id: op_id.to_owned(),
                     params,
                     instance: instance.map(str::to_owned),
+                    reason: None,
+                },
+            )
+            .await
+    }
+
+    /// `submit_script` on the default connection: `{source, args?, limits?, dry_run?}`.
+    pub async fn submit_script(&self, params: Value) -> Envelope {
+        self.submit_script_with(&self.default_conn, params).await
+    }
+
+    pub async fn submit_script_with(&self, conn: &ConnectionMeta, params: Value) -> Envelope {
+        self.handler
+            .submit_script(
+                conn,
+                SubmitParams {
+                    op_id: "script.run".to_owned(),
+                    params,
+                    instance: None,
                     reason: None,
                 },
             )

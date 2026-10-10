@@ -62,6 +62,9 @@ pub use decision::{
     DecisionOutcome, DenyDetails, PreviewDelivery, QueueItem, RawPage, SessionKey,
 };
 pub use edit::Edits;
+pub use engine::script::{
+    CompileError, HostCalls, KillReason, RunEnd, RunHandle, RunSpec, RunnerError, ScriptRunner,
+};
 pub use gate::{
     AttentionKind, GateHandler, GateState, MSG_FIRST_RUN, UiEvent, UiSink, gate_handler,
     hello_check, ops_describe_local, ops_list_local,

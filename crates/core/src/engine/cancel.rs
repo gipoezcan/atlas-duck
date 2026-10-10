@@ -29,6 +29,7 @@ use atlas_duck_ipc::envelope::{Envelope, Status};
 use serde_json::json;
 
 use super::envelope::{self, OpenStatus, RecordStatus};
+use super::script::KillReason;
 use super::{Engine, GateGuard, Prepared, RequestEntry};
 use crate::lifecycle::model::{CancelReason, Event, Kind, Phase, Rejection, is_pending};
 use crate::payloads::{self, FetchRecord, InFlightReason, ReadFetched};
@@ -230,14 +231,23 @@ impl Engine {
         cause: CancelCause,
     ) -> Locked {
         let event = cause.event();
-        let (prepared, fetching) = {
+        let (prepared, fetching, script) = {
             let mut st = entry.state();
             if !is_pending(st.model.phase()) {
                 return Locked::Unchanged;
             }
             let fetching = matches!(st.model.phase(), Phase::Fetching);
+            // A script that is `Running` or `DryRunning` has a worker to kill (Task 27).
+            let script = match st.model.phase() {
+                Phase::Running | Phase::DryRunning => st.script.as_ref().and_then(|s| {
+                    s.shared
+                        .clone()
+                        .map(|shared| (shared, s.queued, st.model.phase() == Phase::Running))
+                }),
+                _ => None,
+            };
             match Prepared::step(&st, event) {
-                Ok(p) => (p, fetching),
+                Ok(p) => (p, fetching, script),
                 Err(Rejection::Illegal) if matches!(event, Event::Expire) => {
                     st.expiry_due = true;
                     return Locked::Unchanged;
@@ -295,8 +305,74 @@ impl Engine {
                 }
             }
         }
-        // Task 27: a running script is killed here (`RunHandle::kill(KillReason::Client)`,
-        // without awaiting `wait`) and `SCRIPT_FAILED {cancelled_by_client}` goes first.
+        // A running script is killed here, before its terminal record and without awaiting
+        // `wait` (§4.4): the calls in flight are recorded (`cancelled_in_flight`), then the
+        // non-terminal `SCRIPT_FAILED {cancelled_by_client | app_quit | os_shutdown}`, then
+        // `CANCELLED`. A run that is `DryRunning` is only killed; one waiting for a slot has
+        // nothing to kill and gets `CANCELLED` alone.
+        if let Some((shared, queued, running)) = script {
+            let (kill, reason) = match cause {
+                CancelCause::Client => (KillReason::Client, "cancelled_by_client"),
+                CancelCause::Shutdown(ShutdownReason::AppQuit) => {
+                    (KillReason::Shutdown, "app_quit")
+                }
+                CancelCause::Shutdown(ShutdownReason::OsShutdown) => {
+                    (KillReason::Shutdown, "os_shutdown")
+                }
+                // `Expire` never gets here: the model refuses it while `Running`.
+                CancelCause::Expiry => (KillReason::Shutdown, "expired"),
+            };
+            shared.request_kill(kill);
+            if running {
+                for (info, ctl) in shared.take_in_flight() {
+                    ctl.cancel();
+                    let cap = ctl.take_captured();
+                    if !cap.sent {
+                        continue;
+                    }
+                    let size = cap
+                        .pages
+                        .iter()
+                        .map(|p| p.body.len() as u64)
+                        .sum::<u64>()
+                        .saturating_add(cap.partial.len() as u64);
+                    let ctx = payloads::EventCtx {
+                        instance_id: Some(info.instance_id.clone()),
+                        ..entry.ctx.clone()
+                    };
+                    records.push(payloads::script_call(
+                        &ctx,
+                        &payloads::ScriptCallMeta {
+                            call_id: info.call_id,
+                            op: &info.op,
+                            params: &info.params,
+                            instance: Some(&info.alias),
+                            user_key: info.user_key.as_deref(),
+                            rejection: Some("cancelled_in_flight"),
+                        },
+                        &ReadFetched::CancelledInFlight {
+                            reason: cause.in_flight(),
+                            responses: &cap.pages,
+                            partial: &cap.partial,
+                            size,
+                        },
+                        size,
+                        None,
+                    ));
+                }
+                records.push(payloads::script_failed(
+                    &entry.ctx,
+                    &payloads::ScriptFailed {
+                        reason,
+                        queued,
+                        dispatched: shared.dispatched(),
+                        direct: false,
+                        details: None,
+                        candidate: None,
+                    },
+                ));
+            }
+        }
         records.push(cause.terminal_record(entry));
         let appended = if records.len() == 1 {
             records
@@ -375,7 +451,7 @@ impl Engine {
             return envelope::pending_envelope(
                 &entry.head.request_id,
                 Some(&entry.head.op_id),
-                Some(&entry.head.instance),
+                entry.head.instance_opt(),
                 open,
             );
         }
@@ -415,7 +491,7 @@ fn ended_envelope(entry: &RequestEntry, cause: CancelCause) -> Envelope {
     envelope::status_envelope(&RecordStatus {
         request_id: entry.head.request_id.clone(),
         op_id: Some(entry.head.op_id.clone()),
-        instance: Some(entry.head.instance.clone()),
+        instance: entry.head.instance_opt().map(str::to_owned),
         status,
         error,
     })

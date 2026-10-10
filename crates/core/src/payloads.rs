@@ -1,6 +1,6 @@
 //! §8.3 payload builders: one per event kind `core` writes, each returning a `NewEvent` with the
 //! plaintext columns filled (decision column and caller-settable flags included) and a JSON
-//! payload with the §8.3 field names. `SCRIPT_*` builders are Task 27's.
+//! payload with the §8.3 field names (`SCRIPT_*` builders: Task 27).
 //!
 //! Plan decisions (spec silent): every hash is lowercase hex; a body is stored losslessly as
 //! `{"text"}`, `{"text", "tail_b64"}` or `{"b64"}` (padded RFC 4648), never larger than
@@ -840,6 +840,223 @@ pub fn read_failed(
         m.insert(k.into(), v.into());
     }
     event(ctx, EventType::READ_FAILED, Value::Object(m))
+}
+
+// ---- Scripts (Task 27, §8.3) -----------------------------------------------------------------
+
+/// The host's own view of a script run's error (§9.5): the worker's self-reported class, message
+/// and stack are untrusted payload, stored only for the release preview. Serialized as the
+/// candidate's `script_error` object `{class, message, stack, elapsed, logs, stderr}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptErrorDetails {
+    pub class: String,
+    pub message: String,
+    pub stack: String,
+    pub elapsed_ms: u64,
+    pub logs: Vec<String>,
+    pub stderr: String,
+}
+
+impl ScriptErrorDetails {
+    pub fn to_value(&self) -> Value {
+        json!({
+            "class": self.class,
+            "message": self.message,
+            "stack": self.stack,
+            "elapsed": self.elapsed_ms,
+            "logs": self.logs,
+            "stderr": self.stderr,
+        })
+    }
+}
+
+/// `SCRIPT_STARTED {source, args, limits, queued}` (§9.1 step 2): the full source, so the log
+/// can show what ran.
+pub fn script_started(
+    ctx: &EventCtx,
+    source: &str,
+    args: &Value,
+    limits: &atlas_duck_ipc::sandbox::ScriptLimits,
+    queued: bool,
+) -> NewEvent {
+    event(
+        ctx,
+        EventType::SCRIPT_STARTED,
+        json!({
+            "source": source,
+            "args": args,
+            "limits": serde_json::to_value(limits).unwrap_or(Value::Null),
+            "queued": queued,
+        }),
+    )
+}
+
+/// `SCRIPT_CALL_SENT {call_id, op_id, instance}` (non-terminal): the run is now dispatched.
+pub fn script_call_sent(
+    ctx: &EventCtx,
+    call_id: u64,
+    op_id: &str,
+    instance: Option<&str>,
+) -> NewEvent {
+    event(
+        ctx,
+        EventType::SCRIPT_CALL_SENT,
+        json!({ "call_id": call_id, "op_id": op_id, "instance": instance }),
+    )
+}
+
+/// What identifies one internal read of a script.
+#[derive(Debug, Clone, Copy)]
+pub struct ScriptCallMeta<'a> {
+    pub call_id: u64,
+    pub op: &'a str,
+    pub params: &'a Value,
+    /// The instance alias.
+    pub instance: Option<&'a str>,
+    /// The PAT's Atlassian user key (never the PAT).
+    pub user_key: Option<&'a str>,
+    /// The class the script saw when the call was rejected (`upstream_http`, `result_too_large`,
+    /// ...); `None` when the result was handed over.
+    pub rejection: Option<&'a str>,
+}
+
+/// `SCRIPT_CALL` (§8.3): the op, params, instance and user, with every byte received laid out as
+/// `READ_FETCHED` does (`responses`, or `outcome` with the partial bytes), then `bytes`.
+pub fn script_call(
+    ctx: &EventCtx,
+    meta: &ScriptCallMeta<'_>,
+    fetched: &ReadFetched<'_>,
+    bytes: u64,
+    user_resolutions: Option<&Value>,
+) -> NewEvent {
+    script_call_from(read_fetched(ctx, fetched, user_resolutions), meta, bytes)
+}
+
+/// [`script_call`] over an already built `READ_FETCHED`-shaped record (a classified fetch's own
+/// `record`): retyped, with the call's identity and `bytes` added.
+pub fn script_call_from(mut ev: NewEvent, meta: &ScriptCallMeta<'_>, bytes: u64) -> NewEvent {
+    ev.event_type = EventType::SCRIPT_CALL;
+    if let Some(m) = ev.payload.as_object_mut() {
+        m.insert("call_id".into(), meta.call_id.into());
+        m.insert("op".into(), meta.op.into());
+        m.insert("params".into(), meta.params.clone());
+        m.insert("instance".into(), json!(meta.instance));
+        m.insert("user_key".into(), json!(meta.user_key));
+        m.insert("rejection".into(), json!(meta.rejection));
+        m.insert("bytes".into(), bytes.into());
+    }
+    ev
+}
+
+/// `SCRIPT_FINISHED {result, logs, stderr}`: the release candidate of a run that returned.
+pub fn script_finished_result(
+    ctx: &EventCtx,
+    value: &Value,
+    logs: &[String],
+    stderr: &str,
+) -> NewEvent {
+    event(
+        ctx,
+        EventType::SCRIPT_FINISHED,
+        json!({ "result": value, "logs": logs, "stderr": stderr }),
+    )
+}
+
+/// `SCRIPT_FINISHED {error}`: the release candidate of a run that raised.
+pub fn script_finished_error(ctx: &EventCtx, error: &ScriptErrorDetails) -> NewEvent {
+    event(
+        ctx,
+        EventType::SCRIPT_FINISHED,
+        json!({ "error": error.to_value() }),
+    )
+}
+
+/// The flags and text of a `SCRIPT_FAILED` (§8.3): `direct` is exactly the §9.5 single rule.
+#[derive(Debug, Clone, Copy)]
+pub struct ScriptFailed<'a> {
+    pub reason: &'a str,
+    pub queued: bool,
+    pub dispatched: bool,
+    pub direct: bool,
+    /// `{line, column, message}` of a syntax error.
+    pub details: Option<&'a Value>,
+    /// The error-details candidate of a non-direct failure that is a release item.
+    pub candidate: Option<&'a Value>,
+}
+
+/// `SCRIPT_FAILED {reason, queued, dispatched, data_free, direct, details?, candidate?}`.
+pub fn script_failed(ctx: &EventCtx, f: &ScriptFailed<'_>) -> NewEvent {
+    let mut m = Map::new();
+    m.insert("reason".into(), f.reason.into());
+    m.insert("queued".into(), f.queued.into());
+    m.insert("dispatched".into(), f.dispatched.into());
+    m.insert("data_free".into(), (!f.dispatched).into());
+    m.insert("direct".into(), f.direct.into());
+    if let Some(d) = f.details {
+        m.insert("details".into(), d.clone());
+    }
+    if let Some(c) = f.candidate {
+        m.insert("candidate".into(), c.clone());
+    }
+    event(ctx, EventType::SCRIPT_FAILED, Value::Object(m))
+}
+
+/// What a `SCRIPT_RELEASED` hands over (§4.3): the result, or the error details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptReleasedItem {
+    Result,
+    Error,
+}
+
+impl ScriptReleasedItem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Result => "result",
+            Self::Error => "script_error",
+        }
+    }
+}
+
+/// `SCRIPT_RELEASED`: the released bytes (the candidate, `{result}` or `{script_error}`), the
+/// redaction ops that produced them and their SHA-256, like `READ_RELEASED`.
+pub fn script_released(
+    ctx: &EventCtx,
+    released: &[u8],
+    redaction_ops: &[RedactionOp],
+    item: ScriptReleasedItem,
+) -> Result<NewEvent, serde_json::Error> {
+    let mut ev = read_released(ctx, released, redaction_ops)?;
+    ev.event_type = EventType::SCRIPT_RELEASED;
+    if let Some(o) = ev.payload.as_object_mut() {
+        o.insert("item".into(), item.as_str().into());
+    }
+    Ok(ev)
+}
+
+/// `SCRIPT_DENIED {reason}`, decision `deny`.
+pub fn script_denied(ctx: &EventCtx, reason: Option<&str>) -> NewEvent {
+    let mut ev = read_denied(ctx, reason);
+    ev.event_type = EventType::SCRIPT_DENIED;
+    ev
+}
+
+/// `SCRIPT_DRY_RUN {mode, calls, outcome, result | error | details, logs}` (terminal; no
+/// `SCRIPT_STARTED`, no `SCRIPT_CALL`).
+pub fn script_dry_run(
+    ctx: &EventCtx,
+    mode: &str,
+    calls: &[Value],
+    outcome: &str,
+    body: (&str, &Value),
+    logs: &[String],
+) -> NewEvent {
+    let mut m = Map::new();
+    m.insert("mode".into(), mode.into());
+    m.insert("calls".into(), calls.to_vec().into());
+    m.insert("outcome".into(), outcome.into());
+    m.insert(body.0.into(), body.1.clone());
+    m.insert("logs".into(), logs.to_vec().into());
+    event(ctx, EventType::SCRIPT_DRY_RUN, Value::Object(m))
 }
 
 // ---- Writes ----------------------------------------------------------------------------------

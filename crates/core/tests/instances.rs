@@ -513,6 +513,7 @@ async fn install(
         http,
         app_start_extra: Map::new(),
         pats_deleted: Vec::new(),
+        scripts: None,
     };
     let hooks = TestHooks {
         allow_http: true,
@@ -1331,6 +1332,7 @@ async fn start_fails_closed_when_the_derivation_panics() -> TestResult {
         http,
         app_start_extra: Map::new(),
         pats_deleted: Vec::new(),
+        scripts: None,
     };
     let hooks = TestHooks {
         allow_http: true,
