@@ -778,7 +778,7 @@ async fn needs_attention_until_acknowledged() -> TestResult {
     h.approver().approve(&w).map_err(de)?;
     let env = h.await_(&w, 10_000).await;
     assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
-    assert_eq!(h.engine().needs_attention(), [w.clone()]);
+    assert_eq!(h.engine().needs_attention(), std::slice::from_ref(&w));
     h.decisions()
         .acknowledge_attention(std::slice::from_ref(&w));
     assert!(h.engine().needs_attention().is_empty());
@@ -791,5 +791,155 @@ async fn needs_attention_until_acknowledged() -> TestResult {
         .filter_map(|e| e.pointer("/NeedsAttentionChanged/count")?.as_u64())
         .collect();
     assert_eq!(counts, [1, 0]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i06_batch_with_similar_request_applies_none() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let a = read_item(&h, "ABC-1").await?;
+    // Same target, different params: "similar request", not "possible duplicate".
+    let b = request_id(
+        &h.submit(ISSUE, json!({ "key": "ABC-1", "fields": ["summary"] }))
+            .await,
+    )?;
+    h.queued(&b, 10_000).await.ok_or("never queued")?;
+    let ap = h.approver();
+    ap.open(&a).map_err(de)?;
+    ap.open(&b).map_err(de)?;
+    let row = ap.item(&b).ok_or("not queued")?;
+    assert_eq!(row.similar_to.as_deref(), Some(a.as_str()));
+    assert_eq!(row.possible_duplicate_of, None);
+    let failed = rejected(h.decisions().decide_batch(items(&h, &[&a, &b])?))?;
+    let flagged = BatchFailure::Invalid(InvalidReason::BatchItemFlagged);
+    let mut want = vec![(a.clone(), flagged), (b.clone(), flagged)];
+    want.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(failed, want);
+    assert_eq!(count_type(&h, EventType::BATCH_CONFIRMED)?, 0);
+    assert!(h.confirmer().texts().is_empty(), "no dialog");
+    still_queued(&h, &[&a, &b], true)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_releases_an_already_redacted_revision_with_its_redactions() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let a = read_item(&h, "ABC-1").await?;
+    let b = read_item(&h, "ABC-2").await?;
+    let ap = h.approver();
+    ap.open(&a).map_err(de)?;
+    let mask = atlas_duck_core::RedactionOp::MaskText {
+        text: "Login page".into(),
+        every_occurrence: true,
+        at: None,
+    };
+    // Ruling 3: a revision that already carries redactions (applied and opened individually)
+    // is batch-released with exactly those, and nothing new.
+    let rev = ap.redact(&a, vec![mask.clone()]).map_err(de)?;
+    h.decisions().preview_fetch(&a, Some(rev)).map_err(de)?;
+    ap.open(&b).map_err(de)?;
+    h.plan().record_appends(true);
+    let out = h
+        .decisions()
+        .decide_batch(items(&h, &[&a, &b])?)
+        .map_err(de)?;
+    h.plan().record_appends(false);
+    assert_eq!(out.items.len(), 2);
+    let calls = h.plan().appends();
+    let call = calls
+        .iter()
+        .find(|c| {
+            c.first()
+                .is_some_and(|e| e.event_type == EventType::BATCH_CONFIRMED)
+        })
+        .ok_or("no BATCH_CONFIRMED call")?;
+    assert_eq!(call.len(), 3);
+    let released = |id: &str| {
+        call[1..]
+            .iter()
+            .find(|e| e.request_id.as_deref() == Some(id))
+            .ok_or_else(|| format!("{id} not in the batch call"))
+    };
+    let ra = released(&a)?;
+    assert_eq!(ra.event_type, EventType::READ_RELEASED);
+    assert!(ra.flags.contains(EventFlags::BATCH | EventFlags::REDACTED));
+    assert_eq!(ra.payload["redaction_ops"], json!([mask]));
+    let rb = released(&b)?;
+    assert!(rb.flags.contains(EventFlags::BATCH));
+    assert!(!rb.flags.contains(EventFlags::REDACTED));
+    assert_eq!(rb.payload["redaction_ops"], json!([]));
+    assert_eq!(h.await_(&a, 5000).await.status, Status::Released);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn batch_rejects_an_outcome_item() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    // 17 MiB: over the release cap, so the item is the outcome card (§5.2 step 6).
+    let summary: String = "z".repeat(17 * 1024 * 1024);
+    let body = json!({ "key": "BIG-1", "fields": { "summary": summary } }).to_string();
+    jira(&h)?.json("/rest/api/2/issue/BIG-1", 200, &body).await;
+    let big = request_id(&h.submit(ISSUE, json!({ "key": "BIG-1" })).await)?;
+    h.queued(&big, 10_000).await.ok_or("never queued")?;
+    let ok = read_item(&h, "ABC-2").await?;
+    let ap = h.approver();
+    ap.open(&big).map_err(de)?;
+    ap.open(&ok).map_err(de)?;
+    let failed = rejected(h.decisions().decide_batch(items(&h, &[&big, &ok])?))?;
+    // §5.6/L43: outcome-only releases are individual decisions only.
+    assert_eq!(
+        failed,
+        [(
+            big.clone(),
+            BatchFailure::Invalid(InvalidReason::NotApprovable)
+        )]
+    );
+    assert_eq!(
+        records(&h, &big, EventType::DECISION_INVALID).await?,
+        [
+            json!({ "reason": "not_approvable", "submitted_rev": 1, "decision": "release", "batch": true })
+        ]
+    );
+    assert_eq!(count_type(&h, EventType::BATCH_CONFIRMED)?, 0);
+    assert!(records(&h, &ok, EventType::READ_RELEASED).await?.is_empty());
+    // Individually it releases.
+    ap.release(&big).map_err(de)?;
+    assert_eq!(h.await_(&big, 5000).await.status, Status::Failed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deny_session_skips_items_not_yet_queued() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    Mock::given(path(mock.path("/rest/api/2/issue/SLOW-1")))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(fixtures::JIRA_ISSUE, "application/json")
+                .set_delay(Duration::from_millis(1500)),
+        )
+        .mount(mock.server())
+        .await;
+    let queued = read_item(&h, "ABC-1").await?;
+    let slow = request_id(&h.submit(ISSUE, json!({ "key": "SLOW-1" })).await)?;
+    let session = h.approver().item(&queued).ok_or("gone")?.session;
+    assert!(h.approver().item(&slow).is_none(), "still fetching");
+    let n = h.decisions().deny_session(session, "stop").map_err(de)?;
+    assert_eq!(n, 1, "only the queued item is denied");
+    assert_eq!(h.await_(&queued, 5000).await.status, Status::Denied);
+    // The fetching one is left alone: it reaches the queue undenied.
+    h.queued(&slow, 10_000).await.ok_or("never queued")?;
+    assert!(records(&h, &slow, EventType::READ_DENIED).await?.is_empty());
     Ok(())
 }

@@ -301,3 +301,67 @@ async fn rf4_seeding_reads_create_and_move_payloads() -> TestResult {
     assert_eq!(index.similar_to(&resubmitted("Add dark mode")), None);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf4_seeding_reads_target_and_move_payloads() -> TestResult {
+    let h = Harness::jira().await?;
+    jira(&h)?
+        .json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let target = queued(&h, h.submit(ISSUE, json!({ "key": "ABC-1" })).await).await?;
+    let sprint = queued(
+        &h,
+        h.submit(
+            "jira.sprint.move_issues",
+            json!({ "id": 5, "issues": ["A-1", "A-2"] }),
+        )
+        .await,
+    )
+    .await?;
+    let backlog = queued(
+        &h,
+        h.submit("jira.backlog.move_issues", json!({ "issues": ["B-1"] }))
+            .await,
+    )
+    .await?;
+    let instance_id = h.instance("jira-main").ok_or("no instance")?.id.clone();
+    let record = |op: &str, params: Value| -> Result<SimRecord, TestError> {
+        Ok(SimRecord {
+            request_id: "req_resubmitted".to_owned(),
+            op_id: op.to_owned(),
+            instance_id: instance_id.clone(),
+            params_sha256: None,
+            key: sim_key(spec(op)?, &params),
+        })
+    };
+    let clock: Arc<dyn Clock> = h.clock().clone();
+    let index = SimilarityIndex::seed(&*h.port(), clock)?;
+    assert_eq!(index.seed_skipped(), 0);
+    let hit = |r: &SimRecord| index.similar_to(r).map(|x| (x.request_id, x.when));
+    let pending = |id: &String| Some((id.clone(), "pending".to_owned()));
+    // `Target`: from the plaintext column.
+    assert_eq!(
+        hit(&record(ISSUE, json!({ "key": "ABC-1" }))?),
+        pending(&target)
+    );
+    assert_eq!(hit(&record(ISSUE, json!({ "key": "ABC-2" }))?), None);
+    // `MoveIssues`: any shared issue key of the same sprint.
+    let sprint_move = |id: u64, issues: Value| {
+        record(
+            "jira.sprint.move_issues",
+            json!({ "id": id, "issues": issues }),
+        )
+    };
+    assert_eq!(
+        hit(&sprint_move(5, json!(["A-2", "A-9"]))?),
+        pending(&sprint)
+    );
+    assert_eq!(hit(&sprint_move(5, json!(["A-9"]))?), None);
+    assert_eq!(hit(&sprint_move(6, json!(["A-1"]))?), None);
+    let backlog_move = record(
+        "jira.backlog.move_issues",
+        json!({ "issues": ["B-1", "B-7"] }),
+    )?;
+    assert_eq!(hit(&backlog_move), pending(&backlog));
+    Ok(())
+}

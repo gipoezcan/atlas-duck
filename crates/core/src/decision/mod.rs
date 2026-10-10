@@ -253,6 +253,8 @@ pub trait DecisionApi: Send + Sync {
     fn decide_batch(&self, items: Vec<BatchItem>) -> Result<BatchOutcome, DecisionError>;
     /// No dialog, per item, not all-or-nothing (L43).
     fn deny_batch(&self, request_ids: &[String], reason: &str) -> Result<usize, DecisionError>;
+    /// `deny_batch` over the session's queued items. Items not yet queued or not decidable
+    /// (fetching, enriching, checking, executing) are skipped (§5.1, §5.6, L43).
     fn deny_session(&self, session: SessionKey, reason: &str) -> Result<usize, DecisionError>;
     /// In memory, not audited.
     fn acknowledge_attention(&self, request_ids: &[String]);

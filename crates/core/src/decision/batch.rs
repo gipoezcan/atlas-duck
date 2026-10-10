@@ -21,6 +21,10 @@
 //! 5. **Effects** only after the commit: the model steps apply, released reads wake their
 //!    watchers, approved writes start their stale checks (each bound to its approval).
 //!
+//! Outcome items (an outcome-only release: the cap, budget or failure card) are not batchable
+//! (§5.6: "outcome-only releases are individual decisions only"): they fail the check as
+//! `DECISION_INVALID {not_approvable, batch: true}`. Upstream-error items release as they are.
+//!
 //! The natural decision is the one the item's current, opened revision takes as it is: no edits
 //! and no new redactions (those are individual decisions). A read whose current revision already
 //! carries redaction ops (applied, then opened, individually) is released with them
@@ -51,7 +55,7 @@ use crate::engine::read::preview_model;
 use crate::engine::write;
 use crate::engine::{BatchCommitError, BatchStep, Engine, OnApply, RequestEntry};
 use crate::ids::BatchId;
-use crate::lifecycle::model::{Event, Kind, Rejection, is_pending};
+use crate::lifecycle::model::{Event, Kind, Rejection, ReleaseItem, is_pending};
 use crate::payloads::{self, InvalidReason, SubmittedDecision};
 
 /// Why an item check stopped: the item failed (the batch is rejected), or logging its failure
@@ -186,6 +190,18 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
     };
     let flagged = Flags::of(engine, &entry).any();
     let event = match dry_step(&entry, event_of, Some(&rev)) {
+        // §5.6/L43: outcome-only releases are individual decisions only.
+        Ok(_)
+            if kind == Kind::Read
+                && entry
+                    .state()
+                    .read
+                    .as_ref()
+                    .is_some_and(|r| r.item == ReleaseItem::Outcome) =>
+        {
+            let f = BatchFailure::Invalid(InvalidReason::NotApprovable);
+            return Err(failed(engine, &entry, f, rev.counter).await);
+        }
         Ok(_) if flagged => {
             let f = BatchFailure::Invalid(InvalidReason::BatchItemFlagged);
             return Err(failed(engine, &entry, f, rev.counter).await);
@@ -446,7 +462,12 @@ pub(super) async fn decide_batch(
         return Err(DecisionError::BatchRejected { failed: bad });
     }
     match engine.commit_batch(&gates, lead, steps).await {
-        Ok(_) => {}
+        // Every record-bearing event goes through its gate, which the batch holds, so a re-step
+        // cannot fail; the audit would then say something the model does not.
+        Ok(results) => debug_assert!(
+            results.iter().all(Result::is_ok),
+            "a batch item failed to apply after its commit"
+        ),
         Err(BatchCommitError::Audit(e)) => return Err(DecisionError::Audit(e)),
         // The request changed outside the gate between the check and the commit (e.g. a
         // rebuild failure cleared approvability): nothing was appended.
@@ -524,8 +545,9 @@ async fn deny_one(
 
 /// `DecisionApi::deny_batch`: every listed item still in the queue is denied with `reason`, one
 /// record each, no dialog; returns how many were denied. Items that are not (or no longer)
-/// waiting for a decision are skipped. An audit failure on some item does not stop the others;
-/// if nothing could be denied because of one, the audit error is returned.
+/// waiting for a decision are skipped. An audit failure on some item does not stop the others,
+/// but is returned once the rest is done (`Err(Audit)`): the items denied meanwhile stay
+/// denied, so on this error the caller re-reads the queue rather than trusting a count.
 pub(super) async fn deny_batch(
     engine: Arc<Engine>,
     request_ids: Vec<String>,
@@ -548,12 +570,15 @@ pub(super) async fn deny_batch(
         }
     }
     match audit {
-        Some(e) if denied == 0 => Err(DecisionError::Audit(e)),
-        _ => Ok(denied),
+        Some(e) => Err(DecisionError::Audit(e)),
+        None => Ok(denied),
     }
 }
 
-/// The queued items of one session (§5.6 "select all from session"), sorted.
+/// The queued items of one session (§5.6 "select all from session"), sorted. Only decidable
+/// items are listed (`AwaitingRelease` / `AwaitingApproval`): an item not yet queued (still
+/// fetching or enriching, or already checking or executing) has no deny transition (§5.1) and
+/// is skipped (§5.6, L43 "each still-pending item"), as a manual selection would skip it.
 pub(super) fn session_items(engine: &Engine, session: &SessionKey) -> Vec<String> {
     let mut ids: Vec<String> = engine
         .pending_entries()
