@@ -20,6 +20,7 @@ use wiremock::matchers::path;
 
 const ISSUE: &str = "jira.issue.get";
 const CREATE: &str = "jira.issue.create";
+const COMMENT: &str = "jira.comment.add";
 
 fn jira(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("jira-main").ok_or_else(|| "no jira mock".into())
@@ -303,27 +304,16 @@ async fn rf4_seeding_reads_create_and_move_payloads() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rf4_seeding_reads_target_and_move_payloads() -> TestResult {
+async fn rf4_seeding_reads_target_payloads_of_reads_and_writes() -> TestResult {
+    // The move ops are not available in this build yet ("operation not available"), so their
+    // seeding is exercised once T26 enables them; `move_issues_shared_key` covers their keys.
     let h = Harness::jira().await?;
     jira(&h)?
         .json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
         .await;
-    let target = queued(&h, h.submit(ISSUE, json!({ "key": "ABC-1" })).await).await?;
-    let sprint = queued(
-        &h,
-        h.submit(
-            "jira.sprint.move_issues",
-            json!({ "id": 5, "issues": ["A-1", "A-2"] }),
-        )
-        .await,
-    )
-    .await?;
-    let backlog = queued(
-        &h,
-        h.submit("jira.backlog.move_issues", json!({ "issues": ["B-1"] }))
-            .await,
-    )
-    .await?;
+    let read = queued(&h, h.submit(ISSUE, json!({ "key": "ABC-1" })).await).await?;
+    let comment_params = json!({ "key": "ABC-1", "body": "Done.", "body_format": "wiki" });
+    let write = queued(&h, h.submit(COMMENT, comment_params.clone()).await).await?;
     let instance_id = h.instance("jira-main").ok_or("no instance")?.id.clone();
     let record = |op: &str, params: Value| -> Result<SimRecord, TestError> {
         Ok(SimRecord {
@@ -339,29 +329,14 @@ async fn rf4_seeding_reads_target_and_move_payloads() -> TestResult {
     assert_eq!(index.seed_skipped(), 0);
     let hit = |r: &SimRecord| index.similar_to(r).map(|x| (x.request_id, x.when));
     let pending = |id: &String| Some((id.clone(), "pending".to_owned()));
-    // `Target`: from the plaintext column.
+    // `Target`: from the plaintext column, no decryption.
     assert_eq!(
         hit(&record(ISSUE, json!({ "key": "ABC-1" }))?),
-        pending(&target)
+        pending(&read)
     );
     assert_eq!(hit(&record(ISSUE, json!({ "key": "ABC-2" }))?), None);
-    // `MoveIssues`: any shared issue key of the same sprint.
-    let sprint_move = |id: u64, issues: Value| {
-        record(
-            "jira.sprint.move_issues",
-            json!({ "id": id, "issues": issues }),
-        )
-    };
-    assert_eq!(
-        hit(&sprint_move(5, json!(["A-2", "A-9"]))?),
-        pending(&sprint)
-    );
-    assert_eq!(hit(&sprint_move(5, json!(["A-9"]))?), None);
-    assert_eq!(hit(&sprint_move(6, json!(["A-1"]))?), None);
-    let backlog_move = record(
-        "jira.backlog.move_issues",
-        json!({ "issues": ["B-1", "B-7"] }),
-    )?;
-    assert_eq!(hit(&backlog_move), pending(&backlog));
+    assert_eq!(hit(&record(COMMENT, comment_params)?), pending(&write));
+    let other = json!({ "key": "ABC-2", "body": "Done.", "body_format": "wiki" });
+    assert_eq!(hit(&record(COMMENT, other)?), None);
     Ok(())
 }
