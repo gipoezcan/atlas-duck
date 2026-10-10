@@ -311,7 +311,8 @@ async fn check_all(
 fn dialog_text(lines: &[Line]) -> String {
     let n = lines.len();
     let reads = lines.iter().filter(|l| l.class == "read").count();
-    let writes = n - reads;
+    let scripts = lines.iter().filter(|l| l.class == "script").count();
+    let writes = n - reads - scripts;
     let plural = |k: usize, one: &str, many: &str| {
         if k == 1 {
             format!("1 {one}")
@@ -323,6 +324,9 @@ fn dialog_text(lines: &[Line]) -> String {
     if reads > 0 {
         parts.push(format!("release {}", plural(reads, "read", "reads")));
     }
+    if scripts > 0 {
+        parts.push(format!("release {}", plural(scripts, "script", "scripts")));
+    }
     if writes > 0 {
         parts.push(format!("approve {}", plural(writes, "write", "writes")));
     }
@@ -332,7 +336,11 @@ fn dialog_text(lines: &[Line]) -> String {
         parts.join(", ")
     );
     for (i, l) in lines.iter().enumerate() {
-        let _ = write!(s, "\n{}. {} {} on {}", i + 1, l.op_id, l.target, l.alias);
+        let _ = write!(s, "\n{}. {} {}", i + 1, l.op_id, l.target);
+        // A script runs on no instance.
+        if !l.alias.is_empty() {
+            let _ = write!(s, " on {}", l.alias);
+        }
         for c in &l.cautions {
             let _ = write!(s, "\n   Caution: {c}");
         }

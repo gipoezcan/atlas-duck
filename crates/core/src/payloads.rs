@@ -158,6 +158,18 @@ const _: () = assert!(
         <= atlas_duck_audit::MAX_PAYLOAD_LEN
 );
 
+/// Task 27: the largest `SCRIPT_FINISHED` carries a result of at most `max_result_mb` (16 MiB,
+/// §9.4) beside the run's logs and stderr, each at most one 24 MiB worker frame (§3.4); the
+/// largest `SCRIPT_CALL` is a `READ_FETCHED`-shaped record (the bound above) plus its params.
+/// A run whose record is larger than the store takes fails closed (`audit_failure`).
+pub const SCRIPT_RESULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const SCRIPT_LOGS_MAX_BYTES: u64 = 2 * 24 * 1024 * 1024;
+
+const _: () = assert!(
+    SCRIPT_RESULT_MAX_BYTES + SCRIPT_LOGS_MAX_BYTES + READ_FETCHED_FRAMING_BYTES
+        <= atlas_duck_audit::MAX_PAYLOAD_LEN
+);
+
 /// `{status, content_type, body}`.
 pub fn response_json(r: &UpstreamResponse) -> Value {
     json!({

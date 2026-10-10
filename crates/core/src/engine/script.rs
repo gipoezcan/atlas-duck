@@ -1003,14 +1003,6 @@ impl LiveBackend {
     ) -> Settled {
         let ctx = self.ctx_for(vc);
         let max_result = u64::from(self.limits.max_call_result_mb).saturating_mul(MIB);
-        let meta = |rejection: Option<&'static str>| ScriptCallMeta {
-            call_id: call.id,
-            op: &info.op,
-            params: &info.params,
-            instance: Some(&info.alias),
-            user_key: info.user_key.as_deref(),
-            rejection,
-        };
         match classified {
             Classified::Item(rec) => {
                 let size = rec.size();
@@ -1045,20 +1037,26 @@ impl LiveBackend {
                 };
                 Settled {
                     result,
-                    record: payloads::script_call_from(event, &meta(rejection), size),
+                    record: payloads::script_call_from(
+                        event,
+                        &call_meta(call, info, rejection),
+                        size,
+                    ),
                     size,
                     lossy,
                 }
             }
             Classified::Direct(d) => {
                 let size: u64 = d.responses.iter().map(|r| r.body.len() as u64).sum();
-                let reason = d.cause.map_or("internal", |(_, v)| v);
+                let reason = d
+                    .cause
+                    .map_or_else(|| class_name(d.code), |(_, v)| v.to_owned());
                 let record = payloads::script_call(
                     &ctx,
-                    &meta(Some(reason)),
+                    &call_meta(call, info, Some(&reason)),
                     &ReadFetched::Unavailable {
                         responses: &d.responses,
-                        reason,
+                        reason: &reason,
                     },
                     size,
                     None,
@@ -1082,6 +1080,21 @@ impl LiveBackend {
                 lossy: false,
             },
         }
+    }
+}
+
+fn call_meta<'a>(
+    call: &HostCall,
+    info: &'a CallInfo,
+    rejection: Option<&'a str>,
+) -> ScriptCallMeta<'a> {
+    ScriptCallMeta {
+        call_id: call.id,
+        op: &info.op,
+        params: &info.params,
+        instance: Some(&info.alias),
+        user_key: info.user_key.as_deref(),
+        rejection,
     }
 }
 

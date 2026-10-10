@@ -4,8 +4,9 @@
 //! Task 19 declared the contract and the queue; Task 21 decides reads (preview, raw pages,
 //! release, release with redactions, deny); Task 22 writes (preview, approve, edit, deny with
 //! hints); Task 23 batches (`batch`) and the "possible duplicate" / "similar request" flags of
-//! queue rows and previews (§5.6). Every return type is `Serialize` (PD-12: the capture hook
-//! records them).
+//! queue rows and previews (§5.6); Task 27 scripts (preview, release with or without
+//! redactions, deny, batch release: `SCRIPT_RELEASED` / `SCRIPT_DENIED`). Every return type is
+//! `Serialize` (PD-12: the capture hook records them).
 //!
 //! The trait is synchronous (PD-13): each call runs its async part on the core's runtime
 //! (`Engine::run_sync`). Every decision steps a clone of the model first (PD-19): a rejection is

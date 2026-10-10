@@ -9,11 +9,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use atlas_duck_atlassian::Timeouts;
+use atlas_duck_atlassian::testing::{
+    RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, XAuser, fixtures,
+};
 use atlas_duck_audit::EventType;
-use atlas_duck_core::testing::{FakeScriptRunner, FaultPlan, Harness, ScriptPlan, host_call};
-use atlas_duck_core::{HostCalls, KillReason, RunEnd, RunnerError, TestHooks};
+use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
+use atlas_duck_core::testing::{
+    FakeScriptRunner, FaultPlan, Harness, InstanceAt, ScriptPlan, host_call,
+};
+use atlas_duck_core::{BatchItem, Confirm, HostCalls, KillReason, RunEnd, RunnerError, TestHooks};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult};
+use atlas_duck_registry::Product;
 use common::{TestError, TestResult, code, de, detail, exit, request_id};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -751,5 +759,491 @@ async fn product_is_not_needed_for_a_script() -> TestResult {
         runner.results().first(),
         Some(HostCallResult::Rejected { .. })
     ));
+    Ok(())
+}
+
+// ---- more of the lifecycle ----------------------------------------------------------------------
+
+fn raw_answer(body: &[u8], content_length: usize) -> Vec<u8> {
+    let mut v = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {content_length}\r\nX-AUSERNAME: {TEST_USER}\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes();
+    v.extend_from_slice(body);
+    v
+}
+
+fn secret(s: &str) -> secrecy::SecretString {
+    secrecy::SecretString::from(s.to_owned())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_call_identity_failure_runs_the_recheck_and_rejects_needs_token() -> TestResult {
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![issue_call(1)],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let mock = requests_of(&h)?;
+    // The answer is attributed to `anonymous`, and the re-check says the token is dead (§7.1).
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("X-AUSERNAME", "anonymous")
+                .set_body_raw(fixtures::JIRA_ISSUE, "application/json"),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Anonymous)
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().first() {
+        Some(HostCallResult::Rejected { class, .. }) => assert_eq!(class, "needs_token"),
+        other => return Err(format!("not rejected: {other:?}").into()),
+    }
+    assert_eq!(
+        h.instances().list().first().map(|i| i.state),
+        Some("needs_token")
+    );
+    let rechecks: Vec<Value> = h
+        .events_of(EventType::SYSTEM_FETCH)
+        .await?
+        .into_iter()
+        .filter(|p| p["purpose"] == "token_recheck")
+        .collect();
+    assert_eq!(rechecks.len(), 2, "start and result records");
+    // The answer behind the rejection is audit-only: in `SCRIPT_CALL`, never in the result.
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert!(call.to_string().contains("Login page times out"));
+    assert_eq!(call["rejection"], "needs_token");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_with_a_call_in_flight_records_cancelled_in_flight() -> TestResult {
+    let server = RawHttpServer::serve_sequence(vec![vec![
+        RawStep::Send(raw_answer(br#"{"key":"ABC-1","fi"#, 1_000_000)),
+        RawStep::Sleep(120_000),
+    ]])
+    .await?;
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
+        vec![issue_call(1)],
+        result_end(json!(1)),
+    )]);
+    let h = Harness::builder()
+        .instance_at(
+            "jira-main",
+            Product::Jira,
+            InstanceAt {
+                base_url: server.base_url(),
+                ..InstanceAt::default()
+            },
+        )
+        .timeouts(Timeouts {
+            per_call: Duration::from_secs(300),
+            ..Timeouts::default()
+        })
+        .scripts(runner.clone())
+        .start()
+        .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the connection", || server.connections() >= 1).await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    let events = h.events(&id).await?;
+    let types: Vec<EventType> = events.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+            EventType::CANCELLED,
+        ]
+    );
+    let call = &events[3].1;
+    assert_eq!(call["outcome"], "cancelled_in_flight");
+    assert_eq!(call["reason"], "by_client");
+    assert!(
+        call["partial"]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("ABC-1")),
+        "the bytes received are recorded: {call}"
+    );
+    assert_eq!(events[4].1["reason"], "cancelled_by_client");
+    assert_eq!(events[4].1["dispatched"], true);
+    // The run's own late answer to the call is never committed after the terminal record.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(h.event_types(&id).await?.len(), 6);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_kills_a_running_script_and_cancels_it() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(30_000),
+    ])
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the run to start", || runner.starts() == 1).await?;
+    let env = h
+        .engine()
+        .cancel_and_wait(&id, CancelCause::Shutdown(ShutdownReason::AppQuit))
+        .await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    assert_eq!(runner.kills(), [Some(KillReason::Shutdown)]);
+    let events = h.events(&id).await?;
+    let types: Vec<EventType> = events.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_FAILED,
+            EventType::CANCELLED,
+        ]
+    );
+    assert_eq!(events[2].1["reason"], "app_quit");
+    assert_eq!(events[2].1["direct"], false);
+    assert_eq!(events[3].1["reason"], "app_quit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_kill_becomes_a_release_item() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(30_000),
+    ])
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the run to start", || runner.starts() == 1).await?;
+    assert!(h.engine().kill_script(&id));
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "killed_by_user");
+    assert_eq!(failed["direct"], false);
+    assert_eq!(failed["candidate"]["class"], "killed_by_user");
+    h.approver().release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    assert_eq!(exit(&env), 8);
+    assert_eq!(
+        env.data.clone().ok_or("no data")?["script_error"]["class"],
+        "killed_by_user"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn call_append_failure_ends_audit_failure_after_the_send() -> TestResult {
+    let faults = FaultPlan::new();
+    faults.fail_nth(EventType::SCRIPT_CALL, 1);
+    let (h, runner) = harness_with(
+        vec![ScriptPlan::new(vec![issue_call(1)], result_end(json!(1))).holding(30_000)],
+        TestHooks::none(),
+        faults,
+    )
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "audit_failure");
+    assert_eq!(exit(&env), 1);
+    assert_eq!(env.data, None);
+    // The request left before its record failed; nothing of the answer reached the script.
+    assert_eq!(requests_of(&h)?.received().await.len(), 1);
+    wait_for("the kill", || runner.kills().iter().any(Option::is_some)).await?;
+    assert_eq!(runner.kills(), [Some(KillReason::AuditFailure)]);
+    assert!(
+        !h.event_types(&id)
+            .await?
+            .contains(&EventType::SCRIPT_FINISHED)
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_replacement_invalidates_a_script_candidate_that_called_the_instance() -> TestResult {
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
+        vec![issue_call(1)],
+        result_end(json!({ "n": 1 })),
+    )]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner.clone())
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let mock = requests_of(&h)?;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    h.approver().open(&id).map_err(de)?;
+    let before = h.approver().item(&id).ok_or("not queued")?;
+    assert!(before.opened);
+    // Another user's token replaces the stored one (§7.1).
+    mock.server().reset().await;
+    mock.jira_myself("bob", "JIRAUSER2", XAuser::Same).await;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/serverInfo")))
+        .respond_with(
+            mock.response(200)
+                .insert_header("X-AUSERNAME", "bob")
+                .set_body_raw(fixtures::jira_server_info("9.12.0"), "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    h.instances()
+        .set_token("jira-main", secret("bobs-token"), None)
+        .await?;
+    let mut after = None;
+    for _ in 0..400 {
+        if let Some(item) = h.approver().item(&id)
+            && item.candidate_rev.counter > before.candidate_rev.counter
+        {
+            after = Some(item);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let after = after.ok_or("the revision never advanced")?;
+    // A new revision that must be opened again; the bytes are the same.
+    assert!(!after.opened && after.approvable);
+    assert_eq!(
+        after.candidate_rev.candidate_hash,
+        before.candidate_rev.candidate_hash
+    );
+    match h.approver().release_unopened(&id) {
+        Err(atlas_duck_core::DecisionError::Invalid(_)) => {}
+        other => return Err(format!("released without reopening: {other:?}").into()),
+    }
+    h.approver().release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncated_host_calls_warn_in_the_preview() -> TestResult {
+    let calls = vec![host_call(
+        1,
+        "jira.search",
+        json!({ "jql": "project = ABC", "max": 1 }),
+    )];
+    let (h, runner) = harness(vec![ScriptPlan::new(calls, result_end(json!(1)))]).await?;
+    requests_of(&h)?
+        .json(
+            "/rest/api/2/search",
+            200,
+            &fixtures::jira_search_page(0, 1, 5, 1),
+        )
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert!(matches!(
+        runner.results().first(),
+        Some(HostCallResult::Ok(_))
+    ));
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert_eq!(preview.header.class, "script");
+    let lossy: Vec<_> = preview
+        .warnings
+        .iter()
+        .filter(|w| w.id == atlas_duck_preview::warning::WarningId::HostCallsLossy)
+        .collect();
+    assert_eq!(lossy.len(), 1, "{:?}", preview.warnings);
+    assert_eq!(
+        lossy[0].text,
+        "1 host calls returned truncated or lossy data"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_page_and_redacted_release_of_a_result() -> TestResult {
+    let value = json!({ "keep": 1, "secret": "hunter2" });
+    let (h, _runner) =
+        harness(vec![ScriptPlan::new(Vec::new(), result_end(value.clone()))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let rev = h.approver().open(&id).map_err(de)?.preview.candidate_rev;
+    let page = h.decisions().raw_page(&id, rev, 0).map_err(de)?;
+    assert_eq!(
+        serde_json::from_slice::<Value>(&page.bytes)?,
+        json!({ "result": value })
+    );
+    h.approver()
+        .release_redacted(
+            &id,
+            vec![atlas_duck_core::RedactionOp::DropField {
+                path: "result.secret".to_owned(),
+                scope: atlas_duck_core::DropScope::PerItem,
+            }],
+        )
+        .map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    assert!(env.redacted);
+    assert_eq!(
+        env.data.clone().ok_or("no data")?["result"],
+        json!({ "keep": 1 })
+    );
+    let released = record(&h, &id, EventType::SCRIPT_RELEASED).await?;
+    assert_eq!(released["redaction_ops"].as_array().map(Vec::len), Some(1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scripts_release_in_a_batch() -> TestResult {
+    let runner = FakeScriptRunner::new(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!("a"))),
+        ScriptPlan::new(Vec::new(), result_end(json!("b"))),
+    ]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner)
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let id = submit(&h, json!({ "source": SRC })).await?;
+        h.queued(&id, 20_000).await.ok_or("never queued")?;
+        h.approver().open(&id).map_err(de)?;
+        ids.push(id);
+    }
+    let items: Vec<BatchItem> = ids
+        .iter()
+        .map(|id| {
+            Ok(BatchItem {
+                request_id: id.clone(),
+                candidate_rev: h.approver().rev(id).map_err(de)?,
+            })
+        })
+        .collect::<Result<_, TestError>>()?;
+    let out = h.decisions().decide_batch(items).map_err(de)?;
+    assert!(out.items.iter().all(|i| i.status == Status::Released));
+    for (id, want) in ids.iter().zip(["a", "b"]) {
+        let env = h.await_(id, 5000).await;
+        assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+        assert_eq!(env.data.clone().ok_or("no data")?["result"], json!(want));
+        assert!(
+            h.event_types(id)
+                .await?
+                .contains(&EventType::SCRIPT_RELEASED)
+        );
+    }
+    let texts = h.confirmer().texts();
+    assert_eq!(texts.len(), 1);
+    assert!(texts[0].contains("release 2 scripts"), "{}", texts[0]);
+    assert!(!texts[0].contains("write"), "{}", texts[0]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn evicted_script_candidates_are_rebuilt_from_their_records() -> TestResult {
+    let limited = RunEnd::HostLimit {
+        name: "timeout_s".to_owned(),
+    };
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(vec![issue_call(1)], result_end(json!({ "n": 7 }))),
+        ScriptPlan::new(vec![issue_call(1)], error_end()),
+        // Dispatched, so a limit is a release item whose candidate is in `SCRIPT_FAILED`.
+        ScriptPlan::new(vec![issue_call(1)], limited),
+    ])
+    .await?;
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        let id = submit(&h, json!({ "source": SRC })).await?;
+        h.queued(&id, 20_000).await.ok_or("never queued")?;
+        h.evict_candidate(&id);
+        ids.push(id);
+    }
+    assert_eq!(runner.starts(), 3);
+    for id in &ids {
+        h.approver().release(id).map_err(de)?;
+    }
+    let results = [
+        h.await_(&ids[0], 5000).await,
+        h.await_(&ids[1], 5000).await,
+        h.await_(&ids[2], 5000).await,
+    ];
+    assert_eq!(
+        results[0].data.clone().ok_or("no data")?["result"],
+        json!({ "n": 7 })
+    );
+    assert_eq!(exit(&results[1]), 8);
+    assert_eq!(
+        results[1].data.clone().ok_or("no data")?["script_error"]["class"],
+        "TypeError"
+    );
+    assert_eq!(
+        results[2].data.clone().ok_or("no data")?["script_error"]["class"],
+        "script_limit"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_list_shows_a_script_without_an_instance() -> TestResult {
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(json!(1)))]).await?;
+    let id = submit(&h, json!({ "source": "a\nb\nc" })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let env = h
+        .handler()
+        .requests_list(None, Some(atlas_duck_ipc::proto::ListState::Pending), None)
+        .await;
+    let rows = env.data.clone().ok_or("no data")?["requests"].clone();
+    let row = rows
+        .as_array()
+        .and_then(|r| r.iter().find(|r| r["request_id"] == id.as_str()))
+        .ok_or("the script is not listed")?;
+    assert_eq!(row["op_id"], "script.run");
+    assert_eq!(row["instance"], Value::Null);
+    assert_eq!(row["target_display"], "script · 3 lines");
+    assert_eq!(row["status"], "pending");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_over_max_result_mb_is_a_host_measured_limit() -> TestResult {
+    // `max_result_mb` is lowered by the agent; 2 MiB of result is over 1 MiB.
+    let (h, _runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!("x".repeat(2 * 1024 * 1024)))),
+        ScriptPlan::new(Vec::new(), result_end(json!("x".repeat(512 * 1024)))),
+    ])
+    .await?;
+    // Neither queued nor dispatched, so the limit is direct (§9.5).
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_result_mb": 1 } }),
+    )
+    .await?;
+    let env = h.await_(&id, 20_000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "script_limit");
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "max_result_mb");
+    assert_eq!(failed["direct"], true);
+    // Under it, the result is a release item.
+    let id2 = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_result_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id2, 20_000).await.ok_or("never queued")?;
+    assert!(
+        h.event_types(&id2)
+            .await?
+            .contains(&EventType::SCRIPT_FINISHED)
+    );
     Ok(())
 }

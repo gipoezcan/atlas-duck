@@ -9,7 +9,7 @@
 //! its own task, so a dropped caller future (a client that went away) cannot leave a committed
 //! request unapplied: it is validated and either queued or rejected in the log regardless.
 //! Reads are dispatched to the read flow (Task 21, `read`), writes to the write flow (Task 22,
-//! `write`); scripts are Task 27.
+//! `write`); scripts go through `script::submit` (Task 27).
 //!
 //! `await` answers a terminal request through `Engine::deliver` (committed records only, with
 //! `DELIVERED`); `status` and `cancel` give the reduced form and never deliver.
