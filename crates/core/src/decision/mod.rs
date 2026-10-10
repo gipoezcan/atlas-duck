@@ -1025,19 +1025,23 @@ async fn script_preview(
 
 /// `SCRIPT_RELEASED` of the current revision's exact candidate `c` with its redaction ops.
 fn script_release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, DecisionError> {
-    let (item, ops) = {
+    let (item, ops, redactions) = {
         let st = entry.state();
         (
             st.script.as_ref().and_then(|s| s.item),
             st.redaction_ops.clone(),
+            st.script.as_ref().and_then(|s| s.redaction_meta.clone()),
         )
     };
+    let meta = redactions
+        .and_then(|r| serde_json::to_value(r).ok())
+        .map(|r| serde_json::json!({ "redactions": r }));
     let item = match item {
         Some(ReleaseItem::ScriptResult) => payloads::ScriptReleasedItem::Result,
         Some(ReleaseItem::ScriptErrorDetails) => payloads::ScriptReleasedItem::Error,
         _ => return Err(DecisionError::NotDecidable),
     };
-    payloads::script_released(&entry.ctx, c.bytes(), &ops, item)
+    payloads::script_released(&entry.ctx, c.bytes(), &ops, item, meta.as_ref())
         .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))
 }
 

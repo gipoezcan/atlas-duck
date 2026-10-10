@@ -508,7 +508,7 @@ pub trait ScriptRunner: Send + Sync {                            // implemented 
 #[async_trait::async_trait]
 pub trait HostCalls: Send + Sync { async fn call(&self, run_id: &str, call: ipc::sandbox::HostCall) -> ipc::sandbox::HostCallResult; fn log(&self, run_id: &str, line: &str); }
 #[async_trait::async_trait]
-pub trait RunHandle: Send + Sync { fn kill(&self, why: KillReason); async fn wait(&self) -> RunEnd; }   // [as built in M3, Task 27: Δ `Send + Sync` and `wait(&self)`: the cancel path kills a run another task awaits; `start` returns `Arc<dyn RunHandle>`; `CoreDeps.scripts: Option<Arc<dyn ScriptRunner>>`, `None` = `sandbox_unavailable`]
+pub trait RunHandle: Send + Sync { fn kill(&self, why: KillReason); async fn wait(&self) -> RunEnd; }   // [as built in M3, Task 27: Δ `Send + Sync` and `wait(&self)`: the cancel path kills a run another task awaits; `wait` is called once by core, `kill` after the worker exited is a no-op and never signals a bare PID; `start` returns `Arc<dyn RunHandle>`; `CoreDeps.scripts: Option<Arc<dyn ScriptRunner>>`, `None` = `sandbox_unavailable`]
 pub struct RunSpec { pub run_id: String, pub source: String, pub args: serde_json::Value, pub limits: ipc::sandbox::ScriptLimits, pub dry_run: bool }   // `app::script_glue` turns it into `WorkerInit` (C.8)
 pub mod testing { /* scripted approver over DecisionApi, StubConfirmer (queue of Ok|Cancel), InMemoryCredentials, fake ScriptRunner (M3), Tauri-payload capture hook (§13 canary sweep) */ }
 ```

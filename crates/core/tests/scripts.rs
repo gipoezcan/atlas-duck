@@ -1099,6 +1099,9 @@ async fn raw_page_and_redacted_release_of_a_result() -> TestResult {
     );
     let released = record(&h, &id, EventType::SCRIPT_RELEASED).await?;
     assert_eq!(released["redaction_ops"].as_array().map(Vec::len), Some(1));
+    // A redacted release carries `meta.redactions`, as a read's does (§4.2).
+    let meta = env.meta.clone().ok_or("no meta")?;
+    assert_eq!(meta["redactions"]["fields_dropped"], json!(["secret"]));
     Ok(())
 }
 
@@ -1509,5 +1512,29 @@ async fn host_call_params_over_a_megabyte_are_rejected() -> TestResult {
             .await?
             .contains(&EventType::SCRIPT_CALL_SENT)
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_cap_overrun_is_a_script_limit_inside_the_script() -> TestResult {
+    let mut call = host_call(1, "jira.search", json!({ "jql": "project = ABC", "max": 1 }));
+    call.all = true;
+    let (h, runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
+    let page = json!({
+        "startAt": 0, "maxResults": 1, "total": 100_000,
+        "issues": [{ "id": "1", "key": "ABC-1", "fields": { "summary": "s".repeat(600 * 1024) } }]
+    })
+    .to_string();
+    requests_of(&h)?.json("/rest/api/2/search", 200, &page).await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [HostCallResult::Rejected { class, .. }] => assert_eq!(class, "script_limit"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
     Ok(())
 }

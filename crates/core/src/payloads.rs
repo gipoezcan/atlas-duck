@@ -1040,11 +1040,16 @@ pub fn script_released(
     released: &[u8],
     redaction_ops: &[RedactionOp],
     item: ScriptReleasedItem,
+    meta: Option<&Value>,
 ) -> Result<NewEvent, serde_json::Error> {
     let mut ev = read_released(ctx, released, redaction_ops)?;
     ev.event_type = EventType::SCRIPT_RELEASED;
     if let Some(o) = ev.payload.as_object_mut() {
         o.insert("item".into(), item.as_str().into());
+        // `meta.redactions` of a redacted release, from the record alone like a read's (§4.2).
+        if let Some(m) = meta {
+            o.insert("meta".into(), m.clone());
+        }
     }
     Ok(ev)
 }
