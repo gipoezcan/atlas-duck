@@ -309,6 +309,12 @@ impl AuditPort for RecordingPort {
     fn flush_head_anchor(&self) -> Result<(), AuditError> {
         Ok(())
     }
+    fn reconcile_config_file(
+        &self,
+        _file: &atlas_duck_audit::FilePolicy,
+    ) -> Result<Vec<Committed>, AuditError> {
+        Err(AuditError::Closed)
+    }
 }
 
 #[test]

@@ -287,10 +287,15 @@ async fn rf4_seeding_reads_create_and_move_payloads() -> TestResult {
     );
     assert_eq!(index.similar_to(&resubmitted("Third thing")), None);
 
-    // After the crash reconciliation (§11.3): the approved create is `outcome_unknown`, the
-    // never-approved one abandoned (never decided: no longer a hit).
-    h.store().reconcile_after_crash()?;
-    let index = SimilarityIndex::seed(&*h.port(), clock)?;
+    // A crash and a restart (Task 28): `Core::start` reconciles the log (§11.3) and then seeds
+    // its own index. The approved create is `outcome_unknown`, the never-approved one abandoned
+    // (never decided: no longer a hit), and so is the one whose payload cannot be read.
+    let mut h = h;
+    h.crash_and_restart().await?;
+    assert_eq!(h.core().startup_notice().len(), 1);
+    let index = h.engine().similarity();
+    // (The unreadable request was abandoned by the reconciliation: a gone request is not read.)
+    assert_eq!(index.seed_skipped(), 0);
     let hit = index
         .similar_to(&resubmitted("Fix login"))
         .ok_or("no hit")?;
@@ -300,6 +305,19 @@ async fn rf4_seeding_reads_create_and_move_payloads() -> TestResult {
     );
     assert_eq!(hit.text(), format!("similar to {approved} outcome unknown"));
     assert_eq!(index.similar_to(&resubmitted("Add dark mode")), None);
+    // The agent resubmits the identical create: the queue item names the first one, as a
+    // Caution (still approvable), and the preview says so.
+    let again = queued(&h, h.submit(CREATE, create_params("Fix login")).await).await?;
+    let row = h.approver().item(&again).ok_or("not queued")?;
+    assert_eq!(row.similar_to.as_deref(), Some(approved.as_str()));
+    assert!(row.approvable && row.caution_count >= 1);
+    let preview = h.approver().open(&again).map_err(de)?.preview;
+    let w = preview
+        .warnings
+        .iter()
+        .find(|w| w.id == WarningId::SimilarRequest)
+        .ok_or("no similar_request warning")?;
+    assert_eq!(w.text, format!("similar to {approved} outcome unknown"));
     Ok(())
 }
 

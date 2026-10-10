@@ -36,6 +36,8 @@ x509-parser = { workspace = true }
 base64 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 tokio-util = { workspace = true }
+# Constant, secret-free diagnostics of `Core::start` (never request data, S-15).
+tracing = { workspace = true }
 # The candidate LRU (§5.2 memory budget), byte-accounted by `engine::cache`.
 lru = { workspace = true }
 tempfile = { workspace = true, optional = true }

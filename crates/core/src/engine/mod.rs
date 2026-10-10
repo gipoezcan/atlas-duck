@@ -934,8 +934,9 @@ impl Engine {
         self.shutting_down.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn begin_shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
+    /// `true` for the call that started the shutdown, `false` for every later one.
+    pub(crate) fn begin_shutdown(&self) -> bool {
+        !self.shutting_down.swap(true, Ordering::SeqCst)
     }
 
     pub(crate) fn remember_session(&self, connection_id: &str, session: Session) {

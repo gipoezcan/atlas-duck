@@ -246,6 +246,25 @@ impl CoreInstances {
             .map_err(AdminError::Audit)
     }
 
+    /// `config.toml` as it is now (`Absent` without a path or when it cannot be read): what
+    /// `Core::after_restore` reconciles the audit policy against.
+    pub(crate) async fn current_config(self: &Arc<Self>) -> ConfigState {
+        let path = self.config_path.clone();
+        tokio::task::spawn_blocking(move || {
+            path.and_then(|p| load_config(&p).ok())
+                .unwrap_or(ConfigState::Absent)
+        })
+        .await
+        .unwrap_or(ConfigState::Absent)
+    }
+
+    /// [`CoreInstances::reload`] off the runtime (`Core::after_restore`: a restore deleted
+    /// PATs, so the table must be derived again).
+    pub(crate) async fn reload_now(self: &Arc<Self>) {
+        let this = self.clone();
+        let _ = tokio::task::spawn_blocking(move || this.reload()).await;
+    }
+
     /// PD-22: rebuilds the runtime table from `config.toml`, the audit settings and the
     /// keychain. The file-side records are logged at start only.
     fn reload(&self) -> Result<(), AdminError> {

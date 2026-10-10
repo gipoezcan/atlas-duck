@@ -37,7 +37,7 @@ use crate::audit_port::{AuditPort, DateBridge};
 use crate::config::instances::ensure_ids;
 use crate::config::instances::product_str;
 use crate::config::{CONFIG_FILE_NAME, load_config};
-use crate::core::{Confirm, Core, CoreDeps, TestHooks};
+use crate::core::{Confirm, Core, CoreDeps, HookPoint, TestHooks};
 use crate::decision::{DecisionApi, QueueItem};
 use crate::engine::Engine;
 use crate::engine::payload_json;
@@ -102,6 +102,8 @@ pub struct HarnessBuilder {
     strict_https: bool,
     seed_origins: bool,
     scripts: Option<Arc<dyn ScriptRunner>>,
+    pats_deleted: Vec<String>,
+    app_start_extra: Map<String, Value>,
 }
 
 impl HarnessBuilder {
@@ -221,6 +223,18 @@ impl HarnessBuilder {
         self
     }
 
+    /// `CoreDeps.pats_deleted` of the first start (a restore or recovery deleted these PATs).
+    pub fn pats_deleted(mut self, ids: Vec<String>) -> Self {
+        self.pats_deleted = ids;
+        self
+    }
+
+    /// `CoreDeps.app_start_extra` of the first start (PD-21).
+    pub fn app_start_extra(mut self, extra: Map<String, Value>) -> Self {
+        self.app_start_extra = extra;
+        self
+    }
+
     pub async fn start(self) -> Result<Harness, TestError> {
         let store = TempStore::new()?;
         let capture = Capture::new();
@@ -296,7 +310,8 @@ impl HarnessBuilder {
             seed_settings(&store, &instances, &seed_ids, self.strict_https)?;
         }
 
-        let port: Arc<dyn AuditPort> = Arc::new(FaultyAudit::wrap(store.port(), self.plan.clone()));
+        let faulty = Arc::new(FaultyAudit::wrap(store.port(), self.plan.clone()));
+        let port: Arc<dyn AuditPort> = faulty.clone();
         let ui = CapturingUi::wrap(Arc::new(NullUi), capture.clone());
         let confirmer = Arc::new(StubConfirmer::new(self.answers));
         let no_os_proxy = SystemProxySource::with_reader(Box::new(OsProxy::default));
@@ -318,8 +333,8 @@ impl HarnessBuilder {
             config,
             config_path: Some(config_path),
             http,
-            app_start_extra: Map::new(),
-            pats_deleted: Vec::new(),
+            app_start_extra: self.app_start_extra,
+            pats_deleted: self.pats_deleted,
             scripts: self.scripts.clone(),
         };
         let hooks = TestHooks {
@@ -327,6 +342,10 @@ impl HarnessBuilder {
             allow_http: !self.strict_https,
             ..self.hooks
         };
+        // `freeze_at` is armed on the plan: the crash point lives in the port layer.
+        if let Some(HookPoint::AfterAppend(t)) = hooks.freeze_at {
+            self.plan.freeze_after(t);
+        }
         let core = Core::start_with_port(deps, port.clone(), hooks.clone()).await?;
         let handler = CapturingHandler::wrap(core.handler(), capture.clone());
         let decisions = CapturingDecisions::wrap(core.decisions(), capture.clone());
@@ -341,6 +360,7 @@ impl HarnessBuilder {
             confirmer,
             credentials,
             plan: self.plan,
+            faulty,
             port,
             instances,
             next_conn: AtomicU64::new(0),
@@ -456,6 +476,8 @@ pub struct Harness {
     confirmer: Arc<StubConfirmer>,
     credentials: Arc<InMemoryCredentials>,
     plan: Arc<FaultPlan>,
+    /// The wrapper behind `port` (`crash_and_restart` kills it).
+    faulty: Arc<FaultyAudit>,
     port: Arc<dyn AuditPort>,
     instances: Vec<HarnessInstance>,
     next_conn: AtomicU64,
@@ -484,6 +506,8 @@ impl Harness {
             strict_https: false,
             seed_origins: true,
             scripts: None,
+            pats_deleted: Vec::new(),
+            app_start_extra: Map::new(),
         }
     }
 
@@ -549,6 +573,22 @@ impl Harness {
         self.core = core;
         self.default_conn = self.conn(HARNESS_AGENT).await?;
         Ok(())
+    }
+
+    /// A crash and a restart (Task 28): the old `Core` is dropped without `shutdown` and its
+    /// store wrapper stays as it is (a core that tripped a `FaultPlan::freeze_after` point is
+    /// dead for writes for good); a fresh wrapper over the same store, config file, keychain and
+    /// mocks serves the new `Core`, which reconciles the log like a real start (§11.3). The test
+    /// hooks `freeze_at` and `panic_on_jql` are not carried over.
+    pub async fn crash_and_restart(&mut self) -> Result<(), TestError> {
+        self.hooks.freeze_at = None;
+        self.hooks.panic_on_jql = None;
+        // The dead process writes nothing more: its tasks (a stalled read, a write in flight)
+        // may still run, but every append of theirs now fails.
+        self.faulty.kill();
+        self.faulty = Arc::new(FaultyAudit::wrap(self.store.port(), self.plan.clone()));
+        self.port = self.faulty.clone();
+        self.restart().await
     }
 
     /// The payloads of every record of type `t` from the last 24 h, in seq order, whatever
@@ -653,6 +693,11 @@ impl Harness {
     }
 
     /// The real store (bypasses the fault plan).
+    /// The store's data directory (the files the audit log lives in).
+    pub fn data_dir(&self) -> &std::path::Path {
+        self.store.data_dir()
+    }
+
     pub fn store(&self) -> Store {
         self.store.store()
     }

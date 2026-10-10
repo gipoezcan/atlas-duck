@@ -1333,6 +1333,8 @@ async fn write_5xx_is_outcome_unknown() -> TestResult {
     assert!(!env.to_json_line().contains("SERVERBODY"));
     let unknown = one(&h, &id, EventType::WRITE_OUTCOME_UNKNOWN).await?;
     assert_eq!(unknown["reason"], "server_error_5xx");
+    // Δ C.4 (Task 28): the HTTP status is in the record.
+    assert_eq!(unknown["status"], 503);
     Ok(())
 }
 

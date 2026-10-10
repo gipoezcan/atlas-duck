@@ -743,7 +743,8 @@ async fn shutting_down_refuses_submit_other_methods_answer() -> TestResult {
         )
         .await;
     assert_eq!(detail(&script, "reason"), json!("app_shutting_down"));
-    assert_eq!(h.status(&id).await.status, Status::Pending);
+    assert_eq!(h.status(&id).await.status, Status::Cancelled);
+    // Other methods keep working, and the sweep ended the request (§2.5 step 2).
     Ok(())
 }
 
@@ -816,7 +817,7 @@ async fn doctor_reports_per_alias_without_urls() -> TestResult {
     assert_eq!(jira["configured"], true);
     assert_eq!(jira["config_error"], Value::Null);
     assert_eq!(jira["needs_token"], false);
-    assert_eq!(jira["locked"], Value::Null, "unknown until Task 25");
+    assert_eq!(jira["locked"], false, "a running core has an open store");
     assert!(d["instances"]["wiki"].is_object());
     Ok(())
 }

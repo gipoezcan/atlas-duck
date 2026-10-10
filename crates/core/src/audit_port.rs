@@ -16,8 +16,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use atlas_duck_atlassian::{CommitProbe, DateObserver};
 use atlas_duck_audit::{
-    AuditError, Committed, Confirmed, EventHeader, EventType, NewEvent, QueryKind, ReconcileReport,
-    SettingChange, Settings, Store,
+    AuditError, Committed, Confirmed, EventHeader, EventType, FilePolicy, NewEvent, QueryKind,
+    ReconcileReport, SettingChange, Settings, Store,
 };
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -51,6 +51,10 @@ pub trait AuditPort: Send + Sync {
         confirmed: Option<Confirmed>,
     ) -> Result<Committed, AuditError>;
     fn flush_head_anchor(&self) -> Result<(), AuditError>;
+    /// X-01 (§8.8): logs the `config.toml` audit-policy values that differ from the settings in
+    /// force and lets prune run in this process. `Core::start` calls it before anything else
+    /// that appends; an `Err` leaves prune blocked.
+    fn reconcile_config_file(&self, file: &FilePolicy) -> Result<Vec<Committed>, AuditError>;
 }
 
 impl AuditPort for Store {
@@ -104,6 +108,10 @@ impl AuditPort for Store {
 
     fn flush_head_anchor(&self) -> Result<(), AuditError> {
         Store::flush_head_anchor(self)
+    }
+
+    fn reconcile_config_file(&self, file: &FilePolicy) -> Result<Vec<Committed>, AuditError> {
+        Store::reconcile_config_file(self, file)
     }
 }
 

@@ -12,9 +12,9 @@ use std::time::{Duration, Instant, SystemTime};
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::testing::{FakeClock, Faults, FreeSpaceStub, MemKeyStore, MemKeyring};
 use atlas_duck_audit::{
-    AuditError, Committed, Confirmed, EventFlags, EventHeader, EventType, FirstRunInput, Hooks,
-    NewEvent, OpenConfig, QueryKind, ReconcileReport, SettingChange, Settings, Store, UtcInstant,
-    create_new_store, new_ids,
+    AuditError, Committed, Confirmed, EventFlags, EventHeader, EventType, FilePolicy,
+    FirstRunInput, Hooks, NewEvent, OpenConfig, QueryKind, ReconcileReport, SettingChange,
+    Settings, Store, UtcInstant, create_new_store, new_ids,
 };
 use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
 use secrecy::SecretString;
@@ -162,6 +162,37 @@ pub struct FaultPlan {
     /// While on, every committed `append`/`append_batch` call is kept (`appends`).
     recording: AtomicBool,
     calls: Mutex<Vec<Vec<RecordedEvent>>>,
+    /// While on, `trail` keeps the order of the startup calls and committed appends.
+    trailing: AtomicBool,
+    trail: Mutex<Vec<String>>,
+    /// The armed crash point (`freeze_after`), until it trips.
+    freeze: Mutex<Option<Arc<Freeze>>>,
+    /// `reconcile_after_crash` fails (an integrity problem, Task 28).
+    fail_crash_reconcile: AtomicBool,
+}
+
+/// A crash point (Task 28): right after the append of `after` commits, the wrapper that
+/// committed it stops accepting any further `append`, `append_batch` and `apply_setting` (they
+/// answer `Closed`), as a process that died there would. Nothing the frozen core does later is
+/// written; a restart wraps the same store in a fresh `FaultyAudit`.
+#[derive(Debug)]
+pub struct Freeze {
+    after: EventType,
+    tripped: AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl Freeze {
+    pub fn tripped(&self) -> bool {
+        self.tripped.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the freeze has tripped (also when it tripped before the call).
+    pub async fn wait(&self) {
+        if !self.tripped() {
+            self.notify.notified().await;
+        }
+    }
 }
 
 /// One event of a committed `append`/`append_batch` call, as the port was handed it.
@@ -213,6 +244,40 @@ impl FaultPlan {
     /// The committed calls recorded so far, oldest first; one `Vec` per call.
     pub fn appends(&self) -> Vec<Vec<RecordedEvent>> {
         lock(&self.calls).clone()
+    }
+
+    /// From now on the order of `reconcile_config_file`, `reconcile_after_crash` and every
+    /// committed append is kept as text (`append:<EVENT_TYPE>`), see `trail`.
+    pub fn record_trail(&self, on: bool) {
+        self.trailing.store(on, Ordering::SeqCst);
+    }
+
+    pub fn trail(&self) -> Vec<String> {
+        lock(&self.trail).clone()
+    }
+
+    fn note_trail(&self, what: impl FnOnce() -> String) {
+        if self.trailing.load(Ordering::SeqCst) {
+            lock(&self.trail).push(what());
+        }
+    }
+
+    /// Arms a crash point: the next committed append of `t` freezes the wrapper (see
+    /// [`Freeze`]). Arm it when the test has reached the state it wants to crash in: an earlier
+    /// append of the same type would trip it first.
+    pub fn freeze_after(&self, t: EventType) -> Arc<Freeze> {
+        let f = Arc::new(Freeze {
+            after: t,
+            tripped: AtomicBool::new(false),
+            notify: tokio::sync::Notify::new(),
+        });
+        *lock(&self.freeze) = Some(f.clone());
+        f
+    }
+
+    /// `reconcile_after_crash` answers an integrity error while on.
+    pub fn fail_crash_reconcile(&self, on: bool) {
+        self.fail_crash_reconcile.store(on, Ordering::SeqCst);
     }
 
     fn note_call(&self, evs: Vec<RecordedEvent>) {
@@ -301,11 +366,45 @@ impl FaultPlan {
 pub struct FaultyAudit {
     inner: Arc<dyn AuditPort>,
     plan: Arc<FaultPlan>,
+    /// Set when this wrapper tripped a `Freeze`: it then refuses every write for good.
+    dead: AtomicBool,
+    /// Held across a write, so no other write commits between the one that trips a freeze and
+    /// the flag that stops the rest.
+    writes: Mutex<()>,
 }
 
 impl FaultyAudit {
     pub fn wrap(inner: Arc<dyn AuditPort>, plan: Arc<FaultPlan>) -> FaultyAudit {
-        FaultyAudit { inner, plan }
+        FaultyAudit {
+            inner,
+            plan,
+            dead: AtomicBool::new(false),
+            writes: Mutex::new(()),
+        }
+    }
+
+    /// This wrapper refuses every write from now on (the process it stood for died).
+    pub fn kill(&self) {
+        self.dead.store(true, Ordering::SeqCst);
+    }
+
+    fn check_alive(&self) -> Result<(), AuditError> {
+        if self.dead.load(Ordering::SeqCst) {
+            return Err(AuditError::Closed);
+        }
+        Ok(())
+    }
+
+    /// After a commit of `types`: trips the armed freeze if one of them is its type.
+    fn after_commit(&self, types: &[EventType]) {
+        let mut armed = lock(&self.plan.freeze);
+        if armed.as_ref().is_some_and(|f| types.contains(&f.after))
+            && let Some(f) = armed.take()
+        {
+            self.dead.store(true, Ordering::SeqCst);
+            f.tripped.store(true, Ordering::SeqCst);
+            f.notify.notify_one();
+        }
     }
 
     pub fn plan(&self) -> &Arc<FaultPlan> {
@@ -315,6 +414,8 @@ impl FaultyAudit {
 
 impl AuditPort for FaultyAudit {
     fn append(&self, ev: NewEvent) -> Result<Committed, AuditError> {
+        let _w = lock(&self.writes);
+        self.check_alive()?;
         self.plan.check([&ev])?;
         let t = ev.event_type;
         let recorded = self
@@ -324,13 +425,17 @@ impl AuditPort for FaultyAudit {
             .then(|| vec![RecordedEvent::of(&ev)]);
         let c = self.inner.append(ev)?;
         self.plan.note_committed(t, c.seq);
+        self.plan.note_trail(|| format!("append:{}", t.as_str()));
         if let Some(r) = recorded {
             self.plan.note_call(r);
         }
+        self.after_commit(&[t]);
         Ok(c)
     }
 
     fn append_batch(&self, evs: Vec<NewEvent>) -> Result<Vec<Committed>, AuditError> {
+        let _w = lock(&self.writes);
+        self.check_alive()?;
         self.plan.check(&evs)?;
         let types: Vec<EventType> = evs.iter().map(|e| e.event_type).collect();
         let recorded = self
@@ -342,9 +447,13 @@ impl AuditPort for FaultyAudit {
         for (t, c) in types.iter().zip(&cs) {
             self.plan.note_committed(*t, c.seq);
         }
+        for t in &types {
+            self.plan.note_trail(|| format!("append:{}", t.as_str()));
+        }
         if let Some(r) = recorded {
             self.plan.note_call(r);
         }
+        self.after_commit(&types);
         Ok(cs)
     }
 
@@ -376,7 +485,16 @@ impl AuditPort for FaultyAudit {
     }
 
     fn reconcile_after_crash(&self) -> Result<ReconcileReport, AuditError> {
+        self.plan.note_trail(|| "reconcile_after_crash".to_owned());
+        if self.plan.fail_crash_reconcile.load(Ordering::SeqCst) {
+            return Err(AuditError::Invalid("injected integrity failure (test hook)"));
+        }
         self.inner.reconcile_after_crash()
+    }
+
+    fn reconcile_config_file(&self, file: &FilePolicy) -> Result<Vec<Committed>, AuditError> {
+        self.plan.note_trail(|| "reconcile_config_file".to_owned());
+        self.inner.reconcile_config_file(file)
     }
 
     fn observe_server_date(&self, instance_id: &str, d: SystemTime, at: Instant) {
@@ -392,6 +510,7 @@ impl AuditPort for FaultyAudit {
         c: SettingChange,
         confirmed: Option<Confirmed>,
     ) -> Result<Committed, AuditError> {
+        self.check_alive()?;
         self.plan.check_switch()?;
         self.inner.apply_setting(c, confirmed)
     }

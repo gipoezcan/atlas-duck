@@ -487,6 +487,7 @@ async fn i23_write_3xx_failed_html200_outcome_unknown() -> TestResult {
     }
     let unknown = payloads_of(&h, &ids[1], EventType::WRITE_OUTCOME_UNKNOWN).await?;
     assert_eq!(unknown[0]["reason"], "undeclared_success");
+    assert_eq!(unknown[0]["status"], 200);
     // The page is in the record (audit-only).
     assert!(unknown[0]["received"].to_string().contains("Please log in"));
     Ok(())

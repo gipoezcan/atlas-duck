@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use atlas_duck_atlassian::{CoverIssuer, CredentialProvider};
-use atlas_duck_audit::{AuditError, Clock, Store};
+use atlas_duck_audit::{AuditError, Clock, ReconciledWrite, RestoreReport, Store};
 use atlas_duck_ipc::proto::RequestHandler;
 use serde_json::{Map, Value};
 
@@ -22,12 +22,13 @@ use crate::decision::{CoreDecisions, DecisionApi};
 use crate::engine::handler::CoreHandler;
 use crate::engine::queue::Limits;
 use crate::engine::script::ScriptRunner;
+use crate::engine::cancel::ShutdownReason as CancelWhy;
 use crate::engine::{Engine, EngineDeps};
-use crate::gate::UiSink;
+use crate::gate::{UiEvent, UiSink};
 use crate::http_factory::HttpFactory;
 use crate::instances::state::DeriveCtx;
 use crate::instances::{CoreInstances, InstanceAdmin, InstanceTable};
-use crate::payloads::{self, ConfigSource};
+use crate::payloads::{self, AppStopReason, ConfigSource};
 use crate::similarity::SimilarityIndex;
 
 /// §2.2: the native confirmation dialog (`app`: Tauri; tests: `testing::StubConfirmer`).
@@ -151,6 +152,8 @@ pub struct TestHooks {
     /// A write holds after one of its app-initiated GETs finished and its record is parked, before
     /// any append commits it (Task 24 review I-2).
     pub pause_after_get: Option<Arc<Pause>>,
+    /// Replaces the 60 s that `shutdown` waits for writes that are `executing` (§2.5 step 4).
+    pub shutdown_write_wait: Option<std::time::Duration>,
 }
 
 #[cfg(feature = "testing")]
@@ -162,7 +165,17 @@ impl TestHooks {
 
 /// The running core: one engine behind the handler (IPC), the decision API (UI, approver) and
 /// the instance admin (settings).
+/// What [`Core::shutdown`] did (§2.5).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Requests the sweep ended `cancelled` (reads, writes not yet executing, scripts).
+    pub cancelled: u32,
+    /// Writes that were `executing`, waited for until they logged their outcome.
+    pub writes_waited: u32,
+}
+
 pub struct Core {
+    notice: Vec<ReconciledWrite>,
     engine: Arc<Engine>,
     handler: Arc<CoreHandler>,
     decisions: Arc<CoreDecisions>,
@@ -212,6 +225,16 @@ impl Core {
         let allow_http = opts.hooks.allow_http;
         #[cfg(not(feature = "testing"))]
         let allow_http = false;
+        let install_id = deps.audit.install_id().to_owned();
+        // Startup step 2 (X-01, §8.8): the audit policy the file asks for, logged before
+        // anything else appends; prune stays blocked until this ran.
+        {
+            let (port, cfg) = (port.clone(), config.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::reconcile::reconcile_config_file(&*port, &cfg);
+            })
+            .await;
+        }
         // PD-22: the instance table from `config.toml`, the audit settings and the keychain; the
         // file-side edits it did not apply are logged once per start (I-31).
         let (instances, file_side) = {
@@ -239,12 +262,35 @@ impl Core {
             // Best effort: a failed append must not stop the app from starting.
             let _ = tokio::task::spawn_blocking(move || port.append(ev)).await;
         }
+        // Step 4 (§11.3): close every request the last run left open. The predicate is the
+        // store's. An error is an integrity problem: no `APP_START`, nothing deleted.
+        let report = {
+            let port = port.clone();
+            tokio::task::spawn_blocking(move || port.reconcile_after_crash())
+                .await
+                .unwrap_or(Err(AuditError::Closed))
+                .map_err(StartError::Audit)?
+        };
+        // Step 5 (L45, RF-4): the similarity index from the last 24 h of the log, after the
+        // reconciliation (a write whose outcome is unknown is a hit "outcome unknown"). The flags
+        // are advisory: a scan that fails starts the index empty.
+        let similarity = {
+            let (port, clock) = (port.clone(), deps.clock.clone());
+            tokio::task::spawn_blocking(move || SimilarityIndex::seed(&*port, clock))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+        };
+        let similarity = similarity.unwrap_or_else(|| {
+            tracing::warn!("the similarity index could not be seeded; it starts empty");
+            SimilarityIndex::new(deps.clock.clone())
+        });
+        let seed_skipped = similarity.seed_skipped();
         let committed = Arc::new(CommittedSet::default());
         // The composition root's one cover issuer: covers only for ids the port committed.
         let covers = CoverIssuer::new(Arc::new(StoreProbe(committed.clone())));
-        // Task 28 seeds it at startup step 5 (`SimilarityIndex::seed`, RF-4); until then the
-        // index starts empty and is kept current from submits and terminal states.
-        let similarity = SimilarityIndex::new(deps.clock.clone());
+        let ui = deps.ui.clone();
+        let (app_start_extra, pats_deleted) = (deps.app_start_extra, deps.pats_deleted);
         let engine = Arc::new(Engine::new(EngineDeps {
             port,
             committed,
@@ -263,12 +309,52 @@ impl Core {
             #[cfg(feature = "testing")]
             hooks: opts.hooks,
         }));
-        Ok(Core {
+        let core = Core {
+            notice: report.outcome_unknown,
             handler: Arc::new(CoreHandler::new(engine.clone())),
             decisions: Arc::new(CoreDecisions::new(engine.clone())),
             instances: Arc::new(CoreInstances::new(engine.clone(), config_path)),
             engine,
-        })
+        };
+        // Step 6 (PD-21): `APP_START` with the install id in `target`; then step 7 (PD-28): one
+        // `needs_token` record per PAT a restore or recovery deleted. The start fails if the log
+        // cannot take them: nothing is served that the log does not know about.
+        let proxies = core.effective_proxies().await;
+        let start = crate::reconcile::app_start_event(
+            &install_id,
+            &app_start_extra,
+            &config,
+            proxies,
+            seed_skipped,
+            &pats_deleted,
+        );
+        core.engine
+            .blocking(move |p| {
+                p.append(start)?;
+                crate::reconcile::log_pats_deleted(p, &pats_deleted)
+            })
+            .await
+            .map_err(StartError::Audit)?;
+        if !core.notice.is_empty() {
+            ui.emit(UiEvent::StatusBanner {
+                line_ids: vec![crate::reconcile::LINE_CHECK_TARGET.to_owned()],
+            });
+        }
+        Ok(core)
+    }
+
+    /// `{alias: "host:port" | "direct"}` for `APP_START` (§8.3). The OS proxy reading can block.
+    async fn effective_proxies(&self) -> Map<String, Value> {
+        let admin = self.instances.clone();
+        tokio::task::spawn_blocking(move || admin.list())
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| {
+                let proxy = v.proxy_effective.unwrap_or_else(|| "direct".to_owned());
+                (v.alias, Value::String(proxy))
+            })
+            .collect()
     }
 
     /// What `IpcServer` serves.
@@ -291,11 +377,61 @@ impl Core {
         &self.engine
     }
 
-    /// §2.5 step 1: from now on every `submit`/`submit_script` is refused `app_shutting_down`;
-    /// other methods keep working. Steps 2–5 (cancel, wait for executing writes, `APP_STOP`)
-    /// are Task 28's.
-    pub async fn shutdown(&self, _reason: ShutdownReason) {
-        self.engine.begin_shutdown();
+    /// The one §2.5 shutdown path (I-40): (1) from now on every `submit` / `submit_script` is
+    /// refused `app_shutting_down` (other methods keep working until the app exits); (2, 3)
+    /// every request that is not `executing` ends `cancelled` with the app's reason, a running
+    /// script is killed first; (4) writes that are `executing` are waited for, at most 60 s;
+    /// (5) the head anchor is flushed and `APP_STOP` is appended. A second call changes nothing.
+    /// OS end-session blocking (`ShutdownBlockReasonCreate` etc.) is M6's.
+    pub async fn shutdown(&self, reason: ShutdownReason) -> ShutdownReport {
+        if !self.engine.begin_shutdown() {
+            return ShutdownReport::default();
+        }
+        let (why, stop) = match reason {
+            ShutdownReason::Quit => (CancelWhy::AppQuit, AppStopReason::Quit),
+            // The installer path cancels with the app's own reason (§8.3: `app_quit`).
+            ShutdownReason::Installer => (CancelWhy::AppQuit, AppStopReason::Installer),
+            ShutdownReason::OsShutdown => (CancelWhy::OsShutdown, AppStopReason::OsShutdown),
+        };
+        #[cfg(feature = "testing")]
+        let wait = self
+            .engine
+            .hooks()
+            .shutdown_write_wait
+            .unwrap_or(crate::shutdown::WRITE_WAIT);
+        #[cfg(not(feature = "testing"))]
+        let wait = crate::shutdown::WRITE_WAIT;
+        let swept = crate::shutdown::sweep(&self.engine, why, wait).await;
+        // A failed `APP_STOP` append leaves the next start to reconcile; nothing else to do at
+        // exit.
+        let _ = crate::shutdown::stop(&self.engine, stop).await;
+        ShutdownReport {
+            cancelled: swept.cancelled,
+            writes_waited: swept.writes_waited,
+        }
+    }
+
+    /// M10's restore UI calls this after an in-process `Store::restore` (M2 handoff 3): the
+    /// config file is reconciled again (prune stays blocked until it ran), each instance whose
+    /// PAT the restore deleted (`report.pats_deleted`) gets its `INSTANCE_STATE_CHANGED
+    /// {needs_token}` record, and the instance table is read again (those are `needs_token`).
+    pub async fn after_restore(&self, report: &RestoreReport) -> Result<(), AuditError> {
+        let ids = report.pats_deleted.clone();
+        let cfg = self.instances.current_config().await;
+        self.engine
+            .blocking(move |p| {
+                crate::reconcile::reconcile_config_file(p, &cfg);
+                crate::reconcile::log_pats_deleted(p, &ids)
+            })
+            .await?;
+        self.instances.reload_now().await;
+        Ok(())
+    }
+
+    /// The writes the crash reconciliation of this start closed as `outcome_unknown` (§11.3):
+    /// the startup notice lists their targets ("check the target before resubmitting").
+    pub fn startup_notice(&self) -> Vec<ReconciledWrite> {
+        self.notice.clone()
     }
 }
 

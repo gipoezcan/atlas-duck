@@ -19,4 +19,4 @@ pub use harness::{
     HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, InstanceAt, NoProgress,
 };
 pub use runner::{FakeScriptRunner, ScriptPlan, host_call};
-pub use store::{FaultPlan, FaultyAudit, RecordedEvent, TempStore};
+pub use store::{FaultPlan, FaultyAudit, Freeze, RecordedEvent, TempStore};

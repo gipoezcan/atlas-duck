@@ -913,7 +913,8 @@ impl RequestHandler for CoreHandler {
                 _ => Value::Null,
             };
             // PD-11 from cached state only; reachability, TLS, proxy and version are known
-            // after a connection test or a request (Tasks 25/26), until then `null`.
+            // after a connection test or a request (Tasks 25/26), until then `null`. `locked`:
+            // a running `Core` has an open store (the gate handler answers `true` otherwise).
             instances.insert(
                 i.alias.clone(),
                 json!({
@@ -921,7 +922,7 @@ impl RequestHandler for CoreHandler {
                     "config_error": config_error,
                     "reachable": null,
                     "needs_token": i.state == InstanceState::NeedsToken,
-                    "locked": null,
+                    "locked": false,
                     "tls_error": null,
                     "proxy_error": null,
                     "identity_header": identity_header,

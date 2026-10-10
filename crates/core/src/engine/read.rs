@@ -150,6 +150,19 @@ async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
     if let Some(pause) = engine.hooks().pause_before_fetch.clone() {
         pause.hold().await;
     }
+    // S-15: a read whose JQL holds the hook's text dies here, after `REQUEST_RECEIVED`. The
+    // payload names nothing of the request.
+    #[cfg(feature = "testing")]
+    if let Some(needle) = engine.hooks().panic_on_jql.as_deref()
+        && entry
+            .validated
+            .as_ref()
+            .and_then(|v| v.params.get("jql"))
+            .and_then(Value::as_str)
+            .is_some_and(|jql| jql.contains(needle))
+    {
+        std::panic::panic_any("read task panic (test hook)");
+    }
     let Some(_permit) = fetch_slot(&engine, &entry).await else {
         return;
     };
