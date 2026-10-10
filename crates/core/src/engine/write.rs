@@ -478,6 +478,7 @@ impl Engine {
             self.fail_unlogged(entry);
             return false;
         }
+        entry.take_parked();
         true
     }
 
@@ -1376,6 +1377,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
             let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
             entry.set_in_flight(None);
             let record = get_record(&entry.ctx, purpose, http.client.base(), &call, &outcome);
+            park(engine, entry, &record).await;
             let got = if refreshing {
                 recheck(outcome).map_err(Err)
             } else {
@@ -1435,6 +1437,18 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         ),
     };
     enriched(engine, entry, verdict, failure, requests, last).await;
+}
+
+/// The GET finished and its record is built: park it until an append commits it, so a cancel or
+/// expiry in between still logs it (Task 24 review I-2).
+async fn park(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, record: &NewEvent) {
+    entry.park_record(record);
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks.pause_after_get.clone() {
+        pause.hold().await;
+    }
+    #[cfg(not(feature = "testing"))]
+    let _ = engine;
 }
 
 /// A failed GET of an enrichment: in a refresh a return to the previous hold (`WRITE_STALE`);
@@ -1715,6 +1729,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
     let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
     entry.set_in_flight(None);
     let mut last = get_record(&entry.ctx, purpose, base, &call, &outcome);
+    park(engine, entry, &last).await;
     if let Err(fail) = identity_check(outcome, spec.product, &identity.atlassian_user_key) {
         stale_fail(engine, entry, approval, Some(last), fail).await;
         return;
@@ -1742,6 +1757,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
             let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
             entry.set_in_flight(None);
             last = get_record(&entry.ctx, purpose, base, &call, &outcome);
+            park(engine, entry, &last).await;
             match recheck(outcome) {
                 Ok(v) => bodies.push(v),
                 Err(fail) => {

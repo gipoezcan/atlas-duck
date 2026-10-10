@@ -165,6 +165,11 @@ pub struct RequestEntry {
     /// The app-initiated GET of a write in flight (purpose and resolved path): what a
     /// `cancelled_in_flight` record of it names (Task 24).
     in_flight: Mutex<Option<InFlight>>,
+    /// The record of a write's finished GET that no append has committed yet (Task 24 review
+    /// I-2): a cancel or expiry commits it ahead of the terminal record. Every gated append
+    /// that follows the GET takes it (it is the record being appended), so it is never
+    /// committed twice.
+    parked: Mutex<Option<NewEvent>>,
 }
 
 /// The GET a write's control is currently running (`PREVIEW_FETCH` `purpose` and `path`).
@@ -231,6 +236,7 @@ impl RequestEntry {
             gate: Arc::new(tokio::sync::Mutex::new(())),
             fetch: Mutex::new(None),
             in_flight: Mutex::new(None),
+            parked: Mutex::new(None),
         }
     }
 
@@ -285,12 +291,29 @@ impl RequestEntry {
         if ctl.is_none() {
             *lock(&self.in_flight) = None;
         }
+        // A new control starts a new run of GETs, a dropped one ends it: nothing parked
+        // survives either (the record of the last GET is committed or dropped with its task).
+        *lock(&self.parked) = None;
         *lock(&self.fetch) = ctl;
+    }
+
+    /// A write's GET finished and its record is built: park a copy until an append commits it.
+    pub(crate) fn park_record(&self, record: &NewEvent) {
+        *lock(&self.parked) = Some(record.clone());
+    }
+
+    /// The parked record (the cancel path commits it; a gated append drops it).
+    pub(crate) fn take_parked(&self) -> Option<NewEvent> {
+        lock(&self.parked).take()
     }
 
     /// A write's GET starts (`Some`) or ended (`None`): only a GET that is in flight gets a
     /// `cancelled_in_flight` record.
     pub(crate) fn set_in_flight(&self, f: Option<InFlight>) {
+        if f.is_some() {
+            // The next GET starts: the previous record was committed (or its task is gone).
+            *lock(&self.parked) = None;
+        }
         *lock(&self.in_flight) = f;
     }
 
@@ -1049,6 +1072,7 @@ impl Engine {
             }
             return Err(TransitionError::Audit(e));
         }
+        entry.take_parked();
         #[cfg(feature = "testing")]
         if let Some(pause) = self.hooks.pause_in_transition.clone() {
             pause.hold().await;

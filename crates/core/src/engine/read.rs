@@ -771,6 +771,7 @@ async fn item(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, b: Built) {
     } = b;
     let item = state.item;
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
+    let owner = entry.clone();
     let applied = engine
         .transition_with(
             entry,
@@ -786,12 +787,14 @@ async fn item(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, b: Built) {
                 // §5.1 inv. 6: a fresh read candidate has no ops to block it.
                 st.model.set_approvable(true);
                 cache.candidates().insert(&id, candidate);
+                // The raw fetch is freed once `READ_FETCHED` is committed (§5.2 memory budget),
+                // in this gated step: a cancel or expiry after it must not find a control to
+                // record a second time (Task 24 review I-1).
+                owner.set_fetch_control(None);
             },
         )
         .await;
     if applied.is_ok() {
-        // The raw fetch is freed once `READ_FETCHED` is committed (§5.2 memory budget).
-        entry.set_fetch_control(None);
         let ui = engine.ui();
         ui.emit(UiEvent::QueueChanged {
             request_ids: vec![entry.head.request_id.clone()],

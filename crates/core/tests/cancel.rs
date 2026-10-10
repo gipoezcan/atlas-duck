@@ -14,7 +14,7 @@ use atlas_duck_atlassian::testing::{
 use atlas_duck_audit::EventType;
 use atlas_duck_core::TestHooks;
 use atlas_duck_core::engine::Engine;
-use atlas_duck_core::engine::cancel::CancelCause;
+use atlas_duck_core::engine::cancel::{CancelBusy, CancelCause, ShutdownReason};
 use atlas_duck_core::engine::queue::Limits;
 use atlas_duck_core::testing::{Harness, InstanceAt};
 use atlas_duck_ipc::envelope::{Envelope, Status};
@@ -31,8 +31,8 @@ const TRANSITION: &str = "jira.issue.transition";
 
 /// Compile-time check (I-09): `cancel_now` is synchronous. It compiles only because it is not
 /// `async`: an `async fn` would return a future here, not an `Envelope`.
-#[allow(dead_code)]
-fn assert_cancel_now_is_sync(e: &Engine, id: &str) -> Envelope {
+#[expect(dead_code)]
+fn assert_cancel_now_is_sync(e: &Engine, id: &str) -> Result<Envelope, CancelBusy> {
     e.cancel_now(id, CancelCause::Client)
 }
 
@@ -350,7 +350,10 @@ async fn i09_cancel_path_never_awaits_network() -> TestResult {
         .map_err(|_| "cancel waited for the network")?;
     assert_cancelled(&env);
     assert_eq!(server.closed(), 0);
-    let again = h.engine().cancel_now(&id, CancelCause::Client);
+    let again = h
+        .engine()
+        .cancel_now(&id, CancelCause::Client)
+        .map_err(|_| "cancel_now reported a busy gate")?;
     // Terminal now: the reduced status, never a second record.
     assert_eq!(again.status, Status::Cancelled);
     assert_eq!(h.event_types(&id).await?.len(), 3);
@@ -718,5 +721,242 @@ async fn expiry_hours_come_from_config_and_fall_back_to_24() -> TestResult {
         let cfg = format!("[requests]\nexpiry_hours = {bad}\n");
         assert_eq!(hours(&cfg).await?, h(24), "{bad}");
     }
+    Ok(())
+}
+
+// ---- review fix round (T24 I-1, I-2, I-3) ---------------------------------------------------------
+
+fn not_in_flight(rec: &Value) {
+    assert_ne!(rec["outcome"], "cancelled_in_flight", "{rec}");
+}
+
+/// I-1 and the age clause of the expiry re-check: the request's age passes the expiry while the
+/// `Fetched` transition holds the gate (the timer never fired, `expiry_due` is unset). The
+/// re-check inside that transition expires it; the fetch is recorded once, by the transition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i1_expiry_recheck_after_fetched_records_the_fetch_once() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let hooks = TestHooks {
+        pause_in_transition: Some(pause.clone()),
+        expiry: Some(Duration::from_secs(3600)),
+        ..TestHooks::none()
+    };
+    let issue = fixtures::JIRA_ISSUE.as_bytes();
+    let (h, _server) = raw_jira(
+        vec![vec![RawStep::Send(raw_answer(issue, issue.len()))]],
+        None,
+        hooks,
+    )
+    .await?;
+    let id = submit_pending(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    // `READ_FETCHED` is committed; the model has not applied `Fetched` yet.
+    pause.reached.notified().await;
+    h.clock().advance(Duration::from_secs(2 * 3600));
+    pause.release.notify_one();
+    assert!(h.settled(&id, 10_000).await, "never expired");
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::READ_FETCHED,
+            EventType::EXPIRED
+        ]
+    );
+    let fetched = records(&h, &id, EventType::READ_FETCHED).await?;
+    fetched.iter().for_each(not_in_flight);
+    let env = h.status(&id).await;
+    assert_eq!((env.status, exit(&env)), (Status::Expired, 7));
+    Ok(())
+}
+
+async fn transition_enrichment(
+    pause: &std::sync::Arc<atlas_duck_core::Pause>,
+) -> Result<(Harness, String), TestError> {
+    let hooks = TestHooks {
+        pause_after_get: Some(pause.clone()),
+        ..TestHooks::none()
+    };
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(hooks)
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    mock.json(
+        "/rest/api/2/issue/ABC-1/transitions",
+        200,
+        fixtures::JIRA_TRANSITIONS,
+    )
+    .await;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let id = submit_pending(
+        &h,
+        TRANSITION,
+        json!({ "key": "ABC-1", "transition": "Done" }),
+    )
+    .await?;
+    Ok((h, id))
+}
+
+/// I-2, first GET of a two-GET enrichment: finished, not yet appended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i2_cancel_after_first_enrichment_get_commits_its_record() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let (h, id) = transition_enrichment(&pause).await?;
+    pause.reached.notified().await;
+    assert_cancelled(&h.handler().cancel(&id).await);
+    // The enrichment task goes on and finds the request terminal.
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::CANCELLED
+        ]
+    );
+    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let f = fetch.first().ok_or("no PREVIEW_FETCH")?;
+    assert_eq!(f["purpose"], "resolve");
+    not_in_flight(f);
+    assert!(f["path"].to_string().contains("/transitions"), "{f}");
+    Ok(())
+}
+
+/// I-2, last GET of an enrichment: the first one is committed by `append_pending`, the second
+/// is parked when the cancel lands (before `enriched` could commit it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i2_cancel_after_last_enrichment_get_commits_its_record() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let (h, id) = transition_enrichment(&pause).await?;
+    pause.reached.notified().await;
+    pause.release.notify_one();
+    pause.reached.notified().await;
+    assert_cancelled(&h.handler().cancel(&id).await);
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::CANCELLED
+        ]
+    );
+    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let purposes: Vec<_> = fetch.iter().map(|f| f["purpose"].clone()).collect();
+    assert_eq!(purposes, [json!("resolve"), json!("enrich")]);
+    fetch.iter().for_each(not_in_flight);
+    Ok(())
+}
+
+/// I-2, stale check (and the shutdown cause, the one cause a `StaleCheck` accepts): the identity
+/// GET finished, its record is parked, the shutdown sweep commits it first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i2_shutdown_after_stale_check_get_commits_its_record() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let hooks = TestHooks {
+        pause_after_get: Some(pause.clone()),
+        ..TestHooks::none()
+    };
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(hooks)
+        .start()
+        .await?;
+    jira(&h)?
+        .jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let id = queued(
+        &h,
+        COMMENT,
+        json!({ "key": "ABC-1", "body": "Reproduced.", "body_format": "wiki" }),
+    )
+    .await?;
+    h.approver().approve(&id).map_err(de)?;
+    pause.reached.notified().await;
+    // A client cancel is refused in `StaleCheck` (pinned: the envelope stays `pending`).
+    let refused = h.handler().cancel(&id).await;
+    assert_eq!(
+        refused.status,
+        Status::Pending,
+        "{}",
+        refused.to_json_line()
+    );
+    let env = h
+        .engine()
+        .cancel_and_wait(&id, CancelCause::Shutdown(ShutdownReason::AppQuit))
+        .await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let types = h.event_types(&id).await?;
+    let tail: Vec<_> = types.iter().rev().take(2).rev().copied().collect();
+    assert_eq!(tail, [EventType::PREVIEW_FETCH, EventType::CANCELLED]);
+    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let f = fetch.last().ok_or("no PREVIEW_FETCH")?;
+    assert_eq!(f["purpose"], "stale_check");
+    not_in_flight(f);
+    assert!(f["path"].to_string().contains("myself"), "{f}");
+    let cancelled = records(&h, &id, EventType::CANCELLED).await?;
+    assert_eq!(
+        cancelled.first().map(|c| c["reason"].clone()),
+        Some(json!("app_quit"))
+    );
+    Ok(())
+}
+
+/// I-3: a gate that stays busy makes `cancel_now` report `CancelBusy` (nothing was changed); the
+/// awaited path waits for the gate and ends the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i3_busy_gate_is_visible_and_the_awaited_path_waits() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let hooks = TestHooks {
+        pause_in_transition: Some(pause.clone()),
+        ..TestHooks::none()
+    };
+    let issue = fixtures::JIRA_ISSUE.as_bytes();
+    let (h, _server) = raw_jira(
+        vec![vec![RawStep::Send(raw_answer(issue, issue.len()))]],
+        None,
+        hooks,
+    )
+    .await?;
+    let id = submit_pending(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    // The `Fetched` transition holds the gate.
+    pause.reached.notified().await;
+    let engine = h.engine().clone();
+    let (sweep, sid) = (engine.clone(), id.clone());
+    let awaited = tokio::spawn(async move {
+        sweep
+            .cancel_and_wait(&sid, CancelCause::Shutdown(ShutdownReason::OsShutdown))
+            .await
+    });
+    let (poll, pid) = (engine, id.clone());
+    let busy =
+        tokio::task::spawn_blocking(move || poll.cancel_now(&pid, CancelCause::Client)).await?;
+    assert!(matches!(busy, Err(CancelBusy)));
+    assert!(!awaited.is_finished(), "the awaited path gave up");
+    // Nothing was ended by the busy call.
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    pause.release.notify_one();
+    let env = awaited.await?;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    let cancelled = records(&h, &id, EventType::CANCELLED).await?;
+    assert_eq!(
+        cancelled.first().map(|c| c["reason"].clone()),
+        Some(json!("os_shutdown"))
+    );
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::READ_FETCHED,
+            EventType::CANCELLED
+        ]
+    );
     Ok(())
 }

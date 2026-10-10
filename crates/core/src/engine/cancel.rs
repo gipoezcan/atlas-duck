@@ -1,9 +1,9 @@
 //! Cancel and expiry (§4.4, §5.2 step 3, §5.4 step 2, §2.5 step 2; Task 24).
 //!
-//! [`Engine::cancel_now`] is the one synchronous path to a cancelled, expired or shutdown-ended
-//! request. It never awaits (so it never waits on the network, an aborted connection or a
-//! reaped process) and holds only `std::sync` locks plus the entry's transition gate, which it
-//! takes with `try_lock`.
+//! [`Engine::cancel_now`] (synchronous, non-runtime callers) and [`Engine::cancel_and_wait`]
+//! (async callers, the shutdown sweep) run the same gated section. Neither waits on the network,
+//! an aborted connection or a reaped process; they hold only `std::sync` locks plus the entry's
+//! transition gate (`try_lock`, polled, for `cancel_now`; awaited for the async path).
 //!
 //! **The gate rule (Task 21 handoff, binding).** The request's [`FetchControl`] is cancelled and
 //! its capture taken only while the entry's transition gate is held ([`Engine::cancel_locked`]),
@@ -30,7 +30,7 @@ use serde_json::json;
 
 use super::envelope::{self, OpenStatus, RecordStatus};
 use super::{Engine, GateGuard, Prepared, RequestEntry};
-use crate::lifecycle::model::{CancelReason, Event, Kind, Rejection, is_pending};
+use crate::lifecycle::model::{CancelReason, Event, Kind, Phase, Rejection, is_pending};
 use crate::payloads::{self, FetchRecord, InFlightReason, ReadFetched};
 
 /// Who ends the request (§4.4, §2.5).
@@ -41,7 +41,23 @@ pub enum CancelCause {
     /// The expiry timer (or `expire_now`).
     Expiry,
     /// The shutdown path (§2.5 step 2, Task 28).
-    Shutdown(CancelReason),
+    Shutdown(ShutdownReason),
+}
+
+/// Why the app ends its pending requests (a client cancel is [`CancelCause::Client`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    AppQuit,
+    OsShutdown,
+}
+
+impl ShutdownReason {
+    fn cancel_reason(self) -> CancelReason {
+        match self {
+            Self::AppQuit => CancelReason::AppQuit,
+            Self::OsShutdown => CancelReason::OsShutdown,
+        }
+    }
 }
 
 impl CancelCause {
@@ -49,7 +65,7 @@ impl CancelCause {
         match self {
             Self::Client => Event::Cancel(CancelReason::ByClient),
             Self::Expiry => Event::Expire,
-            Self::Shutdown(r) => Event::Cancel(r),
+            Self::Shutdown(r) => Event::Cancel(r.cancel_reason()),
         }
     }
 
@@ -58,9 +74,8 @@ impl CancelCause {
         match self {
             Self::Client => InFlightReason::ByClient,
             Self::Expiry => InFlightReason::Expired,
-            Self::Shutdown(CancelReason::AppQuit) => InFlightReason::AppQuit,
-            Self::Shutdown(CancelReason::OsShutdown) => InFlightReason::OsShutdown,
-            Self::Shutdown(CancelReason::ByClient) => InFlightReason::ByClient,
+            Self::Shutdown(ShutdownReason::AppQuit) => InFlightReason::AppQuit,
+            Self::Shutdown(ShutdownReason::OsShutdown) => InFlightReason::OsShutdown,
         }
     }
 
@@ -81,9 +96,13 @@ pub(crate) enum Attempt {
     Unchanged(Arc<RequestEntry>),
     /// Not in memory: the records answer.
     Gone,
-    /// Another record-bearing transition holds the entry's gate right now.
-    Busy,
 }
+
+/// [`Engine::cancel_now`] could not take the entry's gate: another transition held it (across
+/// an append) for the whole wait, so **nothing was ended or changed**. This is not an answer
+/// about the request; retry, or use the awaited path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelBusy;
 
 /// What the gated section did.
 enum Locked {
@@ -92,51 +111,66 @@ enum Locked {
 }
 
 /// Tries of 1 ms [`Engine::cancel_now`] waits for a busy gate (a transition holds it across one
-/// append) before it answers with the current state.
+/// append) before it reports [`CancelBusy`].
 const BUSY_TRIES: u32 = 5_000;
 
 impl Engine {
-    /// The state-independent cancel (§4.4): a synchronous function, no `await`, no network.
+    /// The state-independent cancel (§4.4) for **synchronous, non-runtime** callers: no `await`,
+    /// no network.
     ///
     /// A request that is `pending` (any phase before `executing` was emitted) ends `cancelled` /
     /// `expired` with its in-flight bytes committed first; one that is `executing`, terminal or
     /// not in memory is answered with its current reduced status (never `DELIVERED`, never data).
-    /// A gate held by another transition is waited for in 1 ms steps (bounded by `BUSY_TRIES`);
-    /// async callers use [`Engine::cancel_awaited`], which yields instead of sleeping.
-    pub fn cancel_now(&self, request_id: &str, cause: CancelCause) -> Envelope {
+    /// A gate held by another transition is polled in 1 ms steps (bounded by `BUSY_TRIES`); if it
+    /// stays held the call returns `Err(CancelBusy)` and has done nothing, so a caller can tell
+    /// "could not run" from "not cancellable".
+    ///
+    /// **Never call it from a runtime thread**: gates are held across `.await` points, so the
+    /// blocking poll can starve the very task that holds the gate (current-thread runtime).
+    /// Async callers, the shutdown sweep (Task 28) included, use [`Engine::cancel_and_wait`].
+    pub fn cancel_now(&self, request_id: &str, cause: CancelCause) -> Result<Envelope, CancelBusy> {
         for _ in 0..BUSY_TRIES {
-            match self.cancel_attempt(request_id, cause) {
-                Attempt::Ended(env) => return *env,
-                Attempt::Unchanged(entry) => return self.current_answer_sync(&entry),
-                Attempt::Gone => return self.records_answer_sync(request_id),
-                Attempt::Busy => std::thread::sleep(Duration::from_millis(1)),
+            match self.try_attempt(request_id, cause) {
+                Some(attempt) => return Ok(self.attempt_envelope(request_id, attempt)),
+                None => std::thread::sleep(Duration::from_millis(1)),
             }
         }
-        match self.entry(request_id) {
-            Some(entry) => self.current_answer_sync(&entry),
-            None => self.records_answer_sync(request_id),
+        Err(CancelBusy)
+    }
+
+    /// The answer of a finished attempt.
+    fn attempt_envelope(&self, request_id: &str, attempt: Attempt) -> Envelope {
+        match attempt {
+            Attempt::Ended(env) => *env,
+            Attempt::Unchanged(entry) => self.current_answer_sync(&entry),
+            Attempt::Gone => self.records_answer_sync(request_id),
         }
     }
 
     /// [`Engine::cancel_now`] for async callers: the same attempt, but a busy gate is awaited
-    /// with a yielding sleep, and the whole thing runs in its own task so a dropped caller does
-    /// not leave a cancel half-waited (the attempt itself is atomic).
+    /// (`lock_owned().await`: fair, no polling), and the whole thing runs in its own task so a
+    /// dropped caller does not leave a cancel half-waited (the gated section is atomic). It
+    /// always runs the attempt: there is no busy outcome.
     pub(crate) async fn cancel_awaited(
         self: &Arc<Self>,
         request_id: &str,
         cause: CancelCause,
     ) -> Attempt {
         let (engine, id) = (self.clone(), request_id.to_owned());
-        tokio::spawn(async move {
-            loop {
-                match engine.cancel_attempt(&id, cause) {
-                    Attempt::Busy => tokio::time::sleep(Duration::from_millis(1)).await,
-                    other => return other,
-                }
-            }
-        })
-        .await
-        .unwrap_or(Attempt::Gone)
+        tokio::spawn(async move { engine.attempt_awaited(&id, cause).await })
+            .await
+            .unwrap_or(Attempt::Gone)
+    }
+
+    /// [`Engine::cancel_awaited`] with the envelope `cancel_now` answers: the entry point of the
+    /// shutdown sweep (Task 28), which must use the awaited path.
+    pub async fn cancel_and_wait(
+        self: &Arc<Self>,
+        request_id: &str,
+        cause: CancelCause,
+    ) -> Envelope {
+        let attempt = self.cancel_awaited(request_id, cause).await;
+        self.attempt_envelope(request_id, attempt)
     }
 
     /// PD-14: the expiry path now (the timer calls the same code); `false` if the request did
@@ -148,15 +182,32 @@ impl Engine {
         )
     }
 
-    /// One non-waiting try: the entry's gate by `try_lock`, then the gated section.
-    pub(crate) fn cancel_attempt(&self, request_id: &str, cause: CancelCause) -> Attempt {
+    /// One non-waiting try: the entry's gate by `try_lock`, then the gated section. `None`: the
+    /// gate is busy and nothing was done.
+    fn try_attempt(&self, request_id: &str, cause: CancelCause) -> Option<Attempt> {
+        let Some(entry) = self.entry(request_id) else {
+            return Some(Attempt::Gone);
+        };
+        let gate = entry.gate.clone().try_lock_owned().ok()?;
+        Some(self.attempt_locked(entry, &gate, cause))
+    }
+
+    /// The attempt with the gate awaited.
+    pub(crate) async fn attempt_awaited(&self, request_id: &str, cause: CancelCause) -> Attempt {
         let Some(entry) = self.entry(request_id) else {
             return Attempt::Gone;
         };
-        let Ok(gate) = entry.gate.clone().try_lock_owned() else {
-            return Attempt::Busy;
-        };
-        match self.cancel_locked(&entry, &gate, cause) {
+        let gate = entry.gate.clone().lock_owned().await;
+        self.attempt_locked(entry, &gate, cause)
+    }
+
+    fn attempt_locked(
+        &self,
+        entry: Arc<RequestEntry>,
+        gate: &GateGuard,
+        cause: CancelCause,
+    ) -> Attempt {
+        match self.cancel_locked(&entry, gate, cause) {
             Locked::Ended => Attempt::Ended(Box::new(ended_envelope(&entry, cause))),
             Locked::Unchanged => Attempt::Unchanged(entry),
         }
@@ -179,13 +230,14 @@ impl Engine {
         cause: CancelCause,
     ) -> Locked {
         let event = cause.event();
-        let prepared = {
+        let (prepared, fetching) = {
             let mut st = entry.state();
             if !is_pending(st.model.phase()) {
                 return Locked::Unchanged;
             }
+            let fetching = matches!(st.model.phase(), Phase::Fetching);
             match Prepared::step(&st, event) {
-                Ok(p) => p,
+                Ok(p) => (p, fetching),
                 Err(Rejection::Illegal) if matches!(event, Event::Expire) => {
                     st.expiry_due = true;
                     return Locked::Unchanged;
@@ -193,14 +245,21 @@ impl Engine {
                 Err(_) => return Locked::Unchanged,
             }
         };
-        let mut records = Vec::with_capacity(2);
+        let mut records = Vec::with_capacity(3);
+        // Review I-2: the record of a GET that finished but that no append committed yet goes
+        // first (§5.4 step 2: every GET of an enrichment or stale check is logged).
+        if let Some(done) = entry.take_parked() {
+            records.push(done);
+        }
         if let Some(ctl) = entry.fetch_control() {
             ctl.cancel();
             let cap = ctl.take_captured();
             let reason = cause.in_flight();
             if cap.sent {
                 match entry.kind() {
-                    Kind::Read => {
+                    // Review I-1: only a read aborted in `Fetching` has an unrecorded fetch; in
+                    // `AwaitingRelease` its `READ_FETCHED` is committed already.
+                    Kind::Read if fetching => {
                         let size = cap
                             .pages
                             .iter()
@@ -232,7 +291,7 @@ impl Engine {
                             ));
                         }
                     }
-                    Kind::Script | Kind::DryRun => {}
+                    Kind::Read | Kind::Script | Kind::DryRun => {}
                 }
             }
         }
@@ -296,14 +355,8 @@ impl Engine {
                 () = ended => return,
             }
             let id = entry.head.request_id.clone();
-            loop {
-                let Some(engine) = weak.upgrade() else {
-                    return;
-                };
-                match engine.cancel_attempt(&id, CancelCause::Expiry) {
-                    Attempt::Busy => tokio::time::sleep(Duration::from_millis(1)).await,
-                    _ => return,
-                }
+            if let Some(engine) = weak.upgrade() {
+                let _ = engine.attempt_awaited(&id, CancelCause::Expiry).await;
             }
         });
     }
@@ -351,9 +404,8 @@ fn ended_envelope(entry: &RequestEntry, cause: CancelCause) -> Envelope {
         CancelCause::Expiry => (EventType::EXPIRED, None),
         CancelCause::Shutdown(r) => {
             let reason = match r {
-                CancelReason::ByClient => "by_client",
-                CancelReason::AppQuit => "app_quit",
-                CancelReason::OsShutdown => "os_shutdown",
+                ShutdownReason::AppQuit => "app_quit",
+                ShutdownReason::OsShutdown => "os_shutdown",
             };
             (EventType::CANCELLED, Some(json!({ "reason": reason })))
         }

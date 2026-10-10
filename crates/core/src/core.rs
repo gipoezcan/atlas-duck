@@ -145,6 +145,9 @@ pub struct TestHooks {
     /// Accept `http://` instance origins (the harness's mocks); off, an `http://` origin is
     /// refused like in a release build (§7.1, I-02).
     pub allow_http: bool,
+    /// A write holds after one of its app-initiated GETs finished and its record is parked, before
+    /// any append commits it (Task 24 review I-2).
+    pub pause_after_get: Option<Arc<Pause>>,
 }
 
 #[cfg(feature = "testing")]

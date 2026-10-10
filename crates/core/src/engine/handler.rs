@@ -837,7 +837,7 @@ impl RequestHandler for CoreHandler {
             // Not cancellable (executing, already terminal), or the append failed: the current
             // status.
             Attempt::Unchanged(entry) => self.entry_answer(&entry, true).await,
-            Attempt::Gone | Attempt::Busy => self.records_answer(request_id, true).await,
+            Attempt::Gone => self.records_answer(request_id, true).await,
         }
     }
 
