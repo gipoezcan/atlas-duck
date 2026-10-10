@@ -8,7 +8,9 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
+use atlas_duck_atlassian::testing::{
+    MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY, TestTlsServer, XAuser, fixtures, generate_ca_pem,
+};
 use atlas_duck_atlassian::{
     CredentialError, CredentialProvider, PatSecret, StoredCredential, StoredIdentity, UrlHash,
     normalize_base_url,
@@ -17,9 +19,10 @@ use atlas_duck_audit::testing::{MemKeyStore, MemKeyring};
 use atlas_duck_audit::{Confirmed, EntryName, EventType, KeyStore, SettingChange};
 use atlas_duck_core::audit_port::DateBridge;
 use atlas_duck_core::config::load_config;
+use atlas_duck_core::instances::state::ca_fingerprint;
 use atlas_duck_core::proxy::{OsProxy, ProxySetting, SystemProxySource};
 use atlas_duck_core::testing::capture::NullUi;
-use atlas_duck_core::testing::{Harness, StubConfirmer, TempStore};
+use atlas_duck_core::testing::{Harness, InstanceAt, StubConfirmer, TempStore};
 use atlas_duck_core::{
     AddInstance, AdminError, Confirm, ConnectionFailure, Core, CoreDeps, KeychainCredentials,
     TestHooks,
@@ -240,7 +243,10 @@ async fn i31_add_requires_confirmation() -> TestResult {
     assert!(std::fs::read_to_string(h.config_path())?.contains("second"));
     // The origin is confirmed in the audit settings, not only in the file.
     let cfg = load_config(&h.config_path())?;
-    assert_eq!(atlas_duck_core::config::instances::instances(&cfg)?.len(), 2);
+    assert_eq!(
+        atlas_duck_core::config::instances::instances(&cfg)?.len(),
+        2
+    );
     let settings = h.store().settings();
     assert!(
         settings
@@ -751,4 +757,615 @@ async fn wait_rev_after(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     Err("the revision never advanced".into())
+}
+
+// ---- Task 25 fix round: pinned CA, fail-closed start, failure paths, dialog texts -------------
+
+/// The `ca_bundle` path the harness wrote into `config.toml`.
+fn ca_path_in(config: &std::path::Path) -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let text = std::fs::read_to_string(config)?;
+    let line = text
+        .lines()
+        .find_map(|l| l.strip_prefix("ca_bundle = '"))
+        .ok_or("no ca_bundle line")?;
+    Ok(std::path::PathBuf::from(line.trim_end_matches('\'')))
+}
+
+/// One Jira instance at a TLS server, trusting `ca` (the server's own CA unless given).
+async fn tls_harness(
+    ca: Option<String>,
+) -> Result<(Harness, TestTlsServer), Box<dyn std::error::Error>> {
+    let tls = TestTlsServer::start().await?;
+    let pem = ca.unwrap_or_else(|| tls.ca_pem().to_owned());
+    let h = Harness::builder()
+        .instance_at(
+            "tls",
+            Product::Jira,
+            InstanceAt {
+                base_url: tls.base_url(),
+                proxy: None,
+                ca_pem: Some(pem),
+            },
+        )
+        .start()
+        .await?;
+    Ok((h, tls))
+}
+
+/// Submits a read and waits until the TLS server saw a handshake or the request settled (a read
+/// that got through waits for its release, a refused one fails).
+async fn read_settles(h: &Harness, tls: &TestTlsServer) -> TestResult {
+    let env = h.submit("jira.issue.get", j!({ "key": "ABC-1" })).await;
+    let id = request_id(&env)?;
+    for _ in 0..400 {
+        if tls.handshakes() > 0 || h.settled(&id, 25).await {
+            return Ok(());
+        }
+    }
+    Err("neither a handshake nor a result".into())
+}
+
+fn setting_of(h: &Harness, id: &str) -> Option<atlas_duck_audit::InstancePolicy> {
+    h.store().settings().instances.get(id).cloned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_ca_swapped_after_start_uses_the_confirmed_bytes() -> TestResult {
+    let (h, tls) = tls_harness(None).await?;
+    // The file is replaced by another CA after the table was derived and before the client is
+    // built (clients are built lazily, on the first request).
+    std::fs::write(ca_path_in(&h.config_path())?, generate_ca_pem()?)?;
+    read_settles(&h, &tls).await?;
+    assert!(
+        tls.handshakes() >= 1,
+        "the confirmed CA bytes must still be trusted"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_ca_swapped_before_start_is_not_trusted() -> TestResult {
+    let (mut h, tls) = tls_harness(None).await?;
+    let id = instance_id(&h, "tls")?;
+    let confirmed = setting_of(&h, &id)
+        .and_then(|p| p.ca_fingerprint)
+        .ok_or("no confirmed CA fingerprint")?;
+    let other = generate_ca_pem()?;
+    std::fs::write(ca_path_in(&h.config_path())?, &other)?;
+    h.restart().await?;
+    read_settles(&h, &tls).await?;
+    assert_eq!(tls.handshakes(), 0, "an unconfirmed CA must not be trusted");
+    let changes = file_side(&h).await?;
+    let change = changes
+        .iter()
+        .find(|c| c["key"] == j!(format!("instance.{id}.ca_fingerprint")))
+        .ok_or("no file-side CA record")?;
+    assert_eq!(change["applied"], false);
+    assert_eq!(change["old"], j!(confirmed));
+    assert_eq!(change["new"], j!(ca_fingerprint(other.as_bytes())));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_ca_unreadable_at_start_is_never_trusted_later() -> TestResult {
+    // The file names a CA that is not a certificate: nothing is confirmed for the instance.
+    let tls = TestTlsServer::start().await?;
+    let h = Harness::builder()
+        .instance_at(
+            "tls",
+            Product::Jira,
+            InstanceAt {
+                base_url: tls.base_url(),
+                proxy: None,
+                ca_pem: Some("not a certificate".to_owned()),
+            },
+        )
+        .start()
+        .await?;
+    let id = instance_id(&h, "tls")?;
+    assert!(setting_of(&h, &id).is_none_or(|p| p.ca_fingerprint.is_none()));
+    // The file becomes a valid CA (the server's own) after the start.
+    std::fs::write(ca_path_in(&h.config_path())?, tls.ca_pem())?;
+    read_settles(&h, &tls).await?;
+    assert_eq!(tls.handshakes(), 0, "never confirmed, never trusted");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_file_side_ca_and_proxy_edits_not_applied() -> TestResult {
+    let (mut h, tls) = tls_harness(None).await?;
+    let id = instance_id(&h, "tls")?;
+    let fp = setting_of(&h, &id)
+        .and_then(|p| p.ca_fingerprint)
+        .ok_or("no confirmed CA fingerprint")?;
+    let config = h.config_path();
+    let old_path = ca_path_in(&config)?;
+    let other = generate_ca_pem()?;
+    let other_path = old_path.with_file_name("other.pem");
+    std::fs::write(&other_path, &other)?;
+    let text = std::fs::read_to_string(&config)?
+        .replace(
+            old_path.to_string_lossy().as_ref(),
+            other_path.to_string_lossy().as_ref(),
+        )
+        .replace("[[instances]]", "[[instances]]\nproxy = \"127.0.0.1:9\"");
+    std::fs::write(&config, text)?;
+    h.restart().await?;
+    let changes = file_side(&h).await?;
+    let ca = changes
+        .iter()
+        .find(|c| c["key"] == j!(format!("instance.{id}.ca_fingerprint")))
+        .ok_or("no file-side CA record")?;
+    assert_eq!((&ca["old"], &ca["applied"]), (&j!(fp), &j!(false)));
+    assert_eq!(ca["new"], j!(ca_fingerprint(other.as_bytes())));
+    let proxy = changes
+        .iter()
+        .find(|c| c["key"] == j!(format!("instance.{id}.proxy")))
+        .ok_or("no file-side proxy record")?;
+    assert_eq!(
+        (&proxy["old"], &proxy["new"]),
+        (&Value::Null, &j!("127.0.0.1:9"))
+    );
+    assert_eq!(proxy["applied"], false);
+    // Not applied: the proxy in force is still the confirmed one, and the other CA is no trust.
+    let view = h.instances().list().remove(0);
+    assert_ne!(view.proxy_effective.as_deref(), Some("127.0.0.1:9"));
+    read_settles(&h, &tls).await?;
+    assert_eq!(tls.handshakes(), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_add_with_custom_ca_shows_subject_and_fingerprint() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok, Confirm::Ok])
+        .start()
+        .await?;
+    let second = MockDc::start(atl(Product::Jira), "/other").await;
+    let pem = generate_ca_pem()?;
+    let fp = ca_fingerprint(pem.as_bytes()).ok_or("no fingerprint")?;
+    let mut req = add("second", &second.base_url());
+    req.ca_pem = Some(pem.clone().into_bytes());
+    let view = h.instances().add(req)?;
+    assert_eq!(view.state, "needs_token");
+    let texts = h.confirmer().texts();
+    let ca_dialog = texts.last().ok_or("no CA dialog")?;
+    assert!(
+        ca_dialog.starts_with("Trust the custom CA for \"second\""),
+        "{ca_dialog}"
+    );
+    assert!(ca_dialog.contains(&fp), "{ca_dialog}");
+    assert!(ca_dialog.contains("Subject: ") && ca_dialog.contains("atlas-duck other test CA"));
+    assert!(
+        ca_dialog.contains("Issuer: ") && ca_dialog.contains("Valid: "),
+        "{ca_dialog}"
+    );
+    // Recorded as confirmed, and the file holds exactly the bytes that were confirmed.
+    let id = h
+        .store()
+        .settings()
+        .instances
+        .iter()
+        .find(|(_, p)| p.ca_fingerprint.is_some())
+        .map(|(id, _)| id.clone())
+        .ok_or("no CA setting")?;
+    assert_eq!(setting_of(&h, &id).and_then(|p| p.ca_fingerprint), Some(fp));
+    let file = h
+        .config_path()
+        .with_file_name("ca")
+        .join(format!("{id}.pem"));
+    assert_eq!(std::fs::read(file)?, pem.as_bytes());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_add_with_custom_ca_cancelled_or_invalid_changes_nothing() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok, Confirm::Cancel])
+        .start()
+        .await?;
+    let second = MockDc::start(atl(Product::Jira), "/other").await;
+    let before = std::fs::read_to_string(h.config_path())?;
+    let mut req = add("second", &second.base_url());
+    req.ca_pem = Some(generate_ca_pem()?.into_bytes());
+    assert_eq!(h.instances().add(req).err(), Some(AdminError::Cancelled));
+    assert_eq!(std::fs::read_to_string(h.config_path())?, before);
+    assert!(
+        h.store()
+            .settings()
+            .instances
+            .values()
+            .all(|p| p.ca_fingerprint.is_none())
+    );
+    // A bundle that is no certificate never reaches a dialog.
+    let dialogs = h.confirmer().texts().len();
+    let mut req = add("third", &second.base_url());
+    req.ca_pem = Some(b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".to_vec());
+    assert!(matches!(h.instances().add(req), Err(AdminError::Audit(_))));
+    assert_eq!(h.confirmer().texts().len(), dialogs);
+    Ok(())
+}
+
+/// A hand-added instance at a TLS server whose file names the server's CA.
+async fn unconfirmed_tls(
+    answers: Vec<Confirm>,
+) -> Result<(Harness, TestTlsServer, String), Box<dyn std::error::Error>> {
+    let tls = TestTlsServer::start().await?;
+    let h = Harness::builder()
+        .instance_at(
+            "tls",
+            Product::Jira,
+            InstanceAt {
+                base_url: tls.base_url(),
+                proxy: None,
+                ca_pem: Some(tls.ca_pem().to_owned()),
+            },
+        )
+        .unconfirmed()
+        .confirm(answers)
+        .start()
+        .await?;
+    let fp = ca_fingerprint(tls.ca_pem().as_bytes()).ok_or("no fingerprint")?;
+    Ok((h, tls, fp))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_confirm_config_instance_confirms_the_file_ca() -> TestResult {
+    let (h, tls, fp) = unconfirmed_tls(vec![Confirm::Ok, Confirm::Ok]).await?;
+    let id = instance_id(&h, "tls")?;
+    let view = h.instances().confirm_config_instance("tls")?;
+    assert_eq!(view.state, "ok");
+    assert_eq!(
+        setting_of(&h, &id).and_then(|p| p.ca_fingerprint),
+        Some(fp.clone())
+    );
+    let texts = h.confirmer().texts();
+    assert!(texts.last().ok_or("no dialog")?.contains(&fp));
+    // The confirmed CA is in force: the first request completes a handshake.
+    read_settles(&h, &tls).await?;
+    assert!(tls.handshakes() >= 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_confirm_config_instance_ca_cancelled_keeps_origin_and_trusts_no_ca() -> TestResult {
+    let (h, tls, _) = unconfirmed_tls(vec![Confirm::Ok, Confirm::Cancel]).await?;
+    let id = instance_id(&h, "tls")?;
+    let res = h.instances().confirm_config_instance("tls");
+    assert_eq!(res.err(), Some(AdminError::Cancelled));
+    // The origin was confirmed and the table follows it; the CA stays unconfirmed.
+    assert!(setting_of(&h, &id).is_some_and(|p| p.origin.is_some() && p.ca_fingerprint.is_none()));
+    assert_eq!(state_of(&h, "tls")?, "ok");
+    read_settles(&h, &tls).await?;
+    assert_eq!(tls.handshakes(), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_set_proxy_writes_file_and_setting_without_a_dialog() -> TestResult {
+    let h = Harness::jira().await?;
+    let id = instance_id(&h, "jira-main")?;
+    let view = h
+        .instances()
+        .set_proxy("jira-main", ProxySetting::parse("127.0.0.1:9")?)?;
+    assert_eq!(view.proxy_effective.as_deref(), Some("127.0.0.1:9"));
+    assert!(std::fs::read_to_string(h.config_path())?.contains("proxy = \"127.0.0.1:9\""));
+    assert_eq!(
+        setting_of(&h, &id).and_then(|p| p.proxy),
+        Some("127.0.0.1:9".to_owned())
+    );
+    assert!(
+        h.confirmer().texts().is_empty(),
+        "a proxy is a plain setting"
+    );
+    let changed = h.events_of(EventType::CONFIG_CHANGED).await?;
+    assert!(
+        changed
+            .iter()
+            .any(|e| e["key"] == j!(format!("instance.{id}.proxy")) && e["applied"] == true),
+        "{changed:?}"
+    );
+    // Back to direct, then to the OS setting.
+    let view = h.instances().set_proxy("jira-main", ProxySetting::Direct)?;
+    assert_eq!(view.proxy_effective.as_deref(), Some("direct"));
+    assert_eq!(
+        setting_of(&h, &id).and_then(|p| p.proxy),
+        Some("direct".to_owned())
+    );
+    h.instances().set_proxy("jira-main", ProxySetting::Os)?;
+    assert_eq!(setting_of(&h, &id).and_then(|p| p.proxy), None);
+    assert!(!std::fs::read_to_string(h.config_path())?.contains("proxy ="));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i31_accept_config_url_change_applies_through_the_dialog() -> TestResult {
+    let mut h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Cancel])
+        .start()
+        .await?;
+    let id = instance_id(&h, "jira-main")?;
+    let first = h.mock("jira-main").ok_or("mock")?.base_url();
+    // Nothing is pending yet.
+    assert_eq!(
+        h.instances().accept_config_url_change("jira-main").err(),
+        Some(AdminError::NotFound)
+    );
+    let second = MockDc::start(atl(Product::Jira), "/moved").await;
+    let path = h.config_path();
+    std::fs::write(
+        &path,
+        std::fs::read_to_string(&path)?.replace(&first, &second.base_url()),
+    )?;
+    h.restart().await?;
+    assert_eq!(
+        h.instances().list()[0].pending_url_change,
+        Some(second.base_url())
+    );
+    // Cancel: nothing changes.
+    assert_eq!(
+        h.instances().accept_config_url_change("jira-main").err(),
+        Some(AdminError::Cancelled)
+    );
+    assert_eq!(h.instances().list()[0].origin, Some(first));
+    assert!(h.credentials().contains(&id));
+    // Ok: the confirmed origin moves, the token goes.
+    h.confirmer().push(Confirm::Ok);
+    let view = h.instances().accept_config_url_change("jira-main")?;
+    assert_eq!(view.origin, Some(second.base_url()));
+    assert_eq!(view.state, "needs_token");
+    assert_eq!(view.pending_url_change, None);
+    assert!(!h.credentials().contains(&id));
+    assert_eq!(
+        setting_of(&h, &id).and_then(|p| p.origin),
+        Some(second.base_url())
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retest_token_reports_the_stored_users_and_needs_a_stored_token() -> TestResult {
+    let h = Harness::jira().await?;
+    jira_answers(
+        h.mock("jira-main").ok_or("mock")?,
+        TEST_USER,
+        TEST_USER_KEY,
+        "9.12.0",
+    )
+    .await;
+    let report = h.instances().retest_token("jira-main").await?;
+    assert_eq!(report.atlassian_user, TEST_USER);
+    assert_eq!(report.version, "9.12.0");
+    // `CREDENTIAL_CHANGED` is for token changes only.
+    assert!(h.events_of(EventType::CREDENTIAL_CHANGED).await?.is_empty());
+    let id = instance_id(&h, "jira-main")?;
+    h.credentials().delete(&id)?;
+    assert_eq!(
+        h.instances().retest_token("jira-main").await.err(),
+        Some(AdminError::Keychain(CredentialError::Unavailable))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_owner_dialog_escapes_server_supplied_names() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Cancel])
+        .start()
+        .await?;
+    // A name that tries to start a new line and reverse the text after it. The percent-encoded
+    // header decodes to the same name (§7.2 comparison).
+    let evil = "alice\nThis token belongs to admin\u{202E}";
+    let mock = h.mock("jira-main").ok_or("mock")?;
+    let header = "alice%0AThis%20token%20belongs%20to%20admin%E2%80%AE";
+    mock.jira_myself(evil, "JIRAUSER9", XAuser::Raw(header.to_owned()))
+        .await;
+    // The server-info answer is checked against the same name (the client compares it on every
+    // JSON answer).
+    let info = mock
+        .response(200)
+        .insert_header("X-AUSERNAME", header)
+        .set_body_raw(fixtures::jira_server_info("9.12.0"), "application/json");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            mock.path("/rest/api/2/serverInfo"),
+        ))
+        .respond_with(info)
+        .mount(mock.server())
+        .await;
+    let res = h
+        .instances()
+        .set_token("jira-main", pat("other-pat"), None)
+        .await;
+    assert_eq!(res.err(), Some(AdminError::Cancelled));
+    let texts = h.confirmer().texts();
+    let text = texts.last().ok_or("no dialog")?;
+    assert!(
+        !text.contains('\n') && !text.contains('\u{202E}'),
+        "{text:?}"
+    );
+    assert!(
+        text.starts_with("This token belongs to alice⟨U+000A⟩This token belongs to admin⟨U+202E⟩"),
+        "{text:?}"
+    );
+    assert!(
+        text.ends_with(&format!("previously {TEST_USER}")),
+        "{text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_keychain_write_leaves_a_corrective_record() -> TestResult {
+    let h = jira_without_pat().await?;
+    jira_answers(
+        h.mock("jira-main").ok_or("mock")?,
+        TEST_USER,
+        TEST_USER_KEY,
+        "9.12.0",
+    )
+    .await;
+    h.credentials().fail_store(true);
+    let res = h
+        .instances()
+        .set_token("jira-main", pat("fresh-pat"), None)
+        .await;
+    assert_eq!(
+        res.err(),
+        Some(AdminError::Keychain(CredentialError::Unavailable))
+    );
+    let id = instance_id(&h, "jira-main")?;
+    assert!(!h.credentials().contains(&id));
+    let changes: Vec<Value> = h
+        .events_of(EventType::CREDENTIAL_CHANGED)
+        .await?
+        .iter()
+        .map(|e| e["change"].clone())
+        .collect();
+    assert_eq!(changes, [j!("added"), j!("store_failed")]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn origin_change_with_a_failing_record_still_moves_the_runtime_and_the_writes() -> TestResult
+{
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let id = instance_id(&h, "jira-main")?;
+    let first = h.mock("jira-main").ok_or("mock")?;
+    first
+        .jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let params = j!({ "key": "ABC-1", "body": "Reproduced.", "body_format": "wiki" });
+    let env = h.submit("jira.comment.add", params).await;
+    let rid = request_id(&env)?;
+    let item = h.queued(&rid, 10_000).await.ok_or("never queued")?;
+    assert!(item.approvable);
+    let second = MockDc::start(atl(Product::Jira), "/moved").await;
+    // The record of the token deletion cannot be written, after the origin was committed.
+    h.plan().fail_nth(EventType::CREDENTIAL_CHANGED, 1);
+    let res = h
+        .instances()
+        .change_base_url("jira-main", &second.base_url());
+    assert!(matches!(res, Err(AdminError::Audit(_))), "{res:?}");
+    // The runtime follows the confirmed origin all the same: no token is used there, and the
+    // queued write is not approvable (it waits for a new token).
+    let view = h.instances().list().remove(0);
+    assert_eq!(view.origin, Some(second.base_url()));
+    assert_eq!(view.state, "needs_token");
+    assert_eq!(
+        setting_of(&h, &id).and_then(|p| p.origin),
+        Some(second.base_url())
+    );
+    let item = wait_rev_after(&h, &rid, item.candidate_rev.counter).await?;
+    assert!(!item.approvable);
+    let stale: Vec<Value> = h
+        .events(&rid)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::WRITE_STALE)
+        .map(|(_, p)| p["reason"].clone())
+        .collect();
+    assert_eq!(stale, [j!("instance_changed")]);
+    Ok(())
+}
+
+/// A keychain that panics on every read: the derivation of the table dies.
+struct PanickingCreds;
+
+impl CredentialProvider for PanickingCreds {
+    fn load(&self, _: &str) -> Result<Option<StoredCredential>, CredentialError> {
+        panic!("the credential backend failed")
+    }
+    fn store(&self, _: &str, _: StoredCredential) -> Result<(), CredentialError> {
+        Err(CredentialError::Unavailable)
+    }
+    fn delete(&self, _: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::Unavailable)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_fails_closed_when_the_derivation_panics() -> TestResult {
+    let (_ring, mock, dir) = shared_setup().await?;
+    let path = dir.path().join("config.toml");
+    let store = TempStore::new()?;
+    store.store().apply_setting(
+        SettingChange::InstanceOrigin {
+            instance_id: SHARED_ID.to_owned(),
+            origin: Some(
+                normalize_base_url(&mock.base_url())
+                    .map_err(|e| format!("{e:?}"))?
+                    .as_str(),
+            ),
+        },
+        Some(Confirmed {
+            dialog_text_sha256: [1; 32],
+        }),
+    )?;
+    let creds: Arc<dyn CredentialProvider> = Arc::new(PanickingCreds);
+    let port = store.port();
+    let http = atlas_duck_core::http_factory::HttpFactory::new(
+        Arc::new(SystemProxySource::with_reader(Box::new(OsProxy::default))),
+        creds.clone(),
+        Arc::new(DateBridge(port.clone())),
+    );
+    let deps = CoreDeps {
+        audit: store.store(),
+        clock: store.clock().clone(),
+        credentials: creds,
+        confirmer: Arc::new(StubConfirmer::new(Vec::new())),
+        ui: Arc::new(NullUi),
+        config: load_config(&path)?,
+        config_path: Some(path),
+        http,
+        app_start_extra: Map::new(),
+        pats_deleted: Vec::new(),
+    };
+    let hooks = TestHooks {
+        allow_http: true,
+        ..TestHooks::none()
+    };
+    let core = Core::start_with_port(deps, port, hooks).await?;
+    let view = core.instances().list().remove(0);
+    assert_eq!(view.state, "instance_unconfirmed");
+    assert_eq!(view.origin, None, "no origin is routable");
+    assert_eq!(view.executes_as, None);
+    assert!(no_traffic(&mock).await);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn url_password_in_config_toml_never_reaches_the_audit_log() -> TestResult {
+    let mut h = Harness::jira().await?;
+    let first = h.mock("jira-main").ok_or("mock")?.base_url();
+    let path = h.config_path();
+    std::fs::write(
+        &path,
+        std::fs::read_to_string(&path)?.replace(
+            &first,
+            "https://user:hunter2@jira.example/jira?token=hunter3#hunter4",
+        ),
+    )?;
+    h.restart().await?;
+    let file = file_side(&h).await?;
+    assert_eq!(file.len(), 1, "{file:?}");
+    let text = file[0].to_string();
+    assert!(!text.contains("hunter"), "{text}");
+    assert_eq!(file[0]["new"], j!("https://jira.example/jira"));
+    // An address that cannot be accepted is not offered for acceptance either.
+    assert_eq!(h.instances().list()[0].pending_url_change, None);
+    let all = h.events_of(EventType::CONFIG_CHANGED).await?;
+    assert!(
+        all.iter().all(|e| !e.to_string().contains("hunter")),
+        "{all:?}"
+    );
+    Ok(())
 }

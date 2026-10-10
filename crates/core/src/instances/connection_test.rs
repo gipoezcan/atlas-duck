@@ -13,7 +13,6 @@
 //! header is then compared here with the `name` of the body (`username_matches`). The second
 //! call runs with the name found, so the client's own check applies to it.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use atlas_duck_atlassian::{
@@ -73,7 +72,8 @@ pub(crate) struct Target {
     pub product: Product,
     pub origin: NormalizedBaseUrl,
     pub proxy: ProxySetting,
-    pub ca_bundle: Option<PathBuf>,
+    /// The pinned, confirmed CA bytes (review I-1).
+    pub ca_pem: Option<Vec<u8>>,
 }
 
 /// A passed test.
@@ -335,23 +335,13 @@ async fn run_calls(
             atlassian_user_key: String::new(),
         }),
     });
-    // The proxy decision and the CA file read can block (T11 handoff).
-    let spec = {
-        let (path, proxy) = (target.ca_bundle.clone(), target.proxy.clone());
-        let ca_pem = tokio::task::spawn_blocking(move || path.map(std::fs::read).transpose())
-            .await
-            .ok()
-            .and_then(Result::ok);
-        let Some(ca_pem) = ca_pem else {
-            return Ok(Err(ConnectionFailure::Unavailable));
-        };
-        InstanceHttpSpec {
-            instance_id: target.id.clone(),
-            product: atlassian_product(target.product),
-            base: target.origin.clone(),
-            ca_pem,
-            proxy,
-        }
+    // The proxy decision (built below, off the async runtime) can block (T11 handoff).
+    let spec = InstanceHttpSpec {
+        instance_id: target.id.clone(),
+        product: atlassian_product(target.product),
+        base: target.origin.clone(),
+        ca_pem: target.ca_pem.clone(),
+        proxy: target.proxy.clone(),
     };
     let built = {
         let (eng, creds) = (engine.clone(), creds.clone());

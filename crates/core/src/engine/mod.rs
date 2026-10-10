@@ -392,8 +392,6 @@ pub struct InstanceHttp {
 pub enum ClientError {
     /// The instance left the table or has no usable base URL.
     NoInstance,
-    /// The custom CA bundle could not be read.
-    CaBundle,
     Build(BuildError),
 }
 
@@ -823,7 +821,7 @@ impl Engine {
         if let Some(c) = lock(&self.clients).get(instance_id) {
             return Ok(c.clone());
         }
-        let (product, base, proxy, ca_bundle) = {
+        let (product, base, proxy, ca) = {
             let table = self.instances();
             let inst = table.by_id(instance_id).ok_or(ClientError::NoInstance)?;
             let base = inst.base.clone().ok_or(ClientError::NoInstance)?;
@@ -833,14 +831,12 @@ impl Engine {
                     atlas_duck_atlassian::Product::Confluence
                 }
             };
-            (product, base, inst.proxy.clone(), inst.ca_bundle.clone())
+            (product, base, inst.proxy.clone(), inst.ca.clone())
         };
         let (http, id) = (self.http.clone(), instance_id.to_owned());
         let built = tokio::task::spawn_blocking(move || {
-            let ca_pem = match ca_bundle {
-                Some(path) => Some(std::fs::read(path).map_err(|_| ClientError::CaBundle)?),
-                None => None,
-            };
+            // The bytes the user confirmed (review I-1), never the file.
+            let ca_pem = ca.map(|c| c.pem().to_vec());
             let spec = InstanceHttpSpec {
                 instance_id: id,
                 product,
@@ -859,6 +855,16 @@ impl Engine {
             .entry(instance_id.to_owned())
             .or_insert(built)
             .clone())
+    }
+
+    /// Runs `fut` on the core's runtime without waiting for it (the follow-up of a synchronous
+    /// admin call that `run_sync` refused: a current-thread caller must not block, but queued
+    /// writes must still follow the change).
+    pub(crate) fn spawn_detached<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.runtime.spawn(fut);
     }
 
     /// The synchronous `DecisionApi` runs its async part on the core's runtime and waits on a

@@ -226,7 +226,9 @@ impl Core {
                 )
             })
             .await
-            .unwrap_or_else(|_| (InstanceTable::from_config(&config), Vec::new()))
+            // A panic in the derivation fails CLOSED (review I-2): no instance is routable and
+            // none has a usable token until a start that derives.
+            .unwrap_or_else(|_| (InstanceTable::fail_closed(&config), Vec::new()))
         };
         for c in &file_side {
             let ev = payloads::config_changed(ConfigSource::File, &c.key, &c.old, &c.new, false);

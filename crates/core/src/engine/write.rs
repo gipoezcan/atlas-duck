@@ -641,36 +641,14 @@ impl Engine {
             if entry.instance_id != instance_id {
                 continue;
             }
-            let (phase, parked, identity_return) = {
-                let st = entry.state();
-                let Some(w) = st.write.as_ref() else { continue };
-                (
-                    st.model.phase(),
-                    w.awaiting_refresh,
-                    matches!(w.returned, Some(Returned::IdentityMismatch(_))),
-                )
+            let (phase, parked, identity_return) = match route_change(&mut entry.state(), &change) {
+                Routed::Skip | Routed::Deferred => continue,
+                Routed::Go {
+                    phase,
+                    parked,
+                    identity_return,
+                } => (phase, parked, identity_return),
             };
-            if phase == Phase::Enriching {
-                // M-5: the model takes no `Instance` event here; the verdict of the enrichment
-                // applies first, then the change (`follow_pending`).
-                let pending = match &change {
-                    InstanceChange::TokenReplaced => Some(PendingChange::Credential),
-                    InstanceChange::OriginChanged { old, new } => Some(PendingChange::Origin {
-                        old: old.clone(),
-                        new: new.clone(),
-                    }),
-                    InstanceChange::TokenStored
-                    | InstanceChange::StateChanged
-                    | InstanceChange::UserRenamed { .. } => None,
-                };
-                if let Some(p) = pending {
-                    let mut st = entry.state();
-                    if st.model.phase() == Phase::Enriching {
-                        st.instance_change_pending = Some(p);
-                        continue;
-                    }
-                }
-            }
             let queued = matches!(phase, Phase::AwaitingApproval(_) | Phase::StaleCheck);
             let waiting = parked && matches!(phase, Phase::AwaitingApproval(_));
             match &change {
@@ -745,6 +723,55 @@ impl Engine {
                 _ => {}
             }
         }
+    }
+}
+
+/// What `Engine::instance_changed` does with one entry (review I-3).
+#[derive(Debug, PartialEq, Eq)]
+enum Routed {
+    /// Not a write.
+    Skip,
+    /// The write is in `Enriching`: the change is recorded for the verdict to follow (M-5).
+    Deferred,
+    /// The write is not in `Enriching`: route by this phase.
+    Go {
+        phase: Phase,
+        parked: bool,
+        identity_return: bool,
+    },
+}
+
+/// Reads the phase and decides on it in ONE critical section of the entry (review I-3). The
+/// verdict of an enrichment applies, and takes `instance_change_pending`, in that same section:
+/// either the change is recorded here before the verdict lands (and the verdict follows it), or
+/// the phase seen here is already the one after it, so the change is routed by the phase the
+/// write is really in. A phase read in one section and a recording made in another could miss
+/// the verdict in between and drop the change.
+fn route_change(st: &mut EntryState, change: &InstanceChange) -> Routed {
+    let phase = st.model.phase();
+    let Some(w) = st.write.as_ref() else {
+        return Routed::Skip;
+    };
+    if phase == Phase::Enriching {
+        let pending = match change {
+            InstanceChange::TokenReplaced => Some(PendingChange::Credential),
+            InstanceChange::OriginChanged { old, new } => Some(PendingChange::Origin {
+                old: old.clone(),
+                new: new.clone(),
+            }),
+            InstanceChange::TokenStored
+            | InstanceChange::StateChanged
+            | InstanceChange::UserRenamed { .. } => None,
+        };
+        if let Some(p) = pending {
+            st.instance_change_pending = Some(p);
+            return Routed::Deferred;
+        }
+    }
+    Routed::Go {
+        phase,
+        parked: w.awaiting_refresh,
+        identity_return: matches!(w.returned, Some(Returned::IdentityMismatch(_))),
     }
 }
 
@@ -2457,6 +2484,91 @@ mod tests {
             os_read_failed: false,
             effective: "direct".to_owned(),
         }
+    }
+
+    /// An entry state whose write is in the phase the steps lead to.
+    fn write_in(phase_events: &[Event]) -> Result<EntryState, Box<dyn std::error::Error>> {
+        let mut model = Model::new(crate::lifecycle::model::Kind::Write);
+        for e in phase_events {
+            step(&mut model, *e).map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(EntryState {
+            model,
+            candidate_hash: [0; 32],
+            stale: false,
+            caution_count: 0,
+            redaction_ops: Vec::new(),
+            rebuild_failed: false,
+            unlogged_terminal: None,
+            read: None,
+            write: Some(WriteState::new(json!({}))),
+            expiry_due: false,
+            instance_change_pending: None,
+        })
+    }
+
+    const TO_ENRICHING: [Event; 2] = [Event::ValidationPassed, Event::EnrichStarted];
+
+    fn origin_change() -> InstanceChange {
+        InstanceChange::OriginChanged {
+            old: "https://a.example".to_owned(),
+            new: "https://b.example".to_owned(),
+        }
+    }
+
+    /// Review I-3: a change that meets an enriching write is recorded for the verdict, in the
+    /// same critical section that read the phase.
+    #[test]
+    fn a_change_meeting_an_enriching_write_is_recorded_for_the_verdict() -> TestResult {
+        let mut st = write_in(&TO_ENRICHING)?;
+        assert_eq!(
+            route_change(&mut st, &InstanceChange::TokenReplaced),
+            Routed::Deferred
+        );
+        assert_eq!(st.instance_change_pending, Some(PendingChange::Credential));
+        let mut st = write_in(&TO_ENRICHING)?;
+        assert_eq!(route_change(&mut st, &origin_change()), Routed::Deferred);
+        assert!(matches!(
+            st.instance_change_pending,
+            Some(PendingChange::Origin { .. })
+        ));
+        // A stored token or a state change has nothing to wait for.
+        let mut st = write_in(&TO_ENRICHING)?;
+        assert!(matches!(
+            route_change(&mut st, &InstanceChange::TokenStored),
+            Routed::Go {
+                phase: Phase::Enriching,
+                ..
+            }
+        ));
+        assert_eq!(st.instance_change_pending, None);
+        Ok(())
+    }
+
+    /// Review I-3: when the enrichment has finished by the time the change looks, the change is
+    /// routed by the phase the write is in NOW (`AwaitingApproval`), so the caller refreshes or
+    /// parks it; it is neither recorded for a verdict that already landed nor dropped.
+    #[test]
+    fn a_change_after_the_verdict_is_routed_by_the_fresh_phase() -> TestResult {
+        let mut events = TO_ENRICHING.to_vec();
+        events.push(Event::Enriched(Hold::Preview));
+        for change in [InstanceChange::TokenReplaced, origin_change()] {
+            let mut st = write_in(&events)?;
+            assert_eq!(
+                route_change(&mut st, &change),
+                Routed::Go {
+                    phase: Phase::AwaitingApproval(Hold::Preview),
+                    parked: false,
+                    identity_return: false,
+                }
+            );
+            assert_eq!(st.instance_change_pending, None);
+        }
+        // Not a write at all.
+        let mut st = write_in(&events)?;
+        st.write = None;
+        assert_eq!(route_change(&mut st, &origin_change()), Routed::Skip);
+        Ok(())
     }
 
     #[test]

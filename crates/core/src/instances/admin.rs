@@ -13,11 +13,13 @@ use atlas_duck_atlassian::{
     url_hash, username_matches,
 };
 use atlas_duck_audit::{AuditError, Confirmed, SettingChange, Settings};
+use atlas_duck_preview::invisible::escape_for_display;
+use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_registry::Product;
 use sha2::{Digest, Sha256};
 
 use super::connection_test::{self, Target};
-use super::state::{DeriveCtx, InstanceRuntime, InstanceState, InstanceTable, ca_fingerprint};
+use super::state::{CaBundle, DeriveCtx, InstanceRuntime, InstanceState, InstanceTable, parse_ca};
 use super::{
     AddInstance, AdminError, ConnectionFailure, ConnectionReport, InstanceAdmin, InstanceView,
 };
@@ -114,8 +116,55 @@ pub(crate) fn change_text(alias: &str, old: &NormalizedBaseUrl, new: &Normalized
     text
 }
 
-fn ca_text(alias: &str, fingerprint: &str) -> String {
-    format!("Trust the custom CA with fingerprint {fingerprint} for \"{alias}\"?")
+/// A server- or file-supplied name as a native dialog may show it (review I-6): every invisible
+/// or bidi character, and the line breaks and tabs the display escape keeps, as `⟨U+XXXX⟩`;
+/// capped; a mixed-script name is flagged (§6.4).
+pub(crate) fn shown(s: &str) -> String {
+    const CAP: usize = 200;
+    let mut out = String::new();
+    for (n, c) in escape_for_display(s).chars().enumerate() {
+        if n == CAP {
+            out.push('…');
+            break;
+        }
+        match c {
+            '\n' | '\r' | '\t' => out.push_str(&format!("⟨U+{:04X}⟩", c as u32)),
+            _ => out.push(c),
+        }
+    }
+    if is_mixed_script(s) {
+        out.push_str(" [mixed scripts]");
+    }
+    out
+}
+
+/// The most certificates the CA dialog lists one by one; the bundle fingerprint covers the rest.
+const CA_LISTED: usize = 5;
+
+/// §10.3: the text of the custom-CA dialog: the bundle fingerprint, then for each certificate
+/// its subject, issuer, validity and own SHA-256 (review I-5).
+pub(crate) fn ca_text(alias: &str, bundle: &CaBundle) -> String {
+    let n = bundle.certs.len();
+    let mut text = format!(
+        "Trust the custom CA for \"{alias}\"? {n} certificate{}, bundle SHA-256 {}.",
+        if n == 1 { "" } else { "s" },
+        bundle.fingerprint
+    );
+    for (i, c) in bundle.certs.iter().take(CA_LISTED).enumerate() {
+        text.push_str(&format!(
+            "\nCertificate {} of {n}\n  Subject: {}\n  Issuer: {}\n  Valid: {} to {}\n  SHA-256: {}",
+            i + 1,
+            shown(&c.subject),
+            shown(&c.issuer),
+            c.not_before,
+            c.not_after,
+            c.sha256
+        ));
+    }
+    if n > CA_LISTED {
+        text.push_str(&format!("\n... and {} more certificates.", n - CA_LISTED));
+    }
+    text
 }
 
 impl CoreInstances {
@@ -277,7 +326,11 @@ impl CoreInstances {
         let Some(file) = c.ca_bundle else {
             return Ok(());
         };
-        let Some(fp) = std::fs::read(file).ok().and_then(|p| ca_fingerprint(&p)) else {
+        // The file is read once; the dialog shows, and the setting records, what those bytes
+        // are. The table derived afterwards pins the bytes again against that fingerprint
+        // (review I-1), so a swap in between is not trusted. The path is chosen by the file
+        // (an agent can write it): the dialog is the only gate (spec §10.3).
+        let Some(bundle) = std::fs::read(file).ok().and_then(|p| parse_ca(&p)) else {
             return Ok(());
         };
         let stored = self
@@ -285,15 +338,15 @@ impl CoreInstances {
             .instances
             .get(id)
             .and_then(|p| p.ca_fingerprint.clone());
-        if stored.as_deref() == Some(fp.as_str()) {
+        if stored.as_deref() == Some(bundle.fingerprint.as_str()) {
             return Ok(());
         }
-        let text = ca_text(&rt.alias, &fp);
+        let text = ca_text(&rt.alias, &bundle);
         self.confirm(&text)?;
         self.apply(
             SettingChange::InstanceCaFingerprint {
                 instance_id: id.to_owned(),
-                fingerprint: Some(fp),
+                fingerprint: Some(bundle.fingerprint),
             },
             Some(&text),
         )
@@ -330,44 +383,69 @@ impl CoreInstances {
             },
             Some(&text),
         )?;
-        // The token is bound to the old origin: it goes (audit before effect).
-        let engine = self.engine.clone();
-        let old_key = {
-            let (creds, id) = (engine.credentials().clone(), id.clone());
-            creds
-                .load(&id)
-                .ok()
-                .flatten()
-                .map(|c| c.identity.atlassian_user_key)
-        };
-        if let Some(key) = old_key {
-            let ev = payloads::credential_changed(
-                &id,
-                CredentialChange::Deleted,
-                Some(&key),
-                None,
-                None,
-            );
-            self.engine.port().append(ev).map_err(AdminError::Audit)?;
-            self.engine
-                .credentials()
-                .delete(&id)
-                .map_err(AdminError::Keychain)?;
-        }
+        // The origin is committed from here on: the runtime follows it whatever else fails
+        // (review I-4), and the first error is reported afterwards.
+        let deleted = self.delete_token(&id);
         self.engine.invalidate_client(&id);
-        self.reload()?;
-        let (change, eng, inst) = (
+        let reloaded = self.reload();
+        if reloaded.is_err() {
+            // The table could not be rebuilt: the instance still moves to the confirmed origin,
+            // without a token (the deleted or hash-mismatched PAT is not usable there).
+            let origin = new.clone();
+            self.engine.update_instance(&id, move |rt| {
+                rt.base = Some(origin);
+                rt.state = InstanceState::NeedsToken;
+                rt.identity = None;
+                rt.expires_at = None;
+                rt.pending_url_change = None;
+            });
+        }
+        self.follow_writes(
+            id,
             InstanceChange::OriginChanged {
                 old: old.as_str(),
                 new: new.as_str(),
             },
-            self.engine.clone(),
-            id,
         );
-        let _ = self
+        deleted?;
+        reloaded
+    }
+
+    /// The token is bound to the old origin: it goes (audit before effect). The delete is
+    /// attempted even when the old token could not be read, and `CREDENTIAL_CHANGED {deleted}`
+    /// commits first; a failed append leaves the token in place, where the origin hash keeps it
+    /// unused (review I-4, ruling 13).
+    fn delete_token(&self, id: &str) -> Result<(), AdminError> {
+        let creds = self.engine.credentials().clone();
+        let old_key = match creds.load(id) {
+            Ok(Some(c)) => Some(c.identity.atlassian_user_key.clone()),
+            Ok(None) => return Ok(()),
+            Err(_) => None,
+        };
+        let ev = payloads::credential_changed(
+            id,
+            CredentialChange::Deleted,
+            old_key.as_deref(),
+            None,
+            None,
+        );
+        self.engine.port().append(ev).map_err(AdminError::Audit)?;
+        creds.delete(id).map_err(AdminError::Keychain)
+    }
+
+    /// Carries a change to the instance's queued writes. `run_sync` refuses a current-thread
+    /// caller (it must not block); the follow-up then runs detached instead of being dropped.
+    fn follow_writes(&self, id: String, change: InstanceChange) {
+        let eng = self.engine.clone();
+        let (e2, id2, c2) = (eng.clone(), id.clone(), change.clone());
+        if self
             .engine
-            .run_sync(async move { eng.instance_changed(&inst, change).await });
-        Ok(())
+            .run_sync(async move { e2.instance_changed(&id2, c2).await })
+            .is_none()
+        {
+            self.engine
+                .spawn_detached(async move { eng.instance_changed(&id, change).await });
+        }
     }
 
     /// The runtime of `id` after a PAT was stored: `ok`, with the identity and expiry.
@@ -395,7 +473,7 @@ impl CoreInstances {
             product: rt.product,
             origin,
             proxy: rt.proxy.clone(),
-            ca_bundle: rt.ca_bundle.clone(),
+            ca_pem: rt.ca.as_ref().map(|c| c.pem().to_vec()),
         }
     }
 }
@@ -441,7 +519,7 @@ impl InstanceAdmin for CoreInstances {
         }
         let ca = match &req.ca_pem {
             Some(pem) => Some((
-                ca_fingerprint(pem).ok_or(audit("no certificate in the CA bundle"))?,
+                parse_ca(pem).ok_or(audit("no certificate in the CA bundle"))?,
                 pem,
             )),
             None => None,
@@ -449,8 +527,8 @@ impl InstanceAdmin for CoreInstances {
         let text = add_text(req.product, &req.alias, &origin);
         self.confirm(&text)?;
         let ca_dialog = match &ca {
-            Some((fp, _)) => {
-                let t = ca_text(&req.alias, fp);
+            Some((bundle, _)) => {
+                let t = ca_text(&req.alias, bundle);
                 self.confirm(&t)?;
                 Some(t)
             }
@@ -478,11 +556,11 @@ impl InstanceAdmin for CoreInstances {
             },
             Some(&text),
         )?;
-        if let (Some((fp, _)), Some(t)) = (&ca, &ca_dialog) {
+        if let (Some((bundle, _)), Some(t)) = (&ca, &ca_dialog) {
             self.apply(
                 SettingChange::InstanceCaFingerprint {
                     instance_id: id.clone(),
-                    fingerprint: Some(fp.clone()),
+                    fingerprint: Some(bundle.fingerprint.clone()),
                 },
                 Some(t),
             )?;
@@ -534,8 +612,11 @@ impl InstanceAdmin for CoreInstances {
             },
             Some(&text),
         )?;
-        self.confirm_file_ca(&rt, &id)?;
+        // The origin is committed: the table follows it even when the CA dialog is cancelled
+        // (the unconfirmed CA then stays untrusted, review I-4).
+        let ca = self.confirm_file_ca(&rt, &id);
         self.reload()?;
+        ca?;
         self.view(alias)
     }
 
@@ -612,9 +693,11 @@ impl InstanceAdmin for CoreInstances {
             .as_ref()
             .is_some_and(|o| o.identity.atlassian_user_key != tested.user_key);
         if let (true, Some(o)) = (other_user, &old) {
+            // Both names come from servers: escaped like any text an approver reads (I-6).
             let text = format!(
                 "{TOKEN_OWNER_CHANGE}{}, previously {}",
-                tested.user, o.identity.atlassian_user
+                shown(&tested.user),
+                shown(&o.identity.atlassian_user)
             );
             let confirmer = self.engine.confirmer().clone();
             let answer = tokio::task::spawn_blocking(move || confirmer.confirm(&text))
@@ -652,10 +735,25 @@ impl InstanceAdmin for CoreInstances {
             expires_at,
         };
         let (creds, store_id) = (self.engine.credentials().clone(), id.clone());
-        tokio::task::spawn_blocking(move || creds.store(&store_id, cred))
+        let stored = tokio::task::spawn_blocking(move || creds.store(&store_id, cred))
             .await
-            .map_err(|_| AdminError::Keychain(CredentialError::Unavailable))?
-            .map_err(AdminError::Keychain)?;
+            .map_err(|_| AdminError::Keychain(CredentialError::Unavailable))
+            .and_then(|r| r.map_err(AdminError::Keychain));
+        if let Err(e) = stored {
+            // The record above said the token changed; it did not (review M-1): say so.
+            let failed = payloads::credential_changed(
+                &id,
+                CredentialChange::StoreFailed,
+                old.as_ref().map(|o| o.identity.atlassian_user_key.as_str()),
+                Some(&tested.user_key),
+                expires.as_deref(),
+            );
+            let _ = self
+                .engine
+                .blocking(move |p| p.append(failed).map(|_| ()))
+                .await;
+            return Err(e);
+        }
         self.pat_stored(&id, identity, expires_at, tested.version);
         let change = if other_user {
             InstanceChange::TokenReplaced
@@ -697,5 +795,56 @@ impl InstanceAdmin for CoreInstances {
             .instance_changed(&id, InstanceChange::TokenStored)
             .await;
         Ok(tested.report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instances::state::CaCert;
+
+    fn cert(subject: &str) -> CaCert {
+        CaCert {
+            sha256: "ab".repeat(32),
+            subject: subject.to_owned(),
+            issuer: "CN=Issuer".to_owned(),
+            not_before: "2026-01-01".to_owned(),
+            not_after: "2027-01-01".to_owned(),
+        }
+    }
+
+    #[test]
+    fn dialog_names_are_escaped_capped_and_flagged() {
+        assert_eq!(shown("alice"), "alice");
+        // Line breaks, tabs, bidi and zero-width characters never reach the dialog raw.
+        assert_eq!(shown("a\nb\tc\r"), "a⟨U+000A⟩b⟨U+0009⟩c⟨U+000D⟩");
+        assert_eq!(shown("x\u{202E}y\u{200B}"), "x⟨U+202E⟩y⟨U+200B⟩");
+        assert!(shown(&"a".repeat(500)).chars().count() <= 201);
+        // Latin with a Cyrillic look-alike is flagged.
+        assert!(shown("p\u{430}ypal").ends_with("[mixed scripts]"));
+    }
+
+    #[test]
+    fn ca_dialog_lists_subjects_and_caps_the_listing() {
+        let bundle = CaBundle {
+            certs: (0..7).map(|i| cert(&format!("CN=Root {i}"))).collect(),
+            fingerprint: "cd".repeat(32),
+        };
+        let text = ca_text("corp", &bundle);
+        assert!(text.starts_with("Trust the custom CA for \"corp\"? 7 certificates"));
+        assert!(text.contains(&"cd".repeat(32)));
+        assert!(text.contains("Subject: CN=Root 0") && text.contains("Subject: CN=Root 4"));
+        assert!(!text.contains("CN=Root 5"));
+        assert!(text.ends_with("... and 2 more certificates."));
+        // A hostile subject cannot add a line of its own.
+        let hostile = CaBundle {
+            certs: vec![cert("CN=x\nSubject: CN=Trusted Corp")],
+            fingerprint: "cd".repeat(32),
+        };
+        let text = ca_text("corp", &hostile);
+        let lines = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("Subject:"));
+        assert_eq!(lines.count(), 1, "{text}");
     }
 }

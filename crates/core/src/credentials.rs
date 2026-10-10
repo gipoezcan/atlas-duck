@@ -121,7 +121,9 @@ pub(crate) fn encode_blob(c: &StoredCredential) -> Result<Zeroizing<Vec<u8>>, Cr
         user_key: &c.identity.atlassian_user_key,
         expires_at: c.expires_at.map(|d| d.format("%Y-%m-%d").to_string()),
     };
-    let mut buf = Zeroizing::new(Vec::new());
+    // Sized up front: a growing `Vec` frees every outgrown copy of the PAT unzeroized (M-4).
+    let size = out.pat.len() + out.user.len() + out.user_key.len() + 256;
+    let mut buf = Zeroizing::new(Vec::with_capacity(size));
     serde_json::to_writer(&mut *buf, &out).map_err(|_| CredentialError::Corrupt)?;
     Ok(buf)
 }

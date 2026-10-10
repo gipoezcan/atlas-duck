@@ -95,6 +95,9 @@ rustls = { version = "=0.23.45", default-features = false, features = ["ring", "
 httpdate = "=1.0.3"
 # Test harness of `atlassian::testing` (§13: plain-HTTP mock, local TLS server with a generated CA).
 wiremock = "=0.6.5"
+# M3 Task 25 fix round (I-5): the custom-CA dialog shows each certificate's subject, issuer and
+# validity. Already in the lock through rcgen; no default features (no ring verify code).
+x509-parser = { version = "=0.18.1", default-features = false }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem", "crypto"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12", "logging"] }
 # M3 candidate cache (Task 20, §5.2): an LRU whose bytes core accounts by hand.

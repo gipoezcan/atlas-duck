@@ -2,8 +2,6 @@
 //! `doctor` (PD-11) read. `from_config` is the config-only pass; `derive` (Task 25) adds the
 //! audit-side derivation: confirmed origins, stored PATs, file-side edits that are not applied.
 
-use std::path::PathBuf;
-
 use atlas_duck_atlassian::{
     BaseUrlError, CredentialProvider, NormalizedBaseUrl, StoredIdentity, normalize_base_url,
     url_hash,
@@ -71,9 +69,11 @@ pub struct InstanceRuntime {
     /// The instance's proxy setting in force (L42), resolved against the OS reading when its
     /// client is built.
     pub proxy: ProxySetting,
-    /// The custom CA bundle (PEM path, read by Rust only, §7.2); `None` also when the file names
-    /// a CA whose fingerprint was never confirmed (it is not trusted, I-31).
-    pub ca_bundle: Option<PathBuf>,
+    /// The custom CA in force: the bytes whose fingerprint the user confirmed (§7.2, I-31),
+    /// pinned when the table was derived. `None` also when the file names a CA that was never
+    /// confirmed, or that cannot be read: it is not trusted. Clients are built from these bytes,
+    /// never from the path (review I-1).
+    pub ca: Option<PinnedCa>,
     /// Who the stored PAT belongs to (`None` without a usable PAT).
     pub identity: Option<StoredIdentity>,
     /// The stored PAT's expiry.
@@ -86,7 +86,8 @@ pub struct InstanceRuntime {
 }
 
 impl InstanceRuntime {
-    /// The config-only state: an instance with an id and a usable base URL is `Ok`.
+    /// The config-only state: an instance with an id and a usable base URL is `Ok`. Routing
+    /// only: nothing here is confirmed (see `InstanceTable::from_config`).
     fn from_config(c: &InstanceConfig) -> InstanceRuntime {
         let base = normalize_base_url(&c.base_url_raw);
         let state = match (&c.id, &base) {
@@ -103,7 +104,7 @@ impl InstanceRuntime {
             state,
             version: None,
             proxy: c.proxy.clone(),
-            ca_bundle: c.ca_bundle.clone(),
+            ca: None,
             identity: None,
             expires_at: None,
             pending_url_change: None,
@@ -135,16 +136,38 @@ fn opt_json(s: Option<&str>) -> Value {
     s.map_or(Value::Null, |v| json!(v))
 }
 
-/// SHA-256 (hex) over the certificates of a PEM bundle, in order (for one certificate: its
-/// usual fingerprint). `None` for a bundle without a readable certificate.
-pub fn ca_fingerprint(pem: &[u8]) -> Option<String> {
+/// One certificate of a custom CA bundle, as the confirmation dialog shows it (§10.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaCert {
+    /// The certificate's own SHA-256 (hex, what other tools show).
+    pub sha256: String,
+    pub subject: String,
+    pub issuer: String,
+    /// `YYYY-MM-DD`.
+    pub not_before: String,
+    pub not_after: String,
+}
+
+/// A parsed PEM bundle: every certificate in order and the bundle fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaBundle {
+    pub certs: Vec<CaCert>,
+    /// SHA-256 (hex) over the DER of all certificates, in order (for one certificate: its usual
+    /// fingerprint). This is what the audit settings store (`InstanceCaFingerprint`).
+    pub fingerprint: String,
+}
+
+/// Parses a PEM bundle. `None` unless it holds at least one certificate and every
+/// `CERTIFICATE` block is valid base64 holding exactly one parsable X.509 certificate (a bundle
+/// the dialog could not describe is not offered for confirmation).
+pub fn parse_ca(pem: &[u8]) -> Option<CaBundle> {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
     const END: &str = "-----END CERTIFICATE-----";
     let text = std::str::from_utf8(pem).ok()?;
-    let mut hasher = Sha256::new();
-    let mut found = false;
+    let mut bundle = Sha256::new();
+    let mut certs = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find(BEGIN) {
         let after = &rest[start + BEGIN.len()..];
@@ -153,11 +176,77 @@ pub fn ca_fingerprint(pem: &[u8]) -> Option<String> {
         let der = base64::engine::general_purpose::STANDARD
             .decode(body)
             .ok()?;
-        hasher.update(&der);
-        found = true;
+        let (left, cert) = x509_parser::parse_x509_certificate(&der).ok()?;
+        if !left.is_empty() {
+            return None;
+        }
+        let day = |t: x509_parser::time::ASN1Time| t.to_datetime().date().to_string();
+        certs.push(CaCert {
+            sha256: hex::encode(Sha256::digest(&der)),
+            subject: cert.subject().to_string(),
+            issuer: cert.issuer().to_string(),
+            not_before: day(cert.validity().not_before),
+            not_after: day(cert.validity().not_after),
+        });
+        bundle.update(&der);
         rest = &after[end + END.len()..];
     }
-    found.then(|| hex::encode(hasher.finalize()))
+    (!certs.is_empty()).then(|| CaBundle {
+        certs,
+        fingerprint: hex::encode(bundle.finalize()),
+    })
+}
+
+/// The bundle fingerprint of a PEM bundle (see [`CaBundle::fingerprint`]).
+pub fn ca_fingerprint(pem: &[u8]) -> Option<String> {
+    parse_ca(pem).map(|b| b.fingerprint)
+}
+
+/// A custom CA whose fingerprint the user confirmed: the PEM bytes that were hashed. The only
+/// constructor checks the bytes against the confirmed fingerprint, so a client built from a
+/// `PinnedCa` never trusts anything else, whatever happens to the file afterwards (review I-1).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PinnedCa {
+    pem: Vec<u8>,
+    fingerprint: String,
+}
+
+impl PinnedCa {
+    /// `Some` only when `pem` is a valid bundle whose fingerprint equals `confirmed`.
+    pub fn confirmed(pem: Vec<u8>, confirmed: &str) -> Option<PinnedCa> {
+        let fingerprint = ca_fingerprint(&pem)?;
+        (fingerprint == confirmed).then_some(PinnedCa { pem, fingerprint })
+    }
+
+    pub fn pem(&self) -> &[u8] {
+        &self.pem
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
+impl std::fmt::Debug for PinnedCa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PinnedCa({})", self.fingerprint)
+    }
+}
+
+/// A URL as the audit log may carry it: no userinfo, query or fragment (review M-3). A string
+/// without a scheme is not echoed at all.
+pub(crate) fn loggable_url(raw: &str) -> String {
+    let raw = raw.trim();
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return "<unparsable url>".to_owned();
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    format!("{scheme}://{host}{path}")
 }
 
 /// Why no instance could be chosen for a submit (PD-01, PD-02) or a listing.
@@ -181,6 +270,10 @@ pub struct InstanceTable {
 }
 
 impl InstanceTable {
+    /// The config-only pass: every instance with an id and a usable URL is `Ok`, whatever the
+    /// audit settings and the keychain say. Routing tests only; NEVER a production table
+    /// (review I-2): `Core::start` and `reload` use `derive`, and `fail_closed` when that
+    /// cannot run.
     pub fn from_config(cfg: &ConfigState) -> InstanceTable {
         if matches!(cfg, ConfigState::Unreadable { .. }) {
             return InstanceTable {
@@ -198,6 +291,21 @@ impl InstanceTable {
                 list: Vec::new(),
             },
         }
+    }
+
+    /// The table when `derive` could not run (its task panicked): every configured instance is
+    /// `instance_unconfirmed` with no origin, no CA and no identity, so nothing is routed, no
+    /// token is used and no request leaves (review I-2).
+    pub fn fail_closed(cfg: &ConfigState) -> InstanceTable {
+        let mut table = InstanceTable::from_config(cfg);
+        for rt in &mut table.list {
+            rt.state = InstanceState::InstanceUnconfirmed;
+            rt.base = None;
+            rt.ca = None;
+            rt.identity = None;
+            rt.expires_at = None;
+        }
+        table
     }
 
     /// The table from `config.toml` and the audit-authoritative settings (§7.1, §7.7, I-31,
@@ -298,7 +406,7 @@ fn derive_one(
         changes.push(FileSideChange {
             key: origin_key,
             old: opt_json(stored_origin),
-            new: json!(c.base_url_raw.trim()),
+            new: json!(loggable_url(&c.base_url_raw)),
         });
         return;
     }
@@ -309,13 +417,18 @@ fn derive_one(
     };
     // Confirmed. A different file URL is a request, not a change (I-31).
     if file_url.as_ref().ok() != Some(&origin) {
-        let new = c.base_url_raw.trim().to_owned();
+        // The normalized URL when there is one; else the raw text without userinfo, query and
+        // fragment (M-3). Only a URL that normalizes can be accepted later.
+        let new = match &file_url {
+            Ok(u) => u.as_str(),
+            Err(_) => loggable_url(&c.base_url_raw),
+        };
         changes.push(FileSideChange {
             key: origin_key,
             old: opt_json(stored_origin),
             new: json!(new),
         });
-        rt.pending_url_change = Some(new);
+        rt.pending_url_change = file_url.is_ok().then_some(new);
     }
     rt.base = Some(origin.clone());
     derive_proxy_and_ca(rt, c, &id, policy, changes);
@@ -352,18 +465,78 @@ fn derive_proxy_and_ca(
         });
     }
     rt.proxy = setting;
+    // The CA file is read once; what is trusted are those bytes, and only when their
+    // fingerprint is the confirmed one (review I-1). A file that cannot be read, or that names
+    // a CA nobody confirmed, leaves the instance without a custom CA: nothing later reads the
+    // path again.
     let stored_fp = policy.and_then(|p| p.ca_fingerprint.as_deref());
-    let file_fp = c
-        .ca_bundle
-        .as_ref()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|pem| ca_fingerprint(&pem));
+    let file_pem = c.ca_bundle.as_ref().and_then(|p| std::fs::read(p).ok());
+    let file_fp = file_pem.as_deref().and_then(ca_fingerprint);
     if file_fp.as_deref() != stored_fp {
         changes.push(FileSideChange {
             key: format!("instance.{id}.ca_fingerprint"),
             old: opt_json(stored_fp),
             new: opt_json(file_fp.as_deref()),
         });
-        rt.ca_bundle = None;
+    }
+    rt.ca = stored_fp
+        .zip(file_pem)
+        .and_then(|(fp, pem)| PinnedCa::confirmed(pem, fp));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atlas_duck_atlassian::testing::generate_ca_pem;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn loggable_url_drops_userinfo_query_and_fragment() {
+        assert_eq!(
+            loggable_url(" https://user:secret@host.example:8443/jira/?a=b#c "),
+            "https://host.example:8443/jira/"
+        );
+        assert_eq!(loggable_url("https://host.example"), "https://host.example");
+        // A password that holds an `@` or a `/` stays out as well.
+        assert_eq!(
+            loggable_url("https://user:p@ss@host.example/x"),
+            "https://host.example/x"
+        );
+        assert_eq!(loggable_url("secret-without-scheme"), "<unparsable url>");
+    }
+
+    #[test]
+    fn pinned_ca_only_for_the_confirmed_fingerprint() -> TestResult {
+        let pem = generate_ca_pem()?;
+        let other = generate_ca_pem()?;
+        let fp = ca_fingerprint(pem.as_bytes()).ok_or("no fingerprint")?;
+        let other_fp = ca_fingerprint(other.as_bytes()).ok_or("no fingerprint")?;
+        assert_ne!(fp, other_fp);
+        let pinned = PinnedCa::confirmed(pem.clone().into_bytes(), &fp).ok_or("not pinned")?;
+        assert_eq!(pinned.pem(), pem.as_bytes());
+        assert_eq!(pinned.fingerprint(), fp);
+        // Other bytes, or other confirmed text, never pin.
+        assert!(PinnedCa::confirmed(other.into_bytes(), &fp).is_none());
+        assert!(PinnedCa::confirmed(pem.into_bytes(), &other_fp).is_none());
+        assert!(PinnedCa::confirmed(b"nothing".to_vec(), &fp).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn a_bundle_lists_every_certificate_and_one_fingerprint() -> TestResult {
+        let (a, b) = (generate_ca_pem()?, generate_ca_pem()?);
+        let one = parse_ca(a.as_bytes()).ok_or("not parsed")?;
+        assert_eq!(one.certs.len(), 1);
+        assert!(one.certs[0].subject.contains("atlas-duck other test CA"));
+        // For one certificate the bundle fingerprint is that certificate's own.
+        assert_eq!(one.fingerprint, one.certs[0].sha256);
+        let both = parse_ca(format!("{a}\n{b}").as_bytes()).ok_or("not parsed")?;
+        assert_eq!(both.certs.len(), 2);
+        assert_ne!(both.fingerprint, one.fingerprint);
+        // A block that is no certificate refuses the whole bundle.
+        let broken = format!("{a}\n-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----");
+        assert!(parse_ca(broken.as_bytes()).is_none());
+        Ok(())
     }
 }

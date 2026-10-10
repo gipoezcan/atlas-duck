@@ -30,6 +30,8 @@ secrecy = { workspace = true }
 # `InstanceAdmin::set_token`'s `expires_at` (C.4 `StoredCredential` uses `chrono::NaiveDate`).
 chrono = { workspace = true }
 hex = { workspace = true }
+# I-5: certificate subject/issuer for the CA confirmation dialog (see the workspace pin).
+x509-parser = { workspace = true }
 # M2's pin, reused for `{"b64": ..}` bodies (§8.3 payloads).
 base64 = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }

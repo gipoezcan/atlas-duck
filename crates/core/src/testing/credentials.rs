@@ -2,6 +2,7 @@
 //! never touch an OS keychain. Task 25 completes what the instance admin needs.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use atlas_duck_atlassian::{
@@ -20,6 +21,7 @@ struct Entry {
 #[derive(Default)]
 pub struct InMemoryCredentials {
     entries: Mutex<HashMap<String, Entry>>,
+    fail_store: AtomicBool,
 }
 
 impl std::fmt::Debug for InMemoryCredentials {
@@ -55,6 +57,12 @@ impl InMemoryCredentials {
         );
     }
 
+    /// While on, every `store` fails with `Unavailable` (the keychain write after the audit
+    /// record).
+    pub fn fail_store(&self, on: bool) {
+        self.fail_store.store(on, Ordering::SeqCst);
+    }
+
     pub fn contains(&self, instance_id: &str) -> bool {
         self.lock().contains_key(instance_id)
     }
@@ -71,6 +79,9 @@ impl CredentialProvider for InMemoryCredentials {
     }
 
     fn store(&self, instance_id: &str, c: StoredCredential) -> Result<(), CredentialError> {
+        if self.fail_store.load(Ordering::SeqCst) {
+            return Err(CredentialError::Unavailable);
+        }
         self.lock().insert(
             instance_id.to_owned(),
             Entry {

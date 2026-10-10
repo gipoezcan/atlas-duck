@@ -1172,6 +1172,9 @@ pub enum CredentialChange {
     Added,
     Replaced,
     Deleted,
+    /// Corrective record: the keychain write that followed an `added`/`replaced` record failed,
+    /// so the token did not change (the keys are those of that record).
+    StoreFailed,
 }
 
 impl CredentialChange {
@@ -1180,11 +1183,12 @@ impl CredentialChange {
             Self::Added => "added",
             Self::Replaced => "replaced",
             Self::Deleted => "deleted",
+            Self::StoreFailed => "store_failed",
         }
     }
 }
 
-/// `CREDENTIAL_CHANGED {change: added|replaced|deleted, old_user_key, new_user_key, expires_at}`
+/// `CREDENTIAL_CHANGED {change: added|replaced|deleted|store_failed, old_user_key, new_user_key, expires_at}`
 /// for a PAT (§7.1); never the secret. `expires_at` is `YYYY-MM-DD`. The keys are data; the
 /// caller names the operation (a deletion may not know the old key).
 pub fn credential_changed(

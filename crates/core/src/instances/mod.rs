@@ -57,6 +57,11 @@ pub struct AddInstance {
     pub product: Product,
     pub base_url: String,
     pub proxy: ProxySetting,
+    /// A custom CA bundle (PEM). M6 HANDOFF (spec §10.3, review I-5): these bytes must come from
+    /// a file the RUST side chose in a native file dialog it opened itself and read itself;
+    /// never from a webview command argument. The core shows the certificates' subjects and
+    /// fingerprints in its own dialog and pins the confirmed bytes, but it cannot tell where
+    /// the caller got them.
     pub ca_pem: Option<Vec<u8>>,
     pub is_default: bool,
 }
