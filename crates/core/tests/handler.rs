@@ -907,9 +907,13 @@ async fn dry_call_enrichment_required_passes_and_op_checks_reject() -> TestResul
     ] {
         let env = h.submit(op, params).await;
         assert_eq!(env.status, Status::Pending, "{op}: {}", env.to_json_line());
-        assert_eq!(
-            h.event_types(&request_id(&env)?).await?,
-            [EventType::REQUEST_RECEIVED]
+        // The post-commit dispatch (enrichment) keeps logging in the background: assert the
+        // stable prefix and that nothing rejected the request, not the transient count.
+        let types = h.event_types(&request_id(&env)?).await?;
+        assert_eq!(types.first(), Some(&EventType::REQUEST_RECEIVED), "{op}");
+        assert!(
+            !types.contains(&EventType::REQUEST_REJECTED),
+            "{op}: {types:?}"
         );
     }
     // An op-owned static check (the executor as validator hook): edit with nothing to edit.
@@ -1010,7 +1014,19 @@ async fn submit_dropped_after_the_commit_still_lands() -> TestResult {
         })
         .start()
         .await?;
-    let before = h.event_count().await?;
+    // Headers of one event type, ignoring everything else the background tasks log.
+    let count_of = |t: EventType| {
+        let port = h.port();
+        async move {
+            let n = tokio::task::spawn_blocking(move || {
+                port.recent_headers(Duration::from_secs(24 * 3600))
+                    .map(|hs| hs.iter().filter(|e| e.event_type == t).count())
+            })
+            .await??;
+            Ok::<_, common::TestError>(n)
+        }
+    };
+    let received_before = count_of(EventType::REQUEST_RECEIVED).await?;
     {
         let submit = h.submit("jira.issue.get", issue_get("ABC-1"));
         tokio::select! {
@@ -1019,10 +1035,13 @@ async fn submit_dropped_after_the_commit_still_lands() -> TestResult {
         }
         // `submit` is dropped here, right after `REQUEST_RECEIVED` committed.
     }
-    assert_eq!(h.event_count().await?, before + 1);
+    assert_eq!(
+        count_of(EventType::REQUEST_RECEIVED).await?,
+        received_before + 1
+    );
     pause.release.notify_one();
     let mut entries = Vec::new();
-    for _ in 0..200 {
+    for _ in 0..500 {
         entries = h.engine().pending_entries();
         if !entries.is_empty() {
             break;
@@ -1037,22 +1056,36 @@ async fn submit_dropped_after_the_commit_still_lands() -> TestResult {
     assert!(h.engine().committed().request_committed(&id));
     assert_eq!(h.status(&id).await.status, Status::Pending);
     // A dropped submit whose request is rejected still logs the rejection.
+    let rejected_before = count_of(EventType::REQUEST_REJECTED).await?;
     let submit = h.submit("jira.issue.get", json!({}));
     tokio::select! {
         _ = submit => return Err("submit finished while paused".into()),
         _ = pause.reached.notified() => {}
     }
     pause.release.notify_one();
-    for _ in 0..200 {
-        if h.event_count().await? == before + 3 {
+    // Wait for the terminal event of that request (bounded); the first request's own
+    // post-commit records are not counted.
+    let mut rejected = rejected_before;
+    for _ in 0..500 {
+        rejected = count_of(EventType::REQUEST_REJECTED).await?;
+        if rejected > rejected_before {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(
-        h.event_count().await?,
-        before + 3,
-        "REQUEST_RECEIVED + REQUEST_REJECTED"
+        rejected,
+        rejected_before + 1,
+        "REQUEST_REJECTED of the dropped submit"
+    );
+    assert_eq!(
+        count_of(EventType::REQUEST_RECEIVED).await?,
+        received_before + 2,
+        "one REQUEST_RECEIVED per submit"
+    );
+    assert_eq!(
+        h.event_types(&id).await?.first(),
+        Some(&EventType::REQUEST_RECEIVED)
     );
     Ok(())
 }
