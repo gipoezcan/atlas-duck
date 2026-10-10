@@ -324,42 +324,7 @@ impl Engine {
             };
             shared.request_kill(kill);
             if running {
-                for (info, ctl) in shared.take_in_flight() {
-                    ctl.cancel();
-                    let cap = ctl.take_captured();
-                    if !cap.sent {
-                        continue;
-                    }
-                    let size = cap
-                        .pages
-                        .iter()
-                        .map(|p| p.body.len() as u64)
-                        .sum::<u64>()
-                        .saturating_add(cap.partial.len() as u64);
-                    let ctx = payloads::EventCtx {
-                        instance_id: Some(info.instance_id.clone()),
-                        ..entry.ctx.clone()
-                    };
-                    records.push(payloads::script_call(
-                        &ctx,
-                        &payloads::ScriptCallMeta {
-                            call_id: info.call_id,
-                            op: &info.op,
-                            params: &info.params,
-                            instance: Some(&info.alias),
-                            user_key: info.user_key.as_deref(),
-                            rejection: Some("cancelled_in_flight"),
-                        },
-                        &ReadFetched::CancelledInFlight {
-                            reason: cause.in_flight(),
-                            responses: &cap.pages,
-                            partial: &cap.partial,
-                            size,
-                        },
-                        size,
-                        None,
-                    ));
-                }
+                records.extend(shared.in_flight_records(&entry.ctx, cause.in_flight()));
                 records.push(payloads::script_failed(
                     &entry.ctx,
                     &payloads::ScriptFailed {

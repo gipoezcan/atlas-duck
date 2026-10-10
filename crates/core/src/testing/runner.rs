@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult};
 use tokio::sync::watch;
 
+use crate::core::Pause;
 use crate::engine::script::{
     CompileError, HostCalls, KillReason, RunEnd, RunHandle, RunSpec, RunnerError, ScriptRunner,
 };
@@ -26,6 +27,16 @@ pub struct ScriptPlan {
     pub end: RunEnd,
     /// Held after the last call, before `end` (a kill interrupts it).
     pub hold_ms: u64,
+    /// `compile_check` holds here (after taking its plan) until the test releases it.
+    pub compile_pause: Option<Arc<Pause>>,
+    /// `start` holds here (after taking its plan, before it answers) until released.
+    pub start_pause: Option<Arc<Pause>>,
+    /// The run ends by itself with `end` this many ms after it started, even with a host call
+    /// in flight (a timeout, a crash, a limit kill: the worker dies, the call is not answered).
+    pub interrupt: Option<(u64, RunEnd)>,
+    /// With `interrupt`: the call future is not dropped when the worker dies (glue that keeps
+    /// the fetch running); it runs on in its own task.
+    pub keep_calls: bool,
 }
 
 impl ScriptPlan {
@@ -36,6 +47,10 @@ impl ScriptPlan {
             calls,
             end,
             hold_ms: 0,
+            compile_pause: None,
+            start_pause: None,
+            interrupt: None,
+            keep_calls: false,
         }
     }
 
@@ -50,11 +65,36 @@ impl ScriptPlan {
             calls: Vec::new(),
             end: RunEnd::Crashed,
             hold_ms: 0,
+            compile_pause: None,
+            start_pause: None,
+            interrupt: None,
+            keep_calls: false,
         }
     }
 
     pub fn holding(mut self, ms: u64) -> ScriptPlan {
         self.hold_ms = ms;
+        self
+    }
+
+    pub fn with_compile_pause(mut self, pause: Arc<Pause>) -> ScriptPlan {
+        self.compile_pause = Some(pause);
+        self
+    }
+
+    pub fn with_start_pause(mut self, pause: Arc<Pause>) -> ScriptPlan {
+        self.start_pause = Some(pause);
+        self
+    }
+
+    /// The run ends with `end` after `after_ms`, whatever it is doing.
+    pub fn interrupted(mut self, after_ms: u64, end: RunEnd) -> ScriptPlan {
+        self.interrupt = Some((after_ms, end));
+        self
+    }
+
+    pub fn keeping_calls(mut self) -> ScriptPlan {
+        self.keep_calls = true;
         self
     }
 }
@@ -139,14 +179,21 @@ impl FakeScriptRunner {
 #[async_trait]
 impl ScriptRunner for FakeScriptRunner {
     async fn compile_check(&self, _source: &str) -> Result<(), CompileError> {
-        let mut g = self.lock();
-        g.compile_checks += 1;
-        let Some(plan) = g.plans.pop_front() else {
-            return Ok(());
+        let (verdict, pause) = {
+            let mut g = self.lock();
+            g.compile_checks += 1;
+            let Some(plan) = g.plans.pop_front() else {
+                return Ok(());
+            };
+            let verdict = plan.compile.clone();
+            let pause = plan.compile_pause.clone();
+            if verdict.is_ok() {
+                g.compiled.push_back(plan);
+            }
+            (verdict, pause)
         };
-        let verdict = plan.compile.clone();
-        if verdict.is_ok() {
-            g.compiled.push_back(plan);
+        if let Some(p) = pause {
+            p.hold().await;
         }
         verdict
     }
@@ -182,6 +229,9 @@ impl ScriptRunner for FakeScriptRunner {
             g.handles.push(fake.clone());
             (plan, fake)
         };
+        if let Some(p) = plan.start_pause.clone() {
+            p.hold().await;
+        }
         let driver = fake.clone();
         let run_id = run.run_id.clone();
         tokio::spawn(async move { drive(&driver, &run_id, plan, calls).await });
@@ -191,9 +241,36 @@ impl ScriptRunner for FakeScriptRunner {
 
 async fn drive(run: &Arc<FakeRun>, run_id: &str, plan: ScriptPlan, calls: Arc<dyn HostCalls>) {
     let mut kill = run.kill_rx();
+    let deadline = plan
+        .interrupt
+        .as_ref()
+        .map(|(ms, _)| Duration::from_millis(*ms));
+    let interrupt = async {
+        match deadline {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(interrupt);
     for call in plan.calls {
+        let answer = async {
+            if plan.keep_calls {
+                let (calls, id) = (calls.clone(), run_id.to_owned());
+                tokio::spawn(async move { calls.call(&id, call).await })
+                    .await
+                    .unwrap_or_else(|_| HostCallResult::Ok(serde_json::Value::Null))
+            } else {
+                calls.call(run_id, call).await
+            }
+        };
         tokio::select! {
-            result = calls.call(run_id, call) => run.record(result),
+            result = answer => run.record(result),
+            () = &mut interrupt => {
+                if let Some((_, end)) = plan.interrupt {
+                    run.finish(end);
+                }
+                return;
+            }
             _ = kill.wait_for(Option::is_some) => {
                 run.finish_killed();
                 return;
@@ -203,6 +280,12 @@ async fn drive(run: &Arc<FakeRun>, run_id: &str, plan: ScriptPlan, calls: Arc<dy
     if plan.hold_ms > 0 {
         tokio::select! {
             () = tokio::time::sleep(Duration::from_millis(plan.hold_ms)) => {}
+            () = &mut interrupt => {
+                if let Some((_, end)) = plan.interrupt {
+                    run.finish(end);
+                }
+                return;
+            }
             _ = kill.wait_for(Option::is_some) => {
                 run.finish_killed();
                 return;

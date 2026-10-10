@@ -622,6 +622,9 @@ pub enum InFlightReason {
     Expired,
     AppQuit,
     OsShutdown,
+    /// A script run that ended by itself (timeout, crash, limit, user kill) with this host
+    /// call still in flight (§9.5).
+    RunEnded,
 }
 
 impl InFlightReason {
@@ -631,6 +634,7 @@ impl InFlightReason {
             Self::Expired => "expired",
             Self::AppQuit => "app_quit",
             Self::OsShutdown => "os_shutdown",
+            Self::RunEnded => "run_ended",
         }
     }
 }

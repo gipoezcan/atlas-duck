@@ -68,7 +68,8 @@ use crate::ops::{
     op_table,
 };
 use crate::payloads::{
-    self, EventCtx, OutcomeKind, ReadFetched, ScriptCallMeta, ScriptErrorDetails, ScriptFailed,
+    self, EventCtx, InFlightReason, OutcomeKind, ReadFetched, ScriptCallMeta, ScriptErrorDetails,
+    ScriptFailed,
 };
 use crate::redact::RedactionMeta;
 use crate::validate::{
@@ -172,9 +173,13 @@ pub trait HostCalls: Send + Sync {
 /// its end, so both methods take `&self` on a shared handle.
 #[async_trait]
 pub trait RunHandle: Send + Sync {
-    /// Terminates the worker (`TerminateJobObject` / `SIGKILL`) without waiting for it.
+    /// Terminates the worker (`TerminateJobObject` / `SIGKILL`) without waiting for it. A kill
+    /// that reaches a worker that already exited is a no-op: core marks a run ended only after
+    /// `wait` returned, so `kill` can race the exit. The implementation owns its child or job
+    /// handle and never signals a bare PID (the PID may be reaped and reused).
     fn kill(&self, why: KillReason);
-    /// Resolves once, when the run ended.
+    /// The run's end. Core calls it exactly once per handle; it settles when the worker is gone
+    /// and answers the same `RunEnd` however often it is awaited.
     async fn wait(&self) -> RunEnd;
 }
 
@@ -362,11 +367,12 @@ pub struct RunShared {
 
 impl RunShared {
     /// Asks for the worker's death. The first reason wins; a run that ended is not killed.
-    pub(crate) fn request_kill(&self, why: KillReason) {
+    /// `false` = nothing was asked (the run ended or a kill was already requested).
+    pub(crate) fn request_kill(&self, why: KillReason) -> bool {
         let handle = {
             let mut g = lock(&self.inner);
             if g.ended || g.kill.is_some() {
-                return;
+                return false;
             }
             g.kill = Some(why.clone());
             g.handle.clone()
@@ -374,6 +380,7 @@ impl RunShared {
         if let Some(h) = handle {
             h.kill(why);
         }
+        true
     }
 
     fn set_handle(&self, h: Arc<dyn RunHandle>) {
@@ -440,17 +447,62 @@ impl RunShared {
             .insert(info.call_id, InFlight { info, ctl });
     }
 
-    /// `false` = the cancel path took the call (it records it itself).
+    /// `false` = the end of the run took the call (it records it itself). Called under the
+    /// entry's gate, right before the call's own record is appended.
     fn finish_in_flight(&self, call_id: u64) -> bool {
         lock(&self.inner).in_flight.remove(&call_id).is_some()
     }
 
-    /// The calls in flight, taken by the cancel path under the entry's gate.
+    /// The calls in flight, taken by the cancel path or the end of the run under the entry's gate.
     pub(crate) fn take_in_flight(&self) -> Vec<(CallInfo, FetchControl)> {
         let mut g = lock(&self.inner);
         let mut calls: Vec<_> = g.in_flight.drain().map(|(_, f)| (f.info, f.ctl)).collect();
         calls.sort_by_key(|(i, _)| i.call_id);
         calls
+    }
+
+    /// The `SCRIPT_CALL {cancelled_in_flight}` records of the calls in flight (§9.5): each call
+    /// is taken, its control cancelled and the bytes received recorded. A call whose request was
+    /// never written has nothing to record. Under the entry's gate only.
+    pub(crate) fn in_flight_records(&self, ctx: &EventCtx, reason: InFlightReason) -> Vec<NewEvent> {
+        let mut records = Vec::new();
+        for (info, ctl) in self.take_in_flight() {
+            ctl.cancel();
+            let cap = ctl.take_captured();
+            if !cap.sent {
+                continue;
+            }
+            let size = cap
+                .pages
+                .iter()
+                .map(|p| p.body.len() as u64)
+                .sum::<u64>()
+                .saturating_add(cap.partial.len() as u64);
+            let ctx = EventCtx {
+                instance_id: Some(info.instance_id.clone()),
+                ..ctx.clone()
+            };
+            records.push(payloads::script_call(
+                &ctx,
+                &ScriptCallMeta {
+                    call_id: info.call_id,
+                    op: &info.op,
+                    params: &info.params,
+                    instance: Some(&info.alias),
+                    user_key: info.user_key.as_deref(),
+                    rejection: Some("cancelled_in_flight"),
+                },
+                &ReadFetched::CancelledInFlight {
+                    reason,
+                    responses: &cap.pages,
+                    partial: &cap.partial,
+                    size,
+                },
+                size,
+                None,
+            ));
+        }
+        records
     }
 }
 
@@ -513,6 +565,18 @@ impl EngineValidator {
 
 impl CallValidator for EngineValidator {
     fn validate(&self, call: &HostCall) -> Result<ValidatedCall, HostCallResult> {
+        // `SCRIPT_CALL` records the params even of a rejected call: bound them like `args`.
+        let fits = serde_json::to_vec(&call.params)
+            .is_ok_and(|b| b.len() <= crate::validate::MAX_SCRIPT_ARGS_BYTES);
+        if !fits {
+            let mut m = Map::new();
+            m.insert("param".into(), "params".into());
+            return Err(rejected(
+                ErrorCode::Validation,
+                "the params are over 1 MiB",
+                m,
+            ));
+        }
         let Some(spec) = atlas_duck_registry::get(&call.op_id) else {
             return Err(rejected_msg(ErrorCode::Validation, "unknown op"));
         };
@@ -693,15 +757,39 @@ enum Appended {
     Failed,
 }
 
-async fn append_gated(engine: &Engine, entry: &Arc<RequestEntry>, ev: NewEvent) -> Appended {
-    let _gate = entry.gate.clone().lock_owned().await;
-    if !matches!(entry.state().model.phase(), Phase::Running) {
-        return Appended::Ended;
-    }
-    match engine.blocking(move |p| p.append(ev).map(|_| ())).await {
-        Ok(()) => Appended::Done,
-        Err(_) => Appended::Failed,
-    }
+async fn append_gated(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, ev: NewEvent) -> Appended {
+    append_gated_call(engine, entry, None, ev).await
+}
+
+/// [`append_gated`] for the record of host call `call.1`: the call leaves the run's in-flight
+/// table under the gate, right before its record is appended. The end of the run (cancel,
+/// timeout, kill, crash) takes the calls still in the table under the same gate and records
+/// them itself, so a call is recorded exactly once, by whoever holds the gate first. The body
+/// runs in its own task: a dropped call future cannot release the gate while the append runs.
+async fn append_gated_call(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    call: Option<(Arc<RunShared>, u64)>,
+    ev: NewEvent,
+) -> Appended {
+    let (engine, entry) = (engine.clone(), entry.clone());
+    tokio::spawn(async move {
+        let _gate = entry.gate.clone().lock_owned().await;
+        if !matches!(entry.state().model.phase(), Phase::Running) {
+            return Appended::Ended;
+        }
+        if let Some((shared, id)) = &call
+            && !shared.finish_in_flight(*id)
+        {
+            return Appended::Ended;
+        }
+        match engine.blocking(move |p| p.append(ev).map(|_| ())).await {
+            Ok(()) => Appended::Done,
+            Err(_) => Appended::Failed,
+        }
+    })
+    .await
+    .unwrap_or(Appended::Failed)
 }
 
 /// §5.1 inv. 1: an append of the run failed. The worker is killed and the request ends
@@ -851,13 +939,14 @@ impl LiveBackend {
                 return result;
             }
         };
-        let settled = self.settle(&call, &vc, &info, classified);
-        // The cancel path took the call while it was in flight: it records it.
-        if !self.shared.finish_in_flight(call.id) {
+        // The control was cancelled by the end of the run, which took the call and records it.
+        let Some(settled) = self.settle(&call, &vc, &info, classified) else {
+            self.shared.finish_in_flight(call.id);
             return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
-        }
+        };
         self.shared.add_fetched(settled.size);
-        match append_gated(&self.engine, &self.entry, settled.record).await {
+        let ended = Some((self.shared.clone(), call.id));
+        match append_gated_call(&self.engine, &self.entry, ended, settled.record).await {
             Appended::Done => {
                 if settled.lossy
                     && let Some(s) = self.entry.state().script.as_mut()
@@ -1000,7 +1089,7 @@ impl LiveBackend {
         vc: &ValidatedCall,
         info: &CallInfo,
         classified: Classified,
-    ) -> Settled {
+    ) -> Option<Settled> {
         let ctx = self.ctx_for(vc);
         let max_result = u64::from(self.limits.max_call_result_mb).saturating_mul(MIB);
         match classified {
@@ -1023,19 +1112,41 @@ impl LiveBackend {
                         )
                     }
                     _ => {
-                        let (code, name) = match rec.outcome.as_ref().map(|o| o.kind) {
-                            Some(OutcomeKind::TooLarge) => {
-                                (ErrorCode::ResultTooLarge, "result_too_large")
-                            }
-                            Some(OutcomeKind::Unparsable) => {
-                                (ErrorCode::UpstreamUnavailable, "upstream_unavailable")
-                            }
-                            _ => (ErrorCode::UpstreamNetwork, "upstream_network"),
+                        // The record names the cap that stopped the fetch and the cause of a
+                        // later-page failure (`read::gated`).
+                        let cap = event.payload.get("cap_or_budget").and_then(Value::as_str);
+                        let cause = event.payload.get("reason").and_then(Value::as_str);
+                        let kind = rec.outcome.as_ref().map(|o| o.kind);
+                        let (result, name) = match (kind, cap, cause) {
+                            // The run's fetched bytes reached `max_fetch_mb` (§9.5).
+                            (Some(OutcomeKind::TooLarge), Some("fetch_cap_50mib"), _) => (
+                                rejected_msg(
+                                    ErrorCode::ScriptLimit,
+                                    "the run exceeded a call or fetch limit",
+                                ),
+                                "max_fetch_mb",
+                            ),
+                            (Some(OutcomeKind::TooLarge), _, _) => (
+                                rejected_msg(ErrorCode::ResultTooLarge, MSG_UPSTREAM_FAILED),
+                                "result_too_large",
+                            ),
+                            (Some(OutcomeKind::Unparsable), _, Some("needs_token")) => (
+                                rejected_msg(ErrorCode::NeedsToken, read::MSG_NEEDS_TOKEN),
+                                "needs_token",
+                            ),
+                            (Some(OutcomeKind::Unparsable), _, _) => (
+                                rejected_msg(ErrorCode::UpstreamUnavailable, MSG_UPSTREAM_FAILED),
+                                "upstream_unavailable",
+                            ),
+                            _ => (
+                                rejected_msg(ErrorCode::UpstreamNetwork, MSG_UPSTREAM_FAILED),
+                                "upstream_network",
+                            ),
                         };
-                        (rejected_msg(code, MSG_UPSTREAM_FAILED), Some(name), false)
+                        (result, Some(name), false)
                     }
                 };
-                Settled {
+                Some(Settled {
                     result,
                     record: payloads::script_call_from(
                         event,
@@ -1044,7 +1155,7 @@ impl LiveBackend {
                     ),
                     size,
                     lossy,
-                }
+                })
             }
             Classified::Direct(d) => {
                 let size: u64 = d.responses.iter().map(|r| r.body.len() as u64).sum();
@@ -1065,20 +1176,15 @@ impl LiveBackend {
                 if let Some(r) = d.reason_detail {
                     extra.insert("reason".into(), r.into());
                 }
-                Settled {
+                Some(Settled {
                     result: rejected(d.code, &d.message, extra),
                     record,
                     size,
                     lossy: false,
-                }
+                })
             }
-            // The control was cancelled by the cancel path, which records the call itself.
-            Classified::Cancelled => Settled {
-                result: rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED),
-                record: payloads::script_call_sent(&ctx, call.id, &call.op_id, None),
-                size: 0,
-                lossy: false,
-            },
+            // The control was cancelled by the end of the run, which records the call itself.
+            Classified::Cancelled => None,
         }
     }
 }
@@ -1179,9 +1285,90 @@ pub fn normalize(payload: &Value) -> Result<Value, RebuildError> {
         return Ok(json!({ "result": result }));
     }
     if let Some(error) = payload.get("error").or_else(|| payload.get("candidate")) {
-        return Ok(json!({ "script_error": error }));
+        return Ok(json!({ "script_error": bound_error(error.clone()) }));
     }
     Err(RebuildError::Malformed)
+}
+
+/// The bytes of `{"result":` and `}` around a result value.
+const RESULT_WRAPPER_BYTES: u64 = 11;
+/// Bounds of an error candidate (§9.5, I-3): the worker's own text is untrusted and unbounded,
+/// the released envelope must fit one IPC frame. The record keeps the full text; the candidate
+/// (and so the preview and the release) carries the first part and a marker.
+const ERROR_MESSAGE_MAX_BYTES: usize = 64 * 1024;
+const ERROR_STACK_MAX_BYTES: usize = 64 * 1024;
+const ERROR_STDERR_MAX_BYTES: usize = 256 * 1024;
+const ERROR_LOGS_MAX_BYTES: usize = 1024 * 1024;
+
+/// `text` cut to at most `max` bytes (on a character boundary) plus a marker naming how many
+/// bytes were dropped; `None` = it fits.
+fn truncated(text: &str, max: usize) -> Option<String> {
+    if text.len() <= max {
+        return None;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(format!(
+        "{}\n[truncated {} bytes]",
+        &text[..end],
+        text.len() - end
+    ))
+}
+
+/// The error candidate within its byte bounds: `message`, `stack`, `stderr` and `logs` cut with
+/// a marker, `truncated: true` beside them when anything was. Deterministic in the value, so
+/// the candidate built at the end of the run and the one rebuilt from the record agree.
+pub(crate) fn bound_error(mut error: Value) -> Value {
+    let Some(map) = error.as_object_mut() else {
+        return error;
+    };
+    let mut cut = false;
+    for (key, max) in [
+        ("message", ERROR_MESSAGE_MAX_BYTES),
+        ("stack", ERROR_STACK_MAX_BYTES),
+        ("stderr", ERROR_STDERR_MAX_BYTES),
+    ] {
+        let short = map
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|t| truncated(t, max));
+        if let Some(short) = short {
+            map.insert(key.to_owned(), short.into());
+            cut = true;
+        }
+    }
+    if let Some(Value::Array(logs)) = map.get_mut("logs") {
+        let mut budget = ERROR_LOGS_MAX_BYTES;
+        let mut kept = Vec::with_capacity(logs.len());
+        let mut dropped = 0usize;
+        for line in logs.iter() {
+            let text = line.as_str().map_or_else(|| line.to_string(), str::to_owned);
+            if budget == 0 {
+                dropped += 1;
+                continue;
+            }
+            if let Some(short) = truncated(&text, budget) {
+                budget = 0;
+                kept.push(Value::String(short));
+            } else {
+                budget -= text.len();
+                kept.push(Value::String(text));
+            }
+        }
+        if dropped > 0 {
+            kept.push(Value::String(format!("[truncated {dropped} log lines]")));
+        }
+        if dropped > 0 || kept.iter().zip(logs.iter()).any(|(a, b)| a != b) {
+            cut = true;
+            *logs = kept;
+        }
+    }
+    if cut {
+        map.insert("truncated".to_owned(), true.into());
+    }
+    error
 }
 
 /// [`normalize`] for `Engine::candidate`.
@@ -1453,7 +1640,8 @@ fn dispatch(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
     let task = tokio::spawn(run(engine.clone(), entry.clone()));
     tokio::spawn(async move {
         if task.await.is_err() {
-            if let Some(shared) = entry.state().script.as_ref().and_then(|s| s.shared.clone()) {
+            let shared = entry.state().script.as_ref().and_then(|s| s.shared.clone());
+            if let Some(shared) = shared {
                 shared.request_kill(KillReason::Limit("internal".to_owned()));
             }
             let ctx = entry.ctx.clone();
@@ -1613,7 +1801,11 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
     let Some((permit, queued)) = slot(&engine.script_slots, entry, true).await else {
         return;
     };
-    // 3. `SCRIPT_STARTED` is the record of the slot (§9.1 step 2).
+    // 3. `SCRIPT_STARTED` is the record of the slot (§9.1 step 2). The run's shared state is
+    //    installed by the step that enters `Running`, under the gate: a cancel or a kill that
+    //    comes after finds it, one that came before ended the request and this step is refused.
+    let shared = Arc::new(RunShared::default());
+    let installed = shared.clone();
     let (ctx, s, a) = (entry.ctx.clone(), source.clone(), args.clone());
     let started = engine
         .transition_with(
@@ -1624,6 +1816,7 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
             move |st| {
                 if let Some(s) = st.script.as_mut() {
                     s.queued = queued;
+                    s.shared = Some(installed);
                 }
             },
         )
@@ -1633,10 +1826,6 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
     }
     engine.ui().emit(UiEvent::RunningScriptsChanged);
     // 4. The worker.
-    let shared = Arc::new(RunShared::default());
-    if let Some(s) = entry.state().script.as_mut() {
-        s.shared = Some(shared.clone());
-    }
     let validator = Arc::new(EngineValidator::new(engine.clone()));
     let backend = Arc::new(LiveBackend::new(
         engine.clone(),
@@ -1653,18 +1842,25 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         dry_run: false,
     };
     let began = Instant::now();
-    let end = match runner.start(spec, backend).await {
-        Ok(handle) => {
-            shared.set_handle(handle.clone());
-            let end = handle.wait().await;
-            shared.mark_ended();
-            end
-        }
-        // §3.4: a spawn-time `sandbox_unavailable` counts like a host-measured limit.
-        Err(RunnerError::SandboxUnavailable { .. }) => {
-            shared.mark_ended();
-            RunEnd::HostLimit {
-                name: REASON_SANDBOX_UNAVAILABLE.to_owned(),
+    // A kill asked for before the worker exists (a cancel, a user kill in this window): no
+    // worker is started for it.
+    let end = if let Some(reason) = shared.kill_reason() {
+        shared.mark_ended();
+        RunEnd::Killed { reason }
+    } else {
+        match runner.start(spec, backend).await {
+            Ok(handle) => {
+                shared.set_handle(handle.clone());
+                let end = handle.wait().await;
+                shared.mark_ended();
+                end
+            }
+            // §3.4: a spawn-time `sandbox_unavailable` counts like a host-measured limit.
+            Err(RunnerError::SandboxUnavailable { .. }) => {
+                shared.mark_ended();
+                RunEnd::HostLimit {
+                    name: REASON_SANDBOX_UNAVAILABLE.to_owned(),
+                }
             }
         }
     };
@@ -1758,8 +1954,12 @@ fn classify(
             logs,
             stderr,
         } => {
-            let too_big = serde_json::to_vec(&value).map_or(u64::MAX, |b| b.len() as u64)
-                > u64::from(limits.max_result_mb).saturating_mul(MIB);
+            // `max_result_mb`, and the 16 MiB release cap with the candidate's wrapper (I-3): a
+            // result whose candidate could not be released is a limit, not a release item.
+            let bound = u64::from(limits.max_result_mb)
+                .saturating_mul(MIB)
+                .min(RELEASE_CAP_BYTES.saturating_sub(RESULT_WRAPPER_BYTES));
+            let too_big = serde_json::to_vec(&value).map_or(u64::MAX, |b| b.len() as u64) > bound;
             if too_big {
                 return limit("max_result_mb".to_owned());
             }
@@ -1788,7 +1988,7 @@ fn classify(
             Finish::Item {
                 item: ReleaseItem::ScriptErrorDetails,
                 record: payloads::script_finished_error(ctx, &d),
-                body: json!({ "script_error": d.to_value() }),
+                body: json!({ "script_error": bound_error(d.to_value()) }),
             }
         }
         RunEnd::HostLimit { name }
@@ -1822,7 +2022,7 @@ async fn finish_real(
     match classify(end, shared, &entry.ctx, queued, limits, elapsed) {
         Finish::Ignore => {}
         Finish::Item { item, record, body } => {
-            commit_item(engine, entry, item, record, body, false, shared.instances()).await;
+            commit_item(engine, entry, item, record, body, false, shared).await;
         }
         Finish::Failed {
             reason,
@@ -1863,7 +2063,7 @@ async fn finish_real(
                 record,
                 body,
                 preselect,
-                shared.instances(),
+                shared,
             )
             .await;
         }
@@ -1879,12 +2079,13 @@ async fn commit_item(
     record: NewEvent,
     body: Value,
     preselect: bool,
-    called: BTreeSet<String>,
+    shared: &Arc<RunShared>,
 ) {
     // Building the candidate (serialize, hash, preview) is CPU work.
     let built = tokio::task::spawn_blocking(move || Candidate::from_value(body)).await;
     let candidate = match built {
-        Ok(Ok(c)) => Arc::new(c),
+        // The release cap (§5.2): what cannot be released under it fails closed (I-3).
+        Ok(Ok(c)) if c.bytes().len() as u64 <= RELEASE_CAP_BYTES => Arc::new(c),
         _ => {
             let ctx = entry.ctx.clone();
             let _ = engine
@@ -1906,6 +2107,8 @@ async fn commit_item(
         })
     };
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
+    let (called, in_flight) = (shared.instances(), shared.clone());
+    let ctx = entry.ctx.clone();
     let applied = engine
         .transition_with(
             entry,
@@ -1913,7 +2116,13 @@ async fn commit_item(
                 direct: false,
                 item,
             },
-            move |_| vec![record],
+            // Host calls still in flight when the run ended by itself (timeout, kill, crash,
+            // limit) are taken under this gate and recorded before the end (§9.5).
+            move |_| {
+                let mut records = in_flight.in_flight_records(&ctx, InFlightReason::RunEnded);
+                records.push(record);
+                records
+            },
             OnAuditFailure::FailRequest,
             move |st| {
                 st.candidate_hash = *candidate.hash();
@@ -1957,14 +2166,27 @@ async fn run_dry(
     let Some((permit, _)) = slot(&engine.dry_slots, entry, false).await else {
         return;
     };
+    // The kill handle exists from the step that enters `DryRunning`: a cancel during the compile
+    // check is recorded there and no worker is started for it.
+    let shared = Arc::new(RunShared::default());
+    let installed = shared.clone();
     if engine
-        .step_unlogged(entry, Event::DryRunStarted, None, |_| {})
+        .step_unlogged(entry, Event::DryRunStarted, None, move |st| {
+            if let Some(s) = st.script.as_mut() {
+                s.shared = Some(installed);
+            }
+        })
         .await
         .is_err()
     {
         return;
     }
-    if let Err(e) = runner.compile_check(&source).await {
+    let compiled = runner.compile_check(&source).await;
+    if shared.kill_reason().is_some() {
+        // The cancel path ended the request.
+        return;
+    }
+    if let Err(e) = compiled {
         let details = syntax_details(&e);
         dry_end(
             engine,
@@ -1978,10 +2200,6 @@ async fn run_dry(
         )
         .await;
         return;
-    }
-    let shared = Arc::new(RunShared::default());
-    if let Some(s) = entry.state().script.as_mut() {
-        s.shared = Some(shared.clone());
     }
     let validator = Arc::new(EngineValidator::new(engine.clone()));
     let backend = Arc::new(DryRunBackend::new(mode, validator).with_max_calls(limits.max_calls));
@@ -2163,14 +2381,14 @@ impl Engine {
         let Some(entry) = self.entry(request_id) else {
             return false;
         };
-        let shared = entry.state().script.as_ref().and_then(|s| s.shared.clone());
-        match shared {
-            Some(s) if s.kill_reason().is_none() => {
-                s.request_kill(KillReason::User);
-                true
-            }
-            _ => false,
-        }
+        // A dry run has no release item to end in: only a real run can be killed by the user.
+        let shared = entry
+            .state()
+            .script
+            .as_ref()
+            .filter(|s| s.dry.is_none())
+            .and_then(|s| s.shared.clone());
+        shared.is_some_and(|s| s.request_kill(KillReason::User))
     }
 }
 

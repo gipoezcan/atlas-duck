@@ -18,7 +18,9 @@ use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
 use atlas_duck_core::testing::{
     FakeScriptRunner, FaultPlan, Harness, InstanceAt, ScriptPlan, host_call,
 };
-use atlas_duck_core::{BatchItem, Confirm, HostCalls, KillReason, RunEnd, RunnerError, TestHooks};
+use atlas_duck_core::{
+    BatchItem, Confirm, HostCalls, KillReason, Pause, RunEnd, RunnerError, TestHooks,
+};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult};
 use atlas_duck_registry::Product;
@@ -313,7 +315,6 @@ async fn p3_cancel_running_kills_and_cancels() -> TestResult {
     .await?;
     let id = submit(&h, json!({ "source": SRC })).await?;
     wait_for("the run to start", || runner.starts() == 1).await?;
-    wait_for("SCRIPT_STARTED", || runner.starts() == 1).await?;
     let t = Instant::now();
     let env = h.handler().cancel(&id).await;
     assert!(
@@ -1244,6 +1245,269 @@ async fn a_result_over_max_result_mb_is_a_host_measured_limit() -> TestResult {
         h.event_types(&id2)
             .await?
             .contains(&EventType::SCRIPT_FINISHED)
+    );
+    Ok(())
+}
+
+// ---- Task 27 fix round: kill binding, in-flight calls at a run's own end, candidate bounds ------
+
+fn pause() -> Arc<Pause> {
+    Pause::new()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_the_dry_run_compile_check_never_starts_the_worker() -> TestResult {
+    let hold = pause();
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).with_compile_pause(hold.clone()),
+    ])
+    .await?;
+    let id = submit(&h, json!({ "source": SRC, "dry_run": true })).await?;
+    hold.reached.notified().await;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    hold.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(runner.starts(), 0, "a cancelled dry run must not start");
+    assert_eq!(
+        h.event_types(&id).await?,
+        [EventType::REQUEST_RECEIVED, EventType::CANCELLED]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_while_the_worker_is_being_started_kills_it_when_it_appears() -> TestResult {
+    let hold = pause();
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1)))
+            .holding(30_000)
+            .with_start_pause(hold.clone()),
+    ])
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    hold.reached.notified().await;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    hold.release.notify_one();
+    wait_for("the late worker to be killed", || {
+        runner.kills() == [Some(KillReason::Client)]
+    })
+    .await?;
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_FAILED,
+            EventType::CANCELLED,
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_right_after_the_slot_is_taken_logs_the_failure_and_starts_nothing() -> TestResult {
+    let hold = pause();
+    let hooks = TestHooks {
+        pause_in_transition: Some(hold.clone()),
+        ..TestHooks::none()
+    };
+    let (h, runner) = harness_with(
+        vec![ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(30_000)],
+        hooks,
+        FaultPlan::new(),
+    )
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    // `SCRIPT_STARTED` is committed, the model not yet applied: the gate is held.
+    hold.reached.notified().await;
+    let canceller = {
+        let (handler, id) = (h.handler(), id.clone());
+        tokio::spawn(async move { handler.cancel(&id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    hold.release.notify_one();
+    let env = canceller.await?;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(runner.starts(), 0, "no worker for a cancelled run");
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_FAILED,
+            EventType::CANCELLED,
+        ]
+    );
+    Ok(())
+}
+
+/// A run with one host call that never finishes (the server stalls after a partial answer),
+/// ended by the worker's own death or a user kill; returns the events.
+async fn run_ended_with_a_call_in_flight(
+    end: Option<RunEnd>,
+    keep_calls: bool,
+) -> Result<Vec<(EventType, Value)>, TestError> {
+    let server = RawHttpServer::serve_sequence(vec![vec![
+        RawStep::Send(raw_answer(br#"{"key":"ABC-1","fi"#, 1_000_000)),
+        RawStep::Sleep(120_000),
+    ]])
+    .await?;
+    let mut plan = ScriptPlan::new(vec![issue_call(1)], result_end(json!(1)));
+    if let Some(end) = end.clone() {
+        plan = plan.interrupted(1500, end);
+    }
+    if keep_calls {
+        plan = plan.keeping_calls();
+    }
+    let runner = FakeScriptRunner::new(vec![plan]);
+    let h = Harness::builder()
+        .instance_at(
+            "jira-main",
+            Product::Jira,
+            InstanceAt {
+                base_url: server.base_url(),
+                ..InstanceAt::default()
+            },
+        )
+        .timeouts(Timeouts {
+            per_call: Duration::from_secs(300),
+            ..Timeouts::default()
+        })
+        .scripts(runner.clone())
+        .start()
+        .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the connection", || server.connections() >= 1).await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    if end.is_none() {
+        assert!(h.engine().kill_script(&id));
+    }
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(h.events(&id).await?)
+}
+
+fn assert_in_flight_then_failed(events: &[(EventType, Value)], reason: &str) -> TestResult {
+    let types: Vec<EventType> = events.iter().map(|(t, _)| *t).collect();
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+        ]
+    );
+    let call = &events[3].1;
+    assert_eq!(call["outcome"], "cancelled_in_flight");
+    assert_eq!(call["reason"], "run_ended");
+    assert!(
+        call["partial"]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("ABC-1")),
+        "the bytes received are recorded: {call}"
+    );
+    assert_eq!(events[4].1["reason"], reason);
+    assert_eq!(events[4].1["dispatched"], true);
+    assert_eq!(events[4].1["direct"], false);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_with_a_call_in_flight_records_the_call() -> TestResult {
+    let events = run_ended_with_a_call_in_flight(
+        Some(RunEnd::HostLimit {
+            name: "timeout_s".to_owned(),
+        }),
+        false,
+    )
+    .await?;
+    assert_in_flight_then_failed(&events, "timeout_s")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_with_a_call_whose_future_lives_on_records_the_call_once() -> TestResult {
+    let events = run_ended_with_a_call_in_flight(Some(RunEnd::Crashed), true).await?;
+    assert_in_flight_then_failed(&events, "worker_crash")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_user_kill_with_a_call_in_flight_records_the_call() -> TestResult {
+    let events = run_ended_with_a_call_in_flight(None, false).await?;
+    assert_in_flight_then_failed(&events, "killed_by_user")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_huge_error_candidate_is_bounded_and_marked() -> TestResult {
+    let mib = 1024 * 1024;
+    let end = RunEnd::Error {
+        class: "Error".to_owned(),
+        message: "m".repeat(mib),
+        stack: "s".repeat(mib),
+        elapsed_ms: 5,
+        logs: vec!["l".repeat(mib); 6],
+        stderr: "e".repeat(20 * mib),
+    };
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), end)]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    h.approver().release(&id).map_err(de)?;
+    let env = h.await_(&id, 20_000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    let data = env.data.clone().ok_or("no data")?;
+    assert!(
+        serde_json::to_vec(&data)?.len() < 4 * mib,
+        "the released error is bounded"
+    );
+    let err = &data["script_error"];
+    assert_eq!(err["class"], "Error");
+    assert_eq!(err["truncated"], true);
+    assert!(
+        err["stderr"]
+            .as_str()
+            .is_some_and(|s| s.contains("[truncated")),
+        "a marker says what was cut"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_that_cannot_be_released_under_the_cap_is_a_limit() -> TestResult {
+    // Under `max_result_mb` (16) but its candidate would exceed the 16 MiB release cap.
+    let big = "x".repeat(16 * 1024 * 1024 - 5);
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(json!(big)))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let env = h.await_(&id, 20_000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "script_limit");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_call_params_over_a_megabyte_are_rejected() -> TestResult {
+    let big = "A".repeat(2 * 1024 * 1024);
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![host_call(1, "jira.issue.get", json!({ "key": big }))],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [HostCallResult::Rejected { class, details }] => {
+            assert_eq!(class, "validation");
+            assert_eq!(details["param"], "params");
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    assert!(
+        !h.event_types(&id)
+            .await?
+            .contains(&EventType::SCRIPT_CALL_SENT)
     );
     Ok(())
 }
