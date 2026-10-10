@@ -1,13 +1,13 @@
 //! Instances: the runtime table routing reads (`state`) and the `InstanceAdmin` surface the
 //! settings and credential windows call (C.7, §7.1, §10.3).
 //!
-//! Task 19 declares the trait with the Task 25 method set and answers `list` from the runtime
-//! table; every other method is Task 25's (`AdminError::Unsupported` until then). Every return
-//! type is `Serialize` (PD-12: the capture hook records them).
+//! `state` is the runtime table, `admin` the `InstanceAdmin` implementation and
+//! `connection_test` the credential window's test (Task 25). Every return type is `Serialize`
+//! (PD-12: the capture hook records them).
 
+pub mod admin;
+pub mod connection_test;
 pub mod state;
-
-use std::sync::Arc;
 
 use atlas_duck_atlassian::{ConnClass, CredentialError};
 use atlas_duck_audit::AuditError;
@@ -16,9 +16,9 @@ use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
 use crate::config::instances::product_str;
-use crate::engine::Engine;
 use crate::proxy::ProxySetting;
 
+pub use admin::CoreInstances;
 pub use state::{InstanceRuntime, InstanceState, InstanceTable, RouteError};
 
 fn ser_product<S: Serializer>(p: &Product, s: S) -> Result<S::Ok, S::Error> {
@@ -120,8 +120,6 @@ pub enum AdminError {
     ConnectionFailed(ConnectionFailure),
     Audit(AuditError),
     Keychain(CredentialError),
-    /// Task 19 skeleton: the method is implemented by Task 25, which removes this variant.
-    Unsupported,
 }
 
 impl AdminError {
@@ -136,10 +134,21 @@ impl AdminError {
             Self::ConnectionFailed(_) => "connection_failed",
             Self::Audit(_) => "audit",
             Self::Keychain(_) => "keychain",
-            Self::Unsupported => "unsupported",
         }
     }
 }
+
+/// The kind only: an `AuditError` or keychain message can name paths.
+impl std::fmt::Display for AdminError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionFailed(c) => write!(f, "connection_failed ({})", c.kind()),
+            other => f.write_str(other.kind()),
+        }
+    }
+}
+
+impl std::error::Error for AdminError {}
 
 /// `{kind, failure?}`: no error text (an `AuditError` or keychain message can name paths).
 impl Serialize for AdminError {
@@ -153,7 +162,7 @@ impl Serialize for AdminError {
     }
 }
 
-/// C.7: add/change base URL (native confirmation), proxy, token set/re-test (Task 25).
+/// C.7: add/change base URL (native confirmation), proxy, token set/re-test (§7.1, §10.3).
 #[async_trait::async_trait]
 pub trait InstanceAdmin: Send + Sync {
     fn list(&self) -> Vec<InstanceView>;
@@ -169,70 +178,4 @@ pub trait InstanceAdmin: Send + Sync {
         expires_at: Option<chrono::NaiveDate>,
     ) -> Result<ConnectionReport, AdminError>;
     async fn retest_token(&self, alias: &str) -> Result<ConnectionReport, AdminError>;
-}
-
-/// The core's `InstanceAdmin` (skeleton until Task 25).
-pub struct CoreInstances {
-    engine: Arc<Engine>,
-}
-
-impl CoreInstances {
-    pub(crate) fn new(engine: Arc<Engine>) -> CoreInstances {
-        CoreInstances { engine }
-    }
-
-    /// `NotFound` for an unknown alias, else the skeleton's `Unsupported`.
-    fn refuse(&self, alias: &str) -> AdminError {
-        match self.engine.instances().by_alias(alias) {
-            Some(_) => AdminError::Unsupported,
-            None => AdminError::NotFound,
-        }
-    }
-}
-
-fn view(i: &InstanceRuntime) -> InstanceView {
-    InstanceView {
-        alias: i.alias.clone(),
-        product: i.product,
-        origin: i.base.as_ref().map(|b| b.as_str()),
-        state: i.state.as_str(),
-        executes_as: None,
-        expires_at: None,
-        pac_configured: false,
-        proxy_effective: None,
-        pending_url_change: None,
-    }
-}
-
-#[async_trait::async_trait]
-impl InstanceAdmin for CoreInstances {
-    fn list(&self) -> Vec<InstanceView> {
-        self.engine.instances().list().iter().map(view).collect()
-    }
-    fn add(&self, _req: AddInstance) -> Result<InstanceView, AdminError> {
-        Err(AdminError::Unsupported)
-    }
-    fn confirm_config_instance(&self, alias: &str) -> Result<InstanceView, AdminError> {
-        Err(self.refuse(alias))
-    }
-    fn accept_config_url_change(&self, alias: &str) -> Result<InstanceView, AdminError> {
-        Err(self.refuse(alias))
-    }
-    fn change_base_url(&self, alias: &str, _new_url: &str) -> Result<InstanceView, AdminError> {
-        Err(self.refuse(alias))
-    }
-    fn set_proxy(&self, alias: &str, _proxy: ProxySetting) -> Result<InstanceView, AdminError> {
-        Err(self.refuse(alias))
-    }
-    async fn set_token(
-        &self,
-        alias: &str,
-        _pat: secrecy::SecretString,
-        _expires_at: Option<chrono::NaiveDate>,
-    ) -> Result<ConnectionReport, AdminError> {
-        Err(self.refuse(alias))
-    }
-    async fn retest_token(&self, alias: &str) -> Result<ConnectionReport, AdminError> {
-        Err(self.refuse(alias))
-    }
 }

@@ -60,7 +60,17 @@ impl TempStore {
         })
     }
 
+    /// An install of its own over a keyring that other installs share (Q4, I-43): its entries
+    /// are scoped by its `install_id`.
+    pub fn with_ring(ring: Arc<MemKeyring>) -> Result<TempStore, TestError> {
+        TempStore::build(Hooks::default(), ring)
+    }
+
     fn with_hooks(hooks: Hooks) -> Result<TempStore, TestError> {
+        TempStore::build(hooks, MemKeyring::new())
+    }
+
+    fn build(hooks: Hooks, ring: Arc<MemKeyring>) -> Result<TempStore, TestError> {
         let dir = tempfile::tempdir()?;
         let data = match check_data_dir(dir.path())? {
             DataDirResolution::Local(d) => d,
@@ -69,7 +79,6 @@ impl TempStore {
         let lock = InstanceLock::acquire(&data, "testhost")?;
         let start = UtcInstant::parse_rfc3339_ms(TEMP_STORE_START).ok_or("bad TEMP_STORE_START")?;
         let clock = Arc::new(FakeClock::new(start));
-        let ring = MemKeyring::new();
         let free_space = FreeSpaceStub::new(u64::MAX);
         let (install_id, chain_id) = new_ids()?;
         let mut cfg = OpenConfig::new(

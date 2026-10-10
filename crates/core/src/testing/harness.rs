@@ -14,7 +14,7 @@ use std::time::Duration;
 use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY};
 use atlas_duck_atlassian::{ReadBudget, Timeouts, normalize_base_url, url_hash};
 use atlas_duck_audit::testing::{FakeClock, FreeSpaceStub};
-use atlas_duck_audit::{EventType, Store};
+use atlas_duck_audit::{Confirmed, EventType, SettingChange, Store};
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::proto::{
@@ -23,6 +23,7 @@ use atlas_duck_ipc::proto::{
 };
 use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use super::approver::ScriptedApprover;
@@ -33,6 +34,7 @@ use super::confirmer::StubConfirmer;
 use super::credentials::InMemoryCredentials;
 use super::store::{FaultPlan, FaultyAudit, TempStore, TestError};
 use crate::audit_port::{AuditPort, DateBridge};
+use crate::config::instances::ensure_ids;
 use crate::config::instances::product_str;
 use crate::config::{CONFIG_FILE_NAME, load_config};
 use crate::core::{Confirm, Core, CoreDeps, TestHooks};
@@ -44,6 +46,7 @@ use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
 use crate::ids::InstanceId;
 use crate::instances::InstanceAdmin;
+use crate::instances::state::ca_fingerprint;
 use crate::proxy::{OsProxy, SystemProxySource};
 
 /// The agent name of the harness's default connection.
@@ -95,6 +98,8 @@ pub struct HarnessBuilder {
     limits: Option<Limits>,
     hooks: TestHooks,
     timeouts: Option<Timeouts>,
+    strict_https: bool,
+    seed_origins: bool,
 }
 
 impl HarnessBuilder {
@@ -128,6 +133,21 @@ impl HarnessBuilder {
             is_default,
             at: Some(at),
         });
+        self
+    }
+
+    /// Refuses `http://` instance origins like a release build (the mocks are plain http, so an
+    /// instance then needs `instance_at` an https URL or is the object of an insecure-scheme
+    /// test).
+    pub fn strict_https(mut self) -> Self {
+        self.strict_https = true;
+        self
+    }
+
+    /// Leaves the audit settings without confirmed origins: every instance starts
+    /// `instance_unconfirmed` (a hand-added instance, I-31).
+    pub fn unconfirmed(mut self) -> Self {
+        self.seed_origins = false;
         self
     }
 
@@ -244,7 +264,28 @@ impl HarnessBuilder {
         text.push('\n');
         text.push_str(&self.extra_config);
         std::fs::write(&config_path, text)?;
+        // Hand-written instances (`omit_ids`) get their ids here, as the user's first start would
+        // have written them, and are confirmed under those: the core's own id assignment (PD-04)
+        // then finds them in place. `unconfirmed()` is the I-31 hand-added instance.
+        let mut seed_ids: Vec<String> = instances.iter().map(|i| i.id.clone()).collect();
+        if self.omit_ids {
+            ensure_ids(&config_path)?;
+            let written = crate::config::instances::instances(&load_config(&config_path)?)?;
+            for (id, i) in seed_ids.iter_mut().zip(&instances) {
+                if let Some(c) = written.iter().find(|c| c.alias == i.alias)
+                    && let Some(file_id) = &c.id
+                {
+                    id.clone_from(file_id);
+                    let bound =
+                        url_hash(&normalize_base_url(&i.base_url).map_err(|e| format!("{e:?}"))?);
+                    credentials.put(file_id, &self.pat, bound, TEST_USER, TEST_USER_KEY);
+                }
+            }
+        }
         let config = load_config(&config_path)?;
+        if self.seed_origins {
+            seed_settings(&store, &instances, &seed_ids, self.strict_https)?;
+        }
 
         let port: Arc<dyn AuditPort> = Arc::new(FaultyAudit::wrap(store.port(), self.plan.clone()));
         let ui = CapturingUi::wrap(Arc::new(NullUi), capture.clone());
@@ -273,9 +314,10 @@ impl HarnessBuilder {
         };
         let hooks = TestHooks {
             limits: self.limits,
+            allow_http: !self.strict_https,
             ..self.hooks
         };
-        let core = Core::start_with_port(deps, port.clone(), hooks).await?;
+        let core = Core::start_with_port(deps, port.clone(), hooks.clone()).await?;
         let handler = CapturingHandler::wrap(core.handler(), capture.clone());
         let decisions = CapturingDecisions::wrap(core.decisions(), capture.clone());
         let instances_api = CapturingInstances::wrap(core.instances(), capture.clone());
@@ -296,12 +338,66 @@ impl HarnessBuilder {
                 connection_id: String::new(),
                 peer: PeerInfo::default(),
             },
+            hooks,
+            timeouts: self.timeouts,
             _config_dir: config_dir,
             store,
         };
         let default_conn = h.conn(HARNESS_AGENT).await?;
         Ok(Harness { default_conn, ..h })
     }
+}
+
+/// The confirmed origin, proxy and CA fingerprint of every instance, as a user's confirmations
+/// would have left them in the audit settings (I-31); `config.toml` then agrees with them.
+fn seed_settings(
+    store: &TempStore,
+    instances: &[HarnessInstance],
+    ids: &[String],
+    strict_https: bool,
+) -> Result<(), TestError> {
+    let confirmed = Confirmed {
+        dialog_text_sha256: Sha256::digest(b"harness seed").into(),
+    };
+    let audit = store.store();
+    for (i, id) in instances.iter().zip(ids) {
+        // An instance at an `http://` URL under `strict_https` is the test's subject: its origin
+        // is not confirmed, so nothing about it is seeded.
+        let Ok(origin) = normalize_base_url(&i.base_url) else {
+            continue;
+        };
+        if strict_https && origin.as_str().starts_with("http://") {
+            continue;
+        }
+        audit.apply_setting(
+            SettingChange::InstanceOrigin {
+                instance_id: id.clone(),
+                origin: Some(origin.as_str()),
+            },
+            Some(confirmed),
+        )?;
+        if i.proxy.is_some() {
+            audit.apply_setting(
+                SettingChange::InstanceProxy {
+                    instance_id: id.clone(),
+                    proxy: i.proxy.clone(),
+                },
+                None,
+            )?;
+        }
+        if let Some(path) = &i.ca_bundle
+            && let Some(fp) = ca_fingerprint(&std::fs::read(path)?)
+        {
+            audit.apply_setting(
+                SettingChange::InstanceCaFingerprint {
+                    instance_id: id.clone(),
+                    fingerprint: Some(fp),
+                },
+                Some(confirmed),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn config_toml(instances: &[HarnessInstance], with_ids: bool) -> String {
@@ -353,6 +449,8 @@ pub struct Harness {
     instances: Vec<HarnessInstance>,
     next_conn: AtomicU64,
     default_conn: ConnectionMeta,
+    hooks: TestHooks,
+    timeouts: Option<Timeouts>,
     _config_dir: TempDir,
     /// Last: the core lets go of the store before the temp dir goes.
     store: TempStore,
@@ -371,6 +469,8 @@ impl Harness {
             limits: None,
             hooks: TestHooks::none(),
             timeouts: None,
+            strict_https: false,
+            seed_origins: true,
         }
     }
 
@@ -395,6 +495,64 @@ impl Harness {
 
     pub fn core(&self) -> &Core {
         &self.core
+    }
+
+    /// The `config.toml` the core was started from.
+    pub fn config_path(&self) -> std::path::PathBuf {
+        self._config_dir.path().join(CONFIG_FILE_NAME)
+    }
+
+    /// Starts a new `Core` over the same store, keychain, config file and mocks (a restart of the
+    /// app): `config.toml` is read again, the instance table derived again. The old core's
+    /// pending requests are not carried over.
+    pub async fn restart(&mut self) -> Result<(), TestError> {
+        let config = load_config(&self.config_path())?;
+        let no_os_proxy = SystemProxySource::with_reader(Box::new(OsProxy::default));
+        let mut http = HttpFactory::new(
+            Arc::new(no_os_proxy),
+            self.credentials.clone(),
+            Arc::new(DateBridge(self.port.clone())),
+        );
+        if let Some(t) = self.timeouts {
+            http = http.with_timeouts(t);
+        }
+        let deps = CoreDeps {
+            audit: self.store.store(),
+            clock: self.store.clock().clone(),
+            credentials: self.credentials.clone(),
+            confirmer: self.confirmer.clone(),
+            ui: self.ui.clone(),
+            config,
+            config_path: Some(self.config_path()),
+            http,
+            app_start_extra: Map::new(),
+            pats_deleted: Vec::new(),
+        };
+        let core = Core::start_with_port(deps, self.port.clone(), self.hooks.clone()).await?;
+        self.handler = CapturingHandler::wrap(core.handler(), self.capture.clone());
+        self.decisions = CapturingDecisions::wrap(core.decisions(), self.capture.clone());
+        self.instances_api = CapturingInstances::wrap(core.instances(), self.capture.clone());
+        self.core = core;
+        self.default_conn = self.conn(HARNESS_AGENT).await?;
+        Ok(())
+    }
+
+    /// The payloads of every record of type `t` from the last 24 h, in seq order, whatever
+    /// request (or none) they belong to.
+    pub async fn events_of(&self, t: EventType) -> Result<Vec<Value>, TestError> {
+        let port = self.port.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let headers = port.recent_headers(Duration::from_secs(24 * 3600))?;
+            Ok::<_, atlas_duck_audit::AuditError>(
+                headers
+                    .iter()
+                    .filter(|h| h.event_type == t)
+                    .map(|h| payload_json(&*port, h.seq).unwrap_or(Value::Null))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await??;
+        Ok(out)
     }
 
     pub fn engine(&self) -> &Arc<Engine> {

@@ -67,6 +67,22 @@ impl HttpFactory {
         &self,
         inst: &InstanceHttpSpec,
     ) -> Result<(InstanceClient, ResolvedProxy), BuildError> {
+        self.build_with(inst, self.creds.clone())
+    }
+
+    /// The proxy decision for an instance setting (the OS reading is cached 60 s and can block:
+    /// off the async runtime).
+    pub fn resolve(&self, setting: &ProxySetting, host: &str) -> ResolvedProxy {
+        resolve_proxy(setting, host, &self.os.read())
+    }
+
+    /// `build` over another credential source: a connection test holds the entered PAT in a
+    /// provider of its own and stores nothing (§7.1).
+    pub fn build_with(
+        &self,
+        inst: &InstanceHttpSpec,
+        creds: Arc<dyn CredentialProvider>,
+    ) -> Result<(InstanceClient, ResolvedProxy), BuildError> {
         let resolved = resolve_proxy(&inst.proxy, inst.base.host(), &self.os.read());
         #[allow(unused_mut)]
         let mut timeouts = Timeouts::default();
@@ -83,7 +99,7 @@ impl HttpFactory {
             user_agent: self.user_agent.clone(),
             timeouts,
         };
-        let client = InstanceClient::build(cfg, self.creds.clone(), self.dates.clone())?;
+        let client = InstanceClient::build(cfg, creds, self.dates.clone())?;
         Ok((client, resolved))
     }
 }

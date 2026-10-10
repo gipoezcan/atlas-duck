@@ -24,7 +24,9 @@ use crate::engine::queue::Limits;
 use crate::engine::{Engine, EngineDeps};
 use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
+use crate::instances::state::DeriveCtx;
 use crate::instances::{CoreInstances, InstanceAdmin, InstanceTable};
+use crate::payloads::{self, ConfigSource};
 use crate::similarity::SimilarityIndex;
 
 /// §2.2: the native confirmation dialog (`app`: Tauri; tests: `testing::StubConfirmer`).
@@ -140,6 +142,9 @@ pub struct TestHooks {
     pub pause_before_fetch: Option<Arc<Pause>>,
     /// Replaces the request expiry (`[requests] expiry_hours`, default 24 h; Task 24).
     pub expiry: Option<std::time::Duration>,
+    /// Accept `http://` instance origins (the harness's mocks); off, an `http://` origin is
+    /// refused like in a release build (§7.1, I-02).
+    pub allow_http: bool,
 }
 
 #[cfg(feature = "testing")]
@@ -186,6 +191,7 @@ impl Core {
         opts: StartOptions,
     ) -> Result<Core, StartError> {
         let limits = opts.limits;
+        let config_path = deps.config_path.clone();
         let config = match &deps.config_path {
             Some(path) => assign_ids(path.clone(), deps.config).await,
             None => deps.config,
@@ -196,6 +202,35 @@ impl Core {
                 .map(|c| Limits::from_config(&c))
                 .unwrap_or_default()
         });
+        #[cfg(feature = "testing")]
+        let allow_http = opts.hooks.allow_http;
+        #[cfg(not(feature = "testing"))]
+        let allow_http = false;
+        // PD-22: the instance table from `config.toml`, the audit settings and the keychain; the
+        // file-side edits it did not apply are logged once per start (I-31).
+        let (instances, file_side) = {
+            let (port, creds, cfg) = (port.clone(), deps.credentials.clone(), config.clone());
+            tokio::task::spawn_blocking(move || {
+                let settings = port.settings();
+                InstanceTable::derive(
+                    &cfg,
+                    &DeriveCtx {
+                        settings: &settings,
+                        creds: &*creds,
+                        allow_http,
+                        previous: None,
+                    },
+                )
+            })
+            .await
+            .unwrap_or_else(|_| (InstanceTable::from_config(&config), Vec::new()))
+        };
+        for c in &file_side {
+            let ev = payloads::config_changed(ConfigSource::File, &c.key, &c.old, &c.new, false);
+            let port = port.clone();
+            // Best effort: a failed append must not stop the app from starting.
+            let _ = tokio::task::spawn_blocking(move || port.append(ev)).await;
+        }
         let committed = Arc::new(CommittedSet::default());
         // The composition root's one cover issuer: covers only for ids the port committed.
         let covers = CoverIssuer::new(Arc::new(StoreProbe(committed.clone())));
@@ -211,7 +246,7 @@ impl Core {
             confirmer: deps.confirmer,
             clock: deps.clock,
             ui: deps.ui,
-            instances: InstanceTable::from_config(&config),
+            instances,
             limits,
             runtime: tokio::runtime::Handle::current(),
             similarity,
@@ -222,7 +257,7 @@ impl Core {
         Ok(Core {
             handler: Arc::new(CoreHandler::new(engine.clone())),
             decisions: Arc::new(CoreDecisions::new(engine.clone())),
-            instances: Arc::new(CoreInstances::new(engine.clone())),
+            instances: Arc::new(CoreInstances::new(engine.clone(), config_path)),
             engine,
         })
     }

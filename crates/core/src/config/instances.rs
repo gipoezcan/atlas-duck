@@ -98,7 +98,7 @@ pub fn product_str(p: Product) -> &'static str {
     }
 }
 
-fn is_valid_alias(s: &str) -> bool {
+pub(crate) fn is_valid_alias(s: &str) -> bool {
     let n = s.chars().count();
     (1..=MAX_ALIAS_CHARS).contains(&n)
         && s.bytes()
@@ -315,6 +315,34 @@ pub fn add_instance(path: &Path, inst: &InstanceConfig) -> Result<(), ConfigWrit
         .ok_or(ConfigWriteError::Unreadable)?;
     aot.push(to_table(inst));
     save_config(path, &config)
+}
+
+/// Sets (or, for the OS setting, removes) `proxy` of the instance with `id`; `Ok(false)` when no
+/// table has that id.
+pub fn set_proxy_setting(
+    path: &Path,
+    id: &str,
+    proxy: &ProxySetting,
+) -> Result<bool, ConfigWriteError> {
+    let mut config = writable(path)?;
+    let Some(t) = config
+        .doc
+        .get_mut(KEY_INSTANCES)
+        .and_then(Item::as_array_of_tables_mut)
+        .and_then(|aot| {
+            aot.iter_mut()
+                .find(|t| t.get("id").and_then(Item::as_str) == Some(id))
+        })
+    else {
+        return Ok(false);
+    };
+    if *proxy == ProxySetting::Os {
+        t.remove("proxy");
+    } else {
+        t.insert("proxy", value(proxy.as_config_str()));
+    }
+    save_config(path, &config)?;
+    Ok(true)
 }
 
 /// Sets `base_url` of the instance with `id`; `Ok(false)` when no table has that id.

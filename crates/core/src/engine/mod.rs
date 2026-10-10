@@ -53,7 +53,7 @@ use crate::core::NativeConfirmer;
 use crate::decision::SessionKey;
 use crate::gate::{UiEvent, UiSink};
 use crate::http_factory::{HttpFactory, InstanceHttpSpec};
-use crate::instances::InstanceTable;
+use crate::instances::{InstanceRuntime, InstanceTable};
 use crate::lifecycle::model::{
     Applied, Event, Kind, Model, Phase, Rejection, Terminal, agent_status, is_pending, step,
 };
@@ -116,6 +116,10 @@ pub struct EntryState {
     /// `Running`, `DryRunning`; Task 12 review I-4): the request expires as soon as it is in a
     /// phase that can ([`Engine::transition`] re-checks).
     pub expiry_due: bool,
+    /// M-5 (Task 25): the PAT or the base URL changed while the write was in `Enriching`, where
+    /// the model takes no `Instance` event. Applied right after the verdict of that enrichment:
+    /// the write never reaches the queue approvable on an enrichment made under the old token.
+    pub instance_change_pending: Option<write::PendingChange>,
 }
 
 impl EntryState {
@@ -220,6 +224,7 @@ impl RequestEntry {
                 read: None,
                 write: None,
                 expiry_due: false,
+                instance_change_pending: None,
             }),
             status,
             ticket: Mutex::new(ticket),
@@ -533,9 +538,7 @@ pub struct Engine {
     committed: Arc<CommittedSet>,
     covers: CoverIssuer,
     http: Arc<HttpFactory>,
-    #[allow(dead_code)]
     credentials: Arc<dyn CredentialProvider>,
-    #[allow(dead_code)]
     confirmer: Arc<dyn NativeConfirmer>,
     clock: Arc<dyn Clock>,
     ui: Arc<dyn UiSink>,
@@ -623,7 +626,6 @@ impl Engine {
         &self.http
     }
 
-    #[allow(dead_code)] // token recheck and connection tests (Tasks 25/26)
     pub(crate) fn credentials(&self) -> &Arc<dyn CredentialProvider> {
         &self.credentials
     }
@@ -692,6 +694,49 @@ impl Engine {
         self.instances
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Task 25 (PD-22): swaps in a rebuilt instance table. The write lock is held only for the
+    /// swap; never take an entry's state lock while holding it (lock order: entry state, then
+    /// the table).
+    pub(crate) fn replace_instances(&self, table: InstanceTable) {
+        *self
+            .instances
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = table;
+    }
+
+    /// Changes one instance of the table in place (a PAT was stored); the write lock is held
+    /// only for `f`.
+    pub(crate) fn update_instance(&self, instance_id: &str, f: impl FnOnce(&mut InstanceRuntime)) {
+        self.instances
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .update(instance_id, f);
+    }
+
+    /// Drops the cached client of `instance_id` (its origin, CA or proxy changed): the next use
+    /// builds a new one.
+    pub(crate) fn invalidate_client(&self, instance_id: &str) {
+        lock(&self.clients).remove(instance_id);
+    }
+
+    /// §7.1: https only; test builds may allow plain http for their mocks.
+    pub(crate) fn normalize_origin(
+        &self,
+        raw: &str,
+    ) -> Result<atlas_duck_atlassian::NormalizedBaseUrl, atlas_duck_atlassian::BaseUrlError> {
+        crate::instances::state::normalize_origin(raw, self.allow_http())
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn allow_http(&self) -> bool {
+        self.hooks.allow_http
+    }
+
+    #[cfg(not(feature = "testing"))]
+    pub(crate) fn allow_http(&self) -> bool {
+        false
     }
 
     /// §4.4: how long a request may stay pending.

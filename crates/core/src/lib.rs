@@ -11,6 +11,8 @@ pub mod audit_port;
 pub mod config;
 /// The composition root: `CoreDeps`, `Core`, `NativeConfirmer` (C.7).
 mod core;
+/// The PAT in the OS keychain (PD-05, §7.1).
+pub mod credentials;
 /// The decision API (C.7, §5.6): queue rows, previews, decisions.
 pub mod decision;
 
@@ -52,6 +54,7 @@ pub use crate::core::{Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, 
 #[cfg(feature = "testing")]
 pub use crate::core::{HookPoint, Pause, TestHooks};
 pub use atlas_duck_preview::CandidateRev;
+pub use credentials::KeychainCredentials;
 pub use decision::{
     BatchFailure, BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionKind,
     DecisionOutcome, DenyDetails, PreviewDelivery, QueueItem, RawPage, SessionKey,

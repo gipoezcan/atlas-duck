@@ -139,6 +139,11 @@ pub enum Returned {
     IdentityMismatch(Option<String>),
     VersionConflict,
     Instance(InstanceEvt),
+    /// `instance_changed` with the old and new origin (§7.1 "instance URL changed: <old> → <new>").
+    InstanceUrl {
+        old: String,
+        new: String,
+    },
 }
 
 /// A write's state beside its model (Task 22). Nothing here reaches an agent before a decision.
@@ -158,6 +163,10 @@ pub struct WriteState {
     /// The `request_set_hash` the latest committed `WRITE_APPROVED` names.
     pub approved_hash: Option<[u8; 32]>,
     pub returned: Option<Returned>,
+    /// `instance_changed`: the write waits for the instance's new PAT, then
+    /// [`Engine::start_refresh`] (Task 25); its approvability stays false until the refresh's
+    /// `Enriched`, whatever the instance state does meanwhile.
+    pub awaiting_refresh: bool,
 }
 
 /// Kinds and counts only (§7.7): params, bodies and verdict values can be Atlassian data.
@@ -183,6 +192,7 @@ impl WriteState {
             edit: None,
             approved_hash: None,
             returned: None,
+            awaiting_refresh: false,
         }
     }
 }
@@ -290,6 +300,10 @@ fn returned_warning(r: &Returned, executes_as: Option<&str>) -> Option<Warning> 
             warning::token_changed(executes_as.unwrap_or_default()),
         ),
         // The conflict card speaks for itself; Tasks 25/26 bring the URL and rename texts.
+        Returned::InstanceUrl { old, new } => Warning::new(
+            WarningId::InstanceUrlChanged,
+            warning::instance_url_changed(old, new),
+        ),
         Returned::VersionConflict
         | Returned::Instance(InstanceEvt::InstanceChanged | InstanceEvt::UserRenamed) => {
             return None;
@@ -479,6 +493,17 @@ impl Engine {
         entry: &Arc<RequestEntry>,
         cause: RefreshCause,
     ) -> Result<Applied, TransitionError> {
+        self.refresh_write_returned(entry, cause, None).await
+    }
+
+    /// `refresh_write` with the lead warning of the re-review replaced (an `instance_changed`
+    /// return names the old and new URL).
+    pub(crate) async fn refresh_write_returned(
+        self: &Arc<Self>,
+        entry: &Arc<RequestEntry>,
+        cause: RefreshCause,
+        lead: Option<Returned>,
+    ) -> Result<Applied, TransitionError> {
         let ctx = entry.ctx.clone();
         let (event, reason, refresh, returned) = match cause {
             RefreshCause::Stale(r) => (
@@ -495,7 +520,7 @@ impl Engine {
                 Event::Instance(e),
                 instance_reason(e),
                 e != InstanceEvt::InstanceChanged,
-                Returned::Instance(e),
+                lead.unwrap_or(Returned::Instance(e)),
             ),
         };
         let record = payloads::write_stale(&ctx, reason, None);
@@ -519,6 +544,9 @@ impl Engine {
                     Phase::AwaitingApproval(_) => {
                         let applied = step(&mut st.model, Event::EnrichStarted);
                         st.model.set_approvable(false);
+                        if let Some(w) = st.write.as_mut() {
+                            w.awaiting_refresh = false;
+                        }
                         applied
                     }
                     _ => Err(Rejection::Illegal),
@@ -535,6 +563,167 @@ impl Engine {
         spawn_guarded(self, entry, None, enrich_task);
         Ok(applied)
     }
+}
+
+/// An instance change that met a write in `Enriching` (M-5): the kind only in `Debug`.
+#[derive(Clone, PartialEq, Eq)]
+pub enum PendingChange {
+    Credential,
+    Origin { old: String, new: String },
+}
+
+impl fmt::Debug for PendingChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Credential => "PendingChange::Credential",
+            Self::Origin { .. } => "PendingChange::Origin",
+        })
+    }
+}
+
+/// What happened to an instance that its queued writes follow (Task 25, §7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstanceChange {
+    /// A PAT of another user replaced the stored one: `credential_changed`.
+    TokenReplaced,
+    /// The base URL changed and the PAT was deleted: `instance_changed`.
+    OriginChanged { old: String, new: String },
+    /// A PAT was stored (a first one, or the same user's again): writes waiting for it refresh,
+    /// the others re-read their approvability against the instance state.
+    TokenStored,
+}
+
+impl Engine {
+    /// Task 25: carries an instance's credential or origin change to its queued writes (§7.1).
+    /// A write in `AwaitingApproval` or `StaleCheck` returns with `WRITE_STALE` and refreshes
+    /// (`credential_changed`), or waits for the new PAT (`instance_changed`); a write parked that
+    /// way refreshes once a PAT is stored. A write in `Enriching` is not handled here (M-5, see
+    /// the as-built note of Task 25). Call it after the instance table was swapped: it reads the
+    /// instance state inside each entry's critical section (lock order: entry, then the table).
+    pub(crate) async fn instance_changed(
+        self: &Arc<Self>,
+        instance_id: &str,
+        change: InstanceChange,
+    ) {
+        for entry in self.pending_entries() {
+            if entry.instance_id != instance_id {
+                continue;
+            }
+            let (phase, parked, identity_return) = {
+                let st = entry.state();
+                let Some(w) = st.write.as_ref() else { continue };
+                (
+                    st.model.phase(),
+                    w.awaiting_refresh,
+                    matches!(w.returned, Some(Returned::IdentityMismatch(_))),
+                )
+            };
+            if phase == Phase::Enriching {
+                // M-5: the model takes no `Instance` event here; the verdict of the enrichment
+                // applies first, then the change (`follow_pending`).
+                let pending = match &change {
+                    InstanceChange::TokenReplaced => Some(PendingChange::Credential),
+                    InstanceChange::OriginChanged { old, new } => Some(PendingChange::Origin {
+                        old: old.clone(),
+                        new: new.clone(),
+                    }),
+                    InstanceChange::TokenStored => None,
+                };
+                if let Some(p) = pending {
+                    let mut st = entry.state();
+                    if st.model.phase() == Phase::Enriching {
+                        st.instance_change_pending = Some(p);
+                        continue;
+                    }
+                }
+            }
+            let queued = matches!(phase, Phase::AwaitingApproval(_) | Phase::StaleCheck);
+            let waiting = parked && matches!(phase, Phase::AwaitingApproval(_));
+            match &change {
+                InstanceChange::TokenReplaced | InstanceChange::TokenStored if waiting => {
+                    let _ = self.start_refresh(&entry).await;
+                }
+                InstanceChange::TokenReplaced if queued => {
+                    let _ = self
+                        .refresh_write(
+                            &entry,
+                            RefreshCause::Instance(InstanceEvt::CredentialChanged),
+                        )
+                        .await;
+                }
+                InstanceChange::OriginChanged { old, new } if queued => {
+                    let lead = Returned::InstanceUrl {
+                        old: old.clone(),
+                        new: new.clone(),
+                    };
+                    let _ = self
+                        .refresh_write_returned(
+                            &entry,
+                            RefreshCause::Instance(InstanceEvt::InstanceChanged),
+                            Some(lead),
+                        )
+                        .await;
+                }
+                InstanceChange::TokenStored
+                    if matches!(phase, Phase::AwaitingApproval(_)) && !identity_return =>
+                {
+                    let credential = stored_identity(self, &entry).await.is_some();
+                    let _gate = entry.gate.clone().lock_owned().await;
+                    {
+                        let mut st = entry.state();
+                        let parked_now = st.write.as_ref().is_some_and(|w| w.awaiting_refresh);
+                        if matches!(st.model.phase(), Phase::AwaitingApproval(_)) && !parked_now {
+                            let ok = approvable(&st, pat_now(self, instance_id, credential));
+                            st.model.set_approvable(ok);
+                        }
+                    }
+                    self.after_change(&entry);
+                    queue_changed(self, &entry);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// M-5: the change that met the write in `Enriching`, taken inside the critical section that
+/// applies the verdict of the enrichment (which then leaves the write not approvable).
+fn take_pending(st: &mut EntryState) -> Option<PendingChange> {
+    st.instance_change_pending.take()
+}
+
+/// M-5: after the verdict (or the return of a refresh) was applied with the write held not
+/// approvable, the change it missed: `WRITE_STALE {credential_changed | instance_changed}`, the
+/// `Instance` step and, for a credential change, the refresh under the new PAT.
+async fn follow_pending(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    pending: Option<PendingChange>,
+) {
+    let Some(p) = pending else { return };
+    let phase = entry.state().model.phase();
+    if !matches!(phase, Phase::AwaitingApproval(_)) {
+        return;
+    }
+    let _ = match p {
+        PendingChange::Credential => {
+            engine
+                .refresh_write(
+                    entry,
+                    RefreshCause::Instance(InstanceEvt::CredentialChanged),
+                )
+                .await
+        }
+        PendingChange::Origin { old, new } => {
+            engine
+                .refresh_write_returned(
+                    entry,
+                    RefreshCause::Instance(InstanceEvt::InstanceChanged),
+                    Some(Returned::InstanceUrl { old, new }),
+                )
+                .await
+        }
+    };
 }
 
 /// Runs `f` in its own task; if that task panics, the request is ended or returned fail-closed
@@ -659,6 +848,8 @@ async fn stale_return(
     let (spec, alias) = (entry.spec, entry.head.instance.clone());
     let (eng, id) = (engine.clone(), entry.instance_id.clone());
     let recompute = returned == Returned::RecheckFailed && !refresh;
+    let pending = Arc::new(std::sync::Mutex::new(None));
+    let pending_out = pending.clone();
     let applied = engine
         .transition_guarded(
             entry,
@@ -668,12 +859,26 @@ async fn stale_return(
             move |st| {
                 st.stale = true;
                 if let Some(w) = st.write.as_mut() {
+                    w.awaiting_refresh = matches!(
+                        returned,
+                        Returned::Instance(InstanceEvt::InstanceChanged)
+                            | Returned::InstanceUrl { .. }
+                    );
                     w.returned = Some(returned);
                     w.approved_hash = None;
                 }
                 let refreshing = refresh && step(&mut st.model, Event::EnrichStarted).is_ok();
-                let ok = !refreshing && recompute && approvable(st, pat_now(&eng, &id, credential));
+                // M-5: a change that met the enrichment this return ends is followed now; one
+                // that meets the refresh just started waits for its verdict.
+                let missed = if refreshing { None } else { take_pending(st) };
+                let ok = !refreshing
+                    && missed.is_none()
+                    && recompute
+                    && approvable(st, pat_now(&eng, &id, credential));
                 st.model.set_approvable(ok);
+                *pending_out
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = missed;
                 if !refreshing {
                     refresh_caution(st, spec, &alias);
                 }
@@ -692,6 +897,14 @@ async fn stale_return(
         let refreshing = entry.state().model.phase() == Phase::Enriching;
         if refresh && refreshing {
             spawn_guarded(engine, entry, None, enrich_task);
+        }
+        let missed = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if missed.is_some() {
+            // A task of its own: `follow_pending` can return the write again (recursion).
+            tokio::spawn(follow_task(engine.clone(), entry.clone(), missed));
         }
     }
     applied
@@ -1003,13 +1216,43 @@ fn get_record(
     outcome: &FetchOutcome,
 ) -> NewEvent {
     let path = call_path(base, call);
+    let (record, class) = fetch_view(outcome);
+    let mut ev = payloads::preview_fetch(ctx, purpose, "GET", &path, &record);
+    if let (Some(c), Some(o)) = (class, ev.payload.as_object_mut()) {
+        o.insert("class".into(), c.into());
+    }
+    ev
+}
+
+/// `SYSTEM_FETCH {phase: result}` of one GET of a connection test (Task 25): the same record
+/// body as `get_record`, with every byte received.
+pub(crate) fn system_get_record(
+    purpose: payloads::SystemFetchPurpose,
+    instance_id: &str,
+    fetch_id: &str,
+    base: &NormalizedBaseUrl,
+    call: &GetCall,
+    outcome: &FetchOutcome,
+) -> NewEvent {
+    let path = call_path(base, call);
+    let (record, class) = fetch_view(outcome);
+    let mut ev =
+        payloads::system_fetch_result(purpose, instance_id, fetch_id, "GET", &path, &record);
+    if let (Some(c), Some(o)) = (class, ev.payload.as_object_mut()) {
+        o.insert("class".into(), c.into());
+    }
+    ev
+}
+
+/// What a GET's outcome records, and the `class` of one that was refused or never left.
+fn fetch_view(outcome: &FetchOutcome) -> (FetchRecord<'_>, Option<&'static str>) {
     let nothing = FetchRecord::Outcome {
         outcome: OutcomeKind::Network,
         status: None,
         content_type: None,
         received: &[],
     };
-    let (record, class): (FetchRecord<'_>, Option<&str>) = match outcome {
+    match outcome {
         FetchOutcome::Response(r) => (FetchRecord::Response(r), None),
         FetchOutcome::Failed(f) => match f {
             FetchFailure::StatusHeaderDecided { reason, response } => (
@@ -1064,12 +1307,7 @@ fn get_record(
             FetchFailure::NeedsToken => (nothing, Some("needs_token")),
             FetchFailure::MethodGuardRefused => (nothing, Some("method_guard")),
         },
-    };
-    let mut ev = payloads::preview_fetch(ctx, purpose, "GET", &path, &record);
-    if let (Some(c), Some(o)) = (class, ev.payload.as_object_mut()) {
-        o.insert("class".into(), c.into());
     }
-    ev
 }
 
 /// One enrichment (initial, after an edit, or a refresh): every GET of the plan, recorded, then
@@ -1289,6 +1527,8 @@ async fn enriched(
     let (eng, id) = (engine.clone(), entry.instance_id.clone());
     let (spec, alias) = (entry.spec, entry.head.instance.clone());
     let refresh = entry.state().model.refreshing();
+    let pending = Arc::new(std::sync::Mutex::new(None));
+    let pending_out = pending.clone();
     let apply = move |st: &mut EntryState| {
         st.candidate_hash = hash;
         if let Some(w) = st.write.as_mut() {
@@ -1296,9 +1536,13 @@ async fn enriched(
             w.failure = failure;
             w.requests = requests;
         }
-        let ok = approvable(st, pat_now(&eng, &id, credential));
+        let missed = take_pending(st);
+        let ok = missed.is_none() && approvable(st, pat_now(&eng, &id, credential));
         st.model.set_approvable(ok);
         refresh_caution(st, spec, &alias);
+        *pending_out
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = missed;
     };
     let applied = match record {
         Some(rec) => engine
@@ -1323,7 +1567,22 @@ async fn enriched(
         if !refresh {
             attention(engine, AttentionKind::New);
         }
+        let missed = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        follow_pending(engine, entry, missed).await;
     }
+}
+
+/// `follow_pending` as a boxed `Send` future: it returns the write, which can end in another
+/// return, and the boxed type breaks that cycle for the compiler (like `enrich_task`).
+fn follow_task(
+    engine: Arc<Engine>,
+    entry: Arc<RequestEntry>,
+    pending: Option<PendingChange>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move { follow_pending(&engine, &entry, pending).await })
 }
 
 // ---- 4. stale check -------------------------------------------------------------------------------
