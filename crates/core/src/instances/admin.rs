@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use atlas_duck_atlassian::{
     BaseUrlError, CredentialError, NormalizedBaseUrl, PatSecret, StoredCredential, StoredIdentity,
-    url_hash,
+    url_hash, username_matches,
 };
 use atlas_duck_audit::{AuditError, Confirmed, SettingChange, Settings};
 use atlas_duck_registry::Product;
@@ -28,6 +28,7 @@ use crate::config::{ConfigState, ConfigWriteError, load_config};
 use crate::core::Confirm;
 use crate::engine::Engine;
 use crate::engine::write::InstanceChange;
+use crate::identity::{self, RecheckResult};
 use crate::ids::InstanceId;
 use crate::payloads::{self, CredentialChange};
 use crate::proxy::ProxySetting;
@@ -234,6 +235,7 @@ impl CoreInstances {
             pac_configured: resolved.uses_os && resolved.pac_configured,
             proxy_effective: Some(resolved.effective),
             pending_url_change: i.pending_url_change.clone(),
+            note: i.note.clone(),
         }
     }
 
@@ -378,6 +380,7 @@ impl CoreInstances {
     ) {
         self.engine.update_instance(id, |rt| {
             rt.state = InstanceState::Ok;
+            rt.note = None;
             rt.identity = Some(identity);
             rt.expires_at = expires_at;
             if version.is_some() {
@@ -676,12 +679,20 @@ impl InstanceAdmin for CoreInstances {
             connection_test::run(&self.engine, &Self::target(&rt, id.clone(), origin), &pat)
                 .await?;
         if tested.user_key != stored.identity.atlassian_user_key {
-            // The token resolves to someone else now: Task 26's identity handling.
-            return Err(AdminError::ConnectionFailed(
-                ConnectionFailure::IdentityHeaderMismatch,
-            ));
+            // The token resolves to someone else now (§7.1): a confirmed token failure.
+            let result = RecheckResult::TokenFailure {
+                other_user: Some(tested.user.clone()),
+            };
+            identity::on_result(&self.engine, &id, &result).await;
+            return Err(AdminError::ConnectionFailed(ConnectionFailure::OtherUser));
         }
+        // Same key, another name: a rename (§7.1 *Username rename*), no `CREDENTIAL_CHANGED`.
+        let renamed = !username_matches(&tested.user, &stored.identity.atlassian_user);
+        let old = stored.identity.atlassian_user.clone();
         self.pat_stored(&id, stored.identity, stored.expires_at, tested.version);
+        if renamed {
+            identity::apply_rename(&self.engine, &id, &old, &tested.user, &tested.user_key).await;
+        }
         self.engine
             .instance_changed(&id, InstanceChange::TokenStored)
             .await;

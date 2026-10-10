@@ -581,6 +581,8 @@ pub struct Engine {
     terminal_rows: Arc<Mutex<Recent<handler::ListRow>>>,
     /// Built on first use per instance id (Task 25 rebuilds them on configuration changes).
     clients: Mutex<HashMap<String, Arc<InstanceHttp>>>,
+    /// One token re-check in flight per instance (Task 26).
+    identity: crate::identity::Gates,
     runtime: tokio::runtime::Handle,
     similarity: SimilarityIndex,
     expiry: Duration,
@@ -621,6 +623,7 @@ impl Engine {
             terminal_status: Mutex::new(Recent::new(RECENT_MEMO)),
             terminal_rows: Arc::new(Mutex::new(Recent::new(RECENT_MEMO))),
             clients: Mutex::new(HashMap::new()),
+            identity: crate::identity::Gates::default(),
             runtime: d.runtime,
             similarity: d.similarity,
             expiry,
@@ -736,6 +739,16 @@ impl Engine {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
             .update(instance_id, f);
+    }
+
+    pub(crate) fn identity_gates(&self) -> &crate::identity::Gates {
+        &self.identity
+    }
+
+    /// The instance's identity epoch (Task 26): read before a call, passed to
+    /// `identity::recheck` after it failed the identity check.
+    pub(crate) fn identity_epoch(&self, instance_id: &str) -> u64 {
+        self.identity.epoch(instance_id)
     }
 
     /// Drops the cached client of `instance_id` (its origin, CA or proxy changed): the next use

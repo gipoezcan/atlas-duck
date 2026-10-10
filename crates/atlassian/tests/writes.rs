@@ -73,10 +73,12 @@ fn wire_url(req: &wiremock::Request) -> String {
     format!("http://{host}{}{query}", req.url.path())
 }
 
-fn unknown(reason: UnknownReason) -> WriteOutcome {
+/// An outcome of an answered request: the head's status is part of it (Δ C.4, Task 26).
+fn unknown_status(reason: UnknownReason, status: impl Into<Option<u16>>) -> WriteOutcome {
     WriteOutcome::OutcomeUnknown {
         reason,
         request_index: 0,
+        status: status.into(),
     }
 }
 
@@ -435,7 +437,7 @@ async fn i25_html_body_on_empty_op_outcome_unknown() -> TestResult {
         t.client
             .send_approved(&test_cover()?, &empty_op(s, 201))
             .await,
-        unknown(UnknownReason::UndeclaredSuccess)
+        unknown_status(UnknownReason::UndeclaredSuccess, 201)
     );
     Ok(())
 }
@@ -463,7 +465,7 @@ async fn i25_empty_200_on_json_op_outcome_unknown() -> TestResult {
         );
         assert_eq!(
             t.client.send_approved(&cover, &json_op(s)).await,
-            unknown(UnknownReason::UndeclaredSuccess),
+            unknown_status(UnknownReason::UndeclaredSuccess, 200),
             "{p}"
         );
     }
@@ -476,7 +478,7 @@ async fn i25_empty_200_on_json_op_outcome_unknown() -> TestResult {
     );
     assert_eq!(
         t.client.send_approved(&cover, &empty_op(s, 204)).await,
-        unknown(UnknownReason::UndeclaredSuccess)
+        unknown_status(UnknownReason::UndeclaredSuccess, 200)
     );
     Ok(())
 }
@@ -686,14 +688,14 @@ async fn outcome_bodies_stay_in_the_control() -> TestResult {
     // Undeclared 2xx: an HTML 201 on an `Empty` op.
     let answer = jdoe(201).set_body_raw(HTML, "text/html");
     let (out, kept) = write_answered(Product::Jira, answer, empty_201).await?;
-    assert_eq!(out, unknown(UnknownReason::UndeclaredSuccess));
+    assert_eq!(out, unknown_status(UnknownReason::UndeclaredSuccess, 201));
     assert_eq!(kept, HTML);
 
     // 5xx.
     let answer =
         ResponseTemplate::new(503).set_body_raw(r#"{"message":"down"}"#, "application/json");
     let (out, kept) = write_answered(Product::Confluence, answer, json_op).await?;
-    assert_eq!(out, unknown(UnknownReason::ServerError5xx));
+    assert_eq!(out, unknown_status(UnknownReason::ServerError5xx, 503));
     assert_eq!(kept, br#"{"message":"down"}"#);
 
     // A Jira 201 attributed to another user: the created issue is named only here.
@@ -703,9 +705,12 @@ async fn outcome_bodies_stay_in_the_control() -> TestResult {
     let (out, kept) = write_answered(Product::Jira, answer, json_op).await?;
     assert_eq!(
         out,
-        unknown(UnknownReason::IdentityMismatch {
-            server_user: Some("bob".into())
-        })
+        unknown_status(
+            UnknownReason::IdentityMismatch {
+                server_user: Some("bob".into())
+            },
+            201
+        )
     );
     assert_eq!(kept, JIRA_ISSUE_CREATED.as_bytes());
 
@@ -779,7 +784,7 @@ async fn write_cancelled_during_the_response_body_is_unknown() -> TestResult {
     }
     assert!(arrived, "the partial body never arrived");
     ctl.cancel();
-    assert_eq!(task.await?, unknown(UnknownReason::Cancelled));
+    assert_eq!(task.await?, unknown_status(UnknownReason::Cancelled, 200));
     let snap = ctl.take_captured();
     assert!(snap.sent);
     assert_eq!(snap.partial, PARTIAL);
@@ -860,7 +865,7 @@ async fn write_5xx_outcome_unknown() -> TestResult {
         t.client
             .send_approved(&cover, &json_op(page_update(&dc)?))
             .await,
-        unknown(UnknownReason::ServerError5xx)
+        unknown_status(UnknownReason::ServerError5xx, 503)
     );
     let s = spec(
         "PUT",
@@ -870,7 +875,7 @@ async fn write_5xx_outcome_unknown() -> TestResult {
     );
     assert_eq!(
         t.client.send_approved(&cover, &json_op(s)).await,
-        unknown(UnknownReason::ServerError5xx)
+        unknown_status(UnknownReason::ServerError5xx, 500)
     );
     Ok(())
 }
@@ -892,7 +897,7 @@ async fn write_timeout_after_send_outcome_unknown() -> TestResult {
                 &ctl
             )
             .await,
-        unknown(UnknownReason::Timeout)
+        unknown_status(UnknownReason::Timeout, None)
     );
     assert!(ctl.take_captured().sent);
     let heads = silent.request_heads();
@@ -942,7 +947,7 @@ async fn write_timeout_after_send_outcome_unknown() -> TestResult {
                 &json_op(spec("PUT", &url, Some("application/json"), b"{}"))
             )
             .await,
-        unknown(UnknownReason::Timeout)
+        unknown_status(UnknownReason::Timeout, 200)
     );
     Ok(())
 }
@@ -976,10 +981,13 @@ async fn write_identity_anonymous_outcome_unknown() -> TestResult {
         Ok(c.client.send_approved(&test_cover()?, &w).await)
     }
     let s = spec("POST", "", Some("application/json"), b"{}");
-    let mismatch = |u: Option<&str>| {
-        unknown(UnknownReason::IdentityMismatch {
-            server_user: u.map(str::to_owned),
-        })
+    let mismatch = |u: Option<&str>, status: u16| {
+        unknown_status(
+            UnknownReason::IdentityMismatch {
+                server_user: u.map(str::to_owned),
+            },
+            status,
+        )
     };
 
     assert_eq!(
@@ -990,7 +998,7 @@ async fn write_identity_anonymous_outcome_unknown() -> TestResult {
             json_op(s.clone())
         )
         .await?,
-        mismatch(Some("anonymous"))
+        mismatch(Some("anonymous"), 201)
     );
     assert_eq!(
         jira_write(
@@ -1000,12 +1008,12 @@ async fn write_identity_anonymous_outcome_unknown() -> TestResult {
             json_op(s.clone())
         )
         .await?,
-        mismatch(Some("bob"))
+        mismatch(Some("bob"), 201)
     );
     // A declared-empty success is checked too, whatever its content type.
     assert_eq!(
         jira_write(XAuser::Missing, 204, None, empty_op(s.clone(), 204)).await?,
-        mismatch(None)
+        mismatch(None, 204)
     );
     // An error answer not attributed to the PAT's user is audit-only, never a plain failure.
     assert_eq!(
@@ -1016,7 +1024,7 @@ async fn write_identity_anonymous_outcome_unknown() -> TestResult {
             json_op(s.clone())
         )
         .await?,
-        mismatch(None)
+        mismatch(None, 400)
     );
     // The control: the PAT's user (the comparison folds case); the raw header is reported.
     assert!(matches!(

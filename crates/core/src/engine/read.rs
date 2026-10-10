@@ -36,9 +36,11 @@ use serde_json::{Map, Value, json};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::cache::{Candidate, RebuildError, build_candidate, fetched_responses};
-use super::envelope::OpenStatus;
+use super::envelope::{MSG_IDENTITY_HEADER, OpenStatus};
 use super::{Engine, InstanceHttp, OnAuditFailure, RequestEntry};
 use crate::gate::{AttentionKind, UiEvent};
+use crate::identity::{self, Lost};
+use crate::instances::InstanceState;
 use crate::lifecycle::model::{Event, ReleaseItem};
 use crate::ops::generic::{count_value, fallback_preview, invisible_warnings, query_display};
 use crate::ops::{
@@ -159,11 +161,157 @@ async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
     {
         return;
     }
-    let classified = match fetch(&engine, &entry).await {
-        Ok((fetched, http)) => classify_read(fetched, &http.proxy),
-        Err(message) => Classified::Direct(Direct::internal(message, Vec::new())),
-    };
+    // PD-03 for an admitted request: an instance that went bad while this one waited for its
+    // slot is not called (Task 26).
+    let state = engine
+        .instances()
+        .by_id(&entry.instance_id)
+        .map(|i| i.state);
+    if let Some(d) = state.and_then(state_refusal) {
+        settle(&engine, &entry, Classified::Direct(d)).await;
+        return;
+    }
+    let classified = fetch_classified(&engine, &entry).await;
     settle(&engine, &entry, classified).await;
+}
+
+/// A direct failure for an instance that is `needs_token` or in an identity-header state (§7.2
+/// *Header lost*): nothing is sent.
+pub(crate) fn state_refusal(state: InstanceState) -> Option<Direct> {
+    match state {
+        InstanceState::NeedsToken => Some(Direct::needs_token(Vec::new())),
+        InstanceState::IdentityHeaderMissing => {
+            Some(Direct::header_lost(Lost::Missing, Vec::new()))
+        }
+        InstanceState::IdentityHeaderMismatch => {
+            Some(Direct::header_lost(Lost::Mismatch, Vec::new()))
+        }
+        InstanceState::Ok | InstanceState::InsecureScheme | InstanceState::InstanceUnconfirmed => {
+            None
+        }
+    }
+}
+
+/// The fetch and its classification, with the identity handling of Task 26 in between: a failed
+/// identity check or a JSON 401 runs the token re-check (§7.1) and the table of
+/// [`identity::effect`] decides what the read becomes. A rename re-fetches once under the same
+/// request id; the first answer is recorded audit-only before the second fetch.
+async fn fetch_classified(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) -> Classified {
+    let mut refetched = false;
+    loop {
+        let seen = engine.identity_epoch(&entry.instance_id);
+        let (fetched, http) = match fetch(engine, entry).await {
+            Ok(f) => f,
+            Err(message) => return Classified::Direct(Direct::internal(message, Vec::new())),
+        };
+        let Some(trigger) = fetched_trigger(&fetched) else {
+            return classify_read(fetched, &http.proxy);
+        };
+        // The re-fetch failed the check again: `upstream_unavailable`, retryable (§7.1).
+        let effect = if refetched {
+            identity::Effect::HeaderCheckFailed
+        } else {
+            let result = identity::recheck(engine, &entry.instance_id, seen).await;
+            identity::effect(identity::Path::DirectRead, trigger, &result)
+        };
+        match effect {
+            identity::Effect::Ordinary => {
+                return classify_read(ordinary(fetched), &http.proxy);
+            }
+            identity::Effect::Refetch => {
+                let (earlier, answer) = split_answer(fetched);
+                let mut responses = earlier;
+                responses.extend(answer);
+                let first = payloads::read_fetched(
+                    &entry.ctx,
+                    &ReadFetched::Unavailable {
+                        responses: &responses,
+                        reason: "identity_check",
+                    },
+                    None,
+                );
+                if !engine.append_pending(entry, vec![first], None).await {
+                    return Classified::Cancelled;
+                }
+                refetched = true;
+            }
+            other => return identity_classified(other, fetched),
+        }
+    }
+}
+
+/// The trigger of a read's fetch, if its answer failed the identity check or is a JSON 401.
+fn fetched_trigger(f: &Fetched) -> Option<identity::Trigger> {
+    match f {
+        Fetched::Single(o) => identity::trigger(o),
+        Fetched::Paged { outcome, .. } => match &outcome.failure {
+            Some(failure) => identity::failure_trigger(failure),
+            None if outcome.end == PageEnd::Failed
+                && outcome.pages.last().is_some_and(|r| r.status == 401) =>
+            {
+                Some(identity::Trigger::Json401)
+            }
+            None => None,
+        },
+    }
+}
+
+/// The fetch as the ordinary answer it is once the re-check passed on a JSON 401.
+fn ordinary(f: Fetched) -> Fetched {
+    match f {
+        Fetched::Single(o) => Fetched::Single(identity::as_response(o)),
+        Fetched::Paged { mut outcome, start } => {
+            if let Some(FetchFailure::IdentityCheckFailed { response, .. }) = outcome.failure.take()
+            {
+                outcome.pages.push(response);
+                outcome.end = PageEnd::Failed;
+            }
+            Fetched::Paged { outcome, start }
+        }
+    }
+}
+
+/// The complete responses before the triggering answer, and that answer.
+fn split_answer(f: Fetched) -> (Vec<UpstreamResponse>, Option<UpstreamResponse>) {
+    match f {
+        Fetched::Single(FetchOutcome::Failed(FetchFailure::IdentityCheckFailed {
+            response,
+            ..
+        })) => (Vec::new(), Some(response)),
+        Fetched::Single(FetchOutcome::Response(r)) => (Vec::new(), Some(r)),
+        Fetched::Single(FetchOutcome::Failed(_)) => (Vec::new(), None),
+        Fetched::Paged { mut outcome, .. } => match outcome.failure.take() {
+            Some(FetchFailure::IdentityCheckFailed { response, .. }) => {
+                (outcome.pages, Some(response))
+            }
+            _ => {
+                let last = outcome.pages.pop();
+                (outcome.pages, last)
+            }
+        },
+    }
+}
+
+/// What the identity table makes of a read that is not re-fetched (§7.1): `needs_token`, the
+/// identity-header states, or `upstream_unavailable` (retryable) for a passing or inconclusive
+/// re-check. The answer is audit-only (RF-2a); after a first page the failure is an outcome item
+/// like every direct class (review I-1).
+fn identity_classified(effect: identity::Effect, fetched: Fetched) -> Classified {
+    let (mut responses, answer) = split_answer(fetched);
+    let later_page = !responses.is_empty();
+    responses.extend(answer);
+    let d = match effect {
+        identity::Effect::NeedsToken => Direct::needs_token(responses),
+        identity::Effect::HeaderLost(l) => Direct::header_lost(l, responses),
+        _ => Direct {
+            code: ErrorCode::UpstreamUnavailable,
+            message: MSG_IDENTITY.to_owned(),
+            cause: Some(("reason", "identity_check")),
+            reason_detail: None,
+            responses,
+        },
+    };
+    gate_later(d, later_page)
 }
 
 /// A fetch slot (§5.2), or `None` once the request is terminal (cancel, expiry) meanwhile.
@@ -294,6 +442,29 @@ pub(crate) struct Direct {
 }
 
 impl Direct {
+    /// §7.1: a confirmed token failure (exit 9); the answer behind it is audit-only.
+    fn needs_token(responses: Vec<UpstreamResponse>) -> Direct {
+        Direct {
+            code: ErrorCode::NeedsToken,
+            message: MSG_NEEDS_TOKEN.to_owned(),
+            cause: None,
+            reason_detail: None,
+            responses,
+        }
+    }
+
+    /// §7.2 *Header lost*: `upstream_unavailable` with the reason and the admin hint
+    /// (`retryable: false` follows from the reason, envelope).
+    fn header_lost(lost: Lost, responses: Vec<UpstreamResponse>) -> Direct {
+        Direct {
+            code: ErrorCode::UpstreamUnavailable,
+            message: MSG_IDENTITY_HEADER.to_owned(),
+            cause: Some(("reason", lost.reason())),
+            reason_detail: Some(lost.reason()),
+            responses,
+        }
+    }
+
     fn internal(message: &str, responses: Vec<UpstreamResponse>) -> Direct {
         Direct {
             code: ErrorCode::Internal,
@@ -377,7 +548,7 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
             let item = if status_2xx(&r) {
                 ReleaseItem::Result
             } else {
-                // Any non-2xx answer (incl. the final 429; a JSON 401 until Task 26's recheck).
+                // Any non-2xx answer (incl. the final 429; a JSON 401 after a passing re-check).
                 ReleaseItem::UpstreamError
             };
             Classified::Item(ItemRecord {
@@ -447,10 +618,17 @@ fn classify_failure(
 ) -> Classified {
     let later_page = !responses.is_empty();
     match classify_one(f, responses, proxy) {
-        Classified::Direct(d) if later_page && d.code != ErrorCode::Internal => {
-            Classified::Item(gated(d))
-        }
+        Classified::Direct(d) => gate_later(d, later_page),
         c => c,
+    }
+}
+
+/// A direct failure on a later page becomes an outcome item (`internal` stays direct).
+fn gate_later(d: Direct, later_page: bool) -> Classified {
+    if later_page && d.code != ErrorCode::Internal {
+        Classified::Item(gated(d))
+    } else {
+        Classified::Direct(d)
     }
 }
 
@@ -567,7 +745,8 @@ fn classify_one(
             reason_detail: None,
             responses,
         }),
-        // Task 26 runs `token_recheck` here; until then `upstream_unavailable`, body audit-only.
+        // Reached for a failed check the re-check did not turn into anything else (Task 26,
+        // `fetch_classified`): `upstream_unavailable`, body audit-only.
         FetchFailure::IdentityCheckFailed { response, .. } => {
             responses.push(response);
             Classified::Direct(Direct {

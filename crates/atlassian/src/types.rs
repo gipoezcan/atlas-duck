@@ -367,6 +367,9 @@ pub enum WriteOutcome {
     OutcomeUnknown {
         reason: UnknownReason,
         request_index: u32,
+        /// The HTTP status of the answer when its head was received (Δ C.4, Task 26: the
+        /// `WRITE_OUTCOME_UNKNOWN.status` field); `None` when nothing answered.
+        status: Option<u16>,
     },
     NeedsToken,
     OriginGuardRefused,
@@ -412,10 +415,12 @@ impl fmt::Debug for WriteOutcome {
             WriteOutcome::OutcomeUnknown {
                 reason,
                 request_index,
+                status,
             } => f
                 .debug_struct("OutcomeUnknown")
                 .field("reason", reason)
                 .field("request_index", request_index)
+                .field("status", status)
                 .finish(),
             WriteOutcome::NeedsToken => f.write_str("NeedsToken"),
             WriteOutcome::OriginGuardRefused => f.write_str("OriginGuardRefused"),

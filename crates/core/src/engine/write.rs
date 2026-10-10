@@ -44,6 +44,7 @@ use atlas_duck_preview::{Level, OutcomeKind as CardKind};
 use atlas_duck_registry::{OperationSpec, Product, StatusSet, SuccessBody};
 use serde_json::{Map, Value, json};
 
+use super::envelope::MSG_IDENTITY_HEADER;
 use super::read::{
     MSG_IDENTITY, MSG_NEEDS_TOKEN, class_name, connection_message, error_text, unavailable_message,
     unavailable_name,
@@ -53,6 +54,7 @@ use super::{
 };
 use crate::edit::EditedKeys;
 use crate::gate::{AttentionKind, UiEvent};
+use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
 use crate::lifecycle::model::{
     Applied, Event, ExecOutcome, Hold, InstanceEvt, Model, Phase, Rejection, StaleReason,
@@ -87,8 +89,6 @@ const MSG_WRITE_INTERNAL: &str = "the write could not be sent";
 /// Plan wording: a direct enrichment failure that is a bug, not data.
 const MSG_PREPARE_INTERNAL: &str = "the write could not be prepared";
 const MSG_PREPARE_ABORTED: &str = "the write's preparation was aborted";
-/// A JSON 401 during enrichment (Task 26 replaces it with the `token_recheck` result).
-const MSG_JSON_401: &str = "the server answered 401";
 /// Shown when the executor cannot build the request from a `Preview` verdict (fail closed).
 const TEXT_UNRENDERABLE: &str = "the request could not be built from the server's answers";
 
@@ -141,6 +141,11 @@ pub enum Returned {
     Instance(InstanceEvt),
     /// `instance_changed` with the old and new origin (§7.1 "instance URL changed: <old> → <new>").
     InstanceUrl {
+        old: String,
+        new: String,
+    },
+    /// `user_renamed` (§7.1 *Username rename*): "Atlassian username changed: <old> → <new>".
+    UserRenamed {
         old: String,
         new: String,
     },
@@ -304,10 +309,30 @@ fn returned_warning(r: &Returned, executes_as: Option<&str>) -> Option<Warning> 
             WarningId::InstanceUrlChanged,
             warning::instance_url_changed(old, new),
         ),
+        Returned::UserRenamed { old, new } => {
+            Warning::new(WarningId::UserRenamed, warning::user_renamed(old, new))
+        }
         Returned::VersionConflict
         | Returned::Instance(InstanceEvt::InstanceChanged | InstanceEvt::UserRenamed) => {
             return None;
         }
+    })
+}
+
+/// §7.2 *Header lost*: a pending write of an instance in an identity-header state shows the
+/// admin hint as a Caution (Approve is disabled by the instance state, §5.1 inv. 6), whether or
+/// not the write was ever returned for it.
+pub(crate) fn instance_warning(engine: &Engine, instance_id: &str) -> Option<Warning> {
+    let state = engine.instances().by_id(instance_id).map(|i| i.state)?;
+    matches!(
+        state,
+        InstanceState::IdentityHeaderMissing | InstanceState::IdentityHeaderMismatch
+    )
+    .then(|| {
+        Warning::new(
+            WarningId::IdentityHeaderLost,
+            warning::TEXT_IDENTITY_HEADER_LOST,
+        )
     })
 }
 
@@ -592,6 +617,12 @@ pub(crate) enum InstanceChange {
     /// A PAT was stored (a first one, or the same user's again): writes waiting for it refresh,
     /// the others re-read their approvability against the instance state.
     TokenStored,
+    /// Task 26: a re-check moved the instance to `needs_token` or an identity-header state: its
+    /// queued writes re-read their approvability.
+    StateChanged,
+    /// Task 26: the Atlassian username changed under the same key (§7.1): every queued write is
+    /// refreshed (`WRITE_STALE {user_renamed}`), without a native confirmation.
+    UserRenamed { old: String, new: String },
 }
 
 impl Engine {
@@ -628,7 +659,9 @@ impl Engine {
                         old: old.clone(),
                         new: new.clone(),
                     }),
-                    InstanceChange::TokenStored => None,
+                    InstanceChange::TokenStored
+                    | InstanceChange::StateChanged
+                    | InstanceChange::UserRenamed { .. } => None,
                 };
                 if let Some(p) = pending {
                     let mut st = entry.state();
@@ -643,6 +676,34 @@ impl Engine {
             match &change {
                 InstanceChange::TokenReplaced | InstanceChange::TokenStored if waiting => {
                     let _ = self.start_refresh(&entry).await;
+                }
+                // Task 26: the identity is restored: a write held in `IdentityMismatch` is
+                // refreshed like a credential change (the hold stays until the refresh's
+                // `Enriched`).
+                InstanceChange::TokenStored
+                    if phase == Phase::AwaitingApproval(Hold::IdentityMismatch) =>
+                {
+                    let _ = self
+                        .refresh_write(
+                            &entry,
+                            RefreshCause::Instance(InstanceEvt::CredentialChanged),
+                        )
+                        .await;
+                }
+                InstanceChange::UserRenamed { old, new }
+                    if matches!(phase, Phase::AwaitingApproval(_)) && !parked =>
+                {
+                    let lead = Returned::UserRenamed {
+                        old: old.clone(),
+                        new: new.clone(),
+                    };
+                    let _ = self
+                        .refresh_write_returned(
+                            &entry,
+                            RefreshCause::Instance(InstanceEvt::UserRenamed),
+                            Some(lead),
+                        )
+                        .await;
                 }
                 InstanceChange::TokenReplaced if queued => {
                     let _ = self
@@ -665,7 +726,7 @@ impl Engine {
                         )
                         .await;
                 }
-                InstanceChange::TokenStored
+                InstanceChange::TokenStored | InstanceChange::StateChanged
                     if matches!(phase, Phase::AwaitingApproval(_)) && !identity_return =>
                 {
                     let credential = stored_identity(self, &entry).await.is_some();
@@ -1009,6 +1070,133 @@ impl Direct {
     }
 }
 
+/// `upstream_unavailable` for an answer that failed the identity check without the re-check
+/// finding the token or the header at fault (§7.1).
+fn identity_unavailable() -> Direct {
+    Direct {
+        code: ErrorCode::UpstreamUnavailable,
+        message: MSG_IDENTITY.to_owned(),
+        cause: Some(("reason", "identity_check")),
+        reason_detail: None,
+    }
+}
+
+/// §7.2 *Header lost*: the reason and the admin hint, data-free.
+fn header_lost_direct(lost: Lost) -> Direct {
+    Direct {
+        code: ErrorCode::UpstreamUnavailable,
+        message: MSG_IDENTITY_HEADER.to_owned(),
+        cause: Some(("reason", lost.reason())),
+        reason_detail: Some(lost.reason()),
+    }
+}
+
+fn needs_token_direct() -> Direct {
+    Direct {
+        code: ErrorCode::NeedsToken,
+        message: MSG_NEEDS_TOKEN.to_owned(),
+        cause: None,
+        reason_detail: None,
+    }
+}
+
+/// How a GET's identity failure is mapped: an initial enrichment (or an edit's) fails with an
+/// [`Effect`]; a refresh or a stale check returns the write with a [`Recheck`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GetMode {
+    Enrich,
+    Recheck,
+}
+
+/// What an identity-gated GET came to (Task 26).
+enum Gated {
+    /// Classify the answer as before (a passing re-check turned a JSON 401 into a plain one).
+    Proceed(FetchOutcome),
+    /// A rename: run the GET once more.
+    Rerun,
+    /// An initial enrichment's failure.
+    Held(Effect),
+    /// A refresh's or stale check's return.
+    Stale(Recheck),
+}
+
+/// The identity handling of one GET (§7.1): a failed `X-AUSERNAME` check or a JSON 401 runs the
+/// token re-check, and [`identity::effect`] decides. `allow_rerun` is false for the second run
+/// of a GET (a rename re-runs it once; a second failure falls back).
+async fn gate_get(
+    engine: &Arc<Engine>,
+    instance_id: &str,
+    seen: u64,
+    outcome: FetchOutcome,
+    mode: GetMode,
+    allow_rerun: bool,
+) -> Gated {
+    let Some(trigger) = identity::trigger(&outcome) else {
+        return Gated::Proceed(outcome);
+    };
+    let effect = if allow_rerun {
+        let path = match mode {
+            GetMode::Enrich => identity::Path::Enrichment,
+            GetMode::Recheck => identity::Path::StaleOrRefresh,
+        };
+        let result = identity::recheck(engine, instance_id, seen).await;
+        identity::effect(path, trigger, &result)
+    } else {
+        identity::Effect::HeaderCheckFailed
+    };
+    let enrich = mode == GetMode::Enrich;
+    match effect {
+        identity::Effect::Ordinary => Gated::Proceed(identity::as_response(outcome)),
+        identity::Effect::Refetch => Gated::Rerun,
+        identity::Effect::HeaderCheckFailed if enrich => {
+            Gated::Held(Effect::Direct(identity_unavailable()))
+        }
+        identity::Effect::HeaderCheckFailed => Gated::Stale((StaleReason::IdentityMismatch, None)),
+        identity::Effect::Inconclusive if enrich => {
+            Gated::Held(Effect::Direct(identity_unavailable()))
+        }
+        identity::Effect::Inconclusive => Gated::Stale(recheck_failed("identity_recheck")),
+        identity::Effect::HeaderLost(l) if enrich => {
+            Gated::Held(Effect::Direct(header_lost_direct(l)))
+        }
+        identity::Effect::HeaderLost(l) => {
+            Gated::Stale((StaleReason::IdentityMismatch, Some(l.reason().to_owned())))
+        }
+        identity::Effect::NeedsToken if enrich => Gated::Held(Effect::Direct(needs_token_direct())),
+        identity::Effect::NeedsToken => Gated::Stale((StaleReason::IdentityMismatch, None)),
+    }
+}
+
+/// An instance already `needs_token` or in an identity-header state is not called (PD-03):
+/// the failure an admitted write meets at the start of an enrichment.
+fn state_refusal(
+    engine: &Engine,
+    instance_id: &str,
+    mode: GetMode,
+) -> Option<Result<Effect, Recheck>> {
+    let state = engine.instances().by_id(instance_id).map(|i| i.state)?;
+    let lost = match state {
+        InstanceState::IdentityHeaderMissing => Lost::Missing,
+        InstanceState::IdentityHeaderMismatch => Lost::Mismatch,
+        InstanceState::NeedsToken => {
+            return Some(match mode {
+                GetMode::Enrich => Ok(Effect::Direct(needs_token_direct())),
+                GetMode::Recheck => Err((StaleReason::IdentityMismatch, None)),
+            });
+        }
+        InstanceState::Ok | InstanceState::InsecureScheme | InstanceState::InstanceUnconfirmed => {
+            return None;
+        }
+    };
+    Some(match mode {
+        GetMode::Enrich => Ok(Effect::Direct(header_lost_direct(lost))),
+        GetMode::Recheck => Err((
+            StaleReason::IdentityMismatch,
+            Some(lost.reason().to_owned()),
+        )),
+    })
+}
+
 fn held(status: Option<u16>, text: String, card: Option<CardKind>, hint: FailureHint) -> Effect {
     Effect::Held(Failure {
         card: EnrichFailure {
@@ -1052,14 +1240,7 @@ fn enrich_effect(outcome: FetchOutcome, proxy: &ResolvedProxy) -> Result<Value, 
                     Some(r.status),
                 )
             }),
-        // A JSON 401 (a Confluence one; Jira's arrives as an identity failure): Task 26 runs
-        // `token_recheck`; until then data-free `upstream_unavailable`.
-        FetchOutcome::Response(r) if r.status == 401 => Err(Effect::Direct(Direct {
-            code: ErrorCode::UpstreamUnavailable,
-            message: MSG_JSON_401.to_owned(),
-            cause: Some(("reason", "json_401")),
-            reason_detail: None,
-        })),
+        // A JSON 401 reaches here only after a passing re-check (`gate_get`): an ordinary 4xx.
         FetchOutcome::Response(r) => Err(held(
             Some(r.status),
             error_text(&r.body),
@@ -1113,13 +1294,9 @@ fn enrich_effect(outcome: FetchOutcome, proxy: &ResolvedProxy) -> Result<Value, 
                 cause: None,
                 reason_detail: None,
             }),
-            // Task 26 runs `token_recheck` here; until then `upstream_unavailable`.
-            FetchFailure::IdentityCheckFailed { .. } => Effect::Direct(Direct {
-                code: ErrorCode::UpstreamUnavailable,
-                message: MSG_IDENTITY.to_owned(),
-                cause: Some(("reason", "identity_check")),
-                reason_detail: None,
-            }),
+            // Reached for a failed check the re-check did not turn into anything else (Task 26,
+            // `gate_get`): `upstream_unavailable`, body audit-only.
+            FetchFailure::IdentityCheckFailed { .. } => Effect::Direct(identity_unavailable()),
             // Task 24 records an in-flight cancel and its terminal event; a request still
             // pending here was aborted otherwise and fails closed.
             FetchFailure::CancelledInFlight { .. } | FetchFailure::CancelledBeforeSend => {
@@ -1142,7 +1319,7 @@ fn recheck_failed(class: &str) -> Recheck {
 /// A stale-check or refresh GET (§5.4 step 5): anything but a parsed 2xx JSON answer is
 /// `recheck_failed {class}` (`network`, `http_<status>`, `redirect`, `non_json`, `too_large`,
 /// `origin_mismatch`); a Jira answer that fails the `X-AUSERNAME` check is `identity_mismatch`
-/// (a JSON 401 follows the token rule: `http_401`, Task 26 adds the recheck).
+/// (a JSON 401 that passed the re-check of `gate_get` is `http_401`).
 fn recheck(outcome: FetchOutcome) -> Result<Value, Recheck> {
     match outcome {
         FetchOutcome::Response(r) if status_2xx(&r) => {
@@ -1334,6 +1511,16 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         return;
     };
     let spec = entry.spec;
+    let mode = if refreshing {
+        GetMode::Recheck
+    } else {
+        GetMode::Enrich
+    };
+    // PD-03 for an admitted write: an instance that went bad meanwhile is not called.
+    if let Some(fail) = state_refusal(engine, &entry.instance_id, mode) {
+        enrich_failed(engine, entry, None, fail).await;
+        return;
+    }
     let http = match engine.client(&entry.instance_id).await {
         Ok(h) => h,
         Err(_) => {
@@ -1369,19 +1556,47 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
                 (false, EnrichPurpose::Enrich) => PreviewFetchPurpose::Enrich,
                 (false, EnrichPurpose::Resolve) => PreviewFetchPurpose::Resolve,
             };
-            // A cancel while this GET is in flight records it (`cancelled_in_flight`, Task 24).
-            entry.set_in_flight(Some(InFlight {
-                purpose,
-                path: call_path(http.client.base(), &call),
-            }));
-            let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
-            entry.set_in_flight(None);
-            let record = get_record(&entry.ctx, purpose, http.client.base(), &call, &outcome);
-            park(engine, entry, &record).await;
-            let got = if refreshing {
-                recheck(outcome).map_err(Err)
-            } else {
-                enrich_effect(outcome, &http.proxy).map_err(Ok)
+            let mut attempt = 0u8;
+            let (record, got) = loop {
+                let seen = engine.identity_epoch(&entry.instance_id);
+                // A cancel while this GET is in flight records it (`cancelled_in_flight`,
+                // Task 24).
+                entry.set_in_flight(Some(InFlight {
+                    purpose,
+                    path: call_path(http.client.base(), &call),
+                }));
+                let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
+                entry.set_in_flight(None);
+                let record = get_record(&entry.ctx, purpose, http.client.base(), &call, &outcome);
+                park(engine, entry, &record).await;
+                let gated = gate_get(
+                    engine,
+                    &entry.instance_id,
+                    seen,
+                    outcome,
+                    mode,
+                    attempt == 0,
+                )
+                .await;
+                match gated {
+                    // A rename: the first answer is recorded, the GET runs once more (§7.1).
+                    Gated::Rerun => {
+                        attempt += 1;
+                        if !engine.append_pending(entry, vec![record], None).await {
+                            return;
+                        }
+                    }
+                    Gated::Proceed(outcome) => {
+                        let got = if refreshing {
+                            recheck(outcome).map_err(Err)
+                        } else {
+                            enrich_effect(outcome, &http.proxy).map_err(Ok)
+                        };
+                        break (record, got);
+                    }
+                    Gated::Held(effect) => break (record, Err(Ok(effect))),
+                    Gated::Stale(fail) => break (record, Err(Err(fail))),
+                }
             };
             match got {
                 Ok(v) => bodies.push(v),
@@ -1616,7 +1831,7 @@ pub(crate) fn start_stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>,
 }
 
 /// §7.1 identity call: Jira `GET /rest/api/2/myself`, Confluence `GET /rest/api/user/current`.
-fn identity_call(product: Product) -> GetCall {
+pub(crate) fn identity_call(product: Product) -> GetCall {
     let template = match product {
         Product::Jira => "/rest/api/2/myself",
         Product::Confluence => "/rest/api/user/current",
@@ -1707,6 +1922,13 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
         stale_fail(engine, entry, approval, None, recheck_failed("internal")).await;
         return;
     };
+    // An instance in an identity-header state names that reason (§7.2 *Header lost*).
+    if let Some(Err(fail)) = state_refusal(engine, &entry.instance_id, GetMode::Recheck)
+        && fail.1.is_some()
+    {
+        stale_fail(engine, entry, approval, None, fail).await;
+        return;
+    }
     let Some(identity) = stored_identity(engine, entry).await else {
         stale_fail(engine, entry, approval, None, recheck_failed("needs_token")).await;
         return;
@@ -1720,20 +1942,65 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
     let base = http.client.base();
     let purpose = PreviewFetchPurpose::StaleCheck;
 
-    // (a) The identity call, for every write op (§5.4 step 5).
+    // (a) The identity call, for every write op (§5.4 step 5). A failed check or a JSON 401
+    // runs the token re-check; a rename runs the call once more (§7.1).
     let call = identity_call(spec.product);
-    entry.set_in_flight(Some(InFlight {
-        purpose,
-        path: call_path(base, &call),
-    }));
-    let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
-    entry.set_in_flight(None);
-    let mut last = get_record(&entry.ctx, purpose, base, &call, &outcome);
-    park(engine, entry, &last).await;
-    if let Err(fail) = identity_check(outcome, spec.product, &identity.atlassian_user_key) {
-        stale_fail(engine, entry, approval, Some(last), fail).await;
-        return;
-    }
+    let mut attempt = 0u8;
+    let mut last = loop {
+        let seen = engine.identity_epoch(&entry.instance_id);
+        entry.set_in_flight(Some(InFlight {
+            purpose,
+            path: call_path(base, &call),
+        }));
+        let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
+        entry.set_in_flight(None);
+        let record = get_record(&entry.ctx, purpose, base, &call, &outcome);
+        park(engine, entry, &record).await;
+        let gated = gate_get(
+            engine,
+            &entry.instance_id,
+            seen,
+            outcome,
+            GetMode::Recheck,
+            attempt == 0,
+        )
+        .await;
+        match gated {
+            Gated::Rerun => {
+                attempt += 1;
+                if !engine
+                    .append_pending(entry, vec![record], Some(approval))
+                    .await
+                {
+                    return;
+                }
+            }
+            Gated::Proceed(outcome) => {
+                if let Err(fail) =
+                    identity_check(outcome, spec.product, &identity.atlassian_user_key)
+                {
+                    stale_fail(engine, entry, approval, Some(record), fail).await;
+                    return;
+                }
+                break record;
+            }
+            Gated::Stale(fail) => {
+                stale_fail(engine, entry, approval, Some(record), fail).await;
+                return;
+            }
+            Gated::Held(_) => {
+                stale_fail(
+                    engine,
+                    entry,
+                    approval,
+                    Some(record),
+                    recheck_failed("internal"),
+                )
+                .await;
+                return;
+            }
+        }
+    };
 
     // (b) The op's rule (PD-10).
     if let Some(rule) = op.stale_check {
@@ -1750,19 +2017,61 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
             {
                 return;
             }
-            entry.set_in_flight(Some(InFlight {
-                purpose,
-                path: call_path(base, &call),
-            }));
-            let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
-            entry.set_in_flight(None);
-            last = get_record(&entry.ctx, purpose, base, &call, &outcome);
-            park(engine, entry, &last).await;
-            match recheck(outcome) {
-                Ok(v) => bodies.push(v),
-                Err(fail) => {
-                    stale_fail(engine, entry, approval, Some(last), fail).await;
-                    return;
+            let mut attempt = 0u8;
+            loop {
+                let seen = engine.identity_epoch(&entry.instance_id);
+                entry.set_in_flight(Some(InFlight {
+                    purpose,
+                    path: call_path(base, &call),
+                }));
+                let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
+                entry.set_in_flight(None);
+                last = get_record(&entry.ctx, purpose, base, &call, &outcome);
+                park(engine, entry, &last).await;
+                let gated = gate_get(
+                    engine,
+                    &entry.instance_id,
+                    seen,
+                    outcome,
+                    GetMode::Recheck,
+                    attempt == 0,
+                )
+                .await;
+                match gated {
+                    Gated::Rerun => {
+                        attempt += 1;
+                        if !engine
+                            .append_pending(entry, vec![last], Some(approval))
+                            .await
+                        {
+                            return;
+                        }
+                    }
+                    Gated::Proceed(outcome) => match recheck(outcome) {
+                        Ok(v) => {
+                            bodies.push(v);
+                            break;
+                        }
+                        Err(fail) => {
+                            stale_fail(engine, entry, approval, Some(last), fail).await;
+                            return;
+                        }
+                    },
+                    Gated::Stale(fail) => {
+                        stale_fail(engine, entry, approval, Some(last), fail).await;
+                        return;
+                    }
+                    Gated::Held(_) => {
+                        stale_fail(
+                            engine,
+                            entry,
+                            approval,
+                            Some(last),
+                            recheck_failed("internal"),
+                        )
+                        .await;
+                        return;
+                    }
                 }
             }
         }
@@ -1860,10 +2169,11 @@ async fn execute(
     if !approval.current(&entry.state().model) {
         return;
     }
+    let seen = engine.identity_epoch(&entry.instance_id);
     let outcome = http.client.send_approved_ctl(cover, &w, &ctl).await;
     // Bodies of the outcomes that do not carry their response (§7.2: audit-only, T10 handoff).
     let received = ctl.take_captured().partial;
-    settle_execution(engine, entry, outcome, &received, edit, approval).await;
+    settle_execution(engine, entry, outcome, &received, edit, approval, seen).await;
 }
 
 /// The single source of truth for a write's outcome (§5.4 step 6, §7.2, §11.2).
@@ -1874,8 +2184,18 @@ async fn settle_execution(
     received: &[u8],
     edit: Option<EditView>,
     approval: Approval,
+    seen: u64,
 ) {
     let ctx = entry.ctx.clone();
+    // A write answer that failed the identity check stays `outcome_unknown`, never retried
+    // (§7.1); the token re-check that follows only brings the instance state up to date.
+    let identity_followup = matches!(
+        &outcome,
+        WriteOutcome::OutcomeUnknown {
+            reason: UnknownReason::IdentityMismatch { .. },
+            ..
+        }
+    );
     let failed = |index: u32, code: ErrorCode, message: &str, class: &str| {
         payloads::write_failed(
             &ctx,
@@ -1987,9 +2307,10 @@ async fn settle_execution(
         WriteOutcome::OutcomeUnknown {
             reason,
             request_index,
+            status,
         } => (
             Event::Executed(ExecOutcome::OutcomeUnknown),
-            payloads::write_outcome_unknown(&ctx, request_index, &reason, None, received),
+            payloads::write_outcome_unknown(&ctx, request_index, &reason, status, received),
             Some(AttentionKind::OutcomeUnknown),
         ),
         // Confluence's optimistic lock (§5.4 step 6): back to the queue, refreshed in the same
@@ -2037,6 +2358,9 @@ async fn settle_execution(
         }
     };
     let _ = finish(engine, entry, event, record, kind, Some(approval)).await;
+    if identity_followup {
+        let _ = identity::recheck(engine, &entry.instance_id, seen).await;
+    }
 }
 
 // ---- decisions -----------------------------------------------------------------------------------

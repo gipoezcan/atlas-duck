@@ -90,6 +90,7 @@ impl InstanceClient {
         let unknown = |reason| WriteOutcome::OutcomeUnknown {
             reason,
             request_index,
+            status: Some(status),
         };
 
         // Only `Executed` and `Failed4xx` carry the response. On every other answered outcome
@@ -196,6 +197,7 @@ fn not_answered(f: FetchFailure, request_index: u32) -> WriteOutcome {
     let unknown = |reason| WriteOutcome::OutcomeUnknown {
         reason,
         request_index,
+        status: None,
     };
     match f {
         // Nothing of the request left.
@@ -315,7 +317,8 @@ mod tests {
                 not_answered(f, 2),
                 WriteOutcome::OutcomeUnknown {
                     reason,
-                    request_index: 2
+                    request_index: 2,
+                    status: None,
                 }
             );
         }

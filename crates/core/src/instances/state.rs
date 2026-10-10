@@ -80,6 +80,9 @@ pub struct InstanceRuntime {
     pub expires_at: Option<chrono::NaiveDate>,
     /// `config.toml` names another URL than the confirmed origin (I-31): the URL not applied.
     pub pending_url_change: Option<String>,
+    /// Why the state is what it is (Task 26): see `InstanceView::note`. Cleared when a PAT is
+    /// stored.
+    pub note: Option<String>,
 }
 
 impl InstanceRuntime {
@@ -104,6 +107,7 @@ impl InstanceRuntime {
             identity: None,
             expires_at: None,
             pending_url_change: None,
+            note: None,
         }
     }
 }

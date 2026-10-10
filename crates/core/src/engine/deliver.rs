@@ -316,8 +316,10 @@ fn released(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
+    // The last one: a rename re-fetch (Task 26) records its audit-only first answer before it.
     let fetched_at = headers
         .iter()
+        .rev()
         .find(|h| h.event_type == EventType::READ_FETCHED)
         .map(|h| Value::String(h.ts_utc.clone()))
         .unwrap_or(Value::Null);

@@ -577,6 +577,11 @@ async fn write_preview(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, submitte
     let model = write::preview_model(entry.spec, &entry.head.instance, &w, hold, executes_as);
     let raw = write::raw_bytes(&w.requests);
     let mut warnings = model.warnings;
+    if let Some(w) = write::instance_warning(engine, &entry.instance_id)
+        && !warnings.iter().any(|x| x.id == w.id)
+    {
+        warnings.insert(0, w);
+    }
     warnings.extend(Flags::of(engine, entry).warnings());
     let preview = Preview {
         candidate_rev: shown,

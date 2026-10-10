@@ -24,6 +24,8 @@ pub mod engine;
 pub mod gate;
 /// Per-instance HTTP client construction (§7.2, V17).
 pub mod http_factory;
+/// Identity checks, `token_recheck`, rename reconciliation (Task 26).
+pub mod identity;
 /// Request, instance, batch and system-fetch ids.
 pub mod ids;
 /// The instance runtime table (routing, PD-01…PD-03) and `InstanceAdmin` (C.7).

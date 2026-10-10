@@ -116,6 +116,7 @@ fn debug_output_never_contains_sentinel() -> Result<(), Box<dyn std::error::Erro
                 server_user: Some(S.into()),
             },
             request_index: 0,
+            status: Some(200),
         },
     ] {
         dumps.push(format!("{w:?}"));

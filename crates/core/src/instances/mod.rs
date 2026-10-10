@@ -45,6 +45,9 @@ pub struct InstanceView {
     pub proxy_effective: Option<String>,
     /// "config.toml requests a URL change for <alias>" (I-31, Task 25).
     pub pending_url_change: Option<String>,
+    /// Why the state is what it is, for the settings window (Task 26): "token now resolves to
+    /// <user>" after a recheck found another user, the admin hint of the identity-header states.
+    pub note: Option<String>,
 }
 
 /// The add-instance form (§7.1).
@@ -68,6 +71,9 @@ pub enum ConnectionFailure {
     VersionBelowFloor,
     IdentityHeaderMissing,
     IdentityHeaderMismatch,
+    /// The stored token resolves to another user than the one it was stored for (Task 26): the
+    /// instance is `needs_token`.
+    OtherUser,
     NotKnownUser,
     Unavailable,
 }
@@ -82,6 +88,7 @@ impl ConnectionFailure {
             Self::VersionBelowFloor => "version_below_floor",
             Self::IdentityHeaderMissing => "identity_header_missing",
             Self::IdentityHeaderMismatch => "identity_header_mismatch",
+            Self::OtherUser => "other_user",
             Self::NotKnownUser => "not_known_user",
             Self::Unavailable => "unavailable",
         }
