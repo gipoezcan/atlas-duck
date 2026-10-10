@@ -240,7 +240,15 @@ async fn i31_add_requires_confirmation() -> TestResult {
     assert!(std::fs::read_to_string(h.config_path())?.contains("second"));
     // The origin is confirmed in the audit settings, not only in the file.
     let cfg = load_config(&h.config_path())?;
-    assert!(atlas_duck_core::config::instances::instances(&cfg)?.len() == 2);
+    assert_eq!(atlas_duck_core::config::instances::instances(&cfg)?.len(), 2);
+    let settings = h.store().settings();
+    assert!(
+        settings
+            .instances
+            .values()
+            .any(|p| p.origin.as_deref() == Some(second.base_url().as_str())),
+        "{settings:?}"
+    );
     Ok(())
 }
 
