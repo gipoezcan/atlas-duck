@@ -300,14 +300,19 @@ pub async fn run_flow(h: &Harness, flow: Flow, n: usize) -> Result<(), TestError
             )
             .map_err(de)?;
             // `fields` is enrichment-relevant: a re-enrichment, then a new revision.
+            let mut bumped = false;
             for _ in 0..500 {
                 if ap
                     .item(&id)
                     .is_some_and(|i| i.candidate_rev.counter > rev1.counter)
                 {
+                    bumped = true;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if !bumped {
+                return Err("the edit never produced a new revision".into());
             }
             ap.approve(&id).map_err(de)?;
             expect(
@@ -489,6 +494,9 @@ pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
                 };
                 let pages = r.payload["responses"].as_array().map_or(0, Vec::len);
                 let marker = usize::from(r.payload["outcome"].is_string());
+                // Coverage is per (method, path) across requests: a hit carries no request id
+                // and `READ_FETCHED` no path. The marker is the over-cap / timeout / cancelled
+                // answer that has a hit but no response page; it can mask one extra hit.
                 add(m, &p, pages + marker);
             }
             EventType::PREVIEW_FETCH => {
@@ -546,12 +554,17 @@ pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
         if got != Some(ua.as_str()) {
             return Err(format!("{} {}: User-Agent {got:?}", r.method, r.url.path()));
         }
-        if r.headers.contains_key("authorization") {
-            *hits
-                .entry((r.method.to_string(), r.url.path().to_owned()))
-                .or_insert(0) += 1;
-            authed += 1;
+        if !r.headers.contains_key("authorization") {
+            return Err(format!(
+                "{} {}: no Authorization header",
+                r.method,
+                r.url.path()
+            ));
         }
+        *hits
+            .entry((r.method.to_string(), r.url.path().to_owned()))
+            .or_insert(0) += 1;
+        authed += 1;
     }
     for (k, n) in &hits {
         let have = covers.get(k).copied().unwrap_or(0);

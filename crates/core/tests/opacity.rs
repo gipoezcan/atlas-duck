@@ -261,7 +261,7 @@ async fn i07_script_streams_identical_result_error_failed_call() -> TestResult {
         assert_eq!(s, first, "script {n} differs before its decision");
         assert!(
             s.iter()
-                .all(|l| !l.contains("TypeError") && !l.contains("Does not exist"))
+                .all(|l| !l.contains("TypeError") && !l.contains("does not exist"))
         );
     }
     let ap = h.approver();

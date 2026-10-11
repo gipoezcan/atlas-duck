@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_audit::EventType;
-use atlas_duck_core::payloads::{body_from_json, sha256_hex};
+use atlas_duck_core::payloads::{InvalidReason, body_from_json, sha256_hex};
 use atlas_duck_core::testing::{FaultPlan, Harness};
-use atlas_duck_core::{BatchItem, Confirm, DecisionError, Edits};
+use atlas_duck_core::{AdminError, BatchItem, Confirm, DecisionError, Edits};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use common::{TestError, TestResult, code, de, exit, request_id};
 use serde_json::{Map, Value, json};
@@ -152,7 +152,11 @@ async fn row_preview_shown() -> TestResult {
     plan.fail_nth(EventType::PREVIEW_SHOWN, 1);
     let res = h.approver().open(&id);
     assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
-    assert!(h.approver().release_unopened(&id).is_err());
+    let res = h.approver().release_unopened(&id);
+    assert!(
+        matches!(res, Err(DecisionError::Invalid(InvalidReason::NotOpened))),
+        "{res:?}"
+    );
     assert_eq!(h.status(&id).await.status, Status::Pending);
     no_data(&h.await_(&id, 100).await);
     assert_eq!(count_of(&h, EventType::READ_RELEASED).await?, 0);
@@ -209,7 +213,8 @@ async fn row_write_approved() -> TestResult {
     Ok(())
 }
 
-/// `READ_RELEASED`: nothing is released or delivered.
+/// `READ_RELEASED`: nothing is released or delivered, and the request fails (`audit_failure`,
+/// retryable for a read, §5.1 inv. 1) like `WRITE_APPROVED` does: it is not decidable again.
 async fn row_read_released() -> TestResult {
     let (h, plan) = rig().await?;
     let id = queued(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
@@ -217,9 +222,16 @@ async fn row_read_released() -> TestResult {
     plan.fail_nth(EventType::READ_RELEASED, 1);
     let res = h.approver().release(&id);
     assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
-    let env = h.await_(&id, 300).await;
-    no_data(&env);
-    assert_ne!(env.status, Status::Released);
+    audit_failure(&h.await_(&id, 5000).await, true);
+    assert!(h.approver().item(&id).is_none());
+    let again = h.approver().release_unopened(&id);
+    assert!(
+        matches!(
+            again,
+            Err(DecisionError::NotDecidable | DecisionError::Stale { .. })
+        ),
+        "{again:?}"
+    );
     assert_eq!(count_of(&h, EventType::READ_RELEASED).await?, 0);
     assert_eq!(count_of(&h, EventType::DELIVERED).await?, 0);
     assert_eq!(received(&h).await?, before);
@@ -265,7 +277,7 @@ async fn row_system_fetch_start() -> TestResult {
     let (h, plan) = rig().await?;
     plan.fail_nth(EventType::SYSTEM_FETCH, 1);
     let res = h.instances().retest_token("jira-main").await;
-    assert!(res.is_err(), "{res:?}");
+    assert!(matches!(res, Err(AdminError::Audit(_))), "{res:?}");
     assert_eq!(received(&h).await?, 0);
     assert_eq!(count_of(&h, EventType::SYSTEM_FETCH).await?, 0);
     Ok(())
@@ -334,15 +346,18 @@ async fn x06_six_payload_kinds_decrypt() -> TestResult {
             },
         )
         .map_err(de)?;
+    let mut bumped = false;
     for _ in 0..500 {
         if h.approver()
             .item(&write)
             .is_some_and(|i| i.candidate_rev.counter > rev1.counter)
         {
+            bumped = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(bumped, "the edit never produced a new revision");
     h.approver().approve(&write).map_err(de)?;
     assert_eq!(h.await_(&write, 10_000).await.status, Status::Succeeded);
 

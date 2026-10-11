@@ -118,7 +118,11 @@ fn log_capture() -> &'static Arc<LogCapture> {
     static CAPTURE: OnceLock<Arc<LogCapture>> = OnceLock::new();
     CAPTURE.get_or_init(|| {
         let c = Arc::new(LogCapture::default());
-        let _ = tracing::subscriber::set_global_default(Sink(c.clone()));
+        let installed = tracing::subscriber::set_global_default(Sink(c.clone())).is_ok();
+        assert!(
+            installed,
+            "another tracing subscriber was installed first: the log sweep would be vacuous"
+        );
         c
     })
 }
@@ -263,6 +267,12 @@ async fn s16_pat_canary_never_captured() -> TestResult {
     let records = h.audit_records().await?;
     assert!(records.len() > 50, "{} records", records.len());
     for r in &records {
+        assert!(
+            !r.payload.is_null(),
+            "{:?} {} did not decrypt",
+            r.event_type,
+            r.seq
+        );
         let text = serde_json::to_string(&r.payload)?;
         for n in &all {
             assert!(
