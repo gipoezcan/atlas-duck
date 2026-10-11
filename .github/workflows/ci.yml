@@ -140,7 +140,7 @@ jobs:
 
       - name: Core big tests (PD-15, 256 pending requests RSS bound, #[ignore]d)
         if: runner.os == 'Linux'
-        run: cargo test -p atlas-duck-core --features testing --locked --test budget -- --ignored i37_rss_bounded_256_pending
+        run: cargo test -p atlas-duck-core --features testing --locked --test budget -- --ignored i37_rss_bounded_256_pending --nocapture
         env:
           ATLAS_DUCK_BIG_TESTS: "1"
 
