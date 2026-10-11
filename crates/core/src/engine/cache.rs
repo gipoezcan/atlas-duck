@@ -45,7 +45,7 @@ pub struct Candidate {
 
 impl Candidate {
     pub fn from_value(value: Value) -> Result<Candidate, serde_json::Error> {
-        let bytes: Arc<[u8]> = serde_json::to_vec(&value)?.into();
+        let bytes = serialize_exact(&value)?;
         let hash: [u8; 32] = Sha256::digest(&bytes).into();
         let charge = len_u64(bytes.len()).saturating_add(value_heap_estimate(&value));
         Ok(Candidate {
@@ -74,6 +74,37 @@ impl Candidate {
     pub fn charge(&self) -> u64 {
         self.charge
     }
+}
+
+/// An `io::Write` that only counts bytes.
+struct Counter(usize);
+
+impl std::io::Write for Counter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `serde_json::to_vec(value)` written straight into one allocation of the exact length (I-37):
+/// a growing `Vec` ends at up to twice the length, and `Arc<[u8]>::from(Vec)` copies it once
+/// more. The length comes from a counting pass, so a candidate costs its bytes once.
+fn serialize_exact(value: &Value) -> Result<Arc<[u8]>, serde_json::Error> {
+    let mut n = Counter(0);
+    serde_json::to_writer(&mut n, value)?;
+    // `RepeatN` has an exact length: collected into one allocation, no intermediate `Vec`.
+    let mut bytes: Arc<[u8]> = std::iter::repeat_n(0u8, n.0).collect();
+    let short = || serde_json::Error::io(std::io::Error::other("serialized length changed"));
+    let mut out: &mut [u8] = Arc::get_mut(&mut bytes).ok_or_else(short)?;
+    serde_json::to_writer(&mut out, value)?;
+    if !out.is_empty() {
+        return Err(short());
+    }
+    Ok(bytes)
 }
 
 /// Type name and sizes only, never content (§7.7, §10.1).

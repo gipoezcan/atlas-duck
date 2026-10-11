@@ -37,6 +37,69 @@ use serde_json::{Value, json};
 
 const ISSUE: &str = "jira.issue.get";
 
+/// The live heap of this process, for `i37_rss_bounded_256_pending`: RSS also holds what the
+/// platform allocator keeps after `free`, the live heap is what the process holds. Process-wide:
+/// the gated test reads it only when run alone (the CI step filters to it).
+mod heap {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Counting;
+
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    fn grew(n: usize) {
+        let live = LIVE.fetch_add(n, Ordering::Relaxed) + n;
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+
+    // SAFETY: every call forwards to `System` with the caller's arguments; the counters only
+    // observe.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            // SAFETY: the caller's contract for `alloc` is passed through unchanged.
+            let p = unsafe { System.alloc(l) };
+            if !p.is_null() {
+                grew(l.size());
+            }
+            p
+        }
+
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            // SAFETY: the caller's contract for `dealloc` is passed through unchanged.
+            unsafe { System.dealloc(p, l) };
+            LIVE.fetch_sub(l.size(), Ordering::Relaxed);
+        }
+
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+            // SAFETY: the caller's contract for `realloc` is passed through unchanged.
+            let q = unsafe { System.realloc(p, l, new) };
+            if !q.is_null() {
+                if new >= l.size() {
+                    grew(new - l.size());
+                } else {
+                    LIVE.fetch_sub(l.size() - new, Ordering::Relaxed);
+                }
+            }
+            q
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: Counting = Counting;
+
+    /// Starts a new peak at the current live bytes.
+    pub fn reset_peak() {
+        PEAK.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+
+    /// The highest live heap since `reset_peak`, in bytes.
+    pub fn peak() -> u64 {
+        u64::try_from(PEAK.load(Ordering::Relaxed)).unwrap_or(u64::MAX)
+    }
+}
+
 fn issue(key: &str) -> Value {
     json!({ "key": key })
 }
@@ -923,6 +986,25 @@ fn rss_bytes() -> Option<u64> {
     }
 }
 
+/// RSS after glibc returned every free page it can (`malloc_trim(0)`): close to the live heap
+/// unless something outside the counted Rust heap holds memory. Diagnostics for the failure
+/// message only; `None` elsewhere.
+fn rss_after_trim() -> Option<u64> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: usize) -> std::ffi::c_int;
+        }
+        // SAFETY: `malloc_trim` takes a padding size and only releases free memory.
+        let _ = unsafe { malloc_trim(0) };
+        rss_bytes()
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        None
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "PD-15: full size, run with ATLAS_DUCK_BIG_TESTS=1 (one CI step, Task 30)"]
 async fn i37_rss_bounded_256_pending() -> TestResult {
@@ -932,10 +1014,12 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
     }
     let h = Harness::jira().await?;
     let cache_mb = h.engine().limits().candidate_cache_bytes / MIB;
+    let limit = (cache_mb + 1024) * MIB;
     // ~16 MiB, just under the release cap once wrapped. One fixture serves every read, so the
     // mock (in this process) holds one body, not 256.
     mount_issue(&h, "ABC-1", 16 * 1024 * 1024 - 4096, 'm').await?;
     let started = std::time::Instant::now();
+    heap::reset_peak();
     let mut peak = rss_bytes().unwrap_or(0);
     let mut conns = Vec::new();
     for n in 0..8 {
@@ -955,6 +1039,9 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
     // Sample until every read waits for release. The memory check counts only once all 256
     // candidates exist: a read still outside the queue at the deadline fails the test (the run
     // takes a few minutes in a debug build; the deadline is a safety net, not the end condition).
+    // The queue is read past the harness's capture, which would keep every answer (a growing
+    // list four times a second) in this process's heap.
+    let queue = h.core().decisions();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
     let mut queued = 0;
     while queued < ids.len() {
@@ -966,15 +1053,33 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
         );
         tokio::time::sleep(Duration::from_millis(250)).await;
         peak = peak.max(rss_bytes().unwrap_or(0));
-        queued = h.decisions().queue_list().len();
+        queued = queue.queue_list().len();
     }
     peak = peak.max(rss_bytes().unwrap_or(0));
     assert!(h.engine().candidates().bytes() <= cache_mb * MIB);
+    // What the process held: the cache plus every read in flight (at most 8, §5.2), whatever
+    // the allocator keeps after a free.
+    let live = heap::peak();
+    let mib = |b: Option<u64>| b.map_or_else(|| "n/a".to_owned(), |b| format!("{} MiB", b / MIB));
+    let facts = format!(
+        "live heap peak {} MiB, RSS peak {} MiB, RSS now {}, RSS after malloc_trim {}, {:?}",
+        live / MIB,
+        peak / MIB,
+        mib(rss_bytes()),
+        mib(rss_after_trim()),
+        started.elapsed()
+    );
+    eprintln!("i37: {facts}");
+    assert!(
+        live < limit,
+        "live heap exceeds candidate_cache_mb + 1 GiB: {facts}"
+    );
+    // And what it costs the machine: on glibc `Core` keeps large buffers out of the arenas
+    // (`core::return_large_buffers_on_free`), so RSS follows the live heap.
     if rss_bytes().is_some() {
         assert!(
-            peak < (cache_mb + 1024) * MIB,
-            "peak RSS {} MiB exceeds candidate_cache_mb + 1 GiB",
-            peak / MIB
+            peak < limit,
+            "peak RSS exceeds candidate_cache_mb + 1 GiB: {facts}"
         );
     }
     Ok(())

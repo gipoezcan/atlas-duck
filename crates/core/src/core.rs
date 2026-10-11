@@ -217,6 +217,7 @@ impl Core {
         port: Arc<dyn AuditPort>,
         opts: StartOptions,
     ) -> Result<Core, StartError> {
+        return_large_buffers_on_free();
         let limits = opts.limits;
         let config_path = deps.config_path.clone();
         let config = match &deps.config_path {
@@ -478,3 +479,27 @@ async fn assign_ids(path: PathBuf, config: ConfigState) -> ConfigState {
     .await
     .unwrap_or(fallback)
 }
+
+/// glibc's `malloc` raises its mmap threshold (up to 32 MiB) the first time a large mmap'd
+/// buffer is freed; from then on 16-32 MiB buffers (a read's body, its record and candidate, the
+/// JCS of its record) come from per-thread arenas and stay resident after `free`, so RSS grows
+/// by what every thread once held instead of what the process holds (I-37: 2.5 GiB RSS on Linux
+/// against a ~1.1 GiB live heap). A fixed threshold keeps every buffer of 1 MiB and more in its
+/// own mapping, returned to the OS on free, as Windows' heap does for large blocks. Process-wide
+/// and idempotent; `Core` is the only allocator-heavy component of the process.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn return_large_buffers_on_free() {
+    use std::ffi::c_int;
+    /// `M_MMAP_THRESHOLD` of glibc's `<malloc.h>`.
+    const M_MMAP_THRESHOLD: c_int = -3;
+    const THRESHOLD: c_int = 1024 * 1024;
+    unsafe extern "C" {
+        fn mallopt(param: c_int, value: c_int) -> c_int;
+    }
+    // SAFETY: `mallopt` takes two integers and is thread-safe; this parameter only changes where
+    // later allocations come from (a value above glibc's maximum is refused, returning 0).
+    let _ = unsafe { mallopt(M_MMAP_THRESHOLD, THRESHOLD) };
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn return_large_buffers_on_free() {}

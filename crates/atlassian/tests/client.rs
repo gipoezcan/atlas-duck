@@ -104,6 +104,31 @@ async fn i01_jira_myself_roundtrip() -> TestResult {
     Ok(())
 }
 
+/// I-37: a body with a `Content-Length` is received into one buffer of that size, not one that
+/// doubled past it (a 16 MiB body would otherwise hold 32 MiB until the read is recorded).
+#[tokio::test]
+async fn body_with_content_length_is_held_at_its_size() -> TestResult {
+    const MIB: usize = 1024 * 1024;
+    let dc = MockDc::start(Product::Confluence, "").await;
+    let body = format!(r#"{{"a":"{}"}}"#, "x".repeat(3 * MIB));
+    Mock::given(path("/rest/api/content"))
+        .respond_with(
+            dc.response(200)
+                .set_body_raw(body.clone(), "application/json"),
+        )
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let r = response(
+        t.client
+            .get(&test_cover()?, &call("/rest/api/content"))
+            .await,
+    )?;
+    assert_eq!(r.body, body.as_bytes());
+    assert_eq!(r.body.capacity(), r.body.len());
+    Ok(())
+}
+
 #[derive(Default)]
 struct NothingCommitted;
 

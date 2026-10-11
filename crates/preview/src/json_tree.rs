@@ -51,9 +51,25 @@ pub fn json_tree(v: &Value) -> JsonNode {
     build(v).0
 }
 
+/// An `io::Write` that only counts: the escaped length without a copy of the string (I-37, a
+/// candidate string can be 16 MiB).
+struct Counter(u64);
+
+impl std::io::Write for Counter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn json_len(s: &str) -> u64 {
     // JSON-escaped length including the quotes; serializing a str cannot fail.
-    serde_json::to_string(s).map_or(0, |j| j.len() as u64)
+    let mut n = Counter(0);
+    serde_json::to_writer(&mut n, s).map_or(0, |()| n.0)
 }
 
 /// Returns the node and its compact-JSON size in bytes.

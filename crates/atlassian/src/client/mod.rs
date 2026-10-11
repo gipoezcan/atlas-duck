@@ -171,6 +171,16 @@ impl FetchControl {
         self.state().partial.clear();
     }
 
+    /// Room for a body of `n` bytes, so it is received into one allocation instead of a buffer
+    /// that doubles to up to twice its size (I-37).
+    pub(crate) fn reserve_partial(&self, n: usize) {
+        let mut s = self.state();
+        let free = s.partial.capacity() - s.partial.len();
+        if n > free {
+            s.partial.reserve_exact(n);
+        }
+    }
+
     /// Appends a body chunk; returns the new partial length.
     pub(crate) fn append_partial(&self, chunk: &[u8]) -> usize {
         let mut s = self.state();

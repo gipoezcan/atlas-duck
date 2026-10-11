@@ -484,6 +484,11 @@ pub(crate) async fn read_body(
     deadline: Instant,
     cap: u64,
 ) -> BodyRead {
+    // The announced length, never more than the cap allows: a server cannot make this reserve
+    // more than the read may hold anyway.
+    if let Some(n) = resp.content_length() {
+        ctl.reserve_partial(usize::try_from(n.min(cap)).unwrap_or(0));
+    }
     loop {
         let next = tokio::select! {
             biased;

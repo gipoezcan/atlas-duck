@@ -119,13 +119,18 @@ pub fn body_json(bytes: &[u8]) -> Value {
         }
     };
     let n = u64::try_from(prefix.len()).unwrap_or(u64::MAX);
+    // Built by hand: `json!` serializes an expression into a new `Value`, a second full-size
+    // copy of the body (I-37).
+    let mut m = Map::new();
     if (prefix.is_empty() && !tail.is_empty()) || jcs_escaped_len(prefix) > b64_len(n) {
-        json!({ "b64": STANDARD.encode(bytes) })
-    } else if tail.is_empty() {
-        json!({ "text": prefix })
+        m.insert("b64".into(), Value::String(STANDARD.encode(bytes)));
     } else {
-        json!({ "text": prefix, "tail_b64": STANDARD.encode(tail) })
+        m.insert("text".into(), Value::String(prefix.to_owned()));
+        if !tail.is_empty() {
+            m.insert("tail_b64".into(), Value::String(STANDARD.encode(tail)));
+        }
     }
+    Value::Object(m)
 }
 
 /// The bytes `body_json` stored (rebuild, M10 export); `None` for any other shape.
@@ -172,11 +177,12 @@ const _: () = assert!(
 
 /// `{status, content_type, body}`.
 pub fn response_json(r: &UpstreamResponse) -> Value {
-    json!({
-        "status": r.status,
-        "content_type": r.content_type,
-        "body": body_json(&r.body),
-    })
+    // The body is moved in: `json!` would serialize it into a copy (I-37).
+    let mut m = Map::new();
+    m.insert("status".into(), r.status.into());
+    m.insert("content_type".into(), json!(r.content_type));
+    m.insert("body".into(), body_json(&r.body));
+    Value::Object(m)
 }
 
 fn rev_json(rev: &CandidateRev) -> Value {
