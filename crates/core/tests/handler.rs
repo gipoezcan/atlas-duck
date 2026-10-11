@@ -741,7 +741,8 @@ async fn shutting_down_refuses_submit_other_methods_answer() -> TestResult {
                 reason: None,
             },
         )
-        .await;
+        .await
+        .envelope;
     assert_eq!(detail(&script, "reason"), json!("app_shutting_down"));
     assert_eq!(h.status(&id).await.status, Status::Cancelled);
     // Other methods keep working, and the sweep ended the request (§2.5 step 2).
@@ -1106,7 +1107,8 @@ async fn await_bound_is_capped_and_the_reason_excerpt_short() -> TestResult {
                 reason: Some(reason),
             },
         )
-        .await;
+        .await
+        .envelope;
     let id = request_id(&env)?;
     let entry = h.engine().entry(&id).ok_or("entry")?;
     let excerpt = entry.reason_excerpt.clone().ok_or("excerpt")?;

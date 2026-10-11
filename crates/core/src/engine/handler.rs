@@ -22,7 +22,8 @@ use atlas_duck_audit::{AuditError, EventHeader, EventType, QueryKind, is_termina
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use atlas_duck_ipc::proto::{
     AwaitParams, ConnectionMeta, Hello, HelloReply, ListState, MatchParams, ProgressNotification,
-    ProgressSink, RequestHandler, RequestRow, SubmitParams, params_sha256, params_sha256_hex,
+    ProgressSink, RequestHandler, RequestRow, SubmitParams, SubmitReply, params_sha256,
+    params_sha256_hex,
 };
 use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_registry::{
@@ -639,6 +640,71 @@ impl CoreHandler {
         let hash = params_sha256_hex(spec.id, Some(&id), &m.params).ok()?;
         Some((spec.id.to_owned(), id, hash))
     }
+
+    async fn submit_envelope(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
+        let engine = &self.engine;
+        // 1. §2.5 step 1.
+        let Some(gate) = engine.enter_submit().await else {
+            return GateState::ShuttingDown.envelope();
+        };
+        // 2. The hello of this connection.
+        let Some(session) = engine.session(&conn.connection_id) else {
+            return envelope::protocol_error();
+        };
+        // 3. The op (`script.run` is not a registry op: `script.submit` only).
+        let Some(spec) = atlas_duck_registry::get(&p.op_id) else {
+            return envelope::unknown_op(&p.op_id);
+        };
+        // 4. Routing (PD-01…PD-03).
+        let routed = match self.route(spec, p.instance.as_deref()) {
+            Ok(r) => r,
+            Err(env) => return *env,
+        };
+        // 5. Admission, nothing queued or logged on a refusal: low space (§8.1, X-03), then the
+        // pending limits and `max_pending_bytes` (§3.3, §5.2) in one count. The ticket is given
+        // back by every return below until the entry holds it, then at terminal.
+        let kind = kind_of(spec);
+        match engine.blocking(|p| p.admission_check()).await {
+            Ok(()) => {}
+            Err(AuditError::StorageLow) => return envelope::audit_storage_low(),
+            // Never admit on an unanswered check.
+            Err(_) => return envelope::audit_failure(audit_failure_retryable(kind)),
+        }
+        let agent = AgentKey::new(
+            session.normalized.agent_name.as_deref(),
+            session.hello.client_kind,
+            conn,
+        );
+        let ticket = match engine.admission().admit(agent, Reservation::for_op(spec)) {
+            Ok(t) => t,
+            Err(busy) => return busy.envelope(),
+        };
+        // 6. `params_sha256` (PD-27) and the id; nothing is logged before this point.
+        let Ok(sha) = params_sha256(spec.id, Some(&routed.id), &p.params) else {
+            return envelope::integer_out_of_range();
+        };
+        let Ok(request_id) = RequestId::new() else {
+            return envelope::internal("no request id could be generated");
+        };
+        // From the `REQUEST_RECEIVED` commit on, in its own task, driven to completion even if
+        // this future is dropped (a pending request is independent of its connection, §4.4).
+        let job = Received {
+            spec,
+            routed,
+            sha,
+            request_id,
+            kind,
+            params: p.params,
+            reason: p.reason,
+            session,
+            conn: conn.clone(),
+            ticket,
+            gate,
+        };
+        tokio::spawn(record_and_validate(engine.clone(), job))
+            .await
+            .unwrap_or_else(|_| envelope::internal("the request task failed"))
+    }
 }
 
 #[async_trait::async_trait]
@@ -719,73 +785,18 @@ impl RequestHandler for CoreHandler {
         envelope::succeeded(json!({ "instances": rows }))
     }
 
-    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
-        let engine = &self.engine;
-        // 1. §2.5 step 1.
-        let Some(gate) = engine.enter_submit().await else {
-            return GateState::ShuttingDown.envelope();
-        };
-        // 2. The hello of this connection.
-        let Some(session) = engine.session(&conn.connection_id) else {
-            return envelope::protocol_error();
-        };
-        // 3. The op (`script.run` is not a registry op: `script.submit` only).
-        let Some(spec) = atlas_duck_registry::get(&p.op_id) else {
-            return envelope::unknown_op(&p.op_id);
-        };
-        // 4. Routing (PD-01…PD-03).
-        let routed = match self.route(spec, p.instance.as_deref()) {
-            Ok(r) => r,
-            Err(env) => return *env,
-        };
-        // 5. Admission, nothing queued or logged on a refusal: low space (§8.1, X-03), then the
-        // pending limits and `max_pending_bytes` (§3.3, §5.2) in one count. The ticket is given
-        // back by every return below until the entry holds it, then at terminal.
-        let kind = kind_of(spec);
-        match engine.blocking(|p| p.admission_check()).await {
-            Ok(()) => {}
-            Err(AuditError::StorageLow) => return envelope::audit_storage_low(),
-            // Never admit on an unanswered check.
-            Err(_) => return envelope::audit_failure(audit_failure_retryable(kind)),
+    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply {
+        SubmitReply {
+            envelope: self.submit_envelope(conn, p).await,
+            params_sha256: None,
         }
-        let agent = AgentKey::new(
-            session.normalized.agent_name.as_deref(),
-            session.hello.client_kind,
-            conn,
-        );
-        let ticket = match engine.admission().admit(agent, Reservation::for_op(spec)) {
-            Ok(t) => t,
-            Err(busy) => return busy.envelope(),
-        };
-        // 6. `params_sha256` (PD-27) and the id; nothing is logged before this point.
-        let Ok(sha) = params_sha256(spec.id, Some(&routed.id), &p.params) else {
-            return envelope::integer_out_of_range();
-        };
-        let Ok(request_id) = RequestId::new() else {
-            return envelope::internal("no request id could be generated");
-        };
-        // From the `REQUEST_RECEIVED` commit on, in its own task, driven to completion even if
-        // this future is dropped (a pending request is independent of its connection, §4.4).
-        let job = Received {
-            spec,
-            routed,
-            sha,
-            request_id,
-            kind,
-            params: p.params,
-            reason: p.reason,
-            session,
-            conn: conn.clone(),
-            ticket,
-            gate,
-        };
-        tokio::spawn(record_and_validate(engine.clone(), job))
-            .await
-            .unwrap_or_else(|_| envelope::internal("the request task failed"))
     }
 
-    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
-        script::submit(&self.engine, conn, p).await
+    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply {
+        SubmitReply {
+            envelope: script::submit(&self.engine, conn, p).await,
+            params_sha256: None,
+        }
     }
 
     async fn await_request(

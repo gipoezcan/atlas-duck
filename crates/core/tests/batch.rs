@@ -749,7 +749,8 @@ async fn dialog_text_has_targets_and_cautions() -> TestResult {
                 reason: Some("AGENTREASON-7f3a: please hurry".to_owned()),
             },
         )
-        .await;
+        .await
+        .envelope;
     let a = request_id(&env)?;
     h.queued(&a, 10_000).await.ok_or("never queued")?;
     let b = read_item(&h, "XYZ-9").await?;

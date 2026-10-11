@@ -267,3 +267,31 @@ async fn handler_traits_are_dyn_compatible() {
     });
     fn _assert(_: &dyn RequestHandler) {}
 }
+
+#[test]
+fn submit_reply_wire() -> Result<(), Box<dyn std::error::Error>> {
+    use atlas_duck_ipc::proto::SubmitReply;
+
+    let mut env = Envelope::failed(C::Internal, false, "m");
+    env.request_id = Some("req_1".to_owned());
+    let reply = SubmitReply {
+        envelope: env.clone(),
+        params_sha256: Some("ab".repeat(32)),
+    };
+    let wire = serde_json::to_value(&reply)?;
+    assert_eq!(wire["envelope"], serde_json::to_value(&env)?);
+    assert_eq!(wire["params_sha256"], json!("ab".repeat(32)));
+    assert_eq!(serde_json::from_value::<SubmitReply>(wire.clone())?, reply);
+
+    let mut null = wire.clone();
+    null["params_sha256"] = serde_json::Value::Null;
+    assert_eq!(
+        serde_json::from_value::<SubmitReply>(null)?.params_sha256,
+        None
+    );
+
+    let mut extra = wire;
+    extra["zzz"] = json!(1);
+    assert!(serde_json::from_value::<SubmitReply>(extra).is_err());
+    Ok(())
+}

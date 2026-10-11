@@ -775,6 +775,7 @@ impl Harness {
                 },
             )
             .await
+            .envelope
     }
 
     /// `submit_script` on the default connection: `{source, args?, limits?, dry_run?}`.
@@ -794,6 +795,7 @@ impl Harness {
                 },
             )
             .await
+            .envelope
     }
 
     pub async fn status(&self, request_id: &str) -> Envelope {

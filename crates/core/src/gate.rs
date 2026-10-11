@@ -14,7 +14,7 @@ use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::proto::{
     AwaitParams, ConnectionMeta, Hello, HelloReply, ListState, MatchParams, ProgressSink,
-    RequestHandler, SubmitParams,
+    RequestHandler, SubmitParams, SubmitReply,
 };
 use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_registry::{DescribeEnv, LimitsSource, describe};
@@ -235,11 +235,17 @@ impl RequestHandler for GateHandler {
     async fn instances_list(&self) -> Envelope {
         self.state.envelope()
     }
-    async fn submit(&self, _c: &ConnectionMeta, _p: SubmitParams) -> Envelope {
-        self.refuse()
+    async fn submit(&self, _c: &ConnectionMeta, _p: SubmitParams) -> SubmitReply {
+        SubmitReply {
+            envelope: self.refuse(),
+            params_sha256: None,
+        }
     }
-    async fn submit_script(&self, _c: &ConnectionMeta, _p: SubmitParams) -> Envelope {
-        self.refuse()
+    async fn submit_script(&self, _c: &ConnectionMeta, _p: SubmitParams) -> SubmitReply {
+        SubmitReply {
+            envelope: self.refuse(),
+            params_sha256: None,
+        }
     }
     async fn await_request(
         &self,

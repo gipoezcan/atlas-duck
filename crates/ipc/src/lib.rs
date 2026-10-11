@@ -9,4 +9,6 @@ pub mod jcs;
 pub mod paths;
 #[cfg(feature = "async")]
 pub mod proto;
+#[cfg(feature = "async")]
+pub mod rpc;
 pub mod sandbox;

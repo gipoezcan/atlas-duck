@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::proto::{
     AwaitParams, ConnectionMeta, Hello, HelloReply, ListState, MatchParams, ProgressNotification,
-    ProgressSink, RequestHandler, SubmitParams,
+    ProgressSink, RequestHandler, SubmitParams, SubmitReply,
 };
 use atlas_duck_preview::CandidateRev;
 use serde::Serialize;
@@ -86,6 +86,11 @@ impl CapturingHandler {
         self.cap.record(Channel::Envelope, &e);
         e
     }
+
+    fn reply(&self, r: SubmitReply) -> SubmitReply {
+        self.cap.record(Channel::Envelope, &r.envelope);
+        r
+    }
 }
 
 /// Records every notification before passing it on.
@@ -120,11 +125,11 @@ impl RequestHandler for CapturingHandler {
     async fn instances_list(&self) -> Envelope {
         self.env(self.inner.instances_list().await)
     }
-    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
-        self.env(self.inner.submit(conn, p).await)
+    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply {
+        self.reply(self.inner.submit(conn, p).await)
     }
-    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
-        self.env(self.inner.submit_script(conn, p).await)
+    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply {
+        self.reply(self.inner.submit_script(conn, p).await)
     }
     async fn await_request(
         &self,

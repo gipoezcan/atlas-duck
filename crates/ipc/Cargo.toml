@@ -9,14 +9,16 @@ publish.workspace = true
 default = ["async"]
 # Gates the tokio-based codecs. The sandbox worker
 # depends on this crate with default-features = false and stays tokio-free.
-async = ["dep:tokio-util", "dep:async-trait", "dep:sha2", "dep:getrandom"]
+async = ["dep:tokio", "dep:tokio-util", "dep:tracing", "dep:async-trait", "dep:sha2", "dep:getrandom"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml_edit = { workspace = true }
 serde_jcs = { workspace = true }
+tokio = { workspace = true, optional = true, features = ["net", "io-util", "time", "rt", "sync", "macros"] }
 tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }

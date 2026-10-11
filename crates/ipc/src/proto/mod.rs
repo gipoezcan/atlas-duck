@@ -157,6 +157,16 @@ pub struct MatchParams {
     pub instance: Option<String>,
 }
 
+/// Result of `submit` / `script.submit` (Δ1): the envelope plus the `params_sha256` the server
+/// computed after instance resolution. `Some` exactly when `envelope.request_id` is `Some`;
+/// it never appears inside an envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitReply {
+    pub envelope: Envelope,
+    pub params_sha256: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait RequestHandler: Send + Sync {
     async fn hello(&self, conn: &ConnectionMeta, h: Hello) -> Result<HelloReply, Envelope>;
@@ -164,9 +174,9 @@ pub trait RequestHandler: Send + Sync {
     async fn ops_describe(&self, op_id: &str, instance: Option<&str>) -> Envelope;
     async fn instances_list(&self) -> Envelope;
     /// Returns at acceptance: `pending` (+ request_id) or an immediate terminal envelope.
-    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope;
+    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply;
     /// `params` = `{source, args, limits, dry_run?}`.
-    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope;
+    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply;
     /// The only delivering call besides MCP `request_await`.
     async fn await_request(
         &self,
@@ -184,6 +194,9 @@ pub trait RequestHandler: Send + Sync {
         match_params: Option<MatchParams>,
     ) -> Envelope;
     async fn doctor(&self) -> Envelope;
+    /// Called once per connection whose `hello` succeeded, after it closed and every task it
+    /// spawned finished (Δ2).
+    async fn disconnected(&self, _conn: &ConnectionMeta) {}
 }
 
 pub trait ProgressSink: Send + Sync {

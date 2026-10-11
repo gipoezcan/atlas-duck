@@ -152,7 +152,7 @@ async fn gate_envelopes_per_state() -> TestResult {
     ];
     for (state, code, why, exit) in table {
         let h = GateHandler::new(state, Arc::new(RecordingUi::default()));
-        let env = h.submit(&conn(), submit_params()).await;
+        let env = h.submit(&conn(), submit_params()).await.envelope;
         assert_eq!(env.status, Status::Failed, "{why}");
         let err = env.error.as_ref().ok_or("no error object")?;
         assert_eq!(err.code, code, "{why}");
