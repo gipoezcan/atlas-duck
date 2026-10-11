@@ -202,20 +202,7 @@ fn describe_env() -> DescribeEnv {
 
 /// `ops.list` without `instance` (PD-16): every registry op with the built-in defaults.
 pub fn ops_list_local() -> Envelope {
-    let env = describe_env();
-    let ops: Vec<Value> = atlas_duck_registry::all()
-        .iter()
-        .map(|spec| {
-            let d = describe(spec, &env);
-            json!({
-                "op_id": d["op_id"],
-                "class": d["class"],
-                "approval": d["approval"],
-                "description": d["description"],
-            })
-        })
-        .collect();
-    succeeded(json!({ "ops": ops }))
+    succeeded(atlas_duck_registry::ops_list_json(&describe_env()))
 }
 
 /// `ops.describe` without `instance` (PD-16); an unknown id is a `usage` failure.

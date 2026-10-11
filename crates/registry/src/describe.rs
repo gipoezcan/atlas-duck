@@ -84,6 +84,24 @@ pub fn describe(spec: &OperationSpec, env: &DescribeEnv) -> Value {
     Value::Object(out)
 }
 
+/// `ops list` (§2.3): `{"ops": [...]}` with one `{op_id, class, approval, description}` row per
+/// operation, in `all()` order.
+pub fn ops_list_json(env: &DescribeEnv) -> Value {
+    let ops: Vec<Value> = crate::all()
+        .iter()
+        .map(|spec| {
+            let d = describe(spec, env);
+            json!({
+                "op_id": d["op_id"],
+                "class": d["class"],
+                "approval": d["approval"],
+                "description": d["description"],
+            })
+        })
+        .collect();
+    json!({ "ops": ops })
+}
+
 fn description(spec: &OperationSpec) -> String {
     let mut parts = Vec::new();
     if spec.write_guidance || spec.class == OpClass::Write {

@@ -189,7 +189,6 @@ fn c3_names_resolve_at_the_crate_root() {
         named::<EventType>(),
         named::<dyn KeyStore>(),
         named::<KeyStoreError>(),
-        named::<KeyringLocality>(),
         named::<NewEvent>(),
         named::<OpenError>(),
         named::<OsKeyStore>(),
@@ -202,6 +201,8 @@ fn c3_names_resolve_at_the_crate_root() {
     ] {
         assert!(n.starts_with("atlas_duck_audit::") || n.starts_with("dyn atlas_duck_audit::"));
     }
+    // Defined in `atlas_duck_ipc::paths::keyring` (M4), re-exported at the audit root.
+    assert!(named::<KeyringLocality>().starts_with("atlas_duck_ipc::"));
 }
 
 /// Global constraint "secrets in errors/logs": `Debug` of an event shows its plaintext

@@ -834,3 +834,29 @@ fn write_replaces_the_file_atomically() {
     // No temp file is left behind.
     assert_eq!(dir_names(tmp.path()), ["paths.toml"]);
 }
+
+#[test]
+fn keyring_locality_lives_in_ipc() {
+    use atlas_duck_ipc::paths::keyring::{
+        DirsOs, KeyringLocality, keyring_dirs_for, keyring_locality,
+    };
+    use std::path::PathBuf;
+    let dirs =
+        keyring_dirs_for(DirsOs::Linux, Some("/x".into()), &|| Ok("/home/u".into())).unwrap();
+    assert_eq!(
+        dirs,
+        [
+            "/x/keyrings",
+            "/x/kwalletd",
+            "/home/u/.local/share/keyrings",
+            "/home/u/.local/share/kwalletd"
+        ]
+        .map(PathBuf::from)
+    );
+    let l = keyring_locality(&[]);
+    if cfg!(windows) {
+        assert_eq!(l, KeyringLocality::Local);
+    } else {
+        assert!(matches!(l, KeyringLocality::Unknown { .. }));
+    }
+}

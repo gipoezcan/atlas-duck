@@ -115,3 +115,22 @@ fn write_class_gets_the_guidance_even_without_the_flag() {
             .contains(WRITE_GUIDANCE)
     );
 }
+
+#[test]
+fn ops_list_json_shape() {
+    let e = env();
+    let out = ops_list_json(&e);
+    let rows = out["ops"].as_array().unwrap();
+    assert_eq!(rows.len(), 46);
+    assert_eq!(out.as_object().unwrap().len(), 1);
+    for (row, spec) in rows.iter().zip(all()) {
+        let obj = row.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["approval", "class", "description", "op_id"]);
+        let d = describe(spec, &e);
+        for k in ["op_id", "class", "approval", "description"] {
+            assert_eq!(row[k], d[k], "{k}");
+        }
+    }
+}

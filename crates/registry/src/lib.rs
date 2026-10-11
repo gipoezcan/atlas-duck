@@ -10,7 +10,7 @@ mod jira;
 mod model;
 mod script;
 
-pub use describe::{DescribeEnv, LimitsSource, describe};
+pub use describe::{DescribeEnv, LimitsSource, describe, ops_list_json};
 pub use display::target_display;
 pub use jira::{ISSUE_GET_DEFAULT_FIELDS, SEARCH_DEFAULT_FIELDS};
 pub use model::*;

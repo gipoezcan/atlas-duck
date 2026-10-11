@@ -8,13 +8,12 @@ mod os;
 mod windows;
 
 use std::fmt;
-use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
 pub use locality::{
-    DirsOs, Probe, keyring_dirs, keyring_dirs_for, keyring_locality, keyring_locality_with,
-    probe_fs,
+    DirsOs, KeyringLocality, Probe, keyring_dirs, keyring_dirs_for, keyring_locality,
+    keyring_locality_with, probe_fs,
 };
 pub use os::{MappedError, OsKeyStore, map_keyring_error};
 #[cfg(windows)]
@@ -77,13 +76,6 @@ impl fmt::Display for KeyStoreError {
 }
 
 impl std::error::Error for KeyStoreError {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KeyringLocality {
-    Local,
-    NotLocal { dir: PathBuf },
-    Unknown { reason: String },
-}
 
 pub trait KeyStore: Send + Sync {
     fn install_id(&self) -> &str;

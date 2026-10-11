@@ -7,6 +7,7 @@
 
 mod base_dirs;
 mod host;
+pub mod keyring;
 mod locality;
 mod pinned;
 mod resolve;
