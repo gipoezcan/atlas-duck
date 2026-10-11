@@ -41,6 +41,8 @@ tracing = { workspace = true }
 # The candidate LRU (§5.2 memory budget), byte-accounted by `engine::cache`.
 lru = { workspace = true }
 tempfile = { workspace = true, optional = true }
+# `testing::flows`: the proptest strategy over lifecycle flows (Task 29).
+proptest = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = { workspace = true }
@@ -52,7 +54,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_
 [features]
 # `core::testing` (`TempStore`, `FaultyAudit`) over the wiremock harness and the audit doubles,
 # plus `HttpFactory::with_timeouts` for tests that need short budgets. Never a release build.
-testing = ["atlas-duck-atlassian/testing", "atlas-duck-audit/testing", "dep:tempfile"]
+testing = ["atlas-duck-atlassian/testing", "atlas-duck-audit/testing", "dep:tempfile", "dep:proptest"]
 
 [dev-dependencies]
 atlas-duck-atlassian = { path = "../atlassian", features = ["testing"] }

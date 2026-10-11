@@ -1,7 +1,8 @@
 #![cfg(feature = "testing")]
-//! Audit properties over random decision sequences (U-32). Task 23: every decision record with
-//! the `batch` flag follows a `BATCH_CONFIRMED` of the same `append_batch` that lists it with
-//! its revision (L43). Task 29 adds the `PREVIEW_SHOWN` half.
+//! Audit properties over random decision sequences (U-32). Every decision record with the
+//! `batch` flag follows a `BATCH_CONFIRMED` of the same `append_batch` that lists it with its
+//! revision (L43); every positive decision has a `PREVIEW_SHOWN` of the same request and revision
+//! before it (§5.6), over random lifecycle flows.
 
 mod common;
 
@@ -239,4 +240,79 @@ fn regex_escape(s: &str) -> String {
                 .chain(std::iter::once(c))
         })
         .collect()
+}
+
+/// U-32 (preview half) over random sequences of lifecycle flows, each on a fresh harness: every
+/// `READ_RELEASED`, `WRITE_APPROVED` and `SCRIPT_RELEASED` has an earlier `PREVIEW_SHOWN` of the
+/// same request and revision. (`i19_every_hit_is_covered` runs the same check over its flows.)
+#[test]
+fn u32_every_positive_decision_has_preview_shown() -> TestResult {
+    use common::flows::{check_preview_shown, flow_harness, mount_jira, run_flow};
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+    let checked = std::cell::Cell::new(0usize);
+    let mut runner = TestRunner::new(Config {
+        cases: 32,
+        failure_persistence: None,
+        max_shrink_iters: 64,
+        ..Config::default()
+    });
+    runner
+        .run(
+            &atlas_duck_core::testing::flows::flow_sequences(),
+            |flows| {
+                rt.block_on(async {
+                    let h = flow_harness().await.map_err(fail)?;
+                    mount_jira(&h).await.map_err(fail)?;
+                    for (n, f) in flows.iter().enumerate() {
+                        run_flow(&h, *f, n)
+                            .await
+                            .map_err(|e| fail(format!("{f:?}: {e}")))?;
+                    }
+                    let n = check_preview_shown(&h).await.map_err(TestCaseError::fail)?;
+                    checked.set(checked.get() + n);
+                    Ok::<_, TestCaseError>(())
+                })
+            },
+        )
+        .map_err(|e| format!("{e}"))?;
+    assert!(checked.get() > 0, "no positive decision was checked");
+    Ok(())
+}
+
+/// A fixed sequence that makes every kind of positive decision (a plain release, a released
+/// upstream error, an approval, an edited approval, a stale write returned and denied): the
+/// property is not vacuous for any of them.
+#[test]
+fn u32_fixed_sequence_decisions_have_preview_shown() -> TestResult {
+    use atlas_duck_core::testing::Flow;
+    use common::flows::{check_preview_shown, flow_harness, mount_jira, run_flow};
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let h = flow_harness().await?;
+        mount_jira(&h).await?;
+        let flows = [
+            Flow::ReadRelease,
+            Flow::ReadUpstreamError,
+            Flow::WriteApprove,
+            Flow::WriteEditApprove,
+            Flow::WriteStaleChanged,
+            Flow::ReadDeny,
+            Flow::WriteDeny,
+        ];
+        for (n, f) in flows.iter().enumerate() {
+            run_flow(&h, *f, n).await?;
+        }
+        let checked = check_preview_shown(&h).await?;
+        // 2 releases and 2 approvals at the least (the edit's second revision is its own).
+        assert!(checked >= 4, "only {checked} decisions checked");
+        drop(h);
+        Ok::<_, TestError>(())
+    })?;
+    Ok(())
 }

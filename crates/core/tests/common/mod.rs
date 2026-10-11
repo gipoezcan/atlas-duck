@@ -5,6 +5,8 @@ use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::proto::exit_code;
 use serde_json::Value;
 
+pub mod flows;
+
 pub type TestResult = Result<(), Box<dyn std::error::Error>>;
 pub type TestError = Box<dyn std::error::Error>;
 

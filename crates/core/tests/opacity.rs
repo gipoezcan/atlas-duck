@@ -1,18 +1,21 @@
 #![cfg(feature = "testing")]
-//! Opacity before a decision (§4.5, I-07 read cases; Task 29 adds the script and write cases):
-//! whatever a read fetched (data, an upstream error, an outcome) and whatever the human will
-//! decide, the agent-visible streams are identical until the decision.
+//! Opacity before a decision (§4.5, I-07): whatever a read fetched (data, an upstream error, an
+//! outcome), whatever a script returned or threw, and whatever the human will decide about a
+//! write, the agent-visible streams are identical until the decision.
 
 mod common;
 
 use std::sync::Mutex;
 
-use atlas_duck_atlassian::testing::{MockDc, fixtures};
-use atlas_duck_core::testing::Harness;
+use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
+use atlas_duck_core::RunEnd;
+use atlas_duck_core::testing::{FakeScriptRunner, Harness, ScriptPlan, host_call};
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_ipc::proto::{AwaitParams, ProgressNotification, ProgressSink};
 use common::{TestError, TestResult, de, request_id};
 use serde_json::json;
+use wiremock::Mock;
+use wiremock::matchers::{method, path};
 
 const ISSUE: &str = "jira.issue.get";
 
@@ -118,5 +121,158 @@ async fn i07_streams_identical_released_denied_upstream_outcome() -> TestResult 
             Status::Failed
         ]
     );
+    Ok(())
+}
+
+/// What the agent can see of `id` before the decision: `submit`'s envelope, then `status` and
+/// a bounded `await` with its notifications, twice (before and after the item is queued).
+async fn pending_stream(h: &Harness, env_line: String, id: &str) -> Result<Vec<String>, TestError> {
+    let mut s = vec![env_line.replace(id, "REQ")];
+    observe(h, id, &mut s).await?;
+    h.queued(id, 20_000).await.ok_or("never queued")?;
+    observe(h, id, &mut s).await?;
+    Ok(s)
+}
+
+/// I-07 for writes: three writes with the same shape, one to be denied, one approved and
+/// executed, one approved and refused by the instance, look the same to the agent until each
+/// decision (`executing` appears only after an approval, §4.5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i07_write_streams_identical_denied_approved_failed() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let post = |status: u16, body: &str| {
+        mock.response(status)
+            .set_body_raw(body.to_owned(), "application/json")
+    };
+    // The first POST is created, the next one refused.
+    Mock::given(method("POST"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1/comment")))
+        .respond_with(post(201, fixtures::JIRA_COMMENT))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1/comment")))
+        .respond_with(post(
+            400,
+            r#"{"errorMessages":["Comment body can not be empty!"],"errors":{}}"#,
+        ))
+        .with_priority(2)
+        .mount(mock.server())
+        .await;
+    let mut streams = Vec::new();
+    let mut ids = Vec::new();
+    for body in ["First text.", "Second text.", "Third text."] {
+        let env = h
+            .submit(
+                "jira.comment.add",
+                json!({ "key": "ABC-1", "body": body, "body_format": "wiki" }),
+            )
+            .await;
+        let id = request_id(&env)?;
+        streams.push(pending_stream(&h, env.to_json_line(), &id).await?);
+        ids.push(id);
+    }
+    let first = streams.first().ok_or("no streams")?;
+    for (n, s) in streams.iter().enumerate() {
+        assert_eq!(s, first, "write {n} differs before its decision");
+        assert!(
+            s.iter()
+                .all(|l| !l.contains("executing") && !l.contains("text."))
+        );
+    }
+    let ap = h.approver();
+    let [a, b, c] = ids.as_slice() else {
+        return Err("three ids".into());
+    };
+    ap.approve(a).map_err(de)?;
+    assert_eq!(h.await_(a, 10_000).await.status, Status::Succeeded);
+    ap.deny(b, "no").map_err(de)?;
+    assert_eq!(h.await_(b, 10_000).await.status, Status::Denied);
+    ap.approve(c).map_err(de)?;
+    assert_eq!(h.await_(c, 10_000).await.status, Status::Failed);
+    Ok(())
+}
+
+fn script_error() -> RunEnd {
+    RunEnd::Error {
+        class: "TypeError".to_owned(),
+        message: "x is not a function".to_owned(),
+        stack: "at main (script:3)".to_owned(),
+        elapsed_ms: 12,
+        logs: vec!["step 1".to_owned()],
+        stderr: String::new(),
+    }
+}
+
+/// I-07 for scripts: a result, a thrown error and a result after a failed host call (whatever
+/// the instance answered inside the run) are the same `pending` to the agent until released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i07_script_streams_identical_result_error_failed_call() -> TestResult {
+    let runner = FakeScriptRunner::new(vec![
+        ScriptPlan::new(
+            vec![host_call(1, "jira.issue.get", json!({ "key": "ABC-1" }))],
+            RunEnd::Result {
+                value: json!({ "n": 1 }),
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+        ),
+        ScriptPlan::new(Vec::new(), script_error()),
+        ScriptPlan::new(
+            vec![host_call(1, "jira.issue.get", json!({ "key": "ABC-9" }))],
+            RunEnd::Result {
+                value: json!({ "n": 2 }),
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+        ),
+    ]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner)
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    mock.json(
+        "/rest/api/2/issue/ABC-9",
+        404,
+        r#"{"errorMessages":["Issue does not exist"],"errors":{}}"#,
+    )
+    .await;
+    let mut streams = Vec::new();
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let env = h
+            .submit_script(json!({ "source": "return 1;", "args": { "n": n } }))
+            .await;
+        let id = request_id(&env)?;
+        streams.push(pending_stream(&h, env.to_json_line(), &id).await?);
+        ids.push(id);
+    }
+    let first = streams.first().ok_or("no streams")?;
+    for (n, s) in streams.iter().enumerate() {
+        assert_eq!(s, first, "script {n} differs before its decision");
+        assert!(
+            s.iter()
+                .all(|l| !l.contains("TypeError") && !l.contains("Does not exist"))
+        );
+    }
+    let ap = h.approver();
+    let [a, b, c] = ids.as_slice() else {
+        return Err("three ids".into());
+    };
+    ap.release(a).map_err(de)?;
+    ap.release(b).map_err(de)?;
+    ap.deny(c, "no").map_err(de)?;
+    assert_eq!(h.await_(a, 5000).await.status, Status::Released);
+    assert_eq!(h.await_(b, 5000).await.status, Status::Released);
+    assert_eq!(h.await_(c, 5000).await.status, Status::Denied);
     Ok(())
 }

@@ -466,6 +466,16 @@ impl ProgressSink for NoProgress {
     fn progress(&self, _n: ProgressNotification) {}
 }
 
+/// One committed record with its payload decrypted (`Harness::audit_records`).
+#[derive(Debug, Clone)]
+pub struct AuditRecord {
+    pub seq: u64,
+    pub event_type: EventType,
+    pub request_id: Option<String>,
+    pub op_id: Option<String>,
+    pub payload: Value,
+}
+
 pub struct Harness {
     core: Core,
     handler: Arc<CapturingHandler>,
@@ -818,6 +828,30 @@ impl Harness {
                             h.event_type,
                             payload_json(&*port, h.seq).unwrap_or(Value::Null),
                         )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await??;
+        Ok(out)
+    }
+
+    /// Every record of the last 24 h in seq order, payloads decrypted (the property sweeps of
+    /// Task 29 read the whole log, system records included).
+    pub async fn audit_records(&self) -> Result<Vec<AuditRecord>, TestError> {
+        let port = self.port.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            let mut headers = port.recent_headers(Duration::from_secs(24 * 3600))?;
+            headers.sort_by_key(|h| h.seq);
+            Ok::<_, atlas_duck_audit::AuditError>(
+                headers
+                    .iter()
+                    .map(|h| AuditRecord {
+                        seq: h.seq,
+                        event_type: h.event_type,
+                        request_id: h.request_id.clone(),
+                        op_id: h.op_id.clone(),
+                        payload: payload_json(&*port, h.seq).unwrap_or(Value::Null),
                     })
                     .collect::<Vec<_>>(),
             )

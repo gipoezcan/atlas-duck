@@ -7,6 +7,7 @@ pub mod approver;
 pub mod capture;
 pub mod confirmer;
 pub mod credentials;
+pub mod flows;
 pub mod harness;
 pub mod runner;
 pub mod store;
@@ -15,8 +16,9 @@ pub use approver::ScriptedApprover;
 pub use capture::{Capture, Captured, Channel};
 pub use confirmer::{ConfirmHook, StubConfirmer};
 pub use credentials::InMemoryCredentials;
+pub use flows::Flow;
 pub use harness::{
-    HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, InstanceAt, NoProgress,
+    AuditRecord, HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, InstanceAt, NoProgress,
 };
 pub use runner::{FakeScriptRunner, ScriptPlan, host_call};
 pub use store::{FaultPlan, FaultyAudit, Freeze, RecordedEvent, TempStore};
