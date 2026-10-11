@@ -90,7 +90,10 @@ fn last_event(h: &Harness) -> Result<EventType, TestError> {
 async fn app_stop_reason(h: &Harness) -> Result<Value, TestError> {
     let stops = h.events_of(EventType::APP_STOP).await?;
     assert_eq!(stops.len(), 1, "{stops:?}");
-    Ok(stops.first().map(|p| p["reason"].clone()).unwrap_or(Value::Null))
+    Ok(stops
+        .first()
+        .map(|p| p["reason"].clone())
+        .unwrap_or(Value::Null))
 }
 
 /// A Jira harness with a script runner, one write already `executing` (the POST of its comment
@@ -254,7 +257,10 @@ async fn i40_quit_refuses_cancels_finishes_write() -> TestResult {
         ]
     );
     let failed = record(h, &b.script, EventType::SCRIPT_FAILED).await?;
-    assert_eq!((failed["reason"].clone(), failed["direct"].clone()), (json!("app_quit"), json!(false)));
+    assert_eq!(
+        (failed["reason"].clone(), failed["direct"].clone()),
+        (json!("app_quit"), json!(false))
+    );
     // The executing write ran to its end and logged it.
     let env = h.status(&b.executing).await;
     assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
@@ -304,12 +310,19 @@ async fn i40_nothing_left_to_reconcile() -> TestResult {
     b.h.core().shutdown(ShutdownReason::Quit).await;
     // The store's own predicate finds nothing open.
     let report = b.h.store().reconcile_after_crash()?;
-    assert!(report.outcome_unknown.is_empty() && report.abandoned.is_empty(), "{report:?}");
+    assert!(
+        report.outcome_unknown.is_empty() && report.abandoned.is_empty(),
+        "{report:?}"
+    );
     // And so does the next start.
     b.h.restart().await?;
     assert!(b.h.core().startup_notice().is_empty());
     assert!(b.h.events_of(EventType::ABANDONED).await?.is_empty());
-    assert!(b.h.events_of(EventType::WRITE_OUTCOME_UNKNOWN).await?.is_empty());
+    assert!(
+        b.h.events_of(EventType::WRITE_OUTCOME_UNKNOWN)
+            .await?
+            .is_empty()
+    );
     assert_eq!(b.h.events_of(EventType::APP_START).await?.len(), 2);
     Ok(())
 }
@@ -330,7 +343,10 @@ async fn i40_a_write_over_its_budget_is_left_to_the_next_start() -> TestResult {
     // `APP_STOP` is written anyway; the write has no outcome yet.
     assert_eq!(last_event(&b.h)?, EventType::APP_STOP);
     let t = types(&b.h, &b.executing).await?;
-    assert!(!t.contains(&EventType::WRITE_EXECUTED) && !t.contains(&EventType::CANCELLED), "{t:?}");
+    assert!(
+        !t.contains(&EventType::WRITE_EXECUTED) && !t.contains(&EventType::CANCELLED),
+        "{t:?}"
+    );
     // The next start reconciles it like a crash (§11.3).
     b.h.crash_and_restart().await?;
     let env = b.h.await_(&b.executing, 10_000).await;
@@ -368,7 +384,10 @@ async fn a_concurrent_second_shutdown_waits_for_the_first() -> TestResult {
         Ok::<_, TestError>(report)
     });
     assert_eq!(second?, first);
-    assert!(first.app_stop_logged && first.writes_waited == 1, "{first:?}");
+    assert!(
+        first.app_stop_logged && first.writes_waited == 1,
+        "{first:?}"
+    );
     assert_eq!(h.events_of(EventType::APP_STOP).await?.len(), 1);
     assert_eq!(app_stop_reason(h).await?, "quit");
     Ok(())
@@ -427,8 +446,11 @@ async fn racing_submit(
         pause.release.notify_one();
         Ok::<_, TestError>(())
     };
-    let (report, released, env) =
-        tokio::join!(h.core().shutdown(ShutdownReason::Quit), release, &mut submit);
+    let (report, released, env) = tokio::join!(
+        h.core().shutdown(ShutdownReason::Quit),
+        release,
+        &mut submit
+    );
     released?;
     assert!(report.app_stop_logged, "{report:?}");
     assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
@@ -474,7 +496,12 @@ async fn i1_a_script_submit_racing_the_shutdown_is_swept() -> TestResult {
         })
         .start()
         .await?;
-    racing_submit(&h, &pause, h.submit_script(json!({ "source": "return 1;" }))).await
+    racing_submit(
+        &h,
+        &pause,
+        h.submit_script(json!({ "source": "return 1;" })),
+    )
+    .await
 }
 
 // ---- a write in `StaleCheck` (only the shutdown path can cancel it) --------------------------
@@ -510,7 +537,11 @@ async fn a_write_in_stale_check_is_cancelled_by_the_shutdown() -> TestResult {
     assert_cancelled(&h, &id, "app_quit").await?;
     let t = types(&h, &id).await?;
     let tail: Vec<_> = t.iter().rev().take(2).rev().copied().collect();
-    assert_eq!(tail, [EventType::PREVIEW_FETCH, EventType::CANCELLED], "{t:?}");
+    assert_eq!(
+        tail,
+        [EventType::PREVIEW_FETCH, EventType::CANCELLED],
+        "{t:?}"
+    );
     let fetch = record(&h, &id, EventType::PREVIEW_FETCH).await?;
     assert_eq!(fetch["purpose"], "stale_check");
     assert_eq!(last_event(&h)?, EventType::APP_STOP);

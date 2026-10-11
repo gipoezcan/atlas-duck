@@ -489,7 +489,9 @@ impl AuditPort for FaultyAudit {
 
     fn recent_headers(&self, since: Duration) -> Result<Vec<EventHeader>, AuditError> {
         if self.plan.fail_recent_headers.load(Ordering::SeqCst) {
-            return Err(AuditError::Invalid("injected header scan failure (test hook)"));
+            return Err(AuditError::Invalid(
+                "injected header scan failure (test hook)",
+            ));
         }
         self.inner.recent_headers(since)
     }
@@ -497,7 +499,9 @@ impl AuditPort for FaultyAudit {
     fn reconcile_after_crash(&self) -> Result<ReconcileReport, AuditError> {
         self.plan.note_trail(|| "reconcile_after_crash".to_owned());
         if self.plan.fail_crash_reconcile.load(Ordering::SeqCst) {
-            return Err(AuditError::Invalid("injected integrity failure (test hook)"));
+            return Err(AuditError::Invalid(
+                "injected integrity failure (test hook)",
+            ));
         }
         self.inner.reconcile_after_crash()
     }

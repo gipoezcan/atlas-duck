@@ -21,11 +21,11 @@ use atlas_duck_core::payloads::{EventCtx, InvalidReason, SubmittedDecision, deci
 use atlas_duck_core::testing::{
     Channel, FakeScriptRunner, FaultPlan, Freeze, Harness, InstanceAt, ScriptPlan,
 };
-use atlas_duck_registry::Product;
 use atlas_duck_core::{Decision, DecisionKind, HookPoint, RunEnd, TestHooks};
 use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_preview::warning::WarningId;
+use atlas_duck_registry::Product;
 use common::{TestError, TestResult, de, exit, request_id};
 use serde_json::{Map, Value, json};
 use wiremock::Mock;
@@ -112,12 +112,7 @@ async fn queued_page_update(h: &Harness) -> Result<String, TestError> {
 }
 
 fn assert_outcome_unknown(env: &Envelope) {
-    assert_eq!(
-        env.status,
-        Status::OutcomeUnknown,
-        "{}",
-        env.to_json_line()
-    );
+    assert_eq!(env.status, Status::OutcomeUnknown, "{}", env.to_json_line());
     assert_eq!(exit(env), 6);
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
 }
@@ -193,10 +188,16 @@ async fn start_order_and_pats_deleted() -> TestResult {
         gone
     );
     let starts = h.events_of(EventType::APP_START).await?;
-    assert_eq!(starts.first().map(|p| p["pats_deleted"].clone()), Some(json!(gone)));
+    assert_eq!(
+        starts.first().map(|p| p["pats_deleted"].clone()),
+        Some(json!(gone))
+    );
     let states = h.events_of(EventType::INSTANCE_STATE_CHANGED).await?;
     assert_eq!(states.len(), 2);
-    assert!(states.iter().all(|p| p["state"] == "needs_token"), "{states:?}");
+    assert!(
+        states.iter().all(|p| p["state"] == "needs_token"),
+        "{states:?}"
+    );
     Ok(())
 }
 
@@ -297,7 +298,8 @@ async fn every_start_logs_its_own_app_start() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_integrity_error_of_the_reconciliation_is_a_start_error_with_no_app_start() -> TestResult {
+async fn an_integrity_error_of_the_reconciliation_is_a_start_error_with_no_app_start() -> TestResult
+{
     let plan = FaultPlan::new();
     plan.record_trail(true);
     plan.fail_crash_reconcile(true);
@@ -338,7 +340,10 @@ async fn the_config_file_policy_is_reconciled_before_app_start() -> TestResult {
     assert_eq!(retention["applied"], true);
     assert_eq!(retention["new"], 120);
     let hold = h.events_of(EventType::LEGAL_HOLD_CHANGED).await?;
-    assert_eq!(hold.first().map(|p| p["source"].clone()), Some(json!("file")));
+    assert_eq!(
+        hold.first().map(|p| p["source"].clone()),
+        Some(json!("file"))
+    );
     assert_eq!(h.store().settings().retention_days, 120);
     assert!(h.store().settings().legal_hold);
     let trail = plan.trail();
@@ -362,7 +367,10 @@ async fn a_lower_retention_in_the_file_is_logged_and_not_applied() -> TestResult
         .iter()
         .find(|p| p["key"] == "retention_days")
         .ok_or("no retention record")?;
-    assert_eq!((p["source"].clone(), p["applied"].clone()), (json!("file"), json!(false)));
+    assert_eq!(
+        (p["source"].clone(), p["applied"].clone()),
+        (json!("file"), json!(false))
+    );
     assert_eq!(h.store().settings().retention_days, 100);
     Ok(())
 }
@@ -392,14 +400,13 @@ async fn after_restore_reconciles_the_file_again_and_marks_the_deleted_pats() ->
         .start()
         .await?;
     let id = h.instance("jira-main").ok_or("no instance")?.id.clone();
-    assert_eq!(
-        h.instances().list().first().map(|i| i.state),
-        Some("ok")
-    );
+    assert_eq!(h.instances().list().first().map(|i| i.state), Some("ok"));
     // The restore deleted this instance's PAT.
     h.credentials().delete(&id).map_err(|e| format!("{e:?}"))?;
     let before = plan.trail().len();
-    h.core().after_restore(&restore_report(vec![id.clone()])).await?;
+    h.core()
+        .after_restore(&restore_report(vec![id.clone()]))
+        .await?;
     assert_eq!(
         plan.trail().get(before..).map(<[String]>::to_vec),
         Some(vec![
@@ -408,7 +415,10 @@ async fn after_restore_reconciles_the_file_again_and_marks_the_deleted_pats() ->
         ])
     );
     let changed = h.events_of(EventType::INSTANCE_STATE_CHANGED).await?;
-    assert_eq!(changed.last().map(|p| p["state"].clone()), Some(json!("needs_token")));
+    assert_eq!(
+        changed.last().map(|p| p["state"].clone()),
+        Some(json!("needs_token"))
+    );
     // The runtime follows: the instance answers `needs_token` now.
     assert_eq!(
         h.instances().list().first().map(|i| i.state),
@@ -438,7 +448,9 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_jira_transition() 
     assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
     let unknown = h.events_of(EventType::WRITE_OUTCOME_UNKNOWN).await?;
     assert_eq!(
-        unknown.last().map(|p| (p["request_index"].clone(), p["reason"].clone())),
+        unknown
+            .last()
+            .map(|p| (p["request_index"].clone(), p["reason"].clone())),
         Some((json!(0), json!("crash")))
     );
     Ok(())
@@ -531,7 +543,12 @@ async fn i26_crash_after_post_approval_decision_invalid() -> TestResult {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(h.status(&id).await.status, Status::Executing, "{:?}", types(&h, &id).await?);
+    assert_eq!(
+        h.status(&id).await.status,
+        Status::Executing,
+        "{:?}",
+        types(&h, &id).await?
+    );
     let freeze = h.plan().freeze_after(EventType::DECISION_INVALID);
     // No decision call reaches `DECISION_INVALID` after an approval (they all answer stale in
     // `StaleCheck` / `Executing`); the record is appended as the store would see it.
@@ -541,7 +558,13 @@ async fn i26_crash_after_post_approval_decision_invalid() -> TestResult {
         op_class: Some("write".to_owned()),
         ..EventCtx::default()
     };
-    let ev = decision_invalid(&ctx, InvalidReason::NotApprovable, 1, SubmittedDecision::Approve, false);
+    let ev = decision_invalid(
+        &ctx,
+        InvalidReason::NotApprovable,
+        1,
+        SubmittedDecision::Approve,
+        false,
+    );
     h.port().append(ev)?;
     tripped(&freeze).await?;
     h.crash_and_restart().await?;
@@ -649,7 +672,10 @@ async fn i26_pending_read_abandoned() -> TestResult {
     h.crash_and_restart().await?;
     let env = h.await_(&id, 10_000).await;
     assert_abandoned(&env);
-    assert_eq!(types(&h, &id).await?, [EventType::REQUEST_RECEIVED, EventType::ABANDONED]);
+    assert_eq!(
+        types(&h, &id).await?,
+        [EventType::REQUEST_RECEIVED, EventType::ABANDONED]
+    );
     assert!(h.core().startup_notice().is_empty());
     Ok(())
 }
@@ -941,7 +967,10 @@ async fn s15_panic_mid_search_reconciles_next_start() -> TestResult {
     h.crash_and_restart().await?;
     let env = h.await_(&id, 10_000).await;
     assert_abandoned(&env);
-    assert_eq!(types(&h, &id).await?, [EventType::REQUEST_RECEIVED, EventType::ABANDONED]);
+    assert_eq!(
+        types(&h, &id).await?,
+        [EventType::REQUEST_RECEIVED, EventType::ABANDONED]
+    );
     // The sentinel is in no log line, no captured value and no plaintext of the store.
     assert!(
         lines(&logs).iter().all(|l| !l.contains(SENTINEL)),
@@ -955,11 +984,7 @@ async fn s15_panic_mid_search_reconciles_next_start() -> TestResult {
             .all(|c| !c.json.contains(SENTINEL))
     );
     let headers = h.store().recent_headers(Duration::from_secs(3600))?;
-    assert!(
-        headers
-            .iter()
-            .all(|e| !format!("{e:?}").contains(SENTINEL))
-    );
+    assert!(headers.iter().all(|e| !format!("{e:?}").contains(SENTINEL)));
     let mut files = Vec::new();
     files_under(h.data_dir(), &mut files)?;
     let mut scanned = 0;

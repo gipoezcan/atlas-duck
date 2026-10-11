@@ -464,7 +464,11 @@ impl RunShared {
     /// The `SCRIPT_CALL {cancelled_in_flight}` records of the calls in flight (§9.5): each call
     /// is taken, its control cancelled and the bytes received recorded. A call whose request was
     /// never written has nothing to record. Under the entry's gate only.
-    pub(crate) fn in_flight_records(&self, ctx: &EventCtx, reason: InFlightReason) -> Vec<NewEvent> {
+    pub(crate) fn in_flight_records(
+        &self,
+        ctx: &EventCtx,
+        reason: InFlightReason,
+    ) -> Vec<NewEvent> {
         let mut records = Vec::new();
         for (info, ctl) in self.take_in_flight() {
             ctl.cancel();
@@ -1344,7 +1348,9 @@ pub(crate) fn bound_error(mut error: Value) -> Value {
         let mut kept = Vec::with_capacity(logs.len());
         let mut dropped = 0usize;
         for line in logs.iter() {
-            let text = line.as_str().map_or_else(|| line.to_string(), str::to_owned);
+            let text = line
+                .as_str()
+                .map_or_else(|| line.to_string(), str::to_owned);
             if budget == 0 {
                 dropped += 1;
                 continue;

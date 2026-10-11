@@ -1310,7 +1310,8 @@ async fn cancel_while_the_worker_is_being_started_kills_it_when_it_appears() -> 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cancel_right_after_the_slot_is_taken_logs_the_failure_and_kills_or_never_starts() -> TestResult {
+async fn cancel_right_after_the_slot_is_taken_logs_the_failure_and_kills_or_never_starts()
+-> TestResult {
     let hold = pause();
     let hooks = TestHooks {
         pause_in_transition: Some(hold.clone()),
@@ -1337,7 +1338,10 @@ async fn cancel_right_after_the_slot_is_taken_logs_the_failure_and_kills_or_neve
     // Either no worker was started, or the one that was is killed (the run task and the cancel
     // race for the gate right after the transition).
     assert!(
-        runner.kills().iter().all(|k| *k == Some(KillReason::Client)),
+        runner
+            .kills()
+            .iter()
+            .all(|k| *k == Some(KillReason::Client)),
         "a started worker is killed: {:?}",
         runner.kills()
     );
@@ -1396,7 +1400,7 @@ async fn run_ended_with_a_call_in_flight(
     }
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    Ok(h.events(&id).await?)
+    h.events(&id).await
 }
 
 fn assert_in_flight_then_failed(events: &[(EventType, Value)], reason: &str) -> TestResult {
@@ -1523,7 +1527,11 @@ async fn host_call_params_over_a_megabyte_are_rejected() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fetch_cap_overrun_is_a_script_limit_inside_the_script() -> TestResult {
-    let mut call = host_call(1, "jira.search", json!({ "jql": "project = ABC", "max": 1 }));
+    let mut call = host_call(
+        1,
+        "jira.search",
+        json!({ "jql": "project = ABC", "max": 1 }),
+    );
     call.all = true;
     let (h, runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
     let page = json!({
@@ -1531,7 +1539,9 @@ async fn a_fetch_cap_overrun_is_a_script_limit_inside_the_script() -> TestResult
         "issues": [{ "id": "1", "key": "ABC-1", "fields": { "summary": "s".repeat(600 * 1024) } }]
     })
     .to_string();
-    requests_of(&h)?.json("/rest/api/2/search", 200, &page).await;
+    requests_of(&h)?
+        .json("/rest/api/2/search", 200, &page)
+        .await;
     let id = submit(
         &h,
         json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),

@@ -1220,7 +1220,10 @@ async fn server_names_are_escaped_in_approver_text() -> TestResult {
     mock.server().reset().await;
     myself_named(mock, EVIL, EVIL_HEADER, "JIRAUSER9").await;
     let res = h.instances().retest_token("jira-main").await;
-    assert!(matches!(res, Err(AdminError::ConnectionFailed(_))), "{res:?}");
+    assert!(
+        matches!(res, Err(AdminError::ConnectionFailed(_))),
+        "{res:?}"
+    );
     let view = h.instances().list().into_iter().next().ok_or("no view")?;
     let note = view.note.ok_or("no note")?;
     assert!(note.contains("token now resolves to"), "{note}");

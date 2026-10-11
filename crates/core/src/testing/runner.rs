@@ -258,7 +258,7 @@ async fn drive(run: &Arc<FakeRun>, run_id: &str, plan: ScriptPlan, calls: Arc<dy
                 let (calls, id) = (calls.clone(), run_id.to_owned());
                 tokio::spawn(async move { calls.call(&id, call).await })
                     .await
-                    .unwrap_or_else(|_| HostCallResult::Ok(serde_json::Value::Null))
+                    .unwrap_or(HostCallResult::Ok(serde_json::Value::Null))
             } else {
                 calls.call(run_id, call).await
             }
