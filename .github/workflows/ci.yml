@@ -769,8 +769,8 @@ jobs:
       - name: Run the M3 suite on Fedora 40
         run: |
           set -euo pipefail
-          # The platform verifier wants OS roots even where a test uses a custom CA or plain http.
-          docker run --rm -v "$RUNNER_TEMP/fedora-suite:/w:ro" fedora:40 sh -c '
+          # The platform verifier wants OS roots even where a test uses a custom CA or plain http. Core's config tests read fixtures at runtime via CARGO_MANIFEST_DIR, so the checkout is mounted at its build path.
+          docker run --rm -v "$RUNNER_TEMP/fedora-suite:/w:ro" -v "$GITHUB_WORKSPACE:$GITHUB_WORKSPACE:ro" fedora:40 sh -c '
             set -e
             echo "RUNNER_FACT $(rpm -q glibc) on kernel $(uname -r)"
             dnf install -y ca-certificates > /tmp/dnf.log 2>&1 || { cat /tmp/dnf.log; exit 1; }
