@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use atlas_duck_atlassian::UpstreamResponse;
 use atlas_duck_core::engine::cache::Candidate;
+use atlas_duck_core::engine::read::normalize;
 use atlas_duck_core::payloads::response_json;
 use serde_json::{Value, json};
 
@@ -91,7 +92,21 @@ fn read_stages_hold_one_copy_of_a_16_mib_body() -> TestResult {
         "response_json took {peak} bytes for a {} byte body",
         body.len()
     );
-    drop((r, rec));
+    drop(r);
+
+    // The normalization parses the recorded text where it is: the bare body's summary is the
+    // only full-size allocation.
+    let payload = json!({ "pages": 1, "responses": [rec] });
+    let spec = atlas_duck_registry::get("jira.issue.get").ok_or("no op")?;
+    let (bare, peak) = peak_during(|| normalize(spec, &payload));
+    let bare = bare.map_err(|e| format!("{e:?}"))?;
+    assert_eq!(bare["key"], "ABC-1");
+    assert!(
+        peak <= body.len() + SLACK,
+        "normalize took {peak} bytes for a {} byte body",
+        body.len()
+    );
+    drop((payload, bare));
 
     // The candidate: its bytes in one allocation of their length (the tree is moved in).
     let v: Value = serde_json::from_str(&body)?;

@@ -12,12 +12,13 @@
 //! **One construction path (Task 21 contract).** The first candidate of a revision and every
 //! rebuild must be produced by the same two steps, or every rebuild would mismatch: a
 //! normalization `fn(&READ_FETCHED payload) -> bare body` that reads only the committed payload
-//! (its `responses` via [`fetched_responses`] and its committed `user_resolutions`, never the
+//! (its `responses` via [`fetched_refs`] and its committed `user_resolutions`, never the
 //! live user cache), then [`build_candidate`] (stored ops on the bare body, `serde_json::to_vec`,
 //! SHA-256). Task 21 builds its forward candidate as `build_candidate(spec, normalize(&payload),
 //! ops)` with the payload it just committed, and passes the same `normalize` to
 //! `Engine::candidate`.
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use atlas_duck_atlassian::UpstreamResponse;
@@ -28,7 +29,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::audit_port::AuditPort;
-use crate::payloads::body_from_json;
+use crate::payloads::body_ref_from_json;
 use crate::redact::{self, RedactionMeta, RedactionOp};
 
 /// Estimated bytes of one map entry beside its key and value (allocator and tree overhead).
@@ -275,6 +276,27 @@ pub const CANDIDATE_SOURCES: [EventType; 3] = [
 /// The pages (or the error response) of a `READ_FETCHED` payload with their bytes restored
 /// (`payloads::read_fetched`'s `responses`; `body_from_json` per body).
 pub fn fetched_responses(payload: &Value) -> Result<Vec<UpstreamResponse>, RebuildError> {
+    Ok(fetched_refs(payload)?
+        .into_iter()
+        .map(|r| UpstreamResponse {
+            status: r.status,
+            content_type: r.content_type.map(str::to_owned),
+            body: r.body.into_owned(),
+        })
+        .collect())
+}
+
+/// One response of a `READ_FETCHED` payload, read in place.
+pub struct FetchedRef<'a> {
+    pub status: u16,
+    pub content_type: Option<&'a str>,
+    /// Borrowed from the payload when it was stored as text (I-37: a 16 MiB page is parsed
+    /// where it is, not copied first).
+    pub body: Cow<'a, [u8]>,
+}
+
+/// [`fetched_responses`] without copying the bodies stored as text; same checks.
+pub fn fetched_refs(payload: &Value) -> Result<Vec<FetchedRef<'_>>, RebuildError> {
     let Some(rs) = payload.get("responses").and_then(Value::as_array) else {
         return Err(RebuildError::Malformed);
     };
@@ -287,14 +309,14 @@ pub fn fetched_responses(payload: &Value) -> Result<Vec<UpstreamResponse>, Rebui
                 .ok_or(RebuildError::Malformed)?;
             let content_type = match r.get("content_type") {
                 None | Some(Value::Null) => None,
-                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::String(s)) => Some(s.as_str()),
                 Some(_) => return Err(RebuildError::Malformed),
             };
             let body = r
                 .get("body")
-                .and_then(body_from_json)
+                .and_then(body_ref_from_json)
                 .ok_or(RebuildError::Malformed)?;
-            Ok(UpstreamResponse {
+            Ok(FetchedRef {
                 status,
                 content_type,
                 body,

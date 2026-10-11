@@ -1224,7 +1224,7 @@ fn settle_result(
     all: bool,
     max_result: u64,
 ) -> (HostCallResult, Option<&'static str>, bool) {
-    match read::result_body(spec, rec.responses.clone()) {
+    match read::result_body(spec, rec.responses.iter().map(|r| r.body.as_slice())) {
         Ok((body, _)) => {
             let len = serde_json::to_vec(&body).map_or(u64::MAX, |b| b.len() as u64);
             if len > max_result {

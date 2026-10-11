@@ -35,7 +35,7 @@ use atlas_duck_registry::{OperationSpec, RELEASE_CAP_BYTES};
 use serde_json::{Map, Value, json};
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::cache::{Candidate, RebuildError, build_candidate, fetched_responses};
+use super::cache::{Candidate, RebuildError, build_candidate, fetched_refs};
 use super::envelope::{MSG_IDENTITY_HEADER, OpenStatus};
 use super::{Engine, InstanceHttp, OnAuditFailure, RequestEntry};
 use crate::gate::{AttentionKind, UiEvent};
@@ -1095,12 +1095,12 @@ fn normalize_with_drops(
     if payload.get("unavailable").is_some() {
         return Err(RebuildError::Malformed);
     }
-    let responses = fetched_responses(payload)?;
+    let responses = fetched_refs(payload)?;
     if payload.get("upstream_error") == Some(&Value::Bool(true)) {
         let last = responses.last().ok_or(RebuildError::Malformed)?;
-        return Ok((error_candidate(last), 0));
+        return Ok((error_candidate(last.status, &last.body), 0));
     }
-    result_body(spec, responses)
+    result_body(spec, responses.iter().map(|r| &*r.body))
 }
 
 /// The released code of an outcome (§5.2 step 6): caps → `result_too_large`, timeouts and
@@ -1118,13 +1118,13 @@ fn outcome_code(outcome: &str) -> Option<ErrorCode> {
 /// The result: one response's JSON, or for a paged op the first page's object with the items of
 /// every page under `items_key` (server totals as sent, §4.2). `confluence.search` results
 /// without a `content` object are removed and counted (§7.4 defence in depth).
-pub(super) fn result_body(
+pub(super) fn result_body<'a>(
     spec: &OperationSpec,
-    responses: Vec<UpstreamResponse>,
+    bodies: impl IntoIterator<Item = &'a [u8]>,
 ) -> Result<(Value, u64), RebuildError> {
-    let mut pages = responses
+    let mut pages = bodies
         .into_iter()
-        .map(|r| serde_json::from_slice::<Value>(&r.body).map_err(|_| RebuildError::Malformed));
+        .map(|b| serde_json::from_slice::<Value>(b).map_err(|_| RebuildError::Malformed));
     let mut body = pages.next().ok_or(RebuildError::Malformed)??;
     if let Some(paging) = spec.paginated
         && body.is_object()
@@ -1153,8 +1153,8 @@ pub(super) fn result_body(
 }
 
 /// The upstream-error candidate `{status, error_messages}` (§5.2 step 6, §6.3).
-fn error_candidate(r: &UpstreamResponse) -> Value {
-    json!({ "status": r.status, "error_messages": error_text(&r.body) })
+fn error_candidate(status: u16, body: &[u8]) -> Value {
+    json!({ "status": status, "error_messages": error_text(body) })
 }
 
 /// Atlassian `errorMessages` and `errors` (Confluence DC: `message`) as text, capped at 2 KiB

@@ -10,6 +10,8 @@
 //!
 //! No builder takes a PAT (`atlassian::PatSecret`); nothing here can put our token into a record.
 
+use std::borrow::Cow;
+
 use atlas_duck_atlassian::{UnknownReason, UpstreamResponse};
 use atlas_duck_audit::request_set::requests_to_json;
 use atlas_duck_audit::{
@@ -135,16 +137,22 @@ pub fn body_json(bytes: &[u8]) -> Value {
 
 /// The bytes `body_json` stored (rebuild, M10 export); `None` for any other shape.
 pub fn body_from_json(v: &Value) -> Option<Vec<u8>> {
+    body_ref_from_json(v).map(Cow::into_owned)
+}
+
+/// [`body_from_json`] that borrows a `{"text"}` body from `v` instead of copying it (I-37: the
+/// candidate is parsed straight from the record).
+pub fn body_ref_from_json(v: &Value) -> Option<Cow<'_, [u8]>> {
     let o = v.as_object()?;
     let decode = |k: &str| STANDARD.decode(o.get(k)?.as_str()?).ok();
-    let text = || o.get("text")?.as_str().map(|s| s.as_bytes().to_vec());
+    let text = || o.get("text")?.as_str().map(str::as_bytes);
     match o.len() {
-        1 if o.contains_key("b64") => decode("b64"),
-        1 => text(),
+        1 if o.contains_key("b64") => decode("b64").map(Cow::Owned),
+        1 => text().map(Cow::Borrowed),
         2 => {
-            let mut out = text()?;
+            let mut out = text()?.to_vec();
             out.extend(decode("tail_b64")?);
-            Some(out)
+            Some(Cow::Owned(out))
         }
         _ => None,
     }
