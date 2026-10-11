@@ -97,6 +97,42 @@ fn classifier_definition() {
     assert!(is_flagged('\u{FE0F}'));
 }
 
+/// `is_flagged` (with its ASCII shortcut) is the §6.4 set over every code point, read straight
+/// from the linked ICU data.
+#[test]
+fn is_flagged_is_the_definition_everywhere() {
+    let definition = |c: char| {
+        CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(c)
+            || match CodePointMapData::<GeneralCategory>::new().get(c) {
+                GeneralCategory::Control => !matches!(c, '\t' | '\n' | '\r'),
+                GeneralCategory::Format
+                | GeneralCategory::LineSeparator
+                | GeneralCategory::ParagraphSeparator => true,
+                _ => false,
+            }
+    };
+    let differ: Vec<u32> = (0..=0x10FFFFu32)
+        .filter_map(char::from_u32)
+        .filter(|&c| is_flagged(c) != definition(c))
+        .map(|c| c as u32)
+        .collect();
+    assert!(differ.is_empty(), "{differ:X?}");
+}
+
+/// `count`'s all-ASCII shortcut agrees with the per-char flags.
+#[test]
+fn ascii_count_agrees_with_flags() {
+    let all: String = (0..128u8).map(char::from).collect::<String>().repeat(3);
+    let other = all
+        .chars()
+        .zip(flags(&all))
+        .filter(|&(c, f)| f && !is_bidi_control(c))
+        .count();
+    assert_eq!(count(&all), (0, u64::try_from(other).unwrap_or(u64::MAX)));
+    // C0 controls but \t \n \r, and DEL.
+    assert_eq!(count(&all), (0, 3 * 30));
+}
+
 #[test]
 fn bidi_controls_are_exactly_the_bidi_control_property() {
     let expected: Vec<u32> = [0x061C, 0x200E, 0x200F]

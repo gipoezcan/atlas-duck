@@ -113,3 +113,21 @@ panic = "abort"
 opt-level = 3
 [profile.dev.package.blake2]
 opt-level = 3
+# I-37 (PD-15): every audit append hashes, compresses and encrypts its record (~16 MiB each in
+# the big test) and appends are serialized; unoptimized these add about 0.3 s per append.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.aes]
+opt-level = 3
+[profile.dev.package.ctr]
+opt-level = 3
+[profile.dev.package.aes-gcm]
+opt-level = 3
+[profile.dev.package.ghash]
+opt-level = 3
+[profile.dev.package.polyval]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.zstd-sys]
+opt-level = 3

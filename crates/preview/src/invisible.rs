@@ -23,6 +23,11 @@ pub const MAX_RGI_EMOJI_CHARS: usize = 10;
 /// but some Cf code points (U+0600–0605, U+06DD, U+070F, U+FFF9–FFFB, U+13430–1343F, …) are not
 /// Default_Ignorable.
 pub fn is_flagged(c: char) -> bool {
+    // No ASCII code point is Default_Ignorable, Cf, Zl or Zp, and ASCII Cc is U+0000–001F and
+    // U+007F: the same set without the table lookups (a test compares every ASCII char).
+    if c.is_ascii() {
+        return c.is_ascii_control() && !matches!(c, '\t' | '\n' | '\r');
+    }
     if CodePointSetData::new::<DefaultIgnorableCodePoint>().contains(c) {
         return true;
     }
@@ -47,10 +52,16 @@ pub fn is_bidi_control(c: char) -> bool {
 /// minimally-qualified and unqualified spellings to their fully-qualified entry, so the match
 /// compares `as_str()`. U+FE0E is never part of a fully-qualified emoji and so is never exempt.
 pub fn flags(s: &str) -> Vec<bool> {
+    let mut out: Vec<bool> = s.chars().map(is_flagged).collect();
+    // Only ZWJ and the variation selectors can be unflagged: without them the sequence pass
+    // changes nothing, and its index (16 bytes a char, 256 MiB for a 16 MiB candidate string,
+    // I-37) is not built.
+    if !s.contains([ZWJ, VS15, VS16]) {
+        return out;
+    }
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     // Byte offset where char `k` starts (`s.len()` past the end): candidates are slices of `s`.
     let byte_at = |k: usize| chars.get(k).map_or(s.len(), |&(b, _)| b);
-    let mut out: Vec<bool> = chars.iter().map(|&(_, c)| is_flagged(c)).collect();
     let mut i = 0;
     while i < chars.len() {
         if !is_emoji_seq_char(chars[i].1) {
@@ -117,6 +128,12 @@ fn is_emoji_seq_char(c: char) -> bool {
 
 /// (bidi controls, other invisible) over the whole string.
 pub fn count(s: &str) -> (u64, u64) {
+    // All-ASCII text (most of a JSON body): no bidi control and no emoji sequence, so the
+    // flagged chars are the ASCII ones `is_flagged` names, counted without the per-char flags.
+    if s.is_ascii() {
+        let other = s.bytes().filter(|&b| is_flagged(char::from(b))).count();
+        return (0, u64::try_from(other).unwrap_or(u64::MAX));
+    }
     let mut bidi = 0;
     let mut other = 0;
     for (c, flagged) in s.chars().zip(flags(s)) {

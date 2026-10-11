@@ -932,10 +932,10 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
     }
     let h = Harness::jira().await?;
     let cache_mb = h.engine().limits().candidate_cache_bytes / MIB;
-    let fetching = h.engine().limits().fetching;
     // ~16 MiB, just under the release cap once wrapped. One fixture serves every read, so the
     // mock (in this process) holds one body, not 256.
     mount_issue(&h, "ABC-1", 16 * 1024 * 1024 - 4096, 'm').await?;
+    let started = std::time::Instant::now();
     let mut peak = rss_bytes().unwrap_or(0);
     let mut conns = Vec::new();
     for n in 0..8 {
@@ -952,21 +952,23 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
         }
     }
     assert_busy(&h.submit(ISSUE, issue("ABC-1")).await)?;
-    // Sample until every read waits for release, or until no fetch is in flight and the queue
-    // stopped growing for 2 s (before Task 21 nothing fetches).
+    // Sample until every read waits for release. The memory check counts only once all 256
+    // candidates exist: a read still outside the queue at the deadline fails the test (the run
+    // takes a few minutes in a debug build; the deadline is a safety net, not the end condition).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-    let (mut last, mut still) = (usize::MAX, 0u32);
-    loop {
-        peak = peak.max(rss_bytes().unwrap_or(0));
-        let queued = h.decisions().queue_list().len();
-        let idle = h.engine().fetch_slots().available_permits() == fetching;
-        still = if queued == last && idle { still + 1 } else { 0 };
-        last = queued;
-        if queued >= ids.len() || still >= 8 || tokio::time::Instant::now() > deadline {
-            break;
-        }
+    let mut queued = 0;
+    while queued < ids.len() {
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "only {queued} of {} reads reached the queue in {:?}",
+            ids.len(),
+            started.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(250)).await;
+        peak = peak.max(rss_bytes().unwrap_or(0));
+        queued = h.decisions().queue_list().len();
     }
+    peak = peak.max(rss_bytes().unwrap_or(0));
     assert!(h.engine().candidates().bytes() <= cache_mb * MIB);
     if rss_bytes().is_some() {
         assert!(
