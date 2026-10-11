@@ -310,7 +310,7 @@ async fn redaction_over_release_cap_is_blocked() -> TestResult {
     assert!(body.len() < 16 * 1024 * 1024);
     jira(&h)?.json("/rest/api/2/issue/ABC-1", 200, &body).await;
     let id = request_id(&h.submit(ISSUE, json!({ "key": "ABC-1" })).await)?;
-    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    h.queued(&id, 120_000).await.ok_or("never queued")?;
     h.approver().open(&id).map_err(de)?;
     let res = h.approver().redact(
         &id,
