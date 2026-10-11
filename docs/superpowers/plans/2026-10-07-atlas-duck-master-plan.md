@@ -604,7 +604,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Ledger:** L04, L14, L16, L23, L28, L30, L32, L33, L34, L35 (the `doctor` fields), L39 (`doctor` adds the app-reported `secret_service: ok|missing|locked` on Linux, resolved 2026-10-08), L42 (`pac_configured`, `proxy_error`), L44 (CLI-local exit 11 carries `retry_after_s: 5`), L46 (the `first_run` envelope served over IPC).
 - **Handoff from M3 (Task 19 review):** the C.2 drive-to-completion rule: the server spawns one task per request and never aborts it on disconnect (dropping an `await_request` future is fine; a dropped `submit` is still applied by `core`, but the agent loses the answer, so the submission notice must be printed only from the returned envelope); `RequestHandler` has no disconnect call, so `core`'s hello sessions (by `connection_id`) are never removed: add a `disconnected(conn)` method or bound the map; `status` exits 0 for any known id (§4.4), overriding the generic `exit_code` matrix in the CLI.
 - **Handoff from M2:** startup loop retries `open` only on `Locked(KeychainUnavailable)` (`keychain_retry_schedule()`); an `open()` `Err` (tampered newest key row, `audit.db-wal` without `audit.db`, `MigrationFailed`) is a startup error with an evidence-preserving message, never `FirstRun` or a new store; `doctor` `keyring_local` uses `OsKeyStore::new(id).locality()` (M2 plan, "Handoff to later milestones").
-- **Status:** detailed plan: to be written after M3
+- **Status:** detailed plan: 2026-10-07-atlas-duck-m04-ipc-cli.md
 
 ### M5 — Jira adapter + previews
 
