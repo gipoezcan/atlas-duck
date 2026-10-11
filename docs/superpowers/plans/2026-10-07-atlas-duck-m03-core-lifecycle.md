@@ -2505,6 +2505,8 @@ cargo build -p atlas-duck-app --release --locked
 ```
 
 Expected: every command exits 0; `cargo tree -p atlas-duck-app -e features --release 2>/dev/null | grep -E 'atlas-duck-(atlassian|core|audit) feature "(testing|insecure-test-http)"'` prints nothing; the CI run shows `rust` green on Windows MSVC, macOS arm64 (+ Rosetta x86_64 leg), Ubuntu 22.04, `core-suite-fedora` green, `supply-chain` green. Record the CI run URL and commit SHA in the task report.
+Note (M4 plan correction, 2026-10-11): the feature-leak grep in Step 4 walks dev edges under `-e features`, so it can match a dev-only feature and give a false result. The correct form is `cargo tree -p atlas-duck-app -e normal,build,features --release` (the form M4 uses at its lines 691, 767 and 915). Use that form when re-running this check.
+
 - [ ] **Step 5: Commit** `ci: M3 suite on all legs and Fedora 40, test-only feature leak rule, panic-macro gate` (+ trailer).
 
 ---

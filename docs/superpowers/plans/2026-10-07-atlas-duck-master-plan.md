@@ -185,6 +185,7 @@ pub fn target_display(spec: &OperationSpec, params: &serde_json::Value) -> Strin
 pub struct DescribeEnv { pub limits_source: LimitsSource /* Default | Effective */, pub available: Option<bool>,
                          pub caps: serde_json::Value, pub script_limits: serde_json::Value }
 pub fn describe(spec: &OperationSpec, env: &DescribeEnv) -> serde_json::Value;   // §2.3 `ops describe` shape, incl. the Write guidance text and the §7.5 continue-from-`next_start` rule
+pub fn ops_list_json(env: &DescribeEnv) -> serde_json::Value;                   // [M4 Δ5] `{"ops": [{op_id, class, approval, description}, …]}` in `all()` order (the shape `core::gate::ops_list_local` builds today); `core::ops_list_local` and the CLI's local `ops list` both call it, so they cannot drift (PD-10)
 pub struct ScriptRunSpec { pub id: &'static str /* "script.run" */, pub similarity: Similarity /* None */, pub target_display_format: &'static str /* "script · {lines} lines" */ }
 pub const SCRIPT_RUN: &ScriptRunSpec;                // op id "script.run": NOT one of the 46 registry entries (spec-silent; resolved here); submitted via `script.submit`, MCP tool `script_run`; no OpImpl
 ```
@@ -242,15 +243,18 @@ pub trait RequestHandler: Send + Sync {          // implemented by `core`, serve
     async fn ops_list(&self, instance: Option<&str>) -> Envelope;
     async fn ops_describe(&self, op_id: &str, instance: Option<&str>) -> Envelope;
     async fn instances_list(&self) -> Envelope;
-    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope;      // returns at acceptance: `pending` (+ request_id) or an immediate terminal envelope (validation, busy, locked, …)
-    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope; // params = {source, args, limits, dry_run?}
+    async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply;      // returns at acceptance: `pending` (+ request_id) or an immediate terminal envelope (validation, busy, locked, …) [M4 Δ1]
+    async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply; // params = {source, args, limits, dry_run?} [M4 Δ1]
     async fn await_request(&self, conn: &ConnectionMeta, a: AwaitParams, progress: &dyn ProgressSink) -> Envelope; // the only delivering call besides MCP request_await; logs DELIVERED
     async fn status(&self, request_id: &str) -> Envelope;        // never blocks, no data, never DELIVERED
     async fn cancel(&self, request_id: &str) -> Envelope;
     async fn requests_list(&self, agent: Option<&str>, state: Option<ListState>, match_params: Option<MatchParams>) -> Envelope;
     async fn doctor(&self) -> Envelope;
+    async fn disconnected(&self, conn: &ConnectionMeta) {}                           // [M4 Δ2] default no-op (`GateHandler` compiles unchanged); called once per connection whose `hello` succeeded, after the connection closed and every `submit`/`submit_script`/`cancel` task it spawned has finished (await tasks are dropped)
 }
 pub trait ProgressSink: Send + Sync { fn progress(&self, n: ProgressNotification); }
+/// [M4 Δ1] `params_sha256` is `Some(lowercase hex)` exactly when `envelope.request_id` is `Some`; serde `deny_unknown_fields`. It never appears inside an envelope; the JSON-RPC result of `request.submit` / `script.submit` is the serialized `SubmitReply`. The submission notice needs `params_sha256` after instance resolution, which only the server knows (§4.5).
+pub struct SubmitReply { pub envelope: Envelope, pub params_sha256: Option<String> }
 ```
 [2026-10-09 M3 Task 19 review I-3] **Drive-to-completion rule.** A `RequestHandler` implementation drives every audit commit it started to its in-memory effect even when the caller's future is dropped (`core` runs `submit` from the `REQUEST_RECEIVED` commit on, and every record-bearing transition, in their own tasks), so a dropped future never leaves a committed request unapplied, orphaned or doubly terminal. Servers may drop an `await_request` future (disconnect, wait bound); they should still run `submit`/`submit_script`/`cancel` to completion and must never treat a dropped future as a cancel (§4.4: a pending request is independent of its connection; only `cancel` cancels).
 Two-phase submit (accept now, deliver on `await`) is plan-chosen because §4.1 prints the submission notice "immediately after the server accepts"; the spec does not say whether `request.submit` blocks (spec-silent).
@@ -263,7 +267,8 @@ pub fn endpoint_location(data: &LocalDataDir, host: &str) -> EndpointLocation;  
 /// The served handler lives in a swappable cell, so the app replaces `core::gate_handler(..)` by `Core::handler()` (unlock, "Recover this log", "Finish restore", first-run completion) without rebinding the endpoint; an open connection sees the new handler from its next request on.
 pub struct HandlerCell { /* RwLock<Arc<dyn RequestHandler>> */ }   // [named-by-plan]
 impl HandlerCell { pub fn new(h: std::sync::Arc<dyn RequestHandler>) -> Self;  pub fn swap(&self, h: std::sync::Arc<dyn RequestHandler>);  pub fn current(&self) -> std::sync::Arc<dyn RequestHandler>; }
-pub struct ShutdownSignal(pub tokio_util::sync::CancellationToken);                 // [named-by-plan]; cancelled by `Core::shutdown` and the app's quit path
+#[derive(Clone)]
+pub struct ShutdownSignal(pub tokio_util::sync::CancellationToken);                 // [named-by-plan]; cancelled by `Core::shutdown` and the app's quit path; `Clone` [M4 Δ3]
 pub struct IpcServer;  impl IpcServer {
     pub fn bind(data: &LocalDataDir, host: &str) -> std::io::Result<IpcServer>;          // writes `<data>/endpoint` (0600 / user-only ACL); Windows: random suffix regenerated on each start and bind failure
     pub async fn serve(self, handler: std::sync::Arc<HandlerCell>, shutdown: ShutdownSignal);   // owner checks, hello ordering/deadline, limits (64/16), busy envelope, peer origin chain, ProgressSink per await
@@ -272,9 +277,11 @@ pub struct ClientContext { pub data_dir: LocalDataDir, pub host: String, pub hel
 pub struct IpcClient;  impl IpcClient {
     pub async fn connect(ctx: &ClientContext, deadline: std::time::Instant) -> Result<IpcClient, ConnectError>; // owner check (§3.2 a) before the first byte, hello with BUILD_ID
     pub async fn call<R: serde::de::DeserializeOwned>(&mut self, method: &str, params: impl serde::Serialize) -> Result<R, ClientError>;
+    pub async fn call_with_progress<R: serde::de::DeserializeOwned>(&mut self, method: &str, params: impl serde::Serialize, on_progress: &mut dyn FnMut(ProgressNotification)) -> Result<R, ClientError>; // [M4 Δ3]
 }
-pub enum ConnectError { NotRunning, ServerIdentity, PipeBusy, DeadlineExceeded, BuildMismatch { client_newer: bool }, Io(std::io::Error) }
+pub enum ConnectError { NotRunning, ServerIdentity, PipeBusy, DeadlineExceeded, BuildMismatch { client_newer: bool }, Io(std::io::Error), Busy { retry_after_s: u64 } /* [M4 Δ3] server-side connection limit (PD-27) */ }
 ```
+[M4 Δ3] Transport surface, beyond the M4 modules above: `pub mod rpc` (Task 2); `paths::{endpoint_location, EndpointLocation, write_endpoint_file, read_endpoint_file, ENDPOINT_FILE, socket_dir}` (Task 4); `transport::{Listener, Conn, connect_checked, OwnerCheck}` (Tasks 5/6); `peer::{peer_info, PeerSource}` (Task 7). `ConnectError::PipeBusy` stays the CLI-local `WaitNamedPipeW` timeout.
 
 ### C.3 `audit` (M2; `lock` [M1])
 
@@ -285,6 +292,7 @@ pub trait Clock: Send + Sync {                                   // [named-by-pl
     fn now_utc(&self) -> UtcInstant;                             // wall clock
     fn suspend_aware_elapsed(&self) -> std::time::Duration;      // CLOCK_BOOTTIME / mach_continuous_time / Windows interrupt time (V27)
 }
+// [M4 Δ4] Keyring locality moves to `atlas_duck_ipc::paths::keyring` (pure path + `statfs` logic, already built only on `ipc::paths`): `audit::keystore::locality::{DirsOs, keyring_dirs, keyring_dirs_for, Probe, probe_fs, keyring_locality, keyring_locality_with}` and `audit::KeyringLocality`. `audit` re-exports them under the old paths (`pub use atlas_duck_ipc::paths::keyring::…`), so no `audit` caller changes. Reason: §4.7 says the CLI computes `keyring_local` itself, and `cli` may depend on neither `audit` nor a keyring crate (PD-11).
 pub trait KeyStore: Send + Sync {                                // [named-by-plan]; OS impl in `audit::os_keystore` (keyring-core), double in `audit::testing`
     fn get(&self, e: &EntryName) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, KeyStoreError>;
     fn set(&self, e: &EntryName, v: &[u8]) -> Result<(), KeyStoreError>;
@@ -400,7 +408,7 @@ pub enum FetchFailure {                                           // the §7.2 /
 }
 pub enum WriteOutcome { Executed { response: UpstreamResponse, server_user: Option<String>, request_index: u32 },
     Failed4xx { response: UpstreamResponse, request_index: u32 }, Unavailable3xx { request_index: u32 },
-    VersionConflict { request_index: u32 }, OutcomeUnknown { reason: UnknownReason, request_index: u32 }, NeedsToken, OriginGuardRefused,
+    VersionConflict { request_index: u32 }, OutcomeUnknown { reason: UnknownReason, request_index: u32, status: Option<u16> /* [M4 Δ9] */ }, NeedsToken, OriginGuardRefused,
     RefusedMismatch { request_index: u32 }, NotSent { reason: NotSentReason } }   // additive [M3 PD-07]: an outgoing request differed from its list entry (nothing written); nothing of the request left. [M3 Task 10] `NotSentReason { Connection(ConnClass), BudgetExpired, Cancelled }`, `UnknownReason` gains `Cancelled`
 ```
 `atlassian` is a leaf: it has no workspace dependency at all (not `audit`, `core`, `ipc` and not `registry`). Endpoint templates, param schemas, `success` shapes and `result_projection` are registry data that only `core` reads: `core` hands `atlassian` the endpoint template string inside `GetCall`/`PagedCall`/`SearchCall` and the expected success shape inside `ApprovedWrite`, and applies `result_projection` to the returned `UpstreamResponse`; `atlassian` builds the URL from the template under the configured base URL including its context path and never follows `_links.next`. `core` recomputes `audit::request_set_hash` over the `HttpRequestSpec` list immediately before `send_approved` and refuses to send if it differs from the hash stored in `WRITE_APPROVED`; `atlassian` only guarantees that what it writes equals the list it was given.
@@ -453,6 +461,7 @@ pub struct CoreDeps { pub audit: audit::Store, pub clock: Arc<dyn audit::Clock>,
 pub struct Core;  impl Core {
     pub async fn start(deps: CoreDeps) -> Result<Core, StartError>;                  // needs a Ready store; runs reconcile_after_crash, appends APP_START, seeds the similarity index. Without a store the app serves `gate_handler` instead (below)
     pub fn handler(&self) -> Arc<dyn ipc::proto::RequestHandler>;                    // what IpcServer serves
+    pub fn set_utc_offset(&self, minutes: Option<i32>);                              // [M4 Δ6] forwards to `SimilarityIndex::set_utc_offset` (the "similar to req_… executed HH:MM" text is UTC until a caller sets it; M3 progress line 73); the app calls it at start and hourly (PD-32)
     pub fn decisions(&self) -> Arc<dyn DecisionApi>;                                 // Tauri commands and the scripted approver call this, nothing else
     pub fn instances(&self) -> Arc<dyn InstanceAdmin>;                               // add/change base URL (confirmer), replace/re-test token, identity state
     pub async fn shutdown(&self, reason: ShutdownReason);                            // the one §2.5 path: Quit | OsShutdown | Installer
@@ -466,6 +475,8 @@ pub enum GateState {
     ShuttingDown,                              // §2.5
 }
 pub fn gate_handler(state: GateState, ui: Arc<dyn UiSink>) -> Arc<dyn ipc::proto::RequestHandler>;
+// [M4 Δ7] Composition visibility, no change: the app's composition root uses `core::audit_port::DateBridge`, `core::proxy::SystemProxySource::new`, `core::http_factory::HttpFactory::new`, `core::credentials::KeychainCredentials::new`, all already `pub` and not feature-gated on `master` (checked); recorded so nobody gates them later.
+// [M4 Δ8] `GateState` unchanged. The app never serves `GateState::NotConfigured(data_dir_*)`: those states bind no IPC (§7.7 "at a later start the app opens no store, binds no IPC"); the CLI answers them itself (§7.7 CLI-side check). `NotConfigured(config_unreadable)` is not a gate state in practice either: `Core::start` runs with `ConfigState::Unreadable` and answers per request (M3). The variant stays for completeness.
 
 // Decision contract [spec §2.4 field names]
 pub use atlas_duck_preview::CandidateRev;   // { counter: u64, candidate_hash: [u8; 32] }, hash = SHA-256 (spec-silent → plan); defined in `preview` (C.6, M3 PD-06)
@@ -503,7 +514,7 @@ pub trait UiSink: Send + Sync { fn emit(&self, e: UiEvent); }     // ids and cou
 #[async_trait::async_trait]
 pub trait ScriptRunner: Send + Sync {                            // implemented by `app` over sandbox-host (M8)
     async fn compile_check(&self, source: &str) -> Result<(), CompileError>;                    // dry-run pool
-    async fn start(&self, run: RunSpec, calls: Arc<dyn HostCalls>) -> Result<Box<dyn RunHandle>, RunnerError>;   // RunnerError::SandboxUnavailable { app_upgraded: bool }
+    async fn start(&self, run: RunSpec, calls: Arc<dyn HostCalls>) -> Result<Arc<dyn RunHandle>, RunnerError>;   // RunnerError::SandboxUnavailable { app_upgraded: bool }; `Arc` as built in M3 [M4 Δ9]
 }
 #[async_trait::async_trait]
 pub trait HostCalls: Send + Sync { async fn call(&self, run_id: &str, call: ipc::sandbox::HostCall) -> ipc::sandbox::HostCallResult; fn log(&self, run_id: &str, line: &str); }
