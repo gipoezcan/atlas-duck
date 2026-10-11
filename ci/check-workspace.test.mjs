@@ -367,6 +367,68 @@ test("scanToml ignores # inside strings and keeps sections apart", () => {
   assert.equal(s.get("b.c").get("k"), "1");
 });
 
+// ---------- test-only features and the registry allow-list (Task 30) ----------
+
+test("a normal dependency enabling a test-only feature is a violation", () => {
+  for (const [from, to] of [
+    ["atlas-duck-core", "atlas-duck-atlassian"],
+    ["atlas-duck-cli", "atlas-duck-core"],
+    ["atlas-duck-cli", "atlas-duck-audit"],
+  ]) {
+    const e = baseEdges();
+    e[from] = e[from].filter((d) => d !== to);
+    e[from].push({ name: to, features: ["testing"] });
+    assert.deepEqual(graph(e).filter((v) => v.includes("test-only")), [
+      `${from}: normal dependency enables test-only feature ${to}/testing`,
+    ]);
+  }
+  const e = baseEdges();
+  e["atlas-duck-core"] = [
+    ...e["atlas-duck-core"].filter((d) => d !== "atlas-duck-atlassian"),
+    { name: "atlas-duck-atlassian", features: ["insecure-test-http"], kind: "build" },
+  ];
+  assert.equal(graph(e).filter((v) => v.includes("test-only")).length, 1);
+});
+
+test("a dev-dependency may enable test-only features; so may optional external deps", () => {
+  const e = baseEdges();
+  e["atlas-duck-core"] = [
+    ...e["atlas-duck-core"],
+    { name: "atlas-duck-atlassian", kind: "dev", features: ["testing"] },
+    { name: "atlas-duck-audit", kind: "dev", features: ["testing"] },
+    { name: "proptest" },
+    { name: "tempfile" },
+  ];
+  assert.deepEqual(graph(e), []);
+});
+
+test("a default feature that reaches a test-only feature is a violation", () => {
+  const m = makeMetadata(baseEdges());
+  const atlassian = m.packages.find((p) => p.name === "atlas-duck-atlassian");
+  atlassian.features = { default: ["wire"], wire: ["testing"], testing: ["insecure-test-http"], "insecure-test-http": [] };
+  const core = m.packages.find((p) => p.name === "atlas-duck-core");
+  const dep = core.dependencies.find((d) => d.name === "atlas-duck-atlassian");
+  assert.deepEqual(
+    checkGraph(m).filter((v) => v.includes("test-only")).sort(),
+    [
+      "atlas-duck-core: normal dependency enables test-only feature atlas-duck-atlassian/insecure-test-http",
+      "atlas-duck-core: normal dependency enables test-only feature atlas-duck-atlassian/testing",
+    ],
+  );
+  dep.uses_default_features = false;
+  assert.deepEqual(checkGraph(m), []);
+});
+
+test("registry normal dependencies are limited to serde and serde_json", () => {
+  const e = baseEdges();
+  e["atlas-duck-registry"] = ["serde", "serde_json", { name: "jsonschema", kind: "dev" }];
+  assert.deepEqual(graph(e), []);
+  e["atlas-duck-registry"].push("regex");
+  assert.deepEqual(graph(e), [
+    "atlas-duck-registry: external normal dependency regex is not allowed; only serde, serde_json (§2.2)",
+  ]);
+});
+
 // ---------- the real workspace ----------
 
 test("the real workspace passes: node ci/check-workspace.mjs exits 0", () => {

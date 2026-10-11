@@ -41,6 +41,18 @@ export const INTERNAL_RULES = [
   { pkg: PKG.sandboxWorker, allowed: [PKG.ipc] },
 ];
 
+// §13 / §7.7: features that only the test builds may enable. A normal or build dependency
+// edge between workspace packages must not turn one on, directly or through default features.
+export const TEST_ONLY_FEATURES = [
+  "atlas-duck-atlassian/testing",
+  "atlas-duck-atlassian/insecure-test-http",
+  "atlas-duck-core/testing",
+  "atlas-duck-audit/testing",
+];
+
+// The registry stays a plain data crate: its normal dependencies are these and nothing else.
+export const REGISTRY_EXTERNAL_ALLOW = ["serde", "serde_json"];
+
 export const TAURI_CRATES = ["tauri", "wry"];
 
 // §2.1: sandbox "No HTTP client, keychain, or DB code linked"; CLI "Never
@@ -139,6 +151,39 @@ export function checkGraph(metadata) {
           violations.push(`${rule.pkg}: must not depend on ${name} (§2.2)`);
         }
       }
+    }
+  }
+
+  for (const pkg of members) {
+    for (const d of pkg.dependencies) {
+      if (!isNormalOrBuild(d.kind) || !memberNames.has(d.name)) continue;
+      const target = byName.get(d.name);
+      const enabled = new Set(d.features ?? []);
+      if (d.uses_default_features !== false) enabled.add("default");
+      // Expand feature-to-feature edges inside the target package ("a = [\"b\"]"); `dep:` and
+      // `pkg/feat` entries leave the package and are not followed.
+      const stack = [...enabled];
+      while (stack.length > 0) {
+        const feature = stack.pop();
+        for (const e of target?.features?.[feature] ?? []) {
+          if (!e.includes("/") && !e.startsWith("dep:") && !enabled.has(e)) {
+            enabled.add(e);
+            stack.push(e);
+          }
+        }
+      }
+      for (const f of enabled) {
+        if (TEST_ONLY_FEATURES.includes(`${d.name}/${f}`)) {
+          violations.push(`${pkg.name}: normal dependency enables test-only feature ${d.name}/${f}`);
+        }
+      }
+    }
+  }
+
+  const registry = byName.get(PKG.registry);
+  for (const d of registry?.dependencies ?? []) {
+    if (isNormalOrBuild(d.kind) && !memberNames.has(d.name) && !REGISTRY_EXTERNAL_ALLOW.includes(d.name)) {
+      violations.push(`${PKG.registry}: external normal dependency ${d.name} is not allowed; only ${REGISTRY_EXTERNAL_ALLOW.join(", ")} (§2.2)`);
     }
   }
 

@@ -475,6 +475,9 @@ test("verifyRuns: a real-named run still reports a missing, an extra and a faile
   assert.ok(verifyRuns(validDoc(), fakeGithub({ jobs: fail })).some((v) => v.includes("concluded failure")));
 });
 
+// Jobs added by later milestones: the M1 record is a frozen run and does not list them.
+const LATER_MILESTONE_JOBS = ["core-suite-fedora"];
+
 test("the workflows' job names begin with the ids REQUIRED_WORKFLOWS lists", () => {
   for (const [file, required] of Object.entries(REQUIRED_WORKFLOWS)) {
     const text = readFileSync(join(REPO, ".github", "workflows", file), "utf8");
@@ -489,6 +492,7 @@ test("the workflows' job names begin with the ids REQUIRED_WORKFLOWS lists", () 
       );
     }
     for (const name of names) {
+      if (LATER_MILESTONE_JOBS.some((p) => name.startsWith(p))) continue;
       assert.ok(required.some((p) => name.startsWith(jobKey(p))), `${file}: job name '${name}' starts with no required job id`);
     }
   }

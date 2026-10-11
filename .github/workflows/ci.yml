@@ -1,5 +1,5 @@
 # Base CI for atlas-duck (spec §13 CI row, §10.1 supply chain).
-# Jobs: rust (3-OS matrix), rust-macos-x86_64-rosetta, supply-chain.
+# Jobs: rust (3-OS matrix), rust-macos-x86_64-rosetta, core-suite-fedora, supply-chain.
 # Later M1 tasks add steps or jobs to this file.
 name: ci
 
@@ -128,6 +128,21 @@ jobs:
           # §9.4: the Windows floor is met (LPAC, or the plain AppContainer fallback), with the
           # host-side controls of sandbox-host `winscore`. Ignored off Windows.
           ATLAS_DUCK_EXPECT_WINDOWS_FLOOR_MET: "1"
+
+      # The workspace run above does not enable the test-only features (a plain `--workspace`
+      # build is the release-shaped one), so the M3 suite is its own run.
+      - name: M3 suite (atlassian + core, test-only features)
+        run: cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked
+
+      - name: Core PAT keychain test (Windows Credential Manager, RF-3a, #[ignore]d)
+        if: runner.os == 'Windows'
+        run: cargo test -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test keychain_windows -- --ignored --test-threads=1 --nocapture
+
+      - name: Core big tests (PD-15, 256 pending requests RSS bound, #[ignore]d)
+        if: runner.os == 'Linux'
+        run: cargo test -p atlas-duck-core --features testing --locked --test budget -- --ignored i37_rss_bounded_256_pending
+        env:
+          ATLAS_DUCK_BIG_TESTS: "1"
 
       - name: Audit OS keychain tests (Windows Credential Manager, RF-3a)
         if: runner.os == 'Windows'
@@ -331,6 +346,9 @@ jobs:
       - name: Workspace dependency rule (§2.2)
         run: node ci/check-workspace.mjs
 
+      - name: No panic macros in core, atlassian, audit; cover-minting tripwire (§7.7)
+        run: node ci/check-no-panic-macros.mjs
+
       - name: CI script tests
         run: node --test "ci/*.test.mjs"
 
@@ -424,6 +442,9 @@ jobs:
 
       - name: Test x86_64-apple-darwin (test binaries run under Rosetta)
         run: cargo test --workspace --locked --target x86_64-apple-darwin
+
+      - name: M3 suite x86_64-apple-darwin (atlassian + core, test-only features)
+        run: cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --target x86_64-apple-darwin
 
       - name: Audit OS keychain tests (macOS login keychain, x86_64 under Rosetta)
         run: cargo test -p atlas-duck-audit --test os_keystore --locked --target x86_64-apple-darwin -- --ignored --test-threads=1 --nocapture
@@ -698,6 +719,66 @@ jobs:
               fi
               /w/probe_evidence --nocapture --test-threads=1
             '
+
+  core-suite-fedora:
+    name: core-suite-fedora (M3 integration suite on Fedora 40, glibc 2.39, CI-02)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: core-suite-fedora
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Build the M3 test binaries on ubuntu-22.04
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --no-run --message-format=json > "$RUNNER_TEMP/build.json"
+          dir="$RUNNER_TEMP/fedora-suite"
+          mkdir -p "$dir"
+          node -e '
+            const fs = require("fs");
+            const [json, dir] = process.argv.slice(1);
+            const seen = new Set();
+            for (const line of fs.readFileSync(json, "utf8").split("\n")) {
+              let m;
+              try { m = JSON.parse(line); } catch { continue; }
+              if (m.reason !== "compiler-artifact" || !m.executable || !m.profile || m.profile.test !== true) continue;
+              const pkg = /(?:^|[\/#])atlas-duck-(atlassian|core)(?:@|$)/.exec(m.package_id);
+              if (!pkg || seen.has(m.executable)) continue;
+              seen.add(m.executable);
+              fs.copyFileSync(m.executable, dir + "/" + pkg[1] + "-" + require("path").basename(m.executable));
+            }
+            console.log(seen.size + " test executables");
+            if (seen.size === 0) process.exit(1);
+          ' "$RUNNER_TEMP/build.json" "$dir"
+          ls -l "$dir"
+
+      - name: Run the M3 suite on Fedora 40
+        run: |
+          set -euo pipefail
+          # The platform verifier wants OS roots even where a test uses a custom CA or plain http.
+          docker run --rm -v "$RUNNER_TEMP/fedora-suite:/w:ro" fedora:40 sh -c '
+            set -e
+            echo "RUNNER_FACT $(rpm -q glibc) on kernel $(uname -r)"
+            dnf install -y ca-certificates > /tmp/dnf.log 2>&1 || { cat /tmp/dnf.log; exit 1; }
+            for t in /w/*; do
+              echo "== $t"
+              "$t" --test-threads=4
+            done
+          '
 
   supply-chain:
     name: supply-chain (cargo-deny, cargo-audit)
