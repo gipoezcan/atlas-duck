@@ -21,6 +21,11 @@
     )
 )]
 
+// T21 review m-1: `testing` opens the crypto, recovery and schema internals; a release build
+// must never carry it.
+#[cfg(all(feature = "testing", not(debug_assertions)))]
+compile_error!("testing must never reach a release build");
+
 pub mod lock;
 
 pub mod admission;

@@ -33,7 +33,13 @@ path = "src/bin/atlas-duck-sandbox.rs"
 # plain http to the mock). `lib.rs` refuses to compile it into a release build, it is in no default
 # feature, and `ci/check-workspace.mjs` allows only this feature (and the crates' own `testing`) to
 # forward the test-only features below.
-scripted-approver = ["atlas-duck-ipc/test-paths", "atlas-duck-cli/test-env", "atlas-duck-core/testing"]
+scripted-approver = [
+    "atlas-duck-ipc/test-paths",
+    "atlas-duck-cli/test-env",
+    "atlas-duck-core/testing",
+    # The V12 marker (`WaitForSingleObject`) in `testing::control`.
+    "windows-sys/Win32_System_Threading",
+]
 
 [build-dependencies]
 tauri-build = { workspace = true }
@@ -69,9 +75,6 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_System_ErrorReporting",
-    # `scripted-approver`'s V12 marker (`WaitForSingleObject`); a dependency feature cannot be
-    # tied to a cargo feature, the call itself is compiled only with it.
-    "Win32_System_Threading",
     "Win32_System_Time",
 ] }
 

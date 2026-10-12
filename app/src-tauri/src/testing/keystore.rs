@@ -147,7 +147,7 @@ impl KeyStore for FileKeyStore {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
         .recursive(true)
@@ -156,7 +156,7 @@ fn create_private_dir(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> io::Result<()> {
+pub(super) fn create_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)
 }
 

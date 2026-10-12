@@ -518,7 +518,18 @@ mod tests {
         assert_eq!(count(&write_events, EventType::WRITE_APPROVED), 1);
         let held_events = h.events(&held).await?;
         assert_eq!(count(&held_events, EventType::PREVIEW_SHOWN), 0);
-        for events in [&read_events, &write_events, &held_events] {
+        // T21 review m-4: a deny never hits an invalid state either.
+        let denied_events = h.events(&denied).await?;
+        let denied_details_events = h.events(&denied_details).await?;
+        let held_write_events = h.events(&held_write).await?;
+        for events in [
+            &read_events,
+            &write_events,
+            &held_events,
+            &denied_events,
+            &denied_details_events,
+            &held_write_events,
+        ] {
             assert_eq!(count(events, EventType::DECISION_INVALID), 0);
         }
         app.abort();

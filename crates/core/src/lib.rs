@@ -4,6 +4,11 @@
 //! Depends on `registry`, `atlassian`, `convert`, `preview`, `audit` and `ipc`
 //! (§2.2). `clippy::unwrap_used` and `clippy::expect_used` are errors here (§7.7).
 
+// T21 review m-1: `testing` carries the test doubles and the test hooks; a release build must
+// never carry it.
+#[cfg(all(feature = "testing", not(debug_assertions)))]
+compile_error!("testing must never reach a release build");
+
 /// The one path to the audit store, the committed set behind the audit cover, the date bridge
 /// (§5.1 inv. 1, §8.8, C.3).
 pub mod audit_port;

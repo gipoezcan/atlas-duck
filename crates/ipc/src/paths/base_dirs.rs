@@ -156,7 +156,7 @@ pub fn base_dirs() -> io::Result<BaseDirs> {
 /// PD-01: the variable the `test-paths` feature reads. Nothing else in a
 /// build without the feature reads it.
 #[cfg(feature = "test-paths")]
-pub(super) const TEST_HOME_ENV: &str = "ATLAS_DUCK_TEST_HOME";
+pub const TEST_HOME_ENV: &str = "ATLAS_DUCK_TEST_HOME";
 
 /// PD-01 test home: `Some(H)` when `ATLAS_DUCK_TEST_HOME` is set to an
 /// absolute existing directory `H`, `None` when it is unset. Any other

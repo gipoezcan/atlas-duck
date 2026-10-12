@@ -335,6 +335,40 @@ test('missing panic = "abort" in [profile.release] is a violation', () => {
   }
 });
 
+test("debug-assertions in [profile.release] or a release package override is a violation", () => {
+  const bad = (section) =>
+    `workspace Cargo.toml: [${section}] must not set debug-assertions (T21 I-2: it defeats the release locks of the test-only features)`;
+  const cases = [
+    [ROOT_OK.replace('panic = "abort"', 'panic = "abort"\ndebug-assertions = true'), ["profile.release"]],
+    [`${ROOT_OK}
+[profile.release.package.atlas-duck-ipc]
+debug-assertions = true
+`, ["profile.release.package.atlas-duck-ipc"]],
+    [`${ROOT_OK}
+[profile.release.package."*"]
+debug-assertions = true
+`, ['profile.release.package."*"']],
+    [`${ROOT_OK}
+[profile.release.build-override]
+debug-assertions = true
+`, ["profile.release.build-override"]],
+    [ROOT_OK.replace('panic = "abort"', 'panic = "abort"\npackage.x.debug-assertions = true'), ["profile.release"]],
+  ];
+  for (const [root, sections] of cases) {
+    assert.deepEqual(checkManifests(manifests({ root })), sections.map(bad));
+  }
+  // false is fine, and so is debug-assertions in the dev profile.
+  for (const root of [
+    ROOT_OK.replace('panic = "abort"', 'panic = "abort"\ndebug-assertions = false'),
+    `${ROOT_OK}
+[profile.dev]
+debug-assertions = true
+`,
+  ]) {
+    assert.deepEqual(checkManifests(manifests({ root })), []);
+  }
+});
+
 for (const pkg of ["atlas-duck-core", "atlas-duck-atlassian"]) {
   for (const lint of ["unwrap_used", "expect_used"]) {
     test(`${pkg} without ${lint} = "deny" is a violation`, () => {

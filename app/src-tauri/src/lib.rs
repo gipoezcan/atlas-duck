@@ -32,6 +32,9 @@ use crate::state::{AppState, DataDirHold, ServeSlot};
 /// `main.rs`, before this call) -> diagnostic log -> Tauri builder -> in `setup`: the
 /// startup gate (pinned file -> data-dir check -> `instance.lock`).
 pub fn run_gui(background: bool) -> ! {
+    // T21 review I-1: the test build never starts against the real home, store or keychain.
+    #[cfg(feature = "scripted-approver")]
+    testing::require_test_home();
     // §7.7: metadata-only diagnostic log, buffered in memory until the gate attaches the
     // checked data dir; payload-free panic hook.
     let diag = diag::Diag::init();

@@ -14,6 +14,10 @@ mod pinned;
 mod resolve;
 
 pub use base_dirs::{BaseDirs, FirstRunDefaults, base_dirs, first_run_defaults};
+// T21 review I-1: exists only with `test-paths`, so the app's test build fails to compile if the
+// feature is not forwarded.
+#[cfg(feature = "test-paths")]
+pub use base_dirs::TEST_HOME_ENV;
 #[cfg(windows)]
 pub use endpoint::current_user_sid_string;
 #[cfg(all(unix, feature = "async"))]

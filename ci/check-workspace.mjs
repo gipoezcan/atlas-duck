@@ -383,6 +383,18 @@ export function checkManifests({ root, members }) {
   if (panic !== '"abort"' && panic !== "'abort'") {
     violations.push('workspace Cargo.toml: [profile.release] must set panic = "abort" (§7.7)');
   }
+  // T21 review I-2: `debug-assertions` in a release profile would let the test-only features
+  // (their `compile_error!` locks key on `not(debug_assertions)`) into a shipped build.
+  for (const [section, keys] of rootToml) {
+    if (section !== "profile.release" && !section.startsWith("profile.release.")) continue;
+    for (const [key, value] of keys) {
+      if (key.split(".").pop() === "debug-assertions" && value !== "false") {
+        violations.push(
+          `workspace Cargo.toml: [${section}] must not set debug-assertions (T21 I-2: it defeats the release locks of the test-only features)`,
+        );
+      }
+    }
+  }
   for (const name of LINT_PACKAGES) {
     const text = members[name];
     if (text === undefined) {

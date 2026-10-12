@@ -24,7 +24,7 @@ use atlas_duck_ipc::server::ShutdownSignal;
 use tauri::{AppHandle, Manager};
 use tokio::task::JoinHandle;
 
-use super::keystore::write_atomic;
+use super::keystore::{create_private_dir, write_atomic};
 use crate::serve;
 use crate::state::ServeSlot;
 
@@ -43,6 +43,8 @@ pub const REFUSED_NONE: &str = "none";
 pub const POLL: Duration = Duration::from_millis(100);
 /// The cap of `delay-startup-ms`.
 pub const MAX_STARTUP_DELAY: Duration = Duration::from_secs(30);
+/// How many failed `refused` writes in a row end the mirror (one warning, no more attempts).
+pub const MAX_REFUSED_WRITE_FAILURES: u32 = 50;
 
 pub const LOG_EVENT_CONTROL_FAILED: &str = "test_control_failed";
 
@@ -85,11 +87,14 @@ impl Control {
 }
 
 async fn run(dir: PathBuf, host: Arc<dyn ControlHost>, poll: Duration) {
-    if fs::create_dir_all(&dir).is_err() || write_env_names(&dir).is_err() {
+    if create_private_dir(&dir).is_err() {
+        tracing::warn!(event = LOG_EVENT_CONTROL_FAILED, reason = "control_dir");
+    } else if write_env_names(&dir).is_err() {
         tracing::warn!(event = LOG_EVENT_CONTROL_FAILED, reason = "env_names");
     }
     let mut quit_sent = false;
     let mut refused_written: Option<Option<u64>> = None;
+    let mut refused_failures = 0u32;
     let mut marker_written = false;
     loop {
         if !quit_sent && dir.join(QUIT_FILE).exists() {
@@ -97,12 +102,16 @@ async fn run(dir: PathBuf, host: Arc<dyn ControlHost>, poll: Duration) {
             host.quit();
         }
         let refused = host.refused();
-        if refused_written != Some(refused) {
+        if refused_written != Some(refused) && refused_failures < MAX_REFUSED_WRITE_FAILURES {
             let text = refused.map_or_else(|| REFUSED_NONE.to_owned(), |n| n.to_string());
             if write_atomic(&dir, REFUSED_FILE, text.as_bytes()).is_ok() {
                 refused_written = Some(refused);
             } else {
-                tracing::warn!(event = LOG_EVENT_CONTROL_FAILED, reason = "refused");
+                refused_failures += 1;
+                // Bounded: after the last attempt one warning, then the mirror stays as it is.
+                if refused_failures == MAX_REFUSED_WRITE_FAILURES {
+                    tracing::warn!(event = LOG_EVENT_CONTROL_FAILED, reason = "refused");
+                }
             }
         }
         if !marker_written && let Some(text) = read_marker_handle(&dir) {
@@ -135,8 +144,11 @@ fn marker_for(value: usize) -> Option<&'static str> {
     use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
     let handle = value as HANDLE;
-    // SAFETY: a zero-timeout wait never blocks and reads nothing through the value; an invalid
-    // handle value fails with `WAIT_FAILED`.
+    // SAFETY: the call never blocks and reads no memory through the value, and an invalid handle
+    // value fails with `WAIT_FAILED`. It is not free of side effects: a zero-timeout wait on a
+    // mutex acquires it, on a semaphore decrements it and on an auto-reset event resets it, and
+    // a value from the caller can collide with one of this process's own handles. Only the test
+    // build calls it, with a manual-reset event the test process created signaled (T25).
     let r = unsafe { WaitForSingleObject(handle, 0) };
     Some(match r {
         WAIT_OBJECT_0 => "signaled",
