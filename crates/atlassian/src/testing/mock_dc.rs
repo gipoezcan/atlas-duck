@@ -1,5 +1,7 @@
 //! `MockDc`: a wiremock server answering like Jira / Confluence Data Center under a context path.
 
+use std::time::Duration;
+
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -190,6 +192,16 @@ impl MockDc {
     /// Any method on `p`: `status` with a JSON body.
     pub async fn json(&self, p: &str, status: u16, body: &str) {
         let t = self.response(status).set_body_raw(body, "application/json");
+        self.mount_any(p, t).await;
+    }
+
+    /// Any method on `p`: `status` with a JSON body, sent `delay` after the request arrived (a
+    /// fetch the test wants to see held in flight).
+    pub async fn json_delayed(&self, p: &str, status: u16, body: &str, delay: Duration) {
+        let t = self
+            .response(status)
+            .set_body_raw(body, "application/json")
+            .set_delay(delay);
         self.mount_any(p, t).await;
     }
 
