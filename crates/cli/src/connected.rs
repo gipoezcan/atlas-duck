@@ -309,6 +309,10 @@ pub(crate) async fn execute(
     deadline: &Deadline,
     connector: &dyn Connector,
 ) -> Envelope {
+    // `doctor` merges the CLI's local checks into the app's answer and exits 0 without it (T17).
+    if matches!(cmd, Command::Doctor) {
+        return crate::doctor::execute(opts, deadline, connector).await;
+    }
     let waits = matches!(
         cmd,
         Command::Op { .. }
@@ -329,7 +333,7 @@ pub(crate) async fn execute(
 }
 
 /// Discover, launch if needed, connect. `Err` is the envelope to print: nothing was queued.
-async fn reach(
+pub(crate) async fn reach(
     connector: &dyn Connector,
     opts: &GlobalOpts,
     deadline: &Deadline,
@@ -491,9 +495,8 @@ async fn run(
             };
             short_call(client, method::OPS_DESCRIBE, params, deadline).await
         }
-        // Task 17 merges the CLI's local checks into the app's answer.
-        Command::Doctor => short_call(client, method::DOCTOR, EmptyParams {}, deadline).await,
-        Command::Help { .. } | Command::NotInThisBuild(_) => {
+        // `doctor` is answered by `doctor::execute` before the flow starts.
+        Command::Doctor | Command::Help { .. } | Command::NotInThisBuild(_) => {
             Envelope::failed(ErrorCode::Internal, false, MSG_NOT_CONNECTED)
         }
     }
@@ -532,7 +535,7 @@ fn script_params(
     params
 }
 
-async fn short_call<P: Serialize>(
+pub(crate) async fn short_call<P: Serialize>(
     client: &mut IpcClient,
     name: &str,
     params: P,

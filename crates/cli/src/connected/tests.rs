@@ -444,7 +444,6 @@ async fn status_cancel_requests_instances_methods() {
             },
             "ops.describe",
         ),
-        (Command::Doctor, "doctor"),
     ];
     for (cmd, expected) in cases {
         let (env, exit) = run(&cmd, &opts(), &d, &connector).await;

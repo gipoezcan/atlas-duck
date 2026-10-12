@@ -576,8 +576,6 @@ fn stub_error(e: io::Error, breakaway: Breakaway) -> LaunchError {
 
 /// `doctor` (§4.7): `Some(true)` when this process is in a job that allows no breakaway, so a cold
 /// start depends on the shell-parent path; `None` when the query failed.
-// Task 17 (`doctor`) is the caller.
-#[allow(dead_code)]
 pub(crate) fn job_blocks_breakaway() -> Option<bool> {
     job_breakaway().blocks()
 }

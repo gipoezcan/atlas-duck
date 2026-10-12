@@ -19,6 +19,7 @@ mod busy;
 mod connected;
 mod deadline;
 mod discover;
+mod doctor;
 mod exit;
 mod help;
 mod input;
@@ -267,13 +268,24 @@ mod tests {
             &["ops", "describe", "jira.issue.get", "--instance", "x"],
             &["instances"],
             &["status", "req_1"],
-            &["doctor"],
         ] {
             let (o, calls) = go(args);
             assert_eq!(calls, 1, "{args:?}");
             assert_eq!(code(&o), Some(ErrorCode::ServerIdentity));
             assert_eq!(o.exit, 5);
         }
+    }
+
+    #[test]
+    fn doctor_exits_0_with_the_local_checks_when_the_app_is_unreachable() {
+        let (o, calls) = go(&["doctor"]);
+        assert_eq!(calls, 1);
+        assert_eq!(o.exit, 0);
+        assert_eq!(o.env.status, Status::Succeeded);
+        let data = o.env.data.unwrap_or(Value::Null);
+        assert!(data["local"].is_object());
+        assert_eq!(data["app"], Value::Null);
+        assert_eq!(data["app_unavailable"]["code"], "server_identity");
     }
 
     #[test]
