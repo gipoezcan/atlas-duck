@@ -881,8 +881,9 @@ async fn s02_kill_on_job_close_job() -> Result<()> {
 
 // ---- S-01: a squatter pipe gets nothing (Windows) ---------------------------------------------------
 
-/// A pipe of the test's own under this user's SID prefix, named in `<data>/endpoint` (one line,
-/// no newline, PD-26), served on a task that accepts one client and reads from it.
+/// A pipe of the test's own under this user's SID prefix, with the app's descriptor (`PipeSecurity`),
+/// named in `<data>/endpoint` (one line, no newline, PD-26), served on a task that accepts one
+/// client and reads from it.
 #[cfg(windows)]
 struct Squatter {
     name: String,
@@ -910,6 +911,7 @@ fn squat(world: &World, first_only: bool) -> Result<Squatter> {
         DataDirResolution, EndpointLocation, check_data_dir, endpoint_location, write_endpoint_file,
     };
     use atlas_duck_ipc::transport::windows::new_pipe_name;
+    use atlas_duck_ipc::transport::windows::security::PipeSecurity;
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let DataDirResolution::Local(data) = check_data_dir(world.data_dir())? else {
@@ -920,11 +922,19 @@ fn squat(world: &World, first_only: bool) -> Result<Squatter> {
         return Err("no pipe prefix on Windows".into());
     };
     let name = new_pipe_name(&prefix)?;
-    // A plain pipe: default descriptor, owned by this user (only the CLI's forced check refuses
-    // it).
-    let mut server = ServerOptions::new()
-        .first_pipe_instance(true)
-        .create(&name)?;
+    // The app's own descriptor (owner = this user's SID), so the CLI's real check accepts the pipe
+    // and only the forced check refuses it. Not the default descriptor: the check wants the pipe's
+    // owner to be the user SID too, and a pipe an elevated administrator creates (the CI runner)
+    // is owned by BUILTIN\Administrators by default.
+    let security = PipeSecurity::for_current_user()?;
+    let mut attrs = security.attributes();
+    // SAFETY: `attrs` is a valid SECURITY_ATTRIBUTES whose descriptor lives in `security`,
+    // borrowed for the whole call; CreateNamedPipeW copies it.
+    let mut server = unsafe {
+        ServerOptions::new()
+            .first_pipe_instance(true)
+            .create_with_security_attributes_raw(&name, (&raw mut attrs).cast())
+    }?;
     write_endpoint_file(&data, &name)?;
     let task = tokio::spawn(async move {
         server.connect().await?;
@@ -964,7 +974,9 @@ async fn squatter_bytes(s: Squatter, what: &str) -> Result<(Vec<u8>, Ending)> {
 
 /// S-01 (§3.2 (a), §13 "simulated"): an endpoint whose server another account created. The test
 /// creates its own pipe under this user's SID prefix (so discovery accepts the name and the
-/// liveness probe sees a pipe: no launch) and runs the CLI with
+/// liveness probe sees a pipe: no launch), owned by this user like the app's (so the real check
+/// would accept it: `server_owner_ok` wants the server process's user and the pipe's owner to be
+/// this user), and runs the CLI with
 /// `ATLAS_DUCK_TEST_FORCE_OWNER_MISMATCH=1`, which makes the owner check refuse every server
 /// (`connected.rs`, test builds only). The CLI exits 5 `server_identity`, `retryable: false`, and
 /// the pipe read 0 bytes before the client closed.
@@ -989,17 +1001,21 @@ async fn s01_squatter_pipe_cli_sends_nothing_e2e() -> Result<()> {
     // Control: no hook, the CLI writes into the pipe.
     let control = squat(&world, true)?;
     let child = cli_command(&world, &["instances", "--timeout", "30"], &[]).spawn()?;
-    let (sent, _) = squatter_bytes(control, "control").await?;
+    let (sent, ending) = squatter_bytes(control, "control").await?;
     let r = finish(until_notice(child, "control").await?).await?;
     println!(
-        "S01 control: the CLI without the hook sent {} bytes, then exit {}: {}",
+        "S01 control: the CLI without the hook sent {} bytes (ending {ending:?}), then exit {}: {}",
         sent.len(),
         r.exit,
         r.stdout.trim()
     );
     assert!(
         !sent.is_empty(),
-        "control: the CLI without the hook sent nothing: the case below would prove nothing"
+        "control: the CLI without the hook sent nothing (ending {ending:?}): the case below would \
+         prove nothing\nexit {}\nstdout: {}\nstderr: {}",
+        r.exit,
+        r.stdout.trim(),
+        r.stderr.trim()
     );
 
     // The case: the forced mismatch.
@@ -1011,7 +1027,12 @@ async fn s01_squatter_pipe_cli_sends_nothing_e2e() -> Result<()> {
     )
     .spawn()?;
     let r = finish(until_notice(child, "squatter").await?).await?;
-    let what = format!("squatter (the CLI exited {}: {})", r.exit, r.stdout.trim());
+    let what = format!(
+        "squatter (the CLI exited {}: {}; stderr {})",
+        r.exit,
+        r.stdout.trim(),
+        r.stderr.trim()
+    );
     let (got, ending) = squatter_bytes(squatter, &what).await?;
     println!(
         "S01 squatter_bytes_received={} ending={ending:?}",
@@ -1019,7 +1040,7 @@ async fn s01_squatter_pipe_cli_sends_nothing_e2e() -> Result<()> {
     );
     assert!(
         got.is_empty(),
-        "the CLI sent {} bytes to a server whose owner check failed: {:?}",
+        "the CLI sent {} bytes to a server whose owner check failed: {:?}\n{what}",
         got.len(),
         String::from_utf8_lossy(&got)
     );
