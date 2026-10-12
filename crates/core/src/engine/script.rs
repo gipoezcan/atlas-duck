@@ -1418,6 +1418,7 @@ pub(crate) async fn submit(
     engine: &Arc<Engine>,
     conn: &ConnectionMeta,
     p: SubmitParams,
+    sha_out: &mut Option<String>,
 ) -> Envelope {
     let Some(gate) = engine.enter_submit().await else {
         return GateState::ShuttingDown.envelope();
@@ -1452,6 +1453,7 @@ pub(crate) async fn submit(
     let Ok(request_id) = RequestId::new() else {
         return envelope::internal("no request id could be generated");
     };
+    *sha_out = Some(hex::encode(sha));
     let job = Received {
         sha,
         request_id,

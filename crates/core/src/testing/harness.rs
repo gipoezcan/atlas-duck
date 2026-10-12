@@ -19,7 +19,7 @@ use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::proto::{
     AgentNameSource, AwaitParams, ClientKind, ConnectionMeta, Hello, PeerInfo,
-    ProgressNotification, ProgressSink, RequestHandler, SubmitParams,
+    ProgressNotification, ProgressSink, RequestHandler, SubmitParams, SubmitReply,
 };
 use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
@@ -764,6 +764,24 @@ impl Harness {
         params: Value,
         instance: Option<&str>,
     ) -> Envelope {
+        self.submit_reply_with(conn, op_id, params, instance)
+            .await
+            .envelope
+    }
+
+    /// `submit` on the default connection, with the `params_sha256` of the reply.
+    pub async fn submit_reply(&self, op_id: &str, params: Value) -> SubmitReply {
+        self.submit_reply_with(&self.default_conn, op_id, params, None)
+            .await
+    }
+
+    pub async fn submit_reply_with(
+        &self,
+        conn: &ConnectionMeta,
+        op_id: &str,
+        params: Value,
+        instance: Option<&str>,
+    ) -> SubmitReply {
         self.handler
             .submit(
                 conn,
@@ -775,7 +793,6 @@ impl Harness {
                 },
             )
             .await
-            .envelope
     }
 
     /// `submit_script` on the default connection: `{source, args?, limits?, dry_run?}`.

@@ -113,14 +113,20 @@ pub fn app_start_event(
 /// One `INSTANCE_STATE_CHANGED {state: needs_token}` per instance whose PAT a restore or recovery
 /// deleted (M2 handoff (b), PD-28), in order; stops at the first failure.
 pub fn log_pats_deleted(port: &dyn AuditPort, ids: &[String]) -> Result<(), AuditError> {
-    for id in ids {
-        let mut details = Map::new();
-        details.insert("reason".into(), "pat_deleted".into());
-        port.append(payloads::instance_state_changed(
-            id,
-            "needs_token",
-            &details,
-        ))?;
+    for ev in pats_deleted_events(ids) {
+        port.append(ev)?;
     }
     Ok(())
+}
+
+/// The `needs_token` records of [`log_pats_deleted`], for a caller that commits them together with
+/// other records.
+pub fn pats_deleted_events(ids: &[String]) -> Vec<NewEvent> {
+    ids.iter()
+        .map(|id| {
+            let mut details = Map::new();
+            details.insert("reason".into(), "pat_deleted".into());
+            payloads::instance_state_changed(id, "needs_token", &details)
+        })
+        .collect()
 }

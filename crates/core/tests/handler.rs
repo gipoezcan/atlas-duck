@@ -11,12 +11,14 @@ use std::time::Duration;
 
 use atlas_duck_audit::EventType;
 use atlas_duck_core::ShutdownReason;
+use atlas_duck_core::engine::MAX_SESSIONS;
+use atlas_duck_core::engine::queue::Limits;
 use atlas_duck_core::testing::{FaultPlan, Harness, NoProgress};
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_ipc::proto::{
     AgentNameSource, AwaitParams, ClientKind, ConnectionMeta, Hello, ListState, MatchParams,
-    PeerInfo, ProgressNotification, ProgressSink, SubmitParams,
+    PeerInfo, ProgressNotification, ProgressSink, SubmitParams, params_sha256_hex,
 };
 use common::{TestResult, code, detail, exit, json, request_id};
 use serde_json::{Value, json};
@@ -1134,5 +1136,139 @@ async fn await_bound_is_capped_and_the_reason_excerpt_short() -> TestResult {
     };
     let (env, _) = tokio::join!(waiting, expire);
     assert_eq!(env.status, Status::Expired);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submit_reply_carries_params_sha256() -> TestResult {
+    let h = Harness::jira().await?;
+    let instance_id = h.instance("jira-main").ok_or("no instance")?.id.clone();
+    let params = issue_get("ABC-1");
+    let reply = h.submit_reply("jira.issue.get", params.clone()).await;
+    let want = params_sha256_hex("jira.issue.get", Some(&instance_id), &params)?;
+    assert_eq!(reply.params_sha256.as_deref(), Some(want.as_str()));
+    let id = request_id(&reply.envelope)?;
+    // The same value is in the `requests list` row, never inside the envelope.
+    let list = h.handler().requests_list(None, None, None).await;
+    let rows = json(&list)?["data"]["requests"].clone();
+    let row = rows
+        .as_array()
+        .and_then(|r| r.iter().find(|r| r["request_id"] == id.as_str()))
+        .ok_or("no row")?;
+    assert_eq!(row["params_sha256"], json!(want));
+    assert!(!json(&reply.envelope)?.to_string().contains(&want));
+
+    // A validation reject has a request id, so it has the hash too.
+    let bad = h.submit_reply("jira.issue.get", json!({})).await;
+    assert_eq!(code(&bad.envelope), "validation");
+    assert_eq!(
+        bad.params_sha256.as_deref(),
+        Some(params_sha256_hex("jira.issue.get", Some(&instance_id), &json!({}))?.as_str())
+    );
+
+    // No request id, no hash: a routing refusal (PD-01) ...
+    let none = h
+        .submit_reply("confluence.page.get", json!({ "id": "65537" }))
+        .await;
+    assert_eq!(detail(&none.envelope, "reason"), json!("no_instance"));
+    assert_eq!(none.params_sha256, None);
+    // ... and a script submit gets it too, over `instance_id: null`.
+    let source = json!({ "source": "return 1;" });
+    let reply = h
+        .handler()
+        .submit_script(
+            h.default_conn(),
+            SubmitParams {
+                op_id: "script.run".into(),
+                params: source.clone(),
+                instance: None,
+                reason: None,
+            },
+        )
+        .await;
+    let want = params_sha256_hex("script.run", None, &source)?;
+    assert_eq!(reply.params_sha256.as_deref(), Some(want.as_str()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_reply_has_no_params_sha256() -> TestResult {
+    let limits = Limits {
+        total: 1,
+        ..Limits::default()
+    };
+    let h = Harness::builder()
+        .jira("jira-main")
+        .limits(limits)
+        .start()
+        .await?;
+    let first = h.submit_reply("jira.issue.get", issue_get("ABC-1")).await;
+    assert!(first.params_sha256.is_some());
+    let busy = h.submit_reply("jira.issue.get", issue_get("ABC-2")).await;
+    assert_eq!(code(&busy.envelope), "busy");
+    assert_eq!(busy.params_sha256, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnected_forgets_session() -> TestResult {
+    let h = Harness::jira().await?;
+    let conn_a = h.conn("agent-a").await?;
+    let conn_b = h.conn("agent-b").await?;
+    let id = request_id(
+        &h.submit_with(&conn_a, "jira.issue.get", issue_get("ABC-1"), None)
+            .await,
+    )?;
+    h.handler().disconnected(&conn_a).await;
+    assert!(h.engine().session(&conn_a.connection_id).is_none());
+    assert!(h.engine().session(&conn_b.connection_id).is_some());
+    let env = h
+        .submit_with(&conn_a, "jira.issue.get", issue_get("ABC-2"), None)
+        .await;
+    assert_eq!(code(&env), "protocol_error");
+    // The pending request outlives its connection and can be awaited from another one.
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    let awaited = h
+        .handler()
+        .await_request(
+            &conn_b,
+            AwaitParams {
+                request_id: id.clone(),
+                timeout_ms: Some(0),
+            },
+            &NoProgress,
+        )
+        .await;
+    assert_eq!(awaited.status, Status::Pending);
+    assert_eq!(awaited.request_id.as_deref(), Some(id.as_str()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_map_bounded() -> TestResult {
+    let h = Harness::jira().await?;
+    let hello = || Hello {
+        build_id: BUILD_ID.into(),
+        client_kind: ClientKind::Cli,
+        agent_name: None,
+        agent_name_source: AgentNameSource::None,
+        cwd_basename: "w".into(),
+    };
+    let handler = h.handler();
+    for n in 0..1025 {
+        let conn = ConnectionMeta {
+            connection_id: format!("bounded-{n}"),
+            peer: PeerInfo::default(),
+        };
+        handler
+            .hello(&conn, hello())
+            .await
+            .map_err(|e| e.to_json_line())?;
+    }
+    // The harness's own connection said hello first and is long evicted.
+    assert_eq!(h.engine().session_count(), MAX_SESSIONS);
+    assert!(h.engine().session("bounded-0").is_none());
+    assert!(h.engine().session("bounded-1").is_some());
+    assert!(h.engine().session("bounded-1024").is_some());
     Ok(())
 }

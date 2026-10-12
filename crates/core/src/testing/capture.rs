@@ -131,6 +131,9 @@ impl RequestHandler for CapturingHandler {
     async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply {
         self.reply(self.inner.submit_script(conn, p).await)
     }
+    async fn disconnected(&self, conn: &ConnectionMeta) {
+        self.inner.disconnected(conn).await;
+    }
     async fn await_request(
         &self,
         conn: &ConnectionMeta,

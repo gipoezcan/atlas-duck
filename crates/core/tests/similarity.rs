@@ -358,3 +358,74 @@ async fn rf4_seeding_reads_target_payloads_of_reads_and_writes() -> TestResult {
     assert_eq!(hit(&record(COMMENT, other)?), None);
     Ok(())
 }
+
+/// `HH:MM` of the fake clock's now, shifted by `minutes`.
+fn clock_hhmm(h: &Harness, minutes: i64) -> Result<String, TestError> {
+    let ts = h.clock().now_utc().to_rfc3339_ms();
+    let hour: i64 = ts.get(11..13).ok_or("timestamp")?.parse()?;
+    let min: i64 = ts.get(14..16).ok_or("timestamp")?.parse()?;
+    let total = (hour * 60 + min + minutes).rem_euclid(24 * 60);
+    Ok(format!("{:02}:{:02}", total / 60, total % 60))
+}
+
+async fn similar_text(h: &Harness, id: &str) -> Result<String, TestError> {
+    let preview = h.approver().open(id).map_err(de)?.preview;
+    let w = preview
+        .warnings
+        .iter()
+        .find(|w| w.id == WarningId::SimilarRequest)
+        .ok_or("no similar_request warning")?;
+    Ok(w.text.clone())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn similarity_text_uses_local_offset() -> TestResult {
+    let h = Harness::jira().await?;
+    jira(&h)?
+        .json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let first = queued(&h, h.submit(ISSUE, json!({ "key": "ABC-1" })).await).await?;
+    h.approver().open(&first).map_err(de)?;
+    h.approver().release(&first).map_err(de)?;
+    assert!(h.settled(&first, 10_000).await);
+
+    let second = queued(
+        &h,
+        h.submit(ISSUE, json!({ "key": "ABC-1", "fields": ["summary"] }))
+            .await,
+    )
+    .await?;
+    let utc = similar_text(&h, &second).await?;
+    assert!(utc.starts_with(&format!("similar to {first} ")), "{utc}");
+    assert!(
+        utc.ends_with(&format!("{} UTC", clock_hhmm(&h, 0)?)),
+        "{utc}"
+    );
+
+    // An open request is always reported first: cancel it so the decided one is the hit.
+    h.handler().cancel(&second).await;
+    h.core().set_utc_offset(Some(120));
+    let third = queued(
+        &h,
+        h.submit(ISSUE, json!({ "key": "ABC-1", "fields": ["description"] }))
+            .await,
+    )
+    .await?;
+    let local = similar_text(&h, &third).await?;
+    assert!(
+        local.ends_with(&format!(" {}", clock_hhmm(&h, 120)?)),
+        "{local}"
+    );
+    assert!(!local.contains("UTC"), "{local}");
+
+    h.handler().cancel(&third).await;
+    h.core().set_utc_offset(None);
+    let fourth = queued(
+        &h,
+        h.submit(ISSUE, json!({ "key": "ABC-1", "fields": ["status"] }))
+            .await,
+    )
+    .await?;
+    assert!(similar_text(&h, &fourth).await?.ends_with("UTC"));
+    Ok(())
+}

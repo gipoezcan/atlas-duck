@@ -641,7 +641,14 @@ impl CoreHandler {
         Some((spec.id.to_owned(), id, hash))
     }
 
-    async fn submit_envelope(&self, conn: &ConnectionMeta, p: SubmitParams) -> Envelope {
+    /// `sha_out` receives the hex `params_sha256` once it is computed; the caller keeps it only
+    /// when the envelope carries a request id (Δ1).
+    async fn submit_envelope(
+        &self,
+        conn: &ConnectionMeta,
+        p: SubmitParams,
+        sha_out: &mut Option<String>,
+    ) -> Envelope {
         let engine = &self.engine;
         // 1. §2.5 step 1.
         let Some(gate) = engine.enter_submit().await else {
@@ -686,6 +693,7 @@ impl CoreHandler {
         let Ok(request_id) = RequestId::new() else {
             return envelope::internal("no request id could be generated");
         };
+        *sha_out = Some(hex::encode(sha));
         // From the `REQUEST_RECEIVED` commit on, in its own task, driven to completion even if
         // this future is dropped (a pending request is independent of its connection, §4.4).
         let job = Received {
@@ -704,6 +712,15 @@ impl CoreHandler {
         tokio::spawn(record_and_validate(engine.clone(), job))
             .await
             .unwrap_or_else(|_| envelope::internal("the request task failed"))
+    }
+}
+
+///`Some(sha)` exactly when the envelope carries a request id (Δ1).
+fn reply_of(envelope: Envelope, sha: Option<String>) -> SubmitReply {
+    let params_sha256 = sha.filter(|_| envelope.request_id.is_some());
+    SubmitReply {
+        envelope,
+        params_sha256,
     }
 }
 
@@ -786,17 +803,19 @@ impl RequestHandler for CoreHandler {
     }
 
     async fn submit(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply {
-        SubmitReply {
-            envelope: self.submit_envelope(conn, p).await,
-            params_sha256: None,
-        }
+        let mut sha = None;
+        let envelope = self.submit_envelope(conn, p, &mut sha).await;
+        reply_of(envelope, sha)
     }
 
     async fn submit_script(&self, conn: &ConnectionMeta, p: SubmitParams) -> SubmitReply {
-        SubmitReply {
-            envelope: script::submit(&self.engine, conn, p).await,
-            params_sha256: None,
-        }
+        let mut sha = None;
+        let envelope = script::submit(&self.engine, conn, p, &mut sha).await;
+        reply_of(envelope, sha)
+    }
+
+    async fn disconnected(&self, conn: &ConnectionMeta) {
+        self.engine.forget_session(&conn.connection_id);
     }
 
     async fn await_request(

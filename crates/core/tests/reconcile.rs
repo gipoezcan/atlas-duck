@@ -152,6 +152,7 @@ async fn types(h: &Harness, id: &str) -> Result<Vec<EventType>, TestError> {
 async fn start_order_and_pats_deleted() -> TestResult {
     let plan = FaultPlan::new();
     plan.record_trail(true);
+    plan.record_appends(true);
     let gone = ["ins_gone_a".to_owned(), "ins_gone_b".to_owned()];
     let h = Harness::builder()
         .jira("jira-main")
@@ -167,6 +168,21 @@ async fn start_order_and_pats_deleted() -> TestResult {
             "append:APP_START",
             "append:INSTANCE_STATE_CHANGED",
             "append:INSTANCE_STATE_CHANGED",
+        ]
+    );
+    // One audit transaction (M3 review M-7).
+    let calls = plan.appends();
+    assert_eq!(
+        calls.len(),
+        1,
+        "APP_START and the needs_token records are one batch"
+    );
+    assert_eq!(
+        calls[0].iter().map(|e| e.event_type).collect::<Vec<_>>(),
+        [
+            EventType::APP_START,
+            EventType::INSTANCE_STATE_CHANGED,
+            EventType::INSTANCE_STATE_CHANGED,
         ]
     );
     let headers = h.store().recent_headers(Duration::from_secs(3600))?;
@@ -198,6 +214,46 @@ async fn start_order_and_pats_deleted() -> TestResult {
         states.iter().all(|p| p["state"] == "needs_token"),
         "{states:?}"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_start_and_needs_token_one_batch() -> TestResult {
+    // A failing batch: the start fails and neither record was committed.
+    let plan = FaultPlan::new();
+    plan.record_appends(true);
+    plan.fail_nth(EventType::INSTANCE_STATE_CHANGED, 1);
+    let started = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .pats_deleted(vec!["ins_gone_a".to_owned()])
+        .start()
+        .await;
+    let err = started.err().ok_or("the start must fail")?;
+    assert!(
+        matches!(
+            err.downcast_ref::<atlas_duck_core::StartError>(),
+            Some(atlas_duck_core::StartError::Audit(_))
+        ),
+        "{err}"
+    );
+    assert_eq!(plan.attempts(EventType::APP_START), 1);
+    assert!(plan.appends().is_empty(), "nothing was committed");
+
+    // Without the fault both are consecutive records.
+    let h = Harness::builder()
+        .jira("jira-main")
+        .pats_deleted(vec!["ins_gone_a".to_owned()])
+        .start()
+        .await?;
+    let headers = h.store().recent_headers(Duration::from_secs(3600))?;
+    let at = headers
+        .iter()
+        .position(|e| e.event_type == EventType::APP_START)
+        .ok_or("no APP_START")?;
+    let next = headers.get(at + 1).ok_or("no record after APP_START")?;
+    assert_eq!(next.event_type, EventType::INSTANCE_STATE_CHANGED);
+    assert_eq!(next.seq, headers[at].seq + 1);
     Ok(())
 }
 

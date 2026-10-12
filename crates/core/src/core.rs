@@ -328,8 +328,8 @@ impl Core {
             engine,
         };
         // Step 6 (PD-21): `APP_START` with the install id in `target`; then step 7 (PD-28): one
-        // `needs_token` record per PAT a restore or recovery deleted. The start fails if the log
-        // cannot take them: nothing is served that the log does not know about.
+        // `needs_token` record per PAT a restore or recovery deleted, in the same batch. The start
+        // fails if the log cannot take them: nothing is served that the log does not know about.
         let proxies = core.effective_proxies().await;
         let start = crate::reconcile::app_start_event(
             &install_id,
@@ -342,8 +342,10 @@ impl Core {
         );
         core.engine
             .blocking(move |p| {
-                p.append(start)?;
-                crate::reconcile::log_pats_deleted(p, &pats_deleted)
+                // One transaction (M3 review M-7): all or nothing.
+                let mut records = vec![start];
+                records.extend(crate::reconcile::pats_deleted_events(&pats_deleted));
+                p.append_batch(records).map(drop)
             })
             .await
             .map_err(StartError::Audit)?;
@@ -381,6 +383,11 @@ impl Core {
 
     pub fn instances(&self) -> Arc<dyn InstanceAdmin> {
         self.instances.clone()
+    }
+
+    /// The local UTC offset in minutes the similarity notice text uses (Δ6); `None` is UTC.
+    pub fn set_utc_offset(&self, minutes: Option<i32>) {
+        self.engine.similarity().set_utc_offset(minutes);
     }
 
     /// Tests only: the engine's internals (audit port, covers) are not part of the app surface.

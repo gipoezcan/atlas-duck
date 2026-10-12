@@ -575,6 +575,38 @@ impl<V: Clone> Recent<V> {
 /// How many terminal answers / list rows are memoized.
 const RECENT_MEMO: usize = 4096;
 
+/// The most hello sessions the engine remembers; the oldest is evicted beyond it. A submit on an
+/// evicted connection is answered like one without a hello.
+pub const MAX_SESSIONS: usize = 1024;
+
+/// The hello sessions by `connection_id`, with their insertion order for the eviction.
+#[derive(Default)]
+struct Sessions {
+    map: HashMap<String, Session>,
+    order: VecDeque<String>,
+}
+
+impl Sessions {
+    fn insert(&mut self, connection_id: &str, session: Session) {
+        if self.map.insert(connection_id.to_owned(), session).is_some() {
+            return;
+        }
+        self.order.push_back(connection_id.to_owned());
+        while self.map.len() > MAX_SESSIONS {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.map.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, connection_id: &str) {
+        if self.map.remove(connection_id).is_some() {
+            self.order.retain(|k| k != connection_id);
+        }
+    }
+}
+
 pub struct Engine {
     port: Arc<dyn AuditPort>,
     committed: Arc<CommittedSet>,
@@ -585,9 +617,9 @@ pub struct Engine {
     clock: Arc<dyn Clock>,
     ui: Arc<dyn UiSink>,
     instances: RwLock<InstanceTable>,
-    /// By `connection_id`. M4 owns connection lifetimes; the handler trait has no disconnect
-    /// call yet, so entries live as long as the core (handoff to M4).
-    sessions: Mutex<HashMap<String, Session>>,
+    /// By `connection_id`; the IPC server calls `disconnected` per closed connection, and
+    /// `MAX_SESSIONS` bounds the map as a backstop (oldest evicted).
+    sessions: Mutex<Sessions>,
     entries: RwLock<HashMap<String, Arc<RequestEntry>>>,
     shutting_down: AtomicBool,
     /// Submits hold the read side from their shutdown check until their request is registered;
@@ -639,7 +671,7 @@ impl Engine {
             clock: d.clock,
             ui: d.ui,
             instances: RwLock::new(d.instances),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(Sessions::default()),
             entries: RwLock::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
             submit_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -953,11 +985,20 @@ impl Engine {
     }
 
     pub(crate) fn remember_session(&self, connection_id: &str, session: Session) {
-        lock(&self.sessions).insert(connection_id.to_owned(), session);
+        lock(&self.sessions).insert(connection_id, session);
+    }
+
+    pub(crate) fn forget_session(&self, connection_id: &str) {
+        lock(&self.sessions).remove(connection_id);
     }
 
     pub fn session(&self, connection_id: &str) -> Option<Session> {
-        lock(&self.sessions).get(connection_id).cloned()
+        lock(&self.sessions).map.get(connection_id).cloned()
+    }
+
+    /// The number of remembered hello sessions (at most [`MAX_SESSIONS`]).
+    pub fn session_count(&self) -> usize {
+        lock(&self.sessions).map.len()
     }
 
     pub fn entry(&self, request_id: &str) -> Option<Arc<RequestEntry>> {
@@ -1277,7 +1318,9 @@ impl Engine {
             entry.set_fetch_control(None);
             // A request that ended while its worker lives (an append that failed, §11.1) takes
             // the worker with it; a run that ended already is not killed again.
-            if let Some(shared) = entry.state().script.as_ref().and_then(|s| s.shared.clone()) {
+            // The state guard is dropped before the kill call (M3 final review M-1).
+            let shared = entry.state().script.as_ref().and_then(|s| s.shared.clone());
+            if let Some(shared) = shared {
                 shared.request_kill(script::KillReason::AuditFailure);
             }
             self.candidates.remove(&entry.head.request_id);
