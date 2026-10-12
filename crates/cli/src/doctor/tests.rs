@@ -497,3 +497,36 @@ async fn doctor_interrupt_during_launch_is_handled_and_exits_0() {
     assert_eq!(data["app_unavailable"]["reason"], json!("launch_timeout"));
     assert!(data["local"].is_object());
 }
+
+#[tokio::test]
+async fn doctor_interrupt_during_the_app_call_ends_it_and_exits_0() {
+    // The handlers stay installed after registration, so Ctrl-C must end the call itself.
+    let mut fake = Fake::new();
+    fake.doctor_delay = Duration::from_secs(30);
+    let fake = Arc::new(fake);
+    let running: Running = serve(&fake).await;
+    let inner = TestConnector::new(running.data.clone(), Mode::Server(running.location.clone()));
+    let interrupt = inner.interrupt.clone();
+    let c = Wrapped {
+        inner,
+        discovery: discovery(
+            DataState::Local(running.data.clone()),
+            AppLocation::NotFound,
+        ),
+    };
+    let seen = fake.clone();
+    tokio::spawn(async move {
+        seen.wait_for(crate::test_support::Kind::Doctor, 1).await;
+        interrupt.notify_one();
+    });
+    let started = Instant::now();
+    let env = execute_with(&opts(), &within(20_000), &c, &FakeSys::new()).await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(env.status, Status::Succeeded);
+    assert_eq!(exit_for(&Command::Doctor, &env), 0);
+    let data = data_obj(&env);
+    assert_eq!(data["app"], Value::Null);
+    assert_eq!(data["app_unavailable"]["reason"], json!("launch_timeout"));
+    assert!(data["local"].is_object());
+    running.stop().await;
+}

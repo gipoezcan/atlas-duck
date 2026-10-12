@@ -592,18 +592,23 @@ pub(crate) async fn short_call<P: Serialize>(
     params: P,
     deadline: &Deadline,
 ) -> Envelope {
-    match guarded(
-        client.call::<Envelope>(name, params),
-        bound(deadline),
-        &mut Never,
-    )
-    .await
-    {
+    short_call_guarded(client, name, params, deadline, &mut Never).await
+}
+
+/// [`short_call`] that an interrupt ends too (`doctor`, whose handlers stay installed once
+/// registered): the shape is the launch phase's, nothing was queued.
+pub(crate) async fn short_call_guarded<P: Serialize>(
+    client: &mut IpcClient,
+    name: &str,
+    params: P,
+    deadline: &Deadline,
+    intr: &mut dyn Interrupts,
+) -> Envelope {
+    match guarded(client.call::<Envelope>(name, params), bound(deadline), intr).await {
         Wait::Done(Ok(env)) => env,
         Wait::Done(Err(e)) => short_error(e),
-        Wait::TimedOut | Wait::Interrupted => {
-            *launch::unreachable(launch::REASON_LAUNCH_TIMEOUT, MSG_DEADLINE_SHORT)
-        }
+        Wait::Interrupted => *launch::launch_timeout(),
+        Wait::TimedOut => *launch::unreachable(launch::REASON_LAUNCH_TIMEOUT, MSG_DEADLINE_SHORT),
     }
 }
 

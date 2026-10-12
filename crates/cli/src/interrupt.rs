@@ -3,7 +3,9 @@
 //! `Guard` registers the process's interrupt handlers (Unix: SIGINT, SIGTERM, SIGHUP; Windows:
 //! Ctrl-C, Ctrl-Break, console close) and, on Unix, also treats a hung-up stdout as an interrupt
 //! (polled every 500 ms). Handlers exist only for the commands that wait (`op`, `call`,
-//! `script run`, `await`): the short calls keep the default signal behaviour. An interrupt never
+//! `script run`, `await`) and `doctor`: the other short calls keep the default signal behaviour.
+//! Once registered, tokio keeps the handlers for the process lifetime, so a command that
+//! installs them must keep listening. An interrupt never
 //! cancels a request; what is printed instead is decided by `connected`. On Unix a signal that was
 //! ignored when the process started (`nohup` for SIGHUP, a backgrounded job's SIGINT) stays
 //! ignored: the user asked for that.

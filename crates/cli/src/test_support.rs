@@ -70,6 +70,7 @@ pub(crate) struct Fake {
     pub submit_status: Status,
     pub submit_delay: Duration,
     pub await_delay: Duration,
+    pub doctor_delay: Duration,
 }
 
 impl Fake {
@@ -82,6 +83,7 @@ impl Fake {
             submit_status: Status::Pending,
             submit_delay: Duration::ZERO,
             await_delay: Duration::ZERO,
+            doctor_delay: Duration::ZERO,
         }
     }
 
@@ -245,6 +247,7 @@ impl RequestHandler for Fake {
 
     async fn doctor(&self) -> Envelope {
         self.record(Kind::Doctor, None);
+        tokio::time::sleep(self.doctor_delay).await;
         Fake::answer("doctor")
     }
 }
