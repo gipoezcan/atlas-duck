@@ -98,11 +98,22 @@ pub async fn start_core(i: CoreInputs) -> Result<Core, ComposeError> {
 /// The UTC offset of the local time zone in minutes east of UTC, `None` when the OS cannot say
 /// (the notice text then falls back to UTC).
 pub fn local_utc_offset_minutes() -> Option<i32> {
+    read_utc_offset(false)
+}
+
+/// `refresh` re-reads the zone setting first (Unix only: glibc's `localtime_r` does not re-read
+/// it on each call). Only the offset updater thread passes `true`: `tzset` races with `setenv`
+/// elsewhere, so it must not run from any other thread.
+fn read_utc_offset(refresh: bool) -> Option<i32> {
     #[cfg(unix)]
     {
-        // SAFETY: `time(NULL)` has no preconditions; `localtime_r` writes only to the zeroed
-        // `tm` it is given and reads the `time_t` by pointer.
+        // SAFETY: `tzset` takes no arguments (see the single-thread caveat above); `time(NULL)`
+        // has no preconditions; `localtime_r` writes only to the zeroed `tm` it is given and
+        // reads the `time_t` by pointer.
         unsafe {
+            if refresh {
+                libc::tzset();
+            }
             let now = libc::time(std::ptr::null_mut());
             let mut tm: libc::tm = std::mem::zeroed();
             if libc::localtime_r(&now, &mut tm).is_null() {
@@ -113,6 +124,7 @@ pub fn local_utc_offset_minutes() -> Option<i32> {
     }
     #[cfg(windows)]
     {
+        let _ = refresh;
         use windows_sys::Win32::System::Time::{GetTimeZoneInformation, TIME_ZONE_INFORMATION};
         // SAFETY: an all-zero TIME_ZONE_INFORMATION is a valid out-value for the call.
         let (id, tzi) = unsafe {
@@ -123,6 +135,7 @@ pub fn local_utc_offset_minutes() -> Option<i32> {
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = refresh;
         None
     }
 }
@@ -150,10 +163,17 @@ fn windows_offset(id: u32, bias: i32, standard_bias: i32, daylight_bias: i32) ->
 /// How often the offset is read again (DST changes while the app runs).
 pub const OFFSET_REFRESH: Duration = Duration::from_secs(3600);
 
+/// The offset to hand to the core for a new reading, `None` when nothing is to be set: a failed
+/// reading keeps the previous offset, an unchanged one needs no call.
+fn offset_to_apply(last: Option<i32>, reading: Option<i32>) -> Option<i32> {
+    reading.filter(|v| Some(*v) != last)
+}
+
 /// Sets the offset now and then every hour (PD-32). The thread holds the core weakly: it ends
-/// at the first wake-up after the core is gone.
+/// at the first wake-up after the core is gone. A failed reading never replaces a good offset.
 pub fn spawn_offset_updater(core: Arc<Core>) {
-    core.set_utc_offset(local_utc_offset_minutes());
+    let mut last = local_utc_offset_minutes();
+    core.set_utc_offset(last);
     let weak: Weak<Core> = Arc::downgrade(&core);
     drop(core);
     let spawned = std::thread::Builder::new()
@@ -161,9 +181,11 @@ pub fn spawn_offset_updater(core: Arc<Core>) {
         .spawn(move || {
             loop {
                 std::thread::sleep(OFFSET_REFRESH);
-                match weak.upgrade() {
-                    Some(core) => core.set_utc_offset(local_utc_offset_minutes()),
-                    None => return,
+                let Some(core) = weak.upgrade() else { return };
+                let reading = read_utc_offset(true);
+                if let Some(v) = offset_to_apply(last, reading) {
+                    core.set_utc_offset(Some(v));
+                    last = Some(v);
                 }
             }
         });
@@ -301,6 +323,18 @@ mod tests {
         if let Some(m) = local_utc_offset_minutes() {
             assert!((-14 * 60..=14 * 60).contains(&m), "{m}");
         }
+    }
+
+    #[test]
+    fn offset_update_decision() {
+        // A failed reading keeps the previous offset, whatever it was.
+        assert_eq!(offset_to_apply(Some(60), None), None);
+        assert_eq!(offset_to_apply(None, None), None);
+        // The same value needs no call.
+        assert_eq!(offset_to_apply(Some(60), Some(60)), None);
+        // A changed value, or a first good one, is applied.
+        assert_eq!(offset_to_apply(Some(60), Some(120)), Some(120));
+        assert_eq!(offset_to_apply(None, Some(0)), Some(0));
     }
 
     #[test]
