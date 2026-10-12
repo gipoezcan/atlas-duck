@@ -1159,14 +1159,23 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
         }
     }
     assert_busy(&h.submit(ISSUE, issue("ABC-1")).await)?;
+    eprintln!(
+        "i37: {} reads admitted in {:?}, RSS {} MiB",
+        ids.len(),
+        started.elapsed(),
+        rss_bytes().unwrap_or(0) / MIB
+    );
     // Sample until every read waits for release. The memory check counts only once all 256
     // candidates exist: a read still outside the queue at the deadline fails the test (the run
     // takes a few minutes in a debug build; the deadline is a safety net, not the end condition).
     // The queue is read past the harness's capture, which would keep every answer (a growing
     // list four times a second) in this process's heap.
     let queue = h.core().decisions();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+    // 1500 s: a quiet CI runner needs ~250-550 s (debug build); a loaded one took 610 s and failed
+    // a 600 s deadline with 235 of 256 reads queued at a steady rate, not a stall.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1500);
     let mut queued = 0;
+    let mut reported = 0;
     while queued < ids.len() {
         assert!(
             tokio::time::Instant::now() <= deadline,
@@ -1177,6 +1186,18 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
         tokio::time::sleep(Duration::from_millis(250)).await;
         peak = peak.max(rss_bytes().unwrap_or(0));
         queued = queue.queue_list().len();
+        // A line per 32 queued reads (the pace and memory at each checkpoint, for slow runners).
+        if queued >= reported + 32 || (queued == ids.len() && queued > reported) {
+            reported = queued;
+            eprintln!(
+                "i37: {queued} of {} queued at {:?}, RSS {} MiB (peak {} MiB), live heap peak {} MiB",
+                ids.len(),
+                started.elapsed(),
+                rss_bytes().unwrap_or(0) / MIB,
+                peak / MIB,
+                heap::peak() / MIB
+            );
+        }
     }
     peak = peak.max(rss_bytes().unwrap_or(0));
     assert!(h.engine().candidates().bytes() <= cache_mb * MIB);
