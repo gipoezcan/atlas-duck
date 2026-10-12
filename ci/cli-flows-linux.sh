@@ -10,18 +10,18 @@
 set -euo pipefail
 
 # A disposition inherited as "ignored" survives exec into the CLI under test and would hide the
-# very signal paths X-08 exercises (SIGINT, SIGTERM, SIGHUP in turn); SIGPIPE too.
+# very signal paths X-08 exercises (SIGINT, SIGTERM, SIGHUP in turn). SIGPIPE is not checked: GitHub runners start the shell with it ignored, and the Rust runtime sets SIGPIPE to ignore in every binary at startup anyway.
 check_dispositions() {
   local ign sig bit
   ign="$(awk '/^SigIgn:/ {print $2}' /proc/$$/status)"
-  for sig in HUP:1 INT:2 PIPE:13 TERM:15; do
+  for sig in HUP:1 INT:2 TERM:15; do
     bit=$((1 << (${sig#*:} - 1)))
     if (( (0x$ign & bit) != 0 )); then
       echo "cli-flows-linux: SIG${sig%%:*} is ignored in this shell (SigIgn=$ign); the flows need the default disposition" >&2
       exit 2
     fi
   done
-  echo "cli-flows-linux: SIGHUP/SIGINT/SIGPIPE/SIGTERM dispositions are default (SigIgn=$ign)"
+  echo "cli-flows-linux: SIGHUP/SIGINT/SIGTERM dispositions are default (SigIgn=$ign)"
 }
 
 if [ "${1:-}" != --inner ]; then
