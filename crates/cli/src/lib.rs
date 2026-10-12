@@ -8,6 +8,11 @@
 //! the tokio runtime (§4.1 "Local parsing"). Connected commands go through a `Connector` (Task 16
 //! provides the real one).
 
+// §4.7: the launched app's test-only environment names exist only in test builds; a release build
+// must never carry them.
+#[cfg(all(feature = "test-env", not(debug_assertions)))]
+compile_error!("test-env must never reach a release build");
+
 mod argv;
 mod binding;
 mod deadline;
@@ -15,6 +20,7 @@ mod discover;
 mod exit;
 mod help;
 mod input;
+mod launch;
 mod local;
 mod output;
 

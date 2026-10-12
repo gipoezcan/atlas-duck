@@ -432,6 +432,7 @@ dependencies = [
  "atlas-duck-ipc",
  "atlas-duck-registry",
  "lexopt",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
