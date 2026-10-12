@@ -41,6 +41,11 @@ pub trait PeerSource: Send + Sync {
     /// (100 ns since 1601).
     fn start_time(&self, pid: u32) -> Option<u64>;
     fn exe(&self, pid: u32) -> Option<PathBuf>;
+    /// `(parent, start_time)` in one lookup, for sources where both come from
+    /// the same read. The walk calls this once per hop.
+    fn parent_and_start(&self, pid: u32) -> (Option<u32>, Option<u64>) {
+        (self.parent(pid), self.start_time(pid))
+    }
 }
 
 /// File names (lowercase, `.exe` stripped) of hops the walk passes through:
@@ -76,8 +81,12 @@ pub fn is_skipped_hop(exe: &Path) -> bool {
 /// Walks from the direct peer up to [`MAX_HOPS`] processes. Each visited
 /// process is recorded as a hop; the first one that is not skipped is the
 /// origin and ends the walk. The walk also stops at pid 0/1, on a failed
-/// lookup, and when a parent did not start strictly before its child (pid
-/// reuse). Never fails.
+/// lookup, and when a parent started strictly later than its child (pid
+/// reuse; equal start times continue, Linux start times have 10 ms
+/// granularity). Never fails.
+///
+/// A reused `OsPeerSource` keeps a stale Windows snapshot: use
+/// [`os_peer_info`] for the real OS.
 pub fn peer_info(direct_pid: Option<u32>, src: &dyn PeerSource) -> PeerInfo {
     let mut info = PeerInfo {
         peer_pid: direct_pid,
@@ -91,10 +100,11 @@ pub fn peer_info(direct_pid: Option<u32>, src: &dyn PeerSource) -> PeerInfo {
     let mut pid = direct;
     let mut child_start: Option<u64> = None;
     while info.peer_chain.len() < MAX_HOPS && pid > 1 {
-        let Some(start_time) = src.start_time(pid) else {
+        let (parent, start_time) = src.parent_and_start(pid);
+        let Some(start_time) = start_time else {
             break;
         };
-        if child_start.is_some_and(|child| start_time >= child) {
+        if child_start.is_some_and(|child| start_time > child) {
             break;
         }
         let exe = if info.peer_chain.is_empty() {
@@ -120,7 +130,7 @@ pub fn peer_info(direct_pid: Option<u32>, src: &dyn PeerSource) -> PeerInfo {
             info.peer_origin_start_time = Some(start_time);
             break;
         }
-        match src.parent(pid) {
+        match parent {
             Some(parent) if parent != pid => {
                 child_start = Some(start_time);
                 pid = parent;
@@ -129,6 +139,12 @@ pub fn peer_info(direct_pid: Option<u32>, src: &dyn PeerSource) -> PeerInfo {
         }
     }
     info
+}
+
+/// [`peer_info`] on a fresh [`OsPeerSource`] (one process snapshot per walk on
+/// Windows).
+pub fn os_peer_info(direct_pid: Option<u32>) -> PeerInfo {
+    peer_info(direct_pid, &OsPeerSource::default())
 }
 
 /// `(ppid, starttime)` from a `/proc/<pid>/stat` line: fields 4 and 22, counted

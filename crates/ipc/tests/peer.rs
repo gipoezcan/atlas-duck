@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use atlas_duck_ipc::peer::{MAX_HOPS, OsPeerSource, PeerSource, is_skipped_hop, peer_info};
 use atlas_duck_ipc::proto::{PeerHop, PeerInfo};
@@ -84,15 +84,52 @@ fn walk_stops_on_pid_reuse() {
     assert_eq!(info.peer_origin_exe, None);
     assert_eq!(info.peer_origin_start_time, None);
 
-    // "Not earlier than" includes an equal start time.
+    // An equal start time continues (Linux start times have 10 ms
+    // granularity); only a strictly later parent stops the walk.
     let equal = Fake::new(&[
         (100, (Some(90), Some(400), Some("atlas-duck"))),
         (90, (Some(80), Some(300), Some("bash"))),
         (80, (Some(1), Some(300), Some("python3"))),
     ]);
     let info = peer_info(Some(100), &equal);
-    assert_eq!(pids(&info), vec![100, 90]);
+    assert_eq!(pids(&info), vec![100, 90, 80]);
+    assert_eq!(info.peer_origin_exe, Some(PathBuf::from("python3")));
+    assert_eq!(info.peer_origin_start_time, Some(300));
+
+    let same_as_direct = Fake::new(&[
+        (100, (Some(90), Some(400), Some("atlas-duck"))),
+        (90, (Some(80), Some(400), Some("python3"))),
+    ]);
+    assert_eq!(pids(&peer_info(Some(100), &same_as_direct)), vec![100, 90]);
+}
+
+/// Counts `start_time` calls; the second call for a pid reports a different
+/// start time (the pid was reused between the two lookups).
+struct Reusing {
+    calls: AtomicU32,
+}
+
+impl PeerSource for Reusing {
+    fn parent(&self, _pid: u32) -> Option<u32> {
+        Some(1)
+    }
+    fn start_time(&self, _pid: u32) -> Option<u64> {
+        Some(100 + u64::from(self.calls.fetch_add(1, Ordering::SeqCst)))
+    }
+    fn exe(&self, _pid: u32) -> Option<PathBuf> {
+        Some(PathBuf::from("python3"))
+    }
+}
+
+#[test]
+fn walk_stops_when_start_time_changes_between_lookups() {
+    let src = Reusing {
+        calls: AtomicU32::new(0),
+    };
+    let info = peer_info(Some(100), &src);
+    assert!(info.peer_chain.is_empty(), "{info:?}");
     assert_eq!(info.peer_origin_exe, None);
+    assert_eq!(info.peer_pid, Some(100));
 }
 
 #[test]
@@ -268,11 +305,11 @@ fn canon(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|e| panic!("canonicalize {}: {e}", p.display()))
 }
 
-fn assert_start_times_decrease(info: &PeerInfo) {
+fn assert_start_times_non_increasing(info: &PeerInfo) {
     for pair in info.peer_chain.windows(2) {
         assert!(
-            pair[1].start_time < pair[0].start_time,
-            "start times not strictly decreasing: {:?}",
+            pair[1].start_time <= pair[0].start_time,
+            "start times increase towards the origin: {:?}",
             info.peer_chain
         );
     }
@@ -288,9 +325,6 @@ const CHILD_MARKER: &str = "PEER_CHILD_REPORT ";
 fn v18_walk_finds_test_origin() {
     let me = std::env::current_exe().expect("current_exe");
     let me_canon = canon(&me);
-    // Linux start times have clock-tick (10 ms) resolution: make sure the
-    // shell cannot start in the same tick as this process.
-    std::thread::sleep(Duration::from_millis(50));
 
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd");
@@ -300,7 +334,9 @@ fn v18_walk_finds_test_origin() {
     } else {
         let mut c = Command::new("sh");
         c.arg("-c")
-            .arg(r#""$0" --ignored --exact peer_child_report --nocapture"#)
+            // `; exit $?` keeps the shell alive (no exec of the last command),
+            // so the shell hop is really walked through.
+            .arg(r#""$0" --ignored --exact peer_child_report --nocapture; exit $?"#)
             .arg(&me);
         c
     };
@@ -343,7 +379,7 @@ fn v18_walk_finds_test_origin() {
             info.peer_origin_exe.as_deref().and_then(Path::file_name)
         );
         assert!(!info.peer_chain.is_empty(), "{what}: empty chain");
-        assert_start_times_decrease(info);
+        assert_start_times_non_increasing(info);
         let origin = info
             .peer_origin_exe
             .as_deref()
@@ -359,6 +395,9 @@ fn v18_walk_finds_test_origin() {
     // this very process.
     let first = &from_shell.peer_chain[0];
     assert_eq!(first.pid, child.id());
+    // The shell stays alive (`; exit $?`), so it must be a walked-through hop.
+    #[cfg(unix)]
+    assert!(is_skipped_hop(&first.exe), "{from_shell:?}");
     if is_skipped_hop(&first.exe) {
         assert_eq!(from_shell.peer_chain.len(), 2, "{from_shell:?}");
         assert_eq!(from_shell.peer_chain[1].pid, std::process::id());

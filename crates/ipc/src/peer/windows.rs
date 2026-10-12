@@ -39,8 +39,8 @@ fn snapshot_parents() -> Option<HashMap<u32, u32>> {
         return None;
     }
     // SAFETY: a fresh snapshot handle that nothing else owns.
-    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw as _) };
-    let snapshot = snapshot.as_raw_handle() as HANDLE;
+    let owned = unsafe { OwnedHandle::from_raw_handle(raw as _) };
+    let snapshot = owned.as_raw_handle() as HANDLE;
 
     // SAFETY: PROCESSENTRY32W is plain old data; all-zero is a valid value.
     let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
