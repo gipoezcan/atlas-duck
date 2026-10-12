@@ -46,7 +46,7 @@ const NOTICE_WITHIN: Duration = Duration::from_secs(90);
 /// A spawned CLI that has to end (after a kill, an interrupt, a broken pipe) does so within this.
 const ENDS_WITHIN: Duration = Duration::from_secs(60);
 /// The mock holds a fetch this long (I-10: a request held in `Fetching`).
-const FETCH_HELD: Duration = Duration::from_secs(5);
+const FETCH_HELD: Duration = Duration::from_secs(20);
 /// The mock delays a fetch this long (X-08: the final write happens after the pipe is closed).
 const FETCH_DELAYED: Duration = Duration::from_millis(1500);
 /// §4.3: the verbatim message of `pending` + `connection_lost` (the `<id>` is literal).
