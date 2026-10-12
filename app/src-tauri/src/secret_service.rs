@@ -1,9 +1,10 @@
 //! Linux Secret Service check for `doctor` (PD-30, L39, §4.7).
 //!
 //! `secret_service: ok|missing|locked` on Linux, `null` elsewhere. The probe asks the session bus
-//! whether `org.freedesktop.secrets` has an owner (no owner: `missing`; the name is never
-//! activated), then reads the `Locked` property of the collection behind the `default` alias
-//! (`true`: `locked`); every other answer is `ok` (PD-30). No session bus, a bus that cannot be
+//! whether `org.freedesktop.secrets` has an owner (no owner: `missing`), then reads the `Locked`
+//! property of the collection behind the `default` alias (`true`: `locked`); every other answer
+//! is `ok` (PD-30). The name is never activated: `NameHasOwner` goes to the bus itself, and
+//! `ReadAlias` and `Properties.Get` carry `NoAutoStart`. No session bus, a bus that cannot be
 //! reached and a probe that does not finish within [`PROBE_TIMEOUT`] are `missing`. A result is
 //! reused for [`CACHE_TTL`].
 
@@ -148,11 +149,13 @@ fn query(address: &str, timeout: Duration) -> zbus::Result<SecretService> {
 }
 
 /// The `Locked` property of the collection the `default` alias names; `false` when there is
-/// no default collection (`ReadAlias` answers `/`).
+/// no default collection (`ReadAlias` answers `/`). Both calls carry `NoAutoStart`: if the owner
+/// left after `NameHasOwner`, the bus answers an error instead of activating the service.
 #[cfg(target_os = "linux")]
 fn default_collection_locked(connection: &zbus::blocking::Connection) -> zbus::Result<bool> {
     use zbus::blocking::proxy::Builder;
-    use zbus::proxy::CacheProperties;
+    use zbus::proxy::{CacheProperties, MethodFlags};
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
     let service: zbus::blocking::Proxy<'_> = Builder::<zbus::blocking::Proxy<'_>>::new(connection)
         .destination(SECRETS_NAME)?
@@ -160,18 +163,32 @@ fn default_collection_locked(connection: &zbus::blocking::Connection) -> zbus::R
         .interface("org.freedesktop.Secret.Service")?
         .cache_properties(CacheProperties::No)
         .build()?;
-    let alias: zbus::zvariant::OwnedObjectPath = service.call("ReadAlias", &("default",))?;
+    let alias: Option<OwnedObjectPath> =
+        service.call_with_flags("ReadAlias", MethodFlags::NoAutoStart.into(), &("default",))?;
+    // `None` only answers a `NoReplyExpected` call; treated like no default collection.
+    let Some(alias) = alias else {
+        return Ok(false);
+    };
     if alias.as_str() == "/" {
         return Ok(false);
     }
-    let collection: zbus::blocking::Proxy<'_> =
+    // `Properties.Get` by hand: `Proxy::get_property` has no way to pass the flag.
+    let properties: zbus::blocking::Proxy<'_> =
         Builder::<zbus::blocking::Proxy<'_>>::new(connection)
             .destination(SECRETS_NAME)?
             .path(alias.as_str())?
-            .interface("org.freedesktop.Secret.Collection")?
+            .interface("org.freedesktop.DBus.Properties")?
             .cache_properties(CacheProperties::No)
             .build()?;
-    collection.get_property::<bool>("Locked")
+    let locked: Option<OwnedValue> = properties.call_with_flags(
+        "Get",
+        MethodFlags::NoAutoStart.into(),
+        &("org.freedesktop.Secret.Collection", "Locked"),
+    )?;
+    match locked {
+        Some(value) => bool::try_from(value).map_err(zbus::Error::from),
+        None => Ok(false),
+    }
 }
 
 #[cfg(test)]

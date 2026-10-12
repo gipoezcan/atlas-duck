@@ -1,10 +1,12 @@
 //! App-wide state managed by Tauri (`app.manage`). Later milestones read it and add fields.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::LocalDataDir;
+use atlas_duck_ipc::server::ShutdownSignal;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
+use tauri::async_runtime::JoinHandle;
 
 use crate::serve::ServeState;
 use crate::tray_host::TrayHost;
@@ -102,18 +104,41 @@ impl DataDirHold {
 }
 
 /// The serving state (T19), managed in `Ready`. Empty until `serve::start` finished, and for
-/// good when the store could not be opened (PD-06).
+/// good when the store could not be opened (PD-06) or Quit cancelled the start.
 #[derive(Default)]
-pub struct ServeSlot(OnceLock<Arc<ServeState>>);
+pub struct ServeSlot {
+    state: OnceLock<Arc<ServeState>>,
+    /// The `serve::start` task (I-2): Quit cancels [`ServeSlot::quit`], then awaits it.
+    starting: Mutex<Option<JoinHandle<()>>>,
+    /// Quit during startup: `serve::start` passes it as `StartInputs::quit`.
+    quit: ShutdownSignal,
+}
 
 impl ServeSlot {
     pub fn get(&self) -> Option<&Arc<ServeState>> {
-        self.0.get()
+        self.state.get()
     }
 
     /// The first state wins; a later one is dropped.
     pub fn set(&self, state: Arc<ServeState>) {
-        let _ = self.0.set(state);
+        let _ = self.state.set(state);
+    }
+
+    /// Cancelled by the quit path before it awaits [`ServeSlot::take_starting`].
+    pub fn quit(&self) -> &ShutdownSignal {
+        &self.quit
+    }
+
+    pub fn set_starting(&self, task: JoinHandle<()>) {
+        *self.starting.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
+    }
+
+    /// The start task, once: the caller awaits it with a bound (the guard is released first).
+    pub fn take_starting(&self) -> Option<JoinHandle<()>> {
+        self.starting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -132,5 +157,23 @@ mod tests {
         let none = AppState::new(StartupSummary::BeforeFirstRun, None);
         assert_eq!(none.tray_host(), None);
         assert_eq!(none.startup, StartupSummary::BeforeFirstRun);
+    }
+
+    #[test]
+    fn serve_slot_shares_quit_and_hands_out_the_start_task_once() {
+        let slot = ServeSlot::default();
+        assert!(slot.get().is_none());
+        // `serve::start` passes a clone; the quit path cancels the slot's.
+        let passed = slot.quit().clone();
+        assert!(!passed.0.is_cancelled());
+        slot.quit().cancel();
+        assert!(passed.0.is_cancelled());
+
+        assert!(slot.take_starting().is_none());
+        slot.set_starting(tauri::async_runtime::spawn(async {}));
+        let task = slot.take_starting();
+        assert!(slot.take_starting().is_none());
+        let joined = task.map(tauri::async_runtime::block_on);
+        assert!(matches!(joined, Some(Ok(()))));
     }
 }

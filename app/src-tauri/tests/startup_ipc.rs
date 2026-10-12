@@ -7,8 +7,9 @@
 //! socket dir; Windows binds a fresh pipe name under this user's prefix.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::secret_service::{SecretService, SecretServiceCheck};
@@ -31,10 +32,12 @@ use atlas_duck_ipc::paths::{
 use atlas_duck_ipc::proto::{
     AgentNameSource, ClientKind, Hello, SubmitParams, SubmitReply, exit_code,
 };
+use atlas_duck_ipc::server::ShutdownSignal;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 
 const HOST: &str = "thishost";
+const WAL_FILE: &str = "audit.db-wal";
 const WAIT: Duration = Duration::from_secs(20);
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -61,11 +64,14 @@ impl SecretServiceCheck for NoSecretService {
 }
 
 /// `MemKeyStore`s over one keyring. While `available` is false every `keys()` fails
-/// `Unavailable`.
+/// `Unavailable`. A held factory blocks its first `keys()` (on `open`'s blocking thread) until
+/// the test releases it.
 struct MemKeys {
     ring: Arc<MemKeyring>,
     available: AtomicBool,
     calls: AtomicU32,
+    hold: Mutex<Option<Receiver<()>>>,
+    entered: AtomicBool,
 }
 
 impl MemKeys {
@@ -74,17 +80,44 @@ impl MemKeys {
             ring,
             available: AtomicBool::new(available),
             calls: AtomicU32::new(0),
+            hold: Mutex::new(None),
+            entered: AtomicBool::new(false),
         })
+    }
+
+    /// Available, but the first `keys()` waits for a send on the returned sender.
+    fn held(ring: Arc<MemKeyring>) -> (Arc<MemKeys>, Sender<()>) {
+        let (release, held) = std::sync::mpsc::channel();
+        let keys = MemKeys::new(ring, true);
+        *keys.hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(held);
+        (keys, release)
     }
 
     fn calls(&self) -> u32 {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Waits until a `keys()` call has started.
+    async fn wait_entered(&self) -> TestResult {
+        let started = Instant::now();
+        while !self.entered.load(Ordering::SeqCst) {
+            if started.elapsed() > WAIT {
+                return Err("keys() was never called".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 }
 
 impl KeysFactory for MemKeys {
     fn keys(&self, install_id: &str) -> Result<Arc<dyn KeyStore>, KeyStoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.entered.store(true, Ordering::SeqCst);
+        let held = self.hold.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(held) = held {
+            let _ = held.recv();
+        }
         if !self.available.load(Ordering::SeqCst) {
             return Err(KeyStoreError::Unavailable);
         }
@@ -99,6 +132,8 @@ struct World {
     data: LocalDataDir,
     lock: Arc<InstanceLock>,
     location: EndpointLocation,
+    /// The Quit request every start in this world shares.
+    quit: ShutdownSignal,
 }
 
 impl World {
@@ -117,6 +152,7 @@ impl World {
             data,
             lock,
             location,
+            quit: ShutdownSignal::new(),
         })
     }
 
@@ -134,6 +170,7 @@ impl World {
             secret_service: Arc::new(NoSecretService),
             retry_schedule: vec![Duration::from_millis(50); 200],
             endpoint: Some(self.location.clone()),
+            quit: self.quit.clone(),
         }
     }
 
@@ -233,6 +270,16 @@ async fn stop(state: &ServeState) -> TestResult {
     Ok(())
 }
 
+/// Nothing was bound: no endpoint file and (Unix) no socket.
+fn assert_nothing_bound(w: &World) -> TestResult {
+    assert!(read_endpoint_file(&w.data)?.is_none(), "no endpoint file");
+    #[cfg(unix)]
+    if let EndpointLocation::UnixSocket(p) = &w.location {
+        assert!(!p.exists(), "no socket bound");
+    }
+    Ok(())
+}
+
 fn submit_params() -> SubmitParams {
     SubmitParams {
         op_id: "jira.search".into(),
@@ -323,6 +370,19 @@ async fn ready_store_serves_core() -> TestResult {
     let data = doctor.data.unwrap_or_default();
     assert!(data.get("instances").is_some(), "{data}");
     assert!(data.get("tray_host").is_some() && data.get("secret_service").is_some());
+    // An open store keeps its WAL file; `quit_during_open_binds_nothing` relies on this.
+    let files = w.files()?;
+    assert!(files.contains(WAL_FILE), "{files:?}");
+
+    // The quit path's freeze hands out the core set at start; with a core the cell stays.
+    let core = state.core.get().cloned().ok_or("no core")?;
+    let frozen = state.freeze().ok_or("freeze returned no core")?;
+    assert!(Arc::ptr_eq(&frozen, &core));
+    let again = state.freeze_for_shutdown().ok_or("no core")?;
+    assert!(Arc::ptr_eq(&again, &core));
+    assert_eq!(state.refused(), None);
+    let doctor: Envelope = c.call("doctor", json!({})).await?;
+    assert!(doctor.data.unwrap_or_default().get("instances").is_some());
 
     stop(&state).await
 }
@@ -420,11 +480,110 @@ async fn locked_retry_swaps_to_another_gate_state() -> TestResult {
     stop(&state).await
 }
 
+/// After `freeze` the retry loop swaps nothing: a keychain that comes back starts no `Core`, the
+/// locked gate stays in the cell, and the loop ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn freeze_stops_the_retry_loop() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let keys = MemKeys::new(ring, false);
+    let state = start_with(w.inputs(Some(install_id), keys.clone()))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(state.freeze().is_none());
+    keys.available.store(true, Ordering::SeqCst);
+    // Several schedule steps (50 ms each).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(state.core.get().is_none());
+    assert_eq!(
+        state.refused(),
+        Some(0),
+        "the locked gate stays in the cell"
+    );
+    let retry = state.retry.lock().map_err(|_| "poisoned")?.take();
+    let retry = retry.ok_or("no retry loop")?;
+    tokio::time::timeout(WAIT, retry).await??;
+    assert!(state.core.get().is_none());
+    let mut c = w.connect().await?;
+    let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+    assert_eq!(reason(&reply.envelope), Some("keychain_unavailable"));
+    stop(&state).await
+}
+
+/// With a gate serving, `freeze_for_shutdown` swaps the cell to the `ShuttingDown` gate (a fresh
+/// refused counter) and returns no core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn freeze_for_shutdown_swaps_a_gate_to_shutting_down() -> TestResult {
+    let w = World::new()?;
+    let keys = MemKeys::new(MemKeyring::new(), true);
+    let state = start_with(w.inputs(None, keys))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let mut c = w.connect().await?;
+    let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+    assert_eq!(reason(&reply.envelope), Some("first_run"));
+    assert_eq!(state.refused(), Some(1));
+
+    assert!(state.freeze_for_shutdown().is_none());
+    assert_eq!(state.refused(), Some(0));
+    let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+    assert_eq!(reason(&reply.envelope), Some("app_shutting_down"));
+    assert_eq!(state.refused(), Some(1));
+    stop(&state).await
+}
+
+/// I-2: Quit while `open` runs. The opened store is shut down, nothing is bound and the start
+/// ends `Cancelled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_during_open_binds_nothing() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let before = w.files()?;
+    assert!(!before.contains(WAL_FILE), "{before:?}");
+    let (keys, release) = MemKeys::held(ring);
+    let start = tokio::spawn(start_with(w.inputs(Some(install_id), keys.clone())));
+    keys.wait_entered().await?;
+    w.quit.cancel();
+    release.send(())?;
+    let got = tokio::time::timeout(WAIT, start).await??;
+    assert!(
+        matches!(got, Err(StartupFailure::Cancelled)),
+        "{:?}",
+        got.as_ref().err()
+    );
+    assert_nothing_bound(&w)?;
+    // The store was opened (`Ready`) and shut down before any read: closing its writer, the
+    // last connection, removed the WAL file again.
+    assert_eq!(w.files()?, before);
+    Ok(())
+}
+
+/// I-2: Quit before the bind of a gate state: nothing is bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_before_bind_binds_nothing() -> TestResult {
+    let w = World::new()?;
+    let before = w.files()?;
+    let keys = MemKeys::new(MemKeyring::new(), true);
+    w.quit.cancel();
+    let got = start_with(w.inputs(None, keys.clone())).await;
+    assert!(
+        matches!(got, Err(StartupFailure::Cancelled)),
+        "{:?}",
+        got.as_ref().err()
+    );
+    assert_eq!(keys.calls(), 0);
+    assert_nothing_bound(&w)?;
+    assert_eq!(w.files()?, before);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn open_error_binds_nothing() -> TestResult {
     for pinned in [None, Some("0123456789abcdef0123456789abcdef".to_owned())] {
         let w = World::new()?;
-        std::fs::write(w.data.path().join("audit.db-wal"), b"x")?;
+        std::fs::write(w.data.path().join(WAL_FILE), b"x")?;
         let before = w.files()?;
         let keys = MemKeys::new(MemKeyring::new(), true);
         let got = start_with(w.inputs(pinned.clone(), keys.clone())).await;
@@ -433,17 +592,15 @@ async fn open_error_binds_nothing() -> TestResult {
             "{pinned:?}: {:?}",
             got.as_ref().err()
         );
-        assert!(read_endpoint_file(&w.data)?.is_none(), "no endpoint file");
+        // PD-41: no keystore is built without `audit.db`, even with a pinned id.
+        assert_eq!(keys.calls(), 0, "{pinned:?}");
         // Nothing written: only `instance.lock` (taken by the gate) and the planted WAL.
         assert_eq!(w.files()?, before);
         assert_eq!(
             before,
-            BTreeSet::from([INSTANCE_LOCK_FILE.to_owned(), "audit.db-wal".to_owned()])
+            BTreeSet::from([INSTANCE_LOCK_FILE.to_owned(), WAL_FILE.to_owned()])
         );
-        #[cfg(unix)]
-        if let EndpointLocation::UnixSocket(p) = &w.location {
-            assert!(!p.exists(), "no socket bound");
-        }
+        assert_nothing_bound(&w)?;
     }
     Ok(())
 }
@@ -454,7 +611,7 @@ async fn stale_endpoint_file_removed_before_bind() -> TestResult {
     // a dead endpoint.
     let w = World::new()?;
     std::fs::write(w.data.path().join(ENDPOINT_FILE), b"stale-endpoint-name")?;
-    std::fs::write(w.data.path().join("audit.db-wal"), b"x")?;
+    std::fs::write(w.data.path().join(WAL_FILE), b"x")?;
     let keys = MemKeys::new(MemKeyring::new(), true);
     assert!(start_with(w.inputs(None, keys)).await.is_err());
     assert!(!w.data.path().join(ENDPOINT_FILE).exists());

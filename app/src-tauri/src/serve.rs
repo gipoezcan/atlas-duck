@@ -53,6 +53,8 @@ pub const LOG_EVENT_STORE_OPEN_FAILED: &str = "store_open_failed";
 pub const LOG_EVENT_KEYCHAIN_RETRY: &str = "keychain_retry";
 /// The retry schedule ran out while the keychain stayed unavailable; the app stays locked.
 pub const LOG_EVENT_KEYCHAIN_RETRY_EXHAUSTED: &str = "keychain_retry_exhausted";
+/// Quit was requested during startup; nothing was bound (I-2).
+pub const LOG_EVENT_START_CANCELLED: &str = "serve_start_cancelled";
 /// PD-25: the 6-hourly touch of the socket file and its dir failed (Unix).
 pub const LOG_EVENT_TOUCH_FAILED: &str = "ipc_touch_failed";
 
@@ -183,19 +185,31 @@ impl StoreFailure {
     }
 }
 
-/// Why nothing is served (PD-06): no endpoint was bound; the app keeps `instance.lock` and
-/// shows [`tray::MSG_STORE_UNAVAILABLE`].
+/// Why nothing is served: no endpoint was bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartupFailure {
-    /// `audit::open` failed, the store's install id could not be read (PD-41), or `Core::start`
-    /// refused.
+    /// PD-06: `audit::open` failed, the store's install id could not be read (PD-41), or
+    /// `Core::start` refused. The app keeps `instance.lock` and shows
+    /// [`tray::MSG_STORE_UNAVAILABLE`].
     Store(StoreFailure),
+    /// Quit was requested ([`StartInputs::quit`]) before the bind; a store or core this start
+    /// opened is shut down again.
+    Cancelled,
 }
 
 // ---------- the serving state ----------
 
 /// What the app keeps while it serves (managed through [`ServeSlot`]). The quit path (T20)
 /// reads it.
+///
+/// T20 order: cancel [`ServeSlot::quit`] and await [`ServeSlot::take_starting`] with a bound
+/// (a start that has not bound yet ends `Cancelled` and shuts down what it opened); then
+/// [`ServeState::freeze_for_shutdown`] (no swap after it; with no core the cell answers
+/// `app_shutting_down`); then take the handle out of `retry` and await it with a bound, the
+/// `Mutex` guard dropped before the await. Never `abort()` the retry task: it owns a store or
+/// core it is starting and shuts them down itself once it sees the freeze; aborting it leaks
+/// them. Then the core's shutdown, `shutdown.cancel()`, `served` (<= 2 s) and `Store::shutdown`
+/// on a blocking thread.
 pub struct ServeState {
     pub cell: Arc<HandlerCell>,
     pub shutdown: ShutdownSignal,
@@ -208,9 +222,11 @@ pub struct ServeState {
     /// The `serve` task (it returns within 2 s of `shutdown`, PD-38); `None` when the endpoint
     /// could not be bound (logged as `ipc_bind_failed`).
     pub served: Mutex<Option<JoinHandle<()>>>,
-    /// The keychain retry loop, while one runs.
+    /// The keychain retry loop, while one runs. Awaited with a bound after the freeze, never
+    /// aborted (see above).
     pub retry: Mutex<Option<JoinHandle<()>>>,
-    /// True once the quit path called [`ServeState::freeze`]: no swap happens after that.
+    /// True once the quit path called [`ServeState::freeze`] or
+    /// [`ServeState::freeze_for_shutdown`]: no swap happens after that.
     frozen: Mutex<bool>,
     extras: Arc<DoctorExtras>,
     ui: Arc<dyn UiSink>,
@@ -221,6 +237,28 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 impl ServeState {
+    /// The cell serves `initial` (wrapped in [`AppHandler`]); no endpoint is bound yet.
+    fn new(
+        initial: Arc<dyn RequestHandler>,
+        gate: Option<Arc<GateHandler>>,
+        store: Option<Store>,
+        extras: Arc<DoctorExtras>,
+        ui: Arc<dyn UiSink>,
+    ) -> ServeState {
+        ServeState {
+            cell: Arc::new(HandlerCell::new(AppHandler::new(initial, extras.clone()))),
+            shutdown: ShutdownSignal::new(),
+            core: OnceLock::new(),
+            gate: Mutex::new(gate),
+            store: Mutex::new(store),
+            served: Mutex::new(None),
+            retry: Mutex::new(None),
+            frozen: Mutex::new(false),
+            extras,
+            ui,
+        }
+    }
+
     /// PD-35: the kept gate handler's refused count; `None` while `Core` serves.
     pub fn refused(&self) -> Option<u64> {
         lock(&self.gate).as_ref().map(|g| g.refused())
@@ -233,23 +271,47 @@ impl ServeState {
             .is_some_and(|h| !h.is_finished())
     }
 
-    /// For the quit path (T20), first: the keychain retry loop swaps nothing after this. Returns
-    /// the `Core` serving now, if any. A retry that starts a `Core` after the freeze shuts that
-    /// core down itself.
+    /// The keychain retry loop swaps nothing after this. Returns the `Core` serving now, if any.
+    /// A retry that starts a `Core` after the freeze shuts that core down itself. The quit path
+    /// calls [`ServeState::freeze_for_shutdown`], which also swaps a gate to `ShuttingDown`.
     pub fn freeze(&self) -> Option<Arc<Core>> {
         let mut frozen = lock(&self.frozen);
         *frozen = true;
         self.core.get().cloned()
     }
 
+    /// The quit path's freeze (T20): as [`ServeState::freeze`], and with no `Core` serving the
+    /// cell is swapped to the `ShuttingDown` gate in the same step, so no retry can swap in
+    /// between. Returns the `Core` serving now, if any; it keeps serving until its own shutdown
+    /// refuses new submits.
+    pub fn freeze_for_shutdown(&self) -> Option<Arc<Core>> {
+        let mut frozen = lock(&self.frozen);
+        *frozen = true;
+        let core = self.core.get().cloned();
+        if core.is_none() {
+            let gate = GateHandler::new(GateState::ShuttingDown, self.ui.clone());
+            self.cell.swap(self.handler_for(gate.clone()));
+            *lock(&self.gate) = Some(gate);
+        }
+        drop(frozen);
+        core
+    }
+
     fn handler_for(&self, inner: Arc<dyn RequestHandler>) -> Arc<dyn RequestHandler> {
         AppHandler::new(inner, self.extras.clone())
     }
 
-    /// Serves `core` from the next request on (no rebind). False after [`ServeState::freeze`].
+    /// Whether the retry loop may still swap the cell; called with the `frozen` lock held. No
+    /// swap after the freeze or once the shutdown signal fired (m-6).
+    fn swaps_allowed(&self, frozen: bool) -> bool {
+        !frozen && !self.shutdown.0.is_cancelled()
+    }
+
+    /// Serves `core` from the next request on (no rebind). False after [`ServeState::freeze`]
+    /// or the shutdown signal.
     fn install_core(&self, core: Arc<Core>, store: Store) -> bool {
         let frozen = lock(&self.frozen);
-        if *frozen || self.core.set(core.clone()).is_err() {
+        if !self.swaps_allowed(*frozen) || self.core.set(core.clone()).is_err() {
             return false;
         }
         *lock(&self.store) = Some(store);
@@ -259,11 +321,11 @@ impl ServeState {
         true
     }
 
-    /// Serves the gate in `state` from the next request on. False after the freeze or once
-    /// `Core` serves.
+    /// Serves the gate in `state` from the next request on. False after the freeze, the shutdown
+    /// signal, or once `Core` serves.
     fn install_gate(&self, state: GateState) -> bool {
         let frozen = lock(&self.frozen);
-        if *frozen || self.core.get().is_some() {
+        if !self.swaps_allowed(*frozen) || self.core.get().is_some() {
             return false;
         }
         let gate = GateHandler::new(state, self.ui.clone());
@@ -293,6 +355,9 @@ pub struct StartInputs {
     pub secret_service: Arc<dyn SecretServiceCheck>,
     /// The delays between keychain retries; production: `keychain_retry_schedule()`.
     pub retry_schedule: Vec<Duration>,
+    /// Quit during startup (I-2): [`ServeSlot::quit`]. Checked before `Core::start` and before
+    /// the bind; once cancelled the start ends [`StartupFailure::Cancelled`] without binding.
+    pub quit: ShutdownSignal,
     /// Tests: bind here instead of this user's endpoint location (`IpcServer::bind_at`).
     #[doc(hidden)]
     pub endpoint: Option<EndpointLocation>,
@@ -300,7 +365,8 @@ pub struct StartInputs {
 
 /// Starts serving for the Tauri app: returns at once; the work runs on `tauri::async_runtime`
 /// (the `setup` closure must not block the main thread). On success the state goes into the
-/// managed [`ServeSlot`]; on a PD-06 failure the tray shows [`tray::MSG_STORE_UNAVAILABLE`].
+/// managed [`ServeSlot`]; on a PD-06 failure the tray shows [`tray::MSG_STORE_UNAVAILABLE`]. The
+/// slot's quit signal is the start's [`StartInputs::quit`] and the slot keeps the start task.
 pub fn start(
     app: &AppHandle,
     data: LocalDataDir,
@@ -310,6 +376,11 @@ pub fn start(
     tray_host: Option<TrayHost>,
     keys: Arc<dyn KeysFactory>,
 ) {
+    let slot = app.try_state::<ServeSlot>();
+    // `setup` manages the slot before calling this; without one Quit cannot reach the start.
+    let quit = slot
+        .as_ref()
+        .map_or_else(ShutdownSignal::new, |s| s.quit().clone());
     let inputs = StartInputs {
         data,
         lock,
@@ -322,21 +393,27 @@ pub fn start(
         tray_host,
         secret_service: Arc::new(CachedSecretService::new()),
         retry_schedule: keychain_retry_schedule().to_vec(),
+        quit,
         endpoint: None,
     };
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
+    let handle = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
         match start_with(inputs).await {
             Ok(state) => {
-                if let Some(slot) = app.try_state::<ServeSlot>() {
+                if let Some(slot) = handle.try_state::<ServeSlot>() {
                     slot.set(state);
                 }
             }
             Err(StartupFailure::Store(_)) => {
-                tray::set_status_text(&app, tray::MSG_STORE_UNAVAILABLE);
+                tray::set_status_text(&handle, tray::MSG_STORE_UNAVAILABLE);
             }
+            Err(StartupFailure::Cancelled) => {}
         }
     });
+    // The task may have finished already; its handle is still what Quit awaits.
+    if let Some(slot) = slot {
+        slot.set_starting(task);
+    }
 }
 
 /// [`start`] without Tauri: the UI sink and the confirmer come in directly (tests drive it).
@@ -385,6 +462,10 @@ pub async fn start_with(i: StartInputs) -> Result<Arc<ServeState>, StartupFailur
                 StoreFailure::Integrity.log();
                 return Err(StartupFailure::Store(StoreFailure::Integrity));
             };
+            // I-2: Quit during `open` starts no core.
+            if i.quit.0.is_cancelled() {
+                return Err(abandon(None, Some(store)).await);
+            }
             match starter.start(store.clone(), keys, pats_deleted).await {
                 Ok(core) => (core.handler(), Some(core), None, Some(store)),
                 Err(f) => {
@@ -408,19 +489,13 @@ pub async fn start_with(i: StartInputs) -> Result<Arc<ServeState>, StartupFailur
             )
         }
     };
-    let cell = Arc::new(HandlerCell::new(AppHandler::new(initial, extras.clone())));
-    let state = Arc::new(ServeState {
-        cell: cell.clone(),
-        shutdown: ShutdownSignal::new(),
-        core: OnceLock::new(),
-        gate: Mutex::new(gate),
-        store: Mutex::new(store),
-        served: Mutex::new(None),
-        retry: Mutex::new(None),
-        frozen: Mutex::new(false),
-        extras,
-        ui: i.ui.clone(),
-    });
+    // I-2: Quit before the bind binds nothing; what this start opened is shut down. A Quit
+    // after this check finds the state in the slot and shuts it down the usual way.
+    if i.quit.0.is_cancelled() {
+        return Err(abandon(core, store).await);
+    }
+    let state = Arc::new(ServeState::new(initial, gate, store, extras, i.ui.clone()));
+    let cell = state.cell.clone();
     if let Some(core) = core {
         let _ = state.core.set(core);
     }
@@ -560,6 +635,19 @@ async fn run_blocking<T: Send + 'static>(
 
 async fn shutdown_store(store: Store) {
     let _ = tokio::task::spawn_blocking(move || store.shutdown()).await;
+}
+
+/// A start that Quit cancelled before the bind: the core (if one started) shuts down, then the
+/// store. Returns [`StartupFailure::Cancelled`].
+async fn abandon(core: Option<Arc<Core>>, store: Option<Store>) -> StartupFailure {
+    if let Some(core) = core {
+        core.shutdown(ShutdownReason::Quit).await;
+    }
+    if let Some(store) = store {
+        shutdown_store(store).await;
+    }
+    tracing::info!(event = LOG_EVENT_START_CANCELLED);
+    StartupFailure::Cancelled
 }
 
 /// Starts `Core` on an open store (PD-05); shared by the first attempt and the retries.
@@ -811,6 +899,68 @@ mod tests {
         .map(|f| f.as_str())
         .collect();
         assert_eq!(names, ["integrity", "io", "migration", "core_start"]);
+    }
+
+    struct NoUi;
+    impl UiSink for NoUi {
+        fn emit(&self, _: atlas_duck_core::UiEvent) {}
+    }
+
+    struct NoCheck;
+    impl SecretServiceCheck for NoCheck {
+        fn check(&self) -> Option<crate::secret_service::SecretService> {
+            None
+        }
+    }
+
+    /// A serving state with the gate in `gs` and no core (no endpoint, no store).
+    fn gate_serving(gs: GateState) -> ServeState {
+        let ui: Arc<dyn UiSink> = Arc::new(NoUi);
+        let gate = GateHandler::new(gs, ui.clone());
+        let extras = Arc::new(DoctorExtras {
+            tray_host: None,
+            secret_service: Arc::new(NoCheck),
+            data: None,
+        });
+        ServeState::new(gate.clone(), Some(gate), None, extras, ui)
+    }
+
+    async fn gate_label(state: &ServeState) -> serde_json::Value {
+        state.cell.current().doctor().await.data.unwrap_or_default()["gate"].clone()
+    }
+
+    #[tokio::test]
+    async fn install_gate_refuses_after_freeze() {
+        let state = gate_serving(GateState::Locked(LockedReason::KeychainUnavailable));
+        assert!(state.install_gate(GateState::StoreNewer));
+        assert_eq!(gate_label(&state).await, "store_newer");
+        assert!(state.freeze().is_none());
+        assert!(!state.install_gate(GateState::FirstRun));
+        assert_eq!(gate_label(&state).await, "store_newer");
+    }
+
+    /// m-6: once the shutdown signal fired, no swap happens even without a freeze.
+    #[tokio::test]
+    async fn install_gate_refuses_after_the_shutdown_signal() {
+        let state = gate_serving(GateState::Locked(LockedReason::KeychainUnavailable));
+        state.shutdown.cancel();
+        assert!(!state.install_gate(GateState::StoreNewer));
+        assert_eq!(gate_label(&state).await, "locked");
+    }
+
+    #[tokio::test]
+    async fn freeze_for_shutdown_swaps_a_gate_to_shutting_down() {
+        let state = gate_serving(GateState::FirstRun);
+        assert_eq!(gate_label(&state).await, "first_run");
+        assert!(state.freeze_for_shutdown().is_none());
+        assert_eq!(gate_label(&state).await, "shutting_down");
+        assert_eq!(state.refused(), Some(0));
+        // Frozen: the retry loop cannot swap it back.
+        assert!(!state.install_gate(GateState::FirstRun));
+        assert_eq!(gate_label(&state).await, "shutting_down");
+        // A second call keeps the shutting-down gate.
+        assert!(state.freeze_for_shutdown().is_none());
+        assert_eq!(gate_label(&state).await, "shutting_down");
     }
 
     #[test]
