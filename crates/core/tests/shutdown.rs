@@ -275,7 +275,7 @@ async fn i40_quit_refuses_cancels_finishes_write() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i40_installer_reason() -> TestResult {
-    let b = busy(100, TestHooks::none()).await?;
+    let b = busy(1_000, TestHooks::none()).await?;
     let report = shutdown_with_refused_submit(&b, ShutdownReason::Installer).await?;
     assert_eq!(report.cancelled, 4);
     // The installer path cancels with the app's own reason.
@@ -289,7 +289,7 @@ async fn i40_installer_reason() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i40_os_shutdown_reason() -> TestResult {
-    let b = busy(100, TestHooks::none()).await?;
+    let b = busy(1_000, TestHooks::none()).await?;
     let report = shutdown_with_refused_submit(&b, ShutdownReason::OsShutdown).await?;
     assert_eq!(report.cancelled, 4);
     for id in [&b.queued_read, &b.fetching_read, &b.open_write, &b.script] {
@@ -306,7 +306,7 @@ async fn i40_os_shutdown_reason() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i40_nothing_left_to_reconcile() -> TestResult {
-    let mut b = busy(100, TestHooks::none()).await?;
+    let mut b = busy(1_000, TestHooks::none()).await?;
     b.h.core().shutdown(ShutdownReason::Quit).await;
     // The store is closed and opened again by the real startup (I-2); the next start finds
     // nothing to reconcile, and neither does the store's own predicate.
@@ -440,7 +440,7 @@ async fn i40_a_write_over_its_budget_is_left_to_the_next_start() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_shutdown_changes_nothing() -> TestResult {
-    let b = busy(100, TestHooks::none()).await?;
+    let b = busy(1_000, TestHooks::none()).await?;
     let first = b.h.core().shutdown(ShutdownReason::Quit).await;
     assert_eq!(first.cancelled, 4);
     let second = b.h.core().shutdown(ShutdownReason::OsShutdown).await;

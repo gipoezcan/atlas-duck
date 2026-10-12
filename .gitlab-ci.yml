@@ -48,7 +48,7 @@ rust:test:
       artifacts: true
   before_script:
     - apt-get update
-    - apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev dbus-x11 xvfb
+    - apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev dbus-x11 xvfb xauth
     - rustup toolchain install
   script:
     # The container's /tmp is an overlayfs whose layers are not visible inside the container; the data-dir
