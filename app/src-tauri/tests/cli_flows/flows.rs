@@ -1321,8 +1321,8 @@ async fn i39_real_envelopes_match_matrix() -> Result<()> {
 ///
 /// Source: `connected.rs` `await_error` (`ConnectionLost` -> `connection_lost_pending(id, base)`),
 /// `MSG_CONNECTION_LOST`; core `envelope.rs` `record_status` (`ABANDONED` -> retryable true) and
-/// the §11.3 reconciliation at start. A killed app leaves its endpoint file, so the flow removes
-/// it before the restart: `World::start_app` returns as soon as the file exists.
+/// the §11.3 reconciliation at start. A killed app leaves its endpoint file; `World::start_app`
+/// removes it before the restart (T22 review fix), so it returns only for the new app.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i39_connection_lost_after_submit_exit4() -> Result<()> {
     if !opted_in("i39_connection_lost_after_submit_exit4") {
@@ -1358,7 +1358,6 @@ async fn i39_connection_lost_after_submit_exit4() -> Result<()> {
     assert_eq!(err.message, MSG_CONNECTION_LOST);
     assert_eq!(detail(env, "reason"), Some(&json!("connection_lost")));
 
-    let _ = fs::remove_file(world.data_dir().join(ENDPOINT_FILE));
     let _restarted = world.start_app().await?;
     let r = run(&world, &["await", &id]).await?;
     assert_eq!(r.exit, 7, "{}", r.stdout);
