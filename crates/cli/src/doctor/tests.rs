@@ -421,6 +421,15 @@ fn keyring_local_for_never_reports_a_local_disk_as_remote() {
     // The passwd-home variant (Linux) and the overlay checks depend on the runner, so only the
     // one wrong answer is excluded here; `keyring_answer_arms` pins the arms.
     let tmp = tempfile::tempdir().unwrap();
+    // A container runner (GitLab's overlay root) can classify the temp dir itself as not local;
+    // then nothing under it can be asserted local, and the test has no claim to make.
+    if !matches!(
+        atlas_duck_ipc::paths::keyring::keyring_locality(&[tmp.path().to_path_buf()]),
+        KeyringLocality::Local
+    ) {
+        eprintln!("skipped: the temp dir is not classified local on this runner");
+        return;
+    }
     let xdg = tmp.path().join("xdg");
     assert_ne!(keyring_local_for(Some(xdg.into_os_string())), Some(false));
 }
