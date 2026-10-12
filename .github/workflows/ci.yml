@@ -351,7 +351,7 @@ jobs:
           cargo test -p atlas-duck-app --features scripted-approver --locked --test cli_flows -- --list --ignored s02_ 2>/dev/null > "$RUNNER_TEMP/s02.list"
           : > "$RUNNER_TEMP/s02.none"
           node ci/check-no-skips.mjs "$TMPDIR/cli-flows.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
-          grep -E '^V13 ' "$TMPDIR/cli-flows.log" || true
+          grep -E '(^|[[:space:]])V13 ' "$TMPDIR/cli-flows.log" || true
 
       - name: M4 S-02 launch survival (#[ignore]d, macOS)
         if: runner.os == 'macOS'
@@ -365,7 +365,7 @@ jobs:
           cargo "${args[@]}" -- --list --ignored s02_ 2>/dev/null > "$RUNNER_TEMP/s02.list"
           : > "$RUNNER_TEMP/s02.none"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/s02.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
-          grep -E 'V13 ' "$RUNNER_TEMP/s02.log" || true
+          grep -E '(^|[[:space:]])V13 ' "$RUNNER_TEMP/s02.log" || true
 
       - name: M4 S-02 launch survival (#[ignore]d, Windows; tree kill and job close)
         if: runner.os == 'Windows'
@@ -385,7 +385,7 @@ jobs:
           Set-Content -Path $none -Value '' -Encoding utf8
           node ci/check-no-skips.mjs $log $list $none
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Select-String -Path $log -Pattern 'V13 '
+          Select-String -Path $log -Pattern '(^|\s)V13 '
 
       # T22 review: a flow that dies before World::drop can leave an app behind. CI only.
       - name: Kill stray atlas-duck-app processes (cli_flows)
@@ -735,7 +735,7 @@ jobs:
           cargo "${args[@]}" -- --list --ignored s02_ 2>/dev/null > "$RUNNER_TEMP/s02.list"
           : > "$RUNNER_TEMP/s02.none"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/s02.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
-          grep -E 'V13 ' "$RUNNER_TEMP/s02.log" || true
+          grep -E '(^|[[:space:]])V13 ' "$RUNNER_TEMP/s02.log" || true
 
       - name: Kill stray atlas-duck-app processes (cli_flows)
         if: always()

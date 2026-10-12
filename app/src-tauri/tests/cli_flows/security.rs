@@ -16,7 +16,7 @@
 //! the session id carries the proof (PD-23: the first child calls `setsid`, `launch/unix.rs`).
 //!
 //! `launch_blocked_by_job` is not a guaranteed diagnosis (T15 review, ledger): the "blocked"
-//! branches accept `unreachable` with reason `launch_blocked_by_job` or `not_running` and decide
+//! branch of the job test accepts `unreachable` with reason `launch_blocked_by_job` or `not_running` and decide
 //! by evidence (no app holds the instance lock, no app process in the job).
 
 use std::fs;
@@ -338,8 +338,9 @@ struct ProcFacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Session {
     Id(u32),
-    /// macOS `getsid(pid)` refused with `EPERM`: POSIX allows that only for a process in another
-    /// session than the caller's (a process of the caller's own session always answers).
+    /// macOS `getsid(pid)` refused with `EPERM`: if the OS refuses, the process is not in the
+    /// caller's session (POSIX allows `EPERM` for another session; a process of the caller's own
+    /// session always answers).
     OtherThanCallers,
     /// Windows: no session ids of this kind.
     None,
@@ -513,7 +514,25 @@ async fn s02_app_parent_is_not_cli() -> Result<()> {
         assert_ne!(app.pgid, cli.pgid, "the app is in the CLI's process group");
     }
     #[cfg(windows)]
-    let _ = cli;
+    {
+        let _ = cli;
+        // The live ancestors of the app (`win::live_ancestors` stops at the dead stub, or where a
+        // parent pid was reused): neither the CLI nor the test may be among them.
+        let chain = win::live_ancestors(app_pid)?;
+        let shown: Vec<String> = chain
+            .iter()
+            .map(|p| format!("{} {}", p.pid, p.exe))
+            .collect();
+        println!("S02 live ancestors of the app {app_pid}: {shown:?}");
+        assert!(
+            !chain.iter().any(|p| p.pid == cli_pid),
+            "the CLI {cli_pid} is an ancestor of the app: {shown:?}"
+        );
+        assert!(
+            !chain.iter().any(|p| p.pid == test_pid),
+            "the test process {test_pid} is an ancestor of the app: {shown:?}"
+        );
+    }
     let r = finish(started).await?;
     assert_eq!(
         r.exit, 4,
@@ -532,9 +551,9 @@ async fn s02_app_parent_is_not_cli() -> Result<()> {
 /// `SIGKILL` to the group (`kill(-pgid)`); the app left the group with `setsid`
 /// (`launch/unix.rs` `first_child`). Windows: `cmd /c atlas-duck ...` and `taskkill /T /F` on
 /// cmd's pid, which ends cmd and every live descendant by parent pid; the app's parent is the
-/// shell (step 1) or the stub, which already exited (step 2). Or, with neither a shell window
-/// nor breakaway on the runner, the CLI had already ended with a launch refusal and no app runs.
-/// Prints `V13 tree_kill_case=<survived|blocked>`.
+/// shell (step 1) or the stub, which already exited (step 2).
+/// The test adds no job, so a CLI that ends without a launch notice is an error on every OS (a
+/// refusal is never an environment fact here). Prints `V13 tree_kill_case=survived`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "CI: S-02 launch survival"]
 async fn s02_app_survives_cli_tree_kill() -> Result<()> {
@@ -545,14 +564,13 @@ async fn s02_app_survives_cli_tree_kill() -> Result<()> {
     let world = jira_world().await?;
     let mut args = HOLD.to_vec();
     args.extend(["--timeout", KILL_TIMEOUT]);
-    let started = until_notice(spawn_tree(&world, &args)?, "the held read").await?;
+    let child = spawn_tree(&world, &args)?;
+    // Windows: until the kill succeeded, an error path ends cmd's tree.
+    #[cfg(windows)]
+    let mut guard = TreeGuard::armed(child.id());
+    let started = until_notice(child, "the held read").await?;
     let Some(notice) = started.notice.clone() else {
         let r = finish(started).await?;
-        if cfg!(windows) {
-            expect_blocked(&world, &r, "tree kill")?;
-            println!("V13 tree_kill_case=blocked");
-            return Ok(());
-        }
         return Err(format!(
             "no submission notice: exit {}: {}\nstderr: {}\n{}",
             r.exit,
@@ -563,7 +581,10 @@ async fn s02_app_survives_cli_tree_kill() -> Result<()> {
         .into());
     };
     let app_pid = wait_app_pid(&world).await?;
+    #[cfg(unix)]
     let ended = kill_tree(&world, started, app_pid).await?;
+    #[cfg(windows)]
+    let ended = kill_tree(&world, started, app_pid, &mut guard).await?;
     println!("S02 tree kill: the CLI tree ended with {ended}");
     same_app_still_serves(&world, app_pid, &notice.request_id).await?;
     println!("V13 tree_kill_case=survived app_pid={app_pid}");
@@ -635,10 +656,49 @@ async fn kill_tree(world: &World, started: Started, app_pid: u32) -> Result<Stri
     Ok(format!("{status}; the app was {app:?}"))
 }
 
-/// Windows: `taskkill /T /F /PID <cmd>`. The CLI (cmd's `atlas-duck.exe` child) must be gone
-/// afterwards; the app's parent was never the CLI.
+/// Windows: ends `taskkill /T /F /PID <cmd>` of the cmd this test spawned when the test fails
+/// before its own kill succeeded (otherwise the CLI would wait out its 120 s deadline). Disarmed
+/// once the kill ran, or when the tree is not the one the test expects (then nothing is killed).
 #[cfg(windows)]
-async fn kill_tree(world: &World, started: Started, app_pid: u32) -> Result<String> {
+struct TreeGuard(Option<u32>);
+
+#[cfg(windows)]
+impl TreeGuard {
+    fn armed(cmd_pid: Option<u32>) -> TreeGuard {
+        TreeGuard(cmd_pid)
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TreeGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            // Best effort: the process may be gone already.
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Windows: `taskkill /T /F /PID <cmd>`. The CLI (cmd's `atlas-duck.exe` child) must be gone
+/// afterwards; the app's parent was never the CLI. The kill runs only if cmd's transitive
+/// descendants are exactly the CLI and optionally `conhost.exe`, each created after cmd: `/T`
+/// walks parent pids (which Windows never clears), so anything else could be a stranger.
+#[cfg(windows)]
+async fn kill_tree(
+    world: &World,
+    started: Started,
+    app_pid: u32,
+    guard: &mut TreeGuard,
+) -> Result<String> {
     let cmd_pid = started.pid;
     let all = win::processes()?;
     let cli_pid = all
@@ -651,10 +711,29 @@ async fn kill_tree(world: &World, started: Started, app_pid: u32) -> Result<Stri
         app.ppid, cli_pid,
         "the app's parent is the CLI: taskkill /T would end it"
     );
+    let tree = win::descendants(&all, cmd_pid)?;
+    let described: Vec<String> = tree
+        .iter()
+        .map(|p| format!("{} {}", p.pid, p.exe))
+        .collect();
+    println!("S02 descendants of cmd {cmd_pid} before the kill: {described:?}");
+    let expected = tree.iter().all(|p| {
+        p.pid == cli_pid || (p.exe.eq_ignore_ascii_case("conhost.exe") && p.pid != app_pid)
+    }) && tree.iter().any(|p| p.pid == cli_pid);
+    if !expected {
+        guard.disarm();
+        return Err(format!(
+            "refusing taskkill /T on cmd {cmd_pid}: its descendants are {described:?}, expected only the CLI {cli_pid} (and conhost.exe)"
+        )
+        .into());
+    }
     let out = std::process::Command::new("taskkill")
         .args(["/T", "/F", "/PID", &cmd_pid.to_string()])
         .stdin(Stdio::null())
         .output()?;
+    if out.status.success() {
+        guard.disarm();
+    }
     println!(
         "S02 taskkill /T /F /PID {cmd_pid}: {} {} {}",
         out.status,
@@ -687,7 +766,8 @@ async fn kill_tree(world: &World, started: Started, app_pid: u32) -> Result<Stri
 /// with its request pending (`survived`: the shell-parent path, whose child takes the shell's
 /// job), or the CLI ended with a launch refusal and no `atlas-duck-app.exe` is in the job
 /// (`blocked`: `job_breakaway` reads this job, which allows no breakaway). Prints
-/// `V13 job_case=<survived|blocked>`.
+/// `V13 job_case=<survived|blocked> shell_window=<some|none>`; `blocked` with a shell window is a
+/// failure (step 1 would have launched outside the job).
 ///
 /// Source: `launch/windows.rs` `spawn_detached` and `job_breakaway` (`QueryInformationJobObject`
 /// of the innermost job), mirrored from its `probe_in_job` test (suspended child, nested job).
@@ -737,6 +817,13 @@ async fn s02_kill_on_job_close_job() -> Result<()> {
             .any(|p| p.pid == *pid && p.exe.eq_ignore_ascii_case("atlas-duck-app.exe"))
     });
 
+    // Step 1 of the launch needs a shell window (`GetShellWindow`) to take as parent: a runner
+    // with one has no reason to refuse the launch.
+    let shell_window = if win::has_shell_window() {
+        "some"
+    } else {
+        "none"
+    };
     let Some(notice) = started.notice.clone() else {
         let r = finish(started).await?;
         assert!(
@@ -745,7 +832,15 @@ async fn s02_kill_on_job_close_job() -> Result<()> {
         );
         drop(job);
         expect_blocked(&world, &r, "job")?;
-        println!("V13 job_case=blocked");
+        assert_eq!(
+            shell_window,
+            "none",
+            "the launch was refused although a shell window exists, so step 1 should have launched outside the job (exit {}: {})\n{}",
+            r.exit,
+            r.stdout.trim(),
+            world.diagnostics()
+        );
+        println!("V13 job_case=blocked shell_window={shell_window}");
         return Ok(());
     };
     let app_pid = wait_app_pid(&world).await?;
@@ -761,14 +856,26 @@ async fn s02_kill_on_job_close_job() -> Result<()> {
         !in_job.contains(&app_pid) && !app_in_job,
         "the app {app_pid} is in the CLI's job (closing it would end the app): {named:?}"
     );
+    let closed = Instant::now();
     drop(job);
     let Started { mut child, .. } = started;
     let status = tokio::time::timeout(ENDS_WITHIN, child.wait())
         .await
         .map_err(|_| "the CLI did not end when its job was closed")??;
-    println!("S02 job closed: the CLI ended with {status}");
+    let ended_after = closed.elapsed();
+    println!("S02 job closed: the CLI ended with {status} after {ended_after:?}");
+    // The close ended it, not its own 120 s deadline (which is exit 4 `pending`).
+    assert!(
+        ended_after < Duration::from_secs(5),
+        "the CLI ended {ended_after:?} after the job close: not the close's doing ({status})"
+    );
+    assert_ne!(
+        status.code(),
+        Some(4),
+        "the CLI ended with its own deadline's exit 4, not by the job close"
+    );
     same_app_still_serves(&world, app_pid, &notice.request_id).await?;
-    println!("V13 job_case=survived app_pid={app_pid}");
+    println!("V13 job_case=survived app_pid={app_pid} shell_window={shell_window}");
     Ok(())
 }
 
@@ -780,7 +887,21 @@ async fn s02_kill_on_job_close_job() -> Result<()> {
 struct Squatter {
     name: String,
     /// The bytes the client sent: everything up to its close, or (`first_only`) the first read.
-    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    task: tokio::task::JoinHandle<std::io::Result<(Vec<u8>, Ending)>>,
+}
+
+/// How the squatter's read ended.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy)]
+enum Ending {
+    /// `first_only`: the first read returned.
+    FirstRead,
+    /// `read_to_end` returned: the client closed.
+    Eof,
+    /// `ErrorKind::BrokenPipe`: the client closed.
+    BrokenPipe,
+    /// `ErrorKind::NotConnected` (`ERROR_PIPE_NOT_CONNECTED`).
+    NotConnected,
 }
 
 #[cfg(windows)]
@@ -812,29 +933,25 @@ fn squat(world: &World, first_only: bool) -> Result<Squatter> {
             let mut buf = [0u8; 64];
             let n = server.read(&mut buf).await?;
             got.extend_from_slice(&buf[..n]);
-            return Ok(got);
+            return Ok((got, Ending::FirstRead));
         }
         // A client that closed reads as EOF or `BrokenPipe` (transport_windows.rs
         // `s01_squatter_pipe_cli_sends_nothing`), or `NotConnected` (`ERROR_PIPE_NOT_CONNECTED`)
         // when the connect was already pending as it came and went. The bytes are 0 either way.
         match server.read_to_end(&mut got).await {
-            Ok(_) => Ok(got),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected
-                ) =>
-            {
-                Ok(got)
-            }
-            Err(e) => Err(e),
+            Ok(_) => Ok((got, Ending::Eof)),
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::BrokenPipe => Ok((got, Ending::BrokenPipe)),
+                std::io::ErrorKind::NotConnected => Ok((got, Ending::NotConnected)),
+                _ => Err(e),
+            },
         }
     });
     Ok(Squatter { name, task })
 }
 
 #[cfg(windows)]
-async fn squatter_bytes(s: Squatter, what: &str) -> Result<Vec<u8>> {
+async fn squatter_bytes(s: Squatter, what: &str) -> Result<(Vec<u8>, Ending)> {
     let name = s.name;
     match tokio::time::timeout(Duration::from_secs(30), s.task).await {
         Ok(joined) => Ok(joined??),
@@ -872,7 +989,7 @@ async fn s01_squatter_pipe_cli_sends_nothing_e2e() -> Result<()> {
     // Control: no hook, the CLI writes into the pipe.
     let control = squat(&world, true)?;
     let child = cli_command(&world, &["instances", "--timeout", "30"], &[]).spawn()?;
-    let sent = squatter_bytes(control, "control").await?;
+    let (sent, _) = squatter_bytes(control, "control").await?;
     let r = finish(until_notice(child, "control").await?).await?;
     println!(
         "S01 control: the CLI without the hook sent {} bytes, then exit {}: {}",
@@ -895,8 +1012,11 @@ async fn s01_squatter_pipe_cli_sends_nothing_e2e() -> Result<()> {
     .spawn()?;
     let r = finish(until_notice(child, "squatter").await?).await?;
     let what = format!("squatter (the CLI exited {}: {})", r.exit, r.stdout.trim());
-    let got = squatter_bytes(squatter, &what).await?;
-    println!("S01 squatter_bytes_received={}", got.len());
+    let (got, ending) = squatter_bytes(squatter, &what).await?;
+    println!(
+        "S01 squatter_bytes_received={} ending={ending:?}",
+        got.len()
+    );
     assert!(
         got.is_empty(),
         "the CLI sent {} bytes to a server whose owner check failed: {:?}",
@@ -934,7 +1054,7 @@ mod win {
     use std::io;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Foundation::{FILETIME, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
         TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -945,9 +1065,16 @@ mod win {
         JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
         SetInformationJobObject,
     };
-    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION, ResumeThread,
+        THREAD_SUSPEND_RESUME,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetShellWindow;
 
     use super::utf16_until_nul;
+
+    /// The longest parent chain `live_ancestors` follows (a cycle guard).
+    const MAX_ANCESTORS: usize = 64;
 
     /// The most process ids a job list query takes.
     const MAX_JOB_PIDS: usize = 1024;
@@ -994,6 +1121,101 @@ mod win {
             ok = unsafe { Process32NextW(snap.as_raw_handle(), &mut entry) };
         }
         Ok(out)
+    }
+
+    /// When `pid` was created (`GetProcessTimes`, FILETIME ticks). A pid can be reused, a creation
+    /// time cannot go backwards: a parent created after its child is a reused pid.
+    pub(super) fn creation_time(pid: u32) -> io::Result<u64> {
+        // SAFETY: plain call; null on failure.
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a fresh process handle nothing else owns.
+        let h = unsafe { OwnedHandle::from_raw_handle(h) };
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        // SAFETY: a live process handle with query rights; four writable FILETIMEs.
+        let ok = unsafe {
+            GetProcessTimes(
+                h.as_raw_handle(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
+    }
+
+    /// The live ancestors of `pid`, nearest first. Windows does not reparent, so a dead parent
+    /// stays named by its child: the walk ends at a parent that is not in the process snapshot
+    /// (the dead stub is the intended end), or that cannot be opened, or that was created after its
+    /// child (a reused pid, not the real parent).
+    pub(super) fn live_ancestors(pid: u32) -> io::Result<Vec<Proc>> {
+        let all = processes()?;
+        let start = all
+            .iter()
+            .find(|p| p.pid == pid)
+            .ok_or_else(|| io::Error::other(format!("process {pid} is not running")))?;
+        let mut child_created = creation_time(pid)?;
+        let mut next = start.ppid;
+        let mut chain = Vec::new();
+        while chain.len() < MAX_ANCESTORS {
+            let Some(parent) = all.iter().find(|p| p.pid == next) else {
+                break;
+            };
+            let Ok(created) = creation_time(parent.pid) else {
+                break;
+            };
+            if created > child_created {
+                break;
+            }
+            chain.push(parent.clone());
+            child_created = created;
+            next = parent.ppid;
+        }
+        Ok(chain)
+    }
+
+    /// The transitive descendants of `root` by parent pid in `all`, each created no earlier than
+    /// its parent (a stale parent pid of a reused id is skipped). A process that cannot be read is
+    /// an error: the caller must not guess.
+    pub(super) fn descendants(all: &[Proc], root: u32) -> io::Result<Vec<Proc>> {
+        let mut out: Vec<Proc> = Vec::new();
+        let mut open = vec![(root, creation_time(root)?)];
+        while let Some((parent, parent_created)) = open.pop() {
+            for p in all.iter().filter(|p| p.ppid == parent && p.pid != parent) {
+                if out.iter().any(|q| q.pid == p.pid) {
+                    continue;
+                }
+                let created = creation_time(p.pid).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("creation time of {} {}: {e}", p.pid, p.exe),
+                    )
+                })?;
+                if created >= parent_created {
+                    out.push(p.clone());
+                    open.push((p.pid, created));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether the desktop has a shell window (`GetShellWindow`): launch step 1 takes its process
+    /// as the app's parent.
+    pub(super) fn has_shell_window() -> bool {
+        // SAFETY: plain call without arguments; null when there is no shell window.
+        !unsafe { GetShellWindow() }.is_null()
     }
 
     /// `ResumeThread` on every thread of `pid` (a process created suspended has one); returns how
