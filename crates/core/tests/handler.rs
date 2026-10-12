@@ -279,7 +279,18 @@ async fn status_never_blocks_never_delivers() -> TestResult {
     assert_eq!(st.status, Status::Pending);
     // (`status` exits 0 for any known id, §4.4: the CLI's override, M4; not the matrix.)
     assert!(only_routing_fields(&json(&st)?));
-    assert_eq!(h.event_types(&id).await?, [EventType::REQUEST_RECEIVED]);
+    // The fetch runs concurrently, so one READ_FETCHED may already be committed; `status` itself
+    // must add nothing: no DELIVERED/RELEASED/CANCELLED and no second event of any kind.
+    let events = h.event_types(&id).await?;
+    assert_eq!(
+        events.first(),
+        Some(&EventType::REQUEST_RECEIVED),
+        "{events:?}"
+    );
+    assert!(
+        events[1..].iter().all(|e| *e == EventType::READ_FETCHED) && events.len() <= 2,
+        "status added an event: {events:?}"
+    );
     Ok(())
 }
 

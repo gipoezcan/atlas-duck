@@ -353,6 +353,24 @@ jobs:
           node ci/check-no-skips.mjs "$TMPDIR/cli-flows.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
           grep -E '(^|[[:space:]])V13 ' "$TMPDIR/cli-flows.log" || true
 
+      # The compile_error! lock itself: a release build with the test-only feature must fail, and
+      # fail because of the lock (not a missing dependency or a typo). Runs in the rust job (the
+      # supply-chain job has no GTK/WebKit dev packages, so the app's deps cannot build there).
+      - name: Release lock (scripted-approver must not compile in release)
+        if: runner.os == 'Linux'
+        run: |
+          set -uo pipefail
+          if cargo check -p atlas-duck-app --release --features scripted-approver --locked > "$RUNNER_TEMP/release-lock.txt" 2>&1; then
+            cat "$RUNNER_TEMP/release-lock.txt"
+            echo "::error::scripted-approver compiled in a release build"
+            exit 1
+          fi
+          grep -q 'must never reach a release build' "$RUNNER_TEMP/release-lock.txt" || {
+            cat "$RUNNER_TEMP/release-lock.txt"
+            echo "::error::the release build failed, but not on the scripted-approver lock"
+            exit 1
+          }
+
       - name: M4 S-02 launch survival (#[ignore]d, macOS)
         if: runner.os == 'macOS'
         env:
@@ -1148,22 +1166,6 @@ jobs:
           for f in scripted-approver test-paths test-env testing insecure-test-http; do
             grep -qE "\[[^]]*$f[^]]*\]" "$RUNNER_TEMP/tree-control.txt" || { echo "::error::positive control: $f not visible with --features scripted-approver"; exit 1; }
           done
-
-      # The compile_error! lock itself: a release build with the test-only feature must fail, and
-      # fail because of the lock (not a missing dependency or a typo).
-      - name: Release lock (scripted-approver must not compile in release)
-        run: |
-          set -uo pipefail
-          if cargo check -p atlas-duck-app --release --features scripted-approver --locked > "$RUNNER_TEMP/release-lock.txt" 2>&1; then
-            cat "$RUNNER_TEMP/release-lock.txt"
-            echo "::error::scripted-approver compiled in a release build"
-            exit 1
-          fi
-          grep -q 'must never reach a release build' "$RUNNER_TEMP/release-lock.txt" || {
-            cat "$RUNNER_TEMP/release-lock.txt"
-            echo "::error::the release build failed, but not on the scripted-approver lock"
-            exit 1
-          }
 
   ui:
     name: ui (Vite + React shell, spec §2.4, §6.4)
