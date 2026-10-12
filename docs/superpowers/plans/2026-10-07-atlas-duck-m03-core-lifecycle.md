@@ -55,7 +55,7 @@ Verified on 2026-10-08 against crates.io (`/api/v1/crates/<name>`) and docs.rs f
 | `icu_normalizer` | `=2.3.0` | — | T06 (workspace pin only; no preview module uses NFC) | atlassian (T07, username NFC; `atlassian` is a leaf and cannot borrow `preview`'s), core (T14, canonical match form) | NFC from the same ICU data version as the classifier |
 | `icu_casemap` | `=2.3.0` | — | T07 | atlassian | Unicode **simple** case folding (`CaseMapper::simple_fold`) for `username_matches` |
 | `emojis` | `=0.9.0` | — | T06 | preview | RGI emoji sequence lookup (`emojis::get`); `icu_properties` 2.3 has `BasicEmoji` but no RGI_Emoji string set. License `(MIT OR Apache-2.0) AND Unicode-3.0`, all allowed |
-| `ammonia` | `=4.2.1` | — | T05 | preview | master-plan pin, §6.4 sanitizer |
+| `ammonia` | `=4.2.3` | — | T05 | preview | master-plan pin, §6.4 sanitizer |
 | `html-escape` | `=0.2.15` | — | T14 | core (redaction views) | HTML named/decimal/hex entity decoding for the canonical match form |
 | `percent-encoding` | as locked by `url` (add `=2.3.x` exactly as `cargo tree -i percent-encoding` prints after T07) | — | T14 | core | percent views; the version `url` already brings, so no second copy |
 | `secrecy` | `=0.10.3` | — | T07 | atlassian, core | §10.1 non-`Serialize` secret type |

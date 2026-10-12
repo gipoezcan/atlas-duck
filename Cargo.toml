@@ -75,7 +75,7 @@ proptest = "=1.11.0"
 # M3 catalog tests (U-05) and core::validate: no `$ref` I/O (plan "Dependency pins").
 jsonschema = { version = "=0.58.6", default-features = false }
 # M3 preview sanitizer (§6.4).
-ammonia = "=4.2.1"
+ammonia = "=4.2.3"
 # M3 invisible-character classifier, mixed-script check and NFC from one ICU data version (§6.4, V31).
 icu_properties = "=2.3.0"
 icu_normalizer = "=2.3.0"
