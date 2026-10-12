@@ -195,12 +195,30 @@ fn os_socket_dir(host: &str) -> io::Result<PathBuf> {
     if run_ok {
         return Ok(run.join(super::APP_DIR_NAME));
     }
-    Ok(super::base_dirs()?
+    let dir = super::base_dirs()?
         .home
         .join(".local")
         .join("state")
         .join(super::APP_DIR_NAME)
-        .join(format!("run-{host}")))
+        .join(format!("run-{host}"));
+    if socket_path_fits_in(&dir, LINUX_SUN_PATH_LEN) {
+        Ok(dir)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path is 108 bytes or longer",
+        ))
+    }
+}
+
+/// `sun_path` size on Linux, including the terminating NUL.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+const LINUX_SUN_PATH_LEN: usize = 108;
+
+/// True iff the socket path in `dir` is under `limit` bytes.
+#[cfg(any(unix, test))]
+fn socket_path_fits_in(dir: &Path, limit: usize) -> bool {
+    dir.join(SOCKET_FILE_NAME).as_os_str().len() < limit
 }
 
 /// `sun_path` size on macOS, including the terminating NUL.
@@ -210,7 +228,7 @@ const SUN_PATH_LEN: usize = 104;
 /// True iff the socket path in `dir` is under `SUN_PATH_LEN` bytes.
 #[cfg(any(target_os = "macos", test))]
 fn socket_path_fits(dir: &Path) -> bool {
-    dir.join(SOCKET_FILE_NAME).as_os_str().len() < SUN_PATH_LEN
+    socket_path_fits_in(dir, SUN_PATH_LEN)
 }
 
 /// `<home>/s`, refused when the socket path in it would not fit `sun_path` on macOS.
@@ -590,6 +608,18 @@ mod tests {
         let too_long = format!("/{}", "a".repeat(base));
         assert!(socket_path_fits(Path::new(&fits)));
         assert!(!socket_path_fits(Path::new(&too_long)));
+    }
+
+    #[test]
+    fn linux_socket_path_fit_boundary() {
+        let base = LINUX_SUN_PATH_LEN - 1 - SOCKET_FILE_NAME.len() - 1;
+        let fits = format!("/{}", "a".repeat(base - 1));
+        let too_long = format!("/{}", "a".repeat(base));
+        assert!(socket_path_fits_in(Path::new(&fits), LINUX_SUN_PATH_LEN));
+        assert!(!socket_path_fits_in(
+            Path::new(&too_long),
+            LINUX_SUN_PATH_LEN
+        ));
     }
 
     #[test]

@@ -26,6 +26,7 @@ use super::LaunchError;
 #[cfg(target_os = "linux")]
 use super::plan::SYSTEMD_RUN;
 use super::plan::{ExecPlan, Via, exec_plan, must_be_executable};
+use crate::deadline::Deadline;
 use crate::discover;
 
 /// The descriptor sweep's upper bound when `close_range` is unavailable (the soft
@@ -39,8 +40,12 @@ const PROBE_LIMIT: Duration = Duration::from_secs(2);
 
 /// Starts `app --background` detached (PD-23): macOS bundles through `open -n -g -a`, Linux
 /// through `systemd-run --user --scope` when the user manager answers, else directly.
-pub(crate) fn launch_app(app: &Path, env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
-    launch_via(app, via_for_this_os(), env)
+pub(crate) fn launch_app(
+    app: &Path,
+    env: &[(OsString, OsString)],
+    deadline: &Deadline,
+) -> Result<(), LaunchError> {
+    launch_via(app, via_for_this_os(deadline), env)
 }
 
 /// `launch_app` with the launcher chosen. A file the plan executes that is not executable fails
@@ -156,10 +161,10 @@ fn unix_stream_socket() -> io::Result<OwnedFd> {
     Ok(fd)
 }
 
-fn via_for_this_os() -> Via {
+fn via_for_this_os(deadline: &Deadline) -> Via {
     if cfg!(target_os = "macos") {
         Via::MacOpen
-    } else if systemd_run_available() {
+    } else if systemd_run_available(deadline) {
         Via::SystemdRun
     } else {
         Via::Direct
@@ -167,14 +172,15 @@ fn via_for_this_os() -> Via {
 }
 
 /// Whether `systemd-run --user --scope` works here: `/usr/bin/systemd-run` exists and a probe
-/// scope running `/bin/true` succeeds within 2 s. Probed once per process.
-pub(crate) fn systemd_run_available() -> bool {
+/// scope running `/bin/true` succeeds within 2 s or the time left, whichever is shorter. Probed once
+/// per process.
+pub(crate) fn systemd_run_available(deadline: &Deadline) -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(probe_systemd_run)
+    *AVAILABLE.get_or_init(|| probe_systemd_run(deadline))
 }
 
 #[cfg(target_os = "linux")]
-fn probe_systemd_run() -> bool {
+fn probe_systemd_run(deadline: &Deadline) -> bool {
     let systemd_run = Path::new(SYSTEMD_RUN);
     if !systemd_run.is_file() {
         return false;
@@ -185,14 +191,14 @@ fn probe_systemd_run() -> bool {
             systemd_run,
             &["--user", "--scope", "--quiet", "--collect", "/bin/true"],
             &env,
-            PROBE_LIMIT,
+            deadline.cap(PROBE_LIMIT),
         ),
         Some((true, _))
     )
 }
 
 #[cfg(not(target_os = "linux"))]
-fn probe_systemd_run() -> bool {
+fn probe_systemd_run(_deadline: &Deadline) -> bool {
     false
 }
 
@@ -392,6 +398,8 @@ pub(crate) fn spawn_detached(
 /// Only to be called in the child right after `fork`.
 unsafe fn first_child(p: &Prepared, dev_null: libc::c_int) -> ! {
     unsafe {
+        // SAFETY: `setsid`, `fork` and `_exit` are async-signal-safe and touch no memory; `grandchild`
+        // has the same contract and runs only in the fork's child.
         if libc::setsid() < 0 {
             libc::_exit(1);
         }
@@ -410,6 +418,9 @@ unsafe fn first_child(p: &Prepared, dev_null: libc::c_int) -> ! {
 /// Only to be called in the grandchild right after `fork`.
 unsafe fn grandchild(p: &Prepared, dev_null: libc::c_int) -> ! {
     unsafe {
+        // SAFETY: only async-signal-safe calls (`dup2`, `close_range`/`close`, `chdir`, `signal`,
+        // `sigprocmask`, `execve`, `_exit`); no allocation, no locks. The pointers read from `p` were
+        // built before the first `fork` and stay valid because their owners live in `p`.
         for target in 0..=2 {
             if libc::dup2(dev_null, target) < 0 {
                 libc::_exit(EXEC_FAILED);
@@ -729,7 +740,10 @@ mod tests {
     #[test]
     #[ignore = "runs systemd-run; run on the T26 Linux leg with --ignored --nocapture"]
     fn v13_linux_systemd_run_probe() {
-        println!("V13 systemd_run_user_scope={}", systemd_run_available());
+        println!(
+            "V13 systemd_run_user_scope={}",
+            systemd_run_available(&Deadline::from_timeout(Instant::now(), None))
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! fresh name) and accepts only a name with this user's SID prefix.
 //!
 //! The hello frame is built before anything is opened: `agent_name` and `cwd_basename` cut to
-//! 64 characters (§3.3), the whole frame at most [`HELLO_MAX_BYTES`] (the server's first-frame
+//! `HELLO_FIELD_MAX_CHARS` characters (§3.3; the server cuts them to 64), the whole frame at most [`HELLO_MAX_BYTES`] (the server's first-frame
 //! cap), its answer read with the same cap.
 //!
 //! After the hello, one background task per client reads every frame the server sends: a

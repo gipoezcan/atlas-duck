@@ -57,7 +57,12 @@ impl LaunchSys for Double {
         vec![(OsString::from("LANG"), OsString::from("C"))]
     }
 
-    fn spawn_app(&self, _app: &Path, env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
+    fn spawn_app(
+        &self,
+        _app: &Path,
+        env: &[(OsString, OsString)],
+        _deadline: &Deadline,
+    ) -> Result<(), LaunchError> {
         self.spawns.fetch_add(1, Ordering::SeqCst);
         *self.spawned_env.lock().unwrap() = env.to_vec();
         std::thread::sleep(self.spawn_delay);
@@ -323,7 +328,12 @@ impl LaunchSys for RealPipe {
         Vec::new()
     }
 
-    fn spawn_app(&self, _app: &Path, _env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
+    fn spawn_app(
+        &self,
+        _app: &Path,
+        _env: &[(OsString, OsString)],
+        _deadline: &Deadline,
+    ) -> Result<(), LaunchError> {
         use atlas_duck_ipc::paths::{EndpointLocation, endpoint_location, write_endpoint_file};
         use atlas_duck_ipc::transport::windows::PipeListener;
 

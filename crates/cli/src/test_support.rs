@@ -25,6 +25,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::connected::Connector;
+use crate::deadline::Deadline;
 use crate::discover::{AppLocation, DataState, Discovery};
 use crate::interrupt::{BoxFuture, Interrupts};
 use crate::launch::{LaunchError, LaunchSys};
@@ -336,7 +337,12 @@ impl LaunchSys for PresentSys {
     fn launch_env(&self) -> Vec<(OsString, OsString)> {
         Vec::new()
     }
-    fn spawn_app(&self, _app: &Path, _env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
+    fn spawn_app(
+        &self,
+        _app: &Path,
+        _env: &[(OsString, OsString)],
+        _deadline: &Deadline,
+    ) -> Result<(), LaunchError> {
         if self.present {
             Err(LaunchError::Unsupported)
         } else {

@@ -385,8 +385,12 @@ export function checkManifests({ root, members }) {
   }
   // T21 review I-2: `debug-assertions` in a release profile would let the test-only features
   // (their `compile_error!` locks key on `not(debug_assertions)`) into a shipped build.
+  // Every profile table counts, not just `release`: a custom profile that inherits release (and
+  // is selected with `--profile`) ships the same binaries. Only dev and test stay open: the locks
+  // exist because those are the debug-assertion profiles.
   for (const [section, keys] of rootToml) {
-    if (section !== "profile.release" && !section.startsWith("profile.release.")) continue;
+    const profile = /^profile\.("[^"]*"|'[^']*'|[^.]+)/.exec(section)?.[1]?.replace(/["']/g, "");
+    if (profile === undefined || profile === "dev" || profile === "test") continue;
     for (const [key, value] of keys) {
       if (key.split(".").pop() === "debug-assertions" && value !== "false") {
         violations.push(

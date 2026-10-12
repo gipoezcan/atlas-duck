@@ -495,6 +495,10 @@ where
 /// [`shutdown`]s the state it left in `slot` (none when the start failed or was cancelled).
 /// `outer` bounds all of it. One run per slot: a second Quit while one runs waits for it and
 /// gets the same outcome.
+///
+/// When `Core::start` is still running after `START_WAIT` it is not waited for any longer: quit
+/// returns without a store shutdown (logged as `quit_wait_expired`) and the next start recovers
+/// the WAL.
 pub async fn quit(slot: &ServeSlot, reason: ShutdownReason, outer: Duration) -> ShutdownOutcome {
     *slot
         .quit_done()

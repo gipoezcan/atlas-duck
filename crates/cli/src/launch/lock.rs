@@ -53,9 +53,14 @@ pub(crate) fn ensure_pinned_dir(base: &BaseDirs) -> io::Result<PathBuf> {
     let dir = pinned_dir(base);
     match dir_builder().create(&dir) {
         Ok(()) => Ok(dir),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && dir.is_dir() => Ok(dir),
+        // A symlink at that path is refused even when it points at a directory.
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists && real_dir(&dir) => Ok(dir),
         Err(e) => Err(e),
     }
+}
+
+fn real_dir(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir())
 }
 
 /// Non-recursive; mode 0700 on Unix, the default ACL on Windows.
@@ -174,5 +179,18 @@ mod tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_dir_that_is_a_symlink_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = base(tmp.path());
+        let dir = pinned_dir(&b);
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+        assert!(ensure_pinned_dir(&b).is_err());
     }
 }

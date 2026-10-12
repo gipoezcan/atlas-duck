@@ -13,13 +13,14 @@ use serde_json::Value;
 use crate::argv::{GlobalOpts, OutputMode};
 
 /// Prints `env` and returns `exit`, unless stdout cannot be written: then `exit::PENDING` (4).
-pub(crate) fn emit_with_exit(env: &Envelope, opts: &GlobalOpts, exit: i32) -> i32 {
+pub(crate) fn emit_with_exit(env: &Envelope, opts: &GlobalOpts, exit: i32, cli_help: bool) -> i32 {
     emit_to(
         &mut io::stdout().lock(),
         &mut io::stderr().lock(),
         env,
         opts,
         exit,
+        cli_help,
     )
 }
 
@@ -29,13 +30,14 @@ pub(crate) fn emit_to(
     env: &Envelope,
     opts: &GlobalOpts,
     exit_code: i32,
+    cli_help: bool,
 ) -> i32 {
     let written = match opts.output {
         OutputMode::Json => out
             .write_all(env.to_json_line().as_bytes())
             .and_then(|()| out.flush()),
         OutputMode::Text => {
-            let body = render_text(env);
+            let body = render_text(env, cli_help);
             let stdout_result = if body.is_empty() {
                 Ok(())
             } else {
@@ -56,25 +58,52 @@ pub(crate) fn emit_to(
     }
 }
 
-/// PD-15: `data.help` raw; else `data.result` pretty; else `data` pretty; nothing for null data.
-fn render_text(env: &Envelope) -> String {
+/// PD-15: `data.help` raw, only for the CLI's own help envelope (`cli_help`); else `data.result`
+/// pretty; else `data` pretty; nothing for null data. Pretty output has terminal-active characters
+/// escaped: it can carry text from the app and the services behind it.
+fn render_text(env: &Envelope, cli_help: bool) -> String {
     let Some(data) = &env.data else {
         return String::new();
     };
     if data.is_null() {
         return String::new();
     }
-    let mut text = match data.get("help").and_then(Value::as_str) {
+    let help = if cli_help {
+        data.get("help").and_then(Value::as_str)
+    } else {
+        None
+    };
+    let mut text = match help {
         Some(help) => help.to_owned(),
         None => {
             let shown = data.get("result").unwrap_or(data);
-            serde_json::to_string_pretty(shown).unwrap_or_else(|_| shown.to_string())
+            escape_terminal(
+                &serde_json::to_string_pretty(shown).unwrap_or_else(|_| shown.to_string()),
+            )
         }
     };
     if !text.ends_with('\n') {
         text.push('\n');
     }
     text
+}
+
+/// JSON escapes only U+0000 to U+001F: C1 controls (U+009B is CSI) and bidi controls would reach
+/// the terminal raw. They become `\u{..}` text; the layout newlines stay.
+fn escape_terminal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let bidi = matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        );
+        if (c.is_control() && c != '\n') || bidi {
+            out.push_str(&format!("\\u{{{:x}}}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// §4.1 submission notice (PD-19): one flushed stderr line, written right after the server
@@ -148,7 +177,7 @@ mod tests {
 
     fn run(env: &Envelope, mode: OutputMode, code: i32) -> (i32, String, String) {
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let exit = emit_to(&mut out, &mut err, env, &opts(mode), code);
+        let exit = emit_to(&mut out, &mut err, env, &opts(mode), code, true);
         (
             exit,
             String::from_utf8(out).unwrap_or_default(),
@@ -199,11 +228,41 @@ mod tests {
     }
 
     #[test]
+    fn a_server_supplied_help_string_is_not_printed_raw() {
+        let env = with_data(json!({"help": "\u{1b}[2Jowned"}));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        emit_to(&mut out, &mut err, &env, &opts(OutputMode::Text), 0, false);
+        let out = String::from_utf8(out).unwrap_or_default();
+        assert!(out.contains("\"help\""), "{out}");
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn text_escapes_c1_and_bidi_controls_but_not_json_output() {
+        let nasty = "a\u{9b}31m b\u{202e}c\u{2066}d\u{200f}e\u{61c}f\u{7f}g";
+        let env = with_data(json!({"result": {"k": nasty}}));
+        let (_, out, _) = run(&env, OutputMode::Text, 0);
+        assert!(out.contains("\\u{9b}"), "{out}");
+        assert!(out.contains("\\u{202e}"));
+        assert!(out.contains("\\u{2066}"));
+        assert!(out.contains("\\u{200f}"));
+        assert!(out.contains("\\u{61c}"));
+        assert!(out.contains("\\u{7f}"));
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(!out.contains('\u{202e}'));
+        // Layout newlines and ordinary text stay.
+        assert!(out.starts_with("{\n  \"k\": \"a"));
+        // JSON mode is machine output and unchanged.
+        let (_, json_out, _) = run(&env, OutputMode::Json, 0);
+        assert_eq!(json_out, env.to_json_line());
+    }
+
+    #[test]
     fn stdout_write_failure_exit_4() {
         let env = with_data(json!({}));
         for mode in [OutputMode::Json, OutputMode::Text] {
             let mut err = Vec::new();
-            let code = emit_to(&mut Broken, &mut err, &env, &opts(mode), 0);
+            let code = emit_to(&mut Broken, &mut err, &env, &opts(mode), 0, false);
             assert_eq!(code, 4, "{mode:?}");
         }
         // A broken stderr does not change the exit code.
@@ -214,7 +273,8 @@ mod tests {
                 &mut Broken,
                 &with_data(json!({"result": 1})),
                 &opts(OutputMode::Text),
-                0
+                0,
+                false
             ),
             0
         );

@@ -9,7 +9,8 @@
 # about to run:
 #   1. the environment: no RUSTFLAGS-style variable and no CARGO_PROFILE_*_DEBUG_ASSERTIONS enables
 #      debug assertions (they would defeat the locks);
-#   2. the `cargo tauri build` lines of bundle.yml: no `--debug`, no `--features`, no
+#   2. the `cargo tauri build` lines of bundle.yml: no `--debug`, no `--features`, no `--profile`,
+#      no `--config` (either could select a profile or features from outside), no
 #      `scripted-approver` (a debug-profile build is the one place the locks are open);
 #   3. the dependency tree of the app with the bundle build's own flags (target, `--locked`, no
 #      features): no workspace package shows a test-only feature in its `{f}` list. NOT the plan's
@@ -42,8 +43,8 @@ while IFS='=' read -r name value; do
 done < <(env)
 
 # 2. the bundle workflow's own tauri build command lines
-if grep -nE 'cargo tauri build.*(--debug|--features|scripted-approver)' .github/workflows/bundle.yml; then
-  fail "a bundle build uses --debug, --features or scripted-approver"
+if grep -nE 'cargo tauri build.*(--debug|--features|--profile|--config|scripted-approver)' .github/workflows/bundle.yml; then
+  fail "a bundle build uses --debug, --features, --profile, --config or scripted-approver"
 fi
 
 # 3. the feature tree with the build's flags

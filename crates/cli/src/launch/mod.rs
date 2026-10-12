@@ -79,8 +79,14 @@ pub(crate) trait LaunchSys: Sync {
     fn gui_session(&self) -> bool;
     /// The launched app's environment (§4.7 allowlist).
     fn launch_env(&self) -> Vec<(OsString, OsString)>;
-    /// Starts `app --background` detached with exactly `env` (PD-23 / Task 15).
-    fn spawn_app(&self, app: &Path, env: &[(OsString, OsString)]) -> Result<(), LaunchError>;
+    /// Starts `app --background` detached with exactly `env` (PD-23 / Task 15). Any probe it runs
+    /// first (Linux's `systemd-run`) stays within `deadline`.
+    fn spawn_app(
+        &self,
+        app: &Path,
+        env: &[(OsString, OsString)],
+        deadline: &Deadline,
+    ) -> Result<(), LaunchError>;
     /// Whether the app answers on this user's endpoint: a liveness probe, not just the file, so a
     /// stale endpoint left by a crashed app neither stops a launch nor ends the poll early.
     fn endpoint_present(&self, data: &LocalDataDir, host: &str) -> bool;
@@ -100,18 +106,25 @@ impl LaunchSys for OsLaunchSys {
         env::launch_env(std::env::vars_os())
     }
 
-    fn spawn_app(&self, app: &Path, env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
+    fn spawn_app(
+        &self,
+        app: &Path,
+        env: &[(OsString, OsString)],
+        deadline: &Deadline,
+    ) -> Result<(), LaunchError> {
         #[cfg(unix)]
         {
-            unix::launch_app(app, env)
+            unix::launch_app(app, env, deadline)
         }
         #[cfg(windows)]
         {
+            // No probe runs on Windows.
+            let _ = deadline;
             windows::launch_app(app, env)
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (app, env);
+            let _ = (app, env, deadline);
             Err(LaunchError::Unsupported)
         }
     }
@@ -250,7 +263,8 @@ pub(crate) fn ensure_running(
 
     // (6) Detached spawn with the allowlisted environment.
     let env = sys.launch_env();
-    sys.spawn_app(app, &env).map_err(|e| launch_failed(&e))?;
+    sys.spawn_app(app, &env, deadline)
+        .map_err(|e| launch_failed(&e))?;
 
     // (7) Poll for min(20 s, remaining).
     let until = Instant::now() + deadline.cap(POLL_LIMIT);

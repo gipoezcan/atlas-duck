@@ -47,6 +47,8 @@ pub(crate) struct Outcome {
     pub env: Envelope,
     pub opts: GlobalOpts,
     pub exit: i32,
+    /// The envelope is the CLI's own `help` answer (its text may print raw).
+    pub cli_help: bool,
 }
 
 /// Parses `args` and runs the command; prints nothing.
@@ -75,10 +77,13 @@ pub(crate) fn execute(
         _ => execute_connected(&command, &opts, &deadline, connector),
     };
     let exit = exit::exit_for(&command, &envelope);
+    let cli_help = matches!(command, Command::Help { .. })
+        && envelope.status == atlas_duck_ipc::envelope::Status::Succeeded;
     Outcome {
         env: envelope,
         opts,
         exit,
+        cli_help,
     }
 }
 
@@ -97,6 +102,7 @@ fn failure(env: Envelope) -> Outcome {
             help: false,
         },
         exit,
+        cli_help: false,
     }
 }
 
@@ -147,7 +153,7 @@ pub fn run(args: Vec<OsString>) -> i32 {
         &mut Inputs::process(),
         &OsConnector,
     );
-    output::emit_with_exit(&outcome.env, &outcome.opts, outcome.exit)
+    output::emit_with_exit(&outcome.env, &outcome.opts, outcome.exit, outcome.cli_help)
 }
 
 #[cfg(test)]

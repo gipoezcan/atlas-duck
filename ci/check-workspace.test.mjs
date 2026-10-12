@@ -353,6 +353,19 @@ debug-assertions = true
 debug-assertions = true
 `, ["profile.release.build-override"]],
     [ROOT_OK.replace('panic = "abort"', 'panic = "abort"\npackage.x.debug-assertions = true'), ["profile.release"]],
+    [`${ROOT_OK}
+[profile.shipping]
+inherits = "release"
+debug-assertions = true
+`, ["profile.shipping"]],
+    [`${ROOT_OK}
+[profile.shipping.package.atlas-duck-ipc]
+debug-assertions = true
+`, ["profile.shipping.package.atlas-duck-ipc"]],
+    [`${ROOT_OK}
+[profile.bench]
+debug-assertions = true
+`, ["profile.bench"]],
   ];
   for (const [root, sections] of cases) {
     assert.deepEqual(checkManifests(manifests({ root })), sections.map(bad));

@@ -1149,6 +1149,22 @@ jobs:
             grep -qE "\[[^]]*$f[^]]*\]" "$RUNNER_TEMP/tree-control.txt" || { echo "::error::positive control: $f not visible with --features scripted-approver"; exit 1; }
           done
 
+      # The compile_error! lock itself: a release build with the test-only feature must fail, and
+      # fail because of the lock (not a missing dependency or a typo).
+      - name: Release lock (scripted-approver must not compile in release)
+        run: |
+          set -uo pipefail
+          if cargo check -p atlas-duck-app --release --features scripted-approver --locked > "$RUNNER_TEMP/release-lock.txt" 2>&1; then
+            cat "$RUNNER_TEMP/release-lock.txt"
+            echo "::error::scripted-approver compiled in a release build"
+            exit 1
+          fi
+          grep -q 'must never reach a release build' "$RUNNER_TEMP/release-lock.txt" || {
+            cat "$RUNNER_TEMP/release-lock.txt"
+            echo "::error::the release build failed, but not on the scripted-approver lock"
+            exit 1
+          }
+
   ui:
     name: ui (Vite + React shell, spec §2.4, §6.4)
     runs-on: ubuntu-22.04
