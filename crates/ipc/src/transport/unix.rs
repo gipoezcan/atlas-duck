@@ -39,12 +39,15 @@ const MSG_NUL: &str = "path contains a NUL byte";
 pub struct PeerCred {
     /// The peer's effective uid.
     pub uid: u32,
-    /// The peer's pid, when the OS reports one (Linux `SO_PEERCRED`, macOS
-    /// `LOCAL_PEEREPID`).
+    /// The peer's pid, when the OS reports one (Linux `SO_PEERCRED`; Apple
+    /// `LOCAL_PEEREPID`, best effort: `None` once the peer has closed).
     pub pid: Option<u32>,
 }
 
 impl PeerCred {
+    /// `SO_PEERCRED` via tokio: uid and pid as of `connect`, readable after
+    /// the peer has closed.
+    #[cfg(not(target_vendor = "apple"))]
     fn of(stream: &UnixStream) -> io::Result<PeerCred> {
         let cred = stream.peer_cred()?;
         Ok(PeerCred {
@@ -52,6 +55,51 @@ impl PeerCred {
             pid: cred.pid().and_then(|p| u32::try_from(p).ok()),
         })
     }
+
+    /// tokio's `peer_cred` on Apple asks `LOCAL_PEEREPID` first, which fails
+    /// with `ENOTCONN` once the peer has closed. `getpeereid` reads the
+    /// credentials cached at `connect` and survives that, so the uid comes
+    /// from it and the pid is best effort.
+    #[cfg(target_vendor = "apple")]
+    fn of(stream: &UnixStream) -> io::Result<PeerCred> {
+        use std::os::fd::AsRawFd;
+
+        let fd = stream.as_raw_fd();
+        let mut uid: libc::uid_t = 0;
+        let mut gid: libc::gid_t = 0;
+        // SAFETY: `fd` is a socket owned by `stream`, open for the whole call;
+        // `uid` and `gid` are valid, writable locals.
+        if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(PeerCred {
+            uid,
+            pid: peer_pid(fd),
+        })
+    }
+}
+
+/// The peer's pid via `LOCAL_PEEREPID`, or `None` on any error.
+#[cfg(target_vendor = "apple")]
+fn peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
+    const PID_LEN: usize = std::mem::size_of::<libc::pid_t>();
+    let mut pid: libc::pid_t = 0;
+    let mut len = libc::socklen_t::try_from(PID_LEN).ok()?;
+    // SAFETY: `fd` is an open socket (see the caller); `pid` is a writable
+    // `pid_t` and `len` holds its size, which the kernel never exceeds.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEEREPID,
+            (&raw mut pid).cast::<libc::c_void>(),
+            &mut len,
+        )
+    };
+    if rc != 0 || usize::try_from(len).ok() != Some(PID_LEN) {
+        return None;
+    }
+    u32::try_from(pid).ok()
 }
 
 /// The server socket. Holds no file cleanup: the socket file stays after
@@ -75,7 +123,8 @@ impl Listener {
     /// 3. Bind, then `chmod(0600 | S_ISVTX)` (PD-25; plain 0600 where the OS
     ///    refuses the sticky bit on a socket for a non-root user).
     ///
-    /// Must be called inside a tokio runtime with IO enabled.
+    /// Must be called inside a tokio runtime with the IO driver enabled
+    /// (`Builder::enable_io`; `#[tokio::main]` and `#[tokio::test]` do).
     pub fn bind(path: &Path) -> io::Result<Listener> {
         bind_expecting_uid(path, euid())
     }
@@ -269,7 +318,8 @@ impl std::error::Error for ConnectFailure {
 ///    without a byte written.
 ///
 /// Only then is the stream returned. Must be polled inside a tokio runtime
-/// with IO enabled.
+/// with the IO driver enabled (`Builder::enable_io`; `#[tokio::main]` and
+/// `#[tokio::test]` do).
 pub async fn connect_checked(path: &Path, check: &dyn OwnerCheck) -> Result<Conn, ConnectFailure> {
     if tokio::runtime::Handle::try_current().is_err() {
         return Err(ConnectFailure::Io(io::Error::other(MSG_NO_RUNTIME)));

@@ -47,6 +47,7 @@ pub struct Conn {
 impl Conn {
     /// Wraps a stream. The transport constructs these only after its identity
     /// checks; tests may wrap in-memory streams.
+    #[doc(hidden)]
     pub fn new<S>(stream: S) -> Conn
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
