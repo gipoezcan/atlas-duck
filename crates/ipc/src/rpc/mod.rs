@@ -151,9 +151,11 @@ fn present<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawResponse {
-    #[allow(dead_code)]
-    jsonrpc: TwoPointZero,
-    id: Option<u64>,
+    #[serde(rename = "jsonrpc")]
+    _jsonrpc: TwoPointZero,
+    /// Absent is refused; `null` is the unknown-id case, so it is told apart here too.
+    #[serde(default, deserialize_with = "present")]
+    id: Option<Value>,
     #[serde(default, deserialize_with = "present")]
     result: Option<Value>,
     #[serde(default)]
@@ -163,6 +165,11 @@ struct RawResponse {
 impl<'de> Deserialize<'de> for Response {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let raw = RawResponse::deserialize(d)?;
+        let id = match raw.id {
+            None => return Err(de::Error::custom("a response carries an id")),
+            Some(Value::Null) => None,
+            Some(v) => Some(serde_json::from_value::<u64>(v).map_err(de::Error::custom)?),
+        };
         let body = match (raw.result, raw.error) {
             (Some(v), None) => ResponseBody::Result(v),
             (None, Some(e)) => ResponseBody::Error(e),
@@ -174,7 +181,7 @@ impl<'de> Deserialize<'de> for Response {
         };
         Ok(Response {
             jsonrpc: TwoPointZero,
-            id: raw.id,
+            id,
             body,
         })
     }
@@ -219,12 +226,33 @@ impl Serialize for Incoming {
     }
 }
 
+/// The closed set of `details.reason` values a `protocol_error` carries (PD-28).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtocolReason {
+    /// A method before `hello` on the connection (wording as the core's `MSG_HELLO_FIRST`).
+    HelloRequired,
+}
+
+impl ProtocolReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            ProtocolReason::HelloRequired => "hello_required",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            ProtocolReason::HelloRequired => "hello is required before any other method",
+        }
+    }
+}
+
 /// `failed` / `protocol_error`, not retryable, `details.reason` = `reason` (PD-28).
-pub fn protocol_error(reason: &'static str) -> Envelope {
-    let mut e = Envelope::failed(ErrorCode::ProtocolError, false, "protocol error");
+pub fn protocol_error(reason: ProtocolReason) -> Envelope {
+    let mut e = Envelope::failed(ErrorCode::ProtocolError, false, reason.message());
     if let Some(err) = e.error.as_mut() {
         let mut d = Map::new();
-        d.insert("reason".to_owned(), json!(reason));
+        d.insert("reason".to_owned(), json!(reason.as_str()));
         err.details = Some(d);
     }
     e

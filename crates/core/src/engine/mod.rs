@@ -997,6 +997,7 @@ impl Engine {
     }
 
     /// The number of remembered hello sessions (at most [`MAX_SESSIONS`]).
+    #[cfg(feature = "testing")]
     pub fn session_count(&self) -> usize {
         lock(&self.sessions).map.len()
     }

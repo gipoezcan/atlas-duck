@@ -1211,6 +1211,21 @@ async fn busy_reply_has_no_params_sha256() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_failure_reply_has_no_params_sha256() -> TestResult {
+    let plan = FaultPlan::new();
+    plan.fail_nth(EventType::REQUEST_RECEIVED, 1);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan)
+        .start()
+        .await?;
+    let reply = h.submit_reply("jira.issue.get", issue_get("ABC-1")).await;
+    assert_eq!(code(&reply.envelope), "audit_failure");
+    assert_eq!(reply.params_sha256, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnected_forgets_session() -> TestResult {
     let h = Harness::jira().await?;
     let conn_a = h.conn("agent-a").await?;
@@ -1270,5 +1285,14 @@ async fn sessions_map_bounded() -> TestResult {
     assert!(h.engine().session("bounded-0").is_none());
     assert!(h.engine().session("bounded-1").is_some());
     assert!(h.engine().session("bounded-1024").is_some());
+    // An evicted connection has to say hello again before it can submit.
+    let evicted = ConnectionMeta {
+        connection_id: "bounded-0".into(),
+        peer: PeerInfo::default(),
+    };
+    let env = h
+        .submit_with(&evicted, "jira.issue.get", issue_get("ABC-1"), None)
+        .await;
+    assert_eq!(code(&env), "protocol_error");
     Ok(())
 }

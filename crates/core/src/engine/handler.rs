@@ -715,7 +715,7 @@ impl CoreHandler {
     }
 }
 
-///`Some(sha)` exactly when the envelope carries a request id (Δ1).
+/// `Some(sha)` exactly when the envelope carries a request id (Δ1).
 fn reply_of(envelope: Envelope, sha: Option<String>) -> SubmitReply {
     let params_sha256 = sha.filter(|_| envelope.request_id.is_some());
     SubmitReply {

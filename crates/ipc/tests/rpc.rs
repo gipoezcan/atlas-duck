@@ -8,8 +8,8 @@ use std::task::{Context, Poll};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use atlas_duck_ipc::rpc::frame::{FrameError, read_frame_async, write_frame_async};
 use atlas_duck_ipc::rpc::{
-    EmptyParams, IdParams, Incoming, OpsDescribeParams, OpsListParams, Request, RequestsListParams,
-    Response, ResponseBody, codes, error_response, method, protocol_error,
+    EmptyParams, IdParams, Incoming, OpsDescribeParams, OpsListParams, ProtocolReason, Request,
+    RequestsListParams, Response, ResponseBody, codes, error_response, method, protocol_error,
 };
 use atlas_duck_ipc::sandbox::MAX_FRAME_BYTES;
 use atlas_duck_ipc::sandbox::frame::write_frame;
@@ -103,11 +103,21 @@ fn response_result_xor_error() -> TestResult {
 }
 
 #[test]
+fn response_id_must_be_present_null_is_unknown() -> TestResult {
+    let missing = json!({"jsonrpc": "2.0", "result": 1});
+    assert!(serde_json::from_value::<Response>(missing).is_err());
+    let unknown = json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "m"}});
+    let r: Response = serde_json::from_value(unknown)?;
+    assert_eq!(r.id, None);
+    Ok(())
+}
+
+#[test]
 fn error_carries_envelope() -> TestResult {
     let resp = error_response(
         None,
         codes::INVALID_REQUEST,
-        protocol_error("hello_required"),
+        protocol_error(ProtocolReason::HelloRequired),
     );
     let wire = serde_json::to_value(&resp)?;
     assert_eq!(wire["id"], Value::Null);
