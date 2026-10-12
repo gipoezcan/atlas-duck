@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use atlas_duck_audit::{KeyStore, Store, SystemClock};
 use atlas_duck_core::audit_port::DateBridge;
-use atlas_duck_core::config::{CONFIG_FILE_NAME, load_config};
+use atlas_duck_core::config::{CONFIG_FILE_NAME, ConfigReadOnly, ConfigState, load_config};
 use atlas_duck_core::http_factory::HttpFactory;
 use atlas_duck_core::proxy::SystemProxySource;
 use atlas_duck_core::{Core, CoreDeps, KeychainCredentials, NativeConfirmer, StartError, UiSink};
@@ -45,10 +45,22 @@ fn app_start_extra(tray_host: Option<TrayHost>) -> Map<String, Value> {
     extra
 }
 
-/// `CoreDeps` from the app's pieces. Fails when `config.toml` exists and cannot be read.
+/// `CoreDeps` from the app's pieces. A `config.toml` that exists but cannot be read (permissions,
+/// a directory at that path, a sharing violation) does not stop the app: it is composed as
+/// `Unreadable`, so requests keep working and answer `not_configured`, and the file stays untouched.
 pub fn core_deps(i: CoreInputs) -> io::Result<CoreDeps> {
     let config_path = i.config_dir.join(CONFIG_FILE_NAME);
-    let config = load_config(&config_path)?;
+    let config = load_config(&config_path).unwrap_or_else(|_| {
+        // Fixed text only: the path and the OS error stay out of the log (opacity).
+        tracing::warn!("config_read_failed");
+        ConfigState::Unreadable {
+            info: ConfigReadOnly {
+                schema_version: None,
+                parsed: false,
+                written_by: None,
+            },
+        }
+    });
     let credentials = Arc::new(KeychainCredentials::new(i.keys));
     let http = HttpFactory::new(
         Arc::new(SystemProxySource::new()),
@@ -334,12 +346,15 @@ mod tests {
     }
 
     #[test]
-    fn core_deps_refuses_an_unreadable_config() -> TestResult {
+    fn core_deps_composes_an_unreadable_config_as_unreadable() -> TestResult {
         let (dir, _lock, inputs) = temp_inputs(None)?;
         // A directory where the file should be cannot be read as a config.
         std::fs::create_dir(dir.path().join("config.toml"))?;
         let inputs_store = inputs.store.clone();
-        assert!(core_deps(inputs).is_err());
+        let deps = core_deps(inputs)?;
+        assert!(matches!(deps.config, ConfigState::Unreadable { .. }));
+        // Left untouched: still a directory.
+        assert!(dir.path().join("config.toml").is_dir());
         inputs_store.shutdown();
         Ok(())
     }
