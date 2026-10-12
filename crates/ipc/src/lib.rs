@@ -8,6 +8,8 @@
 compile_error!("test-paths must never reach a release build");
 
 pub mod build_info;
+#[cfg(feature = "async")]
+pub mod client;
 pub mod envelope;
 pub mod jcs;
 pub mod paths;
