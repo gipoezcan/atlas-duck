@@ -58,15 +58,15 @@ rust:test:
     - mkdir -p "$CI_PROJECT_DIR/.xdg" && export XDG_DATA_HOME="$CI_PROJECT_DIR/.xdg"
     - cargo clippy --workspace --all-targets --locked -- -D warnings
     - cargo test --workspace --locked
-    # M4 plan Task 26 (T26a): the cli_flows under Xvfb and a private session bus (no Node here: the
-    # script checks for skipped tests and the pass-count minimum itself).
-    - bash ci/cli-flows-linux.sh
-    # M4 plan Task 26 (T26b): the M4 suite with the test-only features, the app's startup tests and
-    # the S-02 launch-survival cases (GitLab sets CI=true; no sudo in this image, so no S-01
+    # cli_flows run on GitHub only (every OS leg, ci.yml): the app's data-dir locality check fails
+    # closed on this runner's container volume ("the test data dir is not a local data dir"), so
+    # none of the spawning flows can start an app here. ci/cli-flows-linux.sh itself is verified up
+    # to that point (signal reset, xauth/xvfb, pass-count) by the GitLab run of 94459e5..507d6b6.
+    # M4 plan Task 26 (T26b): the M4 suite with the test-only features, the app's startup tests (the S-02 cases
+    # run on GitHub: they need the cli_flows harness; no sudo in this image, so no S-01
     # other-user step; no second account on a container runner).
     - cargo test -p atlas-duck-ipc --features test-paths --locked
     - cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate
-    - bash ci/cli-flows-linux.sh --ignored s02_
   after_script:
     - pkill -x atlas-duck-app || true
 
