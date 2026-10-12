@@ -15,6 +15,7 @@ compile_error!("test-env must never reach a release build");
 
 mod argv;
 mod binding;
+mod busy;
 mod deadline;
 mod discover;
 mod exit;
@@ -69,13 +70,6 @@ pub(crate) fn execute(
     inputs: &mut Inputs<'_>,
     connector: &dyn Connector,
 ) -> Outcome {
-    // Task 15 fills the `__launch-stub` dispatch; until then it is an unknown command.
-    if args.first().is_some_and(|a| a == "__launch-stub") {
-        return failure(local::usage(
-            "unknown command: __launch-stub",
-            Default::default(),
-        ));
-    }
     // Reading stdin during parsing counts against `--timeout` (argv sets the limit).
     inputs.set_start(start);
     let (opts, command) = match argv::parse(args, env, inputs) {
@@ -135,6 +129,12 @@ fn execute_connected(deadline: &Deadline, connector: &dyn Connector) -> Envelope
 pub fn run(args: Vec<OsString>) -> i32 {
     // §4.1: the deadline is wall-clock from process start; this is the closest we can get.
     let start = Instant::now();
+    // PD-21: the internal breakaway stub, before argv parsing; it prints nothing.
+    if let Some((first, rest)) = args.split_first()
+        && first == launch::stub::STUB_COMMAND
+    {
+        return launch::stub::run_stub(rest);
+    }
     // §3.3: build_id is compiled into every binary (M4's `hello` sends it). black_box keeps the
     // constant referenced, so the linker cannot drop it from the executable.
     let _ = std::hint::black_box(BUILD_ID);
@@ -308,10 +308,12 @@ mod tests {
     }
 
     #[test]
-    fn launch_stub_is_usage_until_task_15() {
+    fn launch_stub_is_not_an_argv_command() {
+        // `run` dispatches it before `execute`; through argv it is an unknown command.
         let (o, calls) = go(&["__launch-stub"]);
         assert_eq!(calls, 0);
         assert_eq!(o.exit, 2);
+        assert_eq!(code(&o), Some(ErrorCode::Usage));
     }
 
     #[test]

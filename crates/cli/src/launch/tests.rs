@@ -469,3 +469,29 @@ fn envelopes_have_no_request_id() {
         assert_eq!(env.status, Status::Failed);
     }
 }
+
+#[test]
+fn blocked_by_job_envelope_verbatim() {
+    let env = launch_failed(&LaunchError::BlockedByJob);
+    assert_eq!(env.status, Status::Failed);
+    assert_eq!(env.request_id, None);
+    assert_eq!(
+        env.error.as_ref().map(|e| e.code),
+        Some(ErrorCode::Unreachable)
+    );
+    assert_eq!(reason(&env), Some("launch_blocked_by_job"));
+    assert_eq!(
+        message(&env),
+        "start atlas-duck from the desktop or enable autostart"
+    );
+    assert!(retryable(&env));
+    assert_eq!(exit_code(&env), 5);
+    // Every other launch failure stays `not_running`.
+    for e in [
+        LaunchError::InvalidArgument,
+        LaunchError::ChildFailed(1),
+        LaunchError::Unsupported,
+    ] {
+        assert_eq!(reason(&launch_failed(&e)), Some("not_running"), "{e:?}");
+    }
+}

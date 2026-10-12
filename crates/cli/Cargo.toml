@@ -22,5 +22,21 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "time", "sync", 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# §4.7 Windows launch (shell parent, job breakaway, stub) and the PD-24 session check.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Diagnostics_ToolHelp"] }

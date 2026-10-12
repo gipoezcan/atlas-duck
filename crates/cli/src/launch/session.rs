@@ -1,7 +1,8 @@
 //! Interactive GUI session detection (§4.7, PD-24): without one the CLI never launches the app.
 //!
 //! Linux (and other non-macOS Unix): `DISPLAY` or `WAYLAND_DISPLAY` non-empty. macOS:
-//! `/bin/launchctl managername` prints `Aqua`. Windows: Task 15.
+//! `/bin/launchctl managername` prints `Aqua`. Windows: not session 0 and a visible window station
+//! (`windows::gui_session`).
 
 use std::ffi::OsString;
 
@@ -29,9 +30,7 @@ pub(crate) fn gui_session() -> bool {
     }
     #[cfg(windows)]
     {
-        // Task 15 provides the session id / window station check. Until then the CLI never
-        // launches on Windows (fails closed).
-        false
+        super::windows::gui_session()
     }
 }
 

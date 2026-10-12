@@ -29,7 +29,7 @@ pub(crate) const MSG_APP_NOT_FOUND: &str =
     "atlas-duck app not found; reinstall or re-run Install CLI to PATH";
 
 #[cfg(windows)]
-const APP_FILE_NAME: &str = "atlas-duck-app.exe";
+pub(crate) const APP_FILE_NAME: &str = "atlas-duck-app.exe";
 #[cfg(not(windows))]
 const APP_FILE_NAME: &str = "atlas-duck-app";
 

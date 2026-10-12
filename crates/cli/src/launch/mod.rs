@@ -14,8 +14,11 @@ pub(crate) mod env;
 mod lock;
 pub(crate) mod plan;
 pub(crate) mod session;
+pub(crate) mod stub;
 #[cfg(unix)]
 pub(crate) mod unix;
+#[cfg(windows)]
+pub(crate) mod windows;
 
 use std::ffi::OsString;
 use std::io;
@@ -40,6 +43,10 @@ pub(crate) const LOCK_WAIT_LIMIT: Duration = Duration::from_secs(30);
 pub(crate) const REASON_LAUNCH_TIMEOUT: &str = "launch_timeout";
 pub(crate) const REASON_NO_GUI_SESSION: &str = "no_gui_session";
 pub(crate) const REASON_FIRST_RUN: &str = "first_run";
+pub(crate) const REASON_LAUNCH_BLOCKED_BY_JOB: &str = "launch_blocked_by_job";
+/// §4.7 Windows step 3 (verbatim).
+pub(crate) const MSG_LAUNCH_BLOCKED_BY_JOB: &str =
+    "start atlas-duck from the desktop or enable autostart";
 /// PD-24 (plan wording for the spec's "hint to start the app from the desktop").
 pub(crate) const MSG_NO_GUI_SESSION: &str = "no desktop session: start atlas-duck from the desktop";
 /// §2.5 G1 fixed message, reused by PD-04 for a launch that never finished first run.
@@ -59,7 +66,9 @@ pub(crate) enum LaunchError {
     Io(io::Error),
     /// The intermediate launcher process exited with this code.
     ChildFailed(i32),
-    /// No launcher on this OS yet (Windows until Task 15).
+    /// Windows: no shell parent, and this process's job allows no breakaway (§4.7 step 3).
+    BlockedByJob,
+    /// No launcher on this OS (neither Unix nor Windows), or the stub run off Windows.
     Unsupported,
 }
 
@@ -94,7 +103,11 @@ impl LaunchSys for OsLaunchSys {
         {
             unix::launch_app(app, env)
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            windows::launch_app(app, env)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (app, env);
             Err(LaunchError::Unsupported)
@@ -146,9 +159,15 @@ pub(crate) fn first_run() -> Box<Envelope> {
 }
 
 /// The app could not be started (spawn or launch-lock failure). The spec's `unreachable` reasons
-/// are a closed set, so this is `not_running` with a desktop hint.
-pub(crate) fn launch_failed(_e: &LaunchError) -> Box<Envelope> {
-    unreachable(REASON_NOT_RUNNING, MSG_LAUNCH_FAILED)
+/// are a closed set, so this is `not_running` with a desktop hint; a launch the agent's job blocks
+/// is `launch_blocked_by_job` (§4.7 Windows step 3).
+pub(crate) fn launch_failed(e: &LaunchError) -> Box<Envelope> {
+    match e {
+        LaunchError::BlockedByJob => {
+            unreachable(REASON_LAUNCH_BLOCKED_BY_JOB, MSG_LAUNCH_BLOCKED_BY_JOB)
+        }
+        _ => unreachable(REASON_NOT_RUNNING, MSG_LAUNCH_FAILED),
+    }
 }
 
 /// Where this host's data dir stands right now: `Ok(None)` before first run, the refusal when the
