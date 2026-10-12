@@ -16,3 +16,5 @@ pub mod proto;
 #[cfg(feature = "async")]
 pub mod rpc;
 pub mod sandbox;
+#[cfg(feature = "async")]
+pub mod transport;

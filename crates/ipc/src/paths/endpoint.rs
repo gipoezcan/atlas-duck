@@ -218,7 +218,7 @@ fn denied(msg: &'static str) -> io::Error {
 }
 
 #[cfg(unix)]
-fn euid() -> u32 {
+pub(crate) fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() }
 }
@@ -353,8 +353,16 @@ fn darwin_user_temp_dir() -> Option<PathBuf> {
 /// the euid with mode exactly 0700, else `PermissionDenied` naming the check.
 #[cfg(unix)]
 pub fn ensure_socket_dir(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
     create_private_dirs(dir)?;
+    check_socket_dir(dir)
+}
+
+/// The check half of `ensure_socket_dir`, for the CLI (§3.1 "before
+/// connecting"): never creates anything. A missing `dir` is `NotFound` (the
+/// app is not running); a failed check is `PermissionDenied`.
+#[cfg(unix)]
+pub fn check_socket_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     let meta = fs::symlink_metadata(dir)?;
     check_dir_meta(
         meta.uid(),

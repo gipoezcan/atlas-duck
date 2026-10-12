@@ -282,6 +282,48 @@ fn ensure_socket_dir_refuses_symlink_wrong_mode_wrong_owner() {
     // The wrong-owner case is the `check_dir_meta` unit test in src/paths/endpoint.rs.
 }
 
+/// The CLI's check-only path (§3.1): a missing dir is `NotFound` and stays
+/// missing; an existing dir gets the same checks as `ensure_socket_dir`.
+#[cfg(unix)]
+#[test]
+fn check_socket_dir_never_creates() {
+    use atlas_duck_ipc::paths::{check_socket_dir, ensure_socket_dir};
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+
+    let missing = tmp.path().join("a").join("s");
+    let err = check_socket_dir(&missing).expect_err("missing dir accepted");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        !tmp.path().join("a").exists(),
+        "check_socket_dir created a dir"
+    );
+
+    let good = tmp.path().join("good");
+    ensure_socket_dir(&good).expect("ensure");
+    check_socket_dir(&good).expect("good dir");
+
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&good, &link).expect("symlink");
+    let err = check_socket_dir(&link).expect_err("symlink accepted");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let open = tmp.path().join("open");
+    std::fs::create_dir(&open).expect("mkdir");
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o711)).expect("chmod");
+    let err = check_socket_dir(&open).expect_err("0711 accepted");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    let mode = std::fs::metadata(&open).expect("stat").permissions().mode();
+    assert_eq!(mode & 0o7777, 0o711, "check_socket_dir changed the mode");
+
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"x").expect("write");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let err = check_socket_dir(&file).expect_err("file accepted");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn v28_socket_dir_choice_linux() {
