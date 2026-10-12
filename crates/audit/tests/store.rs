@@ -1059,3 +1059,39 @@ fn payload_limit_fits_a_read_at_the_fetch_cap() {
     );
     assert_eq!(store.head().0, head);
 }
+
+/// A store that did reads leaves no `-wal` / `-shm` after an orderly shutdown: the read-only
+/// reader closes before the writer, so the writer is the last connection and its close
+/// checkpoints the WAL into `audit.db` and deletes the sidecars (a backup that copies only
+/// `audit.db` then misses nothing).
+#[test]
+fn shutdown_after_reads_leaves_no_wal_sidecars() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    for i in 0..5u64 {
+        store
+            .append(ev(EventType::CONFIG_CHANGED, None, json!({ "i": i })))
+            .expect("append");
+    }
+    // The first read opens the read-only connection.
+    assert_eq!(payload(&store, 1)["chain_id"], json!(f.chain_id));
+    assert!(
+        files_in(&f).iter().any(|n| n.ends_with("-wal")),
+        "open store has its WAL"
+    );
+    store.shutdown();
+    let files = files_in(&f);
+    assert!(
+        !files
+            .iter()
+            .any(|n| n.ends_with("-wal") || n.ends_with("-shm")),
+        "{files:?}"
+    );
+    // Every row is in `audit.db` alone: a plain copy of that file opens with all of them.
+    let copy = f.dir.path().join("copy.db");
+    std::fs::copy(f.db_path(), &copy).expect("copy audit.db only");
+    let n: i64 = rusqlite::Connection::open(&copy)
+        .expect("open copy")
+        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(n, 6);
+}

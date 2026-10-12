@@ -1107,6 +1107,11 @@ impl Store {
     /// Stops the writer after the commands already queued; later calls get `Closed`. Never
     /// writes an anchor.
     pub fn shutdown(&self) {
+        // The read-only reader closes first: the writer's close must be the last one on the
+        // database, because only that close checkpoints the WAL and removes `-wal` / `-shm`
+        // (a read-only connection closing last cannot). Closing it again afterwards covers a
+        // read that reopened it in between.
+        *lock(&self.inner.shared.reader) = None;
         self.inner.stop();
         *lock(&self.inner.shared.reader) = None;
     }
