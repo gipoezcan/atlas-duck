@@ -409,8 +409,7 @@ pub(crate) fn create_spec(
 pub(crate) struct Child {
     pub process: OwnedHandle,
     /// Held so the handle closes on drop.
-    #[allow(dead_code)]
-    pub thread: OwnedHandle,
+    pub _thread: OwnedHandle,
     pub pid: u32,
 }
 
@@ -471,7 +470,7 @@ pub(crate) fn create_process(
     };
     Ok(Child {
         process,
-        thread,
+        _thread: thread,
         pid: pi.dwProcessId,
     })
 }
@@ -1343,7 +1342,7 @@ mod tests {
                 AssignProcessToJobObject(job.as_raw_handle(), child.process.as_raw_handle()),
                 0
             );
-            assert_ne!(ResumeThread(child.thread.as_raw_handle()), u32::MAX);
+            assert_ne!(ResumeThread(child._thread.as_raw_handle()), u32::MAX);
         }
         let until = Instant::now() + Duration::from_secs(60);
         loop {

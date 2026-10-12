@@ -55,20 +55,21 @@ pub(crate) const MSG_LAUNCH_FAILED: &str =
     "the atlas-duck app could not be started: start atlas-duck from the desktop";
 
 /// Why starting the app failed.
-// The causes in `Io`/`ChildFailed` are kept for Debug output; `Unsupported` is built only on hosts
-// that are neither Unix nor Windows.
-#[allow(dead_code)]
+// The causes in `Io`/`ChildFailed` are kept for Debug output (never read); `Unsupported` is built
+// only on hosts that are neither Unix nor Windows.
 #[derive(Debug)]
 pub(crate) enum LaunchError {
     /// A path, argument or environment entry the OS cannot take (embedded NUL, `=` in a name).
     InvalidArgument,
     /// `fork`/`open`/`waitpid` and friends.
-    Io(io::Error),
+    Io(#[allow(dead_code)] io::Error),
     /// The intermediate launcher process exited with this code.
-    ChildFailed(i32),
+    ChildFailed(#[allow(dead_code)] i32),
     /// Windows: no shell parent, and this process's job allows no breakaway (§4.7 step 3).
+    #[cfg_attr(not(windows), allow(dead_code))]
     BlockedByJob,
     /// No launcher on this OS (neither Unix nor Windows), or the stub run off Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     Unsupported,
 }
 

@@ -4,7 +4,9 @@
 //! Ctrl-C, Ctrl-Break, console close) and, on Unix, also treats a hung-up stdout as an interrupt
 //! (polled every 500 ms). Handlers exist only for the commands that wait (`op`, `call`,
 //! `script run`, `await`): the short calls keep the default signal behaviour. An interrupt never
-//! cancels a request; what is printed instead is decided by `connected`.
+//! cancels a request; what is printed instead is decided by `connected`. On Unix a signal that was
+//! ignored when the process started (`nohup` for SIGHUP, a backgrounded job's SIGINT) stays
+//! ignored: the user asked for that.
 
 use std::future::Future;
 use std::io;
@@ -35,9 +37,9 @@ const HANGUP_POLL: Duration = Duration::from_millis(500);
 
 #[cfg(unix)]
 pub(crate) struct Guard {
-    int: tokio::signal::unix::Signal,
-    term: tokio::signal::unix::Signal,
-    hup: tokio::signal::unix::Signal,
+    int: Option<tokio::signal::unix::Signal>,
+    term: Option<tokio::signal::unix::Signal>,
+    hup: Option<tokio::signal::unix::Signal>,
 }
 
 #[cfg(windows)]
@@ -55,10 +57,18 @@ impl Guard {
     #[cfg(unix)]
     pub(crate) fn install() -> io::Result<Guard> {
         use tokio::signal::unix::{SignalKind, signal};
+        // Registering replaces the disposition, so the inherited `SIG_IGN` must be read first.
+        let handler = |kind: SignalKind| -> io::Result<Option<tokio::signal::unix::Signal>> {
+            if ignored(kind.as_raw_value()) {
+                Ok(None)
+            } else {
+                signal(kind).map(Some)
+            }
+        };
         Ok(Guard {
-            int: signal(SignalKind::interrupt())?,
-            term: signal(SignalKind::terminate())?,
-            hup: signal(SignalKind::hangup())?,
+            int: handler(SignalKind::interrupt())?,
+            term: handler(SignalKind::terminate())?,
+            hup: handler(SignalKind::hangup())?,
         })
     }
 
@@ -79,15 +89,18 @@ impl Guard {
 }
 
 impl Interrupts for Guard {
+    /// The first tick of the hang-up poll is immediate: a stdout that was already hung up before
+    /// submission ends the wait at once (`launch_timeout`, exit 5), then the emit fails and the
+    /// exit is 4.
     #[cfg(unix)]
     fn next(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             let mut poll = tokio::time::interval(HANGUP_POLL);
             loop {
                 tokio::select! {
-                    _ = self.int.recv() => return,
-                    _ = self.term.recv() => return,
-                    _ = self.hup.recv() => return,
+                    () = received(&mut self.int) => return,
+                    () = received(&mut self.term) => return,
+                    () = received(&mut self.hup) => return,
                     _ = poll.tick() => {
                         if stdout_hung_up() {
                             return;
@@ -113,6 +126,27 @@ impl Interrupts for Guard {
     fn next(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(std::future::pending())
     }
+}
+
+/// Completes when the signal arrives; never for a signal that is ignored (`None`).
+#[cfg(unix)]
+async fn received(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// True when `sig` is currently `SIG_IGN` (a query: no new action is installed).
+#[cfg(unix)]
+fn ignored(sig: libc::c_int) -> bool {
+    // SAFETY: an all-zero `sigaction` is a valid value to be overwritten.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null new action only reads the current one into `old`; `sig` is a plain number.
+    let rc = unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
+    rc == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
 /// True when the reader of fd 1 went away (`POLLERR`/`POLLHUP`, no wait).

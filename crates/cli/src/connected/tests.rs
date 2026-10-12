@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::*;
 use crate::argv::{MatchParams as CliMatch, OutputMode};
 use crate::exit::exit_for;
-use crate::test_support::{Fake, Kind, Mode, REQ_ID, Running, TestConnector, serve};
+use crate::test_support::{Fake, Kind, Mode, REQ_ID, Running, TestConnector, WAIT, serve};
 
 fn opts() -> GlobalOpts {
     GlobalOpts {
@@ -272,6 +272,10 @@ async fn connection_lost_after_submit_exit4() {
     assert_eq!(code(&env), Some(ErrorCode::Unreachable));
     assert_eq!(reason_of(&env).as_deref(), Some("connection_lost"));
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert_eq!(
+        env.error.as_ref().map(|e| e.message.as_str()),
+        Some("use `await <id>`; the request may be `abandoned`")
+    );
     assert_eq!(exit, 4);
     // The notice came from the submit reply, before the loss.
     assert_eq!(connector.notice_lines().len(), 1);
@@ -523,6 +527,10 @@ async fn busy_deadline_protocol_and_hello_mapping() {
     assert_eq!((code(&env), exit), (Some(ErrorCode::ProtocolError), 1));
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
 
+    let (env, exit, _) = failing(|| ConnectError::Io(std::io::ErrorKind::Other.into())).await;
+    assert_eq!((code(&env), exit), (Some(ErrorCode::Internal), 1));
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+
     let (env, exit, _) =
         failing(|| ConnectError::Hello(Envelope::failed(ErrorCode::Locked, true, "hello refused")))
             .await;
@@ -653,6 +661,192 @@ fn rpc_error_without_an_envelope_is_protocol_error() {
     };
     assert_eq!(
         code(&short_error(ClientError::Rpc(with))),
+        Some(ErrorCode::UnknownRequest)
+    );
+}
+
+// ---------- deadline already expired (I-1) ----------
+
+/// A connector whose connect completes only after `delay` (the deadline passed meanwhile).
+struct Late {
+    inner: TestConnector,
+    delay: Duration,
+}
+
+impl Connector for Late {
+    fn discover(&self) -> Discovery {
+        self.inner.discover()
+    }
+
+    fn launch_sys(&self) -> Arc<dyn LaunchSys + Send> {
+        self.inner.launch_sys()
+    }
+
+    fn connect<'a>(
+        &'a self,
+        ctx: &'a ClientContext,
+        _deadline: Instant,
+    ) -> BoxFuture<'a, Result<IpcClient, ConnectError>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            self.inner
+                .connect(ctx, Instant::now() + Duration::from_secs(5))
+                .await
+        })
+    }
+
+    fn interrupts(&self) -> Box<dyn Interrupts> {
+        self.inner.interrupts()
+    }
+
+    fn notice(&self, request_id: &str, params_sha256: Option<&str>) {
+        self.inner.notice(request_id, params_sha256);
+    }
+}
+
+#[tokio::test]
+async fn a_deadline_that_passed_during_connect_sends_nothing() {
+    let fake = Arc::new(Fake::new());
+    let running = serve(&fake).await;
+    let connector = Late {
+        inner: TestConnector::new(running.data.clone(), Mode::Server(running.location.clone())),
+        delay: Duration::from_millis(450),
+    };
+    let cmd = op();
+    let deadline = within(300);
+    let env = execute(&cmd, &opts(), &deadline, &connector).await;
+    assert_eq!(reason_of(&env).as_deref(), Some("launch_timeout"));
+    assert_eq!(exit_for(&cmd, &env), 5);
+    assert_eq!(fake.count(Kind::Submit), 0);
+    assert!(connector.inner.notice_lines().is_empty());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn submit_wait_with_an_expired_deadline_writes_no_frame() {
+    let fake = Arc::new(Fake::new());
+    let (running, connector) = setup(&fake).await;
+    let ctx = ClientContext {
+        data_dir: running.data.clone(),
+        host: "host".to_owned(),
+        hello: hello_for(&opts()),
+    };
+    let mut client = match connector.connect(&ctx, Instant::now() + WAIT).await {
+        Ok(c) => c,
+        Err(e) => panic!("connect: {e}"),
+    };
+    let deadline = within(1);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let sp = SubmitParams {
+        op_id: "jira.issue.get".to_owned(),
+        params: json!({}),
+        instance: None,
+        reason: None,
+    };
+    let env = submit_wait(
+        &mut client,
+        method::REQUEST_SUBMIT,
+        sp,
+        &opts(),
+        &deadline,
+        &*connector,
+        &mut Never,
+    )
+    .await;
+    assert_eq!(reason_of(&env).as_deref(), Some("launch_timeout"));
+    assert_eq!(atlas_duck_ipc::proto::exit_code(&env), 5);
+    assert!(!client.written_request());
+    assert_eq!(fake.count(Kind::Submit), 0);
+    // A short call past its deadline writes nothing either.
+    let env = short_call(
+        &mut client,
+        method::REQUEST_CANCEL,
+        IdParams {
+            request_id: REQ_ID.to_owned(),
+        },
+        &deadline,
+    )
+    .await;
+    assert_eq!(reason_of(&env).as_deref(), Some("launch_timeout"));
+    assert!(!client.written_request());
+    assert_eq!(fake.count(Kind::Cancel), 0);
+    running.stop().await;
+}
+
+// ---------- non-answer errors after submission (I-2) ----------
+
+fn bare_rpc() -> ClientError {
+    ClientError::Rpc(atlas_duck_ipc::rpc::RpcError {
+        code: -32602,
+        message: "x".to_owned(),
+        data: None,
+    })
+}
+
+#[test]
+fn submit_error_after_the_frame_was_written_is_pending_without_an_id() {
+    for e in [
+        ClientError::Protocol("x".to_owned()),
+        ClientError::Io(std::io::ErrorKind::BrokenPipe.into()),
+        bare_rpc(),
+        ClientError::ConnectionLost,
+    ] {
+        let env = submit_error(e, true);
+        assert_eq!(status_of(&env), Status::Pending, "{env:?}");
+        assert_eq!(env.request_id, None);
+        assert_eq!(reason_of(&env).as_deref(), Some("connection_lost"));
+        assert_eq!(atlas_duck_ipc::proto::exit_code(&env), 4);
+    }
+    // Nothing written: still a plain failure.
+    assert_eq!(
+        code(&submit_error(ClientError::Protocol("x".to_owned()), false)),
+        Some(ErrorCode::ProtocolError)
+    );
+    assert_eq!(
+        code(&submit_error(bare_rpc(), false)),
+        Some(ErrorCode::ProtocolError)
+    );
+    // An envelope from the app is its answer, written or not.
+    let answer = atlas_duck_ipc::rpc::RpcError {
+        code: -32602,
+        message: "x".to_owned(),
+        data: Some(Envelope::failed(ErrorCode::Validation, false, "bad")),
+    };
+    assert_eq!(
+        code(&submit_error(ClientError::Rpc(answer), true)),
+        Some(ErrorCode::Validation)
+    );
+}
+
+#[test]
+fn await_error_keeps_the_request_id_pending_exit4() {
+    let base = pending_for(REQ_ID, None);
+    for e in [
+        ClientError::Protocol("x".to_owned()),
+        ClientError::Io(std::io::ErrorKind::BrokenPipe.into()),
+        bare_rpc(),
+        ClientError::ConnectionLost,
+    ] {
+        let env = await_error(e, REQ_ID, &base);
+        assert_eq!(status_of(&env), Status::Pending, "{env:?}");
+        assert_eq!(env.request_id.as_deref(), Some(REQ_ID));
+        assert_eq!(code(&env), Some(ErrorCode::Unreachable));
+        assert_eq!(reason_of(&env).as_deref(), Some("connection_lost"));
+        assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+        assert_eq!(atlas_duck_ipc::proto::exit_code(&env), 4);
+    }
+    // The app's own envelope is the answer.
+    let answer = atlas_duck_ipc::rpc::RpcError {
+        code: -32602,
+        message: "x".to_owned(),
+        data: Some(Envelope::failed(
+            ErrorCode::UnknownRequest,
+            false,
+            "no such",
+        )),
+    };
+    assert_eq!(
+        code(&await_error(ClientError::Rpc(answer), REQ_ID, &base)),
         Some(ErrorCode::UnknownRequest)
     );
 }

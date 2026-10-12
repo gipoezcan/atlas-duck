@@ -267,7 +267,9 @@ enum Wait<T> {
     TimedOut,
 }
 
-/// `fut` against the interrupt source and `at`. The interrupt wins a tie.
+/// `fut` against the interrupt source and `at`. The interrupt wins a tie, and an `at` that has
+/// already passed wins over `fut`: the sleep is polled first, so `fut` (whose first poll may write
+/// the request frame) never starts after the deadline.
 async fn guarded<T>(
     fut: impl std::future::Future<Output = T>,
     at: Instant,
@@ -276,10 +278,8 @@ async fn guarded<T>(
     tokio::select! {
         biased;
         () = intr.next() => Wait::Interrupted,
-        r = tokio::time::timeout_at(tokio::time::Instant::from_std(at), fut) => match r {
-            Ok(v) => Wait::Done(v),
-            Err(_) => Wait::TimedOut,
-        },
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => Wait::TimedOut,
+        v = fut => Wait::Done(v),
     }
 }
 
@@ -541,11 +541,18 @@ pub(crate) async fn short_call<P: Serialize>(
     params: P,
     deadline: &Deadline,
 ) -> Envelope {
-    let at = tokio::time::Instant::from_std(bound(deadline));
-    match tokio::time::timeout_at(at, client.call::<Envelope>(name, params)).await {
-        Ok(Ok(env)) => env,
-        Ok(Err(e)) => short_error(e),
-        Err(_) => *launch::unreachable(launch::REASON_LAUNCH_TIMEOUT, MSG_DEADLINE_SHORT),
+    match guarded(
+        client.call::<Envelope>(name, params),
+        bound(deadline),
+        &mut Never,
+    )
+    .await
+    {
+        Wait::Done(Ok(env)) => env,
+        Wait::Done(Err(e)) => short_error(e),
+        Wait::TimedOut | Wait::Interrupted => {
+            *launch::unreachable(launch::REASON_LAUNCH_TIMEOUT, MSG_DEADLINE_SHORT)
+        }
     }
 }
 
@@ -591,13 +598,30 @@ fn no_reply(written: bool) -> Envelope {
     }
 }
 
+/// A submit call that failed. An envelope from the app is its answer; any other failure after the
+/// frame was written leaves a request that may exist, whose id is unknown: pending, exit 4.
 fn submit_error(e: ClientError, written: bool) -> Envelope {
     match e {
-        ClientError::Rpc(rpc) => rpc.data.unwrap_or_else(protocol_failure),
+        ClientError::Rpc(rpc) => match rpc.data {
+            Some(env) => env,
+            None if written => unknown_request_pending(),
+            None => protocol_failure(),
+        },
         ClientError::ConnectionLost if written => unknown_request_pending(),
         ClientError::ConnectionLost => lost_before_submit(),
         ClientError::DeadlineExceeded => no_reply(written),
+        _ if written => unknown_request_pending(),
         other => short_error(other),
+    }
+}
+
+/// An `await` call that failed. An envelope from the app is its answer; any other failure means
+/// no answer came, and the request (its id is known) lives on: pending, exit 4, `await` again.
+fn await_error(e: ClientError, id: &str, base: &Envelope) -> Envelope {
+    match e {
+        ClientError::Rpc(rpc) if rpc.data.is_some() => short_error(ClientError::Rpc(rpc)),
+        ClientError::DeadlineExceeded => base.clone(),
+        _ => connection_lost_pending(id, Some(base)),
     }
 }
 
@@ -632,8 +656,7 @@ async fn await_request(
     .await
     {
         Wait::Done(Ok(env)) => env,
-        Wait::Done(Err(ClientError::ConnectionLost)) => connection_lost_pending(id, Some(base)),
-        Wait::Done(Err(e)) => short_error(e),
+        Wait::Done(Err(e)) => await_error(e, id, base),
         // The wait ended undecided; the request lives on (`await` it again).
         Wait::Interrupted | Wait::TimedOut => base.clone(),
     }

@@ -4,11 +4,11 @@
 //! `/bin/launchctl managername` prints `Aqua`. Windows: not session 0 and a visible window station
 //! (`windows::gui_session`).
 // Each OS consumes one rule (display variables, Aqua); every rule compiles everywhere for the tests.
-#![allow(dead_code)]
 
 use std::ffi::OsString;
 
 /// The rule for X11/Wayland desktops: either display variable is set and non-empty.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 pub(crate) fn display_present(env: &dyn Fn(&str) -> Option<OsString>) -> bool {
     ["DISPLAY", "WAYLAND_DISPLAY"]
         .iter()
@@ -16,6 +16,7 @@ pub(crate) fn display_present(env: &dyn Fn(&str) -> Option<OsString>) -> bool {
 }
 
 /// macOS: `launchctl managername` output names the Aqua (GUI login) session.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn is_aqua(managername_stdout: &[u8]) -> bool {
     std::str::from_utf8(managername_stdout).is_ok_and(|s| s.trim() == "Aqua")
 }
