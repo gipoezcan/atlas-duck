@@ -850,3 +850,98 @@ fn await_error_keeps_the_request_id_pending_exit4() {
         Some(ErrorCode::UnknownRequest)
     );
 }
+
+// ---------- T25: the forced owner mismatch of test builds ----------
+
+#[test]
+fn owner_mismatch_hook_needs_exactly_one() {
+    let with = |value: Option<&'static str>| {
+        move |k: &str| {
+            (k == ENV_FORCE_OWNER_MISMATCH)
+                .then_some(value)
+                .flatten()
+                .map(std::ffi::OsString::from)
+        }
+    };
+    assert!(force_owner_mismatch(&with(Some("1"))));
+    for v in [None, Some(""), Some("0"), Some("true"), Some(" 1")] {
+        assert!(!force_owner_mismatch(&with(v)), "{v:?}");
+    }
+    assert_eq!(
+        ENV_FORCE_OWNER_MISMATCH,
+        "ATLAS_DUCK_TEST_FORCE_OWNER_MISMATCH"
+    );
+}
+
+fn test_hello() -> Hello {
+    Hello {
+        build_id: crate::test_support::BUILD.to_owned(),
+        client_kind: ClientKind::Cli,
+        agent_name: None,
+        agent_name_source: AgentNameSource::None,
+        cwd_basename: String::new(),
+    }
+}
+
+/// The hook's check refuses a server that the production check accepts (stricter, never weaker):
+/// the same served endpoint, first with the current-user check (control: it connects), then with
+/// `NeverOwner` (`server_identity`, the client is dropped before the hello).
+#[tokio::test]
+async fn never_owner_refuses_a_server_the_real_check_accepts() {
+    let fake = Arc::new(Fake::new());
+    let running = serve(&fake).await;
+    let deadline = Instant::now() + WAIT;
+    #[cfg(unix)]
+    let same = atlas_duck_ipc::transport::unix::SameUser;
+    #[cfg(windows)]
+    let same = atlas_duck_ipc::transport::windows::SameUser::current().unwrap();
+    let accepted = IpcClient::connect_at(
+        &running.location,
+        &running.data,
+        &test_hello(),
+        &same,
+        deadline,
+    )
+    .await;
+    assert!(accepted.is_ok(), "control: {accepted:?}");
+    drop(accepted);
+    let refused = IpcClient::connect_at(
+        &running.location,
+        &running.data,
+        &test_hello(),
+        &NeverOwner,
+        deadline,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(ConnectError::ServerIdentity)),
+        "{refused:?}"
+    );
+    // What the CLI prints for it: exit 5 `server_identity`, not retryable.
+    let env = connect_error(ConnectError::ServerIdentity);
+    assert_eq!(code(&env), Some(ErrorCode::ServerIdentity));
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+    assert_eq!(atlas_duck_ipc::proto::exit_code(&env), 5);
+    running.stop().await;
+}
+
+/// Windows: the hook's whole connect (`endpoint_location`, the name in `<data>/endpoint`, the
+/// open, then `NeverOwner`) against a served endpoint. Unix computes the real socket dir from the
+/// host, not the temp socket `serve` binds, so only the check itself is tested there.
+#[cfg(windows)]
+#[tokio::test]
+async fn connect_owner_mismatch_refuses_the_served_endpoint() {
+    let fake = Arc::new(Fake::new());
+    let running = serve(&fake).await;
+    let ctx = ClientContext {
+        data_dir: running.data.clone(),
+        host: "host".to_owned(),
+        hello: test_hello(),
+    };
+    let refused = connect_owner_mismatch(&ctx, Instant::now() + WAIT).await;
+    assert!(
+        matches!(refused, Err(ConnectError::ServerIdentity)),
+        "{refused:?}"
+    );
+    running.stop().await;
+}

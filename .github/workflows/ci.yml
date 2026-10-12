@@ -225,6 +225,57 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-cli --locked -- --ignored --nocapture launch::windows
 
+      # T25 (§13 S-02, V13): the #[ignore]d cli_flows cases that kill the CLI's process tree or
+      # close its job object; they refuse to run without CI=true. Every test `--list --ignored
+      # s02_` names must pass (check-no-skips with an empty ignored list) and none may skip.
+      # The V13 lines (`tree_kill_case`, `job_case`) are the evidence T27 records.
+      - name: M4 S-02 launch survival (#[ignore]d, Linux)
+        if: runner.os == 'Linux'
+        env:
+          CI: "true"
+        run: |
+          set -euo pipefail
+          export TMPDIR="$PWD/.ci-tmp"
+          bash ci/cli-flows-linux.sh --ignored s02_
+          cargo test -p atlas-duck-app --features scripted-approver --locked --test cli_flows -- --list --ignored s02_ 2>/dev/null > "$RUNNER_TEMP/s02.list"
+          : > "$RUNNER_TEMP/s02.none"
+          node ci/check-no-skips.mjs "$TMPDIR/cli-flows.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
+          grep -E '^V13 ' "$TMPDIR/cli-flows.log" || true
+
+      - name: M4 S-02 launch survival (#[ignore]d, macOS)
+        if: runner.os == 'macOS'
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+          CI: "true"
+        run: |
+          set -euo pipefail
+          args=(test -p atlas-duck-app --features scripted-approver --locked --test cli_flows)
+          cargo "${args[@]}" -- --ignored s02_ --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/s02.log"
+          cargo "${args[@]}" -- --list --ignored s02_ 2>/dev/null > "$RUNNER_TEMP/s02.list"
+          : > "$RUNNER_TEMP/s02.none"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/s02.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
+          grep -E '^V13 ' "$RUNNER_TEMP/s02.log" || true
+
+      - name: M4 S-02 launch survival (#[ignore]d, Windows; tree kill and job close)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+          CI: "true"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'cli_flows')
+          $log = Join-Path $env:RUNNER_TEMP 's02.log'
+          $list = Join-Path $env:RUNNER_TEMP 's02.list'
+          $none = Join-Path $env:RUNNER_TEMP 's02.none'
+          cargo @a -- --ignored s02_ --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list --ignored s02_ 2>$null | Set-Content -Path $list -Encoding utf8
+          Set-Content -Path $none -Value '' -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $none
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Select-String -Path $log -Pattern '^V13 '
+
       # T22 review: a flow that dies before World::drop can leave an app behind. CI only.
       - name: Kill stray atlas-duck-app processes (cli_flows)
         if: always()

@@ -86,20 +86,24 @@ atlas-duck-audit = { path = "../../crates/audit", features = ["testing"] }
 atlas-duck-atlassian = { path = "../../crates/atlassian", features = ["testing"] }
 # T22: the cli_flows harness (mock servers, spawned binaries, product ids).
 atlas-duck-registry = { path = "../../crates/registry" }
-# `io-util`: the T23 flows read a spawned CLI's stderr line by line and write its stdin.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
+# `io-util`: the T23 flows read a spawned CLI's stderr line by line and write its stdin. `net`: the
+# T25 squatter pipe (Windows named pipes).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util", "net"] }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 filetime = { workspace = true }
 
-# T19: the Windows probe test inspects the worker's modules and the session.
+# T19: the Windows probe test inspects the worker's modules and the session. T25: the S-02 flows
+# read a process's parent (Toolhelp), resume a suspended CLI and put it in a job object.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Console",
     "Win32_System_DataExchange",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
     "Win32_System_ProcessStatus",
     "Win32_System_RemoteDesktop",
     "Win32_System_StationsAndDesktops",

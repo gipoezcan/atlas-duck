@@ -95,6 +95,10 @@ impl Connector for OsConnector {
         ctx: &'a ClientContext,
         deadline: Instant,
     ) -> BoxFuture<'a, Result<IpcClient, ConnectError>> {
+        #[cfg(feature = "test-env")]
+        if force_owner_mismatch(&|k| std::env::var_os(k)) {
+            return Box::pin(connect_owner_mismatch(ctx, deadline));
+        }
         Box::pin(IpcClient::connect(ctx, deadline))
     }
 
@@ -110,6 +114,53 @@ impl Connector for OsConnector {
     fn notice(&self, request_id: &str, params_sha256: Option<&str>) {
         let _ = crate::output::write_notice(request_id, params_sha256);
     }
+}
+
+// ---------- test builds only: a forced server-owner mismatch (§13 S-01 "simulated") ----------
+
+/// With `test-env` only: `=1` makes the server-owner check of every connect answer "mismatch",
+/// standing in for an endpoint another account created (T25 `s01_squatter_pipe_cli_sends_nothing_e2e`).
+/// Stricter, never weaker: the connect runs the same steps with a check that refuses every
+/// server, so it can only turn an accepted server into `server_identity` (exit 5), never the
+/// reverse.
+#[cfg(any(test, feature = "test-env"))]
+pub(crate) const ENV_FORCE_OWNER_MISMATCH: &str = "ATLAS_DUCK_TEST_FORCE_OWNER_MISMATCH";
+
+/// Whether [`ENV_FORCE_OWNER_MISMATCH`] is exactly `1`.
+#[cfg(any(test, feature = "test-env"))]
+fn force_owner_mismatch(lookup: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    lookup(ENV_FORCE_OWNER_MISMATCH).is_some_and(|v| v == "1")
+}
+
+/// The owner check that refuses every server.
+#[cfg(any(test, feature = "test-env"))]
+struct NeverOwner;
+
+#[cfg(all(any(test, feature = "test-env"), unix))]
+impl atlas_duck_ipc::client::ServerCheck for NeverOwner {
+    fn server_ok(&self, _peer: &atlas_duck_ipc::transport::unix::PeerCred) -> bool {
+        false
+    }
+}
+
+#[cfg(all(any(test, feature = "test-env"), windows))]
+impl atlas_duck_ipc::client::ServerCheck for NeverOwner {
+    fn owner_ok(&self, _client: &tokio::net::windows::named_pipe::NamedPipeClient) -> bool {
+        false
+    }
+}
+
+/// `IpcClient::connect` with [`NeverOwner`] in place of the current-user check: the same
+/// endpoint (`endpoint_location`; Windows reads `<data>/endpoint` and checks the prefix), the
+/// same open, then the refusal before any byte is written. (Its unit test runs on Windows only.)
+#[cfg(any(all(test, windows), feature = "test-env"))]
+async fn connect_owner_mismatch(
+    ctx: &ClientContext,
+    deadline: Instant,
+) -> Result<IpcClient, ConnectError> {
+    let location = atlas_duck_ipc::paths::endpoint_location(&ctx.data_dir, &ctx.host)
+        .map_err(ConnectError::Io)?;
+    IpcClient::connect_at(&location, &ctx.data_dir, &ctx.hello, &NeverOwner, deadline).await
 }
 
 // ---------- envelopes the CLI builds itself ----------
