@@ -55,7 +55,7 @@ fn endpoint_file_roundtrip_and_mode() {
         let data = data.clone();
         std::thread::spawn(move || {
             let mut seen = 0usize;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            loop {
                 match read_endpoint_file(&data) {
                     Ok(Some(v)) => {
                         assert!(
@@ -68,6 +68,9 @@ fn endpoint_file_roundtrip_and_mode() {
                     // can fail transiently (sharing violation, delete pending).
                     Ok(None) | Err(_) if cfg!(windows) => {}
                     other => panic!("reader saw {other:?}"),
+                }
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
                 }
             }
             seen
@@ -446,8 +449,8 @@ fn test_home_overrides_base_dirs() {
         )
     );
 
-    // Unset: the real folders, exactly what this process resolves itself.
-    let real = test_home_report();
+    // Unset: two children with the variable removed agree, and neither uses `h`.
+    let real = child_report(None);
     assert_eq!(child_report(None), real);
     assert!(!real.contains(&h.display().to_string()));
 

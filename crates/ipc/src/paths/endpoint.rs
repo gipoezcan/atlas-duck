@@ -145,8 +145,14 @@ pub fn current_user_sid_string() -> io::Result<String> {
     let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
     let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
     // SAFETY: `sid` is a valid SID; `raw` receives a LocalAlloc'ed string.
-    if unsafe { ConvertSidToStringSidW(sid, &mut raw) } == 0 || raw.is_null() {
+    if unsafe { ConvertSidToStringSidW(sid, &mut raw) } == 0 {
         return Err(io::Error::last_os_error());
+    }
+    if raw.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SID string conversion returned no string",
+        ));
     }
     let mut n = 0usize;
     // SAFETY: on success `raw` is NUL-terminated.
@@ -239,7 +245,7 @@ pub fn socket_dir(host: &str) -> io::Result<PathBuf> {
     }
     #[cfg(feature = "test-paths")]
     if let Some(home) = super::base_dirs::test_home()? {
-        return Ok(home.join("s"));
+        return test_socket_dir(&home);
     }
     os_socket_dir(host)
 }
@@ -265,12 +271,32 @@ fn os_socket_dir(host: &str) -> io::Result<PathBuf> {
 }
 
 /// `sun_path` size on macOS, including the terminating NUL.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const SUN_PATH_LEN: usize = 104;
+
+/// True iff the socket path in `dir` is under `SUN_PATH_LEN` bytes.
+#[cfg(any(target_os = "macos", test))]
+fn socket_path_fits(dir: &Path) -> bool {
+    dir.join(SOCKET_FILE_NAME).as_os_str().len() < SUN_PATH_LEN
+}
+
+/// `<home>/s`, refused when the socket path in it would not fit `sun_path` on macOS.
+#[cfg(all(unix, feature = "test-paths"))]
+fn test_socket_dir(home: &Path) -> io::Result<PathBuf> {
+    let dir = home.join("s");
+    #[cfg(target_os = "macos")]
+    if !socket_path_fits(&dir) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path is 104 bytes or longer",
+        ));
+    }
+    Ok(dir)
+}
 
 #[cfg(target_os = "macos")]
 fn os_socket_dir(_host: &str) -> io::Result<PathBuf> {
-    let fits = |dir: &Path| dir.join(SOCKET_FILE_NAME).as_os_str().len() < SUN_PATH_LEN;
+    let fits = socket_path_fits;
     if let Some(temp) = darwin_user_temp_dir() {
         let dir = temp.join(super::APP_DIR_NAME);
         if fits(&dir) {
@@ -376,6 +402,7 @@ fn create_private_dirs(dir: &Path) -> io::Result<()> {
 // ---------- endpoint file ----------
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+const TMP_ATTEMPTS: usize = 8;
 
 fn valid_endpoint_name(name: &str) -> bool {
     !name.is_empty() && name.len() <= MAX_ENDPOINT_NAME_LEN && !name.chars().any(char::is_control)
@@ -391,12 +418,7 @@ pub fn write_endpoint_file(data: &LocalDataDir, name: &str) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, MSG_BAD_NAME));
     }
     let dir = data.path();
-    let tmp = dir.join(format!(
-        ".{ENDPOINT_FILE}.{}.{}.tmp",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = create_endpoint_temp(&tmp)?;
+    let (tmp, mut file) = create_unique_temp(dir)?;
     let written = (|| -> io::Result<()> {
         file.write_all(name.as_bytes())?;
         file.sync_all()?;
@@ -413,6 +435,25 @@ pub fn write_endpoint_file(data: &LocalDataDir, name: &str) -> io::Result<()> {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// Creates a fresh temp file in `dir`; a name that already exists is skipped
+/// (next counter value), at most `TMP_ATTEMPTS` times.
+fn create_unique_temp(dir: &Path) -> io::Result<(PathBuf, fs::File)> {
+    let mut last = None;
+    for _ in 0..TMP_ATTEMPTS {
+        let tmp = dir.join(format!(
+            ".{ENDPOINT_FILE}.{}.{}.tmp",
+            std::process::id(),
+            TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        match create_endpoint_temp(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
 }
 
 /// Creates the temp file exclusively with mode 0600 (set again after the
@@ -540,6 +581,31 @@ mod tests {
         ] {
             assert!(!is_host_component(bad), "{bad:?} accepted");
         }
+    }
+
+    #[test]
+    fn socket_path_fit_boundary() {
+        // "/" + SOCKET_FILE_NAME is joined onto the dir; under 104 bytes fits.
+        let base = SUN_PATH_LEN - 1 - SOCKET_FILE_NAME.len() - 1;
+        let fits = format!("/{}", "a".repeat(base - 1));
+        let too_long = format!("/{}", "a".repeat(base));
+        assert!(socket_path_fits(Path::new(&fits)));
+        assert!(!socket_path_fits(Path::new(&too_long)));
+    }
+
+    #[test]
+    fn temp_name_collision_takes_next_counter() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let next = TMP_COUNTER.load(Ordering::Relaxed);
+        // Pre-create the names the next attempts would pick (other tests may
+        // advance the counter, so cover a window).
+        for i in next..next + 3 {
+            let name = format!(".{ENDPOINT_FILE}.{}.{i}.tmp", std::process::id());
+            fs::write(tmp.path().join(name), b"x").expect("precreate");
+        }
+        let (path, _file) = create_unique_temp(tmp.path()).expect("unique temp");
+        assert!(path.exists());
+        assert_eq!(fs::read(&path).expect("read"), b"");
     }
 
     #[test]
