@@ -39,15 +39,16 @@ const MSG_NUL: &str = "path contains a NUL byte";
 pub struct PeerCred {
     /// The peer's effective uid.
     pub uid: u32,
-    /// The peer's pid, when the OS reports one (Linux `SO_PEERCRED`; Apple
-    /// `LOCAL_PEEREPID`, best effort: `None` once the peer has closed).
+    /// The peer's pid, when the OS reports one (Linux `SO_PEERCRED`; macOS
+    /// `LOCAL_PEEREPID`, then `LOCAL_PEERPID`, best effort: `None` once the
+    /// peer has closed).
     pub pid: Option<u32>,
 }
 
 impl PeerCred {
     /// `SO_PEERCRED` via tokio: uid and pid as of `connect`, readable after
     /// the peer has closed.
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(not(target_os = "macos"))]
     fn of(stream: &UnixStream) -> io::Result<PeerCred> {
         let cred = stream.peer_cred()?;
         Ok(PeerCred {
@@ -59,10 +60,11 @@ impl PeerCred {
     /// tokio's `peer_cred` on Apple asks `LOCAL_PEEREPID` first, which fails
     /// with `ENOTCONN` once the peer has closed. `getpeereid` reads the
     /// credentials cached at `connect` and survives that, so the uid comes
-    /// from it and the pid is best effort.
-    #[cfg(target_vendor = "apple")]
+    /// from it and the pid is best effort: `LOCAL_PEEREPID`, then
+    /// `LOCAL_PEERPID` (PD-36, V07).
+    #[cfg(target_os = "macos")]
     fn of(stream: &UnixStream) -> io::Result<PeerCred> {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsFd, AsRawFd};
 
         let fd = stream.as_raw_fd();
         let mut uid: libc::uid_t = 0;
@@ -72,34 +74,12 @@ impl PeerCred {
         if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
             return Err(io::Error::last_os_error());
         }
+        let borrowed = stream.as_fd();
         Ok(PeerCred {
             uid,
-            pid: peer_pid(fd),
+            pid: crate::peer::peer_epid(borrowed).or_else(|| crate::peer::peer_pid(borrowed)),
         })
     }
-}
-
-/// The peer's pid via `LOCAL_PEEREPID`, or `None` on any error.
-#[cfg(target_vendor = "apple")]
-fn peer_pid(fd: std::os::fd::RawFd) -> Option<u32> {
-    const PID_LEN: usize = std::mem::size_of::<libc::pid_t>();
-    let mut pid: libc::pid_t = 0;
-    let mut len = libc::socklen_t::try_from(PID_LEN).ok()?;
-    // SAFETY: `fd` is an open socket (see the caller); `pid` is a writable
-    // `pid_t` and `len` holds its size, which the kernel never exceeds.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEEREPID,
-            (&raw mut pid).cast::<libc::c_void>(),
-            &mut len,
-        )
-    };
-    if rc != 0 || usize::try_from(len).ok() != Some(PID_LEN) {
-        return None;
-    }
-    u32::try_from(pid).ok()
 }
 
 /// The server socket. Holds no file cleanup: the socket file stays after

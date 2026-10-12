@@ -471,6 +471,34 @@ pub fn read_endpoint_file(data: &LocalDataDir) -> io::Result<Option<String>> {
     }
 }
 
+/// Removes the temp files a crashed `write_endpoint_file` left in the data dir
+/// (`.endpoint.*.tmp`, regular files only, symlinks not followed). The server
+/// calls it at bind, under `instance.lock`, so no writer is live. Returns how
+/// many were removed.
+pub fn sweep_endpoint_temps(data: &LocalDataDir) -> io::Result<usize> {
+    let prefix = format!(".{ENDPOINT_FILE}.");
+    let mut removed = 0;
+    for entry in fs::read_dir(data.path())? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with(&prefix) && name.ends_with(".tmp")) {
+            continue;
+        }
+        if !fs::symlink_metadata(entry.path())?.is_file() {
+            continue;
+        }
+        match fs::remove_file(entry.path()) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(removed)
+}
+
 /// Removes `<data>/endpoint`; a missing file is not an error.
 pub fn remove_endpoint_file(data: &LocalDataDir) -> io::Result<()> {
     match fs::remove_file(data.path().join(ENDPOINT_FILE)) {

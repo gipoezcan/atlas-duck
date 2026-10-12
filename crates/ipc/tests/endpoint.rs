@@ -5,7 +5,7 @@ use std::path::Path;
 
 use atlas_duck_ipc::paths::{
     DataDirResolution, ENDPOINT_FILE, LocalDataDir, check_data_dir, pipe_name_has_prefix,
-    read_endpoint_file, remove_endpoint_file, write_endpoint_file,
+    read_endpoint_file, remove_endpoint_file, sweep_endpoint_temps, write_endpoint_file,
 };
 
 // ---------- helpers ----------
@@ -125,6 +125,39 @@ fn endpoint_file_rejects_garbage() {
         let err = write_endpoint_file(&data, bad).expect_err("bad name written");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{bad:?}");
     }
+}
+
+#[test]
+fn sweep_removes_only_endpoint_temp_files() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = local(tmp.path());
+    let stale = [
+        ".endpoint.123.0.tmp",
+        ".endpoint.9.17.tmp",
+        ".endpoint.x.tmp",
+    ];
+    let kept = [
+        "endpoint",
+        ".endpoint",
+        ".endpoint.123.0.tmp.bak",
+        "endpoint.1.2.tmp",
+        "audit.db",
+    ];
+    for name in stale.iter().chain(kept.iter()) {
+        std::fs::write(tmp.path().join(name), b"x").expect("write");
+    }
+    // A directory with a temp-file name is not touched.
+    std::fs::create_dir(tmp.path().join(".endpoint.5.5.tmp")).expect("mkdir");
+
+    assert_eq!(sweep_endpoint_temps(&data).expect("sweep"), stale.len());
+    for name in stale {
+        assert!(!tmp.path().join(name).exists(), "{name} survived");
+    }
+    for name in kept {
+        assert!(tmp.path().join(name).exists(), "{name} was removed");
+    }
+    assert!(tmp.path().join(".endpoint.5.5.tmp").is_dir());
+    assert_eq!(sweep_endpoint_temps(&data).expect("second sweep"), 0);
 }
 
 #[test]

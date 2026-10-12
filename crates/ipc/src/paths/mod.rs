@@ -22,7 +22,8 @@ pub(crate) use endpoint::euid;
 pub(crate) use endpoint::hex_lower;
 pub use endpoint::{
     ENDPOINT_FILE, EndpointLocation, MAX_ENDPOINT_NAME_LEN, SOCKET_FILE_NAME, endpoint_location,
-    pipe_name_has_prefix, read_endpoint_file, remove_endpoint_file, write_endpoint_file,
+    pipe_name_has_prefix, read_endpoint_file, remove_endpoint_file, sweep_endpoint_temps,
+    write_endpoint_file,
 };
 #[cfg(unix)]
 pub use endpoint::{check_socket_dir, ensure_socket_dir, socket_dir};
