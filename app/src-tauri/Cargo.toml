@@ -86,7 +86,8 @@ atlas-duck-audit = { path = "../../crates/audit", features = ["testing"] }
 atlas-duck-atlassian = { path = "../../crates/atlassian", features = ["testing"] }
 # T22: the cli_flows harness (mock servers, spawned binaries, product ids).
 atlas-duck-registry = { path = "../../crates/registry" }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }
+# `io-util`: the T23 flows read a spawned CLI's stderr line by line and write its stdin.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

@@ -6,6 +6,9 @@
 
 #[path = "cli_flows/harness.rs"]
 pub mod harness;
+// Task 23: the end-to-end flows (I-03, I-10, I-15, I-16, I-39, U-05, X-08, S-16 CLI slice).
+#[path = "cli_flows/flows.rs"]
+mod flows;
 
 use atlas_duck_audit::EventType;
 use atlas_duck_registry::Product;
