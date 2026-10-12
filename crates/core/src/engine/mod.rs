@@ -1187,7 +1187,7 @@ impl Engine {
         // whose time is up) expires the moment it is back in a phase that can, under this same
         // gate, so no decision can be taken on the new revision first.
         if applied.is_ok() {
-            self.expire_if_due(entry, &gate);
+            self.expire_if_due(entry, &gate).await;
         }
         applied
     }
@@ -1362,7 +1362,7 @@ impl Engine {
         let rebuilt = self
             .blocking(move |p| Ok(cache::rebuild(p, &rid, spec, &ops, &expected, normalize)))
             .await
-            .unwrap_or_else(|e| Err(RebuildError::Audit(e)));
+            .unwrap_or_else(|e| Err(RebuildError::Transient(e)));
         match rebuilt {
             Ok(c) => {
                 let c = Arc::new(c);

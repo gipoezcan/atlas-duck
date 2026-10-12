@@ -12,10 +12,12 @@ use atlas_duck_atlassian::testing::{
     MockDc, RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, XAuser, fixtures,
 };
 use atlas_duck_audit::EventType;
+use atlas_duck_audit::testing::Faults;
 use atlas_duck_core::TestHooks;
 use atlas_duck_core::engine::Engine;
 use atlas_duck_core::engine::cancel::{CancelBusy, CancelCause, ShutdownReason};
 use atlas_duck_core::engine::queue::Limits;
+use atlas_duck_core::lifecycle::model::ReleaseItem;
 use atlas_duck_core::testing::{Harness, InstanceAt};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_registry::Product;
@@ -331,6 +333,15 @@ async fn i09_probe_cancel_envelopes_identical() -> TestResult {
         )
         .await;
     let params = json!({ "jql": "project = NONE", "max": 10 });
+    // M-17: the oversize probe really is an outcome item, so the comparison below is not
+    // between two ordinary result items.
+    let probe = queued(&big, SEARCH, params.clone()).await?;
+    let item = big
+        .engine()
+        .entry(&probe)
+        .and_then(|e| e.state().read.as_ref().map(|r| r.item));
+    assert_eq!(item, Some(ReleaseItem::Outcome));
+    assert_cancelled(&big.handler().cancel(&probe).await);
     let (e1, s1) = probe_cancel(&big, params.clone()).await?;
     let (e2, s2) = probe_cancel(&empty, params).await?;
     assert_eq!(e1, e2);
@@ -357,6 +368,43 @@ async fn i09_cancel_path_never_awaits_network() -> TestResult {
     // Terminal now: the reduced status, never a second record.
     assert_eq!(again.status, Status::Cancelled);
     assert_eq!(h.event_types(&id).await?.len(), 3);
+    Ok(())
+}
+
+/// M3 final review M-2: the append of an expiry runs off the runtime worker. With one worker
+/// and the audit writer held, a request that sits in memory is still answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn expiry_append_does_not_block_runtime_worker() -> TestResult {
+    let faults = Faults::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .store_faults(faults.clone())
+        .start()
+        .await?;
+    jira(&h)?
+        .json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let expiring = queued(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    let other = queued(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    faults.pause_writer();
+    let engine = h.engine().clone();
+    let id = expiring.clone();
+    let expiry = tokio::spawn(async move { engine.expire_now(&id).await });
+    let f = faults.clone();
+    let paused =
+        tokio::task::spawn_blocking(move || f.wait_writer_paused(Duration::from_secs(10))).await?;
+    assert!(paused, "the expiry never reached the audit writer");
+    // The test body runs on the main thread, not on the worker: the answer has to come from a
+    // task, which only the one worker can run.
+    let handler = h.handler();
+    let answer = tokio::spawn(async move { handler.status(&other).await });
+    let answered = tokio::time::timeout(Duration::from_millis(500), answer).await;
+    // Let the writer go first, so a failure ends the test instead of hanging its runtime.
+    faults.resume_writer();
+    let env = answered.map_err(|_| "status waited for the paused audit writer")??;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    assert!(expiry.await?, "the expiry did not complete");
+    assert_eq!(h.status(&expiring).await.status, Status::Expired);
     Ok(())
 }
 

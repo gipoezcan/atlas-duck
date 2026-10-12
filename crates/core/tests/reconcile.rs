@@ -512,6 +512,27 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_jira_transition() 
     Ok(())
 }
 
+/// I-26 across a real reopen (M3 final review I-2): the store is shut down and opened again by
+/// the real startup, whose `VERIFY` finds nothing, and the core reconciles the log from there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_reopened_store_reconciles_stale_check_crash() -> TestResult {
+    let mut h = Harness::jira().await?;
+    let id = queued_transition(&h).await?;
+    let freeze = h.plan().freeze_after(EventType::PREVIEW_FETCH);
+    h.approver().approve(&id).map_err(de)?;
+    tripped(&freeze).await?;
+    assert_eq!(
+        types(&h, &id).await?.last(),
+        Some(&EventType::PREVIEW_FETCH)
+    );
+    h.reopen_and_restart().await?;
+    assert!(h.store().open_incidents().is_empty());
+    assert_listed_unknown(&h, &id, "ABC-1").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_update() -> TestResult {
     let mut h = Harness::confluence().await?;
@@ -955,7 +976,13 @@ fn log_capture() -> &'static Arc<LogCapture> {
     CAPTURE.get_or_init(|| {
         let c = Arc::new(LogCapture::default());
         // Global: the read task runs on a worker thread. Only this test installs one.
-        let _ = tracing::subscriber::set_global_default(Sink(c.clone()));
+        let installed = tracing::subscriber::set_global_default(Sink(c.clone()));
+        assert!(installed.is_ok(), "another global subscriber is installed");
+        // The capture is live for events of any thread: without this the sentinel checks
+        // below would pass over a sink that sees nothing (M-8).
+        let probe = std::thread::spawn(|| tracing::info!("capture probe"));
+        assert!(probe.join().is_ok());
+        assert!(!lines(&c).is_empty(), "the capture saw no log line");
         c
     })
 }

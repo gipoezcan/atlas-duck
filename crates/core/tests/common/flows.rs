@@ -3,6 +3,7 @@
 //! before every positive decision (U-32).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
@@ -14,7 +15,7 @@ use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::envelope::Status;
 use serde_json::{Map, Value, json};
 use wiremock::matchers::{method, path_regex};
-use wiremock::{Mock, ResponseTemplate};
+use wiremock::{Mock, Request, ResponseTemplate};
 
 use super::{TestError, de, request_id};
 
@@ -92,6 +93,13 @@ pub async fn mount_jira(h: &Harness) -> Result<(), TestError> {
 /// `mount_jira` with `issue` as the body of every `ABC`/`EDT` issue.
 pub async fn mount_jira_with(h: &Harness, issue: &str) -> Result<(), TestError> {
     let mock = jira(h)?;
+    // A server of an earlier harness may have had this very URI (a port is reused): its hits
+    // are not this mock's.
+    hits_of(mock)
+        .seen
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
     mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
         .await;
     mock.jira_server_info("9.12.0").await;
@@ -113,9 +121,8 @@ pub async fn mount_jira_with(h: &Harness, issue: &str) -> Result<(), TestError> 
         ),
     )
     .await;
-    mount(
+    mount_hang(
         mock,
-        "GET",
         issue_re(mock, "SLOW|HANG", ""),
         json_body(mock.response(200), fixtures::JIRA_ISSUE).set_delay(HANG),
     )
@@ -134,9 +141,8 @@ pub async fn mount_jira_with(h: &Harness, issue: &str) -> Result<(), TestError> 
         json_body(mock.response(200), &page.to_string()),
     )
     .await;
-    mount(
+    mount_hang(
         mock,
-        "GET",
         issue_re(mock, "ENR", "/transitions"),
         json_body(mock.response(200), fixtures::JIRA_TRANSITIONS).set_delay(HANG),
     )
@@ -158,20 +164,90 @@ fn issue_with(summary: &str) -> String {
     issue.to_string()
 }
 
-/// Waits until the mock has received a request on a path ending `tail`.
+/// The paths a mock was asked for by the delayed answers, in order, with a counter that moves
+/// on every hit: a flow waits on the arrival itself, with no poll interval that could outlast
+/// the per-call timeout and turn the flow's intended outcome into a timeout one.
+struct Hits {
+    seen: Mutex<Vec<String>>,
+    count: tokio::sync::watch::Sender<u64>,
+}
+
+/// One `Hits` per mock server (its URI): flows of different harnesses never see each other.
+fn hits_of(mock: &MockDc) -> Arc<Hits> {
+    static ALL: OnceLock<Mutex<HashMap<String, Arc<Hits>>>> = OnceLock::new();
+    let mut all = ALL
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    all.entry(mock.server().uri())
+        .or_insert_with(|| {
+            Arc::new(Hits {
+                seen: Mutex::new(Vec::new()),
+                count: tokio::sync::watch::channel(0).0,
+            })
+        })
+        .clone()
+}
+
+/// `mount` for an answer that is delayed by `HANG`: the arrival of the request is recorded the
+/// moment the mock answers.
+async fn mount_hang(mock: &MockDc, re: String, t: ResponseTemplate) {
+    let hits = hits_of(mock);
+    Mock::given(method("GET"))
+        .and(path_regex(re))
+        .respond_with(move |req: &Request| {
+            hits.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(req.url.path().to_owned());
+            hits.count.send_modify(|n| *n += 1);
+            t.clone()
+        })
+        .mount(mock.server())
+        .await;
+}
+
+/// Waits until a delayed-answer request on a path ending `tail` has arrived at the mock.
 async fn wait_hit(mock: &MockDc, tail: &str) -> Result<(), TestError> {
-    for _ in 0..500 {
-        if mock
-            .received()
-            .await
-            .iter()
-            .any(|r| r.url.path().ends_with(tail))
-        {
-            return Ok(());
+    let hits = hits_of(mock);
+    let mut rx = hits.count.subscribe();
+    let arrived = async {
+        loop {
+            let seen = hits
+                .seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .any(|p| p.ends_with(tail));
+            if seen {
+                return Ok(());
+            }
+            rx.changed().await?;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    match tokio::time::timeout(Duration::from_secs(10), arrived).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("the mock never received {tail}").into()),
     }
-    Err(format!("the mock never received {tail}").into())
+}
+
+/// The request's `READ_FETCHED` is the one a cancel or expiry commits for bytes in flight, with
+/// the given reason: a timeout or budget outcome in its place would pass the status check of the
+/// flow and cover the wrong thing (I-19).
+async fn expect_cancelled_in_flight(h: &Harness, id: &str, reason: &str) -> Result<(), TestError> {
+    let events = h.events(id).await?;
+    let fetched = events
+        .iter()
+        .find(|(t, _)| *t == EventType::READ_FETCHED)
+        .map(|(_, p)| p.clone())
+        .ok_or_else(|| {
+            let types: Vec<_> = events.iter().map(|(t, _)| t.as_str()).collect();
+            format!("no READ_FETCHED record, only {types:?}")
+        })?;
+    if fetched["outcome"] != "cancelled_in_flight" || fetched["reason"] != reason {
+        return Err(format!("READ_FETCHED is not cancelled_in_flight/{reason}: {fetched}").into());
+    }
+    Ok(())
 }
 
 async fn submit_queued(h: &Harness, op: &str, params: Value) -> Result<String, TestError> {
@@ -249,7 +325,8 @@ pub async fn run_flow(h: &Harness, flow: Flow, n: usize) -> Result<(), TestError
                 "cancel",
                 h.handler().cancel(&id).await.status,
                 Status::Cancelled,
-            )
+            )?;
+            expect_cancelled_in_flight(h, &id, "by_client").await
         }
         Flow::ReadExpireMidFetch => {
             let key = format!("HANG-{n}");
@@ -259,7 +336,8 @@ pub async fn run_flow(h: &Harness, flow: Flow, n: usize) -> Result<(), TestError
             if !h.expire_now(&id).await {
                 return Err("expire_now: not pending".into());
             }
-            expect("expire", h.status(&id).await.status, Status::Expired)
+            expect("expire", h.status(&id).await.status, Status::Expired)?;
+            expect_cancelled_in_flight(h, &id, "expired").await
         }
         Flow::WriteApprove | Flow::WriteDeny => {
             let params =

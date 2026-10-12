@@ -920,6 +920,73 @@ async fn i37_rebuild_hash_mismatch_disables_release() -> TestResult {
     Ok(())
 }
 
+/// PD-40: a record that cannot be decrypted fails the item closed like a hash mismatch; a store
+/// that is only closed for one call fails that call and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_rebuild_decrypt_failure_disables_release() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(&h, "ABC-1", 4096, 'r').await?;
+    // Transient first: this request's item keeps working.
+    let t = request_id(&h.submit(ISSUE, issue("ABC-1")).await)?;
+    let item = queued(&h, &t, 5000).await.ok_or("never queued")?;
+    let rev = item.candidate_rev;
+    h.decisions()
+        .preview_fetch(&t, Some(rev))
+        .map_err(|e| format!("{e:?}"))?;
+    h.evict_candidate(&t);
+    h.plan().close_reads_for(1);
+    let res = h.decisions().preview_fetch(&t, Some(rev));
+    assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
+    assert!(h.decisions().queue_get(&t).ok_or("gone")?.approvable);
+    let res = h.decisions().preview_fetch(&t, Some(rev));
+    assert!(res.is_ok(), "{res:?}");
+    // Permanent: the record of the candidate cannot be decrypted.
+    let id = request_id(&h.submit(ISSUE, issue("ABC-1")).await)?;
+    let item = queued(&h, &id, 5000).await.ok_or("never queued")?;
+    h.decisions()
+        .preview_fetch(&id, Some(item.candidate_rev))
+        .map_err(|e| format!("{e:?}"))?;
+    let seq = h
+        .store()
+        .headers_for_request(&id)?
+        .iter()
+        .find(|e| e.event_type == EventType::READ_FETCHED)
+        .map(|e| e.seq)
+        .ok_or("no READ_FETCHED")?;
+    h.plan().fail_read_payload(seq);
+    h.evict_candidate(&id);
+    let res = h.decisions().preview_fetch(&id, Some(item.candidate_rev));
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let item = h.decisions().queue_get(&id).ok_or("gone")?;
+    assert!(
+        !item.approvable,
+        "release is disabled after a decrypt failure"
+    );
+    let res = h.decisions().decide(release(&id, item.candidate_rev));
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let events = h.events(&id).await?;
+    assert!(
+        events
+            .iter()
+            .any(|(t, p)| *t == EventType::DECISION_INVALID
+                && p["reason"] == json!("not_approvable"))
+    );
+    assert!(!events.iter().any(|(t, _)| *t == EventType::READ_RELEASED));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i37_await_delivers_committed_bytes() -> TestResult {
     let h = Harness::jira().await?;

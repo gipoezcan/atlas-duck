@@ -86,18 +86,29 @@ pub(crate) async fn sweep(engine: &Arc<Engine>, why: CancelWhy, write_wait: Dura
     let mut swept = Swept::default();
     let mut seen: HashSet<String> = HashSet::new();
     let deadline = Instant::now() + write_wait;
+    // A round that finds nothing executing is repeated once more (round, then list again): a
+    // write whose stale check completed while the round cancelled earlier ids has turned
+    // `executing` by now, and is waited for like the others. The sweep ends on a second empty
+    // list in a row or when the budget is over; the last round before it also ends what came
+    // back to the queue (a version conflict) or arrived while the sweep ran.
+    let mut settled = false;
     loop {
         swept.cancelled += cancel_round(engine, cause).await;
         let running = executing(engine);
         seen.extend(running.iter().map(|e| e.head.request_id.clone()));
-        if running.is_empty() || Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             break;
         }
+        if running.is_empty() {
+            if settled {
+                break;
+            }
+            settled = true;
+            continue;
+        }
+        settled = false;
         tokio::time::sleep(POLL).await;
     }
-    // A write that came back to the queue (a version conflict) or a request that arrived while
-    // the sweep ran is not executing any more: it ends here too.
-    swept.cancelled += cancel_round(engine, cause).await;
     swept.writes_waited = u32::try_from(seen.len()).unwrap_or(u32::MAX);
     swept
 }

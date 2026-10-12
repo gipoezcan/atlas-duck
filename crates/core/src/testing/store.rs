@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -14,9 +14,9 @@ use atlas_duck_audit::testing::{FakeClock, Faults, FreeSpaceStub, MemKeyStore, M
 use atlas_duck_audit::{
     AuditError, Committed, Confirmed, EventFlags, EventHeader, EventType, FilePolicy,
     FirstRunInput, Hooks, NewEvent, OpenConfig, QueryKind, ReconcileReport, SettingChange,
-    Settings, Store, UtcInstant, create_new_store, new_ids,
+    Settings, StartupOutcome, Store, UtcInstant, create_new_store, new_ids, open,
 };
-use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
 use secrecy::SecretString;
 use tempfile::TempDir;
 use zeroize::Zeroizing;
@@ -43,7 +43,10 @@ pub struct TempStore {
     ring: Arc<MemKeyring>,
     free_space: Arc<FreeSpaceStub>,
     install_id: String,
-    _lock: InstanceLock,
+    hooks: Hooks,
+    data: LocalDataDir,
+    /// `None` only while `reopen` swaps it.
+    lock: Option<InstanceLock>,
     dir: TempDir,
 }
 
@@ -86,7 +89,7 @@ impl TempStore {
             Arc::new(MemKeyStore::new(ring.clone(), &install_id)),
         );
         cfg.free_space = Some(free_space.clone());
-        cfg.hooks = hooks;
+        cfg.hooks = hooks.clone();
         let store = create_new_store(
             &data,
             &lock,
@@ -105,9 +108,36 @@ impl TempStore {
             ring,
             free_space,
             install_id,
-            _lock: lock,
+            hooks,
+            data,
+            lock: Some(lock),
             dir,
         })
+    }
+
+    /// A real restart of the store (M3 final review I-2): shuts the store down, lets go of and
+    /// takes the instance lock again and runs the real `audit::open` over the same data dir,
+    /// keyring and clock. Clones of the old `store()` answer `Closed` afterwards. The startup
+    /// outcome must be `Ready`, anything else is an error naming it.
+    pub fn reopen(&mut self) -> Result<(), TestError> {
+        self.store.shutdown();
+        drop(self.lock.take());
+        let lock = InstanceLock::acquire(&self.data, "testhost")?;
+        let mut cfg = OpenConfig::new(
+            self.clock.clone(),
+            Arc::new(MemKeyStore::new(self.ring.clone(), &self.install_id)),
+        );
+        cfg.free_space = Some(self.free_space.clone());
+        cfg.hooks = self.hooks.clone();
+        let outcome = open(&self.data, &lock, cfg);
+        self.lock = Some(lock);
+        match outcome? {
+            StartupOutcome::Ready { store, .. } => {
+                self.store = store;
+                Ok(())
+            }
+            other => Err(format!("reopen did not reach Ready: {other:?}").into()),
+        }
     }
 
     pub fn store(&self) -> Store {
@@ -171,6 +201,8 @@ pub struct FaultPlan {
     fail_crash_reconcile: AtomicBool,
     /// `recent_headers` fails (the similarity seed, review M-3).
     fail_recent_headers: AtomicBool,
+    /// The next this many `read_payload` calls answer `Closed` (a transient store failure).
+    closed_reads: AtomicU32,
 }
 
 /// A crash point (Task 28): right after the append of `after` commits, the wrapper that
@@ -285,6 +317,12 @@ impl FaultPlan {
     /// `recent_headers` through this port answers an error while on (the seed fails).
     pub fn fail_recent_headers(&self, on: bool) {
         self.fail_recent_headers.store(on, Ordering::SeqCst);
+    }
+
+    /// The next `n` `read_payload` calls through this port answer `AuditError::Closed` (a store
+    /// that is closed for those calls); later ones succeed again.
+    pub fn close_reads_for(&self, n: u32) {
+        self.closed_reads.store(n, Ordering::SeqCst);
     }
 
     fn note_call(&self, evs: Vec<RecordedEvent>) {
@@ -473,6 +511,14 @@ impl AuditPort for FaultyAudit {
     }
 
     fn read_payload(&self, seq: u64) -> Result<Zeroizing<Vec<u8>>, AuditError> {
+        if self
+            .plan
+            .closed_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(AuditError::Closed);
+        }
         if lock(&self.plan.unreadable).contains(&seq) {
             return Err(AuditError::Invalid(
                 "payload cannot be decrypted (test hook)",

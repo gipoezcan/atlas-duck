@@ -308,14 +308,14 @@ async fn i40_os_shutdown_reason() -> TestResult {
 async fn i40_nothing_left_to_reconcile() -> TestResult {
     let mut b = busy(100, TestHooks::none()).await?;
     b.h.core().shutdown(ShutdownReason::Quit).await;
-    // The store's own predicate finds nothing open.
+    // The store is closed and opened again by the real startup (I-2); the next start finds
+    // nothing to reconcile, and neither does the store's own predicate.
+    b.h.reopen_and_restart().await?;
     let report = b.h.store().reconcile_after_crash()?;
     assert!(
         report.outcome_unknown.is_empty() && report.abandoned.is_empty(),
         "{report:?}"
     );
-    // And so does the next start.
-    b.h.restart().await?;
     assert!(b.h.core().startup_notice().is_empty());
     assert!(b.h.events_of(EventType::ABANDONED).await?.is_empty());
     assert!(
@@ -324,6 +324,88 @@ async fn i40_nothing_left_to_reconcile() -> TestResult {
             .is_empty()
     );
     assert_eq!(b.h.events_of(EventType::APP_START).await?.len(), 2);
+    Ok(())
+}
+
+/// M3 final review M-3: a write whose stale check completes while the sweep is cancelling it
+/// turns `executing` under the sweep's hands; it is waited for like the others, so `APP_STOP`
+/// follows its `WRITE_EXECUTED`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i40_write_turning_executing_in_last_round_is_waited() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_in_transition: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1/comment")))
+        .respond_with(
+            mock.response(201)
+                .set_body_raw(fixtures::JIRA_COMMENT, "application/json")
+                .set_delay(Duration::from_millis(300)),
+        )
+        .mount(mock.server())
+        .await;
+    // The setup's transitions pass the hook; a helper lets them through.
+    let auto = {
+        let p = pause.clone();
+        tokio::spawn(async move {
+            loop {
+                p.reached.notified().await;
+                p.release.notify_one();
+            }
+        })
+    };
+    let id = queued(
+        &h,
+        COMMENT,
+        json!({ "key": "ABC-1", "body": "Reproduced.", "body_format": "wiki" }),
+    )
+    .await?;
+    h.approver().open(&id).map_err(de)?;
+    auto.abort();
+    let _ = auto.await;
+    // The approval's own transition holds first, then the stale check's: its record is
+    // committed and the gate is held, the model has not left `StaleCheck` yet.
+    let approver = h.approver();
+    let rid = id.clone();
+    let decision = std::thread::spawn(move || approver.approve_unopened(&rid).map(|_| ()));
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified()).await?;
+    pause.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified()).await?;
+    let (report, ()) = tokio::join!(h.core().shutdown(ShutdownReason::Quit), async {
+        // The sweep is at this write's gate; letting the transition through makes it
+        // `executing` right there.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        pause.release.notify_one();
+        // The write's own later transitions pass the hook too.
+        let p = pause.clone();
+        tokio::spawn(async move {
+            loop {
+                p.reached.notified().await;
+                p.release.notify_one();
+            }
+        });
+    });
+    decision
+        .join()
+        .map_err(|_| "decision thread panicked")?
+        .map_err(de)?;
+    assert_eq!(report.writes_waited, 1, "{report:?}");
+    assert_eq!(report.cancelled, 0, "{report:?}");
+    let t = types(&h, &id).await?;
+    assert!(t.contains(&EventType::WRITE_EXECUTED), "{t:?}");
+    assert!(!t.contains(&EventType::CANCELLED), "{t:?}");
+    assert_eq!(last_event(&h)?, EventType::APP_STOP);
     Ok(())
 }
 

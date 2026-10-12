@@ -91,6 +91,7 @@ pub struct InstanceAt {
 pub struct HarnessBuilder {
     instances: Vec<InstanceSpec>,
     plan: Arc<FaultPlan>,
+    store_faults: Option<Arc<atlas_duck_audit::testing::Faults>>,
     pat: String,
     answers: Vec<Confirm>,
     config_text: Option<String>,
@@ -173,6 +174,12 @@ impl HarnessBuilder {
         self
     }
 
+    /// The store's own fault points (`Faults::pause_writer` etc.), kept over `reopen`.
+    pub fn store_faults(mut self, faults: Arc<atlas_duck_audit::testing::Faults>) -> Self {
+        self.store_faults = Some(faults);
+        self
+    }
+
     /// The PAT stored for every instance (default `TEST_PAT`).
     pub fn pat(mut self, pat: &str) -> Self {
         self.pat = pat.to_owned();
@@ -236,7 +243,10 @@ impl HarnessBuilder {
     }
 
     pub async fn start(self) -> Result<Harness, TestError> {
-        let store = TempStore::new()?;
+        let store = match self.store_faults.clone() {
+            Some(f) => TempStore::with_faults(f)?,
+            None => TempStore::new()?,
+        };
         let capture = Capture::new();
         let credentials = Arc::new(InMemoryCredentials::new());
         let config_dir = tempfile::tempdir()?;
@@ -505,6 +515,7 @@ impl Harness {
         HarnessBuilder {
             instances: Vec::new(),
             plan: FaultPlan::new(),
+            store_faults: None,
             pat: TEST_PAT.to_owned(),
             answers: Vec::new(),
             config_text: None,
@@ -596,6 +607,19 @@ impl Harness {
         // The dead process writes nothing more: its tasks (a stalled read, a write in flight)
         // may still run, but every append of theirs now fails.
         self.faulty.kill();
+        self.faulty = Arc::new(FaultyAudit::wrap(self.store.port(), self.plan.clone()));
+        self.port = self.faulty.clone();
+        self.restart().await
+    }
+
+    /// `crash_and_restart` through a real store reopen (M3 final review I-2): the old wrapper
+    /// is killed, the store is shut down and opened again by the real startup (`audit::open`,
+    /// so its startup `VERIFY` and anchor checks run), and a new `Core` starts over it.
+    pub async fn reopen_and_restart(&mut self) -> Result<(), TestError> {
+        self.hooks.freeze_at = None;
+        self.hooks.panic_on_jql = None;
+        self.faulty.kill();
+        self.store.reopen()?;
         self.faulty = Arc::new(FaultyAudit::wrap(self.store.port(), self.plan.clone()));
         self.port = self.faulty.clone();
         self.restart().await

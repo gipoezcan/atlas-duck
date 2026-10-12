@@ -247,8 +247,12 @@ impl CandidateCache {
 pub enum RebuildError {
     /// The request has no committed candidate record.
     NoSource,
-    /// The record could not be read (store closed, decrypt or hash failure).
-    Audit(AuditError),
+    /// The store could not answer this call (closed, I/O): only this call fails, a later one
+    /// may succeed (PD-40).
+    Transient(AuditError),
+    /// The record is unusable for good (decrypt failure, payload hash mismatch, invalid or
+    /// missing record, PD-40): Release is disabled like for `HashMismatch`.
+    Permanent(AuditError),
     /// The record or the normalization did not give a candidate.
     Malformed,
     /// A stored redaction op no longer applies.
@@ -258,10 +262,22 @@ pub enum RebuildError {
 }
 
 impl RebuildError {
-    /// Every failure except an unreadable store is permanent for this revision: Release is
-    /// disabled and only Deny remains (§5.2). A store read failure fails only this call.
+    /// Sorts a store failure into `Permanent` (the record itself is bad) or `Transient`.
+    pub fn from_audit(e: AuditError) -> RebuildError {
+        match e {
+            AuditError::Decrypt { .. }
+            | AuditError::PayloadHash { .. }
+            | AuditError::InvalidRecord { .. }
+            | AuditError::NotFound { .. }
+            | AuditError::Invalid(_) => RebuildError::Permanent(e),
+            _ => RebuildError::Transient(e),
+        }
+    }
+
+    /// Every failure except a transient store failure is permanent for this revision: Release is
+    /// disabled and only Deny remains (§5.2). A transient failure fails only this call.
     pub fn disables_release(&self) -> bool {
-        !matches!(self, RebuildError::Audit(_))
+        !matches!(self, RebuildError::Transient(_))
     }
 }
 
@@ -410,13 +426,15 @@ where
 {
     let headers = port
         .headers_for_request(request_id)
-        .map_err(RebuildError::Audit)?;
+        .map_err(RebuildError::from_audit)?;
     let source = headers
         .iter()
         .rev()
         .find(|h| CANDIDATE_SOURCES.contains(&h.event_type))
         .ok_or(RebuildError::NoSource)?;
-    let bytes = port.read_payload(source.seq).map_err(RebuildError::Audit)?;
+    let bytes = port
+        .read_payload(source.seq)
+        .map_err(RebuildError::from_audit)?;
     let payload: Value = serde_json::from_slice(&bytes).map_err(|_| RebuildError::Malformed)?;
     drop(bytes);
     normalize(&payload)

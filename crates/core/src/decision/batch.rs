@@ -244,7 +244,7 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
         _ => {
             let c = match candidate(engine, &entry).await {
                 Ok(c) => c,
-                Err(RebuildError::Audit(e)) => return Err(Fail::Audit(e)),
+                Err(RebuildError::Transient(e)) => return Err(Fail::Audit(e)),
                 // §5.2: a failed rebuild disabled Release on this revision.
                 Err(_) => {
                     let f = BatchFailure::Invalid(InvalidReason::NotApprovable);

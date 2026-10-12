@@ -24,13 +24,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use atlas_duck_audit::{EventType, NewEvent};
+use atlas_duck_audit::{AuditError, EventType, NewEvent};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use serde_json::json;
 
 use super::envelope::{self, OpenStatus, RecordStatus};
 use super::script::KillReason;
 use super::{Engine, GateGuard, Prepared, RequestEntry};
+use crate::audit_port::AuditPort;
 use crate::lifecycle::model::{CancelReason, Event, Kind, Phase, Rejection, is_pending};
 use crate::payloads::{self, FetchRecord, InFlightReason, ReadFetched};
 
@@ -104,6 +105,42 @@ pub(crate) enum Attempt {
 /// about the request; retry, or use the awaited path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelBusy;
+
+/// Steps 1 and 2 of the gated section done: the model event stepped on a clone and the records
+/// to commit in one append.
+struct CancelPlan {
+    prepared: Prepared,
+    event: Event,
+    records: Vec<NewEvent>,
+}
+
+impl CancelPlan {
+    fn take_records(&mut self) -> Vec<NewEvent> {
+        std::mem::take(&mut self.records)
+    }
+
+    fn append_in_place(&self, port: &Arc<dyn AuditPort>) -> Result<(), AuditError> {
+        append_records(&**port, self.records.clone())
+    }
+}
+
+/// One `append` for a single record, one `append_batch` otherwise.
+fn append_records(port: &dyn AuditPort, mut records: Vec<NewEvent>) -> Result<(), AuditError> {
+    if records.len() == 1 {
+        records
+            .pop()
+            .map_or(Ok(()), |ev| port.append(ev).map(|_| ()))
+    } else {
+        port.append_batch(records).map(|_| ())
+    }
+}
+
+fn attempt_of(entry: Arc<RequestEntry>, locked: Locked, cause: CancelCause) -> Attempt {
+    match locked {
+        Locked::Ended => Attempt::Ended(Box::new(ended_envelope(&entry, cause))),
+        Locked::Unchanged => Attempt::Unchanged(entry),
+    }
+}
 
 /// What the gated section did.
 enum Locked {
@@ -199,7 +236,8 @@ impl Engine {
             return Attempt::Gone;
         };
         let gate = entry.gate.clone().lock_owned().await;
-        self.attempt_locked(entry, &gate, cause)
+        let locked = self.cancel_locked_async(&entry, &gate, cause).await;
+        attempt_of(entry, locked, cause)
     }
 
     fn attempt_locked(
@@ -208,10 +246,8 @@ impl Engine {
         gate: &GateGuard,
         cause: CancelCause,
     ) -> Attempt {
-        match self.cancel_locked(&entry, gate, cause) {
-            Locked::Ended => Attempt::Ended(Box::new(ended_envelope(&entry, cause))),
-            Locked::Unchanged => Attempt::Unchanged(entry),
-        }
+        let locked = self.cancel_locked(&entry, gate, cause);
+        attempt_of(entry, locked, cause)
     }
 
     /// The gated section (`gate` is the proof that the entry's transition gate is held).
@@ -224,17 +260,48 @@ impl Engine {
     /// 3. One `append_batch` of `[in-flight record?, CANCELLED | EXPIRED]`; a failed append
     ///    fails the request (`audit_failure`, §11.1).
     /// 4. The model applies, the admission place is released ([`Engine::after_change`]).
+    ///
+    /// The append (step 3) is a synchronous store call: the non-runtime caller
+    /// ([`Engine::cancel_now`]) makes it in place, the async paths hand it to a blocking thread
+    /// ([`Engine::cancel_locked_async`], M3 final review M-2) while the owned gate guard stays
+    /// with the future. Steps 1, 2 and 4 hold only `std::sync` locks and never wait.
     fn cancel_locked(
         &self,
         entry: &Arc<RequestEntry>,
         _gate: &GateGuard,
         cause: CancelCause,
     ) -> Locked {
+        let Some(plan) = self.cancel_plan(entry, cause) else {
+            return Locked::Unchanged;
+        };
+        let appended = plan.append_in_place(self.port());
+        self.cancel_commit(entry, plan, appended)
+    }
+
+    /// [`Engine::cancel_locked`] for async callers: the append runs through `spawn_blocking`
+    /// and is awaited, so a slow or paused audit writer holds no runtime worker. The state lock
+    /// is not held across it (PD-25).
+    async fn cancel_locked_async(
+        &self,
+        entry: &Arc<RequestEntry>,
+        _gate: &GateGuard,
+        cause: CancelCause,
+    ) -> Locked {
+        let Some(mut plan) = self.cancel_plan(entry, cause) else {
+            return Locked::Unchanged;
+        };
+        let records = plan.take_records();
+        let appended = self.blocking(move |p| append_records(p, records)).await;
+        self.cancel_commit(entry, plan, appended)
+    }
+
+    /// Steps 1 and 2: `None` when the request does not end here.
+    fn cancel_plan(&self, entry: &Arc<RequestEntry>, cause: CancelCause) -> Option<CancelPlan> {
         let event = cause.event();
         let (prepared, fetching, script) = {
             let mut st = entry.state();
             if !is_pending(st.model.phase()) {
-                return Locked::Unchanged;
+                return None;
             }
             let fetching = matches!(st.model.phase(), Phase::Fetching);
             // A script that is `Running` or `DryRunning` has a worker to kill (Task 27).
@@ -250,9 +317,9 @@ impl Engine {
                 Ok(p) => (p, fetching, script),
                 Err(Rejection::Illegal) if matches!(event, Event::Expire) => {
                     st.expiry_due = true;
-                    return Locked::Unchanged;
+                    return None;
                 }
-                Err(_) => return Locked::Unchanged,
+                Err(_) => return None,
             }
         };
         let mut records = Vec::with_capacity(3);
@@ -339,18 +406,25 @@ impl Engine {
             }
         }
         records.push(cause.terminal_record(entry));
-        let appended = if records.len() == 1 {
-            records
-                .pop()
-                .map_or(Ok(()), |ev| self.port().append(ev).map(|_| ()))
-        } else {
-            self.port().append_batch(records).map(|_| ())
-        };
+        Some(CancelPlan {
+            prepared,
+            event,
+            records,
+        })
+    }
+
+    /// Step 4 after the append's answer: a failed append fails the request (`audit_failure`).
+    fn cancel_commit(
+        &self,
+        entry: &Arc<RequestEntry>,
+        plan: CancelPlan,
+        appended: Result<(), AuditError>,
+    ) -> Locked {
         if appended.is_err() {
             self.fail_unlogged(entry);
             return Locked::Unchanged;
         }
-        let applied = prepared.apply(entry, event, |_| {}, |_| true);
+        let applied = plan.prepared.apply(entry, plan.event, |_| {}, |_| true);
         self.after_change(entry);
         if applied.is_ok() {
             Locked::Ended
@@ -362,13 +436,15 @@ impl Engine {
     /// Task 12 review I-4, called by [`Engine::transition`] under its gate after a model
     /// replace: a request whose timer fired while its phase could not expire (or whose time is
     /// up) expires now if the new phase can.
-    pub(super) fn expire_if_due(&self, entry: &Arc<RequestEntry>, gate: &GateGuard) {
+    pub(super) async fn expire_if_due(&self, entry: &Arc<RequestEntry>, gate: &GateGuard) {
         let due = {
             let st = entry.state();
             is_pending(st.model.phase()) && (st.expiry_due || entry.age() >= self.expiry())
         };
         if due {
-            let _ = self.cancel_locked(entry, gate, CancelCause::Expiry);
+            let _ = self
+                .cancel_locked_async(entry, gate, CancelCause::Expiry)
+                .await;
         }
     }
 

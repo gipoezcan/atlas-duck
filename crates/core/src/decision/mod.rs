@@ -525,7 +525,7 @@ async fn read_preview(
 ) -> Result<Built, DecisionError> {
     let c = match candidate(engine, entry).await {
         Ok(c) => c,
-        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         // §5.2: the item failed closed; only Deny remains (M6 shows the `internal` banner).
         Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
     };
@@ -699,7 +699,7 @@ async fn raw_page(
         None => {
             let c = match candidate(&engine, &entry).await {
                 Ok(c) => c,
-                Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+                Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
                 Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
             };
             if c.hash() != &rev.candidate_hash {
@@ -777,7 +777,7 @@ async fn release(
     };
     let c = match candidate(engine, entry).await {
         Ok(c) => c,
-        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => {
             let rej = (Rejection::NotApprovable, snapshot(&entry.state()));
             return Err(rejected(engine, entry, rej, rev.counter, dec).await);
@@ -905,7 +905,7 @@ async fn redact(
         .map_err(DecisionError::Audit)?;
     let base = match base {
         Ok(b) => b,
-        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => {
             return Err(rejected(
                 engine,
@@ -991,7 +991,7 @@ async fn script_preview(
 ) -> Result<Built, DecisionError> {
     let c = match candidate(engine, entry).await {
         Ok(c) => c,
-        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
     };
     let built = {
@@ -1064,7 +1064,7 @@ async fn redact_script(
         .map_err(DecisionError::Audit)?;
     let base = match base {
         Ok(b) => b,
-        Err(RebuildError::Audit(e)) => return Err(DecisionError::Audit(e)),
+        Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => {
             let rej = (Rejection::NotApprovable, at);
             return Err(rejected(engine, entry, rej, rev.counter, dec).await);
