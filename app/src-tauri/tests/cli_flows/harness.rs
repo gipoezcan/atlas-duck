@@ -7,7 +7,9 @@
 //!   the spawned binaries receive the variable.
 //! - Every test that spawns a binary starts with [`opted_in`]: without `ATLAS_DUCK_CLI_FLOWS=1`
 //!   it prints a `skipped:` line and returns (CI sets the variable, Task 26). Provisioning
-//!   (`World::new`, `provision_store`, `audit_records`) is in-process and needs no opt-in.
+//!   (`World::new`, `provision_store`, `audit_records`) is in-process and needs no opt-in; with
+//!   the OS keychain (CI only) its keystore calls go to an `atlas-duck-app __test-os-keystore`
+//!   process.
 //! - A `World` must be used from a multi-thread tokio runtime (the mock servers keep serving
 //!   while a test awaits a child).
 
