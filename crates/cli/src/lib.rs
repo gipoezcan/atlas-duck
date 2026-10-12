@@ -11,6 +11,7 @@
 mod argv;
 mod binding;
 mod deadline;
+mod discover;
 mod exit;
 mod help;
 mod input;
