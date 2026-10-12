@@ -137,9 +137,9 @@ fn canary_in(text: &str) -> Option<String> {
 
 /// What the CLI prints on stderr right after the server accepted a request (PD-19).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Notice {
-    request_id: String,
-    params_sha256: Option<String>,
+pub(crate) struct Notice {
+    pub(crate) request_id: String,
+    pub(crate) params_sha256: Option<String>,
 }
 
 /// `Some` for one `{"event":"submitted","request_id":..,"params_sha256":..,"status":"pending"}`.
@@ -155,7 +155,7 @@ fn parse_notice(line: &str) -> Option<Notice> {
 }
 
 /// The notices of `stderr` and the number of non-empty lines that are not one.
-fn notices(stderr: &str) -> (Vec<Notice>, usize) {
+pub(crate) fn notices(stderr: &str) -> (Vec<Notice>, usize) {
     let mut found = Vec::new();
     let mut other = 0;
     for line in stderr.lines().filter(|l| !l.trim().is_empty()) {
@@ -188,17 +188,17 @@ fn is_status(args: &[&str]) -> bool {
     args.first() == Some(&"status")
 }
 
-fn error_code(env: &Envelope) -> Option<ErrorCode> {
+pub(crate) fn error_code(env: &Envelope) -> Option<ErrorCode> {
     env.error.as_ref().map(|e| e.code)
 }
 
 /// `error.details[key]`.
-fn detail<'a>(env: &'a Envelope, key: &str) -> Option<&'a Value> {
+pub(crate) fn detail<'a>(env: &'a Envelope, key: &str) -> Option<&'a Value> {
     env.error.as_ref()?.details.as_ref()?.get(key)
 }
 
 /// `data` walked along `path`.
-fn data_at<'a>(env: &'a Envelope, path: &[&str]) -> Option<&'a Value> {
+pub(crate) fn data_at<'a>(env: &'a Envelope, path: &[&str]) -> Option<&'a Value> {
     let mut v = env.data.as_ref()?;
     for key in path {
         v = v.get(*key)?;
@@ -207,7 +207,7 @@ fn data_at<'a>(env: &'a Envelope, path: &[&str]) -> Option<&'a Value> {
 }
 
 /// The rows of a `requests list` envelope (`data.requests`).
-fn request_rows(env: &Envelope) -> Vec<Value> {
+pub(crate) fn request_rows(env: &Envelope) -> Vec<Value> {
     data_at(env, &["requests"])
         .and_then(Value::as_array)
         .cloned()
@@ -216,7 +216,7 @@ fn request_rows(env: &Envelope) -> Vec<Value> {
 
 /// What a command that must never launch the app leaves behind (PD-22): `<data>/endpoint`,
 /// `<data>/launch.lock` and any `launch*` file in the pinned dir (`launch-<host>.lock`).
-fn launch_artifacts(data: &Path, pinned_dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn launch_artifacts(data: &Path, pinned_dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut found = Vec::new();
     for path in [data.join(ENDPOINT_FILE), data.join("launch.lock")] {
         if path.try_exists()? {
@@ -257,13 +257,13 @@ fn without_id(text: &str, id: &str) -> String {
 /// `atlas-duck <args>` to its end. Checks what holds for every run: stdout is exactly one envelope
 /// line, its exit code is the §4.3 matrix (status override included), and the PAT canary is in
 /// neither stream (S-16).
-async fn run(world: &World, args: &[&str]) -> Result<CliRun> {
+pub(crate) async fn run(world: &World, args: &[&str]) -> Result<CliRun> {
     let r = world.cli(args).await?;
     check_run(args, &r)?;
     Ok(r)
 }
 
-fn check_run(args: &[&str], r: &CliRun) -> Result<()> {
+pub(crate) fn check_run(args: &[&str], r: &CliRun) -> Result<()> {
     no_canary(args, r)?;
     let env = r.envelope.as_ref().ok_or_else(|| {
         format!(
@@ -448,7 +448,7 @@ impl Waiting {
 // ---- the world ---------------------------------------------------------------------------------------
 
 /// A test home with one Jira instance `jira-main`, the first CLI call cold-starts the app.
-async fn jira_world() -> Result<World> {
+pub(crate) async fn jira_world() -> Result<World> {
     let mut world = World::new(WorldOpts::default())?;
     world
         .provision_store(&[("jira-main", Product::Jira)])
@@ -456,7 +456,7 @@ async fn jira_world() -> Result<World> {
     Ok(world)
 }
 
-fn jira(world: &World) -> Result<&atlas_duck_atlassian::testing::MockDc> {
+pub(crate) fn jira(world: &World) -> Result<&atlas_duck_atlassian::testing::MockDc> {
     world
         .mock("jira-main")
         .ok_or_else(|| "no mock for jira-main".into())
@@ -472,7 +472,7 @@ async fn warm(world: &World) -> Result<()> {
     Ok(())
 }
 
-fn request_id_of(env: &Envelope) -> Result<String> {
+pub(crate) fn request_id_of(env: &Envelope) -> Result<String> {
     env.request_id
         .clone()
         .ok_or_else(|| format!("no request id in {}", env.to_json_line()).into())
@@ -480,7 +480,7 @@ fn request_id_of(env: &Envelope) -> Result<String> {
 
 /// Submits a request and returns at once: `--timeout 0` prints the notice and the pending
 /// envelope (exit 4). The id is the notice's and the envelope's.
-async fn submit_pending(world: &World, args: &[&str]) -> Result<String> {
+pub(crate) async fn submit_pending(world: &World, args: &[&str]) -> Result<String> {
     let mut full = args.to_vec();
     full.extend(["--timeout", "0"]);
     let r = run(world, &full).await?;
@@ -501,7 +501,7 @@ async fn submit_pending(world: &World, args: &[&str]) -> Result<String> {
 }
 
 /// Polls `status <id>` until `accept` holds for its envelope.
-async fn wait_status(
+pub(crate) async fn wait_status(
     world: &World,
     id: &str,
     accept: impl Fn(&Envelope) -> bool,
@@ -528,12 +528,12 @@ fn open_status(env: &Envelope) -> bool {
     matches!(env.status, Status::Pending | Status::Executing)
 }
 
-fn decided(env: &Envelope) -> bool {
+pub(crate) fn decided(env: &Envelope) -> bool {
     !open_status(env)
 }
 
 /// Every header of the audit log in order. Needs the app gone (the instance lock).
-fn audit_headers(world: &World) -> Result<Vec<EventHeader>> {
+pub(crate) fn audit_headers(world: &World) -> Result<Vec<EventHeader>> {
     let DataDirResolution::Local(data) = check_data_dir(world.data_dir())? else {
         return Err("the test data dir is not a local data dir".into());
     };
