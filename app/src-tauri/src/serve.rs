@@ -576,6 +576,11 @@ pub fn start(
     let quit = slot
         .as_ref()
         .map_or_else(ShutdownSignal::new, |s| s.quit().clone());
+    // PD-03: the test build tees the core's events to the scripted approver.
+    #[cfg(feature = "scripted-approver")]
+    let tee = Some(crate::testing::approver::ui_tee());
+    #[cfg(not(feature = "scripted-approver"))]
+    let tee = None;
     let inputs = StartInputs {
         data,
         lock,
@@ -583,7 +588,7 @@ pub fn start(
         install_id: pinned.install_id.clone(),
         config_dir: pinned.config_dir.clone(),
         keys,
-        ui: Arc::new(TauriUiSink::new(app.clone(), None)),
+        ui: Arc::new(TauriUiSink::new(app.clone(), tee)),
         confirmer: Arc::new(DialogConfirmer::new(app.clone())),
         tray_host,
         secret_service: Arc::new(CachedSecretService::new()),
@@ -593,6 +598,9 @@ pub fn start(
     };
     let handle = app.clone();
     let task = tauri::async_runtime::spawn(async move {
+        // The test build's `delay-startup-ms` control file (I-17), before the first `open`.
+        #[cfg(feature = "scripted-approver")]
+        crate::testing::control::startup_delay(&inputs.data, &inputs.quit).await;
         match start_with(inputs).await {
             Ok(state) => {
                 if let Some(slot) = handle.try_state::<ServeSlot>() {

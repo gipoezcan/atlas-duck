@@ -89,10 +89,28 @@ impl std::fmt::Display for ComposeError {
 
 impl std::error::Error for ComposeError {}
 
-/// Assembles the deps and starts the core. Task 21 adds the `scripted-approver` branch.
+/// Assembles the deps and starts the core.
+#[cfg(not(feature = "scripted-approver"))]
 pub async fn start_core(i: CoreInputs) -> Result<Core, ComposeError> {
     let deps = core_deps(i).map_err(ComposeError::Config)?;
     Core::start(deps).await.map_err(ComposeError::Start)
+}
+
+/// Assembles the deps and starts the core. The test build accepts the mock's plain `http://`
+/// origins (§13: "plain http to the mock only through a test-only cargo feature"); `allow_http`
+/// exists only under `core/testing`.
+#[cfg(feature = "scripted-approver")]
+pub async fn start_core(i: CoreInputs) -> Result<Core, ComposeError> {
+    use atlas_duck_core::TestHooks;
+    let port = Arc::new(i.store.clone());
+    let deps = core_deps(i).map_err(ComposeError::Config)?;
+    let hooks = TestHooks {
+        allow_http: true,
+        ..TestHooks::none()
+    };
+    Core::start_with_port(deps, port, hooks)
+        .await
+        .map_err(ComposeError::Start)
 }
 
 /// The UTC offset of the local time zone in minutes east of UTC, `None` when the OS cannot say

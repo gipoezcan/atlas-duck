@@ -1,6 +1,11 @@
 //! atlas-duck app library: the GUI / `--background` orchestration behind the three thin
 //! `main`s (§12.1).
 
+// §13: the headless test build (test home, file keystore, scripted approver, plain http to the
+// mock) exists only in test builds; a release build must never carry it.
+#[cfg(all(feature = "scripted-approver", not(debug_assertions)))]
+compile_error!("scripted-approver must never reach a release build");
+
 pub mod compose;
 pub mod confirm;
 pub mod diag;
@@ -10,6 +15,8 @@ pub mod secret_service;
 pub mod serve;
 pub mod startup;
 pub mod state;
+#[cfg(feature = "scripted-approver")]
+pub mod testing;
 pub mod tray;
 pub mod tray_host;
 pub mod ui_sink;
@@ -108,15 +115,14 @@ pub fn run_gui(background: bool) -> ! {
             if let (Some((data, lock)), Some(pinned)) = (serve_args, pinned_paths.as_ref()) {
                 diag.extend_allowed_fields(serve::LOG_FIELDS);
                 app.manage(ServeSlot::default());
-                serve::start(
-                    app.handle(),
-                    data,
-                    lock,
-                    pinned,
-                    &host,
-                    tray_host,
-                    Arc::new(serve::OsKeysFactory),
-                );
+                #[cfg(not(feature = "scripted-approver"))]
+                let keys: Arc<dyn serve::KeysFactory> = Arc::new(serve::OsKeysFactory);
+                // PD-02: the file keystore when `ATLAS_DUCK_TEST_KEYSTORE` is set.
+                #[cfg(feature = "scripted-approver")]
+                let keys = testing::keys_factory();
+                #[cfg(feature = "scripted-approver")]
+                testing::spawn(app.handle(), &data);
+                serve::start(app.handle(), data, lock, pinned, &host, tray_host, keys);
             }
             Ok(())
         })
