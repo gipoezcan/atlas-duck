@@ -134,6 +134,46 @@ jobs:
       - name: M3 suite (atlassian + core, test-only features)
         run: cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked
 
+      # M4 plan Task 26 (early slice T26a). The flows spawn the real CLI and app binaries and only
+      # run with ATLAS_DUCK_CLI_FLOWS=1; a skipped flow still counts as passed, so every leg
+      # fails on any "skipped:" line and on a pass count below (listed - #[ignore]d).
+      - name: M4 app lib tests (scripted-approver)
+        run: cargo test -p atlas-duck-app --features scripted-approver --locked --lib
+
+      - name: M4 cli_flows (Linux, Xvfb + private session bus)
+        if: runner.os == 'Linux'
+        run: bash ci/cli-flows-linux.sh
+
+      - name: M4 cli_flows (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --test cli_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/cli-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/cli-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/cli-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/cli-flows.log" "$RUNNER_TEMP/cli-flows.list" "$RUNNER_TEMP/cli-flows.ignored"
+
+      # pwsh, not the default bash: the X-08 CTRL_BREAK flow needs the step to own a console, and
+      # a console application started by the runner gets one (the Git Bash step is not relied on).
+      - name: M4 cli_flows (Windows, pwsh for a console)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:ATLAS_DUCK_CLI_FLOWS = '1'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'cli_flows')
+          $log = Join-Path $env:RUNNER_TEMP 'cli-flows.log'
+          $list = Join-Path $env:RUNNER_TEMP 'cli-flows.list'
+          $ignored = Join-Path $env:RUNNER_TEMP 'cli-flows.ignored'
+          cargo @a -- --nocapture --test-threads=2 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
+          cargo @a -- --list --ignored 2>$null | Set-Content -Path $ignored -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Core PAT keychain test (Windows Credential Manager, RF-3a, #[ignore]d)
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test keychain_windows -- --ignored --test-threads=1 --nocapture
@@ -155,6 +195,42 @@ jobs:
       - name: Audit OS keychain tests (Linux, file-backed Secret Service)
         if: runner.os == 'Linux'
         run: bash ci/keyring-ci.sh
+
+      # T26 / T22: the same harness_smoke flow against the real OsKeyStore (a 7e570000... test
+      # install id; a guard deletes the entries). CI=true is the guard's second opt-in.
+      - name: M4 OS keychain smoke (Windows Credential Manager, macOS login keychain)
+        if: runner.os != 'Linux'
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+          CI: "true"
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-app --features scripted-approver --locked --test cli_flows -- --ignored os_keychain_smoke --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/os-keychain-smoke.log"
+          if grep -E '(^|[[:space:]])skipped: ' "$RUNNER_TEMP/os-keychain-smoke.log"; then
+            echo "::error::os_keychain_smoke skipped"
+            exit 1
+          fi
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/os-keychain-smoke.log" || { echo "::error::os_keychain_smoke did not run exactly once"; exit 1; }
+
+      # T14/T15 handoffs: the launch tests that spawn a detached shell, launchctl, systemd-run or
+      # a process under the Windows shell parent are #[ignore]d locally.
+      - name: M4 CLI launch tests (#[ignore]d, Linux and macOS)
+        if: runner.os != 'Windows'
+        run: cargo test -p atlas-duck-cli --locked -- --ignored --nocapture 'launch::'
+
+      - name: M4 CLI launch tests (#[ignore]d, Windows)
+        if: runner.os == 'Windows'
+        run: cargo test -p atlas-duck-cli --locked -- --ignored --nocapture launch::windows
+
+      # T22 review: a flow that dies before World::drop can leave an app behind. CI only.
+      - name: Kill stray atlas-duck-app processes (cli_flows)
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            taskkill //F //IM atlas-duck-app.exe >/dev/null 2>&1 || true
+          else
+            pkill -x atlas-duck-app || true
+          fi
 
       - name: Windows probes (T19, §9.4)
         if: runner.os == 'Windows'
@@ -448,6 +524,35 @@ jobs:
 
       - name: Audit OS keychain tests (macOS login keychain, x86_64 under Rosetta)
         run: cargo test -p atlas-duck-audit --test os_keystore --locked --target x86_64-apple-darwin -- --ignored --test-threads=1 --nocapture
+
+      # M4 plan Task 26 (T26a): the same cli_flows run as the native macOS leg, x86_64 under Rosetta.
+      - name: M4 app lib tests and cli_flows x86_64-apple-darwin (no skips, pass-count minimum)
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --lib
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test cli_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/cli-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/cli-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/cli-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/cli-flows.log" "$RUNNER_TEMP/cli-flows.list" "$RUNNER_TEMP/cli-flows.ignored"
+
+      - name: M4 OS keychain smoke (macOS login keychain, x86_64 under Rosetta)
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+          CI: "true"
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test cli_flows -- --ignored os_keychain_smoke --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/os-keychain-smoke.log"
+          if grep -E '(^|[[:space:]])skipped: ' "$RUNNER_TEMP/os-keychain-smoke.log"; then
+            echo "::error::os_keychain_smoke skipped"
+            exit 1
+          fi
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/os-keychain-smoke.log" || { echo "::error::os_keychain_smoke did not run exactly once"; exit 1; }
+
+      - name: Kill stray atlas-duck-app processes (cli_flows)
+        if: always()
+        run: pkill -x atlas-duck-app || true
 
       - name: Probe evidence (§9.4, go/no-go record)
         run: |
@@ -808,6 +913,25 @@ jobs:
 
       - name: cargo audit
         run: cargo audit
+
+      # M4 plan Task 26 (T26a). NOT the plan's `cargo tree ... --release` (cargo tree has no --release
+      # flag, so that check errored into a vacuous pass) and not `-e features` (it hides root-enabled
+      # features). The `{f}` list per package is grepped for the test-only feature names; the second
+      # run is a positive control that proves the grep can see them.
+      - name: Feature leak (no test-only feature in the app's normal and build dependency tree)
+        run: |
+          set -euo pipefail
+          leak='\[[^]]*(testing|insecure-test-http|test-paths|test-env|scripted-approver)[^]]*\]'
+          tree() { cargo tree -p atlas-duck-app -e normal,build --target all --locked --format "{p} [{f}]" --prefix none "$@"; }
+          tree > "$RUNNER_TEMP/tree-clean.txt"
+          if grep -E "$leak" "$RUNNER_TEMP/tree-clean.txt"; then
+            echo "::error::a test-only feature is enabled in the default dependency tree"
+            exit 1
+          fi
+          tree --features scripted-approver > "$RUNNER_TEMP/tree-control.txt"
+          for f in scripted-approver test-paths test-env testing insecure-test-http; do
+            grep -qE "\[[^]]*$f[^]]*\]" "$RUNNER_TEMP/tree-control.txt" || { echo "::error::positive control: $f not visible with --features scripted-approver"; exit 1; }
+          done
 
   ui:
     name: ui (Vite + React shell, spec §2.4, §6.4)

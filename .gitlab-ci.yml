@@ -58,6 +58,11 @@ rust:test:
     - mkdir -p "$CI_PROJECT_DIR/.xdg" && export XDG_DATA_HOME="$CI_PROJECT_DIR/.xdg"
     - cargo clippy --workspace --all-targets --locked -- -D warnings
     - cargo test --workspace --locked
+    # M4 plan Task 26 (T26a): the cli_flows under Xvfb and a private session bus (no Node here: the
+    # script checks for skipped tests and the pass-count minimum itself).
+    - bash ci/cli-flows-linux.sh
+  after_script:
+    - pkill -x atlas-duck-app || true
 
 rust:audit-keychain:
   stage: check
