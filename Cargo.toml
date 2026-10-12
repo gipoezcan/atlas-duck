@@ -110,6 +110,11 @@ lru = "=0.18.5"
 [profile.release]
 panic = "abort"
 
+# Debug builds keep line tables (backtraces still resolve) but not full variable debug info: the
+# default made `target/debug` reach ~280 GB across the many feature combinations the M4 agents built.
+[profile.dev]
+debug = "line-tables-only"
+
 # Argon2id with 64 MiB takes tens of seconds unoptimized; tests inherit the dev profile.
 [profile.dev.package.argon2]
 opt-level = 3
