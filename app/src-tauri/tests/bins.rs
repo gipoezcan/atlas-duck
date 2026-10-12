@@ -13,6 +13,11 @@ const APP: &str = env!("CARGO_BIN_EXE_atlas-duck-app");
 const CLI: &str = env!("CARGO_BIN_EXE_atlas-duck");
 const SANDBOX: &str = env!("CARGO_BIN_EXE_atlas-duck-sandbox");
 
+/// The per-process limit of `run_with_timeout`: only a hang detector. Under Rosetta (the x86_64
+/// macOS leg) the first start of the large app binary is a cold translation, and other tests run in
+/// parallel: it exceeded 5 s there, so the limit is generous on every OS.
+const LIMIT: Duration = Duration::from_secs(60);
+
 struct Run {
     status: ExitStatus,
     stdout: Vec<u8>,
@@ -104,22 +109,22 @@ fn assert_usage_envelope(stdout: &[u8]) {
 
 #[test]
 fn cli_bogus_prints_one_usage_envelope_and_exits_2() {
-    let run = run_with_timeout(cmd(CLI, &["bogus"]), Duration::from_secs(5));
+    let run = run_with_timeout(cmd(CLI, &["bogus"]), LIMIT);
     assert_eq!(run.status.code(), Some(2));
     assert_usage_envelope(&run.stdout);
 }
 
 #[test]
 fn cli_without_arguments_is_a_usage_error_too() {
-    let run = run_with_timeout(cmd(CLI, &[]), Duration::from_secs(5));
+    let run = run_with_timeout(cmd(CLI, &[]), LIMIT);
     assert_eq!(run.status.code(), Some(2));
     assert_usage_envelope(&run.stdout);
 }
 
 #[test]
 fn app_cli_marker_is_byte_identical_to_the_cli_bin() {
-    let direct = run_with_timeout(cmd(CLI, &["bogus"]), Duration::from_secs(5));
-    let via_app = run_with_timeout(cmd(APP, &["__cli", "bogus"]), Duration::from_secs(5));
+    let direct = run_with_timeout(cmd(CLI, &["bogus"]), LIMIT);
+    let via_app = run_with_timeout(cmd(APP, &["__cli", "bogus"]), LIMIT);
     assert_eq!(via_app.status.code(), direct.status.code());
     assert_eq!(via_app.stdout, direct.stdout);
     assert_eq!(via_app.stderr, direct.stderr);
@@ -129,7 +134,7 @@ fn app_cli_marker_is_byte_identical_to_the_cli_bin() {
 #[test]
 fn app_verify_export_marker_and_alias_exit_22() {
     for marker in ["__verify-export", "--verify-export"] {
-        let run = run_with_timeout(cmd(APP, &[marker, "x"]), Duration::from_secs(5));
+        let run = run_with_timeout(cmd(APP, &[marker, "x"]), LIMIT);
         assert_eq!(run.status.code(), Some(22), "{marker}");
         assert!(run.stdout.is_empty(), "{marker}: stdout must stay empty");
     }
@@ -243,11 +248,11 @@ fn sandbox_has_8_mib_stack_reserve_and_console_bins_are_console() {
 /// their stdio. If `apply_process_crash_settings` ran first, stderr would be the null device.
 #[test]
 fn early_argv_modes_keep_their_stdio() {
-    let cli = run_with_timeout(cmd(APP, &["__cli", "bogus"]), Duration::from_secs(5));
+    let cli = run_with_timeout(cmd(APP, &["__cli", "bogus"]), LIMIT);
     assert_eq!(cli.status.code(), Some(2));
     assert_usage_envelope(&cli.stdout);
 
-    let verify = run_with_timeout(cmd(APP, &["__verify-export", "x"]), Duration::from_secs(5));
+    let verify = run_with_timeout(cmd(APP, &["__verify-export", "x"]), LIMIT);
     assert_eq!(verify.status.code(), Some(22));
     assert!(
         !verify.stderr.is_empty(),
