@@ -18,8 +18,9 @@ const INITIAL_BODY_CAPACITY: usize = 64 * 1024;
 ///
 /// `Ok(None)`: clean EOF before the first header byte. `TooLarge` is returned right after the
 /// 4-byte header, before any body byte is read or any body buffer is allocated. `Truncated`:
-/// EOF inside the header or the body. The body buffer starts at `min(len, 64 KiB)` and grows
-/// with the bytes received, so an announced length costs nothing until the peer sends it.
+/// EOF inside the header or the body. The body buffer starts at `min(len, 64 KiB)` and doubles
+/// as the bytes arrive, capped at `len`, so an announced length costs nothing until the peer
+/// sends it and a full body is held in exactly `len` bytes.
 ///
 /// Not cancel-safe: dropping the future mid-frame loses the bytes read so far and leaves the
 /// stream inside a frame. A caller that races it (`timeout`, `select!`) must stop reading that
@@ -45,17 +46,23 @@ pub async fn read_frame_async<R: AsyncRead + Unpin>(
         return Err(FrameError::TooLarge { len });
     }
     // `len <= MAX_FRAME_BYTES`, so the cast cannot truncate.
-    let mut body = Vec::with_capacity((len as usize).min(INITIAL_BODY_CAPACITY));
-    let mut limited = r.take(len);
-    loop {
-        match limited.read_to_end(&mut body).await {
-            Ok(_) => break,
+    let len = len as usize;
+    // `body[..filled]` holds what arrived; the rest is zeroed room for the next read. The
+    // buffer doubles when full, capped at `len`: at most twice what arrived, never above `len`.
+    let mut body = vec![0u8; len.min(INITIAL_BODY_CAPACITY)];
+    let mut filled = 0;
+    while filled < len {
+        if filled == body.len() {
+            let grow = (len - filled).min(body.len());
+            body.reserve_exact(grow);
+            body.resize(filled + grow, 0);
+        }
+        match r.read(&mut body[filled..]).await {
+            Ok(0) => return Err(FrameError::Truncated),
+            Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(FrameError::Io(e)),
         }
-    }
-    if body.len() as u64 != len {
-        return Err(FrameError::Truncated);
     }
     Ok(Some(body))
 }

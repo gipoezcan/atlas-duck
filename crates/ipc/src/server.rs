@@ -6,15 +6,20 @@
 //! (§3.3; on Windows the client SID is checked after it was read and before anything is
 //! answered), the connection limits (PD-27), then one task per request, all answers written by
 //! one writer task. On close, `request.await` tasks are dropped, every other task runs to
-//! completion (C.2 drive-to-completion), then `disconnected` is called once (Δ2).
+//! completion (C.2 drive-to-completion), then `disconnected` is called once per handler (Δ2).
+//! A client that stops reading cannot hold a connection open: a full writer queue gives up on
+//! close (after 2 s) and on shutdown.
 //!
 //! A swap of the cell is seen from the next request on; before that request the connection's
 //! `hello` is replayed on the new handler, so the session survives a gate → core swap.
+//! `disconnected` goes to the current handler (also one that refused the replayed hello) and
+//! to every earlier handler that accepted the hello; a connection whose first `hello` failed
+//! is never `disconnected`.
 
 use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -51,17 +56,27 @@ pub const MAX_CONNECTIONS: usize = 64;
 pub const MAX_PER_ORIGIN: usize = 16;
 /// The `hello` frame must arrive within this time after accept (§3.3).
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-/// Requests one connection may have in flight; the next frame is read only when one of them
-/// finishes (backpressure, bounded memory).
+/// The first frame (the `hello`) may be at most this large; a larger one is `frame_too_large`.
+pub const HELLO_MAX_BYTES: usize = 64 * 1024;
+/// Requests one connection may have in flight (backpressure, bounded memory). With all of
+/// them in flight the read loop waits for one to finish before it reads the next frame, so
+/// it sees neither new requests nor EOF meanwhile: a client that sent 64 `request.await`s
+/// and hung up is noticed when the first await ends (bounded by its timeout). The shutdown
+/// signal is still seen at once.
 pub const MAX_IN_FLIGHT_PER_CONNECTION: usize = 64;
-/// On shutdown, in-flight answers get this long to be written (PD-38).
+/// PD-38: `serve` returns within this time after the shutdown signal.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 /// Encoded frames queued for one connection's writer.
 const WRITER_QUEUE: usize = 64;
-/// Beyond the grace, how long `serve` waits for connection tasks before aborting them.
-const SHUTDOWN_SLACK: Duration = Duration::from_millis(500);
-/// After a close, how long the writer may take to flush what is queued.
+/// After the shutdown signal, each connection has until then to write in-flight answers; then
+/// its remaining tasks are aborted and `disconnected` is called.
+const SHUTDOWN_DRAIN: Duration = Duration::from_millis(1500);
+/// After the shutdown signal, `serve` aborts the connection tasks still running then (inside
+/// [`SHUTDOWN_GRACE`]).
+const SHUTDOWN_HARD: Duration = Duration::from_millis(1900);
+/// After a close, how long the writer may take to flush what is queued; a writer still stuck
+/// then (the client stopped reading) is aborted.
 const CLOSE_DRAIN: Duration = Duration::from_secs(2);
 const ACCEPT_BACKOFF_MIN: Duration = Duration::from_millis(10);
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
@@ -98,9 +113,13 @@ impl HandlerCell {
     }
 
     pub fn swap(&self, h: Arc<dyn RequestHandler>) {
-        let mut slot = self.slot.write().unwrap_or_else(PoisonError::into_inner);
-        slot.handler = h;
-        slot.generation = slot.generation.wrapping_add(1);
+        let old = {
+            let mut slot = self.slot.write().unwrap_or_else(PoisonError::into_inner);
+            slot.generation = slot.generation.wrapping_add(1);
+            std::mem::replace(&mut slot.handler, h)
+        };
+        // The old handler may be the last reference: drop it outside the lock.
+        drop(old);
     }
 
     pub fn current(&self) -> Arc<dyn RequestHandler> {
@@ -114,7 +133,8 @@ impl HandlerCell {
 }
 
 /// Cancelled by `Core::shutdown` and the app's quit path (PD-38): the server stops accepting,
-/// writes in-flight answers for up to [`SHUTDOWN_GRACE`], closes and removes `<data>/endpoint`.
+/// removes `<data>/endpoint`, writes in-flight answers and closes; `serve` returns within
+/// [`SHUTDOWN_GRACE`].
 #[derive(Debug, Clone, Default)]
 pub struct ShutdownSignal(pub CancellationToken);
 
@@ -168,7 +188,11 @@ impl IpcServer {
         match endpoint_location(data, host) {
             Ok(location) => Self::bind_at(data, location),
             Err(e) => {
-                tracing::error!(event = diag::EVENT_BIND_FAILED, "ipc bind failed");
+                tracing::error!(
+                    event = diag::EVENT_BIND_FAILED,
+                    reason = diag::REASON_BIND,
+                    "ipc bind failed"
+                );
                 Err(e)
             }
         }
@@ -180,7 +204,11 @@ impl IpcServer {
     pub fn bind_at(data: &LocalDataDir, location: EndpointLocation) -> io::Result<IpcServer> {
         let bound = Self::bind_inner(data, location);
         if bound.is_err() {
-            tracing::error!(event = diag::EVENT_BIND_FAILED, "ipc bind failed");
+            tracing::error!(
+                event = diag::EVENT_BIND_FAILED,
+                reason = diag::REASON_BIND,
+                "ipc bind failed"
+            );
         }
         bound
     }
@@ -193,6 +221,7 @@ impl IpcServer {
             // Leftover temp files are harmless; the endpoint file is what matters.
             tracing::warn!(
                 event = diag::EVENT_BIND_FAILED,
+                reason = diag::REASON_TEMP_SWEEP,
                 "ipc endpoint temp sweep failed"
             );
         }
@@ -218,9 +247,10 @@ impl IpcServer {
         &self.name
     }
 
-    /// Accepts and serves connections until `shutdown` is cancelled, then stops accepting,
-    /// gives in-flight answers up to [`SHUTDOWN_GRACE`], closes every connection and removes
-    /// `<data>/endpoint`.
+    /// Accepts and serves connections until `shutdown` is cancelled, then (PD-38) stops
+    /// accepting, removes `<data>/endpoint` at once, gives each connection 1.5 s to write its
+    /// in-flight answers before it is closed and `disconnected`, aborts whatever still runs
+    /// at 1.9 s and returns within [`SHUTDOWN_GRACE`].
     ///
     /// Accept errors never end the loop: Unix retries with a capped backoff; on Windows the
     /// failed listener is never used again and a fresh pipe name is bound (and written to
@@ -240,6 +270,7 @@ impl IpcServer {
             limits,
             slots: Arc::new(Mutex::new(Slots::default())),
             stop: shutdown.0.clone(),
+            stopped_at: OnceLock::new(),
             #[cfg(windows)]
             sid,
         });
@@ -265,9 +296,12 @@ impl IpcServer {
                 },
             }
         }
+        // Only the stop signal ends the loop (`recover` gives up on stop only).
+        let stopped_at = shared.stopped_at();
         drop(endpoint);
-        let deadline = Instant::now() + SHUTDOWN_GRACE + SHUTDOWN_SLACK;
-        let drained = tokio::time::timeout_at(deadline, async {
+        // Clients see "not running" from now on, not an endpoint that no longer accepts.
+        remove_endpoint(&data);
+        let drained = tokio::time::timeout_at(stopped_at + SHUTDOWN_HARD, async {
             while conns.join_next().await.is_some() {}
         })
         .await;
@@ -275,12 +309,17 @@ impl IpcServer {
             conns.abort_all();
             while conns.join_next().await.is_some() {}
         }
-        if remove_endpoint_file(&data).is_err() {
-            tracing::warn!(
-                event = diag::EVENT_BIND_FAILED,
-                "ipc endpoint file removal failed"
-            );
-        }
+    }
+}
+
+/// `remove_endpoint_file`, logged on failure.
+fn remove_endpoint(data: &LocalDataDir) {
+    if remove_endpoint_file(data).is_err() {
+        tracing::warn!(
+            event = diag::EVENT_BIND_FAILED,
+            reason = diag::REASON_ENDPOINT_REMOVE,
+            "ipc endpoint file removal failed"
+        );
     }
 }
 
@@ -425,12 +464,17 @@ impl Endpoint {
                     *listener = Some(fresh);
                     return true;
                 }
-                _ => tracing::error!(event = diag::EVENT_BIND_FAILED, "ipc rebind failed"),
+                _ => tracing::error!(
+                    event = diag::EVENT_BIND_FAILED,
+                    reason = diag::REASON_REBIND,
+                    "ipc rebind failed"
+                ),
             }
         }
-        let _ = remove_endpoint_file(data);
+        remove_endpoint(data);
         tracing::error!(
             event = diag::EVENT_BIND_FAILED,
+            reason = diag::REASON_STOPPED_ACCEPTING,
             "ipc server stopped accepting"
         );
         true
@@ -444,8 +488,24 @@ struct Shared {
     limits: ServerLimits,
     slots: Arc<Mutex<Slots>>,
     stop: CancellationToken,
+    /// When the stop signal was first seen (by `serve` or a connection).
+    stopped_at: OnceLock<Instant>,
     #[cfg(windows)]
     sid: String,
+}
+
+impl Shared {
+    /// The moment accepting stopped. Only meaningful once `stop` fired: the first caller after
+    /// that fixes it.
+    fn stopped_at(&self) -> Instant {
+        *self.stopped_at.get_or_init(Instant::now)
+    }
+
+    /// Completes once the server stopped and the connections' drain time has passed.
+    async fn drain_passed(&self) {
+        self.stop.cancelled().await;
+        tokio::time::sleep_until(self.stopped_at() + SHUTDOWN_DRAIN).await;
+    }
 }
 
 /// Open connections, total and per limit key (`None` = the shared "?" bucket).
@@ -500,10 +560,20 @@ fn new_connection_id() -> Option<String> {
     Some(format!("conn_{:032x}", u128::from_be_bytes(b)))
 }
 
-/// The writer task of one connection and the sending side of its queue.
+/// The writer task of one connection and the sending side of its queue. Dropping it aborts
+/// the task, so a connection that `serve` aborts leaves no writer (and stream) behind.
 struct Writer {
     tx: mpsc::Sender<Vec<u8>>,
-    task: JoinHandle<()>,
+    task: AbortOnDrop,
+}
+
+/// A task handle that aborts the task when dropped.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl Writer {
@@ -511,25 +581,58 @@ impl Writer {
         let (tx, rx) = mpsc::channel(WRITER_QUEUE);
         Writer {
             tx,
-            task: tokio::spawn(write_loop(wr, rx)),
+            task: AbortOnDrop(tokio::spawn(write_loop(wr, rx))),
         }
     }
 
-    async fn send(&self, resp: Response) {
+    /// Queues `resp`. A full queue (a client that does not read) is waited on until the stop
+    /// signal or `by`, then the answer is dropped; a gone writer drops it too.
+    async fn send(&self, resp: Response, stop: &CancellationToken, by: Option<Instant>) {
         if let Some(frame) = encode_response(resp) {
-            // A gone writer means a gone client; nothing is left to tell it.
-            let _ = self.tx.send(frame).await;
+            queue(&self.tx, frame, stop, by).await;
         }
     }
 
-    /// Lets the writer flush what is queued (until `deadline`), then closes the write side.
-    /// Every other sender must be gone already.
-    async fn close(self, deadline: Instant) {
+    /// Stops the writer: what is queued is lost, and every pending send fails.
+    fn abort(&self) {
+        self.task.0.abort();
+    }
+
+    /// Lets the writer flush what is queued until `by` (on shutdown at most until the drain
+    /// time ends), then closes the write side; a writer still busy then is aborted. Every
+    /// other sender must be gone already.
+    async fn close(self, shared: &Shared, by: Instant) {
         let Writer { tx, mut task } = self;
         drop(tx);
-        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
-            task.abort();
+        tokio::select! {
+            biased;
+            _ = &mut task.0 => {}
+            () = tokio::time::sleep_until(by) => {}
+            () = shared.drain_passed() => {}
         }
+    }
+}
+
+/// Sends `frame` into a writer queue, waiting for room until the stop signal or `by`, then
+/// dropping it. A frame that finds room is queued even after the stop signal. A gone writer
+/// means a gone client: nothing is left to tell it.
+async fn queue(
+    tx: &mpsc::Sender<Vec<u8>>,
+    frame: Vec<u8>,
+    stop: &CancellationToken,
+    by: Option<Instant>,
+) {
+    let deadline = async {
+        match by {
+            Some(t) => tokio::time::sleep_until(t).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = tx.send(frame) => {}
+        () = stop.cancelled() => {}
+        () = deadline => {}
     }
 }
 
@@ -566,12 +669,28 @@ fn log_protocol_error(meta: &ConnectionMeta, reason: ProtocolReason) {
     );
 }
 
-/// Logs and answers a protocol error.
-async fn refuse(writer: &Writer, meta: &ConnectionMeta, reason: ProtocolReason, id: Option<u64>) {
+/// Logs and answers a protocol error (the answer is given up as in [`Writer::send`]).
+async fn refuse(
+    shared: &Shared,
+    writer: &Writer,
+    meta: &ConnectionMeta,
+    reason: ProtocolReason,
+    id: Option<u64>,
+    by: Option<Instant>,
+) {
     log_protocol_error(meta, reason);
     writer
-        .send(error_response(id, reason.code(), protocol_error(reason)))
+        .send(
+            error_response(id, reason.code(), protocol_error(reason)),
+            &shared.stop,
+            by,
+        )
         .await;
+}
+
+/// The flush deadline of a connection that closes now.
+fn closing() -> Instant {
+    Instant::now() + CLOSE_DRAIN
 }
 
 /// A frame that is not a usable request: its reason and the id when one could be read.
@@ -648,6 +767,7 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
         tracing::error!(
             event = diag::EVENT_REJECT,
             peer_pid = pid,
+            reason = diag::REASON_INTERNAL,
             "ipc connection id unavailable"
         );
         return;
@@ -662,31 +782,38 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
     let writer = Writer::start(wr);
 
     // The peer walk (blocking process lookups, a new source per walk: PD-36) runs while the
-    // first frame is read. Losing the race to `stop` ends the connection, so the half-read
-    // frame is never resumed.
+    // first frame is read; neither may hold the first answer past the hello deadline. A walk
+    // that has not finished by then leaves the peer with its pid only. Losing the race to
+    // `stop` ends the connection, so a half-read frame is never resumed.
     let walk = tokio::task::spawn_blocking(move || peer_info(pid, &OsPeerSource::default()));
-    let read = tokio::time::timeout_at(deadline, read_frame_async(&mut rd, MAX_FRAME_BYTES));
-    let (peer, first) = tokio::select! {
+    let first = tokio::select! {
         biased;
         () = shared.stop.cancelled() => return,
-        both = async { tokio::join!(walk, read) } => both,
+        r = tokio::time::timeout_at(deadline, read_frame_async(&mut rd, HELLO_MAX_BYTES)) => r,
     };
-    let peer = peer.unwrap_or_else(|_| PeerInfo {
-        peer_pid: pid,
-        ..PeerInfo::default()
-    });
-    let meta = Arc::new(ConnectionMeta {
-        connection_id,
-        peer,
-    });
-
     let first = match first {
         Ok(Ok(Some(bytes))) => Ok(bytes),
         Ok(Err(FrameError::TooLarge { .. })) => Err(ProtocolReason::FrameTooLarge),
         Err(_elapsed) => Err(ProtocolReason::HelloTimeout),
         // Gone before a whole frame: nobody to answer.
-        Ok(Ok(None) | Err(_)) => return writer.close(Instant::now()).await,
+        Ok(Ok(None) | Err(_)) => return writer.close(&shared, Instant::now()).await,
     };
+    let peer = tokio::select! {
+        biased;
+        () = shared.stop.cancelled() => return,
+        p = tokio::time::timeout_at(deadline, walk) => match p {
+            Ok(Ok(p)) => p,
+            Ok(Err(_)) | Err(_) => PeerInfo {
+                peer_pid: pid,
+                ..PeerInfo::default()
+            },
+        },
+    };
+    let meta = Arc::new(ConnectionMeta {
+        connection_id,
+        peer,
+    });
+
     // §3.1: data was read, so the client can be impersonated; nothing is answered before its
     // SID matched. A timeout may have read nothing (impersonation would fail); its fixed
     // `hello_timeout` answer is sent without the check.
@@ -694,11 +821,11 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
     if !matches!(first, Err(ProtocolReason::HelloTimeout))
         && !client_sid_ok(pipe, &shared.sid, &meta).await
     {
-        return writer.close(Instant::now()).await;
+        return writer.close(&shared, Instant::now()).await;
     }
 
     let Some((mut session, slot)) = handshake(&shared, &meta, &writer, first).await else {
-        return writer.close(Instant::now() + CLOSE_DRAIN).await;
+        return writer.close(&shared, closing()).await;
     };
     let mut awaits = JoinSet::new();
     let mut others = JoinSet::new();
@@ -712,33 +839,45 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
         &mut others,
     )
     .await;
+    drop(rd);
 
-    match end {
-        End::Stop => {
-            let deadline = Instant::now() + SHUTDOWN_GRACE;
-            let drained = tokio::time::timeout_at(deadline, async {
-                while awaits.join_next().await.is_some() {}
-                while others.join_next().await.is_some() {}
-            })
-            .await;
-            if drained.is_err() {
-                awaits.abort_all();
-                others.abort_all();
-                while awaits.join_next().await.is_some() {}
-                while others.join_next().await.is_some() {}
-            }
-            writer.close(deadline).await;
-        }
-        End::Closed => {
-            // Awaits deliver nothing to a gone client; every other request runs to
-            // completion (C.2).
+    // Closed: awaits deliver nothing to a gone client; every other request runs to completion
+    // (C.2) while the writer gets until `flush_by`. A writer still busy then has a client
+    // that stopped reading: it is aborted, so the pending sends fail and the tasks finish.
+    // Stopped: everything gets until the drain time ends, then the rest is aborted.
+    let flush_by = match end {
+        End::Closed { flush_by } => {
             awaits.abort_all();
+            flush_by
+        }
+        End::Stop => shared.stopped_at() + SHUTDOWN_DRAIN,
+    };
+    let finished = {
+        let tasks = async {
             while awaits.join_next().await.is_some() {}
             while others.join_next().await.is_some() {}
-            writer.close(Instant::now() + CLOSE_DRAIN).await;
+        };
+        tokio::pin!(tasks);
+        let mut flushing = true;
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut tasks => break true,
+                () = shared.drain_passed() => break false,
+                () = tokio::time::sleep_until(flush_by), if flushing => {
+                    writer.abort();
+                    flushing = false;
+                }
+            }
         }
+    };
+    if !finished {
+        awaits.abort_all();
+        others.abort_all();
+        while awaits.join_next().await.is_some() {}
+        while others.join_next().await.is_some() {}
     }
-    drop(rd);
+    writer.close(&shared, flush_by).await;
     drop(slot);
     for h in session.disconnect_targets(shared.cell.current()) {
         h.disconnected(&meta).await;
@@ -790,13 +929,14 @@ async fn handshake(
     let req = match req {
         Ok(req) => req,
         Err(Refusal { reason, id }) => {
-            refuse(writer, meta, reason, id).await;
+            refuse(shared, writer, meta, reason, id, Some(closing())).await;
             return None;
         }
     };
     let id = req.id;
     if req.method != method::HELLO {
-        refuse(writer, meta, ProtocolReason::HelloRequired, Some(id)).await;
+        let reason = ProtocolReason::HelloRequired;
+        refuse(shared, writer, meta, reason, Some(id), Some(closing())).await;
         return None;
     }
     let Some(slot) = try_acquire(shared, &meta.peer) else {
@@ -808,25 +948,30 @@ async fn handshake(
             "ipc connection rejected"
         );
         writer
-            .send(error_response(
-                Some(id),
-                codes::APP_REFUSAL,
-                busy_envelope(BUSY_RETRY_CONNECTION_S),
-            ))
+            .send(
+                error_response(
+                    Some(id),
+                    codes::APP_REFUSAL,
+                    busy_envelope(BUSY_RETRY_CONNECTION_S),
+                ),
+                &shared.stop,
+                Some(closing()),
+            )
             .await;
         return None;
     };
     let hello: Hello = match params_of(req.params) {
         Ok(h) => h,
         Err(reason) => {
-            refuse(writer, meta, reason, Some(id)).await;
+            refuse(shared, writer, meta, reason, Some(id), Some(closing())).await;
             return None;
         }
     };
     let (handler, generation) = shared.cell.current_with_generation();
     match handler.hello(meta, hello.clone()).await {
         Ok(reply) => {
-            writer.send(Response::result(id, to_json(&reply))).await;
+            let reply = Response::result(id, to_json(&reply));
+            writer.send(reply, &shared.stop, None).await;
             Some((
                 Session {
                     hello,
@@ -837,17 +982,17 @@ async fn handshake(
             ))
         }
         Err(env) => {
-            writer
-                .send(error_response(Some(id), codes::APP_REFUSAL, env))
-                .await;
+            let refusal = error_response(Some(id), codes::APP_REFUSAL, env);
+            writer.send(refusal, &shared.stop, Some(closing())).await;
             None
         }
     }
 }
 
 enum End {
-    /// EOF, a read error, or a protocol error that closed the connection.
-    Closed,
+    /// EOF, a read error, or a protocol error that closed the connection; the writer may
+    /// flush until `flush_by`.
+    Closed { flush_by: Instant },
     /// The shutdown signal fired.
     Stop,
 }
@@ -871,7 +1016,7 @@ async fn request_loop(
             () = shared.stop.cancelled() => return End::Stop,
             p = permits.clone().acquire_owned() => match p {
                 Ok(p) => p,
-                Err(_) => return End::Closed,
+                Err(_) => return End::Closed { flush_by: closing() },
             },
         };
         // Not cancel-safe: losing the race to `stop` ends the connection, so the half-read
@@ -881,31 +1026,40 @@ async fn request_loop(
             () = shared.stop.cancelled() => return End::Stop,
             r = read_frame_async(rd, MAX_FRAME_BYTES) => r,
         };
+        // A refusal that closes the connection waits for queue room until `flush_by`; one
+        // that keeps it open waits like any answer (backpressure) until the stop signal.
         let bytes = match read {
             Ok(Some(bytes)) => bytes,
-            Ok(None) => return End::Closed,
             Err(FrameError::TooLarge { .. }) => {
-                refuse(writer, meta, ProtocolReason::FrameTooLarge, None).await;
-                return End::Closed;
+                let flush_by = closing();
+                let reason = ProtocolReason::FrameTooLarge;
+                refuse(shared, writer, meta, reason, None, Some(flush_by)).await;
+                return End::Closed { flush_by };
             }
-            Err(_) => return End::Closed,
+            Ok(None) | Err(_) => {
+                return End::Closed {
+                    flush_by: closing(),
+                };
+            }
         };
         let req = match decode(&bytes) {
             Ok(req) => req,
             Err(Refusal { reason, id }) => {
-                refuse(writer, meta, reason, id).await;
-                return End::Closed;
+                let flush_by = closing();
+                refuse(shared, writer, meta, reason, id, Some(flush_by)).await;
+                return End::Closed { flush_by };
             }
         };
         let id = req.id;
         if req.method == method::HELLO {
-            refuse(writer, meta, ProtocolReason::HelloRepeated, Some(id)).await;
+            let reason = ProtocolReason::HelloRepeated;
+            refuse(shared, writer, meta, reason, Some(id), None).await;
             continue;
         }
         let call = match Call::parse(&req.method, req.params) {
             Ok(call) => call,
             Err(reason) => {
-                refuse(writer, meta, reason, Some(id)).await;
+                refuse(shared, writer, meta, reason, Some(id), None).await;
                 continue;
             }
         };
@@ -916,14 +1070,22 @@ async fn request_loop(
             match handler.hello(meta, session.hello.clone()).await {
                 Ok(_) => session.accepted_by(&handler, generation),
                 Err(env) => {
-                    writer
-                        .send(error_response(Some(id), codes::APP_REFUSAL, env))
-                        .await;
-                    return End::Closed;
+                    let flush_by = closing();
+                    let refusal = error_response(Some(id), codes::APP_REFUSAL, env);
+                    writer.send(refusal, &shared.stop, Some(flush_by)).await;
+                    return End::Closed { flush_by };
                 }
             }
         }
-        let task = run_call(handler, meta.clone(), id, call, writer.tx.clone(), permit);
+        let task = run_call(
+            handler,
+            meta.clone(),
+            id,
+            call,
+            writer.tx.clone(),
+            shared.stop.clone(),
+            permit,
+        );
         if matches!(task.kind, CallKind::Await) {
             awaits.spawn(task.fut);
         } else {
@@ -980,13 +1142,16 @@ struct Task<F> {
     fut: F,
 }
 
-/// One request's task: runs the call on `handler` and queues the answer.
+/// One request's task: runs the call on `handler` and queues the answer. The call always
+/// completes before the answer is queued; a full queue is waited on until the stop signal
+/// (or until the connection aborts its writer), then the answer is dropped.
 fn run_call(
     handler: Arc<dyn RequestHandler>,
     meta: Arc<ConnectionMeta>,
     id: u64,
     call: Call,
     tx: mpsc::Sender<Vec<u8>>,
+    stop: CancellationToken,
     permit: OwnedSemaphorePermit,
 ) -> Task<impl std::future::Future<Output = ()> + Send + 'static> {
     let kind = match call {
@@ -997,7 +1162,7 @@ fn run_call(
         let progress = ChannelProgress { tx: tx.clone() };
         let value = dispatch(handler.as_ref(), &meta, call, &progress).await;
         if let Some(frame) = encode_response(Response::result(id, value)) {
-            let _ = tx.send(frame).await;
+            queue(&tx, frame, &stop, None).await;
         }
         drop(permit);
     };

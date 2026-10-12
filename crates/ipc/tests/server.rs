@@ -12,7 +12,9 @@ use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::paths::{ENDPOINT_FILE, EndpointLocation, read_endpoint_file};
 use atlas_duck_ipc::proto::RequestHandler;
 use atlas_duck_ipc::sandbox::MAX_FRAME_BYTES;
-use atlas_duck_ipc::server::{HandlerCell, IpcServer, ServerLimits, ShutdownSignal};
+use atlas_duck_ipc::server::{
+    HELLO_MAX_BYTES, HandlerCell, IpcServer, SHUTDOWN_GRACE, ServerLimits, ShutdownSignal,
+};
 use common::{Client, Fake, Kind, WAIT, error_of, hello_params, local, mismatch_envelope, request};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -195,6 +197,32 @@ async fn oversize_frame_protocol_error() {
     assert!(c.closed().await);
     assert_eq!(fake.count(Kind::Hello), 1);
     fake.wait_for(Kind::Disconnected, 1).await;
+    srv.stop().await;
+}
+
+/// The first frame (the hello) is capped at 64 KiB; after the hello a frame may be larger.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hello_frame_capped_at_64k() {
+    let fake = Arc::new(Fake::new("A"));
+    let srv = start(&fake).await;
+
+    let mut c = Client::connect(&srv.name).await;
+    let announced = u32::try_from(HELLO_MAX_BYTES + 1).expect("u32");
+    c.send_raw(&announced.to_be_bytes()).await;
+    let v = c.recv().await.expect("error frame");
+    assert_eq!(v["id"], Value::Null);
+    assert_eq!(error_of(&v), (-32600, Some("frame_too_large".to_owned())));
+    assert!(c.closed().await);
+    assert!(fake.events().is_empty(), "handler saw {:?}", fake.events());
+
+    let mut c = Client::hello(&srv.name).await;
+    let big = "i".repeat(HELLO_MAX_BYTES + 1);
+    let v = c.call(2, "ops.list", json!({ "instance": big })).await;
+    assert_eq!(by(&v), "A", "{v}");
+    assert_eq!(
+        fake.of(Kind::OpsList)[0].detail.as_ref().map(String::len),
+        Some(HELLO_MAX_BYTES + 1)
+    );
     srv.stop().await;
 }
 
@@ -628,6 +656,36 @@ async fn swap_keeps_session() {
     srv.stop().await;
 }
 
+/// A swap while a request runs: that request finishes on the handler it started with; the
+/// next request sees the new handler, after the hello was replayed on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn swap_during_in_flight_request() {
+    let mut a = Fake::new("A");
+    a.submit_delay = Duration::from_millis(500);
+    let a = Arc::new(a);
+    let b = Arc::new(Fake::new("B"));
+    let srv = start(&a).await;
+    let mut c = Client::hello(&srv.name).await;
+    c.send(&request(
+        2,
+        "request.submit",
+        json!({"op_id": "x", "params": {}, "instance": null, "reason": null}),
+    ))
+    .await;
+    a.wait_for(Kind::Submit, 1).await;
+    srv.cell.swap(b.clone());
+    let v = c.call(3, "ops.list", json!({})).await;
+    assert_eq!(v["id"], json!(3));
+    assert_eq!(by(&v), "B");
+    assert_eq!(b.count(Kind::Hello), 1, "hello not replayed on B");
+    let v = c.recv().await.expect("submit answer");
+    assert_eq!(v["id"], json!(2));
+    assert_eq!(by(&v), "A", "{v}");
+    assert_eq!(a.count(Kind::SubmitDone), 1);
+    assert_eq!(b.count(Kind::Submit), 0);
+    srv.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnected_goes_to_current_handler() {
     let a = Arc::new(Fake::new("A"));
@@ -676,7 +734,10 @@ async fn shutdown_stops_and_removes_endpoint() {
         .await
         .expect("serve returned")
         .expect("no panic");
-    assert!(t0.elapsed() < Duration::from_secs(4));
+    let took = t0.elapsed();
+    assert!(took < SHUTDOWN_GRACE, "shutdown took {took:?}");
+    assert_eq!(fake.count(Kind::SubmitDone), 1);
+    assert_eq!(fake.count(Kind::Disconnected), 1);
     assert!(
         !data_path.join(ENDPOINT_FILE).exists(),
         "endpoint file kept"
@@ -708,6 +769,42 @@ async fn shutdown_bounds_a_stuck_request() {
     ))
     .await;
     fake.wait_for(Kind::Submit, 1).await;
+    let endpoint_file = srv.data.path().join(ENDPOINT_FILE);
+    assert!(endpoint_file.exists());
+    let t0 = Instant::now();
+    srv.shutdown.0.cancel();
+    // PD-38: the endpoint file goes as soon as accepting stops, before the drain.
+    settle().await;
+    assert!(!endpoint_file.exists(), "endpoint file kept while draining");
+    assert!(!srv.task.is_finished(), "serve returned before the drain");
+    tokio::time::timeout(WAIT, srv.task)
+        .await
+        .expect("serve returned")
+        .expect("no panic");
+    let took = t0.elapsed();
+    assert!(took < SHUTDOWN_GRACE, "shutdown took {took:?}");
+    // The stuck request was aborted; the connection was still `disconnected`.
+    assert_eq!(fake.count(Kind::SubmitDone), 0);
+    assert_eq!(fake.count(Kind::Disconnected), 1);
+    assert!(c.closed().await);
+}
+
+/// PD-38: with an await in flight, shutdown drops it and calls `disconnected` before `serve`
+/// returns, all within the 2 s budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_disconnects_before_serve_returns() {
+    let mut fake = Fake::new("A");
+    fake.await_delay = Duration::from_secs(30);
+    let fake = Arc::new(fake);
+    let srv = start(&fake).await;
+    let mut c = Client::hello(&srv.name).await;
+    c.send(&request(
+        2,
+        "request.await",
+        json!({"request_id": "r", "timeout_ms": null}),
+    ))
+    .await;
+    fake.wait_for(Kind::AwaitStart, 1).await;
     let t0 = Instant::now();
     srv.shutdown.0.cancel();
     tokio::time::timeout(WAIT, srv.task)
@@ -715,8 +812,68 @@ async fn shutdown_bounds_a_stuck_request() {
         .expect("serve returned")
         .expect("no panic");
     let took = t0.elapsed();
-    assert!(took < Duration::from_secs(4), "shutdown took {took:?}");
+    assert!(took < SHUTDOWN_GRACE, "shutdown took {took:?}");
+    assert_eq!(fake.count(Kind::AwaitDropped), 1);
+    assert_eq!(fake.count(Kind::AwaitDone), 0);
+    let disc = fake.of(Kind::Disconnected);
+    assert_eq!(disc.len(), 1, "not disconnected before serve returned");
+    assert!(disc[0].at >= fake.of(Kind::AwaitDropped)[0].at);
     assert!(c.closed().await);
+}
+
+/// I-1: a client that stops reading (here: 100 large answers it never reads, then a bad frame)
+/// cannot pin its connection. The connection ends, every handler call completes, the
+/// connection is `disconnected`, and shutdown stays prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_reading_client_is_closed_and_disconnected() {
+    let mut fake = Fake::new("A");
+    fake.doctor_bytes = 256 * 1024;
+    let fake = Arc::new(fake);
+    let srv = start(&fake).await;
+    let mut c = Client::hello(&srv.name).await;
+    for i in 0..100u64 {
+        c.send(&request(10 + i, "doctor", json!({}))).await;
+    }
+    // A protocol error: the server answers (into its full queue) and closes.
+    c.send_raw(&[0, 0, 0, 2, b'{', b'x']).await;
+    fake.wait_for(Kind::Disconnected, 1).await;
+    assert_eq!(fake.count(Kind::Doctor), 100);
+
+    let t0 = Instant::now();
+    srv.shutdown.0.cancel();
+    tokio::time::timeout(WAIT, srv.task)
+        .await
+        .expect("serve returned")
+        .expect("no panic");
+    let took = t0.elapsed();
+    assert!(took < SHUTDOWN_GRACE, "shutdown took {took:?}");
+    assert_eq!(fake.count(Kind::Disconnected), 1);
+    drop(c);
+}
+
+/// I-1 on the shutdown path: a client that never reads does not hold `serve` past the
+/// budget, and its connection is still `disconnected`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn non_reading_client_does_not_hold_shutdown() {
+    let mut fake = Fake::new("A");
+    fake.doctor_bytes = 256 * 1024;
+    let fake = Arc::new(fake);
+    let srv = start(&fake).await;
+    let mut c = Client::hello(&srv.name).await;
+    for i in 0..100u64 {
+        c.send(&request(10 + i, "doctor", json!({}))).await;
+    }
+    fake.wait_for(Kind::Doctor, 100).await;
+    let t0 = Instant::now();
+    srv.shutdown.0.cancel();
+    tokio::time::timeout(WAIT, srv.task)
+        .await
+        .expect("serve returned")
+        .expect("no panic");
+    let took = t0.elapsed();
+    assert!(took < SHUTDOWN_GRACE, "shutdown took {took:?}");
+    assert_eq!(fake.count(Kind::Disconnected), 1);
+    drop(c);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

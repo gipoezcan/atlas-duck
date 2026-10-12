@@ -36,6 +36,23 @@ pub mod diag {
     pub const REASON_IMPERSONATION: &str = "impersonation";
     /// A connection limit was hit (PD-27).
     pub const REASON_LIMIT: &str = "limit";
+    /// The server could not serve the connection (no connection id: the OS CSPRNG failed).
+    pub const REASON_INTERNAL: &str = "internal";
+
+    // `ipc_bind_failed` reasons. The diag log never writes the message, so `reason` is what
+    // tells these cases apart.
+
+    /// The endpoint could not be bound or `<data>/endpoint` not written.
+    pub const REASON_BIND: &str = "bind";
+    /// Leftover `.endpoint.*.tmp` files could not be removed (harmless).
+    pub const REASON_TEMP_SWEEP: &str = "temp_sweep";
+    /// `<data>/endpoint` could not be removed when accepting stopped.
+    pub const REASON_ENDPOINT_REMOVE: &str = "endpoint_remove";
+    /// Windows: binding a fresh pipe name after an accept error failed.
+    pub const REASON_REBIND: &str = "rebind";
+    /// Windows: every rebind failed; the server stopped accepting and serves only the open
+    /// connections until shutdown.
+    pub const REASON_STOPPED_ACCEPTING: &str = "stopped_accepting";
 }
 
 /// The byte stream behind a `Conn`.
