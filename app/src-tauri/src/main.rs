@@ -12,6 +12,12 @@ fn main() {
     // single-instance plugin, startup hardening, the stderr redirect, the data-dir check and
     // `instance.lock`, and they keep their stdio. They never become a tray instance.
     let args: Vec<OsString> = std::env::args_os().collect();
+    // The test build only: the OS keychain served to the `os_keychain_smoke` harness, so the
+    // entries the app reads were written by this executable (never in a release build).
+    #[cfg(feature = "scripted-approver")]
+    if let Some(code) = atlas_duck_app_lib::testing::os_keystore_proxy::run_if_requested(&args) {
+        std::process::exit(code);
+    }
     match classify_argv(&args) {
         EarlyMode::Cli(rest) => std::process::exit(atlas_duck_cli::run(rest)),
         EarlyMode::VerifyExport(rest) => std::process::exit(verify_export_stub(rest)),

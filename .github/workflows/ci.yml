@@ -197,7 +197,10 @@ jobs:
         run: bash ci/keyring-ci.sh
 
       # T26 / T22: the same harness_smoke flow against the real OsKeyStore (a 7e570000... test
-      # install id; a guard deletes the entries). CI=true is the guard's second opt-in.
+      # install id; a guard deletes the entries). CI=true is the guard's second opt-in. The harness
+      # writes and deletes the entries through `atlas-duck-app __test-os-keystore`: a macOS
+      # keychain item trusts the executable that created it, and the app waited on a confirmation
+      # prompt for items the test binary had written (launch_timeout on both macOS legs).
       - name: M4 OS keychain smoke (Windows Credential Manager, macOS login keychain)
         if: runner.os != 'Linux'
         env:

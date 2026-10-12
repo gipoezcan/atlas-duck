@@ -22,16 +22,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::compose::{self, CoreInputs};
+use atlas_duck_app_lib::diag::LOG_DIR_NAME;
 use atlas_duck_app_lib::testing::control::{
     CONTROL_DIR, ENV_NAMES_FILE, PID_FILE, QUIT_FILE, REFUSED_FILE,
 };
+use atlas_duck_app_lib::testing::os_keystore_proxy::{self, ProxyKeyStore};
 use atlas_duck_app_lib::testing::provision;
 use atlas_duck_atlassian::testing::MockDc;
 use atlas_duck_atlassian::testing::fixtures::{CONFLUENCE_8_5_VERSION, JIRA_9_12_VERSION};
 use atlas_duck_audit::lock::{InstanceLock, LockError};
 use atlas_duck_audit::{
-    EntryName, EventType, FirstRunInput, KeyStore, OpenConfig, OsKeyStore, SystemClock,
-    create_new_store, new_ids,
+    EntryName, EventType, FirstRunInput, KeyStore, OpenConfig, SystemClock, create_new_store,
+    new_ids,
 };
 use atlas_duck_core::proxy::ProxySetting;
 use atlas_duck_core::testing::StubConfirmer;
@@ -191,7 +193,11 @@ pub enum KeystoreKind {
     /// PD-02: files under `<root>/keys`, handed to the binaries through `ATLAS_DUCK_TEST_KEYSTORE`.
     #[default]
     File,
-    /// The real OS keychain under a `7e570000` test install id (CI only).
+    /// The real OS keychain under a `7e570000` test install id (CI only). The test process never
+    /// touches it: every entry call goes to an `atlas-duck-app __test-os-keystore` process
+    /// ([`os_keystore_proxy`]), so the entries the app reads were written by the app executable
+    /// (a macOS keychain item trusts the executable that created it; any other one gets a
+    /// confirmation prompt nobody answers on CI).
     Os,
 }
 
@@ -360,9 +366,10 @@ impl World {
     fn keys(&self) -> Result<Arc<dyn KeyStore>> {
         match self.opts.keystore {
             KeystoreKind::File => Ok(Arc::new(provision(&self.keys_dir, &self.install_id)?)),
-            KeystoreKind::Os => Ok(Arc::new(
-                OsKeyStore::new(&self.install_id).map_err(short_err)?,
-            )),
+            KeystoreKind::Os => Ok(Arc::new(ProxyKeyStore::spawn(
+                self.command(APP_EXE, &[os_keystore_proxy::MARKER, &self.install_id]),
+                &self.install_id,
+            )?)),
         }
     }
 
@@ -675,6 +682,75 @@ impl World {
         out
     }
 
+    // ---- diagnostics -------------------------------------------------------------------------
+
+    /// What a failed flow prints after the CLI run that failed (it probes `instance.lock` like
+    /// [`World::app_running`]): the data dir listing, the app's diagnostic log, the lock holder
+    /// and, on macOS, a one-second stack sample of an app that still runs (a hang shows where it
+    /// waits). The cold-started app has no stderr to capture (the CLI launches it detached).
+    pub fn diagnostics(&self) -> String {
+        let mut out = format!("--- data dir {}\n", self.data.display());
+        list_tree(&self.data, &self.data, 0, &mut out);
+        let logs = self.data.join(LOG_DIR_NAME);
+        let mut log_files: Vec<PathBuf> = fs::read_dir(&logs)
+            .map(|rd| rd.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default();
+        log_files.sort();
+        for file in log_files {
+            match fs::read_to_string(&file) {
+                Ok(text) => {
+                    out.push_str(&format!("--- {}\n", file.display()));
+                    push_tail(&text, 200, &mut out);
+                }
+                Err(e) => out.push_str(&format!("--- {}: {e}\n", file.display())),
+            }
+        }
+        let holder = match self.local_data() {
+            Ok(data) => match InstanceLock::acquire(&data, &self.host) {
+                Ok(_) => {
+                    out.push_str("--- instance.lock: free (no app runs)\n");
+                    None
+                }
+                Err(LockError::Held(holder)) => {
+                    let pid = holder.map(|h| h.pid);
+                    out.push_str(&format!("--- instance.lock: held by pid {pid:?}\n"));
+                    pid
+                }
+                Err(e) => {
+                    out.push_str(&format!("--- instance.lock: {e}\n"));
+                    None
+                }
+            },
+            Err(e) => {
+                out.push_str(&format!("--- data dir: {e}\n"));
+                None
+            }
+        };
+        #[cfg(target_os = "macos")]
+        if let Some(pid) = holder {
+            let file = self.root().join("app-sample.txt");
+            let status = Command::new("/usr/bin/sample")
+                .arg(pid.to_string())
+                .arg("1")
+                .arg("-file")
+                .arg(&file)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            match fs::read_to_string(&file) {
+                Ok(text) => {
+                    out.push_str(&format!("--- sample {pid} 1\n"));
+                    push_head(&text, 300, &mut out);
+                }
+                Err(e) => out.push_str(&format!("--- sample {pid} 1: {status:?} {e}\n")),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = holder;
+        out
+    }
+
     // ---- drop --------------------------------------------------------------------------------
 
     /// Quits whatever app holds `instance.lock` (the control file; after 10 s a hard kill by the
@@ -705,9 +781,10 @@ impl World {
         }
     }
 
-    /// Removes this install's keychain entries (OS keychain runs only).
+    /// Removes this install's keychain entries (OS keychain runs only), through the app
+    /// executable like every other entry call.
     fn delete_os_entries(&self) {
-        let Ok(ks) = OsKeyStore::new(&self.install_id) else {
+        let Ok(ks) = self.keys() else {
             return;
         };
         for e in [
@@ -748,6 +825,54 @@ fn distinct_instance_ids(store: &atlas_duck_audit::Store) -> Vec<String> {
         }
     }
     ids
+}
+
+/// One line per entry under `root` (relative path, and the size of a file), at most four levels.
+fn list_tree(root: &Path, dir: &Path, depth: usize, out: &mut String) {
+    let mut entries: Vec<fs::DirEntry> = match fs::read_dir(dir) {
+        Ok(rd) => rd.flatten().collect(),
+        Err(e) => {
+            out.push_str(&format!("{}: {e}\n", dir.display()));
+            return;
+        }
+    };
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        match entry.metadata() {
+            Ok(md) if md.is_dir() => {
+                out.push_str(&format!("{rel}/\n"));
+                if depth < 3 {
+                    list_tree(root, &path, depth + 1, out);
+                }
+            }
+            Ok(md) => out.push_str(&format!("{rel} ({} bytes)\n", md.len())),
+            Err(e) => out.push_str(&format!("{rel}: {e}\n")),
+        }
+    }
+}
+
+/// The last `n` lines of `text`.
+fn push_tail(text: &str, n: usize, out: &mut String) {
+    let lines: Vec<&str> = text.lines().collect();
+    for line in &lines[lines.len().saturating_sub(n)..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+/// The first `n` lines of `text`.
+#[cfg(target_os = "macos")]
+fn push_head(text: &str, n: usize, out: &mut String) {
+    for line in text.lines().take(n) {
+        out.push_str(line);
+        out.push('\n');
+    }
 }
 
 fn write_control_file(data: &Path, name: &str, content: &str) -> io::Result<()> {

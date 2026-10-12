@@ -22,10 +22,26 @@ async fn smoke(world: &mut World) -> Result<()> {
         .provision_store(&[("jira-main", Product::Jira)])
         .await?;
     let run = world.cli(&["instances"]).await?;
-    assert_eq!(run.exit, 0, "stdout: {} stderr: {}", run.stdout, run.stderr);
+    // A failure shows what the app left behind (data dir, diagnostic log, a hung app's stack).
+    assert_eq!(
+        run.exit,
+        0,
+        "stdout: {}
+stderr: {}
+{}",
+        run.stdout,
+        run.stderr,
+        world.diagnostics()
+    );
     let env = run.envelope.ok_or("stdout holds no envelope")?;
     let rows = instance_rows(&env);
-    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "{rows:?}
+{}",
+        world.diagnostics()
+    );
     assert_eq!(rows[0]["alias"], "jira-main");
     assert_eq!(rows[0]["product"], "jira");
     assert_eq!(rows[0]["is_default"], true);
@@ -49,7 +65,10 @@ async fn harness_smoke() -> Result<()> {
 }
 
 /// The same flow against the real OS keychain under a `7e570000` test install id; the world's
-/// drop deletes every entry it wrote. CI only.
+/// drop deletes every entry it wrote. CI only. Every entry is written and read by the app
+/// executable (the harness provisions through `atlas-duck-app __test-os-keystore`), as in
+/// production: on macOS an item another executable created would make the app wait on a
+/// confirmation prompt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "CI: OS keychain step"]
 async fn os_keychain_smoke() -> Result<()> {

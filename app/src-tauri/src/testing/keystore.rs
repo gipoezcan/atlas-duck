@@ -197,7 +197,7 @@ fn new_private_file(path: &Path) -> io::Result<fs::File> {
         .open(path)
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(super) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -208,7 +208,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Lowercase or uppercase hex of even length; anything else is `None`.
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
+pub(super) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     let digit = |c: u8| {
         char::from(c)
             .to_digit(16)

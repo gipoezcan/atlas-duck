@@ -8,10 +8,13 @@
 //! - [`control`]: the `<data>/test-control/` dir (quit, env names, refused counter, start delay,
 //!   Windows V12 marker).
 //! - [`scope_identifier`]: one single-instance name per test home.
+//! - [`os_keystore_proxy`]: `atlas-duck-app __test-os-keystore`, the OS keychain served by the app
+//!   executable to the `os_keychain_smoke` harness (macOS keychain items trust their creator).
 
 pub mod approver;
 pub mod control;
 pub mod keystore;
+pub mod os_keystore_proxy;
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
