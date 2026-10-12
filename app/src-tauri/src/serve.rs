@@ -10,6 +10,7 @@
 
 mod app_handler;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
@@ -20,13 +21,16 @@ use atlas_duck_audit::{
     OpenError, OsKeyStore, StartupOutcome, Store, SystemClock, keychain_retry_schedule,
     read_store_install_id,
 };
-use atlas_duck_core::{Core, GateHandler, GateState, NativeConfirmer, ShutdownReason, UiSink};
+use atlas_duck_core::{
+    Core, GateHandler, GateState, NativeConfirmer, ShutdownReason, ShutdownReport, UiSink,
+};
 use atlas_duck_ipc::paths::{EndpointLocation, LocalDataDir, PinnedPaths, remove_endpoint_file};
 use atlas_duck_ipc::proto::RequestHandler;
 use atlas_duck_ipc::server::{HandlerCell, IpcServer, ShutdownSignal};
 use atlas_duck_ipc::transport::diag;
 use tauri::{AppHandle, Manager};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 pub use app_handler::{AppHandler, DoctorExtras};
@@ -57,9 +61,25 @@ pub const LOG_EVENT_KEYCHAIN_RETRY_EXHAUSTED: &str = "keychain_retry_exhausted";
 pub const LOG_EVENT_START_CANCELLED: &str = "serve_start_cancelled";
 /// PD-25: the 6-hourly touch of the socket file and its dir failed (Unix).
 pub const LOG_EVENT_TOUCH_FAILED: &str = "ipc_touch_failed";
+/// The quit path stopped waiting for a step; `reason` = `start|retry|core|served|store`.
+pub const LOG_EVENT_QUIT_WAIT_EXPIRED: &str = "quit_wait_expired";
+/// `Core::shutdown` ended without a report (its task panicked).
+pub const LOG_EVENT_QUIT_CORE_LOST: &str = "quit_core_lost";
 
 /// PD-25: how often the socket file and its dir are touched (Unix).
 pub const TOUCH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// PD-38: the outer bound of the whole quit path. `Core::shutdown` waits at most 60 s for
+/// writes that are `executing` (§2.5 step 4); this leaves 15 s for the rest.
+pub const SHUTDOWN_OUTER: Duration = Duration::from_secs(75);
+/// How long the quit path waits for the start task to notice the quit request.
+pub const START_WAIT: Duration = Duration::from_secs(15);
+/// How long the quit path waits for a keychain retry that is mid-`open` or mid-`Core::start`.
+pub const RETRY_WAIT: Duration = Duration::from_secs(20);
+/// PD-38: `serve` returns within 2 s of the shutdown signal.
+pub const SERVE_STOP_WAIT: Duration = Duration::from_secs(2);
+/// How long the quit path waits for `Store::shutdown` (it joins the writer thread).
+pub const STORE_WAIT: Duration = Duration::from_secs(10);
 
 // ---------- keystore ----------
 
@@ -202,14 +222,14 @@ pub enum StartupFailure {
 /// What the app keeps while it serves (managed through [`ServeSlot`]). The quit path (T20)
 /// reads it.
 ///
-/// T20 order: cancel [`ServeSlot::quit`] and await [`ServeSlot::take_starting`] with a bound
-/// (a start that has not bound yet ends `Cancelled` and shuts down what it opened); then
-/// [`ServeState::freeze_for_shutdown`] (no swap after it; with no core the cell answers
-/// `app_shutting_down`); then take the handle out of `retry` and await it with a bound, the
-/// `Mutex` guard dropped before the await. Never `abort()` the retry task: it owns a store or
-/// core it is starting and shuts them down itself once it sees the freeze; aborting it leaks
-/// them. Then the core's shutdown, `shutdown.cancel()`, `served` (<= 2 s) and `Store::shutdown`
-/// on a blocking thread.
+/// The quit path ([`quit`], T20) runs in this order: cancel [`ServeSlot::quit`] and await
+/// [`ServeSlot::take_starting`] with a bound (a start that has not bound yet ends `Cancelled` and
+/// shuts down what it opened); then [`shutdown`]: [`ServeState::freeze_for_shutdown`] (no swap
+/// after it; with no core the cell answers `app_shutting_down`); take the handle out of `retry`
+/// and await it with a bound, the `Mutex` guard dropped before the await. Never `abort()` the
+/// retry task: it owns a store or core it is starting and ends them itself once it sees the
+/// freeze. Then the core's shutdown, `shutdown.cancel()`, `served` (<= 2 s) and
+/// `Store::shutdown` on a blocking thread.
 pub struct ServeState {
     pub cell: Arc<HandlerCell>,
     pub shutdown: ShutdownSignal,
@@ -228,6 +248,9 @@ pub struct ServeState {
     /// True once the quit path called [`ServeState::freeze`] or
     /// [`ServeState::freeze_for_shutdown`]: no swap happens after that.
     frozen: Mutex<bool>,
+    /// Cancelled by the freeze: wakes a retry loop that sleeps between attempts (the server's
+    /// `shutdown` signal only fires at the end of the quit path).
+    retry_stop: ShutdownSignal,
     extras: Arc<DoctorExtras>,
     ui: Arc<dyn UiSink>,
 }
@@ -254,6 +277,7 @@ impl ServeState {
             served: Mutex::new(None),
             retry: Mutex::new(None),
             frozen: Mutex::new(false),
+            retry_stop: ShutdownSignal::new(),
             extras,
             ui,
         }
@@ -277,6 +301,7 @@ impl ServeState {
     pub fn freeze(&self) -> Option<Arc<Core>> {
         let mut frozen = lock(&self.frozen);
         *frozen = true;
+        self.retry_stop.cancel();
         self.core.get().cloned()
     }
 
@@ -287,6 +312,7 @@ impl ServeState {
     pub fn freeze_for_shutdown(&self) -> Option<Arc<Core>> {
         let mut frozen = lock(&self.frozen);
         *frozen = true;
+        self.retry_stop.cancel();
         let core = self.core.get().cloned();
         if core.is_none() {
             let gate = GateHandler::new(GateState::ShuttingDown, self.ui.clone());
@@ -334,6 +360,153 @@ impl ServeState {
         drop(frozen);
         true
     }
+}
+
+// ---------- quit ----------
+
+/// What the quit path did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownOutcome {
+    /// `Core::shutdown`'s report; `None` without a core, when the outer bound ended the wait
+    /// first (`timed_out`), or when the core's task was lost.
+    pub report: Option<ShutdownReport>,
+    /// The outer bound expired while `Core::shutdown` still ran (a write that is `executing`
+    /// holds it). The sweep goes on in its own task; the app exits without `APP_STOP` and the
+    /// next start reconciles what is open like after a crash.
+    pub timed_out: bool,
+}
+
+/// Awaits `f` for at most `d`, and never past `deadline`. `false`: the wait expired (the future
+/// is dropped; a task handle only detaches).
+async fn bounded<F: Future>(f: F, d: Duration, deadline: Instant, what: &'static str) -> bool {
+    let until = (Instant::now() + d).min(deadline);
+    let done = tokio::time::timeout_at(until, f).await.is_ok();
+    if !done {
+        tracing::warn!(event = LOG_EVENT_QUIT_WAIT_EXPIRED, reason = what);
+    }
+    done
+}
+
+/// Runs the core's shutdown in a task of its own and joins it until `deadline`. The task owns
+/// the sweep: a caller that is dropped or times out cannot stop it or start a second one (M3
+/// M-5). `(report, timed_out)`.
+async fn run_core_shutdown<F>(shutdown: F, deadline: Instant) -> (Option<ShutdownReport>, bool)
+where
+    F: Future<Output = ShutdownReport> + Send + 'static,
+{
+    let task = tokio::spawn(shutdown);
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(Ok(report)) => (Some(report), false),
+        Ok(Err(_)) => {
+            tracing::error!(event = LOG_EVENT_QUIT_CORE_LOST);
+            (None, false)
+        }
+        Err(_) => {
+            tracing::warn!(event = LOG_EVENT_QUIT_WAIT_EXPIRED, reason = "core");
+            (None, true)
+        }
+    }
+}
+
+/// The §2.5 shutdown path for a serving state (PD-38), `outer` bounding the whole of it:
+/// freeze (a gate answers `app_shutting_down` from here on), wait for a keychain retry that is
+/// mid-flight, `Core::shutdown` (refuses new submits, cancels pending, kills running scripts,
+/// lets an in-flight write finish, appends `APP_STOP`), stop the server (it removes
+/// `<data>/endpoint` as soon as it stops accepting, within 2 s), then the store. Idempotent;
+/// [`quit`] is what makes a second Quit wait for the first. A write that outlives `outer` is
+/// left to the next start's crash reconciliation (`outcome_unknown`); the store is shut down
+/// regardless, so a late outcome append from it fails.
+pub async fn shutdown(
+    state: &ServeState,
+    reason: ShutdownReason,
+    outer: Duration,
+) -> ShutdownOutcome {
+    shutdown_until(state, reason, Instant::now() + outer).await
+}
+
+async fn shutdown_until(
+    state: &ServeState,
+    reason: ShutdownReason,
+    deadline: Instant,
+) -> ShutdownOutcome {
+    let core = state.freeze_for_shutdown();
+
+    // Never `abort()`: the retry owns a store or core it is starting and ends them itself once
+    // it sees the freeze. The guard is dropped before the await.
+    let retry = lock(&state.retry).take();
+    if let Some(retry) = retry {
+        bounded(retry, RETRY_WAIT, deadline, "retry").await;
+    }
+
+    let (report, timed_out) = match core {
+        Some(core) => run_core_shutdown(async move { core.shutdown(reason).await }, deadline).await,
+        None => (None, false),
+    };
+
+    // The server removes `<data>/endpoint` itself when it stops accepting.
+    state.shutdown.cancel();
+    let served = lock(&state.served).take();
+    if let Some(served) = served {
+        let stopped = bounded(
+            served,
+            SERVE_STOP_WAIT,
+            Instant::now() + SERVE_STOP_WAIT,
+            "served",
+        );
+        if !stopped.await
+            && let Some(data) = &state.extras.data
+        {
+            // A stuck server must not leave an endpoint file pointing at a dying app.
+            let _ = remove_endpoint_file(data);
+        }
+    }
+
+    let store = lock(&state.store).take();
+    if let Some(store) = store {
+        let stopped = tokio::task::spawn_blocking(move || store.shutdown());
+        bounded(stopped, STORE_WAIT, Instant::now() + STORE_WAIT, "store").await;
+    }
+    ShutdownOutcome { report, timed_out }
+}
+
+/// Quit from the tray (§2.5): cancels a start that is still running and waits for it, then
+/// [`shutdown`]s the state it left in `slot` (none when the start failed or was cancelled).
+/// `outer` bounds all of it. One run per slot: a second Quit while one runs waits for it and
+/// gets the same outcome.
+pub async fn quit(slot: &ServeSlot, reason: ShutdownReason, outer: Duration) -> ShutdownOutcome {
+    *slot
+        .quit_done()
+        .get_or_init(|| async move {
+            let deadline = Instant::now() + outer;
+            slot.quit().cancel();
+            // The start task ends `Cancelled` (and shuts down what it opened) or leaves its
+            // state in the slot before it finishes.
+            let starting = slot.take_starting();
+            if let Some(starting) = starting {
+                bounded(starting, START_WAIT, deadline, "start").await;
+            }
+            match slot.get() {
+                Some(state) => shutdown_until(state, reason, deadline).await,
+                None => ShutdownOutcome {
+                    report: None,
+                    timed_out: false,
+                },
+            }
+        })
+        .await
+}
+
+/// The tray's Quit: [`quit`] with [`SHUTDOWN_OUTER`] on the async runtime (the menu handler
+/// runs on the main thread and must not block), then `app.exit(0)`. Without a [`ServeSlot`]
+/// (no store is served in this startup state) it exits at once.
+pub fn shutdown_then_exit(app: &AppHandle, reason: ShutdownReason) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Some(slot) = handle.try_state::<ServeSlot>() {
+            quit(&slot, reason, SHUTDOWN_OUTER).await;
+        }
+        handle.exit(0);
+    });
 }
 
 // ---------- start ----------
@@ -707,6 +880,7 @@ async fn retry_keychain(
         tokio::select! {
             biased;
             () = state.shutdown.0.cancelled() => return,
+            () = state.retry_stop.0.cancelled() => return,
             () = tokio::time::sleep(*delay) => {}
         }
         if *lock(&state.frozen) {
@@ -961,6 +1135,83 @@ mod tests {
         // A second call keeps the shutting-down gate.
         assert!(state.freeze_for_shutdown().is_none());
         assert_eq!(gate_label(&state).await, "shutting_down");
+    }
+
+    /// M-5: the core's shutdown runs in a task of its own. The outer bound only ends the wait;
+    /// the sweep goes on and is never started twice.
+    #[tokio::test]
+    async fn outer_bound_ends_the_wait_not_the_sweep() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = finished.clone();
+        let started = Instant::now();
+        let (report, timed_out) = run_core_shutdown(
+            async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                ShutdownReport::default()
+            },
+            Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        assert!(timed_out);
+        assert!(report.is_none());
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+        // Nobody joins it any more; it still completes.
+        let waited = Instant::now();
+        while !finished.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(waited.elapsed() < Duration::from_secs(10), "sweep stopped");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn core_shutdown_report_is_passed_on_and_a_lost_task_is_not_a_timeout() {
+        let want = ShutdownReport {
+            cancelled: 2,
+            writes_waited: 1,
+            app_stop_logged: true,
+        };
+        let far = Instant::now() + Duration::from_secs(30);
+        let got = run_core_shutdown(async move { want }, far).await;
+        assert_eq!(got, (Some(want), false));
+        let lost = run_core_shutdown(
+            async {
+                let lost: Result<ShutdownReport, &str> =
+                    std::hint::black_box(Err("the core's shutdown task panicked"));
+                lost.unwrap_or_else(|m| panic!("{m}"))
+            },
+            far,
+        )
+        .await;
+        assert_eq!(lost, (None, false));
+    }
+
+    #[tokio::test]
+    async fn bounded_waits_at_most_d_and_never_past_the_deadline() {
+        let now = Instant::now();
+        let far = now + Duration::from_secs(30);
+        assert!(bounded(async {}, Duration::from_secs(5), far, "x").await);
+        let slow = || tokio::time::sleep(Duration::from_secs(30));
+        assert!(!bounded(slow(), Duration::from_millis(50), far, "x").await);
+        // The deadline wins over a longer `d`.
+        let t = Instant::now();
+        let early = t + Duration::from_millis(50);
+        assert!(!bounded(slow(), Duration::from_secs(30), early, "x").await);
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The freeze wakes a retry loop that sleeps (it would otherwise sleep until the server's
+    /// shutdown signal, which fires at the very end of the quit path).
+    #[test]
+    fn freeze_cancels_the_retry_stop_signal() {
+        let state = gate_serving(GateState::Locked(LockedReason::KeychainUnavailable));
+        assert!(!state.retry_stop.0.is_cancelled());
+        state.freeze();
+        assert!(state.retry_stop.0.is_cancelled());
+        let state = gate_serving(GateState::Locked(LockedReason::KeychainUnavailable));
+        state.freeze_for_shutdown();
+        assert!(state.retry_stop.0.is_cancelled());
     }
 
     #[test]

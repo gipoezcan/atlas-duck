@@ -8,7 +8,7 @@ use atlas_duck_ipc::server::ShutdownSignal;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 use tauri::async_runtime::JoinHandle;
 
-use crate::serve::ServeState;
+use crate::serve::{ServeState, ShutdownOutcome};
 use crate::tray_host::TrayHost;
 
 /// The startup outcome as the rest of the app sees it. `AlreadyRunning` is not here: that
@@ -112,6 +112,8 @@ pub struct ServeSlot {
     starting: Mutex<Option<JoinHandle<()>>>,
     /// Quit during startup: `serve::start` passes it as `StartInputs::quit`.
     quit: ShutdownSignal,
+    /// The one quit run (`serve::quit`): a second Quit waits for it.
+    quit_done: tokio::sync::OnceCell<ShutdownOutcome>,
 }
 
 impl ServeSlot {
@@ -127,6 +129,11 @@ impl ServeSlot {
     /// Cancelled by the quit path before it awaits [`ServeSlot::take_starting`].
     pub fn quit(&self) -> &ShutdownSignal {
         &self.quit
+    }
+
+    /// Holds the outcome of the one quit run.
+    pub fn quit_done(&self) -> &tokio::sync::OnceCell<ShutdownOutcome> {
+        &self.quit_done
     }
 
     pub fn set_starting(&self, task: JoinHandle<()>) {

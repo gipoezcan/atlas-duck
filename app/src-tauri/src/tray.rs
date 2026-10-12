@@ -3,12 +3,14 @@
 
 use std::ffi::{OsStr, OsString};
 
+use atlas_duck_core::ShutdownReason;
 use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItem};
 use tauri::plugin::TauriPlugin;
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, RunEvent, Runtime, Wry};
 
 use crate::early_argv::FLAG_BACKGROUND;
+use crate::serve;
 use crate::startup::{StartupState, startup_message};
 
 /// Id of the app's one tray icon.
@@ -45,7 +47,7 @@ const MENU_ITEM_IDS_WITH_STATUS: &[&str] = &[MENU_ID_STATUS, MENU_ID_QUIT];
 /// What a tray menu item does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
-    /// M1: `app.exit(0)`. M3 replaces it with the §2.5 shutdown path.
+    /// The §2.5 shutdown path, then `app.exit(0)` (`serve::shutdown_then_exit`).
     Quit,
 }
 
@@ -169,7 +171,7 @@ pub fn build_tray_or_log(app: &AppHandle, status: Option<&str>) {
 
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match action_for_menu_id(event.id().as_ref()) {
-        Some(TrayAction::Quit) => app.exit(0),
+        Some(TrayAction::Quit) => serve::shutdown_then_exit(app, ShutdownReason::Quit),
         None => {}
     }
 }

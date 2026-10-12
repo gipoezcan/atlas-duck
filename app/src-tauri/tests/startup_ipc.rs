@@ -14,14 +14,18 @@ use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::secret_service::{SecretService, SecretServiceCheck};
 use atlas_duck_app_lib::serve::{
-    KeysFactory, ServeState, StartInputs, StartupFailure, StoreFailure, start_with,
+    KeysFactory, ServeState, ShutdownOutcome, StartInputs, StartupFailure, StoreFailure, quit,
+    shutdown, start_with,
 };
+use atlas_duck_app_lib::state::ServeSlot;
 use atlas_duck_audit::lock::{INSTANCE_LOCK_FILE, InstanceLock};
-use atlas_duck_audit::testing::{FreeSpaceStub, MemKeyStore, MemKeyring};
+use atlas_duck_audit::testing::{FreeSpaceStub, MemKeyStore, MemKeyring, open_existing};
 use atlas_duck_audit::{
     FirstRunInput, KeyStore, KeyStoreError, OpenConfig, SystemClock, create_new_store, new_ids,
 };
-use atlas_duck_core::{Confirm, MSG_FIRST_RUN, NativeConfirmer, UiEvent, UiSink};
+use atlas_duck_core::{
+    Confirm, MSG_FIRST_RUN, NativeConfirmer, ShutdownReason, ShutdownReport, UiEvent, UiSink,
+};
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::client::IpcClient;
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
@@ -64,13 +68,14 @@ impl SecretServiceCheck for NoSecretService {
 }
 
 /// `MemKeyStore`s over one keyring. While `available` is false every `keys()` fails
-/// `Unavailable`. A held factory blocks its first `keys()` (on `open`'s blocking thread) until
-/// the test releases it.
+/// `Unavailable`. A held factory blocks its `hold_at`-th `keys()` (on `open`'s blocking thread)
+/// until the test releases it; `available` is read after the release.
 struct MemKeys {
     ring: Arc<MemKeyring>,
     available: AtomicBool,
     calls: AtomicU32,
     hold: Mutex<Option<Receiver<()>>>,
+    hold_at: u32,
     entered: AtomicBool,
 }
 
@@ -81,20 +86,45 @@ impl MemKeys {
             available: AtomicBool::new(available),
             calls: AtomicU32::new(0),
             hold: Mutex::new(None),
+            hold_at: 1,
             entered: AtomicBool::new(false),
         })
     }
 
     /// Available, but the first `keys()` waits for a send on the returned sender.
     fn held(ring: Arc<MemKeyring>) -> (Arc<MemKeys>, Sender<()>) {
+        MemKeys::held_at(ring, true, 1)
+    }
+
+    /// Starts `available` as given; the `n`-th `keys()` (1-based) waits for a send on the
+    /// returned sender.
+    fn held_at(ring: Arc<MemKeyring>, available: bool, n: u32) -> (Arc<MemKeys>, Sender<()>) {
         let (release, held) = std::sync::mpsc::channel();
-        let keys = MemKeys::new(ring, true);
-        *keys.hold.lock().unwrap_or_else(|e| e.into_inner()) = Some(held);
+        let keys = Arc::new(MemKeys {
+            ring,
+            available: AtomicBool::new(available),
+            calls: AtomicU32::new(0),
+            hold: Mutex::new(Some(held)),
+            hold_at: n,
+            entered: AtomicBool::new(false),
+        });
         (keys, release)
     }
 
     fn calls(&self) -> u32 {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Waits until `n` `keys()` calls have started.
+    async fn wait_calls(&self, n: u32) -> TestResult {
+        let started = Instant::now();
+        while self.calls() < n {
+            if started.elapsed() > WAIT {
+                return Err(format!("keys() was called {} times, not {n}", self.calls()).into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 
     /// Waits until a `keys()` call has started.
@@ -112,11 +142,13 @@ impl MemKeys {
 
 impl KeysFactory for MemKeys {
     fn keys(&self, install_id: &str) -> Result<Arc<dyn KeyStore>, KeyStoreError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.entered.store(true, Ordering::SeqCst);
-        let held = self.hold.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(held) = held {
-            let _ = held.recv();
+        if n == self.hold_at {
+            let held = self.hold.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(held) = held {
+                let _ = held.recv();
+            }
         }
         if !self.available.load(Ordering::SeqCst) {
             return Err(KeyStoreError::Unavailable);
@@ -627,4 +659,282 @@ async fn stale_endpoint_file_removed_before_bind() -> TestResult {
     assert_ne!(name, "stale-endpoint-name");
     w.connect().await?;
     stop(&state).await
+}
+
+// ---------- quit (T20) ----------
+
+/// Submits on `c` until the answer says `app_shutting_down` (the quit path froze the state).
+async fn wait_shutting_down(c: &mut IpcClient) -> Result<Envelope, Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    loop {
+        let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+        if reason(&reply.envelope) == Some("app_shutting_down") {
+            return Ok(reply.envelope);
+        }
+        if started.elapsed() > WAIT {
+            return Err("never answered app_shutting_down".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Nothing serves any more: no endpoint file, and a connect says the app is not running.
+async fn assert_not_running(w: &World) -> TestResult {
+    assert!(read_endpoint_file(&w.data)?.is_none(), "endpoint file gone");
+    let Err(e) = w.connect().await else {
+        return Err("connected to a stopped app".into());
+    };
+    assert!(e.to_string().contains("not running"), "{e}");
+    Ok(())
+}
+
+/// §2.5: a submit during the shutdown is refused `app_shutting_down` (exit 5); when `shutdown`
+/// returns `APP_STOP {reason: quit}` is the last record, the endpoint is gone and the data dir
+/// holds no WAL (the store closed its reader before its writer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_with_core_refuses_then_stops() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let keys = MemKeys::new(ring.clone(), true);
+    let state = start_with(w.inputs(Some(install_id.clone()), keys))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let mut c = w.connect().await?;
+    let instances: Envelope = c.call("instances.list", json!({})).await?;
+    assert_eq!(instances.status, Status::Succeeded, "{instances:?}");
+
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "poisoned")?
+        .clone()
+        .ok_or("no store")?;
+    let before = store.head().0;
+    // Core's own shutdown has started (the first thing `shutdown` runs): the server still
+    // answers, and a submit is refused. `shutdown` below joins the same, single, sweep.
+    let core = state.core.get().cloned().ok_or("no core")?;
+    let first = core.shutdown(ShutdownReason::Quit).await;
+    let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+    assert_eq!(reply.envelope.status, Status::Failed);
+    assert_eq!(reason(&reply.envelope), Some("app_shutting_down"));
+    assert_eq!(exit_code(&reply.envelope), 5);
+
+    let outcome = shutdown(&state, ShutdownReason::Quit, WAIT).await;
+    let expected = ShutdownReport {
+        cancelled: 0,
+        writes_waited: 0,
+        app_stop_logged: true,
+    };
+    assert_eq!(first, expected);
+    assert_eq!(
+        outcome,
+        ShutdownOutcome {
+            report: Some(expected),
+            timed_out: false
+        }
+    );
+    assert_eq!(store.head().0, before + 1);
+    assert!(!state.serving());
+    assert_not_running(&w).await?;
+    let files = w.files()?;
+    assert!(
+        !files.contains(WAL_FILE) && !files.contains("audit.db-shm"),
+        "{files:?}"
+    );
+    // A fresh handle reads the file: one record was added, and it is `APP_STOP {reason: quit}`.
+    let mut cfg = OpenConfig::new(
+        Arc::new(SystemClock::new()),
+        Arc::new(MemKeyStore::new(ring, &install_id)),
+    );
+    cfg.free_space = Some(FreeSpaceStub::new(u64::MAX));
+    let reread = open_existing(&w.data, &w.lock, cfg)?;
+    let (head, ..) = reread.head();
+    assert_eq!(head, before + 1);
+    let stop: Value = serde_json::from_slice(&reread.read_payload(head)?)?;
+    assert_eq!(stop, json!({ "reason": "quit" }));
+    reread.shutdown();
+    Ok(())
+}
+
+/// A gate (no core) answers `app_shutting_down` on an open connection as soon as the quit path
+/// froze it, while it waits for a keychain retry that is inside `open`: the retry is never
+/// aborted, ends the store it opened (when the keychain came back) and starts no core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_in_gate_state_answers_shutting_down() -> TestResult {
+    for keychain_back in [false, true] {
+        let w = World::new()?;
+        let ring = MemKeyring::new();
+        let install_id = w.provision(&ring)?;
+        let before = w.files()?;
+        // Call 1 (start) fails `Unavailable`; call 2 (the first retry) is held.
+        let (keys, release) = MemKeys::held_at(ring, false, 2);
+        let state = Arc::new(
+            start_with(w.inputs(Some(install_id), keys.clone()))
+                .await
+                .map_err(|e| format!("{e:?}"))?,
+        );
+        let mut c = w.connect().await?;
+        let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+        assert_eq!(reason(&reply.envelope), Some("keychain_unavailable"));
+        keys.wait_calls(2).await?;
+
+        let task = {
+            let state = state.clone();
+            tokio::spawn(async move { shutdown(&state, ShutdownReason::Quit, WAIT).await })
+        };
+        let env = wait_shutting_down(&mut c).await?;
+        assert_eq!(exit_code(&env), 5, "keychain_back={keychain_back}");
+        // Still waiting for the retry that sits in `keys()`.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!task.is_finished(), "keychain_back={keychain_back}");
+
+        keys.available.store(keychain_back, Ordering::SeqCst);
+        release.send(())?;
+        let outcome = tokio::time::timeout(WAIT, task).await??;
+        assert_eq!(
+            outcome,
+            ShutdownOutcome {
+                report: None,
+                timed_out: false
+            }
+        );
+        assert!(state.core.get().is_none(), "no core after the freeze");
+        assert!(state.retry.lock().map_err(|_| "poisoned")?.is_none());
+        assert_not_running(&w).await?;
+        // The store a returning keychain let the retry open is shut down again.
+        assert_eq!(w.files()?, before, "keychain_back={keychain_back}");
+    }
+    Ok(())
+}
+
+/// A second Quit while one runs waits for it and gets its outcome; the sweep and `APP_STOP`
+/// happen once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_quit_waits_for_first() -> TestResult {
+    // The first Quit is held on a retry that sits in `open`.
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let (keys, release) = MemKeys::held_at(ring, false, 2);
+    let slot = Arc::new(ServeSlot::default());
+    let state = start_with(w.inputs(Some(install_id), keys.clone()))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    slot.set(state);
+    keys.wait_calls(2).await?;
+    let mut c = w.connect().await?;
+
+    let first = {
+        let slot = slot.clone();
+        tokio::spawn(async move { quit(&slot, ShutdownReason::Quit, WAIT).await })
+    };
+    wait_shutting_down(&mut c).await?;
+    let second = {
+        let slot = slot.clone();
+        tokio::spawn(async move { quit(&slot, ShutdownReason::Quit, WAIT).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!first.is_finished() && !second.is_finished());
+    release.send(())?;
+    let (a, b) = tokio::time::timeout(WAIT, async { tokio::join!(first, second) }).await?;
+    assert_eq!(a?, b?);
+    // Later Quits get the same outcome at once.
+    let third = quit(&slot, ShutdownReason::OsShutdown, WAIT).await;
+    assert!(!third.timed_out);
+    assert_not_running(&w).await?;
+
+    // With a core: two Quits at once append one `APP_STOP`.
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let state = start_with(w.inputs(Some(install_id), MemKeys::new(ring, true)))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let store = state
+        .store
+        .lock()
+        .map_err(|_| "poisoned")?
+        .clone()
+        .ok_or("no store")?;
+    let before = store.head().0;
+    let slot = ServeSlot::default();
+    slot.set(state);
+    let (a, b) = tokio::join!(
+        quit(&slot, ShutdownReason::Quit, WAIT),
+        quit(&slot, ShutdownReason::Quit, WAIT)
+    );
+    assert_eq!(a, b);
+    assert_eq!(a.report.map(|r| r.app_stop_logged), Some(true));
+    assert_eq!(store.head().0, before + 1);
+    Ok(())
+}
+
+/// I-2 / T20: Quit while the start is still inside `open` cancels it and waits for it: the
+/// store it opened is shut down, nothing is bound, and Quit reports no state to shut down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_waits_for_a_start_in_flight() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let before = w.files()?;
+    let (keys, release) = MemKeys::held(ring);
+    let slot = Arc::new(ServeSlot::default());
+    let mut inputs = w.inputs(Some(install_id), keys.clone());
+    inputs.quit = slot.quit().clone();
+    let task = {
+        let slot = slot.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Ok(state) = start_with(inputs).await {
+                slot.set(state);
+            }
+        })
+    };
+    slot.set_starting(task);
+    keys.wait_entered().await?;
+
+    let quitting = {
+        let slot = slot.clone();
+        tokio::spawn(async move { quit(&slot, ShutdownReason::Quit, WAIT).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!quitting.is_finished(), "Quit waits for the start");
+    assert!(slot.quit().0.is_cancelled());
+    release.send(())?;
+    let outcome = tokio::time::timeout(WAIT, quitting).await??;
+    assert_eq!(
+        outcome,
+        ShutdownOutcome {
+            report: None,
+            timed_out: false
+        }
+    );
+    assert!(slot.get().is_none());
+    assert_nothing_bound(&w)?;
+    assert_eq!(w.files()?, before);
+    Ok(())
+}
+
+/// A spent outer bound ends the wait for `Core::shutdown` (which then reports nothing, unless
+/// the sweep won the race against the zero bound): `shutdown` still stops the server and the
+/// store instead of hanging. The timeout itself is pinned by `serve::tests::
+/// outer_bound_ends_the_wait_not_the_sweep`; a held `executing` write needs `core/testing`
+/// (T22/T26).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_outer_timeout_still_tears_down() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let state = start_with(w.inputs(Some(install_id), MemKeys::new(ring, true)))
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    let started = Instant::now();
+    let outcome = shutdown(&state, ShutdownReason::Quit, Duration::ZERO).await;
+    // Either the bound won (no report) or the sweep did; never both, and never a hang.
+    assert_eq!(outcome.report.is_none(), outcome.timed_out, "{outcome:?}");
+    assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
+    assert!(!state.serving());
+    assert!(state.store.lock().map_err(|_| "poisoned")?.is_none());
+    assert_not_running(&w).await?;
+    Ok(())
 }
