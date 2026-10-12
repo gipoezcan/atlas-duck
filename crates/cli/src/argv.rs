@@ -103,6 +103,9 @@ pub(crate) enum Command {
 pub(crate) struct ParseError {
     pub message: String,
     pub details: Map<String, Value>,
+    /// The `--timeout` deadline ran out while reading input: not a `usage` failure but exit 5
+    /// `unreachable` / `launch_timeout` (§4.1: expiry before submission, nothing queued).
+    pub deadline_expired: bool,
 }
 
 impl ParseError {
@@ -110,6 +113,17 @@ impl ParseError {
         ParseError {
             message: message.into(),
             details: Map::new(),
+            deadline_expired: false,
+        }
+    }
+
+    /// The `--timeout` deadline expired while waiting for `what`.
+    pub(crate) fn deadline(what: &str) -> ParseError {
+        ParseError {
+            deadline_expired: true,
+            ..ParseError::new(format!(
+                "the --timeout deadline expired while reading {what}"
+            ))
         }
     }
 
@@ -299,6 +313,9 @@ pub(crate) fn parse(
     let mut agent_flag: Option<String> = None;
     let mut output_flag: Option<OutputMode> = None;
     let mut pos: Vec<String> = Vec::new();
+    // The first unknown flag: reported after the loop unless `--help` is also present, so
+    // `--help` wins over a bad flag wherever it appears.
+    let mut unknown: Option<ParseError> = None;
     // Op flags, re-spelled `--flag=value` for `binding::bind`.
     let mut op_flags: Vec<OsString> = Vec::new();
     let mut parser = lexopt::Parser::from_args(args.iter().cloned());
@@ -307,10 +324,9 @@ pub(crate) fn parse(
             lexopt::Arg::Value(v) => pos.push(text(v)?),
             lexopt::Arg::Short('h') => opts.help = true,
             lexopt::Arg::Short(c) => {
-                return Err(ParseError::arg(
-                    format!("unknown flag: -{c}"),
-                    &format!("-{c}"),
-                ));
+                unknown.get_or_insert_with(|| {
+                    ParseError::arg(format!("unknown flag: -{c}"), &format!("-{c}"))
+                });
             }
             lexopt::Arg::Long(name) => {
                 let flag = format!("--{name}");
@@ -353,7 +369,10 @@ pub(crate) fn parse(
                         let (kind, _) = classify(&pos);
                         if let Kind::Op(spec) = kind {
                             match flag_takes_value(spec, &flag) {
-                                None => return Err(unknown_flag(&flag)),
+                                None => {
+                                    unknown.get_or_insert_with(|| unknown_flag(&flag));
+                                    let _ = parser.optional_value();
+                                }
                                 Some(true) => {
                                     let v = value(&mut parser)?;
                                     op_flags.push(format!("{flag}={v}").into());
@@ -368,7 +387,9 @@ pub(crate) fn parse(
                             continue;
                         }
                         let Some(arity) = flag_arity(kind, &flag) else {
-                            return Err(unknown_flag(&flag));
+                            unknown.get_or_insert_with(|| unknown_flag(&flag));
+                            let _ = parser.optional_value();
+                            continue;
                         };
                         match arity {
                             Arity::Skip => {
@@ -424,6 +445,10 @@ pub(crate) fn parse(
         };
         return Ok((opts, Command::Help { path }));
     }
+    if let Some(e) = unknown {
+        return Err(e);
+    }
+    inputs.set_timeout(opts.timeout);
     let rest = pos.get(path_len..).unwrap_or_default();
     let ctx = Ctx {
         opts: &opts,
@@ -490,7 +515,7 @@ fn inline_json(raw: &str, flag: &str) -> Result<Value, ParseError> {
     parse_json(raw).map_err(|e| {
         ParseError {
             message: format!("{flag}: {}", e.message),
-            details: e.details,
+            ..e
         }
         .with("arg", flag)
     })
@@ -930,6 +955,86 @@ mod tests {
         );
         assert!(ok(&["ops", "list", "--help"]).0.help);
         assert!(err(&["--help=x"]).details.contains_key("arg"));
+    }
+
+    #[test]
+    fn help_wins_over_a_bad_flag_and_never_reads_stdin() {
+        let jira_search = Command::Help {
+            path: vec!["jira".into(), "search".into()],
+        };
+        for list in [
+            &["jira", "search", "--bogus", "--help"][..],
+            &["jira", "search", "--help", "--bogus"],
+            &["jira", "search", "--bogus=x", "--help"],
+            &["jira", "search", "-x", "--help"],
+        ] {
+            assert_eq!(ok(list).1, jira_search, "{list:?}");
+        }
+        // Without --help the same flag is still a usage error.
+        assert!(
+            err(&["jira", "search", "--bogus"])
+                .details
+                .contains_key("arg")
+        );
+        assert_eq!(
+            ok(&["call", "x", "--bogus", "--help"]).1,
+            Command::Help {
+                path: vec!["call".into()]
+            }
+        );
+        // A `-` source is not read when --help is asked for (NoRead panics on a read).
+        assert_eq!(
+            ok(&["script", "run", "-", "--help"]).1,
+            Command::Help {
+                path: vec!["script".into(), "run".into()]
+            }
+        );
+        assert_eq!(
+            ok(&["requests", "list", "--match-params-file", "-", "--help"]).1,
+            Command::Help {
+                path: vec!["requests".into(), "list".into()]
+            }
+        );
+        assert!(matches!(
+            ok(&[
+                "jira",
+                "issue",
+                "create",
+                "--description-file",
+                "-",
+                "--help"
+            ])
+            .1,
+            Command::Help { .. }
+        ));
+    }
+
+    /// A stdin that never produces a byte until it is dropped.
+    struct Blocked(std::sync::mpsc::Receiver<()>);
+
+    impl Read for Blocked {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn stdin_read_is_bounded_by_the_timeout() {
+        let (hold, rx) = std::sync::mpsc::channel::<()>();
+        let mut inputs = Inputs::new(Blocked(rx));
+        let started = std::time::Instant::now();
+        let e = match parse(
+            &args(&["script", "run", "-", "--timeout", "1"]),
+            &no_env,
+            &mut inputs,
+        ) {
+            Ok(_) => panic!("a stdin that never answers must hit the deadline"),
+            Err(e) => e,
+        };
+        assert!(e.deadline_expired, "{}", e.message);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        drop(hold);
     }
 
     #[test]

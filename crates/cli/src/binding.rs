@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::num::IntErrorKind;
 
 use atlas_duck_registry::{FlagKind, OperationSpec, all};
 use serde_json::{Map, Value};
@@ -103,6 +104,34 @@ fn flag_table(spec: &OperationSpec) -> Vec<Flag> {
     table
 }
 
+/// Help lines for the spellings the CLI adds to an op's registry flags: `--<positional>` (the
+/// positional as a flag), and the `--<flag>-file` / `--<param>-file` variants that read the value
+/// from a file or, for `-`, stdin. Generated from the same table that binds the flags.
+pub(crate) fn alias_help(spec: &OperationSpec) -> Vec<String> {
+    let mut lines = Vec::new();
+    for flag in flag_table(spec) {
+        let is_upload = flag.param == "content_base64" && spec.caps.upload_max_bytes.is_some();
+        let is_alias = spec.cli.positional == Some(flag.param)
+            && !spec.cli.flags.iter().any(|f| f.param == flag.param);
+        if is_alias {
+            lines.push(format!(
+                "{:<24} the positional <{}> as a flag",
+                flag.name, flag.param
+            ));
+        }
+        if !flag.file_names.is_empty() {
+            let spellings = flag.file_names.join(" or ");
+            let what = if is_upload {
+                "read the RAW bytes of a file (not base64 text) or `-` for stdin"
+            } else {
+                "read the value from a file, or `-` for stdin"
+            };
+            lines.push(format!("{spellings:<24} {what}"));
+        }
+    }
+    lines
+}
+
 /// `Some(true)` if `flag` (a long flag with its `--`) takes a value for `spec`, `Some(false)` if
 /// it is a plain switch, `None` if the op has no such flag.
 pub(crate) fn flag_takes_value(spec: &OperationSpec, flag: &str) -> Option<bool> {
@@ -131,7 +160,7 @@ fn unknown_flag(flag: &str) -> ParseError {
 fn invalid(e: ParseError, flag: &str) -> ParseError {
     ParseError {
         message: format!("{flag}: {}", e.message),
-        details: e.details,
+        ..e
     }
     .with("arg", flag)
 }
@@ -146,11 +175,29 @@ fn required_param(schema: &Value, param: &str) -> bool {
         .is_some_and(|r| r.iter().any(|v| v == param))
 }
 
+/// A whole number as written: digits with an optional leading `-` (no spaces, no `+`). Anything
+/// outside the signed 64-bit range is "out of range", not "not a number".
 fn parse_int(text: &str, flag: &str) -> Result<Value, ParseError> {
-    text.trim()
-        .parse::<i64>()
-        .map(Value::from)
-        .map_err(|_| ParseError::arg(format!("{flag} takes a whole number"), flag))
+    let plain = !text.starts_with('+') && text.trim() == text;
+    match text.parse::<i64>() {
+        Ok(n) if plain => Ok(Value::from(n)),
+        Err(e)
+            if plain
+                && matches!(
+                    e.kind(),
+                    IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
+                ) =>
+        {
+            Err(ParseError::arg(
+                format!("{flag} is out of range (a signed 64-bit whole number)"),
+                flag,
+            ))
+        }
+        _ => Err(ParseError::arg(
+            format!("{flag} takes a whole number (digits only, no spaces or +)"),
+            flag,
+        )),
+    }
 }
 
 fn csv_list(text: &str) -> Value {
@@ -424,7 +471,18 @@ fn resolve(
                             }
                         }
                     }
-                    other => from_text(other, as_int, name, &text)?,
+                    other => {
+                        // A file ends with a newline by habit; a number does not mind it.
+                        let numeric = other == FlagKind::Int || (other == FlagKind::Str && as_int);
+                        let text = if numeric {
+                            text.strip_suffix('\n')
+                                .map(|t| t.strip_suffix('\r').unwrap_or(t))
+                                .unwrap_or(&text)
+                        } else {
+                            &text
+                        };
+                        from_text(other, as_int, name, text)?
+                    }
                 }
             }
         }
@@ -860,6 +918,150 @@ mod tests {
         });
         assert!(v.is_ok());
         assert!(MAX_INPUT_BYTES > cap);
+    }
+
+    #[test]
+    fn integers_are_strict() {
+        assert_eq!(ok("jira.search", &["--max=-5", "p"])["max"], json!(-5));
+        assert_eq!(
+            ok("jira.search", &["--max", "9223372036854775807", "p"])["max"],
+            json!(i64::MAX)
+        );
+        for bad in [" 5", "5 ", "+5", "", "5.0", "0x5", "-", "--5"] {
+            let e = err("jira.search", &["--max", bad, "p"]);
+            assert!(e.message.contains("whole number"), "{bad:?}: {}", e.message);
+            assert_eq!(e.details["arg"], json!("--max"));
+        }
+        for big in [
+            "9223372036854775808",
+            "18446744073709551615",
+            "-9223372036854775809",
+        ] {
+            let e = err("jira.search", &["--max", big, "p"]);
+            assert!(e.message.contains("out of range"), "{big}: {}", e.message);
+        }
+        // A positional integer follows the same rule.
+        assert!(
+            err("jira.sprint.issues", &[" 4"])
+                .message
+                .contains("whole number")
+        );
+        assert!(
+            err("jira.sprint.issues", &["18446744073709551615"])
+                .message
+                .contains("out of range")
+        );
+    }
+
+    /// The content a `-file` of `kind` is written with, and the param value it must bind to.
+    fn file_case(kind: FlagKind, as_int: bool) -> (&'static [u8], Value) {
+        match kind {
+            FlagKind::Int => (b"42\n", json!(42)),
+            FlagKind::Str if as_int => (b"42\r\n", json!(42)),
+            FlagKind::Str => (b"some text", json!("some text")),
+            FlagKind::Json => (br#"{"a":1}"#, json!({"a":1})),
+            FlagKind::CsvList => (b"a, b,,c\n", json!(["a", "b", "c"])),
+            FlagKind::KeyJsonPairs => (br#"{"a":1}"#, json!({"a":1})),
+            FlagKind::Bool => (b"", Value::Null),
+        }
+    }
+
+    #[test]
+    fn every_file_variant_flag_reads_its_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut checked = 0;
+        for spec in all() {
+            let schema = spec.params_schema_json();
+            for flag in flag_table(spec) {
+                for file_name in &flag.file_names {
+                    let as_int = int_param(&schema, flag.param);
+                    let upload =
+                        flag.param == "content_base64" && spec.caps.upload_max_bytes.is_some();
+                    let (content, expected) = if upload {
+                        (&b"raw\x00bytes\xff"[..], json!(base64(b"raw\x00bytes\xff")))
+                    } else {
+                        file_case(flag.kind, as_int)
+                    };
+                    let path = dir.path().join("in.txt");
+                    std::fs::write(&path, content).expect("write");
+                    let mut tokens = vec![format!("{file_name}={}", path.display())];
+                    // Give the positional (when this flag is not it) so required checks pass.
+                    if let Some(p) = spec.cli.positional
+                        && p != flag.param
+                    {
+                        tokens.push("--".into());
+                        tokens.push(if int_param(&schema, p) { "7" } else { "x" }.into());
+                    }
+                    let rest: Vec<OsString> = tokens.iter().map(OsString::from).collect();
+                    let mut inputs = Inputs::new(NoRead);
+                    let got = bind(spec, &rest, &mut inputs)
+                        .unwrap_or_else(|e| panic!("{} {file_name}: {}", spec.id, e.message));
+                    assert_eq!(got[flag.param], expected, "{} {file_name}", spec.id);
+                    assert!(!inputs.dash_used);
+                    seen.insert(format!("{:?}", flag.kind));
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+        for kind in ["Json", "Str", "KeyJsonPairs"] {
+            assert!(
+                seen.contains(kind),
+                "no -file flag of kind {kind}: {seen:?}"
+            );
+        }
+    }
+
+    /// The registry has no Int or CsvList flag with a file variant today; the binder still
+    /// supports them, so exercise those kinds through a synthetic flag.
+    #[test]
+    fn int_and_csv_file_variants_bind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("in.txt");
+        let spec = spec("jira.search");
+        let schema = spec.params_schema_json();
+        let run = |kind: FlagKind, param: &'static str, content: &[u8]| {
+            std::fs::write(&path, content).expect("write");
+            let flag = Flag {
+                name: format!("--{param}"),
+                param,
+                kind,
+                file_names: vec![format!("--{param}-file")],
+            };
+            let mut params = Map::new();
+            let source = Source::File(path.to_string_lossy().into_owned());
+            let result = resolve(
+                spec,
+                &schema,
+                &flag,
+                source,
+                &mut Inputs::new(NoRead),
+                &mut params,
+                &mut None,
+            );
+            result.map(|()| params[param].clone())
+        };
+        assert_eq!(run(FlagKind::Int, "max", b"42\n").ok(), Some(json!(42)));
+        assert_eq!(run(FlagKind::Int, "max", b"42\r\n").ok(), Some(json!(42)));
+        assert_eq!(
+            run(FlagKind::CsvList, "fields", b"a, b,,c\n").ok(),
+            Some(json!(["a", "b", "c"]))
+        );
+        // Spaces around an integer in a file are refused like inline ones.
+        let e = run(FlagKind::Int, "max", b" 42").expect_err("space");
+        assert!(e.message.contains("whole number"));
+    }
+
+    #[test]
+    fn alias_help_documents_the_extra_spellings() {
+        let lines = alias_help(spec("confluence.attachment.upload")).join("\n");
+        assert!(lines.contains("--content-base64-file"), "{lines}");
+        assert!(lines.contains("RAW bytes"), "{lines}");
+        let lines = alias_help(spec("jira.issue.create")).join("\n");
+        assert!(lines.contains("--description-file"), "{lines}");
+        let lines = alias_help(spec("jira.search")).join("\n");
+        assert!(lines.contains("positional"), "{lines}");
     }
 
     #[test]

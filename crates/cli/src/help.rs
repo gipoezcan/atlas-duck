@@ -7,6 +7,7 @@ use std::fmt::Write;
 use atlas_duck_registry::{OperationSpec, all, describe};
 use serde_json::Value;
 
+use crate::binding::alias_help;
 use crate::local::describe_env;
 
 const GLOBAL_FLAGS: &str = "\
@@ -17,6 +18,11 @@ Global flags (accepted anywhere before `--`):
   --instance ALIAS     the Jira or Confluence instance to use
   --output json|text   json (default) is the agent contract; text renders data for people
   --help               show this help";
+
+/// JSON given on the command line or in a file is read by serde_json.
+const JSON_NOTE: &str = "JSON notes: an integer above 18446744073709551615 (u64::MAX) is rounded to a float, and when an
+object repeats a key the last one wins.
+";
 
 /// One generic (non-registry) command: its path, usage line and one-line summary.
 struct Generic {
@@ -154,6 +160,7 @@ fn op_detail(spec: &OperationSpec) -> String {
         })
         .collect();
     push_section(&mut out, "Flags", &flags);
+    push_section(&mut out, "Also accepted", &alias_help(spec));
     let _ = writeln!(out, "Example: {}", text(&d["examples"]["cli"]));
     let _ = writeln!(out, "Details: atlas-duck ops describe {}\n", spec.id);
     out.push_str(GLOBAL_FLAGS);
@@ -178,6 +185,13 @@ pub(crate) fn help_text(path: &[String]) -> Option<String> {
     if !generic.is_empty() {
         let lines: Vec<String> = generic.iter().map(|g| g.usage.to_owned()).collect();
         push_section(&mut out, "Usage", &lines);
+        if generic
+            .iter()
+            .any(|g| g.usage.contains("json") || g.usage.contains("-file"))
+        {
+            out.push_str(JSON_NOTE);
+            out.push('\n');
+        }
         out.push_str(GLOBAL_FLAGS);
         out.push('\n');
         return Some(out);
@@ -243,6 +257,15 @@ mod tests {
                 .unwrap_or_default()
                 .contains("ops describe")
         );
+    }
+
+    #[test]
+    fn op_help_lists_alias_spellings_and_json_notes() {
+        let text = help_text(&path(&["confluence", "attachment", "upload"])).unwrap_or_default();
+        assert!(text.contains("Also accepted"), "{text}");
+        assert!(text.contains("RAW bytes"), "{text}");
+        let text = help_text(&path(&["call"])).unwrap_or_default();
+        assert!(text.contains("last one wins"), "{text}");
     }
 
     #[test]

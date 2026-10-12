@@ -70,6 +70,8 @@ pub(crate) fn execute(
             Default::default(),
         ));
     }
+    // Reading stdin during parsing counts against `--timeout` (argv sets the limit).
+    inputs.set_start(start);
     let (opts, command) = match argv::parse(args, env, inputs) {
         Ok(parsed) => parsed,
         Err(e) => return failure(local::parse_error(e)),

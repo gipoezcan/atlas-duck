@@ -49,6 +49,16 @@ pub(crate) fn usage(message: &str, details: serde_json::Map<String, Value>) -> E
 }
 
 pub(crate) fn parse_error(e: ParseError) -> Envelope {
+    if e.deadline_expired {
+        // §4.1: the `--timeout` deadline ran out before submission; nothing was queued.
+        let mut env = Envelope::failed(ErrorCode::Unreachable, true, &e.message);
+        if let Some(err) = env.error.as_mut() {
+            let mut details = serde_json::Map::new();
+            details.insert("reason".into(), json!("launch_timeout"));
+            err.details = Some(details);
+        }
+        return env;
+    }
     usage(&e.message, e.details)
 }
 
