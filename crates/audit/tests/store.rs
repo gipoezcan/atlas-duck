@@ -1095,3 +1095,32 @@ fn shutdown_after_reads_leaves_no_wal_sidecars() {
         .expect("count");
     assert_eq!(n, 6);
 }
+
+/// The same when the last handle is dropped without `shutdown()`: `Drop` stops the store in
+/// the same order (reader first, writer last).
+#[test]
+fn drop_after_reads_without_shutdown_leaves_no_wal_sidecars() {
+    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    for i in 0..5u64 {
+        store
+            .append(ev(EventType::CONFIG_CHANGED, None, json!({ "i": i })))
+            .expect("append");
+    }
+    // The first read opens the read-only connection; the store is then dropped, not shut down.
+    assert_eq!(payload(&store, 1)["chain_id"], json!(f.chain_id));
+    drop(store);
+    let files = files_in(&f);
+    assert!(
+        !files
+            .iter()
+            .any(|n| n.ends_with("-wal") || n.ends_with("-shm")),
+        "{files:?}"
+    );
+    let copy = f.dir.path().join("copy.db");
+    std::fs::copy(f.db_path(), &copy).expect("copy audit.db only");
+    let n: i64 = rusqlite::Connection::open(&copy)
+        .expect("open copy")
+        .query_row("SELECT count(*) FROM events", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(n, 6);
+}

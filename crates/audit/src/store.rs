@@ -193,9 +193,13 @@ struct Inner {
 }
 
 impl Inner {
-    /// Stops the writer after the commands already queued, then the anchor thread; never
-    /// writes an anchor.
+    /// Closes the read-only reader, stops the writer after the commands already queued, then
+    /// the anchor thread; never writes an anchor. The reader closes first so the writer's close
+    /// is the last one on the database: only that close checkpoints the WAL and removes `-wal` /
+    /// `-shm` (a read-only connection closing last cannot). The reader lock is released before
+    /// the writer is joined (a restore on the writer thread holds it).
     fn stop(&self) {
+        *lock(&self.shared.reader) = None;
         if let Some(tx) = lock(&self.tx).take() {
             let _ = tx.send(Cmd::Shutdown);
         }
@@ -1107,11 +1111,8 @@ impl Store {
     /// Stops the writer after the commands already queued; later calls get `Closed`. Never
     /// writes an anchor.
     pub fn shutdown(&self) {
-        // The read-only reader closes first: the writer's close must be the last one on the
-        // database, because only that close checkpoints the WAL and removes `-wal` / `-shm`
-        // (a read-only connection closing last cannot). Closing it again afterwards covers a
-        // read that reopened it in between.
-        *lock(&self.inner.shared.reader) = None;
+        // `stop()` closes the reader before the writer; closing it again afterwards covers a
+        // read that reopened it in between (later reads get `Closed`).
         self.inner.stop();
         *lock(&self.inner.shared.reader) = None;
     }
