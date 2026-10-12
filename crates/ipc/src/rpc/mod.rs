@@ -229,20 +229,72 @@ impl Serialize for Incoming {
 /// The closed set of `details.reason` values a `protocol_error` carries (PD-28).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolReason {
+    /// The frame is not JSON.
+    Parse,
+    /// JSON, but not a JSON-RPC 2.0 request.
+    InvalidRequest,
     /// A method before `hello` on the connection (wording as the core's `MSG_HELLO_FIRST`).
     HelloRequired,
+    /// A second `hello` on the connection.
+    HelloRepeated,
+    /// A frame (in or out) above the 24 MiB cap.
+    FrameTooLarge,
+    UnknownMethod,
+    InvalidParams,
+    /// No `hello` frame within the deadline (§3.3: 5 s).
+    HelloTimeout,
 }
 
 impl ProtocolReason {
-    fn as_str(self) -> &'static str {
+    pub const ALL: [ProtocolReason; 8] = [
+        ProtocolReason::Parse,
+        ProtocolReason::InvalidRequest,
+        ProtocolReason::HelloRequired,
+        ProtocolReason::HelloRepeated,
+        ProtocolReason::FrameTooLarge,
+        ProtocolReason::UnknownMethod,
+        ProtocolReason::InvalidParams,
+        ProtocolReason::HelloTimeout,
+    ];
+
+    /// The `details.reason` string (also the PD-29 diagnostic `reason`).
+    pub fn as_str(self) -> &'static str {
         match self {
+            ProtocolReason::Parse => "parse",
+            ProtocolReason::InvalidRequest => "invalid_request",
             ProtocolReason::HelloRequired => "hello_required",
+            ProtocolReason::HelloRepeated => "hello_repeated",
+            ProtocolReason::FrameTooLarge => "frame_too_large",
+            ProtocolReason::UnknownMethod => "unknown_method",
+            ProtocolReason::InvalidParams => "invalid_params",
+            ProtocolReason::HelloTimeout => "hello_timeout",
+        }
+    }
+
+    /// The JSON-RPC error code this reason is answered with (PD-28).
+    pub fn code(self) -> i64 {
+        match self {
+            ProtocolReason::Parse => codes::PARSE,
+            ProtocolReason::UnknownMethod => codes::METHOD_NOT_FOUND,
+            ProtocolReason::InvalidParams => codes::INVALID_PARAMS,
+            ProtocolReason::InvalidRequest
+            | ProtocolReason::HelloRequired
+            | ProtocolReason::HelloRepeated
+            | ProtocolReason::FrameTooLarge
+            | ProtocolReason::HelloTimeout => codes::INVALID_REQUEST,
         }
     }
 
     fn message(self) -> &'static str {
         match self {
+            ProtocolReason::Parse => "the frame is not valid JSON",
+            ProtocolReason::InvalidRequest => "the frame is not a JSON-RPC 2.0 request",
             ProtocolReason::HelloRequired => "hello is required before any other method",
+            ProtocolReason::HelloRepeated => "hello was already sent on this connection",
+            ProtocolReason::FrameTooLarge => "the frame exceeds the 24 MiB limit",
+            ProtocolReason::UnknownMethod => "unknown method",
+            ProtocolReason::InvalidParams => "invalid params for the method",
+            ProtocolReason::HelloTimeout => "no hello within the deadline",
         }
     }
 }

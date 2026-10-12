@@ -139,6 +139,63 @@ fn error_carries_envelope() -> TestResult {
 }
 
 #[test]
+fn protocol_reasons_are_the_pd_28_closed_set() {
+    let table = [
+        (ProtocolReason::Parse, "parse", codes::PARSE),
+        (
+            ProtocolReason::InvalidRequest,
+            "invalid_request",
+            codes::INVALID_REQUEST,
+        ),
+        (
+            ProtocolReason::HelloRequired,
+            "hello_required",
+            codes::INVALID_REQUEST,
+        ),
+        (
+            ProtocolReason::HelloRepeated,
+            "hello_repeated",
+            codes::INVALID_REQUEST,
+        ),
+        (
+            ProtocolReason::FrameTooLarge,
+            "frame_too_large",
+            codes::INVALID_REQUEST,
+        ),
+        (
+            ProtocolReason::UnknownMethod,
+            "unknown_method",
+            codes::METHOD_NOT_FOUND,
+        ),
+        (
+            ProtocolReason::InvalidParams,
+            "invalid_params",
+            codes::INVALID_PARAMS,
+        ),
+        (
+            ProtocolReason::HelloTimeout,
+            "hello_timeout",
+            codes::INVALID_REQUEST,
+        ),
+    ];
+    assert_eq!(ProtocolReason::ALL.len(), table.len());
+    for (reason, name, code) in table {
+        assert!(ProtocolReason::ALL.contains(&reason), "{name} not in ALL");
+        assert_eq!(reason.as_str(), name);
+        assert_eq!(reason.code(), code, "{name}");
+        let env = protocol_error(reason);
+        let err = env.error.expect("error object");
+        assert_eq!(err.code, ErrorCode::ProtocolError);
+        assert!(!err.retryable, "{name}");
+        assert!(!err.message.is_empty(), "{name}");
+        assert_eq!(
+            err.details.and_then(|d| d.get("reason").cloned()),
+            Some(json!(name))
+        );
+    }
+}
+
+#[test]
 fn error_codes_are_pd_28() {
     assert_eq!(codes::PARSE, -32700);
     assert_eq!(codes::INVALID_REQUEST, -32600);

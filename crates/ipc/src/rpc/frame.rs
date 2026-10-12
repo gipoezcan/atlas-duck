@@ -11,11 +11,19 @@ pub use crate::sandbox::frame::FrameError;
 
 const HEADER_LEN: usize = 4;
 
+/// Body buffer allocated up front; beyond it the buffer grows with the bytes that arrive.
+const INITIAL_BODY_CAPACITY: usize = 64 * 1024;
+
 /// Reads one frame whose payload is at most `max` bytes (capped at [`MAX_FRAME_BYTES`]).
 ///
 /// `Ok(None)`: clean EOF before the first header byte. `TooLarge` is returned right after the
 /// 4-byte header, before any body byte is read or any body buffer is allocated. `Truncated`:
-/// EOF inside the header or the body.
+/// EOF inside the header or the body. The body buffer starts at `min(len, 64 KiB)` and grows
+/// with the bytes received, so an announced length costs nothing until the peer sends it.
+///
+/// Not cancel-safe: dropping the future mid-frame loses the bytes read so far and leaves the
+/// stream inside a frame. A caller that races it (`timeout`, `select!`) must stop reading that
+/// stream when the race is lost.
 pub async fn read_frame_async<R: AsyncRead + Unpin>(
     r: &mut R,
     max: usize,
@@ -37,14 +45,18 @@ pub async fn read_frame_async<R: AsyncRead + Unpin>(
         return Err(FrameError::TooLarge { len });
     }
     // `len <= MAX_FRAME_BYTES`, so the cast cannot truncate.
-    let mut body = vec![0u8; len as usize];
-    r.read_exact(&mut body).await.map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            FrameError::Truncated
-        } else {
-            FrameError::Io(e)
+    let mut body = Vec::with_capacity((len as usize).min(INITIAL_BODY_CAPACITY));
+    let mut limited = r.take(len);
+    loop {
+        match limited.read_to_end(&mut body).await {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(FrameError::Io(e)),
         }
-    })?;
+    }
+    if body.len() as u64 != len {
+        return Err(FrameError::Truncated);
+    }
     Ok(Some(body))
 }
 
