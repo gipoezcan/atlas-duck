@@ -61,6 +61,12 @@ rust:test:
     # M4 plan Task 26 (T26a): the cli_flows under Xvfb and a private session bus (no Node here: the
     # script checks for skipped tests and the pass-count minimum itself).
     - bash ci/cli-flows-linux.sh
+    # M4 plan Task 26 (T26b): the M4 suite with the test-only features, the app's startup tests and
+    # the S-02 launch-survival cases (GitLab sets CI=true; no sudo in this image, so no S-01
+    # other-user step; no second account on a container runner).
+    - cargo test -p atlas-duck-ipc --features test-paths --locked
+    - cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate
+    - bash ci/cli-flows-linux.sh --ignored s02_
   after_script:
     - pkill -x atlas-duck-app || true
 

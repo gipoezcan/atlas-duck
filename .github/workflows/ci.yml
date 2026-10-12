@@ -134,6 +134,55 @@ jobs:
       - name: M3 suite (atlassian + core, test-only features)
         run: cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked
 
+      # M4 plan Task 26 step 3. The ipc and cli suites (`--test server`, `--test client` and
+      # `--test endpoint` are among them), ipc again with `test-paths` (the PD-01 override tests of
+      # `endpoint.rs` are cfg(feature = "test-paths")), and the app's startup tests against the
+      # scripted-approver build (T19 `startup_ipc`, T21 `startup_gate`).
+      - name: M4 suite (ipc, cli, test-paths, app startup tests)
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-ipc -p atlas-duck-cli --locked
+          cargo test -p atlas-duck-ipc --features test-paths --locked
+          cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate
+
+      # T4 handoff, spec §15 V28: which socket dir the runner gets (`run_user` or `state_fallback`;
+      # ubuntu runners are expected to show state_fallback). The line is evidence for T27.
+      - name: M4 V28 socket dir choice (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-ipc --test endpoint --locked --features test-paths -- --nocapture v28_ 2>&1 | tee "$RUNNER_TEMP/v28.log"
+          grep -E 'V28 socket_dir=' "$RUNNER_TEMP/v28.log" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/v28.log" || { echo "::error::v28_ did not run exactly once"; exit 1; }
+
+      # T9 handoff: what a full unix-socket backlog answers to a non-blocking connect. Linux says
+      # EAGAIN (the client maps it to busy, exit 11); BSD/macOS may say ECONNREFUSED, which the CLI
+      # reads as "no app running" and then tries to launch a second one (contained by the launch
+      # lock and the single-instance check). Diagnostic only: never fails the job.
+      - name: Unix full-backlog probe (EAGAIN vs ECONNREFUSED, diagnostic)
+        if: runner.os != 'Windows'
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import errno, os, platform, socket, tempfile
+          d = tempfile.mkdtemp(prefix="bl", dir="/tmp")
+          path = os.path.join(d, "s")
+          srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+          srv.bind(path)
+          srv.listen(0)
+          clients, result = [], "never full after 64 connects"
+          for i in range(64):
+              c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+              c.setblocking(False)
+              try:
+                  c.connect(path)
+                  clients.append(c)
+              except OSError as e:
+                  result = "%s after %d queued connects" % (errno.errorcode.get(e.errno, e.errno), i)
+                  break
+          print("PROBE unix_backlog_full %s: %s" % (platform.system(), result))
+          PY
+
       # M4 plan Task 26 (early slice T26a). The flows spawn the real CLI and app binaries and only
       # run with ATLAS_DUCK_CLI_FLOWS=1; a skipped flow still counts as passed, so every leg
       # fails on any "skipped:" line and on a pass count below (listed - #[ignore]d).
@@ -230,6 +279,63 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-cli --locked -- --ignored --nocapture launch::windows
 
+      # M4 plan Task 26 step 3, spec §13 S-01 (Linux): another local user cannot reach the socket
+      # (dir 0700 gives EACCES) and, with the dir and socket opened up, the server rejects the uid
+      # and writes nothing. The test runs its own binary as `atlasduck-s01` through `sudo -n -u`.
+      # Without ATLAS_DUCK_TEST_OTHER_USER it prints "skipping s01_..." and passes, so the step
+      # fails on that line and requires exactly one test to pass. `--exact` keeps the helper
+      # `s01_other_user_probe` (also #[ignore]d, a no-op without its variables) out of the count.
+      - name: M4 S-01 other local user (Linux, second account, #[ignore]d)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo useradd -M -s /usr/sbin/nologin atlasduck-s01
+          # The other user must reach the test binary: every directory from / down to the build
+          # dir needs the execute bit for others (GitHub's /home/runner is 0750).
+          d="$PWD"
+          while [ "$d" != / ]; do sudo chmod o+x "$d"; d="$(dirname "$d")"; done
+          export ATLAS_DUCK_TEST_OTHER_USER=atlasduck-s01
+          cargo test -p atlas-duck-ipc --locked --test transport_unix -- --ignored --exact s01_other_user_connection_rejected --nocapture 2>&1 | tee "$RUNNER_TEMP/s01.log"
+          if grep -E 'skipping s01_' "$RUNNER_TEMP/s01.log"; then
+            echo "::error::S-01 other-user test skipped (ATLAS_DUCK_TEST_OTHER_USER not seen)"
+            exit 1
+          fi
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/s01.log" || { echo "::error::S-01 other-user test did not pass exactly once"; exit 1; }
+
+      - name: M4 S-01 cleanup (delete the throwaway user)
+        if: always() && runner.os == 'Linux'
+        run: sudo userdel atlasduck-s01 || true
+
+      # M4 plan Task 26 step 3, spec §15 V01 (Windows): a pipe DACL that grants the owner only must
+      # refuse a second local account (ERROR_ACCESS_DENIED). The test logs that account on with
+      # LogonUserW (interactive) and opens the pipe impersonating it. The account is created here
+      # (the runner user is an administrator), with a 14 character random password (net user asks
+      # for a confirmation above 14), masked in the log, and deleted by the always() step below.
+      - name: M4 V01 pipe DACL against a second local account (Windows, #[ignore]d)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $suffix = -join ((48..57 + 97..102) | Get-Random -Count 10 | ForEach-Object { [char]$_ })
+          $pw = "Aa1!$suffix"
+          Write-Host "::add-mask::$pw"
+          net user atlasduck-v01 $pw /add
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::net user /add failed ($LASTEXITCODE)"; exit 1 }
+          $env:ATLAS_DUCK_TEST_OTHER_USER = 'atlasduck-v01'
+          $env:ATLAS_DUCK_TEST_OTHER_PASSWORD = $pw
+          $log = Join-Path $env:RUNNER_TEMP 'v01.log'
+          cargo test -p atlas-duck-ipc --locked --test transport_windows -- --ignored --exact v01_other_user_open_denied --nocapture 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $log -Pattern 'V01 other_user_open=denied' -Quiet)) { Write-Host '::error::no V01 other_user_open=denied line'; exit 1 }
+          if (-not (Select-String -Path $log -Pattern 'test result: ok. 1 passed' -Quiet)) { Write-Host '::error::V01 other-user test did not pass exactly once'; exit 1 }
+
+      - name: M4 V01 cleanup (delete the throwaway account)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          net user atlasduck-v01 /delete 2>$null
+          exit 0
+
       # T25 (§13 S-02, V13): the #[ignore]d cli_flows cases that kill the CLI's process tree or
       # close its job object; they refuse to run without CI=true. Every test `--list --ignored
       # s02_` names must pass (check-no-skips with an empty ignored list) and none may skip.
@@ -259,7 +365,7 @@ jobs:
           cargo "${args[@]}" -- --list --ignored s02_ 2>/dev/null > "$RUNNER_TEMP/s02.list"
           : > "$RUNNER_TEMP/s02.none"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/s02.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
-          grep -E '^V13 ' "$RUNNER_TEMP/s02.log" || true
+          grep -E 'V13 ' "$RUNNER_TEMP/s02.log" || true
 
       - name: M4 S-02 launch survival (#[ignore]d, Windows; tree kill and job close)
         if: runner.os == 'Windows'
@@ -279,7 +385,7 @@ jobs:
           Set-Content -Path $none -Value '' -Encoding utf8
           node ci/check-no-skips.mjs $log $list $none
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Select-String -Path $log -Pattern '^V13 '
+          Select-String -Path $log -Pattern 'V13 '
 
       # T22 review: a flow that dies before World::drop can leave an app behind. CI only.
       - name: Kill stray atlas-duck-app processes (cli_flows)
@@ -581,6 +687,14 @@ jobs:
       - name: M3 suite x86_64-apple-darwin (atlassian + core, test-only features)
         run: cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --target x86_64-apple-darwin
 
+      # M4 plan Task 26 step 3: the same M4 suite as the native legs, x86_64 under Rosetta.
+      - name: M4 suite x86_64-apple-darwin (ipc, cli, test-paths, app startup tests)
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-ipc -p atlas-duck-cli --locked --target x86_64-apple-darwin
+          cargo test -p atlas-duck-ipc --features test-paths --locked --target x86_64-apple-darwin
+          cargo test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test startup_ipc --test startup_gate
+
       - name: Audit OS keychain tests (macOS login keychain, x86_64 under Rosetta)
         run: cargo test -p atlas-duck-audit --test os_keystore --locked --target x86_64-apple-darwin -- --ignored --test-threads=1 --nocapture
 
@@ -608,6 +722,20 @@ jobs:
             exit 1
           fi
           grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/os-keychain-smoke.log" || { echo "::error::os_keychain_smoke did not run exactly once"; exit 1; }
+
+      # M4 plan Task 26 step 3, T25: the S-02 launch-survival cases under Rosetta, as on the native leg.
+      - name: M4 S-02 launch survival x86_64-apple-darwin (#[ignore]d)
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+          CI: "true"
+        run: |
+          set -euo pipefail
+          args=(test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test cli_flows)
+          cargo "${args[@]}" -- --ignored s02_ --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/s02.log"
+          cargo "${args[@]}" -- --list --ignored s02_ 2>/dev/null > "$RUNNER_TEMP/s02.list"
+          : > "$RUNNER_TEMP/s02.none"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/s02.log" "$RUNNER_TEMP/s02.list" "$RUNNER_TEMP/s02.none"
+          grep -E 'V13 ' "$RUNNER_TEMP/s02.log" || true
 
       - name: Kill stray atlas-duck-app processes (cli_flows)
         if: always()
@@ -687,15 +815,14 @@ jobs:
             gnome-keyring \
             libsecret-tools
 
+      # Both OSes: the I-42/I-44 cli_flows build the app (and so need the UI).
       - name: Set up Node.js
-        if: runner.os == 'Linux'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
           package-manager-cache: false
 
       - name: Build the UI (tauri::generate_context! needs app/ui/dist)
-        if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           npm --prefix app/ui ci --ignore-scripts
@@ -772,6 +899,18 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test -p atlas-duck-app --test startup_gate --locked -- --nocapture network_mounts symlink_into
 
+      # M4 plan Task 26 step 4, spec §15 I-42 and I-44: the two #[ignore]d cli_flows (T24) against the
+      # NFS mount. The data dir on NFS makes the CLI answer not_configured {data_dir_not_local}
+      # without launching; the keyring dir on NFS makes doctor say keyring_local=false (the flow
+      # also checks the local case). ATLAS_DUCK_TEST_NFS_DIR comes from the mount step.
+      - name: M4 cli_flows I-42/I-44 against the NFS mount (Linux, #[ignore]d)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          export TMPDIR="$PWD/.ci-tmp"
+          bash ci/cli-flows-linux.sh --ignored i42_cli_data_dir_not_local_no_launch i44_doctor_keyring_local_false_on_nfs
+          grep -q 'test result: ok. 2 passed' "$TMPDIR/cli-flows.log" || { echo "::error::I-42/I-44 did not pass exactly twice"; exit 1; }
+
       # Drive mappings are per logon session, so mapping, subst and the
       # test run share one step.
       - name: Mapped, subst and UNC-symlink drives + locality tests (Windows)
@@ -802,6 +941,24 @@ jobs:
           $env:ATLAS_DUCK_TEST_UNC_SYMLINK = $link
           cargo test -p atlas-duck-ipc --test locality --locked -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # M4 plan Task 26 step 4, spec §15 I-42 (Windows): the data dir on the administrative share of
+      # the test home's own drive (\\localhost\C$\...) is not local: not_configured
+      # {data_dir_not_local}, nothing launched. Needs no mapped drive; the flow is `not applicable`
+      # (and the step fails) if the test cannot build the UNC path.
+      - name: M4 cli_flows I-42 against a UNC path (Windows, #[ignore]d)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $log = Join-Path $env:RUNNER_TEMP 'i42.log'
+          cargo test -p atlas-duck-app --features scripted-approver --locked --test cli_flows -- --ignored i42_cli_data_dir_not_local_no_launch --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path $log -Pattern '(^|\s)skipped: ' -Quiet) { Write-Host '::error::I-42 skipped'; exit 1 }
+          if (Select-String -Path $log -Pattern 'not applicable' -Quiet) { Write-Host '::error::I-42 not applicable on Windows'; exit 1 }
+          if (-not (Select-String -Path $log -Pattern 'test result: ok. 1 passed' -Quiet)) { Write-Host '::error::I-42 did not pass exactly once'; exit 1 }
 
   probe-evidence-fedora:
     name: probe-evidence-fedora (§9.4 probes on Fedora 40, glibc 2.39)
