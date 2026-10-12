@@ -8,6 +8,7 @@
 //! connects like any app command (the launch rules apply).
 
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use atlas_duck_ipc::build_info::{APP_VERSION, BUILD_ID};
@@ -24,7 +25,7 @@ use crate::argv::GlobalOpts;
 use crate::connected::{Connector, reach, short_call};
 use crate::deadline::Deadline;
 use crate::discover::{AppLocation, DataState, Discovery};
-use crate::interrupt::Never;
+use crate::interrupt::Interrupts;
 use crate::launch::{LaunchSys, OsLaunchSys};
 
 /// §4.7, verbatim.
@@ -117,13 +118,23 @@ pub(crate) fn keyring_local_for(xdg_data_home: Option<OsString>) -> Option<bool>
     if cfg!(windows) {
         return None;
     }
-    let dirs = keyring_dirs_for(
-        atlas_duck_ipc::paths::keyring::DirsOs::CURRENT,
-        xdg_data_home,
-        &|| base_dirs().map(|b| b.home),
+    keyring_answer(
+        keyring_dirs_for(
+            atlas_duck_ipc::paths::keyring::DirsOs::CURRENT,
+            xdg_data_home,
+            &|| base_dirs().map(|b| b.home),
+        ),
+        &keyring_locality,
     )
-    .ok()?;
-    match keyring_locality(&dirs) {
+}
+
+/// The mapping of `keyring_local_for`, with the dirs and the locality check injected.
+fn keyring_answer(
+    dirs: io::Result<Vec<PathBuf>>,
+    locality: &dyn Fn(&[PathBuf]) -> KeyringLocality,
+) -> Option<bool> {
+    let dirs = dirs.ok()?;
+    match locality(&dirs) {
         KeyringLocality::Local => Some(true),
         KeyringLocality::NotLocal { .. } => Some(false),
         KeyringLocality::Unknown { .. } => None,
@@ -160,12 +171,15 @@ fn shown(p: &Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
 }
 
-/// §4.7 install mode of the located app (the table in the Task 17 brief).
+/// §4.7 install mode of the located app (the table in the Task 17 brief). `program_files` are the
+/// `%ProgramFiles%` roots (a `Program Files` directory elsewhere, say under a user profile, is not
+/// a per-machine install).
 pub(crate) fn install_mode(
     os: Os,
     app: Option<&Path>,
     appimage: Option<&OsStr>,
     local_app_data: Option<&Path>,
+    program_files: &[PathBuf],
 ) -> &'static str {
     let Some(app) = app else {
         return "dev";
@@ -178,10 +192,11 @@ pub(crate) fn install_mode(
                 .is_some_and(|prefix| n.starts_with(&prefix));
             if per_user {
                 "windows_per_user"
-            } else if n
-                .split('/')
-                .any(|s| s == "program files" || s == "program files (x86)")
-            {
+            } else if program_files.iter().any(|pf| {
+                let root = normalized(pf);
+                let root = root.trim_end_matches('/');
+                !root.is_empty() && n.starts_with(&format!("{root}/"))
+            }) {
                 "windows_per_machine"
             } else {
                 "dev"
@@ -216,9 +231,12 @@ pub(crate) fn on_path(path: Option<&OsStr>, exe: Option<&Path>) -> bool {
     std::env::split_paths(path)
         .filter(|dir| dir.is_absolute())
         .any(|dir| {
-            let same_dir = dir
-                .canonicalize()
-                .is_ok_and(|c| Some(c.as_path()) == own_dir);
+            // The Unix symlink layout puts the real binary (`atlas-duck-app`) next to nothing named
+            // `atlas-duck`: the dir alone proves nothing.
+            let same_dir = dir.join(CLI_FILE_NAME).exists()
+                && dir
+                    .canonicalize()
+                    .is_ok_and(|c| Some(c.as_path()) == own_dir);
             same_dir
                 || dir
                     .join(CLI_FILE_NAME)
@@ -271,6 +289,10 @@ pub(crate) fn local_checks(d: &Discovery, sys: &dyn DoctorSys) -> Map<String, Va
     let exe = sys.exe();
     let local_app_data = sys.env("LOCALAPPDATA").map(PathBuf::from);
     let appimage = sys.env("APPIMAGE");
+    let program_files: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .filter_map(|k| sys.env(k).map(PathBuf::from))
+        .collect();
 
     let mut m = Map::new();
     m.insert("cli_version".to_owned(), json!(APP_VERSION));
@@ -281,7 +303,8 @@ pub(crate) fn local_checks(d: &Discovery, sys: &dyn DoctorSys) -> Map<String, Va
             Os::CURRENT,
             app,
             appimage.as_deref(),
-            local_app_data.as_deref()
+            local_app_data.as_deref(),
+            &program_files
         )),
     );
     m.insert("app_path".to_owned(), text(app.map(shown)));
@@ -379,7 +402,9 @@ pub(crate) async fn execute_with(
 ) -> Envelope {
     let d = connector.discover();
     let local = local_checks(&d, sys);
-    merge(local, app_answer(&d, opts, deadline, connector).await)
+    // Registered before connecting, like every command that may launch the app and wait.
+    let intr = connector.interrupts();
+    merge(local, app_answer(&d, opts, deadline, connector, intr).await)
 }
 
 /// The app's `doctor` data, or the envelope that says why there is none.
@@ -388,11 +413,14 @@ async fn app_answer(
     opts: &GlobalOpts,
     deadline: &Deadline,
     connector: &dyn Connector,
+    mut intr: Box<dyn Interrupts>,
 ) -> Result<Value, Box<Envelope>> {
     if let DataState::Refused(env) = &d.data {
         return Err(env.clone());
     }
-    let mut client = reach(connector, opts, deadline, &mut Never).await?;
+    let mut client = reach(connector, opts, deadline, &mut *intr).await?;
+    // The short call has no interrupt handling: release the handlers so Ctrl-C keeps its default.
+    drop(intr);
     let env = short_call(&mut client, method::DOCTOR, EmptyParams {}, deadline).await;
     match (env.status, env.data.clone()) {
         (Status::Succeeded, Some(data)) => Ok(data),

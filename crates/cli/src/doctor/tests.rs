@@ -32,6 +32,8 @@ const KEYS: [&str; 15] = [
 struct FakeSys {
     wsl: Option<bool>,
     pinned: Option<PathBuf>,
+    keyring: Option<bool>,
+    breakaway: Option<bool>,
 }
 
 impl FakeSys {
@@ -39,6 +41,8 @@ impl FakeSys {
         FakeSys {
             wsl: None,
             pinned: None,
+            keyring: None,
+            breakaway: None,
         }
     }
 }
@@ -60,10 +64,10 @@ impl DoctorSys for FakeSys {
         true
     }
     fn keyring_local(&self) -> Option<bool> {
-        None
+        self.keyring
     }
     fn job_blocks_breakaway(&self) -> Option<bool> {
-        None
+        self.breakaway
     }
     fn wsl(&self) -> Option<bool> {
         self.wsl
@@ -160,6 +164,19 @@ fn doctor_local_fields_shape() {
     assert_eq!(m["keyring_local"], Value::Null);
     assert_eq!(m["job_blocks_breakaway"], Value::Null);
     assert_eq!(m["wsl"], Value::Null);
+    // The tri-state maps one to one: Some(true) true, Some(false) false, None null.
+    for (answer, want) in [
+        (Some(true), json!(true)),
+        (Some(false), json!(false)),
+        (None, Value::Null),
+    ] {
+        let mut sys = FakeSys::new();
+        sys.keyring = answer;
+        sys.breakaway = answer;
+        let m = local_checks(&d, &sys);
+        assert_eq!(m["keyring_local"], want);
+        assert_eq!(m["job_blocks_breakaway"], want);
+    }
     // wsl false: no warning; wsl true: the §4.7 text, verbatim.
     let mut sys = FakeSys::new();
     sys.wsl = Some(false);
@@ -280,7 +297,12 @@ fn install_mode_table() {
     let p = Path::new;
     let none: Option<&OsStr> = None;
     let lad = Some(p(r"C:\Users\x\AppData\Local"));
-    let win = |app: &str, lad: Option<&Path>| install_mode(Os::Windows, Some(p(app)), none, lad);
+    let pf = [
+        PathBuf::from(r"C:\Program Files"),
+        PathBuf::from(r"C:\Program Files (x86)"),
+    ];
+    let win =
+        |app: &str, lad: Option<&Path>| install_mode(Os::Windows, Some(p(app)), none, lad, &pf);
     assert_eq!(
         win(
             r"C:\Users\x\AppData\Local\Programs\atlas-duck\atlas-duck-app.exe",
@@ -305,8 +327,22 @@ fn install_mode_table() {
         "windows_per_machine"
     );
     assert_eq!(win(r"C:\src\target\debug\a.exe", lad), "dev");
+    // Case-insensitive, with the verbatim prefix.
+    assert_eq!(
+        win(r"\\?\c:\PROGRAM FILES\atlas-duck\a.exe", None),
+        "windows_per_machine"
+    );
+    // A `Program Files` directory that is not the `%ProgramFiles%` root is not per-machine.
+    assert_eq!(
+        win(r"C:\Users\x\Program Files\atlas-duck\a.exe", lad),
+        "dev"
+    );
+    assert_eq!(win(r"C:\Program Filesx\a.exe", lad), "dev");
+    // Without the env roots nothing is per-machine.
+    let app = p(r"C:\Program Files\atlas-duck\a.exe");
+    assert_eq!(install_mode(Os::Windows, Some(app), none, None, &[]), "dev");
 
-    let mac = |app: &str| install_mode(Os::Macos, Some(p(app)), none, None);
+    let mac = |app: &str| install_mode(Os::Macos, Some(p(app)), none, None, &[]);
     assert_eq!(
         mac("/Applications/atlas-duck.app/Contents/MacOS/atlas-duck-app"),
         "macos_bundle"
@@ -314,7 +350,8 @@ fn install_mode_table() {
     assert_eq!(mac("/Users/x/src/target/debug/a"), "dev");
 
     let image = OsStr::new("/home/x/atlas-duck.AppImage");
-    let lin = |app: &str, image: Option<&OsStr>| install_mode(Os::Linux, Some(p(app)), image, None);
+    let lin =
+        |app: &str, image: Option<&OsStr>| install_mode(Os::Linux, Some(p(app)), image, None, &[]);
     assert_eq!(lin("/home/x/atlas-duck.AppImage", Some(image)), "appimage");
     // $APPIMAGE naming some other file does not make this one an AppImage.
     assert_eq!(lin("/usr/bin/atlas-duck-app", Some(image)), "linux_package");
@@ -322,7 +359,7 @@ fn install_mode_table() {
     assert_eq!(lin("/opt/atlas-duck/atlas-duck-app", None), "linux_package");
     assert_eq!(lin("/usr/binx/a", None), "dev");
     assert_eq!(lin("/home/x/a", None), "dev");
-    assert_eq!(install_mode(Os::Linux, None, none, None), "dev");
+    assert_eq!(install_mode(Os::Linux, None, none, None, &[]), "dev");
 }
 
 #[test]
@@ -349,6 +386,21 @@ fn on_path_checks_dir_and_executable() {
 
 #[cfg(unix)]
 #[test]
+fn on_path_needs_the_cli_file_in_its_own_dir() {
+    // The symlink layout: the real binary is `atlas-duck-app` and `atlas-duck` lives elsewhere.
+    // Its own dir on PATH is not the CLI on PATH.
+    let tmp = tempfile::tempdir().unwrap();
+    let real = tmp.path().join("app");
+    std::fs::create_dir(&real).unwrap();
+    let exe = real.join("atlas-duck-app");
+    std::fs::write(&exe, b"x").unwrap();
+    let exe = exe.canonicalize().unwrap();
+    let path = std::env::join_paths([real]).unwrap();
+    assert!(!on_path(Some(&path), Some(&exe)));
+}
+
+#[cfg(unix)]
+#[test]
 fn on_path_follows_a_symlink_to_the_cli() {
     let tmp = tempfile::tempdir().unwrap();
     let real = tmp.path().join("app");
@@ -365,12 +417,31 @@ fn on_path_follows_a_symlink_to_the_cli() {
 
 #[cfg(unix)]
 #[test]
-fn keyring_local_follows_xdg_data_home() {
+fn keyring_local_for_never_reports_a_local_disk_as_remote() {
+    // The passwd-home variant (Linux) and the overlay checks depend on the runner, so only the
+    // one wrong answer is excluded here; `keyring_answer_arms` pins the arms.
     let tmp = tempfile::tempdir().unwrap();
     let xdg = tmp.path().join("xdg");
-    // A local disk (the NFS case is Task 24's ignored test). Linux also checks the passwd-home
-    // variant, which is local on any CI runner.
-    assert_eq!(keyring_local_for(Some(xdg.into_os_string())), Some(true));
+    assert_ne!(keyring_local_for(Some(xdg.into_os_string())), Some(false));
+}
+
+#[test]
+fn keyring_answer_arms() {
+    let dirs = || Ok(vec![PathBuf::from("/k")]);
+    let answer =
+        |d: io::Result<Vec<PathBuf>>, l: KeyringLocality| keyring_answer(d, &|_| l.clone());
+    assert_eq!(answer(dirs(), KeyringLocality::Local), Some(true));
+    let not_local = KeyringLocality::NotLocal {
+        dir: PathBuf::from("/k"),
+    };
+    assert_eq!(answer(dirs(), not_local), Some(false));
+    let unknown = KeyringLocality::Unknown {
+        reason: "x".to_owned(),
+    };
+    assert_eq!(answer(dirs(), unknown), None);
+    // Dirs that could not be resolved never answer true, whatever the check would say.
+    let err = io::Error::other("no home");
+    assert_eq!(keyring_answer(Err(err), &|_| KeyringLocality::Local), None);
 }
 
 #[test]
@@ -395,4 +466,34 @@ fn doctor_output_has_no_url_or_user() {
             .unwrap()
             .contains("://")
     );
+}
+
+#[tokio::test]
+async fn doctor_interrupt_during_launch_is_handled_and_exits_0() {
+    // Ctrl-C while the launch poll waits: the poll ends at once, the local checks still print.
+    let mut inner = TestConnector::failing(|| ConnectError::ServerIdentity);
+    inner.present = false;
+    let interrupt = inner.interrupt.clone();
+    let tmp = tempfile::tempdir().unwrap();
+    let c = Wrapped {
+        inner,
+        discovery: discovery(
+            DataState::Local(local(tmp.path())),
+            AppLocation::Found(PathBuf::from("app")),
+        ),
+    };
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        interrupt.notify_one();
+    });
+    let started = Instant::now();
+    let env = execute_with(&opts(), &within(1_500), &c, &FakeSys::new()).await;
+    assert!(started.elapsed() < Duration::from_millis(1_200));
+    assert_eq!(env.status, Status::Succeeded);
+    assert_eq!(exit_for(&Command::Doctor, &env), 0);
+    assert_eq!(c.inner.connect_count(), 0);
+    let data = data_obj(&env);
+    assert_eq!(data["app"], Value::Null);
+    assert_eq!(data["app_unavailable"]["reason"], json!("launch_timeout"));
+    assert!(data["local"].is_object());
 }
