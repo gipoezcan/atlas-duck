@@ -17,8 +17,6 @@ pub(crate) struct Deadline {
     pub total: Option<Duration>,
 }
 
-// Task 16 (connected commands) is the first non-test caller of everything below.
-#[allow(dead_code)]
 impl Deadline {
     pub(crate) fn new(start: Instant, total: Option<Duration>) -> Deadline {
         Deadline { start, total }

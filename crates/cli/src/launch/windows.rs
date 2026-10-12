@@ -179,6 +179,8 @@ pub(crate) fn via_shell_parent(target: &Target) -> Result<u32, ShellError> {
 }
 
 /// Why the shell-parent path was not taken.
+// The cause in `Io` is kept for Debug output.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum ShellError {
     /// `GetShellWindow` returned none (no shell in this session, e.g. a service or CI runner).
@@ -358,6 +360,7 @@ impl ParentAttribute {
         self.buf.as_mut_ptr().cast()
     }
 
+    #[cfg(test)]
     pub(crate) fn attributes(&self) -> &[usize] {
         &self.attributes
     }
@@ -405,6 +408,8 @@ pub(crate) fn create_spec(
 /// A created process; both handles are closed on drop.
 pub(crate) struct Child {
     pub process: OwnedHandle,
+    /// Held so the handle closes on drop.
+    #[allow(dead_code)]
     pub thread: OwnedHandle,
     pub pid: u32,
 }
@@ -571,6 +576,8 @@ fn stub_error(e: io::Error, breakaway: Breakaway) -> LaunchError {
 
 /// `doctor` (§4.7): `Some(true)` when this process is in a job that allows no breakaway, so a cold
 /// start depends on the shell-parent path; `None` when the query failed.
+// Task 17 (`doctor`) is the caller.
+#[allow(dead_code)]
 pub(crate) fn job_blocks_breakaway() -> Option<bool> {
     job_breakaway().blocks()
 }

@@ -1,5 +1,7 @@
 //! What the Unix launcher executes (PD-23), as data: the program and its arguments after `argv[0]`.
 //! Kept free of OS calls so every variant is tested on every host.
+// Only the Unix launcher consumes it; other hosts compile it for the tests.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

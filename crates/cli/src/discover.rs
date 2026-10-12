@@ -4,8 +4,6 @@
 //! The CLI never creates a directory or a file here. A data dir that is missing or not local is
 //! refused with `not_configured` (exit 9) and nothing is launched (I-42); an app that cannot be
 //! located is `unreachable {not_running}` (exit 5). Task 16 consumes `Discovery`.
-// Task 16 is the first caller.
-#![allow(dead_code)]
 
 use std::ffi::OsString;
 use std::io;

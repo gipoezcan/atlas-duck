@@ -7,9 +7,6 @@
 //! Windows) and the endpoint (before first run: this host's pinned file, PD-04) is polled every
 //! 100 ms for `min(20 s, remaining deadline)`. The function blocks (it sleeps between polls), so an
 //! async caller runs it on a blocking thread.
-// Task 16 is the first caller.
-#![allow(dead_code)]
-
 pub(crate) mod env;
 mod lock;
 pub(crate) mod plan;
@@ -58,6 +55,9 @@ pub(crate) const MSG_LAUNCH_FAILED: &str =
     "the atlas-duck app could not be started: start atlas-duck from the desktop";
 
 /// Why starting the app failed.
+// The causes in `Io`/`ChildFailed` are kept for Debug output; `Unsupported` is built only on hosts
+// that are neither Unix nor Windows.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum LaunchError {
     /// A path, argument or environment entry the OS cannot take (embedded NUL, `=` in a name).
@@ -140,7 +140,7 @@ fn with_reason(mut env: Envelope, reason: &str) -> Envelope {
     env
 }
 
-fn unreachable(reason: &str, message: &str) -> Box<Envelope> {
+pub(crate) fn unreachable(reason: &str, message: &str) -> Box<Envelope> {
     Box::new(with_reason(
         Envelope::failed(ErrorCode::Unreachable, true, message),
         reason,

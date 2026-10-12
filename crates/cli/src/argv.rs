@@ -5,6 +5,7 @@
 
 use std::ffi::{OsStr, OsString};
 
+use atlas_duck_ipc::proto::AgentNameSource;
 use atlas_duck_registry::OperationSpec;
 use serde_json::{Map, Value, json};
 
@@ -18,11 +19,12 @@ pub(crate) enum OutputMode {
 }
 
 /// The §4.1 global flags. `agent` already includes the `ATLAS_DUCK_AGENT` fallback.
-// Task 16 (connected commands) reads `agent` and `reason`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GlobalOpts {
     pub agent: Option<String>,
+    /// Where `agent` came from (the hello's `agent_name_source`): `--agent`, the environment
+    /// fallback, or nowhere.
+    pub agent_source: AgentNameSource,
     pub reason: Option<String>,
     /// Seconds; `None` = default, `Some(0)` = submit and return pending.
     pub timeout: Option<u64>,
@@ -39,16 +41,12 @@ pub(crate) struct MatchParams {
     pub instance: Option<String>,
 }
 
-// Task 16 (connected commands) sends it.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DryRun {
     Full,
     Sparse,
 }
 
-// Task 16 (connected commands) reads the fields.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Command {
     Help {
@@ -302,6 +300,7 @@ pub(crate) fn parse(
     check_utf8(args)?;
     let mut opts = GlobalOpts {
         agent: None,
+        agent_source: AgentNameSource::None,
         reason: None,
         timeout: None,
         instance: None,
@@ -339,6 +338,7 @@ pub(crate) fn parse(
                         let v = value(&mut parser)?;
                         set_once(&mut agent_flag, &flag, v.clone())?;
                         opts.agent = Some(v);
+                        opts.agent_source = AgentNameSource::Flag;
                     }
                     "reason" => set_once(&mut opts.reason, &flag, value(&mut parser)?)?,
                     "instance" => set_once(&mut opts.instance, &flag, value(&mut parser)?)?,
@@ -435,6 +435,9 @@ pub(crate) fn parse(
             .transpose()
             .map_err(|_| ParseError::new("ATLAS_DUCK_AGENT is not valid UTF-8"))?
             .filter(|s| !s.is_empty());
+        if opts.agent.is_some() {
+            opts.agent_source = AgentNameSource::Env;
+        }
     }
     let (kind, path_len) = classify(&pos);
     if opts.help {
@@ -887,6 +890,22 @@ mod tests {
         );
         let (o, _) = ok_env(&["--agent", "flag", "instances"], &env);
         assert_eq!(o.agent.as_deref(), Some("flag"));
+    }
+
+    #[test]
+    fn agent_source_follows_where_the_name_came_from() {
+        let env = |k: &str| (k == "ATLAS_DUCK_AGENT").then(|| OsString::from("from-env"));
+        let source =
+            |args: &[&str], e: &dyn Fn(&str) -> Option<OsString>| ok_env(args, e).0.agent_source;
+        assert_eq!(source(&["instances"], &env), AgentNameSource::Env);
+        assert_eq!(
+            source(&["--agent", "flag", "instances"], &env),
+            AgentNameSource::Flag
+        );
+        assert_eq!(source(&["instances"], &|_| None), AgentNameSource::None);
+        // An empty environment value is no name at all.
+        let empty = |k: &str| (k == "ATLAS_DUCK_AGENT").then(|| OsString::from(""));
+        assert_eq!(source(&["instances"], &empty), AgentNameSource::None);
     }
 
     #[test]

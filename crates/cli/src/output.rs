@@ -7,18 +7,10 @@
 use std::io::{self, Write};
 
 use atlas_duck_ipc::envelope::{Envelope, exit};
-use atlas_duck_ipc::proto::exit_code;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::argv::{GlobalOpts, OutputMode};
-
-/// Prints `env` and returns the generic matrix exit code (or 4 when stdout is unwritable).
-// Task 16 (connected commands) uses `emit`; local commands go through `emit_with_exit`.
-#[allow(dead_code)]
-pub(crate) fn emit(env: &Envelope, opts: &GlobalOpts) -> i32 {
-    emit_with_exit(env, opts, exit_code(env))
-}
 
 /// Prints `env` and returns `exit`, unless stdout cannot be written: then `exit::PENDING` (4).
 pub(crate) fn emit_with_exit(env: &Envelope, opts: &GlobalOpts, exit: i32) -> i32 {
@@ -87,8 +79,6 @@ fn render_text(env: &Envelope) -> String {
 
 /// §4.1 submission notice (PD-19): one flushed stderr line, written right after the server
 /// accepted the request and before any wait.
-// Task 16 writes it after the submit reply.
-#[allow(dead_code)]
 pub(crate) fn write_notice(request_id: &str, params_sha256: Option<&str>) -> io::Result<()> {
     write_notice_to(&mut io::stderr().lock(), request_id, params_sha256)
 }
@@ -101,7 +91,6 @@ struct Notice<'a> {
     status: &'static str,
 }
 
-#[allow(dead_code)]
 pub(crate) fn write_notice_to(
     w: &mut dyn Write,
     request_id: &str,
@@ -121,6 +110,7 @@ pub(crate) fn write_notice_to(
 #[cfg(test)]
 mod tests {
     use atlas_duck_ipc::envelope::{ErrorCode, Status};
+    use atlas_duck_ipc::proto::AgentNameSource;
     use serde_json::json;
 
     use super::*;
@@ -128,6 +118,7 @@ mod tests {
     fn opts(output: OutputMode) -> GlobalOpts {
         GlobalOpts {
             agent: None,
+            agent_source: AgentNameSource::None,
             reason: None,
             timeout: None,
             instance: None,

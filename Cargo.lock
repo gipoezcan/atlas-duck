@@ -429,6 +429,7 @@ dependencies = [
 name = "atlas-duck-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "atlas-duck-ipc",
  "atlas-duck-registry",
  "lexopt",

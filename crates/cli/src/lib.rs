@@ -5,8 +5,8 @@
 //!
 //! Local commands (argv errors, `--help`, `ops list`/`ops describe` without `--instance`,
 //! `mcp`/`verify-export` in this build) are answered here and never connect to the app or build
-//! the tokio runtime (§4.1 "Local parsing"). Connected commands go through a `Connector` (Task 16
-//! provides the real one).
+//! the tokio runtime (§4.1 "Local parsing"). Connected commands (`connected`) build a current-thread
+//! runtime of their own and reach the app through a `Connector`.
 
 // §4.7: the launched app's test-only environment names exist only in test builds; a release build
 // must never carry them.
@@ -16,44 +16,30 @@ compile_error!("test-env must never reach a release build");
 mod argv;
 mod binding;
 mod busy;
+mod connected;
 mod deadline;
 mod discover;
 mod exit;
 mod help;
 mod input;
+mod interrupt;
 mod launch;
 mod local;
 mod output;
+#[cfg(test)]
+mod test_support;
 
 use std::ffi::OsString;
 use std::time::Instant;
 
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
+use atlas_duck_ipc::proto::AgentNameSource;
 
 use crate::argv::{Command, GlobalOpts, OutputMode};
+use crate::connected::{Connector, OsConnector};
 use crate::deadline::Deadline;
 use crate::input::Inputs;
-
-/// How a connected command reaches the app. Task 16 replaces this placeholder with the real
-/// connect/launch/hello sequence (and the async calls that follow); local commands never see it.
-pub(crate) trait Connector {
-    /// Connects within `deadline`; the envelope is the failure to print.
-    fn connect(&self, deadline: &Deadline) -> Result<(), Box<Envelope>>;
-}
-
-/// Until Task 16: every connected command fails with `internal`.
-struct Unwired;
-
-impl Connector for Unwired {
-    fn connect(&self, _deadline: &Deadline) -> Result<(), Box<Envelope>> {
-        Err(Box::new(Envelope::failed(
-            ErrorCode::Internal,
-            false,
-            "connected commands are not available in this build yet",
-        )))
-    }
-}
 
 /// What a run prints and returns.
 pub(crate) struct Outcome {
@@ -85,7 +71,7 @@ pub(crate) fn execute(
             instance: None,
         } => local::ops_describe(op_id),
         Command::NotInThisBuild(name) => local::not_in_this_build(name),
-        _ => execute_connected(&deadline, connector),
+        _ => execute_connected(&command, &opts, &deadline, connector),
     };
     let exit = exit::exit_for(&command, &envelope);
     Outcome {
@@ -102,6 +88,7 @@ fn failure(env: Envelope) -> Outcome {
         env,
         opts: GlobalOpts {
             agent: None,
+            agent_source: AgentNameSource::None,
             reason: None,
             timeout: None,
             instance: None,
@@ -112,16 +99,30 @@ fn failure(env: Envelope) -> Outcome {
     }
 }
 
-fn execute_connected(deadline: &Deadline, connector: &dyn Connector) -> Envelope {
-    match connector.connect(deadline) {
-        Err(env) => *env,
-        // Task 16 submits / awaits / lists here.
-        Ok(()) => Envelope::failed(
-            ErrorCode::Internal,
-            false,
-            "connected commands are not available in this build yet",
-        ),
-    }
+/// Runs a connected command on a runtime built for it (local commands never get here).
+fn execute_connected(
+    command: &Command,
+    opts: &GlobalOpts,
+    deadline: &Deadline,
+    connector: &dyn Connector,
+) -> Envelope {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => {
+            return Envelope::failed(
+                ErrorCode::Internal,
+                false,
+                "the async runtime did not start",
+            );
+        }
+    };
+    let envelope = runtime.block_on(connected::execute(command, opts, deadline, connector));
+    // An interrupted launch may leave its blocking thread polling: do not wait for it.
+    runtime.shutdown_background();
+    envelope
 }
 
 /// Runs the CLI. `args` excludes the program name (and, under the app's `__cli` dispatch, the
@@ -143,35 +144,27 @@ pub fn run(args: Vec<OsString>) -> i32 {
         &args,
         &|k| std::env::var_os(k),
         &mut Inputs::process(),
-        &Unwired,
+        &OsConnector,
     );
     output::emit_with_exit(&outcome.env, &outcome.opts, outcome.exit)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
+    use atlas_duck_ipc::client::ConnectError;
     use atlas_duck_ipc::envelope::Status;
     use serde_json::Value;
 
     use super::*;
+    use crate::test_support::TestConnector;
 
-    struct Recording(Cell<u32>);
-
-    impl Connector for Recording {
-        fn connect(&self, _deadline: &Deadline) -> Result<(), Box<Envelope>> {
-            self.0.set(self.0.get() + 1);
-            Err(Box::new(Envelope::failed(
-                ErrorCode::Unreachable,
-                false,
-                "double",
-            )))
-        }
+    /// A connector whose connect fails with `server_identity` (exit 5) and counts the attempts.
+    fn double() -> TestConnector {
+        TestConnector::failing(|| ConnectError::ServerIdentity)
     }
 
-    fn go(list: &[&str]) -> (Outcome, u32) {
-        let connector = Recording(Cell::new(0));
+    fn go(list: &[&str]) -> (Outcome, usize) {
+        let connector = double();
         let args: Vec<OsString> = list.iter().map(OsString::from).collect();
         let outcome = execute(
             Instant::now(),
@@ -180,7 +173,7 @@ mod tests {
             &mut Inputs::new(std::io::empty()),
             &connector,
         );
-        (outcome, connector.0.get())
+        (outcome, connector.connect_count())
     }
 
     fn code(o: &Outcome) -> Option<ErrorCode> {
@@ -278,7 +271,7 @@ mod tests {
         ] {
             let (o, calls) = go(args);
             assert_eq!(calls, 1, "{args:?}");
-            assert_eq!(code(&o), Some(ErrorCode::Unreachable));
+            assert_eq!(code(&o), Some(ErrorCode::ServerIdentity));
             assert_eq!(o.exit, 5);
         }
     }

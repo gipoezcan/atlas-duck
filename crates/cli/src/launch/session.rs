@@ -3,6 +3,8 @@
 //! Linux (and other non-macOS Unix): `DISPLAY` or `WAYLAND_DISPLAY` non-empty. macOS:
 //! `/bin/launchctl managername` prints `Aqua`. Windows: not session 0 and a visible window station
 //! (`windows::gui_session`).
+// Each OS consumes one rule (display variables, Aqua); every rule compiles everywhere for the tests.
+#![allow(dead_code)]
 
 use std::ffi::OsString;
 

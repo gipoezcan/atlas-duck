@@ -1,6 +1,4 @@
 //! `busy` from the connect step (§3.3, §4.7, L44): exit 11, never a launch.
-// Task 16 is the first caller.
-#![allow(dead_code)]
 
 use atlas_duck_ipc::client::ConnectError;
 use atlas_duck_ipc::envelope::Envelope;

@@ -34,6 +34,7 @@ const MAX_FD_SWEEP: libc::c_int = 65_536;
 /// Exit status of the grandchild when anything before `execve` fails (nobody waits for it).
 const EXEC_FAILED: libc::c_int = 127;
 /// PD-23: the `systemd-run` probe must answer within 2 s.
+#[cfg(target_os = "linux")]
 const PROBE_LIMIT: Duration = Duration::from_secs(2);
 
 /// Starts `app --background` detached (PD-23): macOS bundles through `open -n -g -a`, Linux
