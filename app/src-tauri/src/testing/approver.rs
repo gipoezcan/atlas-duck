@@ -449,6 +449,51 @@ mod tests {
         assert_eq!(final_status(&h, &write).await, Status::Succeeded);
         assert_eq!(final_status(&h, &denied).await, Status::Denied);
 
+        // An upstream-error read: "Release status only" (§5.2 step 6) ends it `failed` with the
+        // status alone.
+        mock.json(
+            "/rest/api/2/issue/ERR-1",
+            404,
+            r#"{"errorMessages":["Issue does not exist"],"errors":{}}"#,
+        )
+        .await;
+        let status_only = submit(
+            &h,
+            "jira.issue.get",
+            json!({ "key": "ERR-1" }),
+            "atlas-test:release-status-only",
+        )
+        .await?;
+        let env = h.await_(&status_only, 15_000).await;
+        assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+        assert!(env.redacted);
+        assert!(!env.to_json_line().contains("Issue does not exist"));
+        // A write held on an upstream error (its enrichment GET answered 404): the deny carries
+        // the hint with the messages.
+        mock.json(
+            "/rest/api/2/issue/ERR-1/transitions",
+            404,
+            r#"{"errorMessages":["Issue does not exist"],"errors":{}}"#,
+        )
+        .await;
+        let held_write = submit(
+            &h,
+            "jira.issue.transition",
+            json!({ "key": "ERR-1", "transition": "Done" }),
+            "atlas-test:deny-details",
+        )
+        .await?;
+        let env = h.await_(&held_write, 15_000).await;
+        assert_eq!(env.status, Status::Denied, "{}", env.to_json_line());
+        let error = env.error.as_ref().ok_or("no error")?;
+        assert_eq!(serde_json::to_value(error.code)?, json!("upstream_http"));
+        let details = error.details.clone().ok_or("no details")?;
+        assert_eq!(details.get("status"), Some(&json!(404)));
+        assert_eq!(
+            details.get("error_messages"),
+            Some(&json!("Issue does not exist"))
+        );
+
         // Held for a second: still pending, still in the queue, never opened.
         let since = Instant::now();
         h.queued(&held, 10_000)
