@@ -109,7 +109,11 @@ mod tests {
             OsString::from("18446744073709551615"),
             OsString::from("instances"),
         ];
-        let (opts, _) = match crate::argv::parse(&args, &no_env) {
+        let (opts, _) = match crate::argv::parse(
+            &args,
+            &no_env,
+            &mut crate::input::Inputs::new(std::io::empty()),
+        ) {
             Ok(v) => v,
             Err(e) => panic!("parse failed: {}", e.message),
         };

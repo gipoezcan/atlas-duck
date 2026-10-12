@@ -9,9 +9,11 @@
 //! provides the real one).
 
 mod argv;
+mod binding;
 mod deadline;
 mod exit;
 mod help;
+mod input;
 mod local;
 mod output;
 
@@ -23,6 +25,7 @@ use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 
 use crate::argv::{Command, GlobalOpts, OutputMode};
 use crate::deadline::Deadline;
+use crate::input::Inputs;
 
 /// How a connected command reaches the app. Task 16 replaces this placeholder with the real
 /// connect/launch/hello sequence (and the async calls that follow); local commands never see it.
@@ -56,6 +59,7 @@ pub(crate) fn execute(
     start: Instant,
     args: &[OsString],
     env: &dyn Fn(&str) -> Option<OsString>,
+    inputs: &mut Inputs<'_>,
     connector: &dyn Connector,
 ) -> Outcome {
     // Task 15 fills the `__launch-stub` dispatch; until then it is an unknown command.
@@ -65,7 +69,7 @@ pub(crate) fn execute(
             Default::default(),
         ));
     }
-    let (opts, command) = match argv::parse(args, env) {
+    let (opts, command) = match argv::parse(args, env, inputs) {
         Ok(parsed) => parsed,
         Err(e) => return failure(local::parse_error(e)),
     };
@@ -125,7 +129,13 @@ pub fn run(args: Vec<OsString>) -> i32 {
     // §3.3: build_id is compiled into every binary (M4's `hello` sends it). black_box keeps the
     // constant referenced, so the linker cannot drop it from the executable.
     let _ = std::hint::black_box(BUILD_ID);
-    let outcome = execute(start, &args, &|k| std::env::var_os(k), &Unwired);
+    let outcome = execute(
+        start,
+        &args,
+        &|k| std::env::var_os(k),
+        &mut Inputs::process(),
+        &Unwired,
+    );
     output::emit_with_exit(&outcome.env, &outcome.opts, outcome.exit)
 }
 
@@ -154,7 +164,13 @@ mod tests {
     fn go(list: &[&str]) -> (Outcome, u32) {
         let connector = Recording(Cell::new(0));
         let args: Vec<OsString> = list.iter().map(OsString::from).collect();
-        let outcome = execute(Instant::now(), &args, &|_| None, &connector);
+        let outcome = execute(
+            Instant::now(),
+            &args,
+            &|_| None,
+            &mut Inputs::new(std::io::empty()),
+            &connector,
+        );
         (outcome, connector.0.get())
     }
 
