@@ -54,7 +54,8 @@ m4_stop_app() {
 m4_inner() {
   local appimage="$1" data="$2" work="$3" code pid cmdline gate1 gate2 i
   unset APPIMAGE_EXTRACT_AND_RUN
-  trap 'm4_stop_app "$appimage" || true' EXIT
+  # Expanded now: the EXIT trap runs after this function returned, when the local is gone (set -u).
+  trap "m4_stop_app \"$appimage\" || true" EXIT
 
   # (a) cold start through `__cli`: the CLI finds `$APPIMAGE` (set by the type-2 runtime), starts
   # `$APPIMAGE --background` detached and answers once the endpoint is up.
