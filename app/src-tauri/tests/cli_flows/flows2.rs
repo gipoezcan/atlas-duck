@@ -787,50 +787,76 @@ async fn v12_launched_app_inherits_no_handles() -> Result<()> {
 }
 
 #[cfg(windows)]
-struct OpenEvent(windows_sys::Win32::Foundation::HANDLE);
+struct OpenFile(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
-impl Drop for OpenEvent {
+impl Drop for OpenFile {
     fn drop(&mut self) {
-        // SAFETY: closes the event `CreateEventW` returned; it is closed once, here.
+        // SAFETY: closes the handle `CreateFileW` returned; it is closed once, here.
         unsafe {
             windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
     }
 }
 
-/// V12 (Windows): the test creates an inheritable, manual-reset, signaled event; its value goes to
-/// `test-control/marker-handle`; the CLI cold-starts the app; the app runs `WaitForSingleObject`
-/// on that value (zero timeout). Handles are inherited by value, so a leak shows as `signaled`;
-/// `invalid` is the clean answer. Control: the app the test starts directly inherits the event
-/// (`CreateProcess` with `bInheritHandles = TRUE`, which std and tokio pass) and answers
-/// `signaled` (`v12_flow`).
+/// V12 (Windows): the test opens an inheritable disk-file handle (`CreateFileW`, `bInheritHandle =
+/// TRUE`) on a file of its own; `<handle value>\n<full path>` goes to `test-control/marker-handle`;
+/// the CLI cold-starts the app; the app checks that the value is a disk-file handle of its own
+/// whose final path is that file (`GetFileType`, `GetFinalPathNameByHandleW`). Handles are
+/// inherited by value, so a leak shows as `signaled`; `invalid` is the clean answer, and `other`
+/// (the value is one of the app's own handles, as small values are reused) is no leak either.
+/// Control: the app the test starts directly inherits the handle (`CreateProcess` with
+/// `bInheritHandles = TRUE`, which std and tokio pass) and answers `signaled` (`v12_flow`).
 ///
 /// Source: `launch/windows.rs` (every process is created with `bInheritHandles = FALSE`),
 /// `testing/control.rs` `marker_for`.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v12_launched_app_inherits_no_handles() -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-    use windows_sys::Win32::System::Threading::CreateEventW;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
 
     if !opted_in("v12_launched_app_inherits_no_handles") {
         return Ok(());
     }
     let world = jira_world().await?;
+    let marker = world.root().join("v12-marker");
+    fs::write(&marker, b"v12")?;
+    let marker = fs::canonicalize(&marker)?;
+    let wide: Vec<u16> = marker.as_os_str().encode_wide().chain([0]).collect();
     let attributes = SECURITY_ATTRIBUTES {
         nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
         bInheritHandle: 1,
     };
-    // SAFETY: `attributes` outlives the call; the event is manual-reset (1), initially signaled
-    // (1) and unnamed (null); the returned handle is closed by `OpenEvent`.
-    let event = unsafe { CreateEventW(&attributes, 1, 1, std::ptr::null()) };
-    if event.is_null() {
+    // SAFETY: `wide` is a NUL-terminated path and `attributes` outlives the call; the file exists,
+    // is opened for reading and shared fully, and the handle is inheritable on purpose. The
+    // returned handle is closed by `OpenFile`.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0x8000_0000, // GENERIC_READ
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
         return Err(std::io::Error::last_os_error().into());
     }
-    let event = OpenEvent(event);
-    v12_flow(&world, &(event.0 as usize).to_string()).await
+    let handle = OpenFile(handle);
+    v12_flow(
+        &world,
+        &format!("{}\n{}", handle.0 as usize, marker.display()),
+    )
+    .await
 }
 
 // ---- gate states over the endpoint --------------------------------------------------------------------

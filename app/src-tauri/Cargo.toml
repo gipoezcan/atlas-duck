@@ -37,8 +37,8 @@ scripted-approver = [
     "atlas-duck-ipc/test-paths",
     "atlas-duck-cli/test-env",
     "atlas-duck-core/testing",
-    # The V12 marker (`WaitForSingleObject`) in `testing::control`.
-    "windows-sys/Win32_System_Threading",
+    # The V12 marker (`GetFileType`, `GetFinalPathNameByHandleW`) in `testing::control`.
+    "windows-sys/Win32_Storage_FileSystem",
 ]
 
 [build-dependencies]
@@ -100,6 +100,7 @@ filetime = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Diagnostics_ToolHelp",

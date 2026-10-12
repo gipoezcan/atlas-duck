@@ -11,8 +11,12 @@
 //! - `delay-startup-ms` (read by `serve::start` before the first `open`): sleep that many
 //!   milliseconds, at most 30 000 (I-17's deadline test).
 //! - `marker-handle` → `marker` (V12): whether a handle the test opened is open in this process.
-//!   Windows: `marker-handle` holds the handle value; `marker` is the `WaitForSingleObject(handle,
-//!   0)` result: `signaled`, `invalid` or `other`. Linux and macOS: `marker-handle` holds the
+//!   Windows: `marker-handle` holds the value of an inheritable disk-file handle on line 1 and the
+//!   file's full path on line 2; `marker` is `signaled` when that value is a disk-file handle here
+//!   (`GetFileType`) whose final path (`GetFinalPathNameByHandleW`, compared without the `\\?\`
+//!   prefix and ignoring case) is that file (it leaked into the app), `invalid` when the value is
+//!   no handle here, `other` when it is one of the app's own handles (handle values are reused).
+//!   The handle is only queried, never read or closed. Linux and macOS: `marker-handle` holds the
 //!   descriptor number on line 1 and the file's canonical path on line 2; `marker` is `signaled`
 //!   when that descriptor is open here and names that file (it leaked into the app), `invalid`
 //!   when it is not open, `other` when the number is one of the app's own descriptors. (The app
@@ -152,30 +156,71 @@ fn read_marker_handle(dir: &Path) -> Option<&'static str> {
     marker_for_text(&text)
 }
 
+/// V12 (Windows): `<handle value>\n<full path>`; see the module doc.
 #[cfg(windows)]
 fn marker_for_text(text: &str) -> Option<&'static str> {
-    let value: usize = text.trim().parse().ok()?;
-    marker_for(value)
+    let mut lines = text.lines();
+    let value: usize = lines.next()?.trim().parse().ok()?;
+    let want = lines.next()?;
+    Some(marker_for(value, want))
 }
 
-/// V12: whether a handle value is open in this process. `WaitForSingleObject` with a zero
-/// timeout only queries the object.
+/// The path a final-path name names, without the `\\?\` (or `\\?\UNC\`) prefix, lower-cased.
 #[cfg(windows)]
-fn marker_for(value: usize) -> Option<&'static str> {
-    use windows_sys::Win32::Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+fn normalized_path(path: &str) -> String {
+    let path = path.trim();
+    let path = match path.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_owned(),
+    };
+    path.to_lowercase()
+}
+
+/// V12: whether the handle value is an open disk-file handle of this process that names `want`
+/// (it was inherited from the test): `signaled`; `invalid` when the value is no handle here;
+/// `other` when it is one of this process's own handles (another type or another file). A bare
+/// value cannot tell those apart (handle values are small and reused), so the file is checked
+/// too.
+#[cfg(windows)]
+fn marker_for(value: usize, want: &str) -> &'static str {
+    use windows_sys::Win32::Foundation::{GetLastError, HANDLE, NO_ERROR};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_TYPE_DISK, FILE_TYPE_UNKNOWN, GetFileType, GetFinalPathNameByHandleW,
+    };
     let handle = value as HANDLE;
-    // SAFETY: the call never blocks and reads no memory through the value, and an invalid handle
-    // value fails with `WAIT_FAILED`. It is not free of side effects: a zero-timeout wait on a
-    // mutex acquires it, on a semaphore decrements it and on an auto-reset event resets it, and
-    // a value from the caller can collide with one of this process's own handles. Only the test
-    // build calls it, with a manual-reset event the test process created signaled (T25).
-    let r = unsafe { WaitForSingleObject(handle, 0) };
-    Some(match r {
-        WAIT_OBJECT_0 => "signaled",
-        WAIT_FAILED => "invalid",
-        _ => "other",
-    })
+    // SAFETY: `GetFileType` reads no memory through the value and only queries the object; a
+    // value that is no handle fails with `FILE_TYPE_UNKNOWN` and a last error. It never changes
+    // the object's state and never blocks on a disk file. The foreign handle is never read,
+    // written or closed.
+    let kind = unsafe { GetFileType(handle) };
+    // SAFETY: reads this thread's last error, no pointers.
+    if kind == FILE_TYPE_UNKNOWN && unsafe { GetLastError() } != NO_ERROR {
+        return "invalid";
+    }
+    if kind != FILE_TYPE_DISK {
+        return "other";
+    }
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: `buf` is valid for `buf.len()` UTF-16 units, which is passed as the capacity;
+        // flags 0 is `VOLUME_NAME_DOS | FILE_NAME_NORMALIZED`. The call only queries the handle.
+        let n = unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, 0) }
+            as usize;
+        if n == 0 {
+            return "other";
+        }
+        if n < buf.len() {
+            // The path without the terminating NUL.
+            let got = String::from_utf16_lossy(&buf[..n]);
+            return if normalized_path(&got) == normalized_path(want) {
+                "signaled"
+            } else {
+                "other"
+            };
+        }
+        // Too small: `n` is the size needed including the NUL.
+        buf.resize(n + 1, 0);
+    }
 }
 
 /// V12 (Unix): `<fd>\n<path>`; see the module doc.
@@ -462,29 +507,49 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn marker_reports_the_handle_state() -> TestResult {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::CreateEventW;
-        // SAFETY: a manual-reset event created signaled, no name, default security; closed
-        // below.
-        let event = unsafe { CreateEventW(std::ptr::null(), 1, 1, std::ptr::null()) };
-        if event.is_null() {
-            return Err("CreateEventW failed".into());
-        }
-        assert_eq!(marker_for(event as usize), Some("signaled"));
-        // A value far beyond any handle this test process holds.
-        assert_eq!(marker_for(0x7fff_fff1), Some("invalid"));
-
+        use std::os::windows::io::AsRawHandle;
         let tmp = tempfile::tempdir()?;
+        let file_path = fs::canonicalize(tmp.path())?.join("held");
+        fs::write(&file_path, b"x")?;
+        let other_path = fs::canonicalize(tmp.path())?.join("other");
+        fs::write(&other_path, b"y")?;
+        let file = fs::File::open(&file_path)?;
+        let value = file.as_raw_handle() as usize;
+        let text = |value: usize, path: &Path| format!("{value}\n{}", path.display());
+        assert_eq!(marker_for_text(&text(value, &file_path)), Some("signaled"));
+        // Case and the `\\?\` prefix do not matter.
+        let plain = file_path.display().to_string();
+        let plain = plain.strip_prefix(r"\\?\").unwrap_or(&plain).to_uppercase();
+        assert_eq!(
+            marker_for_text(&format!("{value}\n{plain}")),
+            Some("signaled")
+        );
+        // Open here, but another file: one of the app's own handles.
+        assert_eq!(marker_for_text(&text(value, &other_path)), Some("other"));
+        // INVALID_HANDLE_VALUE is no handle.
+        assert_eq!(
+            marker_for_text(&text(usize::MAX, &file_path)),
+            Some("invalid")
+        );
+        // A value far beyond any handle this test process holds.
+        assert_eq!(
+            marker_for_text(&text(0x7fff_fff0, &file_path)),
+            Some("invalid")
+        );
+        assert_eq!(marker_for_text("not-a-number\nC:\\x"), None);
+        assert_eq!(marker_for_text("5"), None);
+
         let dir = tmp.path().join(CONTROL_DIR);
         fs::create_dir(&dir)?;
-        fs::write(dir.join(MARKER_HANDLE_FILE), format!("{}", event as usize))?;
+        fs::write(dir.join(MARKER_HANDLE_FILE), text(value, &file_path))?;
         let task = Control::spawn_with(dir.clone(), Arc::new(Counting::default()), FAST);
         let marker = dir.join(MARKER_FILE);
         wait_for("marker", || marker.exists()).await?;
         task.abort();
         assert_eq!(read(&dir, MARKER_FILE), "signaled");
-        // SAFETY: the event created above, closed once.
-        unsafe { CloseHandle(event) };
+        drop(file);
+        // Closed: the value is no handle any more (or, if reused, not that file).
+        assert_ne!(marker_for_text(&text(value, &file_path)), Some("signaled"));
         Ok(())
     }
 }
