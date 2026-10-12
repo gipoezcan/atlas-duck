@@ -27,6 +27,16 @@ check_dispositions() {
 if [ "${1:-}" != --inner ]; then
   command -v dbus-run-session >/dev/null || { echo "cli-flows-linux: dbus-run-session missing" >&2; exit 2; }
   command -v xvfb-run >/dev/null || { echo "cli-flows-linux: xvfb-run missing" >&2; exit 2; }
+  # GitLab's runner starts the job shell with SIGINT ignored (SigIgn is inherited through exec):
+  # re-exec once through perl, which can set the three dispositions back to default, then check.
+  if [ -z "${CLI_FLOWS_SIG_RESET:-}" ]; then
+    ign="$(awk '/^SigIgn:/ {print $2}' /proc/$$/status)"
+    if (( (0x$ign & ((1 << 0) | (1 << 1) | (1 << 14))) != 0 )); then
+      command -v perl >/dev/null || { echo "cli-flows-linux: HUP/INT/TERM are ignored (SigIgn=$ign) and perl is missing to reset them" >&2; exit 2; }
+      export CLI_FLOWS_SIG_RESET=1
+      exec perl -e '$SIG{HUP} = $SIG{INT} = $SIG{TERM} = "DEFAULT"; exec @ARGV or die "exec: $!"' bash "$0" "$@"
+    fi
+  fi
   check_dispositions
   # The runner's /tmp may be an overlayfs (GitLab containers): the data-dir locality check fails
   # closed there, so keep temp files on the project volume (see ci/keyring-ci.sh, core-suite-fedora).
