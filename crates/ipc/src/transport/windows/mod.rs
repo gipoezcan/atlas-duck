@@ -117,8 +117,11 @@ impl PipeListener {
     /// (§3.1). Returns the connected instance and the client's pid
     /// (`GetNamedPipeClientProcessId`, display only; `None` if unreadable).
     ///
-    /// An error creating the next instance is returned and the listener is
-    /// done: the IPC server stops (§3.1). The connected client is dropped.
+    /// Errors: creating the next instance failed (the connected client is
+    /// dropped), or `ConnectNamedPipe` on the listening instance failed (a
+    /// client that opens and closes at once is not an error: mio treats
+    /// `ERROR_NO_DATA` as connected). Either way the listener is done and
+    /// must not be used again; the IPC server stops (§3.1).
     ///
     /// Cancel-safe: nothing is awaited after the connect completes.
     pub async fn accept(&mut self) -> io::Result<(NamedPipeServer, Option<u32>)> {

@@ -429,6 +429,36 @@ async fn accept_loop_always_listening() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn accept_survives_clients_that_open_and_close() {
+    let mut listener = PipeListener::bind(&prefix()).expect("bind");
+    let name = listener.name().to_owned();
+    for i in 0..20 {
+        if i % 2 == 0 {
+            // Opened and closed before the server waits.
+            drop(open_client(&name).expect("open"));
+            listener.accept().await.expect("accept after open+close");
+        } else {
+            // Opened and closed while the server waits.
+            let name = name.clone();
+            let opener = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drop(open_client(&name).expect("open"));
+            });
+            tokio::time::timeout(WAIT, listener.accept())
+                .await
+                .expect("accept timeout")
+                .expect("accept while open+close");
+            opener.await.expect("opener");
+        }
+    }
+    // Still serving.
+    let server = spawn_echo_server(listener);
+    let mut c = open_client(&name).expect("open");
+    ping(&mut c).await;
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v01_same_user_open_ok() {
     let listener = PipeListener::bind(&prefix()).expect("bind");
     let name = listener.name().to_owned();
