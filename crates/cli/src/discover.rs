@@ -138,16 +138,13 @@ fn resolution_state(resolution: io::Result<DataDirResolution>) -> DataState {
     }
 }
 
-/// §3.2 order: `$APPIMAGE`, the app next to the CLI, `cli.toml`'s `app_path`.
+/// §3.2 order: `$APPIMAGE` (Linux), the app next to the CLI, `cli.toml`'s `app_path`.
 fn locate_app(
     base_host: Option<(&BaseDirs, &str)>,
     env: &dyn Fn(&str) -> Option<OsString>,
     exe: Option<&Path>,
 ) -> AppLocation {
-    if let Some(image) = env("APPIMAGE").map(PathBuf::from)
-        && image.is_absolute()
-        && image.is_file()
-    {
+    if let Some(image) = appimage(env) {
         return AppLocation::Found(image);
     }
     if let Some(next_to) = exe
@@ -167,6 +164,20 @@ fn locate_app(
         return AppLocation::Found(app);
     }
     AppLocation::NotFound
+}
+
+/// `$APPIMAGE` when it names an existing file by absolute path. AppImages exist only on Linux;
+/// elsewhere the variable (which an agent can set) never chooses what the CLI launches.
+#[cfg(target_os = "linux")]
+fn appimage(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    env("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|image| image.is_absolute() && image.is_file())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn appimage(_env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    None
 }
 
 /// Whether this user's endpoint is present: Unix the socket file exists (no connect, no
@@ -346,15 +357,21 @@ mod tests {
             AppLocation::Found(next_to.clone())
         );
 
-        // $APPIMAGE beats next-to, but only when it is an existing file.
+        // On Linux $APPIMAGE beats next-to, but only when it is an existing file; elsewhere it is
+        // never consulted.
         assert_eq!(
             discover_with(&b, HOST, &with_image, Some(&exe)).app,
             AppLocation::Found(next_to.clone())
         );
         touch(&image);
+        let expected = if cfg!(target_os = "linux") {
+            image.clone()
+        } else {
+            next_to.clone()
+        };
         assert_eq!(
             discover_with(&b, HOST, &with_image, Some(&exe)).app,
-            AppLocation::Found(image.clone())
+            AppLocation::Found(expected)
         );
         // A relative $APPIMAGE is ignored.
         let relative = |_: &str| Some(OsString::from("App.AppImage"));

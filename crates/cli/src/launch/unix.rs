@@ -3,22 +3,30 @@
 //!
 //! Between `fork` and `execve` only async-signal-safe calls are made (`setsid`, `fork`, `dup2`,
 //! `close_range`/`close`, `chdir`, `sigprocmask`, `signal`, `execve`, `_exit`); every C string, the
-//! argv/envp arrays, the `/dev/null` descriptor, the descriptor limit and the signal set are prepared
-//! before the first `fork`. `std::process::Command` is used only for the bounded probes
-//! (`systemd-run` availability, `launchctl managername`), never for the app itself.
+//! argv/envp arrays, the `/dev/null` descriptor, the descriptor limit, the signal set and the last
+//! signal number are prepared before the first `fork`. `std::process::Command` is used only for the
+//! bounded probes (`systemd-run` availability, `launchctl managername`), never for the app itself.
+//!
+//! Also the endpoint liveness probe (`endpoint_answers`): a socket file alone does not mean the app
+//! runs.
 
 use std::ffi::{CString, OsStr, OsString};
 use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+use atlas_duck_ipc::paths::{EndpointLocation, LocalDataDir, endpoint_location};
 
 use super::LaunchError;
 #[cfg(target_os = "linux")]
 use super::plan::SYSTEMD_RUN;
-use super::plan::{ExecPlan, Via, exec_plan};
+use super::plan::{ExecPlan, Via, exec_plan, must_be_executable};
+use crate::discover;
 
 /// The descriptor sweep's upper bound when `close_range` is unavailable (the soft
 /// `RLIMIT_NOFILE`, clamped to this so an unlimited soft limit stays a bounded loop).
@@ -31,8 +39,120 @@ const PROBE_LIMIT: Duration = Duration::from_secs(2);
 /// Starts `app --background` detached (PD-23): macOS bundles through `open -n -g -a`, Linux
 /// through `systemd-run --user --scope` when the user manager answers, else directly.
 pub(crate) fn launch_app(app: &Path, env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
-    let ExecPlan { program, args } = exec_plan(app, via_for_this_os());
+    launch_via(app, via_for_this_os(), env)
+}
+
+/// `launch_app` with the launcher chosen. A file the plan executes that is not executable fails
+/// here, before any `fork`, instead of as a 20 s `launch_timeout` after an `execve` nobody sees.
+fn launch_via(app: &Path, via: Via, env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
+    let plan = exec_plan(app, via);
+    for file in must_be_executable(app, &plan) {
+        executable(file).map_err(LaunchError::Io)?;
+    }
+    let ExecPlan { program, args } = plan;
     spawn_detached(&program, &args, env)
+}
+
+/// `access(path, X_OK)`.
+fn executable(path: &Path) -> io::Result<()> {
+    let c = c_string(path.as_os_str()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: `c` is a valid NUL-terminated string for the duration of the call.
+    if unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Whether the app answers on this user's endpoint (§4.7 "When to launch", T14 review I-1): the
+/// socket file must exist (`discover::endpoint_present`, the cheap check) and accept a connection.
+/// A file left behind by a crashed app refuses, so it never stops a launch, and the post-launch
+/// poll waits until the new app listens.
+pub(crate) fn endpoint_answers(data: &LocalDataDir, host: &str) -> bool {
+    if !discover::endpoint_present(data, host) {
+        return false;
+    }
+    match endpoint_location(data, host) {
+        Ok(EndpointLocation::UnixSocket(path)) => socket_answers(&path),
+        _ => false,
+    }
+}
+
+/// A non-blocking `connect` to `path`, dropped at once without a byte written. `ENOENT` and
+/// `ECONNREFUSED` (nobody listens; macOS says `ENOTSOCK` for a non-socket file) are absent.
+/// Success and `EAGAIN` (a full backlog: up but busy) are present, and so is any other error: the
+/// app may well run, and the connect layer reports the real failure (a launch would only meet the
+/// running instance).
+pub(crate) fn socket_answers(path: &Path) -> bool {
+    match connect_nonblocking(path) {
+        Ok(()) => true,
+        Err(e) => !matches!(
+            e.raw_os_error(),
+            Some(libc::ENOENT | libc::ECONNREFUSED | libc::ENOTSOCK)
+        ),
+    }
+}
+
+fn connect_nonblocking(path: &Path) -> io::Result<()> {
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: an all-zero `sockaddr_un` is a valid value of the type.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    // The path plus its NUL must fit `sun_path`.
+    if bytes.is_empty() || bytes.contains(&0) || bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = libc::c_char::from_ne_bytes([*src]);
+    }
+    let fd = unix_stream_socket()?;
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: `addr` is an initialized `sockaddr_un` of `len` bytes; `fd` is our open socket.
+    let r = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const addr).cast::<libc::sockaddr>(),
+            len,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EINPROGRESS) {
+        return Ok(());
+    }
+    Err(err)
+}
+
+/// A close-on-exec, non-blocking `AF_UNIX` stream socket, closed when dropped.
+fn unix_stream_socket() -> io::Result<OwnedFd> {
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: plain syscall; returns a new descriptor or -1.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh descriptor nobody else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: `fcntl` on our own descriptor.
+        let ok = unsafe {
+            libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) >= 0 && {
+                let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+                flags >= 0
+                    && libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) >= 0
+            }
+        };
+        if !ok {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(fd)
 }
 
 fn via_for_this_os() -> Via {
@@ -98,6 +218,9 @@ pub(crate) fn run_probe(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            // `SIGCHLD` ignored (inherited from the agent): the kernel reaped the probe once it
+            // exited, so its status is gone. Read as success; the output decides.
+            Err(e) if is_echild(&e) => break ExitStatus::from_raw(0),
             Ok(None) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
@@ -123,6 +246,7 @@ struct Prepared {
     envp_ptrs: Vec<*const libc::c_char>,
     fd_limit: libc::c_int,
     empty_mask: libc::sigset_t,
+    last_signal: libc::c_int,
 }
 
 fn c_string(s: &OsStr) -> Result<CString, LaunchError> {
@@ -181,7 +305,21 @@ fn prepare(
         envp_ptrs,
         fd_limit: fd_limit(),
         empty_mask,
+        last_signal: last_signal(),
     })
+}
+
+/// The highest signal number (`NSIG - 1`; the `libc` crate exports no `NSIG` here).
+fn last_signal() -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        libc::SIGRTMAX()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS and the BSDs: NSIG is 32.
+        31
+    }
 }
 
 /// The soft descriptor limit, clamped to `3..=MAX_FD_SWEEP`.
@@ -264,8 +402,8 @@ unsafe fn first_child(p: &Prepared, dev_null: libc::c_int) -> ! {
     }
 }
 
-/// The grandchild: stdio onto `/dev/null`, close everything else, `chdir("/")`, default signal
-/// mask and `SIGPIPE`, then `execve`.
+/// The grandchild: stdio onto `/dev/null`, close everything else, `chdir("/")`, every signal
+/// disposition back to the default and an empty signal mask, then `execve`.
 ///
 /// # Safety
 /// Only to be called in the grandchild right after `fork`.
@@ -280,10 +418,15 @@ unsafe fn grandchild(p: &Prepared, dev_null: libc::c_int) -> ! {
         if libc::chdir(c"/".as_ptr()) != 0 {
             libc::_exit(EXEC_FAILED);
         }
-        // Rust ignores SIGPIPE in its own processes and the agent may have blocked signals; the
-        // app starts from the defaults like a login-started one (std's `Command` does the same).
+        // Rust ignores SIGPIPE in its own processes, and the agent may have ignored or blocked
+        // others (`execve` keeps both); the app starts from the defaults like a login-started one.
+        // Numbers the C library reserves for itself fail with EINVAL, which is fine.
+        for sig in 1..=p.last_signal {
+            if sig != libc::SIGKILL && sig != libc::SIGSTOP {
+                libc::signal(sig, libc::SIG_DFL);
+            }
+        }
         libc::sigprocmask(libc::SIG_SETMASK, &p.empty_mask, std::ptr::null_mut());
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         libc::execve(
             p.program.as_ptr(),
             p.argv_ptrs.as_ptr(),
@@ -313,8 +456,13 @@ unsafe fn close_from_3(fd_limit: libc::c_int) {
     }
 }
 
+fn is_echild(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECHILD)
+}
+
 /// `waitpid` for the intermediate child, retrying on `EINTR`; its exit code, or -1 if it did not
-/// exit normally.
+/// exit normally. `ECHILD` (the CLI inherited `SIGCHLD` ignored, so the kernel reaped the child)
+/// reads as 0: the status is gone and the post-launch poll tells whether the launch worked.
 fn wait_for(pid: libc::pid_t) -> io::Result<i32> {
     let mut status: libc::c_int = 0;
     loop {
@@ -324,6 +472,9 @@ fn wait_for(pid: libc::pid_t) -> io::Result<i32> {
             break;
         }
         let err = io::Error::last_os_error();
+        if is_echild(&err) {
+            return Ok(0);
+        }
         if err.kind() != io::ErrorKind::Interrupted {
             return Err(err);
         }
@@ -381,6 +532,51 @@ mod tests {
         assert!(matches!(
             prepare(Path::new("/bin/sh"), &[], &[(OsString::from("A"), nul)]),
             Err(LaunchError::InvalidArgument)
+        ));
+    }
+
+    #[test]
+    fn socket_probe_tells_a_stale_file_from_a_listener() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("s.sock");
+        assert!(!socket_answers(&sock), "no file");
+        let listener = UnixListener::bind(&sock).unwrap();
+        assert!(socket_answers(&sock), "listening");
+        // The probe wrote nothing and is gone: the connection reads EOF at once.
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut got = Vec::new();
+        conn.read_to_end(&mut got).unwrap();
+        assert!(got.is_empty());
+        // A crashed app leaves its socket file behind: nobody listens, so it is absent.
+        drop(listener);
+        assert!(sock.exists());
+        assert!(!socket_answers(&sock), "stale socket file");
+        // A plain file there refuses too.
+        fs::remove_file(&sock).unwrap();
+        fs::write(&sock, b"x").unwrap();
+        assert!(!socket_answers(&sock), "regular file");
+    }
+
+    #[test]
+    fn not_executable_fails_before_fork() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("atlas-duck-app");
+        // Created 0644: no execute bit for anyone (root included).
+        fs::write(&app, b"#!/bin/sh\n").unwrap();
+        for via in [Via::Direct, Via::SystemdRun] {
+            let got = launch_via(&app, via, &[]);
+            let Err(LaunchError::Io(e)) = got else {
+                panic!("{via:?}: {got:?}");
+            };
+            if via == Via::Direct {
+                assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+            }
+        }
+        assert!(matches!(
+            launch_via(&tmp.path().join("missing"), Via::Direct, &[]),
+            Err(LaunchError::Io(_))
         ));
     }
 

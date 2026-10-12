@@ -48,6 +48,7 @@ export const TEST_ONLY_FEATURES = [
   "atlas-duck-atlassian/insecure-test-http",
   "atlas-duck-core/testing",
   "atlas-duck-audit/testing",
+  "atlas-duck-cli/test-env",
 ];
 
 // The registry stays a plain data crate: its normal dependencies are these and nothing else.

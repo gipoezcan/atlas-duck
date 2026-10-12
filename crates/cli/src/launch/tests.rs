@@ -246,6 +246,61 @@ fn launch_lock_serializes() {
     assert!(w.data_path.join("launch.lock").is_file());
 }
 
+/// Makes the double's endpoint answer `after` the first spawn (gives up after 5 s without one).
+fn answer_after_spawn(sys: &Double, after: Duration) {
+    let until = Instant::now() + Duration::from_secs(5);
+    while sys.spawns() == 0 {
+        if Instant::now() >= until {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(after);
+    sys.present.store(true, Ordering::SeqCst);
+}
+
+#[test]
+fn launch_lock_is_held_across_the_poll() {
+    // The app answers ~150 ms after its spawn. A second CLI that got the lock right after the
+    // spawn would find no endpoint and spawn again.
+    let w = world();
+    let mut sys = Double::new(w.base.clone());
+    sys.present_on_spawn = false;
+    let d = discovery(DataState::Local(w.data.clone()));
+    let deadline = within(10_000);
+    let (a, b) = std::thread::scope(|s| {
+        let app = s.spawn(|| answer_after_spawn(&sys, Duration::from_millis(150)));
+        let a = s.spawn(|| ensure_running(&d, &deadline, &sys));
+        let b = s.spawn(|| ensure_running(&d, &deadline, &sys));
+        app.join().unwrap();
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(a.unwrap(), w.data);
+    assert_eq!(b.unwrap(), w.data);
+    assert_eq!(sys.spawns(), 1, "the lock covers spawn and poll");
+}
+
+#[test]
+fn stale_endpoint_still_launches_and_the_poll_waits_for_an_answer() {
+    // The double's endpoint is the liveness probe: a socket file a crashed app left behind is
+    // there, but refused (Unix: `unix::socket_answers`), until the new app listens ~150 ms after
+    // its spawn.
+    let w = world();
+    let mut sys = Double::new(w.base.clone());
+    sys.present_on_spawn = false;
+    let d = discovery(DataState::Local(w.data.clone()));
+    let start = Instant::now();
+    let got = std::thread::scope(|s| {
+        let app = s.spawn(|| answer_after_spawn(&sys, Duration::from_millis(150)));
+        let got = ensure_running(&d, &within(5_000), &sys);
+        app.join().unwrap();
+        got
+    });
+    assert_eq!(got.unwrap(), w.data);
+    assert!(start.elapsed() >= Duration::from_millis(150));
+    assert_eq!(sys.spawns(), 1);
+}
+
 #[test]
 fn spawn_gets_the_allowlisted_env() {
     let w = world();
@@ -440,10 +495,34 @@ fn before_first_run_pinned_to_a_missing_dir_is_refused() {
     let base = w.base.clone();
     let gone = w.data_path.join("gone");
     *sys.on_spawn.lock().unwrap() = Some(Box::new(move || pin(&base, &gone)));
-    let env =
-        ensure_running(&discovery(DataState::BeforeFirstRun), &within(5_000), &sys).unwrap_err();
+    let start = Instant::now();
+    let deadline = Deadline::new(start, Some(Duration::from_millis(400)));
+    let env = ensure_running(&discovery(DataState::BeforeFirstRun), &deadline, &sys).unwrap_err();
+    // Mapped when the poll ends, not when the refusal is first seen.
+    assert!(start.elapsed() >= Duration::from_millis(350));
     assert_eq!(reason(&env), Some("data_dir_missing"));
     assert_eq!(exit_code(&env), 9);
+    assert_eq!(sys.spawns(), 1);
+}
+
+#[test]
+fn before_first_run_refusal_mid_poll_keeps_polling() {
+    // The wizard wrote paths.toml a moment before the data dir: the poll re-reads it and goes on.
+    let w = world();
+    let sys = Double::new(w.base.clone());
+    let base = w.base.clone();
+    let late = w.data_path.join("late");
+    let late_dir = late.clone();
+    *sys.on_spawn.lock().unwrap() = Some(Box::new(move || {
+        pin(&base, &late);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::create_dir(&late).unwrap();
+        });
+    }));
+    let got = ensure_running(&discovery(DataState::BeforeFirstRun), &within(5_000), &sys);
+    assert_eq!(got.unwrap().path(), late_dir.as_path());
+    assert_eq!(sys.spawns(), 1);
 }
 
 #[test]

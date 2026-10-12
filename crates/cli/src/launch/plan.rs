@@ -62,6 +62,19 @@ pub(crate) fn exec_plan(app: &Path, via: Via) -> ExecPlan {
     }
 }
 
+/// The files the launcher checks for execute permission before it forks: the program and, under
+/// `systemd-run`, the app it runs. `open` resolves the bundle itself.
+pub(crate) fn must_be_executable<'a>(app: &'a Path, plan: &'a ExecPlan) -> Vec<&'a Path> {
+    if plan.program == Path::new(MAC_OPEN) {
+        return Vec::new();
+    }
+    let mut files = vec![plan.program.as_path()];
+    if plan.program != app {
+        files.push(app);
+    }
+    files
+}
+
 /// The `*.app` bundle whose `Contents/MacOS/` holds `app`, if any (dev builds have none).
 pub(crate) fn macos_bundle(app: &Path) -> Option<&Path> {
     let macos_dir = app.parent()?;
@@ -137,6 +150,27 @@ mod tests {
         // A dev build outside a bundle is started directly.
         let dev = Path::new("/Users/u/src/target/debug/atlas-duck-app");
         assert_eq!(exec_plan(dev, Via::MacOpen), exec_plan(dev, Via::Direct));
+    }
+
+    #[test]
+    fn executable_checks_per_plan() {
+        let app = Path::new("/opt/a/atlas-duck-app");
+        let direct = exec_plan(app, Via::Direct);
+        assert_eq!(must_be_executable(app, &direct), [app]);
+        let scope = exec_plan(app, Via::SystemdRun);
+        assert_eq!(
+            must_be_executable(app, &scope),
+            [Path::new("/usr/bin/systemd-run"), app]
+        );
+        let bundled = Path::new("/Applications/atlas-duck.app/Contents/MacOS/atlas-duck-app");
+        let open = exec_plan(bundled, Via::MacOpen);
+        assert!(must_be_executable(bundled, &open).is_empty());
+        // A dev build outside a bundle runs directly and is checked.
+        let dev = Path::new("/Users/u/target/debug/atlas-duck-app");
+        assert_eq!(
+            must_be_executable(dev, &exec_plan(dev, Via::MacOpen)),
+            [dev]
+        );
     }
 
     #[test]

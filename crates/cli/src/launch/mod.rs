@@ -80,7 +80,8 @@ pub(crate) trait LaunchSys: Sync {
     fn launch_env(&self) -> Vec<(OsString, OsString)>;
     /// Starts `app --background` detached with exactly `env` (PD-23 / Task 15).
     fn spawn_app(&self, app: &Path, env: &[(OsString, OsString)]) -> Result<(), LaunchError>;
-    /// Whether this user's endpoint exists (`discover::endpoint_present`).
+    /// Whether the app answers on this user's endpoint: a liveness probe, not just the file, so a
+    /// stale endpoint left by a crashed app neither stops a launch nor ends the poll early.
     fn endpoint_present(&self, data: &LocalDataDir, host: &str) -> bool;
     /// This user's base folders: where the pinned files and the first-run lock live.
     fn base_dirs(&self) -> io::Result<BaseDirs>;
@@ -115,7 +116,14 @@ impl LaunchSys for OsLaunchSys {
     }
 
     fn endpoint_present(&self, data: &LocalDataDir, host: &str) -> bool {
-        discover::endpoint_present(data, host)
+        #[cfg(unix)]
+        {
+            unix::endpoint_answers(data, host)
+        }
+        #[cfg(not(unix))]
+        {
+            discover::endpoint_present(data, host)
+        }
     }
 
     fn base_dirs(&self) -> io::Result<BaseDirs> {
@@ -245,12 +253,21 @@ pub(crate) fn ensure_running(
 
     // (7) Poll for min(20 s, remaining).
     let until = Instant::now() + deadline.cap(POLL_LIMIT);
+    // A pinned file that is refused mid-poll may be the wizard's write racing its own mkdir: it is
+    // re-read on every tick and only the last refusal is printed when the poll ends.
+    let mut refused = None;
     loop {
         if data.is_none()
             && let Some(base) = &base
         {
             // PD-04: a pinned file that appears continues with the normal path (the endpoint).
-            data = current_data(base, &d.host)?;
+            match current_data(base, &d.host) {
+                Ok(now) => {
+                    data = now;
+                    refused = None;
+                }
+                Err(env) => refused = Some(env),
+            }
         }
         if let Some(dir) = &data
             && sys.endpoint_present(dir, &d.host)
@@ -263,9 +280,10 @@ pub(crate) fn ensure_running(
         }
         std::thread::sleep(POLL_EVERY.min(until - now));
     }
-    Err(match data {
-        None => first_run(),
-        Some(_) => launch_timeout(),
+    Err(match (data, refused) {
+        (None, Some(env)) => env,
+        (None, None) => first_run(),
+        (Some(_), _) => launch_timeout(),
     })
 }
 
