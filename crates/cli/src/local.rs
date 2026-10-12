@@ -7,11 +7,11 @@ use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_registry::{DescribeEnv, LimitsSource, describe, get, ops_list_json};
 use serde_json::{Value, json};
 
-use crate::argv::ParseError;
+use crate::argv::{ParseError, clip};
 use crate::help::help_text;
 
-/// The built-in defaults: what `core::gate` answers for a local `ops list`/`ops describe`, so the
-/// two cannot drift (`u05_cli_ops_equal_core`).
+/// The built-in defaults: what `core::gate` answers for a local `ops list`/`ops describe`. The two
+/// are pinned to each other by T23's `u05_cli_ops_equal_core`.
 pub(crate) fn describe_env() -> DescribeEnv {
     DescribeEnv {
         limits_source: LimitsSource::Default,
@@ -60,6 +60,7 @@ pub(crate) fn ops_describe(op_id: &str) -> Envelope {
     match get(op_id) {
         Some(spec) => succeeded(describe(spec, &describe_env())),
         None => {
+            let op_id = clip(op_id);
             let mut details = serde_json::Map::new();
             details.insert("op_id".into(), json!(op_id));
             usage(&format!("unknown op id: {op_id}"), details)
@@ -71,9 +72,10 @@ pub(crate) fn help(path: &[String]) -> Envelope {
     match help_text(path) {
         Some(text) => succeeded(json!({ "help": text })),
         None => {
+            let command = clip(&path.join(" "));
             let mut details = serde_json::Map::new();
-            details.insert("command".into(), json!(path.join(" ")));
-            usage(&format!("unknown command: {}", path.join(" ")), details)
+            details.insert("command".into(), json!(command));
+            usage(&format!("unknown command: {command}"), details)
         }
     }
 }
@@ -117,6 +119,24 @@ mod tests {
             err.details.and_then(|d| d.get("op_id").cloned()),
             Some(json!("jira.nope"))
         );
+    }
+
+    #[test]
+    fn echoed_op_id_and_command_are_clipped() {
+        let long = "x".repeat(10_000);
+        let env = ops_describe(&long);
+        let err = env.error.unwrap_or_else(|| panic!("error"));
+        assert!(err.message.chars().count() <= "unknown op id: ".len() + 83);
+        let op_id = err.details.and_then(|d| d.get("op_id").cloned());
+        assert_eq!(
+            op_id.and_then(|v| v.as_str().map(|s| s.chars().count())),
+            Some(83)
+        );
+
+        let path = vec![long];
+        let env = help(&path);
+        let err = env.error.unwrap_or_else(|| panic!("error"));
+        assert!(err.message.chars().count() <= "unknown command: ".len() + 83);
     }
 
     #[test]

@@ -271,6 +271,18 @@ fn set_once<T>(slot: &mut Option<T>, flag: &str, value: T) -> Result<(), ParseEr
     Ok(())
 }
 
+/// Longest echo of user text in an error message or detail.
+const CLIP_CHARS: usize = 80;
+
+/// `s` cut to `CLIP_CHARS` characters (never mid-character), with `...` when cut. Keeps a huge
+/// argument from being echoed whole into an error envelope.
+pub(crate) fn clip(s: &str) -> String {
+    match s.char_indices().nth(CLIP_CHARS) {
+        Some((cut, _)) => format!("{}...", &s[..cut]),
+        None => s.to_string(),
+    }
+}
+
 pub(crate) fn parse(
     args: &[OsString],
     env: &dyn Fn(&str) -> Option<OsString>,
@@ -287,11 +299,13 @@ pub(crate) fn parse(
     let mut flags = Flags::default();
     // `requests list --agent` filters by the explicit flag only, not the environment fallback.
     let mut agent_flag: Option<String> = None;
+    let mut output_flag: Option<OutputMode> = None;
     let mut pos: Vec<String> = Vec::new();
     let mut parser = lexopt::Parser::from_args(args.iter().cloned());
     while let Some(arg) = parser.next().map_err(lex_error)? {
         match arg {
             lexopt::Arg::Value(v) => pos.push(text(v)?),
+            lexopt::Arg::Short('h') => opts.help = true,
             lexopt::Arg::Short(c) => {
                 return Err(ParseError::arg(
                     format!("unknown flag: -{c}"),
@@ -307,11 +321,11 @@ pub(crate) fn parse(
                     }
                     "agent" => {
                         let v = value(&mut parser)?;
-                        agent_flag = Some(v.clone());
+                        set_once(&mut agent_flag, &flag, v.clone())?;
                         opts.agent = Some(v);
                     }
-                    "reason" => opts.reason = Some(value(&mut parser)?),
-                    "instance" => opts.instance = Some(value(&mut parser)?),
+                    "reason" => set_once(&mut opts.reason, &flag, value(&mut parser)?)?,
+                    "instance" => set_once(&mut opts.instance, &flag, value(&mut parser)?)?,
                     "timeout" => {
                         let raw = value(&mut parser)?;
                         let secs = raw.parse::<u64>().map_err(|_| {
@@ -320,10 +334,10 @@ pub(crate) fn parse(
                                 "--timeout",
                             )
                         })?;
-                        opts.timeout = Some(secs);
+                        set_once(&mut opts.timeout, &flag, secs)?;
                     }
                     "output" => {
-                        opts.output = match value(&mut parser)?.as_str() {
+                        let mode = match value(&mut parser)?.as_str() {
                             "json" => OutputMode::Json,
                             "text" => OutputMode::Text,
                             _ => {
@@ -333,11 +347,15 @@ pub(crate) fn parse(
                                 ));
                             }
                         };
+                        set_once(&mut output_flag, &flag, mode)?;
                     }
                     _ => {
                         let (kind, _) = classify(&pos);
                         let Some(arity) = flag_arity(kind, &flag) else {
-                            return Err(ParseError::arg(format!("unknown flag: {flag}"), &flag));
+                            return Err(ParseError::arg(
+                                format!("unknown flag: {}", clip(&flag)),
+                                &clip(&flag),
+                            ));
                         };
                         match arity {
                             Arity::Skip => {
@@ -373,6 +391,9 @@ pub(crate) fn parse(
                 }
             }
         }
+    }
+    if let Some(mode) = output_flag {
+        opts.output = mode;
     }
     if opts.agent.is_none() {
         opts.agent = env("ATLAS_DUCK_AGENT")
@@ -413,8 +434,8 @@ fn exactly<'a>(rest: &'a [String], names: &[&str]) -> Result<&'a [String], Parse
     }
     if let Some(extra) = rest.get(names.len()) {
         return Err(ParseError::arg(
-            format!("unexpected argument: {extra}"),
-            extra,
+            format!("unexpected argument: {}", clip(extra)),
+            &clip(extra),
         ));
     }
     Ok(rest)
@@ -431,16 +452,17 @@ fn build(
     let id_of = |rest: &[String]| rest.first().cloned().unwrap_or_default();
     match kind {
         Kind::Empty => Err(ParseError::new("no command given")),
-        Kind::Incomplete => Err(ParseError::new(format!(
-            "incomplete command: {}; try `atlas-duck {} --help`",
-            pos.join(" "),
-            pos.join(" ")
-        ))
-        .with("command", pos.join(" "))),
-        Kind::Unknown => Err(
-            ParseError::new(format!("unknown command: {}", pos.join(" ")))
-                .with("command", pos.join(" ")),
-        ),
+        Kind::Incomplete => {
+            let command = clip(&pos.join(" "));
+            Err(ParseError::new(format!(
+                "incomplete command: {command}; try `atlas-duck {command} --help`"
+            ))
+            .with("command", command))
+        }
+        Kind::Unknown => {
+            let command = clip(&pos.join(" "));
+            Err(ParseError::new(format!("unknown command: {command}")).with("command", command))
+        }
         Kind::Help => Ok(Command::Help {
             path: rest.to_vec(),
         }),
@@ -530,6 +552,7 @@ fn build(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -550,6 +573,86 @@ mod tests {
         match parse(&args(list), &no_env) {
             Ok(v) => panic!("parse {list:?} should fail, got {v:?}"),
             Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn repeated_global_flags_are_usage_errors() {
+        for (list, flag) in [
+            (
+                &["--agent", "a", "--agent", "b", "ops", "list"][..],
+                "--agent",
+            ),
+            (
+                &["--reason", "a", "--reason", "b", "ops", "list"][..],
+                "--reason",
+            ),
+            (
+                &["--instance", "a", "--instance", "b", "ops", "list"][..],
+                "--instance",
+            ),
+            (
+                &["--timeout", "5", "--timeout", "6", "ops", "list"][..],
+                "--timeout",
+            ),
+            (
+                &["--output", "json", "--output", "text", "ops", "list"][..],
+                "--output",
+            ),
+        ] {
+            let e = err(list);
+            assert_eq!(
+                e.message,
+                format!("{flag} given more than once"),
+                "{list:?}"
+            );
+            assert_eq!(e.details.get("arg"), Some(&json!(flag)), "{list:?}");
+        }
+    }
+
+    #[test]
+    fn short_h_is_help() {
+        assert!(ok(&["-h"]).0.help);
+        assert_eq!(
+            ok(&["ops", "list", "-h"]).1,
+            Command::Help {
+                path: vec!["ops".into(), "list".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn huge_timeout_parses_without_overflow() {
+        let (opts, _) = ok(&["--timeout", "18446744073709551615", "instances"]);
+        assert_eq!(opts.timeout, Some(u64::MAX));
+    }
+
+    #[test]
+    fn clip_is_char_safe_and_bounded() {
+        assert_eq!(clip("short"), "short");
+        assert_eq!(clip(&"a".repeat(80)), "a".repeat(80));
+        let clipped = clip(&"é".repeat(100));
+        assert_eq!(clipped, format!("{}...", "é".repeat(80)));
+    }
+
+    #[test]
+    fn echoed_argv_text_is_clipped() {
+        let long = "x".repeat(10_000);
+        let flag = format!("--{long}");
+        for list in [
+            vec!["ops", "list", long.as_str()],
+            vec!["ops", "list", flag.as_str()],
+            vec![long.as_str()],
+        ] {
+            let e = err(&list);
+            assert!(
+                e.message.chars().count() <= 120,
+                "message: {}",
+                e.message.len()
+            );
+            for value in e.details.values().filter_map(Value::as_str) {
+                assert!(value.chars().count() <= 83, "detail not clipped");
+            }
         }
     }
 
