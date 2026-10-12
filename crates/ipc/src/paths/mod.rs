@@ -6,6 +6,7 @@
 //! `cli.toml` are host-qualified on macOS/Linux (§7.7 Machine-local files).
 
 mod base_dirs;
+mod endpoint;
 mod host;
 pub mod keyring;
 mod locality;
@@ -13,6 +14,14 @@ mod pinned;
 mod resolve;
 
 pub use base_dirs::{BaseDirs, FirstRunDefaults, base_dirs, first_run_defaults};
+#[cfg(windows)]
+pub use endpoint::current_user_sid_string;
+pub use endpoint::{
+    ENDPOINT_FILE, EndpointLocation, MAX_ENDPOINT_NAME_LEN, SOCKET_FILE_NAME, endpoint_location,
+    pipe_name_has_prefix, read_endpoint_file, remove_endpoint_file, write_endpoint_file,
+};
+#[cfg(unix)]
+pub use endpoint::{ensure_socket_dir, socket_dir};
 pub use host::{MAX_HOST_COMPONENT_LEN, host_name, raw_host_name, sanitize_host_component};
 pub use locality::{
     Locality, MACOS_MNT_LOCAL, NotLocalKind, OVERLAYFS_SUPER_MAGIC, check_locality,

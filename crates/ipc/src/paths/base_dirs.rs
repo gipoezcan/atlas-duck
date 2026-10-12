@@ -47,7 +47,8 @@ impl BaseDirs {
     }
 }
 
-/// Resolves the current user's base folders. Reads no environment variable.
+/// Resolves the current user's base folders. Reads no environment variable
+/// (the test-only `test-paths` feature reads `ATLAS_DUCK_TEST_HOME`, PD-01).
 ///
 /// The known-folder values in the registry are `REG_EXPAND_SZ` strings such as
 /// `%USERPROFILE%\AppData\Local`. An explicit process token makes the shell
@@ -58,6 +59,10 @@ impl BaseDirs {
 /// the outcome either way.
 #[cfg(windows)]
 pub fn base_dirs() -> io::Result<BaseDirs> {
+    #[cfg(feature = "test-paths")]
+    if let Some(home) = test_home()? {
+        return Ok(test_base_dirs(home));
+    }
     use windows_sys::Win32::UI::Shell::{
         FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_RoamingAppData,
     };
@@ -72,11 +77,11 @@ pub fn base_dirs() -> io::Result<BaseDirs> {
 /// The current process's primary token, opened with the rights
 /// `SHGetKnownFolderPath` documents for its `hToken` argument.
 #[cfg(windows)]
-struct ProcessToken(windows_sys::Win32::Foundation::HANDLE);
+pub(super) struct ProcessToken(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl ProcessToken {
-    fn open() -> io::Result<Self> {
+    pub(super) fn open() -> io::Result<Self> {
         use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_IMPERSONATE, TOKEN_QUERY};
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
         let mut handle: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
@@ -93,6 +98,11 @@ impl ProcessToken {
             return Err(io::Error::last_os_error());
         }
         Ok(Self(handle))
+    }
+
+    /// The open token handle; valid while `self` lives.
+    pub(super) fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        self.0
     }
 }
 
@@ -133,14 +143,56 @@ fn known_folder(id: &windows_sys::core::GUID, token: &ProcessToken) -> io::Resul
 }
 
 /// Resolves the current user's base folders from the passwd database
-/// (`getpwuid_r(geteuid())`). Reads no environment variable.
+/// (`getpwuid_r(geteuid())`). Reads no environment variable (the test-only
+/// `test-paths` feature reads `ATLAS_DUCK_TEST_HOME`, PD-01).
 #[cfg(unix)]
 pub fn base_dirs() -> io::Result<BaseDirs> {
+    #[cfg(feature = "test-paths")]
+    if let Some(home) = test_home()? {
+        return Ok(test_base_dirs(home));
+    }
     Ok(BaseDirs {
         home: passwd_home()?,
         local_app_data: None,
         roaming_app_data: None,
     })
+}
+
+/// PD-01: the variable the `test-paths` feature reads. Nothing else in a
+/// build without the feature reads it.
+#[cfg(feature = "test-paths")]
+pub(super) const TEST_HOME_ENV: &str = "ATLAS_DUCK_TEST_HOME";
+
+/// PD-01 test home: `Some(H)` when `ATLAS_DUCK_TEST_HOME` is set to an
+/// absolute existing directory `H`, `None` when it is unset. Any other
+/// value is an error, so a mistyped test home never falls back to the real
+/// one.
+#[cfg(feature = "test-paths")]
+pub(super) fn test_home() -> io::Result<Option<PathBuf>> {
+    let Some(value) = std::env::var_os(TEST_HOME_ENV) else {
+        return Ok(None);
+    };
+    let home = PathBuf::from(value);
+    if home.is_absolute() && home.is_dir() {
+        Ok(Some(home))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "ATLAS_DUCK_TEST_HOME must be an absolute existing directory",
+        ))
+    }
+}
+
+/// PD-01: the same layout on every OS, so the Windows folders are testable
+/// everywhere.
+#[cfg(feature = "test-paths")]
+fn test_base_dirs(home: PathBuf) -> BaseDirs {
+    let app_data = home.join("AppData");
+    BaseDirs {
+        local_app_data: Some(app_data.join("Local")),
+        roaming_app_data: Some(app_data.join("Roaming")),
+        home,
+    }
 }
 
 #[cfg(unix)]

@@ -9,7 +9,10 @@ publish.workspace = true
 default = ["async"]
 # Gates the tokio-based codecs. The sandbox worker
 # depends on this crate with default-features = false and stays tokio-free.
-async = ["dep:tokio", "dep:tokio-util", "dep:tracing", "dep:async-trait", "dep:sha2", "dep:getrandom"]
+async = ["dep:tokio", "dep:tokio-util", "dep:tracing", "dep:async-trait", "dep:getrandom"]
+# PD-01: `paths::base_dirs()` and `paths::socket_dir()` honour `ATLAS_DUCK_TEST_HOME`. Test builds
+# only: a release build with it fails to compile (lib.rs), and only the test forwarders may enable it.
+test-paths = []
 
 [dependencies]
 serde = { workspace = true }
@@ -20,7 +23,8 @@ tokio = { workspace = true, optional = true, features = ["net", "io-util", "time
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
+# Not optional: the Windows pipe-name prefix (`paths::endpoint_location`) hashes the user SID.
+sha2 = { workspace = true }
 getrandom = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -34,6 +38,7 @@ system-configuration-sys = { workspace = true }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_SystemInformation",
