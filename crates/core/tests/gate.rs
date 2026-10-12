@@ -218,7 +218,21 @@ async fn gate_method_split() -> TestResult {
         );
         let unknown = h.ops_describe("no.such.op", None).await;
         assert_eq!(unknown.status, Status::Failed);
-        assert_eq!(unknown.error.ok_or("no error")?.code, ErrorCode::Usage);
+        let err = unknown.error.ok_or("no error")?;
+        assert_eq!(err.code, ErrorCode::Usage);
+        // The same answer the CLI gives locally (pinned by `u05_cli_ops_equal_core`).
+        assert_eq!(err.message, "unknown op id: no.such.op");
+        assert_eq!(
+            err.details.and_then(|d| d.get("op_id").cloned()),
+            Some(json!("no.such.op"))
+        );
+        let long = format!("{}é", "x".repeat(200));
+        let clipped = h.ops_describe(&long, None).await;
+        let echoed = clipped
+            .error
+            .and_then(|e| e.details)
+            .and_then(|d| d.get("op_id").cloned());
+        assert_eq!(echoed, Some(json!(format!("{}...", "x".repeat(80)))));
 
         assert_eq!(h.ops_list(Some("x")).await, want);
         assert_eq!(h.ops_describe("jira.issue.get", Some("x")).await, want);

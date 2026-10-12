@@ -205,11 +205,34 @@ pub fn ops_list_local() -> Envelope {
     succeeded(atlas_duck_registry::ops_list_json(&describe_env()))
 }
 
-/// `ops.describe` without `instance` (PD-16); an unknown id is a `usage` failure.
+/// Longest echo of an op id in the local `usage` failure (the CLI's `argv::clip`, pinned by the
+/// `u05_cli_ops_equal_core` flow: the two answers are byte-equal).
+const ECHO_CHARS: usize = 80;
+
+/// `op_id` cut to `ECHO_CHARS` characters (never mid-character), with `...` when cut.
+fn clip_echo(op_id: &str) -> String {
+    match op_id.char_indices().nth(ECHO_CHARS) {
+        Some((cut, _)) => format!("{}...", op_id.get(..cut).unwrap_or_default()),
+        None => op_id.to_owned(),
+    }
+}
+
+/// `ops.describe` without `instance` (PD-16); an unknown id is a `usage` failure with
+/// `details {op_id}`, the same answer the CLI gives locally (PD-10).
 pub fn ops_describe_local(op_id: &str) -> Envelope {
     match atlas_duck_registry::get(op_id) {
         Some(spec) => succeeded(describe(spec, &describe_env())),
-        None => Envelope::failed(ErrorCode::Usage, false, &format!("unknown op id: {op_id}")),
+        None => {
+            let echoed = clip_echo(op_id);
+            let mut env =
+                Envelope::failed(ErrorCode::Usage, false, &format!("unknown op id: {echoed}"));
+            if let Some(err) = env.error.as_mut() {
+                let mut d = Map::new();
+                d.insert("op_id".into(), Value::String(echoed));
+                err.details = Some(d);
+            }
+            env
+        }
     }
 }
 
