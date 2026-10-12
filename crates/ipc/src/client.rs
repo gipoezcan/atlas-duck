@@ -6,6 +6,10 @@
 //! dir; Windows reads `<data>/endpoint` on every connect (the server may have rebound under a
 //! fresh name) and accepts only a name with this user's SID prefix.
 //!
+//! The hello frame is built before anything is opened: `agent_name` and `cwd_basename` cut to
+//! 64 characters (§3.3), the whole frame at most [`HELLO_MAX_BYTES`] (the server's first-frame
+//! cap), its answer read with the same cap.
+//!
 //! After the hello, one background task per client reads every frame the server sends: a
 //! response goes to the waiting call by id, a `request.progress` notification to the active
 //! progress callback. A call whose future is dropped leaves the connection usable; its answer
@@ -18,11 +22,12 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncWrite, ReadHalf, WriteHalf};
+use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -34,6 +39,7 @@ use crate::rpc::{
     Incoming, Notification, Request, Response, ResponseBody, RpcError, TwoPointZero, codes, method,
 };
 use crate::sandbox::MAX_FRAME_BYTES;
+use crate::server::HELLO_MAX_BYTES;
 use crate::transport::Conn;
 
 /// The server-owner check `connect_at` runs before the first byte (§3.2 (a)): Unix
@@ -54,9 +60,21 @@ const PROGRESS_QUEUE: usize = 64;
 /// case the server rebound under a fresh name in between.
 #[cfg(windows)]
 const ENDPOINT_READS: usize = 3;
+/// §3.3: `agent_name` and `cwd_basename` are at most this many characters.
+const HELLO_FIELD_MAX_CHARS: usize = 64;
+/// After a write found the server gone, how long the call waits for an answer the server may
+/// have sent before it closed (e.g. a `null`-id refusal of the frame). The reader sees the
+/// close at once, so this only bounds a peer that stopped reading but kept the connection.
+const GONE_ANSWER_WAIT: Duration = Duration::from_millis(500);
+/// `server_build` of a `protocol_mismatch` refusal without one (PD-08 texts print it).
+pub const UNKNOWN_BUILD: &str = "unknown";
 
 const MSG_WRONG_LOCATION: &str = "endpoint location is not for this OS";
 const MSG_BAD_HELLO_ANSWER: &str = "the server's answer to hello is not a hello reply";
+const MSG_HELLO_NO_ENVELOPE: &str = "the server refused hello without an envelope";
+const MSG_HELLO_WRONG_ID: &str = "the server answered a request other than hello";
+const MSG_HELLO_ANSWER_TOO_LARGE: &str = "the server's answer to hello exceeds 64 KiB";
+const MSG_HELLO_TOO_LARGE: &str = "the hello exceeds the 64 KiB first-frame limit";
 const MSG_ENCODE: &str = "the request could not be encoded";
 const MSG_TOO_LARGE: &str = "the request exceeds the 24 MiB frame limit";
 const MSG_TORN: &str = "an earlier call was cancelled while its request was being written";
@@ -85,25 +103,33 @@ pub enum ConnectError {
     /// hello frame without an answer (a Windows server does that to a client whose SID it
     /// refuses). Exit 5 `server_identity`.
     ServerIdentity,
-    /// CLI-local busy, never a launch: Windows `ERROR_PIPE_BUSY` after the `WaitNamedPipeW`
-    /// wait, Unix `EAGAIN` from `connect` (the listen backlog is full). Exit 11 with
-    /// `retry_after_s: 5`.
+    /// CLI-local busy, never a launch: Windows `ERROR_PIPE_BUSY` after the full 5 s
+    /// `WaitNamedPipeW` wait, Unix `EAGAIN` from `connect` (the listen backlog is full). Exit
+    /// 11 with `retry_after_s: 5`. A Windows connect whose deadline left less than those 5 s
+    /// for the wait is `DeadlineExceeded` instead (§4.7).
     PipeBusy,
     /// The server's connection limit (PD-27): the hello was refused with `busy`.
     Busy { retry_after_s: u64 },
     /// The deadline passed before the hello round trip completed; nothing was submitted.
+    /// Exit 5 `launch_timeout` (§4.7), never 11.
     DeadlineExceeded,
     /// `protocol_mismatch` (§3.3): the hello was refused for another build, or the server
-    /// answered with a build other than ours. `client_newer` per PD-08.
+    /// answered with a build other than ours. `client_newer` per PD-08. `server_build` is
+    /// [`UNKNOWN_BUILD`] when the refusal did not name it (then `client_newer` is false).
     BuildMismatch {
         client_newer: bool,
         client_build: String,
         server_build: String,
     },
     /// Any other hello refusal, as the server's envelope: every other `-32000` refusal, and a
-    /// protocol error the server answered the hello with.
+    /// protocol error the server answered the hello with (e.g. `frame_too_large`, `null` id).
     Hello(Envelope),
-    /// Any other IO error, or an answer that is not a JSON-RPC response to the hello.
+    /// The server's answer to the hello breaks the protocol: an oversize frame, not a JSON-RPC
+    /// message, a server request, a response to another id, an error without an envelope, or
+    /// a result that is not a hello reply. Exit 1 `protocol_error`, like `ClientError::Protocol`.
+    Protocol(String),
+    /// The hello could not be encoded or exceeds [`HELLO_MAX_BYTES`] (`InvalidInput`, nothing
+    /// was opened), or any other IO error.
     Io(io::Error),
 }
 
@@ -129,6 +155,7 @@ impl fmt::Display for ConnectError {
                 Some(e) => write!(f, "hello refused: {}", e.message),
                 None => f.write_str("hello refused"),
             },
+            ConnectError::Protocol(m) => write!(f, "protocol error: {m}"),
             ConnectError::Io(e) => write!(f, "connect failed: {e}"),
         }
     }
@@ -221,7 +248,8 @@ pub struct IpcClient {
 /// Why no further call can be made.
 #[derive(Debug, Clone, Copy)]
 enum Unusable {
-    /// A call's future was dropped while its frame was being written.
+    /// A call's future was dropped after the first byte of its frame was written and before
+    /// the last.
     Torn,
     /// A write failed.
     Lost,
@@ -271,13 +299,14 @@ impl IpcClient {
         if Instant::now() >= deadline {
             return Err(ConnectError::DeadlineExceeded);
         }
+        let frame = hello_frame(hello).map_err(ConnectError::Io)?;
         let at = tokio::time::Instant::from_std(deadline);
         let conn = tokio::time::timeout_at(at, open(location, data, check, deadline))
             .await
             .map_err(|_| ConnectError::DeadlineExceeded)??;
         let (mut rd, mut wr) = conn.split();
         // Not cancel-safe (a frame read): on a timeout the connection is dropped.
-        let reply = tokio::time::timeout_at(at, handshake(&mut rd, &mut wr, hello))
+        let reply = tokio::time::timeout_at(at, handshake(&mut rd, &mut wr, &frame, hello))
             .await
             .map_err(|_| ConnectError::DeadlineExceeded)??;
         if reply.build_id != hello.build_id {
@@ -318,6 +347,11 @@ impl IpcClient {
     /// `call`, passing every `request.progress` notification that arrives before the answer to
     /// `on_progress`, in order. If the notification queue (64) overflows, the newest are
     /// dropped; the answer always arrives.
+    ///
+    /// Only notifications for the request named by `params.request_id` (a string; the server
+    /// sends progress only for `request.await`) reach `on_progress`: a call dropped earlier
+    /// may still be awaiting another request on the server, and its progress is not this
+    /// call's. Without a `request_id` param nothing reaches `on_progress`.
     pub async fn call_with_progress<R: DeserializeOwned>(
         &mut self,
         method: &str,
@@ -340,7 +374,7 @@ impl IpcClient {
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
-        let bytes = encode_request(id, method, params).map_err(ClientError::Io)?;
+        let (bytes, progress_of) = encode_request(id, method, params).map_err(ClientError::Io)?;
 
         let (tx, mut answer) = oneshot::channel();
         let (progress_tx, mut progress) = mpsc::channel(PROGRESS_QUEUE);
@@ -350,25 +384,29 @@ impl IpcClient {
                 return Err(closed.to_error());
             }
             r.waiting = Some((id, tx));
-            r.progress = on_progress.is_some().then_some(progress_tx);
+            r.progress = match (&on_progress, progress_of) {
+                (Some(_), Some(request_id)) => Some((request_id, progress_tx)),
+                _ => None,
+            };
         }
         let _unroute = Unroute {
             routes: &self.routes,
             id,
         };
 
-        self.unusable = Some(Unusable::Torn);
+        // A future dropped after the first byte leaves the stream torn (`Tracked`).
         let mut tracked = Tracked {
             inner: &mut self.writer,
             wrote: &mut self.written,
+            unusable: &mut self.unusable,
         };
         if let Err(e) = write_frame_async(&mut tracked, &bytes).await {
             self.unusable = Some(Unusable::Lost);
-            return Err(if is_gone(&e) {
-                ClientError::ConnectionLost
-            } else {
-                ClientError::Io(e)
-            });
+            return match answer_after_write_error(&e, &mut answer).await {
+                Some(response) => answer_of(method, response),
+                None if is_gone(&e) => Err(ClientError::ConnectionLost),
+                None => Err(ClientError::Io(e)),
+            };
         }
         self.unusable = None;
 
@@ -390,14 +428,9 @@ impl IpcClient {
                 f(n);
             }
         }
-        let response = match got {
-            Ok(r) => r,
-            Err(_) => return Err(self.closed_error()),
-        };
-        match response.body {
-            ResponseBody::Result(v) => serde_json::from_value(v)
-                .map_err(|e| ClientError::Protocol(format!("unexpected answer to {method}: {e}"))),
-            ResponseBody::Error(e) => Err(ClientError::Rpc(e)),
+        match got {
+            Ok(response) => answer_of(method, response),
+            Err(_) => Err(self.closed_error()),
         }
     }
 
@@ -409,20 +442,62 @@ impl IpcClient {
     }
 }
 
-/// The request frame; `InvalidInput` if it cannot be encoded or is over the frame limit.
-fn encode_request(id: u64, method: &str, params: impl Serialize) -> io::Result<Vec<u8>> {
-    let encode = |_| io::Error::new(io::ErrorKind::InvalidInput, MSG_ENCODE);
+/// The request frame and its `params.request_id` (the request whose progress the call may
+/// see); `InvalidInput` if it cannot be encoded or is over the frame limit.
+fn encode_request(
+    id: u64,
+    method: &str,
+    params: impl Serialize,
+) -> io::Result<(Vec<u8>, Option<String>)> {
+    let params = serde_json::to_value(params).map_err(|_| encode_error())?;
+    let request_id = params
+        .get("request_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let req = Request {
         jsonrpc: TwoPointZero,
         id,
         method: method.to_owned(),
-        params: serde_json::to_value(params).map_err(encode)?,
+        params,
     };
-    let bytes = serde_json::to_vec(&req).map_err(encode)?;
+    let bytes = serde_json::to_vec(&req).map_err(|_| encode_error())?;
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, MSG_TOO_LARGE));
     }
-    Ok(bytes)
+    Ok((bytes, request_id))
+}
+
+fn encode_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, MSG_ENCODE)
+}
+
+/// After a call's write failed: the answer the server sent before it closed (a `null`-id
+/// refusal of a frame it did not read whole), which wins over the write error. A gone peer's
+/// answer may still be on its way through the reader, which ends at the close; it is waited
+/// for (bounded). Otherwise only an answer already routed counts.
+async fn answer_after_write_error(
+    e: &io::Error,
+    answer: &mut oneshot::Receiver<Response>,
+) -> Option<Response> {
+    if is_gone(e) {
+        tokio::time::timeout(GONE_ANSWER_WAIT, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        answer.try_recv().ok()
+    }
+}
+
+/// A call's answer: the result as `R`, or the JSON-RPC error.
+// The error carries a whole envelope (`ClientError::Rpc`).
+#[allow(clippy::result_large_err)]
+fn answer_of<R: DeserializeOwned>(method: &str, response: Response) -> Result<R, ClientError> {
+    match response.body {
+        ResponseBody::Result(v) => serde_json::from_value(v)
+            .map_err(|e| ClientError::Protocol(format!("unexpected answer to {method}: {e}"))),
+        ResponseBody::Error(e) => Err(ClientError::Rpc(e)),
+    }
 }
 
 /// The peer is gone (as opposed to some other IO failure).
@@ -437,8 +512,8 @@ fn is_gone(e: &io::Error) -> bool {
     )
 }
 
-fn invalid_data(msg: &str) -> ConnectError {
-    ConnectError::Io(io::Error::new(io::ErrorKind::InvalidData, msg))
+fn protocol(msg: &str) -> ConnectError {
+    ConnectError::Protocol(msg.to_owned())
 }
 
 // ---------- connect ----------
@@ -479,13 +554,20 @@ async fn open(
     deadline: Instant,
 ) -> Result<Conn, ConnectError> {
     use crate::paths::{pipe_name_has_prefix, read_endpoint_file};
-    use crate::transport::windows::{ConnectFailure, connect_checked};
+    use crate::transport::windows::{BUSY_WAIT_MAX, ConnectFailure, connect_checked};
 
     let EndpointLocation::WindowsPipePrefix(prefix) = location else {
         return Err(ConnectError::Io(io::Error::new(
             io::ErrorKind::InvalidInput,
             MSG_WRONG_LOCATION,
         )));
+    };
+    // §4.7: busy (exit 11) only after the full busy wait; a wait the deadline cut short is the
+    // deadline (exit 5 `launch_timeout`).
+    let busy = if deadline.saturating_duration_since(Instant::now()) < BUSY_WAIT_MAX {
+        ConnectError::DeadlineExceeded
+    } else {
+        ConnectError::PipeBusy
     };
     let mut gone: Option<String> = None;
     for _ in 0..ENDPOINT_READS {
@@ -505,7 +587,7 @@ async fn open(
         match connect_checked(&name, check, deadline).await {
             Ok(client) => return Ok(Conn::new(client)),
             Err(ConnectFailure::NotFound) => gone = Some(name),
-            Err(ConnectFailure::PipeBusy) => return Err(ConnectError::PipeBusy),
+            Err(ConnectFailure::PipeBusy) => return Err(busy),
             Err(ConnectFailure::ServerIdentity) => return Err(ConnectError::ServerIdentity),
             Err(ConnectFailure::Io(e)) => return Err(ConnectError::Io(e)),
         }
@@ -513,61 +595,93 @@ async fn open(
     Err(ConnectError::NotRunning)
 }
 
-/// Writes `hello` and reads its answer. No answer at all (EOF or a read error after the hello
-/// frame) is `ServerIdentity`: a server that refuses the client's identity closes unanswered.
-async fn handshake(
-    rd: &mut ReadHalf<Conn>,
-    wr: &mut WriteHalf<Conn>,
-    hello: &Hello,
-) -> Result<HelloReply, ConnectError> {
+/// The `hello` request frame: `agent_name` and `cwd_basename` cut to 64 characters (§3.3);
+/// `InvalidInput` if it cannot be encoded or exceeds the first-frame cap [`HELLO_MAX_BYTES`]
+/// (the server would refuse it with `frame_too_large`).
+fn hello_frame(hello: &Hello) -> io::Result<Vec<u8>> {
+    let mut hello = hello.clone();
+    if let Some(name) = hello.agent_name.as_mut() {
+        truncate_chars(name, HELLO_FIELD_MAX_CHARS);
+    }
+    truncate_chars(&mut hello.cwd_basename, HELLO_FIELD_MAX_CHARS);
     let req = Request {
         jsonrpc: TwoPointZero,
         id: HELLO_ID,
         method: method::HELLO.to_owned(),
-        params: serde_json::to_value(hello).map_err(|_| invalid_data(MSG_ENCODE))?,
+        params: serde_json::to_value(&hello).map_err(|_| encode_error())?,
     };
-    let bytes = serde_json::to_vec(&req).map_err(|_| invalid_data(MSG_ENCODE))?;
-    if let Err(e) = write_frame_async(wr, &bytes).await {
-        return Err(if is_gone(&e) {
-            ConnectError::ServerIdentity
-        } else {
-            ConnectError::Io(e)
-        });
+    let bytes = serde_json::to_vec(&req).map_err(|_| encode_error())?;
+    if bytes.len() > HELLO_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            MSG_HELLO_TOO_LARGE,
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Keeps the first `max` characters of `s`.
+fn truncate_chars(s: &mut String, max: usize) {
+    if let Some((at, _)) = s.char_indices().nth(max) {
+        s.truncate(at);
+    }
+}
+
+/// Writes the hello `frame` and reads its answer. A write that finds the server gone still
+/// reads: a server that refuses the frame (`frame_too_large`) answers and closes without
+/// reading all of it. No answer at all (EOF or a read error) is `ServerIdentity`: a server
+/// that refuses the client's identity closes unanswered.
+async fn handshake<R, W>(
+    rd: &mut R,
+    wr: &mut W,
+    frame: &[u8],
+    hello: &Hello,
+) -> Result<HelloReply, ConnectError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if let Err(e) = write_frame_async(wr, frame).await
+        && !is_gone(&e)
+    {
+        return Err(ConnectError::Io(e));
     }
     loop {
-        let frame = match read_frame_async(rd, MAX_FRAME_BYTES).await {
+        let frame = match read_frame_async(rd, HELLO_MAX_BYTES).await {
             Ok(Some(frame)) => frame,
             Ok(None) | Err(FrameError::Truncated | FrameError::Io(_)) => {
                 return Err(ConnectError::ServerIdentity);
             }
-            Err(FrameError::TooLarge { .. }) => return Err(invalid_data(MSG_BAD_HELLO_ANSWER)),
+            Err(FrameError::TooLarge { .. }) => return Err(protocol(MSG_HELLO_ANSWER_TOO_LARGE)),
         };
-        match serde_json::from_slice::<Incoming>(&frame) {
+        return match serde_json::from_slice::<Incoming>(&frame) {
             Ok(Incoming::Notification(_)) => continue,
-            Ok(Incoming::Response(r)) if r.id.is_none() || r.id == Some(HELLO_ID) => {
-                return hello_answer(r, hello);
-            }
-            _ => return Err(invalid_data(MSG_BAD_HELLO_ANSWER)),
-        }
+            Ok(Incoming::Response(r)) => hello_answer(r, hello),
+            Ok(Incoming::Request(_)) => Err(protocol(MSG_SERVER_REQUEST)),
+            Err(_) => Err(protocol(MSG_BAD_MESSAGE)),
+        };
     }
 }
 
+/// The answer to the hello: a result with id 1, or an error with id 1 or `null` (the server
+/// could not read the id). Anything else breaks the protocol.
 // The error carries a whole envelope (`ConnectError::Hello`).
 #[allow(clippy::result_large_err)]
 fn hello_answer(r: Response, hello: &Hello) -> Result<HelloReply, ConnectError> {
-    match r.body {
-        ResponseBody::Result(v) => {
-            serde_json::from_value(v).map_err(|_| invalid_data(MSG_BAD_HELLO_ANSWER))
+    match (r.id, r.body) {
+        (Some(HELLO_ID), ResponseBody::Result(v)) => {
+            serde_json::from_value(v).map_err(|_| protocol(MSG_BAD_HELLO_ANSWER))
         }
-        ResponseBody::Error(e) => Err(hello_refusal(e, hello)),
+        (Some(HELLO_ID) | None, ResponseBody::Error(e)) => Err(hello_refusal(e, hello)),
+        _ => Err(protocol(MSG_HELLO_WRONG_ID)),
     }
 }
 
 /// `-32000` + `protocol_mismatch` → `BuildMismatch`; `-32000` + `busy` → `Busy`; any other
-/// error with an envelope → `Hello(env)`.
+/// error with an envelope → `Hello(env)`; an error without one → `Protocol`.
 fn hello_refusal(e: RpcError, hello: &Hello) -> ConnectError {
     let Some(env) = e.data else {
-        return invalid_data(MSG_BAD_HELLO_ANSWER);
+        return protocol(MSG_HELLO_NO_ENVELOPE);
     };
     if e.code != codes::APP_REFUSAL {
         return ConnectError::Hello(env);
@@ -578,7 +692,8 @@ fn hello_refusal(e: RpcError, hello: &Hello) -> ConnectError {
             let server_build = details
                 .and_then(|d| d.get("server_build"))
                 .and_then(|v| v.as_str())
-                .unwrap_or_default()
+                .filter(|b| !b.is_empty())
+                .unwrap_or(UNKNOWN_BUILD)
                 .to_owned();
             mismatch(&hello.build_id, server_build)
         }
@@ -609,8 +724,8 @@ fn mismatch(client_build: &str, server_build: String) -> ConnectError {
 struct Routes {
     /// The call waiting for its answer (calls are sequential, so at most one).
     waiting: Option<(u64, oneshot::Sender<Response>)>,
-    /// The active progress callback's queue.
-    progress: Option<mpsc::Sender<ProgressNotification>>,
+    /// The active progress callback's queue, and the request whose progress it takes.
+    progress: Option<(String, mpsc::Sender<ProgressNotification>)>,
     /// Set once the reader stopped; no answer will arrive.
     closed: Option<Closed>,
 }
@@ -690,8 +805,8 @@ fn deliver(routes: &Mutex<Routes>, response: Response) {
     }
 }
 
-/// Queues a `request.progress` notification for the active callback, if any; other
-/// notifications and unreadable params are ignored.
+/// Queues a `request.progress` notification for the active callback if it is for the
+/// callback's request; other notifications and unreadable params are ignored.
 fn notify(routes: &Mutex<Routes>, n: Notification) {
     if n.method != method::REQUEST_PROGRESS {
         return;
@@ -699,20 +814,25 @@ fn notify(routes: &Mutex<Routes>, n: Notification) {
     let Ok(p) = serde_json::from_value::<ProgressNotification>(n.params) else {
         return;
     };
-    if let Some(tx) = &lock(routes).progress {
+    if let Some((request_id, tx)) = &lock(routes).progress
+        && *request_id == p.request_id
+    {
         let _ = tx.try_send(p);
     }
 }
 
 // ---------- write tracking ----------
 
-/// A writer that records whether any byte went out (PD-16).
-struct Tracked<'a> {
-    inner: &'a mut WriteHalf<Conn>,
+/// A writer that records whether any byte went out (PD-16) and, once one of this call's did,
+/// marks the stream torn until the caller clears it after the whole frame: a call dropped
+/// before its first byte leaves the stream framed.
+struct Tracked<'a, W> {
+    inner: &'a mut W,
     wrote: &'a mut bool,
+    unusable: &'a mut Option<Unusable>,
 }
 
-impl AsyncWrite for Tracked<'_> {
+impl<W: AsyncWrite + Unpin> AsyncWrite for Tracked<'_, W> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -724,6 +844,7 @@ impl AsyncWrite for Tracked<'_> {
             && n > 0
         {
             *this.wrote = true;
+            *this.unusable = Some(Unusable::Torn);
         }
         polled
     }
@@ -734,5 +855,256 @@ impl AsyncWrite for Tracked<'_> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::proto::{AgentNameSource, ClientKind};
+    use crate::rpc::{ProtocolReason, error_response, protocol_error};
+
+    fn hello() -> Hello {
+        Hello {
+            build_id: "0.1.0+test".to_owned(),
+            client_kind: ClientKind::Cli,
+            agent_name: Some("tester".to_owned()),
+            agent_name_source: AgentNameSource::Flag,
+            cwd_basename: "repo".to_owned(),
+        }
+    }
+
+    /// Every write fails with `kind`.
+    struct Fails(io::ErrorKind);
+
+    impl AsyncWrite for Fails {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(self.0)))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Takes up to `left` bytes, then never completes a write.
+    struct Stalls {
+        left: usize,
+    }
+
+    impl AsyncWrite for Stalls {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.left == 0 {
+                return Poll::Pending;
+            }
+            let n = buf.len().min(self.left);
+            self.left -= n;
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut v = u32::try_from(payload.len())
+            .expect("u32")
+            .to_be_bytes()
+            .to_vec();
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// The server's answer to an oversize first frame: `null` id, `frame_too_large`.
+    fn too_large_refusal() -> Vec<u8> {
+        let env = protocol_error(ProtocolReason::FrameTooLarge);
+        let r = error_response(None, ProtocolReason::FrameTooLarge.code(), env);
+        framed(&serde_json::to_vec(&r).expect("encode"))
+    }
+
+    #[tokio::test]
+    async fn hello_write_to_a_gone_server_still_reads_its_answer() {
+        let frame = hello_frame(&hello()).expect("frame");
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset] {
+            let mut rd = Cursor::new(too_large_refusal());
+            let got = handshake(&mut rd, &mut Fails(kind), &frame, &hello()).await;
+            match got {
+                Err(ConnectError::Hello(env)) => {
+                    let err = env.error.expect("error");
+                    assert_eq!(err.code, ErrorCode::ProtocolError);
+                    let reason = err.details.as_ref().and_then(|d| d.get("reason")).cloned();
+                    assert_eq!(reason, Some(Value::from("frame_too_large")));
+                }
+                other => panic!("{kind:?}: expected Hello(env), got {other:?}"),
+            }
+            // Gone and no answer: the server closed unanswered.
+            let mut rd = Cursor::new(Vec::new());
+            let got = handshake(&mut rd, &mut Fails(kind), &frame, &hello()).await;
+            assert!(matches!(got, Err(ConnectError::ServerIdentity)), "{got:?}");
+        }
+        // Any other write error is the error.
+        let mut rd = Cursor::new(too_large_refusal());
+        let got = handshake(&mut rd, &mut Fails(io::ErrorKind::Other), &frame, &hello()).await;
+        assert!(matches!(got, Err(ConnectError::Io(_))), "{got:?}");
+    }
+
+    #[test]
+    fn hello_fields_cut_to_64_chars() {
+        let mut h = hello();
+        h.agent_name = Some("ä".repeat(100));
+        h.cwd_basename = "😀".repeat(65);
+        let frame = hello_frame(&h).expect("frame");
+        let req: Request = serde_json::from_slice(&frame).expect("request");
+        let sent: Hello = serde_json::from_value(req.params).expect("hello");
+        assert_eq!(sent.agent_name, Some("ä".repeat(64)));
+        assert_eq!(sent.cwd_basename, "😀".repeat(64));
+        assert_eq!(sent.build_id, h.build_id);
+
+        // Short fields and no name are left alone.
+        let mut h = hello();
+        h.agent_name = None;
+        let req: Request = serde_json::from_slice(&hello_frame(&h).expect("frame")).expect("req");
+        let sent: Hello = serde_json::from_value(req.params).expect("hello");
+        assert_eq!(sent, h);
+    }
+
+    #[test]
+    fn hello_frame_capped_at_64k() {
+        let mut h = hello();
+        let base = hello_frame(&h).expect("frame").len() - h.build_id.len();
+        h.build_id = "b".repeat(HELLO_MAX_BYTES - base);
+        assert_eq!(hello_frame(&h).expect("at the cap").len(), HELLO_MAX_BYTES);
+        h.build_id.push('b');
+        let err = hello_frame(&h).expect_err("over the cap");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn torn_only_after_a_byte_of_the_call() {
+        let bytes = [7u8; 16];
+        // Dropped before its first byte: still framed.
+        let (mut wrote, mut unusable) = (false, None);
+        let mut w = Stalls { left: 0 };
+        let mut tracked = Tracked {
+            inner: &mut w,
+            wrote: &mut wrote,
+            unusable: &mut unusable,
+        };
+        let cut = tokio::time::timeout(
+            Duration::from_millis(20),
+            write_frame_async(&mut tracked, &bytes),
+        )
+        .await;
+        assert!(cut.is_err(), "the stalled write completed");
+        assert!(!wrote);
+        assert!(unusable.is_none(), "{unusable:?}");
+
+        // Dropped after some bytes: torn.
+        let (mut wrote, mut unusable) = (false, None);
+        let mut w = Stalls { left: 6 };
+        let mut tracked = Tracked {
+            inner: &mut w,
+            wrote: &mut wrote,
+            unusable: &mut unusable,
+        };
+        let cut = tokio::time::timeout(
+            Duration::from_millis(20),
+            write_frame_async(&mut tracked, &bytes),
+        )
+        .await;
+        assert!(cut.is_err(), "the stalled write completed");
+        assert!(wrote);
+        assert!(matches!(unusable, Some(Unusable::Torn)), "{unusable:?}");
+    }
+
+    fn null_id_answer() -> Response {
+        Response {
+            jsonrpc: TwoPointZero,
+            id: None,
+            body: ResponseBody::Result(Value::Null),
+        }
+    }
+
+    #[tokio::test]
+    async fn answer_after_write_error_waits_only_for_a_gone_peer() {
+        let gone = io::Error::from(io::ErrorKind::BrokenPipe);
+        let other = io::Error::other("other");
+
+        // Gone: an answer the reader routes a moment later still counts.
+        let (tx, mut rx) = oneshot::channel();
+        let late = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(null_id_answer());
+        });
+        assert!(answer_after_write_error(&gone, &mut rx).await.is_some());
+        let _ = late.await;
+
+        // Gone, and the reader closed without one: no wait.
+        let (tx, mut rx) = oneshot::channel::<Response>();
+        drop(tx);
+        let t0 = Instant::now();
+        assert!(answer_after_write_error(&gone, &mut rx).await.is_none());
+        assert!(t0.elapsed() < GONE_ANSWER_WAIT);
+
+        // Another error: only an answer already routed.
+        let (tx, mut rx) = oneshot::channel();
+        assert!(answer_after_write_error(&other, &mut rx).await.is_none());
+        let _ = tx.send(null_id_answer());
+        assert!(answer_after_write_error(&other, &mut rx).await.is_some());
+    }
+
+    /// §4.7: a busy pipe whose deadline leaves less than the 5 s busy wait is the deadline
+    /// (exit 5), not busy (exit 11). `open` alone: `connect_at`'s own timeout races it.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn busy_pipe_inside_a_short_deadline_is_deadline_exceeded() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        use crate::paths::{DataDirResolution, check_data_dir, write_endpoint_file};
+        use crate::transport::windows::{SameUser, new_pipe_name, open_client};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let DataDirResolution::Local(data) = check_data_dir(tmp.path()).expect("check") else {
+            panic!("temp dir is not a local data dir");
+        };
+        let location = endpoint_location(&data, "host").expect("location");
+        let EndpointLocation::WindowsPipePrefix(prefix) = &location else {
+            panic!("not a pipe location");
+        };
+        let name = new_pipe_name(prefix).expect("name");
+        let _only = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .expect("server");
+        let _first = open_client(&name).expect("first client takes the only instance");
+        write_endpoint_file(&data, &name).expect("endpoint file");
+        let check = SameUser::current().expect("own SID");
+        let got = open(
+            &location,
+            &data,
+            &check,
+            Instant::now() + Duration::from_millis(300),
+        )
+        .await;
+        assert!(
+            matches!(got, Err(ConnectError::DeadlineExceeded)),
+            "{:?}",
+            got.err()
+        );
     }
 }

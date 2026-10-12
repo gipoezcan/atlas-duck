@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::client::{
-    ClientContext, ClientError, ConnectError, IpcClient, ServerCheck, compare_build_versions,
+    ClientContext, ClientError, ConnectError, IpcClient, ServerCheck, UNKNOWN_BUILD,
+    compare_build_versions,
 };
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::paths::{EndpointLocation, LocalDataDir};
@@ -21,12 +22,18 @@ use atlas_duck_ipc::proto::{
     AgentNameSource, AwaitParams, ClientKind, Hello, ProgressNotification, RequestHandler,
     SubmitParams, SubmitReply,
 };
-use atlas_duck_ipc::rpc::{OpsListParams, codes, method};
-use atlas_duck_ipc::server::{HandlerCell, IpcServer, ServerLimits, ShutdownSignal};
+use atlas_duck_ipc::rpc::frame::read_frame_async;
+use atlas_duck_ipc::rpc::{
+    OpsListParams, ProtocolReason, codes, error_response, method, protocol_error,
+};
+use atlas_duck_ipc::sandbox::MAX_FRAME_BYTES;
+use atlas_duck_ipc::server::{
+    HELLO_MAX_BYTES, HandlerCell, IpcServer, ServerLimits, ShutdownSignal,
+};
 use atlas_duck_ipc::transport::Conn;
 use common::{BUILD, Fake, Kind, WAIT, local};
-use serde_json::json;
-use tokio::io::AsyncReadExt;
+use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
 // ---------- harness ----------
@@ -195,14 +202,103 @@ enum Raw {
     CloseAfterFrame,
     /// Reads until EOF and reports how many bytes arrived.
     Count(tokio::sync::mpsc::UnboundedSender<usize>),
+    /// Reads only the header of the first frame, writes these bytes and closes (as the server
+    /// does with an oversize hello).
+    RefuseFirst(Vec<u8>),
+    /// Answers the hello with our build, reads only the header of the next frame, writes
+    /// these bytes and closes.
+    RefuseSecond(Vec<u8>),
+    /// After the hello frame writes `hello`; after every later request frame writes what
+    /// `answer` returns for it.
+    Script(Arc<Script>),
+}
+
+/// The bytes a scripted server writes after a request (given as JSON).
+type Answer = Box<dyn Fn(&Value) -> Vec<u8> + Send + Sync>;
+
+struct Script {
+    hello: Vec<u8>,
+    answer: Answer,
+}
+
+/// `v` as one frame.
+fn frame(v: &Value) -> Vec<u8> {
+    let payload = serde_json::to_vec(v).expect("encode");
+    let mut bytes = u32::try_from(payload.len())
+        .expect("u32")
+        .to_be_bytes()
+        .to_vec();
+    bytes.extend_from_slice(&payload);
+    bytes
+}
+
+/// A successful hello answer naming our build.
+fn hello_ok() -> Vec<u8> {
+    frame(&json!({"jsonrpc": "2.0", "id": 1, "result": {"build_id": BUILD}}))
+}
+
+/// The server's answer to a frame it refused unread: `null` id, `frame_too_large`.
+fn too_large_refusal() -> Vec<u8> {
+    let r = error_response(
+        None,
+        ProtocolReason::FrameTooLarge.code(),
+        protocol_error(ProtocolReason::FrameTooLarge),
+    );
+    frame(&serde_json::to_value(r).expect("refusal"))
+}
+
+fn progress(request_id: &str, status: &str) -> Vec<u8> {
+    frame(&json!({
+        "jsonrpc": "2.0",
+        "method": method::REQUEST_PROGRESS,
+        "params": {"request_id": request_id, "status": status},
+    }))
+}
+
+/// Writes `answer` after reading `header` bytes, then gives the client a moment to read it
+/// before the connection closes.
+async fn refuse(
+    rd: &mut tokio::io::ReadHalf<Conn>,
+    wr: &mut tokio::io::WriteHalf<Conn>,
+    answer: &[u8],
+) {
+    let mut header = [0u8; 4];
+    if rd.read_exact(&mut header).await.is_err() {
+        return;
+    }
+    let _ = wr.write_all(answer).await;
+    let _ = wr.flush().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 async fn serve_raw(conn: Conn, raw: Raw) {
-    let (mut rd, _wr) = conn.split();
+    let (mut rd, mut wr) = conn.split();
     match raw {
         Raw::Silent => tokio::time::sleep(Duration::from_secs(60)).await,
         Raw::CloseAfterFrame => {
-            let _ = atlas_duck_ipc::rpc::frame::read_frame_async(&mut rd, 1 << 20).await;
+            let _ = read_frame_async(&mut rd, 1 << 20).await;
+        }
+        Raw::RefuseFirst(answer) => refuse(&mut rd, &mut wr, &answer).await,
+        Raw::RefuseSecond(answer) => {
+            if let Ok(Some(_)) = read_frame_async(&mut rd, HELLO_MAX_BYTES).await
+                && wr.write_all(&hello_ok()).await.is_ok()
+            {
+                refuse(&mut rd, &mut wr, &answer).await;
+            }
+        }
+        Raw::Script(script) => {
+            let Ok(Some(_)) = read_frame_async(&mut rd, HELLO_MAX_BYTES).await else {
+                return;
+            };
+            if wr.write_all(&script.hello).await.is_err() {
+                return;
+            }
+            while let Ok(Some(req)) = read_frame_async(&mut rd, MAX_FRAME_BYTES).await {
+                let req: Value = serde_json::from_slice(&req).unwrap_or(Value::Null);
+                if wr.write_all(&(script.answer)(&req)).await.is_err() {
+                    return;
+                }
+            }
         }
         Raw::Count(tx) => {
             let mut total = 0;
@@ -825,4 +921,342 @@ async fn connection_lost_mid_call() {
         matches!(again, Err(ClientError::ConnectionLost)),
         "{again:?}"
     );
+}
+
+// ---------- refusals of a frame the server did not read whole, malformed answers ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hello_refused_after_its_header_is_the_protocol_error() {
+    // A small hello and one near the 64 KiB cap (which may still be in flight when the
+    // server closes): either way the client reads the refusal.
+    for build in [BUILD.to_owned(), "b".repeat(60 * 1024)] {
+        let (tmp, data) = data_dir();
+        let (location, task) = raw_server(&tmp, &data, Raw::RefuseFirst(too_large_refusal()));
+        let got = connect_to(&location, &data, hello(&build), soon()).await;
+        match got {
+            Err(ConnectError::Hello(env)) => {
+                let err = env.error.expect("error");
+                assert_eq!(err.code, ErrorCode::ProtocolError);
+                let reason = err.details.as_ref().and_then(|d| d.get("reason")).cloned();
+                assert_eq!(reason, Some(json!("frame_too_large")), "{}", build.len());
+            }
+            other => panic!("expected Hello(env), got {other:?}"),
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversize_hello_is_refused_before_connecting() {
+    let (tmp, data) = data_dir();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (location, task) = raw_server(&tmp, &data, Raw::Count(tx));
+    let got = connect_to(
+        &location,
+        &data,
+        hello(&"b".repeat(HELLO_MAX_BYTES)),
+        soon(),
+    )
+    .await;
+    match got {
+        Err(ConnectError::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+    let opened = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+    assert!(
+        opened.is_err(),
+        "the client opened a connection: {opened:?}"
+    );
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hello_skips_notifications_before_its_answer() {
+    let (tmp, data) = data_dir();
+    let mut before = progress("req_00000000000000000000000000000001", "pending");
+    before.extend(frame(
+        &json!({"jsonrpc": "2.0", "method": "something.else", "params": {}}),
+    ));
+    before.extend(hello_ok());
+    let script = Script {
+        hello: before,
+        answer: Box::new(|req| {
+            frame(&json!({"jsonrpc": "2.0", "id": req["id"], "result": {"by": "raw"}}))
+        }),
+    };
+    let (location, task) = raw_server(&tmp, &data, Raw::Script(Arc::new(script)));
+    let mut c = connect_to(&location, &data, hello(BUILD), soon())
+        .await
+        .expect("connect");
+    let got: Value = c.call(method::DOCTOR, json!({})).await.expect("doctor");
+    assert_eq!(got["by"], "raw");
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn malformed_hello_answers_are_protocol_errors() {
+    let oversize = u32::try_from(HELLO_MAX_BYTES + 1)
+        .expect("u32")
+        .to_be_bytes()
+        .to_vec();
+    let not_json = {
+        let mut v = 4u32.to_be_bytes().to_vec();
+        v.extend_from_slice(b"nope");
+        v
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "error without an envelope",
+            frame(&json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "no"}})),
+        ),
+        (
+            "another id",
+            frame(&json!({"jsonrpc": "2.0", "id": 7, "result": {"build_id": BUILD}})),
+        ),
+        (
+            "null-id result",
+            frame(&json!({"jsonrpc": "2.0", "id": null, "result": {"build_id": BUILD}})),
+        ),
+        (
+            "a server request",
+            frame(&json!({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {}})),
+        ),
+        ("not JSON-RPC", frame(&json!({"x": 1}))),
+        ("not JSON", not_json),
+        (
+            "not a hello reply",
+            frame(&json!({"jsonrpc": "2.0", "id": 1, "result": {"nope": 1}})),
+        ),
+        ("over 64 KiB", oversize),
+    ];
+    for (what, answer) in cases {
+        let (tmp, data) = data_dir();
+        let script = Script {
+            hello: answer,
+            answer: Box::new(|_| Vec::new()),
+        };
+        let (location, task) = raw_server(&tmp, &data, Raw::Script(Arc::new(script)));
+        let got = connect_to(&location, &data, hello(BUILD), soon()).await;
+        assert!(
+            matches!(got, Err(ConnectError::Protocol(_))),
+            "{what}: {got:?}"
+        );
+        task.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mismatch_without_server_build_says_unknown() {
+    let bare = Envelope::failed(ErrorCode::ProtocolMismatch, true, "builds differ");
+    let mut empty = bare.clone();
+    if let Some(err) = empty.error.as_mut() {
+        err.details = json!({"client_build": BUILD, "server_build": ""})
+            .as_object()
+            .cloned();
+    }
+    for refusal in [bare, empty] {
+        let fake = Arc::new(Fake::new("A"));
+        *fake.hello_refusal.lock().expect("lock") = Some(refusal);
+        let srv = start(&fake).await;
+        let err = connect(&srv, hello(BUILD))
+            .await
+            .expect_err("connected despite the mismatch");
+        match &err {
+            ConnectError::BuildMismatch {
+                client_newer,
+                client_build,
+                server_build,
+            } => {
+                assert!(!client_newer);
+                assert_eq!(client_build, BUILD);
+                assert_eq!(server_build, UNKNOWN_BUILD);
+            }
+            other => panic!("expected BuildMismatch, got {other:?}"),
+        }
+        assert!(err.to_string().ends_with("server unknown"), "{err}");
+        srv.stop().await;
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn busy_pipe_within_the_deadline_is_deadline_exceeded() {
+    use atlas_duck_ipc::transport::windows::{new_pipe_name, open_client};
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    // §4.7: a deadline shorter than the 5 s busy wait expires before submission: exit 5
+    // `launch_timeout`, never 11 busy.
+    let (tmp, data) = data_dir();
+    let location = location(&tmp, &data);
+    let EndpointLocation::WindowsPipePrefix(prefix) = &location else {
+        panic!("not a pipe location");
+    };
+    let name = new_pipe_name(prefix).expect("name");
+    let _only = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&name)
+        .expect("server");
+    let _first = open_client(&name).expect("first client takes the only instance");
+    atlas_duck_ipc::paths::write_endpoint_file(&data, &name).expect("endpoint file");
+    let t0 = Instant::now();
+    let got = connect_to(
+        &location,
+        &data,
+        hello(BUILD),
+        t0 + Duration::from_millis(300),
+    )
+    .await;
+    let waited = t0.elapsed();
+    assert!(
+        matches!(got, Err(ConnectError::DeadlineExceeded)),
+        "{got:?}"
+    );
+    assert!(
+        waited >= Duration::from_millis(250),
+        "gave up after {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(1500),
+        "gave up after {waited:?}"
+    );
+}
+
+// ---------- call edge cases ----------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversize_request_writes_nothing_and_keeps_the_client() {
+    let fake = Arc::new(Fake::new("A"));
+    let srv = start(&fake).await;
+    let mut c = connect(&srv, hello(BUILD)).await.expect("connect");
+    let err = c
+        .call::<Envelope>(
+            method::OPS_LIST,
+            OpsListParams {
+                instance: Some("i".repeat(MAX_FRAME_BYTES)),
+            },
+        )
+        .await
+        .expect_err("an oversize request was sent");
+    match err {
+        ClientError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+    assert!(!c.written_request(), "bytes of the oversize request left");
+    let env: Envelope = c.call(method::DOCTOR, json!({})).await.expect("doctor");
+    assert_eq!(data_by(&env).1, "doctor");
+    assert!(c.written_request());
+    assert_eq!(fake.count(Kind::OpsList), 0);
+    srv.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn null_id_answers_reach_the_call_only_as_errors() {
+    let (tmp, data) = data_dir();
+    let script = Script {
+        hello: hello_ok(),
+        answer: Box::new(|req| {
+            if req["method"] == method::DOCTOR {
+                // A `null`-id result is nobody's answer.
+                let mut v = frame(&json!({"jsonrpc": "2.0", "id": null, "result": {"by": "null"}}));
+                v.extend(frame(
+                    &json!({"jsonrpc": "2.0", "id": req["id"], "result": {"by": "own"}}),
+                ));
+                v
+            } else {
+                let r = error_response(
+                    None,
+                    codes::INVALID_REQUEST,
+                    protocol_error(ProtocolReason::InvalidRequest),
+                );
+                frame(&serde_json::to_value(r).expect("error"))
+            }
+        }),
+    };
+    let (location, task) = raw_server(&tmp, &data, Raw::Script(Arc::new(script)));
+    let mut c = connect_to(&location, &data, hello(BUILD), soon())
+        .await
+        .expect("connect");
+    let got: Value = c.call(method::DOCTOR, json!({})).await.expect("doctor");
+    assert_eq!(got["by"], "own");
+    match c.call::<Value>(method::INSTANCES_LIST, json!({})).await {
+        Err(ClientError::Rpc(e)) => assert_eq!(e.code, codes::INVALID_REQUEST),
+        other => panic!("expected Rpc, got {other:?}"),
+    }
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn progress_only_for_the_awaited_request() {
+    let own = await_params().request_id;
+    let (tmp, data) = data_dir();
+    let own_id = own.clone();
+    let script = Script {
+        hello: hello_ok(),
+        answer: Box::new(move |req| {
+            let mut v = progress("req_00000000000000000000000000000002", "pending");
+            v.extend(progress(&own_id, "executing"));
+            v.extend(frame(
+                &json!({"jsonrpc": "2.0", "id": req["id"], "result": {"by": "raw"}}),
+            ));
+            v
+        }),
+    };
+    let (location, task) = raw_server(&tmp, &data, Raw::Script(Arc::new(script)));
+    let mut c = connect_to(&location, &data, hello(BUILD), soon())
+        .await
+        .expect("connect");
+    let mut seen: Vec<ProgressNotification> = Vec::new();
+    let got: Value = c
+        .call_with_progress(method::REQUEST_AWAIT, await_params(), &mut |n| seen.push(n))
+        .await
+        .expect("await");
+    assert_eq!(got["by"], "raw");
+    let seen: Vec<(String, Status)> = seen.into_iter().map(|n| (n.request_id, n.status)).collect();
+    assert_eq!(seen, vec![(own, Status::Executing)]);
+
+    // A method without a request id sees no progress at all.
+    let mut count = 0;
+    let _: Value = c
+        .call_with_progress(method::DOCTOR, json!({}), &mut |_| count += 1)
+        .await
+        .expect("doctor");
+    assert_eq!(count, 0);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_refused_after_its_header_is_the_answer() {
+    // The server refuses a request it did not read whole and closes, possibly while the
+    // client is still writing it: the refusal is the call's answer, not a lost connection.
+    let (tmp, data) = data_dir();
+    let (location, task) = raw_server(&tmp, &data, Raw::RefuseSecond(too_large_refusal()));
+    let mut c = connect_to(&location, &data, hello(BUILD), soon())
+        .await
+        .expect("connect");
+    let got = c
+        .call::<Envelope>(
+            method::OPS_LIST,
+            OpsListParams {
+                instance: Some("i".repeat(16 << 20)),
+            },
+        )
+        .await;
+    match got {
+        Err(ClientError::Rpc(e)) => {
+            assert_eq!(e.code, codes::INVALID_REQUEST);
+            let err = e.data.and_then(|env| env.error).expect("envelope");
+            let reason = err.details.as_ref().and_then(|d| d.get("reason")).cloned();
+            assert_eq!(reason, Some(json!("frame_too_large")));
+        }
+        other => panic!("expected Rpc, got {other:?}"),
+    }
+    assert!(c.written_request());
+    let again = tokio::time::timeout(WAIT, c.call::<Envelope>(method::DOCTOR, json!({})))
+        .await
+        .expect("a call on a closed connection hung");
+    assert!(
+        matches!(again, Err(ClientError::ConnectionLost)),
+        "{again:?}"
+    );
+    task.abort();
 }

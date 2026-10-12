@@ -51,7 +51,7 @@ const BIND_ATTEMPTS: usize = 5;
 /// Bytes of randomness in the pipe-name suffix (32 hex digits, 128 bits).
 const SUFFIX_BYTES: usize = 16;
 /// Longest `WaitNamedPipeW` on `ERROR_PIPE_BUSY` (§4.7).
-const BUSY_WAIT_MAX: Duration = Duration::from_secs(5);
+pub(crate) const BUSY_WAIT_MAX: Duration = Duration::from_secs(5);
 
 const MSG_NO_RUNTIME: &str = "the named-pipe transport needs a tokio runtime";
 const MSG_FOREIGN_NAME: &str = "pipe name does not carry the expected prefix";
