@@ -17,7 +17,7 @@ fn main() {
         EarlyMode::VerifyExport(rest) => std::process::exit(verify_export_stub(rest)),
         EarlyMode::Gui { background } => {
             // PD-33: before any other thread exists; `__cli` and `__verify-export` keep glibc's default.
-            atlas_duck_app_lib::compose::set_mmap_threshold();
+            let _ = atlas_duck_app_lib::compose::set_mmap_threshold();
             // §2.5 Crash artifacts: GUI and `--background` launches only, before any webview.
             // The report is kept for later logging (`applied_report`); no failure blocks startup.
             let _ = apply_process_crash_settings();

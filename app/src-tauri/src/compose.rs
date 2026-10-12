@@ -222,13 +222,15 @@ pub fn spawn_offset_updater(core: Arc<Core>) {
 /// freed, after which the 16-32 MiB read buffers stay resident. Fixing it at 1 MiB keeps them
 /// mapped, so `free` returns them. Call before any other thread exists (GUI and `--background`
 /// only; `__cli` keeps the default). No effect off linux-gnu.
-pub fn set_mmap_threshold() {
+pub fn set_mmap_threshold() -> bool {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         // SAFETY: `mallopt` only sets an allocator parameter; it is called at process start.
-        unsafe {
-            libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES);
-        }
+        unsafe { libc::mallopt(libc::M_MMAP_THRESHOLD, MMAP_THRESHOLD_BYTES) == 1 }
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        false
     }
 }
 
@@ -382,33 +384,22 @@ mod tests {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn mmap_threshold_set() -> TestResult {
-        fn vm_rss_kib() -> Result<u64, Box<dyn std::error::Error>> {
-            let status = std::fs::read_to_string("/proc/self/status")?;
-            let line = status
-                .lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .ok_or("no VmRSS")?;
-            Ok(line
-                .split_whitespace()
-                .nth(1)
-                .ok_or("no VmRSS value")?
-                .parse()?)
+        // Not VmRSS: the other tests of this process run in parallel and allocate, so process RSS
+        // is noise. `hblkhd` (bytes in mmapped blocks) grows by the block size while an allocation
+        // above the threshold is held; a heap-served block never moves it. A concurrent test
+        // freeing a mapped block can mask one attempt, so one clean attempt of eight suffices.
+        fn mapped_bytes() -> usize {
+            // SAFETY: `mallinfo2` only reads allocator statistics.
+            unsafe { libc::mallinfo2() }.hblkhd
         }
-        set_mmap_threshold();
-        let before = vm_rss_kib()?;
-        for _ in 0..64 {
-            let mut v = vec![0u8; 2 << 20];
-            // Touch the pages so they count towards RSS while allocated.
-            for b in v.iter_mut().step_by(4096) {
-                *b = 1;
-            }
+        assert!(set_mmap_threshold(), "mallopt(M_MMAP_THRESHOLD) failed");
+        let grew = (0..8).any(|_| {
+            let before = mapped_bytes();
+            let v = vec![1u8; 2 << 20];
             std::hint::black_box(&v);
-        }
-        let after = vm_rss_kib()?;
-        assert!(
-            after.saturating_sub(before) < 32 * 1024,
-            "RSS grew from {before} to {after} KiB"
-        );
+            mapped_bytes().saturating_sub(before) >= 2 << 20
+        });
+        assert!(grew, "a 2 MiB block was not served by mmap");
         Ok(())
     }
 }
