@@ -81,6 +81,9 @@ tauri = { workspace = true, features = ["test"] }
 atlas-duck-audit = { path = "../../crates/audit", features = ["testing"] }
 # T21: the scripted approver's unit test runs over `core::testing::Harness` and its mock Jira.
 atlas-duck-atlassian = { path = "../../crates/atlassian", features = ["testing"] }
+# T22: the cli_flows harness (mock servers, spawned binaries, product ids).
+atlas-duck-registry = { path = "../../crates/registry" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time"] }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
