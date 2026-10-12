@@ -36,7 +36,7 @@
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -50,6 +50,8 @@ const KEY_DATA_DIR: &str = "data_dir";
 const KEY_CONFIG_DIR: &str = "config_dir";
 const KEY_INSTALL_ID: &str = "install_id";
 const KEY_APP_PATH: &str = "app_path";
+/// Largest pinned file that is read; a bigger one is a `Parse` error.
+const MAX_PINNED_FILE_BYTES: u64 = 64 * 1024;
 
 /// Contents of this host's `paths.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,11 +274,18 @@ fn utf8(p: &Path) -> Result<&str, PinnedError> {
 }
 
 fn read_doc(path: &Path) -> Result<Option<DocumentMut>, PinnedError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(PinnedError::Io(e)),
     };
+    // A pinned file is a few hundred bytes; one past the cap is enough to tell it is too big.
+    let mut bytes = Vec::new();
+    file.take(MAX_PINNED_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_PINNED_FILE_BYTES {
+        return Err(PinnedError::Parse);
+    }
     // Both error values are dropped: they can quote file content.
     let text = String::from_utf8(bytes).map_err(|_| PinnedError::Parse)?;
     let doc = text

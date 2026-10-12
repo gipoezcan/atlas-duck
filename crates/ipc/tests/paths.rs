@@ -719,6 +719,24 @@ fn corrupt_files_are_parse_errors_never_absent_and_stay_untouched() {
 }
 
 #[test]
+fn oversize_pinned_files_are_parse_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let comment = "#".repeat(64 * 1024 + 1);
+    let paths = tmp.path().join("paths.toml");
+    let cli = tmp.path().join("cli.toml");
+    let body = format!("{comment}\nschema_version = 1\n");
+    fs::write(&paths, &body).expect("seed paths");
+    fs::write(&cli, &body).expect("seed cli");
+    assert!(matches!(read_pinned(&paths), Err(PinnedError::Parse)));
+    assert!(matches!(read_cli_toml(&cli), Err(PinnedError::Parse)));
+    // Exactly at the cap is still read.
+    let at_cap = format!("schema_version = 1\n#{}", "#".repeat(64 * 1024 - 20));
+    assert_eq!(at_cap.len(), 64 * 1024);
+    fs::write(&cli, at_cap).expect("seed cap");
+    assert!(matches!(read_cli_toml(&cli), Ok(Some(_))));
+}
+
+#[test]
 fn relative_pinned_dirs_are_refused_on_read_and_write() {
     // A relative value would resolve against the process's current directory and
     // break §7.7 path stability. `Path::is_absolute` on Windows also rejects

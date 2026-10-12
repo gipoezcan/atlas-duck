@@ -8,6 +8,7 @@
 #![allow(dead_code)]
 
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
@@ -68,9 +69,10 @@ pub(crate) fn refusal(reason: &str) -> Envelope {
     env
 }
 
-/// `unreachable {not_running}` for an app that cannot be located; waiting does not fix it.
+/// `unreachable {not_running}` for an app that cannot be located: `retryable: true` like every
+/// `unreachable` (§4.3 exit 5; only `server_identity` is not).
 pub(crate) fn app_not_found() -> Envelope {
-    let mut env = Envelope::failed(ErrorCode::Unreachable, false, MSG_APP_NOT_FOUND);
+    let mut env = Envelope::failed(ErrorCode::Unreachable, true, MSG_APP_NOT_FOUND);
     set_reason(&mut env, REASON_NOT_RUNNING);
     env
 }
@@ -118,7 +120,12 @@ fn data_state(base: &BaseDirs, host: &str) -> DataState {
         Ok(Some(p)) => p,
         Err(_) => return DataState::Refused(Box::new(refusal(REASON_PATHS_UNREADABLE))),
     };
-    match resolve_data_dir(Some(&pinned)) {
+    resolution_state(resolve_data_dir(Some(&pinned)))
+}
+
+/// The pure mapping from a resolution to what the CLI does with it.
+fn resolution_state(resolution: io::Result<DataDirResolution>) -> DataState {
+    match resolution {
         Ok(DataDirResolution::Local(dir)) => DataState::Local(dir),
         Ok(DataDirResolution::BeforeFirstRun) => DataState::BeforeFirstRun,
         Ok(DataDirResolution::Missing { .. }) => {
@@ -154,6 +161,7 @@ fn locate_app(
     if let Some((base, host)) = base_host
         && let Ok(Some(cli)) = read_cli_toml(&cli_file(base, host))
         && let Some(app) = cli.app_path
+        && app.is_absolute()
         && app.is_file()
     {
         return AppLocation::Found(app);
@@ -183,7 +191,9 @@ pub(crate) fn endpoint_present(data: &LocalDataDir, host: &str) -> bool {
 mod tests {
     use std::fs;
 
-    use atlas_duck_ipc::paths::{CliToml, PinnedPaths, write_cli_toml, write_pinned};
+    use atlas_duck_ipc::paths::{
+        CliToml, NotLocalKind, PinnedPaths, check_data_dir, write_cli_toml, write_pinned,
+    };
 
     use super::*;
 
@@ -367,13 +377,122 @@ mod tests {
             e.details.as_ref().and_then(|m| m.get("reason")),
             Some(&Value::from("not_running"))
         );
+        assert!(e.retryable);
         assert_eq!(atlas_duck_ipc::proto::exit_code(&env), 5);
+    }
+
+    fn refused_reason(state: &DataState) -> Option<String> {
+        reason(&Discovery {
+            host: String::new(),
+            data: state.clone(),
+            app: AppLocation::NotFound,
+        })
+    }
+
+    #[test]
+    fn resolution_state_maps_every_arm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = check_data_dir(tmp.path()).unwrap();
+        assert!(matches!(local, DataDirResolution::Local(_)));
+        assert!(matches!(resolution_state(Ok(local)), DataState::Local(_)));
+        assert_eq!(
+            resolution_state(Ok(DataDirResolution::BeforeFirstRun)),
+            DataState::BeforeFirstRun
+        );
+        let missing = resolution_state(Ok(DataDirResolution::Missing {
+            path: tmp.path().join("gone"),
+        }));
+        assert_eq!(
+            refused_reason(&missing).as_deref(),
+            Some("data_dir_missing")
+        );
+        let not_local = resolution_state(Ok(DataDirResolution::NotLocal {
+            path: tmp.path().join("share"),
+            kind: NotLocalKind::Unc,
+        }));
+        assert_eq!(
+            refused_reason(&not_local).as_deref(),
+            Some("data_dir_not_local")
+        );
+        let unusable = resolution_state(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert_eq!(
+            refused_reason(&unusable).as_deref(),
+            Some("data_dir_unusable")
+        );
+        for state in [&missing, &not_local, &unusable] {
+            let DataState::Refused(env) = state else {
+                panic!("not refused");
+            };
+            assert_eq!(atlas_duck_ipc::proto::exit_code(env), 9);
+        }
+    }
+
+    #[test]
+    fn refusal_message_text() {
+        let env = refusal("data_dir_missing");
+        let e = env.error.unwrap();
+        assert_eq!(e.message, "atlas-duck is not configured (data_dir_missing)");
+        assert!(e.retryable);
+    }
+
+    #[test]
+    fn pinned_to_a_regular_file_is_data_dir_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = base(tmp.path());
+        let file = tmp.path().join("a-file");
+        fs::write(&file, b"x").unwrap();
+        pin(&b, &file);
+        let d = discover_with(&b, HOST, &no_env, None);
+        assert_exit_9(&d);
+        assert_eq!(reason(&d).as_deref(), Some("data_dir_missing"));
+        let DataState::Refused(env) = &d.data else {
+            panic!("not refused");
+        };
+        assert_eq!(
+            env.error.as_ref().unwrap().message,
+            "atlas-duck is not configured (data_dir_missing)"
+        );
+    }
+
+    #[test]
+    fn app_path_must_be_absolute_and_non_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = base(tmp.path());
+        // Cargo runs unit tests with the package root as the current directory, so this
+        // relative path names a file that exists there.
+        assert!(Path::new("Cargo.toml").is_file());
+        for relative in ["Cargo.toml", "./Cargo.toml", ""] {
+            write_cli_toml(
+                &cli_file(&b, HOST),
+                &CliToml {
+                    app_path: Some(PathBuf::from(relative)),
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                discover_with(&b, HOST, &no_env, None).app,
+                AppLocation::NotFound,
+                "app_path {relative:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_cli_toml_is_app_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = base(tmp.path());
+        fs::create_dir_all(cli_file(&b, HOST).parent().unwrap()).unwrap();
+        fs::write(cli_file(&b, HOST), b"app_path = [").unwrap();
+        assert_eq!(
+            discover_with(&b, HOST, &no_env, None).app,
+            AppLocation::NotFound
+        );
     }
 
     #[cfg(windows)]
     #[test]
     fn endpoint_present_windows_prefix() {
-        use atlas_duck_ipc::paths::{check_data_dir, write_endpoint_file};
+        use atlas_duck_ipc::paths::write_endpoint_file;
 
         let tmp = tempfile::tempdir().unwrap();
         let DataDirResolution::Local(data) = check_data_dir(tmp.path()).unwrap() else {
