@@ -19,6 +19,9 @@ pub const MENU_ID_QUIT: &str = "quit";
 pub const MENU_ID_STATUS: &str = "status";
 /// Label of the Quit item (app-generated constant, §5.6).
 pub const MENU_LABEL_QUIT: &str = "Quit";
+/// PD-06: the tray status text when the audit store could not be opened (plan text; no path,
+/// no error text).
+pub const MSG_STORE_UNAVAILABLE: &str = "audit store could not be opened";
 
 /// Log event when the tray icon cannot be created (startup continues).
 pub const LOG_EVENT_TRAY_BUILD_FAILED: &str = "tray_build_failed";
@@ -100,16 +103,7 @@ pub fn on_run_event<R: Runtime>(_app: &AppHandle<R>, event: RunEvent) {
 /// with that text above Quit, and the tray tooltip carries the same text (Linux shows no
 /// tooltip, so there the menu item is the place where the text appears, §2.5).
 pub fn build_tray(app: &AppHandle, status: Option<&str>) -> tauri::Result<TrayIcon> {
-    let status_item = status
-        .map(|text| MenuItem::with_id(app, MENU_ID_STATUS, text, false, None::<&str>))
-        .transpose()?;
-    let quit = MenuItem::with_id(app, MENU_ID_QUIT, MENU_LABEL_QUIT, true, None::<&str>)?;
-    let mut items: Vec<&dyn IsMenuItem<Wry>> = Vec::with_capacity(2);
-    if let Some(item) = &status_item {
-        items.push(item);
-    }
-    items.push(&quit);
-    let menu = Menu::with_items(app, &items)?;
+    let menu = tray_menu(app, status)?;
     let icon = app.default_window_icon().cloned().ok_or_else(|| {
         tauri::Error::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -125,6 +119,41 @@ pub fn build_tray(app: &AppHandle, status: Option<&str>) -> tauri::Result<TrayIc
         builder = builder.tooltip(text);
     }
     builder.build(app)
+}
+
+/// The menu of [`menu_item_ids`]: Quit, with a disabled status item above it when `status` is
+/// given.
+fn tray_menu(app: &AppHandle, status: Option<&str>) -> tauri::Result<Menu<Wry>> {
+    let status_item = status
+        .map(|text| MenuItem::with_id(app, MENU_ID_STATUS, text, false, None::<&str>))
+        .transpose()?;
+    let quit = MenuItem::with_id(app, MENU_ID_QUIT, MENU_LABEL_QUIT, true, None::<&str>)?;
+    let mut items: Vec<&dyn IsMenuItem<Wry>> = Vec::with_capacity(2);
+    if let Some(item) = &status_item {
+        items.push(item);
+    }
+    items.push(&quit);
+    Menu::with_items(app, &items)
+}
+
+/// Shows `text` in the already built tray (status item above Quit, and the tooltip), for a
+/// state found after `setup` (T19: PD-06 [`MSG_STORE_UNAVAILABLE`]). Callable from any thread
+/// (Tauri runs the menu calls on the main thread). Without a tray, or on failure, it logs
+/// `event=tray_build_failed`.
+pub fn set_status_text(app: &AppHandle, text: &str) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        tracing::warn!(event = LOG_EVENT_TRAY_BUILD_FAILED, error_class = "no_tray");
+        return;
+    };
+    let updated = tray_menu(app, Some(text))
+        .and_then(|menu| tray.set_menu(Some(menu)))
+        .and_then(|()| tray.set_tooltip(Some(text)));
+    if updated.is_err() {
+        tracing::warn!(
+            event = LOG_EVENT_TRAY_BUILD_FAILED,
+            error_class = "tauri_tray"
+        );
+    }
 }
 
 /// Builds the tray; a failure is logged as `event=tray_build_failed` and startup
@@ -232,6 +261,13 @@ mod tests {
         assert_eq!(MENU_ID_QUIT, "quit");
         assert_eq!(MENU_LABEL_QUIT, "Quit");
         assert_eq!(TRAY_ID, "main");
+    }
+
+    #[test]
+    fn store_unavailable_text_is_the_plan_constant() {
+        // PD-06: constant text, no path and no error text.
+        assert_eq!(MSG_STORE_UNAVAILABLE, "audit store could not be opened");
+        assert!(!MSG_STORE_UNAVAILABLE.contains('<'));
     }
 
     #[test]

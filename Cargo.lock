@@ -347,6 +347,7 @@ dependencies = [
 name = "atlas-duck-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "atlas-duck-audit",
  "atlas-duck-cli",
  "atlas-duck-core",
@@ -369,6 +370,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.61.2",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]

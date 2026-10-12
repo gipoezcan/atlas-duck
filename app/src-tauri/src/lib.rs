@@ -6,16 +6,20 @@ pub mod confirm;
 pub mod diag;
 pub mod early_argv;
 pub mod sandbox_probe;
+pub mod secret_service;
+pub mod serve;
 pub mod startup;
 pub mod state;
 pub mod tray;
 pub mod tray_host;
 pub mod ui_sink;
 
+use std::sync::Arc;
+
 use tauri::Manager;
 
 use crate::startup::{DialogPresenter, StartupAction, StartupState};
-use crate::state::{AppState, DataDirHold};
+use crate::state::{AppState, DataDirHold, ServeSlot};
 
 /// GUI and `--background` launches. Order (§2.5, §3.1, §7.7): crash settings (T09, in
 /// `main.rs`, before this call) -> diagnostic log -> Tauri builder -> in `setup`: the
@@ -54,6 +58,8 @@ pub fn run_gui(background: bool) -> ! {
             // relaunch (T11 registers it before this plugin): only a launch that was not
             // forwarded reaches the lock.
             let (host, pinned) = startup::read_this_host_pinned();
+            // T19: serving needs the pinned config dir and install id; the gate consumes `pinned`.
+            let pinned_paths = pinned.as_ref().ok().cloned().flatten();
             let state = startup::gate(pinned, &host);
             let presenter = DialogPresenter::new(app.handle().clone());
             if let StartupAction::Exit { message } =
@@ -79,8 +85,11 @@ pub fn run_gui(background: bool) -> ! {
             if let Some(summary) = state.summary() {
                 app.manage(AppState::new(summary, tray_host));
             }
+            let mut serve_args = None;
             if let StartupState::Ready { data, lock } = state {
-                app.manage(DataDirHold::new(data, lock));
+                let lock = Arc::new(lock);
+                app.manage(DataDirHold::new(data.clone(), lock.clone()));
+                serve_args = Some((data, lock));
             }
 
             // T20: the §9.4 probe runs on its own thread, in every startup state that reaches
@@ -93,6 +102,22 @@ pub fn run_gui(background: bool) -> ! {
             // The tray is built in every startup state; in the four error states it also shows
             // the startup message (§7.7). A failure is logged and startup continues (§15 V33).
             tray::build_tray_or_log(app.handle(), tray_status.as_deref());
+
+            // T19 (PD-05): in `Ready`, open the store and serve IPC. `serve::start` returns at
+            // once; the work runs on the async runtime, never on this (the main) thread.
+            if let (Some((data, lock)), Some(pinned)) = (serve_args, pinned_paths.as_ref()) {
+                diag.extend_allowed_fields(serve::LOG_FIELDS);
+                app.manage(ServeSlot::default());
+                serve::start(
+                    app.handle(),
+                    data,
+                    lock,
+                    pinned,
+                    &host,
+                    tray_host,
+                    Arc::new(serve::OsKeysFactory),
+                );
+            }
             Ok(())
         })
         .build(tauri::generate_context!())

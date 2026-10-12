@@ -1,11 +1,12 @@
 //! App-wide state managed by Tauri (`app.manage`). Later milestones read it and add fields.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_ipc::paths::LocalDataDir;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 
+use crate::serve::ServeState;
 use crate::tray_host::TrayHost;
 
 /// The startup outcome as the rest of the app sees it. `AlreadyRunning` is not here: that
@@ -79,15 +80,15 @@ impl AppState {
 
 /// The locked data dir, managed only in the `Ready` state. Keeping it in Tauri state holds
 /// `instance.lock` for the app's whole lifetime (§3.1). The M2 audit store opens with
-/// `lock()`.
+/// `lock()`; the serving code (T19) holds another `Arc` of the same lock.
 #[derive(Debug)]
 pub struct DataDirHold {
     data: LocalDataDir,
-    lock: InstanceLock,
+    lock: Arc<InstanceLock>,
 }
 
 impl DataDirHold {
-    pub fn new(data: LocalDataDir, lock: InstanceLock) -> Self {
+    pub fn new(data: LocalDataDir, lock: Arc<InstanceLock>) -> Self {
         DataDirHold { data, lock }
     }
 
@@ -97,6 +98,22 @@ impl DataDirHold {
 
     pub fn lock(&self) -> &InstanceLock {
         &self.lock
+    }
+}
+
+/// The serving state (T19), managed in `Ready`. Empty until `serve::start` finished, and for
+/// good when the store could not be opened (PD-06).
+#[derive(Default)]
+pub struct ServeSlot(OnceLock<Arc<ServeState>>);
+
+impl ServeSlot {
+    pub fn get(&self) -> Option<&Arc<ServeState>> {
+        self.0.get()
+    }
+
+    /// The first state wins; a later one is dropped.
+    pub fn set(&self, state: Arc<ServeState>) {
+        let _ = self.0.set(state);
     }
 }
 
