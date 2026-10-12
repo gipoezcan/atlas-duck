@@ -957,7 +957,16 @@ async fn cancel_of_a_decided_request_says_no_more_than_status() -> TestResult {
     let again = h.handler().cancel(&id).await;
     assert_eq!(again.status, Status::Cancelled);
     assert_eq!(again.error.as_ref().and_then(|e| e.details.clone()), None);
-    assert_eq!(h.event_types(&id).await?.len(), 2);
+    // The cancel races the read's fetch: bytes already sent (or a committed fetch) put one
+    // `READ_FETCHED` before the one terminal record (cancel.rs `cancel_plan`), none otherwise.
+    let types = h.event_types(&id).await?;
+    assert_eq!(types.first(), Some(&EventType::REQUEST_RECEIVED), "{types:?}");
+    assert_eq!(types.last(), Some(&EventType::CANCELLED), "{types:?}");
+    let middle = &types[1..types.len() - 1];
+    assert!(
+        middle.is_empty() || middle == [EventType::READ_FETCHED],
+        "{types:?}"
+    );
     Ok(())
 }
 
