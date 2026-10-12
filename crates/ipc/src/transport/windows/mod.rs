@@ -57,6 +57,7 @@ const MSG_NO_RUNTIME: &str = "the named-pipe transport needs a tokio runtime";
 const MSG_FOREIGN_NAME: &str = "pipe name does not carry the expected prefix";
 const MSG_NUL: &str = "pipe name contains a NUL";
 const MSG_NO_RANDOM: &str = "no system randomness for the pipe name";
+const MSG_LISTENER_DONE: &str = "the pipe listener stopped after an accept error";
 const MSG_JOIN: &str = "a blocking pipe task did not complete";
 
 /// `prefix` + 32 random lowercase hex digits (§3.1).
@@ -91,7 +92,8 @@ fn create_instance(
 pub struct PipeListener {
     name: String,
     security: PipeSecurity,
-    next: NamedPipeServer,
+    /// The listening instance; `None` once an `accept` failed.
+    next: Option<NamedPipeServer>,
 }
 
 impl PipeListener {
@@ -120,16 +122,43 @@ impl PipeListener {
     /// Errors: creating the next instance failed (the connected client is
     /// dropped), or `ConnectNamedPipe` on the listening instance failed (a
     /// client that opens and closes at once is not an error: mio treats
-    /// `ERROR_NO_DATA` as connected). Either way the listener is done and
-    /// must not be used again; the IPC server stops (§3.1).
+    /// `ERROR_NO_DATA` as connected). Either way the listener is done: it
+    /// holds no instance any more and every later `accept` returns an error
+    /// at once; the IPC server stops (§3.1).
     ///
     /// Cancel-safe: nothing is awaited after the connect completes.
     pub async fn accept(&mut self) -> io::Result<(NamedPipeServer, Option<u32>)> {
-        self.next.connect().await?;
-        let fresh = create_instance(&self.name, &self.security, false)?;
-        let connected = std::mem::replace(&mut self.next, fresh);
-        let pid = client_pid(connected.as_handle());
-        Ok((connected, pid))
+        self.accept_with(|name, security| create_instance(name, security, false))
+            .await
+    }
+
+    /// `accept` with the next-instance factory injected (tests fail it).
+    async fn accept_with(
+        &mut self,
+        make_next: impl FnOnce(&str, &PipeSecurity) -> io::Result<NamedPipeServer>,
+    ) -> io::Result<(NamedPipeServer, Option<u32>)> {
+        let Some(listening) = self.next.as_mut() else {
+            return Err(io::Error::other(MSG_LISTENER_DONE));
+        };
+        if let Err(e) = listening.connect().await {
+            self.next = None;
+            return Err(e);
+        }
+        match make_next(&self.name, &self.security) {
+            Ok(fresh) => {
+                let connected = self.next.replace(fresh);
+                let Some(connected) = connected else {
+                    return Err(io::Error::other(MSG_LISTENER_DONE));
+                };
+                let pid = client_pid(connected.as_handle());
+                Ok((connected, pid))
+            }
+            Err(e) => {
+                // Drops the connected client with the listening instance.
+                self.next = None;
+                Err(e)
+            }
+        }
     }
 }
 
@@ -157,7 +186,7 @@ pub fn bind_with_names(
                 return Ok(PipeListener {
                     name,
                     security,
-                    next,
+                    next: Some(next),
                 });
             }
             Err(e) if name_taken(&e) => last = Some(e),
@@ -504,4 +533,24 @@ fn wide_nul(s: &str) -> io::Result<Vec<u16>> {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, MSG_NUL));
     }
     Ok(OsStr::new(s).encode_wide().chain(Some(0)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_next_instance_poisons_the_listener() {
+        let prefix = r"\\.\pipe\atlas-duck-0123456789abcdef-";
+        let mut listener = PipeListener::bind(prefix).expect("bind");
+        let _client = open_client(listener.name()).expect("open");
+        let err = listener
+            .accept_with(|_, _| Err(io::Error::other("injected")))
+            .await
+            .expect_err("accept survived a failed create_instance");
+        assert_eq!(err.to_string(), "injected");
+        assert!(listener.next.is_none());
+        let again = listener.accept().await.expect_err("poisoned accept");
+        assert_eq!(again.to_string(), MSG_LISTENER_DONE);
+    }
 }
