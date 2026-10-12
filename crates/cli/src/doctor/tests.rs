@@ -430,8 +430,19 @@ fn keyring_local_for_never_reports_a_local_disk_as_remote() {
         eprintln!("skipped: the temp dir is not classified local on this runner");
         return;
     }
+    // Every candidate dir under the temp dir (the passwd home too, injected): on a runner whose
+    // real home is on an overlay the unmodified `keyring_local_for` would see that home.
     let xdg = tmp.path().join("xdg");
-    assert_ne!(keyring_local_for(Some(xdg.into_os_string())), Some(false));
+    let home = tmp.path().join("home");
+    let answer = keyring_answer(
+        keyring_dirs_for(
+            atlas_duck_ipc::paths::keyring::DirsOs::CURRENT,
+            Some(xdg.into_os_string()),
+            &|| Ok(home.clone()),
+        ),
+        &keyring_locality,
+    );
+    assert_ne!(answer, Some(false));
 }
 
 #[test]
