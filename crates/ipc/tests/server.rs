@@ -781,3 +781,40 @@ async fn cell_current_and_swap() {
         Arc::as_ptr(&b)
     ));
 }
+
+/// §3.1: a client the SID check does not accept (here: one that allows only anonymous
+/// impersonation) gets no answer at all, not even a protocol error, and the handler sees
+/// nothing.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_unverified_client_is_closed_unanswered() {
+    use atlas_duck_ipc::rpc::frame::{read_frame_async, write_frame_async};
+    use tokio::net::windows::named_pipe::ClientOptions;
+    use windows_sys::Win32::Storage::FileSystem::SECURITY_ANONYMOUS;
+
+    let fake = Arc::new(Fake::new("A"));
+    let srv = start(&fake).await;
+    for first in [
+        request(1, "hello", hello_params()),
+        request(1, "ops.list", json!({})),
+    ] {
+        let mut anon = ClientOptions::new()
+            .security_qos_flags(SECURITY_ANONYMOUS)
+            .open(&srv.name)
+            .expect("open anonymous-level");
+        let bytes = serde_json::to_vec(&first).expect("encode");
+        write_frame_async(&mut anon, &bytes).await.expect("write");
+        let got = tokio::time::timeout(WAIT, read_frame_async(&mut anon, MAX_FRAME_BYTES))
+            .await
+            .expect("closed within WAIT");
+        assert!(
+            matches!(got, Ok(None) | Err(_)),
+            "an unverified client got an answer: {got:?}"
+        );
+    }
+    settle().await;
+    assert!(fake.events().is_empty(), "handler saw {:?}", fake.events());
+    // A verified client is still served.
+    let _c = Client::hello(&srv.name).await;
+    srv.stop().await;
+}
