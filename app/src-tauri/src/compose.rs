@@ -119,6 +119,12 @@ pub fn local_utc_offset_minutes() -> Option<i32> {
     read_utc_offset(false)
 }
 
+#[cfg(unix)]
+unsafe extern "C" {
+    /// POSIX `tzset`; the `libc` crate does not declare it.
+    fn tzset();
+}
+
 /// `refresh` re-reads the zone setting first (Unix only: glibc's `localtime_r` does not re-read
 /// it on each call). Only the offset updater thread passes `true`: `tzset` races with `setenv`
 /// elsewhere, so it must not run from any other thread.
@@ -130,7 +136,7 @@ fn read_utc_offset(refresh: bool) -> Option<i32> {
         // reads the `time_t` by pointer.
         unsafe {
             if refresh {
-                libc::tzset();
+                tzset();
             }
             let now = libc::time(std::ptr::null_mut());
             let mut tm: libc::tm = std::mem::zeroed();
