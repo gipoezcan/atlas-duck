@@ -21,7 +21,8 @@ use atlas_duck_app_lib::state::ServeSlot;
 use atlas_duck_audit::lock::{INSTANCE_LOCK_FILE, InstanceLock};
 use atlas_duck_audit::testing::{FreeSpaceStub, MemKeyStore, MemKeyring, open_existing};
 use atlas_duck_audit::{
-    FirstRunInput, KeyStore, KeyStoreError, OpenConfig, SystemClock, create_new_store, new_ids,
+    EventType, FirstRunInput, KeyStore, KeyStoreError, OpenConfig, SystemClock, create_new_store,
+    new_ids,
 };
 use atlas_duck_core::{
     Confirm, MSG_FIRST_RUN, NativeConfirmer, ShutdownReason, ShutdownReport, UiEvent, UiSink,
@@ -751,6 +752,9 @@ async fn quit_with_core_refuses_then_stops() -> TestResult {
     let reread = open_existing(&w.data, &w.lock, cfg)?;
     let (head, ..) = reread.head();
     assert_eq!(head, before + 1);
+    let last = reread.recent_headers(Duration::from_secs(60 * 60))?;
+    let last = last.last().ok_or("no headers")?;
+    assert_eq!((last.seq, last.event_type), (head, EventType::APP_STOP));
     let stop: Value = serde_json::from_slice(&reread.read_payload(head)?)?;
     assert_eq!(stop, json!({ "reason": "quit" }));
     reread.shutdown();
@@ -805,6 +809,39 @@ async fn quit_in_gate_state_answers_shutting_down() -> TestResult {
         // The store a returning keychain let the retry open is shut down again.
         assert_eq!(w.files()?, before, "keychain_back={keychain_back}");
     }
+    Ok(())
+}
+
+/// m-2: Quit wakes a retry loop that sleeps between attempts. With a 60 s step, the quit path's
+/// bounded wait for the retry task (`RETRY_WAIT`, 20 s) ends at once because the task finished;
+/// the server's shutdown signal, which would also end the sleep, fires only after that wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_wakes_a_sleeping_retry() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring)?;
+    let keys = MemKeys::new(ring, false);
+    let mut inputs = w.inputs(Some(install_id), keys.clone());
+    inputs.retry_schedule = vec![Duration::from_secs(60)];
+    let state = start_with(inputs).await.map_err(|e| format!("{e:?}"))?;
+    assert!(state.retry.lock().map_err(|_| "poisoned")?.is_some());
+    let slot = ServeSlot::default();
+    slot.set(state);
+    let started = Instant::now();
+    let outcome = quit(&slot, ShutdownReason::Quit, WAIT).await;
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert_eq!(
+        outcome,
+        ShutdownOutcome {
+            report: None,
+            timed_out: false
+        }
+    );
+    let state = slot.get().ok_or("no state")?;
+    assert!(state.retry.lock().map_err(|_| "poisoned")?.is_none());
+    assert_eq!(keys.calls(), 1, "no retry attempt ran");
+    assert_not_running(&w).await?;
     Ok(())
 }
 
@@ -915,13 +952,12 @@ async fn quit_waits_for_a_start_in_flight() -> TestResult {
     Ok(())
 }
 
-/// A spent outer bound ends the wait for `Core::shutdown` (which then reports nothing, unless
-/// the sweep won the race against the zero bound): `shutdown` still stops the server and the
-/// store instead of hanging. The timeout itself is pinned by `serve::tests::
-/// outer_bound_ends_the_wait_not_the_sweep`; a held `executing` write needs `core/testing`
-/// (T22/T26).
+/// A spent outer bound (zero) never hangs `shutdown`: whichever wins the race, the core's
+/// sweep or the bound, the server and the store are stopped. The hung-core-stage timeout itself is
+/// pinned by `serve::tests::outer_timeout_ends_a_hung_core_stage_and_still_tears_down`; a held
+/// `executing` write needs `core/testing` and a mock Jira (T22/T26).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn shutdown_outer_timeout_still_tears_down() -> TestResult {
+async fn shutdown_with_a_spent_bound_still_tears_down() -> TestResult {
     let w = World::new()?;
     let ring = MemKeyring::new();
     let install_id = w.provision(&ring)?;

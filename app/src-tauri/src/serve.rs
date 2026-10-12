@@ -416,6 +416,10 @@ where
 /// [`quit`] is what makes a second Quit wait for the first. A write that outlives `outer` is
 /// left to the next start's crash reconciliation (`outcome_unknown`); the store is shut down
 /// regardless, so a late outcome append from it fails.
+///
+/// Public for tests only: a quit path (tray, test control) must call [`shutdown_then_exit`],
+/// whose [`quit`] runs this same path once per [`ServeSlot`], after a start in flight ended.
+#[doc(hidden)]
 pub async fn shutdown(
     state: &ServeState,
     reason: ShutdownReason,
@@ -429,6 +433,24 @@ async fn shutdown_until(
     reason: ShutdownReason,
     deadline: Instant,
 ) -> ShutdownOutcome {
+    shutdown_with(state, deadline, |core| {
+        core.map(|core| async move { core.shutdown(reason).await })
+    })
+    .await
+}
+
+/// [`shutdown_until`] with the core stage passed in: `core_stage` gets the core the freeze
+/// returned and gives the future [`run_core_shutdown`] joins until `deadline` (`None`: no core
+/// stage). Tests pass a stage that never finishes.
+async fn shutdown_with<S, F>(
+    state: &ServeState,
+    deadline: Instant,
+    core_stage: S,
+) -> ShutdownOutcome
+where
+    S: FnOnce(Option<Arc<Core>>) -> Option<F>,
+    F: Future<Output = ShutdownReport> + Send + 'static,
+{
     let core = state.freeze_for_shutdown();
 
     // Never `abort()`: the retry owns a store or core it is starting and ends them itself once
@@ -438,8 +460,8 @@ async fn shutdown_until(
         bounded(retry, RETRY_WAIT, deadline, "retry").await;
     }
 
-    let (report, timed_out) = match core {
-        Some(core) => run_core_shutdown(async move { core.shutdown(reason).await }, deadline).await,
+    let (report, timed_out) = match core_stage(core) {
+        Some(stage) => run_core_shutdown(stage, deadline).await,
         None => (None, false),
     };
 
@@ -1185,6 +1207,108 @@ mod tests {
         )
         .await;
         assert_eq!(lost, (None, false));
+    }
+
+    /// A state serving a gate over a bound endpoint, holding a real store that did a read (its
+    /// reader is open, so the WAL exists until an orderly store shutdown).
+    async fn bound_with_store(
+        tmp: &tempfile::TempDir,
+    ) -> Result<(ServeState, LocalDataDir), Box<dyn std::error::Error>> {
+        use atlas_duck_audit::testing::{FreeSpaceStub, MemKeyStore, MemKeyring};
+        use atlas_duck_audit::{FirstRunInput, create_new_store, new_ids};
+        use atlas_duck_ipc::paths::{DataDirResolution, check_data_dir};
+        use secrecy::SecretString;
+
+        const HOST: &str = "thishost";
+        let dir = tmp.path().join("data");
+        std::fs::create_dir(&dir)?;
+        let DataDirResolution::Local(data) = check_data_dir(&dir)? else {
+            return Err("the temp dir is not a local data dir".into());
+        };
+        let instance = InstanceLock::acquire(&data, HOST)?;
+        let (install_id, chain_id) = new_ids()?;
+        let keys: Arc<dyn KeyStore> = Arc::new(MemKeyStore::new(MemKeyring::new(), &install_id));
+        let mut cfg = OpenConfig::new(Arc::new(SystemClock::new()), keys);
+        cfg.free_space = Some(FreeSpaceStub::new(u64::MAX));
+        let pass = "correct horse battery";
+        let store = create_new_store(
+            &data,
+            &instance,
+            cfg,
+            FirstRunInput {
+                install_id,
+                chain_id,
+                passphrase: SecretString::from(pass.to_owned()),
+                passphrase_confirm: SecretString::from(pass.to_owned()),
+                archived_db: None,
+            },
+        )?;
+        store.recent_headers(Duration::from_secs(60))?;
+
+        let ui: Arc<dyn UiSink> = Arc::new(NoUi);
+        let gate = GateHandler::new(
+            GateState::Locked(LockedReason::KeychainUnavailable),
+            ui.clone(),
+        );
+        let extras = Arc::new(DoctorExtras {
+            tray_host: None,
+            secret_service: Arc::new(NoCheck),
+            data: Some(data.clone()),
+        });
+        let state = ServeState::new(gate.clone(), Some(gate), Some(store), extras, ui);
+        #[cfg(unix)]
+        let location = {
+            let dir = tmp.path().join("s");
+            atlas_duck_ipc::paths::ensure_socket_dir(&dir)?;
+            EndpointLocation::UnixSocket(dir.join("atlas-duck.sock"))
+        };
+        #[cfg(windows)]
+        let location = atlas_duck_ipc::paths::endpoint_location(&data, HOST)?;
+        let server = IpcServer::bind_at(&data, location)?;
+        let task = tokio::spawn(server.serve(state.cell.clone(), state.shutdown.clone()));
+        *lock(&state.served) = Some(task);
+        Ok((state, data))
+    }
+
+    /// I-1 (T20 review): a core stage that never finishes is ended by the outer bound, and the
+    /// server and the store are still torn down: no endpoint file, no WAL left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outer_timeout_ends_a_hung_core_stage_and_still_tears_down()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use atlas_duck_ipc::paths::read_endpoint_file;
+
+        let tmp = tempfile::tempdir()?;
+        let (state, data) = bound_with_store(&tmp).await?;
+        assert!(state.serving());
+        assert!(read_endpoint_file(&data)?.is_some());
+        let wal = data.path().join(format!("{DB_FILE}-wal"));
+        assert!(wal.exists(), "the open store has its WAL");
+
+        let bound = Duration::from_millis(300);
+        let started = Instant::now();
+        let outcome = shutdown_with(&state, started + bound, |_| {
+            Some(std::future::pending::<ShutdownReport>())
+        })
+        .await;
+        let took = started.elapsed();
+        assert_eq!(
+            outcome,
+            ShutdownOutcome {
+                report: None,
+                timed_out: true
+            }
+        );
+        assert!(took >= bound, "{took:?}");
+        // The bound plus the server stop and the store shutdown, which have nothing to wait for.
+        assert!(took < bound + SERVE_STOP_WAIT, "{took:?}");
+        assert!(state.shutdown.0.is_cancelled());
+        assert!(!state.serving());
+        assert!(lock(&state.served).is_none());
+        assert!(lock(&state.store).is_none(), "store taken");
+        assert!(read_endpoint_file(&data)?.is_none(), "endpoint file gone");
+        assert!(!wal.exists(), "the store was shut down");
+        assert_eq!(gate_label(&state).await, "shutting_down");
+        Ok(())
     }
 
     #[tokio::test]
