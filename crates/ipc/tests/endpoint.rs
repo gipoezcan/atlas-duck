@@ -318,6 +318,20 @@ fn v28_socket_dir_choice_linux() {
     );
     // A host argument that is not a sanitized component is refused.
     assert!(socket_dir("../evil").is_err());
+    // A sanitized name with escapes in it (`_` -> `_5f`) is accepted.
+    let escaped = atlas_duck_ipc::paths::sanitize_host_component("my_pc");
+    assert_eq!(
+        socket_dir(&escaped).expect("escaped host"),
+        if run_ok {
+            run.join("atlas-duck")
+        } else {
+            base_dirs()
+                .expect("base_dirs")
+                .home
+                .join(".local/state/atlas-duck")
+                .join(format!("run-{escaped}"))
+        }
+    );
 }
 
 #[cfg(target_os = "macos")]

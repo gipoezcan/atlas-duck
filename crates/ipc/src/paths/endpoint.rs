@@ -173,6 +173,22 @@ const MSG_DIR_NOT_DIR: &str = "socket dir check failed: not a directory";
 #[cfg(unix)]
 const MSG_BAD_HOST: &str = "host is not a sanitized host component";
 
+/// The output shape of `sanitize_host_component`: 1 to 240 bytes of
+/// `[a-z0-9._-]`, no `..`, no leading or trailing `.`. Not idempotence:
+/// `sanitize` escapes `_`, so a sanitized name with an escape in it is not
+/// its own sanitization.
+#[cfg(any(unix, test))]
+fn is_host_component(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= super::MAX_HOST_COMPONENT_LEN
+        && host
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+        && !host.contains("..")
+        && !host.starts_with('.')
+        && !host.ends_with('.')
+}
+
 /// The §3.1 owner/mode/symlink check on `lstat` values: not a symlink,
 /// owner == `euid`, permission bits (incl. setuid, setgid, sticky) exactly
 /// 0700. The file type bits of `mode` are ignored.
@@ -218,7 +234,7 @@ fn euid() -> u32 {
 /// variable is set.
 #[cfg(unix)]
 pub fn socket_dir(host: &str) -> io::Result<PathBuf> {
-    if super::sanitize_host_component(host) != host {
+    if !is_host_component(host) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, MSG_BAD_HOST));
     }
     #[cfg(feature = "test-paths")]
@@ -490,6 +506,40 @@ mod tests {
             pipe_prefix_for_sid("S-1-5-21-1-2-3-1001"),
             r"\\.\pipe\atlas-duck-c169ebe52e9c0ba4-"
         );
+    }
+
+    #[test]
+    fn host_component_shape() {
+        use super::super::sanitize_host_component as sanitize;
+        let long = sanitize(&"h".repeat(300));
+        for ok in [
+            "build-01",
+            "mymac.local",
+            "_empty",
+            "a_5fb",
+            sanitize("build_01").as_str(),
+            sanitize("jürgen-mbp").as_str(),
+            sanitize("").as_str(),
+            sanitize("../../evil").as_str(),
+            long.as_str(),
+        ] {
+            assert!(is_host_component(ok), "{ok:?} refused");
+        }
+        let too_long = "h".repeat(241);
+        for bad in [
+            "",
+            "../evil",
+            "a/b",
+            "A",
+            ".a",
+            "a.",
+            "a..b",
+            "a b",
+            "ü",
+            too_long.as_str(),
+        ] {
+            assert!(!is_host_component(bad), "{bad:?} accepted");
+        }
     }
 
     #[test]
