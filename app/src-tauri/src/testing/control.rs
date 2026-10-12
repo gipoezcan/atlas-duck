@@ -10,8 +10,14 @@
 //!   while `Core` serves or before anything serves.
 //! - `delay-startup-ms` (read by `serve::start` before the first `open`): sleep that many
 //!   milliseconds, at most 30 000 (I-17's deadline test).
-//! - `marker-handle` → `marker` (Windows, V12): the `WaitForSingleObject(handle, 0)` result of
-//!   the handle value in `marker-handle`: `signaled`, `invalid` or `other`.
+//! - `marker-handle` → `marker` (V12): whether a handle the test opened is open in this process.
+//!   Windows: `marker-handle` holds the handle value; `marker` is the `WaitForSingleObject(handle,
+//!   0)` result: `signaled`, `invalid` or `other`. Linux and macOS: `marker-handle` holds the
+//!   descriptor number on line 1 and the file's canonical path on line 2; `marker` is `signaled`
+//!   when that descriptor is open here and names that file (it leaked into the app), `invalid`
+//!   when it is not open, `other` when the number is one of the app's own descriptors. (The app
+//!   cannot be inspected from outside on Linux: it is non-dumpable, so `/proc/<pid>/fd` is
+//!   closed to the test.)
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -140,9 +146,14 @@ fn write_env_names(dir: &Path) -> io::Result<()> {
     write_atomic(dir, ENV_NAMES_FILE, &json)
 }
 
-/// The `marker` text for the handle value in `marker-handle`; `None` without a number.
+/// The `marker` text for the contents of `marker-handle`; `None` without a usable value.
 fn read_marker_handle(dir: &Path) -> Option<&'static str> {
     let text = fs::read_to_string(dir.join(MARKER_HANDLE_FILE)).ok()?;
+    marker_for_text(&text)
+}
+
+#[cfg(windows)]
+fn marker_for_text(text: &str) -> Option<&'static str> {
     let value: usize = text.trim().parse().ok()?;
     marker_for(value)
 }
@@ -167,9 +178,46 @@ fn marker_for(value: usize) -> Option<&'static str> {
     })
 }
 
-/// V12 is a Windows check: elsewhere nothing is written.
-#[cfg(not(windows))]
-fn marker_for(_value: usize) -> Option<&'static str> {
+/// V12 (Unix): `<fd>\n<path>`; see the module doc.
+#[cfg(unix)]
+fn marker_for_text(text: &str) -> Option<&'static str> {
+    let mut lines = text.lines();
+    let fd: libc::c_int = lines.next()?.trim().parse().ok()?;
+    let want = Path::new(lines.next()?);
+    // SAFETY: `F_GETFD` takes no pointer and only reads the descriptor table; a closed number
+    // fails with `EBADF`.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Some("invalid");
+    }
+    Some(if fd_target(fd).is_some_and(|t| t == want) {
+        "signaled"
+    } else {
+        "other"
+    })
+}
+
+/// The file an open descriptor of this process names.
+#[cfg(target_os = "linux")]
+fn fd_target(fd: libc::c_int) -> Option<PathBuf> {
+    fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn fd_target(fd: libc::c_int) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` writes a NUL-terminated path of at most `MAXPATHLEN` (1024, the length
+    // of `PATH_MAX`) bytes into the buffer, which is that long.
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc < 0 {
+        return None;
+    }
+    let len = buf.iter().position(|b| *b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn fd_target(_fd: libc::c_int) -> Option<PathBuf> {
     None
 }
 
@@ -376,6 +424,38 @@ mod tests {
         let t = Instant::now();
         startup_delay(&data, &quit).await;
         assert!(t.elapsed() < Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn marker_reports_the_descriptor_state() -> TestResult {
+        use std::os::fd::AsRawFd;
+        let tmp = tempfile::tempdir()?;
+        let file_path = fs::canonicalize(tmp.path())?.join("held");
+        fs::write(&file_path, b"x")?;
+        let file = fs::File::open(&file_path)?;
+        let fd = file.as_raw_fd();
+        let text = |fd: i32, path: &Path| format!("{fd}\n{}", path.display());
+        assert_eq!(marker_for_text(&text(fd, &file_path)), Some("signaled"));
+        // Open here, but another file: one of the app's own descriptors.
+        assert_eq!(
+            marker_for_text(&text(fd, &tmp.path().join("other"))),
+            Some("other")
+        );
+        // A number far beyond any descriptor this test process holds.
+        assert_eq!(marker_for_text(&text(99_999, &file_path)), Some("invalid"));
+        assert_eq!(marker_for_text("not-a-number\n/x"), None);
+        assert_eq!(marker_for_text("5"), None);
+
+        let dir = tmp.path().join(CONTROL_DIR);
+        fs::create_dir(&dir)?;
+        fs::write(dir.join(MARKER_HANDLE_FILE), text(fd, &file_path))?;
+        let task = Control::spawn_with(dir.clone(), Arc::new(Counting::default()), FAST);
+        wait_for("marker", || dir.join(MARKER_FILE).exists()).await?;
+        task.abort();
+        assert_eq!(read(&dir, MARKER_FILE), "signaled");
+        drop(file);
         Ok(())
     }
 

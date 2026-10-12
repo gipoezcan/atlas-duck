@@ -20,13 +20,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use atlas_duck_app_lib::testing::control::{DELAY_STARTUP_FILE, QUIT_FILE};
+use atlas_duck_app_lib::testing::control::{
+    DELAY_STARTUP_FILE, MARKER_FILE, MARKER_HANDLE_FILE, QUIT_FILE,
+};
 use atlas_duck_app_lib::testing::keystore::{MODE_NOT_LOCAL, MODE_UNAVAILABLE, set_mode};
 use atlas_duck_app_lib::testing::provision;
 use atlas_duck_atlassian::testing::TEST_USER;
 use atlas_duck_atlassian::testing::fixtures::{self, JIRA_9_12_VERSION};
 use atlas_duck_audit::{DB_FILE, EntryName, EventFlags, EventType, KeyStore};
-use atlas_duck_core::gate::MSG_FIRST_RUN;
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_ipc::paths::{
     CliToml, ENDPOINT_FILE, PINNED_SCHEMA_VERSION, PinnedPaths, write_cli_toml, write_pinned,
@@ -59,6 +60,9 @@ const MSG_LAUNCH_TIMEOUT: &str =
 const MSG_APP_NOT_FOUND: &str = "atlas-duck app not found; reinstall or re-run Install CLI to PATH";
 /// `GateState::ShuttingDown.envelope()` (`crates/core/src/gate.rs`).
 const MSG_SHUTTING_DOWN: &str = "atlas-duck is shutting down";
+/// §2.5 (verbatim; `crates/core/src/gate.rs` `MSG_FIRST_RUN`, typed out here so the flow does not
+/// compare the implementation with itself).
+const MSG_FIRST_RUN: &str = "atlas-duck is not set up yet: finish the setup window on the desktop";
 /// `GateState::StoreNewer.envelope()`.
 const MSG_STORE_NEWER: &str =
     "the audit store was written by a newer atlas-duck; upgrade atlas-duck";
@@ -534,7 +538,9 @@ async fn i17_deadline_before_submission_launch_timeout() -> Result<()> {
         "launch_timeout",
         MSG_LAUNCH_TIMEOUT,
     )?;
-    assert!(took < Duration::from_secs(15), "the run took {took:?}");
+    // Well under the 20 s poll limit: a run that waited for the app instead of honouring the 1 s
+    // deadline would take the full 20 s.
+    assert!(took < Duration::from_secs(10), "the run took {took:?}");
     // The launched app comes up after its delay; nothing was queued.
     wait_for_endpoint(&world).await?;
     let list = run(&world, &["requests", "list"]).await?;
@@ -596,7 +602,9 @@ const TEST_PATH: &str = "/atlas-duck-test-path";
 /// Source: `launch/env.rs` (`KEEP`, `TEST_KEEP`, `LC_*`, the system `PATH`; Windows `windows.rs`
 /// adds `SystemRoot` and `PATH`), `testing/control.rs` `write_env_names`. The subset check is the
 /// likeliest assertion to fail: a name the app itself sets (GTK, WebKit, CoreFoundation) before
-/// the control dir writes the file would show up here.
+/// the control dir writes the file would show up here. The app's `PATH` value is not compared:
+/// `/proc/<pid>/environ` is closed to the test (the app is non-dumpable, see V12), and the file
+/// holds names only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i20_launched_app_env_allowlist_no_proxy() -> Result<()> {
     if !opted_in("i20_launched_app_env_allowlist_no_proxy") {
@@ -627,16 +635,19 @@ async fn i20_launched_app_env_allowlist_no_proxy() -> Result<()> {
     Ok(())
 }
 
-/// I-20: with `HTTP_PROXY`/`HTTPS_PROXY` (both cases) pointing at a loopback listener, a release
-/// flow through a CLI-launched app completes (the mock saw the request) and the listener was
-/// never connected to.
+/// I-20 (reduced claim): with `HTTP_PROXY`/`HTTPS_PROXY` (both cases) pointing at a loopback
+/// listener, a release flow through a CLI-launched app completes (the mock saw the request) and
+/// the listener was never connected to.
 ///
-/// The harness provisions the instance with `ProxySetting::Direct`, so the app would not use an
-/// environment proxy for it in any case: this flow shows nothing leaks through the launch, it
-/// does not exercise the "system proxy" setting.
+/// This is a smoke check, not a proof: the harness provisions the instance with
+/// `ProxySetting::Direct` (the mock is on loopback), and the product never reads the process
+/// environment for a proxy at all (`proxy/os_linux.rs`: "the process environment is never a proxy
+/// source", L42), so a positive control (an app started by the test with the same variables
+/// connecting to the trap) is impossible: no app would. The strong claim, that the variables do
+/// not reach the launched app, is `i20_launched_app_env_allowlist_no_proxy`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn i20_launched_app_sends_nothing_through_env_proxy() -> Result<()> {
-    if !opted_in("i20_launched_app_sends_nothing_through_env_proxy") {
+async fn i20_direct_instance_flow_ignores_env_proxy_smoke() -> Result<()> {
+    if !opted_in("i20_direct_instance_flow_ignores_env_proxy_smoke") {
         return Ok(());
     }
     let trap = ProxyTrap::start()?;
@@ -675,22 +686,63 @@ async fn i20_launched_app_sends_nothing_through_env_proxy() -> Result<()> {
 
 // ---- V12: no inherited handles -------------------------------------------------------------------------
 
-/// The targets of `/proc/<pid>/fd`.
-#[cfg(target_os = "linux")]
-fn fd_links(pid: u32) -> std::io::Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
-        if let Ok(target) = fs::read_link(entry?.path()) {
-            out.push(target);
+/// Polls (15 s) for `test-control/marker`, which the app writes once from `marker-handle`
+/// (`testing/control.rs`): `signaled` (the handle or descriptor the test opened is open in the
+/// app), `invalid` (it is not) or `other` (the number is one of the app's own).
+async fn wait_marker(world: &World, what: &str) -> Result<String> {
+    let file = world.control_dir().join(MARKER_FILE);
+    let start = Instant::now();
+    loop {
+        if let Ok(text) = fs::read_to_string(&file) {
+            let text = text.trim().to_owned();
+            if !text.is_empty() {
+                return Ok(text);
+            }
         }
+        if start.elapsed() > Duration::from_secs(15) {
+            return Err(format!("{what}: the app wrote no test-control/marker in 15 s").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Ok(out)
 }
 
-#[cfg(target_os = "linux")]
+/// The body of both V12 flows. `handle_text` is the `marker-handle` content for a handle (Windows)
+/// or descriptor (Unix) that the test process holds and that a child of the test inherits.
+///
+/// First the app a CLI run launches: its marker must not be `signaled`. Then, as the control that
+/// gives that absence its meaning, the app started directly by the test (a plain child, like the
+/// CLI itself): its marker must be `signaled`, i.e. the handle did reach a child of the test and
+/// the app's check does see it.
+async fn v12_flow(world: &World, handle_text: &str) -> Result<()> {
+    let control = world.control_dir();
+    fs::create_dir_all(&control)?;
+    fs::write(control.join(MARKER_HANDLE_FILE), handle_text)?;
+
+    let r = run(world, &["instances"]).await?;
+    assert_eq!(r.exit, 0, "{}", r.stdout);
+    let launched = wait_marker(world, "CLI-launched app").await?;
+    world.quit_app().await?;
+
+    // The control: a fresh app of the same home, started by the test itself.
+    let _ = fs::remove_file(control.join(MARKER_FILE));
+    let _ = fs::remove_file(control.join(QUIT_FILE));
+    let _direct = world.start_app().await?;
+    let direct = wait_marker(world, "directly started app").await?;
+    assert_eq!(
+        direct, "signaled",
+        "the test's own child did not inherit the handle (marker {direct:?}): the flow proves nothing"
+    );
+    assert_ne!(
+        launched, "signaled",
+        "the CLI-launched app inherited the test's handle (marker {launched:?})"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
 struct OpenFd(libc::c_int);
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Drop for OpenFd {
     fn drop(&mut self) {
         // SAFETY: closes the descriptor `libc::open` returned; it is closed once, here.
@@ -700,20 +752,22 @@ impl Drop for OpenFd {
     }
 }
 
-/// V12 (Linux): the test opens a file WITHOUT `O_CLOEXEC`, so every child it spawns inherits the
-/// descriptor; the CLI cold-starts the app; `/proc/<app pid>/fd` has no link to the file. Two
-/// controls make the absence mean something: a plain child of the test (`sleep`) does inherit
-/// the descriptor, and the app's own `instance.lock` shows in its table.
+/// V12 (Linux and macOS): the test opens a file WITHOUT `O_CLOEXEC`, so every child it spawns
+/// inherits the descriptor; the CLI cold-starts the app; the app, checking its own descriptor
+/// table, finds no descriptor with that number naming the file. The app cannot be inspected from
+/// outside: it is non-dumpable on Linux (`startup/crash.rs`), so `/proc/<pid>/fd` is closed to the
+/// test (CI run 3: `PermissionDenied`), and on macOS the same self-check keeps one mechanism.
+/// Control: the app the test starts directly is a plain child of the test and does hold the
+/// descriptor (`v12_flow`).
 ///
-/// Source: `launch/unix.rs` (double fork, exec with the allowlisted environment), `test-control/pid`
-/// (written by the app at start). The Windows half (an inheritable event, `test-control/marker`)
-/// is Task 25's; macOS has no flow here (no `/proc`, no cheap fd listing without a helper binary).
-#[cfg(target_os = "linux")]
+/// Source: `launch/unix.rs` (double fork, exec with the allowlisted environment),
+/// `testing/control.rs` `marker_for_text` (`fcntl(F_GETFD)`, then `/proc/self/fd/<n>` or
+/// `F_GETPATH`).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v12_launched_app_inherits_no_handles() -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
-    use atlas_duck_app_lib::testing::control::PID_FILE;
     if !opted_in("v12_launched_app_inherits_no_handles") {
         return Ok(());
     }
@@ -729,50 +783,54 @@ async fn v12_launched_app_inherits_no_handles() -> Result<()> {
         return Err(std::io::Error::last_os_error().into());
     }
     let _fd = OpenFd(fd);
+    v12_flow(&world, &format!("{fd}\n{}", marker.display())).await
+}
 
-    // Control 1: a direct child inherits it.
-    let mut sleeper = std::process::Command::new("sleep")
-        .arg("30")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let inherited = fd_links(sleeper.id());
-    let _ = sleeper.kill();
-    let _ = sleeper.wait();
-    assert!(
-        inherited?.contains(&marker),
-        "the test's own child did not inherit the marker: the flow proves nothing"
-    );
+#[cfg(windows)]
+struct OpenEvent(windows_sys::Win32::Foundation::HANDLE);
 
-    // The CLI inherits it too and cold-starts the app.
-    let r = run(&world, &["instances"]).await?;
-    assert_eq!(r.exit, 0, "{}", r.stdout);
-    let pid_file = world.control_dir().join(PID_FILE);
-    let start = Instant::now();
-    let pid: u32 = loop {
-        if let Some(pid) = fs::read_to_string(&pid_file)
-            .ok()
-            .and_then(|t| t.trim().parse().ok())
-        {
-            break pid;
+#[cfg(windows)]
+impl Drop for OpenEvent {
+    fn drop(&mut self) {
+        // SAFETY: closes the event `CreateEventW` returned; it is closed once, here.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
         }
-        if start.elapsed() > Duration::from_secs(10) {
-            return Err("the app wrote no test-control/pid".into());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// V12 (Windows): the test creates an inheritable, manual-reset, signaled event; its value goes to
+/// `test-control/marker-handle`; the CLI cold-starts the app; the app runs `WaitForSingleObject`
+/// on that value (zero timeout). Handles are inherited by value, so a leak shows as `signaled`;
+/// `invalid` is the clean answer. Control: the app the test starts directly inherits the event
+/// (`CreateProcess` with `bInheritHandles = TRUE`, which std and tokio pass) and answers
+/// `signaled` (`v12_flow`).
+///
+/// Source: `launch/windows.rs` (every process is created with `bInheritHandles = FALSE`),
+/// `testing/control.rs` `marker_for`.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v12_launched_app_inherits_no_handles() -> Result<()> {
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    if !opted_in("v12_launched_app_inherits_no_handles") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
     };
-    let links = fd_links(pid)?;
-    // Control 2: the app's table is readable and holds its own lock file.
-    assert!(
-        links.iter().any(|l| l.ends_with("instance.lock")),
-        "no instance.lock among the app's descriptors: {links:?}"
-    );
-    assert!(
-        !links.contains(&marker),
-        "the launched app inherited the marker descriptor: {links:?}"
-    );
-    Ok(())
+    // SAFETY: `attributes` outlives the call; the event is manual-reset (1), initially signaled
+    // (1) and unnamed (null); the returned handle is closed by `OpenEvent`.
+    let event = unsafe { CreateEventW(&attributes, 1, 1, std::ptr::null()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let event = OpenEvent(event);
+    v12_flow(&world, &(event.0 as usize).to_string()).await
 }
 
 // ---- gate states over the endpoint --------------------------------------------------------------------
@@ -812,7 +870,17 @@ async fn gate_first_run_over_endpoint() -> Result<()> {
     assert_eq!(data["app"]["gate"], "first_run", "{}", r.stdout);
     assert_eq!(data["app"]["ipc_accepting"], true, "{}", r.stdout);
     assert!(data["app_unavailable"].is_null(), "{}", r.stdout);
-    expect_keys("data.local", &data["local"], &LOCAL_KEYS, &mut Vec::new());
+    // The gate's `doctor` is `{gate}` (`core/gate.rs`); `AppHandler` adds its three extras
+    // (`serve/app_handler.rs` `DoctorExtras::fields`).
+    let mut problems = Vec::new();
+    expect_keys("data.local", &data["local"], &LOCAL_KEYS, &mut problems);
+    expect_keys(
+        "data.app",
+        &data["app"],
+        &["gate", "tray_host", "secret_service", "ipc_accepting"],
+        &mut problems,
+    );
+    assert!(problems.is_empty(), "{problems:#?}\n{}", r.stdout);
     Ok(())
 }
 
@@ -1206,6 +1274,11 @@ async fn doctor_reports_section_4_7_fields() -> Result<()> {
         return Ok(());
     }
     let world = jira_world().await?;
+    // `data.local` is computed BEFORE `doctor` connects (`doctor.rs` `run`: `local_checks` runs
+    // on the discovery, then the connector may launch the app), so `endpoint_exists` describes
+    // the machine as the CLI found it. An app that is already up makes it `true`; on a cold start
+    // it is `false` (CI run 3 saw exactly that on all four legs).
+    let _app = world.start_app().await?;
     let r = run(&world, &["doctor"]).await?;
     let data = doctor_data(&r)?;
     let problems = doctor_problems(
@@ -1216,10 +1289,22 @@ async fn doctor_reports_section_4_7_fields() -> Result<()> {
     );
     assert!(problems.is_empty(), "{problems:#?}\n{}", r.stdout);
     let local = &data["local"];
-    assert_eq!(local["app_path_found"], true);
-    assert_eq!(local["endpoint_exists"], true);
-    assert_eq!(local["data_dir_local"], true);
-    assert!(local["data_dir_reason"].is_null());
+    assert_eq!(local["app_path_found"], true, "{local}");
+    assert_eq!(local["endpoint_exists"], true, "{local}");
+    // A fresh temp dir is local on every runner leg; if a filesystem ever says otherwise the
+    // reason must agree with the flag (`null` iff local), and the message shows both.
+    let reason = &local["data_dir_reason"];
+    assert!(local["data_dir_local"].is_boolean(), "{local}");
+    assert_eq!(
+        reason.is_null(),
+        local["data_dir_local"] == true,
+        "data_dir_local {} with reason {reason}",
+        local["data_dir_local"]
+    );
+    assert_eq!(
+        local["data_dir_local"], true,
+        "data_dir_reason {reason} (the real not-local mounts are the ignored I-42/I-44 flows)"
+    );
     assert_eq!(data["app"]["ipc_accepting"], true);
     let row = &data["app"]["instances"]["jira-main"];
     assert_eq!(row["configured"], true, "{row}");
@@ -1246,10 +1331,10 @@ async fn i44_doctor_keyring_local_false_on_nfs() -> Result<()> {
         .map_err(|_| "ATLAS_DUCK_TEST_NFS_DIR is not set (the locality-mounts job sets it)")?;
     let on_nfs = Path::new(&nfs).join("xdg");
     fs::create_dir_all(&on_nfs)?;
-    let local = World::new(WorldOpts::default())?;
-    let on_disk = local.root().join("xdg");
+    // The local case's dir lives under its own world's root (which stays alive for the run).
+    let local_root = tempfile::tempdir()?;
+    let on_disk = local_root.path().join("xdg");
     fs::create_dir_all(&on_disk)?;
-    drop(local);
     for (xdg, want) in [(on_nfs, false), (on_disk, true)] {
         let world =
             World::new(WorldOpts::default().with_env("XDG_DATA_HOME", &xdg.to_string_lossy()))?;
@@ -1299,7 +1384,16 @@ async fn i26_app_killed_pending_read_abandoned_after_restart() -> Result<()> {
         ],
     )
     .await?;
+    let reads = async |world: &World| -> Result<usize> {
+        Ok(jira(world)?
+            .received()
+            .await
+            .iter()
+            .filter(|req| req.url.path().ends_with("/issue/ABC-1"))
+            .count())
+    };
     app.kill_hard()?;
+    let reads_at_kill = reads(&world).await?;
     let _restarted = world.start_app().await?;
     let r = run(&world, &["await", &id]).await?;
     assert_eq!(r.exit, 7, "{}", r.stdout);
@@ -1308,6 +1402,12 @@ async fn i26_app_killed_pending_read_abandoned_after_restart() -> Result<()> {
     assert_eq!(env.request_id.as_deref(), Some(id.as_str()));
     let err = env.error.as_ref().ok_or("no error")?;
     assert_eq!((err.code, err.retryable), (ErrorCode::Abandoned, true));
+    // The abandoned read was not executed again by the restart or by `await`.
+    assert_eq!(
+        reads(&world).await?,
+        reads_at_kill,
+        "the abandoned read reached the mock again"
+    );
 
     world.quit_app().await?;
     let headers = audit_headers(&world)?;
@@ -1415,6 +1515,14 @@ async fn s01_two_app_instances_one_store() -> Result<()> {
     let endpoint_before = fs::read(&endpoint)?;
 
     let other = world.root().join("s01-other");
+    // The second app's temp and runtime dir: it must exist (and, for `XDG_RUNTIME_DIR`, be
+    // private) or the app could fail for that reason instead of by being the second instance.
+    fs::create_dir_all(&other)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&other, fs::Permissions::from_mode(0o700))?;
+    }
     let overrides = [
         ("LANG", "de_DE.UTF-8"),
         ("TMP", other.to_str().ok_or("non-UTF-8 test home")?),
