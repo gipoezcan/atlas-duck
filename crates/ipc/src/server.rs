@@ -652,6 +652,12 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
         );
         return;
     };
+    tracing::info!(
+        event = diag::EVENT_ACCEPT,
+        connection_id = %connection_id,
+        peer_pid = pid,
+        "ipc connection accepted"
+    );
     let (mut rd, wr) = conn.split();
     let writer = Writer::start(wr);
 
@@ -673,12 +679,6 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
         connection_id,
         peer,
     });
-    tracing::info!(
-        event = diag::EVENT_ACCEPT,
-        connection_id = %meta.connection_id,
-        peer_pid = pid,
-        "ipc connection accepted"
-    );
 
     let first = match first {
         Ok(Ok(Some(bytes))) => Ok(bytes),
