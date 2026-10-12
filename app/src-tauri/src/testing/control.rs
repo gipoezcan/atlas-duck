@@ -4,6 +4,8 @@
 //!   (`serve::shutdown_then_exit`, which also ends the process).
 //! - `env-names.json` (written at start): the sorted **names** of the app's environment
 //!   variables, never their values (I-20).
+//! - `pid` (written at start): the app's own process id, so a test harness can end an app that
+//!   ignored `quit` (never a name-based kill).
 //! - `refused` (written on change): the kept gate handler's refused count (PD-35), or `none`
 //!   while `Core` serves or before anything serves.
 //! - `delay-startup-ms` (read by `serve::start` before the first `open`): sleep that many
@@ -33,6 +35,7 @@ pub const CONTROL_DIR: &str = "test-control";
 pub const QUIT_FILE: &str = "quit";
 pub const ENV_NAMES_FILE: &str = "env-names.json";
 pub const REFUSED_FILE: &str = "refused";
+pub const PID_FILE: &str = "pid";
 pub const DELAY_STARTUP_FILE: &str = "delay-startup-ms";
 pub const MARKER_HANDLE_FILE: &str = "marker-handle";
 pub const MARKER_FILE: &str = "marker";
@@ -91,6 +94,8 @@ async fn run(dir: PathBuf, host: Arc<dyn ControlHost>, poll: Duration) {
         tracing::warn!(event = LOG_EVENT_CONTROL_FAILED, reason = "control_dir");
     } else if write_env_names(&dir).is_err() {
         tracing::warn!(event = LOG_EVENT_CONTROL_FAILED, reason = "env_names");
+    } else if write_pid(&dir).is_err() {
+        tracing::warn!(event = LOG_EVENT_CONTROL_FAILED, reason = "pid");
     }
     let mut quit_sent = false;
     let mut refused_written: Option<Option<u64>> = None;
@@ -119,6 +124,11 @@ async fn run(dir: PathBuf, host: Arc<dyn ControlHost>, poll: Duration) {
         }
         tokio::time::sleep(poll).await;
     }
+}
+
+/// `pid`: this process's id in decimal.
+fn write_pid(dir: &Path) -> io::Result<()> {
+    write_atomic(dir, PID_FILE, std::process::id().to_string().as_bytes())
 }
 
 /// `env-names.json`: a JSON array of the sorted, distinct variable names (lossy UTF-8).
@@ -282,6 +292,17 @@ mod tests {
         if !path_value.is_empty() {
             assert!(!read(&dir, ENV_NAMES_FILE).contains(&path_value));
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_own_pid_is_written_at_start() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let dir = tmp.path().join(CONTROL_DIR);
+        let task = Control::spawn_with(dir.clone(), Arc::new(Counting::default()), FAST);
+        wait_for("pid", || dir.join(PID_FILE).exists()).await?;
+        task.abort();
+        assert_eq!(read(&dir, PID_FILE), std::process::id().to_string());
         Ok(())
     }
 

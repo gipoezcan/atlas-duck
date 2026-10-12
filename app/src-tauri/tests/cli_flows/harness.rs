@@ -22,7 +22,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::compose::{self, CoreInputs};
-use atlas_duck_app_lib::testing::control::{CONTROL_DIR, ENV_NAMES_FILE, QUIT_FILE, REFUSED_FILE};
+use atlas_duck_app_lib::testing::control::{
+    CONTROL_DIR, ENV_NAMES_FILE, PID_FILE, QUIT_FILE, REFUSED_FILE,
+};
 use atlas_duck_app_lib::testing::provision;
 use atlas_duck_atlassian::testing::MockDc;
 use atlas_duck_atlassian::testing::fixtures::{CONFLUENCE_8_5_VERSION, JIRA_9_12_VERSION};
@@ -305,8 +307,10 @@ impl World {
         Ok(world)
     }
 
+    /// The canonical test home (on macOS `/private/tmp/..`, not `/tmp/..`): the one string the
+    /// pinned file, the child environment and every child's `current_dir` are built from.
     pub fn root(&self) -> &Path {
-        self.root.path()
+        &self.base.home
     }
     pub fn data_dir(&self) -> &Path {
         &self.data
@@ -370,7 +374,7 @@ impl World {
         };
         child_env(
             &|n| std::env::var_os(n),
-            self.root.path(),
+            &self.base.home,
             keystore,
             &self.opts.extra_env,
         )
@@ -378,7 +382,7 @@ impl World {
 
     fn command(&self, exe: &str, args: &[&str]) -> Command {
         let mut c = Command::new(exe);
-        c.args(args).env_clear().current_dir(self.root.path());
+        c.args(args).env_clear().current_dir(&self.base.home);
         for (k, v) in self.env() {
             c.env(k, v);
         }
@@ -423,18 +427,16 @@ impl World {
         .await?;
 
         let outcome = self.add_instances(&core, &confirmer, instances).await;
-        let ids = match &outcome {
-            Ok(_) => distinct_instance_ids(&store),
-            Err(_) => Vec::new(),
-        };
+        // Also after a failed add: the entries written so far must be swept by Drop.
+        let ids = distinct_instance_ids(&store);
         // The shutdown path runs whatever happened above.
         core.shutdown(ShutdownReason::Quit).await;
         drop(core);
         store.shutdown();
         drop(lock);
+        self.instance_ids = ids;
         let mocks = outcome?;
         self.mocks.extend(mocks);
-        self.instance_ids = ids;
         Ok(())
     }
 
@@ -533,17 +535,22 @@ impl World {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = cmd.spawn()?;
+        // A leftover endpoint (a killed app) would read as "started": remove it, and the old
+        // pid record, before the spawn. Only inside this world's own data dir.
         let endpoint = self.data.join(ENDPOINT_FILE);
+        let _ = fs::remove_file(&endpoint);
+        let _ = fs::remove_file(self.control_dir().join(PID_FILE));
+        let mut child = cmd.spawn()?;
         let start = Instant::now();
         loop {
-            if endpoint.try_exists()? {
-                break;
-            }
+            // First: a startup death must fail fast with its status, whatever files exist.
             if let Some(status) = child.try_wait()? {
                 return Err(
                     format!("the app ended before it published its endpoint: {status}").into(),
                 );
+            }
+            if endpoint.try_exists()? {
+                break;
             }
             if start.elapsed() > APP_START_WAIT {
                 let _ = child.kill();
@@ -564,6 +571,9 @@ impl World {
     }
 
     /// True while some process holds `instance.lock` (the app of this home, however started).
+    /// The probe takes the lock for a moment when it is free, so an app that is starting at that
+    /// instant can lose it and refuse to start: use it only after the CLI run that started the
+    /// app has exited (same for [`World::wait_app_gone`] and `lock_free_within`).
     pub fn app_running(&self) -> Result<bool> {
         let data = self.local_data()?;
         Ok(InstanceLock::acquire(&data, &self.host).is_err())
@@ -667,8 +677,10 @@ impl World {
 
     // ---- drop --------------------------------------------------------------------------------
 
-    /// Quits whatever app holds `instance.lock` (the control file; a hard kill by the pid in the
-    /// lock record after 10 s where the record is readable, i.e. on Unix).
+    /// Quits whatever app holds `instance.lock` (the control file; after 10 s a hard kill by the
+    /// pid in the lock record, readable on Unix, and by the pid the app wrote to
+    /// `test-control/pid`). Both pids come from this world's own records, never from a process
+    /// name, and the kill only runs when the world's app ignored the quit file.
     fn stop_app_blocking(&self) {
         let Ok(data) = self.local_data() else { return };
         let pid = match InstanceLock::acquire(&data, &self.host) {
@@ -680,8 +692,15 @@ impl World {
         if lock_free_within(&data, &self.host, DROP_QUIT_WAIT) {
             return;
         }
-        if let Some(pid) = pid {
-            kill_pid(pid);
+        let control_pid = fs::read_to_string(self.control_dir().join(PID_FILE))
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok());
+        let mut killed = false;
+        for p in [pid, control_pid].into_iter().flatten() {
+            kill_pid(p);
+            killed = true;
+        }
+        if killed {
             lock_free_within(&data, &self.host, Duration::from_secs(5));
         }
     }
@@ -711,7 +730,8 @@ impl Drop for World {
         if self.opts.keystore == KeystoreKind::Os {
             self.delete_os_entries();
         }
-        // The temp root goes with `root`.
+        // The temp root goes with `root` (after this body): no app of this world is left
+        // running in it unless the kill above failed.
     }
 }
 
@@ -736,7 +756,9 @@ fn write_control_file(data: &Path, name: &str, content: &str) -> io::Result<()> 
     fs::write(dir.join(name), content)
 }
 
-/// True once `instance.lock` can be taken (and is released again at once).
+/// True once `instance.lock` can be taken (and is released again at once). Like
+/// [`World::app_running`], it can make an app that is starting lose the lock: after the CLI
+/// run only.
 fn lock_free_within(data: &LocalDataDir, host: &str, wait: Duration) -> bool {
     let start = Instant::now();
     loop {
