@@ -525,7 +525,21 @@ async fn i26_reopened_store_reconciles_stale_check_crash() -> TestResult {
         types(&h, &id).await?.last(),
         Some(&EventType::PREVIEW_FETCH)
     );
+    let verifies = |h: &Harness| -> Result<usize, TestError> {
+        Ok(h.store()
+            .recent_headers(Duration::from_secs(24 * 3600))?
+            .iter()
+            .filter(|e| e.event_type == EventType::VERIFY)
+            .count())
+    };
+    let before = verifies(&h)?;
     h.reopen_and_restart().await?;
+    // The real startup ran: `audit::open` left its `VERIFY` row.
+    assert_eq!(
+        verifies(&h)?,
+        before + 1,
+        "the reopen wrote no startup VERIFY"
+    );
     assert!(h.store().open_incidents().is_empty());
     assert_listed_unknown(&h, &id, "ABC-1").await?;
     let t = types(&h, &id).await?;

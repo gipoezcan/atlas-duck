@@ -5,7 +5,9 @@
 
 mod common;
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use atlas_duck_atlassian::Timeouts;
 use atlas_duck_atlassian::testing::{
@@ -397,11 +399,34 @@ async fn expiry_append_does_not_block_runtime_worker() -> TestResult {
     // The test body runs on the main thread, not on the worker: the answer has to come from a
     // task, which only the one worker can run.
     let handler = h.handler();
+    // A plain thread, not a tokio timer: with the one worker blocked no timer could fire. If the
+    // answer needs the paused writer, the watchdog lets it go after 2 s and the flag fails the
+    // test instead of leaving it hanging.
+    let fired = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let (f, fired) = (faults.clone(), fired.clone());
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        let t = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !d.load(Ordering::SeqCst) {
+                if start.elapsed() >= Duration::from_secs(2) {
+                    fired.store(true, Ordering::SeqCst);
+                    f.resume_writer();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        (t, done)
+    };
     let answer = tokio::spawn(async move { handler.status(&other).await });
-    let answered = tokio::time::timeout(Duration::from_millis(500), answer).await;
-    // Let the writer go first, so a failure ends the test instead of hanging its runtime.
+    let env = answer.await?;
+    watchdog.1.store(true, Ordering::SeqCst);
+    let _ = watchdog.0.join();
+    let late = fired.load(Ordering::SeqCst);
     faults.resume_writer();
-    let env = answered.map_err(|_| "status waited for the paused audit writer")??;
+    assert!(!late, "status waited for the paused audit writer");
     assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
     assert!(expiry.await?, "the expiry did not complete");
     assert_eq!(h.status(&expiring).await.status, Status::Expired);

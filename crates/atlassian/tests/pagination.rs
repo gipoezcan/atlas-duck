@@ -372,9 +372,10 @@ async fn u04_pagination_stays_under_context_path() -> TestResult {
 /// writes it in pieces up to this size (no chunk constant exists in the mock itself).
 const MOCK_WRITE_CHUNK: usize = 512 * 1024;
 
-/// How far past the 50 MiB cap the cut page may reach: one read chunk, but a read can return
-/// more than one written piece. The macOS arm64 CI run at `66fdca1` saw the cut 580 KB past
-/// 512 KiB (several pieces in one read), so the bound is twice the chunk.
+/// How far past the 50 MiB cap the cut page may reach: `max(512 KiB, 2 x MOCK_WRITE_CHUNK)`, which
+/// is 1 MiB with the chunk above. One read normally returns one written piece, but it can return
+/// several: the macOS arm64 CI run at `66fdca1` saw the cut 580 KB past 512 KiB, so the bound is
+/// twice the chunk.
 const FETCH_CAP_TOLERANCE: usize = if 2 * MOCK_WRITE_CHUNK > 512 * 1024 {
     2 * MOCK_WRITE_CHUNK
 } else {

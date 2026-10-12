@@ -25,7 +25,7 @@ use atlas_duck_core::engine::cache::{
 use atlas_duck_core::engine::queue::{Admission, AgentKey, KeyOrigin, Limits, MIB, Reservation};
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::payloads::{ReadFetched, read_fetched};
-use atlas_duck_core::testing::{FaultPlan, Harness};
+use atlas_duck_core::testing::{FaultPlan, Harness, ReadFault};
 use atlas_duck_core::{Decision, DecisionError, DecisionKind};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::proto::{
@@ -920,42 +920,120 @@ async fn i37_rebuild_hash_mismatch_disables_release() -> TestResult {
     Ok(())
 }
 
-/// PD-40: a record that cannot be decrypted fails the item closed like a hash mismatch; a store
-/// that is only closed for one call fails that call and nothing else.
+/// The seq of the `READ_FETCHED` row of `id`.
+fn fetched_seq(h: &Harness, id: &str) -> Result<u64, TestError> {
+    h.store()
+        .headers_for_request(id)?
+        .iter()
+        .find(|e| e.event_type == EventType::READ_FETCHED)
+        .map(|e| e.seq)
+        .ok_or_else(|| "no READ_FETCHED".into())
+}
+
+/// A queued, previewed item whose candidate was evicted, and the seq it rebuilds from.
+async fn evicted_item(h: &Harness) -> Result<(String, CandidateRev, u64), TestError> {
+    let id = request_id(&h.submit(ISSUE, issue("ABC-1")).await)?;
+    let item = queued(h, &id, 5000).await.ok_or("never queued")?;
+    h.decisions()
+        .preview_fetch(&id, Some(item.candidate_rev))
+        .map_err(|e| format!("{e:?}"))?;
+    let seq = fetched_seq(h, &id)?;
+    h.evict_candidate(&id);
+    Ok((id, item.candidate_rev, seq))
+}
+
+/// The rebuild of `id` failed for good: Release is disabled, Deny stays.
+async fn assert_release_disabled(h: &Harness, id: &str, rev: CandidateRev) -> TestResult {
+    let res = h.decisions().preview_fetch(id, Some(rev));
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let item = h.decisions().queue_get(id).ok_or("gone")?;
+    assert!(!item.approvable, "release is disabled after the failure");
+    let res = h.decisions().decide(release(id, item.candidate_rev));
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let events = h.events(id).await?;
+    assert!(
+        events
+            .iter()
+            .any(|(t, p)| *t == EventType::DECISION_INVALID
+                && p["reason"] == json!("not_approvable"))
+    );
+    assert!(!events.iter().any(|(t, _)| *t == EventType::READ_RELEASED));
+    Ok(())
+}
+
+/// PD-40: a record that cannot be decrypted fails the item closed like a hash mismatch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i37_rebuild_decrypt_failure_disables_release() -> TestResult {
     let h = Harness::jira().await?;
     mount_issue(&h, "ABC-1", 4096, 'r').await?;
-    // Transient first: this request's item keeps working.
-    let t = request_id(&h.submit(ISSUE, issue("ABC-1")).await)?;
-    let item = queued(&h, &t, 5000).await.ok_or("never queued")?;
-    let rev = item.candidate_rev;
-    h.decisions()
-        .preview_fetch(&t, Some(rev))
-        .map_err(|e| format!("{e:?}"))?;
-    h.evict_candidate(&t);
-    h.plan().close_reads_for(1);
-    let res = h.decisions().preview_fetch(&t, Some(rev));
-    assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
-    assert!(h.decisions().queue_get(&t).ok_or("gone")?.approvable);
-    let res = h.decisions().preview_fetch(&t, Some(rev));
-    assert!(res.is_ok(), "{res:?}");
-    // Permanent: the record of the candidate cannot be decrypted.
-    let id = request_id(&h.submit(ISSUE, issue("ABC-1")).await)?;
-    let item = queued(&h, &id, 5000).await.ok_or("never queued")?;
-    h.decisions()
-        .preview_fetch(&id, Some(item.candidate_rev))
-        .map_err(|e| format!("{e:?}"))?;
-    let seq = h
-        .store()
-        .headers_for_request(&id)?
-        .iter()
-        .find(|e| e.event_type == EventType::READ_FETCHED)
-        .map(|e| e.seq)
-        .ok_or("no READ_FETCHED")?;
+    let (id, rev, seq) = evicted_item(&h).await?;
+    h.plan().fail_read_payload_with(seq, ReadFault::Decrypt);
+    assert_release_disabled(&h, &id, rev).await
+}
+
+/// PD-40: a payload that does not match its stored hash is permanent too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_rebuild_payload_hash_failure_disables_release() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(&h, "ABC-1", 4096, 'r').await?;
+    let (id, rev, seq) = evicted_item(&h).await?;
+    h.plan().fail_read_payload_with(seq, ReadFault::PayloadHash);
+    assert_release_disabled(&h, &id, rev).await
+}
+
+/// PD-40: a row of an unexpected shape is permanent too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_rebuild_invalid_row_disables_release() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(&h, "ABC-1", 4096, 'r').await?;
+    let (id, rev, seq) = evicted_item(&h).await?;
     h.plan().fail_read_payload(seq);
-    h.evict_candidate(&id);
-    let res = h.decisions().preview_fetch(&id, Some(item.candidate_rev));
+    assert_release_disabled(&h, &id, rev).await
+}
+
+/// PD-40: a store that is only closed for one call fails that call and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_rebuild_transient_failure_fails_only_that_call() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(&h, "ABC-1", 4096, 'r').await?;
+    let (id, rev, seq) = evicted_item(&h).await?;
+    h.plan().close_reads_of(seq, 1);
+    let res = h.decisions().preview_fetch(&id, Some(rev));
+    assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
+    assert!(h.decisions().queue_get(&id).ok_or("gone")?.approvable);
+    let res = h.decisions().preview_fetch(&id, Some(rev));
+    assert!(res.is_ok(), "{res:?}");
+    Ok(())
+}
+
+/// Review m-4 (spec §5.2): a permanent source error while redacting marks the item
+/// `rebuild_failed`, so it stops listing as approvable at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_redact_with_unreadable_source_disables_release() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(&h, "ABC-1", 4096, 'r').await?;
+    let (id, _, seq) = evicted_item(&h).await?;
+    h.plan().fail_read_payload_with(seq, ReadFault::Decrypt);
+    let res = h.approver().redact(
+        &id,
+        vec![RedactionOp::MaskText {
+            text: "rrrr".into(),
+            every_occurrence: true,
+            at: None,
+        }],
+    );
     assert!(
         matches!(
             res,
@@ -964,26 +1042,7 @@ async fn i37_rebuild_decrypt_failure_disables_release() -> TestResult {
         "{res:?}"
     );
     let item = h.decisions().queue_get(&id).ok_or("gone")?;
-    assert!(
-        !item.approvable,
-        "release is disabled after a decrypt failure"
-    );
-    let res = h.decisions().decide(release(&id, item.candidate_rev));
-    assert!(
-        matches!(
-            res,
-            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
-        ),
-        "{res:?}"
-    );
-    let events = h.events(&id).await?;
-    assert!(
-        events
-            .iter()
-            .any(|(t, p)| *t == EventType::DECISION_INVALID
-                && p["reason"] == json!("not_approvable"))
-    );
-    assert!(!events.iter().any(|(t, _)| *t == EventType::READ_RELEASED));
+    assert!(!item.approvable, "the item still lists as approvable");
     Ok(())
 }
 

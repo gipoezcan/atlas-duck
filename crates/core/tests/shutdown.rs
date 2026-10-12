@@ -329,9 +329,10 @@ async fn i40_nothing_left_to_reconcile() -> TestResult {
 
 /// M3 final review M-3: a write whose stale check completes while the sweep is cancelling it
 /// turns `executing` under the sweep's hands; it is waited for like the others, so `APP_STOP`
-/// follows its `WRITE_EXECUTED`.
+/// follows its `WRITE_EXECUTED`. This guards the re-list loop while a round waits; the window in
+/// the very last round is closed by reading the code, not by a test that fails without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn i40_write_turning_executing_in_last_round_is_waited() -> TestResult {
+async fn i40_write_turning_executing_while_a_round_waits_is_waited() -> TestResult {
     let pause = Pause::new();
     let h = Harness::builder()
         .jira("jira-main")

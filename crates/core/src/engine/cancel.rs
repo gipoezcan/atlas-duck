@@ -119,8 +119,8 @@ impl CancelPlan {
         std::mem::take(&mut self.records)
     }
 
-    fn append_in_place(&self, port: &Arc<dyn AuditPort>) -> Result<(), AuditError> {
-        append_records(&**port, self.records.clone())
+    fn append_in_place(&mut self, port: &Arc<dyn AuditPort>) -> Result<(), AuditError> {
+        append_records(&**port, self.take_records())
     }
 }
 
@@ -271,7 +271,7 @@ impl Engine {
         _gate: &GateGuard,
         cause: CancelCause,
     ) -> Locked {
-        let Some(plan) = self.cancel_plan(entry, cause) else {
+        let Some(mut plan) = self.cancel_plan(entry, cause) else {
             return Locked::Unchanged;
         };
         let appended = plan.append_in_place(self.port());

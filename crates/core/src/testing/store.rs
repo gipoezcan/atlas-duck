@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -187,8 +187,8 @@ pub struct FaultPlan {
     /// Event types whose committed payloads read back tampered (`tamper_released_text`).
     tamper: Mutex<BTreeSet<EventType>>,
     tampered_seqs: Mutex<BTreeSet<u64>>,
-    /// Committed rows whose payload this port cannot decrypt (`fail_read_payload`).
-    unreadable: Mutex<BTreeSet<u64>>,
+    /// Committed rows whose payload this port cannot read (`fail_read_payload_with`).
+    unreadable: Mutex<HashMap<u64, ReadFault>>,
     /// While on, every committed `append`/`append_batch` call is kept (`appends`).
     recording: AtomicBool,
     calls: Mutex<Vec<Vec<RecordedEvent>>>,
@@ -201,8 +201,19 @@ pub struct FaultPlan {
     fail_crash_reconcile: AtomicBool,
     /// `recent_headers` fails (the similarity seed, review M-3).
     fail_recent_headers: AtomicBool,
-    /// The next this many `read_payload` calls answer `Closed` (a transient store failure).
-    closed_reads: AtomicU32,
+    /// Per row, how many more `read_payload` calls answer `Closed` (`close_reads_of`).
+    closed_reads: Mutex<HashMap<u64, u32>>,
+}
+
+/// How `read_payload` fails for a row (`FaultPlan::fail_read_payload_with`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFault {
+    /// `AuditError::Invalid`: the row or payload has a bad shape.
+    Invalid,
+    /// `AuditError::Decrypt`: the payload cannot be decrypted.
+    Decrypt,
+    /// `AuditError::PayloadHash`: the payload does not match its stored hash.
+    PayloadHash,
 }
 
 /// A crash point (Task 28): right after the append of `after` commits, the wrapper that
@@ -319,20 +330,25 @@ impl FaultPlan {
         self.fail_recent_headers.store(on, Ordering::SeqCst);
     }
 
-    /// The next `n` `read_payload` calls through this port answer `AuditError::Closed` (a store
-    /// that is closed for those calls); later ones succeed again.
-    pub fn close_reads_for(&self, n: u32) {
-        self.closed_reads.store(n, Ordering::SeqCst);
+    /// The next `n` `read_payload` calls for row `seq` answer `AuditError::Closed` (a store
+    /// that is closed for those calls); later ones succeed again. Other rows are unaffected.
+    pub fn close_reads_of(&self, seq: u64, n: u32) {
+        lock(&self.closed_reads).insert(seq, n);
     }
 
     fn note_call(&self, evs: Vec<RecordedEvent>) {
         lock(&self.calls).push(evs);
     }
 
-    /// The payload of row `seq` can no longer be decrypted through this port
+    /// The payload of row `seq` can no longer be read through this port
     /// (`AuditError::Invalid`), as a corrupted row would fail (RF-4 seeding skips it).
     pub fn fail_read_payload(&self, seq: u64) {
-        lock(&self.unreadable).insert(seq);
+        self.fail_read_payload_with(seq, ReadFault::Invalid);
+    }
+
+    /// The payload of row `seq` fails with the error `fault` stands for.
+    pub fn fail_read_payload_with(&self, seq: u64, fault: ReadFault) {
+        lock(&self.unreadable).insert(seq, fault);
     }
 
     /// Records of `t` committed from now on read back with one letter of their
@@ -511,18 +527,25 @@ impl AuditPort for FaultyAudit {
     }
 
     fn read_payload(&self, seq: u64) -> Result<Zeroizing<Vec<u8>>, AuditError> {
-        if self
-            .plan
-            .closed_reads
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
         {
-            return Err(AuditError::Closed);
+            let mut closed = lock(&self.plan.closed_reads);
+            if let Some(n) = closed.get_mut(&seq)
+                && *n > 0
+            {
+                *n -= 1;
+                return Err(AuditError::Closed);
+            }
         }
-        if lock(&self.plan.unreadable).contains(&seq) {
-            return Err(AuditError::Invalid(
-                "payload cannot be decrypted (test hook)",
-            ));
+        let fault = lock(&self.plan.unreadable).get(&seq).copied();
+        match fault {
+            Some(ReadFault::Invalid) => {
+                return Err(AuditError::Invalid(
+                    "payload cannot be decrypted (test hook)",
+                ));
+            }
+            Some(ReadFault::Decrypt) => return Err(AuditError::Decrypt { seq }),
+            Some(ReadFault::PayloadHash) => return Err(AuditError::PayloadHash { seq }),
+            None => {}
         }
         self.inner
             .read_payload(seq)

@@ -21,4 +21,4 @@ pub use harness::{
     AuditRecord, HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, InstanceAt, NoProgress,
 };
 pub use runner::{FakeScriptRunner, ScriptPlan, host_call};
-pub use store::{FaultPlan, FaultyAudit, Freeze, RecordedEvent, TempStore};
+pub use store::{FaultPlan, FaultyAudit, Freeze, ReadFault, RecordedEvent, TempStore};

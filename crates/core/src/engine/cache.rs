@@ -262,15 +262,31 @@ pub enum RebuildError {
 }
 
 impl RebuildError {
-    /// Sorts a store failure into `Permanent` (the record itself is bad) or `Transient`.
+    /// Sorts a store failure into `Permanent` (the record itself is bad) or `Transient`. Every
+    /// variant is listed, so a new `AuditError` has to be sorted here.
+    ///
+    /// `Invalid(_)` is `Permanent` on the assumption that `headers_for_request` and
+    /// `read_payload` raise it only for bad row or payload data (a column of the wrong shape, a
+    /// payload that does not decompress). The other `Invalid` sources (`crypto`'s "key length",
+    /// writer, anchor and settings checks) cannot reach a read: the key is fixed-size, from the
+    /// key store, and the rest belong to writes.
     pub fn from_audit(e: AuditError) -> RebuildError {
         match e {
+            AuditError::Closed
+            | AuditError::Io(_)
+            | AuditError::AppendFailed(_)
+            | AuditError::KeyStore(_)
+            | AuditError::StorageLow
+            | AuditError::AnchorThreadDead
+            | AuditError::AnchorFlushTimeout
+            | AuditError::AnchorOutcomeUnknown
+            | AuditError::NeedsConfirmation(_)
+            | AuditError::Restore(_) => RebuildError::Transient(e),
             AuditError::Decrypt { .. }
             | AuditError::PayloadHash { .. }
             | AuditError::InvalidRecord { .. }
             | AuditError::NotFound { .. }
             | AuditError::Invalid(_) => RebuildError::Permanent(e),
-            _ => RebuildError::Transient(e),
         }
     }
 

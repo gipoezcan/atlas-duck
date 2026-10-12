@@ -907,6 +907,9 @@ async fn redact(
         Ok(b) => b,
         Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => {
+            mark_rebuild_failed(entry, &rev);
+            queue_changed(engine, entry);
+            let at = snapshot(&entry.state());
             return Err(rejected(
                 engine,
                 entry,
@@ -1045,6 +1048,17 @@ fn script_release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent
         .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))
 }
 
+/// A source record that cannot be read for good fails the revision `rev` closed (§5.2: rebuild
+/// failure, internal banner, Release disabled), as `Engine::candidate` does for a rebuild; a newer
+/// revision is left alone.
+fn mark_rebuild_failed(entry: &Arc<RequestEntry>, rev: &CandidateRev) {
+    let mut st = entry.state();
+    if st.candidate_hash == rev.candidate_hash {
+        st.rebuild_failed = true;
+        st.model.set_approvable(false);
+    }
+}
+
 /// [`redact`] for a script's candidate: the same flow over `{result}` / `{script_error}`.
 async fn redact_script(
     engine: &Arc<Engine>,
@@ -1066,7 +1080,9 @@ async fn redact_script(
         Ok(b) => b,
         Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         Err(_) => {
-            let rej = (Rejection::NotApprovable, at);
+            mark_rebuild_failed(entry, &rev);
+            queue_changed(engine, entry);
+            let rej = (Rejection::NotApprovable, snapshot(&entry.state()));
             return Err(rejected(engine, entry, rej, rev.counter, dec).await);
         }
     };
