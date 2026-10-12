@@ -1112,21 +1112,14 @@ fn rss_bytes() -> Option<u64> {
     }
 }
 
-/// What RSS may hold above the live-heap bound on glibc: memory `free`d by the process that the
-/// allocator keeps (I-37). glibc raises its mmap threshold (up to 32 MiB) the first time a large
-/// mapped block is freed; from then on the 16-32 MiB buffers of a read come from the arena of the
-/// thread that allocates them (test and core workers, the blocking pool) and stay resident after
-/// `free`. Measured: RSS 2560 MiB on CI (ubuntu-22.04) for a live heap of ~1.1 GiB (1128 MiB,
-/// counting allocator, same code), i.e. ~1.4 GiB retained, before the I-37 copy fixes cut
-/// a read's large allocations by ~175 of ~465 MiB. 1.5 GiB covers that measured figure; the
-/// live-heap assertion is the bound on what the process holds. Windows releases large blocks on
-/// `free` (working set ~= live heap there), so the allowance is glibc's only. The app crate may
-/// fix `M_MMAP_THRESHOLD` at process start (M4), which would let this go.
-const GLIBC_RETENTION_ALLOWANCE: u64 = if cfg!(all(target_os = "linux", target_env = "gnu")) {
-    1536 * MIB
-} else {
-    0
-};
+/// What RSS may hold above the live-heap bound on top of the allocator's retention (I-37). The test
+/// sets `M_MMAP_THRESHOLD` to 1 MiB first on glibc, like the app does at start (M4 PD-33), so the
+/// 16-32 MiB buffers of a read are mapped and `free` returns them: the allowance is 0 on every OS.
+/// Before this, glibc raised its threshold on the first large free and kept ~1.4 GiB resident
+/// (measured on ubuntu-22.04 CI: RSS 2560 MiB for a live heap of ~1.1 GiB). If CI shows the bound
+/// exceeded with the threshold set, restore the 1536 MiB allowance on linux-gnu and report the
+/// measured RSS (PD-33 fallback, the lead decides).
+const GLIBC_RETENTION_ALLOWANCE: u64 = 0;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "PD-15: full size, run with ATLAS_DUCK_BIG_TESTS=1 (one CI step, Task 30)"]
@@ -1134,6 +1127,13 @@ async fn i37_rss_bounded_256_pending() -> TestResult {
     // Run with `--ignored` but without the gate: fail loudly instead of passing vacuously.
     if std::env::var("ATLAS_DUCK_BIG_TESTS").as_deref() != Ok("1") {
         return Err("set ATLAS_DUCK_BIG_TESTS=1 to run the full-size memory test (PD-15)".into());
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: `mallopt` only sets an allocator parameter; nothing here relies on the old value.
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+        }
     }
     let h = Harness::jira().await?;
     let cache_mb = h.engine().limits().candidate_cache_bytes / MIB;

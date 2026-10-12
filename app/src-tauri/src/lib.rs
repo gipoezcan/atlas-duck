@@ -1,6 +1,8 @@
 //! atlas-duck app library: the GUI / `--background` orchestration behind the three thin
 //! `main`s (§12.1).
 
+pub mod compose;
+pub mod confirm;
 pub mod diag;
 pub mod early_argv;
 pub mod sandbox_probe;
@@ -8,6 +10,7 @@ pub mod startup;
 pub mod state;
 pub mod tray;
 pub mod tray_host;
+pub mod ui_sink;
 
 use tauri::Manager;
 

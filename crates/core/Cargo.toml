@@ -68,6 +68,10 @@ wiremock = { workspace = true }
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
+# `budget.rs` :: `i37_rss_bounded_256_pending` sets M_MMAP_THRESHOLD like the app does (PD-33).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dev-dependencies]
+libc = { workspace = true }
+
 # §7.7 / §13: unwrap_used and expect_used are errors in core and atlassian.
 [lints.clippy]
 unwrap_used = "deny"
