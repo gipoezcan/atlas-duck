@@ -43,8 +43,11 @@ while IFS='=' read -r name value; do
 done < <(env)
 
 # 2. the bundle workflow's own tauri build command lines
-if grep -nE 'cargo tauri build.*(--debug|--features|--profile|--config|scripted-approver)' .github/workflows/bundle.yml; then
-  fail "a bundle build uses --debug, --features, --profile, --config or scripted-approver"
+# `--config` alone is legitimate (the macOS legs pass beforeBundleCommand); one that mentions a
+# profile, debug assertions or features is not.
+if grep -nE 'cargo tauri build.*(--debug|--features|--profile|scripted-approver)' .github/workflows/bundle.yml \
+  || grep -nE 'cargo tauri build.*--config.*(profile|debug-assertions|features)' .github/workflows/bundle.yml; then
+  fail "a bundle build uses --debug, --features, --profile, scripted-approver, or a --config that touches profiles or features"
 fi
 
 # 3. the feature tree with the build's flags
