@@ -61,7 +61,9 @@ const PROGRESS_QUEUE: usize = 64;
 #[cfg(windows)]
 const ENDPOINT_READS: usize = 3;
 /// §3.3: `agent_name` and `cwd_basename` are at most this many characters.
-const HELLO_FIELD_MAX_CHARS: usize = 64;
+/// Raw bound only: the server normalizes and applies the spec §3.3 cap of 64 characters; cutting the
+/// raw string at 64 here would change what the audit payload records as the raw original.
+const HELLO_FIELD_MAX_CHARS: usize = 256;
 /// After a write found the server gone, how long the call waits for an answer the server may
 /// have sent before it closed (e.g. a `null`-id refusal of the frame). The reader sees the
 /// close at once, so this only bounds a peer that stopped reading but kept the connection.
@@ -595,7 +597,7 @@ async fn open(
     Err(ConnectError::NotRunning)
 }
 
-/// The `hello` request frame: `agent_name` and `cwd_basename` cut to 64 characters (§3.3);
+/// The `hello` request frame: `agent_name` and `cwd_basename` cut to 256 characters (raw bound; the server applies §3.3's 64 after normalization);
 /// `InvalidInput` if it cannot be encoded or exceeds the first-frame cap [`HELLO_MAX_BYTES`]
 /// (the server would refuse it with `frame_too_large`).
 fn hello_frame(hello: &Hello) -> io::Result<Vec<u8>> {
@@ -964,15 +966,15 @@ mod tests {
     }
 
     #[test]
-    fn hello_fields_cut_to_64_chars() {
+    fn hello_fields_cut_to_256_chars() {
         let mut h = hello();
-        h.agent_name = Some("ä".repeat(100));
-        h.cwd_basename = "😀".repeat(65);
+        h.agent_name = Some("ä".repeat(300));
+        h.cwd_basename = "😀".repeat(257);
         let frame = hello_frame(&h).expect("frame");
         let req: Request = serde_json::from_slice(&frame).expect("request");
         let sent: Hello = serde_json::from_value(req.params).expect("hello");
-        assert_eq!(sent.agent_name, Some("ä".repeat(64)));
-        assert_eq!(sent.cwd_basename, "😀".repeat(64));
+        assert_eq!(sent.agent_name, Some("ä".repeat(256)));
+        assert_eq!(sent.cwd_basename, "😀".repeat(256));
         assert_eq!(sent.build_id, h.build_id);
 
         // Short fields and no name are left alone.
