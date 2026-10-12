@@ -3,8 +3,9 @@
 // Encodes: the §2.2 dependency rule (workspace-internal edges, Tauri only in
 // `app`), the §2.1 "no HTTP client, keychain or DB code linked" rule for the
 // sandbox worker and the CLI, the §9.3 rquickjs pin/feature limits, the §7.7
-// release `panic = "abort"` profile and the §7.7/§13 clippy lints on core and
-// atlassian.
+// release `panic = "abort"` profile, the §7.7/§13 clippy lints on core and
+// atlassian, and the §13 test-only features (no normal edge, no default and no
+// member feature outside TEST_FEATURE_FORWARDERS turns one on).
 //
 // Usage: node ci/check-workspace.mjs
 // Exit 0 = ok. Exit 1 = violations (one per line on stdout), or cargo failed.
@@ -49,6 +50,17 @@ export const TEST_ONLY_FEATURES = [
   "atlas-duck-core/testing",
   "atlas-duck-audit/testing",
   "atlas-duck-cli/test-env",
+  "atlas-duck-ipc/test-paths",
+  "atlas-duck-app/scripted-approver",
+];
+
+// The only member features that may forward a test-only feature from their own `[features]`
+// table (M4 plan "Test-only features and their locks"; closes M3 final review M-10's gap). No
+// member's `default` may reach any test-only feature, forwarders included.
+export const TEST_FEATURE_FORWARDERS = [
+  "atlas-duck-app/scripted-approver",
+  "atlas-duck-core/testing",
+  "atlas-duck-atlassian/testing",
 ];
 
 // The registry stays a plain data crate: its normal dependencies are these and nothing else.
@@ -181,6 +193,10 @@ export function checkGraph(metadata) {
     }
   }
 
+  for (const pkg of members) {
+    violations.push(...checkFeatureForwarding(pkg));
+  }
+
   const registry = byName.get(PKG.registry);
   for (const d of registry?.dependencies ?? []) {
     if (isNormalOrBuild(d.kind) && !memberNames.has(d.name) && !REGISTRY_EXTERNAL_ALLOW.includes(d.name)) {
@@ -242,6 +258,66 @@ export function checkGraph(metadata) {
   }
 
   return [...new Set(violations)];
+}
+
+/**
+ * The `package/feature` a `[features]` entry of `pkg` turns on: `feat` -> `<pkg>/feat`,
+ * `dep/feat` and `dep?/feat` -> `<package of dep>/feat` (a renamed dependency is resolved to its
+ * package); `dep:x` turns on no feature (null).
+ */
+export function featureTarget(pkg, entry) {
+  if (entry.startsWith("dep:")) return null;
+  const slash = entry.indexOf("/");
+  if (slash < 0) return `${pkg.name}/${entry}`;
+  const dep = entry.slice(0, slash).replace(/\?$/, "");
+  const feature = entry.slice(slash + 1);
+  const d = (pkg.dependencies ?? []).find((x) => (x.rename ?? x.name) === dep);
+  return `${d ? d.name : dep}/${feature}`;
+}
+
+/** Every `package/feature` that `feature` of `pkg` turns on, following its own features. */
+export function featureReach(pkg, feature) {
+  const reached = new Set();
+  const seen = new Set([feature]);
+  const stack = [feature];
+  const own = `${pkg.name}/`;
+  while (stack.length > 0) {
+    for (const entry of pkg.features?.[stack.pop()] ?? []) {
+      const target = featureTarget(pkg, entry);
+      if (target === null) continue;
+      reached.add(target);
+      const local = target.startsWith(own) ? target.slice(own.length) : null;
+      if (local !== null && !seen.has(local)) {
+        seen.add(local);
+        stack.push(local);
+      }
+    }
+  }
+  return reached;
+}
+
+/**
+ * A member's own `[features]` table: only TEST_FEATURE_FORWARDERS may turn on a test-only
+ * feature, and `default` may reach none.
+ */
+export function checkFeatureForwarding(pkg) {
+  const violations = [];
+  for (const feature of Object.keys(pkg.features ?? {})) {
+    const testOnly = [...featureReach(pkg, feature)].filter((t) => TEST_ONLY_FEATURES.includes(t)).sort();
+    if (feature === "default") {
+      for (const t of testOnly) {
+        violations.push(`${pkg.name}: default feature reaches test-only feature ${t} (§13)`);
+      }
+      continue;
+    }
+    if (TEST_FEATURE_FORWARDERS.includes(`${pkg.name}/${feature}`)) continue;
+    for (const t of testOnly) {
+      violations.push(
+        `${pkg.name}: feature ${feature} forwards test-only feature ${t}; only ${TEST_FEATURE_FORWARDERS.join(", ")} may (§13)`,
+      );
+    }
+  }
+  return violations;
 }
 
 /**

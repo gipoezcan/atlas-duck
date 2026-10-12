@@ -4,7 +4,14 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { checkGraph, checkManifests, lintLevel, scanToml } from "./check-workspace.mjs";
+import {
+  TEST_FEATURE_FORWARDERS,
+  TEST_ONLY_FEATURES,
+  checkGraph,
+  checkManifests,
+  lintLevel,
+  scanToml,
+} from "./check-workspace.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -408,15 +415,161 @@ test("a default feature that reaches a test-only feature is a violation", () => 
   atlassian.features = { default: ["wire"], wire: ["testing"], testing: ["insecure-test-http"], "insecure-test-http": [] };
   const core = m.packages.find((p) => p.name === "atlas-duck-core");
   const dep = core.dependencies.find((d) => d.name === "atlas-duck-atlassian");
-  assert.deepEqual(
-    checkGraph(m).filter((v) => v.includes("test-only")).sort(),
-    [
-      "atlas-duck-core: normal dependency enables test-only feature atlas-duck-atlassian/insecure-test-http",
-      "atlas-duck-core: normal dependency enables test-only feature atlas-duck-atlassian/testing",
-    ],
-  );
+  const edgeViolations = () => checkGraph(m).filter((v) => v.includes("normal dependency"));
+  assert.deepEqual(edgeViolations().sort(), [
+    "atlas-duck-core: normal dependency enables test-only feature atlas-duck-atlassian/insecure-test-http",
+    "atlas-duck-core: normal dependency enables test-only feature atlas-duck-atlassian/testing",
+  ]);
   dep.uses_default_features = false;
+  assert.deepEqual(edgeViolations(), []);
+  // T21: the package's own table is wrong whoever depends on it: `wire` is no forwarder, and
+  // `default` reaches test-only features.
+  assert.deepEqual(checkGraph(m).sort(), [
+    "atlas-duck-atlassian: default feature reaches test-only feature atlas-duck-atlassian/insecure-test-http (§13)",
+    "atlas-duck-atlassian: default feature reaches test-only feature atlas-duck-atlassian/testing (§13)",
+    `atlas-duck-atlassian: feature wire forwards test-only feature atlas-duck-atlassian/insecure-test-http; only ${TEST_FEATURE_FORWARDERS.join(", ")} may (§13)`,
+    `atlas-duck-atlassian: feature wire forwards test-only feature atlas-duck-atlassian/testing; only ${TEST_FEATURE_FORWARDERS.join(", ")} may (§13)`,
+  ]);
+});
+
+// ---------- test-only feature forwarders (M4 Task 21) ----------
+
+const FORWARD_MSG = (pkg, feature, target) =>
+  `${pkg}: feature ${feature} forwards test-only feature ${target}; only ${TEST_FEATURE_FORWARDERS.join(", ")} may (§13)`;
+
+/** The real M4 feature tables (atlas-duck-app as an extra member with its dependencies). */
+function forwarderMetadata() {
+  const e = baseEdges();
+  e["atlas-duck-app"] = ["atlas-duck-core", "atlas-duck-ipc", "atlas-duck-cli", "atlas-duck-audit"];
+  const m = makeMetadata(e, { extraMembers: ["atlas-duck-app"] });
+  const pkg = (name) => m.packages.find((p) => p.name === name);
+  pkg("atlas-duck-app").features = {
+    "scripted-approver": ["atlas-duck-ipc/test-paths", "atlas-duck-cli/test-env", "atlas-duck-core/testing"],
+  };
+  pkg("atlas-duck-core").features = {
+    testing: ["atlas-duck-atlassian/testing", "atlas-duck-audit/testing", "dep:tempfile", "dep:proptest"],
+    tempfile: ["dep:tempfile"],
+    proptest: ["dep:proptest"],
+  };
+  pkg("atlas-duck-atlassian").features = {
+    "insecure-test-http": [],
+    testing: ["insecure-test-http", "dep:wiremock", "tokio/net"],
+  };
+  pkg("atlas-duck-audit").features = { testing: [] };
+  pkg("atlas-duck-ipc").features = {
+    default: ["async"],
+    async: ["dep:tokio", "dep:sha2"],
+    "test-paths": [],
+  };
+  pkg("atlas-duck-cli").features = { "test-env": [] };
+  pkg("atlas-duck-sandbox-host").features = {};
+  return { m, pkg };
+}
+
+test("the forwarder list and the M4 test-only features", () => {
+  for (const f of ["atlas-duck-ipc/test-paths", "atlas-duck-cli/test-env", "atlas-duck-app/scripted-approver"]) {
+    assert.ok(TEST_ONLY_FEATURES.includes(f), f);
+  }
+  assert.deepEqual(TEST_FEATURE_FORWARDERS, [
+    "atlas-duck-app/scripted-approver",
+    "atlas-duck-core/testing",
+    "atlas-duck-atlassian/testing",
+  ]);
+});
+
+test("the real forwarders (app/scripted-approver, core/testing, atlassian/testing) pass", () => {
+  const { m } = forwarderMetadata();
   assert.deepEqual(checkGraph(m), []);
+});
+
+test("a feature outside the forwarder list that forwards a test-only feature is a violation", () => {
+  for (const [name, features, want] of [
+    ["atlas-duck-sandbox-host", { probe: ["atlas-duck-ipc/test-paths"] }, ["probe", "atlas-duck-ipc/test-paths"]],
+    // A test-only feature that is not a forwarder may not forward another one.
+    ["atlas-duck-audit", { testing: ["atlas-duck-ipc/test-paths"] }, ["testing", "atlas-duck-ipc/test-paths"]],
+    ["atlas-duck-app", { "other-tests": ["atlas-duck-cli/test-env"] }, ["other-tests", "atlas-duck-cli/test-env"]],
+    // The weak form counts.
+    ["atlas-duck-app", { weak: ["atlas-duck-core?/testing"] }, ["weak", "atlas-duck-core/testing"]],
+    // Forwarding a forwarder counts.
+    ["atlas-duck-app", { e2e: ["scripted-approver"], "scripted-approver": [] }, ["e2e", "atlas-duck-app/scripted-approver"]],
+  ]) {
+    const { m, pkg } = forwarderMetadata();
+    Object.assign(pkg(name).features, features);
+    assert.deepEqual(checkGraph(m), [FORWARD_MSG(name, ...want)], `${name} ${JSON.stringify(features)}`);
+  }
+});
+
+test("forwarding through the package's own features is followed", () => {
+  const { m, pkg } = forwarderMetadata();
+  Object.assign(pkg("atlas-duck-sandbox-host").features, { a: ["b"], b: ["c"], c: ["atlas-duck-cli/test-env"] });
+  assert.deepEqual(checkGraph(m).sort(), [
+    FORWARD_MSG("atlas-duck-sandbox-host", "a", "atlas-duck-cli/test-env"),
+    FORWARD_MSG("atlas-duck-sandbox-host", "b", "atlas-duck-cli/test-env"),
+    FORWARD_MSG("atlas-duck-sandbox-host", "c", "atlas-duck-cli/test-env"),
+  ]);
+});
+
+test("a renamed dependency is resolved to its package", () => {
+  const { m, pkg } = forwarderMetadata();
+  const host = pkg("atlas-duck-sandbox-host");
+  host.dependencies.find((d) => d.name === "atlas-duck-ipc").rename = "ipc";
+  host.features = { paths: ["ipc/test-paths"] };
+  assert.deepEqual(checkGraph(m), [FORWARD_MSG("atlas-duck-sandbox-host", "paths", "atlas-duck-ipc/test-paths")]);
+});
+
+test("no default feature may reach a test-only feature, forwarders included", () => {
+  for (const [name, features, want] of [
+    ["atlas-duck-cli", { default: ["test-env"] }, ["atlas-duck-cli/test-env"]],
+    ["atlas-duck-ipc", { default: ["async", "test-paths"] }, ["atlas-duck-ipc/test-paths"]],
+    [
+      "atlas-duck-app",
+      { default: ["scripted-approver"] },
+      [
+        "atlas-duck-app/scripted-approver",
+        "atlas-duck-cli/test-env",
+        "atlas-duck-core/testing",
+        "atlas-duck-ipc/test-paths",
+      ],
+    ],
+    ["atlas-duck-core", { default: ["testing"] }, ["atlas-duck-atlassian/testing", "atlas-duck-audit/testing", "atlas-duck-core/testing"]],
+  ]) {
+    const { m, pkg } = forwarderMetadata();
+    Object.assign(pkg(name).features, features);
+    // (A dependent using default features is reported as well, by the edge rule.)
+    assert.deepEqual(
+      checkGraph(m)
+        .filter((v) => v.includes("default feature reaches"))
+        .sort(),
+      want.map((t) => `${name}: default feature reaches test-only feature ${t} (§13)`).sort(),
+      `${name} ${JSON.stringify(features)}`,
+    );
+  }
+  // Through an intermediate feature: both the intermediate and default are reported.
+  const { m, pkg } = forwarderMetadata();
+  Object.assign(pkg("atlas-duck-app").features, { default: ["gui"], gui: ["scripted-approver"] });
+  const got = checkGraph(m);
+  assert.ok(got.includes("atlas-duck-app: default feature reaches test-only feature atlas-duck-app/scripted-approver (§13)"), got.join("\n"));
+  assert.ok(got.includes(FORWARD_MSG("atlas-duck-app", "gui", "atlas-duck-app/scripted-approver")), got.join("\n"));
+});
+
+test("a normal dependency enabling test-paths or test-env is a violation", () => {
+  for (const [from, to, feature] of [
+    ["atlas-duck-sandbox-host", "atlas-duck-ipc", "test-paths"],
+    ["atlas-duck-cli", "atlas-duck-ipc", "test-paths"],
+  ]) {
+    const e = baseEdges();
+    e[from] = e[from].filter((d) => d !== to);
+    e[from].push({ name: to, features: [feature] });
+    assert.deepEqual(graph(e), [`${from}: normal dependency enables test-only feature ${to}/${feature}`]);
+  }
+  const e = baseEdges();
+  e["atlas-duck-app"] = [{ name: "atlas-duck-cli", features: ["test-env"] }];
+  assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), [
+    "atlas-duck-app: normal dependency enables test-only feature atlas-duck-cli/test-env",
+  ]);
+  // A dev-dependency may (the app's own test targets).
+  e["atlas-duck-app"] = [{ name: "atlas-duck-cli", features: ["test-env"], kind: "dev" }];
+  assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), []);
 });
 
 test("registry normal dependencies are limited to serde and serde_json", () => {
