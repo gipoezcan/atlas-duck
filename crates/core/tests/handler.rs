@@ -370,14 +370,34 @@ async fn cancel_pending_is_cancelled_by_client() -> TestResult {
     assert_eq!(detail(&env, "reason"), json!("by_client"));
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
     assert_eq!(env.data, None);
+    // The cancel races the read's fetch: bytes already sent put one `READ_FETCHED`
+    // (`cancelled_in_flight`, cancel.rs `cancel_plan`) before the one terminal record.
+    let types = h.event_types(&id).await?;
     assert_eq!(
-        h.event_types(&id).await?,
-        [EventType::REQUEST_RECEIVED, EventType::CANCELLED]
+        types.first(),
+        Some(&EventType::REQUEST_RECEIVED),
+        "{types:?}"
     );
+    assert_eq!(types.last(), Some(&EventType::CANCELLED), "{types:?}");
+    let middle = &types[1..types.len() - 1];
+    assert!(
+        middle.is_empty() || middle == [EventType::READ_FETCHED],
+        "{types:?}"
+    );
+    assert!(!types.contains(&EventType::READ_RELEASED), "{types:?}");
+    if !middle.is_empty() {
+        let events = h.events(&id).await?;
+        let (_, f) = events
+            .iter()
+            .find(|(t, _)| *t == EventType::READ_FETCHED)
+            .ok_or("no READ_FETCHED")?;
+        assert_eq!(f["outcome"], "cancelled_in_flight", "{f}");
+        assert_eq!(f["reason"], "by_client", "{f}");
+    }
     // Afterwards it returns the current status (§4.4).
     let again = h.handler().cancel(&id).await;
     assert_eq!(again.status, Status::Cancelled);
-    assert_eq!(h.event_types(&id).await?.len(), 2);
+    assert_eq!(h.event_types(&id).await?.len(), types.len());
     Ok(())
 }
 
