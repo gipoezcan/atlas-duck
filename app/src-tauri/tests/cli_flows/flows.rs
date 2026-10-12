@@ -48,6 +48,7 @@ const ENDS_WITHIN: Duration = Duration::from_secs(60);
 /// The mock holds a fetch this long (I-10: a request held in `Fetching`).
 const FETCH_HELD: Duration = Duration::from_secs(20);
 /// The mock delays a fetch this long (X-08: the final write happens after the pipe is closed).
+#[cfg(not(unix))]
 const FETCH_DELAYED: Duration = Duration::from_millis(1500);
 /// §4.3: the verbatim message of `pending` + `connection_lost` (the `<id>` is literal).
 const MSG_CONNECTION_LOST: &str = "use `await <id>`; the request may be `abandoned`";
@@ -559,6 +560,9 @@ fn audit_headers(world: &World) -> Result<Vec<EventHeader>> {
 /// Source: `crates/cli/src/lib.rs` `execute` (Help / OpsList / OpsDescribe without `--instance`
 /// answer before `execute_connected`), `argv.rs` `parse` (an unknown op flag is a `usage` error
 /// after the loop, `--help` wins over it), `local.rs`.
+///
+/// The plan's "no pinned file" check cannot be met: `World::new` writes a pinned file, so the
+/// check here is "no launch artifacts" (`launch_artifacts`) and "the app never runs".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn u05_help_typo_ops_local_never_launch() -> Result<()> {
     if !opted_in("u05_help_typo_ops_local_never_launch") {
@@ -852,6 +856,18 @@ async fn i10_cancel_identical_over_ipc() -> Result<()> {
     .await?;
     // The quick fetch has returned and the item waits for a release; the slow one is still held.
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    // The slow request really reached the mock (held there): the cancel meets a `Fetching` request.
+    let reached = Instant::now();
+    loop {
+        let seen = jira(&world)?.received().await;
+        if seen.iter().any(|r| r.url.path().ends_with("/issue/SLOW-1")) {
+            break;
+        }
+        if reached.elapsed() > Duration::from_secs(10) {
+            return Err("the slow fetch never reached the mock".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let a = run(&world, &["cancel", &fetching]).await?;
     let b = run(&world, &["cancel", &awaiting]).await?;
     for (r, id) in [(&a, &fetching), (&b, &awaiting)] {
@@ -868,6 +884,18 @@ async fn i10_cancel_identical_over_ipc() -> Result<()> {
         without_id(&a.stdout, &fetching),
         without_id(&b.stdout, &awaiting)
     );
+    // The audit log: only the request that was in flight left a `cancelled_in_flight` read record
+    // (`payloads.rs` 452-457: `outcome`, `reason`), with `by_client` (`payloads.rs` 647).
+    world.quit_app().await?;
+    let in_flight = world
+        .audit_records()?
+        .into_iter()
+        .filter(|(t, p)| {
+            *t == EventType::READ_FETCHED && p.get("outcome") == Some(&json!("cancelled_in_flight"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(in_flight.len(), 1, "{in_flight:?}");
+    assert_eq!(in_flight[0].1.get("reason"), Some(&json!("by_client")));
     Ok(())
 }
 
@@ -1136,8 +1164,13 @@ async fn i16_await_honours_timeout() -> Result<()> {
     let env = r.envelope.as_ref().ok_or("no envelope")?;
     assert_eq!(env.status, Status::Pending);
     assert_eq!(env.request_id.as_deref(), Some(id.as_str()));
+    // The server's own pending envelope carries `op_id` and `instance` (`handler.rs` 440-445);
+    // the CLI's fallback `pending_for(id, None)` does not (`connected.rs` 174-180). Seeing them
+    // proves the server answered at the timeout rather than the CLI giving up at deadline + 2 s.
+    assert_eq!(env.op_id.as_deref(), Some("jira.issue.get"));
+    assert_eq!(env.instance.as_deref(), Some("jira-main"));
     assert!(
-        took >= Duration::from_millis(1800) && took < Duration::from_secs(6),
+        took >= Duration::from_millis(1800) && took < Duration::from_millis(3500),
         "await --timeout 2 took {took:?}"
     );
     Ok(())
@@ -1311,6 +1344,40 @@ async fn i39_real_envelopes_match_matrix() -> Result<()> {
     assert_eq!(unknown.exit, 2, "{}", unknown.stdout);
     let env = unknown.envelope.as_ref().ok_or("no envelope")?;
     assert_eq!(error_code(env), Some(ErrorCode::UnknownRequest));
+    assert_eq!(env.request_id, None);
+    Ok(())
+}
+
+/// I-39 (exit 9 row): an app with no instance at all answers an op with `not_configured`,
+/// `details.reason == no_instance`, `retryable: true`, exit 9, no request id.
+///
+/// Source: core `tests/handler.rs` `pd01_no_instance_at_all_names_the_product` (the same
+/// answer for a store without instances), `exit.rs` row `no_instance` (exit 9), `ipc::proto`
+/// `exit_code` (`NotConfigured` -> 9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i39_no_instance_exit9() -> Result<()> {
+    if !opted_in("i39_no_instance_exit9") {
+        return Ok(());
+    }
+    let mut world = World::new(WorldOpts::default())?;
+    world.provision_store(&[]).await?;
+    let r = run(
+        &world,
+        &[
+            "jira",
+            "issue",
+            "get",
+            "ABC-1",
+            "--reason",
+            "atlas-test:release",
+        ],
+    )
+    .await?;
+    assert_eq!(r.exit, 9, "{}", r.stdout);
+    let env = r.envelope.as_ref().ok_or("no envelope")?;
+    let err = env.error.as_ref().ok_or("no error")?;
+    assert_eq!((err.code, err.retryable), (ErrorCode::NotConfigured, true));
+    assert_eq!(detail(env, "reason"), Some(&json!("no_instance")));
     assert_eq!(env.request_id, None);
     Ok(())
 }
@@ -1510,14 +1577,16 @@ async fn x08_broken_pipe_exit4_no_cancel() -> Result<()> {
     if !opted_in("x08_broken_pipe_exit4_no_cancel") {
         return Ok(());
     }
+    // Unix: the fetch outlasts the 3 s bound by a wide margin, so only the hang-up poll
+    // (`interrupt.rs` 154-163) can end the CLI in time; a final write after the release would be
+    // too late. Windows has no poll and relies on the final write, so the short delay stays.
+    #[cfg(unix)]
+    let delay = Duration::from_secs(8);
+    #[cfg(not(unix))]
+    let delay = FETCH_DELAYED;
     let world = jira_world().await?;
     jira(&world)?
-        .json_delayed(
-            "/rest/api/2/issue/SLOW-1",
-            200,
-            fixtures::JIRA_ISSUE,
-            FETCH_DELAYED,
-        )
+        .json_delayed("/rest/api/2/issue/SLOW-1", 200, fixtures::JIRA_ISSUE, delay)
         .await;
     warm(&world).await?;
     let mut w = spawn_waiting(
@@ -1550,6 +1619,14 @@ async fn x08_broken_pipe_exit4_no_cancel() -> Result<()> {
     );
     #[cfg(not(unix))]
     let _ = dropped;
+    // Unix: the CLI left long before the 8 s fetch ended, so the request is still `pending`
+    // (not released yet): the exit came from the hang-up poll, not from a final write.
+    #[cfg(unix)]
+    {
+        let now = run(&world, &["status", &id]).await?;
+        let env = now.envelope.as_ref().ok_or("no envelope")?;
+        assert_eq!(env.status, Status::Pending, "{}", now.stdout);
+    }
     // Never cancelled: the approver releases it after the delayed fetch.
     let env = wait_status(&world, &id, decided).await?;
     assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
@@ -1581,6 +1658,14 @@ async fn s16_pat_canary_absent_from_cli_channels() -> Result<()> {
     )
     .await?;
     assert_eq!(released.exit, 0, "{}", released.stdout);
+    // Positive control: the canary did go upstream (`Authorization: Bearer <pat>`,
+    // `client/send.rs` 129), so its absence from the CLI channels below is meaningful.
+    let canary_sent = jira(&world)?.received().await.iter().any(|r| {
+        r.headers
+            .values()
+            .any(|v| String::from_utf8_lossy(v.as_bytes()).contains(PAT_CANARY))
+    });
+    assert!(canary_sent, "no upstream request carried the PAT canary");
     let held = submit_pending(
         &world,
         &[
