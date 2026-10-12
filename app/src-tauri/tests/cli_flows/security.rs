@@ -815,10 +815,18 @@ fn squat(world: &World, first_only: bool) -> Result<Squatter> {
             return Ok(got);
         }
         // A client that closed reads as EOF or `BrokenPipe` (transport_windows.rs
-        // `s01_squatter_pipe_cli_sends_nothing`).
+        // `s01_squatter_pipe_cli_sends_nothing`), or `NotConnected` (`ERROR_PIPE_NOT_CONNECTED`)
+        // when the connect was already pending as it came and went. The bytes are 0 either way.
         match server.read_to_end(&mut got).await {
             Ok(_) => Ok(got),
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(got),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::NotConnected
+                ) =>
+            {
+                Ok(got)
+            }
             Err(e) => Err(e),
         }
     });
