@@ -7,6 +7,7 @@
 //! - [`approver`]: decisions scripted by the request's reason, over the real `DecisionApi` (PD-03).
 //! - [`control`]: the `<data>/test-control/` dir (quit, env names, refused counter, start delay,
 //!   Windows V12 marker).
+//! - [`scope_identifier`]: one single-instance name per test home.
 
 pub mod approver;
 pub mod control;
@@ -60,6 +61,32 @@ use crate::serve::{KeysFactory, OsKeysFactory};
 /// PD-02: the directory of the file keystore. Unset: the OS keychain (the `os_keychain_smoke`
 /// test runs this build against the real keychain).
 pub const ENV_TEST_KEYSTORE: &str = "ATLAS_DUCK_TEST_KEYSTORE";
+
+/// The single-instance name of the test build: `base` plus one segment per test home.
+///
+/// `tauri-plugin-single-instance` keys on the bundle identifier (`/tmp/<id>_si.sock` on macOS, the
+/// `<id>-sim` mutex and `<id>-siw` window on Windows, the `<id>.SingleInstance` D-Bus name on
+/// Linux), so the apps of two test homes running at once would forward to each other: the later
+/// one exits 0 before its gate and its CLI times out (`launch_timeout`). One test home stands for
+/// one user; within it the plugin still forwards. The segment is `t` + 16 hex digits of FNV-1a
+/// over the home's bytes: it starts with a letter (a D-Bus name element must not start with a
+/// digit) and is the same in every process that gets the same home.
+pub fn scoped_identifier(base: &str, home: &OsStr) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in home.as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{base}.t{hash:016x}")
+}
+
+/// Scopes `config.identifier` to the test home (see [`scoped_identifier`]). Called before the
+/// builder, after [`require_test_home`] made sure the variable is set.
+pub fn scope_identifier(config: &mut tauri::Config) {
+    if let Some(home) = std::env::var_os(ENV_TEST_HOME) {
+        config.identifier = scoped_identifier(&config.identifier, &home);
+    }
+}
 
 /// The file keystore in a fixed directory.
 pub struct FileKeysFactory {
@@ -129,6 +156,34 @@ mod tests {
     #[test]
     fn the_test_home_variable_is_the_one_the_ipc_crate_reads() {
         assert_eq!(ENV_TEST_HOME, "ATLAS_DUCK_TEST_HOME");
+    }
+
+    /// The CI `i03_write_approve_flow` failure: two test homes shared one single-instance name.
+    #[test]
+    fn the_single_instance_name_is_per_test_home() {
+        let base = "dev.atlasduck.desktop";
+        let a = scoped_identifier(base, OsStr::new("/private/tmp/adt-aaaaaa"));
+        let b = scoped_identifier(base, OsStr::new("/private/tmp/adt-bbbbbb"));
+        assert_ne!(a, b);
+        assert_eq!(
+            a,
+            scoped_identifier(base, OsStr::new("/private/tmp/adt-aaaaaa"))
+        );
+        let long = "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\adt-0123456789".repeat(8);
+        for id in [a, b, scoped_identifier(base, OsStr::new(&long))] {
+            let suffix = id.strip_prefix("dev.atlasduck.desktop.t").unwrap_or("");
+            assert_eq!(suffix.len(), 16, "{id}");
+            assert!(suffix.bytes().all(|c| c.is_ascii_hexdigit()), "{id}");
+            // D-Bus well-known name: no element starts with a digit.
+            assert!(
+                id.split('.')
+                    .all(|e| e.bytes().next().is_some_and(|c| c.is_ascii_alphabetic())),
+                "{id}"
+            );
+            // The macOS socket path stays under the 104-byte `sun_path`.
+            let socket = format!("/tmp/{}_si.sock", id.replace(['.', '-'], "_"));
+            assert!(socket.len() < 104, "{socket}");
+        }
     }
 
     #[test]

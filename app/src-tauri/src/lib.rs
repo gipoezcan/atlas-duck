@@ -42,6 +42,12 @@ pub fn run_gui(background: bool) -> ! {
     // M6 decides what a cold start without `--background` opens; M1 opens no window.
     let _ = background;
 
+    #[cfg_attr(not(feature = "scripted-approver"), allow(unused_mut))]
+    let mut context = tauri::generate_context!();
+    // The test build: apps of different test homes never forward to each other.
+    #[cfg(feature = "scripted-approver")]
+    testing::scope_identifier(context.config_mut());
+
     // single-instance first (research A0/F18), then autostart; the dialog plugin after them.
     let app = match tray::register_plugins(tauri::Builder::default())
         // The dialog plugin serves Rust-side error dialogs only. The capability set is
@@ -129,7 +135,7 @@ pub fn run_gui(background: bool) -> ! {
             }
             Ok(())
         })
-        .build(tauri::generate_context!())
+        .build(context)
     {
         Ok(app) => app,
         Err(_) => {
