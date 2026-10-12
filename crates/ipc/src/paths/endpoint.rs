@@ -70,7 +70,7 @@ fn pipe_prefix_for_sid(sid: &str) -> String {
 }
 
 #[cfg(any(windows, test))]
-fn hex_lower(bytes: &[u8]) -> String {
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -96,74 +96,7 @@ pub fn pipe_name_has_prefix(name: &str, prefix: &str) -> bool {
 /// (`S-1-5-21-…`).
 #[cfg(windows)]
 pub fn current_user_sid_string() -> io::Result<String> {
-    use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HLOCAL, LocalFree};
-    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_USER, TokenUser};
-
-    let token = super::base_dirs::ProcessToken::open()?;
-    let mut needed = 0u32;
-    // SAFETY: a size probe: null buffer of length 0, `needed` is a valid out-pointer.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.handle(),
-            TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
-        )
-    };
-    if ok == 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-            return Err(err);
-        }
-    }
-    let len = usize::try_from(needed).unwrap_or(0);
-    if len < std::mem::size_of::<TOKEN_USER>() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "TokenUser size probe returned too small a size",
-        ));
-    }
-    // u64 elements keep the buffer aligned for TOKEN_USER.
-    let mut buf = vec![0u64; len.div_ceil(8)];
-    // SAFETY: `buf` is writable for at least `needed` bytes.
-    let ok = unsafe {
-        GetTokenInformation(
-            token.handle(),
-            TokenUser,
-            buf.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: on success the buffer starts with an initialized, aligned TOKEN_USER
-    // whose SID points into `buf`, which stays alive below.
-    let sid = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
-    // SAFETY: `sid` is a valid SID; `raw` receives a LocalAlloc'ed string.
-    if unsafe { ConvertSidToStringSidW(sid, &mut raw) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if raw.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "SID string conversion returned no string",
-        ));
-    }
-    let mut n = 0usize;
-    // SAFETY: on success `raw` is NUL-terminated.
-    while unsafe { *raw.add(n) } != 0 {
-        n += 1;
-    }
-    // SAFETY: `raw` is valid for `n` u16 reads.
-    let text = String::from_utf16(unsafe { std::slice::from_raw_parts(raw, n) });
-    // SAFETY: `raw` came from ConvertSidToStringSidW, which documents LocalFree.
-    unsafe { LocalFree(raw as HLOCAL) };
-    text.map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SID string is not UTF-16"))
+    crate::win_security::Sid::current_user()?.to_string_sid()
 }
 
 // ---------- Unix socket dir ----------
@@ -478,16 +411,46 @@ fn create_endpoint_temp(path: &Path) -> io::Result<fs::File> {
     Ok(file)
 }
 
-/// Creates the temp file exclusively.
+/// Creates the temp file exclusively with the owner-only descriptor
+/// (`owner_only_attributes`: owner and only ACE = the user SID, DACL
+/// protected, PD-26). A same-volume rename keeps the descriptor.
 #[cfg(windows)]
 fn create_endpoint_temp(path: &Path) -> io::Result<fs::File> {
-    // Task 6: create with the owner-only descriptor of
-    // `transport::windows::security::owner_only_attributes()` (PD-26). Until
-    // then the file inherits the data dir's default ACL.
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    if wide.iter().take(wide.len() - 1).any(|&c| c == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path contains a NUL",
+        ));
+    }
+    let security = crate::win_security::owner_only_attributes()?;
+    let attrs = security.attributes();
+    // SAFETY: `wide` is NUL-terminated; `attrs` points at a descriptor that
+    // `security` keeps alive for the call; no template handle.
+    let h = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attrs,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a fresh file handle that nothing else owns.
+    Ok(unsafe { fs::File::from_raw_handle(h as _) })
 }
 
 /// Reads `<data>/endpoint`. Missing file → `None`. Empty, over 512 bytes,

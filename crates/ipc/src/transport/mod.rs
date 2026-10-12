@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf, ReadHalf, WriteHalf};
 
 #[cfg(unix)]
 pub mod unix;
+#[cfg(windows)]
+pub mod windows;
 
 /// PD-29 diagnostics: `tracing` event names and reject reasons (closed sets).
 pub mod diag {

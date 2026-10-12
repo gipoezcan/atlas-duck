@@ -18,6 +18,8 @@ pub use base_dirs::{BaseDirs, FirstRunDefaults, base_dirs, first_run_defaults};
 pub use endpoint::current_user_sid_string;
 #[cfg(all(unix, feature = "async"))]
 pub(crate) use endpoint::euid;
+#[cfg(all(windows, feature = "async"))]
+pub(crate) use endpoint::hex_lower;
 pub use endpoint::{
     ENDPOINT_FILE, EndpointLocation, MAX_ENDPOINT_NAME_LEN, SOCKET_FILE_NAME, endpoint_location,
     pipe_name_has_prefix, read_endpoint_file, remove_endpoint_file, write_endpoint_file,

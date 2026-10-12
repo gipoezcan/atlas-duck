@@ -99,11 +99,6 @@ impl ProcessToken {
         }
         Ok(Self(handle))
     }
-
-    /// The open token handle; valid while `self` lives.
-    pub(super) fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
-        self.0
-    }
 }
 
 #[cfg(windows)]
