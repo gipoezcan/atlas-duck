@@ -22,7 +22,8 @@ use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_CANT_OPEN_ANONYMOUS, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, HANDLE,
+    ERROR_ACCESS_DENIED, ERROR_CANT_OPEN_ANONYMOUS, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
+    ERROR_SEM_TIMEOUT, HANDLE,
 };
 use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
 use windows_sys::Win32::Security::{
@@ -528,6 +529,30 @@ async fn wait_named_pipe(name: &str, wait: Duration) -> io::Result<()> {
     .map_err(|_| io::Error::other(MSG_JOIN))
 }
 
+/// Whether the pipe `name` exists, without opening it (§4.7: the app is not running when "the
+/// named pipe returns `ERROR_FILE_NOT_FOUND`"): `WaitNamedPipeW(name, 1 ms)`. An instance free is
+/// present; `ERROR_FILE_NOT_FOUND` is absent; every other failure, `ERROR_SEM_TIMEOUT` (every
+/// instance busy) included, reads as present: the app may well run, the connect layer reports the
+/// real failure, and a launch would only meet the running instance. Blocks for about 1 ms.
+/// `Err` only for a name with a NUL.
+///
+/// The caller passes only names it checked against this user's local prefix
+/// (`pipe_name_has_prefix`): `WaitNamedPipeW` on a `\\server\pipe\…` name would reach out to
+/// that server.
+pub fn pipe_exists(name: &str) -> io::Result<bool> {
+    let wide = wide_nul(name)?;
+    // SAFETY: `wide` is NUL-terminated and lives for the call.
+    if unsafe { WaitNamedPipeW(wide.as_ptr(), 1) } != 0 {
+        return Ok(true);
+    }
+    let code = io::Error::last_os_error().raw_os_error();
+    Ok(match code {
+        Some(c) if c == ERROR_FILE_NOT_FOUND as i32 => false,
+        Some(c) if c == ERROR_SEM_TIMEOUT as i32 => true,
+        _ => true,
+    })
+}
+
 fn wide_nul(s: &str) -> io::Result<Vec<u16>> {
     if s.contains('\0') {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, MSG_NUL));
@@ -552,5 +577,27 @@ mod tests {
         assert!(listener.next.is_none());
         let again = listener.accept().await.expect_err("poisoned accept");
         assert_eq!(again.to_string(), MSG_LISTENER_DONE);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pipe_exists_tells_a_listener_from_no_pipe() {
+        let prefix = r"\\.\pipe\atlas-duck-fedcba9876543210-";
+        let gone = new_pipe_name(prefix).expect("name");
+        assert!(!pipe_exists(&gone).expect("probe"), "no such pipe");
+
+        let listener = PipeListener::bind(prefix).expect("bind");
+        let name = listener.name().to_owned();
+        assert!(pipe_exists(&name).expect("probe"), "an instance listens");
+        // The only instance taken: WaitNamedPipeW times out (ERROR_SEM_TIMEOUT), still present.
+        let _client = open_client(&name).expect("open");
+        assert!(pipe_exists(&name).expect("probe"), "every instance busy");
+        drop(_client);
+        drop(listener);
+        assert!(!pipe_exists(&name).expect("probe"), "listener gone");
+
+        assert_eq!(
+            pipe_exists("a\0b").expect_err("NUL").kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }

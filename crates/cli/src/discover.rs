@@ -31,7 +31,7 @@ pub(crate) const MSG_APP_NOT_FOUND: &str =
 #[cfg(windows)]
 pub(crate) const APP_FILE_NAME: &str = "atlas-duck-app.exe";
 #[cfg(not(windows))]
-const APP_FILE_NAME: &str = "atlas-duck-app";
+pub(crate) const APP_FILE_NAME: &str = "atlas-duck-app";
 
 /// What discovery found on this machine.
 #[derive(Debug, Clone, PartialEq)]
@@ -181,8 +181,10 @@ fn appimage(_env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 }
 
 /// Whether this user's endpoint is present: Unix the socket file exists (no connect, no
-/// symlink follow); Windows the endpoint file names a pipe under this user's SID prefix (§3.1).
-/// Any error reads as not present, so the caller falls through to launching.
+/// symlink follow; `launch::unix::endpoint_answers` adds the liveness probe); Windows the endpoint
+/// file names a pipe under this user's SID prefix (§3.1) and that pipe exists (§4.7: a stale file
+/// a crashed app left behind is absent). An unreadable location or endpoint file reads as not
+/// present, so the caller falls through to launching; a failed pipe probe reads as present.
 pub(crate) fn endpoint_present(data: &LocalDataDir, host: &str) -> bool {
     let Ok(location) = endpoint_location(data, host) else {
         return false;
@@ -190,12 +192,36 @@ pub(crate) fn endpoint_present(data: &LocalDataDir, host: &str) -> bool {
     match location {
         EndpointLocation::UnixSocket(path) => std::fs::symlink_metadata(path).is_ok(),
         EndpointLocation::WindowsPipePrefix(prefix) => {
-            matches!(
-                read_endpoint_file(data),
-                Ok(Some(name)) if pipe_name_has_prefix(&name, &prefix)
-            )
+            pipe_endpoint_present(read_endpoint_file(data), &prefix, &pipe_exists)
         }
     }
+}
+
+/// The Windows rule over the endpoint file's contents: only a name under this user's local prefix
+/// is handed to `probe`, so a tampered file can never aim it at a `\\server\pipe\…` name (whose
+/// probe would authenticate to that server).
+fn pipe_endpoint_present(
+    file: io::Result<Option<String>>,
+    prefix: &str,
+    probe: &dyn Fn(&str) -> bool,
+) -> bool {
+    match file {
+        Ok(Some(name)) if pipe_name_has_prefix(&name, prefix) => probe(&name),
+        _ => false,
+    }
+}
+
+/// `WaitNamedPipeW`-based existence check. Its only error is a NUL in the name, which the prefix
+/// check (a 32-hex suffix) already excluded; it would read as present like every probe failure.
+#[cfg(windows)]
+fn pipe_exists(name: &str) -> bool {
+    atlas_duck_ipc::transport::windows::pipe_exists(name).unwrap_or(true)
+}
+
+/// No named pipes off Windows (`endpoint_location` never yields a pipe prefix there).
+#[cfg(not(windows))]
+fn pipe_exists(_name: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -507,9 +533,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn endpoint_present_windows_prefix() {
+    #[tokio::test]
+    async fn endpoint_present_windows_prefix() {
         use atlas_duck_ipc::paths::write_endpoint_file;
+        use atlas_duck_ipc::transport::windows::PipeListener;
 
         let tmp = tempfile::tempdir().unwrap();
         let DataDirResolution::Local(data) = check_data_dir(tmp.path()).unwrap() else {
@@ -524,8 +551,62 @@ mod tests {
         let other = format!("atlas-duck-{}-{}", "0".repeat(16), "a".repeat(32));
         write_endpoint_file(&data, &other).unwrap();
         assert!(!endpoint_present(&data, HOST));
-        // Our prefix followed by the 32-hex suffix is.
+        // Our prefix and the 32-hex suffix, but no pipe (a crashed app's file): absent.
         write_endpoint_file(&data, &format!("{prefix}{}", "a".repeat(32))).unwrap();
+        assert!(!endpoint_present(&data, HOST));
+        // A listening pipe named in the file: present.
+        let listener = PipeListener::bind(&prefix).unwrap();
+        write_endpoint_file(&data, listener.name()).unwrap();
         assert!(endpoint_present(&data, HOST));
+        drop(listener);
+        assert!(!endpoint_present(&data, HOST), "listener gone");
+    }
+
+    #[test]
+    fn only_a_prefixed_pipe_name_is_probed() {
+        let prefix = r"\\.\pipe\atlas-duck-0123456789abcdef-";
+        let ours = format!("{prefix}{}", "b".repeat(32));
+        let probed = std::cell::RefCell::new(Vec::<String>::new());
+        let probe = |name: &str| {
+            probed.borrow_mut().push(name.to_owned());
+            true
+        };
+        let foreign = [
+            r"\\attacker\pipe\x".to_owned(),
+            format!(
+                r"\\attacker\pipe\atlas-duck-0123456789abcdef-{}",
+                "b".repeat(32)
+            ),
+            format!(r"\\.\pipe\atlas-duck-{}-{}", "0".repeat(16), "b".repeat(32)),
+            format!("{prefix}{}", "B".repeat(32)),
+            format!("{prefix}{}", "b".repeat(31)),
+            String::new(),
+        ];
+        for name in foreign {
+            assert!(
+                !pipe_endpoint_present(Ok(Some(name.clone())), prefix, &probe),
+                "{name}"
+            );
+        }
+        assert!(!pipe_endpoint_present(Ok(None), prefix, &probe));
+        assert!(!pipe_endpoint_present(
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            prefix,
+            &probe
+        ));
+        assert!(probed.borrow().is_empty(), "probed {:?}", probed.borrow());
+
+        // Our name reaches the probe, whose answer is the result.
+        assert!(pipe_endpoint_present(
+            Ok(Some(ours.clone())),
+            prefix,
+            &probe
+        ));
+        assert!(!pipe_endpoint_present(
+            Ok(Some(ours.clone())),
+            prefix,
+            &|_| false
+        ));
+        assert_eq!(*probed.borrow(), [ours]);
     }
 }

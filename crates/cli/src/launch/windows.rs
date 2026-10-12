@@ -51,7 +51,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use super::LaunchError;
 use super::plan::APP_ARGS;
-use super::stub::STUB_COMMAND;
+use super::stub::{EXIT_BLOCKED, EXIT_STARTED, STUB_COMMAND};
 use crate::discover::APP_FILE_NAME;
 
 /// §4.7 step 1: detached, own process group, the parent attribute, a Unicode environment.
@@ -471,7 +471,7 @@ pub(crate) fn create_process(
     })
 }
 
-/// PD-21: the stub must exit 0 within 5 s.
+/// PD-21: the stub must exit within 5 s; its exit code decides (`stub_exit`).
 fn wait_for_stub(process: &OwnedHandle) -> Result<Started, LaunchError> {
     let ms = u32::try_from(STUB_WAIT.as_millis()).unwrap_or(u32::MAX);
     // SAFETY: a process handle we own.
@@ -487,11 +487,15 @@ fn wait_for_stub(process: &OwnedHandle) -> Result<Started, LaunchError> {
     if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
         return Err(LaunchError::Io(io::Error::last_os_error()));
     }
-    match code {
-        0 => Ok(Started::Stub),
-        c => Err(LaunchError::ChildFailed(i32::from_ne_bytes(
-            c.to_ne_bytes(),
-        ))),
+    stub_exit(code)
+}
+
+/// The stub's exit code: started, blocked by the job (its own breakaway refused), or failed.
+fn stub_exit(code: u32) -> Result<Started, LaunchError> {
+    match i32::from_ne_bytes(code.to_ne_bytes()) {
+        EXIT_STARTED => Ok(Started::Stub),
+        EXIT_BLOCKED => Err(LaunchError::BlockedByJob),
+        c => Err(LaunchError::ChildFailed(c)),
     }
 }
 
@@ -550,10 +554,15 @@ impl Breakaway {
 
 /// `ERROR_ACCESS_DENIED` from creating a process with `CREATE_BREAKAWAY_FROM_JOB` while in a job
 /// means the job (or an enclosing one) refused the breakaway (§4.7 step 2 "or by the
-/// `CreateProcess` result").
+/// `CreateProcess` result"). Only when the query said this process is in a job: after a failed
+/// query (`Unknown`) a denial is just an IO error.
 fn stub_error(e: io::Error, breakaway: Breakaway) -> LaunchError {
     let denied = e.raw_os_error() == i32::try_from(ERROR_ACCESS_DENIED).ok();
-    if denied && breakaway != Breakaway::NotInJob {
+    let in_job = matches!(
+        breakaway,
+        Breakaway::Granted | Breakaway::Silent | Breakaway::Blocked
+    );
+    if denied && in_job {
         LaunchError::BlockedByJob
     } else {
         LaunchError::Io(e)
@@ -804,9 +813,7 @@ pub(crate) fn env_block(
         block.extend(value);
         block.push(0);
     }
-    if block.is_empty() {
-        block.push(0);
-    }
+    // Never empty (`SystemRoot` and `PATH` are always there): the final NUL ends the block.
     block.push(0);
     Ok(block)
 }
@@ -1022,17 +1029,41 @@ mod tests {
     #[test]
     fn access_denied_on_breakaway_is_blocked_by_job() {
         let denied = || io::Error::from_raw_os_error(5);
-        for b in [Breakaway::Granted, Breakaway::Silent, Breakaway::Unknown] {
-            assert!(matches!(stub_error(denied(), b), LaunchError::BlockedByJob));
+        // Only when the query said this process is in a job.
+        for b in [Breakaway::Granted, Breakaway::Silent, Breakaway::Blocked] {
+            assert!(
+                matches!(stub_error(denied(), b), LaunchError::BlockedByJob),
+                "{b:?}"
+            );
         }
-        assert!(matches!(
-            stub_error(denied(), Breakaway::NotInJob),
-            LaunchError::Io(_)
-        ));
+        for b in [Breakaway::NotInJob, Breakaway::Unknown] {
+            assert!(
+                matches!(stub_error(denied(), b), LaunchError::Io(_)),
+                "{b:?}"
+            );
+        }
         assert!(matches!(
             stub_error(io::Error::from_raw_os_error(2), Breakaway::Granted),
             LaunchError::Io(_)
         ));
+    }
+
+    #[test]
+    fn stub_exit_codes_map_back() {
+        use super::super::stub::{EXIT_BLOCKED, EXIT_FAILED, EXIT_STARTED, EXIT_USAGE};
+
+        let code = |c: i32| u32::from_ne_bytes(c.to_ne_bytes());
+        assert!(matches!(stub_exit(code(EXIT_STARTED)), Ok(Started::Stub)));
+        assert!(matches!(
+            stub_exit(code(EXIT_BLOCKED)),
+            Err(LaunchError::BlockedByJob)
+        ));
+        for c in [EXIT_FAILED, EXIT_USAGE, -1] {
+            assert!(
+                matches!(stub_exit(code(c)), Err(LaunchError::ChildFailed(got)) if got == c),
+                "{c}"
+            );
+        }
     }
 
     #[test]

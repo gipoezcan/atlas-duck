@@ -301,6 +301,103 @@ fn stale_endpoint_still_launches_and_the_poll_waits_for_an_answer() {
     assert_eq!(sys.spawns(), 1);
 }
 
+/// The real Windows endpoint probe (`discover::endpoint_present`); `spawn_app` counts and starts a
+/// thread that binds a pipe under this user's prefix 150 ms later, writes its name to the endpoint
+/// file and holds the listener until `stop` fires.
+#[cfg(windows)]
+struct RealPipe {
+    base: BaseDirs,
+    data: LocalDataDir,
+    spawns: AtomicU32,
+    stop: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    app: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[cfg(windows)]
+impl LaunchSys for RealPipe {
+    fn gui_session(&self) -> bool {
+        true
+    }
+
+    fn launch_env(&self) -> Vec<(OsString, OsString)> {
+        Vec::new()
+    }
+
+    fn spawn_app(&self, _app: &Path, _env: &[(OsString, OsString)]) -> Result<(), LaunchError> {
+        use atlas_duck_ipc::paths::{EndpointLocation, endpoint_location, write_endpoint_file};
+        use atlas_duck_ipc::transport::windows::PipeListener;
+
+        self.spawns.fetch_add(1, Ordering::SeqCst);
+        let stop = self.stop.lock().unwrap().take();
+        let data = self.data.clone();
+        *self.app.lock().unwrap() = Some(std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .unwrap();
+            let _in_rt = rt.enter();
+            let Ok(EndpointLocation::WindowsPipePrefix(prefix)) = endpoint_location(&data, HOST)
+            else {
+                panic!("not a pipe prefix");
+            };
+            let listener = PipeListener::bind(&prefix).unwrap();
+            write_endpoint_file(&data, listener.name()).unwrap();
+            if let Some(stop) = stop {
+                let _ = stop.recv_timeout(Duration::from_secs(10));
+            }
+            drop(listener);
+        }));
+        Ok(())
+    }
+
+    fn endpoint_present(&self, data: &LocalDataDir, host: &str) -> bool {
+        discover::endpoint_present(data, host)
+    }
+
+    fn base_dirs(&self) -> io::Result<BaseDirs> {
+        Ok(self.base.clone())
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_stale_endpoint_file_launches_once_and_the_poll_waits_for_the_pipe() {
+    use atlas_duck_ipc::paths::{EndpointLocation, endpoint_location, write_endpoint_file};
+
+    let w = world();
+    // A crashed app's endpoint file: our prefix, a well-formed suffix, no pipe behind it.
+    let EndpointLocation::WindowsPipePrefix(prefix) = endpoint_location(&w.data, HOST).unwrap()
+    else {
+        panic!("not a pipe prefix");
+    };
+    write_endpoint_file(&w.data, &format!("{prefix}{}", "c".repeat(32))).unwrap();
+    assert!(!discover::endpoint_present(&w.data, HOST));
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let sys = RealPipe {
+        base: w.base.clone(),
+        data: w.data.clone(),
+        spawns: AtomicU32::new(0),
+        stop: Mutex::new(Some(stop_rx)),
+        app: Mutex::new(None),
+    };
+    let start = Instant::now();
+    let got = ensure_running(
+        &discovery(DataState::Local(w.data.clone())),
+        &within(5_000),
+        &sys,
+    );
+    let took = start.elapsed();
+    stop_tx.send(()).unwrap();
+    if let Some(app) = sys.app.lock().unwrap().take() {
+        app.join().unwrap();
+    }
+    assert_eq!(got.unwrap(), w.data);
+    assert_eq!(sys.spawns.load(Ordering::SeqCst), 1);
+    assert!(took >= Duration::from_millis(150), "{took:?}");
+}
+
 #[test]
 fn spawn_gets_the_allowlisted_env() {
     let w = world();
