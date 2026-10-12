@@ -837,22 +837,25 @@ fn write_replaces_the_file_atomically() {
 
 #[test]
 fn keyring_locality_lives_in_ipc() {
-    use atlas_duck_ipc::paths::keyring::{
-        DirsOs, KeyringLocality, keyring_dirs_for, keyring_locality,
-    };
-    use std::path::PathBuf;
-    let dirs =
-        keyring_dirs_for(DirsOs::Linux, Some("/x".into()), &|| Ok("/home/u".into())).unwrap();
-    assert_eq!(
-        dirs,
-        [
-            "/x/keyrings",
-            "/x/kwalletd",
-            "/home/u/.local/share/keyrings",
-            "/home/u/.local/share/kwalletd"
-        ]
-        .map(PathBuf::from)
-    );
+    use atlas_duck_ipc::paths::keyring::{KeyringLocality, keyring_locality};
+    // "/x" is not an absolute path on Windows, so the Linux layout is only checked on unix hosts.
+    #[cfg(unix)]
+    {
+        use atlas_duck_ipc::paths::keyring::{DirsOs, keyring_dirs_for};
+        use std::path::PathBuf;
+        let dirs =
+            keyring_dirs_for(DirsOs::Linux, Some("/x".into()), &|| Ok("/home/u".into())).unwrap();
+        assert_eq!(
+            dirs,
+            [
+                "/x/keyrings",
+                "/x/kwalletd",
+                "/home/u/.local/share/keyrings",
+                "/home/u/.local/share/kwalletd"
+            ]
+            .map(PathBuf::from)
+        );
+    }
     let l = keyring_locality(&[]);
     if cfg!(windows) {
         assert_eq!(l, KeyringLocality::Local);
