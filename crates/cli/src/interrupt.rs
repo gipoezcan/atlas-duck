@@ -152,9 +152,17 @@ fn ignored(sig: libc::c_int) -> bool {
 /// True when the reader of fd 1 went away (`POLLERR`/`POLLHUP`, no wait).
 #[cfg(unix)]
 fn stdout_hung_up() -> bool {
+    hung_up(1)
+}
+
+/// `events` must ask for `POLLOUT`: Linux reports `POLLERR`/`POLLHUP` regardless of the request, but
+/// macOS builds `poll` on kqueue filters, so with `events: 0` no filter exists and a closed pipe
+/// reader is never reported. The write filter reports it as `POLLHUP` (EV_EOF). Nothing is written.
+#[cfg(unix)]
+fn hung_up(raw: libc::c_int) -> bool {
     let mut fd = libc::pollfd {
-        fd: 1,
-        events: 0,
+        fd: raw,
+        events: libc::POLLOUT,
         revents: 0,
     };
     // SAFETY: `fd` is a valid `pollfd` that outlives the call; one entry, zero timeout.
@@ -198,5 +206,20 @@ mod tests {
                 assert!(!fired);
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hang_up_seen_only_after_the_reader_closes() {
+        let mut ends = [0 as libc::c_int; 2];
+        // SAFETY: `ends` has room for the two descriptors `pipe` fills in.
+        assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+        let (read, write) = (ends[0], ends[1]);
+        assert!(!hung_up(write), "a pipe with a live reader is not hung up");
+        // SAFETY: `read` is an open descriptor owned by this test.
+        assert_eq!(unsafe { libc::close(read) }, 0);
+        assert!(hung_up(write), "the reader is gone");
+        // SAFETY: `write` is an open descriptor owned by this test.
+        unsafe { libc::close(write) };
     }
 }
