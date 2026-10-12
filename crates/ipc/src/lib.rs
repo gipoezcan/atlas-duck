@@ -19,6 +19,8 @@ pub mod proto;
 pub mod rpc;
 pub mod sandbox;
 #[cfg(feature = "async")]
+pub mod server;
+#[cfg(feature = "async")]
 pub mod transport;
 #[cfg(windows)]
 mod win_security;

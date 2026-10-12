@@ -25,6 +25,8 @@ pub mod diag {
     pub const EVENT_PROTOCOL_ERROR: &str = "ipc_protocol_error";
     /// Binding the endpoint failed.
     pub const EVENT_BIND_FAILED: &str = "ipc_bind_failed";
+    /// Accepting a connection failed (the server backs off and goes on).
+    pub const EVENT_ACCEPT_FAILED: &str = "ipc_accept_failed";
 
     /// Unix: the peer's uid is not the server's euid.
     pub const REASON_PEER_UID: &str = "peer_uid";
