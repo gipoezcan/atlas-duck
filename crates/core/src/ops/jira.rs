@@ -514,38 +514,44 @@ fn missing_fields(params: &Value, pages: &[Value]) -> Option<(Vec<MissingField>,
             if out.len() == MAX_MISSING_FIELDS {
                 continue;
             }
-            let schema = |k: &str| {
-                field
-                    .get("schema")
-                    .and_then(|s| s.get(k))
-                    .and_then(Value::as_str)
-                    .map(capped)
-            };
-            let many = schema("type").as_deref() == Some("array");
-            let listed = field
-                .get("allowedValues")
-                .and_then(Value::as_array)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let allowed_values = listed
-                .iter()
-                .filter_map(|v| allowed_value(v, many))
-                .take(MAX_ALLOWED_VALUES)
-                .collect();
-            out.push(MissingField {
-                id: capped(id),
-                name: field
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| capped(id), capped),
-                schema_type: schema("type").unwrap_or_default(),
-                schema_items: schema("items"),
-                allowed_values,
-                allowed_total: u64::try_from(listed.len()).unwrap_or(u64::MAX),
-            });
+            out.push(missing_field(id, field));
         }
     }
     Some((out, total))
+}
+
+/// One required field as createmeta (or a transition screen) lists it: its names, `schema` and
+/// the first [`MAX_ALLOWED_VALUES`] of its `allowedValues`.
+fn missing_field(id: &str, field: &Value) -> MissingField {
+    let schema = |k: &str| {
+        field
+            .get("schema")
+            .and_then(|s| s.get(k))
+            .and_then(Value::as_str)
+            .map(capped)
+    };
+    let many = schema("type").as_deref() == Some("array");
+    let listed = field
+        .get("allowedValues")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let allowed_values = listed
+        .iter()
+        .filter_map(|v| allowed_value(v, many))
+        .take(MAX_ALLOWED_VALUES)
+        .collect();
+    MissingField {
+        id: capped(id),
+        name: field
+            .get("name")
+            .and_then(Value::as_str)
+            .map_or_else(|| capped(id), capped),
+        schema_type: schema("type").unwrap_or_default(),
+        schema_items: schema("items"),
+        allowed_values,
+        allowed_total: u64::try_from(listed.len()).unwrap_or(u64::MAX),
+    }
 }
 
 /// One createmeta `allowedValues` entry (T12 review I1): its label (`value`, else `name`, else
@@ -636,6 +642,7 @@ fn create_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
         issue_type_id: Some(issuetype.id),
         issue_type: issuetype.name.as_deref().map(capped),
         field_names: set_field_names(ctx.params, pages),
+        ..WriteSummaryFacts::default()
     });
     verdict
 }
@@ -956,12 +963,88 @@ fn transition_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
     };
     let wanted = str_param(ctx.params, "transition");
     match resolve(transitions, wanted) {
-        Resolution::One(id) => EnrichVerdict::preview(
-            json!({"status_id": status_id, "transition_id": id}),
-            resolved("transition", &id),
-        ),
+        Resolution::One(id) => {
+            let transition = transitions
+                .iter()
+                .find(|t| t.get("id").and_then(Value::as_str) == Some(id.as_str()));
+            let mut verdict = EnrichVerdict::preview(
+                json!({"status_id": status_id, "transition_id": id}),
+                resolved("transition", &id),
+            );
+            if let Some(transition) = transition {
+                transition_summary(&mut verdict, ctx.params, transition, responses);
+            }
+            verdict
+        }
         Resolution::Unresolved(n, candidates) => unresolved("transition", wanted, n, candidates),
     }
+}
+
+/// Whether the params set the transition screen's field `id` (a `fields` key; the `comment` param
+/// sets `comment`). A `null` or an empty string sets nothing (as for createmeta, PD-49).
+fn transition_field_set(params: &Value, id: &str) -> bool {
+    let set = |v: Option<&Value>| v.is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
+    (id == "comment" && set(params.get("comment")))
+        || set(params
+            .get("fields")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get(id)))
+}
+
+/// T14: the facts of the transition card (the status the issue is in, the one the transition
+/// leads to, the screen's names of the fields the params set) and the transition screen's
+/// required fields no param sets: a Caution, never a block (PD-49 applied to the screen the
+/// enrichment GET already expanded), with the pre-added inputs and the deny hint that come with
+/// `missing_fields`.
+fn transition_summary(
+    verdict: &mut EnrichVerdict,
+    params: &Value,
+    transition: &Value,
+    responses: &[Value],
+) {
+    let screen = transition.get("fields").and_then(Value::as_object);
+    let name_of = |v: Option<&Value>| {
+        v.and_then(|v| v.get("name"))
+            .and_then(Value::as_str)
+            .map(capped)
+    };
+    let (mut missing, mut total) = (Vec::new(), 0u64);
+    for (id, field) in screen.into_iter().flatten() {
+        let flag = |k: &str| field.get(k) == Some(&Value::Bool(true));
+        if !flag("required") || flag("hasDefaultValue") || transition_field_set(params, id) {
+            continue;
+        }
+        total = total.saturating_add(1);
+        if missing.len() < MAX_MISSING_FIELDS {
+            missing.push(missing_field(id, field));
+        }
+    }
+    if total > 0 {
+        verdict.warnings.push(Warning::new(
+            WarningId::MissingRequiredFields,
+            warning::missing_required_fields(&missing_list(&missing, total)),
+        ));
+    }
+    verdict.missing_fields = missing;
+    verdict.missing_fields_total = total;
+    let field_names = params
+        .get("fields")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(Map::keys)
+        .filter_map(|id| Some((id.clone(), name_of(screen?.get(id.as_str()))?)))
+        .take(MAX_MISSING_FIELDS)
+        .collect();
+    verdict.summary = Some(WriteSummaryFacts {
+        from_status: name_of(
+            responses
+                .get(1)
+                .and_then(|r| r.get("fields")?.get("status")),
+        ),
+        to_status: name_of(transition.get("to")),
+        field_names,
+        ..WriteSummaryFacts::default()
+    });
 }
 
 /// `POST /rest/api/2/issue/{key}/transitions`

@@ -408,8 +408,15 @@ fn param_kind(name: &str, prop: &Value) -> InputKind {
 /// review I1); a number for a `number` (decimals allowed, T12 review M7), an integer only for an
 /// `integer`, text for a `string`, else JSON.
 fn missing_kind(f: &MissingField) -> InputKind {
-    let choice = f.schema_type == "option"
-        || (f.schema_type == "array" && f.schema_items.as_deref() == Some("option"));
+    // T14: a transition screen's usual required field is `resolution` (and `priority`), whose
+    // allowed values Jira takes by `{"id"}` like an option's; a multi-pick of versions or
+    // components likewise.
+    let choice = matches!(f.schema_type.as_str(), "option" | "resolution" | "priority")
+        || (f.schema_type == "array"
+            && matches!(
+                f.schema_items.as_deref(),
+                Some("option" | "version" | "component")
+            ));
     match f.schema_type.as_str() {
         _ if choice && !f.allowed_values.is_empty() => InputKind::choice_with_wire(
             f.allowed_values

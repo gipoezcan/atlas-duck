@@ -118,7 +118,7 @@ async fn comment_add_happy_path() -> TestResult {
     let preview = h.approver().open(&id).map_err(de)?.preview;
     assert_eq!(preview.header.executes_as.as_deref(), Some(TEST_USER));
     assert_eq!(preview.header.receipt_fields, ["id"]);
-    assert!(matches!(preview.body, PreviewBody::WriteRequests { .. }));
+    assert!(matches!(preview.body, PreviewBody::WriteSummary { .. }));
     h.approver().approve_unopened(&id).map_err(de)?;
     let env = h.await_(&id, 10_000).await;
     assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());

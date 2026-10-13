@@ -972,22 +972,11 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         ) {
             continue;
         }
-        let label = match facts.field_names.iter().find(|(f, _)| f == id) {
-            Some((_, name)) => line(&format!("{name} ({id})"), CELL_CAP_CHARS * 2, &mut hidden),
-            None => field_label(None, id),
-        };
+        let label = field_row_label(&facts.field_names, id, &mut hidden);
         let json = serde_json::to_string(value).unwrap_or_default();
         rows.push((label, line(&json, FIELD_VALUE_CAP, &mut hidden)));
     }
-    let requests = match std::mem::replace(
-        &mut model.body,
-        PreviewBody::WriteRequests {
-            requests: Vec::new(),
-        },
-    ) {
-        PreviewBody::WriteRequests { requests } => requests,
-        _ => Vec::new(),
-    };
+    let requests = take_requests(&mut model);
     model.body = PreviewBody::WriteSummary {
         sentence: line(
             &create_sentence(&issue_type, &key),
@@ -996,6 +985,180 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         ),
         rows,
         constructs: description.map(construct_list),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden;
+    model
+}
+
+/// A `fields` row's label: `<name> (<id>)` where enrichment named the field (createmeta, the
+/// transition screen; T12 review M8), else the id (write previews take no cached field names, T8
+/// handoff). One display-escaped line.
+fn field_row_label(names: &[(String, String)], id: &str, hidden: &mut u64) -> String {
+    match names.iter().find(|(f, _)| f == id) {
+        Some((_, name)) => line(&format!("{name} ({id})"), CELL_CAP_CHARS * 2, hidden),
+        None => field_label(None, id),
+    }
+}
+
+/// The request list of a write preview whose body is [`PreviewBody::WriteRequests`], moved out
+/// (§5.1 inv. 4: every write card keeps it); the body is left empty for the caller to replace.
+fn take_requests(model: &mut PreviewModel) -> Vec<atlas_duck_preview::RequestView> {
+    match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    }
+}
+
+/// The text of a wiki text's rendering (`wiki_to_text`), display-escaped: the source is cut at
+/// `cap` bytes before it is rendered, the rendering again at `cap` escaped bytes
+/// ([`escaped_prefix`], so an escape is never split and a text of invisible characters stays
+/// bounded). A cut says how many source bytes it hides, which are also added to `hidden`.
+fn rendered_text(wiki: &str, cap: usize, hidden: &mut u64) -> String {
+    let (kept, cut) = cut_at(wiki, cap);
+    let text = wiki_to_text(kept);
+    let (mut shown, used) = escaped_prefix(&text, cap);
+    let more = u64::try_from(text.len().saturating_sub(used)).unwrap_or(u64::MAX);
+    let hides = cut.saturating_add(more);
+    *hidden = hidden.saturating_add(hides);
+    if hides > 0 {
+        shown.push_str(&format!("… {hides} more bytes (see Raw)"));
+    }
+    shown
+}
+
+/// §6.3 comment: the `jira.comment.add` card over the exact request: "Comment on <key>", the
+/// body shown as the text of its wiki markup (read from the request that is sent, T7 M-6: a
+/// Markdown body was converted once, at validation, and not again here), a visibility row when
+/// the comment is restricted (with the Caution of §6.2 "includes restricted-visibility
+/// comments"), and the constructs of the body (PD-47). Any other input keeps the generic write
+/// preview.
+pub fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let (Some(request), PreviewBody::WriteRequests { .. }) = (view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(body) = serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|b| b.as_object().cloned())
+    else {
+        return model;
+    };
+    let Some(wiki) = body.get("body").and_then(Value::as_str) else {
+        return model;
+    };
+    let mut hidden = 0u64;
+    let key = ctx.params.get("key").and_then(Value::as_str).unwrap_or("");
+    let mut rows = vec![(
+        "Body".to_owned(),
+        rendered_text(wiki, COMMENT_CAP, &mut hidden),
+    )];
+    if let Some(visibility) = body.get("visibility").filter(|v| !v.is_null()) {
+        let text = match (
+            visibility.get("type").and_then(Value::as_str),
+            visibility.get("value").and_then(Value::as_str),
+        ) {
+            (Some(kind), Some(value)) => format!("{kind}: {value}"),
+            _ => serde_json::to_string(visibility).unwrap_or_default(),
+        };
+        rows.push((
+            "Visibility".to_owned(),
+            line(&text, CELL_CAP_CHARS * 2, &mut hidden),
+        ));
+        model.warnings.push(Warning::new(
+            WarningId::RestrictedComments,
+            warning::TEXT_RESTRICTED_COMMENTS,
+        ));
+    }
+    let requests = take_requests(&mut model);
+    model.body = PreviewBody::WriteSummary {
+        sentence: line(
+            &format!("Comment on {key}"),
+            CELL_CAP_CHARS * 2,
+            &mut hidden,
+        ),
+        rows,
+        constructs: Some(construct_list(wiki)),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden;
+    model
+}
+
+/// §6.3 transition: the `jira.issue.transition` card over the exact request: the status the
+/// issue is in and the one the transition leads to (the verdict's facts), the `fields` the
+/// transition sets (named like the Caution names a field where the transition screen does), the
+/// comment sent with it as the text of its wiki markup, and that comment's constructs (PD-42,
+/// PD-47: sent verbatim). The required-fields Caution is the verdict's own. Every other hold, or
+/// a request that is not the transition JSON, keeps the generic write preview.
+pub fn transition_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let facts = view
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref());
+    let (Some(facts), Some(request), PreviewBody::WriteRequests { .. }) =
+        (facts, view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(body) = serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|b| b.as_object().cloned())
+    else {
+        return model;
+    };
+    let mut hidden = 0u64;
+    let status = |name: &Option<String>, hidden: &mut u64| {
+        line(
+            name.as_deref().unwrap_or("(not named)"),
+            CELL_CAP_CHARS * 2,
+            hidden,
+        )
+    };
+    let from = status(&facts.from_status, &mut hidden);
+    let to = status(&facts.to_status, &mut hidden);
+    let mut fields = Vec::new();
+    for (id, value) in body
+        .get("fields")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        let label = field_row_label(&facts.field_names, id, &mut hidden);
+        let json = serde_json::to_string(value).unwrap_or_default();
+        fields.push((label, line(&json, FIELD_VALUE_CAP, &mut hidden)));
+    }
+    let comment = body
+        .get("update")
+        .and_then(|u| u.get("comment"))
+        .and_then(Value::as_array)
+        .and_then(|c| c.first())
+        .and_then(|c| c.get("add")?.get("body")?.as_str());
+    if let Some(wiki) = comment {
+        fields.push((
+            "comment".to_owned(),
+            rendered_text(wiki, COMMENT_CAP, &mut hidden),
+        ));
+    }
+    let requests = take_requests(&mut model);
+    model.body = PreviewBody::Transition {
+        from,
+        to,
+        fields,
+        constructs: comment.map(construct_list),
         requests,
     };
     model.header.hidden_in_preview_bytes = hidden;

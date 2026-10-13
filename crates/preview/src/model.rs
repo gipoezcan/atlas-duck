@@ -202,11 +202,14 @@ pub enum PreviewBody {
         raw_only_changes: u64,
         requests: Vec<RequestView>,
     },
-    /// §6.3 transition. Status names and field rows are display-escaped text.
+    /// §6.3 transition. Status names and field rows are display-escaped text. `constructs` lists
+    /// the wiki constructs of the comment sent with the transition (PD-47, M5 T14: Δ2 had no place
+    /// for them); `None` without a comment.
     Transition {
         from: String,
         to: String,
         fields: Vec<(String, String)>,
+        constructs: Option<ConstructList>,
         requests: Vec<RequestView>,
     },
 }

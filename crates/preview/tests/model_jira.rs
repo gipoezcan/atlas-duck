@@ -76,6 +76,7 @@ fn bodies() -> Vec<PreviewBody> {
             from: "Open".to_owned(),
             to: "Done".to_owned(),
             fields: vec![("resolution".to_owned(), "Fixed".to_owned())],
+            constructs: None,
             requests: vec![req()],
         },
     ]

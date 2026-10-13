@@ -1898,8 +1898,12 @@ fn write_preview_shows_exact_requests() -> TestResult {
     assert_eq!(m.header.executes_as, None);
     assert_eq!(m.header.byte_size, u64::try_from(requests[0].body.len())?);
     assert_eq!(m.header.bidi_controls, 1);
-    let PreviewBody::WriteRequests { requests: views } = &m.body else {
-        return Err("expected WriteRequests".into());
+    // T14: the comment card keeps the exact request list (§5.1 inv. 4).
+    let PreviewBody::WriteSummary {
+        requests: views, ..
+    } = &m.body
+    else {
+        return Err("expected WriteSummary".into());
     };
     assert_eq!(views.len(), 1);
     assert_eq!(views[0].method, "POST");

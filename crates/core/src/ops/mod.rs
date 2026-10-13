@@ -322,6 +322,17 @@ pub struct WriteSummaryFacts {
     /// (T12 review M8: the card names them like the Caution does); at most
     /// `jira::MAX_MISSING_FIELDS`.
     pub field_names: Vec<(String, String)>,
+    /// `jira.issue.transition` (T14): the name of the status the issue is in and of the status the
+    /// resolved transition leads to; `field_names` then holds the transition screen's names of
+    /// the `fields` keys the params set.
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
+    /// `jira.issue.assign` (T15): the current assignee's display name.
+    pub assignee_from: Option<String>,
+    /// `jira.issuelink.create` (T16): the link type's phrase for the sentence.
+    pub link_phrase: Option<String>,
+    /// `jira.sprint.move_issues` (T18): the sprint's `(name, state)`.
+    pub sprint: Option<(String, String)>,
 }
 
 /// Redacting `Debug` (§7.7).
@@ -639,7 +650,7 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         "jira.comment.add",
         OpImpl {
             executor: jira::comment_add_executor,
-            previewer: generic::write_preview,
+            previewer: jira_preview::comment_preview,
             stale_check: None,
             enrich: None,
             enrich_keys: &[],
@@ -649,10 +660,10 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         "jira.issue.transition",
         OpImpl {
             executor: jira::issue_transition_executor,
-            previewer: generic::write_preview,
+            previewer: jira_preview::transition_preview,
             stale_check: Some(&stale::ISSUE_TRANSITION),
             enrich: Some(&jira::ISSUE_TRANSITION_ENRICH),
-            enrich_keys: &["transition"],
+            enrich_keys: &["transition", "fields", "comment"],
         },
     ),
     ("jira.issue.assign", LATER_WRITE),
