@@ -1658,12 +1658,15 @@ async fn s16_pat_canary_absent_from_cli_channels() -> Result<()> {
     )
     .await?;
     assert_eq!(released.exit, 0, "{}", released.stdout);
-    // Positive control: the canary did go upstream (`Authorization: Bearer <pat>`,
-    // `client/send.rs` 129), so its absence from the CLI channels below is meaningful.
+    // Positive control: the canary did go upstream on the read itself (`Authorization: Bearer
+    // <pat>`, `client/send.rs` 129), so its absence from the CLI channels below is meaningful.
+    // Only the read's path counts: the connection test at provisioning and the field-name cache
+    // fills (PD-46) carry it too.
     let canary_sent = jira(&world)?.received().await.iter().any(|r| {
-        r.headers
-            .values()
-            .any(|v| String::from_utf8_lossy(v.as_bytes()).contains(PAT_CANARY))
+        r.url.path().ends_with("/issue/ABC-1")
+            && r.headers
+                .values()
+                .any(|v| String::from_utf8_lossy(v.as_bytes()).contains(PAT_CANARY))
     });
     assert!(canary_sent, "no upstream request carried the PAT canary");
     let held = submit_pending(
