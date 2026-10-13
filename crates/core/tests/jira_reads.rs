@@ -396,6 +396,82 @@ async fn comment_page_failure_is_gated() -> TestResult {
     Ok(())
 }
 
+/// Review I-1 (A): the very first comment page answers 302. The issue is already page 0 of the
+/// record, so this is a later-page failure: gated, never `READ_FAILED`, issue data not released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_comment_page_failure_is_gated() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mount_issue(mock, KEY, &issue_body()).await;
+    let redirect = mock
+        .response(302)
+        .insert_header("Location", "https://sso.corp.example/login")
+        .set_body_raw("<html>moved</html>", "text/html");
+    mount_comment_page_with(mock, KEY, 0, redirect).await;
+    let id = queued(&h, json!({ "key": KEY, "comments": true })).await?;
+    let types = h.event_types(&id).await?;
+    assert!(!types.contains(&EventType::READ_FAILED), "{types:?}");
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    match preview.body {
+        PreviewBody::Outcome { outcome, .. } => assert_eq!(outcome, OutcomeKind::LaterPageRefused),
+        other => return Err(format!("not an outcome card: {other:?}").into()),
+    }
+    let fetched = records(&h, &id, EventType::READ_FETCHED).await?;
+    let f = fetched.first().ok_or("no READ_FETCHED")?;
+    assert_eq!(f["reason"], "redirect_3xx");
+    // The issue as page 0, then the 302 answer.
+    assert_eq!(f["pages"], 2);
+    let first: Value = serde_json::from_str(
+        f["responses"][0]["body"]["text"]
+            .as_str()
+            .ok_or("no issue body")?,
+    )?;
+    assert_eq!(first, issue_body());
+    h.approver().release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "upstream_unavailable");
+    assert_eq!(env.data, None);
+    Ok(())
+}
+
+/// Review I-1 (B), PD-45 as built: a comment page answering JSON 500 (page 2) or 404 (page 1) is
+/// an `UpstreamError` item with that status, gated, never `READ_FAILED`; neither the issue nor
+/// the earlier pages are released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn comment_page_json_error_is_a_gated_upstream_error() -> TestResult {
+    for (failing_start, status, pages) in [(50, 500, 3), (0, 404, 2)] {
+        let h = Harness::jira().await?;
+        let mock = jira(&h)?;
+        mount_issue(mock, KEY, &issue_body()).await;
+        if failing_start > 0 {
+            mount_comments(mock, KEY, &[comment_page(0, 50, 70, 50, false)]).await;
+        }
+        let err = mock.response(status).set_body_raw(
+            r#"{"errorMessages":["comment trouble"],"errors":{}}"#,
+            "application/json",
+        );
+        mount_comment_page_with(mock, KEY, failing_start, err).await;
+        let id = queued(&h, json!({ "key": KEY, "comments": true })).await?;
+        let types = h.event_types(&id).await?;
+        assert!(!types.contains(&EventType::READ_FAILED), "{types:?}");
+        let preview = h.approver().open(&id).map_err(de)?.preview;
+        match preview.body {
+            PreviewBody::UpstreamError { status: s, .. } => assert_eq!(s, status),
+            other => return Err(format!("not an upstream-error card: {other:?}").into()),
+        }
+        let fetched = records(&h, &id, EventType::READ_FETCHED).await?;
+        let f = fetched.first().ok_or("no READ_FETCHED")?;
+        assert_eq!(f["pages"], pages, "{status}");
+        h.approver().release(&id).map_err(de)?;
+        let env = h.await_(&id, 5000).await;
+        assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+        assert_eq!(code(&env), "upstream_http");
+        assert_eq!(env.data, None);
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issue_failure_requests_no_comment_page() -> TestResult {
     let h = Harness::jira().await?;

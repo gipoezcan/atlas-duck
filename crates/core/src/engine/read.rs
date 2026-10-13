@@ -411,12 +411,11 @@ pub(crate) async fn run_plan(
             ..
         } => {
             let began = tokio::time::Instant::now();
-            let issue = match client.get_ctl(cover, issue, ctl).await {
+            // A 2xx issue answer is kept in `ctl`: a cancel during the comment pages records it.
+            let issue = match client.get_kept_ctl(cover, issue, ctl).await {
                 FetchOutcome::Response(r) if status_2xx(&r) => r,
                 other => return Fetched::Single(other),
             };
-            // A cancel during the comment pages records the issue answer with them.
-            ctl.push_page(issue.clone());
             let issue_bytes = u64::try_from(issue.body.len()).unwrap_or(u64::MAX);
             let left = ReadBudget {
                 total: budget.total.saturating_sub(began.elapsed()),
@@ -1681,6 +1680,33 @@ mod tests {
             merge_comments([&b"[1]"[..], &page[..]], false),
             Err(RebuildError::Malformed)
         ));
+        Ok(())
+    }
+
+    /// The composite's truncation fact needs all three: more pages exist (`next_start`), and
+    /// fewer comments than the server's total were fetched. The pager never ends with `Some`
+    /// and `items_fetched >= total`, so the second conjunct is pinned here, on a crafted outcome.
+    #[test]
+    fn composite_truncated_needs_more_pages_and_a_short_count() -> TestResult {
+        let truncated = |next_start, items_fetched, server_total| -> Result<_, String> {
+            let outcome = PagedOutcome {
+                pages: vec![answer(200, "application/json")],
+                items_fetched,
+                end: PageEnd::MaxReached,
+                failure: None,
+                next_start,
+                server_total,
+            };
+            match classify_read(Fetched::Composite { outcome }, &direct_proxy()) {
+                Classified::Item(rec) => Ok(rec.comments_truncated),
+                _ => Err("not an item".to_owned()),
+            }
+        };
+        assert_eq!(truncated(Some(100), 100, Some(250))?, Some((100, 250)));
+        assert_eq!(truncated(None, 100, Some(250))?, None);
+        assert_eq!(truncated(Some(100), 100, Some(100))?, None);
+        assert_eq!(truncated(Some(100), 100, Some(40))?, None);
+        assert_eq!(truncated(Some(100), 100, None)?, None);
         Ok(())
     }
 

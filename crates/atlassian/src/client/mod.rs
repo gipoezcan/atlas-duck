@@ -196,10 +196,8 @@ impl FetchControl {
         std::mem::take(&mut self.state().partial)
     }
 
-    /// A completed page of a paginated read (kept for `take_captured`). Public for a composite
-    /// read whose caller fetched an earlier response itself (`jira.issue.get --comments`: the
-    /// issue, then the comment pages under the same control), so a cancel records every response.
-    pub fn push_page(&self, page: UpstreamResponse) {
+    /// A completed page of a paginated read (kept for `take_captured`).
+    pub(crate) fn push_page(&self, page: UpstreamResponse) {
         self.state().pages.push(page);
     }
 
@@ -312,6 +310,24 @@ impl InstanceClient {
     pub async fn post_search(&self, cover: &AuditCover, call: &SearchCall) -> FetchOutcome {
         self.post_search_ctl(cover, call, &FetchControl::new())
             .await
+    }
+
+    /// `get_ctl` for the first leg of a composite read (`jira.issue.get --comments`: the issue,
+    /// then the comment pages under the same control): a 2xx answer is also kept in `ctl`, so a
+    /// cancel during a later leg records it with the pages (every byte received).
+    pub async fn get_kept_ctl(
+        &self,
+        cover: &AuditCover,
+        call: &GetCall,
+        ctl: &FetchControl,
+    ) -> FetchOutcome {
+        let out = self.get_ctl(cover, call, ctl).await;
+        if let FetchOutcome::Response(r) = &out
+            && (200..300).contains(&r.status)
+        {
+            ctl.push_page(r.clone());
+        }
+        out
     }
 
     /// The one allowlisted read `POST` (`jira.search`); the method guard refuses any other path.

@@ -306,6 +306,46 @@ fn u33_caps_clamp_and_hard_cap() -> TestResult {
     Ok(())
 }
 
+/// Δ7: the comments cap is the registry's 100 unless configured, always within 1..=1000, and
+/// only `jira.issue.get` has one.
+#[test]
+fn comments_cap_default_clamp_and_scope() -> TestResult {
+    let get = json!({"key": "ABC-1", "comments": true});
+    let with = |cap: Option<u32>| EffectiveCaps {
+        comments_cap: cap,
+        ..EffectiveCaps::default()
+    };
+    for (configured, expected) in [
+        (None, 100),
+        (Some(0), 1),
+        (Some(1), 1),
+        (Some(1000), 1000),
+        (Some(5000), 1000),
+    ] {
+        let v = check_with(
+            "jira.issue.get",
+            get.clone(),
+            &with(configured),
+            None,
+            false,
+        )??;
+        assert_eq!(v.comments_cap, Some(expected), "{configured:?}");
+    }
+    // A configured cap never reaches another op.
+    let caps = with(Some(10));
+    let v = check_with("jira.search", json!({"jql": "x"}), &caps, None, false)??;
+    assert_eq!(v.comments_cap, None);
+    let v = check_with(
+        "jira.comment.list",
+        json!({"key": "ABC-1"}),
+        &caps,
+        None,
+        false,
+    )??;
+    assert_eq!(v.comments_cap, None);
+    Ok(())
+}
+
 #[test]
 fn move_limit_51_rejected_with_hint() -> TestResult {
     let issues = |n: usize| (1..=n).map(|i| format!("ABC-{i}")).collect::<Vec<_>>();
