@@ -1,4 +1,5 @@
-//! §7.3 field rules: `fields`/`expand` lists, the `fields` and `expected` maps of the Jira writes.
+//! §7.3 field rules: `fields`/`expand` lists, the `fields`, `update` and `expected` maps of the
+//! Jira writes.
 
 use atlas_duck_registry::{FieldRules, OperationSpec};
 use serde_json::Value;
@@ -105,6 +106,9 @@ fn check_rules(
     if let Some(name) = rules.fields_map_param {
         check_map_keys(name, params, spec.id == "jira.issue.create")?;
     }
+    // T13 review M-2: `update` keys are field ids too; they name the enrichment and stale-check
+    // `?fields=` list, so `-description` or `*all` must not reach it.
+    check_map_keys("update", params, false)?;
     Ok(())
 }
 

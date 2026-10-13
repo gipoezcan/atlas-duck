@@ -37,6 +37,9 @@ pub enum WarningId {
     /// M5 T13 (T6 handoff): an edit diff was cut at its caps, so its lines are not the whole
     /// change.
     DiffTruncated,
+    /// M5 T13 review M-1: an edit section shows what is sent without the field's current value
+    /// (no baseline for it, or an operation list that sets the value), so it is not a diff.
+    NoCurrentValue,
     // Info
     LinkedIssueSummaries,
     CustomFields,
@@ -51,7 +54,7 @@ pub enum WarningId {
 }
 
 impl WarningId {
-    pub const ALL: [WarningId; 30] = [
+    pub const ALL: [WarningId; 31] = [
         WarningId::RestrictedComments,
         WarningId::SecurityLevel,
         WarningId::AllFields,
@@ -73,6 +76,7 @@ impl WarningId {
         WarningId::UserRenamed,
         WarningId::InstanceUrlChanged,
         WarningId::DiffTruncated,
+        WarningId::NoCurrentValue,
         WarningId::LinkedIssueSummaries,
         WarningId::CustomFields,
         WarningId::TruncatedByCap,
@@ -106,7 +110,8 @@ impl WarningId {
             | WarningId::IdentityHeaderLost
             | WarningId::UserRenamed
             | WarningId::InstanceUrlChanged
-            | WarningId::DiffTruncated => Level::Caution,
+            | WarningId::DiffTruncated
+            | WarningId::NoCurrentValue => Level::Caution,
             WarningId::LinkedIssueSummaries
             | WarningId::CustomFields
             | WarningId::TruncatedByCap
@@ -245,6 +250,12 @@ pub fn raw_only_diff(n: u64) -> String {
 /// Request tab holds every byte that is sent.
 pub fn diff_truncated(n: u64) -> String {
     format!("diff truncated: {n} bytes not shown (see Request)")
+}
+
+/// plan text (M5 T13 review M-1): "N fields shown as sent, without their current value"; such a
+/// section lists the sent value (or operations) as added lines only.
+pub fn no_current_value(n: u64) -> String {
+    format!("{n} fields shown as sent, without their current value")
 }
 
 /// "this update will remove N macros / M images / K links" (§7.6)

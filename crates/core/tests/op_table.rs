@@ -1493,7 +1493,8 @@ fn edit_conflict_diff_is_capped() -> TestResult {
     let (_, v) = enrich("jira.issue.edit", &params, &[issue])?;
     assert_eq!(v.hold, Hold::Conflict);
     assert!(v.diff_text.len() <= DIFF_TEXT_CAP_BYTES);
-    assert!(v.diff_text.ends_with('…'));
+    // T13 review M-5: the long `+ current` line is cut at its own budget and marked there.
+    assert!(v.diff_text.ends_with("…\n"), "{:?}", v.diff_text.get(..80));
     Ok(())
 }
 

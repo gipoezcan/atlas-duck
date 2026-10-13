@@ -242,6 +242,33 @@ fn u33_create_fields_map_keys() -> TestResult {
         edit(json!({}), json!({"x y": 1})),
     )?)?;
     assert_eq!(param(&e), Some("expected.x y"));
+    // T13 review M-2: `update` keys are field ids too (they name the enrichment and stale GET
+    // `?fields=` list), so `-description` or `*all` cannot alter what is read.
+    let update = |update: Value| json!({"key": "ABC-1", "update": update});
+    assert!(check("jira.issue.edit", update(json!({"labels": [{"add": "x"}]})))?.is_ok());
+    assert!(
+        check(
+            "jira.issue.edit",
+            update(json!({"customfield_7": [{"set": 1}]}))
+        )?
+        .is_ok()
+    );
+    for bad in [
+        "-description",
+        "*all",
+        "*navigable",
+        "nope",
+        "customfield_x",
+        "a,b",
+    ] {
+        let e = rejected(check("jira.issue.edit", update(json!({ bad: [] })))?)?;
+        assert_eq!(e.code, ErrorCode::Validation, "{bad}");
+        assert!(
+            param(&e).is_some_and(|p| p.starts_with("update")),
+            "{bad}: {:?}",
+            param(&e)
+        );
+    }
     Ok(())
 }
 

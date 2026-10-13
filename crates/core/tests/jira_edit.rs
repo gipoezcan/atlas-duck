@@ -169,18 +169,38 @@ fn warning(m: &PreviewModel, id: WarningId) -> Option<&str> {
 
 // ---- PD-50: the `expected` equality -----------------------------------------------------------
 
-/// PD-50 / L59: an integer JCS refuses (beyond ±(2^53−1)) never equals anything, not even
-/// itself: the conflict state (fail closed). `1.0` and `1` have the same JCS bytes: equal.
+/// PD-50 (T13 review M-4): an integer JCS refuses (beyond ±(2^53−1)) equals exactly the same
+/// integer and nothing else (no rounding: a neighbour or a float of it differs, the conflict
+/// state). `1.0` and `1` have the same JCS bytes: equal. (L59 keeps such integers out of agent
+/// params, so through the engine only the current value can hold one.)
 #[test]
-fn expected_over_range_integer_is_conflict() -> TestResult {
+fn expected_over_range_integer_compares_exactly() -> TestResult {
     let big = json!({"customfield_1": 9_007_199_254_740_993_u64});
     let params = json!({"key": KEY, "fields": {"summary": "S"}, "expected": big});
     let (_, v) = judge(&params, &issue_with_fields(big.clone()))?;
-    assert_eq!(v.hold, Hold::Conflict);
-    assert_eq!(
-        v.conflict.as_deref(),
-        Some("conflict: fields changed since the agent read it: customfield_1")
-    );
+    assert_eq!(v.hold, Hold::Preview);
+    for other in [
+        json!(9_007_199_254_740_992_u64),
+        json!(9_007_199_254_740_993.0_f64),
+        json!("9007199254740993"),
+    ] {
+        let (_, v) = judge(
+            &params,
+            &issue_with_fields(json!({ "customfield_1": other })),
+        )?;
+        assert_eq!(v.hold, Hold::Conflict, "{other}");
+        assert_eq!(
+            v.conflict.as_deref(),
+            Some("conflict: fields changed since the agent read it: customfield_1")
+        );
+    }
+    // Nested and mixed with safe values (key order free, `2.0` = `2`).
+    let nested = json!({"customfield_1": {"n": -9_007_199_254_740_993_i64, "m": [2.0, "x"]}});
+    let params = json!({"key": KEY, "fields": {"summary": "S"}, "expected": nested});
+    let current: Value =
+        serde_json::from_str(r#"{"customfield_1":{"m":[2,"x"],"n":-9007199254740993}}"#)?;
+    let (_, v) = judge(&params, &issue_with_fields(current))?;
+    assert_eq!(v.hold, Hold::Preview);
     // A safe integer read back as a float is the same number in JCS.
     let params = json!({"key": KEY, "fields": {"summary": "S"},
                         "expected": {"customfield_2": 1.0}});
@@ -228,6 +248,35 @@ fn conflict_diff_is_the_raw_diff_of_expected_and_current() -> TestResult {
         }
         other => return Err(format!("not the conflict card: {other:?}").into()),
     }
+    Ok(())
+}
+
+/// T13 review M-5/M-6: a long value's `- read` line cannot use the whole card cap: each side has
+/// its own budget (escaped bytes), so the `+ current` line shows too; a cut line ends in `…`.
+#[test]
+fn conflict_diff_keeps_both_sides_of_a_long_value() -> TestResult {
+    let read = format!("{}\u{200B}", "r".repeat(20 * 1024));
+    let now = "c".repeat(20 * 1024);
+    let params = json!({"key": KEY, "fields": {"description": "x"},
+                        "expected": {"description": read}});
+    let (_, v) = judge(&params, &issue_with_fields(json!({"description": now})))?;
+    assert_eq!(v.hold, Hold::Conflict);
+    let t = &v.diff_text;
+    assert!(t.len() <= 16 * 1024, "{}", t.len());
+    assert!(
+        t.starts_with("description (- read, + current)\n- \"rrr"),
+        "{t:.80}"
+    );
+    assert!(t.contains("…\n+ \"ccc"), "the current side shows");
+    // Escaped widths count: 6 KiB of zero-width spaces stay within the cap as well.
+    let read = "\u{200B}".repeat(6 * 1024);
+    let params = json!({"key": KEY, "fields": {"description": "x"},
+                        "expected": {"description": read}});
+    let (_, v) = judge(&params, &issue_with_fields(json!({"description": "now"})))?;
+    let t = &v.diff_text;
+    assert!(t.len() <= 16 * 1024, "{}", t.len());
+    assert!(t.contains("\n+ \"now\"\n"), "{t:.200}");
+    assert_eq!(t.matches('⟨').count(), t.matches('⟩').count());
     Ok(())
 }
 
@@ -390,6 +439,233 @@ fn raw_only_hunk_beside_a_visible_change_is_flagged() -> TestResult {
     Ok(())
 }
 
+/// T13 review I-1: an invisible change on a line next to a visible one falls into the same source
+/// hunk; each changed line whose own projection the rendered diff does not show counts (equal
+/// Del/Add counts also pairwise), so the Caution fires. Plain edits, list items, a visible
+/// emphasis change and a new paragraph stay without it.
+#[test]
+fn raw_only_line_next_to_a_visible_change_is_flagged() -> TestResult {
+    for (old, new) in [
+        ("Steps\n*important*", "Steps v2\nimportant"),
+        ("Steps\nsee {color:red}x{color}", "Steps v2\nsee x"),
+        ("x\na", "y\na "),
+        (
+            "t\n{panel:title=x|bg=green}x{panel}",
+            "T\n{panel:title=x|bg=red}x{panel}",
+        ),
+        // Unequal line counts: a line that renders as nothing removed beside a visible edit.
+        ("a\n{color:red}{color}", "b"),
+        // Unequal line counts: an emphasis removed next to a removed line.
+        ("Steps\n*imp*\nz", "Steps v2\nimp"),
+        // The separated case (T13).
+        ("a\nb\nc\nd", "a\nX\nc\n{color:red}d{color}"),
+    ] {
+        let params = json!({"key": KEY, "fields": {"description": new}});
+        let m = preview(&params, json!({"description": old}))?;
+        let d = diffs(&m)?;
+        assert!(
+            count(&d.rendered, DiffOp::Del) + count(&d.rendered, DiffOp::Add) > 0,
+            "{new:?}: a visible change too"
+        );
+        assert!(d.raw_only_changes >= 1, "{old:?} -> {new:?}");
+        let w = m
+            .warnings
+            .iter()
+            .find(|w| w.id == WarningId::RawOnlyDiff)
+            .ok_or_else(|| format!("no raw_only_diff for {old:?} -> {new:?}"))?;
+        assert_eq!(w.level, Level::Caution);
+    }
+    for (old, new) in [
+        ("a\nb", "c\nd"),
+        ("Steps\nimportant", "Steps v2\nimportant!"),
+        ("# one\n# two\n# three", "# one\n# two\n# four"),
+        ("* a\n* b", "* a\n* c\n* d"),
+        ("*a* b\nc", "*a* x\nc"),
+        ("a", "a\n\nb"),
+        ("h1. Title\ntext", "h1. Title v2\ntext more"),
+    ] {
+        let params = json!({"key": KEY, "fields": {"description": new}});
+        let m = preview(&params, json!({"description": old}))?;
+        assert_eq!(diffs(&m)?.raw_only_changes, 0, "{old:?} -> {new:?}");
+        assert_eq!(
+            warning(&m, WarningId::RawOnlyDiff),
+            None,
+            "{old:?} -> {new:?}"
+        );
+    }
+    Ok(())
+}
+
+/// T13 review M-3: `summary` is plain text in Jira (shown verbatim), so its rendered view is the
+/// text itself: asterisks and link brackets show, and no raw-only Caution is raised for them.
+#[test]
+fn summary_rendered_view_is_literal() -> TestResult {
+    let params = json!({"key": KEY, "fields": {"summary": "Fix *login*"}});
+    let m = preview(&params, json!({"summary": "Fix login"}))?;
+    let d = diffs(&m)?;
+    assert_eq!(
+        d.rendered,
+        [
+            l(DiffOp::Field, "fields.summary"),
+            l(DiffOp::Del, "Fix login"),
+            l(DiffOp::Add, "Fix *login*"),
+        ]
+    );
+    assert_eq!(d.raw_only_changes, 0);
+    assert_eq!(warning(&m, WarningId::RawOnlyDiff), None);
+    let params = json!({"key": KEY, "fields": {"summary": "Fix x v2 [t|https://e.invalid]"}});
+    let m = preview(&params, json!({"summary": "Fix *x* v1"}))?;
+    let d = diffs(&m)?;
+    assert!(
+        d.rendered.contains(&l(DiffOp::Del, "Fix *x* v1")),
+        "{:?}",
+        d.rendered
+    );
+    assert!(
+        d.rendered
+            .contains(&l(DiffOp::Add, "Fix x v2 [t|https://e.invalid]")),
+        "{:?}",
+        d.rendered
+    );
+    assert_eq!(d.raw_only_changes, 0);
+    // `description` keeps the wiki projection.
+    let params = json!({"key": KEY, "fields": {"description": "Fix *login*"}});
+    let m = preview(&params, json!({"description": "Fix login"}))?;
+    assert_eq!(diffs(&m)?.raw_only_changes, 1);
+    Ok(())
+}
+
+/// T13 review M-1: `update.<id>: [{"set": v}]` replaces the value like `fields.<id>`, so it is
+/// diffed against the current value (rendered projection, raw-only count). Other operation lists
+/// stay raw JSON lines.
+#[test]
+fn update_set_is_diffed_against_the_current_value() -> TestResult {
+    let params = json!({"key": KEY, "update": {"description": [{"set": "a\nc"}]}});
+    let m = preview(&params, json!({"description": "a\nb"}))?;
+    let d = diffs(&m)?;
+    assert_eq!(
+        d.rendered,
+        [
+            l(DiffOp::Field, "update.description"),
+            l(DiffOp::Same, "a\n"),
+            l(DiffOp::Del, "b"),
+            l(DiffOp::Add, "c"),
+        ]
+    );
+    assert_eq!(
+        d.raw,
+        [
+            l(DiffOp::Field, "update.description"),
+            l(DiffOp::Del, "\"a\\nb\""),
+            l(DiffOp::Add, "\"a\\nc\""),
+        ]
+    );
+    assert_eq!(d.raw_only_changes, 0);
+    // An invisible change through `set` counts like one through `fields`.
+    let params = json!({"key": KEY, "update": {"description": [{"set": "Steps v2\nimportant"}]}});
+    let m = preview(&params, json!({"description": "Steps\n*important*"}))?;
+    assert!(diffs(&m)?.raw_only_changes >= 1);
+    assert!(warning(&m, WarningId::RawOnlyDiff).is_some());
+    Ok(())
+}
+
+/// T13 review M-1: a section without a current value (the baseline lacks the id, or a list of
+/// several operations that sets the value) shows what is sent as raw Add lines and raises a
+/// visible Caution saying no current value was compared.
+#[test]
+fn edit_without_a_baseline_says_so() -> TestResult {
+    let params = json!({"key": KEY, "fields": {"description": "short"}});
+    let (_, mut v) = judge(
+        &params,
+        &issue_with_fields(json!({"description": "long text"})),
+    )?;
+    v.baseline = json!({});
+    let m = preview_of(&params, &v)?;
+    let d = diffs(&m)?;
+    let shown = [
+        l(DiffOp::Field, "fields.description"),
+        l(DiffOp::Add, "\"short\""),
+    ];
+    assert_eq!(d.raw, shown);
+    assert_eq!(d.rendered, shown);
+    let caution = m
+        .warnings
+        .iter()
+        .find(|w| w.level == Level::Caution && w.text.contains("current value"))
+        .ok_or("no Caution for the missing baseline")?;
+    assert_eq!(caution.id, WarningId::NoCurrentValue);
+    assert_eq!(
+        caution.text,
+        "1 fields shown as sent, without their current value"
+    );
+    // Several operations on a text field: shown raw, the same Caution.
+    let params = json!({"key": KEY, "update": {"description": [{"set": "a"}, {"set": "b"}]}});
+    let m = preview(&params, json!({"description": "x"}))?;
+    let d = diffs(&m)?;
+    assert_eq!(count(&d.raw, DiffOp::Del), 0);
+    assert!(
+        m.warnings
+            .iter()
+            .any(|w| w.text == "1 fields shown as sent, without their current value"),
+        "{:?}",
+        m.warnings
+    );
+    Ok(())
+}
+
+/// T13 review M-6: a view's per-kind budget counts the escaped bytes (an invisible char widens
+/// to `⟨U+XXXX⟩`), so a view stays at its cap; a cut never splits an escape.
+#[test]
+fn diff_budgets_count_escaped_bytes() -> TestResult {
+    let zw = "\u{200B}".repeat(700 * 1024);
+    let params = json!({"key": KEY, "fields": {"description": zw}});
+    let m = preview(&params, json!({"description": ""}))?;
+    let d = diffs(&m)?;
+    for lines in [&d.raw, &d.rendered] {
+        let added: usize = lines
+            .iter()
+            .filter(|l| l.op == DiffOp::Add)
+            .map(|l| l.text.len())
+            .sum();
+        assert!(added <= 1024 * 1024, "{added}");
+        for l in lines.iter() {
+            assert_eq!(
+                l.text.matches('⟨').count(),
+                l.text.matches('⟩').count(),
+                "an escape split at the cut"
+            );
+        }
+    }
+    assert!(warning(&m, WarningId::DiffTruncated).is_some());
+    assert!(m.header.hidden_in_preview_bytes > 0);
+    Ok(())
+}
+
+/// T13 review M-7: the heading cap applies to the whole heading, ` (unchanged)` included, and the
+/// suffix stays visible after the cut marker.
+#[test]
+fn unchanged_heading_stays_within_the_cap() -> TestResult {
+    let long = format!("customfield_{}", "9".repeat(300));
+    let params = json!({"key": KEY, "fields": {long.clone(): "same"}});
+    let m = preview(&params, json!({ long: "same" }))?;
+    let d = diffs(&m)?;
+    let [heading] = d.raw.as_slice() else {
+        return Err(format!("{:?}", d.raw).into());
+    };
+    assert_eq!(heading.op, DiffOp::Field);
+    assert!(
+        heading.text.ends_with("… (unchanged)"),
+        "{:?}",
+        heading.text
+    );
+    assert!(
+        heading.text.chars().count() <= 256,
+        "{}",
+        heading.text.len()
+    );
+    Ok(())
+}
+
 /// `update` operations (labels add/remove) are sent verbatim and shown as raw JSON lines; the
 /// rendered side reuses them, so nothing the raw diff shows is missing from the rendered one.
 #[test]
@@ -418,6 +694,8 @@ fn labels_update_shown_raw() -> TestResult {
     assert_eq!(d.rendered, ops);
     assert_eq!(count(&d.raw, DiffOp::Del), 0);
     assert_eq!(d.raw_only_changes, 0);
+    // Add/remove lists name their own effect: no missing-baseline Caution.
+    assert!(m.warnings.is_empty(), "{:?}", m.warnings);
     Ok(())
 }
 
@@ -510,7 +788,8 @@ fn truncated_diff_is_a_caution() -> TestResult {
 
 /// §5.4 step 5 / PD-50: the stale rule compares the baseline with the same equality as the
 /// `expected` check: a value re-serialized (other key order, `5` read back as `5.0`) is
-/// unchanged; a changed value names its id; an over-range integer differs.
+/// unchanged; a changed value names its id; an over-range integer read back unchanged is
+/// unchanged (T13 review M-4: never permanently stale), a different one is changed.
 #[test]
 fn stale_edit_uses_same_equality() -> TestResult {
     let params = json!({"key": KEY, "fields": {"priority": {"id": "4"}}});
@@ -531,10 +810,17 @@ fn stale_edit_uses_same_equality() -> TestResult {
         StaleVerdict::Unchanged => return Err("a changed priority is unchanged".into()),
     }
     let big = json!({"customfield_1": 9_007_199_254_740_993_u64});
-    assert!(matches!(
+    assert_eq!(
         stale(&params, &big, &issue_with_fields(big.clone()))?,
-        StaleVerdict::Changed { .. }
-    ));
+        StaleVerdict::Unchanged
+    );
+    let moved = issue_with_fields(json!({"customfield_1": 9_007_199_254_740_995_u64}));
+    match stale(&params, &big, &moved)? {
+        StaleVerdict::Changed { delta } => {
+            assert_eq!(delta, "fields changed since review: customfield_1");
+        }
+        StaleVerdict::Unchanged => return Err("a changed big integer is unchanged".into()),
+    }
     Ok(())
 }
 
@@ -727,12 +1013,15 @@ async fn i36_conflict_deny_prefill_and_exit3() -> TestResult {
     // Opacity (§4.5): the conflict text and the diff reach no envelope.
     let line = env.to_json_line();
     assert!(!line.contains("Login page times out"), "{line}");
+    assert!(!line.contains("Old"), "{line}");
+    assert!(!line.contains("conflict:"), "{line}");
     assert!(puts(mock).await.is_empty());
     Ok(())
 }
 
-/// I-36: equal `expected` values (an object given in another key order) leave the edit
-/// approvable; the preview is the edit diff; a 204 with no body is `succeeded` with receipt `{}`.
+/// I-36: equal `expected` values (an object given in another key order, and a nested `4.0`
+/// where Jira has `4`, which plain `Value` equality calls different) leave the edit approvable;
+/// the preview is the edit diff; a 204 with no body is `succeeded` with receipt `{}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i36_expected_match_approvable() -> TestResult {
     let h = Harness::jira().await?;
@@ -746,8 +1035,14 @@ async fn i36_expected_match_approvable() -> TestResult {
         .await;
     let params: Value = serde_json::from_str(
         r#"{"key":"ABC-1","fields":{"priority":{"id":"4"}},
-            "expected":{"priority":{"name":"Major","id":"3"},"summary":"Login page times out"}}"#,
+            "expected":{"priority":{"name":"Major","id":"3"},"summary":"Login page times out",
+                        "status":{"statusCategory":{"name":"In Progress","key":"indeterminate","id":4.0},
+                                  "id":"3","name":"In Progress",
+                                  "self":"https://jira.corp.example/rest/api/2/status/3"}}}"#,
     )?;
+    // The discriminator: M3's `Value` comparison would call this a conflict.
+    let fixture: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+    assert_ne!(params["expected"]["status"], fixture["fields"]["status"]);
     let id = queued(&h, params).await?;
     let p = h.approver().open(&id).map_err(de)?.preview;
     assert!(p.approvable);
@@ -758,7 +1053,10 @@ async fn i36_expected_match_approvable() -> TestResult {
     // The enrichment GET named every edited and expected id and no `expand`.
     let gets = gets_on(mock, &issue_path(KEY)).await;
     let first = gets.first().ok_or("no enrichment GET")?;
-    assert_eq!(query(first, "fields").as_deref(), Some("priority,summary"));
+    assert_eq!(
+        query(first, "fields").as_deref(),
+        Some("priority,status,summary")
+    );
     assert_eq!(query(first, "expand"), None);
     h.approver().approve(&id).map_err(de)?;
     let env = h.await_(&id, 10_000).await;

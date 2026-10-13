@@ -193,7 +193,7 @@ pub(crate) const ISSUE_EDIT_PARAMS: &str = r#"{"$schema":"https://json-schema.or
  "properties":{
   "key":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},
   "fields":{"type":"object","propertyNames":{"pattern":"^([a-z][A-Za-z0-9_]*|customfield_[0-9]+)$"}},
-  "update":{"type":"object","description":"Jira update operations, e.g. {\"labels\":[{\"add\":\"x\"}]}."},
+  "update":{"type":"object","propertyNames":{"pattern":"^([a-z][A-Za-z0-9_]*|customfield_[0-9]+)$"},"description":"Jira update operations, e.g. {\"labels\":[{\"add\":\"x\"}]}."},
   "expected":{"type":"object","description":"{field id: value as read}; a mismatch at enrichment puts the request in the conflict state. Recommended for every edited field, especially description."}},
  "examples":[{"key":"ABC-123","fields":{"summary":"Login fails after reset"},"expected":{"summary":"Login fails after password reset"}}]}"#;
 

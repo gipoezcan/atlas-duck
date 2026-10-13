@@ -706,13 +706,40 @@ fn edit_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
 }
 
 /// PD-50 (§5.4 step 2 "compared like the step 5 rule"): two field values are equal when their
-/// JCS bytes are. A value JCS refuses (an integer beyond ±(2^53−1)) equals nothing, not even
-/// itself (L59: fail closed into the conflict state, or `Changed` in the stale rule). The
-/// caller passes `null` for an absent field.
+/// JCS bytes are. A value JCS refuses (an integer beyond ±(2^53−1)) is compared member by
+/// member with the same rule, and such an integer equals exactly the same integer only (T13
+/// review M-4: a current value holding one must not make the edit stale forever; nothing is
+/// rounded, so a neighbour or a float of it differs). The caller passes `null` for an absent
+/// field.
 pub(crate) fn field_values_equal(a: &Value, b: &Value) -> bool {
     match (to_jcs_vec(a), to_jcs_vec(b)) {
         (Ok(a), Ok(b)) => a == b,
-        _ => false,
+        _ => wide_equal(a, b),
+    }
+}
+
+/// [`field_values_equal`] without the whole-value JCS: objects by key set and members, arrays
+/// by position, leaves by their JCS bytes, an over-range integer by its exact value.
+fn wide_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| wide_equal(v, w)))
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(v, w)| wide_equal(v, w))
+        }
+        (Value::Number(x), Value::Number(y)) => match (to_jcs_vec(a), to_jcs_vec(b)) {
+            (Ok(a), Ok(b)) => a == b,
+            // Integers only: serde keeps them exact as i64/u64.
+            _ => match (x.as_i64(), y.as_i64(), x.as_u64(), y.as_u64()) {
+                (Some(x), Some(y), _, _) => x == y,
+                (_, _, Some(x), Some(y)) => x == y,
+                _ => false,
+            },
+        },
+        _ => a == b,
     }
 }
 
@@ -722,24 +749,71 @@ pub(crate) fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
+/// `s` display-escaped and cut to at most `budget` bytes of escaped text, never inside an
+/// escape: the escaped text kept and how many bytes of `s` it shows (T13 review M-6: a budget
+/// counts what is shown, and an escape widens a char up to 12 bytes).
+pub(crate) fn escaped_prefix(s: &str, budget: usize) -> (String, usize) {
+    let escaped = escape_for_display(s);
+    if escaped.len() <= budget {
+        return (escaped, s.len());
+    }
+    // `escape_for_display` writes each char either as itself or as one `⟨U+XXXX⟩`, and every
+    // `⟨` it writes starts an escape (a literal `⟨` is escaped too).
+    let (mut shown, mut taken) = (0usize, 0usize);
+    let mut rest = escaped.as_str();
+    for c in s.chars() {
+        let width = if rest.starts_with('⟨') {
+            rest.find('⟩').map_or(rest.len(), |i| i + '⟩'.len_utf8())
+        } else {
+            rest.chars().next().map_or(0, char::len_utf8)
+        };
+        if width == 0 || shown + width > budget {
+            break;
+        }
+        shown += width;
+        taken += c.len_utf8();
+        rest = rest.get(width..).unwrap_or("");
+    }
+    (escaped.get(..shown).unwrap_or("").to_owned(), taken)
+}
+
+/// Escaped bytes of conflict-card line text kept per kind (context, `- read`, `+ current`);
+/// what is left of [`DIFF_TEXT_CAP_BYTES`] carries the headings and marks (T13 review M-5: a
+/// long `- read` line cannot push the `+ current` one out).
+const CONFLICT_KIND_BYTES: usize = (DIFF_TEXT_CAP_BYTES - 1024) / 3;
+
 /// The conflict card's diff of one field (§6.3 Conflict): the raw diff (PD-51's pretty JSON)
 /// of what the agent read against the current value, under a `<id> (- read, + current)` line;
-/// one text line per diff line, `-`/`+`/space marked. Not yet escaped. A `line_diff` cut at its
-/// caps (a middle over `DIFF_MAX_LINES` lines or 4 MiB) gives far more than
-/// [`DIFF_TEXT_CAP_BYTES`], so the card's cap and its `…` always mark such a diff as cut.
-fn conflict_diff(id: &str, read: &Value, current: &Value) -> String {
-    let mut out = format!("{id} (- read, + current)\n");
+/// one display-escaped text line per diff line, `-`/`+`/space marked. Each kind of line draws
+/// on its own budget in `left` (escaped bytes, across fields); the line a budget cuts ends in
+/// `…` and later lines of that kind are left out (`None`). A `line_diff` cut at its caps (a
+/// middle over `DIFF_MAX_LINES` lines or 4 MiB) is far over these budgets, so its `…` marks it
+/// as cut.
+fn conflict_diff(id: &str, read: &Value, current: &Value, left: &mut [Option<usize>; 3]) -> String {
+    let mut out = format!("{} (- read, + current)\n", escape_for_display(id));
     for line in line_diff(&pretty(read), &pretty(current)).lines {
-        let mark = match line.op {
-            DiffOp::Del => "- ",
-            DiffOp::Add => "+ ",
-            DiffOp::Same | DiffOp::Field => "  ",
+        let (mark, slot) = match line.op {
+            DiffOp::Del => ("- ", 1),
+            DiffOp::Add => ("+ ", 2),
+            DiffOp::Same | DiffOp::Field => ("  ", 0),
         };
+        let Some(budget) = left.get_mut(slot) else {
+            continue;
+        };
+        let Some(bytes) = budget else {
+            continue;
+        };
+        let text = line.text.strip_suffix('\n').unwrap_or(&line.text);
+        let (kept, taken) = escaped_prefix(text, *bytes);
         out.push_str(mark);
-        out.push_str(&line.text);
-        if !line.text.ends_with('\n') {
-            out.push('\n');
+        out.push_str(&kept);
+        if taken < text.len() {
+            out.push('…');
+            *budget = None;
+        } else {
+            *bytes -= kept.len();
         }
+        out.push('\n');
     }
     out
 }
@@ -761,6 +835,7 @@ fn edit_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
 
     let mut changed = Vec::new();
     let mut diff = String::new();
+    let mut left = [Some(CONFLICT_KIND_BYTES); 3];
     for (id, expected) in ctx
         .params
         .get("expected")
@@ -774,7 +849,7 @@ fn edit_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
             // The cap below bounds what is kept; this bounds the work: once the text is past
             // it, later fields are only named in the summary.
             if diff.len() <= DIFF_TEXT_CAP_BYTES {
-                diff.push_str(&conflict_diff(id, expected, &now));
+                diff.push_str(&conflict_diff(id, expected, &now, &mut left));
             }
         }
     }
@@ -790,7 +865,7 @@ fn edit_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
             .warnings
             .push(Warning::new(WarningId::Conflict, summary.clone()));
         verdict.conflict = Some(summary);
-        verdict.diff_text = cap_diff_text(&escape_for_display(&diff));
+        verdict.diff_text = cap_diff_text(&diff);
     }
     verdict
 }
