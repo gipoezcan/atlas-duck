@@ -611,3 +611,41 @@ async fn jira_identity_is_checked_on_every_page() -> TestResult {
     }
     Ok(())
 }
+
+/// M3 T10 minor 4 / V05: a server that echoes a `maxResults` larger than the one requested (here
+/// on the last page before `max_items`) and returns exactly what was asked is not at the end of
+/// the results: the page was full for the request, so `next_start` points on.
+#[tokio::test]
+async fn short_last_page_is_not_end_of_results() -> TestResult {
+    let dc = MockDc::start(Product::Jira, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/agile/1.0/board"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "startAt").unwrap_or(0);
+            let want = param(req, "maxResults").unwrap_or(0);
+            // 500 boards; the server names its own page size (100) in `maxResults`.
+            let count = want.min(500u64.saturating_sub(start));
+            ok.clone().set_body_raw(
+                jira_board_page(start, 100, Some(500), count),
+                "application/json",
+            )
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let cover = test_cover()?;
+    let out = t
+        .client
+        .read_paginated_ctl(
+            &cover,
+            &board_call(50, 0),
+            &ReadBudget::default(),
+            60,
+            &FetchControl::new(),
+        )
+        .await;
+    assert_eq!(out.end, PageEnd::MaxReached);
+    assert_eq!(out.items_fetched, 60);
+    assert_eq!(out.next_start, Some(60));
+    Ok(())
+}

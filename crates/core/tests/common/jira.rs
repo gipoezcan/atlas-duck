@@ -212,3 +212,52 @@ pub fn full_issue(key: &str) -> Value {
 pub fn restriction() -> Value {
     json!({"type": "role", "value": "Administrators"})
 }
+
+/// `POST /rest/api/2/search` answers pages of `total` issues ABC-1.. from the body's
+/// `startAt`/`maxResults`; each issue's `fields` is `fields(n)` for its zero-based number `n`.
+pub async fn mount_search(
+    mock: &MockDc,
+    total: u64,
+    fields: impl Fn(u64) -> Value + Send + Sync + 'static,
+) {
+    let ok = mock.response(200);
+    Mock::given(method("POST"))
+        .and(path(mock.path("/rest/api/2/search")))
+        .respond_with(move |req: &wiremock::Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let start = body["startAt"].as_u64().unwrap_or(0);
+            let max = body["maxResults"].as_u64().unwrap_or(50);
+            let count = max.min(total.saturating_sub(start));
+            let issues: Vec<Value> = (start..start + count)
+                .map(|n| {
+                    json!({
+                        "id": (10_001 + n).to_string(),
+                        "key": format!("ABC-{}", n + 1),
+                        "self": format!("https://jira.corp.example/rest/api/2/issue/{}", 10_001 + n),
+                        "fields": fields(n)
+                    })
+                })
+                .collect();
+            let page = json!({
+                "startAt": start, "maxResults": max, "total": total, "issues": issues
+            });
+            ok.clone().set_body_raw(page.to_string(), "application/json")
+        })
+        .mount(mock.server())
+        .await;
+}
+
+/// The `startAt` of every `POST /rest/api/2/search` the mock received, in arrival order.
+pub async fn search_starts(mock: &MockDc) -> Vec<u64> {
+    let full = mock.path("/rest/api/2/search");
+    mock.received()
+        .await
+        .into_iter()
+        .filter(|r| r.url.path() == full && r.method.as_str() == "POST")
+        .filter_map(|r| {
+            serde_json::from_slice::<Value>(&r.body)
+                .ok()
+                .and_then(|b| b["startAt"].as_u64())
+        })
+        .collect()
+}

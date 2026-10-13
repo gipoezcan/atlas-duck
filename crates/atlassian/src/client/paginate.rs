@@ -234,11 +234,13 @@ impl InstanceClient {
             };
             start = start.saturating_add(returned);
 
-            // End-of-results signals (§7.2); `_links.next` is not one we read.
+            // End-of-results signals (§7.2); `_links.next` is not one we read. A page is short
+            // against what was asked and what the server applies, whichever is smaller (V05: a
+            // server may echo a larger page size than the request's).
             let ended = facts.items == 0
                 || returned == 0
                 || facts.is_last == Some(true)
-                || facts.limit.is_some_and(|l| returned < l)
+                || facts.limit.is_some_and(|l| returned < l.min(want))
                 || facts.total.is_some_and(|t| start >= t);
             if ended {
                 out.end = PageEnd::ResultsEnded;

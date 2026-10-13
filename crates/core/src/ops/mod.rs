@@ -360,9 +360,27 @@ const LATER_WRITE: OpImpl = OpImpl {
 
 /// One entry per registry id, in registry order (U-05: `tests/op_table.rs` checks the set).
 static ENTRIES: &[(&str, OpImpl)] = &[
-    ("jira.myself", READ),
-    ("jira.project.list", READ),
-    ("jira.project.get", READ),
+    (
+        "jira.myself",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.project.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.project.get",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
     (
         "jira.issue.get",
         OpImpl {
@@ -371,21 +389,111 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             ..READ
         },
     ),
-    ("jira.search", READ),
-    ("jira.comment.list", READ),
-    ("jira.worklog.list", READ),
-    ("jira.transition.list", READ),
-    ("jira.issue.editmeta", READ),
-    ("jira.createmeta.issuetypes", READ),
-    ("jira.createmeta.fields", READ),
-    ("jira.field.list", READ),
-    ("jira.issuelinktype.list", READ),
-    ("jira.attachment.meta", READ),
-    ("jira.user.assignable", READ),
-    ("jira.board.list", READ),
-    ("jira.sprint.list", READ),
-    ("jira.sprint.issues", READ),
-    ("jira.backlog.issues", READ),
+    (
+        "jira.search",
+        OpImpl {
+            previewer: jira_preview::search_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.comment.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.worklog.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.transition.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.issue.editmeta",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.createmeta.issuetypes",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.createmeta.fields",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.field.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.issuelinktype.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.attachment.meta",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.user.assignable",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.board.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.sprint.list",
+        OpImpl {
+            previewer: jira_preview::list_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.sprint.issues",
+        OpImpl {
+            previewer: jira_preview::search_preview,
+            ..READ
+        },
+    ),
+    (
+        "jira.backlog.issues",
+        OpImpl {
+            previewer: jira_preview::search_preview,
+            ..READ
+        },
+    ),
     (
         "jira.issue.create",
         OpImpl {

@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use atlas_duck_atlassian::Timeouts;
 use atlas_duck_atlassian::testing::{
     MockDc, RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, XAuser, fixtures,
 };
+use atlas_duck_atlassian::{ReadBudget, Timeouts};
 use atlas_duck_audit::EventType;
 use atlas_duck_audit::testing::Faults;
 use atlas_duck_core::TestHooks;
@@ -346,6 +346,68 @@ async fn i09_probe_cancel_envelopes_identical() -> TestResult {
     assert_cancelled(&big.handler().cancel(&probe).await);
     let (e1, s1) = probe_cancel(&big, params.clone()).await?;
     let (e2, s2) = probe_cancel(&empty, params).await?;
+    assert_eq!(e1, e2);
+    assert_eq!(s1, s2);
+    Ok(())
+}
+
+/// I-09 for `jira.search`: a probe that matches a lot and runs out of the read budget on page 2
+/// (an outcome item) and a probe that matches nothing are told apart by a cancel no more than by
+/// `status`. The budget probe's JQL has an OR predicate, the empty one cannot match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i09_jira_search_budget_probe_cancel_identical() -> TestResult {
+    let budget = || ReadBudget {
+        total: Duration::from_millis(300),
+        ..ReadBudget::default()
+    };
+    let slow = Harness::builder()
+        .jira("jira-main")
+        .read_budget(budget())
+        .start()
+        .await?;
+    // Full pages, each 200 ms late: the second one outlives the 300 ms budget.
+    Mock::given(method("POST"))
+        .and(path(jira(&slow)?.path("/rest/api/2/search")))
+        .respond_with(
+            jira(&slow)?
+                .response(200)
+                .set_body_raw(
+                    fixtures::jira_search_page(0, 50, 1000, 50),
+                    "application/json",
+                )
+                .set_delay(Duration::from_millis(200)),
+        )
+        .mount(jira(&slow)?.server())
+        .await;
+    let empty = Harness::builder()
+        .jira("jira-main")
+        .read_budget(budget())
+        .start()
+        .await?;
+    jira(&empty)?
+        .json(
+            "/rest/api/2/search",
+            200,
+            r#"{"startAt":0,"maxResults":50,"total":0,"issues":[]}"#,
+        )
+        .await;
+    let or_jql = json!({ "jql": "project = ABC OR assignee = currentUser()", "max": 500 });
+    let none_jql = json!({ "jql": "project = NONE AND key = ABC-1", "max": 500 });
+    // The budget probe really is an outcome item, the empty one a result item.
+    let probe = queued(&slow, SEARCH, or_jql.clone()).await?;
+    let item = |h: &Harness, id: &str| {
+        h.engine()
+            .entry(id)
+            .and_then(|e| e.state().read.as_ref().map(|r| r.item))
+    };
+    assert_eq!(item(&slow, &probe), Some(ReleaseItem::Outcome));
+    assert_cancelled(&slow.handler().cancel(&probe).await);
+    let control = queued(&empty, SEARCH, none_jql.clone()).await?;
+    assert_eq!(item(&empty, &control), Some(ReleaseItem::Result));
+    assert_cancelled(&empty.handler().cancel(&control).await);
+
+    let (e1, s1) = probe_cancel(&slow, or_jql).await?;
+    let (e2, s2) = probe_cancel(&empty, none_jql).await?;
     assert_eq!(e1, e2);
     assert_eq!(s1, s2);
     Ok(())

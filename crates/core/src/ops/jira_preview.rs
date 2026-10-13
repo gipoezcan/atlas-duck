@@ -14,7 +14,8 @@ use atlas_duck_convert::wiki_to_preview_html;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    CommentView, FieldRow, IssueCard, JSON_STRING_COLLAPSE_BYTES, PreviewBody, sanitize_html,
+    CommentView, FieldRow, IssueCard, ItemCount, JSON_STRING_COLLAPSE_BYTES, PreviewBody,
+    PreviewHeader, sanitize_html,
 };
 use serde_json::{Map, Value};
 
@@ -91,20 +92,8 @@ fn content_warnings(
     fields: &Map<String, Value>,
     rendered: &Map<String, Value>,
 ) {
-    if comment_array(fields).iter().any(has_visibility)
-        || comment_array(rendered).iter().any(has_visibility)
-    {
-        warnings.push(Warning::new(
-            WarningId::RestrictedComments,
-            warning::TEXT_RESTRICTED_COMMENTS,
-        ));
-    }
-    if fields.get("security").is_some_and(|s| !s.is_null()) {
-        warnings.push(Warning::new(
-            WarningId::SecurityLevel,
-            warning::TEXT_SECURITY_LEVEL,
-        ));
-    }
+    let restrictions = Restrictions::of_issue(fields, rendered);
+    restrictions.push_warnings(warnings);
     let len = |key: &str| {
         fields
             .get(key)
@@ -130,6 +119,45 @@ fn content_warnings(
             WarningId::CustomFields,
             warning::custom_fields(u64::try_from(custom).unwrap_or(u64::MAX)),
         ));
+    }
+}
+
+/// What restricts a released issue (or many): the two §6.2 Cautions, each shown once however many
+/// issues carry it.
+#[derive(Default)]
+struct Restrictions {
+    comments: bool,
+    security: bool,
+}
+
+impl Restrictions {
+    /// Restricted comments in `fields` or the `renderedFields` mirror, a non-null `security`.
+    fn of_issue(fields: &Map<String, Value>, rendered: &Map<String, Value>) -> Restrictions {
+        Restrictions {
+            comments: comment_array(fields).iter().any(has_visibility)
+                || comment_array(rendered).iter().any(has_visibility),
+            security: fields.get("security").is_some_and(|s| !s.is_null()),
+        }
+    }
+
+    fn merge(&mut self, other: Restrictions) {
+        self.comments |= other.comments;
+        self.security |= other.security;
+    }
+
+    fn push_warnings(&self, warnings: &mut Vec<Warning>) {
+        if self.comments {
+            warnings.push(Warning::new(
+                WarningId::RestrictedComments,
+                warning::TEXT_RESTRICTED_COMMENTS,
+            ));
+        }
+        if self.security {
+            warnings.push(Warning::new(
+                WarningId::SecurityLevel,
+                warning::TEXT_SECURITY_LEVEL,
+            ));
+        }
     }
 }
 
@@ -395,5 +423,355 @@ fn comment_views(
                 restricted: has_visibility(c) || counterpart_restricted,
             }
         })
+        .collect()
+}
+
+// ---- tables: search and lists ----------------------------------------------------------------
+
+/// A table cell shows at most this many chars; Raw has the rest.
+const CELL_CAP_CHARS: usize = 200;
+
+/// A table has at most this many rows; the last row says how many items it leaves out.
+const TABLE_ROW_CAP: usize = 500;
+
+/// The columns of a table come from this many first items.
+const COLUMN_SAMPLE_ITEMS: usize = 50;
+
+/// A table has at most this many columns; the keys beyond count as hidden.
+const MAX_COLUMNS: usize = 40;
+
+/// Keys of a result root that are page mechanics (shown as the count), not content.
+const PAGE_KEYS: [&str; 5] = ["startAt", "maxResults", "total", "isLast", "expand"];
+
+/// Keys of a search item that are not content: its identifiers (the key has its column).
+const ISSUE_ID_KEYS: [&str; 5] = ["key", "id", "self", "expand", "fields"];
+
+/// The item arrays of the list ops that are objects (the paginated ops name theirs in the spec).
+const LIST_KEYS: [&str; 5] = [
+    "values",
+    "issueLinkTypes",
+    "transitions",
+    "worklogs",
+    "comments",
+];
+
+/// The keys a list table puts first, in this order, where the items have them.
+const LEADING_KEYS: [&str; 4] = ["id", "key", "name", "displayName"];
+
+/// Bytes a key and its value take as compact JSON: what a layout that drops them hides.
+fn pair_bytes(key: &str, value: &Value) -> u64 {
+    u64::try_from(key.len().saturating_add(value.to_string().len())).unwrap_or(u64::MAX)
+}
+
+fn bytes_of(value: &Value) -> u64 {
+    u64::try_from(value.to_string().len()).unwrap_or(u64::MAX)
+}
+
+/// `s` cut to at most `cap` chars, and how many bytes were cut.
+fn cut_chars(s: &str, cap: usize) -> (&str, u64) {
+    match s.char_indices().nth(cap) {
+        None => (s, 0),
+        Some((at, _)) => (&s[..at], u64::try_from(s.len() - at).unwrap_or(u64::MAX)),
+    }
+}
+
+/// A table cell: the string itself, else compact JSON, cut at [`CELL_CAP_CHARS`] (said in the
+/// cell, the cut bytes added to `hidden`), display-escaped and one line.
+fn cell(value: &Value, hidden: &mut u64) -> String {
+    let full = match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let (kept, cut) = cut_chars(&full, CELL_CAP_CHARS);
+    let shown = one_line(escape_for_display(kept));
+    if cut == 0 {
+        return shown;
+    }
+    *hidden = hidden.saturating_add(cut);
+    format!("{shown}… {cut} more bytes (see Raw)")
+}
+
+/// A table cell of an item's member, or empty where the item has none.
+fn cell_of(member: Option<&Value>, hidden: &mut u64) -> String {
+    member.map_or_else(String::new, |v| cell(v, hidden))
+}
+
+/// The row that says what the row cap left out; its text is in the first cell.
+fn omitted_row(columns: usize, omitted: usize) -> Vec<String> {
+    let mut row = vec![format!("… {omitted} more items (see Raw)")];
+    row.resize(columns.max(1), String::new());
+    row
+}
+
+/// The result root's keys that are neither the item array nor page mechanics: hidden.
+fn other_root_bytes(root: &Value, items_key: Option<&str>) -> u64 {
+    let Some(map) = root.as_object() else {
+        return 0;
+    };
+    map.iter()
+        .filter(|(k, _)| Some(k.as_str()) != items_key && !PAGE_KEYS.contains(&k.as_str()))
+        .fold(0u64, |sum, (k, v)| sum.saturating_add(pair_bytes(k, v)))
+}
+
+/// The count of a table: the paging facts of the read, else what the list holds.
+fn table_count(header: &mut PreviewHeader, shown: usize) -> Option<ItemCount> {
+    let shown = u64::try_from(shown).unwrap_or(u64::MAX);
+    let count = header.item_count.unwrap_or(ItemCount {
+        shown,
+        total: Some(shown),
+        more_available: false,
+    });
+    header.item_count = Some(count);
+    Some(count)
+}
+
+/// §6.3 "Jira search": a table of the key and the requested (or default) fields, a row per issue,
+/// "N of total". Used for `jira.search` and the agile issue lists. Every cell is display-escaped
+/// text; what the table leaves out of the issues (other fields, `renderedFields`, `changelog`, …)
+/// is counted in `hidden_in_preview_bytes`. Server-rendered HTML is never shown.
+pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let PreviewInput::Read(view) = &ctx.input else {
+        return generic::fallback_preview(ctx);
+    };
+    let items_key = ctx.spec.paginated.map(|p| p.items_key);
+    let Some(issues) = items_key
+        .and_then(|k| view.candidate.get(k))
+        .and_then(Value::as_array)
+    else {
+        return generic::fallback_preview(ctx);
+    };
+
+    let mut hidden = other_root_bytes(view.candidate, items_key);
+    let ids = search_field_ids(ctx, issues);
+    let columns = search_columns(ctx.field_names, &ids);
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(issues.len().min(TABLE_ROW_CAP + 1));
+    let mut restrictions = Restrictions::default();
+    let empty = Map::new();
+    for (n, issue) in issues.iter().enumerate() {
+        let (Some(map), true) = (issue.as_object(), n < TABLE_ROW_CAP) else {
+            hidden = hidden.saturating_add(bytes_of(issue));
+            continue;
+        };
+        let fields = map
+            .get("fields")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        let rendered = map
+            .get("renderedFields")
+            .and_then(Value::as_object)
+            .unwrap_or(&empty);
+        restrictions.merge(Restrictions::of_issue(fields, rendered));
+        let mut row = Vec::with_capacity(ids.len() + 1);
+        row.push(
+            map.get("key")
+                .and_then(Value::as_str)
+                .map(|k| one_line(escape_for_display(k)))
+                .unwrap_or_default(),
+        );
+        row.extend(ids.iter().map(|id| cell_of(fields.get(id), &mut hidden)));
+        rows.push(row);
+        for (k, v) in fields.iter().filter(|(k, _)| !ids.contains(k)) {
+            hidden = hidden.saturating_add(pair_bytes(k, v));
+        }
+        if let Some(f) = map.get("fields").filter(|f| !f.is_object()) {
+            hidden = hidden.saturating_add(pair_bytes("fields", f));
+        }
+        for (k, v) in map
+            .iter()
+            .filter(|(k, _)| !ISSUE_ID_KEYS.contains(&k.as_str()))
+        {
+            hidden = hidden.saturating_add(pair_bytes(k, v));
+        }
+    }
+    if issues.len() > TABLE_ROW_CAP {
+        rows.push(omitted_row(columns.len(), issues.len() - TABLE_ROW_CAP));
+    }
+
+    let (mut header, mut warnings) = generic::read_parts(ctx, view, hidden);
+    restrictions.push_warnings(&mut warnings);
+    let count = table_count(&mut header, issues.len());
+    let query = header.query.clone();
+    PreviewModel {
+        header,
+        body: PreviewBody::Table {
+            columns,
+            rows,
+            count,
+        },
+        warnings,
+        query,
+    }
+}
+
+/// The field ids of the table's columns: the requested ones in order, else the registry's
+/// defaults; with no list, or a list of `*`/`-` tokens (`*all`, `*navigable`, `-description`),
+/// the field keys of the first issues in first-seen order.
+fn search_field_ids(ctx: &PreviewCtx<'_>, issues: &[Value]) -> Vec<String> {
+    let rules = ctx.spec.field_rules;
+    let requested: Vec<&str> = rules
+        .and_then(|r| r.fields_param)
+        .and_then(|name| ctx.params.get(name))
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let named = !requested.is_empty()
+        && requested
+            .iter()
+            .all(|f| !f.starts_with(['*', '-']) && !f.is_empty());
+    let mut ids: Vec<String> = Vec::new();
+    let mut push = |id: &str| {
+        if ids.len() < MAX_COLUMNS && !ids.iter().any(|i| i == id) {
+            ids.push(id.to_owned());
+        }
+    };
+    if named {
+        requested.iter().for_each(|f| push(f));
+    } else if requested.is_empty() && rules.is_some_and(|r| !r.default_fields.is_empty()) {
+        rules
+            .into_iter()
+            .flat_map(|r| r.default_fields.iter())
+            .for_each(|f| push(f));
+    } else {
+        // The registry's default fields first (a JSON object has no insertion order: its keys
+        // come sorted), then the others as first seen.
+        let seen: Vec<&String> = issues
+            .iter()
+            .take(COLUMN_SAMPLE_ITEMS)
+            .filter_map(|i| i.get("fields").and_then(Value::as_object))
+            .flat_map(Map::keys)
+            .collect();
+        let defaults = rules.map_or(&[][..], |r| r.default_fields);
+        defaults
+            .iter()
+            .filter(|d| seen.iter().any(|k| k.as_str() == **d))
+            .for_each(|d| push(d));
+        seen.iter().for_each(|k| push(k));
+    }
+    ids
+}
+
+/// `Key`, then a label per field id. A label two columns share gets its id appended.
+fn search_columns(names: Option<&FieldNames>, ids: &[String]) -> Vec<String> {
+    const KEY: &str = "Key";
+    let labels: Vec<String> = ids.iter().map(|id| row_name(names, id)).collect();
+    let taken = |label: &str| {
+        usize::from(label == KEY) + labels.iter().filter(|l| l.as_str() == label).count() > 1
+    };
+    let mut out = vec![KEY.to_owned()];
+    out.extend(ids.iter().zip(&labels).map(|(id, label)| {
+        if taken(label) {
+            format!("{label} ({})", one_line(escape_for_display(id)))
+        } else {
+            label.clone()
+        }
+    }));
+    out
+}
+
+/// §6.3 "Lists": an item list (an array root, or `values`/`issueLinkTypes`/`transitions`/
+/// `worklogs`/`comments`) as a table whose columns are the scalar keys of the first 50 items in
+/// first-seen order, a row per item. A result that is no list of objects (`jira.myself`,
+/// `project.get`, `attachment.meta`, `editmeta`) keeps the §6.3 Fallback (the JSON tree). What
+/// the table leaves out (nested values, later items' extra keys, other root keys) is counted in
+/// `hidden_in_preview_bytes`; Raw has the exact bytes.
+pub fn list_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let PreviewInput::Read(view) = &ctx.input else {
+        return generic::fallback_preview(ctx);
+    };
+    let spec_key = ctx.spec.paginated.map(|p| p.items_key);
+    let (items, items_key) = match view.candidate {
+        Value::Array(items) => (items, None),
+        Value::Object(map) => {
+            let found = spec_key
+                .into_iter()
+                .chain(LIST_KEYS)
+                .find_map(|k| map.get(k).and_then(Value::as_array).map(|a| (a, Some(k))));
+            match found {
+                Some(found) => found,
+                None => return generic::fallback_preview(ctx),
+            }
+        }
+        _ => return generic::fallback_preview(ctx),
+    };
+    let columns = scalar_columns(items);
+    if columns.is_empty() {
+        return generic::fallback_preview(ctx);
+    }
+
+    let mut hidden = other_root_bytes(view.candidate, items_key);
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len().min(TABLE_ROW_CAP + 1));
+    for (n, item) in items.iter().enumerate() {
+        let (Some(map), true) = (item.as_object(), n < TABLE_ROW_CAP) else {
+            hidden = hidden.saturating_add(bytes_of(item));
+            continue;
+        };
+        rows.push(
+            columns
+                .iter()
+                .map(|c| cell_of(map.get(c).filter(|v| is_scalar(v)), &mut hidden))
+                .collect(),
+        );
+        for (k, v) in map {
+            if !(is_scalar(v) && columns.contains(k)) {
+                hidden = hidden.saturating_add(pair_bytes(k, v));
+            }
+        }
+    }
+    if items.len() > TABLE_ROW_CAP {
+        rows.push(omitted_row(columns.len(), items.len() - TABLE_ROW_CAP));
+    }
+
+    let (mut header, mut warnings) = generic::read_parts(ctx, view, hidden);
+    if ctx.spec.id == "jira.comment.list" && items.iter().any(has_visibility) {
+        warnings.push(Warning::new(
+            WarningId::RestrictedComments,
+            warning::TEXT_RESTRICTED_COMMENTS,
+        ));
+    }
+    let count = table_count(&mut header, items.len());
+    let query = header.query.clone();
+    let columns = columns
+        .iter()
+        .map(|c| one_line(escape_for_display(c)))
+        .collect();
+    PreviewModel {
+        header,
+        body: PreviewBody::Table {
+            columns,
+            rows,
+            count,
+        },
+        warnings,
+        query,
+    }
+}
+
+fn is_scalar(v: &Value) -> bool {
+    !matches!(v, Value::Array(_) | Value::Object(_))
+}
+
+/// The scalar keys of the first [`COLUMN_SAMPLE_ITEMS`] items, at most [`MAX_COLUMNS`]: the
+/// identifying keys of [`LEADING_KEYS`] first, then the rest in first-seen order. (A JSON object
+/// here has no insertion order, its keys come sorted, so "first seen" is per item in key order.)
+fn scalar_columns(items: &[Value]) -> Vec<String> {
+    let mut seen: Vec<&String> = Vec::new();
+    let keys = items
+        .iter()
+        .take(COLUMN_SAMPLE_ITEMS)
+        .filter_map(Value::as_object)
+        .flat_map(|m| m.iter().filter(|(_, v)| is_scalar(v)).map(|(k, _)| k));
+    for key in keys {
+        if !seen.contains(&key) {
+            seen.push(key);
+        }
+    }
+    let leading = LEADING_KEYS
+        .iter()
+        .filter_map(|lead| seen.iter().find(|k| k.as_str() == *lead));
+    let rest = seen.iter().filter(|k| !LEADING_KEYS.contains(&k.as_str()));
+    leading
+        .chain(rest)
+        .take(MAX_COLUMNS)
+        .map(|k| (*k).clone())
         .collect()
 }

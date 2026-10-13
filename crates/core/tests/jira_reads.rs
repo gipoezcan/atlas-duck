@@ -18,8 +18,8 @@ use atlas_duck_preview::warning::{Level, WarningId};
 use atlas_duck_preview::{CommentView, FieldRow, IssueCard, OutcomeKind, Preview, PreviewBody};
 use common::jira::{
     comment_page, comments_path, full_issue, gets_on, issue_path, mount_comment_page_delayed,
-    mount_comment_page_with, mount_comments, mount_comments_rendered, mount_issue, query,
-    restriction,
+    mount_comment_page_with, mount_comments, mount_comments_rendered, mount_issue, mount_search,
+    query, restriction, search_starts,
 };
 use common::{TestError, TestResult, code, de, request_id, test_hits};
 use serde_json::{Value, json};
@@ -1437,5 +1437,640 @@ async fn comment_page_failure_card_names_the_comments_endpoint() -> TestResult {
         return Err(format!("{:?}", preview.body).into());
     };
     assert!(!error_messages_text.contains(NOTE), "{error_messages_text}");
+    Ok(())
+}
+
+// ---- Task 11: search and list previews, `meta.page` (I-22) ----------------------------------------
+
+const SEARCH: &str = "jira.search";
+
+/// The released envelope's `meta` and `data.result` after `ops` redacted the read (none: a plain
+/// release).
+async fn release_with(
+    h: &Harness,
+    id: &str,
+    ops: Vec<atlas_duck_core::RedactionOp>,
+) -> Result<(Value, Value), TestError> {
+    if ops.is_empty() {
+        h.approver().release(id).map_err(de)?;
+    } else {
+        h.approver().release_redacted(id, ops).map_err(de)?;
+    }
+    let env = h.await_(id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    let meta = env.meta.clone().ok_or("no meta")?;
+    Ok((meta, env.data.ok_or("no data")?["result"].clone()))
+}
+
+async fn queued_op(h: &Harness, op: &str, params: Value) -> Result<String, TestError> {
+    let env = h.submit(op, params).await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    Ok(id)
+}
+
+fn drop_issue(key: &str) -> atlas_duck_core::RedactionOp {
+    atlas_duck_core::RedactionOp::DropItem {
+        array_path: "issues".into(),
+        key: "key".into(),
+        value: json!(key),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_jira_drops_keep_totals_and_next_start() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_search(
+        jira(&h)?,
+        25,
+        |n| json!({ "summary": format!("Issue {n}") }),
+    )
+    .await;
+    let id = queued_op(&h, SEARCH, json!({ "jql": "project = ABC", "max": 10 })).await?;
+    let (meta, result) =
+        release_with(&h, &id, vec![drop_issue("ABC-3"), drop_issue("ABC-4")]).await?;
+    // §7.5: the page is what the server answered; the drops only lower `returned`.
+    assert_eq!(
+        meta["page"],
+        json!({ "start": 0, "returned": 8, "total": 25, "truncated": true, "next_start": 10 })
+    );
+    assert_eq!(meta["redactions"]["items_dropped"], 2);
+    assert_eq!(result["total"], 25);
+    assert_eq!(result["issues"].as_array().map(Vec::len), Some(8));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_next_start_loop_rerequests_no_dropped_item() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mount_search(mock, 25, |n| json!({ "summary": format!("Issue {n}") })).await;
+    let mut next = Some(0u64);
+    let mut dropped: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(start) = next {
+        let id = queued_op(
+            &h,
+            SEARCH,
+            json!({ "jql": "project = ABC", "max": 10, "start": start }),
+        )
+        .await?;
+        // Every page drops its first two issues.
+        let first = |n: u64| format!("ABC-{}", start + n + 1);
+        dropped.extend([first(0), first(1)]);
+        let ops = vec![drop_issue(&first(0)), drop_issue(&first(1))];
+        let (meta, result) = release_with(&h, &id, ops).await?;
+        let keys = result["issues"]
+            .as_array()
+            .ok_or("no issues")?
+            .iter()
+            .filter_map(|i| i["key"].as_str().map(str::to_owned));
+        seen.extend(keys);
+        next = meta["page"]["next_start"].as_u64();
+        assert_eq!(meta["page"]["start"], start);
+    }
+    // The agent followed `next_start` only: it never asked for a range holding a dropped item.
+    assert_eq!(search_starts(mock).await, [0, 10, 20]);
+    assert!(
+        seen.iter().all(|k| !dropped.contains(k)),
+        "a dropped issue came back: {seen:?}"
+    );
+    assert_eq!(seen.len(), 25 - 6);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_agile_islast_and_short_page() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    // No `total`, `isLast` on a short page.
+    mock.json(
+        "/rest/agile/1.0/board",
+        200,
+        r#"{"maxResults":50,"startAt":0,"isLast":true,"values":[
+            {"id":1,"name":"A","type":"scrum"},{"id":2,"name":"B","type":"kanban"}]}"#,
+    )
+    .await;
+    mock.json(
+        "/rest/agile/1.0/sprint/5/issue",
+        200,
+        r#"{"maxResults":50,"startAt":0,"total":2,"isLast":true,"issues":[
+            {"id":"1","key":"ABC-1","fields":{"summary":"a"}},
+            {"id":"2","key":"ABC-2","fields":{"summary":"b"}}]}"#,
+    )
+    .await;
+    for (op, params, returned, total) in [
+        ("jira.board.list", json!({ "max": 50 }), 2, Value::Null),
+        (
+            "jira.sprint.issues",
+            json!({ "id": 5, "max": 50 }),
+            2,
+            json!(2),
+        ),
+    ] {
+        let id = queued_op(&h, op, params).await?;
+        let (meta, _) = release_with(&h, &id, Vec::new()).await?;
+        assert_eq!(
+            meta["page"],
+            json!({
+                "start": 0, "returned": returned, "total": total,
+                "truncated": false, "next_start": null
+            }),
+            "{op}"
+        );
+    }
+    Ok(())
+}
+
+type Table<'a> = (
+    &'a [String],
+    &'a [Vec<String>],
+    Option<atlas_duck_preview::ItemCount>,
+);
+
+fn table_of(body: &PreviewBody) -> Result<Table<'_>, TestError> {
+    match body {
+        PreviewBody::Table {
+            columns,
+            rows,
+            count,
+        } => Ok((columns.as_slice(), rows.as_slice(), *count)),
+        other => Err(format!("not a table: {other:?}").into()),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_table_columns_and_count() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_search(
+        jira(&h)?,
+        25,
+        |n| json!({ "summary": format!("Issue {n}"), "status": {"name": "Open"}, "labels": ["a"] }),
+    )
+    .await;
+    let id = queued_op(
+        &h,
+        SEARCH,
+        json!({ "jql": "project = ABC", "fields": ["status", "summary"], "max": 10 }),
+    )
+    .await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let (columns, rows, count) = table_of(&preview.body)?;
+    // `key`, then the requested fields in the requested order.
+    assert_eq!(columns, ["Key", "Status", "Summary"]);
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0], ["ABC-1", r#"{"name":"Open"}"#, "Issue 0"]);
+    assert_eq!(rows[9][0], "ABC-10");
+    assert_eq!(
+        count,
+        Some(atlas_duck_preview::ItemCount {
+            shown: 10,
+            total: Some(25),
+            more_available: true
+        })
+    );
+    assert_eq!(preview.header.item_count, count);
+    // `labels` was not requested: the server's extra field is not in the table and is counted.
+    assert!(preview.header.hidden_in_preview_bytes > 0);
+    assert_eq!(preview.header.query.as_deref(), Some("project = ABC"));
+
+    // No `fields`: the registry's default fields.
+    let id = queued_op(&h, SEARCH, json!({ "jql": "project = ABC", "max": 3 })).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let (columns, rows, _) = table_of(&preview.body)?;
+    assert_eq!(columns.first().map(String::as_str), Some("Key"));
+    assert_eq!(columns.get(1).map(String::as_str), Some("Summary"));
+    assert_eq!(columns.get(2).map(String::as_str), Some("Status"));
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.len() == columns.len()));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_preview_tables() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.json(
+        "/rest/api/2/issueLinkType",
+        200,
+        r#"{"issueLinkTypes":[
+            {"id":"10000","name":"Blocks","inward":"is blocked by","outward":"blocks"},
+            {"id":"10001","name":"Relates","inward":"relates to","outward":"relates to"}]}"#,
+    )
+    .await;
+    mock.json(
+        "/rest/api/2/issue/ABC-1/transitions",
+        200,
+        r#"{"expand":"transitions","transitions":[
+            {"id":"11","name":"Start","hasScreen":false,"to":{"id":"3","name":"In Progress"}}]}"#,
+    )
+    .await;
+    mock.json(
+        "/rest/api/2/user/assignable/search",
+        200,
+        r#"[{"name":"jdoe","key":"JIRAUSER1","displayName":"Jane Doe","active":true}]"#,
+    )
+    .await;
+    mock.json(
+        "/rest/api/2/myself",
+        200,
+        r#"{"name":"jdoe","key":"JIRAUSER1","displayName":"Jane Doe"}"#,
+    )
+    .await;
+
+    let id = queued_op(&h, "jira.issuelinktype.list", json!({})).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let (columns, rows, count) = table_of(&preview.body)?;
+    assert_eq!(columns, ["id", "name", "inward", "outward"]);
+    assert_eq!(rows[0], ["10000", "Blocks", "is blocked by", "blocks"]);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(count.map(|c| c.shown), Some(2));
+
+    let id = queued_op(&h, "jira.transition.list", json!({ "key": "ABC-1" })).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let (columns, rows, _) = table_of(&preview.body)?;
+    // The nested `to` object is not a scalar: it is no column and is counted as hidden.
+    assert_eq!(columns, ["id", "name", "hasScreen"]);
+    assert_eq!(rows[0], ["11", "Start", "false"]);
+    assert!(preview.header.hidden_in_preview_bytes > 0);
+
+    let id = queued_op(
+        &h,
+        "jira.user.assignable",
+        json!({ "username": "jdoe", "issueKey": "ABC-1" }),
+    )
+    .await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let (columns, rows, _) = table_of(&preview.body)?;
+    // The identifying keys first (id, key, name, displayName), then the rest.
+    assert_eq!(columns, ["key", "name", "displayName", "active"]);
+    assert_eq!(rows[0], ["JIRAUSER1", "jdoe", "Jane Doe", "true"]);
+
+    // A single object stays the JSON tree.
+    let id = queued_op(&h, "jira.myself", json!({})).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert!(
+        matches!(preview.body, PreviewBody::JsonTree { .. }),
+        "{:?}",
+        preview.body
+    );
+    Ok(())
+}
+
+// -- the previewers on hand-built candidates --
+
+type PreviewerFn = fn(&atlas_duck_core::ops::PreviewCtx<'_>) -> atlas_duck_core::ops::PreviewModel;
+
+fn read_preview(
+    op: &str,
+    previewer: PreviewerFn,
+    candidate: &Value,
+    params: &Value,
+    names: Option<&atlas_duck_core::metadata::FieldNames>,
+) -> Result<atlas_duck_core::ops::PreviewModel, TestError> {
+    use atlas_duck_core::ops::{PreviewCtx, PreviewInput, ReadView};
+    let spec = atlas_duck_registry::get(op).ok_or("unknown op")?;
+    Ok(previewer(&PreviewCtx {
+        spec,
+        instance_alias: "jira-main",
+        params,
+        input: PreviewInput::Read(ReadView {
+            candidate,
+            byte_size: u64::try_from(candidate.to_string().len())?,
+            server_total: candidate.get("total").and_then(Value::as_u64),
+            more_available: false,
+            clamped: false,
+            comments_truncated: None,
+        }),
+        field_names: names,
+    }))
+}
+
+fn search_model(
+    candidate: &Value,
+    params: &Value,
+    names: Option<&atlas_duck_core::metadata::FieldNames>,
+) -> Result<atlas_duck_core::ops::PreviewModel, TestError> {
+    read_preview(
+        SEARCH,
+        atlas_duck_core::ops::jira_preview::search_preview,
+        candidate,
+        params,
+        names,
+    )
+}
+
+fn list_model(
+    op: &str,
+    candidate: &Value,
+) -> Result<atlas_duck_core::ops::PreviewModel, TestError> {
+    read_preview(
+        op,
+        atlas_duck_core::ops::jira_preview::list_preview,
+        candidate,
+        &json!({}),
+        None,
+    )
+}
+
+fn search_page(issues: Value) -> Value {
+    json!({ "startAt": 0, "maxResults": 50, "total": 1, "issues": issues })
+}
+
+#[test]
+fn search_columns_resolve_names_and_disambiguate_duplicates() -> TestResult {
+    use atlas_duck_core::metadata::FieldNames;
+    let names = FieldNames::from(std::collections::BTreeMap::from([
+        ("customfield_10200".to_owned(), "Team".to_owned()),
+        ("customfield_10201".to_owned(), "Team".to_owned()),
+    ]));
+    let page = search_page(json!([{
+        "key": "ABC-1",
+        "fields": {"summary": "s", "customfield_10200": "a", "customfield_10201": "b"}
+    }]));
+    let params = json!({ "jql": "x", "fields": ["summary", "customfield_10200", "customfield_10201", "customfield_99999"] });
+    let model = search_model(&page, &params, Some(&names))?;
+    let (columns, rows, _) = table_of(&model.body)?;
+    // A name two columns share is told apart by the id; an unknown custom field is flagged.
+    assert_eq!(
+        columns,
+        [
+            "Key",
+            "Summary",
+            "Team (customfield_10200)",
+            "Team (customfield_10201)",
+            "customfield_99999 (unknown field)"
+        ]
+    );
+    assert_eq!(rows[0], ["ABC-1", "s", "a", "b", ""]);
+    // Names never reach the warnings (T8 handoff).
+    let bare = search_model(&page, &params, None)?;
+    let ids = |m: &atlas_duck_core::ops::PreviewModel| -> Vec<(WarningId, String)> {
+        m.warnings.iter().map(|w| (w.id, w.text.clone())).collect()
+    };
+    assert_eq!(ids(&model), ids(&bare));
+    Ok(())
+}
+
+#[test]
+fn search_cells_are_escaped_one_line_text() -> TestResult {
+    let page = search_page(json!([{
+        "key": "AB\u{202e}C-1",
+        "fields": {"summary": "line one\nline two \u{202e}x", "description": "x"}
+    }]));
+    let params = json!({ "jql": "x", "fields": ["summary"] });
+    let model = search_model(&page, &params, None)?;
+    let (_, rows, _) = table_of(&model.body)?;
+    assert_eq!(rows[0][0], "AB\u{27e8}U+202E\u{27e9}C-1");
+    assert_eq!(
+        rows[0][1],
+        "line one\u{27e8}U+000A\u{27e9}line two \u{27e8}U+202E\u{27e9}x"
+    );
+    assert!(model.header.bidi_controls >= 2);
+    assert!(
+        model
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::BidiControls)
+    );
+    Ok(())
+}
+
+#[test]
+fn search_cell_cap_cuts_on_a_char_boundary_and_counts_hidden() -> TestResult {
+    let page = search_page(json!([{
+        "key": "ABC-1",
+        "fields": {"summary": "é".repeat(300), "other": {"a": "x".repeat(300)}}
+    }]));
+    let params = json!({ "jql": "x", "fields": ["summary", "other"] });
+    let model = search_model(&page, &params, None)?;
+    let (_, rows, _) = table_of(&model.body)?;
+    // 200 chars kept, 100 chars (200 bytes) cut, said in the cell.
+    assert_eq!(
+        rows[0][1],
+        format!("{}… 200 more bytes (see Raw)", "é".repeat(200))
+    );
+    // A non-string value is cut like a string.
+    assert!(rows[0][2].contains("(see Raw)"), "{}", rows[0][2]);
+    let compact = json!({"a": "x".repeat(300)}).to_string();
+    let cut = u64::try_from(compact.len() - 200)?;
+    assert_eq!(model.header.hidden_in_preview_bytes, 200 + cut);
+    Ok(())
+}
+
+#[test]
+fn search_hidden_counts_what_the_table_does_not_show() -> TestResult {
+    let mut page = search_page(json!([{
+        "id": "1", "key": "ABC-1", "self": "https://x/1", "expand": "renderedFields",
+        "fields": {"summary": "x", "labels": ["a"]},
+        "renderedFields": {"summary": "x"},
+        "changelog": {"total": 0}
+    }]));
+    page["names"] = json!({"summary": "Summary"});
+    page["warningMessages"] = json!(["w"]);
+    let params = json!({ "jql": "x", "fields": ["summary"] });
+    let model = search_model(&page, &params, None)?;
+    // `labels` (an unrequested field), the issue's other top-level keys and the result's other
+    // top-level keys: key length plus compact value length each.
+    let expect = |k: &str, v: Value| u64::try_from(k.len() + v.to_string().len());
+    let want = expect("labels", json!(["a"]))?
+        + expect("renderedFields", json!({"summary": "x"}))?
+        + expect("changelog", json!({"total": 0}))?
+        + expect("names", json!({"summary": "Summary"}))?
+        + expect("warningMessages", json!(["w"]))?;
+    assert_eq!(model.header.hidden_in_preview_bytes, want);
+    Ok(())
+}
+
+#[test]
+fn search_star_fields_show_every_field_key_and_warn() -> TestResult {
+    let page = search_page(json!([
+        {"key": "ABC-1", "fields": {"summary": "a", "labels": []}},
+        {"key": "ABC-2", "fields": {"summary": "b", "priority": {"name": "High"}}}
+    ]));
+    let params = json!({ "jql": "x", "fields": ["*all"] });
+    let model = search_model(&page, &params, None)?;
+    let (columns, rows, _) = table_of(&model.body)?;
+    // The registry's default fields first, then the others as first seen.
+    assert_eq!(columns, ["Key", "Summary", "Priority", "Labels"]);
+    assert_eq!(rows[1], ["ABC-2", "b", r#"{"name":"High"}"#, ""]);
+    assert!(model.warnings.iter().any(|w| w.id == WarningId::AllFields));
+    // Agile lists name no default fields: the same union.
+    let agile = json!({ "startAt": 0, "maxResults": 50, "total": 2, "issues": page["issues"] });
+    let model = read_preview(
+        "jira.sprint.issues",
+        atlas_duck_core::ops::jira_preview::search_preview,
+        &agile,
+        &json!({ "id": 5 }),
+        None,
+    )?;
+    // No default fields there: the keys as first seen (sorted within an issue).
+    let (columns, _, _) = table_of(&model.body)?;
+    assert_eq!(columns, ["Key", "Labels", "Summary", "Priority"]);
+    Ok(())
+}
+
+#[test]
+fn search_warns_for_restricted_comments_and_security_levels() -> TestResult {
+    let plain =
+        search_page(json!([{"key": "ABC-1", "fields": {"summary": "a", "security": null}}]));
+    let params = json!({ "jql": "x", "fields": ["summary", "comment", "security"] });
+    let model = search_model(&plain, &params, None)?;
+    assert!(
+        !model.warnings.iter().any(|w| w.level == Level::Caution),
+        "{:?}",
+        model.warnings
+    );
+    let page = search_page(json!([{
+        "key": "ABC-1",
+        "fields": {
+            "security": {"name": "Staff"},
+            "comment": {"comments": [{"id": "1", "visibility": restriction()}]}
+        },
+        "renderedFields": {"comment": {"comments": [{"id": "9", "visibility": restriction()}]}}
+    }]));
+    let model = search_model(&page, &params, None)?;
+    let cautions: Vec<WarningId> = model
+        .warnings
+        .iter()
+        .filter(|w| w.level == Level::Caution)
+        .map(|w| w.id)
+        .collect();
+    assert!(
+        cautions.contains(&WarningId::RestrictedComments),
+        "{cautions:?}"
+    );
+    assert!(cautions.contains(&WarningId::SecurityLevel), "{cautions:?}");
+    // One of each, however many issues carry it.
+    assert_eq!(cautions.len(), 2, "{cautions:?}");
+    Ok(())
+}
+
+#[test]
+fn search_rows_are_capped_with_a_visible_note() -> TestResult {
+    let issues: Vec<Value> = (0..600)
+        .map(|n| json!({"key": format!("ABC-{n}"), "fields": {"summary": "s"}}))
+        .collect();
+    let page = json!({ "startAt": 0, "maxResults": 600, "total": 600, "issues": issues });
+    let params = json!({ "jql": "x", "fields": ["summary"] });
+    let model = search_model(&page, &params, None)?;
+    let (_, rows, count) = table_of(&model.body)?;
+    assert_eq!(rows.len(), 501);
+    assert!(
+        rows[500][0].contains("100 more items (see Raw)"),
+        "{:?}",
+        rows[500]
+    );
+    assert_eq!(count.map(|c| c.shown), Some(600));
+    assert!(model.header.hidden_in_preview_bytes > 0);
+    Ok(())
+}
+
+#[test]
+fn list_columns_are_the_scalar_keys_of_the_first_50_items() -> TestResult {
+    let mut items: Vec<Value> = (0..60)
+        .map(|n| json!({"id": n, "name": format!("n{n}"), "nested": {"a": 1}}))
+        .collect();
+    items[1]["extra"] = json!("late");
+    items[55]["tail"] = json!("beyond the first 50");
+    items[2]["flag"] = json!(true);
+    items[3]["none"] = Value::Null;
+    let candidate = json!({ "values": items, "startAt": 0, "maxResults": 100, "isLast": true });
+    let model = list_model("jira.board.list", &candidate)?;
+    let (columns, rows, count) = table_of(&model.body)?;
+    // `id`, `name`, then first seen; `nested` is no scalar; `tail` is outside the first 50 items.
+    assert_eq!(columns, ["id", "name", "extra", "flag", "none"]);
+    assert_eq!(rows.len(), 60);
+    assert_eq!(rows[0], ["0", "n0", "", "", ""]);
+    assert_eq!(rows[1][2], "late");
+    assert_eq!(rows[2][3], "true");
+    assert_eq!(count.map(|c| c.shown), Some(60));
+    // Hidden: every `nested` object and the `tail` key of item 55 (page mechanics excluded).
+    let nested = u64::try_from("nested".len() + json!({"a": 1}).to_string().len())?;
+    let tail = u64::try_from("tail".len() + json!("beyond the first 50").to_string().len())?;
+    assert_eq!(model.header.hidden_in_preview_bytes, 60 * nested + tail);
+    Ok(())
+}
+
+#[test]
+fn list_roots_without_item_objects_keep_the_json_tree() -> TestResult {
+    for candidate in [
+        json!({"name": "jdoe"}),
+        json!(["a", "b"]),
+        json!({"values": ["a"]}),
+        json!({"values": []}),
+        json!({"fields": {"summary": {}}}),
+    ] {
+        let model = list_model("jira.board.list", &candidate)?;
+        assert!(
+            matches!(model.body, PreviewBody::JsonTree { .. }),
+            "{candidate}: {:?}",
+            model.body
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn list_text_is_escaped_and_other_root_keys_are_counted() -> TestResult {
+    let mut candidate = json!([{"na\nme": "a\u{202e}b", "id": 1}]);
+    let model = list_model("jira.project.list", &candidate)?;
+    let (columns, rows, _) = table_of(&model.body)?;
+    assert_eq!(columns, ["id", "na\u{27e8}U+000A\u{27e9}me"]);
+    assert_eq!(rows[0][1], "a\u{27e8}U+202E\u{27e9}b");
+    assert_eq!(model.header.bidi_controls, 1);
+    assert!(
+        model
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::BidiControls)
+    );
+
+    candidate = json!({
+        "transitions": [{"id": "1"}], "expand": "transitions", "warningMessages": ["w"]
+    });
+    let model = list_model("jira.transition.list", &candidate)?;
+    let want = u64::try_from("warningMessages".len() + json!(["w"]).to_string().len())?;
+    assert_eq!(model.header.hidden_in_preview_bytes, want);
+    let (_, _, count) = table_of(&model.body)?;
+    assert_eq!(
+        count,
+        Some(atlas_duck_preview::ItemCount {
+            shown: 1,
+            total: Some(1),
+            more_available: false
+        })
+    );
+    Ok(())
+}
+
+#[test]
+fn list_cells_are_capped_and_comment_lists_warn_on_restrictions() -> TestResult {
+    let candidate = json!({
+        "startAt": 0, "maxResults": 50, "total": 1,
+        "comments": [{"id": "1", "body": "x".repeat(500), "visibility": null}]
+    });
+    let model = list_model("jira.comment.list", &candidate)?;
+    let (_, rows, _) = table_of(&model.body)?;
+    assert!(
+        rows[0][1].contains("300 more bytes (see Raw)"),
+        "{}",
+        rows[0][1]
+    );
+    assert!(model.header.hidden_in_preview_bytes >= 300);
+    assert!(!model.warnings.iter().any(|w| w.level == Level::Caution));
+
+    let restricted = json!({
+        "total": 1,
+        "comments": [{"id": "1", "body": "b", "visibility": restriction()}]
+    });
+    let model = list_model("jira.comment.list", &restricted)?;
+    assert!(
+        model
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::RestrictedComments)
+    );
     Ok(())
 }
