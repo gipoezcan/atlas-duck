@@ -340,9 +340,27 @@ fn class_name(spec: &OperationSpec) -> String {
 }
 
 fn read_fallback(ctx: &PreviewCtx<'_>, view: &ReadView<'_>) -> PreviewModel {
+    let tree = json_tree(view.candidate);
+    let (header, warnings) = read_parts(ctx, view, tree.hidden_bytes());
+    let query = header.query.clone();
+    PreviewModel {
+        header,
+        body: PreviewBody::JsonTree { tree },
+        warnings,
+        query,
+    }
+}
+
+/// The header and the warnings every read preview shares, whatever its body layout: the `*all`
+/// Caution, the classifier counts and their warnings, mixed-script identifiers and the cap
+/// notes. `hidden_in_preview_bytes` is what the layout does not show of the candidate.
+pub(crate) fn read_parts(
+    ctx: &PreviewCtx<'_>,
+    view: &ReadView<'_>,
+    hidden_in_preview_bytes: u64,
+) -> (PreviewHeader, Vec<Warning>) {
     let spec = ctx.spec;
     let candidate = view.candidate;
-    let tree = json_tree(candidate);
     let (bidi, other) = count_value(candidate);
     let item_count = item_count(spec, view);
 
@@ -375,26 +393,21 @@ fn read_fallback(ctx: &PreviewCtx<'_>, view: &ReadView<'_>) -> PreviewModel {
         ));
     }
 
-    let query = query_display(spec, ctx.params);
-    PreviewModel {
-        header: PreviewHeader {
-            instance_alias: ctx.instance_alias.to_owned(),
-            op_id: spec.id.to_owned(),
-            class: class_name(spec),
-            item_count,
-            byte_size: view.byte_size,
-            fields_included: fields_included(spec, ctx.params, candidate),
-            hidden_in_preview_bytes: tree.hidden_bytes(),
-            bidi_controls: bidi,
-            other_invisible: other,
-            executes_as: None,
-            receipt_fields: Vec::new(),
-            query: query.clone(),
-        },
-        body: PreviewBody::JsonTree { tree },
-        warnings,
-        query,
-    }
+    let header = PreviewHeader {
+        instance_alias: ctx.instance_alias.to_owned(),
+        op_id: spec.id.to_owned(),
+        class: class_name(spec),
+        item_count,
+        byte_size: view.byte_size,
+        fields_included: fields_included(spec, ctx.params, candidate),
+        hidden_in_preview_bytes,
+        bidi_controls: bidi,
+        other_invisible: other,
+        executes_as: None,
+        receipt_fields: Vec::new(),
+        query: query_display(spec, ctx.params),
+    };
+    (header, warnings)
 }
 
 /// Searches show their query (§6.3); keyed ops none.

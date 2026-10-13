@@ -1332,7 +1332,8 @@ fn fallback_preview_header_and_tree() -> TestResult {
     );
     assert_eq!((m.header.bidi_controls, m.header.other_invisible), (0, 0));
     assert!(m.warnings.is_empty());
-    assert!(matches!(m.body, PreviewBody::JsonTree { .. }));
+    // T10: `jira.issue.get` has its own layout; the other fallback tests cover the JSON tree.
+    assert!(matches!(m.body, PreviewBody::JiraIssue { .. }));
     assert_eq!(m.query, None);
 
     let m = read_preview(
@@ -1586,5 +1587,18 @@ fn write_preview_hold_bodies() -> TestResult {
         m.body,
         PreviewBody::enrichment_error(Some(404), "Issue does not exist", None)
     );
+    Ok(())
+}
+
+#[test]
+fn ops_without_a_layout_use_the_json_tree() -> TestResult {
+    let m = read_preview(
+        "jira.project.get",
+        &json!({"key": "ABC"}),
+        &json!({"key": "ABC", "name": "Alpha"}),
+        false,
+        false,
+    )?;
+    assert!(matches!(m.body, PreviewBody::JsonTree { .. }));
     Ok(())
 }

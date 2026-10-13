@@ -13,6 +13,7 @@ use atlas_duck_core::Confirm;
 use atlas_duck_core::metadata::{FIELD_CACHE_TTL, FieldNames, UNKNOWN_FIELD_SUFFIX, field_label};
 use atlas_duck_core::testing::{AuditRecord, FaultPlan, Harness, JIRA_FIELDS};
 use atlas_duck_ipc::envelope::Status;
+use atlas_duck_preview::PreviewBody;
 use common::{TestError, TestResult, de, request_id};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -206,6 +207,15 @@ async fn metadata_cache_never_blocks_preview() -> TestResult {
         t0.elapsed()
     );
     assert!(delivery.preview.approvable);
+    // The field table was built from the map cached before the refresh (T10).
+    let PreviewBody::JiraIssue { fields, .. } = &delivery.preview.body else {
+        return Err(format!("not a Jira issue preview: {:?}", delivery.preview.body).into());
+    };
+    let row_name = |id: &str| fields.iter().find(|f| f.id == id).map(|f| f.name.as_str());
+    assert_eq!(
+        row_name("customfield_10200"),
+        Some("customfield_10200 (unknown field)")
+    );
     // The refresh is running (its start record committed) while the preview was built from the
     // map cached before it: `customfield_10200` is not in it.
     fills_reach(&h, 2).await?;

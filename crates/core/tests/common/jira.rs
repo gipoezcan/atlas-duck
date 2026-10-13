@@ -179,3 +179,36 @@ pub fn query(r: &wiremock::Request, name: &str) -> Option<String> {
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.into_owned())
 }
+
+/// An issue as the previewer tests need it (T10): a parent, two issue links, a custom field,
+/// `security: null`, no comments, no invisible characters (U-34's "default issue").
+pub fn full_issue(key: &str) -> Value {
+    json!({
+        "id": "10007",
+        "key": key,
+        "self": "https://jira.corp.example/rest/api/2/issue/10007",
+        "fields": {
+            "summary": "Login page times out",
+            "issuetype": {"id": "1", "name": "Bug"},
+            "status": {"id": "3", "name": "In Progress"},
+            "priority": {"id": "2", "name": "High"},
+            "assignee": {"name": "jdoe", "key": "JIRAUSER1", "displayName": "Jane Doe"},
+            "reporter": {"name": "asmith", "key": "JIRAUSER2", "displayName": "Alex Smith"},
+            "description": "h1. Steps\n\nOpen the *login* page.",
+            "labels": ["web"],
+            "parent": {"id": "10001", "key": "ABC-1", "fields": {"summary": "Epic"}},
+            "issuelinks": [
+                {"id": "1", "type": {"name": "Blocks"}, "outwardIssue": {"key": "ABC-8"}},
+                {"id": "2", "type": {"name": "Blocks"}, "inwardIssue": {"key": "ABC-9"}}
+            ],
+            "subtasks": [],
+            "security": null,
+            "customfield_10200": {"value": "Platform"}
+        }
+    })
+}
+
+/// A role restriction as Jira sends it on a restricted comment.
+pub fn restriction() -> Value {
+    json!({"type": "role", "value": "Administrators"})
+}

@@ -10,6 +10,7 @@ pub mod confluence;
 pub mod generic;
 pub mod jira;
 pub(crate) mod jira_body;
+pub mod jira_preview;
 pub mod stale;
 
 use std::collections::BTreeMap;
@@ -366,6 +367,7 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         "jira.issue.get",
         OpImpl {
             executor: jira::issue_get_executor,
+            previewer: jira_preview::issue_preview,
             ..READ
         },
     ),

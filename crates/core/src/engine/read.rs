@@ -1447,11 +1447,15 @@ pub(crate) fn preview_model(cx: &ReadContext<'_>, read: &ReadState, c: &Candidat
                 .get("error_messages")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let mut text = escape_for_display(text);
+            if comment_page_failed(cx, read) {
+                text = format!("{COMMENT_PAGE_NOTE}\n{text}");
+            }
             card(
                 cx,
                 value,
                 byte_size,
-                PreviewBody::upstream_error(status, &escape_for_display(text)),
+                PreviewBody::upstream_error(status, &text),
             )
         }
         _ => {
@@ -1468,6 +1472,18 @@ pub(crate) fn preview_model(cx: &ReadContext<'_>, read: &ReadState, c: &Candidat
             card(cx, value, byte_size, body)
         }
     }
+}
+
+/// plan text (T10): leads the error text when a comment page of `jira.issue.get --comments`
+/// failed, since a 404 there reads as "issue not found".
+const COMMENT_PAGE_NOTE: &str =
+    "the failing request was the issue's comment list, not the issue itself";
+
+/// An upstream error of the composite read (PD-45) that is not the issue's own answer: the
+/// issue GET is the first response and was 2xx, so a record of two or more responses ended on a
+/// comment page.
+fn comment_page_failed(cx: &ReadContext<'_>, read: &ReadState) -> bool {
+    cx.spec.id == "jira.issue.get" && jira::wants_comments(cx.params) && read.pages >= 2
 }
 
 fn card(cx: &ReadContext<'_>, value: &Value, byte_size: u64, body: PreviewBody) -> PreviewModel {

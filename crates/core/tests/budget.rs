@@ -163,6 +163,8 @@ fn key(name: &str) -> AgentKey {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn x03_storage_low_refuses_nothing_queued() -> TestResult {
     let h = Harness::jira().await?;
+    // The start fill of the field-name cache (T8) logs its own records: let it end first.
+    assert!(h.field_cache_filled().await);
     mount_issue(&h, "ABC-1", 64, 'a').await?;
     let before = h.event_count().await?;
     h.free_space().set(0);
