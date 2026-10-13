@@ -113,6 +113,27 @@ pub(crate) async fn sweep(engine: &Arc<Engine>, why: CancelWhy, write_wait: Dura
     swept
 }
 
+/// How long the shutdown lets the cancelled field-name cache fills end: what is left of a fill
+/// after its cancel is one local append.
+pub(crate) const FILL_WAIT: Duration = Duration::from_secs(5);
+
+/// §2.5 step 5 for the field-name cache (PD-46, T8 review I-1): the fills cancelled when the
+/// shutdown began ([`crate::metadata::FieldCache::cancel_all`]) record their result (or nothing,
+/// when cancelled before their start record) and end. Waited for at most `bound` and never
+/// blocking, like the write wait; `false` when one is still running then.
+pub(crate) async fn fills_ended(engine: &Arc<Engine>, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        if engine.field_cache().idle() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// §2.5 step 5: flush the head anchor, append `APP_STOP`, flush again so the anchor covers it.
 /// A failed flush is not an error (`health()` shows it); a failed append is returned.
 pub(crate) async fn stop(

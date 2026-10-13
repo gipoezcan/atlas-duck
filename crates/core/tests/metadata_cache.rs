@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_audit::EventType;
+use atlas_duck_core::Confirm;
 use atlas_duck_core::metadata::{FIELD_CACHE_TTL, FieldNames, UNKNOWN_FIELD_SUFFIX, field_label};
 use atlas_duck_core::testing::{AuditRecord, FaultPlan, Harness, JIRA_FIELDS};
 use atlas_duck_ipc::envelope::Status;
@@ -231,7 +232,12 @@ async fn metadata_cache_failure_keeps_old_map() -> TestResult {
     let mock = jira(&h)?;
     mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
         .await;
-    mock.json(FIELD, 500, r#"{"errorMessages":["boom"]}"#).await;
+    // Two failing answers, then a good one.
+    for _ in 0..2 {
+        mock.json_once(FIELD, 500, r#"{"errorMessages":["boom"]}"#)
+            .await;
+    }
+    mock.json(FIELD, 200, FIELDS_WITH_TEAM).await;
     assert_eq!(h.field_cache_failures("jira-main"), 0);
     h.clock().advance(FIELD_CACHE_TTL + Duration::from_secs(60));
     let id = queued_read(&h).await?;
@@ -249,12 +255,100 @@ async fn metadata_cache_failure_keeps_old_map() -> TestResult {
     let names = h.field_names("jira-main");
     assert_eq!(name_of(&names, "customfield_10100"), Some("Story Points"));
     assert_eq!(h.field_cache_failures("jira-main"), 1);
-    // A failed fill is not retried before the TTL is over again: the next preview build
-    // starts nothing.
+    // A failed fill is retried after a 5 min backoff, not on every preview build and not only
+    // after the hour (lead ruling, T8 review M-4): nothing at once or 4 min later, one at 5 min.
     h.approver().open(&id).map_err(de)?;
     assert!(h.field_cache_filled().await);
     assert_eq!(fills(&h).await?, 2);
     assert_eq!(h.field_cache_failures("jira-main"), 1);
+    h.clock().advance(Duration::from_secs(4 * 60));
+    h.approver().open(&id).map_err(de)?;
+    assert!(h.field_cache_filled().await);
+    assert_eq!(fills(&h).await?, 2, "retried within the backoff");
+    h.clock().advance(Duration::from_secs(60));
+    h.approver().open(&id).map_err(de)?;
+    assert!(h.field_cache_filled().await);
+    assert_eq!(fills(&h).await?, 3, "not retried after the backoff");
+    assert_eq!(h.field_cache_failures("jira-main"), 2);
+    // After a success the hour counts again: 5 min later nothing starts.
+    h.clock().advance(Duration::from_secs(5 * 60));
+    h.approver().open(&id).map_err(de)?;
+    assert!(h.field_cache_filled().await);
+    assert_eq!(fills(&h).await?, 4);
+    assert_eq!(
+        name_of(&h.field_names("jira-main"), "customfield_10200"),
+        Some("Team")
+    );
+    h.clock().advance(Duration::from_secs(5 * 60));
+    h.approver().open(&id).map_err(de)?;
+    assert!(h.field_cache_filled().await);
+    assert_eq!(
+        fills(&h).await?,
+        4,
+        "refreshed within the hour after a success"
+    );
+    Ok(())
+}
+
+/// The field list is untrusted: at most 20 000 entries are kept and a name is cut to 256 chars
+/// (T8 review I-2), whatever the 32 MiB response cap lets through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_cache_caps_untrusted_content() -> TestResult {
+    let h = Harness::jira().await?;
+    assert!(h.field_cache_filled().await);
+    let mock = jira(&h)?;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    mock.json(
+        FIELD,
+        200,
+        &oversized_field_list(20_050, 100_000).to_string(),
+    )
+    .await;
+    h.clock().advance(FIELD_CACHE_TTL + Duration::from_secs(60));
+    queued_read(&h).await?;
+    assert!(h.field_cache_filled().await);
+    assert_eq!(fills(&h).await?, 2);
+    let names = h.field_names("jira-main").ok_or("no map")?;
+    assert_eq!(names.len(), 20_000);
+    let long = names.get("customfield_0").ok_or("first entry dropped")?;
+    assert_eq!(long.chars().count(), 256);
+    assert!(long.ends_with('…'));
+    assert_eq!(names.get("customfield_19999"), Some("Field 19999"));
+    assert_eq!(names.get("customfield_20000"), None);
+    assert_eq!(names.capped(), 51, "50 dropped, 1 cut");
+    assert_eq!(h.field_cache_failures("jira-main"), 0);
+    Ok(())
+}
+
+/// `n` fields `customfield_0..n`; the first one's name is `long` chars.
+fn oversized_field_list(n: usize, long: usize) -> Value {
+    Value::Array(
+        (0..n)
+            .map(|i| {
+                let name = if i == 0 {
+                    "x".repeat(long)
+                } else {
+                    format!("Field {i}")
+                };
+                json!({ "id": format!("customfield_{i}"), "name": name, "custom": true })
+            })
+            .collect(),
+    )
+}
+
+/// A new origin is another server: the old server's names are dropped with the client
+/// (T8 review M-5), so its custom ids are never labelled with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_cache_forgotten_on_origin_change() -> TestResult {
+    let h = Harness::jira().await?;
+    assert!(h.field_cache_filled().await);
+    assert!(h.field_names("jira-main").is_some());
+    let second = MockDc::start(atlas_duck_atlassian::Product::Jira, "/moved").await;
+    h.confirmer().push(Confirm::Ok);
+    h.instances()
+        .change_base_url("jira-main", &second.base_url())?;
+    assert!(h.field_names("jira-main").is_none());
     Ok(())
 }
 
@@ -440,4 +534,62 @@ fn field_names_parse_and_label() {
     );
     assert_eq!(field_label(odd.as_ref(), "labels"), "labels");
     assert!(JIRA_FIELDS.contains("customfield_10100"));
+}
+
+/// A label is one line: `\n`, `\r` and `\t` in a name are shown as escapes like every other
+/// flagged char (T8 review M-1), so a name cannot pass for a second table row.
+#[test]
+fn field_label_is_one_line() {
+    let names = FieldNames::parse(
+        br#"[{"id":"customfield_1","name":"Story Points\nAssignee: admin"},{"id":"customfield_2","name":"a\r\tb"}]"#,
+    );
+    assert_eq!(
+        field_label(names.as_ref(), "customfield_1"),
+        "Story Points⟨U+000A⟩Assignee: admin"
+    );
+    assert_eq!(
+        field_label(names.as_ref(), "customfield_2"),
+        "a⟨U+000D⟩⟨U+0009⟩b"
+    );
+    // A literal escape in a name stays distinguishable from a neutralised newline.
+    let lit = FieldNames::parse("[{\"id\":\"customfield_3\",\"name\":\"⟨U+000A⟩\"}]".as_bytes());
+    assert_eq!(
+        field_label(lit.as_ref(), "customfield_3"),
+        "⟨U+27E8⟩U+000A⟨U+27E9⟩"
+    );
+}
+
+/// `parse` caps what it keeps: 20 000 entries (answer order), names cut to 256 chars with `…`,
+/// ids over 256 chars dropped (T8 review I-2).
+#[test]
+fn field_names_parse_caps() {
+    let names = FieldNames::parse(
+        oversized_field_list(25_000, 1_000_000)
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap_or_default();
+    assert_eq!(names.len(), 20_000);
+    let long = names.get("customfield_0").unwrap_or_default();
+    assert_eq!(long.chars().count(), 256);
+    assert!(long.ends_with('…'));
+    assert_eq!(names.get("customfield_24999"), None);
+    assert_eq!(names.capped(), 5_001, "5 000 dropped, 1 cut");
+    // A name of exactly 256 chars is kept as it is; multi-byte chars are cut on a char boundary.
+    let exact = "é".repeat(256);
+    let over = "é".repeat(257);
+    let body = json!([
+        { "id": "customfield_1", "name": exact },
+        { "id": "customfield_2", "name": over },
+        { "id": "c".repeat(257), "name": "Too long an id" },
+    ]);
+    let names = FieldNames::parse(body.to_string().as_bytes()).unwrap_or_default();
+    assert_eq!(names.get("customfield_1"), Some(exact.as_str()));
+    let cut = names.get("customfield_2").unwrap_or_default();
+    assert_eq!(cut.chars().count(), 256);
+    assert!(cut.starts_with(&"é".repeat(255)) && cut.ends_with('…'));
+    assert_eq!(names.len(), 2, "the over-long id is dropped");
+    assert_eq!(names.capped(), 2);
+    // The redacting `Debug` shows counts only.
+    assert_eq!(format!("{names:?}"), "FieldNames(2 fields, 2 capped)");
 }

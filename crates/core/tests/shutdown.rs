@@ -5,14 +5,17 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atlas_duck_atlassian::Timeouts;
 use atlas_duck_atlassian::testing::{
     MockDc, RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, XAuser, fixtures,
 };
 use atlas_duck_audit::EventType;
-use atlas_duck_core::testing::{FakeScriptRunner, FaultPlan, Harness, InstanceAt, ScriptPlan};
+use atlas_duck_core::metadata::FIELD_CACHE_TTL;
+use atlas_duck_core::testing::{
+    AuditRecord, FakeScriptRunner, FaultPlan, Harness, InstanceAt, JIRA_FIELDS, ScriptPlan,
+};
 use atlas_duck_core::{Pause, RunEnd, ShutdownReason, ShutdownReport, TestHooks};
 use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::envelope::Status;
@@ -644,6 +647,154 @@ async fn other_methods_keep_working_during_the_shutdown() -> TestResult {
         Ok::<_, TestError>(env.status)
     });
     assert_eq!(seen?, Status::Cancelled);
+    Ok(())
+}
+
+// ---- PD-46: the Jira field-name cache at shutdown (T8 review I-1) -----------------------------
+
+const FIELD: &str = "/rest/api/2/field";
+
+/// The `metadata_cache` records and the record that is last in the log (by seq).
+async fn cache_and_last(h: &Harness) -> Result<(Vec<AuditRecord>, AuditRecord), TestError> {
+    let all = h.audit_records().await?;
+    let last = all
+        .iter()
+        .max_by_key(|r| r.seq)
+        .cloned()
+        .ok_or("empty log")?;
+    let cache = all
+        .into_iter()
+        .filter(|r| {
+            r.event_type == EventType::SYSTEM_FETCH && r.payload["purpose"] == "metadata_cache"
+        })
+        .collect();
+    Ok((cache, last))
+}
+
+/// §2.5 step 5 for the cache: `APP_STOP` is the last record, and every `metadata_cache` start
+/// has its result before it.
+async fn cache_pairs_end_before_app_stop(h: &Harness) -> Result<Vec<AuditRecord>, TestError> {
+    let (cache, last) = cache_and_last(h).await?;
+    assert_eq!(last.event_type, EventType::APP_STOP, "{:?}", last.payload);
+    for start in cache.iter().filter(|r| r.payload["phase"] == "start") {
+        let result = cache
+            .iter()
+            .find(|r| {
+                r.payload["phase"] == "result" && r.payload["fetch_id"] == start.payload["fetch_id"]
+            })
+            .ok_or("a metadata_cache start without its result")?;
+        assert!(start.seq < result.seq && result.seq < last.seq);
+    }
+    Ok(cache)
+}
+
+/// A fill whose GET is in flight at quit is cancelled, not waited for and not left running: its
+/// result record (`class: cancelled`) is written before `APP_STOP`, and nothing follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_field_cache_fill_in_flight_ends_before_app_stop() -> TestResult {
+    let h = Harness::jira().await?;
+    assert!(h.field_cache_filled().await, "the start fill never ended");
+    let mock = jira(&h)?;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    mock.json_delayed(FIELD, 200, JIRA_FIELDS, Duration::from_secs(10))
+        .await;
+    // The map is stale: the read's preview build starts a refresh, whose GET hangs.
+    h.clock().advance(FIELD_CACHE_TTL + Duration::from_secs(60));
+    queued(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    for _ in 0..500 {
+        let (cache, _) = cache_and_last(&h).await?;
+        if cache
+            .iter()
+            .filter(|r| r.payload["phase"] == "start")
+            .count()
+            == 2
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let t0 = Instant::now();
+    let report = h.core().shutdown(ShutdownReason::Quit).await;
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "the shutdown waited {:?} for the GET",
+        t0.elapsed()
+    );
+    assert!(report.app_stop_logged);
+    // The fill ended before the shutdown returned.
+    assert!(h.field_cache_filled_within(Duration::ZERO).await);
+    let cache = cache_pairs_end_before_app_stop(&h).await?;
+    let phases: Vec<&str> = cache
+        .iter()
+        .filter_map(|r| r.payload["phase"].as_str())
+        .collect();
+    assert_eq!(phases, ["start", "result", "start", "result"]);
+    let refresh = cache.last().ok_or("no record")?;
+    assert_eq!(refresh.payload["class"], "cancelled");
+    Ok(())
+}
+
+/// The shutdown lets a cancelled fill end before `APP_STOP` (bounded, never blocking): a fill held
+/// between its GET and its result record when the shutdown begins still records its result
+/// before `APP_STOP`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_shutdown_waits_for_a_fill_to_record_its_result() -> TestResult {
+    let pause = Pause::new();
+    // The start fill passes the hold at once (a stored permit each way).
+    pause.release.notify_one();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_before_cache_result: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    assert!(h.field_cache_filled().await, "the start fill never ended");
+    pause.reached.notified().await;
+    let mock = jira(&h)?;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    mock.json(FIELD, 200, JIRA_FIELDS).await;
+    h.clock().advance(FIELD_CACHE_TTL + Duration::from_secs(60));
+    queued(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    // The refresh got its answer and holds before recording it.
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified()).await?;
+    let (report, held) = tokio::join!(h.core().shutdown(ShutdownReason::Quit), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let stopped_early = !h.events_of(EventType::APP_STOP).await?.is_empty();
+        pause.release.notify_one();
+        Ok::<_, TestError>(stopped_early)
+    });
+    assert!(
+        !held?,
+        "APP_STOP was written while the fill was still running"
+    );
+    assert!(report.app_stop_logged);
+    assert!(h.field_cache_filled_within(Duration::ZERO).await);
+    let cache = cache_pairs_end_before_app_stop(&h).await?;
+    assert_eq!(cache.len(), 4);
+    Ok(())
+}
+
+/// Once the shutdown began no fill starts: a connection test passing afterwards (other methods
+/// keep working until the app exits) records no `metadata_cache` start after `APP_STOP`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_field_cache_fill_starts_once_the_shutdown_began() -> TestResult {
+    let h = Harness::jira().await?;
+    assert!(h.field_cache_filled().await, "the start fill never ended");
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.jira_server_info(fixtures::JIRA_9_12_VERSION).await;
+    mock.json(FIELD, 200, JIRA_FIELDS).await;
+    let report = h.core().shutdown(ShutdownReason::Quit).await;
+    assert!(report.app_stop_logged);
+    h.core().instances().retest_token("jira-main").await?;
+    assert!(h.field_cache_filled().await);
+    let (cache, _) = cache_and_last(&h).await?;
+    assert_eq!(cache.len(), 2, "only the start fill's start and result");
     Ok(())
 }
 

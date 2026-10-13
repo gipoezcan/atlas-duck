@@ -407,6 +407,8 @@ impl CoreInstances {
         // (review I-4), and the first error is reported afterwards.
         let deleted = self.delete_token(&id);
         self.engine.invalidate_client(&id);
+        // Another server's field names (PD-46, T8 review M-5).
+        self.engine.field_cache().forget(&id);
         let reloaded = self.reload();
         if reloaded.is_err() {
             // The table could not be rebuilt: the instance still moves to the confirmed origin,

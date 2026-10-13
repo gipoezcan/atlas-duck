@@ -12,13 +12,14 @@ pub type TestError = Box<dyn std::error::Error>;
 
 /// The requests `mock` received apart from the Jira field-name cache's `GET /rest/api/2/field`
 /// (PD-46): every Jira harness fills the cache at start, and a token set or a stale map at a
-/// preview build fills it again, outside the test's own steps.
+/// preview build fills it again, outside the test's own steps. Any other method on that path is
+/// counted: the cache only ever sends a GET.
 pub async fn test_hits(mock: &atlas_duck_atlassian::testing::MockDc) -> Vec<wiremock::Request> {
     let field = mock.path("/rest/api/2/field");
     mock.received()
         .await
         .into_iter()
-        .filter(|r| r.url.path() != field)
+        .filter(|r| r.url.path() != field || r.method.as_str() != "GET")
         .collect()
 }
 

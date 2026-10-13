@@ -165,6 +165,9 @@ pub struct TestHooks {
     /// The Jira field-name cache never fills (PD-46): a harness whose instances sit at raw
     /// servers answering scripted connections in order sets it, so no background GET takes one.
     pub no_field_cache: bool,
+    /// A field-name cache fill holds after its GET returned, before its result record is
+    /// appended (T8 review I-1: the shutdown lets it end before `APP_STOP`).
+    pub pause_before_cache_result: Option<Arc<Pause>>,
 }
 
 #[cfg(feature = "testing")]
@@ -436,6 +439,9 @@ impl Core {
         // Waits for every submit that passed its check to register its request, then refuses
         // all later ones (review I-1).
         self.engine.begin_shutdown().await;
+        // PD-46 (T8 review I-1): no field-name cache fill starts from now on, and the running
+        // ones are cancelled (never waits); they end before `APP_STOP` below.
+        self.engine.field_cache().cancel_all();
         let (why, stop) = match reason {
             ShutdownReason::Quit => (CancelWhy::AppQuit, AppStopReason::Quit),
             // The installer path cancels with the app's own reason (§8.3: `app_quit`).
@@ -451,6 +457,7 @@ impl Core {
         #[cfg(not(feature = "testing"))]
         let wait = crate::shutdown::WRITE_WAIT;
         let swept = crate::shutdown::sweep(&self.engine, why, wait).await;
+        crate::shutdown::fills_ended(&self.engine, crate::shutdown::FILL_WAIT).await;
         let app_stop_logged = crate::shutdown::stop(&self.engine, stop).await.is_ok();
         ShutdownReport {
             cancelled: swept.cancelled,
