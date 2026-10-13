@@ -165,22 +165,24 @@ pub enum PreviewBody {
         class: String,
         requests: Vec<RequestView>,
     },
-    /// §6.3 Jira issue: the card, the fields, the rendered description and the comments. Every
-    /// string is display-escaped by core; the HTML strings are sanitized by core.
+    /// §6.3 Jira issue: the card, the fields, the rendered description and the comments. Plain
+    /// strings are display-escaped text (the UI renders them as text); the `*_html` strings are
+    /// sanitized HTML (by core, before they get here; the type does not enforce it).
     JiraIssue {
         card: IssueCard,
         fields: Vec<FieldRow>,
         description_html: Option<String>,
         comments: Vec<CommentView>,
     },
-    /// §6.3 Jira search and the lists.
+    /// §6.3 Jira search and the lists. Every cell and column name is display-escaped text.
     Table {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
         count: Option<ItemCount>,
     },
     /// §6.3 create, comment, assign, link, labels, worklog, sprint move. `constructs` lists the
-    /// wiki constructs of the outgoing text (PD-47).
+    /// wiki constructs of the outgoing text (PD-47). `sentence` and `rows` are display-escaped
+    /// text; the `constructs` entries are raw wiki-derived text (see [`ConstructList`]).
     WriteSummary {
         sentence: String,
         rows: Vec<(String, String)>,
@@ -188,14 +190,17 @@ pub enum PreviewBody {
         requests: Vec<RequestView>,
     },
     /// §6.3 edit/update: the rendered and the raw line diff; `raw_only_changes` counts hunks that
-    /// only the raw diff shows (PD-51).
+    /// only the raw diff shows (PD-51). Diff line texts are untrusted text exactly as in the
+    /// input (they carry their `\n`/`\r`, see [`DiffLine`]): the UI renders them as text and makes
+    /// line terminators and trailing whitespace visible. A `LineDiff.truncated` diff must be
+    /// flagged by the builder (a warning), since its lines are not the whole change.
     EditDiff {
         rendered: Vec<DiffLine>,
         raw: Vec<DiffLine>,
         raw_only_changes: u64,
         requests: Vec<RequestView>,
     },
-    /// §6.3 transition.
+    /// §6.3 transition. Status names and field rows are display-escaped text.
     Transition {
         from: String,
         to: String,
@@ -233,7 +238,9 @@ pub struct CommentView {
     pub restricted: bool,
 }
 
-/// The wiki constructs of an outgoing text, in document order per kind (PD-47).
+/// The wiki constructs of an outgoing text, in document order per kind (PD-47). Entries (macro
+/// names, mention names, link targets, file names) are raw wiki-derived, agent-controlled text,
+/// NOT escaped: the UI must render them as text, never as HTML or a live link.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ConstructList {
     pub macros: Vec<String>,

@@ -1,4 +1,6 @@
-use atlas_duck_preview::diff::{DIFF_MAX_LINES, DiffLine, DiffOp, hunks, line_diff};
+use atlas_duck_preview::diff::{
+    DIFF_MAX_LINES, DIFF_MAX_MIDDLE_BYTES, DiffLine, DiffOp, hunks, line_diff,
+};
 
 fn d(op: DiffOp, t: &str) -> DiffLine {
     DiffLine {
@@ -7,69 +9,78 @@ fn d(op: DiffOp, t: &str) -> DiffLine {
     }
 }
 
-/// Checks that an edit script turns `old` into `new`; returns the number of non-Same lines.
+/// Checks that an untruncated edit script turns `old` into `new` byte for byte (lines split
+/// like `line_diff` does, keeping the terminator); returns the number of non-Same lines.
 fn check_script(old: &str, new: &str, script: &[DiffLine]) -> usize {
-    let o: Vec<&str> = old.lines().collect();
-    let n: Vec<&str> = new.lines().collect();
-    let kept_old: Vec<&str> = script
+    let kept_old: String = script
         .iter()
         .filter(|l| l.op != DiffOp::Add)
         .map(|l| l.text.as_str())
         .collect();
-    let kept_new: Vec<&str> = script
+    let kept_new: String = script
         .iter()
         .filter(|l| l.op != DiffOp::Del)
         .map(|l| l.text.as_str())
         .collect();
-    assert_eq!(kept_old, o, "Same+Del must reproduce old");
-    assert_eq!(kept_new, n, "Same+Add must reproduce new");
+    assert_eq!(kept_old, old, "Same+Del must reproduce old");
+    assert_eq!(kept_new, new, "Same+Add must reproduce new");
     script.iter().filter(|l| l.op != DiffOp::Same).count()
+}
+
+/// Terminates every line, so cases read as lists of lines.
+fn nl(s: &str) -> String {
+    if s.is_empty() {
+        String::new()
+    } else {
+        format!("{s}\n")
+    }
 }
 
 #[test]
 fn line_diff_identity_is_all_same() {
     let s = "a\nb\nc";
     let out = line_diff(s, s);
+    assert!(!out.truncated);
     assert_eq!(
-        out,
+        out.lines,
         vec![
-            d(DiffOp::Same, "a"),
-            d(DiffOp::Same, "b"),
+            d(DiffOp::Same, "a\n"),
+            d(DiffOp::Same, "b\n"),
             d(DiffOp::Same, "c")
         ]
     );
-    assert!(line_diff("", "").is_empty());
+    assert!(line_diff("", "").lines.is_empty());
 }
 
 #[test]
 fn line_diff_insert_delete_replace() {
     assert_eq!(
-        line_diff("a\nc", "a\nb\nc"),
+        line_diff("a\nc\n", "a\nb\nc\n").lines,
         vec![
-            d(DiffOp::Same, "a"),
-            d(DiffOp::Add, "b"),
-            d(DiffOp::Same, "c")
+            d(DiffOp::Same, "a\n"),
+            d(DiffOp::Add, "b\n"),
+            d(DiffOp::Same, "c\n")
         ]
     );
     assert_eq!(
-        line_diff("a\nb\nc", "a\nc"),
+        line_diff("a\nb\nc\n", "a\nc\n").lines,
         vec![
-            d(DiffOp::Same, "a"),
-            d(DiffOp::Del, "b"),
-            d(DiffOp::Same, "c")
+            d(DiffOp::Same, "a\n"),
+            d(DiffOp::Del, "b\n"),
+            d(DiffOp::Same, "c\n")
         ]
     );
     assert_eq!(
-        line_diff("a\nb\nc", "a\nx\nc"),
+        line_diff("a\nb\nc\n", "a\nx\nc\n").lines,
         vec![
-            d(DiffOp::Same, "a"),
-            d(DiffOp::Del, "b"),
-            d(DiffOp::Add, "x"),
-            d(DiffOp::Same, "c")
+            d(DiffOp::Same, "a\n"),
+            d(DiffOp::Del, "b\n"),
+            d(DiffOp::Add, "x\n"),
+            d(DiffOp::Same, "c\n")
         ]
     );
-    assert_eq!(line_diff("", "x"), vec![d(DiffOp::Add, "x")]);
-    assert_eq!(line_diff("x", ""), vec![d(DiffOp::Del, "x")]);
+    assert_eq!(line_diff("", "x").lines, vec![d(DiffOp::Add, "x")]);
+    assert_eq!(line_diff("x", "").lines, vec![d(DiffOp::Del, "x")]);
 }
 
 #[test]
@@ -88,31 +99,157 @@ fn line_diff_myers_minimal_on_small_cases() {
         ("k\nl\nm", "l\nm\nn", 2),
     ];
     for (old, new, min) in table {
-        let script = line_diff(old, new);
-        assert_eq!(check_script(old, new, &script), min, "{old:?} -> {new:?}");
+        let (old, new) = (nl(old), nl(new));
+        let out = line_diff(&old, &new);
+        assert!(!out.truncated);
+        assert_eq!(
+            check_script(&old, &new, &out.lines),
+            min,
+            "{old:?} -> {new:?}"
+        );
+    }
+}
+
+/// I-1: every byte difference shows as a non-Same line.
+#[test]
+fn line_diff_is_byte_faithful() {
+    let pairs = [
+        ("a", "a\n"),
+        ("a\n", "a"),
+        ("a\r\n", "a\n"),
+        ("a", "a "),
+        ("a\r", "a"),
+        ("a\r", "a\n"),
+        ("a\u{2028}b", "a b"),
+        ("a\u{2028}b\n", "a\u{2028}b"),
+        ("", "\n"),
+        ("a\r\r\n", "a\r\n"),
+        ("a\nb", "a\nb\n"),
+    ];
+    for (old, new) in pairs {
+        let out = line_diff(old, new);
+        assert!(!out.truncated);
+        assert!(
+            out.lines.iter().any(|l| l.op != DiffOp::Same),
+            "{old:?} vs {new:?} diffed as all-Same"
+        );
+        check_script(old, new, &out.lines);
+        let out = line_diff(new, old);
+        assert!(out.lines.iter().any(|l| l.op != DiffOp::Same));
+        check_script(new, old, &out.lines);
+    }
+    assert_eq!(
+        line_diff("a", "a\n").lines,
+        vec![d(DiffOp::Del, "a"), d(DiffOp::Add, "a\n")]
+    );
+    assert_eq!(
+        line_diff("a\r\nb\n", "a\nb\n").lines,
+        vec![
+            d(DiffOp::Del, "a\r\n"),
+            d(DiffOp::Add, "a\n"),
+            d(DiffOp::Same, "b\n")
+        ]
+    );
+}
+
+#[test]
+fn line_diff_equal_inputs_are_all_same() {
+    for s in ["a", "a\n", "a\r\n", "a\r", "a\u{2028}", "a \n b", "\n\n"] {
+        let out = line_diff(s, s);
+        assert!(out.lines.iter().all(|l| l.op == DiffOp::Same), "{s:?}");
+        check_script(s, s, &out.lines);
     }
 }
 
 #[test]
-fn line_diff_cap_falls_back_to_whole_replace() {
+fn line_diff_cap_applies_to_the_middle_only() {
+    // 20 001 old lines against 2 new ones: nothing in common, the middle exceeds the cap.
     let old: String = (0..=DIFF_MAX_LINES).map(|i| format!("o{i}\n")).collect();
     let new = "same\nsame2\n";
     let out = line_diff(&old, new);
-    let dels = out.iter().filter(|l| l.op == DiffOp::Del).count();
-    let adds = out.iter().filter(|l| l.op == DiffOp::Add).count();
-    assert_eq!(dels, DIFF_MAX_LINES + 1);
+    assert!(out.truncated);
+    let dels = out.lines.iter().filter(|l| l.op == DiffOp::Del).count();
+    let adds = out.lines.iter().filter(|l| l.op == DiffOp::Add).count();
+    assert_eq!(dels, DIFF_MAX_LINES);
     assert_eq!(adds, 2);
-    assert!(out.iter().all(|l| l.op != DiffOp::Same));
+    assert!(out.lines.iter().all(|l| l.op != DiffOp::Same));
     // one Del block, then one Add block: a single hunk
-    assert_eq!(hunks(&out), 1);
+    assert_eq!(hunks(&out.lines), 1);
     assert_eq!(
-        out.iter().position(|l| l.op == DiffOp::Add),
-        Some(DIFF_MAX_LINES + 1)
+        out.lines.iter().position(|l| l.op == DiffOp::Add),
+        Some(DIFF_MAX_LINES)
     );
-    // exactly at the cap still diffs normally
-    let at_cap: String = (0..DIFF_MAX_LINES).map(|i| format!("l{i}\n")).collect();
-    let out = line_diff(&at_cap, &at_cap);
-    assert!(out.iter().all(|l| l.op == DiffOp::Same));
+    // identical texts at the cap and past it diff as all Same
+    for n in [DIFF_MAX_LINES, DIFF_MAX_LINES + 1] {
+        let t: String = (0..n).map(|i| format!("l{i}\n")).collect();
+        let out = line_diff(&t, &t);
+        assert!(!out.truncated);
+        assert_eq!(out.lines.len(), n);
+        assert!(out.lines.iter().all(|l| l.op == DiffOp::Same));
+    }
+}
+
+/// I-2: a one-line change in a text past the cap still shows as one changed line.
+#[test]
+fn line_diff_huge_but_nearly_identical_keeps_prefix_and_suffix() {
+    let n = DIFF_MAX_LINES + 1;
+    let build = |mid: &str| -> String {
+        (0..n)
+            .map(|i| {
+                if i == n / 2 {
+                    format!("{mid}\n")
+                } else {
+                    format!("l{i}\n")
+                }
+            })
+            .collect()
+    };
+    let (old, new) = (build("old"), build("new"));
+    let out = line_diff(&old, &new);
+    assert!(!out.truncated);
+    assert_eq!(out.lines.len(), n + 1);
+    assert_eq!(hunks(&out.lines), 1);
+    assert_eq!(out.lines.iter().filter(|l| l.op == DiffOp::Del).count(), 1);
+    assert_eq!(out.lines.iter().filter(|l| l.op == DiffOp::Add).count(), 1);
+    assert_eq!(check_script(&old, &new, &out.lines), 2);
+    assert_eq!(out.lines.first(), Some(&d(DiffOp::Same, "l0\n")));
+    assert_eq!(
+        out.lines.last(),
+        Some(&d(DiffOp::Same, &format!("l{}\n", n - 1)))
+    );
+}
+
+#[test]
+fn line_diff_truncates_a_huge_middle_visibly() {
+    // shared head and tail, two 30 000-line dissimilar middles
+    let mk = |tag: &str| -> String {
+        let mid: String = (0..30_000).map(|i| format!("{tag}{i}\n")).collect();
+        format!("head\n{mid}tail\n")
+    };
+    let out = line_diff(&mk("a"), &mk("b"));
+    assert!(out.truncated);
+    assert_eq!(out.lines.first(), Some(&d(DiffOp::Same, "head\n")));
+    assert_eq!(out.lines.last(), Some(&d(DiffOp::Same, "tail\n")));
+    let dels = out.lines.iter().filter(|l| l.op == DiffOp::Del).count();
+    let adds = out.lines.iter().filter(|l| l.op == DiffOp::Add).count();
+    assert_eq!((dels, adds), (DIFF_MAX_LINES, DIFF_MAX_LINES));
+}
+
+#[test]
+fn line_diff_bounds_the_bytes_of_a_huge_middle() {
+    let big = "x".repeat(DIFF_MAX_MIDDLE_BYTES + 1000);
+    let out = line_diff(&format!("h\n{big}\nt\n"), "h\ny\nt\n");
+    assert!(out.truncated);
+    let del_bytes: usize = out
+        .lines
+        .iter()
+        .filter(|l| l.op == DiffOp::Del)
+        .map(|l| l.text.len())
+        .sum();
+    assert_eq!(del_bytes, DIFF_MAX_MIDDLE_BYTES);
+    assert_eq!(out.lines.first(), Some(&d(DiffOp::Same, "h\n")));
+    assert_eq!(out.lines.last(), Some(&d(DiffOp::Same, "t\n")));
+    assert!(out.lines.contains(&d(DiffOp::Add, "y\n")));
 }
 
 #[test]
@@ -120,7 +257,24 @@ fn line_diff_bounded_work_on_dissimilar_inputs() {
     let old: String = (0..5000).map(|i| format!("a{i}\n")).collect();
     let new: String = (0..5000).map(|i| format!("b{i}\n")).collect();
     let out = line_diff(&old, &new);
-    check_script(&old, &new, &out);
+    assert!(!out.truncated);
+    check_script(&old, &new, &out.lines);
+    // past the distance bound: one Del block, then one Add block, no Same
+    assert_eq!(out.lines.len(), 10_000);
+    assert!(out.lines[..5000].iter().all(|l| l.op == DiffOp::Del));
+    assert!(out.lines[5000..].iter().all(|l| l.op == DiffOp::Add));
+    assert_eq!(hunks(&out.lines), 1);
+
+    // the same with a shared prefix and suffix: they stay Same around the replaced middle
+    let (old, new) = (format!("p\n{old}s\n"), format!("p\n{new}s\n"));
+    let out = line_diff(&old, &new);
+    assert!(!out.truncated);
+    check_script(&old, &new, &out.lines);
+    assert_eq!(out.lines.len(), 10_002);
+    assert_eq!(out.lines.first(), Some(&d(DiffOp::Same, "p\n")));
+    assert_eq!(out.lines.last(), Some(&d(DiffOp::Same, "s\n")));
+    assert!(out.lines[1..5001].iter().all(|l| l.op == DiffOp::Del));
+    assert!(out.lines[5001..10_001].iter().all(|l| l.op == DiffOp::Add));
 }
 
 #[test]

@@ -34,16 +34,34 @@ pub enum InputKind {
     Integer,
     Boolean,
     Json,
-    /// At most [`CHOICE_MAX_VALUES`] values; build with [`InputKind::choice`].
-    Choice {
-        allowed_values: Vec<String>,
-    },
+    /// At most [`CHOICE_MAX_VALUES`] values; [`AllowedValues`] cannot be built past the cap.
+    Choice(AllowedValues),
+}
+
+/// The allowed values of a `Choice`; the field is private so the cap cannot be bypassed.
+/// Serializes as `{"allowed_values": [..]}` (flattened into the `Choice` tag object).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AllowedValues {
+    allowed_values: Vec<String>,
+}
+
+impl AllowedValues {
+    /// Truncated to [`CHOICE_MAX_VALUES`] values.
+    pub fn new(mut values: Vec<String>) -> AllowedValues {
+        values.truncate(CHOICE_MAX_VALUES);
+        AllowedValues {
+            allowed_values: values,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.allowed_values
+    }
 }
 
 impl InputKind {
     /// A `Choice` truncated to [`CHOICE_MAX_VALUES`] values.
-    pub fn choice(mut allowed_values: Vec<String>) -> InputKind {
-        allowed_values.truncate(CHOICE_MAX_VALUES);
-        InputKind::Choice { allowed_values }
+    pub fn choice(values: Vec<String>) -> InputKind {
+        InputKind::Choice(AllowedValues::new(values))
     }
 }

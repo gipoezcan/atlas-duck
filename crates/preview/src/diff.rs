@@ -3,9 +3,14 @@
 
 use serde::Serialize;
 
-/// More lines than this on either side: no diff is computed, the result is one Del block of all
-/// old lines followed by one Add block of all new lines.
+/// More differing lines than this on either side (after the common prefix and suffix are cut):
+/// no diff is computed, the middle is one Del block of old lines followed by one Add block of new
+/// lines, each cut to this many lines and [`DIFF_MAX_MIDDLE_BYTES`] bytes (`truncated` is set).
 pub const DIFF_MAX_LINES: usize = 20_000;
+
+/// Most bytes of changed (Del or Add) line text emitted per side. A line that crosses the budget
+/// is cut at a char boundary and the rest is dropped (`truncated` is set).
+pub const DIFF_MAX_MIDDLE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Edit distance bound of the Myers search. Past it the differing middle (after the common
 /// prefix and suffix are cut) is shown as a whole replace; this keeps time and the O(D^2) trace
@@ -20,10 +25,24 @@ pub enum DiffOp {
     Del,
 }
 
+/// One diff line. `text` is the line exactly as it is in the input, including its `\n`
+/// terminator (a final line without one has none), so a `\r`, a missing final newline or a
+/// trailing space is part of the text: the rendering layer must make them visible (escape `\r`
+/// and `\n`, mark trailing whitespace); the text is untrusted and goes out as text, never HTML.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiffLine {
     pub op: DiffOp,
     pub text: String,
+}
+
+/// The result of [`line_diff`]. `lines` is a script whose Same+Del lines concatenate to `old`
+/// and whose Same+Add lines concatenate to `new`, unless `truncated`: then the changed middle
+/// was cut at [`DIFF_MAX_LINES`] lines / [`DIFF_MAX_MIDDLE_BYTES`] bytes per side and the UI must
+/// say so (and must not offer the diff as the whole change).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LineDiff {
+    pub lines: Vec<DiffLine>,
+    pub truncated: bool,
 }
 
 /// Number of hunks: maximal runs of non-`Same` lines.
@@ -47,17 +66,17 @@ fn push(out: &mut Vec<DiffLine>, op: DiffOp, text: &str) {
     });
 }
 
-/// Line diff of `old` against `new` (lines as `str::lines` splits them, so a trailing newline
-/// is not a line). The script is a minimal edit script (fewest Add + Del lines) unless a cap
-/// applies ([`DIFF_MAX_LINES`], then the internal distance bound).
-pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
-    let a: Vec<&str> = old.lines().collect();
-    let b: Vec<&str> = new.lines().collect();
-    let mut out = Vec::new();
-    if a.len() > DIFF_MAX_LINES || b.len() > DIFF_MAX_LINES {
-        replace_all(&mut out, &a, &b);
-        return out;
-    }
+/// Line diff of `old` against `new`. Lines split after each `\n` and keep it
+/// (`split_inclusive`), so the diff is byte-faithful: two different texts never diff as all
+/// `Same` (a final newline, `\r\n` against `\n`, a lone `\r`, U+2028 and trailing whitespace all
+/// change a line). The script is a minimal edit script (fewest Add + Del lines) unless a cap
+/// applies (the internal distance bound, then [`DIFF_MAX_LINES`] / [`DIFF_MAX_MIDDLE_BYTES`]).
+/// The common prefix and suffix are always cut first and kept as `Same`; only the differing
+/// middle is capped. Same lines come from the input (so they are bounded by it); changed lines
+/// are bounded per side.
+pub fn line_diff(old: &str, new: &str) -> LineDiff {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
     let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
     let a_rest = a.get(prefix..).unwrap_or_default();
     let b_rest = b.get(prefix..).unwrap_or_default();
@@ -70,26 +89,57 @@ pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine> {
     let a_mid = a_rest.get(..a_rest.len() - suffix).unwrap_or_default();
     let b_mid = b_rest.get(..b_rest.len() - suffix).unwrap_or_default();
 
+    let mut out = Vec::new();
+    let mut truncated = false;
     for t in a.iter().take(prefix) {
         push(&mut out, DiffOp::Same, t);
     }
-    match myers(a_mid, b_mid) {
+    let fits = |m: &[&str]| {
+        m.len() <= DIFF_MAX_LINES
+            && m.iter().map(|t| t.len()).sum::<usize>() <= DIFF_MAX_MIDDLE_BYTES
+    };
+    let small = fits(a_mid) && fits(b_mid);
+    match small.then(|| myers(a_mid, b_mid)).flatten() {
         Some(script) => out.extend(script),
-        None => replace_all(&mut out, a_mid, b_mid),
+        None => truncated = replace_all(&mut out, a_mid, b_mid),
     }
     for t in a_rest.iter().skip(a_rest.len() - suffix) {
         push(&mut out, DiffOp::Same, t);
     }
-    out
+    LineDiff {
+        lines: out,
+        truncated,
+    }
 }
 
-fn replace_all(out: &mut Vec<DiffLine>, a: &[&str], b: &[&str]) {
-    for t in a {
-        push(out, DiffOp::Del, t);
+/// The middle as one Del block then one Add block, each side bounded; whether anything was cut.
+fn replace_all(out: &mut Vec<DiffLine>, a: &[&str], b: &[&str]) -> bool {
+    let cut_a = push_bounded(out, DiffOp::Del, a);
+    let cut_b = push_bounded(out, DiffOp::Add, b);
+    cut_a || cut_b
+}
+
+fn push_bounded(out: &mut Vec<DiffLine>, op: DiffOp, lines: &[&str]) -> bool {
+    let mut left = DIFF_MAX_MIDDLE_BYTES;
+    for (i, t) in lines.iter().enumerate() {
+        if i >= DIFF_MAX_LINES {
+            return true;
+        }
+        if t.len() <= left {
+            push(out, op, t);
+            left -= t.len();
+            continue;
+        }
+        let mut end = left;
+        while !t.is_char_boundary(end) {
+            end -= 1;
+        }
+        if let Some(head) = t.get(..end).filter(|h| !h.is_empty()) {
+            push(out, op, head);
+        }
+        return true;
     }
-    for t in b {
-        push(out, DiffOp::Add, t);
-    }
+    false
 }
 
 /// Myers' forward search with a trace for the backtrack. `None` when the edit distance exceeds

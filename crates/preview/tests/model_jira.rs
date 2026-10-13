@@ -91,6 +91,8 @@ fn jira_bodies_serialize_with_kind_tags() -> Result<(), serde_json::Error> {
         "transition",
     ];
     let all = bodies();
+    // a variant added to `bodies()` without a tag (or the reverse) fails here, not silently
+    assert_eq!(all.len(), tags.len());
     for (b, tag) in all.iter().zip(tags) {
         assert_eq!(serde_json::to_value(b)?["kind"], tag);
     }
