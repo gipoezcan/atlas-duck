@@ -1666,6 +1666,9 @@ async fn i25_issuelink_201_html_body_outcome_unknown() -> TestResult {
         env.to_json_line()
     );
     assert!(!env.to_json_line().contains("Please log in"));
+    // The positive control of the capture the 201-empty case checks: this one raises attention.
+    let kinds = attention_kinds(&h);
+    assert!(kinds.iter().any(|k| k == "OutcomeUnknown"), "{kinds:?}");
     assert_eq!(link_posts(mock).await.len(), 1);
     assert_eq!(
         records(&h, &id, EventType::WRITE_OUTCOME_UNKNOWN)
@@ -1753,12 +1756,37 @@ async fn issuelink_edit_form_and_type_edit() -> TestResult {
     assert_eq!(purposes(&h, &id).await?, ["resolve", "resolve"]);
     let (sentence, _) = card_rows(&opened(&h, &id)?)?;
     assert_eq!(sentence, "ABC-124 relates to ABC-123 (Relates)");
+    // An edit to a blank comment is refused by the executor's check: nothing changes.
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let comment = |text: &str| {
+        let mut set = Map::new();
+        set.insert("comment".into(), json!(text));
+        Edits {
+            set,
+            remove: Vec::new(),
+        }
+    };
+    match h.approver().edit(&id, comment("  ")) {
+        Err(DecisionError::EditRejected(e)) => {
+            assert_eq!(e.details.get("param"), Some(&json!("comment")));
+        }
+        other => return Err(format!("blank comment edit not refused: {other:?}").into()),
+    }
+    assert_eq!(h.approver().rev(&id).map_err(de)?, rev);
+    // A comment edit renders a new revision with the same resolved type (no new GET).
+    h.approver()
+        .edit(&id, comment("Linked {code}x{code}"))
+        .map_err(de)?;
+    let item = item_after(&h, &id, rev.counter).await?;
+    assert!(item.approvable);
+    assert_eq!(purposes(&h, &id).await?, ["resolve", "resolve"]);
     h.approver().approve(&id).map_err(de)?;
     let env = h.await_(&id, 10_000).await;
     assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
     let sent = link_posts(mock).await;
     let body: Value = serde_json::from_slice(&sent.first().ok_or("no POST")?.body)?;
     assert_eq!(body["type"], json!({"name": "Relates"}));
+    assert_eq!(body["comment"], json!({"body": "Linked {code}x{code}"}));
 
     // Linking an issue to itself: rejected at validation.
     let env = h
