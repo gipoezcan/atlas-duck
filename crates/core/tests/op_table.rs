@@ -14,7 +14,7 @@ use atlas_duck_core::ops::{
     StaleCtx, StaleVerdict, WriteView, confluence, entry_count, generic, op_table,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
-use atlas_duck_preview::{BodyView, ItemCount, PreviewBody, WarningId};
+use atlas_duck_preview::{BodyView, ItemCount, Level, PreviewBody, WarningId};
 use atlas_duck_registry::{BodySource, Method, OpClass, OperationSpec, SCRIPT_RUN};
 use proptest::prelude::*;
 use serde_json::{Map, Value, json};
@@ -1124,6 +1124,265 @@ fn create_missing_required_fields() -> TestResult {
     );
     assert!(!text.contains("F10"), "{text}");
     assert!(!text.contains('\u{202E}'), "{text}");
+    Ok(())
+}
+
+/// The projects and issue-type fixtures: the answers of the create's first two stages.
+fn create_stage_answers() -> Result<[Value; 2], serde_json::Error> {
+    Ok([
+        serde_json::from_str(fixtures::JIRA_PROJECTS)?,
+        serde_json::from_str(fixtures::JIRA_CREATEMETA_ISSUETYPES)?,
+    ])
+}
+
+/// A createmeta field that is not required.
+fn optional_field(n: u64) -> Value {
+    json!({"fieldId": format!("customfield_{}", 30_000 + n), "name": format!("F{n}"),
+           "schema": {"type": "string"}, "required": false, "hasDefaultValue": false})
+}
+
+/// A createmeta field page of `count` optional fields from `start`.
+fn field_page(start: u64, max: u64, total: Option<u64>, last: bool, count: u64) -> Value {
+    let mut page = json!({"startAt": start, "maxResults": max, "isLast": last,
+                          "values": (start..start + count).map(optional_field).collect::<Vec<_>>()});
+    if let Some(total) = total {
+        page["total"] = json!(total);
+    }
+    page
+}
+
+/// Name/value pairs: a query, or the rows of a card.
+type Pairs = Vec<(String, String)>;
+
+/// The later field pages a plan asks for, as `(startAt, maxResults)` query pairs.
+fn later_pages(step: EnrichStep) -> Result<Vec<Pairs>, Box<dyn std::error::Error>> {
+    let EnrichStep::Fetch(calls) = step else {
+        return Err("no later pages".into());
+    };
+    Ok(calls
+        .iter()
+        .map(|(purpose, call)| {
+            assert_eq!(*purpose, EnrichPurpose::Enrich);
+            query_of(call)
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect()
+        })
+        .collect())
+}
+
+fn page_query(start: u64, max: u64) -> Pairs {
+    vec![
+        ("startAt".to_owned(), start.to_string()),
+        ("maxResults".to_owned(), max.to_string()),
+    ]
+}
+
+/// T12 review M2: a page that is not the last but shorter than its `maxResults` steps the later
+/// pages by its own length, so no field between them is skipped.
+#[test]
+fn create_later_pages_step_by_page_length() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let [projects, types] = create_stage_answers()?;
+    let params = json!({"project": "ABC", "issuetype": "Bug", "summary": "S"});
+    let short = field_page(0, 5, Some(6), false, 2);
+    let pages = later_pages(plan_after(CREATE, &params, &[projects, types, short])?)?;
+    assert_eq!(pages, [page_query(2, 2), page_query(4, 2)]);
+    Ok(())
+}
+
+/// PD-49 / T12 review M10: at most 4 field pages: a total of 1000 asks for pages 2..4 (one round)
+/// and no fifth; after them the plan judges.
+#[test]
+fn create_field_pages_capped_at_four() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let [projects, types] = create_stage_answers()?;
+    let params = json!({"project": "ABC", "issuetype": "Bug", "summary": "S"});
+    let first = field_page(0, 50, Some(1000), false, 50);
+    let mut answers = vec![projects, types, first];
+    let pages = later_pages(plan_after(CREATE, &params, &answers)?)?;
+    assert_eq!(
+        pages,
+        [page_query(50, 50), page_query(100, 50), page_query(150, 50)]
+    );
+    answers.extend((1..4).map(|k| field_page(k * 50, 50, Some(1000), false, 50)));
+    assert!(matches!(
+        plan_after(CREATE, &params, &answers)?,
+        EnrichStep::Judge
+    ));
+    Ok(())
+}
+
+/// T12 review M10: a required-field list cut by the page cap says so (Info, never a block);
+/// a complete one does not.
+#[test]
+fn create_incomplete_field_list_is_an_info() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let [projects, types] = create_stage_answers()?;
+    let params = json!({"project": "ABC", "issuetype": "Bug", "summary": "S"});
+    let judged = |total: Option<u64>, last_is_last: bool| {
+        let mut answers = vec![projects.clone(), types.clone()];
+        answers.extend((0..4).map(|k| field_page(k * 50, 50, total, k == 3 && last_is_last, 50)));
+        enrich(CREATE, &params, &answers).map(|(_, v)| v)
+    };
+    let info = |v: &EnrichVerdict| {
+        v.warnings
+            .iter()
+            .find(|w| w.id == WarningId::RequiredFieldListIncomplete)
+            .cloned()
+    };
+    let v = judged(Some(1000), false)?;
+    assert_eq!(v.hold, Hold::Preview);
+    let w = info(&v).ok_or("no incomplete-list warning")?;
+    assert_eq!(w.level, Level::Info);
+    assert_eq!(w.text, "required-field list incomplete: 4 of 20 pages read");
+    // No total: the fourth page still says `isLast: false`.
+    let v = judged(None, false)?;
+    let w = info(&v).ok_or("no incomplete-list warning")?;
+    assert_eq!(
+        w.text,
+        "required-field list incomplete: 4 of more than 4 pages read"
+    );
+    // Complete: every page up to the total was read, or the last one says so.
+    assert!(info(&judged(Some(200), false)?).is_none());
+    assert!(info(&judged(None, true)?).is_none());
+    let one = [projects, types, field_page(0, 50, None, true, 3)];
+    assert!(info(&enrich(CREATE, &params, &one)?.1).is_none());
+    Ok(())
+}
+
+/// T12 review M6: an empty string or a `null` does not set a required field (Jira refuses it).
+#[test]
+fn create_empty_or_null_value_leaves_a_required_field_missing() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let [projects, types] = create_stage_answers()?;
+    let required = |id: &str, name: &str, ty: &str| {
+        json!({"fieldId": id, "name": name, "schema": {"type": ty}, "required": true,
+               "hasDefaultValue": false})
+    };
+    let page = json!({"isLast": true, "values": [
+        required("description", "Description", "string"),
+        required("customfield_1", "Team", "option"),
+        required("customfield_2", "Notes", "string")
+    ]});
+    let answers = [projects, types, page];
+    let p = json!({"project": "ABC", "issuetype": "Bug", "summary": "S", "description": "",
+                   "fields": {"customfield_1": null, "customfield_2": ""}});
+    let (_, v) = enrich(CREATE, &p, &answers)?;
+    let ids: Vec<&str> = v.missing_fields.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(ids, ["description", "customfield_1", "customfield_2"]);
+    Ok(())
+}
+
+/// T12 review I1 / M5: each allowed value keeps the Jira value it stands for (`{"id"}` when
+/// createmeta gives one, else `{"value"}`, in an array for an `array` of `option`; none derivable
+/// from a bare `name`), and a field with more than 10 keeps the first 10 and counts them all.
+#[test]
+fn create_missing_field_allowed_values_carry_wire_values() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let [projects, types] = create_stage_answers()?;
+    let field = |id: &str, schema: Value, allowed: Value| {
+        json!({"fieldId": id, "name": id, "schema": schema, "required": true,
+               "hasDefaultValue": false, "allowedValues": allowed})
+    };
+    let many: Vec<Value> = (0..12)
+        .map(|n| json!({"id": format!("{}", 500 + n), "value": format!("V{n}")}))
+        .collect();
+    let page = json!({"isLast": true, "values": [
+        field("customfield_1", json!({"type": "option"}), json!([
+            {"id": "10400", "value": "Platform"}, {"value": "Ops"}, {"id": "10402"},
+            {"name": "Legacy"}
+        ])),
+        field("customfield_2", json!({"type": "array", "items": "option"}),
+              json!([{"id": "1", "value": "UI"}, {"value": "API"}])),
+        field("customfield_3", json!({"type": "option"}), json!(many))
+    ]});
+    let p = json!({"project": "ABC", "issuetype": "Bug", "summary": "S"});
+    let (_, v) = enrich(CREATE, &p, &[projects, types, page])?;
+    let [single, multi, long] = v.missing_fields.as_slice() else {
+        return Err(format!("{:?}", v.missing_fields).into());
+    };
+    let pairs = |f: &atlas_duck_core::ops::MissingField| -> Vec<(String, Option<Value>)> {
+        f.allowed_values
+            .iter()
+            .map(|a| (a.label.clone(), a.wire.clone()))
+            .collect()
+    };
+    assert_eq!(
+        pairs(single),
+        [
+            ("Platform".to_owned(), Some(json!({"id": "10400"}))),
+            ("Ops".to_owned(), Some(json!({"value": "Ops"}))),
+            ("10402".to_owned(), Some(json!({"id": "10402"}))),
+            ("Legacy".to_owned(), None),
+        ]
+    );
+    assert_eq!(single.allowed_total, 4);
+    assert_eq!(
+        pairs(multi),
+        [
+            ("UI".to_owned(), Some(json!([{"id": "1"}]))),
+            ("API".to_owned(), Some(json!([{"value": "API"}]))),
+        ]
+    );
+    assert_eq!(long.allowed_values.len(), 10);
+    assert_eq!(long.allowed_total, 12);
+    Ok(())
+}
+
+/// T12 review M4 / M8: the create card's project and issue type are read from the request that
+/// is sent, a `fields` row is named like the Caution names it (`<name> (<id>)`), and a verdict
+/// whose facts disagree with the sent body cannot put its names on the card.
+#[test]
+fn create_preview_rows_come_from_the_sent_body() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let [projects, types] = create_stage_answers()?;
+    let page = json!({"isLast": true, "values": [
+        {"fieldId": "customfield_1", "name": "Team", "schema": {"type": "option"},
+         "required": true, "hasDefaultValue": false}
+    ]});
+    let p = json!({"project": "ABC", "issuetype": "Bug", "summary": "S",
+                   "fields": {"customfield_1": {"id": "10400"}}});
+    let (_, v) = enrich(CREATE, &p, &[projects, types, page])?;
+    let rows_of = |v: &EnrichVerdict| -> Result<(String, Pairs), Box<dyn std::error::Error>> {
+        let requests = write_requests(CREATE, &p, Some(v))?;
+        match write_preview(CREATE, &p, &requests, Hold::Preview, Some(v), None)?.body {
+            PreviewBody::WriteSummary { sentence, rows, .. } => Ok((sentence, rows)),
+            other => Err(format!("not the create card: {other:?}").into()),
+        }
+    };
+    let row = |rows: &[(String, String)], k: &str| {
+        rows.iter()
+            .find(|(name, _)| name == k)
+            .map(|(_, v)| v.clone())
+    };
+    let (sentence, rows) = rows_of(&v)?;
+    assert_eq!(sentence, "Create a Bug in ABC");
+    assert_eq!(row(&rows, "Project").as_deref(), Some("ABC (Alpha Beta)"));
+    assert_eq!(row(&rows, "Issue type").as_deref(), Some("Bug"));
+    assert_eq!(
+        row(&rows, "Team (customfield_1)").as_deref(),
+        Some(r#"{"id":"10400"}"#),
+        "{rows:?}"
+    );
+    // The executor sends what `resolved` says; facts that disagree are not shown as its names.
+    let mut other = v.clone();
+    other
+        .resolved
+        .insert("project_key".to_owned(), json!("OPS"));
+    other
+        .resolved
+        .insert("issuetype".to_owned(), json!("10001"));
+    let (sentence, rows) = rows_of(&other)?;
+    assert_eq!(
+        row(&rows, "Project").as_deref(),
+        Some("OPS (enrichment resolved ABC)")
+    );
+    assert_eq!(
+        row(&rows, "Issue type").as_deref(),
+        Some("10001 (enrichment resolved 10002)")
+    );
+    assert_eq!(sentence, "Create a 10001 in OPS");
     Ok(())
 }
 

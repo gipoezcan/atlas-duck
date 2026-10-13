@@ -1,6 +1,7 @@
 //! `ScriptedApprover` (C.7 `core::testing`): a headless human over `DecisionApi`. Task 21 adds
 //! the read decisions (`open`, `release`, `release_redacted`, `release_status_only`, `deny`);
-//! Task 22 the write decisions (`approve`, `edit`, `deny_with`); M5 Task 12 `edit_preadded`.
+//! Task 22 the write decisions (`approve`, `edit`, `deny_with`); M5 Task 12 `edit_preadded` and
+//! `choose_preadded`.
 //!
 //! Every decision opens the item's current revision first (`PREVIEW_SHOWN`, §5.6), as the
 //! approvals UI does, unless the method says `unopened`. The methods block (`DecisionApi` is
@@ -10,7 +11,8 @@
 use std::sync::Arc;
 
 use atlas_duck_ipc::envelope::ErrorCode;
-use atlas_duck_preview::CandidateRev;
+use atlas_duck_preview::form::{EditInput, InputKind};
+use atlas_duck_preview::{CandidateRev, Preview};
 use serde_json::{Map, Value};
 
 use crate::decision::{
@@ -23,6 +25,27 @@ use crate::validate::ValidationError;
 
 pub struct ScriptedApprover {
     decisions: Arc<dyn DecisionApi>,
+}
+
+/// The input `path` of `preview`'s edit form, if enrichment pre-added it.
+fn preadded<'p>(preview: &'p Preview, path: &str) -> Option<&'p EditInput> {
+    preview
+        .edit_form
+        .as_ref()?
+        .inputs
+        .iter()
+        .find(|i| i.pre_added && i.path == path)
+}
+
+/// What the UI would not let through, refused before it reaches core (nothing logged).
+fn refused(path: &str, message: &str) -> DecisionError {
+    let mut details = Map::new();
+    details.insert("param".into(), Value::from(path));
+    DecisionError::EditRejected(ValidationError {
+        code: ErrorCode::Validation,
+        message: message.to_owned(),
+        details,
+    })
 }
 
 fn decision(request_id: &str, decision: DecisionKind, rev: CandidateRev) -> Decision {
@@ -173,7 +196,9 @@ impl ScriptedApprover {
     /// Fills the pre-added input `path` (`fields.<id>`, a missing required field, PD-49) of the
     /// current revision's edit form with `value`, as the approvals UI does: opens the revision,
     /// refuses a path its edit form did not pre-add, then edits like [`Self::edit`] (an
-    /// `enrich_keys` param: enrichment runs again).
+    /// `enrich_keys` param: enrichment runs again). The open is the UI's own (the form is only
+    /// reachable from an opened preview, §5.6), so it logs `PREVIEW_SHOWN` even when the path is
+    /// then refused; the refusal itself logs nothing (T12 review M9).
     pub fn edit_preadded(
         &self,
         request_id: &str,
@@ -181,19 +206,38 @@ impl ScriptedApprover {
         value: Value,
     ) -> Result<DecisionOutcome, DecisionError> {
         let preview = self.open(request_id)?.preview;
-        let pre_added = preview
-            .edit_form
-            .as_ref()
-            .is_some_and(|f| f.inputs.iter().any(|i| i.pre_added && i.path == path));
-        if !pre_added {
-            let mut details = Map::new();
-            details.insert("param".into(), Value::from(path));
-            return Err(DecisionError::EditRejected(ValidationError {
-                code: ErrorCode::Validation,
-                message: "not a pre-added input of this revision".to_owned(),
-                details,
-            }));
+        if preadded(&preview, path).is_none() {
+            return Err(refused(path, "not a pre-added input of this revision"));
         }
+        self.set(request_id, path, value)
+    }
+
+    /// Picks `label` in the pre-added `Choice` input `path`, as the approvals UI does: opens the
+    /// revision, refuses a label the input does not list, then sends the label as the edit; core
+    /// turns it into the Jira value (T12 review I1).
+    pub fn choose_preadded(
+        &self,
+        request_id: &str,
+        path: &str,
+        label: &str,
+    ) -> Result<DecisionOutcome, DecisionError> {
+        let preview = self.open(request_id)?.preview;
+        let listed = match preadded(&preview, path).map(|i| &i.kind) {
+            Some(InputKind::Choice(allowed)) => allowed.as_slice().iter().any(|l| l == label),
+            _ => false,
+        };
+        if !listed {
+            return Err(refused(path, "not a choice of this revision's input"));
+        }
+        self.set(request_id, path, Value::from(label))
+    }
+
+    fn set(
+        &self,
+        request_id: &str,
+        path: &str,
+        value: Value,
+    ) -> Result<DecisionOutcome, DecisionError> {
         let mut set = Map::new();
         set.insert(path.to_owned(), value);
         self.edit(

@@ -1303,11 +1303,15 @@ async fn edit_write(
         .validated
         .as_ref()
         .map_or(Value::Null, |v| v.params.clone());
+    // T12 review I1: a label picked in a pre-added choice becomes the Jira value it stands for,
+    // from the very form this revision shows.
+    let form = write::edit_form(spec, &snap.write);
+    let edits = write::choice_edits(&form, edits).map_err(DecisionError::EditRejected)?;
     let result = match apply_edits(
         spec,
         &agent,
         &snap.write.params,
-        edits,
+        &edits,
         op.enrich_keys,
         &vctx,
     ) {
@@ -1386,14 +1390,19 @@ fn resolution_message(params: &Value, param: &str, value: &str) -> String {
 }
 
 /// PD-49: a missing required field as a `missing_fields` deny hint lists it (§4.3): raw server
-/// text like resolution candidates, `allowed_values` only when the human ticked them.
+/// text like resolution candidates, `allowed_values` (names only) only when the human ticked
+/// them, with `allowed_values_total` when that list is cut (T12 review M5).
 fn missing_field_detail(f: &MissingField, include_allowed_values: bool) -> Value {
     let mut m = serde_json::Map::new();
     m.insert("id".into(), Value::from(f.id.clone()));
     m.insert("name".into(), Value::from(f.name.clone()));
     m.insert("schema_type".into(), Value::from(f.schema_type.clone()));
     if include_allowed_values {
-        m.insert("allowed_values".into(), serde_json::json!(f.allowed_values));
+        let labels: Vec<&str> = f.allowed_values.iter().map(|v| v.label.as_str()).collect();
+        if f.allowed_total > u64::try_from(labels.len()).unwrap_or(u64::MAX) {
+            m.insert("allowed_values_total".into(), Value::from(f.allowed_total));
+        }
+        m.insert("allowed_values".into(), serde_json::json!(labels));
     }
     Value::Object(m)
 }
@@ -1460,7 +1469,17 @@ fn deny_hint(entry: &RequestEntry, details: DenyDetails) -> Result<Value, Decisi
                 .iter()
                 .map(|f| missing_field_detail(f, include_allowed_values))
                 .collect();
-            Ok(serde_json::json!({ "code": "denied", "details": { "missing_fields": list } }))
+            let mut d = serde_json::Map::new();
+            // T12 review M5: a list cut at `jira::MAX_MISSING_FIELDS` says how many there are.
+            let listed = u64::try_from(list.len()).unwrap_or(u64::MAX);
+            if verdict.missing_fields_total > listed {
+                d.insert(
+                    "missing_fields_total".into(),
+                    Value::from(verdict.missing_fields_total),
+                );
+            }
+            d.insert("missing_fields".into(), Value::Array(list));
+            Ok(serde_json::json!({ "code": "denied", "details": d }))
         }
         _ => Err(refuse()),
     }

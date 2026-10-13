@@ -39,7 +39,7 @@ use atlas_duck_atlassian::{
 use atlas_duck_audit::request_set::requests_to_json;
 use atlas_duck_audit::{NewEvent, RequestRecord, request_set_hash};
 use atlas_duck_ipc::envelope::ErrorCode;
-use atlas_duck_preview::form::{EditForm, EditInput, InputKind};
+use atlas_duck_preview::form::{ChoiceRefusal, EditForm, EditInput, InputKind};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{Level, OutcomeKind as CardKind};
@@ -55,7 +55,7 @@ use super::read::{
 use super::{
     Engine, EntryState, InFlight, InstanceHttp, OnAuditFailure, RequestEntry, TransitionError,
 };
-use crate::edit::EditedKeys;
+use crate::edit::{EditedKeys, Edits};
 use crate::gate::{AttentionKind, UiEvent};
 use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
@@ -74,6 +74,7 @@ use crate::payloads::{
     self, EventCtx, FetchRecord, OutcomeKind, PreviewFetchPurpose, WriteFailure, WriteStaleReason,
 };
 use crate::proxy::ResolvedProxy;
+use crate::validate::{ValidationError, echo};
 
 /// §5.4 step 2 (verbatim): the deny reason the approvals UI pre-fills for a conflict (M6).
 pub const CONFLICT_DENY_PREFILL: &str = "target changed since you read it; re-read and resubmit";
@@ -381,8 +382,8 @@ pub(crate) fn preview_model(
 const LONG_TEXT_PARAMS: [&str; 3] = ["description", "body", "comment"];
 
 /// The input kind of a params-schema property (Δ2): `string` → text (long for bodies and
-/// comments), `integer` → integer, `boolean` → boolean, anything else (object, array, number,
-/// none) → JSON. A type list (`["string", "null"]`) counts by its first non-null entry.
+/// comments), `integer` → integer, `number` → number, `boolean` → boolean, anything else (object,
+/// array, none) → JSON. A type list (`["string", "null"]`) counts by its first non-null entry.
 fn param_kind(name: &str, prop: &Value) -> InputKind {
     let ty = match prop.get("type") {
         Some(Value::String(t)) => Some(t.as_str()),
@@ -396,27 +397,91 @@ fn param_kind(name: &str, prop: &Value) -> InputKind {
         Some("string") if LONG_TEXT_PARAMS.contains(&name) => InputKind::LongText,
         Some("string") => InputKind::Text,
         Some("integer") => InputKind::Integer,
+        Some("number") => InputKind::Number,
         Some("boolean") => InputKind::Boolean,
         _ => InputKind::Json,
     }
 }
 
 /// PD-49: the input of a missing required field: a choice of its allowed values for an `option`
-/// (or an `array` of `option`), an integer for a `number`, text for a `string`, else JSON.
+/// (or an `array` of `option`), each label paired with the Jira value a pick of it sends (T12
+/// review I1); a number for a `number` (decimals allowed, T12 review M7), an integer only for an
+/// `integer`, text for a `string`, else JSON.
 fn missing_kind(f: &MissingField) -> InputKind {
     let choice = f.schema_type == "option"
         || (f.schema_type == "array" && f.schema_items.as_deref() == Some("option"));
     match f.schema_type.as_str() {
-        _ if choice && !f.allowed_values.is_empty() => InputKind::choice(
+        _ if choice && !f.allowed_values.is_empty() => InputKind::choice_with_wire(
             f.allowed_values
                 .iter()
-                .map(|v| one_line(escape_for_display(v)))
+                .map(|v| (one_line(escape_for_display(&v.label)), v.wire.clone()))
                 .collect(),
         ),
-        "number" => InputKind::Integer,
+        "number" => InputKind::Number,
+        "integer" => InputKind::Integer,
         "string" => InputKind::Text,
         _ => InputKind::Json,
     }
+}
+
+/// The label of a missing field's input: `<name> (<id>)` like the Caution names it, plus a count
+/// when its choice lists only the first of more allowed values (T12 review M5).
+fn missing_label(f: &MissingField, kind: &InputKind) -> String {
+    let mut label = format!("{} ({})", f.name, f.id);
+    let listed = u64::try_from(f.allowed_values.len()).unwrap_or(u64::MAX);
+    if let InputKind::Choice(allowed) = kind
+        && f.allowed_total > listed
+    {
+        let shown = allowed.as_slice().len();
+        label.push_str(&format!(", {shown} of {} values listed", f.allowed_total));
+    }
+    one_line(escape_for_display(&label))
+}
+
+/// Message of an edit that picks a label its `Choice` input cannot send (T12 review I1).
+pub const MSG_CHOICE_NOT_LISTED: &str = "not one of this input's choices";
+/// Message of an edit that picks a label shown for more than one allowed value.
+pub const MSG_CHOICE_AMBIGUOUS: &str = "this choice names more than one allowed value";
+/// Message of an edit that picks an allowed value createmeta gave neither an id nor a value for.
+pub const MSG_CHOICE_NO_VALUE: &str =
+    "this choice has no id or value Jira accepts; enter the field as JSON";
+
+/// T12 review I1: the UI sends the label it showed for a pre-added `Choice` input; before the
+/// edit is applied each such label becomes the Jira value it stands for ([`missing_kind`]). A
+/// label the input does not list, lists twice, or has no Jira value for refuses the edit
+/// (nothing logged, like invalid params). Any other value passes as it is (the raw-JSON editor,
+/// §5.4 step 4).
+pub(crate) fn choice_edits(form: &EditForm, edits: &Edits) -> Result<Edits, ValidationError> {
+    let mut out = edits.clone();
+    for (path, value) in out.set.iter_mut() {
+        let Value::String(label) = &*value else {
+            continue;
+        };
+        let Some(InputKind::Choice(allowed)) = form
+            .inputs
+            .iter()
+            .find(|i| i.pre_added && i.path == *path)
+            .map(|i| &i.kind)
+        else {
+            continue;
+        };
+        let wire = allowed.wire_for(label).cloned().map_err(|why| {
+            let message = match why {
+                ChoiceRefusal::NotListed => MSG_CHOICE_NOT_LISTED,
+                ChoiceRefusal::Ambiguous => MSG_CHOICE_AMBIGUOUS,
+                ChoiceRefusal::NoWireValue => MSG_CHOICE_NO_VALUE,
+            };
+            let mut details = Map::new();
+            details.insert("param".into(), Value::from(echo(path)));
+            ValidationError {
+                code: ErrorCode::Validation,
+                message: message.to_owned(),
+                details,
+            }
+        })?;
+        *value = wire;
+    }
+    Ok(out)
 }
 
 /// §5.4 step 4 (Δ2, L06, PD-49): the edit form of a write preview: one input per params-schema
@@ -454,10 +519,11 @@ pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
             own.required = true;
             continue;
         }
+        let kind = missing_kind(f);
         inputs.push(EditInput {
             path: format!("fields.{}", f.id),
-            label: one_line(escape_for_display(&format!("{} ({})", f.name, f.id))),
-            kind: missing_kind(f),
+            label: missing_label(f, &kind),
+            kind,
             read_only: false,
             required: true,
             pre_added: true,

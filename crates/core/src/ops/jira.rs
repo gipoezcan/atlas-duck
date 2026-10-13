@@ -9,9 +9,10 @@ use atlas_duck_preview::warning::{self, Warning, WarningId};
 use serde_json::{Map, Value, json};
 
 use super::{
-    EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    MAX_ALLOWED_VALUES, MissingField, ReadPlan, WriteSummaryFacts, cap_diff_text, generic,
-    get_call, jira_body, json_request, resolve_url, single_round, str_param,
+    AllowedValue, EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx,
+    ExecError, ExecPlan, MAX_ALLOWED_VALUES, MissingField, ReadPlan, WriteSummaryFacts,
+    cap_diff_text, generic, get_call, jira_body, json_request, resolve_url, single_round,
+    str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
@@ -348,23 +349,36 @@ fn fields_call(key: &str, type_id: &str, page: Option<(u64, u64)>) -> (EnrichPur
     (EnrichPurpose::Enrich, call)
 }
 
-/// PD-49: the pages after the first while it says `isLast: false`, all in one round: by the
-/// server's `maxResults` (else the first page's length) from its `startAt`, below `total` when it
-/// sends one, at most [`MAX_FIELD_PAGES`] pages in all.
+/// How many fields a createmeta page holds.
+fn page_len(page: &Value) -> Option<u64> {
+    page.get("values")
+        .and_then(Value::as_array)
+        .and_then(|v| u64::try_from(v.len()).ok())
+}
+
+/// The page step of a createmeta answer: its length when it has one, capped by the server's
+/// `maxResults` (T12 review M2: a page shorter than `maxResults` that is not the last must not
+/// make the later pages skip fields), else `maxResults`.
+fn page_step(first: &Value) -> Option<u64> {
+    let max = first
+        .get("maxResults")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0);
+    match (max, page_len(first).filter(|n| *n > 0)) {
+        (Some(max), Some(len)) => Some(max.min(len)),
+        (max, len) => max.or(len),
+    }
+}
+
+/// PD-49: the pages after the first while it says `isLast: false`, all in one round: by
+/// [`page_step`] from its `startAt`, below `total` when it sends one, at most
+/// [`MAX_FIELD_PAGES`] pages in all. Without a `total` they are asked for speculatively (3 more
+/// GETs at most, each answer within the 32 MiB response cap).
 fn later_field_pages(key: &str, type_id: &str, first: &Value) -> Vec<(EnrichPurpose, GetCall)> {
     if first.get("isLast").and_then(Value::as_bool) != Some(false) {
         return Vec::new();
     }
-    let len = first
-        .get("values")
-        .and_then(Value::as_array)
-        .and_then(|v| u64::try_from(v.len()).ok());
-    let Some(size) = first
-        .get("maxResults")
-        .and_then(Value::as_u64)
-        .filter(|n| *n > 0)
-        .or(len.filter(|n| *n > 0))
-    else {
+    let Some(size) = page_step(first) else {
         return Vec::new();
     };
     let start = first.get("startAt").and_then(Value::as_u64).unwrap_or(0);
@@ -374,6 +388,37 @@ fn later_field_pages(key: &str, type_id: &str, first: &Value) -> Vec<(EnrichPurp
         .take_while(|s| total.is_none_or(|t| *s < t))
         .map(|s| fields_call(key, type_id, Some((s, size))))
         .collect()
+}
+
+/// T12 review M10: whether the field pages read leave some out, as `(pages read, pages in all)`
+/// (`None` in all when no `total` says): page 1 said `isLast: false`, and either the pages read
+/// end below its `total`, or (no total) the last one read says `isLast: false` too.
+fn field_list_cut(pages: &[Value]) -> Option<(u64, Option<u64>)> {
+    let first = pages.first()?;
+    if first.get("isLast").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let read = u64::try_from(pages.len()).unwrap_or(u64::MAX);
+    match first.get("total").and_then(Value::as_u64) {
+        Some(total) => {
+            let covered = pages
+                .iter()
+                .filter_map(|p| {
+                    let start = p.get("startAt").and_then(Value::as_u64).unwrap_or(0);
+                    start.checked_add(page_len(p)?)
+                })
+                .max()
+                .unwrap_or(0);
+            (covered < total).then(|| {
+                let all = page_step(first).map(|s| total.div_ceil(s).max(read.saturating_add(1)));
+                (read, all)
+            })
+        }
+        None => {
+            let more = pages.last()?.get("isLast").and_then(Value::as_bool) == Some(false);
+            more.then_some((read, None))
+        }
+    }
 }
 
 /// Δ3: answers `[projects]`, `[.., issue types]`, `[.., fields page 1]`, `[.., later pages]`.
@@ -412,16 +457,37 @@ fn create_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
 }
 
 /// Whether a dedicated param or a `fields` key sets `id` (PD-49). `description` counts only when
-/// the agent gave one.
+/// the agent gave one. A `null` or an empty string sets nothing (T12 review M6: Jira refuses it
+/// for a required field); an empty array or object is left to Jira.
 fn set_by_params(params: &Value, id: &str) -> bool {
-    let present = |name: &str| params.get(name).is_some_and(|v| !v.is_null());
+    let set = |v: Option<&Value>| v.is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
     match id {
-        "project" | "issuetype" | "summary" | "description" if present(id) => true,
-        _ => params
+        "project" | "issuetype" | "summary" | "description" if set(params.get(id)) => true,
+        _ => set(params
             .get("fields")
             .and_then(Value::as_object)
-            .is_some_and(|m| m.contains_key(id)),
+            .and_then(|m| m.get(id))),
     }
+}
+
+/// T12 review M8: createmeta's `(fieldId, name)` of the `fields` keys the params set, in
+/// createmeta order, each once, at most [`MAX_MISSING_FIELDS`] (the card names their rows).
+fn set_field_names(params: &Value, pages: &[Value]) -> Vec<(String, String)> {
+    let Some(set) = params.get("fields").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::HashSet::new();
+    pages
+        .iter()
+        .filter_map(|p| p.get("values").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|f| {
+            let id = f.get("fieldId").and_then(Value::as_str)?;
+            let name = f.get("name").and_then(Value::as_str)?;
+            (set.contains_key(id) && seen.insert(id)).then(|| (id.to_owned(), capped(name)))
+        })
+        .take(MAX_MISSING_FIELDS)
+        .collect()
 }
 
 /// PD-49: `required && !hasDefaultValue` fields no param sets, in createmeta order over the pages
@@ -453,21 +519,17 @@ fn missing_fields(params: &Value, pages: &[Value]) -> Option<(Vec<MissingField>,
                     .and_then(Value::as_str)
                     .map(capped)
             };
-            let allowed_values = field
+            let many = schema("type").as_deref() == Some("array");
+            let listed = field
                 .get("allowedValues")
                 .and_then(Value::as_array)
-                .map(|vals| {
-                    vals.iter()
-                        .filter_map(|v| {
-                            v.get("value")
-                                .or_else(|| v.get("name"))
-                                .and_then(Value::as_str)
-                                .map(capped)
-                        })
-                        .take(MAX_ALLOWED_VALUES)
-                        .collect()
-                })
+                .map(Vec::as_slice)
                 .unwrap_or_default();
+            let allowed_values = listed
+                .iter()
+                .filter_map(|v| allowed_value(v, many))
+                .take(MAX_ALLOWED_VALUES)
+                .collect();
             out.push(MissingField {
                 id: capped(id),
                 name: field
@@ -477,10 +539,29 @@ fn missing_fields(params: &Value, pages: &[Value]) -> Option<(Vec<MissingField>,
                 schema_type: schema("type").unwrap_or_default(),
                 schema_items: schema("items"),
                 allowed_values,
+                allowed_total: u64::try_from(listed.len()).unwrap_or(u64::MAX),
             });
         }
     }
     Some((out, total))
+}
+
+/// One createmeta `allowedValues` entry (T12 review I1): its label (`value`, else `name`, else
+/// `id`) and the value Jira takes for it: `{"id"}` when there is one (exact), else `{"value"}`
+/// with the raw value, in an array when the field is an `array` (`many`). `None`: no label.
+fn allowed_value(v: &Value, many: bool) -> Option<AllowedValue> {
+    let text = |k: &str| v.get(k).and_then(Value::as_str);
+    let id = text("id").filter(|i| !i.is_empty());
+    let label = text("value").or_else(|| text("name")).or(id)?;
+    let one = match (id, text("value")) {
+        (Some(id), _) => Some(json!({"id": id})),
+        (None, Some(value)) => Some(json!({"value": value})),
+        (None, None) => None,
+    };
+    Some(AllowedValue {
+        label: capped(label),
+        wire: one.map(|w| if many { Value::Array(vec![w]) } else { w }),
+    })
 }
 
 /// PD-49 (plan text): `"<name> (<fieldId>, <schema.type>)"` joined by `", "` in createmeta order,
@@ -521,11 +602,10 @@ fn create_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
         Ok(t) => t,
         Err(v) => return *v,
     };
-    let Some((missing, total)) = answers
-        .get(2..)
-        .filter(|pages| !pages.is_empty())
-        .and_then(|pages| missing_fields(ctx.params, pages))
-    else {
+    let Some(pages) = answers.get(2..).filter(|pages| !pages.is_empty()) else {
+        return EnrichVerdict::unusable();
+    };
+    let Some((missing, total)) = missing_fields(ctx.params, pages) else {
         return EnrichVerdict::unusable();
     };
     let mut resolved = Map::new();
@@ -539,11 +619,21 @@ fn create_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
             warning::missing_required_fields(&missing_list(&missing, total)),
         ));
     }
+    // PD-49 is advisory (§5.4 step 2: Jira decides): a cut field list is an Info, not a block.
+    if let Some((read, all)) = field_list_cut(pages) {
+        verdict.warnings.push(Warning::new(
+            WarningId::RequiredFieldListIncomplete,
+            warning::required_field_list_incomplete(read, all),
+        ));
+    }
     verdict.missing_fields = missing;
+    verdict.missing_fields_total = total;
     verdict.summary = Some(WriteSummaryFacts {
         project_key: Some(project.key),
         project_name: project.name.as_deref().map(capped),
+        issue_type_id: Some(issuetype.id),
         issue_type: issuetype.name.as_deref().map(capped),
+        field_names: set_field_names(ctx.params, pages),
     });
     verdict
 }

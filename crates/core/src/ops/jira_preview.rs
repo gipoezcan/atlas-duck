@@ -882,9 +882,9 @@ fn construct_list(wiki: &str) -> ConstructList {
 }
 
 /// §6.3 Create: the `jira.issue.create` card over the exact request (§5.1 inv. 4: the request list
-/// stays part of the body). The project and issue type are what enrichment resolved; summary,
-/// description and the other fields are read from the request that is sent (T7 M-6: never
-/// converted again), the description shown as the text of its wiki markup with its constructs
+/// stays part of the body). Every row is read from the request that is sent (T7 M-6: never
+/// converted again; T12 review M4: the project key and issue type id too, named from the
+/// verdict's facts only where they are about the same ones), the description shown as the text of its wiki markup with its constructs
 /// listed (PD-47). The missing-fields Caution is the verdict's own (PD-49). Every other hold,
 /// or a request that is not the create JSON, keeps the generic write preview.
 pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
@@ -908,11 +908,30 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         return model;
     };
     let mut hidden = 0u64;
-    let key = facts.project_key.as_deref().unwrap_or_default();
-    let issue_type = facts.issue_type.as_deref().unwrap_or_default();
-    let project = match facts.project_name.as_deref() {
-        Some(name) => format!("{key} ({name})"),
-        None => key.to_owned(),
+    // T12 review M4: the project and issue type the request sends; the verdict's names only
+    // where its facts are about the same ones (by construction always; a mismatch is shown).
+    let sent = |k: &str, sub: &str| {
+        fields
+            .get(k)
+            .and_then(|v| v.get(sub))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let (key, type_id) = (sent("project", "key"), sent("issuetype", "id"));
+    let project = match (facts.project_key.as_deref(), facts.project_name.as_deref()) {
+        (Some(k), Some(name)) if k == key => format!("{key} ({name})"),
+        (Some(k), _) if k != key => format!("{key} (enrichment resolved {k})"),
+        _ => key.clone(),
+    };
+    let same_type = facts.issue_type_id.as_deref() == Some(type_id.as_str());
+    let issue_type = match facts.issue_type.as_deref() {
+        Some(name) if same_type => name.to_owned(),
+        _ => type_id.clone(),
+    };
+    let type_row = match facts.issue_type_id.as_deref() {
+        Some(id) if !same_type => format!("{type_id} (enrichment resolved {id})"),
+        _ => issue_type.clone(),
     };
     let mut rows = vec![
         (
@@ -921,7 +940,7 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         ),
         (
             "Issue type".to_owned(),
-            line(issue_type, CELL_CAP_CHARS, &mut hidden),
+            line(&type_row, CELL_CAP_CHARS * 2, &mut hidden),
         ),
     ];
     let text = |k: &str| fields.get(k).and_then(Value::as_str);
@@ -941,8 +960,9 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         }
         rows.push(("Description".to_owned(), shown));
     }
-    // The agent's other fields, verbatim JSON (PD-42), by id: write previews take no field
-    // names (T8 handoff).
+    // The other fields, verbatim JSON (PD-42), named like the Caution and the edit form name a
+    // field (`<name> (<id>)`, T12 review M8) where createmeta listed it; else by id (write
+    // previews take no cached field names, T8 handoff).
     for (id, value) in &fields {
         if matches!(
             id.as_str(),
@@ -950,11 +970,12 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         ) {
             continue;
         }
+        let label = match facts.field_names.iter().find(|(f, _)| f == id) {
+            Some((_, name)) => line(&format!("{name} ({id})"), CELL_CAP_CHARS * 2, &mut hidden),
+            None => field_label(None, id),
+        };
         let json = serde_json::to_string(value).unwrap_or_default();
-        rows.push((
-            field_label(None, id),
-            line(&json, FIELD_VALUE_CAP, &mut hidden),
-        ));
+        rows.push((label, line(&json, FIELD_VALUE_CAP, &mut hidden)));
     }
     let requests = match std::mem::replace(
         &mut model.body,
@@ -967,7 +988,7 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     };
     model.body = PreviewBody::WriteSummary {
         sentence: line(
-            &create_sentence(issue_type, key),
+            &create_sentence(&issue_type, &key),
             CELL_CAP_CHARS * 2,
             &mut hidden,
         ),

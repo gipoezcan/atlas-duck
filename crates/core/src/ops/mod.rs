@@ -248,6 +248,9 @@ pub struct EnrichVerdict {
     /// Δ4 (PD-49): the required fields without a default that no param sets, in createmeta
     /// order (raw server text). A Caution, never a block; a deny may attach them.
     pub missing_fields: Vec<MissingField>,
+    /// How many missing fields there are in all; `missing_fields` keeps at most
+    /// `jira::MAX_MISSING_FIELDS` (T12 review M5: a cut list says so).
+    pub missing_fields_total: u64,
     /// Δ4: resolved display facts for the write previews (raw server text; the previewer
     /// escapes them).
     pub summary: Option<WriteSummaryFacts>,
@@ -265,8 +268,10 @@ pub struct MissingField {
     /// Additive: `schema.items` of an `array` field (`option` for a multi-select), which the edit
     /// form's input kind needs; never delivered.
     pub schema_items: Option<String>,
-    /// At most [`MAX_ALLOWED_VALUES`] names (`value`, else `name`).
-    pub allowed_values: Vec<String>,
+    /// The first [`MAX_ALLOWED_VALUES`] of createmeta's `allowedValues`.
+    pub allowed_values: Vec<AllowedValue>,
+    /// How many `allowedValues` createmeta listed (T12 review M5: a cut list says so).
+    pub allowed_total: u64,
 }
 
 /// Redacting `Debug` (§7.7): names and values are Atlassian data.
@@ -275,6 +280,28 @@ impl fmt::Debug for MissingField {
         f.debug_struct("MissingField")
             .field("id", &format_args!("len={}", self.id.len()))
             .field("allowed_values", &self.allowed_values.len())
+            .field("allowed_total", &self.allowed_total)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One allowed value of a missing field (T12 review I1): the name it is shown and listed by,
+/// and the value a request sends for it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AllowedValue {
+    /// `value`, else `name`, else `id` (raw, cut to the name cap).
+    pub label: String,
+    /// The field value Jira takes for this pick, already in the field's shape: `{"id": ..}` when
+    /// createmeta gives an id, else `{"value": ..}` (the raw value, never cut), inside an array
+    /// for an `array` of `option`. `None`: neither is there, so a pick of it is refused.
+    pub wire: Option<Value>,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for AllowedValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AllowedValue")
+            .field("wire", &self.wire.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -286,10 +313,15 @@ pub const MAX_ALLOWED_VALUES: usize = atlas_duck_preview::form::CHOICE_MAX_VALUE
 /// Later tasks add their facts (from/to status, assignee, link phrases, sprint).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct WriteSummaryFacts {
-    /// `jira.issue.create`: the resolved project's key and name, the issue type's name.
+    /// `jira.issue.create`: the resolved project's key and name, the issue type's id and name.
     pub project_key: Option<String>,
     pub project_name: Option<String>,
+    pub issue_type_id: Option<String>,
     pub issue_type: Option<String>,
+    /// `jira.issue.create`: createmeta's `(fieldId, name)` of the `fields` keys the params set
+    /// (T12 review M8: the card names them like the Caution does); at most
+    /// `jira::MAX_MISSING_FIELDS`.
+    pub field_names: Vec<(String, String)>,
 }
 
 /// Redacting `Debug` (§7.7).
@@ -311,6 +343,7 @@ impl EnrichVerdict {
             warnings: Vec::new(),
             diff_text: String::new(),
             missing_fields: Vec::new(),
+            missing_fields_total: 0,
             summary: None,
         }
     }

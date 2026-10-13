@@ -16,11 +16,13 @@ use atlas_duck_core::ops::{
 };
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::{ConverterFault, Harness};
-use atlas_duck_core::{DecisionError, DecisionOutcome, DenyDetails, Edits, Pause, TestHooks};
+use atlas_duck_core::{
+    DecisionError, DecisionOutcome, DenyDetails, Edits, Pause, ShutdownReason, TestHooks,
+};
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_preview::form::{EditInput, InputKind};
 use atlas_duck_preview::{Level, Preview, PreviewBody, WarningId};
-use common::jira::{PROJECTS_PATH, gets_on, issuetypes_path, mount_create_stages};
+use common::jira::{PROJECTS_PATH, gets_on, issuetypes_path, mount_create_stages, query};
 use common::{TestError, TestResult, code, de, exit, message, request_id, test_hits};
 use serde_json::{Map, Value, json};
 use wiremock::Mock;
@@ -514,7 +516,11 @@ async fn i18_missing_fields_warning_approve_enabled() -> TestResult {
     assert_eq!(caution.text, TEAM_CAUTION);
     let team = input(&p, "fields.customfield_10200")?;
     assert!(team.pre_added && team.required && !team.read_only);
-    assert_eq!(team.kind, InputKind::choice(vec!["Platform".to_owned()]));
+    // The UI sees the labels only (T12 review I1); core keeps the Jira value of each.
+    match &team.kind {
+        InputKind::Choice(allowed) => assert_eq!(allowed.as_slice(), ["Platform"]),
+        other => return Err(format!("not a choice: {other:?}").into()),
+    }
     assert_eq!(team.value, Value::Null);
     assert!(team.label.contains("Team"), "{}", team.label);
     // The create card: resolved project and issue type, the request list.
@@ -540,7 +546,8 @@ async fn i18_missing_fields_warning_approve_enabled() -> TestResult {
     Ok(())
 }
 
-/// Opens, fills the pre-added Team input, waits for the re-enrichment; returns the request id.
+/// Opens, picks `Platform` in the pre-added Team input (the label the UI shows, T12 review I1),
+/// waits for the re-enrichment; returns the request id.
 async fn edited_team_create(h: &Harness) -> Result<String, TestError> {
     let mock = jira(h)?;
     mount_team_stages(mock).await;
@@ -549,11 +556,7 @@ async fn edited_team_create(h: &Harness) -> Result<String, TestError> {
     let rev = h.approver().rev(&id).map_err(de)?;
     let fetched = records(h, &id, EventType::PREVIEW_FETCH).await?.len();
     h.approver()
-        .edit_preadded(
-            &id,
-            "fields.customfield_10200",
-            json!({ "value": "Platform" }),
-        )
+        .choose_preadded(&id, "fields.customfield_10200", "Platform")
         .map_err(de)?;
     rev_after(h, &id, rev.counter).await?;
     // The edit touched `fields` (an `enrich_keys` param): the enrichment ran again.
@@ -594,10 +597,11 @@ async fn i18_edit_and_approve_preadded_input_sends_field() -> TestResult {
         data["edited_keys"]["added"],
         json!(["fields.customfield_10200"])
     );
+    // The picked label went out as the option's id (createmeta gave one).
     let body = sent_create(jira(&h)?).await?;
     assert_eq!(
         body["fields"]["customfield_10200"],
-        json!({ "value": "Platform" })
+        json!({ "id": "10400" })
     );
     // One approval, of the edited revision (the wire bytes are the approved list).
     let approved = records(&h, &id, EventType::WRITE_APPROVED).await?;
@@ -837,7 +841,9 @@ async fn description_edit_reruns_enrichment() -> TestResult {
     Ok(())
 }
 
-/// `edit_preadded` is for the inputs enrichment pre-added, nothing else.
+/// `edit_preadded` is for the inputs enrichment pre-added, nothing else. Like the approvals UI,
+/// it opens the revision first (the form is only reachable from an opened preview, §5.6), so
+/// that open's `PREVIEW_SHOWN` is logged; the refusal itself logs nothing (T12 review M9).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edit_preadded_refuses_other_paths() -> TestResult {
     let h = Harness::jira().await?;
@@ -852,7 +858,16 @@ async fn edit_preadded_refuses_other_paths() -> TestResult {
         matches!(res, Err(DecisionError::EditRejected(_))),
         "{res:?}"
     );
-    assert!(records(&h, &id, EventType::WRITE_EDITED).await?.is_empty());
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_SHOWN
+        ]
+    );
     Ok(())
 }
 
@@ -1075,5 +1090,373 @@ async fn create_preview_lists_description_constructs() -> TestResult {
         !line.contains("Operations") && !line.contains("Story"),
         "{line}"
     );
+    Ok(())
+}
+
+// ---- T12 review fixes ---------------------------------------------------------------------------
+
+/// A required createmeta field of `schema` with `allowed` values.
+fn choice_field(id: &str, name: &str, schema: Value, allowed: Value) -> Value {
+    json!({"required": true, "schema": schema, "name": name, "fieldId": id,
+           "hasDefaultValue": false, "operations": ["set"], "allowedValues": allowed})
+}
+
+/// The `Bug` fields page of `values` (one page, complete).
+fn one_page(values: Vec<Value>) -> Value {
+    json!({"maxResults": 50, "startAt": 0, "total": values.len(), "isLast": true,
+           "values": values})
+}
+
+/// Projects and issue types as usual; the `Bug` fields are `page`.
+async fn mount_fields_page(mock: &MockDc, page: &Value) {
+    mock.json(PROJECTS_PATH, 200, fixtures::JIRA_PROJECTS).await;
+    mock.json(
+        &issuetypes_path("ABC"),
+        200,
+        fixtures::JIRA_CREATEMETA_ISSUETYPES,
+    )
+    .await;
+    mock.json(BUG_FIELDS, 200, &page.to_string()).await;
+}
+
+/// Picks `label` in the pre-added input `path` as the approvals UI does, and waits for the
+/// re-enrichment the edit starts.
+async fn choose(h: &Harness, id: &str, path: &str, label: &str) -> TestResult {
+    let rev = h.approver().rev(id).map_err(de)?;
+    h.approver().choose_preadded(id, path, label).map_err(de)?;
+    rev_after(h, id, rev.counter).await
+}
+
+/// T12 review I1: the approver picks labels; core sends each as the Jira value createmeta gave:
+/// `{"id"}` when the allowed value has an id, else `{"value"}`, in an array for an `array` of
+/// `option`. `WRITE_EDITED` records the params that run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i1_chosen_labels_go_out_in_the_jira_shape() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    let option = json!({"type": "option"});
+    let page = one_page(vec![
+        choice_field(
+            "customfield_10200",
+            "Team",
+            option.clone(),
+            json!([{"id": "10400", "value": "Platform"}, {"id": "10401", "value": "Ops"}]),
+        ),
+        choice_field(
+            "customfield_10300",
+            "Areas",
+            json!({"type": "array", "items": "option"}),
+            json!([{"id": "1", "value": "UI"}, {"id": "2", "value": "API"}]),
+        ),
+        choice_field(
+            "customfield_10400",
+            "Site",
+            option.clone(),
+            json!([{"id": "20001"}]),
+        ),
+        choice_field(
+            "customfield_10500",
+            "Tier",
+            option,
+            json!([{"value": "Gold"}, {"value": "Silver"}]),
+        ),
+    ]);
+    mount_fields_page(mock, &page).await;
+    approvable_server(mock).await;
+    let id = queued(&h, params("Four choices")).await?;
+    let p = preview(&h, &id)?;
+    match &input(&p, "fields.customfield_10400")?.kind {
+        InputKind::Choice(allowed) => assert_eq!(allowed.as_slice(), ["20001"]),
+        other => return Err(format!("not a choice: {other:?}").into()),
+    }
+    for (path, label) in [
+        ("fields.customfield_10200", "Platform"),
+        ("fields.customfield_10300", "UI"),
+        ("fields.customfield_10400", "20001"),
+        ("fields.customfield_10500", "Gold"),
+    ] {
+        choose(&h, &id, path, label).await?;
+    }
+    let p = preview(&h, &id)?;
+    assert!(
+        !p.warnings
+            .iter()
+            .any(|w| w.id == WarningId::MissingRequiredFields),
+        "{:?}",
+        p.warnings
+    );
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let want = json!({
+        "customfield_10200": {"id": "10400"},
+        "customfield_10300": [{"id": "1"}],
+        "customfield_10400": {"id": "20001"},
+        "customfield_10500": {"value": "Gold"}
+    });
+    let body = sent_create(mock).await?;
+    for (k, v) in want.as_object().ok_or("not an object")? {
+        assert_eq!(&body["fields"][k], v, "{k}");
+    }
+    let edited = records(&h, &id, EventType::WRITE_EDITED).await?;
+    assert_eq!(edited.len(), 4);
+    assert_eq!(
+        edited.last().map(|e| e["edited"]["fields"].clone()),
+        Some(want)
+    );
+    Ok(())
+}
+
+/// T12 review I1: a pick core cannot turn into a Jira value is refused, nothing logged: a label
+/// whose allowed value has neither an id nor a value, and a text the input does not list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i1_pick_without_a_jira_value_is_refused() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    let page = one_page(vec![choice_field(
+        "customfield_10200",
+        "Team",
+        json!({"type": "option"}),
+        json!([{"name": "Legacy"}, {"id": "7", "value": "Modern"}]),
+    )]);
+    mount_fields_page(mock, &page).await;
+    let id = queued(&h, params("Unpickable")).await?;
+    let path = "fields.customfield_10200";
+    let refused = [
+        h.approver().choose_preadded(&id, path, "Legacy"),
+        h.approver().edit_preadded(&id, path, json!("Nope")),
+    ];
+    for res in refused {
+        assert!(
+            matches!(res, Err(DecisionError::EditRejected(_))),
+            "{res:?}"
+        );
+    }
+    assert!(records(&h, &id, EventType::WRITE_EDITED).await?.is_empty());
+    assert!(
+        records(&h, &id, EventType::DECISION_INVALID)
+            .await?
+            .is_empty()
+    );
+    assert!(h.approver().item(&id).is_some());
+    Ok(())
+}
+
+/// T12 review M5: the cuts are visible: a choice of the first 10 of 12 values says so in its
+/// label, and a deny that attaches the lists counts what they leave out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cut_lists_say_what_they_leave_out() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    let allowed: Vec<Value> = (0..12)
+        .map(|n| json!({"id": format!("{}", 600 + n), "value": format!("V{n}")}))
+        .collect();
+    let mut values = vec![choice_field(
+        "customfield_10200",
+        "Team",
+        json!({"type": "option"}),
+        json!(allowed),
+    )];
+    values.extend((1..=101).map(|n| {
+        json!({"required": true, "schema": {"type": "string"}, "name": format!("F{n}"),
+               "fieldId": format!("customfield_{}", 40_000 + n), "hasDefaultValue": false})
+    }));
+    mount_fields_page(mock, &one_page(values)).await;
+    let id = queued(&h, params("Many missing")).await?;
+    let p = preview(&h, &id)?;
+    let team = input(&p, "fields.customfield_10200")?;
+    assert_eq!(
+        team.label,
+        "Team (customfield_10200), 10 of 12 values listed"
+    );
+    match &team.kind {
+        InputKind::Choice(allowed) => assert_eq!(allowed.as_slice().len(), 10),
+        other => return Err(format!("not a choice: {other:?}").into()),
+    }
+    h.approver()
+        .deny_with(
+            &id,
+            "too many",
+            DenyDetails::MissingFields {
+                include_allowed_values: true,
+            },
+        )
+        .map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Denied, "{}", env.to_json_line());
+    let d = details(&env)?;
+    assert_eq!(d["missing_fields"].as_array().map(Vec::len), Some(100));
+    assert_eq!(d["missing_fields_total"], json!(102));
+    let first = &d["missing_fields"][0];
+    assert_eq!(first["allowed_values"].as_array().map(Vec::len), Some(10));
+    assert_eq!(first["allowed_values_total"], json!(12));
+    // A field whose list is complete carries no count.
+    assert!(d["missing_fields"][1].get("allowed_values_total").is_none());
+    Ok(())
+}
+
+/// T12 review M7: a missing `number` field (Jira takes decimals) is a number input, not an
+/// integer one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_number_field_is_a_number_input() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    let points = json!({"required": true, "schema": {"type": "number"}, "name": "Points",
+                        "fieldId": "customfield_10106", "hasDefaultValue": false});
+    mount_fields_page(mock, &one_page(vec![points])).await;
+    let id = queued(&h, params("Estimate")).await?;
+    let p = preview(&h, &id)?;
+    let input = input(&p, "fields.customfield_10106")?;
+    assert_eq!(input.kind, InputKind::Number);
+    assert_eq!(input.label, "Points (customfield_10106)");
+    Ok(())
+}
+
+/// PD-49 / T12 review M10: a create screen of 1000 fields: pages 2..4 are fetched in one round and
+/// no fifth; the list is cut, which an Info says; Approve stays enabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn field_pages_stop_at_four_with_an_info() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.json(PROJECTS_PATH, 200, fixtures::JIRA_PROJECTS).await;
+    mock.json(
+        &issuetypes_path("ABC"),
+        200,
+        fixtures::JIRA_CREATEMETA_ISSUETYPES,
+    )
+    .await;
+    let page = |start: u64| {
+        let values: Vec<Value> = (start..start + 50)
+            .map(|n| {
+                json!({"required": false, "schema": {"type": "string"}, "name": format!("F{n}"),
+                       "fieldId": format!("customfield_{}", 50_000 + n),
+                       "hasDefaultValue": false})
+            })
+            .collect();
+        let body = json!({"maxResults": 50, "startAt": start, "total": 1000, "isLast": false,
+                          "values": values});
+        mock.response(200)
+            .set_body_raw(body.to_string(), "application/json")
+    };
+    Mock::given(method("GET"))
+        .and(path(mock.path(BUG_FIELDS)))
+        .and(query_param_is_missing("startAt"))
+        .respond_with(page(0))
+        .mount(mock.server())
+        .await;
+    for start in [50u64, 100, 150, 200] {
+        Mock::given(method("GET"))
+            .and(path(mock.path(BUG_FIELDS)))
+            .and(query_param("startAt", start.to_string().as_str()))
+            .respond_with(page(start))
+            .mount(mock.server())
+            .await;
+    }
+    let id = queued(&h, params("Huge screen")).await?;
+    let mut starts: Vec<Option<String>> = gets_on(mock, BUG_FIELDS)
+        .await
+        .iter()
+        .map(|r| query(r, "startAt"))
+        .collect();
+    starts.sort();
+    assert_eq!(
+        starts,
+        [
+            None,
+            Some("100".to_owned()),
+            Some("150".to_owned()),
+            Some("50".to_owned())
+        ]
+    );
+    let p = preview(&h, &id)?;
+    assert!(p.approvable);
+    let info = p
+        .warnings
+        .iter()
+        .find(|w| w.id == WarningId::RequiredFieldListIncomplete)
+        .ok_or("no incomplete-list warning")?;
+    assert_eq!(info.level, Level::Info);
+    assert_eq!(
+        info.text,
+        "required-field list incomplete: 4 of 20 pages read"
+    );
+    Ok(())
+}
+
+/// A harness whose enrichment GETs hold after their record is parked (Task 24 I-2), the create
+/// stages mounted and a create submitted; returns once stage 1 holds.
+async fn create_held_after_stage1(
+    pause: &std::sync::Arc<Pause>,
+) -> Result<(Harness, String), TestError> {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_after_get: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    mount_create_stages(jira(&h)?).await;
+    let id = request_id(&h.submit(CREATE, params("Stopped")).await)?;
+    pause.reached.notified().await;
+    Ok((h, id))
+}
+
+/// After the request ended: stage 1's record committed before `CANCELLED`, no later stage's GET
+/// left.
+async fn stopped_after_stage1(h: &Harness, id: &str) -> TestResult {
+    assert_eq!(
+        h.event_types(id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::CANCELLED
+        ]
+    );
+    let fetch = records(h, id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(fetch[0]["purpose"], "resolve");
+    let mock = jira(h)?;
+    assert_eq!(gets_on(mock, PROJECTS_PATH).await.len(), 1);
+    assert!(gets_on(mock, &issuetypes_path("ABC")).await.is_empty());
+    assert!(gets_on(mock, BUG_FIELDS).await.is_empty());
+    Ok(())
+}
+
+/// T12 review M1: a client cancel between stages (stage 1 answered, its record parked): the
+/// record is committed, the enrichment stops, stage 2 never leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_between_stages_stops_the_enrichment() -> TestResult {
+    let pause = Pause::new();
+    let (h, id) = create_held_after_stage1(&pause).await?;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    // The enrichment goes on and finds the request ended.
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stopped_after_stage1(&h, &id).await
+}
+
+/// T12 review M1: a shutdown between stages ends the create like a cancel; nothing is logged or
+/// sent after `APP_STOP`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_between_stages_stops_the_enrichment() -> TestResult {
+    let pause = Pause::new();
+    let (h, id) = create_held_after_stage1(&pause).await?;
+    let report = h.core().shutdown(ShutdownReason::Quit).await;
+    assert!(
+        report.app_stop_logged && report.cancelled == 1,
+        "{report:?}"
+    );
+    // The enrichment goes on after `APP_STOP` and finds the request ended.
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stopped_after_stage1(&h, &id).await?;
+    let last = h
+        .audit_records()
+        .await?
+        .into_iter()
+        .max_by_key(|r| r.seq)
+        .ok_or("empty log")?;
+    assert_eq!(last.event_type, EventType::APP_STOP);
     Ok(())
 }
