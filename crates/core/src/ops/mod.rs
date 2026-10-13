@@ -63,10 +63,41 @@ pub struct StaleRule {
     pub judge: fn(&StaleCtx<'_>, &[Value]) -> StaleVerdict,
 }
 
-/// The enrichment GETs and their judge, which gets the parsed 2xx JSON bodies in plan order.
+/// Staged enrichment (Δ3 C.7): `plan` gets the parsed 2xx JSON answers so far (in the order
+/// their GETs were planned, over every earlier round) and names the next round's GETs or says
+/// `Judge`; `judge` then gets every answer. The engine runs at most [`MAX_ENRICH_STAGES`] rounds.
 pub struct EnrichRule {
-    pub plan: fn(&EnrichCtx<'_>) -> Vec<(EnrichPurpose, GetCall)>,
+    pub plan: fn(&EnrichCtx<'_>, &[Value]) -> EnrichStep,
     pub judge: fn(&EnrichCtx<'_>, &[Value]) -> EnrichVerdict,
+}
+
+impl fmt::Debug for EnrichRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EnrichRule").finish_non_exhaustive()
+    }
+}
+
+/// What an enrichment plan asks for next (Δ3).
+#[derive(Debug, Clone, PartialEq)]
+pub enum EnrichStep {
+    /// One round: these GETs, in this order, each recorded before the next one leaves.
+    Fetch(Vec<(EnrichPurpose, GetCall)>),
+    /// No further GET: the judge decides on the answers so far.
+    Judge,
+}
+
+/// Δ3: at most this many `Fetch` rounds; a plan that asks for another one fails the enrichment
+/// closed (an "enrichment failed" hold, Approve disabled).
+pub const MAX_ENRICH_STAGES: usize = 4;
+
+/// One enrichment round from a fixed plan (the single-round M3 rules, wrapped for Δ3): its GETs
+/// while nothing was answered yet, then `Judge`. An empty plan is `Judge` at once.
+pub(crate) fn single_round(calls: Vec<(EnrichPurpose, GetCall)>, answers: &[Value]) -> EnrichStep {
+    if answers.is_empty() && !calls.is_empty() {
+        EnrichStep::Fetch(calls)
+    } else {
+        EnrichStep::Judge
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +245,58 @@ pub struct EnrichVerdict {
     /// Additive: the `Conflict` preview's diff text (agent's read state against the current
     /// one; display-escaped). Empty for every other hold.
     pub diff_text: String,
+    /// Δ4 (PD-49): the required fields without a default that no param sets, in createmeta
+    /// order (raw server text). A Caution, never a block; a deny may attach them.
+    pub missing_fields: Vec<MissingField>,
+    /// Δ4: resolved display facts for the write previews (raw server text; the previewer
+    /// escapes them).
+    pub summary: Option<WriteSummaryFacts>,
+}
+
+/// Δ4 (PD-49): one missing required field of a `jira.issue.create`, as createmeta names it. The
+/// strings are raw server text: escaped for display by whoever shows them, delivered raw in a
+/// `missing_fields` deny hint (like resolution candidates).
+#[derive(Clone, PartialEq, Eq)]
+pub struct MissingField {
+    pub id: String,
+    pub name: String,
+    /// `schema.type` (`option`, `array`, `number`, `string`, ...); `""` when absent.
+    pub schema_type: String,
+    /// Additive: `schema.items` of an `array` field (`option` for a multi-select), which the edit
+    /// form's input kind needs; never delivered.
+    pub schema_items: Option<String>,
+    /// At most [`MAX_ALLOWED_VALUES`] names (`value`, else `name`).
+    pub allowed_values: Vec<String>,
+}
+
+/// Redacting `Debug` (§7.7): names and values are Atlassian data.
+impl fmt::Debug for MissingField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MissingField")
+            .field("id", &format_args!("len={}", self.id.len()))
+            .field("allowed_values", &self.allowed_values.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Δ4 / PD-49: at most this many allowed values per missing field (the `Choice` cap).
+pub const MAX_ALLOWED_VALUES: usize = atlas_duck_preview::form::CHOICE_MAX_VALUES;
+
+/// Δ4: what enrichment resolved, for the write previews' sentence and rows (raw server text).
+/// Later tasks add their facts (from/to status, assignee, link phrases, sprint).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct WriteSummaryFacts {
+    /// `jira.issue.create`: the resolved project's key and name, the issue type's name.
+    pub project_key: Option<String>,
+    pub project_name: Option<String>,
+    pub issue_type: Option<String>,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for WriteSummaryFacts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WriteSummaryFacts").finish_non_exhaustive()
+    }
 }
 
 impl EnrichVerdict {
@@ -227,6 +310,8 @@ impl EnrichVerdict {
             conflict: None,
             warnings: Vec::new(),
             diff_text: String::new(),
+            missing_fields: Vec::new(),
+            summary: None,
         }
     }
 
@@ -249,6 +334,7 @@ impl fmt::Debug for EnrichVerdict {
             .field("unresolved", &self.unresolved.is_some())
             .field("conflict", &self.conflict.is_some())
             .field("warnings", &self.warnings.len())
+            .field("missing_fields", &self.missing_fields.len())
             .finish_non_exhaustive()
     }
 }
@@ -498,10 +584,11 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         "jira.issue.create",
         OpImpl {
             executor: jira::issue_create_executor,
-            previewer: generic::write_preview,
+            previewer: jira_preview::create_preview,
             stale_check: None,
             enrich: Some(&jira::ISSUE_CREATE_ENRICH),
-            enrich_keys: &["project", "issuetype"],
+            // PD-49: an edit that adds `fields.<id>` re-runs enrichment (the warning goes away).
+            enrich_keys: &["project", "issuetype", "fields"],
         },
     ),
     (

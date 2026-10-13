@@ -168,6 +168,9 @@ pub struct TestHooks {
     /// A field-name cache fill holds after its GET returned, before its result record is
     /// appended (T8 review I-1: the shutdown lets it end before `APP_STOP`).
     pub pause_before_cache_result: Option<Arc<Pause>>,
+    /// Replaces every write's enrichment rule (Δ3: the round-limit test's rule that never says
+    /// `Judge`).
+    pub enrich_rule: Option<&'static crate::ops::EnrichRule>,
 }
 
 #[cfg(feature = "testing")]

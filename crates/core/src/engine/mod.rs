@@ -26,6 +26,7 @@
 pub mod cache;
 pub mod cancel;
 pub mod deliver;
+pub mod enrich;
 pub mod envelope;
 pub mod handler;
 pub mod queue;

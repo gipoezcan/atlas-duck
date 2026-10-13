@@ -9,9 +9,9 @@ use atlas_duck_atlassian::{
 };
 use atlas_duck_core::lifecycle::model::Hold;
 use atlas_duck_core::ops::{
-    DIFF_TEXT_CAP_BYTES, EnrichCtx, EnrichFailure, EnrichPurpose, EnrichVerdict, ExecCtx,
-    ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, StaleCtx,
-    StaleVerdict, WriteView, confluence, entry_count, generic, op_table,
+    DIFF_TEXT_CAP_BYTES, EnrichCtx, EnrichFailure, EnrichPurpose, EnrichStep, EnrichVerdict,
+    ExecCtx, ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView,
+    StaleCtx, StaleVerdict, WriteView, confluence, entry_count, generic, op_table,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::{BodyView, ItemCount, PreviewBody, WarningId};
@@ -112,6 +112,7 @@ fn query_of(call: &GetCall) -> Vec<(&str, &str)> {
 
 type EnrichOutcome = (Vec<(EnrichPurpose, GetCall)>, EnrichVerdict);
 
+/// A single-round rule (Δ3, wrapped): its first round's GETs and the judge over `responses`.
 fn enrich(
     id: &str,
     params: &Value,
@@ -123,7 +124,25 @@ fn enrich(
         .and_then(|i| i.enrich)
         .ok_or("no enrich rule")?;
     let ctx = EnrichCtx { spec, params };
-    Ok(((rule.plan)(&ctx), (rule.judge)(&ctx, responses)))
+    let calls = match (rule.plan)(&ctx, &[]) {
+        EnrichStep::Fetch(calls) => calls,
+        EnrichStep::Judge => Vec::new(),
+    };
+    Ok((calls, (rule.judge)(&ctx, responses)))
+}
+
+/// The next round of a staged rule after `answers` (Δ3).
+fn plan_after(
+    id: &str,
+    params: &Value,
+    answers: &[Value],
+) -> Result<EnrichStep, Box<dyn std::error::Error>> {
+    let spec = op(id)?;
+    let rule = op_table()
+        .get(id)
+        .and_then(|i| i.enrich)
+        .ok_or("no enrich rule")?;
+    Ok((rule.plan)(&EnrichCtx { spec, params }, answers))
 }
 
 fn stale(
@@ -713,8 +732,12 @@ fn not_in_this_build_writes() -> TestResult {
 
 fn create_verdict() -> EnrichVerdict {
     let mut resolved = Map::new();
+    resolved.insert("project_key".to_owned(), json!("ABC"));
     resolved.insert("issuetype".to_owned(), json!("10002"));
-    EnrichVerdict::preview(json!({"issuetype_id": "10002"}), resolved)
+    EnrichVerdict::preview(
+        json!({"project_key": "ABC", "issuetype_id": "10002"}),
+        resolved,
+    )
 }
 
 fn transition_verdict() -> EnrichVerdict {
@@ -874,10 +897,11 @@ fn write_bodies_and_urls() -> TestResult {
     )?[0];
     assert_eq!(body_json(r)?, json!({"transition": {"id": "31"}}));
 
-    // A numeric project is an id.
+    // PD-48: the body names the key enrichment resolved, whatever the agent wrote (the M3
+    // all-digit `{"id"}` guess is gone).
     let p = json!({"project": "10000", "issuetype": "Bug", "summary": "S"});
     let r = &write_requests("jira.issue.create", &p, Some(&create_verdict()))?[0];
-    assert_eq!(body_json(r)?["fields"]["project"], json!({"id": "10000"}));
+    assert_eq!(body_json(r)?["fields"]["project"], json!({"key": "ABC"}));
     Ok(())
 }
 
@@ -938,33 +962,63 @@ fn writes_needing_enrichment_wait_for_a_preview_verdict() -> TestResult {
 
 // ---- enrichment and stale rules --------------------------------------------------------------
 
+/// The single call of a `Fetch` round.
+fn one_call(step: EnrichStep) -> Result<(EnrichPurpose, GetCall), Box<dyn std::error::Error>> {
+    match step {
+        EnrichStep::Fetch(mut calls) if calls.len() == 1 => calls.pop().ok_or("no call".into()),
+        other => Err(format!("not one GET: {other:?}").into()),
+    }
+}
+
+/// Δ3 / PD-48 / PD-49 (rewritten from M3's one-stage issue-type rule): projects, then the
+/// resolved project's issue types, then the issue type's createmeta fields, then `Judge`.
 #[test]
 fn create_resolves_issuetype_by_id_or_name() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let projects: Value = serde_json::from_str(fixtures::JIRA_PROJECTS)?;
     let types: Value = serde_json::from_str(fixtures::JIRA_CREATEMETA_ISSUETYPES)?;
-    let params = json!({"project": "ABC", "issuetype": "bug", "summary": "S"});
-    let (plan, v) = enrich("jira.issue.create", &params, std::slice::from_ref(&types))?;
-    assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0].0, EnrichPurpose::Resolve);
+    let fields: Value = serde_json::from_str(fixtures::JIRA_CREATEMETA_FIELDS)?;
+    let params = json!({"project": "alpha beta", "issuetype": "bug", "summary": "S"});
+
+    let (purpose, call) = one_call(plan_after(CREATE, &params, &[])?)?;
+    assert_eq!(purpose, EnrichPurpose::Resolve);
+    assert_eq!(call.endpoint_template, "/rest/api/2/project");
+    let (purpose, call) = one_call(plan_after(
+        CREATE,
+        &params,
+        std::slice::from_ref(&projects),
+    )?)?;
+    assert_eq!(purpose, EnrichPurpose::Resolve);
     assert_eq!(
-        plan[0].1.endpoint_template,
+        call.endpoint_template,
         "/rest/api/2/issue/createmeta/{project}/issuetypes"
     );
-    assert_eq!(plan[0].1.params, json!({"project": "ABC"}));
+    // The resolved key, never the agent's value.
+    assert_eq!(call.params, json!({"project": "ABC"}));
+    let two = [projects.clone(), types.clone()];
+    let (purpose, call) = one_call(plan_after(CREATE, &params, &two)?)?;
+    assert_eq!(purpose, EnrichPurpose::Enrich);
+    assert_eq!(
+        call.endpoint_template,
+        "/rest/api/2/issue/createmeta/{project}/issuetypes/{typeId}"
+    );
+    assert_eq!(call.params, json!({"project": "ABC", "typeId": "10002"}));
+    let all = [projects.clone(), types.clone(), fields.clone()];
+    assert_eq!(plan_after(CREATE, &params, &all)?, EnrichStep::Judge);
+    let (_, v) = enrich(CREATE, &params, &all)?;
     assert_eq!(v.hold, Hold::Preview);
+    assert_eq!(v.resolved.get("project_key"), Some(&json!("ABC")));
     assert_eq!(v.resolved.get("issuetype"), Some(&json!("10002")));
+    assert!(v.missing_fields.is_empty() && v.warnings.is_empty());
 
-    let (_, v) = enrich(
-        "jira.issue.create",
-        &json!({"project": "ABC", "issuetype": "10001", "summary": "S"}),
-        std::slice::from_ref(&types),
-    )?;
+    let by_id = json!({"project": "ABC", "issuetype": "10001", "summary": "S"});
+    let (_, v) = enrich(CREATE, &by_id, &all)?;
     assert_eq!(v.resolved.get("issuetype"), Some(&json!("10001")));
 
-    let (_, v) = enrich(
-        "jira.issue.create",
-        &json!({"project": "ABC", "issuetype": "Bugg", "summary": "S"}),
-        std::slice::from_ref(&types),
-    )?;
+    // An unresolved issue type: `Judge` at once, no fields GET.
+    let bugg = json!({"project": "ABC", "issuetype": "Bugg", "summary": "S"});
+    assert_eq!(plan_after(CREATE, &bugg, &two)?, EnrichStep::Judge);
+    let (_, v) = enrich(CREATE, &bugg, &two)?;
     assert_eq!(v.hold, Hold::UnresolvedName);
     let (param, value, matches, candidates) = v.unresolved.ok_or("unresolved")?;
     assert_eq!(
@@ -975,17 +1029,101 @@ fn create_resolves_issuetype_by_id_or_name() -> TestResult {
 
     // Two types with the same name (case-insensitive) are ambiguous.
     let twice = json!({"values": [{"id": "1", "name": "Bug"}, {"id": "2", "name": "BUG"}]});
-    let (_, v) = enrich(
-        "jira.issue.create",
-        &json!({"project": "ABC", "issuetype": "bug", "summary": "S"}),
-        &[twice],
-    )?;
+    let (_, v) = enrich(CREATE, &params, &[projects.clone(), twice])?;
     assert_eq!(v.hold, Hold::UnresolvedName);
     assert_eq!(v.unresolved.map(|u| u.2), Some(2));
 
-    // No response at all: fail closed.
-    let (_, v) = enrich("jira.issue.create", &params, &[])?;
-    assert_eq!(v.hold, Hold::EnrichmentError);
+    // An unresolved project: `Judge` after stage 1.
+    let nope = json!({"project": "Nope", "issuetype": "Bug", "summary": "S"});
+    assert_eq!(
+        plan_after(CREATE, &nope, std::slice::from_ref(&projects))?,
+        EnrichStep::Judge
+    );
+    let (_, v) = enrich(CREATE, &nope, std::slice::from_ref(&projects))?;
+    assert_eq!(
+        v.unresolved.map(|u| (u.0, u.2)),
+        Some(("project".to_owned(), 0))
+    );
+
+    // Answers missing or of the wrong shape: fail closed.
+    for answers in [
+        Vec::new(),
+        vec![projects.clone(), types.clone()],
+        vec![json!({"values": []})],
+        vec![projects.clone(), types.clone(), json!([])],
+        // A server key that cannot stand in a URL path.
+        vec![json!([{"id": "1", "key": "../x", "name": "Alpha Beta"}])],
+    ] {
+        let (_, v) = enrich(CREATE, &params, &answers)?;
+        assert_eq!(v.hold, Hold::EnrichmentError, "{answers:?}");
+    }
+    let bad_key = json!([{"id": "1", "key": "../x", "name": "Alpha Beta"}]);
+    assert_eq!(plan_after(CREATE, &params, &[bad_key])?, EnrichStep::Judge);
+    Ok(())
+}
+
+/// PD-49: which required fields are missing, the Caution text, the cap of 10 names.
+#[test]
+fn create_missing_required_fields() -> TestResult {
+    const CREATE: &str = "jira.issue.create";
+    let projects: Value = serde_json::from_str(fixtures::JIRA_PROJECTS)?;
+    let types: Value = serde_json::from_str(fixtures::JIRA_CREATEMETA_ISSUETYPES)?;
+    let field = |id: &str, name: &str, ty: &str, required: bool, default: bool| {
+        json!({"fieldId": id, "name": name, "schema": {"type": ty}, "required": required,
+               "hasDefaultValue": default})
+    };
+    let page = json!({"isLast": true, "values": [
+        field("summary", "Summary", "string", true, false),
+        field("description", "Description", "string", true, false),
+        field("customfield_1", "Team", "option", true, false),
+        field("customfield_2", "Points", "number", true, true),
+        field("customfield_3", "Notes", "string", false, false),
+        field("labels", "Labels", "array", true, false)
+    ]});
+    let answers = [projects.clone(), types.clone(), page];
+    // No description param and no `fields`: description, Team and Labels are missing.
+    let p = json!({"project": "ABC", "issuetype": "Bug", "summary": "S"});
+    let (_, v) = enrich(CREATE, &p, &answers)?;
+    assert_eq!(v.hold, Hold::Preview);
+    let ids: Vec<&str> = v.missing_fields.iter().map(|f| f.id.as_str()).collect();
+    assert_eq!(ids, ["description", "customfield_1", "labels"]);
+    assert_eq!(v.warnings.len(), 1);
+    assert_eq!(v.warnings[0].id, WarningId::MissingRequiredFields);
+    assert_eq!(
+        v.warnings[0].text,
+        "missing required fields: Description (description, string), Team (customfield_1, \
+         option), Labels (labels, array)"
+    );
+    // A description param and `fields` keys set them.
+    let p = json!({"project": "ABC", "issuetype": "Bug", "summary": "S", "description": "D",
+                   "fields": {"customfield_1": {"value": "x"}, "labels": []}});
+    let (_, v) = enrich(CREATE, &p, &answers)?;
+    assert!(v.missing_fields.is_empty() && v.warnings.is_empty());
+
+    // More than 10: ten names, then "… and N more"; names display-escaped.
+    let values: Vec<Value> = (0..12)
+        .map(|n| {
+            field(
+                &format!("customfield_{n}"),
+                &format!("F{n}\u{202E}"),
+                "string",
+                true,
+                false,
+            )
+        })
+        .collect();
+    let answers = [projects, types, json!({"isLast": true, "values": values})];
+    let p = json!({"project": "ABC", "issuetype": "Bug", "summary": "S"});
+    let (_, v) = enrich(CREATE, &p, &answers)?;
+    assert_eq!(v.missing_fields.len(), 12);
+    let text = &v.warnings[0].text;
+    assert!(text.ends_with(", … and 2 more"), "{text}");
+    assert!(
+        text.contains("F9⟨U+202E⟩ (customfield_9, string)"),
+        "{text}"
+    );
+    assert!(!text.contains("F10"), "{text}");
+    assert!(!text.contains('\u{202E}'), "{text}");
     Ok(())
 }
 

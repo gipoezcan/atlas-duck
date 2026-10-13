@@ -1,6 +1,7 @@
 //! The Jira issue previewer (§6.3 "Jira issue", §6.2 levels, PD-45/PD-46): a card, the table of
 //! every released field (and of the issue's other keys, such as `changelog`), the description and
-//! the comments rendered from their wiki markup.
+//! the comments rendered from their wiki markup. The search and list tables (T11), and the write
+//! cards over the exact request list (T12: `jira.issue.create`).
 //!
 //! Everything shown is display-escaped text, except the two HTML strings, which come only from
 //! `convert::wiki_to_preview_html` through `preview::sanitize_html` (S-12) and are display-escaped
@@ -10,17 +11,18 @@
 //! Warnings follow the content of the released candidate alone. Field names (the cache, which
 //! changes between previews) never influence a warning or the Caution count (T8 handoff).
 
-use atlas_duck_convert::wiki_to_preview_html;
+use atlas_duck_convert::{wiki_constructs, wiki_to_preview_html, wiki_to_text};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    CommentView, FieldRow, IssueCard, ItemCount, JSON_STRING_COLLAPSE_BYTES, PreviewBody,
-    PreviewHeader, sanitize_html,
+    CommentView, ConstructList, FieldRow, IssueCard, ItemCount, JSON_STRING_COLLAPSE_BYTES,
+    PreviewBody, PreviewHeader, sanitize_html,
 };
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
 use super::{PreviewCtx, PreviewInput, PreviewModel, generic};
+use crate::lifecycle::model::Hold;
 use crate::metadata::{FieldNames, field_label, one_line};
 
 /// A field value shows at most this many bytes (the JSON tree's collapse limit); Raw has it all.
@@ -847,4 +849,132 @@ fn scalar_columns(items: &[Value]) -> Vec<String> {
         .take(MAX_COLUMNS)
         .cloned()
         .collect()
+}
+
+// ---- write previews (Task 12) -----------------------------------------------------------------
+
+/// The sentence of the create card (plan text, §6.3 Create).
+fn create_sentence(issue_type: &str, project_key: &str) -> String {
+    format!("Create a {issue_type} in {project_key}")
+}
+
+/// One line of display text cut to `cap` chars ([`capped_text`]); the cut bytes go to `hidden`.
+fn line(raw: &str, cap: usize, hidden: &mut u64) -> String {
+    let (shown, cut) = capped_text(raw, cap);
+    *hidden = hidden.saturating_add(cut);
+    shown
+}
+
+/// The constructs of an outgoing wiki text (PD-47), each entry display-escaped on one line.
+fn construct_list(wiki: &str) -> ConstructList {
+    let c = wiki_constructs(wiki);
+    let shown = |v: Vec<String>| -> Vec<String> {
+        v.iter().map(|s| one_line(escape_for_display(s))).collect()
+    };
+    ConstructList {
+        macros: shown(c.macros),
+        mentions: shown(c.mentions),
+        includes: shown(c.includes),
+        links: shown(c.links),
+        images: shown(c.images),
+        attachments: shown(c.attachments),
+    }
+}
+
+/// §6.3 Create: the `jira.issue.create` card over the exact request (§5.1 inv. 4: the request list
+/// stays part of the body). The project and issue type are what enrichment resolved; summary,
+/// description and the other fields are read from the request that is sent (T7 M-6: never
+/// converted again), the description shown as the text of its wiki markup with its constructs
+/// listed (PD-47). The missing-fields Caution is the verdict's own (PD-49). Every other hold,
+/// or a request that is not the create JSON, keeps the generic write preview.
+pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let facts = view
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref());
+    let (Some(facts), Some(request), PreviewBody::WriteRequests { .. }) =
+        (facts, view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(fields) = serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|b| b.get("fields").and_then(Value::as_object).cloned())
+    else {
+        return model;
+    };
+    let mut hidden = 0u64;
+    let key = facts.project_key.as_deref().unwrap_or_default();
+    let issue_type = facts.issue_type.as_deref().unwrap_or_default();
+    let project = match facts.project_name.as_deref() {
+        Some(name) => format!("{key} ({name})"),
+        None => key.to_owned(),
+    };
+    let mut rows = vec![
+        (
+            "Project".to_owned(),
+            line(&project, CELL_CAP_CHARS * 2, &mut hidden),
+        ),
+        (
+            "Issue type".to_owned(),
+            line(issue_type, CELL_CAP_CHARS, &mut hidden),
+        ),
+    ];
+    let text = |k: &str| fields.get(k).and_then(Value::as_str);
+    if let Some(summary) = text("summary") {
+        rows.push((
+            "Summary".to_owned(),
+            line(summary, CELL_CAP_CHARS * 2, &mut hidden),
+        ));
+    }
+    let description = text("description");
+    if let Some(wiki) = description {
+        let (kept, cut) = cut_at(wiki, DESCRIPTION_CAP);
+        hidden = hidden.saturating_add(cut);
+        let mut shown = escape_for_display(&wiki_to_text(kept));
+        if cut > 0 {
+            shown.push_str(&format!("… {cut} more bytes (see Raw)"));
+        }
+        rows.push(("Description".to_owned(), shown));
+    }
+    // The agent's other fields, verbatim JSON (PD-42), by id: write previews take no field
+    // names (T8 handoff).
+    for (id, value) in &fields {
+        if matches!(
+            id.as_str(),
+            "project" | "issuetype" | "summary" | "description"
+        ) {
+            continue;
+        }
+        let json = serde_json::to_string(value).unwrap_or_default();
+        rows.push((
+            field_label(None, id),
+            line(&json, FIELD_VALUE_CAP, &mut hidden),
+        ));
+    }
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::WriteSummary {
+        sentence: line(
+            &create_sentence(issue_type, key),
+            CELL_CAP_CHARS * 2,
+            &mut hidden,
+        ),
+        rows,
+        constructs: description.map(construct_list),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden;
+    model
 }

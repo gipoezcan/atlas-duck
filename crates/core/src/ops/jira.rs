@@ -1,14 +1,17 @@
 //! Jira specifics in M3 (PD-09): `jira.issue.get`'s flag mapping, and the four M3 writes with
-//! their enrichment (name resolution, `expected` conflict, from-status baseline).
+//! their enrichment (name resolution, `expected` conflict, from-status baseline). M5: the
+//! `--comments` read (PD-45) and the staged create enrichment (Δ3, PD-48, PD-49: project and
+//! issue type resolution, the createmeta required fields).
 
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_preview::invisible::escape_for_display;
-use atlas_duck_preview::warning::{Warning, WarningId};
+use atlas_duck_preview::warning::{self, Warning, WarningId};
 use serde_json::{Map, Value, json};
 
 use super::{
-    EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan, ReadPlan,
-    cap_diff_text, generic, get_call, jira_body, json_request, resolve_url, str_param,
+    EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
+    MAX_ALLOWED_VALUES, MissingField, ReadPlan, WriteSummaryFacts, cap_diff_text, generic,
+    get_call, jira_body, json_request, resolve_url, single_round, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
@@ -18,7 +21,9 @@ pub const MAX_CANDIDATES: usize = 10;
 
 const ISSUE_PATH: &str = "/rest/api/2/issue/{key}";
 const TRANSITIONS_PATH: &str = "/rest/api/2/issue/{key}/transitions";
+const PROJECTS_PATH: &str = "/rest/api/2/project";
 const CREATEMETA_ISSUETYPES_PATH: &str = "/rest/api/2/issue/createmeta/{project}/issuetypes";
+const CREATEMETA_FIELDS_PATH: &str = "/rest/api/2/issue/createmeta/{project}/issuetypes/{typeId}";
 
 // ---- jira.issue.get ----------------------------------------------------------------------------
 
@@ -205,43 +210,355 @@ fn resolved(name: &str, id: &str) -> Map<String, Value> {
 
 // ---- jira.issue.create -------------------------------------------------------------------------
 
+/// Three stages (Δ3, PD-48, PD-49): the projects (`resolve`), the project's issue types
+/// (`resolve`), the issue type's createmeta fields (`enrich`, up to [`MAX_FIELD_PAGES`] pages). An
+/// unresolved project or issue type ends the plan early (`Judge`, no further GET).
 pub static ISSUE_CREATE_ENRICH: EnrichRule = EnrichRule {
     plan: create_plan,
     judge: create_judge,
 };
 
-fn create_plan(ctx: &EnrichCtx<'_>) -> Vec<(EnrichPurpose, GetCall)> {
-    vec![(
-        EnrichPurpose::Resolve,
-        get_call(CREATEMETA_ISSUETYPES_PATH, ctx.params, &[]),
-    )]
+/// PD-49: at most this many createmeta field pages: the first, then the rest in one round, so
+/// the three stages stay within [`super::MAX_ENRICH_STAGES`] rounds.
+pub const MAX_FIELD_PAGES: u64 = 4;
+
+/// At most this many missing fields are kept (deny details, pre-added inputs); the Caution counts
+/// them all.
+pub const MAX_MISSING_FIELDS: usize = 100;
+
+/// Server-supplied names and ids kept for a preview or a deny hint are cut to this many chars.
+const NAME_CAP_CHARS: usize = crate::metadata::MAX_NAME_CHARS;
+
+/// The resolved project of a create (PD-48).
+struct Project {
+    key: String,
+    name: Option<String>,
 }
 
-fn create_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
-    let Some(types) = responses
-        .first()
-        .and_then(|r| r.get("values"))
-        .and_then(Value::as_array)
-    else {
-        return EnrichVerdict::unusable();
-    };
-    let wanted = str_param(ctx.params, "issuetype");
-    match resolve(types, wanted) {
-        Resolution::One(id) => {
-            EnrichVerdict::preview(json!({"issuetype_id": id}), resolved("issuetype", &id))
-        }
-        Resolution::Unresolved(n, candidates) => unresolved("issuetype", wanted, n, candidates),
+/// The resolved issue type of a create.
+struct IssueType {
+    id: String,
+    name: Option<String>,
+}
+
+/// `s` cut to [`NAME_CAP_CHARS`] chars (`…` marks a cut). Raw text; escaped where it is shown.
+fn capped(s: &str) -> String {
+    match s.char_indices().nth(NAME_CAP_CHARS) {
+        Some((end, _)) => format!("{}…", &s[..end]),
+        None => s.to_owned(),
     }
 }
 
-/// `POST /rest/api/2/issue` `{"fields": {project, issuetype: {id}, summary, description?, ..}}`.
+/// A key that can stand in a URL path segment as Jira writes project keys (`[A-Za-z0-9_]+`).
+/// Anything else from the server fails the enrichment closed rather than reach a URL.
+fn usable_key(key: &str) -> bool {
+    !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// PD-48: exactly one project whose `id` equals the value, else whose `key` equals it (ASCII
+/// case-insensitively), else whose `name` equals it (case-insensitively, as [`resolve`]). The
+/// first rule with any hit decides: one hit resolves, more are ambiguous (the hits are the
+/// candidates); no hit at all lists every project (≤ [`MAX_CANDIDATES`] names).
+fn resolve_project(ctx: &EnrichCtx<'_>, answer: &Value) -> Result<Project, Box<EnrichVerdict>> {
+    let Some(projects) = answer.as_array() else {
+        return Err(Box::new(EnrichVerdict::unusable()));
+    };
+    let wanted = str_param(ctx.params, "project");
+    let folded = wanted.to_lowercase();
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    let rules: [&dyn Fn(&Value) -> bool; 3] = [
+        &|v| text(v, "id").as_deref() == Some(wanted),
+        &|v| text(v, "key").is_some_and(|k| k.eq_ignore_ascii_case(wanted)),
+        &|v| text(v, "name").is_some_and(|n| n.to_lowercase() == folded),
+    ];
+    let names = |items: Vec<&Value>| -> Vec<String> {
+        items
+            .into_iter()
+            .filter_map(|v| text(v, "name"))
+            .take(MAX_CANDIDATES)
+            .collect()
+    };
+    for rule in rules {
+        let hits: Vec<&Value> = projects.iter().filter(|v| rule(v)).collect();
+        match hits.as_slice() {
+            [] => continue,
+            [one] => {
+                let key = text(one, "key").unwrap_or_default();
+                if !usable_key(&key) {
+                    return Err(Box::new(EnrichVerdict::unusable()));
+                }
+                return Ok(Project {
+                    key,
+                    name: text(one, "name"),
+                });
+            }
+            _ => {
+                let n = u64::try_from(hits.len()).unwrap_or(u64::MAX);
+                return Err(Box::new(unresolved("project", wanted, n, names(hits))));
+            }
+        }
+    }
+    Err(Box::new(unresolved(
+        "project",
+        wanted,
+        0,
+        names(projects.iter().collect()),
+    )))
+}
+
+/// The issue type among the project's createmeta issue types ([`resolve`]); its id goes into the
+/// stage-3 path, so it must be all digits (createmeta's `typeId`).
+fn resolve_issuetype(ctx: &EnrichCtx<'_>, answer: &Value) -> Result<IssueType, Box<EnrichVerdict>> {
+    let Some(types) = answer.get("values").and_then(Value::as_array) else {
+        return Err(Box::new(EnrichVerdict::unusable()));
+    };
+    let wanted = str_param(ctx.params, "issuetype");
+    match resolve(types, wanted) {
+        Resolution::One(id) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+            let name = types
+                .iter()
+                .find(|t| t.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                .and_then(|t| t.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Ok(IssueType { id, name })
+        }
+        Resolution::One(_) => Err(Box::new(EnrichVerdict::unusable())),
+        Resolution::Unresolved(n, candidates) => {
+            Err(Box::new(unresolved("issuetype", wanted, n, candidates)))
+        }
+    }
+}
+
+/// Stage 3: `GET /rest/api/2/issue/createmeta/{key}/issuetypes/{typeId}` (a later page with its
+/// `startAt` and the server's page size).
+fn fields_call(key: &str, type_id: &str, page: Option<(u64, u64)>) -> (EnrichPurpose, GetCall) {
+    let params = json!({"project": key, "typeId": type_id});
+    let call = match page {
+        Some((start, size)) => get_call(
+            CREATEMETA_FIELDS_PATH,
+            &params,
+            &[
+                ("startAt", &start.to_string()),
+                ("maxResults", &size.to_string()),
+            ],
+        ),
+        None => get_call(CREATEMETA_FIELDS_PATH, &params, &[]),
+    };
+    (EnrichPurpose::Enrich, call)
+}
+
+/// PD-49: the pages after the first while it says `isLast: false`, all in one round: by the
+/// server's `maxResults` (else the first page's length) from its `startAt`, below `total` when it
+/// sends one, at most [`MAX_FIELD_PAGES`] pages in all.
+fn later_field_pages(key: &str, type_id: &str, first: &Value) -> Vec<(EnrichPurpose, GetCall)> {
+    if first.get("isLast").and_then(Value::as_bool) != Some(false) {
+        return Vec::new();
+    }
+    let len = first
+        .get("values")
+        .and_then(Value::as_array)
+        .and_then(|v| u64::try_from(v.len()).ok());
+    let Some(size) = first
+        .get("maxResults")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0)
+        .or(len.filter(|n| *n > 0))
+    else {
+        return Vec::new();
+    };
+    let start = first.get("startAt").and_then(Value::as_u64).unwrap_or(0);
+    let total = first.get("total").and_then(Value::as_u64);
+    (1..MAX_FIELD_PAGES)
+        .map_while(|k| start.checked_add(k.checked_mul(size)?))
+        .take_while(|s| total.is_none_or(|t| *s < t))
+        .map(|s| fields_call(key, type_id, Some((s, size))))
+        .collect()
+}
+
+/// Δ3: answers `[projects]`, `[.., issue types]`, `[.., fields page 1]`, `[.., later pages]`.
+fn create_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    let Some(projects) = answers.first() else {
+        return EnrichStep::Fetch(vec![(
+            EnrichPurpose::Resolve,
+            get_call(PROJECTS_PATH, ctx.params, &[]),
+        )]);
+    };
+    let Ok(project) = resolve_project(ctx, projects) else {
+        return EnrichStep::Judge;
+    };
+    let Some(types) = answers.get(1) else {
+        let params = json!({"project": project.key});
+        return EnrichStep::Fetch(vec![(
+            EnrichPurpose::Resolve,
+            get_call(CREATEMETA_ISSUETYPES_PATH, &params, &[]),
+        )]);
+    };
+    let Ok(issuetype) = resolve_issuetype(ctx, types) else {
+        return EnrichStep::Judge;
+    };
+    match answers.get(2..) {
+        Some([]) | None => EnrichStep::Fetch(vec![fields_call(&project.key, &issuetype.id, None)]),
+        Some([first]) => {
+            let more = later_field_pages(&project.key, &issuetype.id, first);
+            if more.is_empty() {
+                EnrichStep::Judge
+            } else {
+                EnrichStep::Fetch(more)
+            }
+        }
+        Some(_) => EnrichStep::Judge,
+    }
+}
+
+/// Whether a dedicated param or a `fields` key sets `id` (PD-49). `description` counts only when
+/// the agent gave one.
+fn set_by_params(params: &Value, id: &str) -> bool {
+    let present = |name: &str| params.get(name).is_some_and(|v| !v.is_null());
+    match id {
+        "project" | "issuetype" | "summary" | "description" if present(id) => true,
+        _ => params
+            .get("fields")
+            .and_then(Value::as_object)
+            .is_some_and(|m| m.contains_key(id)),
+    }
+}
+
+/// PD-49: `required && !hasDefaultValue` fields no param sets, in createmeta order over the pages
+/// (a field id seen on an earlier page is not counted again), and how many there are in all. The
+/// kept list stops at [`MAX_MISSING_FIELDS`]. `None`: a page is not a createmeta answer.
+fn missing_fields(params: &Value, pages: &[Value]) -> Option<(Vec<MissingField>, u64)> {
+    let mut seen = std::collections::HashSet::new();
+    let (mut out, mut total) = (Vec::new(), 0u64);
+    for page in pages {
+        for field in page.get("values")?.as_array()? {
+            let Some(id) = field.get("fieldId").and_then(Value::as_str) else {
+                continue;
+            };
+            let flag = |k: &str| field.get(k) == Some(&Value::Bool(true));
+            if !seen.insert(id) || !flag("required") || flag("hasDefaultValue") {
+                continue;
+            }
+            if set_by_params(params, id) {
+                continue;
+            }
+            total = total.saturating_add(1);
+            if out.len() == MAX_MISSING_FIELDS {
+                continue;
+            }
+            let schema = |k: &str| {
+                field
+                    .get("schema")
+                    .and_then(|s| s.get(k))
+                    .and_then(Value::as_str)
+                    .map(capped)
+            };
+            let allowed_values = field
+                .get("allowedValues")
+                .and_then(Value::as_array)
+                .map(|vals| {
+                    vals.iter()
+                        .filter_map(|v| {
+                            v.get("value")
+                                .or_else(|| v.get("name"))
+                                .and_then(Value::as_str)
+                                .map(capped)
+                        })
+                        .take(MAX_ALLOWED_VALUES)
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(MissingField {
+                id: capped(id),
+                name: field
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| capped(id), capped),
+                schema_type: schema("type").unwrap_or_default(),
+                schema_items: schema("items"),
+                allowed_values,
+            });
+        }
+    }
+    Some((out, total))
+}
+
+/// PD-49 (plan text): `"<name> (<fieldId>, <schema.type>)"` joined by `", "` in createmeta order,
+/// display-escaped, at most [`MAX_CANDIDATES`] then `"… and N more"`.
+fn missing_list(fields: &[MissingField], total: u64) -> String {
+    let shown = |s: &str| crate::metadata::one_line(escape_for_display(s));
+    let mut list: Vec<String> = fields
+        .iter()
+        .take(MAX_CANDIDATES)
+        .map(|f| {
+            format!(
+                "{} ({}, {})",
+                shown(&f.name),
+                shown(&f.id),
+                shown(&f.schema_type)
+            )
+        })
+        .collect();
+    let listed = u64::try_from(list.len()).unwrap_or(u64::MAX);
+    if total > listed {
+        list.push(format!("… and {} more", total - listed));
+    }
+    list.join(", ")
+}
+
+fn create_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
+    let Some(projects) = answers.first() else {
+        return EnrichVerdict::unusable();
+    };
+    let project = match resolve_project(ctx, projects) {
+        Ok(p) => p,
+        Err(v) => return *v,
+    };
+    let Some(types) = answers.get(1) else {
+        return EnrichVerdict::unusable();
+    };
+    let issuetype = match resolve_issuetype(ctx, types) {
+        Ok(t) => t,
+        Err(v) => return *v,
+    };
+    let Some((missing, total)) = answers
+        .get(2..)
+        .filter(|pages| !pages.is_empty())
+        .and_then(|pages| missing_fields(ctx.params, pages))
+    else {
+        return EnrichVerdict::unusable();
+    };
+    let mut resolved = Map::new();
+    resolved.insert("project_key".to_owned(), Value::from(project.key.clone()));
+    resolved.insert("issuetype".to_owned(), Value::from(issuetype.id.clone()));
+    let baseline = json!({"project_key": project.key, "issuetype_id": issuetype.id});
+    let mut verdict = EnrichVerdict::preview(baseline, resolved);
+    if total > 0 {
+        verdict.warnings.push(Warning::new(
+            WarningId::MissingRequiredFields,
+            warning::missing_required_fields(&missing_list(&missing, total)),
+        ));
+    }
+    verdict.missing_fields = missing;
+    verdict.summary = Some(WriteSummaryFacts {
+        project_key: Some(project.key),
+        project_name: project.name.as_deref().map(capped),
+        issue_type: issuetype.name.as_deref().map(capped),
+    });
+    verdict
+}
+
+/// `POST /rest/api/2/issue` `{"fields": {project: {key}, issuetype: {id}, summary,
+/// description?, ..}}`; the project is the key enrichment resolved (PD-48).
 pub fn issue_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     // Path checks first, so the validation dry call reports a bad placeholder (exit 2) even
-    // before enrichment: the write URL and the createmeta lookup.
+    // before enrichment: the write URL, and the agent's project as a path segment (M3): a value
+    // that cannot stand in a path (`..`) cannot name the project whose key goes there.
     resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
     resolve_url(ctx.base, CREATEMETA_ISSUETYPES_PATH, ctx.params, &[])?;
     // PD-43: converted and hard-checked before the enrichment wait, so the dry call rejects it.
     let description = jira_body::wiki_text(ctx, "description")?;
+    let project_key = resolved_id(ctx, "project_key")?;
     let issuetype = resolved_id(ctx, "issuetype")?;
     let mut fields = ctx
         .params
@@ -249,14 +566,7 @@ pub fn issue_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let project = str_param(ctx.params, "project");
-    // Jira project keys start with a letter, so an all-digit value is a project id.
-    let project_ref = if !project.is_empty() && project.bytes().all(|b| b.is_ascii_digit()) {
-        json!({"id": project})
-    } else {
-        json!({"key": project})
-    };
-    fields.insert("project".to_owned(), project_ref);
+    fields.insert("project".to_owned(), json!({"key": project_key}));
     fields.insert("issuetype".to_owned(), json!({"id": issuetype}));
     fields.insert(
         "summary".to_owned(),
@@ -295,10 +605,12 @@ pub(crate) fn issue_fields_call(params: &Value, ids: &[String]) -> Option<GetCal
     Some(get_call(ISSUE_PATH, params, &[("fields", &ids.join(","))]))
 }
 
-fn edit_plan(ctx: &EnrichCtx<'_>) -> Vec<(EnrichPurpose, GetCall)> {
-    issue_fields_call(ctx.params, &edited_field_ids(ctx.params))
+/// One round (Δ3, wrapped mechanically); none when there is nothing to read.
+fn edit_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    let calls = issue_fields_call(ctx.params, &edited_field_ids(ctx.params))
         .map(|c| vec![(EnrichPurpose::Enrich, c)])
-        .unwrap_or_default()
+        .unwrap_or_default();
+    single_round(calls, answers)
 }
 
 fn edit_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
@@ -399,12 +711,14 @@ pub(crate) fn transition_calls(params: &Value) -> [GetCall; 2] {
     ]
 }
 
-fn transition_plan(ctx: &EnrichCtx<'_>) -> Vec<(EnrichPurpose, GetCall)> {
+/// One round (Δ3, wrapped mechanically): the transitions, then the current status.
+fn transition_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
     let [transitions, status] = transition_calls(ctx.params);
-    vec![
+    let calls = vec![
         (EnrichPurpose::Resolve, transitions),
         (EnrichPurpose::Enrich, status),
-    ]
+    ];
+    single_round(calls, answers)
 }
 
 /// `(transitions, current status id)` from the two answers of [`transition_calls`].

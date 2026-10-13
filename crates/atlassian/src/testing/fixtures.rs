@@ -60,6 +60,14 @@ pub const JIRA_SEARCH_PAGE: &str = r#"{"expand":"schema,names","startAt":0,"maxR
 
 pub const JIRA_CREATEMETA_ISSUETYPES: &str = r#"{"maxResults":50,"startAt":0,"total":2,"isLast":true,"values":[{"self":"https://jira.corp.example/rest/api/2/issuetype/10001","id":"10001","description":"A user story.","name":"Story","subtask":false},{"self":"https://jira.corp.example/rest/api/2/issuetype/10002","id":"10002","description":"A problem.","name":"Bug","subtask":false}]}"#;
 
+/// `GET /rest/api/2/project`: the projects `jira.issue.create` resolves its `project` against
+/// (stage 1, PD-48).
+pub const JIRA_PROJECTS: &str = r#"[{"self":"https://jira.corp.example/rest/api/2/project/10000","id":"10000","key":"ABC","name":"Alpha Beta","projectTypeKey":"software"},{"self":"https://jira.corp.example/rest/api/2/project/10010","id":"10010","key":"OPS","name":"Operations","projectTypeKey":"business"}]"#;
+
+/// `GET /rest/api/2/issue/createmeta/ABC/issuetypes/10002` (`Bug`, stage 3, PD-49): every
+/// required field without a default is one of the dedicated params, so nothing is missing.
+pub const JIRA_CREATEMETA_FIELDS: &str = r#"{"maxResults":50,"startAt":0,"total":5,"isLast":true,"values":[{"required":true,"schema":{"type":"project","system":"project"},"name":"Project","fieldId":"project","hasDefaultValue":false,"operations":["set"]},{"required":true,"schema":{"type":"issuetype","system":"issuetype"},"name":"Issue Type","fieldId":"issuetype","hasDefaultValue":false,"operations":[]},{"required":true,"schema":{"type":"string","system":"summary"},"name":"Summary","fieldId":"summary","hasDefaultValue":false,"operations":["set"]},{"required":false,"schema":{"type":"string","system":"description"},"name":"Description","fieldId":"description","hasDefaultValue":false,"operations":["set"]},{"required":true,"schema":{"type":"user","system":"reporter"},"name":"Reporter","fieldId":"reporter","hasDefaultValue":true,"operations":["set"]}]}"#;
+
 pub const JIRA_TRANSITIONS: &str = r#"{"expand":"transitions","transitions":[{"id":"21","name":"Start Progress","to":{"self":"https://jira.corp.example/rest/api/2/status/3","name":"In Progress","id":"3","statusCategory":{"id":4,"key":"indeterminate","name":"In Progress"}},"fields":{}},{"id":"31","name":"Done","to":{"self":"https://jira.corp.example/rest/api/2/status/10001","name":"Done","id":"10001","statusCategory":{"id":3,"key":"done","name":"Done"}},"fields":{"resolution":{"required":true,"name":"Resolution","allowedValues":[{"id":"1","name":"Fixed"}]}}}]}"#;
 
 pub const JIRA_COMMENT: &str = r#"{"self":"https://jira.corp.example/rest/api/2/issue/10001/comment/20001","id":"20001","author":{"name":"jdoe","key":"JIRAUSER1","displayName":"Jane Doe"},"body":"Reproduced on staging.","updateAuthor":{"name":"jdoe","key":"JIRAUSER1","displayName":"Jane Doe"},"created":"2026-10-06T10:00:00.000+0200","updated":"2026-10-06T10:00:00.000+0200"}"#;

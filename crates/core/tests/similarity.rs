@@ -40,13 +40,9 @@ fn create_params(summary: &str) -> Value {
     json!({ "project": "ABC", "issuetype": "Bug", "summary": summary, "body_format": "wiki" })
 }
 
+/// The three enrichment answers of a create in `ABC` (Task 12: projects, issue types, fields).
 async fn createmeta_ok(mock: &MockDc) {
-    mock.json(
-        "/rest/api/2/issue/createmeta/ABC/issuetypes",
-        200,
-        fixtures::JIRA_CREATEMETA_ISSUETYPES,
-    )
-    .await;
+    common::jira::mount_create_stages(mock).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

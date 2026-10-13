@@ -46,7 +46,7 @@ use crate::engine::write;
 use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, TransitionError};
 use crate::gate::UiEvent;
 use crate::lifecycle::model::{Event, Hold, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
-use crate::ops::{ExecError, op_table};
+use crate::ops::{ExecError, MissingField, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
 use crate::redact::RedactionOp;
 use crate::similarity::SimHit;
@@ -605,7 +605,7 @@ async fn write_preview(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, submitte
         body: model.body,
         also_appears_in: Vec::new(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
-        edit_form: None,
+        edit_form: Some(write::edit_form(entry.spec, &w)),
     };
     Some((preview, shown, opened))
 }
@@ -1376,12 +1376,26 @@ async fn edit_write(
 /// §5.4 step 2: "no issue type named 'Bugg' in ABC" (app-generated; the value is the agent's).
 fn resolution_message(params: &Value, param: &str, value: &str) -> String {
     let value = echo(value);
-    let of = |name: &str| params.get(name).and_then(Value::as_str).unwrap_or_default();
+    // The agent's own values (never a resolved one: that would be fetched data), escaped.
+    let of = |name: &str| echo(params.get(name).and_then(Value::as_str).unwrap_or_default());
     match param {
         "issuetype" => format!("no issue type named '{value}' in {}", of("project")),
         "transition" => format!("no transition named '{value}' for {}", of("key")),
         _ => format!("no {param} named '{value}'"),
     }
+}
+
+/// PD-49: a missing required field as a `missing_fields` deny hint lists it (§4.3): raw server
+/// text like resolution candidates, `allowed_values` only when the human ticked them.
+fn missing_field_detail(f: &MissingField, include_allowed_values: bool) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert("id".into(), Value::from(f.id.clone()));
+    m.insert("name".into(), Value::from(f.name.clone()));
+    m.insert("schema_type".into(), Value::from(f.schema_type.clone()));
+    if include_allowed_values {
+        m.insert("allowed_values".into(), serde_json::json!(f.allowed_values));
+    }
+    Value::Object(m)
 }
 
 /// The hint a deny attaches (§5.4 step 2, §4.3), only one the current hold has the data for.
@@ -1430,7 +1444,24 @@ fn deny_hint(entry: &RequestEntry, details: DenyDetails) -> Result<Value, Decisi
             }
             Ok(serde_json::json!({ "code": "resolution_failed", "details": d }))
         }
-        // `missing_fields` is M5's (createmeta required fields).
+        // PD-49: only a `Preview` verdict that found missing required fields has them.
+        (
+            DenyDetails::MissingFields {
+                include_allowed_values,
+            },
+            Some(Hold::Preview),
+        ) => {
+            let verdict = &snap.write.verdict;
+            if verdict.hold != Hold::Preview || verdict.missing_fields.is_empty() {
+                return Err(refuse());
+            }
+            let list: Vec<Value> = verdict
+                .missing_fields
+                .iter()
+                .map(|f| missing_field_detail(f, include_allowed_values))
+                .collect();
+            Ok(serde_json::json!({ "code": "denied", "details": { "missing_fields": list } }))
+        }
         _ => Err(refuse()),
     }
 }

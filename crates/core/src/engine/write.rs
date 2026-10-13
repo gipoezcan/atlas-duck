@@ -39,11 +39,14 @@ use atlas_duck_atlassian::{
 use atlas_duck_audit::request_set::requests_to_json;
 use atlas_duck_audit::{NewEvent, RequestRecord, request_set_hash};
 use atlas_duck_ipc::envelope::ErrorCode;
+use atlas_duck_preview::form::{EditForm, EditInput, InputKind};
+use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{Level, OutcomeKind as CardKind};
 use atlas_duck_registry::{OperationSpec, Product, StatusSet, SuccessBody};
 use serde_json::{Map, Value, json};
 
+use super::enrich::{EnrichOutcome, run};
 use super::envelope::MSG_IDENTITY_HEADER;
 use super::read::{
     MSG_IDENTITY, MSG_NEEDS_TOKEN, class_name, connection_message, error_text, unavailable_message,
@@ -61,9 +64,10 @@ use crate::lifecycle::model::{
     Applied, Event, ExecOutcome, Hold, InstanceEvt, Model, Phase, Rejection, StaleReason,
     is_pending, step,
 };
+use crate::metadata::one_line;
 use crate::ops::generic::write_preview;
 use crate::ops::{
-    EnrichCtx, EnrichFailure, EnrichPurpose, EnrichVerdict, ExecError, ExecPlan, PreviewCtx,
+    EnrichFailure, EnrichRule, EnrichVerdict, ExecError, ExecPlan, MissingField, PreviewCtx,
     PreviewInput, PreviewModel, StaleCtx, StaleVerdict, WriteView, op_table,
 };
 use crate::payloads::{
@@ -371,6 +375,88 @@ pub(crate) fn preview_model(
     }
     model.header.executes_as = executes_as.map(str::to_owned);
     model
+}
+
+/// Params whose text is long (bodies and comments): a multi-line input.
+const LONG_TEXT_PARAMS: [&str; 3] = ["description", "body", "comment"];
+
+/// The input kind of a params-schema property (Δ2): `string` → text (long for bodies and
+/// comments), `integer` → integer, `boolean` → boolean, anything else (object, array, number,
+/// none) → JSON. A type list (`["string", "null"]`) counts by its first non-null entry.
+fn param_kind(name: &str, prop: &Value) -> InputKind {
+    let ty = match prop.get("type") {
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(Value::Array(types)) => types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|t| *t != "null"),
+        _ => None,
+    };
+    match ty {
+        Some("string") if LONG_TEXT_PARAMS.contains(&name) => InputKind::LongText,
+        Some("string") => InputKind::Text,
+        Some("integer") => InputKind::Integer,
+        Some("boolean") => InputKind::Boolean,
+        _ => InputKind::Json,
+    }
+}
+
+/// PD-49: the input of a missing required field: a choice of its allowed values for an `option`
+/// (or an `array` of `option`), an integer for a `number`, text for a `string`, else JSON.
+fn missing_kind(f: &MissingField) -> InputKind {
+    let choice = f.schema_type == "option"
+        || (f.schema_type == "array" && f.schema_items.as_deref() == Some("option"));
+    match f.schema_type.as_str() {
+        _ if choice && !f.allowed_values.is_empty() => InputKind::choice(
+            f.allowed_values
+                .iter()
+                .map(|v| one_line(escape_for_display(v)))
+                .collect(),
+        ),
+        "number" => InputKind::Integer,
+        "string" => InputKind::Text,
+        _ => InputKind::Json,
+    }
+}
+
+/// §5.4 step 4 (Δ2, L06, PD-49): the edit form of a write preview: one input per params-schema
+/// property with the value that runs (`null` when absent), target params and conflict baselines
+/// read-only, then one pre-added input per missing required field of the latest verdict. Labels
+/// from the server are display-escaped; values are the params as they are.
+pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
+    let schema = spec.params_schema_json();
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let fixed =
+        |name: &str| spec.target_params.contains(&name) || spec.conflict_baselines.contains(&name);
+    let mut inputs: Vec<EditInput> = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, prop)| EditInput {
+            path: name.clone(),
+            label: name.clone(),
+            kind: param_kind(name, prop),
+            read_only: fixed(name),
+            required: required.contains(&name.as_str()),
+            pre_added: false,
+            value: w.params.get(name).cloned().unwrap_or(Value::Null),
+        })
+        .collect();
+    inputs.extend(w.verdict.missing_fields.iter().map(|f| EditInput {
+        path: format!("fields.{}", f.id),
+        label: one_line(escape_for_display(&format!("{} ({})", f.name, f.id))),
+        kind: missing_kind(f),
+        read_only: false,
+        required: true,
+        pre_added: true,
+        value: Value::Null,
+    }));
+    EditForm { inputs }
 }
 
 /// The queue row's "caution (N)" of the current revision (§5.6).
@@ -1084,7 +1170,7 @@ pub(crate) fn rerun(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
 }
 
 /// What an enrichment GET means for the §5.4 step 2 table.
-enum Effect {
+pub(super) enum Effect {
     /// "enrichment failed": Approve disabled, a deny may attach the hint.
     Held(Failure),
     /// Data-free, returned directly (`REQUEST_FAILED`).
@@ -1092,7 +1178,7 @@ enum Effect {
 }
 
 /// A data-free direct enrichment failure.
-struct Direct {
+pub(super) struct Direct {
     code: ErrorCode,
     message: String,
     cause: Option<(&'static str, &'static str)>,
@@ -1144,13 +1230,13 @@ fn needs_token_direct() -> Direct {
 /// How a GET's identity failure is mapped: an initial enrichment (or an edit's) fails with an
 /// [`Effect`]; a refresh or a stale check returns the write with a [`Recheck`].
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GetMode {
+pub(super) enum GetMode {
     Enrich,
     Recheck,
 }
 
 /// What an identity-gated GET came to (Task 26).
-enum Gated {
+pub(super) enum Gated {
     /// Classify the answer as before (a passing re-check turned a JSON 401 into a plain one).
     Proceed(FetchOutcome),
     /// A rename: run the GET once more.
@@ -1164,7 +1250,7 @@ enum Gated {
 /// The identity handling of one GET (§7.1): a failed `X-AUSERNAME` check or a JSON 401 runs the
 /// token re-check, and [`identity::effect`] decides. `allow_rerun` is false for the second run
 /// of a GET (a rename re-runs it once; a second failure falls back).
-async fn gate_get(
+pub(super) async fn gate_get(
     engine: &Arc<Engine>,
     instance_id: &str,
     seen: u64,
@@ -1270,7 +1356,7 @@ fn status_2xx(r: &UpstreamResponse) -> bool {
 
 /// The single source of truth for an initial or edit-triggered enrichment GET (§5.4 step 2
 /// table, §7.2, §11.2): a usable 2xx JSON body, or its effect.
-fn enrich_effect(outcome: FetchOutcome, proxy: &ResolvedProxy) -> Result<Value, Effect> {
+pub(super) fn enrich_effect(outcome: FetchOutcome, proxy: &ResolvedProxy) -> Result<Value, Effect> {
     match outcome {
         FetchOutcome::Response(r) if status_2xx(&r) => serde_json::from_slice(&r.body)
             // The client accepted the JSON, `Value` could not hold it (nesting): gated.
@@ -1351,9 +1437,9 @@ fn enrich_effect(outcome: FetchOutcome, proxy: &ResolvedProxy) -> Result<Value, 
 }
 
 /// `WRITE_STALE` reason and class of a stale-check or refresh GET.
-type Recheck = (StaleReason, Option<String>);
+pub(super) type Recheck = (StaleReason, Option<String>);
 
-fn recheck_failed(class: &str) -> Recheck {
+pub(super) fn recheck_failed(class: &str) -> Recheck {
     (StaleReason::RecheckFailed, Some(class.to_owned()))
 }
 
@@ -1361,7 +1447,7 @@ fn recheck_failed(class: &str) -> Recheck {
 /// `recheck_failed {class}` (`network`, `http_<status>`, `redirect`, `non_json`, `too_large`,
 /// `origin_mismatch`); a Jira answer that fails the `X-AUSERNAME` check is `identity_mismatch`
 /// (a JSON 401 that passed the re-check of `gate_get` is `http_401`).
-fn recheck(outcome: FetchOutcome) -> Result<Value, Recheck> {
+pub(super) fn recheck(outcome: FetchOutcome) -> Result<Value, Recheck> {
     match outcome {
         FetchOutcome::Response(r) if status_2xx(&r) => {
             serde_json::from_slice(&r.body).map_err(|_| recheck_failed("non_json"))
@@ -1415,7 +1501,7 @@ fn recheck(outcome: FetchOutcome) -> Result<Value, Recheck> {
 }
 
 /// The resolved path and query of a GET, for `PREVIEW_FETCH.path`.
-fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
+pub(super) fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
     match build_url(base, &call.endpoint_template, &call.params, &call.query) {
         Ok(u) => match u.query() {
             Some(q) => format!("{}?{q}", u.path()),
@@ -1427,7 +1513,7 @@ fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
 
 /// `PREVIEW_FETCH {purpose, method, path, status, response | outcome}` of one GET, with every
 /// byte received (§5.4 step 2); a GET that was refused or never left names its `class`.
-fn get_record(
+pub(super) fn get_record(
     ctx: &EventCtx,
     purpose: PreviewFetchPurpose,
     base: &NormalizedBaseUrl,
@@ -1529,8 +1615,36 @@ fn fetch_view(outcome: &FetchOutcome) -> (FetchRecord<'_>, Option<&'static str>)
     }
 }
 
-/// One enrichment (initial, after an edit, or a refresh): every GET of the plan, recorded, then
-/// the verdict and the rendered list (`Enriched`), or the failure's effect.
+/// An enrichment that cannot run fails closed (never left without a driver, review M-3): a direct
+/// `internal` failure with `message`, or in a refresh `recheck_failed {internal}`.
+fn internal_with(refreshing: bool, message: &str) -> Result<Effect, Recheck> {
+    if refreshing {
+        Err(recheck_failed("internal"))
+    } else {
+        Ok(Effect::Direct(Direct::internal(message)))
+    }
+}
+
+/// [`internal_with`] the fixed "could not be prepared" message.
+pub(super) fn internal_effect(refreshing: bool) -> Result<Effect, Recheck> {
+    internal_with(refreshing, MSG_PREPARE_INTERNAL)
+}
+
+/// The op's enrichment rule; under `testing`, `TestHooks::enrich_rule` replaces it (the round
+/// limit test).
+fn enrich_rule(engine: &Engine, rule: Option<&'static EnrichRule>) -> Option<&'static EnrichRule> {
+    #[cfg(feature = "testing")]
+    if let Some(r) = engine.hooks.enrich_rule {
+        return Some(r);
+    }
+    #[cfg(not(feature = "testing"))]
+    let _ = engine;
+    rule
+}
+
+/// One enrichment (initial, after an edit, or a refresh): the staged driver
+/// ([`super::enrich::run`]), then the verdict and the rendered list (`Enriched`), or the
+/// failure's effect.
 async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
     let (params, refreshing) = {
         let st = entry.state();
@@ -1539,16 +1653,9 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
             st.model.refreshing(),
         )
     };
-    // An enrichment that cannot run fails closed (never left without a driver, review M-3).
-    let internal = |message: &str| {
-        if refreshing {
-            Err(recheck_failed("internal"))
-        } else {
-            Ok(Effect::Direct(Direct::internal(message)))
-        }
-    };
+    let internal = |message: &str| internal_with(refreshing, message);
     let (Some(params), Some(op)) = (params, op_table().get(entry.spec.id).copied()) else {
-        enrich_failed(engine, entry, None, internal(MSG_PREPARE_INTERNAL)).await;
+        enrich_failed(engine, entry, None, internal_effect(refreshing)).await;
         return;
     };
     let spec = entry.spec;
@@ -1571,99 +1678,17 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
             return;
         }
     };
-    let calls = op
-        .enrich
-        .map(|r| {
-            (r.plan)(&EnrichCtx {
-                spec,
-                params: &params,
-            })
-        })
-        .unwrap_or_default();
-    let mut bodies = Vec::new();
-    let mut last = None;
-    if !calls.is_empty() {
-        let ctl = FetchControl::new();
-        entry.set_fetch_control(Some(ctl.clone()));
-        // §5.1 inv. 1: only an id whose `REQUEST_RECEIVED` committed gets a cover.
-        let Ok(cover) = engine.covers().for_request(&entry.head.request_id) else {
-            enrich_failed(engine, entry, None, internal(MSG_PREPARE_INTERNAL)).await;
-            return;
-        };
-        let n = calls.len();
-        for (i, (purpose, call)) in calls.into_iter().enumerate() {
-            let purpose = match (refreshing, purpose) {
-                (true, _) => PreviewFetchPurpose::Refresh,
-                (false, EnrichPurpose::Enrich) => PreviewFetchPurpose::Enrich,
-                (false, EnrichPurpose::Resolve) => PreviewFetchPurpose::Resolve,
-            };
-            let mut attempt = 0u8;
-            let (record, got) = loop {
-                let seen = engine.identity_epoch(&entry.instance_id);
-                // A cancel while this GET is in flight records it (`cancelled_in_flight`,
-                // Task 24).
-                entry.set_in_flight(Some(InFlight {
-                    purpose,
-                    path: call_path(http.client.base(), &call),
-                }));
-                let outcome = http.client.get_ctl(&cover, &call, &ctl).await;
-                entry.set_in_flight(None);
-                let record = get_record(&entry.ctx, purpose, http.client.base(), &call, &outcome);
-                park(engine, entry, &record).await;
-                let gated = gate_get(
-                    engine,
-                    &entry.instance_id,
-                    seen,
-                    outcome,
-                    mode,
-                    attempt == 0,
-                )
-                .await;
-                match gated {
-                    // A rename: the first answer is recorded, the GET runs once more (§7.1).
-                    Gated::Rerun => {
-                        attempt += 1;
-                        if !engine.append_pending(entry, vec![record], None).await {
-                            return;
-                        }
-                    }
-                    Gated::Proceed(outcome) => {
-                        let got = if refreshing {
-                            recheck(outcome).map_err(Err)
-                        } else {
-                            enrich_effect(outcome, &http.proxy).map_err(Ok)
-                        };
-                        break (record, got);
-                    }
-                    Gated::Held(effect) => break (record, Err(Ok(effect))),
-                    Gated::Stale(fail) => break (record, Err(Err(fail))),
-                }
-            };
-            match got {
-                Ok(v) => bodies.push(v),
-                Err(fail) => {
-                    enrich_failed(engine, entry, Some(record), fail).await;
-                    return;
-                }
+    // The staged driver (Δ3): every round's GETs, recorded, then the judge.
+    let (verdict, last) = match enrich_rule(engine, op.enrich) {
+        Some(rule) => match run(engine, entry, &http, rule, &params, refreshing).await {
+            EnrichOutcome::Judged { verdict, last } => (*verdict, last),
+            EnrichOutcome::Failed { record, fail } => {
+                enrich_failed(engine, entry, record, fail).await;
+                return;
             }
-            if i + 1 < n {
-                if !engine.append_pending(entry, vec![record], None).await {
-                    return;
-                }
-            } else {
-                last = Some(record);
-            }
-        }
-    }
-    let verdict = match op.enrich {
-        Some(rule) => (rule.judge)(
-            &EnrichCtx {
-                spec,
-                params: &params,
-            },
-            &bodies,
-        ),
-        None => EnrichVerdict::preview(Value::Null, Map::new()),
+            EnrichOutcome::Stopped => return,
+        },
+        None => (EnrichVerdict::preview(Value::Null, Map::new()), None),
     };
     let effective_max = entry.validated.as_ref().and_then(|v| v.effective_max);
     let rendered = if verdict.hold == Hold::Preview {
@@ -1698,7 +1723,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
 
 /// The GET finished and its record is built: park it until an append commits it, so a cancel or
 /// expiry in between still logs it (Task 24 review I-2).
-async fn park(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, record: &NewEvent) {
+pub(super) async fn park(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, record: &NewEvent) {
     entry.park_record(record);
     #[cfg(feature = "testing")]
     if let Some(pause) = engine.hooks.pause_after_get.clone() {

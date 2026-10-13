@@ -19,7 +19,6 @@ const COMMENT: &str = "jira.comment.add";
 const CREATE: &str = "jira.issue.create";
 const COMMENT_PATH: &str = "/rest/api/2/issue/ABC-1/comment";
 const CREATE_PATH: &str = "/rest/api/2/issue";
-const CREATEMETA_PATH: &str = "/rest/api/2/issue/createmeta/ABC/issuetypes";
 
 fn jira(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("jira-main").ok_or_else(|| "no jira mock".into())
@@ -261,11 +260,10 @@ async fn whitespace_only_markdown_rejected_at_validation() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_markdown_description_converted_before_enrichment() -> TestResult {
     // The dry call converts and checks before the executor asks for enrichment: a fault is
-    // rejected before the createmeta GET.
+    // rejected before the first enrichment GET (Task 12: the projects).
     let h = faulty(ConverterFault::Include).await?;
     let mock = jira(&h)?;
-    mock.json(CREATEMETA_PATH, 200, fixtures::JIRA_CREATEMETA_ISSUETYPES)
-        .await;
+    common::jira::mount_create_stages(mock).await;
     let before = hits(mock).await;
     let params = json!({ "project": "ABC", "issuetype": "Bug", "summary": "S",
                          "description": "**x**" });
@@ -278,8 +276,7 @@ async fn create_markdown_description_converted_before_enrichment() -> TestResult
     let h = Harness::jira().await?;
     let mock = jira(&h)?;
     identity_ok(mock).await;
-    mock.json(CREATEMETA_PATH, 200, fixtures::JIRA_CREATEMETA_ISSUETYPES)
-        .await;
+    common::jira::mount_create_stages(mock).await;
     mock.json(CREATE_PATH, 201, fixtures::JIRA_ISSUE_CREATED)
         .await;
     let id = approved(&h, CREATE, params).await?;

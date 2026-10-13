@@ -7,8 +7,9 @@ use atlas_duck_preview::warning::{self, Warning, WarningId};
 use serde_json::{Map, Value, json};
 
 use super::{
-    EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan, PreviewCtx,
-    PreviewModel, generic, get_call, json_request, resolve_url, str_param,
+    EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
+    PreviewCtx, PreviewModel, generic, get_call, json_request, resolve_url, single_round,
+    str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::{ValidationError, invalid};
@@ -230,15 +231,17 @@ pub static PAGE_UPDATE_ENRICH: EnrichRule = EnrichRule {
     judge: page_update_judge,
 };
 
-fn page_update_plan(ctx: &EnrichCtx<'_>) -> Vec<(EnrichPurpose, GetCall)> {
-    vec![(
+/// One round (Δ3, wrapped mechanically): the page with its body, version and space.
+fn page_update_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    let calls: Vec<(EnrichPurpose, GetCall)> = vec![(
         EnrichPurpose::Enrich,
         get_call(
             CONTENT_PATH,
             ctx.params,
             &[("expand", "body.storage,version,space")],
         ),
-    )]
+    )];
+    single_round(calls, answers)
 }
 
 /// `version.number` of a content answer.

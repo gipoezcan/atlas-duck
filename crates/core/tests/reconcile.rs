@@ -921,12 +921,8 @@ async fn i26_startup_notice_lists_targets() -> TestResult {
 async fn rf4_create_after_crash_is_flagged() -> TestResult {
     let mut h = Harness::jira().await?;
     let mock = jira(&h)?;
-    mock.json(
-        "/rest/api/2/issue/createmeta/ABC/issuetypes",
-        200,
-        fixtures::JIRA_CREATEMETA_ISSUETYPES,
-    )
-    .await;
+    // The create's three enrichment stages (Task 12).
+    common::jira::mount_create_stages(mock).await;
     mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
         .await;
     let first = queued(&h, CREATE, create_params("Fix login")).await?;

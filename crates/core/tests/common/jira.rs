@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use atlas_duck_atlassian::testing::MockDc;
+use atlas_duck_atlassian::testing::{MockDc, fixtures};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -115,6 +115,37 @@ pub async fn mount_comment_page_delayed(mock: &MockDc, key: &str, page: &Value, 
 pub async fn mount_createmeta_fields(mock: &MockDc, project: &str, type_id: &str, body: &Value) {
     let p = format!("/rest/api/2/issue/createmeta/{project}/issuetypes/{type_id}");
     mount_get(mock, &p, json_answer(mock, 200, body)).await;
+}
+
+/// `/rest/api/2/project` (`jira.issue.create` stage 1, PD-48).
+pub const PROJECTS_PATH: &str = "/rest/api/2/project";
+
+/// `/rest/api/2/issue/createmeta/{project}/issuetypes` (stage 2).
+pub fn issuetypes_path(project: &str) -> String {
+    format!("/rest/api/2/issue/createmeta/{project}/issuetypes")
+}
+
+/// `/rest/api/2/issue/createmeta/{project}/issuetypes/{type_id}` (stage 3, PD-49).
+pub fn create_fields_path(project: &str, type_id: &str) -> String {
+    format!("/rest/api/2/issue/createmeta/{project}/issuetypes/{type_id}")
+}
+
+/// The three enrichment answers of a `jira.issue.create` in `ABC` (`Alpha Beta`) with issue type
+/// `Bug` (`10002`) and no missing required field.
+pub async fn mount_create_stages(mock: &MockDc) {
+    mock.json(PROJECTS_PATH, 200, fixtures::JIRA_PROJECTS).await;
+    mock.json(
+        &issuetypes_path("ABC"),
+        200,
+        fixtures::JIRA_CREATEMETA_ISSUETYPES,
+    )
+    .await;
+    mock.json(
+        &create_fields_path("ABC", "10002"),
+        200,
+        fixtures::JIRA_CREATEMETA_FIELDS,
+    )
+    .await;
 }
 
 /// `GET /rest/api/2/issueLinkType` answers `{"issueLinkTypes": types}`.

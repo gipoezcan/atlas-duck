@@ -679,8 +679,27 @@ async fn i03_read_release_flow() -> Result<()> {
     Ok(())
 }
 
-/// I-03: a write is approved: `succeeded` with the receipt. The create's enrichment reads the
-/// issue types of the project; the approved POST answers 201.
+/// The three enrichment answers of a `jira.issue.create` in `ABC` with issue type `Bug` (M5
+/// Task 12: the projects, the project's issue types, the issue type's createmeta fields).
+async fn mount_create_stages(mock: &atlas_duck_atlassian::testing::MockDc) {
+    mock.json("/rest/api/2/project", 200, fixtures::JIRA_PROJECTS)
+        .await;
+    mock.json(
+        "/rest/api/2/issue/createmeta/ABC/issuetypes",
+        200,
+        fixtures::JIRA_CREATEMETA_ISSUETYPES,
+    )
+    .await;
+    mock.json(
+        "/rest/api/2/issue/createmeta/ABC/issuetypes/10002",
+        200,
+        fixtures::JIRA_CREATEMETA_FIELDS,
+    )
+    .await;
+}
+
+/// I-03: a write is approved: `succeeded` with the receipt. The create's enrichment resolves the
+/// project and the issue type and reads its fields; the approved POST answers 201.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i03_write_approve_flow() -> Result<()> {
     if !opted_in("i03_write_approve_flow") {
@@ -688,12 +707,7 @@ async fn i03_write_approve_flow() -> Result<()> {
     }
     let world = jira_world().await?;
     let mock = jira(&world)?;
-    mock.json(
-        "/rest/api/2/issue/createmeta/ABC/issuetypes",
-        200,
-        fixtures::JIRA_CREATEMETA_ISSUETYPES,
-    )
-    .await;
+    mount_create_stages(mock).await;
     mock.json("/rest/api/2/issue", 201, fixtures::JIRA_ISSUE_CREATED)
         .await;
     let r = run(
@@ -1197,12 +1211,7 @@ async fn i39_real_envelopes_match_matrix() -> Result<()> {
         fixtures::JIRA_ERROR_400,
     )
     .await;
-    mock.json(
-        "/rest/api/2/issue/createmeta/ABC/issuetypes",
-        200,
-        fixtures::JIRA_CREATEMETA_ISSUETYPES,
-    )
-    .await;
+    mount_create_stages(mock).await;
     mock.json("/rest/api/2/issue", 201, fixtures::JIRA_ISSUE_CREATED)
         .await;
     let comment = r#"{"key":"ABC-1","body":"Seen on staging.","body_format":"wiki"}"#;

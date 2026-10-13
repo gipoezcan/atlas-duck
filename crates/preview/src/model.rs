@@ -181,8 +181,8 @@ pub enum PreviewBody {
         count: Option<ItemCount>,
     },
     /// §6.3 create, comment, assign, link, labels, worklog, sprint move. `constructs` lists the
-    /// wiki constructs of the outgoing text (PD-47). `sentence` and `rows` are display-escaped
-    /// text; the `constructs` entries are raw wiki-derived text (see [`ConstructList`]).
+    /// wiki constructs of the outgoing text (PD-47). `sentence`, `rows` and (as core builds them,
+    /// PD-47) the `constructs` entries are display-escaped text (see [`ConstructList`]).
     WriteSummary {
         sentence: String,
         rows: Vec<(String, String)>,
@@ -239,8 +239,9 @@ pub struct CommentView {
 }
 
 /// The wiki constructs of an outgoing text, in document order per kind (PD-47). Entries (macro
-/// names, mention names, link targets, file names) are raw wiki-derived, agent-controlled text,
-/// NOT escaped: the UI must render them as text, never as HTML or a live link.
+/// names, mention names, link targets, file names) are wiki-derived, agent-controlled text that
+/// core display-escapes (PD-47) but does not otherwise neutralize: the UI must render them as
+/// text, never as HTML or a live link.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ConstructList {
     pub macros: Vec<String>,

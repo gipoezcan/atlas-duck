@@ -1,6 +1,6 @@
 //! `ScriptedApprover` (C.7 `core::testing`): a headless human over `DecisionApi`. Task 21 adds
 //! the read decisions (`open`, `release`, `release_redacted`, `release_status_only`, `deny`);
-//! Task 22 the write decisions (`approve`, `edit`, `deny_with`).
+//! Task 22 the write decisions (`approve`, `edit`, `deny_with`); M5 Task 12 `edit_preadded`.
 //!
 //! Every decision opens the item's current revision first (`PREVIEW_SHOWN`, §5.6), as the
 //! approvals UI does, unless the method says `unopened`. The methods block (`DecisionApi` is
@@ -9,7 +9,9 @@
 
 use std::sync::Arc;
 
+use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::CandidateRev;
+use serde_json::{Map, Value};
 
 use crate::decision::{
     Decision, DecisionApi, DecisionError, DecisionKind, DecisionOutcome, DenyDetails,
@@ -17,6 +19,7 @@ use crate::decision::{
 };
 use crate::edit::Edits;
 use crate::redact::{RedactionOp, RedactionPreset};
+use crate::validate::ValidationError;
 
 pub struct ScriptedApprover {
     decisions: Arc<dyn DecisionApi>,
@@ -165,5 +168,40 @@ impl ScriptedApprover {
             edits: Some(edits),
             ..decision(request_id, DecisionKind::ApproveEdited, rev)
         })
+    }
+
+    /// Fills the pre-added input `path` (`fields.<id>`, a missing required field, PD-49) of the
+    /// current revision's edit form with `value`, as the approvals UI does: opens the revision,
+    /// refuses a path its edit form did not pre-add, then edits like [`Self::edit`] (an
+    /// `enrich_keys` param: enrichment runs again).
+    pub fn edit_preadded(
+        &self,
+        request_id: &str,
+        path: &str,
+        value: Value,
+    ) -> Result<DecisionOutcome, DecisionError> {
+        let preview = self.open(request_id)?.preview;
+        let pre_added = preview
+            .edit_form
+            .as_ref()
+            .is_some_and(|f| f.inputs.iter().any(|i| i.pre_added && i.path == path));
+        if !pre_added {
+            let mut details = Map::new();
+            details.insert("param".into(), Value::from(path));
+            return Err(DecisionError::EditRejected(ValidationError {
+                code: ErrorCode::Validation,
+                message: "not a pre-added input of this revision".to_owned(),
+                details,
+            }));
+        }
+        let mut set = Map::new();
+        set.insert(path.to_owned(), value);
+        self.edit(
+            request_id,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )
     }
 }
