@@ -459,11 +459,14 @@ pub fn sanitize_html(html: &str) -> String;                           // ammonia
 pub fn iframe_document(body_html: &str, platform: Platform) -> String; // meta CSP first, preview.css link, sandbox="" is set by the UI
 pub mod diff {                                                        // [M5 Δ2] Jira edit diffs (§6.3)
     pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine>;          // larger than DIFF_MAX_LINES = 20_000 → one Del-all/Add-all hunk
-    pub struct DiffLine { pub op: DiffOp /* Same | Add | Del */, pub text: String }
+    pub struct DiffLine { pub op: DiffOp /* Same | Add | Del | Field */, pub text: String }
+    // [M5 T13] `Field` (serde "field"): the heading of one field's section in `EditDiff`
+    // (escaped label, one line, ≤ 256 chars); `line_diff` never emits it; `hunks` ends a run
+    // on it; M6 renders it as a heading, apart from text lines.
     pub const DIFF_MAX_LINES: usize = 20_000;
 }
 ```
-`WarningId` (snake_case, stable, [named-by-plan]; one per §6.2 text) — Caution: `restricted_comments`, `security_level`, `all_fields`, `bidi_controls`, `other_invisible`, `mixed_script`, `raw_only_diff`, `lossy_update`, `server_rendered_view`, `possible_duplicate`, `similar_request`, `conflict`, `missing_required_fields`, `changed_since_review`, `could_not_recheck`, `token_changed`, `token_identity_mismatch`, `identity_header_lost`, `user_renamed`, `instance_url_changed`; Info: `linked_issue_summaries`, `custom_fields`, `truncated_by_cap`, `host_calls_lossy`, `unknown_macros`, `unresolved_mention`, `cql_broad`, `source_formatting_removed`, `required_field_list_incomplete` ([M5 T12 review M10] "required-field list incomplete: <read> of <N> pages read", PD-49). The invisible-character classifier crate choice (V31) and its golden test (§13 S-13) are M3.
+`WarningId` (snake_case, stable, [named-by-plan]; one per §6.2 text) — Caution: `restricted_comments`, `security_level`, `all_fields`, `bidi_controls`, `other_invisible`, `mixed_script`, `raw_only_diff`, `lossy_update`, `server_rendered_view`, `possible_duplicate`, `similar_request`, `conflict`, `missing_required_fields`, `changed_since_review`, `could_not_recheck`, `token_changed`, `token_identity_mismatch`, `identity_header_lost`, `user_renamed`, `instance_url_changed`, `diff_truncated` ([M5 T13] "diff truncated: <n> bytes not shown (see Request)": an edit diff view was cut at its caps), `no_current_value` ([M5 T13 review M-1] "<n> fields shown as sent, without their current value": an edit section with no baseline, or an `update` list that sets the value, shown as Add lines only); Info: `linked_issue_summaries`, `custom_fields`, `truncated_by_cap`, `host_calls_lossy`, `unknown_macros`, `unresolved_mention`, `cql_broad`, `source_formatting_removed`, `required_field_list_incomplete` ([M5 T12 review M10] "required-field list incomplete: <read> of <N> pages read", PD-49). `diff_truncated`, `no_current_value` and `required_field_list_incomplete` are plan texts outside the §6.2 table: one §6.2 amendment batch. The invisible-character classifier crate choice (V31) and its golden test (§13 S-13) are M3.
 
 ### C.7 `core` (M3; `config` [M1])
 
