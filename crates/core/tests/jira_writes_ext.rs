@@ -2,6 +2,10 @@
 //! `jira.issue.assign` (Task 15, PD-52): the assignable-user resolution under the username
 //! comparison (§7.2), the unassign body, the assignee stale rule (§5.4 step 5), the from → to
 //! card and the unresolved or ambiguous assignee (I-35 assignable user).
+//!
+//! `jira.issuelink.create` (Task 16, PD-53): the link-type resolution, the link sentence in the
+//! direction Jira reads the body, the declared empty success (I-25), and the unresolved-name
+//! table over every Jira resolution kind (I-35).
 
 mod common;
 
@@ -16,11 +20,16 @@ use atlas_duck_core::ops::{
 };
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::Harness;
-use atlas_duck_core::{DecisionError, DecisionOutcome, DenyDetails, Edits, QueueItem};
-use atlas_duck_ipc::envelope::Status;
-use atlas_duck_preview::{Preview, PreviewBody, WarningId};
-use common::jira::{gets_on, issue_path, mount_assignable, mount_issue, query};
-use common::{TestError, TestResult, code, de, detail, request_id};
+use atlas_duck_core::{
+    BatchFailure, BatchItem, Confirm, DecisionError, DecisionOutcome, DenyDetails, Edits, QueueItem,
+};
+use atlas_duck_ipc::envelope::{Envelope, Status};
+use atlas_duck_preview::{ConstructList, Preview, PreviewBody, WarningId};
+use common::jira::{
+    PROJECTS_PATH, gets_on, issue_path, issuetypes_path, mount_assignable, mount_issue,
+    mount_link_types, query,
+};
+use common::{TestError, TestResult, code, de, detail, exit, request_id};
 use serde_json::{Map, Value, json};
 use wiremock::Mock;
 use wiremock::matchers::{method, path};
@@ -58,12 +67,20 @@ fn issue_with(assignee: &Value) -> Value {
 /// Runs the enrichment plan over `answers` the way the engine does: each round's answers are
 /// taken from `answers` in order; returns the answers the plan asked for and the judge's verdict.
 fn enrich(params: &Value, answers: &[Value]) -> Result<(usize, EnrichVerdict), TestError> {
+    enrich_as(ASSIGN, params, answers)
+}
+
+fn enrich_as(
+    op: &str,
+    params: &Value,
+    answers: &[Value],
+) -> Result<(usize, EnrichVerdict), TestError> {
     let rule = op_table()
-        .get(ASSIGN)
+        .get(op)
         .and_then(|i| i.enrich)
         .ok_or("no enrich rule")?;
     let ctx = EnrichCtx {
-        spec: spec()?,
+        spec: atlas_duck_registry::get(op).ok_or("no spec")?,
         params,
     };
     let mut got: Vec<Value> = Vec::new();
@@ -83,12 +100,18 @@ fn enrich(params: &Value, answers: &[Value]) -> Result<(usize, EnrichVerdict), T
 }
 
 fn exec(params: &Value, verdict: Option<&EnrichVerdict>) -> Result<ExecPlan, ExecError> {
+    exec_as(ASSIGN, params, verdict)
+}
+
+fn exec_as(
+    op: &str,
+    params: &Value,
+    verdict: Option<&EnrichVerdict>,
+) -> Result<ExecPlan, ExecError> {
     let base = atlas_duck_atlassian::normalize_base_url("https://jira.example.invalid")
         .map_err(|_| ExecError::EnrichmentRequired)?;
-    let imp = op_table()
-        .get(ASSIGN)
-        .ok_or(ExecError::EnrichmentRequired)?;
-    let spec = atlas_duck_registry::get(ASSIGN).ok_or(ExecError::EnrichmentRequired)?;
+    let imp = op_table().get(op).ok_or(ExecError::EnrichmentRequired)?;
+    let spec = atlas_duck_registry::get(op).ok_or(ExecError::EnrichmentRequired)?;
     let ctx = ExecCtx {
         spec,
         params,
@@ -119,13 +142,21 @@ fn wire(params: &Value, verdict: &EnrichVerdict) -> Result<Value, TestError> {
 }
 
 fn preview(params: &Value, verdict: &EnrichVerdict) -> Result<PreviewModel, TestError> {
-    let reqs = match exec(params, Some(verdict)) {
+    preview_as(ASSIGN, params, verdict)
+}
+
+fn preview_as(
+    op: &str,
+    params: &Value,
+    verdict: &EnrichVerdict,
+) -> Result<PreviewModel, TestError> {
+    let reqs = match exec_as(op, params, Some(verdict)) {
         Ok(ExecPlan::Write(r)) => r,
         other => return Err(format!("not a write: {other:?}").into()),
     };
-    let imp = op_table().get(ASSIGN).ok_or("no OpImpl")?;
+    let imp = op_table().get(op).ok_or("no OpImpl")?;
     let ctx = PreviewCtx {
-        spec: spec()?,
+        spec: atlas_duck_registry::get(op).ok_or("no spec")?,
         instance_alias: "jira-main",
         params,
         input: PreviewInput::Write(WriteView {
@@ -695,7 +726,11 @@ async fn purposes(h: &Harness, id: &str) -> Result<Vec<Value>, TestError> {
 }
 
 async fn queued(h: &Harness, params: Value) -> Result<String, TestError> {
-    let env = h.submit(ASSIGN, params).await;
+    queued_as(h, ASSIGN, params).await
+}
+
+async fn queued_as(h: &Harness, op: &str, params: Value) -> Result<String, TestError> {
+    let env = h.submit(op, params).await;
     assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
     let id = request_id(&env)?;
     h.queued(&id, 10_000).await.ok_or("never queued")?;
@@ -1106,5 +1141,957 @@ async fn assign_stale_when_assignee_changed() -> TestResult {
         rows.contains(&("From".into(), "bob (Bob)".into())),
         "{rows:?}"
     );
+    Ok(())
+}
+
+// ---- jira.issuelink.create (Task 16) --------------------------------------------------------
+
+const LINK: &str = "jira.issuelink.create";
+const LINK_POST: &str = "/rest/api/2/issueLink";
+const LINK_TYPES: &str = "/rest/api/2/issueLinkType";
+
+fn link_type(id: &str, name: &str, inward: &str, outward: &str) -> Value {
+    json!({
+        "id": id, "name": name, "inward": inward, "outward": outward,
+        "self": format!("https://jira.corp.example/rest/api/2/issueLinkType/{id}")
+    })
+}
+
+/// Jira's default link types.
+fn default_types() -> Vec<Value> {
+    vec![
+        link_type("10000", "Blocks", "is blocked by", "blocks"),
+        link_type("10001", "Cloners", "is cloned by", "clones"),
+        link_type("10002", "Duplicate", "is duplicated by", "duplicates"),
+        link_type("10003", "Relates", "relates to", "relates to"),
+    ]
+}
+
+/// The `GET /rest/api/2/issueLinkType` answer listing `types`.
+fn types_answer(types: Vec<Value>) -> Value {
+    json!({ "issueLinkTypes": types })
+}
+
+fn link_params(kind: &str) -> Value {
+    json!({"type": kind, "inward": "ABC-124", "outward": "ABC-123"})
+}
+
+/// The one POST a resolved link renders, as JSON.
+fn link_wire(params: &Value, verdict: &EnrichVerdict) -> Result<Value, TestError> {
+    match exec_as(LINK, params, Some(verdict)) {
+        Ok(ExecPlan::Write(reqs)) => {
+            assert_eq!(reqs.len(), 1);
+            let r = &reqs[0];
+            assert_eq!(r.method, "POST");
+            assert!(r.resolved_url.ends_with(LINK_POST), "{}", r.resolved_url);
+            assert_eq!(r.content_type.as_deref(), Some("application/json"));
+            Ok(serde_json::from_slice(&r.body)?)
+        }
+        other => Err(format!("not a write: {other:?}").into()),
+    }
+}
+
+struct LinkCard {
+    sentence: String,
+    rows: Vec<(String, String)>,
+    constructs: Option<ConstructList>,
+}
+
+fn link_card(m: &PreviewModel) -> Result<LinkCard, TestError> {
+    match &m.body {
+        PreviewBody::WriteSummary {
+            sentence,
+            rows,
+            constructs,
+            requests,
+        } => {
+            assert_eq!(requests.len(), 1, "the exact request list stays (inv. 4)");
+            Ok(LinkCard {
+                sentence: sentence.clone(),
+                rows: rows.clone(),
+                constructs: constructs.clone(),
+            })
+        }
+        other => Err(format!("not a write summary: {other:?}").into()),
+    }
+}
+
+fn link_row<'a>(c: &'a LinkCard, name: &str) -> Option<&'a str> {
+    c.rows
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// PD-53 + the Jira 9.12 REST reference ("Link issues": the link goes "from the first issue to
+/// the second issue using the outward description"; the first issue is `inwardIssue`): the
+/// `inward` param is the issue the outward phrase starts from. The params map onto the fields of
+/// the same names, and the phrase that named the type never changes the direction.
+#[test]
+fn issuelink_body_and_sentence() -> TestResult {
+    let types = types_answer(default_types());
+    let params = link_params("blocks");
+    let (used, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+    assert_eq!(used, 1, "one GET: the link types");
+    assert_eq!(v.hold, Hold::Preview, "{v:?}");
+    let want = json!({
+        "type": {"name": "Blocks"},
+        "inwardIssue": {"key": "ABC-124"},
+        "outwardIssue": {"key": "ABC-123"}
+    });
+    assert_eq!(link_wire(&params, &v)?, want);
+    let card = link_card(&preview_as(LINK, &params, &v)?)?;
+    assert_eq!(card.sentence, "ABC-124 blocks ABC-123 (Blocks)");
+    // What Jira shows on the other issue: the same link read from its other end.
+    assert_eq!(
+        link_row(&card, "Reads as"),
+        Some("ABC-123 is blocked by ABC-124")
+    );
+    assert_eq!(link_row(&card, "Link type"), Some("Blocks (10000)"));
+    assert_eq!(link_row(&card, "Sent as link type name"), Some("Blocks"));
+    assert_eq!(
+        link_row(&card, "Inward issue (inwardIssue)"),
+        Some("ABC-124")
+    );
+    assert_eq!(
+        link_row(&card, "Outward issue (outwardIssue)"),
+        Some("ABC-123")
+    );
+    assert_eq!(card.constructs, None, "no comment, no wiki text");
+
+    // The same type by its name (any case), its id and its inward phrase: the same request and
+    // the same sentence.
+    for named in [
+        "Blocks",
+        "BLOCKS",
+        "10000",
+        "is blocked by",
+        "Is Blocked By",
+    ] {
+        let params = link_params(named);
+        let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+        assert_eq!(v.hold, Hold::Preview, "{named}: {v:?}");
+        assert_eq!(link_wire(&params, &v)?, want, "{named}");
+        let card = link_card(&preview_as(LINK, &params, &v)?)?;
+        assert_eq!(card.sentence, "ABC-124 blocks ABC-123 (Blocks)", "{named}");
+    }
+
+    // A comment is sent verbatim as wiki markup (PD-42) and its constructs are listed (PD-47).
+    let wiki = "Linked: {code}x{code} for [~jdoe], see [docs|https://docs.example/x]";
+    let mut params = link_params("duplicates");
+    params["comment"] = json!(wiki);
+    let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+    assert_eq!(
+        link_wire(&params, &v)?,
+        json!({
+            "type": {"name": "Duplicate"},
+            "inwardIssue": {"key": "ABC-124"},
+            "outwardIssue": {"key": "ABC-123"},
+            "comment": {"body": wiki}
+        })
+    );
+    let card = link_card(&preview_as(LINK, &params, &v)?)?;
+    assert_eq!(card.sentence, "ABC-124 duplicates ABC-123 (Duplicate)");
+    assert_eq!(
+        link_row(&card, "Reads as"),
+        Some("ABC-123 is duplicated by ABC-124")
+    );
+    let comment = link_row(&card, "Comment").ok_or("no comment row")?;
+    assert!(comment.contains("Linked:"), "{comment}");
+    let constructs = card.constructs.ok_or("no construct list")?;
+    assert_eq!(constructs.mentions, ["jdoe"]);
+    assert!(
+        constructs.macros.iter().any(|m| m == "code"),
+        "{constructs:?}"
+    );
+    assert!(
+        constructs
+            .links
+            .iter()
+            .any(|l| l == "https://docs.example/x"),
+        "{constructs:?}"
+    );
+    Ok(())
+}
+
+/// I-35 link type (PD-53, tightened): a value matches a type by its id, its name, its outward or
+/// its inward phrase (case-insensitively, the id exactly); more than one type matched in any way
+/// is ambiguous, never a pick; no match lists the type names (≤ 10). The name the request sends
+/// must name exactly one type, and a blank value names none (no GET).
+#[test]
+fn i35_link_type_no_match_and_ambiguous() -> TestResult {
+    let one = |kind: &str, types: Vec<Value>| -> Result<(usize, EnrichVerdict), TestError> {
+        enrich_as(LINK, &link_params(kind), &[types_answer(types)])
+    };
+    let unresolved = |kind: &str, n: u64, candidates: &[&str]| {
+        Some((
+            "type".to_owned(),
+            kind.to_owned(),
+            n,
+            candidates
+                .iter()
+                .map(|c| (*c).to_owned())
+                .collect::<Vec<_>>(),
+        ))
+    };
+    // Two types whose names differ only in case: ambiguous on the name.
+    let twins = vec![
+        link_type("10003", "Relates", "relates to", "relates to"),
+        link_type("10004", "relates", "is related to", "relates"),
+        link_type("10000", "Blocks", "is blocked by", "blocks"),
+    ];
+    let (_, v) = one("Relates", twins.clone())?;
+    assert_eq!(v.hold, Hold::UnresolvedName, "{v:?}");
+    assert_eq!(
+        v.unresolved,
+        unresolved("Relates", 2, &["Relates", "relates"])
+    );
+    assert_eq!(
+        exec_as(LINK, &link_params("Relates"), Some(&v)),
+        Err(ExecError::EnrichmentRequired)
+    );
+    // A name of one type that is the outward phrase of another: ambiguous too.
+    let (_, v) = one("relates", twins.clone())?;
+    assert_eq!(
+        v.unresolved,
+        unresolved("relates", 2, &["Relates", "relates"])
+    );
+    let cross = vec![
+        link_type("10010", "Problem/Incident", "is caused by", "causes"),
+        link_type("10011", "Causes", "follows", "leads to"),
+    ];
+    let (_, v) = one("causes", cross)?;
+    assert_eq!(
+        v.unresolved,
+        unresolved("causes", 2, &["Problem/Incident", "Causes"])
+    );
+    // An inward phrase two types share.
+    let shared = vec![
+        link_type("10020", "Depends", "is needed by", "depends on"),
+        link_type("10021", "Requires", "is needed by", "requires"),
+    ];
+    let (_, v) = one("is needed by", shared)?;
+    assert_eq!(
+        v.unresolved,
+        unresolved("is needed by", 2, &["Depends", "Requires"])
+    );
+    // No match: every type name is a candidate.
+    let (used, v) = one("zzz", default_types())?;
+    assert_eq!(used, 1);
+    assert_eq!(
+        v.unresolved,
+        unresolved("zzz", 0, &["Blocks", "Cloners", "Duplicate", "Relates"])
+    );
+    // ... at most ten of them.
+    let many: Vec<Value> = (0..12)
+        .map(|n| link_type(&format!("{}", 11_000 + n), &format!("T{n}"), "in", "out"))
+        .collect();
+    let (_, v) = one("zzz", many)?;
+    let (_, _, n, candidates) = v.unresolved.clone().ok_or("not unresolved")?;
+    assert_eq!((n, candidates.len()), (0, 10));
+    assert_eq!(candidates[0], "T0");
+    // Resolved by id to a name another type also has (any case): the name the body sends would
+    // not say which one, so it is ambiguous.
+    let same_name = vec![
+        link_type("10030", "Follows", "is followed by", "follows"),
+        link_type("10031", "FOLLOWS", "comes after", "comes before"),
+    ];
+    let (_, v) = one("10030", same_name)?;
+    assert_eq!(
+        v.unresolved,
+        unresolved("10030", 2, &["Follows", "FOLLOWS"])
+    );
+    // A blank value names no type: unresolved without a GET.
+    for blank in ["  ", "\t"] {
+        let (used, v) = one(blank, default_types())?;
+        assert_eq!(used, 0, "{blank:?}: no GET");
+        assert_eq!(v.unresolved, unresolved(blank, 0, &[]), "{blank:?}");
+    }
+    // Answers it cannot use fail closed (enrichment error): not the documented object, a
+    // matched type without a name, an empty name, or a missing phrase.
+    for answer in [
+        json!([]),
+        json!({"issueLinkTypes": {}}),
+        json!({"issueLinkTypes": [{"id": "10000", "inward": "is blocked by", "outward": "blocks"}]}),
+        json!({"issueLinkTypes": [link_type("10000", "", "is blocked by", "blocks")]}),
+        json!({"issueLinkTypes": [{"id": "10000", "name": "Blocks", "outward": "blocks"}]}),
+        json!({"issueLinkTypes": [{"id": "10000", "name": "Blocks", "inward": "is blocked by"}]}),
+    ] {
+        let params = if answer.pointer("/issueLinkTypes/0/name").is_some() {
+            link_params("Blocks")
+        } else {
+            link_params("10000")
+        };
+        let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&answer))?;
+        assert_eq!(v.hold, Hold::EnrichmentError, "{answer}: {v:?}");
+        assert_eq!(
+            exec_as(LINK, &params, Some(&v)),
+            Err(ExecError::EnrichmentRequired),
+            "{answer}"
+        );
+    }
+    Ok(())
+}
+
+/// The executor's static checks run at validation (before the enrichment is there): a link of
+/// an issue to itself and a blank comment are refused; only a `Preview` verdict renders.
+#[test]
+fn issuelink_executor_static_checks() -> TestResult {
+    let invalid_param = |r: Result<ExecPlan, ExecError>| match r {
+        Err(ExecError::Invalid(e)) => e.details.get("param").cloned(),
+        _ => None,
+    };
+    let selflink = json!({"type": "Blocks", "inward": "ABC-1", "outward": "ABC-1"});
+    assert_eq!(
+        invalid_param(exec_as(LINK, &selflink, None)),
+        Some(json!("outward"))
+    );
+    for blank in ["  ", "\n\t"] {
+        let mut params = link_params("Blocks");
+        params["comment"] = json!(blank);
+        assert_eq!(
+            invalid_param(exec_as(LINK, &params, None)),
+            Some(json!("comment")),
+            "{blank:?}"
+        );
+    }
+    let params = link_params("Blocks");
+    assert_eq!(
+        exec_as(LINK, &params, None),
+        Err(ExecError::EnrichmentRequired)
+    );
+    let (_, v) = enrich_as(LINK, &params, &[types_answer(default_types())])?;
+    assert!(exec_as(LINK, &params, Some(&v)).is_ok());
+    for hold in [
+        Hold::EnrichmentError,
+        Hold::UnresolvedName,
+        Hold::Conflict,
+        Hold::IdentityMismatch,
+    ] {
+        let mut held = v.clone();
+        held.hold = hold;
+        assert_eq!(
+            exec_as(LINK, &params, Some(&held)),
+            Err(ExecError::EnrichmentRequired),
+            "{hold:?}"
+        );
+    }
+    let mut empty = v.clone();
+    empty.resolved.insert("type".into(), json!(""));
+    assert_eq!(
+        exec_as(LINK, &params, Some(&empty)),
+        Err(ExecError::EnrichmentRequired)
+    );
+    Ok(())
+}
+
+/// Server text on the link card never pushes a sent value out of view: phrases and the type name
+/// are cut short (escaped, the cut counted), the issue keys have rows of their own, and the
+/// invisible characters of the phrases count into the Cautions although the request has none.
+/// The sent type name gets the mixed-script check; facts about another name are not shown as
+/// this link's.
+#[test]
+fn issuelink_card_keeps_sent_values_in_view() -> TestResult {
+    let padded = format!("blocks{}", "\u{2060}".repeat(100));
+    let types = types_answer(vec![link_type("10000", "Blocks", "is blocked by", &padded)]);
+    let params = link_params("Blocks");
+    let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+    let m = preview_as(LINK, &params, &v)?;
+    let card = link_card(&m)?;
+    assert!(
+        card.sentence.starts_with("ABC-124 blocks⟨U+2060⟩"),
+        "{}",
+        card.sentence
+    );
+    assert!(
+        card.sentence.ends_with("… ABC-123 (Blocks)"),
+        "{}",
+        card.sentence
+    );
+    assert_eq!(
+        link_row(&card, "Inward issue (inwardIssue)"),
+        Some("ABC-124")
+    );
+    assert_eq!(
+        link_row(&card, "Outward issue (outwardIssue)"),
+        Some("ABC-123")
+    );
+    assert_eq!(m.header.other_invisible, 100);
+    assert!(m.header.hidden_in_preview_bytes > 0);
+    assert!(
+        m.warnings.iter().any(|w| w.id == WarningId::OtherInvisible),
+        "{:?}",
+        m.warnings
+    );
+
+    // A type name in two scripts (Cyrillic `В`) with a bidi override in its inward phrase.
+    let spoof = "\u{0412}locks";
+    let types = types_answer(vec![link_type(
+        "10000",
+        spoof,
+        "is\u{202e} blocked by",
+        "blocks",
+    )]);
+    let params = link_params("10000");
+    let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+    let m = preview_as(LINK, &params, &v)?;
+    let card = link_card(&m)?;
+    for (name, value) in &card.rows {
+        assert!(!value.contains('\u{202e}'), "{name}: {value}");
+    }
+    assert_eq!(
+        link_row(&card, "Reads as"),
+        Some("ABC-123 is⟨U+202E⟩ blocked by ABC-124")
+    );
+    assert!(m.header.bidi_controls >= 1);
+    assert!(
+        m.warnings.iter().any(|w| w.id == WarningId::BidiControls),
+        "{:?}",
+        m.warnings
+    );
+    assert!(
+        m.warnings
+            .iter()
+            .any(|w| w.id == WarningId::MixedScript && w.text.contains(spoof)),
+        "{:?}",
+        m.warnings
+    );
+
+    // Facts about another type than the one the request names: no phrase is shown for it.
+    let params = link_params("Blocks");
+    let (_, mut v) = enrich_as(LINK, &params, &[types_answer(default_types())])?;
+    v.resolved.insert("type".into(), json!("Relates"));
+    let card = link_card(&preview_as(LINK, &params, &v)?)?;
+    assert_eq!(
+        card.sentence,
+        "Link ABC-124 to ABC-123 with link type Relates (enrichment resolved Blocks)"
+    );
+    assert_eq!(link_row(&card, "Reads as"), None);
+    assert_eq!(link_row(&card, "Sent as link type name"), Some("Relates"));
+    Ok(())
+}
+
+// ---- jira.issuelink.create end to end --------------------------------------------------------
+
+async fn link_posts(mock: &MockDc) -> Vec<wiremock::Request> {
+    let full = mock.path(LINK_POST);
+    mock.received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == full)
+        .collect()
+}
+
+/// The `Attention` kinds the core raised for the UI so far.
+fn attention_kinds(h: &Harness) -> Vec<String> {
+    h.capture()
+        .on(atlas_duck_core::testing::Channel::UiEvent)
+        .iter()
+        .filter_map(|r| serde_json::from_str::<Value>(&r.json).ok())
+        .filter_map(|e| e.pointer("/Attention/kind")?.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Queues a link of ABC-124 → ABC-123 typed `Blocks` with a comment, opens it, approves it and
+/// returns its final envelope.
+async fn link_executed(h: &Harness) -> Result<(String, Envelope), TestError> {
+    let mock = jira(h)?;
+    mount_link_types(mock, &Value::Array(default_types())).await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let mut params = link_params("Blocks");
+    params["comment"] = json!("Linked by *atlas-duck*");
+    let id = queued_as(h, LINK, params).await?;
+    let p = opened(h, &id)?;
+    assert!(p.approvable);
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    Ok((id, env))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i25_issuelink_201_empty_html_succeeded_receipt_empty() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    // Jira 10: 201, no body, `Content-Type: text/html` (§7.2).
+    mock.empty(LINK_POST, 201, Some("text/html;charset=UTF-8"))
+        .await;
+    let (id, env) = link_executed(&h).await?;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::Succeeded, 0),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(env.data, Some(json!({ "receipt": {} })));
+    let sent = link_posts(mock).await;
+    assert_eq!(sent.len(), 1);
+    let body: Value = serde_json::from_slice(&sent[0].body)?;
+    assert_eq!(
+        body,
+        json!({
+            "type": {"name": "Blocks"},
+            "inwardIssue": {"key": "ABC-124"},
+            "outwardIssue": {"key": "ABC-123"},
+            "comment": {"body": "Linked by *atlas-duck*"}
+        })
+    );
+    // The link types (resolve), then the pre-write identity call; no stale rule (spec).
+    assert_eq!(purposes(&h, &id).await?, ["resolve", "stale_check"]);
+    let types = gets_on(mock, LINK_TYPES).await;
+    assert_eq!(types.len(), 1);
+    assert_eq!(
+        types[0].url.query(),
+        None,
+        "nothing of the params in the URL"
+    );
+    let kinds = attention_kinds(&h);
+    assert!(
+        !kinds.iter().any(|k| k == "Failed" || k == "OutcomeUnknown"),
+        "{kinds:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i25_issuelink_201_html_body_outcome_unknown() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.html(LINK_POST, 201).await;
+    let (id, env) = link_executed(&h).await?;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::OutcomeUnknown, 6),
+        "{}",
+        env.to_json_line()
+    );
+    assert!(!env.to_json_line().contains("Please log in"));
+    assert_eq!(link_posts(mock).await.len(), 1);
+    assert_eq!(
+        records(&h, &id, EventType::WRITE_OUTCOME_UNKNOWN)
+            .await?
+            .len(),
+        1
+    );
+    assert!(
+        records(&h, &id, EventType::WRITE_EXECUTED)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// §7.2: an op that declares a JSON success answered by an empty 2xx is `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i25_comment_add_empty_200_outcome_unknown() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.empty(
+        "/rest/api/2/issue/ABC-1/comment",
+        200,
+        Some("application/json;charset=UTF-8"),
+    )
+    .await;
+    let id = queued_as(
+        &h,
+        "jira.comment.add",
+        json!({"key": KEY, "body": "Reproduced.", "body_format": "wiki"}),
+    )
+    .await?;
+    opened(&h, &id)?;
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::OutcomeUnknown, 6),
+        "{}",
+        env.to_json_line()
+    );
+    assert!(
+        records(&h, &id, EventType::WRITE_EXECUTED)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+/// L06: the issue keys are read-only targets; the type and the comment can be edited, and an
+/// edited type is resolved again (§5.4 step 4). A self-link is refused at validation (exit 2,
+/// nothing fetched, nothing queued).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn issuelink_edit_form_and_type_edit() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mount_link_types(mock, &Value::Array(default_types())).await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.empty(LINK_POST, 201, None).await;
+    let id = queued_as(&h, LINK, link_params("zzz")).await?;
+    let p = opened(&h, &id)?;
+    assert!(!p.approvable);
+    let form = p.edit_form.as_ref().ok_or("no edit form")?;
+    let input = |name: &str| form.inputs.iter().find(|i| i.path == name);
+    assert!(input("inward").is_some_and(|i| i.read_only));
+    assert!(input("outward").is_some_and(|i| i.read_only));
+    assert!(input("type").is_some_and(|i| !i.read_only));
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let mut set = Map::new();
+    set.insert("type".into(), json!("relates to"));
+    h.approver()
+        .edit(
+            &id,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )
+        .map_err(de)?;
+    let item = item_after(&h, &id, rev.counter).await?;
+    assert!(item.approvable);
+    assert_eq!(purposes(&h, &id).await?, ["resolve", "resolve"]);
+    let (sentence, _) = card_rows(&opened(&h, &id)?)?;
+    assert_eq!(sentence, "ABC-124 relates to ABC-123 (Relates)");
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let sent = link_posts(mock).await;
+    let body: Value = serde_json::from_slice(&sent.first().ok_or("no POST")?.body)?;
+    assert_eq!(body["type"], json!({"name": "Relates"}));
+
+    // Linking an issue to itself: rejected at validation.
+    let env = h
+        .submit(
+            LINK,
+            json!({"type": "Blocks", "inward": "ABC-7", "outward": "ABC-7"}),
+        )
+        .await;
+    assert_eq!(
+        (env.status, exit(&env), code(&env)),
+        (Status::Failed, 2, "validation".to_owned()),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(detail(&env, "param"), "outward");
+    assert_eq!(gets_on(mock, LINK_TYPES).await.len(), 2, "no further GET");
+    Ok(())
+}
+
+// ---- I-35: every Jira resolution kind --------------------------------------------------------
+
+/// One resolution kind of the I-35 table: the op, its mounts, a no-match and an ambiguous
+/// request, and what each is expected to say.
+struct Kind {
+    op: &'static str,
+    param: &'static str,
+    cases: [Case; 2],
+}
+
+struct Case {
+    params: Value,
+    value: &'static str,
+    matches: u64,
+    candidates: &'static [&'static str],
+    message: &'static str,
+}
+
+fn kinds() -> Vec<Kind> {
+    let create = |project: &str, issuetype: &str, summary: &str| json!({"project": project, "issuetype": issuetype, "summary": summary});
+    vec![
+        Kind {
+            op: "jira.issue.create",
+            param: "project",
+            cases: [
+                Case {
+                    params: create("Nope", "Bug", "S1"),
+                    value: "Nope",
+                    matches: 0,
+                    candidates: &["Alpha", "alpha", "Operations"],
+                    message: "no project named 'Nope'",
+                },
+                Case {
+                    params: create("ALPHA", "Bug", "S2"),
+                    value: "ALPHA",
+                    matches: 2,
+                    candidates: &["Alpha", "alpha"],
+                    message: "no project named 'ALPHA'",
+                },
+            ],
+        },
+        Kind {
+            op: "jira.issue.create",
+            param: "issuetype",
+            cases: [
+                Case {
+                    params: create("ABC", "Bugg", "S3"),
+                    value: "Bugg",
+                    matches: 0,
+                    candidates: &["Story", "Bug", "BUG"],
+                    message: "no issue type named 'Bugg' in ABC",
+                },
+                Case {
+                    params: create("ABC", "bug", "S4"),
+                    value: "bug",
+                    matches: 2,
+                    candidates: &["Bug", "BUG"],
+                    message: "no issue type named 'bug' in ABC",
+                },
+            ],
+        },
+        Kind {
+            op: "jira.issue.transition",
+            param: "transition",
+            cases: [
+                Case {
+                    params: json!({"key": "ABC-1", "transition": "Doen"}),
+                    value: "Doen",
+                    matches: 0,
+                    candidates: &["Start Progress", "Done", "done"],
+                    message: "no transition named 'Doen' for ABC-1",
+                },
+                Case {
+                    params: json!({"key": "ABC-2", "transition": "DONE"}),
+                    value: "DONE",
+                    matches: 2,
+                    candidates: &["Done", "done"],
+                    message: "no transition named 'DONE' for ABC-2",
+                },
+            ],
+        },
+        Kind {
+            op: ASSIGN,
+            param: "assignee",
+            cases: [
+                Case {
+                    params: json!({"key": "ABC-1", "assignee": "nobody"}),
+                    value: "nobody",
+                    matches: 0,
+                    candidates: &["jdoe1", "jdoe2"],
+                    message: "no assignable user 'nobody' for ABC-1",
+                },
+                Case {
+                    params: json!({"key": "ABC-2", "assignee": "Jane Doe"}),
+                    value: "Jane Doe",
+                    matches: 2,
+                    candidates: &["jdoe1", "jdoe2"],
+                    message: "no assignable user 'Jane Doe' for ABC-2",
+                },
+            ],
+        },
+        Kind {
+            op: LINK,
+            param: "type",
+            cases: [
+                Case {
+                    params: json!({"type": "zzz", "inward": "ABC-1", "outward": "ABC-2"}),
+                    value: "zzz",
+                    matches: 0,
+                    candidates: &["Relates", "relates", "Blocks"],
+                    message: "no issue link type named 'zzz'",
+                },
+                Case {
+                    params: json!({"type": "Relates", "inward": "ABC-3", "outward": "ABC-4"}),
+                    value: "Relates",
+                    matches: 2,
+                    candidates: &["Relates", "relates"],
+                    message: "no issue link type named 'Relates'",
+                },
+            ],
+        },
+    ]
+}
+
+/// The answers every kind's resolution GETs get: two names that differ only in case each.
+async fn mount_kind(mock: &MockDc, param: &str) -> TestResult {
+    match param {
+        "project" => {
+            let projects = json!([
+                {"id": "1", "key": "ALA", "name": "Alpha"},
+                {"id": "2", "key": "ALB", "name": "alpha"},
+                {"id": "3", "key": "OPS", "name": "Operations"}
+            ]);
+            mock.json(PROJECTS_PATH, 200, &projects.to_string()).await;
+        }
+        "issuetype" => {
+            let projects = json!([{"id": "10000", "key": "ABC", "name": "Alpha Beta"}]);
+            mock.json(PROJECTS_PATH, 200, &projects.to_string()).await;
+            let types = json!({"isLast": true, "values": [
+                {"id": "1", "name": "Story"}, {"id": "2", "name": "Bug"}, {"id": "3", "name": "BUG"}
+            ]});
+            mock.json(&issuetypes_path("ABC"), 200, &types.to_string())
+                .await;
+        }
+        "transition" => {
+            let transitions = json!({"transitions": [
+                {"id": "21", "name": "Start Progress", "to": {"id": "3", "name": "In Progress"}},
+                {"id": "31", "name": "Done", "to": {"id": "10001", "name": "Done"}},
+                {"id": "41", "name": "done", "to": {"id": "10002", "name": "Closed"}}
+            ]});
+            for key in ["ABC-1", "ABC-2"] {
+                mock.json(
+                    &format!("/rest/api/2/issue/{key}/transitions"),
+                    200,
+                    &transitions.to_string(),
+                )
+                .await;
+                let issue = json!({"key": key, "fields": {"status": {"id": "1", "name": "Open"}}});
+                mount_issue(mock, key, &issue).await;
+            }
+        }
+        "assignee" => {
+            mount_assignable(
+                mock,
+                &json!([
+                    user("jdoe1", "JIRAUSER11", "Jane Doe"),
+                    user("jdoe2", "JIRAUSER12", "Jane Doe")
+                ]),
+            )
+            .await;
+        }
+        "type" => {
+            mount_link_types(
+                mock,
+                &json!([
+                    link_type("10003", "Relates", "relates to", "relates to"),
+                    link_type("10004", "relates", "is related to", "relates"),
+                    link_type("10000", "Blocks", "is blocked by", "blocks")
+                ]),
+            )
+            .await;
+        }
+        other => return Err(format!("no mounts for {other}").into()),
+    }
+    Ok(())
+}
+
+/// I-35 (§13, Review Focus 2): per resolution kind (project, issue type, transition, assignable
+/// user, link type) a no-match and an ambiguous request each leave Approve disabled in Rust:
+/// alone, and in a batch with a clean opened `jira.comment.add`, which is rejected whole with
+/// nothing decided; deny with the candidates ticked delivers `resolution_failed`, exit 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i35_jira_kinds_no_match_and_ambiguous_not_approvable() -> TestResult {
+    for kind in kinds() {
+        let h = Harness::builder()
+            .jira("jira-main")
+            .confirm(vec![Confirm::Ok, Confirm::Ok])
+            .start()
+            .await?;
+        let mock = jira(&h)?;
+        mount_kind(mock, kind.param).await?;
+        let clean = queued_as(
+            &h,
+            "jira.comment.add",
+            json!({"key": "XYZ-9", "body": "clean", "body_format": "wiki"}),
+        )
+        .await?;
+        opened(&h, &clean)?;
+        assert!(h.approver().item(&clean).ok_or("gone")?.approvable);
+        for case in &kind.cases {
+            let what = format!("{} {}", kind.param, case.value);
+            let id = queued_as(&h, kind.op, case.params.clone()).await?;
+            match opened(&h, &id)?.body {
+                PreviewBody::UnresolvedName {
+                    param,
+                    value,
+                    matches,
+                    candidates,
+                } => {
+                    assert_eq!(
+                        (param.as_str(), value.as_str(), matches),
+                        (kind.param, case.value, case.matches),
+                        "{what}"
+                    );
+                    assert_eq!(candidates, case.candidates, "{what}");
+                }
+                other => return Err(format!("{what}: not the unresolved card: {other:?}").into()),
+            }
+            not_approvable(h.approver().approve(&id))?;
+            let batch = [&clean, &id]
+                .iter()
+                .map(|r| {
+                    Ok(BatchItem {
+                        request_id: (*r).clone(),
+                        candidate_rev: h.approver().rev(r).map_err(de)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, TestError>>()?;
+            match h.decisions().decide_batch(batch) {
+                Err(DecisionError::BatchRejected { failed }) => assert_eq!(
+                    failed,
+                    [(
+                        id.clone(),
+                        BatchFailure::Invalid(InvalidReason::NotApprovable)
+                    )],
+                    "{what}"
+                ),
+                other => return Err(format!("{what}: not rejected: {other:?}").into()),
+            }
+            for r in [&clean, &id] {
+                assert!(
+                    records(&h, r, EventType::WRITE_APPROVED).await?.is_empty(),
+                    "{what}"
+                );
+            }
+            assert!(
+                h.approver().item(&clean).ok_or("gone")?.approvable,
+                "{what}"
+            );
+            h.approver()
+                .deny_with(
+                    &id,
+                    "cannot tell",
+                    DenyDetails::ResolutionFailed {
+                        include_candidates: true,
+                    },
+                )
+                .map_err(de)?;
+            let env = h.await_(&id, 5000).await;
+            assert_eq!(
+                (env.status, exit(&env), code(&env)),
+                (Status::Denied, 3, "resolution_failed".to_owned()),
+                "{what}"
+            );
+            assert_eq!(detail(&env, "param"), kind.param, "{what}");
+            assert_eq!(detail(&env, "value"), case.value, "{what}");
+            assert_eq!(detail(&env, "message"), case.message, "{what}");
+            assert_eq!(detail(&env, "candidates"), json!(case.candidates), "{what}");
+        }
+        // Nothing was written by any of them.
+        let writes = mock
+            .received()
+            .await
+            .into_iter()
+            .filter(|r| r.method.as_str() != "GET")
+            .count();
+        assert_eq!(writes, 0, "{}", kind.param);
+    }
+    Ok(())
+}
+
+/// I-35 link type end to end: deny without the candidates ticked carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i35_link_type_deny_without_candidates() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mount_link_types(mock, &Value::Array(default_types())).await;
+    let id = queued_as(&h, LINK, link_params("zzz")).await?;
+    opened(&h, &id)?;
+    not_approvable(h.approver().approve_unopened(&id))?;
+    h.approver()
+        .deny_with(
+            &id,
+            "no such type",
+            DenyDetails::ResolutionFailed {
+                include_candidates: false,
+            },
+        )
+        .map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!((env.status, exit(&env)), (Status::Denied, 3));
+    assert_eq!(code(&env), "resolution_failed");
+    assert_eq!(detail(&env, "message"), "no issue link type named 'zzz'");
+    assert_eq!(detail(&env, "candidates"), Value::Null);
+    assert!(link_posts(mock).await.is_empty());
     Ok(())
 }

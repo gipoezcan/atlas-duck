@@ -1199,15 +1199,16 @@ pub fn transition_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model
 }
 
-/// A display name on the assign card shows at most this many chars after display escaping (T15
-/// review I1): one the user chose, padded with invisible characters (each an 8-char
-/// `⟨U+XXXX⟩`), never pushes the username out of its line.
-const DISPLAY_NAME_CAP_CHARS: usize = 64;
+/// Server text a write card shows next to a sent value (a display name on the assign card, a
+/// link type's name and phrases on the link card) shows at most this many chars after display
+/// escaping (T15 review I1): one padded with invisible characters (each an 8-char `⟨U+XXXX⟩`)
+/// never pushes a sent value out of its line.
+const SERVER_TEXT_CAP_CHARS: usize = 64;
 
-/// `raw` (a display name) cut where its display-escaped one-line form would pass
-/// [`DISPLAY_NAME_CAP_CHARS`] chars, never inside an escape, with `…` where it was cut; the bytes
+/// `raw` (server text) cut where its display-escaped one-line form would pass
+/// [`SERVER_TEXT_CAP_CHARS`] chars, never inside an escape, with `…` where it was cut; the bytes
 /// of `raw` cut go to `hidden`. Raw text: [`line`] escapes it with the rest of its line.
-fn short_display_name(raw: &str, hidden: &mut u64) -> String {
+fn short_server_text(raw: &str, hidden: &mut u64) -> String {
     let escaped = one_line(escape_for_display(raw));
     let mut rest = escaped.as_str();
     let mut width = 0usize;
@@ -1220,7 +1221,7 @@ fn short_display_name(raw: &str, hidden: &mut u64) -> String {
         };
         let (shown, tail) = rest.split_at_checked(len).unwrap_or((rest, ""));
         width += shown.chars().count();
-        if width > DISPLAY_NAME_CAP_CHARS {
+        if width > SERVER_TEXT_CAP_CHARS {
             let cut = u64::try_from(raw.len().saturating_sub(at)).unwrap_or(u64::MAX);
             *hidden = hidden.saturating_add(cut);
             return format!("{}…", raw.get(..at).unwrap_or_default());
@@ -1231,13 +1232,13 @@ fn short_display_name(raw: &str, hidden: &mut u64) -> String {
 }
 
 /// The assign card's text for a user: `<name> (<display name>)`, the username first (T15 review
-/// I1) and the display name cut ([`short_display_name`]), else whichever is there (raw; [`line`]
+/// I1) and the display name cut ([`short_server_text`]), else whichever is there (raw; [`line`]
 /// escapes it).
 fn user_text(user: &JiraUser, hidden: &mut u64) -> String {
     let display = user
         .display_name
         .as_deref()
-        .map(|d| short_display_name(d, hidden));
+        .map(|d| short_server_text(d, hidden));
     match (user.name.as_deref(), display) {
         (Some(name), Some(display)) => format!("{name} ({display})"),
         (Some(name), None) => name.to_owned(),
@@ -1273,6 +1274,25 @@ fn count_card_text<'a>(model: &mut PreviewModel, texts: impl IntoIterator<Item =
             None if n > 0 => model.warnings.push(Warning::new(id, text)),
             None => {}
         }
+    }
+}
+
+/// The mixed-script Caution (§6.4) for an identifier a write card sends that the agent may not
+/// have named (a resolved username, a resolved link type name), unless the params' own check
+/// raised the same one.
+fn mixed_script_caution(model: &mut PreviewModel, sent: &str) {
+    if !is_mixed_script(sent) {
+        return;
+    }
+    let text = warning::mixed_script(&escape_for_display(sent));
+    if !model
+        .warnings
+        .iter()
+        .any(|w| w.id == WarningId::MixedScript && w.text == text)
+    {
+        model
+            .warnings
+            .push(Warning::new(WarningId::MixedScript, text));
     }
 }
 
@@ -1353,19 +1373,8 @@ pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
             rows.push((label.to_owned(), line(k, cap, &mut hidden)));
         }
     }
-    if let Some(name) = sent
-        && is_mixed_script(name)
-    {
-        let text = warning::mixed_script(&escape_for_display(name));
-        if !model
-            .warnings
-            .iter()
-            .any(|w| w.id == WarningId::MixedScript && w.text == text)
-        {
-            model
-                .warnings
-                .push(Warning::new(WarningId::MixedScript, text));
-        }
+    if let Some(name) = sent {
+        mixed_script_caution(&mut model, name);
     }
     // The server text the card shows beyond the request (which has the sent name).
     let shown = from
@@ -1380,6 +1389,137 @@ pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         sentence: line(&sentence, cap, &mut hidden),
         rows,
         constructs: None,
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden;
+    model
+}
+
+/// How Jira reads a link request (PD-53, T16), as `(this link, the same link from the other
+/// issue)`. The Jira 9.12 REST reference ("Link issues", `POST /rest/api/2/issueLink`): the link
+/// goes "from the first issue to the second issue using the outward description", and "from the
+/// second issue to the first issue using the inward description"; the first issue is
+/// `inwardIssue` (the order of its example and schema). The issue-link model of a read agrees: an
+/// issue whose link names an `inwardIssue` labels it with the inward phrase, so the issue in the
+/// inward slot is where the outward phrase starts. `"ABC-124 blocks ABC-123"` for
+/// `inwardIssue: ABC-124, outwardIssue: ABC-123` of `Blocks`. (T24 live probe: confirm.)
+fn link_sentences(
+    inward_issue: &str,
+    outward_issue: &str,
+    inward_phrase: &str,
+    outward_phrase: &str,
+) -> (String, String) {
+    (
+        format!("{inward_issue} {outward_phrase} {outward_issue}"),
+        format!("{outward_issue} {inward_phrase} {inward_issue}"),
+    )
+}
+
+/// §6.3 link: the `jira.issuelink.create` card over the exact request (§5.1 inv. 4). Read from the
+/// request that is sent (T12 review M4): the sentence in the direction Jira reads it
+/// ([`link_sentences`]) with the type's name, the link read from the other issue, the type's name
+/// and id, the sent type name alone, each issue key in a row of its own, and the comment as the
+/// text of its wiki markup with its constructs (PD-42, PD-47: sent verbatim). The type's name and
+/// phrases are server text: each cut short ([`short_server_text`]), so they never push an issue
+/// key out of the sentence, and their invisible characters count into the §6.4 Cautions; the sent
+/// type name gets the mixed-script check (an identifier the agent may not have named). Facts
+/// about another type than the one sent show no phrase. Every other hold, or a request that is
+/// not the link JSON, keeps the generic write preview.
+pub fn issuelink_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let facts = view
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref());
+    let (Some(facts), Some(request), PreviewBody::WriteRequests { .. }) =
+        (facts, view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(body) = serde_json::from_slice::<Value>(&request.body).ok() else {
+        return model;
+    };
+    let text = |k: &str, sub: &str| body.get(k).and_then(|v| v.get(sub)).and_then(Value::as_str);
+    let (Some(sent_type), Some(inward), Some(outward)) = (
+        text("type", "name"),
+        text("inwardIssue", "key"),
+        text("outwardIssue", "key"),
+    ) else {
+        return model;
+    };
+    let comment = text("comment", "body");
+    let mut hidden = 0u64;
+    let cap = CELL_CAP_CHARS * 2;
+    let link = facts.link_type.as_ref().filter(|t| t.name == sent_type);
+    let other = facts
+        .link_type
+        .as_ref()
+        .map(|t| t.name.as_str())
+        .filter(|_| link.is_none());
+    let mut rows = Vec::new();
+    let mut reads_back = None;
+    let sentence = match link {
+        Some(t) => {
+            let name = short_server_text(&t.name, &mut hidden);
+            let inward_phrase = short_server_text(&t.inward, &mut hidden);
+            let outward_phrase = short_server_text(&t.outward, &mut hidden);
+            let (reads, back) = link_sentences(inward, outward, &inward_phrase, &outward_phrase);
+            rows.push((
+                "Link type".to_owned(),
+                line(&format!("{name} ({})", t.id), cap, &mut hidden),
+            ));
+            reads_back = Some(back);
+            format!("{reads} ({name})")
+        }
+        None => {
+            let sent = short_server_text(sent_type, &mut hidden);
+            match other {
+                Some(other) => {
+                    let other = short_server_text(other, &mut hidden);
+                    format!(
+                        "Link {inward} to {outward} with link type {sent} (enrichment resolved {other})"
+                    )
+                }
+                None => format!("Link {inward} to {outward} with link type {sent}"),
+            }
+        }
+    };
+    rows.push((
+        "Sent as link type name".to_owned(),
+        line(sent_type, cap, &mut hidden),
+    ));
+    rows.push((
+        "Inward issue (inwardIssue)".to_owned(),
+        line(inward, cap, &mut hidden),
+    ));
+    rows.push((
+        "Outward issue (outwardIssue)".to_owned(),
+        line(outward, cap, &mut hidden),
+    ));
+    if let Some(back) = reads_back {
+        rows.push(("Reads as".to_owned(), line(&back, cap, &mut hidden)));
+    }
+    if let Some(wiki) = comment {
+        rows.push((
+            "Comment".to_owned(),
+            rendered_text(wiki, COMMENT_CAP, &mut hidden),
+        ));
+    }
+    mixed_script_caution(&mut model, sent_type);
+    // The server text the card shows beyond the request (which has the sent name).
+    let shown = link
+        .into_iter()
+        .flat_map(|t| [t.id.as_str(), t.inward.as_str(), t.outward.as_str()])
+        .chain(other);
+    count_card_text(&mut model, shown);
+    let requests = take_requests(&mut model);
+    model.body = PreviewBody::WriteSummary {
+        sentence: line(&sentence, cap, &mut hidden),
+        rows,
+        constructs: comment.map(construct_list),
         requests,
     };
     model.header.hidden_in_preview_bytes = hidden;

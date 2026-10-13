@@ -335,8 +335,8 @@ pub struct WriteSummaryFacts {
     /// user the assignee param resolved to (`None`: an unassign).
     pub assignee_from: Option<JiraUser>,
     pub assignee_to: Option<JiraUser>,
-    /// `jira.issuelink.create` (T16): the link type's phrase for the sentence.
-    pub link_phrase: Option<String>,
+    /// `jira.issuelink.create` (T16, PD-53): the link type the `type` param resolved to.
+    pub link_type: Option<JiraLinkType>,
     /// `jira.sprint.move_issues` (T18): the sprint's `(name, state)`.
     pub sprint: Option<(String, String)>,
 }
@@ -355,6 +355,25 @@ pub struct JiraUser {
 impl fmt::Debug for JiraUser {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("JiraUser").finish_non_exhaustive()
+    }
+}
+
+/// T16: an issue link type as enrichment read it (raw server text). The request names it by
+/// `name` (PD-53); the link card reads `outward` from the `inwardIssue` and `inward` back.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct JiraLinkType {
+    pub id: String,
+    /// Never cut: the card compares it with the name the request sends.
+    pub name: String,
+    /// The phrases, cut to the name cap (display only).
+    pub inward: String,
+    pub outward: String,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for JiraLinkType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JiraLinkType").finish_non_exhaustive()
     }
 }
 
@@ -701,7 +720,18 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         },
     ),
     ("jira.worklog.add", LATER_WRITE),
-    ("jira.issuelink.create", LATER_WRITE),
+    (
+        "jira.issuelink.create",
+        OpImpl {
+            executor: jira_ext::issuelink_create_executor,
+            previewer: jira_preview::issuelink_preview,
+            // §5.4 step 5: "none" (additive op).
+            stale_check: None,
+            enrich: Some(&jira_ext::ISSUELINK_CREATE_ENRICH),
+            // §5.4 step 4: an edited type is resolved again; the comment is sent verbatim.
+            enrich_keys: &["type"],
+        },
+    ),
     ("jira.sprint.move_issues", LATER_WRITE),
     ("jira.backlog.move_issues", LATER_WRITE),
     ("confluence.user.current", READ),

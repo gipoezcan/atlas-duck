@@ -1,6 +1,6 @@
 //! The Jira writes M5 completes beyond the M3 four (PD-09): `jira.issue.assign` (T15, PD-52), with
 //! the assignable-user resolution under the §7.2 username comparison and the current assignee as
-//! the stale-check baseline.
+//! the stale-check baseline; `jira.issuelink.create` (T16, PD-53), with the link-type resolution.
 
 use atlas_duck_atlassian::{GetCall, UsernameMatcher};
 use serde_json::{Map, Value, json};
@@ -8,7 +8,8 @@ use serde_json::{Map, Value, json};
 use super::jira::{ISSUE_PATH, MAX_CANDIDATES, capped, unresolved};
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    JiraUser, WriteSummaryFacts, get_call, json_request, resolve_url,
+    JiraLinkType, JiraUser, WriteSummaryFacts, get_call, json_request, resolve_url, single_round,
+    str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
@@ -227,4 +228,169 @@ pub fn issue_assign_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
         _ => return Err(ExecError::EnrichmentRequired),
     };
     json_request(ctx, &json!({ "name": name }))
+}
+
+// ---- jira.issuelink.create ---------------------------------------------------------------------
+
+const LINK_TYPES_PATH: &str = "/rest/api/2/issueLinkType";
+
+/// PD-53: one GET, the link types (`resolve`); a `type` that names none ends the plan without it.
+pub static ISSUELINK_CREATE_ENRICH: EnrichRule = EnrichRule {
+    plan: link_plan,
+    judge: link_judge,
+};
+
+/// A `type` that names no link type: blank (the schema's `minLength` lets whitespace through).
+fn names_no_type(wanted: &str) -> bool {
+    wanted.trim().is_empty()
+}
+
+/// `GET /rest/api/2/issueLinkType`: a fixed path, nothing of the params in the URL.
+fn link_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    if names_no_type(str_param(ctx.params, "type")) {
+        return EnrichStep::Judge;
+    }
+    let call = get_call(LINK_TYPES_PATH, ctx.params, &[]);
+    single_round(vec![(EnrichPurpose::Resolve, call)], answers)
+}
+
+/// PD-53, tightened (T16): a type matches the value by its `id` (exactly) or its `name`,
+/// `outward` or `inward` phrase (case-insensitively, as [`super::jira::resolve`]). Exactly one
+/// type matched in any of these ways resolves; several types are ambiguous even when each matched
+/// by another rule (a name of one that is a phrase of another), and their names are the
+/// candidates; no match lists the first [`MAX_CANDIDATES`] type names. The request names the type
+/// by `name`, so a resolved name another type shares (any case) is ambiguous too. A blank value
+/// names no type (no answer needed); an answer that is not the documented object, or a resolved
+/// type without an id, a name or both phrases, fails closed. One pass over the answer per check.
+fn resolve_link_type(
+    wanted: &str,
+    answer: Option<&Value>,
+) -> Result<JiraLinkType, Box<EnrichVerdict>> {
+    if names_no_type(wanted) {
+        return Err(Box::new(unresolved("type", wanted, 0, Vec::new())));
+    }
+    let Some(types) = answer
+        .and_then(|a| a.get("issueLinkTypes"))
+        .and_then(Value::as_array)
+    else {
+        return Err(Box::new(EnrichVerdict::unusable()));
+    };
+    fn text<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
+        v.get(k).and_then(Value::as_str)
+    }
+    fn names<'a>(items: impl IntoIterator<Item = &'a Value>) -> Vec<String> {
+        items
+            .into_iter()
+            .filter_map(|v| text(v, "name"))
+            .take(MAX_CANDIDATES)
+            .map(capped)
+            .collect()
+    }
+    fn count(items: &[&Value]) -> u64 {
+        u64::try_from(items.len()).unwrap_or(u64::MAX)
+    }
+    let folded = wanted.to_lowercase();
+    let same = |s: Option<&str>| s.is_some_and(|s| s.to_lowercase() == folded);
+    let hits: Vec<&Value> = types
+        .iter()
+        .filter(|t| {
+            text(t, "id") == Some(wanted)
+                || same(text(t, "name"))
+                || same(text(t, "outward"))
+                || same(text(t, "inward"))
+        })
+        .collect();
+    let one = match hits.as_slice() {
+        [] => return Err(Box::new(unresolved("type", wanted, 0, names(types)))),
+        [one] => *one,
+        _ => {
+            let n = count(&hits);
+            return Err(Box::new(unresolved("type", wanted, n, names(hits))));
+        }
+    };
+    let filled = |k: &str| text(one, k).filter(|s| !s.trim().is_empty());
+    let (Some(id), Some(name), Some(inward), Some(outward)) = (
+        filled("id"),
+        filled("name"),
+        filled("inward"),
+        filled("outward"),
+    ) else {
+        return Err(Box::new(EnrichVerdict::unusable()));
+    };
+    let folded_name = name.to_lowercase();
+    let namesakes: Vec<&Value> = types
+        .iter()
+        .filter(|t| text(t, "name").is_some_and(|n| n.to_lowercase() == folded_name))
+        .collect();
+    if namesakes.len() > 1 {
+        let n = count(&namesakes);
+        return Err(Box::new(unresolved("type", wanted, n, names(namesakes))));
+    }
+    Ok(JiraLinkType {
+        id: capped(id),
+        name: name.to_owned(),
+        inward: capped(inward),
+        outward: capped(outward),
+    })
+}
+
+fn link_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
+    match resolve_link_type(str_param(ctx.params, "type"), answers.first()) {
+        Err(verdict) => *verdict,
+        Ok(link_type) => {
+            let mut resolved = Map::new();
+            resolved.insert("type".to_owned(), Value::from(link_type.name.clone()));
+            // No stale rule (§5.4 step 5: "none"), so no baseline.
+            let mut verdict = EnrichVerdict::preview(Value::Null, resolved);
+            verdict.summary = Some(WriteSummaryFacts {
+                link_type: Some(link_type),
+                ..WriteSummaryFacts::default()
+            });
+            verdict
+        }
+    }
+}
+
+/// `POST /rest/api/2/issueLink` `{"type": {"name": <resolved name>}, "inwardIssue": {"key":
+/// inward}, "outwardIssue": {"key": outward}, "comment"?: {"body": comment}}` (PD-53): the params
+/// fill the fields of the same names; the comment is wiki markup, sent verbatim (PD-42). Static
+/// checks first, so the validation dry call refuses them (exit 2): a link of an issue to itself,
+/// and a blank comment (`minLength` lets whitespace through; Jira would get an empty comment).
+/// Only a `Preview` verdict renders a request, with the type name enrichment resolved.
+pub fn issuelink_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let inward = str_param(ctx.params, "inward");
+    let outward = str_param(ctx.params, "outward");
+    if inward == outward {
+        return Err(ExecError::Invalid(invalid(
+            "outward",
+            "must name another issue than inward",
+            None,
+        )));
+    }
+    let comment = match ctx.params.get("comment") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) if !c.trim().is_empty() => Some(c.as_str()),
+        Some(_) => {
+            return Err(ExecError::Invalid(invalid(
+                "comment",
+                "must not be blank",
+                None,
+            )));
+        }
+    };
+    let name = ctx
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.resolved.get("type"))
+        .and_then(Value::as_str)
+        .filter(|n| !n.trim().is_empty())
+        .ok_or(ExecError::EnrichmentRequired)?;
+    let mut body = Map::new();
+    body.insert("type".to_owned(), json!({ "name": name }));
+    body.insert("inwardIssue".to_owned(), json!({ "key": inward }));
+    body.insert("outwardIssue".to_owned(), json!({ "key": outward }));
+    if let Some(comment) = comment {
+        body.insert("comment".to_owned(), json!({ "body": comment }));
+    }
+    json_request(ctx, &Value::Object(body))
 }

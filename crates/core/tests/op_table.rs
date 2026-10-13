@@ -30,11 +30,10 @@ const M3_WRITES: [&str; 5] = [
 ];
 
 /// Writes completed in M5 so far (each task moves its op here from [`LATER_WRITES`]).
-const M5_WRITES: [&str; 1] = ["jira.issue.assign"];
+const M5_WRITES: [&str; 2] = ["jira.issue.assign", "jira.issuelink.create"];
 
-const LATER_WRITES: [&str; 10] = [
+const LATER_WRITES: [&str; 9] = [
     "jira.worklog.add",
-    "jira.issuelink.create",
     "jira.sprint.move_issues",
     "jira.backlog.move_issues",
     "confluence.page.create",
@@ -225,6 +224,7 @@ fn reads_have_no_enrich() -> TestResult {
         "jira.issue.edit",
         "jira.issue.transition",
         "jira.issue.assign",
+        "jira.issuelink.create",
         "confluence.page.update",
     ]
     .into_iter()
