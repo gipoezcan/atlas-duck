@@ -1,4 +1,4 @@
-use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
+use atlas_duck_preview::form::{AllowedValues, ChoiceRefusal, EditForm, EditInput, InputKind};
 use serde_json::{Value, json};
 
 #[test]
@@ -7,6 +7,7 @@ fn edit_form_serializes_kinds() -> Result<(), serde_json::Error> {
         (InputKind::Text, json!({"kind": "text"})),
         (InputKind::LongText, json!({"kind": "long_text"})),
         (InputKind::Integer, json!({"kind": "integer"})),
+        (InputKind::Number, json!({"kind": "number"})),
         (InputKind::Boolean, json!({"kind": "boolean"})),
         (InputKind::Json, json!({"kind": "json"})),
         (
@@ -57,4 +58,57 @@ fn choice_allowed_values_capped_at_10() {
     );
     let wire = serde_json::to_value(&direct).unwrap_or(Value::Null);
     assert_eq!(wire["allowed_values"].as_array().map(Vec::len), Some(10));
+}
+
+/// T12 review I1: a `Choice` carries (label, wire value) pairs; the UI sees and sends back the
+/// labels only, core maps the picked label to its wire value.
+#[test]
+fn choice_wire_values_stay_private() -> Result<(), serde_json::Error> {
+    let kind = InputKind::choice_with_wire(vec![
+        ("Platform".to_owned(), Some(json!({"id": "10400"}))),
+        ("Ops".to_owned(), Some(json!({"value": "Ops"}))),
+        ("Legacy".to_owned(), None),
+    ]);
+    assert_eq!(
+        serde_json::to_value(&kind)?,
+        json!({"kind": "choice", "allowed_values": ["Platform", "Ops", "Legacy"]})
+    );
+    let InputKind::Choice(allowed) = kind else {
+        panic!("choice_with_wire() must build Choice");
+    };
+    assert_eq!(allowed.wire_for("Platform"), Ok(&json!({"id": "10400"})));
+    assert_eq!(allowed.wire_for("Ops"), Ok(&json!({"value": "Ops"})));
+    assert_eq!(allowed.wire_for("Legacy"), Err(ChoiceRefusal::NoWireValue));
+    assert_eq!(allowed.wire_for("Nope"), Err(ChoiceRefusal::NotListed));
+    // A label-only `Choice` has no wire values: every pick is refused.
+    let InputKind::Choice(plain) = InputKind::choice(vec!["A".to_owned()]) else {
+        panic!("choice() must build Choice");
+    };
+    assert_eq!(plain.wire_for("A"), Err(ChoiceRefusal::NoWireValue));
+    Ok(())
+}
+
+/// Two entries shown with the same label (cut names) cannot be told apart: a pick is refused.
+#[test]
+fn choice_same_label_twice_is_ambiguous() {
+    let InputKind::Choice(allowed) = InputKind::choice_with_wire(vec![
+        ("A…".to_owned(), Some(json!({"id": "1"}))),
+        ("A…".to_owned(), Some(json!({"id": "2"}))),
+    ]) else {
+        panic!("choice_with_wire() must build Choice");
+    };
+    assert_eq!(allowed.wire_for("A…"), Err(ChoiceRefusal::Ambiguous));
+}
+
+#[test]
+fn choice_with_wire_capped_at_10() {
+    let pairs: Vec<(String, Option<Value>)> = (0..25)
+        .map(|i| (format!("v{i}"), Some(json!({"id": i.to_string()}))))
+        .collect();
+    let InputKind::Choice(allowed) = InputKind::choice_with_wire(pairs) else {
+        panic!("choice_with_wire() must build Choice");
+    };
+    assert_eq!(allowed.as_slice().len(), 10);
+    assert_eq!(allowed.wire_for("v9"), Ok(&json!({"id": "9"})));
+    assert_eq!(allowed.wire_for("v10"), Err(ChoiceRefusal::NotListed));
 }

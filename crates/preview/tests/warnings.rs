@@ -27,7 +27,7 @@ const C6_CAUTION: [&str; 20] = [
     "user_renamed",
     "instance_url_changed",
 ];
-const C6_INFO: [&str; 8] = [
+const C6_INFO: [&str; 9] = [
     "linked_issue_summaries",
     "custom_fields",
     "truncated_by_cap",
@@ -36,6 +36,7 @@ const C6_INFO: [&str; 8] = [
     "unresolved_mention",
     "cql_broad",
     "source_formatting_removed",
+    "required_field_list_incomplete",
 ];
 
 #[test]
@@ -58,7 +59,7 @@ fn every_warning_id_has_exactly_one_level() -> TestResult {
     assert_eq!(info, C6_INFO);
     let mut all = WarningId::ALL.to_vec();
     all.dedup();
-    assert_eq!(all.len(), 28);
+    assert_eq!(all.len(), 29);
     Ok(())
 }
 
@@ -125,6 +126,15 @@ fn parameterized_texts() {
         "missing required fields: Team (customfield_10200, option)"
     );
     assert_eq!(truncated_by_cap(5, 9), "result truncated by cap (5 of 9)");
+    // T12 review M10 (PD-49): the createmeta field pages past the cap.
+    assert_eq!(
+        required_field_list_incomplete(4, Some(20)),
+        "required-field list incomplete: 4 of 20 pages read"
+    );
+    assert_eq!(
+        required_field_list_incomplete(4, None),
+        "required-field list incomplete: 4 of more than 4 pages read"
+    );
     assert_eq!(
         lossy_update(1, 2, 3),
         "this update will remove 1 macros / 2 images / 3 links"

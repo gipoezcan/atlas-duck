@@ -43,10 +43,12 @@ pub enum WarningId {
     UnresolvedMention,
     CqlBroad,
     SourceFormattingRemoved,
+    /// M5 T12 review M10 (PD-49): createmeta field pages past the page cap were not read.
+    RequiredFieldListIncomplete,
 }
 
 impl WarningId {
-    pub const ALL: [WarningId; 28] = [
+    pub const ALL: [WarningId; 29] = [
         WarningId::RestrictedComments,
         WarningId::SecurityLevel,
         WarningId::AllFields,
@@ -75,6 +77,7 @@ impl WarningId {
         WarningId::UnresolvedMention,
         WarningId::CqlBroad,
         WarningId::SourceFormattingRemoved,
+        WarningId::RequiredFieldListIncomplete,
     ];
 
     pub fn level(self) -> Level {
@@ -106,7 +109,8 @@ impl WarningId {
             | WarningId::UnknownMacros
             | WarningId::UnresolvedMention
             | WarningId::CqlBroad
-            | WarningId::SourceFormattingRemoved => Level::Info,
+            | WarningId::SourceFormattingRemoved
+            | WarningId::RequiredFieldListIncomplete => Level::Info,
         }
     }
 }
@@ -211,6 +215,15 @@ pub fn mixed_script(ident: &str) -> String {
 /// "missing required fields: Team (customfield_10200, option)" (§5.4 step 2)
 pub fn missing_required_fields(list: &str) -> String {
     format!("missing required fields: {list}")
+}
+
+/// "required-field list incomplete: 4 of N pages read" (M5 T12 review M10, PD-49); without a
+/// page count, "4 of more than 4 pages read".
+pub fn required_field_list_incomplete(read: u64, pages: Option<u64>) -> String {
+    match pages {
+        Some(n) => format!("required-field list incomplete: {read} of {n} pages read"),
+        None => format!("required-field list incomplete: {read} of more than {read} pages read"),
+    }
 }
 
 /// "result truncated by cap (N of M)"
