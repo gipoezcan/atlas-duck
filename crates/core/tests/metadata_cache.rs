@@ -398,6 +398,28 @@ async fn metadata_cache_identity_failure_rechecks_and_keeps_map() -> TestResult 
     Ok(())
 }
 
+/// Only a Jira instance in state `ok` fills: an unconfirmed one sends nothing and records
+/// nothing (the start filter and the fill's own state check), nor does a Confluence instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_fill_unless_jira_and_ok() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confluence("wiki")
+        .unconfirmed()
+        .start()
+        .await?;
+    assert!(h.field_cache_filled().await);
+    assert_eq!(fills(&h).await?, 0);
+    assert_eq!(field_hits(jira(&h)?).await, 0);
+    assert!(h.field_names("jira-main").is_none());
+    let h = Harness::confluence().await?;
+    assert!(h.field_cache_filled().await);
+    assert_eq!(fills(&h).await?, 0);
+    let wiki = h.mock("wiki").ok_or("no wiki mock")?;
+    assert!(wiki.received().await.is_empty());
+    Ok(())
+}
+
 #[test]
 fn field_names_parse_and_label() {
     let names = FieldNames::parse(br#"[{"id":"customfield_1","name":"Team"},{"id":"x"},{"name":"y"},7,{"id":"summary","name":"Summary"}]"#);
