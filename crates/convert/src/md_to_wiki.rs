@@ -9,8 +9,9 @@
 //!   always escaped `{{…}}`.
 //! - Block quotes: one paragraph → `bq. ` (line breaks as `\\`); several blocks → a
 //!   `{quote}` container. `{quote}` cannot nest, so a quote inside a quote is written flat
-//!   (paragraphs as `bq. ` lines, other blocks as they are), and so is a quote whose content
-//!   holds the text `{quote` anywhere (inside a code body), which could close it early.
+//!   (paragraphs as `bq. ` lines, other blocks as they are), and so is a quote whose rendered
+//!   content holds the text `{quote` (ASCII case-insensitive) anywhere: in a code body, or as
+//!   escaped prose `\{quote\}` (Jira's search for the closing tag may not honour escapes).
 //! - Images become links `[alt|url]` (PD-44); raw HTML is escaped text; link targets are
 //!   percent-encoded where the wiki grammar would read them.
 //! - A list item is one line: its first paragraph, further paragraphs appended after `\\`.

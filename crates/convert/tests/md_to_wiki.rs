@@ -337,6 +337,10 @@ fn quote_holding_its_own_closer_is_flattened() -> TestResult {
     let (out, e) = convert_checked("> a\n>\n> ```\n> {QUOTE}\n> ```\n")?;
     assert_eq!(out, "bq. a\n\n{code}\n{QUOTE}\n{code}\n");
     assert_eq!(kinds(&e), [ContainerKind::Code]);
+    // Escaped prose counts as well (fail closed): no container either.
+    let (out, e) = convert_checked("> a {quote} b\n>\n> c\n")?;
+    assert_eq!(out, "bq. a \\{quote\\} b\n\nbq. c\n");
+    assert!(e.code_blocks.is_empty());
     Ok(())
 }
 
@@ -400,6 +404,12 @@ fn line_start_markers_after_soft_breaks() -> TestResult {
     );
     let doc = wiki::parse(&out);
     assert_eq!(doc.blocks.len(), 1, "{:?}", doc.blocks);
+    // pulldown splits text at escapes and entities (`h1\.` is `h1` + `.`); the converter
+    // escapes the joined text, so split markers are still caught.
+    let (out, _) = convert_checked("h1\\. x\n\nb\\q. y\n\na\\&amp;b \\&amp;c\\;\n")?;
+    assert_eq!(out, "&#104;1. x\n\nb&#92;q. y\n\na&#38;amp;b &#38;amp;c;\n");
+    let (out, _) = convert_checked("x\n\nb\\\nq. y\n\nbq\\. z\n")?;
+    assert_eq!(out, "x\n\nb\nq. y\n\n&#98;q. z\n");
     Ok(())
 }
 
