@@ -429,8 +429,9 @@ pub fn lossy_update(current_storage: &str, outgoing_storage: &str) -> LostCounts
 pub fn wiki_to_preview_html(wiki: &str) -> String;
 pub fn wiki_to_text(wiki: &str) -> String;                            // [M5 Δ1] text projection of the renderer output, for the Jira rendered diff (§6.3)
 pub fn wiki_constructs(wiki: &str) -> WikiConstructs;                 // [M5 Δ1] inventory the write previews list (§7.6)
-pub struct EmittedConstructs { pub code_blocks: Vec<EmittedCode> }    // [M5 Δ1] the converter's own containers, by position in its output
-pub struct EmittedCode { pub kind: CodeKind /* Code | Noformat */, pub byte_range: std::ops::Range<usize> }
+pub struct EmittedConstructs { pub code_blocks: Vec<EmittedCode> }    // [M5 Δ1] the converter's own containers ({code}, {noformat}, multi-block {quote}), sorted by start
+pub struct EmittedCode { pub kind: ContainerKind, pub byte_range: std::ops::Range<usize> }   // byte_range: opening `{` through the closing tag's `}` in the output
+pub enum ContainerKind { Code, Noformat, Quote }                      // [M5 T3 ruling] was CodeKind (Code | Noformat): {quote} containers are recorded too, so the hard check can verify them
 pub struct Unrecorded { pub kind: ConstructKind, pub count: u64 }     // no text, no offset: the error must not echo the body
 pub enum ConstructKind { Macro, Mention, Include, Image, Attachment }
 pub struct WikiConstructs { pub macros: Vec<String>, pub mentions: Vec<String>, pub includes: Vec<String>, pub links: Vec<String> /* targets */, pub images: Vec<String>, pub attachments: Vec<String> }
