@@ -1,0 +1,3 @@
+Name | Value
+a | b
+x (https://x.example/) | [image: https://img.example/i.png]

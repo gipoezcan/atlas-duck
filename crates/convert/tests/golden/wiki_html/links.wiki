@@ -1,0 +1,5 @@
+[Example|https://example.com/a_b?x=1&y=2] and [https://auto.example/p|https://auto.example/p].
+
+Bare https://bare.example/x and [click|javascript:alert(1)].
+
+!https://evil.example/x.png! [^report.pdf] [~jdoe] [Jane|~jdoe] [spec|^spec.docx]

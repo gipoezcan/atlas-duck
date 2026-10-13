@@ -1,0 +1,4 @@
+int x = a < b && c > d;
+  indented
+raw *not bold* {color:red}
+unterminated <b>

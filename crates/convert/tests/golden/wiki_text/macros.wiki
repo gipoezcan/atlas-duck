@@ -1,0 +1,13 @@
+{panel:title=Note}
+Inside *panel*
+{panel}
+
+{toc}
+
+{html}<script>alert(1)</script>{html}
+
+Inline {status:colour=red}DONE{status} and {color:red}red{color} and {span:style=x}span{span}.
+
+{quote}
+Quoted *text*
+{quote}

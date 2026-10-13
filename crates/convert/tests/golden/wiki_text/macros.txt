@@ -1,0 +1,8 @@
+[macro: panel]
+Note
+Inside panel
+[macro: toc]
+[macro: html]
+<script>alert(1)</script>
+Inline [macro: status]DONE[macro: status] and red and span.
+> Quoted text
