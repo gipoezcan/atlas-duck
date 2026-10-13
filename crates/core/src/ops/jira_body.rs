@@ -10,13 +10,17 @@ use atlas_duck_ipc::envelope::ErrorCode;
 use serde_json::{Map, Value};
 
 use super::{ExecCtx, ExecError};
-use crate::validate::ValidationError;
+use crate::validate::{ValidationError, invalid};
 
 /// plan text (PD-43): the message of a failed hard check, followed by the construct kind.
 pub const UNRECORDED_MESSAGE: &str = "markdown conversion produced an unrecorded";
+/// plan text (T7 review M-4): Markdown with nothing but whitespace converts to `"\n"`, which Jira
+/// refuses (400) only after a human approved the write.
+pub const EMPTY_MESSAGE: &str = "is empty after markdown conversion";
 
 /// `None` when `param` is absent; with `body_format: wiki` the text verbatim; otherwise (Markdown,
-/// also when `body_format` is absent) the converted text, after the hard check passed.
+/// also when `body_format` is absent) the converted text, after the hard check passed. Converted
+/// text that is only whitespace is refused (`validation`, the param and the fixed message).
 pub(crate) fn wiki_text(ctx: &ExecCtx<'_>, param: &str) -> Result<Option<String>, ExecError> {
     let Some(text) = ctx.params.get(param).and_then(Value::as_str) else {
         return Ok(None);
@@ -25,6 +29,9 @@ pub(crate) fn wiki_text(ctx: &ExecCtx<'_>, param: &str) -> Result<Option<String>
         return Ok(Some(text.to_owned()));
     }
     let (wiki, emitted) = markdown_to_wiki(text);
+    if wiki.trim().is_empty() {
+        return Err(ExecError::Invalid(invalid(param, EMPTY_MESSAGE, None)));
+    }
     #[cfg(feature = "testing")]
     let wiki = match ctx.test_fault {
         Some(fault) => fault.apply(&wiki),

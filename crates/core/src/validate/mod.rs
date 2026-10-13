@@ -241,8 +241,9 @@ fn check_body_format(
     if spec.class != atlas_duck_registry::OpClass::Write || !compiled.has_body_format {
         return Ok(());
     }
-    // Nothing to convert without a body (create without `description`).
-    if params.get("body").is_none() && params.get("description").is_none() {
+    // Nothing to convert without a body. Jira's `description` needs no guard: Jira is exempt
+    // below, and only Jira ops carry `description` (T7 review M-3).
+    if params.get("body").is_none() {
         return Ok(());
     }
     let markdown = match params.get("body_format") {

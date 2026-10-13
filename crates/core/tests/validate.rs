@@ -5,7 +5,7 @@ use atlas_duck_core::validate::{
     validate_script_submit,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
-use atlas_duck_registry::{OperationSpec, Version};
+use atlas_duck_registry::{OperationSpec, Product, Version};
 use serde_json::{Value, json};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -90,10 +90,15 @@ fn u33_all_ops_compile_and_accept_their_example() -> TestResult {
             .cloned()
             .ok_or_else(|| format!("{} has no example", spec.id))?;
         let r = check(spec.id, example)?;
-        // Writes with a body and no `body_format` hit the PD-09 rule; everything else passes.
+        // Confluence writes with a body and no `body_format` hit the PD-09 rule (no Markdown
+        // conversion before M7); Jira converts from M5 on (PD-43), so every Jira example and
+        // everything else passes.
         match r {
             Ok(_) => {}
-            Err(e) => assert_eq!(param(&e), Some("body_format"), "{}: {e}", spec.id),
+            Err(e) => {
+                assert_eq!(spec.product, Product::Confluence, "{}: {e}", spec.id);
+                assert_eq!(param(&e), Some("body_format"), "{}: {e}", spec.id);
+            }
         }
     }
     Ok(())

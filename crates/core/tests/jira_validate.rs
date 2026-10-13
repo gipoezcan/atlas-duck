@@ -25,6 +25,17 @@ fn jira(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("jira-main").ok_or_else(|| "no jira mock".into())
 }
 
+/// The requests the mock received apart from the field-name cache's `GET /rest/api/2/field`
+/// (PD-46), which a background fill may send at any time (T7 review M-1).
+async fn hits(mock: &MockDc) -> usize {
+    let field = mock.path("/rest/api/2/field");
+    mock.received()
+        .await
+        .iter()
+        .filter(|r| r.url.path() != field)
+        .count()
+}
+
 /// A harness whose converter output gets `fault` appended before the hard check.
 async fn faulty(fault: ConverterFault) -> Result<Harness, TestError> {
     Harness::builder()
@@ -169,7 +180,7 @@ async fn u24_injected_fault_fails_validation_exit2() -> TestResult {
     ] {
         let h = faulty(fault).await?;
         let mock = jira(&h)?;
-        let before = mock.received().await.len();
+        let before = hits(mock).await;
         let params = json!({ "project": "ABC", "issuetype": "Bug", "summary": "S",
                              "description": "Steps:\n\n1. log in\n2. `reset`" });
         let env = h.submit(CREATE, params).await;
@@ -186,7 +197,7 @@ async fn u24_injected_fault_fails_validation_exit2() -> TestResult {
         assert!(
             !line.contains("Steps") && !line.contains("injected") && !line.contains("Injected")
         );
-        assert_eq!(mock.received().await.len(), before, "no wiremock hit");
+        assert_eq!(hits(mock).await, before, "no wiremock hit");
         // The same through `jira.comment.add`'s `body`.
         let env = h
             .submit(COMMENT, json!({ "key": "ABC-1", "body": "plain *text*" }))
@@ -194,7 +205,7 @@ async fn u24_injected_fault_fails_validation_exit2() -> TestResult {
         assert_rejected_at_validation(&h, &env).await?;
         assert_eq!(detail(&env, "param"), json!("body"));
         assert_eq!(detail(&env, "construct"), json!(construct));
-        assert_eq!(mock.received().await.len(), before, "no wiremock hit");
+        assert_eq!(hits(mock).await, before, "no wiremock hit");
         // The fault touches only converted text: verbatim wiki still passes validation.
         let env = h
             .submit(
@@ -207,6 +218,52 @@ async fn u24_injected_fault_fails_validation_exit2() -> TestResult {
     Ok(())
 }
 
+/// T7 review M-4: whitespace-only Markdown converts to `"\n"`, which Jira answers with a 400
+/// after a human approved it. It is refused at validation instead, without echoing the text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn whitespace_only_markdown_rejected_at_validation() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    let before = hits(mock).await;
+    let blank = " \n\t \n";
+    for (op, params, param) in [
+        (COMMENT, json!({ "key": "ABC-1", "body": blank }), "body"),
+        (
+            COMMENT,
+            json!({ "key": "ABC-1", "body": blank, "body_format": "markdown" }),
+            "body",
+        ),
+        (
+            CREATE,
+            json!({ "project": "ABC", "issuetype": "Bug", "summary": "S", "description": blank }),
+            "description",
+        ),
+    ] {
+        let env = h.submit(op, params).await;
+        assert_rejected_at_validation(&h, &env).await?;
+        assert_eq!(detail(&env, "param"), json!(param), "{op}");
+        assert_eq!(
+            detail(&env, "message"),
+            json!("is empty after markdown conversion")
+        );
+        assert_eq!(
+            message(&env),
+            format!("params/{param}: is empty after markdown conversion")
+        );
+        assert!(!env.to_json_line().contains("\\t"), "no body text echoed");
+    }
+    assert_eq!(hits(mock).await, before, "no wiremock hit");
+    // Verbatim wiki stays the agent's choice (PD-42): not converted, not refused here.
+    let env = h
+        .submit(
+            COMMENT,
+            json!({ "key": "ABC-1", "body": blank, "body_format": "wiki" }),
+        )
+        .await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn create_markdown_description_converted_before_enrichment() -> TestResult {
     // The dry call converts and checks before the executor asks for enrichment: a fault is
@@ -215,16 +272,12 @@ async fn create_markdown_description_converted_before_enrichment() -> TestResult
     let mock = jira(&h)?;
     mock.json(CREATEMETA_PATH, 200, fixtures::JIRA_CREATEMETA_ISSUETYPES)
         .await;
-    let before = mock.received().await.len();
+    let before = hits(mock).await;
     let params = json!({ "project": "ABC", "issuetype": "Bug", "summary": "S",
                          "description": "**x**" });
     let env = h.submit(CREATE, params.clone()).await;
     assert_rejected_at_validation(&h, &env).await?;
-    assert_eq!(
-        mock.received().await.len(),
-        before,
-        "wiremock saw zero requests"
-    );
+    assert_eq!(hits(mock).await, before, "wiremock saw zero requests");
 
     // Without a fault the same params enrich, and the approved request carries the converted
     // description.
