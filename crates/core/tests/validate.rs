@@ -412,14 +412,28 @@ fn pd09_markdown_rejected_absent_counts_as_markdown() -> TestResult {
         }
         p
     };
-    for params in [jira(json!({})), jira(json!({"body_format": "markdown"}))] {
-        let e = rejected(check("jira.comment.add", params)?)?;
+    // Jira converts Markdown from M5 on (PD-43): the refusal is Confluence's until M7.
+    let confluence = |extra: Value| {
+        let mut p = json!({"content_id": "1", "body": "hello"});
+        if let (Some(p), Some(extra)) = (p.as_object_mut(), extra.as_object()) {
+            p.extend(extra.clone());
+        }
+        p
+    };
+    for params in [
+        confluence(json!({})),
+        confluence(json!({"body_format": "markdown"})),
+    ] {
+        let e = rejected(check("confluence.comment.add", params)?)?;
         assert_eq!(e.code, ErrorCode::Validation);
         assert_eq!(param(&e), Some("body_format"));
         assert_eq!(
             e.details.get("message"),
             Some(&json!("markdown conversion is not available in this build"))
         );
+    }
+    for format in [json!({}), json!({"body_format": "markdown"})] {
+        assert!(check("jira.comment.add", jira(format))?.is_ok());
     }
     assert!(check("jira.comment.add", jira(json!({"body_format": "wiki"})))?.is_ok());
     assert!(
@@ -575,9 +589,18 @@ fn create_without_a_body_needs_no_body_format() -> TestResult {
         )?
         .is_ok()
     );
+    // With a Markdown description it passes too from M5 on: the executor converts it (PD-43).
+    // The body rule itself stays Confluence's (every Confluence body write requires `body`).
+    assert!(
+        check(
+            "jira.issue.create",
+            json!({"project": "ABC", "issuetype": "Bug", "summary": "s", "description": "d"})
+        )?
+        .is_ok()
+    );
     let e = rejected(check(
-        "jira.issue.create",
-        json!({"project": "ABC", "issuetype": "Bug", "summary": "s", "description": "d"}),
+        "confluence.page.create",
+        json!({"space": "DOC", "title": "t", "body": "d"}),
     )?)?;
     assert_eq!(param(&e), Some("body_format"));
     Ok(())

@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_preview::invisible;
-use atlas_duck_registry::{OperationSpec, Version};
+use atlas_duck_registry::{OperationSpec, Product, Version};
 use jsonschema::Validator;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -230,7 +230,9 @@ fn check_min_version(spec: &OperationSpec, ctx: &ValidateCtx<'_>) -> Result<(), 
     })
 }
 
-/// PD-09: markdown conversion is not in this build; an absent `body_format` is `markdown`.
+/// PD-09: markdown conversion is not in this build for Confluence (M7); an absent `body_format`
+/// is `markdown`. Jira converts from M5 on (PD-43: the executor converts and hard-checks, so the
+/// validation dry call rejects a failed check).
 fn check_body_format(
     spec: &OperationSpec,
     compiled: &Compiled,
@@ -247,7 +249,7 @@ fn check_body_format(
         None => true,
         Some(value) => value.as_str() == Some("markdown"),
     };
-    if markdown {
+    if markdown && spec.product != Product::Jira {
         return Err(invalid(
             "body_format",
             "markdown conversion is not available in this build",

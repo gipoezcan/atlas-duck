@@ -23,6 +23,10 @@ pub const RELEASE_CAP_BYTES: u64 = 16 * 1024 * 1024;
 /// to every Write op.
 pub const WRITE_GUIDANCE: &str = "Submit human names (project, issue type, transition, user, link type, parent page); the app resolves and validates them. Do not pre-read createmeta, transitions or assignable users; if you need metadata, fetch it in one script.";
 
+/// plan text (PD-42): the sentence `describe` adds after [`WRITE_GUIDANCE`] to every Jira write
+/// (which params convert from Markdown, which are sent verbatim).
+pub const JIRA_VERBATIM_GUIDANCE: &str = "Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted.";
+
 /// §7.5 (verbatim): the rule `describe` states for paginated ops.
 pub const PAGINATION_GUIDANCE: &str = "continue only from meta.page.next_start";
 

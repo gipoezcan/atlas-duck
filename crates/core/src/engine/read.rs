@@ -43,9 +43,7 @@ use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
 use crate::lifecycle::model::{Event, ReleaseItem};
 use crate::ops::generic::{count_value, fallback_preview, invisible_warnings, query_display};
-use crate::ops::{
-    ExecCtx, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table,
-};
+use crate::ops::{ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table};
 use crate::payloads::{self, CapOrBudget, EventCtx, OutcomeKind, ReadFetched};
 use crate::proxy::{PAC_HINT, ResolvedProxy};
 use crate::redact::RedactionMeta;
@@ -361,13 +359,13 @@ async fn fetch(
         .client(&entry.instance_id)
         .await
         .map_err(|_| "the instance's connection settings (custom CA or proxy) cannot be used")?;
-    let plan = (op.executor)(&ExecCtx {
-        spec: entry.spec,
-        params: &validated.params,
-        base: http.client.base(),
-        enrichment: None,
-        effective_max: validated.effective_max,
-    });
+    let plan = (op.executor)(&engine.exec_ctx(
+        entry.spec,
+        &validated.params,
+        http.client.base(),
+        None,
+        validated.effective_max,
+    ));
     let Ok(ExecPlan::Read(plan)) = plan else {
         return Err(MSG_INTERNAL);
     };

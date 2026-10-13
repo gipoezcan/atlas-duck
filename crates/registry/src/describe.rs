@@ -2,8 +2,8 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::model::{FlagKind, OpClass, OperationSpec, Version};
-use crate::{PAGINATION_GUIDANCE, WRITE_GUIDANCE};
+use crate::model::{FlagKind, OpClass, OperationSpec, Product, Version};
+use crate::{JIRA_VERBATIM_GUIDANCE, PAGINATION_GUIDANCE, WRITE_GUIDANCE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitsSource {
@@ -106,6 +106,10 @@ fn description(spec: &OperationSpec) -> String {
     let mut parts = Vec::new();
     if spec.write_guidance || spec.class == OpClass::Write {
         parts.push(WRITE_GUIDANCE.to_string());
+    }
+    // PD-42: keyed on the class, so a read flagged for the write guidance does not get it.
+    if spec.product == Product::Jira && spec.class == OpClass::Write {
+        parts.push(JIRA_VERBATIM_GUIDANCE.to_string());
     }
     if spec.paginated.is_some() {
         parts.push(format!("Paginated: {PAGINATION_GUIDANCE}."));

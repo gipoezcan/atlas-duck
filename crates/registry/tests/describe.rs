@@ -134,3 +134,33 @@ fn ops_list_json_shape() {
         }
     }
 }
+
+#[test]
+fn jira_writes_state_verbatim_rule() {
+    // PD-42 (plan text, verbatim).
+    let sentence = "Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; \
+                    only `description`/`body` with `body_format=markdown` are converted.";
+    assert_eq!(JIRA_VERBATIM_GUIDANCE, sentence);
+    let mut jira_writes = 0;
+    for spec in all() {
+        let out = describe(spec, &env());
+        let text = out["description"].as_str().unwrap_or("");
+        let jira_write = spec.product == Product::Jira && spec.class == OpClass::Write;
+        assert_eq!(text.contains(sentence), jira_write, "{}", spec.id);
+        if jira_write {
+            jira_writes += 1;
+            // After the write guidance.
+            let at = text.find(sentence).unwrap_or(0);
+            assert!(text[..at].contains(WRITE_GUIDANCE), "{}", spec.id);
+        }
+    }
+    assert_eq!(jira_writes, 9);
+    // A read flagged for the write guidance gets that guidance only.
+    let spec = OperationSpec {
+        write_guidance: true,
+        ..READ
+    };
+    let out = describe(&spec, &env());
+    let text = out["description"].as_str().unwrap_or("");
+    assert!(text.contains(WRITE_GUIDANCE) && !text.contains(sentence));
+}

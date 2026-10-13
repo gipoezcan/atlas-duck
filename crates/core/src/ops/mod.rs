@@ -9,6 +9,7 @@
 pub mod confluence;
 pub mod generic;
 pub mod jira;
+pub(crate) mod jira_body;
 pub mod stale;
 
 use std::collections::BTreeMap;
@@ -128,6 +129,10 @@ pub struct ExecCtx<'a> {
     pub enrichment: Option<&'a EnrichVerdict>,
     /// `Validated::effective_max`: the clamped `max` of ops with a `max` cap.
     pub effective_max: Option<u32>,
+    /// U-24 (PD-64): the engine copies `TestHooks::converter_fault` here; `jira_body` appends it
+    /// to converted Markdown before the hard check. Absent from production builds.
+    #[cfg(feature = "testing")]
+    pub test_fault: Option<crate::testing::ConverterFault>,
 }
 
 pub struct EnrichCtx<'a> {

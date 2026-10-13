@@ -138,12 +138,13 @@ async fn pd02_unknown_alias_validation() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pd09_markdown_body_rejected() -> TestResult {
-    let h = Harness::jira().await?;
+    // Jira converts Markdown from M5 on (PD-43); Confluence keeps the refusal until M7.
+    let h = Harness::confluence().await?;
     for params in [
-        json!({ "key": "ABC-1", "body": "**hi**" }),
-        json!({ "key": "ABC-1", "body": "**hi**", "body_format": "markdown" }),
+        json!({ "id": "65537", "base_version": 5, "body": "**hi**" }),
+        json!({ "id": "65537", "base_version": 5, "body": "**hi**", "body_format": "markdown" }),
     ] {
-        let env = h.submit("jira.comment.add", params).await;
+        let env = h.submit("confluence.page.update", params).await;
         assert_eq!(code(&env), "validation");
         assert_eq!(exit(&env), 2);
         assert_eq!(detail(&env, "param"), json!("body_format"));
@@ -157,11 +158,11 @@ async fn pd09_markdown_body_rejected() -> TestResult {
             [EventType::REQUEST_RECEIVED, EventType::REQUEST_REJECTED]
         );
     }
-    // Wiki passes validation and waits.
+    // Storage passes validation and waits.
     let env = h
         .submit(
-            "jira.comment.add",
-            json!({ "key": "ABC-1", "body": "hi", "body_format": "wiki" }),
+            "confluence.page.update",
+            json!({ "id": "65537", "base_version": 5, "body": "<p>hi</p>", "body_format": "storage" }),
         )
         .await;
     assert_eq!(env.status, Status::Pending);

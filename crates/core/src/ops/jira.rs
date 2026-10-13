@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    cap_diff_text, generic, get_call, json_request, resolve_url, str_param,
+    cap_diff_text, generic, get_call, jira_body, json_request, resolve_url, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
@@ -147,6 +147,8 @@ pub fn issue_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     // before enrichment: the write URL and the createmeta lookup.
     resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
     resolve_url(ctx.base, CREATEMETA_ISSUETYPES_PATH, ctx.params, &[])?;
+    // PD-43: converted and hard-checked before the enrichment wait, so the dry call rejects it.
+    let description = jira_body::wiki_text(ctx, "description")?;
     let issuetype = resolved_id(ctx, "issuetype")?;
     let mut fields = ctx
         .params
@@ -167,8 +169,8 @@ pub fn issue_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
         "summary".to_owned(),
         Value::from(str_param(ctx.params, "summary")),
     );
-    if let Some(description) = ctx.params.get("description") {
-        fields.insert("description".to_owned(), description.clone());
+    if let Some(description) = description {
+        fields.insert("description".to_owned(), Value::from(description));
     }
     json_request(ctx, &json!({"fields": fields}))
 }
@@ -273,13 +275,12 @@ pub fn issue_edit_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
 
 // ---- jira.comment.add --------------------------------------------------------------------------
 
-/// `POST /rest/api/2/issue/{key}/comment` `{"body", "visibility"?}` (wiki markup, PD-09).
+/// `POST /rest/api/2/issue/{key}/comment` `{"body", "visibility"?}`; `body` is wiki markup,
+/// converted from Markdown unless `body_format` is `wiki` (PD-43).
 pub fn comment_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let text = jira_body::wiki_text(ctx, "body")?.unwrap_or_default();
     let mut body = Map::new();
-    body.insert(
-        "body".to_owned(),
-        Value::from(str_param(ctx.params, "body")),
-    );
+    body.insert("body".to_owned(), Value::from(text));
     if let Some(v) = ctx.params.get("visibility").filter(|v| !v.is_null()) {
         body.insert("visibility".to_owned(), v.clone());
     }

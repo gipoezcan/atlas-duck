@@ -157,6 +157,9 @@ pub struct TestHooks {
     pub pause_after_get: Option<Arc<Pause>>,
     /// Replaces the 60 s that `shutdown` waits for writes that are `executing` (§2.5 step 4).
     pub shutdown_write_wait: Option<std::time::Duration>,
+    /// U-24 (PD-64): every executor context the engine builds carries this fault, so converted
+    /// Markdown gets one unrecorded construct appended before the hard check.
+    pub converter_fault: Option<crate::testing::ConverterFault>,
 }
 
 #[cfg(feature = "testing")]

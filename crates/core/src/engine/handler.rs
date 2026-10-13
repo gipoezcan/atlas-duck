@@ -46,7 +46,7 @@ use crate::ids::RequestId;
 use crate::instances::{InstanceRuntime, InstanceState, RouteError};
 use crate::lifecycle::model::{Event, Kind, Model, step};
 use crate::normalize::{normalize_agent_name, normalize_hello, normalize_reason};
-use crate::ops::{ExecCtx, ExecError, NOT_IN_THIS_BUILD_MESSAGE, op_table};
+use crate::ops::{ExecError, NOT_IN_THIS_BUILD_MESSAGE, op_table};
 use crate::payloads::{self, EventCtx};
 use crate::validate::{EffectiveCaps, ValidateCtx, ValidationError, validate};
 
@@ -182,13 +182,13 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
     // 8. The dry executor call: op-owned static checks (CQL, edit with nothing to edit) and
     // PD-09; `EnrichmentRequired` passes (T18).
     let dry = match op_table().get(spec.id) {
-        Some(op) => (op.executor)(&ExecCtx {
+        Some(op) => (op.executor)(&engine.exec_ctx(
             spec,
-            params: &validated.params,
-            base: &j.routed.base,
-            enrichment: None,
-            effective_max: validated.effective_max,
-        })
+            &validated.params,
+            &j.routed.base,
+            None,
+            validated.effective_max,
+        ))
         .map(|_| ()),
         None => Err(ExecError::NotInThisBuild),
     };

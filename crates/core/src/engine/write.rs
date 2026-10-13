@@ -63,8 +63,8 @@ use crate::lifecycle::model::{
 };
 use crate::ops::generic::write_preview;
 use crate::ops::{
-    EnrichCtx, EnrichFailure, EnrichPurpose, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    PreviewCtx, PreviewInput, PreviewModel, StaleCtx, StaleVerdict, WriteView, op_table,
+    EnrichCtx, EnrichFailure, EnrichPurpose, EnrichVerdict, ExecError, ExecPlan, PreviewCtx,
+    PreviewInput, PreviewModel, StaleCtx, StaleVerdict, WriteView, op_table,
 };
 use crate::payloads::{
     self, EventCtx, FetchRecord, OutcomeKind, PreviewFetchPurpose, WriteFailure, WriteStaleReason,
@@ -256,6 +256,7 @@ fn expectation(spec: &OperationSpec) -> SuccessExpectation {
 /// The exact request list for `params` and a `Preview` verdict (§5.1 inv. 3). The executor sees
 /// the verdict only when it is `Preview` (T18 as built).
 pub(crate) fn render(
+    engine: &Engine,
     spec: &'static OperationSpec,
     base: &NormalizedBaseUrl,
     params: &Value,
@@ -264,13 +265,7 @@ pub(crate) fn render(
 ) -> Result<Vec<HttpRequestSpec>, ExecError> {
     let op = op_table().get(spec.id).ok_or(ExecError::NotInThisBuild)?;
     let enrichment = verdict.filter(|v| v.hold == Hold::Preview);
-    match (op.executor)(&ExecCtx {
-        spec,
-        params,
-        base,
-        enrichment,
-        effective_max,
-    })? {
+    match (op.executor)(&engine.exec_ctx(spec, params, base, enrichment, effective_max))? {
         ExecPlan::Write(requests) => Ok(requests),
         ExecPlan::Read(_) => Err(ExecError::NotInThisBuild),
     }
@@ -1671,6 +1666,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
     let effective_max = entry.validated.as_ref().and_then(|v| v.effective_max);
     let rendered = if verdict.hold == Hold::Preview {
         render(
+            engine,
             spec,
             http.client.base(),
             &params,

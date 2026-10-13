@@ -39,7 +39,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use atlas_duck_atlassian::{
-    BuildError, CoverIssuer, CredentialProvider, FetchControl, InstanceClient, ReadBudget,
+    BuildError, CoverIssuer, CredentialProvider, FetchControl, InstanceClient, NormalizedBaseUrl,
+    ReadBudget,
 };
 use atlas_duck_audit::ScriptFailedFlags;
 use atlas_duck_audit::{AuditError, Clock, EventHeader, EventType, NewEvent, is_terminal};
@@ -59,6 +60,7 @@ use crate::lifecycle::model::{
     Applied, Event, Kind, Model, Phase, Rejection, Terminal, agent_status, is_pending, step,
 };
 use crate::normalize::NormalizedHello;
+use crate::ops::{EnrichVerdict, ExecCtx};
 use crate::payloads::{EventCtx, PreviewFetchPurpose};
 use crate::proxy::ResolvedProxy;
 use crate::redact::RedactionOp;
@@ -865,6 +867,27 @@ impl Engine {
     #[cfg(feature = "testing")]
     pub fn hooks(&self) -> &crate::core::TestHooks {
         &self.hooks
+    }
+
+    /// Every executor context the engine builds; under `testing` it carries the hooks' converter
+    /// fault (U-24, PD-64).
+    pub(crate) fn exec_ctx<'a>(
+        &self,
+        spec: &'static OperationSpec,
+        params: &'a Value,
+        base: &'a NormalizedBaseUrl,
+        enrichment: Option<&'a EnrichVerdict>,
+        effective_max: Option<u32>,
+    ) -> ExecCtx<'a> {
+        ExecCtx {
+            spec,
+            params,
+            base,
+            enrichment,
+            effective_max,
+            #[cfg(feature = "testing")]
+            test_fault: self.hooks.converter_fault,
+        }
     }
 
     pub(crate) fn terminal_rows(&self) -> &Arc<Mutex<Recent<handler::ListRow>>> {

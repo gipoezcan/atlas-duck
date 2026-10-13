@@ -70,6 +70,8 @@ fn exec(
         base: &base,
         enrichment,
         effective_max,
+        #[cfg(feature = "testing")]
+        test_fault: None,
     };
     Ok((imp.executor)(&ctx))
 }
@@ -669,8 +671,24 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             json!({"id": "65537", "base_version": 5, "body": "<p>x</p>", "body_format": "storage"}),
             Some(page_verdict()),
         ),
+        // PD-43: Markdown bodies convert in the executor; every render gives the same bytes.
+        (
+            "jira.issue.create",
+            json!({"project": "ABC", "issuetype": "bug", "summary": "S",
+                   "description": MARKDOWN}),
+            Some(create_verdict()),
+        ),
+        (
+            "jira.comment.add",
+            json!({"key": "ABC-1", "body": MARKDOWN, "body_format": "markdown"}),
+            None,
+        ),
     ]
 }
+
+/// A Markdown body with a heading, emphasis, wiki specials, a quote and a code block.
+const MARKDOWN: &str =
+    "# Steps\n\n**bold** {toc} [~jdoe]\n\n> quoted\n>\n> twice\n\n```rust\n{code}\n```\n";
 
 #[test]
 fn executors_deterministic() -> TestResult {
@@ -684,6 +702,15 @@ fn executors_deterministic() -> TestResult {
         // Key order is fixed (serde_json's ordered map): re-serializing gives the same bytes.
         assert_eq!(serde_json::to_vec(&body_json(&a[0])?)?, a[0].body, "{id}");
     }
+    // The Markdown cases carry the converter's output (PD-43), never the agent's text.
+    let wiki = json!(atlas_duck_convert::markdown_to_wiki(MARKDOWN).0);
+    let create =
+        json!({"project": "ABC", "issuetype": "bug", "summary": "S", "description": MARKDOWN});
+    let r = &write_requests("jira.issue.create", &create, Some(&create_verdict()))?[0];
+    assert_eq!(body_json(r)?["fields"]["description"], wiki);
+    let comment = json!({"key": "ABC-1", "body": MARKDOWN});
+    let r = &write_requests("jira.comment.add", &comment, None)?[0];
+    assert_eq!(body_json(r)?["body"], wiki);
     Ok(())
 }
 

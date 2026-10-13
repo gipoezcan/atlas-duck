@@ -1317,7 +1317,7 @@ async fn edit_write(
         .map_err(|_| edit_refused("the instance cannot be reached from this build", "instance"))?;
     let base = http.client.base();
     let effective_max = entry.validated.as_ref().and_then(|v| v.effective_max);
-    match write::render(spec, base, &result.params, None, effective_max) {
+    match write::render(engine, spec, base, &result.params, None, effective_max) {
         Ok(_) | Err(ExecError::EnrichmentRequired) => {}
         Err(e) => return Err(exec_refused(e)),
     }
@@ -1326,7 +1326,7 @@ async fn edit_write(
     } else if snap.write.verdict.hold == Hold::Preview {
         let verdict = Some(&snap.write.verdict);
         Some(
-            write::render(spec, base, &result.params, verdict, effective_max)
+            write::render(engine, spec, base, &result.params, verdict, effective_max)
                 .map_err(exec_refused)?,
         )
     } else {

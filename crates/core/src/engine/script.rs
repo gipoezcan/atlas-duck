@@ -64,8 +64,7 @@ use crate::lifecycle::model::{Event, Kind, Model, Phase, ReleaseItem, step};
 use crate::normalize::normalize_reason;
 use crate::ops::generic::fallback_preview;
 use crate::ops::{
-    ExecCtx, ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView,
-    op_table,
+    ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table,
 };
 use crate::payloads::{
     self, EventCtx, InFlightReason, OutcomeKind, ReadFetched, ScriptCallMeta, ScriptErrorDetails,
@@ -651,13 +650,13 @@ impl CallValidator for EngineValidator {
         let validated = validate(spec, &call.params, &ctx).map_err(|e| from_validation(&e))?;
         // The op's own static checks (CQL rules, ...): the dry executor call.
         let dry = match op_table().get(spec.id) {
-            Some(op) => (op.executor)(&ExecCtx {
+            Some(op) => (op.executor)(&self.engine.exec_ctx(
                 spec,
-                params: &validated.params,
-                base: &base,
-                enrichment: None,
-                effective_max: validated.effective_max,
-            })
+                &validated.params,
+                &base,
+                None,
+                validated.effective_max,
+            ))
             .map(|_| ()),
             None => Err(ExecError::NotInThisBuild),
         };
@@ -983,13 +982,13 @@ impl LiveBackend {
             .await
             .map_err(|_| internal())?;
         let op = op_table().get(vc.spec.id).ok_or_else(internal)?;
-        let plan = (op.executor)(&ExecCtx {
-            spec: vc.spec,
-            params: &vc.validated.params,
-            base: http.client.base(),
-            enrichment: None,
-            effective_max: vc.validated.effective_max,
-        });
+        let plan = (op.executor)(&self.engine.exec_ctx(
+            vc.spec,
+            &vc.validated.params,
+            http.client.base(),
+            None,
+            vc.validated.effective_max,
+        ));
         let Ok(ExecPlan::Read(plan)) = plan else {
             return Err(internal());
         };
