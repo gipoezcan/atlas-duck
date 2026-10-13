@@ -90,7 +90,7 @@ async fn queued(h: &Harness, op: &str, params: Value) -> Result<String, TestErro
 
 /// How many requests the instance has received.
 async fn received(h: &Harness) -> Result<usize, TestError> {
-    Ok(jira(h)?.received().await.len())
+    Ok(common::test_hits(jira(h)?).await.len())
 }
 
 async fn non_get(h: &Harness) -> Result<usize, TestError> {
@@ -275,11 +275,16 @@ async fn row_preview_fetch_enrich() -> TestResult {
 /// `SYSTEM_FETCH` start of a connection test: no request leaves.
 async fn row_system_fetch_start() -> TestResult {
     let (h, plan) = rig().await?;
-    plan.fail_nth(EventType::SYSTEM_FETCH, 1);
+    // The field-name cache's start fill (PD-46) committed its two records before the test ran.
+    let before = count_of(&h, EventType::SYSTEM_FETCH).await?;
+    plan.fail_nth(
+        EventType::SYSTEM_FETCH,
+        plan.attempts(EventType::SYSTEM_FETCH) + 1,
+    );
     let res = h.instances().retest_token("jira-main").await;
     assert!(matches!(res, Err(AdminError::Audit(_))), "{res:?}");
     assert_eq!(received(&h).await?, 0);
-    assert_eq!(count_of(&h, EventType::SYSTEM_FETCH).await?, 0);
+    assert_eq!(count_of(&h, EventType::SYSTEM_FETCH).await?, before);
     Ok(())
 }
 

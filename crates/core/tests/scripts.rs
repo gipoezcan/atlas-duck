@@ -167,7 +167,7 @@ async fn p3_script_result_release_flow() -> TestResult {
             EventType::DELIVERED,
         ]
     );
-    assert_eq!(requests_of(&h)?.received().await.len(), 1);
+    assert_eq!(common::test_hits(requests_of(&h)?).await.len(), 1);
     Ok(())
 }
 
@@ -290,7 +290,7 @@ async fn call_sent_append_failure_sends_nothing_and_ends_audit_failure() -> Test
     assert_eq!(exit(&env), 1);
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
     assert_eq!(env.data, None);
-    assert!(requests_of(&h)?.received().await.is_empty());
+    assert!(common::test_hits(requests_of(&h)?).await.is_empty());
     wait_for("the kill", || runner.kills().iter().any(Option::is_some)).await?;
     assert_eq!(runner.kills(), [Some(KillReason::AuditFailure)]);
     let types = h.event_types(&id).await?;
@@ -409,7 +409,7 @@ async fn p3_dry_run_backend_answers_from_examples() -> TestResult {
             HostCallResult::Ok(search.result_example_json()),
         ]
     );
-    assert!(requests_of(&h)?.received().await.is_empty());
+    assert!(common::test_hits(requests_of(&h)?).await.is_empty());
     // No `SCRIPT_STARTED`, no `SCRIPT_CALL`: the only record besides the request's own and its
     // delivery is the dry run's.
     assert_eq!(
@@ -476,7 +476,7 @@ async fn dry_run_validates_every_call_like_a_real_run() -> TestResult {
         })
         .collect();
     assert_eq!(classes, ["validation", "validation"]);
-    assert!(requests_of(&h)?.received().await.is_empty());
+    assert!(common::test_hits(requests_of(&h)?).await.is_empty());
     Ok(())
 }
 
@@ -518,7 +518,7 @@ async fn write_op_rejected_in_script() -> TestResult {
         HostCallResult::Rejected { class, .. } => assert_eq!(class, "validation"),
         other => return Err(format!("not rejected: {other:?}").into()),
     }
-    assert!(requests_of(&h)?.received().await.is_empty());
+    assert!(common::test_hits(requests_of(&h)?).await.is_empty());
     // Never validated, so the run never dispatched.
     let types = h.event_types(&id).await?;
     assert!(!types.contains(&EventType::SCRIPT_CALL_SENT), "{types:?}");
@@ -959,7 +959,7 @@ async fn call_append_failure_ends_audit_failure_after_the_send() -> TestResult {
     assert_eq!(exit(&env), 1);
     assert_eq!(env.data, None);
     // The request left before its record failed; nothing of the answer reached the script.
-    assert_eq!(requests_of(&h)?.received().await.len(), 1);
+    assert_eq!(common::test_hits(requests_of(&h)?).await.len(), 1);
     wait_for("the kill", || runner.kills().iter().any(Option::is_some)).await?;
     assert_eq!(runner.kills(), [Some(KillReason::AuditFailure)]);
     assert!(

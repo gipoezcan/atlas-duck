@@ -10,6 +10,18 @@ pub mod flows;
 pub type TestResult = Result<(), Box<dyn std::error::Error>>;
 pub type TestError = Box<dyn std::error::Error>;
 
+/// The requests `mock` received apart from the Jira field-name cache's `GET /rest/api/2/field`
+/// (PD-46): every Jira harness fills the cache at start, and a token set or a stale map at a
+/// preview build fills it again, outside the test's own steps.
+pub async fn test_hits(mock: &atlas_duck_atlassian::testing::MockDc) -> Vec<wiremock::Request> {
+    let field = mock.path("/rest/api/2/field");
+    mock.received()
+        .await
+        .into_iter()
+        .filter(|r| r.url.path() != field)
+        .collect()
+}
+
 /// The envelope as the agent sees it.
 pub fn json(env: &Envelope) -> Result<Value, TestError> {
     Ok(serde_json::to_value(env)?)

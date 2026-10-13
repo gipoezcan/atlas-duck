@@ -32,6 +32,7 @@ use crate::engine::Engine;
 use crate::engine::write::InstanceChange;
 use crate::identity::{self, RecheckResult};
 use crate::ids::InstanceId;
+use crate::metadata::FieldCache;
 use crate::payloads::{self, CredentialChange};
 use crate::proxy::ProxySetting;
 
@@ -486,6 +487,14 @@ impl CoreInstances {
         });
     }
 
+    /// PD-46: after a passing connection test a Jira instance's field-name cache fills in the
+    /// background.
+    fn fill_field_cache(&self, rt: &InstanceRuntime, id: &str) {
+        if rt.product == Product::Jira {
+            FieldCache::spawn_fill(&self.engine, id);
+        }
+    }
+
     fn target(rt: &InstanceRuntime, id: String, origin: NormalizedBaseUrl) -> Target {
         Target {
             id,
@@ -780,6 +789,7 @@ impl InstanceAdmin for CoreInstances {
             InstanceChange::TokenStored
         };
         self.engine.instance_changed(&id, change).await;
+        self.fill_field_cache(&rt, &id);
         Ok(tested.report)
     }
 
@@ -813,6 +823,7 @@ impl InstanceAdmin for CoreInstances {
         self.engine
             .instance_changed(&id, InstanceChange::TokenStored)
             .await;
+        self.fill_field_cache(&rt, &id);
         Ok(tested.report)
     }
 }

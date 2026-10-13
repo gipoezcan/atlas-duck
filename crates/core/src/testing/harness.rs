@@ -46,14 +46,19 @@ use crate::engine::script::ScriptRunner;
 use crate::gate::UiSink;
 use crate::http_factory::HttpFactory;
 use crate::ids::InstanceId;
-use crate::instances::InstanceAdmin;
 use crate::instances::state::ca_fingerprint;
-use crate::proxy::{OsProxy, SystemProxySource};
+use crate::instances::{AddInstance, AdminError, ConnectionReport, InstanceAdmin, InstanceView};
+use crate::proxy::{OsProxy, ProxySetting, SystemProxySource};
 
 /// The agent name of the harness's default connection.
 pub const HARNESS_AGENT: &str = "test-agent";
 /// The `cwd_basename` every harness connection reports.
 pub const HARNESS_CWD: &str = "workdir";
+/// What every harness Jira mock answers the first `GET /rest/api/2/field` with (the start fill of
+/// the field-name cache, PD-46); later fills get what the test mounts (404 otherwise).
+pub const JIRA_FIELDS: &str = r#"[{"id":"summary","name":"Summary","custom":false,"schema":{"type":"string","system":"summary"}},{"id":"customfield_10100","name":"Story Points","custom":true,"schema":{"type":"number","custom":"com.atlassian.jira.plugin.system.customfieldtypes:float","customId":10100}}]"#;
+/// How long the harness waits for field-name cache fills it started (start, token set).
+const FIELD_CACHE_WAIT: Duration = Duration::from_secs(10);
 
 /// One instance the harness configures, with its own mock server.
 pub struct HarnessInstance {
@@ -261,6 +266,9 @@ impl HarnessBuilder {
                 Product::Confluence => atlas_duck_atlassian::Product::Confluence,
             };
             let mock = MockDc::start(product, context).await;
+            if spec.product == Product::Jira {
+                mock.json_once("/rest/api/2/field", 200, JIRA_FIELDS).await;
+            }
             let id = InstanceId::new()?.0;
             let (base_url, bound) = match &spec.at {
                 Some(at) => (
@@ -347,9 +355,12 @@ impl HarnessBuilder {
             pats_deleted: self.pats_deleted,
             scripts: self.scripts.clone(),
         };
+        // Raw servers answer scripted connections in order: no background fill may take one.
+        let at_raw = self.instances.iter().any(|i| i.at.is_some());
         let hooks = TestHooks {
             limits: self.limits,
             allow_http: !self.strict_https,
+            no_field_cache: self.hooks.no_field_cache || at_raw,
             ..self.hooks
         };
         // `freeze_at` is armed on the plan: the crash point lives in the port layer.
@@ -385,7 +396,11 @@ impl HarnessBuilder {
             store,
         };
         let default_conn = h.conn(HARNESS_AGENT).await?;
-        Ok(Harness { default_conn, ..h })
+        let h = Harness { default_conn, ..h };
+        // The start fills end before the test runs, so their records and hits come first. A
+        // fill held by the test's own fault plan just runs out the wait.
+        h.field_cache_filled().await;
+        Ok(h)
     }
 }
 
@@ -593,6 +608,7 @@ impl Harness {
         self.instances_api = CapturingInstances::wrap(core.instances(), self.capture.clone());
         self.core = core;
         self.default_conn = self.conn(HARNESS_AGENT).await?;
+        self.field_cache_filled().await;
         Ok(())
     }
 
@@ -657,9 +673,43 @@ impl Harness {
         self.decisions.clone()
     }
 
-    /// The capturing instance admin.
+    /// The capturing instance admin. A token set or re-test returns once the field-name cache
+    /// fill it started in the background has ended (bounded), so tests see its records first.
     pub fn instances(&self) -> Arc<dyn InstanceAdmin> {
-        self.instances_api.clone()
+        Arc::new(SettlingInstances {
+            inner: self.instances_api.clone(),
+            engine: self.engine().clone(),
+        })
+    }
+
+    /// Waits until no field-name cache fill is running (PD-46); `false` after 10 s.
+    pub async fn field_cache_filled(&self) -> bool {
+        self.field_cache_filled_within(FIELD_CACHE_WAIT).await
+    }
+
+    /// [`Harness::field_cache_filled`] with the bound given.
+    pub async fn field_cache_filled_within(&self, bound: Duration) -> bool {
+        cache_idle(self.engine(), bound).await
+    }
+
+    /// The field names cached for `alias` now (PD-46).
+    pub fn field_names(&self, alias: &str) -> Option<Arc<crate::metadata::FieldNames>> {
+        let id = self.routed_id(alias)?;
+        self.engine().field_cache().snapshot(&id)
+    }
+
+    /// Fills of `alias` that ended in `metadata_cache_failed`.
+    pub fn field_cache_failures(&self, alias: &str) -> u64 {
+        self.routed_id(alias)
+            .map_or(0, |id| self.engine().field_cache().failures(&id))
+    }
+
+    /// The id the core routes `alias` to.
+    fn routed_id(&self, alias: &str) -> Option<String> {
+        self.engine()
+            .instances()
+            .by_alias(alias)
+            .and_then(|i| i.id.clone())
     }
 
     /// The capturing `UiSink` the core emits into.
@@ -950,5 +1000,64 @@ impl Harness {
         }
         self.evict_candidate(request_id);
         true
+    }
+}
+
+/// Polls until no field-name cache fill runs; `false` once `bound` passed.
+async fn cache_idle(engine: &Engine, bound: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + bound;
+    loop {
+        if engine.field_cache().idle() {
+            return true;
+        }
+        if tokio::time::Instant::now() > deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The capturing instance admin whose token set and re-test return after the field-name cache
+/// fill they started (PD-46) has ended, so the fill's records and hits never interleave with the
+/// test's next step.
+struct SettlingInstances {
+    inner: Arc<CapturingInstances>,
+    engine: Arc<Engine>,
+}
+
+#[async_trait::async_trait]
+impl InstanceAdmin for SettlingInstances {
+    fn list(&self) -> Vec<InstanceView> {
+        self.inner.list()
+    }
+    fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
+        self.inner.add(req)
+    }
+    fn confirm_config_instance(&self, alias: &str) -> Result<InstanceView, AdminError> {
+        self.inner.confirm_config_instance(alias)
+    }
+    fn accept_config_url_change(&self, alias: &str) -> Result<InstanceView, AdminError> {
+        self.inner.accept_config_url_change(alias)
+    }
+    fn change_base_url(&self, alias: &str, new_url: &str) -> Result<InstanceView, AdminError> {
+        self.inner.change_base_url(alias, new_url)
+    }
+    fn set_proxy(&self, alias: &str, proxy: ProxySetting) -> Result<InstanceView, AdminError> {
+        self.inner.set_proxy(alias, proxy)
+    }
+    async fn set_token(
+        &self,
+        alias: &str,
+        pat: secrecy::SecretString,
+        expires_at: Option<chrono::NaiveDate>,
+    ) -> Result<ConnectionReport, AdminError> {
+        let r = self.inner.set_token(alias, pat, expires_at).await;
+        cache_idle(&self.engine, FIELD_CACHE_WAIT).await;
+        r
+    }
+    async fn retest_token(&self, alias: &str) -> Result<ConnectionReport, AdminError> {
+        let r = self.inner.retest_token(alias).await;
+        cache_idle(&self.engine, FIELD_CACHE_WAIT).await;
+        r
     }
 }

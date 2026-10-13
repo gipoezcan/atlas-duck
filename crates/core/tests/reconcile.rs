@@ -168,10 +168,17 @@ async fn start_order_and_pats_deleted() -> TestResult {
             "append:APP_START",
             "append:INSTANCE_STATE_CHANGED",
             "append:INSTANCE_STATE_CHANGED",
+            // PD-46: the field-name cache's start fill follows APP_START (start, result).
+            "append:SYSTEM_FETCH",
+            "append:SYSTEM_FETCH",
         ]
     );
-    // One audit transaction (M3 review M-7).
-    let calls = plan.appends();
+    // One audit transaction (M3 review M-7); the fill's records are appends of their own.
+    let calls: Vec<_> = plan
+        .appends()
+        .into_iter()
+        .filter(|c| c.iter().all(|e| e.event_type != EventType::SYSTEM_FETCH))
+        .collect();
     assert_eq!(
         calls.len(),
         1,

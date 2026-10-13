@@ -11,6 +11,7 @@ use std::sync::Arc;
 use atlas_duck_atlassian::{CoverIssuer, CredentialProvider};
 use atlas_duck_audit::{AuditError, Clock, ReconciledWrite, RestoreReport, Store};
 use atlas_duck_ipc::proto::RequestHandler;
+use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
 
 use crate::audit_port::{AuditPort, CommittedSet, StoreProbe};
@@ -27,7 +28,8 @@ use crate::engine::{Engine, EngineDeps};
 use crate::gate::{UiEvent, UiSink};
 use crate::http_factory::HttpFactory;
 use crate::instances::state::DeriveCtx;
-use crate::instances::{CoreInstances, InstanceAdmin, InstanceTable};
+use crate::instances::{CoreInstances, InstanceAdmin, InstanceState, InstanceTable};
+use crate::metadata::FieldCache;
 use crate::payloads::{self, AppStopReason, ConfigSource};
 use crate::similarity::SimilarityIndex;
 
@@ -160,6 +162,9 @@ pub struct TestHooks {
     /// U-24 (PD-64): every executor context the engine builds carries this fault, so converted
     /// Markdown gets one unrecorded construct appended before the hard check.
     pub converter_fault: Option<crate::testing::ConverterFault>,
+    /// The Jira field-name cache never fills (PD-46): a harness whose instances sit at raw
+    /// servers answering scripted connections in order sets it, so no background GET takes one.
+    pub no_field_cache: bool,
 }
 
 #[cfg(feature = "testing")]
@@ -356,6 +361,19 @@ impl Core {
             ui.emit(UiEvent::StatusBanner {
                 line_ids: vec![crate::reconcile::LINE_CHECK_TARGET.to_owned()],
             });
+        }
+        // PD-46: the field-name cache of every working Jira instance fills in the background,
+        // after `APP_START` (each fill under its own `SYSTEM_FETCH {metadata_cache}`).
+        let jira_ok: Vec<String> = core
+            .engine
+            .instances()
+            .list()
+            .iter()
+            .filter(|i| i.product == Product::Jira && i.state == InstanceState::Ok)
+            .filter_map(|i| i.id.clone())
+            .collect();
+        for id in jira_ok {
+            FieldCache::spawn_fill(&core.engine, &id);
         }
         Ok(core)
     }

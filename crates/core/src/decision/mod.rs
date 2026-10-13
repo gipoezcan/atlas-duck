@@ -38,7 +38,8 @@ use serde_json::Value;
 use crate::edit::{EditError, Edits, apply_edits};
 use crate::engine::cache::{Candidate, RebuildError, build_redacted, source_body};
 use crate::engine::read::{
-    OUTCOME_HINT, ReadContext, caution_count, normalizer, preview_model, release_meta,
+    OUTCOME_HINT, ReadContext, caution_count, normalizer, preview_field_names, preview_model,
+    release_meta,
 };
 use crate::engine::script;
 use crate::engine::write;
@@ -494,7 +495,7 @@ async fn candidate(
     }
 }
 
-fn read_context(entry: &RequestEntry) -> (&Value, ReadContext<'_>) {
+fn read_context<'a>(engine: &Arc<Engine>, entry: &'a RequestEntry) -> (&'a Value, ReadContext<'a>) {
     let params = entry.validated.as_ref().map_or(&Value::Null, |v| &v.params);
     (
         params,
@@ -503,6 +504,7 @@ fn read_context(entry: &RequestEntry) -> (&Value, ReadContext<'_>) {
             alias: &entry.head.instance,
             params,
             target_display: &entry.target_display,
+            field_names: preview_field_names(engine, entry),
         },
     )
 }
@@ -542,7 +544,7 @@ async fn read_preview(
     let Some((read, shown, approvable, opened)) = built else {
         return Ok(None);
     };
-    let (_, cx) = read_context(entry);
+    let (_, cx) = read_context(engine, entry);
     let model = preview_model(&cx, &read, &c);
     let mut warnings = model.warnings;
     warnings.extend(Flags::of(engine, entry).warnings());
@@ -953,7 +955,7 @@ async fn redact(
         also_appears_in,
         ..read
     };
-    let (_, cx) = read_context(entry);
+    let (_, cx) = read_context(engine, entry);
     let caution = caution_count(&preview_model(&cx, &new_read, &c));
     let c = Arc::new(c);
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());

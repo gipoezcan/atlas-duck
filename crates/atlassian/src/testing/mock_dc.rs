@@ -195,6 +195,16 @@ impl MockDc {
         self.mount_any(p, t).await;
     }
 
+    /// Any method on `p`: `status` with a JSON body, for the first request only; later requests
+    /// get whatever is mounted after it (a default a test can still replace).
+    pub async fn json_once(&self, p: &str, status: u16, body: &str) {
+        Mock::given(path(self.path(p)))
+            .respond_with(self.response(status).set_body_raw(body, "application/json"))
+            .up_to_n_times(1)
+            .mount(&self.server)
+            .await;
+    }
+
     /// Any method on `p`: `status` with a JSON body, sent `delay` after the request arrived (a
     /// fetch the test wants to see held in flight).
     pub async fn json_delayed(&self, p: &str, status: u16, body: &str, delay: Duration) {

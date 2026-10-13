@@ -239,7 +239,12 @@ async fn valid_read_is_pending_with_four_fields() -> TestResult {
         events.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
         [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED]
     );
-    assert_eq!(h.mock("jira-main").ok_or("mock")?.received().await.len(), 1);
+    assert_eq!(
+        common::test_hits(h.mock("jira-main").ok_or("mock")?)
+            .await
+            .len(),
+        1
+    );
     // Still only the four routing fields once the read waits for release (§4.5).
     assert!(only_routing_fields(&json(&h.status(&id).await)?));
     Ok(())
@@ -649,9 +654,7 @@ async fn audit_failure_on_received_returns_audit_failure() -> TestResult {
     assert_eq!(h.event_count().await?, before, "nothing committed");
     assert!(h.engine().pending_entries().is_empty(), "nothing queued");
     assert!(
-        h.mock("jira-main")
-            .ok_or("mock")?
-            .received()
+        common::test_hits(h.mock("jira-main").ok_or("mock")?)
             .await
             .is_empty()
     );

@@ -947,7 +947,7 @@ async fn write_approved_append_failure_sends_nothing() -> TestResult {
     assert_eq!(code(&env), "audit_failure");
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(mock.received().await.is_empty(), "nothing was sent");
+    assert!(common::test_hits(mock).await.is_empty(), "nothing was sent");
     assert!(
         records(&h, &id, EventType::WRITE_APPROVED)
             .await?

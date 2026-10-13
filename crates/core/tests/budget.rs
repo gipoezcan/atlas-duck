@@ -178,9 +178,7 @@ async fn x03_storage_low_refuses_nothing_queued() -> TestResult {
     assert_eq!(h.engine().admission().pending_total(), 0);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
-        h.mock("jira-main")
-            .ok_or("no mock")?
-            .received()
+        common::test_hits(h.mock("jira-main").ok_or("no mock")?)
             .await
             .is_empty()
     );

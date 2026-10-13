@@ -1397,6 +1397,7 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
         instance_alias: "",
         params: &Value::Null,
         input: PreviewInput::Read(view),
+        field_names: None,
     });
     m.header.class = "script".to_owned();
     if st.lossy_calls > 0 {

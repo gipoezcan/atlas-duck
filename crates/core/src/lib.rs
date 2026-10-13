@@ -37,6 +37,8 @@ pub mod ids;
 pub mod instances;
 /// Request lifecycle: the pure §5.1 state machine model.
 pub mod lifecycle;
+/// The per-instance Jira field-name cache (`SYSTEM_FETCH {purpose: metadata_cache}`, PD-46).
+pub mod metadata;
 /// Agent-string normalization at `hello`/submit (§3.3, C.0).
 pub mod normalize;
 /// The op table: an `OpImpl` per registry id, read plans, write executors, enrichment and stale

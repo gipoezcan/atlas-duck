@@ -12,7 +12,7 @@ use atlas_duck_convert::markdown_to_wiki;
 use atlas_duck_core::TestHooks;
 use atlas_duck_core::testing::{ConverterFault, Harness};
 use atlas_duck_ipc::envelope::{Envelope, Status};
-use common::{TestError, TestResult, code, de, detail, exit, message, request_id};
+use common::{TestError, TestResult, code, de, detail, exit, message, request_id, test_hits};
 use serde_json::{Value, json};
 
 const COMMENT: &str = "jira.comment.add";
@@ -25,15 +25,9 @@ fn jira(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("jira-main").ok_or_else(|| "no jira mock".into())
 }
 
-/// The requests the mock received apart from the field-name cache's `GET /rest/api/2/field`
-/// (PD-46), which a background fill may send at any time (T7 review M-1).
+/// The requests the mock received apart from the field-name cache's fills (T7 review M-1).
 async fn hits(mock: &MockDc) -> usize {
-    let field = mock.path("/rest/api/2/field");
-    mock.received()
-        .await
-        .iter()
-        .filter(|r| r.url.path() != field)
-        .count()
+    test_hits(mock).await.len()
 }
 
 /// A harness whose converter output gets `fault` appended before the hard check.

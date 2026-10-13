@@ -263,7 +263,7 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
                 let Some(read) = entry.state().read.clone() else {
                     return Err(Fail::Item(BatchFailure::NotPending));
                 };
-                let (_, cx) = read_context(&entry);
+                let (_, cx) = read_context(engine, &entry);
                 preview_model(&cx, &read, &c).warnings
             };
             (Natural::Release(c), warnings)

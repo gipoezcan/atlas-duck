@@ -359,6 +359,8 @@ pub(crate) fn preview_model(
             enrichment: Some(&w.verdict),
             failure: w.failure.as_ref().map(|f| &f.card),
         }),
+        // PD-46 feeds Jira read previews only.
+        field_names: None,
     });
     if let Some(lead) = w
         .returned

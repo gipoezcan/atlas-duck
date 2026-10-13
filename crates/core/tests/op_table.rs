@@ -1205,6 +1205,7 @@ fn read_preview(
             more_available: more,
             clamped,
         }),
+        field_names: None,
     };
     Ok((imp.previewer)(&ctx))
 }
@@ -1382,6 +1383,7 @@ fn write_preview(
             enrichment,
             failure,
         }),
+        field_names: None,
     };
     Ok((imp.previewer)(&ctx))
 }

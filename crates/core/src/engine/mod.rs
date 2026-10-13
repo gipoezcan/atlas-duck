@@ -639,6 +639,8 @@ pub struct Engine {
     clients: Mutex<HashMap<String, Arc<InstanceHttp>>>,
     /// One token re-check in flight per instance (Task 26).
     identity: crate::identity::Gates,
+    /// The Jira field-name cache (PD-46).
+    field_cache: crate::metadata::FieldCache,
     runtime: tokio::runtime::Handle,
     similarity: SimilarityIndex,
     expiry: Duration,
@@ -686,6 +688,7 @@ impl Engine {
             terminal_rows: Arc::new(Mutex::new(Recent::new(RECENT_MEMO))),
             clients: Mutex::new(HashMap::new()),
             identity: crate::identity::Gates::default(),
+            field_cache: crate::metadata::FieldCache::default(),
             runtime: d.runtime,
             similarity: d.similarity,
             expiry,
@@ -808,6 +811,11 @@ impl Engine {
 
     pub(crate) fn identity_gates(&self) -> &crate::identity::Gates {
         &self.identity
+    }
+
+    /// The per-instance Jira field-name cache (PD-46).
+    pub(crate) fn field_cache(&self) -> &crate::metadata::FieldCache {
+        &self.field_cache
     }
 
     /// The instance's identity epoch (Task 26): read before a call, passed to

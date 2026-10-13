@@ -83,8 +83,9 @@ async fn file_side(h: &Harness) -> Result<Vec<Value>, Box<dyn std::error::Error>
         .collect())
 }
 
+/// Nothing reached the mock but the field-name cache's start fill (PD-46).
 async fn no_traffic(mock: &MockDc) -> bool {
-    mock.received().await.is_empty()
+    common::test_hits(mock).await.is_empty()
 }
 
 // ---- I-02: https only ---------------------------------------------------------------------
@@ -428,7 +429,13 @@ async fn connection_test_logs_system_fetch() -> TestResult {
     assert_eq!(report.atlassian_user, TEST_USER);
     assert_eq!(report.version, "9.12.0");
     assert!(report.warnings.is_empty());
-    let fetches = h.events_of(EventType::SYSTEM_FETCH).await?;
+    // The field-name cache's own fills (PD-46: at start, after the token was set) aside.
+    let fetches: Vec<Value> = h
+        .events_of(EventType::SYSTEM_FETCH)
+        .await?
+        .into_iter()
+        .filter(|f| f["purpose"] != "metadata_cache")
+        .collect();
     let phases: Vec<&str> = fetches.iter().filter_map(|f| f["phase"].as_str()).collect();
     assert_eq!(phases, ["start", "result", "result"], "{fetches:?}");
     assert!(fetches.iter().all(|f| f["purpose"] == "connection_test"));
@@ -455,7 +462,9 @@ async fn connection_test_logs_system_fetch() -> TestResult {
     let h = jira_without_pat().await?;
     let mock = h.mock("jira-main").ok_or("mock")?;
     jira_answers(mock, TEST_USER, TEST_USER_KEY, "9.12.0").await;
-    h.plan().fail_nth(EventType::SYSTEM_FETCH, 1);
+    // The next `SYSTEM_FETCH` append after the start fill's (PD-46) is the connection test's.
+    let next = h.plan().attempts(EventType::SYSTEM_FETCH) + 1;
+    h.plan().fail_nth(EventType::SYSTEM_FETCH, next);
     let res = h
         .instances()
         .set_token("jira-main", pat("fresh-pat"), None)

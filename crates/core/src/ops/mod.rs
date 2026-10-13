@@ -247,6 +247,9 @@ pub struct PreviewCtx<'a> {
     /// The params that run (reads: the validated params).
     pub params: &'a Value,
     pub input: PreviewInput<'a>,
+    /// Δ5 (PD-46): the instance's cached `/rest/api/2/field` id → name map for Jira reads, as
+    /// it was when the preview was built; `None` = unknown (ids shown). Display-only.
+    pub field_names: Option<&'a crate::metadata::FieldNames>,
 }
 
 pub enum PreviewInput<'a> {

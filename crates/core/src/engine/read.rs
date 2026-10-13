@@ -31,7 +31,7 @@ use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::{
     Level, OutcomeKind as CardKind, PreviewBody, PreviewHeader, cap_error_text,
 };
-use atlas_duck_registry::{OperationSpec, RELEASE_CAP_BYTES};
+use atlas_duck_registry::{OperationSpec, Product, RELEASE_CAP_BYTES};
 use serde_json::{Map, Value, json};
 use tokio::sync::OwnedSemaphorePermit;
 
@@ -42,6 +42,7 @@ use crate::gate::{AttentionKind, UiEvent};
 use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
 use crate::lifecycle::model::{Event, ReleaseItem};
+use crate::metadata::{FieldCache, FieldNames};
 use crate::ops::generic::{count_value, fallback_preview, invisible_warnings, query_display};
 use crate::ops::{ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table};
 use crate::payloads::{self, CapOrBudget, EventCtx, OutcomeKind, ReadFetched};
@@ -846,6 +847,22 @@ pub(crate) struct ReadContext<'a> {
     pub alias: &'a str,
     pub params: &'a Value,
     pub target_display: &'a str,
+    /// The cached Jira field names ([`preview_field_names`]); `None` for Confluence.
+    pub field_names: Option<Arc<FieldNames>>,
+}
+
+/// The field names a read preview of `entry` shows (PD-46): for a Jira read, the instance's
+/// cached map as it is now. A map whose last fill started at least `FIELD_CACHE_TTL` ago is
+/// refreshed in the background; this preview never waits for it.
+pub(crate) fn preview_field_names(
+    engine: &Arc<Engine>,
+    entry: &RequestEntry,
+) -> Option<Arc<FieldNames>> {
+    if entry.spec.product != Product::Jira {
+        return None;
+    }
+    FieldCache::refresh_if_stale(engine, &entry.instance_id);
+    engine.field_cache().snapshot(&entry.instance_id)
 }
 
 /// Records the fetch and applies `Fetched(item)` (rev 1) or `FetchFailedDirect`.
@@ -873,6 +890,7 @@ async fn settle(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, classified: Cla
                 .map(|v| v.params.clone())
                 .unwrap_or(Value::Null);
             let (alias, target) = (entry.head.instance.clone(), entry.target_display.clone());
+            let field_names = preview_field_names(engine, entry);
             // Normalizing up to 50 MiB of pages and building the preview is CPU work.
             let built = tokio::task::spawn_blocking(move || {
                 let cx = ReadContext {
@@ -880,6 +898,7 @@ async fn settle(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, classified: Cla
                     alias: &alias,
                     params: &params,
                     target_display: &target,
+                    field_names,
                 };
                 // A 2xx body the client accepted that the candidate cannot be built from (e.g.
                 // JSON nested deeper than `serde_json::Value` parses) depends on the content:
@@ -1207,6 +1226,7 @@ pub(crate) fn preview_model(cx: &ReadContext<'_>, read: &ReadState, c: &Candidat
                     more_available: read.more_available,
                     clamped: read.clamped,
                 }),
+                field_names: cx.field_names.as_deref(),
             })
         }
         ReleaseItem::UpstreamError => {
