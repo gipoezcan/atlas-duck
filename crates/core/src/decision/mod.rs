@@ -1379,17 +1379,25 @@ async fn edit_write(
 }
 
 /// §5.4 step 2: "no issue type named 'Bugg' in ABC" (app-generated; the value is the agent's).
-fn resolution_message(params: &Value, param: &str, value: &str) -> String {
+/// Keyed by the op and the param (T16 review M7): another op's param of the same name gets the
+/// generic text, never one that names the wrong kind of thing.
+fn resolution_message(op: &str, params: &Value, param: &str, value: &str) -> String {
     let value = echo(value);
     // The agent's own values (never a resolved one: that would be fetched data), escaped.
     let of = |name: &str| echo(params.get(name).and_then(Value::as_str).unwrap_or_default());
-    match param {
-        "issuetype" => format!("no issue type named '{value}' in {}", of("project")),
-        "transition" => format!("no transition named '{value}' for {}", of("key")),
+    match (op, param) {
+        ("jira.issue.create", "issuetype") => {
+            format!("no issue type named '{value}' in {}", of("project"))
+        }
+        ("jira.issue.transition", "transition") => {
+            format!("no transition named '{value}' for {}", of("key"))
+        }
         // PD-62 (plan text).
-        "assignee" => format!("no assignable user '{value}' for {}", of("key")),
-        // PD-62 (plan text): `jira.issuelink.create`.
-        "type" => format!("no issue link type named '{value}'"),
+        ("jira.issue.assign", "assignee") => {
+            format!("no assignable user '{value}' for {}", of("key"))
+        }
+        // PD-62 (plan text).
+        ("jira.issuelink.create", "type") => format!("no issue link type named '{value}'"),
         _ => format!("no {param} named '{value}'"),
     }
 }
@@ -1451,7 +1459,12 @@ fn deny_hint(entry: &RequestEntry, details: DenyDetails) -> Result<Value, Decisi
             d.insert("value".into(), Value::from(echo(value)));
             d.insert(
                 "message".into(),
-                Value::from(resolution_message(&snap.write.params, param, value)),
+                Value::from(resolution_message(
+                    entry.spec.id,
+                    &snap.write.params,
+                    param,
+                    value,
+                )),
             );
             if include_candidates {
                 d.insert("candidates".into(), serde_json::json!(candidates));

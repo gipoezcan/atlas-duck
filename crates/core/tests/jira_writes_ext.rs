@@ -24,7 +24,7 @@ use atlas_duck_core::{
     BatchFailure, BatchItem, Confirm, DecisionError, DecisionOutcome, DenyDetails, Edits, QueueItem,
 };
 use atlas_duck_ipc::envelope::{Envelope, Status};
-use atlas_duck_preview::{ConstructList, Preview, PreviewBody, WarningId};
+use atlas_duck_preview::{ConstructList, Level, Preview, PreviewBody, Warning, WarningId};
 use common::jira::{
     PROJECTS_PATH, gets_on, issue_path, issuetypes_path, mount_assignable, mount_issue,
     mount_link_types, query,
@@ -1241,13 +1241,18 @@ fn issuelink_body_and_sentence() -> TestResult {
     });
     assert_eq!(link_wire(&params, &v)?, want);
     let card = link_card(&preview_as(LINK, &params, &v)?)?;
-    assert_eq!(card.sentence, "ABC-124 blocks ABC-123 (Blocks)");
+    assert_eq!(
+        card.sentence,
+        r#"ABC-124 "blocks" ABC-123 (link type "Blocks")"#
+    );
     // What Jira shows on the other issue: the same link read from its other end.
     assert_eq!(
         link_row(&card, "Reads as"),
-        Some("ABC-123 is blocked by ABC-124")
+        Some(r#"ABC-123 "is blocked by" ABC-124"#)
     );
     assert_eq!(link_row(&card, "Link type"), Some("Blocks (10000)"));
+    assert_eq!(link_row(&card, "Outward phrase"), Some("blocks"));
+    assert_eq!(link_row(&card, "Inward phrase"), Some("is blocked by"));
     assert_eq!(link_row(&card, "Sent as link type name"), Some("Blocks"));
     assert_eq!(
         link_row(&card, "Inward issue (inwardIssue)"),
@@ -1273,7 +1278,10 @@ fn issuelink_body_and_sentence() -> TestResult {
         assert_eq!(v.hold, Hold::Preview, "{named}: {v:?}");
         assert_eq!(link_wire(&params, &v)?, want, "{named}");
         let card = link_card(&preview_as(LINK, &params, &v)?)?;
-        assert_eq!(card.sentence, "ABC-124 blocks ABC-123 (Blocks)", "{named}");
+        assert_eq!(
+            card.sentence, r#"ABC-124 "blocks" ABC-123 (link type "Blocks")"#,
+            "{named}"
+        );
     }
 
     // A comment is sent verbatim as wiki markup (PD-42) and its constructs are listed (PD-47).
@@ -1291,10 +1299,13 @@ fn issuelink_body_and_sentence() -> TestResult {
         })
     );
     let card = link_card(&preview_as(LINK, &params, &v)?)?;
-    assert_eq!(card.sentence, "ABC-124 duplicates ABC-123 (Duplicate)");
+    assert_eq!(
+        card.sentence,
+        r#"ABC-124 "duplicates" ABC-123 (link type "Duplicate")"#
+    );
     assert_eq!(
         link_row(&card, "Reads as"),
-        Some("ABC-123 is duplicated by ABC-124")
+        Some(r#"ABC-123 "is duplicated by" ABC-124"#)
     );
     let comment = link_row(&card, "Comment").ok_or("no comment row")?;
     assert!(comment.contains("Linked:"), "{comment}");
@@ -1434,18 +1445,54 @@ fn i35_link_type_no_match_and_ambiguous() -> TestResult {
 }
 
 /// The executor's static checks run at validation (before the enrichment is there): a link of
-/// an issue to itself and a blank comment are refused; only a `Preview` verdict renders.
+/// an issue to itself (also through a key that differs only in the project key's case or the
+/// number's leading zeros, T16 review M4), a blank type and a blank comment are refused (T16
+/// review M5: both blank texts alike, as the schema's `minLength` refuses an empty one); only a
+/// `Preview` verdict renders.
 #[test]
 fn issuelink_executor_static_checks() -> TestResult {
     let invalid_param = |r: Result<ExecPlan, ExecError>| match r {
         Err(ExecError::Invalid(e)) => e.details.get("param").cloned(),
         _ => None,
     };
-    let selflink = json!({"type": "Blocks", "inward": "ABC-1", "outward": "ABC-1"});
-    assert_eq!(
-        invalid_param(exec_as(LINK, &selflink, None)),
-        Some(json!("outward"))
-    );
+    for (inward, outward) in [
+        ("ABC-1", "ABC-1"),
+        ("ABC-01", "ABC-1"),
+        ("ABC-1", "ABC-001"),
+        ("abc-1", "ABC-1"),
+        ("Abc_2-10", "ABC_2-010"),
+        ("ABC-0", "ABC-00"),
+    ] {
+        let selflink = json!({"type": "Blocks", "inward": inward, "outward": outward});
+        assert_eq!(
+            invalid_param(exec_as(LINK, &selflink, None)),
+            Some(json!("outward")),
+            "{inward} / {outward}"
+        );
+    }
+    // Other issues: another number (leading zeros only where they are), another project.
+    for (inward, outward) in [
+        ("ABC-10", "ABC-1"),
+        ("ABC-100", "ABC-10"),
+        ("ABC-1", "ABD-1"),
+        ("AB-11", "ABC-1"),
+        ("ABC-0", "ABC-10"),
+    ] {
+        let other = json!({"type": "Blocks", "inward": inward, "outward": outward});
+        assert_eq!(
+            exec_as(LINK, &other, None),
+            Err(ExecError::EnrichmentRequired),
+            "{inward} / {outward}"
+        );
+    }
+    for blank in [" ", "\t\n"] {
+        let params = link_params(blank);
+        assert_eq!(
+            invalid_param(exec_as(LINK, &params, None)),
+            Some(json!("type")),
+            "{blank:?}"
+        );
+    }
     for blank in ["  ", "\n\t"] {
         let mut params = link_params("Blocks");
         params["comment"] = json!(blank);
@@ -1499,12 +1546,13 @@ fn issuelink_card_keeps_sent_values_in_view() -> TestResult {
     let m = preview_as(LINK, &params, &v)?;
     let card = link_card(&m)?;
     assert!(
-        card.sentence.starts_with("ABC-124 blocks⟨U+2060⟩"),
+        card.sentence.starts_with(r#"ABC-124 "blocks⟨U+2060⟩"#),
         "{}",
         card.sentence
     );
     assert!(
-        card.sentence.ends_with("… ABC-123 (Blocks)"),
+        card.sentence
+            .ends_with(r#"…" ABC-123 (link type "Blocks")"#),
         "{}",
         card.sentence
     );
@@ -1541,7 +1589,7 @@ fn issuelink_card_keeps_sent_values_in_view() -> TestResult {
     }
     assert_eq!(
         link_row(&card, "Reads as"),
-        Some("ABC-123 is⟨U+202E⟩ blocked by ABC-124")
+        Some(r#"ABC-123 "is⟨U+202E⟩ blocked by" ABC-124"#)
     );
     assert!(m.header.bidi_controls >= 1);
     assert!(
@@ -1564,10 +1612,138 @@ fn issuelink_card_keeps_sent_values_in_view() -> TestResult {
     let card = link_card(&preview_as(LINK, &params, &v)?)?;
     assert_eq!(
         card.sentence,
-        "Link ABC-124 to ABC-123 with link type Relates (enrichment resolved Blocks)"
+        r#"Link ABC-124 to ABC-123 with link type "Relates" (enrichment resolved "Blocks")"#
     );
     assert_eq!(link_row(&card, "Reads as"), None);
     assert_eq!(link_row(&card, "Sent as link type name"), Some("Relates"));
+    Ok(())
+}
+
+/// The T16 review I1 Caution of a preview, as `(wire id, level, text)`.
+fn inward_phrase_cautions(warnings: &[Warning]) -> Result<Vec<(Value, Level, String)>, TestError> {
+    let mut found = Vec::new();
+    for w in warnings {
+        let id = serde_json::to_value(w.id)?;
+        if id == json!("link_type_inward_phrase") || w.text.starts_with("link type named by") {
+            found.push((id, w.level, w.text.clone()));
+        }
+    }
+    Ok(found)
+}
+
+/// T16 review I1: a type named only by its inward phrase links the other way round from the
+/// agent's wording (`"ABC-1" "is blocked by" "ABC-2"` sends "ABC-1 blocks ABC-2"), so a Caution
+/// names the phrase and the one the inward issue gets. Named by its id, its name or its outward
+/// phrase, or by the phrase of a type whose phrases read the same both ways, nothing is raised.
+#[test]
+fn issuelink_named_by_inward_phrase_is_a_caution() -> TestResult {
+    let types = types_answer(default_types());
+    let raised = |kind: &str| -> Result<Vec<(Value, Level, String)>, TestError> {
+        let params = json!({"type": kind, "inward": "ABC-1", "outward": "ABC-2"});
+        let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+        // A Caution, never a block.
+        assert_eq!(v.hold, Hold::Preview, "{kind}: {v:?}");
+        inward_phrase_cautions(&preview_as(LINK, &params, &v)?.warnings)
+    };
+    let want = |phrase: &str, outward: &str| {
+        vec![(
+            json!("link_type_inward_phrase"),
+            Level::Caution,
+            format!(
+                "link type named by its inward phrase '{phrase}': the inward issue gets the outward phrase '{outward}'"
+            ),
+        )]
+    };
+    assert_eq!(raised("is blocked by")?, want("is blocked by", "blocks"));
+    assert_eq!(raised("IS BLOCKED BY")?, want("is blocked by", "blocks"));
+    assert_eq!(
+        raised("is duplicated by")?,
+        want("is duplicated by", "duplicates")
+    );
+    // The card still reads the link as it is sent.
+    let params = json!({"type": "is blocked by", "inward": "ABC-1", "outward": "ABC-2"});
+    let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+    let card = link_card(&preview_as(LINK, &params, &v)?)?;
+    assert_eq!(
+        card.sentence,
+        r#"ABC-1 "blocks" ABC-2 (link type "Blocks")"#
+    );
+    for quiet in [
+        "Blocks",
+        "blocks",
+        "10000",
+        "BLOCKS",
+        "relates to",
+        "Relates",
+    ] {
+        assert_eq!(raised(quiet)?, Vec::new(), "{quiet}");
+    }
+    // A value that is the inward phrase of the type and also its name: named by its name.
+    let named = types_answer(vec![link_type(
+        "10040",
+        "is part of",
+        "is part of",
+        "contains",
+    )]);
+    let params = json!({"type": "is part of", "inward": "ABC-1", "outward": "ABC-2"});
+    let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&named))?;
+    assert_eq!(v.hold, Hold::Preview, "{v:?}");
+    assert_eq!(
+        inward_phrase_cautions(&preview_as(LINK, &params, &v)?.warnings)?,
+        Vec::new()
+    );
+    // Server text in the Caution is escaped and on one line.
+    let odd = types_answer(vec![link_type(
+        "10050",
+        "Odd",
+        "is\u{202e} odd\nto",
+        "odds",
+    )]);
+    let params = json!({"type": "is\u{202e} odd\nto", "inward": "ABC-1", "outward": "ABC-2"});
+    let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&odd))?;
+    let found = inward_phrase_cautions(&preview_as(LINK, &params, &v)?.warnings)?;
+    let (_, _, text) = found.first().ok_or("no Caution")?;
+    assert!(text.contains("'is⟨U+202E⟩ odd⟨U+000A⟩to'"), "{text}");
+    assert!(!text.contains('\u{202e}') && !text.contains('\n'), "{text}");
+    Ok(())
+}
+
+/// T16 review M2: server text on the link card is quoted in the sentence (a `"` or `\` in it
+/// escaped), so a phrase or name that holds an issue key never reads as part of the link; the
+/// phrases have rows of their own.
+#[test]
+fn issuelink_server_text_is_delimited() -> TestResult {
+    let types = types_answer(vec![link_type(
+        "10000",
+        "Blocks\" ABC-7 \"x",
+        "is blocked by ABC-8\\",
+        "blocks ABC-9",
+    )]);
+    let params = link_params("10000");
+    let (_, v) = enrich_as(LINK, &params, std::slice::from_ref(&types))?;
+    assert_eq!(v.hold, Hold::Preview, "{v:?}");
+    let card = link_card(&preview_as(LINK, &params, &v)?)?;
+    assert_eq!(
+        card.sentence,
+        r#"ABC-124 "blocks ABC-9" ABC-123 (link type "Blocks\" ABC-7 \"x")"#
+    );
+    assert_eq!(
+        link_row(&card, "Reads as"),
+        Some(r#"ABC-123 "is blocked by ABC-8\\" ABC-124"#)
+    );
+    assert_eq!(link_row(&card, "Outward phrase"), Some("blocks ABC-9"));
+    assert_eq!(
+        link_row(&card, "Inward phrase"),
+        Some("is blocked by ABC-8\\")
+    );
+    assert_eq!(
+        link_row(&card, "Inward issue (inwardIssue)"),
+        Some("ABC-124")
+    );
+    assert_eq!(
+        link_row(&card, "Outward issue (outwardIssue)"),
+        Some("ABC-123")
+    );
     Ok(())
 }
 
@@ -1721,8 +1897,9 @@ async fn i25_comment_add_empty_200_outcome_unknown() -> TestResult {
 }
 
 /// L06: the issue keys are read-only targets; the type and the comment can be edited, and an
-/// edited type is resolved again (§5.4 step 4). A self-link is refused at validation (exit 2,
-/// nothing fetched, nothing queued).
+/// edited type is resolved again (§5.4 step 4). A self-link and a blank type are refused at
+/// validation (exit 2, nothing fetched, nothing queued), and so is an edit to a blank type or
+/// comment (T16 review M5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn issuelink_edit_form_and_type_edit() -> TestResult {
     let h = Harness::jira().await?;
@@ -1755,9 +1932,29 @@ async fn issuelink_edit_form_and_type_edit() -> TestResult {
     assert!(item.approvable);
     assert_eq!(purposes(&h, &id).await?, ["resolve", "resolve"]);
     let (sentence, _) = card_rows(&opened(&h, &id)?)?;
-    assert_eq!(sentence, "ABC-124 relates to ABC-123 (Relates)");
-    // An edit to a blank comment is refused by the executor's check: nothing changes.
+    assert_eq!(
+        sentence,
+        r#"ABC-124 "relates to" ABC-123 (link type "Relates")"#
+    );
+    // An edit to a blank type or a blank comment is refused by the executor's check: nothing
+    // changes, nothing is fetched.
     let rev = h.approver().rev(&id).map_err(de)?;
+    let mut set = Map::new();
+    set.insert("type".into(), json!("  "));
+    match h.approver().edit(
+        &id,
+        Edits {
+            set,
+            remove: Vec::new(),
+        },
+    ) {
+        Err(DecisionError::EditRejected(e)) => {
+            assert_eq!(e.details.get("param"), Some(&json!("type")));
+        }
+        other => return Err(format!("blank type edit not refused: {other:?}").into()),
+    }
+    assert_eq!(h.approver().rev(&id).map_err(de)?, rev);
+    assert_eq!(purposes(&h, &id).await?, ["resolve", "resolve"]);
     let comment = |text: &str| {
         let mut set = Map::new();
         set.insert("comment".into(), json!(text));
@@ -1788,20 +1985,31 @@ async fn issuelink_edit_form_and_type_edit() -> TestResult {
     assert_eq!(body["type"], json!({"name": "Relates"}));
     assert_eq!(body["comment"], json!({"body": "Linked {code}x{code}"}));
 
-    // Linking an issue to itself: rejected at validation.
-    let env = h
-        .submit(
-            LINK,
+    // Linking an issue to itself (also as `ABC-07`), or naming a blank type: rejected at
+    // validation.
+    for (params, param) in [
+        (
             json!({"type": "Blocks", "inward": "ABC-7", "outward": "ABC-7"}),
-        )
-        .await;
-    assert_eq!(
-        (env.status, exit(&env), code(&env)),
-        (Status::Failed, 2, "validation".to_owned()),
-        "{}",
-        env.to_json_line()
-    );
-    assert_eq!(detail(&env, "param"), "outward");
+            "outward",
+        ),
+        (
+            json!({"type": "Blocks", "inward": "ABC-07", "outward": "ABC-7"}),
+            "outward",
+        ),
+        (
+            json!({"type": " \t", "inward": "ABC-7", "outward": "ABC-8"}),
+            "type",
+        ),
+    ] {
+        let env = h.submit(LINK, params.clone()).await;
+        assert_eq!(
+            (env.status, exit(&env), code(&env)),
+            (Status::Failed, 2, "validation".to_owned()),
+            "{params}: {}",
+            env.to_json_line()
+        );
+        assert_eq!(detail(&env, "param"), param, "{params}");
+    }
     assert_eq!(gets_on(mock, LINK_TYPES).await.len(), 2, "no further GET");
     Ok(())
 }

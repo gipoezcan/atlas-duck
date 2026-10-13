@@ -240,9 +240,9 @@ pub(crate) const WORKLOG_ADD_RESULT: &str = r#"{"type":"object","additionalPrope
 pub(crate) const ISSUELINK_CREATE_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
  "required":["type","inward","outward"],
  "properties":{
-  "type":{"type":"string","minLength":1,"description":"Link type name; the app resolves it."},
-  "inward":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},
-  "outward":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},
+  "type":{"type":"string","minLength":1,"description":"Link type name (or id, or one of its phrases); the app resolves it. A phrase never changes the direction: the link always reads from inward to outward with the type's outward phrase."},
+  "inward":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$","description":"Issue the link starts from (sent as inwardIssue): it gets the type's outward phrase, e.g. with type Blocks this issue blocks outward."},
+  "outward":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$","description":"Issue the outward phrase points at (sent as outwardIssue), e.g. with type Blocks this issue is blocked by inward."},
   "comment":{"type":"string","minLength":1,"maxLength":32768}},
  "examples":[{"type":"Blocks","inward":"ABC-124","outward":"ABC-123"}]}"#;
 

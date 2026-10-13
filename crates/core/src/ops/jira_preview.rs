@@ -1401,8 +1401,10 @@ pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
 /// second issue to the first issue using the inward description"; the first issue is
 /// `inwardIssue` (the order of its example and schema). The issue-link model of a read agrees: an
 /// issue whose link names an `inwardIssue` labels it with the inward phrase, so the issue in the
-/// inward slot is where the outward phrase starts. `"ABC-124 blocks ABC-123"` for
-/// `inwardIssue: ABC-124, outwardIssue: ABC-123` of `Blocks`. (T24 live probe: confirm.)
+/// inward slot is where the outward phrase starts. `ABC-124 "blocks" ABC-123` for
+/// `inwardIssue: ABC-124, outwardIssue: ABC-123` of `Blocks` (the phrases come [`quoted`]).
+/// (T24 live probe: confirm; a flip changes this, the pinned card strings, the registry's param
+/// descriptions and the inward-phrase Caution, see the T24 checklist in the M5 plan.)
 fn link_sentences(
     inward_issue: &str,
     outward_issue: &str,
@@ -1415,10 +1417,26 @@ fn link_sentences(
     )
 }
 
+/// Server text in a card sentence, between `"` with each `"` and `\` in it escaped by a `\`
+/// (T16 review M2): text such as `blocks ABC-9` never reads as part of the sentence around it.
+fn quoted(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for c in raw.chars() {
+        if matches!(c, '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
 /// §6.3 link: the `jira.issuelink.create` card over the exact request (§5.1 inv. 4). Read from the
 /// request that is sent (T12 review M4): the sentence in the direction Jira reads it
 /// ([`link_sentences`]) with the type's name, the link read from the other issue, the type's name
-/// and id, the sent type name alone, each issue key in a row of its own, and the comment as the
+/// and id, each phrase and the sent type name alone, each issue key in a row of its own (in the
+/// sentences the server text is [`quoted`], T16 review M2), and the comment as the
 /// text of its wiki markup with its constructs (PD-42, PD-47: sent verbatim). The type's name and
 /// phrases are server text: each cut short ([`short_server_text`]), so they never push an issue
 /// key out of the sentence, and their invisible characters count into the §6.4 Cautions; the sent
@@ -1466,19 +1484,32 @@ pub fn issuelink_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
             let name = short_server_text(&t.name, &mut hidden);
             let inward_phrase = short_server_text(&t.inward, &mut hidden);
             let outward_phrase = short_server_text(&t.outward, &mut hidden);
-            let (reads, back) = link_sentences(inward, outward, &inward_phrase, &outward_phrase);
+            let (reads, back) = link_sentences(
+                inward,
+                outward,
+                &quoted(&inward_phrase),
+                &quoted(&outward_phrase),
+            );
             rows.push((
                 "Link type".to_owned(),
                 line(&format!("{name} ({})", t.id), cap, &mut hidden),
             ));
+            rows.push((
+                "Outward phrase".to_owned(),
+                line(&outward_phrase, cap, &mut hidden),
+            ));
+            rows.push((
+                "Inward phrase".to_owned(),
+                line(&inward_phrase, cap, &mut hidden),
+            ));
             reads_back = Some(back);
-            format!("{reads} ({name})")
+            format!("{reads} (link type {})", quoted(&name))
         }
         None => {
-            let sent = short_server_text(sent_type, &mut hidden);
+            let sent = quoted(&short_server_text(sent_type, &mut hidden));
             match other {
                 Some(other) => {
-                    let other = short_server_text(other, &mut hidden);
+                    let other = quoted(&short_server_text(other, &mut hidden));
                     format!(
                         "Link {inward} to {outward} with link type {sent} (enrichment resolved {other})"
                     )

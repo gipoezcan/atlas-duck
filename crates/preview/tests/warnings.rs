@@ -5,7 +5,7 @@ use atlas_duck_preview::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const C6_CAUTION: [&str; 22] = [
+const C6_CAUTION: [&str; 23] = [
     "restricted_comments",
     "security_level",
     "all_fields",
@@ -28,6 +28,7 @@ const C6_CAUTION: [&str; 22] = [
     "instance_url_changed",
     "diff_truncated",
     "no_current_value",
+    "link_type_inward_phrase",
 ];
 const C6_INFO: [&str; 9] = [
     "linked_issue_summaries",
@@ -61,7 +62,7 @@ fn every_warning_id_has_exactly_one_level() -> TestResult {
     assert_eq!(info, C6_INFO);
     let mut all = WarningId::ALL.to_vec();
     all.dedup();
-    assert_eq!(all.len(), 31);
+    assert_eq!(all.len(), 32);
     Ok(())
 }
 
@@ -146,6 +147,11 @@ fn parameterized_texts() {
     assert_eq!(
         no_current_value(2),
         "2 fields shown as sent, without their current value"
+    );
+    // T16 review I1: a link type named by its inward phrase.
+    assert_eq!(
+        link_type_inward_phrase("is blocked by", "blocks"),
+        "link type named by its inward phrase 'is blocked by': the inward issue gets the outward phrase 'blocks'"
     );
     assert_eq!(
         lossy_update(1, 2, 3),

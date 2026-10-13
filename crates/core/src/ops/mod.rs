@@ -359,7 +359,8 @@ impl fmt::Debug for JiraUser {
 }
 
 /// T16: an issue link type as enrichment read it (raw server text). The request names it by
-/// `name` (PD-53); the link card reads `outward` from the `inwardIssue` and `inward` back.
+/// `name` (PD-53); the link card reads `outward` from the `inwardIssue` and `inward` back
+/// (direction pending the T24 live probe).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct JiraLinkType {
     pub id: String,

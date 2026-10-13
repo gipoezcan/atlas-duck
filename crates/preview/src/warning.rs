@@ -40,6 +40,9 @@ pub enum WarningId {
     /// M5 T13 review M-1: an edit section shows what is sent without the field's current value
     /// (no baseline for it, or an operation list that sets the value), so it is not a diff.
     NoCurrentValue,
+    /// M5 T16 review I1: a `jira.issuelink.create` type named only by its inward phrase, so the
+    /// link reads the other way round from the agent's wording.
+    LinkTypeInwardPhrase,
     // Info
     LinkedIssueSummaries,
     CustomFields,
@@ -54,7 +57,7 @@ pub enum WarningId {
 }
 
 impl WarningId {
-    pub const ALL: [WarningId; 31] = [
+    pub const ALL: [WarningId; 32] = [
         WarningId::RestrictedComments,
         WarningId::SecurityLevel,
         WarningId::AllFields,
@@ -77,6 +80,7 @@ impl WarningId {
         WarningId::InstanceUrlChanged,
         WarningId::DiffTruncated,
         WarningId::NoCurrentValue,
+        WarningId::LinkTypeInwardPhrase,
         WarningId::LinkedIssueSummaries,
         WarningId::CustomFields,
         WarningId::TruncatedByCap,
@@ -111,7 +115,8 @@ impl WarningId {
             | WarningId::UserRenamed
             | WarningId::InstanceUrlChanged
             | WarningId::DiffTruncated
-            | WarningId::NoCurrentValue => Level::Caution,
+            | WarningId::NoCurrentValue
+            | WarningId::LinkTypeInwardPhrase => Level::Caution,
             WarningId::LinkedIssueSummaries
             | WarningId::CustomFields
             | WarningId::TruncatedByCap
@@ -256,6 +261,14 @@ pub fn diff_truncated(n: u64) -> String {
 /// section lists the sent value (or operations) as added lines only.
 pub fn no_current_value(n: u64) -> String {
     format!("{n} fields shown as sent, without their current value")
+}
+
+/// plan text (M5 T16 review I1): "link type named by its inward phrase 'is blocked by': the
+/// inward issue gets the outward phrase 'blocks'"; the caller display-escapes both phrases.
+pub fn link_type_inward_phrase(inward: &str, outward: &str) -> String {
+    format!(
+        "link type named by its inward phrase '{inward}': the inward issue gets the outward phrase '{outward}'"
+    )
 }
 
 /// "this update will remove N macros / M images / K links" (§7.6)

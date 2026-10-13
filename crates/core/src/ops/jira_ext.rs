@@ -3,6 +3,8 @@
 //! the stale-check baseline; `jira.issuelink.create` (T16, PD-53), with the link-type resolution.
 
 use atlas_duck_atlassian::{GetCall, UsernameMatcher};
+use atlas_duck_preview::invisible::escape_for_display;
+use atlas_duck_preview::warning::{self, Warning, WarningId};
 use serde_json::{Map, Value, json};
 
 use super::jira::{ISSUE_PATH, MAX_CANDIDATES, capped, unresolved};
@@ -12,6 +14,7 @@ use super::{
     str_param,
 };
 use crate::lifecycle::model::Hold;
+use crate::metadata::one_line;
 use crate::validate::invalid;
 
 // ---- jira.issue.assign -------------------------------------------------------------------------
@@ -262,10 +265,12 @@ fn link_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
 /// by `name`, so a resolved name another type shares (any case) is ambiguous too. A blank value
 /// names no type (no answer needed); an answer that is not the documented object, or a resolved
 /// type without an id, a name or both phrases, fails closed. One pass over the answer per check.
+/// With the type, whether the value named it only by its inward phrase, of a type whose phrases
+/// differ (T16 review I1): the link then reads the other way round from the agent's wording.
 fn resolve_link_type(
     wanted: &str,
     answer: Option<&Value>,
-) -> Result<JiraLinkType, Box<EnrichVerdict>> {
+) -> Result<(JiraLinkType, bool), Box<EnrichVerdict>> {
     if names_no_type(wanted) {
         return Err(Box::new(unresolved("type", wanted, 0, Vec::new())));
     }
@@ -326,22 +331,42 @@ fn resolve_link_type(
         let n = count(&namesakes);
         return Err(Box::new(unresolved("type", wanted, n, names(namesakes))));
     }
-    Ok(JiraLinkType {
+    let by_inward_only = same(Some(inward))
+        && text(one, "id") != Some(wanted)
+        && !same(Some(name))
+        && !same(Some(outward))
+        && inward.to_lowercase() != outward.to_lowercase();
+    let link_type = JiraLinkType {
         id: capped(id),
         name: name.to_owned(),
         inward: capped(inward),
         outward: capped(outward),
-    })
+    };
+    Ok((link_type, by_inward_only))
+}
+
+/// Server text (already [`capped`]) in a Caution: display-escaped, on one line.
+fn caution_text(cut: &str) -> String {
+    one_line(escape_for_display(cut))
 }
 
 fn link_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
     match resolve_link_type(str_param(ctx.params, "type"), answers.first()) {
         Err(verdict) => *verdict,
-        Ok(link_type) => {
+        Ok((link_type, by_inward_only)) => {
             let mut resolved = Map::new();
             resolved.insert("type".to_owned(), Value::from(link_type.name.clone()));
             // No stale rule (§5.4 step 5: "none"), so no baseline.
             let mut verdict = EnrichVerdict::preview(Value::Null, resolved);
+            if by_inward_only {
+                verdict.warnings.push(Warning::new(
+                    WarningId::LinkTypeInwardPhrase,
+                    warning::link_type_inward_phrase(
+                        &caution_text(&link_type.inward),
+                        &caution_text(&link_type.outward),
+                    ),
+                ));
+            }
             verdict.summary = Some(WriteSummaryFacts {
                 link_type: Some(link_type),
                 ..WriteSummaryFacts::default()
@@ -351,16 +376,45 @@ fn link_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
     }
 }
 
+/// An issue key as Jira tells issues apart (T16 review M4): the project key in upper case and the
+/// number without its leading zeros (`abc-01` is `ABC-1`); a value of another shape as it is.
+fn issue_identity(key: &str) -> String {
+    match key.rsplit_once('-') {
+        Some((project, number))
+            if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let number = number.trim_start_matches('0');
+            let number = if number.is_empty() { "0" } else { number };
+            format!("{}-{number}", project.to_uppercase())
+        }
+        _ => key.to_owned(),
+    }
+}
+
+/// Whether two keys name one issue: equal, or equal as [`issue_identity`] reads them. Another
+/// key of a moved issue (an old project key) is not seen; Jira decides those.
+fn same_issue(a: &str, b: &str) -> bool {
+    a == b || issue_identity(a) == issue_identity(b)
+}
+
 /// `POST /rest/api/2/issueLink` `{"type": {"name": <resolved name>}, "inwardIssue": {"key":
 /// inward}, "outwardIssue": {"key": outward}, "comment"?: {"body": comment}}` (PD-53): the params
 /// fill the fields of the same names; the comment is wiki markup, sent verbatim (PD-42). Static
-/// checks first, so the validation dry call refuses them (exit 2): a link of an issue to itself,
-/// and a blank comment (`minLength` lets whitespace through; Jira would get an empty comment).
-/// Only a `Preview` verdict renders a request, with the type name enrichment resolved.
+/// checks first, so the validation dry call (and an edit) refuses them (exit 2): a blank type and
+/// a blank comment (`minLength` lets whitespace through, T16 review M5: refused alike, as the
+/// schema refuses an empty one), and a link of an issue to itself ([`same_issue`]). Only a
+/// `Preview` verdict renders a request, with the type name enrichment resolved.
 pub fn issuelink_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    if names_no_type(str_param(ctx.params, "type")) {
+        return Err(ExecError::Invalid(invalid(
+            "type",
+            "must not be blank",
+            None,
+        )));
+    }
     let inward = str_param(ctx.params, "inward");
     let outward = str_param(ctx.params, "outward");
-    if inward == outward {
+    if same_issue(inward, outward) {
         return Err(ExecError::Invalid(invalid(
             "outward",
             "must name another issue than inward",
