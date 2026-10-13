@@ -410,7 +410,10 @@ fn param_kind(name: &str, prop: &Value) -> InputKind {
 fn missing_kind(f: &MissingField) -> InputKind {
     // T14: a transition screen's usual required field is `resolution` (and `priority`), whose
     // allowed values Jira takes by `{"id"}` like an option's; a multi-pick of versions or
-    // components likewise.
+    // components likewise. A list over [`MAX_ALLOWED_VALUES`] keeps the capped `Choice` (the
+    // label says "N of M values listed", [`missing_label`]); a label beyond it is refused by
+    // [`choice_edits`], so free-form entry past the list is the raw-JSON editor only (a
+    // non-string value passes as it is, T14 review M4).
     let choice = matches!(f.schema_type.as_str(), "option" | "resolution" | "priority")
         || (f.schema_type == "array"
             && matches!(

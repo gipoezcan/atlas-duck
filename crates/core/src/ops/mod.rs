@@ -327,6 +327,9 @@ pub struct WriteSummaryFacts {
     /// the `fields` keys the params set.
     pub from_status: Option<String>,
     pub to_status: Option<String>,
+    /// `jira.issue.transition` (T14 review M5): the resolved transition's name (its id is the
+    /// request's).
+    pub transition_name: Option<String>,
     /// `jira.issue.assign` (T15): the current assignee's display name.
     pub assignee_from: Option<String>,
     /// `jira.issuelink.create` (T16): the link type's phrase for the sentence.

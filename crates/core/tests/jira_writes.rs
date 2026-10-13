@@ -22,7 +22,6 @@ use atlas_duck_core::testing::Harness;
 use atlas_duck_core::{DecisionError, DenyDetails, QueueItem};
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_preview::form::InputKind;
-use atlas_duck_preview::warning::TEXT_RESTRICTED_COMMENTS;
 use atlas_duck_preview::{ConstructList, Level, Preview, PreviewBody, WarningId};
 use common::{TestError, TestResult, de, request_id};
 use serde_json::{Value, json};
@@ -172,8 +171,11 @@ fn comment_preview_markdown_rendered() -> TestResult {
     Ok(())
 }
 
+/// T14 review I1: §6.2 defines `restricted_comments` for released reads; a restricted comment
+/// being written is the protective choice, shows its Visibility row and raises no Caution (it
+/// would inflate the queue's Caution count).
 #[test]
-fn comment_visibility_row_and_caution() -> TestResult {
+fn comment_visibility_row_without_a_restricted_comments_caution() -> TestResult {
     let (m, wire) = comment_preview(&json!({
         "key": KEY, "body": "x", "body_format": "wiki",
         "visibility": {"type": "role", "value": "Administrators"}
@@ -184,14 +186,61 @@ fn comment_visibility_row_and_caution() -> TestResult {
     );
     let s = summary(&m)?;
     assert_eq!(row(&s, "Visibility"), Some("role: Administrators"));
-    let w: Vec<_> = m
-        .warnings
-        .iter()
-        .filter(|w| w.id == WarningId::RestrictedComments)
-        .collect();
-    assert_eq!(w.len(), 1);
-    assert_eq!(w[0].level, Level::Caution);
-    assert_eq!(w[0].text, TEXT_RESTRICTED_COMMENTS);
+    assert!(
+        m.warnings
+            .iter()
+            .all(|w| w.id != WarningId::RestrictedComments && w.level != Level::Caution),
+        "{:?}",
+        m.warnings
+    );
+    // Role and group text are escaped, one line.
+    let (m, _) = comment_preview(&json!({
+        "key": KEY, "body": "x", "body_format": "wiki",
+        "visibility": {"type": "group", "value": "a\u{202e}b\nc"}
+    }))?;
+    let s = summary(&m)?;
+    let shown = row(&s, "Visibility").ok_or("no Visibility row")?;
+    assert_eq!(shown, "group: a⟨U+202E⟩b⟨U+000A⟩c", "{shown}");
+    assert!(
+        m.warnings
+            .iter()
+            .all(|w| w.id != WarningId::RestrictedComments)
+    );
+    Ok(())
+}
+
+/// T14 review M3: the card reads the request that is sent. A request whose wire body differs from
+/// the params (a previewer converting `params.body` a second time would show the params' text).
+#[test]
+fn comment_preview_reads_the_rendered_request_not_the_params() -> TestResult {
+    let params = json!({ "key": KEY, "body": "FROM PARAMS {panel}", "body_format": "wiki" });
+    let mut reqs = requests(COMMENT, &params, None)?;
+    let first = reqs.first_mut().ok_or("no request")?;
+    first.body = serde_json::to_vec(&json!({
+        "body": "FROM WIRE {toc}",
+        "visibility": {"type": "role", "value": "Wire"}
+    }))?;
+    let imp = op_table().get(COMMENT).ok_or("no OpImpl")?;
+    let ctx = PreviewCtx {
+        spec: spec(COMMENT)?,
+        instance_alias: "jira-main",
+        params: &params,
+        input: PreviewInput::Write(WriteView {
+            requests: &reqs,
+            hold: Hold::Preview,
+            enrichment: None,
+            failure: None,
+        }),
+        field_names: None,
+    };
+    let m = (imp.previewer)(&ctx);
+    let s = summary(&m)?;
+    let body = row(&s, "Body").ok_or("no Body row")?;
+    assert!(body.contains("FROM WIRE"), "{body}");
+    assert!(!body.contains("PARAMS"), "{body}");
+    assert_eq!(row(&s, "Visibility"), Some("role: Wire"));
+    let c = s.constructs.ok_or("no constructs")?;
+    assert_eq!(c.macros, ["toc"], "the constructs of the sent body");
     Ok(())
 }
 
@@ -203,9 +252,12 @@ fn comment_preview_escapes_and_caps_what_it_shows() -> TestResult {
         "visibility": {"type": "group", "value": "x\u{202e}y"}
     }))?;
     let s = summary(&m)?;
-    let shown = format!("{:?}", s.rows);
-    assert!(!shown.contains('\u{202e}'), "{shown}");
-    assert!(shown.contains("⟨U+202E⟩"), "{shown}");
+    // Every shown text, not its Debug form (which escapes U+202E itself).
+    for (name, value) in &s.rows {
+        assert!(!value.contains('\u{202e}'), "{name}: {value}");
+    }
+    assert!(row(&s, "Body").is_some_and(|b| b.contains("a⟨U+202E⟩b")));
+    assert_eq!(row(&s, "Visibility"), Some("group: x⟨U+202E⟩y"));
     // A body of 20 000 chars that each escape to 10 bytes: the cut counts escaped bytes.
     let big = "\u{202e}".repeat(20_000);
     let (m, _) = comment_preview(&json!({ "key": KEY, "body": big, "body_format": "wiki" }))?;
@@ -214,9 +266,18 @@ fn comment_preview_escapes_and_caps_what_it_shows() -> TestResult {
     assert!(body.len() <= 16 * 1024 + 200, "{} bytes shown", body.len());
     assert!(body.contains("see Raw"), "the cut says so");
     assert!(m.header.hidden_in_preview_bytes > 0);
-    // Cut on char boundaries: the text is whole characters (a split would not be a `&str`), and
-    // no escape is cut in half.
-    assert!(!body.trim_end_matches(|c| c != '⟩').ends_with("⟨U+202"));
+    // No escape is cut in half: without the "… N more bytes" suffix the body ends on a whole
+    // escape, and its opening and closing brackets pair up.
+    let (cut_text, _) = body.rsplit_once('…').ok_or("no cut marker")?;
+    assert!(cut_text.ends_with('⟩'), "the body ends in a split escape");
+    assert_eq!(cut_text.matches('⟨').count(), cut_text.matches('⟩').count());
+    // One unit (T14 review M7): the count in the suffix is the header's hidden count.
+    let said: u64 = body
+        .rsplit_once("… ")
+        .and_then(|(_, tail)| tail.split(' ').next())
+        .ok_or("no count")?
+        .parse()?;
+    assert_eq!(said, m.header.hidden_in_preview_bytes);
     Ok(())
 }
 
@@ -270,6 +331,7 @@ fn transition_preview(
 }
 
 struct Card {
+    transition: String,
     from: String,
     to: String,
     fields: Vec<(String, String)>,
@@ -279,6 +341,7 @@ struct Card {
 fn card(m: &PreviewModel) -> Result<Card, TestError> {
     match &m.body {
         PreviewBody::Transition {
+            transition,
             from,
             to,
             fields,
@@ -287,6 +350,7 @@ fn card(m: &PreviewModel) -> Result<Card, TestError> {
         } => {
             assert_eq!(requests.len(), 1, "the exact request list stays (inv. 4)");
             Ok(Card {
+                transition: transition.clone(),
                 from: from.clone(),
                 to: to.clone(),
                 fields: fields.clone(),
@@ -310,6 +374,8 @@ fn transition_preview_from_to_and_fields() -> TestResult {
     assert_eq!(wire["transition"], json!({"id": "31"}));
     let c = card(&m)?;
     assert_eq!((c.from.as_str(), c.to.as_str()), ("In Progress", "Done"));
+    // T14 review M5: the transition the agent asked for, by name and id.
+    assert_eq!(c.transition, "Done (31)");
     // A field row is named like the Caution names a field (`<name> (<id>)`) where the transition
     // screen names it, with the value as it is sent.
     assert_eq!(
@@ -390,10 +456,55 @@ fn transition_comment_is_listed_and_sent_verbatim() -> TestResult {
     let comment = c
         .fields
         .iter()
-        .find(|(n, _)| n == "comment")
+        .find(|(n, _)| n == "comment (update.comment)")
         .ok_or("no comment row")?;
     assert!(comment.1.contains("see"), "{comment:?}");
     assert!(!comment.1.contains("<a"));
+    Ok(())
+}
+
+/// T14 review M8: a `fields.comment` entry and the `comment` param are two rows with two labels.
+#[test]
+fn transition_comment_rows_have_distinct_labels() -> TestResult {
+    let params = json!({
+        "key": KEY, "transition": "Start Progress", "comment": "plain",
+        "fields": {"comment": [{"add": {"body": "other"}}]}
+    });
+    let (m, _, _) = transition_preview(&params, &transitions_answer())?;
+    let c = card(&m)?;
+    let labels: Vec<&str> = c.fields.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(labels.len(), 2, "{labels:?}");
+    assert_ne!(labels[0], labels[1], "{labels:?}");
+    assert!(labels.contains(&"comment (update.comment)"), "{labels:?}");
+    Ok(())
+}
+
+/// T14 review M8: the `fields` rows are bounded; the rest is said and counted as hidden.
+#[test]
+fn transition_field_rows_are_capped_and_counted() -> TestResult {
+    let mut fields = serde_json::Map::new();
+    for n in 0..60 {
+        fields.insert(format!("customfield_{n:03}"), json!("v".repeat(40)));
+    }
+    let params = json!({ "key": KEY, "transition": "Start Progress", "fields": fields });
+    let (m, _, _) = transition_preview(&params, &transitions_answer())?;
+    let c = card(&m)?;
+    assert!(c.fields.len() <= 26, "{} rows", c.fields.len());
+    let (label, note) = c.fields.last().ok_or("no rows")?;
+    assert!(
+        label.contains("more fields") || note.contains("more fields"),
+        "{label} {note}"
+    );
+    assert!(m.header.hidden_in_preview_bytes > 0);
+    // A short list shows no note.
+    let params = json!({ "key": KEY, "transition": "Start Progress", "fields": {"a": 1} });
+    let (m, _, _) = transition_preview(&params, &transitions_answer())?;
+    assert!(
+        !card(&m)?
+            .fields
+            .iter()
+            .any(|(n, v)| n.contains("more fields") || v.contains("more fields"))
+    );
     Ok(())
 }
 
@@ -499,7 +610,7 @@ async fn transition_comment_sent_verbatim() -> TestResult {
         } => {
             // The fixture issue is `In Progress`.
             assert_eq!((from.as_str(), to.as_str()), ("In Progress", "Done"));
-            assert!(fields.iter().any(|(n, _)| n == "comment"));
+            assert!(fields.iter().any(|(n, _)| n == "comment (update.comment)"));
             assert_eq!(
                 constructs.as_ref().map(|c| c.macros.clone()),
                 Some(vec!["toc".to_owned()])
@@ -614,6 +725,77 @@ async fn transition_picking_the_missing_field_reruns_enrichment_and_sends_it() -
     let sent = posts(mock, "/rest/api/2/issue/ABC-1/transitions").await;
     let body: Value = serde_json::from_slice(&sent.first().ok_or("no POST")?.body)?;
     assert_eq!(body["fields"]["resolution"], json!({"id": "1"}));
+    Ok(())
+}
+
+/// T14 review M2/M4: a required `priority`, and a required array of `version` / `component`, are
+/// choices too (an arm removed from `missing_kind` leaves a JSON input); a pick sends `{"id"}`,
+/// inside an array for the array fields; a list over ten values says how many are listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transition_priority_version_component_inputs_are_choices() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    let versions: Vec<Value> = (1..=13)
+        .map(|n| json!({"id": format!("{}", 100 + n), "name": format!("v{n}")}))
+        .collect();
+    let mut t = transitions_answer();
+    t["transitions"][1]["fields"] = json!({
+        "priority": {"required": true, "name": "Priority", "schema": {"type": "priority"},
+                     "allowedValues": [{"id": "2", "name": "High"}, {"id": "3", "name": "Low"}]},
+        "fixVersions": {"required": true, "name": "Fix Version/s",
+                        "schema": {"type": "array", "items": "version"},
+                        "allowedValues": versions},
+        "components": {"required": true, "name": "Component/s",
+                       "schema": {"type": "array", "items": "component"},
+                       "allowedValues": [{"id": "7", "name": "Core"}]}
+    });
+    mount_transitions(mock, &t).await;
+    let id = queued(&h, TRANSITION, json!({ "key": KEY, "transition": "Done" })).await?;
+    let form = opened(&h, &id)?.edit_form.ok_or("no edit form")?;
+    let input = |path: &str| {
+        form.inputs
+            .iter()
+            .find(|i| i.path == path)
+            .ok_or_else(|| format!("no input {path}"))
+    };
+    for path in ["fields.priority", "fields.fixVersions", "fields.components"] {
+        let i = input(path)?;
+        assert!(
+            matches!(i.kind, InputKind::Choice(_)),
+            "{path}: {:?}",
+            i.kind
+        );
+    }
+    // The ten-value cap says so (M4); free-form entry beyond the list is refused (a label the
+    // choice does not list is not a value).
+    let label = &input("fields.fixVersions")?.label;
+    assert!(label.contains("10 of 13 values listed"), "{label}");
+    for (path, pick, wire) in [
+        ("fields.priority", "High", json!({"id": "2"})),
+        ("fields.fixVersions", "v1", json!([{"id": "101"}])),
+        ("fields.components", "Core", json!([{"id": "7"}])),
+    ] {
+        let rev = h.approver().rev(&id).map_err(de)?;
+        h.approver().choose_preadded(&id, path, pick).map_err(de)?;
+        item_after(&h, &id, rev.counter).await?;
+        let key = path.trim_start_matches("fields.");
+        let sent = opened(&h, &id)?;
+        match sent.body {
+            PreviewBody::Transition { requests, .. } => {
+                let body = match &requests.first().ok_or("no request")?.body {
+                    atlas_duck_preview::BodyView::Text(t) => t.clone(),
+                    other => return Err(format!("body: {other:?}").into()),
+                };
+                let body: Value = serde_json::from_str(&body)?;
+                assert_eq!(body["fields"][key], wire, "{path}");
+            }
+            other => return Err(format!("not the transition card: {other:?}").into()),
+        }
+    }
+    let refused = h
+        .approver()
+        .choose_preadded(&id, "fields.fixVersions", "v13");
+    assert!(refused.is_err(), "v13 is beyond the listed values");
     Ok(())
 }
 

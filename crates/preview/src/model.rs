@@ -204,8 +204,11 @@ pub enum PreviewBody {
     },
     /// §6.3 transition. Status names and field rows are display-escaped text. `constructs` lists
     /// the wiki constructs of the comment sent with the transition (PD-47, M5 T14: Δ2 had no place
-    /// for them); `None` without a comment.
+    /// for them); `None` without a comment. `transition` is the transition sent, `<name> (<id>)`
+    /// (the bare id when Jira named none), display-escaped (T14 review M5: two transitions to the
+    /// same status differ only there).
     Transition {
+        transition: String,
         from: String,
         to: String,
         fields: Vec<(String, String)>,

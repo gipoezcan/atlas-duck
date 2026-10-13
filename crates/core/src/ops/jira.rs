@@ -995,7 +995,10 @@ fn transition_field_set(params: &Value, id: &str) -> bool {
 /// leads to, the screen's names of the fields the params set) and the transition screen's
 /// required fields no param sets: a Caution, never a block (PD-49 applied to the screen the
 /// enrichment GET already expanded), with the pre-added inputs and the deny hint that come with
-/// `missing_fields`.
+/// `missing_fields`. (T14 review M9: every edit of `comment` or `fields` re-runs this enrichment,
+/// two GETs, and re-baselines the status and transition; the card shows the new from/to and needs
+/// a fresh Approve, and an unreachable Jira turns the edit into an enrichment error, the I-18
+/// analogue.)
 fn transition_summary(
     verdict: &mut EnrichVerdict,
     params: &Value,
@@ -1042,6 +1045,7 @@ fn transition_summary(
                 .and_then(|r| r.get("fields")?.get("status")),
         ),
         to_status: name_of(transition.get("to")),
+        transition_name: name_of(Some(transition)),
         field_names,
         ..WriteSummaryFacts::default()
     });

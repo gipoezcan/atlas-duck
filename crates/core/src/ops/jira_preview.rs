@@ -36,6 +36,10 @@ const DESCRIPTION_CAP: usize = 64 * 1024;
 /// Each comment's wiki text is rendered up to this many bytes.
 const COMMENT_CAP: usize = 16 * 1024;
 
+/// A transition card shows at most this many `fields` rows; the last row says how many it leaves
+/// out (T14 review M8).
+const TRANSITION_FIELD_ROWS: usize = 25;
+
 /// The marker on the rows of `renderedFields` (plan text, T10).
 const SERVER_RENDERED: &str = " (server-rendered)";
 
@@ -1018,13 +1022,21 @@ fn take_requests(model: &mut PreviewModel) -> Vec<atlas_duck_preview::RequestVie
 /// The text of a wiki text's rendering (`wiki_to_text`), display-escaped: the source is cut at
 /// `cap` bytes before it is rendered, the rendering again at `cap` escaped bytes
 /// ([`escaped_prefix`], so an escape is never split and a text of invisible characters stays
-/// bounded). A cut says how many source bytes it hides, which are also added to `hidden`.
+/// bounded). A cut says how many bytes of the rendered text it hides (one unit, T14 review M7:
+/// the cut-off source is rendered too, at least 1 byte for a cut), which are also added to
+/// `hidden`.
 fn rendered_text(wiki: &str, cap: usize, hidden: &mut u64) -> String {
     let (kept, cut) = cut_at(wiki, cap);
     let text = wiki_to_text(kept);
     let (mut shown, used) = escaped_prefix(&text, cap);
     let more = u64::try_from(text.len().saturating_sub(used)).unwrap_or(u64::MAX);
-    let hides = cut.saturating_add(more);
+    let cut_text = if cut > 0 {
+        let tail = wiki.get(kept.len()..).map_or(0, |t| wiki_to_text(t).len());
+        u64::try_from(tail).unwrap_or(u64::MAX).max(1)
+    } else {
+        0
+    };
+    let hides = cut_text.saturating_add(more);
     *hidden = hidden.saturating_add(hides);
     if hides > 0 {
         shown.push_str(&format!("… {hides} more bytes (see Raw)"));
@@ -1035,9 +1047,9 @@ fn rendered_text(wiki: &str, cap: usize, hidden: &mut u64) -> String {
 /// §6.3 comment: the `jira.comment.add` card over the exact request: "Comment on <key>", the
 /// body shown as the text of its wiki markup (read from the request that is sent, T7 M-6: a
 /// Markdown body was converted once, at validation, and not again here), a visibility row when
-/// the comment is restricted (with the Caution of §6.2 "includes restricted-visibility
-/// comments"), and the constructs of the body (PD-47). Any other input keeps the generic write
-/// preview.
+/// the comment is restricted (no `restricted_comments` Caution: §6.2 defines it for released
+/// reads, and on a write it would only inflate the queue's Caution count, T14 review I1), and the
+/// constructs of the body (PD-47). Any other input keeps the generic write preview.
 pub fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     let mut model = generic::write_preview(ctx);
     let PreviewInput::Write(view) = &ctx.input else {
@@ -1073,10 +1085,6 @@ pub fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         rows.push((
             "Visibility".to_owned(),
             line(&text, CELL_CAP_CHARS * 2, &mut hidden),
-        ));
-        model.warnings.push(Warning::new(
-            WarningId::RestrictedComments,
-            warning::TEXT_RESTRICTED_COMMENTS,
         ));
     }
     let requests = take_requests(&mut model);
@@ -1130,13 +1138,36 @@ pub fn transition_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     };
     let from = status(&facts.from_status, &mut hidden);
     let to = status(&facts.to_status, &mut hidden);
+    let sent_id = body
+        .get("transition")
+        .and_then(|t| t.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let transition = match facts.transition_name.as_deref() {
+        Some(name) => line(
+            &format!("{name} ({sent_id})"),
+            CELL_CAP_CHARS * 2,
+            &mut hidden,
+        ),
+        None => line(sent_id, CELL_CAP_CHARS * 2, &mut hidden),
+    };
     let mut fields = Vec::new();
-    for (id, value) in body
-        .get("fields")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flatten()
-    {
+    let sent_fields = body.get("fields").and_then(Value::as_object);
+    for (n, (id, value)) in sent_fields.into_iter().flatten().enumerate() {
+        if n >= TRANSITION_FIELD_ROWS {
+            let left = sent_fields.map_or(0, |m| m.len().saturating_sub(n));
+            let bytes = sent_fields
+                .into_iter()
+                .flatten()
+                .skip(n)
+                .fold(0u64, |sum, (k, v)| sum.saturating_add(pair_bytes(k, v)));
+            hidden = hidden.saturating_add(bytes);
+            fields.push((
+                format!("… {left} more fields"),
+                format!("{bytes} bytes (see Raw)"),
+            ));
+            break;
+        }
         let label = field_row_label(&facts.field_names, id, &mut hidden);
         let json = serde_json::to_string(value).unwrap_or_default();
         fields.push((label, line(&json, FIELD_VALUE_CAP, &mut hidden)));
@@ -1148,13 +1179,15 @@ pub fn transition_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         .and_then(|c| c.first())
         .and_then(|c| c.get("add")?.get("body")?.as_str());
     if let Some(wiki) = comment {
+        // Labelled apart from a `fields.comment` entry, which is its own row (T14 review M8).
         fields.push((
-            "comment".to_owned(),
+            "comment (update.comment)".to_owned(),
             rendered_text(wiki, COMMENT_CAP, &mut hidden),
         ));
     }
     let requests = take_requests(&mut model);
     model.body = PreviewBody::Transition {
+        transition,
         from,
         to,
         fields,

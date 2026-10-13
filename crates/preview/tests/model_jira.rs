@@ -73,10 +73,14 @@ fn bodies() -> Vec<PreviewBody> {
             requests: vec![req()],
         },
         PreviewBody::Transition {
+            transition: "Done (31)".to_owned(),
             from: "Open".to_owned(),
             to: "Done".to_owned(),
             fields: vec![("resolution".to_owned(), "Fixed".to_owned())],
-            constructs: None,
+            constructs: Some(ConstructList {
+                links: vec!["https://x".to_owned()],
+                ..ConstructList::default()
+            }),
             requests: vec![req()],
         },
     ]
@@ -114,6 +118,14 @@ fn jira_bodies_serialize_with_kind_tags() -> Result<(), serde_json::Error> {
     assert_eq!(v["rendered"], json!([{"op": "add", "text": "x"}]));
     assert_eq!(v["raw"], json!([{"op": "same", "text": "y"}]));
     assert_eq!(v["raw_only_changes"], 1);
+    let v = serde_json::to_value(&all[4])?;
+    assert_eq!(v["transition"], "Done (31)");
+    assert_eq!(
+        v["constructs"],
+        json!({"macros": [], "mentions": [], "includes": [], "links": ["https://x"],
+               "images": [], "attachments": []})
+    );
+    assert_eq!(v["fields"], json!([["resolution", "Fixed"]]));
     Ok(())
 }
 
