@@ -905,7 +905,7 @@ fn code_lang(kind: &CodeBlockKind<'_>) -> Option<String> {
 
 /// Whether `text` holds a `{quote` tag as the parser's closer grammar reads it: `{`, optional
 /// whitespace, `quote` (ASCII case-insensitive).
-fn has_quote_tag(text: &str) -> bool {
+pub(crate) fn has_quote_tag(text: &str) -> bool {
     text.match_indices('{').any(|(i, _)| {
         let rest = text
             .get(i + 1..)
@@ -948,7 +948,7 @@ fn link_target(link_type: LinkType, dest: &str) -> String {
 }
 
 /// ASCII case-insensitive substring test.
-fn contains_ci(hay: &str, needle: &str) -> bool {
+pub(crate) fn contains_ci(hay: &str, needle: &str) -> bool {
     let n = needle.as_bytes();
     !n.is_empty()
         && hay

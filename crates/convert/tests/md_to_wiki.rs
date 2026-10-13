@@ -4,14 +4,14 @@
 //! Every output is checked against the parser the hard check uses (`convert::wiki`): its
 //! construct spans must be exactly the containers the converter recorded, nothing else.
 
-use std::ops::Range;
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use atlas_duck_convert::escape;
 use atlas_duck_convert::wiki::{self, Block, Inline, construct_spans};
-use atlas_duck_convert::{
-    ConstructKind, ContainerKind, EmittedConstructs, markdown_to_wiki, wiki_constructs,
-};
+use atlas_duck_convert::{ContainerKind, EmittedConstructs, markdown_to_wiki, wiki_constructs};
+use common::{markdown, spans_match_record};
 use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -22,53 +22,6 @@ const GOLDEN: [&str; 8] = [
 
 fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/md_to_wiki")
-}
-
-/// The parser's view of `out` agrees with the record: every construct span is a `Macro`
-/// whose range is a recorded container, every recorded container is one span, and each
-/// recorded range slices a whole container of its kind.
-fn spans_match_record(out: &str, e: &EmittedConstructs) -> Result<(), String> {
-    let doc = wiki::parse(out);
-    let mut found: Vec<Range<usize>> = Vec::new();
-    for (kind, r) in construct_spans(&doc) {
-        if kind != ConstructKind::Macro {
-            return Err(format!("unrecorded {kind:?} at {r:?} in {out:?}"));
-        }
-        found.push(r);
-    }
-    let mut recorded: Vec<Range<usize>> =
-        e.code_blocks.iter().map(|c| c.byte_range.clone()).collect();
-    found.sort_by_key(|r| (r.start, r.end));
-    recorded.sort_by_key(|r| (r.start, r.end));
-    if found != recorded {
-        return Err(format!(
-            "parser spans {found:?} != recorded {recorded:?} in {out:?}"
-        ));
-    }
-    for c in &e.code_blocks {
-        let slice = out
-            .get(c.byte_range.clone())
-            .ok_or_else(|| format!("range {:?} not on char boundaries", c.byte_range))?;
-        let ok = match c.kind {
-            ContainerKind::Code => slice.starts_with("{code") && slice.ends_with("{code}"),
-            ContainerKind::Noformat => {
-                slice.starts_with("{noformat}") && slice.ends_with("{noformat}")
-            }
-            ContainerKind::Quote => slice.starts_with("{quote}") && slice.ends_with("{quote}"),
-        };
-        if !ok {
-            return Err(format!("{:?} range slices {slice:?}", c.kind));
-        }
-    }
-    let inv = wiki_constructs(out);
-    if !(inv.mentions.is_empty()
-        && inv.includes.is_empty()
-        && inv.images.is_empty()
-        && inv.attachments.is_empty())
-    {
-        return Err(format!("unexpected constructs {inv:?} in {out:?}"));
-    }
-    Ok(())
 }
 
 /// Text of a document made of paragraphs only: `Text`, `LineBreak` (`\n`) and bare-URL links
@@ -719,96 +672,6 @@ fn line_fragment() -> impl Strategy<Value = String> {
 
 fn line() -> impl Strategy<Value = String> {
     proptest::collection::vec(line_fragment(), 0..24).prop_map(|v| v.concat())
-}
-
-/// Markdown biased to block and inline syntax plus wiki specials.
-fn md_fragment() -> impl Strategy<Value = String> {
-    prop_oneof![
-        prop::sample::select(vec![
-            "\n",
-            "\n\n",
-            "\r\n",
-            "> ",
-            ">> ",
-            "- ",
-            "* ",
-            "1. ",
-            "  ",
-            "    ",
-            "```\n",
-            "```rust\n",
-            "~~~\n",
-            "`",
-            "``",
-            "*",
-            "**",
-            "_",
-            "~~",
-            "~",
-            "#",
-            "## ",
-            "---\n",
-            "[a](https://x.example/{y}|z)",
-            "[~u](https://x.example)",
-            "![i](u)",
-            "![](u)",
-            "[x]()",
-            "<https://x.example>",
-            "<a@b.example>",
-            "[r]\n\n[r]: https://ref\n",
-            "<b>",
-            "</b>",
-            "<div>\n",
-            "<!-- c -->",
-            "| a | b |\n|---|---|\n| c | d |\n",
-            "{code}",
-            "{code:java}",
-            "{noformat}",
-            "{quote}",
-            "{QUOTE}",
-            "{toc}",
-            "{include:X}",
-            "[~jdoe]",
-            "[^f]",
-            "!img.png!",
-            "|",
-            "\\",
-            "\\\\",
-            "h1. ",
-            "bq. ",
-            "----",
-            "&#92;",
-            "&amp;",
-            "&#32;",
-            "]]>",
-            "@jdoe",
-            "é",
-            "\u{202E}",
-            "https://x.example/a_b~c",
-            "*https://x.example/a*",
-            "~~https://x.example/a~~",
-            "https://x.example/a.\\",
-            "{ quote}",
-            "{\tquote }",
-            "[",
-            "](u)",
-            "](~u)",
-            "](^u)",
-            "![",
-            "<~a@b.example>",
-            "\u{2028}",
-            "\u{85}",
-            "{{",
-            "}}",
-        ])
-        .prop_map(str::to_owned),
-        "[a-z]{1,5}",
-        any::<char>().prop_map(String::from),
-    ]
-}
-
-fn markdown() -> impl Strategy<Value = String> {
-    proptest::collection::vec(md_fragment(), 0..40).prop_map(|v| v.concat())
 }
 
 /// Backslash-escapes every ASCII punctuation char, so the Markdown text is `s` itself.

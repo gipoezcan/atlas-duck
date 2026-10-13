@@ -6,8 +6,10 @@
 #![deny(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod escape;
+mod hard_check;
 mod md_to_wiki;
 pub mod wiki;
 
+pub use hard_check::{Unrecorded, hard_check_wiki};
 pub use md_to_wiki::{ContainerKind, EmittedCode, EmittedConstructs, markdown_to_wiki};
 pub use wiki::{CodeKind, ConstructKind, WikiConstructs, wiki_constructs};
