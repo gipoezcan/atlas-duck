@@ -35,7 +35,7 @@ use atlas_duck_registry::{OperationSpec, Product, RELEASE_CAP_BYTES};
 use serde_json::{Map, Value, json};
 use tokio::sync::OwnedSemaphorePermit;
 
-use super::cache::{Candidate, RebuildError, build_candidate, fetched_refs};
+use super::cache::{Candidate, RebuildError, build_candidate, build_unredacted, fetched_refs};
 use super::envelope::{MSG_IDENTITY_HEADER, OpenStatus};
 use super::{Engine, InstanceHttp, OnAuditFailure, RequestEntry};
 use crate::gate::{AttentionKind, UiEvent};
@@ -931,6 +931,8 @@ struct Built {
     candidate: Arc<Candidate>,
     state: ReadState,
     caution: u32,
+    /// The §5.3 mirror check fails on the candidate: Release disabled from the start.
+    mirror_blocked: bool,
 }
 
 /// The approver-side context of a read's preview.
@@ -1069,6 +1071,7 @@ async fn item(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, b: Built) {
         candidate,
         state,
         caution,
+        mirror_blocked,
     } = b;
     let item = state.item;
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
@@ -1082,11 +1085,12 @@ async fn item(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, b: Built) {
             move |st| {
                 st.candidate_hash = *candidate.hash();
                 st.redaction_ops = Vec::new();
-                st.rebuild_failed = false;
+                // §5.1 inv. 6: a fresh read candidate has no ops; only the mirror check (§5.3)
+                // can block it, as a rebuild failure does (`internal` banner, only Deny).
+                st.rebuild_failed = mirror_blocked;
                 st.caution_count = caution;
                 st.read = Some(state);
-                // §5.1 inv. 6: a fresh read candidate has no ops to block it.
-                st.model.set_approvable(true);
+                st.model.set_approvable(!mirror_blocked);
                 cache.candidates().insert(&id, candidate);
                 // The raw fetch is freed once `READ_FETCHED` is committed (§5.2 memory budget),
                 // in this gated step: a cancel or expiry after it must not find a control to
@@ -1117,9 +1121,15 @@ fn build_item(
 ) -> Result<Built, Vec<UpstreamResponse>> {
     let shape = ReadShape::of(cx.spec, cx.params);
     let mut record = rec.record(ctx);
-    let built = normalize_with_drops(cx.spec, shape, &record.payload)
-        .and_then(|(body, dropped)| Ok((build_candidate(cx.spec, body, &[])?, dropped)));
-    let (mut candidate, mut dropped) = match built {
+    // §5.3 mirror check on the unredacted candidate (T10 review I-1): a candidate that fails it
+    // is still shown, but Release stays disabled (`rebuild_failed`: `internal` banner, only Deny
+    // remains) until a redaction drops the orphan entry.
+    let built =
+        normalize_with_drops(cx.spec, shape, &record.payload).and_then(|(body, dropped)| {
+            let (c, blocked) = build_unredacted(cx.spec, body)?;
+            Ok((c, dropped, blocked))
+        });
+    let (mut candidate, mut dropped, mut mirror_blocked) = match built {
         Ok(b) => b,
         Err(_) => return Err(rec.responses),
     };
@@ -1142,6 +1152,7 @@ fn build_item(
             Err(_) => return Err(rec.responses),
         };
         dropped = 0;
+        mirror_blocked = false;
     }
     let state = ReadState {
         item: rec.item,
@@ -1163,6 +1174,7 @@ fn build_item(
         candidate: Arc::new(candidate),
         state,
         caution,
+        mirror_blocked,
     })
 }
 
@@ -1475,7 +1487,8 @@ pub(crate) fn preview_model(cx: &ReadContext<'_>, read: &ReadState, c: &Candidat
 }
 
 /// plan text (T10): leads the error text when a comment page of `jira.issue.get --comments`
-/// failed, since a 404 there reads as "issue not found".
+/// failed, since a 404 there reads as "issue not found". Card-only (T10 review M-3): the
+/// released candidate, and so the agent, carries Jira's own `{status, error_messages}` alone.
 const COMMENT_PAGE_NOTE: &str =
     "the failing request was the issue's comment list, not the issue itself";
 

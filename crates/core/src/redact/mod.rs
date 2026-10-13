@@ -224,6 +224,21 @@ impl fmt::Debug for RedactionOutcome {
     }
 }
 
+/// §5.3 mirror check on a candidate without ops: some mirror entry has no counterpart (or is a
+/// keyless entry in arrays of different lengths). [`apply`] runs the same check after its ops;
+/// this covers the candidate that has none (§5.1 inv. 6). A read-only walk, no copy.
+pub fn mirror_blocked(
+    doc: &serde_json::Value,
+    rules: &atlas_duck_registry::RedactionRules,
+) -> bool {
+    if rules.mirrors.is_empty() {
+        return false;
+    }
+    let mut blocked = Vec::new();
+    mirror::check(doc, rules.mirrors, &[], &mut blocked);
+    !blocked.is_empty()
+}
+
 /// The `url_fields`, copy and mirror paths of `rules` that do not parse in the redaction path
 /// grammar (a malformed one would be ignored silently by [`apply`]).
 pub fn invalid_rule_paths(rules: &atlas_duck_registry::RedactionRules) -> Vec<&'static str> {

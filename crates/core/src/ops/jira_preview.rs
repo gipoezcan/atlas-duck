@@ -1,5 +1,6 @@
 //! The Jira issue previewer (§6.3 "Jira issue", §6.2 levels, PD-45/PD-46): a card, the table of
-//! every released field, the description and the comments rendered from their wiki markup.
+//! every released field (and of the issue's other keys, such as `changelog`), the description and
+//! the comments rendered from their wiki markup.
 //!
 //! Everything shown is display-escaped text, except the two HTML strings, which come only from
 //! `convert::wiki_to_preview_html` through `preview::sanitize_html` (S-12) and are display-escaped
@@ -18,7 +19,7 @@ use atlas_duck_preview::{
 use serde_json::{Map, Value};
 
 use super::{PreviewCtx, PreviewInput, PreviewModel, generic};
-use crate::metadata::{FieldNames, field_label};
+use crate::metadata::{FieldNames, field_label, one_line};
 
 /// A field value shows at most this many bytes (the JSON tree's collapse limit); Raw has it all.
 const FIELD_VALUE_CAP: usize = JSON_STRING_COLLAPSE_BYTES;
@@ -31,6 +32,9 @@ const COMMENT_CAP: usize = 16 * 1024;
 
 /// The marker on the rows of `renderedFields` (plan text, T10).
 const SERVER_RENDERED: &str = " (server-rendered)";
+
+/// The marker on the rows of the issue's keys outside `fields` (T10 review I-3).
+const OUTSIDE_FIELDS: &str = " (outside fields)";
 
 /// §6.3 "Jira issue": the previewer of `jira.issue.get`. A candidate that is not a JSON object
 /// (nothing to lay out) and every non-read input use the §6.3 Fallback.
@@ -52,7 +56,7 @@ pub fn issue_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         .unwrap_or(&empty);
 
     let mut hidden = 0u64;
-    let rows = field_rows(ctx.field_names, fields, rendered, &mut hidden);
+    let rows = field_rows(ctx.field_names, issue, fields, rendered, &mut hidden);
     let description_html = fields
         .get("description")
         .and_then(Value::as_str)
@@ -176,45 +180,88 @@ fn person(user: Option<&Value>) -> Option<String> {
 
 // ---- the field table -------------------------------------------------------------------------
 
-/// A row for every released key of `fields`, then of `renderedFields` (marked), each in id order.
+/// Which part of the issue a row comes from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tree {
+    Fields,
+    /// `renderedFields`, marked as server-rendered.
+    Rendered,
+    /// A key of the issue itself beside `fields` (`changelog`, `names`, `transitions`, …).
+    TopLevel,
+}
+
+/// Top-level keys without a row: the card shows `key`; `id`, `self` and `expand` are the
+/// issue's own identifiers; the two field trees have their rows.
+const NO_ROW_KEYS: [&str; 6] = ["key", "id", "self", "expand", "fields", "renderedFields"];
+
+/// A row for every released key of `fields`, then of `renderedFields` (marked), then of the issue
+/// itself outside them (§6.1 principle 3: a `changelog` carries old values of any field), each in
+/// id order.
 fn field_rows(
     names: Option<&FieldNames>,
+    issue: &Map<String, Value>,
     fields: &Map<String, Value>,
     rendered: &Map<String, Value>,
     hidden: &mut u64,
 ) -> Vec<FieldRow> {
     let mut rows = Vec::with_capacity(fields.len() + rendered.len());
-    for (tree, mirror) in [(fields, false), (rendered, true)] {
-        let mut ids: Vec<&String> = tree.keys().collect();
+    for (map, tree) in [
+        (fields, Tree::Fields),
+        (rendered, Tree::Rendered),
+        (issue, Tree::TopLevel),
+    ] {
+        let mut ids: Vec<&String> = map.keys().collect();
         ids.sort_unstable();
         for id in ids {
-            let Some(value) = tree.get(id) else { continue };
-            let label = row_name(names, id);
-            let (name, shown_id) = if mirror {
-                (
-                    format!("{label}{SERVER_RENDERED}"),
-                    format!("renderedFields.{}", escape_for_display(id)),
-                )
-            } else {
-                (label, escape_for_display(id))
+            let Some(value) = map.get(id) else { continue };
+            let shown = one_line(escape_for_display(id));
+            let (name, shown_id) = match tree {
+                Tree::Fields => (row_name(names, id), shown),
+                Tree::Rendered => (
+                    format!("{}{SERVER_RENDERED}", row_name(names, id)),
+                    format!("renderedFields.{shown}"),
+                ),
+                Tree::TopLevel if NO_ROW_KEYS.contains(&id.as_str()) => continue,
+                Tree::TopLevel => (
+                    format!(
+                        "{}{OUTSIDE_FIELDS}",
+                        top_level_name(id).map_or_else(|| shown.clone(), str::to_owned)
+                    ),
+                    shown,
+                ),
             };
-            let restricted = match id.as_str() {
-                "security" => !value.is_null(),
-                "comment" => value
-                    .get("comments")
-                    .and_then(Value::as_array)
-                    .is_some_and(|c| c.iter().any(has_visibility)),
-                _ => false,
-            };
+            let restricted = tree != Tree::TopLevel
+                && match id.as_str() {
+                    "security" => !value.is_null(),
+                    "comment" => value
+                        .get("comments")
+                        .and_then(Value::as_array)
+                        .is_some_and(|c| c.iter().any(has_visibility)),
+                    _ => false,
+                };
             rows.push(FieldRow {
                 id: shown_id,
                 name,
-                value_text: value_text(id, value, mirror, hidden),
+                value_text: value_text(id, value, tree, hidden),
                 restricted,
             });
         }
     }
     rows
+}
+
+/// Names of the top-level keys an `expand` (or Jira itself) adds to an issue.
+fn top_level_name(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "changelog" => "Change history",
+        "names" => "Field names",
+        "schema" => "Field schemas",
+        "transitions" => "Transitions",
+        "editmeta" => "Edit metadata",
+        "operations" => "Operations",
+        "versionedRepresentations" => "Versioned representations",
+        _ => return None,
+    })
 }
 
 /// The name of field `id`: the instance's cached name, else the built-in name of a system field
@@ -254,14 +301,26 @@ fn builtin_name(id: &str) -> Option<&'static str> {
     })
 }
 
-/// The string itself, else compact JSON; comments are counted (their cards are below the table).
+/// The string itself, else compact JSON; comments are counted (their cards are below the table)
+/// and the wiki description points at its rendering below (cut and counted there, not twice).
 /// Cut at [`FIELD_VALUE_CAP`]; the cut bytes are added to `hidden`.
-fn value_text(id: &str, value: &Value, mirror: bool, hidden: &mut u64) -> String {
-    if id == "comment"
+fn value_text(id: &str, value: &Value, tree: Tree, hidden: &mut u64) -> String {
+    if tree != Tree::TopLevel
+        && id == "comment"
         && let Some(comments) = value.get("comments").and_then(Value::as_array)
     {
-        let kind = if mirror { "server-rendered " } else { "" };
-        return format!("{} {kind}comments, shown below", comments.len());
+        let n = comments.len();
+        return if tree == Tree::Rendered {
+            // The cards show the wiki source; the server's HTML bodies are only in Raw.
+            format!(
+                "{n} server-rendered comments (bodies in Raw; the cards below show the wiki source)"
+            )
+        } else {
+            format!("{n} comments, shown below")
+        };
+    }
+    if tree == Tree::Fields && id == "description" && value.is_string() {
+        return "rendered below".to_owned();
     }
     let full = match value {
         Value::String(s) => s.clone(),

@@ -375,17 +375,35 @@ pub struct RedactionReport {
     pub also_appears_in: Vec<String>,
 }
 
+/// The candidate of `body` without ops, and whether the §5.3 mirror check blocks its release (a
+/// mirror entry without a counterpart). A read's first build shows such a candidate with only
+/// Deny left (T10 review I-1); every other build refuses it ([`build_redacted`]). The same bytes
+/// either way, so the hash a rebuild compares is this one.
+pub fn build_unredacted(
+    spec: &OperationSpec,
+    body: Value,
+) -> Result<(Candidate, bool), RebuildError> {
+    let blocked = redact::mirror_blocked(&body, &spec.redaction_rules);
+    let c = Candidate::from_value(body).map_err(|_| RebuildError::Malformed)?;
+    Ok((c, blocked))
+}
+
 /// [`build_candidate`] with the report of the ops (`None` without ops); a new redacted revision
-/// is built through this, so it hashes exactly as its rebuild will. Ops that block (§5.3), or a
-/// redacted candidate over the 16 MiB release cap (every-occurrence masks can grow a body: each
-/// match becomes `[REDACTED]`; §5.2 step 4, and with it the 24 MiB IPC frame), are `Blocked`.
+/// is built through this, so it hashes exactly as its rebuild will. Ops that block (§5.3), a
+/// candidate without ops that fails the mirror check (§5.3: a rebuild before release, or a
+/// revision whose redactions were all undone), or a redacted candidate over the 16 MiB release
+/// cap (every-occurrence masks can grow a body: each match becomes `[REDACTED]`; §5.2 step 4,
+/// and with it the 24 MiB IPC frame), are `Blocked`.
 pub fn build_redacted(
     spec: &OperationSpec,
     body: Value,
     ops: &[RedactionOp],
 ) -> Result<(Candidate, Option<RedactionReport>), RebuildError> {
     if ops.is_empty() {
-        let c = Candidate::from_value(body).map_err(|_| RebuildError::Malformed)?;
+        let (c, blocked) = build_unredacted(spec, body)?;
+        if blocked {
+            return Err(RebuildError::Blocked);
+        }
         return Ok((c, None));
     }
     let out = redact::apply(

@@ -923,11 +923,9 @@ async fn u27_per_item_field_drop_and_mask_reach_mirror() -> TestResult {
     Ok(())
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn u27_mirror_without_counterpart_blocks_release() -> TestResult {
-    use atlas_duck_core::DecisionError;
-    use atlas_duck_core::payloads::InvalidReason;
-    let h = Harness::jira().await?;
+/// An issue whose rendered mirror holds comment 9, which `fields.comment.comments` lacks (§5.3
+/// "a mirror entry … which has no counterpart at all").
+fn orphan_issue() -> Value {
     let mut issue = full_issue(KEY);
     issue["fields"]["comment"] = json!({
         "total": 1, "startAt": 0, "maxResults": 50,
@@ -936,20 +934,55 @@ async fn u27_mirror_without_counterpart_blocks_release() -> TestResult {
     issue["renderedFields"] = json!({
         "comment": {"comments": [
             {"id": "7", "body": "<p>plain</p>"},
-            {"id": "9", "body": "<p>orphan</p>"}
+            {"id": "9", "body": "<p>orphan</p>", "visibility": restriction()}
         ]}
     });
-    mount_issue(jira(&h)?, KEY, &issue).await;
+    issue
+}
+
+/// A plain release of `id` is refused as not approvable: `DECISION_INVALID {not_approvable}`,
+/// nothing released.
+async fn plain_release_refused(h: &Harness, id: &str) -> TestResult {
+    use atlas_duck_core::DecisionError;
+    use atlas_duck_core::payloads::InvalidReason;
+    let res = h.approver().release(id);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let invalid = records(h, id, EventType::DECISION_INVALID).await?;
+    assert_eq!(
+        invalid.first().map(|r| r["reason"].clone()),
+        Some(json!("not_approvable"))
+    );
+    assert!(
+        records(h, id, EventType::READ_RELEASED).await?.is_empty(),
+        "nothing was released"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u27_mirror_without_counterpart_blocks_release() -> TestResult {
+    use atlas_duck_core::DecisionError;
+    use atlas_duck_core::payloads::InvalidReason;
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &orphan_issue()).await;
     let id = queued(
         &h,
         json!({ "key": KEY, "fields": ["summary", "comment"], "rendered": true }),
     )
     .await?;
-    // The M3 mirror check runs with the redaction ops (an unredacted release drops nothing): a
-    // redaction of an issue whose rendered mirror holds an entry with no `fields` counterpart
-    // is not approvable, so no redacted revision is built and nothing is released.
+    // The mirror check runs on the unredacted candidate too (§5.3, §5.1 inv. 6): the preview is
+    // not approvable and a plain release is refused.
     let ap = h.approver();
-    ap.open(&id).map_err(de)?;
+    let preview = ap.open(&id).map_err(de)?.preview;
+    assert!(!preview.approvable, "an orphan mirror entry is approvable");
+    plain_release_refused(&h, &id).await?;
+    // A redaction that leaves the orphan in place is refused as well (`apply`'s own check).
     let res = ap.redact(
         &id,
         vec![atlas_duck_core::RedactionOp::DropItem {
@@ -965,16 +998,77 @@ async fn u27_mirror_without_counterpart_blocks_release() -> TestResult {
         ),
         "{res:?}"
     );
-    let invalid = records(&h, &id, EventType::DECISION_INVALID).await?;
-    assert_eq!(
-        invalid.first().map(|r| r["reason"].clone()),
-        Some(json!("not_approvable"))
-    );
-    assert!(
-        records(&h, &id, EventType::READ_RELEASED).await?.is_empty(),
-        "nothing was released"
-    );
+    assert!(records(&h, &id, EventType::READ_RELEASED).await?.is_empty());
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u27_dropping_the_orphan_unblocks_and_undo_is_refused() -> TestResult {
+    use atlas_duck_core::payloads::InvalidReason;
+    use atlas_duck_core::{DecisionError, RedactionOp};
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &orphan_issue()).await;
+    let id = queued(
+        &h,
+        json!({ "key": KEY, "fields": ["summary", "comment"], "rendered": true }),
+    )
+    .await?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    // Dropping the orphan entry itself passes the check: a new, approvable revision.
+    let rev = ap
+        .redact(
+            &id,
+            vec![RedactionOp::DropItem {
+                array_path: "renderedFields.comment.comments".into(),
+                key: "id".into(),
+                value: json!("9"),
+            }],
+        )
+        .map_err(de)?;
+    let shown = h.decisions().preview_fetch(&id, Some(rev)).map_err(de)?;
+    assert!(shown.preview.approvable);
+    // Undoing every redaction (back to no ops) rebuilds the orphan candidate: refused, and the
+    // redacted revision stays current.
+    let res = ap.redact(&id, Vec::new());
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    assert!(records(&h, &id, EventType::READ_RELEASED).await?.is_empty());
+    ap.release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    let text = env.to_json_line();
+    assert!(!text.contains("orphan"), "{text}");
+    assert!(!text.contains("Administrators"), "{text}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u27_search_orphan_mirror_blocks_release() -> TestResult {
+    let h = Harness::jira().await?;
+    let mut issue = orphan_issue();
+    issue["fields"] = json!({
+        "summary": "found",
+        "comment": orphan_issue()["fields"]["comment"].clone()
+    });
+    let page = json!({"startAt": 0, "maxResults": 50, "total": 1, "issues": [issue]});
+    jira(&h)?
+        .json("/rest/api/2/search", 200, &page.to_string())
+        .await;
+    let env = h
+        .submit("jira.search", json!({ "jql": "project = ABC" }))
+        .await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert!(!preview.approvable, "an orphan mirror entry is approvable");
+    plain_release_refused(&h, &id).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1137,6 +1231,167 @@ fn long_values_are_cut_and_counted_as_hidden() -> TestResult {
     assert!(row.value_text.len() < 5_000, "{}", row.value_text.len());
     assert!(row.value_text.ends_with("(see Raw)"), "{}", row.value_text);
     assert_eq!(model.header.hidden_in_preview_bytes, 10_000 - 4096);
+    Ok(())
+}
+
+/// The rows of a `JiraIssue` preview model.
+fn rows_of(model: &atlas_duck_core::ops::PreviewModel) -> Result<&[FieldRow], TestError> {
+    match &model.body {
+        PreviewBody::JiraIssue { fields, .. } => Ok(fields),
+        _ => Err("not a Jira issue body".into()),
+    }
+}
+
+#[test]
+fn top_level_keys_have_rows_and_count_as_hidden() -> TestResult {
+    // §6.1 principle 3: a `changelog` (old values of any field) is shown or counted as hidden.
+    let mut issue = full_issue(KEY);
+    let old = "<old secret text>".repeat(500);
+    issue["changelog"] = json!({"histories": [{"items": [
+        {"field": "description", "fromString": old, "toString": "new"}
+    ]}]});
+    issue["names"] = json!({"summary": "Summary"});
+    let params = json!({ "key": KEY, "changelog": true });
+    let model = preview_of(&issue, &params, None)?;
+    let rows = rows_of(&model)?;
+    let changelog = rows
+        .iter()
+        .find(|r| r.id == "changelog")
+        .ok_or("no changelog row")?;
+    assert_eq!(changelog.name, "Change history (outside fields)");
+    assert!(changelog.value_text.contains("<old secret text>"));
+    assert!(changelog.value_text.ends_with("(see Raw)"));
+    let names = rows
+        .iter()
+        .find(|r| r.id == "names")
+        .ok_or("no names row")?;
+    assert_eq!(names.value_text, r#"{"summary":"Summary"}"#);
+    let full = issue["changelog"].to_string().len();
+    assert_eq!(
+        model.header.hidden_in_preview_bytes,
+        u64::try_from(full - 4096)?
+    );
+    // `key`, `id`, `self` and `expand` have no row (the card shows the key).
+    for skipped in ["key", "id", "self", "expand"] {
+        assert!(rows.iter().all(|r| r.id != skipped), "{skipped} has a row");
+    }
+    Ok(())
+}
+
+#[test]
+fn description_is_not_counted_twice() -> TestResult {
+    // The `description` row points at the rendered description; only that one is cut.
+    let mut issue = full_issue(KEY);
+    issue["fields"]["description"] = json!("d".repeat(10_000));
+    let model = preview_of(&issue, &json!({ "key": KEY }), None)?;
+    assert_eq!(model.header.hidden_in_preview_bytes, 0);
+    let row = rows_of(&model)?
+        .iter()
+        .find(|r| r.id == "description")
+        .ok_or("no description row")?;
+    assert_eq!(row.value_text, "rendered below");
+    Ok(())
+}
+
+#[test]
+fn server_rendered_comment_row_names_where_the_bodies_are() -> TestResult {
+    let mut issue = full_issue(KEY);
+    issue["fields"]["comment"] = json!({"comments": [{"id": "7", "body": "plain"}]});
+    issue["renderedFields"] = json!({"comment": {"comments": [{"id": "7", "body": "<p>x</p>"}]}});
+    let model = preview_of(&issue, &json!({ "key": KEY, "rendered": true }), None)?;
+    let rows = rows_of(&model)?;
+    let value = |id: &str| {
+        rows.iter()
+            .find(|r| r.id == id)
+            .map(|r| r.value_text.as_str())
+    };
+    assert_eq!(value("comment"), Some("1 comments, shown below"));
+    assert_eq!(
+        value("renderedFields.comment"),
+        Some("1 server-rendered comments (bodies in Raw; the cards below show the wiki source)")
+    );
+    Ok(())
+}
+
+#[test]
+fn cached_name_wins_over_the_built_in_name() -> TestResult {
+    use atlas_duck_core::metadata::FieldNames;
+    let names = FieldNames::from(std::collections::BTreeMap::from([(
+        "status".to_owned(),
+        "Workflow State".to_owned(),
+    )]));
+    let model = preview_of(&full_issue(KEY), &json!({ "key": KEY }), Some(&names))?;
+    let row = rows_of(&model)?
+        .iter()
+        .find(|r| r.id == "status")
+        .ok_or("no status row")?;
+    assert_eq!(row.name, "Workflow State");
+    Ok(())
+}
+
+#[test]
+fn description_and_comment_caps_cut_and_count() -> TestResult {
+    let mut issue = full_issue(KEY);
+    issue["fields"]["description"] = json!("a".repeat(64 * 1024 + 100));
+    issue["fields"]["comment"] = json!({"comments": [
+        {"id": "7", "body": "b".repeat(16 * 1024 + 50)}
+    ]});
+    let model = preview_of(&issue, &json!({ "key": KEY }), None)?;
+    let PreviewBody::JiraIssue {
+        description_html,
+        comments,
+        ..
+    } = &model.body
+    else {
+        return Err("not a Jira issue body".into());
+    };
+    let description = description_html.as_deref().ok_or("no description_html")?;
+    assert!(
+        description.contains("… 100 more bytes (see Raw)"),
+        "{}",
+        &description[description.len().saturating_sub(200)..]
+    );
+    let body = &comments.first().ok_or("no comment")?.body_html;
+    assert!(body.contains("… 50 more bytes (see Raw)"));
+    assert_eq!(model.header.hidden_in_preview_bytes, 150);
+    Ok(())
+}
+
+#[test]
+fn cut_never_splits_a_multi_byte_char() -> TestResult {
+    let mut issue = full_issue(KEY);
+    issue["fields"]["customfield_10200"] = json!(format!("{}é", "a".repeat(4095)));
+    let model = preview_of(&issue, &json!({ "key": KEY }), None)?;
+    let row = rows_of(&model)?
+        .iter()
+        .find(|r| r.id == "customfield_10200")
+        .ok_or("no row")?;
+    assert_eq!(
+        row.value_text,
+        format!("{}… 2 more bytes (see Raw)", "a".repeat(4095))
+    );
+    assert_eq!(model.header.hidden_in_preview_bytes, 2);
+    // A description cut inside a multi-byte char keeps the whole char out.
+    let mut issue = full_issue(KEY);
+    issue["fields"]["description"] = json!(format!("{}é", "a".repeat(64 * 1024 - 1)));
+    let model = preview_of(&issue, &json!({ "key": KEY }), None)?;
+    assert_eq!(model.header.hidden_in_preview_bytes, 2);
+    Ok(())
+}
+
+#[test]
+fn field_row_ids_are_one_line() -> TestResult {
+    let mut issue = full_issue(KEY);
+    issue["fields"]["odd\nid"] = json!("x");
+    issue["renderedFields"] = json!({"odd\nid": "y"});
+    let model = preview_of(&issue, &json!({ "key": KEY, "rendered": true }), None)?;
+    let ids: Vec<&str> = rows_of(&model)?.iter().map(|r| r.id.as_str()).collect();
+    assert!(ids.contains(&"odd\u{27e8}U+000A\u{27e9}id"), "{ids:?}");
+    assert!(
+        ids.contains(&"renderedFields.odd\u{27e8}U+000A\u{27e9}id"),
+        "{ids:?}"
+    );
+    assert!(ids.iter().all(|i| !i.contains('\n')));
     Ok(())
 }
 

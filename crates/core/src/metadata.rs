@@ -165,7 +165,7 @@ pub fn field_label(names: Option<&FieldNames>, id: &str) -> String {
 /// `\t`, `\n` and `\r`, which [`escape_for_display`] keeps for multi-line text, as the same
 /// `⟨U+XXXX⟩` escapes (T8 review M-1): a label is one line. Applied after `escape_for_display`,
 /// which escapes a literal `⟨`, so the encoding stays injective.
-fn one_line(s: String) -> String {
+pub(crate) fn one_line(s: String) -> String {
     if !s.contains(['\t', '\n', '\r']) {
         return s;
     }
