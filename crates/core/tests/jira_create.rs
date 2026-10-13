@@ -773,6 +773,70 @@ async fn edit_form_read_only_targets() -> TestResult {
     Ok(())
 }
 
+/// A required `description` counts as set only when the param is there (PD-49): its own input is
+/// marked required (no `fields.description`, which validation refuses as a duplicate of the
+/// param), and filling it re-runs enrichment, so the Caution goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn description_edit_reruns_enrichment() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.json(PROJECTS_PATH, 200, fixtures::JIRA_PROJECTS).await;
+    mock.json(
+        &issuetypes_path("ABC"),
+        200,
+        fixtures::JIRA_CREATEMETA_ISSUETYPES,
+    )
+    .await;
+    let mut fields = team_fields();
+    fields["values"][1] = json!({"required": true, "name": "Description", "fieldId": "description",
+                                 "schema": {"type": "string", "system": "description"},
+                                 "hasDefaultValue": false});
+    mock.json(BUG_FIELDS, 200, &fields.to_string()).await;
+    let id = queued(&h, params("No description")).await?;
+    let p = preview(&h, &id)?;
+    let caution = p
+        .warnings
+        .iter()
+        .find(|w| w.id == WarningId::MissingRequiredFields)
+        .ok_or("no missing-fields warning")?;
+    assert_eq!(
+        caution.text,
+        "missing required fields: Description (description, string)"
+    );
+    let description = input(&p, "description")?;
+    assert!(description.required && !description.pre_added && !description.read_only);
+    assert!(input(&p, "fields.description").is_err());
+
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let fetched = records(&h, &id, EventType::PREVIEW_FETCH).await?.len();
+    let mut set = Map::new();
+    set.insert("description".into(), json!("Steps to reproduce"));
+    h.approver()
+        .edit(
+            &id,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )
+        .map_err(de)?;
+    rev_after(&h, &id, rev.counter).await?;
+    assert_eq!(
+        records(&h, &id, EventType::PREVIEW_FETCH).await?.len(),
+        fetched + 3,
+        "the edit re-ran the three stages"
+    );
+    let p = preview(&h, &id)?;
+    assert!(
+        !p.warnings
+            .iter()
+            .any(|w| w.id == WarningId::MissingRequiredFields),
+        "{:?}",
+        p.warnings
+    );
+    Ok(())
+}
+
 /// `edit_preadded` is for the inputs enrichment pre-added, nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn edit_preadded_refuses_other_paths() -> TestResult {

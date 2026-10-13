@@ -421,7 +421,9 @@ fn missing_kind(f: &MissingField) -> InputKind {
 
 /// §5.4 step 4 (Δ2, L06, PD-49): the edit form of a write preview: one input per params-schema
 /// property with the value that runs (`null` when absent), target params and conflict baselines
-/// read-only, then one pre-added input per missing required field of the latest verdict. Labels
+/// read-only, then one pre-added input per missing required field of the latest verdict. A missing
+/// field that is a param of its own (a create's `description`) marks that param's input required
+/// instead (`fields.description` would duplicate the param, which validation refuses). Labels
 /// from the server are display-escaped; values are the params as they are.
 pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
     let schema = spec.params_schema_json();
@@ -447,15 +449,21 @@ pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
             value: w.params.get(name).cloned().unwrap_or(Value::Null),
         })
         .collect();
-    inputs.extend(w.verdict.missing_fields.iter().map(|f| EditInput {
-        path: format!("fields.{}", f.id),
-        label: one_line(escape_for_display(&format!("{} ({})", f.name, f.id))),
-        kind: missing_kind(f),
-        read_only: false,
-        required: true,
-        pre_added: true,
-        value: Value::Null,
-    }));
+    for f in &w.verdict.missing_fields {
+        if let Some(own) = inputs.iter_mut().find(|i| !i.pre_added && i.path == f.id) {
+            own.required = true;
+            continue;
+        }
+        inputs.push(EditInput {
+            path: format!("fields.{}", f.id),
+            label: one_line(escape_for_display(&format!("{} ({})", f.name, f.id))),
+            kind: missing_kind(f),
+            read_only: false,
+            required: true,
+            pre_added: true,
+            value: Value::Null,
+        });
+    }
     EditForm { inputs }
 }
 

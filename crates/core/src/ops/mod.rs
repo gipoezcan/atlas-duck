@@ -587,8 +587,9 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             previewer: jira_preview::create_preview,
             stale_check: None,
             enrich: Some(&jira::ISSUE_CREATE_ENRICH),
-            // PD-49: an edit that adds `fields.<id>` re-runs enrichment (the warning goes away).
-            enrich_keys: &["project", "issuetype", "fields"],
+            // PD-49: an edit that adds `fields.<id>` (or the `description` a createmeta marks
+            // required) re-runs enrichment, so the warning follows the params that run.
+            enrich_keys: &["project", "issuetype", "fields", "description"],
         },
     ),
     (
