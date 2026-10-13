@@ -370,10 +370,13 @@ pub fn url_hash(u: &NormalizedBaseUrl) -> UrlHash;
 pub fn username_matches(header: &str, stored: &str) -> bool;      // the one Jira username comparison (§7.2): trim, %XX-decode only if present, NFC, simple case folding, `anonymous` never matches
 
 pub struct AuditCover { /* private ctor */ }                      // proof of a committed REQUEST_RECEIVED / SCRIPT_STARTED / SYSTEM_FETCH start record
-pub trait CommitProbe: Send + Sync { fn request_committed(&self, request_id: &str) -> bool; fn system_fetch_started(&self, fetch_id: &str) -> bool; }
+pub struct WriteCover { /* private ctor */ }                       // [M5 Δ6] proof of a committed WRITE_APPROVED for (request_id, candidate counter); M3 final review M-18
+pub trait CommitProbe: Send + Sync { fn request_committed(&self, request_id: &str) -> bool; fn system_fetch_started(&self, fetch_id: &str) -> bool;
+    fn write_approved(&self, request_id: &str, candidate_counter: u64) -> bool; }   // [M5 Δ6] `core::audit_port` marks (request_id, counter) only after the WRITE_APPROVED append returned Ok
 pub struct CoverIssuer; impl CoverIssuer { pub fn new(p: Arc<dyn CommitProbe>) -> Self;
     pub fn for_request(&self, request_id: &str) -> Result<AuditCover, NotCommitted>;
-    pub fn for_system_fetch(&self, fetch_id: &str) -> Result<AuditCover, NotCommitted>; }
+    pub fn for_system_fetch(&self, fetch_id: &str) -> Result<AuditCover, NotCommitted>;
+    pub fn for_write(&self, request_id: &str, candidate_counter: u64) -> Result<WriteCover, NotCommitted>; }   // [M5 Δ6]
 pub trait DateObserver: Send + Sync { fn observe(&self, instance_id: &str, server_date: SystemTime, at: Instant); }  // only TLS-verified, parsed responses
 
 pub struct InstanceClient { /* base URL, optional CA, at most one Proxy, limiter (max 4), CredentialProvider, DateObserver */ }
@@ -381,7 +384,7 @@ impl InstanceClient {
     pub async fn get(&self, cover: &AuditCover, call: &GetCall) -> FetchOutcome;                         // GET only
     pub async fn read_paginated(&self, cover: &AuditCover, call: &PagedCall, budget: &ReadBudget) -> PagedOutcome; // offset pagination rebuilt from the template; 32 MiB/response, 50 MiB total, 120 s
     pub async fn post_search(&self, cover: &AuditCover, call: &SearchCall) -> FetchOutcome;               // the one allowlisted POST outside write execution (jira.search)
-    pub async fn send_approved(&self, cover: &AuditCover, w: &ApprovedWrite) -> WriteOutcome;             // sends only the requests of `w.requests`, in index order, 60 s each, and compares every outgoing request byte for byte (method, resolved URL, Content-Type, body) with its list entry before writing it
+    pub async fn send_approved(&self, cover: &WriteCover, w: &ApprovedWrite) -> WriteOutcome;             // sends only the requests of `w.requests`, in index order, 60 s each, and compares every outgoing request byte for byte (method, resolved URL, Content-Type, body) with its list entry before writing it
 }
 pub struct HttpRequestSpec { pub index: u32, pub method: String, pub resolved_url: String, pub content_type: Option<String>, pub body: Vec<u8> }   // [named-by-plan]; the five §5.1 inv. 3 fields
 pub enum ExpectedBody { Json, Empty }
@@ -424,11 +427,26 @@ pub fn hard_check_wiki(wiki: &str, e: &EmittedConstructs) -> Result<(), Unrecord
 pub fn check_markdown_placeholders(md: &str) -> Result<(), Vec<PlaceholderHit /* kind: link|image|macro|user, count */>>;
 pub fn lossy_update(current_storage: &str, outgoing_storage: &str) -> LostCounts;   // {macros, images, links, layouts}
 pub fn wiki_to_preview_html(wiki: &str) -> String;
+pub fn wiki_to_text(wiki: &str) -> String;                            // [M5 Δ1] text projection of the renderer output, for the Jira rendered diff (§6.3)
+pub fn wiki_constructs(wiki: &str) -> WikiConstructs;                 // [M5 Δ1] inventory the write previews list (§7.6)
+pub struct EmittedConstructs { pub code_blocks: Vec<EmittedCode> }    // [M5 Δ1] the converter's own containers, by position in its output
+pub struct EmittedCode { pub kind: CodeKind /* Code | Noformat */, pub byte_range: std::ops::Range<usize> }
+pub struct Unrecorded { pub kind: ConstructKind, pub count: u64 }     // no text, no offset: the error must not echo the body
+pub enum ConstructKind { Macro, Mention, Include, Image, Attachment }
+pub struct WikiConstructs { pub macros: Vec<String>, pub mentions: Vec<String>, pub includes: Vec<String>, pub links: Vec<String> /* targets */, pub images: Vec<String>, pub attachments: Vec<String> }
 
 // preview
 pub struct CandidateRev { pub counter: u64, pub candidate_hash: [u8; 32] }   // [2026-10-08 M3 PD-06] defined here, because `Preview` carries it and `preview` cannot depend on `core`; `core` re-exports it (`pub use atlas_duck_preview::CandidateRev`), same shape as in C.7
 pub struct Preview { pub candidate_rev: CandidateRev, pub approvable: bool, pub header: PreviewHeader, pub warnings: Vec<Warning>,
-                     pub body: PreviewBody, pub raw: RawPager, pub also_appears_in: Vec<String>, pub preview_builder_version: String }   // [spec §2.3] name `Preview`
+                     pub body: PreviewBody, pub raw: RawPager, pub also_appears_in: Vec<String>, pub preview_builder_version: String,
+                     pub edit_form: Option<EditForm> }   // [spec §2.3] name `Preview`; [M5 Δ2] `edit_form`: Rust side of §5.4 step 4, rendered in M6
+// [M5 Δ2] PreviewBody gains: JiraIssue { card: IssueCard, fields: Vec<FieldRow>, description_html: Option<String>, comments: Vec<CommentView> },
+// Table { columns, rows: Vec<Vec<String>>, count: Option<ItemCount> }, WriteSummary { sentence, rows: Vec<(String, String)>, constructs: Option<ConstructList>, requests: Vec<RequestView> },
+// EditDiff { rendered: Vec<DiffLine>, raw: Vec<DiffLine>, raw_only_changes: u64, requests: Vec<RequestView> }, Transition { from, to, fields: Vec<(String, String)>, requests: Vec<RequestView> }.
+// Every string is display-escaped by core; `requests` keeps §5.1 inv. 4 (the exact list is part of every write body).
+pub struct EditForm { pub inputs: Vec<EditInput> }
+pub struct EditInput { pub path: String /* param name or "fields.<id>" */, pub label: String, pub kind: InputKind, pub read_only: bool, pub required: bool, pub pre_added: bool, pub value: serde_json::Value }
+pub enum InputKind { Text, LongText, Integer, Boolean, Json, Choice { allowed_values: Vec<String> /* <= 10 */ } }
 pub enum Level { Caution, Info }   pub struct Warning { pub id: WarningId, pub level: Level, pub text: String }   // exactly one level per id (§13)
 pub const PREVIEW_BUILDER_VERSION: &str;                              // includes the Unicode/emoji table version (§6.4, §8.3)
 pub mod invisible {                                                   // [spec §3.3, §6.4] the single classifier; consumed by `core::normalize`, previews, escaping, counts
@@ -437,6 +455,11 @@ pub mod invisible {                                                   // [spec �
 }
 pub fn sanitize_html(html: &str) -> String;                           // ammonia; never keeps style/class/<style>
 pub fn iframe_document(body_html: &str, platform: Platform) -> String; // meta CSP first, preview.css link, sandbox="" is set by the UI
+pub mod diff {                                                        // [M5 Δ2] Jira edit diffs (§6.3)
+    pub fn line_diff(old: &str, new: &str) -> Vec<DiffLine>;          // larger than DIFF_MAX_LINES = 20_000 → one Del-all/Add-all hunk
+    pub struct DiffLine { pub op: DiffOp /* Same | Add | Del */, pub text: String }
+    pub const DIFF_MAX_LINES: usize = 20_000;
+}
 ```
 `WarningId` (snake_case, stable, [named-by-plan]; one per §6.2 text) — Caution: `restricted_comments`, `security_level`, `all_fields`, `bidi_controls`, `other_invisible`, `mixed_script`, `raw_only_diff`, `lossy_update`, `server_rendered_view`, `possible_duplicate`, `similar_request`, `conflict`, `missing_required_fields`, `changed_since_review`, `could_not_recheck`, `token_changed`, `token_identity_mismatch`, `identity_header_lost`, `user_renamed`, `instance_url_changed`; Info: `linked_issue_summaries`, `custom_fields`, `truncated_by_cap`, `host_calls_lossy`, `unknown_macros`, `unresolved_mention`, `cql_broad`, `source_formatting_removed`. The invisible-character classifier crate choice (V31) and its golden test (§13 S-13) are M3.
 
@@ -451,6 +474,11 @@ pub enum Confirm { Ok, Cancel }
 pub struct OpImpl { pub executor: ExecutorFn, pub previewer: PreviewerFn, pub stale_check: Option<StaleCheckFn>,
                     pub enrich: Option<EnrichFn>, pub enrich_keys: &'static [&'static str] }   // [spec §2.3] first three fields; `enrich` (post-send enrichment for the previewer, re-run on edits of an `enrich_keys` field) and `enrich_keys` added by M3 PD-26 [2026-10-08]
 pub fn op_table() -> &'static std::collections::BTreeMap<&'static str, OpImpl>;     // one entry per registry id (46), coverage test in M3
+// [M5 Δ3] `EnrichRule { plan, judge }` → `EnrichRule { pub plan: fn(&EnrichCtx<'_>, &[Value] /* answers so far */) -> EnrichStep, pub judge: fn(&EnrichCtx<'_>, &[Value]) -> EnrichVerdict }`;
+//   `pub enum EnrichStep { Fetch(Vec<(EnrichPurpose, GetCall)>), Judge }`; the engine calls `plan` until it returns `Judge` (at most `MAX_ENRICH_STAGES = 4` rounds; a fifth `Fetch` is an internal EnrichmentError, fail closed), then `judge` with all answers. `StaleRule` unchanged.
+// [M5 Δ4] `EnrichVerdict` gains `pub missing_fields: Vec<MissingField>` (`MissingField { id, name, schema_type, allowed_values: Vec<String> /* <= 10, raw names */ }`) and `pub summary: Option<WriteSummaryFacts>` (display facts for the write previews; display-escaped by the previewer). `DenyDetails::MissingFields` is wired (today it answers `refuse()`).
+// [M5 Δ5] `PreviewCtx` gains `pub field_names: Option<&'a FieldNames>` (`core::metadata::FieldNames`, the cached field id → name map; `None` = unknown, ids shown). `ExecCtx` unchanged.
+// [M5 Δ7] `EffectiveCaps` gains `pub comments_cap: Option<u32>` (`None` = registry `caps.comments_cap`, 100).
 // ExecutorFn: params + enrichment → Vec<HttpRequestSpec> (writes) or a read plan (template, pagination, normalization); PreviewerFn → preview::Preview; the identity call before every write is NOT a stale_check (it runs for every write incl. rule "none")
 
 pub struct CoreDeps { pub audit: audit::Store, pub clock: Arc<dyn audit::Clock>, pub credentials: Arc<dyn atlassian::CredentialProvider>,
@@ -622,10 +650,10 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Scope (§14 M5):** Jira core then extended ops: declared write success shapes, wiki/markdown converters (code-body rule, re-parse hard check), stale rules incl. `recheck_failed`, the `expected` conflict check for `jira.issue.edit`, name resolution with the unresolved-name deny hint, the 50-issue move limit, `meta.page` semantics, the `jira.issue.create` `fields` param and the missing-required-fields warning, edit-form model and deny details, `edited_keys`, `renderedFields` item-level mirrors and the mirror check.
 - **Placements:** "core then extended" = first the ops that §13 names (`jira.issue.get`, `jira.search`, `jira.issue.create`, `jira.issue.edit`, `jira.comment.add`, `jira.issue.transition`, `jira.issuelink.create`, `jira.sprint.move_issues`), then the rest of the 28; M5 delivers only the Rust/model side of the edit form (§14 lists "edit-form inputs" under M5, but the edit-form UI is M6); every Jira op has a wiremock test generated from the registry (X-09, Jira half).
 - **Depends on:** M3; tests use M4 (CLI flag binding, CLI flows).
-- **Exit criterion:** `cargo test -p atlas-duck-convert -p atlas-duck-preview -p atlas-duck-core --locked` plus `cargo test -p atlas-duck-app --features scripted-approver --test jira_flows` green: U-02, U-23 (wiki half), U-24, U-27, U-30, U-33, U-34 (Jira half); I-06 (move-op cases), I-09 (`jira.search` probe), I-18, I-22 (`meta.page`), I-23 (`recheck_failed`), I-25, I-26 (`jira.issue.transition`), I-28 (`jira.comment.add`), I-35 (Jira kinds), I-36 (`jira.issue.edit`), X-09 (Jira), X-10 (Jira gates), S-12 (Jira previews), RF-5b; env-gated live tests L-01 for V05, V06 (Jira half), V23 (Jira endpoints and SSO fronts that answer 3xx or HTML), V25 (Agile/search) run once against a real Jira DC and their findings update the spec and ledger if they differ.
-- **§15 resolved:** V05, V06 (Jira half), V23 (Jira half, live), V25 (Agile 1.0 and `POST /rest/api/2/search` header half).
-- **Ledger:** L06, L12, L13, L17, L22, L25, L29, L31.
-- **Status:** detailed plan: to be written after M4
+- **Exit criterion:** `cargo test -p atlas-duck-convert -p atlas-duck-preview -p atlas-duck-core --locked` plus `cargo test -p atlas-duck-app --features scripted-approver --test jira_flows` green: U-02, U-23 (wiki half), U-24, U-27, U-30, U-33, U-34 (Jira half); I-06 (move-op cases), I-09 (`jira.search` probe), I-18, I-22 (`meta.page`), I-23 (`recheck_failed`), I-25, I-26 (`jira.issue.transition`), I-28 (`jira.comment.add`), I-35 (Jira kinds), I-36 (`jira.issue.edit`), X-09 (Jira), X-10 (Jira gates), S-12 (Jira previews), RF-5b; env-gated live tests L-01 for V05, V06 (Jira half), V23 (Jira endpoints and SSO fronts that answer 3xx or HTML), V25 (Agile/search) are manual (no CI leg, L96): a human runs them once against a real Jira DC, and their findings update the spec and ledger if they differ.
+- **§15 resolved:** V05, V06 (Jira half), V23 (Jira half, live), V25 (Agile 1.0 and `POST /rest/api/2/search` header half); design-resolved only until the manual live run (L96), as is M3 M-16.
+- **Ledger:** L06, L12, L13, L17, L22, L25, L29, L31, L84–L96.
+- **Status:** detailed plan: 2026-10-13-atlas-duck-m05-jira-adapter.md
 
 ### M6 — Approvals UI
 
