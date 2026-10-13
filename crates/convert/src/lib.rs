@@ -4,3 +4,7 @@
 //! `clippy::unwrap_used` and `clippy::expect_used` are errors here (§7.7).
 
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+
+pub mod wiki;
+
+pub use wiki::{CodeKind, ConstructKind, WikiConstructs, wiki_constructs};
