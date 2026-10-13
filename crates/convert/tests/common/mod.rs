@@ -151,6 +151,12 @@ pub fn md_fragment() -> impl Strategy<Value = String> {
             "\u{85}",
             "{{",
             "}}",
+            "{",
+            "quote",
+            " quote",
+            "Quote",
+            "\n>\n> ",
+            "\n> ```\n",
         ])
         .prop_map(str::to_owned),
         "[a-z]{1,5}",
@@ -158,6 +164,28 @@ pub fn md_fragment() -> impl Strategy<Value = String> {
     ]
 }
 
+/// A block quote opener followed by fragments, with quote-continuation and fence fragments
+/// mixed in so quote containers, and quotes nesting code, are common draws.
+fn quote_markdown() -> impl Strategy<Value = String> {
+    let extra = prop::sample::select(vec![
+        "{",
+        "quote",
+        " quote",
+        "Quote",
+        "\n>\n> ",
+        "\n> ```\n",
+        "- ",
+        "\\{",
+        "{quote}",
+    ])
+    .prop_map(str::to_owned);
+    proptest::collection::vec(prop_oneof![md_fragment(), extra.clone(), extra], 0..24)
+        .prop_map(|v| format!("> {}", v.concat()))
+}
+
 pub fn markdown() -> impl Strategy<Value = String> {
-    proptest::collection::vec(md_fragment(), 0..40).prop_map(|v| v.concat())
+    prop_oneof![
+        3 => proptest::collection::vec(md_fragment(), 0..40).prop_map(|v| v.concat()),
+        2 => quote_markdown(),
+    ]
 }

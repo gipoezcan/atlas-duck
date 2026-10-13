@@ -743,9 +743,16 @@ fn quote(mut blocks: BlockList, nested: bool) -> Rendered {
     if children.is_empty() {
         return Rendered::default();
     }
+    // The hazard is judged on the body as written (children joined by blank lines), the same
+    // text `hard_check` sees: a tag can form across a child boundary (`\{` then `quote`).
+    let body_text = children
+        .iter()
+        .map(|c| c.r.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
     let flat = nested
         || matches!(children.as_slice(), [Child { para: true, .. }])
-        || children.iter().any(|c| has_quote_tag(&c.r.text));
+        || has_quote_tag(&body_text);
     if flat {
         return join(children.into_iter().map(|c| {
             if c.para {

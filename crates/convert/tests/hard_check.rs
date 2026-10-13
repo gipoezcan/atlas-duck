@@ -467,3 +467,71 @@ proptest! {
         );
     }
 }
+
+/// T4 review Important 1: a quote tag formed only across the `\n\n` between two children
+/// (`\{` ending one, `quote` starting the next) is a hazard for `hard_check_wiki`, so the
+/// converter must flatten such quotes instead of recording an untrusted container.
+#[test]
+fn cross_child_quote_tag_flattens_and_passes() -> TestResult {
+    let inputs = [
+        "> a {\n>\n> quote b\n",
+        "> a {\n>\n> Quote of the day\n",
+        "> a {\n>\n> QUOTE\n",
+        "> a {\n>\n>  quote\n",
+        "> a {\n>\n> quote:x\n",
+        "> - x {\n>\n> quote\n",
+        "> a &#123;\n>\n> quote b\n",
+        "> a \\{\n>\n> quote b\n",
+    ];
+    for md in inputs {
+        let (out, e) = markdown_to_wiki(md);
+        assert_eq!(hard_check_wiki(&out, &e), Ok(()), "md {md:?} -> {out:?}");
+        assert!(
+            !kinds(&e).contains(&ContainerKind::Quote),
+            "md {md:?} -> {out:?}"
+        );
+        spans_match_record(&out, &e)?;
+    }
+    Ok(())
+}
+
+/// The fuzz must keep reaching the quote trust logic (T4 review Minor 1): over a fixed
+/// deterministic run of draws, quote containers and quotes nesting code stay common.
+#[test]
+fn fuzz_strategy_reaches_quote_containers() -> TestResult {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    const DRAWS: usize = 2000;
+    let strategy = markdown();
+    let mut runner = TestRunner::deterministic();
+    let (mut quotes, mut quotes_with_code) = (0, 0);
+    for _ in 0..DRAWS {
+        let md = strategy
+            .new_tree(&mut runner)
+            .map_err(|e| e.to_string())?
+            .current();
+        let (_, e) = markdown_to_wiki(&md);
+        for q in e
+            .code_blocks
+            .iter()
+            .filter(|c| c.kind == ContainerKind::Quote)
+        {
+            quotes += 1;
+            if e.code_blocks.iter().any(|c| {
+                c.kind != ContainerKind::Quote
+                    && c.byte_range.start >= q.byte_range.start
+                    && c.byte_range.end <= q.byte_range.end
+            }) {
+                quotes_with_code += 1;
+            }
+        }
+    }
+    eprintln!("quote containers {quotes}, with nested code {quotes_with_code} in {DRAWS} draws");
+    assert!(quotes >= DRAWS / 10, "quote containers: {quotes}");
+    assert!(
+        quotes_with_code >= DRAWS / 10,
+        "quotes with nested code: {quotes_with_code}"
+    );
+    Ok(())
+}
