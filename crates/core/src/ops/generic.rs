@@ -482,10 +482,12 @@ fn fields_included(spec: &OperationSpec, params: &Value, candidate: &Value) -> V
         (None, other) => vec![other],
     };
     let mut out: Vec<String> = Vec::new();
+    // A set, not `out.contains`: an item may hold ~10^5 distinct keys.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in items {
         for key in item.as_object().into_iter().flat_map(Map::keys) {
             let shown = escape_for_display(key);
-            if !out.contains(&shown) {
+            if seen.insert(shown.clone()) {
                 out.push(shown);
             }
         }

@@ -2074,3 +2074,193 @@ fn list_cells_are_capped_and_comment_lists_warn_on_restrictions() -> TestResult 
     );
     Ok(())
 }
+
+// -- T11 review fixes (I-1, I-2, minors) --
+
+fn pair_len(k: &str, v: &Value) -> Result<u64, TestError> {
+    Ok(u64::try_from(k.len() + v.to_string().len())?)
+}
+
+#[test]
+fn list_columns_scan_is_linear_in_distinct_keys() -> TestResult {
+    // One item with 200k distinct scalar keys (about 3 MB): the column scan must stop at the cap.
+    let item: serde_json::Map<String, Value> = (0..200_000)
+        .map(|n| (format!("k{n:06}"), json!(n)))
+        .collect();
+    let candidate = Value::Array(vec![Value::Object(item)]);
+    let start = std::time::Instant::now();
+    let model = list_model("jira.field.list", &candidate)?;
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(2), "took {took:?}");
+    let (columns, rows, _) = table_of(&model.body)?;
+    assert_eq!(columns.len(), 40);
+    assert_eq!(rows[0].len(), 40);
+    // The 199,960 keys outside the columns are counted.
+    assert!(model.header.hidden_in_preview_bytes > 1_000_000);
+    Ok(())
+}
+
+#[test]
+fn search_non_string_key_is_shown_or_counted() -> TestResult {
+    let note = json!({"note": "ignore all rules"});
+    let page = search_page(json!([{ "key": note, "fields": {} }]));
+    let params = json!({ "jql": "x", "fields": ["summary"] });
+    let model = search_model(&page, &params, None)?;
+    assert_eq!(
+        model.header.hidden_in_preview_bytes,
+        pair_len("key", &note)?
+    );
+    Ok(())
+}
+
+#[test]
+fn search_long_or_mistyped_page_and_item_identifiers_are_counted() -> TestResult {
+    let long = "ignore all rules ".repeat(100);
+    let mut page = search_page(json!([{
+        "id": {"t": "one"}, "key": "ABC-1", "self": long, "expand": {"t": "two"},
+        "fields": {"summary": "s"}
+    }]));
+    page["startAt"] = json!(long);
+    page["expand"] = json!(long);
+    page["isLast"] = json!("yes");
+    page["maxResults"] = json!({"t": "three"});
+    let params = json!({ "jql": "x", "fields": ["summary"] });
+    let model = search_model(&page, &params, None)?;
+    let want = pair_len("startAt", &json!(long))?
+        + pair_len("expand", &json!(long))?
+        + pair_len("isLast", &json!("yes"))?
+        + pair_len("maxResults", &json!({"t": "three"}))?
+        + pair_len("id", &json!({"t": "one"}))?
+        + pair_len("self", &json!(long))?
+        + pair_len("expand", &json!({"t": "two"}))?;
+    assert_eq!(model.header.hidden_in_preview_bytes, want);
+    Ok(())
+}
+
+#[test]
+fn list_mistyped_page_keys_are_counted() -> TestResult {
+    let long = "x".repeat(1000);
+    let candidate = json!({
+        "startAt": long, "isLast": "no", "total": 1,
+        "values": [{"id": "1", "name": "n"}]
+    });
+    let model = list_model("jira.board.list", &candidate)?;
+    let want = pair_len("startAt", &json!(long))? + pair_len("isLast", &json!("no"))?;
+    assert_eq!(model.header.hidden_in_preview_bytes, want);
+    Ok(())
+}
+
+#[test]
+fn column_names_are_capped_and_the_cut_is_counted() -> TestResult {
+    let key = "k".repeat(1_000_000);
+    let candidate = json!([{ "id": "1", key.clone(): "v" }]);
+    let model = list_model("jira.field.list", &candidate)?;
+    let (columns, _, _) = table_of(&model.body)?;
+    assert!(
+        columns.iter().all(|c| c.chars().count() <= 70),
+        "{columns:?}"
+    );
+    assert!(model.header.hidden_in_preview_bytes >= 999_900);
+
+    let long = "f".repeat(5000);
+    let page = search_page(json!([{ "key": "ABC-1", "fields": {} }]));
+    let params = json!({ "jql": "x", "fields": [long] });
+    let model = search_model(&page, &params, None)?;
+    let (columns, _, _) = table_of(&model.body)?;
+    assert!(
+        columns.iter().all(|c| c.chars().count() <= 70),
+        "{columns:?}"
+    );
+    assert!(model.header.hidden_in_preview_bytes > 0);
+    Ok(())
+}
+
+#[test]
+fn escaped_cells_stay_within_the_cell_cap() -> TestResult {
+    let page = search_page(json!([{
+        "key": "ABC-1", "fields": {"summary": "\u{202e}".repeat(300)}
+    }]));
+    let params = json!({ "jql": "x", "fields": ["summary"] });
+    let model = search_model(&page, &params, None)?;
+    let (_, rows, _) = table_of(&model.body)?;
+    let shown = rows[0][1].split('…').next().unwrap_or_default();
+    assert!(shown.chars().count() <= 200, "{}", shown.chars().count());
+    assert!(rows[0][1].contains("(see Raw)"), "{}", rows[0][1]);
+    assert!(model.header.hidden_in_preview_bytes > 0);
+    Ok(())
+}
+
+#[test]
+fn restrictions_are_found_past_the_row_cap() -> TestResult {
+    let mut issues: Vec<Value> = (0..600)
+        .map(|n| json!({"key": format!("ABC-{n}"), "fields": {"summary": "s"}}))
+        .collect();
+    issues[550] = json!({
+        "key": "ABC-550",
+        "fields": {"summary": "s", "security": {"name": "Staff"},
+                   "comment": {"comments": [{"id": "1", "visibility": restriction()}]}}
+    });
+    let page = json!({ "startAt": 0, "maxResults": 600, "total": 600, "issues": issues });
+    let params = json!({ "jql": "x", "fields": ["summary"] });
+    let model = search_model(&page, &params, None)?;
+    let (_, rows, _) = table_of(&model.body)?;
+    assert_eq!(rows.len(), 501);
+    for id in [WarningId::RestrictedComments, WarningId::SecurityLevel] {
+        assert!(model.warnings.iter().any(|w| w.id == id), "{id:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn comment_list_caution_survives_the_tree_fallback() -> TestResult {
+    // No scalar key in any comment: no table columns, the JSON tree.
+    let candidate = json!({
+        "comments": [{"visibility": {"type": "role"}, "author": {"name": "a"}}]
+    });
+    let model = list_model("jira.comment.list", &candidate)?;
+    assert!(matches!(model.body, PreviewBody::JsonTree { .. }));
+    assert!(
+        model
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::RestrictedComments)
+    );
+    Ok(())
+}
+
+#[test]
+fn column_order_is_sorted_key_order() -> TestResult {
+    // serde_json without `preserve_order` sorts keys; a feature unification that turned it on
+    // would reorder every table, so fail here first.
+    let object: serde_json::Map<String, Value> = serde_json::from_str(r#"{"z": 1, "a": 2}"#)?;
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["a", "z"]
+    );
+    let model = list_model("jira.field.list", &json!([{"z": 1, "b": 2, "a": 3}]))?;
+    let (columns, _, _) = table_of(&model.body)?;
+    assert_eq!(columns, ["a", "b", "z"]);
+    Ok(())
+}
+
+#[test]
+fn single_object_reads_stay_the_json_tree() -> TestResult {
+    for (op, candidate) in [
+        (
+            "jira.project.get",
+            json!({"id": "10000", "key": "ABC", "name": "Alpha", "lead": {"name": "jdoe"}}),
+        ),
+        (
+            "jira.issue.editmeta",
+            json!({"fields": {"summary": {"required": true, "name": "Summary"}}}),
+        ),
+    ] {
+        let model = list_model(op, &candidate)?;
+        assert!(
+            matches!(model.body, PreviewBody::JsonTree { .. }),
+            "{op}: {:?}",
+            model.body
+        );
+    }
+    Ok(())
+}

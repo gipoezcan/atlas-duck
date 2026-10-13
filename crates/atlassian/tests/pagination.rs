@@ -649,3 +649,37 @@ async fn short_last_page_is_not_end_of_results() -> TestResult {
     assert_eq!(out.next_start, Some(60));
     Ok(())
 }
+
+/// The same server (echo 100 above the request) with a real short page (30 of the 50 asked, no
+/// `total`, `isLast` false): the results have ended, so there is no `next_start`.
+#[tokio::test]
+async fn real_short_page_with_echo_above_want_ends() -> TestResult {
+    let dc = MockDc::start(Product::Jira, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/agile/1.0/board"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "startAt").unwrap_or(0);
+            let want = param(req, "maxResults").unwrap_or(0);
+            // 80 boards in all; no total.
+            let count = want.min(80u64.saturating_sub(start));
+            ok.clone()
+                .set_body_raw(jira_board_page(start, 100, None, count), "application/json")
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated_ctl(
+            &test_cover()?,
+            &board_call(50, 0),
+            &ReadBudget::default(),
+            200,
+            &FetchControl::new(),
+        )
+        .await;
+    assert_eq!(out.end, PageEnd::ResultsEnded);
+    assert_eq!(out.items_fetched, 80);
+    assert_eq!(out.next_start, None);
+    Ok(())
+}

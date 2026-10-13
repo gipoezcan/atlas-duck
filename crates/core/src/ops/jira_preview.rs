@@ -18,6 +18,7 @@ use atlas_duck_preview::{
     PreviewHeader, sanitize_html,
 };
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 
 use super::{PreviewCtx, PreviewInput, PreviewModel, generic};
 use crate::metadata::{FieldNames, field_label, one_line};
@@ -440,11 +441,39 @@ const COLUMN_SAMPLE_ITEMS: usize = 50;
 /// A table has at most this many columns; the keys beyond count as hidden.
 const MAX_COLUMNS: usize = 40;
 
-/// Keys of a result root that are page mechanics (shown as the count), not content.
-const PAGE_KEYS: [&str; 5] = ["startAt", "maxResults", "total", "isLast", "expand"];
+/// A column name shows at most this many chars; the cut bytes count as hidden.
+const COLUMN_NAME_CAP_CHARS: usize = 64;
 
-/// Keys of a search item that are not content: its identifiers (the key has its column).
-const ISSUE_ID_KEYS: [&str; 5] = ["key", "id", "self", "expand", "fields"];
+/// A page key or identifier is skipped (not counted as hidden) only when it has the expected
+/// type and, for a string, is at most this many bytes: nothing reaches the agent unshown and
+/// uncounted.
+const IDENT_CAP_BYTES: usize = 256;
+
+fn short_string(v: &Value) -> bool {
+    matches!(v, Value::String(s) if s.len() <= IDENT_CAP_BYTES)
+}
+
+/// A key of a result root that is page mechanics (shown as the count), not content: a number, a
+/// bool or a short string of the expected kind.
+fn is_page_mechanic(key: &str, value: &Value) -> bool {
+    match key {
+        "startAt" | "maxResults" | "total" => value.is_number(),
+        "isLast" => value.is_boolean(),
+        "expand" => short_string(value),
+        _ => false,
+    }
+}
+
+/// A key of a search item that is not content: its identifiers (the key has its column) with a
+/// short value, and `fields` (shown by the columns, the rest counted apart).
+fn is_item_identifier(key: &str, value: &Value) -> bool {
+    match key {
+        "fields" => true,
+        "key" | "self" | "expand" => short_string(value),
+        "id" => short_string(value) || value.is_number(),
+        _ => false,
+    }
+}
 
 /// The item arrays of the list ops that are objects (the paginated ops name theirs in the spec).
 const LIST_KEYS: [&str; 5] = [
@@ -475,20 +504,39 @@ fn cut_chars(s: &str, cap: usize) -> (&str, u64) {
     }
 }
 
-/// A table cell: the string itself, else compact JSON, cut at [`CELL_CAP_CHARS`] (said in the
-/// cell, the cut bytes added to `hidden`), display-escaped and one line.
+/// `raw` cut at `cap` chars, display-escaped and one line, then cut at `cap` chars again (the
+/// escape widens an invisible char to `⟨U+XXXX⟩`): the text, and the bytes cut in all.
+fn capped_text(raw: &str, cap: usize) -> (String, u64) {
+    let (kept, cut) = cut_chars(raw, cap);
+    let escaped = one_line(escape_for_display(kept));
+    let (shown, cut_escaped) = cut_chars(&escaped, cap);
+    (shown.to_owned(), cut.saturating_add(cut_escaped))
+}
+
+/// A table cell: the string itself, else compact JSON, cut at [`CELL_CAP_CHARS`] after escaping
+/// (said in the cell, the cut bytes added to `hidden`), display-escaped and one line.
 fn cell(value: &Value, hidden: &mut u64) -> String {
     let full = match value {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+        Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        other => std::borrow::Cow::Owned(other.to_string()),
     };
-    let (kept, cut) = cut_chars(&full, CELL_CAP_CHARS);
-    let shown = one_line(escape_for_display(kept));
+    let (shown, cut) = capped_text(&full, CELL_CAP_CHARS);
     if cut == 0 {
         return shown;
     }
     *hidden = hidden.saturating_add(cut);
     format!("{shown}… {cut} more bytes (see Raw)")
+}
+
+/// A column name (display-escaped, one line) cut at [`COLUMN_NAME_CAP_CHARS`]; the cut bytes are
+/// added to `hidden`.
+fn column_name(raw: &str, hidden: &mut u64) -> String {
+    let (shown, cut) = capped_text(raw, COLUMN_NAME_CAP_CHARS);
+    if cut == 0 {
+        return shown;
+    }
+    *hidden = hidden.saturating_add(cut);
+    format!("{shown}…")
 }
 
 /// A table cell of an item's member, or empty where the item has none.
@@ -509,7 +557,7 @@ fn other_root_bytes(root: &Value, items_key: Option<&str>) -> u64 {
         return 0;
     };
     map.iter()
-        .filter(|(k, _)| Some(k.as_str()) != items_key && !PAGE_KEYS.contains(&k.as_str()))
+        .filter(|(k, v)| Some(k.as_str()) != items_key && !is_page_mechanic(k, v))
         .fold(0u64, |sum, (k, v)| sum.saturating_add(pair_bytes(k, v)))
 }
 
@@ -543,12 +591,12 @@ pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
 
     let mut hidden = other_root_bytes(view.candidate, items_key);
     let ids = search_field_ids(ctx, issues);
-    let columns = search_columns(ctx.field_names, &ids);
+    let columns = search_columns(ctx.field_names, &ids, &mut hidden);
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(issues.len().min(TABLE_ROW_CAP + 1));
     let mut restrictions = Restrictions::default();
     let empty = Map::new();
     for (n, issue) in issues.iter().enumerate() {
-        let (Some(map), true) = (issue.as_object(), n < TABLE_ROW_CAP) else {
+        let Some(map) = issue.as_object() else {
             hidden = hidden.saturating_add(bytes_of(issue));
             continue;
         };
@@ -560,14 +608,18 @@ pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
             .get("renderedFields")
             .and_then(Value::as_object)
             .unwrap_or(&empty);
+        // Every issue scanned counts for the Cautions, shown row or not.
         restrictions.merge(Restrictions::of_issue(fields, rendered));
+        if n >= TABLE_ROW_CAP {
+            hidden = hidden.saturating_add(bytes_of(issue));
+            continue;
+        }
         let mut row = Vec::with_capacity(ids.len() + 1);
-        row.push(
-            map.get("key")
-                .and_then(Value::as_str)
-                .map(|k| one_line(escape_for_display(k)))
-                .unwrap_or_default(),
-        );
+        row.push(match map.get("key") {
+            Some(Value::String(k)) if k.len() <= IDENT_CAP_BYTES => one_line(escape_for_display(k)),
+            // Not a short string: counted below, not shown.
+            _ => String::new(),
+        });
         row.extend(ids.iter().map(|id| cell_of(fields.get(id), &mut hidden)));
         rows.push(row);
         for (k, v) in fields.iter().filter(|(k, _)| !ids.contains(k)) {
@@ -576,10 +628,7 @@ pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         if let Some(f) = map.get("fields").filter(|f| !f.is_object()) {
             hidden = hidden.saturating_add(pair_bytes("fields", f));
         }
-        for (k, v) in map
-            .iter()
-            .filter(|(k, _)| !ISSUE_ID_KEYS.contains(&k.as_str()))
-        {
+        for (k, v) in map.iter().filter(|(k, v)| !is_item_identifier(k, v)) {
             hidden = hidden.saturating_add(pair_bytes(k, v));
         }
     }
@@ -651,20 +700,26 @@ fn search_field_ids(ctx: &PreviewCtx<'_>, issues: &[Value]) -> Vec<String> {
 }
 
 /// `Key`, then a label per field id. A label two columns share gets its id appended.
-fn search_columns(names: Option<&FieldNames>, ids: &[String]) -> Vec<String> {
+fn search_columns(names: Option<&FieldNames>, ids: &[String], hidden: &mut u64) -> Vec<String> {
     const KEY: &str = "Key";
     let labels: Vec<String> = ids.iter().map(|id| row_name(names, id)).collect();
     let taken = |label: &str| {
         usize::from(label == KEY) + labels.iter().filter(|l| l.as_str() == label).count() > 1
     };
     let mut out = vec![KEY.to_owned()];
-    out.extend(ids.iter().zip(&labels).map(|(id, label)| {
-        if taken(label) {
-            format!("{label} ({})", one_line(escape_for_display(id)))
-        } else {
-            label.clone()
-        }
-    }));
+    // Labels are display-escaped already; the id (server or agent text) is escaped here.
+    let named: Vec<String> = ids
+        .iter()
+        .zip(&labels)
+        .map(|(id, label)| {
+            if taken(label) {
+                format!("{label} ({})", one_line(escape_for_display(id)))
+            } else {
+                label.clone()
+            }
+        })
+        .collect();
+    out.extend(named.iter().map(|n| column_name(n, hidden)));
     out
 }
 
@@ -694,8 +749,14 @@ pub fn list_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         _ => return generic::fallback_preview(ctx),
     };
     let columns = scalar_columns(items);
+    let restricted_comments =
+        ctx.spec.id == "jira.comment.list" && items.iter().any(has_visibility);
     if columns.is_empty() {
-        return generic::fallback_preview(ctx);
+        let mut model = generic::fallback_preview(ctx);
+        if restricted_comments {
+            model.warnings.push(restricted_comments_warning());
+        }
+        return model;
     }
 
     let mut hidden = other_root_bytes(view.candidate, items_key);
@@ -721,19 +782,16 @@ pub fn list_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         rows.push(omitted_row(columns.len(), items.len() - TABLE_ROW_CAP));
     }
 
+    let columns: Vec<String> = columns
+        .iter()
+        .map(|c| column_name(c, &mut hidden))
+        .collect();
     let (mut header, mut warnings) = generic::read_parts(ctx, view, hidden);
-    if ctx.spec.id == "jira.comment.list" && items.iter().any(has_visibility) {
-        warnings.push(Warning::new(
-            WarningId::RestrictedComments,
-            warning::TEXT_RESTRICTED_COMMENTS,
-        ));
+    if restricted_comments {
+        warnings.push(restricted_comments_warning());
     }
     let count = table_count(&mut header, items.len());
     let query = header.query.clone();
-    let columns = columns
-        .iter()
-        .map(|c| one_line(escape_for_display(c)))
-        .collect();
     PreviewModel {
         header,
         body: PreviewBody::Table {
@@ -746,6 +804,13 @@ pub fn list_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     }
 }
 
+fn restricted_comments_warning() -> Warning {
+    Warning::new(
+        WarningId::RestrictedComments,
+        warning::TEXT_RESTRICTED_COMMENTS,
+    )
+}
+
 fn is_scalar(v: &Value) -> bool {
     !matches!(v, Value::Array(_) | Value::Object(_))
 }
@@ -754,24 +819,32 @@ fn is_scalar(v: &Value) -> bool {
 /// identifying keys of [`LEADING_KEYS`] first, then the rest in first-seen order. (A JSON object
 /// here has no insertion order, its keys come sorted, so "first seen" is per item in key order.)
 fn scalar_columns(items: &[Value]) -> Vec<String> {
-    let mut seen: Vec<&String> = Vec::new();
+    let mut leading: [Option<&String>; LEADING_KEYS.len()] = [None; LEADING_KEYS.len()];
+    let mut rest: Vec<&String> = Vec::new();
+    let mut seen: HashSet<&String> = HashSet::new();
     let keys = items
         .iter()
         .take(COLUMN_SAMPLE_ITEMS)
         .filter_map(Value::as_object)
         .flat_map(|m| m.iter().filter(|(_, v)| is_scalar(v)).map(|(k, _)| k));
     for key in keys {
-        if !seen.contains(&key) {
-            seen.push(key);
+        if let Some(slot) = LEADING_KEYS.iter().position(|l| *l == key.as_str()) {
+            if let Some(entry) = leading.get_mut(slot) {
+                entry.get_or_insert(key);
+            }
+        } else if rest.len() < MAX_COLUMNS && seen.insert(key) {
+            rest.push(key);
+        }
+        // Everything the columns can hold is known: the remaining keys are not scanned.
+        if rest.len() >= MAX_COLUMNS && leading.iter().all(Option::is_some) {
+            break;
         }
     }
-    let leading = LEADING_KEYS
-        .iter()
-        .filter_map(|lead| seen.iter().find(|k| k.as_str() == *lead));
-    let rest = seen.iter().filter(|k| !LEADING_KEYS.contains(&k.as_str()));
     leading
+        .into_iter()
+        .flatten()
         .chain(rest)
         .take(MAX_COLUMNS)
-        .map(|k| (*k).clone())
+        .cloned()
         .collect()
 }
