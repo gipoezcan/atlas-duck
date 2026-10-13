@@ -1,0 +1,21 @@
+{code:rust}
+fn main() { println!("{}", 1); }
+{code}
+
+{noformat}
+has {code} inside
+{noformat}
+
+{{both \{code\} and \{noformat\}}}
+{{&#160;}}
+{{&#160;&#160;indented line}}
+
+{code:xml}
+<![CDATA[ x ]]>
+{code}
+
+Inline {{\{noformat\}}} span and {{\{code:java\}}} span and {{\]\]>}}.
+
+{code}
+indented block
+{code}

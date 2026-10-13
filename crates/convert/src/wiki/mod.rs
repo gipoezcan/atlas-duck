@@ -16,7 +16,7 @@
 //! - `{{` opens monospace when an unescaped `}}` follows on the same line; its content is
 //!   still scanned for constructs.
 
-mod lexer;
+pub(crate) mod lexer;
 mod parse;
 
 use std::ops::Range;

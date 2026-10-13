@@ -1,0 +1,18 @@
+Specials: \{ \} \[ \] \| \! &#92; \~ \^ \+ \?\? \*a\* \_b\_ \-c\- #d &#92; &#38;copy; @jdoe
+
+&#104;1. not a heading
+
+&#98;q. not a quote
+
+\# not a list
+
+\- not a list either
+
+\-\-\-\-
+
+C:&#92;Users&#92;me and a&#92;\{b\}
+
+first line
+&#104;2. second line
+\* not a bullet
+\| not a table

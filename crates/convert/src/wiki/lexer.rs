@@ -354,22 +354,28 @@ impl Lexer<'_> {
         if char_before(self.src, self.pos).is_some_and(char::is_alphanumeric) {
             return None;
         }
-        let scheme = SCHEMES.iter().find(|s| {
-            self.src
-                .get(self.pos..self.pos + s.len())
-                .is_some_and(|p| p.eq_ignore_ascii_case(s))
-        })?;
-        let rest = self.src.get(self.pos..)?;
-        let mut end = rest
-            .char_indices()
-            .find(|&(_, ch)| ch.is_whitespace() || URL_STOP.contains(&ch))
-            .map_or(rest.len(), |(i, _)| i);
-        while let Some(last) = rest.get(..end).and_then(|s| s.chars().next_back()) {
-            if !URL_TRAIL.contains(&last) {
-                break;
-            }
-            end -= last.len_utf8();
-        }
-        (end > scheme.len()).then_some(self.pos + end)
+        bare_url_end(self.src, self.pos)
     }
+}
+
+/// End of a bare URL starting at `pos` of `src`, if one starts there (the caller checks that
+/// the char before `pos` is not alphanumeric). Shared with the converter's escaping, which
+/// copies such URLs unchanged so that they stay links.
+pub(crate) fn bare_url_end(src: &str, pos: usize) -> Option<usize> {
+    let scheme = SCHEMES.iter().find(|s| {
+        src.get(pos..pos + s.len())
+            .is_some_and(|p| p.eq_ignore_ascii_case(s))
+    })?;
+    let rest = src.get(pos..)?;
+    let mut end = rest
+        .char_indices()
+        .find(|&(_, ch)| ch.is_whitespace() || URL_STOP.contains(&ch))
+        .map_or(rest.len(), |(i, _)| i);
+    while let Some(last) = rest.get(..end).and_then(|s| s.chars().next_back()) {
+        if !URL_TRAIL.contains(&last) {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    (end > scheme.len()).then_some(pos + end)
 }

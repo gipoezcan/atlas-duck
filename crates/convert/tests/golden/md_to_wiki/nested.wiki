@@ -1,0 +1,35 @@
+bq. single quote line
+
+bq. multi
+
+bq. block with {{code}}
+
+bq. nested quote\\second line
+
+{code}
+{quote} inside code
+{code}
+
+{quote}
+quote with code
+
+{code}
+plain
+{code}
+{quote}
+
+{quote}
+outer
+
+bq. inner
+{quote}
+
+* item with code
+
+{code}
+x
+{code}
+
+* next _item_ with [link|https://x.example]
+
+bq. quoted in item

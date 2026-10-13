@@ -1,0 +1,9 @@
+[Example|https://example.com/a_b?x=1&y=2] and [https://auto.example/~u|https://auto.example/~u] and [me@example.com|mailto:me@example.com].
+
+[logo|https://img.example/logo.png] and [https://img.example/empty.png]
+
+[&#126;jdoe|https://x.example/u] [&#94;file|https://x.example/f] [a\|b|https://x.example/p%7Cq] [c|https://x.example/%5Bd%5D] [https://x.example/e] empty
+
+Bare https://bare.example/a_b~c+d?x=1 in text.
+
+[ref link|https://ref.example/r] and [_em_ text|https://x.example]

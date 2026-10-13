@@ -1,0 +1,12 @@
+* one
+* two
+** nested _a_
+** nested b
+**# deep ordered
+* three
+
+# first
+# second
+
+* loose item\\second paragraph
+* after
