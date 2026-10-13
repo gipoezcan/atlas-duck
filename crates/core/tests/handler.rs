@@ -174,8 +174,8 @@ async fn not_in_this_build_rejected_internal() -> TestResult {
     let h = Harness::jira().await?;
     let env = h
         .submit(
-            "jira.issue.assign",
-            json!({ "key": "ABC-1", "assignee": "jdoe" }),
+            "jira.worklog.add",
+            json!({ "key": "ABC-1", "time_spent": "2h" }),
         )
         .await;
     assert_eq!(env.status, Status::Failed);

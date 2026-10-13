@@ -1386,6 +1386,8 @@ fn resolution_message(params: &Value, param: &str, value: &str) -> String {
     match param {
         "issuetype" => format!("no issue type named '{value}' in {}", of("project")),
         "transition" => format!("no transition named '{value}' for {}", of("key")),
+        // PD-62 (plan text).
+        "assignee" => format!("no assignable user '{value}' for {}", of("key")),
         _ => format!("no {param} named '{value}'"),
     }
 }

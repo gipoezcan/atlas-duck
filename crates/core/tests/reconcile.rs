@@ -36,6 +36,7 @@ const SEARCH: &str = "jira.search";
 const CREATE: &str = "jira.issue.create";
 const COMMENT: &str = "jira.comment.add";
 const TRANSITION: &str = "jira.issue.transition";
+const ASSIGN: &str = "jira.issue.assign";
 const PAGE_UPDATE: &str = "confluence.page.update";
 
 fn jira(h: &Harness) -> Result<&MockDc, TestError> {
@@ -92,6 +93,22 @@ async fn queued_transition(h: &Harness) -> Result<String, TestError> {
         json!({ "key": "ABC-1", "transition": "Done" }),
     )
     .await
+}
+
+/// A queued `jira.issue.assign` of `ABC-1` to `jdoe` (T15: stale-ruled, PD-52).
+async fn queued_assign(h: &Harness) -> Result<String, TestError> {
+    let mock = jira(h)?;
+    mock.json(
+        "/rest/api/2/user/assignable/search",
+        200,
+        r#"[{"name":"jdoe","key":"JIRAUSER1","displayName":"Jane Doe"}]"#,
+    )
+    .await;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    queued(h, ASSIGN, json!({ "key": "ABC-1", "assignee": "jdoe" })).await
 }
 
 async fn queued_page_update(h: &Harness) -> Result<String, TestError> {
@@ -516,6 +533,34 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_jira_transition() 
             .map(|p| (p["request_index"].clone(), p["reason"].clone())),
         Some((json!(0), json!("crash")))
     );
+    Ok(())
+}
+
+/// I-26 for the stale rule M5 adds (T15): the assignee check's identity call committed, the crash
+/// comes before anything else, and the restart reconciles it like the transition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_jira_assign() -> TestResult {
+    let mut h = Harness::jira().await?;
+    let id = queued_assign(&h).await?;
+    crash_after_stale_check(&mut h, &id).await?;
+    assert_listed_unknown(&h, &id, "ABC-1").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    let unknown = h.events_of(EventType::WRITE_OUTCOME_UNKNOWN).await?;
+    assert_eq!(
+        unknown
+            .last()
+            .map(|p| (p["request_index"].clone(), p["reason"].clone())),
+        Some((json!(0), json!("crash")))
+    );
+    // Nothing was sent before the crash.
+    let puts = jira(&h)?
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .count();
+    assert_eq!(puts, 0);
     Ok(())
 }
 

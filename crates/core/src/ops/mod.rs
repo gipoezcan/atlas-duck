@@ -10,6 +10,7 @@ pub mod confluence;
 pub mod generic;
 pub mod jira;
 pub(crate) mod jira_body;
+pub mod jira_ext;
 pub mod jira_preview;
 pub mod stale;
 
@@ -330,12 +331,31 @@ pub struct WriteSummaryFacts {
     /// `jira.issue.transition` (T14 review M5): the resolved transition's name (its id is the
     /// request's).
     pub transition_name: Option<String>,
-    /// `jira.issue.assign` (T15): the current assignee's display name.
-    pub assignee_from: Option<String>,
+    /// `jira.issue.assign` (T15, PD-52): the issue's current assignee (`None`: unassigned) and the
+    /// user the assignee param resolved to (`None`: an unassign).
+    pub assignee_from: Option<JiraUser>,
+    pub assignee_to: Option<JiraUser>,
     /// `jira.issuelink.create` (T16): the link type's phrase for the sentence.
     pub link_phrase: Option<String>,
     /// `jira.sprint.move_issues` (T18): the sprint's `(name, state)`.
     pub sprint: Option<(String, String)>,
+}
+
+/// T15: a Jira user as enrichment read it (raw server text). Payloads send `name`; the preview
+/// shows `name` and `key` (§7.3), the stale rule compares `key` (PD-52).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct JiraUser {
+    pub name: Option<String>,
+    pub key: Option<String>,
+    /// Cut to the name cap (display only).
+    pub display_name: Option<String>,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for JiraUser {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JiraUser").finish_non_exhaustive()
+    }
 }
 
 /// Redacting `Debug` (§7.7).
@@ -669,7 +689,17 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &["transition", "fields", "comment"],
         },
     ),
-    ("jira.issue.assign", LATER_WRITE),
+    (
+        "jira.issue.assign",
+        OpImpl {
+            executor: jira_ext::issue_assign_executor,
+            previewer: jira_preview::assign_preview,
+            stale_check: Some(&stale::ISSUE_ASSIGN),
+            enrich: Some(&jira_ext::ISSUE_ASSIGN_ENRICH),
+            // §5.4 step 4: an edited assignee is resolved again.
+            enrich_keys: &["assignee"],
+        },
+    ),
     ("jira.worklog.add", LATER_WRITE),
     ("jira.issuelink.create", LATER_WRITE),
     ("jira.sprint.move_issues", LATER_WRITE),

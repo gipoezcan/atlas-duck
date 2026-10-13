@@ -1,4 +1,4 @@
-//! §5.4 step 5 per-op stale rules in M3 (PD-10). The identity call that precedes every write is
+//! §5.4 step 5 per-op stale rules in M3 (PD-10), and M5's assignee rule (PD-52). The identity call that precedes every write is
 //! not one of these (C.7); an op without a rule here has `stale_check: None`.
 
 use atlas_duck_atlassian::GetCall;
@@ -7,6 +7,7 @@ use serde_json::Value;
 
 use super::confluence::content_version;
 use super::jira::{field_values_equal, issue_fields_call, transition_calls, transition_facts};
+use super::jira_ext::{assignee_call, current_assignee};
 use super::{StaleCtx, StaleRule, StaleVerdict, get_call};
 
 /// Shown when the judge did not get the answers its plan names (fail closed: never `Unchanged`).
@@ -24,6 +25,13 @@ pub static ISSUE_EDIT: StaleRule = StaleRule {
 pub static ISSUE_TRANSITION: StaleRule = StaleRule {
     plan: transition_plan,
     judge: transition_judge,
+};
+
+/// `jira.issue.assign` (T15, PD-52): the current `fields.assignee.key` (or none) equals the
+/// baseline's, the assignee the preview showed (§5.4 step 5).
+pub static ISSUE_ASSIGN: StaleRule = StaleRule {
+    plan: assign_plan,
+    judge: assign_judge,
 };
 
 /// `confluence.page.update`: `version.number` unchanged.
@@ -104,6 +112,27 @@ fn transition_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
         return changed("transition no longer available");
     }
     StaleVerdict::Unchanged
+}
+
+fn assign_plan(ctx: &StaleCtx<'_>) -> Vec<GetCall> {
+    vec![assignee_call(ctx.params)]
+}
+
+/// Keys compared exactly; a baseline or an answer it cannot read is a change (fail closed).
+fn assign_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
+    let was = match ctx.baseline.get("assignee_key") {
+        Some(Value::Null) => None,
+        Some(Value::String(key)) => Some(key.as_str()),
+        _ => return changed(DELTA_UNREADABLE),
+    };
+    let Some(now) = responses.first().and_then(current_assignee) else {
+        return changed(DELTA_UNREADABLE);
+    };
+    if now.as_ref().and_then(|u| u.key.as_deref()) == was {
+        StaleVerdict::Unchanged
+    } else {
+        changed("assignee changed since review")
+    }
 }
 
 fn page_plan(ctx: &StaleCtx<'_>) -> Vec<GetCall> {

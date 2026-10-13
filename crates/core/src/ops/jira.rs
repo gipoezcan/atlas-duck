@@ -22,7 +22,7 @@ use crate::validate::invalid;
 /// At most this many candidate names in an unresolved-name preview and deny hint (§5.4 step 2).
 pub const MAX_CANDIDATES: usize = 10;
 
-const ISSUE_PATH: &str = "/rest/api/2/issue/{key}";
+pub(crate) const ISSUE_PATH: &str = "/rest/api/2/issue/{key}";
 const TRANSITIONS_PATH: &str = "/rest/api/2/issue/{key}/transitions";
 const PROJECTS_PATH: &str = "/rest/api/2/project";
 const CREATEMETA_ISSUETYPES_PATH: &str = "/rest/api/2/issue/createmeta/{project}/issuetypes";
@@ -188,7 +188,12 @@ pub(crate) fn resolve(items: &[Value], wanted: &str) -> Resolution {
     Resolution::Unresolved(u64::try_from(matches.len()).unwrap_or(u64::MAX), candidates)
 }
 
-fn unresolved(param: &str, value: &str, matches: u64, candidates: Vec<String>) -> EnrichVerdict {
+pub(crate) fn unresolved(
+    param: &str,
+    value: &str,
+    matches: u64,
+    candidates: Vec<String>,
+) -> EnrichVerdict {
     EnrichVerdict {
         hold: Hold::UnresolvedName,
         unresolved: Some((param.to_owned(), value.to_owned(), matches, candidates)),
@@ -245,7 +250,7 @@ struct IssueType {
 }
 
 /// `s` cut to [`NAME_CAP_CHARS`] chars (`…` marks a cut). Raw text; escaped where it is shown.
-fn capped(s: &str) -> String {
+pub(crate) fn capped(s: &str) -> String {
     match s.char_indices().nth(NAME_CAP_CHARS) {
         Some((end, _)) => format!("{}…", &s[..end]),
         None => s.to_owned(),

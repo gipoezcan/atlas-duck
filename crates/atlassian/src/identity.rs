@@ -23,9 +23,28 @@ pub(crate) fn check_jira_header(values: &[String], stored: &str) -> Result<(), I
 /// Trim, percent-decode only when a `%XX` triplet is present, NFC, Unicode
 /// simple case folding. `anonymous` and the empty name never match.
 pub fn username_matches(header: &str, stored: &str) -> bool {
-    match (canon(header), canon(stored)) {
-        (Some(h), Some(s)) => h != "anonymous" && !h.is_empty() && h == s,
-        _ => false, // undecodable percent-escapes fail closed (recheck path)
+    UsernameMatcher::new(header).matches(stored)
+}
+
+/// [`username_matches`] with its first name canonicalized once, for comparing one name with many
+/// (the assignable-user resolution, T15): linear in the names compared.
+pub struct UsernameMatcher(Option<String>);
+
+impl UsernameMatcher {
+    pub fn new(header: &str) -> UsernameMatcher {
+        // Undecodable percent-escapes fail closed (recheck path), like `anonymous` and "".
+        UsernameMatcher(canon(header).filter(|h| h != "anonymous" && !h.is_empty()))
+    }
+
+    pub fn matches(&self, stored: &str) -> bool {
+        self.0.is_some() && self.0 == canon(stored)
+    }
+}
+
+/// Redacting `Debug` (§7.7): a username is Atlassian data.
+impl std::fmt::Debug for UsernameMatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsernameMatcher").finish_non_exhaustive()
     }
 }
 
@@ -91,5 +110,32 @@ mod tests {
             check_jira_header(&vals(&["jdoe", "jdoe"]), "jdoe"),
             Err(IdentityObserved::Other("jdoe, jdoe".to_owned()))
         );
+    }
+
+    /// T15: the matcher is the same comparison with one side canonicalized once.
+    #[test]
+    fn username_matcher_agrees_with_username_matches() {
+        let names = [
+            "jdoe",
+            " JDoe ",
+            "jdoe%40corp.example",
+            "jdoe@corp.example",
+            "JDOE@CORP.EXAMPLE",
+            "anonymous",
+            "ANONYMOU%53",
+            "",
+            "  ",
+            "%ZZ",
+            "%FF",
+            "Ä",
+            "A\u{308}",
+            "bob",
+        ];
+        for a in names {
+            let m = UsernameMatcher::new(a);
+            for b in names {
+                assert_eq!(m.matches(b), username_matches(a, b), "{a:?} vs {b:?}");
+            }
+        }
     }
 }

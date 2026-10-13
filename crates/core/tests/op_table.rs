@@ -29,8 +29,10 @@ const M3_WRITES: [&str; 5] = [
     "confluence.page.update",
 ];
 
-const LATER_WRITES: [&str; 11] = [
-    "jira.issue.assign",
+/// Writes completed in M5 so far (each task moves its op here from [`LATER_WRITES`]).
+const M5_WRITES: [&str; 1] = ["jira.issue.assign"];
+
+const LATER_WRITES: [&str; 10] = [
     "jira.worklog.add",
     "jira.issuelink.create",
     "jira.sprint.move_issues",
@@ -196,6 +198,8 @@ fn u05_only_writes_have_stale_check() -> TestResult {
     let pd10: BTreeSet<&str> = [
         "jira.issue.edit",
         "jira.issue.transition",
+        // T15 (PD-52): the assignee rule.
+        "jira.issue.assign",
         "confluence.page.update",
     ]
     .into_iter()
@@ -220,6 +224,7 @@ fn reads_have_no_enrich() -> TestResult {
         "jira.issue.create",
         "jira.issue.edit",
         "jira.issue.transition",
+        "jira.issue.assign",
         "confluence.page.update",
     ]
     .into_iter()
@@ -726,7 +731,18 @@ fn not_in_this_build_writes() -> TestResult {
         .iter()
         .filter(|s| s.class == OpClass::Write)
         .count();
-    assert_eq!(writes, M3_WRITES.len() + LATER_WRITES.len());
+    assert_eq!(
+        writes,
+        M3_WRITES.len() + M5_WRITES.len() + LATER_WRITES.len()
+    );
+    // Each needs its enrichment verdict before it renders a request.
+    for id in M5_WRITES {
+        assert_eq!(
+            exec(id, &example(op(id)?), None, None)?,
+            Err(ExecError::EnrichmentRequired),
+            "{id}"
+        );
+    }
     Ok(())
 }
 

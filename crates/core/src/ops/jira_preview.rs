@@ -14,6 +14,7 @@
 use atlas_duck_convert::{wiki_constructs, wiki_to_preview_html, wiki_to_text};
 use atlas_duck_preview::diff::{DiffLine, DiffOp, LineDiff, hunks, line_diff};
 use atlas_duck_preview::invisible::escape_for_display;
+use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     CommentView, ConstructList, FieldRow, IssueCard, ItemCount, JSON_STRING_COLLAPSE_BYTES,
@@ -23,7 +24,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::jira::{escaped_prefix, pretty};
-use super::{PreviewCtx, PreviewInput, PreviewModel, generic};
+use super::{JiraUser, PreviewCtx, PreviewInput, PreviewModel, generic};
 use crate::lifecycle::model::Hold;
 use crate::metadata::{FieldNames, field_label, one_line};
 
@@ -1192,6 +1193,110 @@ pub fn transition_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         to,
         fields,
         constructs: comment.map(construct_list),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden;
+    model
+}
+
+/// The assign card's text for a user: `<display name> (<name>)`, else whichever is there (raw;
+/// [`line`] escapes it).
+fn user_text(user: &JiraUser) -> String {
+    match (user.display_name.as_deref(), user.name.as_deref()) {
+        (Some(display), Some(name)) => format!("{display} ({name})"),
+        (Some(one), None) | (None, Some(one)) => one.to_owned(),
+        (None, None) => user.key.clone().unwrap_or_default(),
+    }
+}
+
+/// What the assign card shows for nobody (an unassigned issue, an unassign).
+const UNASSIGNED: &str = "(unassigned)";
+
+/// §6.3 Assign: the `jira.issue.assign` card over the exact request: "Assign <key> to <user>" or
+/// "Unassign <key>", rows `From` (the current assignee enrichment read, the stale-check baseline)
+/// and `To`, and each one's user key (§7.3: previews show `name` and `key`). `To` is read from the
+/// request that is sent (T12 review M4): the resolved user's display name and key are shown only
+/// when the facts are about the sent `name`, else "<sent> (enrichment resolved <name>)". The sent
+/// username is an identifier the agent may not have named (resolved by key or display name), so
+/// it gets the mixed-script check the params get (§6.4). Every other hold, or a request that is
+/// not the assign JSON, keeps the generic write preview.
+pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let facts = view
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref());
+    let (Some(facts), Some(request), PreviewBody::WriteRequests { .. }) =
+        (facts, view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(body) = serde_json::from_slice::<Value>(&request.body).ok() else {
+        return model;
+    };
+    let sent = match body.get("name") {
+        Some(Value::Null) => None,
+        Some(Value::String(name)) => Some(name.as_str()),
+        _ => return model,
+    };
+    let key = ctx.params.get("key").and_then(Value::as_str).unwrap_or("");
+    let mut hidden = 0u64;
+    let cap = CELL_CAP_CHARS * 2;
+    let from = facts.assignee_from.as_ref();
+    let to = facts
+        .assignee_to
+        .as_ref()
+        .filter(|u| sent.is_some() && u.name.as_deref() == sent);
+    let to_text = match (sent, to) {
+        (None, _) => UNASSIGNED.to_owned(),
+        (Some(_), Some(user)) => user_text(user),
+        (Some(name), None) => match facts.assignee_to.as_ref().and_then(|u| u.name.as_deref()) {
+            Some(other) => format!("{name} (enrichment resolved {other})"),
+            None => name.to_owned(),
+        },
+    };
+    let sentence = match sent {
+        None => format!("Unassign {key}"),
+        Some(_) => format!("Assign {key} to {to_text}"),
+    };
+    let mut rows = vec![
+        (
+            "From".to_owned(),
+            line(
+                &from.map_or_else(|| UNASSIGNED.to_owned(), user_text),
+                cap,
+                &mut hidden,
+            ),
+        ),
+        ("To".to_owned(), line(&to_text, cap, &mut hidden)),
+    ];
+    for (label, user) in [("From user key", from), ("To user key", to)] {
+        if let Some(k) = user.and_then(|u| u.key.as_deref()) {
+            rows.push((label.to_owned(), line(k, cap, &mut hidden)));
+        }
+    }
+    if let Some(name) = sent
+        && is_mixed_script(name)
+    {
+        let text = warning::mixed_script(&escape_for_display(name));
+        if !model
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::MixedScript && w.text == text)
+        {
+            model
+                .warnings
+                .push(Warning::new(WarningId::MixedScript, text));
+        }
+    }
+    let requests = take_requests(&mut model);
+    model.body = PreviewBody::WriteSummary {
+        sentence: line(&sentence, cap, &mut hidden),
+        rows,
+        constructs: None,
         requests,
     };
     model.header.hidden_in_preview_bytes = hidden;

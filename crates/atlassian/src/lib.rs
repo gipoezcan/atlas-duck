@@ -28,7 +28,7 @@ pub use credentials::{
     CredentialError, CredentialProvider, PatSecret, StoredCredential, StoredIdentity,
 };
 pub use guard::{ALLOWED_READ_POSTS, MethodRefused};
-pub use identity::username_matches;
+pub use identity::{UsernameMatcher, username_matches};
 pub use origin::{OriginRefused, origin_guard};
 pub use types::{
     ApprovedWrite, BodyFailure, ConnClass, ExpectedBody, FetchFailure, FetchOutcome, GetCall,
