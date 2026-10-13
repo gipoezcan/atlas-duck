@@ -4,5 +4,5 @@ Inside panel
 [macro: toc]
 [macro: html]
 <script>alert(1)</script>
-Inline [macro: status]DONE[macro: status] and red and span.
+Inline [macro: status colour=red]DONE[macro: status] and red and span.
 > Quoted text

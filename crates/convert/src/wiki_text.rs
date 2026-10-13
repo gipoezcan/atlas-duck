@@ -4,7 +4,7 @@
 //! block, list items prefixed `• ` / `1. `, table cells joined by ` | `, code bodies verbatim.
 //! The helpers shared with the HTML renderer live here so the two cannot disagree on a label.
 
-use crate::wiki::{Block, Inline, parse};
+use crate::wiki::{Block, CodeKind, Inline, parse};
 
 /// Macros that only style their content; the tags are dropped and the content kept.
 pub(crate) fn is_styling(name: &str) -> bool {
@@ -13,9 +13,27 @@ pub(crate) fn is_styling(name: &str) -> bool {
         .any(|s| name.eq_ignore_ascii_case(s))
 }
 
-/// The text standing in for a macro (§7.6: macros are never executed or expanded).
-pub(crate) fn macro_label(name: &str) -> String {
-    format!("[macro: {name}]")
+/// Longest parameter text shown in a macro label, in characters; the rest is cut and marked.
+const MACRO_PARAMS_MAX: usize = 80;
+
+/// The text standing in for a macro (§7.6: macros are never executed or expanded): the name and
+/// the parameters, so a retargeted `{include:...}` or `{jira:key=...}` is visible in a diff.
+/// Parameters are one line (controls become spaces) and capped with an ellipsis. Styling macros
+/// show the name only.
+pub(crate) fn macro_label(name: &str, params: &str) -> String {
+    let params = params.trim();
+    if params.is_empty() || is_styling(name) {
+        return format!("[macro: {name}]");
+    }
+    let mut shown: String = params
+        .chars()
+        .take(MACRO_PARAMS_MAX)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if params.chars().nth(MACRO_PARAMS_MAX).is_some() {
+        shown.push('\u{2026}');
+    }
+    format!("[macro: {name} {shown}]")
 }
 
 /// A link as text: `text (url)`, or just the URL when there is no distinct text.
@@ -38,12 +56,39 @@ pub(crate) fn code_display(body: &str) -> &str {
         .unwrap_or(b)
 }
 
-/// Characters a numeric reference must not produce: controls and the invisible or bidi
-/// formatting characters the §6.4 classifier warns about stay as literal reference text.
+/// Characters a numeric reference must not produce: everything the §6.4 classifier flags
+/// (Default_Ignorable_Code_Point, Cf, Cc, Zl, Zp) stays as literal reference text. This crate has
+/// no `preview` edge, so the set is spelled out as a superset of it (line and paragraph
+/// separators, ALM, soft hyphen, CGJ, Hangul fillers, variation selectors, every bidi and
+/// zero-width character, tag characters); a test compares it with `preview::invisible`.
 fn decodable(c: char) -> bool {
     !(c.is_control()
         || matches!(c,
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2069}' | '\u{feff}'))
+            '\u{ad}'
+                | '\u{34f}'
+                | '\u{600}'..='\u{605}'
+                | '\u{61c}'
+                | '\u{6dd}'
+                | '\u{70f}'
+                | '\u{890}'..='\u{891}'
+                | '\u{8e2}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{fe00}'..='\u{fe0f}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff0}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e0fff}'))
 }
 
 /// Decodes decimal and hex numeric character references (`&#92;`, `&#x5c;`) once. The
@@ -97,7 +142,7 @@ fn inlines_text(inlines: &[Inline], out: &mut String) {
             Inline::Image(t) => out.push_str(&format!("[image: {t}]")),
             Inline::Attachment(f) => out.push_str(&format!("[attachment: {f}]")),
             Inline::Macro { name, .. } if is_styling(name) => {}
-            Inline::Macro { name, .. } => out.push_str(&macro_label(name)),
+            Inline::Macro { name, params, .. } => out.push_str(&macro_label(name, params)),
             Inline::LineBreak => out.push('\n'),
         }
     }
@@ -123,10 +168,13 @@ fn block_text(block: &Block) -> String {
         Block::Heading { inlines, .. } | Block::Paragraph(inlines) => line(inlines),
         Block::List { ordered, items } => {
             let marker = if *ordered { "1. " } else { "• " };
+            let mut cur = 0usize;
             let lines: Vec<String> = items
                 .iter()
                 .map(|(depth, inl)| {
-                    let indent = "  ".repeat(usize::from(*depth).saturating_sub(1));
+                    // Same clamp as the HTML: a jump of more than one level is one level deeper.
+                    cur = usize::from(*depth).clamp(1, cur + 1);
+                    let indent = "  ".repeat(cur - 1);
                     format!("{indent}{marker}{}", line(inl))
                 })
                 .collect();
@@ -142,14 +190,40 @@ fn block_text(block: &Block) -> String {
                 .collect();
             lines.join("\n")
         }
-        Block::Quote(children) => blocks_text(children)
-            .lines()
-            .map(|l| format!("> {l}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Block::Code { body, .. } => code_display(body).to_owned(),
+        Block::Quote(children) => {
+            let inner = blocks_text(children);
+            // An empty quote stays visible as a lone `>`.
+            if inner.is_empty() {
+                return ">".to_owned();
+            }
+            inner
+                .lines()
+                .map(|l| format!("> {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        Block::Code {
+            kind, lang, body, ..
+        } => {
+            // The tags are shown (and an empty block is kept) so code vs noformat, the
+            // language and the block boundaries are visible in the rendered diff.
+            let (name, lang) = match kind {
+                CodeKind::Code => ("code", lang.as_deref().filter(|l| !l.is_empty())),
+                CodeKind::Noformat => ("noformat", None),
+            };
+            let open = match lang {
+                Some(l) => format!("{{{name}:{l}}}"),
+                None => format!("{{{name}}}"),
+            };
+            let body = code_display(body);
+            if body.is_empty() {
+                format!("{open}\n{{{name}}}")
+            } else {
+                format!("{open}\n{body}\n{{{name}}}")
+            }
+        }
         Block::Panel { title, blocks } => {
-            let mut parts = vec![macro_label("panel")];
+            let mut parts = vec![macro_label("panel", "")];
             if let Some(t) = title.as_deref().filter(|t| !t.is_empty()) {
                 parts.push(decode_refs(t));
             }
@@ -159,9 +233,11 @@ fn block_text(block: &Block) -> String {
             }
             parts.join("\n")
         }
-        Block::Macro { name, body, .. } => match body.as_deref().map(code_display) {
-            Some(b) if !b.is_empty() => format!("{}\n{b}", macro_label(name)),
-            _ => macro_label(name),
+        Block::Macro {
+            name, params, body, ..
+        } => match body.as_deref().map(code_display) {
+            Some(b) if !b.is_empty() => format!("{}\n{b}", macro_label(name, params)),
+            _ => macro_label(name, params),
         },
         Block::Rule => "----".to_owned(),
     }

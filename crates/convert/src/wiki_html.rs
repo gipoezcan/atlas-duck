@@ -2,7 +2,7 @@
 //!
 //! The renderer emits only structural text elements. Links, images, attachments, mentions and
 //! macros appear as escaped text (`text (url)`, `[image: url]`, `[attachment: file]`,
-//! `@name`, `[macro: name]`), never as `<a>`, `<img>` or any element that loads or runs
+//! `@name`, `[macro: name params]`), never as `<a>`, `<img>` or any element that loads or runs
 //! something, and styling macros (`{color}`, `{span}`) are dropped. Core still passes the
 //! result through `preview::sanitize_html`; this crate has no `preview` edge.
 
@@ -47,7 +47,7 @@ fn inlines_html(inlines: &[Inline], out: &mut String) {
             Inline::Image(t) => out.push_str(&esc(&format!("[image: {t}]"))),
             Inline::Attachment(f) => out.push_str(&esc(&format!("[attachment: {f}]"))),
             Inline::Macro { name, .. } if is_styling(name) => {}
-            Inline::Macro { name, .. } => out.push_str(&esc(&macro_label(name))),
+            Inline::Macro { name, params, .. } => out.push_str(&esc(&macro_label(name, params))),
             Inline::LineBreak => out.push_str("<br>"),
         }
     }
@@ -129,7 +129,7 @@ fn block_html(block: &Block) -> String {
         Block::Quote(children) => format!("<blockquote>{}</blockquote>", blocks_html(children)),
         Block::Code { body, .. } => format!("<pre>{}</pre>", esc(code_display(body))),
         Block::Panel { title, blocks } => {
-            let mut out = labelled_open("panel");
+            let mut out = labelled_open("panel", "");
             if let Some(t) = title.as_deref().filter(|t| !t.is_empty()) {
                 out.push_str(&format!("<p>{}</p>", esc(&decode_refs(t))));
             }
@@ -140,8 +140,10 @@ fn block_html(block: &Block) -> String {
             out.push_str("</div>");
             out
         }
-        Block::Macro { name, body, .. } => {
-            let mut out = labelled_open(name);
+        Block::Macro {
+            name, params, body, ..
+        } => {
+            let mut out = labelled_open(name, params);
             if let Some(b) = body.as_deref().map(code_display).filter(|b| !b.is_empty()) {
                 out.push_str(&format!("<pre>{}</pre>", esc(b)));
             }
@@ -153,11 +155,11 @@ fn block_html(block: &Block) -> String {
 }
 
 /// `<div data-macro="name"><p>[macro: name]</p>`: the labelled block a macro becomes.
-fn labelled_open(name: &str) -> String {
+fn labelled_open(name: &str, params: &str) -> String {
     format!(
         "<div data-macro=\"{}\"><p>{}</p>",
         esc(name),
-        esc(&macro_label(name))
+        esc(&macro_label(name, params))
     )
 }
 

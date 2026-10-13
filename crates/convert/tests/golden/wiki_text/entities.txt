@@ -1,3 +1,5 @@
 a\b h1. bq. ~t ^c &amp;  nb
 ~jdoe (https://x.example/u) <b> \
+{code}
 a &#92; b
+{code}

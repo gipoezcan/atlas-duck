@@ -1,4 +1,10 @@
+{code:java}
 int x = a < b && c > d;
   indented
+{code}
+{noformat}
 raw *not bold* {color:red}
+{noformat}
+{code}
 unterminated <b>
+{code}

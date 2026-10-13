@@ -452,6 +452,7 @@ dependencies = [
 name = "atlas-duck-convert"
 version = "0.1.0"
 dependencies = [
+ "atlas-duck-preview",
  "proptest",
  "pulldown-cmark",
 ]
