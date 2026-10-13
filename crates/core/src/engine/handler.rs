@@ -48,7 +48,7 @@ use crate::lifecycle::model::{Event, Kind, Model, step};
 use crate::normalize::{normalize_agent_name, normalize_hello, normalize_reason};
 use crate::ops::{ExecError, NOT_IN_THIS_BUILD_MESSAGE, op_table};
 use crate::payloads::{self, EventCtx};
-use crate::validate::{EffectiveCaps, ValidateCtx, ValidationError, validate};
+use crate::validate::{ValidateCtx, ValidationError, validate};
 
 /// §4.1: the CLI's default wait, used when an `await` names none.
 pub const DEFAULT_AWAIT_MS: u64 = 100_000;
@@ -167,9 +167,10 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         ticket: Some(j.ticket),
     };
     // 7. Static validation (T13).
+    let caps = engine.effective_caps();
     let vctx = ValidateCtx {
         instance_version: j.routed.version,
-        caps: &EffectiveCaps::default(),
+        caps: &caps,
         for_script: false,
     };
     let validated = match validate(spec, &j.params, &vctx) {
@@ -188,6 +189,7 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
             &j.routed.base,
             None,
             validated.effective_max,
+            validated.comments_cap,
         ))
         .map(|_| ()),
         None => Err(ExecError::NotInThisBuild),

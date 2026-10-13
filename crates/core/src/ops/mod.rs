@@ -89,6 +89,16 @@ pub enum ReadPlan {
         items_key: String,
         max_items: u64,
     },
+    /// `jira.issue.get --comments` (PD-45): the issue GET, then the `jira.comment.list` pages up
+    /// to `max_items` (the comments cap), under one cover, one control and one read budget.
+    /// `rendered`: the pages carry `renderedBody` and the merge builds `renderedFields.comment`.
+    /// `comments` is boxed so the plan stays small (`clippy::large_enum_variant`).
+    IssueWithComments {
+        issue: GetCall,
+        comments: Box<PagedCall>,
+        max_items: u64,
+        rendered: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,6 +139,9 @@ pub struct ExecCtx<'a> {
     pub enrichment: Option<&'a EnrichVerdict>,
     /// `Validated::effective_max`: the clamped `max` of ops with a `max` cap.
     pub effective_max: Option<u32>,
+    /// `Validated::comments_cap` (Δ7): at most this many comments for `jira.issue.get
+    /// --comments`; `None` for every other op and for writes.
+    pub comments_cap: Option<u32>,
     /// U-24 (PD-64): the engine copies `TestHooks::converter_fault` here; `jira_body` appends it
     /// to converted Markdown before the hard check. Absent from production builds.
     #[cfg(feature = "testing")]
@@ -270,6 +283,10 @@ pub struct ReadView<'a> {
     pub more_available: bool,
     /// `Validated::truncated_by_clamp`: the agent asked for more than the hard cap.
     pub clamped: bool,
+    /// `jira.issue.get --comments` stopped at the comments cap: `(comments fetched, server
+    /// total)`, shown as Info `truncated_by_cap(N, total)` (PD-45). `None` otherwise. For such a
+    /// read `more_available`/`server_total` describe the comment pages, not the issue.
+    pub comments_truncated: Option<(u64, u64)>,
 }
 
 pub struct WriteView<'a> {

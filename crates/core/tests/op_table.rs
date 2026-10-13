@@ -70,6 +70,7 @@ fn exec(
         base: &base,
         enrichment,
         effective_max,
+        comments_cap: None,
         #[cfg(feature = "testing")]
         test_fault: None,
     };
@@ -252,6 +253,10 @@ fn read_methods_are_get_or_search() -> TestResult {
                 assert_eq!(spec.id, "jira.search");
                 assert!(ALLOWED_READ_POSTS.contains(&call.endpoint_template.as_str()));
             }
+            // No registry example asks for `comments`.
+            ReadPlan::IssueWithComments { .. } => {
+                return Err(format!("{}: the example plans a composite read", spec.id).into());
+            }
         }
     }
     Ok(())
@@ -261,7 +266,7 @@ fn read_methods_are_get_or_search() -> TestResult {
 fn get_call_params_hold_only_placeholders() -> TestResult {
     let plan = read_plan(
         "jira.issue.get",
-        &json!({"key": "ABC-1", "fields": ["summary"], "comments": true}),
+        &json!({"key": "ABC-1", "fields": ["summary"], "changelog": false}),
         None,
     )?;
     let ReadPlan::Get(call) = plan else {
@@ -269,8 +274,96 @@ fn get_call_params_hold_only_placeholders() -> TestResult {
     };
     assert_eq!(call.endpoint_template, "/rest/api/2/issue/{key}");
     assert_eq!(call.params, json!({"key": "ABC-1"}));
-    // `comments` is accepted and has no effect in M3 (PD-09).
     assert_eq!(query_of(&call), vec![("fields", "summary")]);
+    Ok(())
+}
+
+/// PD-45: `comments: true` plans the issue GET without `comment` in its `fields`, then the
+/// `jira.comment.list` pages (`orderBy=created`, pages of `min(50, cap)`, up to the cap).
+#[test]
+fn issue_get_comments_plans_the_composite_read() -> TestResult {
+    let plan = read_plan(
+        "jira.issue.get",
+        &json!({"key": "ABC-1", "fields": ["summary", "comment"], "comments": true}),
+        None,
+    )?;
+    let ReadPlan::IssueWithComments {
+        issue,
+        comments,
+        max_items,
+        rendered,
+    } = plan
+    else {
+        return Err("expected the composite read".into());
+    };
+    assert_eq!(issue.endpoint_template, "/rest/api/2/issue/{key}");
+    assert_eq!(issue.params, json!({"key": "ABC-1"}));
+    assert_eq!(query_of(&issue), vec![("fields", "summary")]);
+    assert_eq!(
+        comments.get.endpoint_template,
+        "/rest/api/2/issue/{key}/comment"
+    );
+    assert_eq!(comments.get.params, json!({"key": "ABC-1"}));
+    assert_eq!(query_of(&comments.get), vec![("orderBy", "created")]);
+    assert_eq!(
+        (comments.items_key.as_str(), comments.offset_param.as_str()),
+        ("comments", "startAt")
+    );
+    assert_eq!(comments.limit_param, "maxResults");
+    assert_eq!((comments.page_size, comments.start), (50, 0));
+    // The registry cap (100) when nothing is configured.
+    assert_eq!((max_items, rendered), (100, false));
+
+    // Rendered (also through the agent's own `expand`): the pages carry `renderedBody`. A
+    // `fields` list of only `comment` is sent as it is (an empty one means the defaults).
+    for params in [
+        json!({"key": "ABC-1", "comments": true, "rendered": true, "fields": ["comment"]}),
+        json!({"key": "ABC-1", "comments": true, "expand": ["renderedFields"], "fields": ["comment"]}),
+    ] {
+        let ReadPlan::IssueWithComments {
+            issue,
+            comments,
+            rendered,
+            ..
+        } = read_plan("jira.issue.get", &params, None)?
+        else {
+            return Err("expected the composite read".into());
+        };
+        assert!(rendered);
+        assert_eq!(
+            query_of(&issue),
+            vec![("fields", "comment"), ("expand", "renderedFields")]
+        );
+        assert_eq!(
+            query_of(&comments.get),
+            vec![("orderBy", "created"), ("expand", "renderedBody")]
+        );
+    }
+
+    // A configured cap below the page size: one page of the cap.
+    let spec = op("jira.issue.get")?;
+    let imp = op_table().get("jira.issue.get").ok_or("no OpImpl")?;
+    let base = base()?;
+    let params = json!({"key": "ABC-1", "comments": true});
+    let ctx = ExecCtx {
+        spec,
+        params: &params,
+        base: &base,
+        enrichment: None,
+        effective_max: None,
+        comments_cap: Some(10),
+        #[cfg(feature = "testing")]
+        test_fault: None,
+    };
+    let Ok(ExecPlan::Read(ReadPlan::IssueWithComments {
+        comments,
+        max_items,
+        ..
+    })) = (imp.executor)(&ctx)
+    else {
+        return Err("expected the composite read".into());
+    };
+    assert_eq!((comments.page_size, max_items), (10, 10));
     Ok(())
 }
 
@@ -1204,6 +1297,7 @@ fn read_preview(
             server_total: candidate.get("total").and_then(Value::as_u64),
             more_available: more,
             clamped,
+            comments_truncated: None,
         }),
         field_names: None,
     };

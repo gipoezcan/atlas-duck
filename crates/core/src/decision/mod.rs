@@ -50,7 +50,7 @@ use crate::ops::{ExecError, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
 use crate::redact::RedactionOp;
 use crate::similarity::SimHit;
-use crate::validate::{EffectiveCaps, ValidateCtx, ValidationError, echo};
+use crate::validate::{ValidateCtx, ValidationError, echo};
 
 /// Maps to the audit `decision` values (C.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -491,7 +491,12 @@ async fn candidate(
 ) -> Result<Arc<Candidate>, RebuildError> {
     match entry.kind() {
         Kind::Script | Kind::DryRun => engine.candidate(entry, script::normalizer()).await,
-        _ => engine.candidate(entry, normalizer(entry.spec)).await,
+        _ => {
+            let params = entry.validated.as_ref().map_or(&Value::Null, |v| &v.params);
+            engine
+                .candidate(entry, normalizer(entry.spec, params))
+                .await
+        }
     }
 }
 
@@ -903,8 +908,10 @@ async fn redact(
         .await);
     }
     let (spec, id) = (entry.spec, entry.head.request_id.clone());
+    let params = entry.validated.as_ref().map_or(&Value::Null, |v| &v.params);
+    let normalize = normalizer(spec, params);
     let base = engine
-        .blocking(move |p| Ok(source_body(p, &id, normalizer(spec))))
+        .blocking(move |p| Ok(source_body(p, &id, normalize)))
         .await
         .map_err(DecisionError::Audit)?;
     let base = match base {
@@ -1286,7 +1293,7 @@ async fn edit_write(
         .instances()
         .by_id(&entry.instance_id)
         .and_then(|i| i.version);
-    let caps = EffectiveCaps::default();
+    let caps = engine.effective_caps();
     let vctx = ValidateCtx {
         instance_version: version,
         caps: &caps,

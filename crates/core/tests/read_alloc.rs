@@ -98,7 +98,8 @@ fn read_stages_hold_one_copy_of_a_16_mib_body() -> TestResult {
     // only full-size allocation.
     let payload = json!({ "pages": 1, "responses": [rec] });
     let spec = atlas_duck_registry::get("jira.issue.get").ok_or("no op")?;
-    let (bare, peak) = peak_during(|| normalize(spec, &payload));
+    let params = json!({ "key": "ABC-1" });
+    let (bare, peak) = peak_during(|| normalize(spec, &params, &payload));
     let bare = bare.map_err(|e| format!("{e:?}"))?;
     assert_eq!(bare["key"], "ABC-1");
     assert!(

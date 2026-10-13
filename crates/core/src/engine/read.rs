@@ -22,8 +22,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use atlas_duck_atlassian::{
-    BodyFailure, ConnClass, FetchControl, FetchFailure, FetchOutcome, PageEnd, PagedOutcome,
-    PostSendKind, UnavailableReason, UpstreamResponse,
+    AuditCover, BodyFailure, ConnClass, FetchControl, FetchFailure, FetchOutcome, InstanceClient,
+    PageEnd, PagedOutcome, PostSendKind, ReadBudget, UnavailableReason, UpstreamResponse,
 };
 use atlas_duck_audit::NewEvent;
 use atlas_duck_ipc::envelope::ErrorCode;
@@ -44,7 +44,9 @@ use crate::instances::InstanceState;
 use crate::lifecycle::model::{Event, ReleaseItem};
 use crate::metadata::{FieldCache, FieldNames};
 use crate::ops::generic::{count_value, fallback_preview, invisible_warnings, query_display};
-use crate::ops::{ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table};
+use crate::ops::{
+    ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, jira, op_table,
+};
 use crate::payloads::{self, CapOrBudget, EventCtx, OutcomeKind, ReadFetched};
 use crate::proxy::{PAC_HINT, ResolvedProxy};
 use crate::redact::RedactionMeta;
@@ -104,6 +106,8 @@ pub struct ReadState {
     pub more_available: bool,
     /// `Validated::truncated_by_clamp`.
     pub clamped: bool,
+    /// `jira.issue.get --comments` stopped at the comments cap: `(fetched, server total)`.
+    pub comments_truncated: Option<(u64, u64)>,
     /// Results the normalization removed (§7.4: `confluence.search` results without a `content`
     /// object), counted in `meta.redactions.items_dropped`.
     pub normalized_dropped: u64,
@@ -256,15 +260,19 @@ async fn fetch_classified(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) -> Cl
 pub(super) fn fetched_trigger(f: &Fetched) -> Option<identity::Trigger> {
     match f {
         Fetched::Single(o) => identity::trigger(o),
-        Fetched::Paged { outcome, .. } => match &outcome.failure {
-            Some(failure) => identity::failure_trigger(failure),
-            None if outcome.end == PageEnd::Failed
-                && outcome.pages.last().is_some_and(|r| r.status == 401) =>
-            {
-                Some(identity::Trigger::Json401)
-            }
-            None => None,
-        },
+        Fetched::Paged { outcome, .. } | Fetched::Composite { outcome } => paged_trigger(outcome),
+    }
+}
+
+fn paged_trigger(outcome: &PagedOutcome) -> Option<identity::Trigger> {
+    match &outcome.failure {
+        Some(failure) => identity::failure_trigger(failure),
+        None if outcome.end == PageEnd::Failed
+            && outcome.pages.last().is_some_and(|r| r.status == 401) =>
+        {
+            Some(identity::Trigger::Json401)
+        }
+        None => None,
     }
 }
 
@@ -272,15 +280,22 @@ pub(super) fn fetched_trigger(f: &Fetched) -> Option<identity::Trigger> {
 pub(super) fn ordinary(f: Fetched) -> Fetched {
     match f {
         Fetched::Single(o) => Fetched::Single(identity::as_response(o)),
-        Fetched::Paged { mut outcome, start } => {
-            if let Some(FetchFailure::IdentityCheckFailed { response, .. }) = outcome.failure.take()
-            {
-                outcome.pages.push(response);
-                outcome.end = PageEnd::Failed;
-            }
-            Fetched::Paged { outcome, start }
-        }
+        Fetched::Paged { outcome, start } => Fetched::Paged {
+            outcome: paged_ordinary(outcome),
+            start,
+        },
+        Fetched::Composite { outcome } => Fetched::Composite {
+            outcome: paged_ordinary(outcome),
+        },
     }
+}
+
+fn paged_ordinary(mut outcome: PagedOutcome) -> PagedOutcome {
+    if let Some(FetchFailure::IdentityCheckFailed { response, .. }) = outcome.failure.take() {
+        outcome.pages.push(response);
+        outcome.end = PageEnd::Failed;
+    }
+    outcome
 }
 
 /// The complete responses before the triggering answer, and that answer.
@@ -292,15 +307,17 @@ pub(super) fn split_answer(f: Fetched) -> (Vec<UpstreamResponse>, Option<Upstrea
         })) => (Vec::new(), Some(response)),
         Fetched::Single(FetchOutcome::Response(r)) => (Vec::new(), Some(r)),
         Fetched::Single(FetchOutcome::Failed(_)) => (Vec::new(), None),
-        Fetched::Paged { mut outcome, .. } => match outcome.failure.take() {
-            Some(FetchFailure::IdentityCheckFailed { response, .. }) => {
-                (outcome.pages, Some(response))
+        Fetched::Paged { mut outcome, .. } | Fetched::Composite { mut outcome } => {
+            match outcome.failure.take() {
+                Some(FetchFailure::IdentityCheckFailed { response, .. }) => {
+                    (outcome.pages, Some(response))
+                }
+                _ => {
+                    let last = outcome.pages.pop();
+                    (outcome.pages, last)
+                }
             }
-            _ => {
-                let last = outcome.pages.pop();
-                (outcome.pages, last)
-            }
-        },
+        }
     }
 }
 
@@ -346,7 +363,73 @@ async fn fetch_slot(engine: &Engine, entry: &RequestEntry) -> Option<OwnedSemaph
 /// What the client returned for the plan.
 pub(crate) enum Fetched {
     Single(FetchOutcome),
-    Paged { outcome: PagedOutcome, start: u64 },
+    Paged {
+        outcome: PagedOutcome,
+        start: u64,
+    },
+    /// `jira.issue.get --comments` after a 2xx issue answer (PD-45): `pages[0]` is the issue,
+    /// the rest and every other field are the comment pages'. An issue answer that is not 2xx
+    /// is `Single` (no comment page was requested).
+    Composite {
+        outcome: PagedOutcome,
+    },
+}
+
+/// Runs `plan` under `cover` with `ctl` (the direct read and a script's host call). A composite
+/// read sends the issue GET, then the comment pages with what is left of the one read budget
+/// (time and bytes): `budget` bounds the read as a whole (§7.2).
+pub(crate) async fn run_plan(
+    client: &InstanceClient,
+    cover: &AuditCover,
+    plan: &ReadPlan,
+    budget: &ReadBudget,
+    ctl: &FetchControl,
+    start: u64,
+) -> Fetched {
+    match plan {
+        ReadPlan::Get(call) => Fetched::Single(client.get_ctl(cover, call, ctl).await),
+        ReadPlan::Paged { call, max_items } => Fetched::Paged {
+            outcome: client
+                .read_paginated_ctl(cover, call, budget, *max_items, ctl)
+                .await,
+            start,
+        },
+        ReadPlan::Search {
+            call,
+            items_key,
+            max_items,
+        } => Fetched::Paged {
+            outcome: client
+                .read_paginated_search_ctl(cover, call, items_key, budget, *max_items, ctl)
+                .await,
+            start,
+        },
+        ReadPlan::IssueWithComments {
+            issue,
+            comments,
+            max_items,
+            ..
+        } => {
+            let began = tokio::time::Instant::now();
+            let issue = match client.get_ctl(cover, issue, ctl).await {
+                FetchOutcome::Response(r) if status_2xx(&r) => r,
+                other => return Fetched::Single(other),
+            };
+            // A cancel during the comment pages records the issue answer with them.
+            ctl.push_page(issue.clone());
+            let issue_bytes = u64::try_from(issue.body.len()).unwrap_or(u64::MAX);
+            let left = ReadBudget {
+                total: budget.total.saturating_sub(began.elapsed()),
+                max_bytes: budget.max_bytes.saturating_sub(issue_bytes),
+                ..*budget
+            };
+            let mut outcome = client
+                .read_paginated_ctl(cover, comments, &left, *max_items, ctl)
+                .await;
+            outcome.pages.insert(0, issue);
+            Fetched::Composite { outcome }
+        }
+    }
 }
 
 /// Runs the op's read plan under the request's cover. `Err` = nothing was sent.
@@ -366,6 +449,7 @@ async fn fetch(
         http.client.base(),
         None,
         validated.effective_max,
+        validated.comments_cap,
     ));
     let Ok(ExecPlan::Read(plan)) = plan else {
         return Err(MSG_INTERNAL);
@@ -385,26 +469,7 @@ async fn fetch(
         .get("start")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let client = &http.client;
-    let fetched = match plan {
-        ReadPlan::Get(call) => Fetched::Single(client.get_ctl(&cover, &call, &ctl).await),
-        ReadPlan::Paged { call, max_items } => Fetched::Paged {
-            outcome: client
-                .read_paginated_ctl(&cover, &call, &budget, max_items, &ctl)
-                .await,
-            start,
-        },
-        ReadPlan::Search {
-            call,
-            items_key,
-            max_items,
-        } => Fetched::Paged {
-            outcome: client
-                .read_paginated_search_ctl(&cover, &call, &items_key, &budget, max_items, &ctl)
-                .await,
-            start,
-        },
-    };
+    let fetched = run_plan(&http.client, &cover, &plan, &budget, &ctl, start).await;
     Ok((fetched, http))
 }
 
@@ -427,6 +492,8 @@ pub(crate) struct ItemRecord {
     pub(super) page: Option<PageFacts>,
     server_total: Option<u64>,
     more_available: bool,
+    /// A composite read's comments stopped at the cap: `(fetched, server total)` (PD-45).
+    pub(super) comments_truncated: Option<(u64, u64)>,
 }
 
 pub(super) struct OutcomeFacts {
@@ -545,6 +612,7 @@ impl ItemRecord {
             page: None,
             server_total: None,
             more_available: false,
+            comments_truncated: None,
         }
     }
 }
@@ -570,9 +638,33 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
                 page: None,
                 server_total: None,
                 more_available: false,
+                comments_truncated: None,
             })
         }
         Fetched::Single(FetchOutcome::Failed(f)) => classify_failure(f, Vec::new(), proxy),
+        // Classified as paging (the issue is the first page, so every comment-page failure is a
+        // later-page one: gated, review I-1), then stripped of the paging facts: the op is not
+        // paginated and has no `meta.page` (PD-45).
+        Fetched::Composite { outcome } => {
+            let truncated = match outcome.server_total {
+                Some(total) if outcome.next_start.is_some() && outcome.items_fetched < total => {
+                    Some((outcome.items_fetched, total))
+                }
+                _ => None,
+            };
+            match classify_read(Fetched::Paged { outcome, start: 0 }, proxy) {
+                Classified::Item(mut rec) => {
+                    if rec.item == ReleaseItem::Result {
+                        rec.comments_truncated = truncated;
+                    }
+                    rec.page = None;
+                    rec.server_total = None;
+                    rec.more_available = false;
+                    Classified::Item(rec)
+                }
+                other => other,
+            }
+        }
         Fetched::Paged { outcome, start } => {
             let page = PageFacts {
                 start,
@@ -588,6 +680,7 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
                     page: Some(page),
                     server_total: outcome.server_total,
                     more_available: outcome.next_start.is_some(),
+                    comments_truncated: None,
                 })
             };
             match (outcome.end, outcome.failure) {
@@ -1023,8 +1116,9 @@ fn build_item(
     mut rec: ItemRecord,
     clamped: bool,
 ) -> Result<Built, Vec<UpstreamResponse>> {
+    let shape = ReadShape::of(cx.spec, cx.params);
     let mut record = rec.record(ctx);
-    let built = normalize_with_drops(cx.spec, &record.payload)
+    let built = normalize_with_drops(cx.spec, shape, &record.payload)
         .and_then(|(body, dropped)| Ok((build_candidate(cx.spec, body, &[])?, dropped)));
     let (mut candidate, mut dropped) = match built {
         Ok(b) => b,
@@ -1042,7 +1136,7 @@ fn build_item(
             Vec::new(),
         );
         record = rec.record(ctx);
-        let built = normalize_with_drops(cx.spec, &record.payload)
+        let built = normalize_with_drops(cx.spec, shape, &record.payload)
             .and_then(|(body, _)| build_candidate(cx.spec, body, &[]));
         candidate = match built {
             Ok(c) => c,
@@ -1059,6 +1153,7 @@ fn build_item(
         server_total: rec.server_total,
         more_available: rec.more_available,
         clamped,
+        comments_truncated: rec.comments_truncated,
         normalized_dropped: dropped,
         redaction_meta: None,
         also_appears_in: Vec::new(),
@@ -1082,22 +1177,54 @@ pub(crate) fn caution_count(m: &PreviewModel) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// The bare candidate body of a committed `READ_FETCHED` payload: the one normalization the
-/// first build and every rebuild use (`cache`'s contract). Reads nothing but the payload.
-pub fn normalize(spec: &OperationSpec, payload: &Value) -> Result<Value, RebuildError> {
-    normalize_with_drops(spec, payload).map(|(body, _)| body)
+/// How a read's 2xx pages become its body. Decided by the op and its committed (validated)
+/// params alone, never by fetched content, so the first build and every rebuild agree (PD-45:
+/// the `READ_FETCHED` payload of a composite read has no shape of its own).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadShape {
+    /// One response, or the pages of a paged op.
+    Plain,
+    /// `jira.issue.get --comments`: the issue, then the comment pages, merged into
+    /// `fields.comment` (and with `rendered`, `renderedFields.comment`).
+    IssueWithComments { rendered: bool },
 }
 
-/// [`normalize`] for `Engine::candidate`.
+impl ReadShape {
+    pub fn of(spec: &OperationSpec, params: &Value) -> ReadShape {
+        if spec.id == "jira.issue.get" && jira::wants_comments(params) {
+            ReadShape::IssueWithComments {
+                rendered: jira::comments_rendered(params),
+            }
+        } else {
+            ReadShape::Plain
+        }
+    }
+}
+
+/// The bare candidate body of a committed `READ_FETCHED` payload: the one normalization the
+/// first build and every rebuild use (`cache`'s contract). Reads nothing but the payload and the
+/// request's validated `params` (which decide the [`ReadShape`]).
+pub fn normalize(
+    spec: &OperationSpec,
+    params: &Value,
+    payload: &Value,
+) -> Result<Value, RebuildError> {
+    normalize_with_drops(spec, ReadShape::of(spec, params), payload).map(|(body, _)| body)
+}
+
+/// [`normalize`] for `Engine::candidate`, with the shape decided from `params` up front.
 pub(crate) fn normalizer(
     spec: &'static OperationSpec,
+    params: &Value,
 ) -> impl FnOnce(&Value) -> Result<Value, RebuildError> + Send + 'static {
-    move |payload| normalize(spec, payload)
+    let shape = ReadShape::of(spec, params);
+    move |payload| normalize_with_drops(spec, shape, payload).map(|(body, _)| body)
 }
 
 /// [`normalize`] plus the number of results it removed (§7.4).
 fn normalize_with_drops(
     spec: &OperationSpec,
+    shape: ReadShape,
     payload: &Value,
 ) -> Result<(Value, u64), RebuildError> {
     if let Some(outcome) = payload.get("outcome") {
@@ -1117,7 +1244,88 @@ fn normalize_with_drops(
         let last = responses.last().ok_or(RebuildError::Malformed)?;
         return Ok((error_candidate(last.status, &last.body), 0));
     }
-    result_body(spec, responses.iter().map(|r| &*r.body))
+    result_value(spec, shape, responses.iter().map(|r| &*r.body))
+}
+
+/// The result of a read's 2xx pages in its [`ReadShape`] (the direct read's candidate, a script
+/// host call's result).
+pub(super) fn result_value<'a>(
+    spec: &OperationSpec,
+    shape: ReadShape,
+    bodies: impl IntoIterator<Item = &'a [u8]>,
+) -> Result<(Value, u64), RebuildError> {
+    match shape {
+        ReadShape::Plain => result_body(spec, bodies),
+        ReadShape::IssueWithComments { rendered } => {
+            merge_comments(bodies, rendered).map(|body| (body, 0))
+        }
+    }
+}
+
+/// PD-45: the issue (the first body) with `fields.comment = {startAt, maxResults, total,
+/// comments}`: the first comment page's numbers as the server sent them (the total unchanged)
+/// and the comments of every page in order, replacing whatever `fields.comment` the issue had.
+/// With `rendered`, each comment's `renderedBody` moves out of the field side into
+/// `renderedFields.comment.comments [{id, body}]`, one entry per comment (`body: null` when the
+/// server sent none), so the M3 mirror `fields.comment.comments ↔ renderedFields.comment.comments`
+/// (key `id`) finds a counterpart for every comment.
+fn merge_comments<'a>(
+    bodies: impl IntoIterator<Item = &'a [u8]>,
+    rendered: bool,
+) -> Result<Value, RebuildError> {
+    let mut pages = bodies
+        .into_iter()
+        .map(|b| serde_json::from_slice::<Value>(b).map_err(|_| RebuildError::Malformed));
+    let mut issue = pages.next().ok_or(RebuildError::Malformed)??;
+    let mut first = pages.next().ok_or(RebuildError::Malformed)??;
+    let mut comments = match first.get_mut("comments").map(Value::take) {
+        Some(Value::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    for page in pages {
+        if let Some(Value::Array(a)) = page?.get_mut("comments").map(Value::take) {
+            comments.extend(a);
+        }
+    }
+    let mut mirror = Vec::new();
+    for c in &mut comments {
+        let Some(c) = c.as_object_mut() else { continue };
+        let body = c.remove("renderedBody").unwrap_or(Value::Null);
+        if rendered {
+            let mut entry = Map::new();
+            entry.insert("id".into(), c.get("id").cloned().unwrap_or(Value::Null));
+            entry.insert("body".into(), body);
+            mirror.push(Value::Object(entry));
+        }
+    }
+    let mut comment = Map::new();
+    for key in ["startAt", "maxResults", "total"] {
+        if let Some(v) = first.get_mut(key).map(Value::take) {
+            comment.insert(key.into(), v);
+        }
+    }
+    comment.insert("comments".into(), Value::Array(comments));
+    let root = issue.as_object_mut().ok_or(RebuildError::Malformed)?;
+    object_at(root, "fields")
+        .ok_or(RebuildError::Malformed)?
+        .insert("comment".into(), Value::Object(comment));
+    if rendered {
+        let mut rendered_comment = Map::new();
+        rendered_comment.insert("comments".into(), Value::Array(mirror));
+        object_at(root, "renderedFields")
+            .ok_or(RebuildError::Malformed)?
+            .insert("comment".into(), Value::Object(rendered_comment));
+    }
+    Ok(issue)
+}
+
+/// The object under `key`, made an (empty) object first when it is absent or not one.
+fn object_at<'m>(map: &'m mut Map<String, Value>, key: &str) -> Option<&'m mut Map<String, Value>> {
+    let slot = map.entry(key.to_owned()).or_insert(Value::Null);
+    if !slot.is_object() {
+        *slot = Value::Object(Map::new());
+    }
+    slot.as_object_mut()
 }
 
 /// The released code of an outcome (§5.2 step 6): caps → `result_too_large`, timeouts and
@@ -1225,6 +1433,7 @@ pub(crate) fn preview_model(cx: &ReadContext<'_>, read: &ReadState, c: &Candidat
                     server_total: read.server_total,
                     more_available: read.more_available,
                     clamped: read.clamped,
+                    comments_truncated: read.comments_truncated,
                 }),
                 field_names: cx.field_names.as_deref(),
             })
@@ -1432,6 +1641,45 @@ mod tests {
         assert!(matches!(
             classify_failure(FetchFailure::MethodGuardRefused, page1(), &direct_proxy()),
             Classified::Direct(_)
+        ));
+        Ok(())
+    }
+
+    /// PD-45 edge shapes: a comment without `renderedBody` keeps its mirror entry (`body: null`),
+    /// missing or non-object `fields`/`renderedFields` are made objects, the issue's own
+    /// `fields.comment` is replaced, and anything but an issue object plus a comment page is
+    /// `Malformed`.
+    #[test]
+    fn merge_comments_edge_shapes() -> TestResult {
+        let issue = br#"{"key":"ABC-1","renderedFields":null}"#;
+        let page = br#"{"startAt":0,"maxResults":50,"total":2,"comments":[{"id":"1","body":"a","renderedBody":"<p>a</p>"},{"id":"2","body":"b"}],"extra":true}"#;
+        let merged = merge_comments([&issue[..], &page[..]], true).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(
+            merged["fields"]["comment"],
+            json!({"startAt": 0, "maxResults": 50, "total": 2,
+                   "comments": [{"id": "1", "body": "a"}, {"id": "2", "body": "b"}]})
+        );
+        assert_eq!(
+            merged["renderedFields"],
+            json!({"comment": {"comments": [{"id": "1", "body": "<p>a</p>"}, {"id": "2", "body": null}]}})
+        );
+        // Unrendered: no mirror is built, `renderedBody` still never reaches the field side.
+        let replaced = br#"{"key":"ABC-1","fields":{"comment":{"comments":[{"id":"9"}]}}}"#;
+        let merged =
+            merge_comments([&replaced[..], &page[..]], false).map_err(|e| format!("{e:?}"))?;
+        assert!(merged.get("renderedFields").is_none());
+        assert_eq!(
+            merged["fields"]["comment"]["comments"][0],
+            json!({"id": "1", "body": "a"})
+        );
+        assert_eq!(merged["fields"]["comment"]["total"], 2);
+        assert!(matches!(
+            merge_comments([&issue[..]], false),
+            Err(RebuildError::Malformed)
+        ));
+        assert!(matches!(
+            merge_comments([&b"[1]"[..], &page[..]], false),
+            Err(RebuildError::Malformed)
         ));
         Ok(())
     }

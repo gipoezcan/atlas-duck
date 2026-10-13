@@ -65,7 +65,7 @@ use crate::payloads::{EventCtx, PreviewFetchPurpose};
 use crate::proxy::ResolvedProxy;
 use crate::redact::RedactionOp;
 use crate::similarity::{SimOutcome, SimRecord, SimilarityIndex, sim_key};
-use crate::validate::Validated;
+use crate::validate::{EffectiveCaps, Validated};
 
 use cache::{Candidate, CandidateCache, RebuildError};
 use envelope::{OpenStatus, RecordStatus};
@@ -886,6 +886,7 @@ impl Engine {
         base: &'a NormalizedBaseUrl,
         enrichment: Option<&'a EnrichVerdict>,
         effective_max: Option<u32>,
+        comments_cap: Option<u32>,
     ) -> ExecCtx<'a> {
         ExecCtx {
             spec,
@@ -893,8 +894,18 @@ impl Engine {
             base,
             enrichment,
             effective_max,
+            comments_cap,
             #[cfg(feature = "testing")]
             test_fault: self.hooks.converter_fault,
+        }
+    }
+
+    /// The caps validation applies (§7.5, Δ7): the configured comments cap from the limits;
+    /// configured `max` hard caps arrive with M6's Settings.
+    pub(crate) fn effective_caps(&self) -> EffectiveCaps {
+        EffectiveCaps {
+            comments_cap: self.limits().comments_cap,
+            ..EffectiveCaps::default()
         }
     }
 

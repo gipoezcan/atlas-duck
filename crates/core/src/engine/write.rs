@@ -265,7 +265,7 @@ pub(crate) fn render(
 ) -> Result<Vec<HttpRequestSpec>, ExecError> {
     let op = op_table().get(spec.id).ok_or(ExecError::NotInThisBuild)?;
     let enrichment = verdict.filter(|v| v.hold == Hold::Preview);
-    match (op.executor)(&engine.exec_ctx(spec, params, base, enrichment, effective_max))? {
+    match (op.executor)(&engine.exec_ctx(spec, params, base, enrichment, effective_max, None))? {
         ExecPlan::Write(requests) => Ok(requests),
         ExecPlan::Read(_) => Err(ExecError::NotInThisBuild),
     }

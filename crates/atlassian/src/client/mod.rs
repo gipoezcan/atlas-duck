@@ -196,8 +196,10 @@ impl FetchControl {
         std::mem::take(&mut self.state().partial)
     }
 
-    /// A completed page of a paginated read (kept for `take_captured`).
-    pub(crate) fn push_page(&self, page: UpstreamResponse) {
+    /// A completed page of a paginated read (kept for `take_captured`). Public for a composite
+    /// read whose caller fetched an earlier response itself (`jira.issue.get --comments`: the
+    /// issue, then the comment pages under the same control), so a cancel records every response.
+    pub fn push_page(&self, page: UpstreamResponse) {
         self.state().pages.push(page);
     }
 

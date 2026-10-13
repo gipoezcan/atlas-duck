@@ -7,7 +7,7 @@ use atlas_duck_preview::warning::{Warning, WarningId};
 use serde_json::{Map, Value, json};
 
 use super::{
-    EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
+    EnrichCtx, EnrichPurpose, EnrichRule, EnrichVerdict, ExecCtx, ExecError, ExecPlan, ReadPlan,
     cap_diff_text, generic, get_call, jira_body, json_request, resolve_url, str_param,
 };
 use crate::lifecycle::model::Hold;
@@ -23,8 +23,8 @@ const CREATEMETA_ISSUETYPES_PATH: &str = "/rest/api/2/issue/createmeta/{project}
 // ---- jira.issue.get ----------------------------------------------------------------------------
 
 /// §7.3: `changelog` → `expand += changelog`, `rendered` → `expand += renderedFields`; the
-/// default `fields` come from the registry. `comments` is accepted and has no effect until M5
-/// merges the comment-list executor (PD-09).
+/// default `fields` come from the registry. `comments` makes the read composite (PD-45, see
+/// [`issue_with_comments`]).
 pub fn issue_get_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     let mut expand: Vec<Value> = ctx
         .params
@@ -45,7 +45,100 @@ pub fn issue_get_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     {
         map.insert("expand".to_owned(), Value::Array(expand));
     }
+    if wants_comments(ctx.params) {
+        return issue_with_comments(ctx, params);
+    }
     generic::read_plan(ctx, &params)
+}
+
+/// `comments: true` on `jira.issue.get` (PD-45): the read is the composite
+/// [`ReadPlan::IssueWithComments`]. Its committed params decide the merge too
+/// (`engine::read::ReadShape`), so the first build and every rebuild agree.
+pub fn wants_comments(params: &Value) -> bool {
+    params.get("comments") == Some(&Value::Bool(true))
+}
+
+/// Whether a composite read's issue carries `renderedFields` (`rendered: true`, or the agent's
+/// own `expand`): its comment pages are then fetched with `expand=renderedBody`, so every
+/// comment has its `renderedFields.comment` counterpart (the M3 mirror, U-27).
+pub fn comments_rendered(params: &Value) -> bool {
+    params.get("rendered") == Some(&Value::Bool(true))
+        || params
+            .get("expand")
+            .and_then(Value::as_array)
+            .is_some_and(|e| e.iter().any(|v| v.as_str() == Some("renderedFields")))
+}
+
+/// The comment pages of `--comments` hold at most this many comments each (§7.3: the
+/// `jira.comment.list` page size).
+const COMMENT_PAGE_SIZE: u32 = 50;
+
+/// PD-45: the issue GET with `comment` taken out of the agent's `fields` (the merge fills
+/// `fields.comment`; a list that held only `comment` is sent as it is, since an empty one would
+/// fall back to the registry defaults), then the `jira.comment.list` plan (`orderBy=created`,
+/// `+ expand=renderedBody` when rendered) in pages of `min(50, cap)` up to the cap.
+fn issue_with_comments(ctx: &ExecCtx<'_>, mut params: Value) -> Result<ExecPlan, ExecError> {
+    if let Some(Value::Array(fields)) = params.get_mut("fields") {
+        let kept: Vec<Value> = fields
+            .iter()
+            .filter(|f| f.as_str() != Some("comment"))
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            *fields = kept;
+        }
+    }
+    let ExecPlan::Read(ReadPlan::Get(issue)) = generic::read_plan(ctx, &params)? else {
+        return Err(composite_internal());
+    };
+    let cap = ctx
+        .comments_cap
+        .or(ctx.spec.caps.comments_cap)
+        .ok_or_else(composite_internal)?
+        .max(1);
+    let page_size = cap.min(COMMENT_PAGE_SIZE);
+    let list = atlas_duck_registry::get("jira.comment.list").ok_or_else(composite_internal)?;
+    let mut list_params = Map::new();
+    if let Some(key) = ctx.params.get("key") {
+        list_params.insert("key".to_owned(), key.clone());
+    }
+    let list_params = Value::Object(list_params);
+    let list_ctx = ExecCtx {
+        spec: list,
+        params: &list_params,
+        base: ctx.base,
+        enrichment: None,
+        effective_max: Some(page_size),
+        comments_cap: None,
+        #[cfg(feature = "testing")]
+        test_fault: None,
+    };
+    let ExecPlan::Read(ReadPlan::Paged { mut call, .. }) =
+        generic::read_plan(&list_ctx, &list_params)?
+    else {
+        return Err(composite_internal());
+    };
+    let rendered = comments_rendered(ctx.params);
+    if rendered {
+        call.get
+            .query
+            .push(("expand".to_owned(), "renderedBody".to_owned()));
+    }
+    Ok(ExecPlan::Read(ReadPlan::IssueWithComments {
+        issue,
+        comments: Box::new(call),
+        max_items: u64::from(cap),
+        rendered,
+    }))
+}
+
+/// A registry entry the composite read needs is missing or of the wrong shape (a bug).
+fn composite_internal() -> ExecError {
+    ExecError::Invalid(crate::validate::ValidationError {
+        code: atlas_duck_ipc::envelope::ErrorCode::Internal,
+        message: "the comment pages of the read cannot be planned".to_owned(),
+        details: Map::new(),
+    })
 }
 
 // ---- name resolution ---------------------------------------------------------------------------

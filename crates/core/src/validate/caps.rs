@@ -83,6 +83,21 @@ pub(super) fn effective_max(
     Ok((Some(hard), true))
 }
 
+/// The largest configurable comments cap (PD-63: `[limits] jira_comments_cap` is 1–1000).
+const MAX_COMMENTS_CAP: u32 = 1000;
+
+/// Δ7: the configured comments cap, else the registry's, for an op that has one; bounded to
+/// `1..=MAX_COMMENTS_CAP` so a bad setting can neither fetch nothing nor fetch without bound.
+pub(super) fn comments_cap(spec: &OperationSpec, ctx: &ValidateCtx<'_>) -> Option<u32> {
+    let default = spec.caps.comments_cap?;
+    Some(
+        ctx.caps
+            .comments_cap
+            .unwrap_or(default)
+            .clamp(1, MAX_COMMENTS_CAP),
+    )
+}
+
 fn positive_integer(value: &Value) -> Option<u64> {
     let number = value.as_number()?;
     if let Some(n) = number.as_u64() {

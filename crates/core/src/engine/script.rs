@@ -53,7 +53,7 @@ use super::cache::{Candidate, RebuildError};
 use super::envelope::{self, OpenStatus};
 use super::handler::{CoreHandler, excerpt, internal_error};
 use super::queue::{AgentKey, Reservation};
-use super::read::{self, Classified, Fetched};
+use super::read::{self, Classified};
 use super::{Engine, NewEntry, OnAuditFailure, RequestEntry, RequestHead, audit_failure_retryable};
 use crate::audit_port::commit_request_received;
 use crate::gate::{AttentionKind, GateState, UiEvent};
@@ -71,9 +71,7 @@ use crate::payloads::{
     ScriptFailed,
 };
 use crate::redact::RedactionMeta;
-use crate::validate::{
-    EffectiveCaps, ValidateCtx, Validated, ValidationError, validate, validate_script_submit,
-};
+use crate::validate::{ValidateCtx, Validated, ValidationError, validate, validate_script_submit};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -641,7 +639,7 @@ impl CallValidator for EngineValidator {
                 "the instance is not configured",
             ));
         };
-        let caps = EffectiveCaps::default();
+        let caps = self.engine.effective_caps();
         let ctx = ValidateCtx {
             instance_version: inst.version,
             caps: &caps,
@@ -656,6 +654,7 @@ impl CallValidator for EngineValidator {
                 &base,
                 None,
                 validated.effective_max,
+                validated.comments_cap,
             ))
             .map(|_| ()),
             None => Err(ExecError::NotInThisBuild),
@@ -988,6 +987,7 @@ impl LiveBackend {
             http.client.base(),
             None,
             vc.validated.effective_max,
+            vc.validated.comments_cap,
         ));
         let Ok(ExecPlan::Read(plan)) = plan else {
             return Err(internal());
@@ -1014,26 +1014,7 @@ impl LiveBackend {
         let mut refetched = false;
         loop {
             let seen = self.engine.identity_epoch(&vc.instance_id);
-            let client = &http.client;
-            let fetched = match &plan {
-                ReadPlan::Get(g) => Fetched::Single(client.get_ctl(&cover, g, ctl).await),
-                ReadPlan::Paged { call: c, max_items } => Fetched::Paged {
-                    outcome: client
-                        .read_paginated_ctl(&cover, c, &budget, *max_items, ctl)
-                        .await,
-                    start,
-                },
-                ReadPlan::Search {
-                    call: c,
-                    items_key,
-                    max_items,
-                } => Fetched::Paged {
-                    outcome: client
-                        .read_paginated_search_ctl(&cover, c, items_key, &budget, *max_items, ctl)
-                        .await,
-                    start,
-                },
-            };
+            let fetched = read::run_plan(&http.client, &cover, &plan, &budget, ctl, start).await;
             let Some(trigger) = read::fetched_trigger(&fetched) else {
                 return Ok(read::classify_read(fetched, &http.proxy));
             };
@@ -1100,7 +1081,9 @@ impl LiveBackend {
                 let size = rec.size();
                 let event = rec.record(&ctx);
                 let (result, rejection, lossy) = match rec.item {
-                    ReleaseItem::Result => settle_result(vc.spec, &rec, call.all, max_result),
+                    ReleaseItem::Result => {
+                        settle_result(vc.spec, &vc.validated.params, &rec, call.all, max_result)
+                    }
                     ReleaseItem::UpstreamError => {
                         let (status, text) = rec.responses.last().map_or((0, String::new()), |r| {
                             (r.status, read::error_text(&r.body))
@@ -1219,11 +1202,13 @@ struct Settled {
 /// A 2xx answer: its body as the script's result, unless it is over `max_call_result_mb`.
 fn settle_result(
     spec: &'static OperationSpec,
+    params: &Value,
     rec: &read::ItemRecord,
     all: bool,
     max_result: u64,
 ) -> (HostCallResult, Option<&'static str>, bool) {
-    match read::result_body(spec, rec.responses.iter().map(|r| r.body.as_slice())) {
+    let shape = read::ReadShape::of(spec, params);
+    match read::result_value(spec, shape, rec.responses.iter().map(|r| r.body.as_slice())) {
         Ok((body, _)) => {
             let len = serde_json::to_vec(&body).map_or(u64::MAX, |b| b.len() as u64);
             if len > max_result {
@@ -1236,8 +1221,10 @@ fn settle_result(
                     false,
                 )
             } else {
-                // `atlas.all` pages to the end; a single call that stopped early is lossy.
-                let lossy = !all && rec.page.is_some_and(|p| p.next_start.is_some());
+                // `atlas.all` pages to the end; a single call that stopped early is lossy, and
+                // so are comments cut at the comments cap (which `atlas.all` keeps).
+                let lossy = (!all && rec.page.is_some_and(|p| p.next_start.is_some()))
+                    || rec.comments_truncated.is_some();
                 (HostCallResult::Ok(body), None, lossy)
             }
         }
@@ -1275,6 +1262,8 @@ fn widen(plan: ReadPlan) -> ReadPlan {
             items_key,
             max_items: u64::MAX,
         },
+        // The comments cap is a hard cap, not the agent's `max`: `atlas.all` keeps it.
+        composite @ ReadPlan::IssueWithComments { .. } => composite,
     }
 }
 
@@ -1391,6 +1380,7 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
         server_total: None,
         more_available: false,
         clamped: false,
+        comments_truncated: None,
     };
     let mut m = fallback_preview(&PreviewCtx {
         spec: &SCRIPT_SPEC,

@@ -367,6 +367,13 @@ fn read_fallback(ctx: &PreviewCtx<'_>, view: &ReadView<'_>) -> PreviewModel {
             warning::truncated_by_cap(shown, of),
         ));
     }
+    // PD-45: `jira.issue.get --comments` stopped at the comments cap.
+    if let Some((fetched, total)) = view.comments_truncated {
+        warnings.push(Warning::new(
+            WarningId::TruncatedByCap,
+            warning::truncated_by_cap(fetched, total),
+        ));
+    }
 
     let query = query_display(spec, ctx.params);
     PreviewModel {

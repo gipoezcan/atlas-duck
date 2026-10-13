@@ -52,6 +52,9 @@ pub struct Limits {
     pub candidate_cache_bytes: u64,
     /// A script's static reservation in MiB (§9.4 `max_result_mb`; Settings arrive in M6).
     pub max_result_mb: u32,
+    /// The configured `jira.issue.get --comments` cap (Δ7, PD-63; `[limits] jira_comments_cap`
+    /// from M6's Settings). `None` = the registry's `caps.comments_cap` (100).
+    pub comments_cap: Option<u32>,
 }
 
 impl Default for Limits {
@@ -63,6 +66,7 @@ impl Default for Limits {
             fetching: FETCH_SLOTS,
             candidate_cache_bytes: CANDIDATE_CACHE_MB * MIB,
             max_result_mb: ScriptLimits::default().max_result_mb,
+            comments_cap: None,
         }
     }
 }

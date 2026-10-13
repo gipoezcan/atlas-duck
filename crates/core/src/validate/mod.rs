@@ -54,6 +54,9 @@ pub struct ValidateCtx<'a> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectiveCaps {
     pub hard_caps: BTreeMap<&'static str, u32>,
+    /// Δ7: the configured `jira.issue.get` comments cap (§7.3 "cap 100, configurable");
+    /// `None` = the registry's `caps.comments_cap`.
+    pub comments_cap: Option<u32>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -65,6 +68,9 @@ pub struct Validated {
     /// The agent asked for more than the hard cap and got the cap (the engine sets
     /// `meta.page.truncated`, §7.5).
     pub truncated_by_clamp: bool,
+    /// `Some` for ops with a comments cap (`jira.issue.get`): how many comments `comments: true`
+    /// fetches at most (Δ7).
+    pub comments_cap: Option<u32>,
 }
 
 impl fmt::Debug for Validated {
@@ -74,6 +80,7 @@ impl fmt::Debug for Validated {
             .field("params_bytes", &self.params.to_string().len())
             .field("effective_max", &self.effective_max)
             .field("truncated_by_clamp", &self.truncated_by_clamp)
+            .field("comments_cap", &self.comments_cap)
             .finish()
     }
 }
@@ -281,6 +288,7 @@ pub fn validate(
         params: params.clone(),
         effective_max,
         truncated_by_clamp,
+        comments_cap: caps::comments_cap(spec, ctx),
     })
 }
 
