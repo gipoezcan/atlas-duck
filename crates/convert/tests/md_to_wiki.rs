@@ -85,6 +85,11 @@ fn project(blocks: &[Block]) -> Result<String, String> {
                 Inline::Text(t) => s.push_str(t),
                 Inline::LineBreak => s.push('\n'),
                 Inline::Link { text: None, target } => s.push_str(target),
+                // A bare URL rewritten as `[url|url]`: both parts are the URL.
+                Inline::Link {
+                    text: Some(text),
+                    target,
+                } if text == target => s.push_str(target),
                 other => return Err(format!("unexpected inline {other:?}")),
             }
         }
@@ -277,11 +282,11 @@ fn code_container_detection_is_case_insensitive() -> TestResult {
 #[test]
 fn code_lang_is_sanitized() -> TestResult {
     let (out, _) = convert_checked(
-        "```c++ extra\na\n```\n\n```bad}lang\nb\n```\n\n```rust,ignore\nc\n```\n\n    d\n",
+        "```c++ extra\na\n```\n\n```bad}lang\nb\n```\n\n```java,ignore\nc\n```\n\n    d\n",
     )?;
     assert_eq!(
         out,
-        "{code:c++}\na\n{code}\n\n{code}\nb\n{code}\n\n{code:rust}\nc\n{code}\n\n{code}\nd\n{code}\n"
+        "{code:c++}\na\n{code}\n\n{code}\nb\n{code}\n\n{code:java}\nc\n{code}\n\n{code}\nd\n{code}\n"
     );
     Ok(())
 }
@@ -341,6 +346,127 @@ fn quote_holding_its_own_closer_is_flattened() -> TestResult {
     let (out, e) = convert_checked("> a {quote} b\n>\n> c\n")?;
     assert_eq!(out, "bq. a \\{quote\\} b\n\nbq. c\n");
     assert!(e.code_blocks.is_empty());
+    Ok(())
+}
+
+#[test]
+fn quote_hazard_matches_whitespace_led_closers() -> TestResult {
+    // The parser pairs `{ quote}` / `{\tQuote }` as a closer, so these flatten like `{quote}`.
+    let (out, e) = convert_checked("> a\n>\n> ```\n> { quote}\n> {include:X}\n> ```\n")?;
+    assert_eq!(out, "bq. a\n\n{code}\n{ quote}\n{include:X}\n{code}\n");
+    assert_eq!(kinds(&e), [ContainerKind::Code]);
+    assert!(wiki_constructs(&out).includes.is_empty());
+    let (out, e) = convert_checked("> a\n>\n> ```\n> {\tQuote }\n> ```\n")?;
+    assert_eq!(out, "bq. a\n\n{code}\n{\tQuote }\n{code}\n");
+    assert_eq!(kinds(&e), [ContainerKind::Code]);
+    // Escaped prose.
+    let (out, e) = convert_checked("> a { quote} b\n>\n> c\n")?;
+    assert_eq!(out, "bq. a \\{ quote\\} b\n\nbq. c\n");
+    assert!(e.code_blocks.is_empty());
+    // `{` alone, or `{` + whitespace + another word, keeps the container.
+    let (_, e) = convert_checked("> a { b\n>\n> c { quo}\n")?;
+    assert_eq!(kinds(&e), [ContainerKind::Quote]);
+    Ok(())
+}
+
+#[test]
+fn bare_url_keeps_its_end_next_to_delimiters() -> TestResult {
+    let url = "https://x.example/a";
+    for (md, out) in [
+        (
+            "*https://x.example/a*",
+            "_[https://x.example/a|https://x.example/a]_\n",
+        ),
+        (
+            "_https://x.example/a_",
+            "_[https://x.example/a|https://x.example/a]_\n",
+        ),
+        (
+            "~~https://x.example/a~~ b",
+            "-[https://x.example/a|https://x.example/a]- b\n",
+        ),
+        (
+            "https://x.example/a.\\",
+            "[https://x.example/a|https://x.example/a].&#92;\n",
+        ),
+        (
+            "https://x.example/a\\",
+            "[https://x.example/a|https://x.example/a]&#92;\n",
+        ),
+        // Nothing glues: the URL stays a bare link.
+        ("see https://x.example/a.", "see https://x.example/a.\n"),
+        ("**https://x.example/a**", "*https://x.example/a*\n"),
+        ("https://x.example/a *b*", "https://x.example/a _b_\n"),
+    ] {
+        let (got, _) = convert_checked(md)?;
+        assert_eq!(got, out, "for {md:?}");
+        assert_eq!(wiki_constructs(&got).links, [url], "links of {got:?}");
+    }
+    // The text of a rewritten link escapes like any text, the target keeps the URL.
+    let (got, _) = convert_checked("*https://x.example/a_b-c?d=1&e=2*")?;
+    assert_eq!(
+        got,
+        "_[https://x.example/a_b-c?d=1&e=2|https://x.example/a_b-c?d=1&e=2]_\n"
+    );
+    assert_eq!(
+        wiki_constructs(&got).links,
+        ["https://x.example/a_b-c?d=1&e=2"]
+    );
+    Ok(())
+}
+
+#[test]
+fn code_language_allowlist_and_aliases() -> TestResult {
+    let table = [
+        ("java", Some("java")),
+        ("Java", Some("java")),
+        ("JSON", Some("json")),
+        ("c++", Some("c++")),
+        ("c#", Some("c#")),
+        ("cpp", Some("c++")),
+        ("cs", Some("c#")),
+        ("csharp", Some("c#")),
+        ("js", Some("javascript")),
+        ("jsx", Some("javascript")),
+        ("ts", Some("javascript")),
+        ("typescript", Some("javascript")),
+        ("tsx", Some("javascript")),
+        ("py", Some("python")),
+        ("python", Some("python")),
+        ("yml", Some("yaml")),
+        ("rb", Some("ruby")),
+        ("sh", Some("bash")),
+        ("shell", Some("bash")),
+        ("console", Some("bash")),
+        ("zsh", Some("bash")),
+        ("text", Some("none")),
+        ("plain", Some("none")),
+        ("plaintext", Some("none")),
+        ("none", Some("none")),
+        ("sql", Some("sql")),
+        ("xml", Some("xml")),
+        ("html", Some("html")),
+        ("go", Some("go")),
+        ("objc", Some("objc")),
+        ("visualbasic", Some("visualbasic")),
+        ("rust", None),
+        ("kotlin", None),
+        ("kt", None),
+        ("toml", None),
+        ("diff", None),
+        ("nosuchlang", None),
+    ];
+    for (info, want) in table {
+        let (out, _) = convert_checked(&format!("```{info}\nx\n```\n"))?;
+        let open = match want {
+            Some(l) => format!("{{code:{l}}}"),
+            None => "{code}".to_owned(),
+        };
+        assert_eq!(out, format!("{open}\nx\n{{code}}\n"), "for {info:?}");
+    }
+    // Only the first word counts, and `{code:lang}` stays the opener of an inner container.
+    let (out, _) = convert_checked("```ts extra\nx\n```\n")?;
+    assert_eq!(out, "{code:javascript}\nx\n{code}\n");
     Ok(())
 }
 
@@ -659,6 +785,19 @@ fn md_fragment() -> impl Strategy<Value = String> {
             "é",
             "\u{202E}",
             "https://x.example/a_b~c",
+            "*https://x.example/a*",
+            "~~https://x.example/a~~",
+            "https://x.example/a.\\",
+            "{ quote}",
+            "{\tquote }",
+            "[",
+            "](u)",
+            "](~u)",
+            "](^u)",
+            "![",
+            "<~a@b.example>",
+            "\u{2028}",
+            "\u{85}",
             "{{",
             "}}",
         ])
@@ -790,6 +929,21 @@ proptest! {
     #[test]
     fn markdown_produces_only_recorded_containers(md in markdown()) {
         convert_checked(&md).map_err(TestCaseError::fail)?;
+    }
+
+    /// A bare URL next to emphasis, strike or a backslash stays one link with exactly that
+    /// target (a delimiter or character reference after it must not extend it).
+    #[test]
+    fn bare_url_target_survives_adjacent_markup(
+        path in "[a-z0-9.-]{0,8}[a-z]",
+        wrap in prop::sample::select(vec!["", "*", "**", "_", "__", "~~"]),
+        suffix in prop::sample::select(vec!["", ".", ",", ")", "\\", ".\\", "\\\\", " x", "?"]),
+        prefix in prop::sample::select(vec!["", "a ", "(", "> "]),
+    ) {
+        let url = format!("https://x.example/{path}");
+        let md = format!("{prefix}{wrap}{url}{wrap}{suffix}\n");
+        let (out, _) = convert_checked(&md).map_err(TestCaseError::fail)?;
+        prop_assert_eq!(wiki_constructs(&out).links, vec![url], "md {:?} -> {:?}", md, out);
     }
 }
 

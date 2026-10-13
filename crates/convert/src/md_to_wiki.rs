@@ -3,14 +3,16 @@
 //! The `pulldown-cmark` event stream drives a stack of frames, one per open tag. All text
 //! goes through [`crate::escape`], so Markdown can never produce a macro, mention, include,
 //! image or attachment link. Beyond the escaping:
-//! - Code bodies (fenced, indented): `{code[:lang]}` unless the body contains `{code`
+//! - Code bodies (fenced, indented): `{code[:lang]}` (lang only when Jira has a formatter, see
+//!   `code_lang`) unless the body contains `{code`
 //!   (ASCII case-insensitive), else `{noformat}` unless it also contains `{noformat`, else
 //!   escaped monospace lines (`{{…}}` per line, an empty line as `{{&#160;}}`). Inline code is
 //!   always escaped `{{…}}`.
 //! - Block quotes: one paragraph → `bq. ` (line breaks as `\\`); several blocks → a
 //!   `{quote}` container. `{quote}` cannot nest, so a quote inside a quote is written flat
 //!   (paragraphs as `bq. ` lines, other blocks as they are), and so is a quote whose rendered
-//!   content holds the text `{quote` (ASCII case-insensitive) anywhere: in a code body, or as
+//!   content holds a `{quote` tag (`{`, optional whitespace, `quote`; ASCII case-insensitive)
+//!   anywhere: in a code body, or as
 //!   escaped prose `\{quote\}` (Jira's search for the closing tag may not honour escapes).
 //! - Images become links `[alt|url]` (PD-44); raw HTML is escaped text; link targets are
 //!   percent-encoded where the wiki grammar would read them.
@@ -743,7 +745,7 @@ fn quote(mut blocks: BlockList, nested: bool) -> Rendered {
     }
     let flat = nested
         || matches!(children.as_slice(), [Child { para: true, .. }])
-        || children.iter().any(|c| contains_ci(&c.r.text, "{quote"));
+        || children.iter().any(|c| has_quote_tag(&c.r.text));
     if flat {
         return join(children.into_iter().map(|c| {
             if c.para {
@@ -820,19 +822,99 @@ fn mono_lines(body: &str) -> String {
     lines.join("\n")
 }
 
-/// The language of a fenced block: its info string's first word when it is a plain name
-/// (`[A-Za-z0-9_+#.-]`, at most [`MAX_LANG`] chars), else none.
+/// The languages of Jira's `{code}` macro; any other gets an "unable to find source-code
+/// formatter" panel.
+const JIRA_LANGS: [&str; 32] = [
+    "actionscript",
+    "ada",
+    "applescript",
+    "bash",
+    "c",
+    "c#",
+    "c++",
+    "css",
+    "erlang",
+    "go",
+    "groovy",
+    "haskell",
+    "html",
+    "java",
+    "javascript",
+    "json",
+    "lua",
+    "none",
+    "nyan",
+    "objc",
+    "perl",
+    "php",
+    "python",
+    "r",
+    "rainbow",
+    "ruby",
+    "scala",
+    "sql",
+    "swift",
+    "visualbasic",
+    "xml",
+    "yaml",
+];
+
+/// Common info-string names mapped to a Jira language.
+const LANG_ALIASES: [(&str, &str); 17] = [
+    ("js", "javascript"),
+    ("jsx", "javascript"),
+    ("ts", "javascript"),
+    ("tsx", "javascript"),
+    ("typescript", "javascript"),
+    ("py", "python"),
+    ("yml", "yaml"),
+    ("rb", "ruby"),
+    ("sh", "bash"),
+    ("shell", "bash"),
+    ("console", "bash"),
+    ("zsh", "bash"),
+    ("text", "none"),
+    ("plain", "none"),
+    ("plaintext", "none"),
+    ("cpp", "c++"),
+    ("cs", "c#"),
+];
+
+/// The Jira language of a fenced block: its info string's first word (ASCII
+/// case-insensitive, at most [`MAX_LANG`] chars), through [`LANG_ALIASES`], when Jira has a
+/// formatter for it; else none (the `{code}` macro then shows no formatter error).
 fn code_lang(kind: &CodeBlockKind<'_>) -> Option<String> {
     let CodeBlockKind::Fenced(info) = kind else {
         return None;
     };
     let word = info.split(|c: char| c.is_whitespace() || c == ',').next()?;
-    let ok = !word.is_empty()
-        && word.len() <= MAX_LANG
-        && word
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '#' | '.' | '-'));
-    ok.then(|| word.to_owned())
+    if word.is_empty() || word.len() > MAX_LANG {
+        return None;
+    }
+    let word = word.to_ascii_lowercase();
+    let word = if word == "csharp" {
+        "c#"
+    } else {
+        LANG_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == word)
+            .map_or(word.as_str(), |(_, lang)| lang)
+    };
+    JIRA_LANGS.contains(&word).then(|| word.to_owned())
+}
+
+/// Whether `text` holds a `{quote` tag as the parser's closer grammar reads it: `{`, optional
+/// whitespace, `quote` (ASCII case-insensitive).
+fn has_quote_tag(text: &str) -> bool {
+    text.match_indices('{').any(|(i, _)| {
+        let rest = text
+            .get(i + 1..)
+            .unwrap_or("")
+            .trim_start_matches(|c: char| c.is_whitespace() || c <= ' ');
+        rest.as_bytes()
+            .get(..5)
+            .is_some_and(|w| w.eq_ignore_ascii_case(b"quote"))
+    })
 }
 
 /// A link target: `mailto:` for e-mail autolinks; chars the wiki grammar reads inside

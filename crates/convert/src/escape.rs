@@ -14,12 +14,14 @@
 //! - `&` before something entity-like (`&name;`, `&#n;`) becomes `&#38;`, so text never turns
 //!   into a character reference.
 //! - A bare URL (as the parser finds one) is copied unchanged apart from the `&` rule, so it
-//!   stays one link.
+//!   stays one link. When what the output writes next would extend it (an emphasis `_`/`-`
+//!   delimiter, a character reference such as `&#92;`), it is written as `[url|url]` instead,
+//!   so the link target ends where the source URL ended.
 //!
 //! Character references survive Jira's renderer (it keeps existing entities), so every
 //! replacement above renders as the original char.
 
-use crate::wiki::lexer::bare_url_end;
+use crate::wiki::lexer::{URL_STOP, URL_TRAIL, bare_url_end};
 
 /// Escapes `s` as wiki text at the start of a line; newlines are kept (each new line is a
 /// line start again).
@@ -52,6 +54,11 @@ pub(crate) struct Out {
     multiline: bool,
     /// Open emphasis spans; no newline is written inside one (Jira emphasis is one line).
     spans: usize,
+    /// Link text: the parser finds no bare URLs in it.
+    link: bool,
+    /// The last bare URL written (`start..end` in `s`) while nothing but URL-trailing
+    /// punctuation follows it.
+    url: Option<(usize, usize)>,
 }
 
 impl Out {
@@ -63,6 +70,8 @@ impl Out {
             link_lead,
             multiline,
             spans: 0,
+            link: false,
+            url: None,
         }
     }
 
@@ -78,7 +87,10 @@ impl Out {
 
     /// Link text, written after its `[`.
     pub(crate) fn link() -> Out {
-        Out::new(Some('['), false, true, false)
+        Out {
+            link: true,
+            ..Out::new(Some('['), false, true, false)
+        }
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -102,6 +114,15 @@ impl Out {
     }
 
     fn push(&mut self, c: char) {
+        if let Some(span) = self.url.take() {
+            if c.is_whitespace() || URL_STOP.contains(&c) {
+                // The URL ends here for the parser as well.
+            } else if URL_TRAIL.contains(&c) {
+                self.url = Some(span);
+            } else {
+                self.link_url(span);
+            }
+        }
         self.s.push(c);
         if c == '\n' {
             self.line_blank = true;
@@ -198,6 +219,11 @@ impl Out {
         let Some(url) = t.get(start..end) else {
             return;
         };
+        // Its first char would extend a URL written just before.
+        if let Some(span) = self.url.take() {
+            self.link_url(span);
+        }
+        let from = self.s.len();
         for (j, c) in url.char_indices() {
             let after = t.get(start + j + 1..).unwrap_or("");
             match c {
@@ -205,6 +231,46 @@ impl Out {
                 _ => self.push(c),
             }
         }
+        if !self.link {
+            self.url = Some((from, self.s.len()));
+        }
+    }
+
+    /// Rewrites the bare URL at `span` as `[url|url]` (text escaped, target as is), keeping
+    /// the trailing punctuation that follows it.
+    fn link_url(&mut self, (start, end): (usize, usize)) {
+        let (Some(url), Some(tail)) = (self.s.get(start..end), self.s.get(end..)) else {
+            return;
+        };
+        let (url, tail) = (url.to_owned(), tail.to_owned());
+        let mut text = String::with_capacity(url.len() + 8);
+        let mut prev: Option<char> = None;
+        let mut chars = url.chars().peekable();
+        while let Some(c) = chars.next() {
+            let next = chars.peek().copied();
+            let both =
+                prev.is_some_and(char::is_alphanumeric) && next.is_some_and(char::is_alphanumeric);
+            match c {
+                '_' | '-' if both => text.push(c),
+                '?' if prev == Some('?') || next == Some('?') => {
+                    text.push('\\');
+                    text.push(c);
+                }
+                '_' | '-' | '+' | '~' | '^' => {
+                    text.push('\\');
+                    text.push(c);
+                }
+                _ => text.push(c),
+            }
+            prev = Some(c);
+        }
+        self.s.truncate(start);
+        self.s.push('[');
+        self.s.push_str(&text);
+        self.s.push('|');
+        self.s.push_str(&url);
+        self.s.push(']');
+        self.s.push_str(&tail);
     }
 
     /// Writes an emphasis delimiter and returns where its content starts.

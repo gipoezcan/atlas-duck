@@ -1,4 +1,4 @@
-{code:rust}
+{code}
 fn main() { println!("{}", 1); }
 {code}
 

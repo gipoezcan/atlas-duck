@@ -18,10 +18,10 @@ const PUNCT: [char; 11] = ['[', ']', '|', '!', '*', '_', '-', '+', '^', '~', '?'
 const SCHEMES: [&str; 5] = ["http://", "https://", "ftp://", "file://", "mailto:"];
 
 /// Chars that end a bare URL.
-const URL_STOP: [char; 11] = ['[', ']', '{', '}', '|', '!', '\\', '"', '<', '>', '*'];
+pub(crate) const URL_STOP: [char; 11] = ['[', ']', '{', '}', '|', '!', '\\', '"', '<', '>', '*'];
 
 /// Trailing chars dropped from a bare URL (sentence punctuation).
-const URL_TRAIL: [char; 7] = ['.', ',', ';', ':', ')', '?', '\''];
+pub(crate) const URL_TRAIL: [char; 7] = ['.', ',', ';', ':', ')', '?', '\''];
 
 /// A byte span of the source (`Copy`, unlike `Range`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
