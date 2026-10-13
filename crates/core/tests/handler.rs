@@ -13,13 +13,16 @@ use atlas_duck_audit::EventType;
 use atlas_duck_core::ShutdownReason;
 use atlas_duck_core::engine::MAX_SESSIONS;
 use atlas_duck_core::engine::queue::Limits;
+use atlas_duck_core::ops::{ExecCtx, ExecError, op_table};
 use atlas_duck_core::testing::{FaultPlan, Harness, NoProgress};
+use atlas_duck_core::validate::{EffectiveCaps, ValidateCtx, validate};
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_ipc::proto::{
     AgentNameSource, AwaitParams, ClientKind, ConnectionMeta, Hello, ListState, MatchParams,
     PeerInfo, ProgressNotification, ProgressSink, SubmitParams, params_sha256_hex,
 };
+use atlas_duck_registry::OpClass;
 use common::{TestResult, code, detail, exit, json, request_id};
 use serde_json::{Value, json};
 
@@ -169,15 +172,49 @@ async fn pd09_markdown_body_rejected() -> TestResult {
     Ok(())
 }
 
+/// The first write (registry order) whose schema example validates and whose executor is still
+/// `NotInThisBuild`, with that example: picked from the op table, never named, so the task that
+/// lands an op cannot break the test (T15 review M6). `None` once every write has landed.
+fn not_in_this_build_write() -> Result<Option<(&'static str, Value)>, Box<dyn std::error::Error>> {
+    let base = atlas_duck_atlassian::normalize_base_url("https://example.invalid")?;
+    let caps = EffectiveCaps::default();
+    let vctx = ValidateCtx {
+        instance_version: None,
+        caps: &caps,
+        for_script: false,
+    };
+    for spec in atlas_duck_registry::all() {
+        let params = spec.params_schema_json()["examples"][0].clone();
+        if spec.class != OpClass::Write || validate(spec, &params, &vctx).is_err() {
+            continue;
+        }
+        let ctx = ExecCtx {
+            spec,
+            params: &params,
+            base: &base,
+            enrichment: None,
+            effective_max: None,
+            comments_cap: None,
+            test_fault: None,
+        };
+        let absent = op_table()
+            .get(spec.id)
+            .is_none_or(|op| (op.executor)(&ctx) == Err(ExecError::NotInThisBuild));
+        if absent {
+            return Ok(Some((spec.id, params)));
+        }
+    }
+    Ok(None)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_in_this_build_rejected_internal() -> TestResult {
-    let h = Harness::jira().await?;
-    let env = h
-        .submit(
-            "jira.worklog.add",
-            json!({ "key": "ABC-1", "time_spent": "2h" }),
-        )
-        .await;
+    // Every write landed: no op is "not in this build" any more, nothing to submit.
+    let Some((op, params)) = not_in_this_build_write()? else {
+        return Ok(());
+    };
+    let h = Harness::both().await?;
+    let env = h.submit(op, params).await;
     assert_eq!(env.status, Status::Failed);
     assert_eq!(code(&env), "internal");
     assert_eq!(exit(&env), 1);

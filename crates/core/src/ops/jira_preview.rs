@@ -13,7 +13,7 @@
 
 use atlas_duck_convert::{wiki_constructs, wiki_to_preview_html, wiki_to_text};
 use atlas_duck_preview::diff::{DiffLine, DiffOp, LineDiff, hunks, line_diff};
-use atlas_duck_preview::invisible::escape_for_display;
+use atlas_duck_preview::invisible::{self, escape_for_display};
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
@@ -1199,13 +1199,80 @@ pub fn transition_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model
 }
 
-/// The assign card's text for a user: `<display name> (<name>)`, else whichever is there (raw;
-/// [`line`] escapes it).
-fn user_text(user: &JiraUser) -> String {
-    match (user.display_name.as_deref(), user.name.as_deref()) {
-        (Some(display), Some(name)) => format!("{display} ({name})"),
-        (Some(one), None) | (None, Some(one)) => one.to_owned(),
+/// A display name on the assign card shows at most this many chars after display escaping (T15
+/// review I1): one the user chose, padded with invisible characters (each an 8-char
+/// `⟨U+XXXX⟩`), never pushes the username out of its line.
+const DISPLAY_NAME_CAP_CHARS: usize = 64;
+
+/// `raw` (a display name) cut where its display-escaped one-line form would pass
+/// [`DISPLAY_NAME_CAP_CHARS`] chars, never inside an escape, with `…` where it was cut; the bytes
+/// of `raw` cut go to `hidden`. Raw text: [`line`] escapes it with the rest of its line.
+fn short_display_name(raw: &str, hidden: &mut u64) -> String {
+    let escaped = one_line(escape_for_display(raw));
+    let mut rest = escaped.as_str();
+    let mut width = 0usize;
+    for (at, _) in raw.char_indices() {
+        // Each char shows as itself or as one `⟨U+XXXX⟩` (a literal `⟨` is escaped too).
+        let len = if rest.starts_with('⟨') {
+            rest.find('⟩').map_or(rest.len(), |i| i + '⟩'.len_utf8())
+        } else {
+            rest.chars().next().map_or(0, char::len_utf8)
+        };
+        let (shown, tail) = rest.split_at_checked(len).unwrap_or((rest, ""));
+        width += shown.chars().count();
+        if width > DISPLAY_NAME_CAP_CHARS {
+            let cut = u64::try_from(raw.len().saturating_sub(at)).unwrap_or(u64::MAX);
+            *hidden = hidden.saturating_add(cut);
+            return format!("{}…", raw.get(..at).unwrap_or_default());
+        }
+        rest = tail;
+    }
+    raw.to_owned()
+}
+
+/// The assign card's text for a user: `<name> (<display name>)`, the username first (T15 review
+/// I1) and the display name cut ([`short_display_name`]), else whichever is there (raw; [`line`]
+/// escapes it).
+fn user_text(user: &JiraUser, hidden: &mut u64) -> String {
+    let display = user
+        .display_name
+        .as_deref()
+        .map(|d| short_display_name(d, hidden));
+    match (user.name.as_deref(), display) {
+        (Some(name), Some(display)) => format!("{name} ({display})"),
+        (Some(name), None) => name.to_owned(),
+        (None, Some(display)) => display,
         (None, None) => user.key.clone().unwrap_or_default(),
+    }
+}
+
+/// Adds the invisible characters of server text a write card shows beyond its request (T15
+/// review I1: a display name) to the §6.4 counts; the `bidi_controls` / `other_invisible`
+/// Cautions then follow the totals.
+fn count_card_text<'a>(model: &mut PreviewModel, texts: impl IntoIterator<Item = &'a str>) {
+    let header = &mut model.header;
+    for text in texts {
+        let (bidi, other) = invisible::count(text);
+        header.bidi_controls = header.bidi_controls.saturating_add(bidi);
+        header.other_invisible = header.other_invisible.saturating_add(other);
+    }
+    for (id, n, text) in [
+        (
+            WarningId::BidiControls,
+            header.bidi_controls,
+            warning::bidi_controls(header.bidi_controls),
+        ),
+        (
+            WarningId::OtherInvisible,
+            header.other_invisible,
+            warning::other_invisible(header.other_invisible),
+        ),
+    ] {
+        match model.warnings.iter_mut().find(|w| w.id == id) {
+            Some(w) => *w = Warning::new(id, text),
+            None if n > 0 => model.warnings.push(Warning::new(id, text)),
+            None => {}
+        }
     }
 }
 
@@ -1214,12 +1281,15 @@ const UNASSIGNED: &str = "(unassigned)";
 
 /// §6.3 Assign: the `jira.issue.assign` card over the exact request: "Assign <key> to <user>" or
 /// "Unassign <key>", rows `From` (the current assignee enrichment read, the stale-check baseline)
-/// and `To`, and each one's user key (§7.3: previews show `name` and `key`). `To` is read from the
-/// request that is sent (T12 review M4): the resolved user's display name and key are shown only
-/// when the facts are about the sent `name`, else "<sent> (enrichment resolved <name>)". The sent
-/// username is an identifier the agent may not have named (resolved by key or display name), so
-/// it gets the mixed-script check the params get (§6.4). Every other hold, or a request that is
-/// not the assign JSON, keeps the generic write preview.
+/// and `To`, the sent username alone (`Sent as user name`), and each user's key (§7.3: previews
+/// show `name` and `key`). `To` is read from the request that is sent (T12 review M4): the
+/// resolved user's display name and key are shown only when the facts are about the sent `name`,
+/// else "<sent> (enrichment resolved <name>)". A user shows as `<name> (<display name>)`, the
+/// display name cut short, so the sent username always leads the sentence and `To` (T15 review
+/// I1); the invisible characters of the server text the card shows count into the §6.4
+/// Cautions. The sent username is an identifier the agent may not have named (resolved by key
+/// or display name), so it gets the mixed-script check the params get (§6.4). Every other hold,
+/// or a request that is not the assign JSON, keeps the generic write preview.
 pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     let mut model = generic::write_preview(ctx);
     let PreviewInput::Write(view) = &ctx.input else {
@@ -1250,10 +1320,15 @@ pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         .assignee_to
         .as_ref()
         .filter(|u| sent.is_some() && u.name.as_deref() == sent);
+    let other = facts
+        .assignee_to
+        .as_ref()
+        .and_then(|u| u.name.as_deref())
+        .filter(|_| to.is_none());
     let to_text = match (sent, to) {
         (None, _) => UNASSIGNED.to_owned(),
-        (Some(_), Some(user)) => user_text(user),
-        (Some(name), None) => match facts.assignee_to.as_ref().and_then(|u| u.name.as_deref()) {
+        (Some(_), Some(user)) => user_text(user, &mut hidden),
+        (Some(name), None) => match other {
             Some(other) => format!("{name} (enrichment resolved {other})"),
             None => name.to_owned(),
         },
@@ -1262,17 +1337,17 @@ pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         None => format!("Unassign {key}"),
         Some(_) => format!("Assign {key} to {to_text}"),
     };
+    let from_text = match from {
+        Some(user) => user_text(user, &mut hidden),
+        None => UNASSIGNED.to_owned(),
+    };
     let mut rows = vec![
-        (
-            "From".to_owned(),
-            line(
-                &from.map_or_else(|| UNASSIGNED.to_owned(), user_text),
-                cap,
-                &mut hidden,
-            ),
-        ),
+        ("From".to_owned(), line(&from_text, cap, &mut hidden)),
         ("To".to_owned(), line(&to_text, cap, &mut hidden)),
     ];
+    if let Some(name) = sent {
+        rows.push(("Sent as user name".to_owned(), line(name, cap, &mut hidden)));
+    }
     for (label, user) in [("From user key", from), ("To user key", to)] {
         if let Some(k) = user.and_then(|u| u.key.as_deref()) {
             rows.push((label.to_owned(), line(k, cap, &mut hidden)));
@@ -1292,6 +1367,14 @@ pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
                 .push(Warning::new(WarningId::MixedScript, text));
         }
     }
+    // The server text the card shows beyond the request (which has the sent name).
+    let shown = from
+        .into_iter()
+        .flat_map(|u| [&u.display_name, &u.name, &u.key])
+        .chain(to.into_iter().flat_map(|u| [&u.display_name, &u.key]))
+        .filter_map(|t| t.as_deref())
+        .chain(other);
+    count_card_text(&mut model, shown);
     let requests = take_requests(&mut model);
     model.body = PreviewBody::WriteSummary {
         sentence: line(&sentence, cap, &mut hidden),

@@ -188,9 +188,11 @@ fn assign_preview_from_to() -> TestResult {
     assert_eq!(wire(&params, &v)?, json!({"name": "bob"}));
     let m = preview(&params, &v)?;
     let s = summary(&m)?;
-    assert_eq!(s.sentence, "Assign ABC-1 to Bob (bob)");
-    assert_eq!(row(&s, "From"), Some("Jane Doe (jdoe)"));
-    assert_eq!(row(&s, "To"), Some("Bob (bob)"));
+    // The username leads (T15 review I1): it is what is sent.
+    assert_eq!(s.sentence, "Assign ABC-1 to bob (Bob)");
+    assert_eq!(row(&s, "From"), Some("jdoe (Jane Doe)"));
+    assert_eq!(row(&s, "To"), Some("bob (Bob)"));
+    assert_eq!(row(&s, "Sent as user name"), Some("bob"));
     // §7.3: previews record both `name` and `key`.
     assert_eq!(row(&s, "From user key"), Some("JIRAUSER1"));
     assert_eq!(row(&s, "To user key"), Some("JIRAUSER2"));
@@ -203,8 +205,13 @@ fn assign_preview_from_to() -> TestResult {
     assert_eq!(wire(&params, &v)?, json!({"name": null}));
     let s = summary(&preview(&params, &v)?)?;
     assert_eq!(s.sentence, "Unassign ABC-1");
-    assert_eq!(row(&s, "From"), Some("Jane Doe (jdoe)"));
+    assert_eq!(row(&s, "From"), Some("jdoe (Jane Doe)"));
     assert_eq!(row(&s, "To"), Some("(unassigned)"));
+    assert_eq!(
+        row(&s, "Sent as user name"),
+        None,
+        "an unassign sends no name"
+    );
 
     // An unassigned issue: the baseline key is null.
     let params = json!({"key": KEY, "assignee": "bob"});
@@ -228,8 +235,88 @@ fn assign_card_names_the_sent_user_only() -> TestResult {
     let s = summary(&preview(&params, &v)?)?;
     let to = row(&s, "To").ok_or("no To row")?;
     assert!(to.starts_with("mallory"), "{to}");
-    assert!(!to.contains("Bob (bob)"), "{to}");
+    assert!(!to.contains("bob (Bob)"), "{to}");
     assert!(s.sentence.contains("mallory"), "{}", s.sentence);
+    assert_eq!(row(&s, "Sent as user name"), Some("mallory"));
+    Ok(())
+}
+
+/// T15 review I1: a display name padded with invisible characters (each shown as an 8-char
+/// `⟨U+XXXX⟩`) never pushes the sent username out of the sentence or the `To` row; the display
+/// name shows at most 64 escaped chars, never a split escape, the cut bytes counted, and its
+/// invisible characters raise the Caution although the request carries none.
+#[test]
+fn assign_card_keeps_the_sent_username_in_view() -> TestResult {
+    let padded = format!("Jane Doe (jdoe){}", "\u{2060}".repeat(50));
+    let params = json!({"key": KEY, "assignee": "mallory"});
+    let (_, v) = enrich(
+        &params,
+        &[
+            json!([user("mallory", "JIRAUSER10200", &padded)]),
+            issue_with(&Value::Null),
+        ],
+    )?;
+    assert_eq!(v.hold, Hold::Preview, "{v:?}");
+    assert_eq!(wire(&params, &v)?, json!({"name": "mallory"}));
+    let m = preview(&params, &v)?;
+    let s = summary(&m)?;
+    assert!(
+        s.sentence.starts_with("Assign ABC-1 to mallory ("),
+        "{}",
+        s.sentence
+    );
+    assert_eq!(row(&s, "Sent as user name"), Some("mallory"));
+    let to = row(&s, "To").ok_or("no To row")?;
+    let shown = to
+        .strip_prefix("mallory (")
+        .and_then(|t| t.strip_suffix("…)"))
+        .ok_or_else(|| format!("not `mallory (<display name>…)`: {to}"))?;
+    // "Jane Doe (jdoe)" and six escapes are 63 chars; the seventh would pass 64.
+    assert_eq!(
+        shown,
+        format!("Jane Doe (jdoe){}", "⟨U+2060⟩".repeat(6)),
+        "{to}"
+    );
+    assert!(
+        s.sentence.ends_with(&format!("{shown}…)")),
+        "{}",
+        s.sentence
+    );
+    // The 44 word joiners cut (3 bytes each), counted once.
+    assert_eq!(m.header.hidden_in_preview_bytes, 44 * 3);
+    assert_eq!(m.header.other_invisible, 50);
+    assert!(
+        m.warnings.iter().any(|w| w.id == WarningId::OtherInvisible
+            && w.text == "contains 50 other invisible characters"),
+        "{:?}",
+        m.warnings
+    );
+    // The current assignee's display name: the same cap and count on the `From` row.
+    let (_, v) = enrich(
+        &params,
+        &[
+            json!([user("mallory", "JIRAUSER10200", "Mallory")]),
+            issue_with(&user("jdoe", "JIRAUSER1", &padded)),
+        ],
+    )?;
+    let m = preview(&params, &v)?;
+    let s = summary(&m)?;
+    assert_eq!(s.sentence, "Assign ABC-1 to mallory (Mallory)");
+    let from = row(&s, "From").ok_or("no From row")?;
+    assert!(
+        from.starts_with("jdoe (Jane Doe (jdoe)⟨U+2060⟩") && from.ends_with("…)"),
+        "{from}"
+    );
+    assert_eq!(m.header.other_invisible, 50);
+    assert_eq!(
+        m.warnings
+            .iter()
+            .filter(|w| w.id == WarningId::OtherInvisible)
+            .count(),
+        1,
+        "{:?}",
+        m.warnings
+    );
     Ok(())
 }
 
@@ -252,6 +339,14 @@ fn assign_card_escapes_server_names_and_flags_mixed_script() -> TestResult {
     let to = row(&s, "To").ok_or("no To row")?;
     assert!(to.contains("⟨U+202E⟩"), "{to}");
     assert!(!s.sentence.contains('\u{202e}'), "{}", s.sentence);
+    // The display name's bidi override counts although the request has none (T15 review I1).
+    assert_eq!(m.header.bidi_controls, 1);
+    assert!(
+        m.warnings.iter().any(|w| w.id == WarningId::BidiControls
+            && w.text == "contains 1 bidirectional control characters"),
+        "{:?}",
+        m.warnings
+    );
     // The resolved username is an identifier the param did not name: mixed-script Caution.
     assert!(
         m.warnings
@@ -369,8 +464,10 @@ fn assignee_rules_never_pick_one_of_several() -> TestResult {
     assert_eq!(n, 0);
     assert_eq!(candidates.len(), 10);
     assert_eq!(candidates[0], "u0");
-    // An empty or blank value names nobody, not a user with an empty key or display name.
-    for blank in ["", "  "] {
+    // An empty or blank value names nobody, not a user with an empty key or display name, and
+    // neither does `-1` (Jira's automatic assignee, T15 review M2): unresolved without a search
+    // (T15 review M4: an empty `username=` may list every assignable user).
+    for blank in ["", "  ", "-1", " -1 "] {
         let params = json!({"key": KEY, "assignee": blank});
         let (used, v) = enrich(
             &params,
@@ -380,6 +477,23 @@ fn assignee_rules_never_pick_one_of_several() -> TestResult {
             ],
         )?;
         assert_eq!(v.hold, Hold::UnresolvedName, "{blank:?}: {v:?}");
+        assert_eq!(used, 0, "{blank:?}: no search");
+        assert_eq!(
+            unresolved(&v),
+            Some(("assignee".into(), blank.into(), 0, Vec::new())),
+            "{blank:?}"
+        );
+    }
+    // A user named `-1` never resolves (by key or display name) and is never a candidate.
+    let minus = json!([user("-1", "JIRAUSER99", "Minus"), bob()]);
+    for asked in ["Minus", "JIRAUSER99"] {
+        let params = json!({"key": KEY, "assignee": asked});
+        let (used, v) = enrich(&params, &[minus.clone(), current.clone()])?;
+        assert_eq!(
+            unresolved(&v),
+            Some(("assignee".into(), asked.into(), 0, vec!["bob".into()])),
+            "{asked}: {v:?}"
+        );
         assert_eq!(used, 1);
     }
     // A resolved user without a usable `name` cannot be sent: fail closed.
@@ -409,6 +523,40 @@ fn assignee_rules_never_pick_one_of_several() -> TestResult {
     Ok(())
 }
 
+/// T15 review M1: a full page (as many users as the search asked for) may leave out the user the
+/// agent named, or a namesake: only the username rule resolves there; the key and display-name
+/// rules end unresolved with their hits as the candidates.
+#[test]
+fn assignee_full_page_resolves_by_username_only() -> TestResult {
+    let current = issue_with(&Value::Null);
+    let mut page: Vec<Value> = (0..49)
+        .map(|n| user(&format!("alx{n}"), &format!("K{n}"), &format!("Alex {n}")))
+        .collect();
+    page.push(user("al.jones", "JIRAUSER50", "Al"));
+    let full = Value::Array(page.clone());
+    for asked in ["al", "JIRAUSER50"] {
+        let params = json!({"key": KEY, "assignee": asked});
+        let (used, v) = enrich(&params, &[full.clone(), current.clone()])?;
+        assert_eq!(v.hold, Hold::UnresolvedName, "{asked}: {v:?}");
+        assert_eq!(used, 1, "{asked}");
+        assert_eq!(
+            v.unresolved,
+            Some(("assignee".into(), asked.into(), 1, vec!["al.jones".into()])),
+            "{asked}"
+        );
+    }
+    // The username the hint names resolves on the same page.
+    let params = json!({"key": KEY, "assignee": "al.jones"});
+    let (_, v) = enrich(&params, &[full, current.clone()])?;
+    assert_eq!(resolved_name(&v), Some("al.jones"), "{v:?}");
+    // One user fewer is not a full page: the display name resolves.
+    page.remove(0);
+    let params = json!({"key": KEY, "assignee": "al"});
+    let (_, v) = enrich(&params, &[Value::Array(page), current])?;
+    assert_eq!(resolved_name(&v), Some("al.jones"), "{v:?}");
+    Ok(())
+}
+
 #[test]
 fn assign_executor_needs_the_verdict_for_its_params() -> TestResult {
     let params = json!({"key": KEY, "assignee": "bob"});
@@ -430,6 +578,31 @@ fn assign_executor_needs_the_verdict_for_its_params() -> TestResult {
     let asked = json!({"key": KEY, "assignee": "nobody"});
     let (_, v) = enrich(&asked, &[json!([bob()])])?;
     assert_eq!(exec(&asked, Some(&v)), Err(ExecError::EnrichmentRequired));
+    // Only a `Preview` verdict renders: the same resolved name under any other hold renders
+    // nothing (T15 review M6).
+    assert!(exec(&params, Some(&named)).is_ok());
+    for hold in [
+        Hold::EnrichmentError,
+        Hold::Collision,
+        Hold::UnresolvedName,
+        Hold::Conflict,
+        Hold::IdentityMismatch,
+    ] {
+        let mut held = named.clone();
+        held.hold = hold;
+        assert_eq!(
+            exec(&params, Some(&held)),
+            Err(ExecError::EnrichmentRequired),
+            "{hold:?}"
+        );
+    }
+    // `-1` (Jira's automatic assignee) is never sent, whatever a verdict says (T15 review M2).
+    let mut minus = named.clone();
+    minus.resolved.insert("assignee".into(), json!("-1"));
+    assert_eq!(
+        exec(&params, Some(&minus)),
+        Err(ExecError::EnrichmentRequired)
+    );
     Ok(())
 }
 
@@ -594,9 +767,9 @@ async fn assign_happy_path() -> TestResult {
     let id = queued(&h, json!({"key": KEY, "assignee": "jdoe"})).await?;
     let p = opened(&h, &id)?;
     let (sentence, rows) = card_rows(&p)?;
-    assert_eq!(sentence, "Assign ABC-1 to Jane Doe (jdoe)");
+    assert_eq!(sentence, "Assign ABC-1 to jdoe (Jane Doe)");
     assert!(
-        rows.contains(&("From".into(), "Bob (bob)".into())),
+        rows.contains(&("From".into(), "bob (Bob)".into())),
         "{rows:?}"
     );
     assert!(p.approvable);
@@ -661,7 +834,7 @@ async fn assign_null_unassigns_without_resolution() -> TestResult {
     let (sentence, rows) = card_rows(&p)?;
     assert_eq!(sentence, "Unassign ABC-1");
     assert!(
-        rows.contains(&("From".into(), "Jane Doe (jdoe)".into())),
+        rows.contains(&("From".into(), "jdoe (Jane Doe)".into())),
         "{rows:?}"
     );
     assert!(
@@ -783,6 +956,46 @@ async fn i35_assignee_no_match_and_ambiguous() -> TestResult {
     Ok(())
 }
 
+/// T15 review M2/M4: a blank value and `-1` (Jira's automatic assignee) name nobody: the
+/// unresolved-name card without any GET (an empty `username=` may list every assignable user).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i35_assignee_blank_or_automatic_never_searches() -> TestResult {
+    for value in ["", "-1"] {
+        let h = Harness::jira().await?;
+        let mock = jira(&h)?;
+        mount_assignable(mock, &json!([jane(), user("-1", "JIRAUSER99", "Minus")])).await;
+        mount_issue(mock, KEY, &issue_with(&jane())).await;
+        mount_put(mock).await;
+        let id = queued(&h, json!({"key": KEY, "assignee": value})).await?;
+        match opened(&h, &id)?.body {
+            PreviewBody::UnresolvedName {
+                param,
+                value: v,
+                matches,
+                candidates,
+            } => {
+                assert_eq!(
+                    (param.as_str(), v.as_str(), matches),
+                    ("assignee", value, 0)
+                );
+                assert!(candidates.is_empty(), "{candidates:?}");
+            }
+            other => {
+                return Err(format!("{value:?}: not the unresolved-name card: {other:?}").into());
+            }
+        }
+        not_approvable(h.approver().approve_unopened(&id))?;
+        assert!(purposes(&h, &id).await?.is_empty(), "{value:?}: no GET");
+        assert!(gets_on(mock, ASSIGNABLE).await.is_empty(), "{value:?}");
+        assert!(
+            gets_on(mock, &issue_path(KEY)).await.is_empty(),
+            "{value:?}"
+        );
+        assert!(puts(mock).await.is_empty(), "{value:?}: nothing was sent");
+    }
+    Ok(())
+}
+
 /// §5.4 step 4: `assignee` is an enrichment key: an edit resolves again and the new revision
 /// sends the newly resolved user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -811,7 +1024,7 @@ async fn assign_edit_resolves_again() -> TestResult {
     assert!(item.approvable);
     assert_eq!(purposes(&h, &id).await?, ["resolve", "resolve", "enrich"]);
     let (sentence, _) = card_rows(&opened(&h, &id)?)?;
-    assert_eq!(sentence, "Assign ABC-1 to Bob (bob)");
+    assert_eq!(sentence, "Assign ABC-1 to bob (Bob)");
     h.approver().approve(&id).map_err(de)?;
     let env = h.await_(&id, 10_000).await;
     assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
@@ -849,7 +1062,7 @@ async fn assign_stale_when_assignee_changed() -> TestResult {
     let id = queued(&h, json!({"key": KEY, "assignee": "jdoe"})).await?;
     let (_, rows) = card_rows(&opened(&h, &id)?)?;
     assert!(
-        rows.contains(&("From".into(), "Jane Doe (jdoe)".into())),
+        rows.contains(&("From".into(), "jdoe (Jane Doe)".into())),
         "{rows:?}"
     );
     let rev = h.approver().rev(&id).map_err(de)?;
@@ -890,7 +1103,7 @@ async fn assign_stale_when_assignee_changed() -> TestResult {
     );
     let (_, rows) = card_rows(&opened(&h, &id)?)?;
     assert!(
-        rows.contains(&("From".into(), "Bob (bob)".into())),
+        rows.contains(&("From".into(), "bob (Bob)".into())),
         "{rows:?}"
     );
     Ok(())
