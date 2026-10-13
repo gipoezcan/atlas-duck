@@ -786,21 +786,27 @@ const CONFLICT_KIND_BYTES: usize = (DIFF_TEXT_CAP_BYTES - 1024) / 3;
 /// of what the agent read against the current value, under a `<id> (- read, + current)` line;
 /// one display-escaped text line per diff line, `-`/`+`/space marked. Each kind of line draws
 /// on its own budget in `left` (escaped bytes, across fields); the line a budget cuts ends in
-/// `…` and later lines of that kind are left out (`None`). A `line_diff` cut at its caps (a
-/// middle over `DIFF_MAX_LINES` lines or 4 MiB) is far over these budgets, so its `…` marks it
-/// as cut.
+/// `…` and later lines of that kind are left out (`None`), each field saying so once with a
+/// lone `…` line of that kind. A `line_diff` cut at its caps (a middle over `DIFF_MAX_LINES`
+/// lines or 4 MiB) is far over these budgets, so its `…` marks it as cut.
 fn conflict_diff(id: &str, read: &Value, current: &Value, left: &mut [Option<usize>; 3]) -> String {
     let mut out = format!("{} (- read, + current)\n", escape_for_display(id));
+    let mut marked = [false; 3];
     for line in line_diff(&pretty(read), &pretty(current)).lines {
         let (mark, slot) = match line.op {
             DiffOp::Del => ("- ", 1),
             DiffOp::Add => ("+ ", 2),
             DiffOp::Same | DiffOp::Field => ("  ", 0),
         };
-        let Some(budget) = left.get_mut(slot) else {
+        let (Some(budget), Some(marked)) = (left.get_mut(slot), marked.get_mut(slot)) else {
             continue;
         };
         let Some(bytes) = budget else {
+            if !*marked {
+                *marked = true;
+                out.push_str(mark);
+                out.push_str("…\n");
+            }
             continue;
         };
         let text = line.text.strip_suffix('\n').unwrap_or(&line.text);
@@ -810,6 +816,7 @@ fn conflict_diff(id: &str, read: &Value, current: &Value, left: &mut [Option<usi
         if taken < text.len() {
             out.push('…');
             *budget = None;
+            *marked = true;
         } else {
             *bytes -= kept.len();
         }

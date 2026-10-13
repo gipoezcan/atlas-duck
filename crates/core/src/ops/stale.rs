@@ -65,7 +65,7 @@ fn edit_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
     else {
         return changed(DELTA_UNREADABLE);
     };
-    // PD-50: the equality of the `expected` check (JCS bytes; an over-range integer differs).
+    // PD-50: the equality of the `expected` check (JCS bytes; an over-range integer exactly).
     let moved: Vec<&str> = before
         .iter()
         .filter(|(id, was)| !field_values_equal(now.get(*id).unwrap_or(&Value::Null), was))

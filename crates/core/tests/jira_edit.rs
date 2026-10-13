@@ -1,9 +1,9 @@
 #![cfg(feature = "testing")]
 //! `jira.issue.edit` complete (Task 13): the `expected` conflict check with the PD-50 equality
-//! (JCS bytes, an over-range integer differs), the stale rule over the same equality, the edit
-//! preview's rendered and raw diffs with the raw-only count (PD-51, S-12 diff half), the conflict
-//! card's diff and deny pre-fill (I-36 Jira half, §5.4 step 2), and `describe` recommending
-//! `expected` (§7.3).
+//! (JCS bytes, an over-range integer compared exactly), the stale rule over the same equality,
+//! the edit preview's rendered and raw diffs with the raw-only count (PD-51, S-12 diff half), the
+//! conflict card's diff and deny pre-fill (I-36 Jira half, §5.4 step 2), and `describe`
+//! recommending `expected` (§7.3).
 
 mod common;
 
@@ -268,6 +268,18 @@ fn conflict_diff_keeps_both_sides_of_a_long_value() -> TestResult {
         "{t:.80}"
     );
     assert!(t.contains("…\n+ \"ccc"), "the current side shows");
+    // A later field whose sides are past their budgets says so in its own section.
+    let params = json!({"key": KEY, "fields": {"description": "x"},
+                        "expected": {"description": "r".repeat(20 * 1024), "summary": "Old"}});
+    let current = json!({"description": "c".repeat(20 * 1024), "summary": "Now"});
+    let (_, v) = judge(&params, &issue_with_fields(current))?;
+    let t = &v.diff_text;
+    assert!(t.len() <= 16 * 1024, "{}", t.len());
+    assert!(
+        t.ends_with("summary (- read, + current)\n- …\n+ …\n"),
+        "{:?}",
+        t.get(t.len().saturating_sub(80)..)
+    );
     // Escaped widths count: 6 KiB of zero-width spaces stay within the cap as well.
     let read = "\u{200B}".repeat(6 * 1024);
     let params = json!({"key": KEY, "fields": {"description": "x"},
