@@ -66,6 +66,9 @@ export const TEST_FEATURE_FORWARDERS = [
 // The registry stays a plain data crate: its normal dependencies are these and nothing else.
 export const REGISTRY_EXTERNAL_ALLOW = ["serde", "serde_json"];
 
+// §2.2: convert is pure; its only normal dependency is the CommonMark parser.
+export const CONVERT_EXTERNAL_ALLOW = ["pulldown-cmark"];
+
 export const TAURI_CRATES = ["tauri", "wry"];
 
 // §2.1: sandbox "No HTTP client, keychain, or DB code linked"; CLI "Never
@@ -97,7 +100,7 @@ export const RQUICKJS_BANNED_FEATURES = ["loader", "dyn-load", "parallel"];
 export const RQUICKJS_M1_BANNED_FEATURES = ["futures"];
 export const RQUICKJS_M1_BAN_REASON = "not allowed in M1: M8 decides (§9.3/§15)";
 
-export const LINT_PACKAGES = [PKG.core, PKG.atlassian];
+export const LINT_PACKAGES = [PKG.core, PKG.atlassian, PKG.convert];
 export const REQUIRED_DENY_LINTS = ["unwrap_used", "expect_used"];
 
 const isNormalOrBuild = (kind) => kind === null || kind === undefined || kind === "build";
@@ -201,6 +204,13 @@ export function checkGraph(metadata) {
   for (const d of registry?.dependencies ?? []) {
     if (isNormalOrBuild(d.kind) && !memberNames.has(d.name) && !REGISTRY_EXTERNAL_ALLOW.includes(d.name)) {
       violations.push(`${PKG.registry}: external normal dependency ${d.name} is not allowed; only ${REGISTRY_EXTERNAL_ALLOW.join(", ")} (§2.2)`);
+    }
+  }
+
+  const convert = byName.get(PKG.convert);
+  for (const d of convert?.dependencies ?? []) {
+    if (isNormalOrBuild(d.kind) && !memberNames.has(d.name) && !CONVERT_EXTERNAL_ALLOW.includes(d.name)) {
+      violations.push(`${PKG.convert}: external dependency ${d.name} not allowed`);
     }
   }
 

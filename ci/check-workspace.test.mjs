@@ -139,7 +139,7 @@ expect_used = "deny"
 `;
 const manifests = (over = {}) => ({
   root: ROOT_OK,
-  members: { "atlas-duck-core": LINTS_OK, "atlas-duck-atlassian": LINTS_OK },
+  members: { "atlas-duck-core": LINTS_OK, "atlas-duck-atlassian": LINTS_OK, "atlas-duck-convert": LINTS_OK },
   ...over,
 });
 
@@ -382,7 +382,7 @@ debug-assertions = true
   }
 });
 
-for (const pkg of ["atlas-duck-core", "atlas-duck-atlassian"]) {
+for (const pkg of ["atlas-duck-core", "atlas-duck-atlassian", "atlas-duck-convert"]) {
   for (const lint of ["unwrap_used", "expect_used"]) {
     test(`${pkg} without ${lint} = "deny" is a violation`, () => {
       const want = [`${pkg}: [lints.clippy] must set ${lint} = "deny" (§7.7, §13)`];
@@ -411,6 +411,7 @@ test("lint level accepts the table form and forbid; [lints] workspace = true rea
   const m = manifests();
   m.members["atlas-duck-core"] = '[package]\nname = "x"\n\n[lints.clippy]\nunwrap_used = "forbid"\nexpect_used = { level = "deny" }\n';
   m.members["atlas-duck-atlassian"] = '[package]\nname = "y"\n\n[lints]\nworkspace = true\n';
+  m.members["atlas-duck-convert"] = '[package]\nname = "z"\n\n[lints]\nworkspace = true\n';
   m.root = `${ROOT_OK}\n[workspace.lints.clippy]\nunwrap_used = "deny"\nexpect_used = "deny"\n`;
   assert.deepEqual(checkManifests(m), []);
 });
@@ -627,6 +628,14 @@ test("registry normal dependencies are limited to serde and serde_json", () => {
   assert.deepEqual(graph(e), [
     "atlas-duck-registry: external normal dependency regex is not allowed; only serde, serde_json (§2.2)",
   ]);
+});
+
+test("convert external dependency outside allowlist is rejected", () => {
+  const e = baseEdges();
+  e["atlas-duck-convert"] = ["pulldown-cmark", { name: "proptest", kind: "dev" }];
+  assert.deepEqual(graph(e), []);
+  e["atlas-duck-convert"].push("reqwest");
+  assert.deepEqual(graph(e), ["atlas-duck-convert: external dependency reqwest not allowed"]);
 });
 
 // ---------- the real workspace ----------

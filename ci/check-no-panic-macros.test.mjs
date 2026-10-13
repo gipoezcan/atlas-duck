@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { removeCfgTest, scanCoverMinting, scanPanicMacros, stripNonCode } from "./check-no-panic-macros.mjs";
+import { PANIC_ROOTS, removeCfgTest, scanCoverMinting, scanPanicMacros, stripNonCode } from "./check-no-panic-macros.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CORE = "crates/core/src/ops/read.rs";
@@ -165,4 +165,13 @@ test("the real workspace passes: node ci/check-no-panic-macros.mjs exits 0", () 
   assert.equal(res.stdout, "");
   assert.match(res.stderr, /^check-no-panic-macros: ok \(\d+ files\)/);
   assert.equal(res.status, 0);
+});
+
+// ---------- convert (M5 Task 1) ----------
+
+test("convert/src is a panic-scan root and a .unwrap() there is a violation", () => {
+  assert.ok(PANIC_ROOTS.includes("crates/convert/src"));
+  const f = "crates/convert/src/x.rs";
+  assert.deepEqual(scanPanicMacros(f, "fn a() {\n    let _ = v.unwrap();\n}\n"), [`${f}:2: .unwrap() outside test code`]);
+  assert.deepEqual(scanPanicMacros(f, "#[cfg(test)]\nmod t {\n    fn a() { v.unwrap(); }\n}\n"), []);
 });
