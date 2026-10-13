@@ -291,3 +291,19 @@ fn hunks_counts_runs() {
     ];
     assert_eq!(hunks(&s), 3);
 }
+
+/// T13: a `Field` line heads a field's section of a multi-field diff; it is neither text nor a
+/// change, so it is no hunk and ends the run before it.
+#[test]
+fn field_lines_head_sections_and_are_not_hunks() -> Result<(), serde_json::Error> {
+    assert_eq!(hunks(&[d(DiffOp::Field, "fields.summary")]), 0);
+    let s = [
+        d(DiffOp::Field, "fields.description"),
+        d(DiffOp::Del, "a"),
+        d(DiffOp::Field, "fields.summary"),
+        d(DiffOp::Add, "b"),
+    ];
+    assert_eq!(hunks(&s), 2);
+    assert_eq!(serde_json::to_value(DiffOp::Field)?, "field");
+    Ok(())
+}

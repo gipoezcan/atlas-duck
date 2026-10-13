@@ -23,6 +23,10 @@ pub enum DiffOp {
     Same,
     Add,
     Del,
+    /// T13: the header of one field's section in a multi-field diff (`EditDiff`); its text is
+    /// the field's label, written by core, never a line of either text. [`line_diff`] never
+    /// emits it.
+    Field,
 }
 
 /// One diff line. `text` is the line exactly as it is in the input, including its `\n`
@@ -45,12 +49,12 @@ pub struct LineDiff {
     pub truncated: bool,
 }
 
-/// Number of hunks: maximal runs of non-`Same` lines.
+/// Number of hunks: maximal runs of `Add`/`Del` lines (a `Same` or `Field` line ends a run).
 pub fn hunks(lines: &[DiffLine]) -> u64 {
     let mut count = 0u64;
     let mut in_hunk = false;
     for l in lines {
-        let changed = l.op != DiffOp::Same;
+        let changed = matches!(l.op, DiffOp::Add | DiffOp::Del);
         if changed && !in_hunk {
             count += 1;
         }

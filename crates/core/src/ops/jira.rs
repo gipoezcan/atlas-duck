@@ -4,15 +4,17 @@
 //! issue type resolution, the createmeta required fields).
 
 use atlas_duck_atlassian::GetCall;
+use atlas_duck_ipc::jcs::to_jcs_vec;
+use atlas_duck_preview::diff::{DiffOp, line_diff};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use serde_json::{Map, Value, json};
 
 use super::{
-    AllowedValue, EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx,
-    ExecError, ExecPlan, MAX_ALLOWED_VALUES, MissingField, ReadPlan, WriteSummaryFacts,
-    cap_diff_text, generic, get_call, jira_body, json_request, resolve_url, single_round,
-    str_param,
+    AllowedValue, DIFF_TEXT_CAP_BYTES, EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep,
+    EnrichVerdict, ExecCtx, ExecError, ExecPlan, MAX_ALLOWED_VALUES, MissingField, ReadPlan,
+    WriteSummaryFacts, cap_diff_text, generic, get_call, jira_body, json_request, resolve_url,
+    single_round, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
@@ -703,6 +705,45 @@ fn edit_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
     single_round(calls, answers)
 }
 
+/// PD-50 (§5.4 step 2 "compared like the step 5 rule"): two field values are equal when their
+/// JCS bytes are. A value JCS refuses (an integer beyond ±(2^53−1)) equals nothing, not even
+/// itself (L59: fail closed into the conflict state, or `Changed` in the stale rule). The
+/// caller passes `null` for an absent field.
+pub(crate) fn field_values_equal(a: &Value, b: &Value) -> bool {
+    match (to_jcs_vec(a), to_jcs_vec(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// 2-space pretty JSON (PD-51's raw form of a field value); compact JSON cannot fail either, so
+/// the fallback is never taken in practice.
+pub(crate) fn pretty(v: &Value) -> String {
+    serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+}
+
+/// The conflict card's diff of one field (§6.3 Conflict): the raw diff (PD-51's pretty JSON)
+/// of what the agent read against the current value, under a `<id> (- read, + current)` line;
+/// one text line per diff line, `-`/`+`/space marked. Not yet escaped. A `line_diff` cut at its
+/// caps (a middle over `DIFF_MAX_LINES` lines or 4 MiB) gives far more than
+/// [`DIFF_TEXT_CAP_BYTES`], so the card's cap and its `…` always mark such a diff as cut.
+fn conflict_diff(id: &str, read: &Value, current: &Value) -> String {
+    let mut out = format!("{id} (- read, + current)\n");
+    for line in line_diff(&pretty(read), &pretty(current)).lines {
+        let mark = match line.op {
+            DiffOp::Del => "- ",
+            DiffOp::Add => "+ ",
+            DiffOp::Same | DiffOp::Field => "  ",
+        };
+        out.push_str(mark);
+        out.push_str(&line.text);
+        if !line.text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 fn edit_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
     let ids = edited_field_ids(ctx.params);
     if ids.is_empty() {
@@ -728,9 +769,13 @@ fn edit_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
         .flatten()
     {
         let now = value_of(id);
-        if &now != expected {
+        if !field_values_equal(&now, expected) {
             changed.push(id.clone());
-            diff.push_str(&format!("{id}\n- read:    {expected}\n+ current: {now}\n"));
+            // The cap below bounds what is kept; this bounds the work: once the text is past
+            // it, later fields are only named in the summary.
+            if diff.len() <= DIFF_TEXT_CAP_BYTES {
+                diff.push_str(&conflict_diff(id, expected, &now));
+            }
         }
     }
     let mut verdict = EnrichVerdict::preview(Value::Object(baseline), Map::new());

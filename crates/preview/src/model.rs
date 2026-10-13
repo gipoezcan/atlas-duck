@@ -193,7 +193,9 @@ pub enum PreviewBody {
     /// only the raw diff shows (PD-51). Diff line texts are untrusted text exactly as in the
     /// input (they carry their `\n`/`\r`, see [`DiffLine`]): the UI renders them as text and makes
     /// line terminators and trailing whitespace visible. A `LineDiff.truncated` diff must be
-    /// flagged by the builder (a warning), since its lines are not the whole change.
+    /// flagged by the builder (a warning), since its lines are not the whole change. Each field's
+    /// section starts with a `DiffOp::Field` line naming it (T13); the UI shows that line as a
+    /// heading, apart from the text lines.
     EditDiff {
         rendered: Vec<DiffLine>,
         raw: Vec<DiffLine>,

@@ -5,7 +5,7 @@ use atlas_duck_preview::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const C6_CAUTION: [&str; 20] = [
+const C6_CAUTION: [&str; 21] = [
     "restricted_comments",
     "security_level",
     "all_fields",
@@ -26,6 +26,7 @@ const C6_CAUTION: [&str; 20] = [
     "identity_header_lost",
     "user_renamed",
     "instance_url_changed",
+    "diff_truncated",
 ];
 const C6_INFO: [&str; 9] = [
     "linked_issue_summaries",
@@ -59,7 +60,7 @@ fn every_warning_id_has_exactly_one_level() -> TestResult {
     assert_eq!(info, C6_INFO);
     let mut all = WarningId::ALL.to_vec();
     all.dedup();
-    assert_eq!(all.len(), 29);
+    assert_eq!(all.len(), 30);
     Ok(())
 }
 
@@ -134,6 +135,11 @@ fn parameterized_texts() {
     assert_eq!(
         required_field_list_incomplete(4, None),
         "required-field list incomplete: 4 of more than 4 pages read"
+    );
+    // T13 (T6 handoff): an edit diff cut at its caps.
+    assert_eq!(
+        diff_truncated(12),
+        "diff truncated: 12 bytes not shown (see Request)"
     );
     assert_eq!(
         lossy_update(1, 2, 3),

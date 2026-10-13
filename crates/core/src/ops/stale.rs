@@ -6,14 +6,14 @@ use atlas_duck_preview::invisible::escape_for_display;
 use serde_json::Value;
 
 use super::confluence::content_version;
-use super::jira::{issue_fields_call, transition_calls, transition_facts};
+use super::jira::{field_values_equal, issue_fields_call, transition_calls, transition_facts};
 use super::{StaleCtx, StaleRule, StaleVerdict, get_call};
 
 /// Shown when the judge did not get the answers its plan names (fail closed: never `Unchanged`).
 const DELTA_UNREADABLE: &str = "the target could not be re-read";
 
 /// `jira.issue.edit`: the current values of exactly the edited fields equal the baseline (the
-/// "before" values shown in the diff).
+/// "before" values shown in the diff), by [`field_values_equal`] (PD-50).
 pub static ISSUE_EDIT: StaleRule = StaleRule {
     plan: edit_plan,
     judge: edit_judge,
@@ -65,9 +65,10 @@ fn edit_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
     else {
         return changed(DELTA_UNREADABLE);
     };
+    // PD-50: the equality of the `expected` check (JCS bytes; an over-range integer differs).
     let moved: Vec<&str> = before
         .iter()
-        .filter(|(id, was)| now.get(*id).unwrap_or(&Value::Null) != *was)
+        .filter(|(id, was)| !field_values_equal(now.get(*id).unwrap_or(&Value::Null), was))
         .map(|(id, _)| id.as_str())
         .collect();
     if moved.is_empty() {

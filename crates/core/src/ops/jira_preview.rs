@@ -12,6 +12,7 @@
 //! changes between previews) never influence a warning or the Caution count (T8 handoff).
 
 use atlas_duck_convert::{wiki_constructs, wiki_to_preview_html, wiki_to_text};
+use atlas_duck_preview::diff::{DiffLine, DiffOp, LineDiff, hunks, line_diff};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
@@ -19,8 +20,9 @@ use atlas_duck_preview::{
     PreviewBody, PreviewHeader, sanitize_html,
 };
 use serde_json::{Map, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
+use super::jira::pretty;
 use super::{PreviewCtx, PreviewInput, PreviewModel, generic};
 use crate::lifecycle::model::Hold;
 use crate::metadata::{FieldNames, field_label, one_line};
@@ -997,5 +999,261 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         requests,
     };
     model.header.hidden_in_preview_bytes = hidden;
+    model
+}
+
+// ---- edit diffs (Task 13) ---------------------------------------------------------------------
+
+/// Each view of an edit diff shows at most this many bytes per line kind (`Same`, `Del`, `Add`);
+/// the rest is cut, flagged by the `diff_truncated` Caution and counted as hidden. A budget per
+/// kind, so a huge current value never pushes the outgoing one out of the diff.
+const EDIT_DIFF_KIND_BYTES: usize = 1024 * 1024;
+
+/// A field's section heading shows at most this many chars.
+const FIELD_HEADING_CAP_CHARS: usize = 256;
+
+/// One view (rendered or raw) of an edit diff while it is built.
+struct DiffView {
+    lines: Vec<DiffLine>,
+    /// Bytes left for `Same`, `Del`, `Add` lines.
+    left: [usize; 3],
+    /// Bytes of either text the view does not show.
+    cut: u64,
+}
+
+impl DiffView {
+    fn new() -> DiffView {
+        DiffView {
+            lines: Vec::new(),
+            left: [EDIT_DIFF_KIND_BYTES; 3],
+            cut: 0,
+        }
+    }
+
+    fn heading(&mut self, label: &str) {
+        self.lines.push(DiffLine {
+            op: DiffOp::Field,
+            text: label.to_owned(),
+        });
+    }
+
+    /// One text line, cut to what its kind's budget has left, then display-escaped (the line
+    /// terminator stays: the escape leaves `\n`, `\r` and `\t` alone).
+    fn push(&mut self, op: DiffOp, text: &str) {
+        let slot = match op {
+            DiffOp::Same => 0,
+            DiffOp::Del => 1,
+            DiffOp::Add => 2,
+            DiffOp::Field => return self.heading(text),
+        };
+        let Some(left) = self.left.get_mut(slot) else {
+            return;
+        };
+        let (kept, cut) = cut_at(text, *left);
+        *left -= kept.len();
+        self.cut = self.cut.saturating_add(cut);
+        if !kept.is_empty() {
+            self.lines.push(DiffLine {
+                op,
+                text: escape_for_display(kept),
+            });
+        }
+    }
+
+    /// A whole [`line_diff`] of `old` against `new`; what its own caps dropped counts as cut.
+    fn extend(&mut self, diff: &LineDiff, old: &str, new: &str) {
+        let (mut same, mut del, mut add) = (0usize, 0usize, 0usize);
+        for line in &diff.lines {
+            match line.op {
+                DiffOp::Same => same += line.text.len(),
+                DiffOp::Del => del += line.text.len(),
+                DiffOp::Add => add += line.text.len(),
+                DiffOp::Field => {}
+            }
+            self.push(line.op, &line.text);
+        }
+        if diff.truncated {
+            let missing = old
+                .len()
+                .saturating_sub(same + del)
+                .saturating_add(new.len().saturating_sub(same + add))
+                .max(1);
+            self.cut = self
+                .cut
+                .saturating_add(u64::try_from(missing).unwrap_or(u64::MAX));
+        }
+    }
+}
+
+/// The text pair a string field's rendered diff compares (PD-51): both strings, or a string and
+/// `null` (an absent or cleared field reads as no text). `None` for every other pair.
+fn string_pair<'a>(current: &'a Value, outgoing: &'a Value) -> Option<(&'a str, &'a str)> {
+    match (current, outgoing) {
+        (Value::String(c), Value::String(o)) => Some((c, o)),
+        (Value::Null, Value::String(o)) => Some(("", o)),
+        (Value::String(c), Value::Null) => Some((c, "")),
+        _ => None,
+    }
+}
+
+/// T6 handoff (PD-51 weakness): the hunks of the line diff of the two wiki texts whose removed
+/// and added lines project to the same text (`wiki_to_text`), each a change the rendered diff
+/// cannot show, however many visible changes the field has elsewhere. A change inside a line
+/// that also changes visibly is not found this way (the field's raw diff still shows it). A
+/// diff cut at its caps counts nothing here (the `diff_truncated` Caution covers it).
+fn invisible_hunks(old: &str, new: &str) -> u64 {
+    let diff = line_diff(old, new);
+    if diff.truncated {
+        return 0;
+    }
+    let mut count = 0u64;
+    let (mut del, mut add) = (String::new(), String::new());
+    let mut close = |del: &mut String, add: &mut String| {
+        if !(del.is_empty() && add.is_empty()) && wiki_to_text(del) == wiki_to_text(add) {
+            count += 1;
+        }
+        del.clear();
+        add.clear();
+    };
+    for line in &diff.lines {
+        match line.op {
+            DiffOp::Del => del.push_str(&line.text),
+            DiffOp::Add => add.push_str(&line.text),
+            DiffOp::Same | DiffOp::Field => close(&mut del, &mut add),
+        }
+    }
+    close(&mut del, &mut add);
+    count
+}
+
+/// One `fields.<id>` section of both views (PD-51): the raw diff of the pretty JSON of the
+/// current against the outgoing value; the rendered diff of their `wiki_to_text` projections for
+/// a string field, else the raw diff again. A value sent unchanged is a heading only. Returns
+/// the field's raw-only changes: `max(0, raw hunks − rendered hunks)` (PD-51), or the
+/// [`invisible_hunks`] when there are more of those.
+fn field_section(
+    heading: &str,
+    current: &Value,
+    outgoing: &Value,
+    rendered: &mut DiffView,
+    raw: &mut DiffView,
+) -> u64 {
+    let (old, new) = (pretty(current), pretty(outgoing));
+    if old == new {
+        let unchanged = format!("{heading} (unchanged)");
+        rendered.heading(&unchanged);
+        raw.heading(&unchanged);
+        return 0;
+    }
+    let raw_diff = line_diff(&old, &new);
+    raw.heading(heading);
+    raw.extend(&raw_diff, &old, &new);
+    rendered.heading(heading);
+    let Some((c, o)) = string_pair(current, outgoing) else {
+        rendered.extend(&raw_diff, &old, &new);
+        return 0;
+    };
+    let (c_text, o_text) = (wiki_to_text(c), wiki_to_text(o));
+    let rendered_diff = line_diff(&c_text, &o_text);
+    rendered.extend(&rendered_diff, &c_text, &o_text);
+    let by_hunks = hunks(&raw_diff.lines).saturating_sub(hunks(&rendered_diff.lines));
+    by_hunks.max(invisible_hunks(c, o))
+}
+
+/// §6.3 Edit/update: the `jira.issue.edit` preview over the exact request (§5.1 inv. 4: the
+/// request list stays part of the body). Per edited field id (sorted; `fields` before `update`
+/// for one id) a section in both views: the current value is the verdict's baseline (what the
+/// stale check compares, PD-51), the outgoing one the sent body's `fields.<id>` (never the params
+/// again). `update` operations are sent verbatim and shown as their raw JSON lines in both
+/// views. Caution `raw_only_diff(n)` when a change shows only in the raw diff; Caution
+/// `diff_truncated(n)` when a view was cut. The conflict card (a `Conflict` verdict) and every
+/// other hold keep the generic write preview.
+pub fn edit_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let verdict = view.enrichment.filter(|v| v.hold == Hold::Preview);
+    let (Some(verdict), Some(request), PreviewBody::WriteRequests { .. }) =
+        (verdict, view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(body) = serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|b| b.as_object().cloned())
+    else {
+        return model;
+    };
+    let map = |k: &str| body.get(k).and_then(Value::as_object);
+    let (fields, update) = (map("fields"), map("update"));
+    let ids: BTreeSet<&String> = fields
+        .into_iter()
+        .chain(update)
+        .flat_map(Map::keys)
+        .collect();
+    let mut hidden = 0u64;
+    // A cut heading says so: two long ids with one prefix must not look alike.
+    let mut heading = |path: String| {
+        let (shown, cut) = capped_text(&path, FIELD_HEADING_CAP_CHARS);
+        if cut == 0 {
+            return shown;
+        }
+        hidden = hidden.saturating_add(cut);
+        format!("{shown}…")
+    };
+    let (mut rendered, mut raw) = (DiffView::new(), DiffView::new());
+    let mut raw_only = 0u64;
+    for id in ids {
+        if let Some(outgoing) = fields.and_then(|f| f.get(id.as_str())) {
+            let current = verdict.baseline.get(id.as_str()).unwrap_or(&Value::Null);
+            let h = heading(format!("fields.{id}"));
+            raw_only = raw_only.saturating_add(field_section(
+                &h,
+                current,
+                outgoing,
+                &mut rendered,
+                &mut raw,
+            ));
+        }
+        if let Some(ops) = update.and_then(|u| u.get(id.as_str())) {
+            let h = heading(format!("update.{id}"));
+            let text = pretty(ops);
+            let diff = line_diff("", &text);
+            for v in [&mut rendered, &mut raw] {
+                v.heading(&h);
+                v.extend(&diff, "", &text);
+            }
+        }
+    }
+    if raw_only > 0 {
+        model.warnings.push(Warning::new(
+            WarningId::RawOnlyDiff,
+            warning::raw_only_diff(raw_only),
+        ));
+    }
+    let cut = raw.cut.max(rendered.cut);
+    if cut > 0 {
+        model.warnings.push(Warning::new(
+            WarningId::DiffTruncated,
+            warning::diff_truncated(cut),
+        ));
+    }
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::EditDiff {
+        rendered: rendered.lines,
+        raw: raw.lines,
+        raw_only_changes: raw_only,
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden.saturating_add(cut);
     model
 }

@@ -34,6 +34,9 @@ pub enum WarningId {
     IdentityHeaderLost,
     UserRenamed,
     InstanceUrlChanged,
+    /// M5 T13 (T6 handoff): an edit diff was cut at its caps, so its lines are not the whole
+    /// change.
+    DiffTruncated,
     // Info
     LinkedIssueSummaries,
     CustomFields,
@@ -48,7 +51,7 @@ pub enum WarningId {
 }
 
 impl WarningId {
-    pub const ALL: [WarningId; 29] = [
+    pub const ALL: [WarningId; 30] = [
         WarningId::RestrictedComments,
         WarningId::SecurityLevel,
         WarningId::AllFields,
@@ -69,6 +72,7 @@ impl WarningId {
         WarningId::IdentityHeaderLost,
         WarningId::UserRenamed,
         WarningId::InstanceUrlChanged,
+        WarningId::DiffTruncated,
         WarningId::LinkedIssueSummaries,
         WarningId::CustomFields,
         WarningId::TruncatedByCap,
@@ -101,7 +105,8 @@ impl WarningId {
             | WarningId::TokenIdentityMismatch
             | WarningId::IdentityHeaderLost
             | WarningId::UserRenamed
-            | WarningId::InstanceUrlChanged => Level::Caution,
+            | WarningId::InstanceUrlChanged
+            | WarningId::DiffTruncated => Level::Caution,
             WarningId::LinkedIssueSummaries
             | WarningId::CustomFields
             | WarningId::TruncatedByCap
@@ -234,6 +239,12 @@ pub fn truncated_by_cap(n: u64, m: u64) -> String {
 /// "N changes not visible in rendered diff" (§6.3)
 pub fn raw_only_diff(n: u64) -> String {
     format!("{n} changes not visible in rendered diff")
+}
+
+/// plan text (M5 T13, T6 handoff): "diff truncated: N bytes not shown (see Request)"; the
+/// Request tab holds every byte that is sent.
+pub fn diff_truncated(n: u64) -> String {
+    format!("diff truncated: {n} bytes not shown (see Request)")
 }
 
 /// "this update will remove N macros / M images / K links" (§7.6)

@@ -629,7 +629,7 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         "jira.issue.edit",
         OpImpl {
             executor: jira::issue_edit_executor,
-            previewer: generic::write_preview,
+            previewer: jira_preview::edit_preview,
             stale_check: Some(&stale::ISSUE_EDIT),
             enrich: Some(&jira::ISSUE_EDIT_ENRICH),
             enrich_keys: &["fields", "update"],
