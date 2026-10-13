@@ -79,8 +79,9 @@ pub(crate) fn current_assignee(issue: &Value) -> Option<Option<JiraUser>> {
 /// (`atlassian::username_matches`, as a [`UsernameMatcher`]), else whose `key` equals it, else whose `displayName` equals
 /// it case-insensitively (as [`super::jira::resolve`]). The first rule with any hit decides: one
 /// hit resolves, more are ambiguous (their usernames are the candidates) and never a pick; no hit
-/// at all lists the first [`MAX_CANDIDATES`] usernames of the answer. Each rule is one pass over
-/// the answer. A resolved user without a `name` cannot be sent (fail closed).
+/// at all (and a blank value, which names nobody) lists the first [`MAX_CANDIDATES`] usernames of
+/// the answer. Each rule is one pass over the answer. A resolved user without a `name` cannot be
+/// sent (fail closed).
 fn resolve_user(wanted: &str, answer: &Value) -> Result<JiraUser, Box<EnrichVerdict>> {
     let Some(users) = answer.as_array() else {
         return Err(Box::new(EnrichVerdict::unusable()));
@@ -103,6 +104,12 @@ fn resolve_user(wanted: &str, answer: &Value) -> Result<JiraUser, Box<EnrichVerd
             .take(MAX_CANDIDATES)
             .map(capped)
             .collect()
+    };
+    // A blank value names nobody (never a user with an empty key or display name).
+    let rules = if wanted.trim().is_empty() {
+        &rules[..0]
+    } else {
+        &rules[..]
     };
     for rule in rules {
         let hits: Vec<&Value> = users.iter().filter(|v| rule(v)).collect();

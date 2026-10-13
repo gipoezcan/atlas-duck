@@ -369,6 +369,19 @@ fn assignee_rules_never_pick_one_of_several() -> TestResult {
     assert_eq!(n, 0);
     assert_eq!(candidates.len(), 10);
     assert_eq!(candidates[0], "u0");
+    // An empty or blank value names nobody, not a user with an empty key or display name.
+    for blank in ["", "  "] {
+        let params = json!({"key": KEY, "assignee": blank});
+        let (used, v) = enrich(
+            &params,
+            &[
+                json!([{"name": "x", "key": blank, "displayName": blank}]),
+                current.clone(),
+            ],
+        )?;
+        assert_eq!(v.hold, Hold::UnresolvedName, "{blank:?}: {v:?}");
+        assert_eq!(used, 1);
+    }
     // A resolved user without a usable `name` cannot be sent: fail closed.
     let (_, v) = enrich(
         &params,
