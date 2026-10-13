@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::diff::DiffLine;
+use crate::form::EditForm;
 use crate::json_tree::JsonNode;
 use crate::warning::Warning;
 
@@ -59,6 +61,8 @@ pub struct Preview {
     pub raw: RawPager,
     pub also_appears_in: Vec<String>,
     pub preview_builder_version: String,
+    /// §5.4 step 4: the editable inputs of a write preview; `None` where there is no edit step.
+    pub edit_form: Option<EditForm>,
 }
 
 /// §6.1 item 3 plus the classifier counts (§6.4).
@@ -161,6 +165,83 @@ pub enum PreviewBody {
         class: String,
         requests: Vec<RequestView>,
     },
+    /// §6.3 Jira issue: the card, the fields, the rendered description and the comments. Every
+    /// string is display-escaped by core; the HTML strings are sanitized by core.
+    JiraIssue {
+        card: IssueCard,
+        fields: Vec<FieldRow>,
+        description_html: Option<String>,
+        comments: Vec<CommentView>,
+    },
+    /// §6.3 Jira search and the lists.
+    Table {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        count: Option<ItemCount>,
+    },
+    /// §6.3 create, comment, assign, link, labels, worklog, sprint move. `constructs` lists the
+    /// wiki constructs of the outgoing text (PD-47).
+    WriteSummary {
+        sentence: String,
+        rows: Vec<(String, String)>,
+        constructs: Option<ConstructList>,
+        requests: Vec<RequestView>,
+    },
+    /// §6.3 edit/update: the rendered and the raw line diff; `raw_only_changes` counts hunks that
+    /// only the raw diff shows (PD-51).
+    EditDiff {
+        rendered: Vec<DiffLine>,
+        raw: Vec<DiffLine>,
+        raw_only_changes: u64,
+        requests: Vec<RequestView>,
+    },
+    /// §6.3 transition.
+    Transition {
+        from: String,
+        to: String,
+        fields: Vec<(String, String)>,
+        requests: Vec<RequestView>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IssueCard {
+    pub key: String,
+    pub summary: String,
+    pub issue_type: String,
+    pub status: String,
+    pub priority: Option<String>,
+    pub assignee: Option<String>,
+    pub reporter: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldRow {
+    pub id: String,
+    /// `customfield_N (unknown field)` when the instance field list does not name it.
+    pub name: String,
+    pub value_text: String,
+    pub restricted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommentView {
+    pub id: String,
+    pub author: Option<String>,
+    pub created: Option<String>,
+    pub body_html: String,
+    pub restricted: bool,
+}
+
+/// The wiki constructs of an outgoing text, in document order per kind (PD-47).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ConstructList {
+    pub macros: Vec<String>,
+    pub mentions: Vec<String>,
+    pub includes: Vec<String>,
+    pub links: Vec<String>,
+    pub images: Vec<String>,
+    pub attachments: Vec<String>,
 }
 
 impl PreviewBody {

@@ -555,6 +555,7 @@ async fn read_preview(
         body: model.body,
         also_appears_in: read.also_appears_in.clone(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
+        edit_form: None,
     };
     Ok(Some((preview, shown, opened)))
 }
@@ -597,6 +598,7 @@ async fn write_preview(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, submitte
         body: model.body,
         also_appears_in: Vec::new(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
+        edit_form: None,
     };
     Some((preview, shown, opened))
 }
@@ -1022,6 +1024,7 @@ async fn script_preview(
         body: model.body,
         also_appears_in: script.also_appears_in.clone(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
+        edit_form: None,
     };
     Ok(Some((preview, shown, opened)))
 }
