@@ -95,7 +95,16 @@ pub(crate) async fn sweep(engine: &Arc<Engine>, why: CancelWhy, write_wait: Dura
     loop {
         swept.cancelled += cancel_round(engine, cause).await;
         let running = executing(engine);
+        #[cfg(feature = "testing")]
+        let none_seen = seen.is_empty();
         seen.extend(running.iter().map(|e| e.head.request_id.clone()));
+        #[cfg(feature = "testing")]
+        if none_seen
+            && !seen.is_empty()
+            && let Some(listed) = engine.hooks().sweep_listed_write.as_ref()
+        {
+            listed.notify_one();
+        }
         if Instant::now() >= deadline {
             break;
         }

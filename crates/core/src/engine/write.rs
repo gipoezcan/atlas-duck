@@ -2252,6 +2252,10 @@ async fn execute(
     }
     let seen = engine.identity_epoch(&entry.instance_id);
     let outcome = http.client.send_approved_ctl(cover, &w, &ctl).await;
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks.pause_before_write_result.clone() {
+        pause.hold().await;
+    }
     // Bodies of the outcomes that do not carry their response (§7.2: audit-only, T10 handoff).
     let received = ctl.take_captured().partial;
     settle_execution(engine, entry, outcome, &received, edit, approval, seen).await;

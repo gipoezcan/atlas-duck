@@ -5,6 +5,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atlas_duck_atlassian::Timeouts;
@@ -22,6 +23,7 @@ use atlas_duck_ipc::envelope::Status;
 use atlas_duck_registry::Product;
 use common::{TestError, TestResult, code, de, detail, exit, request_id};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use wiremock::Mock;
 use wiremock::matchers::{method, path};
 
@@ -199,6 +201,43 @@ async fn busy(post_ms: u64, hooks: TestHooks) -> Result<Busy, TestError> {
     })
 }
 
+/// The executing write of [`busy`] held deterministically (the M5 CI flake of a 500 ms POST
+/// racing the setup): its answer is in, its outcome not yet logged, until the sweep has listed it.
+struct HeldWrite {
+    pause: Arc<Pause>,
+    listed: Arc<Notify>,
+}
+
+impl HeldWrite {
+    fn new() -> HeldWrite {
+        HeldWrite {
+            pause: Pause::new(),
+            listed: Arc::new(Notify::new()),
+        }
+    }
+
+    fn hooks(&self) -> TestHooks {
+        TestHooks {
+            pause_before_write_result: Some(self.pause.clone()),
+            sweep_listed_write: Some(self.listed.clone()),
+            ..TestHooks::none()
+        }
+    }
+
+    /// The write's answer arrived and it holds before `WRITE_EXECUTED`.
+    async fn held(&self) -> TestResult {
+        tokio::time::timeout(Duration::from_secs(10), self.pause.reached.notified()).await?;
+        Ok(())
+    }
+
+    /// Once the shutdown's sweep has listed the write as executing, lets it log its outcome.
+    async fn release_once_listed(&self) -> TestResult {
+        let listed = tokio::time::timeout(Duration::from_secs(10), self.listed.notified()).await;
+        self.pause.release.notify_one();
+        Ok(listed?)
+    }
+}
+
 /// A submit that arrives while the shutdown runs: refused, retryable.
 async fn refused_submit(h: &Harness) -> Result<atlas_duck_ipc::envelope::Envelope, TestError> {
     wait_for("the shutdown to start", || h.engine().is_shutting_down()).await?;
@@ -221,9 +260,16 @@ async fn shutdown_with_refused_submit(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i40_quit_refuses_cancels_finishes_write() -> TestResult {
-    let b = busy(500, TestHooks::none()).await?;
+    let held = HeldWrite::new();
+    let b = busy(0, held.hooks()).await?;
     let h = &b.h;
-    let report = shutdown_with_refused_submit(&b, ShutdownReason::Quit).await?;
+    held.held().await?;
+    let (report, released) = tokio::join!(
+        shutdown_with_refused_submit(&b, ShutdownReason::Quit),
+        held.release_once_listed()
+    );
+    released?;
+    let report = report?;
     assert_eq!(
         report,
         ShutdownReport {
@@ -457,14 +503,18 @@ async fn a_second_shutdown_changes_nothing() -> TestResult {
 /// before `APP_STOP` is in the log, and gets the first call's report.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_concurrent_second_shutdown_waits_for_the_first() -> TestResult {
-    let b = busy(1_500, TestHooks::none()).await?;
+    let held = HeldWrite::new();
+    let b = busy(0, held.hooks()).await?;
     let h = &b.h;
+    held.held().await?;
     let (first, second) = tokio::join!(h.core().shutdown(ShutdownReason::Quit), async {
-        wait_for("the shutdown to start", || h.engine().is_shutting_down()).await?;
-        // The first call is in its wait for the executing write.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The first call has listed the held write and waits for it.
+        tokio::time::timeout(Duration::from_secs(10), held.listed.notified()).await?;
         assert!(h.events_of(EventType::APP_STOP).await?.is_empty());
-        let report = h.core().shutdown(ShutdownReason::OsShutdown).await;
+        let (report, ()) = tokio::join!(h.core().shutdown(ShutdownReason::OsShutdown), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            held.pause.release.notify_one();
+        });
         // It returned: the first call's work is complete.
         assert_eq!(last_event(h)?, EventType::APP_STOP);
         Ok::<_, TestError>(report)

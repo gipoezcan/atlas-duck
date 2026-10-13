@@ -171,6 +171,12 @@ pub struct TestHooks {
     /// Replaces every write's enrichment rule (Δ3: the round-limit test's rule that never says
     /// `Judge`).
     pub enrich_rule: Option<&'static crate::ops::EnrichRule>,
+    /// A write holds after its request was sent and answered, before its outcome is recorded
+    /// (`WRITE_EXECUTED`): it stays `executing` until released (the shutdown tests' deterministic
+    /// executing write).
+    pub pause_before_write_result: Option<Arc<Pause>>,
+    /// Notified the first time the shutdown sweep lists an `executing` write it will wait for.
+    pub sweep_listed_write: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(feature = "testing")]
