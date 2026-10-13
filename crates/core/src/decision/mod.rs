@@ -1266,8 +1266,9 @@ fn exec_refused(e: ExecError) -> DecisionError {
 /// §5.4 step 4: the edit applied to the current params (targets and baselines immutable, T15),
 /// re-validated, checked by the op's executor, then `WRITE_EDITED {original, edited}` and either
 /// the new list rendered with the latest verdict (`Edit`, a new revision) or a re-enrichment
-/// (`Edit {rerun}`, `PREVIEW_FETCH {purpose: enrich}`, PD-24). A malformed key or invalid params
-/// leave the request unchanged and log nothing (T15 handoff); a target or baseline edit is
+/// (`Edit {rerun}`, `PREVIEW_FETCH {purpose: enrich}`, PD-24). A malformed key, invalid params or
+/// a choice label core cannot send (`write::choice_edits`, T12 review I1) leave the request
+/// unchanged and log nothing (T15 handoff); a target or baseline edit is
 /// `DECISION_INVALID {target_param_edit}`.
 async fn edit_write(
     engine: &Arc<Engine>,
