@@ -18,6 +18,9 @@ use serde_json::{Map, Value, json};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, Request, ResponseTemplate};
 
+use super::jira::{
+    comment_page, mount_assignable, mount_create_stages, mount_link_types, mount_sprint,
+};
 use super::{TestError, de, request_id};
 
 const ISSUE: &str = "jira.issue.get";
@@ -25,6 +28,10 @@ const SEARCH: &str = "jira.search";
 const COMMENT: &str = "jira.comment.add";
 const EDIT: &str = "jira.issue.edit";
 const TRANSITION: &str = "jira.issue.transition";
+const CREATE: &str = "jira.issue.create";
+const ASSIGN: &str = "jira.issue.assign";
+const ISSUELINK: &str = "jira.issuelink.create";
+const SPRINT_MOVE: &str = "jira.sprint.move_issues";
 
 /// A delayed answer outlives any flow: the flows that use it cancel or expire the request first.
 const HANG: Duration = Duration::from_secs(5);
@@ -156,7 +163,72 @@ pub async fn mount_jira_with(h: &Harness, issue: &str) -> Result<(), TestError> 
     )
     .await;
     mount(mock, "PUT", issue_re(mock, "EDT", ""), mock.response(204)).await;
+    mount_jira_writes(mock).await;
     Ok(())
+}
+
+/// The answers of the M5 flows: the comment page of a `--comments` read, the three create stages
+/// and the created issue, the assignable search and the assignee PUT, the link types and the empty
+/// `201` of `issueLink`, the sprint and the move into it.
+async fn mount_jira_writes(mock: &MockDc) {
+    let json_body = |t: ResponseTemplate, b: &str| t.set_body_raw(b.to_owned(), "application/json");
+    mount(
+        mock,
+        "GET",
+        issue_re(mock, "ABC|EDT", "/comment"),
+        json_body(
+            mock.response(200),
+            &comment_page(0, 50, 1, 1, false).to_string(),
+        ),
+    )
+    .await;
+    mount_create_stages(mock).await;
+    mount(
+        mock,
+        "POST",
+        format!("^{}$", regex_escape(&mock.path("/rest/api/2/issue"))),
+        json_body(mock.response(201), fixtures::JIRA_ISSUE_CREATED),
+    )
+    .await;
+    let users = json!([{
+        "name": "jdoe", "key": "JIRAUSER1", "displayName": "Jane Doe", "active": true
+    }]);
+    mount_assignable(mock, &users).await;
+    mount(
+        mock,
+        "PUT",
+        issue_re(mock, "ABC", "/assignee"),
+        mock.response(204),
+    )
+    .await;
+    let types = json!([{
+        "id": "10000", "name": "Blocks", "inward": "is blocked by", "outward": "blocks"
+    }]);
+    mount_link_types(mock, &types).await;
+    mount(
+        mock,
+        "POST",
+        format!("^{}$", regex_escape(&mock.path("/rest/api/2/issueLink"))),
+        mock.response(201)
+            .set_body_raw(String::new(), "text/html;charset=UTF-8"),
+    )
+    .await;
+    mount_sprint(
+        mock,
+        7,
+        &json!({ "id": 7, "name": "Sprint 7", "state": "active" }),
+    )
+    .await;
+    mount(
+        mock,
+        "POST",
+        format!(
+            "^{}$",
+            regex_escape(&mock.path("/rest/agile/1.0/sprint/7/issue"))
+        ),
+        mock.response(204),
+    )
+    .await;
 }
 
 fn issue_with(summary: &str) -> String {
@@ -269,6 +341,13 @@ fn expect(what: &str, got: Status, want: Status) -> Result<(), TestError> {
     } else {
         Err(format!("{what}: {got:?}, wanted {want:?}").into())
     }
+}
+
+/// Submits a write, approves it as it is and expects it to succeed.
+async fn approved_write(h: &Harness, op: &str, params: Value) -> Result<(), TestError> {
+    let id = submit_queued(h, op, params).await?;
+    h.approver().approve(&id).map_err(de)?;
+    expect(op, h.await_(&id, 10_000).await.status, Status::Succeeded)
 }
 
 /// Runs flow number `n` (its keys are unique to it).
@@ -468,6 +547,45 @@ pub async fn run_flow(h: &Harness, flow: Flow, n: usize) -> Result<(), TestError
                 Status::Cancelled,
             )
         }
+        Flow::CommentMarkdown => {
+            // No `body_format`: Markdown, converted to wiki after an identity call.
+            let params = json!({ "key": format!("ABC-{n}"), "body": "Seen on **staging**." });
+            approved_write(h, COMMENT, params).await
+        }
+        Flow::CreateThreeStage => {
+            let params = json!({
+                "project": "ABC",
+                "issuetype": "Bug",
+                "summary": format!("Flow {n} fails after reset")
+            });
+            approved_write(h, CREATE, params).await
+        }
+        Flow::Assign => {
+            let params = json!({ "key": format!("ABC-{n}"), "assignee": "jdoe" });
+            approved_write(h, ASSIGN, params).await
+        }
+        Flow::IssueLink => {
+            let params = json!({
+                "type": "Blocks",
+                "inward": format!("ABC-{n}"),
+                "outward": format!("ABC-{}", n + 1000)
+            });
+            approved_write(h, ISSUELINK, params).await
+        }
+        Flow::SprintMove => {
+            let params = json!({ "id": 7, "issues": [format!("ABC-{n}")] });
+            approved_write(h, SPRINT_MOVE, params).await
+        }
+        Flow::IssueGetComments => {
+            let params = json!({ "key": format!("ABC-{n}"), "comments": true });
+            let id = submit_queued(h, ISSUE, params).await?;
+            ap.release(&id).map_err(de)?;
+            expect(
+                "comments release",
+                h.await_(&id, 10_000).await.status,
+                Status::Released,
+            )
+        }
         Flow::ConnectionTest => {
             h.instances()
                 .retest_token("jira-main")
@@ -643,10 +761,20 @@ pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
                 };
                 let pages = r.payload["responses"].as_array().map_or(0, Vec::len);
                 let marker = usize::from(r.payload["outcome"].is_string());
-                // Coverage is per (method, path) across requests: a hit carries no request id
-                // and `READ_FETCHED` no path. The marker is the over-cap / timeout / cancelled
-                // answer that has a hit but no response page; it can mask one extra hit.
-                add(m, &p, pages + marker);
+                if r.op_id.as_deref() == Some(ISSUE) && params["comments"] == json!(true) {
+                    // The composite read (T9): response 0 is the issue, the rest are the comment
+                    // pages, all in this one record.
+                    let key = params["key"].as_str().ok_or("read without a key")?;
+                    add(m, &p, 1);
+                    let comments = mock.path(&format!("/rest/api/2/issue/{key}/comment"));
+                    add("GET", &comments, pages.saturating_sub(1) + marker);
+                } else {
+                    // Coverage is per (method, path) across requests: a hit carries no request
+                    // id and `READ_FETCHED` no path. The marker is the over-cap / timeout /
+                    // cancelled answer that has a hit but no response page; it can mask one
+                    // extra hit.
+                    add(m, &p, pages + marker);
+                }
             }
             EventType::PREVIEW_FETCH => {
                 after_received(r)?;

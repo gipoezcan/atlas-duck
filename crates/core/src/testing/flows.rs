@@ -31,6 +31,18 @@ pub enum Flow {
     WriteStaleChanged,
     /// A write cancelled by the client while its enrichment fetch is in flight.
     EnrichCancel,
+    /// A Markdown comment the human approves (the identity call precedes the conversion, I-28).
+    CommentMarkdown,
+    /// A `jira.issue.create` through its three enrichment stages, approved.
+    CreateThreeStage,
+    /// `jira.issue.assign`: the assignable search, the stale check and the PUT, approved.
+    Assign,
+    /// `jira.issuelink.create`: the link-type resolution and the empty `201`, approved.
+    IssueLink,
+    /// `jira.sprint.move_issues`: the sprint read, its stale check and the move, approved.
+    SprintMove,
+    /// `jira.issue.get` with `comments: true` (the composite read), released.
+    IssueGetComments,
     /// A connection test of the stored token.
     ConnectionTest,
     /// `doctor`.
@@ -41,7 +53,7 @@ pub enum Flow {
 
 impl Flow {
     /// Every flow but `Quit`.
-    pub const ALL_BUT_QUIT: [Flow; 13] = [
+    pub const ALL_BUT_QUIT: [Flow; 19] = [
         Flow::ReadRelease,
         Flow::ReadDeny,
         Flow::ReadUpstreamError,
@@ -53,6 +65,12 @@ impl Flow {
         Flow::WriteEditApprove,
         Flow::WriteStaleChanged,
         Flow::EnrichCancel,
+        Flow::CommentMarkdown,
+        Flow::CreateThreeStage,
+        Flow::Assign,
+        Flow::IssueLink,
+        Flow::SprintMove,
+        Flow::IssueGetComments,
         Flow::ConnectionTest,
         Flow::Doctor,
     ];

@@ -151,3 +151,65 @@ fn i19_every_flow_kind_is_covered() -> TestResult {
     })?;
     Ok(())
 }
+
+/// The M5 flows (a Markdown comment, a three-stage create, an assign, an issuelink, a sprint
+/// move, an issue get with `--comments`) reach the instance's endpoints, and every one of those
+/// hits (the cache fill, the stage GETs, the comment page, the stale checks) has its covering
+/// record and a response record with the app's `User-Agent` (I-19). The paths are asserted, so a
+/// flow that stopped sending a call cannot leave the property vacuous for it.
+#[test]
+fn i19_m5_flows_cover_their_hits() -> TestResult {
+    use atlas_duck_core::testing::Flow;
+    let rt = runtime()?;
+    rt.block_on(async {
+        let h = flow_harness().await?;
+        mount_jira(&h).await?;
+        let mock = h.mock("jira-main").ok_or("no jira mock")?;
+        let flows = [
+            Flow::CommentMarkdown,
+            Flow::CreateThreeStage,
+            Flow::Assign,
+            Flow::IssueLink,
+            Flow::SprintMove,
+            Flow::IssueGetComments,
+        ];
+        for (n, f) in flows.iter().enumerate() {
+            run_flow(&h, *f, n).await?;
+        }
+        let seen: Vec<(String, String)> = mock
+            .received()
+            .await
+            .iter()
+            .map(|r| (r.method.to_string(), r.url.path().to_owned()))
+            .collect();
+        for (m, p) in [
+            ("GET", "/rest/api/2/field"),
+            ("GET", "/rest/api/2/myself"),
+            ("GET", "/rest/api/2/project"),
+            ("GET", "/rest/api/2/issue/createmeta/ABC/issuetypes"),
+            ("GET", "/rest/api/2/issue/createmeta/ABC/issuetypes/10002"),
+            ("POST", "/rest/api/2/issue"),
+            ("GET", "/rest/api/2/user/assignable/search"),
+            ("PUT", "/rest/api/2/issue/ABC-2/assignee"),
+            ("GET", "/rest/api/2/issueLinkType"),
+            ("POST", "/rest/api/2/issueLink"),
+            ("GET", "/rest/agile/1.0/sprint/7"),
+            ("POST", "/rest/agile/1.0/sprint/7/issue"),
+            ("POST", "/rest/api/2/issue/ABC-0/comment"),
+            ("GET", "/rest/api/2/issue/ABC-5/comment"),
+        ] {
+            let full = mock.path(p);
+            assert!(
+                seen.iter().any(|(sm, sp)| sm == m && *sp == full),
+                "{m} {p} was never sent: {seen:?}"
+            );
+        }
+        let covered = check_coverage(&h).await?;
+        assert!(covered >= 14, "only {covered} authenticated hits");
+        let shown = check_preview_shown(&h).await?;
+        assert!(shown >= 6, "only {shown} positive decisions");
+        drop(h);
+        Ok::<_, common::TestError>(())
+    })?;
+    Ok(())
+}

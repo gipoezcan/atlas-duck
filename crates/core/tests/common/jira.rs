@@ -4,7 +4,8 @@
 
 use std::time::Duration;
 
-use atlas_duck_atlassian::testing::{MockDc, fixtures};
+use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
+use atlas_duck_registry::{Method, OpClass, OperationSpec, StatusSet, SuccessBody};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
@@ -301,4 +302,233 @@ pub async fn search_starts(mock: &MockDc) -> Vec<u64> {
                 .and_then(|b| b["startAt"].as_u64())
         })
         .collect()
+}
+
+// ---- X-09: mounts generated from the registry ------------------------------------------------------
+
+/// `params_schema["examples"][0]`: the params X-09 submits.
+pub fn example_params(spec: &OperationSpec) -> Value {
+    spec.params_schema_json()["examples"][0].clone()
+}
+
+/// The registry's method as the wire name.
+pub fn http_method(m: Method) -> &'static str {
+    match m {
+        Method::Get => "GET",
+        Method::Post => "POST",
+        Method::Put => "PUT",
+        Method::Delete => "DELETE",
+    }
+}
+
+/// `template` (`/rest/api/2/issue/{key}`) with each `{name}` replaced by `params[name]`.
+pub fn fill_path(template: &str, params: &Value) -> Result<String, String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        let (head, tail) = rest.split_at(open);
+        out.push_str(head);
+        let close = tail
+            .find('}')
+            .ok_or_else(|| format!("{template}: unclosed placeholder"))?;
+        let name = tail.get(1..close).unwrap_or_default();
+        let value = match &params[name] {
+            Value::String(s) => s.clone(),
+            Value::Number(n) => n.to_string(),
+            other => {
+                return Err(format!(
+                    "{template}: no value for {name} in params ({other})"
+                ));
+            }
+        };
+        out.push_str(&value);
+        rest = tail.get(close + 1..).unwrap_or_default();
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// A GET an op sends besides its own request (an enrichment, a resolution, a stale check, or the
+/// second leg of a composite read): `path` answers `body`.
+pub struct Aux {
+    pub path: String,
+    pub body: Value,
+}
+
+fn read_example(op_id: &str) -> Result<Value, String> {
+    atlas_duck_registry::get(op_id)
+        .map(|s| s.result_example_json())
+        .ok_or_else(|| format!("no registry op {op_id}"))
+}
+
+fn str_param<'a>(params: &'a Value, name: &str) -> Result<&'a str, String> {
+    params[name]
+        .as_str()
+        .ok_or_else(|| format!("example params have no string {name}"))
+}
+
+/// The enrichment and stale-check GETs of `spec` for `params`, each body the `result_example` of
+/// the Jira read op that answers the same endpoint, so the fixtures cannot drift from the
+/// registry. Every Jira op id is named here: an op that is not is an error (X-09 fails for a new
+/// op until its GETs are decided, even when the decision is "none").
+pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String> {
+    let issue = |params: &Value| -> Result<Aux, String> {
+        let key = str_param(params, "key")?;
+        Ok(Aux {
+            path: issue_path(key),
+            body: read_example("jira.issue.get")?,
+        })
+    };
+    match spec.id {
+        "jira.myself"
+        | "jira.project.list"
+        | "jira.project.get"
+        | "jira.search"
+        | "jira.comment.list"
+        | "jira.worklog.list"
+        | "jira.transition.list"
+        | "jira.issue.editmeta"
+        | "jira.createmeta.issuetypes"
+        | "jira.createmeta.fields"
+        | "jira.field.list"
+        | "jira.issuelinktype.list"
+        | "jira.attachment.meta"
+        | "jira.user.assignable"
+        | "jira.board.list"
+        | "jira.sprint.list"
+        | "jira.sprint.issues"
+        | "jira.backlog.issues" => Ok(Vec::new()),
+        // The composite read's second leg: the comment pages (T9).
+        "jira.issue.get" => {
+            if params["comments"] == json!(true) {
+                let key = str_param(params, "key")?;
+                Ok(vec![Aux {
+                    path: comments_path(key),
+                    body: read_example("jira.comment.list")?,
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        "jira.issue.create" => {
+            let project = str_param(params, "project")?;
+            let wanted = str_param(params, "issuetype")?;
+            let types = read_example("jira.createmeta.issuetypes")?;
+            let type_id = types["values"]
+                .as_array()
+                .and_then(|v| v.iter().find(|t| t["name"] == wanted))
+                .and_then(|t| t["id"].as_str())
+                .ok_or_else(|| format!("the issuetypes example has no {wanted}"))?
+                .to_owned();
+            Ok(vec![
+                Aux {
+                    path: PROJECTS_PATH.to_owned(),
+                    body: read_example("jira.project.list")?,
+                },
+                Aux {
+                    path: issuetypes_path(project),
+                    body: types,
+                },
+                Aux {
+                    path: create_fields_path(project, &type_id),
+                    body: read_example("jira.createmeta.fields")?,
+                },
+            ])
+        }
+        "jira.issue.edit" => Ok(vec![issue(params)?]),
+        "jira.issue.transition" => {
+            let key = str_param(params, "key")?;
+            Ok(vec![
+                Aux {
+                    path: format!("{}/transitions", issue_path(key)),
+                    body: read_example("jira.transition.list")?,
+                },
+                issue(params)?,
+            ])
+        }
+        "jira.issue.assign" => Ok(vec![
+            Aux {
+                path: "/rest/api/2/user/assignable/search".to_owned(),
+                body: read_example("jira.user.assignable")?,
+            },
+            issue(params)?,
+        ]),
+        "jira.issuelink.create" => Ok(vec![Aux {
+            path: "/rest/api/2/issueLinkType".to_owned(),
+            body: read_example("jira.issuelinktype.list")?,
+        }]),
+        "jira.sprint.move_issues" => {
+            let id = params["id"]
+                .as_u64()
+                .ok_or("example params have no sprint id")?;
+            let sprints = read_example("jira.sprint.list")?;
+            let sprint = sprints["values"]
+                .as_array()
+                .and_then(|v| v.iter().find(|s| s["id"] == id))
+                .cloned()
+                .ok_or_else(|| format!("the sprint.list example has no sprint {id}"))?;
+            Ok(vec![Aux {
+                path: format!("/rest/agile/1.0/sprint/{id}"),
+                body: sprint,
+            }])
+        }
+        // No enrichment and no stale rule: the identity call is the only GET.
+        "jira.comment.add" | "jira.worklog.add" | "jira.backlog.move_issues" => Ok(Vec::new()),
+        other => Err(format!(
+            "{other}: no X-09 mount rule in common::jira::aux_gets (a new op needs its GETs decided)"
+        )),
+    }
+}
+
+/// A write's declared success (§7.2): `{[204], Empty}` is 204 without a body, `{[201], Empty}` is
+/// 201 with an empty `text/html` body, JSON is 201 with the registry receipt example plus a
+/// `self` link a projection must drop.
+pub fn declared_success(mock: &MockDc, spec: &OperationSpec) -> ResponseTemplate {
+    let status = match spec.success.statuses {
+        StatusSet::Exactly(list) => list.first().copied().unwrap_or(200),
+        StatusSet::Any2xx => 201,
+    };
+    match spec.success.body {
+        SuccessBody::Empty if status == 204 => mock.response(204),
+        SuccessBody::Empty => mock
+            .response(status)
+            .set_body_raw(String::new(), "text/html;charset=UTF-8"),
+        SuccessBody::Json => {
+            let mut body = spec.result_example_json();
+            if let Some(m) = body.as_object_mut() {
+                m.insert(
+                    "self".into(),
+                    json!("https://jira.example.invalid/rest/api/2/x/1"),
+                );
+            }
+            json_answer(mock, status, &body)
+        }
+    }
+}
+
+/// Mounts everything `spec` needs to run once with `params`: the identity call, the GETs of
+/// [`aux_gets`] and the op's own endpoint (a read answers its `result_example`, a write its
+/// declared success). Returns the GETs it mounted.
+pub async fn mount_for_op(
+    mock: &MockDc,
+    spec: &OperationSpec,
+    params: &Value,
+) -> Result<Vec<Aux>, String> {
+    let aux = aux_gets(spec, params)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    for a in &aux {
+        mount_get(mock, &a.path, json_answer(mock, 200, &a.body)).await;
+    }
+    let own = fill_path(spec.endpoint.path, params)?;
+    let answer = match spec.class {
+        OpClass::Read => json_answer(mock, 200, &spec.result_example_json()),
+        OpClass::Write => declared_success(mock, spec),
+    };
+    Mock::given(method(http_method(spec.endpoint.method)))
+        .and(path(mock.path(&own)))
+        .respond_with(answer)
+        .mount(mock.server())
+        .await;
+    Ok(aux)
 }
