@@ -708,7 +708,8 @@ impl Engine {
         &self.port
     }
 
-    pub fn committed(&self) -> &Arc<CommittedSet> {
+    /// Crate-private (T20 review m3); tests use `Harness::committed`.
+    pub(crate) fn committed(&self) -> &Arc<CommittedSet> {
         &self.committed
     }
 
@@ -1365,8 +1366,10 @@ impl Engine {
         };
         // A write that left `StaleCheck`/`Executing` (a return to the queue, an approval whose
         // step was refused after its commit, the terminal state) holds no live approval: no
-        // write cover for it until its next `WRITE_APPROVED` commits (Δ6).
-        if !approved {
+        // write cover for it until its next `WRITE_APPROVED` commits (Δ6). Only a write is ever
+        // approved; any other kind holds no mark, and `forget_request` at its terminal state
+        // clears the set anyway (T20 review m5: no write lock per read).
+        if !approved && entry.kind() == Kind::Write {
             self.committed.forget_write_approved(&entry.head.request_id);
         }
         if terminal {

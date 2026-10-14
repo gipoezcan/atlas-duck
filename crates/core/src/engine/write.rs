@@ -2304,6 +2304,8 @@ async fn execute(
     let ctl = FetchControl::new();
     entry.set_fetch_control(Some(ctl.clone()));
     let w = ApprovedWrite {
+        request_id: entry.head.request_id.clone(),
+        candidate_counter: approval.rev,
         requests,
         success: expectation(entry.spec),
     };
@@ -2316,7 +2318,8 @@ async fn execute(
         pause.hold().await;
     }
     // M-18: the type now enforces what the control flow above guarantees. A cover exists only
-    // while this approval's `WRITE_APPROVED` is the write's latest committed one.
+    // while this approval's `WRITE_APPROVED` is the write's latest committed one; the send
+    // consumes it and refuses any write but `w` (same request id and revision, T20 review m1).
     let Ok(cover) = engine
         .covers()
         .for_write(&entry.head.request_id, approval.rev)
@@ -2325,7 +2328,7 @@ async fn execute(
         return;
     };
     let seen = engine.identity_epoch(&entry.instance_id);
-    let outcome = http.client.send_approved_ctl(&cover, &w, &ctl).await;
+    let outcome = http.client.send_approved_ctl(cover, &w, &ctl).await;
     #[cfg(feature = "testing")]
     if let Some(pause) = engine.hooks.pause_before_write_result.clone() {
         pause.hold().await;

@@ -663,6 +663,11 @@ impl Harness {
         self.core.engine()
     }
 
+    /// The engine's committed set (`Engine::committed` is crate-private, T20 review m3).
+    pub fn committed(&self) -> &Arc<crate::audit_port::CommittedSet> {
+        self.engine().committed()
+    }
+
     /// The capturing handler.
     pub fn handler(&self) -> Arc<dyn RequestHandler> {
         self.handler.clone()

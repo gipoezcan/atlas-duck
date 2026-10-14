@@ -16,14 +16,14 @@ use atlas_duck_audit::{
     request_set_hash,
 };
 use atlas_duck_core::audit_port::{
-    AuditPort, CommittedSet, DateBridge, StoreProbe, commit_records, commit_request_received,
+    AuditPort, CommittedSet, DateBridge, StoreProbe, commit_request_received,
     commit_system_fetch_start,
 };
 use atlas_duck_core::ids::{BatchId, FetchId, RequestId};
 use atlas_duck_core::lifecycle::model::CancelReason;
 use atlas_duck_core::payloads::{self, *};
 use atlas_duck_core::redact::{DropScope, RedactionOp};
-use atlas_duck_core::testing::{FaultPlan, FaultyAudit, TempStore};
+use atlas_duck_core::testing::{FaultPlan, FaultyAudit, TempStore, commit_records};
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_ipc::proto::{
     AgentNameSource, ClientKind, ConnectionMeta, Hello, PeerHop, PeerInfo, params_sha256,

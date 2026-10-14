@@ -43,6 +43,10 @@ pub struct SuccessExpectation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ApprovedWrite {
+    /// The write and the revision whose committed `WRITE_APPROVED` approved `requests`: the
+    /// `WriteCover` it is sent under must name the same two (T20 review m1).
+    pub request_id: String,
+    pub candidate_counter: u64,
     pub requests: Vec<HttpRequestSpec>,
     pub success: SuccessExpectation,
 }

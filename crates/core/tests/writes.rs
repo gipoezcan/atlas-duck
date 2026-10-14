@@ -12,14 +12,15 @@ use atlas_duck_atlassian::Timeouts;
 use atlas_duck_atlassian::testing::{
     MockDc, RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, TestTlsServer, XAuser, fixtures,
 };
-use atlas_duck_audit::EventType;
+use atlas_duck_atlassian::{CoverIssuer, NotCommitted};
 use atlas_duck_audit::request_set::requests_from_json;
-use atlas_duck_audit::request_set_hash;
+use atlas_duck_audit::{EventType, RequestRecord, request_set_hash};
+use atlas_duck_core::audit_port::{CommittedSet, StoreProbe};
 use atlas_duck_core::engine::write::RefreshCause;
 use atlas_duck_core::lifecycle::model::InstanceEvt;
-use atlas_duck_core::payloads::InvalidReason;
-use atlas_duck_core::testing::{FaultPlan, Harness, InstanceAt};
-use atlas_duck_core::{DecisionError, DenyDetails, Edits, Pause, TestHooks};
+use atlas_duck_core::payloads::{self, EventCtx, InvalidReason};
+use atlas_duck_core::testing::{FaultPlan, Harness, InstanceAt, TempStore, commit_records};
+use atlas_duck_core::{CandidateRev, DecisionError, DenyDetails, Edits, Pause, TestHooks};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::proto::{AwaitParams, ProgressNotification, ProgressSink};
 use atlas_duck_preview::PreviewBody;
@@ -1431,11 +1432,14 @@ async fn reached(pause: &Pause) -> TestResult {
         .map_err(|_| TestError::from("the flow never reached the pause"))
 }
 
-/// M-18: the write leaves only under a cover minted from its committed `WRITE_APPROVED`. An
-/// approval whose append failed marks nothing (nothing is sent, `audit_failure`); a committed one
-/// marks exactly its own revision while the write executes, and the terminal state forgets it.
+/// M-18, the marking half: an approval whose `WRITE_APPROVED` append failed marks nothing (that
+/// write is also stopped by M3 before any execution: nothing is sent, `audit_failure`); a committed
+/// one marks exactly its own revision while the write executes, and the terminal state forgets
+/// it. That the execution refuses to send without the mark is proven by
+/// `m18_refused_write_cover_sends_nothing`, `m18_cover_is_bound_to_the_executed_revision` and
+/// the Jira table (`jira_identity.rs`); the issuer half by atlassian's `tests/cover.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn m18_execute_uses_write_cover() -> TestResult {
+async fn m18_only_a_committed_approval_is_marked() -> TestResult {
     let plan = FaultPlan::new();
     let pause = Pause::new();
     let h = Harness::builder()
@@ -1450,14 +1454,14 @@ async fn m18_execute_uses_write_cover() -> TestResult {
     let mock = jira(&h)?;
     identity_ok(mock).await;
     comment_ok(mock).await;
-    let set = h.engine().committed().clone();
+    let set = h.committed().clone();
 
     let failed = queued(&h, COMMENT, comment_params()).await?;
-    let rev = h.approver().rev(&failed).map_err(de)?.counter;
+    let failed_rev = h.approver().rev(&failed).map_err(de)?.counter;
     plan.fail_nth(EventType::WRITE_APPROVED, 1);
     let res = h.approver().approve(&failed);
     assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
-    assert!(!set.write_approved(&failed, rev));
+    assert!(!set.write_approved(&failed, failed_rev));
     let env = h.await_(&failed, 5000).await;
     assert_eq!(
         (env.status, exit(&env), code(&env)),
@@ -1472,7 +1476,7 @@ async fn m18_execute_uses_write_cover() -> TestResult {
         reached(&pause).await?;
         assert!(set.write_approved(&id, rev));
         assert!(!set.write_approved(&id, rev + 1));
-        assert!(!set.write_approved(&failed, rev));
+        assert!(!set.write_approved(&failed, failed_rev));
         assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 1);
         Ok::<(), TestError>(())
     }
@@ -1502,7 +1506,7 @@ async fn m18_refused_write_cover_sends_nothing() -> TestResult {
     let mock = jira(&h)?;
     identity_ok(mock).await;
     comment_ok(mock).await;
-    let set = h.engine().committed().clone();
+    let set = h.committed().clone();
     let id = queued(&h, COMMENT, comment_params()).await?;
     let rev = h.approver().rev(&id).map_err(de)?.counter;
     h.approver().approve(&id).map_err(de)?;
@@ -1533,12 +1537,88 @@ async fn m18_refused_write_cover_sends_nothing() -> TestResult {
     Ok(())
 }
 
-/// M-18: approve, then a stale return (credential changed during the stale check) and a
-/// re-approval of the refreshed revision. The returned write holds no approval; once re-approved
-/// only the new revision is covered, so the first approval's execution could not mint a cover
-/// for its counter even past the M3 approval binding. Exactly one write leaves.
+/// A `WRITE_APPROVED` of revision `counter` of `request_id`, committed into `set` through
+/// `commit_records` over a scratch store: `set` then names `counter` as the write's latest
+/// committed approval, as a later approval of the write would.
+fn commit_approval(set: &CommittedSet, request_id: &str, counter: u64) -> TestResult {
+    let ts = TempStore::new()?;
+    let ctx = EventCtx {
+        request_id: Some(request_id.to_owned()),
+        op_id: Some(COMMENT.to_owned()),
+        op_class: Some("write".to_owned()),
+        ..EventCtx::default()
+    };
+    let rev = CandidateRev {
+        counter,
+        candidate_hash: [7; 32],
+    };
+    let records = [RequestRecord {
+        index: 0,
+        method: "POST".into(),
+        resolved_url: "https://jira.corp/rest/api/2/issue/ABC-1/comment".into(),
+        content_type: Some("application/json".into()),
+        body_bytes: br#"{"body":"x"}"#.to_vec(),
+    }];
+    let approval = payloads::write_approved(&ctx, &rev, &records, false);
+    commit_records(&*ts.port(), set, vec![approval])?;
+    Ok(())
+}
+
+/// M-18, end to end: the cover is minted for the revision this execution was approved for, not
+/// for whatever the write's latest committed approval is. A later revision's `WRITE_APPROVED`
+/// commits while the execution holds before the mint: the execution's own revision is no longer
+/// covered, so it sends nothing (`WRITE_FAILED {internal, class: write_cover_refused}`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn m18_superseded_approval_cannot_send() -> TestResult {
+async fn m18_cover_is_bound_to_the_executed_revision() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_before_write_cover: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    identity_ok(mock).await;
+    comment_ok(mock).await;
+    let set = h.committed().clone();
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    let rev = h.approver().rev(&id).map_err(de)?.counter;
+    h.approver().approve(&id).map_err(de)?;
+    let held = async {
+        reached(&pause).await?;
+        assert!(set.write_approved(&id, rev));
+        commit_approval(&set, &id, rev + 1)?;
+        assert!(!set.write_approved(&id, rev));
+        assert!(set.write_approved(&id, rev + 1));
+        Ok::<(), TestError>(())
+    }
+    .await;
+    pause.release.notify_one();
+    held?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(
+        (env.status, exit(&env), code(&env)),
+        (Status::Failed, 1, "internal".to_owned()),
+        "{}",
+        env.to_json_line()
+    );
+    let failed = one(&h, &id, EventType::WRITE_FAILED).await?;
+    assert_eq!(failed["class"], "write_cover_refused");
+    assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 0);
+    Ok(())
+}
+
+/// M-18: approve, then a stale return (credential changed during the stale check) and a
+/// re-approval of the refreshed revision. The returned write holds no approval, and while the
+/// new revision executes the issuer (`CoverIssuer` over the engine's committed set, the one
+/// `execute` mints from) refuses a cover for the first revision and grants one for the second.
+/// The first approval's execution itself never reaches its mint (the M3 approval binding stops
+/// it first), so the refused mint is shown on the issuer; the execution path's refusal is
+/// `m18_cover_is_bound_to_the_executed_revision`. Exactly one write leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m18_superseded_approval_mints_no_cover() -> TestResult {
     let pause = Pause::new();
     let h = Harness::builder()
         .jira("jira-main")
@@ -1551,7 +1631,8 @@ async fn m18_superseded_approval_cannot_send() -> TestResult {
     let mock = jira(&h)?;
     myself_first_slow(mock, 1500, 200).await;
     comment_ok(mock).await;
-    let set = h.engine().committed().clone();
+    let set = h.committed().clone();
+    let issuer = CoverIssuer::new(Arc::new(StoreProbe(set.clone())));
     let id = queued(&h, COMMENT, comment_params()).await?;
     let first = h.approver().rev(&id).map_err(de)?.counter;
     h.approver().approve(&id).map_err(de)?;
@@ -1564,6 +1645,7 @@ async fn m18_superseded_approval_cannot_send() -> TestResult {
         .await
         .map_err(|e| format!("{e:?}"))?;
     assert!(!set.write_approved(&id, first), "a returned write");
+    assert_eq!(issuer.for_write(&id, first).err(), Some(NotCommitted));
     let item = rev_after(&h, &id, first + 1).await?;
     assert!(item.approvable);
     let second = item.candidate_rev.counter;
@@ -1571,8 +1653,8 @@ async fn m18_superseded_approval_cannot_send() -> TestResult {
     h.approver().approve(&id).map_err(de)?;
     let executing = async {
         reached(&pause).await?;
-        assert!(!set.write_approved(&id, first));
-        assert!(set.write_approved(&id, second));
+        assert_eq!(issuer.for_write(&id, first).err(), Some(NotCommitted));
+        assert!(issuer.for_write(&id, second).is_ok());
         assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 1);
         Ok::<(), TestError>(())
     }

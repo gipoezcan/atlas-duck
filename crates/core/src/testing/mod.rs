@@ -25,3 +25,13 @@ pub use harness::{
 };
 pub use runner::{FakeScriptRunner, ScriptPlan, host_call};
 pub use store::{FaultPlan, FaultyAudit, Freeze, ReadFault, RecordedEvent, TempStore};
+
+/// `audit_port::commit_records` for tests: crate-private outside `testing`, so no code outside
+/// `core` can mark a write approval in a committed set (T20 review m3).
+pub fn commit_records(
+    port: &dyn crate::audit_port::AuditPort,
+    set: &crate::audit_port::CommittedSet,
+    evs: Vec<atlas_duck_audit::NewEvent>,
+) -> Result<Vec<atlas_duck_audit::Committed>, atlas_duck_audit::AuditError> {
+    crate::audit_port::commit_records(port, set, evs)
+}

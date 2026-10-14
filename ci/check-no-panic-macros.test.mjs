@@ -164,7 +164,7 @@ const ENGINE_WRITE = "crates/core/src/engine/write.rs";
 
 test("for_write( only in engine/write.rs and its definition in cover.rs", () => {
   const call = "let cover = engine.covers().for_write(&entry.head.request_id, approval.counter());";
-  assert.deepEqual(scanCoverMinting(ENGINE_WRITE, call), []);
+  assert.deepEqual(scanCoverMinting(ENGINE_WRITE, `async fn execute(e: &Engine) {\n    ${call}\n}`), []);
   assert.deepEqual(scanCoverMinting(ATLASSIAN_COVER, "pub fn for_write(&self, request_id: &str, candidate_counter: u64) {}"), []);
   for (const f of ["crates/core/src/engine/read.rs", "crates/core/src/decision/mod.rs", "crates/atlassian/src/client/write.rs", "app/src-tauri/src/main.rs"]) {
     assert.deepEqual(scanCoverMinting(f, `\n${call}`), [`${f}:2: CoverIssuer::for_write outside engine/write.rs`]);
@@ -188,8 +188,11 @@ test("a WriteCover literal outside cover.rs is a violation, a type use is not", 
     scanCoverMinting(f, "fn send(c: &WriteCover) -> Result<WriteCover, NotCommitted> { todo }\nlet v: Option<WriteCover> = None;"),
     [],
   );
-  // A return type or an impl header is followed by a brace, but constructs nothing.
-  assert.deepEqual(scanCoverMinting(f, "fn pass(c: WriteCover) -> WriteCover {\n    c\n}\nimpl Marker for WriteCover {}"), []);
+  // A return type or an impl header is followed by a brace, but constructs nothing (the impl is
+  // a violation of its own, see the T20 review m2 test below).
+  assert.deepEqual(scanCoverMinting(f, "fn pass(c: WriteCover) -> WriteCover {\n    c\n}\nimpl Marker for WriteCover {}"), [
+    `${f}:4: impl of a cover type outside cover.rs`,
+  ]);
   assert.deepEqual(
     scanCoverMinting(ATLASSIAN_COVER, "pub struct WriteCover {\n    request_id: String,\n}\nOk(WriteCover { request_id, candidate_counter })"),
     [],
@@ -201,6 +204,92 @@ test("renaming WriteCover on import is a violation outside the allowed files", (
   assert.deepEqual(scanCoverMinting(f, "use atlas_duck_atlassian::WriteCover as Cover;"), [
     `${f}:1: renamed import of a cover type`,
   ]);
+});
+
+// ---------- T20 review m2: names without a call, macros, aliases, impls ----------
+
+test("for_write named without a call or passed to a macro is a violation", () => {
+  const f = "crates/core/src/engine/mod.rs";
+  assert.deepEqual(scanCoverMinting(f, "let mint = CoverIssuer::for_write;\nlet c = mint(&issuer, id, 3);"), [
+    `${f}:1: CoverIssuer::for_write outside engine/write.rs`,
+  ]);
+  assert.deepEqual(scanCoverMinting(f, "let mint = issuer . for_write ;"), [`${f}:1: CoverIssuer::for_write outside engine/write.rs`]);
+  assert.deepEqual(scanCoverMinting(f, "macro_rules! call { ($i:ident) => { issuer.$i(id, 3) } }\nlet c = call!(for_write);"), [
+    `${f}:2: CoverIssuer::for_write outside engine/write.rs`,
+  ]);
+  assert.deepEqual(scanCoverMinting(f, "let c = mint![issuer, for_write, id];"), [`${f}:1: CoverIssuer::for_write outside engine/write.rs`]);
+  // Not the identifier: longer names, strings, comments.
+  assert.deepEqual(scanCoverMinting(f, 'let a = plan_for_write; let b = for_write_cover; let s = "for_write"; // for_write'), []);
+});
+
+test("in engine/write.rs for_write is allowed only in the body of fn execute", () => {
+  const f = ENGINE_WRITE;
+  const execute = [
+    "async fn execute(",
+    "    engine: &Arc<Engine>,",
+    "    approval: Approval,",
+    ") {",
+    "    if x { y(); }",
+    "    let Ok(cover) = engine.covers().for_write(&id, approval.rev) else { return; };",
+    "}",
+  ].join("\n");
+  assert.deepEqual(scanCoverMinting(f, execute), []);
+  const helper = "fn mint(e: &Engine, id: &str, n: u64) -> Result<WriteCover, NotCommitted> {\n    e.covers().for_write(id, n)\n}";
+  assert.deepEqual(scanCoverMinting(f, `${execute}\n${helper}`), [`${f}:9: CoverIssuer::for_write outside engine::write::execute`]);
+  assert.deepEqual(scanCoverMinting(f, "let f = CoverIssuer::for_write;"), [`${f}:1: CoverIssuer::for_write outside engine::write::execute`]);
+  // A function that only starts with `execute` is not it.
+  assert.equal(scanCoverMinting(f, "fn execute_other() {\n    e.covers().for_write(id, 1);\n}").length, 1);
+});
+
+test("in cover.rs for_write may only be defined", () => {
+  assert.deepEqual(scanCoverMinting(ATLASSIAN_COVER, "    pub fn for_write(\n        &self,\n    ) {}"), []);
+  assert.deepEqual(scanCoverMinting(ATLASSIAN_COVER, "fn other(&self) {\n    self.for_write(\"x\", 1);\n}"), [
+    `${ATLASSIAN_COVER}:2: for_write used in cover.rs outside its definition`,
+  ]);
+});
+
+test("CoverIssuer::new named without a call is a violation, in core.rs too", () => {
+  const f = "crates/core/src/engine/mod.rs";
+  assert.deepEqual(scanCoverMinting(f, "let make = CoverIssuer::new;\nlet c = make(Arc::new(Always));"), [
+    `${f}:1: CoverIssuer::new outside the composition root`,
+  ]);
+  assert.deepEqual(scanCoverMinting(CORE_ROOT, "let make = CoverIssuer::new;\nlet c = make(Arc::new(StoreProbe(set)));"), [
+    `${CORE_ROOT}:1: CoverIssuer::new outside the composition root (core.rs must pass Arc::new(audit_port::StoreProbe(..)))`,
+  ]);
+  assert.deepEqual(scanCoverMinting(f, "let x = CoverIssuer::new_thing(p);"), []);
+});
+
+test("aliases of a cover type are violations outside the allowed files", () => {
+  const f = "crates/core/src/engine/mod.rs";
+  for (const t of ["CoverIssuer", "WriteCover", "atlas_duck_atlassian::CoverIssuer", "CommitProbe", "AuditPort"]) {
+    assert.deepEqual(scanCoverMinting(f, `type Alias = ${t};`), [`${f}:1: type alias of a cover type`], t);
+  }
+  assert.deepEqual(scanCoverMinting(f, "pub(crate) type W<'a> = WriteCover;"), [`${f}:1: type alias of a cover type`]);
+  // `use .. as` of a cover type, in a group and through a module alias.
+  assert.deepEqual(scanCoverMinting(f, "use atlas_duck_atlassian::{AuditCover, CoverIssuer as Issuer};"), [
+    `${f}:1: renamed import of a cover type`,
+  ]);
+  assert.deepEqual(scanCoverMinting(f, "use atlas_duck_atlassian as at;\nlet c = at::CoverIssuer::new(p);\nlet w = at::cover::WriteCover { request_id, candidate_counter };"), [
+    `${f}:2: CoverIssuer::new outside the composition root`,
+    `${f}:3: WriteCover constructed outside cover.rs`,
+  ]);
+  // A type alias that only contains a cover type, or another alias, is not a rename.
+  assert.deepEqual(scanCoverMinting(f, "type Port = Arc<dyn AuditPort>;\ntype Covers = Vec<AuditCover>;"), []);
+  assert.deepEqual(scanCoverMinting(CORE_ROOT, "type P = CommitProbe;"), []);
+});
+
+test("an impl of WriteCover or CoverIssuer outside cover.rs is a violation", () => {
+  const f = "crates/atlassian/src/client/write.rs";
+  assert.deepEqual(scanCoverMinting(f, "impl Clone for WriteCover {\n    fn clone(&self) -> Self { todo!() }\n}"), [
+    `${f}:1: impl of a cover type outside cover.rs`,
+  ]);
+  assert.deepEqual(scanCoverMinting(f, "impl CoverIssuer {\n    fn mint(&self) -> AuditCover { Self::new(x) }\n}"), [
+    `${f}:1: impl of a cover type outside cover.rs`,
+  ]);
+  assert.equal(scanCoverMinting(f, "impl<T: Into<u64>> From<T> for crate::cover::WriteCover {}").length, 1);
+  // A method returning a cover inside another impl is not an impl of it.
+  assert.deepEqual(scanCoverMinting(f, "impl Client {\n    fn take(c: WriteCover) -> WriteCover { c }\n}"), []);
+  assert.deepEqual(scanCoverMinting(ATLASSIAN_COVER, "impl WriteCover {}\nimpl fmt::Debug for WriteCover {}\nimpl CoverIssuer {}"), []);
 });
 
 test("test code is exempt from the write-cover rules", () => {

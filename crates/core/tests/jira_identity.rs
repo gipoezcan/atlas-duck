@@ -846,7 +846,7 @@ async fn m18_every_jira_write_sends_only_under_its_write_cover() -> TestResult {
         };
         let (router, h) = row_server_with(&row, Timeouts::default(), hooks).await?;
         let (id, rev) = opened(&h, &row).await?;
-        let set = h.engine().committed().clone();
+        let set = h.committed().clone();
         h.approver().approve(&id).map_err(de)?;
         let held = async {
             tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())

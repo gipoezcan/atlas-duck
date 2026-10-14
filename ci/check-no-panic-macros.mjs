@@ -5,11 +5,14 @@
 //    (and audit's `src/testing.rs`) must not contain `todo!(`, `unimplemented!(`, `panic!(`,
 //    `.unwrap()` or `.expect(` (the clippy lints say the same; this is the check that does not
 //    depend on a lint attribute staying in place).
-// 2. Cover minting (Task 8/17 handoff): `CoverIssuer::new`, `CommitProbe` impls and `AuditPort`
-//    impls only in the composition root and `audit_port.rs`; write covers (M5 Task 20, M-18):
-//    `for_write(` only in `core/src/engine/write.rs` (and its definition in `cover.rs`), a
-//    `WriteCover` literal only in `cover.rs`. A text tripwire against mistakes, not against a
-//    malicious contributor: macro-generated impls are not seen.
+// 2. Cover minting (Task 8/17 handoff): `CoverIssuer::new` (called or named), `CommitProbe` impls
+//    and `AuditPort` impls only in the composition root and `audit_port.rs`; write covers (M5
+//    Task 20, M-18): the identifier `for_write` (called, named as a value, passed to a macro) only
+//    in the body of `core/src/engine/write.rs`'s `fn execute` (and its definition in `cover.rs`),
+//    a `WriteCover` literal and any impl of `WriteCover`/`CoverIssuer` only in `cover.rs`. A cover
+//    type may not be renamed (`use .. as`, `type X = ..`) outside the files allowed to mint. A
+//    text tripwire against mistakes, not against a malicious contributor: macro-generated impls
+//    and identifiers pasted together by a macro are not seen.
 //
 // Usage: node ci/check-no-panic-macros.mjs
 // Exit 0 = ok. Exit 1 = violations (one `file:line: text` per line on stdout).
@@ -35,7 +38,9 @@ export const COMPOSITION_ROOT = "crates/core/src/core.rs";
 export const ATLASSIAN_COVER_FILE = "crates/atlassian/src/cover.rs";
 /// M5 Task 20 (M-18, PD-56): `engine::write::execute` is the only `for_write` caller (and
 /// `cover.rs` defines it).
-export const FOR_WRITE_ALLOWED = [ATLASSIAN_COVER_FILE, "crates/core/src/engine/write.rs"];
+export const ENGINE_WRITE_FILE = "crates/core/src/engine/write.rs";
+export const FOR_WRITE_CALLER_FN = "execute";
+export const FOR_WRITE_ALLOWED = [ATLASSIAN_COVER_FILE, ENGINE_WRITE_FILE];
 
 const posix = (p) => p.split(sep).join("/");
 
@@ -155,6 +160,38 @@ export function removeCfgTest(code) {
 
 const lineOf = (code, index) => code.slice(0, index).split("\n").length;
 
+/**
+ * The `[start, end)` ranges of the bodies of every `fn <name>` in `code` (`stripNonCode` output):
+ * from the first `{` after the signature's parameter list to its matching `}`.
+ */
+export function fnBodies(code, name) {
+  const ranges = [];
+  const head = new RegExp(`\\bfn\\s+${name}\\s*[<(]`, "g");
+  let m;
+  while ((m = head.exec(code)) !== null) {
+    let j = m.index + m[0].length;
+    let parens = m[0].endsWith("(") ? 1 : 0;
+    // Generics and the parameter list; a `{` inside them (a const generic block) is skipped.
+    for (; j < code.length; j++) {
+      const c = code[j];
+      if (c === "(") parens++;
+      else if (c === ")") parens--;
+      else if (c === "{" && parens === 0) break;
+      else if (c === ";" && parens === 0) break;
+    }
+    if (code[j] !== "{") continue;
+    let depth = 0;
+    let k = j;
+    for (; k < code.length; k++) {
+      if (code[k] === "{") depth++;
+      else if (code[k] === "}" && --depth === 0) break;
+    }
+    ranges.push([j, k + 1]);
+    head.lastIndex = k + 1;
+  }
+  return ranges;
+}
+
 /** Panic-macro violations of one file: `file:line: <macro> outside test code`. */
 export function scanPanicMacros(file, src) {
   if (isTestFile(file)) return [];
@@ -184,14 +221,14 @@ export function scanCoverMinting(file, src) {
     while ((m = re.exec(code)) !== null) fn(m);
   };
 
+  // `CoverIssuer::new` called or named as a value (`let f = CoverIssuer::new;`).
+  const coverNew = /\bCoverIssuer\s*(?:>\s*)?::\s*new\b/g;
   if (!COVER_NEW_ALLOWED.includes(f)) {
-    each(/\bCoverIssuer\s*(?:>\s*)?::\s*new\s*\(/g, (m) =>
-      add(m.index, "CoverIssuer::new outside the composition root"),
-    );
+    each(coverNew, (m) => add(m.index, "CoverIssuer::new outside the composition root"));
   } else if (f === COMPOSITION_ROOT) {
-    each(/\bCoverIssuer\s*::\s*new\s*\(/g, (m) => {
+    each(coverNew, (m) => {
       const after = code.slice(m.index + m[0].length, m.index + m[0].length + 120);
-      if (!/^\s*Arc\s*::\s*new\s*\(\s*(?:audit_port\s*::\s*)?StoreProbe\s*\(/.test(after)) {
+      if (!/^\s*\(\s*Arc\s*::\s*new\s*\(\s*(?:audit_port\s*::\s*)?StoreProbe\s*\(/.test(after)) {
         add(m.index, "CoverIssuer::new outside the composition root (core.rs must pass Arc::new(audit_port::StoreProbe(..)))");
       }
     });
@@ -202,14 +239,39 @@ export function scanCoverMinting(file, src) {
   }
   if (f !== AUDIT_PORT_FILE && !COVER_NEW_ALLOWED.includes(f)) {
     each(/\b(?:CoverIssuer|CommitProbe|AuditPort|WriteCover)\s+as\b/g, (m) => add(m.index, "renamed import of a cover type"));
+    // `type I = CoverIssuer;` would make `I::new(..)` / `I { .. }` invisible to the rules here.
+    each(/\btype\s+\w+\s*(?:<[^=;]*>\s*)?=\s*(?:[\w:]+::)?(?:CoverIssuer|CommitProbe|AuditPort|WriteCover)\b/g, (m) =>
+      add(m.index, "type alias of a cover type"),
+    );
   }
+  // The identifier, not only a call: `let f = CoverIssuer::for_write;` and `m!(for_write)` name it
+  // too. `cover.rs` may only define it; `engine/write.rs` may name it in `fn execute` only.
+  const forWrite = /\bfor_write\b/g;
   if (!FOR_WRITE_ALLOWED.includes(f)) {
-    each(/\bfor_write\s*\(/g, (m) => add(m.index, "CoverIssuer::for_write outside engine/write.rs"));
+    each(forWrite, (m) => add(m.index, "CoverIssuer::for_write outside engine/write.rs"));
+  } else if (f === ENGINE_WRITE_FILE) {
+    const bodies = fnBodies(code, FOR_WRITE_CALLER_FN);
+    each(forWrite, (m) => {
+      if (!bodies.some(([s, e]) => m.index >= s && m.index < e)) {
+        add(m.index, `CoverIssuer::for_write outside engine::write::${FOR_WRITE_CALLER_FN}`);
+      }
+    });
+  } else {
+    each(forWrite, (m) => {
+      if (!/\bfn\s+$/.test(code.slice(Math.max(0, m.index - 16), m.index))) {
+        add(m.index, "for_write used in cover.rs outside its definition");
+      }
+    });
   }
   if (f !== ATLASSIAN_COVER_FILE) {
     // A struct literal or a tuple-struct call; a return type (`-> WriteCover {`) and an impl
     // header (`for WriteCover {`) construct nothing.
     each(/(?<!->\s*)(?<!\bfor\s+)\bWriteCover\s*[{(]/g, (m) => add(m.index, "WriteCover constructed outside cover.rs"));
+    // `impl Clone for WriteCover`, or an inherent block whose `Self::new(..)` / `Self { .. }`
+    // the rules above do not see.
+    each(/\bimpl\b(?:\s*<[^>{;]*>)?\s+(?:[^{;]*?\bfor\s+)?(?:[\w:]+::)?(?:CoverIssuer|WriteCover)\s*\{/g, (m) =>
+      add(m.index, "impl of a cover type outside cover.rs"),
+    );
   }
   return found.sort((a, b) => a.index - b.index).map((x) => x.text);
 }

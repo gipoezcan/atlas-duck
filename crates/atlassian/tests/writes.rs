@@ -32,8 +32,11 @@ fn spec(method: &str, url: &str, content_type: Option<&str>, body: &[u8]) -> Htt
     }
 }
 
+/// The write `test_write_cover()` covers: revision 1 of `req_test`.
 fn json_op(s: HttpRequestSpec) -> ApprovedWrite {
     ApprovedWrite {
+        request_id: "req_test".into(),
+        candidate_counter: 1,
         requests: vec![s],
         success: SuccessExpectation {
             statuses: None,
@@ -44,6 +47,8 @@ fn json_op(s: HttpRequestSpec) -> ApprovedWrite {
 
 fn empty_op(s: HttpRequestSpec, status: u16) -> ApprovedWrite {
     ApprovedWrite {
+        request_id: "req_test".into(),
+        candidate_counter: 1,
         requests: vec![s],
         success: SuccessExpectation {
             statuses: Some(vec![status]),
@@ -123,7 +128,7 @@ async fn u03_send_approved_sends_exactly_the_list() -> TestResult {
 
     let out = t
         .client
-        .send_approved(&test_write_cover()?, &json_op(s.clone()))
+        .send_approved(test_write_cover()?, &json_op(s.clone()))
         .await;
     assert_eq!(
         out,
@@ -193,7 +198,7 @@ async fn u03_wire_bytes_equal_the_list_entry() -> TestResult {
     );
     let out = t
         .client
-        .send_approved(&test_write_cover()?, &json_op(s.clone()))
+        .send_approved(test_write_cover()?, &json_op(s.clone()))
         .await;
     assert!(matches!(out, WriteOutcome::Executed { .. }), "{out:?}");
 
@@ -293,7 +298,7 @@ async fn mismatch_is_not_sent() -> TestResult {
         let s = HttpRequestSpec { index: 7, ..s };
         assert_eq!(
             t.client
-                .send_approved(&test_write_cover()?, &json_op(s.clone()))
+                .send_approved(test_write_cover()?, &json_op(s.clone()))
                 .await,
             WriteOutcome::RefusedMismatch { request_index: 7 },
             "{:?} {}",
@@ -307,11 +312,55 @@ async fn mismatch_is_not_sent() -> TestResult {
     let ok = t
         .client
         .send_approved(
-            &cover,
+            cover,
             &json_op(spec("POST", &good, Some("application/json"), b"{}")),
         )
         .await;
     assert!(matches!(ok, WriteOutcome::Executed { .. }), "{ok:?}");
+    assert_eq!(dc.received().await.len(), 1);
+    Ok(())
+}
+
+/// T20 review m1: a write cover sends only the write it was minted for. A cover of another write,
+/// or of another revision of this one, is refused before anything leaves (`RefusedMismatch`).
+#[tokio::test]
+async fn m18_write_cover_is_bound_to_its_write() -> TestResult {
+    let dc = MockDc::start(Product::Jira, "").await;
+    dc.json("/rest/api/2/issue/ABC-1/comment", 201, JIRA_COMMENT)
+        .await;
+    let t = test_client(dc.client_config())?;
+    let url = url_for(
+        &dc,
+        "/rest/api/2/issue/{key}/comment",
+        json!({"key": "ABC-1"}),
+    )?;
+    let s = HttpRequestSpec {
+        index: 4,
+        ..spec("POST", &url, Some("application/json"), b"{}")
+    };
+    let other_write = ApprovedWrite {
+        request_id: "req_other".into(),
+        ..json_op(s.clone())
+    };
+    let other_revision = ApprovedWrite {
+        candidate_counter: 2,
+        ..json_op(s.clone())
+    };
+    for w in [other_write, other_revision] {
+        assert_eq!(
+            t.client.send_approved(test_write_cover()?, &w).await,
+            WriteOutcome::RefusedMismatch { request_index: 4 },
+            "{w:?}"
+        );
+    }
+    assert!(dc.received().await.is_empty());
+
+    // The control: the write the cover was minted for is sent.
+    let out = t
+        .client
+        .send_approved(test_write_cover()?, &json_op(s))
+        .await;
+    assert!(matches!(out, WriteOutcome::Executed { .. }), "{out:?}");
     assert_eq!(dc.received().await.len(), 1);
     Ok(())
 }
@@ -329,12 +378,12 @@ async fn lists_other_than_one_request_are_refused() -> TestResult {
     let mut w = json_op(one.clone());
     w.requests.clear();
     assert_eq!(
-        t.client.send_approved(&test_write_cover()?, &w).await,
+        t.client.send_approved(test_write_cover()?, &w).await,
         WriteOutcome::RefusedMismatch { request_index: 0 }
     );
     w.requests = vec![one.clone(), HttpRequestSpec { index: 1, ..one }];
     assert_eq!(
-        t.client.send_approved(&test_write_cover()?, &w).await,
+        t.client.send_approved(test_write_cover()?, &w).await,
         WriteOutcome::RefusedMismatch { request_index: 0 }
     );
     assert!(dc.received().await.is_empty());
@@ -350,7 +399,7 @@ async fn origin_guard_refuses_an_approved_url_outside_the_base() -> TestResult {
     let out = t
         .client
         .send_approved(
-            &test_write_cover()?,
+            test_write_cover()?,
             &json_op(spec("PUT", &outside, Some("application/json"), b"{}")),
         )
         .await;
@@ -379,7 +428,7 @@ async fn i25_declared_empty_201_executed() -> TestResult {
     );
     assert_eq!(
         t.client
-            .send_approved(&test_write_cover()?, &empty_op(s, 201))
+            .send_approved(test_write_cover()?, &empty_op(s, 201))
             .await,
         WriteOutcome::Executed {
             response: UpstreamResponse {
@@ -415,7 +464,7 @@ async fn i25_declared_empty_204_with_json_content_type_executed() -> TestResult 
     );
     match t
         .client
-        .send_approved(&test_write_cover()?, &empty_op(s, 204))
+        .send_approved(test_write_cover()?, &empty_op(s, 204))
         .await
     {
         WriteOutcome::Executed { response, .. } => {
@@ -435,7 +484,7 @@ async fn i25_html_body_on_empty_op_outcome_unknown() -> TestResult {
     let s = spec("POST", &url, Some("application/json"), b"{}");
     assert_eq!(
         t.client
-            .send_approved(&test_write_cover()?, &empty_op(s, 201))
+            .send_approved(test_write_cover()?, &empty_op(s, 201))
             .await,
         unknown_status(UnknownReason::UndeclaredSuccess, 201)
     );
@@ -451,7 +500,6 @@ async fn i25_empty_200_on_json_op_outcome_unknown() -> TestResult {
     dc.json("/rest/api/content/3", 200, "{not json").await;
     dc.empty("/rest/api/content/4/label/x", 200, None).await;
     let t = test_client(dc.client_config())?;
-    let cover = test_write_cover()?;
     for p in [
         "/rest/api/content",
         "/rest/api/content/2",
@@ -464,7 +512,9 @@ async fn i25_empty_200_on_json_op_outcome_unknown() -> TestResult {
             b"{}",
         );
         assert_eq!(
-            t.client.send_approved(&cover, &json_op(s)).await,
+            t.client
+                .send_approved(test_write_cover()?, &json_op(s))
+                .await,
             unknown_status(UnknownReason::UndeclaredSuccess, 200),
             "{p}"
         );
@@ -477,7 +527,9 @@ async fn i25_empty_200_on_json_op_outcome_unknown() -> TestResult {
         b"",
     );
     assert_eq!(
-        t.client.send_approved(&cover, &empty_op(s, 204)).await,
+        t.client
+            .send_approved(test_write_cover()?, &empty_op(s, 204))
+            .await,
         unknown_status(UnknownReason::UndeclaredSuccess, 200)
     );
     Ok(())
@@ -496,7 +548,7 @@ async fn write_3xx_unavailable() -> TestResult {
     );
     assert_eq!(
         t.client
-            .send_approved(&test_write_cover()?, &json_op(s))
+            .send_approved(test_write_cover()?, &json_op(s))
             .await,
         WriteOutcome::Unavailable3xx { request_index: 0 }
     );
@@ -528,7 +580,7 @@ async fn write_409_version_conflict() -> TestResult {
     let t = test_client(dc.client_config())?;
     assert_eq!(
         t.client
-            .send_approved(&test_write_cover()?, &json_op(page_update(&dc)?))
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
             .await,
         WriteOutcome::VersionConflict { request_index: 0 }
     );
@@ -537,7 +589,6 @@ async fn write_409_version_conflict() -> TestResult {
 
 #[tokio::test]
 async fn write_400_version_message_conflict() -> TestResult {
-    let cover = test_write_cover()?;
     for body in [
         CONFLUENCE_VERSION_CONFLICT_400,
         r#"{"errorMessages":["Version conflict: the page was changed"]}"#,
@@ -548,7 +599,7 @@ async fn write_400_version_message_conflict() -> TestResult {
         let t = test_client(dc.client_config())?;
         assert_eq!(
             t.client
-                .send_approved(&cover, &json_op(page_update(&dc)?))
+                .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
                 .await,
             WriteOutcome::VersionConflict { request_index: 0 },
             "{body}"
@@ -559,14 +610,13 @@ async fn write_400_version_message_conflict() -> TestResult {
 
 #[tokio::test]
 async fn write_400_other_failed4xx() -> TestResult {
-    let cover = test_write_cover()?;
     let dc = MockDc::start(Product::Confluence, "").await;
     dc.json("/rest/api/content/65537", 400, CONFLUENCE_ERROR_400)
         .await;
     let t = test_client(dc.client_config())?;
     assert_eq!(
         t.client
-            .send_approved(&cover, &json_op(page_update(&dc)?))
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
             .await,
         WriteOutcome::Failed4xx {
             response: UpstreamResponse {
@@ -589,7 +639,7 @@ async fn write_400_other_failed4xx() -> TestResult {
     let t = test_client(dc.client_config())?;
     assert!(matches!(
         t.client
-            .send_approved(&cover, &json_op(page_update(&dc)?))
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
             .await,
         WriteOutcome::Failed4xx { .. }
     ));
@@ -609,7 +659,11 @@ async fn write_400_other_failed4xx() -> TestResult {
             Some("application/json"),
             b"{}",
         );
-        match t.client.send_approved(&cover, &json_op(s)).await {
+        match t
+            .client
+            .send_approved(test_write_cover()?, &json_op(s))
+            .await
+        {
             WriteOutcome::Failed4xx {
                 response,
                 request_index: 0,
@@ -635,7 +689,7 @@ async fn write_non_json_401_is_failed4xx() -> TestResult {
     let t = test_client(dc.client_config())?;
     assert_eq!(
         t.client
-            .send_approved(&test_write_cover()?, &json_op(page_update(&dc)?))
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
             .await,
         WriteOutcome::Failed4xx {
             response: UpstreamResponse {
@@ -670,7 +724,7 @@ async fn write_answered(
     let ctl = FetchControl::new();
     let out = t
         .client
-        .send_approved_ctl(&test_write_cover()?, &op(s), &ctl)
+        .send_approved_ctl(test_write_cover()?, &op(s), &ctl)
         .await;
     Ok((out, ctl.take_captured().partial))
 }
@@ -774,7 +828,7 @@ async fn write_cancelled_during_the_response_body_is_unknown() -> TestResult {
     let ctl = FetchControl::new();
     let task = {
         let (client, cover, ctl) = (t.client.clone(), test_write_cover()?, ctl.clone());
-        tokio::spawn(async move { client.send_approved_ctl(&cover, &w, &ctl).await })
+        tokio::spawn(async move { client.send_approved_ctl(cover, &w, &ctl).await })
     };
     let mut arrived = false;
     for _ in 0..500 {
@@ -803,7 +857,7 @@ async fn write_presend_retry_succeeds() -> TestResult {
     let t = test_client(cfg)?;
     let url = format!("{}/rest/api/content/1", tls.base_url());
     let w = json_op(spec("PUT", &url, Some("application/json"), b"{}"));
-    let out = t.client.send_approved(&test_write_cover()?, &w).await;
+    let out = t.client.send_approved(test_write_cover()?, &w).await;
     assert!(matches!(out, WriteOutcome::Executed { .. }), "{out:?}");
     assert_eq!(tls.connections(), 2);
     assert_eq!(tls.handshakes(), 1);
@@ -812,7 +866,6 @@ async fn write_presend_retry_succeeds() -> TestResult {
 
 #[tokio::test]
 async fn write_json_401_needs_token() -> TestResult {
-    let cover = test_write_cover()?;
     let dc = MockDc::start(Product::Confluence, "").await;
     dc.json(
         "/rest/api/content/65537",
@@ -823,7 +876,7 @@ async fn write_json_401_needs_token() -> TestResult {
     let t = test_client(dc.client_config())?;
     assert_eq!(
         t.client
-            .send_approved(&cover, &json_op(page_update(&dc)?))
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
             .await,
         WriteOutcome::NeedsToken
     );
@@ -849,7 +902,9 @@ async fn write_json_401_needs_token() -> TestResult {
         b"{}",
     );
     assert_eq!(
-        t.client.send_approved(&cover, &json_op(s)).await,
+        t.client
+            .send_approved(test_write_cover()?, &json_op(s))
+            .await,
         WriteOutcome::NeedsToken
     );
     Ok(())
@@ -857,7 +912,6 @@ async fn write_json_401_needs_token() -> TestResult {
 
 #[tokio::test]
 async fn write_5xx_outcome_unknown() -> TestResult {
-    let cover = test_write_cover()?;
     let dc = MockDc::start(Product::Confluence, "").await;
     dc.json("/rest/api/content/65537", 503, r#"{"message":"down"}"#)
         .await;
@@ -865,7 +919,7 @@ async fn write_5xx_outcome_unknown() -> TestResult {
     let t = test_client(dc.client_config())?;
     assert_eq!(
         t.client
-            .send_approved(&cover, &json_op(page_update(&dc)?))
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
             .await,
         unknown_status(UnknownReason::ServerError5xx, 503)
     );
@@ -876,7 +930,9 @@ async fn write_5xx_outcome_unknown() -> TestResult {
         b"{}",
     );
     assert_eq!(
-        t.client.send_approved(&cover, &json_op(s)).await,
+        t.client
+            .send_approved(test_write_cover()?, &json_op(s))
+            .await,
         unknown_status(UnknownReason::ServerError5xx, 500)
     );
     Ok(())
@@ -894,7 +950,7 @@ async fn write_timeout_after_send_outcome_unknown() -> TestResult {
     assert_eq!(
         t.client
             .send_approved_ctl(
-                &test_write_cover()?,
+                test_write_cover()?,
                 &json_op(spec("PUT", &url, Some("application/json"), b"{}")),
                 &ctl
             )
@@ -925,7 +981,7 @@ async fn write_timeout_after_send_outcome_unknown() -> TestResult {
     let out = t
         .client
         .send_approved(
-            &test_write_cover()?,
+            test_write_cover()?,
             &json_op(spec("PUT", &url, Some("application/json"), b"{}")),
         )
         .await;
@@ -945,7 +1001,7 @@ async fn write_timeout_after_send_outcome_unknown() -> TestResult {
     assert_eq!(
         t.client
             .send_approved(
-                &test_write_cover()?,
+                test_write_cover()?,
                 &json_op(spec("PUT", &url, Some("application/json"), b"{}"))
             )
             .await,
@@ -980,7 +1036,7 @@ async fn write_identity_anonymous_outcome_unknown() -> TestResult {
         let c = test_client(dc.client_config())?;
         let mut w = success;
         w.requests[0].resolved_url = url_for(&dc, "/rest/api/2/issue", json!({}))?;
-        Ok(c.client.send_approved(&test_write_cover()?, &w).await)
+        Ok(c.client.send_approved(test_write_cover()?, &w).await)
     }
     let s = spec("POST", "", Some("application/json"), b"{}");
     let mismatch = |u: Option<&str>, status: u16| {
@@ -1041,7 +1097,7 @@ async fn write_identity_anonymous_outcome_unknown() -> TestResult {
     let t = test_client(dc.client_config())?;
     assert!(matches!(
         t.client
-            .send_approved(&test_write_cover()?, &json_op(page_update(&dc)?))
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
             .await,
         WriteOutcome::Executed {
             server_user: None,
@@ -1077,7 +1133,7 @@ async fn write_presend_connection_not_sent() -> TestResult {
     assert_eq!(
         t.client
             .send_approved_ctl(
-                &test_write_cover()?,
+                test_write_cover()?,
                 &json_op(spec("PUT", &url, Some("application/json"), b"{}")),
                 &ctl
             )
@@ -1098,7 +1154,7 @@ async fn write_presend_connection_not_sent() -> TestResult {
     assert_eq!(
         t.client
             .send_approved(
-                &test_write_cover()?,
+                test_write_cover()?,
                 &json_op(spec(
                     "PUT",
                     &format!("{base}/rest/api/content/1"),
@@ -1142,7 +1198,7 @@ async fn write_429_retried() -> TestResult {
     );
     assert!(matches!(
         t.client
-            .send_approved(&test_write_cover()?, &json_op(s.clone()))
+            .send_approved(test_write_cover()?, &json_op(s.clone()))
             .await,
         WriteOutcome::Executed { .. }
     ));
@@ -1168,7 +1224,7 @@ async fn write_429_retried() -> TestResult {
     let t = test_client(dc.client_config())?;
     match t
         .client
-        .send_approved(&test_write_cover()?, &json_op(page_update(&dc)?))
+        .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
         .await
     {
         WriteOutcome::Failed4xx { response, .. } => assert_eq!(response.status, 429),
@@ -1195,7 +1251,6 @@ async fn write_waiting_for_a_permit_is_not_sent() -> TestResult {
     cfg.timeouts.write = Duration::from_millis(200);
     let t = test_client(cfg)?;
     let cover = test_cover()?;
-    let write_cover = test_write_cover()?;
     let mut held = Vec::new();
     for _ in 0..4 {
         let (client, cover) = (t.client.clone(), cover.clone());
@@ -1220,7 +1275,9 @@ async fn write_waiting_for_a_permit_is_not_sent() -> TestResult {
 
     let ctl = FetchControl::new();
     assert_eq!(
-        t.client.send_approved_ctl(&write_cover, &w, &ctl).await,
+        t.client
+            .send_approved_ctl(test_write_cover()?, &w, &ctl)
+            .await,
         WriteOutcome::NotSent {
             reason: NotSentReason::BudgetExpired
         }
@@ -1230,7 +1287,9 @@ async fn write_waiting_for_a_permit_is_not_sent() -> TestResult {
     let ctl = FetchControl::new();
     ctl.cancel();
     assert_eq!(
-        t.client.send_approved_ctl(&write_cover, &w, &ctl).await,
+        t.client
+            .send_approved_ctl(test_write_cover()?, &w, &ctl)
+            .await,
         WriteOutcome::NotSent {
             reason: NotSentReason::Cancelled
         }

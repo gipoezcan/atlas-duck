@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use super::classify::{ConnFlags, execute_error_class, is_json_content_type, retry_after_wait};
 use super::limiter::Acquired;
 use super::{FetchControl, InstanceClient, Product, Timeouts};
-use crate::cover::{AuditCover, Proof};
+use crate::cover::{AuditCover, WriteCover};
 use crate::credentials::{PatSecret, StoredCredential};
 use crate::guard::{Outgoing, SendMode, method_guard};
 use crate::identity::check_jira_header;
@@ -31,11 +31,16 @@ pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 /// §7.2: at most 3 retries of a `429`.
 const MAX_429_RETRIES: u32 = 3;
 
-/// What one call writes.
+/// What one call writes, with the proof that covers it (§5.1 inv. 1 and 3). Each kind carries its
+/// own proof type, so no target exists without it: nothing in this crate can send an approved
+/// write under a request cover (T20 review I1). The borrow is the proof; nothing reads it.
 pub(crate) enum Target<'a> {
     /// A read: `GET`, or the allowlisted search `POST`, built from an endpoint template under the
     /// base URL.
     Template {
+        /// The committed request or system-fetch start record.
+        #[allow(dead_code)]
+        cover: &'a AuditCover,
         method: reqwest::Method,
         template: &'a str,
         params: &'a serde_json::Value,
@@ -44,7 +49,12 @@ pub(crate) enum Target<'a> {
         json_body: Option<Vec<u8>>,
     },
     /// One approved write request, written exactly as listed (§5.1 invariant 3).
-    Approved(&'a HttpRequestSpec),
+    Approved {
+        spec: &'a HttpRequestSpec,
+        /// The committed `WRITE_APPROVED` of this write and revision (Δ6, M-18).
+        #[allow(dead_code)]
+        cover: &'a WriteCover,
+    },
 }
 
 impl Target<'_> {
@@ -53,7 +63,7 @@ impl Target<'_> {
             Target::Template { template, .. } => SendMode::Read {
                 path_template: template,
             },
-            Target::Approved(spec) => SendMode::ApprovedWrite(spec),
+            Target::Approved { spec, .. } => SendMode::ApprovedWrite(spec),
         }
     }
 
@@ -61,7 +71,7 @@ impl Target<'_> {
     fn per_call(&self, t: &Timeouts) -> Duration {
         match self {
             Target::Template { .. } => t.per_call,
-            Target::Approved(_) => t.write,
+            Target::Approved { .. } => t.write,
         }
     }
 }
@@ -168,13 +178,8 @@ fn guard(mode: &SendMode<'_>, request: &reqwest::Request) -> Result<(), FetchFai
 const X_ATLASSIAN_TOKEN: &str = "X-Atlassian-Token";
 
 impl InstanceClient {
-    pub(crate) async fn send_one(
-        &self,
-        cover: &AuditCover,
-        req: OneRequest<'_>,
-        ctl: &FetchControl,
-    ) -> FetchOutcome {
-        let ex = match self.exchange(Proof::Start(cover), &req, ctl).await {
+    pub(crate) async fn send_one(&self, req: OneRequest<'_>, ctl: &FetchControl) -> FetchOutcome {
+        let ex = match self.exchange(&req, ctl).await {
             Ok(ex) => ex,
             Err(f) => return failed(f),
         };
@@ -202,6 +207,7 @@ impl InstanceClient {
                 params,
                 query,
                 json_body,
+                ..
             } => {
                 // A URL that cannot be built under the base is refused like an origin mismatch.
                 fn refused<E>(_: E) -> FetchFailure {
@@ -219,7 +225,7 @@ impl InstanceClient {
                 }
                 b.build().map_err(refused)
             }
-            Target::Approved(spec) => {
+            Target::Approved { spec, .. } => {
                 // Whatever cannot be written exactly as listed is a mismatch; nothing leaves.
                 fn refused<E>(_: E) -> FetchFailure {
                     FetchFailure::MethodGuardRefused
@@ -241,16 +247,13 @@ impl InstanceClient {
     }
 
     /// Steps 1 to 5: guards, limiter, send, `Date`, `429` retries. Every `Err` is a complete
-    /// failure; `Ok` holds the response that is not retried, its body unread.
+    /// failure; `Ok` holds the response that is not retried, its body unread. The target carries
+    /// the proof of its committed covering record (§5.1 inv. 1 and 3).
     pub(crate) async fn exchange(
         &self,
-        proof: Proof<'_>,
         req: &OneRequest<'_>,
         ctl: &FetchControl,
     ) -> Result<Exchange<'_>, FetchFailure> {
-        // Holding a cover is the proof of a committed start record, or for the approved write of
-        // its committed `WRITE_APPROVED` (§5.1 inv. 1 and 3).
-        let _ = proof;
         let mode = req.target.mode();
 
         // Step 1: the request as it will be written, the method guard on it, the credential, the

@@ -2,8 +2,11 @@
 //! committed `WRITE_APPROVED` of exactly that revision of that write (§5.1 inv. 1 and 3).
 //!
 //! The compile-time half (`request_cover_is_not_a_write_cover`: an `AuditCover` handed to
-//! `send_approved` does not compile; no `WriteCover` literal outside `cover.rs`; not `Clone`) is
-//! the `compile_fail` doctests on `InstanceClient::send_approved` and on `WriteCover`.
+//! `send_approved` does not compile; `write_cover_is_used_once`: a cover cannot be sent twice; no
+//! `WriteCover` literal outside `cover.rs`; not `Clone`) is the `compile_fail` doctests on
+//! `InstanceClient::send_approved` and on `WriteCover`. Inside the crate every send target carries
+//! the proof of its own kind (`client/send.rs` `Target`); the binding of a cover to the write it
+//! sends is `tests/writes.rs` `m18_write_cover_is_bound_to_its_write`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};

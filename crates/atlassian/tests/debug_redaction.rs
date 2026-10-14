@@ -58,6 +58,8 @@ fn debug_output_never_contains_sentinel() -> Result<(), Box<dyn std::error::Erro
         format!(
             "{:?}",
             ApprovedWrite {
+                request_id: "req_test".into(),
+                candidate_counter: 1,
                 requests: vec![spec],
                 success: SuccessExpectation {
                     statuses: None,

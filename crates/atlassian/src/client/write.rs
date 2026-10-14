@@ -13,7 +13,7 @@ use super::send::{
     BodyRead, Exchange, MAX_RESPONSE_BYTES, OneRequest, Target, ausernames, header_text, read_body,
 };
 use super::{FetchControl, InstanceClient, Product};
-use crate::cover::{Proof, WriteCover};
+use crate::cover::WriteCover;
 use crate::identity::check_jira_header;
 use crate::types::{
     ApprovedWrite, ExpectedBody, FetchFailure, HttpRequestSpec, IdentityObserved, NotSentReason,
@@ -31,13 +31,26 @@ impl InstanceClient {
     /// ```compile_fail,E0308
     /// # async fn f(
     /// #     c: &atlas_duck_atlassian::InstanceClient,
-    /// #     cover: &atlas_duck_atlassian::AuditCover,
+    /// #     cover: atlas_duck_atlassian::AuditCover,
     /// #     w: &atlas_duck_atlassian::ApprovedWrite,
     /// # ) {
     /// let _ = c.send_approved(cover, w).await;
     /// # }
     /// ```
-    pub async fn send_approved(&self, cover: &WriteCover, w: &ApprovedWrite) -> WriteOutcome {
+    ///
+    /// The cover is consumed by the send: one cover, one send (`write_cover_is_used_once`):
+    ///
+    /// ```compile_fail,E0382
+    /// # async fn f(
+    /// #     c: &atlas_duck_atlassian::InstanceClient,
+    /// #     cover: atlas_duck_atlassian::WriteCover,
+    /// #     w: &atlas_duck_atlassian::ApprovedWrite,
+    /// # ) {
+    /// let _ = c.send_approved(cover, w).await;
+    /// let _ = c.send_approved(cover, w).await;
+    /// # }
+    /// ```
+    pub async fn send_approved(&self, cover: WriteCover, w: &ApprovedWrite) -> WriteOutcome {
         self.send_approved_ctl(cover, w, &FetchControl::new()).await
     }
 
@@ -46,28 +59,37 @@ impl InstanceClient {
     ///
     /// §5.1 invariant 3: every v1 write maps to exactly one HTTP request. A list with no entry or
     /// with several is refused whole (`RefusedMismatch`, nothing sent): a single `WriteOutcome`
-    /// cannot say which requests of a partly executed list took effect.
+    /// cannot say which requests of a partly executed list took effect. So is a write the cover
+    /// was not minted for (another request, another revision; T20 review m1).
     pub async fn send_approved_ctl(
         &self,
-        cover: &WriteCover,
+        cover: WriteCover,
         w: &ApprovedWrite,
         ctl: &FetchControl,
     ) -> WriteOutcome {
+        let refused = || WriteOutcome::RefusedMismatch {
+            request_index: w.requests.first().map_or(0, |s| s.index),
+        };
+        if !cover.covers(w) {
+            return refused();
+        }
         let [spec] = w.requests.as_slice() else {
-            return WriteOutcome::RefusedMismatch {
-                request_index: w.requests.first().map_or(0, |s| s.index),
-            };
+            return refused();
         };
         let budget_end = Instant::now() + self.cfg.timeouts.write;
+        // The one send of this cover; its pre-send retry below is the same send (§5.4 step 6).
         let req = OneRequest {
-            target: Target::Approved(spec),
+            target: Target::Approved {
+                spec,
+                cover: &cover,
+            },
             overall: Some((budget_end, PostSendKind::PerCallTimeout)),
             max_response_bytes: MAX_RESPONSE_BYTES,
             cap_kind: PostSendKind::ResponseCap32MiB,
         };
         let mut retries = 0;
         loop {
-            match self.exchange(Proof::Write(cover), &req, ctl).await {
+            match self.exchange(&req, ctl).await {
                 Ok(ex) => return self.finish_write(ex, spec, &w.success, ctl).await,
                 Err(FetchFailure::PreSendConnection(_))
                     if retries < MAX_PRESEND_RETRIES && Instant::now() < budget_end =>

@@ -69,7 +69,7 @@ async fn validation_rejected_logs_received_then_rejected() -> TestResult {
     assert_eq!(rejected["code"], "validation");
     assert_eq!(rejected["details"]["param"], "key");
     // Rejected requests are never cover-ready (no request is ever sent under this id).
-    assert!(!h.engine().committed().request_committed(&id));
+    assert!(!h.committed().request_committed(&id));
     // Answered from the log afterwards: failed, reduced error.
     let st = h.status(&id).await;
     assert_eq!(st.status, Status::Failed);
@@ -280,7 +280,7 @@ async fn valid_read_is_pending_with_four_fields() -> TestResult {
     assert_eq!(v["instance"], "jira-main");
     let id = request_id(&env)?;
     // The request is cover-ready (its start record committed); the read fetches at once.
-    assert!(h.engine().committed().request_committed(&id));
+    assert!(h.committed().request_committed(&id));
     h.queued(&id, 5000).await.ok_or("never queued")?;
     let events = h.events(&id).await?;
     let (t, payload) = &events[0];
@@ -422,7 +422,7 @@ async fn await_times_out_pending_then_wakes_on_expiry() -> TestResult {
     );
     // Gone from memory, answered from the log; the id is no longer cover-ready.
     assert!(h.engine().entry(&id).is_none());
-    assert!(!h.engine().committed().request_committed(&id));
+    assert!(!h.committed().request_committed(&id));
     let st = h.status(&id).await;
     assert_eq!(st.status, Status::Expired);
     assert_eq!(code(&st), "expired");
@@ -730,7 +730,7 @@ async fn audit_failure_on_rejected_keeps_failed_in_memory() -> TestResult {
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
     let id = request_id(&env)?;
     assert_eq!(h.event_types(&id).await?, [EventType::REQUEST_RECEIVED]);
-    assert!(!h.engine().committed().request_committed(&id));
+    assert!(!h.committed().request_committed(&id));
     let st = h.status(&id).await;
     assert_eq!(st.status, Status::Failed);
     assert_eq!(code(&st), "audit_failure");
@@ -1157,7 +1157,7 @@ async fn submit_dropped_after_the_commit_still_lands() -> TestResult {
         .ok_or("the committed request never reached memory")?;
     assert_eq!(entry.agent_status(), Status::Pending);
     let id = entry.head.request_id.clone();
-    assert!(h.engine().committed().request_committed(&id));
+    assert!(h.committed().request_committed(&id));
     assert_eq!(h.status(&id).await.status, Status::Pending);
     // A dropped submit whose request is rejected still logs the rejection.
     let rejected_before = count_of(EventType::REQUEST_REJECTED).await?;

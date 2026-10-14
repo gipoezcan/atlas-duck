@@ -7,6 +7,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
+use crate::types::ApprovedWrite;
+
 /// Proof of a committed `REQUEST_RECEIVED` / `SCRIPT_STARTED` / `SYSTEM_FETCH` start record.
 ///
 /// No public fields, no public constructor, not `Default`, not `Deserialize`: the only way to
@@ -58,7 +60,8 @@ impl fmt::Debug for AuditCover {
 ///
 /// No public fields, no public constructor, not `Clone`, not `Default`, not `Deserialize`: the only
 /// way to obtain one is `CoverIssuer::for_write`, whose probe answers `true` only for the latest
-/// committed approval of that write.
+/// committed approval of that write. `send_approved` takes it by value (one cover, one send) and
+/// sends only the `ApprovedWrite` of the same `request_id` and `candidate_counter` (T20 review m1).
 ///
 /// ```compile_fail,E0451
 /// let _ = atlas_duck_atlassian::WriteCover { request_id: String::new(), candidate_counter: 1 };
@@ -81,6 +84,11 @@ impl WriteCover {
     pub fn candidate_counter(&self) -> u64 {
         self.candidate_counter
     }
+
+    /// The cover was minted for exactly this write and revision.
+    pub(crate) fn covers(&self, w: &ApprovedWrite) -> bool {
+        self.request_id == w.request_id && self.candidate_counter == w.candidate_counter
+    }
 }
 
 impl fmt::Debug for WriteCover {
@@ -91,15 +99,6 @@ impl fmt::Debug for WriteCover {
             self.request_id, self.candidate_counter
         )
     }
-}
-
-/// What the client's send path takes as the proof of a committed covering record. The borrow is
-/// the proof; nothing reads it.
-pub(crate) enum Proof<'a> {
-    /// A GET or the read `POST` (request or system-fetch start record).
-    Start(#[allow(dead_code)] &'a AuditCover),
-    /// The approved write (its committed `WRITE_APPROVED`).
-    Write(#[allow(dead_code)] &'a WriteCover),
 }
 
 /// Answers from the set of ids whose start record `core` has durably committed, and from the

@@ -166,6 +166,7 @@ impl InstanceClient {
                     query.push((call.limit_param.clone(), want.to_string()));
                     let req = OneRequest {
                         target: Target::Template {
+                            cover,
                             method: reqwest::Method::GET,
                             template: &call.get.endpoint_template,
                             params: &call.get.params,
@@ -176,7 +177,7 @@ impl InstanceClient {
                         max_response_bytes: cap,
                         cap_kind,
                     };
-                    self.send_one(cover, req, ctl).await
+                    self.send_one(req, ctl).await
                 }
                 PageSource::Search { call, .. } => {
                     let mut body = call.body.clone();
@@ -191,6 +192,7 @@ impl InstanceClient {
                     };
                     let req = OneRequest {
                         target: Target::Template {
+                            cover,
                             method: reqwest::Method::POST,
                             template: &call.endpoint_template,
                             params: &Value::Null,
@@ -201,7 +203,7 @@ impl InstanceClient {
                         max_response_bytes: cap,
                         cap_kind,
                     };
-                    self.send_one(cover, req, ctl).await
+                    self.send_one(req, ctl).await
                 }
             };
 

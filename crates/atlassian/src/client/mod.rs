@@ -294,6 +294,7 @@ impl InstanceClient {
     ) -> FetchOutcome {
         let req = send::OneRequest {
             target: send::Target::Template {
+                cover,
                 method: reqwest::Method::GET,
                 template: &call.endpoint_template,
                 params: &call.params,
@@ -304,7 +305,7 @@ impl InstanceClient {
             max_response_bytes: send::MAX_RESPONSE_BYTES,
             cap_kind: PostSendKind::ResponseCap32MiB,
         };
-        self.send_one(cover, req, ctl).await
+        self.send_one(req, ctl).await
     }
 
     pub async fn post_search(&self, cover: &AuditCover, call: &SearchCall) -> FetchOutcome {
@@ -342,6 +343,7 @@ impl InstanceClient {
         };
         let req = send::OneRequest {
             target: send::Target::Template {
+                cover,
                 method: reqwest::Method::POST,
                 template: &call.endpoint_template,
                 params: &serde_json::Value::Null,
@@ -352,7 +354,7 @@ impl InstanceClient {
             max_response_bytes: send::MAX_RESPONSE_BYTES,
             cap_kind: PostSendKind::ResponseCap32MiB,
         };
-        self.send_one(cover, req, ctl).await
+        self.send_one(req, ctl).await
     }
 
     pub fn base(&self) -> &NormalizedBaseUrl {

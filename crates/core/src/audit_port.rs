@@ -273,7 +273,9 @@ pub fn commit_system_fetch_start(
 /// exists only for a committed approval of that revision. On `Err` nothing is marked. A
 /// `WRITE_APPROVED` without a `request_id` or an integer `candidate_rev.counter` refuses the
 /// whole call before anything is appended (`Invalid`). Every other record passes through.
-pub fn commit_records(
+/// Crate-private, like `Engine::committed` (T20 review m3): no code outside `core` can mark the
+/// engine's set; tests reach it through `testing::commit_records`.
+pub(crate) fn commit_records(
     port: &dyn AuditPort,
     set: &CommittedSet,
     mut evs: Vec<NewEvent>,
