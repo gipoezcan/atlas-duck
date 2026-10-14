@@ -55,6 +55,7 @@ atlas-duck-audit = { path = "../../crates/audit" }
 tauri-plugin-dialog = { workspace = true }
 tauri-plugin-single-instance = { workspace = true }
 tauri-plugin-autostart = { workspace = true }
+tauri-plugin-notification = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }

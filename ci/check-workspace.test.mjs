@@ -220,6 +220,37 @@ test("atlas-duck-app may depend on tauri", () => {
   assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), []);
 });
 
+test("app banned plugin dependency is rejected", () => {
+  for (const banned of [
+    "tauri-plugin-shell",
+    "tauri-plugin-fs",
+    "tauri-plugin-http",
+    "tauri-plugin-opener",
+    "tauri-plugin-clipboard-manager",
+    "tauri-plugin-updater",
+  ]) {
+    const e = baseEdges();
+    e["atlas-duck-app"] = ["tauri", banned];
+    assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), [
+      `atlas-duck-app: dependency ${banned} is banned (§10.3)`,
+    ]);
+  }
+  // The notification plugin is the one allowed plugin besides dialog, single-instance, autostart.
+  const e = baseEdges();
+  e["atlas-duck-app"] = ["tauri", "tauri-plugin-notification"];
+  assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), []);
+});
+
+test("tauri devtools feature is rejected", () => {
+  const e = baseEdges();
+  e["atlas-duck-app"] = [{ name: "tauri", features: ["tray-icon", "isolation", "devtools"] }];
+  assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), [
+    "tauri feature devtools must not be enabled (§2.5)",
+  ]);
+  e["atlas-duck-app"] = [{ name: "tauri", features: ["tray-icon", "isolation"] }];
+  assert.deepEqual(graph(e, { extraMembers: ["atlas-duck-app"] }), []);
+});
+
 const BANNED = [
   "reqwest",
   "hyper",

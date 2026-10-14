@@ -74,6 +74,19 @@ export const CONVERT_EXTERNAL_ALLOW = ["pulldown-cmark"];
 
 export const TAURI_CRATES = ["tauri", "wry"];
 
+// §10.3: the webview gets no shell, filesystem, network, opener, clipboard or updater plugin.
+export const APP_BANNED_DEPS = [
+  "tauri-plugin-shell",
+  "tauri-plugin-fs",
+  "tauri-plugin-http",
+  "tauri-plugin-opener",
+  "tauri-plugin-clipboard-manager",
+  "tauri-plugin-updater",
+];
+
+// §2.5: devtools stay off in every build.
+export const TAURI_BANNED_FEATURES = ["devtools"];
+
 // §2.1: sandbox "No HTTP client, keychain, or DB code linked"; CLI "Never
 // touches keychain or DB" (HTTP client ban for the CLI is a plan addition).
 // Names match exactly, so the keyring-core store crates that `audit` links are
@@ -243,6 +256,16 @@ export function checkGraph(metadata) {
       }
     }
     for (const d of pkg.dependencies) {
+      if (pkg.name === APP_PACKAGE && APP_BANNED_DEPS.includes(d.name)) {
+        violations.push(`${APP_PACKAGE}: dependency ${d.name} is banned (§10.3)`);
+      }
+      if (d.name === "tauri") {
+        for (const f of d.features ?? []) {
+          if (TAURI_BANNED_FEATURES.includes(f)) {
+            violations.push(`tauri feature ${f} must not be enabled (§2.5)`);
+          }
+        }
+      }
       if (d.name !== "rquickjs") continue;
       if (d.req !== RQUICKJS_REQ) {
         violations.push(`${pkg.name}: rquickjs version req must be ${RQUICKJS_REQ} (§9.3), found ${d.req}`);
