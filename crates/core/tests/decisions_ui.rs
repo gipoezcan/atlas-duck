@@ -971,3 +971,41 @@ async fn m8_deny_hint_strings_stripped_and_bounded() -> TestResult {
     assert_eq!(text, "Issue does\nnot exist");
     Ok(())
 }
+
+/// T7 review M-1: a single server string longer than the whole bound (createmeta's
+/// `schema.type` is not capped upstream) is cut on its own, so one missing field cannot carry
+/// the hint past `DENY_HINT_MAX_BYTES`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m8_single_over_long_field_cut() -> TestResult {
+    use atlas_duck_core::decision::DENY_HINT_MAX_BYTES;
+    // 80 Ki quotes serialize to 160 KiB: alone more than twice the bound.
+    let huge = "\"".repeat(80 * 1024);
+    let fields = vec![json!({"required": true, "schema": {"type": huge},
+                             "name": "Team", "fieldId": "customfield_30000",
+                             "hasDefaultValue": false, "operations": ["set"]})];
+    let h = Harness::jira().await?;
+    mount_create_fields(jira(&h)?, fields).await;
+    let id = &queued(&h, CREATE, create_params()).await?;
+    h.approver()
+        .deny_with(
+            id,
+            "too much",
+            DenyDetails::MissingFields {
+                include_allowed_values: true,
+            },
+        )
+        .map_err(de)?;
+    let env = h.await_(id, 5000).await;
+    assert_eq!(env.status, Status::Denied, "{}", env.to_json_line());
+    let hint = &records(&h, id, EventType::WRITE_DENIED).await?[0]["hint"];
+    let size = serde_json::to_vec(hint)?.len();
+    assert!(size <= DENY_HINT_MAX_BYTES, "{size}");
+    let listed = detail(&env, "missing_fields");
+    let listed = listed.as_array().ok_or("no list")?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["id"], json!("customfield_30000"));
+    let ty = listed[0]["schema_type"].as_str().ok_or("no schema_type")?;
+    assert!(ty.len() <= 1024, "{}", ty.len());
+    assert!(ty.starts_with("\"\"\"") && ty.ends_with('…'), "{ty}");
+    Ok(())
+}

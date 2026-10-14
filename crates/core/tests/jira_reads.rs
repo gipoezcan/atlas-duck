@@ -1072,7 +1072,7 @@ async fn u27_search_orphan_mirror_blocks_release() -> TestResult {
 }
 
 /// M5 M-11: a first build the §5.3 mirror check refuses fails the item closed, and its preview
-/// carries the `internal` banner (only Deny remains); a clean candidate and a redacted revision
+/// carries the `internal` banner (Release disabled); a clean candidate and a redacted revision
 /// that passes the check carry none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m11_first_build_internal_banner() -> TestResult {
@@ -1092,7 +1092,8 @@ async fn m11_first_build_internal_banner() -> TestResult {
     );
     assert_eq!(
         RELEASE_BLOCKED_INTERNAL,
-        "release blocked: the candidate could not be rebuilt exactly (internal); only Deny remains"
+        "release blocked: the candidate could not be built exactly (internal); deny it, or drop \
+         the flagged items"
     );
     assert!(!ap.item(&id).ok_or("not queued")?.approvable);
     // Dropping the orphan gives a revision that passes: no banner.

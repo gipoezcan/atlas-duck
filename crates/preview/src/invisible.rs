@@ -166,7 +166,8 @@ pub fn escape_for_display(s: &str) -> String {
 }
 
 /// §3.3 agent-string stripping: every flagged char plus `\t`, `\r` and (unless `keep_newlines`,
-/// which only `reason` uses) `\n`. Returns the stripped string and whether anything was removed.
+/// which the agent's `reason`, the human's deny reasons and a deny hint's upstream messages use)
+/// `\n`. Returns the stripped string and whether anything was removed.
 pub fn strip(s: &str, keep_newlines: bool) -> (String, bool) {
     let mut out = String::with_capacity(s.len());
     let mut removed = false;

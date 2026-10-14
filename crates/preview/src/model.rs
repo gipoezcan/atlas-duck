@@ -106,7 +106,7 @@ pub struct PreviewHeader {
     /// The effective query as sent, display-escaped (§6.3: a Confluence search shows its CQL
     /// after the §7.4 rewrite, `jira.search` its JQL); `None` for keyed ops.
     pub query: Option<String>,
-    /// M5 M-11: the Caution banner of a candidate that failed closed (§5.2: only Deny remains);
+    /// M5 M-11: the Caution banner of a candidate that failed closed (§5.2: Release disabled);
     /// core's fixed text, `None` otherwise.
     pub release_blocked: Option<&'static str>,
 }

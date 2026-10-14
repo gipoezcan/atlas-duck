@@ -47,13 +47,15 @@ use sha2::{Digest, Sha256};
 pub use recent::RecentItem;
 pub use redaction_preview::RedactionReport;
 
-/// M5 M-11 (plan text, PD-90 banner level caution): the header banner of a candidate that failed
-/// closed (§5.2: a rebuild that does not reproduce the revision, or a first build the §5.3 mirror
-/// check refuses); Release stays disabled and only Deny remains.
-pub const RELEASE_BLOCKED_INTERNAL: &str =
-    "release blocked: the candidate could not be rebuilt exactly (internal); only Deny remains";
+/// M5 M-11 (PD-90 banner level caution): the header banner of a candidate that failed closed
+/// (§5.2: a rebuild that does not reproduce the revision, or a first build the §5.3 mirror check
+/// refuses); Release stays disabled. Worded per the T7 review M-2 ruling (the plan's "only Deny
+/// remains" was wrong for the mirror case, where dropping the flagged items makes the rest
+/// releasable).
+pub const RELEASE_BLOCKED_INTERNAL: &str = "release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items";
 
-/// PD-86 (plan text): a session's label when its agent named itself nothing.
+/// A session's label when its agent named itself nothing: the T7 implementer's wording (not
+/// PD-86 text), ledgered in the T7 review (M-4).
 pub const SESSION_NO_AGENT_NAME: &str = "(no agent name)";
 
 use crate::edit::{EditError, Edits, apply_edits};
@@ -1516,11 +1518,24 @@ pub const DENY_HINT_MAX_BYTES: usize = 64 * 1024;
 /// Room kept beside a hint's lists for the rest of it and a `*_total` count.
 const HINT_LIST_RESERVE: usize = 256;
 
+/// T7 review M-1: each server string in a deny hint is cut to this many bytes (with `…`), so a
+/// single unbounded field (a createmeta name, say) cannot exceed [`DENY_HINT_MAX_BYTES`] alone.
+const SERVER_TEXT_MAX_BYTES: usize = 1024;
+
 /// M5 M-8: server text in a deny hint (field ids and names, schema types, allowed-value labels,
-/// resolution candidates) is stripped like an agent string (§3.3), line breaks included, before
-/// it reaches the agent; upstream messages keep their line breaks (see `hint_for`).
+/// resolution candidates) is stripped like an agent string (§3.3), line breaks included, and cut
+/// to [`SERVER_TEXT_MAX_BYTES`] before it reaches the agent; upstream messages keep their line
+/// breaks (see `hint_for`).
 fn server_text(s: &str) -> String {
-    strip(s, false).0
+    let s = strip(s, false).0;
+    if s.len() <= SERVER_TEXT_MAX_BYTES {
+        return s;
+    }
+    let mut end = SERVER_TEXT_MAX_BYTES - '…'.len_utf8();
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 fn json_len(v: &Value) -> usize {
@@ -1635,6 +1650,9 @@ fn hint_for(
                     .map(|c| Value::from(server_text(c)))
                     .collect();
                 let listed = fit(all, budget);
+                // T7 review I-1 (lead ruling): an additive key of the same class as
+                // `missing_fields_total` / `allowed_values_total` (§4.3), present only when the
+                // human ticked the candidates and the list was cut.
                 if listed.len() < candidates.len() {
                     d.insert("candidates_total".into(), Value::from(candidates.len()));
                 }
