@@ -2091,7 +2091,9 @@ fn list_columns_scan_is_linear_in_distinct_keys() -> TestResult {
     let start = std::time::Instant::now();
     let model = list_model("jira.field.list", &candidate)?;
     let took = start.elapsed();
-    assert!(took < Duration::from_secs(2), "took {took:?}");
+    // A quadratic scan over 200k keys takes minutes; the bound is loose because the x86_64 macOS
+    // leg runs under Rosetta (2.1 s observed in CI against 0.1 s natively).
+    assert!(took < Duration::from_secs(10), "took {took:?}");
     let (columns, rows, _) = table_of(&model.body)?;
     assert_eq!(columns.len(), 40);
     assert_eq!(rows[0].len(), 40);
