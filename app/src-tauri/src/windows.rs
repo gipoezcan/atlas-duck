@@ -161,7 +161,8 @@ pub struct WindowSpec {
     pub title: &'static str,
     pub size: (f64, f64),
     /// `<data>/webview` (credential: `<data>/webview-credential`); `None` before a data dir
-    /// exists (first run), where Tauri uses its default folder and the window is incognito.
+    /// exists (first run, setup window only), where Tauri uses its default folder and the window
+    /// is incognito. T23 moves the setup window's data into the data dir once it exists.
     pub data_directory: Option<PathBuf>,
     pub incognito: bool,
     pub devtools: bool,
@@ -173,15 +174,21 @@ pub struct WindowSpec {
 /// The builder settings of `label` (§2.5, §10.3, §15 V30, V35): every window gets the app entry,
 /// `<data>/webview` (the Crashpad reports there are cleared before the first webview), devtools
 /// only in debug builds and, on Windows, the browser arguments without crash-report upload. The
-/// credential window is incognito **and** has its own data dir; a window opened before any data
-/// dir exists is incognito.
+/// credential window is incognito **and** has its own data dir, so without a data dir it is
+/// refused ([`WindowError::NoDataDir`]): it never falls back to Tauri's default webview folder,
+/// which other windows share. Any other window opened before a data dir exists is incognito (the
+/// setup window before first run keeps that default profile; T23 moves its data once the data
+/// dir exists).
 pub fn window_spec(
     label: Label,
     how: Show,
     data: Option<&LocalDataDir>,
     windows: bool,
-) -> WindowSpec {
+) -> Result<WindowSpec, WindowError> {
     let credential = label == Label::Credential;
+    if credential && data.is_none() {
+        return Err(WindowError::NoDataDir);
+    }
     let data_directory = data.map(|d| {
         if credential {
             d.path().join(CREDENTIAL_DATA_DIR)
@@ -189,7 +196,7 @@ pub fn window_spec(
             webview_data_dir(d)
         }
     });
-    WindowSpec {
+    Ok(WindowSpec {
         label,
         entry: label.entry(),
         title: label.title(),
@@ -199,7 +206,21 @@ pub fn window_spec(
         devtools: DEVTOOLS_ALLOWED,
         browser_args: windows.then_some(WINDOWS_BROWSER_ARGS),
         focused: how == Show::Focus,
-    }
+    })
+}
+
+/// Every webview data folder under `data` (`<data>/webview`, `<data>/webview-credential`), for
+/// the startup Crashpad clearing (§2.5, §15 V35). Derived from [`window_spec`], so a new folder
+/// there cannot be missed here.
+pub fn webview_data_dirs(data: &LocalDataDir) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Label::ALL
+        .into_iter()
+        .filter_map(|l| window_spec(l, Show::WithoutActivating, Some(data), false).ok())
+        .filter_map(|s| s.data_directory)
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
 }
 
 // ---------- navigation ----------
@@ -442,6 +463,8 @@ impl StartupRoute {
 pub enum WindowError {
     /// No [`WindowRegistry`] is managed (before `setup`).
     NotRegistered,
+    /// The credential window needs a data dir of its own and none exists yet.
+    NoDataDir,
     Build,
     Show,
 }
@@ -555,11 +578,12 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, label: Label, how: Show) -> Result<(
         Some(w) => bring_up(&w, how),
         None => {
             let data = app.try_state::<DataDirHold>().map(|h| h.data().clone());
-            let spec = window_spec(label, how, data.as_ref(), cfg!(windows));
-            build(app, &spec, registry.nav.clone()).and_then(|w| match how {
-                Show::Focus => bring_up(&w, how),
-                Show::WithoutActivating => Ok(()),
-            })
+            window_spec(label, how, data.as_ref(), cfg!(windows))
+                .and_then(|spec| build(app, &spec, registry.nav.clone()))
+                .and_then(|w| match how {
+                    Show::Focus => bring_up(&w, how),
+                    Show::WithoutActivating => Ok(()),
+                })
         }
     };
     if let Err(e) = result {
@@ -567,6 +591,7 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, label: Label, how: Show) -> Result<(
             label,
             match e {
                 WindowError::NotRegistered => "not_registered",
+                WindowError::NoDataDir => "no_data_dir",
                 WindowError::Build => "build",
                 WindowError::Show => "show",
             },
@@ -782,6 +807,8 @@ mod tests {
                 "file:///C:/Windows/win.ini",
                 "about:blank",
                 "data:text/html,<script>1</script>",
+                "blob:https://tauri.localhost/0b9e1d2c-3f4a-4b5c-8d6e-7f8091a2b3c4",
+                "blob:tauri://localhost/0b9e1d2c-3f4a-4b5c-8d6e-7f8091a2b3c4",
                 "javascript:alert(1)",
                 "https://tauri.localhost/",
                 "http://tauri.localhost.evil.example/",
@@ -987,7 +1014,10 @@ mod tests {
         for windows in [false, true] {
             let specs: Vec<WindowSpec> = Label::ALL
                 .into_iter()
-                .map(|l| window_spec(l, Show::Focus, Some(&data), windows))
+                .map(|l| {
+                    window_spec(l, Show::Focus, Some(&data), windows)
+                        .unwrap_or_else(|e| panic!("{e:?}"))
+                })
                 .collect();
             let credential = specs
                 .iter()
@@ -1027,14 +1057,32 @@ mod tests {
                 }
             }
         }
-        // Before any data dir exists (first run) every window is incognito, with no data dir.
+        // Before any data dir exists (first run) the credential window is refused (never the
+        // shared default folder); every other window is incognito, with no data dir.
         for l in Label::ALL {
-            let s = window_spec(l, Show::WithoutActivating, None, cfg!(windows));
+            let r = window_spec(l, Show::WithoutActivating, None, cfg!(windows));
+            if l == Label::Credential {
+                assert_eq!(r, Err(WindowError::NoDataDir));
+                continue;
+            }
+            let s = r.unwrap_or_else(|e| panic!("{l:?}: {e:?}"));
             assert!(s.incognito && s.data_directory.is_none(), "{l:?}");
             assert!(!s.focused);
         }
         #[cfg(not(debug_assertions))]
         assert!(!DEVTOOLS_ALLOWED);
+    }
+
+    #[test]
+    fn webview_data_dirs_lists_both_folders() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let data = data_dir(&tmp);
+        let mut want = vec![
+            webview_data_dir(&data),
+            data.path().join(CREDENTIAL_DATA_DIR),
+        ];
+        want.sort();
+        assert_eq!(webview_data_dirs(&data), want);
     }
 
     #[test]

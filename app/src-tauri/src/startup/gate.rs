@@ -14,8 +14,9 @@ use tauri::AppHandle;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 use crate::diag::Diag;
-use crate::startup::crash::{clear_crashpad_reports, webview_data_dir};
+use crate::startup::crash::clear_crashpad_reports;
 use crate::state::StartupSummary;
+use crate::windows::webview_data_dirs;
 
 /// §7.7 Path stability (verbatim).
 pub const MSG_DATA_DIR_NOT_FOUND: &str = "data directory <path> not found";
@@ -263,6 +264,16 @@ pub enum StartupAction {
     Exit { message: Option<String> },
 }
 
+/// Clears the Crashpad reports of every webview data folder (the main one and the credential
+/// window's, §2.5, §15 V35): a dump from a crashed renderer may hold typed secrets.
+fn clear_webview_crashpad(data: &LocalDataDir) {
+    for dir in webview_data_dirs(data) {
+        if clear_crashpad_reports(&dir).is_err() {
+            tracing::warn!(event = "crashpad_clear_failed");
+        }
+    }
+}
+
 /// Applies the gate's outcome. It logs `startup_state` (the line waits in T08's buffer
 /// until a data dir is attached). When `Ready` it attaches the diagnostic log and clears
 /// Crashpad reports. It shows each error state's text once. It asks `AlreadyRunning` to
@@ -279,9 +290,7 @@ pub fn apply_startup_state(
             if diag.attach_dir(data).is_err() {
                 tracing::warn!(event = "diag_attach_failed");
             }
-            if clear_crashpad_reports(&webview_data_dir(data)).is_err() {
-                tracing::warn!(event = "crashpad_clear_failed");
-            }
+            clear_webview_crashpad(data);
             StartupAction::Stay
         }
         StartupState::BeforeFirstRun => StartupAction::Stay,
@@ -296,6 +305,36 @@ pub fn apply_startup_state(
                 presenter.show(&text);
             }
             StartupAction::Stay
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::startup::crash::crashpad_reports_dir;
+    use atlas_duck_ipc::paths::check_data_dir;
+
+    #[test]
+    fn startup_clears_crashpad_reports_of_both_webview_folders() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let data = match check_data_dir(tmp.path()) {
+            Ok(DataDirResolution::Local(data)) => data,
+            other => panic!("{other:?}"),
+        };
+        let dirs = webview_data_dirs(&data);
+        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        for dir in &dirs {
+            let reports = crashpad_reports_dir(dir);
+            std::fs::create_dir_all(&reports).unwrap_or_else(|e| panic!("{e}"));
+            std::fs::write(reports.join("a.dmp"), b"dump").unwrap_or_else(|e| panic!("{e}"));
+        }
+        clear_webview_crashpad(&data);
+        for dir in &dirs {
+            let left = std::fs::read_dir(crashpad_reports_dir(dir))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .count();
+            assert_eq!(left, 0, "{} not cleared", dir.display());
         }
     }
 }
