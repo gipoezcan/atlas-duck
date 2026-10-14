@@ -437,6 +437,14 @@ async fn stale_return_is_listed_until_decided() -> TestResult {
     }
     let item = h.approver().item(&w).ok_or("not back in the queue")?;
     assert!(item.stale && item.candidate_rev.counter >= rev.counter);
+    let stale = records(&h, &w, EventType::WRITE_STALE).await?;
+    assert_eq!(
+        stale
+            .iter()
+            .map(|s| s["reason"].clone())
+            .collect::<Vec<_>>(),
+        [json!("recheck_failed")]
+    );
     let r = row(&h, &w)?;
     assert_eq!(r.status, Status::Pending);
     assert!(r.needs_attention && !r.acknowledged, "{r:?}");
@@ -957,11 +965,9 @@ async fn m8_deny_hint_strings_stripped_and_bounded() -> TestResult {
         .map_err(de)?;
     let env = h.await_(&id, 5000).await;
     assert_eq!(code(&env), "upstream_http");
+    // Stripped like the human's reason: flagged characters go, the line per message stays.
     let text = detail(&env, "error_messages");
-    assert!(clean(&text), "{text}");
-    assert!(
-        text.as_str().is_some_and(|t| t.contains("doesnot exist")),
-        "{text}"
-    );
+    let text = text.as_str().ok_or("no error_messages")?;
+    assert_eq!(text, "Issue does\nnot exist");
     Ok(())
 }

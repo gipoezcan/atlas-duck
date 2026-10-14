@@ -1517,8 +1517,8 @@ pub const DENY_HINT_MAX_BYTES: usize = 64 * 1024;
 const HINT_LIST_RESERVE: usize = 256;
 
 /// M5 M-8: server text in a deny hint (field ids and names, schema types, allowed-value labels,
-/// resolution candidates, upstream messages) is stripped like an agent string (§3.3), line
-/// breaks included, before it reaches the agent.
+/// resolution candidates) is stripped like an agent string (§3.3), line breaks included, before
+/// it reaches the agent; upstream messages keep their line breaks (see `hint_for`).
 fn server_text(s: &str) -> String {
     strip(s, false).0
 }
@@ -1597,7 +1597,9 @@ fn hint_for(
             let mut d = serde_json::Map::new();
             d.insert("status".into(), serde_json::json!(card.status));
             if include_messages {
-                let text = cap_error_text(&server_text(&card.text));
+                // One line per upstream message (`read::error_text` joins them with `\n`):
+                // stripped like the human's own reason, line breaks kept.
+                let text = cap_error_text(&strip(&card.text, true).0);
                 d.insert("error_messages".into(), Value::from(text));
             }
             Ok(serde_json::json!({ "code": "upstream_http", "details": d }))
