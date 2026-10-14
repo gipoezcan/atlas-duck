@@ -356,6 +356,20 @@ mod tests {
         Ok(())
     }
 
+    /// A `KEY=value` pair. Windows keeps hidden per-drive variables whose
+    /// names start with `=` (`=C:`), so only an `=` after the first char counts.
+    fn looks_like_assignment(s: &str) -> bool {
+        s.chars().skip(1).any(|c| c == '=')
+    }
+
+    #[test]
+    fn assignment_check_flags_values_not_per_drive_names() {
+        assert!(looks_like_assignment("KEY=value"));
+        assert!(looks_like_assignment("K="));
+        assert!(!looks_like_assignment("=C:"));
+        assert!(!looks_like_assignment("PATH"));
+    }
+
     #[tokio::test]
     async fn env_names_are_names_only() -> TestResult {
         let tmp = tempfile::tempdir()?;
@@ -368,7 +382,7 @@ mod tests {
         let mut strings = Vec::new();
         for n in names {
             let s = n.as_str().ok_or("not a string")?;
-            assert!(!s.contains('='), "a value leaked: {s}");
+            assert!(!looks_like_assignment(s), "a value leaked: {s}");
             strings.push(s.to_owned());
         }
         let mut sorted = strings.clone();
