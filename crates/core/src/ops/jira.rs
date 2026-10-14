@@ -972,8 +972,14 @@ fn transition_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
             let transition = transitions
                 .iter()
                 .find(|t| t.get("id").and_then(Value::as_str) == Some(id.as_str()));
+            // M5 final review M-2 (L102): the status the transition leads to is baselined too, so
+            // an admin retarget of the same transition id between review and approval is stale.
+            let to_status_id = transition
+                .and_then(|t| t.get("to"))
+                .and_then(|to| to.get("id"))
+                .and_then(Value::as_str);
             let mut verdict = EnrichVerdict::preview(
-                json!({"status_id": status_id, "transition_id": id}),
+                json!({"status_id": status_id, "transition_id": id, "to_status_id": to_status_id}),
                 resolved("transition", &id),
             );
             if let Some(transition) = transition {

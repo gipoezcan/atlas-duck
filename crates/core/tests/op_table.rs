@@ -788,7 +788,27 @@ fn create_verdict() -> EnrichVerdict {
 fn transition_verdict() -> EnrichVerdict {
     let mut resolved = Map::new();
     resolved.insert("transition".to_owned(), json!("31"));
-    EnrichVerdict::preview(json!({"status_id": "3", "transition_id": "31"}), resolved)
+    EnrichVerdict::preview(
+        json!({"status_id": "3", "transition_id": "31", "to_status_id": "10001"}),
+        resolved,
+    )
+}
+
+/// What enrichment gives for assigning to `jdoe`: the executor sends the resolved name.
+fn assign_verdict() -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("assignee".to_owned(), json!("jdoe"));
+    EnrichVerdict::preview(
+        json!({"assignee_key": null, "assignee_name": null}),
+        resolved,
+    )
+}
+
+/// What enrichment gives for the link type `Blocks`: the executor sends the resolved name.
+fn link_verdict() -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("type".to_owned(), json!("Blocks"));
+    EnrichVerdict::preview(Value::Null, resolved)
 }
 
 fn page_verdict() -> EnrichVerdict {
@@ -856,6 +876,17 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             "jira.backlog.move_issues",
             json!({"issues": ["ABC-3"]}),
             None,
+        ),
+        // M5 final review M-6: the two executors that write enrichment facts.
+        (
+            "jira.issue.assign",
+            json!({"key": "ABC-1", "assignee": "jdoe"}),
+            Some(assign_verdict()),
+        ),
+        (
+            "jira.issuelink.create",
+            json!({"type": "blocks", "inward": "ABC-1", "outward": "ABC-2", "comment": "Linked."}),
+            Some(link_verdict()),
         ),
         (
             "confluence.page.update",
@@ -1545,7 +1576,7 @@ fn transition_resolution_and_stale_rule() -> TestResult {
     assert_eq!(query_of(&plan[1].1), vec![("fields", "status")]);
     assert_eq!(v.hold, Hold::Preview);
     assert_eq!(v.resolved.get("transition"), Some(&json!("31")));
-    assert_eq!(v.baseline, json!({"status_id": "3", "transition_id": "31"}));
+    assert_eq!(v.baseline, v_baseline());
 
     let (_, v) = enrich(
         "jira.issue.transition",
@@ -1568,13 +1599,36 @@ fn transition_resolution_and_stale_rule() -> TestResult {
     )?;
     assert!(matches!(verdict, StaleVerdict::Changed { .. }));
     let gone = json!({"transitions": [{"id": "21", "name": "Start Progress"}]});
-    let (_, verdict) = stale("jira.issue.transition", &params, &baseline, &[gone, issue])?;
+    let (_, verdict) = stale(
+        "jira.issue.transition",
+        &params,
+        &baseline,
+        &[gone, issue.clone()],
+    )?;
     assert!(matches!(verdict, StaleVerdict::Changed { .. }));
+    // M-2 (L102): the same transition id retargeted to another status is stale; the unchanged
+    // target (the run above) is not.
+    let mut retargeted = transitions;
+    let done = retargeted["transitions"]
+        .as_array_mut()
+        .and_then(|all| all.iter_mut().find(|t| t["id"] == "31"))
+        .ok_or("no transition 31")?;
+    done["to"]["id"] = json!("10002");
+    let (_, verdict) = stale(
+        "jira.issue.transition",
+        &params,
+        &baseline,
+        &[retargeted, issue],
+    )?;
+    assert!(
+        matches!(verdict, StaleVerdict::Changed { ref delta } if delta.contains("target")),
+        "{verdict:?}"
+    );
     Ok(())
 }
 
 fn v_baseline() -> Value {
-    json!({"status_id": "3", "transition_id": "31"})
+    json!({"status_id": "3", "transition_id": "31", "to_status_id": "10001"})
 }
 
 #[test]

@@ -115,11 +115,20 @@ fn transition_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
     if status != was_status {
         return changed("status changed since review");
     }
-    let listed = transitions
+    let Some(current) = transitions
         .iter()
-        .any(|t| t.get("id").and_then(Value::as_str) == Some(transition));
-    if !listed {
+        .find(|t| t.get("id").and_then(Value::as_str) == Some(transition))
+    else {
         return changed("transition no longer available");
+    };
+    // L102 (M-2): the target status is compared like the from-status; a baseline without it (or
+    // an answer without it) differs from one with it (fail closed).
+    let now = current
+        .get("to")
+        .and_then(|to| to.get("id"))
+        .and_then(Value::as_str);
+    if now != want("to_status_id") {
+        return changed("transition target changed since review");
     }
     StaleVerdict::Unchanged
 }
