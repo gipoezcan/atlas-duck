@@ -57,6 +57,8 @@ pub const HARNESS_CWD: &str = "workdir";
 /// What every harness Jira mock answers the first `GET /rest/api/2/field` with (the start fill of
 /// the field-name cache, PD-46); later fills get what the test mounts (404 otherwise).
 pub const JIRA_FIELDS: &str = r#"[{"id":"summary","name":"Summary","custom":false,"schema":{"type":"string","system":"summary"}},{"id":"customfield_10100","name":"Story Points","custom":true,"schema":{"type":"number","custom":"com.atlassian.jira.plugin.system.customfieldtypes:float","customId":10100}}]"#;
+/// The alias of the instance `HarnessBuilder::live` configures.
+pub const LIVE_ALIAS: &str = "jira-live";
 /// How long the harness waits for field-name cache fills it started (start, token set).
 const FIELD_CACHE_WAIT: Duration = Duration::from_secs(10);
 
@@ -110,6 +112,15 @@ pub struct HarnessBuilder {
     scripts: Option<Arc<dyn ScriptRunner>>,
     pats_deleted: Vec<String>,
     app_start_extra: Map<String, Value>,
+    live: LiveState,
+}
+
+/// Where `HarnessBuilder::live` stands: not asked for, set up, or refused (not https).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveState {
+    Off,
+    On,
+    Refused,
 }
 
 impl HarnessBuilder {
@@ -144,6 +155,29 @@ impl HarnessBuilder {
             at: Some(at),
         });
         self
+    }
+
+    /// A real Jira Data Center instance at `url` instead of a mock (L-01 live tests, never run by
+    /// agents or CI): https only, the origin confirmed as a user would have, the PAT stored through
+    /// the instance admin's token set (so the identity it keeps is the one the server reports),
+    /// and `strict_https` on so no release lock is weakened. A `url` that is not `https://` makes
+    /// `start` fail. The PAT is never printed or written to the config.
+    pub fn live(mut self, url: &str, pat: &str) -> Self {
+        if !url.to_ascii_lowercase().starts_with("https://") {
+            self.live = LiveState::Refused;
+            return self;
+        }
+        self.live = LiveState::On;
+        self.strict_https = true;
+        self.pat = pat.to_owned();
+        self.instance_at(
+            LIVE_ALIAS,
+            Product::Jira,
+            InstanceAt {
+                base_url: url.to_owned(),
+                ..InstanceAt::default()
+            },
+        )
     }
 
     /// Refuses `http://` instance origins like a release build (the mocks are plain http, so an
@@ -248,6 +282,10 @@ impl HarnessBuilder {
     }
 
     pub async fn start(self) -> Result<Harness, TestError> {
+        if self.live == LiveState::Refused {
+            return Err("a live instance needs an https:// url".into());
+        }
+        let live = self.live == LiveState::On;
         let store = match self.store_faults.clone() {
             Some(f) => TempStore::with_faults(f)?,
             None => TempStore::new()?,
@@ -277,7 +315,10 @@ impl HarnessBuilder {
                 ),
                 None => (mock.base_url(), url_hash(&mock.base())),
             };
-            credentials.put(&id, &self.pat, bound, TEST_USER, TEST_USER_KEY);
+            // The live instance gets the token and the identity the server's own answer names.
+            if !(live && spec.alias == LIVE_ALIAS) {
+                credentials.put(&id, &self.pat, bound, TEST_USER, TEST_USER_KEY);
+            }
             let ca_bundle = match spec.at.as_ref().and_then(|a| a.ca_pem.as_ref()) {
                 Some(pem) => {
                     let path = config_dir.path().join(format!("ca-{n}.pem"));
@@ -356,7 +397,10 @@ impl HarnessBuilder {
             scripts: self.scripts.clone(),
         };
         // Raw servers answer scripted connections in order: no background fill may take one.
-        let at_raw = self.instances.iter().any(|i| i.at.is_some());
+        let at_raw = self
+            .instances
+            .iter()
+            .any(|i| i.at.is_some() && !(live && i.alias == LIVE_ALIAS));
         let hooks = TestHooks {
             limits: self.limits,
             allow_http: !self.strict_https,
@@ -397,6 +441,12 @@ impl HarnessBuilder {
         };
         let default_conn = h.conn(HARNESS_AGENT).await?;
         let h = Harness { default_conn, ..h };
+        if live {
+            h.instances()
+                .set_token(LIVE_ALIAS, secrecy::SecretString::from(self.pat), None)
+                .await
+                .map_err(|e| format!("live token set failed: {e:?}"))?;
+        }
         // The start fills end before the test runs, so their records and hits come first. A
         // fill held by the test's own fault plan just runs out the wait.
         h.field_cache_filled().await;
@@ -544,6 +594,7 @@ impl Harness {
             scripts: None,
             pats_deleted: Vec::new(),
             app_start_extra: Map::new(),
+            live: LiveState::Off,
         }
     }
 
