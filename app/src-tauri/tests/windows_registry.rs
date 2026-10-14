@@ -6,14 +6,25 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
+use atlas_duck_app_lib::state::DataDirHold;
 use atlas_duck_app_lib::tray::on_run_event;
 use atlas_duck_app_lib::windows::{
     Label, NavPolicy, Show, StartupRoute, Unlock, WindowError, WindowRegistry, open,
     open_credential,
 };
+use atlas_duck_audit::lock::InstanceLock;
+use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
 use tauri::test::{MockRuntime, mock_builder};
 use tauri::{App, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+fn local_data_dir(tmp: &tempfile::TempDir) -> Result<LocalDataDir, Box<dyn std::error::Error>> {
+    match check_data_dir(tmp.path())? {
+        DataDirResolution::Local(data) => Ok(data),
+        _ => Err("the temp dir is not a local data dir".into()),
+    }
+}
 
 fn app() -> Result<App<MockRuntime>, Box<dyn std::error::Error>> {
     let context = tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
@@ -41,6 +52,11 @@ fn open_builds_once_under_the_fixed_label() -> TestResult {
         Ok(())
     );
     assert_eq!(handle.webview_windows().len(), 1, "built once");
+    // The credential window has its own webview data dir: it needs the locked data dir (T6).
+    let tmp = tempfile::tempdir()?;
+    let data = local_data_dir(&tmp)?;
+    let lock = Arc::new(InstanceLock::acquire(&data, "testhost")?);
+    app.manage(DataDirHold::new(data, lock));
     assert_eq!(
         open_credential(handle, Unlock::Recover, Show::Focus),
         Ok(())
@@ -59,6 +75,25 @@ fn open_builds_once_under_the_fixed_label() -> TestResult {
             "unexpected label {label}"
         );
     }
+    Ok(())
+}
+
+/// Without a locked data dir (before first run) the credential window is refused and no window is
+/// built; it never falls back to the default webview folder.
+#[test]
+fn credential_without_a_data_dir_is_refused() -> TestResult {
+    let app = app()?;
+    let handle = app.handle();
+    app.manage(WindowRegistry::new(
+        NavPolicy::for_this_platform(None),
+        StartupRoute::completed(),
+    ));
+    assert_eq!(
+        open_credential(handle, Unlock::Recover, Show::Focus),
+        Err(WindowError::NoDataDir)
+    );
+    assert!(handle.get_webview_window("credential").is_none());
+    assert!(handle.webview_windows().is_empty(), "no window built");
     Ok(())
 }
 
