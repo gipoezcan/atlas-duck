@@ -224,6 +224,11 @@ const X_ATLASSIAN_TOKEN: &str = "X-Atlassian-Token";
 
 impl InstanceClient {
     pub(crate) async fn send_one(&self, req: OneRequest<'_>, ctl: &FetchControl) -> FetchOutcome {
+        // M5 final review M-5: the read path never carries a write cover. Approved writes go
+        // through `send_approved_ctl` (its own `exchange` loop), never through here.
+        if matches!(req.target, Target::Approved { .. }) {
+            return failed(FetchFailure::MethodGuardRefused);
+        }
         let ex = match self.exchange(&req, ctl).await {
             Ok(Exchanged::Response(ex)) => ex,
             Ok(Exchanged::Stopped429 {
@@ -652,6 +657,40 @@ mod tests {
                 received: Vec::new(),
             }
         );
+    }
+
+    /// M5 final review M-5: `send_one` refuses an approved write before anything is built or sent.
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn send_one_refuses_an_approved_write() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::testing::{test_client, test_config, test_write_cover};
+        use crate::types::HttpRequestSpec;
+
+        let cfg = test_config(Product::Jira, "https://jira.corp.example")?;
+        let client = test_client(cfg)?.client;
+        let cover = test_write_cover()?;
+        let spec = HttpRequestSpec {
+            index: 0,
+            method: "PUT".to_owned(),
+            resolved_url: "https://jira.corp.example/rest/api/2/issue/ABC-1".to_owned(),
+            content_type: Some("application/json".to_owned()),
+            body: b"{}".to_vec(),
+        };
+        let req = OneRequest {
+            target: Target::Approved {
+                spec: &spec,
+                cover: &cover,
+            },
+            overall: None,
+            max_response_bytes: MAX_RESPONSE_BYTES,
+            cap_kind: PostSendKind::ResponseCap32MiB,
+        };
+        let out = client.send_one(req, &FetchControl::new()).await;
+        assert!(
+            matches!(out, FetchOutcome::Failed(FetchFailure::MethodGuardRefused)),
+            "{out:?}"
+        );
+        Ok(())
     }
 
     #[test]
