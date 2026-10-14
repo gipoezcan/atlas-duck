@@ -1,6 +1,6 @@
-//! Startup hardening (Â§2.5 "Startup hardening", P16): before any webview and before any thread.
+//! Startup hardening (§2.5 "Startup hardening", P16): before any webview and before any thread.
 //!
-//! Applied only to GUI and `--background` launches (Â§2.5 Scope): `main` calls [`apply_early`] first
+//! Applied only to GUI and `--background` launches (§2.5 Scope): `main` calls [`apply_early`] first
 //! in the GUI branch, before the mmap threshold, the crash settings, `Diag::init` and the Tauri
 //! builder. The early-argv modes `__cli` and `__verify-export` keep their environment untouched.
 //!
@@ -26,10 +26,10 @@ use std::sync::atomic::Ordering;
 
 use crate::early_argv::EarlyMode;
 
-/// The WebView2 browser-arguments variable; only its remote-debugging tokens are removed (Â§2.5).
+/// The WebView2 browser-arguments variable; only its remote-debugging tokens are removed (§2.5).
 pub const WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: &str = "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS";
 
-/// Â§2.5 (verbatim): "Remove debug-channel and loader-injection variables from the app's own
+/// §2.5 (verbatim): "Remove debug-channel and loader-injection variables from the app's own
 /// environment and log a warning: `--remote-debugging*` inside
 /// `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, `WEBVIEW2_USER_DATA_FOLDER`, `WEBKIT_INSPECTOR_SERVER`,
 /// `WEBKIT_INSPECTOR_HTTP_SERVER`, `LD_PRELOAD`, `GTK_MODULES`, `GIO_EXTRA_MODULES`."
@@ -43,7 +43,7 @@ pub const SCRUBBED: [&str; 7] = [
     "GIO_EXTRA_MODULES",
 ];
 
-/// Â§2.5 (verbatim): "`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` is kept for fixed-version enterprise
+/// §2.5 (verbatim): "`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` is kept for fixed-version enterprise
 /// deployments."
 pub const KEPT: &str = "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER";
 
@@ -52,7 +52,7 @@ pub const KEPT: &str = "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER";
 /// `/` as switch prefixes and compares switch names case-insensitively.
 pub const REMOTE_DEBUGGING: &str = "remote-debugging";
 
-/// Whether this build may open webview devtools (Â§2.5 "Release builds disable devtools and remote
+/// Whether this build may open webview devtools (§2.5 "Release builds disable devtools and remote
 /// debugging"): debug builds only. The window builder (T6) passes it to
 /// `WebviewWindowBuilder::devtools`.
 pub const DEVTOOLS_ALLOWED: bool = cfg!(debug_assertions);
@@ -60,7 +60,7 @@ pub const DEVTOOLS_ALLOWED: bool = cfg!(debug_assertions);
 #[cfg(not(debug_assertions))]
 const _: () = assert!(
     !DEVTOOLS_ALLOWED,
-    "release builds never allow devtools (Â§2.5)"
+    "release builds never allow devtools (§2.5)"
 );
 
 /// `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR)`.
@@ -167,7 +167,7 @@ fn browser_args_action(value: &OsStr) -> Option<EnvAction> {
     }
 }
 
-/// Whether startup hardening applies to this launch mode: GUI and `--background` only (Â§2.5
+/// Whether startup hardening applies to this launch mode: GUI and `--background` only (§2.5
 /// Scope). `main` calls [`apply_early`] in exactly the [`EarlyMode::Gui`] branch.
 pub fn applies_to(mode: &EarlyMode) -> bool {
     matches!(mode, EarlyMode::Gui { .. })
@@ -175,7 +175,7 @@ pub fn applies_to(mode: &EarlyMode) -> bool {
 
 static APPLIED: OnceLock<Hardening> = OnceLock::new();
 
-/// Applies the Â§2.5 startup hardening: Windows DLL search order, the environment scrub, the
+/// Applies the §2.5 startup hardening: Windows DLL search order, the environment scrub, the
 /// Windows mitigation policies. Never fails; the result is also kept for [`applied`] (the first
 /// call wins).
 ///

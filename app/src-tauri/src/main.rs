@@ -19,13 +19,18 @@ fn main() {
     if let Some(code) = atlas_duck_app_lib::testing::os_keystore_proxy::run_if_requested(&args) {
         std::process::exit(code);
     }
-    match classify_argv(&args) {
+    let mode = classify_argv(&args);
+    // §2.5 Startup hardening, first: it writes the environment, so this must still be the only
+    // thread. The gate is `hardening::applies_to` (GUI and `--background` only; the CLI and
+    // `__verify-export` keep their environment). The result is kept for `run_gui` to log after
+    // `Diag::init`.
+    if hardening::applies_to(&mode) {
+        let _ = hardening::apply_early();
+    }
+    match mode {
         EarlyMode::Cli(rest) => std::process::exit(atlas_duck_cli::run(rest)),
         EarlyMode::VerifyExport(rest) => std::process::exit(verify_export_stub(rest)),
         EarlyMode::Gui { background } => {
-            // §2.5 Startup hardening, first: it writes the environment, so this must still be the
-            // only thread. The result is kept for `run_gui` to log after `Diag::init`.
-            let _ = hardening::apply_early();
             // PD-33: before any other thread exists; `__cli` and `__verify-export` keep glibc's default.
             let _ = atlas_duck_app_lib::compose::set_mmap_threshold();
             // §2.5 Crash artifacts: GUI and `--background` launches only, before any webview.
