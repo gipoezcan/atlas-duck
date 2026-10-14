@@ -14,7 +14,7 @@ use atlas_duck_convert::{
     ConstructKind, ContainerKind, EmittedCode, EmittedConstructs, Unrecorded, hard_check_wiki,
     markdown_to_wiki,
 };
-use common::{markdown, spans_match_record};
+use common::{markdown, spans_match_record, tags_only_at_containers};
 use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -587,6 +587,32 @@ fn fuzz_strategy_reaches_tag_shaped_code() -> TestResult {
         lenient >= DRAWS / 20,
         "lenient code tag in noformat: {lenient}"
     );
+    Ok(())
+}
+
+/// The lenient-scan property catches the pre-I-1 shape and accepts the broken one.
+#[test]
+fn tags_only_at_containers_bites() -> TestResult {
+    let none = EmittedConstructs::default();
+    for bad in [
+        "{{code}}\n",
+        "{{ toc }}\n",
+        "{{include:X}}\n",
+        "x {quote}\n",
+    ] {
+        assert!(tags_only_at_containers(bad, &none).is_err(), "{bad:?}");
+    }
+    for good in [
+        "{{&#8203;code}}\n",
+        "{{a b}}\n",
+        "\\{toc\\}\n",
+        "{{\\{code\\}}}\n",
+    ] {
+        assert_eq!(tags_only_at_containers(good, &none), Ok(()), "{good:?}");
+    }
+    let wiki = "{code}\n{toc}\n{code}\n";
+    let e = record(vec![rec(ContainerKind::Code, 0..wiki.len() - 1)]);
+    assert_eq!(tags_only_at_containers(wiki, &e), Ok(()));
     Ok(())
 }
 
