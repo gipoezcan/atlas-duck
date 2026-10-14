@@ -233,6 +233,17 @@ impl MockDc {
         self.mount_any(p, t).await;
     }
 
+    /// `method` on `p` only: `status` with an empty body, ahead of every any-method mount (the
+    /// fixture's `GET` answer of the same path stays for the other methods).
+    pub async fn empty_for(&self, http_method: &str, p: &str, status: u16) {
+        Mock::given(method(http_method))
+            .and(path(self.path(p)))
+            .respond_with(self.response(status))
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
+
     /// `status` with an empty body and the given `Content-Type` (none when `None`).
     pub async fn empty(&self, p: &str, status: u16, content_type: Option<&str>) {
         let mut t = self.response(status);

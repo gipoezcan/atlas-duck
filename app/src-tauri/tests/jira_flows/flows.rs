@@ -272,14 +272,18 @@ async fn i18_create_missing_field_edit_and_approve() -> Result<()> {
 /// I-36: an edit whose `--expected` baseline differs from what the issue holds (the mock's
 /// summary is "Login page times out") is denied by the human: exit 3, `denied`, nothing written.
 /// The control differs only in `--expected` (the summary the issue holds): the human approves it
-/// and exactly one `PUT` goes out. The fixture answers the `PUT` like the `GET` (`200` with the
-/// issue); any `2xx` is a success.
+/// and exactly one `PUT` goes out, answered with the declared empty `204`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i36_edit_conflict_denied_exit3() -> Result<()> {
     if !opted_in("i36_edit_conflict_denied_exit3") {
         return Ok(());
     }
     let world = jira_world().await?;
+    // The declared success of the edit is an empty `204`; a method-specific mount wins over the
+    // fixture's any-method `/issue/ABC-1` answer (which would be an `outcome_unknown`).
+    jira(&world)?
+        .empty_for("PUT", "/rest/api/2/issue/ABC-1", 204)
+        .await;
     let edit = |expected: &'static str, reason: &'static str| {
         [
             "jira",
