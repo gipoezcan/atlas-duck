@@ -172,11 +172,10 @@ async fn pd09_markdown_body_rejected() -> TestResult {
     Ok(())
 }
 
-/// Whether the M5 plan still has writes to land: false since Task 18 landed the last ones
-/// (`jira.sprint.move_issues` and `jira.backlog.move_issues`). The Confluence writes of M7 are
-/// still `NotInThisBuild`, so the test below keeps picking one of them until M7 lands them all;
-/// only then is an empty pick the documented outcome.
-const WRITES_STILL_LATER: bool = false;
+/// Whether any write is still `NotInThisBuild`: true while one is (the Confluence writes of M7,
+/// e.g. `confluence.page.move`, are), so the test below keeps picking one of them. Flip it to
+/// false in M7's last Confluence write task; only then is an empty pick the documented outcome.
+const WRITES_STILL_LATER: bool = true;
 
 /// The first write (registry order) whose schema example validates and whose executor is still
 /// `NotInThisBuild`, with that example: picked from the op table, never named, so the task that
@@ -216,9 +215,9 @@ fn not_in_this_build_write() -> Result<Option<(&'static str, Value)>, Box<dyn st
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_in_this_build_rejected_internal() -> TestResult {
     let Some((op, params)) = not_in_this_build_write()? else {
-        // Tripwire (T17 review M4): this test must not turn into a silent no-op. While the M5 plan
-        // still lists writes as `LATER_WRITE`, finding none is a failure (a broken picker, or a
-        // task that landed the last one without flipping the flag); the last M5 write task sets
+        // Tripwire (T17 review M4): this test must not turn into a silent no-op. While any write
+        // is still `LATER_WRITE`, finding none is a failure (a broken picker, or a task that
+        // landed the last one without flipping the flag); M7's last Confluence write task sets
         // `WRITES_STILL_LATER` to false, and only then is an empty pick the documented outcome.
         if WRITES_STILL_LATER {
             return Err(

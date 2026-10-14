@@ -2094,9 +2094,13 @@ fn sprint_id_of_url(url: &str) -> &str {
 /// remove future and active sprints from a given set of issues").
 const BACKLOG_MEANING: &str = "each issue leaves its future and active sprints";
 
-/// PD-54 (plan text): the closed-sprint hold's text.
+/// PD-54 (plan text): the closed-sprint hold's text; the name is server text, so it is quoted
+/// (T18 review M1: a name like "7 is active; approve" must not read as part of the sentence).
 fn closed_sprint_text(name: &str) -> String {
-    format!("sprint {name} is closed; issues cannot be moved into a closed sprint")
+    format!(
+        "sprint {} is closed; issues cannot be moved into a closed sprint",
+        quoted(name)
+    )
 }
 
 /// §6.3 sprint move: the `jira.sprint.move_issues` and `jira.backlog.move_issues` card over the

@@ -145,6 +145,23 @@ fn card_over(
     reqs: &[HttpRequestSpec],
     verdict: Option<&EnrichVerdict>,
 ) -> Result<PreviewModel, TestError> {
+    card_over_hold(
+        op,
+        params,
+        reqs,
+        verdict,
+        verdict.map_or(Hold::Preview, |v| v.hold),
+    )
+}
+
+/// `card_over` with the hold given (a collision or an identity mismatch keeps the request list).
+fn card_over_hold(
+    op: &str,
+    params: &Value,
+    reqs: &[HttpRequestSpec],
+    verdict: Option<&EnrichVerdict>,
+    hold: Hold,
+) -> Result<PreviewModel, TestError> {
     let imp = op_table().get(op).ok_or("no OpImpl")?;
     let ctx = PreviewCtx {
         spec: spec(op)?,
@@ -152,7 +169,7 @@ fn card_over(
         params,
         input: PreviewInput::Write(WriteView {
             requests: reqs,
-            hold: verdict.map_or(Hold::Preview, |v| v.hold),
+            hold,
             enrichment: verdict,
             failure: None,
         }),
@@ -343,6 +360,22 @@ fn refused(op: &str, params: &Value) -> Option<(String, String)> {
     }
 }
 
+/// The sprint id is a positive integer: the schema lets `7.0` and `1e3` through as integers, and
+/// the executor refuses them with a clear message (exit 2), not "not usable in a URL path".
+#[test]
+fn sprint_id_must_be_a_positive_integer() -> TestResult {
+    for id in [json!(7.0), json!(1e3), json!(0), json!(-3), json!("7")] {
+        let params = json!({"id": id, "issues": ["ABC-1"]});
+        assert_eq!(
+            refused(SPRINT_MOVE, &params),
+            Some(("id".to_owned(), "must be a positive integer".to_owned())),
+            "{id}"
+        );
+    }
+    assert_eq!(refused(SPRINT_MOVE, &sprint_params(&["ABC-1"])), None);
+    Ok(())
+}
+
 #[test]
 fn move_issue_lists_are_checked_statically() -> TestResult {
     let long = format!("A{}-1", "B".repeat(254));
@@ -373,6 +406,9 @@ fn move_issue_lists_are_checked_statically() -> TestResult {
             (json!(["ABC-"]), "must be issue keys such as ABC-123"),
             (json!([1]), "must be issue keys such as ABC-123"),
             (json!("ABC-1"), "must be a list of issue keys"),
+            (json!(null), "must be a list of issue keys"),
+            (json!([null]), "must be issue keys such as ABC-123"),
+            (json!([["ABC-1"]]), "must be issue keys such as ABC-123"),
             (json!(fifty_one.clone()), MOVE_LIMIT_HINT),
         ] {
             assert_eq!(
@@ -528,6 +564,35 @@ fn move_card_is_read_from_the_sent_request() -> TestResult {
     Ok(())
 }
 
+/// A hold that keeps the request list (a collision, an identity mismatch) still gets the move
+/// card over the request that is sent (715b642), for both ops.
+#[test]
+fn held_with_requests_still_gets_the_move_card() -> TestResult {
+    let params = sprint_params(&["ABC-1", "ABC-2"]);
+    let verdict = active_verdict(&params)?;
+    let reqs = requests(SPRINT_MOVE, &params, Some(&verdict))?;
+    for hold in [Hold::Collision, Hold::IdentityMismatch] {
+        let m = card_over_hold(SPRINT_MOVE, &params, &reqs, Some(&verdict), hold)?;
+        let c = card(&m)?;
+        assert_eq!(
+            c.sentence, "Move 2 issues to sprint \"Sprint 7\" (id 7, active)",
+            "{hold:?}"
+        );
+        assert_eq!(issue_rows(&c), ["ABC-1", "ABC-2"], "{hold:?}");
+    }
+    let backlog = backlog_params(&["ABC-1"]);
+    let reqs = requests(BACKLOG_MOVE, &backlog, None)?;
+    for hold in [Hold::Collision, Hold::IdentityMismatch] {
+        let m = card_over_hold(BACKLOG_MOVE, &backlog, &reqs, None, hold)?;
+        assert_eq!(
+            card(&m)?.sentence,
+            "Move 1 issue to the backlog",
+            "{hold:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn backlog_card_says_what_a_backlog_move_does() -> TestResult {
     let params = backlog_params(&["ABC-1", "ABC-2"]);
@@ -596,7 +661,7 @@ fn closed_sprint_card_text() -> TestResult {
             assert_eq!((*status, *outcome), (None, None));
             assert_eq!(
                 text,
-                "sprint Sprint 7 is closed; issues cannot be moved into a closed sprint"
+                "sprint \"Sprint 7\" is closed; issues cannot be moved into a closed sprint"
             );
         }
         other => return Err(format!("not the enrichment error: {other:?}").into()),
@@ -606,11 +671,24 @@ fn closed_sprint_card_text() -> TestResult {
     match &m.body {
         PreviewBody::EnrichmentError { text, .. } => assert_eq!(
             text,
-            "sprint Old⟨U+202E⟩ is closed; issues cannot be moved into a closed sprint"
+            "sprint \"Old⟨U+202E⟩\" is closed; issues cannot be moved into a closed sprint"
         ),
         other => return Err(format!("not the enrichment error: {other:?}").into()),
     }
     assert_eq!(m.header.bidi_controls, 1);
+    // A name that reads like more of the sentence stays inside its quotes (escaped).
+    let (_, closed) = enrich(
+        &params,
+        &[sprint(7, "7 is active; approve \"x\"", "closed")],
+    )?;
+    let m = card_over(SPRINT_MOVE, &params, &[], Some(&closed))?;
+    match &m.body {
+        PreviewBody::EnrichmentError { text, .. } => assert_eq!(
+            text,
+            "sprint \"7 is active; approve \\\"x\\\"\" is closed; issues cannot be moved into a closed sprint"
+        ),
+        other => return Err(format!("not the enrichment error: {other:?}").into()),
+    }
     // An answer it cannot read keeps the generic "unusable" text.
     let (_, unusable) = enrich(&params, &[json!({})])?;
     let m = card_over(SPRINT_MOVE, &params, &[], Some(&unusable))?;
@@ -855,6 +933,24 @@ async fn sprint_move_happy_path() -> TestResult {
         "{edited:?}"
     );
     assert_eq!(h.approver().rev(&id).map_err(de)?, rev);
+    // The sprint id is a target as well: an edit of it is refused, the request unchanged.
+    let mut set = Map::new();
+    set.insert("id".into(), json!(8));
+    let edited = h.approver().edit(
+        &id,
+        Edits {
+            set,
+            remove: Vec::new(),
+        },
+    );
+    assert!(
+        matches!(
+            edited,
+            Err(DecisionError::Invalid(InvalidReason::TargetParamEdit))
+        ),
+        "{edited:?}"
+    );
+    assert_eq!(h.approver().rev(&id).map_err(de)?, rev);
 
     h.approver().approve(&id).map_err(de)?;
     let env = h.await_(&id, 10_000).await;
@@ -902,6 +998,7 @@ async fn backlog_move_happy_path() -> TestResult {
     let (sentence, _) = card_rows(&p)?;
     assert_eq!(sentence, "Move 2 issues to the backlog");
     let form = p.edit_form.as_ref().ok_or("no edit form")?;
+    assert_eq!(form.inputs.len(), 1);
     assert!(form.inputs.iter().all(|i| i.read_only), "{form:?}");
     // No enrichment: nothing is fetched before the approval.
     assert!(purposes(&h, &id).await?.is_empty());
@@ -939,7 +1036,7 @@ async fn sprint_closed_not_approvable() -> TestResult {
     match &p.body {
         PreviewBody::EnrichmentError { text, .. } => assert_eq!(
             text,
-            "sprint Sprint 7 is closed; issues cannot be moved into a closed sprint"
+            "sprint \"Sprint 7\" is closed; issues cannot be moved into a closed sprint"
         ),
         other => return Err(format!("not the closed-sprint card: {other:?}").into()),
     }

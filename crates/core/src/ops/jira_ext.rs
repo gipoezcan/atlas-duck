@@ -855,6 +855,19 @@ fn move_issues<'a>(ctx: &ExecCtx<'a>) -> Result<Vec<&'a str>, ExecError> {
 /// very sprint, in a state issues can be moved into, renders a request.
 pub fn sprint_move_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     let issues = move_issues(ctx)?;
+    // The schema takes `7.0` and `1e3` as integers; no URL path can carry them (T18 review M5).
+    if ctx
+        .params
+        .get("id")
+        .and_then(Value::as_u64)
+        .is_none_or(|n| n == 0)
+    {
+        return Err(ExecError::Invalid(invalid(
+            "id",
+            "must be a positive integer",
+            None,
+        )));
+    }
     resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
     let want = ctx.params.get("id").and_then(Value::as_u64);
     ctx.enrichment
