@@ -8,16 +8,17 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::path::{Path, PathBuf};
 
 use atlas_duck_app_lib::commands::CommandError;
-use atlas_duck_app_lib::commands::approvals::RawPageDto;
+use atlas_duck_app_lib::commands::approvals::{DenyCount, RawPageDto};
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
 use atlas_duck_core::payloads::InvalidReason;
+use atlas_duck_core::redact::BlockReason;
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, BatchFailure, BatchOutcome, CandidateRev, ConnectionFailure, DecisionError,
-    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, SessionKey,
+    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionReport, SessionKey,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
@@ -382,8 +383,62 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Admin(AdminError::ConnectionFailed(ConnectionFailure::Network(
             ConnClass::ConnectTimeout,
         ))),
+        // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
+        CommandError::ReleaseBlocked,
         CommandError::Internal,
     ]
+}
+
+fn recent_items() -> Vec<RecentItem> {
+    vec![
+        RecentItem {
+            request_id: REQ.into(),
+            op_id: "jira.comment.add".into(),
+            class: "write",
+            instance_alias: "work".into(),
+            target_display: "PROJ-1".into(),
+            status: Status::Failed,
+            decided_at: "2026-10-14T09:30:00.000Z".into(),
+            error_text: Some("HTTP 403: no permission".into()),
+            needs_attention: true,
+            acknowledged: false,
+        },
+        RecentItem {
+            request_id: REQ_2.into(),
+            op_id: "jira.issue.get".into(),
+            class: "read",
+            instance_alias: "work".into(),
+            target_display: "PROJ-2".into(),
+            status: Status::Released,
+            decided_at: "2026-10-14T09:31:00.000Z".into(),
+            error_text: None,
+            needs_attention: false,
+            acknowledged: false,
+        },
+    ]
+}
+
+fn redaction_reports() -> Vec<RedactionReport> {
+    vec![
+        RedactionReport {
+            blocked: vec![BlockReason::MaskStillOccurs {
+                path: "fields.summary".into(),
+            }],
+            also_appears_in: vec!["fields.description".into(), "comment[2]".into()],
+            other_occurrences: 3,
+            released_bytes: 1_024,
+        },
+        RedactionReport {
+            blocked: vec![],
+            also_appears_in: vec![],
+            other_occurrences: 0,
+            released_bytes: 512,
+        },
+    ]
+}
+
+fn deny_counts() -> Vec<DenyCount> {
+    vec![DenyCount { denied: 0 }, DenyCount { denied: 3 }]
 }
 
 fn status_lines() -> Vec<StatusLineDto> {
@@ -434,9 +489,12 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("batch_outcome", value(&batch_outcomes())?),
         ("command_error", value(&command_errors())?),
         ("decision_outcome", value(&decision_outcomes())?),
+        ("deny_count", value(&deny_counts())?),
         ("preview", value(&previews())?),
         ("queue_item", value(&queue_items())?),
         ("raw_page", value(&raw_pages())?),
+        ("recent_item", value(&recent_items())?),
+        ("redaction_report", value(&redaction_reports())?),
         ("status_line", value(&status_lines())?),
     ])
 }

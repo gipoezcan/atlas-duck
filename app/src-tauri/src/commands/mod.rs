@@ -38,8 +38,17 @@ use dto::{AppStatusArgs, Args, StatusLineDto};
 pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         app_status,
+        approvals::acknowledge_attention,
+        approvals::decide,
+        approvals::decide_batch,
+        approvals::deny_batch,
+        approvals::deny_session,
         approvals::preview_fetch,
+        approvals::queue_get,
+        approvals::queue_list,
         approvals::raw_page,
+        approvals::recent_list,
+        approvals::redaction_preview,
         window::open_window,
         window::quit
     ])
@@ -69,11 +78,14 @@ pub fn finish<R: Runtime, T: Serialize>(
 }
 
 /// `app_status {}` (Δ1, PD-90): the status lines the tray tooltip and the header banner show.
+/// The inputs come from synchronous core calls, so they are gathered on the blocking pool.
 #[tauri::command]
 pub async fn app_status<R: Runtime>(
     app: AppHandle<R>,
     args: Args<AppStatusArgs>,
 ) -> Result<Vec<StatusLineDto>, CommandError> {
     let Args(AppStatusArgs {}) = args;
-    finish(&app, Ok(status::lines()))
+    let gather = app.clone();
+    let response = blocking(move || Ok(status::lines(&status::gather(&gather)))).await;
+    finish(&app, response)
 }

@@ -1,15 +1,278 @@
-//! The Approvals window's commands (C.10 + Δ1, §5.6). M6 T10: `preview_fetch`, T11: `raw_page`;
-//! Task 12 adds the rest.
+//! The Approvals window's commands (C.10 + Δ1, §5.6). M6 T10: `preview_fetch`, T11: `raw_page`,
+//! T12: the rest. Each command is a thin `#[tauri::command]` (`core()`, the blocking pool,
+//! `finish`) over a pure function of `&dyn DecisionApi` that the tests drive directly: core
+//! decides, this layer only maps the wire types and never decides anything itself.
 
-use atlas_duck_core::{CandidateRev, DecisionApi};
+use atlas_duck_core::{
+    BatchOutcome, CandidateRev, Decision, DecisionApi, DecisionOutcome, QueueItem, RecentItem,
+    RedactionReport,
+};
 use atlas_duck_preview::render::raw::incomplete_tail;
 use atlas_duck_preview::{Platform, Preview, render};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 
-use super::dto::{Args, CandidateRevDto, RequestId};
+use super::dto::{
+    Args, BatchItems, CandidateRevDto, DecisionDto, DenyDetailsDto, EditsDto, PreviewOpsDto,
+    Reason, RedactionOpsDto, RequestId, RequestIds, SessionId,
+};
 use super::{CommandError, blocking, core, finish};
+
+/// Runs `f` over the serving core's `DecisionApi` on the blocking pool (M3 PD-13) and records the
+/// response (S-16). `NotReady` without a serving core.
+async fn with_decisions<R, T, F>(app: &AppHandle<R>, f: F) -> Result<T, CommandError>
+where
+    R: Runtime,
+    T: Serialize + Send + 'static,
+    F: FnOnce(&dyn DecisionApi) -> Result<T, CommandError> + Send + 'static,
+{
+    let response = match core(app) {
+        Ok(core) => {
+            let decisions = core.decisions();
+            blocking(move || f(&*decisions)).await
+        }
+        Err(e) => Err(e),
+    };
+    finish(app, response)
+}
+
+/// `queue_list {}` (C.10): the queue rows, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueListArgs {}
+
+#[tauri::command]
+pub async fn queue_list<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<QueueListArgs>,
+) -> Result<Vec<QueueItem>, CommandError> {
+    let Args(QueueListArgs {}) = args;
+    with_decisions(&app, |d| Ok(d.queue_list())).await
+}
+
+/// `queue_get {request_id}` (C.10): one row; `not_found` once it left the queue.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueueGetArgs {
+    pub request_id: RequestId,
+}
+
+pub fn queue_get_dto(d: &dyn DecisionApi, request_id: &str) -> Result<QueueItem, CommandError> {
+    d.queue_get(request_id).ok_or(CommandError::NotFound)
+}
+
+#[tauri::command]
+pub async fn queue_get<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<QueueGetArgs>,
+) -> Result<QueueItem, CommandError> {
+    let Args(QueueGetArgs { request_id }) = args;
+    with_decisions(&app, move |d| queue_get_dto(d, request_id.as_str())).await
+}
+
+/// `decide {request_id, decision, candidate_rev, edits?, redactions?, reason?, deny_details?}`
+/// (C.10, PD-20, PD-66): one decision on the revision the approver saw. Which combinations make
+/// sense (a release of a write, an approve of an unopened revision, an edit of a target) is
+/// core's call and its refusals pass through unchanged.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecideArgs {
+    pub request_id: RequestId,
+    pub decision: DecisionDto,
+    pub candidate_rev: CandidateRevDto,
+    pub edits: Option<EditsDto>,
+    pub redactions: Option<RedactionOpsDto>,
+    pub reason: Option<Reason>,
+    pub deny_details: Option<DenyDetailsDto>,
+}
+
+impl DecideArgs {
+    /// The core decision, field for field.
+    pub fn into_decision(self) -> Decision {
+        Decision {
+            request_id: self.request_id.into_inner(),
+            decision: self.decision.0,
+            candidate_rev: self.candidate_rev.0,
+            edits: self.edits.map(|e| e.0),
+            redactions: self.redactions.map(|r| r.0),
+            reason: self.reason.map(Reason::into_inner),
+            deny_details: self.deny_details.map(|d| d.0),
+        }
+    }
+}
+
+pub fn decide_dto(d: &dyn DecisionApi, args: DecideArgs) -> Result<DecisionOutcome, CommandError> {
+    Ok(d.decide(args.into_decision())?)
+}
+
+#[tauri::command]
+pub async fn decide<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<DecideArgs>,
+) -> Result<DecisionOutcome, CommandError> {
+    let Args(args) = args;
+    with_decisions(&app, move |d| decide_dto(d, args)).await
+}
+
+/// `decide_batch {items}` (C.10, L43): the natural positive decision of each item, all or
+/// nothing; core confirms in its own native dialog (U-32).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecideBatchArgs {
+    pub items: BatchItems,
+}
+
+pub fn decide_batch_dto(
+    d: &dyn DecisionApi,
+    items: BatchItems,
+) -> Result<BatchOutcome, CommandError> {
+    Ok(d.decide_batch(items.0)?)
+}
+
+#[tauri::command]
+pub async fn decide_batch<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<DecideBatchArgs>,
+) -> Result<BatchOutcome, CommandError> {
+    let Args(DecideBatchArgs { items }) = args;
+    with_decisions(&app, move |d| decide_batch_dto(d, items)).await
+}
+
+/// How many items a batch deny denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DenyCount {
+    pub denied: u64,
+}
+
+fn deny_count(n: usize) -> DenyCount {
+    DenyCount {
+        denied: u64::try_from(n).unwrap_or(u64::MAX),
+    }
+}
+
+/// `deny_batch {request_ids, reason}` (Δ1, L43): no dialog, per item, not all-or-nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DenyBatchArgs {
+    pub request_ids: RequestIds,
+    pub reason: Reason,
+}
+
+pub fn deny_batch_dto(
+    d: &dyn DecisionApi,
+    request_ids: &RequestIds,
+    reason: &Reason,
+) -> Result<DenyCount, CommandError> {
+    Ok(deny_count(
+        d.deny_batch(request_ids.as_slice(), reason.as_str())?,
+    ))
+}
+
+#[tauri::command]
+pub async fn deny_batch<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<DenyBatchArgs>,
+) -> Result<DenyCount, CommandError> {
+    let Args(DenyBatchArgs {
+        request_ids,
+        reason,
+    }) = args;
+    with_decisions(&app, move |d| deny_batch_dto(d, &request_ids, &reason)).await
+}
+
+/// `deny_session {session_id, reason}` (Δ1, PD-86): denies the queued items of one session.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DenySessionArgs {
+    pub session_id: SessionId,
+    pub reason: Reason,
+}
+
+/// The session key behind `session_id` is found in the queue here, in Rust; no path crosses the
+/// webview boundary. An id no queued item carries is `not_found` and denies nothing.
+pub fn deny_session_dto(
+    d: &dyn DecisionApi,
+    session_id: &SessionId,
+    reason: &Reason,
+) -> Result<DenyCount, CommandError> {
+    let session = d
+        .queue_list()
+        .into_iter()
+        .find(|item| item.session_id == session_id.as_str())
+        .map(|item| item.session)
+        .ok_or(CommandError::NotFound)?;
+    Ok(deny_count(d.deny_session(session, reason.as_str())?))
+}
+
+#[tauri::command]
+pub async fn deny_session<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<DenySessionArgs>,
+) -> Result<DenyCount, CommandError> {
+    let Args(DenySessionArgs { session_id, reason }) = args;
+    with_decisions(&app, move |d| deny_session_dto(d, &session_id, &reason)).await
+}
+
+/// `acknowledge_attention {request_ids}` (C.10): in memory, not audited.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcknowledgeAttentionArgs {
+    pub request_ids: RequestIds,
+}
+
+#[tauri::command]
+pub async fn acknowledge_attention<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<AcknowledgeAttentionArgs>,
+) -> Result<(), CommandError> {
+    let Args(AcknowledgeAttentionArgs { request_ids }) = args;
+    with_decisions(&app, move |d| {
+        d.acknowledge_attention(request_ids.as_slice());
+        Ok(())
+    })
+    .await
+}
+
+/// `recent_list {}` (Δ1): the "Recently decided (24 h) / Needs attention" rows.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecentListArgs {}
+
+#[tauri::command]
+pub async fn recent_list<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RecentListArgs>,
+) -> Result<Vec<RecentItem>, CommandError> {
+    let Args(RecentListArgs {}) = args;
+    with_decisions(&app, |d| Ok(d.recent())).await
+}
+
+/// `redaction_preview {request_id, candidate_rev, ops}` (Δ1, Δ2): what `ops` would do to an
+/// opened revision; UI-only, nothing is logged.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionPreviewArgs {
+    pub request_id: RequestId,
+    pub candidate_rev: CandidateRevDto,
+    pub ops: PreviewOpsDto,
+}
+
+pub fn redaction_preview_dto(
+    d: &dyn DecisionApi,
+    args: &RedactionPreviewArgs,
+) -> Result<RedactionReport, CommandError> {
+    Ok(d.redaction_preview(args.request_id.as_str(), args.candidate_rev.0, &args.ops.0)?)
+}
+
+#[tauri::command]
+pub async fn redaction_preview<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RedactionPreviewArgs>,
+) -> Result<RedactionReport, CommandError> {
+    let Args(args) = args;
+    with_decisions(&app, move |d| redaction_preview_dto(d, &args)).await
+}
 
 /// `preview_fetch {request_id, candidate_rev?}` (Δ1). Without `candidate_rev` the current
 /// revision is shown (a missing `Option` field is `None`; no `#[serde(default)]` around a bounded
@@ -29,8 +292,23 @@ pub struct PreviewFetchResponse {
     pub srcdoc: String,
 }
 
-/// `preview_fetch` (§5.6 "Opened"): core commits `PREVIEW_SHOWN` before it returns the preview;
-/// the document is rendered on the blocking pool as well (a large candidate takes a while).
+/// What `preview_fetch` does over a `DecisionApi`: core commits `PREVIEW_SHOWN` before it returns
+/// the preview (§5.6 "Opened"); the document is rendered from that same preview.
+pub fn preview_fetch_dto(
+    decisions: &dyn DecisionApi,
+    request_id: &str,
+    rev: Option<CandidateRev>,
+) -> Result<PreviewFetchResponse, CommandError> {
+    let preview = decisions
+        .preview_fetch(request_id, rev)
+        .map_err(CommandError::from_candidate_read)?
+        .preview;
+    let srcdoc = render::document(&preview, Platform::current());
+    Ok(PreviewFetchResponse { preview, srcdoc })
+}
+
+/// `preview_fetch` (§5.6 "Opened"): on the blocking pool as well (a large candidate takes a
+/// while to render).
 #[tauri::command]
 pub async fn preview_fetch<R: Runtime>(
     app: AppHandle<R>,
@@ -40,21 +318,10 @@ pub async fn preview_fetch<R: Runtime>(
         request_id,
         candidate_rev,
     }) = args;
-    let response = match core(&app) {
-        Ok(core) => {
-            let decisions = core.decisions();
-            blocking(move || {
-                let preview = decisions
-                    .preview_fetch(request_id.as_str(), candidate_rev.map(|r| r.0))?
-                    .preview;
-                let srcdoc = render::document(&preview, Platform::current());
-                Ok(PreviewFetchResponse { preview, srcdoc })
-            })
-            .await
-        }
-        Err(e) => Err(e),
-    };
-    finish(&app, response)
+    with_decisions(&app, move |d| {
+        preview_fetch_dto(d, request_id.as_str(), candidate_rev.map(|r| r.0))
+    })
+    .await
 }
 
 /// `raw_page {request_id, candidate_rev, page}` (Δ1, PD-68): the page of an opened revision.
@@ -87,13 +354,17 @@ pub fn raw_page_dto(
     rev: CandidateRev,
     page: u64,
 ) -> Result<RawPageDto, CommandError> {
-    let current = decisions.raw_page(request_id, rev, page)?;
+    let current = decisions
+        .raw_page(request_id, rev, page)
+        .map_err(CommandError::from_candidate_read)?;
     if page >= current.page_count {
         return Err(CommandError::InvalidArgument { field: "page" });
     }
     let carry = match page.checked_sub(1) {
         Some(before) => {
-            let previous = decisions.raw_page(request_id, rev, before)?;
+            let previous = decisions
+                .raw_page(request_id, rev, before)
+                .map_err(CommandError::from_candidate_read)?;
             incomplete_tail(&previous.bytes).to_vec()
         }
         None => Vec::new(),
@@ -123,15 +394,10 @@ pub async fn raw_page<R: Runtime>(
         candidate_rev,
         page,
     }) = args;
-    let response = match core(&app) {
-        Ok(core) => {
-            let decisions = core.decisions();
-            blocking(move || raw_page_dto(&*decisions, request_id.as_str(), candidate_rev.0, page))
-                .await
-        }
-        Err(e) => Err(e),
-    };
-    finish(&app, response)
+    with_decisions(&app, move |d| {
+        raw_page_dto(d, request_id.as_str(), candidate_rev.0, page)
+    })
+    .await
 }
 
 #[cfg(test)]

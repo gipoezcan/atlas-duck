@@ -1,0 +1,22 @@
+[
+  {
+    "also_appears_in": [
+      "fields.description",
+      "comment[2]"
+    ],
+    "blocked": [
+      {
+        "path": "fields.summary",
+        "reason": "mask_still_occurs"
+      }
+    ],
+    "other_occurrences": 3,
+    "released_bytes": 1024
+  },
+  {
+    "also_appears_in": [],
+    "blocked": [],
+    "other_occurrences": 0,
+    "released_bytes": 512
+  }
+]

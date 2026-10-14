@@ -1,6 +1,7 @@
 //! The one error type every command answers with (PD-66, §2.4, §10.3).
 
-use atlas_duck_core::{AdminError, DecisionError};
+use atlas_duck_core::payloads::InvalidReason;
+use atlas_duck_core::{AdminError, DecisionError, RELEASE_BLOCKED_INTERNAL};
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
@@ -25,6 +26,10 @@ pub enum CommandError {
     NotReady,
     Decision(DecisionError),
     Admin(AdminError),
+    /// M5 M-11 (T7 review H1): the candidate could not be built, so a preview or a Raw page has
+    /// nothing to show. The text is the core constant, chosen here so the UI never maps an error
+    /// kind to it; wire `{"kind": "release_blocked", "text": ..}`.
+    ReleaseBlocked,
     /// A blocking task died, or a state the command layer cannot explain.
     Internal,
 }
@@ -37,7 +42,17 @@ impl CommandError {
             Self::NotReady => "not_ready",
             Self::Decision(_) => "decision",
             Self::Admin(_) => "admin",
+            Self::ReleaseBlocked => "release_blocked",
             Self::Internal => "internal",
+        }
+    }
+
+    /// A refusal of core on a read of the candidate (`preview_fetch`, `raw_page`): `NotApprovable`
+    /// there is the rebuild failure of §5.2, shown as the `internal` banner; the rest is as is.
+    pub fn from_candidate_read(e: DecisionError) -> Self {
+        match e {
+            DecisionError::Invalid(InvalidReason::NotApprovable) => Self::ReleaseBlocked,
+            other => Self::Decision(other),
         }
     }
 }
@@ -50,6 +65,7 @@ impl Serialize for CommandError {
             Self::InvalidArgument { field } => m.serialize_entry("field", field)?,
             Self::Decision(e) => m.serialize_entry("error", e)?,
             Self::Admin(e) => m.serialize_entry("error", e)?,
+            Self::ReleaseBlocked => m.serialize_entry("text", RELEASE_BLOCKED_INTERNAL)?,
             Self::NotFound | Self::NotReady | Self::Internal => {}
         }
         m.end()
@@ -113,6 +129,23 @@ mod tests {
         assert!(
             text.starts_with(r#"{"kind":"decision","error":{"kind":"stale""#),
             "{text}"
+        );
+        assert_eq!(
+            serde_json::to_value(CommandError::ReleaseBlocked).ok(),
+            Some(json!({"kind": "release_blocked", "text": RELEASE_BLOCKED_INTERNAL}))
+        );
+        // Only a refused read of the candidate becomes the banner; every other refusal is as it was.
+        assert_eq!(
+            CommandError::from_candidate_read(DecisionError::Invalid(InvalidReason::NotApprovable)),
+            CommandError::ReleaseBlocked
+        );
+        assert_eq!(
+            CommandError::from_candidate_read(DecisionError::NotDecidable),
+            CommandError::Decision(DecisionError::NotDecidable)
+        );
+        assert_eq!(
+            CommandError::from_candidate_read(DecisionError::Invalid(InvalidReason::NotOpened)),
+            CommandError::Decision(DecisionError::Invalid(InvalidReason::NotOpened))
         );
         let admin = CommandError::from(AdminError::NotFound);
         assert_eq!(

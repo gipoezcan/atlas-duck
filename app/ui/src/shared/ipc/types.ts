@@ -59,6 +59,41 @@ export interface BatchOutcome {
   items: DecisionOutcome[];
 }
 
+/** `deny_batch` / `deny_session`: how many queued items were denied. */
+export interface DenyCount {
+  denied: number;
+}
+
+/** One "Recently decided (24 h) / Needs attention" row (`recent_list`). */
+export interface RecentItem {
+  request_id: string;
+  op_id: string;
+  class: string;
+  instance_alias: string;
+  target_display: string;
+  status: string;
+  /** RFC 3339 UTC, ms. */
+  decided_at: string;
+  /** Display-escaped Atlassian text, only while `await` can still deliver it. */
+  error_text: string | null;
+  needs_attention: boolean;
+  acknowledged: boolean;
+}
+
+/** Why a release must not happen: a tagged object with the `name[3]` location. */
+export interface BlockReason {
+  reason: string;
+  path: string;
+}
+
+/** What a set of redaction ops would do to an opened revision (`redaction_preview`). */
+export interface RedactionReport {
+  blocked: BlockReason[];
+  also_appears_in: string[];
+  other_occurrences: number;
+  released_bytes: number;
+}
+
 export interface PreviewBody {
   kind: string;
   [field: string]: unknown;
@@ -113,4 +148,6 @@ export type CommandError =
   | { kind: 'internal' }
   | { kind: 'decision'; error: CoreError }
   | { kind: 'admin'; error: CoreError }
+  /** The candidate could not be built (M5 M-11); `text` is the app-generated banner. */
+  | { kind: 'release_blocked'; text: string }
   | { kind: 'refused'; message: string };

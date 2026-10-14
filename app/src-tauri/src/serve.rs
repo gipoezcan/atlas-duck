@@ -293,6 +293,11 @@ impl ServeState {
         lock(&self.gate).as_ref().map(|g| g.state())
     }
 
+    /// True while the keychain retry loop (§8.7) runs.
+    pub fn keychain_retrying(&self) -> bool {
+        lock(&self.retry).as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     /// True while the `serve` task runs.
     pub fn serving(&self) -> bool {
         lock(&self.served)

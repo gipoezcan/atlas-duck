@@ -3,11 +3,20 @@
   "description": "the Approvals window (C.10 + Δ1): queue, previews, decisions, header triggers",
   "windows": ["approvals"],
   "permissions": [
+    "allow-acknowledge-attention",
     "allow-app-status",
+    "allow-decide",
+    "allow-decide-batch",
+    "allow-deny-batch",
+    "allow-deny-session",
     "allow-open-window",
     "allow-preview-fetch",
+    "allow-queue-get",
+    "allow-queue-list",
     "allow-quit",
     "allow-raw-page",
+    "allow-recent-list",
+    "allow-redaction-preview",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

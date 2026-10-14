@@ -1,0 +1,26 @@
+[
+  {
+    "acknowledged": false,
+    "class": "write",
+    "decided_at": "2026-10-14T09:30:00.000Z",
+    "error_text": "HTTP 403: no permission",
+    "instance_alias": "work",
+    "needs_attention": true,
+    "op_id": "jira.comment.add",
+    "request_id": "req_0123456789abcdefghij",
+    "status": "failed",
+    "target_display": "PROJ-1"
+  },
+  {
+    "acknowledged": false,
+    "class": "read",
+    "decided_at": "2026-10-14T09:31:00.000Z",
+    "error_text": null,
+    "instance_alias": "work",
+    "needs_attention": false,
+    "op_id": "jira.issue.get",
+    "request_id": "req_abcdefghij0123456789",
+    "status": "released",
+    "target_display": "PROJ-2"
+  }
+]

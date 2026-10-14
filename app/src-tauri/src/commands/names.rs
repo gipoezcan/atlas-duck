@@ -7,9 +7,18 @@
 /// Every app command, sorted. Later tasks append one line each.
 #[rustfmt::skip]
 pub const COMMANDS: &[&str] = &[
+    "acknowledge_attention",
     "app_status",
+    "decide",
+    "decide_batch",
+    "deny_batch",
+    "deny_session",
     "open_window",
     "preview_fetch",
+    "queue_get",
+    "queue_list",
     "quit",
     "raw_page",
+    "recent_list",
+    "redaction_preview",
 ];

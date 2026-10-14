@@ -6,7 +6,10 @@
 
 use std::cell::Cell;
 
-use atlas_duck_core::CandidateRev;
+use atlas_duck_core::{
+    BatchItem, CandidateRev, DecisionKind, DenyDetails, DropScope, Edits, RedactionOp,
+    RedactionPreset, UrlMode,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -164,6 +167,321 @@ impl<'de> Deserialize<'de> for CandidateRevDto {
         CandidateRev::deserialize(v)
             .map(CandidateRevDto)
             .map_err(|_| refuse("candidate_rev"))
+    }
+}
+
+/// Parses `d` as a JSON value and then as `T`; a refusal at either step names `field`.
+fn nested<'de, T: DeserializeOwned, D: Deserializer<'de>>(
+    d: D,
+    field: &'static str,
+) -> Result<T, D::Error> {
+    let v = Value::deserialize(d).map_err(|_| refuse::<D::Error>(field))?;
+    T::deserialize(v).map_err(|_| refuse::<D::Error>(field))
+}
+
+/// plan text (PD-66): `edits` is at most 1 MiB of serialized JSON.
+pub const EDITS_MAX_BYTES: usize = 1 << 20;
+/// plan text (PD-66): at most 1 000 redaction ops, and 1 000 request ids or batch items per call
+/// (the queue holds far fewer; the bound only keeps a call finite).
+pub const LIST_MAX: usize = 1_000;
+/// plan text (PD-66): a string of one redaction op (and the value of a `drop_item`) is at most
+/// 64 KiB.
+pub const OP_STRING_MAX_BYTES: usize = 64 << 10;
+/// PD-86: a session id is the lowercase hex SHA-256 of the session key.
+pub const SESSION_ID_LEN: usize = 64;
+
+/// The five decision kinds of C.7 (`DecisionKind` has no `Deserialize`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecisionDto(pub DecisionKind);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DecisionWire {
+    Approve,
+    ApproveEdited,
+    Release,
+    ReleaseRedacted,
+    Deny,
+}
+
+impl<'de> Deserialize<'de> for DecisionDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(DecisionDto(
+            match nested::<DecisionWire, D>(d, "decision")? {
+                DecisionWire::Approve => DecisionKind::Approve,
+                DecisionWire::ApproveEdited => DecisionKind::ApproveEdited,
+                DecisionWire::Release => DecisionKind::Release,
+                DecisionWire::ReleaseRedacted => DecisionKind::ReleaseRedacted,
+                DecisionWire::Deny => DecisionKind::Deny,
+            },
+        ))
+    }
+}
+
+/// The deny-hint choice (§5.4/§6.3/§11.2): the wire form of `DenyDetails`' own serialization, a
+/// closed set of keys per kind. Core still decides whether it accepts the kind (PD-70).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenyDetailsDto(pub DenyDetails);
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum DenyDetailsWire {
+    UpstreamHttp { include_messages: bool },
+    OutcomeHint,
+    ResolutionFailed { include_candidates: bool },
+    MissingFields { include_allowed_values: bool },
+}
+
+impl<'de> Deserialize<'de> for DenyDetailsDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(DenyDetailsDto(
+            match nested::<DenyDetailsWire, D>(d, "deny_details")? {
+                DenyDetailsWire::UpstreamHttp { include_messages } => {
+                    DenyDetails::UpstreamHttp { include_messages }
+                }
+                DenyDetailsWire::OutcomeHint => DenyDetails::OutcomeHint,
+                DenyDetailsWire::ResolutionFailed { include_candidates } => {
+                    DenyDetails::ResolutionFailed { include_candidates }
+                }
+                DenyDetailsWire::MissingFields {
+                    include_allowed_values,
+                } => DenyDetails::MissingFields {
+                    include_allowed_values,
+                },
+            },
+        ))
+    }
+}
+
+/// The human's edits `{set, remove}` (C.7), at most [`EDITS_MAX_BYTES`] of JSON; a missing key is
+/// empty. Whether a key may be edited is core's decision (targets and baselines are immutable).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditsDto(pub Edits);
+
+impl<'de> Deserialize<'de> for EditsDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bad = || refuse::<D::Error>("edits");
+        let v = Value::deserialize(d).map_err(|_| bad())?;
+        let m = v.as_object().ok_or_else(bad)?;
+        if !m.keys().all(|k| k == "set" || k == "remove") || !bounded_json(&v, EDITS_MAX_BYTES) {
+            return Err(bad());
+        }
+        let set = match m.get("set") {
+            None => serde_json::Map::new(),
+            Some(s) => s.as_object().cloned().ok_or_else(bad)?,
+        };
+        let remove = match m.get("remove") {
+            None => Vec::new(),
+            Some(Value::Array(a)) if a.len() <= LIST_MAX => a
+                .iter()
+                .map(|k| k.as_str().map(str::to_owned))
+                .collect::<Option<Vec<String>>>()
+                .ok_or_else(bad)?,
+            Some(_) => return Err(bad()),
+        };
+        Ok(EditsDto(Edits { set, remove }))
+    }
+}
+
+/// One redaction op in its wire form: the externally tagged shape `RedactionOp` serializes to,
+/// every key closed. The two `*_loc` fields are redaction-grammar locations inside the candidate
+/// JSON (`issues[key=A].fields`), not filesystem paths; the wire names are the C.7 ones.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum RedactionOpWire {
+    DropItem {
+        #[serde(rename = "array_path")]
+        array_loc: String,
+        key: String,
+        value: Value,
+    },
+    DropField {
+        #[serde(rename = "path")]
+        field_loc: String,
+        scope: DropScope,
+    },
+    MaskText {
+        text: String,
+        every_occurrence: bool,
+        at: Option<String>,
+    },
+    UrlField {
+        mode: UrlMode,
+    },
+    Preset(RedactionPreset),
+}
+
+impl RedactionOpWire {
+    fn within_bounds(&self) -> bool {
+        let ok = |s: &str| s.len() <= OP_STRING_MAX_BYTES;
+        match self {
+            Self::DropItem {
+                array_loc,
+                key,
+                value,
+            } => ok(array_loc) && ok(key) && bounded_json(value, OP_STRING_MAX_BYTES),
+            Self::DropField { field_loc, .. } => ok(field_loc),
+            Self::MaskText { text, at, .. } => ok(text) && at.as_deref().is_none_or(ok),
+            Self::UrlField { .. } | Self::Preset(_) => true,
+        }
+    }
+
+    fn into_op(self) -> RedactionOp {
+        match self {
+            Self::DropItem {
+                array_loc,
+                key,
+                value,
+            } => RedactionOp::DropItem {
+                array_path: array_loc,
+                key,
+                value,
+            },
+            Self::DropField { field_loc, scope } => RedactionOp::DropField {
+                path: field_loc,
+                scope,
+            },
+            Self::MaskText {
+                text,
+                every_occurrence,
+                at,
+            } => RedactionOp::MaskText {
+                text,
+                every_occurrence,
+                at,
+            },
+            Self::UrlField { mode } => RedactionOp::UrlField { mode },
+            Self::Preset(p) => RedactionOp::Preset(p),
+        }
+    }
+}
+
+/// At most [`LIST_MAX`] redaction ops, each inside its bounds (PD-66); a refusal names `field`.
+fn redaction_ops<'de, D: Deserializer<'de>>(
+    d: D,
+    field: &'static str,
+) -> Result<Vec<RedactionOp>, D::Error> {
+    let bad = || refuse::<D::Error>(field);
+    let v = Value::deserialize(d).map_err(|_| bad())?;
+    let Value::Array(items) = v else {
+        return Err(bad());
+    };
+    if items.len() > LIST_MAX {
+        return Err(bad());
+    }
+    let mut ops = Vec::with_capacity(items.len());
+    for item in items {
+        let wire = RedactionOpWire::deserialize(item).map_err(|_| bad())?;
+        if !wire.within_bounds() {
+            return Err(bad());
+        }
+        ops.push(wire.into_op());
+    }
+    Ok(ops)
+}
+
+/// The `redactions` of a decision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RedactionOpsDto(pub Vec<RedactionOp>);
+
+impl<'de> Deserialize<'de> for RedactionOpsDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        redaction_ops(d, "redactions").map(RedactionOpsDto)
+    }
+}
+
+/// The `ops` of a redaction preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreviewOpsDto(pub Vec<RedactionOp>);
+
+impl<'de> Deserialize<'de> for PreviewOpsDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        redaction_ops(d, "ops").map(PreviewOpsDto)
+    }
+}
+
+/// One to [`LIST_MAX`] request ids (PD-66 pattern each).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RequestIds(Vec<String>);
+
+impl RequestIds {
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestIds {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let ids: Vec<String> = nested(d, "request_ids")?;
+        if (1..=LIST_MAX).contains(&ids.len()) && ids.iter().all(|s| RequestId::is_valid(s)) {
+            Ok(RequestIds(ids))
+        } else {
+            Err(refuse("request_ids"))
+        }
+    }
+}
+
+/// One batch item: the request and the revision the approver saw.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BatchItemWire {
+    request_id: RequestId,
+    candidate_rev: CandidateRevDto,
+}
+
+/// One to [`LIST_MAX`] `{request_id, candidate_rev}` items of a batch decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchItems(pub Vec<BatchItem>);
+
+impl<'de> Deserialize<'de> for BatchItems {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let bad = || refuse::<D::Error>("items");
+        let v = Value::deserialize(d).map_err(|_| bad())?;
+        let Value::Array(items) = v else {
+            return Err(bad());
+        };
+        if !(1..=LIST_MAX).contains(&items.len()) {
+            return Err(bad());
+        }
+        items
+            .into_iter()
+            .map(|item| {
+                BatchItemWire::deserialize(item)
+                    .map(|w| BatchItem {
+                        request_id: w.request_id.into_inner(),
+                        candidate_rev: w.candidate_rev.0,
+                    })
+                    .map_err(|_| bad())
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(BatchItems)
+    }
+}
+
+/// PD-86: a session id, 64 lowercase hex characters; the app resolves it to the session key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn is_valid(s: &str) -> bool {
+        s.len() == SESSION_ID_LEN && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d).map_err(|_| refuse::<D::Error>("session_id"))?;
+        if SessionId::is_valid(&s) {
+            Ok(SessionId(s))
+        } else {
+            Err(refuse("session_id"))
+        }
     }
 }
 

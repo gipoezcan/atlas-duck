@@ -1,14 +1,18 @@
 import type {
   BatchOutcome,
+  BlockReason,
   CandidateRev,
   CommandError,
   CoreError,
   DecisionOutcome,
+  DenyCount,
   DenyOffer,
   DenyOfferKind,
   Preview,
   QueueItem,
   RawPage,
+  RecentItem,
+  RedactionReport,
   StatusLine,
 } from './types';
 
@@ -81,6 +85,32 @@ export const isDecisionOutcome = (v: unknown): v is DecisionOutcome =>
 export const isBatchOutcome = (v: unknown): v is BatchOutcome =>
   fields(v, { batch_id: isStr, items: arrayOf(isDecisionOutcome) });
 
+export const isDenyCount = (v: unknown): v is DenyCount => fields(v, { denied: isNum });
+
+export const isRecentItem = (v: unknown): v is RecentItem =>
+  fields(v, {
+    request_id: isStr,
+    op_id: isStr,
+    class: isStr,
+    instance_alias: isStr,
+    target_display: isStr,
+    status: isStr,
+    decided_at: isStr,
+    error_text: strOrNull,
+    needs_attention: isBool,
+    acknowledged: isBool,
+  });
+
+const isBlockReason = (v: unknown): v is BlockReason => fields(v, { reason: isStr, path: isStr });
+
+export const isRedactionReport = (v: unknown): v is RedactionReport =>
+  fields(v, {
+    blocked: arrayOf(isBlockReason),
+    also_appears_in: arrayOf(isStr),
+    other_occurrences: isNum,
+    released_bytes: isNum,
+  });
+
 const DENY_OFFER_KINDS: readonly unknown[] = [
   'upstream_http',
   'outcome_hint',
@@ -124,6 +154,9 @@ export function toCommandError(raw: unknown): CommandError {
       case 'decision':
       case 'admin':
         if (isCoreError(raw.error)) return { kind: raw.kind, error: raw.error };
+        break;
+      case 'release_blocked':
+        if (isStr(raw.text)) return { kind: 'release_blocked', text: raw.text };
         break;
     }
   }
