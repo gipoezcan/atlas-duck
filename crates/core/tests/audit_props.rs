@@ -282,6 +282,87 @@ fn u32_every_positive_decision_has_preview_shown() -> TestResult {
     Ok(())
 }
 
+/// U-32 is enforced, not only observed (M3 T29 M-11): flows try `release_unopened` after a
+/// redaction and `approve_unopened` after an edit, get `Err(Invalid(NotOpened))`, and the property
+/// then runs over the log: every release and approval, outcome releases included, names the
+/// `candidate_rev` of an earlier `PREVIEW_SHOWN` of its request.
+#[test]
+fn u32_unopened_attempts_rejected_then_property_holds() -> TestResult {
+    use atlas_duck_core::testing::Flow;
+    use common::flows::{
+        check_preview_shown, flow_harness, mount_jira, run_flow, run_unopened_attempts,
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let h = flow_harness().await?;
+        mount_jira(&h).await?;
+        run_unopened_attempts(&h, 0).await?;
+        run_flow(&h, Flow::ReadOutcome, 1).await?;
+        let checked = check_preview_shown(&h).await?;
+        // The redacted release, the edited approval and the outcome release at the least.
+        assert!(checked >= 3, "only {checked} decisions checked");
+        let refused = h
+            .audit_records()
+            .await?
+            .iter()
+            .filter(|r| r.event_type == EventType::DECISION_INVALID)
+            .count();
+        assert!(refused >= 2, "{refused} refusals, wanted the two attempts");
+        drop(h);
+        Ok::<_, TestError>(())
+    })?;
+    Ok(())
+}
+
+/// PD-57: every `READ_RELEASED` and `SCRIPT_RELEASED` of the flow property carries a
+/// `candidate_rev` object equal to that of an earlier `PREVIEW_SHOWN` of the same request, the
+/// outcome releases (`{code, hint}`) included; the fixed sequence has data, upstream-error and
+/// outcome releases.
+#[test]
+fn u32_released_candidate_rev_matches_preview_shown() -> TestResult {
+    use atlas_duck_core::testing::Flow;
+    use common::flows::{check_preview_shown, flow_harness, mount_jira, run_flow};
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let h = flow_harness().await?;
+        mount_jira(&h).await?;
+        let flows = [
+            Flow::ReadRelease,
+            Flow::ReadUpstreamError,
+            Flow::ReadOutcome,
+            Flow::ReadDeny,
+        ];
+        for (n, f) in flows.iter().enumerate() {
+            run_flow(&h, *f, n).await?;
+        }
+        let checked = check_preview_shown(&h).await?;
+        let released: Vec<_> = h
+            .audit_records()
+            .await?
+            .into_iter()
+            .filter(|r| r.event_type == EventType::READ_RELEASED)
+            .collect();
+        assert!(
+            released.len() >= 3 && released.iter().any(|r| r.payload["code"].is_string()),
+            "{} releases, no outcome release among them",
+            released.len()
+        );
+        for r in &released {
+            assert!(r.payload["candidate_rev"].is_object(), "{}", r.payload);
+        }
+        assert!(checked >= released.len());
+        drop(h);
+        Ok::<_, TestError>(())
+    })?;
+    Ok(())
+}
+
 /// A fixed sequence that makes every kind of positive decision (a plain release, a released
 /// upstream error, an approval, an edited approval, a stale write returned and denied): the
 /// property is not vacuous for any of them.

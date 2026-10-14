@@ -683,3 +683,105 @@ async fn real_short_page_with_echo_above_want_ends() -> TestResult {
     assert_eq!(out.next_start, None);
     Ok(())
 }
+
+/// Bytes this thread allocated since the test started counting (T10 minor 9). The pages of the
+/// test below are read on the test's own thread (a current-thread runtime), so the figure is the
+/// client's alone: the mock server runs on threads of its own.
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub struct Counting;
+
+    fn bump(n: usize) {
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        let _ = ALLOCATED.try_with(|c| c.set(c.get().saturating_add(n)));
+    }
+
+    pub fn allocated() -> u64 {
+        ALLOCATED.try_with(Cell::get).unwrap_or(0)
+    }
+
+    // SAFETY: every call is forwarded unchanged to `System`; the counter only adds a size.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            bump(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            bump(layout.size());
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            bump(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+}
+
+#[global_allocator]
+static ALLOC: counting::Counting = counting::Counting;
+
+/// T10 minor 9: a page is parsed once into a value tree, by nobody. `send_one` checks that the
+/// body is JSON without building a tree, and the page facts are read the same way (the items are
+/// counted, not kept), so reading a large page of many small items allocates a few times its size
+/// (the response buffer, the copy kept in the control, the copy in the outcome) and not the
+/// ten-fold of a `serde_json::Value` of it.
+#[tokio::test]
+async fn page_facts_read_once_large_page() -> TestResult {
+    const ITEMS: u64 = 6000;
+    let dc = MockDc::start(Product::Jira, "").await;
+    let values: Vec<Value> = (0..ITEMS)
+        .map(|i| {
+            json!({
+                "id": i, "name": "b", "type": "scrum",
+                "location": { "projectId": 1, "key": "A" },
+                "tags": ["x", "y"], "ok": true
+            })
+        })
+        .collect();
+    let page = json!({
+        "maxResults": ITEMS, "startAt": 0, "total": ITEMS, "isLast": true, "values": values
+    })
+    .to_string();
+    let body_len = u64::try_from(page.len())?;
+    Mock::given(path("/rest/agile/1.0/board"))
+        .respond_with(dc.response(200).set_body_raw(page, "application/json"))
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let cover = test_cover()?;
+    let call = board_call(u32::try_from(ITEMS)?, 0);
+    // A first read warms what the client allocates once (connection, TLS-free pools).
+    let warm = t
+        .client
+        .read_paginated(&cover, &call, &ReadBudget::default())
+        .await;
+    assert_eq!(warm.items_fetched, ITEMS);
+
+    let before = counting::allocated();
+    let out = t
+        .client
+        .read_paginated(&cover, &call, &ReadBudget::default())
+        .await;
+    let used = counting::allocated() - before;
+    assert_eq!(out.items_fetched, ITEMS);
+    assert_eq!(out.end, PageEnd::ResultsEnded);
+    assert_eq!(out.server_total, Some(ITEMS));
+    assert!(
+        used < 6 * body_len,
+        "{used} bytes allocated for a {body_len} byte page ({} times)",
+        used / body_len
+    );
+    Ok(())
+}

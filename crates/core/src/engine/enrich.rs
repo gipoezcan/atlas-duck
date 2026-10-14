@@ -118,8 +118,10 @@ pub(super) async fn run(
             let mut attempt = 0u8;
             let (record, got) = loop {
                 let seen = engine.identity_epoch(&entry.instance_id);
+                // The control served the GETs before: `sent` is this GET's own flag (T24 M-4).
+                ctl.begin_call();
                 // A cancel while this GET is in flight records it (`cancelled_in_flight`,
-                // Task 24).
+                // Task 24), once its request was handed to the connection (`sent`).
                 entry.set_in_flight(Some(InFlight {
                     purpose,
                     path: call_path(http.client.base(), &call),

@@ -345,10 +345,16 @@ async fn i08_release_outcome_delivers_failed_exit6() -> TestResult {
     let env = h.await_(&id, 5000).await;
     assert_outcome_delivery(&env, "upstream_network")?;
     // The outcome-only payload (§8.3).
+    // It names the revision the human saw (PD-57).
     let released = record(&h, &id, EventType::READ_RELEASED).await?;
+    let shown = record(&h, &id, EventType::PREVIEW_SHOWN).await?;
     assert_eq!(
         released,
-        json!({ "code": "upstream_network", "hint": OUTCOME_HINT })
+        json!({
+            "candidate_rev": shown["candidate_rev"],
+            "code": "upstream_network",
+            "hint": OUTCOME_HINT
+        })
     );
     // An outcome item takes no redactions.
     Ok(())

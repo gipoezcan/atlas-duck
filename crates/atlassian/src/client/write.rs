@@ -5,15 +5,15 @@
 //! for byte (`send.rs`, `guard.rs`), on every attempt; any difference refuses the write before
 //! anything leaves.
 
-use reqwest::header::CONTENT_TYPE;
 use tokio::time::Instant;
 
 use super::classify::is_json_content_type;
 use super::send::{
-    BodyRead, Exchange, MAX_RESPONSE_BYTES, OneRequest, Target, ausernames, header_text, read_body,
+    Answer, BodyRead, Exchange, Exchanged, MAX_RESPONSE_BYTES, OneRequest, Target, read_body,
 };
 use super::{FetchControl, InstanceClient, Product};
 use crate::cover::WriteCover;
+use crate::credentials::StoredCredential;
 use crate::identity::check_jira_header;
 use crate::types::{
     ApprovedWrite, ExpectedBody, FetchFailure, HttpRequestSpec, IdentityObserved, NotSentReason,
@@ -90,7 +90,22 @@ impl InstanceClient {
         let mut retries = 0;
         loop {
             match self.exchange(&req, ctl).await {
-                Ok(ex) => return self.finish_write(ex, spec, &w.success, ctl).await,
+                Ok(Exchanged::Response(ex)) => {
+                    return self.finish_write(ex, spec, &w.success, ctl).await;
+                }
+                // T10 minor 3: the retry of a `429` could not start; the `429` is the answer.
+                Ok(Exchanged::Stopped429 { answer, body, cred }) => {
+                    ctl.clear_partial();
+                    ctl.append_partial(&body);
+                    return self.classify_write(
+                        &answer,
+                        BodyRead::Complete,
+                        &cred,
+                        spec,
+                        &w.success,
+                        ctl,
+                    );
+                }
                 Err(FetchFailure::PreSendConnection(_))
                     if retries < MAX_PRESEND_RETRIES && Instant::now() < budget_end =>
                 {
@@ -116,22 +131,35 @@ impl InstanceClient {
             deadline,
             deadline_kind: _,
         } = ex;
+        let answer = Answer::of(&resp);
+        let read = read_body(resp, ctl, deadline, MAX_RESPONSE_BYTES).await;
+        drop(permit);
+        self.classify_write(&answer, read, &cred, spec, success, ctl)
+    }
+
+    /// The outcome of an answer whose body was read into the control. Only `Executed` and
+    /// `Failed4xx` carry the response. On every other answered outcome the body stays in the
+    /// control for the outcome event (§7.2: such bodies are audit-only; core reads them with
+    /// `take_captured().partial`).
+    fn classify_write(
+        &self,
+        answer: &Answer,
+        read: BodyRead,
+        cred: &StoredCredential,
+        spec: &HttpRequestSpec,
+        success: &SuccessExpectation,
+        ctl: &FetchControl,
+    ) -> WriteOutcome {
         let request_index = spec.index;
-        let status = resp.status().as_u16();
-        let content_type = header_text(resp.headers(), CONTENT_TYPE).map(str::to_owned);
+        let status = answer.status;
+        let content_type = answer.content_type.clone();
         let json = is_json_content_type(content_type.as_deref());
-        let auser = ausernames(resp.headers());
+        let auser = &answer.auser;
         let unknown = |reason| WriteOutcome::OutcomeUnknown {
             reason,
             request_index,
             status: Some(status),
         };
-
-        // Only `Executed` and `Failed4xx` carry the response. On every other answered outcome
-        // the body stays in the control for the outcome event (§7.2: such bodies are audit-only;
-        // core reads them with `take_captured().partial`).
-        let read = read_body(resp, ctl, deadline, MAX_RESPONSE_BYTES).await;
-        drop(permit);
 
         // Redirects are never followed and never a success (§7.2); the body was read (capped,
         // read errors ignored) for the audit record only.
@@ -179,7 +207,7 @@ impl InstanceClient {
         // success and every JSON answer is checked.
         if self.cfg.product == Product::Jira
             && (declared || json)
-            && let Err(observed) = check_jira_header(&auser, &cred.identity.atlassian_user)
+            && let Err(observed) = check_jira_header(auser, &cred.identity.atlassian_user)
         {
             let server_user = match observed {
                 IdentityObserved::Missing => None,

@@ -988,6 +988,55 @@ async fn i2_cancel_after_last_enrichment_get_commits_its_record() -> TestResult 
     Ok(())
 }
 
+/// T24 M-4: a write's 2nd GET reuses the request's `FetchControl`, whose `sent` flag the 1st GET
+/// set. The 2nd GET waits for a limiter permit (the instance's 4 are held by stalled reads), so it
+/// has handed nothing to a connection when the cancel lands: it records no `cancelled_in_flight`
+/// (the request was never written); GET 1's record is committed as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get2_cancel_before_send_not_recorded_in_flight() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let hooks = TestHooks {
+        pause_after_get: Some(pause.clone()),
+        ..TestHooks::none()
+    };
+    let transitions = fixtures::JIRA_TRANSITIONS.as_bytes();
+    // Connection 0 answers GET 1; connections 1 to 4 are the stalled reads holding the permits.
+    let mut scripts = vec![vec![RawStep::Send(raw_answer(
+        transitions,
+        transitions.len(),
+    ))]];
+    scripts.extend((0..4).map(|_| stalled(b"{")));
+    let (h, server) = raw_jira(scripts, None, hooks).await?;
+    let id = submit_pending(
+        &h,
+        TRANSITION,
+        json!({ "key": "ABC-1", "transition": "Done" }),
+    )
+    .await?;
+    // GET 1 finished (its record parked, `sent` set on the control).
+    pause.reached.notified().await;
+    let mut readers = Vec::new();
+    for n in 0..4 {
+        readers.push(submit_pending(&h, ISSUE, json!({ "key": format!("ABC-{}", n + 2) })).await?);
+    }
+    wait_connections(&server, 5).await?;
+    // GET 2 now waits for a permit: nothing of it reaches the server.
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.connections(), 5);
+    assert_cancelled(&h.handler().cancel(&id).await);
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let purposes: Vec<_> = fetch.iter().map(|f| f["purpose"].clone()).collect();
+    assert_eq!(purposes, [json!("resolve")], "{fetch:?}");
+    fetch.iter().for_each(not_in_flight);
+    for r in readers {
+        assert_cancelled(&h.handler().cancel(&r).await);
+    }
+    Ok(())
+}
+
 /// I-2, stale check (and the shutdown cause, the one cause a `StaleCheck` accepts): the identity
 /// GET finished, its record is parked, the shutdown sweep commits it first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

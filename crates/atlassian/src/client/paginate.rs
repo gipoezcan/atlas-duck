@@ -2,6 +2,10 @@
 //! the search body template) under the configured base URL; `_links.next` is never read. The
 //! page arithmetic is the server's: Confluence `start += size`, Jira `startAt += returned items`.
 
+use std::fmt;
+
+use serde::Deserialize;
+use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 use tokio::time::Instant;
 
@@ -27,6 +31,7 @@ enum PageSource<'a> {
 }
 
 /// What one 2xx page says about the results.
+#[derive(Default)]
 struct PageFacts {
     /// Items in the page's `items_key` array.
     items: u64,
@@ -40,21 +45,137 @@ struct PageFacts {
 }
 
 impl PageFacts {
+    /// One pass over the body, no value tree (T10 minor 9): the items are counted as they go by,
+    /// the five facts are read where they stand, everything else is skipped. `send_one` only
+    /// returns a 2xx JSON body that parsed; a body without the items array counts as zero items,
+    /// which ends the results. A fact of another type is absent, the last of a repeated key wins.
     fn read(body: &[u8], items_key: &str) -> PageFacts {
-        // `send_one` only returns a 2xx JSON body that parsed; a body without the items array
-        // counts as zero items, which ends the results.
-        let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        let num = |k: &str| v.get(k).and_then(Value::as_u64);
-        PageFacts {
-            items: v
-                .get(items_key)
-                .and_then(Value::as_array)
-                .map_or(0, |a| u64::try_from(a.len()).unwrap_or(u64::MAX)),
-            size: num("size"),
-            limit: num("limit").or_else(|| num("maxResults")),
-            total: num("total").or_else(|| num("totalSize")),
-            is_last: v.get("isLast").and_then(Value::as_bool),
+        let mut de = serde_json::Deserializer::from_slice(body);
+        PageFactsSeed { items_key }
+            .deserialize(&mut de)
+            .ok()
+            .filter(|_| de.end().is_ok())
+            .unwrap_or_default()
+    }
+}
+
+/// The page object with the name of its items array.
+struct PageFactsSeed<'a> {
+    items_key: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for PageFactsSeed<'_> {
+    type Value = PageFacts;
+
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<PageFacts, D::Error> {
+        d.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for PageFactsSeed<'_> {
+    type Value = PageFacts;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a page object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<PageFacts, A::Error> {
+        let mut facts = PageFacts::default();
+        let (mut limit, mut max_results) = (None, None);
+        let (mut total, mut total_size) = (None, None);
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            let leaf = map.next_value::<Leaf>()?;
+            if key == self.items_key {
+                // Not an array: no items (a key that is also a fact keeps both readings).
+                facts.items = leaf.len.unwrap_or(0);
+            }
+            match key.as_ref() {
+                "size" => facts.size = leaf.num,
+                "limit" => limit = leaf.num,
+                "maxResults" => max_results = leaf.num,
+                "total" => total = leaf.num,
+                "totalSize" => total_size = leaf.num,
+                "isLast" => facts.is_last = leaf.flag,
+                _ => {}
+            }
         }
+        facts.limit = limit.or(max_results);
+        facts.total = total.or(total_size);
+        Ok(facts)
+    }
+}
+
+/// A value of the page object seen without building it: what `Value::as_u64`, `as_bool` and
+/// `as_array().len()` would say of it. Containers are walked and dropped.
+#[derive(Default)]
+struct Leaf {
+    num: Option<u64>,
+    flag: Option<bool>,
+    len: Option<u64>,
+}
+
+impl<'de> Deserialize<'de> for Leaf {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Leaf, D::Error> {
+        d.deserialize_any(LeafVisitor)
+    }
+}
+
+struct LeafVisitor;
+
+impl<'de> Visitor<'de> for LeafVisitor {
+    type Value = Leaf;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any value")
+    }
+
+    fn visit_u64<E>(self, v: u64) -> Result<Leaf, E> {
+        Ok(Leaf {
+            num: Some(v),
+            ..Leaf::default()
+        })
+    }
+
+    fn visit_i64<E>(self, v: i64) -> Result<Leaf, E> {
+        Ok(Leaf {
+            num: u64::try_from(v).ok(),
+            ..Leaf::default()
+        })
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<Leaf, E> {
+        Ok(Leaf {
+            flag: Some(v),
+            ..Leaf::default()
+        })
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Leaf, E> {
+        Ok(Leaf::default())
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Leaf, E> {
+        Ok(Leaf::default())
+    }
+
+    fn visit_unit<E>(self) -> Result<Leaf, E> {
+        Ok(Leaf::default())
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Leaf, A::Error> {
+        let mut n: u64 = 0;
+        while seq.next_element::<IgnoredAny>()?.is_some() {
+            n = n.saturating_add(1);
+        }
+        Ok(Leaf {
+            len: Some(n),
+            ..Leaf::default()
+        })
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Leaf, A::Error> {
+        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(Leaf::default())
     }
 }
 
@@ -286,4 +407,58 @@ fn ended(mut out: PagedOutcome, start: u64, failure: FetchFailure) -> PagedOutco
     });
     out.next_start = Some(start);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the page facts were while they came from a `serde_json::Value` of the body.
+    fn by_value(body: &[u8], items_key: &str) -> PageFacts {
+        let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+        let num = |k: &str| v.get(k).and_then(Value::as_u64);
+        PageFacts {
+            items: v
+                .get(items_key)
+                .and_then(Value::as_array)
+                .map_or(0, |a| u64::try_from(a.len()).unwrap_or(u64::MAX)),
+            size: num("size"),
+            limit: num("limit").or_else(|| num("maxResults")),
+            total: num("total").or_else(|| num("totalSize")),
+            is_last: v.get("isLast").and_then(Value::as_bool),
+        }
+    }
+
+    #[test]
+    fn facts_read_in_one_pass_equal_the_value_reading() {
+        let bodies = [
+            r#"{"results":[{"a":[1,2]},{"b":{"c":null}},3],"size":3,"limit":25,"totalSize":9,"start":0}"#,
+            r#"{"values":[],"maxResults":50,"isLast":true,"total":0}"#,
+            r#"{"issues":[1],"maxResults":-5,"total":2.5,"isLast":"yes"}"#,
+            r#"{"limit":"25","maxResults":10,"total":{"x":[1]},"totalSize":7,"size":-1}"#,
+            r#"{"results":{"not":"an array"},"size":1}"#,
+            r#"{"results":[1,2],"results":[1],"size":1,"size":2}"#,
+            r#"{"results":[1],"size":18446744073709551615,"total":18446744073709551616}"#,
+            r#"{"isLast":false,"nested":{"results":[1,2,3],"size":9},"results":[7]}"#,
+            r#"[1,2,3]"#,
+            r#"null"#,
+            r#""text""#,
+            r#"{}"#,
+            r#"{"results":[1]} trailing"#,
+            "",
+        ];
+        for key in ["results", "values", "issues", "size"] {
+            for body in bodies {
+                let (got, want) = (
+                    PageFacts::read(body.as_bytes(), key),
+                    by_value(body.as_bytes(), key),
+                );
+                assert_eq!(
+                    (got.items, got.size, got.limit, got.total, got.is_last),
+                    (want.items, want.size, want.limit, want.total, want.is_last),
+                    "{key} in {body}"
+                );
+            }
+        }
+    }
 }

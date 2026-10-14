@@ -799,7 +799,7 @@ async fn release(
         };
         return Err(rejected(engine, entry, (r, at), rev.counter, dec).await);
     }
-    let record = release_record(entry, &c)?;
+    let record = release_record(entry, &rev, &c)?;
     match engine.transition(entry, event, move |_| record).await {
         Ok(_) => {
             queue_changed(engine, entry);
@@ -811,9 +811,13 @@ async fn release(
 
 /// `READ_RELEASED` of the current revision's exact candidate `c` with its redaction ops: the
 /// outcome answer `{code, hint}`, or the bytes with the `item` marker and `meta` (§5.2 step 8).
-fn release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, DecisionError> {
+fn release_record(
+    entry: &RequestEntry,
+    rev: &CandidateRev,
+    c: &Candidate,
+) -> Result<NewEvent, DecisionError> {
     if entry.kind() == Kind::Script {
-        return script_release_record(entry, c);
+        return script_release_record(entry, rev, c);
     }
     let (read, ops) = {
         let st = entry.state();
@@ -831,7 +835,12 @@ fn release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, Decis
                 .cloned()
                 .and_then(|v| serde_json::from_value::<ErrorCode>(v).ok())
                 .ok_or(DecisionError::NotDecidable)?;
-            Ok(payloads::read_released_outcome(ctx, code, OUTCOME_HINT))
+            Ok(payloads::read_released_outcome(
+                ctx,
+                rev,
+                code,
+                OUTCOME_HINT,
+            ))
         }
         item => {
             let marker = if item == ReleaseItem::UpstreamError {
@@ -840,7 +849,7 @@ fn release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, Decis
                 ReleasedItem::Result
             };
             let meta = release_meta(entry.spec, &read, c.value());
-            payloads::read_released_item(ctx, c.bytes(), &ops, marker, &meta)
+            payloads::read_released_item(ctx, rev, c.bytes(), &ops, marker, &meta)
                 .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))
         }
     }
@@ -1039,7 +1048,11 @@ async fn script_preview(
 }
 
 /// `SCRIPT_RELEASED` of the current revision's exact candidate `c` with its redaction ops.
-fn script_release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent, DecisionError> {
+fn script_release_record(
+    entry: &RequestEntry,
+    rev: &CandidateRev,
+    c: &Candidate,
+) -> Result<NewEvent, DecisionError> {
     let (item, ops, redactions) = {
         let st = entry.state();
         (
@@ -1056,7 +1069,7 @@ fn script_release_record(entry: &RequestEntry, c: &Candidate) -> Result<NewEvent
         Some(ReleaseItem::ScriptErrorDetails) => payloads::ScriptReleasedItem::Error,
         _ => return Err(DecisionError::NotDecidable),
     };
-    payloads::script_released(&entry.ctx, c.bytes(), &ops, item, meta.as_ref())
+    payloads::script_released(&entry.ctx, rev, c.bytes(), &ops, item, meta.as_ref())
         .map_err(|_| DecisionError::Audit(AuditError::Invalid("release record")))
 }
 

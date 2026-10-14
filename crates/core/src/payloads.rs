@@ -770,10 +770,12 @@ pub fn read_fetched(
 }
 
 /// `READ_RELEASED` of data: the released bytes, the redaction ops that produced them and their
-/// SHA-256 (the `DELIVERED.payload_sha256` of the hand-off, inv. 2). Decision `release`, or
-/// `release_redacted` with flag `redacted` when any op applied.
+/// SHA-256 (the `DELIVERED.payload_sha256` of the hand-off, inv. 2) and the `candidate_rev` of the
+/// released revision (PD-57: U-32 compares it with the `PREVIEW_SHOWN` of the same request).
+/// Decision `release`, or `release_redacted` with flag `redacted` when any op applied.
 pub fn read_released(
     ctx: &EventCtx,
+    rev: &CandidateRev,
     released: &[u8],
     redaction_ops: &[RedactionOp],
 ) -> Result<NewEvent, serde_json::Error> {
@@ -782,6 +784,7 @@ pub fn read_released(
         ctx,
         EventType::READ_RELEASED,
         json!({
+            "candidate_rev": rev_json(rev),
             "released": body_json(released),
             "redaction_ops": ops,
             "released_sha256": sha256_hex(released),
@@ -819,12 +822,13 @@ impl ReleasedItem {
 /// flag is free for a plaintext marker) and `meta` (`page`, `redactions`; §4.2, §7.5).
 pub fn read_released_item(
     ctx: &EventCtx,
+    rev: &CandidateRev,
     released: &[u8],
     redaction_ops: &[RedactionOp],
     item: ReleasedItem,
     meta: &Value,
 ) -> Result<NewEvent, serde_json::Error> {
-    let mut ev = read_released(ctx, released, redaction_ops)?;
+    let mut ev = read_released(ctx, rev, released, redaction_ops)?;
     if let Some(o) = ev.payload.as_object_mut() {
         o.insert("item".into(), item.as_str().into());
         o.insert("meta".into(), meta.clone());
@@ -832,13 +836,18 @@ pub fn read_released_item(
     Ok(ev)
 }
 
-/// `READ_RELEASED` of an outcome item: the outcome-only payload `{code, hint}`.
-pub fn read_released_outcome(ctx: &EventCtx, code: ErrorCode, hint: &str) -> NewEvent {
+/// `READ_RELEASED` of an outcome item: the outcome-only payload `{candidate_rev, code, hint}`.
+pub fn read_released_outcome(
+    ctx: &EventCtx,
+    rev: &CandidateRev,
+    code: ErrorCode,
+    hint: &str,
+) -> NewEvent {
     decided(
         event(
             ctx,
             EventType::READ_RELEASED,
-            json!({ "code": code_json(code), "hint": hint }),
+            json!({ "candidate_rev": rev_json(rev), "code": code_json(code), "hint": hint }),
         ),
         DecisionColumn::Release,
     )
@@ -1051,12 +1060,13 @@ impl ScriptReleasedItem {
 /// redaction ops that produced them and their SHA-256, like `READ_RELEASED`.
 pub fn script_released(
     ctx: &EventCtx,
+    rev: &CandidateRev,
     released: &[u8],
     redaction_ops: &[RedactionOp],
     item: ScriptReleasedItem,
     meta: Option<&Value>,
 ) -> Result<NewEvent, serde_json::Error> {
-    let mut ev = read_released(ctx, released, redaction_ops)?;
+    let mut ev = read_released(ctx, rev, released, redaction_ops)?;
     ev.event_type = EventType::SCRIPT_RELEASED;
     if let Some(o) = ev.payload.as_object_mut() {
         o.insert("item".into(), item.as_str().into());

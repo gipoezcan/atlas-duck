@@ -382,7 +382,10 @@ async fn confirm(engine: &Engine, text: String) -> Confirm {
 /// The item's record (with the `batch` flag and `batch_id`) and the state its event brings.
 fn step_of(c: &Checked, batch_id: &str) -> Result<BatchStep, DecisionError> {
     let (record, on_apply): (_, OnApply) = match &c.natural {
-        Natural::Release(candidate) => (release_record(&c.entry, candidate)?, Box::new(|_| {})),
+        Natural::Release(candidate) => (
+            release_record(&c.entry, &c.rev, candidate)?,
+            Box::new(|_| {}),
+        ),
         Natural::Approve {
             records,
             hash,

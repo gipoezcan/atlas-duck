@@ -9,8 +9,9 @@ use std::time::Duration;
 use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_atlassian::{ReadBudget, Timeouts};
 use atlas_duck_audit::EventType;
+use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::{AuditRecord, Flow, Harness};
-use atlas_duck_core::{Edits, ShutdownReason};
+use atlas_duck_core::{DecisionError, Edits, RedactionOp, ShutdownReason};
 use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::envelope::Status;
 use serde_json::{Map, Value, json};
@@ -485,6 +486,76 @@ pub async fn run_flow(h: &Harness, flow: Flow, n: usize) -> Result<(), TestError
     }
 }
 
+/// Decisions on revisions nobody opened (M3 T29 M-11): after a redaction (a read) and after an
+/// edit (a write) the new revision is refused as `NotOpened`, then opened and decided, so the
+/// U-32 property runs over a log that saw the guard fire. Flow number `n` (its keys are unique).
+pub async fn run_unopened_attempts(h: &Harness, n: usize) -> Result<(), TestError> {
+    let ap = h.approver();
+    let not_opened = |what: &str, res: Result<_, DecisionError>| -> Result<(), TestError> {
+        match res {
+            Err(DecisionError::Invalid(InvalidReason::NotOpened)) => Ok(()),
+            Err(e) => Err(format!("{what}: {e:?}, wanted NotOpened").into()),
+            Ok(_) => Err(format!("{what}: decided an unopened revision").into()),
+        }
+    };
+    // A read: open, redact, release the redacted revision unopened (refused), open, release.
+    let id = submit_queued(h, ISSUE, json!({ "key": format!("ABC-{n}") })).await?;
+    ap.open(&id).map_err(de)?;
+    let mask = RedactionOp::MaskText {
+        text: "Login page".into(),
+        every_occurrence: true,
+        at: None,
+    };
+    ap.redact(&id, vec![mask]).map_err(de)?;
+    not_opened("release after a redaction", ap.release_unopened(&id))?;
+    ap.release(&id).map_err(de)?;
+    expect(
+        "redacted release",
+        h.await_(&id, 10_000).await.status,
+        Status::Released,
+    )?;
+    // A write: edit (a new revision), approve it unopened (refused), open, approve.
+    let params = json!({
+        "key": format!("EDT-{n}"),
+        "fields": { "summary": "Login fails" },
+        "expected": { "summary": "Login page times out" }
+    });
+    let id = submit_queued(h, EDIT, params).await?;
+    let rev1 = ap.rev(&id).map_err(de)?;
+    ap.open(&id).map_err(de)?;
+    let mut set = Map::new();
+    set.insert("fields.summary".into(), json!("Login fails after reset"));
+    ap.edit(
+        &id,
+        Edits {
+            set,
+            remove: Vec::new(),
+        },
+    )
+    .map_err(de)?;
+    let mut bumped = false;
+    for _ in 0..500 {
+        if ap
+            .item(&id)
+            .is_some_and(|i| i.candidate_rev.counter > rev1.counter)
+        {
+            bumped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    if !bumped {
+        return Err("the edit never produced a new revision".into());
+    }
+    not_opened("approve after an edit", ap.approve_unopened(&id))?;
+    ap.approve(&id).map_err(de)?;
+    expect(
+        "edited write",
+        h.await_(&id, 10_000).await.status,
+        Status::Succeeded,
+    )
+}
+
 // ---- Properties over the log ---------------------------------------------------------------------------
 
 fn seq_of(first: &HashMap<String, u64>, id: &str) -> Option<u64> {
@@ -656,10 +727,9 @@ pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
     Ok(authed)
 }
 
-/// U-32: every `READ_RELEASED`, `WRITE_APPROVED` and `SCRIPT_RELEASED` has an earlier
-/// `PREVIEW_SHOWN` of the same request and revision. A `READ_RELEASED` carries no revision: a
-/// data release is matched through its bytes' hash (the revision's `candidate_hash`), an outcome
-/// release (`{code, hint}`) needs some earlier `PREVIEW_SHOWN` of the request.
+/// U-32 (PD-57): every `READ_RELEASED`, `WRITE_APPROVED` and `SCRIPT_RELEASED` carries a
+/// `candidate_rev` (an object, never null) equal to that of an earlier `PREVIEW_SHOWN` of the same
+/// request. A data release's bytes also hash to that revision's `candidate_hash`.
 pub async fn check_preview_shown(h: &Harness) -> Result<usize, String> {
     let recs = h.audit_records().await.map_err(|e| e.to_string())?;
     let mut checked = 0;
@@ -674,14 +744,18 @@ pub async fn check_preview_shown(h: &Harness) -> Result<usize, String> {
             .request_id
             .as_deref()
             .ok_or("positive decision without a request id")?;
+        let rev = &r.payload["candidate_rev"];
+        if !rev.is_object() {
+            return Err(format!(
+                "{:?} {} of {id} has no candidate_rev object: {rev}",
+                r.event_type, r.seq
+            ));
+        }
         let shown = |p: &Value| -> bool {
-            match r.event_type {
-                EventType::WRITE_APPROVED => p["candidate_rev"] == r.payload["candidate_rev"],
-                EventType::READ_RELEASED if r.payload["released_sha256"].is_string() => {
-                    p["candidate_rev"]["candidate_hash"] == r.payload["released_sha256"]
-                }
-                _ => true,
-            }
+            p["candidate_rev"] == *rev
+                && (r.event_type != EventType::READ_RELEASED
+                    || !r.payload["released_sha256"].is_string()
+                    || p["candidate_rev"]["candidate_hash"] == r.payload["released_sha256"])
         };
         let ok = recs.iter().any(|s| {
             s.event_type == EventType::PREVIEW_SHOWN

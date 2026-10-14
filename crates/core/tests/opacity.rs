@@ -276,3 +276,71 @@ async fn i07_script_streams_identical_result_error_failed_call() -> TestResult {
     assert_eq!(h.await_(c, 5000).await.status, Status::Denied);
     Ok(())
 }
+
+/// I-07 for writes over what enrichment learned (M3 T29 M-10): three `jira.issue.edit`, one whose
+/// `expected` matches the instance, one that conflicts with it and one whose enrichment GET
+/// answers 404, look the same to the agent until the decision: the instance's answer to the read
+/// that built the preview stays with the human.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i07_write_streams_identical_enrichment_conflict_vs_match() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let issue = mock.path("/rest/api/2/issue/ABC-1");
+    // The first two enrichment reads see the issue, the third a 404.
+    Mock::given(method("GET"))
+        .and(path(issue.clone()))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(fixtures::JIRA_ISSUE, "application/json"),
+        )
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(issue))
+        .respond_with(mock.response(404).set_body_raw(
+            r#"{"errorMessages":["Issue does not exist"],"errors":{}}"#,
+            "application/json",
+        ))
+        .with_priority(2)
+        .mount(mock.server())
+        .await;
+    let mut streams = Vec::new();
+    let mut ids = Vec::new();
+    for expected in [
+        "Login page times out",
+        "Something else",
+        "Login page times out",
+    ] {
+        let env = h
+            .submit(
+                "jira.issue.edit",
+                json!({
+                    "key": "ABC-1",
+                    "fields": { "summary": "Login fails" },
+                    "expected": { "summary": expected }
+                }),
+            )
+            .await;
+        let id = request_id(&env)?;
+        streams.push(pending_stream(&h, env.to_json_line(), &id).await?);
+        ids.push(id);
+    }
+    let first = streams.first().ok_or("no streams")?;
+    for (n, s) in streams.iter().enumerate() {
+        assert_eq!(s, first, "write {n} differs before its decision");
+        assert!(
+            s.iter()
+                .all(|l| !l.contains("executing") && !l.contains("times out")),
+            "{s:?}"
+        );
+    }
+    for id in &ids {
+        h.approver().deny(id, "no").map_err(de)?;
+        assert_eq!(h.await_(id, 10_000).await.status, Status::Denied);
+    }
+    Ok(())
+}

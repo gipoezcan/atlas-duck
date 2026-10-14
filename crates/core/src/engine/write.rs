@@ -2100,6 +2100,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
     let mut attempt = 0u8;
     let mut last = loop {
         let seen = engine.identity_epoch(&entry.instance_id);
+        ctl.begin_call();
         entry.set_in_flight(Some(InFlight {
             purpose,
             path: call_path(base, &call),
@@ -2178,6 +2179,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
             let mut attempt = 0u8;
             loop {
                 let seen = engine.identity_epoch(&entry.instance_id);
+                ctl.begin_call();
                 entry.set_in_flight(Some(InFlight {
                     purpose,
                     path: call_path(base, &call),

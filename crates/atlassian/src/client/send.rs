@@ -97,6 +97,38 @@ pub(crate) struct Exchange<'c> {
     pub(crate) deadline_kind: PostSendKind,
 }
 
+/// What a response said before its body: status, content type and every `X-AUSERNAME` value.
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) content_type: Option<String>,
+    pub(crate) auser: Vec<String>,
+}
+
+impl Answer {
+    pub(crate) fn of(resp: &reqwest::Response) -> Answer {
+        Answer {
+            status: resp.status().as_u16(),
+            content_type: header_text(resp.headers(), CONTENT_TYPE).map(str::to_owned),
+            auser: ausernames(resp.headers()),
+        }
+    }
+}
+
+/// What `exchange` ends with.
+pub(crate) enum Exchanged<'c> {
+    /// The response that is not retried, its body unread.
+    Response(Exchange<'c>),
+    /// A `429` whose retry never started (the budget ran out or the call was cancelled in the wait
+    /// or while the next permit was awaited; T10 minor 3): the last answer the instance gave, with
+    /// the part of its body that was read. Nothing of a later attempt was sent, so the `429` is
+    /// the answer, not an unknown outcome.
+    Stopped429 {
+        answer: Answer,
+        body: Vec<u8>,
+        cred: StoredCredential,
+    },
+}
+
 pub(crate) enum BodyRead {
     Complete,
     Cancelled,
@@ -180,7 +212,20 @@ const X_ATLASSIAN_TOKEN: &str = "X-Atlassian-Token";
 impl InstanceClient {
     pub(crate) async fn send_one(&self, req: OneRequest<'_>, ctl: &FetchControl) -> FetchOutcome {
         let ex = match self.exchange(&req, ctl).await {
-            Ok(ex) => ex,
+            Ok(Exchanged::Response(ex)) => ex,
+            Ok(Exchanged::Stopped429 { answer, body, cred }) => {
+                // The 429 is the response, classified like any other that was not retried.
+                ctl.clear_partial();
+                ctl.append_partial(&body);
+                return self.classify(
+                    &answer,
+                    None,
+                    BodyRead::Complete,
+                    (req.cap_kind, req.cap_kind),
+                    &cred,
+                    ctl,
+                );
+            }
             Err(f) => return failed(f),
         };
         let Exchange {
@@ -253,7 +298,7 @@ impl InstanceClient {
         &self,
         req: &OneRequest<'_>,
         ctl: &FetchControl,
-    ) -> Result<Exchange<'_>, FetchFailure> {
+    ) -> Result<Exchanged<'_>, FetchFailure> {
         let mode = req.target.mode();
 
         // Step 1: the request as it will be written, the method guard on it, the credential, the
@@ -276,6 +321,14 @@ impl InstanceClient {
         // Whether this call handed a request to the connection.
         let mut sent = false;
         let mut retries = 0;
+        // The `429` of the last attempt while no later attempt was sent: if the retry cannot
+        // start, it is the answer (T10 minor 3).
+        let mut last_429: Option<(Answer, Vec<u8>)> = None;
+        // How a stop before the next attempt ends the call.
+        let stopped = |last: Option<(Answer, Vec<u8>)>, cred, failure| match last {
+            Some((answer, body)) => Ok(Exchanged::Stopped429 { answer, body, cred }),
+            None => Err(failure),
+        };
         loop {
             // Step 2: limiter permit (cancel-aware, bounded by the overall budget).
             let permit = match self
@@ -284,15 +337,17 @@ impl InstanceClient {
                 .await
             {
                 Acquired::Permit(p) => p,
-                Acquired::Cancelled => return Err(cancelled(ctl, sent)),
-                Acquired::Expired => return Err(budget_expired(sent, req.overall)),
+                Acquired::Cancelled => return stopped(last_429, cred, cancelled(ctl, sent)),
+                Acquired::Expired => {
+                    return stopped(last_429, cred, budget_expired(sent, req.overall));
+                }
             };
             let now = Instant::now();
             let mut deadline = now + per_call;
             let mut deadline_kind = PostSendKind::PerCallTimeout;
             if let Some((end, kind)) = req.overall {
                 if now >= end {
-                    return Err(budget_expired(sent, req.overall));
+                    return stopped(last_429, cred, budget_expired(sent, req.overall));
                 }
                 if end < deadline {
                     deadline = end;
@@ -349,25 +404,34 @@ impl InstanceClient {
                     retry_after_wait(header_text(resp.headers(), RETRY_AFTER), SystemTime::now());
                 let until = Instant::now() + wait;
                 if req.overall.is_none_or(|(end, _)| until < end) {
-                    drop(resp);
+                    // The answer is kept while the retry waits: its body is read now, the
+                    // permit is not held through the wait.
+                    let answer = Answer::of(&resp);
+                    let read = read_body(resp, ctl, deadline, req.max_response_bytes).await;
                     drop(permit);
+                    last_429 = Some((answer, ctl.take_partial()));
                     retries += 1;
+                    if matches!(read, BodyRead::Cancelled) {
+                        return stopped(last_429, cred, cancelled(ctl, sent));
+                    }
                     tokio::select! {
                         biased;
-                        () = ctl.cancelled() => return Err(cancelled(ctl, sent)),
+                        () = ctl.cancelled() => {
+                            return stopped(last_429, cred, cancelled(ctl, sent));
+                        }
                         () = sleep_until(until) => {}
                     }
                     continue;
                 }
             }
 
-            return Ok(Exchange {
+            return Ok(Exchanged::Response(Exchange {
                 resp,
                 permit,
                 cred,
                 deadline,
                 deadline_kind,
-            });
+            }));
         }
     }
 
@@ -391,24 +455,17 @@ impl InstanceClient {
         deadline: Instant,
         deadline_kind: PostSendKind,
     ) -> FetchOutcome {
-        let status = resp.status().as_u16();
-        let content_type = header_text(resp.headers(), CONTENT_TYPE).map(str::to_owned);
-        let json = is_json_content_type(content_type.as_deref());
-        let success = (200..300).contains(&status);
-        let auser = ausernames(resp.headers());
-        let response = |body: Vec<u8>| UpstreamResponse {
-            status,
-            content_type: content_type.clone(),
-            body,
-        };
+        let answer = Answer::of(&resp);
+        let json = is_json_content_type(answer.content_type.as_deref());
+        let success = (200..300).contains(&answer.status);
 
         // Step 6: decided from status and headers alone; the body is read for the audit record
         // only (caps apply, read errors and the deadline just end it).
-        let header_decided = if (300..400).contains(&status) {
+        let header_decided = if (300..400).contains(&answer.status) {
             Some(UnavailableReason::Redirect3xx)
         } else if success && !json {
             Some(UnavailableReason::NonJson2xx)
-        } else if status == 401 && !json {
+        } else if answer.status == 401 && !json {
             Some(UnavailableReason::NonJson401)
         } else {
             None
@@ -416,6 +473,36 @@ impl InstanceClient {
 
         // Step 7: the body.
         let read = read_body(resp, ctl, deadline, req.max_response_bytes).await;
+        self.classify(
+            &answer,
+            header_decided,
+            read,
+            (req.cap_kind, deadline_kind),
+            cred,
+            ctl,
+        )
+    }
+
+    /// Steps 6 to 10 once the body was read into the control. `kinds`: the class of a body over
+    /// the cap and that of a deadline during it.
+    fn classify(
+        &self,
+        answer: &Answer,
+        header_decided: Option<UnavailableReason>,
+        read: BodyRead,
+        kinds: (PostSendKind, PostSendKind),
+        cred: &StoredCredential,
+        ctl: &FetchControl,
+    ) -> FetchOutcome {
+        let (cap_kind, deadline_kind) = kinds;
+        let status = answer.status;
+        let json = is_json_content_type(answer.content_type.as_deref());
+        let success = (200..300).contains(&status);
+        let response = |body: Vec<u8>| UpstreamResponse {
+            status,
+            content_type: answer.content_type.clone(),
+            body,
+        };
         if let Some(reason) = header_decided {
             return match read {
                 BodyRead::Cancelled => failed(cancelled(ctl, true)),
@@ -436,7 +523,7 @@ impl InstanceClient {
             }
             BodyRead::OverCap => {
                 return failed(FetchFailure::PostSend {
-                    kind: req.cap_kind,
+                    kind: cap_kind,
                     received: ctl.take_partial(),
                 });
             }
@@ -467,7 +554,7 @@ impl InstanceClient {
         // Step 9: Jira identity check on every JSON response, error statuses included.
         if self.cfg.product == Product::Jira
             && json
-            && let Err(observed) = check_jira_header(&auser, &cred.identity.atlassian_user)
+            && let Err(observed) = check_jira_header(&answer.auser, &cred.identity.atlassian_user)
         {
             return failed(FetchFailure::IdentityCheckFailed {
                 observed,

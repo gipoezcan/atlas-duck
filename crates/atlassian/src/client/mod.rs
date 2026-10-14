@@ -163,6 +163,14 @@ impl FetchControl {
         self.state().sent = true;
     }
 
+    /// Starts the next call on a control that already served one: `sent` is the flag of the
+    /// current call, not a sticky one of the control (T24 M-4), so a cancel before this call
+    /// handed a request to the connection is no in-flight cancel. The captured pages and bytes
+    /// are the control's own and stay.
+    pub fn begin_call(&self) {
+        self.state().sent = false;
+    }
+
     pub(crate) fn is_sent(&self) -> bool {
         self.state().sent
     }

@@ -482,6 +482,40 @@ async fn retry_429_then_success() -> TestResult {
     Ok(())
 }
 
+/// T10 minor 3 for reads: a cancel in the wait before a `429` retry returns that `429` (the only
+/// answer the instance gave), not an in-flight cancel of a request that has no answer to wait for.
+#[tokio::test]
+async fn read_429_then_cancel_is_the_429_response() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    Mock::given(path("/rest/api/space"))
+        .respond_with(
+            dc.response(429)
+                .insert_header("Retry-After", "30")
+                .set_body_raw(r#"{"message":"slow down"}"#, "application/json"),
+        )
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let ctl = FetchControl::new();
+    let read = {
+        let (client, ctl, cover) = (t.client.clone(), ctl.clone(), test_cover()?);
+        tokio::spawn(async move { client.get_ctl(&cover, &call("/rest/api/space"), &ctl).await })
+    };
+    for _ in 0..500 {
+        if !dc.received().await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    ctl.cancel();
+    let r = response(read.await?)?;
+    assert_eq!(r.status, 429);
+    assert_eq!(r.body, br#"{"message":"slow down"}"#);
+    assert_eq!(dc.received().await.len(), 1);
+    Ok(())
+}
+
 #[tokio::test]
 async fn limiter_caps_concurrency_at_4() -> TestResult {
     let server = RawHttpServer::serve(vec![

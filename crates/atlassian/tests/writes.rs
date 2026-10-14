@@ -1301,3 +1301,115 @@ async fn write_waiting_for_a_permit_is_not_sent() -> TestResult {
     assert_eq!(server.connections(), 4);
     Ok(())
 }
+
+/// A write answered `429` with `retry_after` seconds; the mock keeps answering it.
+async fn mount_429(dc: &MockDc, retry_after: &str) {
+    Mock::given(path("/rest/api/content/65537"))
+        .respond_with(
+            dc.response(429)
+                .insert_header("Retry-After", retry_after)
+                .set_body_raw(r#"{"message":"slow down"}"#, "application/json"),
+        )
+        .mount(dc.server())
+        .await;
+}
+
+/// Waits until the mock has seen `n` requests.
+async fn wait_received(dc: &MockDc, n: usize) -> TestResult {
+    for _ in 0..500 {
+        if dc.received().await.len() >= n {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("the mock never got the request".into())
+}
+
+fn slow_down(out: WriteOutcome) -> TestResult {
+    match out {
+        WriteOutcome::Failed4xx {
+            response,
+            request_index: 0,
+        } => {
+            assert_eq!(response.status, 429);
+            assert_eq!(response.body, br#"{"message":"slow down"}"#);
+            Ok(())
+        }
+        other => Err(format!("{other:?}").into()),
+    }
+}
+
+/// T10 minor 3: a `429` is the only answer the instance gave. When the retry cannot start because
+/// the write budget runs out while every limiter permit is taken, the write did not execute: the
+/// answer is that `429` (`Failed4xx`, its body kept), not an unknown outcome.
+#[tokio::test]
+async fn write_429_then_budget_expiry_is_failed4xx() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    mount_429(&dc, "1").await;
+    // The readers that take the 4 permits answer after the write's budget ended.
+    Mock::given(path("/rest/api/space"))
+        .respond_with(
+            dc.response(200)
+                .set_body_raw("{}", "application/json")
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(dc.server())
+        .await;
+    let mut cfg = dc.client_config();
+    cfg.timeouts.write = Duration::from_millis(1600);
+    let t = test_client(cfg)?;
+    let write = {
+        let client = t.client.clone();
+        let (w, cover) = (json_op(page_update(&dc)?), test_write_cover()?);
+        tokio::spawn(async move { client.send_approved(cover, &w).await })
+    };
+    // The 429 is answered and its permit released; now the readers take all four.
+    wait_received(&dc, 1).await?;
+    let cover = test_cover()?;
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let (client, cover) = (t.client.clone(), cover.clone());
+        held.push(tokio::spawn(async move {
+            let call = GetCall {
+                endpoint_template: "/rest/api/space".into(),
+                params: json!({}),
+                query: vec![],
+            };
+            client.get(&cover, &call).await
+        }));
+    }
+    let out = write.await?;
+    slow_down(out)?;
+    // One PUT only: the retry never started.
+    let puts = dc
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .count();
+    assert_eq!(puts, 1);
+    for task in held {
+        task.abort();
+    }
+    Ok(())
+}
+
+/// T10 minor 3: a cancel in the wait before the retry returns the `429` as the answer too.
+#[tokio::test]
+async fn write_429_then_cancel_is_failed4xx() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    mount_429(&dc, "30").await;
+    let t = test_client(dc.client_config())?;
+    let ctl = FetchControl::new();
+    let write = {
+        let (client, ctl) = (t.client.clone(), ctl.clone());
+        let (w, cover) = (json_op(page_update(&dc)?), test_write_cover()?);
+        tokio::spawn(async move { client.send_approved_ctl(cover, &w, &ctl).await })
+    };
+    wait_received(&dc, 1).await?;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    ctl.cancel();
+    slow_down(write.await?)?;
+    assert_eq!(dc.received().await.len(), 1);
+    Ok(())
+}

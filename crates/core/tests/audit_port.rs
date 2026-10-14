@@ -718,17 +718,25 @@ fn builders_append_with_their_columns() -> TestResult {
             EventFlags::default(),
         ),
         (
-            payloads::read_released(&c, &binary.body, &ops)?,
+            payloads::read_released(&c, &rev, &binary.body, &ops)?,
             Some(DecisionColumn::ReleaseRedacted),
             EventFlags::REDACTED,
         ),
         (
-            payloads::with_batch(payloads::read_released(&c, b"{}", &[])?, batch.as_str()),
+            payloads::with_batch(
+                payloads::read_released(&c, &rev, b"{}", &[])?,
+                batch.as_str(),
+            ),
             Some(DecisionColumn::Release),
             EventFlags::BATCH,
         ),
         (
-            payloads::read_released_outcome(&c, ErrorCode::ResultTooLarge, "narrow the query"),
+            payloads::read_released_outcome(
+                &c,
+                &rev,
+                ErrorCode::ResultTooLarge,
+                "narrow the query",
+            ),
             Some(DecisionColumn::Release),
             EventFlags::default(),
         ),
