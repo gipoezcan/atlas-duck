@@ -419,13 +419,17 @@ async fn i23_stale_check_503_recheck_failed() -> TestResult {
     // Nothing was sent, and the agent still sees `pending` (§4.5).
     assert_eq!(writes_sent(mock).await, 0);
     assert_eq!(h.status(&id).await.status, Status::Pending);
-    match h.approver().open(&id).map_err(de)?.preview.warnings.first() {
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    match preview.warnings.first() {
         Some(w) => assert_eq!(
             w.id,
             atlas_duck_preview::warning::WarningId::CouldNotRecheck
         ),
         None => return Err("the re-review does not lead with the re-check".into()),
     }
+    // T10 review (deviation 6): the strip shows exactly these warnings; the body's implied one
+    // (a `CouldNotRecheck` card, a raw-only diff) is among them.
+    assert!(preview.body.implied_warning_present(&preview.warnings));
     Ok(())
 }
 

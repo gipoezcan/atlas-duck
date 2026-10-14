@@ -261,11 +261,38 @@ fn sanitize_document(html: &str) -> String {
 /// this pass also keeps the renderer's `header`, `section` and `mark`. The UI sets `sandbox=""`
 /// on the iframe.
 pub fn iframe_document(body_html: &str, platform: Platform) -> String {
-    let origin = app_origin(platform);
     let body = sanitize_document(body_html);
+    let style = Stylesheet::of(platform);
     format!(
         "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" \
-         content=\"default-src 'none'; style-src {origin}/preview.css; img-src data:\">\
-         <link rel=\"stylesheet\" href=\"{origin}/preview.css\"></head><body>{body}</body></html>"
+         content=\"default-src 'none'; style-src {}; img-src data:\">{}</head><body>{body}</body>\
+         </html>",
+        style.source, style.element
     )
+}
+
+/// How the document gets `preview.css`: the meta CSP's `style-src` source and the `<head>`
+/// element that loads it, which must change together. The one place to switch for PD-92.
+///
+/// Primary path (today): a `<link>` to `<origin>/preview.css`, allowed by that path source here
+/// and by `style-src 'self'` of the inherited main policy. PD-92 contingency (lead ruling; the
+/// spec/plan text is being amended, T32 decides): a `sha256-` hash source matches inline
+/// `<style>` content only, never a `<link>`, so the switch is: `element` becomes `<style>` with
+/// the exact bytes of `preview.css`, `source` becomes `'sha256-…'` of those bytes, and the same
+/// hash goes into the main policy (`ci/check-csp.mjs` keeps them in step). The tests that check
+/// the whole document for `<style` (`tests/render.rs`: `head()`,
+/// `goldens_have_no_class_or_style_attribute`) then check the body only.
+struct Stylesheet {
+    source: String,
+    element: String,
+}
+
+impl Stylesheet {
+    fn of(platform: Platform) -> Stylesheet {
+        let url = format!("{}/preview.css", app_origin(platform));
+        Stylesheet {
+            element: format!("<link rel=\"stylesheet\" href=\"{url}\">"),
+            source: url,
+        }
+    }
 }

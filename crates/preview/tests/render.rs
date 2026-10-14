@@ -1,7 +1,8 @@
 //! M6 T10 (Δ5, PD-67, PD-69, PD-79; S-06 Rust half, S-12): the sandboxed preview document.
 //!
 //! Goldens live in `tests/golden/render/<name>.html` (macOS/Linux origin); `UPDATE_GOLDENS=1`
-//! rewrites them (and then fails, so a rewrite is never mistaken for a pass).
+//! rewrites them (and then fails, so a rewrite is never mistaken for a pass). A golden or
+//! `preview.css` change needs a new `renderN` (`render_output_change_bumps_the_render_version`).
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -14,8 +15,8 @@ use atlas_duck_preview::render::{self, DOC_MAX_BYTES, DOC_MAX_DIFF_LINES, DOC_MA
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     BodyView, CandidateRev, CommentView, ConstructList, FieldRow, IssueCard, ItemCount,
-    OutcomeKind, PREVIEW_BUILDER_VERSION, Platform, Preview, PreviewBody, PreviewHeader, RawPager,
-    RequestView, json_tree, sanitize_html,
+    OutcomeKind, PREVIEW_BUILDER_VERSION, Platform, Preview, PreviewBody, PreviewHeader,
+    RENDER_VERSIONS, RawPager, RequestView, json_tree, sanitize_html,
 };
 use proptest::prelude::*;
 use serde_json::json;
@@ -578,6 +579,34 @@ fn assert_inert(doc: &str, platform: Platform) {
         marked,
         "an unmarked ⟨ in the text"
     );
+    // None raw in a tag either: an attribute value (an `alt`) holds the escape (T10 review M-1).
+    let tags = text_inside_tags(body);
+    for (c, flagged) in tags.chars().zip(invisible::flags(&tags)) {
+        assert!(!flagged, "raw flagged U+{:04X} in a tag", u32::from(c));
+    }
+}
+
+/// The text of `html` inside its tags, each tag followed by a newline.
+fn text_inside_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    let mut quoted = false;
+    for c in html.chars() {
+        match (in_tag, c) {
+            (false, '<') => in_tag = true,
+            (false, _) => {}
+            (true, '"') => {
+                quoted = !quoted;
+                out.push(c);
+            }
+            (true, '>') if !quoted => {
+                in_tag = false;
+                out.push('\n');
+            }
+            (true, c) => out.push(c),
+        }
+    }
+    out
 }
 
 const CORPUS: &[&str] = &[
@@ -795,6 +824,7 @@ fn assert_inert_rejects_active_content() {
         "<p>⟨U+202E⟩</p>",
         "<details>t</details>",
         "<!-- c -->",
+        "<img src=\"data:image/png;base64,AAAA\" alt=\"a\u{202E}b\">",
     ] {
         let doc = format!("{head}{body}</body></html>");
         let caught = std::panic::catch_unwind(|| assert_inert(&doc, Platform::MacOsLinux));
@@ -878,15 +908,11 @@ fn s12_raw_only_diff_caution_in_strip() {
         1,
         "{s}"
     );
-    // Core always adds the warning; were it missing, the strip still says it.
+    // The strip shows exactly the model's warnings (shown = audited, T10 review deviation 6):
+    // without the warning (core always adds it) there is no strip line.
     p.warnings.clear();
-    let s = strip(&p).unwrap_or_default();
-    assert_eq!(
-        s.matches("1 changes not visible in rendered diff").count(),
-        1,
-        "{s}"
-    );
-    // The raw diff's section names it too.
+    assert_eq!(strip(&p), None);
+    // The raw diff's section names it, from the body's own count.
     assert!(doc(&p).contains(
         "<h2>Raw diff</h2><p><strong>1 changes not visible in rendered diff</strong></p>"
     ));
@@ -936,11 +962,11 @@ fn pd69_trailing_ws_cr_and_missing_newline_visible() {
     );
     let d = doc(&p);
     for want in [
-        "<td>-</td><td><del><code><bdi>x</bdi></code></del></td>",
-        "<td>+</td><td><ins><code><bdi>x<mark>⟨U+000D⟩</mark></bdi></code></ins></td>",
-        "<td>-</td><td><del><code><bdi>y<mark>⟨U+0020⟩</mark></bdi></code></del></td>",
-        "<td>-</td><td><del><code><bdi>z <mark>⟨no newline at end⟩</mark></bdi></code></del></td>",
-        "<td>+</td><td><ins><code><bdi>z</bdi></code></ins></td>",
+        "<td>-</td><td><pre><del><bdi>x</bdi></del></pre></td>",
+        "<td>+</td><td><pre><ins><bdi>x<mark>⟨U+000D⟩</mark></bdi></ins></pre></td>",
+        "<td>-</td><td><pre><del><bdi>y<mark>⟨U+0020⟩</mark></bdi></del></pre></td>",
+        "<td>-</td><td><pre><del><bdi>z <mark>⟨no newline at end⟩</mark></bdi></del></pre></td>",
+        "<td>+</td><td><pre><ins><bdi>z</bdi></ins></pre></td>",
     ] {
         assert!(d.contains(want), "{want}\n{d}");
     }
@@ -966,6 +992,118 @@ fn diff_hunks_are_runs_and_fields_are_headings() {
     assert_eq!(section.matches("<tbody>").count(), 2, "{section}");
 }
 
+/// What a browser shows for `html` with no stylesheet (UA defaults only): tags dropped; outside a
+/// `<pre>` a run of spaces, tabs and newlines is one space, dropped at the start and end (the
+/// cell is a block); inside a `<pre>` whitespace stays as it is.
+fn shown_without_css(html: &str) -> String {
+    let mut out = String::new();
+    let mut pre = 0usize;
+    let mut space = false;
+    let mut rest = html;
+    while let Some(c) = rest.chars().next() {
+        if c == '<' {
+            let end = rest.find('>').map_or(rest.len(), |i| i + 1);
+            match &rest[..end] {
+                "<pre>" => pre += 1,
+                "</pre>" => pre = pre.saturating_sub(1),
+                _ => {}
+            }
+            rest = &rest[end..];
+            continue;
+        }
+        rest = &rest[c.len_utf8()..];
+        if pre == 0 && matches!(c, ' ' | '\t' | '\n') {
+            space = true;
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        out.push(c);
+    }
+    out
+}
+
+/// T10 review I-1: whitespace a browser would collapse shows without `preview.css` (PD-92 leaves
+/// its load unproven). The checks read the document as a browser renders it with no stylesheet.
+#[test]
+fn whitespace_shows_without_the_stylesheet() {
+    // An `a  b` → `a b` edit: two different rows.
+    let p = preview(
+        "write",
+        PreviewBody::EditDiff {
+            rendered: Vec::new(),
+            raw: line_diff("a  b\n", "a b\n").lines,
+            raw_only_changes: 0,
+            requests: Vec::new(),
+        },
+        Vec::new(),
+    );
+    let d = doc(&p);
+    let cell = |marker: &str| {
+        let open = format!("<td>{marker}</td><td>");
+        let at = d.find(&open).map_or(0, |i| i + open.len());
+        d[at..at + d[at..].find("</td>").unwrap_or(0)].to_owned()
+    };
+    let (del, ins) = (cell("-"), cell("+"));
+    assert_eq!(shown_without_css(&del), "a  b", "{d}");
+    assert_eq!(shown_without_css(&ins), "a b", "{d}");
+    // Non-vacuous: render1's cell (no `<pre>`) showed both rows as `a b`.
+    assert_eq!(
+        shown_without_css("<del><code><bdi>a  b</bdi></code></del>"),
+        shown_without_css("<ins><code><bdi>a b</bdi></code></ins>")
+    );
+    // Leading spaces and a tab inside a diff line.
+    let p = preview(
+        "write",
+        PreviewBody::EditDiff {
+            rendered: Vec::new(),
+            raw: line_diff("x\n", "  x\n").lines,
+            raw_only_changes: 0,
+            requests: Vec::new(),
+        },
+        Vec::new(),
+    );
+    assert!(doc(&p).contains("<td>+</td><td><pre><ins><bdi>  x</bdi></ins></pre></td>"));
+
+    // A multi-line field value keeps its line break; a run of spaces, a leading space and a tab
+    // in a one-line value stay; a plain value gets no `<pre>`.
+    let (_, j) = variants().swap_remove(8);
+    let d = doc(&j);
+    let value = "<td><strong>restricted visibility</strong> <pre><bdi>line one\nline two<mark>⟨U+0020⟩</mark><mark>⟨U+0020⟩</mark></bdi></pre></td>";
+    assert!(d.contains(value), "{d}");
+    assert!(shown_without_css(value).contains("line one\nline two"));
+    let p = preview(
+        "write",
+        PreviewBody::WriteSummary {
+            sentence: "Comment  on PROJ-1".into(),
+            rows: vec![
+                ("body".into(), " lead\ttab".into()),
+                ("issue".into(), "PROJ-1".into()),
+            ],
+            constructs: None,
+            requests: Vec::new(),
+        },
+        Vec::new(),
+    );
+    let d = doc(&p);
+    for (html, shown) in [
+        (
+            "<div><pre><bdi>Comment  on PROJ-1</bdi></pre></div>",
+            "Comment  on PROJ-1",
+        ),
+        ("<td><pre><bdi> lead\ttab</bdi></pre></td>", " lead\ttab"),
+    ] {
+        assert!(d.contains(html), "{html}\n{d}");
+        assert_eq!(shown_without_css(html), shown);
+    }
+    assert!(d.contains("<td><bdi>PROJ-1</bdi></td>"), "{d}");
+    // A value in a `<pre>` already (a request body) gets no second one.
+    let (_, w) = variants().swap_remove(1);
+    assert!(!doc(&w).contains("<pre><pre>") && !doc(&w).contains("<code><pre>"));
+}
+
 // ---- U-34, could-not-recheck, release blocked -------------------------------------------------
 
 #[test]
@@ -977,9 +1115,9 @@ fn u34_caution_strip_info_line_levels() {
         .unwrap_or(usize::MAX);
     assert_ne!(strip_start, usize::MAX, "{d}");
     let strip = &d[strip_start..strip_start + d[strip_start..].find("</section>").unwrap_or(0)];
-    let info_start = d.find("<p><strong>Info:</strong> ").unwrap_or(usize::MAX);
+    let info_start = d.find("<div><strong>Info:</strong> ").unwrap_or(usize::MAX);
     assert_ne!(info_start, usize::MAX, "{d}");
-    let info = &d[info_start..info_start + d[info_start..].find("</p>").unwrap_or(0)];
+    let info = &d[info_start..info_start + d[info_start..].find("</div>").unwrap_or(0)];
     for w in &p.warnings {
         let (inside, outside) = match w.id.level() {
             atlas_duck_preview::Level::Caution => (strip, info),
@@ -1065,17 +1203,19 @@ fn could_not_recheck_leads_card_and_strip() {
             "<tr><th>failure class</th><td><bdi>network error after send</bdi></td></tr>"
         )
     );
-    // Without the warning the strip still leads with it.
+    // The strip shows exactly the model's warnings (T10 review deviation 6): without the
+    // warning (core asserts the body implies it) the strip has no line for it; the card still
+    // leads the body.
     let mut q = p.clone();
     q.warnings.retain(|w| w.id != WarningId::CouldNotRecheck);
+    assert!(!q.body.implied_warning_present(&q.warnings));
     let d = doc(&q);
-    assert!(
-        d.contains(&format!(
-            "<h2>Caution</h2><ul><li>{}</li>",
-            warning::TEXT_COULD_NOT_RECHECK
-        )),
-        "{d}"
-    );
+    let strip = &d[..d.find("</header>").unwrap_or(0)];
+    assert!(!strip.contains(warning::TEXT_COULD_NOT_RECHECK), "{d}");
+    assert!(d.contains(&format!(
+        "</header><section><h2>{}</h2>",
+        warning::TEXT_COULD_NOT_RECHECK
+    )));
     // Another body with the warning (the T19 path: the pre-change preview) leads the strip too.
     let (_, mut e) = variants().swap_remove(11);
     e.warnings.push(Warning::new(
@@ -1212,6 +1352,51 @@ fn caps_insert_hidden_note_and_count_bytes() {
     assert!(d.contains("…</bdi>"));
     assert!(d.contains("more bytes not shown here; see Structured or Raw</p></body></html>"));
     assert!(hidden(&d) >= 100);
+
+    // The header's own caps count too (T10 review M-3): a list past its row cap...
+    let empty = PreviewBody::Table {
+        columns: Vec::new(),
+        rows: Vec::new(),
+        count: None,
+    };
+    let mut p = preview("read", empty, Vec::new());
+    p.header.fields_included = (0..=DOC_MAX_ROWS).map(|i| format!("f{i}")).collect();
+    let d = doc(&p);
+    assert!(
+        d.contains("<bdi>f1999</bdi>, 1 more entries not shown here; see Structured or Raw</td>"),
+        "{}",
+        &d[..d.len().min(600)]
+    );
+    assert_eq!(hidden(&d), "f2000".len() as u64);
+    // ...and a header text past the byte budget: cut, counted, noted at the end of the body.
+    p.header.fields_included = Vec::new();
+    p.header.query = Some("q".repeat(DOC_MAX_BYTES + 10));
+    let d = doc(&p);
+    assert!(d.contains("…</bdi></code></td></tr>"));
+    assert!(hidden(&d) >= 10);
+    assert!(d.contains(&format!(
+        "<p>{} more bytes not shown here; see Structured or Raw</p></body></html>",
+        hidden(&d)
+    )));
+}
+
+/// T10 review M-1: a flagged character in an attribute value of a `*_html` string (an `alt`) is
+/// escaped too, also when core did not display-escape the string.
+#[test]
+fn flagged_characters_in_attribute_values_are_escaped() {
+    let (_, mut p) = variants().swap_remove(8);
+    if let PreviewBody::JiraIssue {
+        description_html, ..
+    } = &mut p.body
+    {
+        *description_html = Some(sanitize_html(
+            "<p><img src=\"data:image/png;base64,AAAA\" alt=\"x\u{202E}y\"></p>",
+        ));
+    }
+    let d = doc(&p);
+    assert!(d.contains("alt=\"x⟨U+202E⟩y\""), "{d}");
+    assert!(!d.contains('\u{202E}'));
+    assert_inert(&d, Platform::MacOsLinux);
 }
 
 // ---- document head, platforms, PD-79, version -------------------------------------------------
@@ -1285,7 +1470,50 @@ fn amp_8203_literal() {
 
 #[test]
 fn builder_version_names_the_render_version() {
-    assert_eq!(PREVIEW_BUILDER_VERSION, "pb2;render1;icu-17.0;emoji-17.0");
+    assert_eq!(PREVIEW_BUILDER_VERSION, "pb2;render2;icu-17.0;emoji-17.0");
+}
+
+/// FNV-1a 64 over every golden (by file name: the name, NUL, the bytes, NUL), then
+/// `app/ui/public/preview.css` the same way.
+fn render_digest() -> Result<u64, Box<dyn std::error::Error>> {
+    let mut paths = std::fs::read_dir(golden_dir())?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    paths.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app/ui/public/preview.css"));
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for path in &paths {
+        let name = path.file_name().ok_or("no file name")?.to_string_lossy();
+        let bytes = std::fs::read(path)?;
+        for b in name.bytes().chain([0]).chain(bytes).chain([0]) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    Ok(h)
+}
+
+/// T10 review M-8: the goldens and the stylesheet are what a `renderN` shows; a change to either
+/// without a new version (and a new `RENDER_VERSIONS` entry) fails here.
+#[test]
+fn render_output_change_bumps_the_render_version() -> TestResult {
+    let got = render_digest()?;
+    let &(current, pinned) = RENDER_VERSIONS.last().ok_or("no render version")?;
+    assert!(
+        PREVIEW_BUILDER_VERSION.contains(&format!(";{current};")),
+        "PREVIEW_BUILDER_VERSION {PREVIEW_BUILDER_VERSION} does not name {current}, the last \
+         RENDER_VERSIONS entry"
+    );
+    let names: HashSet<&str> = RENDER_VERSIONS.iter().map(|(n, _)| *n).collect();
+    let digests: HashSet<u64> = RENDER_VERSIONS.iter().map(|(_, d)| *d).collect();
+    assert_eq!(names.len(), RENDER_VERSIONS.len(), "a render version twice");
+    assert_eq!(digests.len(), RENDER_VERSIONS.len(), "a digest twice");
+    assert_eq!(
+        got, pinned,
+        "the goldens or preview.css changed (digest {got:#018x}): bump renderN in \
+         PREVIEW_BUILDER_VERSION and append (\"renderN\", {got:#018x}) to RENDER_VERSIONS"
+    );
+    Ok(())
 }
 
 #[test]

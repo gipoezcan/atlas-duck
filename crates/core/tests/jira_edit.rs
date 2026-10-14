@@ -421,6 +421,29 @@ fn s12_raw_only_diff_flagged() -> TestResult {
     Ok(())
 }
 
+/// T10 review (deviation 6): the Caution strip renders exactly the model's warnings, so an edit
+/// model with raw-only changes must carry `RawOnlyDiff` itself (`implied_warning`), and one
+/// without implies none. `decision::preview_fetch` debug-asserts the same for every preview.
+#[test]
+fn raw_only_edit_model_carries_its_warning() -> TestResult {
+    for (old, new, raw_only) in [
+        ("a", "*a*", true),
+        ("a\nb\nc\nd", "a\nX\nc\n{color:red}d{color}", true),
+        ("a", "b", false),
+    ] {
+        let params = json!({"key": KEY, "fields": {"description": new}});
+        let m = preview(&params, json!({"description": old}))?;
+        assert_eq!(diffs(&m)?.raw_only_changes > 0, raw_only, "{new:?}");
+        assert_eq!(
+            m.body.implied_warning(),
+            raw_only.then_some(WarningId::RawOnlyDiff),
+            "{new:?}"
+        );
+        assert!(m.body.implied_warning_present(&m.warnings), "{new:?}");
+    }
+    Ok(())
+}
+
 /// T6 handoff (PD-51 weakness): a string field's raw diff is one hunk, so a visible change plus
 /// an invisible one in another place of the same field would cancel out under the hunk formula.
 /// Each source-line hunk whose two sides project to the same text counts on its own.

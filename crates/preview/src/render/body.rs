@@ -227,9 +227,9 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
         }
         PreviewBody::Conflict { summary, diff_text } => {
             section(doc, CONFLICT_HEADING);
-            doc.open("p");
+            doc.open("div");
             doc.text(summary);
-            doc.close("p");
+            doc.close("div");
             if !diff_text.is_empty() {
                 doc.el("h3", "Agent's base against the current state");
                 pre_text(doc, diff_text);
@@ -304,9 +304,9 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             requests,
         } => {
             section(doc, "Summary");
-            doc.open("p");
+            doc.open("div");
             doc.text(sentence);
-            doc.close("p");
+            doc.close("div");
             pair_table(doc, rows);
             if let Some(c) = constructs {
                 construct_list(doc, c);
@@ -342,11 +342,11 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             requests,
         } => {
             section(doc, "Transition");
-            doc.open("p");
+            doc.open("div");
             doc.text(from);
             doc.fixed(" → ");
             doc.text(to);
-            doc.close("p");
+            doc.close("div");
             doc.open("table");
             doc.open("tbody");
             text_row(doc, "transition", transition);
@@ -605,9 +605,7 @@ fn json_node(doc: &mut Doc, key: Option<Key<'_>>, n: &JsonNode) {
     doc.open("li");
     match key {
         Some(Key::Name(k)) => {
-            doc.open("code");
-            doc.raw_text(k);
-            doc.close("code");
+            doc.raw_code_text(k);
             doc.fixed(": ");
         }
         Some(Key::Index(i)) => doc.fixed(&format!("[{i}]: ")),
@@ -616,16 +614,8 @@ fn json_node(doc: &mut Doc, key: Option<Key<'_>>, n: &JsonNode) {
     match n {
         JsonNode::Null => doc.el("code", "null"),
         JsonNode::Bool { value } => doc.el("code", if *value { "true" } else { "false" }),
-        JsonNode::Number { text } => {
-            doc.open("code");
-            doc.raw_text(text);
-            doc.close("code");
-        }
-        JsonNode::String { text } => {
-            doc.fixed("\"");
-            doc.raw_text(text);
-            doc.fixed("\"");
-        }
+        JsonNode::Number { text } => doc.raw_code_text(text),
+        JsonNode::String { text } => doc.raw_quoted(text),
         JsonNode::Collapsed { byte_len, .. } => doc.fixed(&format!(
             "string of {byte_len} bytes, not shown here; see Structured or Raw"
         )),
@@ -685,7 +675,8 @@ fn more_item(doc: &mut Doc, n: usize) {
 
 /// A diff: each `Field` line is an `<h3>`; the lines after it form one `<table>` with a marker
 /// column (`+`, `-`, ` `), one `<tbody>` per run (a hunk is a run of `Add`/`Del` lines), the
-/// text PD-69-visible. At most [`DOC_MAX_DIFF_LINES`] lines.
+/// text PD-69-visible and in a `<pre>` (a change in a run of spaces shows without the
+/// stylesheet, T10 review I-1). At most [`DOC_MAX_DIFF_LINES`] lines.
 fn diff(doc: &mut Doc, lines: &[DiffLine]) {
     if lines.is_empty() {
         doc.el("p", "no changes");
@@ -729,15 +720,15 @@ fn diff(doc: &mut Doc, lines: &[DiffLine]) {
         doc.open("tr");
         doc.el("td", marker);
         doc.open("td");
+        doc.open("pre");
         if let Some(tag) = wrap {
             doc.open(tag);
         }
-        doc.open("code");
         doc.diff_line(&line.text);
-        doc.close("code");
         if let Some(tag) = wrap {
             doc.close(tag);
         }
+        doc.close("pre");
         doc.close("td");
         doc.close("tr");
     }
@@ -804,9 +795,7 @@ fn jira_issue(
             doc.text(&f.name);
             doc.close("td");
             doc.open("td");
-            doc.open("code");
-            doc.text(&f.id);
-            doc.close("code");
+            doc.code_text(&f.id);
             doc.close("td");
             doc.open("td");
             if f.restricted {
@@ -849,7 +838,7 @@ fn jira_issue(
         doc.fixed("Comment ");
         doc.text(&c.id);
         doc.close("h4");
-        doc.open("p");
+        doc.open("div");
         match &c.author {
             Some(a) => doc.text(a),
             None => doc.fixed("unknown author"),
@@ -862,7 +851,7 @@ fn jira_issue(
             doc.fixed(" ");
             doc.el("strong", "restricted visibility");
         }
-        doc.close("p");
+        doc.close("div");
         doc.html(&c.body_html);
         doc.close("section");
     }

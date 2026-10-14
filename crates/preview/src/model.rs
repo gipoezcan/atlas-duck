@@ -5,14 +5,15 @@ use serde::{Deserialize, Serialize};
 use crate::diff::DiffLine;
 use crate::form::EditForm;
 use crate::json_tree::JsonNode;
-use crate::warning::Warning;
+use crate::warning::{Warning, WarningId};
 
 /// Size of one Raw page; the bytes themselves stay in core (C.7 `RawPage`).
 pub const RAW_PAGE_BYTES: u64 = 256 * 1024;
 
 /// Names the preview builder and the classifier's Unicode and emoji table versions so counts are
 /// reproducible (§6.4, §8.3, V31). `renderN` is the `render` document's version (M6 T10): every
-/// change to the document's output bumps it. The table versions are literals read from the
+/// change to the document's output bumps it, together with a new [`RENDER_VERSIONS`] entry.
+/// The table versions are literals read from the
 /// pinned crates; `tests/invisible.rs` checks them:
 /// - `icu-17.0`: `icu_properties_data` 2.3.0 README "generated with CLDR version 48.2.1, ICU
 ///   version release-78.1rc"; ICU 78 is the Unicode 17.0 release, and the data assigns U+10940
@@ -20,7 +21,18 @@ pub const RAW_PAGE_BYTES: u64 = 256 * 1024;
 /// - `emoji-17.0`: `emojis` 0.9.0 README "Uses Unicode v17.0 emoji specification"
 ///   (`emojis::UNICODE_VERSION`).
 pub const PREVIEW_BUILDER_VERSION: &str =
-    concat!("pb2;render", "1", ";icu-", "17.0", ";emoji-", "17.0");
+    concat!("pb2;render", "2", ";icu-", "17.0", ";emoji-", "17.0");
+
+/// Each `renderN` with the FNV-1a 64 digest of what it renders: the goldens in
+/// `tests/golden/render` and `app/ui/public/preview.css` (`tests/render.rs` recomputes it and
+/// fails on a mismatch, T10 review M-8). When the document's output or the stylesheet changes,
+/// bump `renderN` in [`PREVIEW_BUILDER_VERSION`] and APPEND its pair here; never edit an entry.
+/// The last entry is the current version.
+#[doc(hidden)]
+pub const RENDER_VERSIONS: &[(&str, u64)] = &[
+    ("render1", 0x50e0_b962_fa25_e8fa),
+    ("render2", 0x5977_a808_67ef_8b73),
+];
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
 pub const ERROR_TEXT_CAP_BYTES: usize = 2048;
@@ -312,6 +324,26 @@ impl PreviewBody {
             text: cap_error_text(text),
             outcome,
         }
+    }
+
+    /// The warning this body's content implies: `CouldNotRecheck` for that card, `RawOnlyDiff`
+    /// for an edit diff with raw-only changes. The model must carry it: the Caution strip shows
+    /// exactly the model's warnings, and those are what `PREVIEW_SHOWN.warning_ids` records
+    /// (shown = audited). Core asserts it where it assembles a `Preview`.
+    pub fn implied_warning(&self) -> Option<WarningId> {
+        match self {
+            PreviewBody::CouldNotRecheck { .. } => Some(WarningId::CouldNotRecheck),
+            PreviewBody::EditDiff {
+                raw_only_changes, ..
+            } if *raw_only_changes > 0 => Some(WarningId::RawOnlyDiff),
+            _ => None,
+        }
+    }
+
+    /// `warnings` names [`PreviewBody::implied_warning`] (true when the body implies none).
+    pub fn implied_warning_present(&self, warnings: &[Warning]) -> bool {
+        self.implied_warning()
+            .is_none_or(|id| warnings.iter().any(|w| w.id == id))
     }
 }
 

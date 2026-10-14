@@ -2,9 +2,11 @@
    The document comes from preview::render (Rust): semantic elements only, never
    a class or style attribute, so every rule here selects by element and position.
    Layout of the body: <header> (the Caution strip <section>, the facts <table>,
-   the Info <p>), then one <section> per part of the preview.
+   the Info <div>), then one <section> per part of the preview.
    Colour is never the only signal: the Caution strip has a text label, diff lines
-   carry a text marker column (+, -, space), escapes like <U+202E> are text. */
+   carry a text marker column (+, -, space), escapes like <U+202E> are text.
+   Whitespace never depends on this file: diff lines, and values whose spaces, tabs
+   or newlines would collapse, come in a <pre> (T10 review I-1). */
 
 body {
   font-family: system-ui, sans-serif;
@@ -49,7 +51,7 @@ body > header > section > ul {
   padding-left: 20px;
 }
 
-body > header > p {
+body > header > div {
   opacity: 0.75;
   margin: 4px 0 0;
 }
@@ -94,6 +96,13 @@ pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   margin: 4px 0;
+}
+
+/* A value's <pre> in a cell or list item (every diff line, a multi-line value). */
+td > pre,
+th > pre,
+li > pre {
+  margin: 0;
 }
 
 /* Diffs: the first cell of a row is the text marker; a hunk is its own <tbody>. */

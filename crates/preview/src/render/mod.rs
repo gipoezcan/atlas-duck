@@ -7,10 +7,15 @@
 //!   `invisible::escape_for_display` here for the raw ones: diff lines, request views, JSON tree
 //!   strings and keys), made whitespace-visible (PD-69, [`ws`]) and wrapped in `<bdi>`; each
 //!   `⟨…⟩` escape is a `<mark>`. A flagged character core left raw is escaped here as well.
-//! - `*_html` strings pass `sanitize_html` again; flagged characters in their text are escaped.
+//! - Whitespace fidelity does not depend on `preview.css` (T10 review I-1: PD-92 leaves its load
+//!   unproven): diff lines, and every value whose whitespace a browser would collapse (leading
+//!   space, a run of spaces, a tab, a newline), are in a `<pre>` (UA `white-space: pre`).
+//! - `*_html` strings pass `sanitize_html` again; flagged characters in their text are escaped,
+//!   in their attribute values (an `alt`) too.
 //! - Semantic elements only (`header`, `section`, `table`, `th`, `td`, `ins`, `del`, `h2`–`h4`,
-//!   `ul`, `li`, `p`, `pre`, `code`, `bdi`, `mark`, `strong`), never a `class` or `style`
-//!   attribute: `preview.css` styles by element and position.
+//!   `ul`, `li`, `p`, `div`, `pre`, `code`, `bdi`, `mark`, `strong`), never a `class` or `style`
+//!   attribute: `preview.css` styles by element and position. A value that may need a `<pre>`
+//!   sits in a `div`, never a `p` (which cannot hold one).
 //! - Display caps: [`DOC_MAX_ROWS`] rows per table or list, [`DOC_MAX_DIFF_LINES`] lines per diff,
 //!   [`DOC_MAX_BYTES`] for the whole body. What a cap leaves out is replaced by the PD-67 note and
 //!   counted in the header's "hidden in preview" bytes.
@@ -26,9 +31,9 @@ pub mod ws;
 pub use raw::{RawDisplay, raw_display, raw_display_last};
 
 use crate::invisible;
-use crate::model::{ItemCount, Preview, PreviewBody};
+use crate::model::{ItemCount, Preview};
 use crate::sanitize::{Platform, iframe_document, sanitize_html};
-use crate::warning::{self, Level, Warning, WarningId};
+use crate::warning::{Level, Warning, WarningId};
 
 /// Most rows of one table or list in the document (PD-67).
 pub const DOC_MAX_ROWS: usize = 2_000;
@@ -45,18 +50,25 @@ pub fn more_not_shown(n: u64, unit: &str) -> String {
 
 /// The whole `srcdoc` document for `p` (Δ5).
 pub fn document(p: &Preview, platform: Platform) -> String {
-    let mut doc = Doc::default();
-    body::body(&mut doc, &p.body);
-    if doc.cut_text > 0 {
-        doc.open("p");
-        doc.fixed(&more_not_shown(doc.cut_text, "bytes"));
-        doc.close("p");
-    }
-    let body = std::mem::take(&mut doc.out);
-    let cut = doc.cut;
+    let mut body = Doc::default();
+    body::body(&mut body, &p.body);
+    // The header's own caps (a list past its row cap, a text past the budget) count too: its
+    // "hidden in preview" value is written once the header is done.
     let mut head = Doc::default();
-    header(&mut head, p, cut);
-    head.out.push_str(&body);
+    let hidden_at = header(&mut head, p);
+    let hidden = p
+        .header
+        .hidden_in_preview_bytes
+        .saturating_add(body.cut)
+        .saturating_add(head.cut);
+    head.out.insert_str(hidden_at, &format!("{hidden} bytes"));
+    head.out.push_str(&body.out);
+    let cut_text = body.cut_text.saturating_add(head.cut_text);
+    if cut_text > 0 {
+        head.open("p");
+        head.fixed(&more_not_shown(cut_text, "bytes"));
+        head.close("p");
+    }
     iframe_document(&head.out, platform)
 }
 
@@ -65,10 +77,28 @@ pub fn document(p: &Preview, platform: Platform) -> String {
 #[derive(Default)]
 pub(crate) struct Doc {
     out: String,
-    /// Every byte a cap left out of the body (rows, lines, items, cut texts).
+    /// Every byte a cap left out (rows, lines, items, cut texts).
     cut: u64,
     /// The part of `cut` cut from inside a single text (one note at the end of the body).
     cut_text: u64,
+    /// `<pre>` elements open.
+    pre: u32,
+}
+
+/// How [`Doc::value`] frames a value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Frame {
+    Plain,
+    Code,
+    /// In double quotes (a JSON string).
+    Quoted,
+}
+
+/// A browser collapses this display text's whitespace unless it is in a `<pre>` (or styled):
+/// a leading space, a run of spaces, a tab or a newline. Trailing spaces and tabs are escapes
+/// already (PD-69).
+fn collapses(shown: &str) -> bool {
+    shown.starts_with(' ') || shown.contains("  ") || shown.contains(['\t', '\n'])
 }
 
 impl Doc {
@@ -84,12 +114,18 @@ impl Doc {
 
     /// `<tag>` (fixed markup, no attribute).
     pub(crate) fn open(&mut self, tag: &str) {
+        if tag == "pre" {
+            self.pre = self.pre.saturating_add(1);
+        }
         self.out.push('<');
         self.out.push_str(tag);
         self.out.push('>');
     }
 
     pub(crate) fn close(&mut self, tag: &str) {
+        if tag == "pre" {
+            self.pre = self.pre.saturating_sub(1);
+        }
         self.out.push_str("</");
         self.out.push_str(tag);
         self.out.push('>');
@@ -108,10 +144,15 @@ impl Doc {
     }
 
     /// A string core display-escaped: whitespace made visible, HTML-escaped, escapes marked, in
-    /// `<bdi>`. Cut at the byte budget (the rest is counted and noted at the end of the body).
+    /// `<bdi>` ([`Doc::value`]). Cut at the byte budget (the rest is counted and noted at the end
+    /// of the body).
     pub(crate) fn text(&mut self, s: &str) {
-        let shown = ws::visible_value(s);
-        self.bdi(&shown);
+        self.value(&ws::visible_value(s), Frame::Plain);
+    }
+
+    /// [`Doc::text`] in `<code>`.
+    pub(crate) fn code_text(&mut self, s: &str) {
+        self.value(&ws::visible_value(s), Frame::Code);
     }
 
     /// A raw string (diff-free): display-escaped here first, then as [`Doc::text`].
@@ -119,10 +160,49 @@ impl Doc {
         self.text(&invisible::escape_for_display(s));
     }
 
-    /// One diff line (raw): display-escaped, PD-69 line notation, as [`Doc::text`].
+    /// [`Doc::raw_text`] in `<code>`.
+    pub(crate) fn raw_code_text(&mut self, s: &str) {
+        self.code_text(&invisible::escape_for_display(s));
+    }
+
+    /// [`Doc::raw_text`] in double quotes (a JSON string value).
+    pub(crate) fn raw_quoted(&mut self, s: &str) {
+        let shown = ws::visible_value(&invisible::escape_for_display(s));
+        self.value(&shown, Frame::Quoted);
+    }
+
+    /// One diff line (raw): display-escaped, PD-69 line notation, in `<bdi>`. The caller puts
+    /// every diff line in a `<pre>`, so a whitespace-only change shows without the stylesheet.
     pub(crate) fn diff_line(&mut self, s: &str) {
         let shown = ws::visible_line(&invisible::escape_for_display(s));
         self.bdi(&shown);
+    }
+
+    /// Display text `shown` (whitespace already made visible) framed in `<bdi>`, and in a `<pre>`
+    /// around the frame when its whitespace would collapse without the stylesheet and no `<pre>`
+    /// is open (T10 review I-1). The `<pre>` starts with an element or a quote, never with the
+    /// value's text, so the parser's leading-newline rule cannot eat a newline of the value.
+    fn value(&mut self, shown: &str, frame: Frame) {
+        let pre = self.pre == 0 && collapses(shown);
+        if pre {
+            self.open("pre");
+        }
+        match frame {
+            Frame::Plain => self.bdi(shown),
+            Frame::Code => {
+                self.open("code");
+                self.bdi(shown);
+                self.close("code");
+            }
+            Frame::Quoted => {
+                self.fixed("\"");
+                self.bdi(shown);
+                self.fixed("\"");
+            }
+        }
+        if pre {
+            self.close("pre");
+        }
     }
 
     fn bdi(&mut self, shown: &str) {
@@ -220,7 +300,8 @@ fn push_marked(out: &mut String, s: &str, limit: usize) -> u64 {
 /// Sanitizer output with the text between its tags passed through the escape marking (its
 /// entities stay as they are). The sanitizer's serialization is canonical: a `<` in text is always
 /// `&lt;` and attribute values are double-quoted with `"` written `&quot;`, so a tag ends at the
-/// first `>` outside quotes. Attribute values (an `alt`) are copied unchanged.
+/// first `>` outside quotes. In a tag (only an attribute value, an `alt`, can hold one) a flagged
+/// character becomes its `⟨U+XXXX⟩` escape: an attribute cannot hold a `<mark>` (T10 review M-1).
 fn mark_html(out: &mut String, html: &str) {
     let mut rest = html;
     while !rest.is_empty() {
@@ -236,7 +317,14 @@ fn mark_html(out: &mut String, html: &str) {
                         c == '>' && !quoted
                     })
                     .map_or(rest.len(), |(i, _)| i + 1);
-                out.push_str(&rest[..end]);
+                let tag = &rest[..end];
+                for (c, flagged) in tag.chars().zip(invisible::flags(tag)) {
+                    if flagged {
+                        ws::push_escape(out, c);
+                    } else {
+                        out.push(c);
+                    }
+                }
                 rest = &rest[end..];
             }
             found => {
@@ -290,53 +378,38 @@ pub fn item_count_text(c: &ItemCount) -> String {
 }
 
 /// The Caution strip's lines in order: the release-blocked banner, then the stale warnings the
-/// re-review leads with (§5.4 step 5: "Could not re-check target" first), then the rest. A
-/// `CouldNotRecheck` body or raw-only diff changes the warnings do not name still get their line.
-fn caution_lines<'a>(p: &'a Preview) -> Vec<CautionLine<'a>> {
+/// re-review leads with (§5.4 step 5: "Could not re-check target" first), then the rest. Exactly
+/// the model's Caution warnings, so the strip shows what `PREVIEW_SHOWN.warning_ids` records
+/// (core asserts a body's implied warning is among them:
+/// [`crate::PreviewBody::implied_warning`]).
+fn caution_lines(p: &Preview) -> Vec<CautionLine<'_>> {
     let mut lines = Vec::new();
     if let Some(text) = p.header.release_blocked {
-        lines.push(CautionLine::Fixed(text.to_owned()));
+        lines.push(CautionLine::Fixed(text));
     }
-    let cautions: Vec<&Warning> = p
+    let (lead, rest): (Vec<&Warning>, Vec<&Warning>) = p
         .warnings
         .iter()
         .filter(|w| w.level == Level::Caution)
-        .collect();
-    let has = |id: WarningId| cautions.iter().any(|w| w.id == id);
-    if matches!(p.body, PreviewBody::CouldNotRecheck { .. }) && !has(WarningId::CouldNotRecheck) {
-        lines.push(CautionLine::Fixed(
-            warning::TEXT_COULD_NOT_RECHECK.to_owned(),
-        ));
-    }
-    let (lead, rest): (Vec<&Warning>, Vec<&Warning>) = cautions
-        .iter()
         .partition(|w| w.id == WarningId::CouldNotRecheck);
     lines.extend(
         lead.into_iter()
             .chain(rest)
             .map(|w| CautionLine::Text(&w.text)),
     );
-    if let PreviewBody::EditDiff {
-        raw_only_changes, ..
-    } = &p.body
-        && *raw_only_changes > 0
-        && !has(WarningId::RawOnlyDiff)
-    {
-        lines.push(CautionLine::Fixed(warning::raw_only_diff(
-            *raw_only_changes,
-        )));
-    }
     lines
 }
 
 enum CautionLine<'a> {
-    /// App-generated (core's constant or a fixed template over counts).
-    Fixed(String),
+    /// App-generated (core's constant).
+    Fixed(&'static str),
     /// A warning text (display-escaped by core where it carries server or agent text).
     Text(&'a str),
 }
 
-fn header(doc: &mut Doc, p: &Preview, cut: u64) {
+/// Writes the header; returns where its "hidden in preview" value goes ([`document`] writes it
+/// once every cap, the header's own included, is counted).
+fn header(doc: &mut Doc, p: &Preview) -> usize {
     let h = &p.header;
     doc.open("header");
     let cautions = caution_lines(p);
@@ -368,8 +441,12 @@ fn header(doc: &mut Doc, p: &Preview, cut: u64) {
     if !h.fields_included.is_empty() {
         row_list(doc, "fields included", &h.fields_included);
     }
-    let hidden = h.hidden_in_preview_bytes.saturating_add(cut);
-    row_fixed(doc, "hidden in preview", &format!("{hidden} bytes"));
+    doc.open("tr");
+    doc.el("th", "hidden in preview");
+    doc.open("td");
+    let hidden_at = doc.out.len();
+    doc.close("td");
+    doc.close("tr");
     row_fixed(doc, "bidi controls", &h.bidi_controls.to_string());
     row_fixed(doc, "other invisible", &h.other_invisible.to_string());
     if let Some(user) = &h.executes_as {
@@ -384,9 +461,7 @@ fn header(doc: &mut Doc, p: &Preview, cut: u64) {
         doc.open("tr");
         doc.el("th", "query");
         doc.open("td");
-        doc.open("code");
-        doc.text(q);
-        doc.close("code");
+        doc.code_text(q);
         doc.close("td");
         doc.close("tr");
     }
@@ -399,15 +474,16 @@ fn header(doc: &mut Doc, p: &Preview, cut: u64) {
         .filter(|w| w.level == Level::Info)
         .collect();
     if !infos.is_empty() {
-        doc.open("p");
+        doc.open("div");
         doc.el("strong", INFO_LABEL);
         for (i, w) in infos.iter().enumerate() {
             doc.fixed(if i == 0 { " " } else { "; " });
             doc.text(&w.text);
         }
-        doc.close("p");
+        doc.close("div");
     }
     doc.close("header");
+    hidden_at
 }
 
 fn row_text(doc: &mut Doc, label: &str, value: &str) {
@@ -426,7 +502,8 @@ fn row_fixed(doc: &mut Doc, label: &str, value: &str) {
     doc.close("tr");
 }
 
-/// A comma-separated list, each entry in its own `<bdi>`, at most [`DOC_MAX_ROWS`] entries.
+/// A comma-separated list, each entry in its own `<bdi>`, at most [`DOC_MAX_ROWS`] entries (the
+/// rest noted and counted).
 fn row_list(doc: &mut Doc, label: &str, items: &[String]) {
     doc.open("tr");
     doc.el("th", label);
@@ -437,10 +514,13 @@ fn row_list(doc: &mut Doc, label: &str, items: &[String]) {
         }
         doc.text(item);
     }
-    if items.len() > DOC_MAX_ROWS {
+    if let Some(rest) = items.get(DOC_MAX_ROWS..)
+        && !rest.is_empty()
+    {
+        doc.hide(rest.iter().map(|s| len_u64(s.len())).sum());
         doc.fixed(&format!(
             ", {}",
-            more_not_shown(len_u64(items.len() - DOC_MAX_ROWS), "entries")
+            more_not_shown(len_u64(rest.len()), "entries")
         ));
     }
     doc.close("td");

@@ -732,6 +732,13 @@ async fn preview_fetch(
         let dec = SubmittedDecision::Preview;
         return Err(rejected(&engine, &entry, (r, at), submitted, dec).await);
     };
+    // Shown = audited: the Caution strip renders exactly these warnings, so a body's implied
+    // warning must be among them (`PREVIEW_SHOWN.warning_ids` below).
+    debug_assert!(
+        preview.body.implied_warning_present(&preview.warnings),
+        "{:?} body without its warning",
+        preview.body.implied_warning()
+    );
     // §5.6: only the first delivery of a revision commits `PREVIEW_SHOWN`.
     if opened {
         return Ok(PreviewDelivery { preview });
