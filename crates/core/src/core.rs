@@ -451,6 +451,8 @@ impl Core {
         // PD-46 (T8 review I-1): no field-name cache fill starts from now on, and the running
         // ones are cancelled (never waits); they end before `APP_STOP` below.
         self.engine.field_cache().cancel_all();
+        // T19: likewise for the token re-checks (`SYSTEM_FETCH {purpose: token_recheck}`).
+        self.engine.identity_gates().cancel_all();
         let (why, stop) = match reason {
             ShutdownReason::Quit => (CancelWhy::AppQuit, AppStopReason::Quit),
             // The installer path cancels with the app's own reason (§8.3: `app_quit`).
@@ -467,6 +469,7 @@ impl Core {
         let wait = crate::shutdown::WRITE_WAIT;
         let swept = crate::shutdown::sweep(&self.engine, why, wait).await;
         crate::shutdown::fills_ended(&self.engine, crate::shutdown::FILL_WAIT).await;
+        crate::shutdown::rechecks_ended(&self.engine, crate::shutdown::FILL_WAIT).await;
         let app_stop_logged = crate::shutdown::stop(&self.engine, stop).await.is_ok();
         ShutdownReport {
             cancelled: swept.cancelled,

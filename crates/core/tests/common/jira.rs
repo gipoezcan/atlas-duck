@@ -185,6 +185,16 @@ pub async fn mount_projects(mock: &MockDc, projects: &Value) {
     .await;
 }
 
+/// `m p` answers `body` (200 JSON) **without** `X-AUSERNAME` and without `MockDc::response`'s
+/// other headers: an answer that fails the §7.2 per-response identity check (T19, RF-5b).
+pub async fn mount_without_xauser(mock: &MockDc, m: &str, p: &str, body: &str) {
+    Mock::given(method(m))
+        .and(path(mock.path(p)))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body.to_owned(), "application/json"))
+        .mount(mock.server())
+        .await;
+}
+
 async fn mount_get(mock: &MockDc, p: &str, t: ResponseTemplate) {
     Mock::given(method("GET"))
         .and(path(mock.path(p)))

@@ -2073,10 +2073,9 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
         stale_fail(engine, entry, approval, None, recheck_failed("internal")).await;
         return;
     };
-    // An instance in an identity-header state names that reason (§7.2 *Header lost*).
-    if let Some(Err(fail)) = state_refusal(engine, &entry.instance_id, GetMode::Recheck)
-        && fail.1.is_some()
-    {
+    // An instance that left `ok` after the approval is not called: an identity-header state names
+    // its reason (§7.2 *Header lost*), `needs_token` is `identity_mismatch` (PD-65, M3 T26 M-6).
+    if let Some(Err(fail)) = state_refusal(engine, &entry.instance_id, GetMode::Recheck) {
         stale_fail(engine, entry, approval, None, fail).await;
         return;
     }

@@ -17,13 +17,18 @@
 //! * A re-check that is not a parsed JSON 2xx (or a JSON 401) is [`RecheckResult::Inconclusive`]:
 //!   it changes no state. The §7.1 branches do not name this case (a rate-limited `/myself`);
 //!   it is decided here: the original call is `upstream_unavailable`, the token state unchanged.
+//!   A parsed 200 that names no user (no `name` or `key`) is a token failure (PD-61, §7.1 "any
+//!   other parsed JSON response").
+//! * §2.5 step 5 (T19): once the shutdown began no re-check starts (it concludes nothing); the
+//!   shutdown cancels the running ones ([`Gates::cancel_all`]) and lets them end
+//!   ([`Gates::idle`]) before `APP_STOP`, so every `token_recheck` start has its result first.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use atlas_duck_atlassian::{
-    FetchFailure, FetchOutcome, GetCall, IdentityObserved, StoredIdentity, UpstreamResponse,
-    username_matches,
+    FetchControl, FetchFailure, FetchOutcome, GetCall, IdentityObserved, StoredIdentity,
+    UpstreamResponse, username_matches,
 };
 use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
@@ -229,8 +234,10 @@ fn judge_jira(outcome: &FetchOutcome, stored: &StoredIdentity) -> RecheckResult 
     let Ok(body) = serde_json::from_slice::<Value>(&response.body) else {
         return RecheckResult::Inconclusive;
     };
+    // PD-61: a parsed 200 that names no user is "any other parsed JSON response" (§7.1), as for
+    // Confluence.
     let (Some(name), Some(key)) = (str_field(&body, "name"), str_field(&body, "key")) else {
-        return RecheckResult::Inconclusive;
+        return RecheckResult::TokenFailure { other_user: None };
     };
     if key != stored.atlassian_user_key {
         return RecheckResult::TokenFailure {
@@ -310,9 +317,65 @@ struct Gate {
 #[derive(Default)]
 pub(crate) struct Gates {
     map: Mutex<HashMap<String, Gate>>,
+    running: Mutex<Running>,
+}
+
+/// The re-checks running now, each with the control its GET runs under (§2.5 step 5).
+#[derive(Default)]
+struct Running {
+    next: u64,
+    controls: HashMap<u64, FetchControl>,
+}
+
+/// A running re-check's place in [`Gates::running`]; it leaves when dropped.
+struct Entered<'a> {
+    gates: &'a Gates,
+    n: u64,
+    ctl: FetchControl,
+}
+
+impl Drop for Entered<'_> {
+    fn drop(&mut self) {
+        self.gates.running().controls.remove(&self.n);
+    }
 }
 
 impl Gates {
+    fn running(&self) -> std::sync::MutexGuard<'_, Running> {
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A re-check starts unless the shutdown began. Read under the lock `cancel_all` takes: a
+    /// re-check either starts before the shutdown's `cancel_all` (and is cancelled by it) or
+    /// sees the shutdown and starts nothing.
+    fn enter(&self, engine: &Engine) -> Option<Entered<'_>> {
+        let mut running = self.running();
+        if engine.is_shutting_down() {
+            return None;
+        }
+        running.next += 1;
+        let (n, ctl) = (running.next, FetchControl::new());
+        running.controls.insert(n, ctl.clone());
+        Some(Entered {
+            gates: self,
+            n,
+            ctl,
+        })
+    }
+
+    /// §2.5: the shutdown began (no re-check starts any more): every running one is cancelled,
+    /// never waited for here.
+    pub(crate) fn cancel_all(&self) {
+        for ctl in self.running().controls.values() {
+            ctl.cancel();
+        }
+    }
+
+    /// No re-check is running (the shutdown waits for this before `APP_STOP`).
+    pub(crate) fn idle(&self) -> bool {
+        self.running().controls.is_empty()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Gate>> {
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -369,8 +432,15 @@ pub async fn recheck(engine: &Arc<Engine>, instance_id: &str, seen: u64) -> Rech
             .clone()
     };
     cell.get_or_init(|| async {
-        let result = run(engine, instance_id).await;
-        on_result(engine, instance_id, &result).await;
+        // Its records (the `SYSTEM_FETCH` pair, a state change) end before `APP_STOP`.
+        let result = match engine.identity_gates().enter(engine) {
+            Some(entered) => {
+                let result = run(engine, instance_id, &entered.ctl).await;
+                on_result(engine, instance_id, &result).await;
+                result
+            }
+            None => RecheckResult::Inconclusive,
+        };
         let mut gates = engine.identity_gates().lock();
         let gate = gates.entry(instance_id.to_owned()).or_default();
         gate.in_flight = None;
@@ -385,8 +455,9 @@ pub async fn recheck(engine: &Arc<Engine>, instance_id: &str, seen: u64) -> Rech
 }
 
 /// The re-check's own call, under `SYSTEM_FETCH {purpose: token_recheck}`: the start record
-/// commits before the request leaves, the result record carries every byte received.
-async fn run(engine: &Arc<Engine>, instance_id: &str) -> RecheckResult {
+/// commits before the request leaves, the result record carries every byte received (or the
+/// cancel by the shutdown, `ctl`).
+async fn run(engine: &Arc<Engine>, instance_id: &str, ctl: &FetchControl) -> RecheckResult {
     let Some(product) = engine.instances().by_id(instance_id).map(|i| i.product) else {
         return RecheckResult::Inconclusive;
     };
@@ -425,7 +496,7 @@ async fn run(engine: &Arc<Engine>, instance_id: &str) -> RecheckResult {
     }
     let result = match engine.covers().for_system_fetch(&fetch_id) {
         Ok(cover) => {
-            let outcome = http.client.get(&cover, &call).await;
+            let outcome = http.client.get_ctl(&cover, &call, ctl).await;
             let record = system_get_record(
                 purpose,
                 instance_id,
@@ -706,6 +777,19 @@ mod tests {
             judge(Product::Jira, &json401, &s),
             RecheckResult::TokenFailure { other_user: None }
         );
+        // PD-61: a parsed 200 without `name` or `key` names no user: a token failure.
+        for body in ["{}", r#"{"name":"jdoe"}"#, r#"{"key":"JIRAUSER1"}"#, "[]"] {
+            for outcome in [
+                FetchOutcome::Response(resp(200, body)),
+                failed(Obs::Missing, 200, body),
+            ] {
+                assert_eq!(
+                    judge(Product::Jira, &outcome, &s),
+                    RecheckResult::TokenFailure { other_user: None },
+                    "{outcome:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -715,7 +799,6 @@ mod tests {
             failed(Obs::Missing, 429, "{}"),
             failed(Obs::Missing, 503, "{}"),
             FetchOutcome::Response(resp(200, "not json")),
-            FetchOutcome::Response(resp(200, "{}")),
             FetchOutcome::Failed(FetchFailure::BudgetExpiredBeforeSend),
             FetchOutcome::Failed(FetchFailure::NeedsToken),
         ] {

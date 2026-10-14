@@ -143,6 +143,22 @@ pub(crate) async fn fills_ended(engine: &Arc<Engine>, bound: Duration) -> bool {
     }
 }
 
+/// §2.5 step 5 for the token re-checks (T19): the re-checks cancelled when the shutdown began
+/// ([`crate::identity::Gates::cancel_all`]) record their result and end; bounded and never
+/// blocking like [`fills_ended`]. `false` when one is still running then.
+pub(crate) async fn rechecks_ended(engine: &Arc<Engine>, bound: Duration) -> bool {
+    let deadline = Instant::now() + bound;
+    loop {
+        if engine.identity_gates().idle() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// §2.5 step 5: flush the head anchor, append `APP_STOP`, flush again so the anchor covers it.
 /// A failed flush is not an error (`health()` shows it); a failed append is returned.
 pub(crate) async fn stop(
