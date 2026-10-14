@@ -7,11 +7,20 @@
 .app-header nav { display: flex; gap: 0.5rem; padding: 0.5rem; }
 .banner { list-style: none; margin: 0; padding: 0 0.5rem; }
 .banner-caution { font-weight: 600; }
-.badge { display: inline-block; border: 1px solid currentColor; border-radius: 0.25rem; padding: 0 0.35rem; margin: 0 0.25rem; font-size: 0.8em; white-space: nowrap; }
+.badge { flex: none; display: inline-block; border: 1px solid currentColor; border-radius: 0.25rem; padding: 0 0.35rem; margin: 0 0.25rem; font-size: 0.8em; white-space: nowrap; }
 .badge-caution { font-weight: 600; }
-.badge-fixed { display: inline-block; min-width: 6.5em; }
+.badge-fixed { flex: none; display: inline-block; min-width: 6.5em; }
+.agent-text { display: inline-flex; align-items: center; min-width: 0; }
 .agent-text bdi { unicode-bidi: isolate; }
+/* Long agent text is ellipsized so the badges after it (unusual characters) are never pushed out. */
+.agent-text-value { display: block; min-width: 0; max-width: 24em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .windowed-row { box-sizing: border-box; overflow: hidden; border-bottom: 1px solid #8884; }
+/* Lines 1 and 2 are one line each: shrinkable text is ellipsized, labels and badges are flex: none.
+   The flags line wraps. A row is QUEUE_ROW_REM (7.5rem) high, so the rem lines and the row scale together. */
 .queue-line { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.5rem; height: 2rem; overflow: hidden; white-space: nowrap; }
+.queue-line > * { flex: none; }
+.queue-line > .agent-text, .queue-line > .target { flex: 0 1 auto; min-width: 0; }
+.queue-line > .target { overflow: hidden; text-overflow: ellipsis; }
+.queue-flags { flex-wrap: wrap; height: 3.5rem; row-gap: 0; align-content: center; }
 .queue-group { display: flex; align-items: center; gap: 0.5rem; height: 100%; font-weight: 600; }
 .recent-item { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }

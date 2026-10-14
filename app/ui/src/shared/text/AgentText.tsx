@@ -18,7 +18,7 @@ export function AgentText({ value, unusual = false }: AgentTextProps) {
       <span className="badge-fixed">
         <Badge label={UNVERIFIED} />
       </span>
-      <bdi>{`\u201C${value}\u201D`}</bdi>
+      <bdi className="agent-text-value">{`\u201C${value}\u201D`}</bdi>
       {unusual ? <Badge label={UNUSUAL_CHARACTERS} tone="caution" /> : null}
     </span>
   );

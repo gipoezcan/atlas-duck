@@ -27,21 +27,27 @@ function useReloaded<T>(
   const reload = useCallback(() => setNonce((n) => n + 1), []);
   useEffect(() => {
     let live = true;
+    // Only the newest read may write: an older read that resolves late is dropped.
+    let latest = 0;
     const refresh = () => {
+      const mine = ++latest;
       load().then(
         (v) => {
-          if (live) {
+          if (live && mine === latest) {
             setValue(v);
             setFailed(false);
           }
         },
         () => {
-          if (live) setFailed(true);
+          if (live && mine === latest) setFailed(true);
         },
       );
     };
-    refresh();
     const unlistens = events.map((name) => on(name, refresh));
+    // Read once the listeners are attached, so an event between a read and a listener is not lost.
+    void Promise.allSettled(unlistens).then(() => {
+      if (live) refresh();
+    });
     return () => {
       live = false;
       for (const u of unlistens) void u.then((off) => off()).catch(() => undefined);
@@ -81,9 +87,17 @@ export function App() {
       <main>
         <h1>{WINDOW_TITLES.approvals}</h1>
         {queue.failed ? <p role="alert">{QUEUE_TEXT.load_failed}</p> : null}
-        <Queue items={queue.value ?? []} />
+        {queue.value !== null ? (
+          <Queue items={queue.value} />
+        ) : queue.failed ? null : (
+          <p role="status">{QUEUE_TEXT.loading}</p>
+        )}
         {recent.failed ? <p role="alert">{RECENT_TEXT.load_failed}</p> : null}
-        <Recent items={recent.value ?? []} onAcknowledge={acknowledge} />
+        {recent.value !== null ? (
+          <Recent items={recent.value} onAcknowledge={acknowledge} />
+        ) : recent.failed ? null : (
+          <p role="status">{RECENT_TEXT.loading}</p>
+        )}
       </main>
     </>
   );

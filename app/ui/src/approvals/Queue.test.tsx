@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { on } from '../shared/ipc/events';
@@ -135,7 +136,7 @@ describe('Queue', () => {
         ]}
       />,
     );
-    const groups = screen.getAllByRole('checkbox', { name: 'select all from session' });
+    const groups = screen.getAllByRole('checkbox', { name: /^select all from session/ });
     expect(groups).toHaveLength(2);
     fireEvent.click(groups[0] as HTMLElement);
     expect(onSelectionChange).toHaveBeenLastCalledWith(['req_a1a1a1a1a1a1a1a1a1a1', 'req_a2a2a2a2a2a2a2a2a2a2']);
@@ -143,6 +144,53 @@ describe('Queue', () => {
     expect((screen.getByRole('checkbox', { name: 'select jira.issue.get B-1' }) as HTMLInputElement).checked).toBe(false);
     fireEvent.click(groups[0] as HTMLElement);
     expect(onSelectionChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it('null_agent_name_and_reason_render_as_fixed_text', () => {
+    render(<Queue items={[item({ agent_name: null, reason_excerpt: null, possible_duplicate_of: null })]} />);
+    expect(screen.getByText('“(no agent name)”').tagName).toBe('BDI');
+    expect(screen.getByLabelText('no reason given')).toBeTruthy();
+  });
+
+  it('the_unusual_flag_follows_the_agent_name_and_the_reason', () => {
+    render(
+      <Queue
+        items={[item({ agent_name: 'n'.repeat(500), unusual: true, possible_duplicate_of: null })]}
+      />,
+    );
+    // One flag per agent string of the row (name, reason) and one for the session group.
+    expect(screen.getAllByLabelText('unusual characters')).toHaveLength(3);
+  });
+
+  it('the_group_checkbox_name_includes_its_session', () => {
+    render(
+      <Queue
+        items={[
+          item({ session_id: SESSION_A, session_label: 'agent-a', possible_duplicate_of: null }),
+          item({ request_id: 'req_otherotherotherother', session_id: SESSION_B, session_label: 'agent-b', possible_duplicate_of: null }),
+        ]}
+      />,
+    );
+    const boxes = screen.getAllByRole('checkbox', { name: /^select all from session/ });
+    const names = boxes.map((b) => b.getAttribute('aria-labelledby'));
+    expect(new Set(names).size).toBe(2);
+    expect(screen.getByRole('checkbox', { name: /select all from session.*agent-a/ })).toBeTruthy();
+    expect(screen.getByRole('checkbox', { name: /select all from session.*agent-b/ })).toBeTruthy();
+  });
+
+  it('an_inline_selection_callback_that_sets_parent_state_does_not_loop', () => {
+    function Parent() {
+      const [ids, setIds] = useState<string[]>([]);
+      return (
+        <>
+          <output>{ids.length}</output>
+          <Queue items={[item({ possible_duplicate_of: null })]} onSelectionChange={(next) => setIds(next)} />
+        </>
+      );
+    }
+    render(<Parent />);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'select jira.issue.get PROJ-1' }));
+    expect(screen.getByRole('status').textContent).toBe('1');
   });
 
   it('empty_queue_says_so', () => {
@@ -197,5 +245,56 @@ describe('Approvals window', () => {
     vi.mocked(queueList).mockRejectedValue({ kind: 'not_ready' });
     render(<App />);
     expect((await screen.findAllByRole('alert'))[0]?.textContent).toBe('Could not load the queue');
+    // A failure is not an empty queue.
+    expect(screen.queryByText('No pending requests')).toBeNull();
+  });
+
+  it('loading_is_not_the_empty_state', async () => {
+    vi.mocked(queueList).mockReturnValue(new Promise(() => undefined));
+    vi.mocked(recentList).mockReturnValue(new Promise(() => undefined));
+    render(<App />);
+    expect(await screen.findByText('Loading the queue')).toBeTruthy();
+    expect(screen.queryByText('No pending requests')).toBeNull();
+    expect(screen.queryByText('Nothing decided in the last 24 hours')).toBeNull();
+  });
+
+  it('a_null_agent_name_does_not_hide_the_queue', async () => {
+    vi.mocked(queueList).mockResolvedValue(queueFixture);
+    render(<App />);
+    await screen.findByRole('checkbox', { name: 'select jira.issue.create PROJ' });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('an_older_read_that_resolves_last_is_ignored', async () => {
+    render(<App />);
+    await screen.findByRole('checkbox', { name: 'select jira.issue.get PROJ-1' });
+    let resolveOld: (v: QueueItem[]) => void = () => undefined;
+    vi.mocked(queueList).mockReturnValueOnce(new Promise((r) => (resolveOld = r)));
+    vi.mocked(queueList).mockResolvedValueOnce([item({ target_display: 'NEW-1', possible_duplicate_of: null })]);
+    await act(async () => {
+      for (const h of handlers.get('queue_changed') ?? []) h({});
+      for (const h of handlers.get('queue_changed') ?? []) h({});
+    });
+    await screen.findByRole('checkbox', { name: 'select jira.issue.get NEW-1' });
+    await act(async () => {
+      resolveOld([item({ target_display: 'OLD-1', possible_duplicate_of: null })]);
+    });
+    expect(screen.queryByRole('checkbox', { name: 'select jira.issue.get OLD-1' })).toBeNull();
+    expect(screen.getByRole('checkbox', { name: 'select jira.issue.get NEW-1' })).toBeTruthy();
+  });
+
+  it('the_first_read_happens_after_the_listeners_are_attached', async () => {
+    const order: string[] = [];
+    vi.mocked(on).mockImplementation((name) => {
+      order.push(`on:${name}`);
+      return Promise.resolve(() => undefined);
+    });
+    vi.mocked(queueList).mockImplementation(() => {
+      order.push('queue_list');
+      return Promise.resolve([]);
+    });
+    render(<App />);
+    await waitFor(() => expect(order).toContain('queue_list'));
+    expect(order.indexOf('on:queue_changed')).toBeLessThan(order.indexOf('queue_list'));
   });
 });

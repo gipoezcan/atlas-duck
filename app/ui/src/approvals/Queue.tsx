@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { Windowed } from '../shared/list/Windowed';
 import type { QueueItem } from '../shared/ipc/types';
@@ -6,7 +6,14 @@ import { CLASS_LABELS, QUEUE_TEXT } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { Badge } from '../shared/text/Badge';
 
-export const QUEUE_ROW_HEIGHT = 96;
+/** A row is two one-line rows (2 rem each) and a flags line of up to two lines (3.5 rem), see app.css. */
+export const QUEUE_ROW_REM = 7.5;
+
+/** The row height in px at the current root font size, so OS font scaling grows rows with their lines. */
+function rowHeightPx(): number {
+  const root = parseFloat(getComputedStyle(document.documentElement).fontSize);
+  return QUEUE_ROW_REM * (Number.isFinite(root) && root > 0 ? root : 16);
+}
 
 type Row =
   | { kind: 'group'; sessionId: string; label: string; unusual: boolean; ids: string[] }
@@ -35,6 +42,8 @@ export function buildRows(items: readonly QueueItem[]): Row[] {
         kind: 'group' as const,
         sessionId: head.session_id,
         label: head.session_label,
+        // `unusual` is about an agent's name or reason, not the label: a group may be flagged for
+        // another member's text. That over-flags, which is harmless.
         unusual: members.some((i) => i.unusual),
         ids: members.map((i) => i.request_id),
       },
@@ -68,9 +77,16 @@ export function Queue({ items, onSelectionChange }: QueueProps) {
     });
   }, [byId]);
 
+  // The callback sits in a ref: an inline callback that sets parent state must not re-fire the
+  // notification below on every render.
+  const notify = useRef(onSelectionChange);
   useEffect(() => {
-    onSelectionChange?.([...selected]);
-  }, [selected, onSelectionChange]);
+    notify.current = onSelectionChange;
+  });
+  useEffect(() => {
+    notify.current?.([...selected]);
+  }, [selected]);
+  const rowHeight = useMemo(rowHeightPx, []);
 
   const toggle = (ids: readonly string[], on: boolean) =>
     setSelected((prev) => {
@@ -90,7 +106,8 @@ export function Queue({ items, onSelectionChange }: QueueProps) {
     <Windowed
       label={QUEUE_TEXT.heading}
       rows={rows}
-      rowHeight={QUEUE_ROW_HEIGHT}
+      rowHeight={rowHeight}
+      rowKey={(row) => (row.kind === 'group' ? `group-${row.sessionId}` : row.item.request_id)}
       render={(row) =>
         row.kind === 'group' ? (
           <GroupRow
@@ -121,16 +138,16 @@ function GroupRow({
   onToggle: (on: boolean) => void;
 }) {
   const labelId = `session-${row.sessionId}`;
+  const selectId = `select-${labelId}`;
   return (
     <div className="queue-group">
       <input
         type="checkbox"
-        aria-label={QUEUE_TEXT.select_session}
-        aria-describedby={labelId}
+        aria-labelledby={`${selectId} ${labelId}`}
         checked={checked}
         onChange={(e) => onToggle(e.currentTarget.checked)}
       />
-      <span>{QUEUE_TEXT.select_session}</span>{' '}
+      <span id={selectId}>{QUEUE_TEXT.select_session}</span>{' '}
       <span id={labelId}>
         <AgentText value={row.label} unusual={row.unusual} />
       </span>
@@ -158,21 +175,21 @@ function ItemRow({
           checked={checked}
           onChange={(e) => onToggle(e.currentTarget.checked)}
         />
-        <AgentText value={item.agent_name} unusual={item.unusual} />
+        <AgentText value={item.agent_name ?? QUEUE_TEXT.no_agent_name} unusual={item.unusual} />
         <span className="op-id">{item.op_id}</span>
         <span className="alias">{item.instance_alias}</span>
         <span className="target">{item.target_display}</span>
         <span className="class">{CLASS_LABELS[item.class] ?? item.class}</span>
       </div>
       <div className="queue-line">
-        {item.reason_excerpt === '' ? (
+        {item.reason_excerpt === null || item.reason_excerpt === '' ? (
           <Badge label={QUEUE_TEXT.no_reason} />
         ) : (
           <AgentText value={item.reason_excerpt} unusual={item.unusual} />
         )}
         <span className="age">{formatAge(item.age_s)}</span>
       </div>
-      <div className="queue-line">
+      <div className="queue-line queue-flags">
         {item.stale ? <Badge label={QUEUE_TEXT.stale} tone="caution" /> : null}
         {item.caution_count > 0 ? (
           <Badge label={QUEUE_TEXT.caution} count={item.caution_count} tone="caution" />

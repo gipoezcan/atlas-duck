@@ -68,4 +68,26 @@ describe('fixtures validate against their TS types', () => {
     expect(isRedactionReport({ ...redactionReport[0], blocked: [{ reason: 'x' }] })).toBe(false);
     expect(isDenyCount({ denied: '3' })).toBe(false);
   });
+
+  it('queue_item: the Option<String> fields accept null and refuse a wrong type', () => {
+    const nulls = queueItem.find((i) => i.agent_name === null);
+    expect(nulls).toBeDefined();
+    expect(isQueueItem(nulls)).toBe(true);
+    for (const key of ['agent_name', 'reason_excerpt', 'possible_duplicate_of', 'similar_to']) {
+      expect(isQueueItem({ ...queueItem[0], [key]: null })).toBe(true);
+      expect(isQueueItem({ ...queueItem[0], [key]: 5 })).toBe(false);
+      expect(isQueueItem({ ...queueItem[0], [key]: undefined })).toBe(false);
+    }
+    // A non-Option field still refuses null.
+    expect(isQueueItem({ ...queueItem[0], op_id: null })).toBe(false);
+  });
+
+  it('every Option field of the other DTOs accepts null and refuses a wrong type', () => {
+    expect(isRecentItem({ ...recentItem[0], error_text: null })).toBe(true);
+    expect(isRecentItem({ ...recentItem[0], error_text: 1 })).toBe(false);
+    const [first] = preview;
+    expect(isPreview({ ...first, deny_prefill: null })).toBe(true);
+    expect(isPreview({ ...first, deny_prefill: 1 })).toBe(false);
+    expect(isPreview({ ...first, header: { ...first?.header, release_blocked: null } })).toBe(true);
+  });
 });

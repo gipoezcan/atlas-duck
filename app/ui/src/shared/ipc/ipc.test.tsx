@@ -22,6 +22,6 @@ describe('invoke.ts can be mocked in a component test', () => {
     const fixture: QueueItem[] = queueItems;
     vi.mocked(queueList).mockResolvedValue(fixture);
     render(<Count />);
-    await waitFor(() => expect(screen.getByText('1 items')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('2 items')).toBeTruthy());
   });
 });

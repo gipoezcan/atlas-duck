@@ -22,5 +22,29 @@
     "stale": false,
     "target_display": "PROJ-1",
     "unusual": false
+  },
+  {
+    "age_s": 3,
+    "agent_name": null,
+    "agent_unverified": true,
+    "approvable": true,
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 1
+    },
+    "caution_count": 0,
+    "class": "write",
+    "instance_alias": "work",
+    "op_id": "jira.issue.create",
+    "opened": false,
+    "possible_duplicate_of": null,
+    "reason_excerpt": null,
+    "request_id": "req_nullnullnullnullnull",
+    "session_id": "2fc6d5518a52f83299c336bd39bd6395aa991ff91819276f1084604eed831c88",
+    "session_label": "atlas-duck",
+    "similar_to": null,
+    "stale": false,
+    "target_display": "PROJ",
+    "unusual": false
   }
 ]

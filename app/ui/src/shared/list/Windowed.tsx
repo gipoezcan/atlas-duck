@@ -5,6 +5,8 @@ interface WindowedProps<T> {
   /** Every row has this height in px; the slice is computed from it. */
   rowHeight: number;
   render: (row: T, index: number) => ReactNode;
+  /** Stable identity of a row, so focus follows the row when the list changes. Defaults to the index. */
+  rowKey?: (row: T, index: number) => string | number;
   /** Viewport height in px. */
   height?: number;
   /** Rows rendered beyond each edge of the viewport. */
@@ -21,6 +23,7 @@ export function Windowed<T>({
   rows,
   rowHeight,
   render,
+  rowKey,
   height = 480,
   overscan = 5,
   label,
@@ -65,7 +68,7 @@ export function Windowed<T>({
       <div style={{ height: rows.length * rowHeight, position: 'relative' }}>
         {slice.map((row, i) => (
           <div
-            key={first + i}
+            key={rowKey ? rowKey(row, first + i) : first + i}
             role="listitem"
             className="windowed-row"
             style={{

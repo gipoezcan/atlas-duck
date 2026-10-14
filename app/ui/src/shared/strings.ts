@@ -31,6 +31,8 @@ export const QUEUE_TEXT = {
   session: 'Session',
   of_session: 'session',
   load_failed: 'Could not load the queue',
+  loading: 'Loading the queue',
+  no_agent_name: '(no agent name)',
 } as const;
 
 /** spec 5.6 (verbatim class names): the registry class of a request. */
@@ -61,10 +63,20 @@ export const RECENT_TEXT = {
   empty: 'Nothing decided in the last 24 hours',
   check_target: 'check target',
   load_failed: 'Could not load the recent list',
+  loading: 'Loading the recent list',
 } as const;
 
-/** plan text (Task 13): core status words shown in the Recently decided list. */
+/** plan text (Task 13): every core `Status` (crates/ipc envelope.rs) as shown in the Recently decided list. */
 export const STATUS_LABELS: Readonly<Record<string, string>> = {
+  pending: 'pending',
+  executing: 'executing',
+  succeeded: 'succeeded',
+  released: 'released',
+  denied: 'denied',
+  expired: 'expired',
+  cancelled: 'cancelled',
+  failed: 'failed',
+  abandoned: 'abandoned',
   outcome_unknown: 'outcome unknown',
   awaiting_approval: 'returned for re-review',
 };

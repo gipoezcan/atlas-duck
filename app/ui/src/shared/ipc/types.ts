@@ -11,7 +11,8 @@ export interface CandidateRev {
 export interface QueueItem {
   request_id: string;
   age_s: number;
-  agent_name: string;
+  /** `null` when the agent sent no name. */
+  agent_name: string | null;
   agent_unverified: boolean;
   approvable: boolean;
   candidate_rev: CandidateRev;
@@ -21,7 +22,8 @@ export interface QueueItem {
   op_id: string;
   opened: boolean;
   possible_duplicate_of: string | null;
-  reason_excerpt: string;
+  /** `null` when the agent gave no reason. */
+  reason_excerpt: string | null;
   /** Hex SHA-256 of the session key (PD-86); the key itself never reaches the UI. */
   session_id: string;
   /** "<agent> · <cwd>": agent-supplied text, display-escaped. */

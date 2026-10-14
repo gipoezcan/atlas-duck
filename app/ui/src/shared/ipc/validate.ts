@@ -52,7 +52,7 @@ export const isQueueItem = (v: unknown): v is QueueItem =>
   fields(v, {
     request_id: isStr,
     age_s: isNum,
-    agent_name: isStr,
+    agent_name: strOrNull,
     agent_unverified: isBool,
     approvable: isBool,
     candidate_rev: isCandidateRev,
@@ -62,7 +62,7 @@ export const isQueueItem = (v: unknown): v is QueueItem =>
     op_id: isStr,
     opened: isBool,
     possible_duplicate_of: strOrNull,
-    reason_excerpt: isStr,
+    reason_excerpt: strOrNull,
     session_id: isStr,
     session_label: isStr,
     similar_to: strOrNull,
