@@ -181,6 +181,8 @@ static APPLIED: OnceLock<Hardening> = OnceLock::new();
 ///
 /// Precondition: called first in the GUI branch of `main`, while this is the only thread.
 pub fn apply_early() -> Hardening {
+    // Only the Windows branches push; elsewhere the vector stays empty.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut mitigations = Vec::new();
     #[cfg(windows)]
     if !set_default_dll_directories() {
