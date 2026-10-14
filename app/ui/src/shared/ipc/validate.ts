@@ -4,6 +4,8 @@ import type {
   CommandError,
   CoreError,
   DecisionOutcome,
+  DenyOffer,
+  DenyOfferKind,
   Preview,
   QueueItem,
   StatusLine,
@@ -55,6 +57,8 @@ export const isQueueItem = (v: unknown): v is QueueItem =>
     opened: isBool,
     possible_duplicate_of: strOrNull,
     reason_excerpt: isStr,
+    session_id: isStr,
+    session_label: isStr,
     similar_to: strOrNull,
     stale: isBool,
     target_display: isStr,
@@ -67,13 +71,31 @@ export const isDecisionOutcome = (v: unknown): v is DecisionOutcome =>
 export const isBatchOutcome = (v: unknown): v is BatchOutcome =>
   fields(v, { batch_id: isStr, items: arrayOf(isDecisionOutcome) });
 
+const DENY_OFFER_KINDS: readonly unknown[] = [
+  'upstream_http',
+  'outcome_hint',
+  'resolution_failed',
+  'missing_fields',
+] satisfies DenyOfferKind[];
+
+export const isDenyOffer = (v: unknown): v is DenyOffer =>
+  fields(v, { kind: (k) => DENY_OFFER_KINDS.includes(k), has_optional_detail: isBool });
+
 export const isPreview = (v: unknown): v is Preview =>
   fields(v, {
     approvable: isBool,
     candidate_rev: isCandidateRev,
     body: (b) => fields(b, { kind: isStr }),
-    header: (h) => fields(h, { class: isStr, op_id: isStr, instance_alias: isStr }),
+    header: (h) =>
+      fields(h, {
+        class: isStr,
+        op_id: isStr,
+        instance_alias: isStr,
+        release_blocked: strOrNull,
+      }),
     warnings: arrayOf(isStatusLine),
+    deny_offers: arrayOf(isDenyOffer),
+    deny_prefill: strOrNull,
   });
 
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });

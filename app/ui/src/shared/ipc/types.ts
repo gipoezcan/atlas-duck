@@ -22,6 +22,10 @@ export interface QueueItem {
   opened: boolean;
   possible_duplicate_of: string | null;
   reason_excerpt: string;
+  /** Hex SHA-256 of the session key (PD-86); the key itself never reaches the UI. */
+  session_id: string;
+  /** "<agent> · <cwd>": agent-supplied text, display-escaped. */
+  session_label: string;
   similar_to: string | null;
   stale: boolean;
   target_display: string;
@@ -49,12 +53,34 @@ export interface PreviewBody {
   [field: string]: unknown;
 }
 
+export type DenyOfferKind =
+  | 'upstream_http'
+  | 'outcome_hint'
+  | 'resolution_failed'
+  | 'missing_fields';
+
+/** A deny hint the core accepts for this request (PD-70). */
+export interface DenyOffer {
+  kind: DenyOfferKind;
+  has_optional_detail: boolean;
+}
+
 export interface Preview {
   approvable: boolean;
   candidate_rev: CandidateRev;
   body: PreviewBody;
-  header: { class: string; op_id: string; instance_alias: string; [field: string]: unknown };
+  header: {
+    class: string;
+    op_id: string;
+    instance_alias: string;
+    /** Set when the candidate could not be rebuilt (M5 M-11): the banner text. */
+    release_blocked: string | null;
+    [field: string]: unknown;
+  };
   warnings: StatusLine[];
+  deny_offers: DenyOffer[];
+  /** Pre-filled deny reason (a conflict hold), or null. */
+  deny_prefill: string | null;
   [field: string]: unknown;
 }
 

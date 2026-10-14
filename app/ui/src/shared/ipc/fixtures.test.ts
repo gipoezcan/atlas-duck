@@ -47,5 +47,10 @@ describe('fixtures validate against their TS types', () => {
   it('rejects a shape change', () => {
     expect(isQueueItem({ ...queueItem[0], opened: 'no' })).toBe(false);
     expect(isQueueItem({ ...queueItem[0], request_id: undefined })).toBe(false);
+    expect(isQueueItem({ ...queueItem[0], session_id: undefined })).toBe(false);
+    const [first] = preview;
+    expect(isPreview(first)).toBe(true);
+    expect(isPreview({ ...first, deny_offers: [{ kind: 'other' }] })).toBe(false);
+    expect(isPreview({ ...first, header: { ...first?.header, release_blocked: 1 } })).toBe(false);
   });
 });
