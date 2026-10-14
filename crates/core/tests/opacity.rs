@@ -338,6 +338,33 @@ async fn i07_write_streams_identical_enrichment_conflict_vs_match() -> TestResul
             "{s:?}"
         );
     }
+    // Positive control (T21 fix M7): the human side does differ, and the mock served one
+    // enrichment read per edit (200, 200, 404 by its priorities), so the identical streams above
+    // hide a real difference instead of comparing three equal fixtures.
+    let approvable = ids
+        .iter()
+        .map(|id| h.approver().item(id).map(|i| i.approvable))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("a write left the queue")?;
+    assert_eq!(approvable, [true, false, false]);
+    let mut previews = Vec::new();
+    for id in &ids {
+        previews.push(format!(
+            "{:?}",
+            h.approver().open(id).map_err(de)?.preview.body
+        ));
+    }
+    assert!(
+        previews[0] != previews[1] && previews[1] != previews[2] && previews[0] != previews[2],
+        "{previews:?}"
+    );
+    let gets = mock
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.url.path().ends_with("/issue/ABC-1"))
+        .count();
+    assert_eq!(gets, 3);
     for id in &ids {
         h.approver().deny(id, "no").map_err(de)?;
         assert_eq!(h.await_(id, 10_000).await.status, Status::Denied);

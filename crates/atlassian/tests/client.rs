@@ -507,12 +507,83 @@ async fn read_429_then_cancel_is_the_429_response() -> TestResult {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Generous: the 429 body is read and the call is in the retry wait long before this ends.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     ctl.cancel();
+    // T21 fix M1: the cancel path snapshots the control right here (`cancel.rs`); the bytes the
+    // app read stay in it for `READ_FETCHED.partial`, the answer itself being refused by the gate.
+    assert_eq!(ctl.take_captured().partial, br#"{"message":"slow down"}"#);
     let r = response(read.await?)?;
     assert_eq!(r.status, 429);
     assert_eq!(r.body, br#"{"message":"slow down"}"#);
     assert_eq!(dc.received().await.len(), 1);
+    Ok(())
+}
+
+fn raw_429_head(retry_after: &str, content_length: usize) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: {retry_after}\r\nContent-Length: {content_length}\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// T21 fix M2: a `429` whose body was cut short (here by a cancel while the body stalls) is not the
+/// complete `429` response: it is the in-flight cancel with the bytes received.
+#[tokio::test]
+async fn read_429_with_a_truncated_body_is_not_a_complete_response() -> TestResult {
+    let mut bytes = raw_429_head("30", 100);
+    bytes.extend_from_slice(b"0123456789");
+    let server = RawHttpServer::serve(vec![
+        RawStep::Send(bytes),
+        RawStep::Sleep(20_000),
+        RawStep::Close,
+    ])
+    .await?;
+    let t = raw_client(&server)?;
+    let ctl = FetchControl::new();
+    let task = {
+        let (client, cover, ctl) = (t.client.clone(), test_cover()?, ctl.clone());
+        tokio::spawn(async move { client.get_ctl(&cover, &call("/rest/api/space"), &ctl).await })
+    };
+    wait_for(|| ctl.take_captured().partial.len() == 10).await?;
+    ctl.cancel();
+    match failure(task.await?)? {
+        FetchFailure::CancelledInFlight { bytes_received } => {
+            assert_eq!(bytes_received, b"0123456789");
+        }
+        other => return Err(format!("{other:?}").into()),
+    }
+    Ok(())
+}
+
+/// T21 fix M6: a stalled `429` body is read for at most a few seconds, however long the call's own
+/// deadline is, so it neither holds the limiter permit nor delays a call without an overall budget
+/// by the whole per-call deadline; the retry then runs.
+#[tokio::test]
+async fn stalled_429_body_is_bounded_and_the_retry_runs() -> TestResult {
+    let mut stalled = raw_429_head("0", 100);
+    stalled.extend_from_slice(b"0123456789");
+    let server = RawHttpServer::serve_sequence(vec![
+        vec![
+            RawStep::Send(stalled),
+            RawStep::Sleep(30_000),
+            RawStep::Close,
+        ],
+        vec![RawStep::Send(raw_ok()), RawStep::Close],
+    ])
+    .await?;
+    let mut cfg = test_config(Product::Confluence, &server.base_url())?;
+    cfg.timeouts.per_call = Duration::from_secs(20);
+    let t = test_client(cfg)?;
+    let start = std::time::Instant::now();
+    let r = response(t.client.get(&test_cover()?, &call("/rest/api/space")).await)?;
+    assert_eq!(r.status, 200);
+    assert_eq!(server.connections(), 2);
+    assert!(
+        start.elapsed() < Duration::from_secs(15),
+        "the 429 body read was not bounded: {:?}",
+        start.elapsed()
+    );
     Ok(())
 }
 

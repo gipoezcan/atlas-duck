@@ -30,6 +30,13 @@ use crate::url::build_url;
 pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
 /// §7.2: at most 3 retries of a `429`.
 const MAX_429_RETRIES: u32 = 3;
+/// How long the body of a `429` that is about to be retried is read (in addition to the attempt
+/// deadline): it is an error body, and the permit is held until it is read.
+const BODY_429_READ: Duration = Duration::from_secs(5);
+
+/// The last `429` of a call: its answer, the body read, how the read ended and the class of the
+/// attempt's deadline.
+type Last429 = (Answer, Vec<u8>, BodyRead, PostSendKind);
 
 /// What one call writes, with the proof that covers it (§5.1 inv. 1 and 3). Each kind carries its
 /// own proof type, so no target exists without it: nothing in this crate can send an approved
@@ -116,19 +123,25 @@ impl Answer {
 
 /// What `exchange` ends with.
 pub(crate) enum Exchanged<'c> {
-    /// The response that is not retried, its body unread.
+    /// The response that is not retried (a `429` that is not retried included), its body unread.
     Response(Exchange<'c>),
     /// A `429` whose retry never started (the budget ran out or the call was cancelled in the wait
     /// or while the next permit was awaited; T10 minor 3): the last answer the instance gave, with
-    /// the part of its body that was read. Nothing of a later attempt was sent, so the `429` is
-    /// the answer, not an unknown outcome.
+    /// the part of its body that was read, which may be partial (`read`: cut by a deadline, the
+    /// cap, a read error or the cancel). Nothing of a later attempt was sent, so the `429` is the
+    /// answer, not an unknown outcome.
     Stopped429 {
         answer: Answer,
+        /// The part of the body that was read; `read` says whether it is all of it.
         body: Vec<u8>,
+        read: BodyRead,
+        /// The class of a deadline that cut the body short.
+        deadline_kind: PostSendKind,
         cred: StoredCredential,
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum BodyRead {
     Complete,
     Cancelled,
@@ -213,15 +226,22 @@ impl InstanceClient {
     pub(crate) async fn send_one(&self, req: OneRequest<'_>, ctl: &FetchControl) -> FetchOutcome {
         let ex = match self.exchange(&req, ctl).await {
             Ok(Exchanged::Response(ex)) => ex,
-            Ok(Exchanged::Stopped429 { answer, body, cred }) => {
-                // The 429 is the response, classified like any other that was not retried.
+            Ok(Exchanged::Stopped429 {
+                answer,
+                body,
+                read,
+                deadline_kind,
+                cred,
+            }) => {
+                // The 429 is the response, classified like any other that was not retried, with
+                // the state its body was really left in.
                 ctl.clear_partial();
                 ctl.append_partial(&body);
                 return self.classify(
                     &answer,
                     None,
-                    BodyRead::Complete,
-                    (req.cap_kind, req.cap_kind),
+                    read,
+                    (req.cap_kind, deadline_kind),
                     &cred,
                     ctl,
                 );
@@ -292,7 +312,8 @@ impl InstanceClient {
     }
 
     /// Steps 1 to 5: guards, limiter, send, `Date`, `429` retries. Every `Err` is a complete
-    /// failure; `Ok` holds the response that is not retried, its body unread. The target carries
+    /// failure; `Ok` holds the response that is not retried (its body unread) or the `429` whose
+    /// retry could not start (its body read, possibly partially). The target carries
     /// the proof of its committed covering record (§5.1 inv. 1 and 3).
     pub(crate) async fn exchange(
         &self,
@@ -323,10 +344,16 @@ impl InstanceClient {
         let mut retries = 0;
         // The `429` of the last attempt while no later attempt was sent: if the retry cannot
         // start, it is the answer (T10 minor 3).
-        let mut last_429: Option<(Answer, Vec<u8>)> = None;
+        let mut last_429: Option<Last429> = None;
         // How a stop before the next attempt ends the call.
-        let stopped = |last: Option<(Answer, Vec<u8>)>, cred, failure| match last {
-            Some((answer, body)) => Ok(Exchanged::Stopped429 { answer, body, cred }),
+        let stopped = |last: Option<Last429>, cred, failure| match last {
+            Some((answer, body, read, deadline_kind)) => Ok(Exchanged::Stopped429 {
+                answer,
+                body,
+                read,
+                deadline_kind,
+                cred,
+            }),
             None => Err(failure),
         };
         loop {
@@ -407,9 +434,15 @@ impl InstanceClient {
                     // The answer is kept while the retry waits: its body is read now, the
                     // permit is not held through the wait.
                     let answer = Answer::of(&resp);
-                    let read = read_body(resp, ctl, deadline, req.max_response_bytes).await;
+                    // An error body is read for a few seconds at most, so a stalled one holds
+                    // the permit and a call without an overall budget for that long, not for
+                    // the whole attempt deadline.
+                    let body_end = deadline.min(Instant::now() + BODY_429_READ);
+                    let read = read_body(resp, ctl, body_end, req.max_response_bytes).await;
                     drop(permit);
-                    last_429 = Some((answer, ctl.take_partial()));
+                    // A copy: the bytes stay in the control for a cancel record (§5.2 step 3);
+                    // the next attempt clears them.
+                    last_429 = Some((answer, ctl.snapshot_partial(), read, deadline_kind));
                     retries += 1;
                     if matches!(read, BodyRead::Cancelled) {
                         return stopped(last_429, cred, cancelled(ctl, sent));

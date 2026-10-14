@@ -1351,13 +1351,14 @@ async fn write_429_then_budget_expiry_is_failed4xx() -> TestResult {
         .respond_with(
             dc.response(200)
                 .set_body_raw("{}", "application/json")
-                .set_delay(Duration::from_secs(5)),
+                .set_delay(Duration::from_secs(10)),
         )
         .mount(dc.server())
         .await;
     let mut cfg = dc.client_config();
-    cfg.timeouts.write = Duration::from_millis(1600);
+    cfg.timeouts.write = Duration::from_secs(3);
     let t = test_client(cfg)?;
+    let start = std::time::Instant::now();
     let write = {
         let client = t.client.clone();
         let (w, cover) = (json_op(page_update(&dc)?), test_write_cover()?);
@@ -1380,6 +1381,12 @@ async fn write_429_then_budget_expiry_is_failed4xx() -> TestResult {
     }
     let out = write.await?;
     slow_down(out)?;
+    // The Stopped429 path waited out the budget (an ordinary non-retried 429 returns at once).
+    assert!(
+        start.elapsed() >= Duration::from_millis(2500),
+        "{:?}",
+        start.elapsed()
+    );
     // One PUT only: the retry never started.
     let puts = dc
         .received()
@@ -1407,9 +1414,50 @@ async fn write_429_then_cancel_is_failed4xx() -> TestResult {
         tokio::spawn(async move { client.send_approved_ctl(cover, &w, &ctl).await })
     };
     wait_received(&dc, 1).await?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     ctl.cancel();
     slow_down(write.await?)?;
     assert_eq!(dc.received().await.len(), 1);
+    Ok(())
+}
+
+/// T21 fix M2: a `429` whose body was cut short by a cancel is no complete `429` answer: the write
+/// is `OutcomeUnknown { Cancelled }` like any answered write cancelled during its body, with the
+/// bytes received kept in the control.
+#[tokio::test]
+async fn write_429_with_a_truncated_body_is_not_a_complete_failed4xx() -> TestResult {
+    let mut bytes = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 30\r\nContent-Length: 100\r\n\r\n".to_vec();
+    bytes.extend_from_slice(b"0123456789");
+    let server = RawHttpServer::serve(vec![
+        RawStep::Send(bytes),
+        RawStep::Sleep(20_000),
+        RawStep::Close,
+    ])
+    .await?;
+    let t = test_client(test_config(Product::Confluence, &server.base_url())?)?;
+    let url = format!("{}/rest/api/content/1", server.base_url());
+    let w = json_op(spec("PUT", &url, Some("application/json"), b"{}"));
+    let ctl = FetchControl::new();
+    let task = {
+        let (client, ctl) = (t.client.clone(), ctl.clone());
+        let cover = test_write_cover()?;
+        tokio::spawn(async move { client.send_approved_ctl(cover, &w, &ctl).await })
+    };
+    for _ in 0..500 {
+        if ctl.take_captured().partial.len() == 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    ctl.cancel();
+    assert_eq!(
+        task.await?,
+        WriteOutcome::OutcomeUnknown {
+            reason: UnknownReason::Cancelled,
+            request_index: 0,
+            status: Some(429),
+        }
+    );
+    assert_eq!(ctl.take_captured().partial, b"0123456789");
     Ok(())
 }

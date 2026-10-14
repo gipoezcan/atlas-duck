@@ -1022,14 +1022,202 @@ async fn get2_cancel_before_send_not_recorded_in_flight() -> TestResult {
     wait_connections(&server, 5).await?;
     // GET 2 now waits for a permit: nothing of it reaches the server.
     pause.release.notify_one();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(server.connections(), 5);
     assert_cancelled(&h.handler().cancel(&id).await);
     pause.release.notify_one();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
     let purposes: Vec<_> = fetch.iter().map(|f| f["purpose"].clone()).collect();
     assert_eq!(purposes, [json!("resolve")], "{fetch:?}");
+    fetch.iter().for_each(not_in_flight);
+    for r in readers {
+        assert_cancelled(&h.handler().cancel(&r).await);
+    }
+    Ok(())
+}
+
+/// Four reads of `ABC-2` to `ABC-5` that answer after 30 s as `user`: they hold all four limiter
+/// permits of the instance until cancelled.
+async fn hold_permits(mock: &MockDc, user: &str) {
+    for n in 2..=5 {
+        Mock::given(method("GET"))
+            .and(path(mock.path(&format!("/rest/api/2/issue/ABC-{n}"))))
+            .respond_with(
+                mock.response(200)
+                    .insert_header("X-AUSERNAME", user)
+                    .set_body_raw(fixtures::JIRA_ISSUE, "application/json")
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(mock.server())
+            .await;
+    }
+}
+
+/// Submits the four reads of [`hold_permits`] and waits until the mock has them (they own the
+/// permits then).
+async fn start_holders(h: &Harness) -> Result<Vec<String>, TestError> {
+    let mut readers = Vec::new();
+    for n in 2..=5 {
+        readers.push(submit_pending(h, ISSUE, json!({ "key": format!("ABC-{n}") })).await?);
+    }
+    for _ in 0..1000 {
+        let held = jira(h)?
+            .received()
+            .await
+            .iter()
+            .filter(|r| (2..=5).any(|n| r.url.path().ends_with(&format!("/issue/ABC-{n}"))))
+            .count();
+        if held == 4 {
+            return Ok(readers);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("the mock never got the four holding reads".into())
+}
+
+/// The `stale_check` `PREVIEW_FETCH` records of a request.
+async fn stale_check_fetches(h: &Harness, id: &str) -> Result<Vec<Value>, TestError> {
+    Ok(records(h, id, EventType::PREVIEW_FETCH)
+        .await?
+        .into_iter()
+        .filter(|f| f["purpose"] == "stale_check")
+        .collect())
+}
+
+/// The first `begin_call` of the stale check's data GETs (`write.rs`): the identity GET finished
+/// and set the control's `sent` flag, the data GET then waits for a limiter permit and has handed
+/// nothing to a connection when the shutdown lands, so only the identity GET is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_check_data_get_cancel_before_send_not_recorded_in_flight() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let (h, id) = transition_enrichment(&pause).await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    hold_permits(mock, TEST_USER).await;
+    // The two enrichment GETs.
+    for _ in 0..2 {
+        pause.reached.notified().await;
+        pause.release.notify_one();
+    }
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    h.approver().approve(&id).map_err(de)?;
+    // The stale check's identity GET is done, its record parked.
+    pause.reached.notified().await;
+    let readers = start_holders(&h).await?;
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let transitions = |r: &wiremock::Request| r.url.path().ends_with("/transitions");
+    // The enrichment's one only: the data GET has not left.
+    assert_eq!(
+        jira(&h)?
+            .received()
+            .await
+            .iter()
+            .filter(|r| transitions(r))
+            .count(),
+        1
+    );
+    let env = h
+        .engine()
+        .cancel_and_wait(&id, CancelCause::Shutdown(ShutdownReason::AppQuit))
+        .await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let fetch = stale_check_fetches(&h, &id).await?;
+    assert_eq!(fetch.len(), 1, "{fetch:?}");
+    fetch.iter().for_each(not_in_flight);
+    for r in readers {
+        assert_cancelled(&h.handler().cancel(&r).await);
+    }
+    Ok(())
+}
+
+/// The `begin_call` at the top of the identity GET's loop (`write.rs`): a rename (healed by a
+/// read while the stale check's first GET is parked) runs the identity GET once more on the same
+/// control. That second GET waits for a permit when the shutdown lands, so it records no
+/// `cancelled_in_flight` although the first GET set `sent`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_check_identity_rerun_cancel_before_send_not_recorded_in_flight() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let hooks = TestHooks {
+        pause_after_get: Some(pause.clone()),
+        ..TestHooks::none()
+    };
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(hooks)
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let id = queued(
+        &h,
+        COMMENT,
+        json!({ "key": "ABC-1", "body": "Reproduced.", "body_format": "wiki" }),
+    )
+    .await?;
+    // The rename: every answer now names `jdoe2` (same key).
+    mock.server().reset().await;
+    mock.jira_myself("jdoe2", TEST_USER_KEY, XAuser::Same).await;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/serverInfo")))
+        .respond_with(
+            mock.response(200)
+                .insert_header("X-AUSERNAME", "jdoe2")
+                .set_body_raw(fixtures::jira_server_info("9.12.0"), "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
+        .respond_with(
+            mock.response(200)
+                .insert_header("X-AUSERNAME", "jdoe2")
+                .set_body_raw(fixtures::JIRA_ISSUE, "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    hold_permits(mock, "jdoe2").await;
+    h.approver().approve(&id).map_err(de)?;
+    // The identity GET answered as `jdoe2` (a mismatch), its record parked before the check.
+    pause.reached.notified().await;
+    // A read meets the rename first and heals it (the epoch moves on), so the stale check's
+    // re-check is answered from that and asks for the GET to run again.
+    let heal = submit_pending(&h, ISSUE, json!({ "key": "ABC-1" })).await?;
+    h.queued(&heal, 10_000).await.ok_or("heal never queued")?;
+    let readers = start_holders(&h).await?;
+    let myself = |r: &wiremock::Request| r.url.path().ends_with("/myself");
+    let before = jira(&h)?
+        .received()
+        .await
+        .iter()
+        .filter(|r| myself(r))
+        .count();
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The repeated identity GET has not left: it waits for a permit.
+    assert_eq!(
+        jira(&h)?
+            .received()
+            .await
+            .iter()
+            .filter(|r| myself(r))
+            .count(),
+        before
+    );
+    let env = h
+        .engine()
+        .cancel_and_wait(&id, CancelCause::Shutdown(ShutdownReason::AppQuit))
+        .await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let fetch = stale_check_fetches(&h, &id).await?;
+    assert_eq!(fetch.len(), 1, "{fetch:?}");
     fetch.iter().for_each(not_in_flight);
     for r in readers {
         assert_cancelled(&h.handler().cancel(&r).await);

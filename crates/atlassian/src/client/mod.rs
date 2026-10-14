@@ -167,6 +167,10 @@ impl FetchControl {
     /// current call, not a sticky one of the control (T24 M-4), so a cancel before this call
     /// handed a request to the connection is no in-flight cancel. The captured pages and bytes
     /// are the control's own and stay.
+    ///
+    /// Never call this while a call is running (it would hide an in-flight request from a
+    /// cancel), and reads must not call it: the sticky `sent` flag is needed for page 1 after a
+    /// cancel on page 2, so a read's record stays per read.
     pub fn begin_call(&self) {
         self.state().sent = false;
     }

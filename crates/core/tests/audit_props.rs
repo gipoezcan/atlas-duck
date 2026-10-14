@@ -99,6 +99,12 @@ fn check_batch_records(calls: &[Vec<RecordedEvent>]) -> Result<usize, String> {
                 EventType::WRITE_APPROVED if e.payload["candidate_rev"] != *rev => {
                     return Err("WRITE_APPROVED names another revision".into());
                 }
+                // Exact U-32: a release, outcome releases included, names the confirmed revision.
+                EventType::READ_RELEASED | EventType::SCRIPT_RELEASED
+                    if e.payload["candidate_rev"] != *rev =>
+                {
+                    return Err("a release names another revision".into());
+                }
                 // An unredacted result is the candidate itself: same bytes, same hash.
                 EventType::READ_RELEASED
                     if e.payload["released_sha256"].is_string()
@@ -107,7 +113,9 @@ fn check_batch_records(calls: &[Vec<RecordedEvent>]) -> Result<usize, String> {
                 {
                     return Err("READ_RELEASED released another revision".into());
                 }
-                EventType::WRITE_APPROVED | EventType::READ_RELEASED => {}
+                EventType::WRITE_APPROVED
+                | EventType::READ_RELEASED
+                | EventType::SCRIPT_RELEASED => {}
                 other => return Err(format!("{} carries the batch flag", other.as_str())),
             }
             seen.push(id);

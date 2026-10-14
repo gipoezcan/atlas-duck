@@ -1133,9 +1133,13 @@ async fn scripts_release_in_a_batch() -> TestResult {
             })
         })
         .collect::<Result<_, TestError>>()?;
+    let confirmed: Vec<Value> = items
+        .iter()
+        .map(|i| json!({ "counter": i.candidate_rev.counter, "candidate_hash": hex::encode(i.candidate_rev.candidate_hash) }))
+        .collect();
     let out = h.decisions().decide_batch(items).map_err(de)?;
     assert!(out.items.iter().all(|i| i.status == Status::Released));
-    for (id, want) in ids.iter().zip(["a", "b"]) {
+    for ((id, want), confirmed) in ids.iter().zip(["a", "b"]).zip(&confirmed) {
         let env = h.await_(id, 5000).await;
         assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
         assert_eq!(env.data.clone().ok_or("no data")?["result"], json!(want));
@@ -1144,6 +1148,9 @@ async fn scripts_release_in_a_batch() -> TestResult {
                 .await?
                 .contains(&EventType::SCRIPT_RELEASED)
         );
+        // Exact U-32: the release names the revision the batch confirmed for this item.
+        let released = record(&h, id, EventType::SCRIPT_RELEASED).await?;
+        assert_eq!(released["candidate_rev"], *confirmed);
     }
     let texts = h.confirmer().texts();
     assert_eq!(texts.len(), 1);

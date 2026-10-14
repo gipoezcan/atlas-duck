@@ -94,17 +94,16 @@ impl InstanceClient {
                     return self.finish_write(ex, spec, &w.success, ctl).await;
                 }
                 // T10 minor 3: the retry of a `429` could not start; the `429` is the answer.
-                Ok(Exchanged::Stopped429 { answer, body, cred }) => {
+                Ok(Exchanged::Stopped429 {
+                    answer,
+                    body,
+                    read,
+                    cred,
+                    ..
+                }) => {
                     ctl.clear_partial();
                     ctl.append_partial(&body);
-                    return self.classify_write(
-                        &answer,
-                        BodyRead::Complete,
-                        &cred,
-                        spec,
-                        &w.success,
-                        ctl,
-                    );
+                    return self.classify_write(&answer, read, &cred, spec, &w.success, ctl);
                 }
                 Err(FetchFailure::PreSendConnection(_))
                     if retries < MAX_PRESEND_RETRIES && Instant::now() < budget_end =>

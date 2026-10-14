@@ -49,6 +49,12 @@ impl PageFacts {
     /// the five facts are read where they stand, everything else is skipped. `send_one` only
     /// returns a 2xx JSON body that parsed; a body without the items array counts as zero items,
     /// which ends the results. A fact of another type is absent, the last of a repeated key wins.
+    ///
+    /// Equal to the reading of a `serde_json::Value` on well-formed pages. On a malformed one that
+    /// step 8 of `send_one` accepts (a lone surrogate, a byte that is not UTF-8 or nesting deeper
+    /// than 128 inside an item) it is stricter and better: the items are counted, where the value
+    /// tree failed and read as zero items, a silently truncated result. The parse of the body in
+    /// `core` fails closed on such a page.
     fn read(body: &[u8], items_key: &str) -> PageFacts {
         let mut de = serde_json::Deserializer::from_slice(body);
         PageFactsSeed { items_key }
@@ -430,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn facts_read_in_one_pass_equal_the_value_reading() {
+    fn facts_read_in_one_pass_equal_the_value_reading_on_well_formed_pages() {
         let bodies = [
             r#"{"results":[{"a":[1,2]},{"b":{"c":null}},3],"size":3,"limit":25,"totalSize":9,"start":0}"#,
             r#"{"values":[],"maxResults":50,"isLast":true,"total":0}"#,
@@ -459,6 +465,44 @@ mod tests {
                     "{key} in {body}"
                 );
             }
+        }
+    }
+
+    /// T21 fix M3: pages that step 8 of `send_one` accepts but a `Value` does not parse. The old
+    /// reading saw zero items (the results ended silently); the streaming one counts the items
+    /// and reads the facts, in line with step 8 (`core` then fails closed on the body). None of
+    /// them panics or overflows the stack, however deep the nesting.
+    #[test]
+    fn facts_of_malformed_pages_are_counted_not_dropped() {
+        let tail = br#"],"isLast":false,"total":5}"#;
+        let mut lone_surrogate = br#"{"values":[{"a":"\uD800"}"#.to_vec();
+        lone_surrogate.extend_from_slice(tail);
+        let mut raw_ff = br#"{"values":[{"a":""#.to_vec();
+        raw_ff.push(0xFF);
+        raw_ff.extend_from_slice(br#""}"#);
+        raw_ff.extend_from_slice(tail);
+        let mut deep = br#"{"values":["#.to_vec();
+        deep.extend(std::iter::repeat_n(b'[', 200));
+        deep.extend(std::iter::repeat_n(b']', 200));
+        deep.extend_from_slice(tail);
+        let mut very_deep = br#"{"values":["#.to_vec();
+        very_deep.extend(std::iter::repeat_n(b'[', 200_000));
+        very_deep.extend(std::iter::repeat_n(b']', 200_000));
+        very_deep.extend_from_slice(tail);
+        for (name, body) in [
+            ("lone surrogate", lone_surrogate),
+            ("raw 0xFF", raw_ff),
+            ("nesting 200", deep),
+            ("nesting 200000", very_deep),
+        ] {
+            let got = PageFacts::read(&body, "values");
+            assert_eq!(
+                (got.items, got.total, got.is_last),
+                (1, Some(5), Some(false)),
+                "{name}"
+            );
+            // The value reading failed on each of them: zero items.
+            assert_eq!(by_value(&body, "values").items, 0, "{name} (old reading)");
         }
     }
 }
