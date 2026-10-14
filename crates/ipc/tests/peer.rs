@@ -397,9 +397,8 @@ fn v18_walk_finds_test_origin() {
     // this very process.
     let first = &from_shell.peer_chain[0];
     assert_eq!(first.pid, child.id());
-    // The shell stays alive (`; exit $?`), so it must be a walked-through hop.
-    #[cfg(unix)]
-    assert!(is_skipped_hop(&first.exe), "{from_shell:?}");
+    // Whether `sh -c` execs the last command is the shell's choice (the CI runner's
+    // /bin/sh did exec even with `; r=$?; exit $r`), so both shapes are accepted.
     if is_skipped_hop(&first.exe) {
         assert_eq!(from_shell.peer_chain.len(), 2, "{from_shell:?}");
         assert_eq!(from_shell.peer_chain[1].pid, std::process::id());
