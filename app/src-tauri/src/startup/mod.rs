@@ -1,7 +1,9 @@
-//! GUI / `--background` startup: crash-artifact settings (T09) and the data-dir gate (T10).
+//! GUI / `--background` startup: crash-artifact settings (T09), the data-dir gate (T10) and the
+//! startup hardening (M6 T2).
 
 pub mod crash;
 pub mod gate;
+pub mod hardening;
 
 pub use gate::{
     DialogPresenter, ErrorPresenter, LOG_FIELDS, MSG_DATA_DIR_NOT_FOUND, MSG_DATA_DIR_NOT_LOCAL,

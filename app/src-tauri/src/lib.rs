@@ -28,9 +28,10 @@ use tauri::Manager;
 use crate::startup::{DialogPresenter, StartupAction, StartupState};
 use crate::state::{AppState, DataDirHold, ServeSlot};
 
-/// GUI and `--background` launches. Order (§2.5, §3.1, §7.7): crash settings (T09, in
-/// `main.rs`, before this call) -> diagnostic log -> Tauri builder -> in `setup`: the
-/// startup gate (pinned file -> data-dir check -> `instance.lock`).
+/// GUI and `--background` launches. Order (§2.5, §3.1, §7.7): startup hardening and crash
+/// settings (M6 T2, T09, in `main.rs`, before this call) -> diagnostic log -> Tauri builder -> in
+/// `setup`: the startup gate (pinned file -> data-dir check -> `instance.lock`; in `Ready` it clears
+/// the Crashpad reports before any webview).
 pub fn run_gui(background: bool) -> ! {
     // T21 review I-1: the test build never starts against the real home, store or keychain.
     #[cfg(feature = "scripted-approver")]
@@ -39,6 +40,10 @@ pub fn run_gui(background: bool) -> ! {
     // checked data dir; payload-free panic hook.
     let diag = diag::Diag::init();
     diag::install_panic_hook(diag::PANIC_CATEGORY_APP);
+    // §2.5: one warning per scrubbed variable name and per failed mitigation (buffered until attach).
+    if let Some(hardening) = startup::hardening::applied() {
+        startup::hardening::log(hardening);
+    }
     // M6 decides what a cold start without `--background` opens; M1 opens no window.
     let _ = background;
 

@@ -6,6 +6,7 @@ use std::ffi::OsString;
 
 use atlas_duck_app_lib::early_argv::{EarlyMode, classify_argv, verify_export_stub};
 use atlas_duck_app_lib::startup::crash::apply_process_crash_settings;
+use atlas_duck_app_lib::startup::hardening;
 
 fn main() {
     // §12.1 / §2.5 Scope: the early-argv modes run first, before the Tauri builder, the
@@ -22,6 +23,9 @@ fn main() {
         EarlyMode::Cli(rest) => std::process::exit(atlas_duck_cli::run(rest)),
         EarlyMode::VerifyExport(rest) => std::process::exit(verify_export_stub(rest)),
         EarlyMode::Gui { background } => {
+            // §2.5 Startup hardening, first: it writes the environment, so this must still be the
+            // only thread. The result is kept for `run_gui` to log after `Diag::init`.
+            let _ = hardening::apply_early();
             // PD-33: before any other thread exists; `__cli` and `__verify-export` keep glibc's default.
             let _ = atlas_duck_app_lib::compose::set_mmap_threshold();
             // §2.5 Crash artifacts: GUI and `--background` launches only, before any webview.

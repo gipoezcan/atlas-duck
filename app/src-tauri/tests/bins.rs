@@ -244,6 +244,33 @@ fn sandbox_has_8_mib_stack_reserve_and_console_bins_are_console() {
     );
 }
 
+/// M6 T2 / §2.5 Scope: the `__cli` and `__verify-export` early modes are not hardened, so their
+/// environment (`LD_PRELOAD`-style variables included) stays as the caller set it; only the GUI
+/// branch runs `startup::hardening::apply_early`. Checked on the dispatch helper, no process spawn.
+#[test]
+fn cli_mode_is_not_hardened() {
+    use std::ffi::OsString;
+
+    use atlas_duck_app_lib::early_argv::classify_argv;
+    use atlas_duck_app_lib::startup::hardening::applies_to;
+
+    let argv = |items: &[&str]| -> Vec<OsString> { items.iter().map(OsString::from).collect() };
+    for args in [
+        argv(&["atlas-duck-app", "__cli", "bogus"]),
+        argv(&["atlas-duck-app", "__cli", "--background"]),
+        argv(&["atlas-duck-app", "__verify-export", "x"]),
+        argv(&["atlas-duck-app", "--verify-export", "x"]),
+    ] {
+        assert!(!applies_to(&classify_argv(&args)), "{args:?}");
+    }
+    for args in [
+        argv(&["atlas-duck-app"]),
+        argv(&["atlas-duck-app", "--background"]),
+    ] {
+        assert!(applies_to(&classify_argv(&args)), "{args:?}");
+    }
+}
+
 /// T09 / §2.5 Scope: the early-argv modes are dispatched before the crash settings, so they keep
 /// their stdio. If `apply_process_crash_settings` ran first, stderr would be the null device.
 #[test]

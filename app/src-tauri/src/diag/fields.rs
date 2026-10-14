@@ -22,7 +22,8 @@ use tracing_subscriber::layer::Context;
 
 /// §7.7 metadata: op id, request id, instance alias, HTTP method, path
 /// template, status code, duration, error class; §3.3: connection id,
-/// peer pid/exe, reason. `event` names the log line itself.
+/// peer pid/exe, reason. `event` names the log line itself. §2.5 (M6 T2): `removed_var`, the
+/// name (never the value) of a scrubbed environment variable.
 pub const ALLOWED_FIELDS: &[&str] = &[
     "event",
     "op_id",
@@ -37,6 +38,7 @@ pub const ALLOWED_FIELDS: &[&str] = &[
     "peer_pid",
     "peer_exe",
     "reason",
+    "removed_var",
 ];
 
 /// Target rule, the second half of the allowlist: only events whose
@@ -455,7 +457,8 @@ mod tests {
                 "connection_id",
                 "peer_pid",
                 "peer_exe",
-                "reason"
+                "reason",
+                "removed_var"
             ]
         );
     }

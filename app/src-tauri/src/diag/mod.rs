@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -52,6 +53,10 @@ pub struct Diag {
 
 static GLOBAL: OnceLock<Diag> = OnceLock::new();
 
+/// Set by the first `Diag::init`. The Tauri builder and its threads follow it in `run_gui`, so
+/// `startup::hardening`'s environment writes assert in debug builds that it is still false.
+pub(crate) static STARTED: AtomicBool = AtomicBool::new(false);
+
 thread_local! {
     /// Set while this thread holds the sink lock, so a panic raised inside
     /// the sink (whose hook writes to the sink) never self-deadlocks.
@@ -82,6 +87,7 @@ impl Diag {
     /// by the allowlist layer): third-party events never reach the log.
     /// Creates no file or directory.
     pub fn init() -> &'static Diag {
+        STARTED.store(true, Ordering::SeqCst);
         let mut created = false;
         let diag = GLOBAL.get_or_init(|| {
             created = true;
