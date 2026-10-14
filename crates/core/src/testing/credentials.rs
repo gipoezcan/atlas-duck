@@ -22,7 +22,12 @@ struct Entry {
 pub struct InMemoryCredentials {
     entries: Mutex<HashMap<String, Entry>>,
     fail_store: AtomicBool,
+    fail_delete: AtomicBool,
+    /// Runs once, at the start of the next `load` (a test holds the caller there).
+    on_next_load: Mutex<Option<LoadHook>>,
 }
+
+type LoadHook = Box<dyn FnOnce() + Send>;
 
 impl std::fmt::Debug for InMemoryCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,6 +68,20 @@ impl InMemoryCredentials {
         self.fail_store.store(on, Ordering::SeqCst);
     }
 
+    /// While on, every `delete` fails with `Unavailable` and keeps the entry (the keychain
+    /// delete after the audit record).
+    pub fn fail_delete(&self, on: bool) {
+        self.fail_delete.store(on, Ordering::SeqCst);
+    }
+
+    /// `hook` runs at the start of the next `load`, on the caller's thread, once.
+    pub fn on_next_load(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .on_next_load
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
     pub fn contains(&self, instance_id: &str) -> bool {
         self.lock().contains_key(instance_id)
     }
@@ -70,6 +89,14 @@ impl InMemoryCredentials {
 
 impl CredentialProvider for InMemoryCredentials {
     fn load(&self, instance_id: &str) -> Result<Option<StoredCredential>, CredentialError> {
+        let hook = self
+            .on_next_load
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
         Ok(self.lock().get(instance_id).map(|e| StoredCredential {
             pat: PatSecret::new(e.pat.as_str().to_owned()),
             base_url_hash: e.base_url_hash,
@@ -95,6 +122,9 @@ impl CredentialProvider for InMemoryCredentials {
     }
 
     fn delete(&self, instance_id: &str) -> Result<(), CredentialError> {
+        if self.fail_delete.load(Ordering::SeqCst) {
+            return Err(CredentialError::Unavailable);
+        }
         self.lock().remove(instance_id);
         Ok(())
     }

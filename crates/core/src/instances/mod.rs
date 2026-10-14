@@ -53,6 +53,9 @@ pub struct InstanceView {
     /// counted from the local date (an expired token is `1`). A hint only: it never gates a
     /// request (I-27).
     pub expiry_warning: Option<u8>,
+    /// PD-84: the days from the local date to `expires_at` (`0`: it expires today; negative: it
+    /// expired), for the status texts; set whenever `expires_at` is.
+    pub days_left: Option<i64>,
 }
 
 /// The add-instance form (§7.1).

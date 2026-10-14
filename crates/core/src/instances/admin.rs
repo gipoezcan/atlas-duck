@@ -52,6 +52,9 @@ pub struct CoreInstances {
     /// Minutes east of UTC of the app's local time zone (`Core::set_utc_offset`): the local date
     /// the expiry warnings count from (PD-84); `None` is UTC.
     utc_offset_min: Mutex<Option<i32>>,
+    /// One table rebuild at a time, from its snapshot to its swap: a rebuild never swaps in a
+    /// table older than the one before it (M6 T9 review I-2).
+    reload_lock: Mutex<()>,
 }
 
 fn audit(msg: &'static str) -> AdminError {
@@ -148,10 +151,16 @@ pub(crate) fn shown(s: &str) -> String {
     out
 }
 
-/// PD-84 (§7.1): the tightest of the 14, 7 and 1 day warnings for a token expiring on `expires`,
-/// counted from the local date `today`; the expiry day itself and every later day are `1`.
-pub(crate) fn expiry_warning(expires: chrono::NaiveDate, today: chrono::NaiveDate) -> Option<u8> {
-    match (expires - today).num_days() {
+/// PD-84 (§7.1): the days from the local date to a token's expiry date: `0` on the expiry day,
+/// negative once it passed.
+pub(crate) fn days_left(expires: chrono::NaiveDate, today: chrono::NaiveDate) -> i64 {
+    (expires - today).num_days()
+}
+
+/// PD-84 (§7.1): the tightest of the 14, 7 and 1 day warnings for a token `days_left` days from
+/// its expiry; the expiry day itself and every later day are `1`.
+pub(crate) fn expiry_warning(days_left: i64) -> Option<u8> {
+    match days_left {
         ..=1 => Some(1),
         2..=7 => Some(7),
         8..=14 => Some(14),
@@ -159,18 +168,31 @@ pub(crate) fn expiry_warning(expires: chrono::NaiveDate, today: chrono::NaiveDat
     }
 }
 
+/// PD-84: the local date at `now`, `offset_min` minutes east of UTC (`None` is UTC).
+fn local_date(now: UtcInstant, offset_min: Option<i32>) -> chrono::NaiveDate {
+    let shift = i64::from(offset_min.unwrap_or(0)) * 60_000;
+    UtcInstant(now.0.saturating_add(shift)).date()
+}
+
 /// The stored token goes (audit before effect): after an origin change (it is bound to the old
 /// origin) or on request (`delete_token`). The delete is attempted even when the old token could
 /// not be read, and `CREDENTIAL_CHANGED {deleted}` commits first; a failed append
 /// (`AdminError::Audit`) leaves the token in place, where the origin hash keeps it unused (review
-/// I-4, ruling 13). `Ok(false)`: nothing was stored, nothing logged. Blocking (store, keychain).
-fn delete_stored(engine: &Engine, id: &str) -> Result<bool, AdminError> {
+/// I-4, ruling 13). A failed keychain delete leaves it in place too, and a corrective
+/// `CREDENTIAL_CHANGED {delete_failed}` says so (M6 T9 review I-1). `on_request`: refused
+/// `ShuttingDown` before the append once the shutdown began (the keychain read can outlast its
+/// wait, review I-3); an origin change is committed already and goes on. `Ok(false)`: nothing was
+/// stored, nothing logged. Blocking (store, keychain).
+fn delete_stored(engine: &Engine, id: &str, on_request: bool) -> Result<bool, AdminError> {
     let creds = engine.credentials().clone();
     let old_key = match creds.load(id) {
         Ok(Some(c)) => Some(c.identity.atlassian_user_key.clone()),
         Ok(None) => return Ok(false),
         Err(_) => None,
     };
+    if on_request && engine.is_shutting_down() {
+        return Err(AdminError::ShuttingDown);
+    }
     let ev = payloads::credential_changed(
         id,
         CredentialChange::Deleted,
@@ -179,12 +201,25 @@ fn delete_stored(engine: &Engine, id: &str) -> Result<bool, AdminError> {
         None,
     );
     engine.port().append(ev).map_err(AdminError::Audit)?;
-    creds.delete(id).map_err(AdminError::Keychain)?;
+    if let Err(e) = creds.delete(id) {
+        // The record above said the token went; it did not: say so (as `set_token`'s
+        // `store_failed`).
+        let failed = payloads::credential_changed(
+            id,
+            CredentialChange::DeleteFailed,
+            old_key.as_deref(),
+            None,
+            None,
+        );
+        let _ = engine.port().append(failed);
+        return Err(AdminError::Keychain(e));
+    }
     Ok(true)
 }
 
-/// The token-owner dialog on a dedicated OS thread, never on the blocking pool (PD-13, PD-25,
-/// M3 M-6; as `decision::batch`); the async caller waits for it off the workers.
+/// The token-owner dialog on a dedicated OS thread, never on a tokio worker or the blocking pool
+/// (PD-13, PD-25, M3 M-6; as `decision::batch`); the async caller waits for it off the workers,
+/// one blocking-pool thread joining it while the dialog is open.
 async fn confirm_on_own_thread(confirmer: Arc<dyn NativeConfirmer>, text: String) -> Confirm {
     tokio::task::spawn_blocking(move || {
         std::thread::Builder::new()
@@ -233,6 +268,7 @@ impl CoreInstances {
             config_path,
             work: Arc::new(AdminWork::default()),
             utc_offset_min: Mutex::new(None),
+            reload_lock: Mutex::new(()),
         }
     }
 
@@ -268,9 +304,7 @@ impl CoreInstances {
             .utc_offset_min
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let now = self.engine.clock().now_utc();
-        let shift = i64::from(offset.unwrap_or(0)) * 60_000;
-        UtcInstant(now.0.saturating_add(shift)).date()
+        local_date(self.engine.clock().now_utc(), offset)
     }
 
     fn path(&self) -> Result<&PathBuf, AdminError> {
@@ -368,8 +402,13 @@ impl CoreInstances {
     /// PD-22: rebuilds the runtime table from `config.toml`, the audit settings and the
     /// keychain. The file-side records are logged at start only. The derivation runs on a
     /// snapshot without the table lock (keychain I/O); a change made to an instance meanwhile
-    /// (a re-check's `needs_token`) is kept at the swap, under the lock (M3 M-14).
+    /// (a re-check's `needs_token`) is kept at the swap, under the lock (M3 M-14). Rebuilds run
+    /// one at a time (`reload_lock`, review I-2). Blocking.
     fn reload(&self) -> Result<(), AdminError> {
+        let _one = self
+            .reload_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let path = self.path()?;
         let cfg = load_config(path).map_err(|_| AdminError::ConfigReadOnly)?;
         let settings = self.settings();
@@ -402,6 +441,7 @@ impl CoreInstances {
     fn view_of(&self, i: &InstanceRuntime) -> InstanceView {
         let host = i.base.as_ref().map_or("", NormalizedBaseUrl::host);
         let resolved = self.engine.http().resolve(&i.proxy, host);
+        let left = i.expires_at.map(|d| days_left(d, self.local_today()));
         InstanceView {
             alias: i.alias.clone(),
             product: i.product,
@@ -413,9 +453,8 @@ impl CoreInstances {
             proxy_effective: Some(resolved.effective),
             pending_url_change: i.pending_url_change.clone(),
             note: i.note.clone(),
-            expiry_warning: i
-                .expires_at
-                .and_then(|d| expiry_warning(d, self.local_today())),
+            expiry_warning: left.and_then(expiry_warning),
+            days_left: left,
         }
     }
 
@@ -517,7 +556,7 @@ impl CoreInstances {
         )?;
         // The origin is committed from here on: the runtime follows it whatever else fails
         // (review I-4), and the first error is reported afterwards.
-        let deleted = delete_stored(&self.engine, &id);
+        let deleted = delete_stored(&self.engine, &id, false);
         self.engine.invalidate_client(&id);
         // Another server's field names (PD-46, T8 review M-5).
         self.engine.field_cache().forget(&id);
@@ -954,17 +993,19 @@ impl InstanceAdmin for CoreInstances {
             return self.view(alias);
         };
         let (engine, del_id) = (self.engine.clone(), id.clone());
-        let deleted = tokio::task::spawn_blocking(move || delete_stored(&engine, &del_id))
-            .await
-            .unwrap_or(Err(AdminError::Keychain(CredentialError::Unavailable)));
-        match deleted {
-            Ok(false) => return self.view(alias),
-            // The record did not commit: nothing was deleted, nothing changes.
-            Err(AdminError::Audit(e)) => return Err(AdminError::Audit(e)),
-            Ok(true) | Err(_) => {}
-        }
-        // Recorded as deleted (the keychain delete may still have failed): the instance uses no
-        // token from now on (fail closed), and its queued writes are no longer approvable.
+        let deleted =
+            tokio::task::spawn_blocking(move || delete_stored(&engine, &del_id, true)).await;
+        let failed = match deleted {
+            Ok(Ok(false)) => return self.view(alias),
+            Ok(Ok(true)) => None,
+            // Nothing was deleted, and the log says so (no record, or a corrective one after a
+            // failed keychain delete, review I-1), or the shutdown began: nothing changes.
+            Ok(Err(e)) => return Err(e),
+            // Whether the record committed is unknown: fail closed.
+            Err(_) => Some(AdminError::Keychain(CredentialError::Unavailable)),
+        };
+        // Deleted: the instance uses no token from now on, and its queued writes are no longer
+        // approvable.
         self.engine.invalidate_client(&id);
         self.engine.update_instance(&id, |rt| {
             if matches!(
@@ -982,7 +1023,9 @@ impl InstanceAdmin for CoreInstances {
         self.engine
             .instance_changed(&id, InstanceChange::StateChanged)
             .await;
-        deleted?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
         self.view(alias)
     }
 }
@@ -1005,9 +1048,12 @@ mod tests {
     #[test]
     fn expiry_warnings_take_the_tightest_threshold() {
         let expires = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).unwrap_or_default();
-        // `today` is `days_left` days before the expiry date.
-        let warning =
-            |days_left: i64| expiry_warning(expires, expires - chrono::TimeDelta::days(days_left));
+        // `today` is `left` days before the expiry date.
+        let warning = |left: i64| {
+            let today = expires - chrono::TimeDelta::days(left);
+            assert_eq!(days_left(expires, today), left);
+            expiry_warning(days_left(expires, today))
+        };
         let got: Vec<Option<u8>> = [30, 15, 14, 13, 8, 7, 2, 1, 0, -1, -400]
             .into_iter()
             .map(warning)
@@ -1028,6 +1074,22 @@ mod tests {
                 Some(1)
             ]
         );
+    }
+
+    /// Review M-3: the UTC offset moves the local date the warnings count from.
+    #[test]
+    fn local_date_follows_the_utc_offset() {
+        // 2026-03-30 23:30 UTC.
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 3, 30).unwrap_or_default();
+        let ms = day
+            .and_hms_opt(23, 30, 0)
+            .unwrap_or_default()
+            .and_utc()
+            .timestamp_millis();
+        let now = UtcInstant(ms);
+        assert_eq!(local_date(now, None), day);
+        assert_eq!(local_date(now, Some(-600)), day);
+        assert_eq!(local_date(now, Some(60)), day + chrono::Days::new(1));
     }
 
     #[test]

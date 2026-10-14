@@ -974,6 +974,36 @@ async fn m4_no_append_after_app_stop_with_admin_work() -> TestResult {
     Ok(())
 }
 
+/// M6 T9 review I-3: a `delete_token` whose keychain read is still running when the shutdown
+/// begins (an OS keychain prompt can outlast the drain) appends nothing and deletes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m4_delete_token_rechecks_the_shutdown_after_the_keychain_read() -> TestResult {
+    let h = Harness::jira().await?;
+    assert!(h.field_cache_filled().await, "the start fill never ended");
+    let id = h.instance("jira-main").ok_or("no instance")?.id.clone();
+    let go = Arc::new(Notify::new());
+    let (reached, engine) = (go.clone(), h.engine().clone());
+    // The keychain read of `delete_token` holds until the shutdown began.
+    h.credentials().on_next_load(move || {
+        reached.notify_one();
+        let end = Instant::now() + Duration::from_secs(5);
+        while !engine.is_shutting_down() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let admin = h.core().instances();
+    let (deleted, report) = tokio::join!(admin.delete_token("jira-main"), async {
+        go.notified().await;
+        h.core().shutdown(ShutdownReason::Quit).await
+    });
+    assert_eq!(deleted.err(), Some(AdminError::ShuttingDown));
+    assert!(report.app_stop_logged);
+    assert!(h.credentials().contains(&id), "the token is untouched");
+    assert!(h.events_of(EventType::CREDENTIAL_CHANGED).await?.is_empty());
+    assert_eq!(last_event(&h)?, EventType::APP_STOP);
+    Ok(())
+}
+
 /// Polls until the mock received `n` `/myself` requests.
 async fn wait_for_myself(h: &Harness, n: usize) -> TestResult {
     for _ in 0..1000 {

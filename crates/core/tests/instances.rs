@@ -1412,8 +1412,9 @@ fn view_of(h: &Harness, alias: &str) -> Result<InstanceView, Box<dyn std::error:
         .ok_or_else(|| "no such alias".into())
 }
 
-/// M3 M-6: the token-owner dialog of `set_token` runs on its own OS thread, not on a tokio
-/// thread (an open dialog must not park a blocking-pool thread and hang the runtime's teardown).
+/// M3 M-6: the token-owner dialog of `set_token` runs on its own named OS thread, never on a tokio
+/// worker or blocking-pool thread (as `decision::batch`; one blocking-pool thread still waits
+/// on that thread's join while the dialog is open).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn m6_owner_change_confirm_not_on_blocking_pool() -> TestResult {
     let h = Harness::builder()
@@ -1531,6 +1532,121 @@ async fn delete_token_logs_deleted_and_sets_needs_token() -> TestResult {
     Ok(())
 }
 
+/// M6 T9 review I-1: a keychain delete that fails after `CREDENTIAL_CHANGED {deleted}` committed
+/// is followed by a corrective `CREDENTIAL_CHANGED {delete_failed}`; the call fails and the
+/// instance keeps its token, as the keychain does (a rebuild derives the same). An origin change
+/// whose keychain delete fails logs the same pair and still moves the instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_keychain_delete_leaves_a_corrective_record() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let id = instance_id(&h, "jira-main")?;
+    h.credentials().fail_delete(true);
+    let res = h.instances().delete_token("jira-main").await;
+    assert_eq!(
+        res.err(),
+        Some(AdminError::Keychain(CredentialError::Unavailable))
+    );
+    assert!(h.credentials().contains(&id));
+    let view = view_of(&h, "jira-main")?;
+    assert_eq!(view.state, "ok", "the token was not deleted");
+    assert!(view.executes_as.is_some());
+    let changed = h.events_of(EventType::CREDENTIAL_CHANGED).await?;
+    let changes: Vec<&Value> = changed.iter().map(|e| &e["change"]).collect();
+    assert_eq!(changes, [&j!("deleted"), &j!("delete_failed")]);
+    assert_eq!(changed[1]["old_user_key"], TEST_USER_KEY);
+    // A rebuild of the table agrees with the log.
+    let admin = h.instances();
+    let view =
+        tokio::task::spawn_blocking(move || admin.set_proxy("jira-main", ProxySetting::Direct))
+            .await??;
+    assert_eq!(view.state, "ok");
+    // An origin change is committed before its delete: the instance moves all the same.
+    let second = MockDc::start(atl(Product::Jira), "/moved").await;
+    let (admin, url) = (h.instances(), second.base_url());
+    let res = tokio::task::spawn_blocking(move || admin.change_base_url("jira-main", &url)).await?;
+    assert_eq!(
+        res.err(),
+        Some(AdminError::Keychain(CredentialError::Unavailable))
+    );
+    let view = view_of(&h, "jira-main")?;
+    assert_eq!(view.origin, Some(second.base_url()));
+    assert_eq!(view.state, "needs_token");
+    let changes: Vec<Value> = h
+        .events_of(EventType::CREDENTIAL_CHANGED)
+        .await?
+        .iter()
+        .map(|e| e["change"].clone())
+        .collect();
+    assert_eq!(
+        changes,
+        [
+            j!("deleted"),
+            j!("delete_failed"),
+            j!("deleted"),
+            j!("delete_failed")
+        ]
+    );
+    Ok(())
+}
+
+/// M6 T9 review I-2: table rebuilds run one at a time. While one (`set_proxy` direct) is held
+/// between its derivation and its swap, a second (`set_proxy` to a proxy) has applied its setting
+/// but does not reach its own derivation; released, it derives after the first swapped, and its
+/// own value is what stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i2_reloads_run_one_at_a_time() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_in_reload: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let id = instance_id(&h, "jira-main")?;
+    let admin = h.instances();
+    let first =
+        tokio::task::spawn_blocking(move || admin.set_proxy("jira-main", ProxySetting::Direct));
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified()).await?;
+    let admin = h.instances();
+    let proxy = ProxySetting::HostPort {
+        host: "proxy.corp.example".to_owned(),
+        port: 3128,
+    };
+    let second = tokio::task::spawn_blocking(move || admin.set_proxy("jira-main", proxy));
+    // The second call applied its setting: from here on it is in its rebuild.
+    let wanted = Some("proxy.corp.example:3128".to_owned());
+    let mut applied = false;
+    for _ in 0..1000 {
+        if setting_of(&h, &id).and_then(|p| p.proxy) == wanted {
+            applied = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(applied, "the second setting was never applied");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), pause.reached.notified())
+            .await
+            .is_err(),
+        "a second rebuild derived beside the first"
+    );
+    pause.release.notify_one();
+    let view = tokio::time::timeout(Duration::from_secs(10), first).await???;
+    assert_eq!(view.proxy_effective.as_deref(), Some("direct"));
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified()).await?;
+    pause.release.notify_one();
+    let view = tokio::time::timeout(Duration::from_secs(10), second).await???;
+    assert_eq!(view.proxy_effective, wanted);
+    assert_eq!(view_of(&h, "jira-main")?.proxy_effective, wanted);
+    Ok(())
+}
+
 /// I-27 (PD-84): an entered expiry date warns 14, 7 and 1 days ahead (the tightest; an expired
 /// token stays at 1) and never blocks: a read still executes after the date.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1547,6 +1663,7 @@ async fn i27_expiry_warnings_14_7_1_never_block() -> TestResult {
         .await?;
     let day = Duration::from_secs(86_400);
     let mut warnings = Vec::new();
+    let mut days = Vec::new();
     for left in [15_i64, 14, 7, 1, 0, -1] {
         // The local date (UTC here) `left` days before the expiry date.
         let target = expires - chrono::TimeDelta::days(left);
@@ -1559,10 +1676,16 @@ async fn i27_expiry_warnings_14_7_1_never_block() -> TestResult {
             Some(expires.format("%Y-%m-%d").to_string())
         );
         warnings.push(view.expiry_warning);
+        days.push(view.days_left);
     }
     assert_eq!(
         warnings,
         [None, Some(14), Some(7), Some(1), Some(1), Some(1)]
+    );
+    // The PD-84 texts count from the same local date ("expires in N days", "today", "expired").
+    assert_eq!(
+        days,
+        [Some(15), Some(14), Some(7), Some(1), Some(0), Some(-1)]
     );
     // One day after the expiry date the stored token is still used.
     let env = h.submit("jira.issue.get", j!({ "key": "ABC-1" })).await;
