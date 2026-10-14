@@ -2131,8 +2131,9 @@ pub fn move_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         }
         return model;
     }
-    let (Hold::Preview, Some(request), PreviewBody::WriteRequests { .. }) =
-        (view.hold, view.requests.first(), &model.body)
+    // A request list (a `Preview`, or one returned for a collision or an identity mismatch,
+    // which keep it, as the other write cards do).
+    let (Some(request), PreviewBody::WriteRequests { .. }) = (view.requests.first(), &model.body)
     else {
         return model;
     };
