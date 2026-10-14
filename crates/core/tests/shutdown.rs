@@ -17,11 +17,12 @@ use atlas_duck_core::metadata::FIELD_CACHE_TTL;
 use atlas_duck_core::testing::{
     AuditRecord, FakeScriptRunner, FaultPlan, Harness, InstanceAt, JIRA_FIELDS, ScriptPlan,
 };
-use atlas_duck_core::{Pause, RunEnd, ShutdownReason, ShutdownReport, TestHooks};
+use atlas_duck_core::{AdminError, Pause, RunEnd, ShutdownReason, ShutdownReport, TestHooks};
 use atlas_duck_ipc::envelope::Envelope;
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_registry::Product;
 use common::{TestError, TestResult, code, de, detail, exit, request_id};
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
 use wiremock::Mock;
@@ -828,8 +829,8 @@ async fn the_shutdown_waits_for_a_fill_to_record_its_result() -> TestResult {
     Ok(())
 }
 
-/// Once the shutdown began no fill starts: a connection test passing afterwards (other methods
-/// keep working until the app exits) records no `metadata_cache` start after `APP_STOP`.
+/// Once the shutdown began no fill starts: a connection test asked for afterwards is refused
+/// (M3 M-4) and records no `metadata_cache` start after `APP_STOP`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_field_cache_fill_starts_once_the_shutdown_began() -> TestResult {
     let h = Harness::jira().await?;
@@ -841,11 +842,147 @@ async fn no_field_cache_fill_starts_once_the_shutdown_began() -> TestResult {
     mock.json(FIELD, 200, JIRA_FIELDS).await;
     let report = h.core().shutdown(ShutdownReason::Quit).await;
     assert!(report.app_stop_logged);
-    h.core().instances().retest_token("jira-main").await?;
+    let res = h.core().instances().retest_token("jira-main").await;
+    assert_eq!(res.err(), Some(AdminError::ShuttingDown));
     assert!(h.field_cache_filled().await);
-    let (cache, _) = cache_and_last(&h).await?;
+    let (cache, last) = cache_and_last(&h).await?;
     assert_eq!(cache.len(), 2, "only the start fill's start and result");
+    assert_eq!(last.event_type, EventType::APP_STOP);
     Ok(())
+}
+
+// ---- M3 M-4: the admin work of the settings and credential windows -----------------------------
+
+const MYSELF: &str = "/rest/api/2/myself";
+
+/// The `connection_test` records, and the record that is last in the log.
+async fn connection_tests(h: &Harness) -> Result<(Vec<AuditRecord>, AuditRecord), TestError> {
+    let all = h.audit_records().await?;
+    let last = all
+        .iter()
+        .max_by_key(|r| r.seq)
+        .cloned()
+        .ok_or("empty log")?;
+    let tests = all
+        .into_iter()
+        .filter(|r| {
+            r.event_type == EventType::SYSTEM_FETCH && r.payload["purpose"] == "connection_test"
+        })
+        .collect();
+    Ok((tests, last))
+}
+
+async fn myself_requests(h: &Harness) -> Result<usize, TestError> {
+    Ok(jira(h)?
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.url.path().ends_with(MYSELF))
+        .count())
+}
+
+/// A re-test (and every other admin call) asked for while the shutdown runs is refused
+/// `ShuttingDown` without I/O: no request, no record, the token untouched; and afterwards too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m4_admin_retest_during_shutdown_refused() -> TestResult {
+    let held = HeldWrite::new();
+    let b = busy(0, held.hooks()).await?;
+    let h = &b.h;
+    held.held().await?;
+    jira(h)?.jira_server_info(fixtures::JIRA_9_12_VERSION).await;
+    let id = h.instance("jira-main").ok_or("no instance")?.id.clone();
+    let (tests_before, _) = connection_tests(h).await?;
+    let myself_before = myself_requests(h).await?;
+    let (report, refused) = tokio::join!(h.core().shutdown(ShutdownReason::Quit), async {
+        wait_for("the shutdown to start", || h.engine().is_shutting_down()).await?;
+        let admin = h.core().instances();
+        let refused = vec![
+            admin.retest_token("jira-main").await.err(),
+            admin
+                .set_token("jira-main", SecretString::from("new-pat".to_owned()), None)
+                .await
+                .err(),
+            admin.delete_token("jira-main").await.err(),
+            admin
+                .set_proxy("jira-main", atlas_duck_core::proxy::ProxySetting::Direct)
+                .err(),
+            admin
+                .change_base_url("jira-main", "https://jira.example/moved")
+                .err(),
+        ];
+        // The shutdown is still waiting for the executing write.
+        let stopped_early = !h.events_of(EventType::APP_STOP).await?.is_empty();
+        held.release_once_listed().await?;
+        Ok::<_, TestError>((refused, stopped_early))
+    });
+    let (refused, stopped_early) = refused?;
+    assert!(!stopped_early, "the calls did not run during the shutdown");
+    assert!(
+        refused.iter().all(|e| *e == Some(AdminError::ShuttingDown)),
+        "{refused:?}"
+    );
+    assert!(report.app_stop_logged);
+    // After the shutdown as well.
+    assert_eq!(
+        h.core().instances().retest_token("jira-main").await.err(),
+        Some(AdminError::ShuttingDown)
+    );
+    assert_eq!(myself_requests(h).await?, myself_before, "no request left");
+    let (tests, last) = connection_tests(h).await?;
+    assert_eq!(tests.len(), tests_before.len(), "no connection test record");
+    assert!(h.credentials().contains(&id), "the token is untouched");
+    assert!(h.events_of(EventType::CREDENTIAL_CHANGED).await?.is_empty());
+    assert_eq!(last.event_type, EventType::APP_STOP);
+    Ok(())
+}
+
+/// A re-test whose `/myself` answer takes 2 s when the shutdown begins: the shutdown cancels its
+/// GET, the cancelled result is recorded before `APP_STOP`, nothing follows `APP_STOP`, and the
+/// call reports `ShuttingDown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m4_no_append_after_app_stop_with_admin_work() -> TestResult {
+    let h = Harness::jira().await?;
+    assert!(h.field_cache_filled().await, "the start fill never ended");
+    let mock = jira(&h)?;
+    let me = fixtures::jira_myself(TEST_USER, TEST_USER_KEY);
+    mock.json_delayed(MYSELF, 200, &me, Duration::from_secs(2))
+        .await;
+    mock.jira_server_info(fixtures::JIRA_9_12_VERSION).await;
+    let admin = h.core().instances();
+    let retest = tokio::spawn(async move { admin.retest_token("jira-main").await });
+    wait_for_myself(&h, 1).await?;
+    let report = h.core().shutdown(ShutdownReason::Quit).await;
+    assert!(report.app_stop_logged);
+    let res = tokio::time::timeout(Duration::from_secs(10), retest).await??;
+    assert_eq!(res.err(), Some(AdminError::ShuttingDown));
+    // Whatever the re-test still does, nothing follows `APP_STOP`.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let (tests, last) = connection_tests(&h).await?;
+    assert_eq!(last.event_type, EventType::APP_STOP, "{:?}", last.payload);
+    let phases: Vec<&str> = tests
+        .iter()
+        .filter_map(|r| r.payload["phase"].as_str())
+        .collect();
+    assert_eq!(phases, ["start", "result"], "{tests:?}");
+    assert!(tests.iter().all(|r| r.seq < last.seq));
+    assert_eq!(
+        tests[1].payload["class"], "cancelled",
+        "{:?}",
+        tests[1].payload
+    );
+    assert_eq!(h.events_of(EventType::APP_STOP).await?.len(), 1);
+    Ok(())
+}
+
+/// Polls until the mock received `n` `/myself` requests.
+async fn wait_for_myself(h: &Harness, n: usize) -> TestResult {
+    for _ in 0..1000 {
+        if myself_requests(h).await? >= n {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!("timed out waiting for {n} /myself requests").into())
 }
 
 // ---- I-11: the Quit case ----------------------------------------------------------------------

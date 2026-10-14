@@ -792,14 +792,17 @@ impl Engine {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Task 25 (PD-22): swaps in a rebuilt instance table. The write lock is held only for the
-    /// swap; never take an entry's state lock while holding it (lock order: entry state, then
-    /// the table).
-    pub(crate) fn replace_instances(&self, table: InstanceTable) {
-        *self
+    /// Task 25 (PD-22): swaps in a rebuilt instance table, the one `f` builds from the table in
+    /// force (M3 M-14: a rebuild keeps the changes made since its snapshot). The write lock is
+    /// held only for `f` and the swap; `f` must not block, and never take an entry's state lock
+    /// while holding it (lock order: entry state, then the table).
+    pub(crate) fn swap_instances(&self, f: impl FnOnce(&InstanceTable) -> InstanceTable) {
+        let mut table = self
             .instances
             .write()
-            .unwrap_or_else(PoisonError::into_inner) = table;
+            .unwrap_or_else(PoisonError::into_inner);
+        let next = f(&table);
+        *table = next;
     }
 
     /// Changes one instance of the table in place (a PAT was stored); the write lock is held

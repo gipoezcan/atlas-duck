@@ -16,16 +16,17 @@ use atlas_duck_atlassian::{
     normalize_base_url,
 };
 use atlas_duck_audit::testing::{MemKeyStore, MemKeyring};
-use atlas_duck_audit::{Confirmed, EntryName, EventType, KeyStore, SettingChange};
+use atlas_duck_audit::{Clock, Confirmed, EntryName, EventType, KeyStore, SettingChange};
 use atlas_duck_core::audit_port::DateBridge;
 use atlas_duck_core::config::load_config;
+use atlas_duck_core::instances::admin::OWNER_CONFIRM_THREAD;
 use atlas_duck_core::instances::state::ca_fingerprint;
 use atlas_duck_core::proxy::{OsProxy, ProxySetting, SystemProxySource};
 use atlas_duck_core::testing::capture::NullUi;
 use atlas_duck_core::testing::{Harness, InstanceAt, StubConfirmer, TempStore};
 use atlas_duck_core::{
-    AddInstance, AdminError, Confirm, ConnectionFailure, Core, CoreDeps, KeychainCredentials,
-    TestHooks,
+    AddInstance, AdminError, Confirm, ConnectionFailure, Core, CoreDeps, InstanceView,
+    KeychainCredentials, Pause, TestHooks,
 };
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_registry::Product;
@@ -1381,5 +1382,195 @@ async fn url_password_in_config_toml_never_reaches_the_audit_log() -> TestResult
         all.iter().all(|e| !e.to_string().contains("hunter")),
         "{all:?}"
     );
+    Ok(())
+}
+
+// ---- M6 Task 9: Δ4 delete_token, M3 M-6 / M-14, PD-84 expiry warnings -------------------------
+
+/// The connection test answering as another Jira user (`/myself` and `serverInfo` carry the
+/// other name in `X-AUSERNAME`, the client compares it on every JSON answer).
+async fn other_user_answers(mock: &MockDc, user: &str, key: &str) {
+    mock.jira_myself(user, key, XAuser::Same).await;
+    let info = mock
+        .response(200)
+        .insert_header("X-AUSERNAME", user)
+        .set_body_raw(fixtures::jira_server_info("9.12.0"), "application/json");
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(
+            mock.path("/rest/api/2/serverInfo"),
+        ))
+        .respond_with(info)
+        .mount(mock.server())
+        .await;
+}
+
+fn view_of(h: &Harness, alias: &str) -> Result<InstanceView, Box<dyn std::error::Error>> {
+    h.instances()
+        .list()
+        .into_iter()
+        .find(|i| i.alias == alias)
+        .ok_or_else(|| "no such alias".into())
+}
+
+/// M3 M-6: the token-owner dialog of `set_token` runs on its own OS thread, not on a tokio
+/// thread (an open dialog must not park a blocking-pool thread and hang the runtime's teardown).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m6_owner_change_confirm_not_on_blocking_pool() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Cancel])
+        .start()
+        .await?;
+    let threads = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let seen = threads.clone();
+    h.confirmer().set_hook(Arc::new(move |_| {
+        let name = std::thread::current().name().map(str::to_owned);
+        seen.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(name);
+    }));
+    other_user_answers(h.mock("jira-main").ok_or("mock")?, "alice", "JIRAUSER9").await;
+    let res = h
+        .instances()
+        .set_token("jira-main", pat("other-pat"), None)
+        .await;
+    assert_eq!(res.err(), Some(AdminError::Cancelled));
+    let names = threads
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(names, [Some(OWNER_CONFIRM_THREAD.to_owned())], "{names:?}");
+    // Tokio names its workers and its blocking pool alike.
+    assert!(
+        names
+            .iter()
+            .all(|n| n.as_deref() != Some("tokio-runtime-worker")),
+        "{names:?}"
+    );
+    // Cancelled: the old token stays.
+    let changed = h.events_of(EventType::CREDENTIAL_CHANGED).await?;
+    assert!(changed.is_empty(), "{changed:?}");
+    Ok(())
+}
+
+/// M3 M-14: a re-test that moves the instance to `needs_token` while a table rebuild (here the
+/// one of `set_proxy`) is between its derivation and its swap survives the swap. The keychain
+/// still holds the PAT, so the derivation alone would say `ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m14_reload_keeps_concurrent_needs_token() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_in_reload: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    assert_eq!(state_of(&h, "jira-main")?, "ok");
+    let admin = h.instances();
+    let rebuild =
+        tokio::task::spawn_blocking(move || admin.set_proxy("jira-main", ProxySetting::Direct));
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified()).await?;
+    other_user_answers(h.mock("jira-main").ok_or("mock")?, "mallory", "JIRAUSER9").await;
+    let res = h.instances().retest_token("jira-main").await;
+    assert_eq!(
+        res.err(),
+        Some(AdminError::ConnectionFailed(ConnectionFailure::OtherUser))
+    );
+    assert_eq!(state_of(&h, "jira-main")?, "needs_token");
+    pause.release.notify_one();
+    let view = tokio::time::timeout(Duration::from_secs(10), rebuild).await???;
+    // The rebuild applied (the proxy) and kept the newer state.
+    assert_eq!(view.proxy_effective.as_deref(), Some("direct"));
+    assert_eq!(view.state, "needs_token");
+    assert_eq!(view.note.as_deref(), Some("token now resolves to mallory"));
+    let id = instance_id(&h, "jira-main")?;
+    assert!(h.credentials().contains(&id), "the PAT is still stored");
+    Ok(())
+}
+
+/// Δ4: `delete_token` logs `CREDENTIAL_CHANGED {deleted}` before the keychain delete, and the
+/// instance is `needs_token` (its queued write not approvable); a failed record deletes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_token_logs_deleted_and_sets_needs_token() -> TestResult {
+    let h = Harness::jira().await?;
+    let id = instance_id(&h, "jira-main")?;
+    let params = j!({ "key": "ABC-1", "body": "Reproduced.", "body_format": "wiki" });
+    let rid = request_id(&h.submit("jira.comment.add", params).await)?;
+    let item = h.queued(&rid, 10_000).await.ok_or("never queued")?;
+    assert!(item.approvable);
+    // Audit before effect: the record fails, the token stays, nothing changes.
+    h.plan().fail_nth(EventType::CREDENTIAL_CHANGED, 1);
+    let res = h.instances().delete_token("jira-main").await;
+    assert!(matches!(res, Err(AdminError::Audit(_))), "{res:?}");
+    assert!(h.credentials().contains(&id));
+    assert_eq!(state_of(&h, "jira-main")?, "ok");
+    assert!(h.events_of(EventType::CREDENTIAL_CHANGED).await?.is_empty());
+    let view = h.instances().delete_token("jira-main").await?;
+    assert_eq!(view.state, "needs_token");
+    assert_eq!(view.executes_as, None);
+    assert_eq!(view.expires_at, None);
+    assert!(!h.credentials().contains(&id));
+    let changed = h.events_of(EventType::CREDENTIAL_CHANGED).await?;
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(changed[0]["change"], "deleted");
+    assert_eq!(changed[0]["old_user_key"], TEST_USER_KEY);
+    assert!(
+        !h.approver().item(&rid).ok_or("left the queue")?.approvable,
+        "a write without a token is not approvable"
+    );
+    // Nothing stored: nothing logged.
+    let again = h.instances().delete_token("jira-main").await?;
+    assert_eq!(again.state, "needs_token");
+    assert_eq!(h.events_of(EventType::CREDENTIAL_CHANGED).await?.len(), 1);
+    // A read is refused for the missing token.
+    let env = h.submit("jira.issue.get", j!({ "key": "ABC-1" })).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!((exit(&env), code(&env).as_str()), (9, "needs_token"));
+    Ok(())
+}
+
+/// I-27 (PD-84): an entered expiry date warns 14, 7 and 1 days ahead (the tightest; an expired
+/// token stays at 1) and never blocks: a read still executes after the date.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i27_expiry_warnings_14_7_1_never_block() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = h.mock("jira-main").ok_or("mock")?;
+    jira_answers(mock, TEST_USER, TEST_USER_KEY, "9.12.0").await;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    let today = h.clock().now_utc().date();
+    let expires = today + chrono::Days::new(15);
+    h.instances()
+        .set_token("jira-main", pat(TEST_PAT), Some(expires))
+        .await?;
+    let day = Duration::from_secs(86_400);
+    let mut warnings = Vec::new();
+    for left in [15_i64, 14, 7, 1, 0, -1] {
+        // The local date (UTC here) `left` days before the expiry date.
+        let target = expires - chrono::TimeDelta::days(left);
+        let ahead = u32::try_from((target - h.clock().now_utc().date()).num_days())?;
+        h.clock().advance(day * ahead);
+        let view = view_of(&h, "jira-main")?;
+        assert_eq!(view.state, "ok", "a date never changes the state");
+        assert_eq!(
+            view.expires_at,
+            Some(expires.format("%Y-%m-%d").to_string())
+        );
+        warnings.push(view.expiry_warning);
+    }
+    assert_eq!(
+        warnings,
+        [None, Some(14), Some(7), Some(1), Some(1), Some(1)]
+    );
+    // One day after the expiry date the stored token is still used.
+    let env = h.submit("jira.issue.get", j!({ "key": "ABC-1" })).await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let rid = request_id(&env)?;
+    h.queued(&rid, 10_000).await.ok_or("never queued")?;
+    h.approver().release(&rid).map_err(common::de)?;
+    let env = h.await_(&rid, 5_000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
     Ok(())
 }

@@ -6,13 +6,13 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use atlas_duck_atlassian::{
     BaseUrlError, CredentialError, NormalizedBaseUrl, PatSecret, StoredCredential, StoredIdentity,
     url_hash, username_matches,
 };
-use atlas_duck_audit::{AuditError, Confirmed, SettingChange, Settings};
+use atlas_duck_audit::{AuditError, Confirmed, SettingChange, Settings, UtcInstant};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_registry::Product;
@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::connection_test::{self, Target};
 use super::state::{CaBundle, DeriveCtx, InstanceRuntime, InstanceState, InstanceTable, parse_ca};
+use super::work::{AdminWork, Job};
 use super::{
     AddInstance, AdminError, ConnectionFailure, ConnectionReport, InstanceAdmin, InstanceView,
 };
@@ -27,7 +28,7 @@ use crate::config::instances::{
     InstanceConfig, add_instance, instances, is_valid_alias, set_base_url, set_proxy_setting,
 };
 use crate::config::{ConfigState, ConfigWriteError, load_config};
-use crate::core::Confirm;
+use crate::core::{Confirm, NativeConfirmer};
 use crate::engine::Engine;
 use crate::engine::write::InstanceChange;
 use crate::identity::{self, RecheckResult};
@@ -39,10 +40,18 @@ use crate::proxy::ProxySetting;
 /// §7.1 verbatim.
 const TOKEN_OWNER_CHANGE: &str = "This token belongs to ";
 
+/// The thread the token-owner dialog runs on (PD-13, PD-25, M3 M-6).
+pub const OWNER_CONFIRM_THREAD: &str = "atlas-duck-owner-confirm";
+
 /// The core's `InstanceAdmin`.
 pub struct CoreInstances {
     engine: Arc<Engine>,
     config_path: Option<PathBuf>,
+    /// The calls that can write or send, drained by the shutdown (M3 M-4).
+    work: Arc<AdminWork>,
+    /// Minutes east of UTC of the app's local time zone (`Core::set_utc_offset`): the local date
+    /// the expiry warnings count from (PD-84); `None` is UTC.
+    utc_offset_min: Mutex<Option<i32>>,
 }
 
 fn audit(msg: &'static str) -> AdminError {
@@ -139,6 +148,55 @@ pub(crate) fn shown(s: &str) -> String {
     out
 }
 
+/// PD-84 (§7.1): the tightest of the 14, 7 and 1 day warnings for a token expiring on `expires`,
+/// counted from the local date `today`; the expiry day itself and every later day are `1`.
+pub(crate) fn expiry_warning(expires: chrono::NaiveDate, today: chrono::NaiveDate) -> Option<u8> {
+    match (expires - today).num_days() {
+        ..=1 => Some(1),
+        2..=7 => Some(7),
+        8..=14 => Some(14),
+        _ => None,
+    }
+}
+
+/// The stored token goes (audit before effect): after an origin change (it is bound to the old
+/// origin) or on request (`delete_token`). The delete is attempted even when the old token could
+/// not be read, and `CREDENTIAL_CHANGED {deleted}` commits first; a failed append
+/// (`AdminError::Audit`) leaves the token in place, where the origin hash keeps it unused (review
+/// I-4, ruling 13). `Ok(false)`: nothing was stored, nothing logged. Blocking (store, keychain).
+fn delete_stored(engine: &Engine, id: &str) -> Result<bool, AdminError> {
+    let creds = engine.credentials().clone();
+    let old_key = match creds.load(id) {
+        Ok(Some(c)) => Some(c.identity.atlassian_user_key.clone()),
+        Ok(None) => return Ok(false),
+        Err(_) => None,
+    };
+    let ev = payloads::credential_changed(
+        id,
+        CredentialChange::Deleted,
+        old_key.as_deref(),
+        None,
+        None,
+    );
+    engine.port().append(ev).map_err(AdminError::Audit)?;
+    creds.delete(id).map_err(AdminError::Keychain)?;
+    Ok(true)
+}
+
+/// The token-owner dialog on a dedicated OS thread, never on the blocking pool (PD-13, PD-25,
+/// M3 M-6; as `decision::batch`); the async caller waits for it off the workers.
+async fn confirm_on_own_thread(confirmer: Arc<dyn NativeConfirmer>, text: String) -> Confirm {
+    tokio::task::spawn_blocking(move || {
+        std::thread::Builder::new()
+            .name(OWNER_CONFIRM_THREAD.into())
+            .spawn(move || confirmer.confirm(&text))
+            .map(|t| t.join().unwrap_or(Confirm::Cancel))
+            .unwrap_or(Confirm::Cancel)
+    })
+    .await
+    .unwrap_or(Confirm::Cancel)
+}
+
 /// The most certificates the CA dialog lists one by one; the bundle fingerprint covers the rest.
 const CA_LISTED: usize = 5;
 
@@ -173,7 +231,46 @@ impl CoreInstances {
         CoreInstances {
             engine,
             config_path,
+            work: Arc::new(AdminWork::default()),
+            utc_offset_min: Mutex::new(None),
         }
+    }
+
+    /// The admin work the shutdown closes and waits for (M3 M-4).
+    pub(crate) fn work(&self) -> &AdminWork {
+        &self.work
+    }
+
+    pub(crate) fn set_utc_offset(&self, minutes: Option<i32>) {
+        *self
+            .utc_offset_min
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = minutes;
+    }
+
+    /// A call that can write or send: refused once the shutdown began (M3 M-4).
+    fn enter(&self) -> Result<Job, AdminError> {
+        self.work.enter(&self.engine)
+    }
+
+    /// Refuses to go on once the shutdown began: checked after a dialog (a user can answer one
+    /// long after the shutdown's bounded wait) and before a step that writes.
+    fn still_running(&self) -> Result<(), AdminError> {
+        if self.engine.is_shutting_down() {
+            return Err(AdminError::ShuttingDown);
+        }
+        Ok(())
+    }
+
+    /// The local date (PD-84): the engine's clock moved by the app's UTC offset.
+    fn local_today(&self) -> chrono::NaiveDate {
+        let offset = *self
+            .utc_offset_min
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let now = self.engine.clock().now_utc();
+        let shift = i64::from(offset.unwrap_or(0)) * 60_000;
+        UtcInstant(now.0.saturating_add(shift)).date()
     }
 
     fn path(&self) -> Result<&PathBuf, AdminError> {
@@ -192,9 +289,11 @@ impl CoreInstances {
         self.engine.port().settings()
     }
 
+    /// The dialog of a synchronous call (on the caller's blocking-pool thread, PD-13); an OK
+    /// given after the shutdown began changes nothing.
     fn confirm(&self, text: &str) -> Result<(), AdminError> {
         match self.engine.confirmer().confirm(text) {
-            Confirm::Ok => Ok(()),
+            Confirm::Ok => self.still_running(),
             Confirm::Cancel => Err(AdminError::Cancelled),
         }
     }
@@ -267,13 +366,15 @@ impl CoreInstances {
     }
 
     /// PD-22: rebuilds the runtime table from `config.toml`, the audit settings and the
-    /// keychain. The file-side records are logged at start only.
+    /// keychain. The file-side records are logged at start only. The derivation runs on a
+    /// snapshot without the table lock (keychain I/O); a change made to an instance meanwhile
+    /// (a re-check's `needs_token`) is kept at the swap, under the lock (M3 M-14).
     fn reload(&self) -> Result<(), AdminError> {
         let path = self.path()?;
         let cfg = load_config(path).map_err(|_| AdminError::ConfigReadOnly)?;
         let settings = self.settings();
         let previous = self.engine.instances().clone();
-        let (table, _file_side) = InstanceTable::derive(
+        let (mut table, _file_side) = InstanceTable::derive(
             &cfg,
             &DeriveCtx {
                 settings: &settings,
@@ -282,7 +383,14 @@ impl CoreInstances {
                 previous: Some(&previous),
             },
         );
-        self.engine.replace_instances(table);
+        #[cfg(feature = "testing")]
+        if let Some(p) = self.engine.hooks().pause_in_reload.clone() {
+            let _ = self.engine.run_sync(async move { p.hold().await });
+        }
+        self.engine.swap_instances(move |current| {
+            table.keep_newer(current);
+            table
+        });
         Ok(())
     }
 
@@ -305,6 +413,9 @@ impl CoreInstances {
             proxy_effective: Some(resolved.effective),
             pending_url_change: i.pending_url_change.clone(),
             note: i.note.clone(),
+            expiry_warning: i
+                .expires_at
+                .and_then(|d| expiry_warning(d, self.local_today())),
         }
     }
 
@@ -381,6 +492,7 @@ impl CoreInstances {
         rt: &InstanceRuntime,
         new: NormalizedBaseUrl,
         file_url: Option<&str>,
+        job: &Job,
     ) -> Result<(), AdminError> {
         let (id, old) = Self::usable(rt)?;
         if old == new {
@@ -405,7 +517,7 @@ impl CoreInstances {
         )?;
         // The origin is committed from here on: the runtime follows it whatever else fails
         // (review I-4), and the first error is reported afterwards.
-        let deleted = self.delete_token(&id);
+        let deleted = delete_stored(&self.engine, &id);
         self.engine.invalidate_client(&id);
         // Another server's field names (PD-46, T8 review M-5).
         self.engine.field_cache().forget(&id);
@@ -428,36 +540,16 @@ impl CoreInstances {
                 old: old.as_str(),
                 new: new.as_str(),
             },
+            job,
         );
         deleted?;
         reloaded
     }
 
-    /// The token is bound to the old origin: it goes (audit before effect). The delete is
-    /// attempted even when the old token could not be read, and `CREDENTIAL_CHANGED {deleted}`
-    /// commits first; a failed append leaves the token in place, where the origin hash keeps it
-    /// unused (review I-4, ruling 13).
-    fn delete_token(&self, id: &str) -> Result<(), AdminError> {
-        let creds = self.engine.credentials().clone();
-        let old_key = match creds.load(id) {
-            Ok(Some(c)) => Some(c.identity.atlassian_user_key.clone()),
-            Ok(None) => return Ok(()),
-            Err(_) => None,
-        };
-        let ev = payloads::credential_changed(
-            id,
-            CredentialChange::Deleted,
-            old_key.as_deref(),
-            None,
-            None,
-        );
-        self.engine.port().append(ev).map_err(AdminError::Audit)?;
-        creds.delete(id).map_err(AdminError::Keychain)
-    }
-
     /// Carries a change to the instance's queued writes. `run_sync` refuses a current-thread
-    /// caller (it must not block); the follow-up then runs detached instead of being dropped.
-    fn follow_writes(&self, id: String, change: InstanceChange) {
+    /// caller (it must not block); the follow-up then runs detached instead of being dropped,
+    /// under a fork of `job` (the shutdown waits for it, M3 M-4).
+    fn follow_writes(&self, id: String, change: InstanceChange, job: &Job) {
         let eng = self.engine.clone();
         let (e2, id2, c2) = (eng.clone(), id.clone(), change.clone());
         if self
@@ -465,8 +557,11 @@ impl CoreInstances {
             .run_sync(async move { e2.instance_changed(&id2, c2).await })
             .is_none()
         {
-            self.engine
-                .spawn_detached(async move { eng.instance_changed(&id, change).await });
+            let forked = job.fork();
+            self.engine.spawn_detached(async move {
+                eng.instance_changed(&id, change).await;
+                drop(forked);
+            });
         }
     }
 
@@ -497,6 +592,19 @@ impl CoreInstances {
         }
     }
 
+    /// A connection test the shutdown cancelled failed because of the shutdown, not the server.
+    fn tested(
+        result: Result<connection_test::Tested, AdminError>,
+        job: &Job,
+    ) -> Result<connection_test::Tested, AdminError> {
+        match result {
+            Err(AdminError::ConnectionFailed(_)) if job.cancelled() => {
+                Err(AdminError::ShuttingDown)
+            }
+            other => other,
+        }
+    }
+
     fn target(rt: &InstanceRuntime, id: String, origin: NormalizedBaseUrl) -> Target {
         Target {
             id,
@@ -516,6 +624,7 @@ impl InstanceAdmin for CoreInstances {
     }
 
     fn add(&self, req: AddInstance) -> Result<InstanceView, AdminError> {
+        let _job = self.enter()?;
         let origin = self
             .engine
             .normalize_origin(&req.base_url)
@@ -622,6 +731,7 @@ impl InstanceAdmin for CoreInstances {
     }
 
     fn confirm_config_instance(&self, alias: &str) -> Result<InstanceView, AdminError> {
+        let _job = self.enter()?;
         let rt = self.find(alias)?;
         match rt.state {
             InstanceState::InstanceUnconfirmed => {}
@@ -651,6 +761,7 @@ impl InstanceAdmin for CoreInstances {
     }
 
     fn accept_config_url_change(&self, alias: &str) -> Result<InstanceView, AdminError> {
+        let job = self.enter()?;
         let rt = self.find(alias)?;
         let Some(url) = rt.pending_url_change.clone() else {
             return Err(AdminError::NotFound);
@@ -659,22 +770,24 @@ impl InstanceAdmin for CoreInstances {
             BaseUrlError::InsecureScheme => AdminError::InsecureScheme,
             BaseUrlError::Invalid(_) => AdminError::InvalidUrl,
         })?;
-        self.change_origin(&rt, new, None)?;
+        self.change_origin(&rt, new, None, &job)?;
         self.view(alias)
     }
 
     fn change_base_url(&self, alias: &str, new_url: &str) -> Result<InstanceView, AdminError> {
+        let job = self.enter()?;
         let rt = self.find(alias)?;
         let new = self.engine.normalize_origin(new_url).map_err(|e| match e {
             BaseUrlError::InsecureScheme => AdminError::InsecureScheme,
             BaseUrlError::Invalid(_) => AdminError::InvalidUrl,
         })?;
         let new_raw = new.as_str();
-        self.change_origin(&rt, new, Some(&new_raw))?;
+        self.change_origin(&rt, new, Some(&new_raw), &job)?;
         self.view(alias)
     }
 
     fn set_proxy(&self, alias: &str, proxy: ProxySetting) -> Result<InstanceView, AdminError> {
+        let _job = self.enter()?;
         let rt = self.find(alias)?;
         let id = rt.id.clone().ok_or(AdminError::Unconfirmed)?;
         let path = self.path()?;
@@ -708,14 +821,14 @@ impl InstanceAdmin for CoreInstances {
         pat: secrecy::SecretString,
         expires_at: Option<chrono::NaiveDate>,
     ) -> Result<ConnectionReport, AdminError> {
+        let job = self.enter()?;
         let rt = self.find(alias)?;
         let (id, origin) = Self::usable(&rt)?;
-        let tested = connection_test::run(
-            &self.engine,
-            &Self::target(&rt, id.clone(), origin.clone()),
-            &pat,
-        )
-        .await?;
+        let target = Self::target(&rt, id.clone(), origin.clone());
+        let tested = Self::tested(
+            connection_test::run(&self.engine, &target, &pat, &job).await,
+            &job,
+        )?;
         let bound = url_hash(&origin);
         // A stored token bound to another origin belongs to no one here.
         let old = self.stored(&id).await.filter(|c| c.base_url_hash == bound);
@@ -730,13 +843,12 @@ impl InstanceAdmin for CoreInstances {
                 shown(&o.identity.atlassian_user)
             );
             let confirmer = self.engine.confirmer().clone();
-            let answer = tokio::task::spawn_blocking(move || confirmer.confirm(&text))
-                .await
-                .unwrap_or(Confirm::Cancel);
-            if answer == Confirm::Cancel {
+            if confirm_on_own_thread(confirmer, text).await == Confirm::Cancel {
                 return Err(AdminError::Cancelled);
             }
         }
+        // Nothing is written once the shutdown began (the dialog can outlast its wait).
+        self.still_running()?;
         let expires = expires_at.map(|d| d.format("%Y-%m-%d").to_string());
         let ev = payloads::credential_changed(
             &id,
@@ -796,6 +908,7 @@ impl InstanceAdmin for CoreInstances {
     }
 
     async fn retest_token(&self, alias: &str) -> Result<ConnectionReport, AdminError> {
+        let job = self.enter()?;
         let rt = self.find(alias)?;
         let (id, origin) = Self::usable(&rt)?;
         let stored = self
@@ -804,9 +917,13 @@ impl InstanceAdmin for CoreInstances {
             .filter(|c| c.base_url_hash == url_hash(&origin))
             .ok_or(AdminError::Keychain(CredentialError::Unavailable))?;
         let pat = secrecy::SecretString::from(stored.pat.expose_secret().to_owned());
-        let tested =
-            connection_test::run(&self.engine, &Self::target(&rt, id.clone(), origin), &pat)
-                .await?;
+        let target = Self::target(&rt, id.clone(), origin);
+        let tested = Self::tested(
+            connection_test::run(&self.engine, &target, &pat, &job).await,
+            &job,
+        )?;
+        // The result is in the log; the instance is not changed once the shutdown began.
+        self.still_running()?;
         if tested.user_key != stored.identity.atlassian_user_key {
             // The token resolves to someone else now (§7.1): a confirmed token failure.
             let result = RecheckResult::TokenFailure {
@@ -828,6 +945,46 @@ impl InstanceAdmin for CoreInstances {
         self.fill_field_cache(&rt, &id);
         Ok(tested.report)
     }
+
+    async fn delete_token(&self, alias: &str) -> Result<InstanceView, AdminError> {
+        let _job = self.enter()?;
+        let rt = self.find(alias)?;
+        // No id: no keychain entry can belong to the instance.
+        let Some(id) = rt.id.clone() else {
+            return self.view(alias);
+        };
+        let (engine, del_id) = (self.engine.clone(), id.clone());
+        let deleted = tokio::task::spawn_blocking(move || delete_stored(&engine, &del_id))
+            .await
+            .unwrap_or(Err(AdminError::Keychain(CredentialError::Unavailable)));
+        match deleted {
+            Ok(false) => return self.view(alias),
+            // The record did not commit: nothing was deleted, nothing changes.
+            Err(AdminError::Audit(e)) => return Err(AdminError::Audit(e)),
+            Ok(true) | Err(_) => {}
+        }
+        // Recorded as deleted (the keychain delete may still have failed): the instance uses no
+        // token from now on (fail closed), and its queued writes are no longer approvable.
+        self.engine.invalidate_client(&id);
+        self.engine.update_instance(&id, |rt| {
+            if matches!(
+                rt.state,
+                InstanceState::Ok
+                    | InstanceState::IdentityHeaderMissing
+                    | InstanceState::IdentityHeaderMismatch
+            ) {
+                rt.state = InstanceState::NeedsToken;
+            }
+            rt.identity = None;
+            rt.expires_at = None;
+            rt.note = None;
+        });
+        self.engine
+            .instance_changed(&id, InstanceChange::StateChanged)
+            .await;
+        deleted?;
+        self.view(alias)
+    }
 }
 
 #[cfg(test)]
@@ -843,6 +1000,34 @@ mod tests {
             not_before: "2026-01-01".to_owned(),
             not_after: "2027-01-01".to_owned(),
         }
+    }
+
+    #[test]
+    fn expiry_warnings_take_the_tightest_threshold() {
+        let expires = chrono::NaiveDate::from_ymd_opt(2026, 3, 31).unwrap_or_default();
+        // `today` is `days_left` days before the expiry date.
+        let warning =
+            |days_left: i64| expiry_warning(expires, expires - chrono::TimeDelta::days(days_left));
+        let got: Vec<Option<u8>> = [30, 15, 14, 13, 8, 7, 2, 1, 0, -1, -400]
+            .into_iter()
+            .map(warning)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                None,
+                None,
+                Some(14),
+                Some(14),
+                Some(14),
+                Some(7),
+                Some(7),
+                Some(1),
+                Some(1),
+                Some(1),
+                Some(1)
+            ]
+        );
     }
 
     #[test]

@@ -183,6 +183,9 @@ pub struct TestHooks {
     pub pause_before_write_cover: Option<Arc<Pause>>,
     /// Notified the first time the shutdown sweep lists an `executing` write it will wait for.
     pub sweep_listed_write: Option<Arc<tokio::sync::Notify>>,
+    /// An instance-table rebuild (`reload`) holds after its derivation, before its swap (M3
+    /// M-14: a change made meanwhile must survive the swap).
+    pub pause_in_reload: Option<Arc<Pause>>,
 }
 
 #[cfg(feature = "testing")]
@@ -427,6 +430,8 @@ impl Core {
     /// The local UTC offset in minutes the similarity notice text uses (Δ6); `None` is UTC.
     pub fn set_utc_offset(&self, minutes: Option<i32>) {
         self.engine.similarity().set_utc_offset(minutes);
+        // The local date of the token expiry warnings (PD-84).
+        self.instances.set_utc_offset(minutes);
     }
 
     /// Tests only: the engine's internals (audit port, covers) are not part of the app surface.
@@ -436,7 +441,8 @@ impl Core {
     }
 
     /// The one §2.5 shutdown path (I-40): (1) from now on every `submit` / `submit_script` is
-    /// refused `app_shutting_down` (other methods keep working until the app exits); (2, 3)
+    /// refused `app_shutting_down` and every `InstanceAdmin` call `ShuttingDown` (other methods
+    /// keep working until the app exits); (2, 3)
     /// every request that is not `executing` ends `cancelled` with the app's reason, a running
     /// script is killed first; (4) writes that are `executing` are waited for, at most 60 s;
     /// (5) the head anchor is flushed and `APP_STOP` is appended. A second (concurrent or later)
@@ -459,6 +465,10 @@ impl Core {
         self.engine.field_cache().cancel_all();
         // T19: likewise for the token re-checks (`SYSTEM_FETCH {purpose: token_recheck}`).
         self.engine.identity_gates().cancel_all();
+        // M3 M-4: and for the admin work of the settings and credential windows: every
+        // `InstanceAdmin` call is refused `ShuttingDown` from now on, the running connection
+        // tests are cancelled (they record a `cancelled` result).
+        self.instances.work().close();
         let (why, stop) = match reason {
             ShutdownReason::Quit => (CancelWhy::AppQuit, AppStopReason::Quit),
             // The installer path cancels with the app's own reason (§8.3: `app_quit`).
@@ -482,7 +492,7 @@ impl Core {
             .unwrap_or(crate::shutdown::FILL_WAIT);
         #[cfg(not(feature = "testing"))]
         let drain = crate::shutdown::FILL_WAIT;
-        // One deadline for both drains: the shutdown waits at most `drain` for them together.
+        // One deadline for the three drains: the shutdown waits at most `drain` for them together.
         let drain_began = std::time::Instant::now();
         if !crate::shutdown::fills_ended(&self.engine, drain).await {
             tracing::warn!("a field-name cache fill was still running at APP_STOP");
@@ -490,6 +500,10 @@ impl Core {
         let left = drain.saturating_sub(drain_began.elapsed());
         if !crate::shutdown::rechecks_ended(&self.engine, left).await {
             tracing::warn!("a token re-check was still running at APP_STOP");
+        }
+        let left = drain.saturating_sub(drain_began.elapsed());
+        if !admin_work_ended(&self.instances, left).await {
+            tracing::warn!("an instance admin call was still running at APP_STOP");
         }
         let app_stop_logged = crate::shutdown::stop(&self.engine, stop).await.is_ok();
         ShutdownReport {
@@ -529,6 +543,23 @@ struct StartOptions {
     limits: Option<Limits>,
     #[cfg(feature = "testing")]
     hooks: TestHooks,
+}
+
+/// §2.5 step 5 for the admin work (M3 M-4): the calls cancelled when the shutdown began record
+/// their results and end; bounded and never blocking like `shutdown::rechecks_ended`. `false`
+/// when one is still running then (a native dialog left open: what it would do afterwards is
+/// refused, `AdminError::ShuttingDown`).
+async fn admin_work_ended(instances: &CoreInstances, bound: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        if instances.work().idle() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// PD-04: write ids for hand-written instances when the file is writable, then read it again.

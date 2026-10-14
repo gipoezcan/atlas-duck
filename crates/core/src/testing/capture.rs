@@ -385,6 +385,10 @@ impl InstanceAdmin for CapturingInstances {
         let r = self.inner.retest_token(alias).await;
         self.rec(r)
     }
+    async fn delete_token(&self, alias: &str) -> Result<InstanceView, AdminError> {
+        let r = self.inner.delete_token(alias).await;
+        self.rec(r)
+    }
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@
 pub mod admin;
 pub mod connection_test;
 pub mod state;
+pub(crate) mod work;
 
 use atlas_duck_atlassian::{ConnClass, CredentialError};
 use atlas_duck_audit::AuditError;
@@ -48,6 +49,10 @@ pub struct InstanceView {
     /// Why the state is what it is, for the settings window (Task 26): "token now resolves to
     /// <user>" after a recheck found another user, the admin hint of the identity-header states.
     pub note: Option<String>,
+    /// PD-84: the tightest of the 14, 7 and 1 day thresholds the stored expiry date is within,
+    /// counted from the local date (an expired token is `1`). A hint only: it never gates a
+    /// request (I-27).
+    pub expiry_warning: Option<u8>,
 }
 
 /// The add-instance form (§7.1).
@@ -132,6 +137,8 @@ pub enum AdminError {
     ConnectionFailed(ConnectionFailure),
     Audit(AuditError),
     Keychain(CredentialError),
+    /// The shutdown began (M3 M-4): the call did nothing.
+    ShuttingDown,
 }
 
 impl AdminError {
@@ -146,6 +153,7 @@ impl AdminError {
             Self::ConnectionFailed(_) => "connection_failed",
             Self::Audit(_) => "audit",
             Self::Keychain(_) => "keychain",
+            Self::ShuttingDown => "shutting_down",
         }
     }
 }
@@ -174,7 +182,9 @@ impl Serialize for AdminError {
     }
 }
 
-/// C.7: add/change base URL (native confirmation), proxy, token set/re-test (§7.1, §10.3).
+/// C.7: add/change base URL (native confirmation), proxy, token set/re-test/delete (§7.1,
+/// §10.3). Every call that can write or send is refused `ShuttingDown` once `Core::shutdown`
+/// began (M3 M-4).
 #[async_trait::async_trait]
 pub trait InstanceAdmin: Send + Sync {
     fn list(&self) -> Vec<InstanceView>;
@@ -190,4 +200,9 @@ pub trait InstanceAdmin: Send + Sync {
         expires_at: Option<chrono::NaiveDate>,
     ) -> Result<ConnectionReport, AdminError>;
     async fn retest_token(&self, alias: &str) -> Result<ConnectionReport, AdminError>;
+    /// Δ4 ("Prepare for removal", PD-88): deletes the stored PAT. `CREDENTIAL_CHANGED {change:
+    /// deleted}` commits before the keychain delete (audit before effect); the instance is
+    /// `needs_token` afterwards. No stored PAT: nothing is logged. The native confirmation is the
+    /// caller's (the removal procedure's `begin` step).
+    async fn delete_token(&self, alias: &str) -> Result<InstanceView, AdminError>;
 }

@@ -25,6 +25,7 @@ use secrecy::ExposeSecret;
 use serde_json::{Map, Value};
 use zeroize::Zeroizing;
 
+use super::work::Job;
 use super::{AdminError, ConnectionFailure, ConnectionReport};
 use crate::audit_port::commit_system_fetch_start;
 use crate::engine::Engine;
@@ -280,17 +281,22 @@ fn judge_version(
 }
 
 /// Runs the test. `Err(AdminError::ConnectionFailed(..))` for a failed test, `Audit` when the
-/// start record could not be committed (then nothing was sent).
+/// start record could not be committed (then nothing was sent). Its GETs run under controls of
+/// `job`: the shutdown cancels them, and each records its (`cancelled`) result (M3 M-4).
 pub(crate) async fn run(
     engine: &Arc<Engine>,
     target: &Target,
     pat: &secrecy::SecretString,
+    job: &Job,
 ) -> Result<Tested, AdminError> {
     let (identity_path, version_path) = match target.product {
         Product::Jira => ("/rest/api/2/myself", "/rest/api/2/serverInfo"),
         Product::Confluence => ("/rest/api/user/current", "/rest/applinks/1.0/manifest"),
     };
     let fail = |f| AdminError::ConnectionFailed(f);
+    if job.cancelled() {
+        return Err(AdminError::ShuttingDown);
+    }
     let fetch_id = FetchId::new()
         .map_err(|_| AdminError::Audit(atlas_duck_audit::AuditError::Invalid("no randomness")))?
         .0;
@@ -303,7 +309,8 @@ pub(crate) async fn run(
         .blocking(move |p| commit_system_fetch_start(p, &committed, start, &fid).map(|_| ()))
         .await
         .map_err(AdminError::Audit)?;
-    let outcome = run_calls(engine, target, pat, &fetch_id, identity_path, version_path).await;
+    let paths = (identity_path, version_path);
+    let outcome = run_calls(engine, target, pat, &fetch_id, paths, job).await;
     engine.committed().forget_fetch(&fetch_id);
     match outcome? {
         Ok(tested) => Ok(tested),
@@ -317,8 +324,8 @@ async fn run_calls(
     target: &Target,
     pat: &secrecy::SecretString,
     fetch_id: &str,
-    identity_path: &str,
-    version_path: &str,
+    (identity_path, version_path): (&str, &str),
+    job: &Job,
 ) -> Result<Result<Tested, ConnectionFailure>, AdminError> {
     let purpose = SystemFetchPurpose::ConnectionTest;
     let covers_err = || AdminError::Audit(atlas_duck_audit::AuditError::Invalid("no audit cover"));
@@ -361,7 +368,7 @@ async fn run_calls(
     };
 
     let call = get(identity_path);
-    let outcome = client.get(&cover, &call).await;
+    let outcome = client.get_ctl(&cover, &call, &job.fetch_control()).await;
     append(system_get_record(
         purpose,
         &target.id,
@@ -388,7 +395,7 @@ async fn run_calls(
     };
 
     let call = get(version_path);
-    let outcome = client.get(&cover, &call).await;
+    let outcome = client.get_ctl(&cover, &call, &job.fetch_control()).await;
     append(system_get_record(
         purpose,
         &target.id,

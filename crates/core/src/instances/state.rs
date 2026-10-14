@@ -83,6 +83,9 @@ pub struct InstanceRuntime {
     /// Why the state is what it is (Task 26): see `InstanceView::note`. Cleared when a PAT is
     /// stored.
     pub note: Option<String>,
+    /// Bumped by every in-place change ([`InstanceTable::update`]); kept across a rebuild. A
+    /// rebuild that finds it newer than in its snapshot keeps that change (M3 M-14).
+    pub state_epoch: u64,
 }
 
 impl InstanceRuntime {
@@ -109,6 +112,7 @@ impl InstanceRuntime {
             expires_at: None,
             pending_url_change: None,
             note: None,
+            state_epoch: 0,
         }
     }
 }
@@ -323,10 +327,36 @@ impl InstanceTable {
         (table, changes)
     }
 
-    /// Changes one instance in place (a PAT was stored, its state moved).
+    /// Changes one instance in place (a PAT was stored, its state moved) and bumps its epoch.
     pub(crate) fn update(&mut self, id: &str, f: impl FnOnce(&mut InstanceRuntime)) {
         if let Some(i) = self.list.iter_mut().find(|i| i.id.as_deref() == Some(id)) {
             f(i);
+            i.state_epoch += 1;
+        }
+    }
+
+    /// M3 M-14: this table was derived from a snapshot of `current`; an instance that changed in
+    /// `current` since that snapshot (a newer `state_epoch`, e.g. a re-check that set
+    /// `needs_token`) keeps that change, unless the rebuild moved it out of the token states
+    /// (insecure scheme, unconfirmed) or to another origin: those are the file's and the audit
+    /// settings' to decide, and a token state of the old origin says nothing about the new one.
+    /// Call under the table's write lock, right before the swap.
+    pub(crate) fn keep_newer(&mut self, current: &InstanceTable) {
+        for rt in &mut self.list {
+            let Some(cur) = rt.id.as_deref().and_then(|id| current.by_id(id)) else {
+                continue;
+            };
+            if cur.state_epoch <= rt.state_epoch {
+                continue;
+            }
+            rt.state_epoch = cur.state_epoch;
+            if is_token_state(rt.state) && is_token_state(cur.state) && cur.base == rt.base {
+                rt.state = cur.state;
+                rt.note = cur.note.clone();
+                rt.identity = cur.identity.clone();
+                rt.expires_at = cur.expires_at;
+                rt.version = cur.version;
+            }
         }
     }
 
@@ -380,6 +410,14 @@ impl InstanceTable {
     }
 }
 
+/// The states a stored PAT decides (the others are the file's and the settings').
+fn is_token_state(s: InstanceState) -> bool {
+    !matches!(
+        s,
+        InstanceState::InsecureScheme | InstanceState::InstanceUnconfirmed
+    )
+}
+
 fn derive_one(
     rt: &mut InstanceRuntime,
     c: &InstanceConfig,
@@ -393,10 +431,9 @@ fn derive_one(
     let policy = ctx.settings.instances.get(&id);
     let stored_origin = policy.and_then(|p| p.origin.as_deref());
     let file_url = normalize_origin(&c.base_url_raw, ctx.allow_http);
-    rt.version = ctx
-        .previous
-        .and_then(|t| t.by_id(&id))
-        .and_then(|i| i.version);
+    let previous = ctx.previous.and_then(|t| t.by_id(&id));
+    rt.version = previous.and_then(|i| i.version);
+    rt.state_epoch = previous.map_or(0, |i| i.state_epoch);
     let origin_key = format!("instance.{id}.origin");
     // The confirmed origin is the one in force; the file only ever proposes.
     let confirmed = stored_origin.and_then(|o| normalize_origin(o, ctx.allow_http).ok());

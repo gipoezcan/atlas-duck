@@ -1136,4 +1136,7 @@ impl InstanceAdmin for SettlingInstances {
         cache_idle(&self.engine, FIELD_CACHE_WAIT).await;
         r
     }
+    async fn delete_token(&self, alias: &str) -> Result<InstanceView, AdminError> {
+        self.inner.delete_token(alias).await
+    }
 }
