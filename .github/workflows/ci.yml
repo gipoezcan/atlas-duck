@@ -653,6 +653,9 @@ jobs:
       - name: Command surface check (C.10, PD-66)
         run: node ci/check-commands.mjs
 
+      - name: Isolation hook tests (payload allowlist, 2 MiB cap)
+        run: node --test app/isolation/hook.test.mjs
+
       - name: No panic macros in core, atlassian, audit; cover-minting tripwire (§7.7)
         run: node ci/check-no-panic-macros.mjs
 

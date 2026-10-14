@@ -101,6 +101,7 @@ node:ci-checks:
     - node ci/check-workspace.mjs
     - node ci/check-csp.mjs
     - node ci/check-commands.mjs
+    - node --test app/isolation/hook.test.mjs
     - node --test "ci/*.test.mjs"
     - node ci/check-audit-vectors.mjs
 
