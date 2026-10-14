@@ -439,8 +439,12 @@ async fn cancel_pending_is_cancelled_by_client() -> TestResult {
     assert_eq!(detail(&env, "reason"), json!("by_client"));
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
     assert_eq!(env.data, None);
-    // The cancel races the read's fetch: bytes already sent put one `READ_FETCHED`
+    // The cancel races the read's fetch, so two interleavings are legal. Either the
+    // cancel lands mid-fetch: bytes already sent put one `READ_FETCHED`
     // (`cancelled_in_flight`, cancel.rs `cancel_plan`) before the one terminal record.
+    // Or the fetch finished first (an upstream answer, possibly a 404): its
+    // `READ_FETCHED` carries responses and no cancellation reason, then the terminal
+    // record follows. Both are accepted below; anything else still fails.
     let types = h.event_types(&id).await?;
     assert_eq!(
         types.first(),
@@ -460,8 +464,18 @@ async fn cancel_pending_is_cancelled_by_client() -> TestResult {
             .iter()
             .find(|(t, _)| *t == EventType::READ_FETCHED)
             .ok_or("no READ_FETCHED")?;
-        assert_eq!(f["outcome"], "cancelled_in_flight", "{f}");
-        assert_eq!(f["reason"], "by_client", "{f}");
+        if f["outcome"].is_null() {
+            // The fetch completed before the cancel landed: no cancellation claim,
+            // and the answer it got is recorded.
+            assert!(f["reason"].is_null(), "{f}");
+            assert!(
+                f["responses"].as_array().is_some_and(|r| !r.is_empty()),
+                "{f}"
+            );
+        } else {
+            assert_eq!(f["outcome"], "cancelled_in_flight", "{f}");
+            assert_eq!(f["reason"], "by_client", "{f}");
+        }
     }
     // Afterwards it returns the current status (§4.4).
     let again = h.handler().cancel(&id).await;
