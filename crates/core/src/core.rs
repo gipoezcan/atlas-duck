@@ -31,6 +31,7 @@ use crate::instances::state::DeriveCtx;
 use crate::instances::{CoreInstances, InstanceAdmin, InstanceState, InstanceTable};
 use crate::metadata::FieldCache;
 use crate::payloads::{self, AppStopReason, ConfigSource};
+use crate::settings::{CoreSettings, SettingsAdmin};
 use crate::similarity::SimilarityIndex;
 
 /// §2.2: the native confirmation dialog (`app`: Tauri; tests: `testing::StubConfirmer`).
@@ -217,6 +218,7 @@ pub struct Core {
     handler: Arc<CoreHandler>,
     decisions: Arc<CoreDecisions>,
     instances: Arc<CoreInstances>,
+    settings: Arc<CoreSettings>,
 }
 
 impl Core {
@@ -329,6 +331,7 @@ impl Core {
         // The composition root's one cover issuer: covers only for ids the port committed.
         let covers = CoverIssuer::new(Arc::new(StoreProbe(committed.clone())));
         let ui = deps.ui.clone();
+        let audit = deps.audit.clone();
         let (app_start_extra, pats_deleted) = (deps.app_start_extra, deps.pats_deleted);
         let engine = Arc::new(Engine::new(EngineDeps {
             port,
@@ -353,7 +356,13 @@ impl Core {
             notice: report.outcome_unknown,
             handler: Arc::new(CoreHandler::new(engine.clone())),
             decisions: Arc::new(CoreDecisions::new(engine.clone())),
-            instances: Arc::new(CoreInstances::new(engine.clone(), config_path)),
+            instances: Arc::new(CoreInstances::new(engine.clone(), config_path.clone())),
+            settings: Arc::new(CoreSettings::new(
+                engine.clone(),
+                audit,
+                config_path,
+                &config,
+            )),
             engine,
         };
         // Step 6 (PD-21): `APP_START` with the install id in `target`; then step 7 (PD-28): one
@@ -427,6 +436,12 @@ impl Core {
         self.instances.clone()
     }
 
+    /// The Settings and Audit windows' limits, attention mode, retention, legal hold, "Prune
+    /// backlog now" and "Verify now" (M6 Δ3).
+    pub fn settings(&self) -> Arc<dyn SettingsAdmin> {
+        self.settings.clone()
+    }
+
     /// The local UTC offset in minutes the similarity notice text uses (Δ6); `None` is UTC.
     pub fn set_utc_offset(&self, minutes: Option<i32>) {
         self.engine.similarity().set_utc_offset(minutes);
@@ -441,10 +456,10 @@ impl Core {
     }
 
     /// The one §2.5 shutdown path (I-40): (1) from now on every `submit` / `submit_script` is
-    /// refused `app_shutting_down` and every `InstanceAdmin` call `ShuttingDown` (other methods
-    /// keep working until the app exits); (2, 3)
-    /// every request that is not `executing` ends `cancelled` with the app's reason, a running
-    /// script is killed first; (4) writes that are `executing` are waited for, at most 60 s;
+    /// refused `app_shutting_down` and every `InstanceAdmin` and writing `SettingsAdmin` call
+    /// `ShuttingDown` (other methods keep working until the app exits); (2, 3) every request
+    /// that is not `executing` ends `cancelled` with the app's reason, a running script is
+    /// killed first; (4) writes that are `executing` are waited for, at most 60 s;
     /// (5) the head anchor is flushed and `APP_STOP` is appended. A second (concurrent or later)
     /// call changes nothing: it waits for the first to finish and returns the same report. M6
     /// exits right after this returns (a write past its 60 s may still commit after `APP_STOP`).
@@ -467,8 +482,10 @@ impl Core {
         self.engine.identity_gates().cancel_all();
         // M3 M-4: and for the admin work of the settings and credential windows: every
         // `InstanceAdmin` call is refused `ShuttingDown` from now on, the running connection
-        // tests are cancelled (they record a `cancelled` result).
+        // tests are cancelled (they record a `cancelled` result); likewise every `SettingsAdmin`
+        // call that writes (M6 Δ3).
         self.instances.work().close();
+        self.settings.work().close();
         let (why, stop) = match reason {
             ShutdownReason::Quit => (CancelWhy::AppQuit, AppStopReason::Quit),
             // The installer path cancels with the app's own reason (§8.3: `app_quit`).
@@ -502,8 +519,8 @@ impl Core {
             tracing::warn!("a token re-check was still running at APP_STOP");
         }
         let left = drain.saturating_sub(drain_began.elapsed());
-        if !admin_work_ended(&self.instances, left).await {
-            tracing::warn!("an instance admin call was still running at APP_STOP");
+        if !admin_work_ended(&self.instances, &self.settings, left).await {
+            tracing::warn!("an instance or settings admin call was still running at APP_STOP");
         }
         let app_stop_logged = crate::shutdown::stop(&self.engine, stop).await.is_ok();
         ShutdownReport {
@@ -549,10 +566,14 @@ struct StartOptions {
 /// their results and end; bounded and never blocking like `shutdown::rechecks_ended`. `false`
 /// when one is still running then (a native dialog left open: what it would do afterwards is
 /// refused, `AdminError::ShuttingDown`).
-async fn admin_work_ended(instances: &CoreInstances, bound: std::time::Duration) -> bool {
+async fn admin_work_ended(
+    instances: &CoreInstances,
+    settings: &CoreSettings,
+    bound: std::time::Duration,
+) -> bool {
     let deadline = std::time::Instant::now() + bound;
     loop {
-        if instances.work().idle() {
+        if instances.work().idle() && settings.work().idle() {
             return true;
         }
         if std::time::Instant::now() >= deadline {

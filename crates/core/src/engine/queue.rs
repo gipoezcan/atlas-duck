@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use atlas_duck_ipc::envelope::Envelope;
@@ -39,9 +40,10 @@ pub const DRY_SLOTS: usize = 2;
 /// §5.2: `candidate_cache_mb` default.
 pub const CANDIDATE_CACHE_MB: u64 = 512;
 
-/// The limits the engine runs with (§3.3, §5.2). Only `max_pending_bytes` and
-/// `candidate_cache_bytes` come from `config.toml` (`config::limits`); the rest are the spec's
-/// constants (tests scale them through `TestHooks`).
+/// The limits the engine runs with (§3.3, §5.2). Only `max_pending_bytes`,
+/// `candidate_cache_bytes` and `comments_cap` come from `config.toml` (`config::limits`); the rest
+/// are the spec's constants (tests scale them through `TestHooks`). Fixed for the run, except the
+/// comments cap: Settings changes it live ([`Admission::set_comments_cap`], PD-76).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub per_agent: u32,
@@ -52,8 +54,9 @@ pub struct Limits {
     pub candidate_cache_bytes: u64,
     /// A script's static reservation in MiB (§9.4 `max_result_mb`; Settings arrive in M6).
     pub max_result_mb: u32,
-    /// The configured `jira.issue.get --comments` cap (Δ7, PD-63; `[limits] jira_comments_cap`
-    /// from M6's Settings). `None` = the registry's `caps.comments_cap` (100).
+    /// The configured `jira.issue.get --comments` cap at start (Δ7, PD-63; `[limits]
+    /// jira_comments_cap`). `None` = the registry's `caps.comments_cap` (100). The one in force is
+    /// [`Admission::comments_cap`].
     pub comments_cap: Option<u32>,
 }
 
@@ -80,6 +83,7 @@ impl Limits {
             candidate_cache_bytes: c
                 .candidate_cache_mb
                 .map_or(d.candidate_cache_bytes, |mb| mb.saturating_mul(MIB)),
+            comments_cap: c.jira_comments_cap,
             ..d
         }
     }
@@ -174,6 +178,8 @@ fn lock(m: &Mutex<Counts>) -> MutexGuard<'_, Counts> {
 pub struct Admission {
     limits: Limits,
     counts: Arc<Mutex<Counts>>,
+    /// The comments cap in force (0 = `None`): `limits.comments_cap` until Settings changes it.
+    comments_cap: AtomicU32,
 }
 
 impl Admission {
@@ -181,11 +187,24 @@ impl Admission {
         Admission {
             limits,
             counts: Arc::new(Mutex::new(Counts::default())),
+            comments_cap: AtomicU32::new(limits.comments_cap.unwrap_or(0)),
         }
     }
 
+    /// The limits of the run as started (the comments cap in force is [`Self::comments_cap`]).
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The configured `jira.issue.get --comments` cap in force; `None` = the registry's.
+    pub fn comments_cap(&self) -> Option<u32> {
+        Some(self.comments_cap.load(Ordering::SeqCst)).filter(|n| *n > 0)
+    }
+
+    /// PD-76: a Settings change of `jira_comments_cap` applies to every request validated from
+    /// now on (the caller logged it first).
+    pub fn set_comments_cap(&self, cap: Option<u32>) {
+        self.comments_cap.store(cap.unwrap_or(0), Ordering::SeqCst);
     }
 
     /// Counts the request in, or refuses with [`Busy`] (one answer for every limit kind, L44).

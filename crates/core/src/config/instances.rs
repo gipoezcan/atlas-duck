@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use atlas_duck_registry::Product;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
-use super::{CONFIG_SCHEMA_HEAD, Config, ConfigState, ConfigWriteError, load_config, save_config};
+use super::{ConfigState, ConfigWriteError, load_config, save_config, writable};
 use crate::ids::InstanceId;
 use crate::proxy::ProxySetting;
 
@@ -285,20 +285,6 @@ fn to_table(inst: &InstanceConfig) -> Table {
         t.insert("default", value(true));
     }
     t
-}
-
-/// The writable config at `path`, or a new empty one when the file is absent.
-fn writable(path: &Path) -> Result<Config, ConfigWriteError> {
-    match load_config(path)? {
-        ConfigState::Writable(c) => Ok(c),
-        ConfigState::Absent => Ok(Config {
-            schema_version: CONFIG_SCHEMA_HEAD,
-            written_by: None,
-            doc: DocumentMut::new(),
-        }),
-        ConfigState::ReadOnly { .. } => Err(ConfigWriteError::ReadOnly),
-        ConfigState::Unreadable { .. } => Err(ConfigWriteError::Unreadable),
-    }
 }
 
 /// Appends `inst` as a new `[[instances]]` table (the caller validated it: alias unique, id set,

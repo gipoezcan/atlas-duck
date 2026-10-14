@@ -19,6 +19,7 @@ pub mod instances;
 pub mod limits;
 mod migrate;
 pub mod requests;
+pub mod ui;
 
 use std::ffi::OsString;
 use std::fmt;
@@ -256,6 +257,35 @@ pub fn save_config(path: &Path, config: &Config) -> Result<(), ConfigWriteError>
     stamp(&mut doc, CONFIG_SCHEMA_HEAD);
     write_atomic(path, doc.to_string().as_bytes())?;
     Ok(())
+}
+
+/// The writable config at `path`, or a new empty one when the file is absent.
+pub(crate) fn writable(path: &Path) -> Result<Config, ConfigWriteError> {
+    match load_config(path)? {
+        ConfigState::Writable(c) => Ok(c),
+        ConfigState::Absent => Ok(Config {
+            schema_version: CONFIG_SCHEMA_HEAD,
+            written_by: None,
+            doc: DocumentMut::new(),
+        }),
+        ConfigState::ReadOnly { .. } => Err(ConfigWriteError::ReadOnly),
+        ConfigState::Unreadable { .. } => Err(ConfigWriteError::Unreadable),
+    }
+}
+
+/// Reads `path` again, lets `edit` change the document (additive keys, §7.7) and writes it with
+/// [`save_config`]. A read-only or unreadable file is never written; an `edit` that returns
+/// `Err` writes nothing.
+pub fn update_config<E>(
+    path: &Path,
+    edit: impl FnOnce(&mut DocumentMut) -> Result<(), E>,
+) -> Result<Result<(), E>, ConfigWriteError> {
+    let mut config = writable(path)?;
+    if let Err(e) = edit(&mut config.doc) {
+        return Ok(Err(e));
+    }
+    save_config(path, &config)?;
+    Ok(Ok(()))
 }
 
 enum Inspected {

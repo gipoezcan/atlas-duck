@@ -52,6 +52,8 @@ pub mod proxy;
 pub mod reconcile;
 /// Redaction engine: drops with copies and mirrors, masks in the canonical match form (§5.3).
 pub mod redact;
+/// `SettingsAdmin` (M6 Δ3): limits, attention mode, retention, legal hold, prune, verify now.
+pub mod settings;
 /// The shutdown sweep (§2.5 steps 2-5, I-40).
 pub(crate) mod shutdown;
 /// The "possible duplicate" and "similar request" flags and their RF-4 seeding (§5.6, L45).
@@ -69,6 +71,7 @@ pub use crate::core::{
 #[cfg(feature = "testing")]
 pub use crate::core::{HookPoint, Pause, TestHooks};
 pub use atlas_duck_preview::CandidateRev;
+pub use config::ui::AttentionMode;
 pub use credentials::KeychainCredentials;
 pub use decision::{
     BatchFailure, BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionKind,
@@ -88,3 +91,7 @@ pub use instances::{
 };
 pub use ops::{OpImpl, op_table};
 pub use redact::{DropScope, RedactionOp, RedactionPreset, UrlMode};
+pub use settings::{
+    ConfigBanner, LimitsView, PruneReport, SettingChangeReq, SettingsAdmin, SettingsError,
+    SettingsView, StoreHealthView, VerifyNow,
+};

@@ -1,9 +1,10 @@
 //! Typed `[limits]` accessors for `config.toml` (§5.2 memory budget, Settings).
 //!
 //! Keys: `max_pending_bytes_mb` (the optional admission cap on the sum of static reservations;
-//! absent = off) and `candidate_cache_mb` (the candidate LRU; absent = 512). Both are whole MiB in
-//! `1..=MAX_LIMIT_MB`. The pending-count limits (32 per agent key, 256 total, §3.3) and the 8
-//! fetch slots are fixed by the spec and have no key.
+//! absent = off) and `candidate_cache_mb` (the candidate LRU; absent = 512), both whole MiB in
+//! `1..=MAX_LIMIT_MB`; `jira_comments_cap` (the `jira.issue.get --comments` cap, PD-63; absent =
+//! the registry's 100), a count in `COMMENTS_CAP_RANGE` (M6 Δ6). The pending-count limits (32
+//! per agent key, 256 total, §3.3) and the 8 fetch slots are fixed by the spec and have no key.
 //!
 //! A malformed value makes the table an error naming the key, never echoing the value; the core
 //! then runs with the defaults (fail safe: the defaults are the spec's limits).
@@ -20,14 +21,19 @@ pub const KEY_LIMITS: &str = "limits";
 pub const KEY_MAX_PENDING_BYTES_MB: &str = "max_pending_bytes_mb";
 /// §5.2: the candidate LRU size, in MiB.
 pub const KEY_CANDIDATE_CACHE_MB: &str = "candidate_cache_mb";
-/// The largest accepted value of either key (1 TiB): bounds the MiB-to-bytes product.
+/// PD-63: the `jira.issue.get --comments` cap.
+pub const KEY_JIRA_COMMENTS_CAP: &str = "jira_comments_cap";
+/// The largest accepted value of either MiB key (1 TiB): bounds the MiB-to-bytes product.
 pub const MAX_LIMIT_MB: u64 = 1 << 20;
+/// PD-63: the accepted `jira_comments_cap` values.
+pub const COMMENTS_CAP_RANGE: std::ops::RangeInclusive<u32> = 1..=1000;
 
 /// What `[limits]` says; `None` = the key is absent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LimitsConfig {
     pub max_pending_bytes_mb: Option<u64>,
     pub candidate_cache_mb: Option<u64>,
+    pub jira_comments_cap: Option<u32>,
 }
 
 /// Why `[limits]` cannot be used. No value from the file is echoed.
@@ -66,6 +72,20 @@ fn mb(item: Option<&Item>, key: &'static str) -> Result<Option<u64>, LimitsError
         })
 }
 
+fn comments_cap(item: Option<&Item>) -> Result<Option<u32>, LimitsError> {
+    let Some(item) = item else {
+        return Ok(None);
+    };
+    item.as_integer()
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|v| COMMENTS_CAP_RANGE.contains(v))
+        .map(Some)
+        .ok_or(LimitsError::Malformed {
+            key: KEY_JIRA_COMMENTS_CAP,
+            reason: "must be a whole number of comments from 1 to 1000",
+        })
+}
+
 /// The `[limits]` keys; all `None` for an absent or unreadable config or a missing table.
 pub fn limits_config(cfg: &ConfigState) -> Result<LimitsConfig, LimitsError> {
     let doc = match cfg {
@@ -84,5 +104,6 @@ pub fn limits_config(cfg: &ConfigState) -> Result<LimitsConfig, LimitsError> {
             KEY_MAX_PENDING_BYTES_MB,
         )?,
         candidate_cache_mb: mb(table.get(KEY_CANDIDATE_CACHE_MB), KEY_CANDIDATE_CACHE_MB)?,
+        jira_comments_cap: comments_cap(table.get(KEY_JIRA_COMMENTS_CAP))?,
     })
 }

@@ -917,11 +917,11 @@ impl Engine {
         }
     }
 
-    /// The caps validation applies (§7.5, Δ7): the configured comments cap from the limits;
-    /// configured `max` hard caps arrive with M6's Settings.
+    /// The caps validation applies (§7.5, Δ7): the comments cap in force (Settings change it
+    /// live, PD-76).
     pub(crate) fn effective_caps(&self) -> EffectiveCaps {
         EffectiveCaps {
-            comments_cap: self.limits().comments_cap,
+            comments_cap: self.admission.comments_cap(),
             ..EffectiveCaps::default()
         }
     }
