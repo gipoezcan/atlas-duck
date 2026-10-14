@@ -370,9 +370,9 @@ pub fn url_hash(u: &NormalizedBaseUrl) -> UrlHash;
 pub fn username_matches(header: &str, stored: &str) -> bool;      // the one Jira username comparison (§7.2): trim, %XX-decode only if present, NFC, simple case folding, `anonymous` never matches
 
 pub struct AuditCover { /* private ctor */ }                      // proof of a committed REQUEST_RECEIVED / SCRIPT_STARTED / SYSTEM_FETCH start record
-pub struct WriteCover { /* private ctor */ }                       // [M5 Δ6] proof of a committed WRITE_APPROVED for (request_id, candidate counter); M3 final review M-18
+pub struct WriteCover { /* private ctor */ }                       // [M5 Δ6] proof of a committed WRITE_APPROVED for (request_id, candidate counter); M3 final review M-18. Not Clone/Default/Deserialize; getters `request_id()`, `candidate_counter()`; consumed by one `send_approved` (T20 review m1)
 pub trait CommitProbe: Send + Sync { fn request_committed(&self, request_id: &str) -> bool; fn system_fetch_started(&self, fetch_id: &str) -> bool;
-    fn write_approved(&self, request_id: &str, candidate_counter: u64) -> bool; }   // [M5 Δ6] `core::audit_port` marks (request_id, counter) only after the WRITE_APPROVED append returned Ok
+    fn write_approved(&self, request_id: &str, candidate_counter: u64) -> bool; }   // [M5 Δ6] `true` only while `candidate_counter` is the write's LATEST committed approval (see the note below the block)
 pub struct CoverIssuer; impl CoverIssuer { pub fn new(p: Arc<dyn CommitProbe>) -> Self;
     pub fn for_request(&self, request_id: &str) -> Result<AuditCover, NotCommitted>;
     pub fn for_system_fetch(&self, fetch_id: &str) -> Result<AuditCover, NotCommitted>;
@@ -384,12 +384,12 @@ impl InstanceClient {
     pub async fn get(&self, cover: &AuditCover, call: &GetCall) -> FetchOutcome;                         // GET only
     pub async fn read_paginated(&self, cover: &AuditCover, call: &PagedCall, budget: &ReadBudget) -> PagedOutcome; // offset pagination rebuilt from the template; 32 MiB/response, 50 MiB total, 120 s
     pub async fn post_search(&self, cover: &AuditCover, call: &SearchCall) -> FetchOutcome;               // the one allowlisted POST outside write execution (jira.search)
-    pub async fn send_approved(&self, cover: &WriteCover, w: &ApprovedWrite) -> WriteOutcome;             // sends only the requests of `w.requests`, in index order, 60 s each, and compares every outgoing request byte for byte (method, resolved URL, Content-Type, body) with its list entry before writing it
+    pub async fn send_approved(&self, cover: WriteCover, w: &ApprovedWrite) -> WriteOutcome;              // [M5 Δ6] the cover by value, and only for `w` (same request_id and candidate_counter, else `RefusedMismatch`, nothing sent); sends only the requests of `w.requests`, in index order, 60 s each, and compares every outgoing request byte for byte (method, resolved URL, Content-Type, body) with its list entry before writing it
 }
 pub struct HttpRequestSpec { pub index: u32, pub method: String, pub resolved_url: String, pub content_type: Option<String>, pub body: Vec<u8> }   // [named-by-plan]; the five §5.1 inv. 3 fields
 pub enum ExpectedBody { Json, Empty }
 pub struct SuccessExpectation { pub statuses: Option<Vec<u16>> /* None = any 2xx */, pub body: ExpectedBody }   // `core` copies it from the registry `SuccessShape`; `atlassian` has no `registry` edge
-pub struct ApprovedWrite { pub requests: Vec<HttpRequestSpec>, pub success: SuccessExpectation }   // no hash here: `atlassian` cannot depend on `audit`; `core` recomputes `audit::request_set_hash` from this list and compares it with the `WRITE_APPROVED` value immediately before `send_approved`
+pub struct ApprovedWrite { pub request_id: String, pub candidate_counter: u64 /* [M5 Δ6] the approval it was approved by */, pub requests: Vec<HttpRequestSpec>, pub success: SuccessExpectation }   // no hash here: `atlassian` cannot depend on `audit`; `core` recomputes `audit::request_set_hash` from this list and compares it with the `WRITE_APPROVED` value immediately before `send_approved`
 pub struct GetCall { pub endpoint_template: String, pub params: serde_json::Value }              // `core` copies the template string from `registry` data
 pub struct PagedCall { pub get: GetCall, pub items_key: String, pub offset_param: String, pub limit_param: String, pub page_size: u32, pub start: u64 }   // items_key and param names from `registry::PageSpec`; `start` = the agent's `start` [2026-10-08 M3 PD-07]
 pub struct PagedOutcome { pub pages: Vec<UpstreamResponse> /* every complete page, in order */, pub items_fetched: u64, pub end: PageEnd, pub failure: Option<FetchFailure> /* ended paging early; its bytes inside */, pub next_start: Option<u64> /* §7.5 server arithmetic */, pub server_total: Option<u64> }   // [M3 PD-07] named but undefined before
@@ -416,6 +416,19 @@ pub enum WriteOutcome { Executed { response: UpstreamResponse, server_user: Opti
     RefusedMismatch { request_index: u32 }, NotSent { reason: NotSentReason } }   // additive [M3 PD-07]: an outgoing request differed from its list entry (nothing written); nothing of the request left. [M3 Task 10] `NotSentReason { Connection(ConnClass), BudgetExpired, Cancelled }`, `UnknownReason` gains `Cancelled`
 ```
 `atlassian` is a leaf: it has no workspace dependency at all (not `audit`, `core`, `ipc` and not `registry`). Endpoint templates, param schemas, `success` shapes and `result_projection` are registry data that only `core` reads: `core` hands `atlassian` the endpoint template string inside `GetCall`/`PagedCall`/`SearchCall` and the expected success shape inside `ApprovedWrite`, and applies `result_projection` to the returned `UpstreamResponse`; `atlassian` builds the URL from the template under the configured base URL including its context path and never follows `_links.next`. `core` recomputes `audit::request_set_hash` over the `HttpRequestSpec` list immediately before `send_approved` and refuses to send if it differs from the hash stored in `WRITE_APPROVED`; `atlassian` only guarantees that what it writes equals the list it was given.
+
+[M5 Δ6, as built in T20 and its review fix] The write cover:
+- **Inside `atlassian`.** Every crate-internal send target carries the proof of its own kind. A read target (`GET`, the allowlisted search `POST`) carries its `&AuditCover`, and the approved-write target carries its `&WriteCover`. There is no separate proof argument, so no code in the crate can send an approved write under a request cover. `send_approved(_ctl)` takes the `WriteCover` by value: one cover, one send. The §5.4 step 6 pre-send retry and the 429 retries inside that call are the same send and borrow the cover. Each new execution in `core` mints a new cover. Before anything is built, the cover's `(request_id, candidate_counter)` must equal the `ApprovedWrite`'s; otherwise the result is `RefusedMismatch`, and `core` records it as `WRITE_FAILED request_mismatch`.
+- **Latest-approval semantics.** `core::audit_port::CommittedSet` keeps, per write, the counter of its latest committed `WRITE_APPROVED`. A later approval replaces it. `write_approved(id, n)` also requires the request's start record to be committed.
+- **The forget rule.** `Engine::after_change` forgets a write's mark whenever the write is not in `StaleCheck`/`Executing`. That covers a return to the queue, an approval whose step was refused after its commit, and the terminal state. Only writes are checked; `forget_request` at any terminal state clears the mark as well. A returned write has no cover until its next `WRITE_APPROVED` commits.
+- **Marking.** `core::audit_port::commit_records(port, set, evs)` (crate-private; tests use `core::testing::commit_records`) is the only marker. It appends a transition's records: one `append` for one record, else one `append_batch`. Only on `Ok` does it mark `(request_id, candidate_rev.counter)` of every `WRITE_APPROVED` among them. A `WRITE_APPROVED` without either refuses the whole call (`Invalid`). Single approvals (`transition_gated`) and batch approvals (`commit_batch`) both append through it. `Engine::committed()` is crate-private too.
+- **The mint.** `core::engine::write::execute` is the only `for_write` caller. It mints right before `send_approved_ctl`. A refusal records `WRITE_FAILED {internal, class: write_cover_refused}` and sends nothing. The set is in memory only, so no write approved before a restart can be sent after it.
+- **Tripwire.** `ci/check-no-panic-macros.mjs` enforces these rules outside test code:
+  - The identifier `for_write` appears only in the body of `engine/write.rs`'s `fn execute`, and in `cover.rs` only as its definition. This catches a call, a function value, or the name passed to a macro.
+  - `CoverIssuer::new`, called or named, appears only in `core.rs` with `Arc::new(StoreProbe(..))`, and in `cover.rs`.
+  - `CommitProbe` and `AuditPort` impls appear only in `audit_port.rs`.
+  - A `WriteCover` literal, and any impl of `WriteCover` or `CoverIssuer`, appears only in `cover.rs`.
+  - Cover types are not renamed: no `use .. as` and no `type X = ..`.
 
 ### C.5 `convert` (M5, M7) and C.6 `preview` (M3, M5–M7)
 
