@@ -9,5 +9,6 @@
 pub const COMMANDS: &[&str] = &[
     "app_status",
     "open_window",
+    "preview_fetch",
     "quit",
 ];

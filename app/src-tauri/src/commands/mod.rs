@@ -10,6 +10,7 @@
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod approvals;
 mod blocking;
 #[cfg(feature = "scripted-approver")]
 pub mod capture;
@@ -37,6 +38,7 @@ use dto::{AppStatusArgs, Args, StatusLineDto};
 pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         app_status,
+        approvals::preview_fetch,
         window::open_window,
         window::quit
     ])

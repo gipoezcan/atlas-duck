@@ -322,3 +322,46 @@ fn s16_tauri_capture_records_every_response_and_event() -> TestResult {
     assert_eq!(cap.dropped(Channel::TauriEvent), 0);
     Ok(())
 }
+
+/// M6 T10 (Δ1): `preview_fetch` is granted to `approvals` only; its body is checked before the
+/// handler, and without a serving core it answers `not_ready`.
+#[test]
+fn preview_fetch_granted_to_approvals_only() -> TestResult {
+    let app = app()?;
+    let id = format!("req_{}", "a".repeat(24));
+    let approvals = window(&app, "approvals")?;
+    assert_eq!(
+        invoke(&approvals, "preview_fetch", json!({ "request_id": id })),
+        Err(json!({"kind": "not_ready"}))
+    );
+    assert_eq!(
+        invoke(
+            &approvals,
+            "preview_fetch",
+            json!({ "request_id": "req_x" })
+        ),
+        Err(json!({"kind": "invalid_argument", "field": "request_id"}))
+    );
+    for label in [
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "credential",
+        "setup",
+    ] {
+        let refused = invoke(
+            &window(&app, label)?,
+            "preview_fetch",
+            json!({ "request_id": id }),
+        );
+        assert!(
+            refused
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.get("kind").is_none()),
+            "{label}: {refused:?}"
+        );
+    }
+    Ok(())
+}
