@@ -15,5 +15,15 @@ fn main() {
             "cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
         );
     }
-    tauri_build::build();
+    // M6 T3: the app manifest is the command list (`allow-<command>` / `deny-<command>`), so a
+    // command outside every capability is refused by Tauri's ACL, and the manifest and
+    // `commands::register` cannot drift (Task 4's checker compares both with the capabilities).
+    println!("cargo:rerun-if-changed=src/commands/names.rs");
+    let attributes = tauri_build::Attributes::new()
+        .app_manifest(tauri_build::AppManifest::new().commands(COMMANDS));
+    if let Err(e) = tauri_build::try_build(attributes) {
+        panic!("tauri-build failed: {e:#}");
+    }
 }
+
+include!("src/commands/names.rs");

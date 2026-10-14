@@ -1,0 +1,1353 @@
+[
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "kind": "json_tree",
+      "tree": {
+        "entries": [
+          [
+            "key",
+            {
+              "kind": "string",
+              "text": "PROJ-1"
+            }
+          ],
+          [
+            "list",
+            {
+              "items": [
+                {
+                  "kind": "null"
+                },
+                {
+                  "kind": "number",
+                  "text": "1.5"
+                }
+              ],
+              "kind": "array",
+              "size": 10
+            }
+          ],
+          [
+            "n",
+            {
+              "kind": "number",
+              "text": "2"
+            }
+          ],
+          [
+            "ok",
+            {
+              "kind": "bool",
+              "value": true
+            }
+          ]
+        ],
+        "kind": "object",
+        "size": 50
+      }
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "read",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "kind": "write_requests",
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ]
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "error_messages_text": "Field 'summary' is required.",
+      "kind": "upstream_error",
+      "status": 400
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "read",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "kind": "outcome",
+      "outcome": "release_cap16",
+      "query": "project = PROJ",
+      "size_or_pages": "17 MiB"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "read",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "kind": "enrichment_error",
+      "outcome": null,
+      "status": 404,
+      "text": "Issue does not exist"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "candidates": [
+        "jdoe",
+        "jdoe2"
+      ],
+      "kind": "unresolved_name",
+      "matches": 2,
+      "param": "assignee",
+      "value": "J. Doe"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "diff_text": "- old\n+ new\n",
+      "kind": "conflict",
+      "summary": "the issue changed since the preview"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "class": "network",
+      "kind": "could_not_recheck",
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ]
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "card": {
+        "assignee": null,
+        "issue_type": "Bug",
+        "key": "PROJ-1",
+        "priority": "High",
+        "reporter": "jdoe",
+        "status": "Open",
+        "summary": "Fix the thing"
+      },
+      "comments": [
+        {
+          "author": "jdoe",
+          "body_html": "<p>a comment</p>",
+          "created": "2026-10-14T10:00:00.000+0000",
+          "id": "10000",
+          "restricted": true
+        }
+      ],
+      "description_html": "<p>sanitized</p>",
+      "fields": [
+        {
+          "id": "customfield_10001",
+          "name": "customfield_10001 (unknown field)",
+          "restricted": false,
+          "value_text": "42"
+        }
+      ],
+      "kind": "jira_issue"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "read",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "columns": [
+        "Key",
+        "Summary"
+      ],
+      "count": {
+        "more_available": false,
+        "shown": 1,
+        "total": null
+      },
+      "kind": "table",
+      "rows": [
+        [
+          "PROJ-1",
+          "Fix the thing"
+        ]
+      ]
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "read",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "constructs": {
+        "attachments": [
+          "a.txt"
+        ],
+        "images": [],
+        "includes": [],
+        "links": [
+          "https://example.com"
+        ],
+        "macros": [
+          "code"
+        ],
+        "mentions": [
+          "jdoe"
+        ]
+      },
+      "kind": "write_summary",
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ],
+      "rows": [
+        [
+          "Summary",
+          "Fix the thing"
+        ]
+      ],
+      "sentence": "Create a Bug in PROJ"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "kind": "edit_diff",
+      "raw": [
+        {
+          "op": "add",
+          "text": "h1. new"
+        }
+      ],
+      "raw_only_changes": 1,
+      "rendered": [
+        {
+          "op": "field",
+          "text": "Description"
+        },
+        {
+          "op": "same",
+          "text": "same\n"
+        },
+        {
+          "op": "del",
+          "text": "old \r\n"
+        },
+        {
+          "op": "add",
+          "text": "new"
+        }
+      ],
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ]
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "constructs": null,
+      "fields": [
+        [
+          "Resolution",
+          "Fixed"
+        ]
+      ],
+      "from": "Open",
+      "kind": "transition",
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ],
+      "to": "Resolved",
+      "transition": "Resolve (5)"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ]
+    },
+    "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  }
+]

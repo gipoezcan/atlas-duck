@@ -1,7 +1,8 @@
 //! The capture hook (PD-12, S-16 core half): every `Envelope` the `RequestHandler` returns, every
 //! `ProgressNotification`, every `UiEvent` and every value `DecisionApi` / `InstanceAdmin` return
 //! is recorded as the JSON the outside world would get, so canary sweeps can search one place.
-//! M6 wraps its Tauri command layer around the same recorder.
+//! M6 wraps its Tauri command layer around the same recorder (`Channel::TauriCommand`,
+//! `Channel::TauriEvent`, recorded by `atlas-duck-app`'s `commands::capture`).
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -29,6 +30,10 @@ pub enum Channel {
     UiEvent,
     Decision,
     Instance,
+    /// M6 (Δ7, S-16 Tauri half): every Tauri command response as the webview receives it.
+    TauriCommand,
+    /// M6 (Δ7, S-16 Tauri half): every Tauri event the app emits, `{event, payload}`.
+    TauriEvent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

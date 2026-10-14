@@ -91,6 +91,8 @@ atlas-duck-audit = { path = "../../crates/audit", features = ["testing"] }
 atlas-duck-atlassian = { path = "../../crates/atlassian", features = ["testing"] }
 # T22: the cli_flows harness (mock servers, spawned binaries, product ids).
 atlas-duck-registry = { path = "../../crates/registry" }
+# M6 T3: `dto_fixtures` builds one `Preview` per `PreviewBody` variant.
+atlas-duck-preview = { path = "../../crates/preview" }
 # `io-util`: the T23 flows read a spawned CLI's stderr line by line and write its stdin. `net`: the
 # T25 squatter pipe (Windows named pipes).
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util", "net"] }

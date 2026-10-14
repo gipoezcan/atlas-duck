@@ -1,0 +1,68 @@
+[
+  {
+    "field": "reason",
+    "kind": "invalid_argument"
+  },
+  {
+    "kind": "not_found"
+  },
+  {
+    "kind": "not_ready"
+  },
+  {
+    "error": {
+      "current": {
+        "candidate_hash": "abababababababababababababababababababababababababababababababab",
+        "counter": 2
+      },
+      "kind": "stale"
+    },
+    "kind": "decision"
+  },
+  {
+    "error": {
+      "kind": "invalid",
+      "reason": "not_opened"
+    },
+    "kind": "decision"
+  },
+  {
+    "error": {
+      "failed": [
+        [
+          "req_0123456789abcdefghij",
+          "stale"
+        ]
+      ],
+      "kind": "batch_rejected"
+    },
+    "kind": "decision"
+  },
+  {
+    "error": {
+      "kind": "cancelled"
+    },
+    "kind": "decision"
+  },
+  {
+    "error": {
+      "kind": "not_decidable"
+    },
+    "kind": "decision"
+  },
+  {
+    "error": {
+      "kind": "not_found"
+    },
+    "kind": "admin"
+  },
+  {
+    "error": {
+      "kind": "cancelled"
+    },
+    "kind": "admin"
+  },
+  {
+    "kind": "internal"
+  }
+]

@@ -1,0 +1,12 @@
+[
+  {
+    "id": "locked_refused",
+    "level": "caution",
+    "text": "Locked — 3 requests refused"
+  },
+  {
+    "id": "needs_attention",
+    "level": "info",
+    "text": "2 need attention"
+  }
+]

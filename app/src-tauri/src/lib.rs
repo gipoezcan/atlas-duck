@@ -6,6 +6,7 @@
 #[cfg(all(feature = "scripted-approver", not(debug_assertions)))]
 compile_error!("scripted-approver must never reach a release build");
 
+pub mod commands;
 pub mod compose;
 pub mod confirm;
 pub mod diag;
@@ -15,6 +16,7 @@ pub mod secret_service;
 pub mod serve;
 pub mod startup;
 pub mod state;
+pub mod status;
 #[cfg(feature = "scripted-approver")]
 pub mod testing;
 pub mod tray;
@@ -53,12 +55,20 @@ pub fn run_gui(background: bool) -> ! {
     #[cfg(feature = "scripted-approver")]
     testing::scope_identifier(context.config_mut());
 
-    // single-instance first (research A0/F18), then autostart; the dialog plugin after them.
-    let app = match tray::register_plugins(tauri::Builder::default())
+    // single-instance first (research A0/F18), then autostart; the dialog plugin after them. The
+    // command list (M6 T3) is the app manifest's (`build.rs`); no capability grants one yet.
+    let app = match commands::register(tray::register_plugins(tauri::Builder::default()))
         // The dialog plugin serves Rust-side error dialogs only. The capability set is
         // empty (§10.3), so no webview can call its commands.
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
+            // S-16 (test build only): command responses and event payloads are recorded.
+            #[cfg(feature = "scripted-approver")]
+            commands::capture::install(
+                app.handle(),
+                atlas_duck_core::testing::capture::Capture::new(),
+            );
+
             // macOS menu-bar app, no Dock icon (§2.5).
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);

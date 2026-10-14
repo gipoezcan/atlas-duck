@@ -6,15 +6,18 @@ use std::sync::Arc;
 
 use atlas_duck_core::{AttentionKind, UiEvent, UiSink};
 use serde_json::{Value, json};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 /// The seam between the sink and Tauri: tests record instead of emitting.
 pub trait EventOut: Send + Sync {
     fn emit(&self, name: &str, payload: Value);
 }
 
-impl EventOut for AppHandle {
+impl<R: Runtime> EventOut for AppHandle<R> {
     fn emit(&self, name: &str, payload: Value) {
+        // S-16 (test build only): every payload the webviews could receive is recorded.
+        #[cfg(feature = "scripted-approver")]
+        crate::commands::capture::event(self, name, &payload);
         // A failed emit (no webview, app closing) must not disturb the core.
         let _ = Emitter::emit(self, name, payload);
     }
@@ -56,7 +59,7 @@ pub struct TauriUiSink {
 }
 
 impl TauriUiSink {
-    pub fn new(app: AppHandle, tee: Option<Arc<dyn UiSink>>) -> TauriUiSink {
+    pub fn new<R: Runtime>(app: AppHandle<R>, tee: Option<Arc<dyn UiSink>>) -> TauriUiSink {
         TauriUiSink::with_out(Arc::new(app), tee)
     }
 

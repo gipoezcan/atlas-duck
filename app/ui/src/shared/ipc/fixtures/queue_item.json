@@ -1,0 +1,30 @@
+[
+  {
+    "age_s": 12,
+    "agent_name": "claude-code",
+    "agent_unverified": true,
+    "approvable": true,
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "caution_count": 1,
+    "class": "read",
+    "instance_alias": "work",
+    "op_id": "jira.issue.get",
+    "opened": false,
+    "possible_duplicate_of": "req_abcdefghij0123456789",
+    "reason_excerpt": "look up the ticket",
+    "request_id": "req_0123456789abcdefghij",
+    "session": {
+      "agent_name": "claude-code",
+      "connection_id": null,
+      "cwd_basename": "atlas-duck",
+      "peer_origin_exe": null
+    },
+    "similar_to": null,
+    "stale": false,
+    "target_display": "PROJ-1",
+    "unusual": false
+  }
+]
