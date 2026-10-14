@@ -3,7 +3,7 @@
     "also_appears_in": [
       "fields.description"
     ],
-    "approvable": true,
+    "approvable": false,
     "body": {
       "kind": "json_tree",
       "tree": {
@@ -54,6 +54,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": null,
     "header": {
       "bidi_controls": 0,
@@ -76,7 +78,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": "release blocked: the candidate could not be rebuilt exactly (internal); only Deny remains"
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -140,6 +143,17 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [
+      {
+        "has_optional_detail": true,
+        "kind": "upstream_http"
+      },
+      {
+        "has_optional_detail": false,
+        "kind": "outcome_hint"
+      }
+    ],
+    "deny_prefill": null,
     "edit_form": {
       "inputs": [
         {
@@ -202,7 +216,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -237,6 +252,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": null,
     "header": {
       "bidi_controls": 0,
@@ -259,7 +276,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -295,6 +313,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": null,
     "header": {
       "bidi_controls": 0,
@@ -317,7 +337,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -353,6 +374,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": {
       "inputs": [
         {
@@ -415,7 +438,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -455,6 +479,13 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [
+      {
+        "has_optional_detail": true,
+        "kind": "resolution_failed"
+      }
+    ],
+    "deny_prefill": null,
     "edit_form": {
       "inputs": [
         {
@@ -517,7 +548,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -552,6 +584,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": "target changed since you read it; re-read and resubmit",
     "edit_form": {
       "inputs": [
         {
@@ -614,7 +648,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -679,6 +714,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": {
       "inputs": [
         {
@@ -741,7 +778,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -801,6 +839,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": null,
     "header": {
       "bidi_controls": 0,
@@ -823,7 +863,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -871,6 +912,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": null,
     "header": {
       "bidi_controls": 0,
@@ -893,7 +936,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -980,6 +1024,13 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [
+      {
+        "has_optional_detail": false,
+        "kind": "missing_fields"
+      }
+    ],
+    "deny_prefill": null,
     "edit_form": {
       "inputs": [
         {
@@ -1042,7 +1093,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -1131,6 +1183,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": {
       "inputs": [
         {
@@ -1193,7 +1247,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {
@@ -1267,6 +1322,8 @@
       "candidate_hash": "abababababababababababababababababababababababababababababababab",
       "counter": 2
     },
+    "deny_offers": [],
+    "deny_prefill": null,
     "edit_form": {
       "inputs": [
         {
@@ -1329,7 +1386,8 @@
       "query": null,
       "receipt_fields": [
         "key"
-      ]
+      ],
+      "release_blocked": null
     },
     "preview_builder_version": "pb1;icu-17.0;emoji-17.0",
     "raw": {

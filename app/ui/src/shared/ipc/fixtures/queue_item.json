@@ -16,12 +16,8 @@
     "possible_duplicate_of": "req_abcdefghij0123456789",
     "reason_excerpt": "look up the ticket",
     "request_id": "req_0123456789abcdefghij",
-    "session": {
-      "agent_name": "claude-code",
-      "connection_id": null,
-      "cwd_basename": "atlas-duck",
-      "peer_origin_exe": null
-    },
+    "session_id": "1fc6d5518a52f83299c336bd39bd6395aa991ff91819276f1084604eed831c88",
+    "session_label": "claude-code · atlas-duck",
     "similar_to": null,
     "stale": false,
     "target_display": "PROJ-1",

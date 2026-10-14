@@ -11,19 +11,21 @@ use atlas_duck_app_lib::commands::CommandError;
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
+use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, BatchFailure, BatchOutcome, CandidateRev, ConnectionFailure, DecisionError,
-    DecisionOutcome, QueueItem, SessionKey,
+    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, SessionKey,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
 use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    BodyView, CommentView, ConstructList, FieldRow, IssueCard, ItemCount, OutcomeKind,
-    PREVIEW_BUILDER_VERSION, Preview, PreviewBody, PreviewHeader, RawPager, RequestView, json_tree,
+    BodyView, CommentView, ConstructList, DenyOffer, DenyOfferKind, FieldRow, IssueCard, ItemCount,
+    OutcomeKind, PREVIEW_BUILDER_VERSION, Preview, PreviewBody, PreviewHeader, RawPager,
+    RequestView, json_tree,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -39,6 +41,13 @@ fn rev() -> CandidateRev {
 }
 
 fn queue_items() -> Vec<QueueItem> {
+    // Never serialized (PD-86); only its id and label reach the wire.
+    let session = SessionKey {
+        agent_name: Some("claude-code".into()),
+        peer_origin_exe: None,
+        connection_id: None,
+        cwd_basename: "atlas-duck".into(),
+    };
     vec![QueueItem {
         request_id: REQ.into(),
         op_id: "jira.issue.get".into(),
@@ -54,13 +63,9 @@ fn queue_items() -> Vec<QueueItem> {
         caution_count: 1,
         possible_duplicate_of: Some(REQ_2.into()),
         similar_to: None,
-        // Δ2 (Task 7) stops serializing the session (`session_id` / `session_label` instead).
-        session: SessionKey {
-            agent_name: Some("claude-code".into()),
-            peer_origin_exe: None,
-            connection_id: None,
-            cwd_basename: "atlas-duck".into(),
-        },
+        session_id: session.id(),
+        session_label: session.label(),
+        session,
         opened: false,
         approvable: true,
         candidate_rev: rev(),
@@ -85,6 +90,7 @@ fn header(class: &str) -> PreviewHeader {
         executes_as: Some("jdoe".into()),
         receipt_fields: vec!["key".into()],
         query: None,
+        release_blocked: None,
     }
 }
 
@@ -244,10 +250,36 @@ fn previews() -> Vec<Preview> {
                     | PreviewBody::JiraIssue { .. }
                     | PreviewBody::Table { .. }
             );
+            let mut header = header(if write { "write" } else { "read" });
+            // M5 M-11: a read whose rebuild failed shows the banner and cannot be approved.
+            let blocked = matches!(body, PreviewBody::JsonTree { .. });
+            if blocked {
+                header.release_blocked = Some(RELEASE_BLOCKED_INTERNAL);
+            }
+            // Every offer kind once, with and without an optional detail.
+            let offer = |kind, has_optional_detail| DenyOffer {
+                kind,
+                has_optional_detail,
+            };
+            let deny_offers = match body {
+                PreviewBody::WriteRequests { .. } => vec![
+                    offer(DenyOfferKind::UpstreamHttp, true),
+                    offer(DenyOfferKind::OutcomeHint, false),
+                ],
+                PreviewBody::UnresolvedName { .. } => {
+                    vec![offer(DenyOfferKind::ResolutionFailed, true)]
+                }
+                PreviewBody::WriteSummary { .. } => {
+                    vec![offer(DenyOfferKind::MissingFields, false)]
+                }
+                _ => vec![],
+            };
+            let deny_prefill = matches!(body, PreviewBody::Conflict { .. })
+                .then(|| CONFLICT_DENY_PREFILL.to_owned());
             Preview {
                 candidate_rev: rev(),
-                approvable: i % 2 == 0,
-                header: header(if write { "write" } else { "read" }),
+                approvable: i % 2 == 0 && !blocked,
+                header,
                 warnings: vec![
                     Warning::new(
                         WarningId::PossibleDuplicate,
@@ -293,6 +325,8 @@ fn previews() -> Vec<Preview> {
                         },
                     ],
                 }),
+                deny_offers,
+                deny_prefill,
             }
         })
         .collect()
