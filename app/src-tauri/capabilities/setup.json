@@ -1,0 +1,9 @@
+{
+  "identifier": "setup",
+  "description": "the first-run wizard window (Δ1, PD-72)",
+  "windows": ["setup"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

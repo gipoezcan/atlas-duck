@@ -1,6 +1,6 @@
 //! Bundle identity (§12.1, §12.5): the identifier and the product name differ from the data-dir
-//! folder name `atlas-duck` (§7.7), the main binary is `atlas-duck-app`, and the M1 app declares no
-//! windows and no capabilities (§10.3).
+//! folder name `atlas-duck` (§7.7), the main binary is `atlas-duck-app`, the config declares no
+//! windows and one capability per window label, with the M6 frontend lockdown (§2.4, §6.4, §10.3).
 
 use std::path::PathBuf;
 
@@ -46,11 +46,98 @@ fn main_binary_is_atlas_duck_app() {
     assert_eq!(conf()["mainBinaryName"], "atlas-duck-app");
 }
 
+/// The seven window labels (C.10 + Δ1, PD-72), one capability file each (§10.3).
+const WINDOW_LABELS: [&str; 7] = [
+    "approvals",
+    "settings",
+    "audit",
+    "running_scripts",
+    "onboarding",
+    "credential",
+    "setup",
+];
+
+/// M6 T4 (§2.4, §6.4, §10.3): Rust builds every window (T6), so the config declares none; the
+/// capability list is explicit (an empty list would mean "every file in `capabilities/`"), each
+/// file grants its own window only, and the frontend lockdown is on.
 #[test]
-fn no_startup_windows_and_no_capabilities() {
+fn capabilities_one_per_window_and_no_static_windows() {
     let c = conf();
     assert_eq!(c["app"]["windows"], Value::Array(vec![]));
-    assert_eq!(c["app"]["security"]["capabilities"], Value::Array(vec![]));
+    let security = &c["app"]["security"];
+    assert_eq!(security["capabilities"], serde_json::json!(WINDOW_LABELS));
+    assert_eq!(security["freezePrototype"], Value::Bool(true));
+    assert_eq!(
+        security["pattern"],
+        serde_json::json!({"use": "isolation", "options": {"dir": "../isolation"}})
+    );
+    let isolation = manifest_dir().join("../isolation/index.html");
+    let html = std::fs::read_to_string(&isolation).expect("read app/isolation/index.html");
+    assert!(html.contains("__TAURI_ISOLATION_HOOK__"));
+    // The CSP: one policy for every platform (no overlay overrides it); `frame-src` carries the
+    // placeholder `csp::patch_context` replaces with the build's isolation origin (§6.4, V34;
+    // `ci/check-csp.mjs` compares the whole text).
+    let csp = security["csp"]
+        .as_str()
+        .expect("app.security.csp is a string");
+    assert!(
+        csp.contains(&format!(
+            "frame-src 'self' {}",
+            atlas_duck_app_lib::csp::ISOLATION_ORIGIN_PLACEHOLDER
+        )),
+        "{csp}"
+    );
+    assert!(!csp.contains("unsafe-"), "{csp}");
+    assert!(security.get("devCsp").is_none());
+    for platform in ["windows", "macos", "linux"] {
+        let overlay = manifest_dir().join(format!("tauri.{platform}.conf.json"));
+        if let Ok(text) = std::fs::read_to_string(&overlay) {
+            let overlay: Value = serde_json::from_str(&text).expect("overlay is JSON");
+            assert!(
+                overlay.pointer("/app/security").is_none(),
+                "tauri.{platform}.conf.json overrides app.security"
+            );
+        }
+    }
+
+    let mut files: Vec<String> = std::fs::read_dir(manifest_dir().join("capabilities"))
+        .expect("read capabilities/")
+        .map(|e| {
+            e.expect("capabilities/ entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    files.sort();
+    let mut expected: Vec<String> = WINDOW_LABELS.iter().map(|l| format!("{l}.json")).collect();
+    expected.sort();
+    assert_eq!(
+        files, expected,
+        "exactly one capability file per window label"
+    );
+    for label in WINDOW_LABELS {
+        let path = manifest_dir()
+            .join("capabilities")
+            .join(format!("{label}.json"));
+        let text = std::fs::read_to_string(&path).expect("read capability file");
+        let cap: Value = serde_json::from_str(&text).expect("capability file is JSON");
+        assert_eq!(cap["identifier"], label);
+        assert_eq!(cap["windows"], serde_json::json!([label]), "{label}");
+        for key in ["webviews", "remote", "local", "platforms"] {
+            assert!(cap.get(key).is_none(), "{label}.json sets {key}");
+        }
+        let permissions = cap["permissions"].as_array().expect("permissions array");
+        for p in permissions {
+            let p = p.as_str().expect("plain permission identifier");
+            assert!(
+                p.starts_with("allow-")
+                    || p == "core:event:allow-listen"
+                    || p == "core:event:allow-unlisten",
+                "{label}.json grants {p}"
+            );
+        }
+    }
 }
 
 #[test]

@@ -1,0 +1,10 @@
+{
+  "identifier": "settings",
+  "description": "the Settings window (Δ1): settings, instances, credential trigger, CLI, removal",
+  "windows": ["settings"],
+  "permissions": [
+    "allow-app-status",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

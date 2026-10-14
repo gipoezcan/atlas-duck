@@ -9,6 +9,7 @@ compile_error!("scripted-approver must never reach a release build");
 pub mod commands;
 pub mod compose;
 pub mod confirm;
+pub mod csp;
 pub mod diag;
 pub mod early_argv;
 pub mod sandbox_probe;
@@ -49,8 +50,12 @@ pub fn run_gui(background: bool) -> ! {
     // M6 decides what a cold start without `--background` opens; M1 opens no window.
     let _ = background;
 
-    #[cfg_attr(not(feature = "scripted-approver"), allow(unused_mut))]
     let mut context = tauri::generate_context!();
+    // §6.4 (M6 T4): the main CSP's `frame-src` names this build's isolation origin.
+    if csp::patch_context(&mut context).is_err() {
+        eprintln!("atlas-duck-app: failed to start the application shell");
+        std::process::exit(1);
+    }
     // The test build: apps of different test homes never forward to each other.
     #[cfg(feature = "scripted-approver")]
     testing::scope_identifier(context.config_mut());

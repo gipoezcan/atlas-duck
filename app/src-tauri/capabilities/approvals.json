@@ -1,0 +1,10 @@
+{
+  "identifier": "approvals",
+  "description": "the Approvals window (C.10 + Δ1): queue, previews, decisions, header triggers",
+  "windows": ["approvals"],
+  "permissions": [
+    "allow-app-status",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

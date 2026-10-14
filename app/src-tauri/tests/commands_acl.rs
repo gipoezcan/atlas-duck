@@ -1,8 +1,7 @@
 //! M6 T3 (§2.4, §10.3, S-09 mock-runtime half, S-16 Tauri half): the command layer over Tauri's
 //! mock runtime. The context is the app's generated one (`generate_context!`: the app manifest
-//! `build.rs` derives from `COMMANDS`, the capabilities of `tauri.conf.json`), with no assets; a
-//! test grants commands through a runtime capability, as a capability file would. The mock runtime
-//! opens no OS window.
+//! `build.rs` derives from `COMMANDS`, the seven capability files of `tauri.conf.json` (T4)), with
+//! no assets, so the grants under test are the shipped ones. The mock runtime opens no OS window.
 //!
 //! Tauri checks the ACL of an app command only when the context carries an app manifest
 //! (`webview/mod.rs`, `has_app_acl_manifest`): `tauri::test::mock_context` has none, so these
@@ -17,18 +16,9 @@ use tauri::test::{INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder};
 use tauri::webview::InvokeRequest;
 use tauri::{App, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 
-/// Grants `app_status` to the `approvals` window only (Task 4 writes the real capability files).
-const CAP_APPROVALS: &str = r#"{
-  "identifier": "test-approvals",
-  "windows": ["approvals"],
-  "permissions": ["allow-app-status"]
-}"#;
-
 fn app() -> Result<App<MockRuntime>, Box<dyn std::error::Error>> {
     let context = tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
-    let app = commands::register(mock_builder()).build(context)?;
-    app.add_capability(CAP_APPROVALS)?;
-    Ok(app)
+    Ok(commands::register(mock_builder()).build(context)?)
 }
 
 fn window(app: &App<MockRuntime>, label: &str) -> tauri::Result<WebviewWindow<MockRuntime>> {
@@ -71,12 +61,24 @@ fn invoke_app_status_round_trips() -> TestResult {
 }
 
 /// The V34-adjacent answer for Task 31: under the mock runtime, with the generated context, the
-/// ACL is enforced for app commands per window label.
+/// ACL is enforced for app commands per window label. `app_status` is granted to `approvals` and
+/// `settings` (Δ1) and to no other window.
 #[test]
 fn app_status_outside_grant_rejected() -> TestResult {
     let app = app()?;
     let granted = window(&app, "approvals")?;
-    for label in ["settings", "credential", "unknown"] {
+    assert_eq!(
+        invoke(&window(&app, "settings")?, "app_status", json!({})),
+        Ok(json!([]))
+    );
+    for label in [
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "credential",
+        "setup",
+        "unknown",
+    ] {
         let w = window(&app, label)?;
         let refused = invoke(&w, "app_status", json!({}));
         assert!(refused.is_err(), "{label}: {refused:?}");

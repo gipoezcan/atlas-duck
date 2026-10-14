@@ -1,0 +1,9 @@
+{
+  "identifier": "running_scripts",
+  "description": "the Running scripts window (Δ1)",
+  "windows": ["running_scripts"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "identifier": "onboarding",
+  "description": "the Onboarding window (Δ1): read-only onboarding text",
+  "windows": ["onboarding"],
+  "permissions": []
+}

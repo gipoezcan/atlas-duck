@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>atlas-duck isolation</title>
+  </head>
+  <body>
+    <!--
+      Tauri isolation app (§2.4, §10.3, PD-87). Every IPC message of every window passes this hook
+      in a hidden sandboxed iframe before Tauri encrypts it for Rust. The hook sees no window label,
+      so per-window rules stay in the capability files; it passes only known command names under a
+      payload size cap and turns everything else into a command that does not exist, which Rust
+      refuses (the invoke rejects instead of hanging). One inline classic script, no ES modules (the
+      WebView2 iframe limitation, §10.3). `ALLOWED` is generated: `node ci/check-commands.mjs --write`.
+    -->
+    <script>
+      (function () {
+        "use strict";
+
+        // BEGIN GENERATED (node ci/check-commands.mjs --write)
+        var ALLOWED = [
+          "app_status",
+          "plugin:event|listen",
+          "plugin:event|unlisten",
+        ];
+        // END GENERATED
+
+        /** PD-87: the JSON serialization of a message is at most 2 MiB (UTF-16 code units). */
+        var MAX_PAYLOAD_CHARS = 2 * 1024 * 1024;
+        /** Never a command name (`ci/check-commands.mjs` keeps it out of `COMMANDS`). */
+        var DROPPED_CMD = "__atlas_duck_isolation_dropped__";
+
+        var allowed = Object.create(null);
+        for (var i = 0; i < ALLOWED.length; i += 1) {
+          allowed[ALLOWED[i]] = true;
+        }
+
+        function isBinary(body) {
+          return (
+            ArrayBuffer.isView(body) ||
+            Object.prototype.toString.call(body) === "[object ArrayBuffer]"
+          );
+        }
+
+        function withinCap(message) {
+          // No command takes raw bytes (T3 refuses them) and `JSON.stringify` would see an
+          // `ArrayBuffer` as `{}`, so a binary body never passes.
+          if (isBinary(message.payload)) {
+            return false;
+          }
+          var text;
+          try {
+            text = JSON.stringify(message);
+          } catch (e) {
+            return false;
+          }
+          return typeof text === "string" && text.length <= MAX_PAYLOAD_CHARS;
+        }
+
+        function passes(message) {
+          return (
+            typeof message === "object" &&
+            message !== null &&
+            typeof message.cmd === "string" &&
+            allowed[message.cmd] === true &&
+            withinCap(message)
+          );
+        }
+
+        function dropped(message) {
+          var out = Object.create(null);
+          out.cmd = DROPPED_CMD;
+          out.callback = message === null || typeof message !== "object" ? 0 : message.callback;
+          out.error = message === null || typeof message !== "object" ? 0 : message.error;
+          out.payload = {};
+          return out;
+        }
+
+        Object.defineProperty(window, "__TAURI_ISOLATION_HOOK__", {
+          value: function (message) {
+            return passes(message) ? message : dropped(message);
+          },
+          writable: false,
+          configurable: false,
+        });
+      })();
+    </script>
+  </body>
+</html>
