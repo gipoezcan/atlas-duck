@@ -18,7 +18,9 @@ function Count() {
 
 describe('invoke.ts can be mocked in a component test', () => {
   it('renders what the mocked wrapper returns', async () => {
-    vi.mocked(queueList).mockResolvedValue(queueItems as unknown as QueueItem[]);
+    // Typed, not cast: tsc checks the Rust-produced fixture against the wire type.
+    const fixture: QueueItem[] = queueItems;
+    vi.mocked(queueList).mockResolvedValue(fixture);
     render(<Count />);
     await waitFor(() => expect(screen.getByText('1 items')).toBeTruthy());
   });

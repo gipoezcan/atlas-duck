@@ -16,7 +16,10 @@ function internals(): TauriInternals {
   return t;
 }
 
-/** The whole invoke body is the argument struct (Task 3 arg contract). */
-export function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknown> {
+/**
+ * The whole invoke body is the argument struct (Task 3 arg contract). Async, so a missing
+ * `__TAURI_INTERNALS__` is a rejected promise, never a synchronous throw.
+ */
+export async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknown> {
   return internals().invoke(cmd, args);
 }

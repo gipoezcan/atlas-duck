@@ -21,6 +21,19 @@ const HTML_COMPONENT_PATTERN = {
   message: 'HTML-emitting Markdown/linkify components are banned in ui/ (spec §6.4).',
 };
 
+const TAURI_API_PATTERN = {
+  group: ['@tauri-apps/api', '@tauri-apps/api/*'],
+  message: 'Tauri API imports belong in src/shared/ipc/ only (Task 5).',
+};
+
+const BLOB_URL_PROPERTY = {
+  property: 'createObjectURL',
+  message: 'Blob URLs (blob workers) are banned in ui/ (spec §6.4).',
+};
+
+const WEB_STORAGE = ['localStorage', 'sessionStorage', 'indexedDB', 'BroadcastChannel'];
+const WEB_STORAGE_MESSAGE = 'No web storage or cross-context channels in the credential page (spec §10.3).';
+
 export default [
   { ignores: ['dist/**', 'node_modules/**'] },
   {
@@ -45,45 +58,49 @@ export default [
       'no-eval': 'error',
       'no-implied-eval': 'error',
       'no-new-func': 'error',
+      'no-restricted-properties': ['error', BLOB_URL_PROPERTY],
+      'no-restricted-imports': [
+        'error',
+        { patterns: [HTML_COMPONENT_PATTERN, TAURI_API_PATTERN] },
+      ],
+    },
+  },
+  {
+    // The only place that may import the Tauri API.
+    files: ['src/shared/ipc/**'],
+    rules: {
+      'no-restricted-imports': ['error', { patterns: [HTML_COMPONENT_PATTERN] }],
+    },
+  },
+  {
+    // The credential page keeps no web storage (spec §10.3) and imports nothing from src/shared/
+    // (PD-71: a shared module would join its bundle to the main windows'). no-restricted-globals
+    // catches the bare identifiers, no-restricted-properties window.x, globalThis.x, self.x and
+    // ['x']. ci/check-credential-bundle.mjs backs this up on the built chunks. Each rule restates
+    // the base options: a flat-config override replaces them.
+    files: ['src/credential/**'],
+    rules: {
+      'no-restricted-globals': [
+        'error',
+        ...WEB_STORAGE.map((name) => ({ name, message: WEB_STORAGE_MESSAGE })),
+      ],
       'no-restricted-properties': [
         'error',
-        {
-          property: 'createObjectURL',
-          message: 'Blob URLs (blob workers) are banned in ui/ (spec §6.4).',
-        },
+        BLOB_URL_PROPERTY,
+        ...WEB_STORAGE.map((property) => ({ property, message: WEB_STORAGE_MESSAGE })),
       ],
       'no-restricted-imports': [
         'error',
         {
           patterns: [
             HTML_COMPONENT_PATTERN,
+            TAURI_API_PATTERN,
             {
-              group: ['@tauri-apps/api', '@tauri-apps/api/*'],
-              message: 'Tauri API imports belong in src/shared/ipc/ only (Task 5).',
+              group: ['**/shared', '**/shared/**'],
+              message: 'src/credential/ imports nothing from src/shared/ (PD-71, spec §10.3).',
             },
           ],
         },
-      ],
-    },
-  },
-  {
-    // The only place that may import the Tauri API.
-    files: ['src/shared/ipc/**', 'src/credential/ipc.ts'],
-    rules: {
-      'no-restricted-imports': ['error', { patterns: [HTML_COMPONENT_PATTERN] }],
-    },
-  },
-  {
-    // The credential page keeps no web storage (spec §10.3);
-    // ci/check-credential-bundle.mjs backs this up on the built chunks.
-    files: ['src/credential/**'],
-    rules: {
-      'no-restricted-globals': [
-        'error',
-        ...['localStorage', 'sessionStorage', 'indexedDB', 'BroadcastChannel'].map((name) => ({
-          name,
-          message: 'No web storage or cross-context channels in the credential page (spec §10.3).',
-        })),
       ],
     },
   },
