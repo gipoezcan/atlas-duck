@@ -6,6 +6,9 @@
 //! `jira.issuelink.create` (Task 16, PD-53): the link-type resolution, the link sentence in the
 //! direction Jira reads the body, the declared empty success (I-25), and the unresolved-name
 //! table over every Jira resolution kind (I-35).
+//!
+//! `jira.worklog.add` (Task 17, PD-55): the time-spent and started checks, the card read from the
+//! sent request, the verbatim comment, and the identity call of an op without a stale rule.
 
 mod common;
 
@@ -2329,5 +2332,636 @@ async fn i35_link_type_deny_without_candidates() -> TestResult {
     assert_eq!(detail(&env, "message"), "no issue link type named 'zzz'");
     assert_eq!(detail(&env, "candidates"), Value::Null);
     assert!(link_posts(mock).await.is_empty());
+    Ok(())
+}
+
+// ---- jira.worklog.add (Task 17, PD-55) ---------------------------------------------------------
+
+const WORKLOG: &str = "jira.worklog.add";
+const WORKLOG_POST: &str = "/rest/api/2/issue/ABC-1/worklog";
+const STARTED: &str = "2026-09-02T09:00:00.000+0200";
+const WORKLOG_ANSWER: &str = r#"{"id":"11001","issueId":"10001","timeSpent":"2h","timeSpentSeconds":7200,"started":"2026-09-02T09:00:00.000+0200","comment":"Investigation"}"#;
+
+fn worklog_params(time_spent: &str) -> Value {
+    json!({"key": KEY, "time_spent": time_spent})
+}
+
+/// The one POST a worklog renders, as JSON (no enrichment verdict: PD-55).
+fn worklog_wire(params: &Value) -> Result<Value, TestError> {
+    match exec_as(WORKLOG, params, None) {
+        Ok(ExecPlan::Write(reqs)) => {
+            assert_eq!(reqs.len(), 1);
+            let r = &reqs[0];
+            assert_eq!(r.method, "POST");
+            assert!(r.resolved_url.ends_with(WORKLOG_POST), "{}", r.resolved_url);
+            assert_eq!(r.content_type.as_deref(), Some("application/json"));
+            Ok(serde_json::from_slice(&r.body)?)
+        }
+        other => Err(format!("not a write: {other:?}").into()),
+    }
+}
+
+/// The param an executor refusal names, or `None` when the executor renders a request.
+fn worklog_refused(params: &Value) -> Result<Option<String>, TestError> {
+    match exec_as(WORKLOG, params, None) {
+        Ok(ExecPlan::Write(_)) => Ok(None),
+        Err(ExecError::Invalid(e)) => Ok(Some(
+            e.details
+                .get("param")
+                .and_then(Value::as_str)
+                .ok_or("no param in the refusal")?
+                .to_owned(),
+        )),
+        other => Err(format!("unexpected: {other:?}").into()),
+    }
+}
+
+/// The worklog card over `reqs` (the request list is what the card reads, §5.1 inv. 4).
+fn worklog_card_over(
+    params: &Value,
+    reqs: &[atlas_duck_atlassian::HttpRequestSpec],
+) -> Result<PreviewModel, TestError> {
+    let imp = op_table().get(WORKLOG).ok_or("no OpImpl")?;
+    let ctx = PreviewCtx {
+        spec: atlas_duck_registry::get(WORKLOG).ok_or("no spec")?,
+        instance_alias: "jira-main",
+        params,
+        input: PreviewInput::Write(WriteView {
+            requests: reqs,
+            hold: Hold::Preview,
+            enrichment: None,
+            failure: None,
+        }),
+        field_names: None,
+    };
+    Ok((imp.previewer)(&ctx))
+}
+
+fn worklog_card(params: &Value) -> Result<PreviewModel, TestError> {
+    match exec_as(WORKLOG, params, None) {
+        Ok(ExecPlan::Write(reqs)) => worklog_card_over(params, &reqs),
+        other => Err(format!("not a write: {other:?}").into()),
+    }
+}
+
+#[test]
+fn worklog_body_is_exactly_the_params() -> TestResult {
+    assert_eq!(
+        worklog_wire(&worklog_params("2h"))?,
+        json!({"timeSpent": "2h"})
+    );
+    let mut params = worklog_params("2h");
+    params["comment"] = json!("Investigation");
+    assert_eq!(
+        worklog_wire(&params)?,
+        json!({"timeSpent": "2h", "comment": "Investigation"})
+    );
+    params["started"] = json!(STARTED);
+    assert_eq!(
+        worklog_wire(&params)?,
+        json!({"timeSpent": "2h", "comment": "Investigation", "started": STARTED})
+    );
+    // PD-42/L84: the comment is wiki or plain text, never converted from Markdown.
+    let text = "**bold** {toc} [~jdoe]\n# not a heading\n";
+    params["comment"] = json!(text);
+    assert_eq!(worklog_wire(&params)?["comment"], json!(text));
+    // An absent or null optional sends nothing.
+    params["comment"] = Value::Null;
+    params["started"] = Value::Null;
+    assert_eq!(worklog_wire(&params)?, json!({"timeSpent": "2h"}));
+    Ok(())
+}
+
+#[test]
+fn worklog_time_spent_is_parsed_not_trusted() -> TestResult {
+    for ok in [
+        "2h",
+        "30m",
+        "1w 2d 3h",
+        "4w",
+        "1d 30m",
+        "15m",
+        "1w 2d 3h 4m",
+        "9600m",
+        "160h",
+    ] {
+        assert_eq!(worklog_refused(&worklog_params(ok))?, None, "{ok}");
+    }
+    for bad in [
+        // zero
+        "0h",
+        "0m",
+        "00h",
+        "0w 0d",
+        // the same unit twice, or the smaller unit first
+        "2h 3h",
+        "30m 2h",
+        "1d 1w",
+        // absurd: over four working weeks (1d = 8h, 1w = 5d), or over four digits
+        "5w",
+        "4w 1m",
+        "161h",
+        "9601m",
+        "10000m",
+        "99999h",
+        // shapes Jira would read differently or refuse
+        "1h  30m",
+        " 2h",
+        "2h ",
+        "2H",
+        "2h30m",
+        "1.5h",
+        "90s",
+        "-1h",
+        "2",
+        "h",
+        "",
+        "2h\n",
+        "2h\u{a0}30m",
+        "\u{662}h",
+        "\u{ff12}h",
+    ] {
+        assert_eq!(
+            worklog_refused(&worklog_params(bad))?.as_deref(),
+            Some("time_spent"),
+            "{bad:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn worklog_started_is_jiras_format_and_not_the_future() -> TestResult {
+    let with = |started: &str| {
+        let mut p = worklog_params("2h");
+        p["started"] = json!(started);
+        p
+    };
+    for ok in [
+        STARTED,
+        "2026-09-02T09:00:00.000-0530",
+        "2024-02-29T23:59:59.999+0000",
+        "2026-01-01T00:00:00.000+1400",
+        "2000-01-01T00:00:00.000-1200",
+    ] {
+        assert_eq!(worklog_refused(&with(ok))?, None, "{ok}");
+        assert_eq!(worklog_wire(&with(ok))?["started"], json!(ok), "verbatim");
+    }
+    for bad in [
+        // not Jira's `yyyy-MM-dd'T'HH:mm:ss.SSSZ`
+        "2026-09-02T09:00:00.000Z",
+        "2026-09-02T09:00:00.000+02:00",
+        "2026-09-02T09:00:00+0200",
+        "2026-09-02T09:00:00.00+0200",
+        "2026-09-02T09:00:00.0000+0200",
+        "2026-09-02 09:00:00.000+0200",
+        "2026-09-02",
+        "2026-9-2T09:00:00.000+0200",
+        " 2026-09-02T09:00:00.000+0200",
+        "2026-09-02T09:00:00.000+0200 ",
+        "2026-09-02T09:00:00.000+0200\n",
+        "\u{ff12}026-09-02T09:00:00.000+0200",
+        "2026-09-02t09:00:00.000+0200",
+        // not a date or time
+        "2026-13-02T09:00:00.000+0200",
+        "2026-00-02T09:00:00.000+0200",
+        "2026-02-30T09:00:00.000+0200",
+        "2025-02-29T09:00:00.000+0200",
+        "2026-09-02T24:00:00.000+0200",
+        "2026-09-02T09:60:00.000+0200",
+        "2026-09-02T09:00:60.000+0200",
+        // not a zone
+        "2026-09-02T09:00:00.000+1500",
+        "2026-09-02T09:00:00.000-1401",
+        "2026-09-02T09:00:00.000+0260",
+        // absurd: before 2000, or in the future
+        "1999-12-31T23:59:59.999+0000",
+        "1970-01-01T00:00:00.000+0000",
+        "2999-01-01T00:00:00.000+0000",
+        "9999-12-31T23:59:59.999+0000",
+        // blank
+        "",
+        "   ",
+    ] {
+        assert_eq!(
+            worklog_refused(&with(bad))?.as_deref(),
+            Some("started"),
+            "{bad:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn worklog_blank_comment_is_refused_like_the_link_comment() -> TestResult {
+    for blank in ["", " ", "\n\t ", "\u{a0}"] {
+        let mut p = worklog_params("2h");
+        p["comment"] = json!(blank);
+        assert_eq!(
+            worklog_refused(&p)?.as_deref(),
+            Some("comment"),
+            "{blank:?}"
+        );
+    }
+    // Leading and trailing whitespace of a comment with text stays as written.
+    let mut p = worklog_params("2h");
+    p["comment"] = json!("  Investigation \n");
+    assert_eq!(worklog_wire(&p)?["comment"], json!("  Investigation \n"));
+    Ok(())
+}
+
+struct WorklogCard {
+    sentence: String,
+    rows: Vec<(String, String)>,
+    constructs: Option<ConstructList>,
+}
+
+fn worklog_rows(m: &PreviewModel) -> Result<WorklogCard, TestError> {
+    match &m.body {
+        PreviewBody::WriteSummary {
+            sentence,
+            rows,
+            constructs,
+            requests,
+        } => {
+            assert_eq!(requests.len(), 1, "the exact request list stays (inv. 4)");
+            Ok(WorklogCard {
+                sentence: sentence.clone(),
+                rows: rows.clone(),
+                constructs: constructs.clone(),
+            })
+        }
+        other => Err(format!("not a write summary: {other:?}").into()),
+    }
+}
+
+fn card_row<'a>(c: &'a WorklogCard, name: &str) -> Option<&'a str> {
+    c.rows
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+#[test]
+fn worklog_card_states_what_is_sent_and_what_it_means() -> TestResult {
+    let mut params = worklog_params("1w 2d 3h");
+    params["comment"] = json!("Look {toc} [~jdoe] [spec|https://e.example/x]");
+    params["started"] = json!(STARTED);
+    let card = worklog_rows(&worklog_card(&params)?)?;
+    assert_eq!(card.sentence, "Log 1w 2d 3h on ABC-1");
+    assert_eq!(card_row(&card, "Time spent (sent)"), Some("1w 2d 3h"));
+    // Weeks and days are working time: the card says so and gives the default reading only as
+    // that, never as the seconds Jira books.
+    assert_eq!(
+        card_row(&card, "Meaning"),
+        Some(
+            "1 week, 2 days, 3 hours of working time; at Jira's defaults (1d = 8h, 1w = 5d) \
+             59h = 212400 s, your instance's time tracking settings decide"
+        )
+    );
+    assert_eq!(card_row(&card, "Started (sent)"), Some(STARTED));
+    assert_eq!(
+        card_row(&card, "Started as"),
+        Some("2026-09-02 09:00:00 at UTC+02:00 (2026-09-02 07:00:00 UTC)")
+    );
+    assert!(
+        card_row(&card, "Comment").is_some_and(|c| c.contains("Look")),
+        "{:?}",
+        card.rows
+    );
+    let constructs = card.constructs.ok_or("no constructs")?;
+    assert_eq!(constructs.macros, ["toc"]);
+    assert_eq!(constructs.mentions, ["jdoe"]);
+    assert_eq!(constructs.links, ["https://e.example/x"]);
+
+    // Hours and minutes alone are exact.
+    let card = worklog_rows(&worklog_card(&worklog_params("2h 30m"))?)?;
+    assert_eq!(card.sentence, "Log 2h 30m on ABC-1");
+    assert_eq!(
+        card_row(&card, "Meaning"),
+        Some("2 hours, 30 minutes = 9000 s")
+    );
+    // No started: the card says Jira picks the time; no comment: no row, no constructs.
+    assert_eq!(
+        card_row(&card, "Started"),
+        Some("(not sent: Jira uses the time the worklog is created)")
+    );
+    assert_eq!(card_row(&card, "Started (sent)"), None);
+    assert_eq!(card_row(&card, "Comment"), None);
+    assert_eq!(card.constructs, None);
+
+    // A negative zone, and a day that rolls over in UTC.
+    let mut params = worklog_params("15m");
+    params["started"] = json!("2026-09-02T22:30:00.000-0530");
+    let card = worklog_rows(&worklog_card(&params)?)?;
+    assert_eq!(
+        card_row(&card, "Started as"),
+        Some("2026-09-02 22:30:00 at UTC-05:30 (2026-09-03 04:00:00 UTC)")
+    );
+    Ok(())
+}
+
+/// §5.1 inv. 4, T12 review M4: the card is read from the request that is sent, never from the
+/// params.
+#[test]
+fn worklog_card_is_read_from_the_sent_request() -> TestResult {
+    let mut params = worklog_params("2h");
+    params["comment"] = json!("from the params");
+    let reqs = match exec_as(WORKLOG, &params, None) {
+        Ok(ExecPlan::Write(r)) => r,
+        other => return Err(format!("not a write: {other:?}").into()),
+    };
+    let mut sent = reqs.clone();
+    sent[0].body = serde_json::to_vec(&json!({
+        "timeSpent": "3d", "comment": "what is sent", "started": STARTED
+    }))?;
+    let card = worklog_rows(&worklog_card_over(&params, &sent)?)?;
+    assert_eq!(card.sentence, "Log 3d on ABC-1");
+    assert_eq!(card_row(&card, "Time spent (sent)"), Some("3d"));
+    assert_eq!(card_row(&card, "Started (sent)"), Some(STARTED));
+    assert!(
+        card_row(&card, "Comment").is_some_and(|c| c.contains("what is sent")),
+        "{:?}",
+        card.rows
+    );
+    assert!(!format!("{:?}", card.rows).contains("from the params"));
+    Ok(())
+}
+
+#[test]
+fn worklog_card_counts_invisible_comment_characters() -> TestResult {
+    let mut params = worklog_params("2h");
+    params["comment"] = json!("pay\u{202e}ed\u{200b}");
+    let m = worklog_card(&params)?;
+    let ids: Vec<WarningId> = m.warnings.iter().map(|w| w.id).collect();
+    assert!(ids.contains(&WarningId::BidiControls), "{ids:?}");
+    assert!(ids.contains(&WarningId::OtherInvisible), "{ids:?}");
+    assert_eq!(m.header.bidi_controls, 1);
+    // The card text never carries the raw control characters.
+    let card = worklog_rows(&m)?;
+    let shown = format!("{:?}", card.rows);
+    assert!(!shown.contains('\u{202e}') && !shown.contains('\u{200b}'));
+    Ok(())
+}
+
+#[test]
+fn worklog_card_without_a_request_keeps_the_generic_preview() -> TestResult {
+    let params = worklog_params("2h");
+    let m = worklog_card_over(&params, &[])?;
+    assert!(
+        !matches!(m.body, PreviewBody::WriteSummary { .. }),
+        "{:?}",
+        m.body
+    );
+    Ok(())
+}
+
+// ---- jira.worklog.add end to end -------------------------------------------------------------
+
+async fn worklog_posts(mock: &MockDc) -> Vec<wiremock::Request> {
+    let full = mock.path(WORKLOG_POST);
+    mock.received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == full)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worklog_add_happy_path() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.json(WORKLOG_POST, 201, WORKLOG_ANSWER).await;
+    let id = queued_as(
+        &h,
+        WORKLOG,
+        json!({"key": KEY, "time_spent": "2h", "comment": "Investigation"}),
+    )
+    .await?;
+    let p = opened(&h, &id)?;
+    assert!(p.approvable);
+    assert!(p.warnings.is_empty(), "{:?}", p.warnings);
+    let (sentence, rows) = card_rows(&p)?;
+    assert_eq!(sentence, "Log 2h on ABC-1");
+    assert!(
+        rows.contains(&("Time spent (sent)".into(), "2h".into())),
+        "{rows:?}"
+    );
+    // No enrichment, no stale rule: nothing is fetched before the approval.
+    assert!(purposes(&h, &id).await?.is_empty());
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(
+        (env.status, exit(&env)),
+        (Status::Succeeded, 0),
+        "{}",
+        env.to_json_line()
+    );
+    assert_eq!(env.data, Some(json!({ "receipt": {"id": "11001"} })));
+    let sent = worklog_posts(mock).await;
+    assert_eq!(sent.len(), 1);
+    let body: Value = serde_json::from_slice(&sent[0].body)?;
+    assert_eq!(body, json!({"timeSpent": "2h", "comment": "Investigation"}));
+    assert_eq!(records(&h, &id, EventType::WRITE_EXECUTED).await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worklog_started_passed_verbatim() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.json(WORKLOG_POST, 201, WORKLOG_ANSWER).await;
+    let id = queued_as(
+        &h,
+        WORKLOG,
+        json!({"key": KEY, "time_spent": "1d 30m", "started": STARTED,
+               "comment": "**not converted** {toc}"}),
+    )
+    .await?;
+    let p = opened(&h, &id)?;
+    let (_, rows) = card_rows(&p)?;
+    assert!(
+        rows.contains(&("Started (sent)".into(), STARTED.into())),
+        "{rows:?}"
+    );
+    assert!(
+        rows.contains(&(
+            "Started as".into(),
+            "2026-09-02 09:00:00 at UTC+02:00 (2026-09-02 07:00:00 UTC)".into()
+        )),
+        "{rows:?}"
+    );
+    match &p.body {
+        PreviewBody::WriteSummary { constructs, .. } => {
+            let c = constructs.as_ref().ok_or("no constructs")?;
+            assert_eq!(c.macros, ["toc"]);
+        }
+        other => return Err(format!("not the card: {other:?}").into()),
+    }
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let sent = worklog_posts(mock).await;
+    assert_eq!(sent.len(), 1);
+    let body: Value = serde_json::from_slice(&sent[0].body)?;
+    assert_eq!(
+        body,
+        json!({"timeSpent": "1d 30m", "started": STARTED, "comment": "**not converted** {toc}"})
+    );
+    Ok(())
+}
+
+/// §5.4 step 5: the rule is "none", but the pre-write identity call still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worklog_identity_call_runs() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.json(WORKLOG_POST, 201, WORKLOG_ANSWER).await;
+    let id = queued_as(&h, WORKLOG, worklog_params("2h")).await?;
+    opened(&h, &id)?;
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    assert_eq!(purposes(&h, &id).await?, ["stale_check"]);
+    let gets: Vec<String> = records(&h, &id, EventType::PREVIEW_FETCH)
+        .await?
+        .iter()
+        .filter_map(|r| r["path"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(gets.len(), 1, "{gets:?}");
+    assert!(gets[0].ends_with("/rest/api/2/myself"), "{gets:?}");
+
+    // The same with a PAT that stopped working: stale, nothing sent.
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.json(WORKLOG_POST, 201, WORKLOG_ANSWER).await;
+    let id = queued_as(&h, WORKLOG, worklog_params("2h")).await?;
+    opened(&h, &id)?;
+    let before = h.approver().item(&id).ok_or("not queued")?;
+    mock.server().reset().await;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Anonymous)
+        .await;
+    mock.json(WORKLOG_POST, 201, WORKLOG_ANSWER).await;
+    h.approver().approve(&id).map_err(de)?;
+    let after = item_after(&h, &id, before.candidate_rev.counter).await?;
+    assert!(!after.approvable, "Approve is disabled");
+    let reasons: Vec<Value> = records(&h, &id, EventType::WRITE_STALE)
+        .await?
+        .into_iter()
+        .map(|p| p["reason"].clone())
+        .collect();
+    assert_eq!(reasons, [json!("identity_mismatch")]);
+    assert!(worklog_posts(mock).await.is_empty(), "nothing was sent");
+    Ok(())
+}
+
+/// L06: the issue key is a read-only target; the time, the start and the comment can be edited,
+/// and every edit goes through the executor's checks (§5.4 step 4): nothing changes on a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worklog_edit_form_and_edits() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.json(WORKLOG_POST, 201, WORKLOG_ANSWER).await;
+    let id = queued_as(&h, WORKLOG, worklog_params("2h")).await?;
+    let p = opened(&h, &id)?;
+    let form = p.edit_form.as_ref().ok_or("no edit form")?;
+    let input = |name: &str| form.inputs.iter().find(|i| i.path == name);
+    assert!(input("key").is_some_and(|i| i.read_only));
+    for name in ["time_spent", "comment", "started"] {
+        assert!(input(name).is_some_and(|i| !i.read_only), "{name}");
+    }
+    let edit = |name: &str, value: &str| {
+        let mut set = Map::new();
+        set.insert(name.into(), json!(value));
+        Edits {
+            set,
+            remove: Vec::new(),
+        }
+    };
+    let rev = h.approver().rev(&id).map_err(de)?;
+    for (name, value) in [
+        ("time_spent", "0h"),
+        ("time_spent", "2h 3h"),
+        ("time_spent", "2h30m"),
+        ("started", "2026-09-02T09:00:00.000Z"),
+        ("started", "2999-01-01T00:00:00.000+0000"),
+        ("comment", "  "),
+    ] {
+        match h.approver().edit(&id, edit(name, value)) {
+            Err(DecisionError::EditRejected(e)) => {
+                assert_eq!(e.details.get("param"), Some(&json!(name)), "{value:?}");
+            }
+            other => return Err(format!("{name}={value:?} not refused: {other:?}").into()),
+        }
+        assert_eq!(h.approver().rev(&id).map_err(de)?, rev, "{name}={value:?}");
+    }
+    // A valid edit renders a new revision; nothing is fetched for it.
+    h.approver()
+        .edit(&id, edit("time_spent", "3h"))
+        .map_err(de)?;
+    let item = item_after(&h, &id, rev.counter).await?;
+    assert!(item.approvable);
+    let (sentence, _) = card_rows(&opened(&h, &id)?)?;
+    assert_eq!(sentence, "Log 3h on ABC-1");
+    assert!(purposes(&h, &id).await?.is_empty());
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let sent = worklog_posts(mock).await;
+    let body: Value = serde_json::from_slice(&sent.first().ok_or("no POST")?.body)?;
+    assert_eq!(body, json!({"timeSpent": "3h"}));
+    Ok(())
+}
+
+/// A value the executor refuses is exit 2 at validation: nothing is queued, nothing is fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worklog_invalid_values_are_validation_errors() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.json(WORKLOG_POST, 201, WORKLOG_ANSWER).await;
+    let before = mock.received().await.len();
+    for (params, param) in [
+        (json!({"key": KEY, "time_spent": "0h"}), "time_spent"),
+        (json!({"key": KEY, "time_spent": "2h 3h"}), "time_spent"),
+        (json!({"key": KEY, "time_spent": "5w"}), "time_spent"),
+        (
+            json!({"key": KEY, "time_spent": "2h", "comment": " "}),
+            "comment",
+        ),
+        (
+            json!({"key": KEY, "time_spent": "2h", "started": "2026-09-02T09:00:00.000+02:00"}),
+            "started",
+        ),
+        (
+            json!({"key": KEY, "time_spent": "2h", "started": "2999-01-01T00:00:00.000+0000"}),
+            "started",
+        ),
+    ] {
+        let env = h.submit(WORKLOG, params.clone()).await;
+        assert_eq!(
+            (env.status, exit(&env), code(&env)),
+            (Status::Failed, 2, "validation".to_owned()),
+            "{params}: {}",
+            env.to_json_line()
+        );
+        assert_eq!(detail(&env, "param"), param, "{params}");
+    }
+    assert_eq!(
+        mock.received().await.len(),
+        before,
+        "nothing fetched or sent after the setup"
+    );
     Ok(())
 }

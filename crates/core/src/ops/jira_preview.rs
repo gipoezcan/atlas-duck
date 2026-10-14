@@ -24,6 +24,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use super::jira::{escaped_prefix, pretty};
+use super::jira_ext::{describe_started, describe_time_spent};
 use super::{JiraUser, PreviewCtx, PreviewInput, PreviewModel, generic};
 use crate::lifecycle::model::Hold;
 use crate::metadata::{FieldNames, field_label, one_line};
@@ -1992,5 +1993,69 @@ pub fn edit_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         requests,
     };
     model.header.hidden_in_preview_bytes = diff.headings_cut.saturating_add(cut);
+    model
+}
+
+/// What the worklog card shows for a start that was not sent.
+const STARTED_NOT_SENT: &str = "(not sent: Jira uses the time the worklog is created)";
+
+/// §6.3 worklog: the `jira.worklog.add` card over the exact request (§5.1 inv. 4): "Log <time> on
+/// <key>", read from the request that is sent (T12 review M4), never from the params. Rows: the
+/// time as sent and what it means (weeks and days are Jira working time, so the seconds are given
+/// at Jira's defaults and as that, T17), the start as sent and as a zoned time with its UTC
+/// instant (or that none was sent), and the comment as the text of its wiki markup with its
+/// constructs (PD-42, PD-47: sent verbatim). Every value is a validated one (the executor refuses
+/// the rest), and the invisible characters of the comment count through the request. A request
+/// that is not the worklog JSON keeps the generic write preview.
+pub fn worklog_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let (Some(request), PreviewBody::WriteRequests { .. }) = (view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(body) = serde_json::from_slice::<Value>(&request.body).ok() else {
+        return model;
+    };
+    let Some(time_spent) = body.get("timeSpent").and_then(Value::as_str) else {
+        return model;
+    };
+    let started = body.get("started").and_then(Value::as_str);
+    let comment = body.get("comment").and_then(Value::as_str);
+    let key = ctx.params.get("key").and_then(Value::as_str).unwrap_or("");
+    let mut hidden = 0u64;
+    let cap = CELL_CAP_CHARS * 2;
+    let mut rows = vec![(
+        "Time spent (sent)".to_owned(),
+        line(time_spent, cap, &mut hidden),
+    )];
+    if let Some(meaning) = describe_time_spent(time_spent) {
+        rows.push(("Meaning".to_owned(), line(&meaning, cap, &mut hidden)));
+    }
+    match started {
+        Some(raw) => {
+            rows.push(("Started (sent)".to_owned(), line(raw, cap, &mut hidden)));
+            if let Some(zoned) = describe_started(raw) {
+                rows.push(("Started as".to_owned(), line(&zoned, cap, &mut hidden)));
+            }
+        }
+        None => rows.push(("Started".to_owned(), STARTED_NOT_SENT.to_owned())),
+    }
+    if let Some(wiki) = comment {
+        rows.push((
+            "Comment".to_owned(),
+            rendered_text(wiki, COMMENT_CAP, &mut hidden),
+        ));
+    }
+    let requests = take_requests(&mut model);
+    model.body = PreviewBody::WriteSummary {
+        sentence: line(&format!("Log {time_spent} on {key}"), cap, &mut hidden),
+        rows,
+        constructs: comment.map(construct_list),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden;
     model
 }

@@ -30,10 +30,16 @@ const M3_WRITES: [&str; 5] = [
 ];
 
 /// Writes completed in M5 so far (each task moves its op here from [`LATER_WRITES`]).
-const M5_WRITES: [&str; 2] = ["jira.issue.assign", "jira.issuelink.create"];
-
-const LATER_WRITES: [&str; 9] = [
+const M5_WRITES: [&str; 3] = [
+    "jira.issue.assign",
+    "jira.issuelink.create",
     "jira.worklog.add",
+];
+
+/// The M5 writes that render a request without an enrichment verdict (PD-55: no enrichment).
+const M5_WITHOUT_ENRICH: [&str; 1] = ["jira.worklog.add"];
+
+const LATER_WRITES: [&str; 8] = [
     "jira.sprint.move_issues",
     "jira.backlog.move_issues",
     "confluence.page.create",
@@ -736,10 +742,27 @@ fn not_in_this_build_writes() -> TestResult {
         M3_WRITES.len() + M5_WRITES.len() + LATER_WRITES.len()
     );
     // Each needs its enrichment verdict before it renders a request.
-    for id in M5_WRITES {
+    for id in M5_WRITES
+        .into_iter()
+        .filter(|id| !M5_WITHOUT_ENRICH.contains(id))
+    {
         assert_eq!(
             exec(id, &example(op(id)?), None, None)?,
             Err(ExecError::EnrichmentRequired),
+            "{id}"
+        );
+    }
+    // The worklog has no enrichment (PD-55): its example renders a request on its own.
+    for id in M5_WITHOUT_ENRICH {
+        assert!(
+            matches!(
+                exec(id, &example(op(id)?), None, None)?,
+                Ok(ExecPlan::Write(_))
+            ),
+            "{id}"
+        );
+        assert!(
+            op_table().get(id).is_some_and(|i| i.enrich.is_none()),
             "{id}"
         );
     }
@@ -797,6 +820,12 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             json!({"key": "ABC-1", "transition": "Done", "fields": {"resolution": {"name": "Fixed"}},
                    "comment": "Closing."}),
             Some(transition_verdict()),
+        ),
+        (
+            "jira.worklog.add",
+            json!({"key": "ABC-1", "time_spent": "1w 2d 3h", "comment": "Investigation",
+                   "started": "2026-09-02T09:00:00.000+0200"}),
+            None,
         ),
         (
             "confluence.page.update",

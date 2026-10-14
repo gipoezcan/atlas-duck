@@ -1,10 +1,14 @@
 //! The Jira writes M5 completes beyond the M3 four (PD-09): `jira.issue.assign` (T15, PD-52), with
 //! the assignable-user resolution under the §7.2 username comparison and the current assignee as
-//! the stale-check baseline; `jira.issuelink.create` (T16, PD-53), with the link-type resolution.
+//! the stale-check baseline; `jira.issuelink.create` (T16, PD-53), with the link-type resolution;
+//! `jira.worklog.add` (T17, PD-55), whose time and start are checked strictly (no enrichment).
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use atlas_duck_atlassian::{GetCall, UsernameMatcher};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 use serde_json::{Map, Value, json};
 
 use super::jira::{ISSUE_PATH, MAX_CANDIDATES, capped, unresolved};
@@ -445,6 +449,284 @@ pub fn issuelink_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecErro
     body.insert("outwardIssue".to_owned(), json!({ "key": outward }));
     if let Some(comment) = comment {
         body.insert("comment".to_owned(), json!({ "body": comment }));
+    }
+    json_request(ctx, &Value::Object(body))
+}
+
+// ---- jira.worklog.add --------------------------------------------------------------------------
+
+/// The most one worklog books (PD-55, T17): four working weeks at Jira's default time tracking
+/// (1d = 8h, 1w = 5d), in minutes. A larger value is a typo or a unit mix-up, not a worklog.
+const MAX_WORKLOG_MINUTES: u32 = 4 * 5 * 8 * 60;
+
+/// A `time_spent` amount has at most this many digits (`9999`).
+const MAX_AMOUNT_DIGITS: usize = 4;
+
+/// Jira's default working time (the instance's time tracking settings can change it): hours in a
+/// day and days in a week.
+const DEFAULT_HOURS_PER_DAY: u32 = 8;
+const DEFAULT_DAYS_PER_WEEK: u32 = 5;
+
+const TIME_SHAPE: &str = "must be amounts of w, d, h or m, such as '1h 30m'";
+
+/// A worklog's `timeSpent` as Jira reads it: each of weeks, days, hours and minutes at most once,
+/// the largest first (`1w 2d 3h 4m`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TimeSpent {
+    weeks: u32,
+    days: u32,
+    hours: u32,
+    minutes: u32,
+}
+
+impl TimeSpent {
+    /// The minutes at Jira's default working time (1d = 8h, 1w = 5d).
+    fn default_minutes(self) -> u32 {
+        let days = self.weeks * DEFAULT_DAYS_PER_WEEK + self.days;
+        (days * DEFAULT_HOURS_PER_DAY + self.hours) * 60 + self.minutes
+    }
+}
+
+/// Parses a worklog's `time_spent`, strictly: single-space separated `<1-4 digits><w|d|h|m>`
+/// tokens, each unit once and the largest first, more than zero and at most
+/// [`MAX_WORKLOG_MINUTES`]. Anything Jira could read another way (`2h30m`, `1.5h`, `90s`, `2H`,
+/// two spaces, non-ASCII digits) is refused, so what is sent has one reading.
+pub(crate) fn parse_time_spent(raw: &str) -> Result<TimeSpent, &'static str> {
+    let mut amounts = [0u32; 4];
+    let mut last: Option<usize> = None;
+    for token in raw.split(' ') {
+        let Some((digits, unit)) = token.split_at_checked(token.len().saturating_sub(1)) else {
+            return Err(TIME_SHAPE);
+        };
+        let rank = match unit {
+            "w" => 0,
+            "d" => 1,
+            "h" => 2,
+            "m" => 3,
+            _ => return Err(TIME_SHAPE),
+        };
+        if digits.is_empty()
+            || digits.len() > MAX_AMOUNT_DIGITS
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(TIME_SHAPE);
+        }
+        match last {
+            Some(prev) if rank == prev => return Err("must name each unit only once"),
+            Some(prev) if rank < prev => return Err("must name the largest unit first"),
+            _ => {}
+        }
+        last = Some(rank);
+        let amount: u32 = digits.parse().map_err(|_| TIME_SHAPE)?;
+        if let Some(slot) = amounts.get_mut(rank) {
+            *slot = amount;
+        }
+    }
+    let [weeks, days, hours, minutes] = amounts;
+    let spent = TimeSpent {
+        weeks,
+        days,
+        hours,
+        minutes,
+    };
+    match spent.default_minutes() {
+        0 => Err("must be more than zero"),
+        m if m > MAX_WORKLOG_MINUTES => Err("must not exceed 4w (the most one worklog books)"),
+        _ => Ok(spent),
+    }
+}
+
+/// What the approver reads next to the sent `time_spent`: the amounts in words. Weeks and days
+/// are working time, whose length Jira's time tracking settings decide, so the seconds are given
+/// at the defaults and as that; hours and minutes alone are exact.
+pub(crate) fn describe_time_spent(raw: &str) -> Option<String> {
+    let spent = parse_time_spent(raw).ok()?;
+    let part = |n: u32, one: &str, many: &str| {
+        (n > 0).then(|| format!("{n} {}", if n == 1 { one } else { many }))
+    };
+    let words: Vec<String> = [
+        part(spent.weeks, "week", "weeks"),
+        part(spent.days, "day", "days"),
+        part(spent.hours, "hour", "hours"),
+        part(spent.minutes, "minute", "minutes"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let words = words.join(", ");
+    let minutes = spent.default_minutes();
+    let seconds = u64::from(minutes) * 60;
+    if spent.weeks == 0 && spent.days == 0 {
+        return Some(format!("{words} = {seconds} s"));
+    }
+    let (h, m) = (minutes / 60, minutes % 60);
+    let total = if m == 0 {
+        format!("{h}h")
+    } else {
+        format!("{h}h {m}m")
+    };
+    Some(format!(
+        "{words} of working time; at Jira's defaults (1d = {DEFAULT_HOURS_PER_DAY}h, \
+         1w = {DEFAULT_DAYS_PER_WEEK}d) {total} = {seconds} s, your instance's time tracking \
+         settings decide"
+    ))
+}
+
+/// A worklog's `started` in Jira's `yyyy-MM-dd'T'HH:mm:ss.SSSZ` (`2026-09-02T09:00:00.000+0200`):
+/// the local date and time and the zone's offset in seconds east of UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Started {
+    local: NaiveDateTime,
+    offset_secs: i32,
+}
+
+/// No worklog starts before this year (a typo or a wrong century).
+const EARLIEST_STARTED_YEAR: i32 = 2000;
+
+/// The zones are within `-14:00` to `+14:00`.
+const MAX_OFFSET_SECS: i32 = 14 * 3600;
+
+/// A start this far past now is not "now" (this machine's clock against the server's, and a time
+/// written in the wrong zone): a typo, refused.
+const FUTURE_SLACK_SECS: i64 = 3600;
+
+const STARTED_SHAPE: &str = "must be Jira's format, such as 2026-09-02T09:00:00.000+0200";
+
+impl Started {
+    /// The instant in UTC, when it is representable.
+    fn utc(self) -> Option<NaiveDateTime> {
+        self.local
+            .checked_sub_signed(TimeDelta::try_seconds(i64::from(self.offset_secs))?)
+    }
+
+    /// Seconds since the Unix epoch.
+    fn epoch_secs(self) -> Option<i64> {
+        Some(self.utc()?.and_utc().timestamp())
+    }
+}
+
+/// Parses a `started`, strictly: the exact shape, a real date and time (seconds up to `59`), a
+/// zone of at most 14 hours written `+hhmm` (not `Z`, not `+hh:mm`), the year at least 2000.
+/// Digits are ASCII digits only.
+pub(crate) fn parse_started(raw: &str) -> Result<Started, &'static str> {
+    let b = raw.as_bytes();
+    let digits = |from: usize, to: usize| -> Option<u32> {
+        b.get(from..to)?.iter().try_fold(0u32, |n, c| {
+            c.is_ascii_digit().then(|| n * 10 + u32::from(*c - b'0'))
+        })
+    };
+    let sep = |at: usize, want: u8| b.get(at) == Some(&want);
+    let sign = match b.get(23) {
+        Some(b'+') => 1i32,
+        Some(b'-') => -1i32,
+        _ => return Err(STARTED_SHAPE),
+    };
+    if b.len() != 28
+        || !(sep(4, b'-') && sep(7, b'-') && sep(10, b'T'))
+        || !(sep(13, b':') && sep(16, b':') && sep(19, b'.'))
+    {
+        return Err(STARTED_SHAPE);
+    }
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        digits(0, 4),
+        digits(5, 7),
+        digits(8, 10),
+        digits(11, 13),
+        digits(14, 16),
+        digits(17, 19),
+    ) else {
+        return Err(STARTED_SHAPE);
+    };
+    let (Some(_millis), Some(zone_h), Some(zone_m)) =
+        (digits(20, 23), digits(24, 26), digits(26, 28))
+    else {
+        return Err(STARTED_SHAPE);
+    };
+    let year = i32::try_from(year).map_err(|_| STARTED_SHAPE)?;
+    let (Some(date), Some(time)) = (
+        NaiveDate::from_ymd_opt(year, month, day),
+        NaiveTime::from_hms_opt(hour, minute, second),
+    ) else {
+        return Err("must be a date and time that exist");
+    };
+    if year < EARLIEST_STARTED_YEAR {
+        return Err("must not be before the year 2000");
+    }
+    let offset = i32::try_from(zone_h * 3600 + zone_m * 60).map_err(|_| STARTED_SHAPE)?;
+    if zone_m > 59 || offset > MAX_OFFSET_SECS {
+        return Err("must have a zone between -1400 and +1400");
+    }
+    Ok(Started {
+        local: date.and_time(time),
+        offset_secs: sign * offset,
+    })
+}
+
+/// Whether `started` lies in the future of this machine's clock by more than the slack. A clock
+/// that cannot be read decides nothing.
+fn started_in_future(started: Started) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok());
+    match (now, started.epoch_secs()) {
+        (Some(now), Some(at)) => at > now.saturating_add(FUTURE_SLACK_SECS),
+        _ => false,
+    }
+}
+
+/// What the approver reads next to the sent `started`: the local time with its zone and the same
+/// instant in UTC (`2026-09-02 09:00:00 at UTC+02:00 (2026-09-02 07:00:00 UTC)`).
+pub(crate) fn describe_started(raw: &str) -> Option<String> {
+    let started = parse_started(raw).ok()?;
+    let utc = started.utc()?;
+    let offset = started.offset_secs.unsigned_abs();
+    let sign = if started.offset_secs < 0 { '-' } else { '+' };
+    Some(format!(
+        "{} at UTC{sign}{:02}:{:02} ({utc} UTC)",
+        started.local,
+        offset / 3600,
+        offset % 3600 / 60,
+    ))
+}
+
+/// `POST /rest/api/2/issue/{key}/worklog` `{"timeSpent", "comment"?, "started"?}` (PD-55): the
+/// params fill the fields of the same names, verbatim (PD-42: the comment is plain text or wiki
+/// markup, `started` Jira's timestamp). Static checks first, so the validation dry call (and an
+/// edit) refuses them (exit 2): the time ([`parse_time_spent`]), the start ([`parse_started`], and
+/// not in the future) and a blank comment (`maxLength` alone lets whitespace through; refused as
+/// the link comment is). An absent or `null` optional sends nothing. No enrichment and no stale
+/// rule (§5.4 step 5: an additive op).
+pub fn worklog_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let refuse = |param: &str, message: &str| ExecError::Invalid(invalid(param, message, None));
+    let time_spent = str_param(ctx.params, "time_spent");
+    parse_time_spent(time_spent).map_err(|why| refuse("time_spent", why))?;
+    let started = match ctx.params.get("started") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if s.trim().is_empty() => {
+            return Err(refuse("started", "must not be blank"));
+        }
+        Some(Value::String(s)) => {
+            let at = parse_started(s).map_err(|why| refuse("started", why))?;
+            if started_in_future(at) {
+                return Err(refuse("started", "must not be in the future"));
+            }
+            Some(s.as_str())
+        }
+        Some(_) => return Err(refuse("started", STARTED_SHAPE)),
+    };
+    let comment = match ctx.params.get("comment") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(c)) if !c.trim().is_empty() => Some(c.as_str()),
+        Some(_) => return Err(refuse("comment", "must not be blank")),
+    };
+    let mut body = Map::new();
+    body.insert("timeSpent".to_owned(), Value::from(time_spent));
+    if let Some(comment) = comment {
+        body.insert("comment".to_owned(), Value::from(comment));
+    }
+    if let Some(started) = started {
+        body.insert("started".to_owned(), Value::from(started));
     }
     json_request(ctx, &Value::Object(body))
 }

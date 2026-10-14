@@ -229,9 +229,9 @@ pub(crate) const WORKLOG_ADD_PARAMS: &str = r#"{"$schema":"https://json-schema.o
  "required":["key","time_spent"],
  "properties":{
   "key":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},
-  "time_spent":{"type":"string","pattern":"^[0-9]+[wdhm]( [0-9]+[wdhm])*$"},
-  "comment":{"type":"string","maxLength":32768},
-  "started":{"type":"string","description":"Jira timestamp, e.g. 2026-09-02T09:00:00.000+0200."}},
+  "time_spent":{"type":"string","pattern":"^[0-9]+[wdhm]( [0-9]+[wdhm])*$","description":"Time as Jira reads timeSpent: amounts of w, d, h, m separated by single spaces, largest first, each unit once (1w 2d 3h 30m). More than zero, at most 4w. w and d are working time (Jira default 1d = 8h, 1w = 5d; the instance decides). No seconds, no decimals, no 2h30m."},
+  "comment":{"type":"string","maxLength":32768,"description":"Plain text or Jira wiki markup, sent as written (not converted from Markdown). The preview lists its macros, mentions and links."},
+  "started":{"type":"string","description":"Jira timestamp yyyy-MM-dd'T'HH:mm:ss.SSSZ with the zone as +hhmm, e.g. 2026-09-02T09:00:00.000+0200. Not Z, not +hh:mm, not in the future, not before 2000. Omitted: Jira uses the time the worklog is created."}},
  "examples":[{"key":"ABC-123","time_spent":"2h","comment":"Investigation"}]}"#;
 pub(crate) const WORKLOG_ADD_EXAMPLE: &str = r#"{"id":"11001"}"#;
 pub(crate) const WORKLOG_ADD_EXAMPLE_SPARSE: &str = r#"{"id":"11001"}"#;

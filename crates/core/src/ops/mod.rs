@@ -720,7 +720,18 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &["assignee"],
         },
     ),
-    ("jira.worklog.add", LATER_WRITE),
+    (
+        "jira.worklog.add",
+        OpImpl {
+            executor: jira_ext::worklog_add_executor,
+            previewer: jira_preview::worklog_preview,
+            // §5.4 step 5: "none" (additive op); no enrichment (PD-55). The pre-write identity
+            // call still runs.
+            stale_check: None,
+            enrich: None,
+            enrich_keys: &[],
+        },
+    ),
     (
         "jira.issuelink.create",
         OpImpl {
