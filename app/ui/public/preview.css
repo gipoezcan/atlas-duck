@@ -1,0 +1,52 @@
+/* Placeholder stylesheet for the sandboxed preview iframe (spec 6.4, PD-92).
+   Task 10 replaces it with the final rules. The renderer emits semantic
+   elements only (no class, no style attribute), so everything is styled by
+   element. Colour is never the only signal: changes carry a text glyph and a
+   weight or decoration as well. */
+body {
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  margin: 8px;
+}
+table {
+  border-collapse: collapse;
+}
+th,
+td {
+  border: 1px solid currentColor;
+  padding: 2px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+th {
+  font-weight: 700;
+}
+pre,
+code {
+  font-family: ui-monospace, Consolas, monospace;
+}
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+ins,
+del {
+  text-decoration: none;
+}
+ins {
+  font-weight: 700;
+}
+ins::before {
+  content: '+ ';
+}
+del {
+  text-decoration: line-through;
+}
+del::before {
+  content: '- ';
+}
+mark {
+  font-weight: 700;
+  outline: 1px solid currentColor;
+}

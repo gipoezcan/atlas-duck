@@ -1,0 +1,5 @@
+/* The Tauri isolation iframe is hidden here because style-src 'self' blocks
+   the inline <style> that isolation.js injects (spec 6.4). */
+#__tauri_isolation__ {
+  display: none !important;
+}
