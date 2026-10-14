@@ -190,8 +190,8 @@ test("credential_page_policy", () => {
     /first <head> element is not the CSP meta tag/,
   );
   assertFails(
-    checkCredentialPages({ "credential-windows.html": page(CREDENTIAL_POLICY.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'")) }, "dist"),
-    /dist\/credential-windows\.html: CSP contains 'unsafe-inline'/,
+    checkCredentialPages({ "credential.html": page(CREDENTIAL_POLICY.replace("script-src 'self'", "script-src 'self' 'unsafe-inline'")) }, "dist"),
+    /dist\/credential\.html: CSP contains 'unsafe-inline'/,
   );
   assertFails(
     checkCredentialPages({ "credential.html": page(CREDENTIAL_POLICY.replace("frame-src <isolation-origin>", "frame-src isolation://localhost")) }, "app/ui"),

@@ -441,6 +441,25 @@ export function checkArgStructs(files, exemptions = ARG_EXEMPTIONS) {
     if (derives && item.kind === "enum" && /\{/.test(item.body) && !/#\[serde\([^)]*\bdeny_unknown_fields\b/.test(item.attrs)) {
       errors.push(`${file}: ${name} has struct variants but no #[serde(deny_unknown_fields)]`);
     }
+    // T3's field naming (`dto::parse`, a thread-local the bounded newtypes set) holds only while
+    // nothing retries after a failed inner deserialize: no untagged enum, no flatten, no default
+    // around a bounded newtype (plain, `Option<>` or `Vec<>` fields only).
+    const serdeAttrs = [...`${item.attrs}\n${item.body}`.matchAll(/#\[serde\(([^\]]*)\)\]/g)].map((m) => m[1]);
+    for (const word of ["untagged", "flatten"]) {
+      if (serdeAttrs.some((a) => new RegExp(`\\b${word}\\b`).test(a))) {
+        errors.push(`${file}: ${name} uses #[serde(${word})]; it breaks the refused-field naming of dto::parse`);
+      }
+    }
+    const bounded = [...handImpl].filter((t) => t !== name);
+    const mentionsBounded = (type) => bounded.some((t) => new RegExp(`\\b${t}\\b`).test(type));
+    if (/#\[serde\([^\]]*\bdefault\b/.test(item.attrs) && fields(item.body).some((f) => mentionsBounded(f.type))) {
+      errors.push(`${file}: ${name} has #[serde(default)] around a bounded newtype field`);
+    }
+    for (const m of item.body.matchAll(/#\[serde\(([^\]]*)\)\]\s*(?:pub(?:\([^)]*\))?\s+)?(\w+)\s*:\s*([^,}]+)/g)) {
+      if (/\bdefault\b/.test(m[1]) && mentionsBounded(m[3])) {
+        errors.push(`${file}: ${name}.${m[2]}: no #[serde(default)] on a bounded newtype field`);
+      }
+    }
     for (const re of FORBIDDEN_TYPES) {
       if (re.test(item.body)) errors.push(`${file}: ${name} has a field of a forbidden type (${re.source}); no command takes a path or bytes (§10.3)`);
     }
@@ -448,6 +467,21 @@ export function checkArgStructs(files, exemptions = ARG_EXEMPTIONS) {
       if (FORBIDDEN_FIELD_NAME.test(f.name)) {
         errors.push(`${file}: ${name}.${f.name}: no field named like a path, PEM or certificate (§10.3)`);
       }
+    }
+  }
+  return errors;
+}
+
+/**
+ * T3 review M-9: Tauri's default `dynamic-acl` feature ships `add_capability` and
+ * `runtime_authority_mut`; app code never widens the capability files at run time (tests may).
+ */
+export function checkAclMutators(files) {
+  const errors = [];
+  for (const [file, raw] of Object.entries(files)) {
+    const src = stripTestModules(stripComments(raw));
+    for (const call of ["add_capability", "runtime_authority_mut"]) {
+      if (new RegExp(`\\b${call}\\s*\\(`).test(src)) errors.push(`${file}: ${call} widens the capability files at run time (§10.3)`);
     }
   }
   return errors;
@@ -481,8 +515,11 @@ export function readRepo(repo = REPO) {
   }
   const conf = JSON.parse(readFileSync(join(app, "tauri.conf.json"), "utf8"));
   const files = {};
-  for (const p of rustFiles(join(app, "src", "commands"))) {
-    files[relative(repo, p).replace(/\\/g, "/")] = readFileSync(p, "utf8");
+  const srcFiles = {};
+  for (const p of rustFiles(join(app, "src"))) {
+    const rel = relative(repo, p).replace(/\\/g, "/");
+    srcFiles[rel] = readFileSync(p, "utf8");
+    if (rel.startsWith("app/src-tauri/src/commands/")) files[rel] = srcFiles[rel];
   }
   return {
     namesRs: readFileSync(join(app, "src", "commands", "names.rs"), "utf8"),
@@ -491,6 +528,7 @@ export function readRepo(repo = REPO) {
     securityCapabilities: conf?.app?.security?.capabilities,
     isolationPath: join(repo, "app", "isolation", "index.html"),
     files,
+    srcFiles,
   };
 }
 
@@ -514,7 +552,7 @@ export function main(argv = process.argv.slice(2), repo = REPO) {
     }
     input.allowed = parseAllowedBlock(html);
   }
-  const errors = [...checkSurface(input).errors, ...checkArgStructs(r.files)];
+  const errors = [...checkSurface(input).errors, ...checkArgStructs(r.files), ...checkAclMutators(r.srcFiles)];
   for (const e of errors) console.log(e);
   if (errors.length === 0) console.log("check-commands: ok");
   return errors.length === 0 ? 0 : 1;

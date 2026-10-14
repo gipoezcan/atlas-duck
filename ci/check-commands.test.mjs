@@ -14,6 +14,7 @@ import {
   LISTENING_WINDOWS,
   WINDOW_COMMANDS,
   allowPermission,
+  checkAclMutators,
   checkArgStructs,
   checkSurface,
   parseAllowedBlock,
@@ -120,6 +121,7 @@ test("repository_passes", () => {
       allowed: parseAllowedBlock(html),
     }).errors,
     ...checkArgStructs(r.files),
+    ...checkAclMutators(r.srcFiles),
   ];
   assert.deepEqual(errors, []);
 });
@@ -316,4 +318,24 @@ test("test_modules_are_not_arguments", () => {
   assert.deepEqual(argErrors(ARGS_OK), []);
   // Without the cfg(test) marker the same struct is checked.
   assertFails(argErrors(ARGS_OK.replace("#[cfg(test)]", "")), /Probe/);
+});
+
+test("field_naming_rules_around_bounded_newtypes", () => {
+  const item = (attrs, body) =>
+    argErrors(`${ARGS_OK}\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields${attrs})]\npub struct DenyArgs {\n${body}\n}\n`);
+  assert.deepEqual(item("", "    pub request_id: RequestId,\n    pub reason: Option<Reason>,"), []);
+  assertFails(item("", "    #[serde(flatten)]\n    pub inner: Inner,"), /DenyArgs uses #\[serde\(flatten\)\]/);
+  assertFails(item(", default", "    pub request_id: RequestId,"), /DenyArgs has #\[serde\(default\)\] around a bounded newtype/);
+  assertFails(item("", "    #[serde(default)]\n    pub request_id: Option<RequestId>,"), /DenyArgs\.request_id: no #\[serde\(default\)\]/);
+  // `default` on a plain field is fine.
+  assert.deepEqual(item("", "    #[serde(default)]\n    pub is_default: bool,\n    pub request_id: RequestId,"), []);
+  const untagged = argErrors(`${ARGS_OK}\n#[derive(Deserialize)]\n#[serde(untagged)]\npub enum Target { Id(RequestId), Name(String) }\n`);
+  assertFails(untagged, /Target uses #\[serde\(untagged\)\]/);
+});
+
+test("acl_mutators_are_banned_outside_tests", () => {
+  for (const call of ["app.add_capability(CAP)?;", "ctx.runtime_authority_mut().add(x);"]) {
+    assertFails(checkAclMutators({ "app/src-tauri/src/lib.rs": `fn f() { ${call} }` }), /widens the capability files/);
+  }
+  assert.deepEqual(checkAclMutators({ "app/src-tauri/src/lib.rs": "#[cfg(test)]\nmod tests { fn f() { app.add_capability(C); } }\n// add_capability(x)" }), []);
 });

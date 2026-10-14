@@ -9,7 +9,6 @@ const ENTRIES = [
   'onboarding',
   'setup',
   'credential',
-  'credential-windows',
 ];
 
 // UI shell for the Tauri app (app/src-tauri reads ../ui/dist).
@@ -31,7 +30,7 @@ export default defineConfig({
         // Every module under src/credential/ goes into the one "credential"
         // chunk and nothing else joins it (PD-71, spec 10.3). The page script
         // main.ts stays in the entry chunk so that Vite's manifest still maps
-        // the credential*.html entries to it.
+        // the credential.html entry to it.
         manualChunks(id: string) {
           const path = id.replaceAll('\\', '/');
           return path.includes('/src/credential/') && !path.endsWith('/src/credential/main.ts')

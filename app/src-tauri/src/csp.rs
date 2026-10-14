@@ -5,9 +5,9 @@
 //! (`AssetOptions::isolation_schema`), and patches that origin into `default-src` only. The §6.4
 //! policy sets `frame-src` explicitly, so `tauri.conf.json` carries the literal
 //! [`ISOLATION_ORIGIN_PLACEHOLDER`] there and [`patch_context`] replaces it with this build's
-//! origin before the app is built. An HTML page with its own meta CSP (the credential page,
-//! §10.3, whose `frame-src` must name the origin too) carries the same placeholder, and
-//! [`OriginAssets`] replaces it whenever the page is served. Unpatched, the placeholder is not a
+//! origin before the app is built. The credential page's own meta CSP (§10.3), whose `frame-src`
+//! must name the origin too, carries the same placeholder, and [`OriginAssets`] replaces it
+//! whenever the page is served (or serves [`BROKEN_PAGE`]). Unpatched, the placeholder is not a
 //! valid CSP source and the iframe stays blocked: every invoke fails, nothing opens up.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
@@ -82,8 +82,31 @@ pub fn patch_context<R: Runtime>(context: &mut Context<R>) -> Result<(), CspErro
     Ok(())
 }
 
-/// The embedded frontend with this build's isolation origin in every HTML page that carries the
-/// placeholder (in its meta CSP; no other HTML names it). Everything else passes unchanged.
+/// The pages [`OriginAssets`] serves with the origin substituted: the credential entry (§10.3,
+/// PD-71), whose own meta CSP must name the isolation origin in `frame-src`. One page for every
+/// platform; no other page is touched.
+pub const ORIGIN_PAGES: [&str; 1] = ["credential.html"];
+
+/// Served in place of an origin page whose placeholder cannot be completed: no script, no frame,
+/// nothing to load, so the window can do nothing (fail closed; answering `None` would let Tauri
+/// fall back to another page).
+pub const BROKEN_PAGE: &str = "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'\"><title>atlas-duck</title></head><body></body></html>";
+
+/// `page` with every placeholder, raw or attribute-escaped, replaced by `origin`. A page without
+/// one is refused: its policy would block the isolation iframe or name no isolation origin.
+pub fn substitute_page(page: &str, origin: &str) -> Result<String, CspError> {
+    let found = page.matches(ISOLATION_ORIGIN_PLACEHOLDER).count()
+        + page.matches(PLACEHOLDER_ESCAPED).count();
+    if found == 0 || origin.contains(ISOLATION_ORIGIN_PLACEHOLDER) {
+        return Err(CspError::Placeholder);
+    }
+    Ok(page
+        .replace(ISOLATION_ORIGIN_PLACEHOLDER, origin)
+        .replace(PLACEHOLDER_ESCAPED, origin))
+}
+
+/// The embedded frontend with this build's isolation origin in the [`ORIGIN_PAGES`]; everything
+/// else passes unchanged.
 pub struct OriginAssets<R: Runtime> {
     inner: Box<dyn Assets<R>>,
     origin: String,
@@ -102,21 +125,16 @@ impl<R: Runtime> Assets<R> for OriginAssets<R> {
 
     fn get(&self, key: &AssetKey) -> Option<Cow<'_, [u8]>> {
         let bytes = self.inner.get(key)?;
-        if !key.as_ref().ends_with(".html") {
+        if !ORIGIN_PAGES.contains(&key.as_ref().trim_start_matches('/')) {
             return Some(bytes);
         }
-        match std::str::from_utf8(&bytes) {
-            Ok(text)
-                if text.contains(ISOLATION_ORIGIN_PLACEHOLDER)
-                    || text.contains(PLACEHOLDER_ESCAPED) =>
-            {
-                let text = text
-                    .replace(ISOLATION_ORIGIN_PLACEHOLDER, &self.origin)
-                    .replace(PLACEHOLDER_ESCAPED, &self.origin);
-                Some(Cow::Owned(text.into_bytes()))
-            }
-            _ => Some(bytes),
-        }
+        let page = std::str::from_utf8(&bytes)
+            .map_err(|_| CspError::Placeholder)
+            .and_then(|text| substitute_page(text, &self.origin));
+        Some(match page {
+            Ok(page) => Cow::Owned(page.into_bytes()),
+            Err(_) => Cow::Borrowed(BROKEN_PAGE.as_bytes()),
+        })
     }
 
     fn iter(&self) -> Box<AssetsIter<'_>> {
@@ -127,7 +145,6 @@ impl<R: Runtime> Assets<R> for OriginAssets<R> {
         self.inner.csp_hashes(html_path)
     }
 }
-
 /// Holds the context's asset slot while [`patch_context`] wraps the real assets.
 struct NoAssets;
 
@@ -201,32 +218,101 @@ mod tests {
     }
 
     #[test]
-    fn html_pages_get_the_origin_and_nothing_else_changes() {
-        let page =
-            r#"<meta http-equiv="Content-Security-Policy" content="frame-src <isolation-origin>">"#;
-        let escaped = r#"<meta http-equiv="Content-Security-Policy" content="frame-src &lt;isolation-origin&gt;">"#;
-        let script = "const s = '<isolation-origin>';";
-        let assets = OriginAssets::new(
-            Box::new(MapAssets(vec![
-                ("credential.html", page),
-                ("credential-windows.html", escaped),
-                ("index.html", "<p>no policy</p>"),
-                ("assets/app.js", script),
-            ])),
-            "isolation-x://localhost".into(),
+    fn substitute_page_replaces_every_placeholder_or_refuses() {
+        let o = "isolation-x://localhost";
+        assert_eq!(
+            substitute_page(r#"content="frame-src <isolation-origin>""#, o),
+            Ok(r#"content="frame-src isolation-x://localhost""#.into())
         );
-        let get = |k: &str| {
+        // The attribute-escaped spelling (how the source page writes it).
+        assert_eq!(
+            substitute_page(r#"content="frame-src &lt;isolation-origin&gt;""#, o),
+            Ok(r#"content="frame-src isolation-x://localhost""#.into())
+        );
+        // Each occurrence is replaced once, by the origin, and none survives.
+        let two = "a <isolation-origin> b &lt;isolation-origin&gt; c";
+        let out = substitute_page(two, o).unwrap_or_default();
+        assert_eq!(out, format!("a {o} b {o} c"));
+        assert_eq!(out.matches(o).count(), 2);
+        // No placeholder: refused, never served as is.
+        for page in [
+            "frame-src isolation://localhost",
+            "",
+            "&lt;isolation-origin",
+        ] {
+            assert_eq!(
+                substitute_page(page, o),
+                Err(CspError::Placeholder),
+                "{page}"
+            );
+        }
+        assert_eq!(
+            substitute_page("<isolation-origin>", "<isolation-origin>"),
+            Err(CspError::Placeholder)
+        );
+    }
+
+    #[test]
+    fn only_the_credential_page_is_rewritten_and_a_broken_one_fails_closed() {
+        let page = r#"<meta http-equiv="Content-Security-Policy" content="frame-src &lt;isolation-origin&gt;">"#;
+        let other = r#"<meta content="frame-src <isolation-origin>">"#;
+        let get = |entries: Vec<(&'static str, &'static str)>, k: &str| {
+            let assets = OriginAssets::new(
+                Box::new(MapAssets(entries)),
+                "isolation-x://localhost".into(),
+            );
             Assets::<tauri::test::MockRuntime>::get(&assets, &k.into())
                 .map(|b| String::from_utf8_lossy(&b).into_owned())
         };
         let patched = r#"<meta http-equiv="Content-Security-Policy" content="frame-src isolation-x://localhost">"#;
-        assert_eq!(get("credential.html").as_deref(), Some(patched));
-        assert_eq!(get("/credential-windows.html").as_deref(), Some(patched));
-        assert_eq!(get("index.html").as_deref(), Some("<p>no policy</p>"));
-        assert_eq!(get("assets/app.js").as_deref(), Some(script));
-        assert_eq!(get("missing.html"), None);
+        let entries = vec![
+            ("credential.html", page),
+            ("approvals.html", other),
+            ("assets/credential.js", "const s = '<isolation-origin>';"),
+        ];
+        assert_eq!(
+            get(entries.clone(), "credential.html").as_deref(),
+            Some(patched)
+        );
+        assert_eq!(
+            get(entries.clone(), "/credential.html").as_deref(),
+            Some(patched)
+        );
+        // Every other asset is served as built (an unpatched page stays blocked, never opened).
+        assert_eq!(
+            get(entries.clone(), "approvals.html").as_deref(),
+            Some(other)
+        );
+        assert_eq!(
+            get(entries.clone(), "assets/credential.js").as_deref(),
+            Some("const s = '<isolation-origin>';")
+        );
+        assert_eq!(get(entries, "missing.html"), None);
+        // A credential page without the placeholder is replaced by the inert page.
+        let stale = vec![(
+            "credential.html",
+            "<meta content=\"frame-src isolation://localhost\">",
+        )];
+        assert_eq!(get(stale, "credential.html").as_deref(), Some(BROKEN_PAGE));
+        assert!(!BROKEN_PAGE.contains("<script") && !BROKEN_PAGE.contains("<iframe"));
     }
 
+    /// A policy without the placeholder is an error and stays as it was: `frame-src` is never
+    /// widened to make up for it.
+    #[test]
+    fn unpatched_policy_is_an_error_and_unchanged() {
+        let mut context: Context<tauri::test::MockRuntime> =
+            tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
+        let narrow = "default-src 'self'; frame-src 'self'";
+        context.config_mut().app.security.csp = Some(Csp::Policy(narrow.into()));
+        assert_eq!(patch_context(&mut context), Err(CspError::Placeholder));
+        assert_eq!(
+            context.config().app.security.csp,
+            Some(Csp::Policy(narrow.into()))
+        );
+        context.config_mut().app.security.csp = None;
+        assert_eq!(patch_context(&mut context), Err(CspError::NoPolicy));
+    }
     /// The shipped config with this build's generated context: the policy names the isolation
     /// origin Tauri serves the iframe from (`isolation-<uuid>`), and no placeholder survives.
     #[test]

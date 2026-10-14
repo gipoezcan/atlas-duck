@@ -3,8 +3,9 @@ import { test } from 'node:test';
 
 import { checkBundle } from './check-credential-bundle.mjs';
 
-// Shape of Vite's manifest for this project: the two credential pages share one
-// script, so it appears as a non-entry chunk and only the built html names it.
+// A manifest whose credential script is a non-entry chunk that only the built html
+// names (the page is the seed); the single-entry shape Vite emits for the one
+// credential.html is covered below.
 const clean = () => ({
   'approvals.html': {
     file: 'assets/approvals.js',
@@ -22,7 +23,6 @@ const page = (script) => `<script type="module" src="/${script}"></script>`;
 const files = (extra = {}) => {
   const all = {
     'credential.html': page('assets/main.js'),
-    'credential-windows.html': page('assets/main.js'),
     'assets/main.js': 'document.title="x"',
     ...extra,
   };
@@ -56,6 +56,17 @@ test('a shared dynamic import fails', () => {
 test('a credential page that preloads a main-bundle chunk fails', () => {
   const read = files({ 'credential.html': page('assets/main.js') + page('assets/vendor.js') });
   assert.match(checkBundle(clean(), read).join('\n'), /vendor\.js is shared/);
+});
+
+test('a clean single credential.html entry passes', () => {
+  const m = clean();
+  delete m['_main.js'];
+  m['credential.html'] = { file: 'assets/credential.js', isEntry: true, imports: ['_credential.js'], css: ['assets/credential.css'] };
+  m['_credential.js'] = { file: 'assets/credential-chunk.js' };
+  const read = (f) => ({ 'credential.html': page('assets/credential.js'), 'assets/credential.js': 'x', 'assets/credential-chunk.js': 'y' })[f];
+  assert.deepEqual(checkBundle(m, read), []);
+  m['_credential.js'].imports = ['_vendor.js'];
+  assert.match(checkBundle(m, read).join('\n'), /vendor\.js is shared by a credential entry and approvals\.html/);
 });
 
 test('an entry keyed credential.html in the manifest is found too', () => {

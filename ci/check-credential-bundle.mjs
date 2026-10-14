@@ -9,7 +9,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export const CREDENTIAL_ENTRIES = ['credential.html', 'credential-windows.html'];
+// One page: Rust puts the build's isolation origin into its meta CSP when it serves it (M6 T4).
+export const CREDENTIAL_ENTRIES = ['credential.html'];
 export const FORBIDDEN = [
   'localStorage',
   'sessionStorage',
@@ -38,10 +39,9 @@ function closure(manifest, starts) {
 }
 
 /**
- * Manifest keys of everything a built credential page loads. Two html entries
- * with one script make Vite emit that script as a shared (non-entry) chunk, so
- * the manifest has no key for the page itself; the page's own script and link
- * tags are the reliable seed.
+ * Manifest keys of everything a built credential page loads: its manifest entry,
+ * plus every chunk the page's own script and link tags name (the reliable seed
+ * should Vite ever emit the page script as a non-entry chunk).
  */
 function credentialSeeds(manifest, readText) {
   const hrefs = new Set();

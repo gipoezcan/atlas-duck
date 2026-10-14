@@ -33,8 +33,8 @@ export const CREDENTIAL_POLICY =
 
 export const PLATFORMS = ["windows", "macos", "linux"];
 
-/** The credential entry pages (PD-71); `credential.html` is the one whose presence counts. */
-export const CREDENTIAL_PAGES = ["credential.html", "credential-windows.html"];
+/** The credential entry page (PD-71; one page since T4: Rust serves it with the build's origin). */
+export const CREDENTIAL_PAGES = ["credential.html"];
 
 /** `run_gui` must call this before it builds the app. */
 export const PATCH_CALL = "csp::patch_context(&mut context)";
