@@ -53,7 +53,8 @@ check_dispositions  # again, inside dbus-run-session and xvfb-run
 export ATLAS_DUCK_CLI_FLOWS=1
 target="${CLI_FLOWS_TEST:-cli_flows}"
 cargo_args=(test -p atlas-duck-app --features scripted-approver --locked --test "$target")
-log="$TMPDIR/$target.log"
+# the default target keeps the log name its callers (S-02, I-42/I-44) read
+if [ "$target" = cli_flows ]; then log="$TMPDIR/cli-flows.log"; else log="$TMPDIR/$target.log"; fi
 
 # --test-threads=2: the flows start whole app instances (T22 handoff).
 set +e

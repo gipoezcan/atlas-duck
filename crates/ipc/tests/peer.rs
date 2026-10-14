@@ -334,9 +334,11 @@ fn v18_walk_finds_test_origin() {
     } else {
         let mut c = Command::new("sh");
         c.arg("-c")
-            // `; exit $?` keeps the shell alive (no exec of the last command),
-            // so the shell hop is really walked through.
-            .arg(r#""$0" --ignored --exact peer_child_report --nocapture; exit $?"#)
+            // The status is saved and returned after the command: a trailing
+            // `; exit $?` alone is exec-optimised by newer dash (the shell
+            // vanished from the chain in CI), the assignment keeps the shell
+            // alive so the shell hop is really walked through.
+            .arg(r#""$0" --ignored --exact peer_child_report --nocapture; r=$?; exit $r"#)
             .arg(&me);
         c
     };
