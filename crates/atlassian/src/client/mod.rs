@@ -469,6 +469,9 @@ mod https_only_tests {
         fn system_fetch_started(&self, _: &str) -> bool {
             true
         }
+        fn write_approved(&self, _: &str, _: u64) -> bool {
+            true
+        }
     }
 
     #[tokio::test]

@@ -609,6 +609,15 @@ impl Row {
 
 /// A Jira instance at a fresh router that answers `row`'s GETs, the identity call and the write.
 async fn row_server(row: &Row, timeouts: Timeouts) -> Result<(Router, Harness), TestError> {
+    row_server_with(row, timeouts, TestHooks::none()).await
+}
+
+/// [`row_server`] with `hooks` installed.
+async fn row_server_with(
+    row: &Row,
+    timeouts: Timeouts,
+    hooks: TestHooks,
+) -> Result<(Router, Harness), TestError> {
     let router = Router::start().await?;
     router.route(
         &format!("GET {MYSELF}"),
@@ -628,6 +637,7 @@ async fn row_server(row: &Row, timeouts: Timeouts) -> Result<(Router, Harness), 
             },
         )
         .timeouts(timeouts)
+        .hooks(hooks)
         .start()
         .await?;
     Ok((router, h))
@@ -816,6 +826,59 @@ async fn i23_jira_rows_send_when_nothing_fails() -> TestResult {
         let mut want = vec![MYSELF.to_owned()];
         want.extend(row.rule.iter().map(|p| (*p).to_owned()));
         assert_eq!(stale, want, "{}", row.op);
+    }
+    Ok(())
+}
+
+/// M-18 (Δ6, PD-56) over every Jira write: the committed `WRITE_APPROVED` marks exactly the
+/// approved revision, and the execution sends only under a cover minted from that mark. With the
+/// approval taken out of the committed set while the execution holds before the mint, nothing is
+/// sent and the write ends `WRITE_FAILED {internal, class: write_cover_refused}`. The positive
+/// half is `i23_jira_rows_send_when_nothing_fails`; `i23_rows_cover_every_jira_write` keeps the
+/// table complete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m18_every_jira_write_sends_only_under_its_write_cover() -> TestResult {
+    for row in rows() {
+        let pause = Pause::new();
+        let hooks = TestHooks {
+            pause_before_write_cover: Some(pause.clone()),
+            ..TestHooks::none()
+        };
+        let (router, h) = row_server_with(&row, Timeouts::default(), hooks).await?;
+        let (id, rev) = opened(&h, &row).await?;
+        let set = h.engine().committed().clone();
+        h.approver().approve(&id).map_err(de)?;
+        let held = async {
+            tokio::time::timeout(Duration::from_secs(30), pause.reached.notified())
+                .await
+                .map_err(|_| format!("{}: never reached the mint", row.op))?;
+            assert!(set.write_approved(&id, rev), "{}", row.op);
+            assert!(!set.write_approved(&id, rev + 1), "{}", row.op);
+            set.forget_write_approved(&id);
+            Ok::<(), TestError>(())
+        }
+        .await;
+        pause.release.notify_one();
+        held?;
+        assert!(h.settled(&id, 30_000).await, "{} never settled", row.op);
+        let env = h.await_(&id, 1000).await;
+        assert_eq!(
+            (env.status, code(&env)),
+            (Status::Failed, "internal".to_owned()),
+            "{}: {}",
+            row.op,
+            env.to_json_line()
+        );
+        let failed = payloads(&h, &id, EventType::WRITE_FAILED).await?;
+        assert_eq!(failed.len(), 1, "{}", row.op);
+        assert_eq!(failed[0]["class"], "write_cover_refused", "{}", row.op);
+        assert!(
+            router.sends().is_empty(),
+            "{}: {:?}",
+            row.op,
+            router.sends()
+        );
+        assert!(!set.write_approved(&id, rev), "{}", row.op);
     }
     Ok(())
 }

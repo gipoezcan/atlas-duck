@@ -1,16 +1,18 @@
 //! The one path from `core` to the audit store (C.3), and the audit-before-effect seam
 //! (§5.1 inv. 1): `CommittedSet` holds the ids whose start record (`REQUEST_RECEIVED`,
-//! `SCRIPT_STARTED`, `SYSTEM_FETCH {phase: start}`) is durably committed; `StoreProbe` answers
-//! `atlassian::CoverIssuer` from it, so no PAT-bearing request is sent before that commit.
-//! An id enters the set only through `commit_request_received` / `commit_system_fetch_start`,
-//! and only after `AuditPort::append` returned `Ok`; an `Err` marks nothing (fail closed).
+//! `SCRIPT_STARTED`, `SYSTEM_FETCH {phase: start}`) is durably committed, and per write the
+//! revision of its latest committed `WRITE_APPROVED` (Δ6); `StoreProbe` answers
+//! `atlassian::CoverIssuer` from it, so no PAT-bearing request is sent before that commit and no
+//! write before its approval's. An id enters the set only through `commit_request_received` /
+//! `commit_system_fetch_start` / `commit_records`, and only after `AuditPort::append` (or
+//! `append_batch`) returned `Ok`; an `Err` marks nothing (fail closed).
 //! "`Ok`" means "durably committed" only for the real `Store` port: the composition root
 //! (`core.rs`) wires `StoreProbe` over the set that the `Store` port commits to, and Task 30's
 //! scanner keeps other `AuditPort`/`CommitProbe` impls and `CoverIssuer::new` calls in tests.
 //!
 //! If M2's store API changes, adapt this file and `testing/store.rs` only.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -115,19 +117,21 @@ impl AuditPort for Store {
     }
 }
 
-/// Ids whose start record is durably committed. In memory only: after a restart nothing is
-/// covered until a new start record commits.
+/// Ids whose start record is durably committed, and per write the revision counter of its latest
+/// committed `WRITE_APPROVED` (Δ6, M3 final review M-18). In memory only: after a restart nothing
+/// is covered until a new start record commits, and no write approved before it can be sent.
 #[derive(Debug, Default)]
 pub struct CommittedSet {
     requests: RwLock<HashSet<String>>,
     fetches: RwLock<HashSet<String>>,
+    approvals: RwLock<HashMap<String, u64>>,
 }
 
-fn read(l: &RwLock<HashSet<String>>) -> RwLockReadGuard<'_, HashSet<String>> {
+fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     l.read().unwrap_or_else(|e| e.into_inner())
 }
 
-fn write(l: &RwLock<HashSet<String>>) -> RwLockWriteGuard<'_, HashSet<String>> {
+fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     l.write().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -145,11 +149,25 @@ impl CommittedSet {
         write(&self.fetches).insert(fetch_id.to_owned());
     }
 
-    /// At terminal: no further request is sent under this id. Call it only after
+    /// Only with the `Ok` of the append that committed `WRITE_APPROVED` for revision `counter`
+    /// of `request_id`; private, like `mark_request` (`commit_records` is the one caller). A
+    /// later approval replaces an earlier one.
+    fn mark_write_approved(&self, request_id: &str, counter: u64) {
+        write(&self.approvals).insert(request_id.to_owned(), counter);
+    }
+
+    /// At terminal: no further request is sent under this id (nor its write). Call it only after
     /// `commit_request_received` returned (a `forget` racing the append-to-mark window would
     /// leave the id marked).
     pub fn forget_request(&self, request_id: &str) {
         write(&self.requests).remove(request_id);
+        self.forget_write_approved(request_id);
+    }
+
+    /// The write holds no live approval any more (it left `StaleCheck`/`Executing`): no write
+    /// cover for any of its revisions until a new `WRITE_APPROVED` commits.
+    pub fn forget_write_approved(&self, request_id: &str) {
+        write(&self.approvals).remove(request_id);
     }
 
     /// After the fetch's last `phase: result` record.
@@ -164,6 +182,13 @@ impl CommittedSet {
     pub fn fetch_started(&self, fetch_id: &str) -> bool {
         read(&self.fetches).contains(fetch_id)
     }
+
+    /// Revision `counter` is the latest committed approval of `request_id`, whose start record is
+    /// committed and which is not terminal.
+    pub fn write_approved(&self, request_id: &str, counter: u64) -> bool {
+        self.request_committed(request_id)
+            && read(&self.approvals).get(request_id) == Some(&counter)
+    }
 }
 
 /// `atlassian::CommitProbe` over the committed set. Core builds its `CoverIssuer` from this and
@@ -177,6 +202,10 @@ impl CommitProbe for StoreProbe {
 
     fn system_fetch_started(&self, fetch_id: &str) -> bool {
         self.0.fetch_started(fetch_id)
+    }
+
+    fn write_approved(&self, request_id: &str, candidate_counter: u64) -> bool {
+        self.0.write_approved(request_id, candidate_counter)
     }
 }
 
@@ -235,5 +264,47 @@ pub fn commit_system_fetch_start(
     }
     let committed = port.append(ev)?;
     set.mark_fetch(fetch_id);
+    Ok(committed)
+}
+
+/// The one place that marks a write approval (Δ6, M3 final review M-18): appends a transition's
+/// records (one `append` for one record, else one `append_batch`, in order) and, on `Ok`, marks
+/// `(request_id, candidate_rev.counter)` of every `WRITE_APPROVED` among them, so a write cover
+/// exists only for a committed approval of that revision. On `Err` nothing is marked. A
+/// `WRITE_APPROVED` without a `request_id` or an integer `candidate_rev.counter` refuses the
+/// whole call before anything is appended (`Invalid`). Every other record passes through.
+pub fn commit_records(
+    port: &dyn AuditPort,
+    set: &CommittedSet,
+    mut evs: Vec<NewEvent>,
+) -> Result<Vec<Committed>, AuditError> {
+    let mut approvals = Vec::new();
+    for ev in evs
+        .iter()
+        .filter(|e| e.event_type == EventType::WRITE_APPROVED)
+    {
+        let counter = ev
+            .payload
+            .get("candidate_rev")
+            .and_then(|r| r.get("counter"))
+            .and_then(Value::as_u64);
+        let (Some(request_id), Some(counter)) = (ev.request_id.clone(), counter) else {
+            return Err(AuditError::Invalid(
+                "a WRITE_APPROVED names its request_id and candidate_rev.counter",
+            ));
+        };
+        approvals.push((request_id, counter));
+    }
+    let committed = if evs.len() == 1 {
+        match evs.pop() {
+            Some(ev) => vec![port.append(ev)?],
+            None => Vec::new(),
+        }
+    } else {
+        port.append_batch(evs)?
+    };
+    for (request_id, counter) in &approvals {
+        set.mark_write_approved(request_id, *counter);
+    }
     Ok(committed)
 }

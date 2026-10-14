@@ -13,7 +13,7 @@ use super::send::{
     BodyRead, Exchange, MAX_RESPONSE_BYTES, OneRequest, Target, ausernames, header_text, read_body,
 };
 use super::{FetchControl, InstanceClient, Product};
-use crate::cover::AuditCover;
+use crate::cover::{Proof, WriteCover};
 use crate::identity::check_jira_header;
 use crate::types::{
     ApprovedWrite, ExpectedBody, FetchFailure, HttpRequestSpec, IdentityObserved, NotSentReason,
@@ -24,8 +24,20 @@ use crate::types::{
 const MAX_PRESEND_RETRIES: u32 = 1;
 
 impl InstanceClient {
-    /// `send_approved_ctl` with a fresh control.
-    pub async fn send_approved(&self, cover: &AuditCover, w: &ApprovedWrite) -> WriteOutcome {
+    /// `send_approved_ctl` with a fresh control. The write-scoped cover is the proof of the
+    /// committed `WRITE_APPROVED` (Δ6, M3 final review M-18); a request cover, which covers the
+    /// GETs before the write, is no such proof (`request_cover_is_not_a_write_cover`):
+    ///
+    /// ```compile_fail,E0308
+    /// # async fn f(
+    /// #     c: &atlas_duck_atlassian::InstanceClient,
+    /// #     cover: &atlas_duck_atlassian::AuditCover,
+    /// #     w: &atlas_duck_atlassian::ApprovedWrite,
+    /// # ) {
+    /// let _ = c.send_approved(cover, w).await;
+    /// # }
+    /// ```
+    pub async fn send_approved(&self, cover: &WriteCover, w: &ApprovedWrite) -> WriteOutcome {
         self.send_approved_ctl(cover, w, &FetchControl::new()).await
     }
 
@@ -37,7 +49,7 @@ impl InstanceClient {
     /// cannot say which requests of a partly executed list took effect.
     pub async fn send_approved_ctl(
         &self,
-        cover: &AuditCover,
+        cover: &WriteCover,
         w: &ApprovedWrite,
         ctl: &FetchControl,
     ) -> WriteOutcome {
@@ -55,7 +67,7 @@ impl InstanceClient {
         };
         let mut retries = 0;
         loop {
-            match self.exchange(cover, &req, ctl).await {
+            match self.exchange(Proof::Write(cover), &req, ctl).await {
                 Ok(ex) => return self.finish_write(ex, spec, &w.success, ctl).await,
                 Err(FetchFailure::PreSendConnection(_))
                     if retries < MAX_PRESEND_RETRIES && Instant::now() < budget_end =>

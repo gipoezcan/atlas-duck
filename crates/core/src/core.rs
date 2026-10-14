@@ -178,6 +178,9 @@ pub struct TestHooks {
     /// (`WRITE_EXECUTED`): it stays `executing` until released (the shutdown tests' deterministic
     /// executing write).
     pub pause_before_write_result: Option<Arc<Pause>>,
+    /// A write holds after its passed stale check and last approval check, right before its
+    /// write cover is minted (M-18: a test can take the approval out of the committed set).
+    pub pause_before_write_cover: Option<Arc<Pause>>,
     /// Notified the first time the shutdown sweep lists an `executing` write it will wait for.
     pub sweep_listed_write: Option<Arc<tokio::sync::Notify>>,
 }

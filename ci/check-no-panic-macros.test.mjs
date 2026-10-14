@@ -158,6 +158,58 @@ test("test code is exempt from the cover rules", () => {
   assert.equal(scanCoverMinting("crates/atlassian/src/client/mod.rs", src).length, 2);
 });
 
+// ---------- write covers (M5 Task 20, M-18) ----------
+
+const ENGINE_WRITE = "crates/core/src/engine/write.rs";
+
+test("for_write( only in engine/write.rs and its definition in cover.rs", () => {
+  const call = "let cover = engine.covers().for_write(&entry.head.request_id, approval.counter());";
+  assert.deepEqual(scanCoverMinting(ENGINE_WRITE, call), []);
+  assert.deepEqual(scanCoverMinting(ATLASSIAN_COVER, "pub fn for_write(&self, request_id: &str, candidate_counter: u64) {}"), []);
+  for (const f of ["crates/core/src/engine/read.rs", "crates/core/src/decision/mod.rs", "crates/atlassian/src/client/write.rs", "app/src-tauri/src/main.rs"]) {
+    assert.deepEqual(scanCoverMinting(f, `\n${call}`), [`${f}:2: CoverIssuer::for_write outside engine/write.rs`]);
+  }
+  // The UFCS form and a split call are seen too; a name that only ends in for_write is not.
+  const f = "crates/core/src/engine/mod.rs";
+  assert.equal(scanCoverMinting(f, "CoverIssuer::for_write(&issuer, id, 3)").length, 1);
+  assert.equal(scanCoverMinting(f, "issuer.for_write (\n  id, 3)").length, 1);
+  assert.deepEqual(scanCoverMinting(f, "let x = plan_for_write(id);"), []);
+  // Comments and strings are not code.
+  assert.deepEqual(scanCoverMinting(f, '// issuer.for_write(id, 3)\nlet s = "for_write(";'), []);
+});
+
+test("a WriteCover literal outside cover.rs is a violation, a type use is not", () => {
+  const f = "crates/core/src/engine/write.rs";
+  assert.deepEqual(scanCoverMinting(f, "let c = WriteCover { request_id: id, candidate_counter: 3 };"), [
+    `${f}:1: WriteCover constructed outside cover.rs`,
+  ]);
+  assert.equal(scanCoverMinting(f, "let c = atlas_duck_atlassian::WriteCover(id, 3);").length, 1);
+  assert.deepEqual(
+    scanCoverMinting(f, "fn send(c: &WriteCover) -> Result<WriteCover, NotCommitted> { todo }\nlet v: Option<WriteCover> = None;"),
+    [],
+  );
+  // A return type or an impl header is followed by a brace, but constructs nothing.
+  assert.deepEqual(scanCoverMinting(f, "fn pass(c: WriteCover) -> WriteCover {\n    c\n}\nimpl Marker for WriteCover {}"), []);
+  assert.deepEqual(
+    scanCoverMinting(ATLASSIAN_COVER, "pub struct WriteCover {\n    request_id: String,\n}\nOk(WriteCover { request_id, candidate_counter })"),
+    [],
+  );
+});
+
+test("renaming WriteCover on import is a violation outside the allowed files", () => {
+  const f = "crates/core/src/engine/mod.rs";
+  assert.deepEqual(scanCoverMinting(f, "use atlas_duck_atlassian::WriteCover as Cover;"), [
+    `${f}:1: renamed import of a cover type`,
+  ]);
+});
+
+test("test code is exempt from the write-cover rules", () => {
+  const src = "let c = CoverIssuer::new(Arc::new(AllCommitted)).for_write(\"req_test\", 1);\nlet w = WriteCover { request_id: x, candidate_counter: 1 };";
+  assert.deepEqual(scanCoverMinting("crates/atlassian/src/testing/mod.rs", src), []);
+  assert.deepEqual(scanCoverMinting("crates/atlassian/tests/cover.rs", src), []);
+  assert.deepEqual(scanCoverMinting("crates/core/src/engine/mod.rs", `#[cfg(test)]\nmod tests {\n${src}\n}`), []);
+});
+
 // ---------- the real workspace ----------
 
 test("the real workspace passes: node ci/check-no-panic-macros.mjs exits 0", () => {

@@ -1,6 +1,7 @@
 //! The audit guard (§5.1 invariant 1, §7.2): no PAT-bearing request without proof that its
-//! start record is committed. The proof can only be minted by `CoverIssuer`, whose probe
-//! answers from the in-memory set `core` fills after `AuditPort::append` returned `Ok`.
+//! start record is committed, and no write without proof that its `WRITE_APPROVED` is (Δ6). The
+//! proof can only be minted by `CoverIssuer`, whose probe answers from the in-memory set `core`
+//! fills after `AuditPort::append` returned `Ok`.
 
 use std::fmt;
 use std::sync::Arc;
@@ -50,10 +51,65 @@ impl fmt::Debug for AuditCover {
     }
 }
 
-/// Answers from the set of ids whose start record `core` has durably committed.
+/// Proof of a committed `WRITE_APPROVED` for revision `candidate_counter` of the write
+/// `request_id` (§5.1 inv. 1 and 3: the execution of a write is gated by its committed record;
+/// Δ6, M3 final review M-18). The only proof `send_approved` accepts: a request cover (`AuditCover`)
+/// covers the GETs before it, never the write.
+///
+/// No public fields, no public constructor, not `Clone`, not `Default`, not `Deserialize`: the only
+/// way to obtain one is `CoverIssuer::for_write`, whose probe answers `true` only for the latest
+/// committed approval of that write.
+///
+/// ```compile_fail,E0451
+/// let _ = atlas_duck_atlassian::WriteCover { request_id: String::new(), candidate_counter: 1 };
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn cloneable<T: Clone>() {}
+/// cloneable::<atlas_duck_atlassian::WriteCover>();
+/// ```
+pub struct WriteCover {
+    request_id: String,
+    candidate_counter: u64,
+}
+
+impl WriteCover {
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn candidate_counter(&self) -> u64 {
+        self.candidate_counter
+    }
+}
+
+impl fmt::Debug for WriteCover {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "WriteCover({}, {})",
+            self.request_id, self.candidate_counter
+        )
+    }
+}
+
+/// What the client's send path takes as the proof of a committed covering record. The borrow is
+/// the proof; nothing reads it.
+pub(crate) enum Proof<'a> {
+    /// A GET or the read `POST` (request or system-fetch start record).
+    Start(#[allow(dead_code)] &'a AuditCover),
+    /// The approved write (its committed `WRITE_APPROVED`).
+    Write(#[allow(dead_code)] &'a WriteCover),
+}
+
+/// Answers from the set of ids whose start record `core` has durably committed, and from the
+/// latest committed `WRITE_APPROVED` of each write.
 pub trait CommitProbe: Send + Sync {
     fn request_committed(&self, request_id: &str) -> bool;
     fn system_fetch_started(&self, fetch_id: &str) -> bool;
+    /// `true` only while revision `candidate_counter` is the latest committed approval of the
+    /// write `request_id` (a later approval, a return to the queue or the terminal state ends it).
+    fn write_approved(&self, request_id: &str, candidate_counter: u64) -> bool;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +146,23 @@ impl CoverIssuer {
         if self.probe.system_fetch_started(fetch_id) {
             Ok(AuditCover {
                 kind: CoverKind::SystemFetch(fetch_id.to_owned()),
+            })
+        } else {
+            Err(NotCommitted)
+        }
+    }
+
+    /// The cover of one approved write (PD-56: `core::engine::write::execute` is the only
+    /// caller, right before the send).
+    pub fn for_write(
+        &self,
+        request_id: &str,
+        candidate_counter: u64,
+    ) -> Result<WriteCover, NotCommitted> {
+        if self.probe.write_approved(request_id, candidate_counter) {
+            Ok(WriteCover {
+                request_id: request_id.to_owned(),
+                candidate_counter,
             })
         } else {
             Err(NotCommitted)

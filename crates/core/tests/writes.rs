@@ -19,7 +19,7 @@ use atlas_duck_core::engine::write::RefreshCause;
 use atlas_duck_core::lifecycle::model::InstanceEvt;
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::{FaultPlan, Harness, InstanceAt};
-use atlas_duck_core::{DecisionError, DenyDetails, Edits};
+use atlas_duck_core::{DecisionError, DenyDetails, Edits, Pause, TestHooks};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::proto::{AwaitParams, ProgressNotification, ProgressSink};
 use atlas_duck_preview::PreviewBody;
@@ -1417,5 +1417,172 @@ async fn write_edited_original_is_the_agents_params() -> TestResult {
         "{res:?}"
     );
     assert!(records(&h, &id, EventType::WRITE_DENIED).await?.is_empty());
+    Ok(())
+}
+
+// ---- M-18 (Δ6, PD-56): the write-scoped cover ---------------------------------------------------
+
+const COMMENT_PATH: &str = "/rest/api/2/issue/ABC-1/comment";
+
+/// Waits (10 s at most) until a flow holds at `pause`.
+async fn reached(pause: &Pause) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .map_err(|_| TestError::from("the flow never reached the pause"))
+}
+
+/// M-18: the write leaves only under a cover minted from its committed `WRITE_APPROVED`. An
+/// approval whose append failed marks nothing (nothing is sent, `audit_failure`); a committed one
+/// marks exactly its own revision while the write executes, and the terminal state forgets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m18_execute_uses_write_cover() -> TestResult {
+    let plan = FaultPlan::new();
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .faults(plan.clone())
+        .hooks(TestHooks {
+            pause_before_write_result: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    identity_ok(mock).await;
+    comment_ok(mock).await;
+    let set = h.engine().committed().clone();
+
+    let failed = queued(&h, COMMENT, comment_params()).await?;
+    let rev = h.approver().rev(&failed).map_err(de)?.counter;
+    plan.fail_nth(EventType::WRITE_APPROVED, 1);
+    let res = h.approver().approve(&failed);
+    assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
+    assert!(!set.write_approved(&failed, rev));
+    let env = h.await_(&failed, 5000).await;
+    assert_eq!(
+        (env.status, exit(&env), code(&env)),
+        (Status::Failed, 1, "audit_failure".to_owned())
+    );
+    assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 0);
+
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    let rev = h.approver().rev(&id).map_err(de)?.counter;
+    h.approver().approve(&id).map_err(de)?;
+    let executing = async {
+        reached(&pause).await?;
+        assert!(set.write_approved(&id, rev));
+        assert!(!set.write_approved(&id, rev + 1));
+        assert!(!set.write_approved(&failed, rev));
+        assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 1);
+        Ok::<(), TestError>(())
+    }
+    .await;
+    pause.release.notify_one();
+    executing?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    assert!(!set.write_approved(&id, rev));
+    Ok(())
+}
+
+/// M-18: an execution whose approval is not (or no longer) in the committed set mints no cover
+/// and sends nothing: `WRITE_FAILED {internal, class: write_cover_refused}` after the passed
+/// stale check (the test takes the approval out while the execution holds before the mint).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m18_refused_write_cover_sends_nothing() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_before_write_cover: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    identity_ok(mock).await;
+    comment_ok(mock).await;
+    let set = h.engine().committed().clone();
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    let rev = h.approver().rev(&id).map_err(de)?.counter;
+    h.approver().approve(&id).map_err(de)?;
+    let held = async {
+        reached(&pause).await?;
+        assert!(set.write_approved(&id, rev));
+        set.forget_write_approved(&id);
+        assert!(!set.write_approved(&id, rev));
+        Ok::<(), TestError>(())
+    }
+    .await;
+    pause.release.notify_one();
+    held?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(
+        (env.status, exit(&env), code(&env)),
+        (Status::Failed, 1, "internal".to_owned()),
+        "{}",
+        env.to_json_line()
+    );
+    let failed = one(&h, &id, EventType::WRITE_FAILED).await?;
+    assert_eq!(failed["class"], "write_cover_refused");
+    assert_eq!(failed["code"], "internal");
+    assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 0);
+    let types = h.event_types(&id).await?;
+    assert!(!types.contains(&EventType::WRITE_EXECUTED), "{types:?}");
+    assert_eq!(records(&h, &id, EventType::PREVIEW_FETCH).await?.len(), 1);
+    Ok(())
+}
+
+/// M-18: approve, then a stale return (credential changed during the stale check) and a
+/// re-approval of the refreshed revision. The returned write holds no approval; once re-approved
+/// only the new revision is covered, so the first approval's execution could not mint a cover
+/// for its counter even past the M3 approval binding. Exactly one write leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m18_superseded_approval_cannot_send() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_before_write_result: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    myself_first_slow(mock, 1500, 200).await;
+    comment_ok(mock).await;
+    let set = h.engine().committed().clone();
+    let id = queued(&h, COMMENT, comment_params()).await?;
+    let first = h.approver().rev(&id).map_err(de)?.counter;
+    h.approver().approve(&id).map_err(de)?;
+    assert!(set.write_approved(&id, first));
+    h.engine()
+        .refresh_write(
+            &entry_of(&h, &id)?,
+            RefreshCause::Instance(InstanceEvt::CredentialChanged),
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+    assert!(!set.write_approved(&id, first), "a returned write");
+    let item = rev_after(&h, &id, first + 1).await?;
+    assert!(item.approvable);
+    let second = item.candidate_rev.counter;
+    assert!(!set.write_approved(&id, second), "not approved yet");
+    h.approver().approve(&id).map_err(de)?;
+    let executing = async {
+        reached(&pause).await?;
+        assert!(!set.write_approved(&id, first));
+        assert!(set.write_approved(&id, second));
+        assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 1);
+        Ok::<(), TestError>(())
+    }
+    .await;
+    pause.release.notify_one();
+    executing?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    assert_eq!(hits(mock, "POST", COMMENT_PATH).await, 1);
+    assert_eq!(records(&h, &id, EventType::WRITE_APPROVED).await?.len(), 2);
+    assert!(!set.write_approved(&id, second));
     Ok(())
 }

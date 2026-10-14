@@ -139,6 +139,9 @@ impl CommitProbe for NothingCommitted {
     fn system_fetch_started(&self, _: &str) -> bool {
         false
     }
+    fn write_approved(&self, _: &str, _: u64) -> bool {
+        false
+    }
 }
 
 /// The compile-time half (no `AuditCover` outside `CoverIssuer`) is the `compile_fail` doctest on
@@ -148,6 +151,7 @@ async fn no_cover_no_request() -> TestResult {
     let issuer = CoverIssuer::new(Arc::new(NothingCommitted));
     assert_eq!(issuer.for_request("req_a").err(), Some(NotCommitted));
     assert_eq!(issuer.for_system_fetch("fetch_a").err(), Some(NotCommitted));
+    assert_eq!(issuer.for_write("req_a", 1).err(), Some(NotCommitted));
     assert!(
         CoverIssuer::new(Arc::new(AllCommitted))
             .for_request("req_a")

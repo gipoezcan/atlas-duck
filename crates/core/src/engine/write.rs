@@ -2263,19 +2263,24 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
         .await;
     if passed.is_ok() {
         queue_changed(engine, entry);
-        execute(engine, entry, &http, &cover, approval).await;
+        execute(engine, entry, &http, approval).await;
     }
 }
 
 // ---- 5. execution ---------------------------------------------------------------------------------
 
+/// Plan text (PD-56): the `WRITE_FAILED` class of an execution whose approval was not (or no
+/// longer) the committed one when its write cover was minted; nothing was sent.
+const CLASS_WRITE_COVER_REFUSED: &str = "write_cover_refused";
+
 /// §5.4 step 6: the list held in the entry is re-hashed and must equal the committed approval;
-/// then exactly that request is sent and its outcome recorded.
+/// then exactly that request is sent, under a write cover minted from the committed
+/// `WRITE_APPROVED` of this approval's revision (Δ6, PD-56: the only `for_write` caller), and its
+/// outcome recorded.
 async fn execute(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
     http: &InstanceHttp,
-    cover: &atlas_duck_atlassian::AuditCover,
     approval: Approval,
 ) {
     let held = {
@@ -2291,28 +2296,7 @@ async fn execute(
     let (requests, approved, edit) = held.unwrap_or_default();
     let index = requests.first().map_or(0, |r| r.index);
     if approved.is_none() || approved != Some(list_hash(&requests)) {
-        // Nothing was sent; still a terminal outcome event of an approved write (M-8: an append
-        // failure here is `outcome_unknown`, conservative and intended).
-        let record = payloads::write_failed(
-            &entry.ctx,
-            index,
-            ErrorCode::Internal,
-            MSG_WRITE_INTERNAL,
-            &WriteFailure::Class {
-                class: "request_set_mismatch",
-                status: None,
-                received: &[],
-            },
-        );
-        let _ = finish(
-            engine,
-            entry,
-            Event::Executed(ExecOutcome::Failed),
-            record,
-            Some(AttentionKind::Failed),
-            Some(approval),
-        )
-        .await;
+        not_executed(engine, entry, index, "request_set_mismatch", approval).await;
         return;
     }
     let ctl = FetchControl::new();
@@ -2325,8 +2309,21 @@ async fn execute(
     if !approval.current(&entry.state().model) {
         return;
     }
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks.pause_before_write_cover.clone() {
+        pause.hold().await;
+    }
+    // M-18: the type now enforces what the control flow above guarantees. A cover exists only
+    // while this approval's `WRITE_APPROVED` is the write's latest committed one.
+    let Ok(cover) = engine
+        .covers()
+        .for_write(&entry.head.request_id, approval.rev)
+    else {
+        not_executed(engine, entry, index, CLASS_WRITE_COVER_REFUSED, approval).await;
+        return;
+    };
     let seen = engine.identity_epoch(&entry.instance_id);
-    let outcome = http.client.send_approved_ctl(cover, &w, &ctl).await;
+    let outcome = http.client.send_approved_ctl(&cover, &w, &ctl).await;
     #[cfg(feature = "testing")]
     if let Some(pause) = engine.hooks.pause_before_write_result.clone() {
         pause.hold().await;
@@ -2334,6 +2331,38 @@ async fn execute(
     // Bodies of the outcomes that do not carry their response (§7.2: audit-only, T10 handoff).
     let received = ctl.take_captured().partial;
     settle_execution(engine, entry, outcome, &received, edit, approval, seen).await;
+}
+
+/// An approved write refused before anything was sent: `WRITE_FAILED {internal, class}`, still a
+/// terminal outcome event of an approved write (M-8: an append failure here is
+/// `outcome_unknown`, conservative and intended).
+async fn not_executed(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    index: u32,
+    class: &'static str,
+    approval: Approval,
+) {
+    let record = payloads::write_failed(
+        &entry.ctx,
+        index,
+        ErrorCode::Internal,
+        MSG_WRITE_INTERNAL,
+        &WriteFailure::Class {
+            class,
+            status: None,
+            received: &[],
+        },
+    );
+    let _ = finish(
+        engine,
+        entry,
+        Event::Executed(ExecOutcome::Failed),
+        record,
+        Some(AttentionKind::Failed),
+        Some(approval),
+    )
+    .await;
 }
 
 /// The single source of truth for a write's outcome (§5.4 step 6, §7.2, §11.2).

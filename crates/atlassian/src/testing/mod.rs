@@ -14,7 +14,7 @@ pub use mock_dc::{MockDc, UserKind, XAuser};
 pub use raw_server::{RawHttpServer, RawStep, TestTlsServer, generate_ca_pem};
 
 use crate::client::{BuildError, ClientConfig, InstanceClient, Product, ProxyChoice, Timeouts};
-use crate::cover::{AuditCover, CommitProbe, CoverIssuer, DateObserver, NotCommitted};
+use crate::cover::{AuditCover, CommitProbe, CoverIssuer, DateObserver, NotCommitted, WriteCover};
 use crate::credentials::{
     CredentialError, CredentialProvider, PatSecret, StoredCredential, StoredIdentity,
 };
@@ -164,11 +164,19 @@ impl CommitProbe for AllCommitted {
     fn system_fetch_started(&self, _fetch_id: &str) -> bool {
         true
     }
+    fn write_approved(&self, _request_id: &str, _candidate_counter: u64) -> bool {
+        true
+    }
 }
 
 /// A cover for `req_test` from `AllCommitted`.
 pub fn test_cover() -> Result<AuditCover, NotCommitted> {
     CoverIssuer::new(Arc::new(AllCommitted)).for_request("req_test")
+}
+
+/// A write cover for revision 1 of `req_test` from `AllCommitted`.
+pub fn test_write_cover() -> Result<WriteCover, NotCommitted> {
+    CoverIssuer::new(Arc::new(AllCommitted)).for_write("req_test", 1)
 }
 
 /// A built client with its doubles.

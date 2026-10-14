@@ -23,7 +23,7 @@ pub use client::{
     BuildError, Captured, ClientConfig, FetchControl, InstanceClient, Product, ProxyChoice,
     Timeouts,
 };
-pub use cover::{AuditCover, CommitProbe, CoverIssuer, DateObserver, NotCommitted};
+pub use cover::{AuditCover, CommitProbe, CoverIssuer, DateObserver, NotCommitted, WriteCover};
 pub use credentials::{
     CredentialError, CredentialProvider, PatSecret, StoredCredential, StoredIdentity,
 };

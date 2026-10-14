@@ -29,6 +29,10 @@ impl CommitProbe for SetProbe {
             .map(|s| s.contains(fetch_id))
             .unwrap_or(false)
     }
+    /// The guard tests send no write.
+    fn write_approved(&self, _: &str, _: u64) -> bool {
+        false
+    }
 }
 
 #[test]

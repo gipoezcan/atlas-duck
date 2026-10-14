@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use super::classify::{ConnFlags, execute_error_class, is_json_content_type, retry_after_wait};
 use super::limiter::Acquired;
 use super::{FetchControl, InstanceClient, Product, Timeouts};
-use crate::cover::AuditCover;
+use crate::cover::{AuditCover, Proof};
 use crate::credentials::{PatSecret, StoredCredential};
 use crate::guard::{Outgoing, SendMode, method_guard};
 use crate::identity::check_jira_header;
@@ -174,7 +174,7 @@ impl InstanceClient {
         req: OneRequest<'_>,
         ctl: &FetchControl,
     ) -> FetchOutcome {
-        let ex = match self.exchange(cover, &req, ctl).await {
+        let ex = match self.exchange(Proof::Start(cover), &req, ctl).await {
             Ok(ex) => ex,
             Err(f) => return failed(f),
         };
@@ -244,12 +244,13 @@ impl InstanceClient {
     /// failure; `Ok` holds the response that is not retried, its body unread.
     pub(crate) async fn exchange(
         &self,
-        cover: &AuditCover,
+        proof: Proof<'_>,
         req: &OneRequest<'_>,
         ctl: &FetchControl,
     ) -> Result<Exchange<'_>, FetchFailure> {
-        // Holding a cover is the proof of a committed start record (§5.1 inv. 1).
-        let _ = cover;
+        // Holding a cover is the proof of a committed start record, or for the approved write of
+        // its committed `WRITE_APPROVED` (§5.1 inv. 1 and 3).
+        let _ = proof;
         let mode = req.target.mode();
 
         // Step 1: the request as it will be written, the method guard on it, the credential, the

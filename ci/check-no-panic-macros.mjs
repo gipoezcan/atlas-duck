@@ -6,8 +6,10 @@
 //    `.unwrap()` or `.expect(` (the clippy lints say the same; this is the check that does not
 //    depend on a lint attribute staying in place).
 // 2. Cover minting (Task 8/17 handoff): `CoverIssuer::new`, `CommitProbe` impls and `AuditPort`
-//    impls only in the composition root and `audit_port.rs`. A text tripwire against mistakes,
-//    not against a malicious contributor: macro-generated impls are not seen.
+//    impls only in the composition root and `audit_port.rs`; write covers (M5 Task 20, M-18):
+//    `for_write(` only in `core/src/engine/write.rs` (and its definition in `cover.rs`), a
+//    `WriteCover` literal only in `cover.rs`. A text tripwire against mistakes, not against a
+//    malicious contributor: macro-generated impls are not seen.
 //
 // Usage: node ci/check-no-panic-macros.mjs
 // Exit 0 = ok. Exit 1 = violations (one `file:line: text` per line on stdout).
@@ -30,6 +32,10 @@ export const PANIC_PATTERNS = [
 export const COVER_NEW_ALLOWED = ["crates/atlassian/src/cover.rs", "crates/core/src/core.rs"];
 export const AUDIT_PORT_FILE = "crates/core/src/audit_port.rs";
 export const COMPOSITION_ROOT = "crates/core/src/core.rs";
+export const ATLASSIAN_COVER_FILE = "crates/atlassian/src/cover.rs";
+/// M5 Task 20 (M-18, PD-56): `engine::write::execute` is the only `for_write` caller (and
+/// `cover.rs` defines it).
+export const FOR_WRITE_ALLOWED = [ATLASSIAN_COVER_FILE, "crates/core/src/engine/write.rs"];
 
 const posix = (p) => p.split(sep).join("/");
 
@@ -195,7 +201,15 @@ export function scanCoverMinting(file, src) {
     each(/\bimpl\b[^{;]*\bAuditPort\s+for\b/g, (m) => add(m.index, "AuditPort impl outside audit_port.rs"));
   }
   if (f !== AUDIT_PORT_FILE && !COVER_NEW_ALLOWED.includes(f)) {
-    each(/\b(?:CoverIssuer|CommitProbe|AuditPort)\s+as\b/g, (m) => add(m.index, "renamed import of a cover type"));
+    each(/\b(?:CoverIssuer|CommitProbe|AuditPort|WriteCover)\s+as\b/g, (m) => add(m.index, "renamed import of a cover type"));
+  }
+  if (!FOR_WRITE_ALLOWED.includes(f)) {
+    each(/\bfor_write\s*\(/g, (m) => add(m.index, "CoverIssuer::for_write outside engine/write.rs"));
+  }
+  if (f !== ATLASSIAN_COVER_FILE) {
+    // A struct literal or a tuple-struct call; a return type (`-> WriteCover {`) and an impl
+    // header (`for WriteCover {`) construct nothing.
+    each(/(?<!->\s*)(?<!\bfor\s+)\bWriteCover\s*[{(]/g, (m) => add(m.index, "WriteCover constructed outside cover.rs"));
   }
   return found.sort((a, b) => a.index - b.index).map((x) => x.text);
 }

@@ -51,7 +51,7 @@ use atlas_duck_registry::{OpClass, OperationSpec};
 use serde_json::Value;
 use tokio::sync::{Semaphore, watch};
 
-use crate::audit_port::{AuditPort, CommittedSet};
+use crate::audit_port::{AuditPort, CommittedSet, commit_records};
 use crate::core::NativeConfirmer;
 use crate::decision::SessionKey;
 use crate::gate::{UiEvent, UiSink};
@@ -1215,16 +1215,12 @@ impl Engine {
             }
             Prepared::step(&st, event).map_err(TransitionError::Rejected)?
         };
-        let mut evs = records(&prepared.clone);
-        let appended = if evs.len() == 1 {
-            match evs.pop() {
-                Some(ev) => self.blocking(move |p| p.append(ev).map(|_| ())).await,
-                None => Ok(()),
-            }
-        } else {
-            self.blocking(move |p| p.append_batch(evs).map(|_| ()))
-                .await
-        };
+        let evs = records(&prepared.clone);
+        // A `WRITE_APPROVED` among them is cover-ready once this append returned `Ok` (Δ6).
+        let set = self.committed.clone();
+        let appended = self
+            .blocking(move |p| commit_records(p, &set, evs).map(|_| ()))
+            .await;
         if let Err(e) = appended {
             if on_fail == OnAuditFailure::FailRequest {
                 self.fail_unlogged(entry);
@@ -1280,7 +1276,9 @@ impl Engine {
             evs.push(s.record);
             prepared.push((s.entry, s.event, p, s.on_apply));
         }
-        self.blocking(move |p| p.append_batch(evs).map(|_| ()))
+        // Each item's `WRITE_APPROVED` is cover-ready once the batch committed (Δ6).
+        let set = self.committed.clone();
+        self.blocking(move |p| commit_records(p, &set, evs).map(|_| ()))
             .await
             .map_err(BatchCommitError::Audit)?;
         // `after_change` with every item's gate held, as `transition_gated` runs it with its
@@ -1356,14 +1354,21 @@ impl Engine {
     /// answered from the log from now on. Every path that makes a request terminal ends here.
     fn after_change(&self, entry: &Arc<RequestEntry>) {
         entry.publish();
-        let (terminal, logged, outcome) = {
+        let (terminal, approved, logged, outcome) = {
             let st = entry.state();
             (
                 !is_pending(st.model.phase()),
+                matches!(st.model.phase(), Phase::StaleCheck | Phase::Executing),
                 st.unlogged_terminal.is_none(),
                 sim_outcome(&st),
             )
         };
+        // A write that left `StaleCheck`/`Executing` (a return to the queue, an approval whose
+        // step was refused after its commit, the terminal state) holds no live approval: no
+        // write cover for it until its next `WRITE_APPROVED` commits (Δ6).
+        if !approved {
+            self.committed.forget_write_approved(&entry.head.request_id);
+        }
         if terminal {
             if let Some(o) = outcome {
                 self.similarity

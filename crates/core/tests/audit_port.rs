@@ -16,7 +16,7 @@ use atlas_duck_audit::{
     request_set_hash,
 };
 use atlas_duck_core::audit_port::{
-    AuditPort, CommittedSet, DateBridge, StoreProbe, commit_request_received,
+    AuditPort, CommittedSet, DateBridge, StoreProbe, commit_records, commit_request_received,
     commit_system_fetch_start,
 };
 use atlas_duck_core::ids::{BatchId, FetchId, RequestId};
@@ -257,6 +257,136 @@ fn fetch_cover_only_after_start_record() -> TestResult {
 
     set.forget_fetch(fid.as_str());
     assert!(issuer.for_system_fetch(fid.as_str()).is_err());
+    Ok(())
+}
+
+fn comment_record() -> Vec<RequestRecord> {
+    vec![RequestRecord {
+        index: 0,
+        method: "POST".into(),
+        resolved_url: "https://jira.corp/rest/api/2/issue/ABC-1/comment".into(),
+        content_type: Some("application/json".into()),
+        body_bytes: br#"{"body":"hi"}"#.to_vec(),
+    }]
+}
+
+fn approved(request_id: &str, counter: u64) -> NewEvent {
+    payloads::write_approved(
+        &ctx(request_id),
+        &CandidateRev {
+            counter,
+            candidate_hash: [9; 32],
+        },
+        &comment_record(),
+        false,
+    )
+}
+
+/// M-18 (Δ6): a write cover exists only for the revision whose `WRITE_APPROVED` append returned
+/// `Ok`, alone or in a batch; a later approval supersedes it; the terminal state forgets it.
+#[test]
+fn write_cover_only_after_write_approved_commits() -> TestResult {
+    let ts = TempStore::new()?;
+    let plan = FaultPlan::new();
+    plan.fail_nth(EventType::WRITE_APPROVED, 1);
+    let port = FaultyAudit::wrap(ts.port(), plan.clone());
+    let set = Arc::new(CommittedSet::default());
+    let issuer = CoverIssuer::new(Arc::new(StoreProbe(set.clone())));
+    let id = RequestId::new()?;
+    let id = id.as_str();
+    commit_request_received(&port, &set, received(id, &json!({}))?)?;
+    assert!(issuer.for_request(id).is_ok());
+    assert_eq!(issuer.for_write(id, 3).err(), Some(NotCommitted));
+
+    let head = ts.store().head().0;
+    let r = commit_records(&port, &set, vec![approved(id, 3)]);
+    assert!(matches!(r, Err(AuditError::AppendFailed(_))), "{r:?}");
+    assert_eq!(ts.store().head().0, head);
+    assert!(!set.write_approved(id, 3));
+    assert_eq!(issuer.for_write(id, 3).err(), Some(NotCommitted));
+
+    let c = commit_records(&port, &set, vec![approved(id, 3)])?;
+    assert_eq!(c.len(), 1);
+    assert!(set.write_approved(id, 3));
+    let cover = issuer.for_write(id, 3)?;
+    assert_eq!((cover.request_id(), cover.candidate_counter()), (id, 3));
+    assert_eq!(issuer.for_write(id, 4).err(), Some(NotCommitted));
+    assert_eq!(issuer.for_write("req_other", 3).err(), Some(NotCommitted));
+
+    // A batch: `BATCH_CONFIRMED` first, the approval with its batch flag; it supersedes rev 3.
+    let batch = BatchId::new()?;
+    let rev5 = CandidateRev {
+        counter: 5,
+        candidate_hash: [9; 32],
+    };
+    let lead = payloads::batch_confirmed(
+        &Actor::default(),
+        batch.as_str(),
+        &[(id.to_owned(), rev5)],
+        &[1; 32],
+    );
+    let c = commit_records(
+        &port,
+        &set,
+        vec![lead, payloads::with_batch(approved(id, 5), batch.as_str())],
+    )?;
+    assert_eq!(c.len(), 2);
+    assert_eq!(issuer.for_write(id, 3).err(), Some(NotCommitted));
+    assert!(issuer.for_write(id, 5).is_ok());
+
+    // Other records pass through and mark nothing.
+    let shown = payloads::preview_shown(&ctx(id), &rev5, &[], "v1");
+    commit_records(&port, &set, vec![shown])?;
+    assert!(set.write_approved(id, 5));
+
+    // A returned write holds no approval; the terminal state forgets both kinds of cover.
+    set.forget_write_approved(id);
+    assert_eq!(issuer.for_write(id, 5).err(), Some(NotCommitted));
+    commit_records(&port, &set, vec![approved(id, 6)])?;
+    assert!(issuer.for_write(id, 6).is_ok());
+    set.forget_request(id);
+    assert_eq!(issuer.for_write(id, 6).err(), Some(NotCommitted));
+    assert_eq!(issuer.for_request(id).err(), Some(NotCommitted));
+    Ok(())
+}
+
+/// A `WRITE_APPROVED` that names no request or no revision counter is refused whole, before
+/// anything is appended (no record without its mark, no mark without its record).
+#[test]
+fn commit_records_refuses_an_unattributable_approval() -> TestResult {
+    let ts = TempStore::new()?;
+    let port = ts.port();
+    let set = CommittedSet::default();
+    let id = RequestId::new()?;
+    let id = id.as_str();
+    commit_request_received(&*port, &set, received(id, &json!({}))?)?;
+    let head = ts.store().head().0;
+
+    let mut no_id = approved(id, 3);
+    no_id.request_id = None;
+    let mut no_counter = approved(id, 3);
+    if let Some(rev) = no_counter.payload.get_mut("candidate_rev") {
+        *rev = json!({ "counter": "3" });
+    }
+    let shown = payloads::preview_shown(
+        &ctx(id),
+        &CandidateRev {
+            counter: 3,
+            candidate_hash: [9; 32],
+        },
+        &[],
+        "v1",
+    );
+    for evs in [
+        vec![no_id],
+        vec![no_counter.clone()],
+        vec![shown, no_counter],
+    ] {
+        let r = commit_records(&*port, &set, evs);
+        assert!(matches!(r, Err(AuditError::Invalid(_))), "{r:?}");
+    }
+    assert_eq!(ts.store().head().0, head);
+    assert!(!set.write_approved(id, 3));
     Ok(())
 }
 
