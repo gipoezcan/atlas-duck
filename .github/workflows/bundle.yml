@@ -68,7 +68,8 @@ jobs:
           set -euo pipefail
           npm --prefix app/ui ci --ignore-scripts
           npm --prefix app/ui run build
-          test -f app/ui/dist/index.html
+          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
+          npm --prefix app/ui run check:bundle
 
       - name: Install cargo-tauri (prebuilt release, sha256-pinned)
         shell: pwsh
@@ -149,7 +150,8 @@ jobs:
           set -euo pipefail
           npm --prefix app/ui ci --ignore-scripts
           npm --prefix app/ui run build
-          test -f app/ui/dist/index.html
+          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
+          npm --prefix app/ui run check:bundle
 
       - name: Install cargo-tauri (prebuilt release, sha256-pinned)
         run: |
@@ -250,7 +252,8 @@ jobs:
           set -euo pipefail
           npm --prefix app/ui ci --ignore-scripts
           npm --prefix app/ui run build
-          test -f app/ui/dist/index.html
+          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
+          npm --prefix app/ui run check:bundle
 
       - name: Install cargo-tauri (prebuilt release, sha256-pinned)
         run: |
@@ -346,7 +349,8 @@ jobs:
           set -euo pipefail
           npm --prefix app/ui ci --ignore-scripts
           npm --prefix app/ui run build
-          test -f app/ui/dist/index.html
+          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
+          npm --prefix app/ui run check:bundle
 
       - name: Install cargo-tauri (prebuilt release, sha256-pinned)
         run: |

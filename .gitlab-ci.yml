@@ -37,6 +37,7 @@ ui:
     - npm test
     - npm run test:scripts
     - npm run build
+    - npm run check:bundle
   artifacts:
     paths: [app/ui/dist]
     expire_in: 1 day
@@ -67,7 +68,7 @@ rust:test:
     # run on GitHub: they need the cli_flows harness; no sudo in this image, so no S-01
     # other-user step; no second account on a container runner).
     - cargo test -p atlas-duck-ipc --features test-paths --locked
-    - cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate
+    - cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate --test commands_acl --test dto_fixtures
   after_script:
     - pkill -x atlas-duck-app || true
 
@@ -98,6 +99,8 @@ node:ci-checks:
     - export PATH="$CARGO_HOME/bin:$PATH"  # before_script and script share one shell
   script:
     - node ci/check-workspace.mjs
+    - node ci/check-csp.mjs
+    - node ci/check-commands.mjs
     - node --test "ci/*.test.mjs"
     - node ci/check-audit-vectors.mjs
 

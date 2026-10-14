@@ -144,6 +144,8 @@ jobs:
           cargo test -p atlas-duck-ipc -p atlas-duck-cli --locked
           cargo test -p atlas-duck-ipc --features test-paths --locked
           cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate
+          # M6 T3: the S-16 capture tests run only with the feature; the fixture check must never be stale.
+          cargo test -p atlas-duck-app --features scripted-approver --locked --test commands_acl --test dto_fixtures
 
       # T4 handoff, spec §15 V28: which socket dir the runner gets (`run_user` or `state_fallback`;
       # ubuntu runners are expected to show state_fallback). The line is evidence for T27.
@@ -645,6 +647,12 @@ jobs:
       - name: Workspace dependency rule (§2.2)
         run: node ci/check-workspace.mjs
 
+      - name: CSP check (6.4, 10.3)
+        run: node ci/check-csp.mjs
+
+      - name: Command surface check (C.10, PD-66)
+        run: node ci/check-commands.mjs
+
       - name: No panic macros in core, atlassian, audit; cover-minting tripwire (§7.7)
         run: node ci/check-no-panic-macros.mjs
 
@@ -752,6 +760,7 @@ jobs:
           cargo test -p atlas-duck-ipc -p atlas-duck-cli --locked --target x86_64-apple-darwin
           cargo test -p atlas-duck-ipc --features test-paths --locked --target x86_64-apple-darwin
           cargo test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test startup_ipc --test startup_gate
+          cargo test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test commands_acl --test dto_fixtures
 
       - name: Audit OS keychain tests (macOS login keychain, x86_64 under Rosetta)
         run: cargo test -p atlas-duck-audit --test os_keystore --locked --target x86_64-apple-darwin -- --ignored --test-threads=1 --nocapture
@@ -1249,6 +1258,12 @@ jobs:
 
       - name: Build
         run: npm --prefix app/ui run build
+
+      - name: Credential bundle isolation (PD-71, 10.3)
+        run: npm --prefix app/ui run check:bundle
+
+      - name: CSP of the built pages
+        run: node ci/check-csp.mjs --dist app/ui/dist
 
       - name: npm audit (spec §10.1)
         run: npm --prefix app/ui audit
