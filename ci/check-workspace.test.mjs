@@ -638,6 +638,18 @@ test("convert external dependency outside allowlist is rejected", () => {
   assert.deepEqual(graph(e), ["atlas-duck-convert: external dependency reqwest not allowed"]);
 });
 
+test("convert and preview depend on no workspace crate", () => {
+  for (const leaf of ["atlas-duck-convert", "atlas-duck-preview"]) {
+    const e = baseEdges();
+    assert.deepEqual(graph(e), []);
+    // A dev-dependency is ignored.
+    e[leaf] = [{ name: "atlas-duck-core", kind: "dev" }];
+    assert.deepEqual(graph(e), []);
+    e[leaf] = ["atlas-duck-core"];
+    assert.deepEqual(graph(e), [`${leaf}: must not depend on atlas-duck-core (§2.2)`]);
+  }
+});
+
 // ---------- the real workspace ----------
 
 test("the real workspace passes: node ci/check-workspace.mjs exits 0", () => {

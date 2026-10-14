@@ -38,6 +38,9 @@ export const INTERNAL_RULES = [
     pkg: PKG.core,
     exact: [PKG.registry, PKG.atlassian, PKG.convert, PKG.preview, PKG.audit, PKG.ipc],
   },
+  // M5 final review M-10: leaf crates (§2.2): no workspace dependency.
+  { pkg: PKG.convert, allowed: [] },
+  { pkg: PKG.preview, allowed: [] },
   { pkg: PKG.cli, allowed: [PKG.ipc, PKG.registry] },
   { pkg: PKG.sandboxWorker, allowed: [PKG.ipc] },
 ];

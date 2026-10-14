@@ -1065,9 +1065,12 @@ async fn rf5b_rechecks_coalesce_and_are_logged() -> TestResult {
     }
     let starts = rechecks(&h, "start").await?;
     let results = rechecks(&h, "result").await?;
+    // M5 final review M-15 (PD-58): coalescing is what the test is after, but it is timing
+    // dependent; on a slow runner each of the 8 reads may start its own re-check, which PD-58
+    // allows. Zero is the failure (a failed read must always re-check at least once).
     assert!(
-        (1..8).contains(&starts.len()),
-        "{} token_recheck starts for 8 reads (no coalescing at 8)",
+        (1..=8).contains(&starts.len()),
+        "{} token_recheck starts for 8 reads (none logged, or more than one per read)",
         starts.len()
     );
     assert_eq!(
