@@ -172,6 +172,10 @@ async fn pd09_markdown_body_rejected() -> TestResult {
     Ok(())
 }
 
+/// Whether the M5 plan still has writes to land (`jira.sprint.move_issues` and
+/// `jira.backlog.move_issues`, Task 18). The last M5 write task sets this to false.
+const WRITES_STILL_LATER: bool = true;
+
 /// The first write (registry order) whose schema example validates and whose executor is still
 /// `NotInThisBuild`, with that example: picked from the op table, never named, so the task that
 /// lands an op cannot break the test (T15 review M6). `None` once every write has landed.
@@ -209,8 +213,18 @@ fn not_in_this_build_write() -> Result<Option<(&'static str, Value)>, Box<dyn st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn not_in_this_build_rejected_internal() -> TestResult {
-    // Every write landed: no op is "not in this build" any more, nothing to submit.
     let Some((op, params)) = not_in_this_build_write()? else {
+        // Tripwire (T17 review M4): this test must not turn into a silent no-op. While the M5 plan
+        // still lists writes as `LATER_WRITE`, finding none is a failure (a broken picker, or a
+        // task that landed the last one without flipping the flag); the last M5 write task sets
+        // `WRITES_STILL_LATER` to false, and only then is an empty pick the documented outcome.
+        if WRITES_STILL_LATER {
+            return Err(
+                "no write is NotInThisBuild, but WRITES_STILL_LATER says some remain: if \
+                        every write has landed, set it to false (and retire this test)"
+                    .into(),
+            );
+        }
         return Ok(());
     };
     let h = Harness::both().await?;

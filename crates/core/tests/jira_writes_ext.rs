@@ -2444,6 +2444,11 @@ fn worklog_time_spent_is_parsed_not_trusted() -> TestResult {
         "1w 2d 3h 4m",
         "9600m",
         "160h",
+        // leading zeros within four digits, and a zero amount beside a real one
+        "0001h",
+        "02h",
+        "0h 5m",
+        "0d 5m",
     ] {
         assert_eq!(worklog_refused(&worklog_params(ok))?, None, "{ok}");
     }
@@ -2464,6 +2469,8 @@ fn worklog_time_spent_is_parsed_not_trusted() -> TestResult {
         "9601m",
         "10000m",
         "99999h",
+        // five digits by leading zeros alone: only the digit limit refuses it
+        "00001h",
         // shapes Jira would read differently or refuse
         "1h  30m",
         " 2h",
@@ -2491,7 +2498,7 @@ fn worklog_time_spent_is_parsed_not_trusted() -> TestResult {
 }
 
 #[test]
-fn worklog_started_is_jiras_format_and_not_the_future() -> TestResult {
+fn worklog_started_is_jiras_format_and_checks_no_clock() -> TestResult {
     let with = |started: &str| {
         let mut p = worklog_params("2h");
         p["started"] = json!(started);
@@ -2503,6 +2510,10 @@ fn worklog_started_is_jiras_format_and_not_the_future() -> TestResult {
         "2024-02-29T23:59:59.999+0000",
         "2026-01-01T00:00:00.000+1400",
         "2000-01-01T00:00:00.000-1200",
+        // PD-55: no clock is read, so a start far ahead validates (the card shows its UTC instant)
+        "2099-01-01T00:00:00.000+0000",
+        "2999-01-01T00:00:00.000+0000",
+        "9999-12-31T23:59:59.999+0000",
     ] {
         assert_eq!(worklog_refused(&with(ok))?, None, "{ok}");
         assert_eq!(worklog_wire(&with(ok))?["started"], json!(ok), "verbatim");
@@ -2533,12 +2544,12 @@ fn worklog_started_is_jiras_format_and_not_the_future() -> TestResult {
         // not a zone
         "2026-09-02T09:00:00.000+1500",
         "2026-09-02T09:00:00.000-1401",
+        "2026-09-02T09:00:00.000+1401",
+        "2026-09-02T09:00:00.abc+0200",
         "2026-09-02T09:00:00.000+0260",
-        // absurd: before 2000, or in the future
+        // absurd: before 2000
         "1999-12-31T23:59:59.999+0000",
         "1970-01-01T00:00:00.000+0000",
-        "2999-01-01T00:00:00.000+0000",
-        "9999-12-31T23:59:59.999+0000",
         // blank
         "",
         "   ",
@@ -2549,6 +2560,76 @@ fn worklog_started_is_jiras_format_and_not_the_future() -> TestResult {
             "{bad:?}"
         );
     }
+    Ok(())
+}
+
+/// PD-55: the executor is a pure function of the params, so validation reads no clock.
+#[test]
+fn worklog_validation_reads_no_clock() {
+    let src = include_str!("../src/ops/jira_ext.rs");
+    for clock in [
+        "SystemTime",
+        "Instant::now",
+        "Utc::now",
+        "Local::now",
+        "UNIX_EPOCH",
+    ] {
+        assert!(!src.contains(clock), "jira_ext.rs reads a clock: {clock}");
+    }
+}
+
+#[test]
+fn worklog_far_future_start_renders_its_utc_instant() -> TestResult {
+    let mut params = worklog_params("2h");
+    params["started"] = json!("2099-01-01T02:00:00.000+0200");
+    let card = worklog_rows(&worklog_card(&params)?)?;
+    assert_eq!(
+        card_row(&card, "Started as"),
+        Some("2099-01-01 02:00:00 at UTC+02:00 (2099-01-01 00:00:00 UTC)")
+    );
+    Ok(())
+}
+
+/// The message an executor refusal carries.
+fn worklog_refusal_message(params: &Value) -> Result<String, TestError> {
+    match exec_as(WORKLOG, params, None) {
+        Err(ExecError::Invalid(e)) => Ok(e.message),
+        other => Err(format!("unexpected: {other:?}").into()),
+    }
+}
+
+/// A value of the wrong type is a type error, not "must not be blank" (T17 review M2).
+#[test]
+fn worklog_non_string_params_are_type_errors() -> TestResult {
+    for field in ["comment", "started", "time_spent"] {
+        for wrong in [json!(5), json!(true), json!(["x"]), json!({"a": 1})] {
+            let mut p = worklog_params("2h");
+            p[field] = wrong.clone();
+            let msg = worklog_refusal_message(&p)?;
+            assert!(msg.contains(field), "{field} {wrong}: {msg}");
+            assert!(msg.contains("must be a string"), "{field} {wrong}: {msg}");
+        }
+    }
+    Ok(())
+}
+
+/// The registry text says what the executor enforces (T17 review M3).
+#[test]
+fn worklog_schema_text_matches_the_checks() -> TestResult {
+    let spec = atlas_duck_registry::get(WORKLOG).ok_or("no spec")?;
+    let schema = spec.params_schema_json();
+    let started = schema["properties"]["started"]["description"]
+        .as_str()
+        .ok_or("no started text")?;
+    let time = schema["properties"]["time_spent"]["description"]
+        .as_str()
+        .ok_or("no time text")?;
+    assert!(!started.to_lowercase().contains("future"), "{started}");
+    assert!(started.contains("2000"), "{started}");
+    assert!(
+        time.contains("1 to 4 digits") && time.contains("4w"),
+        "{time}"
+    );
     Ok(())
 }
 
@@ -2685,6 +2766,26 @@ fn worklog_card_is_read_from_the_sent_request() -> TestResult {
         card.rows
     );
     assert!(!format!("{:?}", card.rows).contains("from the params"));
+    Ok(())
+}
+
+/// The key comes from the URL of the request that is sent, not from the params (T17 review I2).
+#[test]
+fn worklog_card_key_is_read_from_the_sent_url() -> TestResult {
+    let params = worklog_params("2h");
+    let reqs = match exec_as(WORKLOG, &params, None) {
+        Ok(ExecPlan::Write(r)) => r,
+        other => return Err(format!("not a write: {other:?}").into()),
+    };
+    let mut sent = reqs.clone();
+    sent[0].resolved_url = sent[0].resolved_url.replace("ABC-1", "XYZ-9");
+    assert!(sent[0].resolved_url.contains("XYZ-9"));
+    let card = worklog_rows(&worklog_card_over(&params, &sent)?)?;
+    assert_eq!(card.sentence, "Log 2h on XYZ-9");
+    // A URL with no issue key shows no key, never the param's.
+    sent[0].resolved_url = "https://j.example/rest/api/2/other".to_owned();
+    let card = worklog_rows(&worklog_card_over(&params, &sent)?)?;
+    assert!(!card.sentence.contains("ABC-1"), "{}", card.sentence);
     Ok(())
 }
 
@@ -2894,7 +2995,7 @@ async fn worklog_edit_form_and_edits() -> TestResult {
         ("time_spent", "2h 3h"),
         ("time_spent", "2h30m"),
         ("started", "2026-09-02T09:00:00.000Z"),
-        ("started", "2999-01-01T00:00:00.000+0000"),
+        ("started", "1999-12-31T23:59:59.999+0000"),
         ("comment", "  "),
     ] {
         match h.approver().edit(&id, edit(name, value)) {
@@ -2945,7 +3046,7 @@ async fn worklog_invalid_values_are_validation_errors() -> TestResult {
             "started",
         ),
         (
-            json!({"key": KEY, "time_spent": "2h", "started": "2999-01-01T00:00:00.000+0000"}),
+            json!({"key": KEY, "time_spent": "2h", "started": "1999-12-31T23:59:59.999+0000"}),
             "started",
         ),
     ] {

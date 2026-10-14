@@ -3,8 +3,6 @@
 //! the stale-check baseline; `jira.issuelink.create` (T16, PD-53), with the link-type resolution;
 //! `jira.worklog.add` (T17, PD-55), whose time and start are checked strictly (no enrichment).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use atlas_duck_atlassian::{GetCall, UsernameMatcher};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
@@ -467,6 +465,8 @@ const MAX_AMOUNT_DIGITS: usize = 4;
 const DEFAULT_HOURS_PER_DAY: u32 = 8;
 const DEFAULT_DAYS_PER_WEEK: u32 = 5;
 
+const NOT_A_STRING: &str = "must be a string";
+
 const TIME_SHAPE: &str = "must be amounts of w, d, h or m, such as '1h 30m'";
 
 /// A worklog's `timeSpent` as Jira reads it: each of weeks, days, hours and minutes at most once,
@@ -586,10 +586,6 @@ const EARLIEST_STARTED_YEAR: i32 = 2000;
 /// The zones are within `-14:00` to `+14:00`.
 const MAX_OFFSET_SECS: i32 = 14 * 3600;
 
-/// A start this far past now is not "now" (this machine's clock against the server's, and a time
-/// written in the wrong zone): a typo, refused.
-const FUTURE_SLACK_SECS: i64 = 3600;
-
 const STARTED_SHAPE: &str = "must be Jira's format, such as 2026-09-02T09:00:00.000+0200";
 
 impl Started {
@@ -597,11 +593,6 @@ impl Started {
     fn utc(self) -> Option<NaiveDateTime> {
         self.local
             .checked_sub_signed(TimeDelta::try_seconds(i64::from(self.offset_secs))?)
-    }
-
-    /// Seconds since the Unix epoch.
-    fn epoch_secs(self) -> Option<i64> {
-        Some(self.utc()?.and_utc().timestamp())
     }
 }
 
@@ -662,19 +653,6 @@ pub(crate) fn parse_started(raw: &str) -> Result<Started, &'static str> {
     })
 }
 
-/// Whether `started` lies in the future of this machine's clock by more than the slack. A clock
-/// that cannot be read decides nothing.
-fn started_in_future(started: Started) -> bool {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_secs()).ok());
-    match (now, started.epoch_secs()) {
-        (Some(now), Some(at)) => at > now.saturating_add(FUTURE_SLACK_SECS),
-        _ => false,
-    }
-}
-
 /// What the approver reads next to the sent `started`: the local time with its zone and the same
 /// instant in UTC (`2026-09-02 09:00:00 at UTC+02:00 (2026-09-02 07:00:00 UTC)`).
 pub(crate) fn describe_started(raw: &str) -> Option<String> {
@@ -693,13 +671,17 @@ pub(crate) fn describe_started(raw: &str) -> Option<String> {
 /// `POST /rest/api/2/issue/{key}/worklog` `{"timeSpent", "comment"?, "started"?}` (PD-55): the
 /// params fill the fields of the same names, verbatim (PD-42: the comment is plain text or wiki
 /// markup, `started` Jira's timestamp). Static checks first, so the validation dry call (and an
-/// edit) refuses them (exit 2): the time ([`parse_time_spent`]), the start ([`parse_started`], and
-/// not in the future) and a blank comment (`maxLength` alone lets whitespace through; refused as
+/// edit) refuses them (exit 2): the time ([`parse_time_spent`]), the start ([`parse_started`]; no
+/// future check, so the executor is a pure function of the params and reads no clock, PD-55) and a blank comment (`maxLength` alone lets whitespace through; refused as
 /// the link comment is). An absent or `null` optional sends nothing. No enrichment and no stale
 /// rule (§5.4 step 5: an additive op).
 pub fn worklog_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     let refuse = |param: &str, message: &str| ExecError::Invalid(invalid(param, message, None));
-    let time_spent = str_param(ctx.params, "time_spent");
+    let time_spent = match ctx.params.get("time_spent") {
+        Some(Value::String(t)) => t.as_str(),
+        Some(_) => return Err(refuse("time_spent", NOT_A_STRING)),
+        None => "",
+    };
     parse_time_spent(time_spent).map_err(|why| refuse("time_spent", why))?;
     let started = match ctx.params.get("started") {
         None | Some(Value::Null) => None,
@@ -707,18 +689,16 @@ pub fn worklog_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
             return Err(refuse("started", "must not be blank"));
         }
         Some(Value::String(s)) => {
-            let at = parse_started(s).map_err(|why| refuse("started", why))?;
-            if started_in_future(at) {
-                return Err(refuse("started", "must not be in the future"));
-            }
+            parse_started(s).map_err(|why| refuse("started", why))?;
             Some(s.as_str())
         }
-        Some(_) => return Err(refuse("started", STARTED_SHAPE)),
+        Some(_) => return Err(refuse("started", NOT_A_STRING)),
     };
     let comment = match ctx.params.get("comment") {
         None | Some(Value::Null) => None,
         Some(Value::String(c)) if !c.trim().is_empty() => Some(c.as_str()),
-        Some(_) => return Err(refuse("comment", "must not be blank")),
+        Some(Value::String(_)) => return Err(refuse("comment", "must not be blank")),
+        Some(_) => return Err(refuse("comment", NOT_A_STRING)),
     };
     let mut body = Map::new();
     body.insert("timeSpent".to_owned(), Value::from(time_spent));

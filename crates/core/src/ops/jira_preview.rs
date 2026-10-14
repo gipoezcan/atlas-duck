@@ -1996,11 +1996,22 @@ pub fn edit_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model
 }
 
+/// The issue key of a sent `.../issue/{key}/...` URL (the segment after `issue`, before any query
+/// or fragment), or `""` when the URL has none.
+fn issue_key_of_url(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    path.split('/')
+        .skip_while(|s| *s != "issue")
+        .nth(1)
+        .unwrap_or("")
+}
+
 /// What the worklog card shows for a start that was not sent.
 const STARTED_NOT_SENT: &str = "(not sent: Jira uses the time the worklog is created)";
 
 /// §6.3 worklog: the `jira.worklog.add` card over the exact request (§5.1 inv. 4): "Log <time> on
-/// <key>", read from the request that is sent (T12 review M4), never from the params. Rows: the
+/// <key>", read from the request that is sent (T12 review M4), never from the params: the time from its
+/// body and the key from its URL (T17 review I2). Rows: the
 /// time as sent and what it means (weeks and days are Jira working time, so the seconds are given
 /// at Jira's defaults and as that, T17), the start as sent and as a zoned time with its UTC
 /// instant (or that none was sent), and the comment as the text of its wiki markup with its
@@ -2024,7 +2035,7 @@ pub fn worklog_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     };
     let started = body.get("started").and_then(Value::as_str);
     let comment = body.get("comment").and_then(Value::as_str);
-    let key = ctx.params.get("key").and_then(Value::as_str).unwrap_or("");
+    let key = issue_key_of_url(&request.resolved_url);
     let mut hidden = 0u64;
     let cap = CELL_CAP_CHARS * 2;
     let mut rows = vec![(
