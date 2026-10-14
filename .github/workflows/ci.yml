@@ -223,6 +223,46 @@ jobs:
           node ci/check-no-skips.mjs $log $list $ignored
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # M5 plan Task 25: the Jira flows (app/src-tauri/tests/jira_flows.rs, 8 flows) on the cli_flows
+      # harness. Same rules: ATLAS_DUCK_CLI_FLOWS=1, no "skipped:" line, pass count of at least
+      # listed - #[ignore]d (an empty list fails too), so the flows cannot pass vacuously.
+      - name: M5 suites (convert, preview)
+        run: cargo test -p atlas-duck-convert -p atlas-duck-preview --locked
+
+      - name: M5 jira_flows (Linux, Xvfb + private session bus)
+        if: runner.os == 'Linux'
+        env:
+          CLI_FLOWS_TEST: jira_flows
+        run: bash ci/cli-flows-linux.sh
+
+      - name: M5 jira_flows (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --test jira_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/jira-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/jira-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/jira-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/jira-flows.log" "$RUNNER_TEMP/jira-flows.list" "$RUNNER_TEMP/jira-flows.ignored" jira_flows
+
+      - name: M5 jira_flows (Windows, pwsh)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:ATLAS_DUCK_CLI_FLOWS = '1'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'jira_flows')
+          $log = Join-Path $env:RUNNER_TEMP 'jira-flows.log'
+          $list = Join-Path $env:RUNNER_TEMP 'jira-flows.list'
+          $ignored = Join-Path $env:RUNNER_TEMP 'jira-flows.ignored'
+          cargo @a -- --nocapture --test-threads=2 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
+          cargo @a -- --list --ignored 2>$null | Set-Content -Path $ignored -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $ignored jira_flows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Core PAT keychain test (Windows Credential Manager, RF-3a, #[ignore]d)
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test keychain_windows -- --ignored --test-threads=1 --nocapture
@@ -728,6 +768,18 @@ jobs:
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/cli-flows.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/cli-flows.log" "$RUNNER_TEMP/cli-flows.list" "$RUNNER_TEMP/cli-flows.ignored"
 
+      # M5 plan Task 25: the jira_flows target (8 flows) as the native macOS leg, x86_64 under Rosetta.
+      - name: M5 suites and jira_flows x86_64-apple-darwin (no skips, pass-count minimum)
+        run: |
+          set -euo pipefail
+          cargo test -p atlas-duck-convert -p atlas-duck-preview --locked --target x86_64-apple-darwin
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test jira_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/jira-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/jira-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/jira-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/jira-flows.log" "$RUNNER_TEMP/jira-flows.list" "$RUNNER_TEMP/jira-flows.ignored" jira_flows
+
       - name: M4 OS keychain smoke (macOS login keychain, x86_64 under Rosetta)
         env:
           ATLAS_DUCK_CLI_FLOWS: "1"
@@ -1084,7 +1136,7 @@ jobs:
       - name: Build the M3 test binaries on ubuntu-22.04
         run: |
           set -euo pipefail
-          cargo test -p atlas-duck-atlassian -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --no-run --message-format=json > "$RUNNER_TEMP/build.json"
+          cargo test -p atlas-duck-atlassian -p atlas-duck-core -p atlas-duck-convert --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --no-run --message-format=json > "$RUNNER_TEMP/build.json"
           dir="$RUNNER_TEMP/fedora-suite"
           mkdir -p "$dir"
           node -e '
@@ -1095,7 +1147,7 @@ jobs:
               let m;
               try { m = JSON.parse(line); } catch { continue; }
               if (m.reason !== "compiler-artifact" || !m.executable || !m.profile || m.profile.test !== true) continue;
-              const pkg = /(?:^|[\/#])atlas-duck-(atlassian|core)(?:@|$)/.exec(m.package_id);
+              const pkg = /(?:^|[\/#])atlas-duck-(atlassian|core|convert)(?:@|$)/.exec(m.package_id);
               if (!pkg || seen.has(m.executable)) continue;
               seen.add(m.executable);
               fs.copyFileSync(m.executable, dir + "/" + pkg[1] + "-" + require("path").basename(m.executable));

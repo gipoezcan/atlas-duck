@@ -3,8 +3,9 @@
 // The flows skip (print a "skipped:" line and return) unless ATLAS_DUCK_CLI_FLOWS=1, and a skipped
 // test still counts as passed, so CI checks the output instead of the exit status alone.
 //
-//   node ci/check-no-skips.mjs <run.log> <list.txt> <list-ignored.txt>
+//   node ci/check-no-skips.mjs <run.log> <list.txt> <list-ignored.txt> [label]
 //
+// label             the test target named in the messages (default cli_flows; M5 passes jira_flows)
 // run.log           the `cargo test ... -- --nocapture` output (stdout and stderr)
 // list.txt          `cargo test ... --test cli_flows -- --list` (every test)
 // list-ignored.txt  the same with `--list --ignored` (only the #[ignore]d ones)
@@ -52,13 +53,13 @@ export function check(log, listText, ignoredText) {
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const [log, list, ignored] = process.argv.slice(2);
+  const [log, list, ignored, label = "cli_flows"] = process.argv.slice(2);
   if (!log || !list || !ignored) {
-    console.error("usage: check-no-skips.mjs <run.log> <list.txt> <list-ignored.txt>");
+    console.error("usage: check-no-skips.mjs <run.log> <list.txt> <list-ignored.txt> [label]");
     process.exit(2);
   }
   const problems = check(readFileSync(log, "utf8"), readFileSync(list, "utf8"), readFileSync(ignored, "utf8"));
-  for (const p of problems) console.error(`::error::cli_flows: ${p}`);
+  for (const p of problems) console.error(`::error::${label}: ${p}`);
   if (problems.length > 0) process.exit(1);
-  console.log("cli_flows: no skipped tests, pass count meets the listed minimum");
+  console.log(`${label}: no skipped tests, pass count meets the listed minimum`);
 }

@@ -34,6 +34,24 @@ test("a log without a result line, or an empty list, fails", () => {
   assert.match(check(ok(2), "", "")[0], /list is empty/);
 });
 
+// M5 Task 25: the same checker guards jira_flows (8 flows); a vacuous run (every flow skipped and
+// counted as passed, or zero tests) must fail.
+const JIRA_LIST = Array.from({ length: 8 }, (_, i) => `j${i}: test`).join("\n") + "\n\n8 tests, 0 benchmarks\n";
+const JIRA_SKIPPED =
+  Array.from({ length: 8 }, (_, i) => `test j${i} ... skipped: j${i} spawns the real binaries; set ATLAS_DUCK_CLI_FLOWS=1`).join("\n") +
+  "\ntest result: ok. 8 passed; 0 failed; 0 ignored; 0 measured\n";
+
+test("jira_flows: all flows skipped but counted as passed fails (negative control)", () => {
+  const problems = check(JIRA_SKIPPED, JIRA_LIST, "");
+  assert.equal(problems.length, 8);
+  assert.ok(problems.every((p) => p.startsWith("skipped: ")));
+});
+
+test("jira_flows: zero tests run fails, eight real passes are fine", () => {
+  assert.deepEqual(check("running 0 tests\ntest result: ok. 0 passed; 0 failed\n", JIRA_LIST, ""), ["0 tests passed, expected at least 8"]);
+  assert.deepEqual(check(ok(8), JIRA_LIST, ""), []);
+});
+
 test("passedCount sums result lines and ignores prose", () => {
   assert.equal(passedCount("test result: ok. 3 passed; 0 failed\ntest result: ok. 4 passed; 0 failed\n"), 7);
   assert.equal(passedCount("3 passed\n"), null);

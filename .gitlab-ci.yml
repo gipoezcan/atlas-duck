@@ -62,6 +62,7 @@ rust:test:
     # closed on this runner's container volume ("the test data dir is not a local data dir"), so
     # none of the spawning flows can start an app here. ci/cli-flows-linux.sh itself is verified up
     # to that point (signal reset, xauth/xvfb, pass-count) by the GitLab run of 94459e5..507d6b6.
+    # M5 jira_flows run on GitHub only, for the same reason as cli_flows (ci.yml: every OS leg).
     # M4 plan Task 26 (T26b): the M4 suite with the test-only features, the app's startup tests (the S-02 cases
     # run on GitHub: they need the cli_flows harness; no sudo in this image, so no S-01
     # other-user step; no second account on a container runner).

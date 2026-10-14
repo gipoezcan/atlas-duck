@@ -5,6 +5,9 @@
 # GitLab rust image has no Node).
 #
 #   bash ci/cli-flows-linux.sh            run every non-ignored flow and check the output
+#   CLI_FLOWS_TEST=jira_flows bash ci/cli-flows-linux.sh
+#                                         the same for another test target of the app (M5
+#                                         jira_flows); the default is cli_flows
 #   bash ci/cli-flows-linux.sh a b ...    extra test-binary arguments (e.g. `--ignored s02_`); the
 #                                         pass-count minimum is not checked then, skip lines still are
 set -euo pipefail
@@ -48,8 +51,9 @@ shift
 
 check_dispositions  # again, inside dbus-run-session and xvfb-run
 export ATLAS_DUCK_CLI_FLOWS=1
-cargo_args=(test -p atlas-duck-app --features scripted-approver --locked --test cli_flows)
-log="$TMPDIR/cli-flows.log"
+target="${CLI_FLOWS_TEST:-cli_flows}"
+cargo_args=(test -p atlas-duck-app --features scripted-approver --locked --test "$target")
+log="$TMPDIR/$target.log"
 
 # --test-threads=2: the flows start whole app instances (T22 handoff).
 set +e
@@ -57,13 +61,13 @@ cargo "${cargo_args[@]}" -- --nocapture --test-threads=2 "$@" 2>&1 | tee "$log"
 status="${PIPESTATUS[0]}"
 set -e
 if [ "$status" -ne 0 ]; then
-  echo "::error::cli_flows failed (exit $status)"
+  echo "::error::$target failed (exit $status)"
   exit "$status"
 fi
 
 # A skipped flow prints a "skipped:" line and counts as passed: fail on any (T22 review).
 if grep -E '(^|[[:space:]])skipped: ' "$log"; then
-  echo "::error::cli_flows skipped tests (is ATLAS_DUCK_CLI_FLOWS set?)"
+  echo "::error::$target skipped tests (is ATLAS_DUCK_CLI_FLOWS set?)"
   exit 1
 fi
 
@@ -73,9 +77,9 @@ if [ "$#" -eq 0 ]; then
   ignored="$(cargo "${cargo_args[@]}" -- --list --ignored 2>/dev/null | grep -c ': test$' || true)"
   expected=$((total - ignored))
   passed="$(sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' "$log" | awk '{s += $1} END {print s + 0}')"
-  echo "cli-flows-linux: $passed passed, expected at least $expected ($total listed, $ignored ignored)"
+  echo "cli-flows-linux: $target: $passed passed, expected at least $expected ($total listed, $ignored ignored)"
   if [ "$expected" -eq 0 ] || [ "$passed" -lt "$expected" ]; then
-    echo "::error::cli_flows passed $passed tests, expected at least $expected"
+    echo "::error::$target passed $passed tests, expected at least $expected"
     exit 1
   fi
 fi
