@@ -4,9 +4,10 @@
 // (`commands::register`), the union of the capability files' app permissions and the isolation
 // hook's generated `ALLOWED` block name the same commands; every command is granted in exactly the
 // windows of the Δ1 table below; only the listening windows get the two event permissions and no
-// window gets any other permission (no `core:default`, no plugin permission); every argument
-// struct in `app/src-tauri/src/commands/**` denies unknown fields and carries no path, byte or
-// certificate field (grep-level).
+// window gets any other permission (no `core:default`, no plugin permission); every
+// `#[tauri::command]` lives under `app/src-tauri/src/commands/**` and takes exactly one `Args<…>`
+// besides injected parameters; every argument struct there denies unknown fields and carries no
+// path, byte or certificate field (grep-level).
 //
 // Usage: node ci/check-commands.mjs [--write]
 //   --write regenerates the `ALLOWED` block of app/isolation/index.html, then checks.
@@ -111,7 +112,19 @@ export const DROPPED_CMD = "__atlas_duck_isolation_dropped__";
  */
 export const ARG_EXEMPTIONS = [];
 
-const FORBIDDEN_TYPES = [/\bPathBuf\b/, /\bPath\b/, /\bOsString\b/, /\bOsStr\b/, /\bVec\s*<\s*u8\s*>/, /\[\s*u8\s*;/];
+// Core types that carry a `PathBuf` count as one (T4 review M-3; grep cannot see inside them):
+// `SessionKey.peer_origin_exe` (PD-86), `KeyOrigin::Exe`, `InstanceConfig.ca_bundle`.
+const FORBIDDEN_TYPES = [
+  /\bPathBuf\b/,
+  /\bPath\b/,
+  /\bOsString\b/,
+  /\bOsStr\b/,
+  /\bVec\s*<\s*u8\s*>/,
+  /\[\s*u8\s*;/,
+  /\bSessionKey\b/,
+  /\bKeyOrigin\b/,
+  /\bInstanceConfig\b/,
+];
 const FORBIDDEN_FIELD_NAME = /path|pem|cert/i;
 
 export const BEGIN_MARKER = "// BEGIN GENERATED (node ci/check-commands.mjs --write)";
@@ -473,6 +486,130 @@ export function checkArgStructs(files, exemptions = ARG_EXEMPTIONS) {
 }
 
 /**
+ * The parameters Tauri injects instead of reading a body key (T3 contract: a command takes these
+ * plus its one `Args<…>`). `ipc::Channel` and `ipc::Request` are deliberately absent: both read
+ * the invoke body and would bypass `Args`.
+ */
+export const INJECTED_PARAMS = ["AppHandle", "State", "Window", "WebviewWindow", "Webview"];
+
+const COMMANDS_DIR = "app/src-tauri/src/commands/";
+const INJECTED_TYPE = new RegExp(`^(?:tauri\\s*::\\s*(?:[a-z_]+\\s*::\\s*)?)?(?:${INJECTED_PARAMS.join("|")})\\s*(?:<|$)`);
+const ARGS_TYPE = /^(?:\w+\s*::\s*)*Args\s*</;
+
+/** Index just past the bracket group opening at `open` (`()`, `<>` or `[]`, nesting counted). */
+function closeGroup(src, open) {
+  const pairs = { "(": ")", "<": ">", "[": "]", "{": "}" };
+  let depth = 0;
+  for (let i = open; i < src.length; i += 1) {
+    const c = src[i];
+    if (c === "-" && src[i + 1] === ">") {
+      i += 1;
+    } else if (c in pairs) {
+      depth += 1;
+    } else if (Object.values(pairs).includes(c)) {
+      depth -= 1;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return src.length;
+}
+
+/** `list` split on commas outside any bracket group. */
+function splitTopLevel(list, sep) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < list.length; i += 1) {
+    const c = list[i];
+    if (c === "-" && list[i + 1] === ">") i += 1;
+    else if ("(<[{".includes(c)) depth += 1;
+    else if (")>]}".includes(c)) depth -= 1;
+    else if (c === sep && depth === 0) {
+      parts.push(list.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(list.slice(start));
+  return parts.map((p) => p.trim()).filter(Boolean);
+}
+
+/** `{ name, params: [{ pattern, type }] }` per `#[tauri::command]` fn in comment-free `src`. */
+export function parseCommandFns(src) {
+  const fns = [];
+  for (const m of src.matchAll(/#\[\s*(?:tauri\s*::\s*)?command\b[^\]]*\]/g)) {
+    const rest = src.slice(m.index + m[0].length);
+    const head = rest.match(/^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(\w+)\s*/);
+    if (!head) {
+      fns.push({ name: null, params: null });
+      continue;
+    }
+    let i = head[0].length;
+    if (rest[i] === "<") i = closeGroup(rest, i);
+    while (/\s/.test(rest[i] ?? "")) i += 1;
+    if (rest[i] !== "(") {
+      fns.push({ name: head[1], params: null });
+      continue;
+    }
+    const end = closeGroup(rest, i);
+    const params = splitTopLevel(rest.slice(i + 1, end - 1), ",").map((p) => {
+      // The first `:` outside brackets that is not half of a `::`.
+      let depth = 0;
+      for (let k = 0; k < p.length; k += 1) {
+        const c = p[k];
+        if ("(<[{".includes(c)) depth += 1;
+        else if (")>]}".includes(c)) depth -= 1;
+        else if (c === ":" && depth === 0) {
+          if (p[k + 1] === ":") k += 1;
+          else return { pattern: p.slice(0, k).trim(), type: p.slice(k + 1).trim() };
+        }
+      }
+      return { pattern: p, type: "" };
+    });
+    fns.push({ name: head[1], params });
+  }
+  return fns;
+}
+
+/**
+ * T4 review I-2: every `#[tauri::command]` in `srcFiles` ({path: source}, all of
+ * `app/src-tauri/src`) is defined under `commands/**`, is listed in `COMMANDS`, and takes exactly
+ * one `Args<…>` besides the injected parameters (Tauri maps any other parameter to a body key,
+ * outside `deny_unknown_fields` and the field rules); every `COMMANDS` entry has such a fn.
+ */
+export function checkCommandHandlers(srcFiles, commands) {
+  const errors = [];
+  const defined = new Set();
+  for (const [file, raw] of Object.entries(srcFiles)) {
+    const src = stripTestModules(stripComments(raw));
+    for (const { name, params } of parseCommandFns(src)) {
+      if (name === null || params === null) {
+        errors.push(`${file}: cannot parse the fn after #[tauri::command]${name ? ` (${name})` : ""}`);
+        continue;
+      }
+      defined.add(name);
+      if (!file.startsWith(COMMANDS_DIR)) {
+        errors.push(`${file}: #[tauri::command] ${name} is defined outside ${COMMANDS_DIR}**`);
+      }
+      if (commands && !commands.includes(name)) errors.push(`${file}: #[tauri::command] ${name} is not in COMMANDS`);
+      const args = params.filter((p) => ARGS_TYPE.test(p.type));
+      if (args.length !== 1) {
+        errors.push(`${file}: command ${name} must take exactly one Args<…> argument struct (found ${args.length})`);
+      }
+      for (const p of params) {
+        if (ARGS_TYPE.test(p.type) || INJECTED_TYPE.test(p.type)) continue;
+        errors.push(
+          `${file}: command ${name} parameter \`${p.pattern}: ${p.type}\` is neither Args<…> nor injected (${INJECTED_PARAMS.join("/")}); Tauri would read it from a body key`,
+        );
+      }
+    }
+  }
+  for (const c of commands ?? []) {
+    if (!defined.has(c)) errors.push(`COMMANDS lists ${c}, but no #[tauri::command] fn ${c} is defined`);
+  }
+  return errors;
+}
+
+/**
  * T3 review M-9: Tauri's default `dynamic-acl` feature ships `add_capability` and
  * `runtime_authority_mut`; app code never widens the capability files at run time (tests may).
  */
@@ -552,7 +689,12 @@ export function main(argv = process.argv.slice(2), repo = REPO) {
     }
     input.allowed = parseAllowedBlock(html);
   }
-  const errors = [...checkSurface(input).errors, ...checkArgStructs(r.files), ...checkAclMutators(r.srcFiles)];
+  const errors = [
+    ...checkSurface(input).errors,
+    ...checkCommandHandlers(r.srcFiles, input.commands),
+    ...checkArgStructs(r.files),
+    ...checkAclMutators(r.srcFiles),
+  ];
   for (const e of errors) console.log(e);
   if (errors.length === 0) console.log("check-commands: ok");
   return errors.length === 0 ? 0 : 1;

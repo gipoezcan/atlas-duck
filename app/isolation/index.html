@@ -8,8 +8,8 @@
     <!--
       Tauri isolation app (§2.4, §10.3, PD-87). Every IPC message of every window passes this hook
       in a hidden sandboxed iframe before Tauri encrypts it for Rust. The hook sees no window label,
-      so per-window rules stay in the capability files; it passes only known command names under a
-      payload size cap and turns everything else into a command that does not exist, which Rust
+      so per-window rules stay in the capability files; it passes only known command names with plain
+      JSON data under a size cap and turns everything else into a command that does not exist, which Rust
       refuses (the invoke rejects instead of hanging). One inline classic script, no ES modules (the
       WebView2 iframe limitation, §10.3). `ALLOWED` is generated: `node ci/check-commands.mjs --write`.
     -->
@@ -27,58 +27,179 @@
 
         /** PD-87: the JSON serialization of a message is at most 2 MiB (UTF-16 code units). */
         var MAX_PAYLOAD_CHARS = 2 * 1024 * 1024;
+        /** Nesting limit (the message is depth 0, its payload 1); a cycle exceeds it too. */
+        var MAX_DEPTH = 32;
         /** Never a command name (`ci/check-commands.mjs` keeps it out of `COMMANDS`). */
         var DROPPED_CMD = "__atlas_duck_isolation_dropped__";
+        /** The message fields Tauri's isolation.js reads and sends (`payload` encrypted). */
+        var SENT_FIELDS = ["cmd", "callback", "error", "payload", "options"];
+        /** Tauri's process-ipc-message-fn.js calls `val[TO_IPC]()` on any object that has it. */
+        var TO_IPC = "__TAURI_TO_IPC_KEY__";
+
+        var toTag = Object.prototype.toString;
+        var getProto = Object.getPrototypeOf;
+        var ownDescriptor = Object.getOwnPropertyDescriptor;
+        var objectKeys = Object.keys;
+        var isArray = Array.isArray;
+        var stringify = JSON.stringify;
 
         var allowed = Object.create(null);
         for (var i = 0; i < ALLOWED.length; i += 1) {
           allowed[ALLOWED[i]] = true;
         }
 
-        function isBinary(body) {
-          return (
-            ArrayBuffer.isView(body) ||
-            Object.prototype.toString.call(body) === "[object ArrayBuffer]"
-          );
+        // Plain data of any realm: tags and prototypes, never `instanceof`.
+        function isPlainObject(value) {
+          if (toTag.call(value) !== "[object Object]") {
+            return false;
+          }
+          var proto = getProto(value);
+          return proto === null || getProto(proto) === null;
         }
 
+        function isPlainArray(value) {
+          if (!isArray(value)) {
+            return false;
+          }
+          // A realm's Array.prototype is itself an array whose prototype is Object.prototype.
+          var proto = getProto(value);
+          return isArray(proto) && getProto(getProto(proto)) === null;
+        }
+
+        // The JSON length of `value`, or -1 when it is over `budget` or not plain JSON data.
+        // Tauri's process-ipc-message-fn.js expands a Map, Uint8Array or ArrayBuffer before it
+        // encrypts the payload while `JSON.stringify` here renders them as `{}`, so only
+        // primitives, plain objects and arrays of data properties pass, at every depth: a Set,
+        // DataView, typed array, Blob, File, Date, boxed primitive or class instance is refused
+        // as well, and so is an accessor, a `toJSON` or a `__TAURI_TO_IPC_KEY__`. On plain data
+        // Tauri's replacer returns every value unchanged, so this length is what it sends.
+        function jsonLength(value, depth, budget) {
+          var type = typeof value;
+          var total;
+          var length;
+          var keys;
+          var desc;
+          var n;
+          var k;
+          if (value === null) {
+            return 4 <= budget ? 4 : -1;
+          }
+          if (type === "string" && value.length + 2 > budget) {
+            return -1;
+          }
+          if (type === "string" || type === "number" || type === "boolean") {
+            n = stringify(value).length;
+            return n <= budget ? n : -1;
+          }
+          if (type !== "object" || depth >= MAX_DEPTH || "toJSON" in value || TO_IPC in value) {
+            return -1;
+          }
+          if (isPlainArray(value)) {
+            length = value.length;
+            // Every element is at least one character.
+            if (length * 2 + 1 > budget) {
+              return -1;
+            }
+            total = length === 0 ? 2 : length + 1;
+            for (k = 0; k < length; k += 1) {
+              desc = ownDescriptor(value, k);
+              if (desc !== undefined && !("value" in desc)) {
+                return -1;
+              }
+              // A hole or `undefined` is written as `null`.
+              n = desc === undefined || desc.value === undefined ? 4 : jsonLength(desc.value, depth + 1, budget - total);
+              if (n < 0) {
+                return -1;
+              }
+              total += n;
+              if (total > budget) {
+                return -1;
+              }
+            }
+            return total;
+          }
+          if (!isPlainObject(value)) {
+            return -1;
+          }
+          keys = objectKeys(value);
+          total = 2;
+          for (k = 0; k < keys.length; k += 1) {
+            desc = ownDescriptor(value, keys[k]);
+            if (desc === undefined || !("value" in desc)) {
+              return -1;
+            }
+            // `JSON.stringify` leaves an `undefined` member out.
+            if (desc.value !== undefined) {
+              n = jsonLength(desc.value, depth + 1, budget - total);
+              if (n < 0) {
+                return -1;
+              }
+              total += (total === 2 ? 0 : 1) + stringify(keys[k]).length + 1 + n;
+              if (total > budget) {
+                return -1;
+              }
+            }
+          }
+          return total;
+        }
+
+        // Measures exactly the fields Tauri sends; every command takes one JSON object (T3), so
+        // the payload must be a plain object (a top-level array would go out as raw bytes).
         function withinCap(message) {
-          // No command takes raw bytes (T3 refuses them) and `JSON.stringify` would see an
-          // `ArrayBuffer` as `{}`, so a binary body never passes.
-          if (isBinary(message.payload)) {
+          var sent = Object.create(null);
+          var desc;
+          for (var f = 0; f < SENT_FIELDS.length; f += 1) {
+            desc = ownDescriptor(message, SENT_FIELDS[f]);
+            if (desc !== undefined && !("value" in desc)) {
+              return false;
+            }
+            sent[SENT_FIELDS[f]] = desc === undefined ? undefined : desc.value;
+          }
+          if (!isPlainObject(sent.payload)) {
             return false;
           }
-          var text;
-          try {
-            text = JSON.stringify(message);
-          } catch (e) {
-            return false;
-          }
-          return typeof text === "string" && text.length <= MAX_PAYLOAD_CHARS;
+          var n = jsonLength(sent, 0, MAX_PAYLOAD_CHARS);
+          return n >= 0 && stringify(sent).length === n;
         }
 
         function passes(message) {
           return (
-            typeof message === "object" &&
-            message !== null &&
+            isPlainObject(message) &&
             typeof message.cmd === "string" &&
             allowed[message.cmd] === true &&
             withinCap(message)
           );
         }
 
+        // Keeps the callback ids (numbers in Tauri 2) so the invoke rejects instead of hanging.
+        function callbackId(message, field) {
+          try {
+            var desc = isPlainObject(message) ? ownDescriptor(message, field) : undefined;
+            return desc !== undefined && typeof desc.value === "number" ? desc.value : 0;
+          } catch (e) {
+            return 0;
+          }
+        }
+
         function dropped(message) {
           var out = Object.create(null);
           out.cmd = DROPPED_CMD;
-          out.callback = message === null || typeof message !== "object" ? 0 : message.callback;
-          out.error = message === null || typeof message !== "object" ? 0 : message.error;
+          out.callback = callbackId(message, "callback");
+          out.error = callbackId(message, "error");
           out.payload = {};
           return out;
         }
 
         Object.defineProperty(window, "__TAURI_ISOLATION_HOOK__", {
           value: function (message) {
-            return passes(message) ? message : dropped(message);
+            try {
+              if (passes(message)) {
+                return message;
+              }
+            } catch (e) {
+              // Fail closed: a throw here would stop Tauri's handler and hang the invoke.
+            }
+            return dropped(message);
           },
           writable: false,
           configurable: false,

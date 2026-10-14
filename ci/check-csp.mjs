@@ -124,6 +124,11 @@ export function checkConfig(conf, platform) {
   if (security.assetProtocol?.enable) errors.push(`${where}: the asset protocol must stay disabled (§10.3)`);
   if (security.freezePrototype !== true) errors.push(`${where}: app.security.freezePrototype must be true`);
   if (security.pattern?.use !== "isolation") errors.push(`${where}: app.security.pattern must be the isolation pattern`);
+  // T4 review M-4: both default off; neither may be turned on.
+  if (conf?.app?.withGlobalTauri !== undefined && conf.app.withGlobalTauri !== false) {
+    errors.push(`${where}: app.withGlobalTauri must stay unset (no window.__TAURI__ global)`);
+  }
+  if (security.headers !== undefined) errors.push(`${where}: app.security.headers must not be set (no custom response headers)`);
   for (const hit of findKeys(conf, ["useHttpsScheme", "use-https-scheme"])) {
     if (hit.value !== false) errors.push(`${where}: ${hit.path} must stay unset (the isolation origin assumes http/custom schemes)`);
   }

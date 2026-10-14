@@ -124,6 +124,167 @@ test("isolation_hook_drops_malformed_messages", () => {
   }
 });
 
+/**
+ * Tauri 2.12.1 scripts/process-ipc-message-fn.js:18-39: the JSON the isolation frame encrypts
+ * (`instanceof` against this realm, as in the iframe).
+ */
+function tauriJson(payload) {
+  return JSON.stringify(payload, (_k, val) => {
+    if (val instanceof Map) return Object.fromEntries(val.entries());
+    if (val instanceof Uint8Array) return Array.from(val);
+    if (val instanceof ArrayBuffer) return Array.from(new Uint8Array(val));
+    if (typeof val === "object" && val !== null && "__TAURI_TO_IPC_KEY__" in val) return val.__TAURI_TO_IPC_KEY__();
+    return val;
+  });
+}
+
+test("isolation_hook_refuses_nested_non_json_values", () => {
+  const { hook, ctx } = loadHook();
+  // T4 review I-1: `JSON.stringify` renders these as `{}`, Tauri expands them past the cap.
+  const bigBuffer = { x: new ArrayBuffer(8 * CAP) };
+  const bigMap = { x: new Map([["k", "x".repeat(8 * CAP)]]) };
+  assert.ok(JSON.stringify(bigBuffer).length < 16 && tauriJson(bigBuffer).length > 8 * CAP);
+  assert.ok(JSON.stringify(bigMap).length < 16 && tauriJson(bigMap).length > 8 * CAP);
+  for (const payload of [bigBuffer, bigMap]) {
+    const m = message("app_status", payload);
+    assertDropped(hook(m), m);
+  }
+  // Refused by type, not by size: tiny values at depth 1 to 3, in arrays, and from the iframe's
+  // own realm.
+  const values = [
+    () => new ArrayBuffer(4),
+    () => new Uint8Array(4),
+    () => new Float64Array(1),
+    () => new DataView(new ArrayBuffer(4)),
+    () => new Map(),
+    () => new Set([1]),
+    () => new Blob(["x"]),
+    () => new Date(0),
+    () => /x/,
+    () => new String("x"),
+    () => new Error("x"),
+    () => new (class Point { constructor() { this.x = 1; } })(),
+    () => 1n,
+    () => Symbol("x"),
+    () => () => 1,
+    () => vm.runInContext("new Map([['k', 'v']])", ctx),
+    () => vm.runInContext("new Uint8Array(4)", ctx),
+    () => vm.runInContext("new ArrayBuffer(4)", ctx),
+  ];
+  if (typeof File === "function") values.push(() => new File(["x"], "x.txt"));
+  for (const make of values) {
+    for (const wrap of [(v) => ({ x: v }), (v) => ({ a: { b: [v] } }), (v) => ({ a: [{ b: { c: v } }] }), (v) => ({ list: [1, v] })]) {
+      const m = message("app_status", wrap(make()));
+      assertDropped(hook(m), m);
+    }
+  }
+  // `options` travels with the message and is held to the same rules.
+  const opts = { ...message("app_status"), options: { headers: new Map([["a", "b"]]) } };
+  assertDropped(hook(opts), opts);
+});
+
+test("isolation_hook_refuses_accessors_tojson_and_tauri_to_ipc", () => {
+  const { hook } = loadHook();
+  // A getter could answer small to the hook and large to Tauri's serialization.
+  let calls = 0;
+  const getter = {};
+  Object.defineProperty(getter, "s", { enumerable: true, get: () => (calls++ === 0 ? "" : "x".repeat(8 * CAP)) });
+  const accessorArray = [1];
+  Object.defineProperty(accessorArray, 0, { enumerable: true, get: () => 1 });
+  const cases = [
+    { nested: getter },
+    { nested: { list: accessorArray } },
+    { nested: { toJSON: () => "x".repeat(8 * CAP) } },
+    { nested: Object.create({ toJSON: () => "x" }) },
+    { nested: { __TAURI_TO_IPC_KEY__: 1 } },
+    { nested: Object.create({ __TAURI_TO_IPC_KEY__: () => "x" }) },
+  ];
+  for (const payload of cases) {
+    const m = message("app_status", payload);
+    assertDropped(hook(m), m);
+  }
+  const outer = message("app_status", {});
+  Object.defineProperty(outer, "payload", { enumerable: true, get: () => ({}) });
+  assertDropped(hook(outer), outer);
+  const cmd = message("app_status", {});
+  Object.defineProperty(cmd, "cmd", { enumerable: true, get: () => "app_status" });
+  assertDropped(hook(cmd), cmd);
+  // A throwing getter is a drop, not a throw out of the hook.
+  const throwing = message("app_status", {});
+  Object.defineProperty(throwing.payload, "x", { enumerable: true, get: () => { throw new Error("boom"); } });
+  assertDropped(hook(throwing), throwing);
+});
+
+test("isolation_hook_refuses_non_object_payloads_cycles_and_depth", () => {
+  const { hook } = loadHook();
+  // Every command takes one JSON object; a top-level array would go out as raw bytes.
+  for (const payload of [[1, 2, 3], [], "x", 1, null, true]) {
+    const m = message("app_status", payload);
+    assertDropped(hook(m), m);
+  }
+  const noPayload = { ...message("app_status"), payload: undefined };
+  assertDropped(hook(noPayload), noPayload);
+  const cyclic = { a: { b: {} } };
+  cyclic.a.b.back = cyclic;
+  assertDropped(hook(message("app_status", cyclic)), message("app_status"));
+  const cyclicArray = [];
+  cyclicArray.push(cyclicArray);
+  assertDropped(hook(message("app_status", { a: cyclicArray })), message("app_status"));
+  const nest = (n) => {
+    let v = {};
+    for (let i = 0; i < n; i += 1) v = { v };
+    return v;
+  };
+  // The payload is depth 1; its innermost object at depth 31 passes, at 32 it does not.
+  const deepOk = message("app_status", nest(30));
+  assert.equal(hook(deepOk), deepOk);
+  const tooDeep = message("app_status", nest(31));
+  assertDropped(hook(tooDeep), tooDeep);
+  assertDropped(hook(message("app_status", nest(10000))), message("app_status"));
+  // Shared references are expanded by JSON: a small graph with a huge serialization is dropped.
+  let fan = "x".repeat(1024);
+  for (let i = 0; i < 20; i += 1) fan = [fan, fan];
+  assertDropped(hook(message("app_status", { fan })), message("app_status"));
+  // A huge sparse array is dropped before it is walked.
+  assertDropped(hook(message("app_status", { a: new Array(1e9) })), message("app_status"));
+});
+
+test("isolation_hook_passes_plain_json_and_measures_what_tauri_sends", () => {
+  const { hook, ctx } = loadHook();
+  const payloads = [
+    {},
+    Object.create(null),
+    vm.runInContext("({ a: [1, { b: null }] })", ctx),
+    { event: "queue_changed", target: { kind: "Any" }, handler: 3 },
+    { s: "quote \" backslash \\ newline \n nul \u0000 emoji \u{1F986}", n: -0, nan: NaN, big: 1e300, t: true, f: false, z: null },
+    { holes: [1, , 3], undef: [undefined], skipped: undefined, nested: [[[]], [{}]] },
+    { "key \"quoted\"": 1, "": 2 },
+  ];
+  for (const payload of payloads) {
+    const m = message("app_status", payload);
+    assert.equal(hook(m), m, JSON.stringify(payload));
+    assert.equal(tauriJson(payload), JSON.stringify(payload), "plain data: Tauri sends what the hook measured");
+  }
+  // `options` may be absent (core.js passes `undefined`).
+  const noOptions = { cmd: "app_status", callback: 1, error: 2, payload: {}, options: undefined };
+  assert.equal(hook(noOptions), noOptions);
+  // The cap counts JSON characters, escapes included: "\n" is two.
+  const overhead = JSON.stringify(message("app_status", { s: "" })).length;
+  const escaped = (n) => message("app_status", { s: "\n".repeat(n) });
+  const half = Math.floor((CAP - overhead) / 2);
+  assert.ok(JSON.stringify(escaped(half)).length <= CAP);
+  assert.equal(hook(escaped(half)).cmd, "app_status");
+  assertDropped(hook(escaped(half + 1)), escaped(half + 1));
+  // At the cap through an array of strings and nested objects.
+  const parts = message("app_status", { a: ["", ""], b: { c: "" } });
+  const room = CAP - JSON.stringify(parts).length;
+  parts.payload.b.c = "y".repeat(room);
+  assert.equal(JSON.stringify(parts).length, CAP);
+  assert.equal(hook(parts), parts);
+  parts.payload.a[1] = "y";
+  assertDropped(hook(parts), parts);
+});
+
 test("isolation_hook_cannot_be_replaced", () => {
   const { hook, ctx } = loadHook();
   vm.runInContext("try { window.__TAURI_ISOLATION_HOOK__ = function (m) { return m; }; } catch (e) {}", ctx);

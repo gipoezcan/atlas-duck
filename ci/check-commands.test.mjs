@@ -10,14 +10,17 @@ import {
   DROPPED_CMD,
   END_MARKER,
   EVENT_PERMISSIONS,
+  INJECTED_PARAMS,
   LABELS,
   LISTENING_WINDOWS,
   WINDOW_COMMANDS,
   allowPermission,
   checkAclMutators,
   checkArgStructs,
+  checkCommandHandlers,
   checkSurface,
   parseAllowedBlock,
+  parseCommandFns,
   parseCommandList,
   parseHandlerLists,
   readRepo,
@@ -120,6 +123,7 @@ test("repository_passes", () => {
       securityCapabilities: r.securityCapabilities,
       allowed: parseAllowedBlock(html),
     }).errors,
+    ...checkCommandHandlers(r.srcFiles, parseCommandList(r.namesRs)),
     ...checkArgStructs(r.files),
     ...checkAclMutators(r.srcFiles),
   ];
@@ -331,6 +335,107 @@ test("field_naming_rules_around_bounded_newtypes", () => {
   assert.deepEqual(item("", "    #[serde(default)]\n    pub is_default: bool,\n    pub request_id: RequestId,"), []);
   const untagged = argErrors(`${ARGS_OK}\n#[derive(Deserialize)]\n#[serde(untagged)]\npub enum Target { Id(RequestId), Name(String) }\n`);
   assertFails(untagged, /Target uses #\[serde\(untagged\)\]/);
+});
+
+// ---------- command handlers (T4 review I-2) ----------
+
+const HANDLER_OK = `
+#[tauri::command]
+pub async fn app_status<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<AppStatusArgs>,
+) -> Result<Vec<StatusLineDto>, CommandError> {
+    finish(&app, Ok(vec![]))
+}
+
+/// Injected parameters and a qualified \`Args\` path are fine.
+#[tauri::command(rename_all = "snake_case")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn quit<'a, R: Runtime>(
+    mut app: tauri::AppHandle<R>,
+    state: tauri::State<'_, Mutex<HashMap<String, Vec<u8>>>>,
+    window: Window<R>,
+    webview: tauri::webview::WebviewWindow<R>,
+    Args(QuitArgs {}): dto::Args<QuitArgs>,
+) -> Result<(), CommandError> {
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[tauri::command]
+    async fn test_only(alias: String) {}
+}
+`;
+
+function handlerErrors(files, commands = ["app_status", "quit"]) {
+  return checkCommandHandlers(files, commands);
+}
+
+const MOD_RS = "app/src-tauri/src/commands/mod.rs";
+
+test("command_handlers_fixture_passes", () => {
+  assert.deepEqual(handlerErrors({ [MOD_RS]: HANDLER_OK }), []);
+  assert.deepEqual(INJECTED_PARAMS, ["AppHandle", "State", "Window", "WebviewWindow", "Webview"]);
+  const [, quit] = parseCommandFns(HANDLER_OK);
+  assert.equal(quit.name, "quit");
+  assert.deepEqual(
+    quit.params.map((p) => p.type),
+    ["tauri::AppHandle<R>", "tauri::State<'_, Mutex<HashMap<String, Vec<u8>>>>", "Window<R>", "tauri::webview::WebviewWindow<R>", "dto::Args<QuitArgs>"],
+  );
+});
+
+test("command_with_plain_params_fails", () => {
+  const src = `${HANDLER_OK}
+#[tauri::command]
+pub async fn instance_add(app: AppHandle, alias: String, ca: PathBuf) -> Result<(), CommandError> { Ok(()) }
+`;
+  const errors = handlerErrors({ [MOD_RS]: src }, ["app_status", "instance_add", "quit"]);
+  assertFails(errors, /command instance_add must take exactly one Args<…> argument struct \(found 0\)/);
+  assertFails(errors, /instance_add parameter `alias: String` is neither Args<…> nor injected/);
+  assertFails(errors, /instance_add parameter `ca: PathBuf`/);
+  // A plain parameter next to an `Args` is refused as well.
+  const mixed = HANDLER_OK.replace("args: Args<AppStatusArgs>,", "args: Args<AppStatusArgs>, extra: u32,");
+  assertFails(handlerErrors({ [MOD_RS]: mixed }), /app_status parameter `extra: u32`/);
+  // `Channel` and `Request` read the invoke body: not injected.
+  for (const type of ["tauri::ipc::Channel<Progress>", "Channel<Progress>", "tauri::ipc::Request<'_>"]) {
+    const src2 = HANDLER_OK.replace("app: AppHandle<R>,", `app: AppHandle<R>, ch: ${type},`);
+    assertFails(handlerErrors({ [MOD_RS]: src2 }), /app_status parameter `ch: /);
+  }
+});
+
+test("command_with_two_args_fails", () => {
+  const src = HANDLER_OK.replace("args: Args<AppStatusArgs>,", "args: Args<AppStatusArgs>, more: Args<QuitArgs>,");
+  assertFails(handlerErrors({ [MOD_RS]: src }), /command app_status must take exactly one Args<…> argument struct \(found 2\)/);
+});
+
+test("command_outside_commands_dir_fails", () => {
+  const wizard = `#[tauri::command]\npub async fn wizard_begin(args: Args<WizardBeginArgs>) -> Result<(), CommandError> { Ok(()) }\n`;
+  const errors = handlerErrors(
+    { [MOD_RS]: HANDLER_OK, "app/src-tauri/src/wizard/mod.rs": wizard },
+    ["app_status", "quit", "wizard_begin"],
+  );
+  assertFails(errors, /src\/wizard\/mod\.rs: #\[tauri::command\] wizard_begin is defined outside app\/src-tauri\/src\/commands\/\*\*/);
+  // `use tauri::command; #[command]` is the same attribute.
+  const bare = handlerErrors({ [MOD_RS]: HANDLER_OK, "app/src-tauri/src/lib.rs": wizard.replace("tauri::command", "command") }, [
+    "app_status",
+    "quit",
+    "wizard_begin",
+  ]);
+  assertFails(bare, /lib\.rs: #\[tauri::command\] wizard_begin is defined outside/);
+});
+
+test("command_fns_must_match_commands", () => {
+  assertFails(handlerErrors({ [MOD_RS]: HANDLER_OK }, ["app_status"]), /#\[tauri::command\] quit is not in COMMANDS/);
+  assertFails(handlerErrors({ [MOD_RS]: HANDLER_OK }, ["app_status", "decide", "quit"]), /COMMANDS lists decide, but no #\[tauri::command\] fn decide/);
+  assertFails(handlerErrors({ [MOD_RS]: "#[tauri::command]\nconst X: u8 = 1;" }, []), /cannot parse the fn after #\[tauri::command\]/);
+});
+
+test("session_key_and_other_path_bearing_core_types_fail", () => {
+  for (const type of ["SessionKey", "atlas_duck_core::SessionKey", "Option<KeyOrigin>", "InstanceConfig"]) {
+    const errors = argErrors(`${ARGS_OK}\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct DenySessionArgs { pub key: ${type} }\n`);
+    assertFails(errors, /DenySessionArgs has a field of a forbidden type/);
+  }
 });
 
 test("acl_mutators_are_banned_outside_tests", () => {

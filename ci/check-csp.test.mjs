@@ -169,6 +169,13 @@ test("other_security_settings_fail", () => {
   assertFails(checkConfig(baseConf({ assetProtocol: { enable: true, scope: ["**"] } }), "linux"), /asset protocol/);
   assertFails(checkConfig(baseConf({ freezePrototype: false }), "linux"), /freezePrototype must be true/);
   assertFails(checkConfig(baseConf({ pattern: { use: "brownfield" } }), "linux"), /isolation pattern/);
+  assertFails(checkConfig(baseConf({ headers: { "Cross-Origin-Opener-Policy": "same-origin" } }), "linux"), /app\.security\.headers must not be set/);
+  const global = baseConf();
+  global.app.withGlobalTauri = true;
+  assertFails(checkConfig(global, "linux"), /app\.withGlobalTauri must stay unset/);
+  assertFails(checkConfigs(baseConf(), { macos: { app: { withGlobalTauri: true } } }), /\(macos\): app\.withGlobalTauri/);
+  global.app.withGlobalTauri = false;
+  assert.deepEqual(checkConfig(global, "linux"), []);
 });
 
 test("the_app_must_patch_the_placeholder_before_building", () => {
