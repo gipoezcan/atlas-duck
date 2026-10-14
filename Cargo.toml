@@ -95,7 +95,7 @@ html-escape = "=0.2.15"
 # M3 atlassian HTTP client (Task 9). No default features: they would bring `system-proxy`
 # (reads OS/env proxies, L42), http2, charset and the aws-lc-rs provider (licence not allowed).
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider"] }
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 httpdate = "=1.0.3"
 # Test harness of `atlassian::testing` (§13: plain-HTTP mock, local TLS server with a generated CA).
 wiremock = "=0.6.5"
