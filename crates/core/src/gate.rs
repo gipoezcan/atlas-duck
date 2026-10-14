@@ -139,6 +139,11 @@ impl GateHandler {
         })
     }
 
+    /// The state this handler serves (the app's GUI relaunch routes on it, §2.5).
+    pub fn state(&self) -> GateState {
+        self.state
+    }
+
     /// How many `submit`, `submit_script`, `await` and `cancel` calls were refused so far.
     pub fn refused(&self) -> u64 {
         self.refused.load(Ordering::SeqCst)

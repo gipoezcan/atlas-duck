@@ -16,6 +16,7 @@ pub mod capture;
 pub mod dto;
 mod errors;
 mod names;
+pub mod window;
 
 use std::sync::Arc;
 
@@ -34,7 +35,11 @@ use dto::{AppStatusArgs, Args, StatusLineDto};
 /// Registers every command of [`COMMANDS`] (one `generate_handler!` list; `lib.rs` and the
 /// mock-runtime tests share it).
 pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
-    builder.invoke_handler(tauri::generate_handler![app_status])
+    builder.invoke_handler(tauri::generate_handler![
+        app_status,
+        window::open_window,
+        window::quit
+    ])
 }
 
 /// The serving `Core`; `NotReady` before first run, while locked or starting, and when the store

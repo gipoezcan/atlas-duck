@@ -1,5 +1,6 @@
 //! App-wide state managed by Tauri (`app.manage`). Later milestones read it and add fields.
 
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use atlas_duck_audit::lock::InstanceLock;
@@ -53,6 +54,13 @@ pub struct AppState {
     tray_host: Option<TrayHost>,
     /// The §9.4 probe report; set once by the `atlas-duck-probe` thread.
     pub probe: OnceLock<ProbeReport>,
+    /// The startup error text (`startup::startup_message`) of the four data-dir error states,
+    /// re-shown on a GUI relaunch (§2.5, PD-85).
+    startup_text: Option<String>,
+    /// The pending count the tray shows ("Open approvals (N)", tooltip); Task 19 feeds it.
+    pending: AtomicU32,
+    /// The no-tray-host hint was shown (§2.5: dismissal is UI state, in memory, not audited).
+    tray_hint_shown: AtomicBool,
 }
 
 impl AppState {
@@ -61,7 +69,34 @@ impl AppState {
             startup,
             tray_host,
             probe: OnceLock::new(),
+            startup_text: None,
+            pending: AtomicU32::new(0),
+            tray_hint_shown: AtomicBool::new(false),
         }
+    }
+
+    /// The startup error text of this state (the same app-generated text the tray shows).
+    pub fn with_startup_text(mut self, text: Option<String>) -> AppState {
+        self.startup_text = text;
+        self
+    }
+
+    pub fn startup_text(&self) -> Option<&str> {
+        self.startup_text.as_deref()
+    }
+
+    pub fn pending(&self) -> u32 {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pending(&self, n: u32) {
+        self.pending.store(n, Ordering::Relaxed);
+    }
+
+    /// True exactly once per process, and only when the tray-host check found no host (§2.5).
+    pub fn claim_tray_hint(&self) -> bool {
+        self.tray_host == Some(TrayHost::Missing)
+            && !self.tray_hint_shown.swap(true, Ordering::SeqCst)
     }
 
     pub fn tray_host(&self) -> Option<TrayHost> {
@@ -114,11 +149,22 @@ pub struct ServeSlot {
     quit: ShutdownSignal,
     /// The one quit run (`serve::quit`): a second Quit waits for it.
     quit_done: tokio::sync::OnceCell<ShutdownOutcome>,
+    /// PD-06: the store could not be opened (or the core not started); nothing is served.
+    store_failed: AtomicBool,
 }
 
 impl ServeSlot {
     pub fn get(&self) -> Option<&Arc<ServeState>> {
         self.state.get()
+    }
+
+    /// Set by `serve::start` on a PD-06 failure: the GUI relaunch shows the error window then.
+    pub fn mark_store_failed(&self) {
+        self.store_failed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn store_failed(&self) -> bool {
+        self.store_failed.load(Ordering::SeqCst)
     }
 
     /// The first state wins; a later one is dropped.
@@ -164,6 +210,30 @@ mod tests {
         let none = AppState::new(StartupSummary::BeforeFirstRun, None);
         assert_eq!(none.tray_host(), None);
         assert_eq!(none.startup, StartupSummary::BeforeFirstRun);
+    }
+
+    #[test]
+    fn tray_hint_is_claimed_once_and_only_without_a_tray_host() {
+        let missing = AppState::new(StartupSummary::Ready, Some(TrayHost::Missing));
+        assert!(missing.claim_tray_hint());
+        assert!(!missing.claim_tray_hint(), "one-time hint");
+        let present = AppState::new(StartupSummary::Ready, Some(TrayHost::Present));
+        assert!(!present.claim_tray_hint());
+        assert!(!AppState::new(StartupSummary::Ready, None).claim_tray_hint());
+    }
+
+    #[test]
+    fn startup_text_and_pending_count() {
+        let state = AppState::new(StartupSummary::DataDirMissing, None)
+            .with_startup_text(Some("data directory /x not found".into()));
+        assert_eq!(state.startup_text(), Some("data directory /x not found"));
+        assert_eq!(state.pending(), 0);
+        state.set_pending(3);
+        assert_eq!(state.pending(), 3);
+        let slot = ServeSlot::default();
+        assert!(!slot.store_failed());
+        slot.mark_store_failed();
+        assert!(slot.store_failed());
     }
 
     #[test]

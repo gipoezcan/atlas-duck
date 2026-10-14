@@ -23,6 +23,7 @@ pub mod testing;
 pub mod tray;
 pub mod tray_host;
 pub mod ui_sink;
+pub mod windows;
 
 use std::sync::Arc;
 
@@ -30,6 +31,7 @@ use tauri::Manager;
 
 use crate::startup::{DialogPresenter, StartupAction, StartupState};
 use crate::state::{AppState, DataDirHold, ServeSlot};
+use crate::windows::{NavPolicy, StartupRoute, WindowRegistry};
 
 /// GUI and `--background` launches. Order (§2.5, §3.1, §7.7): startup hardening and crash
 /// settings (M6 T2, T09, in `main.rs`, before this call) -> diagnostic log -> Tauri builder -> in
@@ -47,15 +49,15 @@ pub fn run_gui(background: bool) -> ! {
     if let Some(hardening) = startup::hardening::applied() {
         startup::hardening::log(hardening);
     }
-    // M6 decides what a cold start without `--background` opens; M1 opens no window.
-    let _ = background;
-
     let mut context = tauri::generate_context!();
     // §6.4 (M6 T4): the main CSP's `frame-src` names this build's isolation origin.
     if csp::patch_context(&mut context).is_err() {
         eprintln!("atlas-duck-app: failed to start the application shell");
         std::process::exit(1);
     }
+    // §6.4, §10.3 (M6 T6): navigation stays on the app origin; subframes may also load this
+    // build's isolation origin (from the pattern, never a constant).
+    let nav = NavPolicy::for_this_platform(csp::isolation_origin(context.pattern()));
     // The test build: apps of different test homes never forward to each other.
     #[cfg(feature = "scripted-approver")]
     testing::scope_identifier(context.config_mut());
@@ -116,13 +118,26 @@ pub fn run_gui(background: bool) -> ! {
             tray_host::log_tray_host(tray_host);
 
             if let Some(summary) = state.summary() {
-                app.manage(AppState::new(summary, tray_host));
+                app.manage(AppState::new(summary, tray_host).with_startup_text(tray_status));
             }
+            // M6 T6: the window registry. In `Ready` the cold start opens its window once
+            // `serve::start` finished (§2.5); in every other state nothing waits.
+            diag.extend_allowed_fields(windows::LOG_FIELDS);
+            let route = match state {
+                StartupState::Ready { .. } => StartupRoute::awaiting(background),
+                _ => StartupRoute::completed(),
+            };
+            app.manage(WindowRegistry::new(nav, route));
             let mut serve_args = None;
-            if let StartupState::Ready { data, lock } = state {
-                let lock = Arc::new(lock);
-                app.manage(DataDirHold::new(data.clone(), lock.clone()));
-                serve_args = Some((data, lock));
+            let mut first_run = false;
+            match state {
+                StartupState::Ready { data, lock } => {
+                    let lock = Arc::new(lock);
+                    app.manage(DataDirHold::new(data.clone(), lock.clone()));
+                    serve_args = Some((data, lock));
+                }
+                StartupState::BeforeFirstRun => first_run = true,
+                _ => {}
             }
 
             // T20: the §9.4 probe runs on its own thread, in every startup state that reaches
@@ -134,7 +149,16 @@ pub fn run_gui(background: bool) -> ! {
 
             // The tray is built in every startup state; in the four error states it also shows
             // the startup message (§7.7). A failure is logged and startup continues (§15 V33).
-            tray::build_tray_or_log(app.handle(), tray_status.as_deref());
+            tray::build_tray_or_log(app.handle());
+            // §2.5: no tray host (Linux) → the one-time hint naming the GNOME extension.
+            windows::show_no_tray_host_hint(app.handle());
+            // §2.5 First run: the cold start opens the wizard (the setup window) at once.
+            if first_run {
+                let snapshot = windows::AppSnapshot::BeforeFirstRun;
+                let action = windows::route_cold_start(&snapshot, background);
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || windows::perform(&handle, action));
+            }
 
             // T19 (PD-05): in `Ready`, open the store and serve IPC. `serve::start` returns at
             // once; the work runs on the async runtime, never on this (the main) thread.
@@ -162,7 +186,8 @@ pub fn run_gui(background: bool) -> ! {
         }
     };
     // An exit request without a code (last window closed, OS) is prevented; Quit calls
-    // `app.exit(0)`, which carries a code and is honoured.
+    // `app.exit(0)`, which carries a code and is honoured. Closing a window hides it; macOS
+    // `Reopen` is a GUI relaunch (§2.5).
     app.run(tray::on_run_event);
     std::process::exit(0)
 }

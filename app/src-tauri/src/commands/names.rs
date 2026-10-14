@@ -8,4 +8,6 @@
 #[rustfmt::skip]
 pub const COMMANDS: &[&str] = &[
     "app_status",
+    "open_window",
+    "quit",
 ];

@@ -28,7 +28,7 @@ use atlas_duck_ipc::paths::{EndpointLocation, LocalDataDir, PinnedPaths, remove_
 use atlas_duck_ipc::proto::RequestHandler;
 use atlas_duck_ipc::server::{HandlerCell, IpcServer, ShutdownSignal};
 use atlas_duck_ipc::transport::diag;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use zeroize::Zeroizing;
@@ -288,6 +288,11 @@ impl ServeState {
         lock(&self.gate).as_ref().map(|g| g.refused())
     }
 
+    /// The state of the gate serving now; `None` while `Core` serves.
+    pub fn gate_state(&self) -> Option<GateState> {
+        lock(&self.gate).as_ref().map(|g| g.state())
+    }
+
     /// True while the `serve` task runs.
     pub fn serving(&self) -> bool {
         lock(&self.served)
@@ -522,10 +527,11 @@ pub async fn quit(slot: &ServeSlot, reason: ShutdownReason, outer: Duration) -> 
         .await
 }
 
-/// The tray's Quit: [`quit`] with [`SHUTDOWN_OUTER`] on the async runtime (the menu handler
-/// runs on the main thread and must not block), then `app.exit(0)`. Without a [`ServeSlot`]
-/// (no store is served in this startup state) it exits at once.
-pub fn shutdown_then_exit(app: &AppHandle, reason: ShutdownReason) {
+/// Every Quit (tray, the `quit` command, the error windows): [`quit`] with [`SHUTDOWN_OUTER`] on
+/// the async runtime (the menu handler runs on the main thread and must not block), then
+/// `app.exit(0)`. Without a [`ServeSlot`] (no store is served in this startup state) it exits at
+/// once.
+pub fn shutdown_then_exit<R: Runtime>(app: &AppHandle<R>, reason: ShutdownReason) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Some(slot) = handle.try_state::<ServeSlot>() {
@@ -612,10 +618,16 @@ pub fn start(
                 }
             }
             Err(StartupFailure::Store(_)) => {
-                tray::set_status_text(&handle, tray::MSG_STORE_UNAVAILABLE);
+                if let Some(slot) = handle.try_state::<ServeSlot>() {
+                    slot.mark_store_failed();
+                }
             }
             Err(StartupFailure::Cancelled) => {}
         }
+        // M6 T6: the tray shows the state startup ended in (PD-06: [`tray::MSG_STORE_UNAVAILABLE`]),
+        // and a cold start without `--background` opens its window now (§2.5).
+        tray::refresh(&handle);
+        crate::windows::startup_completed(&handle);
     });
     // The task may have finished already; its handle is still what Quit awaits.
     if let Some(slot) = slot {

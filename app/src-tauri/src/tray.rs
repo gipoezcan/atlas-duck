@@ -1,17 +1,22 @@
-//! Tray shell (§2.5): tray icon with a Quit item, tray-only lifecycle, the
-//! single-instance and autostart plugins. All tray text is app-generated (§5.6).
+//! Tray shell (§2.5): the tray menu ("Open approvals (N)", "Unlock…", "Presentation mode",
+//! "Retry keychain", Quit), the tray-only lifecycle (closing a window hides it, an exit without a
+//! code is prevented), the single-instance and autostart plugins and the GUI relaunch they
+//! forward. All tray text is app-generated (§5.6).
 
 use std::ffi::{OsStr, OsString};
 
-use atlas_duck_core::ShutdownReason;
+use atlas_duck_audit::LockedReason;
+use atlas_duck_core::{GateState, ShutdownReason};
 use tauri::menu::{IsMenuItem, Menu, MenuEvent, MenuItem};
 use tauri::plugin::TauriPlugin;
 use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::{AppHandle, RunEvent, Runtime, Wry};
+use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent, Wry};
 
 use crate::early_argv::FLAG_BACKGROUND;
 use crate::serve;
 use crate::startup::{StartupState, startup_message};
+use crate::state::AppState;
+use crate::windows::{self, AppSnapshot, Label};
 
 /// Id of the app's one tray icon.
 pub const TRAY_ID: &str = "main";
@@ -19,8 +24,26 @@ pub const TRAY_ID: &str = "main";
 pub const MENU_ID_QUIT: &str = "quit";
 /// Menu id of the disabled status item shown in the startup error states (§7.7).
 pub const MENU_ID_STATUS: &str = "status";
+/// Menu id of "Open approvals (N)".
+pub const MENU_ID_OPEN_APPROVALS: &str = "open_approvals";
+/// Menu id of "Unlock…" (locked only).
+pub const MENU_ID_UNLOCK: &str = "unlock";
+/// Menu id of "Presentation mode" (Task 19 wires it).
+pub const MENU_ID_PRESENTATION_MODE: &str = "presentation_mode";
+/// Menu id of "Retry keychain" (`keychain_unavailable` only; Task 22 wires it, PD-89).
+pub const MENU_ID_RETRY_KEYCHAIN: &str = "retry_keychain";
 /// Label of the Quit item (app-generated constant, §5.6).
 pub const MENU_LABEL_QUIT: &str = "Quit";
+/// §2.5 (verbatim): "Open approvals (N)"; `<n>` is the pending count.
+pub const MENU_LABEL_OPEN_APPROVALS: &str = "Open approvals (<n>)";
+/// §2.5 (verbatim).
+pub const MENU_LABEL_UNLOCK: &str = "Unlock…";
+/// §5.6 (verbatim): switches to "badge only" without confirmation (Task 19).
+pub const MENU_LABEL_PRESENTATION_MODE: &str = "Presentation mode";
+/// plan text (PD-89).
+pub const MENU_LABEL_RETRY_KEYCHAIN: &str = "Retry keychain";
+/// plan text (T6): the tooltip outside the error states; `<n>` is the pending count.
+pub const TOOLTIP_PENDING: &str = "atlas-duck: <n> pending";
 /// PD-06: the tray status text when the audit store could not be opened (plan text; no path,
 /// no error text).
 pub const MSG_STORE_UNAVAILABLE: &str = "audit store could not be opened";
@@ -41,23 +64,104 @@ pub const AUTOSTART_APP_NAME: &str = "atlas-duck";
 /// CI-only flag: enable autostart once, then exit (Linux, `CI=true`; see `run_autostart_probe`).
 pub const FLAG_AUTOSTART_PROBE: &str = "--autostart-probe";
 
-const MENU_ITEM_IDS: &[&str] = &[MENU_ID_QUIT];
-const MENU_ITEM_IDS_WITH_STATUS: &[&str] = &[MENU_ID_STATUS, MENU_ID_QUIT];
-
 /// What a tray menu item does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
+    /// The GUI relaunch path (§2.5): Approvals, or the window the state needs instead.
+    OpenApprovals,
+    /// The credential window for unlock; the same routing as a relaunch while locked.
+    Unlock,
+    /// Task 19: switches the attention mode to "badge only" (§5.6).
+    PresentationMode,
+    /// Task 22: one more keychain attempt (PD-89).
+    RetryKeychain,
     /// The §2.5 shutdown path, then `app.exit(0)` (`serve::shutdown_then_exit`).
     Quit,
 }
 
-/// Menu item ids in menu order. Without a status text the menu holds only Quit. With one
-/// (the four startup error states) a disabled status item sits above Quit.
-pub fn menu_item_ids(status: Option<&str>) -> &'static [&'static str] {
-    if status.is_some() {
-        MENU_ITEM_IDS_WITH_STATUS
-    } else {
-        MENU_ITEM_IDS
+/// One tray menu item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuEntry {
+    pub id: &'static str,
+    pub label: String,
+    pub enabled: bool,
+}
+
+impl MenuEntry {
+    fn item(id: &'static str, label: impl Into<String>) -> MenuEntry {
+        MenuEntry {
+            id,
+            label: label.into(),
+            enabled: true,
+        }
+    }
+}
+
+/// The status text the tray shows for `state`: the startup error text (§7.7) or the PD-06 text;
+/// `None` otherwise (Task 22 adds the locked and no-store lines).
+pub fn status_text(state: &AppSnapshot) -> Option<String> {
+    match state {
+        AppSnapshot::StartupError(text) => Some(text.clone()),
+        AppSnapshot::StoreUnavailable => Some(MSG_STORE_UNAVAILABLE.to_owned()),
+        _ => None,
+    }
+}
+
+/// True when the credential window can unlock `state` (`keyring_not_local` has nothing to
+/// unlock, §8.7).
+fn unlockable(state: &AppSnapshot) -> bool {
+    matches!(
+        state,
+        AppSnapshot::Gate(GateState::Locked(
+            LockedReason::KeychainUnavailable | LockedReason::KeychainLost { .. }
+        ))
+    )
+}
+
+/// The tray menu for `state` with `pending` requests, in menu order (§2.5): the disabled status
+/// item (error states), "Open approvals (N)" (always: it takes the GUI relaunch path), "Unlock…"
+/// (locked), "Retry keychain" (`keychain_unavailable`), "Presentation mode" (while `Core` serves),
+/// Quit.
+pub fn menu_entries(state: &AppSnapshot, pending: u32) -> Vec<MenuEntry> {
+    let mut entries = Vec::with_capacity(6);
+    if let Some(text) = status_text(state) {
+        entries.push(MenuEntry {
+            id: MENU_ID_STATUS,
+            label: text,
+            enabled: false,
+        });
+    }
+    entries.push(MenuEntry::item(
+        MENU_ID_OPEN_APPROVALS,
+        MENU_LABEL_OPEN_APPROVALS.replace("<n>", &pending.to_string()),
+    ));
+    if unlockable(state) {
+        entries.push(MenuEntry::item(MENU_ID_UNLOCK, MENU_LABEL_UNLOCK));
+    }
+    if state == &AppSnapshot::Gate(GateState::Locked(LockedReason::KeychainUnavailable)) {
+        entries.push(MenuEntry::item(
+            MENU_ID_RETRY_KEYCHAIN,
+            MENU_LABEL_RETRY_KEYCHAIN,
+        ));
+    }
+    if state == &AppSnapshot::Serving {
+        entries.push(MenuEntry::item(
+            MENU_ID_PRESENTATION_MODE,
+            MENU_LABEL_PRESENTATION_MODE,
+        ));
+    }
+    entries.push(MenuEntry::item(MENU_ID_QUIT, MENU_LABEL_QUIT));
+    entries
+}
+
+/// The tooltip: the status text when there is one (Linux shows no tooltip, so the status item
+/// carries it there), else the pending count (§5.6 "The tray badge/tooltip always shows the
+/// pending count").
+pub fn tooltip_text(status: Option<&str>, pending: u32) -> String {
+    let count = TOOLTIP_PENDING.replace("<n>", &pending.to_string());
+    match status {
+        Some(text) => format!("{text}\n{count}"),
+        None => count,
     }
 }
 
@@ -77,9 +181,13 @@ pub fn tray_status_text(state: &StartupState) -> Option<String> {
     }
 }
 
-/// Maps a menu id to its action; unknown ids do nothing.
+/// Maps a menu id to its action; unknown ids (and the status item) do nothing.
 pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
     match id {
+        MENU_ID_OPEN_APPROVALS => Some(TrayAction::OpenApprovals),
+        MENU_ID_UNLOCK => Some(TrayAction::Unlock),
+        MENU_ID_PRESENTATION_MODE => Some(TrayAction::PresentationMode),
+        MENU_ID_RETRY_KEYCHAIN => Some(TrayAction::RetryKeychain),
         MENU_ID_QUIT => Some(TrayAction::Quit),
         _ => None,
     }
@@ -92,64 +200,103 @@ pub fn should_prevent_exit(code: Option<i32>) -> bool {
     code.is_none()
 }
 
-/// The run-loop handler passed to `App::run`.
-pub fn on_run_event<R: Runtime>(_app: &AppHandle<R>, event: RunEvent) {
-    if let RunEvent::ExitRequested { code, api, .. } = event
-        && should_prevent_exit(code)
-    {
-        api.prevent_exit();
+/// What closing a window does (§2.5 "Closing windows hides them; the app exits only through the
+/// shutdown path").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// The window is hidden and keeps its state.
+    Hide,
+    /// The credential window is destroyed instead, so no typed, unsubmitted secret stays in a
+    /// hidden webview (§10.1); Rust builds it again, incognito, when it is next needed. The app
+    /// keeps running either way (the code-less exit request is prevented).
+    Destroy,
+}
+
+/// The close rule per window label.
+pub fn close_action(label: &str) -> CloseAction {
+    if label == Label::Credential.as_str() {
+        CloseAction::Destroy
+    } else {
+        CloseAction::Hide
     }
 }
 
-/// Builds the tray icon `TRAY_ID`. The menu is Quit; with `status` it gains a disabled item
-/// with that text above Quit, and the tray tooltip carries the same text (Linux shows no
-/// tooltip, so there the menu item is the place where the text appears, §2.5).
-pub fn build_tray(app: &AppHandle, status: Option<&str>) -> tauri::Result<TrayIcon> {
-    let menu = tray_menu(app, status)?;
+/// The run-loop handler passed to `App::run`: a code-less exit request is prevented, a window
+/// close hides the window ([`close_action`]), and macOS `RunEvent::Reopen` (Dock, Finder,
+/// Spotlight) takes the GUI relaunch path (§2.5).
+pub fn on_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
+    match event {
+        RunEvent::ExitRequested { code, api, .. } if should_prevent_exit(code) => {
+            api.prevent_exit();
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::CloseRequested { api, .. },
+            ..
+        } if close_action(&label) == CloseAction::Hide => {
+            api.prevent_close();
+            if let Some(window) = app.get_webview_window(&label) {
+                let _ = window.hide();
+            }
+        }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => windows::spawn_relaunch(app, Vec::new()),
+        _ => {}
+    }
+}
+
+/// The current state, its menu and tooltip.
+fn tray_view(app: &AppHandle) -> (Vec<MenuEntry>, String) {
+    let state = windows::snapshot(app);
+    let pending = app.try_state::<AppState>().map_or(0, |s| s.pending());
+    let status = status_text(&state);
+    (
+        menu_entries(&state, pending),
+        tooltip_text(status.as_deref(), pending),
+    )
+}
+
+/// Builds the tray icon `TRAY_ID` with the menu and tooltip of the current state.
+pub fn build_tray(app: &AppHandle) -> tauri::Result<TrayIcon> {
+    let (entries, tooltip) = tray_view(app);
+    let menu = tray_menu(app, &entries)?;
     let icon = app.default_window_icon().cloned().ok_or_else(|| {
         tauri::Error::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "bundle has no default window icon",
         ))
     })?;
-    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+    TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .menu(&menu)
+        .tooltip(tooltip)
         .show_menu_on_left_click(true)
-        .on_menu_event(on_menu_event);
-    if let Some(text) = status {
-        builder = builder.tooltip(text);
-    }
-    builder.build(app)
+        .on_menu_event(on_menu_event)
+        .build(app)
 }
 
-/// The menu of [`menu_item_ids`]: Quit, with a disabled status item above it when `status` is
-/// given.
-fn tray_menu(app: &AppHandle, status: Option<&str>) -> tauri::Result<Menu<Wry>> {
-    let status_item = status
-        .map(|text| MenuItem::with_id(app, MENU_ID_STATUS, text, false, None::<&str>))
-        .transpose()?;
-    let quit = MenuItem::with_id(app, MENU_ID_QUIT, MENU_LABEL_QUIT, true, None::<&str>)?;
-    let mut items: Vec<&dyn IsMenuItem<Wry>> = Vec::with_capacity(2);
-    if let Some(item) = &status_item {
-        items.push(item);
-    }
-    items.push(&quit);
-    Menu::with_items(app, &items)
+/// The menu of `entries`.
+fn tray_menu(app: &AppHandle, entries: &[MenuEntry]) -> tauri::Result<Menu<Wry>> {
+    let items = entries
+        .iter()
+        .map(|e| MenuItem::with_id(app, e.id, &e.label, e.enabled, None::<&str>))
+        .collect::<tauri::Result<Vec<_>>>()?;
+    let refs: Vec<&dyn IsMenuItem<Wry>> = items.iter().map(|i| i as &dyn IsMenuItem<Wry>).collect();
+    Menu::with_items(app, &refs)
 }
 
-/// Shows `text` in the already built tray (status item above Quit, and the tooltip), for a
-/// state found after `setup` (T19: PD-06 [`MSG_STORE_UNAVAILABLE`]). Callable from any thread
-/// (Tauri runs the menu calls on the main thread). Without a tray, or on failure, it logs
-/// `event=tray_build_failed`.
-pub fn set_status_text(app: &AppHandle, text: &str) {
+/// Rebuilds the menu and tooltip from the current state (after startup, on a pending-count
+/// change). Callable from any thread (Tauri runs the menu calls on the main thread). Without a
+/// tray, or on failure, it logs `event=tray_build_failed`.
+pub fn refresh(app: &AppHandle) {
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         tracing::warn!(event = LOG_EVENT_TRAY_BUILD_FAILED, error_class = "no_tray");
         return;
     };
-    let updated = tray_menu(app, Some(text))
+    let (entries, tooltip) = tray_view(app);
+    let updated = tray_menu(app, &entries)
         .and_then(|menu| tray.set_menu(Some(menu)))
-        .and_then(|()| tray.set_tooltip(Some(text)));
+        .and_then(|()| tray.set_tooltip(Some(tooltip)));
     if updated.is_err() {
         tracing::warn!(
             event = LOG_EVENT_TRAY_BUILD_FAILED,
@@ -158,10 +305,18 @@ pub fn set_status_text(app: &AppHandle, text: &str) {
     }
 }
 
+/// The pending count of "Open approvals (N)" and the tooltip (Task 19 calls it on queue changes).
+pub fn set_pending(app: &AppHandle, pending: u32) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.set_pending(pending);
+    }
+    refresh(app);
+}
+
 /// Builds the tray; a failure is logged as `event=tray_build_failed` and startup
 /// continues (§2.5: the app must not depend on a tray host; §15 V33).
-pub fn build_tray_or_log(app: &AppHandle, status: Option<&str>) {
-    if build_tray(app, status).is_err() {
+pub fn build_tray_or_log(app: &AppHandle) {
+    if build_tray(app).is_err() {
         tracing::warn!(
             event = LOG_EVENT_TRAY_BUILD_FAILED,
             error_class = "tauri_tray"
@@ -171,17 +326,24 @@ pub fn build_tray_or_log(app: &AppHandle, status: Option<&str>) {
 
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match action_for_menu_id(event.id().as_ref()) {
+        // The menu handler runs on the main thread; the relaunch builds windows elsewhere.
+        Some(TrayAction::OpenApprovals | TrayAction::Unlock) => {
+            windows::spawn_relaunch(app, Vec::new());
+        }
         Some(TrayAction::Quit) => serve::shutdown_then_exit(app, ShutdownReason::Quit),
-        None => {}
+        // Task 19 (attention mode) and Task 22 (PD-89) wire these.
+        Some(TrayAction::PresentationMode | TrayAction::RetryKeychain) | None => {}
     }
 }
 
-/// tauri-plugin-single-instance: forwards a relaunch to the running instance only
-/// (§2.5). M1 logs `event=forwarded_launch` and nothing else (no argv, no cwd);
-/// the GUI relaunch rule is M6.
+/// tauri-plugin-single-instance: forwards a relaunch to the running instance only (§2.5). It
+/// logs `event=forwarded_launch` (no argv, no cwd) and takes the GUI relaunch path with the
+/// forwarded argv: no arguments open Approvals (or what the state needs), `--background` opens
+/// nothing (§15 V33).
 pub fn single_instance_plugin<R: Runtime>() -> TauriPlugin<R> {
-    tauri_plugin_single_instance::init(|_app, _argv, _cwd| {
+    tauri_plugin_single_instance::init(|app, argv, _cwd| {
         tracing::info!(event = LOG_EVENT_FORWARDED_LAUNCH);
+        windows::spawn_relaunch(app, argv.into_iter().map(OsString::from).collect());
     })
 }
 
@@ -258,33 +420,120 @@ mod tests {
     }
 
     #[test]
-    fn menu_holds_only_quit_without_a_status() {
-        assert_eq!(menu_item_ids(None), &["quit"]);
-        assert_eq!(MENU_ID_QUIT, "quit");
-        assert_eq!(MENU_LABEL_QUIT, "Quit");
-        assert_eq!(TRAY_ID, "main");
-    }
-
-    #[test]
     fn store_unavailable_text_is_the_plan_constant() {
         // PD-06: constant text, no path and no error text.
         assert_eq!(MSG_STORE_UNAVAILABLE, "audit store could not be opened");
         assert!(!MSG_STORE_UNAVAILABLE.contains('<'));
     }
 
+    fn ids(entries: &[MenuEntry]) -> Vec<&'static str> {
+        entries.iter().map(|e| e.id).collect()
+    }
+
+    fn locked(reason: LockedReason) -> AppSnapshot {
+        AppSnapshot::Gate(GateState::Locked(reason))
+    }
+
     #[test]
-    fn menu_gains_one_status_item_above_quit_with_a_status() {
-        assert_eq!(MENU_ID_STATUS, "status");
-        assert_eq!(menu_item_ids(Some("text")), &["status", "quit"]);
+    fn tray_menu_items_per_state() {
+        use atlas_duck_audit::RecoveryOffer;
+        assert_eq!(TRAY_ID, "main");
+        assert_eq!(MENU_LABEL_QUIT, "Quit");
+        assert_eq!(MENU_LABEL_UNLOCK, "Unlock\u{2026}");
+        assert_eq!(MENU_LABEL_PRESENTATION_MODE, "Presentation mode");
+
+        // Serving: the count, presentation mode, Quit.
+        let serving = menu_entries(&AppSnapshot::Serving, 3);
         assert_eq!(
-            menu_item_ids(Some("text")).len(),
-            menu_item_ids(None).len() + 1
+            ids(&serving),
+            ["open_approvals", "presentation_mode", "quit"]
+        );
+        assert_eq!(serving[0].label, "Open approvals (3)");
+        assert!(serving.iter().all(|e| e.enabled));
+        assert_eq!(
+            menu_entries(&AppSnapshot::Serving, 0)[0].label,
+            "Open approvals (0)"
+        );
+        assert_eq!(
+            menu_entries(&AppSnapshot::Serving, 1234)[0].label,
+            "Open approvals (1234)"
+        );
+
+        // Locked: "Unlock…"; "Retry keychain" only while the keychain is unavailable.
+        let unavailable = menu_entries(&locked(LockedReason::KeychainUnavailable), 6);
+        assert_eq!(
+            ids(&unavailable),
+            ["open_approvals", "unlock", "retry_keychain", "quit"]
+        );
+        assert_eq!(unavailable[1].label, "Unlock\u{2026}");
+        assert_eq!(unavailable[2].label, "Retry keychain");
+        for offer in [RecoveryOffer::RecoverThisLog, RecoveryOffer::FinishRestore] {
+            assert_eq!(
+                ids(&menu_entries(
+                    &locked(LockedReason::KeychainLost { offer }),
+                    0
+                )),
+                ["open_approvals", "unlock", "quit"]
+            );
+        }
+        // Nothing to unlock: no "Unlock…" (§8.7).
+        assert_eq!(
+            ids(&menu_entries(&locked(LockedReason::KeyringNotLocal), 0)),
+            ["open_approvals", "quit"]
+        );
+
+        // The error states: a disabled status item above the rest.
+        let error = menu_entries(
+            &AppSnapshot::StartupError("data directory /d not found".into()),
+            0,
+        );
+        assert_eq!(ids(&error), ["status", "open_approvals", "quit"]);
+        assert_eq!(error[0].label, "data directory /d not found");
+        assert!(!error[0].enabled);
+        let failed = menu_entries(&AppSnapshot::StoreUnavailable, 0);
+        assert_eq!(ids(&failed), ["status", "open_approvals", "quit"]);
+        assert_eq!(failed[0].label, MSG_STORE_UNAVAILABLE);
+
+        for state in [
+            AppSnapshot::BeforeFirstRun,
+            AppSnapshot::Starting,
+            AppSnapshot::ShuttingDown,
+            AppSnapshot::Gate(GateState::FirstRun),
+            AppSnapshot::Gate(GateState::StoreNewer),
+        ] {
+            assert_eq!(
+                ids(&menu_entries(&state, 0)),
+                ["open_approvals", "quit"],
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tooltip_shows_the_pending_count() {
+        assert_eq!(tooltip_text(None, 3), "atlas-duck: 3 pending");
+        assert_eq!(
+            tooltip_text(Some("audit store could not be opened"), 0),
+            "audit store could not be opened\natlas-duck: 0 pending"
         );
     }
 
     #[test]
     fn menu_ids_map_to_actions() {
         assert_eq!(action_for_menu_id("quit"), Some(TrayAction::Quit));
+        assert_eq!(
+            action_for_menu_id("open_approvals"),
+            Some(TrayAction::OpenApprovals)
+        );
+        assert_eq!(action_for_menu_id("unlock"), Some(TrayAction::Unlock));
+        assert_eq!(
+            action_for_menu_id("presentation_mode"),
+            Some(TrayAction::PresentationMode)
+        );
+        assert_eq!(
+            action_for_menu_id("retry_keychain"),
+            Some(TrayAction::RetryKeychain)
+        );
         assert_eq!(action_for_menu_id("Quit"), None);
         assert_eq!(action_for_menu_id(""), None);
         assert_eq!(
@@ -292,12 +541,32 @@ mod tests {
             None,
             "the status item does nothing"
         );
-        for id in menu_item_ids(None) {
-            assert!(
-                action_for_menu_id(id).is_some(),
-                "menu id {id} has no action"
-            );
+        // Every enabled item of every state has an action.
+        for state in [
+            AppSnapshot::Serving,
+            locked(LockedReason::KeychainUnavailable),
+            AppSnapshot::StoreUnavailable,
+        ] {
+            for e in menu_entries(&state, 1).iter().filter(|e| e.enabled) {
+                assert!(action_for_menu_id(e.id).is_some(), "{} has no action", e.id);
+            }
         }
+    }
+
+    /// The close rule; `tests/windows_registry.rs::close_hides_never_exits_under_the_run_loop`
+    /// drives `on_run_event` through the mock runtime's event loop (the lib's unit-test
+    /// executable carries no Common-Controls v6 manifest, `build.rs`).
+    #[test]
+    fn close_hides_never_exits() {
+        for label in Label::ALL {
+            let want = if label == Label::Credential {
+                CloseAction::Destroy
+            } else {
+                CloseAction::Hide
+            };
+            assert_eq!(close_action(label.as_str()), want, "{label:?}");
+        }
+        assert_eq!(close_action("unknown"), CloseAction::Hide);
     }
 
     #[test]

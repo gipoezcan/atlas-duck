@@ -4,6 +4,8 @@
   "windows": ["approvals"],
   "permissions": [
     "allow-app-status",
+    "allow-open-window",
+    "allow-quit",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

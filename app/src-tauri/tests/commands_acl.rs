@@ -131,6 +131,84 @@ fn unknown_field_rejected_before_handler() -> TestResult {
     Ok(())
 }
 
+/// M6 T6 (Δ1): `open_window` is granted to `approvals` only and opens one of four windows, built
+/// under its fixed label; `quit` is granted to `approvals`, `credential` and `setup` only. (A
+/// granted `quit` would end the test process, so only its refusals are invoked.)
+#[test]
+fn open_window_and_quit_follow_their_grants() -> TestResult {
+    use atlas_duck_app_lib::windows::{NavPolicy, StartupRoute, WindowRegistry};
+    let app = app()?;
+    app.manage(WindowRegistry::new(
+        NavPolicy::for_this_platform(None),
+        StartupRoute::completed(),
+    ));
+    let approvals = window(&app, "approvals")?;
+    assert_eq!(
+        invoke(&approvals, "open_window", json!({"window": "settings"})),
+        Ok(Value::Null)
+    );
+    assert!(app.get_webview_window("settings").is_some());
+    let refused_window = json!({"kind": "invalid_argument", "field": "window"});
+    let before = app.webview_windows().len();
+    for bad in ["approvals", "credential", "setup", "main"] {
+        assert_eq!(
+            invoke(&approvals, "open_window", json!({ "window": bad })),
+            Err(refused_window.clone()),
+            "{bad}"
+        );
+    }
+    assert_eq!(
+        app.webview_windows().len(),
+        before,
+        "a refused window was opened"
+    );
+    assert!(app.get_webview_window("credential").is_none());
+    assert_eq!(
+        invoke(
+            &approvals,
+            "open_window",
+            json!({"window": "audit", "url": "https://evil.example/"})
+        ),
+        Err(json!({"kind": "invalid_argument", "field": "payload"}))
+    );
+
+    let acl_refused =
+        |r: &Result<Value, Value>| r.as_ref().err().is_some_and(|e| e.get("kind").is_none());
+    for label in [
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "credential",
+        "setup",
+    ] {
+        let w = app
+            .get_webview_window(label)
+            .map_or_else(|| window(&app, label), Ok)?;
+        let r = invoke(&w, "open_window", json!({"window": "audit"}));
+        assert!(acl_refused(&r), "{label}: open_window {r:?}");
+    }
+    for label in ["settings", "audit", "running_scripts", "onboarding"] {
+        let w = app
+            .get_webview_window(label)
+            .map_or_else(|| window(&app, label), Ok)?;
+        let r = invoke(&w, "quit", json!({}));
+        assert!(acl_refused(&r), "{label}: quit {r:?}");
+    }
+    // Granted, but the body is checked before the handler (which would quit) runs.
+    for label in ["approvals", "credential", "setup"] {
+        let w = app
+            .get_webview_window(label)
+            .map_or_else(|| window(&app, label), Ok)?;
+        assert_eq!(
+            invoke(&w, "quit", json!({"now": true})),
+            Err(json!({"kind": "invalid_argument", "field": "payload"})),
+            "{label}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn not_ready_without_a_serving_core() -> TestResult {
     let app = app()?;

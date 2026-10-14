@@ -30,8 +30,9 @@ thread_local! {
     static REFUSED: Cell<Option<&'static str>> = const { Cell::new(None) };
 }
 
-/// A serde error for `field`, noted for [`parse`] so the answer can name it.
-fn refuse<E: serde::de::Error>(field: &'static str) -> E {
+/// A serde error for `field`, noted for [`parse`] so the answer can name it (for the bounded
+/// newtypes of every command module).
+pub(crate) fn refuse<E: serde::de::Error>(field: &'static str) -> E {
     REFUSED.with(|r| r.set(Some(field)));
     E::custom(field)
 }
