@@ -846,7 +846,8 @@ fn probe(label: &str, format: &'static str, body: &str) -> Probe {
     }
 }
 
-fn wiki_probes() -> Vec<Probe> {
+/// `user`: the configured user, so a mention that turns live resolves (final review I-1, M-3).
+fn wiki_probes(user: &str) -> Vec<Probe> {
     let mut p = vec![
         // (a) a control or zero-width character before `~` in link text: a mention?
         probe("a-control", "wiki", "[\u{1}\\~jdoe|http://x.example]"),
@@ -879,6 +880,46 @@ fn wiki_probes() -> Vec<Probe> {
             "{noformat}\n{code}\n{noformat}\n{noformat}\n{code}\n{include:X}\n{noformat}",
         ),
     ];
+    // (I-1 pairing) a macro-named monospace span before a real `{code}` block: does the span's
+    // inner `{code}` open a container that pairs with the block's opener, so the body (a live
+    // mention, macro and image if so) renders as wiki? The wiki form is the converter's output
+    // before the I-1 fix; the Markdown form is what it writes now (`{{&#8203;code}}`).
+    let body = format!("[~{user}]\n{{toc}}\n!x.png!");
+    p.push(probe(
+        "i1-pair-wiki",
+        "wiki",
+        &format!("{{{{code}}}}\n\n{{code}}\n{body}\n{{code}}"),
+    ));
+    p.push(probe(
+        "i1-pair-markdown",
+        "markdown",
+        &format!("`code`\n\n```\n{body}\n```"),
+    ));
+    // (I-1 break) a decimal reference vs a zero-width-space reference as the first char of a
+    // monospace span: does either keep `{{…}}` inert before a `{code}` block holding `{toc}`?
+    for (label, span) in [
+        ("i1-ref-c", "{{&#99;ode}}"),
+        ("i1-ref-zwsp", "{{&#8203;code}}"),
+    ] {
+        p.push(probe(
+            label,
+            "wiki",
+            &format!("{span}\n\n{{code}}\n{{toc}}\n{{code}}"),
+        ));
+    }
+    // (M-3) a forced line break followed by an escaped special in a flat quote: `\\\[` must stay
+    // a break plus an escaped `[` (likewise `{`, `!`).
+    for (label, tail) in [
+        ("m3-break-mention", format!(r"\[\~{user}\]")),
+        ("m3-break-macro", r"\{toc\}".to_owned()),
+        ("m3-break-image", r"\!x.png\!".to_owned()),
+    ] {
+        p.push(Probe {
+            label: label.to_owned(),
+            format: "wiki",
+            body: format!(r"bq. see\\{tail}"),
+        });
+    }
     // (b) U+2028 and U+0085 before a heading, list or quote marker at a "line start"
     for (name, ch) in [("2028", '\u{2028}'), ("0085", '\u{0085}')] {
         for (marker, text) in [("h1", "h1. "), ("list", "# "), ("bq", "bq. ")] {
@@ -904,7 +945,7 @@ async fn v_wiki_render_probes() -> TestResult {
     let (key, _) = create_issue(&l, "atlas-duck live wiki render probes").await?;
 
     let mut posted: Vec<(String, String)> = Vec::new();
-    for p in wiki_probes() {
+    for p in wiki_probes(&l.user) {
         let r = write(
             &l,
             "jira.comment.add",
@@ -940,7 +981,11 @@ async fn v_wiki_render_probes() -> TestResult {
 
     // (h) the converter's output `{code}\n{ code}\n{include:X}\n{code}` is what `h-fenced`
     // posted in wiki form; (f) and (h) must agree (`{ code}` does not close the body and
-    // `{include:X}` stays inert), and (i) must keep B's `{include:X}` inert.
+    // `{include:X}` stays inert), and (i) must keep B's `{include:X}` inert. The I-1 probes
+    // must show monospace `code` and a code block holding the mention, `{toc}` and image as
+    // text (`i1-pair-wiki` failing that means the I-1 break is load-bearing; `i1-ref-c` keeping
+    // it inert means `&#99;` would do instead of `&#8203;`). The M-3 probes must render a line
+    // break followed by a literal `[~…]`, `{toc}` and `!x.png!`.
     println!("W scratch issue {key} left in the project");
     Ok(())
 }

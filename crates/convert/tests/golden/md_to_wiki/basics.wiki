@@ -2,7 +2,7 @@ h1. Title
 
 h2. Sub _heading_
 
-Plain paragraph with _emphasis_, *strong*, -strike- and {{code}}.
+Plain paragraph with _emphasis_, *strong*, -strike- and {{&#8203;code}}.
 Second line of the same paragraph.
 Hard break above.
 

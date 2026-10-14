@@ -2,7 +2,7 @@ bq. single quote line
 
 bq. multi
 
-bq. block with {{code}}
+bq. block with {{&#8203;code}}
 
 bq. nested quote\\second line
 

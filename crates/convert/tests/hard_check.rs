@@ -535,3 +535,102 @@ fn fuzz_strategy_reaches_quote_containers() -> TestResult {
     );
     Ok(())
 }
+
+/// A `{`, then at least one whitespace or control char, then `code` (ASCII case-insensitive):
+/// a closer only a lenient (trimming) scan would see.
+fn lenient_code_tag(body: &str) -> bool {
+    body.match_indices('{').any(|(i, _)| {
+        let rest = body.get(i + 1..).unwrap_or("");
+        let t = rest.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
+        t.len() < rest.len()
+            && t.as_bytes()
+                .get(..4)
+                .is_some_and(|w| w.eq_ignore_ascii_case(b"code"))
+    })
+}
+
+/// The fuzz must keep reaching the final review I-1 shapes: monospace broken by `&#8203;`
+/// before a real `{code}`/`{noformat}` container (the pairing case), and code bodies whose only
+/// `{code` tag is led by whitespace or a control char (moved to `{noformat}`).
+#[test]
+fn fuzz_strategy_reaches_tag_shaped_code() -> TestResult {
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    const DRAWS: usize = 2000;
+    let strategy = markdown();
+    let mut runner = TestRunner::deterministic();
+    let (mut paired, mut lenient) = (0, 0);
+    for _ in 0..DRAWS {
+        let md = strategy
+            .new_tree(&mut runner)
+            .map_err(|e| e.to_string())?
+            .current();
+        let (out, e) = markdown_to_wiki(&md);
+        if let Some(brk) = out.find("{{&#8203;")
+            && e.code_blocks
+                .iter()
+                .any(|c| c.kind != ContainerKind::Quote && c.byte_range.start > brk)
+        {
+            paired += 1;
+        }
+        if e.code_blocks.iter().any(|c| {
+            c.kind == ContainerKind::Noformat
+                && out.get(c.byte_range.clone()).is_some_and(lenient_code_tag)
+        }) {
+            lenient += 1;
+        }
+    }
+    eprintln!("break before a container {paired}, lenient code tag in noformat {lenient}");
+    assert!(paired >= DRAWS / 20, "break before a container: {paired}");
+    assert!(
+        lenient >= DRAWS / 20,
+        "lenient code tag in noformat: {lenient}"
+    );
+    Ok(())
+}
+
+/// Final review I-1 (b): a code body whose `{code` tag is led by whitespace or a control char
+/// goes to `{noformat}` (or monospace lines with a `{noformat` tag of that shape too), and the
+/// hard check does not trust a forged `{code}` record over such a body.
+#[test]
+fn lenient_closers_leave_the_code_container() -> TestResult {
+    use ContainerKind::Noformat;
+    for tag in [
+        "{ code}",
+        "{\tcode}",
+        "{\u{a0}code}",
+        "{\u{1}code}",
+        "{ CODE }",
+        "{\u{85}code:x}",
+    ] {
+        let md = format!("```\n{tag}\n[~jdoe] {{toc}} !x.png!\n```\n");
+        let (out, e) = markdown_to_wiki(&md);
+        assert_eq!(kinds(&e), [Noformat], "{md:?} -> {out:?}");
+        assert_eq!(hard_check_wiki(&out, &e), Ok(()), "{md:?} -> {out:?}");
+        spans_match_record(&out, &e)?;
+        let md = format!("```\n{tag} {{ noformat}}\n```\n");
+        let (out, e) = markdown_to_wiki(&md);
+        assert!(e.code_blocks.is_empty(), "{md:?} -> {out:?}");
+        assert_eq!(hard_check_wiki(&out, &e), Ok(()), "{md:?} -> {out:?}");
+        spans_match_record(&out, &e)?;
+    }
+    for wiki in [
+        "{code}\n{ code}\n{include:X}\n{code}\n",
+        "{code:java}\n{\u{1}code}\n{code}\n",
+        "{noformat}\n{\tnoformat}\n{noformat}\n",
+    ] {
+        let kind = if wiki.starts_with("{code") {
+            ContainerKind::Code
+        } else {
+            ContainerKind::Noformat
+        };
+        let e = record(vec![rec(kind, 0..wiki.len() - 1)]);
+        assert_eq!(
+            hard_check_wiki(wiki, &e),
+            unrecorded(ConstructKind::Macro, 1),
+            "{wiki:?}"
+        );
+    }
+    Ok(())
+}

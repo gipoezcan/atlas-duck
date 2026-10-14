@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 
 use atlas_duck_convert::escape;
 use atlas_duck_convert::wiki::{self, Block, Inline, construct_spans};
-use atlas_duck_convert::{ContainerKind, EmittedConstructs, markdown_to_wiki, wiki_constructs};
+use atlas_duck_convert::{
+    ContainerKind, EmittedConstructs, markdown_to_wiki, wiki_constructs, wiki_to_preview_html,
+    wiki_to_text,
+};
 use common::{markdown, spans_match_record};
 use proptest::prelude::*;
 
@@ -199,7 +202,7 @@ fn code_container_by_content() -> TestResult {
         out,
         "{code}\nlet a = 1;\n{code}\n\n\
          {noformat}\nx {code} y\n{noformat}\n\n\
-         {{\\{code\\} and \\{noformat\\}}}\n{{&#160;}}\n{{last}}\n\n\
+         {{\\{code\\} and \\{noformat\\}}}\n{{&#160;}}\n{{&#8203;last}}\n\n\
          inline {{\\{noformat\\}}} span\n"
     );
     assert_eq!(kinds(&e), [ContainerKind::Code, ContainerKind::Noformat]);
@@ -215,9 +218,93 @@ fn code_container_by_content() -> TestResult {
             Inline::LineBreak,
             Inline::Monospace("&#160;".into()),
             Inline::LineBreak,
-            Inline::Monospace("last".into()),
+            Inline::Monospace("&#8203;last".into()),
         ]
     );
+    Ok(())
+}
+
+/// Final review I-1 (a): monospace whose trimmed content is shaped like a macro tag starts
+/// with `&#8203;`, so no `{name}` sits inside `{{…}}`; other content is unchanged. The break
+/// is a reference (no invisible char is written) and the projection shows it literally.
+#[test]
+fn tag_shaped_monospace_gets_a_break() -> TestResult {
+    let broken = [
+        ("`code`", "{{&#8203;code}}"),
+        ("`code:java`", "{{&#8203;code:java}}"),
+        ("`noformat`", "{{&#8203;noformat}}"),
+        ("`toc`", "{{&#8203;toc}}"),
+        ("`quote`", "{{&#8203;quote}}"),
+        ("`include:X`", "{{&#8203;include:X}}"),
+        ("`  code`", "{{&#8203;  code}}"),
+        ("`code :x`", "{{&#8203;code :x}}"),
+        ("`a_b.c-d`", "{{&#8203;a_b.c-d}}"),
+        ("`日本`", "{{&#8203;日本}}"),
+        ("`x`", "{{&#8203;x}}"),
+    ];
+    for (md, want) in broken {
+        let (out, e) = convert_checked(md)?;
+        assert_eq!(out, format!("{want}\n"), "{md:?}");
+        assert!(e.code_blocks.is_empty());
+        assert!(!out.contains('\u{200B}'), "{out:?}");
+        let doc = wiki::parse(&out);
+        let [Block::Paragraph(inl)] = doc.blocks.as_slice() else {
+            return Err(format!("{md:?}: {:?}", doc.blocks).into());
+        };
+        assert!(
+            matches!(inl.as_slice(), [Inline::Monospace(_)]),
+            "{md:?}: {inl:?}"
+        );
+        assert!(construct_spans(&doc).is_empty(), "{md:?}");
+        assert!(wiki_to_text(&out).starts_with("&#8203;"), "{md:?}");
+        assert!(
+            wiki_to_preview_html(&out).contains("<code>&amp;#8203;"),
+            "{md:?}"
+        );
+    }
+    let kept = [
+        ("`a b`", "{{a b}}"),
+        ("`{code}`", "{{\\{code\\}}}"),
+        ("`x|y`", "{{x\\|y}}"),
+        ("`a?`", "{{a?}}"),
+        ("`:x`", "{{:x}}"),
+        ("`&#99;ode`", "{{&#38;#99;ode}}"),
+    ];
+    for (md, want) in kept {
+        let (out, _) = convert_checked(md)?;
+        assert_eq!(out, format!("{want}\n"), "{md:?}");
+    }
+    // A URL is name chars and a `:` too (the parser reads it as a link inside the span).
+    let (out, _) = convert_checked("`https://x.example/a`")?;
+    assert_eq!(out, "{{&#8203;https://x.example/a}}\n");
+    // Monospace lines of a body holding both tags: the break goes first, before the lead.
+    let (out, e) = convert_checked("```\n{code} {noformat}\n  toc\ncode:x\n```\n")?;
+    assert!(e.code_blocks.is_empty());
+    assert_eq!(
+        out,
+        "{{\\{code\\} \\{noformat\\}}}\n{{&#8203;&#160;&#160;toc}}\n{{&#8203;code:x}}\n"
+    );
+    // The pairing case: the inline span no longer holds `{code}` before the real container.
+    let (out, e) = convert_checked("`code`\n\n```\n[~jdoe] {toc} !x.png!\n```\n")?;
+    assert_eq!(
+        out,
+        "{{&#8203;code}}\n\n{code}\n[~jdoe] {toc} !x.png!\n{code}\n"
+    );
+    assert_eq!(kinds(&e), [ContainerKind::Code]);
+    Ok(())
+}
+
+/// Final review I-1 (b): a `{code` tag led by whitespace or a control char counts as one
+/// when choosing the container.
+#[test]
+fn lenient_code_tag_picks_noformat() -> TestResult {
+    for tag in ["{ code}", "{\tcode}", "{\u{a0}code}", "{\u{1}Code}"] {
+        let (out, e) = convert_checked(&format!("```\n{tag}\n```\n"))?;
+        assert_eq!(out, format!("{{noformat}}\n{tag}\n{{noformat}}\n"));
+        assert_eq!(kinds(&e), [ContainerKind::Noformat]);
+        let (out, e) = convert_checked(&format!("```\n{tag}{{\nnoformat}}\n```\n"))?;
+        assert!(e.code_blocks.is_empty(), "{out:?}");
+    }
     Ok(())
 }
 

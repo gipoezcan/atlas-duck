@@ -4,14 +4,18 @@
 //! goes through [`crate::escape`], so Markdown can never produce a macro, mention, include,
 //! image or attachment link. Beyond the escaping:
 //! - Code bodies (fenced, indented): `{code[:lang]}` (lang only when Jira has a formatter, see
-//!   `code_lang`) unless the body contains `{code`
-//!   (ASCII case-insensitive), else `{noformat}` unless it also contains `{noformat`, else
-//!   escaped monospace lines (`{{…}}` per line, an empty line as `{{&#160;}}`). Inline code is
-//!   always escaped `{{…}}`.
+//!   `code_lang`) unless the body holds a `{code` tag (`{`, optional whitespace or controls,
+//!   `code`; ASCII case-insensitive), else `{noformat}` unless it also holds a `{noformat` tag,
+//!   else escaped monospace lines (`{{…}}` per line, an empty line as `{{&#160;}}`). Inline code
+//!   is always escaped `{{…}}`.
+//! - Monospace content shaped like a macro tag (`code`, ` toc `, `include:X`; see
+//!   `tag_shaped`) starts with [`MONO_BREAK`], so `{{…}}` never holds a `{name}` a macro scan
+//!   could match (final review I-1).
 //! - Block quotes: one paragraph → `bq. ` (line breaks as `\\`); several blocks → a
 //!   `{quote}` container. `{quote}` cannot nest, so a quote inside a quote is written flat
 //!   (paragraphs as `bq. ` lines, other blocks as they are), and so is a quote whose rendered
-//!   content holds a `{quote` tag (`{`, optional whitespace, `quote`; ASCII case-insensitive)
+//!   content holds a `{quote` tag (`{`, optional whitespace or controls, `quote`; ASCII
+//!   case-insensitive)
 //!   anywhere: in a code body, or as
 //!   escaped prose `\{quote\}` (Jira's search for the closing tag may not honour escapes).
 //! - Images become links `[alt|url]` (PD-44); raw HTML is escaped text; link targets are
@@ -36,6 +40,15 @@ const MAX_DEPTH: usize = 32;
 
 /// Longest code-block language kept in `{code:lang}`.
 const MAX_LANG: usize = 32;
+
+/// A zero-width space as a character reference, written right after the `{{` of monospace
+/// whose content is [`tag_shaped`] (final review I-1): `{{code}}` holds `{code}`, which Jira's
+/// macro scan might read as an unclosed `{code}` that pairs with the next real one. Neither
+/// `{&#8203;code}` nor, if Jira decoded references first, `{` + U+200B + `code` is a tag
+/// (U+200B is a format char, not whitespace). It stays a reference rather than the raw char,
+/// so no invisible char is written, and the preview (which never decodes a reference to an
+/// invisible char) shows `&#8203;` literally: the approver sees it.
+pub(crate) const MONO_BREAK: &str = "&#8203;";
 
 /// A container the converter wrote itself (Δ1, widened by the T2 ruling: `{quote}` too).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -495,6 +508,9 @@ impl Converter {
         }
         if let Some(o) = self.sink() {
             o.raw("{{");
+            if tag_shaped(t) {
+                o.raw(MONO_BREAK);
+            }
             o.text_one_line(t);
             o.raw("}}");
         }
@@ -752,7 +768,7 @@ fn quote(mut blocks: BlockList, nested: bool) -> Rendered {
         .join("\n\n");
     let flat = nested
         || matches!(children.as_slice(), [Child { para: true, .. }])
-        || has_quote_tag(&body_text);
+        || has_tag(&body_text, "quote");
     if flat {
         return join(children.into_iter().map(|c| {
             if c.para {
@@ -783,7 +799,7 @@ fn code_block(lang: Option<&str>, body: &str) -> Rendered {
     } else {
         "\n"
     };
-    if !contains_ci(body, "{code") {
+    if !has_tag(body, "code") {
         let open = match lang {
             Some(l) => format!("{{code:{l}}}"),
             None => "{code}".to_owned(),
@@ -793,7 +809,7 @@ fn code_block(lang: Option<&str>, body: &str) -> Rendered {
             format!("{open}\n{body}{close}{{code}}"),
         );
     }
-    if !contains_ci(body, "{noformat") {
+    if !has_tag(body, "noformat") {
         return Rendered::container(
             ContainerKind::Noformat,
             format!("{{noformat}}\n{body}{close}{{noformat}}"),
@@ -802,8 +818,9 @@ fn code_block(lang: Option<&str>, body: &str) -> Rendered {
     Rendered::plain(mono_lines(body))
 }
 
-/// A body holding both `{code` and `{noformat`: one escaped `{{…}}` line per code line,
-/// leading whitespace as no-break spaces (it would collapse), an empty line as one.
+/// A body holding both a `{code` and a `{noformat` tag: one escaped `{{…}}` line per code line,
+/// leading whitespace as no-break spaces (it would collapse), an empty line as one, a
+/// [`tag_shaped`] line led by [`MONO_BREAK`].
 fn mono_lines(body: &str) -> String {
     let body = body.strip_suffix('\n').unwrap_or(body);
     let lines: Vec<String> = body
@@ -823,7 +840,8 @@ fn mono_lines(body: &str) -> String {
             if o.as_str().is_empty() {
                 o.raw("&#160;");
             }
-            format!("{{{{{}}}}}", o.as_str())
+            let brk = if tag_shaped(line) { MONO_BREAK } else { "" };
+            format!("{{{{{brk}{}}}}}", o.as_str())
         })
         .collect();
     lines.join("\n")
@@ -910,18 +928,35 @@ fn code_lang(kind: &CodeBlockKind<'_>) -> Option<String> {
     JIRA_LANGS.contains(&word).then(|| word.to_owned())
 }
 
-/// Whether `text` holds a `{quote` tag as the parser's closer grammar reads it: `{`, optional
-/// whitespace, `quote` (ASCII case-insensitive).
-pub(crate) fn has_quote_tag(text: &str) -> bool {
+/// Whether `text` holds a `{name` tag as a lenient closer grammar might read it: `{`, optional
+/// whitespace or controls, `name` (ASCII case-insensitive; `name` is lowercase ASCII). Jira may
+/// trim tag names, so `{ code}` is treated as a closer too (final review I-1).
+pub(crate) fn has_tag(text: &str, name: &str) -> bool {
     text.match_indices('{').any(|(i, _)| {
         let rest = text
             .get(i + 1..)
             .unwrap_or("")
-            .trim_start_matches(|c: char| c.is_whitespace() || c <= ' ');
+            .trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
         rest.as_bytes()
-            .get(..5)
-            .is_some_and(|w| w.eq_ignore_ascii_case(b"quote"))
+            .get(..name.len())
+            .is_some_and(|w| w.eq_ignore_ascii_case(name.as_bytes()))
     })
+}
+
+/// Whether monospace content `t` could read as a macro tag once wrapped in `{{…}}`: optional
+/// whitespace or controls, one or more name chars (Unicode alphanumerics, `-`, `_`, `.`, as the
+/// parser's lexer reads a name), optional whitespace or controls, then the end or a `:`. A
+/// superset of `^[A-Za-z0-9_.-]+(:.*)?$` on the trimmed content (final review I-1).
+fn tag_shaped(t: &str) -> bool {
+    let skip = |c: char| c.is_whitespace() || c.is_control();
+    let rest = t.trim_start_matches(skip);
+    let after =
+        rest.trim_start_matches(|c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if after.len() == rest.len() {
+        return false;
+    }
+    let after = after.trim_start_matches(skip);
+    after.is_empty() || after.starts_with(':')
 }
 
 /// A link target: `mailto:` for e-mail autolinks; chars the wiki grammar reads inside
@@ -952,14 +987,4 @@ fn link_target(link_type: LinkType, dest: &str) -> String {
         }
     }
     out
-}
-
-/// ASCII case-insensitive substring test.
-pub(crate) fn contains_ci(hay: &str, needle: &str) -> bool {
-    let n = needle.as_bytes();
-    !n.is_empty()
-        && hay
-            .as_bytes()
-            .windows(n.len())
-            .any(|w| w.eq_ignore_ascii_case(n))
 }

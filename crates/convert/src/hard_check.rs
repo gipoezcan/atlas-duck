@@ -5,7 +5,8 @@
 //!
 //! Fail closed throughout. A record is trusted only when its range slices a whole container
 //! of its kind exactly as the converter writes one, with a body that does not hold the
-//! container's own tag (ASCII case-insensitive; for `{quote}` also `{ quote}`), and only when
+//! container's own tag (ASCII case-insensitive, also after whitespace or controls: `{ code}`,
+//! `{\tquote}`; the converter's own rule), and only when
 //! no two records cross each other. Anything a record does not cover is unrecorded, wherever
 //! it sits (a macro inside a recorded `{quote}` is unrecorded; a recorded `{code}` body is
 //! opaque to the parser, so nothing inside it is reported at all).
@@ -15,7 +16,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::ops::Range;
 
-use crate::md_to_wiki::{ContainerKind, EmittedConstructs, contains_ci, has_quote_tag};
+use crate::md_to_wiki::{ContainerKind, EmittedConstructs, has_tag};
 use crate::wiki::{ConstructKind, construct_spans, parse};
 
 /// A construct the converter did not record (Δ1): the kind of the first one in document
@@ -104,19 +105,19 @@ fn crossing<'a>(ranges: impl Iterator<Item = &'a Range<usize>>) -> bool {
 
 /// The opening tag's length when `range` of `wiki` is a whole container of `kind` as the
 /// converter writes it: `{code}` or `{code:lang}` (lang from `[A-Za-z0-9_+#.-]`),
-/// `{noformat}`, `{quote}`, then a body without the container's own tag, then the closing
-/// tag. `None` otherwise (out of bounds, off a char boundary, other params, a body holding
-/// the tag).
+/// `{noformat}`, `{quote}`, then a body without the container's own tag (`has_tag`, the rule
+/// the converter chooses containers by), then the closing tag. `None` otherwise (out of
+/// bounds, off a char boundary, other params, a body holding the tag).
 fn container(wiki: &str, kind: ContainerKind, range: &Range<usize>) -> Option<usize> {
     let slice = wiki.get(range.clone())?;
-    let (close, holds_tag): (&str, fn(&str) -> bool) = match kind {
-        ContainerKind::Code => ("{code}", |b| contains_ci(b, "{code")),
-        ContainerKind::Noformat => ("{noformat}", |b| contains_ci(b, "{noformat")),
-        ContainerKind::Quote => ("{quote}", has_quote_tag),
+    let (close, name) = match kind {
+        ContainerKind::Code => ("{code}", "code"),
+        ContainerKind::Noformat => ("{noformat}", "noformat"),
+        ContainerKind::Quote => ("{quote}", "quote"),
     };
     let open = opening_tag_len(kind, slice)?;
     let body = slice.get(open..slice.len().checked_sub(close.len())?)?;
-    (slice.ends_with(close) && !holds_tag(body)).then_some(open)
+    (slice.ends_with(close) && !has_tag(body, name)).then_some(open)
 }
 
 fn opening_tag_len(kind: ContainerKind, slice: &str) -> Option<usize> {
