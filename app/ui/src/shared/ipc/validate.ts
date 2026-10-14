@@ -9,6 +9,7 @@ import type {
   DenyOffer,
   DenyOfferKind,
   Preview,
+  PreviewFetchResponse,
   QueueItem,
   RawPage,
   RecentItem,
@@ -137,6 +138,9 @@ export const isPreview = (v: unknown): v is Preview =>
     deny_offers: arrayOf(isDenyOffer),
     deny_prefill: strOrNull,
   });
+
+export const isPreviewFetchResponse = (v: unknown): v is PreviewFetchResponse =>
+  fields(v, { preview: isPreview, srcdoc: isStr });
 
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });
 

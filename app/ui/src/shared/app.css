@@ -3,3 +3,15 @@
 #__tauri_isolation__ {
   display: none !important;
 }
+
+.app-header nav { display: flex; gap: 0.5rem; padding: 0.5rem; }
+.banner { list-style: none; margin: 0; padding: 0 0.5rem; }
+.banner-caution { font-weight: 600; }
+.badge { display: inline-block; border: 1px solid currentColor; border-radius: 0.25rem; padding: 0 0.35rem; margin: 0 0.25rem; font-size: 0.8em; white-space: nowrap; }
+.badge-caution { font-weight: 600; }
+.badge-fixed { display: inline-block; min-width: 6.5em; }
+.agent-text bdi { unicode-bidi: isolate; }
+.windowed-row { box-sizing: border-box; overflow: hidden; border-bottom: 1px solid #8884; }
+.queue-line { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.5rem; height: 2rem; overflow: hidden; white-space: nowrap; }
+.queue-group { display: flex; align-items: center; gap: 0.5rem; height: 100%; font-weight: 600; }
+.recent-item { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }

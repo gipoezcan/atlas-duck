@@ -130,6 +130,12 @@ export interface Preview {
   [field: string]: unknown;
 }
 
+/** `{preview, srcdoc}`: the model for the tabs and the document for the sandboxed iframe. */
+export interface PreviewFetchResponse {
+  preview: Preview;
+  srcdoc: string;
+}
+
 /** A tagged error object from core (`DecisionError` / `AdminError`). */
 export interface CoreError {
   kind: string;
