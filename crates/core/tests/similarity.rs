@@ -7,16 +7,17 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, fixtures};
+use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_audit::testing::FakeClock;
 use atlas_duck_audit::{Clock, EventType, UtcInstant};
 use atlas_duck_core::similarity::{SimRecord, SimilarityIndex, normalize_title, sim_key};
 use atlas_duck_core::testing::{Channel, Harness};
+use atlas_duck_ipc::envelope::Status;
 use atlas_duck_preview::warning::WarningId;
 use common::{TestError, TestResult, de, request_id};
 use serde_json::{Value, json};
 use wiremock::Mock;
-use wiremock::matchers::path;
+use wiremock::matchers::{method, path};
 
 const ISSUE: &str = "jira.issue.get";
 const CREATE: &str = "jira.issue.create";
@@ -319,8 +320,8 @@ async fn rf4_seeding_reads_create_and_move_payloads() -> TestResult {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rf4_seeding_reads_target_payloads_of_reads_and_writes() -> TestResult {
-    // The move ops are not available in this build yet ("operation not available"), so their
-    // seeding is exercised once T26 enables them; `move_issues_shared_key` covers their keys.
+    // The move ops' seeding (their keys come from the decrypted payload, not this column) is
+    // `rf4_seeding_reads_move_payloads`.
     let h = Harness::jira().await?;
     jira(&h)?
         .json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
@@ -352,6 +353,111 @@ async fn rf4_seeding_reads_target_payloads_of_reads_and_writes() -> TestResult {
     assert_eq!(hit(&record(COMMENT, comment_params)?), pending(&write));
     let other = json!({ "key": "ABC-2", "body": "Done.", "body_format": "wiki" });
     assert_eq!(hit(&record(COMMENT, other)?), None);
+    Ok(())
+}
+
+const SPRINT_MOVE: &str = "jira.sprint.move_issues";
+const BACKLOG_MOVE: &str = "jira.backlog.move_issues";
+
+/// RF-4 (Task 18, the carried M3 T23 test): after a crash and a restart over the reopened store,
+/// the index is seeded from the decrypted `REQUEST_RECEIVED` params of the move ops, so a move
+/// that shares an issue key with an executed one (a sprint move: into the same sprint) is
+/// "similar" to it; a disjoint move, or one into another sprint, is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf4_seeding_reads_move_payloads() -> TestResult {
+    let mut h = Harness::jira().await?;
+    {
+        let mock = jira(&h)?;
+        mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+            .await;
+        for id in [7u64, 8] {
+            common::jira::mount_sprint(
+                mock,
+                id,
+                &json!({"id": id, "name": format!("Sprint {id}"), "state": "active"}),
+            )
+            .await;
+        }
+        for p in [
+            "/rest/agile/1.0/sprint/7/issue",
+            "/rest/agile/1.0/sprint/8/issue",
+            "/rest/agile/1.0/backlog/issue",
+        ] {
+            Mock::given(method("POST"))
+                .and(path(mock.path(p)))
+                .respond_with(mock.response(204))
+                .mount(mock.server())
+                .await;
+        }
+    }
+    let mut executed = Vec::new();
+    for (op, params) in [
+        (SPRINT_MOVE, json!({"id": 7, "issues": ["ABC-1", "ABC-2"]})),
+        (BACKLOG_MOVE, json!({"issues": ["XYZ-1", "XYZ-2"]})),
+    ] {
+        let id = queued(&h, h.submit(op, params).await).await?;
+        h.approver().approve(&id).map_err(de)?;
+        let env = h.await_(&id, 10_000).await;
+        assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+        executed.push(id);
+    }
+    let (sprint_move, backlog_move) = (executed[0].clone(), executed[1].clone());
+
+    h.reopen_and_restart().await?;
+    assert_eq!(h.engine().similarity().seed_skipped(), 0);
+    let similar =
+        |text: &str, first: &str| text.starts_with(&format!("similar to {first} executed "));
+    // A sprint move sharing ABC-2, into the same sprint: names the first request.
+    let again = queued(
+        &h,
+        h.submit(SPRINT_MOVE, json!({"id": 7, "issues": ["ABC-2", "ABC-3"]}))
+            .await,
+    )
+    .await?;
+    let row = h.approver().item(&again).ok_or("not queued")?;
+    assert_eq!(row.similar_to.as_deref(), Some(sprint_move.as_str()));
+    assert!(row.caution_count >= 1);
+    let text = similar_text(&h, &again).await?;
+    assert!(similar(&text, &sprint_move), "{text}");
+    // A backlog move sharing XYZ-1 likewise.
+    let back = queued(
+        &h,
+        h.submit(BACKLOG_MOVE, json!({"issues": ["XYZ-1"]})).await,
+    )
+    .await?;
+    assert_eq!(
+        h.approver()
+            .item(&back)
+            .ok_or("not queued")?
+            .similar_to
+            .as_deref(),
+        Some(backlog_move.as_str())
+    );
+    let text = similar_text(&h, &back).await?;
+    assert!(similar(&text, &backlog_move), "{text}");
+    // Another sprint, or no shared key: not similar to the seeded moves.
+    let other_sprint = queued(
+        &h,
+        h.submit(SPRINT_MOVE, json!({"id": 8, "issues": ["ABC-1"]}))
+            .await,
+    )
+    .await?;
+    assert_eq!(
+        h.approver()
+            .item(&other_sprint)
+            .ok_or("not queued")?
+            .similar_to,
+        None
+    );
+    let disjoint = queued(
+        &h,
+        h.submit(BACKLOG_MOVE, json!({"issues": ["QQ-9"]})).await,
+    )
+    .await?;
+    assert_eq!(
+        h.approver().item(&disjoint).ok_or("not queued")?.similar_to,
+        None
+    );
     Ok(())
 }
 

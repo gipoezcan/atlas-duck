@@ -337,8 +337,28 @@ pub struct WriteSummaryFacts {
     pub assignee_to: Option<JiraUser>,
     /// `jira.issuelink.create` (T16, PD-53): the link type the `type` param resolved to.
     pub link_type: Option<JiraLinkType>,
-    /// `jira.sprint.move_issues` (T18): the sprint's `(name, state)`.
-    pub sprint: Option<(String, String)>,
+    /// `jira.sprint.move_issues` (T18, PD-54): the sprint enrichment read.
+    pub sprint: Option<JiraSprint>,
+}
+
+/// T18: the target sprint of a `jira.sprint.move_issues` as enrichment read it (raw server text).
+/// The card names the sprint only when `id` is the one the sent URL moves into (PD-54).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct JiraSprint {
+    pub id: u64,
+    /// Never cut: the card cuts it for display.
+    pub name: String,
+    /// `future`, `active` or `closed`.
+    pub state: String,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for JiraSprint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JiraSprint")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// T15: a Jira user as enrichment read it (raw server text). Payloads send `name`; the preview
@@ -744,8 +764,30 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &["type"],
         },
     ),
-    ("jira.sprint.move_issues", LATER_WRITE),
-    ("jira.backlog.move_issues", LATER_WRITE),
+    (
+        "jira.sprint.move_issues",
+        OpImpl {
+            executor: jira_ext::sprint_move_executor,
+            previewer: jira_preview::move_preview,
+            // PD-54: the sprint is still future or active.
+            stale_check: Some(&stale::SPRINT_MOVE),
+            enrich: Some(&jira_ext::SPRINT_MOVE_ENRICH),
+            // Both params are targets (L06: not editable), so nothing re-runs enrichment.
+            enrich_keys: &[],
+        },
+    ),
+    (
+        "jira.backlog.move_issues",
+        OpImpl {
+            executor: jira_ext::backlog_move_executor,
+            previewer: jira_preview::move_preview,
+            // PD-54: no enrichment, no stale rule (§5.4 step 5: an idempotent op); the
+            // pre-write identity call still runs.
+            stale_check: None,
+            enrich: None,
+            enrich_keys: &[],
+        },
+    ),
     ("confluence.user.current", READ),
     ("confluence.space.list", READ),
     ("confluence.space.get", READ),

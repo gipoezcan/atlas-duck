@@ -1,5 +1,6 @@
-//! §5.4 step 5 per-op stale rules in M3 (PD-10), and M5's assignee rule (PD-52). The identity call that precedes every write is
-//! not one of these (C.7); an op without a rule here has `stale_check: None`.
+//! §5.4 step 5 per-op stale rules in M3 (PD-10), and M5's assignee (PD-52) and sprint (PD-54)
+//! rules. The identity call that precedes every write is not one of these (C.7); an op without a
+//! rule here has `stale_check: None`.
 
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_preview::invisible::escape_for_display;
@@ -7,7 +8,9 @@ use serde_json::Value;
 
 use super::confluence::content_version;
 use super::jira::{field_values_equal, issue_fields_call, transition_calls, transition_facts};
-use super::jira_ext::{assignee_call, current_assignee};
+use super::jira_ext::{
+    SPRINT_CLOSED, assignee_call, current_assignee, sprint_call, sprint_facts, sprint_open,
+};
 use super::{StaleCtx, StaleRule, StaleVerdict, get_call};
 
 /// Shown when the judge did not get the answers its plan names (fail closed: never `Unchanged`).
@@ -32,6 +35,13 @@ pub static ISSUE_TRANSITION: StaleRule = StaleRule {
 pub static ISSUE_ASSIGN: StaleRule = StaleRule {
     plan: assign_plan,
     judge: assign_judge,
+};
+
+/// `jira.sprint.move_issues` (T18, PD-54): the target sprint's current `state` is still `future`
+/// or `active` (§5.4 step 5); a start or a rename since the review is no change.
+pub static SPRINT_MOVE: StaleRule = StaleRule {
+    plan: sprint_plan,
+    judge: sprint_judge,
 };
 
 /// `confluence.page.update`: `version.number` unchanged.
@@ -132,6 +142,23 @@ fn assign_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
         StaleVerdict::Unchanged
     } else {
         changed("assignee changed since review")
+    }
+}
+
+fn sprint_plan(ctx: &StaleCtx<'_>) -> Vec<GetCall> {
+    vec![sprint_call(ctx.params)]
+}
+
+/// The state of the sprint the params name (an answer about another sprint, or without a state,
+/// is unreadable: fail closed).
+fn sprint_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
+    let Some(now) = responses.first().and_then(|r| sprint_facts(ctx.params, r)) else {
+        return changed(DELTA_UNREADABLE);
+    };
+    match now.state.as_str() {
+        state if sprint_open(state) => StaleVerdict::Unchanged,
+        SPRINT_CLOSED => changed("sprint closed since review"),
+        _ => changed("sprint no longer future or active since review"),
     }
 }
 

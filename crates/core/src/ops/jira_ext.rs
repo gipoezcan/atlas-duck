@@ -1,7 +1,11 @@
 //! The Jira writes M5 completes beyond the M3 four (PD-09): `jira.issue.assign` (T15, PD-52), with
 //! the assignable-user resolution under the §7.2 username comparison and the current assignee as
 //! the stale-check baseline; `jira.issuelink.create` (T16, PD-53), with the link-type resolution;
-//! `jira.worklog.add` (T17, PD-55), whose time and start are checked strictly (no enrichment).
+//! `jira.worklog.add` (T17, PD-55), whose time and start are checked strictly (no enrichment);
+//! `jira.sprint.move_issues` and `jira.backlog.move_issues` (T18, PD-54), whose issue lists are
+//! checked strictly and whose target sprint must be future or active.
+
+use std::collections::HashSet;
 
 use atlas_duck_atlassian::{GetCall, UsernameMatcher};
 use atlas_duck_preview::invisible::escape_for_display;
@@ -12,12 +16,12 @@ use serde_json::{Map, Value, json};
 use super::jira::{ISSUE_PATH, MAX_CANDIDATES, capped, unresolved};
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    JiraLinkType, JiraUser, WriteSummaryFacts, get_call, json_request, resolve_url, single_round,
-    str_param,
+    JiraLinkType, JiraSprint, JiraUser, WriteSummaryFacts, get_call, json_request, resolve_url,
+    single_round, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::metadata::one_line;
-use crate::validate::invalid;
+use crate::validate::{MOVE_LIMIT_HINT, invalid};
 
 // ---- jira.issue.assign -------------------------------------------------------------------------
 
@@ -709,4 +713,162 @@ pub fn worklog_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
         body.insert("started".to_owned(), Value::from(started));
     }
     json_request(ctx, &Value::Object(body))
+}
+
+// ---- jira.sprint.move_issues, jira.backlog.move_issues -----------------------------------------
+
+/// The target sprint (`GET /rest/agile/1.0/sprint/{id}`): enrichment and the stale check read it.
+const SPRINT_PATH: &str = "/rest/agile/1.0/sprint/{id}";
+
+/// The sprint states Jira Software names (agile 1.0); issues can be moved into the first two.
+const SPRINT_FUTURE: &str = "future";
+const SPRINT_ACTIVE: &str = "active";
+pub(crate) const SPRINT_CLOSED: &str = "closed";
+
+/// The longest issue key a move sends (T18): a project key of at most 255 characters (Jira's
+/// largest setting) and its number need less; a longer one is a mistake the card could not show
+/// in a line (the schema pattern has no `maxLength`).
+const MAX_MOVE_KEY_CHARS: usize = 255;
+
+/// Whether issues can be moved into a sprint in `state` (PD-54).
+pub(crate) fn sprint_open(state: &str) -> bool {
+    state == SPRINT_FUTURE || state == SPRINT_ACTIVE
+}
+
+/// PD-54: one GET, the target sprint (`enrich`).
+pub static SPRINT_MOVE_ENRICH: EnrichRule = EnrichRule {
+    plan: sprint_plan,
+    judge: sprint_judge,
+};
+
+/// `GET /rest/agile/1.0/sprint/{id}`: the agent's (schema-validated) sprint id, nothing else.
+pub(crate) fn sprint_call(params: &Value) -> GetCall {
+    get_call(SPRINT_PATH, params, &[])
+}
+
+fn sprint_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    single_round(
+        vec![(EnrichPurpose::Enrich, sprint_call(ctx.params))],
+        answers,
+    )
+}
+
+/// The sprint an answer describes, when it is the one the params name: an `id` equal to the
+/// params' `id`, a string `name` and `state`. Anything else is `None` (fail closed: an answer
+/// about another sprint never passes for this one).
+pub(crate) fn sprint_facts(params: &Value, answer: &Value) -> Option<JiraSprint> {
+    let want = params.get("id").and_then(Value::as_u64)?;
+    let id = answer
+        .get("id")
+        .and_then(Value::as_u64)
+        .filter(|id| *id == want)?;
+    let text = |k: &str| answer.get(k).and_then(Value::as_str).map(str::to_owned);
+    Some(JiraSprint {
+        id,
+        name: text("name")?,
+        state: text("state")?,
+    })
+}
+
+/// PD-54: a future or active sprint is a `Preview` with the baseline `{state, name}`; a closed one
+/// holds the move (`EnrichmentError`; the card says why from the facts, and no deny hint applies:
+/// nothing failed upstream); any other state or an answer [`sprint_facts`] cannot read fails
+/// closed. The facts name the sprint on the card.
+fn sprint_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
+    let Some(sprint) = answers.first().and_then(|a| sprint_facts(ctx.params, a)) else {
+        return EnrichVerdict::unusable();
+    };
+    let mut verdict = match sprint.state.as_str() {
+        // The raw state and name (never cut): the stale check reads the state again.
+        state if sprint_open(state) => {
+            let baseline = json!({ "state": sprint.state, "name": sprint.name });
+            EnrichVerdict::preview(baseline, Map::new())
+        }
+        SPRINT_CLOSED => EnrichVerdict::unusable(),
+        _ => return EnrichVerdict::unusable(),
+    };
+    verdict.summary = Some(WriteSummaryFacts {
+        sprint: Some(sprint),
+        ..WriteSummaryFacts::default()
+    });
+    verdict
+}
+
+/// Whether `key` has the shape the schema's pattern gives an issue key, `^[A-Z][A-Z0-9_]*-[0-9]+$`
+/// (an approver's edit runs the schema too; checked again here, cheaply, so the executor never
+/// sends another shape).
+fn is_issue_key(key: &str) -> bool {
+    let Some((project, number)) = key.split_once('-') else {
+        return false;
+    };
+    project
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_uppercase())
+        && project
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+        && !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The `issues` of a move, checked statically (T18), so the validation dry call (and an edit)
+/// refuses them (exit 2): a list of 1 to 50 issue keys ([`is_issue_key`], at most
+/// [`MAX_MOVE_KEY_CHARS`] each), none listed twice as Jira tells issues apart ([`issue_identity`]:
+/// `ABC-01` is `ABC-1`), so the card's count is the number of issues moved. More than the
+/// registry's `move_limit` is refused with the §7.3 hint, as validation refuses it. One pass, a
+/// set of the normalized keys.
+fn move_issues<'a>(ctx: &ExecCtx<'a>) -> Result<Vec<&'a str>, ExecError> {
+    let refuse = |message: &str| ExecError::Invalid(invalid("issues", message, None));
+    let Some(list) = ctx.params.get("issues").and_then(Value::as_array) else {
+        return Err(refuse("must be a list of issue keys"));
+    };
+    let mut keys = Vec::with_capacity(list.len());
+    for item in list {
+        let Some(key) = item.as_str().filter(|k| is_issue_key(k)) else {
+            return Err(refuse("must be issue keys such as ABC-123"));
+        };
+        if key.len() > MAX_MOVE_KEY_CHARS {
+            return Err(refuse("must be issue keys of at most 255 characters"));
+        }
+        keys.push(key);
+    }
+    if keys.is_empty() {
+        return Err(refuse("must list at least one issue"));
+    }
+    if let Some(limit) = ctx.spec.caps.move_limit
+        && keys.len() > usize::try_from(limit).unwrap_or(usize::MAX)
+    {
+        let mut err = invalid("issues", MOVE_LIMIT_HINT, None);
+        err.details.insert("limit".to_owned(), Value::from(limit));
+        return Err(ExecError::Invalid(err));
+    }
+    let mut seen = HashSet::with_capacity(keys.len());
+    if !keys.iter().all(|k| seen.insert(issue_identity(k))) {
+        return Err(refuse("must not list an issue twice"));
+    }
+    Ok(keys)
+}
+
+/// `POST /rest/agile/1.0/sprint/{id}/issue` `{"issues": [..]}` (PD-54, agile 1.0): the keys as
+/// the agent wrote them ([`move_issues`] checks them first). Only a `Preview` verdict about this
+/// very sprint, in a state issues can be moved into, renders a request.
+pub fn sprint_move_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let issues = move_issues(ctx)?;
+    resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
+    let want = ctx.params.get("id").and_then(Value::as_u64);
+    ctx.enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref())
+        .and_then(|s| s.sprint.as_ref())
+        .filter(|s| Some(s.id) == want && sprint_open(&s.state))
+        .ok_or(ExecError::EnrichmentRequired)?;
+    json_request(ctx, &json!({ "issues": issues }))
+}
+
+/// `POST /rest/agile/1.0/backlog/issue` `{"issues": [..]}` (PD-54): no enrichment and no stale
+/// rule; the keys as the agent wrote them ([`move_issues`] checks them first).
+pub fn backlog_move_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let issues = move_issues(ctx)?;
+    json_request(ctx, &json!({ "issues": issues }))
 }

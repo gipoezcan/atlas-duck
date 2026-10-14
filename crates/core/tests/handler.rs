@@ -172,9 +172,11 @@ async fn pd09_markdown_body_rejected() -> TestResult {
     Ok(())
 }
 
-/// Whether the M5 plan still has writes to land (`jira.sprint.move_issues` and
-/// `jira.backlog.move_issues`, Task 18). The last M5 write task sets this to false.
-const WRITES_STILL_LATER: bool = true;
+/// Whether the M5 plan still has writes to land: false since Task 18 landed the last ones
+/// (`jira.sprint.move_issues` and `jira.backlog.move_issues`). The Confluence writes of M7 are
+/// still `NotInThisBuild`, so the test below keeps picking one of them until M7 lands them all;
+/// only then is an empty pick the documented outcome.
+const WRITES_STILL_LATER: bool = false;
 
 /// The first write (registry order) whose schema example validates and whose executor is still
 /// `NotInThisBuild`, with that example: picked from the op table, never named, so the task that

@@ -10,8 +10,9 @@ use atlas_duck_atlassian::{
 use atlas_duck_core::lifecycle::model::Hold;
 use atlas_duck_core::ops::{
     DIFF_TEXT_CAP_BYTES, EnrichCtx, EnrichFailure, EnrichPurpose, EnrichStep, EnrichVerdict,
-    ExecCtx, ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView,
-    StaleCtx, StaleVerdict, WriteView, confluence, entry_count, generic, op_table,
+    ExecCtx, ExecError, ExecPlan, JiraSprint, PreviewCtx, PreviewInput, PreviewModel, ReadPlan,
+    ReadView, StaleCtx, StaleVerdict, WriteSummaryFacts, WriteView, confluence, entry_count,
+    generic, op_table,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::{BodyView, ItemCount, Level, PreviewBody, WarningId};
@@ -30,18 +31,20 @@ const M3_WRITES: [&str; 5] = [
 ];
 
 /// Writes completed in M5 so far (each task moves its op here from [`LATER_WRITES`]).
-const M5_WRITES: [&str; 3] = [
+const M5_WRITES: [&str; 5] = [
     "jira.issue.assign",
     "jira.issuelink.create",
     "jira.worklog.add",
-];
-
-/// The M5 writes that render a request without an enrichment verdict (PD-55: no enrichment).
-const M5_WITHOUT_ENRICH: [&str; 1] = ["jira.worklog.add"];
-
-const LATER_WRITES: [&str; 8] = [
     "jira.sprint.move_issues",
     "jira.backlog.move_issues",
+];
+
+/// The M5 writes that render a request without an enrichment verdict (PD-54, PD-55: no
+/// enrichment).
+const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_issues"];
+
+/// No Jira write is left after T18; the Confluence writes land in M7.
+const LATER_WRITES: [&str; 6] = [
     "confluence.page.create",
     "confluence.page.move",
     "confluence.comment.add",
@@ -205,6 +208,8 @@ fn u05_only_writes_have_stale_check() -> TestResult {
         "jira.issue.transition",
         // T15 (PD-52): the assignee rule.
         "jira.issue.assign",
+        // T18 (PD-54): the sprint is still future or active.
+        "jira.sprint.move_issues",
         "confluence.page.update",
     ]
     .into_iter()
@@ -231,6 +236,7 @@ fn reads_have_no_enrich() -> TestResult {
         "jira.issue.transition",
         "jira.issue.assign",
         "jira.issuelink.create",
+        "jira.sprint.move_issues",
         "confluence.page.update",
     ]
     .into_iter()
@@ -795,6 +801,20 @@ fn page_verdict() -> EnrichVerdict {
     )
 }
 
+/// What enrichment gives for an active sprint 7: the executor renders only for these facts.
+fn sprint_verdict() -> EnrichVerdict {
+    let mut v = EnrichVerdict::preview(json!({"state": "active", "name": "Sprint 7"}), Map::new());
+    v.summary = Some(WriteSummaryFacts {
+        sprint: Some(JiraSprint {
+            id: 7,
+            name: "Sprint 7".to_owned(),
+            state: "active".to_owned(),
+        }),
+        ..WriteSummaryFacts::default()
+    });
+    v
+}
+
 fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
     vec![
         (
@@ -825,6 +845,16 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             "jira.worklog.add",
             json!({"key": "ABC-1", "time_spent": "1w 2d 3h", "comment": "Investigation",
                    "started": "2026-09-02T09:00:00.000+0200"}),
+            None,
+        ),
+        (
+            "jira.sprint.move_issues",
+            json!({"id": 7, "issues": ["ABC-1", "ABC-2"]}),
+            Some(sprint_verdict()),
+        ),
+        (
+            "jira.backlog.move_issues",
+            json!({"issues": ["ABC-3"]}),
             None,
         ),
         (
@@ -941,6 +971,24 @@ fn write_bodies_and_urls() -> TestResult {
         verdict.as_ref(),
     )?[0];
     assert_eq!(body_json(r)?, json!({"transition": {"id": "31"}}));
+
+    // PD-54: both moves send `{"issues": [..]}` (agile 1.0), the keys as the agent wrote them.
+    let (id, params, verdict) = get("jira.sprint.move_issues")?;
+    let r = &write_requests(id, params, verdict.as_ref())?[0];
+    assert_eq!(r.method, "POST");
+    assert_eq!(
+        r.resolved_url,
+        "https://jira.example.invalid/ctx/rest/agile/1.0/sprint/7/issue"
+    );
+    assert_eq!(body_json(r)?, json!({"issues": ["ABC-1", "ABC-2"]}));
+    let (id, params, _) = get("jira.backlog.move_issues")?;
+    let r = &write_requests(id, params, None)?[0];
+    assert_eq!(r.method, "POST");
+    assert_eq!(
+        r.resolved_url,
+        "https://jira.example.invalid/ctx/rest/agile/1.0/backlog/issue"
+    );
+    assert_eq!(body_json(r)?, json!({"issues": ["ABC-3"]}));
 
     // PD-48: the body names the key enrichment resolved, whatever the agent wrote (the M3
     // all-digit `{"id"}` guess is gone).

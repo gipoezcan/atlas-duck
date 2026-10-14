@@ -249,14 +249,14 @@ pub(crate) const ISSUELINK_CREATE_PARAMS: &str = r#"{"$schema":"https://json-sch
 pub(crate) const SPRINT_MOVE_ISSUES_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
  "required":["id","issues"],
  "properties":{
-  "id":{"type":"integer","minimum":1},
-  "issues":{"type":"array","items":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},"minItems":1,"maxItems":50}},
+  "id":{"type":"integer","minimum":1,"description":"Sprint id (as jira.sprint.list lists it). The app reads the sprint first: the move can be approved only into a future or active sprint; a closed sprint holds it (deny only)."},
+  "issues":{"type":"array","items":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},"minItems":1,"maxItems":50,"description":"Issue keys to move, 1 to 50, each listed once (ABC-01 and ABC-1 are one issue), at most 255 characters each. More than 50 is refused: split into requests of ≤ 50 issues; moves of disjoint issues can be batch-approved."}},
  "examples":[{"id":7,"issues":["ABC-123","ABC-124"]}]}"#;
 
 pub(crate) const BACKLOG_MOVE_ISSUES_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,
  "required":["issues"],
  "properties":{
-  "issues":{"type":"array","items":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},"minItems":1,"maxItems":50}},
+  "issues":{"type":"array","items":{"type":"string","pattern":"^[A-Z][A-Z0-9_]*-[0-9]+$"},"minItems":1,"maxItems":50,"description":"Issue keys to move to the backlog (each issue leaves its future and active sprints), 1 to 50, each listed once (ABC-01 and ABC-1 are one issue), at most 255 characters each. More than 50 is refused: split into requests of ≤ 50 issues; moves of disjoint issues can be batch-approved."}},
  "examples":[{"issues":["ABC-123"]}]}"#;
 
 /// Receipt of every write whose declared success is an empty body (`204`/`201`): `{}`.

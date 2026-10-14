@@ -20,6 +20,7 @@ use atlas_duck_preview::{
     CommentView, ConstructList, FieldRow, IssueCard, ItemCount, JSON_STRING_COLLAPSE_BYTES,
     PreviewBody, PreviewHeader, sanitize_html,
 };
+use atlas_duck_registry::TargetDisplay;
 use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -1996,14 +1997,19 @@ pub fn edit_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model
 }
 
-/// The issue key of a sent `.../issue/{key}/...` URL (the segment after `issue`, before any query
-/// or fragment), or `""` when the URL has none.
-fn issue_key_of_url(url: &str) -> &str {
+/// The path segment after the first `marker` segment of a sent URL (before any query or
+/// fragment), or `""` when the URL has none.
+fn segment_after<'a>(url: &'a str, marker: &str) -> &'a str {
     let path = url.split(['?', '#']).next().unwrap_or("");
     path.split('/')
-        .skip_while(|s| *s != "issue")
+        .skip_while(|s| *s != marker)
         .nth(1)
         .unwrap_or("")
+}
+
+/// The issue key of a sent `.../issue/{key}/...` URL, or `""` when the URL has none.
+fn issue_key_of_url(url: &str) -> &str {
+    segment_after(url, "issue")
 }
 
 /// What the worklog card shows for a start that was not sent.
@@ -2065,6 +2071,136 @@ pub fn worklog_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         sentence: line(&format!("Log {time_spent} on {key}"), cap, &mut hidden),
         rows,
         constructs: comment.map(construct_list),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden;
+    model
+}
+
+// ---- moves (Task 18) --------------------------------------------------------------------------
+
+/// The sprint id of a sent `.../sprint/{id}/issue` URL (read from the end, so a context path
+/// never stands in for it), or `""` when the URL is not of that shape.
+fn sprint_id_of_url(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or("");
+    let mut tail = path.rsplit('/');
+    match (tail.next(), tail.next(), tail.next()) {
+        (Some("issue"), Some(id), Some("sprint")) => id,
+        _ => "",
+    }
+}
+
+/// What the backlog card says a backlog move does (the agile 1.0 reference: "equivalent to
+/// remove future and active sprints from a given set of issues").
+const BACKLOG_MEANING: &str = "each issue leaves its future and active sprints";
+
+/// PD-54 (plan text): the closed-sprint hold's text.
+fn closed_sprint_text(name: &str) -> String {
+    format!("sprint {name} is closed; issues cannot be moved into a closed sprint")
+}
+
+/// §6.3 sprint move: the `jira.sprint.move_issues` and `jira.backlog.move_issues` card over the
+/// exact request (§5.1 inv. 4), a sentence and a table of the issues (one row per key, so all of
+/// them show: the executor sends at most 50 keys of at most 255 characters, each within a row's
+/// cap, and a cut would still be counted). Read from the request that is sent (T12 review M4,
+/// T17 review I2): the keys and their count from its body, the sprint id from its URL. The
+/// sprint's name and state are the verdict's facts, shown only when they are about the sent id
+/// (else "<id> (enrichment read sprint <other>)"); the name is server text: cut short, quoted in
+/// the sentence, and its invisible characters counted into the §6.4 Cautions. The closed-sprint
+/// hold (PD-54: a judge's `EnrichmentError`, no failed fetch) shows the app's text instead of the
+/// generic "unusable" one. Every other hold, or a request that is not the move JSON, keeps the
+/// generic write preview.
+pub fn move_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let facts = view
+        .enrichment
+        .and_then(|v| v.summary.as_ref())
+        .and_then(|s| s.sprint.as_ref());
+    let mut hidden = 0u64;
+    let cap = CELL_CAP_CHARS * 2;
+    if view.hold == Hold::EnrichmentError && view.failure.is_none() {
+        if let Some(sprint) = facts.filter(|s| s.state == super::jira_ext::SPRINT_CLOSED) {
+            let name = short_server_text(&sprint.name, &mut hidden);
+            let text = line(&closed_sprint_text(&name), cap, &mut hidden);
+            model.body = PreviewBody::enrichment_error(None, &text, None);
+            count_card_text(&mut model, [sprint.name.as_str()]);
+            model.header.hidden_in_preview_bytes = hidden;
+        }
+        return model;
+    }
+    let (Hold::Preview, Some(request), PreviewBody::WriteRequests { .. }) =
+        (view.hold, view.requests.first(), &model.body)
+    else {
+        return model;
+    };
+    let Some(issues) = serde_json::from_slice::<Value>(&request.body)
+        .ok()
+        .and_then(|b| match b.get("issues") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|k| k.as_str().map(str::to_owned))
+                .collect::<Option<Vec<String>>>(),
+            _ => None,
+        })
+    else {
+        return model;
+    };
+    let count = issues.len();
+    let noun = if count == 1 { "issue" } else { "issues" };
+    let into_sprint = matches!(
+        ctx.spec.target_display,
+        TargetDisplay::MoveInto {
+            sprint_param: Some(_),
+            ..
+        }
+    );
+    let mut rows = Vec::new();
+    let mut shown_facts = None;
+    let sentence = if into_sprint {
+        let sent_id = sprint_id_of_url(&request.resolved_url);
+        rows.push((
+            "Sprint id (sent)".to_owned(),
+            line(sent_id, cap, &mut hidden),
+        ));
+        match facts {
+            Some(s) if s.id.to_string() == sent_id => {
+                let name = short_server_text(&s.name, &mut hidden);
+                let state = short_server_text(&s.state, &mut hidden);
+                rows.push(("Sprint name".to_owned(), line(&name, cap, &mut hidden)));
+                rows.push(("Sprint state".to_owned(), line(&state, cap, &mut hidden)));
+                shown_facts = Some(s);
+                format!(
+                    "Move {count} {noun} to sprint {} (id {sent_id}, {state})",
+                    quoted(&name)
+                )
+            }
+            Some(s) => format!(
+                "Move {count} {noun} to sprint {sent_id} (enrichment read sprint {})",
+                s.id
+            ),
+            None => format!("Move {count} {noun} to sprint {sent_id}"),
+        }
+    } else {
+        rows.push(("Meaning".to_owned(), BACKLOG_MEANING.to_owned()));
+        format!("Move {count} {noun} to the backlog")
+    };
+    rows.push(("Issues (sent)".to_owned(), count.to_string()));
+    for (n, key) in issues.iter().enumerate() {
+        rows.push((format!("Issue {}", n + 1), line(key, cap, &mut hidden)));
+    }
+    // The server text the card shows beyond the request.
+    let shown = shown_facts
+        .into_iter()
+        .flat_map(|s| [s.name.as_str(), s.state.as_str()]);
+    count_card_text(&mut model, shown);
+    let requests = take_requests(&mut model);
+    model.body = PreviewBody::WriteSummary {
+        sentence: line(&sentence, cap, &mut hidden),
+        rows,
+        constructs: None,
         requests,
     };
     model.header.hidden_in_preview_bytes = hidden;
