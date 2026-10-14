@@ -159,6 +159,9 @@ pub struct TestHooks {
     pub pause_after_get: Option<Arc<Pause>>,
     /// Replaces the 60 s that `shutdown` waits for writes that are `executing` (§2.5 step 4).
     pub shutdown_write_wait: Option<std::time::Duration>,
+    /// Replaces the 5 s that `shutdown` lets the cancelled field fills and token re-checks end
+    /// (§2.5 step 5, one shared deadline).
+    pub shutdown_drain_wait: Option<std::time::Duration>,
     /// U-24 (PD-64): every executor context the engine builds carries this fault, so converted
     /// Markdown gets one unrecorded construct appended before the hard check.
     pub converter_fault: Option<crate::testing::ConverterFault>,
@@ -468,8 +471,23 @@ impl Core {
         #[cfg(not(feature = "testing"))]
         let wait = crate::shutdown::WRITE_WAIT;
         let swept = crate::shutdown::sweep(&self.engine, why, wait).await;
-        crate::shutdown::fills_ended(&self.engine, crate::shutdown::FILL_WAIT).await;
-        crate::shutdown::rechecks_ended(&self.engine, crate::shutdown::FILL_WAIT).await;
+        #[cfg(feature = "testing")]
+        let drain = self
+            .engine
+            .hooks()
+            .shutdown_drain_wait
+            .unwrap_or(crate::shutdown::FILL_WAIT);
+        #[cfg(not(feature = "testing"))]
+        let drain = crate::shutdown::FILL_WAIT;
+        // One deadline for both drains: the shutdown waits at most `drain` for them together.
+        let drain_began = std::time::Instant::now();
+        if !crate::shutdown::fills_ended(&self.engine, drain).await {
+            tracing::warn!("a field-name cache fill was still running at APP_STOP");
+        }
+        let left = drain.saturating_sub(drain_began.elapsed());
+        if !crate::shutdown::rechecks_ended(&self.engine, left).await {
+            tracing::warn!("a token re-check was still running at APP_STOP");
+        }
         let app_stop_logged = crate::shutdown::stop(&self.engine, stop).await.is_ok();
         ShutdownReport {
             cancelled: swept.cancelled,

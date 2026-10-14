@@ -810,6 +810,18 @@ impl Engine {
             .update(instance_id, f);
     }
 
+    /// Test-only: registers a token re-check that never ends (until [`Engine::unpark_recheck`]),
+    /// to prove the shutdown's bounded wait.
+    #[cfg(feature = "testing")]
+    pub fn park_recheck(&self) -> u64 {
+        self.identity.park()
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn unpark_recheck(&self, n: u64) {
+        self.identity.unpark(n);
+    }
+
     pub(crate) fn identity_gates(&self) -> &crate::identity::Gates {
         &self.identity
     }

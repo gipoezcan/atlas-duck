@@ -371,6 +371,20 @@ impl Gates {
         }
     }
 
+    #[cfg(feature = "testing")]
+    pub(crate) fn park(&self) -> u64 {
+        let mut running = self.running();
+        running.next += 1;
+        let n = running.next;
+        running.controls.insert(n, FetchControl::new());
+        n
+    }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn unpark(&self, n: u64) {
+        self.running().controls.remove(&n);
+    }
+
     /// No re-check is running (the shutdown waits for this before `APP_STOP`).
     pub(crate) fn idle(&self) -> bool {
         self.running().controls.is_empty()

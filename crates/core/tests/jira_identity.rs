@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
+use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_atlassian::{CredentialProvider, Timeouts};
 use atlas_duck_audit::EventType;
 use atlas_duck_core::identity::{RecheckResult, on_result};
@@ -34,6 +34,7 @@ use atlas_duck_preview::warning::WarningId;
 use atlas_duck_registry::{OpClass, Product};
 use common::jira::mount_without_xauser;
 use common::{TestError, TestResult, code, de, detail, exit, request_id, test_hits};
+use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -259,11 +260,16 @@ async fn serve(mut sock: TcpStream, routes: Arc<Routes>) {
         let answer = answer
             .unwrap_or_else(|| json_answer("404 Not Found", r#"{"errorMessages":["no route"]}"#));
         tokio::time::sleep(answer.delay).await;
+        // The connection stops counting before its answer goes out: the client frees its limiter
+        // permit only after it read the answer, so the server's count never exceeds the
+        // client's (a new connection cannot be counted while this one still is).
+        routes.active.fetch_sub(1, Ordering::SeqCst);
         let _ = sock.write_all(&answer.bytes).await;
         let _ = sock.flush().await;
+    } else {
+        routes.active.fetch_sub(1, Ordering::SeqCst);
     }
     let _ = sock.shutdown().await;
-    routes.active.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Reads the request head and its `Content-Length` body; returns `METHOD /path`.
@@ -955,7 +961,7 @@ async fn rf5b_search_post_header_absent() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rf5b_rechecks_coalesce_and_are_logged() -> TestResult {
     let router = Router::start().await?;
-    let slow = Duration::from_millis(250);
+    let slow = Duration::from_millis(500);
     router.route(
         &format!("GET {MYSELF}"),
         vec![ok_json(&fixtures::jira_myself(TEST_USER, TEST_USER_KEY)).after(slow)],
@@ -997,8 +1003,8 @@ async fn rf5b_rechecks_coalesce_and_are_logged() -> TestResult {
     let starts = rechecks(&h, "start").await?;
     let results = rechecks(&h, "result").await?;
     assert!(
-        (1..=8).contains(&starts.len()),
-        "{} token_recheck starts",
+        (1..8).contains(&starts.len()),
+        "{} token_recheck starts for 8 reads (no coalescing at 8)",
         starts.len()
     );
     assert_eq!(
@@ -1585,12 +1591,142 @@ async fn t26_m6_needs_token_stale_is_identity_mismatch() -> TestResult {
     Ok(())
 }
 
+/// T19 review M-7: the way out of a PD-65 return. An instance in `needs_token` holds the write
+/// as `WRITE_STALE {identity_mismatch}` (not approvable); storing a token makes the instance `ok`
+/// again, the hold is refreshed and the write is approvable again, and approving it sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn t19_m7_token_stored_makes_the_returned_write_approvable() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            pause_in_transition: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    world_as(mock, TEST_USER).await;
+    let auto = |p: Arc<Pause>| {
+        tokio::spawn(async move {
+            loop {
+                p.reached.notified().await;
+                p.release.notify_one();
+            }
+        })
+    };
+    let setup = auto(pause.clone());
+    let (id, rev) = queued_open(&h, COMMENT, comment_params()).await?;
+    setup.abort();
+    let _ = setup.await;
+    let approver = h.approver();
+    let rid = id.clone();
+    let decision = std::thread::spawn(move || approver.approve_unopened(&rid).map(|_| ()));
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified()).await?;
+    let (engine, sid) = (
+        h.engine().clone(),
+        h.instance("jira-main").ok_or("instance")?.id.clone(),
+    );
+    let flip = tokio::spawn(async move {
+        on_result(
+            &engine,
+            &sid,
+            &RecheckResult::TokenFailure { other_user: None },
+        )
+        .await
+    });
+    wait_for("needs_token", || state_of(&h) == "needs_token").await?;
+    pause.release.notify_one();
+    let rest = auto(pause.clone());
+    decision
+        .join()
+        .map_err(|_| "decision thread panicked")?
+        .map_err(de)?;
+    let held = item_after(&h, &id, rev).await?;
+    assert!(!held.approvable && !held.opened, "{held:?}");
+    assert_eq!(
+        stale_reasons(&h, &id).await?,
+        [json!({ "reason": "identity_mismatch" })]
+    );
+    flip.await?;
+    // The way out: a token that resolves to the stored identity.
+    world_as(mock, TEST_USER).await;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/serverInfo")))
+        .respond_with(
+            mock.response(200)
+                .insert_header("X-AUSERNAME", TEST_USER)
+                .set_body_raw(fixtures::jira_server_info("9.12.0"), "application/json"),
+        )
+        .mount(mock.server())
+        .await;
+    h.instances()
+        .set_token("jira-main", SecretString::from(TEST_PAT.to_owned()), None)
+        .await?;
+    assert_eq!(state_of(&h), "ok");
+    let back = item_after(&h, &id, held.candidate_rev.counter).await?;
+    assert!(back.approvable, "{back:?}");
+    assert_eq!(
+        sends(mock).await,
+        0,
+        "nothing was sent before the new approval"
+    );
+    h.approver().open(&id).map_err(de)?;
+    h.approver().approve(&id).map_err(de)?;
+    executed(&h, &id).await?;
+    assert_eq!(sends(mock).await, 1);
+    rest.abort();
+    Ok(())
+}
+
+/// T19 review M-3: a token re-check that never ends does not hold the shutdown beyond the drain
+/// bound, and `APP_STOP` is still written (the late result would follow it; the shutdown logs
+/// that it gave up).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn token_recheck_that_never_ends_is_waited_for_only_up_to_the_bound() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            shutdown_drain_wait: Some(Duration::from_millis(600)),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let parked = h.engine().park_recheck();
+    let started = std::time::Instant::now();
+    let report = h.core().shutdown(ShutdownReason::Quit).await;
+    let took = started.elapsed();
+    assert!(report.app_stop_logged);
+    assert!(
+        took >= Duration::from_millis(500),
+        "the shutdown did not wait for the re-check: {took:?}"
+    );
+    assert!(
+        took < Duration::from_secs(20),
+        "the shutdown was not bounded: {took:?}"
+    );
+    let all = h.audit_records().await?;
+    let last = all.iter().max_by_key(|r| r.seq).ok_or("empty log")?;
+    assert_eq!(last.event_type, EventType::APP_STOP, "{:?}", last.payload);
+    h.engine().unpark_recheck(parked);
+    Ok(())
+}
+
 /// §2.5 step 5 for the token re-check: a re-check in flight when the shutdown runs is cancelled
 /// and ends before `APP_STOP` (its `/myself` would answer only after the shutdown's 5 s wait), so
 /// every `token_recheck` start has its result and nothing follows `APP_STOP`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_recheck_in_flight_ends_before_app_stop() -> TestResult {
-    let h = Harness::jira().await?;
+    // The drain bound is 10 s and the answer comes after 30 s: without the cancel the shutdown
+    // takes the whole bound, with it a few ms; 5 s is the margin on both sides.
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            shutdown_drain_wait: Some(Duration::from_secs(10)),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
     let mock = jira(&h)?;
     mount_without_xauser(mock, "GET", ISSUE_PATH, fixtures::JIRA_ISSUE).await;
     Mock::given(method("GET"))
@@ -1601,7 +1737,7 @@ async fn token_recheck_in_flight_ends_before_app_stop() -> TestResult {
                     fixtures::jira_myself(TEST_USER, TEST_USER_KEY),
                     "application/json",
                 )
-                .set_delay(Duration::from_secs(10)),
+                .set_delay(Duration::from_secs(30)),
         )
         .mount(mock.server())
         .await;
@@ -1620,7 +1756,7 @@ async fn token_recheck_in_flight_ends_before_app_stop() -> TestResult {
     let started = std::time::Instant::now();
     let _report = h.core().shutdown(ShutdownReason::Quit).await;
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(5),
         "the shutdown waited for the re-check's answer"
     );
     // A re-check left running would record its result after `APP_STOP`.
