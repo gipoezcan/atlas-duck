@@ -46,6 +46,13 @@ pub enum Directive {
     DenyDetails,
     /// A write or a script: open + approve.
     Approve,
+    /// A write with missing required fields (PD-49): open, fill every pre-added `fields.<id>`
+    /// input with its first allowed value (else `"x"`), submit the edit, open the new revision
+    /// and approve it.
+    EditPreadded,
+    /// Open + deny with [`DENY_REASON`] and the hint the hold has the data for (no candidates,
+    /// allowed values or messages), else a plain deny.
+    DenyHint,
     /// Nothing (also the default without a directive).
     Hold,
 }
@@ -63,6 +70,8 @@ pub fn directive(reason_excerpt: Option<&str>) -> Directive {
         "deny" => Directive::Deny,
         "deny-details" => Directive::DenyDetails,
         "approve" => Directive::Approve,
+        "edit-preadded" => Directive::EditPreadded,
+        "deny-hint" => Directive::DenyHint,
         _ => Directive::Hold,
     }
 }
@@ -219,7 +228,8 @@ fn fits(d: Directive, item: &QueueItem) -> bool {
             item.class == "read" && item.approvable
         }
         Directive::Approve => matches!(item.class, "write" | "script") && item.approvable,
-        Directive::Deny | Directive::DenyDetails => true,
+        Directive::EditPreadded => item.class == "write" && item.approvable,
+        Directive::Deny | Directive::DenyDetails | Directive::DenyHint => true,
     }
 }
 
@@ -242,8 +252,42 @@ fn act(approver: &ScriptedApprover, d: Directive, item: &QueueItem) -> Result<()
             }
         }
         Directive::Approve => approver.approve(id).map(drop),
+        Directive::EditPreadded => {
+            // The edit makes a new revision; one with nothing left to fill is approved. An
+            // approve that cannot happen yet (enrichment runs again) is retried on the next tick.
+            if approver.edit_all_preadded(id)? {
+                approver.approve(id).map(drop)
+            } else {
+                approver.approve_unopened(id).map(drop)
+            }
+        }
+        Directive::DenyHint => deny_with_hint(approver, id),
         Directive::Hold => Ok(()),
     }
+}
+
+/// A deny with the first hint the hold accepts, each without its optional lists; a plain deny
+/// when none applies. A refused hint logs nothing.
+fn deny_with_hint(approver: &ScriptedApprover, id: &str) -> Result<(), DecisionError> {
+    let hints = [
+        DenyDetails::ResolutionFailed {
+            include_candidates: false,
+        },
+        DenyDetails::MissingFields {
+            include_allowed_values: false,
+        },
+        DenyDetails::OutcomeHint,
+        DenyDetails::UpstreamHttp {
+            include_messages: false,
+        },
+    ];
+    for details in hints {
+        match approver.deny_with(id, DENY_REASON, details) {
+            Err(DecisionError::EditRejected(_)) => {}
+            other => return other.map(drop),
+        }
+    }
+    approver.deny_unopened(id, DENY_REASON).map(drop)
 }
 
 /// The static log name of an error (never its text).
@@ -285,6 +329,10 @@ mod tests {
             (Some("atlas-test:deny please"), Directive::Deny),
             (Some("atlas-test:deny-details"), Directive::DenyDetails),
             (Some("atlas-test:approve"), Directive::Approve),
+            (Some("atlas-test:edit-preadded"), Directive::EditPreadded),
+            (Some("atlas-test:deny-hint"), Directive::DenyHint),
+            (Some("atlas-test:deny-hint please"), Directive::DenyHint),
+            (Some("atlas-test:edit-preadded2"), Directive::Hold),
             (Some("atlas-test:approve\nsecond line"), Directive::Approve),
             (Some("atlas-test:hold"), Directive::Hold),
             (Some("  atlas-test:release"), Directive::Release),
@@ -309,6 +357,8 @@ mod tests {
             "deny",
             "deny-details",
             "approve",
+            "edit-preadded",
+            "deny-hint",
             "hold",
         ] {
             assert!(DIRECTIVE_PREFIX.len() + name.len() <= 60, "{name}");

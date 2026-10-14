@@ -232,6 +232,34 @@ impl ScriptedApprover {
         self.set(request_id, path, Value::from(label))
     }
 
+    /// Fills every pre-added input of the current revision's edit form with its first allowed
+    /// value (any other kind: `"x"`) and submits the edit, like [`Self::edit_preadded`] for all of
+    /// them at once. `Ok(false)` when the revision has none (nothing was edited; the revision
+    /// was opened).
+    pub fn edit_all_preadded(&self, request_id: &str) -> Result<bool, DecisionError> {
+        let preview = self.open(request_id)?.preview;
+        let mut set = Map::new();
+        let inputs = preview.edit_form.iter().flat_map(|f| f.inputs.iter());
+        for input in inputs.filter(|i| i.pre_added) {
+            let value = match &input.kind {
+                InputKind::Choice(allowed) => allowed.as_slice().first().map(String::as_str),
+                _ => None,
+            };
+            set.insert(input.path.clone(), Value::from(value.unwrap_or("x")));
+        }
+        if set.is_empty() {
+            return Ok(false);
+        }
+        self.edit(
+            request_id,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )?;
+        Ok(true)
+    }
+
     fn set(
         &self,
         request_id: &str,
