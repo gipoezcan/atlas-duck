@@ -11,4 +11,5 @@ pub const COMMANDS: &[&str] = &[
     "open_window",
     "preview_fetch",
     "quit",
+    "raw_page",
 ];

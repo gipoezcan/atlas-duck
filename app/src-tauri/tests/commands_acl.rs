@@ -365,3 +365,223 @@ fn preview_fetch_granted_to_approvals_only() -> TestResult {
     }
     Ok(())
 }
+
+/// M6 T11 (Δ1, PD-68): `raw_page` is granted to `approvals` only; its body is checked before the
+/// handler, and without a serving core it answers `not_ready`.
+#[test]
+fn raw_page_granted_to_approvals_only() -> TestResult {
+    let app = app()?;
+    let id = format!("req_{}", "a".repeat(24));
+    let rev = json!({"counter": 1, "candidate_hash": "ab".repeat(32)});
+    let body = json!({"request_id": id, "candidate_rev": rev, "page": 0});
+    let approvals = window(&app, "approvals")?;
+    assert_eq!(
+        invoke(&approvals, "raw_page", body.clone()),
+        Err(json!({"kind": "not_ready"}))
+    );
+    // The carry is derived in Rust: a body that names one is refused.
+    let mut with_carry = body.clone();
+    with_carry["carry"] = json!("");
+    assert_eq!(
+        invoke(&approvals, "raw_page", with_carry),
+        Err(json!({"kind": "invalid_argument", "field": "payload"}))
+    );
+    for label in [
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "credential",
+        "setup",
+    ] {
+        let refused = invoke(&window(&app, label)?, "raw_page", body.clone());
+        assert!(
+            refused
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.get("kind").is_none()),
+            "{label}: {refused:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "scripted-approver")]
+mod raw_pages {
+    use atlas_duck_app_lib::commands::CommandError;
+    use atlas_duck_app_lib::commands::approvals::raw_page_dto;
+    use atlas_duck_atlassian::testing::fixtures;
+    use atlas_duck_core::payloads::InvalidReason;
+    use atlas_duck_core::testing::Harness;
+    use atlas_duck_core::{CandidateRev, DecisionError};
+    use atlas_duck_preview::RAW_PAGE_BYTES;
+    use base64::Engine;
+    use serde_json::{Value, json};
+
+    use super::TestResult;
+
+    const ISSUE: &str = "jira.issue.get";
+
+    fn b64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+        base64::engine::general_purpose::STANDARD.decode(s)
+    }
+
+    /// Submits a read of `body`, waits for the queue and opens it; its id and revision.
+    async fn opened(
+        h: &Harness,
+        body: &str,
+    ) -> Result<(String, CandidateRev), Box<dyn std::error::Error>> {
+        h.mock("jira-main")
+            .ok_or("no jira mock")?
+            .json("/rest/api/2/issue/ABC-1", 200, body)
+            .await;
+        let env = h.submit(ISSUE, json!({ "key": "ABC-1" })).await;
+        let id = env.request_id.clone().ok_or("no request id")?;
+        h.queued(&id, 120_000).await.ok_or("never queued")?;
+        let preview = h
+            .approver()
+            .open(&id)
+            .map_err(|e| format!("{e:?}"))?
+            .preview;
+        Ok((id, preview.candidate_rev))
+    }
+
+    /// X-07: the Raw pages' bytes, concatenated, are the bytes the agent receives as `result`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn x07_raw_pages_concat_equal_released_bytes() -> TestResult {
+        let h = Harness::jira().await?;
+        // Two pages and a bit; multi-byte text so a page boundary can cut a character.
+        let summary = "日本語 😀 résumé trailing  ".repeat(25_000);
+        let body = json!({ "key": "ABC-1", "fields": { "summary": summary } }).to_string();
+        let (id, rev) = opened(&h, &body).await?;
+        let decisions = h.decisions();
+
+        let first = raw_page_dto(&*decisions, &id, rev, 0)?;
+        assert!(first.page_count >= 3, "{}", first.page_count);
+        let mut bytes = Vec::new();
+        let mut shown = String::new();
+        for page in 0..first.page_count {
+            let p = raw_page_dto(&*decisions, &id, rev, page)?;
+            assert_eq!(
+                (p.page, p.page_count, p.total_bytes),
+                (page, first.page_count, first.total_bytes)
+            );
+            bytes.extend(b64(&p.bytes_b64)?);
+            shown.push_str(&p.display);
+        }
+        assert_eq!(bytes.len() as u64, first.total_bytes);
+        assert!(
+            shown.contains("😀"),
+            "characters are shown once, whatever page cuts them"
+        );
+
+        decisions
+            .decide(atlas_duck_core::Decision {
+                request_id: id.clone(),
+                decision: atlas_duck_core::DecisionKind::Release,
+                candidate_rev: rev,
+                edits: None,
+                redactions: None,
+                reason: None,
+                deny_details: None,
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        let env = h.await_(&id, 15_000).await;
+        let data: Value = env.data.clone().ok_or("no data")?;
+        let released = serde_json::to_vec(&data["result"])?;
+        assert_eq!(bytes, released);
+        // READ_RELEASED records the same bytes it released.
+        let events = h.events(&id).await?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(t, _)| *t == atlas_duck_audit::EventType::READ_RELEASED)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    /// P-02 (Rust half): a candidate just under 16 MiB pages into 64 pages, the last shorter; the
+    /// counts are over the full candidate; a page past the last is an invalid argument.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn p02_16mib_raw_paging_counts() -> TestResult {
+        let h = Harness::jira().await?;
+        let summary = "m".repeat(16 * 1024 * 1024 - 4096);
+        let body = json!({ "key": "ABC-1", "fields": { "summary": summary } }).to_string();
+        let (id, rev) = opened(&h, &body).await?;
+        let decisions = h.decisions();
+
+        let header = decisions
+            .preview_fetch(&id, Some(rev))
+            .map_err(|e| format!("{e:?}"))?
+            .preview
+            .raw;
+        assert_eq!(header.page_count, 64);
+        let mut sum = 0u64;
+        let mut last_len = 0u64;
+        for page in 0..64 {
+            let p = raw_page_dto(&*decisions, &id, rev, page)?;
+            assert_eq!(
+                (p.page, p.page_count, p.total_bytes),
+                (page, 64, header.total_bytes)
+            );
+            let len = b64(&p.bytes_b64)?.len() as u64;
+            sum += len;
+            last_len = len;
+            if page < 63 {
+                assert_eq!(len, RAW_PAGE_BYTES, "page {page}");
+            }
+        }
+        assert_eq!(sum, header.total_bytes);
+        assert!(
+            last_len < RAW_PAGE_BYTES,
+            "the last page is shorter: {last_len}"
+        );
+        assert!(header.total_bytes > 16 * 1024 * 1024 - 4096);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raw_page_out_of_range_is_invalid_argument() -> TestResult {
+        let h = Harness::jira().await?;
+        let (id, rev) = opened(&h, fixtures::JIRA_ISSUE).await?;
+        let decisions = h.decisions();
+        let only = raw_page_dto(&*decisions, &id, rev, 0)?;
+        assert_eq!(only.page_count, 1);
+        for page in [1, 2, u64::MAX] {
+            assert_eq!(
+                raw_page_dto(&*decisions, &id, rev, page),
+                Err(CommandError::InvalidArgument { field: "page" }),
+                "{page}"
+            );
+        }
+        // The refusals of core pass through: a stale revision, an unknown request.
+        let stale = CandidateRev {
+            counter: rev.counter,
+            candidate_hash: [1; 32],
+        };
+        assert!(matches!(
+            raw_page_dto(&*decisions, &id, stale, 0),
+            Err(CommandError::Decision(DecisionError::Stale { .. }))
+        ));
+        assert!(matches!(
+            raw_page_dto(&*decisions, "req_0123456789abcdefghij", rev, 0),
+            Err(CommandError::Decision(DecisionError::NotDecidable))
+        ));
+        // An unopened revision shows nothing.
+        let (id2, rev2) = {
+            let env = h.submit(ISSUE, json!({ "key": "ABC-1" })).await;
+            let id2 = env.request_id.clone().ok_or("no request id")?;
+            let item = h.queued(&id2, 10_000).await.ok_or("never queued")?;
+            (id2, item.candidate_rev)
+        };
+        assert!(matches!(
+            raw_page_dto(&*decisions, &id2, rev2, 0),
+            Err(CommandError::Decision(DecisionError::Invalid(
+                InvalidReason::NotOpened
+            )))
+        ));
+        Ok(())
+    }
+}

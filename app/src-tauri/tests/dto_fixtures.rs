@@ -8,6 +8,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::path::{Path, PathBuf};
 
 use atlas_duck_app_lib::commands::CommandError;
+use atlas_duck_app_lib::commands::approvals::RawPageDto;
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
@@ -400,6 +401,25 @@ fn status_lines() -> Vec<StatusLineDto> {
     ]
 }
 
+fn raw_pages() -> Vec<RawPageDto> {
+    vec![
+        RawPageDto {
+            page: 0,
+            page_count: 2,
+            total_bytes: 262_150,
+            bytes_b64: "YQ0KYv8=".into(),
+            display: "a⟨U+000D⟩\nb⟨0xFF⟩".into(),
+        },
+        RawPageDto {
+            page: 1,
+            page_count: 2,
+            total_bytes: 262_150,
+            bytes_b64: String::new(),
+            display: String::new(),
+        },
+    ]
+}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ui/src/shared/ipc/fixtures")
 }
@@ -416,6 +436,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("decision_outcome", value(&decision_outcomes())?),
         ("preview", value(&previews())?),
         ("queue_item", value(&queue_items())?),
+        ("raw_page", value(&raw_pages())?),
         ("status_line", value(&status_lines())?),
     ])
 }

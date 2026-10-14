@@ -7,6 +7,7 @@
     "allow-open-window",
     "allow-preview-fetch",
     "allow-quit",
+    "allow-raw-page",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

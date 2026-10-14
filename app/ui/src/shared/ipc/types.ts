@@ -32,6 +32,17 @@ export interface QueueItem {
   unusual: boolean;
 }
 
+/** One Raw page (PD-68): the UI shows `display` and never decodes `bytes_b64`. */
+export interface RawPage {
+  page: number;
+  page_count: number;
+  total_bytes: number;
+  /** Exact page bytes, base64; for the write-only copy gesture only. */
+  bytes_b64: string;
+  /** The Rust display projection: invisible, bidi, CR and trailing whitespace marked. */
+  display: string;
+}
+
 export interface StatusLine {
   id: string;
   level: 'caution' | 'info';

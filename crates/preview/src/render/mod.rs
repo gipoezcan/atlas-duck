@@ -20,7 +20,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 mod body;
+pub mod raw;
 pub mod ws;
+
+pub use raw::{RawDisplay, raw_display, raw_display_last};
 
 use crate::invisible;
 use crate::model::{ItemCount, Preview, PreviewBody};

@@ -1,0 +1,16 @@
+[
+  {
+    "bytes_b64": "YQ0KYv8=",
+    "display": "a⟨U+000D⟩\nb⟨0xFF⟩",
+    "page": 0,
+    "page_count": 2,
+    "total_bytes": 262150
+  },
+  {
+    "bytes_b64": "",
+    "display": "",
+    "page": 1,
+    "page_count": 2,
+    "total_bytes": 262150
+  }
+]

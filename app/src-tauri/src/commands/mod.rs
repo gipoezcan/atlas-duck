@@ -39,6 +39,7 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
     builder.invoke_handler(tauri::generate_handler![
         app_status,
         approvals::preview_fetch,
+        approvals::raw_page,
         window::open_window,
         window::quit
     ])

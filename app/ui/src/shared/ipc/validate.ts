@@ -8,6 +8,7 @@ import type {
   DenyOfferKind,
   Preview,
   QueueItem,
+  RawPage,
   StatusLine,
 } from './types';
 
@@ -63,6 +64,15 @@ export const isQueueItem = (v: unknown): v is QueueItem =>
     stale: isBool,
     target_display: isStr,
     unusual: isBool,
+  });
+
+export const isRawPage = (v: unknown): v is RawPage =>
+  fields(v, {
+    page: isNum,
+    page_count: isNum,
+    total_bytes: isNum,
+    bytes_b64: isStr,
+    display: isStr,
   });
 
 export const isDecisionOutcome = (v: unknown): v is DecisionOutcome =>

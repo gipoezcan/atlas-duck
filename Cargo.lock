@@ -392,6 +392,7 @@ dependencies = [
  "atlas-duck-registry",
  "atlas-duck-sandbox-host",
  "atlas-duck-sandbox-worker",
+ "base64 0.22.1",
  "filetime",
  "libc",
  "secrecy",

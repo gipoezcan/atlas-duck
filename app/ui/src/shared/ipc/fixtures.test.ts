@@ -5,6 +5,7 @@ import commandError from './fixtures/command_error.json';
 import decisionOutcome from './fixtures/decision_outcome.json';
 import preview from './fixtures/preview.json';
 import queueItem from './fixtures/queue_item.json';
+import rawPage from './fixtures/raw_page.json';
 import statusLine from './fixtures/status_line.json';
 import {
   arrayOf,
@@ -12,6 +13,7 @@ import {
   isDecisionOutcome,
   isPreview,
   isQueueItem,
+  isRawPage,
   isStatusLine,
   toCommandError,
 } from './validate';
@@ -19,6 +21,7 @@ import {
 describe('fixtures validate against their TS types', () => {
   it.each([
     ['queue_item', queueItem, arrayOf(isQueueItem)],
+    ['raw_page', rawPage, arrayOf(isRawPage)],
     ['status_line', statusLine, arrayOf(isStatusLine)],
     ['decision_outcome', decisionOutcome, arrayOf(isDecisionOutcome)],
     ['batch_outcome', batchOutcome, arrayOf(isBatchOutcome)],

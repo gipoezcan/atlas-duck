@@ -66,6 +66,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 zeroize = { workspace = true }
+# M6 T11: `raw_page` sends the exact page bytes as base64 (PD-68, X-07).
+base64 = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
