@@ -411,10 +411,11 @@ mod raw_pages {
     use atlas_duck_app_lib::commands::CommandError;
     use atlas_duck_app_lib::commands::approvals::raw_page_dto;
     use atlas_duck_atlassian::testing::fixtures;
-    use atlas_duck_core::payloads::InvalidReason;
+    use atlas_duck_core::payloads::{InvalidReason, body_json, sha256_hex};
     use atlas_duck_core::testing::Harness;
     use atlas_duck_core::{CandidateRev, DecisionError};
     use atlas_duck_preview::RAW_PAGE_BYTES;
+    use atlas_duck_preview::render::raw::{incomplete_tail, raw_display_last};
     use base64::Engine;
     use serde_json::{Value, json};
 
@@ -450,8 +451,10 @@ mod raw_pages {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn x07_raw_pages_concat_equal_released_bytes() -> TestResult {
         let h = Harness::jira().await?;
-        // Two pages and a bit; multi-byte text so a page boundary can cut a character.
-        let summary = "日本語 😀 résumé trailing  ".repeat(25_000);
+        // Two pages and a bit; multi-byte text so a page boundary can cut a character. No space,
+        // tab, CR, ZWJ or VS: those are marked page-locally, so the concatenated pages would not
+        // have to equal the display of the whole candidate.
+        let summary = "日本語😀résumé".repeat(25_000);
         let body = json!({ "key": "ABC-1", "fields": { "summary": summary } }).to_string();
         let (id, rev) = opened(&h, &body).await?;
         let decisions = h.decisions();
@@ -460,20 +463,30 @@ mod raw_pages {
         assert!(first.page_count >= 3, "{}", first.page_count);
         let mut bytes = Vec::new();
         let mut shown = String::new();
+        let mut cut_boundaries = 0;
         for page in 0..first.page_count {
             let p = raw_page_dto(&*decisions, &id, rev, page)?;
             assert_eq!(
                 (p.page, p.page_count, p.total_bytes),
                 (page, first.page_count, first.total_bytes)
             );
-            bytes.extend(b64(&p.bytes_b64)?);
+            let page_bytes = b64(&p.bytes_b64)?;
+            if page + 1 < first.page_count && !incomplete_tail(&page_bytes).is_empty() {
+                cut_boundaries += 1;
+            }
+            bytes.extend(page_bytes);
             shown.push_str(&p.display);
         }
         assert_eq!(bytes.len() as u64, first.total_bytes);
+        // The test proves something only if a boundary really cuts a character.
         assert!(
-            shown.contains("😀"),
-            "characters are shown once, whatever page cuts them"
+            cut_boundaries >= 1,
+            "no page boundary cuts a multi-byte character"
         );
+        // The pages' display, concatenated, is the display of the whole candidate: a carry that
+        // is dropped, or the wrong last-page function, shows as `⟨0x..⟩` bytes.
+        assert_eq!(shown, raw_display_last(&bytes, &[]).text);
+        assert!(!shown.contains("⟨0x"), "no byte is shown as invalid");
 
         decisions
             .decide(atlas_duck_core::Decision {
@@ -492,13 +505,14 @@ mod raw_pages {
         assert_eq!(bytes, released);
         // READ_RELEASED records the same bytes it released.
         let events = h.events(&id).await?;
-        assert_eq!(
-            events
-                .iter()
-                .filter(|(t, _)| *t == atlas_duck_audit::EventType::READ_RELEASED)
-                .count(),
-            1
-        );
+        let recorded: Vec<&Value> = events
+            .iter()
+            .filter(|(t, _)| *t == atlas_duck_audit::EventType::READ_RELEASED)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0]["released_sha256"], json!(sha256_hex(&bytes)));
+        assert_eq!(recorded[0]["released"], body_json(&bytes));
         Ok(())
     }
 

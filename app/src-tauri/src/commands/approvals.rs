@@ -1,5 +1,5 @@
-//! The Approvals window's commands (C.10 + Δ1, §5.6). M6 T10: `preview_fetch`; Task 12 adds the
-//! rest.
+//! The Approvals window's commands (C.10 + Δ1, §5.6). M6 T10: `preview_fetch`, T11: `raw_page`;
+//! Task 12 adds the rest.
 
 use atlas_duck_core::{CandidateRev, DecisionApi};
 use atlas_duck_preview::render::raw::incomplete_tail;

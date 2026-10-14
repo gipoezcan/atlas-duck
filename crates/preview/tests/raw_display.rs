@@ -22,6 +22,35 @@ fn raw_display_marks_bidi_and_invisible_and_the_delimiters() {
 }
 
 #[test]
+fn raw_display_marks_control_and_line_separator_characters() {
+    let d = raw_display_last("a\u{0}b\u{1B}c\u{85}d\u{2028}e".as_bytes(), &[]);
+    assert_eq!(d.text, "a⟨U+0000⟩b⟨U+001B⟩c⟨U+0085⟩d⟨U+2028⟩e");
+}
+
+/// Documented in `raw.rs`: the end of a page looks like a line end, so spaces and a CR right
+/// before a boundary are marked, although they would not be in the middle of a line.
+#[test]
+fn spaces_and_cr_before_a_page_boundary_are_over_marked() {
+    assert_eq!(raw_display(b"a  ", &[]).text, "a⟨U+0020⟩⟨U+0020⟩");
+    assert_eq!(raw_display(b"a\r", &[]).text, "a⟨U+000D⟩");
+    // The same bytes in the middle of a line.
+    assert_eq!(raw_display_last(b"a  b", &[]).text, "a  b");
+}
+
+/// Documented in `raw.rs`: emoji sequences are classified per page, so a ZWJ sequence cut by a
+/// boundary has its ZWJ marked on the page, which the unsplit text does not do (the safe side).
+#[test]
+fn a_zwj_sequence_cut_by_a_boundary_is_over_marked() {
+    let whole = "👩\u{200D}💻";
+    assert_eq!(raw_display_last(whole.as_bytes(), &[]).text, whole);
+    let cut = whole.find('\u{200D}').map(|i| i + '\u{200D}'.len_utf8());
+    let (a, b) = whole.split_at(cut.unwrap_or(0));
+    let first = raw_display(a.as_bytes(), &[]);
+    let second = raw_display_last(b.as_bytes(), &first.carry_out);
+    assert_eq!(format!("{}{}", first.text, second.text), "👩⟨U+200D⟩💻");
+}
+
+#[test]
 fn raw_display_utf8_split_carried() {
     let emoji = "😀".as_bytes();
     assert_eq!(emoji.len(), 4);
@@ -93,6 +122,10 @@ fn incomplete_tail_is_only_a_valid_prefix() {
     // A lone continuation byte, or a complete character, is not a tail.
     assert_eq!(incomplete_tail(b"a\x98"), b"");
     assert_eq!(incomplete_tail("€".as_bytes()), b"");
+    // A prefix that no valid sequence continues (overlong, surrogate, above U+10FFFF).
+    assert_eq!(incomplete_tail(b"a\xE0\x80"), b"");
+    assert_eq!(incomplete_tail(b"a\xED\xA0"), b"");
+    assert_eq!(incomplete_tail(b"a\xF4\x90"), b"");
     assert_eq!(raw::MAX_CARRY_BYTES, 3);
 }
 

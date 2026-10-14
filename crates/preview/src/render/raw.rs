@@ -6,6 +6,10 @@
 //!   spaces and tabs of a line, as `⟨U+000D⟩`, `⟨U+0020⟩`, `⟨U+0009⟩`. A page boundary inside a
 //!   line makes the end of the page look like a line end, so spaces right before the boundary are
 //!   marked as trailing: a mark that is there for a space is never missing.
+//! - Emoji sequences (ZWJ, VS16) are classified per page, so one cut by a boundary can be marked
+//!   on a page although the unsplit text does not mark it (the safe direction), and overlapping
+//!   RGI sequences can match differently; the bytes are shown either way, but the marks of such a
+//!   sequence can differ from the header counts.
 //! - Bytes that are not UTF-8 are shown as `⟨0xFF⟩` (one per byte). The delimiters `⟨` and `⟩` of
 //!   the text itself are escaped, so a marker is never forged by the candidate's own text.
 //! - A UTF-8 sequence cut by the page boundary is carried: the page before ends ahead of it (its
@@ -78,8 +82,9 @@ fn display(bytes: &[u8], carry: &[u8], last: bool) -> RawDisplay {
                     Ok(s) => escaped.push_str(&invisible::escape_for_display(s)),
                     Err(_) => push_bytes(&mut escaped, valid),
                 }
-                // `error_len` None: an incomplete sequence at the very end (only the last page
-                // gets here, the others carried it).
+                // `error_len` None: an incomplete sequence at the very end of the body. The last
+                // page gets here with its tail; so does a page whose body ends in an incomplete
+                // sequence that a carried lead byte follows (`C3` + carried `F0 9F`).
                 let bad = e.error_len().unwrap_or(after.len()).min(after.len());
                 let (bad_bytes, next) = after.split_at(bad);
                 push_bytes(&mut escaped, bad_bytes);

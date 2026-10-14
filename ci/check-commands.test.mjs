@@ -138,7 +138,7 @@ test("delta1_table_covers_seven_windows_and_listeners_are_labels", () => {
   assert.deepEqual(Object.keys(WINDOW_COMMANDS).sort(), [...LABELS].sort());
   for (const l of LISTENING_WINDOWS) assert.ok(LABELS.includes(l), l);
   // Decision commands only in approvals, secret commands only in credential (§10.3).
-  for (const c of ["decide", "decide_batch", "deny_batch", "deny_session", "preview_fetch"]) {
+  for (const c of ["decide", "decide_batch", "deny_batch", "deny_session", "preview_fetch", "raw_page"]) {
     assert.deepEqual(LABELS.filter((l) => WINDOW_COMMANDS[l].includes(c)), ["approvals"], c);
   }
   assert.deepEqual(LABELS.filter((l) => WINDOW_COMMANDS[l].includes("submit_secret")), ["credential"]);
