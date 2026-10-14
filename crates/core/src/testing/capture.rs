@@ -42,40 +42,108 @@ pub struct Captured {
     pub json: String,
 }
 
+impl Channel {
+    const COUNT: usize = 7;
+
+    fn index(self) -> usize {
+        match self {
+            Channel::Envelope => 0,
+            Channel::Progress => 1,
+            Channel::UiEvent => 2,
+            Channel::Decision => 3,
+            Channel::Instance => 4,
+            Channel::TauriCommand => 5,
+            Channel::TauriEvent => 6,
+        }
+    }
+}
+
+/// A per-channel cap of a bounded [`Capture`]: at most `max_records` records and `max_bytes` bytes
+/// of JSON on each channel. A new record evicts that channel's oldest ones until both hold; the
+/// newest record always stays, even when it alone exceeds `max_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_records: usize,
+    pub max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    records: Vec<Captured>,
+    count: [usize; Channel::COUNT],
+    bytes: [usize; Channel::COUNT],
+    dropped: [u64; Channel::COUNT],
+}
+
 #[derive(Debug, Default)]
 pub struct Capture {
-    records: Mutex<Vec<Captured>>,
+    state: Mutex<State>,
+    limits: Option<Limits>,
 }
 
 impl Capture {
+    /// An unbounded recorder: the harness's tests sweep everything a run produced.
     pub fn new() -> Arc<Capture> {
         Arc::new(Capture::default())
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<Captured>> {
-        self.records.lock().unwrap_or_else(PoisonError::into_inner)
+    /// A recorder with a per-channel ring buffer (drop-oldest, counted by [`Capture::dropped`]):
+    /// for a process that records for its whole life and is never drained (the test-build app).
+    pub fn bounded(limits: Limits) -> Arc<Capture> {
+        Arc::new(Capture {
+            state: Mutex::default(),
+            limits: Some(limits),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records `value` as compact JSON (a value that does not serialize is recorded as `""`,
     /// which a sweep then sees as an empty record rather than missing it).
     pub fn record<T: Serialize + ?Sized>(&self, channel: Channel, value: &T) {
         let json = serde_json::to_string(value).unwrap_or_default();
-        self.lock().push(Captured { channel, json });
+        let ch = channel.index();
+        let mut s = self.lock();
+        s.count[ch] += 1;
+        s.bytes[ch] += json.len();
+        s.records.push(Captured { channel, json });
+        let Some(limits) = self.limits else {
+            return;
+        };
+        while s.count[ch] > 1
+            && (s.count[ch] > limits.max_records || s.bytes[ch] > limits.max_bytes)
+        {
+            let Some(pos) = s.records.iter().position(|c| c.channel == channel) else {
+                break;
+            };
+            let old = s.records.remove(pos);
+            s.count[ch] -= 1;
+            s.bytes[ch] -= old.json.len();
+            s.dropped[ch] += 1;
+        }
     }
 
     pub fn records(&self) -> Vec<Captured> {
-        self.lock().clone()
+        self.lock().records.clone()
     }
 
     pub fn on(&self, channel: Channel) -> Vec<Captured> {
         self.lock()
+            .records
             .iter()
             .filter(|c| c.channel == channel)
             .cloned()
             .collect()
     }
-}
 
+    /// How many records of `channel` a bounded recorder evicted (always 0 when unbounded). A
+    /// canary sweep over a recorder with drops proves nothing about the evicted records.
+    pub fn dropped(&self, channel: Channel) -> u64 {
+        self.lock().dropped[channel.index()]
+    }
+}
 /// The `RequestHandler` the harness hands out.
 pub struct CapturingHandler {
     inner: Arc<dyn RequestHandler>,
@@ -301,5 +369,60 @@ impl InstanceAdmin for CapturingInstances {
     async fn retest_token(&self, alias: &str) -> Result<ConnectionReport, AdminError> {
         let r = self.inner.retest_token(alias).await;
         self.rec(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unbounded_keeps_everything() {
+        let cap = Capture::new();
+        for i in 0..50 {
+            cap.record(Channel::Envelope, &i);
+        }
+        assert_eq!(cap.on(Channel::Envelope).len(), 50);
+        assert_eq!(cap.dropped(Channel::Envelope), 0);
+    }
+
+    #[test]
+    fn bounded_drops_oldest_per_channel_and_counts() {
+        let cap = Capture::bounded(Limits {
+            max_records: 3,
+            max_bytes: usize::MAX,
+        });
+        for i in 0..5 {
+            cap.record(Channel::TauriCommand, &i);
+            cap.record(Channel::TauriEvent, &(i * 10));
+        }
+        let cmds: Vec<String> = cap
+            .on(Channel::TauriCommand)
+            .into_iter()
+            .map(|c| c.json)
+            .collect();
+        assert_eq!(cmds, ["2", "3", "4"]);
+        assert_eq!(cap.on(Channel::TauriEvent).len(), 3);
+        assert_eq!(cap.dropped(Channel::TauriCommand), 2);
+        assert_eq!(cap.dropped(Channel::TauriEvent), 2);
+        assert_eq!(cap.dropped(Channel::Envelope), 0);
+        assert_eq!(cap.records().len(), 6);
+    }
+
+    #[test]
+    fn bounded_byte_cap_keeps_the_newest_record_even_when_oversized() {
+        let cap = Capture::bounded(Limits {
+            max_records: 100,
+            max_bytes: 15,
+        });
+        cap.record(Channel::Decision, &"aaaaaaaa");
+        cap.record(Channel::Decision, &"bbbbbbbb");
+        assert_eq!(cap.on(Channel::Decision).len(), 1);
+        assert_eq!(cap.dropped(Channel::Decision), 1);
+        cap.record(Channel::Decision, &"c".repeat(100));
+        let kept = cap.on(Channel::Decision);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].json.contains('c'));
+        assert_eq!(cap.dropped(Channel::Decision), 2);
     }
 }

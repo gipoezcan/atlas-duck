@@ -4,8 +4,11 @@ use atlas_duck_core::{AdminError, DecisionError};
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
-/// No free text from Atlassian or the agent: every variant is a fixed kind, a static field name or
-/// a core error that already serializes without content (`DecisionError`, `AdminError`).
+/// No free text from Atlassian: every variant is a fixed kind, a static field name or a core error
+/// (`DecisionError`, `AdminError`) that serializes a kind and fixed data. One exception:
+/// `DecisionError::EditRejected` carries the validator's app-generated message, which can echo
+/// values of the user's edit or of the agent's request, bounded and display-escaped by the validator;
+/// no secret or path can appear in it. The UI never renders it (it maps `kind` to fixed strings).
 ///
 /// Wire shape: `{"kind": "invalid_argument", "field": "<name>"}`, `{"kind": "not_found"}`,
 /// `{"kind": "not_ready"}`, `{"kind": "internal"}`, and the wrapped core errors nested under

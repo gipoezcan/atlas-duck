@@ -5,16 +5,19 @@
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use atlas_duck_app_lib::commands::CommandError;
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
+use atlas_duck_atlassian::ConnClass;
+use atlas_duck_audit::AuditError;
 use atlas_duck_core::payloads::InvalidReason;
+use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
-    AdminError, BatchFailure, BatchOutcome, CandidateRev, DecisionError, DecisionOutcome,
-    QueueItem, SessionKey,
+    AdminError, BatchFailure, BatchOutcome, CandidateRev, ConnectionFailure, DecisionError,
+    DecisionOutcome, QueueItem, SessionKey,
 };
-use atlas_duck_ipc::envelope::Status;
+use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
 use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
@@ -327,8 +330,23 @@ fn command_errors() -> Vec<CommandError> {
         }),
         CommandError::Decision(DecisionError::Cancelled),
         CommandError::Decision(DecisionError::NotDecidable),
+        // The one variant carrying text: an app-generated message that can echo bounded agent values.
+        CommandError::Decision(DecisionError::EditRejected(ValidationError {
+            code: ErrorCode::Validation,
+            message: "summary: must be a string (got 3)".into(),
+            details: serde_json::Map::from_iter([("path".to_owned(), json!("summary"))]),
+        })),
+        // An AuditError is reduced to its kind on the wire.
+        CommandError::Decision(DecisionError::Audit(AuditError::StorageLow)),
         CommandError::Admin(AdminError::NotFound),
         CommandError::Admin(AdminError::Cancelled),
+        CommandError::Admin(AdminError::ConnectionFailed(ConnectionFailure::Http401)),
+        CommandError::Admin(AdminError::ConnectionFailed(ConnectionFailure::Tls(
+            ConnClass::TlsUnknownIssuer,
+        ))),
+        CommandError::Admin(AdminError::ConnectionFailed(ConnectionFailure::Network(
+            ConnClass::ConnectTimeout,
+        ))),
         CommandError::Internal,
     ]
 }
@@ -385,31 +403,73 @@ fn every_preview_body_variant_has_a_fixture() -> TestResult {
     Ok(())
 }
 
+/// The fixtures of `dir` that differ from `fixtures` (compared as JSON values: a checkout's line
+/// endings do not matter), a missing or unparsable file included, and any `.json` file in `dir`
+/// no fixture owns.
+fn stale(dir: &Path, fixtures: &[(&str, Value)]) -> std::io::Result<Vec<String>> {
+    let mut stale = Vec::new();
+    for (name, v) in fixtures {
+        let on_disk = std::fs::read_to_string(dir.join(format!("{name}.json")))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        if on_disk.as_ref() != Some(v) {
+            stale.push((*name).to_owned());
+        }
+    }
+    if dir.is_dir() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let stem = path.file_stem().and_then(|s| s.to_str());
+            if path.extension().is_some_and(|e| e == "json")
+                && let Some(stem) = stem
+                && !fixtures.iter().any(|(name, _)| *name == stem)
+            {
+                stale.push(format!("{stem} (no longer emitted)"));
+            }
+        }
+    }
+    Ok(stale)
+}
+
 #[test]
 fn dto_fixtures_up_to_date() -> TestResult {
     let dir = fixtures_dir();
-    let update = std::env::var_os("UPDATE_FIXTURES").is_some_and(|v| v == "1");
-    if update {
+    let fixtures = all()?;
+    if std::env::var_os("UPDATE_FIXTURES").is_some_and(|v| v == "1") {
         std::fs::create_dir_all(&dir)?;
-    }
-    let mut stale = Vec::new();
-    for (name, v) in all()? {
-        let path = dir.join(format!("{name}.json"));
-        if update {
-            std::fs::write(&path, format!("{}\n", serde_json::to_string_pretty(&v)?))?;
-            continue;
+        for (name, v) in &fixtures {
+            let text = format!("{}\n", serde_json::to_string_pretty(v)?);
+            std::fs::write(dir.join(format!("{name}.json")), text)?;
         }
-        // Compared as JSON values: a checkout's line endings do not matter.
-        let on_disk = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-        if on_disk.as_ref() != Some(&v) {
-            stale.push(name);
-        }
+        // Never a pass: a leaked variable must not let CI go green on whatever was written.
+        panic!("fixtures rewritten; commit them and rerun without UPDATE_FIXTURES");
     }
+    let stale = stale(&dir, &fixtures)?;
     assert!(
         stale.is_empty(),
         "fixtures out of date: {stale:?}; run with UPDATE_FIXTURES=1 and commit the result"
     );
+    Ok(())
+}
+
+/// The comparison itself is not vacuous: a changed, a missing and a leftover file are each found.
+#[test]
+fn stale_detects_differences() -> TestResult {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("dto_fixtures_stale");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let fixtures = vec![("a", json!([1])), ("b", json!([2])), ("c", json!([3]))];
+    std::fs::write(dir.join("a.json"), "[1]\r\n")?;
+    std::fs::write(dir.join("b.json"), "[9]\n")?;
+    std::fs::write(dir.join("old.json"), "[]\n")?;
+    assert_eq!(
+        stale(&dir, &fixtures)?,
+        ["b", "c", "old (no longer emitted)"]
+    );
+    std::fs::write(dir.join("b.json"), "[2]")?;
+    std::fs::write(dir.join("c.json"), "[3]")?;
+    std::fs::remove_file(dir.join("old.json"))?;
+    assert!(stale(&dir, &fixtures)?.is_empty());
+    std::fs::remove_dir_all(&dir)?;
     Ok(())
 }

@@ -5,10 +5,25 @@
 
 use std::sync::Arc;
 
-use atlas_duck_core::testing::capture::{Capture, Channel};
+use atlas_duck_core::testing::capture::{Capture, Channel, Limits};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Manager, Runtime};
+
+/// The cap per channel of the app's recorder. The app records for its whole life and nothing
+/// drains it, so each channel is a ring buffer: the newest 1 024 records or 32 MiB of JSON
+/// (`raw_page` and `preview_fetch` responses are up to 4 MiB each), whichever is hit first;
+/// older ones are dropped and counted (`Capture::dropped`). A sweep that must see every record
+/// asserts `dropped(..) == 0` first.
+pub const LIMITS: Limits = Limits {
+    max_records: 1024,
+    max_bytes: 32 << 20,
+};
+
+/// The bounded recorder the test-build app installs.
+pub fn bounded() -> Arc<Capture> {
+    Capture::bounded(LIMITS)
+}
 
 /// The recorder an app instance writes to (managed state).
 pub struct TauriCapture(pub Arc<Capture>);

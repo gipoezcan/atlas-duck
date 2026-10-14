@@ -67,12 +67,9 @@ pub fn run_gui(background: bool) -> ! {
         // empty (§10.3), so no webview can call its commands.
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
-            // S-16 (test build only): command responses and event payloads are recorded.
+            // S-16 (test build only): command responses and event payloads are recorded, in a bounded\n            // ring buffer per channel (nothing drains it).
             #[cfg(feature = "scripted-approver")]
-            commands::capture::install(
-                app.handle(),
-                atlas_duck_core::testing::capture::Capture::new(),
-            );
+            commands::capture::install(app.handle(), commands::capture::bounded());
 
             // macOS menu-bar app, no Dock icon (§2.5).
             #[cfg(target_os = "macos")]

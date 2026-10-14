@@ -52,6 +52,25 @@
   },
   {
     "error": {
+      "error": {
+        "code": "validation",
+        "details": {
+          "path": "summary"
+        },
+        "message": "summary: must be a string (got 3)"
+      },
+      "kind": "edit_rejected"
+    },
+    "kind": "decision"
+  },
+  {
+    "error": {
+      "kind": "audit"
+    },
+    "kind": "decision"
+  },
+  {
+    "error": {
       "kind": "not_found"
     },
     "kind": "admin"
@@ -59,6 +78,35 @@
   {
     "error": {
       "kind": "cancelled"
+    },
+    "kind": "admin"
+  },
+  {
+    "error": {
+      "failure": {
+        "kind": "http_401"
+      },
+      "kind": "connection_failed"
+    },
+    "kind": "admin"
+  },
+  {
+    "error": {
+      "failure": {
+        "class": "TlsUnknownIssuer",
+        "kind": "tls"
+      },
+      "kind": "connection_failed"
+    },
+    "kind": "admin"
+  },
+  {
+    "error": {
+      "failure": {
+        "class": "ConnectTimeout",
+        "kind": "network"
+      },
+      "kind": "connection_failed"
     },
     "kind": "admin"
   },

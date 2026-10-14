@@ -102,7 +102,7 @@ fn unknown_field_rejected_before_handler() -> TestResult {
     let app = app()?;
     #[cfg(feature = "scripted-approver")]
     let cap = {
-        let cap = atlas_duck_core::testing::capture::Capture::new();
+        let cap = commands::capture::bounded();
         commands::capture::install(app.handle(), cap.clone());
         cap
     };
@@ -126,6 +126,7 @@ fn unknown_field_rejected_before_handler() -> TestResult {
         assert!(recorded.iter().all(|c| c.json.contains("invalid_argument")));
         assert_eq!(invoke(&w, "app_status", json!({})), Ok(json!([])));
         assert_eq!(cap.on(Channel::TauriCommand).len(), 5);
+        assert_eq!(cap.dropped(Channel::TauriCommand), 0);
     }
     Ok(())
 }
@@ -214,11 +215,12 @@ fn dto_bounds() -> TestResult {
 #[test]
 fn s16_tauri_capture_records_every_response_and_event() -> TestResult {
     use atlas_duck_app_lib::ui_sink::TauriUiSink;
-    use atlas_duck_core::testing::capture::{Capture, Channel};
+    use atlas_duck_core::testing::capture::Channel;
     use atlas_duck_core::{UiEvent, UiSink};
 
     let app = app()?;
-    let cap = Capture::new();
+    // The recorder the test-build app installs: the sweep below is only meaningful if it dropped nothing.
+    let cap = commands::capture::bounded();
     assert!(commands::capture::install(app.handle(), cap.clone()));
     let w = window(&app, "approvals")?;
 
@@ -238,5 +240,7 @@ fn s16_tauri_capture_records_every_response_and_event() -> TestResult {
         json!({"event": "queue_changed", "payload": {"request_ids": [id]}})
     );
     assert_eq!(cap.records().len(), 2);
+    assert_eq!(cap.dropped(Channel::TauriCommand), 0);
+    assert_eq!(cap.dropped(Channel::TauriEvent), 0);
     Ok(())
 }
