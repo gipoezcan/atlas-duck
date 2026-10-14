@@ -27,6 +27,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use atlas_duck_ipc::build_info::APP_VERSION;
 use toml_edit::{DocumentMut, Item, Value};
@@ -259,6 +260,15 @@ pub fn save_config(path: &Path, config: &Config) -> Result<(), ConfigWriteError>
     Ok(())
 }
 
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The process-wide lock of every config read-modify-write ([`update_config`], the writers of
+/// `instances.rs`, [`instances::ensure_ids`]): two concurrent edits each load, edit and rename,
+/// and without it one edit would be lost. Never held across a dialog or an audit append.
+pub(crate) fn write_lock() -> MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// The writable config at `path`, or a new empty one when the file is absent.
 pub(crate) fn writable(path: &Path) -> Result<Config, ConfigWriteError> {
     match load_config(path)? {
@@ -280,6 +290,7 @@ pub fn update_config<E>(
     path: &Path,
     edit: impl FnOnce(&mut DocumentMut) -> Result<(), E>,
 ) -> Result<Result<(), E>, ConfigWriteError> {
+    let _guard = write_lock();
     let mut config = writable(path)?;
     if let Err(e) = edit(&mut config.doc) {
         return Ok(Err(e));

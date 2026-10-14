@@ -291,7 +291,7 @@ impl Serialize for VerifyNow {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum SettingsError {
     /// Out of bounds, a key named twice, too many changes, or a key `record_app_change` may not
     /// use. Nothing happened.
@@ -336,6 +336,17 @@ impl std::fmt::Display for SettingsError {
     }
 }
 
+/// `{:?}` is the kind too (and the key of `Invalid`): the derived text would carry the
+/// `AuditError`'s, which can name paths.
+impl std::fmt::Debug for SettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid { key } => write!(f, "SettingsError::Invalid({key})"),
+            _ => write!(f, "SettingsError::{}", self.kind()),
+        }
+    }
+}
+
 impl std::error::Error for SettingsError {}
 
 /// `{kind, key?, banner?}`: no error text.
@@ -367,9 +378,13 @@ pub trait SettingsAdmin: Send + Sync {
     fn prune_backlog_now(&self) -> Result<PruneReport, SettingsError>;
     /// `Store::try_full_verify`; an error is `DidNotComplete` (M2 handoff), never a pass.
     fn verify_now(&self) -> VerifyNow;
-    /// An app-owned setting changed (attention mode from the tray, CLI install, "Prepare for
-    /// removal"): one `CONFIG_CHANGED {source: app, key, old, new, applied: true}`. `Ok` once it
-    /// committed (the app acts after it: audit before effect).
+    /// An app-owned setting changed (CLI install, "Prepare for removal"): one
+    /// `CONFIG_CHANGED {source: app, key, old, new, applied: true}`. `Ok` once it committed (the
+    /// app acts after it: audit before effect). Presentation mode is not one of these: it is
+    /// in-memory session state of the attention engine, never persisted, never recorded, and
+    /// never routed through `apply`; the persisted `attention_mode` key is only its default.
+    /// There is no failure record: an app effect that fails afterwards appends a second call
+    /// with `new = old`.
     fn record_app_change(&self, key: &str, old: Value, new: Value) -> Result<(), SettingsError>;
 }
 
@@ -408,6 +423,14 @@ fn banner(cfg: &ConfigState) -> Option<ConfigBanner> {
                 shown_version(info)
             ),
         }),
+        // No schema and not parsed: the file could not be read at all (an I/O error, or no
+        // structure to read a version from); "a newer atlas-duck" would be wrong for it.
+        ConfigState::Unreadable { info } if info.schema_version.is_none() && !info.parsed => {
+            Some(ConfigBanner {
+                kind: "unreadable",
+                text: "config could not be read; settings unavailable until it can be".to_owned(),
+            })
+        }
         ConfigState::Unreadable { info } => Some(ConfigBanner {
             kind: "unreadable",
             text: format!(
@@ -584,11 +607,19 @@ fn set_key(doc: &mut DocumentMut, table: &str, key: &str, v: Option<toml_edit::V
     true
 }
 
+/// `CONFIG_CHANGED.reason` of the corrective record after a failed `config.toml` write.
+pub const REASON_CONFIG_WRITE_FAILED: &str = "config_write_failed";
+
 /// The `CONFIG_CHANGED {source: app}` of a file-backed change, with the confirmation's dialog hash
-/// like the store's own settings records.
+/// like the store's own settings records. The corrective `applied: false` record (the file write
+/// failed after the `applied: true` one committed) carries `reason: "config_write_failed"`, which
+/// links it to that record and tells it from a refused change.
 fn record(p: &Planned, confirmed: Option<&Confirmed>, applied: bool) -> NewEvent {
     let mut ev = payloads::config_changed(ConfigSource::App, p.req.key(), &p.old, &p.new, applied);
     if let Value::Object(o) = &mut ev.payload {
+        if !applied {
+            o.insert("reason".into(), REASON_CONFIG_WRITE_FAILED.into());
+        }
         o.insert(
             "confirmed".into(),
             confirmed.map_or(
@@ -819,7 +850,9 @@ impl CoreSettings {
                 if let Some((table, v)) = file_value(&p.req)
                     && !set_key(doc, table, p.req.key(), v)
                 {
-                    return Err(SettingsError::Invalid { key: p.req.key() });
+                    // The table is not a table: the records already committed, so this is a
+                    // failed write, not "nothing happened".
+                    return Err(SettingsError::ConfigWrite);
                 }
             }
             Ok(())
@@ -1037,6 +1070,29 @@ mod tests {
         assert_eq!(
             ro(Some("x\u{202E}; settings fine")),
             "config written by a newer atlas-duck could not be read; upgrade atlas-duck"
+        );
+        // An I/O error (no schema, not parsed) is not "a newer atlas-duck".
+        let io = banner(&ConfigState::Unreadable {
+            info: ConfigReadOnly {
+                schema_version: None,
+                parsed: false,
+                written_by: None,
+            },
+        })
+        .map(|b| b.text);
+        assert_eq!(
+            io.as_deref(),
+            Some("config could not be read; settings unavailable until it can be")
+        );
+    }
+
+    #[test]
+    fn settings_error_debug_is_the_kind_only() {
+        let e = SettingsError::Invalid { key: "k" };
+        assert_eq!(format!("{e:?}"), "SettingsError::Invalid(k)");
+        assert_eq!(
+            format!("{:?}", SettingsError::ConfigWrite),
+            "SettingsError::config_write_failed"
         );
     }
 

@@ -484,6 +484,72 @@ async fn a_failed_append_changes_nothing() -> TestResult {
     Ok(())
 }
 
+/// M6 T8 review I-1: the records commit, the file cannot take the value (`[limits]` is not a
+/// table, so `set_key` refuses it): `ConfigWrite`, a corrective `applied: false` record that
+/// names the reason, nothing changed in the file or in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_config_write_after_the_records_is_recorded_and_reported() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let broken = "schema_version = 1\nlimits = 1\n";
+    std::fs::write(h.config_path(), broken)?;
+    for change in [JiraCommentsCap(10), Mode(AttentionMode::BadgeOnly)] {
+        let key = change.key();
+        let r = apply(&s, vec![change]).await?;
+        // The attention mode lives in `[ui]`, which is a table: only the cap's write fails.
+        if key == "jira_comments_cap" {
+            assert_eq!(r.err(), Some(SettingsError::ConfigWrite));
+            let recs = config_changed(&h, key).await?;
+            let applied: Vec<_> = recs.iter().map(|p| p["applied"].clone()).collect();
+            assert_eq!(applied, [json!(true), json!(false)], "{recs:?}");
+            assert!(recs[0].get("reason").is_none());
+            assert_eq!(recs[1]["reason"], "config_write_failed");
+            assert_eq!(recs[1]["old"], recs[0]["old"]);
+            assert_eq!(recs[1]["new"], recs[0]["new"]);
+            assert_eq!(std::fs::read_to_string(h.config_path())?, broken);
+            assert_eq!(view(&s).await?.limits.jira_comments_cap, 100);
+        } else {
+            assert!(r.is_ok(), "{r:?}");
+        }
+    }
+    Ok(())
+}
+
+/// M6 T8 review I-3: `SettingsAdmin` and the instance writers share one lock, so concurrent
+/// read-modify-write edits of `config.toml` all survive.
+#[test]
+fn concurrent_config_edits_all_survive() -> TestResult {
+    use atlas_duck_core::config::update_config;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "schema_version = 1\n")?;
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                for i in 0..20 {
+                    let key = format!("k_{t}_{i}");
+                    let r = update_config(&path, |doc| {
+                        doc[key.as_str()] = toml_edit::value(1);
+                        Ok::<(), ()>(())
+                    });
+                    assert!(matches!(r, Ok(Ok(()))));
+                }
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().map_err(|_| "a writer thread panicked")?;
+    }
+    let text = std::fs::read_to_string(&path)?;
+    for t in 0..8 {
+        for i in 0..20 {
+            assert!(text.contains(&format!("k_{t}_{i} = 1")), "lost k_{t}_{i}");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn settings_writes_refused_after_shutdown() -> TestResult {
     let h = Harness::jira().await?;

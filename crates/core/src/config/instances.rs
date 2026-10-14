@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use atlas_duck_registry::Product;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table, value};
 
-use super::{ConfigState, ConfigWriteError, load_config, save_config, writable};
+use super::{ConfigState, ConfigWriteError, load_config, save_config, writable, write_lock};
 use crate::ids::InstanceId;
 use crate::proxy::ProxySetting;
 
@@ -239,6 +239,7 @@ fn write_error(e: ConfigWriteError) -> io::Error {
 /// a malformed `[[instances]]` list is left alone (it is refused as a whole). Nothing is written
 /// when every table already has an id.
 pub fn ensure_ids(path: &Path) -> io::Result<()> {
+    let _guard = write_lock();
     let state = load_config(path)?;
     if instances(&state).is_err() {
         return Ok(());
@@ -290,6 +291,7 @@ fn to_table(inst: &InstanceConfig) -> Table {
 /// Appends `inst` as a new `[[instances]]` table (the caller validated it: alias unique, id set,
 /// URL normalized and confirmed, Task 25) and writes the file atomically.
 pub fn add_instance(path: &Path, inst: &InstanceConfig) -> Result<(), ConfigWriteError> {
+    let _guard = write_lock();
     let mut config = writable(path)?;
     let doc = &mut config.doc;
     if doc.get(KEY_INSTANCES).is_none() {
@@ -310,6 +312,7 @@ pub fn set_proxy_setting(
     id: &str,
     proxy: &ProxySetting,
 ) -> Result<bool, ConfigWriteError> {
+    let _guard = write_lock();
     let mut config = writable(path)?;
     let Some(t) = config
         .doc
@@ -333,6 +336,7 @@ pub fn set_proxy_setting(
 
 /// Sets `base_url` of the instance with `id`; `Ok(false)` when no table has that id.
 pub fn set_base_url(path: &Path, id: &str, url: &str) -> Result<bool, ConfigWriteError> {
+    let _guard = write_lock();
     let mut config = writable(path)?;
     let Some(t) = config
         .doc
