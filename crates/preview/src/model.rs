@@ -10,14 +10,17 @@ use crate::warning::Warning;
 /// Size of one Raw page; the bytes themselves stay in core (C.7 `RawPage`).
 pub const RAW_PAGE_BYTES: u64 = 256 * 1024;
 
-/// Names the classifier's Unicode and emoji table versions so counts are reproducible (§6.4, §8.3,
-/// V31). Both are literals read from the pinned crates; `tests/invisible.rs` checks them:
+/// Names the preview builder and the classifier's Unicode and emoji table versions so counts are
+/// reproducible (§6.4, §8.3, V31). `renderN` is the `render` document's version (M6 T10): every
+/// change to the document's output bumps it. The table versions are literals read from the
+/// pinned crates; `tests/invisible.rs` checks them:
 /// - `icu-17.0`: `icu_properties_data` 2.3.0 README "generated with CLDR version 48.2.1, ICU
 ///   version release-78.1rc"; ICU 78 is the Unicode 17.0 release, and the data assigns U+10940
 ///   to Sidetic (new in 17.0).
 /// - `emoji-17.0`: `emojis` 0.9.0 README "Uses Unicode v17.0 emoji specification"
 ///   (`emojis::UNICODE_VERSION`).
-pub const PREVIEW_BUILDER_VERSION: &str = concat!("pb1;icu-", "17.0", ";emoji-", "17.0");
+pub const PREVIEW_BUILDER_VERSION: &str =
+    concat!("pb2;render", "1", ";icu-", "17.0", ";emoji-", "17.0");
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
 pub const ERROR_TEXT_CAP_BYTES: usize = 2048;

@@ -13,6 +13,17 @@ pub enum Platform {
     Windows,
 }
 
+impl Platform {
+    /// The platform this build runs on.
+    pub fn current() -> Platform {
+        if cfg!(windows) {
+            Platform::Windows
+        } else {
+            Platform::MacOsLinux
+        }
+    }
+}
+
 /// §6.4 (verbatim): `tauri://localhost` on macOS/Linux, `http://tauri.localhost` on Windows.
 pub fn app_origin(p: Platform) -> &'static str {
     match p {
@@ -69,8 +80,17 @@ const TAGS: &[&str] = &[
     "img",
 ];
 
-fn builder(keep_links: bool) -> ammonia::Builder<'static> {
+/// The renderer's structural elements (`preview::render`, PD-67): allowed in the document pass of
+/// [`iframe_document`] only, never in [`sanitize_html`], so a `*_html` string (sanitized before
+/// it is embedded) cannot bring a `<section>` that passes for the Caution strip or a `<mark>` that
+/// passes for an escape.
+const DOCUMENT_TAGS: &[&str] = &["header", "section", "mark"];
+
+fn builder(keep_links: bool, document: bool) -> ammonia::Builder<'static> {
     let mut tags: HashSet<&'static str> = TAGS.iter().copied().collect();
+    if document {
+        tags.extend(DOCUMENT_TAGS);
+    }
     let mut attrs: HashMap<&'static str, HashSet<&'static str>> = HashMap::from([
         ("img", HashSet::from(["src", "alt"])),
         ("td", HashSet::from(["colspan", "rowspan"])),
@@ -212,19 +232,37 @@ fn links_to_text(clean: &str) -> String {
 pub fn sanitize_html(html: &str) -> String {
     static LINKS: OnceLock<ammonia::Builder<'static>> = OnceLock::new();
     static FINAL: OnceLock<ammonia::Builder<'static>> = OnceLock::new();
-    let first = LINKS.get_or_init(|| builder(true)).clean(html).to_string();
+    let first = LINKS
+        .get_or_init(|| builder(true, false))
+        .clean(html)
+        .to_string();
     FINAL
-        .get_or_init(|| builder(false))
+        .get_or_init(|| builder(false, false))
+        .clean(&links_to_text(&first))
+        .to_string()
+}
+
+/// [`sanitize_html`] with the renderer's structural elements ([`DOCUMENT_TAGS`]) allowed too.
+fn sanitize_document(html: &str) -> String {
+    static LINKS: OnceLock<ammonia::Builder<'static>> = OnceLock::new();
+    static FINAL: OnceLock<ammonia::Builder<'static>> = OnceLock::new();
+    let first = LINKS
+        .get_or_init(|| builder(true, true))
+        .clean(html)
+        .to_string();
+    FINAL
+        .get_or_init(|| builder(false, true))
         .clean(&links_to_text(&first))
         .to_string()
 }
 
 /// The `srcdoc` document: meta CSP is the first `<head>` element, then the bundled stylesheet.
-/// The body is sanitized again here (idempotent), so a caller that forgot cannot open a hole.
-/// The UI sets `sandbox=""` on the iframe.
+/// The body is sanitized again here (idempotent), so a caller that forgot cannot open a hole;
+/// this pass also keeps the renderer's `header`, `section` and `mark`. The UI sets `sandbox=""`
+/// on the iframe.
 pub fn iframe_document(body_html: &str, platform: Platform) -> String {
     let origin = app_origin(platform);
-    let body = sanitize_html(body_html);
+    let body = sanitize_document(body_html);
     format!(
         "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" \
          content=\"default-src 'none'; style-src {origin}/preview.css; img-src data:\">\

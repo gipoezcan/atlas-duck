@@ -6,6 +6,7 @@ pub mod invisible;
 mod json_tree;
 pub mod mixed_script;
 mod model;
+pub mod render;
 mod sanitize;
 pub mod warning;
 
