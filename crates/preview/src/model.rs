@@ -63,6 +63,30 @@ pub struct Preview {
     pub preview_builder_version: String,
     /// §5.4 step 4: the editable inputs of a write preview; `None` where there is no edit step.
     pub edit_form: Option<EditForm>,
+    /// PD-70: exactly the deny details core accepts for this revision (the UI offers no other;
+    /// core still checks every decision). Empty for reads and scripts.
+    pub deny_offers: Vec<DenyOffer>,
+    /// PD-70: the text the deny reason field starts with (a conflict hold's fixed prefill).
+    pub deny_prefill: Option<String>,
+}
+
+/// One deny detail the approver may attach (PD-70, C.7 `DenyDetails`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DenyOffer {
+    pub kind: DenyOfferKind,
+    /// The detail has an optional part the approver may include (messages, candidates,
+    /// allowed values); `false` when including it would change nothing.
+    pub has_optional_detail: bool,
+}
+
+/// The `DenyDetails` kinds (§5.4 step 2, §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenyOfferKind {
+    UpstreamHttp,
+    OutcomeHint,
+    ResolutionFailed,
+    MissingFields,
 }
 
 /// §6.1 item 3 plus the classifier counts (§6.4).
@@ -82,6 +106,9 @@ pub struct PreviewHeader {
     /// The effective query as sent, display-escaped (§6.3: a Confluence search shows its CQL
     /// after the §7.4 rewrite, `jira.search` its JQL); `None` for keyed ops.
     pub query: Option<String>,
+    /// M5 M-11: the Caution banner of a candidate that failed closed (§5.2: only Deny remains);
+    /// core's fixed text, `None` otherwise.
+    pub release_blocked: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

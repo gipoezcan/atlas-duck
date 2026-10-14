@@ -72,7 +72,8 @@ pub use atlas_duck_preview::CandidateRev;
 pub use credentials::KeychainCredentials;
 pub use decision::{
     BatchFailure, BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionKind,
-    DecisionOutcome, DenyDetails, PreviewDelivery, QueueItem, RawPage, SessionKey,
+    DecisionOutcome, DenyDetails, PreviewDelivery, QueueItem, RELEASE_BLOCKED_INTERNAL, RawPage,
+    RecentItem, RedactionReport, SessionKey,
 };
 pub use edit::Edits;
 pub use engine::script::{

@@ -461,14 +461,17 @@ pub const MSG_CHOICE_NO_VALUE: &str =
 /// T12 review I1: the UI sends the label it showed for a pre-added `Choice` input; before the
 /// edit is applied each such label becomes the Jira value it stands for ([`missing_kind`]). A
 /// label the input does not list, lists twice, or has no Jira value for refuses the edit
-/// (nothing logged, like invalid params). Any other value passes as it is (the raw-JSON editor,
-/// §5.4 step 4).
-pub(crate) fn choice_edits(form: &EditForm, edits: &Edits) -> Result<Edits, ValidationError> {
+/// (nothing logged, like invalid params). M5 M-12: at the input of an `array` field (a
+/// multi-pick, `missing`'s `schema_type`), an array's string entries are labels too, each mapped
+/// the same way; their wire values (each already an array, `AllowedValue::wire`) are joined
+/// into one array. Any other value passes as it is (the raw-JSON editor, §5.4 step 4).
+pub(crate) fn choice_edits(
+    form: &EditForm,
+    missing: &[MissingField],
+    edits: &Edits,
+) -> Result<Edits, ValidationError> {
     let mut out = edits.clone();
     for (path, value) in out.set.iter_mut() {
-        let Value::String(label) = &*value else {
-            continue;
-        };
         let Some(InputKind::Choice(allowed)) = form
             .inputs
             .iter()
@@ -477,21 +480,43 @@ pub(crate) fn choice_edits(form: &EditForm, edits: &Edits) -> Result<Edits, Vali
         else {
             continue;
         };
-        let wire = allowed.wire_for(label).cloned().map_err(|why| {
-            let message = match why {
-                ChoiceRefusal::NotListed => MSG_CHOICE_NOT_LISTED,
-                ChoiceRefusal::Ambiguous => MSG_CHOICE_AMBIGUOUS,
-                ChoiceRefusal::NoWireValue => MSG_CHOICE_NO_VALUE,
-            };
-            let mut details = Map::new();
-            details.insert("param".into(), Value::from(echo(path)));
-            ValidationError {
-                code: ErrorCode::Validation,
-                message: message.to_owned(),
-                details,
+        let wire_of = |label: &str| {
+            allowed.wire_for(label).cloned().map_err(|why| {
+                let message = match why {
+                    ChoiceRefusal::NotListed => MSG_CHOICE_NOT_LISTED,
+                    ChoiceRefusal::Ambiguous => MSG_CHOICE_AMBIGUOUS,
+                    ChoiceRefusal::NoWireValue => MSG_CHOICE_NO_VALUE,
+                };
+                let mut details = Map::new();
+                details.insert("param".into(), Value::from(echo(path)));
+                ValidationError {
+                    code: ErrorCode::Validation,
+                    message: message.to_owned(),
+                    details,
+                }
+            })
+        };
+        let multi = path
+            .strip_prefix("fields.")
+            .and_then(|id| missing.iter().find(|f| f.id == id))
+            .is_some_and(|f| f.schema_type == "array");
+        match &*value {
+            Value::String(label) => *value = wire_of(label)?,
+            Value::Array(entries) if multi => {
+                let mut joined = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    match entry {
+                        Value::String(label) => match wire_of(label)? {
+                            Value::Array(wire) => joined.extend(wire),
+                            wire => joined.push(wire),
+                        },
+                        other => joined.push(other.clone()),
+                    }
+                }
+                *value = Value::Array(joined);
             }
-        })?;
-        *value = wire;
+            _ => {}
+        }
     }
     Ok(out)
 }

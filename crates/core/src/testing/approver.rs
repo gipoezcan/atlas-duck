@@ -1,7 +1,7 @@
 //! `ScriptedApprover` (C.7 `core::testing`): a headless human over `DecisionApi`. Task 21 adds
 //! the read decisions (`open`, `release`, `release_redacted`, `release_status_only`, `deny`);
 //! Task 22 the write decisions (`approve`, `edit`, `deny_with`); M5 Task 12 `edit_preadded` and
-//! `choose_preadded`.
+//! `choose_preadded`; M6 Task 7 the side reads `redaction_preview` and `recent`.
 //!
 //! Every decision opens the item's current revision first (`PREVIEW_SHOWN`, §5.6), as the
 //! approvals UI does, unless the method says `unopened`. The methods block (`DecisionApi` is
@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 
 use crate::decision::{
     Decision, DecisionApi, DecisionError, DecisionKind, DecisionOutcome, DenyDetails,
-    PreviewDelivery, QueueItem,
+    PreviewDelivery, QueueItem, RecentItem, RedactionReport,
 };
 use crate::edit::Edits;
 use crate::redact::{RedactionOp, RedactionPreset};
@@ -124,6 +124,29 @@ impl ScriptedApprover {
             redactions: Some(ops),
             ..decision(request_id, DecisionKind::ReleaseRedacted, rev)
         })
+    }
+
+    /// What `ops` would do to the current revision (M6 Δ2; nothing logged). The revision must
+    /// be opened, as in the UI, where the redaction panel is part of an opened preview.
+    pub fn redaction_preview(
+        &self,
+        request_id: &str,
+        ops: &[RedactionOp],
+    ) -> Result<RedactionReport, DecisionError> {
+        let rev = self.rev(request_id)?;
+        self.decisions.redaction_preview(request_id, rev, ops)
+    }
+
+    /// The "Recently decided (24 h) / Needs attention" rows (M6 Δ2).
+    pub fn recent(&self) -> Vec<RecentItem> {
+        self.decisions.recent()
+    }
+
+    /// `request_id`'s "Recently decided" row, if listed.
+    pub fn recent_row(&self, request_id: &str) -> Option<RecentItem> {
+        self.recent()
+            .into_iter()
+            .find(|r| r.request_id == request_id)
     }
 
     /// §5.2 step 6 "Release status only" (an upstream-error item).

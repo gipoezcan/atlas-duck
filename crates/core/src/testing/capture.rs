@@ -16,11 +16,12 @@ use serde::Serialize;
 
 use crate::decision::{
     BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionOutcome,
-    PreviewDelivery, QueueItem, RawPage, SessionKey,
+    PreviewDelivery, QueueItem, RawPage, RecentItem, RedactionReport, SessionKey,
 };
 use crate::gate::{UiEvent, UiSink};
 use crate::instances::{AddInstance, AdminError, ConnectionReport, InstanceAdmin, InstanceView};
 use crate::proxy::ProxySetting;
+use crate::redact::RedactionOp;
 
 /// Which boundary a record crossed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -317,6 +318,20 @@ impl DecisionApi for CapturingDecisions {
     }
     fn acknowledge_attention(&self, request_ids: &[String]) {
         self.inner.acknowledge_attention(request_ids);
+    }
+    fn redaction_preview(
+        &self,
+        request_id: &str,
+        rev: CandidateRev,
+        ops: &[RedactionOp],
+    ) -> Result<RedactionReport, DecisionError> {
+        self.rec(self.inner.redaction_preview(request_id, rev, ops))
+    }
+    fn recent(&self) -> Vec<RecentItem> {
+        self.rec(self.inner.recent())
+    }
+    fn needs_attention(&self) -> Vec<String> {
+        self.rec(self.inner.needs_attention())
     }
 }
 

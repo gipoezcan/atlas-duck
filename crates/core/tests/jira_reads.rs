@@ -1071,6 +1071,105 @@ async fn u27_search_orphan_mirror_blocks_release() -> TestResult {
     plain_release_refused(&h, &id).await
 }
 
+/// M5 M-11: a first build the §5.3 mirror check refuses fails the item closed, and its preview
+/// carries the `internal` banner (only Deny remains); a clean candidate and a redacted revision
+/// that passes the check carry none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_first_build_internal_banner() -> TestResult {
+    use atlas_duck_core::{RELEASE_BLOCKED_INTERNAL, RedactionOp};
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mount_issue(mock, KEY, &orphan_issue()).await;
+    mount_issue(mock, "ABC-8", &full_issue("ABC-8")).await;
+    let params = json!({ "key": KEY, "fields": ["summary", "comment"], "rendered": true });
+    let id = queued(&h, params).await?;
+    let ap = h.approver();
+    let preview = ap.open(&id).map_err(de)?.preview;
+    assert!(!preview.approvable);
+    assert_eq!(
+        preview.header.release_blocked,
+        Some(RELEASE_BLOCKED_INTERNAL)
+    );
+    assert_eq!(
+        RELEASE_BLOCKED_INTERNAL,
+        "release blocked: the candidate could not be rebuilt exactly (internal); only Deny remains"
+    );
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+    // Dropping the orphan gives a revision that passes: no banner.
+    let rev = ap
+        .redact(
+            &id,
+            vec![RedactionOp::DropItem {
+                array_path: "renderedFields.comment.comments".into(),
+                key: "id".into(),
+                value: json!("9"),
+            }],
+        )
+        .map_err(de)?;
+    let shown = h.decisions().preview_fetch(&id, Some(rev)).map_err(de)?;
+    assert!(shown.preview.approvable);
+    assert_eq!(shown.preview.header.release_blocked, None);
+    // A clean issue has none from the start.
+    let clean = queued(&h, json!({ "key": "ABC-8" })).await?;
+    let preview = ap.open(&clean).map_err(de)?.preview;
+    assert!(preview.approvable);
+    assert_eq!(preview.header.release_blocked, None);
+    Ok(())
+}
+
+/// M5 M-11: a rebuild after eviction that the mirror check refuses (`Blocked`) keeps the item
+/// failed closed: no preview, nothing logged for the refusal, the release refused as
+/// `not_approvable`, Deny still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_rebuild_after_eviction_blocked() -> TestResult {
+    use atlas_duck_core::DecisionError;
+    use atlas_duck_core::payloads::InvalidReason;
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &orphan_issue()).await;
+    let id = queued(
+        &h,
+        json!({ "key": KEY, "fields": ["summary", "comment"], "rendered": true }),
+    )
+    .await?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    h.evict_candidate(&id);
+    let count = h.event_count().await?;
+    let res = ap.open(&id);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    assert_eq!(
+        h.event_count().await?,
+        count,
+        "the refused open logs nothing"
+    );
+    assert!(!h.engine().candidates().contains(&id), "nothing cached");
+    let item = ap.item(&id).ok_or("not queued")?;
+    assert!(!item.approvable);
+    let res = ap.release_unopened(&id);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let invalid = records(&h, &id, EventType::DECISION_INVALID).await?;
+    assert_eq!(
+        invalid.first().map(|r| r["reason"].clone()),
+        Some(json!("not_approvable"))
+    );
+    assert!(records(&h, &id, EventType::READ_RELEASED).await?.is_empty());
+    ap.deny_unopened(&id, "cannot be released").map_err(de)?;
+    assert_eq!(h.await_(&id, 5000).await.status, Status::Denied);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn s12_issue_preview_marks_invisible() -> TestResult {
     let h = Harness::jira().await?;

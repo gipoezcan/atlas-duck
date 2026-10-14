@@ -406,6 +406,7 @@ pub(crate) fn read_parts(
         executes_as: None,
         receipt_fields: Vec::new(),
         query: query_display(spec, ctx.params),
+        release_blocked: None,
     };
     (header, warnings)
 }
@@ -576,6 +577,7 @@ fn write_model(ctx: &PreviewCtx<'_>, view: &WriteView<'_>) -> PreviewModel {
             executes_as: None,
             receipt_fields: receipt_fields(spec),
             query: None,
+            release_blocked: None,
         },
         body,
         warnings,

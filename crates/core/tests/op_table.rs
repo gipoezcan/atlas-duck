@@ -933,6 +933,19 @@ fn executors_deterministic() -> TestResult {
     let comment = json!({"key": "ABC-1", "body": MARKDOWN});
     let r = &write_requests("jira.comment.add", &comment, None)?[0];
     assert_eq!(body_json(r)?["body"], wiki);
+    // M5 M-6: the two executors that write enrichment facts send the resolved names, never the
+    // agent's spelling: the link type `blocks` resolved to `Blocks`, the assignee `Jane` to the
+    // user name `jdoe`.
+    let link = json!({"type": "blocks", "inward": "ABC-1", "outward": "ABC-2"});
+    let r = &write_requests("jira.issuelink.create", &link, Some(&link_verdict()))?[0];
+    assert_eq!(body_json(r)?["type"], json!({"name": "Blocks"}));
+    let assign = json!({"key": "ABC-1", "assignee": "Jane"});
+    let a = write_requests("jira.issue.assign", &assign, Some(&assign_verdict()))?;
+    assert_eq!(
+        a,
+        write_requests("jira.issue.assign", &assign, Some(&assign_verdict()))?
+    );
+    assert_eq!(body_json(&a[0])?, json!({"name": "jdoe"}));
     Ok(())
 }
 

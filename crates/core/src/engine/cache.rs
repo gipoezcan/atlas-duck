@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::audit_port::AuditPort;
 use crate::payloads::body_ref_from_json;
-use crate::redact::{self, RedactionMeta, RedactionOp};
+use crate::redact::{self, BlockReason, RedactionMeta, RedactionOp};
 
 /// Estimated bytes of one map entry beside its key and value (allocator and tree overhead).
 const MAP_ENTRY_OVERHEAD: u64 = 32;
@@ -399,12 +399,42 @@ pub fn build_redacted(
     body: Value,
     ops: &[RedactionOp],
 ) -> Result<(Candidate, Option<RedactionReport>), RebuildError> {
+    let check = check_redacted(spec, body, ops)?;
+    if !check.blocked.is_empty() {
+        return Err(RebuildError::Blocked);
+    }
+    Ok((check.candidate, check.report))
+}
+
+/// What [`build_redacted`] decides on, every reason kept: the UI's `redaction_preview` shows it
+/// (M6 Δ2), so the preview and the release path cannot disagree.
+pub struct RedactionCheck {
+    /// The candidate the ops give (also when they block).
+    pub candidate: Candidate,
+    /// Empty ⇒ the release path takes these ops: the §5.3 checks of `redact::apply`, the mirror
+    /// check of a candidate without ops, and the 16 MiB release cap (`OverReleaseCap`).
+    pub blocked: Vec<BlockReason>,
+    /// `None` without ops.
+    pub report: Option<RedactionReport>,
+    /// The single-occurrence masks' "N other occurrences remain", summed.
+    pub other_occurrences: u64,
+}
+
+/// The one check behind [`build_redacted`] (see there).
+pub fn check_redacted(
+    spec: &OperationSpec,
+    body: Value,
+    ops: &[RedactionOp],
+) -> Result<RedactionCheck, RebuildError> {
     if ops.is_empty() {
-        let (c, blocked) = build_unredacted(spec, body)?;
-        if blocked {
-            return Err(RebuildError::Blocked);
-        }
-        return Ok((c, None));
+        let blocked = redact::mirror_reasons(&body, &spec.redaction_rules);
+        let candidate = Candidate::from_value(body).map_err(|_| RebuildError::Malformed)?;
+        return Ok(RedactionCheck {
+            candidate,
+            blocked,
+            report: None,
+            other_occurrences: 0,
+        });
     }
     let out = redact::apply(
         &body,
@@ -413,18 +443,22 @@ pub fn build_redacted(
         ops,
     );
     drop(body);
-    if !out.blocked.is_empty() {
-        return Err(RebuildError::Blocked);
+    let mut blocked = out.blocked;
+    let candidate = Candidate::from_value(out.released).map_err(|_| RebuildError::Malformed)?;
+    if len_u64(candidate.bytes().len()) > RELEASE_CAP_BYTES {
+        blocked.push(BlockReason::OverReleaseCap {
+            path: String::new(),
+        });
     }
-    let c = Candidate::from_value(out.released).map_err(|_| RebuildError::Malformed)?;
-    if len_u64(c.bytes().len()) > RELEASE_CAP_BYTES {
-        return Err(RebuildError::Blocked);
-    }
-    let report = RedactionReport {
-        meta: out.meta,
-        also_appears_in: out.also_appears_in,
-    };
-    Ok((c, Some(report)))
+    Ok(RedactionCheck {
+        candidate,
+        blocked,
+        report: Some(RedactionReport {
+            meta: out.meta,
+            also_appears_in: out.also_appears_in,
+        }),
+        other_occurrences: out.other_occurrences,
+    })
 }
 
 /// Rebuilds `request_id`'s candidate from its last committed candidate record (blocking: call it

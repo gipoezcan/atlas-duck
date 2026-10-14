@@ -322,9 +322,37 @@ fn describe_env(available: bool) -> DescribeEnv {
 /// One `requests list` row with the fields the filters need.
 #[derive(Debug, Clone)]
 pub(crate) struct ListRow {
-    row: RequestRow,
+    pub(crate) row: RequestRow,
     agent_name: Option<String>,
     instance_id: Option<String>,
+    /// `None` for a row of an in-memory request.
+    pub(crate) decided: Option<Decided>,
+}
+
+/// What `DecisionApi::recent` needs of a recorded row besides `requests list`'s fields (M6 Δ2),
+/// from the plaintext headers of the same scan.
+#[derive(Debug, Clone)]
+pub(crate) struct Decided {
+    pub(crate) terminal: EventType,
+    /// `"read"`, `"write"` or `"script"` (the start record's `op_class`).
+    pub(crate) op_class: Option<String>,
+    /// The latest record up to the terminal one with a decision column (else the terminal
+    /// record): when the request was decided.
+    pub(crate) decided_at: String,
+    /// The latest `WRITE_APPROVED` before the terminal record: a write's result is deliverable
+    /// for 1 h after it (§4.4).
+    pub(crate) approved_at: Option<String>,
+}
+
+/// `requests list`'s recorded rows (M6 Δ2 `DecisionApi::recent`): every request decided within
+/// 24 h whose id is not in `skip`, memoized like `requests list`'s.
+pub(crate) async fn recorded_rows(
+    engine: &Arc<Engine>,
+    skip: HashSet<String>,
+) -> Result<Vec<ListRow>, AuditError> {
+    CoreHandler::new(engine.clone())
+        .recent_rows(skip, None, None)
+        .await
 }
 
 impl CoreHandler {
@@ -476,6 +504,7 @@ impl CoreHandler {
                     },
                     agent_name: e.agent_name.clone(),
                     instance_id: (!e.instance_id.is_empty()).then(|| e.instance_id.clone()),
+                    decided: None,
                 }
             })
             .collect()
@@ -606,6 +635,22 @@ impl CoreHandler {
                         released.as_ref(),
                         start.op_class.as_deref(),
                     );
+                    let mut upto = hs.iter().filter(|h| h.seq <= terminal.seq);
+                    let decided = Decided {
+                        terminal: terminal.event_type,
+                        op_class: start.op_class.clone(),
+                        decided_at: upto
+                            .clone()
+                            .rfind(|h| h.decision.is_some())
+                            .unwrap_or(terminal)
+                            .ts_utc
+                            .clone(),
+                        approved_at: upto
+                            .rfind(|h| {
+                                h.seq < terminal.seq && h.event_type == EventType::WRITE_APPROVED
+                            })
+                            .map(|h| h.ts_utc.clone()),
+                    };
                     let row = ListRow {
                         row: RequestRow {
                             request_id: id.clone(),
@@ -621,6 +666,7 @@ impl CoreHandler {
                         },
                         agent_name: start.actor.agent_name.clone(),
                         instance_id: start.instance_id.clone(),
+                        decided: Some(decided),
                     };
                     memo.lock()
                         .unwrap_or_else(PoisonError::into_inner)

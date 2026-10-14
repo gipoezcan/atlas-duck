@@ -102,15 +102,16 @@ pub fn apply(
     if !needles.is_empty() {
         r.final_pass(&post, &every);
     }
-    let needs_confirmation = singles
+    let left: Vec<u64> = singles
         .iter()
-        .filter_map(|&(i, _)| {
-            let left = r.count_left(&post, &needles, i);
-            match left {
-                0 => None,
-                1 => Some("1 other occurrence remains".to_owned()),
-                _ => Some(format!("{left} other occurrences remain")),
-            }
+        .map(|&(i, _)| r.count_left(&post, &needles, i))
+        .collect();
+    let needs_confirmation = left
+        .iter()
+        .filter_map(|&left| match left {
+            0 => None,
+            1 => Some("1 other occurrence remains".to_owned()),
+            _ => Some(format!("{left} other occurrences remain")),
         })
         .collect();
     RedactionOutcome {
@@ -118,6 +119,7 @@ pub fn apply(
         meta: r.meta,
         blocked: dedup(r.blocked),
         needs_confirmation,
+        other_occurrences: left.iter().fold(0, |a, &n| a.saturating_add(n)),
         also_appears_in: dedup(r.also),
     }
 }

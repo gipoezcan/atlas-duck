@@ -159,6 +159,10 @@ pub enum BlockReason {
     /// parse or matches nothing (a key holding `.`, `[` or `]` cannot be addressed), a preset
     /// whose container is missing, or a single-occurrence `at` without an occurrence.
     OpTargetMissing { path: String },
+    /// M6 Δ2 addition: the redacted candidate is over the 16 MiB release cap (§5.2 step 4;
+    /// every-occurrence masks can grow a body). The whole candidate: `path` is the root (`""`).
+    /// [`apply`] never reports it; the release path's size check does (`cache::check_redacted`).
+    OverReleaseCap { path: String },
 }
 
 impl BlockReason {
@@ -169,7 +173,8 @@ impl BlockReason {
             | Self::ReencodeAmbiguous { path }
             | Self::MirrorOrphan { path }
             | Self::MirrorUnmatchable { path }
-            | Self::OpTargetMissing { path } => path,
+            | Self::OpTargetMissing { path }
+            | Self::OverReleaseCap { path } => path,
         }
     }
 
@@ -181,6 +186,7 @@ impl BlockReason {
             Self::MirrorOrphan { .. } => "MirrorOrphan",
             Self::MirrorUnmatchable { .. } => "MirrorUnmatchable",
             Self::OpTargetMissing { .. } => "OpTargetMissing",
+            Self::OverReleaseCap { .. } => "OverReleaseCap",
         }
     }
 }
@@ -206,6 +212,8 @@ pub struct RedactionOutcome {
     pub blocked: Vec<BlockReason>,
     /// Single-occurrence masks: "N other occurrences remain" (§5.3), one per such mask.
     pub needs_confirmation: Vec<String>,
+    /// The N of every `needs_confirmation` line, summed (M6 Δ2 `redaction_preview`).
+    pub other_occurrences: u64,
     /// Locations with a canonical hit for a masked/selected string (after the drops, before
     /// any mask, per mask in document order), then the locations of blocked values; no
     /// duplicates.
@@ -231,12 +239,20 @@ pub fn mirror_blocked(
     doc: &serde_json::Value,
     rules: &atlas_duck_registry::RedactionRules,
 ) -> bool {
-    if rules.mirrors.is_empty() {
-        return false;
-    }
+    !mirror_reasons(doc, rules).is_empty()
+}
+
+/// [`mirror_blocked`] with its reasons (`MirrorOrphan` / `MirrorUnmatchable`), for the UI's
+/// `redaction_preview` of a revision without ops (M6 Δ2).
+pub fn mirror_reasons(
+    doc: &serde_json::Value,
+    rules: &atlas_duck_registry::RedactionRules,
+) -> Vec<BlockReason> {
     let mut blocked = Vec::new();
-    mirror::check(doc, rules.mirrors, &[], &mut blocked);
-    !blocked.is_empty()
+    if !rules.mirrors.is_empty() {
+        mirror::check(doc, rules.mirrors, &[], &mut blocked);
+    }
+    blocked
 }
 
 /// The `url_fields`, copy and mirror paths of `rules` that do not parse in the redaction path

@@ -1521,6 +1521,7 @@ fn card(cx: &ReadContext<'_>, value: &Value, byte_size: u64, body: PreviewBody) 
             executes_as: None,
             receipt_fields: Vec::new(),
             query: query.clone(),
+            release_blocked: None,
         },
         body,
         warnings,

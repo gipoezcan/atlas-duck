@@ -18,22 +18,43 @@
 //! the normalized body as a new revision (`CandidateChanged`, inv. 5) and answers `pending`; that
 //! revision must be opened (`preview_fetch`) and then released with the same ops (or `None`).
 //! Ops that block (§5.3 checks, an outcome item) are `DECISION_INVALID {not_approvable}`.
+//!
+//! M6 Δ2 (Task 7) adds the UI's side reads: `redaction_preview` (what a set of ops would do,
+//! nothing logged), `recent` and `needs_attention` ("Recently decided (24 h) / Needs
+//! attention"), the Rust-computed deny offers of a write preview (PD-70), the `internal` banner
+//! of a candidate that failed closed (M5 M-11), and path-free session ids (PD-86).
 
 mod batch;
+mod offers;
+mod recent;
+mod redaction_preview;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
-use atlas_duck_preview::invisible::strip;
+use atlas_duck_preview::invisible::{escape_for_display, strip};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    CandidateRev, PREVIEW_BUILDER_VERSION, Preview, RAW_PAGE_BYTES, RawPager,
+    CandidateRev, PREVIEW_BUILDER_VERSION, Preview, RAW_PAGE_BYTES, RawPager, cap_error_text,
 };
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+pub use recent::RecentItem;
+pub use redaction_preview::RedactionReport;
+
+/// M5 M-11 (plan text, PD-90 banner level caution): the header banner of a candidate that failed
+/// closed (§5.2: a rebuild that does not reproduce the revision, or a first build the §5.3 mirror
+/// check refuses); Release stays disabled and only Deny remains.
+pub const RELEASE_BLOCKED_INTERNAL: &str =
+    "release blocked: the candidate could not be rebuilt exactly (internal); only Deny remains";
+
+/// PD-86 (plan text): a session's label when its agent named itself nothing.
+pub const SESSION_NO_AGENT_NAME: &str = "(no agent name)";
 
 use crate::edit::{EditError, Edits, apply_edits};
 use crate::engine::cache::{Candidate, RebuildError, build_redacted, source_body};
@@ -102,6 +123,36 @@ pub struct SessionKey {
     /// MCP only.
     pub connection_id: Option<String>,
     pub cwd_basename: String,
+}
+
+impl SessionKey {
+    /// PD-86: lowercase hex SHA-256 of the JCS object of the key, the webview's only handle on a
+    /// session (no path crosses the boundary). `peer_origin_exe` enters as the hex of its
+    /// lossless OS bytes (§8.4 WTF-8), so a path that is not UTF-8 hashes as well.
+    pub fn id(&self) -> String {
+        let exe = self
+            .peer_origin_exe
+            .as_deref()
+            .map(|p| hex::encode(atlas_duck_audit::encoding::os_path_bytes(p)));
+        let v = serde_json::json!({
+            "agent_name": self.agent_name,
+            "connection_id": self.connection_id,
+            "cwd_basename": self.cwd_basename,
+            "peer_origin_exe": exe,
+        });
+        let bytes = atlas_duck_ipc::jcs::to_jcs_vec(&v).unwrap_or_else(|_| v.to_string().into());
+        hex::encode(Sha256::digest(&bytes))
+    }
+
+    /// PD-86: what the queue shows for the session: the agent name and the `cwd_basename`, both
+    /// normalized at hello and display-escaped here; never `peer_origin_exe`.
+    pub fn label(&self) -> String {
+        let agent = self
+            .agent_name
+            .as_deref()
+            .map_or_else(|| SESSION_NO_AGENT_NAME.to_owned(), escape_for_display);
+        format!("{agent} · {}", escape_for_display(&self.cwd_basename))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +280,14 @@ pub struct QueueItem {
     /// Another request of the same op and instance that matches under the op's `similarity`
     /// rule and is pending or was decided in the last 24 h (§5.6).
     pub similar_to: Option<String>,
+    /// Never serialized (PD-86: it carries `peer_origin_exe`); the app resolves a webview's
+    /// `session_id` to it by scanning `queue_list`.
+    #[serde(skip)]
     pub session: SessionKey,
+    /// [`SessionKey::id`].
+    pub session_id: String,
+    /// [`SessionKey::label`].
+    pub session_label: String,
     pub opened: bool,
     pub approvable: bool,
     pub candidate_rev: CandidateRev,
@@ -261,6 +319,20 @@ pub trait DecisionApi: Send + Sync {
     fn deny_session(&self, session: SessionKey, reason: &str) -> Result<usize, DecisionError>;
     /// In memory, not audited.
     fn acknowledge_attention(&self, request_ids: &[String]);
+    /// M6 Δ2 (M3 handoff): what `ops` would do to revision `rev` of an opened item, as the
+    /// release path decides it (§5.3: block reasons, "also appears in", "N other occurrences
+    /// remain", the size). UI-only and never logged: no record, no `PREVIEW_SHOWN`, no state
+    /// change. Refused like `raw_page` (`NotDecidable`, `Stale`, `Invalid(NotOpened)`).
+    fn redaction_preview(
+        &self,
+        request_id: &str,
+        rev: CandidateRev,
+        ops: &[RedactionOp],
+    ) -> Result<RedactionReport, DecisionError>;
+    /// M6 Δ2: the "Recently decided (24 h) / Needs attention" rows (§5.6).
+    fn recent(&self) -> Vec<RecentItem>;
+    /// M6 Δ2: the unacknowledged "Needs attention" ids (sorted; in memory, reset on restart).
+    fn needs_attention(&self) -> Vec<String>;
 }
 
 /// The core's `DecisionApi` (reads from Task 21; writes Task 22, batches Task 23).
@@ -350,6 +422,8 @@ fn in_queue(engine: &Engine, e: &RequestEntry) -> Option<QueueItem> {
         possible_duplicate_of: flags.duplicate_of.clone(),
         similar_to: flags.similar.as_ref().map(|h| h.request_id.clone()),
         session: e.session.clone(),
+        session_id: e.session.id(),
+        session_label: e.session.label(),
         opened: m.opened(),
         approvable: st.approvable(),
         candidate_rev: current_rev(&st),
@@ -533,7 +607,8 @@ async fn read_preview(
     let c = match candidate(engine, entry).await {
         Ok(c) => c,
         Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
-        // §5.2: the item failed closed; only Deny remains (M6 shows the `internal` banner).
+        // §5.2: the item failed closed; only Deny remains. No candidate, so no preview: the UI
+        // shows `RELEASE_BLOCKED_INTERNAL` for this refusal itself (M5 M-11).
         Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
     };
     let built = {
@@ -541,12 +616,13 @@ async fn read_preview(
         if st.model.rev() != submitted || &st.candidate_hash != c.hash() {
             None
         } else {
-            st.read
-                .clone()
-                .map(|read| (read, current_rev(&st), st.approvable(), st.model.opened()))
+            st.read.clone().map(|read| {
+                let at = (current_rev(&st), st.approvable(), st.model.opened());
+                (read, at, st.rebuild_failed)
+            })
         }
     };
-    let Some((read, shown, approvable, opened)) = built else {
+    let Some((read, (shown, approvable, opened), failed)) = built else {
         return Ok(None);
     };
     let (_, cx) = read_context(engine, entry);
@@ -557,14 +633,26 @@ async fn read_preview(
         candidate_rev: shown,
         approvable,
         raw: RawPager::for_total(u64::try_from(c.bytes().len()).unwrap_or(u64::MAX)),
-        header: model.header,
+        header: blocked_header(model.header, failed),
         warnings,
         body: model.body,
         also_appears_in: read.also_appears_in.clone(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
         edit_form: None,
+        deny_offers: Vec::new(),
+        deny_prefill: None,
     };
     Ok(Some((preview, shown, opened)))
+}
+
+/// M5 M-11: a revision whose candidate failed closed (`rebuild_failed`, e.g. a read's first
+/// build the §5.3 mirror check refuses) carries the `internal` banner.
+fn blocked_header(
+    mut header: atlas_duck_preview::PreviewHeader,
+    rebuild_failed: bool,
+) -> atlas_duck_preview::PreviewHeader {
+    header.release_blocked = rebuild_failed.then_some(RELEASE_BLOCKED_INTERNAL);
+    header
 }
 
 /// A write's preview (§6.3, §5.6): the exact request list or the hold's card, led by the reason
@@ -606,6 +694,8 @@ async fn write_preview(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, submitte
         also_appears_in: Vec::new(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
         edit_form: Some(write::edit_form(entry.spec, &w)),
+        deny_offers: offers::deny_offers(entry.spec.id, &w, Some(hold)),
+        deny_prefill: (hold == Hold::Conflict).then(|| write::CONFLICT_DENY_PREFILL.to_owned()),
     };
     Some((preview, shown, opened))
 }
@@ -1022,12 +1112,13 @@ async fn script_preview(
         if st.model.rev() != submitted || &st.candidate_hash != c.hash() {
             None
         } else {
-            st.script
-                .clone()
-                .map(|s| (s, current_rev(&st), st.approvable(), st.model.opened()))
+            st.script.clone().map(|s| {
+                let at = (current_rev(&st), st.approvable(), st.model.opened());
+                (s, at, st.rebuild_failed)
+            })
         }
     };
-    let Some((script, shown, approvable, opened)) = built else {
+    let Some((script, (shown, approvable, opened), failed)) = built else {
         return Ok(None);
     };
     let model = script::preview_model(&script, &c);
@@ -1037,12 +1128,14 @@ async fn script_preview(
         candidate_rev: shown,
         approvable,
         raw: RawPager::for_total(u64::try_from(c.bytes().len()).unwrap_or(u64::MAX)),
-        header: model.header,
+        header: blocked_header(model.header, failed),
         warnings,
         body: model.body,
         also_appears_in: script.also_appears_in.clone(),
         preview_builder_version: PREVIEW_BUILDER_VERSION.to_owned(),
         edit_form: None,
+        deny_offers: Vec::new(),
+        deny_prefill: None,
     };
     Ok(Some((preview, shown, opened)))
 }
@@ -1320,7 +1413,8 @@ async fn edit_write(
     // T12 review I1: a label picked in a pre-added choice becomes the Jira value it stands for,
     // from the very form this revision shows.
     let form = write::edit_form(spec, &snap.write);
-    let edits = write::choice_edits(&form, edits).map_err(DecisionError::EditRejected)?;
+    let missing = &snap.write.verdict.missing_fields;
+    let edits = write::choice_edits(&form, missing, edits).map_err(DecisionError::EditRejected)?;
     let result = match apply_edits(
         spec,
         &agent,
@@ -1415,30 +1509,86 @@ fn resolution_message(op: &str, params: &Value, param: &str, value: &str) -> Str
     }
 }
 
-/// PD-49: a missing required field as a `missing_fields` deny hint lists it (§4.3): raw server
-/// text like resolution candidates, `allowed_values` (names only) only when the human ticked
-/// them, with `allowed_values_total` when that list is cut (T12 review M5).
-fn missing_field_detail(f: &MissingField, include_allowed_values: bool) -> Value {
+/// M5 M-8: a deny hint reaches the agent; serialized it is at most this many bytes (lists cut
+/// at item boundaries, their `*_total` counts kept).
+pub const DENY_HINT_MAX_BYTES: usize = 64 * 1024;
+
+/// Room kept beside a hint's lists for the rest of it and a `*_total` count.
+const HINT_LIST_RESERVE: usize = 256;
+
+/// M5 M-8: server text in a deny hint (field ids and names, schema types, allowed-value labels,
+/// resolution candidates, upstream messages) is stripped like an agent string (§3.3), line
+/// breaks included, before it reaches the agent.
+fn server_text(s: &str) -> String {
+    strip(s, false).0
+}
+
+fn json_len(v: &Value) -> usize {
+    serde_json::to_vec(v).map_or(usize::MAX, |b| b.len())
+}
+
+/// The longest prefix of `items` that fits `budget` serialized bytes (each with a separator).
+fn fit(items: Vec<Value>, budget: usize) -> Vec<Value> {
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    for item in items {
+        used = used.saturating_add(json_len(&item).saturating_add(1));
+        if used > budget {
+            break;
+        }
+        out.push(item);
+    }
+    out
+}
+
+fn len_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// PD-49: a missing required field as a `missing_fields` deny hint lists it (§4.3): server text
+/// like resolution candidates (stripped, M-8), `allowed_values` (names only) only when the human
+/// ticked them, at most `budget` bytes of them, with `allowed_values_total` when that list is cut
+/// (T12 review M5).
+fn missing_field_detail(f: &MissingField, include_allowed_values: bool, budget: usize) -> Value {
     let mut m = serde_json::Map::new();
-    m.insert("id".into(), Value::from(f.id.clone()));
-    m.insert("name".into(), Value::from(f.name.clone()));
-    m.insert("schema_type".into(), Value::from(f.schema_type.clone()));
+    m.insert("id".into(), Value::from(server_text(&f.id)));
+    m.insert("name".into(), Value::from(server_text(&f.name)));
+    m.insert(
+        "schema_type".into(),
+        Value::from(server_text(&f.schema_type)),
+    );
     if include_allowed_values {
-        let labels: Vec<&str> = f.allowed_values.iter().map(|v| v.label.as_str()).collect();
-        if f.allowed_total > u64::try_from(labels.len()).unwrap_or(u64::MAX) {
+        let labels: Vec<Value> = f
+            .allowed_values
+            .iter()
+            .map(|v| Value::from(server_text(&v.label)))
+            .collect();
+        let labels = fit(labels, budget);
+        if f.allowed_total > len_u64(labels.len()) {
             m.insert("allowed_values_total".into(), Value::from(f.allowed_total));
         }
-        m.insert("allowed_values".into(), serde_json::json!(labels));
+        m.insert("allowed_values".into(), Value::Array(labels));
     }
     Value::Object(m)
 }
 
 /// The hint a deny attaches (§5.4 step 2, §4.3), only one the current hold has the data for.
 fn deny_hint(entry: &RequestEntry, details: DenyDetails) -> Result<Value, DecisionError> {
-    let refuse = || edit_refused(MSG_HINT_NOT_APPLICABLE, "deny_details");
     let snap = write::snapshot(entry).ok_or(DecisionError::NotDecidable)?;
-    let failure = snap.write.failure.as_ref();
-    match (details, snap.hold) {
+    hint_for(entry.spec.id, &snap.write, snap.hold, details)
+}
+
+/// [`deny_hint`] of a write state and the hold it waits in; also what the preview's deny offers
+/// are computed by (PD-70), so an offer is exactly a hint this accepts.
+fn hint_for(
+    op_id: &str,
+    w: &write::WriteState,
+    hold: Option<Hold>,
+    details: DenyDetails,
+) -> Result<Value, DecisionError> {
+    let refuse = || edit_refused(MSG_HINT_NOT_APPLICABLE, "deny_details");
+    let failure = w.failure.as_ref();
+    match (details, hold) {
         (DenyDetails::UpstreamHttp { include_messages }, Some(Hold::EnrichmentError)) => {
             let card = failure
                 .filter(|f| f.hint == write::FailureHint::UpstreamHttp)
@@ -1447,7 +1597,8 @@ fn deny_hint(entry: &RequestEntry, details: DenyDetails) -> Result<Value, Decisi
             let mut d = serde_json::Map::new();
             d.insert("status".into(), serde_json::json!(card.status));
             if include_messages {
-                d.insert("error_messages".into(), Value::from(card.text.clone()));
+                let text = cap_error_text(&server_text(&card.text));
+                d.insert("error_messages".into(), Value::from(text));
             }
             Ok(serde_json::json!({ "code": "upstream_http", "details": d }))
         }
@@ -1465,22 +1616,27 @@ fn deny_hint(entry: &RequestEntry, details: DenyDetails) -> Result<Value, Decisi
             Ok(serde_json::json!({ "code": code, "message": message }))
         }
         (DenyDetails::ResolutionFailed { include_candidates }, Some(Hold::UnresolvedName)) => {
-            let (param, value, _, candidates) =
-                snap.write.verdict.unresolved.as_ref().ok_or_else(refuse)?;
+            let (param, value, _, candidates) = w.verdict.unresolved.as_ref().ok_or_else(refuse)?;
             let mut d = serde_json::Map::new();
             d.insert("param".into(), Value::from(param.clone()));
             d.insert("value".into(), Value::from(echo(value)));
             d.insert(
                 "message".into(),
-                Value::from(resolution_message(
-                    entry.spec.id,
-                    &snap.write.params,
-                    param,
-                    value,
-                )),
+                Value::from(resolution_message(op_id, &w.params, param, value)),
             );
             if include_candidates {
-                d.insert("candidates".into(), serde_json::json!(candidates));
+                let budget = DENY_HINT_MAX_BYTES
+                    .saturating_sub(json_len(&Value::Object(d.clone())))
+                    .saturating_sub(HINT_LIST_RESERVE);
+                let all: Vec<Value> = candidates
+                    .iter()
+                    .map(|c| Value::from(server_text(c)))
+                    .collect();
+                let listed = fit(all, budget);
+                if listed.len() < candidates.len() {
+                    d.insert("candidates_total".into(), Value::from(candidates.len()));
+                }
+                d.insert("candidates".into(), Value::Array(listed));
             }
             Ok(serde_json::json!({ "code": "resolution_failed", "details": d }))
         }
@@ -1491,23 +1647,41 @@ fn deny_hint(entry: &RequestEntry, details: DenyDetails) -> Result<Value, Decisi
             },
             Some(Hold::Preview),
         ) => {
-            let verdict = &snap.write.verdict;
+            let verdict = &w.verdict;
             if verdict.hold != Hold::Preview || verdict.missing_fields.is_empty() {
                 return Err(refuse());
             }
-            let list: Vec<Value> = verdict
-                .missing_fields
-                .iter()
-                .map(|f| missing_field_detail(f, include_allowed_values))
-                .collect();
+            // M-8: whole fields while they fit; a first field too large alone keeps the
+            // allowed values that fit.
+            let budget = DENY_HINT_MAX_BYTES.saturating_sub(HINT_LIST_RESERVE);
+            let mut used = 0usize;
+            let mut list: Vec<Value> = Vec::new();
+            for f in &verdict.missing_fields {
+                let mut detail = missing_field_detail(f, include_allowed_values, usize::MAX);
+                let n = json_len(&detail).saturating_add(1);
+                if used.saturating_add(n) > budget {
+                    if !list.is_empty() {
+                        break;
+                    }
+                    let bare = json_len(&missing_field_detail(f, false, 0));
+                    let room = budget
+                        .saturating_sub(bare)
+                        .saturating_sub(HINT_LIST_RESERVE);
+                    detail = missing_field_detail(f, include_allowed_values, room);
+                    list.push(detail);
+                    break;
+                }
+                used = used.saturating_add(n);
+                list.push(detail);
+            }
             let mut d = serde_json::Map::new();
-            // T12 review M5: a list cut at `jira::MAX_MISSING_FIELDS` says how many there are.
-            let listed = u64::try_from(list.len()).unwrap_or(u64::MAX);
-            if verdict.missing_fields_total > listed {
-                d.insert(
-                    "missing_fields_total".into(),
-                    Value::from(verdict.missing_fields_total),
-                );
+            // T12 review M5: a list cut at `jira::MAX_MISSING_FIELDS` (or by M-8) says how many
+            // there are.
+            let total = verdict
+                .missing_fields_total
+                .max(len_u64(verdict.missing_fields.len()));
+            if total > len_u64(list.len()) {
+                d.insert("missing_fields_total".into(), Value::from(total));
             }
             d.insert("missing_fields".into(), Value::Array(list));
             Ok(serde_json::json!({ "code": "denied", "details": d }))
@@ -1615,5 +1789,33 @@ impl DecisionApi for CoreDecisions {
 
     fn acknowledge_attention(&self, request_ids: &[String]) {
         self.engine.acknowledge_attention(request_ids);
+    }
+
+    fn redaction_preview(
+        &self,
+        request_id: &str,
+        rev: CandidateRev,
+        ops: &[RedactionOp],
+    ) -> Result<RedactionReport, DecisionError> {
+        let (engine, id) = (self.engine.clone(), request_id.to_owned());
+        self.engine
+            .run_sync(redaction_preview::redaction_preview(
+                engine,
+                id,
+                rev,
+                ops.to_vec(),
+            ))
+            .unwrap_or_else(|| Err(task_failed()))
+    }
+
+    fn recent(&self) -> Vec<RecentItem> {
+        let engine = self.engine.clone();
+        self.engine
+            .run_sync(recent::recent(engine))
+            .unwrap_or_default()
+    }
+
+    fn needs_attention(&self) -> Vec<String> {
+        self.engine.needs_attention()
     }
 }

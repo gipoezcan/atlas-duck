@@ -1242,6 +1242,53 @@ async fn i1_pick_without_a_jira_value_is_refused() -> TestResult {
     Ok(())
 }
 
+/// M5 M-12: a multi-pick (an `array` of `option`) takes a list of the labels shown; core sends
+/// each as its Jira value, joined into one array. A label the input does not list refuses the
+/// whole edit, nothing logged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m12_array_choice_labels_mapped() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    let page = one_page(vec![choice_field(
+        "customfield_10300",
+        "Areas",
+        json!({"type": "array", "items": "option"}),
+        json!([{"id": "1", "value": "UI"}, {"id": "2", "value": "API"}, {"value": "Docs"}]),
+    )]);
+    mount_fields_page(mock, &page).await;
+    approvable_server(mock).await;
+    let id = queued(&h, params("Three areas")).await?;
+    let path = "fields.customfield_10300";
+    // Unknown (or ambiguous) labels refuse the edit; nothing is logged, the revision stays.
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let res = h.approver().edit_preadded(&id, path, json!(["UI", "Nope"]));
+    assert!(
+        matches!(res, Err(DecisionError::EditRejected(_))),
+        "{res:?}"
+    );
+    assert!(records(&h, &id, EventType::WRITE_EDITED).await?.is_empty());
+    assert_eq!(h.approver().rev(&id).map_err(de)?, rev);
+    // The listed labels go out as one array of Jira values, in the order picked.
+    h.approver()
+        .edit_preadded(&id, path, json!(["API", "Docs", "UI"]))
+        .map_err(de)?;
+    rev_after(&h, &id, rev.counter).await?;
+    let p = preview(&h, &id)?;
+    assert!(p.approvable, "{:?}", p.warnings);
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let want = json!([{"id": "2"}, {"value": "Docs"}, {"id": "1"}]);
+    assert_eq!(
+        sent_create(mock).await?["fields"]["customfield_10300"],
+        want
+    );
+    let edited = records(&h, &id, EventType::WRITE_EDITED).await?;
+    assert_eq!(edited.len(), 1);
+    assert_eq!(edited[0]["edited"]["fields"]["customfield_10300"], want);
+    Ok(())
+}
+
 /// T12 review M5: the cuts are visible: a choice of the first 10 of 12 values says so in its
 /// label, and a deny that attaches the lists counts what they leave out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
