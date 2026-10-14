@@ -672,7 +672,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Exit criterion:** `cargo test -p atlas-duck-convert -p atlas-duck-preview -p atlas-duck-core --locked` plus `cargo test -p atlas-duck-app --features scripted-approver --test jira_flows` green: U-02, U-23 (wiki half), U-24, U-27, U-30, U-33, U-34 (Jira half); I-06 (move-op cases), I-09 (`jira.search` probe), I-18, I-22 (`meta.page`), I-23 (`recheck_failed`), I-25, I-26 (`jira.issue.transition`), I-28 (`jira.comment.add`), I-35 (Jira kinds), I-36 (`jira.issue.edit`), X-09 (Jira), X-10 (Jira gates), S-12 (Jira previews), RF-5b; env-gated live tests L-01 for V05, V06 (Jira half), V23 (Jira endpoints and SSO fronts that answer 3xx or HTML), V25 (Agile/search) are manual (no CI leg, L96): a human runs them once against a real Jira DC, and their findings update the spec and ledger if they differ.
 - **§15 resolved:** V05, V06 (Jira half), V23 (Jira half, live), V25 (Agile 1.0 and `POST /rest/api/2/search` header half); design-resolved only until the manual live run (L96), as is M3 M-16.
 - **Ledger:** L06, L12, L13, L17, L22, L25, L29, L31, L84–L96.
-- **Status:** detailed plan: 2026-10-13-atlas-duck-m05-jira-adapter.md
+- **Status:** done pending merge. Final review: `.superpowers/sdd/2026-10-13-atlas-duck-m05-jira-adapter/final-review.md`; detailed plan: 2026-10-13-atlas-duck-m05-jira-adapter.md. The PD-60 live human run (L96) is outstanding.
 
 ### M6 — Approvals UI
 
