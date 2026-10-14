@@ -21,8 +21,10 @@
 //!    op's stale rule; a change or a failed re-check returns the write to the queue
 //!    (`WRITE_STALE`), a change with a refresh started in the same critical section (T12 I-1b).
 //! 5. **Execute**: the list is re-hashed and checked against the committed approval, then sent
-//!    exactly (`send_approved_ctl`); [`settle_execution`] maps every `WriteOutcome`. A write that
-//!    may have reached the server is never retried (§5.4 step 6).
+//!    exactly (`send_approved_ctl`) under a write cover that `CoverIssuer::for_write` mints only
+//!    while this approval's `WRITE_APPROVED` is the write's latest committed one (Δ6, PD-56;
+//!    otherwise `WRITE_FAILED {internal}`, nothing sent); [`settle_execution`] maps every
+//!    `WriteOutcome`. A write that may have reached the server is never retried (§5.4 step 6).
 //!
 //! Opacity (§4.5): nothing here reaches an envelope before a decision; `executing` is the model's
 //! once `StalePassed` applied and stays until terminal (also across a version-conflict return).

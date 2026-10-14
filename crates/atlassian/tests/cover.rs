@@ -91,7 +91,7 @@ fn m18_stale_revision_cover_refused() -> TestResult {
 
 /// The probe of every other kind answers `false` for writes it was not told about.
 #[test]
-fn write_cover_probe_is_separate_from_start_records() {
+fn write_cover_probe_is_separate_from_start_records() -> TestResult {
     struct StartsOnly;
     impl CommitProbe for StartsOnly {
         fn request_committed(&self, _: &str) -> bool {
@@ -108,4 +108,5 @@ fn write_cover_probe_is_separate_from_start_records() {
     assert!(issuer.for_request("req_a").is_ok());
     assert!(issuer.for_system_fetch("fetch_a").is_ok());
     assert_eq!(issuer.for_write("req_a", 1).err(), Some(NotCommitted));
+    Ok(())
 }
