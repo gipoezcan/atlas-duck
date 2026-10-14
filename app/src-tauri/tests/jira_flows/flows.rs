@@ -12,6 +12,7 @@
 //! per-response identity check), the empty `201` and the `204`s included.
 
 use atlas_duck_atlassian::testing::{MockDc, fixtures};
+use atlas_duck_audit::EventType;
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::proto::exit_code;
 use atlas_duck_registry::Product;
@@ -110,6 +111,17 @@ async fn count_of(mock: &MockDc, method: &str) -> usize {
         .count()
 }
 
+/// Every audit record of the world, read after the app quit (the log needs the app gone).
+async fn audit(world: &World) -> Result<Vec<(EventType, Value)>> {
+    world.quit_app().await?;
+    world.audit_records()
+}
+
+/// How many records of `kind` the log holds.
+fn records_of(records: &[(EventType, Value)], kind: EventType) -> usize {
+    records.iter().filter(|(t, _)| *t == kind).count()
+}
+
 /// The three enrichment answers of a `jira.issue.create` in `ABC` with issue type `Bug`; the
 /// `Bug` createmeta marks the option field `customfield_10200` (`Team`) required (PD-49).
 async fn mount_team_stages(mock: &MockDc) {
@@ -199,6 +211,9 @@ async fn md_comment_sent_as_wiki() -> Result<()> {
     let posts = sent(mock, "POST", "/rest/api/2/issue/ABC-1/comment").await?;
     assert_eq!(posts.len(), 1, "{posts:?}");
     assert_eq!(posts[0]["body"], json!("*done* \\{toc\\}\n"));
+    let records = audit(&world).await?;
+    assert_eq!(records_of(&records, EventType::WRITE_APPROVED), 1);
+    assert_eq!(records_of(&records, EventType::WRITE_EXECUTED), 1);
     Ok(())
 }
 
@@ -248,20 +263,25 @@ async fn i18_create_missing_field_edit_and_approve() -> Result<()> {
         posts[0]["fields"]["customfield_10200"],
         json!({ "id": "10400" })
     );
+    let records = audit(&world).await?;
+    assert_eq!(records_of(&records, EventType::WRITE_EDITED), 1);
+    assert_eq!(records_of(&records, EventType::WRITE_APPROVED), 1);
     Ok(())
 }
 
 /// I-36: an edit whose `--expected` baseline differs from what the issue holds (the mock's
 /// summary is "Login page times out") is denied by the human: exit 3, `denied`, nothing written.
+/// The control differs only in `--expected` (the summary the issue holds): the human approves it
+/// and exactly one `PUT` goes out. The fixture answers the `PUT` like the `GET` (`200` with the
+/// issue); any `2xx` is a success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn i36_edit_conflict_denied_exit3() -> Result<()> {
     if !opted_in("i36_edit_conflict_denied_exit3") {
         return Ok(());
     }
     let world = jira_world().await?;
-    let r = run(
-        &world,
-        &[
+    let edit = |expected: &'static str, reason: &'static str| {
+        [
             "jira",
             "issue",
             "edit",
@@ -269,16 +289,34 @@ async fn i36_edit_conflict_denied_exit3() -> Result<()> {
             "--field",
             "summary=\"new\"",
             "--expected",
-            "{\"summary\":\"old\"}",
+            expected,
             "--reason",
-            "atlas-test:deny",
-        ],
-    )
-    .await?;
+            reason,
+        ]
+    };
+    let r = run(&world, &edit("{\"summary\":\"old\"}", "atlas-test:deny")).await?;
     assert_eq!(r.exit, 3, "{}", r.stdout);
     let env = envelope(&r)?;
     assert_eq!(env.status, Status::Denied, "{}", r.stdout);
     assert_eq!(count_of(jira(&world)?, "PUT").await, 0);
+
+    let r = run(
+        &world,
+        &edit(
+            "{\"summary\":\"Login page times out\"}",
+            "atlas-test:approve",
+        ),
+    )
+    .await?;
+    assert_eq!(r.exit, 0, "{}", r.stdout);
+    assert_eq!(envelope(&r)?.status, Status::Succeeded, "{}", r.stdout);
+    let puts = sent(jira(&world)?, "PUT", "/rest/api/2/issue/ABC-1").await?;
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!(puts[0]["fields"]["summary"], json!("new"));
+
+    let records = audit(&world).await?;
+    assert_eq!(records_of(&records, EventType::WRITE_DENIED), 1);
+    assert_eq!(records_of(&records, EventType::WRITE_APPROVED), 1);
     Ok(())
 }
 
@@ -327,6 +365,19 @@ async fn issue_get_comments_released() -> Result<()> {
         .and_then(Value::as_array)
         .ok_or_else(|| format!("no comments in {}", r.stdout))?;
     assert_eq!(comments.len(), 2, "{}", r.stdout);
+    let ids: Vec<&str> = comments
+        .iter()
+        .filter_map(|c| c.get("id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(ids, ["30000", "30001"], "{}", r.stdout);
+    let mock = jira(&world)?;
+    let endpoint = mock.path("/rest/api/2/issue/ABC-1/comment");
+    let fetched = mock
+        .received()
+        .await
+        .iter()
+        .any(|req| req.method.as_str() == "GET" && req.url.path() == endpoint);
+    assert!(fetched, "the comment endpoint was not fetched");
     Ok(())
 }
 
@@ -369,6 +420,12 @@ async fn issuelink_201_empty_succeeded() -> Result<()> {
     assert_eq!(data_at(env, &["receipt"]), Some(&json!({})), "{}", r.stdout);
     let posts = sent(mock, "POST", "/rest/api/2/issueLink").await?;
     assert_eq!(posts.len(), 1, "{posts:?}");
+    assert_eq!(posts[0]["type"]["name"], json!("Blocks"));
+    assert_eq!(posts[0]["inwardIssue"]["key"], json!("ABC-2"));
+    assert_eq!(posts[0]["outwardIssue"]["key"], json!("ABC-1"));
+    let records = audit(&world).await?;
+    assert_eq!(records_of(&records, EventType::WRITE_APPROVED), 1);
+    assert_eq!(records_of(&records, EventType::WRITE_EXECUTED), 1);
     Ok(())
 }
 
@@ -414,11 +471,20 @@ async fn unresolved_transition_deny_hint_exit3() -> Result<()> {
     assert_eq!(details.get("param"), Some(&json!("transition")));
     assert!(!details.contains_key("candidates"), "{}", r.stdout);
     assert_eq!(count_of(mock, "POST").await, 0);
+    let records = audit(&world).await?;
+    let denied: Vec<&Value> = records
+        .iter()
+        .filter(|(t, _)| *t == EventType::WRITE_DENIED)
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(denied.len(), 1, "{records:?}");
+    assert_eq!(denied[0]["hint"]["code"], json!("resolution_failed"));
+    assert_eq!(records_of(&records, EventType::WRITE_APPROVED), 0);
     Ok(())
 }
 
-/// U-02 (§7.3): 51 issues in one sprint move are refused at validation, exit 2, before anything
-/// is queued: `requests list` is empty.
+/// U-02 (§7.3): 51 issues in one sprint move are refused at validation, exit 2, after the
+/// request is received and before anything is queued: it is rejected, nothing is pending.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn u02_move_51_issues_usage_exit2() -> Result<()> {
     if !opted_in("u02_move_51_issues_usage_exit2") {
@@ -441,14 +507,19 @@ async fn u02_move_51_issues_usage_exit2() -> Result<()> {
     assert_eq!(r.exit, 2, "{}", r.stdout);
     let env = envelope(&r)?;
     assert_eq!(error_code(env)?, json!("validation"), "{}", r.stdout);
-    assert!(env.request_id.is_none(), "{}", r.stdout);
+    assert!(env.request_id.is_some(), "{}", r.stdout);
 
-    let list = run(&world, &["requests", "list"]).await?;
+    let list = run(&world, &["requests", "list", "--state", "pending"]).await?;
     assert_eq!(list.exit, 0, "{}", list.stdout);
     let rows = data_at(envelope(&list)?, &["requests"])
         .and_then(Value::as_array)
         .ok_or_else(|| format!("no request list in {}", list.stdout))?;
     assert!(rows.is_empty(), "{}", list.stdout);
     assert_eq!(count_of(jira(&world)?, "POST").await, 0);
+    let records = audit(&world).await?;
+    assert_eq!(records_of(&records, EventType::REQUEST_RECEIVED), 1);
+    assert_eq!(records_of(&records, EventType::REQUEST_REJECTED), 1);
+    assert_eq!(records_of(&records, EventType::PREVIEW_SHOWN), 0);
+    assert_eq!(records_of(&records, EventType::WRITE_APPROVED), 0);
     Ok(())
 }

@@ -267,7 +267,8 @@ fn act(approver: &ScriptedApprover, d: Directive, item: &QueueItem) -> Result<()
 }
 
 /// A deny with the first hint the hold accepts, each without its optional lists; a plain deny
-/// when none applies. A refused hint logs nothing.
+/// when none applies. A refused hint logs nothing itself; each try opens the revision first,
+/// so the open is repeated per refused hint.
 fn deny_with_hint(approver: &ScriptedApprover, id: &str) -> Result<(), DecisionError> {
     let hints = [
         DenyDetails::ResolutionFailed {
