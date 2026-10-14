@@ -765,7 +765,7 @@ pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
                     // The composite read (T9): response 0 is the issue, the rest are the comment
                     // pages, all in this one record.
                     let key = params["key"].as_str().ok_or("read without a key")?;
-                    add(m, &p, 1);
+                    add(m, &p, usize::from(pages >= 1));
                     let comments = mock.path(&format!("/rest/api/2/issue/{key}/comment"));
                     add("GET", &comments, pages.saturating_sub(1) + marker);
                 } else {
@@ -848,6 +848,16 @@ pub async fn check_coverage(h: &Harness) -> Result<usize, String> {
         if *n > have {
             return Err(format!(
                 "{} {}: {n} hits, {have} response records",
+                k.0, k.1
+            ));
+        }
+    }
+    // The other way round: a record that claims a response the instance never sent.
+    for (k, have) in &covers {
+        let n = hits.get(k).copied().unwrap_or(0);
+        if *have > n {
+            return Err(format!(
+                "{} {}: {have} response records, {n} hits",
                 k.0, k.1
             ));
         }

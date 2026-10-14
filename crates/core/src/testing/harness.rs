@@ -709,6 +709,26 @@ impl Harness {
             .map_or(0, |id| self.engine().field_cache().failures(&id))
     }
 
+    /// The server version cached for `alias` (the last connection test's; `None` = unknown).
+    pub fn instance_version(&self, alias: &str) -> Option<atlas_duck_registry::Version> {
+        self.engine()
+            .instances()
+            .by_alias(alias)
+            .and_then(|i| i.version)
+    }
+
+    /// Test seam: caches `version` for `alias` as a connection test would. The test itself
+    /// refuses a server below the floor (8.14), so a version below an op's `min_version` (8.4
+    /// for the createmeta reads) cannot be reached any other way.
+    pub fn set_instance_version(&self, alias: &str, version: atlas_duck_registry::Version) -> bool {
+        let Some(id) = self.routed_id(alias) else {
+            return false;
+        };
+        self.engine()
+            .update_instance(&id, |rt| rt.version = Some(version));
+        true
+    }
+
     /// The id the core routes `alias` to.
     fn routed_id(&self, alias: &str) -> Option<String> {
         self.engine()

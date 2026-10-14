@@ -17,11 +17,13 @@
 
 mod common;
 
-use atlas_duck_atlassian::testing::MockDc;
+use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY};
 use atlas_duck_audit::EventType;
 use atlas_duck_core::testing::Harness;
 use atlas_duck_ipc::envelope::{Envelope, Status};
-use atlas_duck_registry::{BodySource, OpClass, OperationSpec, Product, QueryValue, StatusSet};
+use atlas_duck_registry::{
+    BodySource, OpClass, OperationSpec, Product, QueryValue, StatusSet, Version,
+};
 use common::jira::{Aux, example_params, fill_path, http_method, mount_for_op};
 use common::{TestError, TestResult, de, exit, json, request_id, test_hits};
 use serde_json::{Value, json as j};
@@ -62,6 +64,116 @@ fn cases() -> Vec<Case> {
         }
     }
     out
+}
+
+/// Spec §7.3, transcribed: op id, method and path template. An oracle independent of the
+/// registry, so a wrong endpoint in the registry fails here instead of agreeing with itself.
+const SPEC_ENDPOINTS: [(&str, &str, &str); 28] = [
+    ("jira.myself", "GET", "/rest/api/2/myself"),
+    ("jira.project.list", "GET", "/rest/api/2/project"),
+    ("jira.project.get", "GET", "/rest/api/2/project/{key}"),
+    ("jira.issue.get", "GET", "/rest/api/2/issue/{key}"),
+    ("jira.search", "POST", "/rest/api/2/search"),
+    (
+        "jira.comment.list",
+        "GET",
+        "/rest/api/2/issue/{key}/comment",
+    ),
+    (
+        "jira.worklog.list",
+        "GET",
+        "/rest/api/2/issue/{key}/worklog",
+    ),
+    (
+        "jira.transition.list",
+        "GET",
+        "/rest/api/2/issue/{key}/transitions",
+    ),
+    (
+        "jira.issue.editmeta",
+        "GET",
+        "/rest/api/2/issue/{key}/editmeta",
+    ),
+    (
+        "jira.createmeta.issuetypes",
+        "GET",
+        "/rest/api/2/issue/createmeta/{project}/issuetypes",
+    ),
+    (
+        "jira.createmeta.fields",
+        "GET",
+        "/rest/api/2/issue/createmeta/{project}/issuetypes/{typeId}",
+    ),
+    ("jira.field.list", "GET", "/rest/api/2/field"),
+    (
+        "jira.issuelinktype.list",
+        "GET",
+        "/rest/api/2/issueLinkType",
+    ),
+    ("jira.attachment.meta", "GET", "/rest/api/2/attachment/{id}"),
+    (
+        "jira.user.assignable",
+        "GET",
+        "/rest/api/2/user/assignable/search",
+    ),
+    ("jira.board.list", "GET", "/rest/agile/1.0/board"),
+    (
+        "jira.sprint.list",
+        "GET",
+        "/rest/agile/1.0/board/{id}/sprint",
+    ),
+    (
+        "jira.sprint.issues",
+        "GET",
+        "/rest/agile/1.0/sprint/{id}/issue",
+    ),
+    (
+        "jira.backlog.issues",
+        "GET",
+        "/rest/agile/1.0/board/{id}/backlog",
+    ),
+    ("jira.issue.create", "POST", "/rest/api/2/issue"),
+    ("jira.issue.edit", "PUT", "/rest/api/2/issue/{key}"),
+    (
+        "jira.comment.add",
+        "POST",
+        "/rest/api/2/issue/{key}/comment",
+    ),
+    (
+        "jira.issue.transition",
+        "POST",
+        "/rest/api/2/issue/{key}/transitions",
+    ),
+    (
+        "jira.issue.assign",
+        "PUT",
+        "/rest/api/2/issue/{key}/assignee",
+    ),
+    (
+        "jira.worklog.add",
+        "POST",
+        "/rest/api/2/issue/{key}/worklog",
+    ),
+    ("jira.issuelink.create", "POST", "/rest/api/2/issueLink"),
+    (
+        "jira.sprint.move_issues",
+        "POST",
+        "/rest/agile/1.0/sprint/{id}/issue",
+    ),
+    (
+        "jira.backlog.move_issues",
+        "POST",
+        "/rest/agile/1.0/backlog/issue",
+    ),
+];
+
+/// The oracle's method and path template of `op_id`.
+fn spec_endpoint(op_id: &str) -> Result<(&'static str, &'static str), String> {
+    SPEC_ENDPOINTS
+        .iter()
+        .find(|(id, _, _)| *id == op_id)
+        .map(|(_, m, p)| (*m, *p))
+        .ok_or_else(|| format!("{op_id} is not in the spec's endpoint table"))
 }
 
 fn s(e: impl std::fmt::Debug) -> String {
@@ -119,7 +231,8 @@ fn query_of(r: &Request, name: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
-/// The requests the instance received for `case`, against the registry's declared endpoint.
+/// The requests the instance received for `case`: method and path against the spec's table,
+/// query and body against the registry's declaration.
 async fn check_shape(
     case: &Case,
     mock: &MockDc,
@@ -128,7 +241,8 @@ async fn check_shape(
 ) -> Result<(), String> {
     let spec = case.spec;
     let ep = spec.endpoint;
-    let own_path = mock.path(&fill_path(ep.path, &case.params)?);
+    let (spec_method, spec_path) = spec_endpoint(spec.id)?;
+    let own_path = mock.path(&fill_path(spec_path, &case.params)?);
     let field_path = mock.path("/rest/api/2/field");
     let all = mock.received().await;
     // Every harness fills the field-name cache once at start (PD-46), through a GET on `/field`
@@ -144,7 +258,7 @@ async fn check_shape(
             true
         })
         .collect();
-    let method = http_method(ep.method);
+    let method = spec_method;
     let own: Vec<&&Request> = hits
         .iter()
         .filter(|r| r.method.as_str() == method && r.url.path() == own_path)
@@ -274,6 +388,21 @@ async fn check_shape(
     Ok(())
 }
 
+/// What a read releases: the body its mock answers (a read is a pass-through by construction),
+/// except the composite `jira.issue.get [comments]`, whose comment pages are merged into
+/// `fields.comment` (PD-45): the `jira.comment.list` example (`startAt`, `maxResults`, `total`,
+/// `comments`).
+fn expected_read(case: &Case) -> Result<Value, String> {
+    let mut want = case.spec.result_example_json();
+    if case.spec.id == "jira.issue.get" && case.params["comments"] == j!(true) {
+        let list = atlas_duck_registry::get("jira.comment.list")
+            .ok_or("no jira.comment.list")?
+            .result_example_json();
+        want["fields"]["comment"] = list;
+    }
+    Ok(want)
+}
+
 /// Runs `case` once and checks its outcome and the wire.
 async fn run_case(case: &Case) -> Result<(), String> {
     let spec = case.spec;
@@ -294,6 +423,18 @@ async fn run_case(case: &Case) -> Result<(), String> {
                 .ok_or("no data")?;
             validates(&spec.result_schema_json(), &result)
                 .map_err(|e| format!("released result: {e}"))?;
+            let want = expected_read(case)?;
+            if spec.id == "jira.myself" {
+                // The harness identity mock (same path, mounted first) answers this read: the
+                // released result is that identity, not the registry example.
+                if result["name"] != TEST_USER || result["key"] != TEST_USER_KEY {
+                    return Err(format!("jira.myself released {result}"));
+                }
+            } else if result != want {
+                return Err(format!(
+                    "released result {result}, the instance answered {want}"
+                ));
+            }
         }
         OpClass::Write => {
             h.approver().approve(&id).map_err(|e| s(de(e)))?;
@@ -331,7 +472,12 @@ async fn run_case(case: &Case) -> Result<(), String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn x09_jira_every_op_once() -> TestResult {
     let all = cases();
-    assert!(all.len() >= 28, "only {} Jira cases", all.len());
+    // One case per op, plus the `jira.issue.get [comments]` variant.
+    assert_eq!(
+        all.len(),
+        jira_specs().len() + 1,
+        "the case list lost or gained an op"
+    );
     let mut failed = Vec::new();
     for case in &all {
         match run_case(case).await {
@@ -362,7 +508,22 @@ async fn x09_jira_every_op_once() -> TestResult {
 #[test]
 fn x09_jira_generator_covers_the_registry() -> TestResult {
     let specs = jira_specs();
-    assert!(specs.len() >= 28, "only {} Jira ops", specs.len());
+    assert_eq!(specs.len(), 28, "the Jira catalog is 28 ops (spec §7.3)");
+    // The registry's endpoints are the spec's (§7.3), op for op.
+    assert_eq!(
+        SPEC_ENDPOINTS.len(),
+        specs.len(),
+        "the oracle and the registry list other ops"
+    );
+    for spec in &specs {
+        let (m, p) = spec_endpoint(spec.id)?;
+        assert_eq!(
+            (http_method(spec.endpoint.method), spec.endpoint.path),
+            (m, p),
+            "{}: registry endpoint differs from spec §7.3",
+            spec.id
+        );
+    }
     for spec in &specs {
         let params = example_params(spec);
         validates(&spec.params_schema_json(), &params)
@@ -517,7 +678,8 @@ async fn x10_jira_unlisted_ops_are_refused() -> TestResult {
     Ok(())
 }
 
-/// A harness whose Jira instance reports `version`, with the connection test run once.
+/// A harness whose Jira instance reports `version`, with the connection test run once. The
+/// version the test recorded is asserted, so a floor test cannot pass because nothing was cached.
 async fn harness_at(version: &str) -> Result<Harness, TestError> {
     let h = Harness::jira().await?;
     let mock = h.mock("jira-main").ok_or("no jira mock")?;
@@ -526,12 +688,26 @@ async fn harness_at(version: &str) -> Result<Harness, TestError> {
         .retest_token("jira-main")
         .await
         .map_err(|e| format!("{e:?}"))?;
+    let recorded = h
+        .instance_version("jira-main")
+        .ok_or("no version recorded")?;
+    assert_eq!(
+        format!("{}.{}.{}", recorded.major, recorded.minor, recorded.patch),
+        version,
+        "the connection test recorded another version"
+    );
     Ok(h)
 }
 
-/// X-10: on an instance at the Jira floor (8.14.0) `jira.createmeta.fields` is available, and the
-/// envelope carries no version string (§7.1: below `min_version` the op does not exist and the
-/// error names the registry's version, never the instance's).
+fn available(env: &Envelope) -> Result<Value, TestError> {
+    let v = json(env)?;
+    Ok(v["data"]["available"].clone())
+}
+
+/// X-10: on an instance at the Jira connection-test floor (8.14.0) `jira.createmeta.fields`
+/// (`min_version` 8.4.0) is available, and the envelope carries no version string (§7.1: below
+/// `min_version` the op does not exist and the error names the registry's version, never the
+/// instance's).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn x10_jira_createmeta_available_on_floor() -> TestResult {
     let h = harness_at("8.14.0").await?;
@@ -551,8 +727,9 @@ async fn x10_jira_createmeta_available_on_floor() -> TestResult {
     Ok(())
 }
 
-/// X-10 over the whole Jira catalog: at the floor every op is available (each `min_version` is at
-/// or below it), `ops list --instance` says so, and no envelope shows the instance's version.
+/// X-10 over the whole Jira catalog: at the connection-test floor every op is available (each
+/// `min_version` is at or below it), `ops list --instance` says so, and no envelope shows the
+/// instance's version.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn x10_jira_every_op_available_on_floor() -> TestResult {
     let h = harness_at("8.14.0").await?;
@@ -567,5 +744,84 @@ async fn x10_jira_every_op_available_on_floor() -> TestResult {
     assert_eq!(ops.len(), jira_specs().len());
     assert!(ops.iter().all(|o| o["available"] == true), "{list}");
     assert!(!list.to_string().contains("8.14"), "{list}");
+    Ok(())
+}
+
+/// X-10 negative control, at the real `min_version` boundary: the connection test refuses a
+/// server below 8.14, so the cached version is set through the harness seam. At 8.3.9 exactly the
+/// ops with `min_version` 8.4.0 (the two createmeta reads) are unavailable, everything else is
+/// available, and no envelope names the instance's version; at 8.4.0 they are available.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x10_jira_min_version_gates_below_its_floor() -> TestResult {
+    let h = Harness::jira().await?;
+    let gated: Vec<&str> = jira_specs()
+        .iter()
+        .filter(|s| s.min_version.is_some())
+        .map(|s| s.id)
+        .collect();
+    assert_eq!(
+        gated,
+        ["jira.createmeta.issuetypes", "jira.createmeta.fields"],
+        "the ops with a min_version changed: decide X-10 for them"
+    );
+    for (version, want) in [
+        (
+            Version {
+                major: 8,
+                minor: 3,
+                patch: 9,
+            },
+            false,
+        ),
+        (
+            Version {
+                major: 8,
+                minor: 4,
+                patch: 0,
+            },
+            true,
+        ),
+    ] {
+        assert!(h.set_instance_version("jira-main", version));
+        assert_eq!(h.instance_version("jira-main"), Some(version));
+        for spec in jira_specs() {
+            let env = h.handler().ops_describe(spec.id, Some("jira-main")).await;
+            let expect = want || !gated.contains(&spec.id);
+            assert_eq!(
+                available(&env)?,
+                expect,
+                "{} at {version:?}: {}",
+                spec.id,
+                env.to_json_line()
+            );
+            assert!(
+                !json(&env)?.to_string().contains("8.3.9"),
+                "{}: the instance's version is in the envelope",
+                spec.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// An instance whose version is unknown (never tested) keeps every op available (§2.3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x10_jira_unknown_version_keeps_every_op_available() -> TestResult {
+    let h = Harness::jira().await?;
+    assert_eq!(
+        h.instance_version("jira-main"),
+        None,
+        "the harness cached a version"
+    );
+    for spec in jira_specs() {
+        let env = h.handler().ops_describe(spec.id, Some("jira-main")).await;
+        assert_eq!(
+            available(&env)?,
+            true,
+            "{}: {}",
+            spec.id,
+            env.to_json_line()
+        );
+    }
     Ok(())
 }
