@@ -483,10 +483,12 @@ fn raw_page_granted_to_approvals_only() -> TestResult {
     Ok(())
 }
 
-/// The refusal of the ACL itself: Tauri answers a plain string, the command layer an object with
-/// a `kind`.
+/// The refusal of the ACL itself: Tauri answers a plain string saying the command is "not
+/// allowed" (the command layer an object with a `kind`; a missing command another string).
 fn acl_refused(r: &Result<Value, Value>) -> bool {
-    r.as_ref().err().is_some_and(|e| e.get("kind").is_none())
+    r.as_ref()
+        .err()
+        .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed")))
 }
 
 const REQ: &str = "req_0123456789abcdefghij";
@@ -2017,7 +2019,7 @@ fn wizard_commands_granted_to_setup_only() -> TestResult {
         if takes_step {
             assert_eq!(
                 invoke(&setup, cmd, json!({})),
-                Err(json!({"kind": "invalid_argument", "field": "payload"})),
+                Err(json!({"kind": "invalid_argument", "field": "step"})),
                 "{cmd} without a step"
             );
         }
@@ -4228,7 +4230,11 @@ fn s09_permissions(capability: &Value) -> Vec<String> {
         .as_array()
         .map(|a| {
             a.iter()
-                .filter_map(|p| p.as_str().map(str::to_owned))
+                .map(|p| {
+                    p.as_str()
+                        .unwrap_or_else(|| panic!("a permission that is not a string: {p}"))
+                        .to_owned()
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -4588,6 +4594,13 @@ fn s09_unknown_field_wrong_type_out_of_bounds_rejected() -> TestResult {
             .err()
             .is_some_and(|e| e["kind"] == "invalid_argument" && e["field"].is_string())
     };
+    // The field a refusal names: the key itself (a bounded newtype) or `payload` (a plain field,
+    // or a body that is not an object), never another key.
+    let names_field = |r: &Result<Value, Value>, key: Option<&str>| {
+        r.as_ref()
+            .err()
+            .is_some_and(|e| e["field"] == "payload" || key.is_some_and(|k| e["field"] == k))
+    };
     for c in &cases {
         let w = s09_window(&app, c.window)?;
         assert!(
@@ -4599,8 +4612,8 @@ fn s09_unknown_field_wrong_type_out_of_bounds_rejected() -> TestResult {
             c.window
         );
         // Control: the valid body is not refused as an invalid argument (the handler answers
-        // `not_ready`, or for `quit`/`open_window` is not asked: they act on the app).
-        if !matches!(c.cmd, "quit" | "open_window") {
+        // `not_ready`; `quit` is not asked: it exits the app).
+        if c.cmd != "quit" {
             let r = invoke(&w, c.cmd, c.valid.clone());
             assert!(!invalid(&r), "{}: its valid body is refused: {r:?}", c.cmd);
         }
@@ -4622,6 +4635,11 @@ fn s09_unknown_field_wrong_type_out_of_bounds_rejected() -> TestResult {
         };
         let r = invoke(&w, c.cmd, body);
         assert!(invalid(&r), "{}: wrong type: {r:?}", c.cmd);
+        assert!(
+            names_field(&r, *key),
+            "{}: wrong type names another field: {r:?}",
+            c.cmd
+        );
 
         // Out of bounds.
         let (key, value) = &c.out_of_bounds;
@@ -4630,13 +4648,10 @@ fn s09_unknown_field_wrong_type_out_of_bounds_rejected() -> TestResult {
             None => s09_with(&c.valid, "pad", json!("x".repeat(1 << 20))),
         };
         let r = invoke(&w, c.cmd, body);
-        // `step` is matched against the closed set of wizard steps, never stored: a huge one is a
-        // mismatch the wizard answers (here `not_ready`, the mock app has no wizard).
-        let matched_only = matches!(c.cmd, "wizard_finish" | "wizard_skip_instances")
-            && r == Err(json!({"kind": "not_ready"}));
+        assert!(invalid(&r), "{}: out of bounds: {r:?}", c.cmd);
         assert!(
-            invalid(&r) || matched_only,
-            "{}: out of bounds: {r:?}",
+            names_field(&r, *key),
+            "{}: out of bounds names another field: {r:?}",
             c.cmd
         );
     }

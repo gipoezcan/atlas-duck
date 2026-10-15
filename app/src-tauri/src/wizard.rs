@@ -123,6 +123,21 @@ impl WizardStep {
     }
 }
 
+/// Every wire name of [`WizardStep::as_str`]: what `wizard_finish` and `wizard_skip_instances`
+/// accept as the step the page showed (`commands::dto::StepName`).
+pub const STEP_NAMES: [&str; 10] = [
+    "data_dir",
+    "existing_store",
+    "passphrase",
+    "genesis",
+    "recovery_note",
+    "instances",
+    "cli",
+    "onboarding",
+    "done",
+    "stopped",
+];
+
 /// What runs now (one at a time; a second request is `busy`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InFlight {
@@ -1277,6 +1292,8 @@ mod tests {
         ];
         let names: std::collections::BTreeSet<&str> = all.iter().map(|s| s.as_str()).collect();
         assert_eq!(names.len(), all.len());
+        // The accepted step names are exactly the wire names.
+        assert_eq!(names, STEP_NAMES.iter().copied().collect());
     }
 
     /// §8.6: the stop text is the spec's sentence, verbatim.

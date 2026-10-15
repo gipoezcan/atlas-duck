@@ -12,7 +12,7 @@
 use serde::Deserialize;
 use tauri::{AppHandle, Runtime};
 
-use super::dto::Args;
+use super::dto::{Args, StepName};
 use super::{CommandError, finish};
 use crate::wizard::{self, DirChoice, WizardState};
 
@@ -42,7 +42,7 @@ pub struct WizardBeginArgs {}
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WizardSkipInstancesArgs {
-    pub step: String,
+    pub step: StepName,
 }
 
 /// `wizard_finish {step}`: the recovery note, the CLI step or the onboarding snippet is done.
@@ -50,7 +50,7 @@ pub struct WizardSkipInstancesArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WizardFinishArgs {
-    pub step: String,
+    pub step: StepName,
 }
 
 /// `wizard_state {}` (Δ1): the step, the data dir, the refused count, the Secret Service answer,
@@ -107,7 +107,7 @@ pub async fn wizard_skip_instances<R: Runtime>(
     args: Args<WizardSkipInstancesArgs>,
 ) -> Result<WizardState, CommandError> {
     let Args(WizardSkipInstancesArgs { step }) = args;
-    let response = wizard::skip_instances(&app, &step).await;
+    let response = wizard::skip_instances(&app, step.as_str()).await;
     finish(&app, response)
 }
 
@@ -118,7 +118,7 @@ pub async fn wizard_finish<R: Runtime>(
     args: Args<WizardFinishArgs>,
 ) -> Result<WizardState, CommandError> {
     let Args(WizardFinishArgs { step }) = args;
-    let response = wizard::finish(&app, &step).await;
+    let response = wizard::finish(&app, step.as_str()).await;
     finish(&app, response)
 }
 
@@ -159,23 +159,48 @@ mod tests {
     }
 
     /// `wizard_finish` and `wizard_skip_instances` take the step the page showed, and only that:
-    /// no step is `invalid_argument`, nor is another key next to it (a path, a passphrase).
+    /// a step that is not one of the wizard's names (of any length) is `invalid_argument` with
+    /// `field: "step"`, and so is no step, nor is another key next to it (a path, a passphrase).
     #[test]
     fn finish_and_skip_take_only_the_step() {
         assert_eq!(
             parse::<WizardFinishArgs>(&json!({"step": "cli"})),
-            Ok(WizardFinishArgs { step: "cli".into() })
+            Ok(WizardFinishArgs {
+                step: StepName::new("cli").unwrap()
+            })
         );
         assert_eq!(
             parse::<WizardSkipInstancesArgs>(&json!({"step": "instances"})),
             Ok(WizardSkipInstancesArgs {
-                step: "instances".into()
+                step: StepName::new("instances").unwrap()
             })
         );
+        for name in wizard::STEP_NAMES {
+            assert!(
+                parse::<WizardFinishArgs>(&json!({"step": name})).is_ok(),
+                "{name}"
+            );
+        }
+        fn bad_step<T>() -> Result<T, CommandError> {
+            Err(CommandError::InvalidArgument { field: "step" })
+        }
         for body in [
             json!({}),
             json!({"step": 3}),
             json!({"step": null}),
+            json!({"step": "unknown"}),
+            json!({"step": "CLI"}),
+            json!({"step": ""}),
+            json!({"step": "x".repeat(1 << 20)}),
+        ] {
+            assert_eq!(parse::<WizardFinishArgs>(&body), bad_step(), "{body:.40}");
+            assert_eq!(
+                parse::<WizardSkipInstancesArgs>(&body),
+                bad_step(),
+                "{body:.40}"
+            );
+        }
+        for body in [
             json!({"step": "cli", "path": "C:\\evil"}),
             json!({"step": "cli", "secret": "canary-passphrase"}),
         ] {

@@ -148,6 +148,31 @@ impl<'de> Deserialize<'de> for Reason {
     }
 }
 
+/// A wizard step as the page names it (PD-77): one of [`crate::wizard::STEP_NAMES`], so a step
+/// of any other text or length is refused with `field: "step"` before the handler runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct StepName(String);
+
+impl StepName {
+    pub fn new(s: &str) -> Option<Self> {
+        crate::wizard::STEP_NAMES
+            .contains(&s)
+            .then(|| Self(s.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for StepName {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d).map_err(|_| refuse::<D::Error>("step"))?;
+        StepName::new(&s).ok_or_else(|| refuse("step"))
+    }
+}
+
 /// A candidate revision `{counter, candidate_hash}` with nothing else: `CandidateRev`'s own
 /// `Deserialize` (lowercase hex of exactly 32 bytes) under a closed key set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
