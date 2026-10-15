@@ -221,6 +221,22 @@ describe('PAT entry', () => {
     expect((h.root.querySelector('.result')?.textContent ?? '').length).toBeLessThan(200);
   });
 
+  it('a failure class named like an object member is an unknown class, not that member', async () => {
+    for (const cls of ['constructor', 'toString', '__proto__']) {
+      const h = await mount(PAT_CTX);
+      handlers.submit_secret = () => ({ failed: { class: cls } });
+      type(inputs(h.root)[0] as HTMLInputElement, 'x');
+      submitForm(h.root);
+      await flush();
+      const shown = h.root.querySelector('.result')?.textContent ?? '';
+      expect(shown).toContain('The operation failed');
+      expect(shown).not.toContain('native code');
+      expect(shown).not.toContain('[object');
+      h.stop();
+      h.root.remove();
+    }
+  });
+
   it('shows a user and version from the server as escaped text', async () => {
     const h = await mount(PAT_CTX);
     handlers.submit_secret = () => ({

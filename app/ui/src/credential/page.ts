@@ -116,8 +116,8 @@ function parseContext(v: unknown): Context | null {
 
 /** The text of a failure class: fixed for the known classes, escaped and cut for any other. */
 function failureText(cls: string): string {
-  const known = FAILURES[cls];
-  if (known !== undefined) return known;
+  // Own entries only: a class named `constructor` is an unknown class, not a member of `Object`.
+  if (Object.hasOwn(FAILURES, cls)) return FAILURES[cls] ?? '';
   return `The operation failed (${describe(cls, true).shown.slice(0, 64)}).`;
 }
 
