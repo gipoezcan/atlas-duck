@@ -285,18 +285,17 @@ impl<'de> Deserialize<'de> for EditsDto {
 
 /// One redaction op in its wire form: the externally tagged shape `RedactionOp` serializes to,
 /// every key closed. The two `*_loc` fields are redaction-grammar locations inside the candidate
-/// JSON (`issues[key=A].fields`), not filesystem paths; the wire names are the C.7 ones.
+/// JSON (`issues[key=A].fields`), not filesystem paths. Their wire names are the Rust names (the
+/// `check-commands` rule holds wire names too, so there is no rename back to `path`).
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum RedactionOpWire {
     DropItem {
-        #[serde(rename = "array_path")]
         array_loc: String,
         key: String,
         value: Value,
     },
     DropField {
-        #[serde(rename = "path")]
         field_loc: String,
         scope: DropScope,
     },

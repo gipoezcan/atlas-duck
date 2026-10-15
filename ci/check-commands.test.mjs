@@ -318,6 +318,20 @@ test("pathbuf_and_byte_fields_fail", () => {
   assert.deepEqual(field("pub use_custom_ca: bool"), []);
 });
 
+test("serde_wire_names_are_held_to_the_field_name_rule", () => {
+  const field = (decl) =>
+    argErrors(`${ARGS_OK}\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct InstanceAddArgs {\n    pub alias: String,\n    ${decl},\n}\n`);
+  // A harmless Rust name does not hide a forbidden wire name.
+  assertFails(field('#[serde(rename = "ca_path")] pub x: String'), /InstanceAddArgs: serde name "ca_path"/);
+  assertFails(field('#[serde(rename(deserialize = "client_cert"))] pub x: String'), /serde name "client_cert"/);
+  assertFails(field('#[serde(alias = "pem")] pub x: String'), /serde name "pem"/);
+  const variant = argErrors(`${ARGS_OK}\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\npub enum Op {\n    #[serde(rename = "filePath")]\n    A { x: String },\n}\n`);
+  assertFails(variant, /Op: serde name "filePath"/);
+  // A harmless rename and the usual case styles pass.
+  assert.deepEqual(field('#[serde(rename = "alias_name")] pub x: String'), []);
+  assert.deepEqual(argErrors(ARGS_OK), []);
+});
+
 test("test_modules_are_not_arguments", () => {
   assert.deepEqual(argErrors(ARGS_OK), []);
   // Without the cfg(test) marker the same struct is checked.

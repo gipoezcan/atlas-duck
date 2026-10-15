@@ -476,6 +476,18 @@ export function checkArgStructs(files, exemptions = ARG_EXEMPTIONS) {
     for (const re of FORBIDDEN_TYPES) {
       if (re.test(item.body)) errors.push(`${file}: ${name} has a field of a forbidden type (${re.source}); no command takes a path or bytes (§10.3)`);
     }
+    // The wire name counts as much as the Rust one: `#[serde(rename = "ca_path")]` (also the
+    // `rename(deserialize = "..")` form, `rename_all` and `alias`) is a field the webview can set.
+    for (const attr of serdeAttrs) {
+      const quoted = [...attr.matchAll(/\b(?:rename|rename_all|alias)\b\s*(?:=\s*"([^"]*)"|\(([^)]*)\))/g)].flatMap((m) =>
+        m[1] !== undefined ? [m[1]] : [...m[2].matchAll(/"([^"]*)"/g)].map((q) => q[1]),
+      );
+      for (const wire of quoted) {
+        if (FORBIDDEN_FIELD_NAME.test(wire)) {
+          errors.push(`${file}: ${name}: serde name "${wire}": no wire name like a path, PEM or certificate (§10.3)`);
+        }
+      }
+    }
     for (const f of fields(item.body)) {
       if (FORBIDDEN_FIELD_NAME.test(f.name)) {
         errors.push(`${file}: ${name}.${f.name}: no field named like a path, PEM or certificate (§10.3)`);
