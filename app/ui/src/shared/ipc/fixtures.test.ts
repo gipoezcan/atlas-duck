@@ -6,7 +6,9 @@ import commandError from './fixtures/command_error.json';
 import decisionOutcome from './fixtures/decision_outcome.json';
 import denyCount from './fixtures/deny_count.json';
 import instanceView from './fixtures/instance_view.json';
+import killAnswer from './fixtures/kill_answer.json';
 import noteSaved from './fixtures/note_saved.json';
+import onboardingText from './fixtures/onboarding_text.json';
 import preview from './fixtures/preview.json';
 import pruneReport from './fixtures/prune_report.json';
 import queueDetail from './fixtures/queue_detail.json';
@@ -20,8 +22,10 @@ import removalFinishAnswer from './fixtures/removal_finish_answer.json';
 import removalState from './fixtures/removal_state.json';
 import retestOutcome from './fixtures/retest_outcome.json';
 import retryStarted from './fixtures/retry_started.json';
+import runningScript from './fixtures/running_script.json';
 import settingsGet from './fixtures/settings_get.json';
 import statusLine from './fixtures/status_line.json';
+import verifyNow from './fixtures/verify_now.json';
 import wizardState from './fixtures/wizard_state.json';
 import {
   arrayOf,
@@ -30,6 +34,8 @@ import {
   isDecisionOutcome,
   isDenyCount,
   isInstanceView,
+  isKillAnswer,
+  isOnboardingText,
   isPreview,
   isPruneReport,
   isQueueDetail,
@@ -44,8 +50,10 @@ import {
   isRemovalFinishAnswer,
   isRemovalState,
   isRetestOutcome,
+  isRunningScriptView,
   isSettingsGet,
   isStatusLine,
+  isVerifyNow,
   isWizardState,
   toCommandError,
 } from './validate';
@@ -72,6 +80,10 @@ describe('fixtures validate against their TS types', () => {
     ['removal_state', removalState, arrayOf(isRemovalState)],
     ['removal_backup_answer', removalBackupAnswer, arrayOf(isRemovalBackupAnswer)],
     ['removal_finish_answer', removalFinishAnswer, arrayOf(isRemovalFinishAnswer)],
+    ['verify_now', verifyNow, arrayOf(isVerifyNow)],
+    ['running_script', runningScript, arrayOf(isRunningScriptView)],
+    ['kill_answer', killAnswer, arrayOf(isKillAnswer)],
+    ['onboarding_text', onboardingText, arrayOf(isOnboardingText)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -99,6 +111,26 @@ describe('fixtures validate against their TS types', () => {
     }
   });
 
+  it('verify_now, running_script, kill_answer and onboarding_text: closed shapes, null where Rust sends null', () => {
+    // The three outcomes are all present, and `count` belongs to the incident alone.
+    expect(verifyNow.map((v) => v.result)).toEqual(['verified', 'did_not_complete', 'incident']);
+    expect(isVerifyNow({ result: 'verified', text: 'verified', count: 1 })).toBe(false);
+    expect(isVerifyNow({ result: 'incident', text: 'x' })).toBe(false);
+    expect(isVerifyNow({ result: 'incident', count: 'x', text: 'x' })).toBe(false);
+    expect(isVerifyNow({ result: 'passed', text: 'x' })).toBe(false);
+    // An agent that sent no name is a null; a wrong type or a missing key is refused.
+    expect(runningScript.some((r) => r.agent_name === null)).toBe(true);
+    expect(isRunningScriptView({ ...runningScript[0], agent_name: null })).toBe(true);
+    expect(isRunningScriptView({ ...runningScript[0], agent_name: 5 })).toBe(false);
+    expect(isRunningScriptView({ ...runningScript[0], agent_name: undefined })).toBe(false);
+    expect(isRunningScriptView({ ...runningScript[0], host_calls: '4' })).toBe(false);
+    expect(isRunningScriptView({ ...runningScript[0], extra: 1 })).toBe(false);
+    expect(killAnswer.map((k) => k.killed)).toEqual([true, false]);
+    expect(isKillAnswer({ killed: 'yes' })).toBe(false);
+    expect(isKillAnswer({ killed: true, extra: 1 })).toBe(false);
+    expect(isOnboardingText({ text: null })).toBe(false);
+    expect(isOnboardingText({ text: 'x', extra: 1 })).toBe(false);
+  });
   it('a plain string rejection (ACL refusal) maps to refused', () => {
     expect(toCommandError('command not allowed')).toEqual({
       kind: 'refused',

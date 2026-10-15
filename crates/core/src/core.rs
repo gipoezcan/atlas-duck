@@ -31,6 +31,7 @@ use crate::instances::state::DeriveCtx;
 use crate::instances::{CoreInstances, InstanceAdmin, InstanceState, InstanceTable};
 use crate::metadata::FieldCache;
 use crate::payloads::{self, AppStopReason, ConfigSource};
+use crate::running::RunningScriptView;
 use crate::settings::{CoreSettings, SettingsAdmin};
 use crate::similarity::SimilarityIndex;
 
@@ -440,6 +441,19 @@ impl Core {
     /// backlog now" and "Verify now" (M6 Δ3).
     pub fn settings(&self) -> Arc<dyn SettingsAdmin> {
         self.settings.clone()
+    }
+
+    /// The live script runs (PD-81, §9.6): what the Running-scripts window lists.
+    pub fn running_scripts(&self) -> Vec<RunningScriptView> {
+        crate::running::list(&self.engine)
+    }
+
+    /// The window's kill button (§9.6): the run's worker is asked to die; the run's own path then
+    /// records `SCRIPT_FAILED {killed_by_user}` and the request becomes a release item (audit
+    /// before effect stays with that path). `false` = no such live real run (or a kill is already
+    /// on its way).
+    pub fn kill_script(&self, request_id: &str) -> bool {
+        self.engine.kill_script(request_id)
     }
 
     /// The local UTC offset in minutes the similarity notice text uses (Δ6); `None` is UTC.

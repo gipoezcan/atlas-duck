@@ -17,6 +17,8 @@ use atlas_duck_app_lib::commands::credential::{
     RetryStarted, SubmitFailure, SubmitOutcome, connection_failure, context_dto,
 };
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
+use atlas_duck_app_lib::commands::onboarding::OnboardingTextDto;
+use atlas_duck_app_lib::commands::running::KillAnswer;
 use atlas_duck_app_lib::commands::settings::{
     CliInstallAnswer, ConfinementDto, ExtraLayerDto, OUTCOME_ALREADY_INSTALLED,
     OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_INSTALLED_LOCAL_BIN, OUTCOME_REMOVED,
@@ -32,13 +34,14 @@ use atlas_duck_audit::AuditError;
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::redact::{BlockReason, DropScope, RedactionPreset};
+use atlas_duck_core::running::RunningScriptView;
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, AttentionMode, BatchFailure, BatchOutcome, CandidateRev, ConfigBanner,
     ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView, Product,
     PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext, RedactionOp,
     RedactionReport, RequestDetail, SessionKey, SettingsError, SettingsView, StoreHealthView,
-    UrlMode,
+    UrlMode, VerifyNow,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
@@ -938,6 +941,45 @@ fn prune_reports() -> Vec<PruneReport> {
     ]
 }
 
+/// `verify_now` (M6 T30, PD-82): the three outcomes.
+fn verify_nows() -> Vec<VerifyNow> {
+    vec![
+        VerifyNow::Verified,
+        VerifyNow::DidNotComplete,
+        VerifyNow::Incident { count: 3 },
+    ]
+}
+
+/// `running_list` (M6 T30, PD-81): a named run and one whose agent sent no name.
+fn running_scripts() -> Vec<RunningScriptView> {
+    vec![
+        RunningScriptView {
+            request_id: REQ.into(),
+            agent_name: Some("claude-code-billing-api".into()),
+            started_at: "2026-10-15T08:30:00.000Z".into(),
+            host_calls: 4,
+        },
+        RunningScriptView {
+            request_id: REQ_2.into(),
+            agent_name: None,
+            started_at: "2026-10-15T08:31:12.250Z".into(),
+            host_calls: 0,
+        },
+    ]
+}
+
+/// `running_kill` (M6 T30): a kill was asked for, and no such live run.
+fn kill_answers() -> Vec<KillAnswer> {
+    vec![KillAnswer { killed: true }, KillAnswer { killed: false }]
+}
+
+/// `onboarding_text` (M6 T30): a short sample; the real text is generated from the registry.
+fn onboarding_texts() -> Vec<OnboardingTextDto> {
+    vec![OnboardingTextDto {
+        text: "# atlas-duck\n\n- `atlas-duck ops list`\n".into(),
+    }]
+}
+
 /// `cli_install` / `cli_uninstall` (M6 T27): every outcome word.
 fn cli_install_answers() -> Vec<CliInstallAnswer> {
     [
@@ -1106,7 +1148,9 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("decision_outcome", value(&decision_outcomes())?),
         ("deny_count", value(&deny_counts())?),
         ("instance_view", value(&instance_views())?),
+        ("kill_answer", value(&kill_answers())?),
         ("note_saved", value(&note_saved())?),
+        ("onboarding_text", value(&onboarding_texts())?),
         ("preview", value(&previews())?),
         ("prune_report", value(&prune_reports())?),
         ("queue_detail", value(&queue_details())?),
@@ -1120,9 +1164,11 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("removal_state", value(&removal_states())?),
         ("retest_outcome", value(&retest_outcomes())?),
         ("retry_started", value(&retry_started())?),
+        ("running_script", value(&running_scripts())?),
         ("settings_get", value(&settings_gets())?),
         ("status_line", value(&status_lines())?),
         ("submit_outcome", value(&submit_outcomes())?),
+        ("verify_now", value(&verify_nows())?),
         ("wizard_state", value(&wizard_states())?),
     ])
 }

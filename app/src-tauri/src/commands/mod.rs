@@ -11,6 +11,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod approvals;
+pub mod audit;
 mod blocking;
 #[cfg(feature = "scripted-approver")]
 pub mod capture;
@@ -18,6 +19,8 @@ pub mod credential;
 pub mod dto;
 mod errors;
 mod names;
+pub mod onboarding;
+pub mod running;
 pub mod settings;
 pub mod setup;
 pub mod window;
@@ -52,12 +55,16 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         approvals::raw_page,
         approvals::recent_list,
         approvals::redaction_preview,
+        audit::verify_now,
         credential::archive_and_start_fresh,
         credential::close_credential,
         credential::credential_context,
         credential::retry_keychain,
         credential::save_recovery_note,
         credential::submit_secret,
+        onboarding::onboarding_text,
+        running::running_kill,
+        running::running_list,
         settings::cli_install,
         settings::cli_uninstall,
         settings::credential_window_open,

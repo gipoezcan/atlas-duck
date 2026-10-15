@@ -3,6 +3,8 @@
   "description": "the Running scripts window (Δ1)",
   "windows": ["running_scripts"],
   "permissions": [
+    "allow-running-kill",
+    "allow-running-list",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

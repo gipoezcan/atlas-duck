@@ -1833,6 +1833,105 @@ fn credential_window_open_is_refused_while_a_removal_call_runs() -> TestResult {
     Ok(())
 }
 
+/// M6 T30 (Δ1): the window-shell commands. `verify_now` is the Audit window's, `running_list` and
+/// `running_kill` the Running-scripts window's, `onboarding_text` the Onboarding window's and the
+/// wizard's; every other window is refused by Tauri's ACL first. A valid body reaches the handler
+/// (`not_ready` without a serving core; the onboarding text needs none), a body with another key or
+/// a request id outside the PD-66 shape is refused before it.
+#[test]
+fn shell_commands_granted_to_their_windows_only() -> TestResult {
+    const REQ: &str = "req_0123456789abcdefghij";
+    let app = app()?;
+    let labels = [
+        "approvals",
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "credential",
+        "setup",
+        "unknown",
+    ];
+    let windows = labels
+        .map(|label| window(&app, label).map(|w| (label, w)))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let table: [(&str, Value, &[&str]); 4] = [
+        ("verify_now", json!({}), &["audit"]),
+        ("running_list", json!({}), &["running_scripts"]),
+        (
+            "running_kill",
+            json!({ "request_id": REQ }),
+            &["running_scripts"],
+        ),
+        ("onboarding_text", json!({}), &["onboarding", "setup"]),
+    ];
+    for (cmd, body, granted) in &table {
+        assert!(COMMANDS.contains(cmd), "{cmd} is not in COMMANDS");
+        for (label, w) in &windows {
+            let r = invoke(w, cmd, body.clone());
+            if !granted.contains(label) {
+                assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
+            } else if *cmd == "onboarding_text" {
+                let text = r
+                    .as_ref()
+                    .ok()
+                    .and_then(|v| v["text"].as_str())
+                    .ok_or("no text")?;
+                assert!(text.contains("never resubmit a pending request"), "{label}");
+            } else {
+                assert_eq!(r, Err(json!({"kind": "not_ready"})), "{label}: {cmd}");
+            }
+        }
+    }
+    let find = |name: &str| {
+        windows
+            .iter()
+            .find(|(label, _)| *label == name)
+            .map(|(_, w)| w)
+            .ok_or("no such window")
+    };
+    let (audit, running, onboarding) = (
+        find("audit")?,
+        find("running_scripts")?,
+        find("onboarding")?,
+    );
+    let refused = Err(json!({"kind": "invalid_argument", "field": "payload"}));
+    for (w, cmd, key) in [
+        (audit, "verify_now", "full"),
+        (running, "running_list", "all"),
+        (onboarding, "onboarding_text", "path"),
+    ] {
+        assert_eq!(invoke(w, cmd, json!({ key: true })), refused, "{cmd}");
+    }
+    assert_eq!(
+        invoke(
+            running,
+            "running_kill",
+            json!({"request_id": REQ, "all": true})
+        ),
+        refused
+    );
+    assert_eq!(
+        invoke(running, "running_kill", json!({})),
+        Err(json!({"kind": "invalid_argument", "field": "request_id"}))
+    );
+    for bad in [
+        "",
+        "x",
+        "req_short",
+        "../../etc",
+        "req_0123456789abcdefghij!",
+    ] {
+        assert_eq!(
+            invoke(running, "running_kill", json!({ "request_id": bad })),
+            Err(json!({"kind": "invalid_argument", "field": "request_id"})),
+            "{bad}"
+        );
+    }
+    Ok(())
+}
+
 /// M6 T25 (T21 review I-4): `close_credential {}` is the credential window's own; no other window
 /// may close it, and it takes nothing.
 #[test]

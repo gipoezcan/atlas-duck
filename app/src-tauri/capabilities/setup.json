@@ -8,6 +8,7 @@
     "allow-instance-add",
     "allow-instance-change-url",
     "allow-instance-confirm-config",
+    "allow-onboarding-text",
     "allow-quit",
     "allow-wizard-begin",
     "allow-wizard-choose-dir",

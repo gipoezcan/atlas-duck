@@ -1,9 +1,8 @@
 import { createRoot } from 'react-dom/client';
 
-import { WINDOW_TITLES } from '../shared/strings';
+import { Running } from './Running';
 
-// Placeholder entry: a later task replaces it with the real window.
 const root = document.getElementById('root');
 if (root) {
-  createRoot(root).render(<h1>{WINDOW_TITLES.running_scripts}</h1>);
+  createRoot(root).render(<Running />);
 }

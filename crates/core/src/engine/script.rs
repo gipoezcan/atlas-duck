@@ -396,6 +396,11 @@ impl RunShared {
         lock(&self.inner).ended = true;
     }
 
+    /// Host calls the run made so far (validated calls, counted by the host, never the worker).
+    pub(crate) fn calls(&self) -> u32 {
+        lock(&self.inner).calls
+    }
+
     pub(crate) fn kill_reason(&self) -> Option<KillReason> {
         lock(&self.inner).kill.clone()
     }

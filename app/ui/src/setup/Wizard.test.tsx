@@ -7,6 +7,7 @@ import {
   instanceAcceptUrlChange,
   instanceAdd,
   instanceConfirmConfig,
+  onboardingText,
   quit,
   wizardBegin,
   wizardChooseDir,
@@ -22,6 +23,7 @@ import { REREAD_DEBOUNCE_MS, STEP0_ERROR_DELAY_MS, STEP_COOLDOWN_MS, Wizard } fr
 
 vi.mock('../shared/ipc/invoke', () => ({
   cliInstall: vi.fn(),
+  onboardingText: vi.fn(),
   quit: vi.fn(),
   instanceAdd: vi.fn(),
   instanceConfirmConfig: vi.fn(),
@@ -91,6 +93,7 @@ const click = async (name: string | RegExp) => {
 
 const mocks = [
   cliInstall,
+  onboardingText,
   quit,
   instanceAdd,
   instanceConfirmConfig,
@@ -112,6 +115,8 @@ beforeEach(() => {
       return Promise.resolve(() => undefined);
     });
   for (const f of mocks) vi.mocked(f as (...a: unknown[]) => Promise<unknown>).mockReset();
+  // The onboarding step reads the snippet from Rust; most tests do not look at it.
+  vi.mocked(onboardingText).mockResolvedValue({ text: 'snippet' });
 });
 
 afterEach(() => {
@@ -438,9 +443,29 @@ describe('Wizard', () => {
     expect(wizardFinish).toHaveBeenCalledTimes(1);
   });
 
-  it('onboarding step shows the marked placeholder until onboarding_text exists', async () => {
+  it('onboarding_text_rendered_as_text: the step shows the snippet as one text node, never markup', async () => {
+    const hostile = '# atlas-duck\n<img src=x onerror="window.__pwned=1"><script>window.__pwned=1</script>';
+    vi.mocked(onboardingText).mockResolvedValue({ text: hostile });
     await show(at('onboarding'));
     const section = screen.getByRole('region', { name: T.onboarding_heading });
-    expect(within(section).getByText(/^Placeholder:/)).toBeTruthy();
+    const pre = within(section).getByLabelText('Instructions for your agents');
+    expect(pre.tagName).toBe('PRE');
+    expect(pre.textContent).toBe(hostile);
+    expect(pre.childElementCount).toBe(0);
+    expect(section.querySelector('img, script')).toBeNull();
+    expect(onboardingText).toHaveBeenCalledTimes(1);
+    // The finish button is still there beside it.
+    expect(within(section).getByRole('button', { name: T.onboarding_finish })).toBeTruthy();
+  });
+
+  it('onboarding step: a failed load is a fixed alert with a retry, and finishing stays possible', async () => {
+    vi.mocked(onboardingText).mockRejectedValueOnce({ kind: 'internal' });
+    await show(at('onboarding'));
+    const section = screen.getByRole('region', { name: T.onboarding_heading });
+    expect(within(section).getByRole('alert').textContent).toContain('Could not load the instructions');
+    expect(within(section).getByRole('button', { name: T.onboarding_finish })).toBeTruthy();
+    vi.mocked(onboardingText).mockResolvedValueOnce({ text: 'second try' });
+    await click('Try again');
+    expect(within(section).getByLabelText('Instructions for your agents').textContent).toBe('second try');
   });
 });

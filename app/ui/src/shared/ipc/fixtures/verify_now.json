@@ -1,0 +1,15 @@
+[
+  {
+    "result": "verified",
+    "text": "verified"
+  },
+  {
+    "result": "did_not_complete",
+    "text": "verification did not complete"
+  },
+  {
+    "count": 3,
+    "result": "incident",
+    "text": "integrity incident: see Audit"
+  }
+]

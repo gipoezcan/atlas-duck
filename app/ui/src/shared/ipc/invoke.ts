@@ -8,6 +8,8 @@ import type {
   DenyCount,
   InstanceAddArgs,
   InstanceView,
+  KillAnswer,
+  OnboardingText,
   PreviewFetchResponse,
   PruneReport,
   QueueDetail,
@@ -21,10 +23,12 @@ import type {
   RemovalFinishAnswer,
   RemovalState,
   RetestOutcome,
+  RunningScriptView,
   SettingChange,
   SettingsGet,
   SettingsView,
   StatusLine,
+  VerifyNow,
   WizardState,
   WizardStep,
 } from './types';
@@ -35,6 +39,8 @@ import {
   isDecisionOutcome,
   isDenyCount,
   isInstanceView,
+  isKillAnswer,
+  isOnboardingText,
   isPreviewFetchResponse,
   isPruneReport,
   isQueueDetail,
@@ -46,9 +52,11 @@ import {
   isRemovalFinishAnswer,
   isRemovalState,
   isRetestOutcome,
+  isRunningScriptView,
   isSettingsGet,
   isSettingsView,
   isStatusLine,
+  isVerifyNow,
   isWizardState,
   toCommandError,
   type Validator,
@@ -251,6 +259,26 @@ export function removalMark(alias: string, choice: RemovalChoice): Promise<Remov
 /** Steps 3 and 4: refused until every instance is ticked or skipped; Rust confirms natively. */
 export function removalFinish(): Promise<RemovalFinishAnswer> {
   return call('removal_finish', {}, isRemovalFinishAnswer);
+}
+
+/** "Verify now" (8.7, PD-82): one full verification; the answer carries the text to show. */
+export function verifyNow(): Promise<VerifyNow> {
+  return call('verify_now', {}, isVerifyNow);
+}
+
+/** The live script runs (PD-81, 9.6), oldest first. */
+export function runningList(): Promise<RunningScriptView[]> {
+  return call('running_list', {}, arrayOf(isRunningScriptView));
+}
+
+/** Asks for a run's death (9.6); the run's own audited path records `killed_by_user`. */
+export function runningKill(requestId: string): Promise<KillAnswer> {
+  return call('running_kill', { request_id: requestId }, isKillAnswer);
+}
+
+/** The agent-onboarding snippet (12.4, PD-80), generated in Rust. */
+export function onboardingText(): Promise<OnboardingText> {
+  return call('onboarding_text', {}, isOnboardingText);
 }
 
 /** The setup window's whole state (T23): Rust decides the step, the page renders it. */

@@ -41,6 +41,8 @@ pub mod lifecycle;
 pub mod metadata;
 /// Agent-string normalization at `hello`/submit (§3.3, C.0).
 pub mod normalize;
+/// The agent-onboarding snippet generated from the registry (§12.4, PD-80).
+pub mod onboarding;
 /// The op table: an `OpImpl` per registry id, read plans, write executors, enrichment and stale
 /// rules, previewers (§2.3, PD-09, PD-10).
 pub mod ops;
@@ -52,6 +54,8 @@ pub mod proxy;
 pub mod reconcile;
 /// Redaction engine: drops with copies and mirrors, masks in the canonical match form (§5.3).
 pub mod redact;
+/// The live script runs (PD-81, §9.6).
+pub mod running;
 /// `SettingsAdmin` (M6 Δ3): limits, attention mode, retention, legal hold, prune, verify now.
 pub mod settings;
 /// The shutdown sweep (§2.5 steps 2-5, I-40).

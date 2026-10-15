@@ -68,3 +68,4 @@
 .batch { margin: 0.5rem 0; padding: 0.5rem; border: 1px solid #8886; }
 .batch-actions, .batch-session { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.25rem 0; }
 .batch-confirm ul, .batch-excluded ul, .batch-blocked ul { max-height: 12rem; overflow: auto; margin: 0.25rem 0; }
+.onboarding-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 32rem; overflow: auto; padding: 0.5rem; border: 1px solid #8886; }

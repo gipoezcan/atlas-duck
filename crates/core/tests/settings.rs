@@ -417,6 +417,42 @@ async fn verify_now_err_is_did_not_complete() -> TestResult {
     Ok(())
 }
 
+/// PD-82's third outcome: a finding that is an incident (a `PRUNE` whose snapshot names fewer
+/// than the 92 retention days of §8.8) is `incident` with its count, and the fixed text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verify_now_three_outcomes() -> TestResult {
+    use atlas_duck_audit::testing::{FakePrune, insert_fake_prune};
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let s2 = s.clone();
+    let ok = tokio::task::spawn_blocking(move || s2.verify_now()).await?;
+    assert_eq!(ok.text(), "verified");
+    insert_fake_prune(
+        &h.store(),
+        FakePrune {
+            first_retained_seq: 2,
+            cutoff: "2026-06-01".into(),
+            settings: json!({"retention_days": 30, "legal_hold": false}),
+            update_first_retained: false,
+        },
+    )?;
+    let s2 = s.clone();
+    let r = tokio::task::spawn_blocking(move || s2.verify_now()).await?;
+    let VerifyNow::Incident { count } = r else {
+        return Err(format!("not an incident: {r:?}").into());
+    };
+    assert!(count >= 1);
+    assert_eq!(r.text(), "integrity incident: see Audit");
+    assert_eq!(
+        serde_json::to_value(r)?,
+        json!({"result": "incident", "count": count, "text": "integrity incident: see Audit"})
+    );
+    h.store().shutdown();
+    let r = tokio::task::spawn_blocking(move || s.verify_now()).await?;
+    assert_eq!(r.text(), "verification did not complete");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_app_change_logs_config_changed() -> TestResult {
     let h = Harness::jira().await?;

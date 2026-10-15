@@ -2,5 +2,7 @@
   "identifier": "audit",
   "description": "the Audit window (Δ1, M6: Verify now only); no decision command",
   "windows": ["audit"],
-  "permissions": []
+  "permissions": [
+    "allow-verify-now"
+  ]
 }

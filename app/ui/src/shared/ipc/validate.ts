@@ -15,6 +15,8 @@ import type {
   EditInput,
   InputKind,
   InstanceView,
+  KillAnswer,
+  OnboardingText,
   PlainInputKind,
   Preview,
   PreviewFetchResponse,
@@ -32,9 +34,11 @@ import type {
   RemovalState,
   RequestDetail,
   RetestOutcome,
+  RunningScriptView,
   SettingsGet,
   SettingsView,
   StatusLine,
+  VerifyNow,
   WizardError,
   WizardState,
 } from './types';
@@ -381,7 +385,23 @@ export const isRemovalState = (v: unknown): v is RemovalState =>
     instances: arrayOf(isRemovalItem),
   }) && Object.keys(v).length === 5;
 
-export const isRemovalBackupAnswer = (v: unknown): v is RemovalBackupAnswer =>
+export const isVerifyNow = (v: unknown): v is VerifyNow => {
+  if (!rec(v)) return false;
+  if (v.result === 'incident') return closed(v, { result: isStr, count: isNum, text: isStr });
+  return (
+    (v.result === 'verified' || v.result === 'did_not_complete') &&
+    closed(v, { result: isStr, text: isStr })
+  );
+};
+
+export const isRunningScriptView = (v: unknown): v is RunningScriptView =>
+  closed(v, { request_id: isStr, agent_name: strOrNull, started_at: isStr, host_calls: isNum });
+
+export const isKillAnswer = (v: unknown): v is KillAnswer => closed(v, { killed: isBool });
+
+export const isOnboardingText = (v: unknown): v is OnboardingText => closed(v, { text: isStr });
+
+export const isRemovalBackupAnswer =(v: unknown): v is RemovalBackupAnswer =>
   fields(v, { saved: isBool }) && Object.keys(v).length === 1;
 
 export const isRemovalFinishAnswer = (v: unknown): v is RemovalFinishAnswer =>

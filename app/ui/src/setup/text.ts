@@ -57,9 +57,6 @@ export const SETUP_TEXT = {
   cli_install: 'Install CLI to PATH',
   cli_continue: 'Continue',
   onboarding_heading: 'Agent onboarding',
-  /** TODO(T30): replaced by the `onboarding_text` snippet (PD-80) once that command exists. */
-  onboarding_placeholder:
-    'Placeholder: the copy-paste instructions for your agents (CLAUDE.md, AGENTS.md, MCP client config) appear here once the onboarding window ships. You can open them later from the Approvals header.',
   onboarding_finish: 'Finish setup',
   done_heading: 'Setup is complete',
   done_text: 'atlas-duck is ready. The approvals window opens next.',

@@ -620,3 +620,49 @@ export const SETTINGS_TEXT = {
     use_custom_ca: 'the CA file: choose another file',
   } as Readonly<Record<string, string>>,
 } as const;
+/**
+ * plan text (PD-82, T30): the Audit window's "Verify now" and its three results. The sentences are
+ * the plan's own words; Rust answers one of the three `result` words and the page picks the text
+ * from this table, so no other text can appear there.
+ */
+export const AUDIT_TEXT = {
+  verify: 'Verify now',
+  verifying: 'Verifying\u2026',
+  results: {
+    verified: 'verified',
+    did_not_complete: 'verification did not complete',
+    incident: 'integrity incident: see Audit',
+  },
+  /** A call Rust refused or that failed is not a verification result and never a pass. */
+  refused: 'verification did not complete',
+} as const;
+
+/** plan text (PD-81, T30): the Running scripts window shell. */
+export const RUNNING_TEXT = {
+  loading: 'Loading the running scripts',
+  load_failed: 'Could not load the running scripts',
+  retry: 'Try again',
+  empty: 'No scripts are running.',
+  list_label: 'Running scripts',
+  col_request: 'Request',
+  col_agent: 'Agent',
+  col_started: 'Started',
+  col_calls: 'Host calls',
+  kill: 'Kill',
+  killing: 'Stopping\u2026',
+  /** The accessible name of a row's kill button (the request id names the row). */
+  kill_label: (requestId: string) => `Kill the script ${requestId}`,
+  stop_requested: 'Stop requested. The script becomes an item to review in Approvals.',
+  already_ended: 'That script is no longer running.',
+  kill_failed: 'Could not stop the script.',
+  no_agent: 'no agent name',
+} as const;
+
+/** plan text (PD-80, T30): the Onboarding window and the wizard's onboarding panel. */
+export const ONBOARDING_PANEL_TEXT = {
+  loading: 'Loading the instructions',
+  load_failed: 'Could not load the instructions',
+  retry: 'Try again',
+  intro: 'Copy these instructions into the CLAUDE.md or AGENTS.md of the repositories your agents work in.',
+  text_label: 'Instructions for your agents',
+} as const;

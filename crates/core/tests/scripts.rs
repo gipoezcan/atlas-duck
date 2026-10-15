@@ -943,6 +943,31 @@ async fn user_kill_becomes_a_release_item() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_list_empty_and_one() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(30_000),
+    ])
+    .await?;
+    assert!(h.core().running_scripts().is_empty());
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the run to start", || runner.starts() == 1).await?;
+    let rows = h.core().running_scripts();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].request_id, id);
+    assert_eq!(rows[0].host_calls, 0);
+    assert!(!rows[0].started_at.is_empty());
+    // The kill goes through the run's own audited path; an unknown id kills nothing.
+    assert!(!h.core().kill_script("no-such-request"));
+    assert!(h.core().kill_script(&id));
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert!(h.core().running_scripts().is_empty());
+    assert!(!h.core().kill_script(&id), "a run that ended is not killed");
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "killed_by_user");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn call_append_failure_ends_audit_failure_after_the_send() -> TestResult {
     let faults = FaultPlan::new();
     faults.fail_nth(EventType::SCRIPT_CALL, 1);

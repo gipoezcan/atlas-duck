@@ -346,6 +346,36 @@ export type RetestOutcome =
     }
   | { failed: { class: string; conn?: string } };
 
+/**
+ * `verify_now` (PD-82): the three outcomes with the text core chose for each. `count` is the number
+ * of integrity findings of an `incident`.
+ */
+export type VerifyNow =
+  | { result: 'verified'; text: string }
+  | { result: 'did_not_complete'; text: string }
+  | { result: 'incident'; count: number; text: string };
+
+/**
+ * One live script run (`running_list`, PD-81). `agent_name` is agent data: shown only through
+ * `AgentText`. `started_at` is RFC 3339 UTC.
+ */
+export interface RunningScriptView {
+  request_id: string;
+  agent_name: string | null;
+  started_at: string;
+  host_calls: number;
+}
+
+/** `running_kill`: `killed: false` = no such live run (it ended meanwhile). */
+export interface KillAnswer {
+  killed: boolean;
+}
+
+/** `onboarding_text` (PD-80): the snippet to copy, generated in Rust from the registry. */
+export interface OnboardingText {
+  text: string;
+}
+
 /** `prune_backlog_now`. */
 export type PruneReport =
   | { result: 'pruned'; count: number; cutoff: string; clamped: boolean }
