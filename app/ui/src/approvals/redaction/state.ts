@@ -131,12 +131,15 @@ export function useRedactionReport(
 export type CandidateState =
   | { state: 'loading' }
   | { state: 'unavailable' }
+  /** A `raw_page` call failed: `retry` reads the pages again. */
+  | { state: 'failed'; retry: () => void }
   | { state: 'ready'; candidate: Candidate };
 
 /**
  * The displayed revision's exact candidate, read page by page through `raw_page` (plan Task 17:
- * the tree is built from the concatenated pages), once per revision while `enabled`. Rust checks
- * every page against the revision's hash; a candidate over the release cap is not read.
+ * the tree is built from the concatenated pages), once per revision while `enabled` (again after
+ * a failed read on `retry`). Rust checks every page against the revision's hash; a candidate over
+ * the release cap is not read.
  */
 export function useCandidate(
   requestId: string,
@@ -144,9 +147,10 @@ export function useCandidate(
   enabled: boolean,
 ): CandidateState | null {
   const [loaded, setLoaded] = useState<{ rev: string; value: CandidateState } | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const counter = rev?.counter ?? 0;
   const hash = rev?.candidate_hash ?? '';
-  const want = rev === null ? null : `${requestId}:${counter}:${hash}`;
+  const want = rev === null ? null : `${requestId}:${counter}:${hash}:${attempt}`;
   const have = loaded !== null && loaded.rev === want;
   useEffect(() => {
     if (!enabled || want === null || have) return undefined;
@@ -175,7 +179,7 @@ export function useCandidate(
         const candidate = readCandidate(bytes);
         done(candidate === null ? { state: 'unavailable' } : { state: 'ready', candidate });
       } catch {
-        done({ state: 'unavailable' });
+        done({ state: 'failed', retry: () => setAttempt((a) => a + 1) });
       }
     })();
     return () => {

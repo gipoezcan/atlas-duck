@@ -82,6 +82,15 @@ export function indexDependent(loc: Loc): boolean {
   return loc.some((s) => 'index' in s && s.ident === null);
 }
 
+/**
+ * Whether `loc` continues past an element named by index. Rust checks a drop against the source
+ * as well (`drop_field`/`drop_item`: naming nothing there blocks); on a revision whose drops
+ * shortened that list, the rest of such a path is read on another source element than the one
+ * shown (core `a_drop_past_a_shifted_index_is_checked_on_another_element`). A path that ends in
+ * the index, or names elements by identity, reads the same element in both.
+ */
+export const indexOnTheWay = (loc: Loc): boolean => indexDependent(loc.slice(0, -1));
+
 const isElement = (loc: Loc): boolean => {
   const last = loc[loc.length - 1];
   return last !== undefined && 'index' in last;
@@ -123,10 +132,11 @@ export const dropOf = (loc: Loc): RedactionOp | null =>
 
 /**
  * "Mask text" (spec 5.3): every occurrence by default; `at` (the value's plain location) masks the
- * one occurrence there. Null for a text the UI refuses: empty, or exactly the placeholder.
+ * one occurrence there. Null for a text the UI refuses: empty, or holding the placeholder (Rust
+ * blocks such a mask: the placeholder it leaves would hold the text again).
  */
 export function maskOp(text: string, at: Loc | null): RedactionOp | null {
-  if (text === '' || text === REDACTED) return null;
+  if (text === '' || text.includes(REDACTED)) return null;
   if (at === null) return { mask_text: { text, every_occurrence: true, at: null } };
   const loc = concreteOf(at);
   return loc === null ? null : { mask_text: { text, every_occurrence: false, at: loc } };
@@ -142,6 +152,39 @@ export const isMask = (op: RedactionOp): boolean => 'mask_text' in op;
 
 export const isSingleMask = (op: RedactionOp): boolean =>
   'mask_text' in op && !op.mask_text.every_occurrence;
+
+/** An op that names no location (a preset, the URL choice, an every-occurrence mask): a repeat does nothing. */
+export const locationFree = (op: RedactionOp): boolean =>
+  'preset' in op || 'url_field' in op || ('mask_text' in op && op.mask_text.every_occurrence);
+
+/**
+ * Rust's `is_plain` (redact/views.rs): printable ASCII, tab, LF and CR, without `%`, `&` or `+`.
+ * Such a text has no other canonical form than itself (no reference, escape, NFC or invisible
+ * character to decode).
+ */
+export const isPlain = (s: string): boolean => /^[\t\n\r\x20-\x24\x27-\x2a\x2c-\x7e]*$/.test(s);
+
+/**
+ * Why "Only this occurrence" of `text` in `value` might mask another occurrence than the selected
+ * one, or null. Rust masks the first match it finds in the value (`mask_value` with `first_only`):
+ * a match across a placeholder first (a text with a bracket), then, part by part between
+ * placeholders, the first part with any canonical match, and in that part the first raw match.
+ * So the one occurrence is certain only when the text occurs once in the value, holds no bracket,
+ * and, where the value has (or this round may give it) a placeholder, no part has an encoded
+ * match: a plain value. `maskedInRound`: the round masks text, which can put a placeholder here
+ * before this mask runs.
+ */
+export function singleMaskProblem(
+  value: string,
+  text: string,
+  maskedInRound: boolean,
+): 'bracket' | 'repeated' | 'encoded' | null {
+  if (text === '') return null;
+  if (/[[\]]/.test(text)) return 'bracket';
+  if (value.indexOf(text) !== value.lastIndexOf(text)) return 'repeated';
+  if (!isPlain(value) && (value.includes(REDACTED) || maskedInRound)) return 'encoded';
+  return null;
+}
 
 /** JSON with object keys sorted, so equal ops have equal text whatever order their keys came in. */
 export function canonical(v: unknown): string {

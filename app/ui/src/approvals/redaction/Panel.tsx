@@ -3,7 +3,7 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref }
 import type { RedactionContext, RedactionOp, RedactionPreset, UrlMode } from '../../shared/ipc/types';
 import { BLOCK_REASON_TEXT, REDACTION_TEXT } from '../../shared/strings';
 import { AgentText } from '../../shared/text/AgentText';
-import { unusual } from '../../shared/text/unusual';
+import { escapeInvisible, unusual } from '../../shared/text/unusual';
 import { EDIT_ENTRY_ATTR, POSITIVE_ATTR } from '../keyboard';
 import { members, stringOf } from './json';
 import {
@@ -14,14 +14,17 @@ import {
   dropItemOp,
   dropOf,
   firstUnaddressable,
+  indexOnTheWay,
   inItems,
   isDrop,
   isMask,
   isSingleMask,
   isUrlField,
+  locationFree,
   maskOp,
   presetOp,
   REDACTED,
+  singleMaskProblem,
   within,
   type Loc,
   type RoundOp,
@@ -31,6 +34,18 @@ import { cut, Tree, TreeModel, type TreeNode } from './Tree';
 
 /** The selected value's text is shown up to this many code points. */
 export const VALUE_SHOWN_MAX = 100_000;
+
+const SINGLE_PROBLEM_TEXT = {
+  bracket: REDACTION_TEXT.single_bracket,
+  repeated: REDACTION_TEXT.single_repeated,
+  encoded: REDACTION_TEXT.single_encoded,
+} as const;
+
+/** Why the last action added nothing, next to the controls it came from. */
+interface Hint {
+  text: string;
+  at: 'node' | 'presets';
+}
 
 /** Agent text in a line: the value as a quoted, bidi-isolated text node. */
 const Text = ({ value }: { value: string }) => <AgentText value={value} unusual={unusual(value)} />;
@@ -126,7 +141,7 @@ export function Panel(props: PanelProps) {
   const [selected, setSelected] = useState<TreeNode | null>(null);
   const [maskText, setMaskText] = useState('');
   const [onlyHere, setOnlyHere] = useState(false);
-  const [hint, setHint] = useState<string | null>(null);
+  const [hint, setHint] = useState<Hint | null>(null);
   const valueRef = useRef<HTMLDivElement>(null);
   const releaseHint = useId();
   const { onPendingInput } = props;
@@ -144,24 +159,53 @@ export function Panel(props: PanelProps) {
 
   const roundDrops = round.filter((r) => isDrop(r.op));
   const roundSingles = round.some((r) => isSingleMask(r.op));
-  const anyMask = round.some((r) => isMask(r.op)) || context.ops.some(isMask);
-  const known = new Set([...context.ops, ...round.map((r) => r.op)].map(canonical));
+  const roundMasks = round.some((r) => isMask(r.op));
+  const anyMask = roundMasks || context.ops.some(isMask);
+  // Review T17 C1: Rust places a single-occurrence mask after every drop of the set, so a drop
+  // appended to a revision that holds one would move it (core
+  // `a_later_drop_moves_a_revision_single_occurrence_mask`). Only "Remove all" is left for drops.
+  const baseSingles = context.ops.some(isSingleMask);
+  // Review T17 I1: drops that may have shortened a list (presets and the URL choice remove keys only).
+  const baseShifts = context.ops.some((op) => 'drop_item' in op || 'drop_field' in op);
+  // A repeat inside the round does nothing; across rounds only a location-free op does. A
+  // location names what this revision shows: `fields.labels[0]` again is the next label.
+  const inRound = new Set(round.map((r) => canonical(r.op)));
+  const applied = new Set(context.ops.filter(locationFree).map(canonical));
 
-  const add = (op: RedactionOp | null, loc: Loc | null) => {
+  /** Adds `op` to the round; a refusal says why. */
+  const add = (op: RedactionOp | null, loc: Loc | null, where: Hint['at'] = 'node'): boolean => {
     setHint(null);
-    if (op === null || known.has(canonical(op))) return;
+    if (op === null) return false;
+    const key = canonical(op);
+    if (inRound.has(key) || applied.has(key)) {
+      setHint({ text: inRound.has(key) ? REDACTION_TEXT.already_in_round : REDACTION_TEXT.already_applied, at: where });
+      return false;
+    }
     onRound([...round, { op, loc }]);
+    return true;
   };
 
   const droppedLoc = (loc: Loc) => roundDrops.some((r) => r.loc !== null && within(loc, r.loc));
 
-  const addMask = (node: TreeNode, value: string) => {
-    if (maskText === '') return setHint(REDACTION_TEXT.mask_empty);
-    if (maskText === REDACTED) return setHint(REDACTION_TEXT.mask_placeholder);
-    if (!value.includes(maskText)) return setHint(REDACTION_TEXT.mask_not_in_value);
-    add(maskOp(maskText, onlyHere ? node.loc : null), onlyHere ? node.loc : null);
-    setMaskText('');
-    setOnlyHere(false);
+  /** Adds the typed mask; the text and the checkbox are kept when it is refused. */
+  const addMask = (node: TreeNode, value: string, single: boolean) => {
+    const refusal =
+      maskText === ''
+        ? REDACTION_TEXT.mask_empty
+        : maskText.includes(REDACTED)
+          ? REDACTION_TEXT.mask_placeholder
+          : value.includes(maskText)
+            ? null
+            : REDACTION_TEXT.mask_not_in_value;
+    if (refusal !== null) {
+      setHint({ text: refusal, at: 'node' });
+      return;
+    }
+    const at = single ? node.loc : null;
+    if (add(maskOp(maskText, at), at)) {
+      setMaskText('');
+      setOnlyHere(false);
+    }
   };
 
   const takeSelection = () => {
@@ -177,13 +221,19 @@ export function Panel(props: PanelProps) {
     const { loc } = node;
     const value = node.span.kind === 'string' && model !== null ? stringOf(model.text, node.span) : null;
     const bad = firstUnaddressable(loc);
-    const blockedDrops = roundSingles || removeAll;
+    const blockedDrops = roundSingles || baseSingles || removeAll;
     const already = droppedLoc(loc);
-    const dropButton = (label: string, op: RedactionOp | null, at: Loc) => (
-      <button type="button" disabled={blockedDrops || already || op === null} onClick={() => add(op, at)}>
-        {label}
-      </button>
-    );
+    let shifted = false;
+    const dropButton = (label: string, op: RedactionOp | null, at: Loc) => {
+      // A field across all items names no index: Rust reads it on every element.
+      const past = baseShifts && indexOnTheWay(at) && !(op !== null && 'drop_field' in op && op.drop_field.scope === 'all_items');
+      shifted ||= past;
+      return (
+        <button type="button" disabled={blockedDrops || already || past || op === null} onClick={() => add(op, at)}>
+          {label}
+        </button>
+      );
+    };
     let drops: ReactNode = null;
     if (bad >= 0) {
       const parent = loc.slice(0, bad);
@@ -205,13 +255,16 @@ export function Panel(props: PanelProps) {
           </>
         );
     }
-    const singleOk = roundDrops.length === 0 && concreteOf(loc) !== null;
+    const problem = value === null ? null : singleMaskProblem(value, maskText, roundMasks);
+    const singleOk = roundDrops.length === 0 && concreteOf(loc) !== null && problem === null;
     return (
       <>
         <div className="redaction-actions">
           {drops}
           {already ? <span>{REDACTION_TEXT.already_dropped}</span> : null}
           {roundSingles ? <p>{REDACTION_TEXT.drops_need_no_singles}</p> : null}
+          {baseSingles && drops !== null ? <p>{REDACTION_TEXT.drops_need_no_applied_singles}</p> : null}
+          {shifted && !blockedDrops ? <p>{REDACTION_TEXT.index_on_the_way}</p> : null}
         </div>
         {value === null ? null : (
           <div className="mask-form">
@@ -239,15 +292,16 @@ export function Panel(props: PanelProps) {
               />{' '}
               {REDACTION_TEXT.mask_only_here}
             </label>
-            <button type="button" disabled={removeAll} onClick={() => addMask(node, value)}>
+            <button type="button" disabled={removeAll} onClick={() => addMask(node, value, onlyHere && singleOk)}>
               {REDACTION_TEXT.mask_add}
             </button>
             {roundDrops.length > 0 ? <p>{REDACTION_TEXT.single_needs_no_drops}</p> : null}
-            <span className="field-hint" role="alert">
-              {hint ?? ''}
-            </span>
+            {problem === null ? null : <p>{SINGLE_PROBLEM_TEXT[problem]}</p>}
           </div>
         )}
+        <span className="field-hint" role="alert">
+          {hint?.at === 'node' ? hint.text : ''}
+        </span>
       </>
     );
   };
@@ -256,16 +310,25 @@ export function Panel(props: PanelProps) {
     if (model === null) return null;
     const value = node.span.kind === 'string' ? stringOf(model.text, node.span) : null;
     const points = value === null ? 0 : Array.from(value).length;
+    const shownValue = value === null ? null : cut(value, VALUE_SHOWN_MAX);
+    const escaped = shownValue === null ? null : escapeInvisible(shownValue);
     return (
       <section className="redaction-selected" aria-label={REDACTION_TEXT.selected}>
         <p>
           {REDACTION_TEXT.selected}: <Text value={displayOf(node.loc)} />
         </p>
-        {value === null ? null : (
-          <div className="tree-value-full" ref={valueRef} tabIndex={0} aria-label={REDACTION_TEXT.value}>
-            <AgentText value={cut(value, VALUE_SHOWN_MAX)} unusual={unusual(value)} />
-            {points > VALUE_SHOWN_MAX ? <p>{REDACTION_TEXT.value_cut(VALUE_SHOWN_MAX, points)}</p> : null}
-          </div>
+        {value === null || shownValue === null ? null : (
+          <>
+            <div className="tree-value-full" ref={valueRef} tabIndex={0} aria-label={REDACTION_TEXT.value}>
+              <AgentText value={shownValue} unusual={unusual(value)} />
+              {points > VALUE_SHOWN_MAX ? <p>{REDACTION_TEXT.value_cut(VALUE_SHOWN_MAX, points)}</p> : null}
+            </div>
+            {escaped === null || escaped === shownValue ? null : (
+              <div className="tree-value-escaped" aria-label={REDACTION_TEXT.value_escaped}>
+                {REDACTION_TEXT.value_escaped}: <AgentText value={escaped} unusual={unusual(escaped)} />
+              </div>
+            )}
+          </>
         )}
         {actions(node)}
       </section>
@@ -336,6 +399,16 @@ export function Panel(props: PanelProps) {
 
   const body = (): ReactNode => {
     if (candidate === null || candidate.state === 'loading') return <p role="status">{REDACTION_TEXT.loading}</p>;
+    if (candidate.state === 'failed') {
+      return (
+        <p role="alert">
+          {REDACTION_TEXT.read_failed}{' '}
+          <button type="button" onClick={candidate.retry}>
+            {REDACTION_TEXT.retry}
+          </button>
+        </p>
+      );
+    }
     if (model === null) return <p role="alert">{REDACTION_TEXT.unavailable}</p>;
     return (
       <>
@@ -422,10 +495,19 @@ export function Panel(props: PanelProps) {
       {presets.length === 0 ? null : (
         <div className="redaction-presets" role="group" aria-label={REDACTION_TEXT.presets}>
           {presets.map((p) => (
-            <button key={p} type="button" disabled={removeAll || roundSingles} onClick={() => add(presetOp(p), null)}>
+            <button
+              key={p}
+              type="button"
+              disabled={removeAll || roundSingles || baseSingles}
+              onClick={() => add(presetOp(p), null, 'presets')}
+            >
               {p === 'status_only' ? REDACTION_TEXT.preset_status_only : REDACTION_TEXT.preset_error_class_only}
             </button>
           ))}
+          {baseSingles ? <p>{REDACTION_TEXT.drops_need_no_applied_singles}</p> : null}
+          <span className="field-hint" role="alert">
+            {hint?.at === 'presets' ? hint.text : ''}
+          </span>
         </div>
       )}
       {showUrl ? (

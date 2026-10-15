@@ -247,11 +247,18 @@ describe('read redaction panel (spec 5.3, 6.3)', () => {
     const text = within(panel()).getByRole('textbox', { name: 'Text to mask' });
     fireEvent.change(text, { target: { value: '[REDACTED]' } });
     fireEvent.click(action('Mask text'));
-    expect(within(panel()).getByText('The text [REDACTED] cannot be masked')).toBeTruthy();
+    expect(within(panel()).getByText('A text that holds [REDACTED] cannot be masked')).toBeTruthy();
+    // So is a text that holds it among other text (Rust would block it: the placeholder holds it again).
+    fireEvent.change(text, { target: { value: 'was [REDACTED]' } });
+    fireEvent.click(action('Mask text'));
+    expect(within(panel()).getByText('A text that holds [REDACTED] cannot be masked')).toBeTruthy();
+    // A refused text stays in the field.
+    expect((text as HTMLInputElement).value).toBe('was [REDACTED]');
     // Text that is not in the selected value is refused too.
     fireEvent.change(text, { target: { value: 'elsewhere' } });
     fireEvent.click(action('Mask text'));
     expect(within(panel()).getByText('The text is not in this value')).toBeTruthy();
+    expect((text as HTMLInputElement).value).toBe('elsewhere');
     await checked();
     expect(mockedReport).not.toHaveBeenCalled();
     expect(within(panel()).queryByText('Not yet released')).toBeNull();
@@ -464,19 +471,42 @@ describe('read redaction panel (spec 5.3, 6.3)', () => {
     expect(within(panel()).getByText(/structured view is not available/)).toBeTruthy();
   });
 
-  it('the_same_op_is_never_added_twice', async () => {
+  it('the_same_op_is_never_added_twice_in_a_round_and_says_so', async () => {
     const applied: RedactionOp = { drop_field: { field_loc: 'fields.labels', scope: 'per_item' } };
-    await openPanel(context([applied]), 'jira_issue', { fields: { summary: 'x', labels: ['a'] } });
+    // The revision dropped `labels`: its candidate has none.
+    await openPanel(context([applied]), 'jira_issue', { fields: { summary: 'x plan', key: 'k' } });
     expand('fields');
     select('summary');
+    const text = within(panel()).getByRole('textbox', { name: 'Text to mask' }) as HTMLInputElement;
+    fireEvent.change(text, { target: { value: 'plan' } });
+    fireEvent.click(action('Mask text'));
+    fireEvent.change(text, { target: { value: 'plan' } });
+    fireEvent.click(action('Mask text'));
+    // Refused with a reason; the typed text stays.
+    expect(within(panel()).getByText('Already in this round')).toBeTruthy();
+    expect(text.value).toBe('plan');
+    fireEvent.change(text, { target: { value: '' } });
+    select('key');
     fireEvent.click(action('Drop field (this item)'));
-    select('summary');
-    fireEvent.click(action('Drop field (this item)'));
-    // Already applied to this revision: not added again.
-    select('labels');
-    fireEvent.click(action('Drop field (this item)'));
+    // The row's drop is now off ("already dropped"), so a second one cannot be clicked.
+    expect(action('Drop field (this item)').disabled).toBe(true);
     await checked();
-    expect(lastReportOps()).toEqual([applied, { drop_field: { field_loc: 'fields.summary', scope: 'per_item' } }]);
+    expect(lastReportOps()).toEqual([
+      applied,
+      { mask_text: { text: 'plan', every_occurrence: true, at: null } },
+      { drop_field: { field_loc: 'fields.key', scope: 'per_item' } },
+      { url_field: { mode: 'replace_whole' } },
+    ]);
+  });
+
+  it('a_preset_the_revision_already_holds_is_refused_with_a_reason', async () => {
+    const applied: RedactionOp = { preset: 'status_only' };
+    await openPanel(context([applied], []), 'upstream_error', { status: 404 });
+    fireEvent.click(action('Release status only'));
+    expect(within(panel()).getByText('Already applied to this revision')).toBeTruthy();
+    expect(within(panel()).queryByText('Not yet released')).toBeNull();
+    await checked();
+    expect(mockedReport).not.toHaveBeenCalled();
   });
 
   it('agent_strings_are_text_nodes_in_bdi', async () => {
@@ -580,6 +610,239 @@ describe('redaction rounds on a redacted revision', () => {
     fireEvent.click(panelRelease());
     await flush();
     expect(mockedDecide.mock.calls[1]?.[0]).toMatchObject({ decision: 'release', candidate_rev: rev2 });
+  });
+});
+
+describe('ops that would not act on what the revision shows (review T17 C1, I1, I2)', () => {
+  const ISSUES = {
+    issues: [
+      { summary: 's0' },
+      { summary: 's1' },
+      { summary: 's2' },
+      { summary: 's3 [REDACTED]' },
+      { summary: 's4' },
+    ],
+  };
+  const SINGLE: RedactionOp = { mask_text: { text: 'Falcon', every_occurrence: false, at: 'issues[3].summary' } };
+  const EVERY: RedactionOp = { mask_text: { text: 'Falcon', every_occurrence: true, at: null } };
+  const URL: RedactionOp = { url_field: { mode: 'replace_whole' } };
+
+  it('a_revision_single_mask_turns_drops_and_presets_off', async () => {
+    // Rust masks issues[3] after every drop: a drop of issues[1] would move the mask to issues[4]
+    // (core `a_later_drop_moves_a_revision_single_occurrence_mask`). It cannot be built.
+    await openPanel(context([SINGLE, URL], []), 'jira_issue', ISSUES);
+    expand('issues');
+    select('[1]');
+    expect(action('Drop item').disabled).toBe(true);
+    expect(within(panel()).getByText(/This revision masks a single occurrence/)).toBeTruthy();
+    fireEvent.click(action('Drop item'));
+    expand('[1]');
+    select('summary');
+    expect(action('Drop field (this item)').disabled).toBe(true);
+    expect(action('Drop field (all items)').disabled).toBe(true);
+    await checked();
+    expect(mockedReport).not.toHaveBeenCalled();
+    expect(within(panel()).queryByText('Not yet released')).toBeNull();
+    // Masks stay open (they place nothing after a drop), and so does Remove all.
+    const text = within(panel()).getByRole('textbox', { name: 'Text to mask' });
+    fireEvent.change(text, { target: { value: 's1' } });
+    fireEvent.click(action('Mask text'));
+    expect(within(panel()).getByText('Not yet released')).toBeTruthy();
+    expect(action('Remove all redactions').disabled).toBe(false);
+  });
+
+  it('an_every_occurrence_mask_leaves_drops_on', async () => {
+    // Control: an every-occurrence mask names no location, so the drop is built and sent after it.
+    await openPanel(context([EVERY, URL], []), 'jira_issue', ISSUES);
+    expand('issues');
+    select('[1]');
+    expect(action('Drop item').disabled).toBe(false);
+    expect(within(panel()).queryByText(/This revision masks a single occurrence/)).toBeNull();
+    fireEvent.click(action('Drop item'));
+    await checked();
+    expect(lastReportOps()).toEqual([EVERY, URL, { drop_field: { field_loc: 'issues[1]', scope: 'per_item' } }]);
+  });
+
+  it('a_revision_single_mask_turns_the_presets_off', async () => {
+    const single: RedactionOp = { mask_text: { text: 'ABC-9', every_occurrence: false, at: 'error_messages[0]' } };
+    await openPanel(context([single, URL], []), 'upstream_error', {
+      status: 404,
+      error_messages: ['Issue [REDACTED] does not exist'],
+    });
+    expect(action('Release status only').disabled).toBe(true);
+    expect(within(panel()).getByText(/This revision masks a single occurrence/)).toBeTruthy();
+  });
+
+  it('without_a_revision_single_mask_the_presets_are_on', async () => {
+    await openPanel(context([EVERY, URL], []), 'upstream_error', { status: 404, error_messages: ['Issue x'] });
+    expect(action('Release status only').disabled).toBe(false);
+  });
+
+  it('a_repeated_index_drop_names_the_element_the_revision_shows', async () => {
+    // The revision dropped the source's first label: its labels[0] is the source's second. The same
+    // op text again is the next label (core `ops_appended_to_a_revision_act_on_what_it_shows`).
+    const base: RedactionOp = { drop_field: { field_loc: 'fields.labels[0]', scope: 'per_item' } };
+    await openPanel(context([base], []), 'jira_issue', { fields: { labels: ['b', 'c'] } });
+    expand('fields');
+    expand('labels');
+    select('[0]');
+    fireEvent.click(action('Drop item'));
+    expect(within(panel()).getByText('Not yet released')).toBeTruthy();
+    expect(within(rowOf('[0]')).getByLabelText('dropped')).toBeTruthy();
+    await checked();
+    expect(lastReportOps()).toEqual([base, base]);
+    fireEvent.click(panelRelease());
+    await flush();
+    expect(sentRedactions()).toEqual([base, base]);
+  });
+
+  it('a_drop_past_an_index_of_a_shortened_list_is_not_offered', async () => {
+    // The revision dropped list[0]: the shown list[0].author is the source's list[1].author, and
+    // Rust checks the path on the source's list[0] (core
+    // `a_drop_past_a_shifted_index_is_checked_on_another_element`).
+    const base: RedactionOp = { drop_field: { field_loc: 'list[0]', scope: 'per_item' } };
+    const doc = { list: [{ body: 'y', author: 'Ann' }, { body: 'z', author: 'Bo' }] };
+    await openPanel(context([base], []), 'jira_issue', doc);
+    expand('list');
+    select('[0]');
+    // The element itself (the index is the path's end) is offered.
+    expect(action('Drop item').disabled).toBe(false);
+    expand('[0]');
+    select('author');
+    expect(action('Drop field (this item)').disabled).toBe(true);
+    expect(within(panel()).getByText(/named by position in a list this revision already shortened/)).toBeTruthy();
+    // Across all items names no index: offered, and sent after the revision's drop.
+    expect(action('Drop field (all items)').disabled).toBe(false);
+    fireEvent.click(action('Drop field (all items)'));
+    await checked();
+    expect(lastReportOps()).toEqual([base, { drop_field: { field_loc: 'list[0].author', scope: 'all_items' } }]);
+  });
+
+  it('a_drop_past_an_index_is_offered_when_no_drop_shortened_a_list', async () => {
+    // Control: the same location on a revision whose ops drop nothing.
+    await openPanel(context([EVERY, URL], []), 'jira_issue', { list: [{ body: 'y', author: 'Ann' }] });
+    expand('list');
+    expand('[0]');
+    select('author');
+    expect(action('Drop field (this item)').disabled).toBe(false);
+    expect(within(panel()).queryByText(/already shortened/)).toBeNull();
+  });
+
+  /** The "Only this occurrence" checkbox after typing `text` for the value of row `label`. */
+  async function onlyHereFor(doc: unknown, label: string, text: string) {
+    await openPanel(context([], []), 'jira_issue', doc);
+    select(label);
+    fireEvent.change(within(panel()).getByRole('textbox', { name: 'Text to mask' }), { target: { value: text } });
+    return within(panel()).getByRole('checkbox', { name: 'Only this occurrence' }) as HTMLInputElement;
+  }
+
+  it('only_this_occurrence_is_off_when_the_value_holds_the_text_twice', async () => {
+    const only = await onlyHereFor({ note: 'Falcon and Falcon' }, 'note', 'Falcon');
+    expect(only.disabled).toBe(true);
+    expect(within(panel()).getByText(/holds the text more than once/)).toBeTruthy();
+    // Clicking it changes nothing: the mask is every occurrence.
+    fireEvent.click(only);
+    fireEvent.click(action('Mask text'));
+    await checked();
+    expect(lastReportOps()?.[0]).toEqual({ mask_text: { text: 'Falcon', every_occurrence: true, at: null } });
+  });
+
+  it('only_this_occurrence_is_on_when_the_text_occurs_once', async () => {
+    const only = await onlyHereFor({ note: 'Falcon and Falcon' }, 'note', 'and Falcon');
+    expect(only.disabled).toBe(false);
+    fireEvent.click(only);
+    fireEvent.click(action('Mask text'));
+    await checked();
+    expect(lastReportOps()?.[0]).toEqual({ mask_text: { text: 'and Falcon', every_occurrence: false, at: 'note' } });
+  });
+
+  it('only_this_occurrence_counts_overlapping_occurrences', async () => {
+    // "aa" starts twice in "aaa": Rust masks the first.
+    expect((await onlyHereFor({ note: 'aaa' }, 'note', 'aa')).disabled).toBe(true);
+  });
+
+  it('only_this_occurrence_is_off_for_a_text_with_a_bracket', async () => {
+    const only = await onlyHereFor({ note: 'see [1] here' }, 'note', '[1]');
+    expect(only.disabled).toBe(true);
+    expect(within(panel()).getByText(/not offered for a text with \[ or \]/)).toBeTruthy();
+  });
+
+  it('only_this_occurrence_is_off_where_an_encoded_part_comes_first', async () => {
+    // Before the placeholder, "Falc&#111;n" is an encoded match Rust masks first.
+    const only = await onlyHereFor({ note: 'Falc&#111;n [REDACTED] Falcon' }, 'note', 'Falcon');
+    expect(only.disabled).toBe(true);
+    expect(within(panel()).getByText(/holds encoded text/)).toBeTruthy();
+  });
+
+  it('only_this_occurrence_is_on_for_an_encoded_value_without_a_placeholder', async () => {
+    // Control: one part, raw matches first: the one raw "Falcon" is the one masked.
+    expect((await onlyHereFor({ note: 'Falc&#111;n x Falcon' }, 'note', 'Falcon')).disabled).toBe(false);
+  });
+
+  it('only_this_occurrence_is_off_for_an_encoded_value_once_the_round_masks_text', async () => {
+    // A mask of the round can put a placeholder into the value before this one runs.
+    await openPanel(context([], []), 'jira_issue', { note: 'Falc&#111;n x Falcon', other: 'x' });
+    select('other');
+    const text = within(panel()).getByRole('textbox', { name: 'Text to mask' });
+    fireEvent.change(text, { target: { value: 'x' } });
+    fireEvent.click(action('Mask text'));
+    select('note');
+    fireEvent.change(text, { target: { value: 'Falcon' } });
+    expect((within(panel()).getByRole('checkbox', { name: 'Only this occurrence' }) as HTMLInputElement).disabled).toBe(
+      true,
+    );
+  });
+
+  it('a_ticked_single_mask_becomes_every_occurrence_once_a_drop_joins_the_round', async () => {
+    // The checkbox shows unchecked once a drop is in the round; the mask added is what it shows.
+    await openPanel();
+    expand('fields');
+    select('summary');
+    fireEvent.change(within(panel()).getByRole('textbox', { name: 'Text to mask' }), { target: { value: 'plan' } });
+    fireEvent.click(within(panel()).getByRole('checkbox', { name: 'Only this occurrence' }));
+    fireEvent.click(action('Drop field (this item)'));
+    const only = within(panel()).getByRole('checkbox', { name: 'Only this occurrence' }) as HTMLInputElement;
+    expect(only.checked).toBe(false);
+    fireEvent.click(action('Mask text'));
+    await checked();
+    const ops = lastReportOps() ?? [];
+    expect(ops).toContainEqual({ mask_text: { text: 'plan', every_occurrence: true, at: null } });
+    expect(ops.some((op) => 'mask_text' in op && !op.mask_text.every_occurrence)).toBe(false);
+  });
+});
+
+describe('the selected value and the candidate read', () => {
+  it('invisible_characters_are_shown_escaped', async () => {
+    const zwsp = String.fromCodePoint(0x200b);
+    const rlo = String.fromCodePoint(0x202e);
+    await openPanel(context(), 'jira_issue', { note: `Fal${zwsp}con ${rlo}x` });
+    select('note');
+    const escaped = within(panel()).getByLabelText('With invisible characters marked');
+    expect(escaped.querySelector('bdi')?.textContent).toBe('“Fal⟨U+200B⟩con ⟨U+202E⟩x”');
+  });
+
+  it('a_plain_value_has_no_escaped_line', async () => {
+    await openPanel(context(), 'jira_issue', { note: 'Falcon\tplan' });
+    select('note');
+    expect(within(panel()).queryByLabelText('With invisible characters marked')).toBeNull();
+  });
+
+  it('a_failed_read_can_be_tried_again', async () => {
+    serveCandidate(DOC);
+    mockedRaw.mockRejectedValueOnce({ kind: 'internal' });
+    mockedPreview.mockResolvedValue(readPreview(READ.candidate_rev));
+    mockedReport.mockResolvedValue(OK);
+    await renderWindow();
+    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    await flush();
+    fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
+    await flush();
+    expect(within(panel()).getByText('Could not read the candidate.')).toBeTruthy();
+    expect(within(panel()).queryByRole('list', { name: 'Candidate' })).toBeNull();
+    fireEvent.click(action('Try again'));
+    await flush();
+    expect(within(panel()).queryByText('Could not read the candidate.')).toBeNull();
+    expect(rowOf('fields')).toBeTruthy();
   });
 });
 

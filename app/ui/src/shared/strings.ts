@@ -161,6 +161,8 @@ export const REDACTION_TEXT = {
     'Redactions make a new revision of this request. Release sends them; open the new revision, review it, then release it.',
   loading: 'Loading the candidate',
   unavailable: 'The structured view is not available for this candidate. Use Release or Deny.',
+  read_failed: 'Could not read the candidate.',
+  retry: 'Try again',
   nothing: 'Nothing to redact in this request',
   tree_label: 'Candidate',
   root: '(root)',
@@ -179,6 +181,7 @@ export const REDACTION_TEXT = {
   selected: 'Selected',
   value: 'Value',
   value_cut: (shown: number, total: number) => `Showing ${shown} of ${total} characters`,
+  value_escaped: 'With invisible characters marked',
   drop_item: 'Drop item',
   drop_field_item: 'Drop field (this item)',
   drop_field_all: 'Drop field (all items)',
@@ -191,13 +194,24 @@ export const REDACTION_TEXT = {
   mask_only_here: 'Only this occurrence',
   mask_add: 'Mask text',
   mask_not_in_value: 'The text is not in this value',
-  /** M3 plan ~1724: the placeholder is public, so it is no hit. */
-  mask_placeholder: 'The text [REDACTED] cannot be masked',
+  /** M3 plan ~1724: the placeholder is public, so it is no hit; a text holding it would hold it again after masking. */
+  mask_placeholder: 'A text that holds [REDACTED] cannot be masked',
   mask_empty: 'Enter the text to mask',
   single_needs_no_drops:
     'Only this occurrence needs a revision without unreleased drops: release the drops first, then mask single occurrences in the new revision.',
   drops_need_no_singles:
     'Drops cannot join a single-occurrence mask in one release: remove the single-occurrence masks, or release them first.',
+  drops_need_no_applied_singles:
+    'This revision masks a single occurrence, which is placed after every drop: a drop now would move that mask. Remove all redactions to drop items or fields.',
+  index_on_the_way:
+    'This location is named by position in a list this revision already shortened: drop the list element above it, or remove all redactions first.',
+  single_bracket: 'Only this occurrence is not offered for a text with [ or ]: mask every occurrence.',
+  single_repeated:
+    'This value holds the text more than once and Rust masks the first: mask every occurrence, or select more text.',
+  single_encoded:
+    'This value holds encoded text where a mask can stand: Rust may mask another occurrence first. Mask every occurrence.',
+  already_in_round: 'Already in this round',
+  already_applied: 'Already applied to this revision',
   already_dropped: 'Already dropped in this round',
   url_mode: 'When a masked text appears in a link field',
   url_replace_whole: 'replace the whole link with [REDACTED]',

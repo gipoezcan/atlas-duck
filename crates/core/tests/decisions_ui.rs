@@ -376,6 +376,144 @@ fn ops_appended_to_a_revision_act_on_what_it_shows() -> TestResult {
     Ok(())
 }
 
+fn drop_at(p: &str) -> RedactionOp {
+    RedactionOp::DropField {
+        path: p.into(),
+        scope: atlas_duck_core::redact::DropScope::PerItem,
+    }
+}
+
+fn op_target_missing(blocked: &[BlockReason], at: &str) -> bool {
+    blocked
+        .iter()
+        .any(|b| matches!(b, BlockReason::OpTargetMissing { path } if path == at))
+}
+
+/// M6 T17 review C1, the rule the panel relies on: a single-occurrence mask's `at` is resolved
+/// after every drop of the set (apply.rs: drops first, then masks), so a drop appended to a
+/// revision that holds one moves the mask to another element. The panel offers no drop or
+/// preset on such a revision.
+#[test]
+fn a_later_drop_moves_a_revision_single_occurrence_mask() -> TestResult {
+    let spec = atlas_duck_registry::get(ISSUE).ok_or("no spec")?;
+    let rules = &spec.redaction_rules;
+    let issues = |four: &str| {
+        json!({"issues": [
+            {"summary": "s0"}, {"summary": "s1"}, {"summary": "s2"},
+            {"summary": "s3 Falcon"}, {"summary": four}
+        ]})
+    };
+    let single = RedactionOp::MaskText {
+        text: "Falcon".into(),
+        every_occurrence: false,
+        at: Some("issues[3].summary".into()),
+    };
+    let url = RedactionOp::UrlField {
+        mode: UrlMode::ReplaceWhole,
+    };
+    let round = [drop_at("issues[1]")];
+    let appended =
+        |base: &[RedactionOp]| -> Vec<RedactionOp> { base.iter().chain(&round).cloned().collect() };
+
+    // The element after the shown issues[3] does not hold the text: the mask names nothing.
+    let source = issues("s4");
+    let base = vec![single.clone(), url.clone()];
+    let shown = apply(&source, rules, None, &base);
+    assert!(shown.blocked.is_empty(), "{:?}", shown.blocked);
+    assert_eq!(
+        shown.released["issues"][3]["summary"],
+        json!("s3 [REDACTED]")
+    );
+    let on_shown = apply(&shown.released, rules, None, &round);
+    assert!(on_shown.blocked.is_empty(), "{:?}", on_shown.blocked);
+    let on_source = apply(&source, rules, None, &appended(&base));
+    assert!(
+        op_target_missing(&on_source.blocked, "issues[3].summary"),
+        "{:?}",
+        on_source.blocked
+    );
+
+    // It does: the wrong value is masked and the masked one comes back, nothing blocked.
+    let source = issues("s4 Falcon");
+    let on_source = apply(&source, rules, None, &appended(&base));
+    assert!(on_source.blocked.is_empty(), "{:?}", on_source.blocked);
+    assert_eq!(
+        on_source.released["issues"][2]["summary"],
+        json!("s3 Falcon")
+    );
+    assert_eq!(
+        on_source.released["issues"][3]["summary"],
+        json!("s4 [REDACTED]")
+    );
+
+    // Control: an every-occurrence mask has no location, so the drop acts as on the shown one.
+    let base = vec![mask("Falcon", true), url];
+    let shown = apply(&source, rules, None, &base);
+    let on_shown = apply(&shown.released, rules, None, &round);
+    let on_source = apply(&source, rules, None, &appended(&base));
+    assert!(on_source.blocked.is_empty(), "{:?}", on_source.blocked);
+    assert_eq!(on_source.released, on_shown.released);
+    Ok(())
+}
+
+/// M6 T17 review I1: a drop built on what a revision shows is checked against the source as well
+/// (apply.rs `drop_field`/`drop_item`: "matching nothing in the candidate is a mismatch"). Where
+/// the path continues past an element named by index whose list the revision shortened, that
+/// check reads another element than the one shown and blocks; a path ending in that index, or
+/// one that names elements by identity, reads the same element. The panel offers only those.
+#[test]
+fn a_drop_past_a_shifted_index_is_checked_on_another_element() -> TestResult {
+    let spec = atlas_duck_registry::get(ISSUE).ok_or("no spec")?;
+    let rules = &spec.redaction_rules;
+    let source = json!({"list": [
+        {"body": "x"},
+        {"body": "y", "author": "Ann"},
+        {"body": "z", "author": "Bo"}
+    ]});
+    let base = vec![drop_at("list[0]")];
+    let shown = apply(&source, rules, None, &base);
+    assert!(shown.blocked.is_empty(), "{:?}", shown.blocked);
+    assert_eq!(shown.released["list"][0]["author"], json!("Ann"));
+    let appended =
+        |round: &[RedactionOp]| -> Vec<RedactionOp> { base.iter().chain(round).cloned().collect() };
+
+    // The shown list[0] has an author, the source's list[0] has none: blocked.
+    let tail = [drop_at("list[0].author")];
+    let on_shown = apply(&shown.released, rules, None, &tail);
+    assert!(on_shown.blocked.is_empty(), "{:?}", on_shown.blocked);
+    let on_source = apply(&source, rules, None, &appended(&tail));
+    assert!(
+        op_target_missing(&on_source.blocked, "list[0].author"),
+        "{:?}",
+        on_source.blocked
+    );
+
+    // Offered: the element itself by index (again `list[0]`, a repeat of the base op) and a
+    // field across all items (no index left to read).
+    for round in [
+        vec![drop_at("list[0]")],
+        vec![RedactionOp::DropField {
+            path: "list[0].author".into(),
+            scope: atlas_duck_core::redact::DropScope::AllItems,
+        }],
+    ] {
+        let on_shown = apply(&shown.released, rules, None, &round);
+        let on_source = apply(&source, rules, None, &appended(&round));
+        assert!(
+            on_source.blocked.is_empty(),
+            "{round:?}: {:?}",
+            on_source.blocked
+        );
+        assert_eq!(on_source.released, on_shown.released, "{round:?}");
+    }
+    let repeat = apply(&source, rules, None, &appended(&[drop_at("list[0]")]));
+    assert_eq!(
+        repeat.released,
+        json!({"list": [{"body": "z", "author": "Bo"}]})
+    );
+    Ok(())
+}
+
 // ---- recent / needs attention (§5.6, X-13) ---------------------------------------------------------
 
 /// The identity call of the stale check (§5.4 step 5) answers as the PAT's user.

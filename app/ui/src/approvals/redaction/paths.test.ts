@@ -7,10 +7,13 @@ import {
   dropFieldOp,
   dropItemOp,
   firstUnaddressable,
+  indexOnTheWay,
+  isPlain,
   isUrlField,
   maskOp,
   ordered,
   pathOf,
+  singleMaskProblem,
   type Loc,
   type RoundOp,
 } from './paths';
@@ -77,7 +80,40 @@ describe('paths in the redaction grammar', () => {
   it('redacted_placeholder_selection_refused', () => {
     expect(maskOp('[REDACTED]', null)).toBeNull();
     expect(maskOp('', null)).toBeNull();
-    expect(maskOp('[REDACTED] x', null)).not.toBeNull();
+    // A text that holds the placeholder would hold it again after masking (Rust blocks it).
+    expect(maskOp('[REDACTED] x', null)).toBeNull();
+    expect(maskOp('REDACTED', null)).not.toBeNull();
+  });
+
+  it('is_plain_is_rusts_is_plain', () => {
+    expect(isPlain('Falcon plan\t\n\r ~!"#$\'()*,-./09:;<=>?@AZ[\\]^_`az{|}')).toBe(true);
+    for (const c of ['%', '&', '+', 'ü', '\x7f', '\x00', String.fromCodePoint(0x200b)]) {
+      expect(isPlain(`a${c}b`)).toBe(false);
+    }
+  });
+
+  it('single_mask_problems', () => {
+    expect(singleMaskProblem('Falcon and Falcon', 'and Falcon', false)).toBeNull();
+    expect(singleMaskProblem('Falcon and Falcon', 'Falcon', false)).toBe('repeated');
+    expect(singleMaskProblem('aaa', 'aa', false)).toBe('repeated');
+    expect(singleMaskProblem('a [1] b', '[1]', false)).toBe('bracket');
+    expect(singleMaskProblem('a [1] b', 'a [', false)).toBe('bracket');
+    // An encoded part before a placeholder (or one the round may add) is masked first.
+    expect(singleMaskProblem('Falc&#111;n [REDACTED] Falcon', 'Falcon', false)).toBe('encoded');
+    expect(singleMaskProblem('Falc&#111;n x Falcon', 'Falcon', true)).toBe('encoded');
+    expect(singleMaskProblem('Falc&#111;n x Falcon', 'Falcon', false)).toBeNull();
+    expect(singleMaskProblem('x [REDACTED] Falcon', 'Falcon', true)).toBeNull();
+    // Nothing typed, or a text not in the value: no problem of this kind (the add refuses those).
+    expect(singleMaskProblem('Falcon Falcon', '', false)).toBeNull();
+    expect(singleMaskProblem('Falcon', 'Kite', false)).toBeNull();
+  });
+
+  it('index_on_the_way_is_an_index_before_the_last_step', () => {
+    expect(indexOnTheWay([k('list'), i(0), k('author')])).toBe(true);
+    expect(indexOnTheWay([k('list'), i(0)])).toBe(false);
+    expect(indexOnTheWay([k('list'), i(0, 'a'), k('author')])).toBe(false);
+    expect(indexOnTheWay([k('list'), i(0, 'a'), k('labels'), i(2)])).toBe(false);
+    expect(indexOnTheWay([k('x'), i(1), i(2)])).toBe(true);
   });
 
   it('round_drops_by_index_go_first_in_reverse_document_order', () => {
