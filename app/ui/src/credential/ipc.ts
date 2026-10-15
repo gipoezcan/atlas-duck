@@ -6,6 +6,7 @@
 
 interface TauriInternals {
   invoke(cmd: string, args?: Record<string, unknown>): Promise<unknown>;
+  transformCallback(callback: (event: unknown) => void, once?: boolean): number;
 }
 
 function internals(): TauriInternals {
@@ -22,4 +23,20 @@ function internals(): TauriInternals {
  */
 export async function invoke(cmd: string, args: Record<string, unknown> = {}): Promise<unknown> {
   return internals().invoke(cmd, args);
+}
+
+/**
+ * Listens to an app event (what `event.listen` of the API package does). The callback gets no
+ * payload: the one event this page uses, `credential_context_changed`, carries none. Resolves to
+ * the unlisten function.
+ */
+export async function listen(event: string, callback: () => void): Promise<() => void> {
+  const t = internals();
+  const handler = t.transformCallback(() => {
+    callback();
+  });
+  const id = await t.invoke('plugin:event|listen', { event, target: { kind: 'Any' }, handler });
+  return () => {
+    void t.invoke('plugin:event|unlisten', { event, eventId: id });
+  };
 }
