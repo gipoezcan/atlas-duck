@@ -10,6 +10,7 @@ import type {
   QueueItem,
   RawPage,
   RecentItem,
+  RedactionOp,
   RedactionReport,
   StatusLine,
 } from './types';
@@ -98,7 +99,7 @@ export interface DecideArgs {
   decision: DecisionKind;
   candidate_rev: CandidateRev;
   edits?: { set?: Record<string, unknown>; remove?: string[] };
-  redactions?: Record<string, unknown>[];
+  redactions?: RedactionOp[];
   reason?: string;
   deny_details?: DenyDetails;
 }
@@ -127,7 +128,7 @@ export function denySession(sessionId: string, reason: string): Promise<DenyCoun
 export function redactionPreview(
   requestId: string,
   candidateRev: CandidateRev,
-  ops: Record<string, unknown>[],
+  ops: RedactionOp[],
 ): Promise<RedactionReport> {
   return call(
     'redaction_preview',

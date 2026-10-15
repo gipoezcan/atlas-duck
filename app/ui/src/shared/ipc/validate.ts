@@ -18,6 +18,8 @@ import type {
   QueueItem,
   RawPage,
   RecentItem,
+  RedactionContext,
+  RedactionOp,
   RedactionReport,
   RequestDetail,
   StatusLine,
@@ -199,8 +201,41 @@ export const isPreview = (v: unknown): v is Preview =>
     deny_prefill: strOrNull,
   });
 
+/** Exactly `keys`, no other key (a wire op is closed, like `RedactionOpWire`). */
+function closed(v: unknown, shape: Record<string, (x: unknown) => boolean>): v is Rec {
+  return fields(v, shape) && Object.keys(v).length === Object.keys(shape).length;
+}
+
+const oneOf =
+  (...values: readonly string[]) =>
+  (v: unknown): boolean =>
+    isStr(v) && values.includes(v);
+
+export const isRedactionOp = (v: unknown): v is RedactionOp => {
+  if (!rec(v) || Object.keys(v).length !== 1) return false;
+  if ('drop_item' in v) {
+    return closed(v.drop_item, { array_loc: isStr, key: isStr, value: (x) => x !== undefined });
+  }
+  if ('drop_field' in v) {
+    return closed(v.drop_field, { field_loc: isStr, scope: oneOf('per_item', 'all_items') });
+  }
+  if ('mask_text' in v) {
+    return closed(v.mask_text, { text: isStr, every_occurrence: isBool, at: strOrNull });
+  }
+  if ('url_field' in v) return closed(v.url_field, { mode: oneOf('replace_whole', 'drop') });
+  if ('preset' in v) return oneOf('status_only', 'error_class_only')(v.preset);
+  return false;
+};
+
+export const isRedactionContext = (v: unknown): v is RedactionContext =>
+  fields(v, { ops: arrayOf(isRedactionOp), url_fields: arrayOf(isStr) });
+
 export const isPreviewFetchResponse = (v: unknown): v is PreviewFetchResponse =>
-  fields(v, { preview: isPreview, srcdoc: isStr });
+  fields(v, {
+    preview: isPreview,
+    srcdoc: isStr,
+    redaction: (r) => r === null || isRedactionContext(r),
+  });
 
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });
 

@@ -9,6 +9,7 @@ import queueDetail from './fixtures/queue_detail.json';
 import queueItem from './fixtures/queue_item.json';
 import rawPage from './fixtures/raw_page.json';
 import recentItem from './fixtures/recent_item.json';
+import redactionContext from './fixtures/redaction_context.json';
 import redactionReport from './fixtures/redaction_report.json';
 import statusLine from './fixtures/status_line.json';
 import {
@@ -20,7 +21,10 @@ import {
   isQueueDetail,
   isQueueItem,
   isRawPage,
+  isPreviewFetchResponse,
   isRecentItem,
+  isRedactionContext,
+  isRedactionOp,
   isRedactionReport,
   isStatusLine,
   toCommandError,
@@ -38,6 +42,7 @@ describe('fixtures validate against their TS types', () => {
     ['deny_count', denyCount, arrayOf(isDenyCount)],
     ['recent_item', recentItem, arrayOf(isRecentItem)],
     ['redaction_report', redactionReport, arrayOf(isRedactionReport)],
+    ['redaction_context', redactionContext, arrayOf(isRedactionContext)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -92,6 +97,32 @@ describe('fixtures validate against their TS types', () => {
     expect(isPreview({ ...first, deny_prefill: null })).toBe(true);
     expect(isPreview({ ...first, deny_prefill: 1 })).toBe(false);
     expect(isPreview({ ...first, header: { ...first?.header, release_blocked: null } })).toBe(true);
+  });
+
+  it('redaction_context: every op kind validates in its wire form, any other shape is refused', () => {
+    const ops = redactionContext.flatMap((c) => c.ops);
+    const kinds = new Set(ops.map((op) => Object.keys(op)[0]));
+    for (const kind of ['drop_item', 'drop_field', 'mask_text', 'url_field', 'preset']) {
+      expect(kinds.has(kind)).toBe(true);
+    }
+    // `at: null` (every occurrence) is a valid Option.
+    expect(ops.some((op) => 'mask_text' in op && op.mask_text?.at === null)).toBe(true);
+    // Closed shapes: the Rust names (`array_path`, `path`) are not the wire names, extra keys and
+    // two ops in one object are refused.
+    expect(isRedactionOp({ drop_item: { array_path: 'a', key: 'id', value: '1' } })).toBe(false);
+    expect(isRedactionOp({ drop_field: { path: 'a', scope: 'per_item' } })).toBe(false);
+    expect(isRedactionOp({ drop_field: { field_loc: 'a', scope: 'per_item', x: 1 } })).toBe(false);
+    expect(isRedactionOp({ drop_field: { field_loc: 'a', scope: 'some' } })).toBe(false);
+    expect(isRedactionOp({ mask_text: { text: 'a', every_occurrence: true } })).toBe(false);
+    expect(isRedactionOp({ preset: 'everything' })).toBe(false);
+    expect(isRedactionOp({ preset: 'status_only', url_field: { mode: 'drop' } })).toBe(false);
+    // `preview_fetch`'s `redaction` is null (a write, an outcome item) or a context, never absent.
+    const [first] = preview;
+    const response = { preview: first, srcdoc: '' };
+    expect(isPreviewFetchResponse({ ...response, redaction: null })).toBe(true);
+    expect(isPreviewFetchResponse({ ...response, redaction: redactionContext[1] })).toBe(true);
+    expect(isPreviewFetchResponse(response)).toBe(false);
+    expect(isPreviewFetchResponse({ ...response, redaction: { ops: [], url_fields: [1] } })).toBe(false);
   });
 
   it('edit_form: every input kind validates, nulls are valid values, a wrong shape is refused', () => {

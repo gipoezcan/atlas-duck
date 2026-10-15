@@ -287,9 +287,11 @@ impl<'de> Deserialize<'de> for EditsDto {
 /// every key closed. The two `*_loc` fields are redaction-grammar locations inside the candidate
 /// JSON (`issues[key=A].fields`), not filesystem paths. Their wire names are the Rust names (the
 /// `check-commands` rule holds wire names too, so there is no rename back to `path`).
-#[derive(Deserialize)]
+/// `Serialize` (M6 T17): a revision's ops go back to the UI in this same form (`preview_fetch`),
+/// so the UI resends them unchanged in front of new ones.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-enum RedactionOpWire {
+pub enum RedactionOpWire {
     DropItem {
         array_loc: String,
         key: String,
@@ -351,6 +353,44 @@ impl RedactionOpWire {
             },
             Self::UrlField { mode } => RedactionOp::UrlField { mode },
             Self::Preset(p) => RedactionOp::Preset(p),
+        }
+    }
+}
+
+/// Redacting, as `RedactionOp`'s own `Debug` (§7.7): lengths, never the text, path or value.
+impl std::fmt::Debug for RedactionOpWire {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.clone().into_op(), f)
+    }
+}
+
+impl From<&RedactionOp> for RedactionOpWire {
+    fn from(op: &RedactionOp) -> Self {
+        match op.clone() {
+            RedactionOp::DropItem {
+                array_path,
+                key,
+                value,
+            } => Self::DropItem {
+                array_loc: array_path,
+                key,
+                value,
+            },
+            RedactionOp::DropField { path, scope } => Self::DropField {
+                field_loc: path,
+                scope,
+            },
+            RedactionOp::MaskText {
+                text,
+                every_occurrence,
+                at,
+            } => Self::MaskText {
+                text,
+                every_occurrence,
+                at,
+            },
+            RedactionOp::UrlField { mode } => Self::UrlField { mode },
+            RedactionOp::Preset(p) => Self::Preset(p),
         }
     }
 }
@@ -648,5 +688,58 @@ mod tests {
             })
         );
         assert!(parse::<AppStatusArgs>(&json!([])).is_err());
+    }
+
+    /// M6 T17: a revision's ops go to the UI in the wire form and come back in front of new
+    /// ones; what the UI resends unchanged must be the very ops core holds (`decide` compares
+    /// them to tell "release this revision" from "make a new one").
+    #[test]
+    fn redaction_ops_round_trip_through_their_wire_form() {
+        let ops = vec![
+            RedactionOp::DropItem {
+                array_path: "issues[key=A].fields.comment.comments".into(),
+                key: "id".into(),
+                value: json!("10001"),
+            },
+            RedactionOp::DropField {
+                path: "issues[3].fields.summary".into(),
+                scope: DropScope::AllItems,
+            },
+            RedactionOp::MaskText {
+                text: "Falcon".into(),
+                every_occurrence: true,
+                at: None,
+            },
+            RedactionOp::MaskText {
+                text: "Falcon".into(),
+                every_occurrence: false,
+                at: Some("issues[0].fields.summary".into()),
+            },
+            RedactionOp::UrlField {
+                mode: UrlMode::Drop,
+            },
+            RedactionOp::Preset(RedactionPreset::StatusOnly),
+        ];
+        let wire: Vec<RedactionOpWire> = ops.iter().map(RedactionOpWire::from).collect();
+        let sent = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            sent,
+            json!([
+                {"drop_item": {"array_loc": "issues[key=A].fields.comment.comments", "key": "id", "value": "10001"}},
+                {"drop_field": {"field_loc": "issues[3].fields.summary", "scope": "all_items"}},
+                {"mask_text": {"text": "Falcon", "every_occurrence": true, "at": null}},
+                {"mask_text": {"text": "Falcon", "every_occurrence": false, "at": "issues[0].fields.summary"}},
+                {"url_field": {"mode": "drop"}},
+                {"preset": "status_only"}
+            ])
+        );
+        let back: RedactionOpsDto = serde_json::from_value(sent).unwrap();
+        assert_eq!(back.0, ops);
+        // The wire form's `Debug` redacts like the op's own.
+        let debug = format!("{:?}", wire[3]);
+        assert!(
+            !debug.contains("Falcon") && !debug.contains("summary"),
+            "{debug}"
+        );
     }
 }

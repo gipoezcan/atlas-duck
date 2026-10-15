@@ -285,6 +285,97 @@ async fn redaction_preview_unopened_is_not_opened() -> TestResult {
     Ok(())
 }
 
+/// M6 T17: a delivery carries its revision's own ops, as `decide` stored them, and the op's URL
+/// fields: the panel appends ops built on what the revision shows to them (a new set replaces
+/// the old one, so sent alone they would bring the earlier drops back). A write has none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preview_delivery_carries_the_revision_ops() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mount_issue(mock, KEY, &full_issue(KEY)).await;
+    identity_ok(mock).await;
+    let id = queued(&h, ISSUE, json!({ "key": KEY })).await?;
+    let ap = h.approver();
+    let first = ap
+        .open(&id)
+        .map_err(de)?
+        .redaction
+        .ok_or("a read has one")?;
+    assert!(first.ops.is_empty());
+    let spec = atlas_duck_registry::get(ISSUE).ok_or("no spec")?;
+    assert_eq!(first.url_fields, spec.redaction_rules.url_fields);
+    assert!(!first.url_fields.is_empty());
+    let ops = vec![
+        RedactionOp::DropField {
+            path: "fields.summary".into(),
+            scope: atlas_duck_core::redact::DropScope::PerItem,
+        },
+        RedactionOp::UrlField {
+            mode: UrlMode::Drop,
+        },
+    ];
+    ap.redact(&id, ops.clone()).map_err(de)?;
+    let second = ap.open(&id).map_err(de)?.redaction.ok_or("still a read")?;
+    assert_eq!(second.ops, ops);
+    // A reopen of the same revision carries the same ops.
+    assert_eq!(ap.open(&id).map_err(de)?.redaction.ok_or("read")?.ops, ops);
+    let w = comment_item(&h, "Fixed.").await?;
+    assert_eq!(ap.open(&w).map_err(de)?.redaction, None);
+    Ok(())
+}
+
+/// M6 T17, the panel's rule in engine terms: ops built on the candidate a revision shows (the
+/// source with its ops applied), appended to that revision's ops, give what they give on the
+/// shown candidate itself, mirrors and copies included. Index paths resolve against the shown
+/// candidate because each drop resolves against the document the earlier drops left.
+#[test]
+fn ops_appended_to_a_revision_act_on_what_it_shows() -> TestResult {
+    let spec = atlas_duck_registry::get(ISSUE).ok_or("no spec")?;
+    let rules = &spec.redaction_rules;
+    let comments = |ids: &[&str]| -> Vec<Value> {
+        ids.iter()
+            .map(|i| json!({"id": i, "body": format!("comment {i} by Falcon")}))
+            .collect()
+    };
+    let source = json!({
+        "key": KEY,
+        "fields": {
+            "summary": "Falcon",
+            "labels": ["a", "b", "c", "d"],
+            "comment": {"comments": comments(&["1", "2", "3"])}
+        },
+        "renderedFields": {"comment": {"comments": comments(&["1", "2", "3"])}}
+    });
+    let drop = |p: &str| RedactionOp::DropField {
+        path: p.into(),
+        scope: atlas_duck_core::redact::DropScope::PerItem,
+    };
+    let base = vec![drop("fields.labels[0]"), drop("fields.comment.comments[0]")];
+    let shown = apply(&source, rules, None, &base);
+    assert!(shown.blocked.is_empty(), "{:?}", shown.blocked);
+    // Built on the shown candidate: its `labels[0]` is the source's "b", its first comment id 2.
+    let round = vec![
+        drop("fields.labels[1]"),
+        drop("fields.labels[0]"),
+        drop("fields.comment.comments[0]"),
+        mask("Falcon", true),
+    ];
+    let on_shown = apply(&shown.released, rules, None, &round);
+    let appended: Vec<RedactionOp> = base.iter().chain(&round).cloned().collect();
+    let on_source = apply(&source, rules, None, &appended);
+    assert!(on_source.blocked.is_empty(), "{:?}", on_source.blocked);
+    assert_eq!(on_source.released, on_shown.released);
+    assert_eq!(on_source.released["fields"]["labels"], json!(["d"]));
+    assert_eq!(
+        on_source.released["renderedFields"]["comment"]["comments"][0]["id"],
+        json!("3")
+    );
+    // Sent alone, the round acts on the source instead: another label, another comment.
+    let alone = apply(&source, rules, None, &round);
+    assert_ne!(alone.released, on_shown.released);
+    Ok(())
+}
+
 // ---- recent / needs attention (§5.6, X-13) ---------------------------------------------------------
 
 /// The identity call of the stale check (§5.4 step 5) answers as the PAT's user.

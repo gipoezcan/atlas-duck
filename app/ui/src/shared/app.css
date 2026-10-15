@@ -49,3 +49,16 @@
 .edit-form .pick, .edit-form .as-json { display: flex; gap: 0.35rem; align-items: center; }
 .edit-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .keyboard-legend { display: flex; flex-wrap: wrap; gap: 0 1rem; list-style: none; margin: 0 0 0.5rem 0; padding: 0; font-size: 0.85em; }
+.redaction-panel { display: flex; flex-direction: column; gap: 0.5rem; }
+.redaction-ops ul, .redaction-report ul { margin: 0.25rem 0; padding-left: 1.25rem; }
+.redaction-presets, .redaction-release, .redaction-actions, .mask-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.redaction-url { border: 1px solid #8886; }
+.tree-row { display: flex; align-items: center; gap: 0.35rem; height: 100%; white-space: nowrap; overflow: hidden; }
+.tree-toggle { flex: none; width: 1.75rem; }
+.tree-leaf { flex: none; width: 1.75rem; text-align: center; }
+.tree-select { display: flex; align-items: center; gap: 0.5rem; min-width: 0; flex: 0 1 auto; overflow: hidden; background: none; border: 0; padding: 0; text-align: left; font: inherit; color: inherit; }
+.tree-select[aria-pressed="true"] { outline: 2px solid currentColor; }
+.tree-scalar, .tree-count { font-family: monospace; }
+.tree-value-full { max-height: 16rem; overflow: auto; border: 1px solid #8886; padding: 0.35rem; }
+.tree-value-full .agent-text-value { max-width: none; white-space: pre-wrap; overflow-wrap: anywhere; overflow: visible; }
+.unaddressable { margin: 0; }

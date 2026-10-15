@@ -76,7 +76,7 @@ pub use credentials::KeychainCredentials;
 pub use decision::{
     BatchFailure, BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionKind,
     DecisionOutcome, DenyDetails, PreviewDelivery, QueueItem, RELEASE_BLOCKED_INTERNAL, RawPage,
-    RecentItem, RedactionReport, RequestDetail, SessionKey,
+    RecentItem, RedactionContext, RedactionReport, RequestDetail, SessionKey,
 };
 pub use edit::Edits;
 pub use engine::script::{

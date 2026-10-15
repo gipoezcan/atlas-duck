@@ -238,6 +238,7 @@ describe('Approvals window', () => {
     vi.mocked(previewFetch).mockResolvedValue({
       preview: previewFixture[0] as unknown as Preview,
       srcdoc: '<p>x</p>',
+      redaction: null,
     });
     fireEvent.click(await screen.findByRole('button', { name: 'Open jira.issue.get PROJ-1' }));
     await screen.findByTitle('Preview');

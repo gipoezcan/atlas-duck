@@ -18,5 +18,36 @@
     "blocked": [],
     "other_occurrences": 0,
     "released_bytes": 512
+  },
+  {
+    "also_appears_in": [],
+    "blocked": [
+      {
+        "path": "fields.description",
+        "reason": "unstable_encoding"
+      },
+      {
+        "path": "self",
+        "reason": "reencode_ambiguous"
+      },
+      {
+        "path": "renderedFields.comment.comments[1]",
+        "reason": "mirror_orphan"
+      },
+      {
+        "path": "renderedFields.worklog.worklogs[0]",
+        "reason": "mirror_unmatchable"
+      },
+      {
+        "path": "fields.user.email",
+        "reason": "op_target_missing"
+      },
+      {
+        "path": "",
+        "reason": "over_release_cap"
+      }
+    ],
+    "other_occurrences": 0,
+    "released_bytes": 16777217
   }
 ]

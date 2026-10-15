@@ -5,7 +5,7 @@
 
 use atlas_duck_core::{
     BatchOutcome, CandidateRev, Decision, DecisionApi, DecisionOutcome, QueueItem, RecentItem,
-    RedactionReport, RequestDetail,
+    RedactionContext, RedactionReport, RequestDetail,
 };
 use atlas_duck_preview::render::raw::incomplete_tail;
 use atlas_duck_preview::{Platform, Preview, render};
@@ -15,7 +15,7 @@ use tauri::{AppHandle, Runtime};
 
 use super::dto::{
     Args, BatchItems, CandidateRevDto, DecisionDto, DenyDetailsDto, EditsDto, PreviewOpsDto,
-    Reason, RedactionOpsDto, RequestId, RequestIds, SessionId,
+    Reason, RedactionOpWire, RedactionOpsDto, RequestId, RequestIds, SessionId,
 };
 use super::{CommandError, blocking, core, finish};
 
@@ -301,12 +301,31 @@ pub struct PreviewFetchArgs {
     pub candidate_rev: Option<CandidateRevDto>,
 }
 
-/// `{preview, srcdoc}` (Δ1, PD-67): the preview model for the Structured/Raw/Request tabs and the
-/// Rust-rendered document the UI sets as the `srcDoc` of the `<iframe sandbox="">`.
+/// `{preview, srcdoc, redaction}` (Δ1, PD-67; `redaction` M6 T17): the preview model for the
+/// Structured/Raw/Request tabs, the Rust-rendered document the UI sets as the `srcDoc` of the
+/// `<iframe sandbox="">`, and what the redaction panel builds on (`null` for a write or a read
+/// outcome item).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreviewFetchResponse {
     pub preview: Preview,
     pub srcdoc: String,
+    pub redaction: Option<RedactionContextDto>,
+}
+
+/// `RedactionContext` with its ops in the wire form the UI sends back (`RedactionOpWire`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RedactionContextDto {
+    pub ops: Vec<RedactionOpWire>,
+    pub url_fields: Vec<&'static str>,
+}
+
+impl From<&RedactionContext> for RedactionContextDto {
+    fn from(c: &RedactionContext) -> Self {
+        RedactionContextDto {
+            ops: c.ops.iter().map(RedactionOpWire::from).collect(),
+            url_fields: c.url_fields.clone(),
+        }
+    }
 }
 
 /// What `preview_fetch` does over a `DecisionApi`: core commits `PREVIEW_SHOWN` before it returns
@@ -316,12 +335,15 @@ pub fn preview_fetch_dto(
     request_id: &str,
     rev: Option<CandidateRev>,
 ) -> Result<PreviewFetchResponse, CommandError> {
-    let preview = decisions
+    let delivery = decisions
         .preview_fetch(request_id, rev)
-        .map_err(CommandError::from_candidate_read)?
-        .preview;
-    let srcdoc = render::document(&preview, Platform::current());
-    Ok(PreviewFetchResponse { preview, srcdoc })
+        .map_err(CommandError::from_candidate_read)?;
+    let srcdoc = render::document(&delivery.preview, Platform::current());
+    Ok(PreviewFetchResponse {
+        redaction: delivery.redaction.as_ref().map(RedactionContextDto::from),
+        preview: delivery.preview,
+        srcdoc,
+    })
 }
 
 /// `preview_fetch` (§5.6 "Opened"): on the blocking pool as well (a large candidate takes a

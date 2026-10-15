@@ -42,6 +42,7 @@ function responseOf(kind: string, over: Record<string, unknown> = {}): PreviewFe
       ...over,
     },
     srcdoc: '<!doctype html><p>preview</p>',
+    redaction: null,
   };
 }
 
@@ -263,7 +264,8 @@ describe('Detail', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Raw' }));
     await waitFor(() => expect(mockedRaw).toHaveBeenCalledTimes(1));
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
-    expect(screen.getByText(/Open the preview to use the structured view/)).toBeTruthy();
+    // This preview carries no redaction context (`redaction: null`): nothing to redact.
+    expect(screen.getByText('Nothing to redact in this request')).toBeTruthy();
   });
 
   it('request_tab_all_text_nodes', async () => {

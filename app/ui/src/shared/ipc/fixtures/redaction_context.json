@@ -1,0 +1,63 @@
+[
+  {
+    "ops": [],
+    "url_fields": [
+      "self",
+      "fields.attachment[].content"
+    ]
+  },
+  {
+    "ops": [
+      {
+        "drop_item": {
+          "array_loc": "fields.comment.comments",
+          "key": "id",
+          "value": "10001"
+        }
+      },
+      {
+        "drop_field": {
+          "field_loc": "issues[key=ABC-1].fields.summary",
+          "scope": "per_item"
+        }
+      },
+      {
+        "drop_field": {
+          "field_loc": "issues[key=ABC-1].fields.labels",
+          "scope": "all_items"
+        }
+      },
+      {
+        "mask_text": {
+          "at": null,
+          "every_occurrence": true,
+          "text": "Falcon"
+        }
+      },
+      {
+        "mask_text": {
+          "at": "fields.description",
+          "every_occurrence": false,
+          "text": "Falcon"
+        }
+      },
+      {
+        "url_field": {
+          "mode": "replace_whole"
+        }
+      },
+      {
+        "url_field": {
+          "mode": "drop"
+        }
+      },
+      {
+        "preset": "status_only"
+      },
+      {
+        "preset": "error_class_only"
+      }
+    ],
+    "url_fields": []
+  }
+]

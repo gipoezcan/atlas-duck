@@ -9,14 +9,23 @@ import {
 } from 'react';
 
 import { decide, previewFetch, type DenyDetails } from '../shared/ipc/invoke';
-import type { PreviewFetchResponse, QueueItem } from '../shared/ipc/types';
-import { CLASS_LABELS, DETAIL_TEXT, EDIT_TEXT, STATUS_LABELS } from '../shared/strings';
-import { cardOf, DecisionBar, type DecisionArgs } from './DecisionBar';
+import type { PreviewFetchResponse, QueueItem, UrlMode } from '../shared/ipc/types';
+import { CLASS_LABELS, DETAIL_TEXT, EDIT_TEXT, REDACTION_TEXT, STATUS_LABELS } from '../shared/strings';
+import { cardOf, DecisionBar, STATUS_ONLY, type DecisionArgs } from './DecisionBar';
 import { DenyDialog } from './DenyDialog';
 import { buildEdits, EditForm, type Draft, type Drafts } from './EditForm';
 import { candidateKey, useInert } from './inert';
 import { PreviewFrame } from './PreviewFrame';
 import { RawPager } from './RawPager';
+import { Panel } from './redaction/Panel';
+import { canonical, type RoundOp } from './redaction/paths';
+import {
+  draftOf,
+  releaseReady,
+  revKey,
+  useCandidate,
+  useRedactionReport,
+} from './redaction/state';
 import { RequestTab } from './RequestTab';
 
 type TabId = 'preview' | 'structured' | 'raw' | 'request';
@@ -115,6 +124,16 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   const [rejection, setRejection] = useState<string | null>(null);
   /** An edit made a new revision that has not been opened yet. */
   const [edited, setEdited] = useState(false);
+  /** Reads (task 17): the redaction round built on the displayed revision, kept across tabs. */
+  const [round, setRound] = useState<RoundOp[]>([]);
+  const [urlChoice, setUrlChoice] = useState<UrlMode | null>(null);
+  const [removeAll, setRemoveAll] = useState(false);
+  /** The ops whose "N other occurrences remain" the user confirmed (bound to those exact ops). */
+  const [confirmedKey, setConfirmedKey] = useState<string | null>(null);
+  /** Text typed for a mask and not added yet. */
+  const [pendingInput, setPendingInput] = useState(false);
+  const [redactionApplied, setRedactionApplied] = useState(false);
+  const panelRef = useRef<HTMLElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const latest = useRef(0);
 
@@ -127,6 +146,11 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
     setDrafts({});
     setRejection(null);
     setEdited(false);
+    setRound([]);
+    setUrlChoice(null);
+    setRemoveAll(false);
+    setConfirmedKey(null);
+    setRedactionApplied(false);
     previewFetch(item.request_id).then(
       (response) => {
         if (mine !== latest.current) return;
@@ -166,13 +190,39 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   const built = form === null ? null : buildEdits(form, drafts);
   /** The form holds changes that are not sent: an approve would leave them out. */
   const unsentEdits = built?.changed ?? false;
+  // Reads and scripts (task 17): the redaction round and what Release would send. The revision
+  // shows the source with its own ops applied; the round is built on what it shows.
+  const context = shown?.redaction ?? null;
+  const redactable =
+    context !== null && shown !== null && releaseBlocked === null && !gone && shown.preview.body.kind !== 'outcome';
+  const draft = redactable ? draftOf(context, round, urlChoice, removeAll) : null;
+  /** Redactions the user built and has not released: every other positive control is off. */
+  const unsentRedactions = (draft?.unsent ?? false) || pendingInput;
+  const shownRev = shown?.preview.candidate_rev ?? null;
+  const shownRevKey = shownRev === null ? '' : revKey(shownRev);
+  const report = useRedactionReport(item.request_id, redactable ? shownRev : null, draft);
+  const candidate = useCandidate(item.request_id, redactable ? shownRev : null, redactable && tab === 'structured');
+  const reportShown =
+    report !== null && draft !== null && report.rev === shownRevKey && report.key === draft.key ? report : null;
+  /** The redaction panel's Release (spec 5.3): the report for exactly these ops, nothing blocked, others confirmed. */
+  const redactionReleaseOk =
+    draft !== null && !pendingInput && releaseReady(draft, shownRevKey, report, confirmedKey);
+
   const positiveEnabled =
     shown !== null &&
     shown.preview.approvable &&
     !busy &&
     !denyOpen &&
     !unsentEdits &&
+    !unsentRedactions &&
     !inert.approveInert;
+  const panelReleaseEnabled =
+    shown !== null &&
+    shown.preview.approvable &&
+    !busy &&
+    !denyOpen &&
+    !inert.approveInert &&
+    redactionReleaseOk;
   /** The edit button: not an approval, so a preview that is not approvable can still be edited. */
   const editEnabled =
     form !== null &&
@@ -207,6 +257,26 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       inert.approveInertNow()
     ) {
       return;
+    } else if (args.redactions !== undefined) {
+      // A release with ops is either the panel's (exactly the ops Rust's last report was computed
+      // for on this revision, nothing blocked, others confirmed) or the card's one-click "Release
+      // status only" with no unreleased round. Anything else is not what the approver saw checked.
+      const sent = canonical(args.redactions);
+      const fromPanel =
+        draft !== null &&
+        draft.unsent &&
+        sent === draft.key &&
+        !pendingInput &&
+        releaseReady(draft, shownRevKey, report, confirmedKey);
+      const statusOnly =
+        !unsentRedactions &&
+        sent === canonical(STATUS_ONLY) &&
+        card !== null &&
+        card.positives.some((p) => p.args.redactions !== undefined && canonical(p.args.redactions) === sent);
+      if (!fromPanel && !statusOnly) return;
+    } else if (unsentRedactions) {
+      // A plain release would leave the unreleased redactions out.
+      return;
     }
     setRejection(null);
     const rev = shown?.preview.candidate_rev ?? item.candidate_rev;
@@ -231,7 +301,10 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           // follows the user's own "Release status only" press, so it is not a navigation the user
           // did not ask for. The new revision is displayed once the queue re-read brings it, and
           // `useInert` starts the inert period then, as for any displayed candidate change.
+          // Task 17: the panel's release with ops takes the same path; the round is cleared by the
+          // open, the new revision's own ops come with its preview.
           open();
+          if (args.redactions !== undefined) setRedactionApplied(true);
         } else {
           // No auto-advance: the decided item stays selected, its preview is cleared, nothing is fetched.
           latest.current++;
@@ -280,9 +353,29 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
     heading.current?.focus();
   };
 
+  const releaseFromPanel = () => {
+    if (draft === null) return;
+    send(draft.unsent ? { decision: 'release_redacted', redactions: draft.ops } : { decision: 'release' });
+  };
+
+  /**
+   * Focus or a text selection in the redaction panel: the user is building redactions there, so a
+   * window-wide approve chord must not release past them (the panel's Release button still works).
+   */
+  const panelHolds = (): boolean => {
+    const el = panelRef.current;
+    if (el === null) return false;
+    if (el.contains(document.activeElement)) return true;
+    const sel = window.getSelection();
+    return (
+      sel !== null && !sel.isCollapsed && (el.contains(sel.anchorNode) || el.contains(sel.focusNode))
+    );
+  };
+
   // The chord runs the first positive action through `send()`, the same gate as the button.
   useImperativeHandle(ref, () => ({
     approve: () => {
+      if (panelHolds()) return;
       const primary = card?.positives[0];
       if (primary !== undefined) send(primary.args);
     },
@@ -325,7 +418,37 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
         />
       );
     }
-    return <p>{DETAIL_TEXT.structured_pending}</p>;
+    if (redactable && draft !== null && context !== null) {
+      return (
+        <Panel
+          ref={panelRef}
+          candidate={candidate}
+          context={context}
+          round={round}
+          onRound={(next) => {
+            setRemoveAll(false);
+            setRound(next);
+          }}
+          urlChoice={urlChoice}
+          onUrlChoice={setUrlChoice}
+          removeAll={removeAll}
+          onRemoveAll={(on) => {
+            setRound([]);
+            setRemoveAll(on);
+          }}
+          draft={draft}
+          report={reportShown}
+          confirmed={confirmedKey === draft.key}
+          onConfirm={(on) => setConfirmedKey(on ? draft.key : null)}
+          upstreamError={shown.preview.body.kind === 'upstream_error'}
+          script={shown.preview.header.class === 'script'}
+          canRelease={panelReleaseEnabled}
+          onRelease={releaseFromPanel}
+          onPendingInput={setPendingInput}
+        />
+      );
+    }
+    return <p>{REDACTION_TEXT.nothing}</p>;
   };
 
   return (
@@ -351,6 +474,8 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${STATUS_LABELS[decided] ?? decided}`}</p>}
       {edited ? <p role="status">{EDIT_TEXT.applied}</p> : null}
       {unsentEdits ? <p role="status">{EDIT_TEXT.unsent}</p> : null}
+      {redactionApplied ? <p role="status">{REDACTION_TEXT.applied}</p> : null}
+      {unsentRedactions ? <p role="status">{REDACTION_TEXT.unsent}</p> : null}
       {actionFailed ? <p role="alert">{DETAIL_TEXT.action_failed}</p> : null}
       <DecisionBar
         card={card}

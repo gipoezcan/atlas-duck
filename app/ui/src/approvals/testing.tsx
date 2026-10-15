@@ -7,7 +7,13 @@ import previewFixture from '../shared/ipc/fixtures/preview.json';
 import queueFixture from '../shared/ipc/fixtures/queue_item.json';
 import { on } from '../shared/ipc/events';
 import { appStatus, decide, previewFetch, queueList, recentList } from '../shared/ipc/invoke';
-import type { CandidateRev, Preview, PreviewFetchResponse, QueueItem } from '../shared/ipc/types';
+import type {
+  CandidateRev,
+  Preview,
+  PreviewFetchResponse,
+  QueueItem,
+  RedactionContext,
+} from '../shared/ipc/types';
 import { App } from './App';
 
 export const items: readonly QueueItem[] = queueFixture satisfies QueueItem[];
@@ -20,6 +26,7 @@ export function previewOf(
   item: QueueItem,
   kind: string,
   over: Partial<Preview> = {},
+  redaction: RedactionContext | null = null,
 ): PreviewFetchResponse {
   const base = previews.find((p) => p.body.kind === kind);
   if (base === undefined) throw new Error(`no ${kind} fixture`);
@@ -32,6 +39,7 @@ export function previewOf(
       ...over,
     },
     srcdoc: '<!doctype html><p>preview</p>',
+    redaction,
   };
 }
 

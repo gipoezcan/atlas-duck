@@ -154,6 +154,86 @@ export const EDIT_TEXT = {
   keys: 'In these fields Ctrl/Cmd+Shift+Down / Up select text and do not change the request',
 } as const;
 
+/** spec 5.3 (verbatim where quoted) and plan text (Task 17): the read redaction panel. */
+export const REDACTION_TEXT = {
+  label: 'Redact before releasing',
+  intro:
+    'Redactions make a new revision of this request. Release sends them; open the new revision, review it, then release it.',
+  loading: 'Loading the candidate',
+  unavailable: 'The structured view is not available for this candidate. Use Release or Deny.',
+  nothing: 'Nothing to redact in this request',
+  tree_label: 'Candidate',
+  root: '(root)',
+  expand: 'Expand',
+  collapse: 'Collapse',
+  link_field: 'link field',
+  dropped: 'dropped',
+  applied_heading: 'Applied to this revision',
+  round_heading: 'Not yet released',
+  none_applied: 'none',
+  remove: 'Remove',
+  remove_all: 'Remove all redactions',
+  remove_all_pending:
+    'All redactions of this revision will be removed. Release makes a revision with the full candidate.',
+  undo_remove_all: 'Keep the redactions',
+  selected: 'Selected',
+  value: 'Value',
+  value_cut: (shown: number, total: number) => `Showing ${shown} of ${total} characters`,
+  drop_item: 'Drop item',
+  drop_field_item: 'Drop field (this item)',
+  drop_field_all: 'Drop field (all items)',
+  /** plan text, verbatim (N-6). */
+  unaddressable: 'this key cannot be addressed; drop its parent',
+  drop_parent: 'Drop parent',
+  root_unaddressable: 'this key cannot be addressed and the root cannot be dropped; mask its text or deny',
+  mask_label: 'Text to mask',
+  mask_use_selection: 'Use selected text',
+  mask_only_here: 'Only this occurrence',
+  mask_add: 'Mask text',
+  mask_not_in_value: 'The text is not in this value',
+  /** M3 plan ~1724: the placeholder is public, so it is no hit. */
+  mask_placeholder: 'The text [REDACTED] cannot be masked',
+  mask_empty: 'Enter the text to mask',
+  single_needs_no_drops:
+    'Only this occurrence needs a revision without unreleased drops: release the drops first, then mask single occurrences in the new revision.',
+  drops_need_no_singles:
+    'Drops cannot join a single-occurrence mask in one release: remove the single-occurrence masks, or release them first.',
+  already_dropped: 'Already dropped in this round',
+  url_mode: 'When a masked text appears in a link field',
+  url_replace_whole: 'replace the whole link with [REDACTED]',
+  url_drop: 'drop the link field',
+  presets: 'Presets',
+  preset_status_only: 'Release status only',
+  preset_error_class_only: 'Keep error class only',
+  checking: 'Checking the redactions',
+  check_failed: 'Could not check these redactions. Change them or deny.',
+  blocked: 'Release is blocked:',
+  also_appears_in: 'also appears in:',
+  /** spec 5.3: Rust's own "N other occurrences remain" text. */
+  other_occurrences: (n: number) =>
+    n === 1 ? '1 other occurrence remains' : `${n} other occurrences remain`,
+  confirm_others: 'Release anyway: the other occurrences stay in what the agent receives',
+  released_bytes: (n: number) => `Released size: ${n} bytes`,
+  release: 'Release',
+  release_redacted_hint: 'Release sends these redactions; the new revision is then opened for review.',
+  unsent:
+    'Unreleased redactions: release them from the redaction panel, or remove them. The other release controls stay off until then.',
+  applied:
+    'Redactions applied: the request has a new revision. Review it, then release it.',
+  keys: 'While this panel has focus or a selection, Ctrl/Cmd+Shift+Enter does nothing here; use the Release button',
+} as const;
+
+/** spec 5.3 / C.7: why a release is blocked, by `BlockReason.reason`. */
+export const BLOCK_REASON_TEXT: Readonly<Record<string, string>> = {
+  mask_still_occurs: 'a masked text still occurs',
+  unstable_encoding: 'a value still changes after 3 decoding rounds',
+  reencode_ambiguous: 'a match could not be masked cleanly',
+  mirror_orphan: 'a mirrored entry has no counterpart',
+  mirror_unmatchable: 'mirrored entries cannot be matched',
+  op_target_missing: 'a redaction names nothing in the candidate',
+  over_release_cap: 'the redacted candidate is over the 16 MiB release cap',
+};
+
 /** plan text (Task 14): the Raw pager. */
 export const RAW_TEXT = {
   label: 'Raw',

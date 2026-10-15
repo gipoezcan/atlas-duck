@@ -176,9 +176,32 @@ pub struct BatchOutcome {
 }
 
 /// Handed out only after `PREVIEW_SHOWN` is committed (§5.6 "opened").
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PreviewDelivery {
     pub preview: Preview,
+    /// M6 T17: what the redaction panel builds on; `None` where there is nothing to redact (a
+    /// write, a read outcome item).
+    pub redaction: Option<RedactionContext>,
+}
+
+/// M6 T17: the redaction state of a read or script revision. Ops are absolute against the source
+/// body and a new set replaces the revision's (`decide`), so the candidate this revision shows is
+/// the source body with `ops` applied: ops built on what it shows go after `ops`, never alone.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RedactionContext {
+    /// The revision's own ops, as `decide` stored them (empty for the first revision).
+    pub ops: Vec<RedactionOp>,
+    /// The op's URL-valued field patterns (§5.3 rule 2, `RedactionRules::url_fields`).
+    pub url_fields: Vec<&'static str>,
+}
+
+impl RedactionContext {
+    fn of(spec: &atlas_duck_registry::OperationSpec, ops: Vec<RedactionOp>) -> RedactionContext {
+        RedactionContext {
+            ops,
+            url_fields: spec.redaction_rules.url_fields.to_vec(),
+        }
+    }
 }
 
 /// An exact slice of the hashed candidate bytes.
@@ -644,9 +667,10 @@ fn queue_changed(engine: &Engine, entry: &RequestEntry) {
     });
 }
 
-/// What a preview delivery shows: the preview, the revision it shows and whether that revision
-/// was opened before. `None` = the revision moved on while it was built.
-type Built = Option<(Preview, CandidateRev, bool)>;
+/// What a preview delivery shows: the preview, the revision it shows, whether that revision was
+/// opened before and its redaction state (M6 T17). `None` = the revision moved on while it was
+/// built.
+type Built = Option<(Preview, CandidateRev, bool, Option<RedactionContext>)>;
 
 /// A read's preview: its candidate (rebuilt if evicted) through the op's previewer or the cards.
 async fn read_preview(
@@ -668,11 +692,14 @@ async fn read_preview(
         } else {
             st.read.clone().map(|read| {
                 let at = (current_rev(&st), st.approvable(), st.model.opened());
-                (read, at, st.rebuild_failed)
+                // Taken under the same lock as the revision it belongs to.
+                let redaction = (read.item != ReleaseItem::Outcome)
+                    .then(|| RedactionContext::of(entry.spec, st.redaction_ops.clone()));
+                (read, at, st.rebuild_failed, redaction)
             })
         }
     };
-    let Some((read, (shown, approvable, opened), failed)) = built else {
+    let Some((read, (shown, approvable, opened), failed, redaction)) = built else {
         return Ok(None);
     };
     let (_, cx) = read_context(engine, entry);
@@ -692,7 +719,7 @@ async fn read_preview(
         deny_offers: Vec::new(),
         deny_prefill: None,
     };
-    Ok(Some((preview, shown, opened)))
+    Ok(Some((preview, shown, opened, redaction)))
 }
 
 /// M5 M-11: a revision whose candidate failed closed (`rebuild_failed`, e.g. a read's first
@@ -747,7 +774,7 @@ async fn write_preview(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, submitte
         deny_offers: offers::deny_offers(entry.spec.id, &w, Some(hold)),
         deny_prefill: (hold == Hold::Conflict).then(|| write::CONFLICT_DENY_PREFILL.to_owned()),
     };
-    Some((preview, shown, opened))
+    Some((preview, shown, opened, None))
 }
 
 /// Step 6 (PD-19 order, PD-29): a dry step first, so no `PREVIEW_SHOWN` is ever committed for
@@ -772,7 +799,7 @@ async fn preview_fetch(
         // A dry run is terminal at once: it never waits for a decision.
         Kind::DryRun => return Err(DecisionError::NotDecidable),
     };
-    let Some((preview, shown, opened)) = built else {
+    let Some((preview, shown, opened, redaction)) = built else {
         let at = snapshot(&entry.state());
         let r = Rejection::StaleRev {
             current: at.current.counter,
@@ -789,7 +816,7 @@ async fn preview_fetch(
     );
     // §5.6: only the first delivery of a revision commits `PREVIEW_SHOWN`.
     if opened {
-        return Ok(PreviewDelivery { preview });
+        return Ok(PreviewDelivery { preview, redaction });
     }
     let warning_ids: Vec<String> = preview
         .warnings
@@ -816,7 +843,7 @@ async fn preview_fetch(
         )
         .await
     {
-        Ok(_) => Ok(PreviewDelivery { preview }),
+        Ok(_) => Ok(PreviewDelivery { preview, redaction }),
         Err(e) => {
             Err(transition_failed(&engine, &entry, e, submitted, SubmittedDecision::Preview).await)
         }
@@ -1171,11 +1198,12 @@ async fn script_preview(
         } else {
             st.script.clone().map(|s| {
                 let at = (current_rev(&st), st.approvable(), st.model.opened());
-                (s, at, st.rebuild_failed)
+                let redaction = RedactionContext::of(entry.spec, st.redaction_ops.clone());
+                (s, at, st.rebuild_failed, redaction)
             })
         }
     };
-    let Some((script, (shown, approvable, opened), failed)) = built else {
+    let Some((script, (shown, approvable, opened), failed, redaction)) = built else {
         return Ok(None);
     };
     let model = script::preview_model(&script, &c);
@@ -1194,7 +1222,7 @@ async fn script_preview(
         deny_offers: Vec::new(),
         deny_prefill: None,
     };
-    Ok(Some((preview, shown, opened)))
+    Ok(Some((preview, shown, opened, Some(redaction))))
 }
 
 /// `SCRIPT_RELEASED` of the current revision's exact candidate `c` with its redaction ops.

@@ -1,14 +1,14 @@
 import { Fragment, useId, type ReactNode } from 'react';
 
 import type { DecideArgs } from '../shared/ipc/invoke';
-import type { Preview } from '../shared/ipc/types';
+import type { Preview, RedactionOp } from '../shared/ipc/types';
 import { DETAIL_TEXT, KEYBOARD_TEXT } from '../shared/strings';
 import { POSITIVE_ATTR } from './keyboard';
 
 export type DecisionArgs = Omit<DecideArgs, 'request_id' | 'candidate_rev'>;
 
 /** The redaction a "Release status only" sends (I-38): core's own preset, no text from the UI. */
-const STATUS_ONLY: Record<string, unknown>[] = [{ preset: 'status_only' }];
+export const STATUS_ONLY: readonly RedactionOp[] = [{ preset: 'status_only' }];
 
 /** Body kinds whose card allows Deny only; Approve is shown disabled (spec 6.3, 5.4 step 2). */
 const DENY_ONLY_KINDS: ReadonlySet<string> = new Set([
@@ -45,7 +45,7 @@ export function cardOf(preview: Preview): Card {
         { label: DETAIL_TEXT.release, args: { decision: 'release' } },
         {
           label: DETAIL_TEXT.release_status_only,
-          args: { decision: 'release_redacted', redactions: STATUS_ONLY },
+          args: { decision: 'release_redacted', redactions: [...STATUS_ONLY] },
         },
       ],
       approveShownDisabled: false,

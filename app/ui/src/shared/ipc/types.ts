@@ -63,7 +63,11 @@ export interface QueueDetail {
   request: RequestDetail;
 }
 
-/** One Raw page (PD-68): the UI shows `display` and never decodes `bytes_b64`. */
+/**
+ * One Raw page (PD-68): the Raw tab shows `display` and never decodes `bytes_b64`. The redaction
+ * panel (Task 17) is the other reader: it builds its JSON tree from the exact bytes, because ops
+ * name the candidate's real keys and text, which `display` marks.
+ */
 export interface RawPage {
   page: number;
   page_count: number;
@@ -190,10 +194,36 @@ export interface Preview {
   [field: string]: unknown;
 }
 
-/** `{preview, srcdoc}`: the model for the tabs and the document for the sandboxed iframe. */
+export type DropScope = 'per_item' | 'all_items';
+export type UrlMode = 'replace_whole' | 'drop';
+export type RedactionPreset = 'status_only' | 'error_class_only';
+
+/**
+ * One redaction op in its wire form (`RedactionOpWire`, C.7 + PD-20 `at`). The `*_loc` strings
+ * are locations in the redaction path grammar (`issues[key=A].fields`), never file paths.
+ */
+export type RedactionOp =
+  | { drop_item: { array_loc: string; key: string; value: unknown } }
+  | { drop_field: { field_loc: string; scope: DropScope } }
+  | { mask_text: { text: string; every_occurrence: boolean; at: string | null } }
+  | { url_field: { mode: UrlMode } }
+  | { preset: RedactionPreset };
+
+/**
+ * What the redaction panel builds on (M6 T17): the revision's own ops (absolute against the
+ * source body; the revision shows the source with them applied) and the op's URL-valued fields.
+ */
+export interface RedactionContext {
+  ops: RedactionOp[];
+  url_fields: string[];
+}
+
+/** `{preview, srcdoc, redaction}`: the model for the tabs, the document for the sandboxed iframe, the redaction state. */
 export interface PreviewFetchResponse {
   preview: Preview;
   srcdoc: string;
+  /** `null` for a write and a read outcome item: nothing to redact. */
+  redaction: RedactionContext | null;
 }
 
 /** A tagged error object from core (`DecisionError` / `AdminError`). */

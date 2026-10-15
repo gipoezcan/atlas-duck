@@ -8,18 +8,20 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::path::{Path, PathBuf};
 
 use atlas_duck_app_lib::commands::CommandError;
-use atlas_duck_app_lib::commands::approvals::{DenyCount, QueueDetail, RawPageDto};
+use atlas_duck_app_lib::commands::approvals::{
+    DenyCount, QueueDetail, RawPageDto, RedactionContextDto,
+};
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
 use atlas_duck_core::payloads::InvalidReason;
-use atlas_duck_core::redact::BlockReason;
+use atlas_duck_core::redact::{BlockReason, DropScope, RedactionPreset};
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, BatchFailure, BatchOutcome, CandidateRev, ConnectionFailure, DecisionError,
-    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionReport,
-    RequestDetail, SessionKey,
+    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext,
+    RedactionOp, RedactionReport, RequestDetail, SessionKey, UrlMode,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
@@ -545,7 +547,83 @@ fn redaction_reports() -> Vec<RedactionReport> {
             other_occurrences: 0,
             released_bytes: 512,
         },
+        // Every other reason the UI labels (M6 T17).
+        RedactionReport {
+            blocked: vec![
+                BlockReason::UnstableEncoding {
+                    path: "fields.description".into(),
+                },
+                BlockReason::ReencodeAmbiguous {
+                    path: "self".into(),
+                },
+                BlockReason::MirrorOrphan {
+                    path: "renderedFields.comment.comments[1]".into(),
+                },
+                BlockReason::MirrorUnmatchable {
+                    path: "renderedFields.worklog.worklogs[0]".into(),
+                },
+                BlockReason::OpTargetMissing {
+                    path: "fields.user.email".into(),
+                },
+                BlockReason::OverReleaseCap {
+                    path: String::new(),
+                },
+            ],
+            also_appears_in: vec![],
+            other_occurrences: 0,
+            released_bytes: 16_777_217,
+        },
     ]
+}
+
+/// `preview_fetch`'s `redaction` (M6 T17): a first revision, and one with every op kind.
+fn redaction_contexts() -> Vec<RedactionContextDto> {
+    let ops = vec![
+        RedactionOp::DropItem {
+            array_path: "fields.comment.comments".into(),
+            key: "id".into(),
+            value: json!("10001"),
+        },
+        RedactionOp::DropField {
+            path: "issues[key=ABC-1].fields.summary".into(),
+            scope: DropScope::PerItem,
+        },
+        RedactionOp::DropField {
+            path: "issues[key=ABC-1].fields.labels".into(),
+            scope: DropScope::AllItems,
+        },
+        RedactionOp::MaskText {
+            text: "Falcon".into(),
+            every_occurrence: true,
+            at: None,
+        },
+        RedactionOp::MaskText {
+            text: "Falcon".into(),
+            every_occurrence: false,
+            at: Some("fields.description".into()),
+        },
+        RedactionOp::UrlField {
+            mode: UrlMode::ReplaceWhole,
+        },
+        RedactionOp::UrlField {
+            mode: UrlMode::Drop,
+        },
+        RedactionOp::Preset(RedactionPreset::StatusOnly),
+        RedactionOp::Preset(RedactionPreset::ErrorClassOnly),
+    ];
+    [
+        RedactionContext {
+            ops: Vec::new(),
+            url_fields: vec!["self", "fields.attachment[].content"],
+        },
+        RedactionContext {
+            ops,
+            url_fields: Vec::new(),
+        },
+    ]
+    .iter()
+    .map(RedactionContextDto::from)
+    .collect()
 }
 
 fn deny_counts() -> Vec<DenyCount> {
@@ -606,6 +684,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("queue_item", value(&queue_items())?),
         ("raw_page", value(&raw_pages())?),
         ("recent_item", value(&recent_items())?),
+        ("redaction_context", value(&redaction_contexts())?),
         ("redaction_report", value(&redaction_reports())?),
         ("status_line", value(&status_lines())?),
     ])

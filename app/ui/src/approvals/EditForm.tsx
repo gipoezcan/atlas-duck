@@ -1,6 +1,7 @@
 import { useId } from 'react';
 
 import { AgentText } from '../shared/text/AgentText';
+import { unusual } from '../shared/text/unusual';
 import type { EditForm as EditFormModel, EditInput } from '../shared/ipc/types';
 import { EDIT_TEXT } from '../shared/strings';
 import { JsonFallback, readJson } from './JsonFallback';
@@ -150,9 +151,6 @@ function sameJson(a: unknown, b: unknown): boolean {
   );
 }
 
-/** Characters a reader cannot see or that reorder text (bidi controls, zero-width, other format and control characters). */
-const UNUSUAL = /(?![\n\t])[\p{Cc}\p{Cf}\u2028\u2029]/u;
-
 interface EditFormProps {
   form: EditFormModel;
   drafts: Drafts;
@@ -214,7 +212,7 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
           {input.value === null || text === undefined ? (
             <span className="none">{EDIT_TEXT.none}</span>
           ) : (
-            <AgentText value={text} unusual={UNUSUAL.test(text)} />
+            <AgentText value={text} unusual={unusual(text)} />
           )}
         </div>
       );
