@@ -378,11 +378,12 @@ pub trait SettingsAdmin: Send + Sync {
     fn prune_backlog_now(&self) -> Result<PruneReport, SettingsError>;
     /// `Store::try_full_verify`; an error is `DidNotComplete` (M2 handoff), never a pass.
     fn verify_now(&self) -> VerifyNow;
-    /// An app-owned setting changed (CLI install, "Prepare for removal"): one
-    /// `CONFIG_CHANGED {source: app, key, old, new, applied: true}`. `Ok` once it committed (the
-    /// app acts after it: audit before effect). Presentation mode is not one of these: it is
-    /// in-memory session state of the attention engine, never persisted, never recorded, and
-    /// never routed through `apply`; the persisted `attention_mode` key is only its default.
+    /// An app-owned setting changed (CLI install, "Prepare for removal", the tray's Presentation
+    /// mode): one `CONFIG_CHANGED {source: app, key, old, new, applied: true}`. `Ok` once it
+    /// committed (the app acts after it: audit before effect). Presentation mode is in-memory
+    /// session state of the attention engine: recorded here under the key `presentation_mode`
+    /// (§5.6, §10.3: a plain `CONFIG_CHANGED`, no confirmation), never persisted and never routed
+    /// through `apply`; the persisted `attention_mode` key is only its default.
     /// There is no failure record: an app effect that fails afterwards appends a second call
     /// with `new = old`.
     fn record_app_change(&self, key: &str, old: Value, new: Value) -> Result<(), SettingsError>;

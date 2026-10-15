@@ -1,6 +1,6 @@
-//! M6 T19 (Ã‚Â§5.6, PD-75): what the attention engine does outside its unit tests. Mock-runtime
+//! M6 T19 (§5.6, PD-75): what the attention engine does outside its unit tests. Mock-runtime
 //! tests (the `window_focus` event reaches the Approvals window and no other, with the payload the
-//! page expects) and, in the test build, the Ã‚Â§5.6 opacity check of the toast against a real core.
+//! page expects) and, in the test build, the §5.6 opacity check of the toast against a real core.
 //! They live here, not in the lib's unit tests, because only integration-test executables get the
 //! Common-Controls v6 manifest the mock runtime needs on Windows (`build.rs`).
 
@@ -47,8 +47,8 @@ fn drain(heard: &Heard) -> Vec<Value> {
 }
 
 /// PD-75: `window_focus` goes to the Approvals window only (`emit_to`, never a broadcast), exactly
-/// `{requested: bool}`: `false` when the attention engine takes the focus, `true` for a focus the
-/// user asked for, nothing when the window is only shown.
+/// `{requested: bool}`: `false` when the attention engine shows the window (with or without the
+/// focus), `true` for a focus the user asked for.
 #[test]
 fn window_focus_reaches_approvals_only_with_the_requested_flag() -> TestResult {
     let app = app()?;
@@ -63,9 +63,10 @@ fn window_focus_reaches_approvals_only_with_the_requested_flag() -> TestResult {
         .ok_or("no settings window")?;
     let (a, s) = (hear(&approvals), hear(&settings));
 
-    // Shown without the focus: nothing to announce.
+    // Shown without the activation: tao's `show()` may activate a built window anyway (Windows),
+    // so the page hears an unrequested focus first (it is harmless where none follows).
     show(handle, Label::Approvals, Show::WithoutActivating)?;
-    assert_eq!(drain(&a), Vec::<Value>::new());
+    assert_eq!(drain(&a), vec![json!({"requested": false})]);
 
     // "Show and focus": unrequested.
     show(handle, Label::Approvals, Show::FocusUnrequested)?;
@@ -129,7 +130,7 @@ fn window_focus_is_recorded_for_the_s16_sweep() -> TestResult {
 
 #[cfg(feature = "scripted-approver")]
 mod opacity {
-    //! Ã‚Â§5.6, Ã‚Â§10.1: toast text carries counts only. Agent-supplied strings are in the queue the
+    //! §5.6, §10.1: toast text carries counts only. Agent-supplied strings are in the queue the
     //! engine counts, and none of them reaches a toast.
 
     use std::sync::{Arc, Mutex};
@@ -285,6 +286,84 @@ mod opacity {
             leaks(&leaking.unwrap_or_default()),
             vec![AGENT, "ignore previous"]
         );
+        Ok(())
+    }
+}
+
+#[cfg(feature = "scripted-approver")]
+mod presentation {
+    //! The tray's Presentation mode against the real `SettingsAdmin`: the key it records under
+    //! passes the real key validation, and the audit store holds the record (§5.6, §10.3).
+
+    use std::sync::Arc;
+
+    use atlas_duck_app_lib::attention::{AttentionEngine, KEY_PRESENTATION_MODE, Notifier};
+    use atlas_duck_audit::EventType;
+    use atlas_duck_audit::clock::UtcInstant;
+    use atlas_duck_audit::testing::FakeClock;
+    use atlas_duck_core::SettingsError;
+    use atlas_duck_core::testing::Harness;
+    use serde_json::{Value, json};
+
+    use super::TestResult;
+
+    struct Silent;
+
+    impl Notifier for Silent {
+        fn raise(&self, _: bool) {}
+        fn flash(&self) {}
+        fn toast(&self, _: &str) {}
+        fn set_badge(&self, _: u32) {}
+    }
+
+    async fn records(h: &Harness) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+        Ok(h.events_of(EventType::CONFIG_CHANGED)
+            .await?
+            .into_iter()
+            .filter(|p| p["key"] == KEY_PRESENTATION_MODE)
+            .collect())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn presentation_mode_is_recorded_by_the_real_settings_admin() -> TestResult {
+        let h = Harness::builder().jira("jira-main").start().await?;
+        let settings = h.core().settings();
+        let engine = Arc::new(AttentionEngine::new(
+            Arc::new(Silent),
+            Arc::new(FakeClock::new(UtcInstant(0))),
+            None,
+        ));
+
+        // The control: the validator is live (a reserved key is refused), so the success below
+        // is not a store that accepts anything.
+        let s = settings.clone();
+        let refused = tokio::task::spawn_blocking(move || {
+            s.record_app_change(
+                "attention_mode",
+                json!("badge_only"),
+                json!("show_and_focus"),
+            )
+        })
+        .await?;
+        assert_eq!(refused, Err(SettingsError::Invalid { key: "key" }));
+        assert!(records(&h).await?.is_empty());
+
+        // The tray's item: on, then off again.
+        for want in [true, false] {
+            let (e, s) = (engine.clone(), settings.clone());
+            let now = tokio::task::spawn_blocking(move || e.toggle_presentation(&*s)).await??;
+            assert_eq!(now, want);
+        }
+        let recs = records(&h).await?;
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        for (rec, (old, new)) in recs.iter().zip([(false, true), (true, false)]) {
+            assert_eq!(rec["source"], "app");
+            assert_eq!(
+                (rec["old"].clone(), rec["new"].clone()),
+                (json!(old), json!(new))
+            );
+            assert_eq!(rec["applied"], true);
+        }
         Ok(())
     }
 }

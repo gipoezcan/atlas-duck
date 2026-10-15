@@ -41,6 +41,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
@@ -337,6 +338,24 @@ describe('keyboard (spec 5.6, PD-91)', () => {
     expect(fireEvent.keyDown(document.body, { key: 'x', code: 'KeyX' })).toBe(false);
   });
 
+  it('a_page_that_mounts_focused_swallows_input_for_1s_without_any_event', async () => {
+    // Rust built the window for a raise: its window_focus came before this page listened.
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    await renderWindow();
+    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }));
+    expect(fireEvent.keyDown(document.body, { key: 'x', code: 'KeyX' })).toBe(false);
+    advance(INERT_MS - 1);
+    expect(fireEvent.keyDown(document.body, { key: 'x', code: 'KeyX' })).toBe(false);
+    advance(1);
+    expect(fireEvent.keyDown(document.body, { key: 'x', code: 'KeyX' })).toBe(true);
+  });
+
+  it('a_page_that_mounts_unfocused_takes_input_at_once', async () => {
+    // The control of the test above: without the window focus nothing is swallowed.
+    vi.spyOn(document, 'hasFocus').mockReturnValue(false);
+    await renderWindow();
+    expect(fireEvent.keyDown(document.body, { key: 'x', code: 'KeyX' })).toBe(true);
+  });
   it('enter_or_space_on_a_positive_button_is_not_a_single_key_approval', async () => {
     const keys = new Keyboard();
     await renderWindow();

@@ -81,7 +81,9 @@ function isTextEntry(el: HTMLElement): boolean {
  * The window's inert periods (spec 5.6): approve/release is inert for `INERT_MS` after the window
  * gains focus (the DOM `focus` of the window, and Rust's `window_focus`); after a focus the user did
  * not request (`requested: false`) all keyboard input is inert as well and focus moves to `heading`,
- * a non-input element. A new focus restarts a period; nothing shortens one.
+ * a non-input element. A new focus restarts a period; nothing shortens one. A page that mounts while
+ * its window has focus (Rust just built it, and any `window_focus` came before the listener) starts
+ * the unrequested period at once.
  */
 export function useWindowInert(heading: RefObject<HTMLElement | null>): WindowInert {
   const ends = useRef<Ends>({ approve: 0, all: 0 });
@@ -117,6 +119,10 @@ export function useWindowInert(heading: RefObject<HTMLElement | null>): WindowIn
     window.addEventListener('focus', onFocus);
     window.addEventListener('blur', onBlur);
     const off = on<unknown>('window_focus', (p) => start(!requestedOf(p)), { thisWindow: true });
+    // A window Rust builds for a raise gets its window_focus before this page listens (the event is
+    // lost) and its first DOM focus before this effect: a page that mounts focused cannot tell who
+    // asked for that focus, so it takes the stricter rule (all input inert, focus on the heading).
+    if (document.hasFocus()) start(true);
     return () => {
       window.removeEventListener('focus', onFocus);
       window.removeEventListener('blur', onBlur);

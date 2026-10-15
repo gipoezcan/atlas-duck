@@ -9,9 +9,10 @@
 //! [`spawn_worker`] runs the engine on its own thread so the core's `UiSink::emit` never waits on
 //! `queue_list()`, a window call or the keychain-backed settings read.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use atlas_duck_audit::Clock;
@@ -202,6 +203,26 @@ impl AttentionEngine {
         log: &L,
     ) -> Result<bool, SettingsError> {
         let _one_switch_at_a_time = lock(&self.switching);
+        self.switch_locked(on, log)
+    }
+
+    /// Flips Presentation mode; the previous value is read under the switch lock, so two quick
+    /// clicks are two flips (not two "on"s). Returns the new state.
+    pub fn toggle_presentation<L: AppChangeLog + ?Sized>(
+        &self,
+        log: &L,
+    ) -> Result<bool, SettingsError> {
+        let _one_switch_at_a_time = lock(&self.switching);
+        let on = !self.presentation();
+        self.switch_locked(on, log)?;
+        Ok(on)
+    }
+
+    fn switch_locked<L: AppChangeLog + ?Sized>(
+        &self,
+        on: bool,
+        log: &L,
+    ) -> Result<bool, SettingsError> {
         let old = self.presentation();
         if old == on {
             return Ok(false);
@@ -328,9 +349,95 @@ pub fn core_counts(core: &Core) -> Counts {
     Counts::of(&core.decisions().queue_list())
 }
 
+/// How many `Attention` events wait for the worker at most; the oldest is dropped beyond that
+/// (each only asks for one raise/toast, and those are rate-limited anyway).
+pub const INBOX_ATTENTION_CAP: usize = 32;
+
+/// The worker's queue: bounded by coalescing, and `push` never blocks (the core's `emit` must not
+/// wait on a stalled worker). Only the latest `QueueChanged` and `NeedsAttentionChanged` matter (the
+/// worker reads the queue itself), so a newer one replaces a waiting one; waiting `Attention`
+/// events are capped at [`INBOX_ATTENTION_CAP`], dropping the oldest.
+#[derive(Default)]
+struct Inbox {
+    state: Mutex<InboxState>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct InboxState {
+    events: VecDeque<UiEvent>,
+    closed: bool,
+}
+
+impl Inbox {
+    fn push(&self, e: UiEvent) {
+        let mut st = lock(&self.state);
+        match &e {
+            UiEvent::QueueChanged { .. } => st
+                .events
+                .retain(|w| !matches!(w, UiEvent::QueueChanged { .. })),
+            UiEvent::NeedsAttentionChanged { .. } => st
+                .events
+                .retain(|w| !matches!(w, UiEvent::NeedsAttentionChanged { .. })),
+            _ => {
+                let waiting = |w: &&UiEvent| matches!(w, UiEvent::Attention { .. });
+                if st.events.iter().filter(waiting).count() >= INBOX_ATTENTION_CAP
+                    && let Some(oldest) = st
+                        .events
+                        .iter()
+                        .position(|w| matches!(w, UiEvent::Attention { .. }))
+                {
+                    st.events.remove(oldest);
+                }
+            }
+        }
+        st.events.push_back(e);
+        self.wake.notify_one();
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.wake.notify_all();
+    }
+
+    /// The next event; waits at most `wait` (`None`: without limit). `Disconnected` once the feed
+    /// is gone and the queue drained.
+    fn recv(&self, wait: Option<Duration>) -> Result<UiEvent, RecvTimeoutError> {
+        let deadline = wait.map(|w| std::time::Instant::now() + w);
+        let mut st = lock(&self.state);
+        loop {
+            if let Some(e) = st.events.pop_front() {
+                return Ok(e);
+            }
+            if st.closed {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            st = match deadline {
+                None => self.wake.wait(st).unwrap_or_else(PoisonError::into_inner),
+                Some(d) => {
+                    let left = d.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(RecvTimeoutError::Timeout);
+                    }
+                    self.wake
+                        .wait_timeout(st, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0
+                }
+            };
+        }
+    }
+}
+
 /// The first half of the §5.6 sink: queues the events the engine follows for the worker.
 pub struct AttentionFeed {
-    tx: mpsc::Sender<UiEvent>,
+    inbox: Arc<Inbox>,
+}
+
+impl Drop for AttentionFeed {
+    fn drop(&mut self) {
+        self.inbox.close();
+    }
 }
 
 impl UiSink for AttentionFeed {
@@ -342,8 +449,7 @@ impl UiSink for AttentionFeed {
                 | UiEvent::NeedsAttentionChanged { .. }
         );
         if wanted {
-            // The worker only ends with the process.
-            let _ = self.tx.send(e);
+            self.inbox.push(e);
         }
     }
 }
@@ -354,15 +460,13 @@ pub fn spawn_worker(
     engine: Arc<AttentionEngine>,
     env: Arc<dyn AttentionEnv>,
 ) -> std::io::Result<AttentionFeed> {
-    let (tx, rx) = mpsc::channel::<UiEvent>();
+    let inbox = Arc::new(Inbox::default());
+    let rx = inbox.clone();
     std::thread::Builder::new()
         .name("atlas-duck-attention".into())
         .spawn(move || {
             loop {
-                let next = match engine.toast_due_in() {
-                    Some(wait) => rx.recv_timeout(wait),
-                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                };
+                let next = rx.recv(engine.toast_due_in());
                 match next {
                     Ok(event) => handle(&engine, &*env, &event),
                     Err(RecvTimeoutError::Timeout) => {
@@ -374,7 +478,7 @@ pub fn spawn_worker(
                 }
             }
         })?;
-    Ok(AttentionFeed { tx })
+    Ok(AttentionFeed { inbox })
 }
 
 /// One event through the engine, with the app's state as it is now.
@@ -476,13 +580,20 @@ impl<R: Runtime> AttentionEnv for TauriEnv<R> {
     }
 }
 
-/// The engine of this app, managed by `serve::start`.
-pub struct AttentionHandle(pub Arc<AttentionEngine>);
+/// The engine of this app, managed by `serve::start`, with the feed that drives it: a later
+/// `install` (T20's handler swap) hands out the same feed, so the engine and the tray keep
+/// following the one worker.
+pub struct AttentionHandle(pub Arc<AttentionEngine>, Arc<dyn UiSink>);
 
 /// Builds the engine over the real clock and the Tauri notifier, manages it (the tray reads it) and
-/// starts its thread; the feed goes into the UI sink. On a thread failure the app runs without
-/// attention (logged; the badge and the queue itself do not depend on it).
+/// starts its thread; the feed goes into the UI sink. Idempotent: a second call returns the feed of
+/// the first (the engine, its worker and the tray's handle stay the same). On a thread failure the
+/// app runs without attention (logged; the queue itself does not depend on it, but the tray badge
+/// is driven by the worker, so it stays at 0).
 pub fn install(app: &AppHandle<Wry>, tray_host: Option<TrayHost>) -> Option<Arc<dyn UiSink>> {
+    if let Some(h) = app.try_state::<AttentionHandle>() {
+        return Some(h.1.clone());
+    }
     let engine = Arc::new(AttentionEngine::new(
         Arc::new(TauriNotifier::new(app.clone())),
         Arc::new(atlas_duck_audit::SystemClock::new()),
@@ -490,8 +601,9 @@ pub fn install(app: &AppHandle<Wry>, tray_host: Option<TrayHost>) -> Option<Arc<
     ));
     match spawn_worker(engine.clone(), Arc::new(TauriEnv::new(app.clone()))) {
         Ok(feed) => {
-            app.manage(AttentionHandle(engine));
-            Some(Arc::new(feed))
+            let feed: Arc<dyn UiSink> = Arc::new(feed);
+            app.manage(AttentionHandle(engine, feed.clone()));
+            Some(feed)
         }
         Err(_) => {
             tracing::warn!(
@@ -522,7 +634,7 @@ pub fn toggle_presentation(app: &AppHandle<Wry>) {
             return;
         };
         let settings = core.settings();
-        match engine.set_presentation(!engine.presentation(), &*settings) {
+        match engine.toggle_presentation(&*settings) {
             Ok(_) => crate::tray::refresh(&app),
             Err(e) => tracing::warn!(
                 event = LOG_EVENT_PRESENTATION_FAILED,
@@ -698,6 +810,11 @@ mod tests {
         r.engine.on_event(&queue(2), counts(2, 0, 0), false);
         r.engine.on_event(&new_req(), counts(2, 0, 0), false);
         assert_eq!(r.mock.raises(), 1, "visible and not 0 -> 1");
+        // A new request that stays put is not flashed (only stale/failed ones are told that way).
+        assert!(
+            !r.mock.calls().contains(&Call::Flash),
+            "no flash for a new request"
+        );
         // Hidden raises (the limiter has released after 61 s).
         r.engine.on_event(&queue(3), counts(3, 0, 0), true);
         r.engine.on_event(&new_req(), counts(3, 0, 0), true);
@@ -939,6 +1056,116 @@ mod tests {
             }
             .pending(),
             u32::MAX
+        );
+    }
+
+    #[test]
+    fn two_quick_toggles_are_two_flips() {
+        struct Slow(Mutex<Vec<String>>);
+        impl AppChangeLog for Slow {
+            fn record(&self, key: &str, old: Value, new: Value) -> Result<(), SettingsError> {
+                std::thread::sleep(Duration::from_millis(100));
+                lock(&self.0).push(format!("{key}:{old}->{new}"));
+                Ok(())
+            }
+        }
+        let r = rig();
+        let engine = Arc::new(r.engine);
+        let log = Arc::new(Slow(Mutex::default()));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let (e, l) = (engine.clone(), log.clone());
+                std::thread::spawn(move || e.toggle_presentation(&*l))
+            })
+            .collect();
+        for t in threads {
+            assert!(t.join().expect("thread").is_ok());
+        }
+        // Off again: the second click was not lost to a stale read of "off".
+        assert!(!engine.presentation());
+        assert_eq!(
+            *lock(&log.0),
+            vec![
+                "presentation_mode:false->true".to_owned(),
+                "presentation_mode:true->false".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_inbox_is_bounded_by_coalescing_and_never_blocks() {
+        let inbox = Arc::new(Inbox::default());
+        let feed = AttentionFeed {
+            inbox: inbox.clone(),
+        };
+        // A stalled worker: nothing reads while the core keeps emitting.
+        for i in 0..1_000 {
+            feed.emit(queue(i % 5));
+            feed.emit(UiEvent::NeedsAttentionChanged { count: i as u32 });
+            feed.emit(new_req());
+        }
+        let waiting = lock(&inbox.state).events.len();
+        assert_eq!(waiting, 2 + INBOX_ATTENTION_CAP);
+        // The latest of the coalesced ones survives, in the order they were pushed.
+        let mut seen = Vec::new();
+        while let Ok(e) = inbox.recv(Some(Duration::ZERO)) {
+            seen.push(e);
+        }
+        assert!(seen.contains(&queue(4)), "{seen:?}");
+        assert!(seen.contains(&UiEvent::NeedsAttentionChanged { count: 999 }));
+        assert_eq!(
+            seen.iter()
+                .filter(|e| matches!(e, UiEvent::Attention { .. }))
+                .count(),
+            INBOX_ATTENTION_CAP
+        );
+        // Closed and drained: the worker is told.
+        drop(feed);
+        assert!(matches!(
+            inbox.recv(None),
+            Err(RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    /// A held-back toast goes out by the worker itself (the `Timeout -> tick` path) once the
+    /// engine's clock says the 30 s are over.
+    #[test]
+    fn the_worker_sends_the_trailing_toast_by_itself() {
+        struct Env;
+        impl AttentionEnv for Env {
+            fn counts(&self) -> Option<Counts> {
+                Some(counts(1, 0, 0))
+            }
+            fn window_hidden(&self) -> bool {
+                true
+            }
+            fn configured_mode(&self) -> Option<AttentionMode> {
+                Some(AttentionMode::BadgeOnly)
+            }
+        }
+        let r = rig();
+        let (mock, clock) = (r.mock.clone(), r.clock.clone());
+        let feed = spawn_worker(Arc::new(r.engine), Arc::new(Env)).expect("thread");
+        let wait_for = |toasts: usize| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while mock.toasts().len() < toasts && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        feed.emit(new_req());
+        wait_for(1);
+        assert_eq!(mock.toasts().len(), 1, "the leading toast");
+        // 29.99 s later: held back, due in 10 ms (the worker's real wait).
+        clock.advance(Duration::from_millis(29_990));
+        feed.emit(new_req());
+        // Let the worker take it (it must not send: 10 ms of the 30 s are left on the clock).
+        std::thread::sleep(Duration::from_millis(5));
+        clock.advance(Duration::from_millis(10));
+        wait_for(2);
+        assert_eq!(
+            mock.toasts().len(),
+            2,
+            "the trailing toast, sent by the tick"
         );
     }
 

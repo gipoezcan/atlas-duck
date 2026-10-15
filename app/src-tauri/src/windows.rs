@@ -529,7 +529,11 @@ fn log_open_failed(label: Label, class: &'static str) {
 fn bring_up<R: Runtime>(w: &WebviewWindow<R>, how: Show) -> Result<(), WindowError> {
     // PD-75: the Approvals page learns whether the focus it is about to get was requested, before
     // it gets it (its 1 s inert periods start on this event; an unrequested one swallows input).
-    if w.label() == Label::Approvals.as_str() && how.focuses() {
+    // Also for `WithoutActivating`: tao's `show()` activates an already-built window on Windows, so
+    // a "show without activating" may end in a focus nobody asked for; the page takes the longer
+    // period of all it hears, so this is harmless where no activation follows. (A window built just
+    // now has no listening page yet: the page covers that itself, see `useWindowInert`.)
+    if w.label() == Label::Approvals.as_str() {
         crate::ui_sink::emit_window_focus(w.app_handle(), w.label(), how == Show::Focus);
     }
     w.show().map_err(|_| WindowError::Show)?;
