@@ -21,7 +21,8 @@ const UNLOCK = { ...LOCKED, purpose: 'unlock', refused_count: 0 };
 const FIRST_RUN = { ...LOCKED, purpose: 'recovery_passphrase', refused_count: 1 };
 const OK = { ok: { atlassian_user: 'alice', product: 'jira', version: '9.4.0', warnings: [] } };
 
-// Rust answers of retry_keychain and save_recovery_note (commands/credential.rs: RetryStarted, NoteSaved).
+// Rust answers of retry_keychain and save_recovery_note (commands/credential.rs: RetryStarted,
+// NoteSaved), copied from src/shared/ipc/fixtures/{retry_started,note_saved}.json (first element).
 const RETRY_STARTED = { started: true };
 const NOTE_SAVED = { saved: true };
 

@@ -12,8 +12,8 @@ use atlas_duck_app_lib::commands::approvals::{
     DenyCount, QueueDetail, RawPageDto, RedactionContextDto,
 };
 use atlas_duck_app_lib::commands::credential::{
-    ArchiveOutcome, CLASS_CONTEXT_CHANGED, Connected, CredentialContextDto, SubmitFailure,
-    SubmitOutcome, connection_failure, context_dto,
+    ArchiveOutcome, CLASS_CONTEXT_CHANGED, Connected, CredentialContextDto, NoteSaved,
+    RetryStarted, SubmitFailure, SubmitOutcome, connection_failure, context_dto,
 };
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
@@ -720,6 +720,19 @@ fn archive_outcomes() -> Vec<ArchiveOutcome> {
     ]
 }
 
+/// `save_recovery_note` (M6 T20): saved, or the save dialog was cancelled.
+fn note_saved() -> Vec<NoteSaved> {
+    vec![NoteSaved { saved: true }, NoteSaved { saved: false }]
+}
+
+/// `retry_keychain` (M6 T20, T22): a retry started, or one is still running.
+fn retry_started() -> Vec<RetryStarted> {
+    vec![
+        RetryStarted { started: true },
+        RetryStarted { started: false },
+    ]
+}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ui/src/shared/ipc/fixtures")
 }
@@ -737,6 +750,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("credential_context", value(&credential_contexts())?),
         ("decision_outcome", value(&decision_outcomes())?),
         ("deny_count", value(&deny_counts())?),
+        ("note_saved", value(&note_saved())?),
         ("preview", value(&previews())?),
         ("queue_detail", value(&queue_details())?),
         ("queue_item", value(&queue_items())?),
@@ -744,6 +758,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("recent_item", value(&recent_items())?),
         ("redaction_context", value(&redaction_contexts())?),
         ("redaction_report", value(&redaction_reports())?),
+        ("retry_started", value(&retry_started())?),
         ("status_line", value(&status_lines())?),
         ("submit_outcome", value(&submit_outcomes())?),
     ])

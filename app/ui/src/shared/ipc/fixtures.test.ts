@@ -4,6 +4,7 @@ import batchOutcome from './fixtures/batch_outcome.json';
 import commandError from './fixtures/command_error.json';
 import decisionOutcome from './fixtures/decision_outcome.json';
 import denyCount from './fixtures/deny_count.json';
+import noteSaved from './fixtures/note_saved.json';
 import preview from './fixtures/preview.json';
 import queueDetail from './fixtures/queue_detail.json';
 import queueItem from './fixtures/queue_item.json';
@@ -11,6 +12,7 @@ import rawPage from './fixtures/raw_page.json';
 import recentItem from './fixtures/recent_item.json';
 import redactionContext from './fixtures/redaction_context.json';
 import redactionReport from './fixtures/redaction_report.json';
+import retryStarted from './fixtures/retry_started.json';
 import statusLine from './fixtures/status_line.json';
 import {
   arrayOf,
@@ -54,6 +56,19 @@ describe('fixtures validate against their TS types', () => {
       const mapped = toCommandError(wire);
       expect(mapped.kind).toBe(wire.kind);
       expect(mapped).toEqual(wire);
+    }
+  });
+
+  // The credential window reads these two answers with its own checks (src/credential imports
+  // nothing from src/shared/, PD-71); here the wire shape is pinned: one boolean, both values.
+  it('note_saved and retry_started: exactly one boolean key, both values present', () => {
+    for (const [fixture, key] of [
+      [noteSaved, 'saved'],
+      [retryStarted, 'started'],
+    ] as const) {
+      const answers: Record<string, unknown>[] = fixture;
+      expect(answers.map((a) => Object.keys(a))).toEqual(answers.map(() => [key]));
+      expect(answers.map((a) => a[key])).toEqual([true, false]);
     }
   });
 
