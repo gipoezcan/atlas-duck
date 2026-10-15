@@ -81,7 +81,10 @@ function editRejection(e: unknown): string | null {
   const core = (e as { error?: { kind?: unknown; error?: { message?: unknown } } }).error;
   if (core?.kind !== 'edit_rejected') return null;
   const message = core.error?.message;
-  return typeof message === 'string' ? message.slice(0, 300) : '';
+  if (typeof message !== 'string') return '';
+  // By code points, so a surrogate pair is never split; the ellipsis says the text was cut.
+  const points = Array.from(message);
+  return points.length > 300 ? `${points.slice(0, 300).join('')}…` : message;
 }
 
 /**
@@ -254,7 +257,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   };
 
   const submitEdit = () => {
-    if (built === null || Object.keys(built.errors).length > 0 || !built.changed) return;
+    if (built === null || Object.keys(built.errors).length > 0 || built.oversize || !built.changed) return;
     send({ decision: 'approve_edited', edits: built.edits });
   };
 

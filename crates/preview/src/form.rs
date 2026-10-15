@@ -42,8 +42,8 @@ pub enum InputKind {
 }
 
 /// The allowed values of a `Choice`; the fields are private so the cap cannot be bypassed.
-/// Serializes as `{"allowed_values": [..]}` (flattened into the `Choice` tag object): the labels
-/// only. The UI sends the picked label back; core maps it to its wire value ([`Self::wire_for`]),
+/// Serializes as `{"allowed_values": [..]}`, plus `"multiple": true` for a list input (flattened
+/// into the `Choice` tag object): the labels only. The UI sends the picked label back; core maps it to its wire value ([`Self::wire_for`]),
 /// which never leaves core (T12 review I1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AllowedValues {

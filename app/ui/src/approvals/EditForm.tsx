@@ -42,11 +42,15 @@ export interface BuiltEdits {
   edits: { set: Record<string, unknown>; remove: string[] };
   /** A changed input whose text is not valid for its kind, by path: the local syntax hint. */
   errors: Readonly<Record<string, string>>;
+  /** The edits are past the size Rust accepts (`EDITS_MAX_BYTES`): a local hint, Rust stays the bound. */
+  oversize: boolean;
   /** Some input differs from the revision's value. */
   changed: boolean;
 }
 
-const INTEGER = /^-?\d+$/;
+/** The bound Rust puts on the serialized `edits` (`EDITS_MAX_BYTES`, 1 MiB). */
+const EDITS_MAX_BYTES = 1024 * 1024;
+const INTEGER =/^-?\d+$/;
 const DECIMAL = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
 
 /**
@@ -63,70 +67,91 @@ export function buildEdits(form: EditFormModel, drafts: Drafts): BuiltEdits {
     if (input.read_only) continue;
     const d = draftOf(input, drafts);
     const { kind } = input;
-    const clearable = (original: string) => {
-      if (d.text === original) return 'same' as const;
-      return d.text === '' ? ('clear' as const) : ('value' as const);
+    // "Changed" compares values, not text: `050` for 50 or re-indented JSON is no change.
+    const setIfChanged = (value: unknown) => {
+      if (!sameJson(value, input.value)) set.push([input.path, value]);
+    };
+    const readJsonInto = (text: string) => {
+      const read = readJson(text);
+      if (!read.ok) errors[input.path] = EDIT_TEXT.json_invalid;
+      else if (read.value === null) {
+        if (input.value !== null) remove.push(input.path);
+      } else setIfChanged(read.value);
     };
     if (kind.kind === 'choice') {
       if (d.asJson) {
-        if (d.text.trim() === '') continue;
-        const read = readJson(d.text);
-        if (!read.ok) errors[input.path] = EDIT_TEXT.json_invalid;
-        else if (read.value === null) remove.push(input.path);
-        else set.push([input.path, read.value]);
+        if (d.text.trim() !== '') readJsonInto(d.text);
       } else if (kind.multiple === true) {
         const picked = kind.allowed_values.filter((l) => d.picks.includes(l));
-        if (picked.length > 0) set.push([input.path, picked]);
+        if (picked.length > 0) setIfChanged(picked);
       } else if (d.text !== '') {
-        set.push([input.path, d.text]);
+        setIfChanged(d.text);
       }
       continue;
     }
     if (kind.kind === 'boolean') {
-      const was = typeof input.value === 'boolean' ? input.value : null;
+      // An absent boolean counts as unchecked: checking and unchecking it again is no change, and
+      // `false` is sent only to replace a `true`.
+      const was = input.value === true;
       if (d.bool !== null && d.bool !== was) set.push([input.path, d.bool]);
       continue;
     }
-    const change = clearable(initialText(input));
-    if (change === 'same') continue;
-    if (change === 'clear') {
+    const original = initialText(input);
+    if (d.text === original) continue;
+    if (d.text === '') {
       remove.push(input.path);
       continue;
     }
     switch (kind.kind) {
       case 'integer':
         if (INTEGER.test(d.text) && Number.isSafeInteger(Number(d.text))) {
-          set.push([input.path, Number(d.text)]);
+          setIfChanged(Number(d.text));
         } else errors[input.path] = EDIT_TEXT.integer_invalid;
         break;
       case 'number':
         if (DECIMAL.test(d.text) && Number.isFinite(Number(d.text))) {
-          set.push([input.path, Number(d.text)]);
+          setIfChanged(Number(d.text));
         } else errors[input.path] = EDIT_TEXT.number_invalid;
         break;
       case 'json': {
         // Blank text is a clear of the original value, or no change when there was none.
         if (d.text.trim() === '') {
-          if (initialText(input) !== '') remove.push(input.path);
+          if (original !== '') remove.push(input.path);
           break;
         }
-        const read = readJson(d.text);
-        if (!read.ok) errors[input.path] = EDIT_TEXT.json_invalid;
-        else if (read.value === null) remove.push(input.path);
-        else set.push([input.path, read.value]);
+        readJsonInto(d.text);
         break;
       }
       default:
         set.push([input.path, d.text]);
     }
   }
+  const edits = { set: Object.fromEntries(set), remove };
   return {
     // `fromEntries` defines own properties: no key can reach a prototype.
-    edits: { set: Object.fromEntries(set), remove },
+    edits,
     errors,
+    oversize: set.length + remove.length > 0 && new TextEncoder().encode(JSON.stringify(edits)).length > EDITS_MAX_BYTES,
     changed: set.length > 0 || remove.length > 0 || Object.keys(errors).length > 0,
   };
 }
+
+/** JSON equality of two values read from JSON: key order does not matter. */
+function sameJson(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  const x = a as Record<string, unknown>;
+  const y = b as Record<string, unknown>;
+  const keys = Object.keys(x);
+  return (
+    keys.length === Object.keys(y).length &&
+    keys.every((k) => Object.prototype.hasOwnProperty.call(y, k) && sameJson(x[k], y[k]))
+  );
+}
+
+/** Characters a reader cannot see or that reorder text (bidi controls, zero-width, other format and control characters). */
+const UNUSUAL = /(?![\n\t])[\p{Cc}\p{Cf}\u2028\u2029]/u;
 
 interface EditFormProps {
   form: EditFormModel;
@@ -149,7 +174,7 @@ interface EditFormProps {
 export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, rejection }: EditFormProps) {
   const base = useId();
   const built = buildEdits(form, drafts);
-  const hasErrors = Object.keys(built.errors).length > 0;
+  const hasErrors = Object.keys(built.errors).length > 0 || built.oversize;
   const own = form.inputs.filter((i) => !i.pre_added);
   const added = form.inputs.filter((i) => i.pre_added);
 
@@ -166,22 +191,31 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
     );
     const entry = { [EDIT_ENTRY_ATTR]: '' };
     const error = built.errors[input.path];
+    // The live region stays in the DOM, so a message added later is announced.
     const hint = (
-      <span id={hintId} className="field-hint" role={error === undefined ? undefined : 'alert'}>
+      <span id={hintId} className="field-hint" aria-live="polite">
         {error ?? ''}
       </span>
     );
+    const required = input.required ? true : undefined;
     const { kind } = input;
 
     if (input.read_only) {
-      const text = typeof input.value === 'string' ? input.value : JSON.stringify(input.value ?? null);
+      // Never sent, so it does not need to round-trip through a control: shown as agent text, which
+      // marks invisible and bidi characters. A disabled input would show them raw.
+      const text = typeof input.value === 'string' ? input.value : JSON.stringify(input.value);
+      const labelId = `${id}-label`;
       return (
-        <div className="field" key={input.path}>
-          <label htmlFor={id}>
+        <div className="field" key={input.path} role="group" aria-labelledby={labelId}>
+          <span id={labelId} className="field-label">
             {input.label}
             {marks}
-          </label>
-          <input id={id} type="text" value={text} disabled readOnly />
+          </span>{' '}
+          {input.value === null || text === undefined ? (
+            <span className="none">{EDIT_TEXT.none}</span>
+          ) : (
+            <AgentText value={text} unusual={UNUSUAL.test(text)} />
+          )}
         </div>
       );
     }
@@ -209,16 +243,23 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
               {label}
             </label>
           ))}
-          <AsJson id={`${id}-json`} on={d.asJson} onChange={(on) => set({ asJson: on, text: '' })} />
+          <AsJson id={`${id}-json`} label={input.label} on={d.asJson} onChange={(on) => set({ asJson: on, text: '' })} />
         </fieldset>
       );
     }
     let control;
     if (kind.kind === 'choice') {
       control = d.asJson ? (
-        <JsonFallback id={id} value={d.text} onChange={(text) => set({ text })} invalid={error !== undefined} hintId={hintId} />
+        <JsonFallback id={id} value={d.text} onChange={(text) => set({ text })} invalid={error !== undefined} hintId={hintId} required={required} />
       ) : (
-        <select id={id} {...entry} value={d.text} onChange={(e) => set({ text: e.target.value })}>
+        <select
+          id={id}
+          {...entry}
+          value={d.text}
+          aria-required={required}
+          aria-describedby={hintId}
+          onChange={(e) => set({ text: e.target.value })}
+        >
           <option value="">{EDIT_TEXT.choice_none}</option>
           {kind.allowed_values.map((label, i) => (
             <option key={`${i}-${label}`} value={label}>
@@ -229,7 +270,7 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
       );
     } else if (kind.kind === 'json') {
       control = (
-        <JsonFallback id={id} value={d.text} onChange={(text) => set({ text })} invalid={error !== undefined} hintId={hintId} />
+        <JsonFallback id={id} value={d.text} onChange={(text) => set({ text })} invalid={error !== undefined} hintId={hintId} required={required} />
       );
     } else if (kind.kind === 'long_text') {
       control = (
@@ -237,6 +278,7 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
           id={id}
           {...entry}
           value={d.text}
+          aria-required={required}
           aria-describedby={hintId}
           onChange={(e) => set({ text: e.target.value })}
         />
@@ -248,6 +290,8 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
           type="checkbox"
           {...entry}
           checked={d.bool === true}
+          aria-required={required}
+          aria-describedby={hintId}
           onChange={(e) => set({ bool: e.target.checked })}
         />
       );
@@ -259,6 +303,7 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
           {...entry}
           inputMode={kind.kind === 'integer' ? 'numeric' : kind.kind === 'number' ? 'decimal' : 'text'}
           value={d.text}
+          aria-required={required}
           aria-invalid={error !== undefined}
           aria-describedby={hintId}
           onChange={(e) => set({ text: e.target.value })}
@@ -274,7 +319,7 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
         {control}
         {kind.kind === 'json' || (kind.kind === 'choice' && d.asJson) ? null : hint}
         {kind.kind === 'choice' ? (
-          <AsJson id={`${id}-json`} on={d.asJson} onChange={(on) => set({ asJson: on, text: '' })} />
+          <AsJson id={`${id}-json`} label={input.label} on={d.asJson} onChange={(on) => set({ asJson: on, text: '' })} />
         ) : null}
       </div>
     );
@@ -306,23 +351,25 @@ export function EditForm({ form, drafts, onDraft, onReset, onSubmit, canSubmit, 
         </p>
       )}
       <div className="edit-actions">
-        <button type="button" disabled={!canSubmit || !built.changed || hasErrors} onClick={onSubmit}>
+        <button type="button" {...{ [EDIT_ENTRY_ATTR]: '' }} disabled={!canSubmit || !built.changed || hasErrors} onClick={onSubmit}>
           {EDIT_TEXT.submit}
         </button>
-        <button type="button" disabled={!built.changed} onClick={onReset}>
+        <button type="button" {...{ [EDIT_ENTRY_ATTR]: '' }} disabled={!built.changed} onClick={onReset}>
           {EDIT_TEXT.reset}
         </button>
-        {built.changed ? null : <span className="field-hint">{EDIT_TEXT.nothing_to_send}</span>}
+        <span className="field-hint" aria-live="polite">
+          {built.oversize ? EDIT_TEXT.too_large : built.changed ? '' : EDIT_TEXT.nothing_to_send}
+        </span>
       </div>
     </section>
   );
 }
 
-function AsJson({ id, on, onChange }: { id: string; on: boolean; onChange: (on: boolean) => void }) {
+function AsJson({ id, label, on, onChange }: { id: string; label: string; on: boolean; onChange: (on: boolean) => void }) {
   return (
     <label className="as-json" htmlFor={id}>
-      <input id={id} type="checkbox" checked={on} onChange={(e) => onChange(e.target.checked)} />{' '}
-      {EDIT_TEXT.as_json}
+      <input id={id} type="checkbox" {...{ [EDIT_ENTRY_ATTR]: '' }} checked={on} onChange={(e) => onChange(e.target.checked)} />{' '}
+      {EDIT_TEXT.as_json(label)}
     </label>
   );
 }

@@ -94,33 +94,45 @@ function sentEdits(n = 0) {
 describe('write edit form (spec 5.4 step 4)', () => {
   it('ui01_target_and_baseline_inputs_read_only', async () => {
     await openStructured([SUMMARY, ISSUE, BASE]);
-    for (const name of [/Issue/, /Expected/]) {
-      const el = field(name);
-      expect(el.disabled).toBe(true);
-      expect(el.readOnly).toBe(true);
+    // A read-only value is agent text (a bidi-isolated quote with the unverified badge), no control.
+    for (const [name, text] of [[/Issue/, '“PROJ-1”'], [/Expected/, '“{"v":1}”']] as const) {
+      const box = screen.getByRole('group', { name });
+      expect(within(box).queryByRole('textbox')).toBeNull();
+      expect(within(box).getByText(text).tagName).toBe('BDI');
+      expect(within(box).getByText('unverified')).toBeTruthy();
     }
     // The plan's label sits next to each, and the editable input has none.
     expect(screen.getAllByText(/read-only: deny to retarget/)).toHaveLength(2);
     expect(field(/Summary/).disabled).toBe(false);
     expect(within(field(/Summary/).closest('.field') as HTMLElement).queryByText(/read-only/)).toBeNull();
-
-    // Negative control: nothing of a read-only input is ever sent, whatever happens to its control.
-    fireEvent.change(field(/Issue/), { target: { value: 'OTHER-9' } });
-    fireEvent.change(field(/Expected/), { target: { value: '{}' } });
-    expect(field(/Issue/).value).toBe('PROJ-1');
     expect(editButton().disabled).toBe(true);
     change(field(/Summary/), 'Fix it now');
     fireEvent.click(editButton());
     await flush();
     const edits = sentEdits();
     expect(edits).toEqual({ set: { summary: 'Fix it now' }, remove: [] });
-    expect(JSON.stringify(edits)).not.toMatch(/issue_key|expected|OTHER-9/);
+    expect(JSON.stringify(edits)).not.toMatch(/issue_key|expected/);
 
     // The model-level control: a draft for a read-only path is not read either.
     const form = { inputs: [SUMMARY, ISSUE] };
     const draft = { text: 'OTHER', bool: null, picks: [], asJson: false };
     expect(buildEdits(form, { issue_key: draft }).edits).toEqual({ set: {}, remove: [] });
     expect(buildEdits(form, { issue_key: draft }).changed).toBe(false);
+  });
+
+  it('a_read_only_value_marks_bidi_and_invisible_characters_and_shows_none_for_absent', async () => {
+    const tricky = input({ path: 'expected', label: 'Expected', kind: { kind: 'text' }, read_only: true, value: 'Done\u202Egnp.exe' });
+    const zero = input({ path: 'space', label: 'Space', kind: { kind: 'text' }, read_only: true, value: 'DE\u200BV' });
+    const plain = input({ path: 'issue_key', label: 'Issue', kind: { kind: 'text' }, read_only: true, value: 'PROJ-1' });
+    const absent = input({ path: 'label', label: 'Label', kind: { kind: 'text' }, read_only: true });
+    await openStructured([SUMMARY, tricky, zero, plain, absent]);
+    for (const name of [/Expected/, /Space/]) {
+      expect(within(screen.getByRole('group', { name })).getByLabelText('unusual characters')).toBeTruthy();
+    }
+    expect(within(screen.getByRole('group', { name: /Issue/ })).queryByLabelText('unusual characters')).toBeNull();
+    const none = within(screen.getByRole('group', { name: /Label/ }));
+    expect(none.getByText('(none)')).toBeTruthy();
+    expect(none.queryByText(/null/)).toBeNull();
   });
 
   it('preadded_inputs_grouped_and_required', async () => {
@@ -133,12 +145,12 @@ describe('write edit form (spec 5.4 step 4)', () => {
     });
     await openStructured([SUMMARY, priority, ISSUE]);
     const missing = screen.getByRole('group', { name: 'Missing required fields' });
-    expect(within(missing).getByLabelText(/Priority/)).toBeTruthy();
+    expect(within(missing).getByLabelText(/^Priority/)).toBeTruthy();
     expect(within(missing).queryByLabelText(/Summary/)).toBeNull();
     expect(within(missing).getByText(/\(required\)/)).toBeTruthy();
     const params = screen.getByRole('group', { name: 'Parameters' });
     expect(within(params).getByLabelText(/Summary/)).toBeTruthy();
-    expect(within(params).queryByLabelText(/Priority/)).toBeNull();
+    expect(within(params).queryByLabelText(/^Priority/)).toBeNull();
     // A form without a pre-added input has no such group.
   });
 
@@ -155,7 +167,7 @@ describe('write edit form (spec 5.4 step 4)', () => {
       pre_added: true,
     });
     await openStructured([priority]);
-    const select = field(/Priority/);
+    const select = field(/^Priority/);
     expect(select.tagName).toBe('SELECT');
     expect(within(select).getAllByRole('option').map((o) => o.textContent)).toEqual(['(none)', 'High', 'Low']);
     expect(editButton().disabled).toBe(true);
@@ -280,11 +292,100 @@ describe('write edit form (spec 5.4 step 4)', () => {
     change(field(/^update/), 'null');
     expect(editButton().disabled).toBe(false);
     // A choice can be entered as JSON instead (a value its labels cannot name).
-    fireEvent.click(screen.getByLabelText('Enter as JSON'));
+    fireEvent.click(screen.getByLabelText('Enter Team as JSON'));
     change(field(/^Team/), '{"id": "10400"}');
     fireEvent.click(editButton());
     await flush();
     expect(sentEdits()).toEqual({ set: { 'fields.team': { id: '10400' } }, remove: ['update'] });
+  });
+
+  it('changed_compares_values_not_text', async () => {
+    const inputs = [
+      input({ path: 'n', label: 'n', kind: { kind: 'integer' }, value: 50 }),
+      input({ path: 'x', label: 'x', kind: { kind: 'number' }, value: 1.5 }),
+      input({ path: 'doc', label: 'doc', kind: { kind: 'json' }, value: { a: [1, 2], b: 'c' } }),
+    ];
+    await openStructured(inputs);
+    change(field(/^n$/), '050');
+    change(field(/^x$/), '1.50');
+    change(field(/^doc$/), '{"b":"c","a":[1,2]}');
+    expect(editButton().disabled).toBe(true);
+    expect(screen.queryByText(/Unsent edits/)).toBeNull();
+    const form = { inputs };
+    expect(buildEdits(form, { n: { text: '050', bool: null, picks: [], asJson: false } }).changed).toBe(false);
+    // Control: a real change in the same field still counts.
+    change(field(/^n$/), '051');
+    expect(editButton().disabled).toBe(false);
+  });
+
+  it('a_boolean_from_absent_is_sent_only_when_it_ends_up_different', async () => {
+    const flag = input({ path: 'notify', label: 'notify', kind: { kind: 'boolean' } });
+    const on = input({ path: 'on', label: 'on', kind: { kind: 'boolean' }, value: true });
+    await openStructured([flag, on]);
+    // Absent, checked, unchecked again: the same as the start, nothing to send (not `false`).
+    fireEvent.click(field(/^notify$/));
+    expect(editButton().disabled).toBe(false);
+    fireEvent.click(field(/^notify$/));
+    expect(editButton().disabled).toBe(true);
+    expect(buildEdits({ inputs: [flag] }, { notify: { text: '', bool: false, picks: [], asJson: false } }).changed).toBe(false);
+    // `false` over a `true` is a change.
+    fireEvent.click(field(/^on$/));
+    fireEvent.click(editButton());
+    await flush();
+    expect(sentEdits()).toEqual({ set: { on: false }, remove: [] });
+  });
+
+  it('a_multi_pick_can_be_entered_as_json_instead', async () => {
+    const areas = input({
+      path: 'fields.areas',
+      label: 'Areas',
+      kind: { kind: 'choice', allowed_values: ['UI', 'API'], multiple: true },
+      pre_added: true,
+    });
+    await openStructured([areas]);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'UI' }));
+    fireEvent.click(screen.getByLabelText('Enter Areas as JSON'));
+    // The list of checkboxes is gone and the picks no longer count; the text does.
+    expect(screen.queryByRole('checkbox', { name: 'UI' })).toBeNull();
+    expect(editButton().disabled).toBe(true);
+    change(field(/^Areas/), '[{"id": "1"}, {"id": "2"}]');
+    fireEvent.click(editButton());
+    await flush();
+    expect(sentEdits()).toEqual({ set: { 'fields.areas': [{ id: '1' }, { id: '2' }] }, remove: [] });
+  });
+
+  it('json_toggles_are_named_by_field_and_required_fields_are_aria_required', async () => {
+    const a = input({ path: 'fields.a', label: 'Alpha', kind: { kind: 'choice', allowed_values: ['x'] }, required: true, pre_added: true });
+    const b = input({ path: 'fields.b', label: 'Beta', kind: { kind: 'choice', allowed_values: ['y'] }, pre_added: true });
+    await openStructured([SUMMARY, a, b]);
+    expect(Array.from(document.querySelectorAll('.as-json')).map((l) => l.textContent?.trim())).toEqual([
+      'Enter Alpha as JSON',
+      'Enter Beta as JSON',
+    ]);
+    expect(field(/Summary/).getAttribute('aria-required')).toBe('true');
+    expect(field(/^Alpha/).getAttribute('aria-required')).toBe('true');
+    expect(field(/^Beta/).getAttribute('aria-required')).toBeNull();
+    // The hint region exists before its message and is not an alert (no duplicate alert text).
+    const hint = document.getElementById(field(/Summary/).getAttribute('aria-describedby') as string) as HTMLElement;
+    expect(hint.getAttribute('aria-live')).toBe('polite');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('edits_past_one_mib_are_refused_locally_with_a_specific_message', async () => {
+    const doc = input({ path: 'description', label: 'description', kind: { kind: 'long_text' }, value: 'x' });
+    await openStructured([doc]);
+    change(field(/^description/), 'a'.repeat(1024 * 1024 + 1));
+    expect(screen.getByText(/too large to send/)).toBeTruthy();
+    expect(editButton().disabled).toBe(true);
+    fireEvent.click(editButton());
+    await flush();
+    expect(mockedDecide).not.toHaveBeenCalled();
+    // Control: under the bound it goes out.
+    change(field(/^description/), 'a'.repeat(1024));
+    expect(screen.queryByText(/too large to send/)).toBeNull();
+    fireEvent.click(editButton());
+    await flush();
+    expect(mockedDecide).toHaveBeenCalledTimes(1);
   });
 
   it('edit_then_new_revision_needs_open_before_approve', async () => {
@@ -396,7 +497,19 @@ describe('write edit form (spec 5.4 step 4)', () => {
     });
     fireEvent.click(editButton());
     await flush();
-    expect(screen.getByText(/^“m+”$/).textContent?.length).toBeLessThan(400);
+    expect(screen.getByText(/^“m+…”$/).textContent?.length).toBeLessThan(400);
+    // Cut by code points: a pair at the cut is not split, and a short text has no ellipsis.
+    mockedDecide.mockRejectedValueOnce({
+      kind: 'decision',
+      error: { kind: 'edit_rejected', error: { message: `${'m'.repeat(299)}😀tail` } },
+    });
+    fireEvent.click(editButton());
+    await flush();
+    expect(screen.getByText(`“${'m'.repeat(299)}😀…”`)).toBeTruthy();
+    mockedDecide.mockRejectedValueOnce({ kind: 'decision', error: { kind: 'edit_rejected', error: { message: 'short' } } });
+    fireEvent.click(editButton());
+    await flush();
+    expect(screen.getByText('“short”')).toBeTruthy();
   });
 
   it('unsent_edits_keep_the_revisions_own_approve_off', async () => {
@@ -529,6 +642,19 @@ describe('chords and inert rules while an edit field has focus', () => {
     await flush();
     expect(mockedPreview).toHaveBeenCalledTimes(2);
     expect(mockedPreview).toHaveBeenLastCalledWith(READ.request_id);
+  });
+
+  it('next_prev_chords_stay_in_the_json_toggle_and_the_edit_buttons', async () => {
+    const keys = new Keyboard();
+    const team = input({ path: 'fields.team', label: 'Team', kind: { kind: 'choice', allowed_values: ['A'] }, pre_added: true });
+    await openStructured([SUMMARY, team]);
+    for (const el of [screen.getByLabelText('Enter Team as JSON'), screen.getByRole('button', { name: 'Reset edits' }), editButton()]) {
+      (el as HTMLElement).focus();
+      expect(keys.chord('Up')).toBe(true);
+    }
+    await flush();
+    advance(INERT_MS);
+    expect(mockedPreview).toHaveBeenCalledTimes(1);
   });
 
   it('approve_chord_in_a_field_is_gated_by_unsent_edits_and_runs_when_there_are_none', async () => {

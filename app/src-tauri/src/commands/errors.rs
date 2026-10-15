@@ -9,7 +9,8 @@ use serde::{Serialize, Serializer};
 /// (`DecisionError`, `AdminError`) that serializes a kind and fixed data. One exception:
 /// `DecisionError::EditRejected` carries the validator's app-generated message, which can echo
 /// values of the user's edit or of the agent's request, bounded and display-escaped by the validator;
-/// no secret or path can appear in it. The UI never renders it (it maps `kind` to fixed strings).
+/// no secret or path can appear in it. The UI shows it only for an edit, cut to a bounded length and
+/// inside `AgentText` after a fixed prefix; every other error it maps from `kind` to fixed strings.
 ///
 /// Wire shape: `{"kind": "invalid_argument", "field": "<name>"}`, `{"kind": "not_found"}`,
 /// `{"kind": "not_ready"}`, `{"kind": "internal"}`, and the wrapped core errors nested under

@@ -19,6 +19,7 @@ interface JsonFallbackProps {
   /** The text does not parse: the hint is shown and the field is marked invalid. */
   invalid: boolean;
   hintId: string;
+  required?: true | undefined;
 }
 
 /**
@@ -26,7 +27,7 @@ interface JsonFallbackProps {
  * value a `choice` cannot name. The text is parsed locally only to show a syntax hint; what is sent
  * is decided by `buildEdits` and checked again by Rust.
  */
-export function JsonFallback({ id, value, onChange, invalid, hintId }: JsonFallbackProps) {
+export function JsonFallback({ id, value, onChange, invalid, hintId, required }: JsonFallbackProps) {
   return (
     <>
       <textarea
@@ -35,11 +36,12 @@ export function JsonFallback({ id, value, onChange, invalid, hintId }: JsonFallb
         className="json-input"
         spellCheck={false}
         value={value}
+        aria-required={required}
         aria-invalid={invalid}
         aria-describedby={hintId}
         onChange={(e) => onChange(e.target.value)}
       />
-      <span id={hintId} className="field-hint" role={invalid ? 'alert' : undefined}>
+      <span id={hintId} className="field-hint" aria-live="polite">
         {invalid ? EDIT_TEXT.json_invalid : ''}
       </span>
     </>
