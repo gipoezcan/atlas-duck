@@ -4113,3 +4113,599 @@ mod raw_pages {
         Ok(())
     }
 }
+
+// ---- M6 T31 (§13 Security Frontend row, S-09 mock-runtime half; §10.3) ----
+
+/// The seven window labels (C.10 + Δ1, PD-72).
+const S09_LABELS: [&str; 7] = [
+    "approvals",
+    "settings",
+    "audit",
+    "running_scripts",
+    "onboarding",
+    "credential",
+    "setup",
+];
+
+/// The commands each window holds (C.10 + Δ1 table), written out here on purpose: a second source
+/// next to `ci/check-commands.mjs`, compared with the capability files below, never derived from
+/// them. A window outside its row is refused by Tauri's ACL.
+const S09_GRANTS: [(&str, &[&str]); 7] = [
+    (
+        "approvals",
+        &[
+            "queue_list",
+            "queue_get",
+            "preview_fetch",
+            "raw_page",
+            "decide",
+            "decide_batch",
+            "deny_batch",
+            "deny_session",
+            "redaction_preview",
+            "recent_list",
+            "acknowledge_attention",
+            "open_window",
+            "quit",
+            "app_status",
+        ],
+    ),
+    (
+        "settings",
+        &[
+            "settings_get",
+            "settings_apply",
+            "instance_add",
+            "instance_change_url",
+            "instance_confirm_config",
+            "instance_accept_url_change",
+            "instance_set_proxy",
+            "credential_window_open",
+            "retest_token",
+            "prune_backlog_now",
+            "cli_install",
+            "cli_uninstall",
+            "removal_state",
+            "removal_backup",
+            "removal_begin",
+            "removal_mark",
+            "removal_finish",
+            "app_status",
+        ],
+    ),
+    ("audit", &["verify_now"]),
+    ("running_scripts", &["running_list", "running_kill"]),
+    ("onboarding", &["onboarding_text"]),
+    (
+        "credential",
+        &[
+            "submit_secret",
+            "credential_context",
+            "save_recovery_note",
+            "archive_and_start_fresh",
+            "retry_keychain",
+            "close_credential",
+            "quit",
+        ],
+    ),
+    (
+        "setup",
+        &[
+            "wizard_state",
+            "wizard_use_default_dir",
+            "wizard_choose_dir",
+            "wizard_begin",
+            "wizard_skip_instances",
+            "wizard_finish",
+            "instance_add",
+            "instance_change_url",
+            "instance_confirm_config",
+            "instance_accept_url_change",
+            "cli_install",
+            "onboarding_text",
+            "quit",
+        ],
+    ),
+];
+
+/// The window of label: the one already open, or a new one.
+fn s09_window(app: &App<MockRuntime>, label: &str) -> tauri::Result<WebviewWindow<MockRuntime>> {
+    app.get_webview_window(label)
+        .map_or_else(|| window(app, label), Ok)
+}
+
+/// The capability file of `label`, parsed.
+fn s09_capability(label: &str) -> Result<Value, Box<dyn std::error::Error>> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("capabilities")
+        .join(format!("{label}.json"));
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+}
+
+/// The permission strings of a capability file.
+fn s09_permissions(capability: &Value) -> Vec<String> {
+    capability["permissions"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|p| p.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// §13 / §10.3 (S-09): for each of the seven windows, every command of `COMMANDS` outside its row
+/// of the Δ1 table is refused by the runtime's authority (Tauri's ACL, before any command layer),
+/// and the table itself is the capability files' content, one file per window. A tenth window label
+/// holds nothing.
+#[test]
+fn s09_command_outside_grant_rejected_every_window() -> TestResult {
+    // The table is the command list: every command is granted somewhere, none is unknown.
+    let mut granted: Vec<&str> = S09_GRANTS
+        .iter()
+        .flat_map(|(_, c)| c.iter().copied())
+        .collect();
+    granted.sort_unstable();
+    granted.dedup();
+    assert_eq!(
+        granted, COMMANDS,
+        "every command, and only commands, are granted"
+    );
+
+    // The table is what the capability files grant (`allow-<command>`, `_` written as `-`).
+    let mut files: Vec<String> =
+        std::fs::read_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities"))?
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .collect();
+    files.sort();
+    let mut want: Vec<String> = S09_LABELS.iter().map(|l| format!("{l}.json")).collect();
+    want.sort();
+    assert_eq!(files, want, "one capability file per window, no other");
+    for (label, commands) in S09_GRANTS {
+        let capability = s09_capability(label)?;
+        assert_eq!(capability["windows"], json!([label]), "{label}: windows");
+        let mut from_file: Vec<String> = s09_permissions(&capability)
+            .iter()
+            .filter_map(|p| p.strip_prefix("allow-").map(|c| c.replace('-', "_")))
+            .collect();
+        from_file.sort();
+        let mut table: Vec<String> = commands.iter().map(|c| (*c).to_owned()).collect();
+        table.sort();
+        assert_eq!(
+            from_file, table,
+            "{label}: capability file and Δ1 row differ"
+        );
+    }
+
+    // Every command outside a window's row is refused by the ACL: a body of `{}` is enough, the
+    // check comes first (a granted command in the wrong window never reaches its handler).
+    let app = app()?;
+    let mut refusals = 0;
+    for label in S09_LABELS.into_iter().chain(["unknown"]) {
+        let row: &[&str] = S09_GRANTS
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map_or(&[], |(_, c)| c);
+        let w = s09_window(&app, label)?;
+        for cmd in COMMANDS {
+            if row.contains(cmd) {
+                continue;
+            }
+            let r = invoke(&w, cmd, json!({}));
+            assert!(
+                acl_refused(&r),
+                "{label}: {cmd} was not refused by the ACL: {r:?}"
+            );
+            refusals += 1;
+        }
+    }
+    // 8 labels x every command, less the table's grants (a command two windows hold counts twice).
+    let grants: usize = S09_GRANTS.iter().map(|(_, c)| c.len()).sum();
+    assert_eq!(refusals, 8 * COMMANDS.len() - grants);
+
+    // The event commands follow the same authority: the windows that listen hold both, the others
+    // neither.
+    let listen = json!({"event": "queue_changed", "target": {"kind": "Any"}, "handler": 0});
+    for label in ["audit", "onboarding", "unknown"] {
+        let w = s09_window(&app, label)?;
+        let r = invoke(&w, "plugin:event|listen", listen.clone());
+        assert!(
+            r.as_ref()
+                .err()
+                .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed"))),
+            "{label}: plugin:event|listen {r:?}"
+        );
+    }
+    Ok(())
+}
+
+/// A body and where it goes: the window that holds the command, and per case the edit that must be
+/// refused before the handler.
+struct S09Case {
+    cmd: &'static str,
+    window: &'static str,
+    valid: Value,
+    /// A key to give a value of the wrong type (the whole body when `None`: not an object).
+    wrong_type: (Option<&'static str>, Value),
+    /// A key to push past its bound (the body gains a 1 MiB pad when `None`: nothing to bound).
+    out_of_bounds: (Option<&'static str>, Value),
+}
+
+fn s09_cases() -> Vec<S09Case> {
+    let id = "req_0123456789abcdefghij";
+    let rev = json!({"counter": 1, "candidate_hash": "ab".repeat(32)});
+    let huge = || json!("x".repeat(1 << 20));
+    let many = |v: Value| json!(vec![v; 100_001]);
+    let case = |cmd, window, valid: Value, wrong_type, out_of_bounds| S09Case {
+        cmd,
+        window,
+        valid,
+        wrong_type,
+        out_of_bounds,
+    };
+    let num = |key: &'static str| (Some(key), json!(7));
+    let whole = || (None, json!("not an object"));
+    let pad = || (None, Value::Null);
+    vec![
+        case(
+            "acknowledge_attention",
+            "approvals",
+            json!({"request_ids": [id]}),
+            (Some("request_ids"), json!("x")),
+            (Some("request_ids"), many(json!(id))),
+        ),
+        case("app_status", "approvals", json!({}), whole(), pad()),
+        case(
+            "archive_and_start_fresh",
+            "credential",
+            json!({}),
+            whole(),
+            pad(),
+        ),
+        case("cli_install", "settings", json!({}), whole(), pad()),
+        case("cli_uninstall", "settings", json!({}), whole(), pad()),
+        case("close_credential", "credential", json!({}), whole(), pad()),
+        case(
+            "credential_context",
+            "credential",
+            json!({}),
+            whole(),
+            pad(),
+        ),
+        case(
+            "credential_window_open",
+            "settings",
+            json!({"alias": "work", "purpose": "add_pat"}),
+            num("alias"),
+            (Some("purpose"), huge()),
+        ),
+        case(
+            "decide",
+            "approvals",
+            json!({"request_id": id, "decision": "release", "candidate_rev": rev}),
+            num("request_id"),
+            (Some("reason"), huge()),
+        ),
+        case(
+            "decide_batch",
+            "approvals",
+            json!({"items": [{"request_id": id, "candidate_rev": rev}]}),
+            (Some("items"), json!("x")),
+            (
+                Some("items"),
+                many(json!({"request_id": id, "candidate_rev": rev})),
+            ),
+        ),
+        case(
+            "deny_batch",
+            "approvals",
+            json!({"request_ids": [id], "reason": "no"}),
+            (Some("request_ids"), json!("x")),
+            (Some("reason"), huge()),
+        ),
+        case(
+            "deny_session",
+            "approvals",
+            json!({"session_id": "ab".repeat(32), "reason": "no"}),
+            num("session_id"),
+            (Some("reason"), huge()),
+        ),
+        case(
+            "instance_accept_url_change",
+            "settings",
+            json!({"alias": "work"}),
+            num("alias"),
+            (Some("alias"), huge()),
+        ),
+        case(
+            "instance_add",
+            "settings",
+            json!({"alias": "work", "product": "jira", "base_url": "https://jira.example", "proxy": "", "use_custom_ca": false, "is_default": false}),
+            num("alias"),
+            (Some("base_url"), huge()),
+        ),
+        case(
+            "instance_change_url",
+            "settings",
+            json!({"alias": "work", "new_url": "https://jira.example/new"}),
+            num("new_url"),
+            (Some("new_url"), huge()),
+        ),
+        case(
+            "instance_confirm_config",
+            "settings",
+            json!({"alias": "work"}),
+            num("alias"),
+            (Some("alias"), huge()),
+        ),
+        case(
+            "instance_set_proxy",
+            "settings",
+            json!({"alias": "work", "proxy": "direct"}),
+            num("proxy"),
+            (Some("proxy"), huge()),
+        ),
+        case("onboarding_text", "onboarding", json!({}), whole(), pad()),
+        case(
+            "open_window",
+            "approvals",
+            json!({"window": "audit"}),
+            num("window"),
+            (Some("window"), huge()),
+        ),
+        case(
+            "preview_fetch",
+            "approvals",
+            json!({"request_id": id}),
+            num("request_id"),
+            (Some("request_id"), huge()),
+        ),
+        case("prune_backlog_now", "settings", json!({}), whole(), pad()),
+        case(
+            "queue_get",
+            "approvals",
+            json!({"request_id": id}),
+            num("request_id"),
+            (Some("request_id"), huge()),
+        ),
+        case("queue_list", "approvals", json!({}), whole(), pad()),
+        case("quit", "approvals", json!({}), whole(), pad()),
+        case(
+            "raw_page",
+            "approvals",
+            json!({"request_id": id, "candidate_rev": rev, "page": 0}),
+            (Some("page"), json!("0")),
+            (Some("request_id"), json!("r".repeat(1 << 16))),
+        ),
+        case("recent_list", "approvals", json!({}), whole(), pad()),
+        case(
+            "redaction_preview",
+            "approvals",
+            json!({"request_id": id, "candidate_rev": rev, "ops": []}),
+            (Some("ops"), json!("x")),
+            (Some("ops"), many(json!({"preset": "status_only"}))),
+        ),
+        case("removal_backup", "settings", json!({}), whole(), pad()),
+        case("removal_begin", "settings", json!({}), whole(), pad()),
+        case("removal_finish", "settings", json!({}), whole(), pad()),
+        case(
+            "removal_mark",
+            "settings",
+            json!({"alias": "work", "choice": "done"}),
+            num("alias"),
+            (Some("choice"), huge()),
+        ),
+        case("removal_state", "settings", json!({}), whole(), pad()),
+        case(
+            "retest_token",
+            "settings",
+            json!({"alias": "work"}),
+            num("alias"),
+            (Some("alias"), huge()),
+        ),
+        case("retry_keychain", "credential", json!({}), whole(), pad()),
+        case(
+            "running_kill",
+            "running_scripts",
+            json!({"request_id": id}),
+            num("request_id"),
+            (Some("request_id"), huge()),
+        ),
+        case("running_list", "running_scripts", json!({}), whole(), pad()),
+        case(
+            "save_recovery_note",
+            "credential",
+            json!({}),
+            whole(),
+            pad(),
+        ),
+        case(
+            "settings_apply",
+            "settings",
+            json!({"changes": [{"key": "legal_hold", "value": true}]}),
+            (Some("changes"), json!("x")),
+            (
+                Some("changes"),
+                many(json!({"key": "legal_hold", "value": true})),
+            ),
+        ),
+        case("settings_get", "settings", json!({}), whole(), pad()),
+        case(
+            "submit_secret",
+            "credential",
+            json!({"secret": "canary-s09"}),
+            num("secret"),
+            (Some("secret"), huge()),
+        ),
+        case("verify_now", "audit", json!({}), whole(), pad()),
+        case("wizard_begin", "setup", json!({}), whole(), pad()),
+        case("wizard_choose_dir", "setup", json!({}), whole(), pad()),
+        case(
+            "wizard_finish",
+            "setup",
+            json!({"step": "cli"}),
+            num("step"),
+            (Some("step"), huge()),
+        ),
+        case(
+            "wizard_skip_instances",
+            "setup",
+            json!({"step": "cli"}),
+            num("step"),
+            (Some("step"), huge()),
+        ),
+        case("wizard_state", "setup", json!({}), whole(), pad()),
+        case("wizard_use_default_dir", "setup", json!({}), whole(), pad()),
+    ]
+}
+
+/// `body` with `key` set to `value`.
+fn s09_with(body: &Value, key: &str, value: Value) -> Value {
+    let mut out = body.clone();
+    if let Some(m) = out.as_object_mut() {
+        m.insert(key.into(), value);
+    }
+    out
+}
+
+/// §10.3 (S-09): one case per command, three ways a body can be wrong, each refused as
+/// `invalid_argument` before the handler: an unknown key, a value of the wrong type (a body that is
+/// no object, for the commands that take nothing), a value past its bound (a 1 MiB pad, for the
+/// commands that take nothing). Every command of `COMMANDS` has its row.
+#[test]
+fn s09_unknown_field_wrong_type_out_of_bounds_rejected() -> TestResult {
+    let cases = s09_cases();
+    let mut names: Vec<&str> = cases.iter().map(|c| c.cmd).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names, COMMANDS,
+        "a command without a case (or a case without a command)"
+    );
+
+    let app = app()?;
+    let invalid = |r: &Result<Value, Value>| {
+        r.as_ref()
+            .err()
+            .is_some_and(|e| e["kind"] == "invalid_argument" && e["field"].is_string())
+    };
+    for c in &cases {
+        let w = s09_window(&app, c.window)?;
+        assert!(
+            S09_GRANTS
+                .iter()
+                .any(|(l, cmds)| *l == c.window && cmds.contains(&c.cmd)),
+            "{}: {} does not hold it",
+            c.cmd,
+            c.window
+        );
+        // Control: the valid body is not refused as an invalid argument (the handler answers
+        // `not_ready`, or for `quit`/`open_window` is not asked: they act on the app).
+        if !matches!(c.cmd, "quit" | "open_window") {
+            let r = invoke(&w, c.cmd, c.valid.clone());
+            assert!(!invalid(&r), "{}: its valid body is refused: {r:?}", c.cmd);
+        }
+
+        // An unknown key.
+        let r = invoke(&w, c.cmd, s09_with(&c.valid, "__unknown", json!(1)));
+        assert_eq!(
+            r,
+            Err(json!({"kind": "invalid_argument", "field": "payload"})),
+            "{}: unknown key",
+            c.cmd
+        );
+
+        // The wrong type.
+        let (key, value) = &c.wrong_type;
+        let body = match key {
+            Some(k) => s09_with(&c.valid, k, value.clone()),
+            None => value.clone(),
+        };
+        let r = invoke(&w, c.cmd, body);
+        assert!(invalid(&r), "{}: wrong type: {r:?}", c.cmd);
+
+        // Out of bounds.
+        let (key, value) = &c.out_of_bounds;
+        let body = match key {
+            Some(k) => s09_with(&c.valid, k, value.clone()),
+            None => s09_with(&c.valid, "pad", json!("x".repeat(1 << 20))),
+        };
+        let r = invoke(&w, c.cmd, body);
+        // `step` is matched against the closed set of wizard steps, never stored: a huge one is a
+        // mismatch the wizard answers (here `not_ready`, the mock app has no wizard).
+        let matched_only = matches!(c.cmd, "wizard_finish" | "wizard_skip_instances")
+            && r == Err(json!({"kind": "not_ready"}));
+        assert!(
+            invalid(&r) || matched_only,
+            "{}: out of bounds: {r:?}",
+            c.cmd
+        );
+    }
+    Ok(())
+}
+
+/// §10.3 / §13: the dialog and notification plugins serve Rust only (the startup dialogs, the
+/// attention toast): no capability file grants a single command of either, and with both plugins
+/// registered as in the real app every one of their commands is refused in every window.
+#[test]
+fn dialog_and_notification_plugin_commands_granted_to_none() -> TestResult {
+    // The files: nothing but the app's own `allow-<command>` and the two event permissions.
+    for label in S09_LABELS {
+        let capability = s09_capability(label)?;
+        let permissions = s09_permissions(&capability);
+        assert!(!permissions.is_empty(), "{label}: no permissions read");
+        for p in &permissions {
+            let lower = p.to_lowercase();
+            assert!(
+                !lower.contains("dialog") && !lower.contains("notification"),
+                "{label}: {p} grants a plugin command"
+            );
+            assert!(
+                p.starts_with("allow-")
+                    || p == "core:event:allow-listen"
+                    || p == "core:event:allow-unlisten",
+                "{label}: {p} is neither an app command nor an event permission"
+            );
+            assert!(
+                !p.ends_with(":default") && !p.contains('*'),
+                "{label}: {p} is a set"
+            );
+        }
+    }
+
+    // The runtime: the real app registers both plugins; every command of both is refused by the ACL
+    // (not "plugin not found"), also in a window that holds the most.
+    let context = tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
+    let app = commands::register(mock_builder())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .build(context)?;
+    let refused_by_acl = |r: &Result<Value, Value>| {
+        r.as_ref()
+            .err()
+            .is_some_and(|e| e.as_str().is_some_and(|s| s.contains("not allowed")))
+    };
+    for label in S09_LABELS.into_iter().chain(["unknown"]) {
+        let w = s09_window(&app, label)?;
+        for cmd in [
+            "plugin:dialog|open",
+            "plugin:dialog|save",
+            "plugin:dialog|message",
+            "plugin:dialog|ask",
+            "plugin:dialog|confirm",
+            "plugin:notification|notify",
+            "plugin:notification|request_permission",
+            "plugin:notification|permission_state",
+            "plugin:notification|is_permission_granted",
+            "plugin:notification|show",
+            "plugin:notification|cancel",
+        ] {
+            let r = invoke(
+                &w,
+                cmd,
+                json!({"message": "x", "title": "x", "options": {}}),
+            );
+            assert!(refused_by_acl(&r), "{label}: {cmd} {r:?}");
+        }
+    }
+    Ok(())
+}
