@@ -357,6 +357,43 @@ export interface CliInstallAnswer {
   outcome: 'installed' | 'already_installed' | 'removed' | 'already_on_path';
 }
 
+/** The wizard steps in the order Rust walks them (`app::wizard::WizardStep`, PD-77). */
+export type WizardStep =
+  | 'data_dir'
+  | 'existing_store'
+  | 'passphrase'
+  | 'genesis'
+  | 'recovery_note'
+  | 'instances'
+  | 'cli'
+  | 'onboarding'
+  | 'done'
+  | 'stopped';
+
+/** Why the last wizard step did nothing: a fixed class, and for a refused folder Rust's own text. */
+export interface WizardError {
+  class: string;
+  text: string | null;
+}
+
+/** `wizard_state` (and every `wizard_*` answer): what the setup window shows. */
+export interface WizardState {
+  step: WizardStep;
+  /** The fixed text of `stopped`; `null` otherwise. */
+  stopped_text: string | null;
+  /** The data dir in use (display only); `null` before step 0. */
+  data_dir: string | null;
+  default_dir: string;
+  /** "Setup required — N requests refused"; `null` while no gate serves. */
+  refused_count: number | null;
+  existing_store: boolean;
+  secret_service: 'ok' | 'missing' | 'locked' | 'n/a';
+  /** The credential window waits for the recovery passphrase. */
+  passphrase_window: boolean;
+  error: WizardError | null;
+  instances: InstanceView[];
+}
+
 /** A tagged error object from core (`DecisionError` / `AdminError` / `SettingsError`). */
 export interface CoreError {
   kind: string;

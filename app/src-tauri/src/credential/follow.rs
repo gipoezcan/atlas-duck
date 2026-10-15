@@ -90,8 +90,8 @@ pub fn follow_serving<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// The app's [`ServeWatcher`]: the tray is rebuilt and the credential window follows, on the
-/// blocking pool (both wait for the main thread).
+/// The app's [`ServeWatcher`]: the tray is rebuilt, the credential window follows and the wizard's
+/// page re-reads (M6 T23), on the blocking pool (the first two wait for the main thread).
 pub struct AppWatcher {
     app: AppHandle<Wry>,
 }
@@ -108,6 +108,7 @@ impl ServeWatcher for AppWatcher {
         tauri::async_runtime::spawn_blocking(move || {
             crate::tray::refresh(&app);
             follow_serving(&app);
+            crate::wizard::serving_changed(&app);
         });
     }
 }

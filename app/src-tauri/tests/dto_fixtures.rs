@@ -22,6 +22,7 @@ use atlas_duck_app_lib::commands::settings::{
     OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_REMOVED, RetestOutcome, SettingsGet,
 };
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
+use atlas_duck_app_lib::wizard::{MSG_NEEDS_SECRET_SERVICE, WizardError, WizardState, WizardStep};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
@@ -935,6 +936,58 @@ fn cli_install_answers() -> Vec<CliInstallAnswer> {
     .collect()
 }
 
+/// `wizard_state` (M6 T23): a fresh start, a refused folder, the passphrase window, the instance
+/// step with an unconfirmed instance, the Secret Service stop.
+fn wizard_states() -> Vec<WizardState> {
+    let base = WizardState {
+        step: WizardStep::DataDir.as_str(),
+        stopped_text: None,
+        data_dir: None,
+        default_dir: "C:\\Users\\alice\\AppData\\Local\\atlas-duck".into(),
+        refused_count: None,
+        existing_store: false,
+        secret_service: "n/a",
+        passphrase_window: false,
+        error: None,
+        instances: vec![],
+    };
+    let data_dir = Some("C:\\Users\\alice\\AppData\\Local\\atlas-duck".to_owned());
+    vec![
+        base.clone(),
+        WizardState {
+            error: Some(WizardError {
+                class: "not_local",
+                text: Some(
+                    "data directory \\\\nas\\home\\atlas is not on a local filesystem".into(),
+                ),
+            }),
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::Passphrase.as_str(),
+            data_dir: data_dir.clone(),
+            refused_count: Some(3),
+            secret_service: "ok",
+            passphrase_window: true,
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::Instances.as_str(),
+            data_dir: data_dir.clone(),
+            instances: instance_views().into_iter().take(1).collect(),
+            ..base.clone()
+        },
+        WizardState {
+            step: WizardStep::Stopped(MSG_NEEDS_SECRET_SERVICE).as_str(),
+            stopped_text: Some(MSG_NEEDS_SECRET_SERVICE),
+            data_dir,
+            refused_count: Some(0),
+            secret_service: "missing",
+            ..base
+        },
+    ]
+}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ui/src/shared/ipc/fixtures")
 }
@@ -968,6 +1021,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("settings_get", value(&settings_gets())?),
         ("status_line", value(&status_lines())?),
         ("submit_outcome", value(&submit_outcomes())?),
+        ("wizard_state", value(&wizard_states())?),
     ])
 }
 

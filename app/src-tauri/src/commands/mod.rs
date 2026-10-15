@@ -19,6 +19,7 @@ pub mod dto;
 mod errors;
 mod names;
 pub mod settings;
+pub mod setup;
 pub mod window;
 
 use std::sync::Arc;
@@ -69,6 +70,12 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         settings::retest_token,
         settings::settings_apply,
         settings::settings_get,
+        setup::wizard_begin,
+        setup::wizard_choose_dir,
+        setup::wizard_finish,
+        setup::wizard_skip_instances,
+        setup::wizard_state,
+        setup::wizard_use_default_dir,
         window::open_window,
         window::quit
     ])

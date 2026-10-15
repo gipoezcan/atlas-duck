@@ -499,6 +499,38 @@ pub fn open_existing(
     crate::open::start_existing(data, cfg, kek, genesis_hash)
 }
 
+/// The `recovery` row of the store in `data` as stored (`blob`, `created_at`), read on a read-only
+/// connection: for "the row is byte-identical" assertions (I-34). `None` without a row.
+pub fn recovery_row(
+    data: &atlas_duck_ipc::paths::LocalDataDir,
+) -> Result<Option<(Vec<u8>, String)>, crate::error::OpenError> {
+    use rusqlite::OptionalExtension;
+    let conn = crate::schema::open_peek(&crate::schema::db_path(data))?;
+    conn.query_row(
+        "SELECT blob, created_at FROM recovery WHERE id = 1",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+    .map_err(crate::open::sql)
+}
+
+/// The plaintext `event_type` of every record of the store in `data`, in `seq` order, read on a
+/// read-only connection (no KEK): for "no second `GENESIS`" assertions (I-34).
+pub fn event_types(
+    data: &atlas_duck_ipc::paths::LocalDataDir,
+) -> Result<Vec<String>, crate::error::OpenError> {
+    let conn = crate::schema::open_peek(&crate::schema::db_path(data))?;
+    let mut stmt = conn
+        .prepare("SELECT event_type FROM events ORDER BY seq")
+        .map_err(crate::open::sql)?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(crate::open::sql)?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(crate::open::sql)
+}
+
 /// `open()` step 4 for a verdict: its `VERIFY`, the anchor actions, then anchors enabled.
 pub fn apply_startup(
     store: &crate::store::Store,

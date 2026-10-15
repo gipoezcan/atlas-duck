@@ -19,6 +19,7 @@ import retestOutcome from './fixtures/retest_outcome.json';
 import retryStarted from './fixtures/retry_started.json';
 import settingsGet from './fixtures/settings_get.json';
 import statusLine from './fixtures/status_line.json';
+import wizardState from './fixtures/wizard_state.json';
 import {
   arrayOf,
   isBatchOutcome,
@@ -39,6 +40,7 @@ import {
   isRetestOutcome,
   isSettingsGet,
   isStatusLine,
+  isWizardState,
   toCommandError,
 } from './validate';
 
@@ -60,6 +62,7 @@ describe('fixtures validate against their TS types', () => {
     ['retest_outcome', retestOutcome, arrayOf(isRetestOutcome)],
     ['prune_report', pruneReport, arrayOf(isPruneReport)],
     ['cli_install_answer', cliInstallAnswer, arrayOf(isCliInstallAnswer)],
+    ['wizard_state', wizardState, arrayOf(isWizardState)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -200,6 +203,12 @@ describe('fixtures validate against their TS types', () => {
     expect(isCliInstallAnswer({ outcome: 'done' })).toBe(false);
     expect(isCliInstallAnswer({ outcome: 3 })).toBe(false);
     expect(isCliInstallAnswer({})).toBe(false);
+    const wizard = wizardState[0];
+    expect(isWizardState(wizard)).toBe(true);
+    expect(isWizardState({ ...wizard, step: 'skip_ahead' })).toBe(false);
+    expect(isWizardState({ ...wizard, secret_service: 'maybe' })).toBe(false);
+    expect(isWizardState({ ...wizard, error: { class: 'x' } })).toBe(false);
+    expect(isWizardState({ ...wizard, instances: [{}] })).toBe(false);
   });
 
   it('edit_form: every input kind validates, nulls are valid values, a wrong shape is refused', () => {

@@ -54,6 +54,17 @@ pub fn emit_settings_changed<R: Runtime>(app: &AppHandle<R>) {
     EventOut::emit(app, EVENT_SETTINGS_CHANGED, Value::Null);
 }
 
+/// The event the setup page re-reads `wizard_state` on (Δ1, M6 T23): a step ended, the serving
+/// state changed, a request was refused (the header's count), the credential window went. App-owned,
+/// not a core event; no payload.
+pub const EVENT_WIZARD_CHANGED: &str = "wizard_changed";
+
+/// Tells every listening window that the wizard's state changed (no payload). Recorded like every
+/// payload a webview can receive (S-16).
+pub fn emit_wizard_changed<R: Runtime>(app: &AppHandle<R>) {
+    EventOut::emit(app, EVENT_WIZARD_CHANGED, Value::Null);
+}
+
 /// The C.10 event name and payload of a core event.
 pub fn wire(e: &UiEvent) -> (&'static str, Value) {
     match e {

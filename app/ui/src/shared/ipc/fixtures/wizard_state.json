@@ -1,0 +1,80 @@
+[
+  {
+    "data_dir": null,
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": null,
+    "existing_store": false,
+    "instances": [],
+    "passphrase_window": false,
+    "refused_count": null,
+    "secret_service": "n/a",
+    "step": "data_dir",
+    "stopped_text": null
+  },
+  {
+    "data_dir": null,
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": {
+      "class": "not_local",
+      "text": "data directory \\\\nas\\home\\atlas is not on a local filesystem"
+    },
+    "existing_store": false,
+    "instances": [],
+    "passphrase_window": false,
+    "refused_count": null,
+    "secret_service": "n/a",
+    "step": "data_dir",
+    "stopped_text": null
+  },
+  {
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": null,
+    "existing_store": false,
+    "instances": [],
+    "passphrase_window": true,
+    "refused_count": 3,
+    "secret_service": "ok",
+    "step": "passphrase",
+    "stopped_text": null
+  },
+  {
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": null,
+    "existing_store": false,
+    "instances": [
+      {
+        "alias": "work",
+        "days_left": 5,
+        "executes_as": "alice",
+        "expires_at": "2027-01-31",
+        "expiry_warning": 7,
+        "note": "token now resolves to bob",
+        "origin": "https://jira.example/jira",
+        "pac_configured": true,
+        "pending_url_change": "https://jira.example/moved",
+        "product": "jira",
+        "proxy_effective": "proxy.corp:3128",
+        "state": "ok"
+      }
+    ],
+    "passphrase_window": false,
+    "refused_count": null,
+    "secret_service": "n/a",
+    "step": "instances",
+    "stopped_text": null
+  },
+  {
+    "data_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "default_dir": "C:\\Users\\alice\\AppData\\Local\\atlas-duck",
+    "error": null,
+    "existing_store": false,
+    "instances": [],
+    "passphrase_window": false,
+    "refused_count": 0,
+    "secret_service": "missing",
+    "step": "stopped",
+    "stopped_text": "atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck."
+  }
+]

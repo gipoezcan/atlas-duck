@@ -217,6 +217,8 @@ impl RaiseEnv for TauriRaiseEnv {
     fn refresh_tray(&self) {
         // The rebuild reads the refused count itself when it runs.
         crate::tray::refresh(&self.app);
+        // The wizard's header shows the same count ("Setup required — N requests refused", §2.5).
+        crate::wizard::serving_changed(&self.app);
     }
 }
 

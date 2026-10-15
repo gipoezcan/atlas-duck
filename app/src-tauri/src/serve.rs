@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::{
-    ArchivedDb, Confirmed, DB_FILE, EntryName, KeyStore, KeyStoreError, KeyringLocality,
-    LockedReason, OpenConfig, OpenError, OsKeyStore, RecoveryOffer, StartupOutcome, Store,
-    SystemClock, keychain_retry_schedule, read_store_install_id,
+    ArchivedDb, Confirmed, DB_FILE, EntryName, FirstRunInput, KeyStore, KeyStoreError,
+    KeyringLocality, LockedReason, OpenConfig, OpenError, OsKeyStore, RecoveryOffer,
+    StartupOutcome, Store, SystemClock, keychain_retry_schedule, new_ids, read_store_install_id,
 };
 use atlas_duck_core::{
     Confirm, Core, GateHandler, GateState, NativeConfirmer, ShutdownReason, ShutdownReport, UiSink,
@@ -39,6 +39,7 @@ pub use app_handler::{AppHandler, DoctorExtras};
 
 use crate::compose::{self, CoreInputs};
 use crate::confirm::DialogConfirmer;
+use crate::credential::FirstRunPassphrase;
 use crate::credential::follow::AppWatcher;
 use crate::credential::raise::{RaiseGate, RaiseHandle, RaiseSink, TauriRaiseEnv};
 use crate::secret_service::{CachedSecretService, SecretServiceCheck};
@@ -817,6 +818,167 @@ fn confirmed_by(text: &str) -> Confirmed {
     }
 }
 
+// ---------- the first store: the wizard's `GENESIS` (M6 T23) ----------
+
+/// The pinned file was rewritten, `install_id` given or not (a `GENESIS` was written but the
+/// pinned file still lacks its id); `error_class` is never logged with a path.
+pub const LOG_EVENT_PINNED_WRITE_FAILED: &str = "pinned_write_failed";
+/// The wizard's `GENESIS` (or the core after it) did not happen; `error_class` =
+/// [`FirstStoreFailure::class`].
+pub const LOG_EVENT_FIRST_STORE_FAILED: &str = "first_store_failed";
+
+/// Why the wizard's first store was not created, or was created without a serving core. Classes
+/// only (the setup page maps them to fixed texts); never an error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstStoreFailure {
+    /// The first-run gate is not serving (a core serves, the store failed, another state).
+    NotFirstRun,
+    /// An unlock, archive or another `GENESIS` runs.
+    Busy,
+    ShuttingDown,
+    /// This host's pinned file could not be rewritten first: nothing was created.
+    PinnedWrite,
+    /// The audit store's own count of the passphrase (NFC) found it too short (§8.6).
+    PassphraseTooShort,
+    /// The second entry did not unwrap the KEK (§8.6: nothing committed).
+    PassphraseMismatch,
+    KeychainUnavailable,
+    KeyringNotLocal,
+    /// `audit.db` exists now: never a `GENESIS` over or beside it (§2.5).
+    StoreExists,
+    Integrity,
+    Io,
+    Invalid,
+    /// `GENESIS` is written, the core did not start: the store is unusable until a restart (which
+    /// opens it as any start does).
+    CoreStart,
+}
+
+impl FirstStoreFailure {
+    pub fn class(self) -> &'static str {
+        match self {
+            FirstStoreFailure::NotFirstRun => "not_first_run",
+            FirstStoreFailure::Busy => "busy",
+            FirstStoreFailure::ShuttingDown => "shutting_down",
+            FirstStoreFailure::PinnedWrite => "pinned_write",
+            FirstStoreFailure::PassphraseTooShort => "passphrase_too_short",
+            FirstStoreFailure::PassphraseMismatch => "passphrase_mismatch",
+            FirstStoreFailure::KeychainUnavailable => "keychain_unavailable",
+            FirstStoreFailure::KeyringNotLocal => "keyring_not_local",
+            FirstStoreFailure::StoreExists => "store_exists",
+            FirstStoreFailure::Integrity => "integrity",
+            FirstStoreFailure::Io => "io",
+            FirstStoreFailure::Invalid => "invalid",
+            FirstStoreFailure::CoreStart => "core_start",
+        }
+    }
+
+    fn of(e: &OpenError) -> FirstStoreFailure {
+        match e {
+            OpenError::PassphraseTooShort => FirstStoreFailure::PassphraseTooShort,
+            OpenError::PassphraseMismatch => FirstStoreFailure::PassphraseMismatch,
+            OpenError::KeyStore(KeyStoreError::NotLocal) => FirstStoreFailure::KeyringNotLocal,
+            OpenError::KeyStore(_) => FirstStoreFailure::KeychainUnavailable,
+            OpenError::AlreadyExists => FirstStoreFailure::StoreExists,
+            OpenError::Integrity(_) | OpenError::Restore(_) => FirstStoreFailure::Integrity,
+            OpenError::Io(_) | OpenError::Sqlite(_) | OpenError::MigrationFailed { .. } => {
+                FirstStoreFailure::Io
+            }
+            OpenError::NotFirstRun
+            | OpenError::WrongPassphrase
+            | OpenError::NewerStore(_)
+            | OpenError::Invalid(_) => FirstStoreFailure::Invalid,
+        }
+    }
+
+    fn log(self) {
+        tracing::warn!(
+            event = LOG_EVENT_FIRST_STORE_FAILED,
+            error_class = self.class()
+        );
+    }
+}
+
+/// Rewrites this host's pinned file (§7.7) with the `install_id` given, or without one; `false`
+/// when it could not be written. The wizard builds it over its pinned paths.
+pub type PinWriter = Box<dyn Fn(Option<&str>) -> bool + Send>;
+
+/// The wizard's `GENESIS` (§2.5 step (1b), PD-77), only while the first-run gate serves with no
+/// core: in one task the quit path awaits (bounded, like an unlock), one at a time with unlocks and
+/// archives. In order, on a blocking thread: the pinned file loses any `install_id` (an archive left
+/// the old one there; a `GENESIS` must never sit beside a pinned id of another store), new ids
+/// (`new_ids()` before every `create_new_store` attempt, M2 handoff: an id a failed attempt used may
+/// have left keychain entries), the keystore for them, `create_new_store` (the passphrase pair moves
+/// in and is dropped, zeroized, there; the store refuses an existing DB), then the pinned file names
+/// the new `install_id` (a failed write is logged: the next start reads the store's own id, PD-41).
+/// Then `Core::start` on the start's own `CoreStarter` (the same UI sink and attention feed) and the
+/// cell swapped to it without a rebind (`install_core` also keeps the store for the recovery note).
+/// A core that does not start leaves the store failed (PD-06; a restart opens it).
+pub async fn create_first_store(
+    state: &Arc<ServeState>,
+    pair: FirstRunPassphrase,
+    archived: Option<ArchivedDb>,
+    pin: PinWriter,
+) -> Result<(), FirstStoreFailure> {
+    let failed = |f: FirstStoreFailure| {
+        f.log();
+        Err(f)
+    };
+    let Some(restart) = state.restart.get() else {
+        return failed(FirstStoreFailure::NotFirstRun);
+    };
+    let Ok(one) = state.unlocking.clone().try_lock_owned() else {
+        return failed(FirstStoreFailure::Busy);
+    };
+    if state.core.get().is_some()
+        || state.store_failed()
+        || state.gate_state() != Some(GateState::FirstRun)
+    {
+        return failed(FirstStoreFailure::NotFirstRun);
+    }
+    let (st, opener, starter) = (
+        state.clone(),
+        restart.opener.clone(),
+        restart.starter.clone(),
+    );
+    let done = state.spawn_unlock_work(async move {
+        let _one_at_a_time = one;
+        let created =
+            tokio::task::spawn_blocking(move || opener.create_blocking(pair, archived, &pin))
+                .await
+                .unwrap_or(Err(FirstStoreFailure::Io));
+        let (store, keys) = created?;
+        if *lock(&st.frozen) {
+            shutdown_store(store).await;
+            return Err(FirstStoreFailure::ShuttingDown);
+        }
+        let core = match starter.start(store.clone(), keys, Vec::new()).await {
+            Ok(core) => core,
+            Err(f) => {
+                // `CoreStarter::start` shut the store down.
+                f.log();
+                st.mark_store_failed();
+                return Err(FirstStoreFailure::CoreStart);
+            }
+        };
+        if !st.install_core(core.clone(), store.clone()) {
+            core.shutdown(ShutdownReason::Quit).await;
+            shutdown_store(store).await;
+            return Err(FirstStoreFailure::ShuttingDown);
+        }
+        tracing::info!(event = LOG_EVENT_SERVING, serve_state = "core");
+        Ok(())
+    });
+    let result = match done {
+        Ok(rx) => rx.await.unwrap_or(Err(FirstStoreFailure::Io)),
+        Err(_) => Err(FirstStoreFailure::ShuttingDown),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(f) => failed(f),
+    }
+}
+
 /// What a manual keychain retry did (PD-89).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryNow {
@@ -1158,6 +1320,8 @@ pub fn start(
         // and a cold start without `--background` opens its window now (§2.5).
         tray::refresh(&handle);
         crate::windows::startup_completed(&handle);
+        // M6 T23: a start the wizard's step 0 began routes a (1a) lock or error state itself.
+        crate::wizard::serving_started(&handle);
     });
     // The task may have finished already; its handle is still what Quit awaits.
     if let Some(slot) = slot {
@@ -1399,6 +1563,51 @@ impl Opener {
         unlocked
             .map(|(store, pats_deleted)| (store, keys, pats_deleted))
             .map_err(|e| UnlockFailure::of(&e))
+    }
+
+    /// The blocking half of [`create_first_store`] (see there for the order).
+    fn create_blocking(
+        &self,
+        pair: FirstRunPassphrase,
+        archived: Option<ArchivedDb>,
+        pin: &PinWriter,
+    ) -> Result<(Store, Arc<dyn KeyStore>), FirstStoreFailure> {
+        if !pin(None) {
+            tracing::warn!(event = LOG_EVENT_PINNED_WRITE_FAILED);
+            return Err(FirstStoreFailure::PinnedWrite);
+        }
+        // Never the id of `Opener::install_id`: after an archive it names the old store.
+        let (install_id, chain_id) = new_ids().map_err(|e| FirstStoreFailure::of(&e))?;
+        let keys = self
+            .keys
+            .keys(&install_id)
+            .map_err(|e| match locked_reason_for(&e) {
+                LockedReason::KeyringNotLocal => FirstStoreFailure::KeyringNotLocal,
+                _ => FirstStoreFailure::KeychainUnavailable,
+            })?;
+        let cfg = OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
+        let FirstRunPassphrase {
+            passphrase,
+            confirm,
+        } = pair;
+        let store = atlas_duck_audit::create_new_store(
+            &self.data,
+            &self.lock,
+            cfg,
+            FirstRunInput {
+                install_id: install_id.clone(),
+                chain_id,
+                passphrase,
+                passphrase_confirm: confirm,
+                archived_db: archived,
+            },
+        )
+        .map_err(|e| FirstStoreFailure::of(&e))?;
+        // `GENESIS` is committed: the pinned file names its store (§7.7, §8.6).
+        if !pin(Some(&install_id)) {
+            tracing::warn!(event = LOG_EVENT_PINNED_WRITE_FAILED);
+        }
+        Ok((store, keys))
     }
 
     fn open_blocking(&self) -> Result<Opened, StoreFailure> {

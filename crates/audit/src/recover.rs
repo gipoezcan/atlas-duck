@@ -492,3 +492,80 @@ pub fn archive_and_start_fresh(
         head_hash,
     })
 }
+
+/// `(chain_id, head_seq, stamp)` of an archive file name `audit-<chain_id>-<head_seq>-<stamp>.db`
+/// as [`archive_and_start_fresh`] writes it; `None` for any other name (its WAL and `-shm` files,
+/// a stray file).
+fn parse_archive_name(name: &str) -> Option<(String, u64, String)> {
+    let rest = name.strip_prefix("audit-")?.strip_suffix(".db")?;
+    let (chain_id, rest) = rest.split_once('-')?;
+    let (seq, stamp) = rest.split_once('-')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let stamp_ok = !stamp.is_empty()
+        && stamp
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'T' || b == b'Z');
+    if !is_id(chain_id) || !digits(seq) || !stamp_ok {
+        return None;
+    }
+    Some((chain_id.to_owned(), seq.parse().ok()?, stamp.to_owned()))
+}
+
+/// The archived store a first run in `data` names in its `GENESIS` when the one
+/// [`archive_and_start_fresh`] returned is no longer in memory (a quit or crash between the archive
+/// and the wizard's `GENESIS`; M6 T23, T20 review I-1): the newest
+/// `archived/audit-<chain_id>-<head_seq>-<stamp>.db` by its UTC stamp (fixed width, so the text
+/// order is the time order), with its head read again on a read-only connection and checked
+/// against its name. No archive folder or no archive file: `Ok(None)`.
+///
+/// Called only while `data` holds no `audit.db`. The newest archive is never named by a `GENESIS`
+/// yet: a chain that names an archive was started after that archive was made, so if it was
+/// archived itself its file is the newer one. `Integrity` when the newest file's head does not
+/// match its name.
+pub fn latest_archived(data: &LocalDataDir) -> Result<Option<ArchivedDb>, OpenError> {
+    let dir = data.path().join(ARCHIVE_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    // (stamp, file name, chain_id, head_seq) of the newest archive so far.
+    let mut newest: Option<(String, String, String, u64)> = None;
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some((chain_id, seq, stamp)) = parse_archive_name(&name) else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let newer = newest
+            .as_ref()
+            .is_none_or(|(s, n, ..)| (stamp.as_str(), name.as_str()) > (s.as_str(), n.as_str()));
+        if newer {
+            newest = Some((stamp, name, chain_id, seq));
+        }
+    }
+    let Some((_, name, chain_id, seq)) = newest else {
+        return Ok(None);
+    };
+    let path = dir.join(&name);
+    let head = plaintext_head(&path);
+    // A read-only open of a store with a WAL may have created `-shm`; it is derived state.
+    let _ = remove_if_present(&with_suffix(&path, "-shm"));
+    let (head_seq, head_hash, head_chain) = head?;
+    if head_chain != chain_id || head_seq != seq {
+        return Err(OpenError::Integrity(
+            "an archived store does not match its file name".into(),
+        ));
+    }
+    Ok(Some(ArchivedDb {
+        file: format!("{ARCHIVE_DIR}/{name}"),
+        chain_id,
+        head_seq,
+        head_hash,
+    }))
+}

@@ -9,6 +9,12 @@
     "allow-instance-change-url",
     "allow-instance-confirm-config",
     "allow-quit",
+    "allow-wizard-begin",
+    "allow-wizard-choose-dir",
+    "allow-wizard-finish",
+    "allow-wizard-skip-instances",
+    "allow-wizard-state",
+    "allow-wizard-use-default-dir",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

@@ -695,7 +695,9 @@ pub fn snapshot<R: Runtime>(app: &AppHandle<R>) -> AppSnapshot {
         return AppSnapshot::Starting;
     };
     match state.startup {
-        StartupSummary::BeforeFirstRun => AppSnapshot::BeforeFirstRun,
+        StartupSummary::BeforeFirstRun => {
+            first_run_snapshot(app.try_state::<ServeSlot>().as_deref())
+        }
         StartupSummary::Ready => serving_snapshot(app.try_state::<ServeSlot>().as_deref()),
         StartupSummary::DataDirMissing
         | StartupSummary::DataDirNotLocal
@@ -703,6 +705,17 @@ pub fn snapshot<R: Runtime>(app: &AppHandle<R>) -> AppSnapshot {
         | StartupSummary::PinnedUnreadable => {
             AppSnapshot::StartupError(state.startup_text().unwrap_or_default().to_owned())
         }
+    }
+}
+
+/// The `BeforeFirstRun` part of [`snapshot`] (M6 T23): the wizard's step 0 manages a `ServeSlot`
+/// and serves in-process, and from then on the app is in whatever state that serving is (the
+/// first-run gate, a core after `GENESIS`, the (1a) lock states), as a pinned start would be. Until
+/// that start has left its state in the slot it is still before first run (the wizard).
+pub fn first_run_snapshot(slot: Option<&ServeSlot>) -> AppSnapshot {
+    match slot.map(|s| serving_snapshot(Some(s))) {
+        None | Some(AppSnapshot::Starting) => AppSnapshot::BeforeFirstRun,
+        Some(state) => state,
     }
 }
 
@@ -1125,6 +1138,26 @@ mod tests {
         assert_eq!(serving_snapshot(Some(&slot)), AppSnapshot::StoreUnavailable);
         slot.quit().cancel();
         assert_eq!(serving_snapshot(Some(&slot)), AppSnapshot::ShuttingDown);
+    }
+
+    /// M6 T23: before first run the app is in the state the wizard's serving is in, once there is
+    /// one (`tests/wizard.rs` covers the gate and the core).
+    #[test]
+    fn first_run_snapshot_follows_the_wizards_serving() {
+        assert_eq!(first_run_snapshot(None), AppSnapshot::BeforeFirstRun);
+        let slot = ServeSlot::default();
+        assert_eq!(
+            first_run_snapshot(Some(&slot)),
+            AppSnapshot::BeforeFirstRun,
+            "the start is still running"
+        );
+        slot.mark_store_failed();
+        assert_eq!(
+            first_run_snapshot(Some(&slot)),
+            AppSnapshot::StoreUnavailable
+        );
+        slot.quit().cancel();
+        assert_eq!(first_run_snapshot(Some(&slot)), AppSnapshot::ShuttingDown);
     }
 
     fn data_dir(tmp: &tempfile::TempDir) -> LocalDataDir {

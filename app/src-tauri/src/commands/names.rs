@@ -39,4 +39,10 @@ pub const COMMANDS: &[&str] = &[
     "settings_apply",
     "settings_get",
     "submit_secret",
+    "wizard_begin",
+    "wizard_choose_dir",
+    "wizard_finish",
+    "wizard_skip_instances",
+    "wizard_state",
+    "wizard_use_default_dir",
 ];

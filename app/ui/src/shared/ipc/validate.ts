@@ -31,6 +31,8 @@ import type {
   SettingsGet,
   SettingsView,
   StatusLine,
+  WizardError,
+  WizardState,
 } from './types';
 
 export type Validator<T> = (value: unknown) => value is T;
@@ -346,6 +348,34 @@ export const isPruneReport = (v: unknown): v is PruneReport => {
 export const isCliInstallAnswer = (v: unknown): v is CliInstallAnswer =>
   fields(v, {
     outcome: oneOf('installed', 'already_installed', 'removed', 'already_on_path'),
+  });
+
+const isWizardError = (v: unknown): v is WizardError =>
+  fields(v, { class: isStr, text: strOrNull });
+
+export const isWizardState = (v: unknown): v is WizardState =>
+  fields(v, {
+    step: oneOf(
+      'data_dir',
+      'existing_store',
+      'passphrase',
+      'genesis',
+      'recovery_note',
+      'instances',
+      'cli',
+      'onboarding',
+      'done',
+      'stopped',
+    ),
+    stopped_text: strOrNull,
+    data_dir: strOrNull,
+    default_dir: isStr,
+    refused_count: numOrNull,
+    existing_store: isBool,
+    secret_service: oneOf('ok', 'missing', 'locked', 'n/a'),
+    passphrase_window: isBool,
+    error: (e) => e === null || isWizardError(e),
+    instances: (i) => Array.isArray(i) && i.every(isInstanceView),
   });
 
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });

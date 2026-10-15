@@ -21,7 +21,7 @@ use atlas_duck_audit::testing::{FaultPoint, Faults, KeyOp, KeyOpKind, MemKeyStor
 use atlas_duck_audit::types::{Confirmed, EventFlags};
 use atlas_duck_audit::{
     LockedReason, OpenConfig, RecoverReport, RecoveryOffer, SettingChange, StartupOutcome, Store,
-    archive_and_start_fresh, create_new_store, new_ids, open, recover_this_log,
+    archive_and_start_fresh, create_new_store, latest_archived, new_ids, open, recover_this_log,
 };
 use common::*;
 use rusqlite::{OpenFlags, Transaction};
@@ -795,6 +795,36 @@ fn archive_refuses_unusable_chain_id() {
     }
     assert_eq!(db_files(f.dir.path()), before);
     assert!(!f.dir.path().join("archived").exists());
+}
+
+/// M6 T23 (T20 review I-1): an `ArchivedDb` lost between the archive and the wizard's `GENESIS`
+/// (a quit or crash) is derived again from the archive folder: the newest archive by its stamp,
+/// with its head read again and checked against its name; other files there are ignored.
+#[test]
+fn latest_archived_rederives_the_newest_archive() {
+    let f = closed_store(2);
+    assert_eq!(latest_archived(&f.data).expect("no folder"), None);
+    f.ring.wipe_install(&f.install_id);
+    let a = archive_and_start_fresh(&f.data, &f.lock, confirmed()).expect("archive");
+    assert_eq!(latest_archived(&f.data).expect("latest"), Some(a.clone()));
+
+    // An older archive (an earlier stamp) and stray files change nothing.
+    let dir = f.dir.path().join("archived");
+    let file = dir.join(a.file.strip_prefix("archived/").expect("archived/"));
+    let older = format!("audit-{}-{}-19990101T000000000Z.db", a.chain_id, a.head_seq);
+    std::fs::copy(&file, dir.join(older)).expect("older copy");
+    std::fs::write(dir.join("notes.txt"), b"x").expect("stray file");
+    std::fs::create_dir(dir.join(format!("audit-{}-1-99990101T000000000Z.db", a.chain_id)))
+        .expect("a dir with an archive name");
+    assert_eq!(latest_archived(&f.data).expect("latest"), Some(a.clone()));
+
+    // A newer file whose head is not what its name says is refused, never named.
+    let liar = format!("audit-{}-1-99991231T235959999Z.db", "0".repeat(32));
+    std::fs::copy(&file, dir.join(liar)).expect("liar copy");
+    match latest_archived(&f.data) {
+        Err(OpenError::Integrity(_)) => {}
+        other => panic!("expected Integrity, got {other:?}"),
+    }
 }
 
 #[test]

@@ -31,7 +31,7 @@ use secrecy::{ExposeSecret, SecretString};
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::sync::oneshot;
 
-use crate::ui_sink::{EventOut, wire};
+use crate::ui_sink::{EventOut, emit_wizard_changed, wire};
 use crate::windows::{self, Label, Show, Unlock, WindowError, WindowRegistry};
 
 /// The minimum length of the recovery passphrase in characters (§8.6; the audit store counts the
@@ -362,6 +362,8 @@ pub fn window_destroyed_if<R: Runtime>(app: &AppHandle<R>, gone: fn(&AppHandle<R
     if let Some(_no_open_running) = r.try_opening() {
         if gone(app) {
             r.credential_state().reset();
+            // The wizard's recovery-note step ends with the window (M6 T23).
+            emit_wizard_changed(app);
         }
         return;
     }
@@ -373,6 +375,7 @@ pub fn window_destroyed_if<R: Runtime>(app: &AppHandle<R>, gone: fn(&AppHandle<R
         let _open_is_over = r.lock_opening();
         if gone(&app) {
             r.credential_state().reset();
+            emit_wizard_changed(&app);
         }
     });
 }
@@ -406,6 +409,7 @@ fn close_matching<R: Runtime>(app: &AppHandle<R>, generation: Option<Generation>
     if let Some(w) = app.get_webview_window(Label::Credential.as_str()) {
         let _ = w.destroy();
     }
+    emit_wizard_changed(app);
     true
 }
 

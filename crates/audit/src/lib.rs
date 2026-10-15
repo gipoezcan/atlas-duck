@@ -84,7 +84,7 @@ pub use open::{
     keychain_retry_schedule, new_ids, open, read_store_install_id,
 };
 pub use prune::{PruneOutcome, PruneSkip};
-pub use recover::{RecoverReport, archive_and_start_fresh, recover_this_log};
+pub use recover::{RecoverReport, archive_and_start_fresh, latest_archived, recover_this_log};
 pub use recovery::MIN_PASSPHRASE_CHARS;
 pub use request_set::{RequestRecord, request_set_hash};
 pub use requests::{ReconcileReport, ReconciledWrite, ScriptFailedFlags, is_terminal};

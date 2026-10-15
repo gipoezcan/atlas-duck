@@ -1797,6 +1797,55 @@ fn close_credential_granted_to_credential_only() -> TestResult {
     Ok(())
 }
 
+/// M6 T23 (Δ1, PD-72): the six wizard commands are the setup window's alone; with a valid body they
+/// reach their handler (`not_ready`: this app has no wizard), everywhere else Tauri's ACL refuses
+/// them first. None takes a key: a folder, a path or a passphrase is refused before the handler.
+#[test]
+fn wizard_commands_granted_to_setup_only() -> TestResult {
+    let app = app()?;
+    let wizard = [
+        "wizard_begin",
+        "wizard_choose_dir",
+        "wizard_finish",
+        "wizard_skip_instances",
+        "wizard_state",
+        "wizard_use_default_dir",
+    ];
+    let others = [
+        "approvals",
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "credential",
+        "unknown",
+    ]
+    .map(|label| window(&app, label).map(|w| (label, w)))
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    let setup = window(&app, "setup")?;
+    for cmd in wizard {
+        assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
+        for (label, w) in &others {
+            let r = invoke(w, cmd, json!({}));
+            assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
+        }
+        assert_eq!(
+            invoke(&setup, cmd, json!({})),
+            Err(json!({"kind": "not_ready"})),
+            "{cmd}"
+        );
+        for key in ["data_dir", "path", "dir", "secret", "step"] {
+            assert_eq!(
+                invoke(&setup, cmd, json!({ key: "C:\\evil" })),
+                Err(json!({"kind": "invalid_argument", "field": "payload"})),
+                "{cmd} {key}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The CA file the user chose, as Rust reads it (`read_ca_bounded`): a regular file of 1 byte to
 /// 1 MiB. Anything else is refused with `use_custom_ca`; nothing is parsed here.
 #[test]

@@ -27,14 +27,85 @@ pub mod tray;
 pub mod tray_host;
 pub mod ui_sink;
 pub mod windows;
+pub mod wizard;
 
 use std::sync::Arc;
 
+use atlas_duck_audit::lock::InstanceLock;
+use atlas_duck_ipc::paths::{self, LocalDataDir, PinnedPaths};
 use tauri::Manager;
 
 use crate::startup::{DialogPresenter, StartupAction, StartupState};
 use crate::state::{AppState, DataDirHold, ServeSlot};
+use crate::tray_host::TrayHost;
 use crate::windows::{NavPolicy, StartupRoute, WindowRegistry};
+use crate::wizard::{ServeStarter, Wizard, WizardEnv};
+
+/// The wizard's serving start (M6 T23): the one `Ready` uses (`serve::start`), with the same
+/// keystore factory and, in the test build, the control dir and the scripted approver.
+struct AppStarter {
+    host: String,
+    tray_host: Option<TrayHost>,
+    keys: Arc<dyn serve::KeysFactory>,
+}
+
+impl ServeStarter<tauri::Wry> for AppStarter {
+    fn start(
+        &self,
+        app: &tauri::AppHandle,
+        data: LocalDataDir,
+        lock: Arc<InstanceLock>,
+        pinned: &PinnedPaths,
+    ) {
+        #[cfg(feature = "scripted-approver")]
+        testing::spawn(app, &data);
+        serve::start(
+            app,
+            data,
+            lock,
+            pinned,
+            &self.host,
+            self.tray_host,
+            self.keys.clone(),
+        );
+    }
+}
+
+/// What the wizard takes from this host (§7.7): its pinned file, the default data and config dirs
+/// (the pinned ones when startup read a pinned file), the Secret Service check, Rust's folder
+/// dialog and the shared path functions. `None` when the base folders cannot be resolved (then
+/// startup did not reach `BeforeFirstRun` either).
+fn wizard_env(
+    host: &str,
+    pinned: Option<&PinnedPaths>,
+    tray_host: Option<TrayHost>,
+    keys: Arc<dyn serve::KeysFactory>,
+) -> Option<WizardEnv<tauri::Wry>> {
+    let (default_data_dir, config_dir) = match pinned {
+        Some(p) => (p.data_dir.clone(), p.config_dir.clone()),
+        None => {
+            let base = paths::base_dirs().ok()?;
+            // §7.7: XDG overrides are honoured only here, at first run, and then pinned.
+            let d = paths::first_run_defaults(&base, &|name| std::env::var_os(name));
+            (d.data_dir, d.config_dir)
+        }
+    };
+    Some(WizardEnv {
+        pinned_file: startup::this_host_pinned_file(host),
+        default_data_dir,
+        config_dir,
+        host: host.to_owned(),
+        secret_service: Arc::new(secret_service::CachedSecretService::new()),
+        starter: Arc::new(AppStarter {
+            host: host.to_owned(),
+            tray_host,
+            keys,
+        }),
+        pick_folder: Arc::new(|app: &tauri::AppHandle| wizard::pick_folder_dialog(app)),
+        write_pinned: Arc::new(paths::write_pinned),
+        check_dir: paths::check_data_dir,
+    })
+}
 
 /// GUI and `--background` launches. Order (§2.5, §3.1, §7.7): startup hardening and crash
 /// settings (M6 T2, T09, in `main.rs`, before this call) -> diagnostic log -> Tauri builder -> in
@@ -145,6 +216,21 @@ pub fn run_gui(background: bool) -> ! {
                 StartupState::BeforeFirstRun => first_run = true,
                 _ => {}
             }
+            #[cfg(not(feature = "scripted-approver"))]
+            let keys: Arc<dyn serve::KeysFactory> = Arc::new(serve::OsKeysFactory);
+            // PD-02: the file keystore when `ATLAS_DUCK_TEST_KEYSTORE` is set.
+            #[cfg(feature = "scripted-approver")]
+            let keys = testing::keys_factory();
+            // M6 T23: the first-run wizard, before first run and in a pinned data dir (whose
+            // first-run gate serves after an interrupted setup or an archived store). Managed before
+            // the setup window can ask for it.
+            if first_run || serve_args.is_some() {
+                diag.extend_allowed_fields(serve::LOG_FIELDS);
+                if let Some(env) = wizard_env(&host, pinned_paths.as_ref(), tray_host, keys.clone())
+                {
+                    app.manage(Wizard::new(env, pinned_paths.clone()));
+                }
+            }
 
             // T20: the §9.4 probe runs on its own thread, in every startup state that reaches
             // this point (AlreadyRunning returned above). It needs no data dir; its log line
@@ -169,13 +255,7 @@ pub fn run_gui(background: bool) -> ! {
             // T19 (PD-05): in `Ready`, open the store and serve IPC. `serve::start` returns at
             // once; the work runs on the async runtime, never on this (the main) thread.
             if let (Some((data, lock)), Some(pinned)) = (serve_args, pinned_paths.as_ref()) {
-                diag.extend_allowed_fields(serve::LOG_FIELDS);
                 app.manage(ServeSlot::default());
-                #[cfg(not(feature = "scripted-approver"))]
-                let keys: Arc<dyn serve::KeysFactory> = Arc::new(serve::OsKeysFactory);
-                // PD-02: the file keystore when `ATLAS_DUCK_TEST_KEYSTORE` is set.
-                #[cfg(feature = "scripted-approver")]
-                let keys = testing::keys_factory();
                 #[cfg(feature = "scripted-approver")]
                 testing::spawn(app.handle(), &data);
                 serve::start(app.handle(), data, lock, pinned, &host, tray_host, keys);

@@ -265,8 +265,10 @@ pub enum StartupAction {
 }
 
 /// Clears the Crashpad reports of every webview data folder (the main one and the credential
-/// window's, §2.5, §15 V35): a dump from a crashed renderer may hold typed secrets.
-fn clear_webview_crashpad(data: &LocalDataDir) {
+/// window's, §2.5, §15 V35): a dump from a crashed renderer may hold typed secrets. At startup in
+/// `Ready`, and by the wizard's step 0 when a data dir is chosen (M6 T23), before any webview uses
+/// the folders.
+pub(crate) fn clear_webview_crashpad(data: &LocalDataDir) {
     for dir in webview_data_dirs(data) {
         if clear_crashpad_reports(&dir).is_err() {
             tracing::warn!(event = "crashpad_clear_failed");
