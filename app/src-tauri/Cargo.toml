@@ -68,6 +68,8 @@ async-trait = { workspace = true }
 zeroize = { workspace = true }
 # M6 T11: `raw_page` sends the exact page bytes as base64 (PD-68, X-07).
 base64 = { workspace = true }
+# M6 T20: the credential window's secrets are `secrecy::SecretString` from the DTO on (§10.1).
+secrecy = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
@@ -99,7 +101,6 @@ atlas-duck-registry = { path = "../../crates/registry" }
 # `io-util`: the T23 flows read a spawned CLI's stderr line by line and write its stdin. `net`: the
 # T25 squatter pipe (Windows named pipes).
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "time", "io-util", "net"] }
-secrecy = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 filetime = { workspace = true }

@@ -92,7 +92,20 @@ pub enum ConnectionFailure {
 }
 
 impl ConnectionFailure {
-    fn kind(&self) -> &'static str {
+    /// The connection class of a TLS, proxy or network failure (`tls_unknown_issuer`,
+    /// `proxy_connect_407`, …: the §11.2 hint the credential window shows, M6 T20); `None` for the
+    /// other failures.
+    pub fn conn_class(&self) -> Option<&'static str> {
+        match self {
+            Self::Tls(c) | Self::Proxy(c) | Self::Network(c) => {
+                Some(crate::engine::read::class_name(*c))
+            }
+            _ => None,
+        }
+    }
+
+    /// The failure's wire name (`http_401`, `tls`, `version_below_floor`, …).
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::Http401 => "http_401",
             Self::Tls(_) => "tls",

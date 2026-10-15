@@ -9,6 +9,8 @@
 pub const COMMANDS: &[&str] = &[
     "acknowledge_attention",
     "app_status",
+    "archive_and_start_fresh",
+    "credential_context",
     "decide",
     "decide_batch",
     "deny_batch",
@@ -21,4 +23,7 @@ pub const COMMANDS: &[&str] = &[
     "raw_page",
     "recent_list",
     "redaction_preview",
+    "retry_keychain",
+    "save_recovery_note",
+    "submit_secret",
 ];

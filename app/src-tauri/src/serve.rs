@@ -17,17 +17,18 @@ use std::time::Duration;
 
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::{
-    DB_FILE, EntryName, KeyStore, KeyStoreError, KeyringLocality, LockedReason, OpenConfig,
-    OpenError, OsKeyStore, StartupOutcome, Store, SystemClock, keychain_retry_schedule,
-    read_store_install_id,
+    ArchivedDb, Confirmed, DB_FILE, EntryName, KeyStore, KeyStoreError, KeyringLocality,
+    LockedReason, OpenConfig, OpenError, OsKeyStore, RecoveryOffer, StartupOutcome, Store,
+    SystemClock, keychain_retry_schedule, read_store_install_id,
 };
 use atlas_duck_core::{
-    Core, GateHandler, GateState, NativeConfirmer, ShutdownReason, ShutdownReport, UiSink,
+    Confirm, Core, GateHandler, GateState, NativeConfirmer, ShutdownReason, ShutdownReport, UiSink,
 };
 use atlas_duck_ipc::paths::{EndpointLocation, LocalDataDir, PinnedPaths, remove_endpoint_file};
 use atlas_duck_ipc::proto::RequestHandler;
 use atlas_duck_ipc::server::{HandlerCell, IpcServer, ShutdownSignal};
 use atlas_duck_ipc::transport::diag;
+use secrecy::SecretString;
 use tauri::{AppHandle, Manager, Runtime};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -61,8 +62,11 @@ pub const LOG_EVENT_KEYCHAIN_RETRY_EXHAUSTED: &str = "keychain_retry_exhausted";
 pub const LOG_EVENT_START_CANCELLED: &str = "serve_start_cancelled";
 /// PD-25: the 6-hourly touch of the socket file and its dir failed (Unix).
 pub const LOG_EVENT_TOUCH_FAILED: &str = "ipc_touch_failed";
-/// The quit path stopped waiting for a step; `reason` = `start|retry|core|served|store`.
+/// The quit path stopped waiting for a step; `reason` = `start|retry|unlock|core|served|store`.
 pub const LOG_EVENT_QUIT_WAIT_EXPIRED: &str = "quit_wait_expired";
+/// M6 T20: an unlock, archive or manual retry from the credential window did nothing;
+/// `error_class` = [`UnlockFailure::class`]. Never a passphrase, a path or an error text.
+pub const LOG_EVENT_UNLOCK_FAILED: &str = "credential_unlock_failed";
 /// `Core::shutdown` ended without a report (its task panicked).
 pub const LOG_EVENT_QUIT_CORE_LOST: &str = "quit_core_lost";
 
@@ -253,6 +257,22 @@ pub struct ServeState {
     retry_stop: ShutdownSignal,
     extras: Arc<DoctorExtras>,
     ui: Arc<dyn UiSink>,
+    /// What the credential window's unlock, archive and manual keychain retry reuse from the
+    /// start (M6 T20); set by [`start_with`].
+    restart: OnceLock<Restart>,
+    /// One unlock or archive at a time (M6 T20).
+    unlocking: tokio::sync::Mutex<()>,
+    /// The task of an unlock or archive in flight: the quit path awaits it with a bound, like the
+    /// keychain retry, and never aborts it (it owns the store it opens).
+    unlock_task: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// The store opener and the core starter of this start (M6 T20): the data dir, `instance.lock`,
+/// the keystore factory and install id, the config dir, the UI sink (whose attention feed a core
+/// started later keeps) and the confirmer.
+struct Restart {
+    opener: Arc<Opener>,
+    starter: Arc<CoreStarter>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -280,6 +300,9 @@ impl ServeState {
             retry_stop: ShutdownSignal::new(),
             extras,
             ui,
+            restart: OnceLock::new(),
+            unlocking: tokio::sync::Mutex::new(()),
+            unlock_task: Mutex::new(None),
         }
     }
 
@@ -370,6 +393,324 @@ impl ServeState {
         drop(frozen);
         true
     }
+
+    /// What the recovery note names of the store `Core` serves (§8.6): its `install_id`, its
+    /// `chain_id` and the data dir; `None` while no store is open.
+    pub fn note_facts(&self) -> Option<(String, String, PathBuf)> {
+        let data = self.extras.data.as_ref()?.path().to_path_buf();
+        let store = lock(&self.store);
+        let store = store.as_ref()?;
+        Some((store.install_id().to_owned(), store.head().2, data))
+    }
+
+    /// Starts `work` as the one unlock or archive task (M6 T20), unless the quit path froze the
+    /// state: the handle is stored under the `frozen` lock, so a freeze either comes first (and
+    /// nothing starts) or finds the handle and awaits it.
+    fn spawn_unlock_work<T, F>(
+        &self,
+        work: F,
+    ) -> Result<tokio::sync::oneshot::Receiver<T>, UnlockFailure>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        let frozen = lock(&self.frozen);
+        if !self.swaps_allowed(*frozen) {
+            return Err(UnlockFailure::ShuttingDown);
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = tx.send(work.await);
+        });
+        *lock(&self.unlock_task) = Some(task);
+        drop(frozen);
+        Ok(rx)
+    }
+
+    /// The `keychain_lost` gate is serving, with no core: the only state an unlock or archive
+    /// may touch the store in (no `Store` of this data dir is open then).
+    fn keychain_lost(&self) -> Option<RecoveryOffer> {
+        if self.core.get().is_some() {
+            return None;
+        }
+        match self.gate_state() {
+            Some(GateState::Locked(LockedReason::KeychainLost { offer })) => Some(offer),
+            _ => None,
+        }
+    }
+}
+
+// ---------- the credential window's unlock, archive and keychain retry (M6 T20) ----------
+
+/// The credential window's way out of `keychain_lost` (§8.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockKind {
+    RecoverThisLog,
+    FinishRestore,
+}
+
+/// Why an unlock or archive did nothing (or, for `CoreStart`, opened no core). Classes only:
+/// never an error text (a store or keychain message can name paths).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnlockFailure {
+    /// The gate is not `keychain_lost` with the matching offer, or a core serves.
+    NotLocked,
+    /// Another unlock or archive runs.
+    Busy,
+    /// The quit path began.
+    ShuttingDown,
+    /// The native confirmation was cancelled (archive).
+    Cancelled,
+    WrongPassphrase,
+    KeychainUnavailable,
+    KeyringNotLocal,
+    StoreNewer,
+    Integrity,
+    Io,
+    /// The store refused the call as such (e.g. nothing to recover: the keychain KEK opens it).
+    Invalid,
+    /// The store was recovered but the core did not start (the store was shut down again).
+    CoreStart,
+}
+
+impl UnlockFailure {
+    pub fn class(self) -> &'static str {
+        match self {
+            UnlockFailure::NotLocked => "not_locked",
+            UnlockFailure::Busy => "busy",
+            UnlockFailure::ShuttingDown => "shutting_down",
+            UnlockFailure::Cancelled => "cancelled",
+            UnlockFailure::WrongPassphrase => "wrong_passphrase",
+            UnlockFailure::KeychainUnavailable => "keychain_unavailable",
+            UnlockFailure::KeyringNotLocal => "keyring_not_local",
+            UnlockFailure::StoreNewer => "store_newer",
+            UnlockFailure::Integrity => "integrity",
+            UnlockFailure::Io => "io",
+            UnlockFailure::Invalid => "invalid",
+            UnlockFailure::CoreStart => "core_start",
+        }
+    }
+
+    fn of(e: &OpenError) -> UnlockFailure {
+        match e {
+            OpenError::WrongPassphrase => UnlockFailure::WrongPassphrase,
+            OpenError::KeyStore(KeyStoreError::NotLocal) => UnlockFailure::KeyringNotLocal,
+            OpenError::KeyStore(_) => UnlockFailure::KeychainUnavailable,
+            OpenError::NewerStore(_) => UnlockFailure::StoreNewer,
+            OpenError::Integrity(_) | OpenError::Restore(_) => UnlockFailure::Integrity,
+            OpenError::Io(_) | OpenError::Sqlite(_) | OpenError::MigrationFailed { .. } => {
+                UnlockFailure::Io
+            }
+            OpenError::AlreadyExists
+            | OpenError::NotFirstRun
+            | OpenError::PassphraseTooShort
+            | OpenError::PassphraseMismatch
+            | OpenError::Invalid(_) => UnlockFailure::Invalid,
+        }
+    }
+
+    fn log(self) {
+        tracing::warn!(event = LOG_EVENT_UNLOCK_FAILED, error_class = self.class());
+    }
+}
+
+/// "Recover this log" / "Finish restore" (§8.7) with the passphrase the credential window took:
+/// the audit call on a blocking thread (the passphrase is dropped, zeroized, when it returns),
+/// then `Core::start` with the store's `pats_deleted` and the cell swapped to the core without a
+/// rebind (the endpoint stays; T8 replays each connection's `hello`). Only while the gate is
+/// `keychain_lost` with the matching offer and no core serves. The quit path awaits it (bounded);
+/// a core started after the freeze is shut down again.
+pub async fn unlock(
+    state: &Arc<ServeState>,
+    kind: UnlockKind,
+    passphrase: SecretString,
+) -> Result<(), UnlockFailure> {
+    let failed = |f: UnlockFailure| {
+        f.log();
+        Err(f)
+    };
+    let Some(restart) = state.restart.get() else {
+        return failed(UnlockFailure::NotLocked);
+    };
+    let Ok(_one) = state.unlocking.try_lock() else {
+        return failed(UnlockFailure::Busy);
+    };
+    let want = match kind {
+        UnlockKind::RecoverThisLog => RecoveryOffer::RecoverThisLog,
+        UnlockKind::FinishRestore => RecoveryOffer::FinishRestore,
+    };
+    if state.keychain_lost() != Some(want) {
+        return failed(UnlockFailure::NotLocked);
+    }
+    let (st, opener, starter) = (
+        state.clone(),
+        restart.opener.clone(),
+        restart.starter.clone(),
+    );
+    let done = state.spawn_unlock_work(async move {
+        let opened = run_blocking_unlock(move || opener.unlock_blocking(kind, &passphrase)).await;
+        let (store, keys, pats_deleted) = opened?;
+        if *lock(&st.frozen) {
+            shutdown_store(store).await;
+            return Err(UnlockFailure::ShuttingDown);
+        }
+        let core = match starter.start(store.clone(), keys, pats_deleted).await {
+            Ok(core) => core,
+            Err(f) => {
+                f.log();
+                return Err(UnlockFailure::CoreStart);
+            }
+        };
+        if !st.install_core(core.clone(), store.clone()) {
+            core.shutdown(ShutdownReason::Quit).await;
+            shutdown_store(store).await;
+            return Err(UnlockFailure::ShuttingDown);
+        }
+        tracing::info!(event = LOG_EVENT_SERVING, serve_state = "core");
+        Ok(())
+    });
+    let result = match done {
+        Ok(rx) => rx.await.unwrap_or(Err(UnlockFailure::Io)),
+        Err(f) => Err(f),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(f) => failed(f),
+    }
+}
+
+/// Runs a blocking unlock step; a lost thread is an I/O failure.
+async fn run_blocking_unlock<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, UnlockFailure> + Send + 'static,
+) -> Result<T, UnlockFailure> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .unwrap_or(Err(UnlockFailure::Io))
+}
+
+/// plan text (T20, §8.7, §10.3): the native confirmation of "Archive old DB and start fresh";
+/// `<archived>` is the data dir's archive folder.
+pub const ARCHIVE_CONFIRM_TEXT: &str = "Archive this audit log and start a new one? audit.db (with its WAL) is moved to <archived> as audit-<chain_id>-<last record>-<time>.db; it is never deleted. Keep it for its remaining retention period: it can be read later only with its own recovery passphrase, through a restore. Next, a new audit log is set up with a new recovery passphrase, and every token must be entered again.";
+
+/// The data-dir folder `audit::archive_and_start_fresh` moves a store into (its `ARCHIVE_DIR`).
+pub const ARCHIVED_DIR: &str = "archived";
+
+/// The archive confirmation text for `data`.
+pub fn archive_confirm_text(data: &LocalDataDir) -> String {
+    let dir = data.path().join(ARCHIVED_DIR);
+    ARCHIVE_CONFIRM_TEXT.replace("<archived>", &dir.display().to_string())
+}
+
+/// "Archive old DB and start fresh" (§8.7): a Rust-drawn native confirmation (§10.3), then the
+/// audit call moves the store aside (never deleting it), and the cell serves the first-run gate
+/// (no store exists now) until the wizard's `GENESIS` (Task 23), which names the returned
+/// [`ArchivedDb`]. Only in `keychain_lost` (either offer) with no core. Nothing is logged: there is
+/// no open store; the new `GENESIS` records it.
+pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<ArchivedDb, UnlockFailure> {
+    let failed = |f: UnlockFailure| {
+        f.log();
+        Err(f)
+    };
+    let Some(restart) = state.restart.get() else {
+        return failed(UnlockFailure::NotLocked);
+    };
+    let Ok(_one) = state.unlocking.try_lock() else {
+        return failed(UnlockFailure::Busy);
+    };
+    if state.keychain_lost().is_none() {
+        return failed(UnlockFailure::NotLocked);
+    }
+    let text = archive_confirm_text(&restart.opener.data);
+    let confirmer = restart.starter.confirmer.clone();
+    // The dialog blocks until the user answers: never on the async runtime or the main thread.
+    let shown = text.clone();
+    let answer = tokio::task::spawn_blocking(move || confirmer.confirm(&shown))
+        .await
+        .unwrap_or(Confirm::Cancel);
+    if answer != Confirm::Ok {
+        return failed(UnlockFailure::Cancelled);
+    }
+    let confirmed = confirmed_by(&text);
+    let (st, opener) = (state.clone(), restart.opener.clone());
+    let done = state.spawn_unlock_work(async move {
+        if *lock(&st.frozen) {
+            return Err(UnlockFailure::ShuttingDown);
+        }
+        let archived = run_blocking_unlock(move || {
+            atlas_duck_audit::archive_and_start_fresh(&opener.data, &opener.lock, confirmed)
+                .map_err(|e| UnlockFailure::of(&e))
+        })
+        .await?;
+        // No store is left: requests get the first-run answer until `GENESIS` (§2.5).
+        st.install_gate(GateState::FirstRun);
+        Ok(archived)
+    });
+    let result = match done {
+        Ok(rx) => rx.await.unwrap_or(Err(UnlockFailure::Io)),
+        Err(f) => Err(f),
+    };
+    match result {
+        Ok(a) => Ok(a),
+        Err(f) => failed(f),
+    }
+}
+
+/// The audit store's proof of a native confirmation: the SHA-256 of the dialog text.
+fn confirmed_by(text: &str) -> Confirmed {
+    let hex = atlas_duck_core::payloads::sha256_hex(text.as_bytes());
+    let mut digest = [0u8; 32];
+    for (i, b) in digest.iter_mut().enumerate() {
+        *b = hex
+            .get(2 * i..2 * i + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+            .unwrap_or(0);
+    }
+    Confirmed {
+        dialog_text_sha256: digest,
+    }
+}
+
+/// What a manual keychain retry did (PD-89).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryNow {
+    /// One more keystore + `open` runs now, through the retry loop's own path.
+    Started,
+    /// The retry loop still runs; nothing new was started.
+    AlreadyRunning,
+    /// The gate is not `keychain_unavailable` (or a core serves).
+    NotLocked,
+    ShuttingDown,
+}
+
+/// The manual keychain retry (PD-89: the credential window's "Retry keychain", Task 22's tray
+/// item): one more attempt of [`retry_keychain`] with no delay, only while the gate is
+/// `keychain_unavailable` and no retry runs (two concurrent `open`s would race for the cell).
+pub fn retry_keychain_now(state: &Arc<ServeState>) -> RetryNow {
+    let Some(restart) = state.restart.get() else {
+        return RetryNow::NotLocked;
+    };
+    let frozen = lock(&state.frozen);
+    if !state.swaps_allowed(*frozen) {
+        return RetryNow::ShuttingDown;
+    }
+    if state.core.get().is_some()
+        || state.gate_state() != Some(GateState::Locked(LockedReason::KeychainUnavailable))
+    {
+        return RetryNow::NotLocked;
+    }
+    let mut retry = lock(&state.retry);
+    if retry.as_ref().is_some_and(|h| !h.is_finished()) {
+        return RetryNow::AlreadyRunning;
+    }
+    *retry = Some(tokio::spawn(retry_keychain(
+        state.clone(),
+        restart.opener.clone(),
+        restart.starter.clone(),
+        vec![Duration::ZERO],
+    )));
+    drop(retry);
+    drop(frozen);
+    RetryNow::Started
 }
 
 // ---------- quit ----------
@@ -468,6 +809,11 @@ where
     let retry = lock(&state.retry).take();
     if let Some(retry) = retry {
         bounded(retry, RETRY_WAIT, deadline, "retry").await;
+    }
+    // M6 T20: likewise an unlock or archive of the credential window (it sees the freeze).
+    let unlock = lock(&state.unlock_task).take();
+    if let Some(unlock) = unlock {
+        bounded(unlock, RETRY_WAIT, deadline, "unlock").await;
     }
 
     let (report, timed_out) = match core_stage(core) {
@@ -724,6 +1070,10 @@ pub async fn start_with(i: StartInputs) -> Result<Arc<ServeState>, StartupFailur
         return Err(abandon(core, store).await);
     }
     let state = Arc::new(ServeState::new(initial, gate, store, extras, i.ui.clone()));
+    let _ = state.restart.set(Restart {
+        opener: opener.clone(),
+        starter: starter.clone(),
+    });
     let cell = state.cell.clone();
     if let Some(core) = core {
         let _ = state.core.set(core);
@@ -778,6 +1128,8 @@ struct Opener {
 }
 
 type Opened = (StartupOutcome, Option<Arc<dyn KeyStore>>);
+/// A recovered store, its keystore and the instance ids whose PAT the recovery deleted.
+type Unlocked = (Store, Arc<dyn KeyStore>, Vec<String>);
 
 impl Opener {
     /// The first attempt (on a blocking thread): the stale endpoint file goes first (PD-05),
@@ -834,6 +1186,40 @@ impl Opener {
             Ok(_) => Err(StoreFailure::Integrity),
             Err(e) => Err(StoreFailure::of(&e)),
         }
+    }
+
+    /// The audit call of an unlock (§8.7), with a keystore built for the install id of the first
+    /// attempt: the recovered store, that keystore and the instance ids whose PAT it deleted.
+    fn unlock_blocking(
+        &self,
+        kind: UnlockKind,
+        passphrase: &SecretString,
+    ) -> Result<Unlocked, UnlockFailure> {
+        let Some(id) = self.install_id.get() else {
+            return Err(UnlockFailure::Integrity);
+        };
+        let keys = self
+            .keys
+            .keys(id)
+            .map_err(|e| match locked_reason_for(&e) {
+                LockedReason::KeyringNotLocal => UnlockFailure::KeyringNotLocal,
+                _ => UnlockFailure::KeychainUnavailable,
+            })?;
+        let mut cfg = OpenConfig::new(Arc::new(SystemClock::new()), keys.clone());
+        cfg.pinned_install_id = self.pinned_install_id.clone();
+        let unlocked = match kind {
+            UnlockKind::RecoverThisLog => {
+                atlas_duck_audit::recover_this_log(&self.data, &self.lock, cfg, passphrase)
+                    .map(|(store, report)| (store, report.pats_deleted))
+            }
+            UnlockKind::FinishRestore => {
+                atlas_duck_audit::finish_restore(&self.data, &self.lock, cfg, passphrase)
+                    .map(|(store, _verify, pats_deleted)| (store, pats_deleted))
+            }
+        };
+        unlocked
+            .map(|(store, pats_deleted)| (store, keys, pats_deleted))
+            .map_err(|e| UnlockFailure::of(&e))
     }
 
     fn open_blocking(&self) -> Result<Opened, StoreFailure> {

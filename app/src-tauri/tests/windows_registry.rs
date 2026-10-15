@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use atlas_duck_app_lib::credential::Purpose;
 use atlas_duck_app_lib::state::DataDirHold;
 use atlas_duck_app_lib::tray::on_run_event;
 use atlas_duck_app_lib::windows::{
@@ -65,8 +66,8 @@ fn open_builds_once_under_the_fixed_label() -> TestResult {
     assert_eq!(
         handle
             .try_state::<WindowRegistry>()
-            .and_then(|r| r.credential_unlock()),
-        Some(Unlock::Recover)
+            .and_then(|r| r.credential_purpose()),
+        Some(Purpose::RecoverThisLog)
     );
     let labels: Vec<String> = handle.webview_windows().into_keys().collect();
     for label in &labels {

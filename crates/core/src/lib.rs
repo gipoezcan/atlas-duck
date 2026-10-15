@@ -71,6 +71,9 @@ pub use crate::core::{
 #[cfg(feature = "testing")]
 pub use crate::core::{HookPoint, Pause, TestHooks};
 pub use atlas_duck_preview::CandidateRev;
+/// The date type of `InstanceAdmin::set_token`'s expiry (M6 T20: the app parses the credential
+/// window's "token expires on" into it without a chrono dependency of its own).
+pub use chrono::NaiveDate;
 pub use config::ui::AttentionMode;
 pub use credentials::KeychainCredentials;
 pub use decision::{

@@ -1,0 +1,835 @@
+//! The credential window's commands (C.10 + Δ1, §10.3; M6 T20): `credential_context`,
+//! `submit_secret`, `save_recovery_note`, `archive_and_start_fresh`, `retry_keychain` (`quit` is
+//! `window::quit`). Granted to the `credential` window only.
+//!
+//! What a call may do is decided by the purpose Rust opened the window for
+//! (`credential::Purpose`), never by an argument. A secret arrives only in `submit_secret`, is a
+//! `secrecy::SecretString` from the DTO on ([`Secret`]: no `Serialize`, a redacting `Debug`,
+//! zeroized on drop) and goes to `InstanceAdmin::set_token`, the wizard's channel or the audit
+//! store; no response, event, log line or capture record holds it. A PAT's answer is the
+//! connection test's outcome only (§10.3).
+
+use std::fmt;
+use std::sync::Arc;
+
+use atlas_duck_core::{AdminError, ConnectionFailure, ConnectionReport, InstanceAdmin, NaiveDate};
+use secrecy::{ExposeSecret, SecretString};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use tauri::{AppHandle, Manager, Runtime};
+use zeroize::Zeroize;
+
+use super::dto::{Args, refuse};
+use super::{CommandError, blocking, finish};
+use crate::credential::{self, FirstRunPassphrase, NoteFacts, PatTarget, Purpose};
+use crate::serve::{self, ServeState, UnlockKind};
+use crate::state::ServeSlot;
+use crate::windows::{self, Label, Show};
+
+/// plan text (T20): a secret (PAT or passphrase) is 1 to 1 024 bytes of UTF-8 without `\0`.
+pub const SECRET_MAX_BYTES: usize = 1024;
+
+/// One secret as the credential page typed it. Built straight from the borrowed JSON string into
+/// a `SecretString` (no intermediate `String` of its own); refused values are dropped, zeroized.
+fn secret_from<'de, D: Deserializer<'de>>(
+    d: D,
+    field: &'static str,
+) -> Result<SecretString, D::Error> {
+    struct SecretVisitor;
+    impl Visitor<'_> for SecretVisitor {
+        type Value = SecretString;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a string")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<SecretString, E> {
+            Ok(SecretString::from(v))
+        }
+        fn visit_string<E: de::Error>(self, mut v: String) -> Result<SecretString, E> {
+            let s = SecretString::from(v.as_str());
+            v.zeroize();
+            Ok(s)
+        }
+    }
+    let s = d
+        .deserialize_str(SecretVisitor)
+        .map_err(|_| refuse::<D::Error>(field))?;
+    let t = s.expose_secret();
+    if t.is_empty() || t.len() > SECRET_MAX_BYTES || t.contains('\0') {
+        return Err(refuse(field));
+    }
+    Ok(s)
+}
+
+/// `secret`: a PAT or a passphrase. `Debug` never shows it; there is no `Serialize`.
+pub struct Secret(SecretString);
+
+impl Secret {
+    pub fn into_inner(self) -> SecretString {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        secret_from(d, "secret").map(Secret)
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Secret([redacted])")
+    }
+}
+
+/// `secret_confirm`: the second entry of the first-run recovery passphrase (§8.6).
+pub struct SecretConfirm(SecretString);
+
+impl SecretConfirm {
+    pub fn into_inner(self) -> SecretString {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretConfirm {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        secret_from(d, "secret_confirm").map(SecretConfirm)
+    }
+}
+
+impl fmt::Debug for SecretConfirm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SecretConfirm([redacted])")
+    }
+}
+
+/// `expires_on`: the PAT's "token expires on" date (§7.1), `YYYY-MM-DD`, a real calendar date.
+/// Not secret; recorded in `CREDENTIAL_CHANGED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiryDate(pub NaiveDate);
+
+impl ExpiryDate {
+    pub fn parse(s: &str) -> Option<ExpiryDate> {
+        let b = s.as_bytes();
+        let shaped = b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+        if !shaped {
+            return None;
+        }
+        let year: i32 = s.get(0..4)?.parse().ok()?;
+        let month: u32 = s.get(5..7)?.parse().ok()?;
+        let day: u32 = s.get(8..10)?.parse().ok()?;
+        NaiveDate::from_ymd_opt(year, month, day).map(ExpiryDate)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExpiryDate {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d).map_err(|_| refuse::<D::Error>("expires_on"))?;
+        ExpiryDate::parse(&s).ok_or_else(|| refuse("expires_on"))
+    }
+}
+
+/// `submit_secret {secret, secret_confirm?, expires_on?}` (Δ1). Which keys a purpose takes is
+/// checked by the handler: a PAT takes `expires_on`, the first-run passphrase `secret_confirm`,
+/// the unlock passphrases neither.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitSecretArgs {
+    pub secret: Secret,
+    pub secret_confirm: Option<SecretConfirm>,
+    pub expires_on: Option<ExpiryDate>,
+}
+
+/// Redacting: whether the secrets are there, never what they are.
+impl fmt::Debug for SubmitSecretArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SubmitSecretArgs")
+            .field("secret", &self.secret)
+            .field("secret_confirm", &self.secret_confirm)
+            .field("expires_on", &self.expires_on)
+            .finish()
+    }
+}
+
+/// `credential_context {}` (read-only).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialContextArgs {}
+
+/// `save_recovery_note {}` (Rust save dialog; no path argument).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveRecoveryNoteArgs {}
+
+/// `archive_and_start_fresh {}` (Rust confirms natively).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveAndStartFreshArgs {}
+
+/// `retry_keychain {}` (PD-89).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryKeychainArgs {}
+
+/// The read-only context header (§10.3): the purpose, for a PAT the instance as Rust read it when
+/// it opened the window, for the locked and first-run purposes the refused count (§2.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CredentialContextDto {
+    pub purpose: &'static str,
+    pub alias: Option<String>,
+    pub product: Option<&'static str>,
+    /// The normalized base URL (§7.1).
+    pub base_url: Option<String>,
+    /// "Locked — N requests refused" / "Setup required — N requests refused" (§2.5).
+    pub refused_count: Option<u64>,
+    /// §15 V26: no hint in M6 (the user types the expiry date); always `null`.
+    pub product_version_hint: Option<String>,
+    /// "Save recovery note" is offered: the first-run passphrase went to the wizard and the new
+    /// store serves (§8.6: right after `GENESIS`).
+    pub note_available: bool,
+}
+
+/// "Connected as <user>, Jira <version>" (§10.3), plus the version warnings (§7.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Connected {
+    pub atlassian_user: String,
+    pub product: &'static str,
+    pub version: String,
+    pub warnings: Vec<String>,
+}
+
+impl From<ConnectionReport> for Connected {
+    fn from(r: ConnectionReport) -> Connected {
+        Connected {
+            atlassian_user: r.atlassian_user,
+            product: atlas_duck_core::config::instances::product_str(r.product),
+            version: r.version,
+            warnings: r.warnings,
+        }
+    }
+}
+
+/// Why a submit did nothing: a fixed class (§10.3 connection-test classes, §11.2 `conn`, the
+/// passphrase and unlock classes); the window stays open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SubmitFailure {
+    pub class: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conn: Option<&'static str>,
+}
+
+impl SubmitFailure {
+    pub fn class(class: &'static str) -> SubmitFailure {
+        SubmitFailure { class, conn: None }
+    }
+}
+
+/// plan text (T20): the instance changed (URL, state) since the window opened; it must be opened
+/// again for the instance as it is now.
+pub const CLASS_CONTEXT_CHANGED: &str = "context_changed";
+
+/// The connection test's failure as the window shows it.
+pub fn connection_failure(f: &ConnectionFailure) -> SubmitFailure {
+    SubmitFailure {
+        class: f.kind(),
+        conn: f.conn_class(),
+    }
+}
+
+/// `submit_secret`'s answer: `{"ok": {..}}` (PAT stored), `{"accepted": {}}` (first-run passphrase
+/// handed to the wizard), `{"unlocked": {}}` (the store serves again; the window closes) or
+/// `{"failed": {"class", "conn"?}}` (nothing stored; the window stays open).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmitOutcome {
+    Ok(Connected),
+    Accepted {},
+    Unlocked {},
+    Failed(SubmitFailure),
+}
+
+/// `save_recovery_note`'s answer: false when the save dialog was cancelled. Never the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct NoteSaved {
+    pub saved: bool,
+}
+
+/// `archive_and_start_fresh`'s answer: the archived file (relative to the data dir, §8.7), or a
+/// failure class (`cancelled` when the confirmation was declined).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveOutcome {
+    Archived { archived_file: String },
+    Failed(SubmitFailure),
+}
+
+/// `retry_keychain`'s answer: false when a retry is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct RetryStarted {
+    pub started: bool,
+}
+
+fn serve_state<R: Runtime>(app: &AppHandle<R>) -> Option<Arc<ServeState>> {
+    app.try_state::<ServeSlot>().and_then(|s| s.get().cloned())
+}
+
+/// The context header of `purpose`.
+pub fn context_dto(
+    purpose: &Purpose,
+    refused_count: Option<u64>,
+    note_available: bool,
+) -> CredentialContextDto {
+    let target = purpose.pat_target();
+    CredentialContextDto {
+        purpose: purpose.as_str(),
+        alias: target.map(|t| t.alias.clone()),
+        product: target.map(|t| t.product),
+        base_url: target.map(|t| t.origin.clone()),
+        refused_count: if target.is_some() {
+            None
+        } else {
+            refused_count
+        },
+        product_version_hint: None,
+        note_available,
+    }
+}
+
+/// `credential_context {}` (Δ1, §10.3): the header of the purpose Rust opened the window for.
+#[tauri::command]
+pub async fn credential_context<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<CredentialContextArgs>,
+) -> Result<CredentialContextDto, CommandError> {
+    let Args(CredentialContextArgs {}) = args;
+    let response = match credential::current_purpose(&app) {
+        None => Err(CommandError::NotReady),
+        Some(purpose) => {
+            let serve = serve_state(&app);
+            let refused = serve.as_ref().and_then(|s| s.refused());
+            let note = note_available(&app, &purpose, serve.as_deref());
+            Ok(context_dto(&purpose, refused, note))
+        }
+    };
+    finish(&app, response)
+}
+
+fn note_available<R: Runtime>(
+    app: &AppHandle<R>,
+    purpose: &Purpose,
+    serve: Option<&ServeState>,
+) -> bool {
+    *purpose == Purpose::RecoveryPassphrase
+        && credential::handed_over(app)
+        && serve.is_some_and(|s| s.note_facts().is_some())
+}
+
+/// A PAT for `target` (§7.1, §10.3): the instance must still be the one the window shows
+/// (`context_changed` otherwise); then `InstanceAdmin::set_token` runs the connection test with
+/// the entered token before storing anything (a failure stores nothing and keeps the old PAT) and
+/// asks the native owner-change confirmation itself.
+pub async fn submit_pat_dto(
+    admin: Arc<dyn InstanceAdmin>,
+    target: &PatTarget,
+    args: SubmitSecretArgs,
+) -> Result<SubmitOutcome, CommandError> {
+    let SubmitSecretArgs {
+        secret,
+        secret_confirm,
+        expires_on,
+    } = args;
+    if secret_confirm.is_some() {
+        return Err(CommandError::InvalidArgument {
+            field: "secret_confirm",
+        });
+    }
+    let list = admin.clone();
+    let views = blocking(move || Ok(list.list())).await?;
+    match credential::pat_target(&views, &target.alias) {
+        Ok(now) if now == *target => {}
+        Ok(_) => {
+            return Ok(SubmitOutcome::Failed(SubmitFailure::class(
+                CLASS_CONTEXT_CHANGED,
+            )));
+        }
+        Err(e) => return Err(CommandError::Admin(e)),
+    }
+    match admin
+        .set_token(&target.alias, secret.into_inner(), expires_on.map(|d| d.0))
+        .await
+    {
+        Ok(report) => Ok(SubmitOutcome::Ok(Connected::from(report))),
+        Err(AdminError::ConnectionFailed(f)) => Ok(SubmitOutcome::Failed(connection_failure(&f))),
+        Err(e) => Err(CommandError::Admin(e)),
+    }
+}
+
+/// The first-run pair (§8.6): `secret_confirm` is required, `expires_on` refused; a pair the
+/// window's check refuses is a `failed` outcome (nothing is handed on, nothing committed).
+pub fn passphrase_pair(
+    args: SubmitSecretArgs,
+) -> Result<Result<FirstRunPassphrase, SubmitOutcome>, CommandError> {
+    let SubmitSecretArgs {
+        secret,
+        secret_confirm,
+        expires_on,
+    } = args;
+    if expires_on.is_some() {
+        return Err(CommandError::InvalidArgument {
+            field: "expires_on",
+        });
+    }
+    let Some(confirm) = secret_confirm else {
+        return Err(CommandError::InvalidArgument {
+            field: "secret_confirm",
+        });
+    };
+    let pair = FirstRunPassphrase {
+        passphrase: secret.into_inner(),
+        confirm: confirm.into_inner(),
+    };
+    Ok(
+        match credential::check_passphrase_pair(&pair.passphrase, &pair.confirm) {
+            Ok(()) => Ok(pair),
+            Err(r) => Err(SubmitOutcome::Failed(SubmitFailure::class(r.class()))),
+        },
+    )
+}
+
+/// The passphrase of "Recover this log" / "Finish restore": one entry, nothing else.
+pub fn unlock_passphrase(args: SubmitSecretArgs) -> Result<SecretString, CommandError> {
+    let SubmitSecretArgs {
+        secret,
+        secret_confirm,
+        expires_on,
+    } = args;
+    if secret_confirm.is_some() {
+        return Err(CommandError::InvalidArgument {
+            field: "secret_confirm",
+        });
+    }
+    if expires_on.is_some() {
+        return Err(CommandError::InvalidArgument {
+            field: "expires_on",
+        });
+    }
+    Ok(secret.into_inner())
+}
+
+/// Destroys the credential window once this command has answered (the page is gone with it).
+fn close_after_answer<R: Runtime>(app: &AppHandle<R>) {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || credential::close(&handle));
+}
+
+async fn submit<R: Runtime>(
+    app: &AppHandle<R>,
+    args: SubmitSecretArgs,
+) -> Result<SubmitOutcome, CommandError> {
+    let purpose = credential::current_purpose(app).ok_or(CommandError::NotReady)?;
+    match purpose {
+        Purpose::AddPat(target) | Purpose::ReplacePat(target) => {
+            let core = super::core(app)?;
+            submit_pat_dto(core.instances(), &target, args).await
+        }
+        Purpose::RecoveryPassphrase => {
+            let pair = match passphrase_pair(args)? {
+                Ok(pair) => pair,
+                Err(failed) => return Ok(failed),
+            };
+            // No wizard waits: nothing is handed on (the pair is dropped, zeroized).
+            if credential::hand_over(app, pair).is_err() {
+                return Err(CommandError::NotReady);
+            }
+            Ok(SubmitOutcome::Accepted {})
+        }
+        Purpose::RecoverThisLog | Purpose::FinishRestore => {
+            let passphrase = unlock_passphrase(args)?;
+            let state = serve_state(app).ok_or(CommandError::NotReady)?;
+            let kind = if purpose == Purpose::RecoverThisLog {
+                UnlockKind::RecoverThisLog
+            } else {
+                UnlockKind::FinishRestore
+            };
+            match serve::unlock(&state, kind, passphrase).await {
+                Ok(()) => {
+                    close_after_answer(app);
+                    Ok(SubmitOutcome::Unlocked {})
+                }
+                Err(f) => Ok(SubmitOutcome::Failed(SubmitFailure::class(f.class()))),
+            }
+        }
+        // `keychain_unavailable`: nothing to type in v1 (L39); "Retry keychain" instead.
+        Purpose::Unlock => Err(CommandError::NotReady),
+    }
+}
+
+/// `submit_secret {secret, secret_confirm?, expires_on?}` (Δ1, §10.3): the secret for the purpose
+/// Rust opened the window for. The answer never holds the secret.
+#[tauri::command]
+pub async fn submit_secret<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<SubmitSecretArgs>,
+) -> Result<SubmitOutcome, CommandError> {
+    let Args(args) = args;
+    let response = submit(&app, args).await;
+    finish(&app, response)
+}
+
+/// plan text (T20): the save dialog's title and file-type filter.
+const NOTE_DIALOG_TITLE: &str = "Save the atlas-duck recovery note";
+const NOTE_FILTER: &str = "Text";
+
+/// `save_recovery_note {}` (§8.6, §10.3): after the first-run passphrase went to the wizard and
+/// the new store serves, Rust opens a native save dialog and writes the recovery note there. The
+/// note never contains the passphrase; the path never reaches the webview.
+#[tauri::command]
+pub async fn save_recovery_note<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<SaveRecoveryNoteArgs>,
+) -> Result<NoteSaved, CommandError> {
+    let Args(SaveRecoveryNoteArgs {}) = args;
+    let response = save_note(&app).await;
+    finish(&app, response)
+}
+
+async fn save_note<R: Runtime>(app: &AppHandle<R>) -> Result<NoteSaved, CommandError> {
+    let purpose = credential::current_purpose(app);
+    let serve = serve_state(app);
+    if purpose != Some(Purpose::RecoveryPassphrase) || !credential::handed_over(app) {
+        return Err(CommandError::NotReady);
+    }
+    let (install_id, chain_id, data) = serve
+        .and_then(|s| s.note_facts())
+        .ok_or(CommandError::NotReady)?;
+    let facts = NoteFacts {
+        host: atlas_duck_ipc::paths::host_name().unwrap_or_default(),
+        os_user: credential::os_user(),
+        install_id,
+        chain_id,
+        data_dir: data.display().to_string(),
+    };
+    let handle = app.clone();
+    // The dialog blocks until the user answers: on the blocking pool, never the main thread.
+    blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let Some(chosen) = handle
+            .dialog()
+            .file()
+            .set_title(NOTE_DIALOG_TITLE)
+            .set_file_name(credential::NOTE_FILE_NAME)
+            .add_filter(NOTE_FILTER, &["txt"])
+            .blocking_save_file()
+        else {
+            return Ok(NoteSaved { saved: false });
+        };
+        let path = chosen.into_path().map_err(|_| CommandError::Internal)?;
+        std::fs::write(&path, credential::note_text(&facts)).map_err(|_| CommandError::Internal)?;
+        Ok(NoteSaved { saved: true })
+    })
+    .await
+}
+
+/// `archive_and_start_fresh {}` (§8.7, §10.3): only for a `keychain_lost` window. Rust shows the
+/// native confirmation naming the archive folder, moves the store aside (never deleting it), keeps
+/// the [`atlas_duck_audit::ArchivedDb`] for the wizard's `GENESIS` (Task 23), closes this window
+/// and opens the setup window (wizard step (1b)).
+#[tauri::command]
+pub async fn archive_and_start_fresh<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<ArchiveAndStartFreshArgs>,
+) -> Result<ArchiveOutcome, CommandError> {
+    let Args(ArchiveAndStartFreshArgs {}) = args;
+    let response = archive(&app).await;
+    finish(&app, response)
+}
+
+async fn archive<R: Runtime>(app: &AppHandle<R>) -> Result<ArchiveOutcome, CommandError> {
+    let purpose = credential::current_purpose(app);
+    if !matches!(
+        purpose,
+        Some(Purpose::RecoverThisLog | Purpose::FinishRestore)
+    ) {
+        return Err(CommandError::NotReady);
+    }
+    let state = serve_state(app).ok_or(CommandError::NotReady)?;
+    match serve::archive_and_start_fresh(&state).await {
+        Ok(archived) => {
+            let archived_file = archived.file.clone();
+            credential::set_archived(app, archived);
+            let handle = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                credential::close(&handle);
+                // `open` logs its own failure.
+                let _ = windows::open(&handle, Label::Setup, Show::Focus);
+            });
+            Ok(ArchiveOutcome::Archived { archived_file })
+        }
+        Err(f) => Ok(ArchiveOutcome::Failed(SubmitFailure::class(f.class()))),
+    }
+}
+
+/// `retry_keychain {}` (PD-89): one more keystore + `open` while the app is locked
+/// `keychain_unavailable`; `not_ready` in any other state.
+#[tauri::command]
+pub async fn retry_keychain<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RetryKeychainArgs>,
+) -> Result<RetryStarted, CommandError> {
+    let Args(RetryKeychainArgs {}) = args;
+    let response = match serve_state(&app).map(|s| serve::retry_keychain_now(&s)) {
+        Some(serve::RetryNow::Started) => Ok(RetryStarted { started: true }),
+        Some(serve::RetryNow::AlreadyRunning) => Ok(RetryStarted { started: false }),
+        Some(serve::RetryNow::NotLocked | serve::RetryNow::ShuttingDown) | None => {
+            Err(CommandError::NotReady)
+        }
+    };
+    finish(&app, response)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::commands::dto::{FIELD_PAYLOAD, parse};
+
+    const CANARY: &str = "canary-PAT-7f3a9c";
+
+    fn field(body: Value) -> Option<&'static str> {
+        match parse::<SubmitSecretArgs>(&body) {
+            Err(CommandError::InvalidArgument { field }) => Some(field),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn submit_secret_args_parse_and_bound_every_field() {
+        let ok = parse::<SubmitSecretArgs>(&json!({
+            "secret": CANARY,
+            "secret_confirm": CANARY,
+            "expires_on": "2027-02-28",
+        }))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(ok.secret.0.expose_secret(), CANARY);
+        assert_eq!(
+            ok.expires_on,
+            NaiveDate::from_ymd_opt(2027, 2, 28).map(ExpiryDate)
+        );
+        // Optional keys may be absent or null.
+        let bare = parse::<SubmitSecretArgs>(&json!({"secret": CANARY, "secret_confirm": null}))
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(bare.secret_confirm.is_none() && bare.expires_on.is_none());
+
+        let max = "x".repeat(SECRET_MAX_BYTES);
+        assert!(parse::<SubmitSecretArgs>(&json!({ "secret": max })).is_ok());
+        for bad in [
+            json!({"secret": "x".repeat(SECRET_MAX_BYTES + 1)}),
+            json!({"secret": ""}),
+            json!({"secret": "a\u{0}b"}),
+            json!({"secret": 7}),
+            json!({"secret": ["c", "a"]}),
+            json!({"secret": null}),
+            json!({}),
+        ] {
+            assert_eq!(field(bad.clone()), Some("secret"), "{bad}");
+        }
+        assert_eq!(
+            field(json!({"secret": CANARY, "secret_confirm": ""})),
+            Some("secret_confirm")
+        );
+        for date in [
+            "2027-02-30",
+            "2027-2-28",
+            "27-02-28",
+            "2027/02/28",
+            "2027-02-28T00:00",
+            "+027-02-28",
+            "",
+        ] {
+            assert_eq!(
+                field(json!({"secret": CANARY, "expires_on": date})),
+                Some("expires_on"),
+                "{date}"
+            );
+        }
+        assert_eq!(
+            field(json!({"secret": CANARY, "expires_on": 20270228})),
+            Some("expires_on")
+        );
+        // Unknown keys and non-object bodies: the payload.
+        assert_eq!(
+            field(json!({"secret": CANARY, "alias": "other"})),
+            Some(FIELD_PAYLOAD)
+        );
+        assert_eq!(field(json!([CANARY])), Some(FIELD_PAYLOAD));
+    }
+
+    /// The secret is in no `Debug` of the arguments, of a refusal or of its wire form.
+    #[test]
+    fn no_debug_or_error_shows_the_secret() {
+        let args = parse::<SubmitSecretArgs>(&json!({
+            "secret": CANARY,
+            "secret_confirm": CANARY,
+            "expires_on": "2027-01-31",
+        }))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+        let debug = format!("{args:?} {:#?}", args);
+        assert!(!debug.contains(CANARY), "{debug}");
+        assert!(debug.contains("[redacted]") && debug.contains("2027-01-31"));
+
+        // A refused secret: the error names the field only.
+        let long = format!("{CANARY}{}", "x".repeat(SECRET_MAX_BYTES));
+        for body in [
+            json!({ "secret": long }),
+            json!({"secret": CANARY, "extra": CANARY}),
+            json!({"secret": format!("{CANARY}\u{0}")}),
+        ] {
+            let e = match parse::<SubmitSecretArgs>(&body) {
+                Err(e) => e,
+                Ok(_) => panic!("accepted {body}"),
+            };
+            let shown = format!(
+                "{e:?} {e} {}",
+                serde_json::to_string(&e).unwrap_or_default()
+            );
+            assert!(!shown.contains(CANARY), "{shown}");
+        }
+    }
+
+    fn payload<T>() -> Result<T, CommandError> {
+        Err(CommandError::InvalidArgument {
+            field: FIELD_PAYLOAD,
+        })
+    }
+
+    #[test]
+    fn empty_argument_structs_take_nothing() {
+        assert_eq!(
+            parse::<CredentialContextArgs>(&json!({})),
+            Ok(CredentialContextArgs {})
+        );
+        assert_eq!(
+            parse::<CredentialContextArgs>(&json!({"alias": "b"})),
+            payload()
+        );
+        assert_eq!(
+            parse::<SaveRecoveryNoteArgs>(&json!({"file": "/tmp/x"})),
+            payload()
+        );
+        assert_eq!(
+            parse::<ArchiveAndStartFreshArgs>(&json!({"confirmed": true})),
+            payload()
+        );
+        assert_eq!(parse::<RetryKeychainArgs>(&json!({"now": true})), payload());
+        assert_eq!(
+            parse::<RetryKeychainArgs>(&json!({})),
+            Ok(RetryKeychainArgs {})
+        );
+    }
+
+    #[test]
+    fn keys_per_purpose() {
+        let args = |v: Value| parse::<SubmitSecretArgs>(&v).unwrap_or_else(|e| panic!("{e:?}"));
+        let twelve = "twelve-chars";
+        // First run: the confirmation is required, the expiry refused, the pair checked.
+        assert!(matches!(
+            passphrase_pair(args(json!({ "secret": twelve }))),
+            Err(CommandError::InvalidArgument {
+                field: "secret_confirm"
+            })
+        ));
+        assert!(matches!(
+            passphrase_pair(args(
+                json!({"secret": twelve, "secret_confirm": twelve, "expires_on": "2027-01-01"})
+            )),
+            Err(CommandError::InvalidArgument {
+                field: "expires_on"
+            })
+        ));
+        let mismatch = passphrase_pair(args(
+            json!({"secret": twelve, "secret_confirm": "twelve-charZ"}),
+        ));
+        assert!(matches!(
+            mismatch,
+            Ok(Err(SubmitOutcome::Failed(SubmitFailure {
+                class: "passphrase_mismatch",
+                conn: None
+            })))
+        ));
+        let short = passphrase_pair(args(json!({"secret": "short", "secret_confirm": "short"})));
+        assert!(matches!(
+            short,
+            Ok(Err(SubmitOutcome::Failed(SubmitFailure {
+                class: "passphrase_too_short",
+                ..
+            })))
+        ));
+        assert!(matches!(
+            passphrase_pair(args(json!({"secret": twelve, "secret_confirm": twelve}))),
+            Ok(Ok(_))
+        ));
+        // Unlock: one entry only.
+        assert!(unlock_passphrase(args(json!({ "secret": twelve }))).is_ok());
+        assert!(matches!(
+            unlock_passphrase(args(json!({"secret": twelve, "secret_confirm": twelve}))),
+            Err(CommandError::InvalidArgument {
+                field: "secret_confirm"
+            })
+        ));
+        assert!(matches!(
+            unlock_passphrase(args(json!({"secret": twelve, "expires_on": "2027-01-01"}))),
+            Err(CommandError::InvalidArgument {
+                field: "expires_on"
+            })
+        ));
+    }
+
+    #[test]
+    fn outcomes_have_their_wire_shapes() {
+        let v = |o: &SubmitOutcome| serde_json::to_value(o).unwrap_or_default();
+        assert_eq!(v(&SubmitOutcome::Accepted {}), json!({"accepted": {}}));
+        assert_eq!(v(&SubmitOutcome::Unlocked {}), json!({"unlocked": {}}));
+        assert_eq!(
+            v(&SubmitOutcome::Failed(SubmitFailure::class(
+                "wrong_passphrase"
+            ))),
+            json!({"failed": {"class": "wrong_passphrase"}})
+        );
+        assert_eq!(
+            v(&SubmitOutcome::Failed(connection_failure(
+                &ConnectionFailure::Http401
+            ))),
+            json!({"failed": {"class": "http_401"}})
+        );
+        let ok = SubmitOutcome::Ok(Connected {
+            atlassian_user: "alice".into(),
+            product: "jira",
+            version: "9.12.0".into(),
+            warnings: vec![],
+        });
+        assert_eq!(
+            v(&ok),
+            json!({"ok": {"atlassian_user": "alice", "product": "jira", "version": "9.12.0", "warnings": []}})
+        );
+        let target = PatTarget {
+            alias: "work".into(),
+            product: "jira",
+            origin: "https://jira.example/jira".into(),
+        };
+        let pat = context_dto(&Purpose::ReplacePat(target), Some(4), false);
+        assert_eq!(
+            serde_json::to_value(&pat).unwrap_or_default(),
+            json!({"purpose": "replace_pat", "alias": "work", "product": "jira",
+                   "base_url": "https://jira.example/jira", "refused_count": null,
+                   "product_version_hint": null, "note_available": false})
+        );
+        let locked = context_dto(&Purpose::RecoverThisLog, Some(6), false);
+        assert_eq!(locked.refused_count, Some(6));
+        assert_eq!(locked.alias, None);
+    }
+}

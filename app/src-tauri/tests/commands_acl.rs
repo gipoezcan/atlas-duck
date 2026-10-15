@@ -209,6 +209,83 @@ fn open_window_and_quit_follow_their_grants() -> TestResult {
     Ok(())
 }
 
+/// M6 T20 (Δ1, §10.3): the five credential commands are granted to the `credential` window only;
+/// there the body is checked before the handler (unknown keys, a secret over its bound), and with
+/// no window purpose set by Rust every command answers `not_ready`. The credential window holds no
+/// command of another window.
+#[test]
+fn credential_commands_granted_to_credential_only() -> TestResult {
+    use atlas_duck_app_lib::commands::credential::SECRET_MAX_BYTES;
+    use atlas_duck_app_lib::windows::{NavPolicy, StartupRoute, WindowRegistry};
+    let app = app()?;
+    app.manage(WindowRegistry::new(
+        NavPolicy::for_this_platform(None),
+        StartupRoute::completed(),
+    ));
+    let canary = "canary-acl-secret-3e7d";
+    let calls = [
+        ("credential_context", json!({})),
+        ("submit_secret", json!({ "secret": canary })),
+        ("save_recovery_note", json!({})),
+        ("archive_and_start_fresh", json!({})),
+        ("retry_keychain", json!({})),
+    ];
+    let acl_refused =
+        |r: &Result<Value, Value>| r.as_ref().err().is_some_and(|e| e.get("kind").is_none());
+    for label in [
+        "approvals",
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "setup",
+        "unknown",
+    ] {
+        let w = window(&app, label)?;
+        for (cmd, body) in &calls {
+            let r = invoke(&w, cmd, body.clone());
+            assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
+            assert!(!format!("{r:?}").contains(canary), "{label}: {r:?}");
+        }
+    }
+    let credential = window(&app, "credential")?;
+    let not_ready = Err(json!({"kind": "not_ready"}));
+    for (cmd, body) in &calls {
+        assert_eq!(invoke(&credential, cmd, body.clone()), not_ready, "{cmd}");
+        let mut extra = body.clone();
+        if let Some(m) = extra.as_object_mut() {
+            m.insert("path".into(), json!("/tmp/x"));
+        }
+        assert_eq!(
+            invoke(&credential, cmd, extra),
+            Err(json!({"kind": "invalid_argument", "field": "payload"})),
+            "{cmd}"
+        );
+    }
+    let over = "x".repeat(SECRET_MAX_BYTES + 1);
+    assert_eq!(
+        invoke(&credential, "submit_secret", json!({ "secret": over })),
+        Err(json!({"kind": "invalid_argument", "field": "secret"}))
+    );
+    assert_eq!(
+        invoke(
+            &credential,
+            "submit_secret",
+            json!({"secret": canary, "expires_on": "2027-13-01"})
+        ),
+        Err(json!({"kind": "invalid_argument", "field": "expires_on"}))
+    );
+    for (cmd, body) in [
+        ("app_status", json!({})),
+        ("queue_list", json!({})),
+        ("open_window", json!({"window": "settings"})),
+    ] {
+        let r = invoke(&credential, cmd, body);
+        assert!(acl_refused(&r), "credential: {cmd} {r:?}");
+    }
+    Ok(())
+}
+
 #[test]
 fn not_ready_without_a_serving_core() -> TestResult {
     let app = app()?;

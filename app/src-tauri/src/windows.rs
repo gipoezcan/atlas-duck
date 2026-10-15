@@ -24,6 +24,7 @@ use tauri::webview::NewWindowResponse;
 use tauri::{AppHandle, Manager, Runtime, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
+use crate::credential::{CredentialState, Purpose};
 use crate::early_argv::{EarlyMode, classify_argv};
 use crate::serve;
 use crate::startup::crash::webview_data_dir;
@@ -476,19 +477,43 @@ pub enum WindowError {
     NotRegistered,
     /// The credential window needs a data dir of its own and none exists yet.
     NoDataDir,
+    /// The credential window is open for another purpose; it keeps it (§10.3, M6 T20).
+    Busy,
     Build,
     Show,
 }
 
+impl WindowError {
+    /// The class the log line and the error's text use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowError::NotRegistered => "not_registered",
+            WindowError::NoDataDir => "no_data_dir",
+            WindowError::Busy => "busy",
+            WindowError::Build => "build",
+            WindowError::Show => "show",
+        }
+    }
+}
+
+impl std::fmt::Display for WindowError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for WindowError {}
+
 /// Managed in `setup` (`app.manage`): the navigation policy, the startup routing state and the
-/// credential window's purpose.
+/// credential window's state.
 pub struct WindowRegistry {
     nav: NavPolicy,
     route: Mutex<StartupRoute>,
     /// Serializes [`open`]: one build per label.
     opening: Mutex<()>,
-    /// What the credential window opened for (Task 20 reads it; never set by a webview).
-    credential: Mutex<Option<Unlock>>,
+    /// What the credential window is open for, and its passphrase hand-over (M6 T20): set by
+    /// Rust only (`credential::open`, under `opening`), never by a webview.
+    credential: Mutex<CredentialState>,
     /// One error window at a time.
     error_dialog_open: Arc<AtomicBool>,
 }
@@ -503,7 +528,7 @@ impl WindowRegistry {
             nav,
             route: Mutex::new(route),
             opening: Mutex::new(()),
-            credential: Mutex::new(None),
+            credential: Mutex::new(CredentialState::default()),
             error_dialog_open: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -512,9 +537,23 @@ impl WindowRegistry {
         &self.nav
     }
 
-    /// The purpose the credential window was last opened for by Rust.
-    pub fn credential_unlock(&self) -> Option<Unlock> {
-        *lock(&self.credential)
+    /// The purpose the open credential window has (Rust set it).
+    pub fn credential_purpose(&self) -> Option<Purpose> {
+        lock(&self.credential).purpose().cloned()
+    }
+
+    /// The credential window's state. Taken after `opening` when both are held, never before.
+    pub(crate) fn credential_state(&self) -> std::sync::MutexGuard<'_, CredentialState> {
+        lock(&self.credential)
+    }
+
+    /// The `opening` lock if no open holds it (never waits: for the main thread).
+    pub(crate) fn try_opening(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        match self.opening.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 }
 
@@ -590,13 +629,28 @@ fn build<R: Runtime>(
 /// Opens `label`: builds it the first time (from [`window_spec`] with the locked data dir, if
 /// any), then shows it (§2.5). Never on the main thread (see the module docs).
 pub fn open<R: Runtime>(app: &AppHandle<R>, label: Label, how: Show) -> Result<(), WindowError> {
+    open_with(app, label, how, |_, _| Ok(()))
+}
+
+/// [`open`], with `decide(registry, exists)` run first under the same `opening` lock (`exists`:
+/// the window is built already); its `Err` opens nothing. The credential window decides its
+/// purpose there (`credential::open`), so a purpose and the window it belongs to cannot be set
+/// apart by a second request.
+pub(crate) fn open_with<R: Runtime>(
+    app: &AppHandle<R>,
+    label: Label,
+    how: Show,
+    decide: impl FnOnce(&WindowRegistry, bool) -> Result<(), WindowError>,
+) -> Result<(), WindowError> {
     let registry = app
         .try_state::<WindowRegistry>()
         .ok_or(WindowError::NotRegistered)?;
     let _one_at_a_time = lock(&registry.opening);
-    let result = match app.get_webview_window(label.as_str()) {
-        Some(w) => bring_up(&w, how),
-        None => {
+    let existing = app.get_webview_window(label.as_str());
+    let result = match decide(&registry, existing.is_some()).and(Ok(existing)) {
+        Err(e) => Err(e),
+        Ok(Some(w)) => bring_up(&w, how),
+        Ok(None) => {
             let data = app.try_state::<DataDirHold>().map(|h| h.data().clone());
             window_spec(label, how, data.as_ref(), cfg!(windows))
                 .and_then(|spec| build(app, &spec, registry.nav.clone()))
@@ -607,30 +661,19 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, label: Label, how: Show) -> Result<(
         }
     };
     if let Err(e) = result {
-        log_open_failed(
-            label,
-            match e {
-                WindowError::NotRegistered => "not_registered",
-                WindowError::NoDataDir => "no_data_dir",
-                WindowError::Build => "build",
-                WindowError::Show => "show",
-            },
-        );
+        log_open_failed(label, e.as_str());
     }
     result
 }
 
-/// Opens the credential window for `unlock`; the purpose is fixed here, by Rust (§10.3).
+/// Opens the credential window for `unlock`; the purpose is fixed by Rust, under the window's
+/// `opening` lock (§10.3, `credential::open`).
 pub fn open_credential<R: Runtime>(
     app: &AppHandle<R>,
     unlock: Unlock,
     how: Show,
 ) -> Result<(), WindowError> {
-    let registry = app
-        .try_state::<WindowRegistry>()
-        .ok_or(WindowError::NotRegistered)?;
-    *lock(&registry.credential) = Some(unlock);
-    open(app, Label::Credential, how)
+    crate::credential::open(app, Purpose::from(unlock), how)
 }
 
 /// The app's state for the relaunch routing.

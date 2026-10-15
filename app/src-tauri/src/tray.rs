@@ -248,6 +248,13 @@ pub fn on_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
                 let _ = window.hide();
             }
         }
+        // M6 T20: a destroyed credential window takes its purpose and a pending passphrase
+        // request with it (the next one is built for its own purpose).
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } if label == Label::Credential.as_str() => crate::credential::window_destroyed(app),
         // PD-75: whenever the Approvals window gains the focus the page hears whether it was
         // requested. One the engine took (`Show::FocusUnrequested`) already announced
         // `requested: false`, and the page keeps the stricter of the two; any other (the user's

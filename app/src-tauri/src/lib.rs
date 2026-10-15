@@ -10,6 +10,7 @@ pub mod attention;
 pub mod commands;
 pub mod compose;
 pub mod confirm;
+pub mod credential;
 pub mod csp;
 pub mod diag;
 pub mod early_argv;

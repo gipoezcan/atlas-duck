@@ -1,0 +1,601 @@
+//! The credential-entry window, Rust side (§10.3, §7.1, §8.6, §8.7; C.10 + Δ1; M6 T20).
+//!
+//! Rust fixes what the window is for when it opens it ([`Purpose`], kept in the
+//! `WindowRegistry` under its `opening` lock) and never takes it from the triggering window: a
+//! settings page can ask for "the PAT of alias A", but the alias, product and normalized base URL
+//! the window shows and tests against are the ones Rust read from the instance table then
+//! ([`PatTarget`]). While the window is open its purpose stays; another request is refused
+//! ([`WindowError::Busy`]), except that the lock states may follow each other (the keychain retry
+//! can move `keychain_unavailable` to `keychain_lost`), which re-announces the context
+//! (`credential_context_changed`).
+//!
+//! Secrets enter only through `submit_secret` (`commands::credential`) as `secrecy::SecretString`
+//! and leave Rust never: a PAT goes to `InstanceAdmin::set_token`, the first-run recovery
+//! passphrase to the wizard through [`request_recovery_passphrase`]'s in-memory channel (Task 23),
+//! the passphrase of "Recover this log" / "Finish restore" to the audit store
+//! (`serve::unlock`). The recovery note ([`note_text`]) is built from facts that hold no secret.
+
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+use atlas_duck_audit::{ArchivedDb, LockedReason, RecoveryOffer};
+use atlas_duck_core::config::instances::product_str;
+use atlas_duck_core::{AdminError, GateState, InstanceView, UiEvent};
+use secrecy::{ExposeSecret, SecretString};
+use tauri::{AppHandle, Manager, Runtime};
+use tokio::sync::oneshot;
+
+use crate::ui_sink::{EventOut, wire};
+use crate::windows::{self, Label, Show, Unlock, WindowError, WindowRegistry};
+
+/// The minimum length of the recovery passphrase in characters (§8.6; the audit store counts the
+/// NFC form and has the last word when it wraps the KEK).
+pub use atlas_duck_audit::MIN_PASSPHRASE_CHARS;
+
+/// §8.6 (verbatim): the one fixed line that states the recovery passphrase's purpose, shown at
+/// entry and printed at the top of the recovery note.
+pub const PASSPHRASE_PURPOSE: &str = "Unlocks and restores the audit log (after a keychain loss, from a backup, or on a new machine). Stored tokens are never recovered (from a backup or after a keychain loss); you re-enter them. It is not your Atlassian password. Store it where your compliance owner can retrieve it.";
+
+/// The PAT a credential window takes: the instance as Rust read it when it opened the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatTarget {
+    pub alias: String,
+    /// `jira` | `confluence`.
+    pub product: &'static str,
+    /// The normalized base URL in force when the window opened (§7.1).
+    pub origin: String,
+}
+
+/// What the credential window is open for (§10.3 context header). Fixed by Rust when it opens
+/// the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Purpose {
+    AddPat(PatTarget),
+    ReplacePat(PatTarget),
+    /// The first-run recovery passphrase, entered twice (§8.6, wizard step (1b)).
+    RecoveryPassphrase,
+    /// Locked `keychain_unavailable`: nothing to type in v1 (L39); the window offers "Retry
+    /// keychain" (PD-89) and Quit.
+    Unlock,
+    /// Locked `keychain_lost`: "Recover this log" with the store's recovery passphrase (§8.7).
+    RecoverThisLog,
+    /// Locked `keychain_lost` after an unfinished restore: "Finish restore" (§8.7).
+    FinishRestore,
+}
+
+impl Purpose {
+    /// The wire name `credential_context` reports.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Purpose::AddPat(_) => "add_pat",
+            Purpose::ReplacePat(_) => "replace_pat",
+            Purpose::RecoveryPassphrase => "recovery_passphrase",
+            Purpose::Unlock => "unlock",
+            Purpose::RecoverThisLog => "recover_this_log",
+            Purpose::FinishRestore => "finish_restore",
+        }
+    }
+
+    /// The three locked-mode purposes (§2.5): Rust moves between them as the lock changes.
+    pub fn is_lock_state(&self) -> bool {
+        matches!(
+            self,
+            Purpose::Unlock | Purpose::RecoverThisLog | Purpose::FinishRestore
+        )
+    }
+
+    pub fn pat_target(&self) -> Option<&PatTarget> {
+        match self {
+            Purpose::AddPat(t) | Purpose::ReplacePat(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+impl From<Unlock> for Purpose {
+    fn from(u: Unlock) -> Purpose {
+        match u {
+            Unlock::Unlock => Purpose::Unlock,
+            Unlock::Recover => Purpose::RecoverThisLog,
+            Unlock::FinishRestore => Purpose::FinishRestore,
+        }
+    }
+}
+
+/// The purpose a gate state opens the credential window for (§2.5, §8.7): the three unlockable
+/// lock states; `keyring_not_local` has nothing to unlock (its error window instead), and no other
+/// state opens it.
+pub fn purpose_for_gate(state: GateState) -> Option<Purpose> {
+    match state {
+        GateState::Locked(LockedReason::KeychainUnavailable) => Some(Purpose::Unlock),
+        GateState::Locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::RecoverThisLog,
+        }) => Some(Purpose::RecoverThisLog),
+        GateState::Locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::FinishRestore,
+        }) => Some(Purpose::FinishRestore),
+        _ => None,
+    }
+}
+
+/// The first-run recovery passphrase, both entries (§8.6: the store unwraps the KEK once with
+/// the second and compares before it commits). `Debug` shows neither.
+#[derive(Debug)]
+pub struct FirstRunPassphrase {
+    pub passphrase: SecretString,
+    pub confirm: SecretString,
+}
+
+/// Why a first-run passphrase pair was refused (the window says so and stays open).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassphraseRefusal {
+    TooShort,
+    Mismatch,
+}
+
+impl PassphraseRefusal {
+    pub fn class(self) -> &'static str {
+        match self {
+            PassphraseRefusal::TooShort => "passphrase_too_short",
+            PassphraseRefusal::Mismatch => "passphrase_mismatch",
+        }
+    }
+}
+
+/// The window's own check of a first-run pair: at least [`MIN_PASSPHRASE_CHARS`] characters,
+/// typed twice the same. The audit store checks again (on the NFC form) when it wraps the KEK.
+pub fn check_passphrase_pair(
+    passphrase: &SecretString,
+    confirm: &SecretString,
+) -> Result<(), PassphraseRefusal> {
+    if passphrase.expose_secret().chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(PassphraseRefusal::TooShort);
+    }
+    if passphrase.expose_secret() != confirm.expose_secret() {
+        return Err(PassphraseRefusal::Mismatch);
+    }
+    Ok(())
+}
+
+/// The credential window's state, kept in the `WindowRegistry` (one lock with the window's
+/// build, `windows::open_with`).
+#[derive(Debug, Default)]
+pub struct CredentialState {
+    pub(crate) purpose: Option<Purpose>,
+    /// The wizard's end of a first-run passphrase request (Task 23).
+    passphrase: Option<oneshot::Sender<FirstRunPassphrase>>,
+    /// The first-run passphrase went to the wizard (the recovery note becomes available once a
+    /// store serves).
+    handed_over: bool,
+    /// "Archive old DB and start fresh" moved this store aside; the wizard's `GENESIS` names it
+    /// (Task 23 takes it). Kept when the window closes.
+    archived: Option<ArchivedDb>,
+}
+
+impl CredentialState {
+    pub fn purpose(&self) -> Option<&Purpose> {
+        self.purpose.as_ref()
+    }
+
+    /// A new window: the purpose and the passphrase request of the old one go (a dropped sender
+    /// tells the wizard the window closed); an archived store stays for the wizard.
+    fn reset(&mut self) {
+        self.purpose = None;
+        self.passphrase = None;
+        self.handed_over = false;
+    }
+}
+
+fn registry<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<tauri::State<'_, WindowRegistry>, WindowError> {
+    app.try_state::<WindowRegistry>()
+        .ok_or(WindowError::NotRegistered)
+}
+
+/// `credential_context_changed` (C.10; no payload): the page reads `credential_context` again.
+pub fn context_changed<R: Runtime>(app: &AppHandle<R>) {
+    let (name, payload) = wire(&UiEvent::CredentialContextChanged);
+    EventOut::emit(app, name, payload);
+}
+
+/// Opens the credential window for `purpose` (§10.3), deciding under the registry's `opening`
+/// lock: no window yet → this purpose; the same purpose → shown again; one lock state for
+/// another → the new one, announced; anything else while the window is open → `Busy` (the open
+/// window keeps its purpose). Never on the main thread (it builds the window).
+pub fn open<R: Runtime>(
+    app: &AppHandle<R>,
+    purpose: Purpose,
+    how: Show,
+) -> Result<(), WindowError> {
+    open_inner(app, purpose, None, how)
+}
+
+fn open_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    purpose: Purpose,
+    passphrase: Option<oneshot::Sender<FirstRunPassphrase>>,
+    how: Show,
+) -> Result<(), WindowError> {
+    enum Decide {
+        New,
+        Same,
+        NextLockState,
+        Busy,
+    }
+    let mut announce = false;
+    let opened = windows::open_with(app, Label::Credential, how, |registry, exists| {
+        let mut st = registry.credential_state();
+        let decide = match (st.purpose.as_ref(), exists) {
+            (_, false) => Decide::New,
+            (Some(current), true) if *current == purpose => Decide::Same,
+            (Some(current), true) if current.is_lock_state() && purpose.is_lock_state() => {
+                Decide::NextLockState
+            }
+            (_, true) => Decide::Busy,
+        };
+        match decide {
+            Decide::Busy => return Err(WindowError::Busy),
+            Decide::Same => {}
+            Decide::NextLockState => {
+                st.purpose = Some(purpose);
+                announce = true;
+            }
+            Decide::New => {
+                st.reset();
+                st.purpose = Some(purpose);
+            }
+        }
+        if passphrase.is_some() {
+            st.passphrase = passphrase;
+            st.handed_over = false;
+        }
+        Ok(())
+    });
+    if announce {
+        context_changed(app);
+    }
+    opened
+}
+
+/// Asks for the first-run recovery passphrase (§2.5 wizard step (1b), §8.6; Task 23): opens the
+/// window for [`Purpose::RecoveryPassphrase`] and returns the wizard's end of the in-memory
+/// channel `submit_secret` hands the checked pair to (never a command response). The receiver
+/// errors when the window closes before a pair was accepted.
+pub fn request_recovery_passphrase<R: Runtime>(
+    app: &AppHandle<R>,
+    how: Show,
+) -> Result<oneshot::Receiver<FirstRunPassphrase>, WindowError> {
+    let (tx, rx) = oneshot::channel();
+    open_inner(app, Purpose::RecoveryPassphrase, Some(tx), how)?;
+    Ok(rx)
+}
+
+/// The purpose the open window has (`None`: no window, or the registry is missing).
+pub fn current_purpose<R: Runtime>(app: &AppHandle<R>) -> Option<Purpose> {
+    registry(app)
+        .ok()
+        .and_then(|r| r.credential_state().purpose.clone())
+}
+
+/// True once the first-run passphrase went to the wizard (this window).
+pub fn handed_over<R: Runtime>(app: &AppHandle<R>) -> bool {
+    registry(app).is_ok_and(|r| r.credential_state().handed_over)
+}
+
+/// Hands a checked first-run pair to the wizard. `Err(pair)` when no wizard waits (no request, or
+/// its receiver is gone): the pair is dropped (zeroized) by the caller.
+pub fn hand_over<R: Runtime>(
+    app: &AppHandle<R>,
+    pair: FirstRunPassphrase,
+) -> Result<(), FirstRunPassphrase> {
+    let Ok(registry) = registry(app) else {
+        return Err(pair);
+    };
+    let mut st = registry.credential_state();
+    if st.purpose != Some(Purpose::RecoveryPassphrase) {
+        return Err(pair);
+    }
+    let Some(tx) = st.passphrase.take() else {
+        return Err(pair);
+    };
+    tx.send(pair)?;
+    st.handed_over = true;
+    Ok(())
+}
+
+/// Keeps the store "Archive old DB and start fresh" moved aside, for the wizard (Task 23).
+pub fn set_archived<R: Runtime>(app: &AppHandle<R>, archived: ArchivedDb) {
+    if let Ok(r) = registry(app) {
+        r.credential_state().archived = Some(archived);
+    }
+}
+
+/// The archived store the next `GENESIS` names (§8.7), once (Task 23).
+pub fn take_archived<R: Runtime>(app: &AppHandle<R>) -> Option<ArchivedDb> {
+    registry(app)
+        .ok()
+        .and_then(|r| r.credential_state().archived.take())
+}
+
+/// The window was destroyed (closed by the user or by Rust): its purpose and a pending
+/// passphrase request go (`tray::on_run_event`; Tauri forgets the window before that callback
+/// runs). A window built again since then has its own purpose, which stays. Runs on the main
+/// thread, so it never waits for `opening` (an open holding it waits for the main thread to build
+/// its window): while an open runs, that open has decided the state already (a new window resets
+/// it there).
+pub fn window_destroyed<R: Runtime>(app: &AppHandle<R>) {
+    let Ok(r) = registry(app) else {
+        return;
+    };
+    let Some(_no_open_running) = r.try_opening() else {
+        return;
+    };
+    if app.get_webview_window(Label::Credential.as_str()).is_none() {
+        r.credential_state().reset();
+    }
+}
+
+/// Forgets the window's purpose, then destroys the window (its webview and anything typed in it,
+/// §10.1): from here on its commands answer `not_ready`. Off the main thread.
+pub fn close<R: Runtime>(app: &AppHandle<R>) {
+    if let Ok(r) = registry(app) {
+        r.credential_state().reset();
+    }
+    if let Some(w) = app.get_webview_window(Label::Credential.as_str()) {
+        let _ = w.destroy();
+    }
+}
+
+/// The PAT target of `alias` from the instance list (§7.1, §10.3): refused for an unknown alias,
+/// an `http://` instance (`insecure_scheme`) and an instance whose origin is not natively
+/// confirmed yet (`instance_unconfirmed`), so the window cannot open for them.
+pub fn pat_target(views: &[InstanceView], alias: &str) -> Result<PatTarget, AdminError> {
+    let view = views
+        .iter()
+        .find(|v| v.alias == alias)
+        .ok_or(AdminError::NotFound)?;
+    match view.state {
+        "insecure_scheme" => return Err(AdminError::InsecureScheme),
+        "instance_unconfirmed" => return Err(AdminError::Unconfirmed),
+        _ => {}
+    }
+    let origin = view.origin.clone().ok_or(AdminError::Unconfirmed)?;
+    Ok(PatTarget {
+        alias: view.alias.clone(),
+        product: product_str(view.product),
+        origin,
+    })
+}
+
+/// Why the window did not open for a PAT.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PatOpenError {
+    Instance(AdminError),
+    Window(WindowError),
+}
+
+/// The kind only (an `AdminError` is shown by its kind, never a message).
+impl std::fmt::Display for PatOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PatOpenError::Instance(e) => write!(f, "instance: {e}"),
+            PatOpenError::Window(e) => write!(f, "window: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for PatOpenError {}
+
+/// Opens the window to add (or replace) the PAT of `alias` (the Settings trigger, Task 25). The
+/// instance list is read here, by Rust; `views` is `InstanceAdmin::list()` (a sync call: the
+/// caller runs on the blocking pool, which this needs anyway to build the window).
+pub fn open_for_pat<R: Runtime>(
+    app: &AppHandle<R>,
+    views: &[InstanceView],
+    alias: &str,
+    replace: bool,
+) -> Result<(), PatOpenError> {
+    let target = pat_target(views, alias).map_err(PatOpenError::Instance)?;
+    let purpose = if replace {
+        Purpose::ReplacePat(target)
+    } else {
+        Purpose::AddPat(target)
+    };
+    open(app, purpose, Show::Focus).map_err(PatOpenError::Window)
+}
+
+// ---------- the recovery note (§8.6) ----------
+
+/// What the recovery note names. Nothing here is secret, and nothing secret can be passed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteFacts {
+    pub host: String,
+    pub os_user: String,
+    pub install_id: String,
+    pub chain_id: String,
+    pub data_dir: String,
+}
+
+/// plan text (T20): the file name the save dialog proposes.
+pub const NOTE_FILE_NAME: &str = "atlas-duck-recovery-note.txt";
+/// plan text (T20): the title of the recovery note.
+const NOTE_TITLE: &str = "atlas-duck recovery note";
+/// plan text (T20): the recovery and restore steps the note gives (§8.7 "Recover this log",
+/// "Archive old DB and start fresh", §8.11 restore).
+const NOTE_STEPS: &str = "\
+If this machine's keychain is lost (password reset, profile wipe, reinstall), atlas-duck starts locked and its credential window offers \"Recover this log\": enter the recovery passphrase. The log is verified, an integrity incident is recorded (it needs an acknowledgement), and every stored token must be entered again.
+After an interrupted restore the window offers \"Finish restore\": enter the recovery passphrase of the restored backup.
+To move to a new machine, or to go back to a backup: restore the full backup in atlas-duck and enter that backup's recovery passphrase. Tokens are never restored; enter them again.
+Without the passphrase the only way on is \"Archive old DB and start fresh\": the old log is moved to the archived folder of the data directory, never deleted. Keep it for its retention period; it can be read later only with this passphrase.";
+
+/// The recovery note (§8.6): the purpose line, host, OS user, `install_id`, `chain_id`, the data
+/// directory, the recovery and restore steps, and a blank line to write the passphrase on by
+/// hand. It never contains the passphrase: this function cannot be given one.
+pub fn note_text(f: &NoteFacts) -> String {
+    format!(
+        "{NOTE_TITLE}\n\n{PASSPHRASE_PURPOSE}\n\nHost: {}\nOS user: {}\ninstall_id: {}\nchain_id: {}\nData directory: {}\n\n{NOTE_STEPS}\n\nRecovery passphrase (write it here by hand):\n\n________________________________________\n",
+        f.host, f.os_user, f.install_id, f.chain_id, f.data_dir
+    )
+}
+
+/// The OS user the note names (best effort; never fails).
+pub fn os_user() -> String {
+    ["USERNAME", "USER", "LOGNAME"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::windows::{AppSnapshot, Relaunch, route_relaunch};
+
+    fn locked(r: LockedReason) -> GateState {
+        GateState::Locked(r)
+    }
+
+    /// U-18 (window half): a wiped keychain leaves the store locked `keychain_lost`; the credential
+    /// window it opens (at startup, from the tray's "Unlock…" and on a relaunch) offers "Recover
+    /// this log".
+    #[test]
+    fn u18_keychain_lost_opens_recover_this_log() {
+        let lost = locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::RecoverThisLog,
+        });
+        assert_eq!(purpose_for_gate(lost), Some(Purpose::RecoverThisLog));
+        let routed = route_relaunch(&AppSnapshot::Gate(lost), &[]);
+        assert_eq!(routed, Relaunch::OpenCredential(Unlock::Recover));
+        let Relaunch::OpenCredential(unlock) = routed else {
+            panic!("{routed:?}");
+        };
+        assert_eq!(Purpose::from(unlock), Purpose::RecoverThisLog);
+        assert_eq!(Purpose::RecoverThisLog.as_str(), "recover_this_log");
+    }
+
+    #[test]
+    fn finish_restore_offer_opens_finish_restore() {
+        let unfinished = locked(LockedReason::KeychainLost {
+            offer: RecoveryOffer::FinishRestore,
+        });
+        assert_eq!(purpose_for_gate(unfinished), Some(Purpose::FinishRestore));
+        let routed = route_relaunch(&AppSnapshot::Gate(unfinished), &[]);
+        assert_eq!(routed, Relaunch::OpenCredential(Unlock::FinishRestore));
+        assert_eq!(Purpose::from(Unlock::FinishRestore), Purpose::FinishRestore);
+        assert_eq!(Purpose::FinishRestore.as_str(), "finish_restore");
+    }
+
+    /// Every gate state: the mapping here and the relaunch routing agree on which states open the
+    /// credential window and for what.
+    #[test]
+    fn purpose_for_gate_agrees_with_the_relaunch_routing() {
+        let states = [
+            GateState::FirstRun,
+            GateState::StoreNewer,
+            GateState::ShuttingDown,
+            GateState::NotConfigured("data_dir_missing"),
+            locked(LockedReason::KeychainUnavailable),
+            locked(LockedReason::KeyringNotLocal),
+            locked(LockedReason::KeychainLost {
+                offer: RecoveryOffer::RecoverThisLog,
+            }),
+            locked(LockedReason::KeychainLost {
+                offer: RecoveryOffer::FinishRestore,
+            }),
+        ];
+        for s in states {
+            let routed = match route_relaunch(&AppSnapshot::Gate(s), &[]) {
+                Relaunch::OpenCredential(u) => Some(Purpose::from(u)),
+                _ => None,
+            };
+            assert_eq!(purpose_for_gate(s), routed, "{s:?}");
+            if let Some(p) = routed {
+                assert!(p.is_lock_state(), "{s:?}");
+            }
+        }
+        assert_eq!(
+            purpose_for_gate(locked(LockedReason::KeychainUnavailable)),
+            Some(Purpose::Unlock)
+        );
+        assert_eq!(
+            purpose_for_gate(locked(LockedReason::KeyringNotLocal)),
+            None
+        );
+    }
+
+    #[test]
+    fn purposes_have_distinct_wire_names_and_lock_states() {
+        let t = PatTarget {
+            alias: "a".into(),
+            product: "jira",
+            origin: "https://jira.example/jira".into(),
+        };
+        let all = [
+            Purpose::AddPat(t.clone()),
+            Purpose::ReplacePat(t.clone()),
+            Purpose::RecoveryPassphrase,
+            Purpose::Unlock,
+            Purpose::RecoverThisLog,
+            Purpose::FinishRestore,
+        ];
+        let names: std::collections::BTreeSet<&str> = all.iter().map(Purpose::as_str).collect();
+        assert_eq!(names.len(), all.len());
+        let lock: Vec<&str> = all
+            .iter()
+            .filter(|p| p.is_lock_state())
+            .map(Purpose::as_str)
+            .collect();
+        assert_eq!(lock, ["unlock", "recover_this_log", "finish_restore"]);
+        assert_eq!(all[0].pat_target(), Some(&t));
+        assert_eq!(all[2].pat_target(), None);
+    }
+
+    #[test]
+    fn passphrase_pair_needs_twelve_characters_twice() {
+        let s = |v: &str| SecretString::from(v);
+        let twelve = "abcdefghijkl";
+        assert_eq!(check_passphrase_pair(&s(twelve), &s(twelve)), Ok(()));
+        // Characters, not bytes: twelve two-byte characters pass, eleven do not.
+        let wide = "é".repeat(12);
+        assert_eq!(check_passphrase_pair(&s(&wide), &s(&wide)), Ok(()));
+        let short = "é".repeat(11);
+        assert_eq!(
+            check_passphrase_pair(&s(&short), &s(&short)),
+            Err(PassphraseRefusal::TooShort)
+        );
+        assert_eq!(
+            check_passphrase_pair(&s(twelve), &s("abcdefghijkL")),
+            Err(PassphraseRefusal::Mismatch)
+        );
+        assert_eq!(
+            check_passphrase_pair(&s(twelve), &s("")),
+            Err(PassphraseRefusal::Mismatch)
+        );
+        assert_eq!(MIN_PASSPHRASE_CHARS, 12);
+        // The pair's `Debug` shows neither entry.
+        let pair = FirstRunPassphrase {
+            passphrase: s("canary-passphrase-1"),
+            confirm: s("canary-passphrase-1"),
+        };
+        assert!(!format!("{pair:?}").contains("canary"), "{pair:?}");
+    }
+
+    #[test]
+    fn note_text_names_the_install_and_leaves_the_passphrase_line_blank() {
+        let f = NoteFacts {
+            host: "build-01".into(),
+            os_user: "alice".into(),
+            install_id: "0123456789abcdef0123456789abcdef".into(),
+            chain_id: "fedcba9876543210fedcba9876543210".into(),
+            data_dir: "/home/alice/.local/share/atlas-duck".into(),
+        };
+        let text = note_text(&f);
+        assert!(text.contains(PASSPHRASE_PURPOSE));
+        for v in [&f.host, &f.os_user, &f.install_id, &f.chain_id, &f.data_dir] {
+            assert!(text.contains(v.as_str()), "{v}");
+        }
+        assert!(text.contains("Recover this log") && text.contains("Finish restore"));
+        assert!(text.ends_with("Recovery passphrase (write it here by hand):\n\n________________________________________\n"));
+        assert!(PASSPHRASE_PURPOSE.starts_with("Unlocks and restores the audit log"));
+    }
+}

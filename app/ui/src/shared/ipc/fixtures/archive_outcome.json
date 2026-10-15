@@ -1,0 +1,12 @@
+[
+  {
+    "archived": {
+      "archived_file": "archived/audit-0123456789abcdef0123456789abcdef-42-20261015T093000123Z.db"
+    }
+  },
+  {
+    "failed": {
+      "class": "cancelled"
+    }
+  }
+]

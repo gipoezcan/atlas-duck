@@ -11,7 +11,12 @@ use atlas_duck_app_lib::commands::CommandError;
 use atlas_duck_app_lib::commands::approvals::{
     DenyCount, QueueDetail, RawPageDto, RedactionContextDto,
 };
+use atlas_duck_app_lib::commands::credential::{
+    ArchiveOutcome, CLASS_CONTEXT_CHANGED, Connected, CredentialContextDto, SubmitFailure,
+    SubmitOutcome, connection_failure, context_dto,
+};
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
+use atlas_duck_app_lib::credential::{PatTarget, Purpose};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
 use atlas_duck_core::engine::write::CONFLICT_DENY_PREFILL;
@@ -496,6 +501,8 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Admin(AdminError::ConnectionFailed(ConnectionFailure::Network(
             ConnClass::ConnectTimeout,
         ))),
+        // M3 M-4 / T9: an admin call after the shutdown began.
+        CommandError::Admin(AdminError::ShuttingDown),
         // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
         CommandError::ReleaseBlocked,
         CommandError::Internal,
@@ -664,6 +671,55 @@ fn raw_pages() -> Vec<RawPageDto> {
     ]
 }
 
+/// `credential_context` (M6 T20): a PAT purpose, a locked one, the first-run one after `GENESIS`.
+fn credential_contexts() -> Vec<CredentialContextDto> {
+    let target = PatTarget {
+        alias: "work".into(),
+        product: "jira",
+        origin: "https://jira.example/jira".into(),
+    };
+    vec![
+        context_dto(&Purpose::ReplacePat(target), None, false),
+        context_dto(&Purpose::RecoverThisLog, Some(3), false),
+        context_dto(&Purpose::Unlock, Some(0), false),
+        context_dto(&Purpose::RecoveryPassphrase, Some(1), true),
+    ]
+}
+
+/// `submit_secret` (M6 T20): every outcome shape; never a secret.
+fn submit_outcomes() -> Vec<SubmitOutcome> {
+    vec![
+        SubmitOutcome::Ok(Connected {
+            atlassian_user: "alice".into(),
+            product: "jira",
+            version: "9.4.0".into(),
+            warnings: vec!["Jira 9.12 or newer is recommended; this server reports 9.4.0.".into()],
+        }),
+        SubmitOutcome::Accepted {},
+        SubmitOutcome::Unlocked {},
+        SubmitOutcome::Failed(connection_failure(&ConnectionFailure::Tls(
+            ConnClass::TlsUnknownIssuer,
+        ))),
+        SubmitOutcome::Failed(connection_failure(
+            &ConnectionFailure::IdentityHeaderMissing,
+        )),
+        SubmitOutcome::Failed(SubmitFailure::class("wrong_passphrase")),
+        SubmitOutcome::Failed(SubmitFailure::class("passphrase_mismatch")),
+        SubmitOutcome::Failed(SubmitFailure::class(CLASS_CONTEXT_CHANGED)),
+    ]
+}
+
+/// `archive_and_start_fresh` (M6 T20).
+fn archive_outcomes() -> Vec<ArchiveOutcome> {
+    vec![
+        ArchiveOutcome::Archived {
+            archived_file:
+                "archived/audit-0123456789abcdef0123456789abcdef-42-20261015T093000123Z.db".into(),
+        },
+        ArchiveOutcome::Failed(SubmitFailure::class("cancelled")),
+    ]
+}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ui/src/shared/ipc/fixtures")
 }
@@ -675,8 +731,10 @@ fn value<T: Serialize>(items: &[T]) -> Result<Value, serde_json::Error> {
 /// Every fixture: file name (without `.json`) and its value.
 fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
     Ok(vec![
+        ("archive_outcome", value(&archive_outcomes())?),
         ("batch_outcome", value(&batch_outcomes())?),
         ("command_error", value(&command_errors())?),
+        ("credential_context", value(&credential_contexts())?),
         ("decision_outcome", value(&decision_outcomes())?),
         ("deny_count", value(&deny_counts())?),
         ("preview", value(&previews())?),
@@ -687,6 +745,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("redaction_context", value(&redaction_contexts())?),
         ("redaction_report", value(&redaction_reports())?),
         ("status_line", value(&status_lines())?),
+        ("submit_outcome", value(&submit_outcomes())?),
     ])
 }
 

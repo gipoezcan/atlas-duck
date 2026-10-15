@@ -14,6 +14,7 @@ pub mod approvals;
 mod blocking;
 #[cfg(feature = "scripted-approver")]
 pub mod capture;
+pub mod credential;
 pub mod dto;
 mod errors;
 mod names;
@@ -49,6 +50,11 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         approvals::raw_page,
         approvals::recent_list,
         approvals::redaction_preview,
+        credential::archive_and_start_fresh,
+        credential::credential_context,
+        credential::retry_keychain,
+        credential::save_recovery_note,
+        credential::submit_secret,
         window::open_window,
         window::quit
     ])

@@ -1,0 +1,44 @@
+[
+  {
+    "ok": {
+      "atlassian_user": "alice",
+      "product": "jira",
+      "version": "9.4.0",
+      "warnings": [
+        "Jira 9.12 or newer is recommended; this server reports 9.4.0."
+      ]
+    }
+  },
+  {
+    "accepted": {}
+  },
+  {
+    "unlocked": {}
+  },
+  {
+    "failed": {
+      "class": "tls",
+      "conn": "tls_unknown_issuer"
+    }
+  },
+  {
+    "failed": {
+      "class": "identity_header_missing"
+    }
+  },
+  {
+    "failed": {
+      "class": "wrong_passphrase"
+    }
+  },
+  {
+    "failed": {
+      "class": "passphrase_mismatch"
+    }
+  },
+  {
+    "failed": {
+      "class": "context_changed"
+    }
+  }
+]
