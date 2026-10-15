@@ -41,6 +41,10 @@ export function errorText(e: unknown): string {
     }
     return (typeof inner === 'string' ? own(t.errors, inner) : undefined) ?? t.errors.other ?? '';
   }
+  if (err.kind === 'cli_install') {
+    const inner = err.error?.kind;
+    return (typeof inner === 'string' ? own(t.cli_errors, inner) : undefined) ?? t.cli_errors.other ?? '';
+  }
   return own(t.errors, err.kind) ?? t.errors.internal ?? '';
 }
 

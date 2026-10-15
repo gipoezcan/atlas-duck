@@ -7,6 +7,7 @@
 compile_error!("scripted-approver must never reach a release build");
 
 pub mod attention;
+pub mod cli_install;
 pub mod commands;
 pub mod compose;
 pub mod confirm;

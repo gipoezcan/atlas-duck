@@ -1,0 +1,14 @@
+[
+  {
+    "outcome": "installed"
+  },
+  {
+    "outcome": "already_installed"
+  },
+  {
+    "outcome": "removed"
+  },
+  {
+    "outcome": "already_on_path"
+  }
+]

@@ -495,7 +495,29 @@ export const SETTINGS_TEXT = {
   cli_not_installed: 'The atlas-duck command is not on your PATH.',
   cli_install: 'Install CLI to PATH',
   cli_uninstall: 'Remove CLI from PATH',
-  cli_pending: 'Not available in this build yet.',
+  /** What `cli_install` / `cli_uninstall` did (spec 12.3), by the answer's fixed word. */
+  cli_outcomes: {
+    installed:
+      'Installed. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
+    already_installed: 'The atlas-duck command was already installed.',
+    removed: 'Removed. New terminals no longer find the atlas-duck command.',
+    already_on_path:
+      'The atlas-duck command comes with the package and is already on your PATH: there is nothing to install or remove.',
+  } as const,
+  /** Why the install or its removal failed, by core-of-the-app error kind (`cli_install` errors). */
+  cli_errors: {
+    no_stable_path:
+      'atlas-duck cannot tell which file to put on your PATH: start it from the installed app (or the AppImage file itself) and try again',
+    unsafe_path:
+      'The install location has a character that cannot be put on the PATH safely (for example a semicolon or a quote): move the app to another folder',
+    occupied:
+      'A file or link named atlas-duck is already in the way and was left alone: remove it and try again',
+    unsupported: 'Installing to the PATH is not supported on this system',
+    registry: 'Your user PATH could not be read or changed',
+    io: 'The command file could not be written or removed',
+    cli_toml: 'The file that records where the app is could not be written',
+    other: 'The command line could not be installed or removed',
+  } as Readonly<Record<string, string>>,
   removal: 'Prepare for removal',
   removal_button: 'Prepare for removal',
   removal_pending: 'Not available in this build yet.',

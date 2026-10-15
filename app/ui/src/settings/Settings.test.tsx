@@ -3,6 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { on } from '../shared/ipc/events';
 import {
+  cliInstall,
+  cliUninstall,
   credentialWindowOpen,
   instanceAcceptUrlChange,
   instanceAdd,
@@ -20,6 +22,8 @@ import { Settings } from './Settings';
 import { expiryWarningText } from './text';
 
 vi.mock('../shared/ipc/invoke', () => ({
+  cliInstall: vi.fn(),
+  cliUninstall: vi.fn(),
   settingsGet: vi.fn(),
   settingsApply: vi.fn(),
   instanceAdd: vi.fn(),
@@ -82,6 +86,8 @@ beforeEach(() => {
       return Promise.resolve(() => undefined);
     });
   for (const f of [
+    cliInstall,
+    cliUninstall,
     settingsApply,
     instanceAdd,
     instanceChangeUrl,
@@ -202,10 +208,11 @@ describe('Settings', () => {
     const controls = [...document.querySelectorAll('input, select, button, textarea')];
     expect(controls.length).toBeGreaterThan(8);
     const open = controls.filter((c) => !c.matches(':disabled')).map((c) => c.textContent);
-    // Only the token, re-test and prune buttons stay on (core refuses ConfigReadOnly elsewhere).
+    // Only the token, re-test, prune and CLI buttons stay on: core refuses ConfigReadOnly for what
+    // writes config.toml, and the CLI install records an audit event only.
     for (const c of controls) {
       const name = c.textContent ?? '';
-      const stays = /token|Re-test|Prune backlog/.test(name);
+      const stays = /token|Re-test|Prune backlog|CLI/.test(name);
       expect(c.matches(':disabled'), c.outerHTML).toBe(!stays);
     }
     expect(open.length).toBeGreaterThan(0);
@@ -352,15 +359,85 @@ describe('Settings', () => {
     expect(screen.getByText('the startup probe has not finished')).toBeTruthy();
   });
 
-  it('CLI and removal entries are off stubs per cli_installed', async () => {
-    const { unmount } = await show(plain({}, { cli_installed: true }));
-    expect((screen.getByRole('button', { name: 'Remove CLI from PATH' }) as HTMLButtonElement).disabled).toBe(true);
+  it('the CLI button follows cli_installed and calls the matching command with no arguments', async () => {
+    const { unmount } = await show(plain({}, { cli_installed: false }));
+    const install = screen.getByRole('button', { name: 'Install CLI to PATH' }) as HTMLButtonElement;
+    expect(install.disabled).toBe(false);
+    expect(screen.getByText('The atlas-duck command is not on your PATH.')).toBeTruthy();
+    vi.mocked(cliInstall).mockResolvedValue({ outcome: 'installed' });
+    fireEvent.click(install);
+    await flush();
+    expect(cliInstall).toHaveBeenCalledTimes(1);
+    expect(cliInstall).toHaveBeenCalledWith();
+    expect(cliUninstall).not.toHaveBeenCalled();
+    expect(screen.getByRole('status').textContent).toContain('Open a new terminal');
+    // The window re-reads: the state shown is Rust's, not a local guess.
+    expect(settingsGet).toHaveBeenCalledTimes(2);
     unmount();
-    await show(plain({}, { cli_installed: false }));
-    expect((screen.getByRole('button', { name: 'Install CLI to PATH' }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('button', { name: 'Prepare for removal' }) as HTMLButtonElement).disabled).toBe(true);
+
+    await show(plain({}, { cli_installed: true }));
+    expect(screen.getByText('The atlas-duck command is on your PATH.')).toBeTruthy();
+    vi.mocked(cliUninstall).mockResolvedValue({ outcome: 'removed' });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove CLI from PATH' }));
+    await flush();
+    expect(cliUninstall).toHaveBeenCalledTimes(1);
+    expect(cliUninstall).toHaveBeenCalledWith();
+    expect(cliInstall).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('status').textContent).toContain('Removed');
   });
 
+  it('every CLI outcome has its own fixed text', async () => {
+    const seen = new Set<string>();
+    for (const outcome of ['installed', 'already_installed', 'removed', 'already_on_path'] as const) {
+      const { unmount } = await show(plain({}, { cli_installed: false }));
+      vi.mocked(cliInstall).mockResolvedValue({ outcome });
+      fireEvent.click(screen.getByRole('button', { name: 'Install CLI to PATH' }));
+      await flush();
+      const text = screen.getByRole('status').textContent ?? '';
+      expect(text.length).toBeGreaterThan(10);
+      seen.add(text);
+      unmount();
+    }
+    expect(seen.size).toBe(4);
+  });
+
+  it('a refused CLI install shows a fixed text per error kind and never echoes the wire', async () => {
+    await show(plain({}, { cli_installed: false }));
+    const texts: Record<string, RegExp> = {
+      no_stable_path: /cannot tell which file to put on your PATH/,
+      unsafe_path: /cannot be put on the PATH safely/,
+      occupied: /already in the way and was left alone/,
+      unsupported: /not supported on this system/,
+      registry: /user PATH could not be read or changed/,
+      io: /command file could not be written or removed/,
+      cli_toml: /records where the app is/,
+    };
+    for (const [kind, text] of Object.entries(texts)) {
+      vi.mocked(cliInstall).mockRejectedValue({ kind: 'cli_install', error: { kind } });
+      fireEvent.click(screen.getByRole('button', { name: 'Install CLI to PATH' }));
+      await flush();
+      expect(screen.getByRole('alert').textContent, kind).toMatch(text);
+      // A failed call leaves no success text behind.
+      expect(screen.queryByRole('status')).toBeNull();
+    }
+    // An unknown kind (or hostile text) is the generic line, not the wire string.
+    vi.mocked(cliInstall).mockRejectedValue({ kind: 'cli_install', error: { kind: 'x\u202ey' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Install CLI to PATH' }));
+    await flush();
+    expect(screen.getByRole('alert').textContent).toBe('The command line could not be installed or removed');
+    // The audit record that could not be written is the settings error's own text.
+    vi.mocked(cliInstall).mockRejectedValue({ kind: 'settings', error: { kind: 'audit' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Install CLI to PATH' }));
+    await flush();
+    expect(screen.getByRole('alert').textContent).toBe('The change was refused');
+  });
+
+  it('the CLI buttons stay on under a read-only config, the removal entry is still a stub', async () => {
+    await show(FULL);
+    const cli = FULL.cli_installed ? 'Remove CLI from PATH' : 'Install CLI to PATH';
+    expect((screen.getByRole('button', { name: cli }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('button', { name: 'Prepare for removal' }) as HTMLButtonElement).disabled).toBe(true);
+  });
   it('add instance sends the typed values with no CA data and shows the https hint on refusal', async () => {
     await show(BARE);
     const form = within(screen.getByRole('region', { name: 'Add an instance' }));

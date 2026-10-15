@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import batchOutcome from './fixtures/batch_outcome.json';
+import cliInstallAnswer from './fixtures/cli_install_answer.json';
 import commandError from './fixtures/command_error.json';
 import decisionOutcome from './fixtures/decision_outcome.json';
 import denyCount from './fixtures/deny_count.json';
@@ -21,6 +22,7 @@ import statusLine from './fixtures/status_line.json';
 import {
   arrayOf,
   isBatchOutcome,
+  isCliInstallAnswer,
   isDecisionOutcome,
   isDenyCount,
   isInstanceView,
@@ -57,6 +59,7 @@ describe('fixtures validate against their TS types', () => {
     ['settings_get', settingsGet, arrayOf(isSettingsGet)],
     ['retest_outcome', retestOutcome, arrayOf(isRetestOutcome)],
     ['prune_report', pruneReport, arrayOf(isPruneReport)],
+    ['cli_install_answer', cliInstallAnswer, arrayOf(isCliInstallAnswer)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -193,6 +196,10 @@ describe('fixtures validate against their TS types', () => {
     expect(isPruneReport({ result: 'pruned', count: 1 })).toBe(false);
     expect(isPruneReport({ result: 'skipped', reason: 3 })).toBe(false);
     expect(isPruneReport({ result: 'other' })).toBe(false);
+    expect(isCliInstallAnswer({ outcome: 'installed' })).toBe(true);
+    expect(isCliInstallAnswer({ outcome: 'done' })).toBe(false);
+    expect(isCliInstallAnswer({ outcome: 3 })).toBe(false);
+    expect(isCliInstallAnswer({})).toBe(false);
   });
 
   it('edit_form: every input kind validates, nulls are valid values, a wrong shape is refused', () => {

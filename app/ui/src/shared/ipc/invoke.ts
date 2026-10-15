@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   BatchOutcome,
   CandidateRev,
+  CliInstallAnswer,
   DecisionOutcome,
   DenyCount,
   InstanceAddArgs,
@@ -24,6 +25,7 @@ import type {
 import {
   arrayOf,
   isBatchOutcome,
+  isCliInstallAnswer,
   isDecisionOutcome,
   isDenyCount,
   isInstanceView,
@@ -204,6 +206,16 @@ export function retestToken(alias: string): Promise<RetestOutcome> {
 
 export function pruneBacklogNow(): Promise<PruneReport> {
   return call('prune_backlog_now', {}, isPruneReport);
+}
+
+/** Puts the CLI on the PATH (12.3). Rust decides where; the call carries no path. */
+export function cliInstall(): Promise<CliInstallAnswer> {
+  return call('cli_install', {}, isCliInstallAnswer);
+}
+
+/** Removes what `cliInstall` wrote and `cli.toml`. */
+export function cliUninstall(): Promise<CliInstallAnswer> {
+  return call('cli_uninstall', {}, isCliInstallAnswer);
 }
 
 export function rawPage(

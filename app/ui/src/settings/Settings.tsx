@@ -5,6 +5,7 @@ import { settingsGet } from '../shared/ipc/invoke';
 import type { Confinement, SettingsGet } from '../shared/ipc/types';
 import { SETTINGS_TEXT as T, WINDOW_TITLES } from '../shared/strings';
 import { InstanceForm } from './InstanceForm';
+import { Cli } from './Cli';
 import { Instances } from './Instances';
 import { Limits } from './Limits';
 import { Retention } from './Retention';
@@ -97,7 +98,7 @@ export function Settings() {
       <Limits view={settings} onChanged={reload} readOnly={readOnly} />
       <Retention view={settings} onChanged={reload} readOnly={readOnly} />
       <ConfinementStatus confinement={confinement} />
-      <CliSection installed={cliInstalled} />
+      <Cli installed={cliInstalled} onChanged={reload} />
       <RemovalSection />
     </main>
     </WindowBusyContext.Provider>
@@ -142,20 +143,6 @@ function ConfinementStatus({ confinement }: { confinement: Confinement }) {
           ))}
         </p>
       )}
-    </section>
-  );
-}
-
-/** The CLI install and removal buttons stay off until their commands exist (Task 27). */
-function CliSection({ installed }: { installed: boolean }) {
-  return (
-    <section aria-label={T.cli}>
-      <h2>{T.cli}</h2>
-      <p>{installed ? T.cli_installed : T.cli_not_installed}</p>
-      <button type="button" disabled>
-        {installed ? T.cli_uninstall : T.cli_install}
-      </button>
-      <p>{T.cli_pending}</p>
     </section>
   );
 }

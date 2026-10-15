@@ -4,6 +4,8 @@
   "windows": ["settings"],
   "permissions": [
     "allow-app-status",
+    "allow-cli-install",
+    "allow-cli-uninstall",
     "allow-credential-window-open",
     "allow-instance-accept-url-change",
     "allow-instance-add",

@@ -270,6 +270,19 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test keychain_windows -- --ignored --test-threads=1 --nocapture
 
+      # M6 T27 (§12.3, CI-04 half): the real HKCU registry round trip of "Install CLI to PATH" (append
+      # to the user PATH as REG_EXPAND_SZ, idempotent, remove, WM_SETTINGCHANGE broadcast). It runs
+      # against a scratch key under HKCU (never the runner's own Environment\Path) and is
+      # `#[ignore]`d everywhere else, so it never writes the registry of a developer machine. An
+      # exact name that matches nothing would pass with zero tests, so the log must show the one pass.
+      - name: App CLI install registry round trip (Windows, HKCU scratch key, #[ignore]d)
+        if: runner.os == 'Windows'
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'cli-install-registry.log'
+          cargo test -p atlas-duck-app --features scripted-approver --locked --lib -- --ignored --exact cli_install::windows::tests::real_registry_round_trip --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path $log -Pattern 'test result: ok\. 1 passed' -Quiet)) { throw 'real_registry_round_trip did not run exactly once' }
+
       - name: Core big tests (PD-15, 256 pending requests RSS bound, #[ignore]d)
         if: runner.os == 'Linux'
         run: |

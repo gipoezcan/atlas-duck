@@ -10,6 +10,8 @@ pub const COMMANDS: &[&str] = &[
     "acknowledge_attention",
     "app_status",
     "archive_and_start_fresh",
+    "cli_install",
+    "cli_uninstall",
     "close_credential",
     "credential_context",
     "credential_window_open",

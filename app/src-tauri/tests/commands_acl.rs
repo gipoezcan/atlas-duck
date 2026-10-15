@@ -1642,6 +1642,10 @@ fn settings_bodies() -> Vec<(&'static str, Value, &'static [&'static str])> {
         ),
         ("retest_token", json!({"alias": "work"}), SETTINGS),
         ("prune_backlog_now", json!({}), SETTINGS),
+        // M6 T27 (§12.3): the wizard holds `cli_install` only; removal is Settings'. Both answer
+        // `not_ready` before any machine access: with no serving core nothing is read or written.
+        ("cli_install", json!({}), SETTINGS_AND_SETUP),
+        ("cli_uninstall", json!({}), SETTINGS),
     ]
 }
 
@@ -1706,6 +1710,17 @@ fn settings_commands_granted_to_settings_and_setup_only() -> TestResult {
             invoke(w, "instance_add", b),
             Err(json!({"kind": "invalid_argument", "field": "payload"}))
         );
+    }
+    // The CLI commands take no key: a path, a force flag or anything else is refused as an unknown
+    // field before the handler runs (where the CLI goes is Rust's decision, §10.3).
+    for cmd in ["cli_install", "cli_uninstall"] {
+        for key in ["path", "app_path", "dir", "force"] {
+            assert_eq!(
+                invoke(settings, cmd, json!({ key: "C:\\evil" })),
+                Err(json!({"kind": "invalid_argument", "field": "payload"})),
+                "{cmd} {key}"
+            );
+        }
     }
     for (cmd, body, field) in [
         (
@@ -1819,15 +1834,17 @@ fn ca_file_is_read_bounded_regular_and_non_empty() -> TestResult {
 
 #[cfg(feature = "scripted-approver")]
 mod settings_commands {
+    use atlas_duck_app_lib::cli_install::fake::{FakeOps, State};
+    use atlas_duck_app_lib::cli_install::{Inputs, InstallError, Layout, Platform};
     use atlas_duck_app_lib::commands::CommandError;
     use atlas_duck_app_lib::commands::dto::parse;
     use atlas_duck_app_lib::commands::settings::{
         ConfinementDto, InstanceAcceptUrlChangeArgs, InstanceAddArgs, InstanceChangeUrlArgs,
-        InstanceConfirmConfigArgs, RetestOutcome, RetestTokenArgs, SettingChanges,
-        conclude_instance_call, instance_accept_url_change_dto, instance_add_dto,
-        instance_change_url_dto, instance_confirm_config_dto, instance_set_proxy_dto,
-        pat_open_error, prune_backlog_now_dto, retest_token_dto, settings_apply_dto,
-        settings_get_dto,
+        InstanceConfirmConfigArgs, RetestOutcome, RetestTokenArgs, SettingChanges, cli_install_dto,
+        cli_uninstall_dto, conclude_instance_call, instance_accept_url_change_dto,
+        instance_add_dto, instance_change_url_dto, instance_confirm_config_dto,
+        instance_set_proxy_dto, pat_open_error, prune_backlog_now_dto, retest_token_dto,
+        settings_apply_dto, settings_get_dto,
     };
     use atlas_duck_app_lib::credential::{PatOpenError, open_for_pat};
     use atlas_duck_atlassian::testing::{
@@ -2300,7 +2317,8 @@ mod settings_commands {
     async fn settings_get_and_set_proxy_through_the_commands() -> TestResult {
         let h = Harness::jira().await?;
         let (s, i) = (h.core().settings(), h.instances());
-        let got = blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending())).await?;
+        let got =
+            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), false)).await?;
         assert_eq!(got.instances.len(), 1);
         // The answer is what core's own admin objects say, not a copy of one field.
         assert_eq!(got.settings, h.core().settings().view());
@@ -2319,6 +2337,173 @@ mod settings_commands {
         .map_err(|e| format!("{e:?}"))?;
         let view = blocking(move || instance_set_proxy_dto(&*a, args)).await??;
         assert_eq!(view.proxy_effective.as_deref(), Some("direct"));
+        // The CLI state is the caller's read of the OS, passed through as it is.
+        let (s, i) = (h.core().settings(), h.instances());
+        let got =
+            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), true)).await?;
+        assert!(got.cli_installed);
+        Ok(())
+    }
+
+    /// An AppImage machine: `$APPIMAGE` is the stable file, the running binary is in the mount.
+    fn appimage_layout() -> Result<Layout, Boxed> {
+        let inputs = Inputs {
+            platform: Platform::Linux,
+            home: "/home/u".into(),
+            cli_toml: "/home/u/.config/atlas-duck/cli-h.toml".into(),
+            current_exe: "/tmp/.mount_atlasXYZ/usr/bin/atlas-duck-app".into(),
+            appimage: Some("/home/u/Apps/Atlas Duck.AppImage".into()),
+            appimage_is_file: true,
+        };
+        Ok(Layout::resolve(&inputs).map_err(|e| format!("{e:?}"))?)
+    }
+
+    async fn cli_records(h: &Harness) -> Result<Vec<Value>, Boxed> {
+        Ok(h.events_of(EventType::CONFIG_CHANGED)
+            .await?
+            .into_iter()
+            .filter(|v| v["key"] == "cli_install")
+            .collect())
+    }
+
+    /// §12.3 through the commands: install records `CONFIG_CHANGED {source: app, key: cli_install}`
+    /// (old false, new true) and installs; a second install is a no-op without a record; uninstall
+    /// records (true, false) and leaves the machine as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cli_install_and_uninstall_record_and_change_the_machine() -> TestResult {
+        let h = rig(vec![]).await?;
+        let ops = std::sync::Arc::new(FakeOps::new());
+        let layout = appimage_layout()?;
+        let run = |install: bool| {
+            let (s, o, l) = (h.core().settings(), ops.clone(), layout.clone());
+            blocking(move || {
+                if install {
+                    cli_install_dto(&*s, &*o, Ok(l))
+                } else {
+                    cli_uninstall_dto(&*s, &*o, Ok(l))
+                }
+            })
+        };
+        assert_eq!(run(true).await??.outcome, "installed");
+        assert_eq!(
+            cli_records(&h).await?,
+            vec![
+                json!({"source": "app", "key": "cli_install", "old": {"installed": false},
+                        "new": {"installed": true}, "applied": true})
+            ]
+        );
+        let installed = ops.state();
+        assert_eq!(installed.files.len(), 2, "wrapper and launcher");
+        assert_eq!(installed.cli_tomls.len(), 1);
+        // Already complete: nothing recorded, nothing written.
+        assert_eq!(run(true).await??.outcome, "already_installed");
+        assert_eq!(cli_records(&h).await?.len(), 1);
+        assert_eq!(ops.state(), installed);
+
+        assert_eq!(run(false).await??.outcome, "removed");
+        let records = cli_records(&h).await?;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1]["old"], json!({"installed": true}));
+        assert_eq!(records[1]["new"], json!({"installed": false}));
+        assert_eq!(
+            ops.state(),
+            State::default(),
+            "exactly what was written is gone"
+        );
+        Ok(())
+    }
+
+    /// Audit before effect (`SettingsAdmin::record_app_change`): a record that cannot be written
+    /// stops the call and the machine is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cli_install_writes_nothing_when_the_record_fails() -> TestResult {
+        let h = rig(vec![]).await?;
+        let ops = std::sync::Arc::new(FakeOps::new());
+        let (s, o, l) = (h.core().settings(), ops.clone(), appimage_layout()?);
+        h.plan().fail_all(true);
+        let res = blocking(move || cli_install_dto(&*s, &*o, Ok(l))).await?;
+        h.plan().fail_all(false);
+        assert!(
+            matches!(res, Err(CommandError::Settings(SettingsError::Audit(_)))),
+            "{res:?}"
+        );
+        assert_eq!(ops.state(), State::default());
+        assert!(cli_records(&h).await?.is_empty());
+        Ok(())
+    }
+
+    /// An effect that fails after its record appends a second record with new = old, answers the
+    /// failure's kind and leaves nothing of the install behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_install_is_recorded_and_undone() -> TestResult {
+        let h = rig(vec![]).await?;
+        let ops = std::sync::Arc::new(FakeOps::new());
+        let layout = appimage_layout()?;
+        let launcher = match &layout.kind {
+            atlas_duck_app_lib::cli_install::Kind::AppImage { launcher, .. } => launcher.clone(),
+            other => return Err(format!("{other:?}").into()),
+        };
+        ops.fail_writes_to(&launcher);
+        let (s, o, l) = (h.core().settings(), ops.clone(), layout);
+        let res = blocking(move || cli_install_dto(&*s, &*o, Ok(l))).await?;
+        assert_eq!(res, Err(CommandError::CliInstall(InstallError::Io)));
+        let records = cli_records(&h).await?;
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0]["new"], json!({"installed": true}));
+        assert_eq!(records[1]["old"], json!({"installed": true}));
+        assert_eq!(records[1]["new"], json!({"installed": false}));
+        assert_eq!(ops.state(), State::default());
+        Ok(())
+    }
+
+    /// No stable path, or deb/rpm: nothing recorded, nothing written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cli_install_without_a_stable_path_or_on_deb_changes_nothing() -> TestResult {
+        let h = rig(vec![]).await?;
+        let ops = std::sync::Arc::new(FakeOps::new());
+        let mounted = Inputs {
+            platform: Platform::Linux,
+            home: "/home/u".into(),
+            cli_toml: "/home/u/.config/atlas-duck/cli-h.toml".into(),
+            current_exe: "/tmp/.mount_atlasXYZ/usr/bin/atlas-duck-app".into(),
+            appimage: None,
+            appimage_is_file: false,
+        };
+        let deb = Inputs {
+            current_exe: "/usr/bin/atlas-duck-app".into(),
+            ..mounted.clone()
+        };
+        for install in [true, false] {
+            let (s, o) = (h.core().settings(), ops.clone());
+            let layout = Layout::resolve(&mounted);
+            assert_eq!(layout, Err(InstallError::NoStablePath));
+            let res = blocking(move || {
+                if install {
+                    cli_install_dto(&*s, &*o, layout)
+                } else {
+                    cli_uninstall_dto(&*s, &*o, layout)
+                }
+            })
+            .await?;
+            assert_eq!(
+                res,
+                Err(CommandError::CliInstall(InstallError::NoStablePath))
+            );
+
+            let (s, o) = (h.core().settings(), ops.clone());
+            let layout = Layout::resolve(&deb);
+            let res = blocking(move || {
+                if install {
+                    cli_install_dto(&*s, &*o, layout)
+                } else {
+                    cli_uninstall_dto(&*s, &*o, layout)
+                }
+            })
+            .await??;
+            assert_eq!(res.outcome, "already_on_path");
+        }
+        assert_eq!(ops.state(), State::default());
+        assert!(cli_records(&h).await?.is_empty());
         Ok(())
     }
 }

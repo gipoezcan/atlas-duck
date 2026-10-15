@@ -33,6 +33,9 @@ use tauri::{AppHandle, Manager, Runtime};
 use super::credential::{Connected, SubmitFailure, connection_failure};
 use super::dto::{Args, refuse};
 use super::{CommandError, blocking, core, finish};
+use crate::cli_install::{
+    self, APP_CHANGE_KEY, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
+};
 use crate::credential::{self, PatOpenError};
 use crate::sandbox_probe::{floor_label, mode_label, probe_id_name};
 use crate::state::AppState;
@@ -270,6 +273,17 @@ pub struct RetestTokenArgs {
 #[serde(deny_unknown_fields)]
 pub struct PruneBacklogNowArgs {}
 
+/// `cli_install {}`: no key. Rust decides where (known folders, `$APPIMAGE`, the running binary);
+/// the webview names no path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliInstallArgs {}
+
+/// `cli_uninstall {}`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CliUninstallArgs {}
+
 // ---------- responses ----------
 
 /// One extra confinement layer the probe saw (`landlock`, ...): its name and whether it is on.
@@ -340,25 +354,126 @@ pub enum RetestOutcome {
     Failed(SubmitFailure),
 }
 
-/// Whether the CLI is installed on the PATH (§12.6). Task 27 owns the install state and replaces
-/// this with its check; until then Settings is told `false` (it offers "Install CLI to PATH").
+/// `cli_install` / `cli_uninstall`'s answer (§12.3): what happened, as a fixed word the page maps
+/// to its own text: `installed`, `already_installed`, `removed`, or `already_on_path` (deb/rpm have
+/// the CLI in `/usr/bin`; nothing is installed or removed).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CliInstallAnswer {
+    pub outcome: &'static str,
+}
+
+pub const OUTCOME_INSTALLED: &str = "installed";
+pub const OUTCOME_ALREADY_INSTALLED: &str = "already_installed";
+pub const OUTCOME_REMOVED: &str = "removed";
+pub const OUTCOME_ALREADY_ON_PATH: &str = "already_on_path";
+
+/// The layout of this machine: known folders, `$APPIMAGE`, the running binary.
+fn this_machine() -> Result<Layout, InstallError> {
+    Layout::resolve(&Inputs::detect()?)
+}
+
+/// Whether the CLI is on the PATH as this installation wants it (§12.3); a machine whose layout
+/// cannot be resolved (no stable path) counts as not installed.
 pub fn cli_installed() -> bool {
-    false
+    this_machine().is_ok_and(|layout| cli_install::is_installed(&SystemOps, &layout))
 }
 
 // ---------- the pure parts the tests drive ----------
 
-/// `settings_get` over core.
+/// `settings_get` over core. `cli_installed` is [`cli_installed`] (the caller reads the OS).
 pub fn settings_get_dto(
     settings: &dyn SettingsAdmin,
     instances: &dyn InstanceAdmin,
     confinement: ConfinementDto,
+    cli_installed: bool,
 ) -> SettingsGet {
     SettingsGet {
         settings: settings.view(),
         instances: instances.list(),
         confinement,
-        cli_installed: cli_installed(),
+        cli_installed,
+    }
+}
+
+/// The `old` / `new` of the `cli_install` record: `{"installed": bool}`.
+fn installed(on: bool) -> Value {
+    serde_json::json!({ "installed": on })
+}
+
+/// A second `record_app_change` that undoes the first after the effect failed (`SettingsAdmin`: "an
+/// app effect that fails afterwards appends a second call with `new = old`"). Its own failure cannot
+/// improve the answer; it is logged by kind.
+fn record_undo(settings: &dyn SettingsAdmin, old: bool, new: bool) {
+    if let Err(e) = settings.record_app_change(APP_CHANGE_KEY, installed(new), installed(old)) {
+        tracing::warn!(
+            event = LOG_EVENT_SETTINGS_FAILED,
+            error_class = "settings",
+            error_kind = e.to_string().as_str()
+        );
+    }
+}
+
+/// `cli_install` (§12.3): `CONFIG_CHANGED {source: app, key: cli_install, old, new: true}` first
+/// (audit before effect, `?`: a record that cannot be written stops the call), then the install. A
+/// failed install is answered with its kind and a second record puts the old value back. deb/rpm
+/// (`Packaged`) and an installation that is already complete change nothing and record nothing.
+///
+/// T23 HOOK (first-run wizard): the setup window holds `cli_install` too (Δ1), through this same
+/// command: it answers `not_ready` until the core serves, so the wizard runs its CLI step after
+/// `wizard_begin` has started serving. If T23 needs another route it calls this function with its
+/// own `settings` handle; the install, the record and the errors stay in one place.
+pub fn cli_install_dto(
+    settings: &dyn SettingsAdmin,
+    ops: &dyn PlatformOps,
+    layout: Result<Layout, InstallError>,
+) -> Result<CliInstallAnswer, CommandError> {
+    let layout = layout?;
+    if matches!(layout.kind, Kind::Packaged) {
+        return Ok(CliInstallAnswer {
+            outcome: OUTCOME_ALREADY_ON_PATH,
+        });
+    }
+    if cli_install::is_installed(ops, &layout) {
+        return Ok(CliInstallAnswer {
+            outcome: OUTCOME_ALREADY_INSTALLED,
+        });
+    }
+    settings.record_app_change(APP_CHANGE_KEY, installed(false), installed(true))?;
+    match cli_install::install(ops, &layout) {
+        Ok(_) => Ok(CliInstallAnswer {
+            outcome: OUTCOME_INSTALLED,
+        }),
+        Err(e) => {
+            record_undo(settings, false, true);
+            Err(CommandError::CliInstall(e))
+        }
+    }
+}
+
+/// `cli_uninstall` (§12.3, §12.5 step 3): the record first (`old` is whether the CLI was installed),
+/// then everything `install` writes is removed (and `cli.toml`); what is not ours is left. A failure
+/// is answered with its kind and a second record puts the old value back.
+pub fn cli_uninstall_dto(
+    settings: &dyn SettingsAdmin,
+    ops: &dyn PlatformOps,
+    layout: Result<Layout, InstallError>,
+) -> Result<CliInstallAnswer, CommandError> {
+    let layout = layout?;
+    if matches!(layout.kind, Kind::Packaged) {
+        return Ok(CliInstallAnswer {
+            outcome: OUTCOME_ALREADY_ON_PATH,
+        });
+    }
+    let old = cli_install::is_installed(ops, &layout);
+    settings.record_app_change(APP_CHANGE_KEY, installed(old), installed(false))?;
+    match cli_install::uninstall(ops, &layout) {
+        Ok(_) => Ok(CliInstallAnswer {
+            outcome: OUTCOME_REMOVED,
+        }),
+        Err(e) => {
+            record_undo(settings, old, false);
+            Err(CommandError::CliInstall(e))
+        }
     }
 }
 
@@ -499,6 +614,7 @@ pub fn failure_class(e: &CommandError) -> Option<(String, Option<String>)> {
         | CommandError::NotReady => return None,
         CommandError::Admin(a) => Some(a.to_string()),
         CommandError::Settings(s) => Some(s.to_string()),
+        CommandError::CliInstall(c) => Some(c.to_string()),
         _ => None,
     };
     Some((e.to_string(), inner))
@@ -560,7 +676,16 @@ pub async fn settings_get<R: Runtime>(
     let response = match core(&app) {
         Ok(core) => {
             let (settings, instances) = (core.settings(), core.instances());
-            blocking(move || Ok(settings_get_dto(&*settings, &*instances, confinement))).await
+            // Reads the registry or the file system: the blocking pool.
+            blocking(move || {
+                Ok(settings_get_dto(
+                    &*settings,
+                    &*instances,
+                    confinement,
+                    cli_installed(),
+                ))
+            })
+            .await
         }
         Err(e) => Err(e),
     };
@@ -710,6 +835,47 @@ pub async fn retest_token<R: Runtime>(
     if response.is_ok() {
         emit_settings_changed(&app);
     }
+    finish(&app, response)
+}
+
+/// `cli_install {}` (Δ1, §12.3): puts the CLI on the PATH for this installation (Windows user PATH,
+/// macOS link, AppImage wrapper and launcher; deb/rpm have it already). Also granted to `setup` (the
+/// wizard's CLI step, T23 hook at [`cli_install_dto`]). The registry and the file system are touched
+/// on the blocking pool; the windows re-read afterwards (`settings_changed`), whatever the answer.
+#[tauri::command]
+pub async fn cli_install<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<CliInstallArgs>,
+) -> Result<CliInstallAnswer, CommandError> {
+    let Args(CliInstallArgs {}) = args;
+    let response = match core(&app) {
+        Ok(core) => {
+            let settings = core.settings();
+            blocking(move || cli_install_dto(&*settings, &SystemOps, this_machine())).await
+        }
+        Err(e) => Err(e),
+    };
+    note_failure(&response);
+    emit_settings_changed(&app);
+    finish(&app, response)
+}
+
+/// `cli_uninstall {}` (Δ1, §12.3): removes what `cli_install` wrote and `cli.toml`.
+#[tauri::command]
+pub async fn cli_uninstall<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<CliUninstallArgs>,
+) -> Result<CliInstallAnswer, CommandError> {
+    let Args(CliUninstallArgs {}) = args;
+    let response = match core(&app) {
+        Ok(core) => {
+            let settings = core.settings();
+            blocking(move || cli_uninstall_dto(&*settings, &SystemOps, this_machine())).await
+        }
+        Err(e) => Err(e),
+    };
+    note_failure(&response);
+    emit_settings_changed(&app);
     finish(&app, response)
 }
 
@@ -943,6 +1109,30 @@ mod tests {
         );
     }
 
+    /// The CLI commands take no key at all: where the CLI goes is Rust's decision (known folders,
+    /// `$APPIMAGE`, the running binary), never a path from the webview (§10.3).
+    #[test]
+    fn the_cli_commands_take_no_arguments() {
+        assert_eq!(parse::<CliInstallArgs>(&json!({})), Ok(CliInstallArgs {}));
+        assert_eq!(
+            parse::<CliUninstallArgs>(&json!({})),
+            Ok(CliUninstallArgs {})
+        );
+        for key in ["path", "app_path", "dir", "force", "appimage", "x"] {
+            let body = json!({ key: "/tmp/x" });
+            assert_eq!(
+                field::<CliInstallArgs>(body.clone()),
+                Some(FIELD_PAYLOAD),
+                "{key}"
+            );
+            assert_eq!(
+                field::<CliUninstallArgs>(body),
+                Some(FIELD_PAYLOAD),
+                "{key}"
+            );
+        }
+    }
+
     #[test]
     fn settings_changes_are_bounded_and_in_the_core_form() {
         let ok = parse::<SettingsApplyArgs>(&json!({"changes": [
@@ -1037,6 +1227,10 @@ mod tests {
             class(CommandError::InvalidArgument { field: "proxy" }),
             Some(("invalid_argument (proxy)".to_owned(), None))
         );
+        assert_eq!(
+            class(CommandError::CliInstall(InstallError::Occupied)),
+            Some(("cli_install".into(), Some("occupied".into())))
+        );
         assert_eq!(class(CommandError::Admin(AdminError::Cancelled)), None);
         assert_eq!(
             class(CommandError::Settings(SettingsError::Cancelled)),
@@ -1047,7 +1241,13 @@ mod tests {
 
     #[test]
     fn the_cli_state_and_confinement_have_stable_shapes() {
-        assert!(!cli_installed());
+        assert_eq!(
+            serde_json::to_value(CliInstallAnswer {
+                outcome: OUTCOME_INSTALLED
+            })
+            .unwrap_or_default(),
+            json!({"outcome": "installed"})
+        );
         let pending = ConfinementDto::pending();
         assert_eq!(
             serde_json::to_value(&pending).unwrap_or_default(),

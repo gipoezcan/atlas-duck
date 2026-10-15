@@ -2,6 +2,7 @@ import type {
   BatchOutcome,
   BlockReason,
   CandidateRev,
+  CliInstallAnswer,
   CommandError,
   ConfigBanner,
   Confinement,
@@ -342,6 +343,11 @@ export const isPruneReport = (v: unknown): v is PruneReport => {
   return v.result === 'skipped' && fields(v, { reason: isStr });
 };
 
+export const isCliInstallAnswer = (v: unknown): v is CliInstallAnswer =>
+  fields(v, {
+    outcome: oneOf('installed', 'already_installed', 'removed', 'already_on_path'),
+  });
+
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });
 
 /** Maps whatever a rejected invoke carried to a `CommandError`. */
@@ -359,6 +365,7 @@ export function toCommandError(raw: unknown): CommandError {
       case 'decision':
       case 'admin':
       case 'settings':
+      case 'cli_install':
         if (isCoreError(raw.error)) return { kind: raw.kind, error: raw.error };
         break;
       case 'release_blocked':

@@ -7,6 +7,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 use std::path::{Path, PathBuf};
 
+use atlas_duck_app_lib::cli_install::InstallError;
 use atlas_duck_app_lib::commands::CommandError;
 use atlas_duck_app_lib::commands::approvals::{
     DenyCount, QueueDetail, RawPageDto, RedactionContextDto,
@@ -17,7 +18,8 @@ use atlas_duck_app_lib::commands::credential::{
 };
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_app_lib::commands::settings::{
-    ConfinementDto, ExtraLayerDto, RetestOutcome, SettingsGet,
+    CliInstallAnswer, ConfinementDto, ExtraLayerDto, OUTCOME_ALREADY_INSTALLED,
+    OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_REMOVED, RetestOutcome, SettingsGet,
 };
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
 use atlas_duck_atlassian::ConnClass;
@@ -525,6 +527,14 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::Admin(AdminError::InsecureScheme),
         CommandError::Admin(AdminError::Unconfirmed),
         CommandError::Busy,
+        // M6 T27: "Install CLI to PATH" failures, the kind only (no path, no OS text).
+        CommandError::CliInstall(InstallError::NoStablePath),
+        CommandError::CliInstall(InstallError::UnsafePath),
+        CommandError::CliInstall(InstallError::Occupied),
+        CommandError::CliInstall(InstallError::Unsupported),
+        CommandError::CliInstall(InstallError::Registry),
+        CommandError::CliInstall(InstallError::Io),
+        CommandError::CliInstall(InstallError::CliToml),
         // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
         CommandError::ReleaseBlocked,
         CommandError::Internal,
@@ -912,6 +922,19 @@ fn prune_reports() -> Vec<PruneReport> {
     ]
 }
 
+/// `cli_install` / `cli_uninstall` (M6 T27): every outcome word.
+fn cli_install_answers() -> Vec<CliInstallAnswer> {
+    [
+        OUTCOME_INSTALLED,
+        OUTCOME_ALREADY_INSTALLED,
+        OUTCOME_REMOVED,
+        OUTCOME_ALREADY_ON_PATH,
+    ]
+    .into_iter()
+    .map(|outcome| CliInstallAnswer { outcome })
+    .collect()
+}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ui/src/shared/ipc/fixtures")
 }
@@ -925,6 +948,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
     Ok(vec![
         ("archive_outcome", value(&archive_outcomes())?),
         ("batch_outcome", value(&batch_outcomes())?),
+        ("cli_install_answer", value(&cli_install_answers())?),
         ("command_error", value(&command_errors())?),
         ("credential_context", value(&credential_contexts())?),
         ("decision_outcome", value(&decision_outcomes())?),

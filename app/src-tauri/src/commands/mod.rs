@@ -57,6 +57,8 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         credential::retry_keychain,
         credential::save_recovery_note,
         credential::submit_secret,
+        settings::cli_install,
+        settings::cli_uninstall,
         settings::credential_window_open,
         settings::instance_accept_url_change,
         settings::instance_add,

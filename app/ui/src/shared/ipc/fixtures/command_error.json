@@ -185,6 +185,48 @@
     "kind": "busy"
   },
   {
+    "error": {
+      "kind": "no_stable_path"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
+      "kind": "unsafe_path"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
+      "kind": "occupied"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
+      "kind": "unsupported"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
+      "kind": "registry"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
+      "kind": "io"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
+      "kind": "cli_toml"
+    },
+    "kind": "cli_install"
+  },
+  {
     "kind": "release_blocked",
     "text": "release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items"
   },

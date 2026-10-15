@@ -349,6 +349,14 @@ export type PruneReport =
   | { result: 'pruned'; count: number; cutoff: string; clamped: boolean }
   | { result: 'skipped'; reason: string };
 
+/**
+ * `cli_install` / `cli_uninstall` (spec 12.3): what happened, as a fixed word. `already_on_path` is
+ * deb/rpm, where the CLI is in `/usr/bin` and nothing is installed or removed.
+ */
+export interface CliInstallAnswer {
+  outcome: 'installed' | 'already_installed' | 'removed' | 'already_on_path';
+}
+
 /** A tagged error object from core (`DecisionError` / `AdminError` / `SettingsError`). */
 export interface CoreError {
   kind: string;
@@ -369,6 +377,11 @@ export type CommandError =
   | { kind: 'admin'; error: CoreError }
   /** `SettingsAdmin` refused: `error.kind` is `invalid` (+`key`), `cancelled`, `config_read_only` (+`banner`), ... */
   | { kind: 'settings'; error: CoreError }
+  /**
+   * "Install CLI to PATH" or its removal failed (T27): `error.kind` is `no_stable_path`,
+   * `unsafe_path`, `occupied`, `unsupported`, `registry`, `io` or `cli_toml`; no path, no OS text.
+   */
+  | { kind: 'cli_install'; error: CoreError }
   /** The credential window is open for something else (T25): close it first. */
   | { kind: 'busy' }
   /** The candidate could not be built (M5 M-11); `text` is the app-generated banner. */

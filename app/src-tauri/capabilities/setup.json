@@ -3,6 +3,7 @@
   "description": "the first-run wizard window (Δ1, PD-72)",
   "windows": ["setup"],
   "permissions": [
+    "allow-cli-install",
     "allow-instance-accept-url-change",
     "allow-instance-add",
     "allow-instance-change-url",
