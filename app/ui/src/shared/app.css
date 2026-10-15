@@ -41,4 +41,11 @@
 .deny-keys { flex-basis: 100%; font-size: 0.9em; }
 .deny-offers { flex-basis: 100%; margin: 0; }
 .deny-offer-detail { margin-left: 1.5rem; }
+.edit-form fieldset { margin: 0.5rem 0; border: 1px solid #8886; }
+.edit-form .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.4rem 0; border: 0; padding: 0; }
+.edit-form .field input[type="text"], .edit-form .field textarea, .edit-form .field select { max-width: 100%; }
+.edit-form .json-input { font-family: monospace; min-height: 5rem; }
+.edit-form .read-only, .edit-form .field-hint, .edit-form .field-keys { font-size: 0.9em; }
+.edit-form .pick, .edit-form .as-json { display: flex; gap: 0.35rem; align-items: center; }
+.edit-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .keyboard-legend { display: flex; flex-wrap: wrap; gap: 0 1rem; list-style: none; margin: 0 0 0.5rem 0; padding: 0; font-size: 0.85em; }

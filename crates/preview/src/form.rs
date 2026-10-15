@@ -48,10 +48,18 @@ pub enum InputKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AllowedValues {
     allowed_values: Vec<String>,
+    /// The input takes a list of labels (an `array` field, M5 M-12) instead of one; written only
+    /// when set, so a single pick keeps its shape.
+    #[serde(skip_serializing_if = "is_false")]
+    multiple: bool,
     /// The value each label stands for in the request, by position; `None` when none can be
     /// derived (a pick of it is refused).
     #[serde(skip)]
     wire: Vec<Option<Value>>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Why a picked label has no wire value.
@@ -77,8 +85,20 @@ impl AllowedValues {
         let (allowed_values, wire) = pairs.into_iter().unzip();
         AllowedValues {
             allowed_values,
+            multiple: false,
             wire,
         }
+    }
+
+    /// The same choice as a multi-pick: the UI sends a list of labels.
+    #[must_use]
+    pub fn into_multiple(mut self) -> AllowedValues {
+        self.multiple = true;
+        self
+    }
+
+    pub fn is_multiple(&self) -> bool {
+        self.multiple
     }
 
     pub fn as_slice(&self) -> &[String] {
@@ -109,5 +129,10 @@ impl InputKind {
     /// A `Choice` of `(label, wire value)` pairs truncated to [`CHOICE_MAX_VALUES`].
     pub fn choice_with_wire(pairs: Vec<(String, Option<Value>)>) -> InputKind {
         InputKind::Choice(AllowedValues::with_wire(pairs))
+    }
+
+    /// Like [`Self::choice_with_wire`], for an `array` field: the input takes a list of labels.
+    pub fn multi_choice_with_wire(pairs: Vec<(String, Option<Value>)>) -> InputKind {
+        InputKind::Choice(AllowedValues::with_wire(pairs).into_multiple())
     }
 }

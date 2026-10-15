@@ -8,6 +8,10 @@ import type {
   DenyCount,
   DenyOffer,
   DenyOfferKind,
+  EditForm,
+  EditInput,
+  InputKind,
+  PlainInputKind,
   Preview,
   PreviewFetchResponse,
   QueueDetail,
@@ -146,9 +150,41 @@ const DENY_OFFER_KINDS: readonly unknown[] = [
 export const isDenyOffer = (v: unknown): v is DenyOffer =>
   fields(v, { kind: (k) => DENY_OFFER_KINDS.includes(k), has_optional_detail: isBool });
 
+const PLAIN_INPUT_KINDS: readonly unknown[] = [
+  'text',
+  'long_text',
+  'integer',
+  'number',
+  'boolean',
+  'json',
+] satisfies PlainInputKind[];
+
+const isInputKind = (v: unknown): v is InputKind =>
+  fields(v, { kind: isStr }) &&
+  (PLAIN_INPUT_KINDS.includes(v.kind) ||
+    (v.kind === 'choice' &&
+      arrayOf(isStr)(v.allowed_values) &&
+      // Written only when true: a missing key is a single pick.
+      (!('multiple' in v) || isBool(v.multiple))));
+
+export const isEditInput = (v: unknown): v is EditInput =>
+  fields(v, {
+    path: isStr,
+    label: isStr,
+    kind: isInputKind,
+    read_only: isBool,
+    required: isBool,
+    pre_added: isBool,
+    // `null` (an absent value) is as valid as any JSON value.
+    value: (x) => x !== undefined,
+  });
+
+const isEditForm = (v: unknown): v is EditForm => fields(v, { inputs: arrayOf(isEditInput) });
+
 export const isPreview = (v: unknown): v is Preview =>
   fields(v, {
     approvable: isBool,
+    edit_form: (f) => f === null || isEditForm(f),
     candidate_rev: isCandidateRev,
     body: (b) => fields(b, { kind: isStr }),
     header: (h) =>

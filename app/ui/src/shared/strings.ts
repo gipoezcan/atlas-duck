@@ -126,6 +126,32 @@ export const DENY_TEXT = {
   missing_fields_detail: 'include the allowed values',
 } as const;
 
+/** plan text (Task 16): the write edit form. */
+export const EDIT_TEXT = {
+  label: 'Edit before approving',
+  intro:
+    'An edit makes a new revision of this request. Open the new revision and approve it as a second step.',
+  params: 'Parameters',
+  missing: 'Missing required fields',
+  /** plan text, verbatim: next to every target and baseline input. */
+  read_only: 'read-only: deny to retarget',
+  required: 'required',
+  choice_none: '(none)',
+  as_json: 'Enter as JSON',
+  json_invalid: 'Not valid JSON',
+  integer_invalid: 'Not a whole number',
+  number_invalid: 'Not a number',
+  submit: 'Edit & approve',
+  reset: 'Reset edits',
+  nothing_to_send: 'Change a field to send an edit',
+  rejected: 'The edit was refused:',
+  rejected_plain: 'The edit was refused',
+  applied:
+    'Edit applied: the request has a new revision. Open its preview to review it, then approve it.',
+  unsent: 'Unsent edits: send them with Edit & approve, or reset them. Approve stays off until then.',
+  keys: 'In these fields Ctrl/Cmd+Shift+Down / Up select text and do not change the request',
+} as const;
+
 /** plan text (Task 14): the Raw pager. */
 export const RAW_TEXT = {
   label: 'Raw',

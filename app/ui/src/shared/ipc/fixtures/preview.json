@@ -192,6 +192,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },
@@ -414,6 +489,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },
@@ -524,6 +674,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },
@@ -624,6 +849,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },
@@ -754,6 +1054,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },
@@ -1069,6 +1444,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },
@@ -1223,6 +1673,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },
@@ -1362,6 +1887,81 @@
           "read_only": true,
           "required": true,
           "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
         }
       ]
     },

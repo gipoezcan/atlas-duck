@@ -43,6 +43,19 @@ fn rev() -> CandidateRev {
     }
 }
 
+/// An editable, optional, params-own input.
+fn form_input(path: &str, kind: InputKind, value: Value) -> EditInput {
+    EditInput {
+        path: path.into(),
+        label: path.into(),
+        kind,
+        read_only: false,
+        required: false,
+        pre_added: false,
+        value,
+    }
+}
+
 fn queue_items() -> Vec<QueueItem> {
     // Never serialized (PD-86); only its id and label reach the wire.
     let session = SessionKey {
@@ -403,6 +416,25 @@ fn previews() -> Vec<Preview> {
                             required: true,
                             pre_added: false,
                             value: json!("PROJ-1"),
+                        },
+                        // T16: one input of every other kind (the UI validates the whole form),
+                        // the multi-pick (M-12) and an optional that is null.
+                        form_input("description", InputKind::LongText, json!("A\nB")),
+                        form_input("max_results", InputKind::Integer, json!(50)),
+                        form_input("ratio", InputKind::Number, Value::Null),
+                        form_input("notify", InputKind::Boolean, json!(true)),
+                        form_input("update", InputKind::Json, json!({"labels": ["x"]})),
+                        EditInput {
+                            path: "fields.customfield_10300".into(),
+                            label: "Areas (customfield_10300)".into(),
+                            kind: InputKind::multi_choice_with_wire(vec![
+                                ("UI".into(), Some(json!([{"id": "1"}]))),
+                                ("API".into(), Some(json!([{"id": "2"}]))),
+                            ]),
+                            read_only: false,
+                            required: true,
+                            pre_added: true,
+                            value: Value::Null,
                         },
                     ],
                 }),

@@ -127,6 +127,13 @@ export type ChordHandlers = Record<Chord, () => void>;
 /** A positive decision control (approve, release, release outcome / status only). */
 export const POSITIVE_ATTR = 'data-positive-decision';
 
+/** An edit-form field (task 16): Ctrl/Cmd+Shift+Down / Up there select text, they do not navigate. */
+export const EDIT_ENTRY_ATTR = 'data-edit-entry';
+
+function inEditEntry(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(`[${EDIT_ENTRY_ATTR}]`) !== null;
+}
+
 function onPositiveControl(target: EventTarget | null): boolean {
   return target instanceof Element && target.closest(`[${POSITIVE_ATTR}]`) !== null;
 }
@@ -143,6 +150,7 @@ function swallow(e: Event): void {
  *   is swallowed; the tracker still sees each key go down and up;
  * - a chord is kept from the page; it runs only per `ChordTracker` (never on `repeat`, a decision
  *   chord only after the previous chord's keys were released);
+ * - next/prev chords are not run (nor kept from the field) while focus is in an edit-form field;
  * - Enter and Space on a positive decision button are dropped: a button activated by one key would
  *   be a single-key approval. Those buttons take a pointer click or the chord.
  */
@@ -162,6 +170,9 @@ export function useChords(handlers: ChordHandlers, allInert: () => boolean): voi
         return;
       }
       if (chord !== null) {
+        // Navigation would drop the form's unsent text, and the keys select text in a field: leave
+        // them to the field. (Approve is gated by unsent edits in `Detail`, deny keeps working.)
+        if ((chord === 'next' || chord === 'prev') && inEditEntry(e.target)) return;
         swallow(e);
         if (act) latest.current[chord]();
         return;

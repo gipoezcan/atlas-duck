@@ -93,4 +93,31 @@ describe('fixtures validate against their TS types', () => {
     expect(isPreview({ ...first, deny_prefill: 1 })).toBe(false);
     expect(isPreview({ ...first, header: { ...first?.header, release_blocked: null } })).toBe(true);
   });
+
+  it('edit_form: every input kind validates, nulls are valid values, a wrong shape is refused', () => {
+    const forms = preview.map((p) => p.edit_form).filter((f) => f !== null);
+    expect(forms.length).toBeGreaterThan(0);
+    const kinds = new Set(forms.flatMap((f) => f.inputs.map((i) => i.kind.kind)));
+    for (const kind of ['text', 'long_text', 'integer', 'number', 'boolean', 'json', 'choice']) {
+      expect(kinds.has(kind)).toBe(true);
+    }
+    const [first] = preview;
+    const form = forms[0];
+    const withInputs = (inputs: unknown[]) => ({ ...first, edit_form: { inputs } });
+    const input = form?.inputs[0];
+    // `null` is a valid value (an absent optional) and `edit_form` is null for reads.
+    expect(isPreview({ ...first, edit_form: null })).toBe(true);
+    expect(isPreview(withInputs([{ ...input, value: null }]))).toBe(true);
+    expect(isPreview(withInputs([{ ...input, value: undefined }]))).toBe(false);
+    // The multi-pick flag is written only when true: absent and true validate, anything else does not.
+    const choice = { ...input, kind: { kind: 'choice', allowed_values: ['A'] } };
+    expect(isPreview(withInputs([choice]))).toBe(true);
+    expect(isPreview(withInputs([{ ...choice, kind: { ...choice.kind, multiple: true } }]))).toBe(true);
+    expect(isPreview(withInputs([{ ...choice, kind: { ...choice.kind, multiple: 'yes' } }]))).toBe(false);
+    expect(isPreview(withInputs([{ ...choice, kind: { kind: 'choice' } }]))).toBe(false);
+    expect(isPreview(withInputs([{ ...input, kind: { kind: 'date' } }]))).toBe(false);
+    expect(isPreview(withInputs([{ ...input, read_only: 'no' }]))).toBe(false);
+    expect(isPreview({ ...first, edit_form: { inputs: 'none' } })).toBe(false);
+    expect(isPreview({ ...first, edit_form: undefined })).toBe(false);
+  });
 });

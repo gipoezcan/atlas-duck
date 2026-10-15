@@ -60,6 +60,29 @@ fn choice_allowed_values_capped_at_10() {
     assert_eq!(wire["allowed_values"].as_array().map(Vec::len), Some(10));
 }
 
+/// T16 (M5 M-12): a multi-pick says so on the wire (`multiple`), a single pick does not.
+#[test]
+fn multi_choice_is_marked_on_the_wire() -> Result<(), serde_json::Error> {
+    let pairs = vec![("UI".to_owned(), Some(json!([{"id": "1"}])))];
+    let multi = InputKind::multi_choice_with_wire(pairs.clone());
+    assert_eq!(
+        serde_json::to_value(&multi)?,
+        json!({"kind": "choice", "allowed_values": ["UI"], "multiple": true})
+    );
+    let single = InputKind::choice_with_wire(pairs);
+    assert_eq!(
+        serde_json::to_value(&single)?,
+        json!({"kind": "choice", "allowed_values": ["UI"]})
+    );
+    let (InputKind::Choice(m), InputKind::Choice(s)) = (multi, single) else {
+        panic!("both build Choice");
+    };
+    assert!(m.is_multiple() && !s.is_multiple());
+    // The labels map as before.
+    assert_eq!(m.wire_for("UI"), Ok(&json!([{"id": "1"}])));
+    Ok(())
+}
+
 /// T12 review I1: a `Choice` carries (label, wire value) pairs; the UI sees and sends back the
 /// labels only, core maps the picked label to its wire value.
 #[test]

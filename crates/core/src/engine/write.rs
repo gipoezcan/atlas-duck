@@ -423,12 +423,19 @@ fn missing_kind(f: &MissingField) -> InputKind {
                 Some("option" | "version" | "component")
             ));
     match f.schema_type.as_str() {
-        _ if choice && !f.allowed_values.is_empty() => InputKind::choice_with_wire(
-            f.allowed_values
+        _ if choice && !f.allowed_values.is_empty() => {
+            let pairs = f
+                .allowed_values
                 .iter()
                 .map(|v| (one_line(escape_for_display(&v.label)), v.wire.clone()))
-                .collect(),
-        ),
+                .collect();
+            // M-12: an `array` field is a multi-pick, so the UI knows to send a list of labels.
+            if f.schema_type == "array" {
+                InputKind::multi_choice_with_wire(pairs)
+            } else {
+                InputKind::choice_with_wire(pairs)
+            }
+        }
         "number" => InputKind::Number,
         "integer" => InputKind::Integer,
         "string" => InputKind::Text,

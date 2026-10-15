@@ -142,8 +142,37 @@ export interface DenyOffer {
   has_optional_detail: boolean;
 }
 
+/** How an edit-form input is entered (`InputKind`); a choice lists the labels the UI may send back. */
+export type PlainInputKind = 'text' | 'long_text' | 'integer' | 'number' | 'boolean' | 'json';
+
+export type InputKind =
+  | { kind: PlainInputKind }
+  /** `multiple` is present (true) only for an `array` field: a list of labels is sent (M5 M-12). */
+  | { kind: 'choice'; allowed_values: string[]; multiple?: boolean };
+
+/** One input of a write's edit form (spec 5.4 step 4). Labels are display-escaped by Rust. */
+export interface EditInput {
+  /** A param name, or `fields.<id>` for a Jira field. */
+  path: string;
+  label: string;
+  kind: InputKind;
+  /** Target params and conflict baselines: shown, never sent back. */
+  read_only: boolean;
+  required: boolean;
+  /** Added by enrichment (a missing required field), not part of the agent's request. */
+  pre_added: boolean;
+  /** The value that runs, as it is; `null` when absent. */
+  value: unknown;
+}
+
+export interface EditForm {
+  inputs: EditInput[];
+}
+
 export interface Preview {
   approvable: boolean;
+  /** The edit form of a write preview; `null` for reads and scripts. */
+  edit_form: EditForm | null;
   candidate_rev: CandidateRev;
   body: PreviewBody;
   header: {

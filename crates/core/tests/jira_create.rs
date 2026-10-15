@@ -1166,7 +1166,14 @@ async fn i1_chosen_labels_go_out_in_the_jira_shape() -> TestResult {
     let id = queued(&h, params("Four choices")).await?;
     let p = preview(&h, &id)?;
     match &input(&p, "fields.customfield_10400")?.kind {
-        InputKind::Choice(allowed) => assert_eq!(allowed.as_slice(), ["20001"]),
+        InputKind::Choice(allowed) => {
+            assert_eq!(allowed.as_slice(), ["20001"]);
+            assert!(!allowed.is_multiple(), "an option is a single pick");
+        }
+        other => return Err(format!("not a choice: {other:?}").into()),
+    }
+    match &input(&p, "fields.customfield_10300")?.kind {
+        InputKind::Choice(allowed) => assert!(allowed.is_multiple(), "an array is a multi-pick"),
         other => return Err(format!("not a choice: {other:?}").into()),
     }
     for (path, label) in [
@@ -1259,6 +1266,11 @@ async fn m12_array_choice_labels_mapped() -> TestResult {
     approvable_server(mock).await;
     let id = queued(&h, params("Three areas")).await?;
     let path = "fields.customfield_10300";
+    // T16: the form tells the UI this is a multi-pick (it sends a list of labels).
+    match &input(&preview(&h, &id)?, path)?.kind {
+        InputKind::Choice(allowed) => assert!(allowed.is_multiple()),
+        other => return Err(format!("not a choice: {other:?}").into()),
+    }
     // Unknown (or ambiguous) labels refuse the edit; nothing is logged, the revision stays.
     let rev = h.approver().rev(&id).map_err(de)?;
     let res = h.approver().edit_preadded(&id, path, json!(["UI", "Nope"]));

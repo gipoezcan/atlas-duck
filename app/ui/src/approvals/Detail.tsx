@@ -10,9 +10,10 @@ import {
 
 import { decide, previewFetch, type DenyDetails } from '../shared/ipc/invoke';
 import type { PreviewFetchResponse, QueueItem } from '../shared/ipc/types';
-import { CLASS_LABELS, DETAIL_TEXT, STATUS_LABELS } from '../shared/strings';
+import { CLASS_LABELS, DETAIL_TEXT, EDIT_TEXT, STATUS_LABELS } from '../shared/strings';
 import { cardOf, DecisionBar, type DecisionArgs } from './DecisionBar';
 import { DenyDialog } from './DenyDialog';
+import { buildEdits, EditForm, type Draft, type Drafts } from './EditForm';
 import { candidateKey, useInert } from './inert';
 import { PreviewFrame } from './PreviewFrame';
 import { RawPager } from './RawPager';
@@ -72,11 +73,29 @@ function blockedText(e: unknown): string | null {
 }
 
 /**
+ * Core's message of a refused edit (`DecisionError::EditRejected`, the validator's app-generated
+ * text, bounded and display-escaped by Rust), `''` when it carried none; null for any other error.
+ */
+function editRejection(e: unknown): string | null {
+  if (typeof e !== 'object' || e === null || !('kind' in e) || e.kind !== 'decision') return null;
+  const core = (e as { error?: { kind?: unknown; error?: { message?: unknown } } }).error;
+  if (core?.kind !== 'edit_rejected') return null;
+  const message = core.error?.message;
+  return typeof message === 'string' ? message.slice(0, 300) : '';
+}
+
+/**
  * The Approvals detail pane: Preview / Structured / Raw / Request tabs and the decision controls
  * of the opened revision. Nothing here fetches a preview except `open()`, which runs on the Open
  * button or an `openToken` bump. Every decision goes through `send()`, which re-checks what the
  * controls show (spec 5.6): a positive decision needs the displayed revision opened, approvable
  * per Rust, not inert, and nothing in flight. Rust checks all of it again (spec 2.4).
+ *
+ * Writes (task 16): the Structured tab is the edit form. "Edit & approve" is a `decide
+ * {approve_edited, edits}` through `send()` like every decision; it makes a new revision (PD-20), and
+ * the pane then shows that revision unopened: opening it is the user's next click, then the inert
+ * period, then approve. While the form holds unsent changes the revision's own Approve is off:
+ * approving it would silently leave the changes out.
  */
 export function Detail({ item, openToken = 0, gone = false, renderStructured, ref }: DetailProps) {
   const [tab, setTab] = useState<TabId>('preview');
@@ -88,6 +107,11 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
   const inFlight = useRef(false);
   const [denyOpen, setDenyOpen] = useState(false);
   const [denyFocus, setDenyFocus] = useState(0);
+  /** The edit form's text, kept here so a tab switch does not lose it; cleared on every open. */
+  const [drafts, setDrafts] = useState<Drafts>({});
+  const [rejection, setRejection] = useState<string | null>(null);
+  /** An edit made a new revision that has not been opened yet. */
+  const [edited, setEdited] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const latest = useRef(0);
 
@@ -97,6 +121,9 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
     setActionFailed(false);
     setDecided(null);
     setDenyOpen(false);
+    setDrafts({});
+    setRejection(null);
+    setEdited(false);
     previewFetch(item.request_id).then(
       (response) => {
         if (mine !== latest.current) return;
@@ -132,22 +159,53 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
     state.kind === 'blocked' ? state.text : (shown?.preview.header.release_blocked ?? null);
   const card = gone || shown === null ? null : cardOf(shown.preview);
   const canDeny = !gone && (shown !== null || releaseBlocked !== null);
+  const form = shown?.preview.edit_form ?? null;
+  const built = form === null ? null : buildEdits(form, drafts);
+  /** The form holds changes that are not sent: an approve would leave them out. */
+  const unsentEdits = built?.changed ?? false;
   const positiveEnabled =
-    shown !== null && shown.preview.approvable && !busy && !denyOpen && !inert.approveInert;
+    shown !== null &&
+    shown.preview.approvable &&
+    !busy &&
+    !denyOpen &&
+    !unsentEdits &&
+    !inert.approveInert;
+  /** The edit button: not an approval, so a preview that is not approvable can still be edited. */
+  const editEnabled =
+    form !== null &&
+    releaseBlocked === null &&
+    !gone &&
+    !busy &&
+    !denyOpen &&
+    !inert.approveInert;
 
   const send = (args: DecisionArgs) => {
     if (inFlight.current || gone) return;
+    const isEdit = args.decision === 'approve_edited';
     if (args.decision === 'deny') {
       if (!canDeny) return;
+    } else if (isEdit) {
+      // `approve_edited` without edits would approve the revision as it is: never from here.
+      if (
+        args.edits === undefined ||
+        form === null ||
+        releaseBlocked !== null ||
+        denyOpen ||
+        inert.approveInertNow()
+      ) {
+        return;
+      }
     } else if (
       shown === null ||
       !shown.preview.approvable ||
       releaseBlocked !== null ||
       denyOpen ||
+      unsentEdits ||
       inert.approveInertNow()
     ) {
       return;
     }
+    setRejection(null);
     const rev = shown?.preview.candidate_rev ?? item.candidate_rev;
     inFlight.current = true;
     setBusy(true);
@@ -157,7 +215,15 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
         inFlight.current = false;
         setBusy(false);
         setDenyOpen(false);
-        if (outcome.status === 'pending') {
+        if (outcome.status === 'pending' && isEdit) {
+          // An edit made a new revision (PD-20). Unlike the "Release status only" case below the
+          // user asked for a change, not to look at it: the pane shows the new revision unopened.
+          // Opening it is the user's next click, which fetches it and starts the inert period.
+          latest.current++;
+          setState({ kind: 'idle' });
+          setDrafts({});
+          setEdited(true);
+        } else if (outcome.status === 'pending') {
           // A redaction made a new revision (I-38). Ruling (T14 review I3): the fetch below
           // follows the user's own "Release status only" press, so it is not a navigation the user
           // did not ask for. The new revision is displayed once the queue re-read brings it, and
@@ -174,10 +240,22 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
         inFlight.current = false;
         setBusy(false);
         const text = blockedText(e);
+        const refused = isEdit ? editRejection(e) : null;
         if (text !== null) setState({ kind: 'blocked', text });
+        else if (refused !== null) setRejection(refused);
         else setActionFailed(true);
       },
     );
+  };
+
+  const onDraft = (path: string, draft: Draft) => {
+    setRejection(null);
+    setDrafts((d) => ({ ...d, [path]: draft }));
+  };
+
+  const submitEdit = () => {
+    if (built === null || Object.keys(built.errors).length > 0 || !built.changed) return;
+    send({ decision: 'approve_edited', edits: built.edits });
   };
 
   const openDeny = () => {
@@ -227,11 +305,24 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
         />
       );
     }
-    return renderStructured ? (
-      renderStructured({ item, response: shown })
-    ) : (
-      <p>{DETAIL_TEXT.structured_pending}</p>
-    );
+    if (renderStructured) return renderStructured({ item, response: shown });
+    if (form !== null) {
+      return (
+        <EditForm
+          form={form}
+          drafts={drafts}
+          onDraft={onDraft}
+          onReset={() => {
+            setRejection(null);
+            setDrafts({});
+          }}
+          onSubmit={submitEdit}
+          canSubmit={editEnabled}
+          rejection={rejection}
+        />
+      );
+    }
+    return <p>{DETAIL_TEXT.structured_pending}</p>;
   };
 
   return (
@@ -255,6 +346,8 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
         </button>
       ) : null}
       {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${STATUS_LABELS[decided] ?? decided}`}</p>}
+      {edited ? <p role="status">{EDIT_TEXT.applied}</p> : null}
+      {unsentEdits ? <p role="status">{EDIT_TEXT.unsent}</p> : null}
       {actionFailed ? <p role="alert">{DETAIL_TEXT.action_failed}</p> : null}
       <DecisionBar
         card={card}
