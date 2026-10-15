@@ -130,6 +130,7 @@ export const REQUEST_TEXT = {
   peer_pid: 'Peer pid',
   peer_exe: 'Peer exe',
   peer_origin_exe: 'Peer origin exe',
+  peer_chain: 'Peer chain',
   none: '(none)',
 } as const;
 

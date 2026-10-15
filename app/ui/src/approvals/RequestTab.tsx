@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { queueGet } from '../shared/ipc/invoke';
 import type { QueueDetail } from '../shared/ipc/types';
-import { QUEUE_TEXT, REQUEST_TEXT } from '../shared/strings';
+import { QUEUE_TEXT, REQUEST_TEXT, UNVERIFIED } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { Badge } from '../shared/text/Badge';
 import { formatAge } from './Queue';
@@ -92,14 +92,31 @@ export function RequestTab({ requestId }: RequestTabProps) {
         <dt>{REQUEST_TEXT.connection_id}</dt>
         <dd>{text(r.connection_id)}</dd>
         <dt>{REQUEST_TEXT.peer_pid}</dt>
-        <dd>{text(r.peer_pid)}</dd>
+        <dd>
+          {text(r.peer_pid)} <Badge label={UNVERIFIED} />
+        </dd>
         <dt>{REQUEST_TEXT.peer_exe}</dt>
         <dd>
-          <bdi>{text(r.peer_exe)}</bdi>
+          <bdi>{text(r.peer_exe)}</bdi> <Badge label={UNVERIFIED} />
         </dd>
         <dt>{REQUEST_TEXT.peer_origin_exe}</dt>
         <dd>
-          <bdi>{text(r.peer_origin_exe)}</bdi>
+          <bdi>{text(r.peer_origin_exe)}</bdi> <Badge label={UNVERIFIED} />
+        </dd>
+        <dt>{REQUEST_TEXT.peer_chain}</dt>
+        <dd>
+          {r.peer_chain.length === 0 ? (
+            REQUEST_TEXT.none
+          ) : (
+            <ol className="peer-chain">
+              {r.peer_chain.map((hop, i) => (
+                <li key={i}>
+                  <bdi>{hop}</bdi>
+                </li>
+              ))}
+            </ol>
+          )}{' '}
+          <Badge label={UNVERIFIED} />
         </dd>
       </dl>
     </section>

@@ -24,6 +24,13 @@ export const BANNED_SINKS = [
   { name: 'allowDangerousHtml', pattern: /\ballowDangerousHtml\b/ },
   { name: 'react-markdown', pattern: /\breact-markdown\b/ },
   { name: 'linkify', pattern: /linkify/i },
+  // An iframe document is an HTML sink: only PreviewFrame.tsx may set one, and only from the
+  // `preview_fetch` response's `srcdoc` (§6.4).
+  {
+    name: 'srcDoc (iframe document; only PreviewFrame.tsx)',
+    pattern: /\bsrcDoc\b|\.srcdoc\s*=|setAttribute\(\s*['"]srcdoc['"]/,
+    allowedIn: ['src/approvals/PreviewFrame.tsx'],
+  },
   { name: 'markdown renderer (marked / markdown-it / snarkdown)', pattern: /(?:from|require\()\s*['"](?:marked|markdown-it|snarkdown)['"]/ },
 ];
 
@@ -50,6 +57,7 @@ export function scan(paths) {
       const lines = readFileSync(file, 'utf8').split(/\r?\n/);
       lines.forEach((text, index) => {
         for (const sink of BANNED_SINKS) {
+          if (sink.allowedIn?.some((p) => file.split(path.sep).join('/').endsWith(p))) continue;
           if (sink.pattern.test(text)) {
             findings.push({ file, line: index + 1, sink: sink.name });
           }

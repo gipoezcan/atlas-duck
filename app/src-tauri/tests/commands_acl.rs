@@ -773,9 +773,10 @@ mod approvals_commands {
     use atlas_duck_core::testing::Harness;
     use atlas_duck_core::{CandidateRev, Confirm, DecisionError};
     use atlas_duck_ipc::envelope::{ErrorCode, Status};
-    use atlas_duck_ipc::proto::exit_code;
+    use atlas_duck_ipc::proto::{PeerHop, PeerInfo, exit_code};
     use atlas_duck_preview::PreviewBody;
     use serde_json::{Value, json};
+    use std::path::PathBuf;
 
     use super::TestResult;
 
@@ -881,10 +882,104 @@ mod approvals_commands {
         assert!(got.request.submitted_at.ends_with('Z'), "{got:?}");
         assert_eq!(got.request.agent_name.as_deref(), Some("test-agent"));
         assert_eq!(got.request.cwd_basename, "workdir");
+        // The default connection carries no OS peer facts: the negative control of the test below.
+        assert_eq!(got.request.client_kind.as_deref(), Some("cli"));
+        assert_eq!(got.request.agent_name_source.as_deref(), Some("flag"));
+        assert_eq!(got.request.peer_pid, None);
+        assert_eq!(got.request.peer_exe, None);
+        assert_eq!(got.request.peer_origin_exe, None);
+        assert!(got.request.peer_chain.is_empty());
         assert_eq!(
             queue_detail_dto(&*d, "req_0000000000000000none"),
             Err(CommandError::NotFound)
         );
+        Ok(())
+    }
+
+    /// T14 review C1/I2: every connection fact of the Request tab comes from the connection (not
+    /// constants, not `ctx.actor`), the chain is capped at `MAX_HOPS`, and the audit records keep
+    /// their actor columns: the agent columns stay on `REQUEST_RECEIVED` only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_get_carries_the_connection_facts_and_audit_actors_stay() -> TestResult {
+        let h = rig(vec![]).await?;
+        let d = h.decisions();
+        let hop = |pid: u32, exe: &str| PeerHop {
+            pid,
+            start_time: u64::from(pid),
+            exe: PathBuf::from(exe),
+        };
+        let peer = PeerInfo {
+            peer_pid: Some(4242),
+            peer_exe: Some(PathBuf::from("/usr/bin/atlas-duck")),
+            peer_chain: vec![
+                hop(4242, "/usr/bin/atlas-duck"),
+                hop(4100, "/usr/bin/bash"),
+                hop(4000, "/usr/bin/tmux"),
+                hop(3900, "/usr/bin/login"),
+                hop(3800, "/usr/bin/init"),
+                hop(3700, "/usr/bin/init2"),
+            ],
+            peer_origin_exe: Some(PathBuf::from("/usr/bin/bash")),
+            peer_origin_start_time: Some(4100),
+        };
+        let conn = h.conn_with_peer("peer-agent", peer).await?;
+        let env = h.submit_with(&conn, COMMENT, comment(), None).await;
+        let id = env.request_id.clone().ok_or("no request id")?;
+        h.queued(&id, 10_000).await.ok_or("never queued")?;
+
+        let r = queue_detail_dto(&*d, &id)?.request;
+        assert_eq!(r.client_kind.as_deref(), Some("cli"));
+        assert_eq!(r.agent_name_source.as_deref(), Some("flag"));
+        assert_eq!(r.agent_name.as_deref(), Some("peer-agent"));
+        assert_eq!(
+            r.connection_id.as_deref(),
+            Some(conn.connection_id.as_str())
+        );
+        assert_eq!(r.peer_pid, Some(4242));
+        assert_eq!(r.peer_exe.as_deref(), Some("/usr/bin/atlas-duck"));
+        assert_eq!(r.peer_origin_exe.as_deref(), Some("/usr/bin/bash"));
+        assert_eq!(
+            r.peer_chain,
+            vec![
+                "4242 /usr/bin/atlas-duck",
+                "4100 /usr/bin/bash",
+                "4000 /usr/bin/tmux",
+                "3900 /usr/bin/login"
+            ]
+        );
+
+        // A decision record follows, so the pin below has a later record to look at.
+        let rev = queue_get_dto(&*d, &id)?.candidate_rev;
+        decide_dto(&*d, decide_args(&id, "deny", rev, json!({}))?)?;
+        let headers = h.port().headers_for_request(&id)?;
+        let (received, later): (Vec<_>, Vec<_>) = headers
+            .iter()
+            .partition(|e| e.event_type == EventType::REQUEST_RECEIVED);
+        assert_eq!(received.len(), 1);
+        let a = &received[0].actor;
+        assert_eq!(a.client_kind.as_deref(), Some("cli"));
+        assert_eq!(a.agent_name_source.as_deref(), Some("flag"));
+        assert_eq!(
+            a.connection_id.as_deref(),
+            Some(conn.connection_id.as_str())
+        );
+        assert_eq!(a.peer_pid, Some(4242));
+        assert_eq!(a.peer_origin_exe, Some(PathBuf::from("/usr/bin/bash")));
+        assert!(!later.is_empty(), "no later record to pin");
+        for e in later {
+            let a = &e.actor;
+            assert!(
+                a.agent_name.is_none()
+                    && a.agent_name_source.is_none()
+                    && a.client_kind.is_none()
+                    && a.connection_id.is_none()
+                    && a.peer_pid.is_none()
+                    && a.peer_exe.is_none()
+                    && a.peer_origin_exe.is_none(),
+                "{:?} gained agent columns: {a:?}",
+                e.event_type
+            );
+        }
         Ok(())
     }
 

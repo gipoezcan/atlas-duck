@@ -26,7 +26,7 @@
     },
     "request": {
       "agent_name": "claude-code",
-      "agent_name_source": "hello",
+      "agent_name_source": "flag",
       "client_kind": "cli",
       "connection_id": "conn-0001",
       "cwd_basename": "atlas-duck",
@@ -38,11 +38,56 @@
         "key": "PROJ-1"
       },
       "params_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "peer_chain": [
+        "4242 /usr/bin/atlas",
+        "4100 /usr/bin/zsh"
+      ],
       "peer_exe": "/usr/bin/atlas",
-      "peer_origin_exe": null,
+      "peer_origin_exe": "/usr/bin/zsh",
       "peer_pid": 4242,
       "reason": "look up the ticket",
       "submitted_at": "2026-10-14T09:30:00.000Z"
+    }
+  },
+  {
+    "item": {
+      "age_s": 3,
+      "agent_name": null,
+      "agent_unverified": true,
+      "approvable": true,
+      "candidate_rev": {
+        "candidate_hash": "abababababababababababababababababababababababababababababababab",
+        "counter": 1
+      },
+      "caution_count": 0,
+      "class": "write",
+      "instance_alias": "work",
+      "op_id": "jira.issue.create",
+      "opened": false,
+      "possible_duplicate_of": null,
+      "reason_excerpt": null,
+      "request_id": "req_nullnullnullnullnull",
+      "session_id": "f73d4e21611cb012d3df4051eeb26f9ae91ec96e2226a6746be021eec3923800",
+      "session_label": "(no agent name) · atlas-duck",
+      "similar_to": null,
+      "stale": false,
+      "target_display": "PROJ",
+      "unusual": false
+    },
+    "request": {
+      "agent_name": null,
+      "agent_name_source": null,
+      "client_kind": null,
+      "connection_id": null,
+      "cwd_basename": "atlas-duck",
+      "params": null,
+      "params_sha256": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+      "peer_chain": [],
+      "peer_exe": null,
+      "peer_origin_exe": null,
+      "peer_pid": null,
+      "reason": null,
+      "submitted_at": "2026-10-14T09:31:00.000Z"
     }
   }
 ]

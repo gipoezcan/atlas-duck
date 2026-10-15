@@ -46,13 +46,15 @@ export interface RequestDetail {
   submitted_at: string;
   client_kind: string | null;
   agent_name: string | null;
-  /** Where the agent name came from (`hello`, `env`, ...). */
+  /** Where the agent name came from (`flag`, `env`, `mcp-clientInfo` or `none`). */
   agent_name_source: string | null;
   cwd_basename: string;
   connection_id: string | null;
   peer_pid: number | null;
   peer_exe: string | null;
   peer_origin_exe: string | null;
+  /** One display-escaped line per hop (`<pid> <exe>`), direct peer first, at most 4. */
+  peer_chain: string[];
 }
 
 /** What `queue_get` returns: the queue row plus the Request tab's facts. */

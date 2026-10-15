@@ -25,6 +25,7 @@ const BANNED_FIXTURES = [
   ['blobworker.ts', 'export function f(code: string) {\n  return new Worker(URL.createObjectURL(new Blob([code])));\n}\n'],
   ['rehyperaw.tsx', 'import Markdown from "react-markdown";\nimport rehypeRaw from "rehype-raw";\nexport const M = () => <Markdown rehypePlugins={[rehypeRaw]}>x</Markdown>;\n'],
   ['linkify.tsx', 'export const L = (p: { t: string }) => p.t;\nimport Linkify from "linkify-react";\n'],
+  ['srcdoc.tsx', 'export const F = (p: { h: string }) => (\n  <iframe sandbox="" srcDoc={p.h} title="x" />\n);\n'],
 ];
 
 const CLEAN_FIXTURE = [

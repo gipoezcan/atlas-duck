@@ -44,9 +44,9 @@ use atlas_duck_atlassian::{
     ReadBudget,
 };
 use atlas_duck_audit::ScriptFailedFlags;
-use atlas_duck_audit::{AuditError, Clock, EventHeader, EventType, NewEvent, is_terminal};
+use atlas_duck_audit::{Actor, AuditError, Clock, EventHeader, EventType, NewEvent, is_terminal};
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
-use atlas_duck_ipc::proto::{ClientKind, Hello};
+use atlas_duck_ipc::proto::{ClientKind, Hello, PeerHop};
 use atlas_duck_registry::{OpClass, OperationSpec};
 use serde_json::Value;
 use tokio::sync::{Semaphore, watch};
@@ -168,6 +168,11 @@ pub struct RequestEntry {
     /// A script's params (its source), kept because a script has no [`Validated`]; `None` for
     /// every other request, whose params are `validated.params`.
     pub script_params: Option<Value>,
+    /// The agent columns of the connection (`payloads::agent_actor`), for the Request tab. Kept
+    /// apart from `ctx.actor` on purpose: `ctx.actor` is copied into every later record.
+    pub connection: Actor,
+    /// The peer's process chain (at most `MAX_HOPS`), for the Request tab.
+    pub peer_chain: Vec<PeerHop>,
     pub unusual: bool,
     pub session: SessionKey,
     /// `None` only for a request whose validation failed.
@@ -211,6 +216,8 @@ pub struct NewEntry {
     pub reason_excerpt: Option<String>,
     pub reason: Option<String>,
     pub script_params: Option<Value>,
+    pub connection: Actor,
+    pub peer_chain: Vec<PeerHop>,
     pub unusual: bool,
     pub session: SessionKey,
     pub validated: Option<Validated>,
@@ -240,6 +247,8 @@ impl RequestEntry {
             reason_excerpt: n.reason_excerpt,
             reason: n.reason,
             script_params: n.script_params,
+            connection: n.connection,
+            peer_chain: n.peer_chain,
             unusual: n.unusual,
             session: n.session,
             validated: n.validated,

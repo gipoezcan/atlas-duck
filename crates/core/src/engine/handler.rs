@@ -151,6 +151,7 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         None => (None, false),
     };
     let reason_excerpt = reason.as_deref().map(excerpt);
+    let (connection, peer_chain) = payloads::connection_facts(&j.session.hello, &j.conn);
     let mut new = NewEntry {
         head,
         spec,
@@ -161,6 +162,8 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         reason_excerpt,
         reason,
         script_params: None,
+        connection,
+        peer_chain,
         unusual: j.session.normalized.unusual || reason_unusual,
         session: j.session.key(&j.conn),
         validated: None,

@@ -19,7 +19,8 @@ use atlas_duck_audit::{
 };
 use atlas_duck_ipc::build_info::APP_VERSION;
 use atlas_duck_ipc::envelope::ErrorCode;
-use atlas_duck_ipc::proto::{AgentNameSource, ClientKind, ConnectionMeta, Hello};
+use atlas_duck_ipc::peer::MAX_HOPS;
+use atlas_duck_ipc::proto::{AgentNameSource, ClientKind, ConnectionMeta, Hello, PeerHop};
 use atlas_duck_preview::CandidateRev;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -277,6 +278,19 @@ pub fn agent_actor(hello: &Hello, conn: &ConnectionMeta) -> Actor {
         peer_origin_exe: conn.peer.peer_origin_exe.clone(),
         ..Actor::default()
     }
+}
+
+/// What a queued entry keeps of its connection for the Request tab: the agent columns and the
+/// peer chain cut to `MAX_HOPS`. Never written into `ctx.actor` (see `RequestEntry::connection`).
+pub fn connection_facts(hello: &Hello, conn: &ConnectionMeta) -> (Actor, Vec<PeerHop>) {
+    let chain = conn
+        .peer
+        .peer_chain
+        .iter()
+        .take(MAX_HOPS)
+        .cloned()
+        .collect();
+    (agent_actor(hello, conn), chain)
 }
 
 /// The agent columns of `hello`/`conn` over `ctx.actor`'s approver fields.

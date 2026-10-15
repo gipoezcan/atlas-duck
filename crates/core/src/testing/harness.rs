@@ -882,10 +882,19 @@ impl Harness {
 
     /// A new connection whose `hello` (CLI, `agent_name` via flag) has been answered.
     pub async fn conn(&self, agent: &str) -> Result<ConnectionMeta, TestError> {
+        self.conn_with_peer(agent, PeerInfo::default()).await
+    }
+
+    /// [`Harness::conn`] with the OS facts of the peer `peer`.
+    pub async fn conn_with_peer(
+        &self,
+        agent: &str,
+        peer: PeerInfo,
+    ) -> Result<ConnectionMeta, TestError> {
         let n = self.next_conn.fetch_add(1, Ordering::SeqCst);
         let conn = ConnectionMeta {
             connection_id: format!("conn-{n}"),
-            peer: PeerInfo::default(),
+            peer,
         };
         let hello = Hello {
             build_id: BUILD_ID.to_owned(),

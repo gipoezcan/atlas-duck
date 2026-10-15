@@ -110,11 +110,11 @@ fn queue_items() -> Vec<QueueItem> {
 }
 
 fn queue_details() -> Vec<QueueDetail> {
-    queue_items()
-        .into_iter()
-        .take(1)
-        .map(|item| QueueDetail {
-            item,
+    let mut items = queue_items().into_iter();
+    let (full, nulls) = (items.next().unwrap(), items.next().unwrap());
+    vec![
+        QueueDetail {
+            item: full,
             request: RequestDetail {
                 params: json!({ "key": "PROJ-1", "fields": ["summary", "status"] }),
                 params_sha256: "cd".repeat(32),
@@ -122,15 +122,35 @@ fn queue_details() -> Vec<QueueDetail> {
                 submitted_at: "2026-10-14T09:30:00.000Z".into(),
                 client_kind: Some("cli".into()),
                 agent_name: Some("claude-code".into()),
-                agent_name_source: Some("hello".into()),
+                agent_name_source: Some("flag".into()),
                 cwd_basename: "atlas-duck".into(),
                 connection_id: Some("conn-0001".into()),
                 peer_pid: Some(4242),
                 peer_exe: Some("/usr/bin/atlas".into()),
-                peer_origin_exe: None,
+                peer_origin_exe: Some("/usr/bin/zsh".into()),
+                peer_chain: vec!["4242 /usr/bin/atlas".into(), "4100 /usr/bin/zsh".into()],
             },
-        })
-        .collect()
+        },
+        // Every `Option` is `None`: the null branches of `isRequestDetail`.
+        QueueDetail {
+            item: nulls,
+            request: RequestDetail {
+                params: serde_json::Value::Null,
+                params_sha256: "ef".repeat(32),
+                reason: None,
+                submitted_at: "2026-10-14T09:31:00.000Z".into(),
+                client_kind: None,
+                agent_name: None,
+                agent_name_source: None,
+                cwd_basename: "atlas-duck".into(),
+                connection_id: None,
+                peer_pid: None,
+                peer_exe: None,
+                peer_origin_exe: None,
+                peer_chain: vec![],
+            },
+        },
+    ]
 }
 
 fn header(class: &str) -> PreviewHeader {

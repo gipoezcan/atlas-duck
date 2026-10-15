@@ -298,8 +298,8 @@ pub struct QueueItem {
 /// What the Approvals window's Request tab shows of a queued request (§5.6): the agent's params,
 /// their hash, the normalized reason and the connection facts. Every string that came from an
 /// agent or from the peer's process is display-escaped here (§6.4), the strings and keys of
-/// `params` included; `params` is JSON the UI renders as text. The peer chain is not kept past `REQUEST_RECEIVED`, so only the origin exe
-/// is shown.
+/// `params` included; `params` is JSON the UI renders as text. The peer facts are the OS's, not
+/// the agent's: the UI shows them as unverified (§3.1).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RequestDetail {
     pub params: Value,
@@ -311,13 +311,15 @@ pub struct RequestDetail {
     pub submitted_at: String,
     pub client_kind: Option<String>,
     pub agent_name: Option<String>,
-    /// `hello`, `env` or `none` (§3.3): where the agent name came from.
+    /// `flag`, `env`, `mcp-clientInfo` or `none` (§3.3): where the agent name came from.
     pub agent_name_source: Option<String>,
     pub cwd_basename: String,
     pub connection_id: Option<String>,
     pub peer_pid: Option<u32>,
     pub peer_exe: Option<String>,
     pub peer_origin_exe: Option<String>,
+    /// One display-escaped line per hop, direct peer first (`<pid> <exe>`), at most `MAX_HOPS`.
+    pub peer_chain: Vec<String>,
 }
 
 fn display_path(p: &std::path::Path) -> String {
@@ -1814,7 +1816,7 @@ impl DecisionApi for CoreDecisions {
     fn request_detail(&self, request_id: &str) -> Option<RequestDetail> {
         let e = self.engine.entry(request_id)?;
         in_queue(&self.engine, &e)?;
-        let actor = &e.ctx.actor;
+        let actor = &e.connection;
         Some(RequestDetail {
             params: e.params().map_or(Value::Null, escape_json),
             params_sha256: e.params_sha256.clone(),
@@ -1828,6 +1830,11 @@ impl DecisionApi for CoreDecisions {
             peer_pid: actor.peer_pid,
             peer_exe: actor.peer_exe.as_deref().map(display_path),
             peer_origin_exe: actor.peer_origin_exe.as_deref().map(display_path),
+            peer_chain: e
+                .peer_chain
+                .iter()
+                .map(|h| format!("{} {}", h.pid, display_path(&h.exe)))
+                .collect(),
         })
     }
 

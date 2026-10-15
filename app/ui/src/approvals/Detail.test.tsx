@@ -126,6 +126,40 @@ describe('Detail', () => {
     expect(screen.getByText(/agent receives `failed` \(exit 6\), HTTP \d+, no text/)).toBeTruthy();
   });
 
+  it('i38_second_press_sends_the_displayed_revision', async () => {
+    const { rerender } = await opened('upstream_error');
+    const rev2 = { ...item.candidate_rev, counter: item.candidate_rev.counter + 1 };
+    const item2: QueueItem = { ...item, candidate_rev: rev2 };
+    mockedDecide.mockResolvedValueOnce({ request_id: item.request_id, status: 'pending' });
+    mockedPreview.mockResolvedValueOnce(responseOf('upstream_error', { candidate_rev: rev2 }));
+    fireEvent.click(screen.getByRole('button', { name: 'Release status only' }));
+    await waitFor(() => expect(mockedPreview).toHaveBeenCalledTimes(2));
+    // Until the queue re-read brings rev 2, nothing can be sent against rev 1.
+    expect(screen.queryByRole('button', { name: 'Release status only' })).toBeNull();
+    rerender(<Detail item={item2} openToken={1} />);
+    mockedDecide.mockResolvedValueOnce({ request_id: item.request_id, status: 'released' });
+    fireEvent.click(await screen.findByRole('button', { name: 'Release status only' }));
+    await waitFor(() => expect(mockedDecide).toHaveBeenCalledTimes(2));
+    expect(mockedDecide.mock.calls[1]?.[0]).toEqual({
+      request_id: item.request_id,
+      candidate_rev: rev2,
+      decision: 'release_redacted',
+      redactions: [{ preset: 'status_only' }],
+    });
+  });
+
+  it('decision_buttons_are_disabled_while_a_decision_is_in_flight', async () => {
+    await opened('jira_issue');
+    mockedDecide.mockReturnValue(new Promise(() => undefined));
+    fireEvent.click(screen.getByRole('button', { name: 'Release' }));
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: 'Release' }) as HTMLButtonElement).disabled).toBe(true),
+    );
+    expect((screen.getByRole('button', { name: 'Deny' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Release' }));
+    expect(mockedDecide).toHaveBeenCalledTimes(1);
+  });
+
   it('outcome_card_offers_release_outcome_and_deny_only', async () => {
     await opened('outcome');
     expect(actionNames()).toEqual(['Release outcome', 'Deny']);
@@ -217,12 +251,13 @@ describe('Detail', () => {
         agent_name: '<b>agent</b>',
         reason: '<script>reason</script>',
         peer_exe: '<i>/bin/x</i>',
+        peer_chain: ['<u>1 /bin/x</u>'],
       },
     });
     const { container } = render(<Detail item={item} />);
     fireEvent.click(screen.getByRole('tab', { name: 'Request' }));
     await screen.findByText(detail.request.params_sha256);
-    expect(container.querySelector('img, b, i, script')).toBeNull();
+    expect(container.querySelector('img, b, i, u, script')).toBeNull();
     // Params are JSON text in a <pre>.
     const params = container.querySelector('pre.params-text');
     expect(params?.textContent).toBe(JSON.stringify({ body: hostile, list: [1, null] }, null, 2));
@@ -233,6 +268,12 @@ describe('Detail', () => {
       expect(within(bdi.parentElement as HTMLElement).getByText('unverified')).toBeTruthy();
     }
     expect(screen.getByText('<i>/bin/x</i>').tagName).toBe('BDI');
+    expect(screen.getByText('<u>1 /bin/x</u>').tagName).toBe('BDI');
+    // The OS-derived peer facts each carry the unverified marker (spec 3.1): pid, exe, origin exe, chain.
+    for (const label of ['Peer pid', 'Peer exe', 'Peer origin exe', 'Peer chain']) {
+      const dd = screen.getByText(label).nextElementSibling as HTMLElement;
+      expect(within(dd).getByText('unverified')).toBeTruthy();
+    }
     // The rest of the spec 5.6 list, as text.
     for (const label of [
       'Params',
@@ -248,6 +289,7 @@ describe('Detail', () => {
       'Peer pid',
       'Peer exe',
       'Peer origin exe',
+      'Peer chain',
     ]) {
       expect(screen.getByText(label).tagName).toBe('DT');
     }

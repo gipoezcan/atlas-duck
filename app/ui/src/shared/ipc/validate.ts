@@ -89,6 +89,7 @@ export const isRequestDetail = (v: unknown): v is RequestDetail =>
     peer_pid: numOrNull,
     peer_exe: strOrNull,
     peer_origin_exe: strOrNull,
+    peer_chain: (p) => Array.isArray(p) && p.every(isStr),
   });
 
 export const isQueueDetail = (v: unknown): v is QueueDetail =>

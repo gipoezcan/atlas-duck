@@ -72,6 +72,8 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
   const [state, setState] = useState<OpenState>({ kind: 'idle' });
   const [actionFailed, setActionFailed] = useState(false);
   const [decided, setDecided] = useState<string | null>(null);
+  /** A `decide` is in flight: every decision button is disabled until it answers. */
+  const [busy, setBusy] = useState(false);
   const latest = useRef(0);
 
   const open = useCallback(() => {
@@ -107,12 +109,17 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
 
   const send = (args: Omit<DecideArgs, 'request_id' | 'candidate_rev'>) => {
     const rev = shown?.preview.candidate_rev ?? item.candidate_rev;
+    if (busy) return;
+    setBusy(true);
     setActionFailed(false);
     decide({ request_id: item.request_id, candidate_rev: rev, ...args }).then(
       (outcome) => {
+        setBusy(false);
         if (outcome.status === 'pending') {
-          // A redaction made a new revision (I-38): open it so it is reviewed before the release,
-          // which is the same button pressed once more.
+          // A redaction made a new revision (I-38). Ruling (T14 review I3): the fetch below
+          // follows the user's own "Release status only" press, so it is not a navigation the user
+          // did not ask for; the new revision is displayed, and the second press of the same button
+          // sends that displayed revision. T15's inert window must cover this candidate change.
           open();
         } else {
           // No auto-advance: the decided item stays selected, its preview is cleared, nothing is fetched.
@@ -122,6 +129,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
         }
       },
       (e: unknown) => {
+        setBusy(false);
         const text = blockedText(e);
         if (text !== null) setState({ kind: 'blocked', text });
         else setActionFailed(true);
@@ -138,7 +146,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
     shown !== null && typeof shown.preview.body.status === 'number' ? shown.preview.body.status : null;
 
   const denyButton = (
-    <button type="button" onClick={() => send({ decision: 'deny' })}>
+    <button type="button" disabled={busy} onClick={() => send({ decision: 'deny' })}>
       {DETAIL_TEXT.deny}
     </button>
   );
@@ -159,12 +167,16 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
   } else if (kind === 'upstream_error') {
     actions = (
       <>
-        <button type="button" disabled={!approvable} onClick={() => send({ decision: 'release' })}>
+        <button
+          type="button"
+          disabled={!approvable || busy}
+          onClick={() => send({ decision: 'release' })}
+        >
           {DETAIL_TEXT.release}
         </button>
         <button
           type="button"
-          disabled={!approvable}
+          disabled={!approvable || busy}
           onClick={() => send({ decision: 'release_redacted', redactions: STATUS_ONLY })}
         >
           {DETAIL_TEXT.release_status_only}
@@ -180,7 +192,11 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
   } else if (kind === 'outcome') {
     actions = (
       <>
-        <button type="button" disabled={!approvable} onClick={() => send({ decision: 'release' })}>
+        <button
+          type="button"
+          disabled={!approvable || busy}
+          onClick={() => send({ decision: 'release' })}
+        >
           {DETAIL_TEXT.release_outcome}
         </button>
         {denyButton}
@@ -201,7 +217,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
       <>
         <button
           type="button"
-          disabled={!approvable}
+          disabled={!approvable || busy}
           onClick={() => send({ decision: isWrite ? 'approve' : 'release' })}
         >
           {isWrite ? DETAIL_TEXT.approve : DETAIL_TEXT.release}
