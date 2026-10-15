@@ -116,6 +116,12 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", 
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 filetime = { workspace = true }
+# M6 T32: the `e2e` target's WebDriver client talks plain http to `tauri-driver` on 127.0.0.1. The
+# workspace pin with no extra feature (crates/atlassian already builds it), so Cargo.lock gains no crate.
+reqwest = { workspace = true }
+# reqwest's `rustls-no-provider` build panics in `ClientBuilder::build` without a process-wide
+# provider: the client installs `ring` once, as crates/atlassian does (same workspace pin).
+rustls = { workspace = true }
 
 # T19: the Windows probe test inspects the worker's modules and the session. T25: the S-02 flows
 # read a process's parent (Toolhelp), resume a suspended CLI and put it in a job object.

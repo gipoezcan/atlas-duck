@@ -122,8 +122,18 @@ impl ScrubPlan {
 /// when no token names [`REMOTE_DEBUGGING`], rewritten without those tokens otherwise, and removed
 /// when nothing is left or the value cannot be rewritten safely (quoted, or not Unicode).
 pub fn scrub_plan(env: &dyn Fn(&str) -> Option<OsString>) -> ScrubPlan {
+    scrub_plan_exempting(env, &[])
+}
+
+/// [`scrub_plan`] leaving the `exempt` names alone. `apply_early` passes a non-empty list only in
+/// the `scripted-approver` build with the E2E opt-in ([`driver_exemptions`]); every other build
+/// passes `&[]`.
+fn scrub_plan_exempting(env: &dyn Fn(&str) -> Option<OsString>, exempt: &[&str]) -> ScrubPlan {
     let mut actions = Vec::new();
     for name in SCRUBBED {
+        if exempt.contains(&name) {
+            continue;
+        }
         let Some(value) = env(name) else {
             continue;
         };
@@ -136,6 +146,34 @@ pub fn scrub_plan(env: &dyn Fn(&str) -> Option<OsString>) -> ScrubPlan {
         }
     }
     ScrubPlan { actions }
+}
+
+/// M6 T32 (ledger, T2 review): the E2E opt-in. `msedgedriver` and `WebKitWebDriver` reach the app's
+/// webview through the variables below, so the `e2e` target's driver processes set them and the app
+/// started by `tauri-driver` would otherwise remove them (§2.5). Honoured only in the
+/// `scripted-approver` build (debug builds only: `lib.rs` refuses it in a release build) and only
+/// with this variable set to `1`. Release builds never see it: S-04 runs the release build with the
+/// variables set and no exemption.
+#[cfg(feature = "scripted-approver")]
+pub const ENV_E2E_ALLOW_DRIVER: &str = "ATLAS_DUCK_E2E_ALLOW_DRIVER";
+
+/// What the E2E opt-in leaves alone: the webview driver variables only. `LD_PRELOAD`, `GTK_MODULES`
+/// and `GIO_EXTRA_MODULES` are scrubbed whatever the opt-in says.
+#[cfg(feature = "scripted-approver")]
+pub const DRIVER_EXEMPT: [&str; 3] = [
+    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS,
+    "WEBVIEW2_USER_DATA_FOLDER",
+    "WEBKIT_INSPECTOR_SERVER",
+];
+
+/// The names the E2E opt-in exempts for this environment: [`DRIVER_EXEMPT`] when
+/// [`ENV_E2E_ALLOW_DRIVER`] is exactly `1`, nothing otherwise.
+#[cfg(feature = "scripted-approver")]
+pub fn driver_exemptions(env: &dyn Fn(&str) -> Option<OsString>) -> &'static [&'static str] {
+    match env(ENV_E2E_ALLOW_DRIVER) {
+        Some(v) if v == "1" => &DRIVER_EXEMPT,
+        _ => &[],
+    }
 }
 
 fn names_remote_debugging(text: &str) -> bool {
@@ -189,7 +227,11 @@ pub fn apply_early() -> Hardening {
         mitigations.push(MITIGATION_DLL_DIRECTORIES);
     }
 
-    let plan = scrub_plan(&|name| std::env::var_os(name));
+    #[cfg(feature = "scripted-approver")]
+    let exempt = driver_exemptions(&|name| std::env::var_os(name));
+    #[cfg(not(feature = "scripted-approver"))]
+    let exempt: &[&str] = &[];
+    let plan = scrub_plan_exempting(&|name| std::env::var_os(name), exempt);
     apply_env(&plan);
 
     #[cfg(windows)]
@@ -463,6 +505,90 @@ mod tests {
             (name == WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS).then(|| clean.clone())
         });
         assert!(plan.actions.is_empty());
+    }
+
+    /// Without the E2E opt-in (every build but `scripted-approver` + the variable) the plan is
+    /// exactly the §2.5 scrub: `scrub_plan` takes no exemption.
+    #[test]
+    fn scrub_plan_has_no_driver_exemption() {
+        let mut pairs: Vec<(&str, &str)> = SCRUBBED.iter().map(|n| (*n, "x")).collect();
+        pairs[0].1 = "--remote-debugging-port=0";
+        let plan = scrub_plan(&env_of(&pairs));
+        assert_eq!(plan.log_names(), SCRUBBED);
+    }
+
+    #[cfg(feature = "scripted-approver")]
+    mod driver_opt_in {
+        use super::*;
+
+        fn all_scrubbed_present(opt_in: Option<&'static str>) -> impl Fn(&str) -> Option<OsString> {
+            let mut pairs: Vec<(&str, &str)> = SCRUBBED.iter().map(|n| (*n, "x")).collect();
+            pairs[0].1 = "--remote-debugging-port=0";
+            if let Some(v) = opt_in {
+                pairs.push((ENV_E2E_ALLOW_DRIVER, v));
+            }
+            env_of(&pairs)
+        }
+
+        fn plan_names(opt_in: Option<&'static str>) -> Vec<&'static str> {
+            let env = all_scrubbed_present(opt_in);
+            scrub_plan_exempting(&env, driver_exemptions(&env)).log_names()
+        }
+
+        #[test]
+        fn the_opt_in_leaves_only_the_driver_variables() {
+            assert_eq!(
+                plan_names(Some("1")),
+                [
+                    "WEBKIT_INSPECTOR_HTTP_SERVER",
+                    "LD_PRELOAD",
+                    "GTK_MODULES",
+                    "GIO_EXTRA_MODULES"
+                ]
+            );
+        }
+
+        #[test]
+        fn without_the_opt_in_everything_is_scrubbed() {
+            assert_eq!(plan_names(None), SCRUBBED);
+            // Only the exact value 1 counts.
+            for v in ["", "0", "true", "yes", "11", " 1"] {
+                assert_eq!(plan_names(Some(v)), SCRUBBED, "{v:?}");
+            }
+        }
+
+        #[test]
+        fn the_opt_in_keeps_the_debugging_tokens_of_the_browser_arguments() {
+            let env = env_of(&[
+                (ENV_E2E_ALLOW_DRIVER, "1"),
+                (
+                    WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS,
+                    "--remote-debugging-port=0",
+                ),
+            ]);
+            assert!(
+                scrub_plan_exempting(&env, driver_exemptions(&env))
+                    .actions
+                    .is_empty()
+            );
+            // The same variable without the opt-in loses the token.
+            let env = env_of(&[(
+                WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS,
+                "--remote-debugging-port=0",
+            )]);
+            assert_eq!(
+                scrub_plan_exempting(&env, driver_exemptions(&env)).actions,
+                [(WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS, EnvAction::Remove)]
+            );
+        }
+
+        #[test]
+        fn the_exemption_never_covers_the_loader_variables() {
+            for name in ["LD_PRELOAD", "GTK_MODULES", "GIO_EXTRA_MODULES"] {
+                assert!(!DRIVER_EXEMPT.contains(&name), "{name}");
+            }
+            assert!(!DRIVER_EXEMPT.contains(&KEPT));
+        }
     }
 
     const SENTINEL: &str = "SENTINEL-VALUE-5c1e";

@@ -395,6 +395,8 @@ dependencies = [
  "base64 0.22.1",
  "filetime",
  "libc",
+ "reqwest",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",

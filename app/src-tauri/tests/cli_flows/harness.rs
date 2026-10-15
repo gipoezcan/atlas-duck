@@ -954,8 +954,8 @@ impl AppProc {
         Ok(())
     }
 
-    /// Waits (100 s) for the process to exit by itself (M6 T29: after a signal sent to it).
-    #[cfg(unix)]
+    /// Waits (100 s) for the process to exit by itself (M6 T29: after a signal sent to it; M6 T32:
+    /// after the Windows `WM_QUERYENDSESSION`).
     pub fn wait_exit(&mut self) -> Result<ExitStatus> {
         let Some(child) = self.child.as_mut() else {
             return Err("the app is not running".into());
