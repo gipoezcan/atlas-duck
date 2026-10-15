@@ -1,9 +1,8 @@
 import { createRoot } from 'react-dom/client';
 
-import { WINDOW_TITLES } from '../shared/strings';
+import { Wizard } from './Wizard';
 
-// Placeholder entry: a later task replaces it with the real window.
 const root = document.getElementById('root');
 if (root) {
-  createRoot(root).render(<h1>{WINDOW_TITLES.setup}</h1>);
+  createRoot(root).render(<Wizard />);
 }

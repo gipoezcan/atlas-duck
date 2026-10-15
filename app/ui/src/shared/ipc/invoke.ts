@@ -21,6 +21,7 @@ import type {
   SettingsGet,
   SettingsView,
   StatusLine,
+  WizardState,
 } from './types';
 import {
   arrayOf,
@@ -40,6 +41,7 @@ import {
   isSettingsGet,
   isSettingsView,
   isStatusLine,
+  isWizardState,
   toCommandError,
   type Validator,
 } from './validate';
@@ -216,6 +218,39 @@ export function cliInstall(): Promise<CliInstallAnswer> {
 /** Removes what `cliInstall` wrote and `cli.toml`. */
 export function cliUninstall(): Promise<CliInstallAnswer> {
   return call('cli_uninstall', {}, isCliInstallAnswer);
+}
+
+/** The setup window's whole state (T23): Rust decides the step, the page renders it. */
+export function wizardState(): Promise<WizardState> {
+  return call('wizard_state', {}, isWizardState);
+}
+
+/**
+ * Step 0 with the default folder. Rust destroys and rebuilds the calling window while it answers:
+ * the answer may never arrive, and the page must not treat that as a failure.
+ */
+export function wizardUseDefaultDir(): Promise<WizardState> {
+  return call('wizard_use_default_dir', {}, isWizardState);
+}
+
+/** Step 0 with a folder Rust's own dialog picks (the page never sees or sends a path). */
+export function wizardChooseDir(): Promise<WizardState> {
+  return call('wizard_choose_dir', {}, isWizardState);
+}
+
+/** (1b) Begin: Rust checks the keyring and opens the credential window for the passphrase. */
+export function wizardBegin(): Promise<WizardState> {
+  return call('wizard_begin', {}, isWizardState);
+}
+
+/** Leaves the instances step, with or without additions. */
+export function wizardSkipInstances(): Promise<WizardState> {
+  return call('wizard_skip_instances', {}, isWizardState);
+}
+
+/** Ends the recovery-note, CLI or onboarding step; one step per call (Rust has no "from step"). */
+export function wizardFinish(): Promise<WizardState> {
+  return call('wizard_finish', {}, isWizardState);
 }
 
 export function rawPage(
