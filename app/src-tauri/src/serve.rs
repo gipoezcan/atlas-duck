@@ -596,6 +596,11 @@ pub fn start(
     let tee = Some(crate::testing::approver::ui_tee());
     #[cfg(not(feature = "scripted-approver"))]
     let tee = None;
+    // M6 T19: the attention engine follows the same events (raise rules, toast, tray count).
+    let mut ui = TauriUiSink::new(app.clone(), tee);
+    if let Some(feed) = crate::attention::install(app, tray_host) {
+        ui = ui.with_attention(feed);
+    }
     let inputs = StartInputs {
         data,
         lock,
@@ -603,7 +608,7 @@ pub fn start(
         install_id: pinned.install_id.clone(),
         config_dir: pinned.config_dir.clone(),
         keys,
-        ui: Arc::new(TauriUiSink::new(app.clone(), tee)),
+        ui: Arc::new(ui),
         confirmer: Arc::new(DialogConfirmer::new(app.clone())),
         tray_host,
         secret_service: Arc::new(CachedSecretService::new()),

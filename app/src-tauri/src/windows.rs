@@ -151,6 +151,17 @@ pub enum Show {
     Focus,
     /// Shown without taking the focus (attention mode "show without activating", Task 19).
     WithoutActivating,
+    /// Shown and focused by the attention engine, not by the user (attention mode "show and
+    /// focus", Task 19): the Approvals window gets `window_focus {requested: false}` first, so its
+    /// page swallows input for 1 s (§5.6, PD-75).
+    FocusUnrequested,
+}
+
+impl Show {
+    /// True when the window takes the focus.
+    fn focuses(self) -> bool {
+        matches!(self, Show::Focus | Show::FocusUnrequested)
+    }
 }
 
 /// Everything [`open`] passes to the window builder, decided by [`window_spec`] (pure).
@@ -205,7 +216,7 @@ pub fn window_spec(
         data_directory,
         devtools: DEVTOOLS_ALLOWED,
         browser_args: windows.then_some(WINDOWS_BROWSER_ARGS),
-        focused: how == Show::Focus,
+        focused: how.focuses(),
     })
 }
 
@@ -516,8 +527,13 @@ fn log_open_failed(label: Label, class: &'static str) {
 }
 
 fn bring_up<R: Runtime>(w: &WebviewWindow<R>, how: Show) -> Result<(), WindowError> {
+    // PD-75: the Approvals page learns whether the focus it is about to get was requested, before
+    // it gets it (its 1 s inert periods start on this event; an unrequested one swallows input).
+    if w.label() == Label::Approvals.as_str() && how.focuses() {
+        crate::ui_sink::emit_window_focus(w.app_handle(), w.label(), how == Show::Focus);
+    }
     w.show().map_err(|_| WindowError::Show)?;
-    if how == Show::Focus {
+    if how.focuses() {
         w.unminimize().map_err(|_| WindowError::Show)?;
         w.set_focus().map_err(|_| WindowError::Show)?;
     }
@@ -581,7 +597,7 @@ pub fn open<R: Runtime>(app: &AppHandle<R>, label: Label, how: Show) -> Result<(
             window_spec(label, how, data.as_ref(), cfg!(windows))
                 .and_then(|spec| build(app, &spec, registry.nav.clone()))
                 .and_then(|w| match how {
-                    Show::Focus => bring_up(&w, how),
+                    Show::Focus | Show::FocusUnrequested => bring_up(&w, how),
                     Show::WithoutActivating => Ok(()),
                 })
         }
@@ -1068,6 +1084,9 @@ mod tests {
             let s = r.unwrap_or_else(|e| panic!("{l:?}: {e:?}"));
             assert!(s.incognito && s.data_directory.is_none(), "{l:?}");
             assert!(!s.focused);
+            // T19: the attention engine's "show and focus" takes the focus like a user's request.
+            let unrequested = window_spec(l, Show::FocusUnrequested, None, cfg!(windows));
+            assert_eq!(unrequested.map(|s| s.focused), Ok(true), "{l:?}");
         }
         #[cfg(not(debug_assertions))]
         assert!(!DEVTOOLS_ALLOWED);

@@ -12,6 +12,7 @@ use tauri::plugin::TauriPlugin;
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent, Wry};
 
+use crate::attention;
 use crate::early_argv::FLAG_BACKGROUND;
 use crate::serve;
 use crate::startup::{StartupState, startup_message};
@@ -28,7 +29,7 @@ pub const MENU_ID_STATUS: &str = "status";
 pub const MENU_ID_OPEN_APPROVALS: &str = "open_approvals";
 /// Menu id of "Unlock…" (locked only).
 pub const MENU_ID_UNLOCK: &str = "unlock";
-/// Menu id of "Presentation mode" (Task 19 wires it).
+/// Menu id of "Presentation mode" (T19: it toggles `attention::toggle_presentation`).
 pub const MENU_ID_PRESENTATION_MODE: &str = "presentation_mode";
 /// Menu id of "Retry keychain" (`keychain_unavailable` only; Task 22 wires it, PD-89).
 pub const MENU_ID_RETRY_KEYCHAIN: &str = "retry_keychain";
@@ -38,12 +39,15 @@ pub const MENU_LABEL_QUIT: &str = "Quit";
 pub const MENU_LABEL_OPEN_APPROVALS: &str = "Open approvals (<n>)";
 /// §2.5 (verbatim).
 pub const MENU_LABEL_UNLOCK: &str = "Unlock…";
-/// §5.6 (verbatim): switches to "badge only" without confirmation (Task 19).
+/// §5.6 (verbatim): switches to "badge only" without confirmation (T19).
 pub const MENU_LABEL_PRESENTATION_MODE: &str = "Presentation mode";
 /// plan text (PD-89).
 pub const MENU_LABEL_RETRY_KEYCHAIN: &str = "Retry keychain";
 /// plan text (T6): the tooltip outside the error states; `<n>` is the pending count.
 pub const TOOLTIP_PENDING: &str = "atlas-duck: <n> pending";
+/// plan text (T19): the tooltip's second line while Presentation mode is on (badge only, until the
+/// same menu item switches it off).
+pub const TOOLTIP_PRESENTATION: &str = "Presentation mode: badge only";
 /// PD-06: the tray status text when the audit store could not be opened (plan text; no path,
 /// no error text).
 pub const MSG_STORE_UNAVAILABLE: &str = "audit store could not be opened";
@@ -71,7 +75,7 @@ pub enum TrayAction {
     OpenApprovals,
     /// The credential window for unlock; the same routing as a relaunch while locked.
     Unlock,
-    /// Task 19: switches the attention mode to "badge only" (§5.6).
+    /// T19: Presentation mode, on or off again (§5.6).
     PresentationMode,
     /// Task 22: one more keychain attempt (PD-89).
     RetryKeychain,
@@ -156,13 +160,18 @@ pub fn menu_entries(state: &AppSnapshot, pending: u32) -> Vec<MenuEntry> {
 
 /// The tooltip: the status text when there is one (Linux shows no tooltip, so the status item
 /// carries it there), else the pending count (§5.6 "The tray badge/tooltip always shows the
-/// pending count").
-pub fn tooltip_text(status: Option<&str>, pending: u32) -> String {
+/// pending count"); a second line says while Presentation mode is on.
+pub fn tooltip_text(status: Option<&str>, pending: u32, presentation: bool) -> String {
     let count = TOOLTIP_PENDING.replace("<n>", &pending.to_string());
-    match status {
+    let mut text = match status {
         Some(text) => format!("{text}\n{count}"),
         None => count,
+    };
+    if presentation {
+        text.push('\n');
+        text.push_str(TOOLTIP_PRESENTATION);
     }
+    text
 }
 
 /// The tray status text of a startup state: `startup_message(state)` for the four error
@@ -239,9 +248,26 @@ pub fn on_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
                 let _ = window.hide();
             }
         }
+        // PD-75: whenever the Approvals window gains the focus the page hears whether it was
+        // requested. One the engine took (`Show::FocusUnrequested`) already announced
+        // `requested: false`, and the page keeps the stricter of the two; any other (the user's
+        // click, alt-tab, the tray) is the user's own.
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Focused(true),
+            ..
+        } => on_window_focused(app, &label),
         #[cfg(target_os = "macos")]
         RunEvent::Reopen { .. } => windows::spawn_relaunch(app, Vec::new()),
         _ => {}
+    }
+}
+
+/// Window `label` gained the focus. Only the Approvals page listens to `window_focus` (its inert
+/// periods, PD-75); a focus nobody asked the engine for is the user's own: `requested: true`.
+pub fn on_window_focused<R: Runtime>(app: &AppHandle<R>, label: &str) {
+    if label == Label::Approvals.as_str() {
+        crate::ui_sink::emit_window_focus(app, label, true);
     }
 }
 
@@ -252,7 +278,7 @@ fn tray_view(app: &AppHandle) -> (Vec<MenuEntry>, String) {
     let status = status_text(&state);
     (
         menu_entries(&state, pending),
-        tooltip_text(status.as_deref(), pending),
+        tooltip_text(status.as_deref(), pending, attention::presentation_on(app)),
     )
 }
 
@@ -331,8 +357,10 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
             windows::spawn_relaunch(app, Vec::new());
         }
         Some(TrayAction::Quit) => serve::shutdown_then_exit(app, ShutdownReason::Quit),
-        // Task 19 (attention mode) and Task 22 (PD-89) wire these.
-        Some(TrayAction::PresentationMode | TrayAction::RetryKeychain) | None => {}
+        // The store write runs on the blocking pool (`toggle_presentation`).
+        Some(TrayAction::PresentationMode) => attention::toggle_presentation(app),
+        // Task 22 (PD-89) wires this.
+        Some(TrayAction::RetryKeychain) | None => {}
     }
 }
 
@@ -511,10 +539,15 @@ mod tests {
 
     #[test]
     fn tooltip_shows_the_pending_count() {
-        assert_eq!(tooltip_text(None, 3), "atlas-duck: 3 pending");
+        assert_eq!(tooltip_text(None, 3, false), "atlas-duck: 3 pending");
         assert_eq!(
-            tooltip_text(Some("audit store could not be opened"), 0),
+            tooltip_text(Some("audit store could not be opened"), 0, false),
             "audit store could not be opened\natlas-duck: 0 pending"
+        );
+        // Presentation mode adds one fixed line, after the count.
+        assert_eq!(
+            tooltip_text(None, 2, true),
+            "atlas-duck: 2 pending\nPresentation mode: badge only"
         );
     }
 

@@ -6,6 +6,7 @@
 #[cfg(all(feature = "scripted-approver", not(debug_assertions)))]
 compile_error!("scripted-approver must never reach a release build");
 
+pub mod attention;
 pub mod commands;
 pub mod compose;
 pub mod confirm;
@@ -68,6 +69,9 @@ pub fn run_gui(background: bool) -> ! {
         // The dialog plugin serves Rust-side error dialogs only. The capability set is
         // empty (§10.3), so no webview can call its commands.
         .plugin(tauri_plugin_dialog::init())
+        // The attention toast (§5.6, M6 T19) is sent from Rust (`attention::TauriNotifier`) only;
+        // no capability grants the plugin's commands to a window.
+        .plugin(tauri_plugin_notification::init())
         .setup(move |app| {
             // S-16 (test build only): command responses and event payloads are recorded, in a bounded\n            // ring buffer per channel (nothing drains it).
             #[cfg(feature = "scripted-approver")]
