@@ -61,20 +61,53 @@ const PASSPHRASE: &str = "correct horse battery";
 /// A scratch dir under cargo's per-target test dir, not `%TEMP%`: Tauri's mock runtime keeps every
 /// window it built alive for the rest of the process (the app and its windows hold each other),
 /// and with them the `instance.lock` of the data dir the app manages, so on Windows a dir cannot
-/// be deleted while the test binary runs. Leftovers of earlier runs are swept once per run
-/// (their locks died with their process); `cargo clean` removes the rest (M6 T22 m-6).
+/// be deleted while the test binary runs. Leftovers of earlier runs are swept once per run, but
+/// only those older than [`SWEEP_AGE`]: a younger one may belong to a run that is still going
+/// (nextest, two `cargo test`s on one target dir); `cargo clean` removes the rest (M6 T22 m-6).
 fn scratch() -> std::io::Result<tempfile::TempDir> {
     static SWEEP: std::sync::Once = std::sync::Once::new();
     let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("credential");
     std::fs::create_dir_all(&root)?;
-    SWEEP.call_once(|| {
-        if let Ok(old) = std::fs::read_dir(&root) {
-            for e in old.flatten() {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
-    });
+    SWEEP.call_once(|| sweep_older_than(&root, SWEEP_AGE));
     tempfile::Builder::new().tempdir_in(&root)
+}
+
+/// Dirs under the scratch root younger than this are never swept (another run's live data).
+const SWEEP_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Removes the entries of `root` last modified more than `age` ago; an entry whose age cannot be
+/// read is kept.
+fn sweep_older_than(root: &std::path::Path, age: Duration) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|elapsed| elapsed > age);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// M6 T22 review m-6: the sweep keeps what is younger than the age (another run's live data dir)
+/// and removes what is older.
+#[test]
+fn the_sweep_spares_young_dirs() -> TestResult {
+    let root = scratch()?;
+    let dir = root.path().join("another-runs-data");
+    std::fs::create_dir(&dir)?;
+    std::fs::write(dir.join("audit.db"), b"x")?;
+    std::thread::sleep(Duration::from_millis(60));
+    sweep_older_than(root.path(), SWEEP_AGE);
+    assert!(dir.join("audit.db").exists(), "a young dir is not swept");
+    sweep_older_than(root.path(), Duration::from_millis(10));
+    assert!(!dir.exists(), "an old one is");
+    Ok(())
 }
 
 fn app() -> Result<App<MockRuntime>, Box<dyn std::error::Error>> {
@@ -1342,6 +1375,67 @@ async fn a_failed_retry_is_a_failed_store_the_relaunch_says_so() -> TestResult {
     stop(&state).await
 }
 
+/// M6 T22 review m-2: an I/O error of the retry's `open` (a transient lock) is not a failed store:
+/// the gate stays locked and "Retry keychain" runs again, and then starts the core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_io_error_of_the_retry_open_keeps_a_manual_retry_possible() -> TestResult {
+    let w = World::new()?;
+    let watcher = Follower::new();
+    let fail = Arc::new(std::sync::atomic::AtomicU32::new(1));
+    let hooks = ServeHooks {
+        fail_retry_open: Some(fail.clone()),
+        ..watcher.hooks()
+    };
+    let (state, keys) = w.unavailable(false, hooks).await?;
+    let st = state.clone();
+    eventually("the automatic retries ended", move || {
+        !st.keychain_retrying()
+    })
+    .await?;
+    keys.available.store(true, Ordering::SeqCst);
+    assert_eq!(retry_keychain_now(&state), RetryNow::Started);
+    let st = state.clone();
+    eventually("the failed retry ended", move || !st.keychain_retrying()).await?;
+    assert_eq!(fail.load(Ordering::SeqCst), 0, "the failure was used");
+    assert!(!state.store_failed());
+    assert_eq!(
+        state.gate_state(),
+        Some(GateState::Locked(LockedReason::KeychainUnavailable))
+    );
+    assert_eq!(retry_keychain_now(&state), RetryNow::Started);
+    let st = state.clone();
+    eventually("the second retry started the core", move || {
+        st.core.get().is_some()
+    })
+    .await?;
+    stop(&state).await
+}
+
+/// M6 T22 review m-3: a retry started from anywhere (the credential window's command included)
+/// tells the watcher at once, so the tray shows "Waiting for keyring" while it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_started_retry_tells_the_watcher_at_once() -> TestResult {
+    let w = World::new()?;
+    let watcher = Follower::new();
+    let (state, keys) = w.unavailable(false, watcher.hooks()).await?;
+    let st = state.clone();
+    eventually("the automatic retries ended", move || {
+        !st.keychain_retrying()
+    })
+    .await?;
+    keys.hold(true);
+    let seen = watcher.calls();
+    assert_eq!(retry_keychain_now(&state), RetryNow::Started);
+    let (running, told) = (state.keychain_retrying(), watcher.calls() > seen);
+    // Released before the asserts: a held keystore would hang the runtime's shutdown.
+    keys.hold(false);
+    assert!(running, "the retry still runs (held)");
+    assert!(told, "told when it started");
+    let st = state.clone();
+    eventually("the retry ended", move || !st.keychain_retrying()).await?;
+    stop(&state).await
+}
+
 /// M6 T22 (L78): an `open` that blocks past the threshold raises the keychain prompt hint and
 /// tells the watcher; it goes again when the open returns. (The threshold is 10 s in production.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1354,6 +1448,7 @@ async fn a_blocked_open_raises_the_keychain_prompt_hint() -> TestResult {
     let watcher = Follower::new();
     let hooks = ServeHooks {
         keychain_prompt_after: Duration::from_millis(150),
+        keychain_prompt_enabled: true,
         ..watcher.hooks()
     };
     let flag = hooks.keychain_prompt.clone();

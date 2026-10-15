@@ -9,10 +9,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use atlas_duck_app_lib::credential::Purpose;
+use atlas_duck_app_lib::credential::raise::{raise_window, raise_window_with};
 use atlas_duck_app_lib::state::DataDirHold;
 use atlas_duck_app_lib::tray::on_run_event;
 use atlas_duck_app_lib::windows::{
-    Label, NavPolicy, Show, StartupRoute, Unlock, WindowError, WindowRegistry, open,
+    Label, NavPolicy, Relaunch, Show, StartupRoute, Unlock, WindowError, WindowRegistry, open,
     open_credential,
 };
 use atlas_duck_audit::lock::InstanceLock;
@@ -76,6 +77,44 @@ fn open_builds_once_under_the_fixed_label() -> TestResult {
             "unexpected label {label}"
         );
     }
+    Ok(())
+}
+
+/// M6 T22 review I-1: the locked / first-run re-raise never shows a window that exists (hidden:
+/// on Windows `show()` activates it, and an agent decides when a refused request lands); one that is
+/// not built yet is built unfocused. The mock runtime has no visibility to observe, so the test counts
+/// the calls that would build or show.
+#[test]
+fn the_re_raise_never_shows_a_window_that_exists() -> TestResult {
+    let app = app()?;
+    let handle = app.handle();
+    app.manage(WindowRegistry::new(
+        NavPolicy::for_this_platform(None),
+        StartupRoute::completed(),
+    ));
+    let calls = std::cell::Cell::new(0);
+    // A window that does not exist yet is built.
+    raise_window_with(handle, Relaunch::OpenSetup, |_| calls.set(calls.get() + 1));
+    assert_eq!(calls.get(), 1);
+
+    assert_eq!(open(handle, Label::Setup, Show::Focus), Ok(()));
+    handle
+        .get_webview_window("setup")
+        .ok_or("the setup window was not built")?
+        .hide()?;
+    // One that exists (the user closed the wizard: hidden) is not shown again.
+    raise_window_with(handle, Relaunch::OpenSetup, |_| calls.set(calls.get() + 1));
+    assert_eq!(calls.get(), 1, "a hidden window is not shown again");
+    // An action that opens no window touches nothing.
+    raise_window_with(handle, Relaunch::Nothing, |_| calls.set(calls.get() + 1));
+    assert_eq!(calls.get(), 1);
+    // The real builder is the one that builds.
+    let tmp = tempfile::tempdir()?;
+    let data = local_data_dir(&tmp)?;
+    let lock = Arc::new(InstanceLock::acquire(&data, "testhost")?);
+    app.manage(DataDirHold::new(data, lock));
+    raise_window(handle, Relaunch::OpenCredential(Unlock::Recover));
+    assert!(handle.get_webview_window("credential").is_some());
     Ok(())
 }
 

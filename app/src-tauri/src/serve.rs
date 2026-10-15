@@ -77,6 +77,11 @@ pub const LOG_EVENT_QUIT_CORE_LOST: &str = "quit_core_lost";
 /// waiting for a keychain authorization (an unsigned dev build re-prompts after every rebuild).
 pub const KEYCHAIN_PROMPT_AFTER: Duration = Duration::from_secs(10);
 
+/// L78: whether the platform's credential store can show an authorization prompt that blocks
+/// `audit::open` (macOS keychain, Secret Service unlock). Windows' Credential Manager shows none,
+/// so a slow `open` there is never a prompt and the hint would be false.
+pub const PLATFORM_HAS_KEYCHAIN_PROMPT: bool = cfg!(not(windows));
+
 /// L78: `audit::open`, started at `open_started`, still blocks at `now`: the status line
 /// `keychain_prompt` (PD-90) is shown. Pure over the two instants.
 pub fn keychain_prompt_hint(open_started: Instant, now: Instant) -> bool {
@@ -106,9 +111,14 @@ pub struct ServeHooks {
     pub keychain_prompt: Arc<AtomicBool>,
     /// [`KEYCHAIN_PROMPT_AFTER`] in production.
     pub keychain_prompt_after: Duration,
+    /// [`PLATFORM_HAS_KEYCHAIN_PROMPT`] in production; without it the hint is never raised.
+    pub keychain_prompt_enabled: bool,
     /// Tests: the next `n` `Core::start`s of this serving state fail (the store is shut down).
     #[doc(hidden)]
     pub fail_core_start: Option<Arc<AtomicU32>>,
+    /// Tests: the next `n` retry `open`s of this serving state fail with an I/O error.
+    #[doc(hidden)]
+    pub fail_retry_open: Option<Arc<AtomicU32>>,
 }
 
 impl Default for ServeHooks {
@@ -117,7 +127,9 @@ impl Default for ServeHooks {
             watcher: None,
             keychain_prompt: Arc::new(AtomicBool::new(false)),
             keychain_prompt_after: KEYCHAIN_PROMPT_AFTER,
+            keychain_prompt_enabled: PLATFORM_HAS_KEYCHAIN_PROMPT,
             fail_core_start: None,
+            fail_retry_open: None,
         }
     }
 }
@@ -140,6 +152,9 @@ impl ServeHooks {
 /// authorization prompt, L78); past [`ServeHooks::keychain_prompt_after`] the hint is up until it
 /// returns.
 async fn with_prompt_hint<T>(open: impl Future<Output = T>, hooks: &ServeHooks) -> T {
+    if !hooks.keychain_prompt_enabled {
+        return open.await;
+    }
     tokio::pin!(open);
     let started = Instant::now();
     tokio::select! {
@@ -843,6 +858,8 @@ pub fn retry_keychain_now(state: &Arc<ServeState>) -> RetryNow {
     );
     *lock(&state.retry) = Some(task);
     drop(frozen);
+    // The tray shows "Waiting for keyring" at once, whichever surface started the retry.
+    state.hooks.notify();
     RetryNow::Started
 }
 
@@ -1482,7 +1499,8 @@ impl CoreStarter {
 /// another locked reason, `StoreNewer` or `FirstRun` swaps to that gate and stops; a failure
 /// (`Err`, or `Core::start` refusing) is logged and keeps the locked gate (the endpoint is
 /// already bound, PD-06 cannot apply) and marks the store failed ([`ServeState::store_failed`]:
-/// the tray and the relaunch say so). After the schedule the app stays locked; the tray's and the
+/// the tray and the relaunch say so), except an I/O error of the `open`, which only ends this run
+/// (a manual retry may try again). After the schedule the app stays locked; the tray's and the
 /// credential window's "Retry keychain" run one more attempt (`manual`, PD-89). Ends early on the
 /// shutdown signal and after [`ServeState::freeze`].
 async fn retry_keychain(
@@ -1503,12 +1521,21 @@ async fn retry_keychain(
         if *lock(&state.frozen) {
             return;
         }
-        let opened = with_prompt_hint(opener.clone().retry_open(), &state.hooks).await;
+        let opened = if take_one(state.hooks.fail_retry_open.as_deref()) {
+            Err(StoreFailure::Io)
+        } else {
+            with_prompt_hint(opener.clone().retry_open(), &state.hooks).await
+        };
         let (outcome, keys) = match opened {
             Ok(opened) => opened,
             Err(f) => {
                 f.log();
-                state.mark_store_failed();
+                // An I/O error of the `open` (a transient AV or backup lock on Windows) is not a
+                // verdict on the store: the gate stays locked and "Retry keychain" can try again
+                // (T20). Any other class (integrity, migration) is final until a restart.
+                if f != StoreFailure::Io {
+                    state.mark_store_failed();
+                }
                 return;
             }
         };
@@ -1573,6 +1600,14 @@ async fn retry_keychain(
     if !manual {
         tracing::warn!(event = LOG_EVENT_KEYCHAIN_RETRY_EXHAUSTED);
     }
+}
+
+/// Tests: consumes one of the failures a counter in `hooks` still holds.
+fn take_one(counter: Option<&AtomicU32>) -> bool {
+    counter.is_some_and(|c| {
+        c.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    })
 }
 
 /// Spawns [`retry_keychain`]; the caller has set [`ServeState::retrying`]. When the task ends, by
@@ -2017,6 +2052,7 @@ mod tests {
         let told = Arc::new(Told::default());
         let hooks = ServeHooks {
             keychain_prompt_after: Duration::from_millis(300),
+            keychain_prompt_enabled: true,
             ..watched(&told)
         };
         let flag = hooks.keychain_prompt.clone();
@@ -2058,6 +2094,37 @@ mod tests {
         assert_eq!(slow.await.ok(), Some(2));
         assert!(!flag.load(Ordering::SeqCst));
         assert_eq!(told.count(), 2);
+    }
+
+    /// L78: Windows' Credential Manager shows no authorization prompt, so there the hint is never
+    /// raised, however long `open` blocks; the production default follows the platform.
+    #[tokio::test]
+    async fn no_prompt_hint_where_the_platform_has_no_keychain_prompt() {
+        assert_eq!(PLATFORM_HAS_KEYCHAIN_PROMPT, cfg!(not(windows)));
+        assert_eq!(
+            ServeHooks::default().keychain_prompt_enabled,
+            PLATFORM_HAS_KEYCHAIN_PROMPT
+        );
+        let told = Arc::new(Told::default());
+        let hooks = ServeHooks {
+            keychain_prompt_after: Duration::from_millis(20),
+            keychain_prompt_enabled: false,
+            ..watched(&told)
+        };
+        let seen = Arc::new(AtomicBool::new(false));
+        let (flag, probe) = (hooks.keychain_prompt.clone(), seen.clone());
+        let out = with_prompt_hint(
+            async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                probe.store(flag.load(Ordering::SeqCst), Ordering::SeqCst);
+                3
+            },
+            &hooks,
+        )
+        .await;
+        assert_eq!(out, 3);
+        assert!(!seen.load(Ordering::SeqCst), "no hint while blocked");
+        assert_eq!(told.count(), 0);
     }
 
     /// The watcher (tray, credential window) hears every swap and a failed store, and nothing

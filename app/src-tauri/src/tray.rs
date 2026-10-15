@@ -148,9 +148,14 @@ fn unlockable(state: &AppSnapshot) -> bool {
 
 /// The tray menu for `state` with `pending` requests, in menu order (§2.5): the disabled status
 /// items (`status`: [`status_lines`]), "Open approvals (N)" (always: it takes the GUI relaunch
-/// path), "Unlock…" (locked), "Retry keychain" (`keychain_unavailable`), "Presentation mode" (while
-/// `Core` serves), Quit.
-pub fn menu_entries(state: &AppSnapshot, pending: u32, status: &[String]) -> Vec<MenuEntry> {
+/// path), "Unlock…" (locked), "Retry keychain" (`keychain_unavailable`; disabled while a retry
+/// runs, `keychain_retrying`), "Presentation mode" (while `Core` serves), Quit.
+pub fn menu_entries(
+    state: &AppSnapshot,
+    pending: u32,
+    status: &[String],
+    keychain_retrying: bool,
+) -> Vec<MenuEntry> {
     let mut entries = Vec::with_capacity(9);
     for (id, text) in MENU_ID_STATUS_LINES.iter().zip(status) {
         entries.push(MenuEntry {
@@ -167,10 +172,13 @@ pub fn menu_entries(state: &AppSnapshot, pending: u32, status: &[String]) -> Vec
         entries.push(MenuEntry::item(MENU_ID_UNLOCK, MENU_LABEL_UNLOCK));
     }
     if state == &AppSnapshot::Gate(GateState::Locked(LockedReason::KeychainUnavailable)) {
-        entries.push(MenuEntry::item(
-            MENU_ID_RETRY_KEYCHAIN,
-            MENU_LABEL_RETRY_KEYCHAIN,
-        ));
+        // PD-89: a retry the user may start is the one after the automatic schedule; while a retry
+        // runs the entry is listed but disabled (a click would be a silent no-op).
+        entries.push(MenuEntry {
+            id: MENU_ID_RETRY_KEYCHAIN,
+            label: MENU_LABEL_RETRY_KEYCHAIN.to_owned(),
+            enabled: !keychain_retrying,
+        });
     }
     if state == &AppSnapshot::Serving {
         entries.push(MenuEntry::item(
@@ -309,9 +317,10 @@ fn tray_view(app: &AppHandle) -> (Vec<MenuEntry>, String) {
     let state = windows::snapshot(app);
     let pending = app.try_state::<AppState>().map_or(0, |s| s.pending());
     // The gate's lines only: no core call (the menu is built on the main thread, too).
-    let status = status_lines(&state, &status::gather_gate(app));
+    let inputs = status::gather_gate(app);
+    let status = status_lines(&state, &inputs);
     (
-        menu_entries(&state, pending, &status),
+        menu_entries(&state, pending, &status, inputs.keychain_retrying),
         tooltip_text(&status, pending, attention::presentation_on(app)),
     )
 }
@@ -401,16 +410,12 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
 
 /// The tray's "Retry keychain" (PD-89): one more attempt through the retry loop's own path
 /// (`serve::retry_keychain_now`). The menu handler runs on the main thread, and the retry spawns
-/// onto the async runtime, so it goes through that runtime; the tray is rebuilt at once ("Waiting
-/// for keyring") and again by the watcher when the attempt ended.
+/// onto the async runtime, so it goes through that runtime; the watcher rebuilds the tray when the
+/// retry starts ("Waiting for keyring") and when the attempt ended.
 fn retry_keychain(app: &AppHandle) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let started = serve::retry_keychain_from_menu(handle.try_state::<ServeSlot>().as_deref());
-        if started == Some(serve::RetryNow::Started) {
-            let app = handle.clone();
-            tauri::async_runtime::spawn_blocking(move || refresh(&app));
-        }
+        let _ = serve::retry_keychain_from_menu(handle.try_state::<ServeSlot>().as_deref());
     });
 }
 
@@ -521,7 +526,7 @@ mod tests {
         assert_eq!(MENU_LABEL_PRESENTATION_MODE, "Presentation mode");
 
         // Serving: the count, presentation mode, Quit.
-        let serving = menu_entries(&AppSnapshot::Serving, 3, &[]);
+        let serving = menu_entries(&AppSnapshot::Serving, 3, &[], false);
         assert_eq!(
             ids(&serving),
             ["open_approvals", "presentation_mode", "quit"]
@@ -529,28 +534,35 @@ mod tests {
         assert_eq!(serving[0].label, "Open approvals (3)");
         assert!(serving.iter().all(|e| e.enabled));
         assert_eq!(
-            menu_entries(&AppSnapshot::Serving, 0, &[])[0].label,
+            menu_entries(&AppSnapshot::Serving, 0, &[], false)[0].label,
             "Open approvals (0)"
         );
         assert_eq!(
-            menu_entries(&AppSnapshot::Serving, 1234, &[])[0].label,
+            menu_entries(&AppSnapshot::Serving, 1234, &[], false)[0].label,
             "Open approvals (1234)"
         );
 
         // Locked: "Unlock…"; "Retry keychain" only while the keychain is unavailable.
-        let unavailable = menu_entries(&locked(LockedReason::KeychainUnavailable), 6, &[]);
+        let unavailable = menu_entries(&locked(LockedReason::KeychainUnavailable), 6, &[], false);
         assert_eq!(
             ids(&unavailable),
             ["open_approvals", "unlock", "retry_keychain", "quit"]
         );
         assert_eq!(unavailable[1].label, "Unlock\u{2026}");
         assert_eq!(unavailable[2].label, "Retry keychain");
+        assert!(unavailable[2].enabled);
+        // While a retry runs the entry stays listed, disabled (PD-89: after the schedule).
+        let running = menu_entries(&locked(LockedReason::KeychainUnavailable), 6, &[], true);
+        assert_eq!(ids(&running), ids(&unavailable));
+        assert!(!running[2].enabled);
+        assert!(running[1].enabled, "Unlock stays usable");
         for offer in [RecoveryOffer::RecoverThisLog, RecoveryOffer::FinishRestore] {
             assert_eq!(
                 ids(&menu_entries(
                     &locked(LockedReason::KeychainLost { offer }),
                     0,
-                    &[]
+                    &[],
+                    false
                 )),
                 ["open_approvals", "unlock", "quit"]
             );
@@ -560,25 +572,36 @@ mod tests {
             ids(&menu_entries(
                 &locked(LockedReason::KeyringNotLocal),
                 0,
-                &[]
+                &[],
+                false
             )),
             ["open_approvals", "quit"]
         );
 
         // The error states: a disabled status item above the rest.
         let state = AppSnapshot::StartupError("data directory /d not found".into());
-        let error = menu_entries(&state, 0, &status_lines(&state, &StatusInputs::default()));
+        let error = menu_entries(
+            &state,
+            0,
+            &status_lines(&state, &StatusInputs::default()),
+            false,
+        );
         assert_eq!(ids(&error), ["status", "open_approvals", "quit"]);
         assert_eq!(error[0].label, "data directory /d not found");
         assert!(!error[0].enabled);
         let state = AppSnapshot::StoreUnavailable;
-        let failed = menu_entries(&state, 0, &status_lines(&state, &StatusInputs::default()));
+        let failed = menu_entries(
+            &state,
+            0,
+            &status_lines(&state, &StatusInputs::default()),
+            false,
+        );
         assert_eq!(ids(&failed), ["status", "open_approvals", "quit"]);
         assert_eq!(failed[0].label, MSG_STORE_UNAVAILABLE);
 
         // More lines than the four status items are dropped from the menu (the tooltip has all).
         let many: Vec<String> = (1..=6).map(|n| format!("line {n}")).collect();
-        let crowded = menu_entries(&AppSnapshot::Serving, 0, &many);
+        let crowded = menu_entries(&AppSnapshot::Serving, 0, &many, false);
         assert_eq!(
             ids(&crowded),
             [
@@ -604,7 +627,7 @@ mod tests {
             AppSnapshot::Gate(GateState::StoreNewer),
         ] {
             assert_eq!(
-                ids(&menu_entries(&state, 0, &[])),
+                ids(&menu_entries(&state, 0, &[], false)),
                 ["open_approvals", "quit"],
                 "{state:?}"
             );
@@ -658,7 +681,7 @@ mod tests {
         // The count is in the menu and in the tooltip.
         let inputs = gate_inputs(GateState::Locked(LockedReason::KeychainUnavailable), 6);
         let lines = status_lines(&state, &inputs);
-        let menu = menu_entries(&state, 0, &lines);
+        let menu = menu_entries(&state, 0, &lines, false);
         assert_eq!(menu[0].id, MENU_ID_STATUS);
         assert_eq!(menu[0].label, "Locked \u{2014} 6 requests refused");
         assert!(!menu[0].enabled);
@@ -751,7 +774,10 @@ mod tests {
             locked(LockedReason::KeychainUnavailable),
             AppSnapshot::StoreUnavailable,
         ] {
-            for e in menu_entries(&state, 1, &[]).iter().filter(|e| e.enabled) {
+            for e in menu_entries(&state, 1, &[], false)
+                .iter()
+                .filter(|e| e.enabled)
+            {
                 assert!(action_for_menu_id(e.id).is_some(), "{} has no action", e.id);
             }
         }
