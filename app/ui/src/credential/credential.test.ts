@@ -21,6 +21,10 @@ const UNLOCK = { ...LOCKED, purpose: 'unlock', refused_count: 0 };
 const FIRST_RUN = { ...LOCKED, purpose: 'recovery_passphrase', refused_count: 1 };
 const OK = { ok: { atlassian_user: 'alice', product: 'jira', version: '9.4.0', warnings: [] } };
 
+// Rust answers of retry_keychain and save_recovery_note (commands/credential.rs: RetryStarted, NoteSaved).
+const RETRY_STARTED = { started: true };
+const NOTE_SAVED = { saved: true };
+
 const CANARY = 'canary-pat-S21-do-not-show';
 
 interface Harness {
@@ -132,6 +136,10 @@ describe('context header', () => {
     expect(t).not.toContain('Locked');
     const locked = await mount(LOCKED);
     expect(locked.root.textContent).toContain('Locked \u2014 3 requests refused');
+    // first run is not a locked state (spec 2.5)
+    const first = await mount(FIRST_RUN);
+    expect(first.root.textContent).toContain('Setup required \u2014 1 requests refused');
+    expect(first.root.textContent).not.toContain('Locked');
   });
 
   it('shows a refused-count of zero and an unknown purpose as escaped text without a form', async () => {
@@ -160,7 +168,7 @@ describe('PAT entry', () => {
     expect(h.calls('submit_secret')).toEqual([{ secret: CANARY, expires_on: '2027-01-31' }]);
     release(OK);
     await flush();
-    expect(h.root.textContent).toContain('Connected as alice, Jira 9.4.0');
+    expect(h.root.textContent).toContain('Connected as alice, Jira 9.4.0. You can close this window.');
     expect(h.root.outerHTML).not.toContain(CANARY);
     expect(h.root.querySelector('input')).toBeNull();
   });
@@ -177,15 +185,17 @@ describe('PAT entry', () => {
   it('failure_class_shown_window_stays', async () => {
     const h = await mount(PAT_CTX);
     handlers.submit_secret = () => ({ failed: { class: 'tls', conn: 'tls_unknown_issuer' } });
-    type(inputs(h.root)[0] as HTMLInputElement, CANARY);
+    const original = inputs(h.root)[0] as HTMLInputElement;
+    type(original, CANARY);
     submitForm(h.root);
     await flush();
     const t = h.root.textContent ?? '';
     expect(t).toContain('TLS certificate');
     expect(t).toContain('tls_unknown_issuer');
-    // still open for another try, secret field empty, nothing about the secret anywhere
-    const [pat] = inputs(h.root);
-    expect(pat?.value).toBe('');
+    // the element that held the secret is empty (render() builds new inputs, so check the old
+    // one), the form is open for another try, nothing about the secret anywhere
+    expect(original.value).toBe('');
+    expect(inputs(h.root)[0]?.value).toBe('');
     expect(h.root.outerHTML).not.toContain(CANARY);
     expect(h.invoke.mock.calls.some((c) => c[0] === 'quit')).toBe(false);
   });
@@ -229,9 +239,11 @@ describe('PAT entry', () => {
     handlers.submit_secret = () => {
       throw { kind: 'admin', message: `leaked ${CANARY}` };
     };
-    type(inputs(h.root)[0] as HTMLInputElement, CANARY);
+    const original = inputs(h.root)[0] as HTMLInputElement;
+    type(original, CANARY);
     submitForm(h.root);
     await flush();
+    expect(original.value).toBe('');
     expect(inputs(h.root)[0]?.value).toBe('');
     expect(h.root.outerHTML).not.toContain(CANARY);
     expect(h.root.textContent).toContain('could not be completed');
@@ -322,20 +334,70 @@ describe('passphrase entry', () => {
     expect(h.root.querySelector('form')).not.toBeNull();
   });
 
-  it('clears the fields when the context changes', async () => {
+  it('a refused-count refresh with the same purpose and target keeps the typed fields', async () => {
     const h = await mount(FIRST_RUN);
     const [a, b] = inputs(h.root) as [HTMLInputElement, HTMLInputElement];
     type(a, 'a'.repeat(12));
     type(b, 'a'.repeat(12));
-    ctxNow = { ...FIRST_RUN, note_available: true };
+    a.focus();
+    ctxNow = { ...FIRST_RUN, refused_count: 7, note_available: true };
     h.emit();
+    await flush();
+    // same elements, same values, same focus, only the header and the note button moved
+    expect(inputs(h.root)[0]).toBe(a);
+    expect(inputs(h.root)[1]).toBe(b);
+    expect(a.value).toBe('a'.repeat(12));
+    expect(b.value).toBe('a'.repeat(12));
+    expect(document.activeElement).toBe(a);
+    expect((h.root.querySelector('button[type=submit]') as HTMLButtonElement).disabled).toBe(false);
+    expect(h.root.textContent).toContain('Setup required — 7 requests refused');
+    expect(h.root.textContent).not.toContain('1 requests refused');
+    expect(buttons(h.root)).toContain('Save recovery note');
+  });
+
+  it('a refused-count refresh keeps busy and the in-flight answer', async () => {
+    const h = await mount(LOCKED);
+    let release: (v: unknown) => void = () => undefined;
+    handlers.submit_secret = () => new Promise((r) => (release = r));
+    type(inputs(h.root)[0] as HTMLInputElement, 'p'.repeat(12));
+    submitForm(h.root);
+    ctxNow = { ...LOCKED, refused_count: 4 };
+    h.emit();
+    await flush();
+    expect(h.root.textContent).toContain('Locked — 4 requests refused');
+    // still busy: a second submit is not started
+    type(inputs(h.root)[0] as HTMLInputElement, 'q'.repeat(12));
+    submitForm(h.root);
+    expect(h.calls('submit_secret')).toHaveLength(1);
+    release({ failed: { class: 'wrong_passphrase' } });
+    await flush();
+    expect(h.root.textContent).toContain('not the recovery passphrase');
+  });
+
+  it('clears the fields when the purpose changes', async () => {
+    const h = await mount(FIRST_RUN);
+    const [a, b] = inputs(h.root) as [HTMLInputElement, HTMLInputElement];
+    type(a, 'a'.repeat(12));
+    type(b, 'a'.repeat(12));
+    ctxNow = { ...FIRST_RUN, purpose: 'recover_this_log' };
+    h.emit();
+    await flush();
     expect(a.value).toBe('');
     expect(b.value).toBe('');
+    expect(inputs(h.root)).toHaveLength(1);
+    expect(inputs(h.root)[0]?.value).toBe('');
+  });
+
+  it('clears the fields when the target changes', async () => {
+    const h = await mount(PAT_CTX);
+    const pat = inputs(h.root)[0] as HTMLInputElement;
+    type(pat, CANARY);
+    ctxNow = { ...PAT_CTX, base_url: 'https://other.example' };
+    h.emit();
     await flush();
-    const [a2, b2] = inputs(h.root);
-    expect(a2?.value).toBe('');
-    expect(b2?.value).toBe('');
-    expect(buttons(h.root)).toContain('Save recovery note');
+    expect(pat.value).toBe('');
+    expect(inputs(h.root)[0]?.value).toBe('');
+    expect(h.root.textContent).toContain('https://other.example');
   });
 
   it('drops the answer of a submit that a context change overtook', async () => {
@@ -379,14 +441,60 @@ describe('buttons per purpose', () => {
     expect(h.calls('archive_and_start_fresh')).toEqual([{}]);
     expect(h.root.textContent).toContain('Cancelled.');
     const u = await mount(UNLOCK);
-    handlers.retry_keychain = () => ({ started: {} });
+    handlers.retry_keychain = () => RETRY_STARTED;
     button(u.root, 'Retry keychain').click();
     await flush();
     expect(u.calls('retry_keychain')).toEqual([{}]);
+    expect(u.root.textContent).toContain('Trying the keychain again.');
+  });
+
+  it('retry_keychain {started:false} says a retry is already running', async () => {
+    const u = await mount(UNLOCK);
+    handlers.retry_keychain = () => ({ started: false });
+    button(u.root, 'Retry keychain').click();
+    await flush();
+    expect(u.root.textContent).toContain('A keychain retry is already running.');
+    expect(u.root.textContent).not.toContain('Trying the keychain again.');
+    expect(u.root.querySelector('.result.failed')).not.toBeNull();
+  });
+
+  it('save_recovery_note shows saved only for {saved:true}', async () => {
+    const h = await mount({ ...FIRST_RUN, note_available: true });
+    handlers.save_recovery_note = () => NOTE_SAVED;
+    button(h.root, 'Save recovery note').click();
+    await flush();
+    expect(h.root.textContent).toContain('Recovery note saved.');
+    // a cancelled save dialog
+    handlers.save_recovery_note = () => ({ saved: false });
+    button(h.root, 'Save recovery note').click();
+    await flush();
+    expect(h.root.textContent).toContain('The recovery note was not saved.');
+    expect(h.root.textContent).not.toContain('Recovery note saved.');
+    expect(h.root.textContent).not.toContain('Done.');
+  });
+
+  it('an unknown answer of a plain action is not reported as success', async () => {
+    const h = await mount({ ...FIRST_RUN, note_available: true });
+    handlers.save_recovery_note = () => ({});
+    button(h.root, 'Save recovery note').click();
+    await flush();
+    expect(h.root.querySelector('.result.ok')).toBeNull();
   });
 
   it('Quit sends quit', async () => {
     const h = await mount(UNLOCK);
+    button(h.root, 'Quit').click();
+    await flush();
+    expect(h.calls('quit')).toEqual([{}]);
+  });
+
+  it('Quit stays enabled and sends quit while submit_secret is in flight', async () => {
+    const h = await mount(LOCKED);
+    handlers.submit_secret = () => new Promise(() => undefined);
+    type(inputs(h.root)[0] as HTMLInputElement, 'p'.repeat(12));
+    submitForm(h.root);
+    expect(button(h.root, 'Archive old DB and start fresh').disabled).toBe(true);
+    expect(button(h.root, 'Quit').disabled).toBe(false);
     button(h.root, 'Quit').click();
     await flush();
     expect(h.calls('quit')).toEqual([{}]);

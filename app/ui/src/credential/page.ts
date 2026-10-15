@@ -150,6 +150,10 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   let meter: HTMLMeterElement | null = null;
   let matchText: HTMLElement | null = null;
   let actionButtons: HTMLButtonElement[] = [];
+  let headerEl: HTMLElement | null = null;
+  let barEl: HTMLElement | null = null;
+  // Orders overlapping context reads: only the newest one is applied.
+  let loadSeq = 0;
 
   function clearSecrets(): void {
     if (secretField) secretField.value = '';
@@ -169,6 +173,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
 
   function refreshControls(): void {
     if (submitButton) submitButton.disabled = busy || !secretsValid();
+    // Quit is not in actionButtons: it is never disabled (spec 10.3, 2.5).
     for (const b of actionButtons) b.disabled = busy;
     if (secretField && ctx && !isPat(ctx.purpose)) {
       const n = Math.min(charCount(secretField.value), MIN_PASSPHRASE_CHARS);
@@ -215,6 +220,16 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     actionButtons.push(b);
   }
 
+  /** Quit works while a call is in flight: a locked app must stay quittable (spec 10.3, 2.5). */
+  function addQuit(parent: HTMLElement): void {
+    const b = el('button', 'action', 'Quit');
+    b.type = 'button';
+    b.addEventListener('click', () => {
+      call('quit').catch((e: unknown) => showResult(rejectionText(e), false));
+    });
+    parent.append(b);
+  }
+
   function showResult(text: string, ok: boolean, extra: string[] = []): void {
     result = { text, ok, extra };
     render();
@@ -256,7 +271,11 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       if (user.unusual || version.unusual) {
         extra.push('Some characters in the user or version are shown as escapes.');
       }
-      showResult(`Connected as ${user.shown}, ${name} ${version.shown}`, true, extra);
+      showResult(
+        `Connected as ${user.shown}, ${name} ${version.shown}. You can close this window.`,
+        true,
+        extra,
+      );
       return;
     }
     if (isRecord(outcome.accepted)) {
@@ -296,8 +315,11 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     } catch (e) {
       if (mine === generation) showResult(rejectionText(e), false);
     } finally {
-      busy = false;
-      if (mine === generation) refreshControls();
+      // An answer of an older generation never releases the busy flag of a newer call.
+      if (mine === generation) {
+        busy = false;
+        refreshControls();
+      }
     }
   }
 
@@ -314,18 +336,22 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       } else if (isRecord(outcome) && isRecord(outcome.archived)) {
         done = true;
         showResult('The old audit log was moved aside. Set up atlas-duck again in the setup window.', true);
-      } else if (isRecord(outcome) && isRecord(outcome.saved)) {
-        showResult('Recovery note saved.', true);
-      } else if (isRecord(outcome) && isRecord(outcome.started)) {
-        showResult('Trying the keychain again.', true);
+      } else if (isRecord(outcome) && typeof outcome.saved === 'boolean') {
+        if (outcome.saved) showResult('Recovery note saved.', true);
+        else showResult('The recovery note was not saved.', false);
+      } else if (isRecord(outcome) && typeof outcome.started === 'boolean') {
+        if (outcome.started) showResult('Trying the keychain again.', true);
+        else showResult('A keychain retry is already running.', false);
       } else {
-        showResult('Done.', true);
+        showResult('The request could not be completed.', false);
       }
     } catch (e) {
       if (mine === generation) showResult(rejectionText(e), false);
     } finally {
-      busy = false;
-      if (mine === generation) refreshControls();
+      if (mine === generation) {
+        busy = false;
+        refreshControls();
+      }
     }
   }
 
@@ -361,9 +387,25 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       );
     }
     if (ctx.refusedCount !== null) {
-      h.append(el('p', 'locked', `Locked \u2014 ${ctx.refusedCount} requests refused`));
+      const label = ctx.purpose === 'recovery_passphrase' ? 'Setup required' : 'Locked';
+      h.append(el('p', 'locked', `${label} \u2014 ${ctx.refusedCount} requests refused`));
     }
     return h;
+  }
+
+  function buildBar(bar: HTMLElement): void {
+    if (!ctx) return;
+    const purpose = ctx.purpose;
+    if (purpose === 'unlock') {
+      addAction(bar, 'Retry keychain', () => void plainAction('retry_keychain'));
+    }
+    if (purpose === 'recovery_passphrase' && ctx.noteAvailable) {
+      addAction(bar, 'Save recovery note', () => void plainAction('save_recovery_note'));
+    }
+    if (purpose === 'recover_this_log' || purpose === 'finish_restore') {
+      addAction(bar, 'Archive old DB and start fresh', () => void plainAction('archive_and_start_fresh'));
+    }
+    addQuit(bar);
   }
 
   function render(): void {
@@ -380,13 +422,15 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
       root.append(el('h1', 'title', 'Credential entry'));
       root.append(el('p', 'error', 'The window context is unavailable. Quit and start atlas-duck again.'));
       const bar = el('div', 'actions');
-      addAction(bar, 'Quit', () => void plainAction('quit'));
+      addQuit(bar);
       root.append(bar);
       return;
     }
-    root.append(header());
+    headerEl = header();
+    root.append(headerEl);
     const purpose = ctx.purpose;
     const bar = el('div', 'actions');
+    barEl = bar;
 
     if (!done && (isPat(purpose) || purpose === 'recovery_passphrase' || takesOnePassphrase(purpose))) {
       const form = el('form', 'entry');
@@ -428,15 +472,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
 
     if (purpose === 'unlock') {
       root.append(el('p', 'hint', 'The OS keychain is not available. Unlock it, then try again.'));
-      addAction(bar, 'Retry keychain', () => void plainAction('retry_keychain'));
     }
-    if (purpose === 'recovery_passphrase' && ctx.noteAvailable) {
-      addAction(bar, 'Save recovery note', () => void plainAction('save_recovery_note'));
-    }
-    if (purpose === 'recover_this_log' || purpose === 'finish_restore') {
-      addAction(bar, 'Archive old DB and start fresh', () => void plainAction('archive_and_start_fresh'));
-    }
-    addAction(bar, 'Quit', () => void plainAction('quit'));
+    buildBar(bar);
 
     if (result) {
       const box = el('div', result.ok ? 'result ok' : 'result failed');
@@ -449,25 +486,51 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     refreshControls();
   }
 
+  function sameTarget(a: Context, b: Context): boolean {
+    return a.purpose === b.purpose && a.alias === b.alias && a.product === b.product && a.baseUrl === b.baseUrl;
+  }
+
+  /** Same purpose and target: only the header and the note button change; the form is not touched. */
+  function updateInPlace(next: Context): void {
+    const noteChanged = ctx?.noteAvailable !== next.noteAvailable;
+    ctx = next;
+    if (headerEl) {
+      const fresh = header();
+      headerEl.replaceWith(fresh);
+      headerEl = fresh;
+    }
+    if (noteChanged && barEl) {
+      barEl.replaceChildren();
+      actionButtons = [];
+      buildBar(barEl);
+      refreshControls();
+    }
+  }
+
   async function reload(): Promise<void> {
-    // Whatever was typed belongs to the old context.
+    loadSeq += 1;
+    const token = loadSeq;
+    let next: Context | null = null;
+    try {
+      next = parseContext(await call('credential_context'));
+    } catch {
+      next = null;
+    }
+    if (token !== loadSeq) return;
+    if (ctx !== null && next !== null && sameTarget(ctx, next)) {
+      updateInPlace(next);
+      return;
+    }
+    // Another purpose or target (or no context at all): whatever was typed belongs to the old
+    // one, and the answer of a call in flight is dropped.
     clearSecrets();
     generation += 1;
-    const mine = generation;
-    try {
-      const next = parseContext(await call('credential_context'));
-      if (mine !== generation) return;
-      failedLoad = next === null;
-      if (ctx === null || next === null || ctx.purpose !== next.purpose) {
-        result = null;
-        done = false;
-      }
-      ctx = next;
-    } catch {
-      if (mine !== generation) return;
-      failedLoad = true;
-      ctx = null;
+    failedLoad = next === null;
+    if (ctx === null || next === null || ctx.purpose !== next.purpose) {
+      result = null;
+      done = false;
     }
+    ctx = next;
     busy = false;
     render();
   }
@@ -475,10 +538,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   let unlisten: (() => void) | null = null;
   let stopped = false;
   void deps
-    .listen('credential_context_changed', () => {
-      clearSecrets();
-      void reload();
-    })
+    .listen('credential_context_changed', () => void reload())
     .then((u) => {
       if (stopped) u();
       else unlisten = u;
