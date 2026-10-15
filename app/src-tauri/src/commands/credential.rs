@@ -420,17 +420,18 @@ pub fn unlock_passphrase(args: SubmitSecretArgs) -> Result<SecretString, Command
     Ok(secret.into_inner())
 }
 
-/// Destroys the credential window once this command has answered (the page is gone with it).
-fn close_after_answer<R: Runtime>(app: &AppHandle<R>) {
+/// Destroys the credential window once this command has answered (the page is gone with it): the
+/// window this command was called from (`generation`), never one a later open built meanwhile.
+fn close_after_answer<R: Runtime>(app: &AppHandle<R>, generation: credential::Generation) {
     let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || credential::close(&handle));
+    tauri::async_runtime::spawn_blocking(move || credential::close_if(&handle, generation));
 }
 
 async fn submit<R: Runtime>(
     app: &AppHandle<R>,
     args: SubmitSecretArgs,
 ) -> Result<SubmitOutcome, CommandError> {
-    let purpose = credential::current_purpose(app).ok_or(CommandError::NotReady)?;
+    let (purpose, generation) = credential::current_window(app).ok_or(CommandError::NotReady)?;
     match purpose {
         Purpose::AddPat(target) | Purpose::ReplacePat(target) => {
             let core = super::core(app)?;
@@ -457,7 +458,7 @@ async fn submit<R: Runtime>(
             };
             match serve::unlock(&state, kind, passphrase).await {
                 Ok(()) => {
-                    close_after_answer(app);
+                    close_after_answer(app, generation);
                     Ok(SubmitOutcome::Unlocked {})
                 }
                 Err(f) => Ok(SubmitOutcome::Failed(SubmitFailure::class(f.class()))),
@@ -549,13 +550,10 @@ pub async fn archive_and_start_fresh<R: Runtime>(
 }
 
 async fn archive<R: Runtime>(app: &AppHandle<R>) -> Result<ArchiveOutcome, CommandError> {
-    let purpose = credential::current_purpose(app);
-    if !matches!(
-        purpose,
-        Some(Purpose::RecoverThisLog | Purpose::FinishRestore)
-    ) {
+    let window = credential::current_window(app);
+    let Some((Purpose::RecoverThisLog | Purpose::FinishRestore, generation)) = window else {
         return Err(CommandError::NotReady);
-    }
+    };
     let state = serve_state(app).ok_or(CommandError::NotReady)?;
     match serve::archive_and_start_fresh(&state).await {
         Ok(archived) => {
@@ -563,7 +561,7 @@ async fn archive<R: Runtime>(app: &AppHandle<R>) -> Result<ArchiveOutcome, Comma
             credential::set_archived(app, archived);
             let handle = app.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                credential::close(&handle);
+                credential::close_if(&handle, generation);
                 // `open` logs its own failure.
                 let _ = windows::open(&handle, Label::Setup, Show::Focus);
             });

@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use atlas_duck_app_lib::secret_service::{SecretService, SecretServiceCheck};
 use atlas_duck_app_lib::serve::{
-    KeysFactory, ServeState, ShutdownOutcome, StartInputs, StartupFailure, StoreFailure, quit,
-    shutdown, start_with,
+    KeysFactory, ServeHooks, ServeState, ShutdownOutcome, StartInputs, StartupFailure,
+    StoreFailure, quit, shutdown, start_with,
 };
 use atlas_duck_app_lib::state::ServeSlot;
 use atlas_duck_audit::lock::{INSTANCE_LOCK_FILE, InstanceLock};
@@ -204,6 +204,7 @@ impl World {
             retry_schedule: vec![Duration::from_millis(50); 200],
             endpoint: Some(self.location.clone()),
             quit: self.quit.clone(),
+            hooks: ServeHooks::default(),
         }
     }
 

@@ -86,8 +86,8 @@ pub struct StatusInputs {
     pub startup_notice: u64,
     /// The IPC endpoint is bound and served (M4 T19).
     pub ipc_accepting: bool,
-    /// `open` has waited on a keychain authorization prompt past 10 s (L78). Nothing sets this
-    /// yet: the bounded first `open` is M6's open handoff.
+    /// `open` has waited on a keychain authorization prompt past 10 s (L78): `serve` sets the
+    /// flag the `ServeSlot` holds while a first or retried `open` blocks that long.
     pub keychain_prompt: bool,
     /// The installed app was replaced under the running one (§12.2); M8 sets it.
     pub update_pending: bool,
@@ -253,10 +253,29 @@ pub fn lines(i: &StatusInputs) -> Vec<StatusLineDto> {
 /// on the blocking pool (M3 PD-13). Without a serving state (before first run, starting, quitting)
 /// there is nothing to report.
 pub fn gather<R: Runtime>(app: &AppHandle<R>) -> StatusInputs {
+    let mut i = gather_gate(app);
+    let core = app.try_state::<ServeSlot>().and_then(|slot| {
+        if slot.quit().0.is_cancelled() {
+            return None;
+        }
+        slot.get().and_then(|s| s.core.get().cloned())
+    });
+    if let Some(core) = core {
+        gather_core(&mut i, &core);
+    }
+    i
+}
+
+/// The half of [`gather`] that reads no `Core`: the gate, its refused count, the retry, the
+/// endpoint and the keychain prompt hint. Only flags and counters, so the tray (which rebuilds on
+/// the main thread, M6 T22) can call it.
+pub fn gather_gate<R: Runtime>(app: &AppHandle<R>) -> StatusInputs {
     let mut i = StatusInputs::default();
     let Some(slot) = app.try_state::<ServeSlot>() else {
         return i;
     };
+    // L78: the first `open` blocks before any serving state exists, so the flag is the slot's.
+    i.keychain_prompt = slot.keychain_prompt();
     let Some(state) = slot.get() else {
         return i;
     };
@@ -267,9 +286,6 @@ pub fn gather<R: Runtime>(app: &AppHandle<R>) -> StatusInputs {
     i.gate = state.gate_state();
     i.refused = state.refused().unwrap_or(0);
     i.keychain_retrying = state.keychain_retrying();
-    if let Some(core) = state.core.get() {
-        gather_core(&mut i, core);
-    }
     i
 }
 

@@ -14,8 +14,15 @@
 //! passphrase to the wizard through [`request_recovery_passphrase`]'s in-memory channel (Task 23),
 //! the passphrase of "Recover this log" / "Finish restore" to the audit store
 //! (`serve::unlock`). The recovery note ([`note_text`]) is built from facts that hold no secret.
+//!
+//! The window also follows what is served behind its back ([`follow`], M6 T22: the retry turning
+//! one lock state into another, a core that started) and a gate's refused requests raise it at
+//! most once per 5 minutes ([`raise`], UI-04).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+pub mod follow;
+pub mod raise;
 
 use atlas_duck_audit::{ArchivedDb, LockedReason, RecoveryOffer};
 use atlas_duck_core::config::instances::product_str;
@@ -169,7 +176,13 @@ pub struct CredentialState {
     /// "Archive old DB and start fresh" moved this store aside; the wizard's `GENESIS` names it
     /// (Task 23 takes it). Kept when the window closes.
     archived: Option<ArchivedDb>,
+    /// Which window the purpose belongs to: bumped by every open that builds a new one. A close
+    /// that was meant for one window ([`close_if`]) leaves its successor alone (M6 T22, m-2).
+    generation: Generation,
 }
+
+/// Identifies one credential window (its purpose and its passphrase request).
+pub type Generation = u64;
 
 impl CredentialState {
     pub fn purpose(&self) -> Option<&Purpose> {
@@ -242,6 +255,7 @@ fn open_inner<R: Runtime>(
             }
             Decide::New => {
                 st.reset();
+                st.generation = st.generation.wrapping_add(1);
                 st.purpose = Some(purpose);
             }
         }
@@ -275,6 +289,14 @@ pub fn current_purpose<R: Runtime>(app: &AppHandle<R>) -> Option<Purpose> {
     registry(app)
         .ok()
         .and_then(|r| r.credential_state().purpose.clone())
+}
+
+/// The open window's purpose and which window it is, read together: a command that later closes
+/// "its" window passes the generation to [`close_if`].
+pub fn current_window<R: Runtime>(app: &AppHandle<R>) -> Option<(Purpose, Generation)> {
+    let r = registry(app).ok()?;
+    let st = r.credential_state();
+    st.purpose.clone().map(|p| (p, st.generation))
 }
 
 /// True once the first-run passphrase went to the wizard (this window).
@@ -319,31 +341,72 @@ pub fn take_archived<R: Runtime>(app: &AppHandle<R>) -> Option<ArchivedDb> {
 
 /// The window was destroyed (closed by the user or by Rust): its purpose and a pending
 /// passphrase request go (`tray::on_run_event`; Tauri forgets the window before that callback
-/// runs). A window built again since then has its own purpose, which stays. Runs on the main
-/// thread, so it never waits for `opening` (an open holding it waits for the main thread to build
-/// its window): while an open runs, that open has decided the state already (a new window resets
-/// it there).
+/// runs), so a sender never outlives its window. A window built again since then has its own
+/// purpose, which stays. Runs on the main thread, which never waits for `opening` (an open
+/// holding it waits for the main thread to build its window): with no open running the reset is
+/// done here; otherwise it is retried off the main thread once that open is over, and whichever
+/// open it was (any label shares the lock), the destroyed window's state goes (M6 T22, m-1).
 pub fn window_destroyed<R: Runtime>(app: &AppHandle<R>) {
+    window_destroyed_if(app, |app| {
+        app.get_webview_window(Label::Credential.as_str()).is_none()
+    });
+}
+
+/// [`window_destroyed`] with the "the window is gone" check passed in (the mock runtime keeps
+/// reporting a destroyed window, so a test cannot reach the real check).
+#[doc(hidden)]
+pub fn window_destroyed_if<R: Runtime>(app: &AppHandle<R>, gone: fn(&AppHandle<R>) -> bool) {
     let Ok(r) = registry(app) else {
         return;
     };
-    let Some(_no_open_running) = r.try_opening() else {
+    if let Some(_no_open_running) = r.try_opening() {
+        if gone(app) {
+            r.credential_state().reset();
+        }
         return;
-    };
-    if app.get_webview_window(Label::Credential.as_str()).is_none() {
-        r.credential_state().reset();
     }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Ok(r) = registry(&app) else {
+            return;
+        };
+        let _open_is_over = r.lock_opening();
+        if gone(&app) {
+            r.credential_state().reset();
+        }
+    });
 }
 
 /// Forgets the window's purpose, then destroys the window (its webview and anything typed in it,
-/// §10.1): from here on its commands answer `not_ready`. Off the main thread.
+/// §10.1): from here on its commands answer `not_ready`. Under `opening`, so a concurrent open
+/// sees the window and its purpose either both there or both gone. Off the main thread.
 pub fn close<R: Runtime>(app: &AppHandle<R>) {
-    if let Ok(r) = registry(app) {
-        r.credential_state().reset();
+    close_matching(app, None);
+}
+
+/// [`close`], but only the window `generation` names (from [`current_window`]): a command that
+/// answered for one window must not destroy the next one a later open built meanwhile (M6 T22,
+/// m-2). False when that window is gone already.
+pub fn close_if<R: Runtime>(app: &AppHandle<R>, generation: Generation) -> bool {
+    close_matching(app, Some(generation))
+}
+
+fn close_matching<R: Runtime>(app: &AppHandle<R>, generation: Option<Generation>) -> bool {
+    let Ok(r) = registry(app) else {
+        return false;
+    };
+    let _no_open_in_between = r.lock_opening();
+    {
+        let mut st = r.credential_state();
+        if generation.is_some_and(|g| st.purpose.is_none() || st.generation != g) {
+            return false;
+        }
+        st.reset();
     }
     if let Some(w) = app.get_webview_window(Label::Credential.as_str()) {
         let _ = w.destroy();
     }
+    true
 }
 
 /// The PAT target of `alias` from the instance list (§7.1, §10.3): refused for an unknown alias,

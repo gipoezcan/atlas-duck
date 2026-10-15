@@ -17,18 +17,25 @@ use atlas_duck_app_lib::commands;
 use atlas_duck_app_lib::credential::{self, PatOpenError, Purpose};
 use atlas_duck_app_lib::secret_service::{SecretService, SecretServiceCheck};
 use atlas_duck_app_lib::serve::{
-    KeysFactory, ServeState, StartInputs, UnlockFailure, UnlockKind, start_with, unlock,
+    KeysFactory, RetryNow, ServeHooks, ServeState, ServeWatcher, StartInputs, UnlockFailure,
+    UnlockKind, retry_keychain_from_menu, retry_keychain_now, start_with, unlock,
 };
 use atlas_duck_app_lib::state::{DataDirHold, ServeSlot};
+use atlas_duck_app_lib::status::StatusInputs;
+use atlas_duck_app_lib::tray::{MSG_STORE_UNAVAILABLE, status_lines};
 use atlas_duck_app_lib::windows::{
-    NavPolicy, Show, StartupRoute, Unlock, WindowError, WindowRegistry, open_credential,
+    AppSnapshot, NavPolicy, Relaunch, Show, StartupRoute, Unlock, WindowError, WindowRegistry,
+    open_credential, route_relaunch, serving_snapshot,
 };
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::testing::{FreeSpaceStub, MemKeyStore, MemKeyring};
 use atlas_duck_audit::{
-    FirstRunInput, KeyStore, KeyStoreError, OpenConfig, SystemClock, create_new_store, new_ids,
+    FirstRunInput, KeyStore, KeyStoreError, LockedReason, OpenConfig, SystemClock,
+    create_new_store, new_ids,
 };
-use atlas_duck_core::{AdminError, Confirm, InstanceView, NativeConfirmer, UiEvent, UiSink};
+use atlas_duck_core::{
+    AdminError, Confirm, GateState, InstanceView, NativeConfirmer, UiEvent, UiSink,
+};
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::client::IpcClient;
 use atlas_duck_ipc::envelope::{Envelope, Status};
@@ -50,6 +57,25 @@ const WAIT: Duration = Duration::from_secs(30);
 const PASSPHRASE: &str = "correct horse battery";
 
 // ---------- the mock app ----------
+
+/// A scratch dir under cargo's per-target test dir, not `%TEMP%`: Tauri's mock runtime keeps every
+/// window it built alive for the rest of the process (the app and its windows hold each other),
+/// and with them the `instance.lock` of the data dir the app manages, so on Windows a dir cannot
+/// be deleted while the test binary runs. Leftovers of earlier runs are swept once per run
+/// (their locks died with their process); `cargo clean` removes the rest (M6 T22 m-6).
+fn scratch() -> std::io::Result<tempfile::TempDir> {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("credential");
+    std::fs::create_dir_all(&root)?;
+    SWEEP.call_once(|| {
+        if let Ok(old) = std::fs::read_dir(&root) {
+            for e in old.flatten() {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
+    tempfile::Builder::new().tempdir_in(&root)
+}
 
 fn app() -> Result<App<MockRuntime>, Box<dyn std::error::Error>> {
     let context = tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
@@ -173,11 +199,14 @@ impl SecretServiceCheck for NoSecretService {
     }
 }
 
-/// `MemKeyStore`s over one keyring; every `keys()` fails `Unavailable` while `available` is off.
+/// `MemKeyStore`s over one keyring; every `keys()` fails `Unavailable` while `available` is off,
+/// and waits while a test holds it (a keychain authorization prompt that nobody answered yet).
 struct MemKeys {
     ring: Arc<MemKeyring>,
     available: AtomicBool,
     calls: std::sync::atomic::AtomicU32,
+    held: Mutex<bool>,
+    released: std::sync::Condvar,
 }
 
 impl MemKeys {
@@ -186,13 +215,32 @@ impl MemKeys {
             ring,
             available: AtomicBool::new(available),
             calls: std::sync::atomic::AtomicU32::new(0),
+            held: Mutex::new(false),
+            released: std::sync::Condvar::new(),
         })
+    }
+
+    /// `true`: every `keys()` call from now on blocks until `hold(false)`.
+    fn hold(&self, on: bool) {
+        if let Ok(mut held) = self.held.lock() {
+            *held = on;
+        }
+        self.released.notify_all();
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
 impl KeysFactory for MemKeys {
     fn keys(&self, install_id: &str) -> Result<Arc<dyn KeyStore>, KeyStoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut held) = self.held.lock() {
+            while *held {
+                held = self.released.wait(held).unwrap_or_else(|e| e.into_inner());
+            }
+        }
         if !self.available.load(Ordering::SeqCst) {
             return Err(KeyStoreError::Unavailable);
         }
@@ -200,16 +248,19 @@ impl KeysFactory for MemKeys {
     }
 }
 
+/// Fields drop in declaration order: `tmp` is last so the directory goes after everything that
+/// holds `instance.lock` open (on Windows the delete fails silently otherwise, and the directory
+/// stays in `%TEMP%`; M6 T22 m-6).
 struct World {
-    tmp: tempfile::TempDir,
     data: LocalDataDir,
     lock: Arc<InstanceLock>,
     location: EndpointLocation,
+    tmp: tempfile::TempDir,
 }
 
 impl World {
     fn new() -> Result<World, Box<dyn std::error::Error>> {
-        let tmp = tempfile::tempdir()?;
+        let tmp = scratch()?;
         let dir = tmp.path().join("data");
         std::fs::create_dir(&dir)?;
         let data = local_data_dir(&dir)?;
@@ -217,10 +268,10 @@ impl World {
         std::fs::create_dir(tmp.path().join("config"))?;
         let location = location(&tmp, &data)?;
         Ok(World {
-            tmp,
             data,
             lock,
             location,
+            tmp,
         })
     }
 
@@ -249,6 +300,7 @@ impl World {
             retry_schedule,
             endpoint: Some(self.location.clone()),
             quit: ShutdownSignal::new(),
+            hooks: ServeHooks::default(),
         }
     }
 
@@ -285,15 +337,49 @@ impl World {
         pass: &str,
         confirmer: Arc<dyn NativeConfirmer>,
     ) -> Result<Arc<ServeState>, Box<dyn std::error::Error>> {
+        Ok(self
+            .lost_with(pass, confirmer, ServeHooks::default())
+            .await?
+            .0)
+    }
+
+    /// [`World::lost`] with `hooks`, and the keystore factory the state keeps using.
+    async fn lost_with(
+        &self,
+        pass: &str,
+        confirmer: Arc<dyn NativeConfirmer>,
+        hooks: ServeHooks,
+    ) -> Result<(Arc<ServeState>, Arc<MemKeys>), Box<dyn std::error::Error>> {
         let ring = MemKeyring::new();
         let install_id = self.provision(&ring, pass)?;
         ring.wipe_install(&install_id);
         let keys = MemKeys::new(ring, true);
-        let state = start_with(self.inputs(Some(install_id), keys, confirmer, vec![]))
-            .await
-            .map_err(|e| format!("{e:?}"))?;
+        let mut inputs = self.inputs(Some(install_id), keys.clone(), confirmer, vec![]);
+        inputs.hooks = hooks;
+        let state = start_with(inputs).await.map_err(|e| format!("{e:?}"))?;
         assert!(state.core.get().is_none());
-        Ok(state)
+        Ok((state, keys))
+    }
+
+    /// A provisioned store whose keychain is unavailable: `start_with` serves the
+    /// `keychain_unavailable` gate (no automatic retry); `keys.available` brings the keychain
+    /// back, and `wipe` first makes it `keychain_lost` instead.
+    async fn unavailable(
+        &self,
+        wipe: bool,
+        hooks: ServeHooks,
+    ) -> Result<(Arc<ServeState>, Arc<MemKeys>), Box<dyn std::error::Error>> {
+        let ring = MemKeyring::new();
+        let install_id = self.provision(&ring, PASSPHRASE)?;
+        if wipe {
+            ring.wipe_install(&install_id);
+        }
+        let keys = MemKeys::new(ring, false);
+        let mut inputs = self.inputs(Some(install_id), keys.clone(), Answers::new(vec![]), vec![]);
+        inputs.hooks = hooks;
+        let state = start_with(inputs).await.map_err(|e| format!("{e:?}"))?;
+        assert!(state.core.get().is_none());
+        Ok((state, keys))
     }
 
     fn files(&self) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
@@ -403,8 +489,10 @@ fn reason(env: &Envelope) -> Option<&str> {
 /// keeps alias A, and `credential_context` takes no argument that could name another.
 #[test]
 fn credential_context_is_rust_fixed() -> TestResult {
+    // `tmp` first: locals drop in reverse, so the app (which holds `instance.lock` in `tmp`) goes
+    // before the directory does.
+    let tmp = scratch()?;
     let app = app()?;
-    let tmp = tempfile::tempdir()?;
     let data = local_data_dir(tmp.path())?;
     let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
     app.manage(DataDirHold::new(data, lock));
@@ -508,8 +596,10 @@ async fn closed(handle: &tauri::AppHandle<MockRuntime>) -> TestResult {
 /// `keychain_unavailable` into `keychain_lost`); a PAT purpose never replaces one.
 #[test]
 fn lock_states_follow_each_other_in_an_open_window() -> TestResult {
+    // `tmp` first: locals drop in reverse, so the app (which holds `instance.lock` in `tmp`) goes
+    // before the directory does.
+    let tmp = scratch()?;
     let app = app()?;
-    let tmp = tempfile::tempdir()?;
     let data = local_data_dir(tmp.path())?;
     let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
     app.manage(DataDirHold::new(data, lock));
@@ -538,8 +628,10 @@ fn lock_states_follow_each_other_in_an_open_window() -> TestResult {
 /// natively confirmed; nothing is built.
 #[test]
 fn credential_refused_for_unconfirmed_or_insecure_instance() -> TestResult {
+    // `tmp` first: locals drop in reverse, so the app (which holds `instance.lock` in `tmp`) goes
+    // before the directory does.
+    let tmp = scratch()?;
     let app = app()?;
-    let tmp = tempfile::tempdir()?;
     let data = local_data_dir(tmp.path())?;
     let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
     app.manage(DataDirHold::new(data, lock));
@@ -574,8 +666,10 @@ fn credential_refused_for_unconfirmed_or_insecure_instance() -> TestResult {
 /// window stays. Without a waiting wizard nothing is accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn first_run_passphrase_mismatch_commits_nothing() -> TestResult {
+    // `tmp` first: locals drop in reverse, so the app (which holds `instance.lock` in `tmp`) goes
+    // before the directory does.
+    let tmp = scratch()?;
     let app = app()?;
-    let tmp = tempfile::tempdir()?;
     let data = local_data_dir(tmp.path())?;
     let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
     app.manage(DataDirHold::new(data.clone(), lock));
@@ -861,7 +955,7 @@ async fn archive_and_start_fresh_confirms_then_moves_the_store_aside() -> TestRe
 /// PD-89: "Retry keychain" runs one more keystore + `open` while locked `keychain_unavailable`
 /// (here: the keychain is back, so the core serves); in any other state it is `not_ready`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn retry_keychain_runs_one_more_open() -> TestResult {
+async fn retry_keychain_runs_one_open() -> TestResult {
     let w = World::new()?;
     let ring = MemKeyring::new();
     let install_id = w.provision(&ring, PASSPHRASE)?;
@@ -903,6 +997,401 @@ async fn retry_keychain_runs_one_more_open() -> TestResult {
     assert_eq!(
         call(&win, "retry_keychain", json!({})).await,
         Err(json!({"kind": "not_ready"}))
+    );
+    stop(&state).await
+}
+
+// ---------- M6 T22: the window follows the serving state ----------
+
+/// The app's watcher in the mock runtime: counts the calls and lets an open credential window
+/// follow the serving state (`follow_serving`, on a thread of its own as the real one does).
+struct Follower {
+    app: std::sync::OnceLock<tauri::AppHandle<MockRuntime>>,
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl Follower {
+    fn new() -> Arc<Follower> {
+        Arc::new(Follower {
+            app: std::sync::OnceLock::new(),
+            calls: std::sync::atomic::AtomicU32::new(0),
+        })
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn hooks(self: &Arc<Self>) -> ServeHooks {
+        ServeHooks {
+            watcher: Some(self.clone()),
+            ..ServeHooks::default()
+        }
+    }
+}
+
+impl ServeWatcher for Follower {
+    fn serving_changed(&self) {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(app) = self.app.get() {
+            let app = app.clone();
+            std::thread::spawn(move || credential::follow::follow_serving(&app));
+        }
+    }
+}
+
+/// M6 T22 m-1: the window is destroyed while another open holds the `opening` lock: the purpose
+/// and the first-run sender still go once that open is over, so the wizard's receiver errors
+/// instead of waiting for a window that is not there.
+// The held guard stands in for an open in flight; nothing else in this test takes `opening`.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn window_destroyed_resets_even_while_another_open_runs() -> TestResult {
+    let tmp = scratch()?;
+    let app = app()?;
+    let data = local_data_dir(tmp.path())?;
+    let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
+    app.manage(DataDirHold::new(data, lock));
+    let handle = app.handle().clone();
+    let mut rx = credential::request_recovery_passphrase(&handle, Show::Focus)?;
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::RecoveryPassphrase)
+    );
+
+    // A window that is still there keeps its purpose (the check is the open's, not a reflex),
+    // with no open running and with one running.
+    credential::window_destroyed_if(&handle, |_| false);
+    let registry = app.state::<WindowRegistry>();
+    let other_open = registry.try_opening().ok_or("opening is held")?;
+    credential::window_destroyed_if(&handle, |_| false);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::RecoveryPassphrase)
+    );
+    drop(other_open);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::RecoveryPassphrase)
+    );
+
+    let other_open = registry.try_opening().ok_or("opening is held")?;
+    credential::window_destroyed_if(&handle, |_| true);
+    // The main thread's call did not wait, and did nothing yet: the other open is in flight.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::RecoveryPassphrase),
+        "nothing reset while the lock is held"
+    );
+    drop(other_open);
+    let h = handle.clone();
+    eventually("the destroyed window's purpose went", move || {
+        credential::current_purpose(&h).is_none()
+    })
+    .await?;
+    assert!(
+        matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ),
+        "the sender went with the window"
+    );
+
+    Ok(())
+}
+
+/// M6 T22 m-2: a close meant for one window leaves any other alone, and closes nothing once its
+/// own window is gone.
+#[test]
+fn close_if_only_closes_its_own_window() -> TestResult {
+    let tmp = scratch()?;
+    let app = app()?;
+    let data = local_data_dir(tmp.path())?;
+    let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
+    app.manage(DataDirHold::new(data, lock));
+    let handle = app.handle();
+    open_credential(handle, Unlock::Unlock, Show::Focus)?;
+    let (purpose, generation) = credential::current_window(handle).ok_or("no window")?;
+    assert_eq!(purpose, Purpose::Unlock);
+
+    // Another window's generation: nothing closes.
+    assert!(!credential::close_if(handle, generation.wrapping_add(1)));
+    assert_eq!(credential::current_purpose(handle), Some(Purpose::Unlock));
+    // Its own: closed, and a second close of it finds nothing.
+    assert!(credential::close_if(handle, generation));
+    assert_eq!(credential::current_purpose(handle), None);
+    assert!(!credential::close_if(handle, generation));
+    Ok(())
+}
+
+/// M6 T22 m-4: a caller that drops its `unlock` future (the command future is dropped when the
+/// window goes) does not release the one-at-a-time guard of the work still running: a second
+/// unlock is `Busy` until the first finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_unlock_caller_keeps_the_guard() -> TestResult {
+    let w = World::new()?;
+    let (state, keys) = w
+        .lost_with(PASSPHRASE, Answers::new(vec![]), ServeHooks::default())
+        .await?;
+    keys.hold(true);
+    let before = keys.calls();
+    let st = state.clone();
+    let caller = tokio::spawn(async move {
+        unlock(
+            &st,
+            UnlockKind::RecoverThisLog,
+            SecretString::from(PASSPHRASE),
+        )
+        .await
+    });
+    let k = keys.clone();
+    eventually("the unlock reached the keychain", move || {
+        k.calls() > before
+    })
+    .await?;
+    caller.abort();
+    let _ = caller.await;
+    assert!(state.unlock_busy(), "the work still holds the guard");
+    assert_eq!(
+        unlock(
+            &state,
+            UnlockKind::RecoverThisLog,
+            SecretString::from(PASSPHRASE)
+        )
+        .await,
+        Err(UnlockFailure::Busy)
+    );
+    keys.hold(false);
+    let st = state.clone();
+    eventually("the work finished and served", move || {
+        st.core.get().is_some() && !st.unlock_busy()
+    })
+    .await?;
+    stop(&state).await
+}
+
+/// M6 T22 m-8: a recovery that took but whose core did not start leaves no stale `keychain_lost`
+/// gate: the gate says `keychain_unavailable`, and "Retry keychain" starts the core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_core_start_failure_after_recovery_leaves_no_stale_lost_gate() -> TestResult {
+    let w = World::new()?;
+    let fail = Arc::new(std::sync::atomic::AtomicU32::new(1));
+    let watcher = Follower::new();
+    let hooks = ServeHooks {
+        fail_core_start: Some(fail.clone()),
+        ..watcher.hooks()
+    };
+    let (state, _keys) = w.lost_with(PASSPHRASE, Answers::new(vec![]), hooks).await?;
+    let seen = watcher.calls();
+    assert_eq!(
+        unlock(
+            &state,
+            UnlockKind::RecoverThisLog,
+            SecretString::from(PASSPHRASE)
+        )
+        .await,
+        Err(UnlockFailure::CoreStart)
+    );
+    assert_eq!(fail.load(Ordering::SeqCst), 0, "the failure was used");
+    assert_eq!(
+        state.gate_state(),
+        Some(GateState::Locked(LockedReason::KeychainUnavailable))
+    );
+    assert!(watcher.calls() > seen, "the tray hears of the new gate");
+    // A second "Recover this log" has nothing to recover.
+    assert_eq!(
+        unlock(
+            &state,
+            UnlockKind::RecoverThisLog,
+            SecretString::from(PASSPHRASE)
+        )
+        .await,
+        Err(UnlockFailure::NotLocked)
+    );
+    assert_eq!(retry_keychain_now(&state), RetryNow::Started);
+    let st = state.clone();
+    eventually("the retry started the core", move || {
+        st.core.get().is_some()
+    })
+    .await?;
+    stop(&state).await
+}
+
+/// M6 T22 m-5: the retry turns `keychain_unavailable` into `keychain_lost` behind an open Unlock
+/// window: the window moves to "Recover this log" instead of staying on a page with nothing to
+/// retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unlock_window_follows_the_retry_into_keychain_lost() -> TestResult {
+    let w = World::new()?;
+    let watcher = Follower::new();
+    let (state, keys) = w.unavailable(true, watcher.hooks()).await?;
+    let app = w.app(&state)?;
+    let handle = app.handle().clone();
+    assert!(watcher.app.set(handle.clone()).is_ok());
+    open_credential(&handle, Unlock::Unlock, Show::Focus)?;
+    let _win = window(&app, "credential")?;
+    let st = state.clone();
+    eventually("the automatic retries ended", move || {
+        !st.keychain_retrying()
+    })
+    .await?;
+    assert_eq!(credential::current_purpose(&handle), Some(Purpose::Unlock));
+
+    keys.available.store(true, Ordering::SeqCst);
+    assert_eq!(retry_keychain_now(&state), RetryNow::Started);
+    let h = handle.clone();
+    eventually("the window moved to recovery", move || {
+        credential::current_purpose(&h) == Some(Purpose::RecoverThisLog)
+    })
+    .await?;
+    assert_eq!(app.webview_windows().len(), 1, "the same window");
+    stop(&state).await
+}
+
+/// M6 T22 (T20/T21 handoff): a manual retry that starts the core closes the open Unlock window
+/// (nothing is left to unlock) and tells the watcher (the tray is rebuilt); a second retry while a
+/// core serves is `NotLocked`, and the tray's entry answers the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_manual_retry_closes_the_window_and_refreshes_the_tray() -> TestResult {
+    let w = World::new()?;
+    let watcher = Follower::new();
+    let (state, keys) = w.unavailable(false, watcher.hooks()).await?;
+    let app = w.app(&state)?;
+    let handle = app.handle().clone();
+    assert!(watcher.app.set(handle.clone()).is_ok());
+    open_credential(&handle, Unlock::Unlock, Show::Focus)?;
+    let _win = window(&app, "credential")?;
+    let st = state.clone();
+    eventually("the automatic retries ended", move || {
+        !st.keychain_retrying()
+    })
+    .await?;
+    let calls = keys.calls();
+    let seen = watcher.calls();
+
+    // The tray's "Retry keychain": one open, with the keychain back.
+    keys.available.store(true, Ordering::SeqCst);
+    let slot_state = app.state::<ServeSlot>();
+    let slot: &ServeSlot = &slot_state;
+    assert_eq!(
+        retry_keychain_from_menu(Some(slot)),
+        Some(RetryNow::Started)
+    );
+    let st = state.clone();
+    eventually("the core serves", move || st.core.get().is_some()).await?;
+    closed(&handle).await?;
+    assert_eq!(keys.calls(), calls + 1, "exactly one open");
+    let st = state.clone();
+    eventually("the retry ended", move || !st.keychain_retrying()).await?;
+    assert!(watcher.calls() > seen, "the tray was told");
+    assert_eq!(
+        retry_keychain_from_menu(Some(slot)),
+        Some(RetryNow::NotLocked)
+    );
+    assert_eq!(retry_keychain_from_menu(None), None);
+    assert_eq!(serving_snapshot(Some(slot)), AppSnapshot::Serving);
+    stop(&state).await
+}
+
+/// M6 T22 (M4 T19 notes): a core that fails to start under a retry is a failed store, not a gate
+/// that waits: the tray says so, a relaunch shows the PD-06 dialog, nothing offers a retry again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_retry_is_a_failed_store_the_relaunch_says_so() -> TestResult {
+    let w = World::new()?;
+    let watcher = Follower::new();
+    let hooks = ServeHooks {
+        fail_core_start: Some(Arc::new(std::sync::atomic::AtomicU32::new(1))),
+        ..watcher.hooks()
+    };
+    let (state, keys) = w.unavailable(false, hooks).await?;
+    let app = w.app(&state)?;
+    let slot_state = app.state::<ServeSlot>();
+    let slot: &ServeSlot = &slot_state;
+    let st = state.clone();
+    eventually("the automatic retries ended", move || {
+        !st.keychain_retrying()
+    })
+    .await?;
+    assert!(!state.store_failed());
+    assert_eq!(
+        serving_snapshot(Some(slot)),
+        AppSnapshot::Gate(GateState::Locked(LockedReason::KeychainUnavailable))
+    );
+    keys.available.store(true, Ordering::SeqCst);
+    assert_eq!(retry_keychain_now(&state), RetryNow::Started);
+    let st = state.clone();
+    eventually("the store is failed", move || {
+        st.store_failed() && !st.keychain_retrying()
+    })
+    .await?;
+
+    let snapshot = serving_snapshot(Some(slot));
+    assert_eq!(snapshot, AppSnapshot::StoreUnavailable);
+    assert_eq!(
+        status_lines(&snapshot, &StatusInputs::default()),
+        vec![MSG_STORE_UNAVAILABLE.to_owned()]
+    );
+    assert_eq!(
+        route_relaunch(&snapshot, &[std::ffi::OsString::from("atlas-duck")]),
+        Relaunch::ShowErrorDialog(MSG_STORE_UNAVAILABLE.into())
+    );
+    assert_eq!(retry_keychain_now(&state), RetryNow::NotLocked);
+    stop(&state).await
+}
+
+/// M6 T22 (L78): an `open` that blocks past the threshold raises the keychain prompt hint and
+/// tells the watcher; it goes again when the open returns. (The threshold is 10 s in production.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocked_open_raises_the_keychain_prompt_hint() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring, PASSPHRASE)?;
+    let keys = MemKeys::new(ring, true);
+    keys.hold(true);
+    let watcher = Follower::new();
+    let hooks = ServeHooks {
+        keychain_prompt_after: Duration::from_millis(150),
+        ..watcher.hooks()
+    };
+    let flag = hooks.keychain_prompt.clone();
+    let mut inputs = w.inputs(Some(install_id), keys.clone(), Answers::new(vec![]), vec![]);
+    inputs.hooks = hooks;
+    let starting = tokio::spawn(start_with(inputs));
+    let f = flag.clone();
+    eventually("the hint came up", move || f.load(Ordering::SeqCst)).await?;
+    assert!(watcher.calls() >= 1, "the tray hears of the hint");
+    assert!(!starting.is_finished(), "the open is still blocked");
+
+    keys.hold(false);
+    let state = starting.await?.map_err(|e| format!("{e:?}"))?;
+    assert!(!flag.load(Ordering::SeqCst), "the hint went with the open");
+    assert!(watcher.calls() >= 2);
+    stop(&state).await
+}
+
+/// M6 T22 (L78): an `open` that is quick never shows the hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quick_open_shows_no_keychain_prompt_hint() -> TestResult {
+    let w = World::new()?;
+    let ring = MemKeyring::new();
+    let install_id = w.provision(&ring, PASSPHRASE)?;
+    let keys = MemKeys::new(ring, true);
+    let watcher = Follower::new();
+    let flag = watcher.hooks().keychain_prompt;
+    let mut inputs = w.inputs(Some(install_id), keys, Answers::new(vec![]), vec![]);
+    inputs.hooks = ServeHooks {
+        keychain_prompt: flag.clone(),
+        ..watcher.hooks()
+    };
+    let state = start_with(inputs).await.map_err(|e| format!("{e:?}"))?;
+    assert!(!flag.load(Ordering::SeqCst));
+    assert_eq!(
+        watcher.calls(),
+        0,
+        "the hint never came, so nothing to tell"
     );
     stop(&state).await
 }
@@ -1120,6 +1609,7 @@ mod canary {
     use atlas_duck_app_lib::commands;
     use atlas_duck_app_lib::credential;
     use atlas_duck_app_lib::diag::fields::allowlist_layer;
+    use atlas_duck_app_lib::ui_sink::EventOut;
     use atlas_duck_app_lib::windows::{Show, Unlock, open_credential};
     use atlas_duck_atlassian::Product as AtlProduct;
     use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser};
@@ -1310,6 +1800,17 @@ mod canary {
         assert!(rx.try_recv().is_ok());
         record(&call(&win, "credential_context", json!({})).await);
 
+        // The event half (M6 T22, m-7). A lock state following a lock state in an open window is
+        // announced as `credential_context_changed`, through the app's own emit path (which the
+        // test build records); and a payload that does carry a value is found in that channel, so
+        // "the canaries are absent from the events" is not vacuous.
+        credential::close(&handle);
+        let app = app_for(&w)?;
+        let handle = app.handle().clone();
+        open_credential(&handle, Unlock::Unlock, Show::Focus)?;
+        open_credential(&handle, Unlock::Recover, Show::Focus)?;
+        EventOut::emit(&handle, "s16_control", json!({ "reason": CONTROL_CANARY }));
+
         // The PAT reached the server: the sweep below could have found it.
         let sent = mock
             .received()
@@ -1329,6 +1830,17 @@ mod canary {
         assert_eq!(cap.dropped(Channel::TauriEvent), 0);
         let commands = cap.on(Channel::TauriCommand);
         assert!(commands.len() >= 9, "{} command records", commands.len());
+        let events = cap.on(Channel::TauriEvent);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.json.contains("credential_context_changed")),
+            "the lock-state change was not announced: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| e.json.contains(CONTROL_CANARY)),
+            "the event channel is blind: {events:?}"
+        );
         let records = cap.records();
         let logs_text = format!("{}\n{}", diag.text(), raw.text());
         for c in canaries {

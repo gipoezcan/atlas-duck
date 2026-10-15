@@ -151,6 +151,10 @@ pub struct ServeSlot {
     quit_done: tokio::sync::OnceCell<ShutdownOutcome>,
     /// PD-06: the store could not be opened (or the core not started); nothing is served.
     store_failed: AtomicBool,
+    /// L78: `audit::open` has blocked on a keychain prompt past 10 s. Shared with
+    /// `serve::start_with` (`ServeHooks::keychain_prompt`); it lives here because the first `open`
+    /// runs before any `ServeState` exists.
+    keychain_prompt: Arc<AtomicBool>,
 }
 
 impl ServeSlot {
@@ -165,6 +169,16 @@ impl ServeSlot {
 
     pub fn store_failed(&self) -> bool {
         self.store_failed.load(Ordering::SeqCst)
+    }
+
+    /// The flag `serve::start` hands `serve::start_with` (`ServeHooks::keychain_prompt`).
+    pub fn keychain_prompt_flag(&self) -> Arc<AtomicBool> {
+        self.keychain_prompt.clone()
+    }
+
+    /// The status line `keychain_prompt` is due (L78).
+    pub fn keychain_prompt(&self) -> bool {
+        self.keychain_prompt.load(Ordering::SeqCst)
     }
 
     /// The first state wins; a later one is dropped.

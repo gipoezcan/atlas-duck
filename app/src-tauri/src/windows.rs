@@ -415,12 +415,17 @@ pub fn route_relaunch(state: &AppSnapshot, argv: &[OsString]) -> Relaunch {
 
 /// The cold start, once startup completed (§2.5 "A cold GUI start with no arguments takes the
 /// same path once startup completes"). The four data-dir error states showed their dialog in
-/// `startup::apply_startup_state` already. Under `--background` nothing opens here; the wizard
-/// (L46, Task 23) and the locked-mode credential window (§2.5, Task 22) add their own rows.
+/// `startup::apply_startup_state` already. Under `--background` (autostart at login) only what the
+/// user cannot do without opens: the first-run wizard (L46) and the credential window of a locked
+/// store (§2.5 "opens for unlock automatically only at startup (also under `--background`)").
+/// Approvals and the no-store error windows wait for the user (the tray shows the state).
 pub fn route_cold_start(state: &AppSnapshot, background: bool) -> Relaunch {
     match state {
-        _ if background => Relaunch::Nothing,
         AppSnapshot::StartupError(_) => Relaunch::Nothing,
+        state if background => match route_open(state) {
+            action @ (Relaunch::OpenSetup | Relaunch::OpenCredential(_)) => action,
+            _ => Relaunch::Nothing,
+        },
         state => route_open(state),
     }
 }
@@ -547,8 +552,16 @@ impl WindowRegistry {
         lock(&self.credential)
     }
 
-    /// The `opening` lock if no open holds it (never waits: for the main thread).
-    pub(crate) fn try_opening(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+    /// The `opening` lock, waiting for an open that holds it (never on the main thread: an open
+    /// waits for the main thread to build its window).
+    pub(crate) fn lock_opening(&self) -> std::sync::MutexGuard<'_, ()> {
+        lock(&self.opening)
+    }
+
+    /// The `opening` lock if no open holds it (never waits: for the main thread). Public for the
+    /// tests that hold it to stand in for an open in flight.
+    #[doc(hidden)]
+    pub fn try_opening(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
         match self.opening.try_lock() {
             Ok(g) => Some(g),
             Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
@@ -706,6 +719,8 @@ pub fn serving_snapshot(slot: Option<&ServeSlot>) -> AppSnapshot {
     }
     match slot.get() {
         None => AppSnapshot::Starting,
+        // M6 T22: a retry's `open` or a core start failed with the endpoint bound.
+        Some(served) if served.store_failed() => AppSnapshot::StoreUnavailable,
         Some(served) if served.core.get().is_some() => AppSnapshot::Serving,
         Some(served) => served
             .gate_state()
@@ -715,12 +730,18 @@ pub fn serving_snapshot(slot: Option<&ServeSlot>) -> AppSnapshot {
 
 /// Carries out `action` (off the main thread).
 pub fn perform<R: Runtime>(app: &AppHandle<R>, action: Relaunch) {
+    perform_with(app, action, Show::Focus);
+}
+
+/// [`perform`] with `how` the windows come to the front (the locked-mode re-raise does not take
+/// the focus, §2.5 / UI-04).
+pub fn perform_with<R: Runtime>(app: &AppHandle<R>, action: Relaunch, how: Show) {
     // `open` logs its own failure.
     let _ = match action {
         Relaunch::Nothing | Relaunch::Defer => Ok(()),
-        Relaunch::OpenApprovals => open(app, Label::Approvals, Show::Focus),
-        Relaunch::OpenSetup => open(app, Label::Setup, Show::Focus),
-        Relaunch::OpenCredential(unlock) => open_credential(app, unlock, Show::Focus),
+        Relaunch::OpenApprovals => open(app, Label::Approvals, how),
+        Relaunch::OpenSetup => open(app, Label::Setup, how),
+        Relaunch::OpenCredential(unlock) => open_credential(app, unlock, how),
         Relaunch::ShowErrorDialog(text) => {
             show_error_dialog(app, &text);
             Ok(())
@@ -760,7 +781,12 @@ pub fn startup_completed<R: Runtime>(app: &AppHandle<R>) {
     if let Some(background) = pending {
         let app = app.clone();
         tauri::async_runtime::spawn_blocking(move || {
-            perform(&app, route_cold_start(&snapshot(&app), background));
+            let action = route_cold_start(&snapshot(&app), background);
+            // §2.5: a window raised at startup starts the 5 minutes before the next raise.
+            if matches!(action, Relaunch::OpenCredential(_) | Relaunch::OpenSetup) {
+                crate::credential::raise::note_startup_raise(&app);
+            }
+            perform(&app, action);
         });
     }
 }
@@ -1031,7 +1057,45 @@ mod tests {
                 AppSnapshot::StartupError(_) => assert_eq!(cold, Relaunch::Nothing),
                 _ => assert_eq!(&cold, expected, "{state:?} cold start"),
             }
-            assert_eq!(route_cold_start(state, true), Relaunch::Nothing);
+            // The cold start under `--background` (autostart at login, §2.5): the wizard and the
+            // locked-mode credential window open at startup anyway (L46, "also under
+            // `--background`"); Approvals and the no-store error windows wait for the user.
+            let quiet = match expected {
+                Relaunch::OpenSetup | Relaunch::OpenCredential(_) => expected.clone(),
+                _ => Relaunch::Nothing,
+            };
+            assert_eq!(
+                route_cold_start(state, true),
+                quiet,
+                "{state:?} cold start --background"
+            );
+        }
+        // Spelled out, so a changed row is seen: what a `--background` cold start opens.
+        let opens = |state: &AppSnapshot| route_cold_start(state, true);
+        assert_eq!(opens(&AppSnapshot::BeforeFirstRun), Relaunch::OpenSetup);
+        assert_eq!(
+            opens(&AppSnapshot::Gate(GateState::FirstRun)),
+            Relaunch::OpenSetup
+        );
+        assert_eq!(
+            opens(&locked(LockedReason::KeychainUnavailable)),
+            Relaunch::OpenCredential(Unlock::Unlock)
+        );
+        assert_eq!(
+            opens(&locked(LockedReason::KeychainLost {
+                offer: RecoveryOffer::RecoverThisLog
+            })),
+            Relaunch::OpenCredential(Unlock::Recover)
+        );
+        for quiet in [
+            AppSnapshot::Serving,
+            AppSnapshot::Starting,
+            AppSnapshot::StoreUnavailable,
+            AppSnapshot::Gate(GateState::StoreNewer),
+            locked(LockedReason::KeyringNotLocal),
+            AppSnapshot::StartupError("x".into()),
+        ] {
+            assert_eq!(opens(&quiet), Relaunch::Nothing, "{quiet:?}");
         }
     }
 

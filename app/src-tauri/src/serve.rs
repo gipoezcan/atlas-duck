@@ -12,6 +12,7 @@ mod app_handler;
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
@@ -38,6 +39,8 @@ pub use app_handler::{AppHandler, DoctorExtras};
 
 use crate::compose::{self, CoreInputs};
 use crate::confirm::DialogConfirmer;
+use crate::credential::follow::AppWatcher;
+use crate::credential::raise::{RaiseGate, RaiseHandle, RaiseSink, TauriRaiseEnv};
 use crate::secret_service::{CachedSecretService, SecretServiceCheck};
 use crate::state::ServeSlot;
 use crate::tray;
@@ -69,6 +72,90 @@ pub const LOG_EVENT_QUIT_WAIT_EXPIRED: &str = "quit_wait_expired";
 pub const LOG_EVENT_UNLOCK_FAILED: &str = "credential_unlock_failed";
 /// `Core::shutdown` ended without a report (its task panicked).
 pub const LOG_EVENT_QUIT_CORE_LOST: &str = "quit_core_lost";
+
+/// L78: how long `audit::open` may block before the status line `keychain_prompt` says the app is
+/// waiting for a keychain authorization (an unsigned dev build re-prompts after every rebuild).
+pub const KEYCHAIN_PROMPT_AFTER: Duration = Duration::from_secs(10);
+
+/// L78: `audit::open`, started at `open_started`, still blocks at `now`: the status line
+/// `keychain_prompt` (PD-90) is shown. Pure over the two instants.
+pub fn keychain_prompt_hint(open_started: Instant, now: Instant) -> bool {
+    prompt_due(open_started, now, KEYCHAIN_PROMPT_AFTER)
+}
+
+fn prompt_due(open_started: Instant, now: Instant, after: Duration) -> bool {
+    now.saturating_duration_since(open_started) >= after
+}
+
+/// What the app wants to hear when the serving state changes behind a command's back: the
+/// keychain retry ended or swapped the cell, an unlock or an archive did, the store failed, the
+/// keychain prompt hint came or went (M6 T22). The tray and an open credential window follow it.
+pub trait ServeWatcher: Send + Sync {
+    /// Called after the change, with no lock of the serving state held, on a thread of the serve
+    /// runtime: it must not block (the app's own spawns the real work).
+    fn serving_changed(&self);
+}
+
+/// What the app hands the serving state beyond the data it serves (M6 T22). `Default` is what the
+/// tests that need none of it use.
+#[derive(Clone)]
+pub struct ServeHooks {
+    pub watcher: Option<Arc<dyn ServeWatcher>>,
+    /// Set while `audit::open` has blocked past [`ServeHooks::keychain_prompt_after`] (L78); the
+    /// app's `ServeSlot` owns the flag, so it is readable before any `ServeState` exists.
+    pub keychain_prompt: Arc<AtomicBool>,
+    /// [`KEYCHAIN_PROMPT_AFTER`] in production.
+    pub keychain_prompt_after: Duration,
+    /// Tests: the next `n` `Core::start`s of this serving state fail (the store is shut down).
+    #[doc(hidden)]
+    pub fail_core_start: Option<Arc<AtomicU32>>,
+}
+
+impl Default for ServeHooks {
+    fn default() -> ServeHooks {
+        ServeHooks {
+            watcher: None,
+            keychain_prompt: Arc::new(AtomicBool::new(false)),
+            keychain_prompt_after: KEYCHAIN_PROMPT_AFTER,
+            fail_core_start: None,
+        }
+    }
+}
+
+impl ServeHooks {
+    fn notify(&self) {
+        if let Some(w) = &self.watcher {
+            w.serving_changed();
+        }
+    }
+
+    fn set_prompt(&self, on: bool) {
+        if self.keychain_prompt.swap(on, Ordering::SeqCst) != on {
+            self.notify();
+        }
+    }
+}
+
+/// Runs `open` (a keystore + `audit::open`, which blocks while the OS shows a keychain
+/// authorization prompt, L78); past [`ServeHooks::keychain_prompt_after`] the hint is up until it
+/// returns.
+async fn with_prompt_hint<T>(open: impl Future<Output = T>, hooks: &ServeHooks) -> T {
+    tokio::pin!(open);
+    let started = Instant::now();
+    tokio::select! {
+        biased;
+        out = &mut open => return out,
+        () = tokio::time::sleep(hooks.keychain_prompt_after) => {}
+    }
+    hooks.set_prompt(prompt_due(
+        started,
+        Instant::now(),
+        hooks.keychain_prompt_after,
+    ));
+    let out = open.await;
+    hooks.set_prompt(false);
+    out
+}
 
 /// PD-25: how often the socket file and its dir are touched (Unix).
 pub const TOUCH_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -260,11 +347,21 @@ pub struct ServeState {
     /// What the credential window's unlock, archive and manual keychain retry reuse from the
     /// start (M6 T20); set by [`start_with`].
     restart: OnceLock<Restart>,
-    /// One unlock or archive at a time (M6 T20).
-    unlocking: tokio::sync::Mutex<()>,
+    /// One unlock or archive at a time (M6 T20). The guard (`try_lock_owned`) moves into the task
+    /// that does the work, so a command future that is dropped cannot release it early (M6 T22).
+    unlocking: Arc<tokio::sync::Mutex<()>>,
     /// The task of an unlock or archive in flight: the quit path awaits it with a bound, like the
     /// keychain retry, and never aborts it (it owns the store it opens).
     unlock_task: Mutex<Option<JoinHandle<()>>>,
+    /// The keychain retry (scheduled or manual) is running: set when it is spawned, cleared by
+    /// the task itself right before it tells the watcher it ended (a `JoinHandle` only reports
+    /// "finished" after the task returned).
+    retrying: AtomicBool,
+    /// An open or a core start failed after the endpoint was bound (M6 T22, M4 T19 m-4): the gate
+    /// answers as before, but the app says the store is unusable (tray text, relaunch dialog) and
+    /// offers no unlock, archive or retry. Only a restart clears it.
+    store_failed: AtomicBool,
+    hooks: ServeHooks,
 }
 
 /// The store opener and the core starter of this start (M6 T20): the data dir, `instance.lock`,
@@ -287,6 +384,7 @@ impl ServeState {
         store: Option<Store>,
         extras: Arc<DoctorExtras>,
         ui: Arc<dyn UiSink>,
+        hooks: ServeHooks,
     ) -> ServeState {
         ServeState {
             cell: Arc::new(HandlerCell::new(AppHandler::new(initial, extras.clone()))),
@@ -301,8 +399,11 @@ impl ServeState {
             extras,
             ui,
             restart: OnceLock::new(),
-            unlocking: tokio::sync::Mutex::new(()),
+            unlocking: Arc::new(tokio::sync::Mutex::new(())),
             unlock_task: Mutex::new(None),
+            retrying: AtomicBool::new(false),
+            store_failed: AtomicBool::new(false),
+            hooks,
         }
     }
 
@@ -318,7 +419,24 @@ impl ServeState {
 
     /// True while the keychain retry loop (§8.7) runs.
     pub fn keychain_retrying(&self) -> bool {
-        lock(&self.retry).as_ref().is_some_and(|h| !h.is_finished())
+        self.retrying.load(Ordering::SeqCst)
+    }
+
+    /// True once an open or a core start failed with the endpoint bound (see the field).
+    pub fn store_failed(&self) -> bool {
+        self.store_failed.load(Ordering::SeqCst)
+    }
+
+    /// An unlock or archive of the credential window runs (it closes its own window after the
+    /// answer, so the watcher leaves that window alone).
+    pub fn unlock_busy(&self) -> bool {
+        self.unlocking.try_lock().is_err()
+    }
+
+    /// The store is unusable (the retry's `open` failed, or a core start did): see the field.
+    fn mark_store_failed(&self) {
+        self.store_failed.store(true, Ordering::SeqCst);
+        self.hooks.notify();
     }
 
     /// True while the `serve` task runs.
@@ -377,6 +495,7 @@ impl ServeState {
         self.cell.swap(self.handler_for(core.handler()));
         *lock(&self.gate) = None;
         drop(frozen);
+        self.hooks.notify();
         true
     }
 
@@ -391,6 +510,7 @@ impl ServeState {
         self.cell.swap(self.handler_for(gate.clone()));
         *lock(&self.gate) = Some(gate);
         drop(frozen);
+        self.hooks.notify();
         true
     }
 
@@ -430,7 +550,7 @@ impl ServeState {
     /// The `keychain_lost` gate is serving, with no core: the only state an unlock or archive
     /// may touch the store in (no `Store` of this data dir is open then).
     fn keychain_lost(&self) -> Option<RecoveryOffer> {
-        if self.core.get().is_some() {
+        if self.core.get().is_some() || self.store_failed() {
             return None;
         }
         match self.gate_state() {
@@ -532,7 +652,8 @@ pub async fn unlock(
     let Some(restart) = state.restart.get() else {
         return failed(UnlockFailure::NotLocked);
     };
-    let Ok(_one) = state.unlocking.try_lock() else {
+    // The guard belongs to the task that does the work (below), not to this future.
+    let Ok(one) = state.unlocking.clone().try_lock_owned() else {
         return failed(UnlockFailure::Busy);
     };
     let want = match kind {
@@ -548,6 +669,7 @@ pub async fn unlock(
         restart.starter.clone(),
     );
     let done = state.spawn_unlock_work(async move {
+        let _one_unlock_at_a_time = one;
         let opened = run_blocking_unlock(move || opener.unlock_blocking(kind, &passphrase)).await;
         let (store, keys, pats_deleted) = opened?;
         if *lock(&st.frozen) {
@@ -558,6 +680,12 @@ pub async fn unlock(
             Ok(core) => core,
             Err(f) => {
                 f.log();
+                // The recovery took: the keychain holds the KEK again and the store was shut
+                // down. "Keychain lost" and its "Recover this log" would be stale (a second try
+                // fails `invalid`: nothing is left to recover). The gate says what is true: the
+                // keychain is not the problem, a start is, and "Retry keychain" runs one
+                // more `open` + start (M6 T22, m-8).
+                st.install_gate(GateState::Locked(LockedReason::KeychainUnavailable));
                 return Err(UnlockFailure::CoreStart);
             }
         };
@@ -614,7 +742,7 @@ pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<Archived
     let Some(restart) = state.restart.get() else {
         return failed(UnlockFailure::NotLocked);
     };
-    let Ok(_one) = state.unlocking.try_lock() else {
+    let Ok(one) = state.unlocking.clone().try_lock_owned() else {
         return failed(UnlockFailure::Busy);
     };
     if state.keychain_lost().is_none() {
@@ -623,16 +751,20 @@ pub async fn archive_and_start_fresh(state: &Arc<ServeState>) -> Result<Archived
     let text = archive_confirm_text(&restart.opener.data);
     let confirmer = restart.starter.confirmer.clone();
     // The dialog blocks until the user answers: never on the async runtime or the main thread.
+    // The guard goes into that thread and comes back out of it, so a dropped caller leaves the
+    // archive "in progress" for as long as the dialog is up.
     let shown = text.clone();
-    let answer = tokio::task::spawn_blocking(move || confirmer.confirm(&shown))
-        .await
-        .unwrap_or(Confirm::Cancel);
+    let asked = tokio::task::spawn_blocking(move || (confirmer.confirm(&shown), one)).await;
+    let Ok((answer, one)) = asked else {
+        return failed(UnlockFailure::Cancelled);
+    };
     if answer != Confirm::Ok {
         return failed(UnlockFailure::Cancelled);
     }
     let confirmed = confirmed_by(&text);
     let (st, opener) = (state.clone(), restart.opener.clone());
     let done = state.spawn_unlock_work(async move {
+        let _one_archive_at_a_time = one;
         if *lock(&st.frozen) {
             return Err(UnlockFailure::ShuttingDown);
         }
@@ -694,23 +826,30 @@ pub fn retry_keychain_now(state: &Arc<ServeState>) -> RetryNow {
         return RetryNow::ShuttingDown;
     }
     if state.core.get().is_some()
+        || state.store_failed()
         || state.gate_state() != Some(GateState::Locked(LockedReason::KeychainUnavailable))
     {
         return RetryNow::NotLocked;
     }
-    let mut retry = lock(&state.retry);
-    if retry.as_ref().is_some_and(|h| !h.is_finished()) {
+    if state.retrying.swap(true, Ordering::SeqCst) {
         return RetryNow::AlreadyRunning;
     }
-    *retry = Some(tokio::spawn(retry_keychain(
+    let task = spawn_retry(
         state.clone(),
         restart.opener.clone(),
         restart.starter.clone(),
         vec![Duration::ZERO],
-    )));
-    drop(retry);
+        true,
+    );
+    *lock(&state.retry) = Some(task);
     drop(frozen);
     RetryNow::Started
+}
+
+/// The tray's "Retry keychain" (PD-89): [`retry_keychain_now`] on the state `slot` holds; `None`
+/// while nothing serves (startup, a failed start).
+pub fn retry_keychain_from_menu(slot: Option<&ServeSlot>) -> Option<RetryNow> {
+    slot.and_then(ServeSlot::get).map(retry_keychain_now)
 }
 
 // ---------- quit ----------
@@ -917,6 +1056,8 @@ pub struct StartInputs {
     /// Tests: bind here instead of this user's endpoint location (`IpcServer::bind_at`).
     #[doc(hidden)]
     pub endpoint: Option<EndpointLocation>,
+    /// The watcher, the keychain-prompt flag (M6 T22); `ServeHooks::default()` for none.
+    pub hooks: ServeHooks,
 }
 
 /// Starts serving for the Tauri app: returns at once; the work runs on `tauri::async_runtime`
@@ -947,6 +1088,21 @@ pub fn start(
     if let Some(feed) = crate::attention::install(app, tray_host) {
         ui = ui.with_attention(feed);
     }
+    // M6 T22: a refused request while a gate serves raises its window at most once per 5 minutes
+    // (UI-04), and the tray follows every one.
+    let raise = Arc::new(RaiseGate::new(
+        Arc::new(TauriRaiseEnv::new(app.clone())),
+        Arc::new(atlas_duck_audit::SystemClock::new()),
+    ));
+    app.manage(RaiseHandle(raise.clone()));
+    ui = ui.with_raise(Arc::new(RaiseSink::new(raise)));
+    let hooks = ServeHooks {
+        watcher: Some(Arc::new(AppWatcher::new(app.clone()))),
+        keychain_prompt: slot
+            .as_ref()
+            .map_or_else(Arc::default, |s| s.keychain_prompt_flag()),
+        ..ServeHooks::default()
+    };
     let inputs = StartInputs {
         data,
         lock,
@@ -961,6 +1117,7 @@ pub fn start(
         retry_schedule: keychain_retry_schedule().to_vec(),
         quit,
         endpoint: None,
+        hooks,
     };
     let handle = app.clone();
     let task = tauri::async_runtime::spawn(async move {
@@ -1007,10 +1164,12 @@ pub async fn start_with(i: StartInputs) -> Result<Arc<ServeState>, StartupFailur
         ui: i.ui.clone(),
         confirmer: i.confirmer.clone(),
         tray_host: i.tray_host,
+        fail_next: i.hooks.fail_core_start.clone(),
     });
 
-    // Steps 1–4: stale endpoint file, install id, keystore, `open`.
-    let first = opener.clone().first_open().await;
+    // Steps 1–4: stale endpoint file, install id, keystore, `open`. A keychain authorization
+    // prompt blocks the last (L78): past 10 s the status line `keychain_prompt` says so.
+    let first = with_prompt_hint(opener.clone().first_open(), &i.hooks).await;
     let (outcome, keys) = match first {
         Ok(opened) => opened,
         Err(f) => {
@@ -1069,7 +1228,14 @@ pub async fn start_with(i: StartInputs) -> Result<Arc<ServeState>, StartupFailur
     if i.quit.0.is_cancelled() {
         return Err(abandon(core, store).await);
     }
-    let state = Arc::new(ServeState::new(initial, gate, store, extras, i.ui.clone()));
+    let state = Arc::new(ServeState::new(
+        initial,
+        gate,
+        store,
+        extras,
+        i.ui.clone(),
+        i.hooks.clone(),
+    ));
     let _ = state.restart.set(Restart {
         opener: opener.clone(),
         starter: starter.clone(),
@@ -1106,12 +1272,8 @@ pub async fn start_with(i: StartInputs) -> Result<Arc<ServeState>, StartupFailur
 
     // §8.7 step 2: only `keychain_unavailable` is retried (M2 handoff).
     if served == Served::Gate(GateState::Locked(LockedReason::KeychainUnavailable)) {
-        let task = tokio::spawn(retry_keychain(
-            state.clone(),
-            opener,
-            starter,
-            i.retry_schedule,
-        ));
+        state.retrying.store(true, Ordering::SeqCst);
+        let task = spawn_retry(state.clone(), opener, starter, i.retry_schedule, false);
         *lock(&state.retry) = Some(task);
     }
     Ok(state)
@@ -1271,6 +1433,8 @@ struct CoreStarter {
     ui: Arc<dyn UiSink>,
     confirmer: Arc<dyn NativeConfirmer>,
     tray_host: Option<TrayHost>,
+    /// Tests ([`ServeHooks::fail_core_start`]): how many of the next starts fail.
+    fail_next: Option<Arc<AtomicU32>>,
 }
 
 impl CoreStarter {
@@ -1282,6 +1446,14 @@ impl CoreStarter {
         keys: Arc<dyn KeyStore>,
         pats_deleted: Vec<String>,
     ) -> Result<Arc<Core>, StoreFailure> {
+        let injected = self.fail_next.as_ref().is_some_and(|n| {
+            n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+                .is_ok()
+        });
+        if injected {
+            shutdown_store(store).await;
+            return Err(StoreFailure::CoreStart);
+        }
         let inputs = CoreInputs {
             store: store.clone(),
             keys,
@@ -1309,13 +1481,16 @@ impl CoreStarter {
 /// `Ready` starts `Core` and swaps the cell (no rebind; T8 replays each connection's `hello`);
 /// another locked reason, `StoreNewer` or `FirstRun` swaps to that gate and stops; a failure
 /// (`Err`, or `Core::start` refusing) is logged and keeps the locked gate (the endpoint is
-/// already bound, PD-06 cannot apply). After the schedule the app stays locked (manual retry is
-/// M6). Ends early on the shutdown signal and after [`ServeState::freeze`].
+/// already bound, PD-06 cannot apply) and marks the store failed ([`ServeState::store_failed`]:
+/// the tray and the relaunch say so). After the schedule the app stays locked; the tray's and the
+/// credential window's "Retry keychain" run one more attempt (`manual`, PD-89). Ends early on the
+/// shutdown signal and after [`ServeState::freeze`].
 async fn retry_keychain(
     state: Arc<ServeState>,
     opener: Arc<Opener>,
     starter: Arc<CoreStarter>,
     schedule: Vec<Duration>,
+    manual: bool,
 ) {
     for (n, delay) in schedule.iter().enumerate() {
         let attempt = n + 1;
@@ -1328,10 +1503,12 @@ async fn retry_keychain(
         if *lock(&state.frozen) {
             return;
         }
-        let (outcome, keys) = match opener.clone().retry_open().await {
+        let opened = with_prompt_hint(opener.clone().retry_open(), &state.hooks).await;
+        let (outcome, keys) = match opened {
             Ok(opened) => opened,
             Err(f) => {
                 f.log();
+                state.mark_store_failed();
                 return;
             }
         };
@@ -1367,6 +1544,7 @@ async fn retry_keychain(
                     Ok(core) => core,
                     Err(f) => {
                         f.log();
+                        state.mark_store_failed();
                         return;
                     }
                 };
@@ -1380,6 +1558,7 @@ async fn retry_keychain(
             (StartupOutcome::Ready { store, .. }, None) => {
                 shutdown_store(store).await;
                 StoreFailure::Integrity.log();
+                state.mark_store_failed();
                 return;
             }
             (_, _) => {
@@ -1390,7 +1569,33 @@ async fn retry_keychain(
             }
         }
     }
-    tracing::warn!(event = LOG_EVENT_KEYCHAIN_RETRY_EXHAUSTED);
+    // A manual retry is one attempt by design; its outcome is logged above.
+    if !manual {
+        tracing::warn!(event = LOG_EVENT_KEYCHAIN_RETRY_EXHAUSTED);
+    }
+}
+
+/// Spawns [`retry_keychain`]; the caller has set [`ServeState::retrying`]. When the task ends, by
+/// whatever way, the flag goes and the watcher hears of it (the tray's "Waiting for keyring"
+/// goes, an open credential window follows the state it was left in).
+fn spawn_retry(
+    state: Arc<ServeState>,
+    opener: Arc<Opener>,
+    starter: Arc<CoreStarter>,
+    schedule: Vec<Duration>,
+    manual: bool,
+) -> JoinHandle<()> {
+    struct Ended(Arc<ServeState>);
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            self.0.retrying.store(false, Ordering::SeqCst);
+            self.0.hooks.notify();
+        }
+    }
+    tokio::spawn(async move {
+        let _ended = Ended(state.clone());
+        retry_keychain(state, opener, starter, schedule, manual).await;
+    })
 }
 
 /// PD-25: every [`TOUCH_INTERVAL`] the socket file and its dir get a fresh mtime
@@ -1531,6 +1736,10 @@ mod tests {
 
     /// A serving state with the gate in `gs` and no core (no endpoint, no store).
     fn gate_serving(gs: GateState) -> ServeState {
+        gate_serving_with(gs, ServeHooks::default())
+    }
+
+    fn gate_serving_with(gs: GateState, hooks: ServeHooks) -> ServeState {
         let ui: Arc<dyn UiSink> = Arc::new(NoUi);
         let gate = GateHandler::new(gs, ui.clone());
         let extras = Arc::new(DoctorExtras {
@@ -1538,7 +1747,7 @@ mod tests {
             secret_service: Arc::new(NoCheck),
             data: None,
         });
-        ServeState::new(gate.clone(), Some(gate), None, extras, ui)
+        ServeState::new(gate.clone(), Some(gate), None, extras, ui, hooks)
     }
 
     async fn gate_label(state: &ServeState) -> serde_json::Value {
@@ -1675,7 +1884,14 @@ mod tests {
             secret_service: Arc::new(NoCheck),
             data: Some(data.clone()),
         });
-        let state = ServeState::new(gate.clone(), Some(gate), Some(store), extras, ui);
+        let state = ServeState::new(
+            gate.clone(),
+            Some(gate),
+            Some(store),
+            extras,
+            ui,
+            ServeHooks::default(),
+        );
         #[cfg(unix)]
         let location = {
             let dir = tmp.path().join("s");
@@ -1756,6 +1972,122 @@ mod tests {
         let state = gate_serving(GateState::Locked(LockedReason::KeychainUnavailable));
         state.freeze_for_shutdown();
         assert!(state.retry_stop.0.is_cancelled());
+    }
+
+    /// Counts what the watcher is told.
+    #[derive(Default)]
+    struct Told(AtomicU32);
+
+    impl ServeWatcher for Told {
+        fn serving_changed(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Told {
+        fn count(&self) -> u32 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn watched(told: &Arc<Told>) -> ServeHooks {
+        ServeHooks {
+            watcher: Some(told.clone()),
+            ..ServeHooks::default()
+        }
+    }
+
+    #[test]
+    fn keychain_prompt_hint_after_10s() {
+        let t0 = Instant::now();
+        assert_eq!(KEYCHAIN_PROMPT_AFTER, Duration::from_secs(10));
+        assert!(!keychain_prompt_hint(t0, t0));
+        assert!(!keychain_prompt_hint(t0, t0 + Duration::from_millis(9_999)));
+        assert!(keychain_prompt_hint(t0, t0 + Duration::from_secs(10)));
+        assert!(keychain_prompt_hint(t0, t0 + Duration::from_secs(600)));
+        // An `open` that started after `now` has not waited at all.
+        assert!(!keychain_prompt_hint(t0 + Duration::from_secs(60), t0));
+    }
+
+    /// L78: the hint is up only while an `open` blocks past the limit, and the watcher hears of
+    /// it going up and going down; an `open` that returns in time tells nobody.
+    #[tokio::test]
+    async fn the_prompt_hint_is_up_only_while_open_blocks_past_the_limit() {
+        // Real time (the runtime has no paused clock): the limit is shortened through the hooks.
+        let told = Arc::new(Told::default());
+        let hooks = ServeHooks {
+            keychain_prompt_after: Duration::from_millis(300),
+            ..watched(&told)
+        };
+        let flag = hooks.keychain_prompt.clone();
+        let quick = with_prompt_hint(
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                1
+            },
+            &hooks,
+        )
+        .await;
+        assert_eq!(quick, 1);
+        assert!(!flag.load(Ordering::SeqCst));
+        assert_eq!(told.count(), 0);
+
+        let slow_hooks = hooks.clone();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let slow = tokio::spawn(async move {
+            with_prompt_hint(
+                async {
+                    let _ = released.await;
+                    2
+                },
+                &slow_hooks,
+            )
+            .await
+        });
+        let started = Instant::now();
+        while !flag.load(Ordering::SeqCst) {
+            assert!(started.elapsed() < Duration::from_secs(20), "never came up");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "not before the limit"
+        );
+        assert_eq!(told.count(), 1);
+        assert!(release.send(()).is_ok());
+        assert_eq!(slow.await.ok(), Some(2));
+        assert!(!flag.load(Ordering::SeqCst));
+        assert_eq!(told.count(), 2);
+    }
+
+    /// The watcher (tray, credential window) hears every swap and a failed store, and nothing
+    /// after the freeze; a failed store offers no unlock or archive.
+    #[test]
+    fn the_watcher_hears_swaps_and_a_failed_store() {
+        let told = Arc::new(Told::default());
+        let state = gate_serving_with(
+            GateState::Locked(LockedReason::KeychainLost {
+                offer: RecoveryOffer::RecoverThisLog,
+            }),
+            watched(&told),
+        );
+        assert_eq!(state.keychain_lost(), Some(RecoveryOffer::RecoverThisLog));
+        assert!(state.install_gate(GateState::StoreNewer));
+        assert_eq!(told.count(), 1);
+        assert!(
+            state.install_gate(GateState::Locked(LockedReason::KeychainLost {
+                offer: RecoveryOffer::RecoverThisLog
+            }))
+        );
+        assert_eq!(told.count(), 2);
+        assert!(!state.store_failed());
+        state.mark_store_failed();
+        assert_eq!(told.count(), 3);
+        assert!(state.store_failed());
+        assert_eq!(state.keychain_lost(), None, "nothing to unlock or archive");
+        state.freeze();
+        assert!(!state.install_gate(GateState::FirstRun));
+        assert_eq!(told.count(), 3, "a refused swap is not a change");
     }
 
     #[test]

@@ -79,6 +79,8 @@ pub struct TauriUiSink {
     tee: Option<Arc<dyn UiSink>>,
     /// The attention engine's feed (Task 19): it only queues the event, never blocks the core.
     attention: Option<Arc<dyn UiSink>>,
+    /// The locked-mode raise gate (Task 22): a refused request is `credential_context_changed`.
+    raise: Option<Arc<dyn UiSink>>,
 }
 
 impl TauriUiSink {
@@ -91,12 +93,20 @@ impl TauriUiSink {
             out,
             tee,
             attention: None,
+            raise: None,
         }
     }
 
     /// Also forwards every event to the attention engine's feed.
     pub fn with_attention(mut self, feed: Arc<dyn UiSink>) -> TauriUiSink {
         self.attention = Some(feed);
+        self
+    }
+
+    /// Also forwards every event to the locked-mode raise gate (it reacts to
+    /// `CredentialContextChanged` only and never blocks).
+    pub fn with_raise(mut self, gate: Arc<dyn UiSink>) -> TauriUiSink {
+        self.raise = Some(gate);
         self
     }
 }
@@ -107,6 +117,9 @@ impl UiSink for TauriUiSink {
         self.out.emit(name, payload);
         if let Some(feed) = &self.attention {
             feed.emit(e.clone());
+        }
+        if let Some(gate) = &self.raise {
+            gate.emit(e.clone());
         }
         if let Some(tee) = &self.tee {
             tee.emit(e);
