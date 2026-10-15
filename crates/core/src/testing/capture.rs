@@ -16,7 +16,7 @@ use serde::Serialize;
 
 use crate::decision::{
     BatchItem, BatchOutcome, Decision, DecisionApi, DecisionError, DecisionOutcome,
-    PreviewDelivery, QueueItem, RawPage, RecentItem, RedactionReport, SessionKey,
+    PreviewDelivery, QueueItem, RawPage, RecentItem, RedactionReport, RequestDetail, SessionKey,
 };
 use crate::gate::{UiEvent, UiSink};
 use crate::instances::{AddInstance, AdminError, ConnectionReport, InstanceAdmin, InstanceView};
@@ -288,6 +288,9 @@ impl DecisionApi for CapturingDecisions {
     }
     fn queue_get(&self, request_id: &str) -> Option<QueueItem> {
         self.rec(self.inner.queue_get(request_id))
+    }
+    fn request_detail(&self, request_id: &str) -> Option<RequestDetail> {
+        self.rec(self.inner.request_detail(request_id))
     }
     fn preview_fetch(
         &self,

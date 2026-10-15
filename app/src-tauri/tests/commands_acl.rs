@@ -764,7 +764,7 @@ mod approvals_commands {
     use atlas_duck_app_lib::commands::CommandError;
     use atlas_duck_app_lib::commands::approvals::{
         DecideArgs, DenyCount, decide_batch_dto, decide_dto, deny_batch_dto, deny_session_dto,
-        preview_fetch_dto, queue_get_dto, redaction_preview_dto,
+        preview_fetch_dto, queue_detail_dto, queue_get_dto, redaction_preview_dto,
     };
     use atlas_duck_app_lib::commands::dto::{BatchItems, Reason, RequestIds, SessionId, parse};
     use atlas_duck_atlassian::testing::{TEST_USER, TEST_USER_KEY, XAuser, fixtures};
@@ -858,6 +858,34 @@ mod approvals_commands {
             .iter()
             .filter(|r| r.method.as_str() != "GET")
             .count())
+    }
+
+    /// `queue_get` carries the Request tab's facts (T14): the params as the agent sent them, their
+    /// hash, the connection; a request that left the queue (unknown id) is `not_found`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_get_carries_the_request_tab_facts() -> TestResult {
+        let h = rig(vec![]).await?;
+        let d = h.decisions();
+        let params = comment();
+        let id = queued(&h, COMMENT, params.clone()).await?;
+        let got = queue_detail_dto(&*d, &id)?;
+        assert_eq!(got.item.request_id, id);
+        assert_eq!(got.request.params, params);
+        assert_eq!(got.request.params_sha256.len(), 64);
+        assert!(
+            got.request
+                .params_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        );
+        assert!(got.request.submitted_at.ends_with('Z'), "{got:?}");
+        assert_eq!(got.request.agent_name.as_deref(), Some("test-agent"));
+        assert_eq!(got.request.cwd_basename, "workdir");
+        assert_eq!(
+            queue_detail_dto(&*d, "req_0000000000000000none"),
+            Err(CommandError::NotFound)
+        );
+        Ok(())
     }
 
     /// `decide` of a kind the item does not take is refused and changes nothing; an approve of a

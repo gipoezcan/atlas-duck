@@ -295,10 +295,56 @@ pub struct QueueItem {
     pub candidate_rev: CandidateRev,
 }
 
+/// What the Approvals window's Request tab shows of a queued request (§5.6): the agent's params,
+/// their hash, the normalized reason and the connection facts. Every string that came from an
+/// agent or from the peer's process is display-escaped here (§6.4), the strings and keys of
+/// `params` included; `params` is JSON the UI renders as text. The peer chain is not kept past `REQUEST_RECEIVED`, so only the origin exe
+/// is shown.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RequestDetail {
+    pub params: Value,
+    /// Lowercase hex (§4.4).
+    pub params_sha256: String,
+    /// The whole normalized `reason` (§3.3), display-escaped; `None` when the agent sent none.
+    pub reason: Option<String>,
+    /// RFC 3339 UTC, ms.
+    pub submitted_at: String,
+    pub client_kind: Option<String>,
+    pub agent_name: Option<String>,
+    /// `hello`, `env` or `none` (§3.3): where the agent name came from.
+    pub agent_name_source: Option<String>,
+    pub cwd_basename: String,
+    pub connection_id: Option<String>,
+    pub peer_pid: Option<u32>,
+    pub peer_exe: Option<String>,
+    pub peer_origin_exe: Option<String>,
+}
+
+fn display_path(p: &std::path::Path) -> String {
+    escape_for_display(&p.to_string_lossy())
+}
+
+/// `v` with every string and key display-escaped (§6.4): the Request tab shows params as text, and
+/// an invisible or bidi character in them must not reorder or hide what the approver reads.
+fn escape_json(v: &Value) -> Value {
+    match v {
+        Value::String(s) => Value::String(escape_for_display(s)),
+        Value::Array(a) => Value::Array(a.iter().map(escape_json).collect()),
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .map(|(k, v)| (escape_for_display(k), escape_json(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// C.7. Synchronous (PD-13): callers are never on a UI thread (M6 uses `spawn_blocking`).
 pub trait DecisionApi: Send + Sync {
     fn queue_list(&self) -> Vec<QueueItem>;
     fn queue_get(&self, request_id: &str) -> Option<QueueItem>;
+    /// M6 T14: the Request tab's facts of a queued request; `None` once it left the queue.
+    fn request_detail(&self, request_id: &str) -> Option<RequestDetail>;
     /// Commits `PREVIEW_SHOWN` before delivery; this is "opened" (Task 21).
     fn preview_fetch(
         &self,
@@ -1763,6 +1809,26 @@ impl DecisionApi for CoreDecisions {
         self.engine
             .entry(request_id)
             .and_then(|e| in_queue(&self.engine, &e))
+    }
+
+    fn request_detail(&self, request_id: &str) -> Option<RequestDetail> {
+        let e = self.engine.entry(request_id)?;
+        in_queue(&self.engine, &e)?;
+        let actor = &e.ctx.actor;
+        Some(RequestDetail {
+            params: e.params().map_or(Value::Null, escape_json),
+            params_sha256: e.params_sha256.clone(),
+            reason: e.reason.as_deref().map(escape_for_display),
+            submitted_at: e.submitted_at.clone(),
+            client_kind: actor.client_kind.clone(),
+            agent_name: e.agent_name.as_deref().map(escape_for_display),
+            agent_name_source: actor.agent_name_source.clone(),
+            cwd_basename: escape_for_display(&e.session.cwd_basename),
+            connection_id: actor.connection_id.clone(),
+            peer_pid: actor.peer_pid,
+            peer_exe: actor.peer_exe.as_deref().map(display_path),
+            peer_origin_exe: actor.peer_origin_exe.as_deref().map(display_path),
+        })
     }
 
     fn preview_fetch(

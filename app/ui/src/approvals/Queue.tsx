@@ -62,9 +62,13 @@ interface QueueProps {
   items: readonly QueueItem[];
   /** Called with the selected request ids whenever the selection changes. */
   onSelectionChange?: (ids: string[]) => void;
+  /** The explicit open action of a row (spec 5.6 "Opened"): the only thing that may fetch a preview. */
+  onOpen?: (requestId: string) => void;
+  /** The row whose detail is shown. */
+  selectedId?: string | null;
 }
 
-export function Queue({ items, onSelectionChange }: QueueProps) {
+export function Queue({ items, onSelectionChange, onOpen, selectedId = null }: QueueProps) {
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const rows = useMemo(() => buildRows(items), [items]);
   const byId = useMemo(() => new Map(items.map((i) => [i.request_id, i])), [items]);
@@ -121,6 +125,8 @@ export function Queue({ items, onSelectionChange }: QueueProps) {
             other={row.item.possible_duplicate_of === null ? undefined : byId.get(row.item.possible_duplicate_of)}
             checked={selected.has(row.item.request_id)}
             onToggle={(on) => toggle([row.item.request_id], on)}
+            current={row.item.request_id === selectedId}
+            onOpen={onOpen}
           />
         )
       }
@@ -160,14 +166,18 @@ function ItemRow({
   other,
   checked,
   onToggle,
+  current,
+  onOpen,
 }: {
   item: QueueItem;
   other: QueueItem | undefined;
   checked: boolean;
   onToggle: (on: boolean) => void;
+  current: boolean;
+  onOpen: ((requestId: string) => void) | undefined;
 }) {
   return (
-    <div className="queue-item">
+    <div className="queue-item" aria-current={current ? 'true' : undefined}>
       <div className="queue-line">
         <input
           type="checkbox"
@@ -180,6 +190,15 @@ function ItemRow({
         <span className="alias">{item.instance_alias}</span>
         <span className="target">{item.target_display}</span>
         <span className="class">{CLASS_LABELS[item.class] ?? item.class}</span>
+        {onOpen === undefined ? null : (
+          <button
+            type="button"
+            aria-label={`${QUEUE_TEXT.open} ${item.op_id} ${item.target_display}`}
+            onClick={() => onOpen(item.request_id)}
+          >
+            {QUEUE_TEXT.open}
+          </button>
+        )}
       </div>
       <div className="queue-line">
         {item.reason_excerpt === null || item.reason_excerpt === '' ? (

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { Header } from '../shared/Header';
 import {
@@ -9,7 +9,8 @@ import {
 } from '../shared/ipc/invoke';
 import { on } from '../shared/ipc/events';
 import type { QueueItem, RecentItem, StatusLine } from '../shared/ipc/types';
-import { QUEUE_TEXT, RECENT_TEXT, WINDOW_TITLES } from '../shared/strings';
+import { DETAIL_TEXT, QUEUE_TEXT, RECENT_TEXT, WINDOW_TITLES } from '../shared/strings';
+import { Detail } from './Detail';
 import { Queue } from './Queue';
 import { Recent } from './Recent';
 
@@ -81,6 +82,24 @@ export function App() {
     [reloadRecent, reloadStatus],
   );
 
+  // The open action is the only thing that bumps `token`; a queue re-read never does.
+  const [selected, setSelected] = useState<{ item: QueueItem; token: number } | null>(null);
+  const tokens = useRef(0);
+  const byId = useMemo(
+    () => new Map((queue.value ?? []).map((i) => [i.request_id, i])),
+    [queue.value],
+  );
+  const onOpen = useCallback(
+    (id: string) => {
+      const item = byId.get(id);
+      if (item !== undefined) setSelected({ item, token: ++tokens.current });
+    },
+    [byId],
+  );
+  const current = selected === null ? undefined : byId.get(selected.item.request_id);
+  // Keep the last known row of a request that left the queue (a decided item stays selected).
+  const shownItem = current ?? selected?.item;
+
   return (
     <>
       <Header lines={status.value ?? []} />
@@ -88,9 +107,19 @@ export function App() {
         <h1>{WINDOW_TITLES.approvals}</h1>
         {queue.failed ? <p role="alert">{QUEUE_TEXT.load_failed}</p> : null}
         {queue.value !== null ? (
-          <Queue items={queue.value} />
+          <Queue items={queue.value} onOpen={onOpen} selectedId={selected?.item.request_id ?? null} />
         ) : queue.failed ? null : (
           <p role="status">{QUEUE_TEXT.loading}</p>
+        )}
+        {selected === null || shownItem === undefined ? (
+          <p>{DETAIL_TEXT.select_prompt}</p>
+        ) : (
+          <Detail
+            key={selected.item.request_id}
+            item={shownItem}
+            openToken={selected.token}
+            gone={current === undefined}
+          />
         )}
         {recent.failed ? <p role="alert">{RECENT_TEXT.load_failed}</p> : null}
         {recent.value !== null ? (

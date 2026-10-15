@@ -5,7 +5,7 @@
 
 use atlas_duck_core::{
     BatchOutcome, CandidateRev, Decision, DecisionApi, DecisionOutcome, QueueItem, RecentItem,
-    RedactionReport,
+    RedactionReport, RequestDetail,
 };
 use atlas_duck_preview::render::raw::incomplete_tail;
 use atlas_duck_preview::{Platform, Preview, render};
@@ -62,13 +62,30 @@ pub fn queue_get_dto(d: &dyn DecisionApi, request_id: &str) -> Result<QueueItem,
     d.queue_get(request_id).ok_or(CommandError::NotFound)
 }
 
+/// What `queue_get` returns (T14): the queue row and the Request tab's facts (params, hash,
+/// reason, connection). `queue_list` rows stay light and carry no `request`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct QueueDetail {
+    pub item: QueueItem,
+    pub request: RequestDetail,
+}
+
+pub fn queue_detail_dto(
+    d: &dyn DecisionApi,
+    request_id: &str,
+) -> Result<QueueDetail, CommandError> {
+    let item = queue_get_dto(d, request_id)?;
+    let request = d.request_detail(request_id).ok_or(CommandError::NotFound)?;
+    Ok(QueueDetail { item, request })
+}
+
 #[tauri::command]
 pub async fn queue_get<R: Runtime>(
     app: AppHandle<R>,
     args: Args<QueueGetArgs>,
-) -> Result<QueueItem, CommandError> {
+) -> Result<QueueDetail, CommandError> {
     let Args(QueueGetArgs { request_id }) = args;
-    with_decisions(&app, move |d| queue_get_dto(d, request_id.as_str())).await
+    with_decisions(&app, move |d| queue_detail_dto(d, request_id.as_str())).await
 }
 
 /// `decide {request_id, decision, candidate_rev, edits?, redactions?, reason?, deny_details?}`

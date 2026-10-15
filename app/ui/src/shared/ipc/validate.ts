@@ -10,10 +10,12 @@ import type {
   DenyOfferKind,
   Preview,
   PreviewFetchResponse,
+  QueueDetail,
   QueueItem,
   RawPage,
   RecentItem,
   RedactionReport,
+  RequestDetail,
   StatusLine,
 } from './types';
 
@@ -71,7 +73,28 @@ export const isQueueItem = (v: unknown): v is QueueItem =>
     unusual: isBool,
   });
 
-export const isRawPage = (v: unknown): v is RawPage =>
+const numOrNull = (v: unknown): v is number | null => v === null || isNum(v);
+
+export const isRequestDetail = (v: unknown): v is RequestDetail =>
+  fields(v, {
+    params: (p) => p !== undefined,
+    params_sha256: isStr,
+    reason: strOrNull,
+    submitted_at: isStr,
+    client_kind: strOrNull,
+    agent_name: strOrNull,
+    agent_name_source: strOrNull,
+    cwd_basename: isStr,
+    connection_id: strOrNull,
+    peer_pid: numOrNull,
+    peer_exe: strOrNull,
+    peer_origin_exe: strOrNull,
+  });
+
+export const isQueueDetail = (v: unknown): v is QueueDetail =>
+  fields(v, { item: isQueueItem, request: isRequestDetail });
+
+export const isRawPage =(v: unknown): v is RawPage =>
   fields(v, {
     page: isNum,
     page_count: isNum,

@@ -34,6 +34,33 @@ export interface QueueItem {
   unusual: boolean;
 }
 
+/** The Request tab's facts (`queue_get`, spec 5.6). Agent- and peer-derived strings are display-escaped by Rust. */
+export interface RequestDetail {
+  /** The agent's params; the UI renders them as JSON text. */
+  params: unknown;
+  /** Lowercase hex SHA-256 of the canonical params. */
+  params_sha256: string;
+  /** The whole normalized reason, or `null` when the agent sent none. */
+  reason: string | null;
+  /** RFC 3339 UTC, ms. */
+  submitted_at: string;
+  client_kind: string | null;
+  agent_name: string | null;
+  /** Where the agent name came from (`hello`, `env`, ...). */
+  agent_name_source: string | null;
+  cwd_basename: string;
+  connection_id: string | null;
+  peer_pid: number | null;
+  peer_exe: string | null;
+  peer_origin_exe: string | null;
+}
+
+/** What `queue_get` returns: the queue row plus the Request tab's facts. */
+export interface QueueDetail {
+  item: QueueItem;
+  request: RequestDetail;
+}
+
 /** One Raw page (PD-68): the UI shows `display` and never decodes `bytes_b64`. */
 export interface RawPage {
   page: number;

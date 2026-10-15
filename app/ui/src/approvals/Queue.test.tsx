@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { on } from '../shared/ipc/events';
+import previewFixture from '../shared/ipc/fixtures/preview.json';
 import queueFixture from '../shared/ipc/fixtures/queue_item.json';
 import recentFixture from '../shared/ipc/fixtures/recent_item.json';
 import statusFixture from '../shared/ipc/fixtures/status_line.json';
@@ -13,7 +14,7 @@ import {
   queueList,
   recentList,
 } from '../shared/ipc/invoke';
-import type { QueueItem, RecentItem, StatusLine } from '../shared/ipc/types';
+import type { Preview, QueueItem, RecentItem, StatusLine } from '../shared/ipc/types';
 import { App } from './App';
 import { Queue } from './Queue';
 
@@ -229,6 +230,26 @@ describe('Approvals window', () => {
     await screen.findByRole('checkbox', { name: 'select jira.issue.get PROJ-9' });
     expect(queueList).toHaveBeenCalledTimes(2);
     expect(previewFetch).not.toHaveBeenCalled();
+  });
+
+  it('the_open_button_is_the_only_preview_fetch', async () => {
+    render(<App />);
+    expect(await screen.findByText('Select a request to see its detail')).toBeTruthy();
+    vi.mocked(previewFetch).mockResolvedValue({
+      preview: previewFixture[0] as unknown as Preview,
+      srcdoc: '<p>x</p>',
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Open jira.issue.get PROJ-1' }));
+    await screen.findByTitle('Preview');
+    expect(previewFetch).toHaveBeenCalledTimes(1);
+
+    // Re-reads of the queue keep the selection and fetch nothing.
+    await act(async () => {
+      for (const h of handlers.get('queue_changed') ?? []) h({ request_ids: [] });
+    });
+    await waitFor(() => expect(queueList).toHaveBeenCalledTimes(2));
+    expect(previewFetch).toHaveBeenCalledTimes(1);
+    expect(screen.getByTitle('Preview')).toBeTruthy();
   });
 
   it('acknowledging_re_reads_the_recent_list_and_banner', async () => {

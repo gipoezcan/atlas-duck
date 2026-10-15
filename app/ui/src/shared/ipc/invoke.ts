@@ -6,6 +6,7 @@ import type {
   DecisionOutcome,
   DenyCount,
   PreviewFetchResponse,
+  QueueDetail,
   QueueItem,
   RawPage,
   RecentItem,
@@ -18,6 +19,7 @@ import {
   isDecisionOutcome,
   isDenyCount,
   isPreviewFetchResponse,
+  isQueueDetail,
   isQueueItem,
   isRawPage,
   isRecentItem,
@@ -58,8 +60,8 @@ export function appStatus(): Promise<StatusLine[]> {
   return call('app_status', {}, arrayOf(isStatusLine));
 }
 
-export function queueGet(requestId: string): Promise<QueueItem> {
-  return call('queue_get', { request_id: requestId }, isQueueItem);
+export function queueGet(requestId: string): Promise<QueueDetail> {
+  return call('queue_get', { request_id: requestId }, isQueueDetail);
 }
 
 export function recentList(): Promise<RecentItem[]> {

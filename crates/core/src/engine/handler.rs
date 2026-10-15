@@ -146,10 +146,11 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         op_id: spec.id.to_owned(),
         instance: j.routed.alias.clone(),
     };
-    let (reason_excerpt, reason_unusual) = match j.reason.as_deref().map(normalize_reason) {
-        Some((r, u)) => ((!r.is_empty()).then(|| excerpt(&r)), u),
+    let (reason, reason_unusual) = match j.reason.as_deref().map(normalize_reason) {
+        Some((r, u)) => ((!r.is_empty()).then_some(r), u),
         None => (None, false),
     };
+    let reason_excerpt = reason.as_deref().map(excerpt);
     let mut new = NewEntry {
         head,
         spec,
@@ -158,6 +159,8 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         target_display: target_display(spec, &j.params),
         agent_name: j.session.normalized.agent_name.clone(),
         reason_excerpt,
+        reason,
+        script_params: None,
         unusual: j.session.normalized.unusual || reason_unusual,
         session: j.session.key(&j.conn),
         validated: None,

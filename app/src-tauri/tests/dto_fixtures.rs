@@ -8,7 +8,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::path::{Path, PathBuf};
 
 use atlas_duck_app_lib::commands::CommandError;
-use atlas_duck_app_lib::commands::approvals::{DenyCount, RawPageDto};
+use atlas_duck_app_lib::commands::approvals::{DenyCount, QueueDetail, RawPageDto};
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
@@ -18,7 +18,8 @@ use atlas_duck_core::redact::BlockReason;
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, BatchFailure, BatchOutcome, CandidateRev, ConnectionFailure, DecisionError,
-    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionReport, SessionKey,
+    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionReport,
+    RequestDetail, SessionKey,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
@@ -50,28 +51,86 @@ fn queue_items() -> Vec<QueueItem> {
         connection_id: None,
         cwd_basename: "atlas-duck".into(),
     };
-    vec![QueueItem {
-        request_id: REQ.into(),
-        op_id: "jira.issue.get".into(),
-        class: "read",
-        instance_alias: "work".into(),
-        target_display: "PROJ-1".into(),
-        agent_name: Some("claude-code".into()),
-        agent_unverified: true,
-        reason_excerpt: Some("look up the ticket".into()),
-        unusual: false,
-        age_s: 12,
-        stale: false,
-        caution_count: 1,
-        possible_duplicate_of: Some(REQ_2.into()),
-        similar_to: None,
-        session_id: session.id(),
-        session_label: session.label(),
-        session,
-        opened: false,
-        approvable: true,
-        candidate_rev: rev(),
-    }]
+    // An agent that sent no name and no reason: every `Option<String>` is null (T13 review).
+    let unnamed = SessionKey {
+        agent_name: None,
+        peer_origin_exe: None,
+        connection_id: None,
+        cwd_basename: "atlas-duck".into(),
+    };
+    vec![
+        QueueItem {
+            request_id: REQ.into(),
+            op_id: "jira.issue.get".into(),
+            class: "read",
+            instance_alias: "work".into(),
+            target_display: "PROJ-1".into(),
+            agent_name: Some("claude-code".into()),
+            agent_unverified: true,
+            reason_excerpt: Some("look up the ticket".into()),
+            unusual: false,
+            age_s: 12,
+            stale: false,
+            caution_count: 1,
+            possible_duplicate_of: Some(REQ_2.into()),
+            similar_to: None,
+            session_id: session.id(),
+            session_label: session.label(),
+            session,
+            opened: false,
+            approvable: true,
+            candidate_rev: rev(),
+        },
+        QueueItem {
+            request_id: "req_nullnullnullnullnull".into(),
+            op_id: "jira.issue.create".into(),
+            class: "write",
+            instance_alias: "work".into(),
+            target_display: "PROJ".into(),
+            agent_name: None,
+            agent_unverified: true,
+            reason_excerpt: None,
+            unusual: false,
+            age_s: 3,
+            stale: false,
+            caution_count: 0,
+            possible_duplicate_of: None,
+            similar_to: None,
+            session_id: unnamed.id(),
+            session_label: unnamed.label(),
+            session: unnamed,
+            opened: false,
+            approvable: true,
+            candidate_rev: CandidateRev {
+                counter: 1,
+                candidate_hash: [0xab; 32],
+            },
+        },
+    ]
+}
+
+fn queue_details() -> Vec<QueueDetail> {
+    queue_items()
+        .into_iter()
+        .take(1)
+        .map(|item| QueueDetail {
+            item,
+            request: RequestDetail {
+                params: json!({ "key": "PROJ-1", "fields": ["summary", "status"] }),
+                params_sha256: "cd".repeat(32),
+                reason: Some("look up the ticket".into()),
+                submitted_at: "2026-10-14T09:30:00.000Z".into(),
+                client_kind: Some("cli".into()),
+                agent_name: Some("claude-code".into()),
+                agent_name_source: Some("hello".into()),
+                cwd_basename: "atlas-duck".into(),
+                connection_id: Some("conn-0001".into()),
+                peer_pid: Some(4242),
+                peer_exe: Some("/usr/bin/atlas".into()),
+                peer_origin_exe: None,
+            },
+        })
+        .collect()
 }
 
 fn header(class: &str) -> PreviewHeader {
@@ -491,6 +550,7 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("decision_outcome", value(&decision_outcomes())?),
         ("deny_count", value(&deny_counts())?),
         ("preview", value(&previews())?),
+        ("queue_detail", value(&queue_details())?),
         ("queue_item", value(&queue_items())?),
         ("raw_page", value(&raw_pages())?),
         ("recent_item", value(&recent_items())?),

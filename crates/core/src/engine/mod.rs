@@ -163,6 +163,11 @@ pub struct RequestEntry {
     pub agent_name: Option<String>,
     /// Normalized `reason`, cut for the queue row.
     pub reason_excerpt: Option<String>,
+    /// The whole normalized `reason` (§3.3), for the Request tab; `None` when the agent sent none.
+    pub reason: Option<String>,
+    /// A script's params (its source), kept because a script has no [`Validated`]; `None` for
+    /// every other request, whose params are `validated.params`.
+    pub script_params: Option<Value>,
     pub unusual: bool,
     pub session: SessionKey,
     /// `None` only for a request whose validation failed.
@@ -204,6 +209,8 @@ pub struct NewEntry {
     pub target_display: String,
     pub agent_name: Option<String>,
     pub reason_excerpt: Option<String>,
+    pub reason: Option<String>,
+    pub script_params: Option<Value>,
     pub unusual: bool,
     pub session: SessionKey,
     pub validated: Option<Validated>,
@@ -231,6 +238,8 @@ impl RequestEntry {
             clock,
             agent_name: n.agent_name,
             reason_excerpt: n.reason_excerpt,
+            reason: n.reason,
+            script_params: n.script_params,
             unusual: n.unusual,
             session: n.session,
             validated: n.validated,
@@ -265,6 +274,14 @@ impl RequestEntry {
 
     pub fn kind(&self) -> Kind {
         self.kind
+    }
+
+    /// The agent's params as received: `validated.params`, or a script's own copy.
+    pub fn params(&self) -> Option<&Value> {
+        self.validated
+            .as_ref()
+            .map(|v| &v.params)
+            .or(self.script_params.as_ref())
     }
 
     /// `"read"`, `"write"` or `"script"`.
