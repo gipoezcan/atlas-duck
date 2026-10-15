@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
 
+import { own } from '../../shared/text/own';
 import type { RedactionContext, RedactionOp, RedactionPreset, UrlMode } from '../../shared/ipc/types';
 import { BLOCK_REASON_TEXT, REDACTION_TEXT } from '../../shared/strings';
 import { AgentText } from '../../shared/text/AgentText';
@@ -349,7 +350,7 @@ export function Panel(props: PanelProps) {
             <ul>
               {r.blocked.map((b, i) => (
                 <li key={i}>
-                  {BLOCK_REASON_TEXT[b.reason] ?? b.reason}
+                  {own(BLOCK_REASON_TEXT, b.reason) ?? b.reason}
                   {b.path === '' ? null : (
                     <>
                       {': '}

@@ -318,6 +318,19 @@ describe('write edit form (spec 5.4 step 4)', () => {
     expect(editButton().disabled).toBe(false);
   });
 
+  it('an_input_path_named_like_an_object_member_is_an_ordinary_path', () => {
+    // A path comes from a server's field name: `constructor` must not find `Object`'s member as a
+    // draft, and `__proto__` must keep its syntax error instead of losing it to the prototype setter.
+    const names = ['constructor', 'toString', '__proto__'];
+    const inputs = names.map((path) => input({ path, label: path, kind: { kind: 'json' }, value: null }));
+    const bad = { text: '{', bool: null, picks: [], asJson: false };
+    const built = buildEdits({ inputs }, { ...Object.fromEntries(names.map((n) => [n, bad])) });
+    expect(Object.keys(built.errors).sort()).toEqual(['__proto__', 'constructor', 'toString']);
+    expect(built.changed).toBe(true);
+    expect(() => buildEdits({ inputs }, {})).not.toThrow();
+    expect(buildEdits({ inputs }, {}).changed).toBe(false);
+  });
+
   it('a_boolean_from_absent_is_sent_only_when_it_ends_up_different', async () => {
     const flag = input({ path: 'notify', label: 'notify', kind: { kind: 'boolean' } });
     const on = input({ path: 'on', label: 'on', kind: { kind: 'boolean' }, value: true });

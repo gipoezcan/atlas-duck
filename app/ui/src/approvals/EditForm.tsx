@@ -1,6 +1,7 @@
 import { useId } from 'react';
 
 import { AgentText } from '../shared/text/AgentText';
+import { own } from '../shared/text/own';
 import { unusual } from '../shared/text/unusual';
 import type { EditForm as EditFormModel, EditInput } from '../shared/ipc/types';
 import { EDIT_TEXT } from '../shared/strings';
@@ -35,7 +36,7 @@ function initialDraft(input: EditInput): Draft {
   };
 }
 
-const draftOf = (input: EditInput, drafts: Drafts): Draft => drafts[input.path] ?? initialDraft(input);
+const draftOf = (input: EditInput, drafts: Drafts): Draft => own(drafts, input.path) ?? initialDraft(input);
 
 /** What `buildEdits` made of the drafts. */
 export interface BuiltEdits {
@@ -63,7 +64,8 @@ const DECIMAL = /^-?\d+(\.\d+)?([eE][+-]?\d+)?$/;
 export function buildEdits(form: EditFormModel, drafts: Drafts): BuiltEdits {
   const set: [string, unknown][] = [];
   const remove: string[] = [];
-  const errors: Record<string, string> = {};
+  // No prototype: a path such as `__proto__` is a key like any other.
+  const errors: Record<string, string> = Object.create(null) as Record<string, string>;
   for (const input of form.inputs) {
     if (input.read_only) continue;
     const d = draftOf(input, drafts);

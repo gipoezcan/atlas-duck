@@ -1,5 +1,6 @@
 import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 
+import { own } from '../shared/text/own';
 import { decideBatch, denyBatch, denySession } from '../shared/ipc/invoke';
 import type { BatchItem } from '../shared/ipc/invoke';
 import type { QueueItem } from '../shared/ipc/types';
@@ -366,7 +367,7 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
           <ul>
             {open.shown.map((i) => (
               <li key={i.request_id}>
-                {CLASS_LABELS[i.class] ?? i.class} {i.op_id} {i.instance_alias} {i.target_display}
+                {own(CLASS_LABELS, i.class) ?? i.class} {i.op_id} {i.instance_alias} {i.target_display}
               </li>
             ))}
           </ul>
@@ -451,7 +452,7 @@ function ResultView({ result }: { result: Result | null }) {
           <ul>
             {(result.failed ?? []).map((f) => (
               <li key={`${f.request_id}-${f.code}`}>
-                {result.names.get(f.request_id) ?? f.request_id}: {BATCH_FAILURE_TEXT[f.code] ?? BATCH_FAILURE_UNKNOWN}
+                {result.names.get(f.request_id) ?? f.request_id}: {own(BATCH_FAILURE_TEXT, f.code) ?? BATCH_FAILURE_UNKNOWN}
               </li>
             ))}
           </ul>

@@ -1,6 +1,7 @@
 import type { InstanceView } from '../shared/ipc/types';
 import { HTTPS_REQUIRED_HINT, SETTINGS_TEXT, UNUSUAL_CHARACTERS } from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
+import { own } from '../shared/text/own';
 import { unusual } from '../shared/text/unusual';
 
 /**
@@ -52,10 +53,7 @@ export function errorText(e: unknown): string {
   return own(t.errors, err.kind) ?? t.errors.internal ?? '';
 }
 
-/** An own entry of a text table: a wire name like `constructor` must not reach a prototype member. */
-export function own(table: Readonly<Record<string, string>>, key: string): string | undefined {
-  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
-}
+export { own };
 
 /** PD-84: the warning line of an instance whose token expiry is near; `null` when there is none. */
 export function expiryWarningText(inst: InstanceView): string | null {

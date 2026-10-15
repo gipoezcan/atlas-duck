@@ -8,6 +8,7 @@ import {
   type Ref,
 } from 'react';
 
+import { own } from '../shared/text/own';
 import { decide, previewFetch, type DenyDetails } from '../shared/ipc/invoke';
 import type { PreviewFetchResponse, QueueItem, UrlMode } from '../shared/ipc/types';
 import { CLASS_LABELS, DETAIL_TEXT, EDIT_TEXT, REDACTION_TEXT, STATUS_LABELS } from '../shared/strings';
@@ -472,7 +473,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       <p className="detail-summary">
         <span className="op-id">{item.op_id}</span> <span className="alias">{item.instance_alias}</span>{' '}
         <span className="target">{item.target_display}</span>{' '}
-        <span className="class">{CLASS_LABELS[item.class] ?? item.class}</span>
+        <span className="class">{own(CLASS_LABELS, item.class) ?? item.class}</span>
       </p>
       {releaseBlocked === null ? null : (
         <div className="caution-strip" role="alert">
@@ -484,7 +485,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           {DETAIL_TEXT.open}
         </button>
       ) : null}
-      {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${STATUS_LABELS[decided] ?? decided}`}</p>}
+      {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${own(STATUS_LABELS, decided) ?? decided}`}</p>}
       {edited ? <p role="status">{EDIT_TEXT.applied}</p> : null}
       {unsentEdits ? <p role="status">{EDIT_TEXT.unsent}</p> : null}
       {redactionApplied ? <p role="status">{REDACTION_TEXT.applied}</p> : null}

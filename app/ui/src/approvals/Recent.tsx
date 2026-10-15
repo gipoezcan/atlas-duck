@@ -1,4 +1,5 @@
 import type { RecentItem } from '../shared/ipc/types';
+import { own } from '../shared/text/own';
 import { CLASS_LABELS, RECENT_TEXT, STATUS_LABELS } from '../shared/strings';
 import { Badge } from '../shared/text/Badge';
 
@@ -63,9 +64,9 @@ function RecentRow({
       <span className="op-id">{item.op_id}</span>
       <span className="alias">{item.instance_alias}</span>
       <span className="target">{item.target_display}</span>
-      <span className="class">{CLASS_LABELS[item.class] ?? item.class}</span>
+      <span className="class">{own(CLASS_LABELS, item.class) ?? item.class}</span>
       <Badge
-        label={STATUS_LABELS[item.status] ?? item.status}
+        label={own(STATUS_LABELS, item.status) ?? item.status}
         tone={item.needs_attention ? 'caution' : 'neutral'}
       />
       {item.status === 'outcome_unknown' ? <Badge label={RECENT_TEXT.check_target} tone="caution" /> : null}

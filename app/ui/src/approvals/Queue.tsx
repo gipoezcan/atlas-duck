@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 
+import { own } from '../shared/text/own';
 import { Windowed } from '../shared/list/Windowed';
 import type { QueueItem } from '../shared/ipc/types';
 import { CLASS_LABELS, QUEUE_TEXT } from '../shared/strings';
@@ -211,7 +212,7 @@ function ItemRow({
         <span className="op-id">{item.op_id}</span>
         <span className="alias">{item.instance_alias}</span>
         <span className="target">{item.target_display}</span>
-        <span className="class">{CLASS_LABELS[item.class] ?? item.class}</span>
+        <span className="class">{own(CLASS_LABELS, item.class) ?? item.class}</span>
         {onOpen === undefined ? null : (
           <button
             type="button"

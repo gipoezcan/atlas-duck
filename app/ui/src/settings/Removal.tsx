@@ -16,7 +16,7 @@ import type {
 import { SETTINGS_TEXT as T } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { unusual } from '../shared/text/unusual';
-import { Cfg } from './text';
+import { Cfg, own } from './text';
 import { useAction } from './useAction';
 
 /**
@@ -120,7 +120,7 @@ export function Removal({ onChanged }: { onChanged: () => void }) {
           <p>{T.removal_cli[finished.cli]}</p>
           {finished.cli_reason === null ? null : (
             <p>
-              {T.removal_cli_reasons[finished.cli_reason] ?? T.removal_cli_reasons['other']}
+              {own(T.removal_cli_reasons, finished.cli_reason) ?? T.removal_cli_reasons['other']}
             </p>
           )}
           <p>{finished.cli === 'not_removed' ? T.removal_incomplete : T.removal_complete}</p>
