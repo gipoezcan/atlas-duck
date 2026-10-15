@@ -189,6 +189,8 @@ export interface Preview {
   };
   warnings: StatusLine[];
   deny_offers: DenyOffer[];
+  /** spec 5.3 "also appears in" of the revision's own masks (`name[3]` locations; may hold upstream text). */
+  also_appears_in: string[];
   /** Pre-filled deny reason (a conflict hold), or null. */
   deny_prefill: string | null;
   [field: string]: unknown;

@@ -85,7 +85,7 @@ const context = (ops: RedactionOp[] = [], url_fields = ['self']): RedactionConte
 
 /** The read's preview with a redaction context, on revision `rev`. */
 function readPreview(rev: CandidateRev, ctx: RedactionContext = context(), kind = 'jira_issue'): PreviewFetchResponse {
-  return previewOf({ ...READ, candidate_rev: rev }, kind, {}, ctx);
+  return previewOf({ ...READ, candidate_rev: rev }, kind, { also_appears_in: [] }, ctx);
 }
 
 /** Opens the read, waits out the inert period and shows the Structured tab with the candidate. */
@@ -448,7 +448,7 @@ describe('read redaction panel (spec 5.3, 6.3)', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
     await flush();
     expect(within(panel()).getByText(/structured view is not available/)).toBeTruthy();
-    expect(within(panel()).queryByRole('list')).toBeNull();
+    expect(within(panel()).queryByRole('list', { name: 'Candidate' })).toBeNull();
   });
 
   it('pages_that_do_not_add_up_offer_no_tree', async () => {
@@ -511,6 +511,28 @@ describe('redaction rounds on a redacted revision', () => {
     fireEvent.click(action('Drop field (this item)'));
     await checked();
     expect(lastReportOps()).toEqual([X, { drop_field: { field_loc: 'fields.summary', scope: 'per_item' } }]);
+  });
+
+  it('the_revision_also_appears_in_is_shown_before_its_release', async () => {
+    const mask: RedactionOp = { mask_text: { text: 'Falcon', every_occurrence: true, at: null } };
+    serveCandidate({ key: 'ABC-7' });
+    mockedPreview.mockResolvedValue(
+      previewOf(READ, 'jira_issue', { also_appears_in: ['fields.description', 'fields.‮x'] }, context([mask])),
+    );
+    await renderWindow();
+    fireEvent.click(screen.getByRole('button', { name: `Open ${READ.op_id} ${READ.target_display}` }));
+    await flush();
+    fireEvent.click(screen.getByRole('tab', { name: 'Structured' }));
+    await flush();
+    // The applied list sits under "Applied to this revision", next to the ops (not the report).
+    const list = within(panel()).getByText('also appears in:');
+    expect([...list.querySelectorAll('bdi')].map((b) => b.textContent)).toEqual([
+      '“fields.description”',
+      '“fields.‮x”',
+    ]);
+    expect(within(list).getByLabelText('unusual characters')).toBeTruthy();
+    // Nothing unsent: no report is asked for.
+    expect(mockedReport).not.toHaveBeenCalled();
   });
 
   it('remove_all_sends_no_ops_after_its_check', async () => {

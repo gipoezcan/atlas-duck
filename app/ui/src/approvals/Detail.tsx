@@ -424,6 +424,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           ref={panelRef}
           candidate={candidate}
           context={context}
+          appliedAlsoAppearsIn={shown.preview.also_appears_in}
           round={round}
           onRound={(next) => {
             setRemoveAll(false);

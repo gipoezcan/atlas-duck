@@ -84,6 +84,8 @@ function OpText({ op }: { op: RedactionOp }) {
 export interface PanelProps {
   candidate: CandidateState | null;
   context: RedactionContext;
+  /** Rust's "also appears in" of the revision's own masks (`Preview.also_appears_in`), shown before release. */
+  appliedAlsoAppearsIn: readonly string[];
   /** The unsent round: ops built on what this revision shows. */
   round: readonly RoundOp[];
   onRound: (round: RoundOp[]) => void;
@@ -376,6 +378,18 @@ export function Panel(props: PanelProps) {
               </li>
             ))}
           </ul>
+        )}
+        {props.appliedAlsoAppearsIn.length === 0 ? null : (
+          <div>
+            {REDACTION_TEXT.also_appears_in}
+            <ul className="also-appears-in">
+              {props.appliedAlsoAppearsIn.map((p, i) => (
+                <li key={i}>
+                  <Text value={p} />
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
         {context.ops.length === 0 ? null : removeAll ? (
           <p role="status">

@@ -198,6 +198,7 @@ export const isPreview = (v: unknown): v is Preview =>
       }),
     warnings: arrayOf(isStatusLine),
     deny_offers: arrayOf(isDenyOffer),
+    also_appears_in: arrayOf(isStr),
     deny_prefill: strOrNull,
   });
 
