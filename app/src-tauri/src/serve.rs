@@ -1213,7 +1213,8 @@ pub async fn quit(slot: &ServeSlot, reason: ShutdownReason, outer: Duration) -> 
 /// with [`SHUTDOWN_OUTER`] on the async runtime (the menu handler runs on the main thread and must
 /// not block), ends the path's ticket and runs what the OS hooks left for its end (they release
 /// their block, `os_hooks::ShutdownPath::end`), then `app.exit(0)` (after
-/// `os_hooks::EXIT_GRACE` when the OS ends the process itself). A later call joins the run: the
+/// `os_hooks::EXIT_GRACE` when the OS ends the process itself, and `std::process::exit(0)` one
+/// grace later if the process still runs then). A later call joins the run: the
 /// same ticket, nothing started again, the first call's reason kept. Without a [`ServeSlot`] (no
 /// store is served in this startup state) the path ends at once.
 pub fn shutdown_then_exit<R: Runtime>(
@@ -1228,6 +1229,17 @@ pub fn shutdown_then_exit<R: Runtime>(
             }
             if os_hooks::path_of(&handle).end() {
                 tokio::time::sleep(os_hooks::EXIT_GRACE).await;
+                handle.exit(0);
+                // The OS's reply and `exit(0)` both reach the main thread; when neither ended
+                // the process (macOS: a modal loop that serves neither route), it ends here. The
+                // path is over: the store is shut down.
+                tokio::time::sleep(os_hooks::EXIT_GRACE).await;
+                tracing::warn!(
+                    event = os_hooks::LOG_EVENT_OS_HOOK_FAILED,
+                    reason = "exit",
+                    error_class = "main_thread"
+                );
+                std::process::exit(0);
             }
             handle.exit(0);
         });

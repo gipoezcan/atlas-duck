@@ -20,7 +20,8 @@ use super::ShutdownPort;
 
 /// The inhibitor's `who`.
 pub const INHIBIT_WHO: &str = "atlas-duck";
-/// The inhibitor's `why` (the text Windows shows too, `windows::BLOCK_REASON`).
+/// The inhibitor's `why` (Windows' text while a write is on the wire, `windows::BLOCK_REASON`;
+/// the lock is held from start, so `systemd-inhibit --list` shows it idle too).
 pub const INHIBIT_WHY: &str = super::windows::BLOCK_REASON;
 
 /// Follows logind's `PrepareForShutdown` signals with the delay lock `lock` held: the first
@@ -44,15 +45,38 @@ pub fn follow_logind<L>(
     ended
 }
 
+/// Marks `fd` close-on-exec, so no child process inherits it. The inhibitor lock arrives through
+/// `recvmsg` without `MSG_CMSG_CLOEXEC` (zbus), and a child that kept it (`xdg-open` and the
+/// browser it starts, the CLI install's `sh`, the tray host) would hold the lock after the app
+/// quit: every later shutdown would wait `InhibitDelayMaxSec` for it. A child forked by another
+/// thread between `recvmsg` and this call can still inherit it; nothing closes that gap.
+#[cfg(unix)]
+pub fn close_on_exec(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let raw = fd.as_raw_fd();
+    // SAFETY: `raw` is a live descriptor, borrowed for the whole call; `F_GETFD` and `F_SETFD`
+    // read and set only its descriptor flags.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(raw, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 pub use self::logind::install;
 
 #[cfg(target_os = "linux")]
 mod logind {
+    use std::os::fd::AsFd;
     use std::sync::Arc;
 
     use super::super::{LOG_EVENT_OS_END_SESSION, LOG_EVENT_OS_HOOK_FAILED, PATH_WAIT};
-    use super::{INHIBIT_WHO, INHIBIT_WHY, ShutdownPort, follow_logind};
+    use super::{INHIBIT_WHO, INHIBIT_WHY, ShutdownPort, close_on_exec, follow_logind};
 
     const THREAD_NAME: &str = "atlas-duck-logind";
     const LOGIND: &str = "org.freedesktop.login1";
@@ -93,6 +117,10 @@ mod logind {
         let lock: zbus::zvariant::OwnedFd = manager
             .call("Inhibit", &("shutdown", INHIBIT_WHO, INHIBIT_WHY, "delay"))
             .map_err(|_| "inhibit")?;
+        // Without the flag the lock is still held for the path; only a child could keep it longer.
+        if close_on_exec(lock.as_fd()).is_err() {
+            failed("cloexec");
+        }
         let starts = signals.filter_map(|message| message.body().deserialize::<bool>().ok());
         let starts = starts.inspect(|start| {
             if *start {
@@ -191,5 +219,24 @@ mod tests {
         assert!(released.load(Ordering::SeqCst));
         assert_eq!(INHIBIT_WHY, "atlas-duck is finishing an approved write");
         assert_eq!(INHIBIT_WHO, "atlas-duck");
+    }
+
+    /// The lock's descriptor is close-on-exec after `close_on_exec`. `dup` makes a descriptor
+    /// without the flag, as `recvmsg` does for the lock.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_is_close_on_exec() {
+        use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        // SAFETY: `file` is open; `dup` returns a new descriptor (or -1, checked below).
+        let raw = unsafe { libc::dup(file.as_raw_fd()) };
+        assert!(raw >= 0, "dup");
+        // SAFETY: `raw` is the new descriptor `dup` returned; nothing else owns it.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `fd` is open; `F_GETFD` reads its descriptor flags.
+        let flags = || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert_eq!(flags() & libc::FD_CLOEXEC, 0, "dup leaves the flag off");
+        assert!(close_on_exec(fd.as_fd()).is_ok());
+        assert_eq!(flags() & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
     }
 }

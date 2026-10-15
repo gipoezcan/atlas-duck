@@ -2,15 +2,15 @@
 //! asked to stop runs the one shutdown path ([`serve::shutdown_then_exit`]) once, through a
 //! [`ShutdownPort`]; the hooks only say when, with which reason, and how long the OS waits:
 //!
-//! - Windows ([`windows`]): a hidden top-level window answers `WM_QUERYENDSESSION` (FALSE with
-//!   `ShutdownBlockReasonCreate` while a write is on the wire) and `WM_ENDSESSION`.
+//! - Windows ([`windows`]): a hidden top-level window answers `WM_QUERYENDSESSION` (TRUE only
+//!   after the path ended; FALSE with `ShutdownBlockReasonCreate` until then) and `WM_ENDSESSION`.
 //! - macOS ([`macos`]): `applicationShouldTerminate:` on the app delegate answers
 //!   `NSTerminateLater` and replies at the end of the path. Cmd+Q, the Dock's Quit and the
 //!   logout's quit event all arrive there (L83); a logout, restart or shutdown is `OsShutdown`,
 //!   the others `Quit`.
 //! - Linux ([`linux`]): logind `PrepareForShutdown(true)`, with a `delay` inhibitor held from the
 //!   start until the end of the path.
-//! - Unix: `SIGTERM` and `SIGINT` (`tokio::signal::unix`).
+//! - Unix: `SIGTERM`, `SIGINT` and `SIGHUP` (`tokio::signal::unix`, [`END_SIGNALS`]).
 //! - The run loop ([`on_exit_requested`], [`on_loop_exit`]): an exit request that does not follow
 //!   the last window closing runs the path with `Quit`; a loop that ends without the path (tao's
 //!   `WM_ENDSESSION`, AppKit's `terminate:` without the delegate method) runs it before it ends.
@@ -44,7 +44,8 @@ pub const PATH_WAIT: Duration = Duration::from_secs(
 );
 
 /// When the OS ends the process at the end of the path (macOS `replyToApplicationShouldTerminate:`),
-/// the path's own `exit(0)` follows after this, in case the OS did not.
+/// the path's own `exit(0)` follows after this, in case the OS did not, and `std::process::exit(0)`
+/// one more grace later, in case the main thread served neither (`serve::shutdown_then_exit`).
 pub const EXIT_GRACE: Duration = Duration::from_secs(2);
 
 /// Log event: an OS end-session source fired (`reason`: which one).
@@ -301,7 +302,38 @@ pub fn loop_exit_with(port: &dyn ShutdownPort, path: &ShutdownPath, wait: Durati
     true
 }
 
-/// `SIGTERM` or `SIGINT` (Unix): the path runs with `OsShutdown`; a second signal joins it.
+/// A Unix signal that runs the path ([`on_signal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndSignal {
+    /// `SIGTERM`: systemd's stop, `kill`.
+    Terminate,
+    /// `SIGINT`: Ctrl+C in a terminal.
+    Interrupt,
+    /// `SIGHUP`: a logout ends a logind session scope with `SIGTERM` and, right after it,
+    /// `SIGHUP`, whose default action would end the process before the path ran; a closed
+    /// terminal sends it too.
+    Hangup,
+}
+
+impl EndSignal {
+    /// The `reason` of its `os_end_session` log event.
+    pub fn name(self) -> &'static str {
+        match self {
+            EndSignal::Terminate => "sigterm",
+            EndSignal::Interrupt => "sigint",
+            EndSignal::Hangup => "sighup",
+        }
+    }
+}
+
+/// The signals the Unix hooks handle ([`EndSignal`]).
+pub const END_SIGNALS: [EndSignal; 3] = [
+    EndSignal::Terminate,
+    EndSignal::Interrupt,
+    EndSignal::Hangup,
+];
+
+/// One of [`END_SIGNALS`] (Unix): the path runs with `OsShutdown`; a second signal joins it.
 pub fn on_signal(port: &dyn ShutdownPort) -> ShutdownTicket {
     port.begin(ShutdownReason::OsShutdown)
 }
@@ -367,14 +399,21 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// macOS: the delegate method, whose reply runs at the end of the path on the main thread.
+/// macOS: the delegate method, whose reply runs at the end of the path on the main thread. It is
+/// sent through two routes, and the first to arrive replies ([`macos::ReplyOnce`]): libdispatch's
+/// main queue, which does not depend on tao draining its proxy in `NSTerminateLater`'s modal loop
+/// and runs outside tao's callback, and tauri's `run_on_main_thread` (tao's proxy).
 #[cfg(target_os = "macos")]
 fn install_macos<R: Runtime>(app: &AppHandle<R>, port: Arc<dyn ShutdownPort>) {
     let handle = app.clone();
     let defer_reply = move || -> bool {
         let main = handle.clone();
         let path = path_of(&handle);
-        let deferred = path.before_exit(Box::new(move || {
+        // Before the action is kept: the path's task reads it in `end()` right after it takes the
+        // actions. After an end that already happened the flag is read by no one.
+        path.set_os_ends_process();
+        path.before_exit(Box::new(move || {
+            macos::reply_terminate_on_main_queue();
             if main.run_on_main_thread(macos::reply_terminate).is_err() {
                 tracing::warn!(
                     event = LOG_EVENT_OS_HOOK_FAILED,
@@ -382,11 +421,7 @@ fn install_macos<R: Runtime>(app: &AppHandle<R>, port: Arc<dyn ShutdownPort>) {
                     error_class = "main_thread"
                 );
             }
-        }));
-        if deferred {
-            path.set_os_ends_process();
-        }
-        deferred
+        }))
     };
     if let Err(step) = macos::install(port, Box::new(defer_reply)) {
         tracing::warn!(
@@ -397,15 +432,18 @@ fn install_macos<R: Runtime>(app: &AppHandle<R>, port: Arc<dyn ShutdownPort>) {
     }
 }
 
-/// Unix: `SIGTERM` and `SIGINT` run the path ([`on_signal`]). Once a handler is registered the
-/// signal no longer ends the process by itself.
+/// Unix: [`END_SIGNALS`] run the path ([`on_signal`]). Once a handler is registered the signal no
+/// longer ends the process by itself.
 #[cfg(unix)]
 fn spawn_signal_hooks(port: Arc<dyn ShutdownPort>) {
     use tokio::signal::unix::{SignalKind, signal};
-    for (kind, name) in [
-        (SignalKind::terminate(), "sigterm"),
-        (SignalKind::interrupt(), "sigint"),
-    ] {
+    for end in END_SIGNALS {
+        let kind = match end {
+            EndSignal::Terminate => SignalKind::terminate(),
+            EndSignal::Interrupt => SignalKind::interrupt(),
+            EndSignal::Hangup => SignalKind::hangup(),
+        };
+        let name = end.name();
         let port = port.clone();
         tauri::async_runtime::spawn(async move {
             let Ok(mut signals) = signal(kind) else {
@@ -566,6 +604,25 @@ mod tests {
             let _ = t.join();
         }
         assert_eq!(port.starts(), 1);
+    }
+
+    /// M7: `SIGHUP` (a Linux logout, right after `SIGTERM`) runs the path like `SIGTERM` and
+    /// `SIGINT` do, with `OsShutdown`, instead of its default action ending the process.
+    #[test]
+    fn a_hangup_runs_the_shutdown_path() {
+        assert_eq!(
+            END_SIGNALS.map(EndSignal::name),
+            ["sigterm", "sigint", "sighup"]
+        );
+        for end in END_SIGNALS {
+            let port = FakePort::new();
+            let ticket = on_signal(&*port);
+            assert_eq!(port.begins(), [ShutdownReason::OsShutdown], "{end:?}");
+            assert_eq!(
+                (ticket.reason(), port.starts()),
+                (ShutdownReason::OsShutdown, 1)
+            );
+        }
     }
 
     #[test]

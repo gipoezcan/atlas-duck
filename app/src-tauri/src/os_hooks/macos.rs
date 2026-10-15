@@ -4,8 +4,9 @@
 //! went straight to `applicationWillTerminate:` and ended the process without the shutdown path.
 //! The method is added to the delegate's class at runtime (raw Objective-C runtime calls: the app
 //! crate links no Objective-C crate). It answers `NSTerminateLater` and begins the path; the reply
-//! (`replyToApplicationShouldTerminate:YES`) runs on the main thread at the end of the path, and
-//! AppKit then ends the process. The decisions ([`should_terminate`], [`quit_reason`]) are plain
+//! (`replyToApplicationShouldTerminate:YES`) runs on the main thread at the end of the path, sent
+//! through two routes (libdispatch's main queue and tauri's main-thread proxy) and delivered once
+//! ([`ReplyOnce`]), and AppKit then ends the process. The decisions ([`should_terminate`], [`quit_reason`]) are plain
 //! Rust that every OS compiles and tests; only the runtime glue is macOS code.
 //!
 //! The reason: a quit Apple event that carries a logout, restart or shutdown reason
@@ -15,6 +16,8 @@
 //! PD-83: AppKit sets no bound on `NSTerminateLater`; at logout the login window gives up on an
 //! app that does not quit and cancels the logout, and a forced restart ends the process, whose
 //! write on the wire is then reconciled `outcome_unknown {crash}` at the next start.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use atlas_duck_core::ShutdownReason;
 
@@ -78,8 +81,30 @@ pub fn should_terminate(
     NS_TERMINATE_LATER
 }
 
+/// The reply to `NSTerminateLater` goes out once. It is sent through two routes (libdispatch's
+/// main queue and tauri's main-thread proxy, `os_hooks::install_macos`), and every terminate
+/// that joined the run left its own reply for the end of the path; the first delivery replies,
+/// every later one does nothing.
+#[derive(Debug, Default)]
+pub struct ReplyOnce(AtomicBool);
+
+impl ReplyOnce {
+    pub const fn new() -> ReplyOnce {
+        ReplyOnce(AtomicBool::new(false))
+    }
+
+    /// Runs `send` if no reply went out yet. True when it ran.
+    pub fn deliver(&self, send: impl FnOnce()) -> bool {
+        if self.0.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        send();
+        true
+    }
+}
+
 #[cfg(target_os = "macos")]
-pub use self::runtime::{install, reply_terminate};
+pub use self::runtime::{install, reply_terminate, reply_terminate_on_main_queue};
 
 #[cfg(target_os = "macos")]
 mod runtime {
@@ -88,7 +113,9 @@ mod runtime {
     use std::sync::{Arc, OnceLock};
 
     use super::super::{LOG_EVENT_OS_END_SESSION, ShutdownPort};
-    use super::{AppleEvent, K_AE_QUIT_REASON, NS_TERMINATE_NOW, quit_reason, should_terminate};
+    use super::{
+        AppleEvent, K_AE_QUIT_REASON, NS_TERMINATE_NOW, ReplyOnce, quit_reason, should_terminate,
+    };
 
     type Id = *mut c_void;
     type Sel = *mut c_void;
@@ -107,6 +134,17 @@ mod runtime {
     #[cfg(not(target_arch = "aarch64"))]
     const YES: ObjcBool = 1;
 
+    /// A `BOOL` read as true: any value but NO (on x86_64 a `signed char` that is only
+    /// conventionally 1).
+    #[cfg(target_arch = "aarch64")]
+    fn is_yes(flag: ObjcBool) -> bool {
+        flag
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    fn is_yes(flag: ObjcBool) -> bool {
+        flag != 0
+    }
+
     #[link(name = "objc", kind = "dylib")]
     unsafe extern "C" {
         fn objc_getClass(name: *const c_char) -> Class;
@@ -116,6 +154,26 @@ mod runtime {
         /// Called through a pointer cast to each message's own signature (never variadic).
         fn objc_msgSend();
     }
+
+    /// libdispatch's queue object (opaque).
+    #[repr(C)]
+    struct DispatchQueue {
+        _opaque: [u8; 0],
+    }
+
+    #[link(name = "System", kind = "dylib")]
+    unsafe extern "C" {
+        /// The main queue: `dispatch_get_main_queue()` is a C macro for its address.
+        static _dispatch_main_q: DispatchQueue;
+        fn dispatch_async_f(
+            queue: *const DispatchQueue,
+            context: *mut c_void,
+            work: extern "C" fn(*mut c_void),
+        );
+    }
+
+    /// The reply went out (either route).
+    static REPLIED: ReplyOnce = ReplyOnce::new();
 
     /// The `defer_reply` of [`super::should_terminate`] (`os_hooks::install_macos`).
     pub type DeferReply = Box<dyn Fn() -> bool + Send + Sync>;
@@ -210,7 +268,7 @@ mod runtime {
             >(objc_msgSend);
             f(recv, sel)
         };
-        flag == YES
+        is_yes(flag)
     }
 
     /// `NSApp` (`[NSApplication sharedApplication]`); null when AppKit is not loaded.
@@ -264,8 +322,11 @@ mod runtime {
 
     /// The added `applicationShouldTerminate:` (AppKit calls it on the main thread).
     extern "C" fn application_should_terminate(_this: Id, _cmd: Sel, _sender: Id) -> usize {
-        // A panic must not unwind into AppKit: it answers "now", and the run loop's fallback
-        // (`os_hooks::on_loop_exit`) runs the path before the process ends.
+        // A panic must not unwind into AppKit. In builds that unwind (dev and test) it is caught
+        // here and answers "now", and the run loop's fallback (`os_hooks::on_loop_exit`) runs
+        // the path before the process ends. Release builds use `panic = "abort"` (workspace
+        // Cargo.toml): there a panic ends the process at once, before this catch, with no path,
+        // no `APP_STOP` and no cancellations; the next start reconciles (§11.3).
         catch_unwind(AssertUnwindSafe(|| {
             let Some(hook) = HOOK.get() else {
                 return NS_TERMINATE_NOW;
@@ -304,6 +365,10 @@ mod runtime {
         if cls.is_null() {
             return Err("no_delegate_class");
         }
+        // tao 0.37's delegate class (`TaoAppDelegateParent`, tao `platform_impl/macos/
+        // app_delegate.rs`, its method list) has no `applicationShouldTerminate:`. A tao update
+        // that adds one makes this `class_addMethod` refuse (NO): logged, the fallback stays, so
+        // review this hook on every tao update.
         // SAFETY: `application_should_terminate` has the C signature of the method ("Q@:@":
         // NSUInteger return, self, _cmd, sender); `class_addMethod` only takes it as an untyped
         // IMP. It refuses (NO) when the class already has the method; nothing is replaced.
@@ -318,7 +383,7 @@ mod runtime {
                 c"Q@:@".as_ptr(),
             )
         };
-        if added != YES {
+        if !is_yes(added) {
             return Err("add_method");
         }
         // NSApp may have looked at what the delegate answers when it was set: set it again so the
@@ -332,7 +397,8 @@ mod runtime {
     }
 
     /// `[NSApp replyToApplicationShouldTerminate:YES]`: AppKit ends the process. Main thread only
-    /// (anywhere else it does nothing).
+    /// (anywhere else it does nothing), and once ([`ReplyOnce`]): the delivery that comes second
+    /// does nothing.
     pub fn reply_terminate() {
         if !on_main_thread() {
             return;
@@ -341,8 +407,24 @@ mod runtime {
         if app.is_null() {
             return;
         }
-        // SAFETY: `app` is NSApp (checked), on the main thread; the method takes one `BOOL`.
-        unsafe { send_with_bool(app, sel(c"replyToApplicationShouldTerminate:"), YES) };
+        REPLIED.deliver(|| {
+            // SAFETY: `app` is NSApp (checked), on the main thread; the method takes one `BOOL`.
+            unsafe { send_with_bool(app, sel(c"replyToApplicationShouldTerminate:"), YES) };
+        });
+    }
+
+    /// [`reply_terminate`] through libdispatch's main queue: a route that does not wait for
+    /// tao to drain its proxy, and runs outside tao's callback. The main queue is served by the
+    /// main run loop in its common modes, which include the modal loop `NSTerminateLater` runs.
+    pub fn reply_terminate_on_main_queue() {
+        extern "C" fn work(_context: *mut c_void) {
+            // A panic must not unwind into libdispatch (dev and test builds; release aborts).
+            let _ = catch_unwind(reply_terminate);
+        }
+        // SAFETY: `_dispatch_main_q` is libdispatch's main queue object, which lives for the
+        // process (only its address is taken); `work` ignores its context, so a null context
+        // is fine; `dispatch_async_f` copies nothing and returns at once.
+        unsafe { dispatch_async_f(&raw const _dispatch_main_q, std::ptr::null_mut(), work) };
     }
 }
 
@@ -448,5 +530,44 @@ mod tests {
         port.finish();
         assert!(replied.load(Ordering::SeqCst));
         assert!(port.path.ended());
+    }
+
+    /// I2: each terminate leaves the reply on two routes for the end of the path (as
+    /// `os_hooks::install_macos` does), and a second terminate joins the run with its own; AppKit
+    /// gets one reply, from the delivery that comes first.
+    #[test]
+    fn the_reply_goes_out_once() {
+        use std::sync::{Arc, Mutex};
+        let port = FakePort::new();
+        let once = Arc::new(ReplyOnce::new());
+        let sent: Arc<Mutex<Vec<(u32, &'static str)>>> = Arc::default();
+        let terminates = std::cell::Cell::new(0u32);
+        let defer = || {
+            terminates.set(terminates.get() + 1);
+            let mut deferred = true;
+            for route in ["main_queue", "proxy"] {
+                let (once, sent, n) = (once.clone(), sent.clone(), terminates.get());
+                deferred &= port.path.before_exit(Box::new(move || {
+                    once.deliver(|| {
+                        if let Ok(mut s) = sent.lock() {
+                            s.push((n, route));
+                        }
+                    });
+                }));
+            }
+            deferred
+        };
+        for reason in [ShutdownReason::OsShutdown, ShutdownReason::Quit] {
+            assert_eq!(should_terminate(&*port, reason, &defer), NS_TERMINATE_LATER);
+        }
+        assert!(sent.lock().map(|s| s.is_empty()).unwrap_or(false));
+        port.finish();
+        assert_eq!(
+            sent.lock().map(|s| s.clone()).ok(),
+            Some(vec![(1, "main_queue")]),
+            "one reply, from the first delivery"
+        );
+        assert!(!once.deliver(|| {}), "a late delivery does nothing");
+        assert_eq!(port.starts(), 1);
     }
 }
