@@ -1100,7 +1100,9 @@ fn shutdown_after_reads_leaves_no_wal_sidecars() {
 /// the same order (reader first, writer last).
 #[test]
 fn drop_after_reads_without_shutdown_leaves_no_wal_sidecars() {
-    let (store, f) = new_store(fake_clock(START), MemKeyring::new());
+    let (store, mut f) = new_store(fake_clock(START), MemKeyring::new());
+    // The store's own handle must be the last one: the fixture lets go of its handle.
+    f.release_stores();
     for i in 0..5u64 {
         store
             .append(ev(EventType::CONFIG_CHANGED, None, json!({ "i": i })))

@@ -10,6 +10,16 @@ interface InstanceFormProps {
   onAdded: () => void;
   /** config.toml is read-only: the form is off. */
   readOnly: boolean;
+  /**
+   * The heading level: 2 in Settings, 3 where the form sits inside a panel that has its own h2 (the
+   * setup wizard).
+   */
+  headingLevel?: 2 | 3;
+  /**
+   * What is said after an add that leaves the instance without a token. Settings: "Add its token
+   * next" (it has the control); the setup window has none and names Settings instead.
+   */
+  addedNeedsToken?: string;
 }
 
 /**
@@ -17,7 +27,13 @@ interface InstanceFormProps {
  * refuses `http://` (with the fixed hint) and draws the confirmation. A custom CA is never read
  * here: the checkbox only asks Rust to open its own file dialog (spec 10.3).
  */
-export function InstanceForm({ onAdded, readOnly }: InstanceFormProps) {
+export function InstanceForm({
+  onAdded,
+  readOnly,
+  headingLevel = 2,
+  addedNeedsToken = T.add_done_token,
+}: InstanceFormProps) {
+  const Heading = headingLevel === 3 ? 'h3' : 'h2';
   const [alias, setAlias] = useState('');
   const [product, setProduct] = useState<'jira' | 'confluence'>('jira');
   const [baseUrl, setBaseUrl] = useState('');
@@ -43,7 +59,7 @@ export function InstanceForm({ onAdded, readOnly }: InstanceFormProps) {
       .then((v) => {
         if (v === undefined) return;
         // dd confirmed the origin in its own dialog: an instance without a token is next.
-        setAdded(v.state === 'needs_token' ? T.add_done_token : T.add_done);
+        setAdded(v.state === 'needs_token' ? addedNeedsToken : T.add_done);
         setAlias('');
         setBaseUrl('');
         setProxy('');
@@ -55,7 +71,7 @@ export function InstanceForm({ onAdded, readOnly }: InstanceFormProps) {
 
   return (
     <section aria-label={T.add_heading}>
-      <h2>{T.add_heading}</h2>
+      <Heading>{T.add_heading}</Heading>
       <Guard disabled={readOnly}>
       <label>
         {T.add_alias}

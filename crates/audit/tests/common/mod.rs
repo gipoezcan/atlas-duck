@@ -39,6 +39,11 @@ pub fn fake_clock(ts: &str) -> Arc<FakeClock> {
 }
 
 /// A fresh temp dir that passed the §7.7 local check, with `instance.lock` held.
+///
+/// Drop order matters on Windows: `instance.lock` is open with share mode 0, so a `TempDir` that
+/// goes first fails to delete its folder (silently) and leaves it in `%TEMP%`. Destructure the
+/// tuple into separate bindings (`let (dir, data, lock) = ...`): bindings drop in reverse order, so
+/// the lock goes before the dir. A tuple kept whole drops `dir` first: do not.
 pub fn tmp_data_dir() -> (TempDir, LocalDataDir, InstanceLock) {
     let dir = tempfile::tempdir().expect("tempdir");
     let data = match check_data_dir(dir.path()).expect("check_data_dir") {
@@ -49,17 +54,36 @@ pub fn tmp_data_dir() -> (TempDir, LocalDataDir, InstanceLock) {
     (dir, data, lock)
 }
 
+/// Fields drop in declaration order: `lock` (open with share mode 0 on Windows) must go before
+/// `dir`, or the folder cannot be deleted and stays in `%TEMP%`. `dir` stays last. The store a
+/// helper returns next to its fixture (`let (store, f) = new_store(..)`) is dropped AFTER `f`
+/// (locals drop in reverse order), with its SQLite files still open: `Drop` shuts it down first.
 pub struct Fixture {
-    pub dir: TempDir,
-    pub data: LocalDataDir,
+    stores: Vec<Store>,
     pub lock: InstanceLock,
+    pub data: LocalDataDir,
     pub ring: Arc<MemKeyring>,
     pub clock: Arc<FakeClock>,
     pub install_id: String,
     pub chain_id: String,
+    pub dir: TempDir,
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for store in &self.stores {
+            store.shutdown();
+        }
+    }
 }
 
 impl Fixture {
+    /// Stops the fixture from holding a handle of the store a helper made: for a test that needs
+    /// its own handle to be the last one (`Drop` of the store, not `shutdown()`).
+    pub fn release_stores(&mut self) {
+        self.stores.clear();
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.dir.path().join(DB_FILE)
     }
@@ -88,6 +112,7 @@ pub fn fixture(clock: Arc<FakeClock>, ring: Arc<MemKeyring>) -> Fixture {
     let (dir, data, lock) = tmp_data_dir();
     let (install_id, chain_id) = new_ids().expect("ids");
     Fixture {
+        stores: Vec::new(),
         dir,
         data,
         lock,
@@ -103,7 +128,7 @@ pub fn new_store_with(
     ring: Arc<MemKeyring>,
     tweak: impl FnOnce(&mut OpenConfig),
 ) -> (Store, Fixture) {
-    let f = fixture(clock, ring);
+    let mut f = fixture(clock, ring);
     let mut cfg = f.config();
     tweak(&mut cfg);
     let store = create_new_store(
@@ -113,6 +138,7 @@ pub fn new_store_with(
         input(&f.install_id, &f.chain_id, PASSPHRASE, PASSPHRASE),
     )
     .expect("create_new_store");
+    f.stores.push(store.clone());
     (store, f)
 }
 

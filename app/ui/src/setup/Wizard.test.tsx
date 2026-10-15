@@ -270,7 +270,12 @@ describe('Wizard', () => {
     });
     await flush();
     expect(wizardFinish).toHaveBeenCalledTimes(1);
-    // A second click that lands after the answer, on the next step's button, is still a double click.
+    // The page names the step it rendered: Rust refuses any other (`wrong_step`).
+    expect(wizardFinish).toHaveBeenCalledWith('cli');
+    // A second click that lands after the answer, on the next step's button (a different step
+    // that Rust would accept), is still a double click: the button is visibly off for the cooldown.
+    const next = screen.getByRole('button', { name: T.onboarding_finish }) as HTMLButtonElement;
+    expect(next.disabled).toBe(true);
     await click(T.onboarding_finish);
     expect(wizardFinish).toHaveBeenCalledTimes(1);
     expect(heading()).toBe(T.onboarding_heading);
@@ -280,13 +285,71 @@ describe('Wizard', () => {
     await show(at('cli'));
     vi.mocked(wizardFinish).mockResolvedValueOnce(at('onboarding')).mockResolvedValueOnce(at('done'));
     vi.mocked(wizardState).mockResolvedValueOnce(at('onboarding')).mockResolvedValue(at('done'));
-    const real = Date.now();
-    const now = vi.spyOn(Date, 'now').mockReturnValue(real);
     await click(T.cli_continue);
-    now.mockReturnValue(real + STEP_COOLDOWN_MS + 1);
+    const next = screen.getByRole('button', { name: T.onboarding_finish }) as HTMLButtonElement;
+    expect(next.disabled).toBe(true);
+    await waitFor(() => expect(next.disabled).toBe(false), { timeout: STEP_COOLDOWN_MS + 1500 });
     await click(T.onboarding_finish);
     expect(wizardFinish).toHaveBeenCalledTimes(2);
+    expect(wizardFinish).toHaveBeenLastCalledWith('onboarding');
     expect(heading()).toBe(T.done_heading);
+  });
+
+  it('wrong_step answer: the page takes the step Rust names, shows no error and moves nothing', async () => {
+    // A stale page: it still shows the CLI step while Rust is at the onboarding step.
+    await show(at('cli'));
+    const stale = at('onboarding', { error: { class: 'wrong_step', text: null } });
+    answer(wizardFinish, stale);
+    await click(T.cli_continue);
+    expect(wizardFinish).toHaveBeenCalledWith('cli');
+    expect(wizardFinish).toHaveBeenCalledTimes(1);
+    expect(heading()).toBe(T.onboarding_heading);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('a step change moves focus to the new heading and announces it', async () => {
+    await show(at('cli'));
+    const live = () => document.querySelector('[aria-live="polite"]')?.textContent;
+    expect(live()).toBe(T.step_announce(T.cli_heading));
+    // The first render does not take focus from anything.
+    expect(document.activeElement).toBe(document.body);
+    answer(wizardFinish, at('onboarding'));
+    await click(T.cli_continue);
+    expect(live()).toBe(T.step_announce(T.onboarding_heading));
+    expect(document.activeElement?.tagName).toBe('H2');
+    expect(document.activeElement?.textContent).toBe(T.onboarding_heading);
+  });
+
+  it('the loading and failed views offer Quit', async () => {
+    vi.mocked(wizardState).mockRejectedValue({ kind: 'not_ready' });
+    render(<Wizard />);
+    await flush();
+    expect(screen.getByRole('alert').textContent).toContain(T.load_failed);
+    vi.mocked(quit).mockResolvedValue(null);
+    await click(T.quit);
+    expect(quit).toHaveBeenCalledTimes(1);
+  });
+
+  it('the add form sits under the panel heading and says tokens are added in Settings', async () => {
+    await show(at('instances'));
+    // The form's heading is one level below the panel's (no h2 inside the panel's h2 section).
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual([
+      T.instances_heading,
+    ]);
+    expect(screen.getByRole('heading', { level: 3, name: 'Add an instance' })).toBeTruthy();
+    vi.mocked(instanceAdd).mockResolvedValue({ ...WORK, state: 'needs_token' });
+    fireEvent.change(screen.getByLabelText('Alias'), { target: { value: 'work' } });
+    fireEvent.change(screen.getByLabelText(/Base URL/), { target: { value: 'https://jira.example' } });
+    await click('Add instance');
+    const done = screen.getByText(T.instance_added);
+    expect(done.textContent).not.toMatch(/next/i);
+  });
+
+  it('a needs_token row says the token is added in Settings after setup', async () => {
+    const waiting: InstanceView = { ...WORK, state: 'needs_token' };
+    const ok: InstanceView = { ...WORK, alias: 'other', state: 'ok' };
+    await show(at('instances', { instances: [waiting, ok] }));
+    expect(screen.getAllByText(T.token_in_settings)).toHaveLength(1);
   });
 
   it('coalesces a burst of wizard_changed into one re-read', async () => {

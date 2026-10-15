@@ -30,8 +30,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use atlas_duck_audit::lock::{InstanceLock, LockError};
-use atlas_duck_audit::{ArchivedDb, DB_FILE, latest_archived, read_store_install_id};
+use atlas_duck_audit::lock::{INSTANCE_LOCK_FILE, InstanceLock, LockError};
+use atlas_duck_audit::{
+    ArchivedDb, DB_FILE, KeyringLocality, latest_archived, read_store_install_id,
+};
 use atlas_duck_core::{GateState, InstanceView};
 use atlas_duck_ipc::paths::{
     self, DataDirResolution, LocalDataDir, PINNED_SCHEMA_VERSION, PinnedError, PinnedPaths,
@@ -56,9 +58,21 @@ use crate::windows::{self, AppSnapshot, Label, Relaunch, Show, WindowError};
 /// Secret Service; nothing is written and the first-run gate keeps answering.
 pub const MSG_NEEDS_SECRET_SERVICE: &str = "atlas-duck needs a system keyring (Secret Service, e.g. GNOME Keyring or KWallet). Install or unlock one, then restart atlas-duck.";
 
+/// §8.6 (L39): the wizard stops with this text (and a Quit button) when the keyring's backing
+/// directory is not on a local filesystem. It is the text the error window shows for the same
+/// state at a later start (§8.7, `GateState::Locked(KeyringNotLocal)`), so tray, error window and
+/// wizard say the same; a test pins the equality.
+pub const MSG_KEYRING_NOT_LOCAL: &str = "atlas-duck is locked (keyring_not_local)";
+
+/// [`WizardError::class`] of a `wizard_finish` / `wizard_skip_instances` for another step.
+pub const CLASS_WRONG_STEP: &str = "wrong_step";
+
+/// `reason` of [`LOG_EVENT_STOPPED`] when the keyring is not local.
+const REASON_KEYRING_NOT_LOCAL: &str = "keyring_not_local";
+
 /// A data dir step 0 refused; `error_class` = [`DirRefusal::class`] (never the path).
 pub const LOG_EVENT_DIR_REFUSED: &str = "wizard_data_dir_refused";
-/// The wizard stopped before (1b); `reason` = the Secret Service answer.
+/// The wizard stopped before (1b); `reason` = the Secret Service answer, or `keyring_not_local`.
 pub const LOG_EVENT_STOPPED: &str = "wizard_stopped";
 /// The archive folder could not be read for the `GENESIS` link; `error_class` = `integrity|io`.
 pub const LOG_EVENT_ARCHIVED_UNREADABLE: &str = "wizard_archived_unreadable";
@@ -308,13 +322,36 @@ fn local_or_created(chosen: &Path, check: DirCheck) -> Result<LocalDataDir, DirR
     }
 }
 
+/// The folder a populated pick gets inside it.
+pub const NESTED_DATA_DIR: &str = "atlas-duck";
+
+/// `data` (the existing folder `chosen`) holds files of something else: it has entries and is not
+/// an atlas-duck data dir (no `audit.db`, no `instance.lock`).
+fn holds_other_files(data: &LocalDataDir, chosen: &Path) -> Result<bool, DirRefusal> {
+    let unusable = |_| DirRefusal::Unusable(chosen.to_path_buf());
+    let dir = data.path();
+    if dir.join(DB_FILE).try_exists().map_err(unusable)?
+        || dir
+            .join(INSTANCE_LOCK_FILE)
+            .try_exists()
+            .map_err(unusable)?
+    {
+        return Ok(false);
+    }
+    Ok(std::fs::read_dir(dir).map_err(unusable)?.next().is_some())
+}
+
 /// Step 0 on the file system (§2.5 (0), §7.7, M4 T14), with every path given (the wizard passes
 /// this host's): refuses while this host has a pinned file; the data dir is checked and created
 /// ([`local_or_created`]); `instance.lock` is taken (§3.1: before the store is touched); an existing
 /// `audit.db` is (1a) and its `install_id` is read without the KEK; then the pinned file is written
-/// (`write`): the data dir always exists before it. Any refusal pins nothing.
+/// (`write`): the data dir always exists before it. Any refusal pins nothing. `nest_populated` (a
+/// folder the user picked): a folder that holds other files and is not an atlas-duck data dir
+/// already gets [`NESTED_DATA_DIR`] inside it (the store, the lock, `webview*/` and `archived/`
+/// never land in `Documents` or a drive root).
 pub fn prepare_data_dir(
     chosen: &Path,
+    nest_populated: bool,
     pinned_file: &Path,
     config_dir: &Path,
     host: &str,
@@ -329,6 +366,14 @@ pub fn prepare_data_dir(
         Ok(Some(_)) | Err(_) => return Err(DirRefusal::AlreadyPinned),
     }
     let data = local_or_created(chosen, check)?;
+    let (chosen, data) = if nest_populated && holds_other_files(&data, chosen)? {
+        let nested = chosen.join(NESTED_DATA_DIR);
+        let data = local_or_created(&nested, check)?;
+        (nested, data)
+    } else {
+        (chosen.to_path_buf(), data)
+    };
+    let chosen = chosen.as_path();
     let lock = match InstanceLock::acquire(&data, host) {
         Ok(lock) => lock,
         Err(LockError::Held(Some(holder))) if holder.host != host => {
@@ -411,7 +456,13 @@ pub struct WizardEnv<R: Runtime> {
     pub pick_folder: FolderPicker<R>,
     pub write_pinned: PinnedWriter,
     pub check_dir: DirCheck,
+    /// Where the keyring entries live (§8.6): what `KeyStore::locality` answers, with no keyring
+    /// call (`OsKeyStore::locality` in production).
+    pub keyring_locality: KeyringLocalityCheck,
 }
+
+/// The §8.6 keyring locality check, asked before the passphrase.
+pub type KeyringLocalityCheck = Arc<dyn Fn() -> KeyringLocality + Send + Sync>;
 
 /// The wizard, managed by `setup` (`app.manage`).
 pub struct Wizard<R: Runtime> {
@@ -588,29 +639,32 @@ pub async fn use_dir<R: Runtime>(
     }
     let outcome = run_step0(app, choice).await;
     let w = wizard(app)?;
-    {
-        let mut p = w.progress();
-        p.in_flight = None;
-        match outcome {
-            Ok(Some(prepared)) => {
-                let Prepared {
-                    data,
-                    lock,
-                    pinned,
-                    existing_store,
-                } = prepared;
+    match outcome {
+        Ok(Some(prepared)) => {
+            let Prepared {
+                data,
+                lock,
+                pinned,
+                existing_store,
+            } = prepared;
+            {
+                let mut p = w.progress();
                 p.pinned = Some(pinned.clone());
                 p.existing_store = existing_store;
                 p.step0_done = true;
-                drop(p);
-                serve_data_dir(app, &w, data, lock, &pinned);
             }
-            // The folder dialog was cancelled.
-            Ok(None) => {}
-            Err(refusal) => {
-                tracing::warn!(event = LOG_EVENT_DIR_REFUSED, error_class = refusal.class());
-                p.error = Some(refusal.error());
-            }
+            // `in_flight` stays `DataDir` until the data dir is managed: a second step-0 call in
+            // between would pass the guards and end in a spurious `already_pinned`.
+            serve_data_dir(app, &w, data, lock, &pinned);
+            w.progress().in_flight = None;
+        }
+        // The folder dialog was cancelled.
+        Ok(None) => w.progress().in_flight = None,
+        Err(refusal) => {
+            tracing::warn!(event = LOG_EVENT_DIR_REFUSED, error_class = refusal.class());
+            let mut p = w.progress();
+            p.error = Some(refusal.error());
+            p.in_flight = None;
         }
     }
     answer(app).await
@@ -643,7 +697,17 @@ async fn run_step0<R: Runtime>(
                 None => return Ok(None),
             },
         };
-        prepare_data_dir(&chosen, &pinned_file, &config_dir, &host, check, &*write).map(Some)
+        let nest = choice == DirChoice::Pick;
+        prepare_data_dir(
+            &chosen,
+            nest,
+            &pinned_file,
+            &config_dir,
+            &host,
+            check,
+            &*write,
+        )
+        .map(Some)
     })
     .await;
     done.unwrap_or(Err(DirRefusal::PinnedWrite))
@@ -780,47 +844,69 @@ pub async fn begin<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, Comman
 
 /// The passphrase step with `in_flight` set to `Passphrase` by [`begin`].
 async fn request_passphrase<R: Runtime>(app: &AppHandle<R>) -> Result<(), CommandError> {
-    let check = wizard(app)?.env.secret_service.clone();
+    let (check, locality) = {
+        let w = wizard(app)?;
+        (w.env.secret_service.clone(), w.env.keyring_locality.clone())
+    };
     let handle = app.clone();
     let waiting = credential::current_purpose(app) == Some(Purpose::RecoveryPassphrase);
     let asked = blocking(move || {
         if waiting {
             // The window waits already: bring it back, the request stays.
             return credential::open(&handle, Purpose::RecoveryPassphrase, Show::Focus)
-                .map(|()| (None, None))
+                .map(|()| Asked::Waiting)
                 .map_err(window_error);
         }
         let found = check.check();
         if matches!(found, Some(SecretService::Missing | SecretService::Locked)) {
-            return Ok((found, None));
+            return Ok(Asked::Stopped {
+                found,
+                text: MSG_NEEDS_SECRET_SERVICE,
+                reason: found.map_or("", SecretService::as_str),
+            });
+        }
+        // §8.6 (L39): the keyring's directories are checked before the passphrase is asked for
+        // (no keyring call). `Unknown` goes on: the store's own check at `GENESIS` is the backstop
+        // and a retry can succeed.
+        if matches!(locality(), KeyringLocality::NotLocal { .. }) {
+            return Ok(Asked::Stopped {
+                found,
+                text: MSG_KEYRING_NOT_LOCAL,
+                reason: REASON_KEYRING_NOT_LOCAL,
+            });
         }
         credential::request_recovery_passphrase(&handle, Show::Focus)
-            .map(|rx| (found, Some(rx)))
+            .map(|rx| Asked::Window { found, rx })
             .map_err(window_error)
     })
     .await;
     let w = wizard(app)?;
     match asked {
-        Ok((found, rx)) => {
+        Ok(Asked::Waiting) => Ok(()),
+        Ok(Asked::Stopped {
+            found,
+            text,
+            reason,
+        }) => {
             let mut p = w.progress();
             if found.is_some() {
                 p.secret_service = found;
             }
-            if let Some(found @ (SecretService::Missing | SecretService::Locked)) = found {
-                tracing::warn!(event = LOG_EVENT_STOPPED, reason = found.as_str());
-                p.stopped = Some(MSG_NEEDS_SECRET_SERVICE);
-                p.in_flight = None;
-                return Ok(());
+            tracing::warn!(event = LOG_EVENT_STOPPED, reason);
+            p.stopped = Some(text);
+            p.in_flight = None;
+            Ok(())
+        }
+        Ok(Asked::Window { found, rx }) => {
+            let mut p = w.progress();
+            if found.is_some() {
+                p.secret_service = found;
             }
-            if let Some(rx) = rx {
-                p.passphrase_request = p.passphrase_request.wrapping_add(1);
-                let request = p.passphrase_request;
-                drop(p);
-                let handle = app.clone();
-                tauri::async_runtime::spawn(
-                    async move { await_passphrase(handle, rx, request).await },
-                );
-            }
+            p.passphrase_request = p.passphrase_request.wrapping_add(1);
+            let request = p.passphrase_request;
+            drop(p);
+            let handle = app.clone();
+            tauri::async_runtime::spawn(async move { await_passphrase(handle, rx, request).await });
             Ok(())
         }
         Err(e) => {
@@ -830,6 +916,23 @@ async fn request_passphrase<R: Runtime>(app: &AppHandle<R>) -> Result<(), Comman
             Err(e)
         }
     }
+}
+
+/// What asking for the passphrase came to.
+enum Asked {
+    /// The credential window waited already and was brought back.
+    Waiting,
+    /// The wizard stops (Quit only): `text` is shown, `reason` is logged.
+    Stopped {
+        found: Option<SecretService>,
+        text: &'static str,
+        reason: &'static str,
+    },
+    /// The credential window waits for the pair.
+    Window {
+        found: Option<SecretService>,
+        rx: oneshot::Receiver<FirstRunPassphrase>,
+    },
 }
 
 fn window_error(e: WindowError) -> CommandError {
@@ -955,34 +1058,73 @@ fn archived_on_disk(data: &LocalDataDir) -> Option<ArchivedDb> {
 
 // ---------- the rest ----------
 
-/// `wizard_skip_instances {}`: leaves the instance step (with or without instances added).
-pub async fn skip_instances<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
-    {
+/// The answer to a `wizard_finish` / `wizard_skip_instances` that names another step than the
+/// wizard is at (a double click, a stale page): nothing changed, the state says so in `error`
+/// (not kept: the next answer does not carry it) and the page shows the step it holds.
+async fn wrong_step<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
+    let mut s = state(app).await?;
+    s.error = Some(WizardError {
+        class: CLASS_WRONG_STEP,
+        text: None,
+    });
+    Ok(s)
+}
+
+/// `wizard_skip_instances {step}`: leaves the instance step (with or without instances added).
+/// `expected` is the step the page showed ([`WizardStep::as_str`]); any other step is
+/// `wrong_step`.
+pub async fn skip_instances<R: Runtime>(
+    app: &AppHandle<R>,
+    expected: &str,
+) -> Result<WizardState, CommandError> {
+    // The lock is not held across an await: the block answers whether the step matched.
+    let matched = {
         let w = wizard(app)?;
         let mut p = w.progress();
-        if current_step(app, &mut p, None) != WizardStep::Instances {
+        let step = current_step(app, &mut p, None);
+        if step.as_str() != expected {
+            false
+        } else if step != WizardStep::Instances {
             return Err(CommandError::NotReady);
+        } else {
+            p.instances_done = true;
+            true
         }
-        p.instances_done = true;
+    };
+    if !matched {
+        return wrong_step(app).await;
     }
     answer(app).await
 }
 
-/// `wizard_finish {}`: the step shown is done. The recovery note: the credential window closes;
+/// `wizard_finish {step}`: the step shown is done. The recovery note: the credential window closes;
 /// the CLI step: on to the onboarding snippet; the onboarding snippet: the wizard is done, the
-/// setup window goes and Approvals opens. Elsewhere `not_ready`.
-pub async fn finish<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, CommandError> {
+/// setup window goes and Approvals opens. `expected` is the step the page showed
+/// ([`WizardStep::as_str`]): any other step is `wrong_step` and nothing moves, so a repeated
+/// request never skips a step. Elsewhere `not_ready`.
+pub async fn finish<R: Runtime>(
+    app: &AppHandle<R>,
+    expected: &str,
+) -> Result<WizardState, CommandError> {
+    // The lock is not held across an await: the block answers the step, or `None` for a mismatch.
     let step = {
         let w = wizard(app)?;
         let mut p = w.progress();
         let step = current_step(app, &mut p, None);
-        match step {
-            WizardStep::RecoveryNote => {}
-            WizardStep::Cli => p.cli_done = true,
-            WizardStep::Onboarding => p.finished = true,
-            _ => return Err(CommandError::NotReady),
+        if step.as_str() != expected {
+            None
+        } else {
+            match step {
+                WizardStep::RecoveryNote => {}
+                WizardStep::Cli => p.cli_done = true,
+                WizardStep::Onboarding => p.finished = true,
+                _ => return Err(CommandError::NotReady),
+            }
+            Some(step)
         }
-        step
+    };
+    let Some(step) = step else {
+        return wrong_step(app).await;
     };
     let handle = app.clone();
     match step {
@@ -1147,6 +1289,14 @@ mod tests {
             text.contains(&format!("\"{MSG_NEEDS_SECRET_SERVICE}\"")),
             "§8.6 text drifted"
         );
+    }
+
+    /// The keyring stop says what the error window says for the same state (§8.7).
+    #[test]
+    fn the_keyring_stop_text_is_the_error_window_text() {
+        let gate = GateState::Locked(atlas_duck_audit::LockedReason::KeyringNotLocal);
+        let shown = gate.envelope().error.map(|e| e.message);
+        assert_eq!(shown.as_deref(), Some(MSG_KEYRING_NOT_LOCAL));
     }
 
     #[test]

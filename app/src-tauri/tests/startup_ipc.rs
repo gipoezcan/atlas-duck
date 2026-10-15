@@ -160,13 +160,15 @@ impl KeysFactory for MemKeys {
 
 // ---------- world ----------
 
+/// Fields drop in declaration order: the lock (share mode 0 on Windows) goes before `tmp`, which
+/// stays last, or the folder cannot be deleted.
 struct World {
-    tmp: tempfile::TempDir,
-    data: LocalDataDir,
     lock: Arc<InstanceLock>,
+    data: LocalDataDir,
     location: EndpointLocation,
     /// The Quit request every start in this world shares.
     quit: ShutdownSignal,
+    tmp: tempfile::TempDir,
 }
 
 impl World {

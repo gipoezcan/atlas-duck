@@ -841,6 +841,9 @@ fn unreadable_anchor_dir_defers_interrupted_prune_reconciliation() {
             .first_retained_seq,
         6
     );
+    // `path` was closed with its `TempDir` and made again by hand: nothing owns it any more.
+    drop(store);
+    std::fs::remove_dir_all(&path).expect("remove the restored anchor dir");
 }
 
 #[test]

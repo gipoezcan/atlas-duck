@@ -1827,17 +1827,42 @@ fn wizard_commands_granted_to_setup_only() -> TestResult {
     for cmd in wizard {
         assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
         for (label, w) in &others {
+            let r = invoke(w, cmd, json!({"step": "cli"}));
+            assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
             let r = invoke(w, cmd, json!({}));
             assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
         }
+        // T24 review I-1: the two commands that move on name the step the page showed.
+        let takes_step = matches!(cmd, "wizard_finish" | "wizard_skip_instances");
+        let valid = if takes_step {
+            json!({"step": "cli"})
+        } else {
+            json!({})
+        };
         assert_eq!(
-            invoke(&setup, cmd, json!({})),
+            invoke(&setup, cmd, valid),
             Err(json!({"kind": "not_ready"})),
             "{cmd}"
         );
-        for key in ["data_dir", "path", "dir", "secret", "step"] {
+        if takes_step {
             assert_eq!(
-                invoke(&setup, cmd, json!({ key: "C:\\evil" })),
+                invoke(&setup, cmd, json!({})),
+                Err(json!({"kind": "invalid_argument", "field": "payload"})),
+                "{cmd} without a step"
+            );
+        }
+        for key in ["data_dir", "path", "dir", "secret", "step"] {
+            // `step` is the one key `wizard_finish` and `wizard_skip_instances` take.
+            if takes_step && key == "step" {
+                continue;
+            }
+            let body = if takes_step {
+                json!({ "step": "cli", key: "C:\\evil" })
+            } else {
+                json!({ key: "C:\\evil" })
+            };
+            assert_eq!(
+                invoke(&setup, cmd, body),
                 Err(json!({"kind": "invalid_argument", "field": "payload"})),
                 "{cmd} {key}"
             );

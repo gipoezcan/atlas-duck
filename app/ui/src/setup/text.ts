@@ -34,6 +34,12 @@ export const SETUP_TEXT = {
   instances_intro:
     'Add the servers atlas-duck may talk to. Tokens are added afterwards in Settings. You can also do this later.',
   instances_none: 'No instances yet',
+  /** After `instance_add` in the setup window: there is no token control here (T24 review I-2). */
+  instance_added: 'The instance was added. Add its token in Settings after setup.',
+  /** On every `needs_token` row of the setup window. */
+  token_in_settings: 'Add its token in Settings after setup.',
+  /** The live region's text when the step changes (the heading is focused as well). */
+  step_announce: (heading: string) => `Step: ${heading}`,
   instances_continue: 'Continue',
   instances_skip: 'Skip for now',
   instances_list: 'Instances in config.toml',
@@ -68,6 +74,7 @@ export const SETUP_TEXT = {
     pinned_write: 'The choice of folder could not be saved.',
     not_first_run: 'The audit log was already created.',
     busy: 'Another step is still running: wait a moment.',
+    wrong_step: 'Setup was already past that step. The page shows where it is now.',
     shutting_down: 'atlas-duck is shutting down.',
     passphrase_too_short: 'The recovery passphrase is too short.',
     passphrase_mismatch: 'The two entries of the recovery passphrase differ.',

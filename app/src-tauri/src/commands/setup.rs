@@ -3,7 +3,8 @@
 //! `wizard_finish`. Granted to the `setup` window only; it also holds the four instance commands
 //! and `cli_install` (`commands::settings`) and `quit`.
 //!
-//! None takes a value: the data dir is the §7.7 default or what Rust's own folder dialog returns,
+//! None takes a value but the two that move on (`wizard_skip_instances`, `wizard_finish`), which take
+//! the step the page showed: the data dir is the §7.7 default or what Rust's own folder dialog returns,
 //! the recovery passphrase goes to the credential window (never here), and every answer is the
 //! wizard's whole state ([`WizardState`]), so the page renders what Rust decided and skips nothing
 //! itself. The rules live in `crate::wizard`.
@@ -35,15 +36,22 @@ pub struct WizardChooseDirArgs {}
 #[serde(deny_unknown_fields)]
 pub struct WizardBeginArgs {}
 
-/// `wizard_skip_instances {}`: leaves the instance step.
+/// `wizard_skip_instances {step}`: leaves the instance step. `step` is the step the page showed
+/// (`WizardState::step`); Rust answers `wrong_step` for any other, so a repeated click or a stale
+/// page moves nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WizardSkipInstancesArgs {}
+pub struct WizardSkipInstancesArgs {
+    pub step: String,
+}
 
-/// `wizard_finish {}`: the recovery note, the CLI step or the onboarding snippet is done.
+/// `wizard_finish {step}`: the recovery note, the CLI step or the onboarding snippet is done.
+/// `step` as for `wizard_skip_instances`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct WizardFinishArgs {}
+pub struct WizardFinishArgs {
+    pub step: String,
+}
 
 /// `wizard_state {}` (Δ1): the step, the data dir, the refused count, the Secret Service answer,
 /// the instances; `not_ready` without a wizard (any start that is not a first run).
@@ -98,8 +106,8 @@ pub async fn wizard_skip_instances<R: Runtime>(
     app: AppHandle<R>,
     args: Args<WizardSkipInstancesArgs>,
 ) -> Result<WizardState, CommandError> {
-    let Args(WizardSkipInstancesArgs {}) = args;
-    let response = wizard::skip_instances(&app).await;
+    let Args(WizardSkipInstancesArgs { step }) = args;
+    let response = wizard::skip_instances(&app, &step).await;
     finish(&app, response)
 }
 
@@ -109,8 +117,8 @@ pub async fn wizard_finish<R: Runtime>(
     app: AppHandle<R>,
     args: Args<WizardFinishArgs>,
 ) -> Result<WizardState, CommandError> {
-    let Args(WizardFinishArgs {}) = args;
-    let response = wizard::finish(&app).await;
+    let Args(WizardFinishArgs { step }) = args;
+    let response = wizard::finish(&app, &step).await;
     finish(&app, response)
 }
 
@@ -148,5 +156,31 @@ mod tests {
             parse::<WizardChooseDirArgs>(&json!({})),
             Ok(WizardChooseDirArgs {})
         );
+    }
+
+    /// `wizard_finish` and `wizard_skip_instances` take the step the page showed, and only that:
+    /// no step is `invalid_argument`, nor is another key next to it (a path, a passphrase).
+    #[test]
+    fn finish_and_skip_take_only_the_step() {
+        assert_eq!(
+            parse::<WizardFinishArgs>(&json!({"step": "cli"})),
+            Ok(WizardFinishArgs { step: "cli".into() })
+        );
+        assert_eq!(
+            parse::<WizardSkipInstancesArgs>(&json!({"step": "instances"})),
+            Ok(WizardSkipInstancesArgs {
+                step: "instances".into()
+            })
+        );
+        for body in [
+            json!({}),
+            json!({"step": 3}),
+            json!({"step": null}),
+            json!({"step": "cli", "path": "C:\\evil"}),
+            json!({"step": "cli", "secret": "canary-passphrase"}),
+        ] {
+            assert_eq!(parse::<WizardFinishArgs>(&body), refused(), "{body}");
+            assert_eq!(parse::<WizardSkipInstancesArgs>(&body), refused(), "{body}");
+        }
     }
 }

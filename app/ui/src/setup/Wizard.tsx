@@ -11,7 +11,7 @@ import {
   wizardState,
   wizardUseDefaultDir,
 } from '../shared/ipc/invoke';
-import type { CliInstallAnswer, WizardError, WizardState } from '../shared/ipc/types';
+import type { CliInstallAnswer, WizardError, WizardState, WizardStep } from '../shared/ipc/types';
 import { SETTINGS_TEXT, WINDOW_TITLES } from '../shared/strings';
 import { InstanceForm } from '../settings/InstanceForm';
 import { Cfg, own } from '../settings/text';
@@ -23,7 +23,12 @@ import { SETUP_TEXT as T } from './text';
 export const REREAD_DEBOUNCE_MS = 150;
 /** Steps 0 destroys the calling window; a failure shows only if the window is still there after this. */
 export const STEP0_ERROR_DELAY_MS = 400;
-/** A second click this soon after a step ended is a double click, not a decision (T23 m-3). */
+/**
+ * After a step ended, the next step's buttons stay off this long: a second click of a double click
+ * would otherwise land on the next panel's button (Rust refuses a request for another step than the
+ * page rendered, `wrong_step`, but this click names the step it hit). The buttons look disabled, so
+ * a click is never swallowed without a cue (T24 review I-1, M-3).
+ */
 export const STEP_COOLDOWN_MS = 700;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -50,8 +55,28 @@ function WizardWindow() {
   const [nonce, setNonce] = useState(0);
   const latest = useRef(0);
   const read = useRef<() => void>(() => undefined);
-  const cooldown = useRef(0);
+  const [settling, setSettling] = useState(false);
+  const settleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const panel = useRef<HTMLDivElement>(null);
+  const shown = useRef<WizardStep | null>(null);
   const action = useAction();
+  const stepName = state === null ? null : state.step;
+
+  // A step change moves focus to the new step's heading (the live region below says it too).
+  useEffect(() => {
+    if (stepName === null) return;
+    if (shown.current !== null && shown.current !== stepName) {
+      panel.current?.querySelector<HTMLElement>('h2')?.focus();
+    }
+    shown.current = stepName;
+  }, [stepName]);
+
+  useEffect(
+    () => () => {
+      if (settleTimer.current !== null) clearTimeout(settleTimer.current);
+    },
+    [],
+  );
 
   useEffect(() => {
     let live = true;
@@ -97,13 +122,17 @@ function WizardWindow() {
   const reread = useCallback(() => read.current(), []);
   const retry = useCallback(() => setNonce((n) => n + 1), []);
 
-  /** Runs one wizard command; its answer is the new state, and a re-read follows either way. */
-  const step = (cmd: () => Promise<WizardState>, opts: { destroysWindow?: boolean; settle?: boolean } = {}) => {
-    if (opts.settle === true && Date.now() < cooldown.current) return;
+  /**
+   * Runs one wizard command with the step this page rendered (the commands that move on send it;
+   * Rust refuses another one); its answer is the new state, and a re-read follows either way.
+   */
+  const step: Step = (cmd, opts = {}) => {
+    if (state === null) return;
+    const rendered = state.step;
     void action
       .run(async () => {
         try {
-          return await cmd();
+          return await cmd(rendered);
         } catch (e) {
           // Step 0 destroys this window: an error that arrives while it goes is not shown. A window
           // that is still here after the delay shows it.
@@ -113,7 +142,11 @@ function WizardWindow() {
       })
       .then((v) => {
         if (v !== undefined) {
-          if (opts.settle === true) cooldown.current = Date.now() + STEP_COOLDOWN_MS;
+          if (opts.settle === true) {
+            setSettling(true);
+            if (settleTimer.current !== null) clearTimeout(settleTimer.current);
+            settleTimer.current = setTimeout(() => setSettling(false), STEP_COOLDOWN_MS);
+          }
           setState(v);
         }
         reread();
@@ -134,6 +167,7 @@ function WizardWindow() {
         ) : (
           <p role="status">{T.loading}</p>
         )}
+        <Quit />
       </main>
     );
   }
@@ -153,7 +187,12 @@ function WizardWindow() {
             </button>
           </p>
         ) : null}
-        <Panel state={state} step={step} pending={action.pending} onChanged={reread} />
+        <p className="visually-hidden" aria-live="polite">
+          {T.step_announce(headingOf(state))}
+        </p>
+        <div ref={panel}>
+          <Panel state={state} step={step} pending={action.pending || settling} onChanged={reread} />
+        </div>
         {action.error === null ? null : <p role="alert">{action.error}</p>}
         <Quit />
       </main>
@@ -162,9 +201,35 @@ function WizardWindow() {
 }
 
 type Step = (
-  cmd: () => Promise<WizardState>,
+  cmd: (rendered: WizardStep) => Promise<WizardState>,
   opts?: { destroysWindow?: boolean; settle?: boolean },
 ) => void;
+
+/** The heading of the step's panel. */
+function headingOf(state: WizardState): string {
+  switch (state.step) {
+    case 'data_dir':
+      return T.data_dir_heading;
+    case 'existing_store':
+      return T.existing_heading;
+    case 'passphrase':
+      return T.passphrase_heading;
+    case 'genesis':
+      return T.genesis_heading;
+    case 'recovery_note':
+      return T.note_heading;
+    case 'instances':
+      return T.instances_heading;
+    case 'cli':
+      return T.cli_heading;
+    case 'onboarding':
+      return T.onboarding_heading;
+    case 'done':
+      return T.done_heading;
+    case 'stopped':
+      return T.stopped_heading;
+  }
+}
 
 /** One panel per `WizardStep`, chosen only by what Rust reported. */
 function Panel({
@@ -182,7 +247,7 @@ function Panel({
     case 'data_dir':
       return (
         <section aria-label={T.data_dir_heading}>
-          <h2>{T.data_dir_heading}</h2>
+          <h2 tabIndex={-1}>{T.data_dir_heading}</h2>
           <p>{T.data_dir_intro}</p>
           <p>
             {T.data_dir_default}: <Cfg value={state.default_dir} />
@@ -191,14 +256,14 @@ function Panel({
           <button
             type="button"
             disabled={pending}
-            onClick={() => step(wizardUseDefaultDir, { destroysWindow: true })}
+            onClick={() => step(() => wizardUseDefaultDir(), { destroysWindow: true })}
           >
             {T.data_dir_use_default}
           </button>{' '}
           <button
             type="button"
             disabled={pending}
-            onClick={() => step(wizardChooseDir, { destroysWindow: true })}
+            onClick={() => step(() => wizardChooseDir(), { destroysWindow: true })}
           >
             {T.data_dir_choose}
           </button>
@@ -208,7 +273,7 @@ function Panel({
     case 'existing_store':
       return (
         <section aria-label={T.existing_heading}>
-          <h2>{T.existing_heading}</h2>
+          <h2 tabIndex={-1}>{T.existing_heading}</h2>
           <p>{T.existing_intro}</p>
           {state.data_dir === null ? null : (
             <p>
@@ -216,7 +281,7 @@ function Panel({
             </p>
           )}
           <StepError error={state.error} />
-          <button type="button" disabled={pending} onClick={() => step(wizardBegin)}>
+          <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
             {T.existing_continue}
           </button>
         </section>
@@ -224,13 +289,13 @@ function Panel({
     case 'passphrase':
       return (
         <section aria-label={T.passphrase_heading}>
-          <h2>{T.passphrase_heading}</h2>
+          <h2 tabIndex={-1}>{T.passphrase_heading}</h2>
           <p>{T.passphrase_intro}</p>
           <StepError error={state.error} />
           {state.passphrase_window ? (
             <p role="status">{T.passphrase_waiting}</p>
           ) : (
-            <button type="button" disabled={pending} onClick={() => step(wizardBegin)}>
+            <button type="button" disabled={pending} onClick={() => step(() => wizardBegin())}>
               {T.passphrase_begin}
             </button>
           )}
@@ -239,16 +304,16 @@ function Panel({
     case 'genesis':
       return (
         <section aria-label={T.genesis_heading}>
-          <h2>{T.genesis_heading}</h2>
+          <h2 tabIndex={-1}>{T.genesis_heading}</h2>
           <p role="status">{T.genesis_working}</p>
         </section>
       );
     case 'recovery_note':
       return (
         <section aria-label={T.note_heading}>
-          <h2>{T.note_heading}</h2>
+          <h2 tabIndex={-1}>{T.note_heading}</h2>
           <p>{T.note_intro}</p>
-          <button type="button" disabled={pending} onClick={() => step(wizardFinish, { settle: true })}>
+          <button type="button" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
             {T.continue}
           </button>
         </section>
@@ -256,14 +321,19 @@ function Panel({
     case 'instances':
       return (
         <section aria-label={T.instances_heading}>
-          <h2>{T.instances_heading}</h2>
+          <h2 tabIndex={-1}>{T.instances_heading}</h2>
           <p>{T.instances_intro}</p>
           <SetupInstances instances={state.instances} onChanged={onChanged} />
-          <InstanceForm onAdded={onChanged} readOnly={false} />
+          <InstanceForm
+            onAdded={onChanged}
+            readOnly={false}
+            headingLevel={3}
+            addedNeedsToken={T.instance_added}
+          />
           <button
             type="button"
             disabled={pending}
-            onClick={() => step(wizardSkipInstances, { settle: true })}
+            onClick={() => step((rendered) => wizardSkipInstances(rendered), { settle: true })}
           >
             {state.instances.length === 0 ? T.instances_skip : T.instances_continue}
           </button>
@@ -274,9 +344,9 @@ function Panel({
     case 'onboarding':
       return (
         <section aria-label={T.onboarding_heading}>
-          <h2>{T.onboarding_heading}</h2>
+          <h2 tabIndex={-1}>{T.onboarding_heading}</h2>
           <p>{T.onboarding_placeholder}</p>
-          <button type="button" disabled={pending} onClick={() => step(wizardFinish, { settle: true })}>
+          <button type="button" disabled={pending} onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}>
             {T.onboarding_finish}
           </button>
         </section>
@@ -284,14 +354,14 @@ function Panel({
     case 'done':
       return (
         <section aria-label={T.done_heading}>
-          <h2>{T.done_heading}</h2>
+          <h2 tabIndex={-1}>{T.done_heading}</h2>
           <p role="status">{T.done_text}</p>
         </section>
       );
     case 'stopped':
       return (
         <section aria-label={T.stopped_heading}>
-          <h2>{T.stopped_heading}</h2>
+          <h2 tabIndex={-1}>{T.stopped_heading}</h2>
           {/* Rust's fixed text (spec 8.6 for the keyring), shown as a plain text node. */}
           <p role="alert">{state.stopped_text ?? T.errors.other}</p>
         </section>
@@ -304,7 +374,7 @@ function CliStep({ pending, step }: { pending: boolean; step: Step }) {
   const [outcome, setOutcome] = useState<CliInstallAnswer['outcome'] | null>(null);
   return (
     <section aria-label={T.cli_heading}>
-      <h2>{T.cli_heading}</h2>
+      <h2 tabIndex={-1}>{T.cli_heading}</h2>
       <p>{T.cli_intro}</p>
       <button
         type="button"
@@ -323,7 +393,7 @@ function CliStep({ pending, step }: { pending: boolean; step: Step }) {
         <button
           type="button"
           disabled={pending || install.pending}
-          onClick={() => step(wizardFinish, { settle: true })}
+          onClick={() => step((rendered) => wizardFinish(rendered), { settle: true })}
         >
           {T.cli_continue}
         </button>

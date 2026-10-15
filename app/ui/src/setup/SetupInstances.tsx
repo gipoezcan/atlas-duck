@@ -56,6 +56,7 @@ function Row({ inst, onChanged }: { inst: InstanceView; onChanged: () => void })
             <AgentText value={inst.note} unusual={unusual(inst.note)} />
           </p>
         )}
+        {inst.state === 'needs_token' ? <p>{T.token_in_settings}</p> : null}
         {inst.state === 'instance_unconfirmed' ? (
           <>
             <p>{T.confirm_hint}</p>

@@ -26,11 +26,15 @@ use atlas_duck_app_lib::state::{AppState, DataDirHold, ServeSlot, StartupSummary
 use atlas_duck_app_lib::windows::{
     self, AppSnapshot, NavPolicy, Relaunch, StartupRoute, WindowRegistry,
 };
-use atlas_duck_app_lib::wizard::{self, MSG_NEEDS_SECRET_SERVICE, ServeStarter, Wizard, WizardEnv};
+use atlas_duck_app_lib::wizard::{
+    self, InFlight, MSG_KEYRING_NOT_LOCAL, MSG_NEEDS_SECRET_SERVICE, ServeStarter, Wizard,
+    WizardEnv,
+};
 use atlas_duck_audit::lock::InstanceLock;
 use atlas_duck_audit::testing::{KeyOpKind, MemKeyStore, MemKeyring, event_types, recovery_row};
 use atlas_duck_audit::{
-    FirstRunInput, KeyStore, KeyStoreError, OpenConfig, SystemClock, create_new_store, new_ids,
+    FirstRunInput, KeyStore, KeyStoreError, KeyringLocality, OpenConfig, SystemClock,
+    create_new_store, new_ids,
 };
 use atlas_duck_core::{Confirm, GateState, NativeConfirmer, ShutdownReason, UiEvent, UiSink};
 use atlas_duck_ipc::build_info::BUILD_ID;
@@ -119,6 +123,17 @@ async fn run(
     call(w, cmd, json!({}))
         .await
         .map_err(|e| format!("{cmd}: {e}").into())
+}
+
+/// `wizard_finish` / `wizard_skip_instances` from `w`, naming the step the page showed.
+async fn run_step(
+    w: &WebviewWindow<MockRuntime>,
+    cmd: &str,
+    step: &str,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    call(w, cmd, json!({ "step": step }))
+        .await
+        .map_err(|e| format!("{cmd} {step}: {e}").into())
 }
 
 async fn wizard_state(
@@ -254,6 +269,8 @@ struct TestStarter {
     root: PathBuf,
     /// The start never ends (a store still opening).
     idle: bool,
+    /// What the wizard's `in_flight` was each time a start began.
+    in_flight_at_start: Arc<Mutex<Vec<Option<InFlight>>>>,
 }
 
 impl TestStarter {
@@ -299,6 +316,12 @@ impl ServeStarter<MockRuntime> for TestStarter {
         lock: Arc<InstanceLock>,
         pinned: &PinnedPaths,
     ) {
+        if let (Some(w), Ok(mut seen)) = (
+            app.try_state::<Wizard<MockRuntime>>(),
+            self.in_flight_at_start.lock(),
+        ) {
+            seen.push(w.progress_now().in_flight);
+        }
         if self.idle {
             return;
         }
@@ -376,6 +399,7 @@ struct Machine {
     secret_service: Option<SecretService>,
     /// Step 0's start never ends.
     idle_start: bool,
+    in_flight_at_start: Arc<Mutex<Vec<Option<InFlight>>>>,
 }
 
 impl Machine {
@@ -411,6 +435,7 @@ impl Machine {
             pick: Arc::default(),
             secret_service: None,
             idle_start: false,
+            in_flight_at_start: Arc::default(),
             root,
         })
     }
@@ -426,12 +451,14 @@ impl Machine {
             confirmer: self.confirmer.clone(),
             root: self.root.clone(),
             idle: self.idle_start,
+            in_flight_at_start: self.in_flight_at_start.clone(),
         })
     }
 
     fn env(&self) -> WizardEnv<MockRuntime> {
         let pins = self.pins.clone();
         let pick = self.pick.clone();
+        let ring = self.ring.clone();
         WizardEnv {
             pinned_file: self.pinned_file.clone(),
             default_data_dir: self.default_dir.clone(),
@@ -450,6 +477,10 @@ impl Machine {
                 paths::write_pinned(file, p)
             }),
             check_dir: fake_nfs_check,
+            // What `MemKeyStore::locality` answers: no ring operation is recorded.
+            keyring_locality: Arc::new(move || {
+                MemKeyStore::new(ring.clone(), "locality-probe").locality()
+            }),
         }
     }
 
@@ -639,7 +670,70 @@ async fn step0_writes_data_dir_before_pinned_file() -> TestResult {
         );
     }
     assert_eq!(m.pins().len(), 1);
+    // T23 m-4: `in_flight` held until the data dir is managed, the start included (a second step-0
+    // call in between would pass its guards and end in `already_pinned`).
+    assert_eq!(
+        *m.in_flight_at_start.lock().map_err(|_| "poisoned")?,
+        [Some(InFlight::DataDir)]
+    );
+    assert_eq!(
+        app.state::<Wizard<MockRuntime>>().progress_now().in_flight,
+        None
+    );
     stop(&app).await
+}
+
+/// What `wizard_choose_dir` pinned after picking `pick` (prepared by `prepare`), on a machine of its
+/// own.
+async fn pinned_after_pick(
+    tmp: &tempfile::TempDir,
+    host: &'static str,
+    prepare: impl FnOnce(&Machine, &Path) -> TestResult,
+) -> Result<(PathBuf, PathBuf, Value), Box<dyn std::error::Error>> {
+    let m = Machine::new(tmp, host, None, MemKeyring::new())?;
+    let pick = m.root.join("picked");
+    std::fs::create_dir_all(&pick)?;
+    prepare(&m, &pick)?;
+    *m.pick.lock().map_err(|_| "poisoned")? = Some(pick.clone());
+    let (app, setup) = m.app()?;
+    let s = run(&setup, "wizard_choose_dir").await?;
+    let pinned = read_pinned(&m.pinned_file)?.ok_or("no pinned file")?;
+    stop(&app).await?;
+    Ok((pick, pinned.data_dir, s))
+}
+
+/// T23 m-11: a picked folder that holds other files gets `atlas-duck` inside it (the store, the
+/// lock, `webview*/` and `archived/` never land in `Documents` or a drive root); an empty folder is
+/// used as it is, and so is a folder that already is an atlas-duck data dir (`audit.db`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_populated_pick_gets_an_atlas_duck_folder() -> TestResult {
+    let tmp = scratch()?;
+    // Populated with something else: nested.
+    let (pick, pinned, s) = pinned_after_pick(&tmp, "host-a", |_, dir| {
+        std::fs::write(dir.join("notes.txt"), b"mine")?;
+        Ok(())
+    })
+    .await?;
+    assert_eq!(pinned, pick.join("atlas-duck"));
+    assert_eq!(s["data_dir"], pick.join("atlas-duck").display().to_string());
+    assert!(pick.join("atlas-duck").join("instance.lock").exists());
+    assert!(
+        !pick.join("instance.lock").exists(),
+        "nothing of ours beside the user's files"
+    );
+    // Empty: as it is.
+    let (pick, pinned, s) = pinned_after_pick(&tmp, "host-b", |_, _| Ok(())).await?;
+    assert_eq!(pinned, pick);
+    assert_eq!(s["data_dir"], pick.display().to_string());
+    // Already an atlas-duck data dir (a store): as it is, and it is (1a).
+    let (pick, pinned, s) = pinned_after_pick(&tmp, "host-c", |m, dir| {
+        m.provision(dir)?;
+        Ok(())
+    })
+    .await?;
+    assert_eq!(pinned, pick);
+    assert_eq!(s["existing_store"], true);
+    Ok(())
 }
 
 /// §7.7: a data dir that is not on a local filesystem is refused with the startup text, and a
@@ -879,7 +973,7 @@ async fn wizard_genesis_swaps_handler_without_rebind() -> TestResult {
     // The steps before the passphrase refuse.
     for cmd in ["wizard_skip_instances", "wizard_finish"] {
         assert_eq!(
-            call(&setup, cmd, json!({})).await,
+            call(&setup, cmd, json!({"step": "passphrase"})).await,
             Err(json!({"kind": "not_ready"})),
             "{cmd}"
         );
@@ -953,22 +1047,56 @@ async fn wizard_genesis_swaps_handler_without_rebind() -> TestResult {
     assert_eq!(ctx["note_available"], true, "{ctx}");
 
     // The note step ends with the window; then instances (none yet), CLI, onboarding, done.
-    let s = run(&setup, "wizard_finish").await?;
+    // T24 I-1 / T23 m-3: a request for another step than the wizard is at moves nothing and says
+    // `wrong_step` (and the answer after it does not carry that error).
+    let s = run_step(&setup, "wizard_finish", "cli").await?;
+    assert_eq!(s["step"], "recovery_note", "{s}");
+    assert_eq!(s["error"]["class"], "wrong_step", "{s}");
+    assert_eq!(
+        credential::current_purpose(&handle),
+        Some(Purpose::RecoveryPassphrase),
+        "the note window stays"
+    );
+    assert_eq!(wizard_state(&setup).await?["error"], Value::Null);
+    let s = run_step(&setup, "wizard_finish", "recovery_note").await?;
     assert_eq!(s["step"], "instances");
     assert_eq!(credential::current_purpose(&handle), None);
+    // The double click: the second finish names the step the first one left.
+    let s = run_step(&setup, "wizard_finish", "recovery_note").await?;
+    assert_eq!(
+        (s["step"].clone(), s["error"]["class"].clone()),
+        (json!("instances"), json!("wrong_step"))
+    );
     assert_eq!(
         call(&setup, "wizard_begin", json!({})).await,
         Err(json!({"kind": "not_ready"})),
         "no second GENESIS"
     );
-    let s = run(&setup, "wizard_skip_instances").await?;
+    let s = run_step(&setup, "wizard_skip_instances", "cli").await?;
+    assert_eq!(
+        (s["step"].clone(), s["error"]["class"].clone()),
+        (json!("instances"), json!("wrong_step"))
+    );
+    let s = run_step(&setup, "wizard_skip_instances", "instances").await?;
     assert_eq!(s["step"], "cli");
-    let s = run(&setup, "wizard_finish").await?;
+    let s = run_step(&setup, "wizard_skip_instances", "instances").await?;
+    assert_eq!(
+        (s["step"].clone(), s["error"]["class"].clone()),
+        (json!("cli"), json!("wrong_step")),
+        "a repeated skip does not touch the CLI step"
+    );
+    let s = run_step(&setup, "wizard_finish", "cli").await?;
     assert_eq!(s["step"], "onboarding");
-    let s = run(&setup, "wizard_finish").await?;
+    // The double click on the CLI step's Continue must not skip the onboarding step.
+    let s = run_step(&setup, "wizard_finish", "cli").await?;
+    assert_eq!(
+        (s["step"].clone(), s["error"]["class"].clone()),
+        (json!("onboarding"), json!("wrong_step"))
+    );
+    let s = run_step(&setup, "wizard_finish", "onboarding").await?;
     assert_eq!(s["step"], "done");
     assert_eq!(
-        call(&setup, "wizard_finish", json!({})).await,
+        call(&setup, "wizard_finish", json!({"step": "done"})).await,
         Err(json!({"kind": "not_ready"}))
     );
     // Requests are answered normally now (no instance yet: `no_instance`, §4.3).
@@ -1090,9 +1218,13 @@ async fn linux_no_secret_service_stops_with_text() -> TestResult {
         read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
         None
     );
-    for cmd in ["wizard_begin", "wizard_skip_instances", "wizard_finish"] {
+    for (cmd, body) in [
+        ("wizard_begin", json!({})),
+        ("wizard_skip_instances", json!({"step": "stopped"})),
+        ("wizard_finish", json!({"step": "stopped"})),
+    ] {
         assert_eq!(
-            call(&setup, cmd, json!({})).await,
+            call(&setup, cmd, body).await,
             Err(json!({"kind": "not_ready"})),
             "{cmd}"
         );
@@ -1102,6 +1234,89 @@ async fn linux_no_secret_service_stops_with_text() -> TestResult {
     assert_eq!(reason(&reply.envelope), Some("first_run"));
     drop(c);
     stop(&app).await
+}
+
+/// §8.6 (L39): the keyring's directories are checked before the passphrase is asked for. A keyring
+/// that is not local stops the wizard at that step with the §8.7 text and Quit only: no credential
+/// window, no id, no keyring call, no store; the first-run gate keeps answering. The check is
+/// injected, so this runs on every OS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keyring_not_local_stops_before_the_passphrase() -> TestResult {
+    let tmp = scratch()?;
+    let m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    m.ring.set_locality(KeyringLocality::NotLocal {
+        dir: m.root.join("home-on-nfs"),
+    });
+    let (app, setup) = m.app()?;
+    run(&setup, "wizard_use_default_dir").await?;
+    until(&setup, "the gate serves", |s| s["refused_count"] == 0).await?;
+    let s = run(&setup, "wizard_begin").await?;
+    assert_eq!(s["step"], "stopped", "{s}");
+    assert_eq!(s["stopped_text"], MSG_KEYRING_NOT_LOCAL);
+    assert_eq!(s["passphrase_window"], false);
+    assert_eq!(s["error"], Value::Null);
+    assert_eq!(credential::current_purpose(app.handle()), None);
+    assert!(m.ring.ops().is_empty(), "no keyring call");
+    assert!(m.keys.ids().is_empty(), "no install id");
+    let data = local(&m.default_dir)?;
+    assert!(!data.path().join("audit.db").exists());
+    assert_eq!(
+        read_pinned(&m.pinned_file)?.and_then(|p| p.install_id),
+        None
+    );
+    // Sticky: Begin again does not ask either, and nothing else moves on.
+    for (cmd, body) in [
+        ("wizard_begin", json!({})),
+        ("wizard_skip_instances", json!({"step": "stopped"})),
+        ("wizard_finish", json!({"step": "stopped"})),
+    ] {
+        assert_eq!(
+            call(&setup, cmd, body).await,
+            Err(json!({"kind": "not_ready"})),
+            "{cmd}"
+        );
+    }
+    assert_eq!(credential::current_purpose(app.handle()), None);
+    let mut c = connect(&m, &data).await?;
+    let reply: SubmitReply = c.call("request.submit", submit_params()).await?;
+    assert_eq!(reason(&reply.envelope), Some("first_run"));
+    drop(c);
+    stop(&app).await
+}
+
+/// The negative control of the above: a keyring that is local, or whose locality cannot be told
+/// (`Unknown`: the store's own check at `GENESIS` is the backstop, a retry can succeed), goes on to
+/// the passphrase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_or_unknown_keyring_goes_on_to_the_passphrase() -> TestResult {
+    let tmp = scratch()?;
+    for (host, locality) in [
+        ("host-a", KeyringLocality::Local),
+        (
+            "host-b",
+            KeyringLocality::Unknown {
+                reason: "no keyring directories to check".into(),
+            },
+        ),
+    ] {
+        let m = Machine::new(&tmp, host, None, MemKeyring::new())?;
+        m.ring.set_locality(locality);
+        let (app, setup) = m.app()?;
+        run(&setup, "wizard_use_default_dir").await?;
+        until(&setup, "the gate serves", |s| s["refused_count"] == 0).await?;
+        let s = run(&setup, "wizard_begin").await?;
+        assert_eq!(
+            (s["step"].clone(), s["passphrase_window"].clone()),
+            (json!("passphrase"), json!(true)),
+            "{host}"
+        );
+        assert_eq!(
+            credential::current_purpose(app.handle()),
+            Some(Purpose::RecoveryPassphrase)
+        );
+        stop(&app).await?;
+    }
+    Ok(())
 }
 
 /// PD-77: the passphrase is asked for only once the first-run gate serves. While the start after
@@ -1202,7 +1417,7 @@ async fn rf3b_roamed_config_second_machine() -> TestResult {
         Ok(json!({"accepted": {}}))
     );
     until(&setup, "B's GENESIS", step_is("recovery_note")).await?;
-    let s = run(&setup, "wizard_finish").await?;
+    let s = run_step(&setup, "wizard_finish", "recovery_note").await?;
     assert_eq!(s["step"], "instances", "{s}");
     let states = |s: &Value| -> Vec<(String, String)> {
         let mut v: Vec<(String, String)> = s["instances"]

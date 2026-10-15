@@ -21,6 +21,33 @@ use atlas_duck_ipc::paths::{DataDirResolution, LocalDataDir, check_data_dir};
 use tauri::test::{MockRuntime, mock_builder};
 use tauri::{App, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 
+/// A scratch dir under cargo's per-target test dir, not `%TEMP%`: the mock runtime keeps the app, and
+/// with it the `instance.lock` of the data dir it manages, alive for the rest of the process, so
+/// the folder cannot be deleted when the test ends. Leftovers older than an hour are swept once per
+/// run (a younger one may belong to a run that is still going).
+fn scratch() -> std::io::Result<tempfile::TempDir> {
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("windows_registry");
+    std::fs::create_dir_all(&root)?;
+    SWEEP.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let old = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(60 * 60));
+            if old {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
+    tempfile::Builder::new().tempdir_in(&root)
+}
+
 fn local_data_dir(tmp: &tempfile::TempDir) -> Result<LocalDataDir, Box<dyn std::error::Error>> {
     match check_data_dir(tmp.path())? {
         DataDirResolution::Local(data) => Ok(data),
@@ -55,7 +82,7 @@ fn open_builds_once_under_the_fixed_label() -> TestResult {
     );
     assert_eq!(handle.webview_windows().len(), 1, "built once");
     // The credential window has its own webview data dir: it needs the locked data dir (T6).
-    let tmp = tempfile::tempdir()?;
+    let tmp = scratch()?;
     let data = local_data_dir(&tmp)?;
     let lock = Arc::new(InstanceLock::acquire(&data, "testhost")?);
     app.manage(DataDirHold::new(data, lock));
@@ -109,7 +136,7 @@ fn the_re_raise_never_shows_a_window_that_exists() -> TestResult {
     raise_window_with(handle, Relaunch::Nothing, |_| calls.set(calls.get() + 1));
     assert_eq!(calls.get(), 1);
     // The real builder is the one that builds.
-    let tmp = tempfile::tempdir()?;
+    let tmp = scratch()?;
     let data = local_data_dir(&tmp)?;
     let lock = Arc::new(InstanceLock::acquire(&data, "testhost")?);
     app.manage(DataDirHold::new(data, lock));

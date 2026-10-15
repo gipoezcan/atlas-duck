@@ -22,6 +22,7 @@ import type {
   SettingsView,
   StatusLine,
   WizardState,
+  WizardStep,
 } from './types';
 import {
   arrayOf,
@@ -243,14 +244,17 @@ export function wizardBegin(): Promise<WizardState> {
   return call('wizard_begin', {}, isWizardState);
 }
 
-/** Leaves the instances step, with or without additions. */
-export function wizardSkipInstances(): Promise<WizardState> {
-  return call('wizard_skip_instances', {}, isWizardState);
+/**
+ * Leaves the instances step, with or without additions. `step` is the step the page rendered:
+ * Rust answers `error.class = "wrong_step"` and moves nothing when the wizard is at another one.
+ */
+export function wizardSkipInstances(step: WizardStep): Promise<WizardState> {
+  return call('wizard_skip_instances', { step }, isWizardState);
 }
 
-/** Ends the recovery-note, CLI or onboarding step; one step per call (Rust has no "from step"). */
-export function wizardFinish(): Promise<WizardState> {
-  return call('wizard_finish', {}, isWizardState);
+/** Ends the recovery-note, CLI or onboarding step the page rendered (`step`); one step per call. */
+export function wizardFinish(step: WizardStep): Promise<WizardState> {
+  return call('wizard_finish', { step }, isWizardState);
 }
 
 export function rawPage(

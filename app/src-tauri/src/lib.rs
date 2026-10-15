@@ -104,6 +104,13 @@ fn wizard_env(
         pick_folder: Arc::new(|app: &tauri::AppHandle| wizard::pick_folder_dialog(app)),
         write_pinned: Arc::new(paths::write_pinned),
         check_dir: paths::check_data_dir,
+        // What `OsKeyStore::locality` answers (no keyring call, §8.6).
+        keyring_locality: Arc::new(|| match paths::keyring::keyring_dirs() {
+            Ok(dirs) => paths::keyring::keyring_locality(&dirs),
+            Err(e) => paths::keyring::KeyringLocality::Unknown {
+                reason: e.to_string(),
+            },
+        }),
     })
 }
 
