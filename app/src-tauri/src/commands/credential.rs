@@ -597,7 +597,10 @@ pub async fn close_credential<R: Runtime>(
     let response = match credential::current_window(&app) {
         None => Err(CommandError::NotReady),
         Some((_, generation)) => {
-            // Only the window this call came from: a later open's window is left alone.
+            // The window that is open when this handler runs (Tauri hands the handler the label,
+            // not the webview instance): a window opened *after* the handler read its generation
+            // is left alone, but one built between the page's click and this read is closed. That
+            // is what the OS close button would do; the user reopens it.
             tauri::async_runtime::spawn_blocking(move || credential::close_if(&handle, generation));
             Ok(())
         }

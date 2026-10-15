@@ -240,7 +240,7 @@ async fn i31_add_requires_confirmation() -> TestResult {
         text.contains("\"second\"") && text.contains(&second.base_url()),
         "{text}"
     );
-    assert!(text.starts_with("Add Jira instance"), "{text}");
+    assert!(text.contains("Add Jira instance"), "{text}");
     assert_eq!(h.instances().list().len(), 2);
     assert!(std::fs::read_to_string(h.config_path())?.contains("second"));
     // The origin is confirmed in the audit settings, not only in the file.
@@ -286,18 +286,55 @@ async fn i31_url_change_requires_confirmation() -> TestResult {
     assert!(!h.credentials().contains(&id));
     let text = h.confirmer().texts().last().cloned().ok_or("no dialog")?;
     assert!(
-        text.starts_with(&format!(
+        text.ends_with(&format!(
             "Change \"jira-main\" from {first} to {}? The stored token will be deleted.",
             second.base_url()
         )),
         "{text}"
     );
+    assert!(text.starts_with("Warning: "), "{text}");
     assert!(text.contains("is a loopback address"), "{text}");
     let changed = h.events_of(EventType::CREDENTIAL_CHANGED).await?;
     assert_eq!(changed.len(), 1);
     assert_eq!(changed[0]["change"], "deleted");
     assert_eq!(changed[0]["old_user_key"], TEST_USER_KEY);
     assert_eq!(changed[0]["new_user_key"], Value::Null);
+    Ok(())
+}
+
+/// M6 T25 review I-2: a ~6 KB percent-encoded URL cannot push the warnings out of a native message
+/// box; they sit at the start of both URL dialogs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn url_dialogs_carry_the_warnings_before_a_long_url() -> TestResult {
+    const WARNING_WINDOW: usize = 200;
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confirm(vec![Confirm::Cancel, Confirm::Cancel])
+        .start()
+        .await?;
+    let other = MockDc::start(atl(Product::Jira), "/other").await;
+    let long = format!("{}/{}", other.base_url(), "é".repeat(700));
+    assert_eq!(
+        h.instances().add(add("second", &long)).err(),
+        Some(AdminError::Cancelled)
+    );
+    assert_eq!(
+        h.instances().change_base_url("jira-main", &long).err(),
+        Some(AdminError::Cancelled)
+    );
+    let texts = h.confirmer().texts();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    for text in &texts {
+        assert!(
+            text.len() > 4000,
+            "the URL is shown in full: {}",
+            text.len()
+        );
+        let at = text
+            .find("is a loopback address")
+            .ok_or("no loopback warning")?;
+        assert!(at < WARNING_WINDOW, "warning at byte {at}");
+    }
     Ok(())
 }
 

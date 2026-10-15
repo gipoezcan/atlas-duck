@@ -1730,6 +1730,13 @@ fn settings_commands_granted_to_settings_and_setup_only() -> TestResult {
             json!({"changes": [{"key": "audit_enabled", "value": false}]}),
             "changes",
         ),
+        // T19 ruling: presentation mode is not a persisted setting; it is refused at the IPC
+        // boundary, before core is asked.
+        (
+            "settings_apply",
+            json!({"changes": [{"key": "presentation_mode", "value": true}]}),
+            "changes",
+        ),
     ] {
         assert_eq!(
             invoke(settings, cmd, body),
@@ -1815,10 +1822,12 @@ mod settings_commands {
     use atlas_duck_app_lib::commands::CommandError;
     use atlas_duck_app_lib::commands::dto::parse;
     use atlas_duck_app_lib::commands::settings::{
-        ConfinementDto, HTTPS_REQUIRED_HINT, InstanceAddArgs, InstanceChangeUrlArgs, RetestOutcome,
-        RetestTokenArgs, SettingChanges, instance_add_dto, instance_change_url_dto,
-        instance_set_proxy_dto, pat_open_error, prune_backlog_now_dto, retest_token_dto,
-        settings_apply_dto, settings_get_dto,
+        ConfinementDto, InstanceAcceptUrlChangeArgs, InstanceAddArgs, InstanceChangeUrlArgs,
+        InstanceConfirmConfigArgs, RetestOutcome, RetestTokenArgs, SettingChanges,
+        conclude_instance_call, instance_accept_url_change_dto, instance_add_dto,
+        instance_change_url_dto, instance_confirm_config_dto, instance_set_proxy_dto,
+        pat_open_error, prune_backlog_now_dto, retest_token_dto, settings_apply_dto,
+        settings_get_dto,
     };
     use atlas_duck_app_lib::credential::{PatOpenError, open_for_pat};
     use atlas_duck_atlassian::testing::{
@@ -1885,6 +1894,7 @@ mod settings_commands {
         let admin = h.instances();
         let before_file = std::fs::read_to_string(h.config_path())?;
         let records = config_records(&h).await?;
+        let events = h.event_count().await?;
 
         // instance_add: Cancel.
         let args = add_args("second", &second.base_url(), false)?;
@@ -1894,6 +1904,7 @@ mod settings_commands {
         assert_eq!(std::fs::read_to_string(h.config_path())?, before_file);
         assert_eq!(admin.list().len(), 1);
         assert_eq!(config_records(&h).await?, records);
+        assert_eq!(h.event_count().await?, events, "no event of any type");
         // Ok.
         h.confirmer().push(Confirm::Ok);
         let args = add_args("second", &second.base_url(), false)?;
@@ -1906,7 +1917,7 @@ mod settings_commands {
         assert!(
             texts
                 .last()
-                .is_some_and(|t| t.starts_with("Add Jira instance")),
+                .is_some_and(|t| t.contains("Add Jira instance")),
             "{texts:?}"
         );
 
@@ -1997,10 +2008,8 @@ mod settings_commands {
             serde_json::to_value(&err)?,
             json!({"kind": "admin", "error": {"kind": "insecure_scheme"}})
         );
-        assert_eq!(
-            HTTPS_REQUIRED_HINT,
-            "atlas-duck requires https; if your server uses an internal CA, add it as the instance's custom CA"
-        );
+        // (The hint's text is the page's: `the_https_hint_is_the_spec_sentence_and_the_pages_copy`
+        // ties it to the spec and to `shared/strings.ts`.)
         // A URL change to http is refused the same way; the hint is for both entry points.
         let a = admin.clone();
         let change = parse::<InstanceChangeUrlArgs>(
@@ -2172,6 +2181,119 @@ mod settings_commands {
         Ok(())
     }
 
+    /// M6 T25 review I-1: core can commit and then answer an error (a declined CA dialog after the
+    /// origin was confirmed, a failed token delete or table reload after an origin change), so every
+    /// answer of an instance command, error or not, is followed by `settings_changed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_instance_answer_is_followed_by_settings_changed() -> TestResult {
+        use atlas_duck_app_lib::commands;
+        use atlas_duck_audit::AuditError;
+        use atlas_duck_core::testing::capture::Channel;
+
+        let h = Harness::jira().await?;
+        let view = h.instances().list().remove(0);
+        let app = mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets()))?;
+        let cap = commands::capture::bounded();
+        assert!(commands::capture::install(app.handle(), cap.clone()));
+        let answers = [
+            Ok(view),
+            Err(CommandError::Admin(AdminError::Audit(AuditError::Invalid(
+                "committed, then the reload failed",
+            )))),
+            Err(CommandError::Admin(AdminError::Cancelled)),
+            Err(CommandError::Admin(AdminError::InvalidUrl)),
+            Err(CommandError::NotReady),
+        ];
+        let sent = answers.len();
+        for answer in answers {
+            let expected = answer.clone();
+            assert_eq!(conclude_instance_call(app.handle(), answer), expected);
+        }
+        let events = cap.on(Channel::TauriEvent);
+        assert_eq!(events.len(), sent, "{events:?}");
+        for e in &events {
+            assert_eq!(
+                serde_json::from_str::<Value>(&e.json)?,
+                json!({"event": "settings_changed", "payload": null})
+            );
+        }
+        // The answers themselves are recorded as the webview gets them.
+        assert_eq!(cap.on(Channel::TauriCommand).len(), sent);
+        Ok(())
+    }
+
+    /// I-31 through the commands for the two gates of an instance `config.toml` proposed:
+    /// `instance_confirm_config` (an instance added in `config.toml`) and
+    /// `instance_accept_url_change` (a URL change `config.toml` asked for). A `Cancel` is
+    /// `Cancelled` and nothing is logged at all; an `Ok` confirms, writes the audit record, and
+    /// the dialog names the alias and the origin.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn i31_confirm_config_and_accept_url_change_need_native_confirm() -> TestResult {
+        let mut h = Harness::builder()
+            .jira("jira-main")
+            .unconfirmed()
+            .confirm(vec![Confirm::Cancel])
+            .start()
+            .await?;
+        let admin = h.instances();
+        let first = h.mock("jira-main").ok_or("mock")?.base_url();
+        assert_eq!(admin.list()[0].state, "instance_unconfirmed");
+
+        // instance_confirm_config: Cancel logs nothing and leaves the instance unconfirmed.
+        let confirm = |alias: &str| {
+            parse::<InstanceConfirmConfigArgs>(&json!({ "alias": alias }))
+                .map_err(|e| format!("{e:?}"))
+        };
+        let events = h.event_count().await?;
+        let (a, args) = (admin.clone(), confirm("jira-main")?);
+        let res = blocking(move || instance_confirm_config_dto(&*a, args)).await?;
+        assert_eq!(res.err(), Some(CommandError::Admin(AdminError::Cancelled)));
+        assert_eq!(h.event_count().await?, events, "a Cancel logs nothing");
+        assert_eq!(admin.list()[0].state, "instance_unconfirmed");
+        // Ok: confirmed and logged.
+        h.confirmer().push(Confirm::Ok);
+        let (a, args) = (admin.clone(), confirm("jira-main")?);
+        let view = blocking(move || instance_confirm_config_dto(&*a, args)).await??;
+        assert_ne!(view.state, "instance_unconfirmed");
+        assert_eq!(view.origin, Some(first.clone()));
+        assert!(h.event_count().await? > events);
+        let texts = h.confirmer().texts();
+        let text = texts.last().ok_or("no dialog")?;
+        assert!(
+            text.contains("\"jira-main\"") && text.contains(&first),
+            "{text}"
+        );
+
+        // instance_accept_url_change: config.toml asks for another origin.
+        let second = MockDc::start(atlas_duck_atlassian::Product::Jira, "/moved").await;
+        let path = h.config_path();
+        std::fs::write(
+            &path,
+            std::fs::read_to_string(&path)?.replace(&first, &second.base_url()),
+        )?;
+        h.restart().await?;
+        let admin = h.instances();
+        assert_eq!(admin.list()[0].pending_url_change, Some(second.base_url()));
+        let accept = || {
+            parse::<InstanceAcceptUrlChangeArgs>(&json!({"alias": "jira-main"}))
+                .map_err(|e| format!("{e:?}"))
+        };
+        h.confirmer().push(Confirm::Cancel);
+        let events = h.event_count().await?;
+        let (a, args) = (admin.clone(), accept()?);
+        let res = blocking(move || instance_accept_url_change_dto(&*a, args)).await?;
+        assert_eq!(res.err(), Some(CommandError::Admin(AdminError::Cancelled)));
+        assert_eq!(h.event_count().await?, events, "a Cancel logs nothing");
+        assert_eq!(admin.list()[0].origin, Some(first));
+        h.confirmer().push(Confirm::Ok);
+        let (a, args) = (admin.clone(), accept()?);
+        let view = blocking(move || instance_accept_url_change_dto(&*a, args)).await??;
+        assert_eq!(view.origin, Some(second.base_url()));
+        assert_eq!(view.pending_url_change, None);
+        assert!(h.event_count().await? > events);
+        Ok(())
+    }
+
     /// `settings_get`'s parts: the view, the instances, the confinement placeholder before the probe
     /// finished, no CLI install state yet; a proxy change through the command lands in the view.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2180,10 +2302,10 @@ mod settings_commands {
         let (s, i) = (h.core().settings(), h.instances());
         let got = blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending())).await?;
         assert_eq!(got.instances.len(), 1);
-        assert_eq!(
-            got.settings.limits.expiry_hours,
-            got.settings.limits.expiry_hours
-        );
+        // The answer is what core's own admin objects say, not a copy of one field.
+        assert_eq!(got.settings, h.core().settings().view());
+        assert_eq!(got.instances, h.instances().list());
+        assert_eq!(got.instances[0].alias, "jira-main");
         assert_eq!(got.confinement.state, "pending");
         assert!(!got.cli_installed);
         let wire = serde_json::to_value(&got)?;

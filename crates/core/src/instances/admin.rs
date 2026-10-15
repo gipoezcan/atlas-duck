@@ -94,38 +94,41 @@ fn host_warnings(host: &str) -> Option<String> {
     }
 }
 
-/// §10.3: the text of the add dialog.
+/// §10.3: the text of the add dialog. The warnings come first: the URL is attacker-sized (a long
+/// percent-encoded path) and a native message box cuts what does not fit (M6 T25 review I-2).
 pub(crate) fn add_text(product: Product, alias: &str, origin: &NormalizedBaseUrl) -> String {
-    let mut text = format!(
+    let mut text = String::new();
+    if let Some(w) = host_warnings(origin.host()) {
+        text.push_str(&w);
+        text.push('\n');
+    }
+    text.push_str(&format!(
         "Add {} instance \"{alias}\" at {}?",
         product_name(product),
         origin.as_str()
-    );
-    if let Some(w) = host_warnings(origin.host()) {
-        text.push('\n');
-        text.push_str(&w);
-    }
+    ));
     text
 }
 
-/// §10.3: the text of the URL-change dialog.
+/// §10.3: the text of the URL-change dialog; the warnings come first (see [`add_text`]).
 pub(crate) fn change_text(alias: &str, old: &NormalizedBaseUrl, new: &NormalizedBaseUrl) -> String {
-    let mut text = format!(
-        "Change \"{alias}\" from {} to {}? The stored token will be deleted.",
-        old.as_str(),
-        new.as_str()
-    );
+    let mut text = String::new();
     if let Some(w) = host_warnings(new.host()) {
-        text.push('\n');
         text.push_str(&w);
+        text.push('\n');
     }
     if old.host() != new.host() {
         text.push_str(&format!(
-            "\nWarning: the host changes from {} to {}.",
+            "Warning: the host changes from {} to {}.\n",
             old.host(),
             new.host()
         ));
     }
+    text.push_str(&format!(
+        "Change \"{alias}\" from {} to {}? The stored token will be deleted.",
+        old.as_str(),
+        new.as_str()
+    ));
     text
 }
 

@@ -649,6 +649,13 @@ fn lock_states_follow_each_other_in_an_open_window() -> TestResult {
         credential::open_for_pat(handle, &views, "A", false),
         Err(PatOpenError::Window(WindowError::Busy))
     );
+    // The command path (`credential_window_open`) answers that refusal as `busy` on the wire.
+    let refused = credential::open_for_pat(handle, &views, "A", false)
+        .err()
+        .ok_or("opened over a recovery window")?;
+    let answer = atlas_duck_app_lib::commands::settings::pat_open_error(refused);
+    assert_eq!(answer, atlas_duck_app_lib::commands::CommandError::Busy);
+    assert_eq!(serde_json::to_value(&answer)?, json!({"kind": "busy"}));
     assert_eq!(
         credential::current_purpose(handle),
         Some(Purpose::RecoverThisLog)

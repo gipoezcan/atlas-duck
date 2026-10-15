@@ -143,7 +143,10 @@ pub struct ProxyDto(pub ProxySetting);
 impl<'de> Deserialize<'de> for ProxyDto {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = text(d, "proxy")?;
-        if s.len() > PROXY_MAX_BYTES {
+        // A proxy host is a DNS name or an IP literal: ASCII, no control or bidi character (core's
+        // parser bans whitespace and URL delimiters only, and what it accepts is written to the
+        // config file, the audit record and the Settings page).
+        if s.len() > PROXY_MAX_BYTES || !s.is_ascii() || s.chars().any(char::is_control) {
             return Err(refuse("proxy"));
         }
         ProxySetting::parse(&s)
@@ -375,6 +378,12 @@ pub fn read_ca_bounded(path: &Path) -> Result<Vec<u8>, CommandError> {
     let refused = || CommandError::InvalidArgument {
         field: "use_custom_ca",
     };
+    // The type check comes before the open: opening a FIFO blocks until a writer appears, and this
+    // runs on a blocking-pool thread. The check on the open handle below is the one the read
+    // relies on (the same file is checked and read).
+    if !std::fs::metadata(path).map_err(|_| refused())?.is_file() {
+        return Err(refused());
+    }
     let file = std::fs::File::open(path).map_err(|_| refused())?;
     if !file.metadata().map_err(|_| refused())?.is_file() {
         return Err(refused());
@@ -478,25 +487,50 @@ pub fn pat_open_error(e: PatOpenError) -> CommandError {
 
 // ---------- the commands ----------
 
-/// Logs a refusal or failure by its kind (the `Display` of core's errors never holds a message, a
-/// path or a value); a declined dialog is the user's own answer, not a failure.
+/// What a failed call logs, or `None` when it is not logged: the outer kind (`admin`, `settings`,
+/// `busy`, ...) and, for core's errors, the inner kind too (`config_read_only`, `keychain`, ...).
+/// Both are the errors' `Display`, which never holds a message, a path or a value. A declined
+/// dialog is the user's own answer and `not_ready` is the state before the core serves: neither
+/// is a failure.
+pub fn failure_class(e: &CommandError) -> Option<(String, Option<String>)> {
+    let inner = match e {
+        CommandError::Admin(AdminError::Cancelled)
+        | CommandError::Settings(SettingsError::Cancelled)
+        | CommandError::NotReady => return None,
+        CommandError::Admin(a) => Some(a.to_string()),
+        CommandError::Settings(s) => Some(s.to_string()),
+        _ => None,
+    };
+    Some((e.to_string(), inner))
+}
+
 fn note_failure<T>(result: &Result<T, CommandError>) {
     let Err(e) = result else { return };
-    let cancelled = matches!(
-        e,
-        CommandError::Admin(AdminError::Cancelled)
-            | CommandError::Settings(SettingsError::Cancelled)
-    );
-    if !cancelled {
+    if let Some((class, inner)) = failure_class(e) {
         tracing::warn!(
             event = LOG_EVENT_SETTINGS_FAILED,
-            error_class = e.to_string().as_str()
+            error_class = class.as_str(),
+            error_kind = inner.as_deref().unwrap_or("")
         );
     }
 }
 
-/// Runs `f` over the serving core's `InstanceAdmin` on the blocking pool and tells the windows
-/// that settings changed when it succeeded.
+/// The end of every instance command: logs a failure by kind, tells the windows that settings
+/// changed, and answers. The event follows *whatever* core answered: core can commit and then
+/// answer an error (a declined CA dialog after the origin was confirmed, a failed token delete or
+/// table reload after an origin change), and the windows must re-read `settings_get` either way
+/// (M6 T25 review I-1). A call that changed nothing costs one harmless re-read.
+pub fn conclude_instance_call<R: Runtime>(
+    app: &AppHandle<R>,
+    response: Result<InstanceView, CommandError>,
+) -> Result<InstanceView, CommandError> {
+    note_failure(&response);
+    emit_settings_changed(app);
+    finish(app, response)
+}
+
+/// Runs `f` over the serving core's `InstanceAdmin` on the blocking pool, then
+/// [`conclude_instance_call`].
 async fn with_instances<R, F>(app: &AppHandle<R>, f: F) -> Result<InstanceView, CommandError>
 where
     R: Runtime,
@@ -509,11 +543,7 @@ where
         }
         Err(e) => Err(e),
     };
-    note_failure(&response);
-    if response.is_ok() {
-        emit_settings_changed(app);
-    }
-    finish(app, response)
+    conclude_instance_call(app, response)
 }
 
 /// `settings_get {}` (Δ1): the view, the instances, the confinement verdict, the CLI state.
@@ -723,11 +753,23 @@ mod tests {
                "proxy": "", "use_custom_ca": false, "is_default": true})
     }
 
+    /// The hint reaches the page through the page's own copy (`shared/strings.ts`, shown for
+    /// `admin/insecure_scheme`; the wire carries only the kind). The Rust constant, that copy and
+    /// the spec's §7.1 text must be one string: each is read from its file, none is compared with
+    /// itself.
     #[test]
-    fn the_https_hint_is_the_spec_sentence() {
-        assert_eq!(
-            HTTPS_REQUIRED_HINT,
-            "atlas-duck requires https; if your server uses an internal CA, add it as the instance's custom CA"
+    fn the_https_hint_is_the_spec_sentence_and_the_pages_copy() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+        };
+        let spec = read("docs/superpowers/specs/2026-10-07-atlas-duck-design.md");
+        assert!(spec.contains(HTTPS_REQUIRED_HINT), "the spec (7.1) differs");
+        let page = read("app/ui/src/shared/strings.ts");
+        assert!(
+            page.contains(&format!("'{HTTPS_REQUIRED_HINT}'"))
+                || page.contains(&format!("\"{HTTPS_REQUIRED_HINT}\"")),
+            "the page's copy differs"
         );
     }
 
@@ -762,6 +804,11 @@ mod tests {
             ("proxy", json!("proxy:0")),
             ("proxy", json!("http://proxy:8080")),
             ("proxy", json!("p".repeat(PROXY_MAX_BYTES + 1))),
+            ("proxy", json!("a\u{202E}b:8080")),
+            ("proxy", json!("a\u{0}b:80")),
+            ("proxy", json!("pro\txy:80")),
+            ("proxy", json!("pr\u{f8}xy:80")),
+            ("proxy", json!("[\u{ff1a}\u{ff1a}1]:80")),
         ] {
             assert_eq!(
                 field::<InstanceAddArgs>(with(key, bad.clone())),
@@ -925,6 +972,9 @@ mod tests {
             json!([{"key": "unknown_key", "value": 1}]),
             json!([{"key": "legal_hold", "value": true, "extra": 1}]),
             json!([{"key": "attention_mode", "value": "sometimes"}]),
+            // presentation_mode is not a persisted setting (T19 ruling): refused as a key.
+            json!([{"key": "presentation_mode", "value": true}]),
+            json!([{"key": "presentation_mode", "value": "on"}]),
             json!([7]),
             json!(null),
         ] {
@@ -962,6 +1012,37 @@ mod tests {
             pat_open_error(PatOpenError::Instance(AdminError::Unconfirmed)),
             CommandError::Admin(AdminError::Unconfirmed)
         );
+    }
+
+    /// The log line names the inner kind of core's errors (kind-only), skips a declined dialog
+    /// and `not_ready`, and never takes a value: the inner text is `Display`, which is the kind.
+    #[test]
+    fn failures_log_the_outer_and_inner_kind_only() {
+        let class = |e: CommandError| failure_class(&e);
+        assert_eq!(
+            class(CommandError::Admin(AdminError::ConfigReadOnly)),
+            Some(("admin".into(), Some("config_read_only".into())))
+        );
+        assert_eq!(
+            class(CommandError::Settings(SettingsError::Invalid {
+                key: "jira_comments_cap"
+            })),
+            Some(("settings".into(), Some("invalid".into())))
+        );
+        assert_eq!(
+            class(CommandError::Busy),
+            Some(("busy".to_owned(), None::<String>))
+        );
+        assert_eq!(
+            class(CommandError::InvalidArgument { field: "proxy" }),
+            Some(("invalid_argument (proxy)".to_owned(), None))
+        );
+        assert_eq!(class(CommandError::Admin(AdminError::Cancelled)), None);
+        assert_eq!(
+            class(CommandError::Settings(SettingsError::Cancelled)),
+            None
+        );
+        assert_eq!(class(CommandError::NotReady), None);
     }
 
     #[test]
