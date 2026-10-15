@@ -1,5 +1,6 @@
 # Base CI for atlas-duck (spec §13 CI row, §10.1 supply chain).
-# Jobs: rust (3-OS matrix), rust-macos-x86_64-rosetta, core-suite-fedora, supply-chain.
+# Jobs: rust (3-OS matrix), rust-macos-x86_64-rosetta, core-suite-fedora, supply-chain, ui,
+# e2e (Windows + Linux, tauri-driver, M6 T33).
 # Later M1 tasks add steps or jobs to this file.
 name: ci
 
@@ -1284,5 +1285,206 @@ jobs:
       - name: CSP of the built pages
         run: node ci/check-csp.mjs --dist app/ui/dist
 
+      # M6 plan Task 33. The credential-bundle import ban is checked once, above, by the package
+      # script `check:bundle` (= ci/check-credential-bundle.mjs dist); no second invocation here.
+      # The two checks below need only Node and also run in the `rust` job.
+      - name: CSP of the sources and command surface (6.4, C.10, PD-66)
+        run: |
+          set -euo pipefail
+          node ci/check-csp.mjs
+          node ci/check-commands.mjs
+
+      - name: Isolation hook tests (payload allowlist, 2 MiB cap)
+        run: node --test app/isolation/hook.test.mjs
+
       - name: npm audit (spec §10.1)
         run: npm --prefix app/ui audit
+
+  # M6 plan Task 33 (spec §13 UI End to end, UI-06, S-06 to S-09, P-01, S-04): the real debug
+  # `scripted-approver` app driven through tauri-driver (WebView2 via msedgedriver on Windows,
+  # WebKitGTK via WebKitWebDriver under Xvfb on Linux), against the wiremock instance, and the S-04
+  # release build with the debugging variables set. The Windows registry round trip of "Install CLI
+  # to PATH" (`real_registry_round_trip`) is not repeated here: the `rust` job's Windows leg runs it
+  # (it needs no driver). Everything about the drivers is verified by the first CI run only.
+  e2e:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, ubuntu-22.04]
+    env:
+      # tauri-driver is a WebDriver proxy that does not link tauri, so any 2.x pairs with Tauri
+      # 2.12.1. 2.0.6 (2026-05-06) is the release whose --port, --native-port and --native-driver
+      # options the e2e target was written against (2.1.0 is three weeks old); the first run confirms.
+      TAURI_DRIVER_VERSION: "2.0.6"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux system packages (Tauri, D-Bus, Xvfb, WebKitWebDriver)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            dbus-x11 \
+            xvfb \
+            webkit2gtk-driver
+          command -v WebKitWebDriver
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc -vV
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: e2e-${{ matrix.os }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Build the UI (tauri::generate_context! reads app/ui/dist)
+        run: |
+          npm --prefix app/ui ci --ignore-scripts
+          npm --prefix app/ui run build
+
+      - name: Install tauri-driver (exact version, locked)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'tauri-driver'
+          cargo install --locked tauri-driver --version $env:TAURI_DRIVER_VERSION --root $root
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = if ($IsWindows) { Join-Path $root 'bin\tauri-driver.exe' } else { Join-Path $root 'bin/tauri-driver' }
+          if (-not (Test-Path -LiteralPath $exe)) { throw "tauri-driver not found at $exe" }
+          Add-Content -Path $env:GITHUB_ENV -Value "ATLAS_DUCK_TAURI_DRIVER=$exe"
+          Add-Content -Path $env:GITHUB_ENV -Value "ATLAS_DUCK_E2E_ARTIFACTS=$(Join-Path $env:RUNNER_TEMP 'e2e-artifacts')"
+
+      # msedgedriver must match the WebView2 runtime the app loads (not the Edge browser): the
+      # runtime's version is the `pv` value of its EdgeUpdate client. The driver comes from
+      # Microsoft's own endpoint; there is no published hash, so the zip's size is bounded, the
+      # extracted exe must carry a valid Microsoft Authenticode signature, and its --version must
+      # share the runtime's major version. If the exact build is not published, the newest driver of
+      # the same major (LATEST_RELEASE_<major>_WINDOWS) is used. Verifiable only on the first run.
+      - name: Install msedgedriver matching the WebView2 runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $pv = $null
+          foreach ($p in @(
+              "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$guid",
+              "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid",
+              "HKCU:\Software\Microsoft\EdgeUpdate\Clients\$guid")) {
+            if (Test-Path -LiteralPath $p) {
+              $v = (Get-ItemProperty -LiteralPath $p).pv
+              if ($v) { $pv = [string]$v; break }
+            }
+          }
+          if (-not $pv) { throw 'the WebView2 runtime version (EdgeUpdate pv) is not in the registry' }
+          Write-Host "WebView2 runtime version: $pv"
+          $major = $pv.Split('.')[0]
+          $dir = Join-Path $env:RUNNER_TEMP 'msedgedriver'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $zip = Join-Path $dir 'edgedriver_win64.zip'
+          $version = $pv
+          try {
+            Invoke-WebRequest -UseBasicParsing -Uri "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip" -OutFile $zip
+          } catch {
+            Write-Host "no driver for $version ($($_.Exception.Message)); asking for the latest of major $major"
+            $raw = (Invoke-WebRequest -UseBasicParsing -Uri "https://msedgedriver.microsoft.com/LATEST_RELEASE_${major}_WINDOWS").Content
+            if ($raw -is [byte[]]) { $raw = [System.Text.Encoding]::Unicode.GetString($raw) }
+            $version = ($raw -replace '[^0-9.]', '').Trim()
+            if (-not $version) { throw 'LATEST_RELEASE answered no version' }
+            Write-Host "using msedgedriver $version"
+            Invoke-WebRequest -UseBasicParsing -Uri "https://msedgedriver.microsoft.com/$version/edgedriver_win64.zip" -OutFile $zip
+          }
+          $size = (Get-Item -LiteralPath $zip).Length
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          Write-Host "edgedriver_win64.zip: $size bytes, sha256 $sha"
+          if ($size -lt 3MB -or $size -gt 60MB) { throw "edgedriver_win64.zip has an implausible size ($size bytes)" }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dir -Force
+          $exe = Join-Path $dir 'msedgedriver.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw 'msedgedriver.exe is not in the archive' }
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe
+          Write-Host "Authenticode: $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Microsoft Corporation') {
+            throw 'msedgedriver.exe has no valid Microsoft signature'
+          }
+          $out = (& $exe --version) | Out-String
+          Write-Host $out
+          if ($out -notmatch "WebDriver $major\.") { throw "msedgedriver major version differs from the WebView2 runtime ($major)" }
+          Add-Content -Path $env:GITHUB_ENV -Value "ATLAS_DUCK_E2E_NATIVE_DRIVER=$exe"
+
+      - name: e2e (Linux, Xvfb + private session bus)
+        if: runner.os == 'Linux'
+        run: bash ci/e2e-linux.sh
+
+      # pwsh, like the cli_flows Windows steps. --test-threads=1: every flow owns one app and one driver.
+      - name: e2e (Windows, pwsh)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:ATLAS_DUCK_CLI_FLOWS = '1'
+          $env:ATLAS_DUCK_E2E_ALLOW_DRIVER = '1'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'e2e')
+          $log = Join-Path $env:RUNNER_TEMP 'e2e.log'
+          $list = Join-Path $env:RUNNER_TEMP 'e2e.list'
+          $ignored = Join-Path $env:RUNNER_TEMP 'e2e.ignored'
+          cargo @a -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
+          cargo @a -- --list --ignored 2>$null | Set-Content -Path $ignored -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $ignored e2e
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Select-String -Path $log -Pattern '(^|\s)P01 '
+
+      # S-04 (spec §13): the release build, no features, with the debugging variables set, opens no
+      # debug port while a real webview runs (the scripts fail on a vacuous run).
+      - name: Build the release app (S-04, no features)
+        run: cargo build --release -p atlas-duck-app --bin atlas-duck-app --locked
+
+      - name: S-04 no debug port with the inspector variables set (Linux, release build)
+        if: runner.os == 'Linux'
+        run: bash ci/s04-no-debug-port.sh target/release/atlas-duck-app
+
+      - name: S-04 no debug port with the WebView2 variables set (Windows, release build)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./ci/s04-no-debug-port.ps1 -Exe target\release\atlas-duck-app.exe
+
+      # The driver kills tauri-driver only; msedgedriver and an app a failed flow left are killed here.
+      - name: Kill stray driver and app processes
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            for p in atlas-duck-app tauri-driver msedgedriver msedgewebview2; do taskkill //F //IM "$p.exe" >/dev/null 2>&1 || true; done
+          else
+            for p in atlas-duck-app tauri-driver WebKitWebDriver; do pkill -x "$p" || true; done
+          fi
+
+      - name: Upload e2e screenshots and logs
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-artifacts-${{ matrix.os }}
+          path: ${{ runner.temp }}/e2e-artifacts
+          if-no-files-found: ignore
+          retention-days: 7

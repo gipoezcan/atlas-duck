@@ -1,0 +1,211 @@
+name: e2e-bundle
+
+# M6 plan Task 33: the packaged-app GUI runs that need tauri-driver (CI-03 Fedora no-tray-host,
+# CI-04 AppImage M6 steps). They run against a DEBUG `scripted-approver` Linux bundle, built here and
+# not in bundle.yml: a release build scrubs the WebDriver variables from its environment (§2.5, spec
+# §13 S-04) and tauri-driver cannot drive it, and bundle.yml builds shipped artifacts only (its
+# ci/check-release-build.sh refuses --debug, --features and scripted-approver in any
+# `cargo tauri build` line of that file). Nothing built here is ever shipped or uploaded as a
+# bundle-<target> artifact.
+#
+# Jobs:
+#   bundle-linux-e2e      debug scripted-approver rpm + AppImage, tauri-driver built once
+#   fedora-no-tray-host   CI-03: fedora:40 container, Xvfb, session bus without a StatusNotifierWatcher
+#   appimage-m6           CI-04 M6 steps: wizard and Install CLI to PATH through tauri-driver, wrapper, moved AppImage
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  TAURI_CLI_VERSION: "2.12.1"
+  # tauri-driver is a WebDriver proxy that does not link tauri, so any 2.x pairs with Tauri 2.12.1.
+  # 2.0.6 (2026-05-06) is the release whose --port, --native-port and --native-driver options the e2e
+  # target was written against; 2.1.0 (2026-09-26, the crates.io max stable) is three weeks old and
+  # shipped the same day line as 3.0.0-alpha.1, so it was not chosen. First run confirms.
+  TAURI_DRIVER_VERSION: "2.0.6"
+
+jobs:
+  bundle-linux-e2e:
+    name: bundle-linux-e2e (debug scripted-approver rpm + AppImage, tauri-driver)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+      TAURI_CLI_ARCHIVE: cargo-tauri-x86_64-unknown-linux-gnu.tgz
+      TAURI_CLI_SHA256: 04ef3a9a2ed7b7dc479bef08ab40deee80065c99fc778f79ebce775eb72bbeff
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Linux system packages (Tauri build, rpm tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            libxdo-dev \
+            libssl-dev \
+            file \
+            rpm \
+            cpio
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          set -euo pipefail
+          rustup toolchain install
+          rustup show active-toolchain
+          rustc -vV
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: bundle-e2e-${{ env.TARGET }}
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Build the UI (tauri frontendDist)
+        run: |
+          set -euo pipefail
+          npm --prefix app/ui ci --ignore-scripts
+          npm --prefix app/ui run build
+          for page in approvals credential; do test -f "app/ui/dist/$page.html"; done
+
+      - name: Install cargo-tauri (prebuilt release, sha256-pinned)
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/cargo-tauri"
+          mkdir -p "$dest"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$dest/$TAURI_CLI_ARCHIVE" \
+            "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${TAURI_CLI_VERSION}/${TAURI_CLI_ARCHIVE}"
+          echo "${TAURI_CLI_SHA256}  $dest/$TAURI_CLI_ARCHIVE" | sha256sum -c -
+          tar -xzf "$dest/$TAURI_CLI_ARCHIVE" -C "$dest"
+          chmod +x "$dest/cargo-tauri"
+          echo "$dest" >> "$GITHUB_PATH"
+
+      - name: Show the cargo-tauri version
+        run: cargo tauri --version
+
+      - name: Install tauri-driver (exact version, locked)
+        run: |
+          set -euo pipefail
+          cargo install --locked tauri-driver --version "$TAURI_DRIVER_VERSION" --root "$RUNNER_TEMP/tauri-driver"
+          "$RUNNER_TEMP/tauri-driver/bin/tauri-driver" --help | head -n 20
+
+      # Debug profile (debug assertions on: the compile_error! lock of scripted-approver is open
+      # there and only there) with the test-only feature; rpm and AppImage like the shipped bundle.
+      - name: Build the debug scripted-approver rpm and AppImage
+        working-directory: app/src-tauri
+        env:
+          # linuxdeploy and its plug-ins are AppImages themselves; extract-and-run needs no FUSE.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: cargo tauri build --ci --debug --features scripted-approver --target "$TARGET" --bundles rpm,appimage -- --locked
+
+      - name: Stage the artifact (rpm, AppImage, tools/tauri-driver)
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/e2e-bundle"
+          bundle="target/$TARGET/debug/bundle"
+          mkdir -p "$out/rpm" "$out/appimage" "$out/tools"
+          cp "$bundle"/rpm/*.rpm "$out/rpm/"
+          cp "$bundle"/appimage/*.AppImage "$out/appimage/"
+          cp "$RUNNER_TEMP/tauri-driver/bin/tauri-driver" "$out/tools/"
+          ls -lR "$out"
+
+      - name: Upload bundle-linux-e2e
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bundle-linux-e2e
+          path: ${{ runner.temp }}/e2e-bundle
+          if-no-files-found: error
+          retention-days: 7
+
+  fedora-no-tray-host:
+    name: fedora-no-tray-host (fedora:40, Xvfb, no StatusNotifierWatcher, tauri-driver, CI-03)
+    needs: bundle-linux-e2e
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download bundle-linux-e2e
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-linux-e2e
+          path: dist
+
+      # /root is a runner directory, not the container's overlayfs: the app's locality checks (data
+      # dir, keyring dir) fail closed on overlayfs and read the passwd home, which is /root.
+      - name: Install the rpm on Fedora 40 and run the no-tray-host GUI flows
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fedora-root"
+          docker run --rm --volume "$PWD:/work" --volume "$RUNNER_TEMP/fedora-root:/root" --workdir /work fedora:40 \
+            bash ci/fedora-no-tray-host.sh dist
+
+      - name: Container logs (diagnostics)
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/fedora-root" -maxdepth 6 \( -name 'diag.log' -o -name '*-driver.log' \) -print -exec tail -n 60 {} \; 2>/dev/null || true
+
+      - name: Remove the root-owned container files
+        if: always()
+        run: sudo rm -rf "$RUNNER_TEMP/fedora-root"
+
+  appimage-m6:
+    name: appimage-m6 (ubuntu-22.04, FUSE mount, tauri-driver, CI-04 M6 steps)
+    needs: bundle-linux-e2e
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download bundle-linux-e2e
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bundle-linux-e2e
+          path: dist
+
+      - name: Install libfuse2, Xvfb, D-Bus, a Secret Service and the WebKit driver
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libfuse2 xvfb xauth dbus-x11 gnome-keyring libsecret-tools webkit2gtk-driver python3 \
+            libayatana-appindicator3-1 librsvg2-2
+          command -v WebKitWebDriver
+
+      - name: AppImage M6 section (wizard, Install CLI to PATH, wrapper doctor, moved AppImage)
+        run: CI=true bash ci/appimage-smoke.sh --m6 dist
+
+      - name: Kill stray processes
+        if: always()
+        run: |
+          pkill -x atlas-duck-app || true
+          pkill -x tauri-driver || true
+          pkill -x WebKitWebDriver || true

@@ -476,7 +476,7 @@ test("verifyRuns: a real-named run still reports a missing, an extra and a faile
 });
 
 // Jobs added by later milestones: the M1 record is a frozen run and does not list them.
-const LATER_MILESTONE_JOBS = ["core-suite-fedora"];
+const LATER_MILESTONE_JOBS = ["core-suite-fedora", "e2e"];
 
 test("the workflows' job names begin with the ids REQUIRED_WORKFLOWS lists", () => {
   for (const [file, required] of Object.entries(REQUIRED_WORKFLOWS)) {

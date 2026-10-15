@@ -2,6 +2,10 @@
 # written without runner access). Windows, macOS and Rosetta legs exist only in
 # the GitHub workflow.
 #
+# M6: the e2e job (tauri-driver, Windows and Linux), the S-04 release-build step, the Fedora
+# no-tray-host run and the AppImage M6 steps are GitHub-only (ci.yml `e2e`, e2e-bundle.yml): they need
+# a webview driver, Xvfb, a fedora:40 container or a Windows runner, which this mirror does not have.
+#
 # Shape: the `rust:1.95` image has cargo but no Node, the `node:22` image has Node
 # but no cargo. So the UI is built in a Node job whose app/ui/dist is passed as an
 # artifact (tauri::generate_context! needs it at compile time, so clippy and the tests
