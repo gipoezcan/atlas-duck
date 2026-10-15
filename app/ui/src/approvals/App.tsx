@@ -10,6 +10,7 @@ import {
 import { on } from '../shared/ipc/events';
 import type { QueueItem, RecentItem, StatusLine } from '../shared/ipc/types';
 import { DETAIL_TEXT, QUEUE_TEXT, RECENT_TEXT, WINDOW_TITLES } from '../shared/strings';
+import { Batch } from './Batch';
 import { Detail, type DetailHandle } from './Detail';
 import { useWindowInert, WindowInertContext } from './inert';
 import { useChords } from './keyboard';
@@ -120,9 +121,18 @@ export function App() {
   const { ends } = inert;
   const allInertNow = useCallback(() => performance.now() < ends.current.all, [ends]);
   const detail = useRef<DetailHandle>(null);
+  // A batch panel (its confirmation or reason field) or call in progress: the approve chord of the
+  // open item must not fire from there (a chord typed in the reason field, a call in flight).
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const batchEngaged = useRef(false);
+  const onBatchEngaged = useCallback((engaged: boolean) => {
+    batchEngaged.current = engaged;
+  }, []);
   useChords(
     {
-      approve: () => detail.current?.approve(),
+      approve: () => {
+        if (!batchEngaged.current) detail.current?.approve();
+      },
       deny: () => detail.current?.deny(),
       next: () => step(1),
       prev: () => step(-1),
@@ -139,10 +149,18 @@ export function App() {
         </h1>
         {queue.failed ? <p role="alert">{QUEUE_TEXT.load_failed}</p> : null}
         {queue.value !== null ? (
-          <Queue items={queue.value} onOpen={onOpen} selectedId={selected?.item.request_id ?? null} />
+          <Queue
+            items={queue.value}
+            onSelectionChange={setSelectedIds}
+            onOpen={onOpen}
+            selectedId={selected?.item.request_id ?? null}
+          />
         ) : queue.failed ? null : (
           <p role="status">{QUEUE_TEXT.loading}</p>
         )}
+        {queue.value !== null ? (
+          <Batch items={queue.value} selectedIds={selectedIds} onEngagedChange={onBatchEngaged} />
+        ) : null}
         {selected === null || shownItem === undefined ? (
           <p>{DETAIL_TEXT.select_prompt}</p>
         ) : (

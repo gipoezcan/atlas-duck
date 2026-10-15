@@ -11,6 +11,57 @@ export const WINDOW_TITLES = {
   setup: 'Setup',
 } as const;
 
+/** plan text (Task 18): batch approve/release/deny and "deny all pending from this session". */
+export const BATCH_TEXT = {
+  label: 'Batch decision',
+  selected: (n: number) => `${n} selected`,
+  /** The enabled button; Rust shows its own native confirmation afterwards. */
+  review: (n: number) => `Approve or release ${n} selected`,
+  /** spec 5.6 (plan text): flagged items are never part of a batch. */
+  individually: 'approve individually',
+  excluded: 'Not part of the batch',
+  blocked: 'Batch approve is unavailable: open the preview of each selected request first, and every one must be approvable',
+  blocked_unopened: 'preview not opened',
+  blocked_not_approvable: 'not approvable',
+  confirm_title: 'Confirm batch decision',
+  confirm_summary: (parts: string) => `This will ${parts}.`,
+  confirm_note: 'Rust shows a native confirmation next, and rejects the whole batch if any item changed.',
+  confirm: 'Confirm batch',
+  cancel: 'Cancel',
+  deny_selected: 'Deny selected',
+  deny_session: 'Deny all pending from this session',
+  deny_selected_title: (n: number) => `Deny the ${n} selected request${n === 1 ? '' : 's'}`,
+  deny_session_title: 'Deny all pending requests from this session',
+  deny_session_note:
+    'This denies every request of the session that is pending when you press the button, including ones that are not shown here or arrive until then.',
+  deny_reason: 'Reason for the agent',
+  deny_reason_required: 'A reason is required',
+  deny_send: 'Send deny',
+  decided: (n: number) => `${n} decided`,
+  denied: (n: number) => `${n} denied`,
+  /** spec 5.6: the batch is all-or-nothing, a rejection decided nothing. */
+  rejected: 'The batch was rejected and nothing was decided',
+  rejected_unknown: 'The batch was rejected and nothing was decided; the failing items could not be listed',
+  cancelled: 'The batch was cancelled and nothing was decided',
+  failed: 'The batch decision could not be applied; re-read the queue before trying again',
+  deny_failed: 'The deny could not be applied; re-read the queue before trying again',
+  session: 'Session',
+  class_read: ['read', 'reads'],
+  class_write: ['write', 'writes'],
+  class_script: ['script', 'scripts'],
+  class_other: ['other request', 'other requests'],
+} as const;
+
+/** Failure codes of a rejected batch (Rust `BatchFailure`), as the text next to each item. */
+export const BATCH_FAILURE_TEXT: Readonly<Record<string, string>> = {
+  stale: 'stale: its revision changed',
+  not_opened: 'its preview was not opened',
+  not_approvable: 'not approvable (decide it individually)',
+  batch_item_flagged: 'flagged as a possible duplicate or similar request (approve individually)',
+  not_pending: 'no longer pending',
+};
+export const BATCH_FAILURE_UNKNOWN = 'rejected';
+
 /** spec 5.6 (verbatim): the fixed-width badge before every agent-supplied string. */
 export const UNVERIFIED = 'unverified';
 

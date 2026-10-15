@@ -57,6 +57,11 @@ export function queueOrder(items: readonly QueueItem[]): string[] {
   return buildRows(items).flatMap((row) => (row.kind === 'item' ? [row.item.request_id] : []));
 }
 
+/** A row's candidate revision as one comparable string. */
+function revKey(item: QueueItem): string {
+  return `${item.candidate_rev.counter}:${item.candidate_rev.candidate_hash}`;
+}
+
 export function formatAge(seconds: number): string {
   if (seconds < 60) return `${Math.floor(seconds)} s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;
@@ -78,10 +83,16 @@ export function Queue({ items, onSelectionChange, onOpen, selectedId = null }: Q
   const rows = useMemo(() => buildRows(items), [items]);
   const byId = useMemo(() => new Map(items.map((i) => [i.request_id, i])), [items]);
 
-  // An item that left the queue leaves the selection.
+  // The revision each selected row had when it was ticked: batch decisions carry the revision the
+  // user saw, so a row whose revision moved leaves the selection (it must be selected again).
+  const tickedRev = useRef(new Map<string, string>());
+  // An item that left the queue, or changed revision, leaves the selection.
   useEffect(() => {
     setSelected((prev) => {
-      const kept = [...prev].filter((id) => byId.has(id));
+      const kept = [...prev].filter((id) => {
+        const item = byId.get(id);
+        return item !== undefined && revKey(item) === tickedRev.current.get(id);
+      });
       return kept.length === prev.size ? prev : new Set(kept);
     });
   }, [byId]);
@@ -101,8 +112,14 @@ export function Queue({ items, onSelectionChange, onOpen, selectedId = null }: Q
     setSelected((prev) => {
       const next = new Set(prev);
       for (const id of ids) {
-        if (on) next.add(id);
-        else next.delete(id);
+        const item = byId.get(id);
+        if (on && item !== undefined) {
+          next.add(id);
+          tickedRev.current.set(id, revKey(item));
+        } else {
+          next.delete(id);
+          tickedRev.current.delete(id);
+        }
       }
       return next;
     });
