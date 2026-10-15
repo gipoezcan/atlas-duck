@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import previewFixture from '../shared/ipc/fixtures/preview.json';
 import queueDetailFixture from '../shared/ipc/fixtures/queue_detail.json';
@@ -14,6 +14,7 @@ import type {
   RawPage,
 } from '../shared/ipc/types';
 import { Detail } from './Detail';
+import { INERT_MS } from './inert';
 
 vi.mock('../shared/ipc/invoke', () => ({
   previewFetch: vi.fn(),
@@ -57,15 +58,34 @@ function actionNames(): string[] {
     .map((b) => b.textContent ?? '');
 }
 
+/** Lets the 1 s approve/release inert period of a newly displayed candidate run out (spec 5.6). */
+function pastInert() {
+  act(() => {
+    vi.advanceTimersByTime(INERT_MS);
+  });
+}
+
 async function opened(kind: string, over: Record<string, unknown> = {}) {
   mockedPreview.mockResolvedValue(responseOf(kind, over));
   const view = render(<Detail item={item} openToken={1} />);
-  await screen.findByTitle('Preview');
+  // The mocked answer resolves inside act, so the render it causes and that render's effects (the
+  // inert period's timer) are flushed before the clock moves.
+  await act(async () => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  });
+  screen.getByTitle('Preview');
+  pastInert();
   return view;
 }
 
 beforeEach(() => {
   vi.resetAllMocks();
+  // Fake clock (the inert periods), still advancing with real time so findBy/waitFor poll.
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe('Detail', () => {
@@ -137,8 +157,12 @@ describe('Detail', () => {
     // Until the queue re-read brings rev 2, nothing can be sent against rev 1.
     expect(screen.queryByRole('button', { name: 'Release status only' })).toBeNull();
     rerender(<Detail item={item2} openToken={1} />);
+    // rev 2 is a newly displayed candidate: its controls start inert (T14 review I3 ruling).
+    const second = await screen.findByRole('button', { name: 'Release status only' });
+    expect((second as HTMLButtonElement).disabled).toBe(true);
+    pastInert();
     mockedDecide.mockResolvedValueOnce({ request_id: item.request_id, status: 'released' });
-    fireEvent.click(await screen.findByRole('button', { name: 'Release status only' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Release status only' }));
     await waitFor(() => expect(mockedDecide).toHaveBeenCalledTimes(2));
     expect(mockedDecide.mock.calls[1]?.[0]).toEqual({
       request_id: item.request_id,
@@ -209,6 +233,7 @@ describe('Detail', () => {
     expect(actionNames()).toEqual(['Deny']);
     mockedDecide.mockResolvedValue({ request_id: item.request_id, status: 'denied' });
     fireEvent.click(screen.getByRole('button', { name: 'Deny' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Send deny' }));
     await waitFor(() => expect(mockedDecide).toHaveBeenCalled());
     expect(mockedDecide.mock.calls[0]?.[0]).toMatchObject({
       decision: 'deny',

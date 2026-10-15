@@ -10,8 +10,10 @@ import {
 import { on } from '../shared/ipc/events';
 import type { QueueItem, RecentItem, StatusLine } from '../shared/ipc/types';
 import { DETAIL_TEXT, QUEUE_TEXT, RECENT_TEXT, WINDOW_TITLES } from '../shared/strings';
-import { Detail } from './Detail';
-import { Queue } from './Queue';
+import { Detail, type DetailHandle } from './Detail';
+import { useWindowInert, WindowInertContext } from './inert';
+import { useChords } from './keyboard';
+import { Queue, queueOrder } from './Queue';
 import { Recent } from './Recent';
 
 /**
@@ -63,7 +65,9 @@ const STATUS_EVENTS = ['status_banner', 'needs_attention_changed'] as const;
 
 /**
  * The Approvals window. Auto-display of a new request renders the queue only: nothing here calls
- * `preview_fetch` (spec 5.6 "Opened"); a preview opens on explicit user navigation (Task 14).
+ * `preview_fetch` (spec 5.6 "Opened"); a preview opens on explicit user navigation (a row's Open
+ * button or the next/prev chord). The window owns the keyboard (`useChords`) and the focus inert
+ * periods (`useWindowInert`); a decision never moves the selection (no auto-advance).
  */
 export function App() {
   const queue = useReloaded<QueueItem[]>(queueList, QUEUE_EVENTS);
@@ -89,6 +93,7 @@ export function App() {
     () => new Map((queue.value ?? []).map((i) => [i.request_id, i])),
     [queue.value],
   );
+  const order = useMemo(() => queueOrder(queue.value ?? []), [queue.value]);
   const onOpen = useCallback(
     (id: string) => {
       const item = byId.get(id);
@@ -100,11 +105,38 @@ export function App() {
   // Keep the last known row of a request that left the queue (a decided item stays selected).
   const shownItem = current ?? selected?.item;
 
+  // Next/prev is an explicit navigation: it opens the neighbour in the queue's display order,
+  // which fetches its preview and starts its inert period (spec 5.6).
+  const step = (delta: 1 | -1) => {
+    if (order.length === 0) return;
+    const at = selected === null ? -1 : order.indexOf(selected.item.request_id);
+    const to = at === -1 ? (delta === 1 ? 0 : order.length - 1) : at + delta;
+    const id = order[to];
+    if (id !== undefined) onOpen(id);
+  };
+
+  const heading = useRef<HTMLHeadingElement>(null);
+  const inert = useWindowInert(heading);
+  const { ends } = inert;
+  const allInertNow = useCallback(() => Date.now() < ends.current.all, [ends]);
+  const detail = useRef<DetailHandle>(null);
+  useChords(
+    {
+      approve: () => detail.current?.approve(),
+      deny: () => detail.current?.deny(),
+      next: () => step(1),
+      prev: () => step(-1),
+    },
+    allInertNow,
+  );
+
   return (
-    <>
+    <WindowInertContext.Provider value={inert}>
       <Header lines={status.value ?? []} />
       <main>
-        <h1>{WINDOW_TITLES.approvals}</h1>
+        <h1 ref={heading} tabIndex={-1}>
+          {WINDOW_TITLES.approvals}
+        </h1>
         {queue.failed ? <p role="alert">{QUEUE_TEXT.load_failed}</p> : null}
         {queue.value !== null ? (
           <Queue items={queue.value} onOpen={onOpen} selectedId={selected?.item.request_id ?? null} />
@@ -116,6 +148,7 @@ export function App() {
         ) : (
           <Detail
             key={selected.item.request_id}
+            ref={detail}
             item={shownItem}
             openToken={selected.token}
             gone={current === undefined}
@@ -128,6 +161,6 @@ export function App() {
           <p role="status">{RECENT_TEXT.loading}</p>
         )}
       </main>
-    </>
+    </WindowInertContext.Provider>
   );
 }

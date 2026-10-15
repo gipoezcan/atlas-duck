@@ -99,6 +99,31 @@ export const DETAIL_TEXT = {
     'agent receives `failed` (exit 6), `result_too_large` / `upstream_network` / `upstream_unavailable` and a fixed hint; no size',
 } as const;
 
+/** plan text (PD-91): the keyboard legend of the decision bar. */
+export const KEYBOARD_TEXT = {
+  legend_label: 'Keyboard',
+  approve: 'Ctrl/Cmd+Shift+Enter: approve or release',
+  deny: 'Ctrl/Cmd+Shift+D: deny',
+  navigate: 'Ctrl/Cmd+Shift+Down / Up: next / previous request',
+} as const;
+
+/** spec 5.6 (Enter submits, Esc cancels), plan text (Task 15, PD-70): the deny reason field and its hint offers. */
+export const DENY_TEXT = {
+  label: 'Deny this request',
+  reason: 'Reason for the agent',
+  submit: 'Send deny',
+  cancel: 'Cancel',
+  keys: 'Enter sends the deny, Esc cancels',
+  offers: 'Attach a hint',
+  upstream_http: 'the upstream HTTP status',
+  upstream_http_detail: 'include the upstream error messages',
+  outcome_hint: 'the outcome class with its fixed message (no size)',
+  resolution_failed: 'the unresolved name (param, value, message)',
+  resolution_failed_detail: 'include the candidate names',
+  missing_fields: 'the missing required fields',
+  missing_fields_detail: 'include the allowed values',
+} as const;
+
 /** plan text (Task 14): the Raw pager. */
 export const RAW_TEXT = {
   label: 'Raw',

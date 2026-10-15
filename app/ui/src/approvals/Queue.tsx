@@ -52,6 +52,11 @@ export function buildRows(items: readonly QueueItem[]): Row[] {
   });
 }
 
+/** The request ids in the order the queue shows them (next/prev follows it). */
+export function queueOrder(items: readonly QueueItem[]): string[] {
+  return buildRows(items).flatMap((row) => (row.kind === 'item' ? [row.item.request_id] : []));
+}
+
 export function formatAge(seconds: number): string {
   if (seconds < 60) return `${Math.floor(seconds)} s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)} min`;

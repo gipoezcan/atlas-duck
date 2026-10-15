@@ -1,8 +1,19 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type ReactNode,
+  type Ref,
+} from 'react';
 
-import { decide, previewFetch, type DecideArgs } from '../shared/ipc/invoke';
+import { decide, previewFetch, type DenyDetails } from '../shared/ipc/invoke';
 import type { PreviewFetchResponse, QueueItem } from '../shared/ipc/types';
 import { CLASS_LABELS, DETAIL_TEXT, STATUS_LABELS } from '../shared/strings';
+import { cardOf, DecisionBar, type DecisionArgs } from './DecisionBar';
+import { DenyDialog } from './DenyDialog';
+import { candidateKey, useInert } from './inert';
 import { PreviewFrame } from './PreviewFrame';
 import { RawPager } from './RawPager';
 import { RequestTab } from './RequestTab';
@@ -15,16 +26,6 @@ const TABS: readonly { id: TabId; label: string }[] = [
   { id: 'raw', label: DETAIL_TEXT.tab_raw },
   { id: 'request', label: DETAIL_TEXT.tab_request },
 ];
-
-/** The redaction a "Release status only" sends (I-38): core's own preset, no text from the UI. */
-const STATUS_ONLY: Record<string, unknown>[] = [{ preset: 'status_only' }];
-
-/** Body kinds whose card allows Deny only; Approve is shown disabled (spec 6.3, 5.4 step 2). */
-const DENY_ONLY_KINDS: ReadonlySet<string> = new Set([
-  'enrichment_error',
-  'unresolved_name',
-  'conflict',
-]);
 
 type OpenState =
   | { kind: 'idle' }
@@ -39,17 +40,26 @@ export interface StructuredSlotProps {
   response: PreviewFetchResponse;
 }
 
+/** What the window's chords run on the displayed request (`useChords` in `App`). */
+export interface DetailHandle {
+  /** The card's first positive action, under the same checks as its button. */
+  approve: () => void;
+  /** Opens the deny reason field (or focuses it again). */
+  deny: () => void;
+}
+
 interface DetailProps {
   item: QueueItem;
   /**
-   * Bumped only by an explicit user open (a row click): each change opens the preview. Selection
-   * and queue re-reads never change it, so they never fetch (spec 5.6 "Opened").
+   * Bumped only by an explicit user open (a row click, next/prev): each change opens the preview.
+   * Selection and queue re-reads never change it, so they never fetch (spec 5.6 "Opened").
    */
   openToken?: number;
   /** The request left the queue (decided, expired, cancelled): `item` is its last known row and nothing can be opened. */
   gone?: boolean;
   /** The Structured tab body (reads: redaction controls, writes: the edit form). */
   renderStructured?: (props: StructuredSlotProps) => ReactNode;
+  ref?: Ref<DetailHandle>;
 }
 
 /** The text of a `release_blocked` rejection, which Rust generates; every other error is one fixed text. */
@@ -62,18 +72,23 @@ function blockedText(e: unknown): string | null {
 }
 
 /**
- * The Approvals detail pane: Preview / Structured / Raw / Request tabs and the card actions of the
- * opened revision. Nothing here fetches a preview except `open()`, which runs on the Open button or
- * an `openToken` bump. Decision controls beyond the card buttons (opened flag gating, inert
- * periods, chords, the deny dialog) are Task 15.
+ * The Approvals detail pane: Preview / Structured / Raw / Request tabs and the decision controls
+ * of the opened revision. Nothing here fetches a preview except `open()`, which runs on the Open
+ * button or an `openToken` bump. Every decision goes through `send()`, which re-checks what the
+ * controls show (spec 5.6): a positive decision needs the displayed revision opened, approvable
+ * per Rust, not inert, and nothing in flight. Rust checks all of it again (spec 2.4).
  */
-export function Detail({ item, openToken = 0, gone = false, renderStructured }: DetailProps) {
+export function Detail({ item, openToken = 0, gone = false, renderStructured, ref }: DetailProps) {
   const [tab, setTab] = useState<TabId>('preview');
   const [state, setState] = useState<OpenState>({ kind: 'idle' });
   const [actionFailed, setActionFailed] = useState(false);
   const [decided, setDecided] = useState<string | null>(null);
-  /** A `decide` is in flight: every decision button is disabled until it answers. */
+  /** A `decide` is in flight: every decision control is disabled until it answers. */
   const [busy, setBusy] = useState(false);
+  const inFlight = useRef(false);
+  const [denyOpen, setDenyOpen] = useState(false);
+  const [denyFocus, setDenyFocus] = useState(0);
+  const heading = useRef<HTMLHeadingElement>(null);
   const latest = useRef(0);
 
   const open = useCallback(() => {
@@ -81,6 +96,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
     setState({ kind: 'loading' });
     setActionFailed(false);
     setDecided(null);
+    setDenyOpen(false);
     previewFetch(item.request_id).then(
       (response) => {
         if (mine !== latest.current) return;
@@ -106,20 +122,46 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
       ? state.response
       : null;
   const stale = state.kind === 'open' && shown === null;
+  const displayed = candidateKey(
+    item.request_id,
+    shown === null ? null : shown.preview.candidate_rev,
+  );
+  const inert = useInert(displayed);
 
-  const send = (args: Omit<DecideArgs, 'request_id' | 'candidate_rev'>) => {
+  const releaseBlocked =
+    state.kind === 'blocked' ? state.text : (shown?.preview.header.release_blocked ?? null);
+  const card = gone || shown === null ? null : cardOf(shown.preview);
+  const canDeny = !gone && (shown !== null || releaseBlocked !== null);
+  const positiveEnabled =
+    shown !== null && shown.preview.approvable && !busy && !denyOpen && !inert.approveInert;
+
+  const send = (args: DecisionArgs) => {
+    if (inFlight.current || gone) return;
+    if (args.decision === 'deny') {
+      if (!canDeny) return;
+    } else if (
+      shown === null ||
+      !shown.preview.approvable ||
+      releaseBlocked !== null ||
+      denyOpen ||
+      inert.approveInertNow()
+    ) {
+      return;
+    }
     const rev = shown?.preview.candidate_rev ?? item.candidate_rev;
-    if (busy) return;
+    inFlight.current = true;
     setBusy(true);
     setActionFailed(false);
     decide({ request_id: item.request_id, candidate_rev: rev, ...args }).then(
       (outcome) => {
+        inFlight.current = false;
         setBusy(false);
+        setDenyOpen(false);
         if (outcome.status === 'pending') {
           // A redaction made a new revision (I-38). Ruling (T14 review I3): the fetch below
           // follows the user's own "Release status only" press, so it is not a navigation the user
-          // did not ask for; the new revision is displayed, and the second press of the same button
-          // sends that displayed revision. T15's inert window must cover this candidate change.
+          // did not ask for. The new revision is displayed once the queue re-read brings it, and
+          // `useInert` starts the inert period then, as for any displayed candidate change.
           open();
         } else {
           // No auto-advance: the decided item stays selected, its preview is cleared, nothing is fetched.
@@ -129,6 +171,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
         }
       },
       (e: unknown) => {
+        inFlight.current = false;
         setBusy(false);
         const text = blockedText(e);
         if (text !== null) setState({ kind: 'blocked', text });
@@ -137,95 +180,33 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
     );
   };
 
-  const kind = shown?.preview.body.kind;
-  const releaseBlocked =
-    state.kind === 'blocked' ? state.text : (shown?.preview.header.release_blocked ?? null);
-  const approvable = shown?.preview.approvable === true;
-  const isWrite = shown?.preview.header.class === 'write';
-  const status =
-    shown !== null && typeof shown.preview.body.status === 'number' ? shown.preview.body.status : null;
+  const openDeny = () => {
+    if (!canDeny) return;
+    setDenyOpen(true);
+    setDenyFocus((n) => n + 1);
+  };
 
-  const denyButton = (
-    <button type="button" disabled={busy} onClick={() => send({ decision: 'deny' })}>
-      {DETAIL_TEXT.deny}
-    </button>
-  );
-  const lines = (...parts: (string | null)[]) => (
-    <ul className="consequences">
-      {parts.map((p) => (p === null ? null : <li key={p}>{p}</li>))}
-    </ul>
-  );
-  const withStatus = (s: string) => s.replace('<status>', String(status ?? ''));
+  const sendDeny = (reason: string | undefined, details: DenyDetails | undefined) => {
+    send({
+      decision: 'deny',
+      ...(reason === undefined ? {} : { reason }),
+      ...(details === undefined ? {} : { deny_details: details }),
+    });
+  };
 
-  let actions: ReactNode;
-  if (gone) {
-    actions = null;
-  } else if (releaseBlocked !== null) {
-    actions = denyButton;
-  } else if (shown === null || gone) {
-    actions = null;
-  } else if (kind === 'upstream_error') {
-    actions = (
-      <>
-        <button
-          type="button"
-          disabled={!approvable || busy}
-          onClick={() => send({ decision: 'release' })}
-        >
-          {DETAIL_TEXT.release}
-        </button>
-        <button
-          type="button"
-          disabled={!approvable || busy}
-          onClick={() => send({ decision: 'release_redacted', redactions: STATUS_ONLY })}
-        >
-          {DETAIL_TEXT.release_status_only}
-        </button>
-        {denyButton}
-        {lines(
-          withStatus(DETAIL_TEXT.consequence_release),
-          withStatus(DETAIL_TEXT.consequence_status_only),
-          DETAIL_TEXT.consequence_deny,
-        )}
-      </>
-    );
-  } else if (kind === 'outcome') {
-    actions = (
-      <>
-        <button
-          type="button"
-          disabled={!approvable || busy}
-          onClick={() => send({ decision: 'release' })}
-        >
-          {DETAIL_TEXT.release_outcome}
-        </button>
-        {denyButton}
-        {lines(DETAIL_TEXT.consequence_release_outcome, DETAIL_TEXT.consequence_deny)}
-      </>
-    );
-  } else if (kind !== undefined && DENY_ONLY_KINDS.has(kind)) {
-    actions = (
-      <>
-        <button type="button" disabled>
-          {DETAIL_TEXT.approve}
-        </button>
-        {denyButton}
-      </>
-    );
-  } else {
-    actions = (
-      <>
-        <button
-          type="button"
-          disabled={!approvable || busy}
-          onClick={() => send({ decision: isWrite ? 'approve' : 'release' })}
-        >
-          {isWrite ? DETAIL_TEXT.approve : DETAIL_TEXT.release}
-        </button>
-        {denyButton}
-      </>
-    );
-  }
+  const cancelDeny = () => {
+    setDenyOpen(false);
+    heading.current?.focus();
+  };
+
+  // The chord runs the first positive action through `send()`, the same gate as the button.
+  useImperativeHandle(ref, () => ({
+    approve: () => {
+      const primary = card?.positives[0];
+      if (primary !== undefined) send(primary.args);
+    },
+    deny: openDeny,
+  }));
 
   const needsOpen = shown === null && state.kind !== 'loading';
   const panel = (): ReactNode => {
@@ -255,7 +236,9 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
 
   return (
     <article className="detail" aria-label={DETAIL_TEXT.heading}>
-      <h2>{DETAIL_TEXT.heading}</h2>
+      <h2 ref={heading} tabIndex={-1}>
+        {DETAIL_TEXT.heading}
+      </h2>
       <p className="detail-summary">
         <span className="op-id">{item.op_id}</span> <span className="alias">{item.instance_alias}</span>{' '}
         <span className="target">{item.target_display}</span>{' '}
@@ -273,9 +256,27 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured }: 
       ) : null}
       {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${STATUS_LABELS[decided] ?? decided}`}</p>}
       {actionFailed ? <p role="alert">{DETAIL_TEXT.action_failed}</p> : null}
-      <div className="detail-actions" role="group" aria-label={DETAIL_TEXT.actions_label}>
-        {actions}
-      </div>
+      <DecisionBar
+        card={card}
+        canDeny={canDeny}
+        positiveEnabled={positiveEnabled}
+        busy={busy}
+        onPositive={send}
+        onDeny={openDeny}
+        denyDialog={
+          denyOpen && canDeny ? (
+            <DenyDialog
+              key={displayed ?? 'blocked'}
+              offers={shown?.preview.deny_offers ?? []}
+              prefill={shown?.preview.deny_prefill ?? null}
+              busy={busy}
+              focusToken={denyFocus}
+              onSubmit={sendDeny}
+              onCancel={cancelDeny}
+            />
+          ) : null
+        }
+      />
       <div role="tablist" aria-label={DETAIL_TEXT.tabs_label}>
         {TABS.map((t) => (
           <button
