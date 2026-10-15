@@ -277,7 +277,9 @@ jobs:
       # exact name that matches nothing would pass with zero tests, so the log must show the one pass.
       - name: App CLI install registry round trip (Windows, HKCU scratch key, #[ignore]d)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
           $log = Join-Path $env:RUNNER_TEMP 'cli-install-registry.log'
           cargo test -p atlas-duck-app --features scripted-approver --locked --lib -- --ignored --exact cli_install::windows::tests::real_registry_round_trip --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
