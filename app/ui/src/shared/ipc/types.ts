@@ -311,6 +311,27 @@ export interface SettingsGet {
   cli_installed: boolean;
 }
 
+/** One `settings_apply` change, in core's closed `{key, value}` form (`SettingChangeReq`). */
+export type SettingChange =
+  | { key: 'jira_comments_cap'; value: number }
+  | { key: 'candidate_cache_mb'; value: number }
+  | { key: 'max_pending_bytes_mb'; value: number | null }
+  | { key: 'expiry_hours'; value: number }
+  | { key: 'attention_mode'; value: AttentionMode }
+  | { key: 'retention_days'; value: number }
+  | { key: 'legal_hold'; value: boolean };
+
+/** `instance_add`: no CA bytes or path ever (`use_custom_ca` makes Rust open its own file dialog). */
+export interface InstanceAddArgs {
+  alias: string;
+  product: 'jira' | 'confluence';
+  base_url: string;
+  /** `""` (the OS setting), `direct` or `host:port`. */
+  proxy: string;
+  use_custom_ca: boolean;
+  is_default: boolean;
+}
+
 /** `retest_token`: "Connected as <user>" or a fixed failure class (`conn` for tls/proxy/network). */
 export type RetestOutcome =
   | {

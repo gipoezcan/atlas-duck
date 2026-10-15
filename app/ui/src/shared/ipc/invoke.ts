@@ -5,13 +5,20 @@ import type {
   CandidateRev,
   DecisionOutcome,
   DenyCount,
+  InstanceAddArgs,
+  InstanceView,
   PreviewFetchResponse,
+  PruneReport,
   QueueDetail,
   QueueItem,
   RawPage,
   RecentItem,
   RedactionOp,
   RedactionReport,
+  RetestOutcome,
+  SettingChange,
+  SettingsGet,
+  SettingsView,
   StatusLine,
 } from './types';
 import {
@@ -19,12 +26,17 @@ import {
   isBatchOutcome,
   isDecisionOutcome,
   isDenyCount,
+  isInstanceView,
   isPreviewFetchResponse,
+  isPruneReport,
   isQueueDetail,
   isQueueItem,
   isRawPage,
   isRecentItem,
   isRedactionReport,
+  isRetestOutcome,
+  isSettingsGet,
+  isSettingsView,
   isStatusLine,
   toCommandError,
   type Validator,
@@ -149,6 +161,49 @@ export function previewFetch(
       : { request_id: requestId, candidate_rev: candidateRev },
     isPreviewFetchResponse,
   );
+}
+
+export function settingsGet(): Promise<SettingsGet> {
+  return call('settings_get', {}, isSettingsGet);
+}
+
+export function settingsApply(changes: SettingChange[]): Promise<SettingsView> {
+  return call('settings_apply', { changes }, isSettingsView);
+}
+
+export function instanceAdd(args: InstanceAddArgs): Promise<InstanceView> {
+  return call('instance_add', { ...args }, isInstanceView);
+}
+
+export function instanceChangeUrl(alias: string, newUrl: string): Promise<InstanceView> {
+  return call('instance_change_url', { alias, new_url: newUrl }, isInstanceView);
+}
+
+export function instanceConfirmConfig(alias: string): Promise<InstanceView> {
+  return call('instance_confirm_config', { alias }, isInstanceView);
+}
+
+export function instanceAcceptUrlChange(alias: string): Promise<InstanceView> {
+  return call('instance_accept_url_change', { alias }, isInstanceView);
+}
+
+export function instanceSetProxy(alias: string, proxy: string): Promise<InstanceView> {
+  return call('instance_set_proxy', { alias, proxy }, isInstanceView);
+}
+
+export function credentialWindowOpen(
+  alias: string,
+  purpose: 'add_pat' | 'replace_pat',
+): Promise<null | undefined> {
+  return call('credential_window_open', { alias, purpose }, isNothing);
+}
+
+export function retestToken(alias: string): Promise<RetestOutcome> {
+  return call('retest_token', { alias }, isRetestOutcome);
+}
+
+export function pruneBacklogNow(): Promise<PruneReport> {
+  return call('prune_backlog_now', {}, isPruneReport);
 }
 
 export function rawPage(
