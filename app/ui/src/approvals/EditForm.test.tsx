@@ -512,6 +512,24 @@ describe('write edit form (spec 5.4 step 4)', () => {
     expect(screen.getByText('“short”')).toBeTruthy();
   });
 
+  it('a_batch_does_not_decide_a_request_whose_form_holds_unsent_edits', async () => {
+    mockWindow([{ ...WRITE, opened: true }]);
+    await openStructured([SUMMARY]);
+    change(field(/Summary/), 'Edited');
+    fireEvent.click(screen.getByRole('checkbox', { name: /^select jira.issue.create/ }));
+    advance(INERT_MS);
+    const batch = screen.getByRole('region', { name: 'Batch decision' });
+    expect(batch.querySelector('.batch-blocked')?.textContent).toContain('unsent edits or redactions');
+    expect((within(batch).getByRole('button', { name: /^Approve or release/ }) as HTMLButtonElement).disabled).toBe(true);
+    // Reset gives the batch back after the inert period.
+    fireEvent.click(screen.getByRole('button', { name: 'Reset edits' }));
+    advance(INERT_MS);
+    expect(batch.querySelector('.batch-blocked')).toBeNull();
+    expect((within(batch).getByRole('button', { name: 'Approve or release 1 selected' }) as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+  });
+
   it('unsent_edits_keep_the_revisions_own_approve_off', async () => {
     const keys = new Keyboard();
     await openStructured([SUMMARY]);

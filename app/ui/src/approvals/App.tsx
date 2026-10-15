@@ -128,6 +128,11 @@ export function App() {
   const onBatchEngaged = useCallback((engaged: boolean) => {
     batchEngaged.current = engaged;
   }, []);
+  // The open request whose card holds unsent edits or redactions; a batch must not decide it.
+  const [unsentId, setUnsentId] = useState<string | null>(null);
+  const onUnsentChange = useCallback((id: string, unsent: boolean) => {
+    setUnsentId((cur) => (unsent ? id : cur === id ? null : cur));
+  }, []);
   useChords(
     {
       approve: () => {
@@ -159,7 +164,12 @@ export function App() {
           <p role="status">{QUEUE_TEXT.loading}</p>
         )}
         {queue.value !== null ? (
-          <Batch items={queue.value} selectedIds={selectedIds} onEngagedChange={onBatchEngaged} />
+          <Batch
+            items={queue.value}
+            selectedIds={selectedIds}
+            unsentId={unsentId}
+            onEngagedChange={onBatchEngaged}
+          />
         ) : null}
         {selected === null || shownItem === undefined ? (
           <p>{DETAIL_TEXT.select_prompt}</p>
@@ -170,6 +180,7 @@ export function App() {
             item={shownItem}
             openToken={selected.token}
             gone={current === undefined}
+            onUnsentChange={onUnsentChange}
           />
         )}
         {recent.failed ? <p role="alert">{RECENT_TEXT.load_failed}</p> : null}

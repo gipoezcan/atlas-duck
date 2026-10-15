@@ -21,13 +21,14 @@ export interface BatchSplit {
   /** Flagged "possible duplicate" / "similar request": never in a batch, decided individually. */
   flagged: QueueItem[];
   /** Unflagged but not opened or not approvable: they keep the whole batch disabled. */
-  blocked: { item: QueueItem; why: 'unopened' | 'not_approvable' }[];
+  blocked: { item: QueueItem; why: 'unopened' | 'not_approvable' | 'unsent' }[];
 }
 
-export function splitSelection(selected: readonly QueueItem[]): BatchSplit {
+export function splitSelection(selected: readonly QueueItem[], unsentId: string | null = null): BatchSplit {
   const out: BatchSplit = { eligible: [], flagged: [], blocked: [] };
   for (const item of selected) {
     if (isFlagged(item)) out.flagged.push(item);
+    else if (item.request_id === unsentId) out.blocked.push({ item, why: 'unsent' });
     else if (!item.opened) out.blocked.push({ item, why: 'unopened' });
     else if (!item.approvable) out.blocked.push({ item, why: 'not_approvable' });
     else out.eligible.push(item);
@@ -36,7 +37,7 @@ export function splitSelection(selected: readonly QueueItem[]): BatchSplit {
 }
 
 /** Everything a batch decision depends on, so that any change of it closes an open confirmation. */
-function signature(selected: readonly QueueItem[]): string | null {
+function signature(selected: readonly QueueItem[], unsentId: string | null): string | null {
   if (selected.length === 0) return null;
   return selected
     .map((i) =>
@@ -49,6 +50,7 @@ function signature(selected: readonly QueueItem[]): string | null {
         i.possible_duplicate_of,
         i.similar_to,
         i.class,
+        i.request_id === unsentId,
       ].join(':'),
     )
     .join('|');
@@ -60,14 +62,13 @@ const plural = (n: number, [one, many]: readonly [string, string]) => `${n} ${n 
 export function classSummary(items: readonly QueueItem[]): string {
   const count = (cls: string) => items.filter((i) => i.class === cls).length;
   const reads = count('read');
-  const writes = count('write');
   const scripts = count('script');
-  const other = items.length - reads - writes - scripts;
+  // Like the native dialog: every request that is neither a read nor a script counts as a write.
+  const writes = items.length - reads - scripts;
   const parts: string[] = [];
   if (reads > 0) parts.push(`release ${plural(reads, BATCH_TEXT.class_read)}`);
   if (scripts > 0) parts.push(`release ${plural(scripts, BATCH_TEXT.class_script)}`);
   if (writes > 0) parts.push(`approve ${plural(writes, BATCH_TEXT.class_write)}`);
-  if (other > 0) parts.push(`decide ${plural(other, BATCH_TEXT.class_other)}`);
   return `${plural(items.length, ['request', 'requests'])}: ${parts.join(', ')}`;
 }
 
@@ -82,6 +83,7 @@ type Names = ReadonlyMap<string, string>;
 type Result =
   | { kind: 'decided'; items: { request_id: string; status: string }[]; names: Names }
   | { kind: 'denied'; count: number }
+  | { kind: 'nothing_pending' }
   | { kind: 'rejected'; failed: { request_id: string; code: string }[] | null; names: Names }
   | { kind: 'cancelled' }
   | { kind: 'failed'; deny: boolean };
@@ -114,6 +116,8 @@ interface BatchProps {
   items: readonly QueueItem[];
   /** The ids `Queue` reports as selected; an id the queue no longer holds is ignored. */
   selectedIds: readonly string[];
+  /** The open request whose card holds unsent edits or redactions: a batch would drop them, so it is blocked. */
+  unsentId?: string | null;
   /** Whether a panel is open or a batch call is running (the window then ignores its approve chord). */
   onEngagedChange?: (engaged: boolean) => void;
 }
@@ -131,13 +135,13 @@ interface BatchProps {
  * - Deny (of the selection, or of a whole session) takes one reason and has no dialog.
  * - A call in flight blocks every other one; nothing advances on its own.
  */
-export function Batch({ items, selectedIds, onEngagedChange }: BatchProps) {
+export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: BatchProps) {
   const selected = useMemo(() => {
     const ids = new Set(selectedIds);
     return items.filter((i) => ids.has(i.request_id));
   }, [items, selectedIds]);
-  const sig = useMemo(() => signature(selected), [selected]);
-  const split = useMemo(() => splitSelection(selected), [selected]);
+  const sig = useMemo(() => signature(selected, unsentId), [selected, unsentId]);
+  const split = useMemo(() => splitSelection(selected, unsentId), [selected, unsentId]);
 
   const [panel, setPanel] = useState<Panel | null>(null);
   const [result, setResult] = useState<Result | null>(null);
@@ -257,13 +261,21 @@ export function Batch({ items, selectedIds, onEngagedChange }: BatchProps) {
         setReason('');
         setResult({ kind: 'denied', count: r.denied });
       },
-      () => {
+      (e: unknown) => {
         inFlight.current = false;
         setBusy(false);
         setPanel(null);
-        setResult({ kind: 'failed', deny: true });
+        const none = open.scope.session !== null && (e as { kind?: unknown } | null)?.kind === 'not_found';
+        setResult(none ? { kind: 'nothing_pending' } : { kind: 'failed', deny: true });
       },
     );
+  };
+
+  // No single key decides (T15, spec 5.6): Enter never activates Confirm, so one held or typed Enter
+  // cannot pass this step and the native dialog that opens under it. Space acts on key-up, after the
+  // key is up; auto-repeat is ignored for every key.
+  const onConfirmKey = (e: KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === 'Enter' || e.repeat) e.preventDefault();
   };
 
   const onReasonKey = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -318,7 +330,11 @@ export function Batch({ items, selectedIds, onEngagedChange }: BatchProps) {
                 {split.blocked.map(({ item, why }) => (
                   <li key={item.request_id}>
                     {item.op_id} {item.target_display}:{' '}
-                    {why === 'unopened' ? BATCH_TEXT.blocked_unopened : BATCH_TEXT.blocked_not_approvable}
+                    {why === 'unopened'
+                      ? BATCH_TEXT.blocked_unopened
+                      : why === 'unsent'
+                        ? BATCH_TEXT.blocked_unsent
+                        : BATCH_TEXT.blocked_not_approvable}
                   </li>
                 ))}
               </ul>
@@ -355,10 +371,10 @@ export function Batch({ items, selectedIds, onEngagedChange }: BatchProps) {
             ))}
           </ul>
           <p>{BATCH_TEXT.confirm_note}</p>
-          <button type="button" disabled={confirmDisabled} onClick={confirm}>
+          <button type="button" disabled={confirmDisabled} onClick={confirm} onKeyDown={onConfirmKey}>
             {BATCH_TEXT.confirm}
           </button>
-          <button type="button" ref={cancelButton} onClick={() => setPanel(null)}>
+          <button type="button" ref={cancelButton} disabled={busy} onClick={() => setPanel(null)}>
             {BATCH_TEXT.cancel}
           </button>
         </div>
@@ -424,6 +440,8 @@ function ResultView({ result }: { result: Result | null }) {
       );
     case 'denied':
       return <p role="status">{BATCH_TEXT.denied(result.count)}</p>;
+    case 'nothing_pending':
+      return <p role="status">{BATCH_TEXT.nothing_pending}</p>;
     case 'cancelled':
       return <p role="status">{BATCH_TEXT.cancelled}</p>;
     case 'rejected':

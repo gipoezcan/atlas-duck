@@ -73,12 +73,19 @@ afterEach(() => {
 
 const ids = (items: readonly QueueItem[]) => items.map((i) => i.request_id);
 
-function view(items: readonly QueueItem[], selected: readonly QueueItem[], onEngaged?: (e: boolean) => void) {
-  const r = render(<Batch items={items} selectedIds={ids(selected)} onEngagedChange={onEngaged} />);
+function view(
+  items: readonly QueueItem[],
+  selected: readonly QueueItem[],
+  onEngaged?: (e: boolean) => void,
+  unsentId: string | null = null,
+) {
+  const r = render(<Batch items={items} selectedIds={ids(selected)} unsentId={unsentId} onEngagedChange={onEngaged} />);
   return {
     ...r,
-    update: (nextItems: readonly QueueItem[], nextSelected: readonly QueueItem[]) =>
-      r.rerender(<Batch items={nextItems} selectedIds={ids(nextSelected)} onEngagedChange={onEngaged} />),
+    update: (nextItems: readonly QueueItem[], nextSelected: readonly QueueItem[], nextUnsent: string | null = null) =>
+      r.rerender(
+        <Batch items={nextItems} selectedIds={ids(nextSelected)} unsentId={nextUnsent} onEngagedChange={onEngaged} />,
+      ),
   };
 }
 
@@ -211,6 +218,53 @@ describe('batch approve and release', () => {
     fireEvent.click(button('Cancel'));
     expect(mockedBatch).not.toHaveBeenCalled();
     expect(screen.queryByRole('group', { name: 'Confirm batch decision' })).toBeNull();
+  });
+
+  it('unsent_changes_of_the_open_item_block_the_batch_and_close_a_confirmation', () => {
+    const u = row('req_u');
+    const v = view([A, u], [A, u]);
+    advance(INERT_MS);
+    expect(review(2).disabled).toBe(false);
+    fireEvent.click(review(2));
+    expect(screen.getByRole('group', { name: 'Confirm batch decision' })).toBeTruthy();
+    // A draft starts in the open item: the confirmation closes and the batch is off with its reason.
+    v.update([A, u], [A, u], 'req_u');
+    expect(screen.queryByRole('group', { name: 'Confirm batch decision' })).toBeNull();
+    advance(INERT_MS);
+    expect(review(1).disabled).toBe(true);
+    expect(document.querySelector('.batch-blocked')?.textContent).toContain('unsent edits or redactions in the open preview');
+    // The draft is sent or reset: the batch is back after the inert period.
+    v.update([A, u], [A, u], null);
+    expect(review(2).disabled).toBe(true);
+    advance(INERT_MS);
+    expect(review(2).disabled).toBe(false);
+  });
+
+  it('enter_never_activates_confirm_and_a_repeat_of_any_key_is_ignored', () => {
+    view([A], [A]);
+    confirmation(1);
+    const confirm = button('Confirm batch');
+    confirm.focus();
+    // Enter acts on the button on key-down: it is cancelled, so it cannot run into the native dialog.
+    expect(fireEvent.keyDown(confirm, { key: 'Enter', code: 'Enter' })).toBe(false);
+    expect(fireEvent.keyDown(confirm, { key: 'Enter', code: 'Enter', repeat: true })).toBe(false);
+    expect(fireEvent.keyDown(confirm, { key: ' ', code: 'Space', repeat: true })).toBe(false);
+    // Space is left alone: it acts on key-up, once the key is up.
+    expect(fireEvent.keyDown(confirm, { key: ' ', code: 'Space' })).toBe(true);
+    expect(fireEvent.keyUp(confirm, { key: ' ', code: 'Space' })).toBe(true);
+    expect(mockedBatch).not.toHaveBeenCalled();
+    fireEvent.click(confirm);
+    expect(mockedBatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancel_is_off_while_the_native_dialog_is_open', () => {
+    mockedBatch.mockReturnValue(new Promise(() => undefined));
+    view([A], [A]);
+    confirmation(1);
+    fireEvent.click(button('Confirm batch'));
+    expect(button('Cancel').disabled).toBe(true);
+    fireEvent.click(button('Cancel'));
+    expect(screen.getByRole('group', { name: 'Confirm batch decision' })).toBeTruthy();
   });
 
   it('the_confirm_button_is_inert_after_the_confirmation_opens', () => {
@@ -404,7 +458,7 @@ describe('batch deny and deny all from a session', () => {
     fireEvent.click(within(sessionGroups[1] as HTMLElement).getByRole('button', { name: 'Deny all pending from this session' }));
     // The text says "all pending": no fixed count.
     expect(screen.getByRole('group', { name: 'Deny all pending requests from this session' }).textContent).toContain(
-      'every request of the session that is pending when you press the button',
+      'every request of the session that is waiting for a decision when you press the button',
     );
     fireEvent.change(screen.getByRole('textbox'), { target: { value: 'wrong session' } });
     fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
@@ -467,6 +521,32 @@ describe('batch deny and deny all from a session', () => {
     expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe('');
   });
 
+  it('deny_all_from_a_session_with_nothing_pending_is_no_failure', async () => {
+    mockedDenySession.mockRejectedValue({ kind: 'not_found' });
+    view([A], [A]);
+    fireEvent.click(button('Deny all pending from this session'));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'no' } });
+    fireEvent.click(button('Send deny'));
+    await flush();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText('Nothing is pending in this session')).toBeTruthy();
+    // Another error of the same call stays a failure; so does not_found of a deny of the selection.
+    mockedDenyBatch.mockRejectedValue({ kind: 'not_found' });
+    fireEvent.click(button('Deny selected'));
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'no' } });
+    fireEvent.click(button('Send deny'));
+    await flush();
+    expect(screen.getByRole('alert').textContent).toContain('re-read the queue');
+  });
+
+  it('the_session_deny_text_says_what_it_skips', () => {
+    view([A], [A]);
+    fireEvent.click(button('Deny all pending from this session'));
+    const text = screen.getByRole('group', { name: 'Deny all pending requests from this session' }).textContent;
+    expect(text).toContain('waiting for a decision when you press the button');
+    expect(text).toContain('still being fetched or enriched are skipped');
+  });
+
   it('a_failed_deny_says_to_re_read_the_queue', async () => {
     mockedDenyBatch.mockRejectedValue({ kind: 'decision', error: { kind: 'audit' } });
     view([A], [A]);
@@ -494,8 +574,14 @@ describe('the mirrored rules', () => {
     ]);
   });
 
-  it('names a class this UI does not know without hiding it', () => {
-    expect(classSummary([row('x', { class: 'other' })])).toBe('1 request: decide 1 other request');
+  it('counts a class this UI does not know as a write, like the native dialog', () => {
+    expect(classSummary([row('x', { class: 'other' }), A])).toBe('2 requests: release 1 read, approve 1 write');
+  });
+
+  it('an_item_with_unsent_changes_is_blocked', () => {
+    const s = splitSelection([A, row('u')], 'u');
+    expect(s.eligible.map((i) => i.request_id)).toEqual(['req_a']);
+    expect(s.blocked.map((b) => [b.item.request_id, b.why])).toEqual([['u', 'unsent']]);
   });
 });
 

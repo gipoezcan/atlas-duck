@@ -70,6 +70,8 @@ interface DetailProps {
   /** The Structured tab body (reads: redaction controls, writes: the edit form). */
   renderStructured?: (props: StructuredSlotProps) => ReactNode;
   ref?: Ref<DetailHandle>;
+  /** Reports whether this request's card holds unsent edits or redactions (false again when they go or the card unmounts). */
+  onUnsentChange?: (requestId: string, unsent: boolean) => void;
 }
 
 /** The text of a `release_blocked` rejection, which Rust generates; every other error is one fixed text. */
@@ -109,7 +111,7 @@ function editRejection(e: unknown): string | null {
  * period, then approve. While the form holds unsent changes the revision's own Approve is off:
  * approving it would silently leave the changes out.
  */
-export function Detail({ item, openToken = 0, gone = false, renderStructured, ref }: DetailProps) {
+export function Detail({ item, openToken = 0, gone = false, renderStructured, ref, onUnsentChange }: DetailProps) {
   const [tab, setTab] = useState<TabId>('preview');
   const [state, setState] = useState<OpenState>({ kind: 'idle' });
   const [actionFailed, setActionFailed] = useState(false);
@@ -371,6 +373,16 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       sel !== null && !sel.isCollapsed && (el.contains(sel.anchorNode) || el.contains(sel.focusNode))
     );
   };
+
+  // The window learns of unsent edits or redactions, so a batch does not decide this request
+  // without them (its own Approve/Release is off for the same reason).
+  const unsent = !gone && (unsentEdits || unsentRedactions);
+  const requestId = item.request_id;
+  useEffect(() => {
+    if (!unsent) return;
+    onUnsentChange?.(requestId, true);
+    return () => onUnsentChange?.(requestId, false);
+  }, [unsent, requestId, onUnsentChange]);
 
   // The chord runs the first positive action through `send()`, the same gate as the button.
   useImperativeHandle(ref, () => ({

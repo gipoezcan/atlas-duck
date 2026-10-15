@@ -23,6 +23,7 @@ export const BATCH_TEXT = {
   blocked: 'Batch approve is unavailable: open the preview of each selected request first, and every one must be approvable',
   blocked_unopened: 'preview not opened',
   blocked_not_approvable: 'not approvable',
+  blocked_unsent: 'unsent edits or redactions in the open preview: send or reset them, or decide it individually',
   confirm_title: 'Confirm batch decision',
   confirm_summary: (parts: string) => `This will ${parts}.`,
   confirm_note: 'Rust shows a native confirmation next, and rejects the whole batch if any item changed.',
@@ -33,7 +34,7 @@ export const BATCH_TEXT = {
   deny_selected_title: (n: number) => `Deny the ${n} selected request${n === 1 ? '' : 's'}`,
   deny_session_title: 'Deny all pending requests from this session',
   deny_session_note:
-    'This denies every request of the session that is pending when you press the button, including ones that are not shown here or arrive until then.',
+    'This denies every request of the session that is waiting for a decision when you press the button, including ones not shown here. Requests still being fetched or enriched are skipped and will appear afterwards.',
   deny_reason: 'Reason for the agent',
   deny_reason_required: 'A reason is required',
   deny_send: 'Send deny',
@@ -44,12 +45,12 @@ export const BATCH_TEXT = {
   rejected_unknown: 'The batch was rejected and nothing was decided; the failing items could not be listed',
   cancelled: 'The batch was cancelled and nothing was decided',
   failed: 'The batch decision could not be applied; re-read the queue before trying again',
+  nothing_pending: 'Nothing is pending in this session',
   deny_failed: 'The deny could not be applied; re-read the queue before trying again',
   session: 'Session',
   class_read: ['read', 'reads'],
   class_write: ['write', 'writes'],
   class_script: ['script', 'scripts'],
-  class_other: ['other request', 'other requests'],
 } as const;
 
 /** Failure codes of a rejected batch (Rust `BatchFailure`), as the text next to each item. */
