@@ -285,6 +285,28 @@ describe('keyboard (spec 5.6, PD-91)', () => {
     }
   });
 
+  it('ui03_dom_focus_before_the_event_keeps_typed_text_out_of_the_deny_field', async () => {
+    const keys = new Keyboard();
+    await renderWindow();
+    await openFirst(keys);
+    keys.chord('D');
+    const field = screen.getByRole('textbox', { name: 'Reason for the agent' }) as HTMLInputElement;
+    expect(document.activeElement).toBe(field);
+
+    // The window loses focus; focus leaves the field at once, so the browser has nothing to restore.
+    fireEvent.blur(window);
+    expect(document.activeElement).not.toBe(field);
+    // The DOM focus comes first, window_focus {requested:false} only later: typing in the gap.
+    fireEvent.focus(window);
+    keys.tap('X');
+    keys.tap('Enter');
+    await flush();
+    expect(field.value).toBe('');
+    expect(mockedDecide).not.toHaveBeenCalled();
+    emit('window_focus', { requested: false });
+    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 1 }));
+  });
+
   it('a_requested_focus_makes_approve_inert_but_not_typing', async () => {
     const keys = new Keyboard();
     await renderWindow();
@@ -443,6 +465,33 @@ describe('ChordTracker', () => {
     t.down(ev('x', 'KeyX'));
     t.up(ev('x', 'KeyX'));
     expect(t.armed).toBe(true);
+  });
+
+  it('macos_keys_released_under_cmd_send_no_keyup_and_must_not_block_the_next_chord', () => {
+    const t = new ChordTracker();
+    const M = { metaKey: true, shiftKey: true };
+    t.down(ev('Meta', 'MetaLeft', { metaKey: true }));
+    t.down(ev('Shift', 'ShiftLeft', M));
+    expect(t.down(ev('Enter', 'Enter', M)).act).toBe(true);
+    // WebKit: Cmd is released first, Enter and Shift go up, but Enter's keyup is never sent.
+    t.up(ev('Meta', 'MetaLeft', { shiftKey: true }));
+    t.up(ev('Shift', 'ShiftLeft'));
+    expect(t.armed).toBe(true);
+    t.down(ev('Meta', 'MetaLeft', { metaKey: true }));
+    t.down(ev('Shift', 'ShiftLeft', M));
+    expect(t.down(ev('Enter', 'Enter', M)).act).toBe(true);
+  });
+
+  it('a_key_held_with_cmd_still_down_keeps_the_chord_blocked', () => {
+    // Negative control of the rule above: only Meta's release frees the key.
+    const t = new ChordTracker();
+    const M = { metaKey: true, shiftKey: true };
+    t.down(ev('Meta', 'MetaLeft', { metaKey: true }));
+    t.down(ev('Shift', 'ShiftLeft', M));
+    expect(t.down(ev('Enter', 'Enter', M)).act).toBe(true);
+    t.up(ev('Shift', 'ShiftLeft', { metaKey: true }));
+    expect(t.armed).toBe(false);
+    expect(t.down(ev('Enter', 'Enter', M)).act).toBe(false);
   });
 
   it('a_decision_chord_that_did_not_act_still_needs_release', () => {

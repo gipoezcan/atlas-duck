@@ -73,7 +73,9 @@ export function DenyDialog({ offers, prefill, busy, focusToken, onSubmit, onCanc
     const plain = !e.ctrlKey && !e.metaKey && !e.shiftKey && !e.altKey;
     if (e.key === 'Enter') {
       e.preventDefault();
-      if (plain && !e.repeat) submit();
+      // The Enter that commits an IME composition is not a submit (WebKit reports keyCode 229).
+      const composing = e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229;
+      if (plain && !e.repeat && !composing) submit();
     } else if (e.key === 'Escape') {
       e.preventDefault();
       onCancel();
@@ -102,8 +104,11 @@ export function DenyDialog({ offers, prefill, busy, focusToken, onSubmit, onCanc
         {DENY_TEXT.keys}
       </span>
       {offers.length === 0 ? null : (
-        <fieldset className="deny-offers">
+        <fieldset className="deny-offers" aria-describedby={`${ids}-one`}>
           <legend>{DENY_TEXT.offers}</legend>
+          <span id={`${ids}-one`} className="deny-keys">
+            {DENY_TEXT.offers_one}
+          </span>
           {offers.map((offer) => {
             const text = OFFER_TEXT[offer.kind];
             const on = chosen === offer.kind;

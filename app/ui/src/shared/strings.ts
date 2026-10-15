@@ -105,6 +105,7 @@ export const KEYBOARD_TEXT = {
   approve: 'Ctrl/Cmd+Shift+Enter: approve or release',
   deny: 'Ctrl/Cmd+Shift+D: deny',
   navigate: 'Ctrl/Cmd+Shift+Down / Up: next / previous request',
+  chord_runs: 'runs this action',
 } as const;
 
 /** spec 5.6 (Enter submits, Esc cancels), plan text (Task 15, PD-70): the deny reason field and its hint offers. */
@@ -115,6 +116,7 @@ export const DENY_TEXT = {
   cancel: 'Cancel',
   keys: 'Enter sends the deny, Esc cancels',
   offers: 'Attach a hint',
+  offers_one: 'At most one hint',
   upstream_http: 'the upstream HTTP status',
   upstream_http_detail: 'include the upstream error messages',
   outcome_hint: 'the outcome class with its fixed message (no size)',

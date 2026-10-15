@@ -46,6 +46,12 @@ export class ChordTracker {
   private readonly pressed = new Set<string>();
   /** Keys that must be seen released before a decision chord acts. */
   private readonly mustRelease = new Set<string>();
+  /**
+   * Non-modifier keys that went down while Meta was held. WebKit (macOS) sends no keyup for a key
+   * released under Cmd, so they are dropped when Meta is seen up (a decision still needs a fresh,
+   * non-repeat keydown of the main key).
+   */
+  private readonly underMeta = new Set<string>();
 
   /**
    * Feeds a keydown. `chord` is the chord the event completes (repeats included, so the caller can
@@ -56,6 +62,7 @@ export class ChordTracker {
     const chord = chordOf(e);
     // A repeat proves the key is down even when its first keydown went to another window.
     this.pressed.add(keyId(e));
+    if (e.metaKey && !(MODIFIERS as readonly string[]).includes(e.key)) this.underMeta.add(keyId(e));
     if (e.repeat) {
       if (chord !== null) this.holdAll();
       return { chord, act: false };
@@ -68,9 +75,11 @@ export class ChordTracker {
 
   up(e: KeyInput): void {
     this.reconcile(e);
+    if (e.key === 'Meta') this.dropUnderMeta();
     const id = keyId(e);
     this.pressed.delete(id);
     this.mustRelease.delete(id);
+    this.underMeta.delete(id);
   }
 
   /** The window lost focus: a key held now may come back up unseen, so each must be seen released. */
@@ -101,6 +110,15 @@ export class ChordTracker {
         this.mustRelease.delete(m);
       }
     }
+    if (!e.metaKey) this.dropUnderMeta();
+  }
+
+  private dropUnderMeta(): void {
+    for (const id of this.underMeta) {
+      this.pressed.delete(id);
+      this.mustRelease.delete(id);
+    }
+    this.underMeta.clear();
   }
 }
 

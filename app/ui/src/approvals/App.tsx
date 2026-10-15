@@ -118,7 +118,7 @@ export function App() {
   const heading = useRef<HTMLHeadingElement>(null);
   const inert = useWindowInert(heading);
   const { ends } = inert;
-  const allInertNow = useCallback(() => Date.now() < ends.current.all, [ends]);
+  const allInertNow = useCallback(() => performance.now() < ends.current.all, [ends]);
   const detail = useRef<DetailHandle>(null);
   useChords(
     {

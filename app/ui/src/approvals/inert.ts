@@ -15,7 +15,7 @@ import { on } from '../shared/ipc/events';
 export const INERT_MS = 1_000;
 
 interface Ends {
-  /** Approve/release controls and the chord are inert until then (`Date.now()` ms). */
+  /** Approve/release controls and the chord are inert until then (`performance.now()` ms). */
   approve: number;
   /** All keyboard input is inert until then. */
   all: number;
@@ -38,15 +38,15 @@ const NO_WINDOW: WindowInert = {
 export const WindowInertContext = createContext<WindowInert>(NO_WINDOW);
 
 /**
- * Re-renders when `at` (`Date.now()` ms) passes, so a disabled control comes back on time. An
+ * Re-renders when `at` (`performance.now()` ms) passes, so a disabled control comes back on time. An
  * effect that runs late (a busy main thread) and finds `at` already past re-renders at once if the
  * last render was still before it.
  */
 function useRenderAt(at: number): void {
   const [, rerender] = useReducer((n: number) => n + 1, 0);
-  const renderedBefore = Date.now() < at;
+  const renderedBefore = performance.now() < at;
   useEffect(() => {
-    const left = at - Date.now();
+    const left = at - performance.now();
     if (left <= 0) {
       if (renderedBefore) rerender();
       return undefined;
@@ -68,6 +68,15 @@ function requestedOf(payload: unknown): boolean {
   );
 }
 
+/** Whether el takes typed text (an input that is not a button/checkbox, textarea, select, editable). */
+function isTextEntry(el: HTMLElement): boolean {
+  if (el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) return true;
+  if (el instanceof HTMLInputElement) {
+    return !['button', 'checkbox', 'radio', 'submit', 'reset', 'image', 'file', 'range', 'color'].includes(el.type);
+  }
+  return el.isContentEditable;
+}
+
 /**
  * The window's inert periods (spec 5.6): approve/release is inert for `INERT_MS` after the window
  * gains focus (the DOM `focus` of the window, and Rust's `window_focus`); after a focus the user did
@@ -80,7 +89,7 @@ export function useWindowInert(heading: RefObject<HTMLElement | null>): WindowIn
 
   const start = useCallback(
     (all: boolean) => {
-      const end = Date.now() + INERT_MS;
+      const end = performance.now() + INERT_MS;
       const next: Ends = {
         approve: Math.max(ends.current.approve, end),
         all: all ? Math.max(ends.current.all, end) : ends.current.all,
@@ -97,19 +106,27 @@ export function useWindowInert(heading: RefObject<HTMLElement | null>): WindowIn
     const onFocus = () => {
       start(false);
       // The browser may restore focus to the last focused input: keep it off inputs.
-      if (Date.now() < ends.current.all) heading.current?.focus();
+      if (performance.now() < ends.current.all) heading.current?.focus();
+    };
+    // The browser hands focus back to the last focused element when the window returns, before
+    // Rust's window_focus {requested} can arrive: leave no text input focused while away.
+    const onBlur = () => {
+      const a = document.activeElement;
+      if (a instanceof HTMLElement && a !== heading.current && isTextEntry(a)) heading.current?.focus();
     };
     window.addEventListener('focus', onFocus);
+    window.addEventListener('blur', onBlur);
     const off = on<unknown>('window_focus', (p) => start(!requestedOf(p)), { thisWindow: true });
     return () => {
       window.removeEventListener('focus', onFocus);
+      window.removeEventListener('blur', onBlur);
       void off.then((f) => f()).catch(() => undefined);
     };
   }, [start, heading]);
 
   useRenderAt(state.approve);
   useRenderAt(state.all);
-  const now = Date.now();
+  const now = performance.now();
   return { approveInert: now < state.approve, allInert: now < state.all, ends };
 }
 
@@ -140,15 +157,15 @@ export function useInert(displayed: string | null): {
   if (displayed !== seen) {
     // React re-renders at once with these, before anything commits.
     setSeen(displayed);
-    if (displayed !== null) setUntil(Date.now() + INERT_MS);
+    if (displayed !== null) setUntil(performance.now() + INERT_MS);
   }
   useRenderAt(until);
-  const now = Date.now();
+  const now = performance.now();
   return {
     approveInert: win.approveInert || win.allInert || displayed !== seen || now < until,
     allInert: win.allInert,
     approveInertNow: () => {
-      const t = Date.now();
+      const t = performance.now();
       return t < until || t < win.ends.current.approve || t < win.ends.current.all;
     },
   };

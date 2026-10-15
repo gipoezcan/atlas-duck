@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { Fragment, useId, type ReactNode } from 'react';
 
 import type { DecideArgs } from '../shared/ipc/invoke';
 import type { Preview } from '../shared/ipc/types';
@@ -106,19 +106,28 @@ export function DecisionBar({
   denyDialog,
 }: DecisionBarProps) {
   const marker = { [POSITIVE_ATTR]: '' };
+  const legendId = useId();
+  const several = (card?.positives.length ?? 0) > 1;
   return (
     <>
       <div className="detail-actions" role="group" aria-label={DETAIL_TEXT.actions_label}>
-        {card?.positives.map((p) => (
-          <button
-            key={p.label}
-            type="button"
-            {...marker}
-            disabled={!positiveEnabled}
-            onClick={() => onPositive(p.args)}
-          >
-            {p.label}
-          </button>
+        {card?.positives.map((p, i) => (
+          <Fragment key={p.label}>
+            <button
+              type="button"
+              {...marker}
+              // Enter/Space do nothing on these buttons (single-key approval): the legend says why.
+              aria-describedby={legendId}
+              {...(i === 0 ? { 'aria-keyshortcuts': 'Control+Shift+Enter Meta+Shift+Enter' } : {})}
+              disabled={!positiveEnabled}
+              onClick={() => onPositive(p.args)}
+            >
+              {p.label}
+            </button>
+            {i === 0 && several ? (
+              <span className="chord-marker">({KEYBOARD_TEXT.chord_runs})</span>
+            ) : null}
+          </Fragment>
         ))}
         {card?.approveShownDisabled === true ? (
           <button type="button" {...marker} disabled>
@@ -140,7 +149,7 @@ export function DecisionBar({
       </div>
       {denyDialog}
       <ul className="keyboard-legend" aria-label={KEYBOARD_TEXT.legend_label}>
-        <li>{KEYBOARD_TEXT.approve}</li>
+        <li id={legendId}>{KEYBOARD_TEXT.approve}</li>
         <li>{KEYBOARD_TEXT.deny}</li>
         <li>{KEYBOARD_TEXT.navigate}</li>
       </ul>

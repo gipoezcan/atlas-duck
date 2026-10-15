@@ -69,6 +69,12 @@ async function queueChanged(queue: QueueItem[]) {
   await flush();
 }
 
+/** The text of the element el's ria-describedby points at. */
+function describedBy(el: Element | null | undefined): string | undefined {
+  const id = el?.getAttribute('aria-describedby');
+  return id == null ? undefined : (document.getElementById(id)?.textContent ?? undefined);
+}
+
 describe('decision controls (spec 5.6, UI-01)', () => {
   it('ui01_opened_flag_only_after_explicit_open', async () => {
     const keys = new Keyboard();
@@ -247,6 +253,32 @@ describe('decision controls (spec 5.6, UI-01)', () => {
   });
 });
 
+describe('chord and screen reader hints (spec 5.6, PD-91)', () => {
+  it('positive_buttons_point_at_the_legend_and_only_the_chord_button_is_marked', async () => {
+    mockedPreview.mockResolvedValue(previewOf(READ, 'upstream_error'));
+    render(<Detail item={READ} openToken={1} />);
+    await flush();
+    const [release, statusOnly] = [positive('Release'), positive('Release status only')];
+    expect(release).not.toBeNull();
+    expect(statusOnly).not.toBeNull();
+    for (const b of [release, statusOnly]) {
+      expect(describedBy(b)).toBe('Ctrl/Cmd+Shift+Enter: approve or release');
+    }
+    expect(release?.getAttribute('aria-keyshortcuts')).toBe('Control+Shift+Enter Meta+Shift+Enter');
+    expect(statusOnly?.hasAttribute('aria-keyshortcuts')).toBe(false);
+    // A visible marker next to the one the chord runs.
+    expect(release?.nextElementSibling?.textContent).toBe('(runs this action)');
+    expect(statusOnly?.nextElementSibling?.textContent ?? '').not.toContain('runs this action');
+  });
+
+  it('a_single_action_card_has_no_chord_marker', async () => {
+    mockedPreview.mockResolvedValue(previewOf(WRITE, 'transition'));
+    render(<Detail item={WRITE} openToken={1} />);
+    await flush();
+    expect(screen.queryByText('(runs this action)')).toBeNull();
+  });
+});
+
 describe('deny flow (PD-70)', () => {
   async function denyFieldFor(response: PreviewFetchResponse) {
     mockedPreview.mockResolvedValue(response);
@@ -340,6 +372,26 @@ describe('deny flow (PD-70)', () => {
       decision: 'deny',
       reason: 'target changed since you read it; re-read and resubmit (PROJ-7 moved)',
     });
+  });
+
+  it('enter_that_commits_an_ime_composition_does_not_send_the_deny', async () => {
+    const group = await denyFieldFor(previewOf(WRITE, 'transition'));
+    const field = within(group).getByRole('textbox');
+    fireEvent.keyDown(field, { key: 'Enter', isComposing: true });
+    fireEvent.keyDown(field, { key: 'Enter', keyCode: 229 });
+    await flush();
+    expect(mockedDecide).not.toHaveBeenCalled();
+    fireEvent.keyDown(field, { key: 'Enter' });
+    await flush();
+    expect(mockedDecide).toHaveBeenCalledTimes(1);
+  });
+
+  it('the_offers_say_one_hint_at_most', async () => {
+    const group = await denyFieldFor(
+      previewOf(WRITE, 'write_requests', { deny_offers: [{ kind: 'outcome_hint', has_optional_detail: false }] }),
+    );
+    const offers = within(group).getByRole('group', { name: 'Attach a hint' });
+    expect(describedBy(offers)).toBe('At most one hint');
   });
 
   it('esc_cancels_and_sends_nothing', async () => {
