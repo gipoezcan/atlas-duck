@@ -252,6 +252,8 @@ struct TestStarter {
     keys: Arc<RecordingKeys>,
     confirmer: Arc<Answers>,
     root: PathBuf,
+    /// The start never ends (a store still opening).
+    idle: bool,
 }
 
 impl TestStarter {
@@ -297,6 +299,9 @@ impl ServeStarter<MockRuntime> for TestStarter {
         lock: Arc<InstanceLock>,
         pinned: &PinnedPaths,
     ) {
+        if self.idle {
+            return;
+        }
         let handle = app.clone();
         let Ok(inputs) = self.inputs(app, data, lock, pinned) else {
             if let Some(slot) = handle.try_state::<ServeSlot>() {
@@ -369,6 +374,8 @@ struct Machine {
     pins: Arc<Mutex<Vec<PinCall>>>,
     pick: Arc<Mutex<Option<PathBuf>>>,
     secret_service: Option<SecretService>,
+    /// Step 0's start never ends.
+    idle_start: bool,
 }
 
 impl Machine {
@@ -403,6 +410,7 @@ impl Machine {
             pins: Arc::default(),
             pick: Arc::default(),
             secret_service: None,
+            idle_start: false,
             root,
         })
     }
@@ -417,6 +425,7 @@ impl Machine {
             keys: self.keys.clone(),
             confirmer: self.confirmer.clone(),
             root: self.root.clone(),
+            idle: self.idle_start,
         })
     }
 
@@ -1093,6 +1102,28 @@ async fn linux_no_secret_service_stops_with_text() -> TestResult {
     assert_eq!(reason(&reply.envelope), Some("first_run"));
     drop(c);
     stop(&app).await
+}
+
+/// PD-77: the passphrase is asked for only once the first-run gate serves. While the start after
+/// step 0 is still opening the data dir, the wizard shows the passphrase step but Begin opens no
+/// window (a pair taken then could only fail).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn begin_waits_for_the_first_run_gate() -> TestResult {
+    let tmp = scratch()?;
+    let mut m = Machine::new(&tmp, "host-a", None, MemKeyring::new())?;
+    m.idle_start = true;
+    let (app, setup) = m.app()?;
+    let s = run(&setup, "wizard_use_default_dir").await?;
+    assert_eq!(s["step"], "passphrase");
+    assert_eq!(s["refused_count"], Value::Null, "nothing serves yet");
+    assert_eq!(windows::snapshot(app.handle()), AppSnapshot::BeforeFirstRun);
+    assert_eq!(
+        call(&setup, "wizard_begin", json!({})).await,
+        Err(json!({"kind": "not_ready"}))
+    );
+    assert_eq!(credential::current_purpose(app.handle()), None);
+    assert_eq!(wizard_state(&setup).await?["passphrase_window"], false);
+    Ok(())
 }
 
 // ---------- RF-3b ----------

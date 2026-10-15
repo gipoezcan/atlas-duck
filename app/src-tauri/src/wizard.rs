@@ -172,6 +172,8 @@ pub fn step_of(p: &Progress, f: &Facts<'_>) -> WizardStep {
         return WizardStep::DataDir;
     }
     match f.snapshot {
+        // The core serves before the wizard has recorded its `GENESIS`.
+        AppSnapshot::Serving if p.in_flight == Some(InFlight::Genesis) => WizardStep::Genesis,
         AppSnapshot::Serving => {
             if p.genesis_written && f.passphrase_window_open {
                 WizardStep::RecoveryNote
@@ -739,6 +741,11 @@ pub async fn begin<R: Runtime>(app: &AppHandle<R>) -> Result<WizardState, Comman
         let mut p = w.progress();
         let step = current_step(app, &mut p, None);
         if step == WizardStep::Passphrase {
+            // Only once the first-run gate serves (the start after step 0 may still be opening):
+            // a pair taken earlier could only fail.
+            if windows::snapshot(app) != AppSnapshot::Gate(GateState::FirstRun) {
+                return Err(CommandError::NotReady);
+            }
             match p.in_flight {
                 Some(InFlight::Passphrase) => {}
                 Some(_) => return Err(CommandError::Busy),
@@ -863,6 +870,14 @@ async fn await_passphrase<R: Runtime>(
     };
     let generation = credential::current_window(&app).map(|(_, g)| g);
     let result = genesis(&app, &w, pair).await;
+    // A failure closes the window before the state shows the failure: whoever sees the class sees
+    // the window gone.
+    if let (Err(_), Some(generation)) = (result, generation) {
+        let handle = app.clone();
+        let _ =
+            tauri::async_runtime::spawn_blocking(move || credential::close_if(&handle, generation))
+                .await;
+    }
     {
         let mut p = w.progress();
         p.in_flight = None;
@@ -876,22 +891,11 @@ async fn await_passphrase<R: Runtime>(
             }
         }
     }
-    match result {
+    if result.is_ok() {
         // The page offers "Save recovery note" now (§8.6: right after `GENESIS`); the Settings and
         // setup windows re-read the instances.
-        Ok(()) => {
-            credential::context_changed(&app);
-            crate::ui_sink::emit_settings_changed(&app);
-        }
-        Err(_) => {
-            if let Some(generation) = generation {
-                let handle = app.clone();
-                let _ = tauri::async_runtime::spawn_blocking(move || {
-                    credential::close_if(&handle, generation)
-                })
-                .await;
-            }
-        }
+        credential::context_changed(&app);
+        crate::ui_sink::emit_settings_changed(&app);
     }
     emit_wizard_changed(&app);
 }
@@ -1034,6 +1038,11 @@ mod tests {
             ..Progress::default()
         };
         assert_eq!(step_of(&genesis, &facts(&first_run)), WizardStep::Genesis);
+        // The core already serves; the wizard has not recorded its GENESIS yet.
+        assert_eq!(
+            step_of(&genesis, &facts(&AppSnapshot::Serving)),
+            WizardStep::Genesis
+        );
         assert_eq!(
             step_of(&p, &facts(&AppSnapshot::Starting)),
             WizardStep::Passphrase
