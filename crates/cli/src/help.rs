@@ -4,7 +4,9 @@
 
 use std::fmt::Write;
 
-use atlas_duck_registry::{OperationSpec, all, describe};
+use atlas_duck_registry::{
+    GENERIC_COMMANDS, GenericCommand, OperationSpec, all, describe, op_usage,
+};
 use serde_json::Value;
 
 use crate::binding::alias_help;
@@ -24,78 +26,8 @@ const JSON_NOTE: &str = "JSON notes: an integer above 18446744073709551615 (u64:
 object repeats a key the last one wins.
 ";
 
-/// One generic (non-registry) command: its path, usage line and one-line summary.
-struct Generic {
-    path: &'static [&'static str],
-    usage: &'static str,
-    summary: &'static str,
-}
-
-const GENERIC: &[Generic] = &[
-    Generic {
-        path: &["call"],
-        usage: "atlas-duck call <op-id> (--params '<json>' | --params-file <path|->)",
-        summary: "Run any operation with a JSON params object",
-    },
-    Generic {
-        path: &["script", "run"],
-        usage: "atlas-duck script run <file|-> [--args <json>] [--limits <json>] [--dry-run[=full|sparse]]",
-        summary: "Run a script in the sandbox",
-    },
-    Generic {
-        path: &["ops", "list"],
-        usage: "atlas-duck ops list [--instance ALIAS]",
-        summary: "List every operation",
-    },
-    Generic {
-        path: &["ops", "describe"],
-        usage: "atlas-duck ops describe <op-id> [--instance ALIAS]",
-        summary: "Describe one operation: params schema, flags, caps, examples",
-    },
-    Generic {
-        path: &["instances"],
-        usage: "atlas-duck instances",
-        summary: "List the configured instances",
-    },
-    Generic {
-        path: &["await"],
-        usage: "atlas-duck await <id>",
-        summary: "Wait for a request to finish",
-    },
-    Generic {
-        path: &["status"],
-        usage: "atlas-duck status <id>",
-        summary: "Show a request's current state without waiting",
-    },
-    Generic {
-        path: &["cancel"],
-        usage: "atlas-duck cancel <id>",
-        summary: "Cancel a pending request",
-    },
-    Generic {
-        path: &["requests", "list"],
-        usage: "atlas-duck requests list [--agent NAME] [--state pending|recent] [--match-params-file <path|->]",
-        summary: "List requests (metadata only)",
-    },
-    Generic {
-        path: &["doctor"],
-        usage: "atlas-duck doctor",
-        summary: "Install and connectivity diagnostics",
-    },
-    Generic {
-        path: &["help"],
-        usage: "atlas-duck help [command...]",
-        summary: "Show this help",
-    },
-];
-
 fn starts_with(path: &[&str], prefix: &[String]) -> bool {
     prefix.len() <= path.len() && path.iter().zip(prefix).all(|(a, b)| a == b)
-}
-
-fn op_usage(spec: &OperationSpec) -> String {
-    let d = describe(spec, &describe_env());
-    d["cli"]["usage"].as_str().unwrap_or_default().to_owned()
 }
 
 fn push_section(out: &mut String, title: &str, lines: &[String]) {
@@ -113,7 +45,7 @@ fn top_level() -> String {
     let mut out =
         String::from("atlas-duck: reach Jira and Confluence through the approval app\n\n");
     out.push_str("Usage: atlas-duck <command> [flags]\n\n");
-    let generic: Vec<String> = GENERIC
+    let generic: Vec<String> = GENERIC_COMMANDS
         .iter()
         .map(|g| format!("{:<16} {}", g.path.join(" "), g.summary))
         .collect();
@@ -178,7 +110,7 @@ pub(crate) fn help_text(path: &[String]) -> Option<String> {
         return Some(format!("{name}: not available in this build\n"));
     }
     let mut out = String::new();
-    let generic: Vec<&Generic> = GENERIC
+    let generic: Vec<&GenericCommand> = GENERIC_COMMANDS
         .iter()
         .filter(|g| starts_with(g.path, path))
         .collect();

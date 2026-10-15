@@ -20,7 +20,8 @@ use super::{CommandError, blocking, core, finish};
 pub struct VerifyNowArgs {}
 
 /// `verify_now {}` (Δ1, §8.7 "Verify now"): runs the full verification once. A call while one runs
-/// is the page's guard to stop; core serializes verification on the store's own lock anyway.
+/// is the page's guard to stop: core takes no lock for it (each call opens its own read-only
+/// connection and appends its own `VERIFY` record).
 #[tauri::command]
 pub async fn verify_now<R: Runtime>(
     app: AppHandle<R>,

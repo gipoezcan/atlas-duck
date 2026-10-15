@@ -124,7 +124,9 @@ export function Running() {
               <th scope="col">{T.col_agent}</th>
               <th scope="col">{T.col_started}</th>
               <th scope="col">{T.col_calls}</th>
-              <th scope="col" />
+              <th scope="col">
+                <span className="visually-hidden">{T.col_actions}</span>
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -147,6 +149,7 @@ export function Running() {
                     type="button"
                     aria-label={T.kill_label(r.request_id)}
                     disabled={killing !== null}
+                    aria-busy={killing === r.request_id}
                     onClick={() => kill(r.request_id)}
                   >
                     {killing === r.request_id ? T.killing : T.kill}

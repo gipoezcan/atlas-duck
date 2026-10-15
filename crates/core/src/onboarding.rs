@@ -33,18 +33,6 @@ pub const RULES: [&str; 5] = [
     RULE_EXIT_9,
 ];
 
-/// The commands the CLI offers beside the registry's operations (`atlas-duck help`).
-const FIXED_COMMANDS: [&str; 8] = [
-    "atlas-duck ops list",
-    "atlas-duck ops describe <op>",
-    "atlas-duck script run",
-    "atlas-duck requests list [--agent <name>] [--match-params-file <file>]",
-    "atlas-duck await <request_id>",
-    "atlas-duck status <request_id>",
-    "atlas-duck cancel <request_id>",
-    "atlas-duck instances",
-];
-
 /// The snippet: Markdown the user copies into an agent's instruction file. Plain text; the
 /// window shows it as a text node.
 pub fn text() -> String {
@@ -55,27 +43,16 @@ pub fn text() -> String {
          on stdout (`status`, `error`, `data`, `meta`); the exit code is a summary of it.\n\n",
     );
     out.push_str("## Commands\n\n");
-    for line in FIXED_COMMANDS {
-        let _ = writeln!(out, "- `{line}`");
+    // The same usage lines atlas-duck --help prints: one table, one formatter.
+    for g in registry::GENERIC_COMMANDS {
+        let _ = writeln!(out, "- `{}`", g.usage);
     }
     for spec in registry::all() {
-        let _ = writeln!(out, "- `{}`", command_line(spec));
+        let _ = writeln!(out, "- `{}`", registry::op_usage(spec));
     }
     out.push_str("\n## Rules\n\n");
     for rule in RULES {
         let _ = writeln!(out, "- {rule}");
     }
     out
-}
-
-/// `atlas-duck <noun path> [<positional>] [--flag ...]` of one operation.
-fn command_line(spec: &registry::OperationSpec) -> String {
-    let mut line = format!("atlas-duck {}", spec.cli.noun_path.join(" "));
-    if let Some(p) = spec.cli.positional {
-        let _ = write!(line, " <{p}>");
-    }
-    for f in spec.cli.flags {
-        let _ = write!(line, " [{}]", f.flag);
-    }
-    line
 }

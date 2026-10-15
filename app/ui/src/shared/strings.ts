@@ -648,6 +648,7 @@ export const RUNNING_TEXT = {
   col_agent: 'Agent',
   col_started: 'Started',
   col_calls: 'Host calls',
+  col_actions: 'Actions',
   kill: 'Kill',
   killing: 'Stopping\u2026',
   /** The accessible name of a row's kill button (the request id names the row). */

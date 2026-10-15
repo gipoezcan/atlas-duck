@@ -396,6 +396,11 @@ impl RunShared {
         lock(&self.inner).ended = true;
     }
 
+    /// The run's worker is gone (the end record may not be appended yet).
+    pub(crate) fn ended(&self) -> bool {
+        lock(&self.inner).ended
+    }
+
     /// Host calls the run made so far (validated calls, counted by the host, never the worker).
     pub(crate) fn calls(&self) -> u32 {
         lock(&self.inner).calls

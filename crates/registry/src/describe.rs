@@ -121,7 +121,9 @@ fn version(v: Version) -> String {
     format!("{}.{}.{}", v.major, v.minor, v.patch)
 }
 
-fn usage(spec: &OperationSpec) -> String {
+/// The usage line of one operation: the one `describe(..)["cli"]["usage"]`, `--help` and the
+/// onboarding snippet all print.
+pub fn usage(spec: &OperationSpec) -> String {
     let mut usage = format!("atlas-duck {}", spec.cli.noun_path.join(" "));
     if let Some(p) = spec.cli.positional {
         usage.push_str(&format!(" <{p}>"));
@@ -140,7 +142,73 @@ fn usage(spec: &OperationSpec) -> String {
     }
     usage
 }
+/// One generic (non-registry) CLI command: its path, usage line and one-line summary. The one
+/// table `atlas-duck --help` and the onboarding snippet both print.
+#[derive(Debug, Clone, Copy)]
+pub struct GenericCommand {
+    pub path: &'static [&'static str],
+    pub usage: &'static str,
+    pub summary: &'static str,
+}
 
+/// The commands the CLI offers beside the registry's operations.
+pub const GENERIC_COMMANDS: &[GenericCommand] = &[
+    GenericCommand {
+        path: &["call"],
+        usage: "atlas-duck call <op-id> (--params '<json>' | --params-file <path|->)",
+        summary: "Run any operation with a JSON params object",
+    },
+    GenericCommand {
+        path: &["script", "run"],
+        usage: "atlas-duck script run <file|-> [--args <json>] [--limits <json>] [--dry-run[=full|sparse]]",
+        summary: "Run a script in the sandbox",
+    },
+    GenericCommand {
+        path: &["ops", "list"],
+        usage: "atlas-duck ops list [--instance ALIAS]",
+        summary: "List every operation",
+    },
+    GenericCommand {
+        path: &["ops", "describe"],
+        usage: "atlas-duck ops describe <op-id> [--instance ALIAS]",
+        summary: "Describe one operation: params schema, flags, caps, examples",
+    },
+    GenericCommand {
+        path: &["instances"],
+        usage: "atlas-duck instances",
+        summary: "List the configured instances",
+    },
+    GenericCommand {
+        path: &["await"],
+        usage: "atlas-duck await <id>",
+        summary: "Wait for a request to finish",
+    },
+    GenericCommand {
+        path: &["status"],
+        usage: "atlas-duck status <id>",
+        summary: "Show a request's current state without waiting",
+    },
+    GenericCommand {
+        path: &["cancel"],
+        usage: "atlas-duck cancel <id>",
+        summary: "Cancel a pending request",
+    },
+    GenericCommand {
+        path: &["requests", "list"],
+        usage: "atlas-duck requests list [--agent NAME] [--state pending|recent] [--match-params-file <path|->]",
+        summary: "List requests (metadata only)",
+    },
+    GenericCommand {
+        path: &["doctor"],
+        usage: "atlas-duck doctor",
+        summary: "Install and connectivity diagnostics",
+    },
+    GenericCommand {
+        path: &["help"],
+        usage: "atlas-duck help [command...]",
+        summary: "Show this help",
+    },
+];
 fn cli(spec: &OperationSpec) -> Value {
     let flags: Vec<Value> = spec
         .cli

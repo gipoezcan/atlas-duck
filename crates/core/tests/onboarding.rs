@@ -54,17 +54,37 @@ fn onboarding_text_contains_verbatim_rules() -> TestResult {
             .ok_or("bullet missing in the spec")?;
         assert!(snippet.contains(from_spec.as_str()), "{opening}");
     }
+    assert_eq!(RULES.len(), 5);
     assert!(snippet.contains("never resubmit a pending request"));
     assert!(snippet.contains("`--timeout`"));
     Ok(())
 }
 
 #[test]
-fn onboarding_text_lists_every_registry_command() {
+fn onboarding_text_lists_every_command_as_the_cli_prints_it() {
     let snippet = text();
+    let lines: Vec<&str> = snippet
+        .lines()
+        .filter_map(|l| l.strip_prefix("- `").and_then(|l| l.strip_suffix('`')))
+        .collect();
+    // Every registry op: the usage `ops describe` and `--help` print, placeholders included.
     for spec in atlas_duck_registry::all() {
-        let name = format!("atlas-duck {}", spec.cli.noun_path.join(" "));
-        assert!(snippet.contains(&name), "{name}");
+        let usage = atlas_duck_registry::op_usage(spec);
+        assert!(lines.contains(&usage.as_str()), "{usage}");
     }
-    assert!(snippet.contains("atlas-duck await <request_id>"));
+    // Every generic command, from the table `--help` prints.
+    for g in atlas_duck_registry::GENERIC_COMMANDS {
+        assert!(lines.contains(&g.usage), "{}", g.usage);
+    }
+    for needle in [
+        "atlas-duck script run <file|-> [--args <json>] [--limits <json>] [--dry-run[=full|sparse]]",
+        "atlas-duck requests list [--agent NAME] [--state pending|recent]",
+        "atlas-duck call <op-id>",
+        "atlas-duck doctor",
+        "atlas-duck help",
+        "<id>=<json>",
+        "-file <path>]",
+    ] {
+        assert!(snippet.contains(needle), "{needle}");
+    }
 }

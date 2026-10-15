@@ -959,6 +959,9 @@ async fn running_list_empty_and_one() -> TestResult {
     // The kill goes through the run's own audited path; an unknown id kills nothing.
     assert!(!h.core().kill_script("no-such-request"));
     assert!(h.core().kill_script(&id));
+    // The row is gone at once: the end record is appended later, and a page that re-reads right
+    // after the kill answer must not see a run with an enabled Kill button.
+    assert!(h.core().running_scripts().is_empty());
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     assert!(h.core().running_scripts().is_empty());
     assert!(!h.core().kill_script(&id), "a run that ended is not killed");
@@ -967,6 +970,24 @@ async fn running_list_empty_and_one() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn running_list_leaves_out_dry_runs_and_kill_ignores_non_scripts() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(30_000),
+    ])
+    .await?;
+    let dry = submit(&h, json!({ "source": SRC, "dry_run": true })).await?;
+    wait_for("the dry run to start", || runner.starts() == 1).await?;
+    assert!(
+        h.core().running_scripts().is_empty(),
+        "a dry run is not listed"
+    );
+    assert!(!h.core().kill_script(&dry), "a dry run has no kill");
+    // A read request (finished) names no script run either.
+    let read = h.submit("jira.issue.get", json!({ "key": "ABC-1" })).await;
+    assert!(!h.core().kill_script(&request_id(&read)?));
+    Ok(())
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn call_append_failure_ends_audit_failure_after_the_send() -> TestResult {
     let faults = FaultPlan::new();

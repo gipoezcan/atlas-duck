@@ -19,7 +19,8 @@ pub struct RunningScriptView {
     pub host_calls: u32,
 }
 
-/// The real runs in `Running`, oldest first (dry runs are not listed: they have no release item
+/// The real runs in `Running` that are not ending, oldest first (dry runs are not listed: they
+/// have no release item
 /// and no kill button, §9.6).
 pub(crate) fn list(engine: &Arc<Engine>) -> Vec<RunningScriptView> {
     let mut rows: Vec<RunningScriptView> = engine
@@ -35,6 +36,11 @@ pub(crate) fn list(engine: &Arc<Engine>) -> Vec<RunningScriptView> {
                 return None;
             }
             let shared = s.shared.as_ref()?;
+            // A run that ended, or whose kill was asked for, is on its way out: the end record is
+            // appended after this point, so the list must not wait for the phase to change.
+            if shared.ended() || shared.kill_reason().is_some() {
+                return None;
+            }
             Some(RunningScriptView {
                 request_id: e.head.request_id.clone(),
                 agent_name: e.agent_name.clone(),
