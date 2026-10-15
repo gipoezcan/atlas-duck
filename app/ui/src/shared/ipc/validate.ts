@@ -317,6 +317,7 @@ export const isSettingsGet = (v: unknown): v is SettingsGet =>
     instances: arrayOf(isInstanceView),
     confinement: isConfinement,
     cli_installed: isBool,
+    cli_removable: isBool,
   });
 
 export const isRetestOutcome = (v: unknown): v is RetestOutcome => {
@@ -347,7 +348,13 @@ export const isPruneReport = (v: unknown): v is PruneReport => {
 
 export const isCliInstallAnswer = (v: unknown): v is CliInstallAnswer =>
   fields(v, {
-    outcome: oneOf('installed', 'already_installed', 'removed', 'already_on_path'),
+    outcome: oneOf(
+      'installed',
+      'installed_local_bin',
+      'already_installed',
+      'removed',
+      'already_on_path',
+    ),
   });
 
 const isWizardError = (v: unknown): v is WizardError =>

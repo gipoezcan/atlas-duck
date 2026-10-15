@@ -21,8 +21,17 @@ fn entry(kind: &Kind) -> Result<String, InstallError> {
     if text.is_empty() || text.chars().any(|c| c.is_control() || c == ';' || c == '"') {
         return Err(InstallError::UnsafePath);
     }
+    // `C:` alone is the current directory of drive C: a drive root keeps its separator.
+    if text.ends_with(':') {
+        return Ok(format!("{text}\\"));
+    }
     Ok(text.to_owned())
 }
+
+/// The longest user PATH (UTF-16 units) install writes. The registry value holds 32767 units, and a
+/// longer one is cut or ignored when new processes read it. The user and system PATH expand and
+/// join in each process; that sum cannot be checked here.
+pub const MAX_PATH_UNITS: usize = 32_000;
 
 /// Resolve-time check that the install dir can be a PATH entry.
 pub fn check_install_dir(kind: &Kind) -> Result<(), InstallError> {
@@ -73,6 +82,9 @@ pub fn install(ops: &dyn PlatformOps, kind: &Kind, done: &mut Report) -> Result<
     let dir = entry(kind)?;
     let current = ops.user_path_get().map_err(|e| registry_error(&e))?;
     if let Some(next) = path_append(current.as_deref(), &dir) {
+        if next.encode_utf16().count() > MAX_PATH_UNITS {
+            return Err(InstallError::PathTooLong);
+        }
         ops.user_path_set(&next).map_err(|e| registry_error(&e))?;
         done.changed.push(Artifact::PathEntry);
         ops.broadcast_setting_change();
@@ -92,7 +104,12 @@ pub fn uninstall(
     let dir = entry(kind)?;
     let current = ops.user_path_get().map_err(|e| registry_error(&e))?;
     if let Some(next) = current.as_deref().and_then(|c| path_remove(c, &dir)) {
-        ops.user_path_set(&next).map_err(|e| registry_error(&e))?;
+        // Nothing else was in the value: it goes, as it was absent before install created it.
+        if next.is_empty() {
+            ops.user_path_remove().map_err(|e| registry_error(&e))?;
+        } else {
+            ops.user_path_set(&next).map_err(|e| registry_error(&e))?;
+        }
         removed.push(Artifact::PathEntry);
         ops.broadcast_setting_change();
     }
@@ -116,8 +133,8 @@ pub mod registry {
     use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_EXPAND_SZ,
-        REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegOpenKeyExW,
-        RegQueryValueExW, RegSetValueExW,
+        REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteValueW,
+        RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
@@ -280,6 +297,19 @@ pub mod registry {
             }
         }
 
+        /// Deletes the `Path` value; a missing key or value is `Ok`.
+        pub fn path_remove(&self) -> io::Result<()> {
+            let Some(key) = self.open(KEY_SET_VALUE)? else {
+                return Ok(());
+            };
+            let name = wide(VALUE_NAME);
+            // SAFETY: `key` is open with KEY_SET_VALUE and `name` is NUL-terminated.
+            match unsafe { RegDeleteValueW(key.0, name.as_ptr()) } {
+                ERROR_SUCCESS | ERROR_FILE_NOT_FOUND => Ok(()),
+                other => Err(win32(other)),
+            }
+        }
+
         /// The registry type of `Path` (the CI test checks `REG_EXPAND_SZ` survives).
         pub fn path_type(&self) -> io::Result<Option<u32>> {
             let Some(key) = self.open(KEY_QUERY_VALUE)? else {
@@ -430,6 +460,52 @@ mod tests {
         assert_eq!(entry(&trailing).as_deref(), Ok(DIR));
     }
 
+    /// `C:\` stays `C:\` (`C:` is the current directory of drive C).
+    #[test]
+    fn a_drive_root_keeps_its_separator() {
+        for root in [r"C:\", "C:", "d:/"] {
+            let kind = Kind::Windows {
+                install_dir: PathBuf::from(root),
+            };
+            let want = format!("{}:\\", &root[..1]);
+            assert_eq!(entry(&kind).as_deref(), Ok(want.as_str()), "{root}");
+        }
+    }
+
+    /// No `Path` value before install means none after uninstall (not an empty one); a value with
+    /// other entries is written back with them.
+    #[test]
+    fn a_missing_path_value_stays_missing_after_uninstall() {
+        let ops = FakeOps::new();
+        install(&ops, &layout()).expect("install");
+        assert_eq!(ops.state().path.as_deref(), Some(DIR));
+        uninstall(&ops, &layout()).expect("uninstall");
+        assert_eq!(ops.state(), State::default(), "no empty value is left");
+        assert_eq!(ops.path_removes(), 1);
+    }
+
+    /// A PATH that would pass the registry value's size is refused with its own kind; nothing is
+    /// written or broadcast and the value is as it was. One that just fits is written.
+    #[test]
+    fn a_path_that_grows_too_long_is_refused() {
+        let room = MAX_PATH_UNITS - DIR.len() - 1;
+        let fits = "a".repeat(room);
+        let ops = FakeOps::with_path(&fits);
+        install(&ops, &layout()).expect("just fits");
+        assert_eq!(ops.path_sets(), 1);
+
+        let long = "a".repeat(room + 1);
+        let ops = FakeOps::with_path(&long);
+        assert_eq!(install(&ops, &layout()), Err(InstallError::PathTooLong));
+        assert_eq!(
+            (ops.path_sets(), ops.broadcasts()),
+            (0, 0),
+            "nothing written"
+        );
+        assert_eq!(ops.state().path.as_deref(), Some(long.as_str()));
+        assert_eq!(ops.state().cli_tomls.len(), 0);
+    }
+
     #[test]
     fn install_state_and_removal_follow_the_path() {
         let ops = FakeOps::with_path(r"C:\Windows");
@@ -483,6 +559,9 @@ mod tests {
             }
             fn user_path_set(&self, v: &str) -> io::Result<()> {
                 self.0.path_set(v)
+            }
+            fn user_path_remove(&self) -> io::Result<()> {
+                self.0.path_remove()
             }
             fn broadcast_setting_change(&self) {
                 // The scratch key is nobody's environment; the real broadcast is smoke-tested below.
@@ -561,6 +640,22 @@ mod tests {
         assert_eq!(reg.path_get().expect("get").as_deref(), Some(original));
         assert_eq!(reg.path_type().expect("type"), Some(REG_EXPAND_SZ));
         assert!(!is_installed(&ops, &layout));
+
+        // No `Path` value at all: install creates it, uninstall deletes it again.
+        reg.path_remove().expect("delete");
+        assert_eq!(reg.path_get().expect("get"), None);
+        install(&ops, &layout).expect("install from nothing");
+        assert_eq!(
+            reg.path_get().expect("get").as_deref(),
+            Some(r"C:\Program Files\atlas-duck-ci")
+        );
+        uninstall(&ops, &layout).expect("uninstall");
+        assert_eq!(
+            reg.path_get().expect("get"),
+            None,
+            "the value stays missing"
+        );
+        assert_eq!(reg.path_type().expect("type"), None);
 
         // The broadcast call itself (every top-level window; hung ones time out).
         broadcast_environment_change();

@@ -27,6 +27,7 @@ pub struct State {
 pub struct FakeOps {
     state: Mutex<State>,
     path_sets: Mutex<usize>,
+    path_removes: Mutex<usize>,
     broadcasts: Mutex<usize>,
     /// `write_file` of this path fails (undo tests).
     fail_write: Mutex<Option<PathBuf>>,
@@ -63,6 +64,10 @@ impl FakeOps {
         *lock(&self.path_sets)
     }
 
+    pub fn path_removes(&self) -> usize {
+        *lock(&self.path_removes)
+    }
+
     pub fn broadcasts(&self) -> usize {
         *lock(&self.broadcasts)
     }
@@ -84,6 +89,12 @@ impl PlatformOps for FakeOps {
     fn user_path_set(&self, v: &str) -> io::Result<()> {
         *lock(&self.path_sets) += 1;
         lock(&self.state).path = Some(v.to_owned());
+        Ok(())
+    }
+
+    fn user_path_remove(&self) -> io::Result<()> {
+        *lock(&self.path_removes) += 1;
+        lock(&self.state).path = None;
         Ok(())
     }
 

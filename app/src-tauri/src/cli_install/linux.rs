@@ -104,7 +104,18 @@ fn has_marker(bytes: &[u8], marker: &str) -> bool {
     String::from_utf8_lossy(bytes).lines().any(|l| l == marker)
 }
 
-/// Writes `bytes` to `p` unless it is already so; refuses a file without `marker`.
+/// A symlink at `p`, dangling or not, is never ours: this module writes regular files. `read_file`
+/// follows links, so a dangling one reads as "absent" and the rename would replace it.
+fn is_symlink(ops: &dyn PlatformOps, p: &Path) -> Result<bool, InstallError> {
+    match ops.read_link(p) {
+        Ok(found) => Ok(found.is_some()),
+        // `InvalidInput`: a regular file or directory is there.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Ok(false),
+        Err(e) => Err(io_error(&e)),
+    }
+}
+
+/// Writes `bytes` to `p` unless it is already so; refuses a file without `marker` and any symlink.
 fn write_owned(
     ops: &dyn PlatformOps,
     p: &Path,
@@ -114,6 +125,9 @@ fn write_owned(
     artifact: Artifact,
     done: &mut Report,
 ) -> Result<(), InstallError> {
+    if is_symlink(ops, p)? {
+        return Err(InstallError::Occupied);
+    }
     match ops.read_file(p) {
         Ok(None) => {}
         Ok(Some(existing)) if existing == bytes => return Ok(()),
@@ -157,7 +171,7 @@ pub fn install(ops: &dyn PlatformOps, kind: &Kind, done: &mut Report) -> Result<
     )
 }
 
-/// Removes `p` when it carries `marker`.
+/// Removes `p` when it carries `marker` (never a symlink).
 fn remove_owned(
     ops: &dyn PlatformOps,
     p: &Path,
@@ -165,6 +179,9 @@ fn remove_owned(
     artifact: Artifact,
     removed: &mut Vec<Artifact>,
 ) -> Result<(), InstallError> {
+    if is_symlink(ops, p)? {
+        return Ok(());
+    }
     match ops.read_file(p) {
         Ok(Some(existing)) if has_marker(&existing, marker) => {
             ops.remove(p).map_err(|e| io_error(&e))?;
@@ -439,6 +456,23 @@ mod tests {
             let before = ops.state();
             assert_eq!(install(&ops, &l), Err(InstallError::Occupied));
             // The failed install also leaves nothing of its own behind.
+            assert_eq!(ops.state(), before);
+            assert!(uninstall(&ops, &l).expect("uninstall").changed.is_empty());
+            assert_eq!(ops.state(), before);
+        }
+    }
+
+    /// A symlink at the wrapper or launcher path is someone else's, dangling or not: a dangling one
+    /// reads as "absent" through `read_file`, but it is never replaced or removed.
+    #[test]
+    fn a_symlink_is_never_replaced_or_removed() {
+        let l = layout(IMAGE);
+        for blocked in [wrapper_of(&l), launcher_of(&l)] {
+            let ops = FakeOps::new();
+            ops.symlink(Path::new("/gone/elsewhere"), &blocked)
+                .expect("link");
+            let before = ops.state();
+            assert_eq!(install(&ops, &l), Err(InstallError::Occupied));
             assert_eq!(ops.state(), before);
             assert!(uninstall(&ops, &l).expect("uninstall").changed.is_empty());
             assert_eq!(ops.state(), before);

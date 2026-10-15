@@ -16,13 +16,17 @@ fn inputs(platform: Platform) -> Inputs {
         current_exe: PathBuf::from("/usr/bin/atlas-duck-app"),
         appimage: None,
         appimage_is_file: false,
+        appdir: None,
     }
 }
 
+/// An AppImage run: `$APPIMAGE` is the file, the running binary is inside the mount.
 fn image(p: &str) -> Inputs {
     Inputs {
+        current_exe: PathBuf::from("/tmp/.mount_atlasXYZ123/usr/bin/atlas-duck-app"),
         appimage: Some(PathBuf::from(p)),
         appimage_is_file: true,
+        appdir: Some(PathBuf::from("/tmp/.mount_atlasXYZ123")),
         ..inputs(Platform::Linux)
     }
 }
@@ -88,6 +92,102 @@ fn cli_toml_never_tmp_mount() {
     }
     assert!(under_mount(Path::new("/tmp/.mount_x/usr/bin/a")));
     assert!(!under_mount(Path::new("/home/u/.mounts/a")));
+}
+
+/// `$APPIMAGE` is inherited by every child of an AppImage (a terminal or editor shipped as one).
+/// It counts only when this process runs from an AppImage: the binary under `$APPDIR` or under a
+/// `.mount_*` point. A deb/rpm install started from such a terminal stays `Packaged`; the wrapper
+/// would otherwise `exec` the other AppImage and shadow the packaged CLI.
+#[test]
+fn a_leaked_appimage_variable_does_not_make_a_deb_an_appimage() {
+    let leaked = Inputs {
+        appimage: Some(PathBuf::from("/home/u/Cursor.AppImage")),
+        appimage_is_file: true,
+        appdir: Some(PathBuf::from("/tmp/.mount_CursorQ1w2E3")),
+        ..inputs(Platform::Linux)
+    };
+    let layout = Layout::resolve(&leaked).expect("deb");
+    assert_eq!(layout.kind, Kind::Packaged);
+    assert_eq!(layout.app_path, PathBuf::from("/usr/bin/atlas-duck-app"));
+    let ops = FakeOps::new();
+    assert!(install(&ops, &layout).expect("install").changed.is_empty());
+    assert_eq!(ops.state(), State::default(), "no wrapper, no launcher");
+
+    // Same without `$APPDIR`, with a relative one, and with the root as `$APPDIR`.
+    for appdir in [None, Some("relative/dir"), Some("/")] {
+        let i = Inputs {
+            appdir: appdir.map(PathBuf::from),
+            ..leaked.clone()
+        };
+        assert_eq!(Layout::resolve(&i).expect("deb").kind, Kind::Packaged);
+    }
+
+    // The same variables are trusted when the binary does run from the AppImage: under the mount
+    // (no `$APPDIR` needed) or under `$APPDIR` (an extracted AppImage).
+    let mounted = Inputs {
+        current_exe: PathBuf::from("/tmp/.mount_atlasXYZ123/usr/bin/atlas-duck-app"),
+        appdir: None,
+        ..leaked.clone()
+    };
+    let extracted = Inputs {
+        current_exe: PathBuf::from("/opt/atlas-duck-root/usr/bin/atlas-duck-app"),
+        appdir: Some(PathBuf::from("/opt/atlas-duck-root")),
+        ..leaked
+    };
+    for i in [mounted, extracted] {
+        let l = Layout::resolve(&i).expect("appimage");
+        assert!(matches!(l.kind, Kind::AppImage { .. }), "{i:?}");
+        assert_eq!(l.app_path, PathBuf::from("/home/u/Cursor.AppImage"));
+    }
+}
+
+/// macOS: an app on a mounted disk image or under App Translocation has no stable path.
+#[test]
+fn a_mac_app_on_a_volume_or_translocated_has_no_stable_path() {
+    for exe in [
+        "/Volumes/Atlas Duck/Atlas Duck.app/Contents/MacOS/atlas-duck-app",
+        "/private/var/folders/x/T/AppTranslocation/ID/d/Atlas Duck.app/Contents/MacOS/atlas-duck-app",
+    ] {
+        let i = Inputs {
+            current_exe: PathBuf::from(exe),
+            ..inputs(Platform::Macos)
+        };
+        assert_eq!(
+            Layout::resolve(&i),
+            Err(InstallError::NoStablePath),
+            "{exe}"
+        );
+    }
+}
+
+/// A temp file a crash left behind does not decide the mode of the file that replaces the target,
+/// and it does not survive. (The mode assertion runs on unix only.)
+#[test]
+fn a_stale_temp_file_does_not_decide_the_mode() {
+    let dir = tempfile::Builder::new()
+        .prefix("atlas-duck-t27f-")
+        .tempdir()
+        .expect("tempdir");
+    let target = dir.path().join("atlas-duck");
+    let stale = dir.path().join(".atlas-duck.atlas-duck-tmp");
+    std::fs::write(&stale, b"stale, and longer than the new content").expect("stale");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    }
+    SystemOps.write_file(&target, b"new", 0o755).expect("write");
+    assert_eq!(std::fs::read(&target).expect("read"), b"new");
+    assert!(!stale.exists(), "no temp file is left");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&target)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
 }
 
 #[test]
@@ -249,6 +349,7 @@ fn errors_name_a_kind_and_nothing_else() {
         (InstallError::Occupied, "occupied"),
         (InstallError::Unsupported, "unsupported"),
         (InstallError::Registry, "registry"),
+        (InstallError::PathTooLong, "path_too_long"),
         (InstallError::Io, "io"),
         (InstallError::CliToml, "cli_toml"),
     ] {

@@ -40,6 +40,8 @@ pub trait PlatformOps: Send + Sync {
     fn user_path_get(&self) -> io::Result<Option<String>>;
     /// Writes `HKCU\Environment\Path` as `REG_EXPAND_SZ`.
     fn user_path_set(&self, v: &str) -> io::Result<()>;
+    /// Deletes the `HKCU\Environment\Path` value; a missing one is `Ok`.
+    fn user_path_remove(&self) -> io::Result<()>;
     /// `WM_SETTINGCHANGE "Environment"` to every top-level window, so new processes see the PATH.
     fn broadcast_setting_change(&self);
     /// A symlink `dst` -> `src`; the parent directory is created.
@@ -72,6 +74,8 @@ pub enum InstallError {
     Unsupported,
     /// The registry could not be read or written.
     Registry,
+    /// The user PATH would grow past what the registry value and new processes can carry.
+    PathTooLong,
     /// A file or link could not be written or removed.
     Io,
     /// `cli.toml` could not be written (unparsable or newer-schema file, I/O).
@@ -86,6 +90,7 @@ impl InstallError {
             Self::Occupied => "occupied",
             Self::Unsupported => "unsupported",
             Self::Registry => "registry",
+            Self::PathTooLong => "path_too_long",
             Self::Io => "io",
             Self::CliToml => "cli_toml",
         }
@@ -187,6 +192,8 @@ pub struct Inputs {
     pub appimage: Option<PathBuf>,
     /// `$APPIMAGE` names an existing regular file.
     pub appimage_is_file: bool,
+    /// `$APPDIR` (Linux): the AppImage runtime sets it next to `$APPIMAGE`.
+    pub appdir: Option<PathBuf>,
 }
 
 /// A path that starts with `/` counts as absolute on every platform: the layouts of other
@@ -201,6 +208,17 @@ pub fn under_mount(p: &Path) -> bool {
         Component::Normal(n) => n.to_str().is_some_and(|s| s.starts_with(".mount_")),
         _ => false,
     })
+}
+
+/// This process really runs from an AppImage: the binary is under `$APPDIR` or under the
+/// `.mount_*` point. Children of any AppImage inherit `$APPIMAGE` (a terminal or editor shipped as
+/// one, then a deb install started from it), so the variable alone proves nothing.
+fn runs_from_appimage(i: &Inputs) -> bool {
+    under_mount(&i.current_exe)
+        || i.appdir.as_ref().is_some_and(|dir| {
+            // The root has no parent: an `$APPDIR` of `/` would contain every path.
+            looks_absolute(dir) && dir.parent().is_some() && i.current_exe.starts_with(dir)
+        })
 }
 
 impl Layout {
@@ -232,18 +250,23 @@ impl Layout {
                 windows::check_install_dir(&layout.kind)?;
                 Ok(layout)
             }
-            Platform::Macos => mk(
-                Kind::Macos {
-                    cli: exe_dir.join("atlas-duck"),
-                    link: macos::link_path(&i.home),
-                },
-                i.current_exe.clone(),
-            ),
+            Platform::Macos => {
+                if macos::unstable(&i.current_exe) {
+                    return Err(InstallError::NoStablePath);
+                }
+                mk(
+                    Kind::Macos {
+                        cli: exe_dir.join("atlas-duck"),
+                        link: macos::link_path(&i.home),
+                    },
+                    i.current_exe.clone(),
+                )
+            }
             Platform::Linux => {
                 let image = i
                     .appimage
                     .as_ref()
-                    .filter(|p| i.appimage_is_file && looks_absolute(p));
+                    .filter(|p| runs_from_appimage(i) && i.appimage_is_file && looks_absolute(p));
                 match image {
                     Some(image) => {
                         let layout = mk(
@@ -282,6 +305,9 @@ impl Inputs {
         let appimage: Option<OsString> = std::env::var_os("APPIMAGE").filter(|v| !v.is_empty());
         let appimage = appimage.map(PathBuf::from);
         let appimage_is_file = appimage.as_ref().is_some_and(|p| p.is_file());
+        let appdir = std::env::var_os("APPDIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         Ok(Inputs {
             platform: Platform::current(),
             home: base.home.clone(),
@@ -289,6 +315,7 @@ impl Inputs {
             current_exe,
             appimage,
             appimage_is_file,
+            appdir,
         })
     }
 }
@@ -426,6 +453,17 @@ impl PlatformOps for SystemOps {
         }
     }
 
+    fn user_path_remove(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            windows::registry::RegistryOps::user().path_remove()
+        }
+        #[cfg(not(windows))]
+        {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
     fn broadcast_setting_change(&self) {
         #[cfg(windows)]
         windows::registry::broadcast_environment_change();
@@ -459,8 +497,16 @@ impl PlatformOps for SystemOps {
         tmp_name.push(name);
         tmp_name.push(".atlas-duck-tmp");
         let tmp = parent.join(tmp_name);
+        // A temp file a crash left behind keeps its old mode (the mode below applies only to a file
+        // that is created) and a planted link there would be followed: remove it, then create the
+        // file new (`create_new` never follows a link).
+        match std::fs::remove_file(&tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;

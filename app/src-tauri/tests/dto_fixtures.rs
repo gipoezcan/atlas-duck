@@ -19,7 +19,8 @@ use atlas_duck_app_lib::commands::credential::{
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
 use atlas_duck_app_lib::commands::settings::{
     CliInstallAnswer, ConfinementDto, ExtraLayerDto, OUTCOME_ALREADY_INSTALLED,
-    OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_REMOVED, RetestOutcome, SettingsGet,
+    OUTCOME_ALREADY_ON_PATH, OUTCOME_INSTALLED, OUTCOME_INSTALLED_LOCAL_BIN, OUTCOME_REMOVED,
+    RetestOutcome, SettingsGet,
 };
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
 use atlas_duck_app_lib::wizard::{MSG_NEEDS_SECRET_SERVICE, WizardError, WizardState, WizardStep};
@@ -534,6 +535,7 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::CliInstall(InstallError::Occupied),
         CommandError::CliInstall(InstallError::Unsupported),
         CommandError::CliInstall(InstallError::Registry),
+        CommandError::CliInstall(InstallError::PathTooLong),
         CommandError::CliInstall(InstallError::Io),
         CommandError::CliInstall(InstallError::CliToml),
         // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
@@ -877,18 +879,22 @@ fn settings_gets() -> Vec<SettingsGet> {
             instances: insts.clone(),
             confinement: met,
             cli_installed: true,
+            cli_removable: true,
         },
         SettingsGet {
             settings: views.next().unwrap_or_else(|| unreachable!()),
             instances: insts.split_off(1),
             confinement: not_met,
             cli_installed: false,
+            cli_removable: true,
         },
+        // deb/rpm: the CLI is in `/usr/bin` and nothing can be removed.
         SettingsGet {
             settings: settings_views().remove(1),
             instances: vec![],
             confinement: ConfinementDto::pending(),
-            cli_installed: false,
+            cli_installed: true,
+            cli_removable: false,
         },
     ]
 }
@@ -927,6 +933,7 @@ fn prune_reports() -> Vec<PruneReport> {
 fn cli_install_answers() -> Vec<CliInstallAnswer> {
     [
         OUTCOME_INSTALLED,
+        OUTCOME_INSTALLED_LOCAL_BIN,
         OUTCOME_ALREADY_INSTALLED,
         OUTCOME_REMOVED,
         OUTCOME_ALREADY_ON_PATH,

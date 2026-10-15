@@ -499,6 +499,8 @@ export const SETTINGS_TEXT = {
   cli_outcomes: {
     installed:
       'Installed. Open a new terminal, and restart your MCP clients, so they find the atlas-duck command.',
+    installed_local_bin:
+      'Installed in ~/.local/bin. If a new terminal does not find the atlas-duck command, add ~/.local/bin to the PATH of your shell (on Ubuntu, log out and in again), and restart your MCP clients afterwards.',
     already_installed: 'The atlas-duck command was already installed.',
     removed: 'Removed. New terminals no longer find the atlas-duck command.',
     already_on_path:
@@ -514,6 +516,7 @@ export const SETTINGS_TEXT = {
       'A file or link named atlas-duck is already in the way and was left alone: remove it and try again',
     unsupported: 'Installing to the PATH is not supported on this system',
     registry: 'Your user PATH could not be read or changed',
+    path_too_long: 'Your user PATH is too long to add the atlas-duck folder: shorten it and try again',
     io: 'The command file could not be written or removed',
     cli_toml: 'The file that records where the app is could not be written',
     other: 'The command line could not be installed or removed',

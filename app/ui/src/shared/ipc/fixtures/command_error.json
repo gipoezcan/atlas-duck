@@ -216,6 +216,12 @@
   },
   {
     "error": {
+      "kind": "path_too_long"
+    },
+    "kind": "cli_install"
+  },
+  {
+    "error": {
       "kind": "io"
     },
     "kind": "cli_install"

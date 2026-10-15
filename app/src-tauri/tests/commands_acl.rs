@@ -2367,7 +2367,8 @@ mod settings_commands {
         let h = Harness::jira().await?;
         let (s, i) = (h.core().settings(), h.instances());
         let got =
-            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), false)).await?;
+            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), false, true))
+                .await?;
         assert_eq!(got.instances.len(), 1);
         // The answer is what core's own admin objects say, not a copy of one field.
         assert_eq!(got.settings, h.core().settings().view());
@@ -2375,8 +2376,15 @@ mod settings_commands {
         assert_eq!(got.instances[0].alias, "jira-main");
         assert_eq!(got.confinement.state, "pending");
         assert!(!got.cli_installed);
+        assert!(got.cli_removable);
         let wire = serde_json::to_value(&got)?;
-        for key in ["settings", "instances", "confinement", "cli_installed"] {
+        for key in [
+            "settings",
+            "instances",
+            "confinement",
+            "cli_installed",
+            "cli_removable",
+        ] {
             assert!(wire.get(key).is_some(), "{key}");
         }
         let a = h.instances();
@@ -2389,8 +2397,10 @@ mod settings_commands {
         // The CLI state is the caller's read of the OS, passed through as it is.
         let (s, i) = (h.core().settings(), h.instances());
         let got =
-            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), true)).await?;
+            blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending(), true, false))
+                .await?;
         assert!(got.cli_installed);
+        assert!(!got.cli_removable);
         Ok(())
     }
 
@@ -2403,6 +2413,7 @@ mod settings_commands {
             current_exe: "/tmp/.mount_atlasXYZ/usr/bin/atlas-duck-app".into(),
             appimage: Some("/home/u/Apps/Atlas Duck.AppImage".into()),
             appimage_is_file: true,
+            appdir: Some("/tmp/.mount_atlasXYZ".into()),
         };
         Ok(Layout::resolve(&inputs).map_err(|e| format!("{e:?}"))?)
     }
@@ -2433,7 +2444,8 @@ mod settings_commands {
                 }
             })
         };
-        assert_eq!(run(true).await??.outcome, "installed");
+        // `~/.local/bin` is not on every default PATH: its own word, with its own text.
+        assert_eq!(run(true).await??.outcome, "installed_local_bin");
         assert_eq!(
             cli_records(&h).await?,
             vec![
@@ -2459,6 +2471,38 @@ mod settings_commands {
             State::default(),
             "exactly what was written is gone"
         );
+        Ok(())
+    }
+
+    /// The outcome word follows where the CLI went: the Windows user PATH is `installed`; macOS's
+    /// `~/.local/bin` link is not on every default PATH and has its own word.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_install_outcome_names_where_the_cli_went() -> TestResult {
+        use atlas_duck_app_lib::cli_install::Kind;
+        let h = rig(vec![]).await?;
+        let windows = Layout {
+            kind: Kind::Windows {
+                install_dir: r"C:\Program Files\atlas-duck".into(),
+            },
+            app_path: r"C:\Program Files\atlas-duck\atlas-duck-app.exe".into(),
+            cli_toml: r"C:\Users\u\AppData\Local\atlas-duck\cli.toml".into(),
+        };
+        let mac = Layout::resolve(&Inputs {
+            platform: Platform::Macos,
+            home: "/Users/u".into(),
+            cli_toml: "/Users/u/Library/Application Support/atlas-duck/cli-h.toml".into(),
+            current_exe: "/Applications/Atlas Duck.app/Contents/MacOS/atlas-duck-app".into(),
+            appimage: None,
+            appimage_is_file: false,
+            appdir: None,
+        })
+        .map_err(|e| format!("{e:?}"))?;
+        for (layout, word) in [(windows, "installed"), (mac, "installed_local_bin")] {
+            let ops = std::sync::Arc::new(FakeOps::new());
+            let (s, o) = (h.core().settings(), ops.clone());
+            let res = blocking(move || cli_install_dto(&*s, &*o, Ok(layout))).await??;
+            assert_eq!(res.outcome, word);
+        }
         Ok(())
     }
 
@@ -2517,6 +2561,7 @@ mod settings_commands {
             current_exe: "/tmp/.mount_atlasXYZ/usr/bin/atlas-duck-app".into(),
             appimage: None,
             appimage_is_file: false,
+            appdir: None,
         };
         let deb = Inputs {
             current_exe: "/usr/bin/atlas-duck-app".into(),

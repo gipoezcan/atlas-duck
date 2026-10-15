@@ -185,6 +185,12 @@ describe('fixtures validate against their TS types', () => {
     expect(new Set(confinement)).toEqual(new Set(['met', 'not_met', 'pending']));
     expect(isSettingsGet({ ...full, confinement: { ...full?.confinement, state: 'maybe' } })).toBe(false);
     expect(isSettingsGet({ ...full, cli_installed: 'yes' })).toBe(false);
+    // `cli_removable` is always on the wire as a bool: both values are in the fixtures, anything
+    // else (absent, null, a string) is refused.
+    expect(new Set(settingsGet.map((g) => g.cli_removable))).toEqual(new Set([true, false]));
+    expect(isSettingsGet({ ...full, cli_removable: 'yes' })).toBe(false);
+    expect(isSettingsGet({ ...full, cli_removable: null })).toBe(false);
+    expect(isSettingsGet({ ...full, cli_removable: undefined })).toBe(false);
     expect(isSettingsGet({ ...full, settings: { ...full?.settings, attention_mode: 'loud' } })).toBe(false);
     expect(isSettingsGet({ ...full, settings: { ...full?.settings, config_read_only: { kind: 'x', text: '' } } })).toBe(false);
     // `conn` is written only for a tls, proxy or network failure.
@@ -200,6 +206,7 @@ describe('fixtures validate against their TS types', () => {
     expect(isPruneReport({ result: 'skipped', reason: 3 })).toBe(false);
     expect(isPruneReport({ result: 'other' })).toBe(false);
     expect(isCliInstallAnswer({ outcome: 'installed' })).toBe(true);
+    expect(isCliInstallAnswer({ outcome: 'installed_local_bin' })).toBe(true);
     expect(isCliInstallAnswer({ outcome: 'done' })).toBe(false);
     expect(isCliInstallAnswer({ outcome: 3 })).toBe(false);
     expect(isCliInstallAnswer({})).toBe(false);

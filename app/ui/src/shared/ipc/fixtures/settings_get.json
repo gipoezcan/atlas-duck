@@ -1,6 +1,7 @@
 [
   {
     "cli_installed": true,
+    "cli_removable": true,
     "confinement": {
       "extra_layers": [
         {
@@ -76,6 +77,7 @@
   },
   {
     "cli_installed": false,
+    "cli_removable": true,
     "confinement": {
       "extra_layers": [],
       "failed": [
@@ -129,7 +131,8 @@
     }
   },
   {
-    "cli_installed": false,
+    "cli_installed": true,
+    "cli_removable": false,
     "confinement": {
       "extra_layers": [],
       "failed": [],

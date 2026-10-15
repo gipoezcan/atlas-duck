@@ -70,7 +70,13 @@ export function Settings() {
     );
   }
 
-  const { settings, instances, confinement, cli_installed: cliInstalled } = data;
+  const {
+    settings,
+    instances,
+    confinement,
+    cli_installed: cliInstalled,
+    cli_removable: cliRemovable,
+  } = data;
   const banner = settings.config_read_only;
   const readOnly = banner !== null;
   return (
@@ -98,7 +104,7 @@ export function Settings() {
       <Limits view={settings} onChanged={reload} readOnly={readOnly} />
       <Retention view={settings} onChanged={reload} readOnly={readOnly} />
       <ConfinementStatus confinement={confinement} />
-      <Cli installed={cliInstalled} onChanged={reload} />
+      <Cli installed={cliInstalled} removable={cliRemovable} onChanged={reload} />
       <RemovalSection />
     </main>
     </WindowBusyContext.Provider>

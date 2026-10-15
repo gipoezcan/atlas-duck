@@ -309,6 +309,8 @@ export interface SettingsGet {
   instances: InstanceView[];
   confinement: Confinement;
   cli_installed: boolean;
+  /** Removal changes something: false for deb/rpm, where the package owns the CLI (no button). */
+  cli_removable: boolean;
 }
 
 /** One `settings_apply` change, in core's closed `{key, value}` form (`SettingChangeReq`). */
@@ -351,10 +353,11 @@ export type PruneReport =
 
 /**
  * `cli_install` / `cli_uninstall` (spec 12.3): what happened, as a fixed word. `already_on_path` is
- * deb/rpm, where the CLI is in `/usr/bin` and nothing is installed or removed.
+ * deb/rpm, where the CLI is in `/usr/bin` and nothing is installed or removed. `installed_local_bin`
+ * is macOS and the AppImage: the CLI is in `~/.local/bin`, which is not on every default PATH.
  */
 export interface CliInstallAnswer {
-  outcome: 'installed' | 'already_installed' | 'removed' | 'already_on_path';
+  outcome: 'installed' | 'installed_local_bin' | 'already_installed' | 'removed' | 'already_on_path';
 }
 
 /** The wizard steps in the order Rust walks them (`app::wizard::WizardStep`, PD-77). */
@@ -416,7 +419,8 @@ export type CommandError =
   | { kind: 'settings'; error: CoreError }
   /**
    * "Install CLI to PATH" or its removal failed (T27): `error.kind` is `no_stable_path`,
-   * `unsafe_path`, `occupied`, `unsupported`, `registry`, `io` or `cli_toml`; no path, no OS text.
+   * `unsafe_path`, `occupied`, `unsupported`, `registry`, `path_too_long`, `io` or `cli_toml`; no
+   * path, no OS text.
    */
   | { kind: 'cli_install'; error: CoreError }
   /** The credential window is open for something else (T25): close it first. */

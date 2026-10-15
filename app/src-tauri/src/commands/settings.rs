@@ -343,6 +343,9 @@ pub struct SettingsGet {
     pub instances: Vec<InstanceView>,
     pub confinement: ConfinementDto,
     pub cli_installed: bool,
+    /// "Remove CLI from PATH" does something here: false for deb/rpm (the CLI is in `/usr/bin`; the
+    /// package owns it), where Settings shows no removal button.
+    pub cli_removable: bool,
 }
 
 /// `retest_token`'s answer: "Connected as <user>" or a fixed failure class (§10.3); the instance
@@ -355,14 +358,18 @@ pub enum RetestOutcome {
 }
 
 /// `cli_install` / `cli_uninstall`'s answer (§12.3): what happened, as a fixed word the page maps
-/// to its own text: `installed`, `already_installed`, `removed`, or `already_on_path` (deb/rpm have
-/// the CLI in `/usr/bin`; nothing is installed or removed).
+/// to its own text: `installed`, `installed_local_bin`, `already_installed`, `removed`, or
+/// `already_on_path` (deb/rpm have the CLI in `/usr/bin`; nothing is installed or removed).
+/// `installed_local_bin` is the answer where the CLI went to `~/.local/bin` (macOS, AppImage): that
+/// directory is not on every default PATH (macOS has none, Ubuntu adds it at login only when it
+/// existed), and the app cannot read the session PATH (§7.7), so the text says what to check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CliInstallAnswer {
     pub outcome: &'static str,
 }
 
 pub const OUTCOME_INSTALLED: &str = "installed";
+pub const OUTCOME_INSTALLED_LOCAL_BIN: &str = "installed_local_bin";
 pub const OUTCOME_ALREADY_INSTALLED: &str = "already_installed";
 pub const OUTCOME_REMOVED: &str = "removed";
 pub const OUTCOME_ALREADY_ON_PATH: &str = "already_on_path";
@@ -372,26 +379,36 @@ fn this_machine() -> Result<Layout, InstallError> {
     Layout::resolve(&Inputs::detect()?)
 }
 
-/// Whether the CLI is on the PATH as this installation wants it (§12.3); a machine whose layout
-/// cannot be resolved (no stable path) counts as not installed.
-pub fn cli_installed() -> bool {
-    this_machine().is_ok_and(|layout| cli_install::is_installed(&SystemOps, &layout))
+/// `(installed, removable)` of the CLI on this machine (§12.3). `installed`: the CLI is on the PATH
+/// as this installation wants it; a machine whose layout cannot be resolved (no stable path) counts
+/// as not installed. `removable`: removal changes something, which it does not for deb/rpm.
+pub fn cli_state() -> (bool, bool) {
+    match this_machine() {
+        Ok(layout) => (
+            cli_install::is_installed(&SystemOps, &layout),
+            !matches!(layout.kind, Kind::Packaged),
+        ),
+        Err(_) => (false, true),
+    }
 }
 
 // ---------- the pure parts the tests drive ----------
 
-/// `settings_get` over core. `cli_installed` is [`cli_installed`] (the caller reads the OS).
+/// `settings_get` over core. `cli_installed` and `cli_removable` are [`cli_state`] (the caller
+/// reads the OS).
 pub fn settings_get_dto(
     settings: &dyn SettingsAdmin,
     instances: &dyn InstanceAdmin,
     confinement: ConfinementDto,
     cli_installed: bool,
+    cli_removable: bool,
 ) -> SettingsGet {
     SettingsGet {
         settings: settings.view(),
         instances: instances.list(),
         confinement,
         cli_installed,
+        cli_removable,
     }
 }
 
@@ -441,7 +458,10 @@ pub fn cli_install_dto(
     settings.record_app_change(APP_CHANGE_KEY, installed(false), installed(true))?;
     match cli_install::install(ops, &layout) {
         Ok(_) => Ok(CliInstallAnswer {
-            outcome: OUTCOME_INSTALLED,
+            outcome: match layout.kind {
+                Kind::Macos { .. } | Kind::AppImage { .. } => OUTCOME_INSTALLED_LOCAL_BIN,
+                Kind::Windows { .. } | Kind::Packaged => OUTCOME_INSTALLED,
+            },
         }),
         Err(e) => {
             record_undo(settings, false, true);
@@ -678,11 +698,13 @@ pub async fn settings_get<R: Runtime>(
             let (settings, instances) = (core.settings(), core.instances());
             // Reads the registry or the file system: the blocking pool.
             blocking(move || {
+                let (installed, removable) = cli_state();
                 Ok(settings_get_dto(
                     &*settings,
                     &*instances,
                     confinement,
-                    cli_installed(),
+                    installed,
+                    removable,
                 ))
             })
             .await

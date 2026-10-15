@@ -388,7 +388,13 @@ describe('Settings', () => {
 
   it('every CLI outcome has its own fixed text', async () => {
     const seen = new Set<string>();
-    for (const outcome of ['installed', 'already_installed', 'removed', 'already_on_path'] as const) {
+    for (const outcome of [
+      'installed',
+      'installed_local_bin',
+      'already_installed',
+      'removed',
+      'already_on_path',
+    ] as const) {
       const { unmount } = await show(plain({}, { cli_installed: false }));
       vi.mocked(cliInstall).mockResolvedValue({ outcome });
       fireEvent.click(screen.getByRole('button', { name: 'Install CLI to PATH' }));
@@ -396,9 +402,30 @@ describe('Settings', () => {
       const text = screen.getByRole('status').textContent ?? '';
       expect(text.length).toBeGreaterThan(10);
       seen.add(text);
+      if (outcome === 'installed_local_bin') {
+        // `~/.local/bin` is not on every default PATH: the text says where it went and what to do.
+        expect(text).toContain('~/.local/bin');
+        expect(text).toMatch(/does not find the atlas-duck command/);
+        expect(text).toMatch(/log out and in again/);
+      } else {
+        expect(text).not.toContain('~/.local/bin');
+      }
       unmount();
     }
-    expect(seen.size).toBe(4);
+    expect(seen.size).toBe(5);
+  });
+
+  it('deb/rpm: no removal button, the package sentence is the status', async () => {
+    await show(plain({}, { cli_installed: true, cli_removable: false }));
+    expect(screen.queryByRole('button', { name: 'Remove CLI from PATH' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Install CLI to PATH' })).toBeNull();
+    expect(screen.getByText(/comes with the package and is already on your PATH/)).toBeTruthy();
+    expect(cliUninstall).not.toHaveBeenCalled();
+  });
+
+  it('a removable CLI shows the removal button (cli_removable true)', async () => {
+    await show(plain({}, { cli_installed: true, cli_removable: true }));
+    expect(screen.getByRole('button', { name: 'Remove CLI from PATH' })).toBeTruthy();
   });
 
   it('a refused CLI install shows a fixed text per error kind and never echoes the wire', async () => {
@@ -409,6 +436,7 @@ describe('Settings', () => {
       occupied: /already in the way and was left alone/,
       unsupported: /not supported on this system/,
       registry: /user PATH could not be read or changed/,
+      path_too_long: /user PATH is too long/,
       io: /command file could not be written or removed/,
       cli_toml: /records where the app is/,
     };

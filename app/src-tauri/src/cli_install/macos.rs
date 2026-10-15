@@ -2,11 +2,15 @@
 //! binary in the bundle. The `/usr/local/bin` variant (admin prompt) is out of v1 scope: the user's
 //! `~/.local/bin` can always be created, so it is never needed (the report says so).
 //!
-//! A link is ours when its target is a file named `atlas-duck`: a link left by an earlier install
-//! of a moved bundle is replaced, anything else (another tool's `atlas-duck`, a regular file) is
-//! `occupied` and left alone. `uninstall` removes only such links.
+//! A link is ours when its target is `<name>.app/Contents/MacOS/atlas-duck`: a link left by an
+//! earlier install of a moved bundle is replaced, anything else (another tool's `atlas-duck`, a
+//! source build's `target/release/atlas-duck`, a regular file) is `occupied` and left alone.
+//! `uninstall` removes only such links.
+//!
+//! The running app must live where it stays: not on a mounted disk image or under App
+//! Translocation ([`unstable`]); the link and `cli.toml` would dangle after eject or quit.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::{Artifact, InstallError, Kind, PlatformOps, Report, io_error};
 
@@ -18,8 +22,35 @@ pub fn link_path(home: &Path) -> PathBuf {
     home.join(".local").join("bin").join(CLI_NAME)
 }
 
+/// The target is the CLI inside an app bundle: `*.app/Contents/MacOS/atlas-duck`.
 fn is_ours(target: &Path) -> bool {
-    target.file_name().is_some_and(|n| n == CLI_NAME)
+    let names: Vec<&str> = target
+        .components()
+        .rev()
+        .take(4)
+        .map(|c| match c {
+            Component::Normal(n) => n.to_str().unwrap_or(""),
+            _ => "",
+        })
+        .collect();
+    matches!(
+        names.as_slice(),
+        [CLI_NAME, "MacOS", "Contents", bundle] if bundle.len() > ".app".len() && bundle.ends_with(".app")
+    )
+}
+
+/// The app runs from a place that disappears: Gatekeeper App Translocation (an `AppTranslocation`
+/// component, the canonical path of a translocated app) or a volume under `/Volumes` (a mounted
+/// disk image; an external disk looks the same and is refused too).
+pub fn unstable(p: &Path) -> bool {
+    let mut parts = p.components();
+    let on_volume = matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(Component::RootDir), Some(Component::Normal(v)), Some(_)) if v == "Volumes"
+    );
+    on_volume
+        || p.components()
+            .any(|c| matches!(c, Component::Normal(n) if n == "AppTranslocation"))
 }
 
 pub fn install(ops: &dyn PlatformOps, kind: &Kind, done: &mut Report) -> Result<(), InstallError> {
@@ -140,20 +171,39 @@ mod tests {
         install(&ops, &l).expect("install over a stale link");
         assert!(is_installed(&ops, &l));
 
-        let foreign = FakeOps::new();
-        foreign
-            .symlink(Path::new("/usr/bin/other"), &link(&l))
-            .expect("link");
-        let before = foreign.state();
-        assert_eq!(install(&foreign, &l), Err(InstallError::Occupied));
-        assert_eq!(foreign.state(), before, "nothing changed");
-        assert!(
-            uninstall(&foreign, &l)
-                .expect("uninstall")
-                .changed
-                .is_empty()
-        );
-        assert_eq!(foreign.state(), before, "a foreign link is not removed");
+        // Other links, among them ones whose target is merely named `atlas-duck` (a source build,
+        // another packaging, a bundle without the `.app` suffix, a dangling one), are never touched.
+        for target in [
+            "/usr/bin/other",
+            "/Users/u/src/atlas-duck/target/release/atlas-duck",
+            "/opt/homebrew/bin/atlas-duck",
+            "/old/Atlas Duck/Contents/MacOS/atlas-duck",
+            "/old/.app/Contents/MacOS/atlas-duck",
+            "/old/Atlas Duck.app/Contents/Resources/atlas-duck",
+            "/gone/not-there/atlas-duck",
+        ] {
+            let foreign = FakeOps::new();
+            foreign.symlink(Path::new(target), &link(&l)).expect("link");
+            let before = foreign.state();
+            assert_eq!(
+                install(&foreign, &l),
+                Err(InstallError::Occupied),
+                "{target}"
+            );
+            assert_eq!(foreign.state(), before, "nothing changed: {target}");
+            assert!(
+                uninstall(&foreign, &l)
+                    .expect("uninstall")
+                    .changed
+                    .is_empty(),
+                "{target}"
+            );
+            assert_eq!(
+                foreign.state(),
+                before,
+                "a foreign link is not removed: {target}"
+            );
+        }
 
         let file = FakeOps::new();
         file.write_file(&link(&l), b"#!/bin/sh\n", 0o755)
@@ -162,6 +212,24 @@ mod tests {
         assert_eq!(install(&file, &l), Err(InstallError::Occupied));
         assert!(uninstall(&file, &l).expect("uninstall").changed.is_empty());
         assert_eq!(file.state(), before);
+    }
+
+    #[test]
+    fn a_disk_image_or_translocated_app_has_no_stable_path() {
+        for bad in [
+            "/Volumes/Atlas Duck/Atlas Duck.app/Contents/MacOS/atlas-duck-app",
+            "/private/var/folders/ab/T/AppTranslocation/1B2C-3D/d/Atlas Duck.app/Contents/MacOS/atlas-duck-app",
+        ] {
+            assert!(unstable(Path::new(bad)), "{bad}");
+        }
+        for good in [
+            "/Applications/Atlas Duck.app/Contents/MacOS/atlas-duck-app",
+            "/Users/u/Applications/Atlas Duck.app/Contents/MacOS/atlas-duck-app",
+            "/Users/u/Volumes/a.app/Contents/MacOS/atlas-duck-app",
+            "/Volumes",
+        ] {
+            assert!(!unstable(Path::new(good)), "{good}");
+        }
     }
 
     #[test]

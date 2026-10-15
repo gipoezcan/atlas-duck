@@ -3,6 +3,9 @@
     "outcome": "installed"
   },
   {
+    "outcome": "installed_local_bin"
+  },
+  {
     "outcome": "already_installed"
   },
   {
