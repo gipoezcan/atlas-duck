@@ -9,6 +9,7 @@ import { Instances } from './Instances';
 import { Limits } from './Limits';
 import { Retention } from './Retention';
 import { Cfg } from './text';
+import { useWindowBusy, WindowBusyContext } from './useAction';
 
 /**
  * The Settings window (spec 5.7). It reads `settings_get` on mount and on every `settings_changed`
@@ -21,6 +22,7 @@ export function Settings() {
   const [nonce, setNonce] = useState(0);
   const latest = useRef(0);
   const reload = useCallback(() => setNonce((n) => n + 1), []);
+  const busy = useWindowBusy();
 
   useEffect(() => {
     let live = true;
@@ -69,7 +71,9 @@ export function Settings() {
 
   const { settings, instances, confinement, cli_installed: cliInstalled } = data;
   const banner = settings.config_read_only;
+  const readOnly = banner !== null;
   return (
+    <WindowBusyContext.Provider value={busy}>
     <main>
       <h1>{WINDOW_TITLES.settings}</h1>
       {failed ? (
@@ -85,17 +89,18 @@ export function Settings() {
           <strong>{T.read_only_prefix}</strong> <Cfg value={banner.text} />
         </p>
       )}
-      {/* A read-only config disables the whole form: every control below is inside this fieldset. */}
-      <fieldset disabled={banner !== null} className="settings-form">
-        <Instances instances={instances} onChanged={reload} />
-        <InstanceForm onAdded={reload} />
-        <Limits view={settings} onChanged={reload} />
-        <Retention view={settings} onChanged={reload} />
-        <ConfinementStatus confinement={confinement} />
-        <CliSection installed={cliInstalled} />
-        <RemovalSection />
-      </fieldset>
+      {/* A read-only config disables the controls that write config.toml (each section wraps them
+          in a Guard). Re-test, Add/Replace token and the prune button stay on: core refuses
+          ConfigReadOnly only for config-writing operations. */}
+      <Instances instances={instances} onChanged={reload} readOnly={readOnly} />
+      <InstanceForm onAdded={reload} readOnly={readOnly} />
+      <Limits view={settings} onChanged={reload} readOnly={readOnly} />
+      <Retention view={settings} onChanged={reload} readOnly={readOnly} />
+      <ConfinementStatus confinement={confinement} />
+      <CliSection installed={cliInstalled} />
+      <RemovalSection />
     </main>
+    </WindowBusyContext.Provider>
   );
 }
 

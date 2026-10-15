@@ -3,6 +3,7 @@ import { useState } from 'react';
 import { settingsApply } from '../shared/ipc/invoke';
 import type { SettingChange, SettingsView } from '../shared/ipc/types';
 import { SETTINGS_TEXT as T } from '../shared/strings';
+import { Guard } from './Guard';
 import { useAction } from './useAction';
 
 /** A whole number, or `null` when the text is not one (range checks are core's). */
@@ -35,13 +36,15 @@ const shown = (view: SettingsView, key: LimitKey): string => {
 interface LimitsProps {
   view: SettingsView;
   onChanged: () => void;
+  /** config.toml is read-only: the form is off. */
+  readOnly: boolean;
 }
 
 /**
  * The limits form. A field the user edited keeps its text across re-reads of the settings (a
  * `settings_changed` event must not overwrite typing); a field not edited follows the view.
  */
-export function Limits({ view, onChanged }: LimitsProps) {
+export function Limits({ view, onChanged, readOnly }: LimitsProps) {
   const [draft, setDraft] = useState<Partial<Record<LimitKey, string>>>({});
   const [local, setLocal] = useState<string | null>(null);
   const [applied, setApplied] = useState(false);
@@ -77,6 +80,7 @@ export function Limits({ view, onChanged }: LimitsProps) {
   return (
     <section aria-label={T.limits}>
       <h2>{T.limits}</h2>
+      <Guard disabled={readOnly}>
       {KEYS.map((key) => (
         <div key={key} className="field">
           <label>
@@ -102,6 +106,7 @@ export function Limits({ view, onChanged }: LimitsProps) {
       {local === null ? null : <p role="alert">{local}</p>}
       {action.error === null ? null : <p role="alert">{action.error}</p>}
       {applied ? <p role="status">{T.applied}</p> : null}
+      </Guard>
     </section>
   );
 }

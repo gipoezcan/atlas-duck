@@ -4,7 +4,8 @@ import { pruneBacklogNow, settingsApply } from '../shared/ipc/invoke';
 import type { AttentionMode, PruneReport, SettingChange, SettingsView } from '../shared/ipc/types';
 import { SETTINGS_TEXT as T } from '../shared/strings';
 import { parseWhole } from './Limits';
-import { Cfg } from './text';
+import { Guard } from './Guard';
+import { Cfg, own } from './text';
 import { useAction } from './useAction';
 
 const MODES: readonly AttentionMode[] = ['show_without_activating', 'badge_only', 'show_and_focus'];
@@ -12,14 +13,17 @@ const MODES: readonly AttentionMode[] = ['show_without_activating', 'badge_only'
 interface RetentionProps {
   view: SettingsView;
   onChanged: () => void;
+  readOnly: boolean;
 }
 
 /**
  * Retention, legal hold and the attention mode, the external anchor directory (display only) and
  * the prune backlog line. Retention and hold go through core's native confirmation when they
- * weaken a guarantee; a declined confirmation is `cancelled` and the form shows the stored value.
+ * weaken a guarantee; a declined confirmation is `cancelled`: the hold and the mode snap back to
+ * the stored value, the typed retention days stay in the field beside the error text. A read-only
+ * config turns the config-writing controls off; the prune button is core's call.
  */
-export function Retention({ view, onChanged }: RetentionProps) {
+export function Retention({ view, onChanged, readOnly }: RetentionProps) {
   const [days, setDays] = useState<string | null>(null);
   const [local, setLocal] = useState<string | null>(null);
   const retention = useAction();
@@ -60,6 +64,7 @@ export function Retention({ view, onChanged }: RetentionProps) {
   return (
     <section aria-label={T.retention}>
       <h2>{T.retention}</h2>
+      <Guard disabled={readOnly}>
       <div className="field">
         <label>
           {T.retention_days}
@@ -106,6 +111,7 @@ export function Retention({ view, onChanged }: RetentionProps) {
         <p>{T.presentation_note}</p>
         {mode.error === null ? null : <p role="alert">{mode.error}</p>}
       </div>
+      </Guard>
       <p>
         {T.anchor}:{' '}
         {view.anchor_dir === null ? T.anchor_none : <Cfg value={view.anchor_dir} />}
@@ -149,7 +155,7 @@ function PruneResult({ report }: { report: PruneReport }) {
       </p>
     );
   }
-  const known = T.prune_reasons[report.reason];
+  const known = own(T.prune_reasons, report.reason);
   return (
     <p role="status">
       {T.prune_skipped}: {known ?? <Cfg value={report.reason} />}

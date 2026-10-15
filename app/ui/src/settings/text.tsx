@@ -26,7 +26,9 @@ export function errorText(e: unknown): string {
   if (typeof e !== 'object' || e === null || !('kind' in e)) return t.errors.internal ?? '';
   const err = e as { kind: string; field?: unknown; error?: { kind?: unknown; key?: unknown } };
   if (err.kind === 'invalid_argument') {
-    return t.invalid_field(typeof err.field === 'string' ? err.field : 'a field');
+    // Only the argument names Rust is known to report get a label; the wire name is not shown.
+    const label = typeof err.field === 'string' ? own(t.invalid_arguments, err.field) : undefined;
+    return t.invalid_field(label ?? 'a field');
   }
   if (err.kind === 'admin' || err.kind === 'settings') {
     const inner = err.error?.kind;
@@ -34,12 +36,17 @@ export function errorText(e: unknown): string {
     if (inner === 'invalid') {
       const key = err.error?.key;
       return t.invalid_field(
-        typeof key === 'string' ? (t.limit_labels[key] ?? 'a setting') : 'a setting',
+        typeof key === 'string' ? (own(t.limit_labels, key) ?? 'a setting') : 'a setting',
       );
     }
-    return (typeof inner === 'string' ? t.errors[inner] : undefined) ?? t.errors.other ?? '';
+    return (typeof inner === 'string' ? own(t.errors, inner) : undefined) ?? t.errors.other ?? '';
   }
-  return t.errors[err.kind] ?? t.errors.internal ?? '';
+  return own(t.errors, err.kind) ?? t.errors.internal ?? '';
+}
+
+/** An own entry of a text table: a wire name like `constructor` must not reach a prototype member. */
+export function own(table: Readonly<Record<string, string>>, key: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
 }
 
 /** PD-84: the warning line of an instance whose token expiry is near; `null` when there is none. */

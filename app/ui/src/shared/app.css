@@ -41,6 +41,7 @@
 .deny-keys { flex-basis: 100%; font-size: 0.9em; }
 .deny-offers { flex-basis: 100%; margin: 0; }
 .deny-offer-detail { margin-left: 1.5rem; }
+.settings-guard { margin: 0; padding: 0; border: 0; min-width: 0; }
 .edit-form fieldset { margin: 0.5rem 0; border: 1px solid #8886; }
 .edit-form .field { display: flex; flex-direction: column; gap: 0.2rem; margin: 0.4rem 0; border: 0; padding: 0; }
 .edit-form .field input[type="text"], .edit-form .field textarea, .edit-form .field select { max-width: 100%; }

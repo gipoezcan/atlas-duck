@@ -2,11 +2,14 @@ import { useState } from 'react';
 
 import { instanceAdd } from '../shared/ipc/invoke';
 import { SETTINGS_TEXT as T } from '../shared/strings';
+import { Guard } from './Guard';
 import { useAction } from './useAction';
 
 interface InstanceFormProps {
   /** Called after Rust added the instance (its native confirmation was answered Ok). */
   onAdded: () => void;
+  /** config.toml is read-only: the form is off. */
+  readOnly: boolean;
 }
 
 /**
@@ -14,18 +17,18 @@ interface InstanceFormProps {
  * refuses `http://` (with the fixed hint) and draws the confirmation. A custom CA is never read
  * here: the checkbox only asks Rust to open its own file dialog (spec 10.3).
  */
-export function InstanceForm({ onAdded }: InstanceFormProps) {
+export function InstanceForm({ onAdded, readOnly }: InstanceFormProps) {
   const [alias, setAlias] = useState('');
   const [product, setProduct] = useState<'jira' | 'confluence'>('jira');
   const [baseUrl, setBaseUrl] = useState('');
   const [proxy, setProxy] = useState('');
   const [ca, setCa] = useState(false);
   const [isDefault, setIsDefault] = useState(false);
-  const [added, setAdded] = useState(false);
+  const [added, setAdded] = useState<string | null>(null);
   const action = useAction();
 
   const submit = () => {
-    setAdded(false);
+    setAdded(null);
     void action
       .run(() =>
         instanceAdd({
@@ -39,7 +42,8 @@ export function InstanceForm({ onAdded }: InstanceFormProps) {
       )
       .then((v) => {
         if (v === undefined) return;
-        setAdded(true);
+        // dd confirmed the origin in its own dialog: an instance without a token is next.
+        setAdded(v.state === 'needs_token' ? T.add_done_token : T.add_done);
         setAlias('');
         setBaseUrl('');
         setProxy('');
@@ -52,6 +56,7 @@ export function InstanceForm({ onAdded }: InstanceFormProps) {
   return (
     <section aria-label={T.add_heading}>
       <h2>{T.add_heading}</h2>
+      <Guard disabled={readOnly}>
       <label>
         {T.add_alias}
         <input type="text" value={alias} onChange={(e) => setAlias(e.target.value)} />
@@ -82,8 +87,9 @@ export function InstanceForm({ onAdded }: InstanceFormProps) {
       <button type="button" disabled={action.pending} onClick={submit}>
         {T.add_submit}
       </button>
+      </Guard>
       {action.error === null ? null : <p role="alert">{action.error}</p>}
-      {added ? <p role="status">{T.add_done}</p> : null}
+      {added === null ? null : <p role="status">{added}</p>}
     </section>
   );
 }

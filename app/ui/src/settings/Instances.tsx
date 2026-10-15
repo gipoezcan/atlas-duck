@@ -1,4 +1,4 @@
-import { Fragment, useState } from 'react';
+import { Fragment, useId, useState } from 'react';
 
 import {
   credentialWindowOpen,
@@ -17,7 +17,8 @@ import {
 } from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { unusual } from '../shared/text/unusual';
-import { Cfg, expiryWarningText } from './text';
+import { Guard } from './Guard';
+import { Cfg, expiryWarningText, own } from './text';
 import { useAction } from './useAction';
 
 const HEADER_STATES = ['identity_header_missing', 'identity_header_mismatch'];
@@ -26,10 +27,12 @@ interface InstancesProps {
   instances: readonly InstanceView[];
   /** Re-reads the window's state after a command changed something. */
   onChanged: () => void;
+  /** config.toml is read-only: the controls that write it are off, token and re-test stay on. */
+  readOnly: boolean;
 }
 
 /** The instances table (spec 7.1): one row per instance, its actions, the pending URL change. */
-export function Instances({ instances, onChanged }: InstancesProps) {
+export function Instances({ instances, onChanged, readOnly }: InstancesProps) {
   if (instances.length === 0) return <p>{T.no_instances}</p>;
   return (
     <table className="instances">
@@ -48,7 +51,7 @@ export function Instances({ instances, onChanged }: InstancesProps) {
       </thead>
       <tbody>
         {instances.map((inst) => (
-          <InstanceRow key={inst.alias} inst={inst} onChanged={onChanged} />
+          <InstanceRow key={inst.alias} inst={inst} onChanged={onChanged} readOnly={readOnly} />
         ))}
       </tbody>
     </table>
@@ -60,13 +63,23 @@ function stateLabel(state: string) {
   return known === undefined ? <Cfg value={state} /> : <>{known}</>;
 }
 
-function InstanceRow({ inst, onChanged }: { inst: InstanceView; onChanged: () => void }) {
+function InstanceRow({
+  inst,
+  onChanged,
+  readOnly,
+}: {
+  inst: InstanceView;
+  onChanged: () => void;
+  readOnly: boolean;
+}) {
+  // The repeated per-row controls point at the alias cell, so a reader hears which instance.
+  const aliasId = useId();
   const warning = expiryWarningText(inst);
   const headerState = HEADER_STATES.includes(inst.state);
   return (
     <Fragment>
       <tr>
-        <th scope="row">
+        <th scope="row" id={aliasId}>
           <Cfg value={inst.alias} />
         </th>
         <td>{T.product[inst.product]}</td>
@@ -95,13 +108,18 @@ function InstanceRow({ inst, onChanged }: { inst: InstanceView; onChanged: () =>
           {inst.pac_configured ? <p>{PAC_HINT}</p> : null}
         </td>
         <td>
-          <RowActions inst={inst} onChanged={onChanged} />
+          <RowActions inst={inst} onChanged={onChanged} readOnly={readOnly} aliasId={aliasId} />
         </td>
       </tr>
       {inst.pending_url_change === null ? null : (
         <tr className="url-change">
           <td colSpan={8}>
-            <PendingUrlChange inst={inst} url={inst.pending_url_change} onChanged={onChanged} />
+            <PendingUrlChange
+              inst={inst}
+              url={inst.pending_url_change}
+              onChanged={onChanged}
+              readOnly={readOnly}
+            />
           </td>
         </tr>
       )}
@@ -113,10 +131,12 @@ function PendingUrlChange({
   inst,
   url,
   onChanged,
+  readOnly,
 }: {
   inst: InstanceView;
   url: string;
   onChanged: () => void;
+  readOnly: boolean;
 }) {
   const accept = useAction();
   return (
@@ -127,17 +147,19 @@ function PendingUrlChange({
       <p>
         {T.url_change_requested} <Cfg value={url} />
       </p>
-      <button
-        type="button"
-        disabled={accept.pending}
-        onClick={() =>
-          void accept.run(() => instanceAcceptUrlChange(inst.alias)).then((v) => {
-            if (v !== undefined) onChanged();
-          })
-        }
-      >
-        {T.url_change_accept}
-      </button>
+      <Guard disabled={readOnly}>
+        <button
+          type="button"
+          disabled={accept.pending}
+          onClick={() =>
+            void accept.run(() => instanceAcceptUrlChange(inst.alias)).then((v) => {
+              if (v !== undefined) onChanged();
+            })
+          }
+        >
+          {T.url_change_accept}
+        </button>
+      </Guard>
       {accept.error === null ? null : <p role="alert">{accept.error}</p>}
     </div>
   );
@@ -145,11 +167,13 @@ function PendingUrlChange({
 
 function RetestResult({ outcome }: { outcome: RetestOutcome }) {
   if ('ok' in outcome) {
-    const { atlassian_user: user, warnings } = outcome.ok;
+    const { atlassian_user: user, product, version, warnings } = outcome.ok;
     return (
       <div role="status">
         <p>
           {T.retest_connected} <AgentText value={user} unusual={unusual(user)} />
+          {', '}
+          {product === 'jira' || product === 'confluence' ? T.product[product] : null}{' '}<AgentText value={version} unusual={unusual(version)} />
         </p>
         {warnings.length === 0 ? null : (
           <>
@@ -166,21 +190,26 @@ function RetestResult({ outcome }: { outcome: RetestOutcome }) {
       </div>
     );
   }
-  const cls = outcome.failed.class;
-  const known = T.retest_classes[cls];
+  // An unrecognized class is shown as fixed text only: the wire name is not echoed.
+  const known = own(T.retest_classes, outcome.failed.class) ?? T.retest_class_unknown;
   return (
     <p role="status">
-      {T.retest_failed}{' '}
-      {known ?? (
-        <>
-          {T.retest_class_unknown} <AgentText value={cls} unusual={unusual(cls)} />
-        </>
-      )}
+      {T.retest_failed} {known}
     </p>
   );
 }
 
-function RowActions({ inst, onChanged }: { inst: InstanceView; onChanged: () => void }) {
+function RowActions({
+  inst,
+  onChanged,
+  readOnly,
+  aliasId,
+}: {
+  inst: InstanceView;
+  onChanged: () => void;
+  readOnly: boolean;
+  aliasId: string;
+}) {
   const confirm = useAction();
   const retest = useAction();
   const token = useAction();
@@ -199,13 +228,16 @@ function RowActions({ inst, onChanged }: { inst: InstanceView; onChanged: () => 
       {unconfirmed ? (
         <>
           <p>{T.confirm_hint}</p>
-          <button
-            type="button"
-            disabled={confirm.pending}
-            onClick={() => void confirm.run(() => instanceConfirmConfig(inst.alias)).then(done)}
-          >
-            {T.confirm}
-          </button>
+          <Guard disabled={readOnly}>
+            <button
+              type="button"
+              disabled={confirm.pending}
+              aria-describedby={aliasId}
+              onClick={() => void confirm.run(() => instanceConfirmConfig(inst.alias)).then(done)}
+            >
+              {T.confirm}
+            </button>
+          </Guard>
           {confirm.error === null ? null : <p role="alert">{confirm.error}</p>}
         </>
       ) : null}
@@ -213,6 +245,7 @@ function RowActions({ inst, onChanged }: { inst: InstanceView; onChanged: () => 
         <button
           type="button"
           disabled={retest.pending}
+          aria-describedby={aliasId}
           onClick={() =>
             void retest.run(() => retestToken(inst.alias)).then((v) => {
               if (v !== undefined) {
@@ -229,6 +262,7 @@ function RowActions({ inst, onChanged }: { inst: InstanceView; onChanged: () => 
         <button
           type="button"
           disabled={token.pending}
+          aria-describedby={aliasId}
           onClick={() =>
             void token.run(() =>
               credentialWindowOpen(inst.alias, adds ? 'add_pat' : 'replace_pat'),
@@ -241,12 +275,22 @@ function RowActions({ inst, onChanged }: { inst: InstanceView; onChanged: () => 
       {retest.error === null ? null : <p role="alert">{retest.error}</p>}
       {token.error === null ? null : <p role="alert">{token.error}</p>}
       {outcome === null ? null : <RetestResult outcome={outcome} />}
-      <EditConnection inst={inst} onChanged={onChanged} />
+      <EditConnection inst={inst} onChanged={onChanged} readOnly={readOnly} aliasId={aliasId} />
     </div>
   );
 }
 
-function EditConnection({ inst, onChanged }: { inst: InstanceView; onChanged: () => void }) {
+function EditConnection({
+  inst,
+  onChanged,
+  readOnly,
+  aliasId,
+}: {
+  inst: InstanceView;
+  onChanged: () => void;
+  readOnly: boolean;
+  aliasId: string;
+}) {
   const url = useAction();
   const proxy = useAction();
   const [newUrl, setNewUrl] = useState('');
@@ -256,14 +300,16 @@ function EditConnection({ inst, onChanged }: { inst: InstanceView; onChanged: ()
   const proxyShown = newProxy ?? '';
   return (
     <details>
-      <summary>{T.change_url}</summary>
+      <summary aria-describedby={aliasId}>{T.change_url}</summary>
+      <Guard disabled={readOnly}>
       <label>
         {T.change_url_label}
-        <input type="text" value={newUrl} onChange={(e) => setNewUrl(e.target.value)} />
+        <input type="text" value={newUrl} aria-describedby={aliasId} onChange={(e) => setNewUrl(e.target.value)} />
       </label>
       <button
         type="button"
         disabled={url.pending || newUrl === ''}
+        aria-describedby={aliasId}
         onClick={() =>
           void url.run(() => instanceChangeUrl(inst.alias, newUrl)).then((v) => {
             if (v !== undefined) {
@@ -278,11 +324,12 @@ function EditConnection({ inst, onChanged }: { inst: InstanceView; onChanged: ()
       {url.error === null ? null : <p role="alert">{url.error}</p>}
       <label>
         {T.proxy_label}
-        <input type="text" value={proxyShown} onChange={(e) => setNewProxy(e.target.value)} />
+        <input type="text" value={proxyShown} aria-describedby={aliasId} onChange={(e) => setNewProxy(e.target.value)} />
       </label>
       <button
         type="button"
         disabled={proxy.pending || newProxy === null}
+        aria-describedby={aliasId}
         onClick={() =>
           void proxy.run(() => instanceSetProxy(inst.alias, proxyShown)).then((v) => {
             if (v !== undefined) {
@@ -295,6 +342,7 @@ function EditConnection({ inst, onChanged }: { inst: InstanceView; onChanged: ()
         {T.proxy_apply}
       </button>
       {proxy.error === null ? null : <p role="alert">{proxy.error}</p>}
+      </Guard>
     </details>
   );
 }

@@ -149,17 +149,18 @@ describe('Settings', () => {
     }
   });
 
-  it('a failed re-test shows a fixed class text, an unknown class as text with the badge', async () => {
+  it('a failed re-test shows a fixed class text, an unknown class as a fixed generic text', async () => {
     await show(plain({ state: 'needs_token' }));
     vi.mocked(retestToken).mockResolvedValue({ failed: { class: 'other_user' } });
     fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
     await flush();
     expect(screen.getByRole('status').textContent).toContain('the token now belongs to another user');
-    vi.mocked(retestToken).mockResolvedValue({ failed: { class: 'x‮y' } });
+    vi.mocked(retestToken).mockResolvedValue({ failed: { class: 'x\u202ey' } });
     fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
     await flush();
-    expect(screen.getByRole('status').textContent).toContain('unknown failure class');
-    expect(screen.getAllByText('unusual characters').length).toBeGreaterThan(0);
+    // An unknown class is fixed text: the wire name is not echoed.
+    expect(screen.getByRole('status').textContent).toContain('does not recognize');
+    expect(screen.getByRole('status').textContent).not.toContain('x\u202ey');
   });
 
   it('pending URL change banner is verbatim and accept calls the command', async () => {
@@ -193,16 +194,40 @@ describe('Settings', () => {
     ).toBeTruthy();
   });
 
-  it('read_only_config_disables_form_with_banner', async () => {
+  it('read_only_config_disables_config_writing_controls_with_banner', async () => {
     await show(FULL);
     expect(
       screen.getByText(/config written by v9\.9\.0; settings read-only until you upgrade/),
     ).toBeTruthy();
     const controls = [...document.querySelectorAll('input, select, button, textarea')];
     expect(controls.length).toBeGreaterThan(8);
+    const open = controls.filter((c) => !c.matches(':disabled')).map((c) => c.textContent);
+    // Only the token, re-test and prune buttons stay on (core refuses ConfigReadOnly elsewhere).
     for (const c of controls) {
-      expect(c.matches(':disabled'), c.outerHTML).toBe(true);
+      const name = c.textContent ?? '';
+      const stays = /token|Re-test|Prune backlog/.test(name);
+      expect(c.matches(':disabled'), c.outerHTML).toBe(!stays);
     }
+    expect(open.length).toBeGreaterThan(0);
+  });
+
+  it('read-only config keeps Re-test and Add/Replace token on for a needs_token instance', async () => {
+    const banner = FULL.settings.config_read_only;
+    await show(
+      plain(
+        { state: 'needs_token', executes_as: null },
+        { settings: { ...FULL.settings, config_read_only: banner } },
+      ),
+    );
+    const r = within(row('work'));
+    expect(r.getByRole('button', { name: 'Re-test stored token' }).matches(':disabled')).toBe(false);
+    expect(r.getByRole('button', { name: 'Add token' }).matches(':disabled')).toBe(false);
+    expect(r.getByRole('button', { name: 'Apply URL change' }).matches(':disabled')).toBe(true);
+    expect(r.getByRole('button', { name: 'Apply proxy' }).matches(':disabled')).toBe(true);
+    vi.mocked(credentialWindowOpen).mockResolvedValue(null);
+    fireEvent.click(r.getByRole('button', { name: 'Add token' }));
+    await flush();
+    expect(credentialWindowOpen).toHaveBeenCalledWith('work', 'add_pat');
   });
 
   it('without the banner the form is enabled (the pair of the test above)', async () => {
@@ -358,10 +383,17 @@ describe('Settings', () => {
     );
     expect(form.getByRole('alert').textContent).toContain('atlas-duck requires https');
 
-    vi.mocked(instanceAdd).mockResolvedValue(WORK);
+    vi.mocked(instanceAdd).mockResolvedValue({ ...WORK, state: 'needs_token' });
     fireEvent.click(form.getByRole('button', { name: 'Add instance' }));
     await flush();
-    expect(form.getByRole('status').textContent).toContain('The instance was added');
+    expect(form.getByRole('status').textContent).toBe(
+      'The instance was added. Add its token next.',
+    );
+    // The text follows the returned state, not a fixed next step.
+    vi.mocked(instanceAdd).mockResolvedValue({ ...WORK, state: 'ok' });
+    fireEvent.click(form.getByRole('button', { name: 'Add instance' }));
+    await flush();
+    expect(form.getByRole('status').textContent).toBe('The instance was added.');
   });
 
   it('change URL and proxy send the typed values; proxy Apply is off until edited', async () => {
@@ -472,6 +504,161 @@ describe('Settings', () => {
     expect(status.querySelector('script')).toBeNull();
     expect(status.textContent).toContain('<script>alert(1)</script>');
     expect(within(status).getAllByText('unusual characters')).toHaveLength(2);
-    expect(within(status).getAllByText('unverified')).toHaveLength(2);
+    // The user, the version and the warning are server strings.
+    expect(within(status).getAllByText('unverified')).toHaveLength(3);
+    expect(status.textContent).toContain('Jira');
+  });
+
+  it('error texts are honest: audit kind is neutral, invalid_url and keychain are specific', async () => {
+    await show(BARE);
+    const form = within(screen.getByRole('region', { name: 'Add an instance' }));
+    const submit = async (e: unknown) => {
+      vi.mocked(instanceAdd).mockRejectedValue(e);
+      fireEvent.click(form.getByRole('button', { name: 'Add instance' }));
+      await flush();
+      return form.getByRole('alert').textContent;
+    };
+    expect(await submit({ kind: 'admin', error: { kind: 'audit' } })).toBe('The change was refused');
+    expect(await submit({ kind: 'admin', error: { kind: 'invalid_url' } })).toBe('That is not a valid URL');
+    expect(await submit({ kind: 'admin', error: { kind: 'keychain' } })).toContain('token store');
+    expect(await submit({ kind: 'admin', error: { kind: 'constructor' } })).toBe('The change was refused');
+    expect(await submit({ kind: 'constructor' })).toBe('The command failed');
+    expect(await submit({ kind: 'invalid_argument', field: 'use_custom_ca' })).toBe(
+      'Check the value of the CA file: choose another file',
+    );
+    expect(await submit({ kind: 'invalid_argument', field: 'secret_field_name' })).toBe(
+      'Check the value of a field',
+    );
+  });
+
+  it('a re-test without a stored token shows the keychain text', async () => {
+    await show(plain({ state: 'needs_token', executes_as: null }));
+    vi.mocked(retestToken).mockRejectedValue({ kind: 'admin', error: { kind: 'keychain' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
+    await flush();
+    expect(screen.getByRole('alert').textContent).toContain('token store');
+  });
+
+  it('every connection failure class of core has a fixed re-test text', async () => {
+    await show(plain({ state: 'needs_token' }));
+    const expected: Record<string, string> = {
+      http_401: 'the server refused the token',
+      tls: 'the TLS certificate was not accepted',
+      proxy: 'the proxy refused',
+      network: 'the server could not be reached',
+      version_below_floor: 'below the supported minimum',
+      identity_header_missing: 'identity header was not received',
+      identity_header_mismatch: 'identity header did not match',
+      other_user: 'another user',
+      not_known_user: 'does not know',
+      unavailable: 'did not answer with an identity',
+    };
+    for (const [cls, text] of Object.entries(expected)) {
+      vi.mocked(retestToken).mockResolvedValue({ failed: { class: cls } });
+      fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
+      await flush();
+      const status = screen.getByRole('status').textContent ?? '';
+      expect(status, cls).toContain(text);
+      expect(status, cls).not.toContain('recognize');
+    }
+  });
+
+  it('a re-test success shows user, product and version', async () => {
+    await show(plain({ state: 'needs_token' }));
+    vi.mocked(retestToken).mockResolvedValue({
+      ok: { atlassian_user: 'alice', product: 'jira', version: '9.12.0', warnings: [] },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Re-test stored token' }));
+    await flush();
+    expect(screen.getByRole('status').textContent).toContain('alice');
+    expect(screen.getByRole('status').textContent).toContain('Jira');
+    expect(screen.getByRole('status').textContent).toContain('9.12.0');
+  });
+
+  it('every prune skip reason of core has a text', async () => {
+    await show(plain({}));
+    for (const reason of [
+      'not_corroborated',
+      'head_epoch_null',
+      'legal_hold',
+      'already_ran_this_epoch',
+      'clock_before_head',
+      'clock_before_last_prune',
+      'nothing_to_advance',
+      'config_not_reconciled',
+      'clock_behind',
+    ]) {
+      vi.mocked(pruneBacklogNow).mockResolvedValue({ result: 'skipped', reason });
+      fireEvent.click(screen.getByRole('button', { name: 'Prune backlog now' }));
+      await flush();
+      const text = screen.getByText(/Pruning was skipped/).textContent ?? '';
+      expect(text, reason).not.toContain('_');
+    }
+  });
+
+  it('a cancelled add, URL change and URL acceptance show the cancelled text and keep the form', async () => {
+    const cancelled = { kind: 'admin', error: { kind: 'cancelled' } };
+    await show(plain({ pending_url_change: 'https://jira.example/moved' }));
+    const form = within(screen.getByRole('region', { name: 'Add an instance' }));
+    fireEvent.change(form.getByLabelText('Alias'), { target: { value: 'prod' } });
+    fireEvent.change(form.getByLabelText(/Base URL/), { target: { value: 'https://jira.corp/jira' } });
+    vi.mocked(instanceAdd).mockRejectedValue(cancelled);
+    fireEvent.click(form.getByRole('button', { name: 'Add instance' }));
+    await flush();
+    expect(form.getByRole('alert').textContent).toBe('Cancelled: nothing was changed');
+    expect((form.getByLabelText('Alias') as HTMLInputElement).value).toBe('prod');
+    expect(form.queryByRole('status')).toBeNull();
+
+    const r = within(row('work'));
+    vi.mocked(instanceChangeUrl).mockRejectedValue(cancelled);
+    fireEvent.change(r.getByLabelText('New base URL'), { target: { value: 'https://new.example/jira' } });
+    fireEvent.click(r.getByRole('button', { name: 'Apply URL change' }));
+    await flush();
+    expect((r.getByLabelText('New base URL') as HTMLInputElement).value).toBe('https://new.example/jira');
+    expect(r.getAllByText('Cancelled: nothing was changed').length).toBeGreaterThan(0);
+
+    vi.mocked(instanceAcceptUrlChange).mockRejectedValue(cancelled);
+    const callsBefore = vi.mocked(settingsGet).mock.calls.length;
+    fireEvent.click(screen.getByRole('button', { name: 'Accept the URL change' }));
+    await flush();
+    expect(screen.getAllByText('Cancelled: nothing was changed').length).toBeGreaterThan(1);
+    expect(settingsGet).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it('only one command is in flight in the window', async () => {
+    await show(plain({ state: 'needs_token' }));
+    let finish: (v: unknown) => void = () => undefined;
+    vi.mocked(settingsApply).mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }) as never,
+    );
+    fireEvent.change(screen.getByLabelText('Jira comments cap'), { target: { value: '60' } });
+    const limits = within(screen.getByRole('region', { name: 'Limits' }));
+    fireEvent.click(limits.getByRole('button', { name: 'Apply' }));
+    await flush();
+    // Every other control that starts a command is off while it runs.
+    expect(screen.getByRole('button', { name: 'Re-test stored token' }).matches(':disabled')).toBe(true);
+    expect(screen.getByRole('button', { name: 'Replace token' }).matches(':disabled')).toBe(true);
+    expect(screen.getByRole('button', { name: 'Add instance' }).matches(':disabled')).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Prune backlog now' }));
+    expect(pruneBacklogNow).not.toHaveBeenCalled();
+    finish(FULL.settings);
+    await flush();
+    expect(screen.getByRole('button', { name: 'Re-test stored token' }).matches(':disabled')).toBe(false);
+  });
+
+  it('per-row controls point at the alias of their row', async () => {
+    await show(plain({ state: 'needs_token' }));
+    const r = within(row('work'));
+    for (const el of [
+      r.getByRole('button', { name: 'Re-test stored token' }),
+      r.getByRole('button', { name: 'Replace token' }),
+      r.getByLabelText('New base URL'),
+      r.getByRole('button', { name: 'Apply proxy' }),
+    ]) {
+      const id = el.getAttribute('aria-describedby') ?? '';
+      expect(document.getElementById(id)?.textContent, el.outerHTML).toContain('work');
+    }
   });
 });
