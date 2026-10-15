@@ -42,6 +42,7 @@ use crate::confirm::DialogConfirmer;
 use crate::credential::FirstRunPassphrase;
 use crate::credential::follow::AppWatcher;
 use crate::credential::raise::{RaiseGate, RaiseHandle, RaiseSink, TauriRaiseEnv};
+use crate::os_hooks;
 use crate::secret_service::{CachedSecretService, SecretServiceCheck};
 use crate::state::ServeSlot;
 use crate::tray;
@@ -1207,18 +1208,38 @@ pub async fn quit(slot: &ServeSlot, reason: ShutdownReason, outer: Duration) -> 
         .await
 }
 
-/// Every Quit (tray, the `quit` command, the error windows): [`quit`] with [`SHUTDOWN_OUTER`] on
-/// the async runtime (the menu handler runs on the main thread and must not block), then
-/// `app.exit(0)`. Without a [`ServeSlot`] (no store is served in this startup state) it exits at
-/// once.
-pub fn shutdown_then_exit<R: Runtime>(app: &AppHandle<R>, reason: ShutdownReason) {
-    let handle = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Some(slot) = handle.try_state::<ServeSlot>() {
-            quit(&slot, reason, SHUTDOWN_OUTER).await;
-        }
-        handle.exit(0);
-    });
+/// The one shutdown path of the process (§2.5): every Quit (tray, the `quit` command, the error
+/// windows) and every OS end-session source (M6 T29, `os_hooks`). The first call runs [`quit`]
+/// with [`SHUTDOWN_OUTER`] on the async runtime (the menu handler runs on the main thread and must
+/// not block), ends the path's ticket and runs what the OS hooks left for its end (they release
+/// their block, `os_hooks::ShutdownPath::end`), then `app.exit(0)` (after
+/// `os_hooks::EXIT_GRACE` when the OS ends the process itself). A later call joins the run: the
+/// same ticket, nothing started again, the first call's reason kept. Without a [`ServeSlot`] (no
+/// store is served in this startup state) the path ends at once.
+pub fn shutdown_then_exit<R: Runtime>(
+    app: &AppHandle<R>,
+    reason: ShutdownReason,
+) -> os_hooks::ShutdownTicket {
+    os_hooks::path_of(app).begin(reason, |_| {
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Some(slot) = handle.try_state::<ServeSlot>() {
+                quit(&slot, reason, SHUTDOWN_OUTER).await;
+            }
+            if os_hooks::path_of(&handle).end() {
+                tokio::time::sleep(os_hooks::EXIT_GRACE).await;
+            }
+            handle.exit(0);
+        });
+    })
+}
+
+/// True while the serving core has a write request on the wire (§2.5 step 4): what the OS
+/// end-session hooks hold the OS back for (M6 T29). False while no core serves.
+pub fn write_in_flight(slot: Option<&ServeSlot>) -> bool {
+    slot.and_then(ServeSlot::get)
+        .and_then(|state| state.core.get())
+        .is_some_and(|core| core.write_on_the_wire())
 }
 
 // ---------- start ----------
@@ -2003,6 +2024,17 @@ mod tests {
             data: None,
         });
         ServeState::new(gate.clone(), Some(gate), None, extras, ui, hooks)
+    }
+
+    /// M6 T29: without a serving core (no slot, nothing started, a gate) no write is on the wire;
+    /// the core's own answer is `core/tests/shutdown.rs::write_on_the_wire_only_while_a_write_executes`.
+    #[tokio::test]
+    async fn no_write_in_flight_without_a_core() {
+        assert!(!write_in_flight(None));
+        let slot = ServeSlot::default();
+        assert!(!write_in_flight(Some(&slot)));
+        slot.set(Arc::new(gate_serving(GateState::FirstRun)));
+        assert!(!write_in_flight(Some(&slot)));
     }
 
     async fn gate_label(state: &ServeState) -> serde_json::Value {

@@ -488,6 +488,35 @@ async fn i40_a_write_over_its_budget_is_left_to_the_next_start() -> TestResult {
     Ok(())
 }
 
+/// M6 T29 (§15 V20): `Core::write_on_the_wire`, what the OS end-session hooks hold the OS back
+/// for, is true while a write is `executing` (held here between its answer and its outcome), and
+/// false once it logged its outcome, with a queued read, an opened write, a read in `Fetching` and
+/// a running script still pending around it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn write_on_the_wire_only_while_a_write_executes() -> TestResult {
+    let held = HeldWrite::new();
+    let b = busy(0, held.hooks()).await?;
+    let h = &b.h;
+    held.held().await?;
+    assert!(
+        h.core().write_on_the_wire(),
+        "the held write is on the wire"
+    );
+    held.pause.release.notify_one();
+    wait_for("the write to log its outcome", || {
+        !h.core().write_on_the_wire()
+    })
+    .await?;
+    let env = h.status(&b.executing).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    for id in [&b.queued_read, &b.fetching_read, &b.open_write, &b.script] {
+        let env = h.status(id).await;
+        assert_eq!(env.status, Status::Pending, "{id}: {}", env.to_json_line());
+    }
+    assert!(!h.core().write_on_the_wire());
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_shutdown_changes_nothing() -> TestResult {
     let b = busy(1_000, TestHooks::none()).await?;

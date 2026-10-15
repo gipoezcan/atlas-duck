@@ -954,6 +954,25 @@ impl AppProc {
         Ok(())
     }
 
+    /// Waits (100 s) for the process to exit by itself (M6 T29: after a signal sent to it).
+    #[cfg(unix)]
+    pub fn wait_exit(&mut self) -> Result<ExitStatus> {
+        let Some(child) = self.child.as_mut() else {
+            return Err("the app is not running".into());
+        };
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.child = None;
+                return Ok(status);
+            }
+            if start.elapsed() > QUIT_WAIT {
+                return Err("the app did not exit within 100 s".into());
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
     /// Writes `test-control/quit` and waits (100 s) for the process to exit.
     pub fn quit(&mut self) -> Result<ExitStatus> {
         let Some(child) = self.child.as_mut() else {

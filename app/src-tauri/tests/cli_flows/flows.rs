@@ -1496,7 +1496,7 @@ const INTERRUPTS: &[&str] = &["CTRL_BREAK"];
 /// Interrupts the waiting CLI `pid`: Unix `kill -<signal>`, Windows `CTRL_BREAK_EVENT` to the
 /// process group the child was created with.
 #[cfg(unix)]
-fn interrupt(pid: u32, signal: &str) -> Result<()> {
+pub(crate) fn interrupt(pid: u32, signal: &str) -> Result<()> {
     let status = std::process::Command::new("kill")
         .arg(format!("-{signal}"))
         .arg(pid.to_string())
@@ -1509,7 +1509,7 @@ fn interrupt(pid: u32, signal: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn interrupt(pid: u32, _signal: &str) -> Result<()> {
+pub(crate) fn interrupt(pid: u32, _signal: &str) -> Result<()> {
     use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent};
     // SAFETY: a plain call; `pid` is the id of the process group the child was created with
     // (`CREATE_NEW_PROCESS_GROUP`), the event reaches that group's console processes only.

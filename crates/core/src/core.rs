@@ -449,6 +449,13 @@ impl Core {
         self.instances.set_utc_offset(minutes);
     }
 
+    /// True while a write request is on the wire (`executing`, §2.5 step 4): the one the shutdown
+    /// path lets finish. M6's OS end-session hooks hold the OS shutdown back only while this is
+    /// true (§15 V20).
+    pub fn write_on_the_wire(&self) -> bool {
+        crate::shutdown::any_executing(&self.engine)
+    }
+
     /// Tests only: the engine's internals (audit port, covers) are not part of the app surface.
     #[cfg(feature = "testing")]
     pub fn engine(&self) -> &Arc<Engine> {

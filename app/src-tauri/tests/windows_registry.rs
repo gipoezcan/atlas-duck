@@ -205,8 +205,8 @@ fn close_under_the_run_loop(
                 }
             }
         }
-        // Not forwarded, so the loop can end (`on_run_event` prevents a code-less exit request:
-        // `tray::tests::exit_is_prevented_only_without_code`).
+        // Not forwarded, so the loop can end (`on_run_event` prevents the exit request that
+        // follows the last window closing: `os_hooks::tests::cmd_q_runs_shutdown_path`).
         RunEvent::ExitRequested { .. } => t.borrow_mut().push("exit_requested"),
         _ => {}
     });

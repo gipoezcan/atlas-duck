@@ -1102,6 +1102,118 @@ async fn gate_shutting_down_over_endpoint() -> Result<()> {
     Ok(())
 }
 
+/// I-40 (Unix half, M6 T29): `SIGTERM` to the app runs the one shutdown path with `OsShutdown`.
+/// The pending read ends `cancelled {os_shutdown}`; the write that is `executing` (the mock
+/// answers its POST after 8 s) runs to its end before `APP_STOP {reason: os_shutdown}`; the app
+/// exits 0 by itself, not by the signal's default action. After a restart `await` gives the read's
+/// `cancelled` envelope with that reason, the write stays `succeeded`, and nothing is reconciled
+/// (no `ABANDONED`, two more `APP_START`s).
+///
+/// Source: `os_hooks/mod.rs` `spawn_signal_hooks` (`tokio::signal::unix`) -> `on_signal` ->
+/// `serve::shutdown_then_exit(OsShutdown)` -> `Core::shutdown`; `ShutdownPath::end` then
+/// `app.exit(0)`.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn i40_sigterm_runs_shutdown_path() -> Result<()> {
+    if !opted_in("i40_sigterm_runs_shutdown_path") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    jira(&world)?
+        .json_delayed(
+            "/rest/api/2/issue/ABC-1/comment",
+            201,
+            fixtures::JIRA_COMMENT,
+            WRITE_HELD,
+        )
+        .await;
+    let before = app_start_count(&world)?;
+    let mut app = world.start_app().await?;
+    let read = submit_pending(
+        &world,
+        &[
+            "jira",
+            "issue",
+            "get",
+            "ABC-1",
+            "--reason",
+            "atlas-test:hold",
+        ],
+    )
+    .await?;
+    let write = submit_pending(
+        &world,
+        &[
+            "call",
+            "jira.comment.add",
+            "--params",
+            COMMENT_PARAMS,
+            "--reason",
+            "atlas-test:approve",
+        ],
+    )
+    .await?;
+    wait_status(&world, &write, |e| e.status == Status::Executing).await?;
+
+    let pid = app.pid().ok_or("the app is not running")?;
+    crate::flows::interrupt(pid, "TERM")?;
+    let status = app.wait_exit()?;
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "the app did not end by itself: {status}"
+    );
+
+    let _restarted = world.start_app().await?;
+    let r = run(&world, &["await", &read]).await?;
+    assert_eq!(r.exit, 7, "{}", r.stdout);
+    let env = r.envelope.as_ref().ok_or("no envelope")?;
+    assert_eq!(env.status, Status::Cancelled, "{}", r.stdout);
+    assert_eq!(
+        detail(env, "reason").and_then(Value::as_str),
+        Some("os_shutdown"),
+        "{}",
+        r.stdout
+    );
+    let w = run(&world, &["status", &write]).await?;
+    let env = w.envelope.as_ref().ok_or("no envelope")?;
+    assert_eq!(env.status, Status::Succeeded, "{}", w.stdout);
+
+    world.quit_app().await?;
+    let headers = audit_headers(&world)?;
+    let records = world.audit_records()?;
+    assert_eq!(headers.len(), records.len(), "headers and records differ");
+    let position = |id: &str, t: EventType| {
+        headers
+            .iter()
+            .position(|h| h.event_type == t && h.request_id.as_deref() == Some(id))
+    };
+    let cancelled = position(&read, EventType::CANCELLED).ok_or("the read was not cancelled")?;
+    assert_eq!(records[cancelled].1["reason"], "os_shutdown");
+    let executed =
+        position(&write, EventType::WRITE_EXECUTED).ok_or("the write did not end executed")?;
+    assert!(
+        position(&write, EventType::CANCELLED).is_none(),
+        "the write was cancelled"
+    );
+    // The signal's `APP_STOP`: the first one after the write's outcome, after the cancel too.
+    let stop = (executed..headers.len())
+        .find(|&i| headers[i].event_type == EventType::APP_STOP)
+        .ok_or("no APP_STOP after the write's outcome")?;
+    assert_eq!(records[stop].1["reason"], "os_shutdown");
+    assert!(cancelled < stop, "APP_STOP before the read's CANCELLED");
+    assert!(
+        headers.iter().all(|h| h.event_type != EventType::ABANDONED),
+        "something was reconciled"
+    );
+    let starts = headers
+        .iter()
+        .filter(|h| h.event_type == EventType::APP_START)
+        .count();
+    assert_eq!(starts, before + 2);
+    Ok(())
+}
+
 /// PD-35: the gate counts the four methods it refuses and only those. In first run one each of
 /// `submit` (`jira search`), `script run`, `await` and `cancel` give `refused == 4` in
 /// `test-control/refused`; `status`, `requests list` and `instances` (the state's envelope, not

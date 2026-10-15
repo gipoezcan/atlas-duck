@@ -15,6 +15,7 @@ pub mod credential;
 pub mod csp;
 pub mod diag;
 pub mod early_argv;
+pub mod os_hooks;
 pub mod removal;
 pub mod sandbox_probe;
 pub mod secret_service;
@@ -193,6 +194,9 @@ pub fn run_gui(background: bool) -> ! {
                 }
                 return Ok(());
             }
+            // M6 T29 (§2.5, §15 V20): every OS end-session source (and Cmd+Q) takes the one
+            // shutdown path, in every startup state that keeps the app running.
+            os_hooks::install(app.handle());
             // The tray text, taken before the `Ready` arm below moves the state.
             let tray_status = tray::tray_status_text(&state);
 
@@ -281,9 +285,9 @@ pub fn run_gui(background: bool) -> ! {
             std::process::exit(1);
         }
     };
-    // An exit request without a code (last window closed, OS) is prevented; Quit calls
-    // `app.exit(0)`, which carries a code and is honoured. Closing a window hides it; macOS
-    // `Reopen` is a GUI relaunch (§2.5).
+    // The app exits only through the shutdown path (M6 T29, `os_hooks`): the exit request after
+    // the last window closed is prevented, any other one runs the path, whose own `app.exit(0)` is
+    // honoured. Closing a window hides it; macOS `Reopen` is a GUI relaunch (§2.5).
     app.run(tray::on_run_event);
     std::process::exit(0)
 }

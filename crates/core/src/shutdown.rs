@@ -69,6 +69,14 @@ async fn cancel_round(engine: &Arc<Engine>, cause: CancelCause) -> u32 {
     ended
 }
 
+/// True while a write is `executing` (§2.5 step 4: "a write request already on the wire").
+pub(crate) fn any_executing(engine: &Arc<Engine>) -> bool {
+    engine
+        .pending_entries()
+        .iter()
+        .any(|e| phase_of(e) == Phase::Executing)
+}
+
 /// The writes that are `executing` now.
 fn executing(engine: &Arc<Engine>) -> Vec<Arc<crate::engine::RequestEntry>> {
     engine

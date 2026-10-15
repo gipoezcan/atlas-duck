@@ -14,6 +14,7 @@ use tauri::{AppHandle, Manager, RunEvent, Runtime, WindowEvent, Wry};
 
 use crate::attention;
 use crate::early_argv::FLAG_BACKGROUND;
+use crate::os_hooks;
 use crate::serve;
 use crate::startup::{StartupState, startup_message};
 use crate::state::{AppState, ServeSlot};
@@ -236,13 +237,6 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
     }
 }
 
-/// `RunEvent::ExitRequested { code: None }` comes from the last window closing
-/// (or the OS); the tray app keeps running. `Some(_)` comes from `AppHandle::exit`
-/// (Quit) and is honoured.
-pub fn should_prevent_exit(code: Option<i32>) -> bool {
-    code.is_none()
-}
-
 /// What closing a window does (§2.5 "Closing windows hides them; the app exits only through the
 /// shutdown path").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,31 +258,47 @@ pub fn close_action(label: &str) -> CloseAction {
     }
 }
 
-/// The run-loop handler passed to `App::run`: a code-less exit request is prevented, a window
-/// close hides the window ([`close_action`]), and macOS `RunEvent::Reopen` (Dock, Finder,
-/// Spotlight) takes the GUI relaunch path (§2.5).
+/// The run-loop handler passed to `App::run`. The app exits only through the shutdown path (§2.5,
+/// M6 T29): the exit request that follows the last window closing is prevented, any other one
+/// runs the path, and the path's own exit goes ahead (`os_hooks::exit_request`); a loop that ends
+/// without the path runs it first (`os_hooks::on_loop_exit`). A window close hides the window
+/// ([`close_action`]), and macOS `RunEvent::Reopen` (Dock, Finder, Spotlight) takes the GUI
+/// relaunch path (§2.5).
 pub fn on_run_event<R: Runtime>(app: &AppHandle<R>, event: RunEvent) {
     match event {
-        RunEvent::ExitRequested { code, api, .. } if should_prevent_exit(code) => {
+        // The guard decides (and starts the path when the request is a quit); an honoured request
+        // falls through to `_`.
+        RunEvent::ExitRequested { code, api, .. } if os_hooks::on_exit_requested(app, code) => {
             api.prevent_exit();
         }
+        RunEvent::Exit => os_hooks::on_loop_exit(app),
+        RunEvent::MainEventsCleared => os_hooks::path_of(app).note_loop_iteration(),
         RunEvent::WindowEvent {
             label,
             event: WindowEvent::CloseRequested { api, .. },
             ..
-        } if close_action(&label) == CloseAction::Hide => {
-            api.prevent_close();
-            if let Some(window) = app.get_webview_window(&label) {
-                let _ = window.hide();
+        } => match close_action(&label) {
+            CloseAction::Hide => {
+                api.prevent_close();
+                if let Some(window) = app.get_webview_window(&label) {
+                    let _ = window.hide();
+                }
             }
-        }
-        // M6 T20: a destroyed credential window takes its purpose and a pending passphrase
-        // request with it (the next one is built for its own purpose).
+            // Destroyed after this callback (the mock runtime reports no `Destroyed`).
+            CloseAction::Destroy => os_hooks::path_of(app).note_window_destroyed(),
+        },
         RunEvent::WindowEvent {
             label,
             event: WindowEvent::Destroyed,
             ..
-        } if label == Label::Credential.as_str() => crate::credential::window_destroyed(app),
+        } => {
+            os_hooks::path_of(app).note_window_destroyed();
+            // M6 T20: a destroyed credential window takes its purpose and a pending passphrase
+            // request with it (the next one is built for its own purpose).
+            if label == Label::Credential.as_str() {
+                crate::credential::window_destroyed(app);
+            }
+        }
         // PD-75: whenever the Approvals window gains the focus the page hears whether it was
         // requested. One the engine took (`Show::FocusUnrequested`) already announced
         // `requested: false`, and the page keeps the stricter of the two; any other (the user's
@@ -399,7 +409,9 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
         Some(TrayAction::OpenApprovals | TrayAction::Unlock) => {
             windows::spawn_relaunch(app, Vec::new());
         }
-        Some(TrayAction::Quit) => serve::shutdown_then_exit(app, ShutdownReason::Quit),
+        Some(TrayAction::Quit) => {
+            serve::shutdown_then_exit(app, ShutdownReason::Quit);
+        }
         // The store write runs on the blocking pool (`toggle_presentation`).
         Some(TrayAction::PresentationMode) => attention::toggle_presentation(app),
         // PD-89: one more keystore + `open`; the watcher hears how it ended.
@@ -494,13 +506,6 @@ mod tests {
     use atlas_duck_audit::lock::InstanceLock;
     use atlas_duck_ipc::paths::{DataDirResolution, NotLocalKind, check_data_dir};
     use std::path::PathBuf;
-
-    #[test]
-    fn exit_is_prevented_only_without_code() {
-        assert!(should_prevent_exit(None));
-        assert!(!should_prevent_exit(Some(0)));
-        assert!(!should_prevent_exit(Some(1)));
-    }
 
     #[test]
     fn store_unavailable_text_is_the_plan_constant() {
