@@ -386,9 +386,10 @@ export const isRemovalBackupAnswer = (v: unknown): v is RemovalBackupAnswer =>
 
 export const isRemovalFinishAnswer = (v: unknown): v is RemovalFinishAnswer =>
   fields(v, {
-    cli: oneOf('removed', 'already_on_path', 'nothing'),
+    cli: oneOf('removed', 'already_on_path', 'not_found', 'not_removed'),
+    cli_reason: strOrNull,
     autostart: oneOf('removed', 'was_off'),
-  }) && Object.keys(v).length === 2;
+  }) && Object.keys(v).length === 3;
 
 const isWizardError = (v: unknown): v is WizardError =>
   fields(v, { class: isStr, text: strOrNull });

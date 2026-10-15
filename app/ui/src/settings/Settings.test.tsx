@@ -554,7 +554,7 @@ describe('Settings', () => {
     vi.mocked(credentialWindowOpen).mockRejectedValue({ kind: 'busy' });
     fireEvent.click(screen.getByRole('button', { name: 'Replace token' }));
     await flush();
-    expect(screen.getByText(/credential window is open for something else/)).toBeTruthy();
+    expect(screen.getByText(/credential window is open, or a removal step is running/)).toBeTruthy();
   });
 
   it('a failed read shows a retry', async () => {

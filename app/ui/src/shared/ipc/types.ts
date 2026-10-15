@@ -393,11 +393,14 @@ export interface RemovalBackupAnswer {
 }
 
 /**
- * `removal_finish`: what was removed, as fixed words. `cli`: `removed`, `already_on_path` (deb/rpm)
- * or `nothing` (no stable path: nothing installed from here). `autostart`: `removed` or `was_off`.
+ * `removal_finish`: what was removed, as fixed words. `cli`: `removed`, `already_on_path` (deb/rpm),
+ * `not_found` (the fixed paths hold nothing of ours) or `not_removed` (this run could not name the
+ * install layout, so the command line may remain; `cli_reason` is the error kind, `null`
+ * otherwise). `autostart`: `removed` or `was_off`.
  */
 export interface RemovalFinishAnswer {
-  cli: 'removed' | 'already_on_path' | 'nothing';
+  cli: 'removed' | 'already_on_path' | 'not_found' | 'not_removed';
+  cli_reason: string | null;
   autostart: 'removed' | 'was_off';
 }
 

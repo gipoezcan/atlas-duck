@@ -24,7 +24,8 @@ import { useAction } from './useAction';
  * step and draws every confirmation itself; this page only shows `removal_state` and sends the
  * four answers (backup, delete the tokens, tick or skip an instance, finish). Nothing it sends is a
  * path, an origin or a token. The checklist is whatever Rust answered last: a refusal changes
- * nothing on the page but the refusal text, and the Finish button is only a mirror of Rust's gate.
+ * nothing but the refusal text, then the page reads the state again, and the Finish button is only
+ * a mirror of Rust's gate.
  * Every string is a fixed text or a text node (aliases from the config file, token identities from
  * the server through `AgentText`).
  */
@@ -90,12 +91,21 @@ export function Removal({ onChanged }: { onChanged: () => void }) {
       if (a !== undefined) setBackup(a.saved);
       load();
     });
-  const doBegin = () => void action.run(() => removalBegin()).then(take);
+  // A refusal or a failure (`undefined`) says Rust's state may differ from the page's (a token
+  // stored again, a recorded procedure, a tick taken back): read it again, so the ticks, the retry
+  // button and Finish show what Rust holds. The refusal text stays.
+  const doBegin = () =>
+    void action.run(() => removalBegin()).then((next) => (next === undefined ? load() : take(next)));
   const doMark = (alias: string, choice: RemovalChoice) =>
-    void action.run(() => removalMark(alias, choice)).then(take);
+    void action
+      .run(() => removalMark(alias, choice))
+      .then((next) => (next === undefined ? load() : take(next)));
   const doFinish = () =>
     void action.run(() => removalFinish()).then((answer) => {
-      if (answer === undefined) return;
+      if (answer === undefined) {
+        load();
+        return;
+      }
       setFinished(answer);
       onChanged();
       load();
@@ -108,7 +118,12 @@ export function Removal({ onChanged }: { onChanged: () => void }) {
         <div role="status">
           <p>{T.removal_autostart[finished.autostart]}</p>
           <p>{T.removal_cli[finished.cli]}</p>
-          <p>{T.removal_complete}</p>
+          {finished.cli_reason === null ? null : (
+            <p>
+              {T.removal_cli_reasons[finished.cli_reason] ?? T.removal_cli_reasons['other']}
+            </p>
+          )}
+          <p>{finished.cli === 'not_removed' ? T.removal_incomplete : T.removal_complete}</p>
         </div>
       )}
       {finished !== null ? null : (
@@ -219,7 +234,7 @@ function Item({
           <p role="status">{choiceText}</p>
         </>
       ) : (
-        <p role="alert">{T.removal_not_deleted}</p>
+        <p role="alert">{item.error === null ? T.removal_token_back : T.removal_not_deleted}</p>
       )}
     </li>
   );

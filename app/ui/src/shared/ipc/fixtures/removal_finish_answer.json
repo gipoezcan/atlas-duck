@@ -1,26 +1,52 @@
 [
   {
     "autostart": "removed",
-    "cli": "removed"
+    "cli": "removed",
+    "cli_reason": null
   },
   {
     "autostart": "was_off",
-    "cli": "removed"
+    "cli": "removed",
+    "cli_reason": null
   },
   {
     "autostart": "removed",
-    "cli": "already_on_path"
+    "cli": "already_on_path",
+    "cli_reason": null
   },
   {
     "autostart": "was_off",
-    "cli": "already_on_path"
+    "cli": "already_on_path",
+    "cli_reason": null
   },
   {
     "autostart": "removed",
-    "cli": "nothing"
+    "cli": "not_found",
+    "cli_reason": null
   },
   {
     "autostart": "was_off",
-    "cli": "nothing"
+    "cli": "not_found",
+    "cli_reason": null
+  },
+  {
+    "autostart": "removed",
+    "cli": "not_removed",
+    "cli_reason": "no_stable_path"
+  },
+  {
+    "autostart": "removed",
+    "cli": "not_removed",
+    "cli_reason": "unsafe_path"
+  },
+  {
+    "autostart": "removed",
+    "cli": "not_removed",
+    "cli_reason": "unsupported"
+  },
+  {
+    "autostart": "removed",
+    "cli": "not_removed",
+    "cli_reason": "io"
   }
 ]

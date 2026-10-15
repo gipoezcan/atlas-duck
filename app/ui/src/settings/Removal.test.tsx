@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -102,7 +102,9 @@ describe('Removal', () => {
   it('shows the retention and the backup offer before anything is deleted', async () => {
     await show({ ...idle, retention_days: 1, legal_hold: true });
     expect(
-      screen.getByText(/kept for 1 day \(a legal hold is on: pruning is stopped\)/),
+      screen.getByText(
+        'The newest audit record is kept until the legal hold is lifted, then for at least 1 more day.',
+      ),
     ).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Create a full backup' })).toBeTruthy();
     expect(screen.queryByText(REVOKE)).toBeNull();
@@ -194,7 +196,11 @@ describe('Removal', () => {
   it('finish takes no arguments, then shows what was removed and the controls are gone', async () => {
     const changed = vi.fn();
     await show(active(item({ choice: 'done' })), changed);
-    vi.mocked(removalFinish).mockResolvedValue({ cli: 'removed', autostart: 'removed' });
+    vi.mocked(removalFinish).mockResolvedValue({
+      cli: 'removed',
+      cli_reason: null,
+      autostart: 'removed',
+    });
     vi.mocked(removalState).mockResolvedValue(idle);
     await click('Finish removal');
     expect(removalFinish).toHaveBeenCalledWith();
@@ -206,7 +212,46 @@ describe('Removal', () => {
     expect(changed).toHaveBeenCalled();
   });
 
-  it('refusals of finish are fixed texts by kind', async () => {
+  it('a finish whose command line step could not look says so and never says Done', async () => {
+    await show(active(item({ choice: 'done' })));
+    vi.mocked(removalFinish).mockResolvedValue({
+      cli: 'not_removed',
+      cli_reason: 'no_stable_path',
+      autostart: 'removed',
+    });
+    vi.mocked(removalState).mockResolvedValue(idle);
+    await click('Finish removal');
+    expect(screen.getByText('The command line was not removed.')).toBeTruthy();
+    expect(screen.getByText(/cannot tell where it is installed from this location/)).toBeTruthy();
+    expect(screen.getByText(/Not done: the command line may still be installed/)).toBeTruthy();
+    expect(screen.queryByText(/Done\. You can uninstall/)).toBeNull();
+    // A kind the page does not know gets the general sentence, never the raw kind.
+    vi.mocked(removalFinish).mockResolvedValue({
+      cli: 'not_removed',
+      cli_reason: 'x‮y',
+      autostart: 'was_off',
+    });
+    cleanup();
+    await show(active(item({ choice: 'done' })));
+    await click('Finish removal');
+    expect(screen.getByText('The command line could not be removed')).toBeTruthy();
+    expect(screen.queryByText(/x‮y/)).toBeNull();
+  });
+
+  it('a nothing-found command line is an honest, complete finish', async () => {
+    await show(active(item({ choice: 'done' })));
+    vi.mocked(removalFinish).mockResolvedValue({
+      cli: 'not_found',
+      cli_reason: null,
+      autostart: 'was_off',
+    });
+    vi.mocked(removalState).mockResolvedValue(idle);
+    await click('Finish removal');
+    expect(screen.getByText('No command line of atlas-duck was found.')).toBeTruthy();
+    expect(screen.getByText(/You can uninstall atlas-duck now/)).toBeTruthy();
+  });
+
+  it('refusals of finish are fixed texts by kind, each followed by a re-read of the state', async () => {
     await show(active(item({ choice: 'done' })));
     for (const [kind, text] of [
       ['unticked', 'Tick or skip every instance first'],
@@ -215,15 +260,55 @@ describe('Removal', () => {
       ['no_procedure', 'Delete the stored tokens first'],
       ['recorded', 'The answers are already recorded: finish the removal'],
     ]) {
+      vi.mocked(removalState).mockClear();
       vi.mocked(removalFinish).mockRejectedValue({ kind: 'removal', error: { kind } });
       await click('Finish removal');
       expect(screen.getByRole('alert').textContent).toBe(text);
+      expect(removalState).toHaveBeenCalledTimes(1);
     }
     // An unknown kind (or one with unusual characters) is never echoed.
     vi.mocked(removalFinish).mockRejectedValue({ kind: 'removal', error: { kind: 'x‮y' } });
     await click('Finish removal');
     expect(screen.getByRole('alert').textContent).toBe('The change was refused');
     expect(screen.getByRole('alert').textContent).not.toContain('‮');
+  });
+
+  it('a token_stored refusal is followed by a re-read: the stale ticks give way to the retry button', async () => {
+    await show(active(item({ choice: 'done' })));
+    expect(disabled('Finish removal')).toBe(false);
+    // Rust flipped the item back to "not deleted, not answered" before it refused.
+    vi.mocked(removalState).mockResolvedValue(
+      active(item({ token_deleted: false, choice: 'pending', error: null })),
+    );
+    vi.mocked(removalFinish).mockRejectedValue({ kind: 'removal', error: { kind: 'token_stored' } });
+    await click('Finish removal');
+    expect(
+      screen.getAllByRole('alert').map((a) => a.textContent),
+    ).toContain('A token is stored again for an instance: delete it again, then finish');
+    expect(screen.getByText('A token is stored again for this instance: delete it again.')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'I revoked it' })).toBeNull();
+    expect(disabled('Finish removal')).toBe(true);
+    vi.mocked(removalBegin).mockResolvedValue(active(item()));
+    await click('Delete the remaining tokens');
+    expect(removalBegin).toHaveBeenCalledWith();
+    expect(screen.getByRole('button', { name: 'I revoked it' })).toBeTruthy();
+  });
+
+  it('a refused tick or begin reads the state again too', async () => {
+    await show(active(item()));
+    vi.mocked(removalState).mockClear();
+    vi.mocked(removalMark).mockRejectedValue({ kind: 'removal', error: { kind: 'recorded' } });
+    await click('I revoked it');
+    expect(screen.getByRole('alert').textContent).toBe(
+      'The answers are already recorded: finish the removal',
+    );
+    expect(removalState).toHaveBeenCalledTimes(1);
+    cleanup();
+    await show(idle);
+    vi.mocked(removalState).mockClear();
+    vi.mocked(removalBegin).mockRejectedValue({ kind: 'busy' });
+    await click('Delete the stored tokens');
+    expect(removalState).toHaveBeenCalledTimes(1);
   });
 
   it('a second click while a command runs sends nothing (in-flight guard)', async () => {

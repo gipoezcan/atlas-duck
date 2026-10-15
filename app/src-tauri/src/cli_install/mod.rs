@@ -288,6 +288,33 @@ impl Layout {
     }
 }
 
+impl Layout {
+    /// What "Prepare for removal" can look for when [`Layout::resolve`] failed (no stable path,
+    /// an unsafe path, ...): the artifacts that sit at fixed paths, removed by marker or link
+    /// target (`uninstall` never reads `app_path`), plus this host's `cli.toml`. Windows has no
+    /// fixed artifact (the PATH entry names the install folder, which is the unknown): only
+    /// `cli.toml` goes there.
+    pub fn for_removal(i: &Inputs) -> Layout {
+        let kind = match i.platform {
+            Platform::Macos => Kind::Macos {
+                cli: PathBuf::new(),
+                link: macos::link_path(&i.home),
+            },
+            Platform::Linux => Kind::AppImage {
+                appimage: PathBuf::new(),
+                wrapper: linux::wrapper_path(&i.home),
+                launcher: linux::launcher_path(&i.home),
+            },
+            Platform::Windows => Kind::Packaged,
+        };
+        Layout {
+            kind,
+            app_path: PathBuf::new(),
+            cli_toml: i.cli_toml.clone(),
+        }
+    }
+}
+
 impl Inputs {
     /// The real machine: known folders and passwd home (never the session environment, §7.7),
     /// `$APPIMAGE`, the running binary.

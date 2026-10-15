@@ -425,6 +425,15 @@ pub fn this_machine() -> Result<Layout, InstallError> {
     Layout::resolve(&Inputs::detect()?)
 }
 
+/// [`this_machine`] for "Prepare for removal": the layout (or why there is none) and, when the
+/// machine could be read at all, the removal-only layout of what sits at fixed paths.
+fn machine_for_removal() -> (Result<Layout, InstallError>, Option<Layout>) {
+    match Inputs::detect() {
+        Ok(inputs) => (Layout::resolve(&inputs), Some(Layout::for_removal(&inputs))),
+        Err(e) => (Err(e), None),
+    }
+}
+
 /// `(installed, removable)` of the CLI on this machine (§12.3). `installed`: the CLI is on the PATH
 /// as this installation wants it; a machine whose layout cannot be resolved (no stable path) counts
 /// as not installed. `removable`: removal changes something, which it does not for deb/rpm.
@@ -1158,7 +1167,7 @@ pub async fn removal_finish<R: Runtime>(
     let Args(RemovalFinishArgs {}) = args;
     let response = async {
         let served = served(&app)?;
-        let layout = blocking(|| Ok(this_machine())).await?;
+        let (layout, fallback) = blocking(|| Ok(machine_for_removal())).await?;
         let state = app
             .try_state::<RemovalState>()
             .ok_or(CommandError::NotReady)?;
@@ -1170,6 +1179,7 @@ pub async fn removal_finish<R: Runtime>(
             Arc::new(PluginAutostart(app.clone())),
             Arc::new(SystemOps),
             layout,
+            fallback,
             || pat_window_open(&app),
         )
         .await

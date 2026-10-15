@@ -439,6 +439,15 @@ async fn submit<R: Runtime>(
     let (purpose, generation) = credential::current_window(app).ok_or(CommandError::NotReady)?;
     match purpose {
         Purpose::AddPat(target) | Purpose::ReplacePat(target) => {
+            // M6 T28 (T20 m-9): a token is not stored while "Prepare for removal" deletes tokens
+            // or finishes: a window that outlived the claim (opened before it, or kept alive by a
+            // submit already under way) cannot put a PAT in the keychain meanwhile.
+            if app
+                .try_state::<crate::removal::RemovalState>()
+                .is_some_and(|r| r.busy())
+            {
+                return Err(CommandError::Busy);
+            }
             let core = super::core(app)?;
             let outcome = submit_pat_dto(core.instances(), &target, args).await;
             if matches!(outcome, Ok(SubmitOutcome::Ok(_))) {

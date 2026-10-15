@@ -1015,10 +1015,22 @@ fn removal_backup_answers() -> Vec<BackupAnswer> {
 
 fn removal_finish_answers() -> Vec<FinishAnswer> {
     let mut all = Vec::new();
-    for cli in ["removed", "already_on_path", "nothing"] {
+    for cli in ["removed", "already_on_path", "not_found"] {
         for autostart in ["removed", "was_off"] {
-            all.push(FinishAnswer { cli, autostart });
+            all.push(FinishAnswer {
+                cli,
+                cli_reason: None,
+                autostart,
+            });
         }
+    }
+    // The CLI step could not name the layout: its kind goes with the word.
+    for reason in ["no_stable_path", "unsafe_path", "unsupported", "io"] {
+        all.push(FinishAnswer {
+            cli: "not_removed",
+            cli_reason: Some(reason),
+            autostart: "removed",
+        });
     }
     all
 }

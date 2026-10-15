@@ -1980,7 +1980,7 @@ fn ca_file_is_read_bounded_regular_and_non_empty() -> TestResult {
 #[cfg(feature = "scripted-approver")]
 mod settings_commands {
     use atlas_duck_app_lib::cli_install::fake::{FakeOps, State};
-    use atlas_duck_app_lib::cli_install::{Inputs, InstallError, Layout, Platform};
+    use atlas_duck_app_lib::cli_install::{Inputs, InstallError, Layout, Platform, PlatformOps};
     use atlas_duck_app_lib::commands::CommandError;
     use atlas_duck_app_lib::commands::dto::parse;
     use atlas_duck_app_lib::commands::settings::{
@@ -2801,6 +2801,7 @@ mod settings_commands {
             m.autostart.clone(),
             m.ops.clone(),
             Ok(m.layout.clone()),
+            None,
             || pat_window,
         )
         .await
@@ -3088,6 +3089,7 @@ mod settings_commands {
             answer,
             FinishAnswer {
                 cli: "removed",
+                cli_reason: None,
                 autostart: "removed"
             }
         );
@@ -3097,18 +3099,20 @@ mod settings_commands {
                 "cli_install",
                 "prepare_for_removal",
                 "autostart",
-                "cli_install"
+                "cli_install",
+                "prepare_for_removal"
             ],
-            "the removal record comes before every effect's record"
+            "the choices come before every effect's record, the outcome after the last one"
         );
         let records = h.events_of(EventType::CONFIG_CHANGED).await?;
         let removal: Vec<&Value> = records
             .iter()
             .filter(|v| v["key"] == "prepare_for_removal")
             .collect();
-        assert_eq!(removal.len(), 1, "exactly one");
+        assert_eq!(removal.len(), 2, "the choices, then the outcome");
         assert_eq!(removal[0]["source"], "app");
-        assert_eq!(removal[0]["new"]["prepared"], true);
+        // m-3: `prepared: true` only once every effect succeeded.
+        assert_eq!(removal[0]["new"]["prepared"], false);
         assert_eq!(removal[0]["new"]["backup"], false);
         assert_eq!(
             removal[0]["new"]["instances"],
@@ -3116,6 +3120,10 @@ mod settings_commands {
                 {"alias": "jira-main", "revoke": "done"},
                 {"alias": "wiki", "revoke": "skipped"},
             ])
+        );
+        assert_eq!(
+            removal[1]["new"],
+            json!({"prepared": true, "cli": "removed"})
         );
         // No token identity or origin in the record: the choices only.
         let text = removal[0].to_string();
@@ -3187,7 +3195,8 @@ mod settings_commands {
         let keys = config_keys(&h).await?;
         assert_eq!(
             keys.iter().filter(|k| *k == "prepare_for_removal").count(),
-            1
+            2,
+            "the choices once, then the outcome: {keys:?}"
         );
         Ok(())
     }
@@ -3217,6 +3226,14 @@ mod settings_commands {
             Some(CommandError::Removal(RemovalError::Recorded))
         );
         let records = h.events_of(EventType::CONFIG_CHANGED).await?;
+        // m-3: the only removal record so far says `prepared: false`; "prepared" is never claimed
+        // while an effect has failed.
+        let removal: Vec<&Value> = records
+            .iter()
+            .filter(|v| v["key"] == "prepare_for_removal")
+            .collect();
+        assert_eq!(removal.len(), 1, "{removal:?}");
+        assert_eq!(removal[0]["new"]["prepared"], false);
         let autostart: Vec<&Value> = records.iter().filter(|v| v["key"] == "autostart").collect();
         assert_eq!(autostart.len(), 2, "{autostart:?}");
         assert_eq!(autostart[0]["old"], json!({"enabled": true}));
@@ -3245,8 +3262,8 @@ mod settings_commands {
         let keys = config_keys(&h).await?;
         assert_eq!(
             keys.iter().filter(|k| *k == "prepare_for_removal").count(),
-            1,
-            "{keys:?}"
+            2,
+            "the choices are not repeated by the retry; the outcome comes once: {keys:?}"
         );
         Ok(())
     }
@@ -3270,43 +3287,157 @@ mod settings_commands {
         Ok(())
     }
 
-    /// deb/rpm own the CLI: the removal says so and only a leftover `cli.toml` goes; a machine with
-    /// no stable path never installed one.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn finish_on_deb_and_without_a_stable_path() -> TestResult {
-        let deb = Layout::resolve(&Inputs {
+    /// The inputs of the AppImage machine of [`appimage_layout`], and of a deb install on the same
+    /// home.
+    fn linux_inputs(current_exe: &str) -> Inputs {
+        Inputs {
             platform: Platform::Linux,
             home: "/home/u".into(),
             cli_toml: "/home/u/.config/atlas-duck/cli-h.toml".into(),
-            current_exe: "/usr/bin/atlas-duck-app".into(),
+            current_exe: current_exe.into(),
             appimage: None,
             appimage_is_file: false,
             appdir: None,
-        })
-        .map_err(|e| format!("{e:?}"))?;
-        for (layout, cli) in [
-            (Ok(deb), "already_on_path"),
-            (Err(InstallError::NoStablePath), "nothing"),
-        ] {
-            let h = two(vec![Confirm::Ok, Confirm::Ok]).await?;
-            let st = RemovalState::default();
-            begin_with(&h, &st, false).await?;
-            answer_all(&st, &["jira-main", "wiki"], Choice::Done)?;
-            let ops = Arc::new(FakeOps::new());
-            let res = removal::finish(
-                &st,
-                h.instances(),
-                h.core().settings(),
-                h.confirmer().clone(),
-                Arc::new(FakeAutostart::default()),
-                ops.clone(),
-                layout,
-                || false,
-            )
-            .await?;
-            assert_eq!(res.cli, cli);
-            assert_eq!(ops.state(), State::default());
         }
+    }
+
+    /// A fake machine with the AppImage CLI installed (links, wrapper, launcher, `cli.toml`).
+    fn installed_ops() -> Result<Arc<FakeOps>, Boxed> {
+        let ops = Arc::new(FakeOps::new());
+        atlas_duck_app_lib::cli_install::install(&*ops, &appimage_layout()?)
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(ops)
+    }
+
+    /// `finish` on a machine whose CLI step is given `layout` and `fallback`, over `ops`; the answer
+    /// and the records of the removal.
+    async fn finish_cli_step(
+        ops: Arc<FakeOps>,
+        layout: Result<Layout, InstallError>,
+        fallback: Option<Layout>,
+    ) -> Result<(FinishAnswer, RemovalState, Harness, Vec<Value>), Boxed> {
+        let h = two(vec![Confirm::Ok, Confirm::Ok]).await?;
+        let st = RemovalState::default();
+        begin_with(&h, &st, false).await?;
+        answer_all(&st, &["jira-main", "wiki"], Choice::Done)?;
+        let res = removal::finish(
+            &st,
+            h.instances(),
+            h.core().settings(),
+            h.confirmer().clone(),
+            Arc::new(FakeAutostart::default()),
+            ops,
+            layout,
+            fallback,
+            || false,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        let records: Vec<Value> = h
+            .events_of(EventType::CONFIG_CHANGED)
+            .await?
+            .into_iter()
+            .filter(|v| v["key"] == "prepare_for_removal")
+            .collect();
+        Ok((res, st, h, records))
+    }
+
+    /// deb/rpm own the CLI: the removal says so and only a leftover `cli.toml` goes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finish_on_deb_removes_only_a_leftover_cli_toml() -> TestResult {
+        let inputs = linux_inputs("/usr/bin/atlas-duck-app");
+        let deb = Layout::resolve(&inputs).map_err(|e| format!("{e:?}"))?;
+        let ops = Arc::new(FakeOps::new());
+        ops.write_cli_toml(
+            &deb.cli_toml,
+            &atlas_duck_ipc::paths::CliToml {
+                app_path: Some("/usr/bin/atlas-duck".into()),
+            },
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let (res, st, _h, records) = finish_cli_step(ops.clone(), Ok(deb), None).await?;
+        assert_eq!(res.cli, "already_on_path");
+        assert_eq!(res.cli_reason, None);
+        assert_eq!(ops.state(), State::default(), "the leftover cli.toml went");
+        assert!(!st.dto(RET).active);
+        assert_eq!(records[1]["new"]["prepared"], true);
+        Ok(())
+    }
+
+    /// I-4: a layout this run cannot name (`NoStablePath` after an earlier install from an
+    /// AppImage, an unsafe path) does not mean nothing was installed. The link, wrapper, launcher
+    /// and `cli.toml` sit at fixed paths and go by content; the CLI step reports its own outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finish_without_a_layout_removes_what_sits_at_fixed_paths() -> TestResult {
+        for cause in [
+            InstallError::NoStablePath,
+            InstallError::UnsafePath,
+            InstallError::Unsupported,
+        ] {
+            let ops = installed_ops()?;
+            assert!(!ops.state().files.is_empty(), "the CLI is installed");
+            let fallback = Layout::for_removal(&linux_inputs("/opt/x/atlas-duck-app"));
+            let (res, st, _h, records) =
+                finish_cli_step(ops.clone(), Err(cause.clone()), Some(fallback)).await?;
+            assert_eq!(res.cli, "removed", "{cause:?}");
+            assert_eq!(res.cli_reason, None);
+            assert_eq!(ops.state(), State::default(), "{cause:?}: nothing left");
+            assert!(!st.dto(RET).active, "the procedure is over");
+            assert_eq!(
+                records[1]["new"],
+                json!({"prepared": true, "cli": "removed"})
+            );
+        }
+        // Nothing of ours at the fixed paths: said so, still done.
+        let ops = Arc::new(FakeOps::new());
+        let fallback = Layout::for_removal(&linux_inputs("/opt/x/atlas-duck-app"));
+        let (res, _st, _h, records) =
+            finish_cli_step(ops, Err(InstallError::NoStablePath), Some(fallback)).await?;
+        assert_eq!((res.cli, res.cli_reason), ("not_found", None));
+        assert_eq!(records[1]["new"]["prepared"], true);
+        Ok(())
+    }
+
+    /// I-4 / m-3: where the layout is unknown and nothing can be looked at (the machine could not
+    /// be read, or Windows, where only `cli.toml` has a fixed path), the CLI step says it did not
+    /// remove the command line, with the kind: `finish` completes, the user is never told "done",
+    /// and the outcome record says `prepared: false`. `cli.toml` goes wherever its path is known.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finish_that_cannot_look_says_the_command_line_stays() -> TestResult {
+        // The machine could not be read at all: nothing is touched.
+        let ops = installed_ops()?;
+        let before = ops.state();
+        let (res, st, h, records) =
+            finish_cli_step(ops.clone(), Err(InstallError::Io), None).await?;
+        assert_eq!((res.cli, res.cli_reason), ("not_removed", Some("io")));
+        assert_eq!(ops.state(), before, "nothing was touched");
+        assert!(!st.dto(RET).active, "finish completed");
+        assert_eq!(
+            records[1]["new"],
+            json!({"prepared": false, "cli": "not_removed", "cli_reason": "io"})
+        );
+        drop(h);
+        // Windows: only cli.toml has a fixed path, the PATH entry stays unknown.
+        let mut win = linux_inputs("C:/x/atlas-duck-app.exe");
+        win.platform = Platform::Windows;
+        win.cli_toml = "C:/Users/u/AppData/Roaming/atlas-duck/cli-h.toml".into();
+        let ops = Arc::new(FakeOps::new());
+        let fallback = Layout::for_removal(&win);
+        ops.write_cli_toml(
+            &fallback.cli_toml,
+            &atlas_duck_ipc::paths::CliToml {
+                app_path: Some("C:/Old/atlas-duck.exe".into()),
+            },
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let (res, _st, _h, records) =
+            finish_cli_step(ops.clone(), Err(InstallError::NoStablePath), Some(fallback)).await?;
+        assert_eq!(
+            (res.cli, res.cli_reason),
+            ("not_removed", Some("no_stable_path"))
+        );
+        assert_eq!(ops.state(), State::default(), "cli.toml went");
+        assert_eq!(records[1]["new"]["prepared"], false);
         Ok(())
     }
 
@@ -3403,6 +3534,119 @@ mod settings_commands {
         );
         answer_all(&st, &["jira-main"], Choice::Done)?;
         h.confirmer().push(Confirm::Ok);
+        assert!(finish_with(&h, &st, &m, false).await.is_ok());
+        Ok(())
+    }
+
+    /// I-1: `finish` (and a later `begin`) look at every instance the table shows now, not at the
+    /// ones the checklist listed at `begin`. An instance confirmed after `begin` that holds a token
+    /// joins the checklist as "not deleted, not answered", `finish` refuses with `token_stored`
+    /// before any dialog and removes nothing, and the next `begin` deletes the token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finish_checks_every_instance_not_only_the_checklist() -> TestResult {
+        // Both instances start unconfirmed: `begin` lists none, nothing can hold a token yet.
+        let h = Harness::builder()
+            .jira("jira-main")
+            .confluence("wiki")
+            .unconfirmed()
+            .confirm(vec![Confirm::Ok, Confirm::Ok, Confirm::Ok, Confirm::Ok])
+            .start()
+            .await?;
+        let st = RemovalState::default();
+        let m = machine(&h).await?;
+        let dto = begin_with(&h, &st, false).await?;
+        assert!(dto.active && dto.instances.is_empty(), "{dto:?}");
+        // Confirmed after `begin`, it holds the stored token (the harness keychain has one).
+        let view = h.instances().confirm_config_instance("jira-main")?;
+        assert!(view.executes_as.is_some(), "premise: a token is stored");
+        let installed = m.ops.state();
+        let dialogs = h.confirmer().texts().len();
+        let records = h.event_count().await?;
+        assert_eq!(
+            finish_with(&h, &st, &m, false).await.err(),
+            Some(CommandError::Removal(RemovalError::TokenStored))
+        );
+        assert_eq!(h.confirmer().texts().len(), dialogs, "no finish dialog");
+        assert_eq!(h.event_count().await?, records, "nothing recorded");
+        assert_eq!(m.ops.state(), installed);
+        assert!(m.autostart.is_on());
+        let item = st
+            .dto(RET)
+            .instances
+            .into_iter()
+            .find(|i| i.alias == "jira-main")
+            .ok_or("the instance joined the checklist")?;
+        assert!(!item.token_deleted);
+        assert_eq!(item.choice, Choice::Pending);
+        assert_eq!(item.identity.as_deref(), Some(TEST_USER));
+        // A later `begin` deletes it too, and only then can the procedure finish.
+        let dto = begin_with(&h, &st, false).await?;
+        assert!(dto.instances.iter().all(|i| i.token_deleted), "{dto:?}");
+        assert!(
+            !h.credentials()
+                .contains(&h.instance("jira-main").ok_or("instance")?.id),
+            "the token is gone"
+        );
+        answer_all(&st, &["jira-main"], Choice::Done)?;
+        assert!(finish_with(&h, &st, &m, false).await.is_ok());
+        Ok(())
+    }
+
+    /// I-2: the dialog of `finish` can stay open for minutes. A token stored while it is open (a
+    /// submit that was already under way) is found by the look *after* the dialog: nothing is
+    /// recorded or removed, and the instance is "not deleted, not answered" again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finish_looks_again_after_its_own_dialog() -> TestResult {
+        let h = two(vec![Confirm::Ok, Confirm::Ok, Confirm::Ok, Confirm::Ok]).await?;
+        let st = RemovalState::default();
+        let m = machine(&h).await?;
+        begin_with(&h, &st, false).await?;
+        answer_all(&st, &["jira-main", "wiki"], Choice::Done)?;
+        let mock = h.mock("jira-main").ok_or("mock")?;
+        mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+            .await;
+        mock.jira_server_info("9.12.0").await;
+        // While the dialog is open, the token arrives.
+        let (admin, runtime) = (h.instances(), tokio::runtime::Handle::current());
+        let armed = Arc::new(AtomicBool::new(true));
+        let flag = armed.clone();
+        h.confirmer().set_hook(Arc::new(move |_| {
+            if flag.swap(false, Ordering::SeqCst) {
+                let _ = runtime.block_on(admin.set_token(
+                    "jira-main",
+                    secrecy::SecretString::from("fresh-pat"),
+                    None,
+                ));
+            }
+        }));
+        let installed = m.ops.state();
+        let dialogs = h.confirmer().texts().len();
+        assert_eq!(
+            finish_with(&h, &st, &m, false).await.err(),
+            Some(CommandError::Removal(RemovalError::TokenStored))
+        );
+        assert!(!armed.load(Ordering::SeqCst), "the dialog was shown");
+        assert_eq!(h.confirmer().texts().len(), dialogs + 1);
+        assert!(
+            config_keys(&h)
+                .await?
+                .iter()
+                .all(|k| k != "prepare_for_removal"),
+            "nothing recorded"
+        );
+        assert_eq!(m.ops.state(), installed);
+        assert!(m.autostart.is_on());
+        let item = st
+            .dto(RET)
+            .instances
+            .into_iter()
+            .find(|i| i.alias == "jira-main")
+            .ok_or("item")?;
+        assert!(!item.token_deleted);
+        assert_eq!(item.choice, Choice::Pending);
+        // The way on: delete it again, answer, finish.
+        begin_with(&h, &st, false).await?;
+        answer_all(&st, &["jira-main"], Choice::Done)?;
         assert!(finish_with(&h, &st, &m, false).await.is_ok());
         Ok(())
     }

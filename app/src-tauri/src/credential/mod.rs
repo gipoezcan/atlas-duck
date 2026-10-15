@@ -238,6 +238,18 @@ fn open_inner<R: Runtime>(
     let mut announce = false;
     let opened = windows::open_with(app, Label::Credential, how, |registry, exists| {
         let mut st = registry.credential_state();
+        // M6 T28 (T20 m-9), the credential half of the two-sided interlock: a window for a token is
+        // not registered while a "Prepare for removal" call runs. The check is made under the
+        // credential-state lock, right before the purpose is set; the removal side claims `busy`
+        // first and reads the purpose (through the same lock) second, so one of the two always
+        // sees the other: there is no check-then-register gap.
+        if purpose.pat_target().is_some()
+            && app
+                .try_state::<crate::removal::RemovalState>()
+                .is_some_and(|r| r.busy())
+        {
+            return Err(WindowError::Busy);
+        }
         let decide = match (st.purpose.as_ref(), exists) {
             (_, false) => Decide::New,
             (Some(current), true) if *current == purpose => Decide::Same,

@@ -602,6 +602,84 @@ fn credential_context_is_rust_fixed() -> TestResult {
     Ok(())
 }
 
+/// M6 T28 (T20 m-9), the credential half of the interlock: while a removal call holds its claim, a
+/// window for a token is not registered at all (the check and the purpose are one step under the
+/// registry's lock): nothing is built, no purpose is set, and the answer is `busy`. Other windows
+/// are not held off, and once the claim is released the token window opens.
+#[test]
+fn a_token_window_is_not_registered_while_a_removal_call_runs() -> TestResult {
+    use atlas_duck_app_lib::removal::RemovalState;
+    let tmp = scratch()?;
+    let app = app()?;
+    let data = local_data_dir(tmp.path())?;
+    let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
+    app.manage(DataDirHold::new(data, lock));
+    app.manage(RemovalState::default());
+    let handle = app.handle();
+    let views = vec![view(
+        "A",
+        "needs_token",
+        Some("https://jira-a.example/jira"),
+    )];
+
+    let state = app.state::<RemovalState>();
+    let claim = state.claim()?;
+    assert_eq!(
+        credential::open_for_pat(handle, &views, "A", false),
+        Err(PatOpenError::Window(WindowError::Busy))
+    );
+    assert_eq!(credential::current_purpose(handle), None);
+    assert_eq!(app.webview_windows().len(), 0, "no window was built");
+    drop(claim);
+    credential::open_for_pat(handle, &views, "A", false)?;
+    assert!(matches!(
+        credential::current_purpose(handle),
+        Some(Purpose::AddPat(_))
+    ));
+    Ok(())
+}
+
+/// M6 T28 (T20 m-9): a window that is open already (opened before the removal call, or kept by a
+/// submit under way) cannot store a token while a removal call runs: `submit_secret` answers `busy`
+/// before it reaches core; without a claim it goes on (here: `not_ready`, no core serves).
+#[test]
+fn a_token_submit_is_refused_while_a_removal_call_runs() -> TestResult {
+    use atlas_duck_app_lib::removal::RemovalState;
+    let tmp = scratch()?;
+    let app = app()?;
+    let data = local_data_dir(tmp.path())?;
+    let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
+    app.manage(DataDirHold::new(data, lock));
+    app.manage(RemovalState::default());
+    let handle = app.handle();
+    let views = vec![view(
+        "A",
+        "needs_token",
+        Some("https://jira-a.example/jira"),
+    )];
+    credential::open_for_pat(handle, &views, "A", false)?;
+    let w = window(&app, "credential")?;
+    let body = json!({"secret": "x"});
+    assert_eq!(
+        invoke(&w, "submit_secret", body.clone()),
+        Err(json!({"kind": "not_ready"})),
+        "no claim: the submit reaches the core check"
+    );
+    let state = app.state::<RemovalState>();
+    let claim = state.claim()?;
+    assert_eq!(
+        invoke(&w, "submit_secret", body.clone()),
+        Err(json!({"kind": "busy"}))
+    );
+    drop(claim);
+    assert_eq!(
+        invoke(&w, "submit_secret", body),
+        Err(json!({"kind": "not_ready"})),
+        "the claim was released"
+    );
+    Ok(())
+}
+
 /// A mock app holding `dir` as its (locked) data dir.
 fn app_with_data_dir(
     dir: &std::path::Path,

@@ -526,9 +526,9 @@ export const SETTINGS_TEXT = {
     'Before you uninstall atlas-duck: make a backup if you want one, delete the stored tokens, revoke each token on its server, and remove the command line and the login item. The audit log, its keys and its anchors are kept, so the log stays verifiable until its retention period has passed.',
   /** spec 12.5 step 1: the remaining retention of the newest record is the setting itself. */
   removal_retention: (days: number, hold: boolean) =>
-    `The newest audit record is kept for ${days} ${days === 1 ? 'day' : 'days'}${hold ? ' (a legal hold is on: pruning is stopped)' : ''}.`,
+    `The newest audit record is kept ${hold ? 'until the legal hold is lifted, then for' : 'for'} at least ${days} more ${days === 1 ? 'day' : 'days'}.`,
   removal_backup: 'Create a full backup',
-  removal_backup_note: 'A backup never contains a token. Rust asks where to put it.',
+  removal_backup_note: 'A backup never contains a token. You choose the folder in the next dialog.',
   removal_backup_saved: 'The backup was saved.',
   removal_backup_cancelled: 'No backup was made.',
   removal_backup_made: 'A backup was made in this procedure.',
@@ -541,6 +541,8 @@ export const SETTINGS_TEXT = {
   removal_identity: 'Token identity',
   removal_identity_unknown: 'not known (no token identity is on record for this instance)',
   removal_not_deleted: 'The token is still stored: it could not be deleted.',
+  /** A token is stored again for the instance (no delete failed): it has to be deleted again. */
+  removal_token_back: 'A token is stored again for this instance: delete it again.',
   removal_done: 'I revoked it',
   removal_skip: 'Skip',
   removal_choice_done: 'Marked as revoked.',
@@ -553,14 +555,31 @@ export const SETTINGS_TEXT = {
   removal_cli: {
     removed: 'The command line was removed.',
     already_on_path: 'The command line comes with the package: remove the package to remove it.',
-    nothing: 'No command line was installed from here.',
+    not_found: 'No command line of atlas-duck was found.',
+    not_removed: 'The command line was not removed.',
   } as const,
+  /** Why the command line step could not look at everything, by error kind (`cli_reason`). */
+  removal_cli_reasons: {
+    no_stable_path:
+      'atlas-duck cannot tell where it is installed from this location, so the command line may still be on your PATH',
+    unsafe_path:
+      'The install location has a character that cannot be handled safely (for example a semicolon or a quote), so the command line may still be on your PATH',
+    unsupported: 'Removing the command line is not supported on this system',
+    io: 'The files of this computer could not be read',
+    registry: 'Your user PATH could not be read or changed',
+    cli_toml: 'The file that records where the app is could not be removed',
+    other: 'The command line could not be removed',
+  } as Readonly<Record<string, string>>,
+  /** Shown only when every step succeeded. */
   removal_autostart: {
     removed: 'atlas-duck no longer starts at login.',
     was_off: 'atlas-duck did not start at login.',
   } as const,
   removal_complete:
     'Done. You can uninstall atlas-duck now. The audit log, its keys and its anchors stay on this computer; the documentation lists where, for deletion after the retention period.',
+  /** Shown when a step could not be completed: never "Done". */
+  removal_incomplete:
+    'Not done: the command line may still be installed. Remove the atlas-duck command and the cli.toml file by hand, or start atlas-duck from where it is installed and run this procedure again. The tokens are deleted and your answers are recorded; the audit log, its keys and its anchors stay on this computer.',
   /** Why a removal step was refused, by error kind (`removal` errors). */
   removal_errors: {
     no_procedure: 'Delete the stored tokens first',
@@ -572,7 +591,7 @@ export const SETTINGS_TEXT = {
   working: 'Working',
   /** Fixed answers for a refused or failed command, by error kind. */
   errors: {
-    busy: 'The credential window is open for something else: close it first',
+    busy: 'The credential window is open, or a removal step is running: close the window or wait, then try again',
     not_found: 'That instance no longer exists',
     not_ready: 'The app is still starting: try again in a moment',
     internal: 'The command failed',

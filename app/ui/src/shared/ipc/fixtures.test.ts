@@ -237,10 +237,14 @@ describe('fixtures validate against their TS types', () => {
     expect(isRemovalBackupAnswer({ saved: true })).toBe(true);
     expect(isRemovalBackupAnswer({ saved: 1 })).toBe(false);
     expect(isRemovalBackupAnswer({ saved: true, path: '/x' })).toBe(false);
-    expect(isRemovalFinishAnswer({ cli: 'removed', autostart: 'was_off' })).toBe(true);
-    expect(isRemovalFinishAnswer({ cli: 'gone', autostart: 'removed' })).toBe(false);
-    expect(isRemovalFinishAnswer({ cli: 'removed' })).toBe(false);
-    expect(isRemovalFinishAnswer({ cli: 'removed', autostart: 'removed', extra: 1 })).toBe(false);
+    const answer = { cli: 'removed', cli_reason: null, autostart: 'was_off' };
+    expect(isRemovalFinishAnswer(answer)).toBe(true);
+    expect(isRemovalFinishAnswer({ ...answer, cli: 'not_removed', cli_reason: 'io' })).toBe(true);
+    expect(isRemovalFinishAnswer({ ...answer, cli: 'nothing' })).toBe(false);
+    expect(isRemovalFinishAnswer({ ...answer, cli: 'gone' })).toBe(false);
+    expect(isRemovalFinishAnswer({ ...answer, cli_reason: 5 })).toBe(false);
+    expect(isRemovalFinishAnswer({ cli: 'removed', autostart: 'removed' })).toBe(false);
+    expect(isRemovalFinishAnswer({ ...answer, extra: 1 })).toBe(false);
   });
 
   it('edit_form: every input kind validates, nulls are valid values, a wrong shape is refused', () => {

@@ -193,11 +193,14 @@ pub struct BackupAnswer {
 }
 
 /// `removal_finish`'s answer: what was removed, as fixed words the page maps to its own text.
-/// `cli`: `removed`, `already_on_path` (deb/rpm: the package owns the CLI) or `nothing` (no stable
-/// path: nothing of the CLI was ever installed from here). `autostart`: `removed` or `was_off`.
+/// `cli`: `removed`, `already_on_path` (deb/rpm: the package owns the CLI), `not_found` (the fixed
+/// paths hold nothing of ours) or `not_removed` (the layout of this run could not be named, so not
+/// everything could be looked at; `cli_reason` is the error kind, `None` otherwise). `autostart`:
+/// `removed` or `was_off`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FinishAnswer {
     pub cli: &'static str,
+    pub cli_reason: Option<&'static str>,
     pub autostart: &'static str,
 }
 
@@ -307,6 +310,75 @@ fn listed(view: &InstanceView) -> bool {
     !matches!(view.state, "instance_unconfirmed" | "insecure_scheme") || token_stored(view)
 }
 
+/// The aliases `begin` deletes the token of. No procedure yet: every listed instance. Otherwise
+/// what is not deleted, every instance whose token the table shows (a token entered since), and
+/// every listed instance the checklist does not have yet.
+fn begin_targets(procedure: Option<&Procedure>, views: &[InstanceView]) -> Vec<String> {
+    let Some(p) = procedure else {
+        return views
+            .iter()
+            .filter(|v| listed(v))
+            .map(|v| v.alias.clone())
+            .collect();
+    };
+    let mut targets: Vec<String> = Vec::new();
+    let mut add = |alias: &str| {
+        if !targets.iter().any(|t| t == alias) {
+            targets.push(alias.to_owned());
+        }
+    };
+    for item in p.items.iter().filter(|i| !i.deleted) {
+        add(&item.alias);
+    }
+    for v in views {
+        let known = p.items.iter().any(|i| i.alias == v.alias);
+        if token_stored(v) || (listed(v) && !known) {
+            add(&v.alias);
+        }
+    }
+    targets
+}
+
+/// Brings the checklist in line with the live instance list (what `InstanceAdmin` shows at this
+/// moment, not what the checklist listed at `begin`): an instance whose token is stored is "not
+/// deleted, not answered" with the identity the table shows now (a new token is a new thing to
+/// revoke: an earlier tick is stale), and one the checklist lacks joins it (`add_unstored`: every
+/// listed instance; otherwise only one holding a token). `true` when a token was found stored. The
+/// choices written to the audit log earlier no longer describe the procedure then.
+fn reconcile(p: &mut Procedure, views: &[InstanceView], add_unstored: bool) -> bool {
+    let mut found = false;
+    for v in views {
+        let stored = token_stored(v);
+        match p.items.iter_mut().find(|i| i.alias == v.alias) {
+            Some(item) if stored => {
+                item.deleted = false;
+                item.error = None;
+                item.choice = Choice::Pending;
+                item.identity = v.executes_as.clone();
+                found = true;
+            }
+            Some(_) => {}
+            None if stored || (add_unstored && listed(v)) => {
+                p.items.push(Item {
+                    alias: v.alias.clone(),
+                    product: product_str(v.product),
+                    origin: v.origin.clone(),
+                    identity: v.executes_as.clone(),
+                    deleted: false,
+                    error: None,
+                    choice: Choice::Pending,
+                });
+                found |= stored;
+            }
+            None => {}
+        }
+    }
+    if found {
+        p.recorded = false;
+    }
+    found
+}
+
 async fn run_blocking<T, F>(f: F) -> Result<T, CommandError>
 where
     F: FnOnce() -> T + Send + 'static,
@@ -391,26 +463,11 @@ pub async fn begin(
     // `delete_token` is called for every listed instance on a first run, not only for those the
     // table says hold a token: it is idempotent and logs nothing when nothing is stored, and a
     // keychain entry must not outlive the delete because the table lost the identity. Afterwards a
-    // run retries only what is not deleted.
-    let targets: Vec<String> = if first_run {
-        views
-            .iter()
-            .filter(|v| listed(v))
-            .map(|v| v.alias.clone())
-            .collect()
-    } else {
-        state
-            .lock()
-            .procedure
-            .as_ref()
-            .map(|p| {
-                p.items
-                    .iter()
-                    .filter(|i| !i.deleted)
-                    .map(|i| i.alias.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+    // run retries what is not deleted, and looks at the live list again: an instance added or
+    // confirmed since, or one given a token since, is deleted too.
+    let targets = {
+        let inner = state.lock();
+        begin_targets(inner.procedure.as_ref(), &views)
     };
     if !first_run && targets.is_empty() {
         return Ok(state.dto(retention));
@@ -422,24 +479,10 @@ pub async fn begin(
         .map(|v| v.alias.clone())
         .collect();
     confirmed(&confirmer, begin_text(&stored)).await?;
-    if first_run {
-        let items = views
-            .iter()
-            .filter(|v| listed(v))
-            .map(|v| Item {
-                alias: v.alias.clone(),
-                product: product_str(v.product),
-                origin: v.origin.clone(),
-                identity: v.executes_as.clone(),
-                deleted: false,
-                error: None,
-                choice: Choice::Pending,
-            })
-            .collect();
-        state.lock().procedure = Some(Procedure {
-            items,
-            recorded: false,
-        });
+    {
+        let mut inner = state.lock();
+        let procedure = inner.procedure.get_or_insert_with(Procedure::default);
+        reconcile(procedure, &views, true);
     }
     for alias in targets {
         let result = instances.delete_token(&alias).await;
@@ -534,23 +577,93 @@ fn remove_autostart(
 
 /// The CLI step (§12.3, §12.5 step 3): `cli_uninstall_dto` for everything this app installs
 /// (record first, undo on failure); deb/rpm own the CLI, so only a leftover `cli.toml` goes. No
-/// stable path means no CLI was ever installed from this run: nothing to remove.
+/// stable path (or any other layout error) does not mean nothing was installed: the link, the
+/// wrapper and `cli.toml` sit at fixed paths, so `fallback` (the removal-only layout, when the
+/// machine could be read at all) removes what is ours by content, and the step reports its own
+/// outcome (a fixed word and the error kind) instead of failing `finish` after its record.
 fn remove_cli(
     settings: &dyn SettingsAdmin,
     ops: &dyn PlatformOps,
     layout: Result<Layout, InstallError>,
-) -> Result<&'static str, CommandError> {
+    fallback: Option<Layout>,
+) -> Result<CliStep, CommandError> {
     let layout = match layout {
         Ok(l) => l,
-        Err(InstallError::NoStablePath) => return Ok("nothing"),
-        Err(e) => return Err(CommandError::CliInstall(e)),
+        Err(cause) => return Ok(remove_cli_without_layout(ops, &cause, fallback)),
     };
     if matches!(layout.kind, Kind::Packaged) {
         cli_install::uninstall(ops, &layout)?;
-        return Ok("already_on_path");
+        return Ok(CliStep::done("already_on_path"));
     }
     cli_uninstall_dto(settings, ops, Ok(layout))?;
-    Ok("removed")
+    Ok(CliStep::done("removed"))
+}
+
+/// No layout could be derived: remove by content what sits at fixed paths. Those removals are
+/// covered by the choices record written before (as the deb/rpm `cli.toml` removal is).
+fn remove_cli_without_layout(
+    ops: &dyn PlatformOps,
+    cause: &InstallError,
+    fallback: Option<Layout>,
+) -> CliStep {
+    let not_removed = |reason: &InstallError| CliStep {
+        cli: CLI_NOT_REMOVED,
+        reason: Some(reason.kind()),
+    };
+    let Some(fallback) = fallback else {
+        return not_removed(cause);
+    };
+    match cli_install::uninstall(ops, &fallback) {
+        Err(e) => not_removed(&e),
+        // Only `cli.toml` has a fixed path here (Windows): the PATH entry stays unknown.
+        Ok(_) if matches!(fallback.kind, Kind::Packaged) => not_removed(cause),
+        Ok(report) if report.changed.is_empty() => CliStep::done("not_found"),
+        Ok(_) => CliStep::done("removed"),
+    }
+}
+
+/// The CLI step's own outcome: a fixed word, and for `not_removed` the kind of what stopped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliStep {
+    cli: &'static str,
+    reason: Option<&'static str>,
+}
+
+impl CliStep {
+    fn done(cli: &'static str) -> CliStep {
+        CliStep { cli, reason: None }
+    }
+
+    /// Every effect of the CLI step succeeded (nothing of ours is left).
+    fn complete(&self) -> bool {
+        self.cli != CLI_NOT_REMOVED
+    }
+}
+
+/// `removal_finish`'s `cli` word when the CLI step could not remove what it could not name.
+const CLI_NOT_REMOVED: &str = "not_removed";
+
+/// Looks at the live instance list (not the checklist's) and puts every token found stored on the
+/// checklist as "not deleted, not answered": `TokenStored`, nothing removed (`begin` deletes it
+/// again). Called before the dialog (no pointless dialog) and after it (it can stay open for
+/// minutes).
+async fn recheck_tokens(
+    state: &RemovalState,
+    instances: &Arc<dyn InstanceAdmin>,
+) -> Result<(), CommandError> {
+    let views = {
+        let admin = instances.clone();
+        run_blocking(move || admin.list()).await?
+    };
+    let mut inner = state.lock();
+    let procedure = inner
+        .procedure
+        .as_mut()
+        .ok_or(CommandError::Removal(RemovalError::NoProcedure))?;
+    if reconcile(procedure, &views, false) {
+        return Err(CommandError::Removal(RemovalError::TokenStored));
+    }
+    Ok(())
 }
 
 /// `finish` (§12.5 steps 2 to 4): refused until every listed instance is ticked or skipped with
@@ -568,13 +681,14 @@ pub async fn finish(
     autostart: Arc<dyn AutostartPort>,
     ops: Arc<dyn PlatformOps>,
     layout: Result<Layout, InstallError>,
+    fallback: Option<Layout>,
     pat_window_open: impl Fn() -> bool,
 ) -> Result<FinishAnswer, CommandError> {
     let _claim = state.claim()?;
     if pat_window_open() {
         return Err(CommandError::Busy);
     }
-    let items = {
+    {
         let inner = state.lock();
         let procedure = inner
             .procedure
@@ -587,45 +701,22 @@ pub async fn finish(
         {
             return Err(CommandError::Removal(RemovalError::Unticked));
         }
-        procedure.items.clone()
-    };
-    // A PAT entered since `begin` would stay valid and stored: look again before removing anything.
-    let views = {
-        let admin = instances.clone();
-        run_blocking(move || admin.list()).await?
-    };
-    let stored: Vec<&str> = items
-        .iter()
-        .filter(|i| views.iter().any(|v| v.alias == i.alias && token_stored(v)))
-        .map(|i| i.alias.as_str())
-        .collect();
-    if !stored.is_empty() {
-        let mut inner = state.lock();
-        if let Some(p) = inner.procedure.as_mut() {
-            for item in p
-                .items
-                .iter_mut()
-                .filter(|i| stored.contains(&i.alias.as_str()))
-            {
-                // A new token is a new thing to revoke: the earlier tick is stale.
-                item.deleted = false;
-                item.error = None;
-                item.choice = Choice::Pending;
-                item.identity = views
-                    .iter()
-                    .find(|v| v.alias == item.alias)
-                    .and_then(|v| v.executes_as.clone());
-            }
-            // The choices recorded earlier (if any) no longer describe the procedure.
-            p.recorded = false;
-        }
-        return Err(CommandError::Removal(RemovalError::TokenStored));
     }
+    // A PAT entered since `begin` would stay valid and stored: look at every instance again before
+    // the dialog, and again after it (the user may take minutes; `begin` and the credential window
+    // are held off by the claim, but a submit already under way is not).
+    recheck_tokens(state, &instances).await?;
     confirmed(&confirmer, finish_text()).await?;
-    let (recorded, backup_made) = {
+    recheck_tokens(state, &instances).await?;
+    let (items, recorded, backup_made) = {
         let inner = state.lock();
+        let procedure = inner
+            .procedure
+            .as_ref()
+            .ok_or(CommandError::Removal(RemovalError::NoProcedure))?;
         (
-            inner.procedure.as_ref().is_some_and(|p| p.recorded),
+            procedure.items.clone(),
+            procedure.recorded,
             inner.backup_made,
         )
     };
@@ -636,11 +727,13 @@ pub async fn finish(
             .collect();
         let admin = settings.clone();
         // Audit before effect: a record that cannot be written stops the call, nothing is removed.
+        // It says `prepared: false`: the machine is prepared only once every effect succeeded, which
+        // the record after the effects says (a failure without a corrective record stays "false").
         run_blocking(move || {
             admin.record_app_change(
                 KEY_REMOVAL,
                 json!({"prepared": false}),
-                json!({"prepared": true, "backup": backup_made, "instances": choices}),
+                json!({"prepared": false, "backup": backup_made, "instances": choices}),
             )
         })
         .await??;
@@ -648,17 +741,43 @@ pub async fn finish(
             p.recorded = true;
         }
     }
-    let answer = run_blocking(move || -> Result<FinishAnswer, CommandError> {
-        let removed = remove_autostart(&*settings, &*autostart)?;
-        let cli = remove_cli(&*settings, &*ops, layout)?;
-        Ok(FinishAnswer {
-            cli,
-            autostart: if removed { "removed" } else { "was_off" },
+    let (autostart_removed, cli) = {
+        let settings = settings.clone();
+        run_blocking(move || -> Result<(bool, CliStep), CommandError> {
+            let removed = remove_autostart(&*settings, &*autostart)?;
+            let cli = remove_cli(&*settings, &*ops, layout, fallback)?;
+            Ok((removed, cli))
         })
+        .await??
+    };
+    // Every effect is done (or the CLI step says what it could not do): the record that says so.
+    // Its own failure cannot undo the effects; the log then keeps `prepared: false`, the safe side.
+    let outcome = if cli.complete() {
+        json!({"prepared": true, "cli": cli.cli})
+    } else {
+        json!({"prepared": false, "cli": cli.cli, "cli_reason": cli.reason})
+    };
+    let recorded_end = run_blocking(move || {
+        settings.record_app_change(KEY_REMOVAL, json!({"prepared": false}), outcome)
     })
-    .await??;
+    .await?;
+    if let Err(e) = recorded_end {
+        tracing::warn!(
+            event = LOG_EVENT_REMOVAL_FAILED,
+            error_class = "settings",
+            error_kind = e.to_string().as_str()
+        );
+    }
     *state.lock() = Inner::default();
-    Ok(answer)
+    Ok(FinishAnswer {
+        cli: cli.cli,
+        cli_reason: cli.reason,
+        autostart: if autostart_removed {
+            "removed"
+        } else {
+            "was_off"
+        },
+    })
 }
 
 #[cfg(test)]
