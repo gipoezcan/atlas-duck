@@ -1,0 +1,12 @@
+[
+  {
+    "clamped": false,
+    "count": 42,
+    "cutoff": "2026-07-15",
+    "result": "pruned"
+  },
+  {
+    "reason": "legal_hold",
+    "result": "skipped"
+  }
+]

@@ -1,6 +1,6 @@
 //! The credential window's commands (C.10 + Δ1, §10.3; M6 T20): `credential_context`,
-//! `submit_secret`, `save_recovery_note`, `archive_and_start_fresh`, `retry_keychain` (`quit` is
-//! `window::quit`). Granted to the `credential` window only.
+//! `submit_secret`, `save_recovery_note`, `archive_and_start_fresh`, `retry_keychain`,
+//! `close_credential` (M6 T25; `quit` is `window::quit`). Granted to the `credential` window only.
 //!
 //! What a call may do is decided by the purpose Rust opened the window for
 //! (`credential::Purpose`), never by an argument. A secret arrives only in `submit_secret`, is a
@@ -174,6 +174,11 @@ pub struct ArchiveAndStartFreshArgs {}
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetryKeychainArgs {}
+
+/// `close_credential {}` (M6 T25, T21 review I-4): the page's own Close / Cancel.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloseCredentialArgs {}
 
 /// The read-only context header (§10.3): the purpose, for a PAT the instance as Rust read it when
 /// it opened the window, for the locked and first-run purposes the refused count (§2.5).
@@ -435,7 +440,12 @@ async fn submit<R: Runtime>(
     match purpose {
         Purpose::AddPat(target) | Purpose::ReplacePat(target) => {
             let core = super::core(app)?;
-            submit_pat_dto(core.instances(), &target, args).await
+            let outcome = submit_pat_dto(core.instances(), &target, args).await;
+            if matches!(outcome, Ok(SubmitOutcome::Ok(_))) {
+                // The token and the instance's state changed: an open Settings window re-reads.
+                crate::ui_sink::emit_settings_changed(app);
+            }
+            outcome
         }
         Purpose::RecoveryPassphrase => {
             let pair = match passphrase_pair(args)? {
@@ -569,6 +579,30 @@ async fn archive<R: Runtime>(app: &AppHandle<R>) -> Result<ArchiveOutcome, Comma
         }
         Err(f) => Ok(ArchiveOutcome::Failed(SubmitFailure::class(f.class()))),
     }
+}
+
+/// `close_credential {}` (M6 T25, §10.3): the window closes itself. Rust forgets the purpose (and a
+/// pending first-run passphrase request, which the wizard sees as "the window closed") and then
+/// destroys the window and its webview, exactly as the OS close button does, so it adds no
+/// capability; `credential::close` runs on the blocking pool because it takes the registry's
+/// `opening` lock. The answer is sent before the page is gone (or fails to be, which the page
+/// cannot tell and does not need to).
+#[tauri::command]
+pub async fn close_credential<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<CloseCredentialArgs>,
+) -> Result<(), CommandError> {
+    let Args(CloseCredentialArgs {}) = args;
+    let handle = app.clone();
+    let response = match credential::current_window(&app) {
+        None => Err(CommandError::NotReady),
+        Some((_, generation)) => {
+            // Only the window this call came from: a later open's window is left alone.
+            tauri::async_runtime::spawn_blocking(move || credential::close_if(&handle, generation));
+            Ok(())
+        }
+    };
+    finish(&app, response)
 }
 
 /// `retry_keychain {}` (PD-89): one more keystore + `open` while the app is locked

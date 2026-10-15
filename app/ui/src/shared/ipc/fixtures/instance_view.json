@@ -1,0 +1,30 @@
+[
+  {
+    "alias": "work",
+    "days_left": 5,
+    "executes_as": "alice",
+    "expires_at": "2027-01-31",
+    "expiry_warning": 7,
+    "note": "token now resolves to bob",
+    "origin": "https://jira.example/jira",
+    "pac_configured": true,
+    "pending_url_change": "https://jira.example/moved",
+    "product": "jira",
+    "proxy_effective": "proxy.corp:3128",
+    "state": "ok"
+  },
+  {
+    "alias": "wiki",
+    "days_left": null,
+    "executes_as": null,
+    "expires_at": null,
+    "expiry_warning": null,
+    "note": null,
+    "origin": null,
+    "pac_configured": false,
+    "pending_url_change": null,
+    "product": "confluence",
+    "proxy_effective": null,
+    "state": "instance_unconfirmed"
+  }
+]

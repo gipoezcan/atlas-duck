@@ -1,0 +1,167 @@
+[
+  {
+    "cli_installed": true,
+    "confinement": {
+      "extra_layers": [
+        {
+          "name": "landlock",
+          "on": true
+        }
+      ],
+      "failed": [],
+      "mode": "lpac",
+      "state": "met"
+    },
+    "instances": [
+      {
+        "alias": "work",
+        "days_left": 5,
+        "executes_as": "alice",
+        "expires_at": "2027-01-31",
+        "expiry_warning": 7,
+        "note": "token now resolves to bob",
+        "origin": "https://jira.example/jira",
+        "pac_configured": true,
+        "pending_url_change": "https://jira.example/moved",
+        "product": "jira",
+        "proxy_effective": "proxy.corp:3128",
+        "state": "ok"
+      },
+      {
+        "alias": "wiki",
+        "days_left": null,
+        "executes_as": null,
+        "expires_at": null,
+        "expiry_warning": null,
+        "note": null,
+        "origin": null,
+        "pac_configured": false,
+        "pending_url_change": null,
+        "product": "confluence",
+        "proxy_effective": null,
+        "state": "instance_unconfirmed"
+      }
+    ],
+    "settings": {
+      "anchor_dir": "anchors",
+      "attention_mode": "badge_only",
+      "config_read_only": {
+        "kind": "read_only",
+        "text": "config written by v9.9.0; settings read-only until you upgrade"
+      },
+      "health": {
+        "anchor_thread_dead": false,
+        "anchor_write_failing": false,
+        "anchors_blocked": false,
+        "last_prune_failed": false,
+        "open_incidents": 0,
+        "prune_backlog": "pruning is 12 days behind",
+        "prune_backlog_days": 12,
+        "settings_unreadable": false,
+        "shred_checkpoint_pending": false,
+        "storage_low": true
+      },
+      "legal_hold": true,
+      "limits": {
+        "candidate_cache_mb": 256,
+        "expiry_hours": 24,
+        "jira_comments_cap": 50,
+        "max_pending_bytes_mb": 512
+      },
+      "restart_pending": [
+        "candidate_cache_mb"
+      ],
+      "retention_days": 365
+    }
+  },
+  {
+    "cli_installed": false,
+    "confinement": {
+      "extra_layers": [],
+      "failed": [
+        "connect_loopback",
+        "cred_read"
+      ],
+      "mode": "appcontainer",
+      "state": "not_met"
+    },
+    "instances": [
+      {
+        "alias": "wiki",
+        "days_left": null,
+        "executes_as": null,
+        "expires_at": null,
+        "expiry_warning": null,
+        "note": null,
+        "origin": null,
+        "pac_configured": false,
+        "pending_url_change": null,
+        "product": "confluence",
+        "proxy_effective": null,
+        "state": "instance_unconfirmed"
+      }
+    ],
+    "settings": {
+      "anchor_dir": null,
+      "attention_mode": "show_without_activating",
+      "config_read_only": null,
+      "health": {
+        "anchor_thread_dead": false,
+        "anchor_write_failing": false,
+        "anchors_blocked": false,
+        "last_prune_failed": false,
+        "open_incidents": 0,
+        "prune_backlog": null,
+        "prune_backlog_days": 0,
+        "settings_unreadable": false,
+        "shred_checkpoint_pending": false,
+        "storage_low": false
+      },
+      "legal_hold": false,
+      "limits": {
+        "candidate_cache_mb": 256,
+        "expiry_hours": 24,
+        "jira_comments_cap": 50,
+        "max_pending_bytes_mb": null
+      },
+      "restart_pending": [],
+      "retention_days": 100
+    }
+  },
+  {
+    "cli_installed": false,
+    "confinement": {
+      "extra_layers": [],
+      "failed": [],
+      "mode": "n/a",
+      "state": "pending"
+    },
+    "instances": [],
+    "settings": {
+      "anchor_dir": null,
+      "attention_mode": "show_without_activating",
+      "config_read_only": null,
+      "health": {
+        "anchor_thread_dead": false,
+        "anchor_write_failing": false,
+        "anchors_blocked": false,
+        "last_prune_failed": false,
+        "open_incidents": 0,
+        "prune_backlog": null,
+        "prune_backlog_days": 0,
+        "settings_unreadable": false,
+        "shred_checkpoint_pending": false,
+        "storage_low": false
+      },
+      "legal_hold": false,
+      "limits": {
+        "candidate_cache_mb": 256,
+        "expiry_hours": 24,
+        "jira_comments_cap": 50,
+        "max_pending_bytes_mb": null
+      },
+      "restart_pending": [],
+      "retention_days": 100
+    }
+  }
+]

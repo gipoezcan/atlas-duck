@@ -18,6 +18,7 @@ pub mod credential;
 pub mod dto;
 mod errors;
 mod names;
+pub mod settings;
 pub mod window;
 
 use std::sync::Arc;
@@ -51,10 +52,21 @@ pub fn register<R: Runtime>(builder: Builder<R>) -> Builder<R> {
         approvals::recent_list,
         approvals::redaction_preview,
         credential::archive_and_start_fresh,
+        credential::close_credential,
         credential::credential_context,
         credential::retry_keychain,
         credential::save_recovery_note,
         credential::submit_secret,
+        settings::credential_window_open,
+        settings::instance_accept_url_change,
+        settings::instance_add,
+        settings::instance_change_url,
+        settings::instance_confirm_config,
+        settings::instance_set_proxy,
+        settings::prune_backlog_now,
+        settings::retest_token,
+        settings::settings_apply,
+        settings::settings_get,
         window::open_window,
         window::quit
     ])

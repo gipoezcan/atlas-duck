@@ -44,6 +44,16 @@ pub fn emit_window_focus<R: Runtime>(app: &AppHandle<R>, label: &str, requested:
     let _ = Emitter::emit_to(app, label, EVENT_WINDOW_FOCUS, payload);
 }
 
+/// The event the Settings window (and the wizard's instance step) re-read on (Δ1, M6 T25): a
+/// setting, an instance or a token changed. App-owned, not a core event; no payload.
+pub const EVENT_SETTINGS_CHANGED: &str = "settings_changed";
+
+/// Tells every listening window that settings or instances changed (no payload: the windows read
+/// `settings_get` again). Recorded like every payload a webview can receive (S-16).
+pub fn emit_settings_changed<R: Runtime>(app: &AppHandle<R>) {
+    EventOut::emit(app, EVENT_SETTINGS_CHANGED, Value::Null);
+}
+
 /// The C.10 event name and payload of a core event.
 pub fn wire(e: &UiEvent) -> (&'static str, Value) {
     match e {

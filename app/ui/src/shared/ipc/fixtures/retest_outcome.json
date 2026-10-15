@@ -1,0 +1,21 @@
+[
+  {
+    "ok": {
+      "atlassian_user": "alice",
+      "product": "jira",
+      "version": "9.12.0",
+      "warnings": []
+    }
+  },
+  {
+    "failed": {
+      "class": "other_user"
+    }
+  },
+  {
+    "failed": {
+      "class": "network",
+      "conn": "connect_timeout"
+    }
+  }
+]

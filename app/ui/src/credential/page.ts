@@ -142,6 +142,8 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
   let generation = 0;
   let result: { text: string; ok: boolean; extra: string[] } | null = null;
   let done = false;
+  // The recovery note was saved: the passphrase went to the wizard, so the window may be closed.
+  let noteSaved = false;
   let secretField: HTMLInputElement | null = null;
   let confirmField: HTMLInputElement | null = null;
   let dateField: HTMLInputElement | null = null;
@@ -220,14 +222,28 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     actionButtons.push(b);
   }
 
-  /** Quit works while a call is in flight: a locked app must stay quittable (spec 10.3, 2.5). */
+  /**
+   * Quit works while a call is in flight: a locked app must stay quittable (spec 10.3, 2.5). The
+   * label says it quits the whole app, so it is not taken for closing this window.
+   */
   function addQuit(parent: HTMLElement): void {
-    const b = el('button', 'action', 'Quit');
+    const b = el('button', 'action', 'Quit atlas-duck');
     b.type = 'button';
     b.addEventListener('click', () => {
       call('quit').catch((e: unknown) => showResult(rejectionText(e), false));
     });
     parent.append(b);
+  }
+
+  /**
+   * Closes this window only (close_credential: Rust forgets the purpose and destroys the window,
+   * as the OS close button does). Disabled while a call is in flight, like the other actions: a
+   * token test that is running would still store its token after a "Cancel".
+   */
+  function addClose(parent: HTMLElement, label: 'Close' | 'Cancel'): void {
+    addAction(parent, label, () => {
+      call('close_credential').catch((e: unknown) => showResult(rejectionText(e), false));
+    });
   }
 
   function showResult(text: string, ok: boolean, extra: string[] = []): void {
@@ -337,8 +353,10 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
         done = true;
         showResult('The old audit log was moved aside. Set up atlas-duck again in the setup window.', true);
       } else if (isRecord(outcome) && typeof outcome.saved === 'boolean') {
-        if (outcome.saved) showResult('Recovery note saved.', true);
-        else showResult('The recovery note was not saved.', false);
+        if (outcome.saved) {
+          noteSaved = true;
+          showResult('Recovery note saved.', true);
+        } else showResult('The recovery note was not saved.', false);
       } else if (isRecord(outcome) && typeof outcome.started === 'boolean') {
         if (outcome.started) showResult('Trying the keychain again.', true);
         else showResult('A keychain retry is already running.', false);
@@ -405,6 +423,9 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     if (purpose === 'recover_this_log' || purpose === 'finish_restore') {
       addAction(bar, 'Archive old DB and start fresh', () => void plainAction('archive_and_start_fresh'));
     }
+    // A token window can always be cancelled; any window can be closed once its work is done.
+    if (isPat(purpose)) addClose(bar, done ? 'Close' : 'Cancel');
+    else if (done || noteSaved) addClose(bar, 'Close');
     addQuit(bar);
   }
 
@@ -529,6 +550,7 @@ export function mountCredentialPage(root: HTMLElement, deps: Deps): () => void {
     if (ctx === null || next === null || ctx.purpose !== next.purpose) {
       result = null;
       done = false;
+      noteSaved = false;
     }
     ctx = next;
     busy = false;

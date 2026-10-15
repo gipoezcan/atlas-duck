@@ -3,6 +3,8 @@ import type {
   BlockReason,
   CandidateRev,
   CommandError,
+  ConfigBanner,
+  Confinement,
   CoreError,
   DecisionOutcome,
   DenyCount,
@@ -11,9 +13,11 @@ import type {
   EditForm,
   EditInput,
   InputKind,
+  InstanceView,
   PlainInputKind,
   Preview,
   PreviewFetchResponse,
+  PruneReport,
   QueueDetail,
   QueueItem,
   RawPage,
@@ -22,6 +26,9 @@ import type {
   RedactionOp,
   RedactionReport,
   RequestDetail,
+  RetestOutcome,
+  SettingsGet,
+  SettingsView,
   StatusLine,
 } from './types';
 
@@ -238,6 +245,103 @@ export const isPreviewFetchResponse = (v: unknown): v is PreviewFetchResponse =>
     redaction: (r) => r === null || isRedactionContext(r),
   });
 
+const isConfigBanner = (v: unknown): v is ConfigBanner =>
+  fields(v, { kind: oneOf('read_only', 'unreadable'), text: isStr });
+
+export const isInstanceView = (v: unknown): v is InstanceView =>
+  fields(v, {
+    alias: isStr,
+    product: oneOf('jira', 'confluence'),
+    origin: strOrNull,
+    state: isStr,
+    executes_as: strOrNull,
+    expires_at: strOrNull,
+    pac_configured: isBool,
+    proxy_effective: strOrNull,
+    pending_url_change: strOrNull,
+    note: strOrNull,
+    expiry_warning: numOrNull,
+    days_left: numOrNull,
+  });
+
+const isLimits = (v: unknown): boolean =>
+  fields(v, {
+    jira_comments_cap: isNum,
+    candidate_cache_mb: isNum,
+    max_pending_bytes_mb: numOrNull,
+    expiry_hours: isNum,
+  });
+
+const isHealth = (v: unknown): boolean =>
+  fields(v, {
+    storage_low: isBool,
+    anchor_write_failing: isBool,
+    anchor_thread_dead: isBool,
+    anchors_blocked: isBool,
+    open_incidents: isNum,
+    prune_backlog_days: isNum,
+    prune_backlog: strOrNull,
+    last_prune_failed: isBool,
+    shred_checkpoint_pending: isBool,
+    settings_unreadable: isBool,
+  });
+
+export const isSettingsView = (v: unknown): v is SettingsView =>
+  fields(v, {
+    limits: isLimits,
+    attention_mode: oneOf('show_without_activating', 'badge_only', 'show_and_focus'),
+    retention_days: isNum,
+    legal_hold: isBool,
+    anchor_dir: strOrNull,
+    health: isHealth,
+    config_read_only: (b) => b === null || isConfigBanner(b),
+    restart_pending: arrayOf(isStr),
+  });
+
+const isConfinement = (v: unknown): v is Confinement =>
+  fields(v, {
+    state: oneOf('pending', 'met', 'not_met'),
+    failed: arrayOf(isStr),
+    mode: isStr,
+    extra_layers: arrayOf((l): l is { name: string; on: boolean } =>
+      fields(l, { name: isStr, on: isBool }),
+    ),
+  });
+
+export const isSettingsGet = (v: unknown): v is SettingsGet =>
+  fields(v, {
+    settings: isSettingsView,
+    instances: arrayOf(isInstanceView),
+    confinement: isConfinement,
+    cli_installed: isBool,
+  });
+
+export const isRetestOutcome = (v: unknown): v is RetestOutcome => {
+  if (!rec(v) || Object.keys(v).length !== 1) return false;
+  if ('ok' in v) {
+    return fields(v.ok, {
+      atlassian_user: isStr,
+      product: isStr,
+      version: isStr,
+      warnings: arrayOf(isStr),
+    });
+  }
+  // `conn` is written only for a tls, proxy or network failure.
+  return (
+    'failed' in v &&
+    fields(v.failed, { class: isStr }) &&
+    (!('conn' in v.failed) || isStr(v.failed.conn))
+  );
+};
+
+export const isPruneReport = (v: unknown): v is PruneReport => {
+  if (!rec(v)) return false;
+  if (v.result === 'pruned') {
+    return fields(v, { count: isNum, cutoff: isStr, clamped: isBool });
+  }
+  return v.result === 'skipped' && fields(v, { reason: isStr });
+};
+
 const isCoreError = (v: unknown): v is CoreError => fields(v, { kind: isStr });
 
 /** Maps whatever a rejected invoke carried to a `CommandError`. */
@@ -249,10 +353,12 @@ export function toCommandError(raw: unknown): CommandError {
         break;
       case 'not_found':
       case 'not_ready':
+      case 'busy':
       case 'internal':
         return { kind: raw.kind };
       case 'decision':
       case 'admin':
+      case 'settings':
         if (isCoreError(raw.error)) return { kind: raw.kind, error: raw.error };
         break;
       case 'release_blocked':

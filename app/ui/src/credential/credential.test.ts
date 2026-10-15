@@ -419,13 +419,13 @@ describe('passphrase entry', () => {
 
 describe('buttons per purpose', () => {
   const cases: [string, unknown, string[]][] = [
-    ['add_pat', { ...PAT_CTX, purpose: 'add_pat' }, ['Test and store', 'Quit']],
-    ['replace_pat', PAT_CTX, ['Test and store', 'Quit']],
-    ['recovery_passphrase', FIRST_RUN, ['Set passphrase', 'Quit']],
-    ['recovery_passphrase+note', { ...FIRST_RUN, note_available: true }, ['Set passphrase', 'Save recovery note', 'Quit']],
-    ['unlock', UNLOCK, ['Retry keychain', 'Quit']],
-    ['recover_this_log', LOCKED, ['Unlock', 'Archive old DB and start fresh', 'Quit']],
-    ['finish_restore', { ...LOCKED, purpose: 'finish_restore' }, ['Unlock', 'Archive old DB and start fresh', 'Quit']],
+    ['add_pat', { ...PAT_CTX, purpose: 'add_pat' }, ['Test and store', 'Cancel', 'Quit atlas-duck']],
+    ['replace_pat', PAT_CTX, ['Test and store', 'Cancel', 'Quit atlas-duck']],
+    ['recovery_passphrase', FIRST_RUN, ['Set passphrase', 'Quit atlas-duck']],
+    ['recovery_passphrase+note', { ...FIRST_RUN, note_available: true }, ['Set passphrase', 'Save recovery note', 'Quit atlas-duck']],
+    ['unlock', UNLOCK, ['Retry keychain', 'Quit atlas-duck']],
+    ['recover_this_log', LOCKED, ['Unlock', 'Archive old DB and start fresh', 'Quit atlas-duck']],
+    ['finish_restore', { ...LOCKED, purpose: 'finish_restore' }, ['Unlock', 'Archive old DB and start fresh', 'Quit atlas-duck']],
   ];
   for (const [name, ctx, expected] of cases) {
     it(`${name}`, async () => {
@@ -482,11 +482,13 @@ describe('buttons per purpose', () => {
     expect(h.root.querySelector('.result.ok')).toBeNull();
   });
 
-  it('Quit sends quit', async () => {
+  it('Quit sends quit and says it quits the whole app', async () => {
     const h = await mount(UNLOCK);
-    button(h.root, 'Quit').click();
+    expect(buttons(h.root)).not.toContain('Quit');
+    button(h.root, 'Quit atlas-duck').click();
     await flush();
     expect(h.calls('quit')).toEqual([{}]);
+    expect(h.calls('close_credential')).toEqual([]);
   });
 
   it('Quit stays enabled and sends quit while submit_secret is in flight', async () => {
@@ -495,16 +497,90 @@ describe('buttons per purpose', () => {
     type(inputs(h.root)[0] as HTMLInputElement, 'p'.repeat(12));
     submitForm(h.root);
     expect(button(h.root, 'Archive old DB and start fresh').disabled).toBe(true);
-    expect(button(h.root, 'Quit').disabled).toBe(false);
-    button(h.root, 'Quit').click();
+    expect(button(h.root, 'Quit atlas-duck').disabled).toBe(false);
+    button(h.root, 'Quit atlas-duck').click();
     await flush();
     expect(h.calls('quit')).toEqual([{}]);
   });
 
   it('a failed context load offers Quit only', async () => {
     const h = await mount(null);
-    expect(buttons(h.root)).toEqual(['Quit']);
+    expect(buttons(h.root)).toEqual(['Quit atlas-duck']);
     expect(h.root.textContent).toContain('context is unavailable');
+  });
+});
+
+describe('closing the window (close_credential, T21 review I-4)', () => {
+  it('a token window offers Cancel, which sends close_credential once with no arguments', async () => {
+    const h = await mount(PAT_CTX);
+    button(h.root, 'Cancel').click();
+    await flush();
+    expect(h.calls('close_credential')).toEqual([{}]);
+    expect(h.calls('quit')).toEqual([]);
+  });
+
+  it('Cancel becomes Close after a stored token and still sends close_credential', async () => {
+    const h = await mount(PAT_CTX);
+    handlers.submit_secret = () => OK;
+    type(inputs(h.root)[0] as HTMLInputElement, CANARY);
+    submitForm(h.root);
+    await flush();
+    expect(buttons(h.root)).toEqual(['Close', 'Quit atlas-duck']);
+    button(h.root, 'Close').click();
+    await flush();
+    expect(h.calls('close_credential')).toEqual([{}]);
+  });
+
+  it('Cancel is disabled while a token test runs: a closed window must not still store the token', async () => {
+    const h = await mount(PAT_CTX);
+    handlers.submit_secret = () => new Promise(() => undefined);
+    type(inputs(h.root)[0] as HTMLInputElement, CANARY);
+    submitForm(h.root);
+    expect(button(h.root, 'Cancel').disabled).toBe(true);
+    button(h.root, 'Cancel').click();
+    await flush();
+    expect(h.calls('close_credential')).toEqual([]);
+  });
+
+  it('a window of another purpose offers no Close until its work is done', async () => {
+    for (const ctx of [UNLOCK, LOCKED, FIRST_RUN]) {
+      const h = await mount(ctx);
+      expect(buttons(h.root)).not.toContain('Close');
+      expect(buttons(h.root)).not.toContain('Cancel');
+    }
+  });
+
+  it('Close appears after a saved recovery note and after an accepted passphrase', async () => {
+    const h = await mount({ ...FIRST_RUN, note_available: true });
+    handlers.save_recovery_note = () => ({ saved: false });
+    button(h.root, 'Save recovery note').click();
+    await flush();
+    expect(buttons(h.root)).not.toContain('Close');
+    handlers.save_recovery_note = () => NOTE_SAVED;
+    button(h.root, 'Save recovery note').click();
+    await flush();
+    expect(buttons(h.root)).toContain('Close');
+    button(h.root, 'Close').click();
+    await flush();
+    expect(h.calls('close_credential')).toEqual([{}]);
+
+    const accepted = await mount(FIRST_RUN);
+    handlers.submit_secret = () => ({ accepted: {} });
+    type(inputs(accepted.root)[0] as HTMLInputElement, 'p'.repeat(12));
+    type(inputs(accepted.root)[1] as HTMLInputElement, 'p'.repeat(12));
+    submitForm(accepted.root);
+    await flush();
+    expect(buttons(accepted.root)).toContain('Close');
+  });
+
+  it('a refused close_credential shows a fixed text and leaves the page usable', async () => {
+    const h = await mount(PAT_CTX);
+    handlers.close_credential = () => Promise.reject({ kind: 'not_ready', message: CANARY });
+    button(h.root, 'Cancel').click();
+    await flush();
+    expect(h.root.textContent).toContain('This window cannot take that now.');
+    expect(h.root.textContent).not.toContain(CANARY);
+    expect(h.root.querySelector('form')).not.toBeNull();
   });
 });
 

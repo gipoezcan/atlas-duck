@@ -71,6 +71,9 @@ pub use crate::core::{
 #[cfg(feature = "testing")]
 pub use crate::core::{HookPoint, Pause, TestHooks};
 pub use atlas_duck_preview::CandidateRev;
+/// The product of `AddInstance` (M6 T25: the app parses the add-instance form's `product` into it
+/// without a registry dependency of its own).
+pub use atlas_duck_registry::Product;
 /// The date type of `InstanceAdmin::set_token`'s expiry (M6 T20: the app parses the credential
 /// window's "token expires on" into it without a chrono dependency of its own).
 pub use chrono::NaiveDate;

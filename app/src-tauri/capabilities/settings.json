@@ -4,6 +4,16 @@
   "windows": ["settings"],
   "permissions": [
     "allow-app-status",
+    "allow-credential-window-open",
+    "allow-instance-accept-url-change",
+    "allow-instance-add",
+    "allow-instance-change-url",
+    "allow-instance-confirm-config",
+    "allow-instance-set-proxy",
+    "allow-prune-backlog-now",
+    "allow-retest-token",
+    "allow-settings-apply",
+    "allow-settings-get",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

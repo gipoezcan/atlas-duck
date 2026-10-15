@@ -3,6 +3,10 @@
   "description": "the first-run wizard window (Δ1, PD-72)",
   "windows": ["setup"],
   "permissions": [
+    "allow-instance-accept-url-change",
+    "allow-instance-add",
+    "allow-instance-change-url",
+    "allow-instance-confirm-config",
     "allow-quit",
     "core:event:allow-listen",
     "core:event:allow-unlisten"

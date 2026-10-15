@@ -4,22 +4,28 @@ import batchOutcome from './fixtures/batch_outcome.json';
 import commandError from './fixtures/command_error.json';
 import decisionOutcome from './fixtures/decision_outcome.json';
 import denyCount from './fixtures/deny_count.json';
+import instanceView from './fixtures/instance_view.json';
 import noteSaved from './fixtures/note_saved.json';
 import preview from './fixtures/preview.json';
+import pruneReport from './fixtures/prune_report.json';
 import queueDetail from './fixtures/queue_detail.json';
 import queueItem from './fixtures/queue_item.json';
 import rawPage from './fixtures/raw_page.json';
 import recentItem from './fixtures/recent_item.json';
 import redactionContext from './fixtures/redaction_context.json';
 import redactionReport from './fixtures/redaction_report.json';
+import retestOutcome from './fixtures/retest_outcome.json';
 import retryStarted from './fixtures/retry_started.json';
+import settingsGet from './fixtures/settings_get.json';
 import statusLine from './fixtures/status_line.json';
 import {
   arrayOf,
   isBatchOutcome,
   isDecisionOutcome,
   isDenyCount,
+  isInstanceView,
   isPreview,
+  isPruneReport,
   isQueueDetail,
   isQueueItem,
   isRawPage,
@@ -28,6 +34,8 @@ import {
   isRedactionContext,
   isRedactionOp,
   isRedactionReport,
+  isRetestOutcome,
+  isSettingsGet,
   isStatusLine,
   toCommandError,
 } from './validate';
@@ -45,6 +53,10 @@ describe('fixtures validate against their TS types', () => {
     ['recent_item', recentItem, arrayOf(isRecentItem)],
     ['redaction_report', redactionReport, arrayOf(isRedactionReport)],
     ['redaction_context', redactionContext, arrayOf(isRedactionContext)],
+    ['instance_view', instanceView, arrayOf(isInstanceView)],
+    ['settings_get', settingsGet, arrayOf(isSettingsGet)],
+    ['retest_outcome', retestOutcome, arrayOf(isRetestOutcome)],
+    ['prune_report', pruneReport, arrayOf(isPruneReport)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -138,6 +150,49 @@ describe('fixtures validate against their TS types', () => {
     expect(isPreviewFetchResponse({ ...response, redaction: redactionContext[1] })).toBe(true);
     expect(isPreviewFetchResponse(response)).toBe(false);
     expect(isPreviewFetchResponse({ ...response, redaction: { ops: [], url_fields: [1] } })).toBe(false);
+  });
+
+  it('settings DTOs: every Option field accepts null and refuses a wrong type, unions are closed', () => {
+    const [inst] = instanceView;
+    for (const key of [
+      'origin',
+      'executes_as',
+      'expires_at',
+      'proxy_effective',
+      'pending_url_change',
+      'note',
+      'expiry_warning',
+      'days_left',
+    ]) {
+      expect(isInstanceView({ ...inst, [key]: null }), key).toBe(true);
+      expect(isInstanceView({ ...inst, [key]: {} }), key).toBe(false);
+      expect(isInstanceView({ ...inst, [key]: undefined }), key).toBe(false);
+    }
+    expect(isInstanceView({ ...inst, product: 'bitbucket' })).toBe(false);
+    const [full, bare] = settingsGet;
+    expect(full && isSettingsGet(full)).toBe(true);
+    // The two ends of the Option fields are both in the fixtures: banner and anchor dir set / null.
+    expect(full?.settings.config_read_only).not.toBeNull();
+    expect(bare?.settings.config_read_only).toBeNull();
+    expect(bare?.settings.limits.max_pending_bytes_mb).toBeNull();
+    const confinement = settingsGet.map((g) => g.confinement.state);
+    expect(new Set(confinement)).toEqual(new Set(['met', 'not_met', 'pending']));
+    expect(isSettingsGet({ ...full, confinement: { ...full?.confinement, state: 'maybe' } })).toBe(false);
+    expect(isSettingsGet({ ...full, cli_installed: 'yes' })).toBe(false);
+    expect(isSettingsGet({ ...full, settings: { ...full?.settings, attention_mode: 'loud' } })).toBe(false);
+    expect(isSettingsGet({ ...full, settings: { ...full?.settings, config_read_only: { kind: 'x', text: '' } } })).toBe(false);
+    // `conn` is written only for a tls, proxy or network failure.
+    expect(
+      retestOutcome.map((o) => ('failed' in o && o.failed ? 'conn' in o.failed : null)),
+    ).toEqual([null, false, true]);
+    expect(isRetestOutcome({ failed: { class: 'tls', conn: 5 } })).toBe(false);
+    expect(isRetestOutcome({ ok: { atlassian_user: 'a' } })).toBe(false);
+    const ok = { atlassian_user: 'a', product: 'jira', version: '9', warnings: [] };
+    expect(isRetestOutcome({ ok })).toBe(true);
+    expect(isRetestOutcome({ ok, failed: { class: 'x' } })).toBe(false);
+    expect(isPruneReport({ result: 'pruned', count: 1 })).toBe(false);
+    expect(isPruneReport({ result: 'skipped', reason: 3 })).toBe(false);
+    expect(isPruneReport({ result: 'other' })).toBe(false);
   });
 
   it('edit_form: every input kind validates, nulls are valid values, a wrong shape is refused', () => {

@@ -16,6 +16,9 @@ use atlas_duck_app_lib::commands::credential::{
     RetryStarted, SubmitFailure, SubmitOutcome, connection_failure, context_dto,
 };
 use atlas_duck_app_lib::commands::dto::{StatusLevel, StatusLineDto};
+use atlas_duck_app_lib::commands::settings::{
+    ConfinementDto, ExtraLayerDto, RetestOutcome, SettingsGet,
+};
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
@@ -24,9 +27,11 @@ use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::redact::{BlockReason, DropScope, RedactionPreset};
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
-    AdminError, BatchFailure, BatchOutcome, CandidateRev, ConnectionFailure, DecisionError,
-    DecisionOutcome, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext,
-    RedactionOp, RedactionReport, RequestDetail, SessionKey, UrlMode,
+    AdminError, AttentionMode, BatchFailure, BatchOutcome, CandidateRev, ConfigBanner,
+    ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView, Product,
+    PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext, RedactionOp,
+    RedactionReport, RequestDetail, SessionKey, SettingsError, SettingsView, StoreHealthView,
+    UrlMode,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
@@ -503,6 +508,23 @@ fn command_errors() -> Vec<CommandError> {
         ))),
         // M3 M-4 / T9: an admin call after the shutdown began.
         CommandError::Admin(AdminError::ShuttingDown),
+        // M6 T25: the SettingsAdmin refusals (kind, key and banner only) and a busy credential window.
+        CommandError::Settings(SettingsError::Invalid {
+            key: "jira_comments_cap",
+        }),
+        CommandError::Settings(SettingsError::Cancelled),
+        CommandError::Settings(SettingsError::ConfigReadOnly(ConfigBanner {
+            kind: "read_only",
+            text: "config written by v9.9.0; settings read-only until you upgrade".into(),
+        })),
+        CommandError::Settings(SettingsError::NoConfigFile),
+        CommandError::Settings(SettingsError::Conflict),
+        CommandError::Settings(SettingsError::ConfigWrite),
+        CommandError::Settings(SettingsError::Audit(AuditError::StorageLow)),
+        CommandError::Settings(SettingsError::ShuttingDown),
+        CommandError::Admin(AdminError::InsecureScheme),
+        CommandError::Admin(AdminError::Unconfirmed),
+        CommandError::Busy,
         // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
         CommandError::ReleaseBlocked,
         CommandError::Internal,
@@ -733,6 +755,163 @@ fn retry_started() -> Vec<RetryStarted> {
     ]
 }
 
+fn instance_views() -> Vec<InstanceView> {
+    vec![
+        InstanceView {
+            alias: "work".into(),
+            product: Product::Jira,
+            origin: Some("https://jira.example/jira".into()),
+            state: "ok",
+            executes_as: Some("alice".into()),
+            expires_at: Some("2027-01-31".into()),
+            pac_configured: true,
+            proxy_effective: Some("proxy.corp:3128".into()),
+            pending_url_change: Some("https://jira.example/moved".into()),
+            note: Some("token now resolves to bob".into()),
+            expiry_warning: Some(7),
+            days_left: Some(5),
+        },
+        // Every `Option` null: a hand-added instance nobody confirmed yet.
+        InstanceView {
+            alias: "wiki".into(),
+            product: Product::Confluence,
+            origin: None,
+            state: "instance_unconfirmed",
+            executes_as: None,
+            expires_at: None,
+            pac_configured: false,
+            proxy_effective: None,
+            pending_url_change: None,
+            note: None,
+            expiry_warning: None,
+            days_left: None,
+        },
+    ]
+}
+
+fn settings_views() -> Vec<SettingsView> {
+    let health = |low: bool, behind: Option<&str>| StoreHealthView {
+        storage_low: low,
+        anchor_write_failing: false,
+        anchor_thread_dead: false,
+        anchors_blocked: false,
+        open_incidents: 0,
+        prune_backlog_days: u32::from(behind.is_some()) * 12,
+        prune_backlog: behind.map(str::to_owned),
+        last_prune_failed: false,
+        shred_checkpoint_pending: false,
+        settings_unreadable: false,
+    };
+    vec![
+        SettingsView {
+            limits: LimitsView {
+                jira_comments_cap: 50,
+                candidate_cache_mb: 256,
+                max_pending_bytes_mb: Some(512),
+                expiry_hours: 24,
+            },
+            attention_mode: AttentionMode::BadgeOnly,
+            retention_days: 365,
+            legal_hold: true,
+            anchor_dir: Some("anchors".into()),
+            health: health(true, Some("pruning is 12 days behind")),
+            config_read_only: Some(ConfigBanner {
+                kind: "read_only",
+                text: "config written by v9.9.0; settings read-only until you upgrade".into(),
+            }),
+            restart_pending: vec!["candidate_cache_mb"],
+        },
+        // Every `Option` null.
+        SettingsView {
+            limits: LimitsView {
+                jira_comments_cap: 50,
+                candidate_cache_mb: 256,
+                max_pending_bytes_mb: None,
+                expiry_hours: 24,
+            },
+            attention_mode: AttentionMode::default(),
+            retention_days: 100,
+            legal_hold: false,
+            anchor_dir: None,
+            health: health(false, None),
+            config_read_only: None,
+            restart_pending: vec![],
+        },
+    ]
+}
+
+/// `settings_get` (M6 T25): the view, the instances, the probe verdict in its three shapes, the CLI
+/// state.
+fn settings_gets() -> Vec<SettingsGet> {
+    let mut views = settings_views().into_iter();
+    let mut insts = instance_views();
+    let met = ConfinementDto {
+        state: "met",
+        failed: vec![],
+        mode: "lpac",
+        extra_layers: vec![ExtraLayerDto {
+            name: "landlock".into(),
+            on: true,
+        }],
+    };
+    let not_met = ConfinementDto {
+        state: "not_met",
+        failed: vec!["connect_loopback", "cred_read"],
+        mode: "appcontainer",
+        extra_layers: vec![],
+    };
+    vec![
+        SettingsGet {
+            settings: views.next().unwrap_or_else(|| unreachable!()),
+            instances: insts.clone(),
+            confinement: met,
+            cli_installed: true,
+        },
+        SettingsGet {
+            settings: views.next().unwrap_or_else(|| unreachable!()),
+            instances: insts.split_off(1),
+            confinement: not_met,
+            cli_installed: false,
+        },
+        SettingsGet {
+            settings: settings_views().remove(1),
+            instances: vec![],
+            confinement: ConfinementDto::pending(),
+            cli_installed: false,
+        },
+    ]
+}
+
+/// `retest_token` (M6 T25): connected, or a fixed failure class.
+fn retest_outcomes() -> Vec<RetestOutcome> {
+    vec![
+        RetestOutcome::Ok(Connected {
+            atlassian_user: "alice".into(),
+            product: "jira",
+            version: "9.12.0".into(),
+            warnings: vec![],
+        }),
+        RetestOutcome::Failed(connection_failure(&ConnectionFailure::OtherUser)),
+        RetestOutcome::Failed(connection_failure(&ConnectionFailure::Network(
+            ConnClass::ConnectTimeout,
+        ))),
+    ]
+}
+
+/// `prune_backlog_now` (M6 T25).
+fn prune_reports() -> Vec<PruneReport> {
+    vec![
+        PruneReport::Pruned {
+            count: 42,
+            cutoff: "2026-07-15".into(),
+            clamped: false,
+        },
+        PruneReport::Skipped {
+            reason: "legal_hold",
+        },
+    ]
+}
+
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ui/src/shared/ipc/fixtures")
 }
@@ -750,15 +929,19 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("credential_context", value(&credential_contexts())?),
         ("decision_outcome", value(&decision_outcomes())?),
         ("deny_count", value(&deny_counts())?),
+        ("instance_view", value(&instance_views())?),
         ("note_saved", value(&note_saved())?),
         ("preview", value(&previews())?),
+        ("prune_report", value(&prune_reports())?),
         ("queue_detail", value(&queue_details())?),
         ("queue_item", value(&queue_items())?),
         ("raw_page", value(&raw_pages())?),
         ("recent_item", value(&recent_items())?),
         ("redaction_context", value(&redaction_contexts())?),
         ("redaction_report", value(&redaction_reports())?),
+        ("retest_outcome", value(&retest_outcomes())?),
         ("retry_started", value(&retry_started())?),
+        ("settings_get", value(&settings_gets())?),
         ("status_line", value(&status_lines())?),
         ("submit_outcome", value(&submit_outcomes())?),
     ])

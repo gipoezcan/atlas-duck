@@ -117,6 +117,74 @@
     "kind": "admin"
   },
   {
+    "error": {
+      "key": "jira_comments_cap",
+      "kind": "invalid"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "kind": "cancelled"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "banner": {
+        "kind": "read_only",
+        "text": "config written by v9.9.0; settings read-only until you upgrade"
+      },
+      "kind": "config_read_only"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "kind": "no_config_file"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "kind": "conflict"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "kind": "config_write_failed"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "kind": "audit"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "kind": "shutting_down"
+    },
+    "kind": "settings"
+  },
+  {
+    "error": {
+      "kind": "insecure_scheme"
+    },
+    "kind": "admin"
+  },
+  {
+    "error": {
+      "kind": "unconfirmed"
+    },
+    "kind": "admin"
+  },
+  {
+    "kind": "busy"
+  },
+  {
     "kind": "release_blocked",
     "text": "release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items"
   },

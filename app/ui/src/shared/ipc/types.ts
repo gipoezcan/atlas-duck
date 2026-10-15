@@ -228,7 +228,107 @@ export interface PreviewFetchResponse {
   redaction: RedactionContext | null;
 }
 
-/** A tagged error object from core (`DecisionError` / `AdminError`). */
+/**
+ * One instance as Settings shows it (`InstanceView`, UI only). `state` is the C.2 state name
+ * (`ok`, `needs_token`, `instance_unconfirmed`, `insecure_scheme`, the identity-header states, ...).
+ */
+export interface InstanceView {
+  alias: string;
+  product: 'jira' | 'confluence';
+  /** The normalized base URL in force; `null` before it is confirmed or when it is unusable. */
+  origin: string | null;
+  state: string;
+  /** "Executes as <user>". */
+  executes_as: string | null;
+  /** `YYYY-MM-DD`. */
+  expires_at: string | null;
+  pac_configured: boolean;
+  /** `host:port` or `direct`. */
+  proxy_effective: string | null;
+  /** The URL config.toml requests (I-31): shown as "config.toml requests a URL change for <alias>". */
+  pending_url_change: string | null;
+  /** Why the state is what it is ("token now resolves to <user>", the admin hint of the identity states). */
+  note: string | null;
+  /** PD-84: 14, 7 or 1 days before the expiry (1 once expired); a hint, never a gate. */
+  expiry_warning: number | null;
+  /** Days from the local date to `expires_at`: 0 today, negative once expired. */
+  days_left: number | null;
+}
+
+export type AttentionMode = 'show_without_activating' | 'badge_only' | 'show_and_focus';
+
+/** The §7.7 banner of a config.toml this build does not write. */
+export interface ConfigBanner {
+  kind: 'read_only' | 'unreadable';
+  text: string;
+}
+
+export interface SettingsView {
+  limits: {
+    jira_comments_cap: number;
+    candidate_cache_mb: number;
+    /** `null`: off. */
+    max_pending_bytes_mb: number | null;
+    expiry_hours: number;
+  };
+  attention_mode: AttentionMode;
+  retention_days: number;
+  legal_hold: boolean;
+  /** Display only. */
+  anchor_dir: string | null;
+  health: {
+    storage_low: boolean;
+    anchor_write_failing: boolean;
+    anchor_thread_dead: boolean;
+    anchors_blocked: boolean;
+    open_incidents: number;
+    prune_backlog_days: number;
+    /** "pruning is N days behind" while it is (then "Prune backlog now" is offered). */
+    prune_backlog: string | null;
+    last_prune_failed: boolean;
+    shred_checkpoint_pending: boolean;
+    settings_unreadable: boolean;
+  };
+  config_read_only: ConfigBanner | null;
+  /** Keys whose config.toml value applies at the next start ("applies after restart"). */
+  restart_pending: string[];
+}
+
+/** The probe verdict: `pending` until the startup probe finished; scripts are off unless `met`. */
+export interface Confinement {
+  state: 'pending' | 'met' | 'not_met';
+  /** The floor probes that failed. */
+  failed: string[];
+  mode: string;
+  extra_layers: { name: string; on: boolean }[];
+}
+
+/** `settings_get`'s answer. */
+export interface SettingsGet {
+  settings: SettingsView;
+  instances: InstanceView[];
+  confinement: Confinement;
+  cli_installed: boolean;
+}
+
+/** `retest_token`: "Connected as <user>" or a fixed failure class (`conn` for tls/proxy/network). */
+export type RetestOutcome =
+  | {
+      ok: {
+        atlassian_user: string;
+        product: string;
+        version: string;
+        warnings: string[];
+      };
+    }
+  | { failed: { class: string; conn?: string } };
+
+/** `prune_backlog_now`. */
+export type PruneReport =
+  | { result: 'pruned'; count: number; cutoff: string; clamped: boolean }
+  | { result: 'skipped'; reason: string };
+
+/** A tagged error object from core (`DecisionError` / `AdminError` / `SettingsError`). */
 export interface CoreError {
   kind: string;
   [field: string]: unknown;
@@ -246,6 +346,10 @@ export type CommandError =
   | { kind: 'internal' }
   | { kind: 'decision'; error: CoreError }
   | { kind: 'admin'; error: CoreError }
+  /** `SettingsAdmin` refused: `error.kind` is `invalid` (+`key`), `cancelled`, `config_read_only` (+`banner`), ... */
+  | { kind: 'settings'; error: CoreError }
+  /** The credential window is open for something else (T25): close it first. */
+  | { kind: 'busy' }
   /** The candidate could not be built (M5 M-11); `text` is the app-generated banner. */
   | { kind: 'release_blocked'; text: string }
   | { kind: 'refused'; message: string };

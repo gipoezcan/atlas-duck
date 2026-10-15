@@ -1598,6 +1598,609 @@ mod approvals_commands {
     }
 }
 
+/// A valid body of every Settings command (M6 T25, Δ1) and the windows that hold it.
+fn settings_bodies() -> Vec<(&'static str, Value, &'static [&'static str])> {
+    const SETTINGS: &[&str] = &["settings"];
+    const SETTINGS_AND_SETUP: &[&str] = &["settings", "setup"];
+    vec![
+        ("settings_get", json!({}), SETTINGS),
+        (
+            "settings_apply",
+            json!({"changes": [{"key": "legal_hold", "value": true}]}),
+            SETTINGS,
+        ),
+        (
+            "instance_add",
+            json!({"alias": "work", "product": "jira", "base_url": "https://jira.example",
+                   "proxy": "", "use_custom_ca": false, "is_default": false}),
+            SETTINGS_AND_SETUP,
+        ),
+        (
+            "instance_change_url",
+            json!({"alias": "work", "new_url": "https://jira.example/new"}),
+            SETTINGS_AND_SETUP,
+        ),
+        (
+            "instance_confirm_config",
+            json!({"alias": "work"}),
+            SETTINGS_AND_SETUP,
+        ),
+        (
+            "instance_accept_url_change",
+            json!({"alias": "work"}),
+            SETTINGS_AND_SETUP,
+        ),
+        (
+            "instance_set_proxy",
+            json!({"alias": "work", "proxy": "direct"}),
+            SETTINGS,
+        ),
+        (
+            "credential_window_open",
+            json!({"alias": "work", "purpose": "add_pat"}),
+            SETTINGS,
+        ),
+        ("retest_token", json!({"alias": "work"}), SETTINGS),
+        ("prune_backlog_now", json!({}), SETTINGS),
+    ]
+}
+
+/// M6 T25 (Δ1): each Settings command is granted to `settings` (the four instance commands the
+/// wizard shares also to `setup`) and to no other window; with a valid body it reaches its handler
+/// (`not_ready` without a serving core), everywhere else Tauri's ACL refuses it first. No body of
+/// it takes a path, a certificate or a PEM, and a refused value names its field.
+#[test]
+fn settings_commands_granted_to_settings_and_setup_only() -> TestResult {
+    let app = app()?;
+    let labels = [
+        "approvals",
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "credential",
+        "setup",
+        "unknown",
+    ];
+    let windows = labels
+        .map(|label| window(&app, label).map(|w| (label, w)))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    for (cmd, body, granted) in settings_bodies() {
+        assert!(COMMANDS.contains(&cmd), "{cmd} is not in COMMANDS");
+        for (label, w) in &windows {
+            let r = invoke(w, cmd, body.clone());
+            if granted.contains(label) {
+                assert_eq!(r, Err(json!({"kind": "not_ready"})), "{label}: {cmd}");
+            } else {
+                assert!(acl_refused(&r), "{label}: {cmd} {r:?}");
+            }
+        }
+    }
+    let find = |name: &str| {
+        windows
+            .iter()
+            .find(|(label, _)| *label == name)
+            .map(|(_, w)| w)
+            .ok_or("no such window")
+    };
+    let (settings, setup) = (find("settings")?, find("setup")?);
+    for w in [settings, setup] {
+        let mut b = settings_bodies()[2].1.clone();
+        let m = b.as_object_mut().ok_or("instance_add body")?;
+        // The CA never comes from the webview: no key carries one, and `use_custom_ca` is a bool.
+        for key in ["ca_pem", "ca_path", "ca_bundle", "pem", "cert", "path"] {
+            let mut with = m.clone();
+            with.insert(key.into(), json!("-----BEGIN CERTIFICATE-----"));
+            assert_eq!(
+                invoke(w, "instance_add", Value::Object(with)),
+                Err(json!({"kind": "invalid_argument", "field": "payload"})),
+                "{key}"
+            );
+        }
+        m.insert(
+            "use_custom_ca".into(),
+            json!(["-----BEGIN CERTIFICATE-----"]),
+        );
+        assert_eq!(
+            invoke(w, "instance_add", b),
+            Err(json!({"kind": "invalid_argument", "field": "payload"}))
+        );
+    }
+    for (cmd, body, field) in [
+        (
+            "instance_add",
+            json!({"alias": "a b", "product": "jira", "base_url": "https://j", "proxy": "",
+                   "use_custom_ca": false, "is_default": false}),
+            "alias",
+        ),
+        (
+            "instance_set_proxy",
+            json!({"alias": "work", "proxy": "user:pw@proxy:8080"}),
+            "proxy",
+        ),
+        (
+            "credential_window_open",
+            json!({"alias": "work", "purpose": "unlock"}),
+            "purpose",
+        ),
+        ("settings_apply", json!({"changes": []}), "changes"),
+        (
+            "settings_apply",
+            json!({"changes": [{"key": "audit_enabled", "value": false}]}),
+            "changes",
+        ),
+    ] {
+        assert_eq!(
+            invoke(settings, cmd, body),
+            Err(json!({"kind": "invalid_argument", "field": field})),
+            "{cmd}"
+        );
+    }
+    Ok(())
+}
+
+/// M6 T25 (T21 review I-4): `close_credential {}` is the credential window's own; no other window
+/// may close it, and it takes nothing.
+#[test]
+fn close_credential_granted_to_credential_only() -> TestResult {
+    let app = app()?;
+    for label in [
+        "approvals",
+        "settings",
+        "audit",
+        "running_scripts",
+        "onboarding",
+        "setup",
+        "unknown",
+    ] {
+        let w = window(&app, label)?;
+        let r = invoke(&w, "close_credential", json!({}));
+        assert!(acl_refused(&r), "{label}: {r:?}");
+    }
+    let credential = window(&app, "credential")?;
+    // No window is open for any purpose in this app: nothing to close.
+    assert_eq!(
+        invoke(&credential, "close_credential", json!({})),
+        Err(json!({"kind": "not_ready"}))
+    );
+    assert_eq!(
+        invoke(
+            &credential,
+            "close_credential",
+            json!({"window": "settings"})
+        ),
+        Err(json!({"kind": "invalid_argument", "field": "payload"}))
+    );
+    Ok(())
+}
+
+/// The CA file the user chose, as Rust reads it (`read_ca_bounded`): a regular file of 1 byte to
+/// 1 MiB. Anything else is refused with `use_custom_ca`; nothing is parsed here.
+#[test]
+fn ca_file_is_read_bounded_regular_and_non_empty() -> TestResult {
+    use atlas_duck_app_lib::commands::CommandError;
+    use atlas_duck_app_lib::commands::settings::{CA_MAX_BYTES, read_ca_bounded};
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("t25_ca_files");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let write = |name: &str, bytes: &[u8]| -> std::io::Result<std::path::PathBuf> {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes)?;
+        Ok(p)
+    };
+    let refused = Err(CommandError::InvalidArgument {
+        field: "use_custom_ca",
+    });
+    assert_eq!(
+        read_ca_bounded(&write("ok.pem", b"-----BEGIN")?),
+        Ok(b"-----BEGIN".to_vec())
+    );
+    let max = vec![b'a'; CA_MAX_BYTES];
+    assert_eq!(
+        read_ca_bounded(&write("max.pem", &max)?).map(|b| b.len()),
+        Ok(CA_MAX_BYTES)
+    );
+    let over = vec![b'a'; CA_MAX_BYTES + 1];
+    assert_eq!(read_ca_bounded(&write("over.pem", &over)?), refused);
+    assert_eq!(read_ca_bounded(&write("empty.pem", b"")?), refused);
+    assert_eq!(read_ca_bounded(&dir.join("missing.pem")), refused);
+    assert_eq!(read_ca_bounded(&dir), refused, "a directory is no CA file");
+    std::fs::remove_dir_all(&dir)?;
+    Ok(())
+}
+
+#[cfg(feature = "scripted-approver")]
+mod settings_commands {
+    use atlas_duck_app_lib::commands::CommandError;
+    use atlas_duck_app_lib::commands::dto::parse;
+    use atlas_duck_app_lib::commands::settings::{
+        ConfinementDto, HTTPS_REQUIRED_HINT, InstanceAddArgs, InstanceChangeUrlArgs, RetestOutcome,
+        RetestTokenArgs, SettingChanges, instance_add_dto, instance_change_url_dto,
+        instance_set_proxy_dto, pat_open_error, prune_backlog_now_dto, retest_token_dto,
+        settings_apply_dto, settings_get_dto,
+    };
+    use atlas_duck_app_lib::credential::{PatOpenError, open_for_pat};
+    use atlas_duck_atlassian::testing::{
+        MockDc, TEST_USER, TEST_USER_KEY, XAuser, generate_ca_pem,
+    };
+    use atlas_duck_audit::EventType;
+    use atlas_duck_core::testing::Harness;
+    use atlas_duck_core::{AdminError, Confirm, SettingsError, ShutdownReason};
+    use serde_json::{Value, json};
+    use tauri::test::{MockRuntime, mock_builder};
+
+    use super::TestResult;
+
+    type Boxed = Box<dyn std::error::Error>;
+
+    async fn rig(answers: Vec<Confirm>) -> Result<Harness, Boxed> {
+        Harness::builder()
+            .jira("jira-main")
+            .confirm(answers)
+            .start()
+            .await
+    }
+
+    fn add_args(
+        alias: &str,
+        base_url: &str,
+        use_custom_ca: bool,
+    ) -> Result<InstanceAddArgs, Boxed> {
+        parse::<InstanceAddArgs>(&json!({
+            "alias": alias, "product": "jira", "base_url": base_url, "proxy": "",
+            "use_custom_ca": use_custom_ca, "is_default": false,
+        }))
+        .map_err(|e| format!("{e:?}").into())
+    }
+
+    fn changes(v: Value) -> Result<SettingChanges, Boxed> {
+        parse::<atlas_duck_app_lib::commands::settings::SettingsApplyArgs>(&json!({ "changes": v }))
+            .map(|a| a.changes)
+            .map_err(|e| format!("{e:?}").into())
+    }
+
+    async fn config_records(h: &Harness) -> Result<usize, Boxed> {
+        Ok(h.events_of(EventType::CONFIG_CHANGED).await?.len())
+    }
+
+    /// Runs `f` off the async workers, as the commands do (`blocking`).
+    async fn blocking<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, Boxed> {
+        Ok(tokio::task::spawn_blocking(f).await?)
+    }
+
+    fn no_ca() -> Result<Vec<u8>, CommandError> {
+        Err(CommandError::Internal)
+    }
+
+    /// I-31 through the commands: a new instance, a URL change, a limit raise and the backlog prune
+    /// each need the native confirmation core draws itself; a `Cancel` is `Cancelled` with nothing
+    /// logged or written, an `Ok` applies and logs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn i31_settings_add_and_url_change_need_native_confirm() -> TestResult {
+        let h = rig(vec![Confirm::Cancel]).await?;
+        let second = MockDc::start(atlas_duck_atlassian::Product::Jira, "/other").await;
+        let admin = h.instances();
+        let before_file = std::fs::read_to_string(h.config_path())?;
+        let records = config_records(&h).await?;
+
+        // instance_add: Cancel.
+        let args = add_args("second", &second.base_url(), false)?;
+        let a = admin.clone();
+        let res = blocking(move || instance_add_dto(&*a, args, no_ca)).await?;
+        assert_eq!(res.err(), Some(CommandError::Admin(AdminError::Cancelled)));
+        assert_eq!(std::fs::read_to_string(h.config_path())?, before_file);
+        assert_eq!(admin.list().len(), 1);
+        assert_eq!(config_records(&h).await?, records);
+        // Ok.
+        h.confirmer().push(Confirm::Ok);
+        let args = add_args("second", &second.base_url(), false)?;
+        let a = admin.clone();
+        let view = blocking(move || instance_add_dto(&*a, args, no_ca)).await??;
+        assert_eq!((view.alias.as_str(), view.state), ("second", "needs_token"));
+        assert_eq!(admin.list().len(), 2);
+        assert!(config_records(&h).await? > records);
+        let texts = h.confirmer().texts();
+        assert!(
+            texts
+                .last()
+                .is_some_and(|t| t.starts_with("Add Jira instance")),
+            "{texts:?}"
+        );
+
+        // instance_change_url: Cancel keeps the origin and the token; Ok moves both.
+        let moved = MockDc::start(atlas_duck_atlassian::Product::Jira, "/moved").await;
+        let url_args = |url: &str| {
+            parse::<InstanceChangeUrlArgs>(&json!({"alias": "jira-main", "new_url": url}))
+                .map_err(|e| format!("{e:?}"))
+        };
+        let first_origin = h.mock("jira-main").ok_or("mock")?.base_url();
+        let records = config_records(&h).await?;
+        h.confirmer().push(Confirm::Cancel);
+        let (a, args) = (admin.clone(), url_args(&moved.base_url())?);
+        let res = blocking(move || instance_change_url_dto(&*a, args)).await?;
+        assert_eq!(res.err(), Some(CommandError::Admin(AdminError::Cancelled)));
+        let jira = admin.list().into_iter().find(|i| i.alias == "jira-main");
+        assert_eq!(
+            jira.as_ref().and_then(|i| i.origin.clone()),
+            Some(first_origin)
+        );
+        assert_eq!(jira.map(|i| i.state), Some("ok"));
+        assert_eq!(config_records(&h).await?, records);
+        h.confirmer().push(Confirm::Ok);
+        let (a, args) = (admin.clone(), url_args(&moved.base_url())?);
+        let view = blocking(move || instance_change_url_dto(&*a, args)).await??;
+        assert_eq!(
+            (view.origin, view.state),
+            (Some(moved.base_url()), "needs_token")
+        );
+        assert!(config_records(&h).await? > records);
+
+        // settings_apply: raising a limit.
+        let s = h.core().settings();
+        let records = config_records(&h).await?;
+        h.confirmer().push(Confirm::Cancel);
+        let (s2, c) = (
+            s.clone(),
+            changes(json!([{"key": "jira_comments_cap", "value": 500}]))?,
+        );
+        let res = blocking(move || settings_apply_dto(&*s2, c)).await?;
+        assert_eq!(
+            res.err(),
+            Some(CommandError::Settings(SettingsError::Cancelled))
+        );
+        assert_eq!(config_records(&h).await?, records);
+        h.confirmer().push(Confirm::Ok);
+        let (s2, c) = (
+            s.clone(),
+            changes(json!([{"key": "jira_comments_cap", "value": 500}]))?,
+        );
+        let view = blocking(move || settings_apply_dto(&*s2, c)).await??;
+        assert_eq!(view.limits.jira_comments_cap, 500);
+        assert_eq!(config_records(&h).await?, records + 1);
+
+        // prune_backlog_now.
+        h.confirmer().push(Confirm::Cancel);
+        let s2 = s.clone();
+        let res = blocking(move || prune_backlog_now_dto(&*s2)).await?;
+        assert_eq!(
+            res.err(),
+            Some(CommandError::Settings(SettingsError::Cancelled))
+        );
+        assert!(h.events_of(EventType::PRUNE).await?.is_empty());
+        h.confirmer().push(Confirm::Ok);
+        let s2 = s.clone();
+        assert!(blocking(move || prune_backlog_now_dto(&*s2)).await?.is_ok());
+        Ok(())
+    }
+
+    /// §7.1: an `http://` base URL never gets a dialog or a record; core refuses it
+    /// (`insecure_scheme`) and the page shows the fixed hint for that kind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn http_base_url_refused_with_fixed_hint() -> TestResult {
+        let h = Harness::builder()
+            .jira("jira-main")
+            .strict_https()
+            .start()
+            .await?;
+        let admin = h.instances();
+        let records = config_records(&h).await?;
+        let args = add_args("plain", "http://jira.corp/jira", false)?;
+        let a = admin.clone();
+        let res = blocking(move || instance_add_dto(&*a, args, no_ca)).await?;
+        let err = res.err().ok_or("accepted an http URL")?;
+        assert_eq!(err, CommandError::Admin(AdminError::InsecureScheme));
+        // On the wire: the kind the page maps to the fixed text, and no text of its own.
+        assert_eq!(
+            serde_json::to_value(&err)?,
+            json!({"kind": "admin", "error": {"kind": "insecure_scheme"}})
+        );
+        assert_eq!(
+            HTTPS_REQUIRED_HINT,
+            "atlas-duck requires https; if your server uses an internal CA, add it as the instance's custom CA"
+        );
+        // A URL change to http is refused the same way; the hint is for both entry points.
+        let a = admin.clone();
+        let change = parse::<InstanceChangeUrlArgs>(
+            &json!({"alias": "jira-main", "new_url": "http://jira.corp/jira"}),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let res = blocking(move || instance_change_url_dto(&*a, change)).await?;
+        assert_eq!(
+            res.err(),
+            Some(CommandError::Admin(AdminError::InsecureScheme))
+        );
+        assert!(h.confirmer().texts().is_empty(), "no dialog for http");
+        assert_eq!(config_records(&h).await?, records);
+        assert_eq!(admin.list().len(), 1);
+        // An http instance read from config.toml cannot get a PAT window either.
+        let views = admin.list();
+        assert_eq!(views[0].state, "insecure_scheme");
+        assert_eq!(
+            atlas_duck_app_lib::credential::pat_target(&views, "jira-main").err(),
+            Some(AdminError::InsecureScheme)
+        );
+        Ok(())
+    }
+
+    /// The CA bytes core pins come from Rust's file dialog only: without `use_custom_ca` the source
+    /// is never asked; with it, the bytes the source gave reach core (which shows their subject and
+    /// fingerprint); a cancelled dialog is `Cancelled` before any core dialog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ca_never_from_webview_bytes_come_from_the_rust_source_only() -> TestResult {
+        let h = rig(vec![Confirm::Ok, Confirm::Ok]).await?;
+        let second = MockDc::start(atlas_duck_atlassian::Product::Jira, "/other").await;
+        let admin = h.instances();
+
+        // use_custom_ca: false never asks for a file.
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (a, flag) = (admin.clone(), asked.clone());
+        let args = add_args("plain", &second.base_url(), false)?;
+        let view = blocking(move || {
+            instance_add_dto(&*a, args, move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(b"-----BEGIN CERTIFICATE-----".to_vec())
+            })
+        })
+        .await??;
+        assert_eq!(view.state, "needs_token");
+        assert!(!asked.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(h.confirmer().texts().len(), 1, "only the add dialog");
+
+        // use_custom_ca: true takes the Rust source's bytes and core shows the CA.
+        h.confirmer().push(Confirm::Ok);
+        h.confirmer().push(Confirm::Ok);
+        let pem = generate_ca_pem()?.into_bytes();
+        let (a, bytes) = (admin.clone(), pem.clone());
+        let args = add_args("pinned", &second.base_url(), true)?;
+        let view = blocking(move || instance_add_dto(&*a, args, move || Ok(bytes))).await??;
+        assert_eq!(view.alias, "pinned");
+        let texts = h.confirmer().texts();
+        let ca = texts.last().ok_or("no CA dialog")?;
+        assert!(ca.starts_with("Trust the custom CA for \"pinned\""), "{ca}");
+        assert!(ca.contains("Subject: ") && ca.contains("Valid: "), "{ca}");
+
+        // A cancelled file dialog: nothing else happens, no dialog of core's either.
+        let dialogs = h.confirmer().texts().len();
+        let records = config_records(&h).await?;
+        let a = admin.clone();
+        let args = add_args("never", &second.base_url(), true)?;
+        let res = blocking(move || {
+            instance_add_dto(&*a, args, || {
+                Err(CommandError::Admin(AdminError::Cancelled))
+            })
+        })
+        .await?;
+        assert_eq!(res.err(), Some(CommandError::Admin(AdminError::Cancelled)));
+        assert_eq!(h.confirmer().texts().len(), dialogs);
+        assert_eq!(config_records(&h).await?, records);
+        assert!(admin.list().iter().all(|i| i.alias != "never"));
+        Ok(())
+    }
+
+    /// `retest_token` over the command: the identity answer, a failure class that left the instance
+    /// `needs_token`, and the refusal during the shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retest_token_through_command() -> TestResult {
+        let h = Harness::jira().await?;
+        let mock = h.mock("jira-main").ok_or("mock")?;
+        mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+            .await;
+        mock.jira_server_info("9.12.0").await;
+        let alias = parse::<RetestTokenArgs>(&json!({"alias": "jira-main"}))
+            .map_err(|e| format!("{e:?}"))?
+            .alias;
+        let outcome = retest_token_dto(h.instances(), &alias).await?;
+        let RetestOutcome::Ok(connected) = &outcome else {
+            return Err(format!("{outcome:?}").into());
+        };
+        assert_eq!(connected.atlassian_user, TEST_USER);
+        assert_eq!(connected.product, "jira");
+        assert_eq!(
+            serde_json::to_value(&outcome)?["ok"]["version"],
+            json!("9.12.0")
+        );
+
+        // A server that rejects the token (a JSON 401): a failed answer, not an error (what the
+        // instance's state becomes is core's, and the page reads it from `settings_get`).
+        let other = Harness::jira().await?;
+        let mock = other.mock("jira-main").ok_or("mock")?;
+        mock.json("/rest/api/2/myself", 401, r#"{"message":"unauthorized"}"#)
+            .await;
+        let outcome = retest_token_dto(other.instances(), &alias).await?;
+        assert_eq!(
+            serde_json::to_value(&outcome)?,
+            json!({"failed": {"class": "http_401"}})
+        );
+
+        // An unknown alias passes through as an admin error.
+        let nobody = parse::<RetestTokenArgs>(&json!({"alias": "nobody"}))
+            .map_err(|e| format!("{e:?}"))?
+            .alias;
+        assert_eq!(
+            retest_token_dto(h.instances(), &nobody).await.err(),
+            Some(CommandError::Admin(AdminError::NotFound))
+        );
+
+        // After the shutdown began every admin call is refused (M3 M-4, Δ4).
+        let report = h.core().shutdown(ShutdownReason::Quit).await;
+        assert!(report.app_stop_logged);
+        assert_eq!(
+            retest_token_dto(h.instances(), &alias).await.err(),
+            Some(CommandError::Admin(AdminError::ShuttingDown))
+        );
+        let s = h.core().settings();
+        let c = changes(json!([{"key": "retention_days", "value": 400}]))?;
+        let res = blocking(move || settings_apply_dto(&*s, c)).await?;
+        assert_eq!(
+            res.err(),
+            Some(CommandError::Settings(SettingsError::ShuttingDown))
+        );
+        Ok(())
+    }
+
+    /// The window never opens for an instance Rust would not let a PAT near, and `Busy` has its own
+    /// kind. `open_for_pat` refuses before it touches any window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn credential_window_refused_for_unconfirmed() -> TestResult {
+        let h = Harness::builder()
+            .jira("jira-main")
+            .unconfirmed()
+            .start()
+            .await?;
+        let views = h.instances().list();
+        assert_eq!(views[0].state, "instance_unconfirmed");
+        let app = mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets()))?;
+        let handle: &tauri::AppHandle<MockRuntime> = app.handle();
+        for (alias, replace, want) in [
+            ("jira-main", false, AdminError::Unconfirmed),
+            ("jira-main", true, AdminError::Unconfirmed),
+            ("nobody", false, AdminError::NotFound),
+        ] {
+            let err = open_for_pat(handle, &views, alias, replace)
+                .err()
+                .ok_or("opened a PAT window")?;
+            assert_eq!(err, PatOpenError::Instance(want.clone()));
+            assert_eq!(pat_open_error(err), CommandError::Admin(want));
+        }
+        assert_eq!(
+            serde_json::to_value(CommandError::Busy)?,
+            json!({"kind": "busy"})
+        );
+        Ok(())
+    }
+
+    /// `settings_get`'s parts: the view, the instances, the confinement placeholder before the probe
+    /// finished, no CLI install state yet; a proxy change through the command lands in the view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settings_get_and_set_proxy_through_the_commands() -> TestResult {
+        let h = Harness::jira().await?;
+        let (s, i) = (h.core().settings(), h.instances());
+        let got = blocking(move || settings_get_dto(&*s, &*i, ConfinementDto::pending())).await?;
+        assert_eq!(got.instances.len(), 1);
+        assert_eq!(
+            got.settings.limits.expiry_hours,
+            got.settings.limits.expiry_hours
+        );
+        assert_eq!(got.confinement.state, "pending");
+        assert!(!got.cli_installed);
+        let wire = serde_json::to_value(&got)?;
+        for key in ["settings", "instances", "confinement", "cli_installed"] {
+            assert!(wire.get(key).is_some(), "{key}");
+        }
+        let a = h.instances();
+        let args = parse::<atlas_duck_app_lib::commands::settings::InstanceSetProxyArgs>(
+            &json!({"alias": "jira-main", "proxy": "direct"}),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let view = blocking(move || instance_set_proxy_dto(&*a, args)).await??;
+        assert_eq!(view.proxy_effective.as_deref(), Some("direct"));
+        Ok(())
+    }
+}
+
 #[cfg(feature = "scripted-approver")]
 mod raw_pages {
     use atlas_duck_app_lib::commands::CommandError;

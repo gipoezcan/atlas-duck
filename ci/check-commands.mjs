@@ -75,6 +75,8 @@ export const WINDOW_COMMANDS = {
     "save_recovery_note",
     "archive_and_start_fresh",
     "retry_keychain",
+    // M6 T25 (T21 review I-4): the page's own Close / Cancel; credential only, like the OS close.
+    "close_credential",
     "quit",
   ],
   setup: [

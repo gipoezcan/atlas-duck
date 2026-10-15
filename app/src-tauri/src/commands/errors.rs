@@ -1,7 +1,7 @@
 //! The one error type every command answers with (PD-66, §2.4, §10.3).
 
 use atlas_duck_core::payloads::InvalidReason;
-use atlas_duck_core::{AdminError, DecisionError, RELEASE_BLOCKED_INTERNAL};
+use atlas_duck_core::{AdminError, DecisionError, RELEASE_BLOCKED_INTERNAL, SettingsError};
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
@@ -27,6 +27,12 @@ pub enum CommandError {
     NotReady,
     Decision(DecisionError),
     Admin(AdminError),
+    /// `SettingsAdmin` refused or failed (M6 T25): nested like `Admin`, `{"kind": "settings",
+    /// "error": {"kind": "invalid", "key": ..}}`. Fixed kinds, keys and the config banner; no text.
+    Settings(SettingsError),
+    /// M6 T25: the credential window is open for something else (`WindowError::Busy`); close it
+    /// first. Nothing was changed.
+    Busy,
     /// M5 M-11 (T7 review H1): the candidate could not be built, so a preview or a Raw page has
     /// nothing to show. The text is the core constant, chosen here so the UI never maps an error
     /// kind to it; wire `{"kind": "release_blocked", "text": ..}`.
@@ -43,6 +49,8 @@ impl CommandError {
             Self::NotReady => "not_ready",
             Self::Decision(_) => "decision",
             Self::Admin(_) => "admin",
+            Self::Settings(_) => "settings",
+            Self::Busy => "busy",
             Self::ReleaseBlocked => "release_blocked",
             Self::Internal => "internal",
         }
@@ -66,8 +74,9 @@ impl Serialize for CommandError {
             Self::InvalidArgument { field } => m.serialize_entry("field", field)?,
             Self::Decision(e) => m.serialize_entry("error", e)?,
             Self::Admin(e) => m.serialize_entry("error", e)?,
+            Self::Settings(e) => m.serialize_entry("error", e)?,
             Self::ReleaseBlocked => m.serialize_entry("text", RELEASE_BLOCKED_INTERNAL)?,
-            Self::NotFound | Self::NotReady | Self::Internal => {}
+            Self::NotFound | Self::NotReady | Self::Busy | Self::Internal => {}
         }
         m.end()
     }
@@ -97,6 +106,12 @@ impl From<AdminError> for CommandError {
     }
 }
 
+impl From<SettingsError> for CommandError {
+    fn from(e: SettingsError) -> Self {
+        Self::Settings(e)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use atlas_duck_core::CandidateRev;
@@ -114,6 +129,7 @@ mod tests {
         for (e, kind) in [
             (CommandError::NotFound, "not_found"),
             (CommandError::NotReady, "not_ready"),
+            (CommandError::Busy, "busy"),
             (CommandError::Internal, "internal"),
         ] {
             assert_eq!(serde_json::to_value(&e).ok(), Some(json!({ "kind": kind })));
@@ -152,6 +168,20 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&admin).ok(),
             Some(json!({"kind": "admin", "error": {"kind": "not_found"}}))
+        );
+        let invalid = CommandError::from(SettingsError::Invalid {
+            key: "jira_comments_cap",
+        });
+        let text = serde_json::to_string(&invalid).unwrap_or_default();
+        assert_eq!(text.matches("\"kind\"").count(), 2, "{text}");
+        assert_eq!(
+            serde_json::to_value(&invalid).ok(),
+            Some(json!({"kind": "settings",
+                        "error": {"kind": "invalid", "key": "jira_comments_cap"}}))
+        );
+        assert_eq!(
+            CommandError::from(SettingsError::Cancelled).to_string(),
+            "settings"
         );
     }
 }
