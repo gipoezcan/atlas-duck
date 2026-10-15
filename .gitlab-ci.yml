@@ -68,7 +68,7 @@ rust:test:
     # run on GitHub: they need the cli_flows harness; no sudo in this image, so no S-01
     # other-user step; no second account on a container runner).
     - cargo test -p atlas-duck-ipc --features test-paths --locked
-    - cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate --test commands_acl --test dto_fixtures
+    - cargo test -p atlas-duck-app --features scripted-approver --locked --test startup_ipc --test startup_gate --test commands_acl --test dto_fixtures --test credential
   after_script:
     - pkill -x atlas-duck-app || true
 
