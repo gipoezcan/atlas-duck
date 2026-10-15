@@ -53,20 +53,41 @@ const DISCRIMINANTS = new Set([
   'attention_mode', 'secret_service', 'code', 'field', 'conn', 'error',
 ]);
 
+/** The one discriminator path a `free` run poisons as well (the per-path prototype pass), or null. */
+let focus: string | null = null;
+
+/** The paths of the fixtures that end in a discriminator, by the path rule of `poison`. */
+function discriminantPaths(value: Json, key: string, path: string, out: Set<string>): void {
+  if (typeof value === 'string') {
+    if (DISCRIMINANTS.has(key)) out.add(path);
+  } else if (Array.isArray(value)) {
+    for (const v of value) discriminantPaths(v, key, path, out);
+  } else if (typeof value === 'object' && value !== null) {
+    for (const [k, v] of Object.entries(value)) discriminantPaths(v, k, path === '' ? k : `${path}.${k}`, out);
+  }
+}
+
+const DISCRIMINANT_PATHS = (() => {
+  const out = new Set<string>();
+  for (const fixture of FIXTURES.values()) discriminantPaths(fixture, '', '', out);
+  return [...out].sort();
+})();
+
 const KEY_MODE_VALUE = '<img src=x onerror="window.__pwned=1">';
 
 function own(target: object, key: string, value: unknown): void {
   Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
 }
 
-function poison(value: Json, payload: string, mode: Mode, key = ''): Json {
+/** `path` is the dotted keys from the root, lists left out: `instances.state`. */
+function poison(value: Json, payload: string, mode: Mode, key = '', path = ''): Json {
   if (typeof value === 'string') {
-    return mode === 'keys' || (mode === 'free' && DISCRIMINANTS.has(key)) ? value : payload;
+    return mode === 'keys' || (mode === 'free' && DISCRIMINANTS.has(key) && path !== focus) ? value : payload;
   }
-  if (Array.isArray(value)) return value.map((v) => poison(v, payload, mode, key));
+  if (Array.isArray(value)) return value.map((v) => poison(v, payload, mode, key, path));
   if (typeof value === 'object' && value !== null) {
     const out = {};
-    for (const [k, v] of Object.entries(value)) own(out, k, poison(v, payload, mode, k));
+    for (const [k, v] of Object.entries(value)) own(out, k, poison(v, payload, mode, k, path === '' ? k : `${path}.${k}`));
     if (mode === 'keys') for (const k of PROTOTYPE_KEYS) own(out, k, payload);
     return out;
   }
@@ -126,11 +147,12 @@ function protoIntact(): boolean {
 // ---- the answers of the commands ----
 
 const used = new Set<string>();
+/** The fixtures the scenario now running has read. */
+let current = new Set<string>();
 let payload = 'x';
 let mode: Mode = 'free';
 let preview = 0;
 let enabled = false;
-let calls = 0;
 let pin = 0;
 let variant: 'none' | 'tokens' | 'removal' = 'none';
 let counters = new Map<string, number>();
@@ -138,6 +160,7 @@ let counters = new Map<string, number>();
 /** The fixture called `name` as a list, poisoned as the current pass says (or as `pass` says). */
 function fx(name: string, pass: Mode = mode): Json[] {
   used.add(name);
+  current.add(name);
   const base = FIXTURES.get(name);
   if (base === undefined) throw new Error(`no fixture ${name}`);
   const v = poison(base, payload, pass);
@@ -224,7 +247,6 @@ function decidable(item: Json): Json {
 
 /** Every command of the seven windows (`COMMANDS`): its answer comes from the fixtures. */
 function answer(cmd: string, args: Record<string, unknown>): Promise<Json> {
-  calls += 1;
   switch (cmd) {
     case 'queue_list': return Promise.resolve(enabled ? fx('queue_item').map(decidable) : fx('queue_item'));
     case 'recent_list': return Promise.resolve(fx('recent_item'));
@@ -429,8 +451,12 @@ const SCENARIOS: Scenario[] = [
   ...[0, 1, 2, 3, 4, 5, 6, 7].map(credential),
 ];
 
+/** The fixtures each scenario read in the benign runs, by `mode/name`: a payload run has to read them too. */
+const benignUsed = new Map<string, Set<string>>();
+
 async function run(scenario: Scenario): Promise<string[]> {
   wire();
+  current = new Set();
   variant = 'none';
   pin = 0;
   scenario.before?.();
@@ -443,7 +469,17 @@ async function run(scenario: Scenario): Promise<string[]> {
     stop = scenario.mount(root);
   }
   await settle();
-  const found = await explore(`${mode}/${scenario.name}`);
+  const where = `${mode}/${scenario.name}`;
+  const found = await explore(where);
+  if (learning) benignUsed.set(where, current);
+  else if (focus === null && mode !== 'keys' && payload.trim() !== '') {
+    // A payload that makes the explorer stall (its clicks spent on controls the payload made) would
+    // scan less and still pass: the run has to reach every tab, dialog and panel the benign run did.
+    // (A blank payload leaves the required fields empty, so the buttons that send stay off.)
+    for (const name of benignUsed.get(where) ?? []) {
+      if (!current.has(name)) found.push(`${where}: did not read fixture ${name} as the benign run did`);
+    }
+  }
   view?.unmount();
   stop();
   document.body.replaceChildren();
@@ -464,10 +500,14 @@ async function runAll(reach: Reach = 'wide'): Promise<string[]> {
 }
 
 let errors: string[] = [];
+/** Console errors of the benign runs: the baseline has to render cleanly before payloads are blamed. */
+const baselineErrors: string[] = [];
 
 beforeAll(async () => {
   vi.useFakeTimers();
-  vi.spyOn(console, 'error').mockImplementation(() => undefined);
+  vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+    baselineErrors.push(args.map(String).join(' ').slice(0, 300));
+  });
   // What the windows put on the page when the text is benign: the elements the corpus runs are measured against.
   learning = true;
   payload = 'benign text';
@@ -477,6 +517,9 @@ beforeAll(async () => {
   }
   learning = false;
   vi.restoreAllMocks();
+  const failures = baselineErrors.filter((e) => RENDER_FAILURES.test(e));
+  baselineErrors.length = 0;
+  baselineErrors.push(...failures);
 }, 300_000);
 
 afterAll(() => {
@@ -499,10 +542,10 @@ afterEach(() => {
 const RENDER_FAILURES = /not valid as a React child|Minified React error|Cannot read|is not a function|is not iterable|Functions are not valid|Uncaught|above error occurred/;
 
 /** Both passes over `reach`; nothing on the page, nothing thrown, no prototype written to. */
-async function clean(value: string, reach: Reach): Promise<void> {
+async function clean(value: string, reach: Reach, modes: readonly Mode[] = ['free', 'all']): Promise<void> {
   payload = value;
   const found: string[] = [];
-  for (const m of ['free', 'all'] as const) {
+  for (const m of modes) {
     mode = m;
     found.push(...(await runAll(reach)));
   }
@@ -516,7 +559,8 @@ describe('s06_injection_payloads_every_field_every_tab', () => {
     expect(baseline.has('iframe')).toBe(true);
     expect(baseline.has('script')).toBe(false);
     expect(baseline.has('img')).toBe(false);
-    expect(errors.filter((e) => RENDER_FAILURES.test(e))).toEqual([]);
+    expect(baselineErrors).toEqual([]);
+    expect(benignUsed.size).toBeGreaterThan(0);
   });
 
   // Every payload alone, in every string field of the small windows.
@@ -531,6 +575,21 @@ describe('s06_injection_payloads_every_field_every_tab', () => {
   it.each(
     [...KINDS.prototype, ...KINDS.null, ...KINDS.long].map((p) => [p.id, p.value] as const),
   )('%s alone, in every window and tab', (_id, value) => clean(value, 'core'));
+
+  // A wire name looked up in a table of a page: the record's other discriminators stay valid, so
+  // the record is rendered, and this one field (a path, as a closed sibling of the same name
+  // elsewhere would reject the record) holds the name of an `Object.prototype` member.
+  it.each(DISCRIMINANT_PATHS.flatMap((path) => ['__proto__', 'constructor'].map((name) => [path, name] as const)))(
+    'discriminator %s = %s, in every window and tab',
+    async (path, name) => {
+      focus = path;
+      try {
+        await clean(name, 'core', ['free']);
+      } finally {
+        focus = null;
+      }
+    },
+  );
 
   it('prototype keys and markup on every record of every answer', async () => {
     mode = 'keys';
@@ -548,6 +607,5 @@ describe('s06_injection_payloads_every_field_every_tab', () => {
     await runAll();
     const unused = [...FIXTURES.keys()].filter((name) => !used.has(name));
     expect(unused).toEqual([]);
-    expect(calls).toBeGreaterThan(0);
   }, 300_000);
 });

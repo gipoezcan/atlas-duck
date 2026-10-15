@@ -59,7 +59,7 @@ export function Instances({ instances, onChanged, readOnly }: InstancesProps) {
 }
 
 function stateLabel(state: string) {
-  const known = T.states[state];
+  const known = own(T.states, state);
   return known === undefined ? <Cfg value={state} /> : <>{known}</>;
 }
 

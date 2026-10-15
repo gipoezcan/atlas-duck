@@ -137,6 +137,14 @@ describe('Settings', () => {
     expect(settingsGet).toHaveBeenCalledTimes(2);
   });
 
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'an instance state named like an object member (%s) is shown as configured text',
+    async (state) => {
+      await show(plain({ state }));
+      expect(within(row('work')).getByText(state)).toBeTruthy();
+    },
+  );
+
   it('needs_token_offers_retest_before_replace', async () => {
     await show(plain({ state: 'needs_token' }));
     const r = within(row('work'));
