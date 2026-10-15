@@ -360,6 +360,47 @@ export interface CliInstallAnswer {
   outcome: 'installed' | 'installed_local_bin' | 'already_installed' | 'removed' | 'already_on_path';
 }
 
+/** The user's answer for one instance's revoke step (`removal_mark`). */
+export type RemovalChoice = 'pending' | 'done' | 'skipped';
+
+/** One instance of the "Prepare for removal" checklist (spec 12.5 step 2). */
+export interface RemovalItem {
+  alias: string;
+  product: 'jira' | 'confluence';
+  origin: string | null;
+  /** The token's identity read before it was deleted; `null` when no longer known. */
+  identity: string | null;
+  token_deleted: boolean;
+  /** Why the delete failed (core's error kind); `null` when it did not. */
+  error: string | null;
+  choice: RemovalChoice;
+}
+
+/** `removal_state` (and `removal_begin`, `removal_mark`): the checklist of this process. */
+export interface RemovalState {
+  /** `begin` ran in this process and `finish` has not completed. */
+  active: boolean;
+  /** A full backup was made in this procedure. */
+  backup_made: boolean;
+  retention_days: number;
+  legal_hold: boolean;
+  instances: RemovalItem[];
+}
+
+/** `removal_backup`: `saved: false` is a cancelled folder dialog. */
+export interface RemovalBackupAnswer {
+  saved: boolean;
+}
+
+/**
+ * `removal_finish`: what was removed, as fixed words. `cli`: `removed`, `already_on_path` (deb/rpm)
+ * or `nothing` (no stable path: nothing installed from here). `autostart`: `removed` or `was_off`.
+ */
+export interface RemovalFinishAnswer {
+  cli: 'removed' | 'already_on_path' | 'nothing';
+  autostart: 'removed' | 'was_off';
+}
+
 /** The wizard steps in the order Rust walks them (`app::wizard::WizardStep`, PD-77). */
 export type WizardStep =
   | 'data_dir'
@@ -423,6 +464,11 @@ export type CommandError =
    * path, no OS text.
    */
   | { kind: 'cli_install'; error: CoreError }
+  /**
+   * "Prepare for removal" refused or failed (T28): `error.kind` is `no_procedure`, `unticked`,
+   * `token_stored` or `autostart`; no text.
+   */
+  | { kind: 'removal'; error: CoreError }
   /** The credential window is open for something else (T25): close it first. */
   | { kind: 'busy' }
   /** The candidate could not be built (M5 M-11); `text` is the app-generated banner. */

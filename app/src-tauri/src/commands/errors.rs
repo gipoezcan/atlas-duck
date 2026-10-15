@@ -6,6 +6,7 @@ use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
 
 use crate::cli_install::InstallError;
+use crate::removal::RemovalError;
 
 /// No free text from Atlassian: every variant is a fixed kind, a static field name or a core error
 /// (`DecisionError`, `AdminError`) that serializes a kind and fixed data. One exception:
@@ -39,6 +40,10 @@ pub enum CommandError {
     /// (`no_stable_path`, `unsafe_path`, `occupied`, `registry`, ...). Nested like `Admin`: `{"kind":
     /// "cli_install", "error": {"kind": "occupied"}}`. No path and no OS text.
     CliInstall(InstallError),
+    /// M6 T28 (§12.5): "Prepare for removal" refused or failed (`no_procedure`, `unticked`,
+    /// `token_stored`, `autostart`). Nested like `Admin`: `{"kind": "removal", "error": {"kind":
+    /// "unticked"}}`. No text.
+    Removal(RemovalError),
     /// M5 M-11 (T7 review H1): the candidate could not be built, so a preview or a Raw page has
     /// nothing to show. The text is the core constant, chosen here so the UI never maps an error
     /// kind to it; wire `{"kind": "release_blocked", "text": ..}`.
@@ -58,6 +63,7 @@ impl CommandError {
             Self::Settings(_) => "settings",
             Self::Busy => "busy",
             Self::CliInstall(_) => "cli_install",
+            Self::Removal(_) => "removal",
             Self::ReleaseBlocked => "release_blocked",
             Self::Internal => "internal",
         }
@@ -83,6 +89,7 @@ impl Serialize for CommandError {
             Self::Admin(e) => m.serialize_entry("error", e)?,
             Self::Settings(e) => m.serialize_entry("error", e)?,
             Self::CliInstall(e) => m.serialize_entry("error", e)?,
+            Self::Removal(e) => m.serialize_entry("error", e)?,
             Self::ReleaseBlocked => m.serialize_entry("text", RELEASE_BLOCKED_INTERNAL)?,
             Self::NotFound | Self::NotReady | Self::Busy | Self::Internal => {}
         }
@@ -123,6 +130,12 @@ impl From<SettingsError> for CommandError {
 impl From<InstallError> for CommandError {
     fn from(e: InstallError) -> Self {
         Self::CliInstall(e)
+    }
+}
+
+impl From<RemovalError> for CommandError {
+    fn from(e: RemovalError) -> Self {
+        Self::Removal(e)
     }
 }
 
@@ -205,5 +218,13 @@ mod tests {
             Some(json!({"kind": "cli_install", "error": {"kind": "occupied"}}))
         );
         assert_eq!(cli.to_string(), "cli_install");
+        let removal = CommandError::from(RemovalError::Unticked);
+        let text = serde_json::to_string(&removal).unwrap_or_default();
+        assert_eq!(text.matches("\"kind\"").count(), 2, "{text}");
+        assert_eq!(
+            serde_json::to_value(&removal).ok(),
+            Some(json!({"kind": "removal", "error": {"kind": "unticked"}}))
+        );
+        assert_eq!(removal.to_string(), "removal");
     }
 }

@@ -45,6 +45,10 @@ export function errorText(e: unknown): string {
     const inner = err.error?.kind;
     return (typeof inner === 'string' ? own(t.cli_errors, inner) : undefined) ?? t.cli_errors.other ?? '';
   }
+  if (err.kind === 'removal') {
+    const inner = err.error?.kind;
+    return (typeof inner === 'string' ? own(t.removal_errors, inner) : undefined) ?? t.errors.other ?? '';
+  }
   return own(t.errors, err.kind) ?? t.errors.internal ?? '';
 }
 

@@ -12,6 +12,11 @@ import {
   instanceConfirmConfig,
   instanceSetProxy,
   pruneBacklogNow,
+  removalBackup,
+  removalBegin,
+  removalFinish,
+  removalMark,
+  removalState,
   retestToken,
   settingsApply,
   settingsGet,
@@ -34,6 +39,11 @@ vi.mock('../shared/ipc/invoke', () => ({
   credentialWindowOpen: vi.fn(),
   retestToken: vi.fn(),
   pruneBacklogNow: vi.fn(),
+  removalBackup: vi.fn(),
+  removalBegin: vi.fn(),
+  removalFinish: vi.fn(),
+  removalMark: vi.fn(),
+  removalState: vi.fn(),
 }));
 vi.mock('../shared/ipc/events', () => ({ on: vi.fn() }));
 
@@ -97,10 +107,24 @@ beforeEach(() => {
     credentialWindowOpen,
     retestToken,
     pruneBacklogNow,
+    removalBackup,
+    removalBegin,
+    removalFinish,
+    removalMark,
   ]) {
     vi.mocked(f as (...a: unknown[]) => Promise<unknown>).mockReset();
   }
   vi.mocked(settingsGet).mockReset();
+  // "Prepare for removal" has its own tests (Removal.test.tsx): here it is the idle entry.
+  vi.mocked(removalState)
+    .mockReset()
+    .mockResolvedValue({
+      active: false,
+      backup_made: false,
+      retention_days: 92,
+      legal_hold: false,
+      instances: [],
+    });
 });
 
 describe('Settings', () => {
@@ -208,11 +232,11 @@ describe('Settings', () => {
     const controls = [...document.querySelectorAll('input, select, button, textarea')];
     expect(controls.length).toBeGreaterThan(8);
     const open = controls.filter((c) => !c.matches(':disabled')).map((c) => c.textContent);
-    // Only the token, re-test, prune and CLI buttons stay on: core refuses ConfigReadOnly for what
-    // writes config.toml, and the CLI install records an audit event only.
+    // Only the token, re-test, prune, CLI and removal buttons stay on: core refuses ConfigReadOnly
+    // for what writes config.toml; the CLI install and "Prepare for removal" record audit events only.
     for (const c of controls) {
       const name = c.textContent ?? '';
-      const stays = /token|Re-test|Prune backlog|CLI/.test(name);
+      const stays = /token|Re-test|Prune backlog|CLI|full backup/.test(name);
       expect(c.matches(':disabled'), c.outerHTML).toBe(!stays);
     }
     expect(open.length).toBeGreaterThan(0);
@@ -460,11 +484,13 @@ describe('Settings', () => {
     expect(screen.getByRole('alert').textContent).toBe('The change was refused');
   });
 
-  it('the CLI buttons stay on under a read-only config, the removal entry is still a stub', async () => {
+  it('the CLI buttons and the removal entry stay on under a read-only config (they write no config.toml)', async () => {
     await show(FULL);
     const cli = FULL.cli_installed ? 'Remove CLI from PATH' : 'Install CLI to PATH';
     expect((screen.getByRole('button', { name: cli }) as HTMLButtonElement).disabled).toBe(false);
-    expect((screen.getByRole('button', { name: 'Prepare for removal' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(
+      (screen.getByRole('button', { name: 'Delete the stored tokens' }) as HTMLButtonElement).disabled,
+    ).toBe(false);
   });
   it('add instance sends the typed values with no CA data and shows the https hint on refusal', async () => {
     await show(BARE);

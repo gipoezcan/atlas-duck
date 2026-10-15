@@ -522,8 +522,53 @@ export const SETTINGS_TEXT = {
     other: 'The command line could not be installed or removed',
   } as Readonly<Record<string, string>>,
   removal: 'Prepare for removal',
-  removal_button: 'Prepare for removal',
-  removal_pending: 'Not available in this build yet.',
+  removal_intro:
+    'Before you uninstall atlas-duck: make a backup if you want one, delete the stored tokens, revoke each token on its server, and remove the command line and the login item. The audit log, its keys and its anchors are kept, so the log stays verifiable until its retention period has passed.',
+  /** spec 12.5 step 1: the remaining retention of the newest record is the setting itself. */
+  removal_retention: (days: number, hold: boolean) =>
+    `The newest audit record is kept for ${days} ${days === 1 ? 'day' : 'days'}${hold ? ' (a legal hold is on: pruning is stopped)' : ''}.`,
+  removal_backup: 'Create a full backup',
+  removal_backup_note: 'A backup never contains a token. Rust asks where to put it.',
+  removal_backup_saved: 'The backup was saved.',
+  removal_backup_cancelled: 'No backup was made.',
+  removal_backup_made: 'A backup was made in this procedure.',
+  removal_begin: 'Delete the stored tokens',
+  removal_retry: 'Delete the remaining tokens',
+  /** spec 12.5 step 2 (verbatim). */
+  removal_revoke_step: 'Revoke this token in Jira/Confluence (Profile → Personal Access Tokens)',
+  removal_checklist: 'Revoke the tokens',
+  removal_alias: 'Instance',
+  removal_identity: 'Token identity',
+  removal_identity_unknown: 'not known (no token identity is on record for this instance)',
+  removal_not_deleted: 'The token is still stored: it could not be deleted.',
+  removal_done: 'I revoked it',
+  removal_skip: 'Skip',
+  removal_choice_done: 'Marked as revoked.',
+  removal_choice_skipped: 'Skipped: the token stays valid on the server until it is revoked there.',
+  removal_choice_pending: 'Not answered yet.',
+  removal_undo: 'Answer again',
+  removal_finish: 'Finish removal',
+  removal_finish_hint:
+    'Finishing needs every instance to be ticked or skipped. It removes the login item and the command line (the PATH entry, link or wrapper, launcher and cli.toml), and keeps the audit log, its keys and its anchors.',
+  removal_cli: {
+    removed: 'The command line was removed.',
+    already_on_path: 'The command line comes with the package: remove the package to remove it.',
+    nothing: 'No command line was installed from here.',
+  } as const,
+  removal_autostart: {
+    removed: 'atlas-duck no longer starts at login.',
+    was_off: 'atlas-duck did not start at login.',
+  } as const,
+  removal_complete:
+    'Done. You can uninstall atlas-duck now. The audit log, its keys and its anchors stay on this computer; the documentation lists where, for deletion after the retention period.',
+  /** Why a removal step was refused, by error kind (`removal` errors). */
+  removal_errors: {
+    no_procedure: 'Delete the stored tokens first',
+    unticked: 'Tick or skip every instance first',
+    token_stored: 'A token is stored again for an instance: delete it again, then finish',
+    autostart: 'The login item could not be read or removed',
+    recorded: 'The answers are already recorded: finish the removal',
+  } as Readonly<Record<string, string>>,
   working: 'Working',
   /** Fixed answers for a refused or failed command, by error kind. */
   errors: {

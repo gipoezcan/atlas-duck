@@ -15,6 +15,7 @@ pub mod credential;
 pub mod csp;
 pub mod diag;
 pub mod early_argv;
+pub mod removal;
 pub mod sandbox_probe;
 pub mod secret_service;
 pub mod serve;
@@ -212,6 +213,8 @@ pub fn run_gui(background: bool) -> ! {
                 _ => StartupRoute::completed(),
             };
             app.manage(WindowRegistry::new(nav, route));
+            // M6 T28: the one "Prepare for removal" procedure of this process (§12.5).
+            app.manage(removal::RemovalState::default());
             let mut serve_args = None;
             let mut first_run = false;
             match state {

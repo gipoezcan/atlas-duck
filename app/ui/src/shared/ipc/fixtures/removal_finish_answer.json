@@ -1,0 +1,26 @@
+[
+  {
+    "autostart": "removed",
+    "cli": "removed"
+  },
+  {
+    "autostart": "was_off",
+    "cli": "removed"
+  },
+  {
+    "autostart": "removed",
+    "cli": "already_on_path"
+  },
+  {
+    "autostart": "was_off",
+    "cli": "already_on_path"
+  },
+  {
+    "autostart": "removed",
+    "cli": "nothing"
+  },
+  {
+    "autostart": "was_off",
+    "cli": "nothing"
+  }
+]

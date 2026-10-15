@@ -1,0 +1,60 @@
+[
+  {
+    "active": false,
+    "backup_made": false,
+    "instances": [],
+    "legal_hold": false,
+    "retention_days": 92
+  },
+  {
+    "active": false,
+    "backup_made": true,
+    "instances": [],
+    "legal_hold": true,
+    "retention_days": 365
+  },
+  {
+    "active": true,
+    "backup_made": true,
+    "instances": [
+      {
+        "alias": "work",
+        "choice": "pending",
+        "error": null,
+        "identity": "jdoe",
+        "origin": "https://work.example/jira",
+        "product": "jira",
+        "token_deleted": true
+      },
+      {
+        "alias": "wiki",
+        "choice": "done",
+        "error": null,
+        "identity": "asmith",
+        "origin": "https://wiki.example/confluence",
+        "product": "confluence",
+        "token_deleted": true
+      },
+      {
+        "alias": "old",
+        "choice": "skipped",
+        "error": null,
+        "identity": null,
+        "origin": "https://old.example/jira",
+        "product": "jira",
+        "token_deleted": true
+      },
+      {
+        "alias": "stuck",
+        "choice": "pending",
+        "error": "keychain",
+        "identity": "jdoe",
+        "origin": "https://stuck.example/jira",
+        "product": "jira",
+        "token_deleted": false
+      }
+    ],
+    "legal_hold": false,
+    "retention_days": 92
+  }
+]

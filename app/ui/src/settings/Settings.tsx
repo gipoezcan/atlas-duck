@@ -8,6 +8,7 @@ import { InstanceForm } from './InstanceForm';
 import { Cli } from './Cli';
 import { Instances } from './Instances';
 import { Limits } from './Limits';
+import { Removal } from './Removal';
 import { Retention } from './Retention';
 import { Cfg } from './text';
 import { useWindowBusy, WindowBusyContext } from './useAction';
@@ -105,7 +106,7 @@ export function Settings() {
       <Retention view={settings} onChanged={reload} readOnly={readOnly} />
       <ConfinementStatus confinement={confinement} />
       <Cli installed={cliInstalled} removable={cliRemovable} onChanged={reload} />
-      <RemovalSection />
+      <Removal onChanged={reload} />
     </main>
     </WindowBusyContext.Provider>
   );
@@ -153,15 +154,3 @@ function ConfinementStatus({ confinement }: { confinement: Confinement }) {
   );
 }
 
-/** "Prepare for removal" is wired by Task 28; until then the entry is shown off, with its reason. */
-function RemovalSection() {
-  return (
-    <section aria-label={T.removal}>
-      <h2>{T.removal}</h2>
-      <button type="button" disabled>
-        {T.removal_button}
-      </button>
-      <p>{T.removal_pending}</p>
-    </section>
-  );
-}

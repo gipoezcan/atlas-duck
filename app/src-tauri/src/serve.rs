@@ -423,6 +423,17 @@ impl ServeState {
         }
     }
 
+    /// The native confirmer the core was started with (M6 T28: "Prepare for removal" draws its own
+    /// dialogs through it); `None` before `start_with` set the restart inputs.
+    pub fn confirmer(&self) -> Option<Arc<dyn NativeConfirmer>> {
+        self.restart.get().map(|r| r.starter.confirmer.clone())
+    }
+
+    /// The open store handle (M6 T28: the full backup); `None` while no store is open.
+    pub fn open_store(&self) -> Option<Store> {
+        lock(&self.store).clone()
+    }
+
     /// PD-35: the kept gate handler's refused count; `None` while `Core` serves.
     pub fn refused(&self) -> Option<u64> {
         lock(&self.gate).as_ref().map(|g| g.refused())

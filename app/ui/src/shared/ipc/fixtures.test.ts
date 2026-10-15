@@ -15,6 +15,9 @@ import rawPage from './fixtures/raw_page.json';
 import recentItem from './fixtures/recent_item.json';
 import redactionContext from './fixtures/redaction_context.json';
 import redactionReport from './fixtures/redaction_report.json';
+import removalBackupAnswer from './fixtures/removal_backup_answer.json';
+import removalFinishAnswer from './fixtures/removal_finish_answer.json';
+import removalState from './fixtures/removal_state.json';
 import retestOutcome from './fixtures/retest_outcome.json';
 import retryStarted from './fixtures/retry_started.json';
 import settingsGet from './fixtures/settings_get.json';
@@ -37,6 +40,9 @@ import {
   isRedactionContext,
   isRedactionOp,
   isRedactionReport,
+  isRemovalBackupAnswer,
+  isRemovalFinishAnswer,
+  isRemovalState,
   isRetestOutcome,
   isSettingsGet,
   isStatusLine,
@@ -63,6 +69,9 @@ describe('fixtures validate against their TS types', () => {
     ['prune_report', pruneReport, arrayOf(isPruneReport)],
     ['cli_install_answer', cliInstallAnswer, arrayOf(isCliInstallAnswer)],
     ['wizard_state', wizardState, arrayOf(isWizardState)],
+    ['removal_state', removalState, arrayOf(isRemovalState)],
+    ['removal_backup_answer', removalBackupAnswer, arrayOf(isRemovalBackupAnswer)],
+    ['removal_finish_answer', removalFinishAnswer, arrayOf(isRemovalFinishAnswer)],
   ] as const)('%s', (_name, fixture, validate) => {
     expect(fixture.length).toBeGreaterThan(0);
     expect(validate(fixture)).toBe(true);
@@ -216,6 +225,22 @@ describe('fixtures validate against their TS types', () => {
     expect(isWizardState({ ...wizard, secret_service: 'maybe' })).toBe(false);
     expect(isWizardState({ ...wizard, error: { class: 'x' } })).toBe(false);
     expect(isWizardState({ ...wizard, instances: [{}] })).toBe(false);
+    // "Prepare for removal" answers are closed: an extra key, a wrong word or a wrong type is refused.
+    const removal = removalState[2];
+    expect(isRemovalState(removal)).toBe(true);
+    expect(isRemovalState({ ...removal, extra: 1 })).toBe(false);
+    expect(isRemovalState({ ...removal, active: 'yes' })).toBe(false);
+    expect(isRemovalState({ ...removal, instances: [{ ...removal?.instances[0], choice: 'maybe' }] })).toBe(false);
+    expect(isRemovalState({ ...removal, instances: [{ ...removal?.instances[0], extra: 1 }] })).toBe(false);
+    expect(isRemovalState({ ...removal, instances: [{ ...removal?.instances[0], product: 'bitbucket' }] })).toBe(false);
+    expect(isRemovalState({ ...removal, instances: [{ ...removal?.instances[0], identity: 5 }] })).toBe(false);
+    expect(isRemovalBackupAnswer({ saved: true })).toBe(true);
+    expect(isRemovalBackupAnswer({ saved: 1 })).toBe(false);
+    expect(isRemovalBackupAnswer({ saved: true, path: '/x' })).toBe(false);
+    expect(isRemovalFinishAnswer({ cli: 'removed', autostart: 'was_off' })).toBe(true);
+    expect(isRemovalFinishAnswer({ cli: 'gone', autostart: 'removed' })).toBe(false);
+    expect(isRemovalFinishAnswer({ cli: 'removed' })).toBe(false);
+    expect(isRemovalFinishAnswer({ cli: 'removed', autostart: 'removed', extra: 1 })).toBe(false);
   });
 
   it('edit_form: every input kind validates, nulls are valid values, a wrong shape is refused', () => {

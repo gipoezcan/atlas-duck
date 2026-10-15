@@ -23,6 +23,9 @@ use atlas_duck_app_lib::commands::settings::{
     RetestOutcome, SettingsGet,
 };
 use atlas_duck_app_lib::credential::{PatTarget, Purpose};
+use atlas_duck_app_lib::removal::{
+    BackupAnswer, Choice, FinishAnswer, ItemDto, RemovalDto, RemovalError,
+};
 use atlas_duck_app_lib::wizard::{MSG_NEEDS_SECRET_SERVICE, WizardError, WizardState, WizardStep};
 use atlas_duck_atlassian::ConnClass;
 use atlas_duck_audit::AuditError;
@@ -538,6 +541,12 @@ fn command_errors() -> Vec<CommandError> {
         CommandError::CliInstall(InstallError::PathTooLong),
         CommandError::CliInstall(InstallError::Io),
         CommandError::CliInstall(InstallError::CliToml),
+        // M6 T28: "Prepare for removal" refusals, the kind only.
+        CommandError::Removal(RemovalError::NoProcedure),
+        CommandError::Removal(RemovalError::Unticked),
+        CommandError::Removal(RemovalError::TokenStored),
+        CommandError::Removal(RemovalError::Autostart),
+        CommandError::Removal(RemovalError::Recorded),
         // The T7 review H1 banner: its text is the core constant, put on the wire by Rust.
         CommandError::ReleaseBlocked,
         CommandError::Internal,
@@ -943,6 +952,77 @@ fn cli_install_answers() -> Vec<CliInstallAnswer> {
     .collect()
 }
 
+/// `removal_state` (M6 T28): before `begin`, and a checklist with every answer and a failed delete.
+fn removal_states() -> Vec<RemovalDto> {
+    let idle = RemovalDto {
+        active: false,
+        backup_made: false,
+        retention_days: 92,
+        legal_hold: false,
+        instances: vec![],
+    };
+    let item =
+        |alias: &str, product, identity: Option<&str>, deleted, error: Option<&str>, choice| {
+            ItemDto {
+                alias: alias.into(),
+                product,
+                origin: Some(format!("https://{alias}.example/{product}")),
+                identity: identity.map(str::to_owned),
+                token_deleted: deleted,
+                error: error.map(str::to_owned),
+                choice,
+            }
+        };
+    vec![
+        idle.clone(),
+        RemovalDto {
+            backup_made: true,
+            retention_days: 365,
+            legal_hold: true,
+            ..idle.clone()
+        },
+        RemovalDto {
+            active: true,
+            backup_made: true,
+            instances: vec![
+                item("work", "jira", Some("jdoe"), true, None, Choice::Pending),
+                item(
+                    "wiki",
+                    "confluence",
+                    Some("asmith"),
+                    true,
+                    None,
+                    Choice::Done,
+                ),
+                item("old", "jira", None, true, None, Choice::Skipped),
+                item(
+                    "stuck",
+                    "jira",
+                    Some("jdoe"),
+                    false,
+                    Some("keychain"),
+                    Choice::Pending,
+                ),
+            ],
+            ..idle
+        },
+    ]
+}
+
+fn removal_backup_answers() -> Vec<BackupAnswer> {
+    vec![BackupAnswer { saved: true }, BackupAnswer { saved: false }]
+}
+
+fn removal_finish_answers() -> Vec<FinishAnswer> {
+    let mut all = Vec::new();
+    for cli in ["removed", "already_on_path", "nothing"] {
+        for autostart in ["removed", "was_off"] {
+            all.push(FinishAnswer { cli, autostart });
+        }
+    }
+    all
+}
+
 /// `wizard_state` (M6 T23): a fresh start, a refused folder, the passphrase window, the instance
 /// step with an unconfirmed instance, the Secret Service stop.
 fn wizard_states() -> Vec<WizardState> {
@@ -1023,6 +1103,9 @@ fn all() -> Result<Vec<(&'static str, Value)>, serde_json::Error> {
         ("recent_item", value(&recent_items())?),
         ("redaction_context", value(&redaction_contexts())?),
         ("redaction_report", value(&redaction_reports())?),
+        ("removal_backup_answer", value(&removal_backup_answers())?),
+        ("removal_finish_answer", value(&removal_finish_answers())?),
+        ("removal_state", value(&removal_states())?),
         ("retest_outcome", value(&retest_outcomes())?),
         ("retry_started", value(&retry_started())?),
         ("settings_get", value(&settings_gets())?),

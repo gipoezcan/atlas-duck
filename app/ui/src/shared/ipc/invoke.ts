@@ -16,6 +16,10 @@ import type {
   RecentItem,
   RedactionOp,
   RedactionReport,
+  RemovalBackupAnswer,
+  RemovalChoice,
+  RemovalFinishAnswer,
+  RemovalState,
   RetestOutcome,
   SettingChange,
   SettingsGet,
@@ -38,6 +42,9 @@ import {
   isRawPage,
   isRecentItem,
   isRedactionReport,
+  isRemovalBackupAnswer,
+  isRemovalFinishAnswer,
+  isRemovalState,
   isRetestOutcome,
   isSettingsGet,
   isSettingsView,
@@ -219,6 +226,31 @@ export function cliInstall(): Promise<CliInstallAnswer> {
 /** Removes what `cliInstall` wrote and `cli.toml`. */
 export function cliUninstall(): Promise<CliInstallAnswer> {
   return call('cli_uninstall', {}, isCliInstallAnswer);
+}
+
+/** "Prepare for removal" (12.5): the checklist of this process (`active: false` before `begin`). */
+export function removalState(): Promise<RemovalState> {
+  return call('removal_state', {}, isRemovalState);
+}
+
+/** Step 1: Rust's folder dialog and a full backup there (no token in it); the page names no path. */
+export function removalBackup(): Promise<RemovalBackupAnswer> {
+  return call('removal_backup', {}, isRemovalBackupAnswer);
+}
+
+/** Step 2: Rust confirms natively, then deletes the stored tokens; answers the checklist. */
+export function removalBegin(): Promise<RemovalState> {
+  return call('removal_begin', {}, isRemovalState);
+}
+
+/** Ticks an instance's revoke step as done or skipped (or back to pending). */
+export function removalMark(alias: string, choice: RemovalChoice): Promise<RemovalState> {
+  return call('removal_mark', { alias, choice }, isRemovalState);
+}
+
+/** Steps 3 and 4: refused until every instance is ticked or skipped; Rust confirms natively. */
+export function removalFinish(): Promise<RemovalFinishAnswer> {
+  return call('removal_finish', {}, isRemovalFinishAnswer);
 }
 
 /** The setup window's whole state (T23): Rust decides the step, the page renders it. */

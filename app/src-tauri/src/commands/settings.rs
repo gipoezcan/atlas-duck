@@ -37,8 +37,11 @@ use crate::cli_install::{
     self, APP_CHANGE_KEY, Inputs, InstallError, Kind, Layout, PlatformOps, SystemOps,
 };
 use crate::credential::{self, PatOpenError};
+use crate::removal::{
+    self, BackupAnswer, Choice, FinishAnswer, PluginAutostart, RemovalDto, RemovalState, Retention,
+};
 use crate::sandbox_probe::{floor_label, mode_label, probe_id_name};
-use crate::state::AppState;
+use crate::state::{AppState, ServeSlot};
 use crate::ui_sink::emit_settings_changed;
 use crate::windows::WindowError;
 
@@ -284,6 +287,49 @@ pub struct CliInstallArgs {}
 #[serde(deny_unknown_fields)]
 pub struct CliUninstallArgs {}
 
+/// `choice` of `removal_mark`: `pending`, `done` or `skipped`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChoiceDto(pub Choice);
+
+impl<'de> Deserialize<'de> for ChoiceDto {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match text(d, "choice")?.as_str() {
+            "pending" => Ok(ChoiceDto(Choice::Pending)),
+            "done" => Ok(ChoiceDto(Choice::Done)),
+            "skipped" => Ok(ChoiceDto(Choice::Skipped)),
+            _ => Err(refuse("choice")),
+        }
+    }
+}
+
+/// `removal_state {}` (read-only).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalStateArgs {}
+
+/// `removal_backup {}`: no key. Rust opens its own folder dialog; the webview names no path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalBackupArgs {}
+
+/// `removal_begin {}`: no key (Rust confirms natively, then deletes the stored tokens).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalBeginArgs {}
+
+/// `removal_mark {alias, choice}`: the answer for one instance's revoke step.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalMarkArgs {
+    pub alias: Alias,
+    pub choice: ChoiceDto,
+}
+
+/// `removal_finish {}`: no key (Rust confirms natively, records, then removes).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemovalFinishArgs {}
+
 // ---------- responses ----------
 
 /// One extra confinement layer the probe saw (`landlock`, ...): its name and whether it is on.
@@ -375,7 +421,7 @@ pub const OUTCOME_REMOVED: &str = "removed";
 pub const OUTCOME_ALREADY_ON_PATH: &str = "already_on_path";
 
 /// The layout of this machine: known folders, `$APPIMAGE`, the running binary.
-fn this_machine() -> Result<Layout, InstallError> {
+pub fn this_machine() -> Result<Layout, InstallError> {
     Layout::resolve(&Inputs::detect()?)
 }
 
@@ -635,6 +681,7 @@ pub fn failure_class(e: &CommandError) -> Option<(String, Option<String>)> {
         CommandError::Admin(a) => Some(a.to_string()),
         CommandError::Settings(s) => Some(s.to_string()),
         CommandError::CliInstall(c) => Some(c.to_string()),
+        CommandError::Removal(r) => Some(r.to_string()),
         _ => None,
     };
     Some((e.to_string(), inner))
@@ -824,6 +871,13 @@ pub async fn credential_window_open<R: Runtime>(
     args: Args<CredentialWindowOpenArgs>,
 ) -> Result<(), CommandError> {
     let Args(CredentialWindowOpenArgs { alias, purpose }) = args;
+    // T28 (T20 m-9): not while a removal call deletes tokens (a token entered then would outlive
+    // the delete; `removal_finish` looks again before it removes anything).
+    if app.try_state::<RemovalState>().is_some_and(|r| r.busy()) {
+        let response = Err(CommandError::Busy);
+        note_failure(&response);
+        return finish(&app, response);
+    }
     let response = match core(&app) {
         Ok(core) => {
             let (admin, handle) = (core.instances(), app.clone());
@@ -920,6 +974,208 @@ pub async fn prune_backlog_now<R: Runtime>(
         emit_settings_changed(&app);
     }
     finish(&app, response)
+}
+
+// ---------- "Prepare for removal" (§12.5, M6 T28) ----------
+
+/// plan text (T28): the title of the folder dialog the backup bundle is written into.
+const BACKUP_DIALOG_TITLE: &str = "Choose the folder for the atlas-duck backup";
+
+/// What the removal commands need of the serving core.
+struct Served {
+    instances: Arc<dyn InstanceAdmin>,
+    settings: Arc<dyn SettingsAdmin>,
+    confirmer: Arc<dyn atlas_duck_core::NativeConfirmer>,
+}
+
+fn served<R: Runtime>(app: &AppHandle<R>) -> Result<Served, CommandError> {
+    let state = app
+        .try_state::<ServeSlot>()
+        .and_then(|slot| slot.get().cloned())
+        .ok_or(CommandError::NotReady)?;
+    let core = state.core.get().cloned().ok_or(CommandError::NotReady)?;
+    let confirmer = state.confirmer().ok_or(CommandError::NotReady)?;
+    Ok(Served {
+        instances: core.instances(),
+        settings: core.settings(),
+        confirmer,
+    })
+}
+
+/// The retention facts beside the backup offer (§12.5 step 1).
+async fn retention_of(settings: &Arc<dyn SettingsAdmin>) -> Result<Retention, CommandError> {
+    let settings = settings.clone();
+    blocking(move || {
+        let view = settings.view();
+        Ok(Retention {
+            days: view.retention_days,
+            legal_hold: view.legal_hold,
+        })
+    })
+    .await
+}
+
+/// The credential window is open for a token (add or replace).
+fn pat_window_open<R: Runtime>(app: &AppHandle<R>) -> bool {
+    credential::current_purpose(app).is_some_and(|p| p.pat_target().is_some())
+}
+
+/// The end of every removal call: logs a failure by kind and answers.
+fn conclude_removal<R: Runtime, T: Serialize>(
+    app: &AppHandle<R>,
+    response: Result<T, CommandError>,
+    changed: bool,
+) -> Result<T, CommandError> {
+    note_failure(&response);
+    if changed {
+        // Whatever the answer: tokens may be deleted and the table has changed (T25 I-1).
+        emit_settings_changed(app);
+    }
+    finish(app, response)
+}
+
+/// `removal_state {}` (§12.5): the checklist of this process (`active: false` before `begin`).
+#[tauri::command]
+pub async fn removal_state<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RemovalStateArgs>,
+) -> Result<RemovalDto, CommandError> {
+    let Args(RemovalStateArgs {}) = args;
+    let response = async {
+        let served = served(&app)?;
+        let retention = retention_of(&served.settings).await?;
+        let state = app
+            .try_state::<RemovalState>()
+            .ok_or(CommandError::NotReady)?;
+        Ok::<_, CommandError>(state.dto(retention))
+    }
+    .await;
+    conclude_removal(&app, response, false)
+}
+
+/// `removal_backup {}` (§12.5 step 1): Rust's folder dialog, then `Store::backup` into a new bundle
+/// directory there (no token in it, §8.10; the store logs `BACKUP`). A cancelled dialog is
+/// `saved: false`. The webview supplies no path.
+#[tauri::command]
+pub async fn removal_backup<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RemovalBackupArgs>,
+) -> Result<BackupAnswer, CommandError> {
+    let Args(RemovalBackupArgs {}) = args;
+    let handle = app.clone();
+    let response = match served(&app) {
+        Ok(_) => {
+            blocking(move || {
+                let state = handle
+                    .try_state::<RemovalState>()
+                    .ok_or(CommandError::NotReady)?;
+                removal::backup(&state, || pick_folder_and_back_up(&handle))
+            })
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    conclude_removal(&app, response, false)
+}
+
+/// The folder dialog and the backup into it. Blocks until the user answers: the blocking pool only.
+fn pick_folder_and_back_up<R: Runtime>(app: &AppHandle<R>) -> Result<bool, CommandError> {
+    use atlas_duck_audit::types::RustChosenPath;
+    use tauri_plugin_dialog::DialogExt;
+    let store = app
+        .try_state::<ServeSlot>()
+        .and_then(|slot| slot.get().and_then(|s| s.open_store()))
+        .ok_or(CommandError::NotReady)?;
+    let Some(chosen) = app
+        .dialog()
+        .file()
+        .set_title(BACKUP_DIALOG_TITLE)
+        .blocking_pick_folder()
+    else {
+        return Ok(false);
+    };
+    let path = chosen.into_path().map_err(|_| CommandError::Internal)?;
+    store
+        .backup(RustChosenPath::from_native_dialog(path))
+        .map_err(|e| CommandError::Settings(SettingsError::Audit(e)))?;
+    Ok(true)
+}
+
+/// `removal_begin {}` (§12.5 step 2): native confirmation, then the stored tokens are deleted
+/// (`CREDENTIAL_CHANGED` per instance, before each keychain delete); answers the checklist.
+#[tauri::command]
+pub async fn removal_begin<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RemovalBeginArgs>,
+) -> Result<RemovalDto, CommandError> {
+    let Args(RemovalBeginArgs {}) = args;
+    let response = async {
+        let served = served(&app)?;
+        let retention = retention_of(&served.settings).await?;
+        let state = app
+            .try_state::<RemovalState>()
+            .ok_or(CommandError::NotReady)?;
+        removal::begin(
+            &state,
+            served.instances,
+            served.confirmer,
+            || pat_window_open(&app),
+            retention,
+        )
+        .await
+    }
+    .await;
+    conclude_removal(&app, response, true)
+}
+
+/// `removal_mark {alias, choice}` (§12.5 step 2): ticks an instance as revoked or marks it skipped.
+#[tauri::command]
+pub async fn removal_mark<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RemovalMarkArgs>,
+) -> Result<RemovalDto, CommandError> {
+    let Args(RemovalMarkArgs { alias, choice }) = args;
+    let response = async {
+        let served = served(&app)?;
+        let retention = retention_of(&served.settings).await?;
+        let state = app
+            .try_state::<RemovalState>()
+            .ok_or(CommandError::NotReady)?;
+        removal::mark(&state, alias.as_str(), choice.0, retention)
+    }
+    .await;
+    conclude_removal(&app, response, false)
+}
+
+/// `removal_finish {}` (§12.5 steps 3 and 4): refused until every instance is ticked or skipped;
+/// native confirmation; one `CONFIG_CHANGED` with the choices; then autostart, the PATH entry, link
+/// or wrapper, launcher and `cli.toml` go. The KEK, the anchors and the DB stay.
+#[tauri::command]
+pub async fn removal_finish<R: Runtime>(
+    app: AppHandle<R>,
+    args: Args<RemovalFinishArgs>,
+) -> Result<FinishAnswer, CommandError> {
+    let Args(RemovalFinishArgs {}) = args;
+    let response = async {
+        let served = served(&app)?;
+        let layout = blocking(|| Ok(this_machine())).await?;
+        let state = app
+            .try_state::<RemovalState>()
+            .ok_or(CommandError::NotReady)?;
+        removal::finish(
+            &state,
+            served.instances,
+            served.settings,
+            served.confirmer,
+            Arc::new(PluginAutostart(app.clone())),
+            Arc::new(SystemOps),
+            layout,
+            || pat_window_open(&app),
+        )
+        .await
+    }
+    .await;
+    conclude_removal(&app, response, true)
 }
 
 #[cfg(test)]

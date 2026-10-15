@@ -26,6 +26,10 @@ import type {
   RedactionContext,
   RedactionOp,
   RedactionReport,
+  RemovalBackupAnswer,
+  RemovalFinishAnswer,
+  RemovalItem,
+  RemovalState,
   RequestDetail,
   RetestOutcome,
   SettingsGet,
@@ -357,6 +361,35 @@ export const isCliInstallAnswer = (v: unknown): v is CliInstallAnswer =>
     ),
   });
 
+const isRemovalItem = (v: unknown): v is RemovalItem =>
+  fields(v, {
+    alias: isStr,
+    product: oneOf('jira', 'confluence'),
+    origin: strOrNull,
+    identity: strOrNull,
+    token_deleted: isBool,
+    error: strOrNull,
+    choice: oneOf('pending', 'done', 'skipped'),
+  }) && Object.keys(v).length === 7;
+
+export const isRemovalState = (v: unknown): v is RemovalState =>
+  fields(v, {
+    active: isBool,
+    backup_made: isBool,
+    retention_days: isNum,
+    legal_hold: isBool,
+    instances: arrayOf(isRemovalItem),
+  }) && Object.keys(v).length === 5;
+
+export const isRemovalBackupAnswer = (v: unknown): v is RemovalBackupAnswer =>
+  fields(v, { saved: isBool }) && Object.keys(v).length === 1;
+
+export const isRemovalFinishAnswer = (v: unknown): v is RemovalFinishAnswer =>
+  fields(v, {
+    cli: oneOf('removed', 'already_on_path', 'nothing'),
+    autostart: oneOf('removed', 'was_off'),
+  }) && Object.keys(v).length === 2;
+
 const isWizardError = (v: unknown): v is WizardError =>
   fields(v, { class: isStr, text: strOrNull });
 
@@ -403,6 +436,7 @@ export function toCommandError(raw: unknown): CommandError {
       case 'admin':
       case 'settings':
       case 'cli_install':
+      case 'removal':
         if (isCoreError(raw.error)) return { kind: raw.kind, error: raw.error };
         break;
       case 'release_blocked':
