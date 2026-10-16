@@ -1578,6 +1578,74 @@ async fn host_call_params_over_a_megabyte_are_rejected() -> TestResult {
     Ok(())
 }
 
+/// T10 review I-2 and B-1: a `confluence.page.get` host call commits its `user_resolutions` map
+/// in `SCRIPT_CALL` (`{}` until Task 11's lookups) and gets the page with its Markdown body,
+/// converted with that map; a page whose Markdown would pass `max_call_result_mb` stops
+/// converting there and is rejected `result_too_large` in the script.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn confluence_page_get_host_call_converts_with_the_committed_map() -> TestResult {
+    use common::confluence::{amplified_storage, mount_page, page_with_storage};
+    let storage = r#"<p>Owner <ac:link><ri:user ri:userkey="8a7f808a1"/></ac:link>.</p><ac:structured-macro ac:name="toc"/>"#;
+    let get = |call: u64, id: &str| host_call(call, "confluence.page.get", json!({ "id": id }));
+    let runner = FakeScriptRunner::new(vec![
+        ScriptPlan::new(vec![get(1, "65537")], result_end(json!(1))),
+        ScriptPlan::new(vec![get(1, "65538")], result_end(json!(1))),
+    ]);
+    let h = Harness::builder()
+        .confluence("wiki")
+        .scripts(runner.clone())
+        .start()
+        .await?;
+    let mock = h.mock("wiki").ok_or("no wiki mock")?;
+    let page = page_with_storage(storage);
+    mount_page(mock, "65537", &page).await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let markdown = atlas_duck_convert::storage_to_markdown(storage, &Default::default()).0;
+    assert!(markdown.contains("@user:8a7f808a1"), "{markdown}");
+    match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => {
+            assert_eq!(
+                v["body"],
+                json!({ "format": "markdown", "value": markdown })
+            );
+            let mut rest = v.clone();
+            let mut sent = page.clone();
+            for x in [&mut rest, &mut sent] {
+                if let Some(o) = x.as_object_mut() {
+                    o.remove("body");
+                }
+            }
+            assert_eq!(rest, sent, "everything but the body as sent");
+        }
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(call["user_resolutions"], json!({}));
+    assert_eq!(call["rejection"], Value::Null);
+
+    // 2 MiB of Markdown against a 1 MiB call result limit.
+    mount_page(
+        mock,
+        "65538",
+        &page_with_storage(&amplified_storage(21_000)),
+    )
+    .await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_call_result_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    match runner.results().as_slice() {
+        [_, HostCallResult::Rejected { class, .. }] => assert_eq!(class, "result_too_large"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(call["rejection"], "result_too_large");
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fetch_cap_overrun_is_a_script_limit_inside_the_script() -> TestResult {
     let mut call = host_call(

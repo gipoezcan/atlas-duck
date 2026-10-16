@@ -23,4 +23,7 @@ pub use parse::{
     Element, MAX_DEPTH, Node, Ns, StorageDoc, StorageReject, StorageUsers, check_storage_body,
     construct_spans, parse, storage_constructs, storage_user_refs,
 };
-pub use to_md::{ConversionReport, KNOWN_MACROS, LostCounts, UserResolutions, storage_to_markdown};
+pub use to_md::{
+    ConversionReport, KNOWN_MACROS, LostCounts, MarkdownTooLarge, UserResolutions,
+    storage_to_markdown, storage_to_markdown_within,
+};

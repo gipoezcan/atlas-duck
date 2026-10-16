@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use atlas_duck_convert::storage::KNOWN_MACROS;
-use atlas_duck_convert::{ConversionReport, LostCounts, UserResolutions, storage_to_markdown};
+use atlas_duck_convert::{
+    ConversionReport, LostCounts, MarkdownTooLarge, UserResolutions, storage_to_markdown,
+    storage_to_markdown_within,
+};
 use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -763,11 +766,211 @@ fn time_lozenges_keep_their_date() -> TestResult {
             "<table><tbody><tr><th>Due</th></tr><tr><td><time datetime=\"2026-10-20\"/></td>\
             </tr></tbody></table>"
         ),
-        "| Due        |\n| ---------- |\n| 2026-10-20 |\n"
+        "| Due |\n| --- |\n| 2026-10-20 |\n"
     );
     assert_eq!(
         report("<p><time datetime=\"2026-10-20\"/></p>"),
         ConversionReport::default()
+    );
+    Ok(())
+}
+
+/// T10 review B-1: a table is written without padding, so a wide cell over many rows costs its
+/// own bytes once (`htmd` padded every row to it: rows × width, ~3 GiB for this page).
+#[test]
+fn wide_cell_table_converts_linearly() -> TestResult {
+    let storage = format!(
+        "<table><tbody><tr><th>{}</th></tr>{}</tbody></table>",
+        "w".repeat(64 * 1024),
+        "<tr><td>x</td></tr>".repeat(50_000)
+    );
+    let start = Instant::now();
+    let out = md(&storage);
+    assert!(
+        start.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(
+        out.len() < storage.len(),
+        "{} > {}",
+        out.len(),
+        storage.len()
+    );
+    let mut lines = out.lines();
+    assert_eq!(
+        lines.next(),
+        Some(format!("| {} |", "w".repeat(64 * 1024)).as_str())
+    );
+    assert_eq!(lines.next(), Some("| --- |"));
+    assert!(lines.all(|l| l == "| x |"), "every body row is unpadded");
+    assert_eq!(out.lines().count(), 50_002);
+    Ok(())
+}
+
+/// T10 review B-1: the pipe table written by the converter (no padding, `| --- |`), for the
+/// table shapes Confluence writes and the edges of the header rule.
+#[test]
+fn tables_convert_without_padding() -> TestResult {
+    let row = |cells: &str| format!("<tr>{cells}</tr>");
+    let table = |rows: &str| format!("<table><tbody>{rows}</tbody></table>");
+    // A header row of `th`s.
+    assert_eq!(
+        md(&table(&format!(
+            "{}{}",
+            row("<th>H1</th><th>H2</th>"),
+            row("<td>a</td><td>b | c</td>")
+        ))),
+        "| H1 | H2 |\n| --- | --- |\n| a | b &#124; c |\n"
+    );
+    // Row headers: the first row (it holds a `th`) is the header, every cell is kept.
+    assert_eq!(
+        md(&table(&format!(
+            "{}{}",
+            row("<th>A</th><td>1</td>"),
+            row("<th>B</th><td>2</td>")
+        ))),
+        "| A | 1 |\n| --- | --- |\n| B | 2 |\n"
+    );
+    // `thead`; rows of uneven width get empty cells; an empty row is dropped.
+    assert_eq!(
+        md(
+            "<table><colgroup><col/><col/></colgroup><thead><tr><th>H1</th><th>H2</th></tr>\
+            </thead><tbody><tr><td>a</td></tr><tr><td>b</td><td>c</td><td>d</td></tr><tr></tr>\
+            </tbody></table>"
+        ),
+        "| H1 | H2 |  |\n| --- | --- | --- |\n| a |  |  |\n| b | c | d |\n"
+    );
+    // No header row of its own (a `th` further down): a header of empty cells.
+    assert_eq!(
+        md(&table(&format!(
+            "{}{}",
+            row("<td>a</td><td>b</td>"),
+            row("<th>c</th><td>d</td>")
+        ))),
+        "|  |  |\n| --- | --- |\n| a | b |\n| c | d |\n"
+    );
+    // A table without `th` or `thead` is its cells as paragraphs (as `htmd` writes it).
+    assert_eq!(md(&table(&row("<td>a</td><td>b</td>"))), "a\n\nb\n");
+    // A table in a cell is never a table; its cells run together in that cell.
+    assert_eq!(
+        md(&table(&format!(
+            "{}{}",
+            row("<th>h</th>"),
+            row(&format!("<td>{}</td>", table(&row("<th>x</th><td>y</td>"))))
+        ))),
+        "| h |\n| --- |\n| x  y |\n"
+    );
+    // A cell's paragraphs and line breaks are one line; the caption stands before the table.
+    assert_eq!(
+        md(&format!(
+            "<table><caption>Cap <b>x</b></caption><tbody>{}{}</tbody></table>",
+            row("<th>h</th>"),
+            row("<td><p>a</p><p>b|c<br/>d</p></td>")
+        )),
+        "Cap **x**\n\n| h |\n| --- |\n| a  b&#124;c\\ d |\n"
+    );
+    // What stands in a table outside its rows and cells is written before it.
+    assert_eq!(
+        md(&format!(
+            "<table>stray<tbody>{}<p>p</p></tbody></table>",
+            row("<th>h</th>")
+        )),
+        "stray\n\np\n\n| h |\n| --- |\n"
+    );
+    // An empty header cell, and a table without any cell.
+    assert_eq!(md(&table(&row("<th></th>"))), "|  |\n| --- |\n");
+    assert_eq!(md("<table><thead></thead></table>"), "");
+    // In a quote and in a list item, every line of the table keeps the prefix.
+    let t = table(&format!("{}{}", row("<th>h</th>"), row("<td>a</td>")));
+    assert_eq!(
+        md(&format!("<blockquote>{t}</blockquote>")),
+        "> | h |\n> | --- |\n> | a |\n"
+    );
+    assert_eq!(
+        md(&format!("<ul><li>{t}</li></ul>")),
+        "- | h |\n  | --- |\n  | a |\n"
+    );
+    // A code macro in a cell of a quoted table is inline code with `|` escaped.
+    let code = "<ac:structured-macro ac:name=\"code\"><ac:plain-text-body><![CDATA[a|b]]>\
+                </ac:plain-text-body></ac:structured-macro>";
+    assert_eq!(
+        md(&format!(
+            "<blockquote>{}</blockquote>",
+            table(&format!(
+                "{}{}",
+                row("<th>h</th>"),
+                row(&format!("<td>{code}</td>"))
+            ))
+        )),
+        "> | h |\n> | --- |\n> | `a\\|b` |\n"
+    );
+    Ok(())
+}
+
+/// T10 review B-1: `storage_to_markdown_within` stops once the Markdown would pass the budget,
+/// and is `storage_to_markdown` below it.
+#[test]
+fn markdown_budget_stops_the_conversion() -> TestResult {
+    let users = UserResolutions::new();
+    let page = std::fs::read_to_string(golden_dir().join("basics.xml"))?;
+    let full = storage_to_markdown(&page, &users);
+    let len = full.0.len();
+    assert_eq!(
+        storage_to_markdown_within(&page, &users, len),
+        Ok(full.clone())
+    );
+    assert_eq!(
+        storage_to_markdown_within(&page, &users, len - 1),
+        Err(MarkdownTooLarge)
+    );
+    // The fallback is held to the budget too.
+    let broken = format!("<p>{}", "word ".repeat(1000));
+    let fallback = storage_to_markdown(&broken, &users);
+    assert!(fallback.1.fallback);
+    assert_eq!(
+        storage_to_markdown_within(&broken, &users, fallback.0.len()),
+        Ok(fallback.clone())
+    );
+    assert_eq!(
+        storage_to_markdown_within(&broken, &users, 100),
+        Err(MarkdownTooLarge)
+    );
+    // A wide table over many rows (61 KiB of Markdown), against a smaller budget.
+    let table = format!(
+        "<table><tbody><tr><th>{}</th></tr>{}</tbody></table>",
+        "w".repeat(1024),
+        "<tr><td>x</td></tr>".repeat(10_000)
+    );
+    let full = storage_to_markdown(&table, &users).0.len();
+    assert!(storage_to_markdown_within(&table, &users, full).is_ok());
+    assert!(storage_to_markdown_within(&table, &users, 32 * 1024).is_err());
+    // Quotes 60 deep around many line breaks: every line gets the whole prefix. The writer's
+    // estimate stops it before `htmd` builds the quotes level by level.
+    let deep = format!(
+        "{}<p>{}</p>{}",
+        "<blockquote>".repeat(60),
+        "x<br/>".repeat(100_000),
+        "</blockquote>".repeat(60)
+    );
+    let start = Instant::now();
+    assert_eq!(
+        storage_to_markdown_within(&deep, &users, 1024 * 1024),
+        Err(MarkdownTooLarge)
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        start.elapsed()
+    );
+    // An empty body fits a budget of 0.
+    assert_eq!(
+        storage_to_markdown_within("", &users, 0),
+        Ok((
+            String::new(),
+            ConversionReport::default(),
+            UserResolutions::new()
+        ))
     );
     Ok(())
 }

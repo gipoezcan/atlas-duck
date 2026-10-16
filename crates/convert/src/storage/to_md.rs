@@ -28,6 +28,19 @@
 //! deep and as large as the input chooses (T3 review B-1). The look-alike pass runs as above.
 //! No mention is rendered, no user map is used and nothing is counted (`fallback` and `lossy`
 //! say so); U+FFFE and U+FFFF become U+FFFD.
+//!
+//! **Tables** never reach `htmd`, which pads every cell to the widest cell of its column (rows ×
+//! width bytes from a page of rows + width bytes; T10 review B-1). A table with a header (a `th`
+//! or `thead`, as `htmd` decides) outside any cell becomes a pipe table written here, unpadded:
+//! `htmd` converts its cells in one run of their own, each cell on one line (`|` as `&#124;`);
+//! any other table is written as the `<div>`s `htmd` makes of it.
+//!
+//! **Budget** ([`storage_to_markdown_within`]): the Markdown may not pass a byte budget. Before
+//! each `htmd` run, what the output holds beyond the text of the HTML (the fragments, and the
+//! prefix of the enclosing quotes and list items on every line) is held to [`ESTIMATE_FACTOR`]
+//! × the budget, as the writer estimates it; after `htmd` every stage is measured exactly.
+//! Either check stops the conversion with [`MarkdownTooLarge`]. What `htmd` makes of the HTML
+//! itself is bounded by the input, not by the budget (a few times the body; T10 review m-3).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,6 +63,16 @@ pub struct LostCounts {
     pub links: u64,
     pub layouts: u64,
 }
+
+/// [`storage_to_markdown_within`]: the Markdown would pass the byte budget (T10 review B-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownTooLarge;
+
+/// How far the writer's estimate ([`Writer::estimate`]) may pass the budget before `htmd` runs.
+/// The fragments are in the output as they are and the prefixes are counted at most twice per
+/// line, so a page within the budget never reaches this multiple, and `htmd` never builds
+/// quotes or list items of many times the budget (60 nested quotes give every line 120 bytes).
+const ESTIMATE_FACTOR: usize = 4;
 
 /// What [`storage_to_markdown`] reduced (Δ1).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -125,8 +148,9 @@ fn ac_rule(local: &str) -> AcRule {
     }
 }
 
-/// XHTML elements written back by name; any other becomes a `<span>`.
-const PASS_HTML: [&str; 63] = [
+/// XHTML elements written back by name; any other becomes a `<span>`. `table` is written by
+/// [`Writer::table`].
+const PASS_HTML: [&str; 62] = [
     "a",
     "abbr",
     "address",
@@ -178,7 +202,6 @@ const PASS_HTML: [&str; 63] = [
     "sub",
     "summary",
     "sup",
-    "table",
     "tbody",
     "td",
     "tfoot",
@@ -212,11 +235,33 @@ const CDATA_CLOSE: &str = "]]>";
 /// that is no usable username (empty, longer than 255 chars, a control character) is returned
 /// as given but rendered `@user:<key>` and counted unresolved. The fallback uses no map and
 /// returns an empty one.
-/// Pure and deterministic; never panics.
+/// Pure and deterministic; never panics. No budget: a caller converting fetched content uses
+/// [`storage_to_markdown_within`].
 pub fn storage_to_markdown(
     storage: &str,
     users: &UserResolutions,
 ) -> (String, ConversionReport, UserResolutions) {
+    // No check trips at `usize::MAX` (the estimate saturates, no string is that long).
+    storage_to_markdown_within(storage, users, usize::MAX).unwrap_or_else(|MarkdownTooLarge| {
+        let report = ConversionReport {
+            lossy: true,
+            fallback: true,
+            ..ConversionReport::default()
+        };
+        (String::new(), report, UserResolutions::new())
+    })
+}
+
+/// [`storage_to_markdown`] with a budget (T10 review B-1): `Err(MarkdownTooLarge)` once the
+/// Markdown would be longer than `max_bytes` (the final newline included), before any stage
+/// builds much more than that (the estimate before `htmd` is held to [`ESTIMATE_FACTOR`] ×
+/// `max_bytes`, every later stage to `max_bytes` exactly). `Ok` is exactly what
+/// [`storage_to_markdown`] returns.
+pub fn storage_to_markdown_within(
+    storage: &str,
+    users: &UserResolutions,
+    max_bytes: usize,
+) -> Result<(String, ConversionReport, UserResolutions), MarkdownTooLarge> {
     let doc = parse(storage);
     if !doc.xml_ok {
         let report = ConversionReport {
@@ -224,7 +269,11 @@ pub fn storage_to_markdown(
             fallback: true,
             ..ConversionReport::default()
         };
-        return (fallback(storage), report, UserResolutions::new());
+        return Ok((
+            fallback(storage, max_bytes)?,
+            report,
+            UserResolutions::new(),
+        ));
     }
     let used: UserResolutions = user_refs(&doc)
         .keys
@@ -235,10 +284,13 @@ pub fn storage_to_markdown(
             (k, v)
         })
         .collect();
-    let mut w = Writer::new(&used);
+    let mut w = Writer::new(&used, max_bytes.saturating_mul(ESTIMATE_FACTOR));
     w.nodes(&doc.nodes);
+    if w.over() {
+        return Err(MarkdownTooLarge);
+    }
     let lost = lost_counts(&doc.nodes);
-    let md = finish(&w.html, &w.frags);
+    let md = finish(&w.html, &w.frags, max_bytes)?;
     let report = ConversionReport {
         lossy: lost != LostCounts::default(),
         lost,
@@ -246,7 +298,7 @@ pub fn storage_to_markdown(
         unresolved_users: w.unresolved,
         fallback: false,
     };
-    (md, report, used)
+    Ok((md, report, used))
 }
 
 /// A piece of Markdown this module writes in place of a token.
@@ -261,7 +313,17 @@ enum Frag {
         language: Option<String>,
         body: String,
     },
+    /// A pipe table, one line per entry (an empty entry is a blank line). Its cells hold the
+    /// tokens of their own fragments; [`expand_tables`] puts the lines in place before the
+    /// tokens are replaced.
+    Table { lines: Vec<String> },
 }
+
+/// The line prefix `htmd` gives the content of a bulleted list item (`- `); an ordered item's is
+/// its marker (`<digits>. `).
+const BULLET_INDENT: usize = 2;
+/// The line prefix of a quote (`> `).
+const QUOTE_INDENT: usize = 2;
 
 /// Writes the HTML for `htmd` and collects the fragments.
 struct Writer<'u> {
@@ -271,10 +333,23 @@ struct Writer<'u> {
     unknown: Vec<String>,
     seen: BTreeSet<String>,
     unresolved: u64,
+    /// Enclosing table cells (a table inside one is never a pipe table, as with `htmd`).
+    cells: usize,
+    /// The width of the line prefix `htmd` gives what is written now (quotes, list items).
+    indent: usize,
+    /// The marker width of an item of the list written now.
+    item: usize,
+    /// What the Markdown holds beyond the HTML `htmd` gets: the fragments' bytes and every
+    /// line's prefix.
+    estimate: usize,
+    /// The estimate at which the conversion stops ([`ESTIMATE_FACTOR`] × the budget).
+    ceiling: usize,
+    /// The estimate passed `ceiling`: nothing more is written.
+    stopped: bool,
 }
 
 impl<'u> Writer<'u> {
-    fn new(users: &'u UserResolutions) -> Self {
+    fn new(users: &'u UserResolutions, ceiling: usize) -> Self {
         Writer {
             users,
             html: String::new(),
@@ -282,10 +357,40 @@ impl<'u> Writer<'u> {
             unknown: Vec::new(),
             seen: BTreeSet::new(),
             unresolved: 0,
+            cells: 0,
+            indent: 0,
+            item: BULLET_INDENT,
+            estimate: 0,
+            ceiling,
+            stopped: false,
         }
     }
 
+    /// The estimate passed the ceiling (sticky).
+    fn over(&mut self) -> bool {
+        self.stopped |= self.estimate > self.ceiling;
+        self.stopped
+    }
+
+    /// `n` lines, each with the current prefix.
+    fn lines(&mut self, n: usize) {
+        self.estimate = self.estimate.saturating_add(n.saturating_mul(self.indent));
+    }
+
     fn token(&mut self, frag: Frag) {
+        let bytes = match &frag {
+            Frag::Inline { md, .. } => md.len(),
+            // The body, its fences (as long as its longest backtick run) and the language.
+            Frag::Code { body, .. } => {
+                self.lines(body.matches('\n').count().saturating_add(2));
+                body.len().saturating_add(2 * MAX_LANGUAGE)
+            }
+            Frag::Table { lines } => {
+                self.lines(lines.len());
+                lines.iter().map(String::len).sum()
+            }
+        };
+        self.estimate = self.estimate.saturating_add(bytes);
         push_token(&mut self.html, self.frags.len());
         self.frags.push(frag);
     }
@@ -296,6 +401,7 @@ impl<'u> Writer<'u> {
 
     /// A fragment on its own lines.
     fn block(&mut self, frag: Frag) {
+        self.lines(2);
         self.html.push_str("<div>");
         self.token(frag);
         self.html.push_str("</div>");
@@ -315,6 +421,8 @@ impl<'u> Writer<'u> {
     }
 
     fn text(&mut self, t: &str) {
+        // A line break kept in the output (a `<pre>`) has a prefix of its own.
+        self.lines(t.matches('\n').count());
         push_html_text(&mut self.html, t);
     }
 
@@ -332,6 +440,9 @@ impl<'u> Writer<'u> {
     }
 
     fn element(&mut self, e: &Element) {
+        if self.over() {
+            return;
+        }
         match e.ns {
             Ns::Html => self.html_element(e),
             Ns::Ac => self.ac(e),
@@ -359,8 +470,33 @@ impl<'u> Writer<'u> {
 
     fn html_element(&mut self, e: &Element) {
         let name = e.local.to_ascii_lowercase();
-        let constructs = has_construct(&e.children);
+        if BREAK_HTML.contains(&name.as_str()) {
+            self.lines(2);
+        }
+        let indent = match name.as_str() {
+            "blockquote" => QUOTE_INDENT,
+            "li" => self.item,
+            _ => 0,
+        };
+        let item = self.item;
         match name.as_str() {
+            "ul" => self.item = BULLET_INDENT,
+            "ol" => {
+                let items = e.child_elements().count().max(1);
+                self.item = items.to_string().len() + 2;
+            }
+            _ => {}
+        }
+        self.indent += indent;
+        self.html_element_body(&name, e);
+        self.indent -= indent;
+        self.item = item;
+    }
+
+    fn html_element_body(&mut self, name: &str, e: &Element) {
+        let constructs = has_construct(&e.children);
+        match name {
+            "table" => self.table(e),
             // A Confluence date lozenge (`<time datetime="2026-10-20"/>`) has no text: its
             // date is written as text (T3 review I-2; not counted lost).
             "time" if !constructs && !has_text(&e.children) => {
@@ -675,6 +811,8 @@ impl<'u> Writer<'u> {
                 plain_text(&c.children, &mut t);
                 t.trim() == "complete"
             });
+        self.lines(2);
+        self.indent += BULLET_INDENT;
         self.html.push_str("<li>");
         self.inline(if done { "[x] " } else { "[ ] " }.to_owned(), None);
         for n in &e.children {
@@ -685,7 +823,255 @@ impl<'u> Writer<'u> {
             }
         }
         self.html.push_str("</li>");
+        self.indent -= BULLET_INDENT;
     }
+
+    /// An XHTML `<table>`. One with a header ([`explicit_header`]) outside any cell is a pipe
+    /// table ([`Writer::pipe_table`]); any other is written as its parts ([`Writer::table_parts`]).
+    fn table(&mut self, e: &Element) {
+        if self.cells == 0 && explicit_header(&e.children) && self.pipe_table(e) {
+            return;
+        }
+        self.table_parts(e);
+    }
+
+    /// A table `htmd` does not write as a table: a `<div>`, its sections, rows, cells and
+    /// captions `<div>`s too (the blocks `htmd` makes of them), `colgroup` and `col` dropped
+    /// (they hold no content), anything else as it is.
+    fn table_parts(&mut self, e: &Element) {
+        if self.over() {
+            return;
+        }
+        self.lines(2);
+        self.html.push_str("<div>");
+        for n in &e.children {
+            match n {
+                Node::Element(c) => match table_part(c) {
+                    Some(TablePart::Columns) => {}
+                    Some(TablePart::Cell) => self.cell(c),
+                    Some(_) => self.table_parts(c),
+                    None => self.element(c),
+                },
+                n => self.node(n),
+            }
+        }
+        self.html.push_str("</div>");
+    }
+
+    /// The content of a table cell (or caption) as a block.
+    fn cell(&mut self, c: &Element) {
+        self.cells += 1;
+        self.lines(2);
+        self.html.push_str("<div>");
+        self.nodes(&c.children);
+        self.html.push_str("</div>");
+        self.cells -= 1;
+    }
+
+    /// A pipe table without padding (T10 review B-1): the captions (each one line, then a blank
+    /// line), the header row, `| --- |` per column, the body rows; every row has as many cells as
+    /// the widest one. The header is the first row of the first `thead`, or else the first row
+    /// when it holds a `th`, or else a row of empty cells; every other row with a cell is a body
+    /// row, in document order. Rows are the `tr`s of the table and of its sections (a section
+    /// without a `tr` but with cells is one row); cells are the `td`s and `th`s of a row. What
+    /// stands in the table outside those (text, other elements) is written before the table, as
+    /// an HTML parser would move it. `htmd` converts the cells and captions in one run of their
+    /// own; a cell's text is trimmed, its line breaks become spaces and `|` becomes `&#124;`.
+    /// `false` (nothing written) for a table without a cell.
+    fn pipe_table(&mut self, e: &Element) -> bool {
+        let mut captions: Vec<&Element> = Vec::new();
+        let mut head: Vec<&Element> = Vec::new();
+        let mut body: Vec<&Element> = Vec::new();
+        let mut strays: Vec<&Node> = Vec::new();
+        for n in &e.children {
+            let Node::Element(c) = n else {
+                if !is_blank(n) {
+                    strays.push(n);
+                }
+                continue;
+            };
+            match table_part(c) {
+                Some(TablePart::Caption) => captions.push(c),
+                Some(TablePart::Columns) => {}
+                Some(TablePart::Head) => section_rows(c, &mut head, &mut strays),
+                Some(TablePart::Section) => section_rows(c, &mut body, &mut strays),
+                Some(TablePart::Row) => body.push(c),
+                Some(TablePart::Cell) | None => strays.push(n),
+            }
+        }
+        let first_has_th = body.first().is_some_and(|r| r.child_elements().any(is_th));
+        let (header, rest): (Option<&Element>, Vec<&Element>) = match head.split_first() {
+            Some((first, more)) => (Some(*first), more.iter().chain(&body).copied().collect()),
+            None if first_has_th => (
+                body.first().copied(),
+                body.iter().skip(1).copied().collect(),
+            ),
+            None => (None, body),
+        };
+        let header: Vec<&Element> = header
+            .map(|h| row_cells(h, &mut strays))
+            .unwrap_or_default();
+        let rows: Vec<Vec<&Element>> = rest
+            .into_iter()
+            .map(|r| row_cells(r, &mut strays))
+            .filter(|cells| !cells.is_empty())
+            .collect();
+        let columns = rows.iter().map(Vec::len).fold(header.len(), usize::max);
+        if columns == 0 {
+            return false;
+        }
+        for n in strays {
+            self.node(n);
+        }
+        // The captions and cells in one `htmd` run, each followed by a separator.
+        let outer = std::mem::take(&mut self.html);
+        let indent = std::mem::take(&mut self.indent);
+        let all = captions.iter().chain(&header).chain(rows.iter().flatten());
+        for c in all {
+            self.cell(c);
+            self.html.push_str("<div>");
+            self.html.push_str(CELL_END);
+            self.html.push_str("</div>");
+        }
+        let batch = std::mem::replace(&mut self.html, outer);
+        self.indent = indent;
+        if self.over() {
+            return true;
+        }
+        let md = html_to_md(&batch);
+        let mut texts = md.split(CELL_END).map(cell_text);
+        let mut next = || texts.next().unwrap_or_default();
+        let mut lines: Vec<String> = Vec::new();
+        for _ in &captions {
+            let caption = next();
+            if !caption.is_empty() {
+                lines.push(caption);
+            }
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        let header: Vec<String> = header.iter().map(|_| next()).collect();
+        lines.push(pipe_row(&header, columns));
+        lines.push(pipe_row(&vec!["---".to_owned(); columns], columns));
+        for row in &rows {
+            let cells: Vec<String> = row.iter().map(|_| next()).collect();
+            lines.push(pipe_row(&cells, columns));
+        }
+        self.block(Frag::Table { lines });
+        true
+    }
+}
+
+/// The parts of a table, by XHTML element name.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TablePart {
+    Caption,
+    Columns,
+    Head,
+    Section,
+    Row,
+    Cell,
+}
+
+fn table_part(e: &Element) -> Option<TablePart> {
+    if e.ns != Ns::Html {
+        return None;
+    }
+    match e.local.to_ascii_lowercase().as_str() {
+        "caption" => Some(TablePart::Caption),
+        "colgroup" | "col" => Some(TablePart::Columns),
+        "thead" => Some(TablePart::Head),
+        "tbody" | "tfoot" => Some(TablePart::Section),
+        "tr" => Some(TablePart::Row),
+        "td" | "th" => Some(TablePart::Cell),
+        _ => None,
+    }
+}
+
+fn is_th(e: &Element) -> bool {
+    e.ns == Ns::Html && e.local.eq_ignore_ascii_case("th")
+}
+
+fn is_blank(n: &Node) -> bool {
+    matches!(n, Node::Text(t) if t.trim().is_empty())
+}
+
+/// The cells of a table row; anything else in it goes to `strays`.
+fn row_cells<'e>(r: &'e Element, strays: &mut Vec<&'e Node>) -> Vec<&'e Element> {
+    let mut cells = Vec::new();
+    for n in &r.children {
+        match n {
+            Node::Element(c) if table_part(c) == Some(TablePart::Cell) => cells.push(c),
+            n if is_blank(n) => {}
+            n => strays.push(n),
+        }
+    }
+    cells
+}
+
+/// The rows of a table section: its `tr`s, or the section itself when it holds cells but no
+/// `tr`; anything else in it goes to `strays`.
+fn section_rows<'e>(s: &'e Element, rows: &mut Vec<&'e Element>, strays: &mut Vec<&'e Node>) {
+    let has_rows = s
+        .child_elements()
+        .any(|c| table_part(c) == Some(TablePart::Row));
+    if !has_rows {
+        if s.child_elements()
+            .any(|c| table_part(c) == Some(TablePart::Cell))
+        {
+            rows.push(s);
+        } else {
+            strays.extend(s.children.iter().filter(|n| !is_blank(n)));
+        }
+        return;
+    }
+    for n in &s.children {
+        match n {
+            Node::Element(c) if table_part(c) == Some(TablePart::Row) => rows.push(c),
+            n if is_blank(n) => {}
+            n => strays.push(n),
+        }
+    }
+}
+
+/// Whether `nodes` hold a `th` or a `thead` outside nested tables: `htmd` writes only such a
+/// table as a table.
+fn explicit_header(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Element(e) if e.ns == Ns::Html && e.local.eq_ignore_ascii_case("table") => false,
+        Node::Element(e) => {
+            matches!(table_part(e), Some(TablePart::Head))
+                || is_th(e)
+                || explicit_header(&e.children)
+        }
+        _ => false,
+    })
+}
+
+/// Ends each cell of an `htmd` run of table cells (no token: never a fragment index).
+const CELL_END: &str = "\u{FFFF}|\u{FFFE}";
+
+/// A cell's Markdown on one line: trimmed, line breaks as spaces, `|` as `&#124;`.
+fn cell_text(md: &str) -> String {
+    let ws = ['\t', '\n', '\r', ' '];
+    md.trim_matches(ws)
+        .replace('\r', "")
+        .replace('\n', " ")
+        .replace('|', "&#124;")
+        .trim_matches(ws)
+        .to_owned()
+}
+
+/// `| a | b |`, with empty cells up to `columns`.
+fn pipe_row(cells: &[String], columns: usize) -> String {
+    let mut line = String::from("|");
+    for i in 0..columns {
+        line.push(' ');
+        line.push_str(cells.get(i).map_or("", String::as_str));
+        line.push_str(" |");
+    }
+    line
 }
 
 fn is_code(name: &str) -> bool {
@@ -983,10 +1369,13 @@ fn converter() -> HtmlToMarkdown {
         .build()
 }
 
-/// `htmd`, the tokens, the look-alike pass, one final newline.
-fn finish(html: &str, frags: &[Frag]) -> String {
-    let (md, genuine) = substitute(&html_to_md(html), frags);
-    finalize(md, genuine)
+/// `htmd`, the tables, the tokens, the look-alike pass, one final newline; at most `max`
+/// bytes.
+fn finish(html: &str, frags: &[Frag], max: usize) -> Result<String, MarkdownTooLarge> {
+    let md = expand_tables(&html_to_md(html), frags);
+    let (md, genuine) = substitute(&md, frags);
+    within(&md, max)?;
+    finalize(md, genuine, max)
 }
 
 fn html_to_md(html: &str) -> String {
@@ -994,15 +1383,97 @@ fn html_to_md(html: &str) -> String {
     converter().convert(html).unwrap_or_default()
 }
 
+const TRAILING: [char; 4] = ['\n', '\r', ' ', '\t'];
+
+/// `Err` when `md` as [`finalize`] ends it would be longer than `max`. Every later stage only
+/// inserts (before text, never into the trailing whitespace), so it can stop at once.
+fn within(md: &str, max: usize) -> Result<(), MarkdownTooLarge> {
+    let len = md.trim_end_matches(TRAILING).len();
+    let final_len = if len == 0 { 0 } else { len.saturating_add(1) };
+    if final_len > max {
+        Err(MarkdownTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
 /// The look-alike pass and one final newline.
-fn finalize(md: String, genuine: BTreeSet<(usize, PlaceholderKind)>) -> String {
-    let mut md = neutralize(md, genuine);
-    let end = md.trim_end_matches(['\n', '\r', ' ', '\t']).len();
+fn finalize(
+    md: String,
+    genuine: BTreeSet<(usize, PlaceholderKind)>,
+    max: usize,
+) -> Result<String, MarkdownTooLarge> {
+    let mut md = neutralize(md, genuine, max)?;
+    let end = md.trim_end_matches(TRAILING).len();
     md.truncate(end);
     if !md.is_empty() {
         md.push('\n');
     }
-    md
+    within(&md, max)?;
+    Ok(md)
+}
+
+/// Puts the lines of each table fragment in place of its token in `src` (`htmd`'s output,
+/// where a table token stands on a line of its own): the first line after the token's line
+/// prefix, every other line after its continuation (as a code block's, [`continuation`]); a
+/// table on a line that holds anything else becomes one line. Other tokens stay.
+fn expand_tables(src: &str, frags: &[Frag]) -> String {
+    if !frags.iter().any(|f| matches!(f, Frag::Table { .. })) {
+        return src.to_owned();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    let (mut line_start, mut scanned) = (0, 0);
+    while let Some(open) = rest.find(TOKEN_OPEN) {
+        out.push_str(rest.get(..open).unwrap_or(""));
+        let after = rest.get(open + TOKEN_OPEN.len_utf8()..).unwrap_or("");
+        let close = after.find(TOKEN_CLOSE);
+        let table = close
+            .and_then(|c| after.get(..c))
+            .and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| frags.get(i))
+            .and_then(|f| match f {
+                Frag::Table { lines } => Some(lines),
+                _ => None,
+            });
+        let (Some(lines), Some(close)) = (table, close) else {
+            out.push(TOKEN_OPEN);
+            rest = after;
+            continue;
+        };
+        rest = after.get(close + TOKEN_CLOSE.len_utf8()..).unwrap_or("");
+        if let Some(nl) = out.get(scanned..).and_then(|s| s.rfind('\n')) {
+            line_start = scanned + nl + 1;
+        }
+        let rest_blank = rest
+            .chars()
+            .take_while(|&c| c != '\n')
+            .all(char::is_whitespace);
+        let cont = continuation(out.get(line_start..).unwrap_or("")).filter(|_| rest_blank);
+        let before = out.len();
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                match &cont {
+                    Some(cont) if line.is_empty() => {
+                        out.push('\n');
+                        out.push_str(cont.trim_end());
+                    }
+                    Some(cont) => {
+                        out.push('\n');
+                        out.push_str(cont);
+                    }
+                    None => out.push(' '),
+                }
+            }
+            out.push_str(line);
+        }
+        if let Some(nl) = out.get(before..).and_then(|s| s.rfind('\n')) {
+            line_start = before + nl + 1;
+        }
+        scanned = out.len();
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Replaces the tokens in `src` by their fragments and returns the result with the offsets of
@@ -1058,7 +1529,8 @@ fn substitute(src: &str, frags: &[Frag]) -> (String, BTreeSet<(usize, Placeholde
                 scanned = out.len();
                 code_block(&mut out, line_start, rest, language.as_deref(), body);
             }
-            None => {}
+            // Tables are in place already ([`expand_tables`]).
+            Some(Frag::Table { .. }) | None => {}
         }
     }
     push_clean(&mut out, rest);
@@ -1075,7 +1547,7 @@ fn push_clean(out: &mut String, s: &str) {
 /// (continuation lines get the same prefix), else inline code.
 fn code_block(out: &mut String, line_start: usize, rest: &str, language: Option<&str>, body: &str) {
     let prefix = out.get(line_start..).unwrap_or("");
-    let table = prefix.starts_with('|');
+    let table = table_row(prefix);
     let rest_blank = rest
         .chars()
         .take_while(|&c| c != '\n')
@@ -1121,6 +1593,30 @@ fn continuation(prefix: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// Whether a line starting with `prefix` is a table row: a `|` after its quote and list
+/// prefix (a table inside a quote or a list item).
+fn table_row(prefix: &str) -> bool {
+    let mut p = prefix;
+    loop {
+        let t = p.trim_start_matches([' ', '>']);
+        let t = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* "))
+            .or_else(|| t.strip_prefix("+ "))
+            .or_else(|| {
+                let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+                t.get(digits..)
+                    .filter(|_| (1..=9).contains(&digits))
+                    .and_then(|r| r.strip_prefix(". ").or_else(|| r.strip_prefix(") ")))
+            })
+            .unwrap_or(t);
+        if t.len() == p.len() {
+            return p.starts_with('|');
+        }
+        p = t;
+    }
 }
 
 fn longest_run(s: &str, ch: char) -> usize {
@@ -1184,9 +1680,14 @@ fn inline_code(out: &mut String, body: &str, table: bool) {
 
 /// Escapes what the placeholder check would count but the converter did not put there (and
 /// the `&` of prose character references), until nothing is left (bounded).
-fn neutralize(mut md: String, mut genuine: BTreeSet<(usize, PlaceholderKind)>) -> String {
+fn neutralize(
+    mut md: String,
+    mut genuine: BTreeSet<(usize, PlaceholderKind)>,
+    max: usize,
+) -> Result<String, MarkdownTooLarge> {
     let at = reference_escapes(&md);
     insert_backslashes(&mut md, &mut genuine, at);
+    within(&md, max)?;
     for _ in 0..MAX_PASSES {
         let mut at = tilde_fences(&md);
         let hits = placeholders::scan(&md);
@@ -1223,8 +1724,9 @@ fn neutralize(mut md: String, mut genuine: BTreeSet<(usize, PlaceholderKind)>) -
             break;
         }
         insert_backslashes(&mut md, &mut genuine, at);
+        within(&md, max)?;
     }
-    md
+    Ok(md)
 }
 
 /// For each link or image written as `[text](…)` or `![alt](…)` (or a reference form), the
@@ -1346,8 +1848,8 @@ fn insert_backslashes(
 }
 
 /// The §7.6 fallback: CDATA bodies first (fenced code), then the text of the rest with every
-/// tag stripped ([`stripped_paragraphs`]).
-fn fallback(storage: &str) -> String {
+/// tag stripped ([`stripped_paragraphs`]); at most `max` bytes.
+fn fallback(storage: &str, max: usize) -> Result<String, MarkdownTooLarge> {
     let clean: String = storage
         .chars()
         .map(|c| {
@@ -1387,14 +1889,16 @@ fn fallback(storage: &str) -> String {
     for (i, part) in html_parts.iter().enumerate() {
         for paragraph in stripped_paragraphs(part) {
             push_block(&mut md, &paragraph);
+            within(&md, max)?;
         }
         if let Some(body) = bodies.get(i) {
             let mut code = String::new();
             fenced(&mut code, "", None, body);
             push_block(&mut md, &code);
+            within(&md, max)?;
         }
     }
-    finalize(md, BTreeSet::new())
+    finalize(md, BTreeSet::new(), max)
 }
 
 /// Appends a block, separated from what is there by a blank line.
@@ -1683,6 +2187,36 @@ mod tests {
         let (md, _) = convert(&format!("<ac:structured-macro ac:name=\"{long}\"/>"));
         assert_eq!(md, format!("[macro: {}- {{}}]\n", "a".repeat(63)));
         assert_eq!(kinds(&md), vec![PlaceholderKind::Macro]);
+    }
+
+    /// T10 review B-1: the writer's estimate stops a page whose line prefixes alone pass the
+    /// ceiling before `htmd` sees it, and leaves an ordinary page alone.
+    #[test]
+    fn writer_estimate_stops_before_htmd() {
+        let deep = format!(
+            "{}<p>{}</p>{}",
+            "<blockquote>".repeat(60),
+            "x<br/>".repeat(100_000),
+            "</blockquote>".repeat(60)
+        );
+        let doc = parse(&deep);
+        assert!(doc.xml_ok);
+        let users = UserResolutions::new();
+        let mut w = Writer::new(&users, 4 * 1024 * 1024);
+        w.nodes(&doc.nodes);
+        assert!(w.stopped);
+        // It stopped about where 120 bytes of prefix on two lines per break pass 4 MiB.
+        assert!(w.html.len() < 200_000, "{}", w.html.len());
+        let mut w = Writer::new(&users, usize::MAX);
+        w.nodes(&doc.nodes);
+        assert!(!w.stopped);
+        assert!(w.estimate >= 100_000 * 2 * 120, "{}", w.estimate);
+        // A page without quotes or lists costs its fragments only.
+        let flat = "<p>a <ac:structured-macro ac:name=\"toc\"/></p>".repeat(1000);
+        let doc = parse(&flat);
+        let mut w = Writer::new(&users, usize::MAX);
+        w.nodes(&doc.nodes);
+        assert_eq!(w.estimate, 1000 * "[macro: toc {}]".len());
     }
 
     /// T3 review I-1: `_` in a user key is `%5F`, so `@user:_a @user:b_` is two mentions.

@@ -11,15 +11,19 @@ use std::collections::BTreeMap;
 
 use atlas_duck_atlassian::testing::MockDc;
 use atlas_duck_audit::EventType;
+use atlas_duck_core::engine::cache::RebuildError;
 use atlas_duck_core::engine::queue::{Limits, MIB};
+use atlas_duck_core::engine::read::normalize;
+use atlas_duck_core::payloads::body_json;
 use atlas_duck_core::testing::Harness;
 use atlas_duck_ipc::envelope::{Envelope, Status};
+use atlas_duck_preview::{OutcomeKind, PreviewBody};
 use common::confluence::{
-    PAGE_EXPAND_STORAGE, PAGE_EXPAND_VIEW, content_path, mount_history_summary,
+    PAGE_EXPAND_STORAGE, PAGE_EXPAND_VIEW, amplified_storage, content_path, mount_history_summary,
     mount_history_version, mount_page, mount_page_view, page_with_storage, page_with_view,
 };
 use common::jira::{gets_on, query};
-use common::{TestError, TestResult, de, request_id, test_hits};
+use common::{TestError, TestResult, code, de, request_id, test_hits};
 use serde_json::{Value, json};
 
 const PAGE_GET: &str = "confluence.page.get";
@@ -347,5 +351,236 @@ async fn markdown_without_storage_body_releases_raw() -> TestResult {
     let env = released(&h, &id).await?;
     assert_eq!(result_of(&env)?, content);
     assert!(meta_of(&env)?.get("conversion").is_none(), "{:?}", env.meta);
+    Ok(())
+}
+
+// ---- Task 10 fix round ---------------------------------------------------------------------------
+
+/// The `READ_FETCHED` payload `payloads::read_fetched` writes for one 2xx answer, with `users`
+/// as its `user_resolutions`.
+fn fetched_payload(content: &Value, users: Option<Value>) -> Value {
+    let mut payload = json!({
+        "pages": 1,
+        "responses": [{
+            "status": 200,
+            "content_type": "application/json",
+            "body": body_json(content.to_string().as_bytes()),
+        }],
+    });
+    if let Some(users) = users {
+        payload["user_resolutions"] = users;
+    }
+    payload
+}
+
+/// T10 review I-1: the normalization converts with the payload's committed map and nothing else,
+/// and a Markdown record without a usable map is malformed (fail closed).
+#[test]
+fn normalize_converts_with_the_committed_map_only() -> TestResult {
+    let spec = atlas_duck_registry::get(PAGE_GET).ok_or("no registry op")?;
+    let page = page_with_storage(MENTION_STORAGE);
+    let params = json!({ "id": ID });
+    let markdown = |key: &str, name: Option<&str>| {
+        let users = BTreeMap::from([(key.to_owned(), name.map(str::to_owned))]);
+        atlas_duck_convert::storage_to_markdown(MENTION_STORAGE, &users).0
+    };
+    // (a) A resolved user in the map is the mention, so the payload's map is the one used.
+    let users = json!({ "8a7f808a1": "jdoe" });
+    let body = normalize(spec, &params, &fetched_payload(&page, Some(users)))
+        .map_err(|e| format!("{e:?}"))?;
+    let expected = markdown("8a7f808a1", Some("jdoe"));
+    assert!(expected.contains("@jdoe"), "{expected}");
+    assert_eq!(
+        body["body"],
+        json!({ "format": "markdown", "value": expected })
+    );
+    // `null` is an unresolved user: the mention is its key.
+    let body = normalize(
+        spec,
+        &params,
+        &fetched_payload(&page, Some(json!({ "8a7f808a1": null }))),
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(body["body"]["value"], markdown("8a7f808a1", None));
+    // (b) no map, (c) a value that is neither a string nor null, (d) a map that is no object.
+    for users in [
+        None,
+        Some(json!({ "8a7f808a1": 7 })),
+        Some(json!({ "8a7f808a1": ["jdoe"] })),
+        Some(json!([])),
+        Some(json!("jdoe")),
+    ] {
+        let got = normalize(spec, &params, &fetched_payload(&page, users.clone()));
+        assert!(
+            matches!(got, Err(RebuildError::Malformed)),
+            "{users:?}: {got:?}"
+        );
+    }
+    // (e) `format: storage` converts nothing and needs no map.
+    let body = normalize(
+        spec,
+        &json!({ "id": ID, "format": "storage" }),
+        &fetched_payload(&page, None),
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(body, page);
+    // T10 review B-1: the conversion is held to the release cap; a record whose Markdown would
+    // pass it cannot be a committed candidate (the first build committed the outcome instead).
+    let big = page_with_storage(&amplified_storage(170_000));
+    let got = normalize(spec, &params, &fetched_payload(&big, Some(json!({}))));
+    assert!(
+        matches!(got, Err(RebuildError::Malformed)),
+        "{:?}",
+        got.map(|_| "a body")
+    );
+    Ok(())
+}
+
+/// T10 review B-1: the crafted table that made `htmd` pad 50 000 rows to a 64 KiB header (about
+/// 3 GiB) converts unpadded and is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wide_cell_table_page_is_released_unpadded() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = format!(
+        "<table><tbody><tr><th>{}</th></tr>{}</tbody></table>",
+        "w".repeat(64 * 1024),
+        "<tr><td>x</td></tr>".repeat(50_000)
+    );
+    mount_page(mock, ID, &page_with_storage(&storage)).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let env = released(&h, &id).await?;
+    let value = result_of(&env)?["body"]["value"]
+        .as_str()
+        .ok_or("no Markdown value")?
+        .to_owned();
+    assert!(value.len() < storage.len(), "{}", value.len());
+    assert_eq!(value.lines().count(), 50_002);
+    assert_eq!(value.lines().nth(1), Some("| --- |"));
+    assert!(value.lines().skip(2).all(|l| l == "| x |"), "unpadded rows");
+    Ok(())
+}
+
+/// T10 review I-3: `meta.conversion` is released with every Markdown body, a lossless one
+/// included, and carries the report's counts one for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn meta_conversion_counts_are_the_reports() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let plain = "<p>Plain <strong>prose</strong> only.</p>";
+    let image_layout = r#"<ac:layout><ac:layout-section ac:type="single"><ac:layout-cell><p>Look: <ac:image><ri:attachment ri:filename="a.png"/></ac:image></p></ac:layout-cell></ac:layout-section></ac:layout>"#;
+    for (id, storage, conversion) in [
+        (
+            "65538",
+            plain,
+            json!({ "lossy": false, "lost": { "macros": 0, "images": 0, "links": 0, "layouts": 0 } }),
+        ),
+        (
+            "65539",
+            image_layout,
+            json!({ "lossy": true, "lost": { "macros": 0, "images": 1, "links": 0, "layouts": 1 } }),
+        ),
+    ] {
+        mount_page(mock, id, &page_with_storage(storage)).await;
+        let rid = queued(&h, PAGE_GET, json!({ "id": id })).await?;
+        let env = released(&h, &rid).await?;
+        assert_eq!(meta_of(&env)?["conversion"], conversion, "{storage}");
+        assert_eq!(result_of(&env)?["body"]["value"], markdown_of(storage));
+    }
+    Ok(())
+}
+
+/// T10 review B-1: a page whose Markdown would pass the 16 MiB release cap stops converting there
+/// and becomes the release-cap outcome item (no candidate past the cap is built, the process
+/// lives), committed without a map; a page under the cap converts as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn markdown_over_the_release_cap_is_the_outcome_item() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = amplified_storage(170_000);
+    assert!(storage.len() < 512 * 1024);
+    let full = markdown_of(&storage);
+    assert!(full.len() > 16 * 1024 * 1024, "{}", full.len());
+    drop(full);
+    mount_page(mock, ID, &page_with_storage(&storage)).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    match &preview.body {
+        PreviewBody::Outcome { outcome, .. } => assert_eq!(*outcome, OutcomeKind::ReleaseCap16),
+        other => return Err(format!("not an outcome card: {other:?}").into()),
+    }
+    assert!(preview.raw.total_bytes < 1024);
+    let fetched = read_fetched(&h, &id).await?;
+    assert_eq!(fetched["outcome"], "too_large");
+    assert_eq!(fetched["cap_or_budget"], "release_cap_16mib");
+    assert!(fetched.get("user_resolutions").is_none(), "{fetched}");
+    h.approver().release_unopened(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "result_too_large");
+    assert_eq!(env.meta, None);
+
+    // The same shape under the cap is a released Markdown body.
+    let small = amplified_storage(1_000);
+    mount_page(mock, "65540", &page_with_storage(&small)).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": "65540" })).await?;
+    let env = released(&h, &id).await?;
+    assert_eq!(result_of(&env)?["body"]["value"], markdown_of(&small));
+    Ok(())
+}
+
+/// T10 review m-7: a span masked in the Markdown body is released masked; the redacted revision
+/// is rebuilt from the record (converted again with its committed map) and keeps
+/// `meta.conversion`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn markdown_body_redaction_rebuilds_and_releases_masked() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(INFO_STORAGE)).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    let mask = atlas_duck_core::RedactionOp::MaskText {
+        text: "Read me first".into(),
+        every_occurrence: true,
+        at: None,
+    };
+    ap.redact(&id, vec![mask]).map_err(de)?;
+    ap.open(&id).map_err(de)?;
+    h.evict_candidate(&id);
+    let env = released(&h, &id).await?;
+    assert!(env.redacted);
+    let value = result_of(&env)?["body"]["value"]
+        .as_str()
+        .ok_or("no Markdown value")?
+        .to_owned();
+    assert!(!value.contains("Read me first"), "{value}");
+    assert!(value.contains("Check the build."), "{value}");
+    let meta = meta_of(&env)?;
+    assert!(
+        meta["redactions"]["spans_masked"].as_u64() >= Some(1),
+        "{meta}"
+    );
+    assert_eq!(meta["conversion"]["lost"]["macros"], 1);
+    Ok(())
+}
+
+/// T10 review m-5: a Markdown read the server answers with an error commits no map.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn markdown_upstream_error_commits_no_map() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mock.json(
+        &content_path("404404"),
+        404,
+        r#"{"statusCode":404,"message":"No content found with id: 404404"}"#,
+    )
+    .await;
+    let env = h.submit(PAGE_GET, json!({ "id": "404404" })).await;
+    let id = request_id(&env)?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let fetched = read_fetched(&h, &id).await?;
+    assert_eq!(fetched["upstream_error"], true, "{fetched}");
+    assert!(fetched.get("user_resolutions").is_none(), "{fetched}");
     Ok(())
 }

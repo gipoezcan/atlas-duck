@@ -23,9 +23,9 @@ pub use md_to_storage::markdown_to_storage;
 pub use md_to_wiki::{ContainerKind, EmittedCode, EmittedConstructs, markdown_to_wiki};
 pub use placeholders::{PlaceholderHit, PlaceholderKind, check_markdown_placeholders};
 pub use storage::{
-    ConversionReport, LostCounts, StorageReject, StorageUsers, UserResolutions, check_storage_body,
-    hard_check_storage, lossy_update, storage_constructs, storage_lines, storage_to_markdown,
-    storage_user_refs,
+    ConversionReport, LostCounts, MarkdownTooLarge, StorageReject, StorageUsers, UserResolutions,
+    check_storage_body, hard_check_storage, lossy_update, storage_constructs, storage_lines,
+    storage_to_markdown, storage_to_markdown_within, storage_user_refs,
 };
 pub use wiki::{CodeKind, ConstructKind, WikiConstructs, wiki_constructs};
 pub use wiki_html::wiki_to_preview_html;

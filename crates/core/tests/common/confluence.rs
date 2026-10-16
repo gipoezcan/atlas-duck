@@ -33,6 +33,18 @@ pub fn page_with_storage(storage: &str) -> Value {
     page
 }
 
+/// A small storage body whose Markdown is `lines` lines of 101 bytes and more (T10 review B-1):
+/// a code block in 50 nested quotes, every line of it with the quotes' 100-byte prefix.
+pub fn amplified_storage(lines: usize) -> String {
+    format!(
+        "{}<ac:structured-macro ac:name=\"code\"><ac:plain-text-body><![CDATA[{}]]>\
+         </ac:plain-text-body></ac:structured-macro>{}",
+        "<blockquote>".repeat(50),
+        "x\n".repeat(lines),
+        "</blockquote>".repeat(50)
+    )
+}
+
 /// `fixtures::CONFLUENCE_PAGE` with `html` as its `body.view.value` and no `body.storage`.
 pub fn page_with_view(html: &str) -> Value {
     let mut page: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE).unwrap_or(Value::Null);

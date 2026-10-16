@@ -5,6 +5,7 @@
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
+use atlas_duck_registry::OperationSpec;
 use serde_json::{Map, Value, json};
 
 use super::{
@@ -251,13 +252,21 @@ impl BodyFormat {
 }
 
 /// The body format of a read that carries a page body, with whether it is a historical version
-/// (`confluence.page.history` with `version`); `None` for every other read, the history summary
-/// included (it has no body and ignores `format`, PD-100). Decided from the op and the validated
-/// params alone: the request's `expand` and the normalization (`ReadShape`) both ask here.
-pub fn body_format(op_id: &str, params: &Value) -> Option<(BodyFormat, bool)> {
-    match op_id {
+/// (`confluence.page.history` on its alternative endpoint, i.e. with `version`); `None` for every
+/// other read, the history summary included (it has no body and ignores `format`, PD-100).
+/// Decided from the op and the validated params alone: the request's `expand` and the
+/// normalization (`ReadShape`) both ask here. The history trigger is the registry's own
+/// (`alt_endpoint.when_param_present`, as `generic` picks the endpoint; T10 review m-6).
+pub fn body_format(spec: &OperationSpec, params: &Value) -> Option<(BodyFormat, bool)> {
+    match spec.id {
         "confluence.page.get" => Some((BodyFormat::of(params), false)),
-        "confluence.page.history" if params.get("version").is_some_and(|v| !v.is_null()) => {
+        "confluence.page.history"
+            if spec.alt_endpoint.is_some_and(|alt| {
+                params
+                    .get(alt.when_param_present)
+                    .is_some_and(|v| !v.is_null())
+            }) =>
+        {
             Some((BodyFormat::of(params), true))
         }
         _ => None,
@@ -268,11 +277,17 @@ pub fn body_format(op_id: &str, params: &Value) -> Option<(BodyFormat, bool)> {
 /// `format=view` (PD-100: `body.view,version,space,ancestors`, history `body.view,version`).
 fn body_read_plan(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     let plan = generic::read_plan(ctx, ctx.params)?;
-    if body_format(ctx.spec.id, ctx.params).map(|(f, _)| f) != Some(BodyFormat::View) {
+    if body_format(ctx.spec, ctx.params).map(|(f, _)| f) != Some(BodyFormat::View) {
         return Ok(plan);
     }
+    // Fail closed (T10 review m-1): `view` is only ever one GET; any other plan would send
+    // `body.storage` and release it as `view`.
     let ExecPlan::Read(ReadPlan::Get(mut call)) = plan else {
-        return Ok(plan);
+        return Err(ExecError::Invalid(ValidationError {
+            code: atlas_duck_ipc::envelope::ErrorCode::Internal,
+            message: "the view format of the read cannot be planned".to_owned(),
+            details: Map::new(),
+        }));
     };
     for (name, value) in &mut call.query {
         if name.as_str() == "expand" {

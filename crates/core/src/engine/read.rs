@@ -26,7 +26,9 @@ use atlas_duck_atlassian::{
     PageEnd, PagedOutcome, PostSendKind, ReadBudget, UnavailableReason, UpstreamResponse,
 };
 use atlas_duck_audit::NewEvent;
-use atlas_duck_convert::{ConversionReport, UserResolutions, storage_to_markdown};
+use atlas_duck_convert::{
+    ConversionReport, MarkdownTooLarge, UserResolutions, storage_to_markdown_within,
+};
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::{
@@ -1135,36 +1137,44 @@ fn build_item(
     // §5.3 mirror check on the unredacted candidate (T10 review I-1): a candidate that fails it
     // is still shown, but Release stays disabled (`rebuild_failed`: `internal` banner, only Deny
     // remains) until a redaction drops the orphan entry.
-    let built = normalize_with_drops(cx.spec, shape, &record.payload).and_then(|n| {
-        let (c, blocked) = build_unredacted(cx.spec, n.body)?;
-        Ok((c, n.dropped, n.conversion, blocked))
-    });
-    let (mut candidate, mut dropped, mut conversion, mut mirror_blocked) = match built {
-        Ok(b) => b,
-        Err(_) => return Err(rec.responses),
+    let first = match normalize_with_drops(cx.spec, shape, &record.payload) {
+        Ok(n) => match build_unredacted(cx.spec, n.body) {
+            Ok((c, blocked)) => Some((c, n.dropped, n.conversion, blocked)),
+            Err(_) => return Err(rec.responses),
+        },
+        // A Markdown body that would pass the release cap stops converting there (T10 review
+        // B-1): the 16 MiB outcome below, never a candidate built past the cap.
+        Err(Unnormalized::TooLarge) => None,
+        Err(Unnormalized::Rebuild(_)) => return Err(rec.responses),
     };
     // §5.2 step 4: the 16 MiB release cap on the serialized candidate.
-    let over_cap = u64::try_from(candidate.bytes().len()).unwrap_or(u64::MAX) > RELEASE_CAP_BYTES;
-    if rec.item == ReleaseItem::Result && over_cap {
-        drop(candidate);
-        rec = ItemRecord::outcome(
-            rec.responses,
-            OutcomeKind::TooLarge,
-            Some(CapOrBudget::ReleaseCap16MiB),
-            CardKind::ReleaseCap16,
-            Vec::new(),
-        );
-        record = rec.record(ctx, None);
-        let built = normalize_with_drops(cx.spec, shape, &record.payload)
-            .and_then(|n| build_candidate(cx.spec, n.body, &[]));
-        candidate = match built {
-            Ok(c) => c,
-            Err(_) => return Err(rec.responses),
+    let over_cap = first.as_ref().is_none_or(|(c, ..)| {
+        u64::try_from(c.bytes().len()).unwrap_or(u64::MAX) > RELEASE_CAP_BYTES
+    });
+    let (candidate, dropped, conversion, mirror_blocked) =
+        if rec.item == ReleaseItem::Result && over_cap {
+            drop(first);
+            rec = ItemRecord::outcome(
+                rec.responses,
+                OutcomeKind::TooLarge,
+                Some(CapOrBudget::ReleaseCap16MiB),
+                CardKind::ReleaseCap16,
+                Vec::new(),
+            );
+            record = rec.record(ctx, None);
+            let built = normalize_with_drops(cx.spec, shape, &record.payload)
+                .ok()
+                .and_then(|n| build_candidate(cx.spec, n.body, &[]).ok());
+            match built {
+                Some(c) => (c, 0, None, false),
+                None => return Err(rec.responses),
+            }
+        } else {
+            match first {
+                Some(b) => b,
+                None => return Err(rec.responses),
+            }
         };
-        dropped = 0;
-        conversion = None;
-        mirror_blocked = false;
-    }
     let state = ReadState {
         item: rec.item,
         outcome: rec.outcome.as_ref().map(|o| o.card),
@@ -1226,7 +1236,7 @@ impl ReadShape {
             ReadShape::IssueWithComments {
                 rendered: jira::comments_rendered(params),
             }
-        } else if let Some((format, historical)) = confluence::body_format(spec.id, params) {
+        } else if let Some((format, historical)) = confluence::body_format(spec, params) {
             ReadShape::ConfluenceBody { format, historical }
         } else {
             ReadShape::Plain
@@ -1273,6 +1283,37 @@ impl Normalized {
     }
 }
 
+/// Why a committed payload gives no candidate body.
+pub(crate) enum Unnormalized {
+    /// The record or the normalization did not give one.
+    Rebuild(RebuildError),
+    /// The Markdown of a page body would pass its budget (T10 review B-1): the conversion
+    /// stopped there. A read's first build releases the 16 MiB outcome instead, a host call
+    /// rejects `result_too_large`; a rebuild never meets it (the outcome was committed).
+    TooLarge,
+}
+
+impl From<RebuildError> for Unnormalized {
+    fn from(e: RebuildError) -> Self {
+        Unnormalized::Rebuild(e)
+    }
+}
+
+impl Unnormalized {
+    /// For the rebuild callers: a body that is too large cannot be the committed candidate.
+    fn rebuild(self) -> RebuildError {
+        match self {
+            Unnormalized::Rebuild(e) => e,
+            Unnormalized::TooLarge => RebuildError::Malformed,
+        }
+    }
+}
+
+/// The Markdown budget of a direct read's body: the release cap (§5.2 step 4).
+fn read_markdown_budget() -> usize {
+    usize::try_from(RELEASE_CAP_BYTES).unwrap_or(usize::MAX)
+}
+
 /// The bare candidate body of a committed `READ_FETCHED` payload: the one normalization the
 /// first build and every rebuild use (`cache`'s contract). Reads nothing but the payload (its
 /// responses and its committed `user_resolutions`) and the request's validated `params` (which
@@ -1282,7 +1323,9 @@ pub fn normalize(
     params: &Value,
     payload: &Value,
 ) -> Result<Value, RebuildError> {
-    normalize_with_drops(spec, ReadShape::of(spec, params), payload).map(|n| n.body)
+    normalize_with_drops(spec, ReadShape::of(spec, params), payload)
+        .map(|n| n.body)
+        .map_err(Unnormalized::rebuild)
 }
 
 /// [`normalize`] for `Engine::candidate`, with the shape decided from `params` up front.
@@ -1291,15 +1334,20 @@ pub(crate) fn normalizer(
     params: &Value,
 ) -> impl FnOnce(&Value) -> Result<Value, RebuildError> + Send + 'static {
     let shape = ReadShape::of(spec, params);
-    move |payload| normalize_with_drops(spec, shape, payload).map(|n| n.body)
+    move |payload| {
+        normalize_with_drops(spec, shape, payload)
+            .map(|n| n.body)
+            .map_err(Unnormalized::rebuild)
+    }
 }
 
-/// [`normalize`] plus the number of results it removed (§7.4) and the conversion report.
+/// [`normalize`] plus the number of results it removed (§7.4) and the conversion report; a
+/// Markdown body is held to the release cap ([`read_markdown_budget`]).
 fn normalize_with_drops(
     spec: &OperationSpec,
     shape: ReadShape,
     payload: &Value,
-) -> Result<Normalized, RebuildError> {
+) -> Result<Normalized, Unnormalized> {
     if let Some(outcome) = payload.get("outcome") {
         let code = outcome
             .as_str()
@@ -1312,7 +1360,7 @@ fn normalize_with_drops(
     }
     // A direct failure's answer is never a candidate.
     if payload.get("unavailable").is_some() {
-        return Err(RebuildError::Malformed);
+        return Err(RebuildError::Malformed.into());
     }
     let responses = fetched_refs(payload)?;
     if payload.get("upstream_error") == Some(&Value::Bool(true)) {
@@ -1324,30 +1372,33 @@ fn normalize_with_drops(
         shape,
         responses.iter().map(|r| &*r.body),
         payload.get("user_resolutions"),
+        read_markdown_budget(),
     )
 }
 
 /// The result of a read's 2xx pages in its [`ReadShape`] (the direct read's candidate, a script
-/// host call's result). `user_resolutions` is the committed map of the record (§7.6).
+/// host call's result). `user_resolutions` is the committed map of the record (§7.6);
+/// `max_markdown` the budget of a Markdown body's text ([`Unnormalized::TooLarge`] above it).
 pub(super) fn result_value<'a>(
     spec: &OperationSpec,
     shape: ReadShape,
     bodies: impl IntoIterator<Item = &'a [u8]>,
     user_resolutions: Option<&Value>,
-) -> Result<Normalized, RebuildError> {
+    max_markdown: usize,
+) -> Result<Normalized, Unnormalized> {
     match shape {
-        ReadShape::Plain => result_body(spec, bodies).map(|(body, dropped)| Normalized {
+        ReadShape::Plain => Ok(result_body(spec, bodies).map(|(body, dropped)| Normalized {
             body,
             dropped,
             conversion: None,
-        }),
+        })?),
         ReadShape::IssueWithComments { rendered } => {
-            merge_comments(bodies, rendered).map(Normalized::plain)
+            Ok(merge_comments(bodies, rendered).map(Normalized::plain)?)
         }
         ReadShape::ConfluenceBody { format, .. } => {
             let (body, _) = result_body(spec, bodies)?;
             match format {
-                BodyFormat::Markdown => markdown_body(body, user_resolutions),
+                BodyFormat::Markdown => markdown_body(body, user_resolutions, max_markdown),
                 BodyFormat::Storage | BodyFormat::View => Ok(Normalized::plain(body)),
             }
         }
@@ -1355,15 +1406,21 @@ pub(super) fn result_value<'a>(
 }
 
 /// PD-100: the content with `body` replaced by `{"format": "markdown", "value": …}` (§4.2),
-/// converted with the committed map only, never the live user cache (§5.2, I-37). A content
-/// answer without a `body.storage.value` string (e.g. an id that is not a page) is the answer as
-/// sent, unconverted and without a report.
-fn markdown_body(mut body: Value, users: Option<&Value>) -> Result<Normalized, RebuildError> {
+/// converted with the committed map only, never the live user cache (§5.2, I-37), and stopped
+/// once the Markdown would pass `max` bytes (T10 review B-1). A content answer without a
+/// `body.storage.value` string (e.g. an id that is not a page) is the answer as sent,
+/// unconverted and without a report.
+fn markdown_body(
+    mut body: Value,
+    users: Option<&Value>,
+    max: usize,
+) -> Result<Normalized, Unnormalized> {
     let users = committed_users(users)?;
     let Some(storage) = body.pointer("/body/storage/value").and_then(Value::as_str) else {
         return Ok(Normalized::plain(body));
     };
-    let (markdown, report, _) = storage_to_markdown(storage, &users);
+    let (markdown, report, _) = storage_to_markdown_within(storage, &users, max)
+        .map_err(|MarkdownTooLarge| Unnormalized::TooLarge)?;
     let root = body.as_object_mut().ok_or(RebuildError::Malformed)?;
     root.insert(
         "body".into(),

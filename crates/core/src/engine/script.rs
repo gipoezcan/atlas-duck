@@ -952,7 +952,7 @@ impl LiveBackend {
             }
         };
         // The control was cancelled by the end of the run, which took the call and records it.
-        let Some(settled) = self.settle(&call, &vc, &info, classified) else {
+        let Some(settled) = self.settle(&call, &vc, &info, classified).await else {
             self.shared.finish_in_flight(call.id);
             return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
         };
@@ -1077,7 +1077,7 @@ impl LiveBackend {
     }
 
     /// What the script sees, the `SCRIPT_CALL` record and the bytes received.
-    fn settle(
+    async fn settle(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
@@ -1093,14 +1093,17 @@ impl LiveBackend {
                 let users = read::user_resolutions(shape, rec.item);
                 let event = rec.record(&ctx, users.as_ref());
                 let (result, rejection, lossy) = match rec.item {
-                    ReleaseItem::Result => settle_result(
-                        vc.spec,
-                        &vc.validated.params,
-                        &rec,
-                        call.all,
-                        max_result,
-                        event.payload.get("user_resolutions"),
-                    ),
+                    ReleaseItem::Result => {
+                        let (spec, params, all) = (vc.spec, vc.validated.params.clone(), call.all);
+                        let users = event.payload.get("user_resolutions").cloned();
+                        // Parsing the answer and converting a page body to Markdown is CPU work
+                        // (T10 review m-2), as for a direct read.
+                        tokio::task::spawn_blocking(move || {
+                            settle_result(spec, &params, &rec, all, max_result, users.as_ref())
+                        })
+                        .await
+                        .unwrap_or_else(|_| unreadable())
+                    }
                     ReleaseItem::UpstreamError => {
                         let (status, text) = rec.responses.last().map_or((0, String::new()), |r| {
                             (r.status, read::error_text(&r.body))
@@ -1226,20 +1229,26 @@ fn settle_result(
     max_result: u64,
     user_resolutions: Option<&Value>,
 ) -> (HostCallResult, Option<&'static str>, bool) {
+    let too_large = || {
+        (
+            rejected_msg(
+                ErrorCode::ResultTooLarge,
+                "the result is above max_call_result_mb",
+            ),
+            Some("result_too_large"),
+            false,
+        )
+    };
     let shape = read::ReadShape::of(spec, params);
     let bodies = rec.responses.iter().map(|r| r.body.as_slice());
-    match read::result_value(spec, shape, bodies, user_resolutions) {
+    // A page's Markdown stops converting at the call's result limit (T10 review B-1).
+    let max_markdown = usize::try_from(max_result).unwrap_or(usize::MAX);
+    match read::result_value(spec, shape, bodies, user_resolutions, max_markdown) {
+        Err(read::Unnormalized::TooLarge) => too_large(),
         Ok(read::Normalized { body, .. }) => {
             let len = serde_json::to_vec(&body).map_or(u64::MAX, |b| b.len() as u64);
             if len > max_result {
-                (
-                    rejected_msg(
-                        ErrorCode::ResultTooLarge,
-                        "the result is above max_call_result_mb",
-                    ),
-                    Some("result_too_large"),
-                    false,
-                )
+                too_large()
             } else {
                 // `atlas.all` pages to the end; a single call that stopped early is lossy, and
                 // so are comments cut at the comments cap (which `atlas.all` keeps).
@@ -1248,15 +1257,20 @@ fn settle_result(
                 (HostCallResult::Ok(body), None, lossy)
             }
         }
-        Err(_) => (
-            rejected_msg(
-                ErrorCode::UpstreamUnavailable,
-                "the answer of the server could not be read",
-            ),
-            Some("upstream_unavailable"),
-            false,
-        ),
+        Err(read::Unnormalized::Rebuild(_)) => unreadable(),
     }
+}
+
+/// A 2xx answer the host could not read.
+fn unreadable() -> (HostCallResult, Option<&'static str>, bool) {
+    (
+        rejected_msg(
+            ErrorCode::UpstreamUnavailable,
+            "the answer of the server could not be read",
+        ),
+        Some("upstream_unavailable"),
+        false,
+    )
 }
 
 #[async_trait]
