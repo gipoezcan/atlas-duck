@@ -34,8 +34,10 @@ pub const CALL_TOO_LARGE: &str = "the host call is above the 1 MiB frame limit";
 pub const CALL_NOT_DECODABLE: &str = "the host call params nest too deeply";
 
 /// The JSON text of the init data the shim reads (`JSON.parse`d once in JS). `max_result_units`
-/// is the terminal-frame budget for the result text in bytes, used by the shim as a UTF-16 unit
-/// bound (a UTF-8 text is never shorter in bytes than in UTF-16 units).
+/// is the terminal-frame budget for the result text in bytes, and `max_frame_units` the worker →
+/// host frame cap, both used by the shim as UTF-16 unit bounds (a UTF-8 text is never shorter in
+/// bytes than in UTF-16 units): a call text above the cap is refused with [`CALL_TOO_LARGE`] and
+/// a log line is cut to it before either is copied to Rust (outside the heap limit).
 pub(crate) fn config_json(
     read_op_ids: &[String],
     instances: &[InstanceInfo],
@@ -45,13 +47,27 @@ pub(crate) fn config_json(
 ) -> serde_json::Result<String> {
     Ok(format!(
         "{{\"read_op_ids\":{},\"instances\":{},\"args\":{},\"max_concurrent_calls\":{},\
-         \"max_result_units\":{}}}",
+         \"max_result_units\":{},\"max_frame_units\":{},\"call_too_large\":{}}}",
         serde_json::to_string(read_op_ids)?,
         serde_json::to_string(instances)?,
         serde_json::to_string(args)?,
         max_concurrent_calls,
         max_result_units,
+        WORKER_FRAME_MAX_BYTES,
+        serde_json::to_string(CALL_TOO_LARGE)?,
     ))
+}
+
+/// The functions the shim returns, read once at install.
+pub(crate) struct ShimApi<'js> {
+    /// `start(main)`: calls `main(args, atlas)`, observes it, returns its promise.
+    pub start: Function<'js>,
+    /// `deliver(frameText)`: the dispatcher, answers 0..=3.
+    pub deliver: Function<'js>,
+    /// `fulfilled(value)`: records a fulfilled `main` (the JSON result rules).
+    pub fulfilled: Function<'js>,
+    /// `fail(thrown)`: records a rejected `main` or a thrown value, described as untrusted payload.
+    pub fail: Function<'js>,
 }
 
 /// Evaluates and runs the `Date` prelude.
@@ -60,16 +76,21 @@ pub(crate) fn install_prelude(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     prelude.call::<_, ()>(())
 }
 
-/// Evaluates the shim, calls it with the natives and the config, and returns `(start, deliver)`.
+/// Evaluates the shim, calls it with the natives and the config, and returns its functions.
 pub(crate) fn install_shim<'js, H: HostPort + 'static>(
     ctx: &Ctx<'js>,
     shared: &Rc<Shared<H>>,
     config: &str,
-) -> rquickjs::Result<(Function<'js>, Function<'js>)> {
+) -> rquickjs::Result<ShimApi<'js>> {
     let natives = natives(ctx, shared)?;
     let shim: Function = ctx.eval(SHIM_JS)?;
     let api: Object = shim.call((natives, config))?;
-    Ok((api.get("start")?, api.get("deliver")?))
+    Ok(ShimApi {
+        start: api.get("start")?,
+        deliver: api.get("deliver")?,
+        fulfilled: api.get("fulfilled")?,
+        fail: api.get("fail")?,
+    })
 }
 
 /// The four natives, as an object the shim reads once.
@@ -144,16 +165,21 @@ fn send_call<H: HostPort>(
     if shared.halted().is_some() {
         return Err(Exception::throw_internal(ctx, HALTED));
     }
-    // The shim numbers calls 1, 2, 3, ...; anything else is a broken shim, not a script error.
+    // The shim numbers calls 1, 2, 3, ... and sends them in increasing id order (gaps where a call
+    // was refused before sending); anything else is a broken shim, not a script error, and is
+    // never sent: a reused id would make the host end the run as a protocol violation.
     if !((1.0..=9_007_199_254_740_991.0).contains(&id) && id.fract() == 0.0) {
         return Err(Exception::throw_internal(ctx, "invalid host call id"));
     }
     let id = id as u64;
+    if id <= shared.last_call_id.get() {
+        return Err(Exception::throw_internal(ctx, "host call id out of order"));
+    }
     if params.len() > WORKER_FRAME_MAX_BYTES {
         return Err(Exception::throw_range(ctx, CALL_TOO_LARGE));
     }
-    // The text is `JSON.stringify` output, so the only way it fails to parse is serde_json's
-    // recursion limit.
+    // The text is the shim's `JSON.stringify` output, so the only way it fails to parse is
+    // serde_json's recursion limit.
     let params: Value =
         serde_json::from_str(params).map_err(|_| Exception::throw_type(ctx, CALL_NOT_DECODABLE))?;
     let call = HostCall {
@@ -174,6 +200,7 @@ fn send_call<H: HostPort>(
     let sent = shared.host.borrow_mut().send_call(id, &call);
     match sent {
         Ok(()) => {
+            shared.last_call_id.set(id);
             shared
                 .outstanding
                 .set(shared.outstanding.get().saturating_add(1));
@@ -192,4 +219,67 @@ fn io_halt<H: HostPort>(
 ) -> rquickjs::Error {
     shared.set_halt(Halt::Io(err.kind()));
     Exception::throw_internal(ctx, HALTED)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::io;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use atlas_duck_ipc::sandbox::HostCall;
+    use rquickjs::{CatchResultExt, Function};
+
+    use super::natives;
+    use crate::engine::{new_context, new_runtime_with_heap_limit};
+    use crate::script::interrupt::Deadline;
+    use crate::script::{HostPort, Shared};
+
+    #[derive(Default)]
+    struct Recorder(Vec<u64>);
+
+    impl HostPort for Recorder {
+        fn send_call(&mut self, id: u64, _call: &HostCall) -> io::Result<()> {
+            self.0.push(id);
+            Ok(())
+        }
+
+        fn send_log(&mut self, _line: &str) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Defence in depth behind the shim's queue: the native never sends an id that is not above
+    /// the last one sent (a reused id would be the host's protocol violation, not the script's).
+    #[test]
+    fn native_call_refuses_an_id_not_above_the_last_sent() -> Result<(), String> {
+        let (rt, meter) = new_runtime_with_heap_limit(16 << 20).map_err(|e| e.to_string())?;
+        let ctx = new_context(&rt).map_err(|e| e.to_string())?;
+        let shared = Rc::new(Shared {
+            host: RefCell::new(Recorder::default()),
+            meter,
+            halt: Cell::new(None),
+            outcome: RefCell::new(None),
+            outstanding: Cell::new(0),
+            last_call_id: Cell::new(0),
+            deadline: Deadline::after(Duration::from_secs(3600)),
+        });
+        let sent = ctx
+            .with(|ctx| -> rquickjs::Result<Vec<bool>> {
+                let call: Function = natives(&ctx, &shared)?.get("call")?;
+                let mut sent = Vec::new();
+                for id in [1.0, 1.0, 3.0, 2.0, 3.0, 4.0] {
+                    let args = (id, "jira.search", "{}", None::<String>, false);
+                    sent.push(call.call::<_, ()>(args).catch(&ctx).is_ok());
+                }
+                Ok(sent)
+            })
+            .map_err(|e| e.to_string())?;
+        assert_eq!(sent, [true, false, true, false, false, true]);
+        assert_eq!(shared.host.borrow().0, [1, 3, 4]);
+        assert_eq!(shared.outstanding.get(), 3);
+        assert!(shared.halted().is_none());
+        Ok(())
+    }
 }

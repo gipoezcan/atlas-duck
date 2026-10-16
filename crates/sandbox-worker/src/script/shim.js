@@ -4,8 +4,14 @@
 // - natives.call(id, opId, paramsJson, instance, all) writes a host.call frame (synchronously);
 // - natives.log(line) writes a host.log frame (synchronously);
 // - natives.ok(json) / natives.err(class, message, stack) record how main settled.
-// It returns { start, deliver }. Every intrinsic it relies on is captured here, before any agent
-// code runs; the natives and the dispatcher are closure captures, never globals.
+// It returns { start, deliver, fulfilled, fail }. Every intrinsic it relies on is captured here,
+// before any agent code runs; the natives and the dispatcher are closure captures, never globals.
+//
+// Rule for everything that runs once main has started: agent code can rewrite every intrinsic
+// prototype, so the shim only calls captured functions, reads own properties of objects it made
+// or parsed, keeps its state in closures and null-prototype objects, and builds property
+// descriptors on null-prototype objects. Agent code it runs on purpose (toJSON, a then getter, a
+// thrown value's fields) sits inside try/catch or a promise job.
 (function (natives, configJson) {
   'use strict';
   var freeze = Object.freeze;
@@ -21,11 +27,10 @@
   var hasOwn = uncurry(Object.prototype.hasOwnProperty);
   var push = uncurry(Array.prototype.push);
   var pop = uncurry(Array.prototype.pop);
-  var shift = uncurry(Array.prototype.shift);
   var join = uncurry(Array.prototype.join);
   var split = uncurry(String.prototype.split);
+  var slice = uncurry(String.prototype.slice);
   var wellFormed = uncurry(String.prototype.toWellFormed);
-  var then = uncurry(Promise.prototype.then);
   var mapGet = uncurry(Map.prototype.get);
   var mapSet = uncurry(Map.prototype.set);
   var mapDelete = uncurry(Map.prototype.delete);
@@ -36,6 +41,7 @@
   var StringCtor = String;
   var ErrorCtor = Error;
   var TypeErrorCtor = TypeError;
+  var RangeErrorCtor = RangeError;
 
   var nativeCall = natives.call;
   var nativeLog = natives.log;
@@ -45,18 +51,37 @@
   var config = jsonParse(configJson);
   var maxConcurrent = config.max_concurrent_calls;
   var maxResultUnits = config.max_result_units;
+  // The worker -> host frame cap in bytes, used as a UTF-16 unit bound (a text never has fewer
+  // UTF-8 bytes than UTF-16 units): a longer call is refused and a longer log line is cut here,
+  // before the text is copied to Rust outside the heap limit.
+  var maxFrameUnits = config.max_frame_units;
+  var callTooLarge = config.call_too_large;
+
+  // A writable, enumerable, configurable data descriptor that inherits nothing.
+  function dataDescriptor(value) {
+    var d = create(null);
+    d.value = value;
+    d.writable = true;
+    d.enumerable = true;
+    d.configurable = true;
+    return d;
+  }
 
   // A host rejection inside the script (spec 9.2): catchable, with the host's class and details.
+  // The fields are defined, not assigned (no setter up the prototype chain runs), and the class
+  // is frozen so its heritage cannot be swapped. Its prototype stays open: freezing it would make
+  // `err.name = ...` on an instance fail (the override mistake), and construction never reads it.
   class AtlasError extends ErrorCtor {
     constructor(cls, details) {
       super('host call rejected: ' + cls);
-      this.class = cls;
-      this.details = details;
+      defineProperty(this, 'class', dataDescriptor(cls));
+      defineProperty(this, 'details', dataDescriptor(details));
     }
   }
   defineProperty(AtlasError.prototype, 'name', {
     value: 'AtlasError', writable: true, enumerable: false, configurable: true
   });
+  freeze(AtlasError);
 
   // Freezes `root` and everything reachable through its own data properties.
   function deepFreeze(root) {
@@ -83,10 +108,15 @@
   }
 
   // Host calls: ids from 1, at most max_concurrent_calls outstanding, the rest queued locally and
-  // sent in call order as earlier ones settle (spec 9.2, 3.4).
+  // sent in call order as earlier ones settle (spec 9.2, 3.4). The queue is a null-prototype
+  // object with head and tail counters: no index accessor on Array.prototype or Object.prototype
+  // can swallow or forge a queued call. Ids leave strictly increasing (deliver pumps the queue
+  // before it settles anything), which the native checks.
   var nextId = 1;
   var outstanding = 0;
-  var queue = [];
+  var queue = create(null);
+  var qHead = 0;
+  var qTail = 0;
   var pending = new MapCtor();
 
   function send(c) {
@@ -102,8 +132,11 @@
   }
 
   function pump() {
-    while (outstanding < maxConcurrent && queue.length > 0) {
-      send(shift(queue));
+    while (outstanding < maxConcurrent && qHead < qTail) {
+      var c = queue[qHead];
+      delete queue[qHead];
+      qHead++;
+      send(c);
     }
   }
 
@@ -129,6 +162,9 @@
       if (typeof text !== 'string') {
         throw new TypeErrorCtor('the params are not JSON-serializable');
       }
+      if (text.length > maxFrameUnits) {
+        throw new RangeErrorCtor(callTooLarge);
+      }
       var c = {
         id: nextId++,
         opId: wellFormed(opId),
@@ -138,17 +174,20 @@
         resolve: resolve,
         reject: reject
       };
+      // While the queue holds calls, `outstanding` is at the cap (pump fills up to it), so a new
+      // call never overtakes a queued one.
       if (outstanding < maxConcurrent) {
         send(c);
       } else {
-        push(queue, c);
+        queue[qTail++] = c;
       }
     });
   }
 
   // One host frame `{"jsonrpc":"2.0","id":n,"result":{"ok":v}|{"rejected":{class,details}}}`,
   // parsed once here. 0 = settled; 1 = not JSON; 2 = wrong shape; 3 = no outstanding call with
-  // that id. Nothing changes unless the answer is 0.
+  // that id. Nothing changes unless the answer is 0, and once the state has changed it returns 0
+  // whatever the agent code it triggers does (a then getter on the value, Error hooks).
   function deliver(text) {
     var msg;
     try {
@@ -157,7 +196,8 @@
       return 1;
     }
     if (msg === null || typeof msg !== 'object' || isArray(msg) || keysOf(msg).length !== 3 ||
-        msg.jsonrpc !== '2.0' || !hasOwn(msg, 'id') || !hasOwn(msg, 'result')) {
+        !hasOwn(msg, 'jsonrpc') || msg.jsonrpc !== '2.0' || !hasOwn(msg, 'id') ||
+        !hasOwn(msg, 'result')) {
       return 2;
     }
     var r = msg.result;
@@ -168,8 +208,8 @@
     if (hasOwn(r, 'rejected')) {
       rejected = r.rejected;
       if (rejected === null || typeof rejected !== 'object' || isArray(rejected) ||
-          keysOf(rejected).length !== 2 || typeof rejected.class !== 'string' ||
-          !hasOwn(rejected, 'details')) {
+          keysOf(rejected).length !== 2 || !hasOwn(rejected, 'class') ||
+          typeof rejected.class !== 'string' || !hasOwn(rejected, 'details')) {
         return 2;
       }
     } else if (!hasOwn(r, 'ok')) {
@@ -181,12 +221,27 @@
     }
     mapDelete(pending, msg.id);
     outstanding--;
-    if (rejected === null) {
-      c.resolve(r.ok);
-    } else {
-      c.reject(new AtlasError(rejected.class, rejected.details));
+    // Queued calls go out before the settlement can run agent code that makes new calls.
+    try {
+      pump();
+    } catch (x) {
+      // Unreachable short of a halt: send catches what the native throws.
     }
-    pump();
+    try {
+      if (rejected === null) {
+        c.resolve(r.ok);
+      } else {
+        var err;
+        try {
+          err = new AtlasError(rejected.class, rejected.details);
+        } catch (x) {
+          err = x;
+        }
+        c.reject(err);
+      }
+    } catch (x) {
+      // Resolve functions do not throw; a halt is reported by Rust.
+    }
     return 0;
   }
 
@@ -257,7 +312,12 @@
         for (var i = 0; i < arguments.length; i++) {
           push(parts, StringCtor(arguments[i]));
         }
-        nativeLog(wellFormed(join(parts, ' ')));
+        var line = join(parts, ' ');
+        if (line.length > maxFrameUnits) {
+          // Cut before wellFormed: the cut may split a surrogate pair.
+          line = slice(line, 0, maxFrameUnits);
+        }
+        nativeLog(wellFormed(line));
       }
     };
     defineProperty(members.ops, 'name', { value: 'ops' });
@@ -324,10 +384,36 @@
     }
   }
 
+  // Observes main's promise with `await`, which (unlike Promise.prototype.then) never looks up a
+  // species constructor. QuickJS-NG reads the promise's `constructor` at the await and, when that
+  // read throws, rejects this observer's own promise instead of throwing at the await; Rust then
+  // reads main's promise state itself and calls `fulfilled` or `fail` (Engine::drain_jobs).
+  async function observe(p) {
+    var v;
+    try {
+      v = await p;
+    } catch (e) {
+      fail(e);
+      return;
+    }
+    fulfilled(v);
+  }
+
   return {
+    // Calls main and returns its promise (undefined if the call threw, which is then settled).
     start: function (main) {
-      then(main(args, atlas), fulfilled, fail);
+      var p;
+      try {
+        p = main(args, atlas);
+      } catch (e) {
+        fail(e);
+        return undefined;
+      }
+      observe(p);
+      return p;
     },
-    deliver: deliver
+    deliver: deliver,
+    fulfilled: fulfilled,
+    fail: fail
   };
 })

@@ -14,7 +14,9 @@
 use std::io;
 use std::time::Duration;
 
-use atlas_duck_ipc::sandbox::script::{InstanceInfo, WorkerInit, encode_response};
+use atlas_duck_ipc::sandbox::script::{
+    InstanceInfo, WorkerInit, encode_response, terminal_frame_max,
+};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_sandbox_worker::engine::{new_context, new_runtime_with_heap_limit};
 use atlas_duck_sandbox_worker::script::alloc::LimitAllocator;
@@ -22,8 +24,8 @@ use atlas_duck_sandbox_worker::script::interrupt::{
     Deadline, OP_BUDGET_CALLBACKS, OpBudget, backstop,
 };
 use atlas_duck_sandbox_worker::script::{
-    CALL_NOT_DECODABLE, CALL_TOO_LARGE, CompileError, Engine, EngineError, Halt, HostPort, Settled,
-    compile, wrapper_source,
+    CALL_NOT_DECODABLE, CALL_TOO_LARGE, CompileError, Engine, EngineError, Halt, HostPort,
+    ScriptError, Settled, compile, wrapper_source,
 };
 use rquickjs::allocator::Allocator;
 use rquickjs::context::intrinsic::{Date, Json, MapSet, Promise, RegExp};
@@ -145,6 +147,43 @@ fn call_ids(sent: &[Sent]) -> Vec<u64> {
         .collect()
 }
 
+fn rejected_frame(id: u64) -> Result<String, String> {
+    let rejected = HostCallResult::Rejected {
+        class: "validation".into(),
+        details: json!({"param": "key"}),
+    };
+    String::from_utf8(encode_response(id, &rejected)).map_err(e)
+}
+
+/// Runs a script to its end, answering every sent call in send order with `answer(id)`; returns
+/// the settlement and the sends. Stops at the first non-pending state or when nothing is left
+/// to answer.
+fn drive(
+    init: &WorkerInit,
+    answer: impl Fn(u64) -> Result<String, String>,
+) -> Result<(Settled, Vec<Sent>), String> {
+    let mut engine = Engine::new(init, FakeHost::default()).map_err(e)?;
+    let mut settled = start_and_drain(&mut engine);
+    let mut answered = 0;
+    loop {
+        if !matches!(settled, Settled::Pending { .. }) {
+            break;
+        }
+        let ids = call_ids(&engine.host().sent);
+        let Some(&id) = ids.get(answered) else {
+            break;
+        };
+        answered += 1;
+        if let Err(halt) = engine.deliver(&answer(id)?) {
+            settled = Settled::Halted(halt);
+            break;
+        }
+        settled = engine.drain_jobs();
+    }
+    let sent = engine.host().sent.clone();
+    Ok((settled, sent))
+}
+
 #[test]
 fn wrapper_compiles_without_running_body() -> TestResult {
     big_stack(|| {
@@ -179,9 +218,21 @@ fn wrapper_escape_is_a_syntax_error() -> TestResult {
             other => return Err(format!("compile: unexpected {other:?}")),
         }
         match Engine::new(&init(escape), FakeHost::default()) {
-            Err(EngineError::Syntax(pos)) if pos.message.contains("wrapper") => Ok(()),
-            Err(other) => Err(format!("run: unexpected {other:?}")),
-            Ok(_) => Err("run: the escape was accepted".into()),
+            Err(EngineError::Syntax(pos)) if pos.message.contains("wrapper") => {}
+            Err(other) => return Err(format!("run: unexpected {other:?}")),
+            Ok(_) => return Err("run: the escape was accepted".into()),
+        }
+        // Escaping top-level code that throws: a syntax error carrying its message, no result
+        // and nothing sent (it ran once, with no natives, `atlas` or `args`).
+        let throwing = "});\nthrow new Error('escaped and threw');\n(async function main(args, atlas) {\natlas.log('x');";
+        match compile(throwing) {
+            Err(CompileError::Syntax(pos)) if pos.message.contains("escaped and threw") => {}
+            other => return Err(format!("compile, throwing: unexpected {other:?}")),
+        }
+        match Engine::new(&init(throwing), FakeHost::default()) {
+            Err(EngineError::Syntax(pos)) if pos.message.contains("escaped and threw") => Ok(()),
+            Err(other) => Err(format!("run, throwing: unexpected {other:?}")),
+            Ok(_) => Err("run, throwing: the escape was accepted".into()),
         }
     })
 }
@@ -347,12 +398,12 @@ fn import_fails_no_module_loader() -> TestResult {
 #[test]
 fn excluded_intrinsics_absent() -> TestResult {
     big_stack(|| {
-        let source = "return ['Proxy', 'WeakRef', 'ArrayBuffer', 'Uint8Array', 'DataView', \
-                      'Atomics', 'SharedArrayBuffer', 'performance', 'Performance', \
-                      'DOMException'].map((n) => typeof globalThis[n]);";
+        let source = "return ['Proxy', 'WeakRef', 'FinalizationRegistry', 'ArrayBuffer', \
+                      'Uint8Array', 'DataView', 'Atomics', 'SharedArrayBuffer', 'performance', \
+                      'Performance', 'DOMException'].map((n) => typeof globalThis[n]);";
         let (settled, _) = run(&init(source))?;
         let got = result_json(&settled)?;
-        if got != json!(vec!["undefined"; 10]) {
+        if got != json!(vec!["undefined"; 11]) {
             return Err(format!("got {got}"));
         }
         let source = "return [typeof JSON, typeof Promise, typeof Map, typeof Set, \
@@ -477,6 +528,9 @@ fn interrupt_deadline_and_op_budget_stop_cpu_loop() -> TestResult {
             "while (true) {}",
             "try { while (true) {} } catch (err) {} return 'caught';",
             "const f = () => Promise.resolve().then(f); f(); await new Promise(() => {});",
+            // Catastrophic backtracking: libregexp polls the interrupt handler (no interpreter
+            // tick happens inside the match).
+            "try { /(a+)+$/.test('a'.repeat(40) + 'b'); } catch (err) {} return 'caught';",
         ];
         for source in deadline_cases {
             let mut engine = Engine::with_interrupts(
@@ -720,6 +774,42 @@ fn atlas_log_stringifies_arguments() -> TestResult {
     })
 }
 
+/// A log line is cut in the shim to the 1 MiB frame cap in UTF-16 units before it is copied to
+/// Rust (the run loop then cuts it exactly in bytes and marks it); a pair split by the cut becomes
+/// U+FFFD.
+#[test]
+fn log_line_is_cut_to_the_frame_cap_before_the_native() -> TestResult {
+    big_stack(|| {
+        let source = r#"
+            atlas.log('x'.repeat(1100000));
+            atlas.log('a' + '\u{1F600}'.repeat(600000));
+            return 0;
+        "#;
+        let (settled, sent) = run(&init(source))?;
+        if result_json(&settled)? != json!(0) {
+            return Err(format!("{settled:?}"));
+        }
+        let cap = 1024 * 1024;
+        match sent.as_slice() {
+            [Sent::Log(ascii), Sent::Log(wide)]
+                if ascii.len() == cap
+                    && wide.encode_utf16().count() == cap
+                    && wide.ends_with("\u{1F600}\u{FFFD}") => {}
+            other => {
+                let lens: Vec<usize> = other
+                    .iter()
+                    .map(|s| match s {
+                        Sent::Log(line) => line.encode_utf16().count(),
+                        Sent::Call(..) => 0,
+                    })
+                    .collect();
+                return Err(format!("sent lines of {lens:?} UTF-16 units"));
+            }
+        }
+        Ok(())
+    })
+}
+
 /// §15 V02 on the script runtime: evaluating the wrapper needs the Eval intrinsic.
 #[test]
 fn v02_host_side_eval_still_needs_eval() -> TestResult {
@@ -846,6 +936,48 @@ fn result_json_rules_and_size_cap() -> TestResult {
     })
 }
 
+/// PD-136 at the exact boundary: a result text of exactly the cap in UTF-8 bytes is a result, one
+/// byte more is `ResultTooLarge`. ASCII is decided by the shim's UTF-16 pre-check; a multi-byte
+/// text whose UTF-16 length is far below the cap is decided by the exact UTF-8 check in Rust.
+#[test]
+fn result_size_cap_exact_boundary() -> TestResult {
+    big_stack(|| {
+        let limits = ScriptLimits {
+            max_result_mb: 1,
+            ..ScriptLimits::default()
+        };
+        // The engine's cap: the terminal frame minus its 64 KiB envelope slack.
+        let cap = terminal_frame_max(&limits) - 64 * 1024;
+        // A string's JSON text is its characters plus two quotes.
+        let ascii = cap - 2;
+        if !ascii.is_multiple_of(2) {
+            return Err(format!("cap {cap} is odd"));
+        }
+        let wide = (cap - 2) / 2;
+        let cases = [
+            (format!("return 'x'.repeat({ascii});"), Some(cap)),
+            (format!("return 'x'.repeat({});", ascii + 1), None),
+            (format!("return '\u{e9}'.repeat({wide});"), Some(cap)),
+            (format!("return '\u{e9}'.repeat({wide}) + 'a';"), None),
+        ];
+        for (source, fits) in cases {
+            let (settled, _) = run(&init_with(&source, json!({}), limits))?;
+            match (fits, settled) {
+                (Some(len), Settled::Result(text)) if text.len() == len => {}
+                (None, Settled::Error(err)) if err.class == "ResultTooLarge" => {}
+                (_, other) => {
+                    let shown = match other {
+                        Settled::Result(text) => format!("a result of {} bytes", text.len()),
+                        other => format!("{other:?}"),
+                    };
+                    return Err(format!("{source}: {shown}"));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 /// A host call the host could not take rejects inside the script and is never sent: params that
 /// nest too deep for the host's decoder (one level deeper inside a `HostCall` than in a bare
 /// `Value` parse; T2 review note) and a frame above 1 MiB.
@@ -930,6 +1062,199 @@ fn uncaught_microtask_exception_is_a_script_error() -> TestResult {
         ))?;
         if result_json(&settled)? != json!(7) {
             return Err(format!("late: {settled:?}"));
+        }
+        Ok(())
+    })
+}
+
+/// The shim only uses intrinsics it captured and objects agent code cannot reach, so tampering
+/// with `Promise`, `Object.prototype`, the `AtlasError` class or `Error` changes what the script
+/// itself sees and never the dispatcher: every run ends as a result, a script error or pending,
+/// never as `Halt::Engine`, and call ids leave strictly increasing.
+#[test]
+fn shim_survives_intrinsic_tampering() -> TestResult {
+    big_stack(|| {
+        type Answer = fn(u64) -> Result<String, String>;
+        let ok: Answer = |id| ok_frame(id, json!({"a": id}));
+        let rejected: Answer = rejected_frame;
+        let cases: [(&str, &str, Answer, Settled); 7] = [
+            (
+                "species getter",
+                r#"
+                Object.defineProperty(Promise, Symbol.species, { get() { return 1; } });
+                const a = await atlas.call('jira.search', {});
+                return a;
+                "#,
+                ok,
+                Settled::Result(r#"{"a":1}"#.into()),
+            ),
+            (
+                // QuickJS-NG rejects an async function's own promise (instead of throwing at the
+                // `await`) when reading `constructor` throws; main's value still reaches the host.
+                "throwing Promise.prototype.constructor, main returns",
+                r#"
+                Object.defineProperty(Promise.prototype, 'constructor', {
+                  get() { throw new Error('ctor'); }
+                });
+                return 5;
+                "#,
+                ok,
+                Settled::Result("5".into()),
+            ),
+            (
+                "throwing Promise.prototype.constructor, main awaits",
+                r#"
+                Object.defineProperty(Promise.prototype, 'constructor', {
+                  get() { throw new Error('ctor'); }
+                });
+                await atlas.call('jira.search', {});
+                return 'after';
+                "#,
+                ok,
+                Settled::Error(ScriptError {
+                    class: "Error".into(),
+                    message: "ctor".into(),
+                    stack: String::new(),
+                }),
+            ),
+            (
+                "Object.prototype setters",
+                r#"
+                for (const k of ['class', 'details', 'name', 'message', 'get', 'set', 'value']) {
+                  Object.defineProperty(Object.prototype, k, {
+                    set() { throw new Error('setter ' + k); }, configurable: true
+                  });
+                }
+                try { await atlas.call('jira.search', {}); return 'resolved'; }
+                catch (e) { return [e.name, e.class, e.details, e.message]; }
+                "#,
+                rejected,
+                Settled::Result(
+                    r#"["AtlasError","validation",{"param":"key"},"host call rejected: validation"]"#
+                        .into(),
+                ),
+            ),
+            (
+                "prototype swap of err.constructor, Error statics",
+                r#"
+                let first;
+                try { await atlas.call('jira.search', {}); } catch (e) { first = e; }
+                let swapped = 'swapped';
+                try { Object.setPrototypeOf(first.constructor, function () { throw 0; }); }
+                catch (err) { swapped = err.name; }
+                Error.prepareStackTrace = () => { throw 0; };
+                Error.stackTraceLimit = { valueOf() { throw 0; } };
+                try { await atlas.call('jira.search', {}); return 'resolved'; }
+                catch (e) { return [swapped, e.name, e.class, e instanceof first.constructor]; }
+                "#,
+                rejected,
+                Settled::Result(r#"["TypeError","AtlasError","validation",true]"#.into()),
+            ),
+            (
+                "throwing Object.prototype getters",
+                r#"
+                for (const k of ['then', 'jsonrpc', 'id', 'result', 'ok', 'rejected', 'class',
+                                 'details', 'resolve', 'reject', 'length']) {
+                  Object.defineProperty(Object.prototype, k, {
+                    get() { throw new Error('getter ' + k); }, configurable: true
+                  });
+                }
+                try { return await atlas.call('jira.search', {}); }
+                catch (e) { return 'caught ' + e.message; }
+                "#,
+                ok,
+                Settled::Result(r#""caught getter then""#.into()),
+            ),
+            (
+                // The settlement of call 1 runs a then getter that makes call 4 while call 3 is
+                // queued: deliver sends 3 before it settles, so 4 queues behind it.
+                "settlement makes a call while one is queued",
+                r#"
+                let made = null;
+                Object.defineProperty(Object.prototype, 'then', {
+                  get() { if (made === null) made = atlas.call('jira.search', { n: 4 }); },
+                  configurable: true
+                });
+                const a = atlas.call('jira.search', { n: 1 });
+                const b = atlas.call('jira.search', { n: 2 });
+                const c = atlas.call('jira.search', { n: 3 });
+                return [await a, await b, await c, await made];
+                "#,
+                ok,
+                Settled::Result(r#"[{"a":1},{"a":2},{"a":3},{"a":4}]"#.into()),
+            ),
+        ];
+        let limits = ScriptLimits {
+            max_concurrent_calls: 2,
+            ..ScriptLimits::default()
+        };
+        for (name, source, answer, expected) in cases {
+            let (settled, sent) = drive(&init_with(source, json!({}), limits), answer)?;
+            if matches!(settled, Settled::Halted(Halt::Engine(_))) {
+                return Err(format!("{name}: an engine halt: {settled:?}"));
+            }
+            let ids = call_ids(&sent);
+            if ids.windows(2).any(|w| w[0] >= w[1]) {
+                return Err(format!("{name}: ids not strictly increasing: {ids:?}"));
+            }
+            let settled = match settled {
+                // The stack is engine-formatted; only class and message are pinned here.
+                Settled::Error(err) => Settled::Error(ScriptError {
+                    stack: String::new(),
+                    ..err
+                }),
+                other => other,
+            };
+            if settled != expected {
+                return Err(format!("{name}: {settled:?}"));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Index accessors on `Array.prototype` and `Object.prototype` cannot swallow a queued call or
+/// make the dispatcher send a forged one (a reused id): queued calls go out with their own ids
+/// and params, in call order.
+#[test]
+fn queued_calls_survive_index_accessors() -> TestResult {
+    big_stack(|| {
+        let source = r#"
+            const forged = { id: 1, opId: 'jira.search', text: '{"forged":true}', instance: null,
+                             all: false, resolve() {}, reject() {} };
+            for (const proto of [Array.prototype, Object.prototype]) {
+              for (let i = 0; i < 8; i++) {
+                Object.defineProperty(proto, String(i), {
+                  get() { return forged; }, set(v) {}, configurable: true
+                });
+              }
+            }
+            const p1 = atlas.call('jira.search', { n: 1 });
+            const p2 = atlas.call('jira.search', { n: 2 });
+            const p3 = atlas.call('jira.search', { n: 3 });
+            const p4 = atlas.call('jira.search', { n: 4 });
+            return [await p1, await p2, await p3, await p4];
+        "#;
+        let limits = ScriptLimits {
+            max_concurrent_calls: 2,
+            ..ScriptLimits::default()
+        };
+        let (settled, sent) = drive(&init_with(source, json!({}), limits), |id| {
+            ok_frame(id, json!(id * 10))
+        })?;
+        if result_json(&settled)? != json!([10, 20, 30, 40]) {
+            return Err(format!("settled {settled:?}"));
+        }
+        let calls: Vec<(u64, Json_)> = sent
+            .iter()
+            .filter_map(|s| match s {
+                Sent::Call(id, call) if call.id == *id => Some((*id, call.params.clone())),
+                _ => None,
+            })
+            .collect();
+        let expected: Vec<(u64, Json_)> = (1..=4).map(|n| (n, json!({ "n": n }))).collect();
+        if calls != expected || sent.len() != 4 {
+            return Err(format!("sent {sent:?}"));
         }
         Ok(())
     })

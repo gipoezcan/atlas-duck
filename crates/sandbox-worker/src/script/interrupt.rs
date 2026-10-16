@@ -7,6 +7,14 @@
 //!
 //! QuickJS calls the interrupt handler once per `JS_INTERRUPT_COUNTER_INIT` (10 000) interpreter
 //! ticks (loop back-edges and calls), so the [`OpBudget`] counts callbacks, not instructions.
+//!
+//! Only code that polls reaches the handler: the interpreter, regex execution (libregexp polls
+//! during backtracking) and some array natives (`every`, `reduce`, `includes`, `indexOf`,
+//! `lastIndexOf`, `find`). Other native loops never poll, e.g.
+//! `Array.prototype.copyWithin.call({ length: 2 ** 53 - 1 }, 0, 1)` probes and deletes about
+//! 9e15 properties inside one native call without allocating. Neither the backstop deadline nor
+//! the op budget can stop such a run; the host's `timeout_s` kill (PD-135) ends it, which is
+//! correct: the host's timer is the authoritative one.
 
 use std::time::{Duration, Instant};
 
@@ -16,9 +24,15 @@ use atlas_duck_ipc::sandbox::ScriptLimits;
 pub const BACKSTOP_SLACK: Duration = Duration::from_secs(2);
 
 /// Interrupt callbacks a run may use (plan value, PD-135): 2^25 callbacks ≈ 3.4 × 10^11
-/// interpreter ticks, more than any run executes within the largest configurable timeout
-/// (4 × 120 s + 2 s) on current hardware. It bounds a CPU-bound run whose clock reads stall; the
-/// deadline normally ends it first.
+/// interpreter ticks. It bounds a CPU-bound run of polling code whose clock reads stall; the
+/// deadline normally ends a run first.
+///
+/// Headroom estimate, not a measurement: the budget outlasts the largest configurable timeout
+/// (4 × 120 s + 2 s = 482 s) only while the interpreter runs below about 3.4e11 / 482 ≈ 7e8
+/// ticks/s. A bare `for (;;) {}` is one `OP_goto` plus a counter decrement per tick, and its
+/// rate on CI hardware is unmeasured (Task 25 measures it). If the budget fires first, a long
+/// CPU-bound run ends as a worker-reported `OpBudget` runtime error instead of the host's
+/// `timeout_s`: conservative, never a leak.
 pub const OP_BUDGET_CALLBACKS: u64 = 1 << 25;
 
 /// The worker's backstop for a run: `timeout_s + 2 s`.

@@ -1,4 +1,4 @@
-//! The script engine of a run worker (spec Â§9.2, Â§9.3, Â§9.4; plan M8 PD-131, PD-134, PD-135,
+//! The script engine of a run worker (spec §9.2, §9.3, §9.4; plan M8 PD-131, PD-134, PD-135,
 //! PD-136, PD-151, PD-152).
 //!
 //! One [`Engine`] per run, on the worker's main thread: a fresh QuickJS runtime whose allocations
@@ -10,7 +10,7 @@
 //! script runs; after a heap refusal nothing more is sent (PD-134).
 //!
 //! [`compile`] is the compile mode: it evaluates the wrapper in a fresh runtime and reports a
-//! syntax error with its position in the agent's source (wrapper line âˆ’ 1).
+//! syntax error with its position in the agent's source (wrapper line − 1).
 
 #![deny(clippy::unwrap_used, clippy::expect_used, unsafe_code)]
 
@@ -28,9 +28,10 @@ use std::time::Duration;
 use atlas_duck_ipc::sandbox::script::{WorkerInit, terminal_frame_max};
 use atlas_duck_ipc::sandbox::{HostCall, ScriptLimits};
 use rquickjs::function::This;
+use rquickjs::promise::PromiseState;
 use rquickjs::runtime::MemoryUsage;
 use rquickjs::{
-    CatchResultExt, CaughtError, Coerced, Context, Ctx, Exception, Function, Object, Persistent,
+    CatchResultExt, CaughtError, Context, Ctx, Exception, Function, Object, Persistent, Promise,
     Runtime, Value,
 };
 
@@ -42,7 +43,7 @@ pub use shim::{CALL_NOT_DECODABLE, CALL_TOO_LARGE, PRELUDE_JS, SHIM_JS};
 
 const MIB: usize = 1024 * 1024;
 
-/// The slack `terminal_frame_max` adds above `max_result_mb` for the frame envelope (Â§3.4).
+/// The slack `terminal_frame_max` adds above `max_result_mb` for the frame envelope (§3.4).
 const TERMINAL_FRAME_SLACK: usize = 64 * 1024;
 
 /// The worker's compile-mode backstop: the host's 10 s compile deadline (PD-135) plus the 2 s
@@ -64,7 +65,7 @@ pub const RESULT_TOO_LARGE: &str = "the result is above max_result_mb";
 /// Plan text: a thrown value whose text could not be read (as in the shim's `describe`).
 pub const UNDESCRIBABLE: &str = "the thrown value could not be described";
 
-/// The wrapper the agent's source is compiled in (Â§9.2): the body of
+/// The wrapper the agent's source is compiled in (§9.2): the body of
 /// `async function main(args, atlas)`.
 pub fn wrapper_source(source: &str) -> String {
     let mut s = String::with_capacity(WRAPPER_PREFIX.len() + source.len() + WRAPPER_SUFFIX.len());
@@ -93,17 +94,17 @@ pub struct SyntaxPos {
 /// Why a run stopped without a settlement of `main`. Sticky: once set, every entry reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Halt {
-    /// The QuickJS allocator refused a request above `heap_mb` (PD-134 â†’ `EXIT_HEAP_LIMIT`).
+    /// The QuickJS allocator refused a request above `heap_mb` (PD-134 → `EXIT_HEAP_LIMIT`).
     HeapLimit,
-    /// An allocation failed below `heap_mb`: the process is out of memory (â†’ `EXIT_PROCESS_LIMIT`).
+    /// An allocation failed below `heap_mb`: the process is out of memory (→ `EXIT_PROCESS_LIMIT`).
     ProcessLimit,
     /// The worker's backstop deadline (`timeout_s + 2 s`) passed (a runtime error, PD-135).
     Deadline,
     /// The run used up its interrupt-callback budget (a runtime error, PD-135).
     OpBudget,
-    /// A send to the host failed (â†’ `EXIT_IO`).
+    /// A send to the host failed (→ `EXIT_IO`).
     Io(io::ErrorKind),
-    /// A host frame the dispatcher cannot use (â†’ `EXIT_PROTOCOL`).
+    /// A host frame the dispatcher cannot use (→ `EXIT_PROTOCOL`).
     Protocol(&'static str),
     /// An engine failure that is neither the script's nor the host's.
     Engine(&'static str),
@@ -127,7 +128,7 @@ pub enum EngineError {
     Init(String),
 }
 
-/// What `main` threw or rejected with, as untrusted payload (Â§9.5).
+/// What `main` threw or rejected with, as untrusted payload (§9.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptError {
     pub class: String,
@@ -143,7 +144,7 @@ pub enum Settled {
     Pending {
         outstanding: usize,
     },
-    /// `main` fulfilled; the JSON text of its value (`undefined` â†’ `null`), within the terminal
+    /// `main` fulfilled; the JSON text of its value (`undefined` → `null`), within the terminal
     /// frame's budget.
     Result(String),
     /// `main` rejected, or its value is not JSON or too large (`TypeError`, `ResultTooLarge`).
@@ -163,6 +164,8 @@ struct Shared<H> {
     halt: Cell<Option<Halt>>,
     outcome: RefCell<Option<Outcome>>,
     outstanding: Cell<usize>,
+    /// The id of the last `host.call` sent; the next one must be above it.
+    last_call_id: Cell<u64>,
     deadline: Deadline,
 }
 
@@ -214,12 +217,18 @@ fn meter_halt(meter: &LimitState) -> Option<Halt> {
     }
 }
 
+type MainPromise = Persistent<Promise<'static>>;
+
 /// The script engine of one run.
 pub struct Engine<H: HostPort + 'static> {
     // The persistent handles come first: they must be dropped while the runtime is alive.
     main: Persistent<Function<'static>>,
     start_fn: Persistent<Function<'static>>,
     deliver_fn: Persistent<Function<'static>>,
+    fulfilled_fn: Persistent<Function<'static>>,
+    fail_fn: Persistent<Function<'static>>,
+    /// The promise `main` returned, once started.
+    main_promise: Option<MainPromise>,
     ctx: Context,
     rt: Runtime,
     shared: Rc<Shared<H>>,
@@ -256,6 +265,7 @@ impl<H: HostPort + 'static> Engine<H> {
             halt: Cell::new(None),
             outcome: RefCell::new(None),
             outstanding: Cell::new(0),
+            last_call_id: Cell::new(0),
             deadline,
         });
         let in_handler = Rc::clone(&shared);
@@ -272,37 +282,33 @@ impl<H: HostPort + 'static> Engine<H> {
         )
         .map_err(|_| EngineError::Init("the init data does not serialize".to_owned()))?;
 
-        type Handles = (
-            Persistent<Function<'static>>,
-            Persistent<Function<'static>>,
-            Persistent<Function<'static>>,
-        );
+        type Handles = [Persistent<Function<'static>>; 5];
         let built = ctx.with(|ctx| -> Result<Handles, EngineError> {
             // Captured before any agent code can run (the wrapper's own evaluation included).
             let to_string = function_to_string(&ctx).map_err(|err| init_error(&ctx, err))?;
             shim::install_prelude(&ctx).map_err(|err| init_error(&ctx, err))?;
-            let (start, deliver) =
+            let api =
                 shim::install_shim(&ctx, &shared, &config).map_err(|err| init_error(&ctx, err))?;
             let main =
                 compile_wrapper(&ctx, &to_string, &init.source).map_err(|err| match err {
                     CompileError::Syntax(pos) => EngineError::Syntax(pos),
                     CompileError::Halted(halt) => EngineError::Halted(halt),
                 })?;
-            Ok((
-                Persistent::save(&ctx, main),
-                Persistent::save(&ctx, start),
-                Persistent::save(&ctx, deliver),
-            ))
+            Ok([main, api.start, api.deliver, api.fulfilled, api.fail]
+                .map(|function| Persistent::save(&ctx, function)))
         });
         // A halt during set-up (a heap refusal, the deadline) explains any error it caused.
         if let Some(halt) = shared.halted() {
             return Err(EngineError::Halted(halt));
         }
-        let (main, start_fn, deliver_fn) = built?;
+        let [main, start_fn, deliver_fn, fulfilled_fn, fail_fn] = built?;
         Ok(Engine {
             main,
             start_fn,
             deliver_fn,
+            fulfilled_fn,
+            fail_fn,
+            main_promise: None,
             ctx,
             rt,
             shared,
@@ -313,6 +319,9 @@ impl<H: HostPort + 'static> Engine<H> {
     }
 
     /// Calls `main(args, atlas)`: the body runs up to its first `await`. Call once.
+    ///
+    /// The shim's `start` catches everything agent code can throw, so only a halt (an
+    /// uncatchable interrupt) makes the call fail.
     pub fn start(&mut self) -> Result<(), Halt> {
         if let Some(halt) = self.shared.halted() {
             return Err(halt);
@@ -321,18 +330,24 @@ impl<H: HostPort + 'static> Engine<H> {
             return Err(Halt::Engine("start called twice"));
         }
         self.started = true;
-        let called = self.ctx.with(|ctx| -> rquickjs::Result<()> {
-            let start = self.start_fn.clone().restore(&ctx)?;
-            let main = self.main.clone().restore(&ctx)?;
-            start
-                .call::<_, ()>((main,))
-                .catch(&ctx)
-                .map_err(|_| rquickjs::Error::Unknown)
-        });
+        let called = self
+            .ctx
+            .with(|ctx| -> rquickjs::Result<Option<MainPromise>> {
+                let start = self.start_fn.clone().restore(&ctx)?;
+                let main = self.main.clone().restore(&ctx)?;
+                let returned: Value = start
+                    .call((main,))
+                    .catch(&ctx)
+                    .map_err(|_| rquickjs::Error::Unknown)?;
+                Ok(returned
+                    .into_promise()
+                    .map(|promise| Persistent::save(&ctx, promise)))
+            });
         if let Some(halt) = self.shared.halted() {
             return Err(halt);
         }
-        called.map_err(|_| Halt::Engine("starting main failed"))
+        self.main_promise = called.map_err(|_| Halt::Engine("starting main failed"))?;
+        Ok(())
     }
 
     /// Runs promise jobs until none is pending (PD-131 step 1) and reports the run's state.
@@ -350,17 +365,25 @@ impl<H: HostPort + 'static> Engine<H> {
                 }
                 // Promise reactions turn exceptions into rejections; an exception escapes a job
                 // only from a `queueMicrotask` callback. Like an uncaught exception it ends the
-                // run as a script error, unless `main` settled first.
-                let thrown = self.ctx.with(|ctx| describe_thrown(ctx.catch()));
+                // run as a script error, unless `main` settled first. The shim's `fail` describes
+                // it, as it describes a rejection of `main`.
+                self.ctx.with(|ctx| {
+                    let thrown = ctx.catch();
+                    self.observe_main(&ctx);
+                    self.record(&ctx, &self.fail_fn, thrown);
+                });
                 if let Some(halt) = self.shared.halted() {
                     return Settled::Halted(halt);
                 }
-                self.shared.settle(Outcome::Error(thrown));
                 break;
             }
         }
         if self.finished {
             return Settled::Halted(Halt::Engine("the run already settled"));
+        }
+        self.ctx.with(|ctx| self.observe_main(&ctx));
+        if let Some(halt) = self.shared.halted() {
+            return Settled::Halted(halt);
         }
         let outcome = self.shared.outcome.borrow_mut().take();
         match outcome {
@@ -437,6 +460,56 @@ impl<H: HostPort + 'static> Engine<H> {
     /// The host port, mutably (never while the script runs).
     pub fn host_mut(&self) -> RefMut<'_, H> {
         self.shared.host.borrow_mut()
+    }
+
+    /// Records how `main` settled from its promise's own state (`JS_PromiseState`, no property
+    /// lookup, no agent code), when nothing is recorded yet. The shim's observer normally records
+    /// it first; QuickJS-NG drops that observer when reading the promise's `constructor` throws
+    /// (it rejects the observer's own promise instead of throwing at its `await`).
+    fn observe_main(&self, ctx: &Ctx<'_>) {
+        if self.shared.outcome.borrow().is_some() {
+            return;
+        }
+        let Some(promise) = &self.main_promise else {
+            return;
+        };
+        let Ok(promise) = promise.clone().restore(ctx) else {
+            return;
+        };
+        let recorder = match promise.state() {
+            PromiseState::Pending => return,
+            PromiseState::Resolved => &self.fulfilled_fn,
+            PromiseState::Rejected => &self.fail_fn,
+        };
+        // A rejection value comes back as the pending exception.
+        let value = match promise.result::<Value>() {
+            Some(Ok(value)) => value,
+            _ => ctx.catch(),
+        };
+        self.record(ctx, recorder, value);
+    }
+
+    /// Calls the shim's `fulfilled` or `fail` with `value`. Both catch what agent code throws;
+    /// should one fail anyway without a halt, the run still ends as a script error.
+    fn record<'js>(
+        &self,
+        ctx: &Ctx<'js>,
+        recorder: &Persistent<Function<'static>>,
+        value: Value<'js>,
+    ) {
+        let called = recorder.clone().restore(ctx).and_then(|recorder| {
+            recorder
+                .call::<_, ()>((value,))
+                .catch(ctx)
+                .map_err(|_| rquickjs::Error::Unknown)
+        });
+        if called.is_err() && self.shared.halted().is_none() {
+            self.shared.settle(Outcome::Error(ScriptError {
+                class: "Error".to_owned(),
+                message: UNDESCRIBABLE.to_owned(),
+                stack: String::new(),
+            }));
+        }
     }
 
     /// The halt, also checking the deadline between promise jobs (a job loop may run without
@@ -586,7 +659,7 @@ fn position_in_stack(stack: &str) -> Option<(u32, u32)> {
     Some((line, column))
 }
 
-/// Maps a wrapper position to the agent's source: line âˆ’ 1, clamped to the source (an error
+/// Maps a wrapper position to the agent's source: line − 1, clamped to the source (an error
 /// QuickJS reports on the wrapper's closing line, e.g. an unclosed comment, lands at the end of
 /// the source's last line).
 fn to_agent_position(line: u32, column: u32, source: &str) -> (u32, u32) {
@@ -616,26 +689,6 @@ fn position_of(source: &str, at: usize) -> (u32, u32) {
         u32::try_from(line).unwrap_or(u32::MAX),
         u32::try_from(column).unwrap_or(u32::MAX),
     )
-}
-
-/// A value thrown past every handler, as untrusted payload (§9.5): `name`, `message` and `stack`
-/// when they are strings, else the defaults the shim's `describe` uses.
-fn describe_thrown(value: Value<'_>) -> ScriptError {
-    let field = |obj: &Object<'_>, key: &str| obj.get::<_, Option<String>>(key).ok().flatten();
-    match value.as_object() {
-        Some(obj) => ScriptError {
-            class: field(obj, "name").unwrap_or_else(|| "Error".to_owned()),
-            message: field(obj, "message").unwrap_or_default(),
-            stack: field(obj, "stack").unwrap_or_default(),
-        },
-        None => ScriptError {
-            class: "Error".to_owned(),
-            message: value
-                .get::<Coerced<String>>()
-                .map_or_else(|_| UNDESCRIBABLE.to_owned(), |text| text.0),
-            stack: String::new(),
-        },
-    }
 }
 
 /// An init failure: the JS exception's text when there is one.
