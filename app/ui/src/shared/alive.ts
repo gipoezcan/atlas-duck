@@ -22,10 +22,20 @@ function countViolations(doc: Document): void {
   if (root.hasAttribute(VIOLATIONS_ATTR)) return;
   let count = 0;
   root.setAttribute(VIOLATIONS_ATTR, '0');
-  doc.addEventListener('securitypolicyviolation', () => {
+  doc.addEventListener('securitypolicyviolation', (e) => {
     count += 1;
     root.setAttribute(VIOLATIONS_ATTR, String(count));
+    root.setAttribute(LAST_VIOLATION_ATTR, describeViolation(e));
   });
+}
+
+/** The directive and the blocked resource (query and fragment cut, 120 characters) of the last violation: what the failing flow prints. */
+export const LAST_VIOLATION_ATTR = 'data-csp-last';
+
+function describeViolation(e: Event): string {
+  const v = e as Partial<SecurityPolicyViolationEvent>;
+  const blocked = String(v.blockedURI ?? '').split(/[?#]/)[0];
+  return `${v.effectiveDirective ?? v.violatedDirective ?? '?'} ${blocked}`.slice(0, 120);
 }
 
 export function markAlive(doc: Document = document): void {

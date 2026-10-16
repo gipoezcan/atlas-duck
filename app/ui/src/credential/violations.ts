@@ -8,12 +8,18 @@
 
 export const VIOLATIONS_ATTR = 'data-csp-violations';
 
+/** The directive and the blocked resource (query and fragment cut, 120 characters) of the last violation: what the failing flow prints. */
+export const LAST_VIOLATION_ATTR = 'data-csp-last';
+
 export function countViolations(doc: Document = document): void {
   const root = doc.documentElement;
   let count = 0;
   root.setAttribute(VIOLATIONS_ATTR, '0');
-  doc.addEventListener('securitypolicyviolation', () => {
+  doc.addEventListener('securitypolicyviolation', (e) => {
     count += 1;
     root.setAttribute(VIOLATIONS_ATTR, String(count));
+    const v = e as Partial<SecurityPolicyViolationEvent>;
+    const blocked = String(v.blockedURI ?? '').split(/[?#]/)[0];
+    root.setAttribute(LAST_VIOLATION_ATTR, `${v.effectiveDirective ?? v.violatedDirective ?? '?'} ${blocked}`.slice(0, 120));
   });
 }
