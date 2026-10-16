@@ -81,7 +81,15 @@ fn push(out: &mut Vec<DiffLine>, op: DiffOp, text: &str) {
 pub fn line_diff(old: &str, new: &str) -> LineDiff {
     let a: Vec<&str> = old.split_inclusive('\n').collect();
     let b: Vec<&str> = new.split_inclusive('\n').collect();
-    let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    line_diff_lines(&a, &b)
+}
+
+/// [`line_diff`] over lines the caller split (M7 Task 15, T7 review I-2: the raw storage diff
+/// diffs `convert::storage_lines`, which end at block tags too). Each line is kept exactly as
+/// given, never split again and never joined, so the script is byte-faithful to the
+/// concatenation of each side; the caps are those of [`line_diff`].
+pub fn line_diff_lines(a: &[&str], b: &[&str]) -> LineDiff {
+    let prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
     let a_rest = a.get(prefix..).unwrap_or_default();
     let b_rest = b.get(prefix..).unwrap_or_default();
     let suffix = a_rest

@@ -1749,6 +1749,7 @@ pub fn edit_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         rendered: diff.rendered.lines,
         raw: diff.raw.lines,
         raw_only_changes: diff.raw_only,
+        constructs: None,
         requests,
     };
     model.header.hidden_in_preview_bytes = diff.headings_cut.saturating_add(cut);

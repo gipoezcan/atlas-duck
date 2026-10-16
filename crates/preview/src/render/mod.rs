@@ -175,10 +175,11 @@ impl Doc {
         self.value(&shown, Frame::Quoted);
     }
 
-    /// One diff line (raw): display-escaped, PD-69 line notation, in `<bdi>`. The caller puts
-    /// every diff line in a `<pre>`, so a whitespace-only change shows without the stylesheet.
-    pub(crate) fn diff_line(&mut self, s: &str) {
-        let shown = ws::visible_line(&invisible::escape_for_display(s));
+    /// One diff line (raw): display-escaped, PD-69 line notation (the missing-newline mark only
+    /// when the line ends its side, `side_end`), in `<bdi>`. The caller puts every diff line in
+    /// a `<pre>`, so a whitespace-only change shows without the stylesheet.
+    pub(crate) fn diff_line(&mut self, s: &str, side_end: bool) {
+        let shown = ws::visible_line_at(&invisible::escape_for_display(s), side_end);
         self.bdi(&shown);
     }
 

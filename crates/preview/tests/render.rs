@@ -9,7 +9,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff};
+use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff, line_diff_lines};
 use atlas_duck_preview::invisible::{self, escape_for_display};
 use atlas_duck_preview::render::{self, DOC_MAX_BYTES, DOC_MAX_DIFF_LINES, DOC_MAX_ROWS, ws};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
@@ -299,6 +299,7 @@ fn variants() -> Vec<(&'static str, Preview)> {
                     rendered: edit_lines(),
                     raw: edit_lines(),
                     raw_only_changes: 1,
+                    constructs: None,
                     requests: requests(),
                 },
                 vec![Warning::new(
@@ -560,10 +561,40 @@ fn confluence_extras() -> Vec<(&'static str, Preview)> {
         vec![Warning::new(WarningId::Conflict, warning::conflict(5, 6))],
     );
     conflict.approvable = false;
+    // M7 Task 15: a `page.update` card: the rendered diff of the Markdown projections, the raw
+    // diff of the storage lines (no `\n` but at a side's end), the outgoing storage constructs.
+    let update = confluence(
+        "write",
+        "confluence.page.update",
+        PreviewBody::EditDiff {
+            rendered: line_diff("# Plan\n\n[macro: toc {}]\n\nold\n", "# Plan\n\nnew\n").lines,
+            raw: line_diff_lines(
+                &[
+                    "<h1>Plan</h1>",
+                    "<ac:structured-macro ac:name=\"toc\"/>",
+                    "<p>old</p>",
+                ],
+                &["<h1>Plan</h1>", "<p>new</p>"],
+            )
+            .lines,
+            raw_only_changes: 0,
+            constructs: Some(ConstructList {
+                macros: vec!["code".into()],
+                links: vec!["https://example.com/".into()],
+                ..ConstructList::default()
+            }),
+            requests: confluence_requests("PUT", "/rest/api/content/65537"),
+        },
+        vec![Warning::new(
+            WarningId::LossyUpdate,
+            warning::lossy_update(1, 0, 0, 0),
+        )],
+    );
     vec![
         ("confluence_page_view", page_view),
         ("confluence_attachment_collision", collision),
         ("confluence_conflict_intended", conflict),
+        ("confluence_update_diff", update),
     ]
 }
 
@@ -684,8 +715,8 @@ fn goldens_have_no_class_or_style_attribute() -> TestResult {
         n += 1;
     }
     assert_eq!(
-        n, 22,
-        "18 variants + 3 Confluence extras + the header golden"
+        n, 23,
+        "18 variants + 4 Confluence extras + the header golden"
     );
     Ok(())
 }
@@ -1084,6 +1115,7 @@ fn arbitrary_preview(kind: usize, s: &[String]) -> Preview {
             rendered: lines(0),
             raw: lines(3),
             raw_only_changes: 1,
+            constructs: Some(constructs(6)),
             requests: vec![req(3)],
         },
         12 => PreviewBody::Transition {
@@ -1355,6 +1387,7 @@ fn pd69_trailing_ws_cr_and_missing_newline_visible() {
             rendered: Vec::new(),
             raw,
             raw_only_changes: 3,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),
@@ -1378,6 +1411,92 @@ fn pd69_trailing_ws_cr_and_missing_newline_visible() {
         "{}",
         doc(&w)
     );
+}
+
+/// M7 Task 15 (T7 review I-2): a raw storage diff ends its lines at block tags, so most lines
+/// carry no `\n`. The marker says where a side's text ends: only the last old-side line
+/// (`Same`/`Del`) and the last new-side line (`Same`/`Add`) of a section can carry it; a line
+/// without `\n` anywhere else gets none.
+#[test]
+fn no_newline_marker_only_where_a_side_ends() {
+    let marker = |p: &Preview| doc(p).matches(ws::NO_NEWLINE_AT_END).count();
+    let edit = |raw: Vec<DiffLine>| {
+        preview(
+            "write",
+            PreviewBody::EditDiff {
+                rendered: Vec::new(),
+                raw,
+                raw_only_changes: 0,
+                constructs: None,
+                requests: Vec::new(),
+            },
+            Vec::new(),
+        )
+    };
+    // Storage lines: only `<p>c</p>`, the end of both sides, is marked.
+    let raw = line_diff_lines(
+        &["<p>a</p>", "<p>b</p>", "<p>c</p>"],
+        &["<p>a</p>", "<p>B</p>", "<p>c</p>"],
+    )
+    .lines;
+    let d = doc(&edit(raw.clone()));
+    assert_eq!(marker(&edit(raw)), 1, "{d}");
+    assert!(
+        d.contains(&format!(
+            "<bdi>&lt;p&gt;c&lt;/p&gt; <mark>{}</mark></bdi>",
+            ws::NO_NEWLINE_AT_END
+        )),
+        "{d}"
+    );
+    assert!(
+        d.contains("<del><bdi>&lt;p&gt;b&lt;/p&gt;</bdi></del>"),
+        "{d}"
+    );
+    // The old side ends in a `Del`, the new side in an `Add`: both marked.
+    let raw = line_diff_lines(&["<p>a</p>", "<p>b</p>"], &["<p>a</p>", "<p>c</p>"]).lines;
+    assert_eq!(marker(&edit(raw)), 2);
+    // `x` against `x\n` (a final newline added) still differs visibly (PD-69).
+    let raw = line_diff("x", "x\n").lines;
+    let d = doc(&edit(raw));
+    assert!(
+        d.contains(&format!(
+            "<del><bdi>x <mark>{}</mark></bdi></del>",
+            ws::NO_NEWLINE_AT_END
+        )),
+        "{d}"
+    );
+    assert!(d.contains("<ins><bdi>x</bdi></ins>"), "{d}");
+    // Each field's section has its own ends.
+    let field = |t: &str| DiffLine {
+        op: DiffOp::Field,
+        text: t.into(),
+    };
+    let mut raw = vec![field("one")];
+    raw.extend(line_diff_lines(&["p", "q"], &["p", "r"]).lines);
+    raw.push(field("two"));
+    raw.extend(line_diff_lines(&["s"], &["s"]).lines);
+    assert_eq!(marker(&edit(raw)), 3);
+}
+
+/// M7 Task 15 (T9 review I-2, ruling a; §7.6 "the preview lists every macro, mention, include
+/// and link target present in an outgoing payload"): an update card lists the outgoing storage
+/// constructs after its diffs, whatever the diff caps left out; a Jira edit has no list.
+#[test]
+fn edit_diff_lists_the_outgoing_constructs() {
+    let d = golden_doc("confluence_update_diff");
+    let list = d
+        .find("<h3>Storage constructs in the body</h3>")
+        .unwrap_or(0);
+    assert!(
+        list > d.find("<h2>Raw diff</h2>").unwrap_or(usize::MAX),
+        "{d}"
+    );
+    assert!(
+        list < d.find("<h2>Requests to be sent</h2>").unwrap_or(0),
+        "{d}"
+    );
+    assert!(d.contains("<th>macros</th><td><bdi>code</bdi></td>"), "{d}");
+    assert!(!golden_doc("edit_diff").contains("Storage constructs"));
 }
 
 #[test]
@@ -1435,6 +1554,7 @@ fn whitespace_shows_without_the_stylesheet() {
             rendered: Vec::new(),
             raw: line_diff("a  b\n", "a b\n").lines,
             raw_only_changes: 0,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),
@@ -1460,6 +1580,7 @@ fn whitespace_shows_without_the_stylesheet() {
             rendered: Vec::new(),
             raw: line_diff("x\n", "  x\n").lines,
             raw_only_changes: 0,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),
@@ -1715,6 +1836,7 @@ fn caps_insert_hidden_note_and_count_bytes() {
             rendered: Vec::new(),
             raw,
             raw_only_changes: 0,
+            constructs: None,
             requests: Vec::new(),
         },
         Vec::new(),

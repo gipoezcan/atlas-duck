@@ -356,6 +356,7 @@ fn bodies() -> Vec<PreviewBody> {
                 text: "h1. new".into(),
             }],
             raw_only_changes: 1,
+            constructs: None,
             requests: requests(),
         },
         PreviewBody::Transition {

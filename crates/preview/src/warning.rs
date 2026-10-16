@@ -282,9 +282,15 @@ pub fn duplicate_title(title: &str, space: &str) -> String {
     format!("a page titled '{title}' already exists in {space}")
 }
 
-/// "this update will remove N macros / M images / K links" (§7.6)
-pub fn lossy_update(macros: u64, images: u64, links: u64) -> String {
-    format!("this update will remove {macros} macros / {images} images / {links} links")
+/// "this update will remove N macros / M images / K links" (§7.6), plus ", L layouts" when
+/// layouts are lost (M7 lead ruling Q10, PD-104: §6.2 amendment).
+pub fn lossy_update(macros: u64, images: u64, links: u64, layouts: u64) -> String {
+    let mut text =
+        format!("this update will remove {macros} macros / {images} images / {links} links");
+    if layouts > 0 {
+        text.push_str(&format!(", {layouts} layouts"));
+    }
+    text
 }
 
 /// "includes summary/status of N linked/parent/sub-task issues"

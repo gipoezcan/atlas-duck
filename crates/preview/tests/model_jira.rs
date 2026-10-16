@@ -70,6 +70,7 @@ fn bodies() -> Vec<PreviewBody> {
                 text: "y".to_owned(),
             }],
             raw_only_changes: 1,
+            constructs: None,
             requests: vec![req()],
         },
         PreviewBody::Transition {

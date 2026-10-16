@@ -156,8 +156,13 @@ fn parameterized_texts() {
         "link type named by its inward phrase 'is blocked by': the inward issue gets the outward phrase 'blocks'"
     );
     assert_eq!(
-        lossy_update(1, 2, 3),
+        lossy_update(1, 2, 3, 0),
         "this update will remove 1 macros / 2 images / 3 links"
+    );
+    // M7 lead ruling Q10 (PD-104): lost layouts are appended only when there are any.
+    assert_eq!(
+        lossy_update(0, 0, 1, 2),
+        "this update will remove 0 macros / 0 images / 1 links, 2 layouts"
     );
     // M7 PD-105: a page with the create's title exists.
     assert_eq!(

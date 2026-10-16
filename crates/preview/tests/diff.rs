@@ -1,5 +1,5 @@
 use atlas_duck_preview::diff::{
-    DIFF_MAX_LINES, DIFF_MAX_MIDDLE_BYTES, DiffLine, DiffOp, hunks, line_diff,
+    DIFF_MAX_LINES, DIFF_MAX_MIDDLE_BYTES, DiffLine, DiffOp, hunks, line_diff, line_diff_lines,
 };
 
 fn d(op: DiffOp, t: &str) -> DiffLine {
@@ -275,6 +275,43 @@ fn line_diff_bounded_work_on_dissimilar_inputs() {
     assert_eq!(out.lines.last(), Some(&d(DiffOp::Same, "s\n")));
     assert!(out.lines[1..5001].iter().all(|l| l.op == DiffOp::Del));
     assert!(out.lines[5001..10_001].iter().all(|l| l.op == DiffOp::Add));
+}
+
+/// M7 Task 15 (T7 review I-2): a diff over a caller's own line projection (the raw storage
+/// lines, which end at block tags, not only at `\n`) keeps every line as given: no line is
+/// re-split, nothing is added, and `line_diff` is the slice diff of its `\n` split.
+#[test]
+fn line_diff_lines_keeps_the_projection() {
+    let old = ["<p>a</p>", "<p>b</p>", "<p>c</p>"];
+    let new = ["<p>a</p>", "<p>B</p>", "<p>c</p>", "<hr/>"];
+    let out = line_diff_lines(&old, &new);
+    assert!(!out.truncated);
+    assert_eq!(
+        out.lines,
+        vec![
+            d(DiffOp::Same, "<p>a</p>"),
+            d(DiffOp::Del, "<p>b</p>"),
+            d(DiffOp::Add, "<p>B</p>"),
+            d(DiffOp::Same, "<p>c</p>"),
+            d(DiffOp::Add, "<hr/>"),
+        ]
+    );
+    check_script(&old.concat(), &new.concat(), &out.lines);
+    // A line holding a `\n` inside is not split again.
+    let out = line_diff_lines(&["x\ny"], &["x\nz"]);
+    assert_eq!(
+        out.lines,
+        vec![d(DiffOp::Del, "x\ny"), d(DiffOp::Add, "x\nz")]
+    );
+    for (old, new) in [("a\nb\nc", "a\nx\nc\n"), ("", "q\n"), ("p\nq", "p\nq")] {
+        let a: Vec<&str> = old.split_inclusive('\n').collect();
+        let b: Vec<&str> = new.split_inclusive('\n').collect();
+        assert_eq!(
+            line_diff(old, new),
+            line_diff_lines(&a, &b),
+            "{old:?} {new:?}"
+        );
+    }
 }
 
 #[test]

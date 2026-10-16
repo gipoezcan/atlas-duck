@@ -136,9 +136,12 @@ fn diffs(m: &PreviewModel) -> Result<Diffs, TestError> {
             rendered,
             raw,
             raw_only_changes,
+            constructs,
             requests,
         } => {
             assert_eq!(requests.len(), 1, "§5.1 inv. 4: the exact request stays");
+            // The storage construct list is Confluence's (M7 Task 15); a Jira edit has none.
+            assert!(constructs.is_none());
             Ok(Diffs {
                 rendered: rendered.clone(),
                 raw: raw.clone(),

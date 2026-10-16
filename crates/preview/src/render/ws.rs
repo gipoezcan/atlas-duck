@@ -15,13 +15,21 @@ pub const NO_NEWLINE_AT_END: &str = "⟨no newline at end⟩";
 /// terminator is dropped, `\r` and every tab are escaped, trailing spaces are escaped, and a line
 /// without a terminator ends in [`NO_NEWLINE_AT_END`].
 pub fn visible_line(line: &str) -> String {
+    visible_line_at(line, true)
+}
+
+/// [`visible_line`] for a line that may not end its side of the diff (M7 Task 15): the
+/// [`NO_NEWLINE_AT_END`] suffix only when `side_end`, since a projection that ends lines at
+/// tags (the raw storage lines) leaves most lines without `\n` and only a side's last line
+/// says where its text ends.
+pub fn visible_line_at(line: &str, side_end: bool) -> String {
     let (content, newline) = match line.strip_suffix('\n') {
         Some(content) => (content, true),
         None => (line, false),
     };
     let mut out = String::with_capacity(content.len() + 24);
     mark_line(&mut out, content, true);
-    if !newline {
+    if !newline && side_end {
         out.push(' ');
         out.push_str(NO_NEWLINE_AT_END);
     }

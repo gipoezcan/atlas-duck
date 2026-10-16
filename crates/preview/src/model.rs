@@ -34,8 +34,10 @@ pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     ("render2", 0x5977_a808_67ef_8b73),
     ("render3", 0x18d6_262f_815e_9ad3),
     // M7 Task 8 (Δ2): the Confluence arms, the conflict card's diffs and requests (only when
-    // there are any), the attachment notes, the digest body.
-    ("render4", 0x6c6a_b8ec_eb41_14a5),
+    // there are any), the attachment notes, the digest body. M7 Task 15 (re-pinned while
+    // render4 is unmerged): the edit diff's storage construct list, the "no newline at end"
+    // mark only on a side's last line, the `confluence_update_diff` golden.
+    ("render4", 0x8ea8_55c4_f735_bb5c),
 ];
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
@@ -262,11 +264,16 @@ pub enum PreviewBody {
     /// line terminators and trailing whitespace visible. A `LineDiff.truncated` diff must be
     /// flagged by the builder (a warning), since its lines are not the whole change. Each field's
     /// section starts with a `DiffOp::Field` line naming it (T13); the UI shows that line as a
-    /// heading, apart from the text lines.
+    /// heading, apart from the text lines. `constructs` (M7 Task 15, T9 review I-2): the storage
+    /// constructs of a Confluence update's outgoing body (§7.6: listed whatever the diff caps
+    /// leave out), display-escaped as [`ConstructList`] says; `None` for a Jira edit. A raw
+    /// line may end without `\n` (a storage line ends at a block tag): only a side's last line
+    /// says so.
     EditDiff {
         rendered: Vec<DiffLine>,
         raw: Vec<DiffLine>,
         raw_only_changes: u64,
+        constructs: Option<ConstructList>,
         requests: Vec<RequestView>,
     },
     /// §6.3 transition. Status names and field rows are display-escaped text. `constructs` lists

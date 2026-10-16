@@ -1618,6 +1618,7 @@
     ],
     "approvable": false,
     "body": {
+      "constructs": null,
       "kind": "edit_diff",
       "raw": [
         {

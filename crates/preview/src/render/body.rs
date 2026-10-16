@@ -366,6 +366,7 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             rendered,
             raw,
             raw_only_changes,
+            constructs,
             requests,
         } => {
             section(doc, "Rendered diff");
@@ -378,6 +379,10 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
                 doc.close("p");
             }
             diff(doc, raw);
+            // M7 Task 15 (§7.6): a Confluence update lists its outgoing storage constructs.
+            if let Some(c) = constructs {
+                construct_list(doc, STORAGE_CONSTRUCTS, c);
+            }
             doc.close("section");
             requests_section(doc, "Requests to be sent", requests);
         }
@@ -1067,6 +1072,7 @@ fn diff(doc: &mut Doc, lines: &[DiffLine]) {
     }
     // `None`: no table open; `Some(changed)`: a `<tbody>` of changed (or same) lines is open.
     let mut open: Option<bool> = None;
+    let ends = side_ends(lines);
     for (i, line) in lines.iter().enumerate() {
         if i >= DOC_MAX_DIFF_LINES || doc.full() {
             close_table(doc, &mut open);
@@ -1107,7 +1113,7 @@ fn diff(doc: &mut Doc, lines: &[DiffLine]) {
         if let Some(tag) = wrap {
             doc.open(tag);
         }
-        doc.diff_line(&line.text);
+        doc.diff_line(&line.text, ends.get(i).copied().unwrap_or(true));
         if let Some(tag) = wrap {
             doc.close(tag);
         }
@@ -1116,6 +1122,35 @@ fn diff(doc: &mut Doc, lines: &[DiffLine]) {
         doc.close("tr");
     }
     close_table(doc, &mut open);
+}
+
+/// Per line, whether it ends a side of its section (M7 Task 15): the last `Same`/`Del` line
+/// (the old text's end) and the last `Same`/`Add` line (the new text's end) between two `Field`
+/// lines. Only there does a line without `\n` mean "no newline at end" (PD-69); a line split
+/// at a tag (the raw storage lines) has none elsewhere. In a `\n`-split diff every line without
+/// `\n` is a side's last, except a line cut by the diff's caps (a truncated diff, flagged as
+/// such).
+fn side_ends(lines: &[DiffLine]) -> Vec<bool> {
+    let mut ends = vec![false; lines.len()];
+    let (mut old, mut new): (Option<usize>, Option<usize>) = (None, None);
+    for (i, line) in lines.iter().enumerate() {
+        match line.op {
+            DiffOp::Field => mark_ends(&mut ends, old.take(), new.take()),
+            DiffOp::Same => (old, new) = (Some(i), Some(i)),
+            DiffOp::Del => old = Some(i),
+            DiffOp::Add => new = Some(i),
+        }
+    }
+    mark_ends(&mut ends, old, new);
+    ends
+}
+
+fn mark_ends(ends: &mut [bool], old: Option<usize>, new: Option<usize>) {
+    for i in [old, new].into_iter().flatten() {
+        if let Some(e) = ends.get_mut(i) {
+            *e = true;
+        }
+    }
 }
 
 fn close_table(doc: &mut Doc, open: &mut Option<bool>) {
