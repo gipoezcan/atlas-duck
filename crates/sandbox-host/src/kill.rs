@@ -162,8 +162,9 @@ pub fn reap_after_wait<T>(
 /// One kill through `primary`, and through `fallback` when `primary` fails
 /// (I-2): Linux `pidfd_send_signal`, then the guarded `kill(pid)`; Windows
 /// `TerminateJobObject`, then `TerminateProcess`. Both run under the caller's
-/// guard lock and must not block. The error of `fallback` is returned when both
-/// fail.
+/// guard lock and must not block, so nothing is logged here: when both fail,
+/// the error (the fallback's kind, both messages) goes to the caller, which
+/// logs it after the lock is released.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn signal_or_fallback(
     primary: impl FnOnce() -> io::Result<()>,
@@ -171,10 +172,12 @@ pub(crate) fn signal_or_fallback(
 ) -> io::Result<()> {
     match primary() {
         Ok(()) => Ok(()),
-        Err(e) => {
-            eprintln!("sandbox worker kill failed ({e}); trying the fallback");
-            fallback()
-        }
+        Err(first) => fallback().map_err(|second| {
+            io::Error::new(
+                second.kind(),
+                format!("{first}; the fallback failed too: {second}"),
+            )
+        }),
     }
 }
 
@@ -350,12 +353,23 @@ mod tests {
         assert!(ok.is_ok());
         assert_eq!(ran.get(), 1);
         let both = signal_or_fallback(
-            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
-            || Err(io::Error::from(io::ErrorKind::InvalidInput)),
-        );
+            || Err(io::Error::other("pidfd call refused")),
+            || {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "pid call refused",
+                ))
+            },
+        )
+        .err();
         assert_eq!(
-            both.err().map(|e| e.kind()),
+            both.as_ref().map(io::Error::kind),
             Some(io::ErrorKind::InvalidInput)
+        );
+        let text = both.map(|e| e.to_string()).unwrap_or_default();
+        assert!(
+            text.contains("pidfd call refused") && text.contains("pid call refused"),
+            "{text}"
         );
     }
 
