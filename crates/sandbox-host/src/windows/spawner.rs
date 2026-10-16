@@ -23,7 +23,7 @@ use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DETACHED_PROCESS, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, GetExitCodeProcess, INFINITE,
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
@@ -34,10 +34,14 @@ use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICA
 
 use super::aces::{AceStatus, check_aces, worker_ace_files_for_exe};
 use super::appcontainer::AppContainer;
-use super::job::{Job, JobLimits, JobSnapshot};
-use super::pipes::{FrameReader, StdinPipe, create_stdio_pipes, drain_stderr};
+use super::job::{Job, JobLimits, JobSnapshot, terminate_job};
+use super::pipes::{STDERR_CAP_BYTES, StdinPipe, create_stdio_pipes};
 use super::{APPCONTAINER_NAME, WORKER_ENV_NAMES, WORKER_ENV_OS_REQUIRED, wide};
-use crate::spawn::{ExitKind, SpawnSpec, WorkerProcess, WorkerSpawner};
+use crate::drain::{ChunkReader, Keep, StderrDrain};
+use crate::kill::{GuardedKill, ReapGuard, reap_after_wait};
+use crate::spawn::{
+    ExitKind, Reaper, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner,
+};
 
 /// The worker is a console-subsystem binary (T04), but it never needs a
 /// console: its stdio is the three pipes. `DETACHED_PROCESS` gives it none, so
@@ -233,8 +237,12 @@ impl WindowsSpawner {
         drop(child);
         drop(_guard);
 
-        let frames = FrameReader::start(host.stdout)?;
-        let stderr = drain_stderr(host.stderr)?;
+        let frames = ChunkReader::spawn(host.stdout, "atlas-duck-sbx-out")?;
+        let stderr = StderrDrain::start(
+            host.stderr,
+            Keep::Head(STDERR_CAP_BYTES),
+            "atlas-duck-sbx-err",
+        )?;
         Ok(WindowsProcess {
             stdin: StdinPipe::new(host.stdin),
             frames,
@@ -244,7 +252,7 @@ impl WindowsSpawner {
             pid: pi.dwProcessId,
             exit: None,
             lpac,
-            run_dir,
+            run_dir: Some(run_dir),
         })
     }
 }
@@ -260,17 +268,20 @@ impl WorkerSpawner for WindowsSpawner {
 }
 
 /// One running worker. Dropping it kills the worker (job terminate, then job
-/// close, which `KILL_ON_JOB_CLOSE` also covers if the host dies first).
+/// close, which `KILL_ON_JOB_CLOSE` also covers if the host dies first), unless
+/// it was split by [`WorkerProcess::into_parts`]: the parts own the worker then.
 pub struct WindowsProcess {
     stdin: StdinPipe,
-    frames: FrameReader,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    frames: ChunkReader,
+    stderr: StderrDrain,
+    /// `None` only after `into_parts`.
     job: Option<Job>,
     process: OwnedHandle,
     pid: u32,
     exit: Option<ExitKind>,
     lpac: bool,
-    run_dir: RunDir,
+    /// `None` only after `into_parts`.
+    run_dir: Option<RunDir>,
 }
 
 impl WindowsProcess {
@@ -281,7 +292,7 @@ impl WindowsProcess {
 
     /// The worker's current directory (an empty per-run directory).
     pub fn run_dir(&self) -> &Path {
-        self.run_dir.path()
+        self.run_dir.as_ref().map_or(Path::new(""), RunDir::path)
     }
 
     /// Limits and members of the worker's job, read back from the OS.
@@ -295,10 +306,7 @@ impl WindowsProcess {
     /// The first 64 KiB the worker wrote to stderr (for test diagnostics; never
     /// logged).
     pub fn stderr_head(&self) -> Vec<u8> {
-        self.stderr
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
+        self.stderr.kept()
     }
 
     /// Raw process handle (for tests that inspect the worker from outside).
@@ -317,7 +325,7 @@ impl WorkerProcess for WindowsProcess {
     }
 
     fn read_frame_timeout(&mut self, max: usize, d: Duration) -> io::Result<Option<Vec<u8>>> {
-        self.frames.recv(max, d)
+        self.frames.next_frame(max, d)
     }
 
     fn close_stdin(&mut self) {
@@ -334,25 +342,12 @@ impl WorkerProcess for WindowsProcess {
         let ms = u32::try_from(millis)
             .unwrap_or(u32::MAX - 1)
             .min(u32::MAX - 1);
-        // SAFETY: valid process handle.
-        match unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), ms) } {
-            WAIT_OBJECT_0 => {
-                let mut code = 0u32;
-                // SAFETY: valid process handle and out-pointer.
-                if unsafe { GetExitCodeProcess(self.process.as_raw_handle().cast(), &mut code) }
-                    == 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                // NTSTATUS exit codes such as 0xC0000005 keep their bit pattern.
-                let e = ExitKind::Code(code as i32);
-                self.exit = Some(e);
-                Ok(Some(e))
-            }
-            WAIT_TIMEOUT => Ok(None),
-            WAIT_FAILED => Err(io::Error::last_os_error()),
-            other => Err(io::Error::other(format!("unexpected wait result {other}"))),
+        if !wait_process(&self.process, ms)? {
+            return Ok(None);
         }
+        let e = exit_code(&self.process)?;
+        self.exit = Some(e);
+        Ok(Some(e))
     }
 
     fn kill(&mut self) -> io::Result<()> {
@@ -361,18 +356,135 @@ impl WorkerProcess for WindowsProcess {
             None => Ok(()),
         }
     }
+
+    /// The kill handle owns a duplicate of the job handle (`TerminateJobObject`,
+    /// PD-137); the reaper owns a duplicate of the process handle, the job
+    /// handle itself and the run directory, which it removes after the exit.
+    fn into_parts(mut self: Box<Self>) -> io::Result<WorkerParts> {
+        // The fallible steps first: on an error `self` is dropped whole, which
+        // kills the worker as before.
+        let kill_job = match &self.job {
+            Some(job) => job.duplicate_handle()?,
+            None => return Err(io::Error::other("the worker's job is already closed")),
+        };
+        let process = self.process.try_clone()?;
+
+        let guard = ReapGuard::new();
+        if self.exit.is_some() {
+            guard.mark_reaped();
+        }
+        let kill = GuardedKill::new(Arc::clone(&guard), move || {
+            // Does not wait for the exit, so it never blocks. A failure leaves
+            // the worker to the timer, the reaper's drop and KILL_ON_JOB_CLOSE.
+            let _ = terminate_job(&kill_job);
+        });
+        let reaper = WindowsReaper {
+            process,
+            job: self.job.take(),
+            _run_dir: self.run_dir.take(),
+            guard,
+            exit: self.exit,
+        };
+        let io = WorkerIo {
+            stdin: Box::new(self.stdin.take()),
+            stdout: Box::new(self.frames.hand_over()),
+            stderr: Box::new(self.stderr.hand_over()),
+        };
+        Ok(WorkerParts {
+            pid: self.pid,
+            io,
+            kill: Arc::new(kill),
+            reaper: Box::new(reaper),
+        })
+    }
 }
 
 impl Drop for WindowsProcess {
     fn drop(&mut self) {
         self.stdin.close();
+        // `None` after `into_parts`: the parts own the worker.
         if let Some(job) = self.job.take() {
             let _ = job.terminate();
             drop(job); // CloseHandle: KILL_ON_JOB_CLOSE
+            // Give the kill up to 1 s to land, so the run dir can be removed.
+            let _ = wait_process(&self.process, 1000);
         }
-        // Give the kill up to 1 s to land, so the run dir can be removed.
-        // SAFETY: valid process handle.
-        unsafe { WaitForSingleObject(self.process.as_raw_handle().cast(), 1000) };
+    }
+}
+
+/// `WaitForSingleObject` on a process handle: `true` once the process has
+/// exited, `false` when `ms` passed first (`INFINITE` waits for the exit).
+fn wait_process(process: &OwnedHandle, ms: u32) -> io::Result<bool> {
+    // SAFETY: `process` is an open process handle owned by the caller for the
+    // whole call.
+    match unsafe { WaitForSingleObject(process.as_raw_handle().cast(), ms) } {
+        WAIT_OBJECT_0 => Ok(true),
+        WAIT_TIMEOUT => Ok(false),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        other => Err(io::Error::other(format!("unexpected wait result {other}"))),
+    }
+}
+
+/// The exit code of an exited process. NTSTATUS exit codes such as
+/// `0xC0000005` keep their bit pattern.
+fn exit_code(process: &OwnedHandle) -> io::Result<ExitKind> {
+    let mut code = 0u32;
+    // SAFETY: `process` is an open process handle owned by the caller and
+    // `code` a valid out-pointer.
+    if unsafe { GetExitCodeProcess(process.as_raw_handle().cast(), &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ExitKind::Code(code as i32))
+}
+
+/// The reaper of a split worker (Δ2). A process handle keeps the process
+/// object alive, so nothing here can reach another process; the guard still
+/// orders the kill handle's flag (no `TerminateJobObject` after the reap).
+/// Fields drop in order: process handle, job handle (the worker is gone, or
+/// `KILL_ON_JOB_CLOSE` ends it once the kill handle's duplicate closes too),
+/// then the run directory.
+struct WindowsReaper {
+    process: OwnedHandle,
+    job: Option<Job>,
+    /// Held only to be removed on drop.
+    _run_dir: Option<RunDir>,
+    guard: Arc<ReapGuard>,
+    /// Set once the exit is known; a reaper dropped before that kills.
+    exit: Option<ExitKind>,
+}
+
+impl Reaper for WindowsReaper {
+    fn wait(mut self: Box<Self>) -> io::Result<ExitKind> {
+        if let Some(exit) = self.exit {
+            return Ok(exit);
+        }
+        let process = &self.process;
+        let exit = reap_after_wait(
+            &self.guard,
+            || {
+                if wait_process(process, INFINITE)? {
+                    Ok(())
+                } else {
+                    Err(io::Error::from(io::ErrorKind::TimedOut))
+                }
+            },
+            || exit_code(process),
+        )?;
+        self.exit = Some(exit);
+        Ok(exit)
+    }
+}
+
+impl Drop for WindowsReaper {
+    fn drop(&mut self) {
+        if self.exit.is_none() {
+            // Dropped without `wait`: kill, and give the kill up to 1 s to land
+            // so the run directory can be removed (as `WindowsProcess`'s drop).
+            if let Some(job) = &self.job {
+                let _ = job.terminate();
+            }
+            let _ = wait_process(&self.process, 1000);
+        }
     }
 }
 

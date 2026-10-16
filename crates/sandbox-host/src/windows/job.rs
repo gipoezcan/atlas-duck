@@ -156,11 +156,14 @@ impl Job {
 
     /// `TerminateJobObject`: kills every process in the job.
     pub(crate) fn terminate(&self) -> io::Result<()> {
-        // SAFETY: valid job handle.
-        if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        terminate_job(&self.0)
+    }
+
+    /// A second, non-inheritable handle to the same job (`DuplicateHandle`
+    /// with the same access), for the run's kill handle (PD-137). The job
+    /// lives, and `KILL_ON_JOB_CLOSE` waits, until the last handle closes.
+    pub(crate) fn duplicate_handle(&self) -> io::Result<OwnedHandle> {
+        self.0.try_clone()
     }
 
     pub(crate) fn snapshot(&self) -> io::Result<JobSnapshot> {
@@ -231,4 +234,16 @@ impl Job {
             pids,
         })
     }
+}
+
+/// `TerminateJobObject(job, 1)` on any handle to a job: kills every process in
+/// it. It does not wait for them to exit, so it never blocks; the worker's exit
+/// code is then 1. Terminating a job whose processes have exited is a no-op.
+pub(crate) fn terminate_job(job: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: `job` is an open job handle owned by the caller for the whole
+    // call; `TerminateJobObject` only reads the handle value.
+    if unsafe { TerminateJobObject(job.as_raw_handle().cast(), 1) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

@@ -16,7 +16,10 @@ use super::{
     SPAWNER_THREAD_NAME, STDERR_CAP_BYTES, WORKER_ENV, WORKER_NOFILE, WORKER_STACK_BYTES,
     child_exit,
 };
-use crate::spawn::{ExitKind, SpawnSpec, WorkerProcess, WorkerSpawner};
+use crate::drain::{Keep, StderrDrain};
+use crate::kill::{GuardedKill, ReapGuard};
+use crate::spawn::{ExitKind, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner};
+use crate::unix::{UnixReaper, sigkill_pid};
 
 /// How often `wait_timeout` polls `waitpid(WNOHANG)`.
 const WAIT_POLL: Duration = Duration::from_millis(5);
@@ -358,17 +361,66 @@ fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
 
 // ------------------------------------------------------------- worker handle
 
-/// A running worker. Dropping it kills and reaps the process.
+/// `pidfd_open(pid, 0)` (Linux 5.3). `None` on `ENOSYS` (an older kernel: the
+/// kill handle then falls back to the guarded pid kill, PD-137); any other
+/// failure is an error, which fails the spawn (the floor needs a killable
+/// worker).
+fn pidfd_open(pid: libc::pid_t) -> io::Result<Option<OwnedFd>> {
+    // SAFETY: the syscall takes a pid and zero flags, touches no memory of
+    // ours, and returns a new descriptor or -1.
+    let rc = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::ENOSYS) {
+            Ok(None)
+        } else {
+            Err(err)
+        };
+    }
+    let fd = RawFd::try_from(rc).map_err(|_| io::Error::other("pidfd out of range"))?;
+    // SAFETY: `fd` is a fresh descriptor (the kernel sets O_CLOEXEC on it)
+    // that nothing else owns.
+    Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// `pidfd_send_signal(pidfd, SIGKILL, NULL, 0)`. A pidfd never refers to
+/// another process, even after the worker was reaped, and the call does not
+/// block.
+fn pidfd_sigkill(pidfd: &OwnedFd) {
+    // SAFETY: the syscall takes a descriptor, a signal number, a null
+    // `siginfo_t` pointer (the kernel fills a default one) and zero flags;
+    // `pidfd` is an open pidfd owned by the caller for the whole call.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0 as libc::c_uint,
+        )
+    };
+}
+
+/// A running worker. Dropping it kills and reaps the process, unless it was
+/// split by [`WorkerProcess::into_parts`]: the parts own the worker then.
 pub struct LinuxProcess {
     pid: libc::pid_t,
+    /// The worker's pidfd, opened right after the fork (`None`: kernel < 5.3).
+    /// Moved into the kill handle by `into_parts`; the probe path does not use
+    /// it.
+    pidfd: Option<OwnedFd>,
     stdin: Option<File>,
     closed_stdin: ClosedStdin,
-    stdout: File,
+    /// `None` only after `into_parts`.
+    stdout: Option<File>,
     /// Bytes read from stdout that do not yet form a complete frame.
     buf: Vec<u8>,
     eof: bool,
     exit: Option<ExitKind>,
-    stderr_head: Arc<Mutex<Vec<u8>>>,
+    /// `None` only while `new` starts the drain thread.
+    stderr: Option<StderrDrain>,
+    /// Set by `into_parts`: the drop then leaves the worker to the parts.
+    parted: bool,
 }
 
 /// What `stdin()` hands out after `close_stdin()`.
@@ -386,22 +438,26 @@ impl Write for ClosedStdin {
 
 impl LinuxProcess {
     fn new(spawned: Spawned) -> io::Result<Self> {
-        let stderr_head = Arc::new(Mutex::new(Vec::new()));
-        let process = Self {
+        let mut process = Self {
             pid: spawned.pid,
+            pidfd: None,
             stdin: Some(File::from(spawned.stdin)),
             closed_stdin: ClosedStdin,
-            stdout: File::from(spawned.stdout),
+            stdout: Some(File::from(spawned.stdout)),
             buf: Vec::new(),
             eof: false,
             exit: None,
-            stderr_head: Arc::clone(&stderr_head),
+            stderr: None,
+            parted: false,
         };
         // On error `process` is dropped, which kills and reaps the worker.
-        let stderr = spawned.stderr;
-        thread::Builder::new()
-            .name("atlas-duck-worker-stderr".to_string())
-            .spawn(move || drain_stderr(stderr, &stderr_head))?;
+        process.stderr = Some(StderrDrain::start(
+            File::from(spawned.stderr),
+            Keep::Head(STDERR_CAP_BYTES),
+            "atlas-duck-worker-stderr",
+        )?);
+        // Nothing reaps the child before its reaper, so the pid still names it.
+        process.pidfd = pidfd_open(process.pid)?;
         Ok(process)
     }
 
@@ -409,10 +465,16 @@ impl LinuxProcess {
     /// (§3.4: capped at 64 KiB; the rest is read and discarded). Never log
     /// these.
     pub fn stderr_head(&self) -> Vec<u8> {
-        self.stderr_head
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+        self.stderr
+            .as_ref()
+            .map(StderrDrain::kept)
+            .unwrap_or_default()
+    }
+
+    /// True when the worker's kill handle will use a pidfd (Linux 5.3+); false
+    /// on the guarded pid fallback (PD-137).
+    pub fn uses_pidfd(&self) -> bool {
+        self.pidfd.is_some()
     }
 
     /// Splits one complete frame off the front of `buf`.
@@ -511,7 +573,11 @@ impl WorkerProcess for LinuxProcess {
                     "no complete frame from the worker in time",
                 ));
             }
-            if !poll_readable(self.stdout.as_raw_fd(), left)? {
+            // `into_parts` consumes the worker, so the stream is always here.
+            let Some(stdout) = self.stdout.as_mut() else {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            };
+            if !poll_readable(stdout.as_raw_fd(), left)? {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "no complete frame from the worker in time",
@@ -519,7 +585,7 @@ impl WorkerProcess for LinuxProcess {
             }
             let mut chunk = [0u8; 8192];
             read_once = true;
-            match self.stdout.read(&mut chunk) {
+            match stdout.read(&mut chunk) {
                 Ok(0) => self.eof = true,
                 Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -565,11 +631,47 @@ impl WorkerProcess for LinuxProcess {
             Err(e)
         }
     }
+
+    /// The kill handle sends through the pidfd (the guarded pid kill without
+    /// one); the reaper is `waitid(WNOWAIT)` + `waitpid` (see `crate::unix`).
+    /// stdout starts with the bytes `read_frame_timeout` buffered.
+    fn into_parts(mut self: Box<Self>) -> io::Result<WorkerParts> {
+        let Some(stdout) = self.stdout.take() else {
+            return Err(io::Error::other("the worker's stdout is gone"));
+        };
+        // From here on nothing fails, and the drop leaves the worker alone.
+        self.parted = true;
+        let pid = self.pid;
+        let pidfd = self.pidfd.take();
+        let kill = Arc::new(GuardedKill::new(ReapGuard::new(), move || match &pidfd {
+            Some(fd) => pidfd_sigkill(fd),
+            None => sigkill_pid(pid),
+        }));
+        let stdout = io::Cursor::new(std::mem::take(&mut self.buf)).chain(stdout);
+        let stdin: Box<dyn Write + Send> = match self.stdin.take() {
+            Some(file) => Box::new(file),
+            None => Box::new(ClosedStdin),
+        };
+        let stderr: Box<dyn Read + Send> = match self.stderr.as_mut() {
+            Some(drain) => Box::new(drain.hand_over()),
+            None => Box::new(io::empty()),
+        };
+        Ok(WorkerParts {
+            pid: u32::try_from(pid).unwrap_or(0),
+            io: WorkerIo {
+                stdin,
+                stdout: Box::new(stdout),
+                stderr,
+            },
+            kill: Arc::<GuardedKill>::clone(&kill),
+            reaper: Box::new(UnixReaper::new(pid, kill, self.exit)),
+        })
+    }
 }
 
 impl Drop for LinuxProcess {
     fn drop(&mut self) {
-        if self.exit.is_none() {
+        if !self.parted && self.exit.is_none() {
             let _ = self.kill();
             let _ = self.wait_timeout(Duration::from_secs(2));
         }
@@ -606,25 +708,6 @@ fn poll_readable(fd: RawFd, timeout: Duration) -> io::Result<bool> {
             return Err(e);
         }
         return Ok(rc > 0);
-    }
-}
-
-/// Reads the worker's stderr to EOF so it never blocks on a full pipe; keeps
-/// the first [`STDERR_CAP_BYTES`] bytes and discards the rest.
-fn drain_stderr(fd: OwnedFd, head: &Mutex<Vec<u8>>) {
-    let mut file = File::from(fd);
-    let mut chunk = [0u8; 4096];
-    loop {
-        match file.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut kept = head.lock().unwrap_or_else(PoisonError::into_inner);
-                let room = STDERR_CAP_BYTES.saturating_sub(kept.len());
-                kept.extend_from_slice(&chunk[..n.min(room)]);
-            }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => break,
-        }
     }
 }
 
@@ -849,6 +932,103 @@ mod tests {
             .read_frame_timeout(512, Duration::from_secs(5))
             .expect_err("too large");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    fn proc_gone(pid: u32) -> bool {
+        !Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn a_split_worker_is_killed_through_its_pidfd_and_reaped() {
+        let spawner = LinuxSpawner::start().expect("start");
+        let mut p = spawner.spawn_process(&spec(CAT)).expect("spawn");
+        assert!(p.uses_pidfd(), "pidfd_open exists on every CI kernel");
+        // One frame is read before the split; the next one is in the buffer
+        // or still in the pipe, and comes out of the split stdout first.
+        p.stdin()
+            .write_all(&[0, 0, 0, 1, b'a', 0, 0, 0, 2, b'b', b'c'])
+            .expect("write");
+        assert_eq!(
+            p.read_frame_timeout(1024, Duration::from_secs(5))
+                .expect("frame"),
+            Some(b"a".to_vec())
+        );
+        let pid = p.pid();
+        let WorkerParts {
+            pid: split_pid,
+            mut io,
+            kill,
+            reaper,
+        } = Box::new(p).into_parts().expect("split");
+        assert_eq!(split_pid, pid);
+        let mut rest = [0u8; 6];
+        io.stdout.read_exact(&mut rest).expect("the buffered frame");
+        assert_eq!(rest, [0, 0, 0, 2, b'b', b'c']);
+
+        let reaper = thread::spawn(move || reaper.wait());
+        let started = Instant::now();
+        kill.kill();
+        kill.kill();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(
+            reaper.join().expect("reaper thread").expect("wait"),
+            ExitKind::Signal(libc::SIGKILL)
+        );
+        assert!(proc_gone(pid), "zombie left behind");
+        kill.kill(); // after the reap: a no-op
+        let mut tail = Vec::new();
+        io.stdout
+            .read_to_end(&mut tail)
+            .expect("EOF after the kill");
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn the_guarded_pid_fallback_kills_and_reaps() {
+        let spawner = LinuxSpawner::start().expect("start");
+        let mut p = spawner.spawn_process(&spec(CAT)).expect("spawn");
+        p.pidfd = None; // as on a kernel without pidfd_open (ENOSYS)
+        let pid = p.pid();
+        let parts = Box::new(p).into_parts().expect("split");
+        let reaper = thread::spawn(move || parts.reaper.wait());
+        parts.kill.kill();
+        assert_eq!(
+            reaper.join().expect("reaper thread").expect("wait"),
+            ExitKind::Signal(libc::SIGKILL)
+        );
+        assert!(proc_gone(pid));
+        parts.kill.kill();
+    }
+
+    #[test]
+    fn a_split_worker_hands_over_stdin_and_stderr_and_exits_normally() {
+        let spawner = LinuxSpawner::start().expect("start");
+        let mut p = spawner.spawn_process(&spec(SH)).expect("spawn");
+        p.stdin().write_all(b"printf err >&2\n").expect("script 1");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while p.stderr_head().len() < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(p.stderr_head(), b"err");
+        let WorkerParts { mut io, reaper, .. } = Box::new(p).into_parts().expect("split");
+        io.stdin
+            .write_all(b"printf more >&2\nexit 4\n")
+            .expect("script 2");
+        drop(io.stdin);
+        let mut stderr = Vec::new();
+        io.stderr.read_to_end(&mut stderr).expect("stderr to EOF");
+        assert_eq!(stderr, b"errmore");
+        assert_eq!(reaper.wait().expect("wait"), ExitKind::Code(4));
+    }
+
+    #[test]
+    fn a_split_worker_whose_reaper_is_dropped_is_killed_and_reaped() {
+        let spawner = LinuxSpawner::start().expect("start");
+        let p = spawner.spawn_process(&spec(CAT)).expect("spawn");
+        let pid = p.pid();
+        let parts = Box::new(p).into_parts().expect("split");
+        drop(parts.reaper);
+        assert!(proc_gone(pid), "zombie or live worker left behind");
     }
 
     #[test]

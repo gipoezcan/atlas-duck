@@ -1,4 +1,5 @@
-//! The worker's three stdio pipes and the host-side frame reader (§3.4).
+//! The worker's three stdio pipes (§3.4). The host-side reader threads are
+//! `crate::drain`'s.
 //!
 //! The worker gets exactly three handles, each a pipe owned by the host. The
 //! child ends are inheritable (and are the only handles named in
@@ -7,15 +8,10 @@
 //! up).
 
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::ptr::{null, null_mut};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use atlas_duck_ipc::sandbox::WORKER_FRAME_MAX_BYTES;
-use atlas_duck_ipc::sandbox::frame::{FrameError, read_frame};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 
@@ -113,6 +109,11 @@ impl StdinPipe {
     pub(crate) fn close(&mut self) {
         self.0 = None;
     }
+
+    /// Moves the pipe out (for `into_parts`), leaving a closed one behind.
+    pub(crate) fn take(&mut self) -> StdinPipe {
+        StdinPipe(self.0.take())
+    }
 }
 
 impl Write for StdinPipe {
@@ -129,89 +130,4 @@ impl Write for StdinPipe {
             None => Ok(()),
         }
     }
-}
-
-enum FrameEvent {
-    Frame(Vec<u8>),
-    Eof,
-    Invalid,
-    Io(io::ErrorKind, String),
-}
-
-/// Reads frames from the worker's stdout on one thread, because a pipe read
-/// has no timeout on Windows. The worker's frames are bounded by
-/// `WORKER_FRAME_MAX_BYTES` (§3.4); a larger `max` passed to
-/// [`FrameReader::recv`] is clamped by that bound.
-pub(crate) struct FrameReader {
-    rx: Receiver<FrameEvent>,
-}
-
-impl FrameReader {
-    pub(crate) fn start(mut stdout: File) -> io::Result<Self> {
-        let (tx, rx) = channel();
-        std::thread::Builder::new()
-            .name("atlas-duck-sbx-out".into())
-            .spawn(move || {
-                loop {
-                    let event = match read_frame(&mut stdout, WORKER_FRAME_MAX_BYTES) {
-                        Ok(Some(payload)) => FrameEvent::Frame(payload),
-                        Ok(None) => FrameEvent::Eof,
-                        Err(FrameError::TooLarge { .. } | FrameError::Truncated) => {
-                            FrameEvent::Invalid
-                        }
-                        Err(FrameError::Io(e)) => FrameEvent::Io(e.kind(), e.to_string()),
-                    };
-                    let last = !matches!(event, FrameEvent::Frame(_));
-                    if tx.send(event).is_err() || last {
-                        break;
-                    }
-                }
-            })?;
-        Ok(Self { rx })
-    }
-
-    /// The `WorkerProcess::read_frame_timeout` contract: `Ok(Some)` one
-    /// frame, `Ok(None)` clean EOF, `TimedOut` nothing within `d`,
-    /// `InvalidData` oversize or truncated.
-    pub(crate) fn recv(&mut self, max: usize, d: Duration) -> io::Result<Option<Vec<u8>>> {
-        match self.rx.recv_timeout(d) {
-            Ok(FrameEvent::Frame(p)) if p.len() > max => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "worker frame larger than the allowed maximum",
-            )),
-            Ok(FrameEvent::Frame(p)) => Ok(Some(p)),
-            Ok(FrameEvent::Eof) | Err(RecvTimeoutError::Disconnected) => Ok(None),
-            Ok(FrameEvent::Invalid) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversize or truncated worker frame",
-            )),
-            Ok(FrameEvent::Io(kind, msg)) => Err(io::Error::new(kind, msg)),
-            Err(RecvTimeoutError::Timeout) => Err(io::ErrorKind::TimedOut.into()),
-        }
-    }
-}
-
-/// Drains the worker's stderr so a chatty worker never blocks on a full
-/// pipe. Only the first [`STDERR_CAP_BYTES`] bytes are kept (section 3.4:
-/// 64 KiB), the rest is discarded. The kept bytes are for tests and are never
-/// written to the diagnostic log.
-pub(crate) fn drain_stderr(mut stderr: File) -> io::Result<Arc<Mutex<Vec<u8>>>> {
-    let kept = Arc::new(Mutex::new(Vec::new()));
-    let sink = Arc::clone(&kept);
-    std::thread::Builder::new()
-        .name("atlas-duck-sbx-err".into())
-        .spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stderr.read(&mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let mut kept = sink.lock().unwrap_or_else(|p| p.into_inner());
-                        let room = STDERR_CAP_BYTES.saturating_sub(kept.len());
-                        kept.extend_from_slice(&chunk[..n.min(room)]);
-                    }
-                }
-            }
-        })?;
-    Ok(kept)
 }

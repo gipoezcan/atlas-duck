@@ -19,6 +19,12 @@ use crate::spawn::{SpawnHook, ThreadConfinement};
 
 pub use spawner::{LinuxProcess, LinuxSpawner};
 
+/// How many split workers of this process were reaped by the polling fallback
+/// because `waitid(WNOWAIT)` failed (CI evidence, PD-137).
+pub fn reap_fallbacks() -> u64 {
+    crate::unix::reap_fallbacks()
+}
+
 /// Name of the one long-lived thread that forks workers (§3.4). The kernel
 /// keeps only the first 15 bytes in `/proc/<pid>/task/<tid>/comm`
 /// (`atlas-duck-spaw`).

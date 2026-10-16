@@ -11,42 +11,45 @@
 //! - The signal state is reset (`POSIX_SPAWN_SETSIGDEF` for every signal,
 //!   `POSIX_SPAWN_SETSIGMASK` empty), so the worker does not inherit the
 //!   host's ignored `SIGPIPE` or a blocked signal mask.
-//! - One reader thread per worker (the `WorkerProcess` contract). It forwards
-//!   raw stdout chunks through a bounded channel, so a half-received frame is
-//!   never lost when `read_frame_timeout` times out, and a flooding worker is
-//!   stopped by pipe back-pressure instead of growing host memory. The read
-//!   deadline covers the whole frame, so a worker that trickles bytes cannot
-//!   hold the host past it (same rule as the Linux routine).
+//! - One reader thread per worker (the `WorkerProcess` contract,
+//!   `crate::drain::ChunkReader`). It forwards raw stdout chunks through a
+//!   bounded channel, so a half-received frame is never lost when
+//!   `read_frame_timeout` times out, and a flooding worker is stopped by pipe
+//!   back-pressure instead of growing host memory. The read deadline covers
+//!   the whole frame, so a worker that trickles bytes cannot hold the host past
+//!   it (same rule as the Linux routine).
 //! - stderr is a pipe drained by a second thread that keeps the last 4 KiB;
 //!   [`MacWorker::stderr_tail`] shows it. The `sandbox_init` error text goes
 //!   there.
+//! - M8 (Δ2, PD-137): `into_parts` hands both threads' streams over; the kill
+//!   handle is a `kill(SIGKILL)` guarded by the reap flag, and the reaper polls
+//!   `waitpid(WNOHANG)` inside the same lock (Darwin's `waitid(WNOWAIT)` is not
+//!   relied on; see `crate::unix`).
 //! - `pipe()` plus `fcntl` is not atomic. `POSIX_SPAWN_CLOEXEC_DEFAULT` makes
 //!   this routine immune to its own race; a foreign `fork`/`spawn` that runs
 //!   inside the same microsecond window could still inherit a pipe end.
 
 use std::ffi::CString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 use std::ptr;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::sync::{Arc, Mutex, PoisonError};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::spawn::{ExitKind, SpawnSpec, WorkerProcess, WorkerSpawner};
+use crate::drain::{ChunkReader, Keep, StderrDrain};
+use crate::kill::{GuardedKill, ReapGuard};
+use crate::spawn::{ExitKind, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner};
+use crate::unix::{UnixReaper, sigkill_pid};
 
 /// The worker's whole environment (§3.4: `TZ=UTC0` keeps libc from opening a
 /// time-zone file under the confinement).
 pub const WORKER_ENV: [(&str, &str); 1] = [("TZ", "UTC0")];
 
-/// Size of one raw read from the worker's stdout.
-const READ_CHUNK: usize = 16 * 1024;
-/// Chunks buffered between the reader thread and the caller (1 MiB).
-const CHANNEL_CHUNKS: usize = 64;
 /// How much of the worker's stderr is kept.
 const STDERR_TAIL_BYTES: usize = 4096;
 /// Poll interval of `wait_timeout` (macOS has no pidfd).
@@ -90,9 +93,12 @@ impl MacSpawner {
 
         // The helper threads only hold host ends, so they can start before the
         // spawn; if the spawn fails they see EOF and end on their own.
-        let frames = FrameReader::spawn(File::from(host_stdout))?;
-        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
-        let stderr_thread = spawn_stderr_drain(File::from(host_stderr), Arc::clone(&stderr_tail))?;
+        let frames = ChunkReader::spawn(File::from(host_stdout), "atlas-duck-worker-out")?;
+        let stderr = StderrDrain::start(
+            File::from(host_stderr),
+            Keep::Tail(STDERR_TAIL_BYTES),
+            "atlas-duck-worker-err",
+        )?;
 
         let pid = posix_spawn_worker(
             &exe,
@@ -109,9 +115,9 @@ impl MacSpawner {
             pid,
             stdin: StdinPipe(Some(File::from(host_stdin))),
             frames,
-            stderr_tail,
-            stderr_thread: Some(stderr_thread),
+            stderr,
             exit: None,
+            parted: false,
         })
     }
 }
@@ -273,152 +279,17 @@ impl Write for StdinPipe {
     }
 }
 
-enum Chunk {
-    Data(Vec<u8>),
-    Eof,
-    Failed(io::ErrorKind),
-}
-
-/// Assembles u32 big-endian length-delimited frames (§3.3) from the chunks
-/// the reader thread forwards.
-struct FrameReader {
-    rx: Receiver<Chunk>,
-    buf: Vec<u8>,
-    eof: bool,
-}
-
-impl FrameReader {
-    fn from_channel(rx: Receiver<Chunk>) -> FrameReader {
-        FrameReader {
-            rx,
-            buf: Vec::new(),
-            eof: false,
-        }
-    }
-
-    /// Starts the reader thread on the host end of the worker's stdout.
-    fn spawn(mut stdout: File) -> io::Result<FrameReader> {
-        let (tx, rx) = mpsc::sync_channel(CHANNEL_CHUNKS);
-        thread::Builder::new()
-            .name("atlas-duck-worker-out".into())
-            .spawn(move || {
-                let mut chunk = vec![0u8; READ_CHUNK];
-                loop {
-                    match stdout.read(&mut chunk) {
-                        Ok(0) => {
-                            let _ = tx.send(Chunk::Eof);
-                            break;
-                        }
-                        Ok(n) => {
-                            if tx.send(Chunk::Data(chunk[..n].to_vec())).is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                        Err(e) => {
-                            let _ = tx.send(Chunk::Failed(e.kind()));
-                            break;
-                        }
-                    }
-                }
-            })?;
-        Ok(FrameReader::from_channel(rx))
-    }
-
-    /// `WorkerProcess::read_frame_timeout` semantics (see `crate::spawn`).
-    fn next_frame(&mut self, max: usize, d: Duration) -> io::Result<Option<Vec<u8>>> {
-        let deadline = deadline_after(d);
-        loop {
-            if let Some(frame) = self.take_frame(max)? {
-                return Ok(Some(frame));
-            }
-            if self.eof {
-                return if self.buf.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "truncated frame",
-                    ))
-                };
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            match self.rx.recv_timeout(left) {
-                Ok(Chunk::Data(bytes)) => self.buf.extend_from_slice(&bytes),
-                Ok(Chunk::Eof) | Err(RecvTimeoutError::Disconnected) => self.eof = true,
-                Ok(Chunk::Failed(kind)) => {
-                    self.eof = true;
-                    return Err(io::Error::new(kind, "reading the worker's stdout failed"));
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "no complete frame in time",
-                    ));
-                }
-            }
-        }
-    }
-
-    /// Removes and returns one complete frame from the buffer, if there is one.
-    fn take_frame(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
-        let Some(header) = self.buf.first_chunk::<4>() else {
-            return Ok(None);
-        };
-        let len = usize::try_from(u32::from_be_bytes(*header)).unwrap_or(usize::MAX);
-        if len > max {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame larger than the limit",
-            ));
-        }
-        let Some(end) = 4usize.checked_add(len) else {
-            return Ok(None);
-        };
-        if self.buf.len() < end {
-            return Ok(None);
-        }
-        let payload = self.buf[4..end].to_vec();
-        self.buf.drain(..end);
-        Ok(Some(payload))
-    }
-}
-
-/// Drains the worker's stderr so a chatty worker can never block on a full
-/// pipe, and keeps the last [`STDERR_TAIL_BYTES`] bytes.
-fn spawn_stderr_drain(mut stderr: File, tail: Arc<Mutex<Vec<u8>>>) -> io::Result<JoinHandle<()>> {
-    thread::Builder::new()
-        .name("atlas-duck-worker-err".into())
-        .spawn(move || {
-            let mut chunk = [0u8; 1024];
-            loop {
-                match stderr.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let mut t = tail.lock().unwrap_or_else(PoisonError::into_inner);
-                        t.extend_from_slice(&chunk[..n]);
-                        if t.len() > STDERR_TAIL_BYTES {
-                            let excess = t.len() - STDERR_TAIL_BYTES;
-                            t.drain(..excess);
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
-            }
-        })
-}
-
 /// One running sandbox worker.
 pub struct MacWorker {
     pid: libc::pid_t,
     stdin: StdinPipe,
-    frames: FrameReader,
-    stderr_tail: Arc<Mutex<Vec<u8>>>,
-    stderr_thread: Option<JoinHandle<()>>,
+    frames: ChunkReader,
+    stderr: StderrDrain,
     /// `Some` once the process has been reaped; it is never signalled after
     /// that, so a recycled pid is never hit.
     exit: Option<ExitKind>,
+    /// Set by `into_parts`: the drop then leaves the worker to the parts.
+    parted: bool,
 }
 
 impl MacWorker {
@@ -426,16 +297,10 @@ impl MacWorker {
     /// worker has exited, this waits for the drain thread, so nothing is
     /// missing.
     pub fn stderr_tail(&mut self) -> String {
-        if self.exit.is_some()
-            && let Some(handle) = self.stderr_thread.take()
-        {
-            let _ = handle.join();
+        if self.exit.is_some() {
+            self.stderr.join();
         }
-        let t = self
-            .stderr_tail
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        String::from_utf8_lossy(&t).into_owned()
+        String::from_utf8_lossy(&self.stderr.kept()).into_owned()
     }
 
     /// Non-blocking `waitpid`.
@@ -513,10 +378,37 @@ impl WorkerProcess for MacWorker {
         }
         Ok(())
     }
+
+    /// The kill handle is a `kill(SIGKILL)` guarded by the reap flag (macOS
+    /// has no pidfd); the reaper polls `waitpid(WNOHANG)` inside the guard's
+    /// lock (see `crate::unix`). Unlike [`WorkerProcess::kill`] above, the
+    /// kill handle never reaps.
+    fn into_parts(mut self: Box<Self>) -> io::Result<WorkerParts> {
+        // Nothing below fails, and the drop leaves the worker alone.
+        self.parted = true;
+        let pid = self.pid;
+        let kill = Arc::new(GuardedKill::new(ReapGuard::new(), move || {
+            sigkill_pid(pid);
+        }));
+        let stdin = StdinPipe(self.stdin.0.take());
+        Ok(WorkerParts {
+            pid: u32::try_from(pid).unwrap_or(0),
+            io: WorkerIo {
+                stdin: Box::new(stdin),
+                stdout: Box::new(self.frames.hand_over()),
+                stderr: Box::new(self.stderr.hand_over()),
+            },
+            kill: Arc::<GuardedKill>::clone(&kill),
+            reaper: Box::new(UnixReaper::new(pid, kill, self.exit)),
+        })
+    }
 }
 
 impl Drop for MacWorker {
     fn drop(&mut self) {
+        if self.parted {
+            return;
+        }
         let _ = self.kill();
         let _ = self.wait_timeout(DROP_REAP);
     }
@@ -530,107 +422,6 @@ mod tests {
     const SHORT: Duration = Duration::from_millis(200);
     const LONG: Duration = Duration::from_secs(10);
     const MAX: usize = 1024 * 1024;
-
-    fn frame(payload: &[u8]) -> Vec<u8> {
-        let mut v = (payload.len() as u32).to_be_bytes().to_vec();
-        v.extend_from_slice(payload);
-        v
-    }
-
-    /// A reader that is fed `chunks` and then sees the channel close.
-    fn reader(chunks: Vec<Chunk>) -> FrameReader {
-        let (tx, rx) = mpsc::sync_channel(64);
-        for c in chunks {
-            assert!(tx.send(c).is_ok());
-        }
-        FrameReader::from_channel(rx)
-    }
-
-    // ----------------------------------------------------- frame assembler
-
-    #[test]
-    fn two_frames_in_one_chunk_then_clean_eof() {
-        let mut both = frame(b"one");
-        both.extend(frame(b"second"));
-        let mut r = reader(vec![Chunk::Data(both), Chunk::Eof]);
-        assert_eq!(r.next_frame(MAX, SHORT).ok(), Some(Some(b"one".to_vec())));
-        assert_eq!(
-            r.next_frame(MAX, SHORT).ok(),
-            Some(Some(b"second".to_vec()))
-        );
-        assert_eq!(r.next_frame(MAX, SHORT).ok(), Some(None));
-    }
-
-    #[test]
-    fn a_frame_split_across_chunks_is_reassembled() {
-        let bytes = frame(b"hello worker");
-        let chunks = bytes.chunks(3).map(|c| Chunk::Data(c.to_vec())).collect();
-        let mut r = reader(chunks);
-        assert_eq!(
-            r.next_frame(MAX, SHORT).ok(),
-            Some(Some(b"hello worker".to_vec()))
-        );
-        assert_eq!(r.next_frame(MAX, SHORT).ok(), Some(None));
-    }
-
-    #[test]
-    fn a_zero_length_frame_is_a_frame() {
-        let mut r = reader(vec![Chunk::Data(frame(b"")), Chunk::Eof]);
-        assert_eq!(r.next_frame(MAX, SHORT).ok(), Some(Some(Vec::new())));
-    }
-
-    #[test]
-    fn an_oversize_frame_is_invalid_data() {
-        let mut r = reader(vec![Chunk::Data(frame(&[7u8; 100])), Chunk::Eof]);
-        let err = r.next_frame(99, SHORT).err();
-        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
-        // The limit is inclusive.
-        let mut r = reader(vec![Chunk::Data(frame(&[7u8; 100])), Chunk::Eof]);
-        assert_eq!(r.next_frame(100, SHORT).ok(), Some(Some(vec![7u8; 100])));
-    }
-
-    #[test]
-    fn a_frame_cut_off_by_eof_is_invalid_data() {
-        let mut bytes = frame(b"abcdef");
-        bytes.truncate(bytes.len() - 2);
-        let mut r = reader(vec![Chunk::Data(bytes), Chunk::Eof]);
-        let err = r.next_frame(MAX, SHORT).err();
-        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
-        let mut r = reader(vec![Chunk::Data(vec![0, 0]), Chunk::Eof]);
-        let err = r.next_frame(MAX, SHORT).err();
-        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
-    }
-
-    #[test]
-    fn a_timeout_keeps_the_partial_frame_for_the_next_call() {
-        let (tx, rx) = mpsc::sync_channel(64);
-        let mut r = FrameReader::from_channel(rx);
-        let bytes = frame(b"late payload");
-        assert!(tx.send(Chunk::Data(bytes[..6].to_vec())).is_ok());
-        let err = r.next_frame(MAX, Duration::from_millis(50)).err();
-        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::TimedOut));
-        assert!(tx.send(Chunk::Data(bytes[6..].to_vec())).is_ok());
-        assert_eq!(
-            r.next_frame(MAX, LONG).ok(),
-            Some(Some(b"late payload".to_vec()))
-        );
-    }
-
-    #[test]
-    fn a_failed_read_surfaces_its_kind() {
-        let mut r = reader(vec![Chunk::Failed(io::ErrorKind::BrokenPipe)]);
-        let err = r.next_frame(MAX, SHORT).err();
-        assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::BrokenPipe));
-    }
-
-    #[test]
-    fn a_huge_timeout_does_not_overflow_the_deadline() {
-        let mut r = reader(vec![Chunk::Data(frame(b"x")), Chunk::Eof]);
-        assert_eq!(
-            r.next_frame(MAX, Duration::MAX).ok(),
-            Some(Some(b"x".to_vec()))
-        );
-    }
 
     // ------------------------------------------- real processes (/bin/cat)
 
@@ -769,5 +560,98 @@ mod tests {
             .map(|&c| c as u8)
             .collect();
         assert_eq!(bytes, b"/");
+    }
+
+    // ------------------------------------------------ the split (M8, Δ2)
+
+    fn pid_gone(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks that the pid exists.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn a_split_worker_is_killed_before_the_reap_only() {
+        use std::io::Read;
+
+        let mut w = spawn_cat();
+        // One frame is read before the split; the next one comes out of the
+        // split stdout first.
+        assert!(
+            w.stdin()
+                .write_all(&[0, 0, 0, 1, b'a', 0, 0, 0, 2, b'b', b'c'])
+                .is_ok()
+        );
+        assert_eq!(
+            w.read_frame_timeout(MAX, LONG).ok(),
+            Some(Some(b"a".to_vec()))
+        );
+        let pid = w.pid() as libc::pid_t;
+        let WorkerParts {
+            mut io,
+            kill,
+            reaper,
+            ..
+        } = match Box::new(w).into_parts() {
+            Ok(parts) => parts,
+            Err(e) => panic!("split: {e}"),
+        };
+        let mut rest = [0u8; 6];
+        assert!(io.stdout.read_exact(&mut rest).is_ok());
+        assert_eq!(rest, [0, 0, 0, 2, b'b', b'c']);
+
+        let reaper = thread::spawn(move || reaper.wait());
+        let started = Instant::now();
+        kill.kill();
+        kill.kill();
+        assert!(started.elapsed() < Duration::from_millis(50));
+        let exit = reaper.join().ok().and_then(Result::ok);
+        assert_eq!(exit, Some(ExitKind::Signal(libc::SIGKILL)));
+        assert!(pid_gone(pid), "zombie left behind");
+        kill.kill(); // after the reap: no signal, whoever has the pid now
+        let mut tail = Vec::new();
+        assert!(io.stdout.read_to_end(&mut tail).is_ok());
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn a_split_worker_hands_over_stdin_and_stderr_and_exits_normally() {
+        use std::io::Read;
+
+        let spec = SpawnSpec {
+            exe: PathBuf::from("/bin/sh"),
+            process_mb: 512,
+        };
+        let mut w = match MacSpawner::new().spawn_mac(&spec) {
+            Ok(w) => w,
+            Err(e) => panic!("spawning /bin/sh failed: {e}"),
+        };
+        assert!(w.stdin().write_all(b"printf err >&2\n").is_ok());
+        let deadline = Instant::now() + LONG;
+        while w.stderr.kept().len() < 3 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let WorkerParts { mut io, reaper, .. } = match Box::new(w).into_parts() {
+            Ok(parts) => parts,
+            Err(e) => panic!("split: {e}"),
+        };
+        assert!(io.stdin.write_all(b"printf more >&2\nexit 4\n").is_ok());
+        drop(io.stdin);
+        let mut stderr = Vec::new();
+        assert!(io.stderr.read_to_end(&mut stderr).is_ok());
+        assert_eq!(stderr, b"errmore");
+        assert_eq!(reaper.wait().ok(), Some(ExitKind::Code(4)));
+    }
+
+    #[test]
+    fn a_split_worker_whose_reaper_is_dropped_is_killed_and_reaped() {
+        let w = spawn_cat();
+        let pid = w.pid() as libc::pid_t;
+        let parts = match Box::new(w).into_parts() {
+            Ok(parts) => parts,
+            Err(e) => panic!("split: {e}"),
+        };
+        drop(parts.reaper);
+        assert!(pid_gone(pid), "zombie or live worker left behind");
     }
 }

@@ -551,6 +551,27 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # M8 plan Task 6 (and Tasks 8-11 later): the real worker through the platform spawner,
+      # split into pipes, kill handle and reaper (app/src-tauri/tests/sandbox_runs.rs). Same rules
+      # as jira_flows: ATLAS_DUCK_CLI_FLOWS=1, no "skipped:" line, pass count of at least
+      # listed - #[ignore]d; the #[cfg] modules make the list (and so the minimum) per leg.
+      - name: M8 sandbox_runs (kill handles and reaper; §3.4, PD-137)
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+        run: |
+          set -euo pipefail
+          args=(test -p atlas-duck-app --features scripted-approver --locked --test sandbox_runs)
+          cargo "${args[@]}" -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sandbox-runs.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/sandbox-runs.log" "$RUNNER_TEMP/sandbox-runs.list" "$RUNNER_TEMP/sandbox-runs.ignored" sandbox_runs
+          {
+            echo "### M8 sandbox_runs ($RUNNER_OS)"
+            echo '```'
+            grep -E '^(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Fedora 40 probes (glibc 2.39, §15 V11)
         if: runner.os == 'Linux'
         run: |
@@ -840,6 +861,24 @@ jobs:
           cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/jira-flows.list"
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/jira-flows.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/jira-flows.log" "$RUNNER_TEMP/jira-flows.list" "$RUNNER_TEMP/jira-flows.ignored" jira_flows
+
+      # M8 plan Task 6: the same sandbox_runs step as the native legs, x86_64 under Rosetta.
+      - name: M8 sandbox_runs x86_64-apple-darwin (kill handles and reaper; §3.4, PD-137)
+        env:
+          ATLAS_DUCK_CLI_FLOWS: "1"
+        run: |
+          set -euo pipefail
+          args=(test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test sandbox_runs)
+          cargo "${args[@]}" -- --nocapture --test-threads=1 2>&1 | tee "$RUNNER_TEMP/sandbox-runs.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/sandbox-runs.log" "$RUNNER_TEMP/sandbox-runs.list" "$RUNNER_TEMP/sandbox-runs.ignored" sandbox_runs
+          {
+            echo "### M8 sandbox_runs (x86_64-apple-darwin under Rosetta)"
+            echo '```'
+            grep -E '^(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: M4 OS keychain smoke (macOS login keychain, x86_64 under Rosetta)
         env:

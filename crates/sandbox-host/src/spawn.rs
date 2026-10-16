@@ -4,8 +4,9 @@
 //! traits, so its scoring rules are tested with a fake spawner before any real
 //! per-OS spawn routine exists (T16 Linux, T18 macOS, T19 Windows).
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -55,6 +56,9 @@ pub enum ExitKind {
 ///   `d`, and reaps it when it has.
 /// - `kill` terminates the process (`SIGKILL` / `TerminateJobObject`); killing
 ///   an already exited process is `Ok(())`.
+/// - `into_parts` (M8, Δ2) splits the worker for a script run; see
+///   [`WorkerParts`]. The probe runner never calls it and keeps using the
+///   methods above.
 pub trait WorkerProcess {
     /// OS process id of the worker.
     fn pid(&self) -> u32;
@@ -68,6 +72,76 @@ pub trait WorkerProcess {
     fn wait_timeout(&mut self, d: Duration) -> io::Result<Option<ExitKind>>;
     /// See the trait documentation.
     fn kill(&mut self) -> io::Result<()>;
+
+    /// Splits the worker into its three byte streams, a kill handle and a
+    /// reaper (Δ2, PD-137), for the bridge's reader, writer, stderr and reaper
+    /// threads. It consumes the worker, so it is called once, and the methods
+    /// above are gone afterwards. It may follow `read_frame_timeout` calls:
+    /// bytes the spawner already read and did not return as a frame are the
+    /// first bytes of [`WorkerIo::stdout`].
+    ///
+    /// The default is `Unsupported`: only the real spawners split (the probe
+    /// runner's fakes do not need to).
+    fn into_parts(self: Box<Self>) -> io::Result<WorkerParts> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+}
+
+/// A worker split for a script run (Δ2): the pid, the three pipes, the kill
+/// handle and the reaper.
+///
+/// Dropping every part kills the worker: on Windows the last job handle closes
+/// (`KILL_ON_JOB_CLOSE`); on Unix a reaper dropped without
+/// [`Reaper::wait`] kills the worker and reaps it for up to 2 s. A bridge
+/// always drives the reaper to the end.
+pub struct WorkerParts {
+    /// OS process id of the worker (for the macOS footprint watchdog and the
+    /// Linux `/proc` check; never signalled directly).
+    pub pid: u32,
+    /// The worker's stdin, stdout and stderr.
+    pub io: WorkerIo,
+    /// Kills the worker; non-blocking and idempotent (PD-137).
+    pub kill: Arc<dyn KillHandle>,
+    /// Waits for the worker's exit and reaps it.
+    pub reaper: Box<dyn Reaper>,
+}
+
+/// The host ends of the worker's three pipes as plain byte streams (§3.4:
+/// exactly three handles). Reads block until bytes arrive or the worker's end
+/// closes (EOF, `Ok(0)`); a kill closes them.
+pub struct WorkerIo {
+    /// Host end of the worker's stdin. Dropping it is the stdin EOF the worker
+    /// exits on.
+    pub stdin: Box<dyn Write + Send>,
+    /// Host end of the worker's stdout, starting with any bytes the spawner
+    /// had already read and not returned as a frame.
+    pub stdout: Box<dyn Read + Send>,
+    /// Host end of the worker's stderr. The spawner's drain thread hands its
+    /// reader over: the bytes it kept so far come first (the head, at most
+    /// 64 KiB, on Linux and Windows; the last 4 KiB on macOS), then everything it
+    /// reads from then on. The thread keeps reading, so the worker never blocks
+    /// on stderr while the stream is read, and discards once the stream is
+    /// dropped.
+    pub stderr: Box<dyn Read + Send>,
+}
+
+/// Kills a worker without blocking (PD-137, M3 final review M-1): Windows
+/// `TerminateJobObject` on a job handle the handle owns, Linux
+/// `pidfd_send_signal(SIGKILL)` (a pid `kill` guarded by the reap flag when the
+/// kernel has no pidfd), macOS `kill(SIGKILL)` guarded by the reap flag.
+///
+/// `kill` never waits for the exit, takes no lock that a reader, writer or
+/// reaper thread holds across a blocking call, never signals a reaped pid, and
+/// a second call is a no-op. See [`crate::kill`].
+pub trait KillHandle: Send + Sync {
+    /// Kills the worker (see the trait documentation).
+    fn kill(&self);
+}
+
+/// Waits for a worker's exit and reaps it, on a thread of its own.
+pub trait Reaper: Send {
+    /// Blocks until the worker exited, reaps it and returns how it ended.
+    fn wait(self: Box<Self>) -> io::Result<ExitKind>;
 }
 
 /// Starts worker processes (one per probe, see [`crate::probe::run_probes`]).

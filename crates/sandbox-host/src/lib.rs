@@ -5,14 +5,21 @@
 //! sandbox binary identity (T15), and the per-OS spawn routines: Linux (T16,
 //! module `linux`), macOS (T18, module `macos`) and Windows (T19, module
 //! `windows`). [`platform_spawner`] returns the one for the running OS.
+//!
+//! M8 (Δ2, PD-137) splits a spawned worker into its pipes, a non-blocking kill
+//! handle and a reaper ([`spawn::WorkerProcess::into_parts`], [`kill`]).
 
+mod drain;
 pub mod identity;
+pub mod kill;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
 pub mod macos;
 pub mod probe;
 pub mod spawn;
+#[cfg(unix)]
+mod unix;
 #[cfg(windows)]
 pub mod windows;
 pub mod winscore;
