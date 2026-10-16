@@ -153,6 +153,16 @@ async fn l83_await_reply_id_compared() {
     assert_eq!((status_of(&env), exit), (Status::Succeeded, 0));
     assert_eq!(env.request_id.as_deref(), Some(REQ_ID));
     running.stop().await;
+
+    // An id-less answer is an error envelope (the fake's default names the request).
+    let mut idless = Fake::new();
+    idless.await_reply_id = None;
+    let fake = Arc::new(idless);
+    let (running, connector) = setup(&fake).await;
+    let (env, _) = run(&op(), &opts(), &within(5_000), &connector).await;
+    assert_eq!(status_of(&env), Status::Failed);
+    assert_eq!(code(&env), Some(ErrorCode::Internal));
+    running.stop().await;
 }
 
 #[tokio::test]

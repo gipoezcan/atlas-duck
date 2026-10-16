@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use atlas_duck_ipc::client::{ClientContext, ConnectError, IpcClient};
-use atlas_duck_ipc::envelope::{Envelope, Status};
+use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use atlas_duck_ipc::paths::{
     BaseDirs, DataDirResolution, EndpointLocation, LocalDataDir, check_data_dir,
 };
@@ -74,7 +74,8 @@ pub(crate) struct Fake {
     pub doctor_delay: Duration,
     /// A `pending` submit reply that carries no request id (a broken app).
     pub submit_null_id: bool,
-    /// The `request_id` the await answer carries (`None`: none).
+    /// The `request_id` the await answer carries. `None` models an app that answers an error:
+    /// an id-less `failed` envelope. A successful answer always names its request (T34b m-5).
     pub await_reply_id: Option<&'static str>,
 }
 
@@ -90,7 +91,7 @@ impl Fake {
             await_delay: Duration::ZERO,
             doctor_delay: Duration::ZERO,
             submit_null_id: false,
-            await_reply_id: None,
+            await_reply_id: Some(REQ_ID),
         }
     }
 
@@ -226,9 +227,14 @@ impl RequestHandler for Fake {
         }
         tokio::time::sleep(self.await_delay).await;
         self.record(Kind::AwaitDone, Some(id));
-        let mut env = Fake::answer("request.await");
-        env.request_id = self.await_reply_id.map(str::to_owned);
-        env
+        match self.await_reply_id {
+            Some(id) => {
+                let mut env = Fake::answer("request.await");
+                env.request_id = Some(id.to_owned());
+                env
+            }
+            None => Envelope::failed(ErrorCode::Internal, false, "the fake app failed the await"),
+        }
     }
 
     async fn status(&self, request_id: &str) -> Envelope {
