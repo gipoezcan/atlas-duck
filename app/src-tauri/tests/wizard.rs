@@ -746,6 +746,7 @@ async fn non_local_dir_refused() -> TestResult {
     let (_app, setup) = m.app()?;
     let share = m.root.join("fake-nfs");
     std::fs::create_dir(&share)?;
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut picks = vec![
         share.clone(),
         share.join("atlas"),
