@@ -388,7 +388,9 @@ async fn first_preview_text(wd: &WebDriver, within: Duration, not: Option<&str>)
             Ok(r) if !r.is_empty() => Some(body_text(wd).await),
             _ => None,
         };
-        wd.switch_to_parent().await?;
+        // Back to the top-level document, not "the parent": a frame that went away while the
+        // driver was in it has none (WebKit answers "no such frame").
+        wd.switch_to_top().await?;
         Ok(match text {
             Some(Ok(t)) if not != Some(t.as_str()) => Some(t),
             _ => None,
@@ -1334,21 +1336,35 @@ async fn chords(rig: &Rig) -> Result<()> {
 
     // Focus inside the preview frame: the same chords do nothing to the page.
     // The frame reloads when the opened row changes (new srcdoc): WebKit answers "no such frame" to
-    // a switch made while it does, so the switch is retried until it takes.
-    wait_for("the preview frame to be entered", WAIT, || async {
-        let Ok(frame) = wd.find("iframe[title='Preview']").await else {
-            return Ok(None);
-        };
-        Ok(wd.switch_to_frame(&frame).await.ok().map(|_| ()))
-    })
+    // a switch made while it does (or to a command in a frame that went away after the switch), so
+    // the switch and the click inside are retried from the top-level document until both take.
+    wait_for(
+        "the preview frame to be entered and clicked",
+        WAIT,
+        || async {
+            let Ok(frame) = wd.find("iframe[title='Preview']").await else {
+                return Ok(None);
+            };
+            if wd.switch_to_frame(&frame).await.is_err() {
+                return Ok(None);
+            }
+            let clicked = match wd.find("body").await {
+                Ok(inside) => wd.click(&inside).await.is_ok(),
+                Err(_) => false,
+            };
+            if clicked {
+                return Ok(Some(()));
+            }
+            wd.switch_to_top().await?;
+            Ok(None)
+        },
+    )
     .await?;
-    let inside = wd.find("body").await?;
-    wd.click(&inside).await?;
     // Sent while the driver is switched into the frame: the keys go where the focus is, and a
     // driver that routes actions by browsing context still means the frame.
     wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
     wd.chord(&ctrl_shift, keys::ENTER).await?;
-    wd.switch_to_parent().await?;
+    wd.switch_to_top().await?;
     ensure!(
         first_exit(&mut held, Duration::from_millis(1500))
             .await?
