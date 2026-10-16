@@ -1,0 +1,31 @@
+# Linux GUI release checklist (M6)
+
+Tester-facing checklist for the parts of the packaged Linux app that CI cannot drive. Run it on the release candidate's own bundles:
+
+- **AppImage** on Ubuntu 22.04 (GNOME session).
+- **rpm** on Fedora 40 Workstation (GNOME session **without** the "AppIndicator and KStatusNotifierItem Support" extension, so there is no tray host).
+
+Each row starts from a user with no atlas-duck data: no `~/.config/atlas-duck/`, no `~/.local/share/atlas-duck/`, no `~/.local/bin/atlas-duck`.
+
+## Why these rows are manual
+
+CI drives windows through `tauri-driver` and WebKitWebDriver. On Linux that cannot reach the first-run wizard (M6 CI ruling, task cifix6, run 38885675593):
+
+- Before a data folder exists, the Setup window is incognito. wry gives an incognito webview a fresh WebKit context with automation off, so the driver gets no session.
+- With a data folder pinned first, the wizard's passphrase step opens the credential window. That window has its own web context (S-07), which WebKitWebDriver cannot reach on Linux (`CREDENTIAL_NOT_ON_LINUX` in `app/src-tauri/tests/e2e/flows.rs`).
+
+The `e2e-bundle.yml` jobs `appimage-m6` and `fedora-no-tray-host` therefore run driver-free checks (`ci/gui-no-driver.sh`). Each row below says what they cover and what is left to this checklist.
+
+Screenshots go outside the repository, in the test-evidence folder the lead names (spec §7.7).
+
+## Rows
+
+| # | Build | Steps | Expected | Automation covers (CI) | Lost from CI, checked here | Result |
+|---|-------|-------|----------|------------------------|----------------------------|--------|
+| L1 | AppImage (Ubuntu 22.04), rpm (Fedora 40) | Start the app with no data. Work through the wizard: "Use the default folder"; "Begin", then the recovery passphrase twice in the credential window and "Set passphrase"; the recovery note step ("Continue"); "Skip for now" for the instances; on the command-line step **do not** install yet ("Continue"); "Finish setup". | The Setup window opens at once. The credential window opens for the passphrase and shows success. The data folder is `~/.local/share/atlas-duck`. After "Finish setup" the Setup window closes and Approvals opens. No passphrase appears in `~/.local/share/atlas-duck/logs/diag.log`. | On the packaged builds: the cold start maps the Setup window on a pinned data dir with no store, `doctor` reports gate `first_run`, the second start comes up clean. On the cargo-built binary (`e2e` job): the Setup window renders a wizard step and refuses navigation (`s09_isolation_invoke_setup_window`). | The wizard end to end through real windows: the data-folder step, the recovery passphrase in the credential window, the recovery note, skip instances, Finish. On Linux this is covered nowhere else. | |
+| L2 | AppImage (Ubuntu 22.04) | With a fresh profile, repeat L1 but press **"Install CLI to PATH"** on the command-line step, then finish. Quit from the Approvals header. Run `~/.local/bin/atlas-duck doctor`. Run it a second time. Quit the app, move the AppImage to another folder, and run `~/.local/bin/atlas-duck doctor` again. | The step shows a status line after the button. `~/.config/atlas-duck/cli-<host>.toml` has `app_path` = the AppImage file's path, never `/tmp/.mount_*`. `~/.local/bin/atlas-duck` exists, is executable and contains `# atlas-duck-cli-wrapper v1`. The first `doctor` exits 0, starts `<AppImage> --background` (check with `ps -eo args`: the AppImage path, not a mount path) and reports a gate other than `first_run`. The second `doctor` exits 0 and reaches the same process (same pid). With the AppImage moved, `doctor` exits 5 with `"reason":"not_running"` and the hint "re-run Install CLI to PATH". | `<AppImage> __cli doctor` cold-starts `<AppImage> --background` with the AppImage path (release AppImage, `bundle.yml` `appimage-smoke`, M4 section). The autostart entry's `Exec` is the AppImage path (V14). The debug AppImage serves `__cli doctor` on a cold start, forwards second launches and stops cleanly on SIGTERM (`appimage-m6`). | Install CLI to PATH from the wizard, the `cli.toml` `app_path`, the wrapper, the wrapper's cold start, a second wrapper call reaching the same instance, and the moved AppImage's exit 5 with the re-install hint (CI-04 M6 steps). | |
+| L3 | rpm (Fedora 40, no tray host) | After L1 on Fedora, quit, then start atlas-duck from the app menu (cold, no arguments). Run `atlas-duck doctor`. Start atlas-duck again from the app menu, then run `atlas-duck-app --background` in a terminal. Open Settings from the Approvals header, return to Approvals, press Quit in the header. Start atlas-duck again from the app menu. | The no-tray-host hint dialog names the GNOME extension. The cold start opens Approvals. `doctor` reports `"tray_host":"missing"`. Each second start opens no new window (Approvals stays the only one; the menu start brings it forward). Settings opens from the header. Header Quit ends the process (no `atlas-duck-app` left) and `diag.log` has `event=app_stop reason=quit` after the click, with no `quit_wait_expired` or `quit_core_lost`. The next start opens Approvals normally. | On the rpm in a Fedora 40 container with no StatusNotifierWatcher (`fedora-no-tray-host`), on a pinned data dir with no store: `tray_host=missing` in the diag log and in `doctor`; a cold start maps the Setup window; a forwarded no-argument launch and a forwarded `--background` launch exit 0, are logged as `forwarded_launch` and change no mapped window; SIGTERM ends the process through the shutdown path (`os_end_session reason=sigterm`, exit 0, no `quit_wait_expired`/`quit_core_lost`); the next start comes up clean. | With a store (CI has none without the wizard): Approvals on a cold start, Settings from the header, header Quit with `app_stop reason=quit`, the next start after Quit (CI-03 store-backed steps). Open item: a Rust-harness store provisioning helper shipped with the e2e bundle would move these back into CI. | |
+
+## Evidence
+
+For each row record: the build id (`atlas-duck --version`), the distribution and session type, Result (PASS / FAIL / N/A), and the screenshot file names. On FAIL attach `~/.local/share/atlas-duck/logs/diag.log` and the output of the failing command.

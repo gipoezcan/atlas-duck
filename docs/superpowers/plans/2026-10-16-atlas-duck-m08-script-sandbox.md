@@ -1,19 +1,19 @@
 # atlas-duck M8 (Script sandbox) Implementation Plan
 
-**Draft status:** DRAFT of 2026-10-16 with the lead's rulings applied (section "Lead rulings (2026-10-16)"; no task waits for an answer); uncommitted. Written while M7 is planned but not built, against `m6-approvals-ui` at `6e35de4` (M1–M5 on `master`, M6 implemented with its final review pending) and the M7 plan `2026-10-16-atlas-duck-m07-confluence-adapter.md` (committed in `a1233dd` with the lead's rulings). Tasks 1–31 need no Confluence code and are planned in full. They do build on four generic M7 artifacts:
+**Plan status:** committed plan of 2026-10-16 with the lead's rulings applied (section "Lead rulings (2026-10-16)"; no task waits for an answer), revised after the plan review (`.superpowers/sdd/m08-plan-review.md`, checked against `m6-approvals-ui` at `81a8b7b`; revision at `04f8f5e`). Written while M7 is planned but not built (M1–M5 on `master`, M6 implemented and reviewed), against the M7 plan `2026-10-16-atlas-duck-m07-confluence-adapter.md` (committed with the lead's rulings and revised after its review in `22a3fb9`/`a0eab73`). Tasks 1–31 (with Tasks 19a, 19b, 19c in place of one Task 19) need no Confluence code and are planned in full. They do build on four generic M7 artifacts:
 - Task 17 reuses M7's `generic::list_table` (M7 PD-114);
-- Task 18 bumps M7's `render4` to `render5` (`render3` is the M6 CI fix round's, M7 owns `render4`);
+- Task 18 takes the next render part after the one the merged M7 uses (planned: M7 `render4`, M8 `render5`; `render3` is the M6 CI fix round's, L215);
 - Task 27 extends `perf_sc3` and `e2e/flows.rs` after M7's additions;
 - Task 30 runs M7's `confluence_flows` in its CI list.
 
-Tasks 32–35 need M7's Confluence code. They sit in the final section, "M7-dependent tasks (reconcile when M7 has merged)", with their assumptions. Execution starts only after M7 has merged, because both milestones change the same crates and only one cargo agent runs at a time. **Numbering:** the lead's global allocation gives M8 **PD-131..PD-155** and ledger entries **L165–L184** (M7: PD-93..114, L136–L154; M9: PD-115..130, L155–L164; M10: PD-156..190, L185–L214). This plan uses PD-131..PD-152 and L165–L182. Contract deltas are Δ1–Δ8 of this plan. The committed M7 plan (with its lead rulings) and the M9 draft were re-read for the Confluence and MCP dependencies: see the assumptions of the M7-dependent tasks and the M9 handoff.
+Tasks 32–35 need M7's Confluence code. They sit in the final section, "M7-dependent tasks", with their assumptions. Execution starts only after M7 has merged, because both milestones change the same crates and only one cargo agent runs at a time. The M7-dependent tasks are therefore not deferred work: they run before the evidence file, the exit run and the final review (Tasks 29–31), because the exit criterion needs `k` fixed in the spec and the Confluence halves of I-22, I-37 and X-12 ("Execution order and dependencies"). **Numbering:** the lead's global allocation gives M8 **PD-131..PD-155** and ledger entries **L165–L184** (M7: PD-93..114, L136–L154; M9: PD-115..130, L155–L164; M10 allocation: PD-156..190, L185–L214, of which M10 uses PD-156..179 and L185–L200). This plan uses PD-131..PD-152 and L165–L182. Contract deltas are Δ1–Δ8 of this plan. The committed M7 plan (with its lead rulings) and the M9 draft were re-read for the Confluence and MCP dependencies: see the assumptions of the M7-dependent tasks and the M9 handoff.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. One implementer subagent works on each task, and one reviewer follows each task. Every task below is self-contained. It names every file it touches, the interfaces it consumes from earlier tasks and the ones it must produce, and the tests with the assertions that matter.
 >
 > **Model policy for the executing agents (memory `subagent-model-preference`; only 5.5 models, never Fable).** Each task header names its implementer and its reviewer.
 > - **Haiku (effort xhigh)**: easy, mechanical work (docs, evidence tables).
 > - **Sonnet (effort medium)**: normal tasks and their reviews.
-> - **Opus (effort medium)**: only the complicated or security-critical tasks, marked `Model: Opus` (the worker engine and run loop, the spawner split and kill handles, the host bridge, host-measured memory limits, the Windows degraded spawner, the core seam and `atlas.all`, the degraded-confinement setting, the script preview renderer, `app::script_glue`), the reviews of those tasks, and the final whole-branch review.
+> - **Opus (effort medium)**: only the complicated or security-critical tasks, marked `Model: Opus` (the worker engine and run loop, the spawner split and kill handles, the host bridge, host-measured memory limits, the Windows degraded spawner, the core seam and `atlas.all`, the degraded-confinement setting, the redaction engine path check, the script preview renderer, `app::script_glue`, the Confluence host calls), the reviews of those tasks, the review of the script preview model (Task 17), and the final whole-branch review.
 > - Opus `xhigh` is reserved for the case where everything else failed.
 >
 > **Hard execution limits (corporate AV, memory `agent-execution-limits`).**
@@ -50,7 +50,7 @@ All of it is proved by in-process tests where the code allows and by CI runs on 
 - **`sandbox-worker`** stays one process per run, with JS on the main thread and no threads or async runtime (§9.3).
   - It gains a script mode and a compile mode beside the probe mode, chosen by the host's first frame.
   - The `atlas.*` shim is embedded JS generated from the init frame's `read_op_ids`.
-  - A limit-aware allocator turns a heap overrun into an uncatchable interrupt.
+  - A limit-aware QuickJS allocator refuses allocations past `heap_mb`; the loop checks its flag after every entry into QuickJS and exits `EXIT_HEAP_LIMIT` without sending anything more (PD-134).
   - Promise jobs are drained with `execute_pending_job`, so rquickjs `futures` stays off (V15).
 - **`sandbox-host`** splits a spawned worker into I/O (stdin writer, stdout reader, stderr reader), a non-blocking `KillHandle` and a reaper (Δ2). On top it adds the C.8 bridge `start_run`/`compile_run`: one reader thread that always drains, one stderr thread, one writer thread, and a per-run state machine whose host calls go to a `HostCallSink` as tokio tasks that are never dropped. It also adds memory-limit attribution (Windows job messages, the macOS watchdog, worker exit codes), the identity re-check, and the Windows degraded spawner.
 - **`core`** keeps the M3 lifecycle. It changes at the seam (Δ3: submit-time availability, compile failure kinds, run policy, `app_upgraded`). It also gains per-page `atlas.all`, configured script limits with invariants, the audit-authoritative degraded toggle, the Running-scripts view with kill answers, and the script preview model.
@@ -59,7 +59,7 @@ All of it is proved by in-process tests where the code allows and by CI runs on 
 
 No new workspace crate. No new process kind.
 
-**Tech Stack:** Rust 1.95.0 (edition 2024, MSRV 1.90), `rquickjs =0.14.0` (QuickJS-NG 0.16.2, features `["macro"]` only: `futures` decided **off**, PD-131). `sandbox-host` gains the existing workspace pins `tokio =1.53.2` (`rt`, `sync`, `time`) and `async-trait =0.1.92`. Every other pin already exists. CI-only tools are unchanged (`tauri-driver` etc. from M6).
+**Tech Stack:** Rust 1.95.0 (edition 2024, MSRV 1.90), `rquickjs =0.14.0` (QuickJS-NG 0.16.2, features `["macro"]` only: `futures` decided **off**, PD-131). `sandbox-host` gains the existing workspace pins `tokio =1.53.2` (`rt`, `sync`, `time`) and `async-trait =0.1.92`. `ipc` turns on the `raw_value` feature of the existing `serde_json =1.0.151` pin (M-3 of the plan review; `RawJsonText`, Task 2). Every other pin already exists. CI-only tools are unchanged (`tauri-driver` etc. from M6).
 
 **Spec:** `docs/superpowers/specs/2026-10-07-atlas-duck-design.md`:
 - §2.1, §2.2, §2.5 step 3;
@@ -75,7 +75,7 @@ No new workspace crate. No new process kind.
 - §14 item 8;
 - §15 V02, V10, V11, V12, V15, V16, V21.
 
-Ledger: `docs/superpowers/specs/2026-10-07-atlas-duck-review-ledger.md`, entries L02, L03, L14, L18, L19, L20, L21, L26, L31, L101, L105 (M-13) and L134.
+Ledger: `docs/superpowers/specs/2026-10-07-atlas-duck-review-ledger.md`, entries L02, L03, L14, L18, L19, L20, L21, L26, L31, L101, L105 (M-13), L123 (redaction round rules), L134 and L217 (M6 final-review handoffs to M8).
 
 **Master plan:** `docs/superpowers/plans/2026-10-07-atlas-duck-master-plan.md`:
 - the M8 entry and its Placements;
@@ -95,6 +95,7 @@ Ledger: `docs/superpowers/specs/2026-10-07-atlas-duck-review-ledger.md`, entries
 - M3 `task-27-report.md`: rulings 4, 5, 9 and the M8 handoff list.
 - M5 `final-review.md`: M-13, "script candidates skip the §5.3 mirror check".
 - M6 `task-30-review.md` and `progress.md`: T30 M-2 "no longer running" vs "already stopping"; T30 M-3 `started_at` = `submitted_at`; L134.
+- M6 `final-review.md` (deferred-items table: the engine-side redaction path check and the M-11 mirror "drop flagged items" tree, both "Defer to M8") and `progress.md` T17 fix `265d320` (the `drop_field`/`drop_item` existence check runs against the original source, `crates/core/src/redact/apply.rs`).
 
 **Prerequisite:** M1–M7 merged on `master`; branch `m8-script-sandbox`. Before Task 1 the lead does two things:
 - (a) applies Δ1–Δ8 to the master plan (C.3, C.6, C.7, C.8, C.10);
@@ -121,13 +122,13 @@ Checked in:
 |---|---|---|
 | Worker | Probe loop `run`/`run_with` (`lib.rs:54-111`): confines, sends `probe.ready {worker_version, engine_version, confinement}`, answers `probe.run` until EOF; refuses frames > 1 MiB (`send`). Engine (`engine.rs`): `Context::custom::<(Eval, Json, Promise, RegExp, MapSet, Date)>`, `set_max_stack_size(1 MiB)`, self-test; no memory limit, no interrupt handler, no script mode. Panic hook exits 101 (SIGSYS-safe). Windows stack `/STACK:8388608` (`app/src-tauri/build.rs:7`) | script and compile modes, `atlas.*` shim, limit allocator, interrupt handler, terminal-frame cap, new exit codes (T3, T4) |
 | Confinement | Linux `no_new_privs` + Landlock + seccomp (allowlist unchanged since `1cbf9e3`; lacks `tgkill`, `gettid`, `rt_sigaction`, so abort/OOM/stack overflow die by SIGSYS: go/no-go "M8 notes"); macOS SBPL; Windows reports only (the host confines at spawn) | no confinement code change planned. V11 closure corpus runs under the filter in CI (T5); no allowlist additions (R3) |
-| Spawners | `WorkerSpawner`/`WorkerProcess` (`spawn.rs:58-86`): a sync trait, `read_frame_timeout` behind a reader thread, `kill(&mut self)`. Linux: long-lived spawner thread, rlimits AS/NOFILE/STACK/CORE, env `TZ=UTC0` + `MALLOC_ARENA_MAX=1`, stderr head 64 KiB. macOS: `posix_spawn`, `chdir /`, stderr tail 4 KiB, `kill` by pid, **no watchdog**. Windows: AppContainer/LPAC, job (`ACTIVE_PROCESS=1`, `KILL_ON_JOB_CLOSE`, `DIE_ON_UNHANDLED_EXCEPTION`, process memory limit, UI bits applied one by one), per-run cwd, env with five names (M1 deviation: `LOCALAPPDATA`, `SystemRoot`, `TEMP`, `TMP`, `TZ`), `TerminateJobObject` (`job.rs:157`). Probe runner, scoring, `fallback_spawner` (plain AppContainer). `identity.rs`: file id, size, mtime + embedded version, recorded by the probe | I/O / kill / reap split (T6), bridge (T7), S-10 (T8), memory-limit attribution + macOS watchdog (T9), identity re-check (T10), Windows degraded spawner (T11) |
+| Spawners | `WorkerSpawner`/`WorkerProcess` (`spawn.rs:58-86`): a sync trait, `read_frame_timeout` behind a reader thread, `kill(&mut self)`. Linux: long-lived spawner thread, rlimits AS/NOFILE/STACK/CORE, env `TZ=UTC0` + `MALLOC_ARENA_MAX=1`, stderr head 64 KiB. macOS: `posix_spawn`, `chdir /`, stderr tail 4 KiB, `kill` by pid, **no watchdog**. Linux: `PR_SET_PDEATHSIG(SIGKILL)` is set by the host spawner in the child before exec (`linux/spawner.rs:248-257`), never by the worker's `confine::apply`. Windows: AppContainer/LPAC, job (`ACTIVE_PROCESS=1`, `KILL_ON_JOB_CLOSE`, `DIE_ON_UNHANDLED_EXCEPTION`, process memory limit, UI bits applied one by one), per-run cwd, env block with three names (`LOCALAPPDATA`, `SystemRoot`, `TZ`) to which the OS adds `TEMP`/`TMP`, so the worker observes five (`windows/mod.rs` `WORKER_ENV_OBSERVED`; M1 deviation), `TerminateJobObject` (`job.rs:160`). Probe runner, scoring, `fallback_spawner` (plain AppContainer). `identity.rs`: file id, size, mtime + embedded version, recorded by the probe | I/O / kill / reap split (T6), bridge (T7), S-10 (T8), memory-limit attribution + macOS watchdog (T9), identity re-check (T10), Windows degraded spawner (T11) |
 | Protocol types | `ipc::sandbox::{ScriptLimits, HostCall, HostCallResult, frame, probe}`; `WORKER_FRAME_MAX_BYTES` = 1 MiB; no init or terminal types | Δ1 (T2) |
-| Core lifecycle | Complete against `FakeScriptRunner` (M3 T27): compile in the dry pool, 2 real + 2 dry slots, `SCRIPT_STARTED`/`SCRIPT_CALL_SENT`/`SCRIPT_CALL`/`SCRIPT_FINISHED`/`SCRIPT_FAILED`, `classify` (`engine/script.rs:1938`), cancel, shutdown, user kill, dry runs from examples, bounded error candidates, rebuild, `on_instance_changed`. `atlas.all` = one plan with one `SCRIPT_CALL` (`widen`, `script.rs:1261`; T27 ruling 5). `HostCalls::log` is a no-op; logs arrive in `RunEnd`. No submit-time availability seam. `sandbox_unavailable` envelope has no `details.reason` and `retryable: false` (`engine/envelope.rs:723`). `kill_script -> bool` (`script.rs:2402`). M3 M-1: the state guard is already dropped before the kill (`engine/mod.rs:1414`) | Δ3 seam (T12), `atlas.all` (T13), limits (T14), degraded (T15), running model (T16), preview model (T17), test sweep (T19) |
+| Core lifecycle | Complete against `FakeScriptRunner` (M3 T27): compile in the dry pool, 2 real + 2 dry slots, `SCRIPT_STARTED`/`SCRIPT_CALL_SENT`/`SCRIPT_CALL`/`SCRIPT_FINISHED`/`SCRIPT_FAILED`, `classify` (`engine/script.rs:1938`), cancel, shutdown, user kill, dry runs from examples, bounded error candidates, rebuild, `on_instance_changed`. `atlas.all` = one plan with one `SCRIPT_CALL` (`widen`, `script.rs:1261`; T27 ruling 5). `HostCalls::log` is a no-op; logs arrive in `RunEnd`. No submit-time availability seam. `sandbox_unavailable` envelope has no `details.reason` and `retryable: false` (`engine/envelope.rs:723`). `kill_script -> bool` (`script.rs:2402`). M3 M-1: the state guard is already dropped before the kill (`engine/mod.rs:1414`) | Δ3 seam (T12), `atlas.all` (T13), limits (T14), degraded (T15), running model (T16), preview model (T17), test sweep (T19a, T19b), redaction engine path check and the M-11 drop-flagged-items tree (T19c) |
 | Script limits | `ScriptLimits::default()` is the ceiling (`validate/mod.rs:308`) and the "effective" `script_limits` of `ops describe --instance` (`engine/handler.rs:324`); invariant 2 enforced (`PROCESS_OVER_HEAP_MB = 88`); invariant 1 waits for `k`; no Settings key | configured defaults, Settings, both invariants, effective describe (T14) |
 | Preview | script items render the generic JSON tree with `class: script` (`script.rs:1386`); Info `host_calls_lossy` counts truncated pages and comment caps; `ScriptState.preselect_error_class_only` not surfaced (M6 handoff) | `PreviewBody::Script` + render arm (T17, T18) |
-| App | `CoreDeps.scripts: None` (`compose.rs:82`); startup probe thread, `AppState.probe: OnceLock` "set once; a second run (M8's) needs its own storage" (`sandbox_probe.rs:272`); `scripts_floor_met()` unused; `APP_START` carries `engine_version`, `tray_host` only; Settings `confinement {state, failed, mode, extra_layers}`; status line `updated_restart` exists, trigger unwired (`status.rs:39`); `keychain_prompt` input unwired (L134) | `script_glue` (T20), probe/status (T21), windows (T22–T24) |
-| Running scripts | `RunningScriptView {request_id, agent_name, started_at (= submitted_at), host_calls}` (`running.rs`); `running_kill -> {killed: bool}`; UI text "That script is no longer running." for both "ended" and "already stopping" | columns, slot time, kill answers (T16, T22) |
+| App | `CoreDeps.scripts: None` (`compose.rs:82`); startup probe thread, `AppState.probe: OnceLock` "set once; a second run (M8's) needs its own storage" (`sandbox_probe.rs:272`); `scripts_floor_met()` unused; `APP_START` carries `engine_version`, `tray_host` only; Settings `confinement {state, failed, mode, extra_layers}`; status line `updated_restart` exists, trigger unwired (`status.rs:39`, `StatusInputs::update_pending` set only in tests); `keychain_prompt` already wired (`status.rs:278` `gather_gate` reads `ServeSlot::keychain_prompt()`, set by `serve.rs` after `KEYCHAIN_PROMPT_AFTER` = 10 s, commit `8fc44a9`; L134's "unwired" is stale for it) | `script_glue` (T20), probe/status (T21), windows (T22–T24) |
+| Running scripts | `RunningScriptView {request_id, agent_name, started_at (= submitted_at), host_calls}` (`running.rs:47` copies `submitted_at`; `ScriptState` has no `started_at` field yet, Task 16 adds it); `running_kill -> {killed: bool}`; UI text "That script is no longer running." for both "ended" and "already stopping" | columns, slot time, kill answers (T16, T22) |
 | CI | `install-probes.yml` (seven package jobs, floor line), `ci.yml` probe-evidence steps, `bundle.yml`, `e2e-bundle.yml` (debug scripted-approver bundles), `ci/appimage-smoke.sh` M4/M6 sections; no script runs anywhere | `script_flows` and `sandbox_runs` on every leg, confined-worker suites, the AppImage script step (CI-04), the CI-07 definition (T26, T28) |
 | Checker | `ci/check-workspace.mjs:113-117`: `futures` banned "not allowed in M1: M8 decides" | the M8 decision recorded (T1) |
 
@@ -138,15 +139,16 @@ Checked in:
 The master plan's "Global Constraints" apply verbatim. The subset M8 touches most:
 
 - **Dependency rule (§2.2, `ci/check-workspace.mjs`):**
-  - `sandbox-worker` depends only on `ipc` (types) + `rquickjs` + `serde_json` (+ the existing OS crates). It links no HTTP client, keychain, DB or async runtime.
-  - `sandbox-host` may add `tokio` and `async-trait` (existing pins) and nothing that reaches the network or the keychain.
+  - `sandbox-worker` depends only on `ipc` (types) + `rquickjs` + `serde_json` (+ the existing OS crates). It links no HTTP client, keychain, DB or async runtime. Task 1 pins its external set in a new checker rule `WORKER_EXTERNAL_ALLOW`.
+  - `sandbox-host` may add `tokio` and `async-trait` (existing pins) and nothing that reaches the network or the keychain. Task 1 enforces that with a new checker rule `BANNED_IN_SANDBOX_HOST` (HTTP clients, keyring crates, SQLite, `tauri`/`wry`). The checker ignores dev-dependencies by design (`check-workspace.mjs:33`), so test-only edges stay free.
   - `core` keeps its exact six edges and gets no edge to `sandbox-host` (C.0).
   - `app` is the only crate that knows both.
 - **The host treats the worker as hostile (§3.4, §9.5):** classification uses host state only (timer, counters, kill reasons, process exit observed by the host, job messages, watchdog); the worker's class, message, stack and `elapsed` are untrusted payload; a worker can never make a run "direct" that the host saw as queued or dispatched; no worker byte reaches the diagnostic log (stderr only into the encrypted run record, §3.4).
 - **Data-free and opacity (§4.5, §9.5, §10.2):** `SCRIPT_CALL_SENT` before the first send of a run; every dispatched call ends in a committed `SCRIPT_CALL` before anything goes back to the worker; before a decision only `pending` is observable; `cancel` answers without waiting for a reap; slot saturation is never `busy`.
 - **Kill never blocks (M3 M-1 hard handoff):** `RunHandle::kill` and every kill path below it take no lock that a reader, writer or reaper thread holds across a blocking call, never wait for exit, never signal a reaped pid, and are idempotent.
-- **Lints and panics:** `clippy -D warnings`; `unwrap_used`/`expect_used` are errors in `core`, `atlassian`, `convert` and by convention (`#![deny(..)]` at the module roots, tests excepted) in `sandbox-host`, `sandbox-worker` and `app/src-tauri/src/script_glue`. `unsafe` only in the per-OS modules and the two allocator wrappers of `sandbox-worker` (`GlobalAlloc`, the QuickJS allocator), each block with a `// SAFETY:` comment; `ci/check-no-panic-macros.mjs` stays green.
-- **Logs:** new diagnostic events carry constants and ids only (`script_spawn_failed {reason}`, `script_identity_mismatch`, `sandbox_watchdog_kill`); allowlisted by the task that emits them.
+- **Lints and panics:** `clippy -D warnings`; `unwrap_used`/`expect_used` are errors in `core`, `atlassian`, `convert` and by convention (`#![deny(..)]` at the module roots, tests excepted) in `sandbox-host`, `sandbox-worker` and `app/src-tauri/src/script_glue`. `unsafe` only in the per-OS modules and the two allocator wrappers of `sandbox-worker` (the `GlobalAlloc` type `ExitOnOomAlloc`, the QuickJS allocator), each block with a `// SAFETY:` comment; `ci/check-no-panic-macros.mjs` stays green.
+- **Global allocator placement (PD-134):** the worker library exports `ExitOnOomAlloc` but never declares `#[global_allocator]`: the app library links the worker crate (`app/src-tauri/Cargo.toml:51`, `compose.rs:16` `ENGINE_VERSION`), so a declaration there would become the allocator of `atlas-duck-app`, `atlas-duck` and every app test binary. Only `app/src-tauri/src/bin/atlas-duck-sandbox.rs` and the `confined_scripts` test binary declare the static.
+- **Logs:** new diagnostic events carry constants and ids only (`script_spawn_failed {reason}`, `script_identity_mismatch`, `sandbox_watchdog_kill`); allowlisted by the task that emits them. `sandbox-host` has no logging dependency and gets none: it reports these facts in `RunOutcome.diag` / `StartRunError`, and the glue (Task 20) logs them and allowlists them in `diag/fields.rs`.
 - **Fixed strings:** spec text verbatim with `/// §x.y (verbatim)`; plan texts with `/// plan text (PD-nnn)`; TS strings in `app/ui/src/shared/strings.ts` with the same convention.
 - **Test-only code:** no new cargo feature; seams behind `core/testing`, `scripted-approver` or `#[cfg(test)]`; the flow targets are `#![cfg(feature = "scripted-approver")]` like `cli_flows`.
 - **Tests:** each Rust test file starts with `type TestResult = Result<(), Box<dyn std::error::Error>>;`; async tests `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`; OS-only tests are `#[cfg]` modules, never runtime skips; `#[ignore]` reasons are a `const IGNORE: &str` naming the CI step.
@@ -161,7 +163,7 @@ This section is binding for every task. "Local" means on the Windows dev laptop.
 | Target | Local | Why |
 |---|---|---|
 | `cargo test -j 4 -p atlas-duck-ipc --locked --test sandbox_script` | yes | pure serde |
-| `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --lib --test script_engine --test run_loop --test k_factor` (without `--ignored`) | yes | in-process QuickJS over in-memory pipes; `confine::apply` and `run()` are never called; no child process |
+| `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --lib --test script_engine --test run_loop --test k_factor` (without `--ignored`) | yes | in-process QuickJS over in-memory pipes; `confine::apply` and `run()` are never called; no child process. Every test that evaluates JS runs its body on a `std::thread::Builder::new().stack_size(8 * 1024 * 1024)` thread, like M1's `engine.rs::deep_recursion_is_a_catchable_range_error` (the default test thread has 2 MiB, QuickJS's own limit is 1 MiB) |
 | `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --test engine --test confined_workload --test confined_scripts --test panic_hook --test probe_negative_control` | **CI only** (`--no-run` locally) | each re-executes the test binary or `cmd.exe`/`sleep` as a child, and the confined ones apply seccomp/sandbox_init to that child |
 | `cargo test -j 4 -p atlas-duck-sandbox-host --locked --lib --test bridge --test bridge_fuzz --test kill_handle` | yes | fake `WorkerIo`/`KillHandle` over in-memory pipes and threads; no spawn |
 | `cargo test -j 4 -p atlas-duck-sandbox-host --locked --test aces_windows` | **never locally** | changes file ACLs |
@@ -175,6 +177,13 @@ This section is binding for every task. "Local" means on the Windows dev laptop.
 
 Each CI-only behaviour gets a local twin where the code allows: a fake-process test that goes red to green locally first (`bridge.rs` for the bridge, `run_loop.rs` for the worker, `glue` unit tests for `script_glue`). The CI flow is then the evidence on the real OS.
 
+**CI from the first task that adds a CI-only test (plan review I-14).** The CI-only targets run on GitHub from the task that creates them, not from Task 28:
+- Task 5 adds the `confined_scripts` step.
+- Task 6 adds a `ci.yml` step that runs `--test sandbox_runs` with `ATLAS_DUCK_CLI_FLOWS=1` on the four `rust` legs (Windows, macOS arm64, Rosetta, Ubuntu) and pipes it through `node ci/check-no-skips.mjs` with a minimum count (the M5 `jira_flows` step pattern).
+- Task 26 does the same for `script_flows`.
+
+Every task with CI-only tests (5, 6, 8, 9, 10, 11, 25, 26, 32, 33) ends with: the lead pushes; the implementer records the run URL and the evidence lines in the task report; a red CI leg is fixed in a follow-up commit of that task before the next task that builds on it starts. Task 28 then keeps only the CI-02, CI-04 and CI-07 wiring, the Fedora steps and the evidence greps.
+
 ---
 
 ## Dependency pins
@@ -184,7 +193,9 @@ No new crate. Task 1 records:
 | Package | Pin | Change | Task | Why |
 |---|---|---|---|---|
 | `rquickjs` | `=0.14.0` (existing), features `["macro"]` | **`futures` stays off (PD-131)**; the M1 ban reason text becomes the M8 decision | T1 | §9.3, §15 V15 |
-| `tokio` | `=1.53.2` (existing workspace pin) | new edge `sandbox-host` (features `rt`, `sync`, `time`) | T1 | `HostCallSink` tasks, `wait`, the run timer |
+| `tokio` | `=1.53.2` (existing workspace pin) | new edge `sandbox-host` (features `rt`, `sync`, `time`); dev-dependency features `rt-multi-thread`, `macros` for the `multi_thread` tests | T1 | `HostCallSink` tasks, `wait`, the run timer |
+| `serde_json` | `=1.0.151` (existing) | feature `raw_value` on the `ipc` edge (unifies into every crate that links `ipc`, the worker included; it adds the `RawValue` type and nothing else) | T1 | `RawJsonText` (Task 2) keeps the result `value` as text |
+| `proptest` | `=1.11.0` (existing) | new dev-dependency of `sandbox-host` | T8 | `bridge_fuzz.rs` strategies |
 | `async-trait` | `=0.1.92` (existing) | new edge `sandbox-host` | T1 | C.8 `HostCallSink` is `#[async_trait]` (master plan async style) |
 | `windows-sys` | `=0.61.2` (existing) | `sandbox-host` features add `Win32_System_IO` (job completion port) and, for T11, the token APIs already under `Win32_Security` (T11 lists any further feature) | T9, T11 | job memory messages, lockdown token |
 | `libc` | `=0.2.190` (existing) | `pidfd_open`/`pidfd_send_signal` through `libc::syscall` (no new crate), `waitid(WNOWAIT)`, `proc_pid_rusage` on macOS | T6, T9 | kill handles, watchdog |
@@ -205,6 +216,7 @@ Tags:
   - `pub struct CompileRequest { pub source: String }`.
   - Method constants `M_SCRIPT_RUN = "script.run"` (params `WorkerInit`), `M_SCRIPT_COMPILE = "script.compile"`, `M_SCRIPT_COMPILED = "script.compiled"` (params `{}`), `M_SCRIPT_SYNTAX = "script.syntax"` (params `{line, column, message}`), `M_HOST_CALL = "host.call"` (a JSON-RPC **request** with `id` = `HostCall.id`, params `HostCall`), `M_HOST_LOG = "host.log"` (`{line}`), `M_SCRIPT_RESULT = "script.result"` (`{value}`), `M_SCRIPT_ERROR = "script.error"` (`{class, message, stack}`).
   - The host's answer to a `host.call` is a JSON-RPC response `{"jsonrpc":"2.0","id":n,"result":<HostCallResult>}`.
+  - The call id appears twice (the envelope `id` and `HostCall.id`): the decoder rejects a `host.call` whose two ids differ. A JSON-RPC **response** sent by the worker (§3.4 "response to an id the host never issued": the host issues no ids, so any worker-sent response is one) is a decode error and a protocol violation.
   - `pub fn terminal_frame_max(limits: &ScriptLimits) -> usize` (`max_result_mb` MiB + 64 KiB).
   - `pub const HOST_TO_WORKER_MAX = MAX_FRAME_BYTES`.
   - The ready frame stays `probe.ready` (`ProbeReady`) for every mode (PD-132).
@@ -213,33 +225,40 @@ Tags:
   - `pub trait KillHandle: Send + Sync { fn kill(&self); }`: non-blocking, idempotent, never a bare-pid signal after reap (PD-137).
   - `pub trait Reaper: Send { fn wait(self: Box<Self>) -> io::Result<ExitKind>; }`: blocking, called on its own thread. The probe runner keeps the old methods.
   - `pub fn start_run(spawner: &dyn WorkerSpawner, spec: &SpawnSpec, expect: &ExpectedWorker, init: WorkerInit, sink: Arc<dyn HostCallSink>, rt: tokio::runtime::Handle) -> Result<RunHandleImpl, StartRunError>`.
-  - `pub fn compile_run(…, source: &str) -> Result<CompileVerdict, StartRunError>`, where `CompileVerdict { Compiled, Syntax { line, column, message } }`.
+  - `pub fn compile_run(…, source: &str, deadline: Duration) -> Result<CompileVerdict, StartRunError>`, where `CompileVerdict { Compiled, Syntax { line, column, message }, Timeout }`. The deadline covers spawn, ready, compile and reply; on expiry the worker is killed and the answer is `Timeout` (PD-135).
   - `RunHandleImpl { kill(&self, KillCause), async wait(&self) -> RunOutcome }`.
-  - `RunOutcome { end: WorkerEnd /* Result { value_json } | Error { class, message, stack } | None */, host: HostVerdict /* None | Limit(&'static str) | Killed(KillCause) | Violation(ViolationKind) | Crashed(ExitKind) | NotSpawned(StartRunError) */, logs: Vec<String>, logs_truncated: Option<u64>, stderr: String, elapsed: Duration }`.
+  - `RunOutcome { end: WorkerEnd /* Result { value_json } | Error { class, message, stack } | None */, host: HostVerdict /* None | Limit(&'static str) | Killed(KillCause) | Violation(ViolationKind) | Crashed(ExitKind) | NotSpawned(StartRunError) */, logs: Vec<String>, logs_truncated: Option<u64>, stderr: String, elapsed: Duration, confinement: ConfinementReport /* the worker's ready-frame report */, diag: Vec<&'static str> /* host facts the glue logs, e.g. "sandbox_watchdog_kill" */ }`.
   - `ExpectedWorker { identity: SandboxBinaryIdentity }`.
-  - `StartRunError { IdentityMismatch, FloorNotMet, Spawn(io::ErrorKind) }`.
+  - `StartRunError { IdentityMismatch { what }, FloorNotMet, Spawn(io::ErrorKind) }`. Reading the ready frame is bounded by the same plan value as the compile deadline (10 s); a late ready frame kills the worker and gives `Spawn(TimedOut)`.
   - `#[async_trait] pub trait HostCallSink: Send + Sync { async fn call(&self, run_id: &str, c: HostCall) -> HostCallResult; fn log(&self, run_id: &str, line: &str); }` (C.8, unchanged).
 - **Δ3 C.7 `core` script seam.**
   - `ScriptRunner` gains `async fn check_available(&self, policy: RunPolicy) -> Result<(), RunnerError>`, called at submit after static validation and before the compile check (§3.4 "re-checks … at submit (before the compile check)").
-  - `compile_check(&self, source: &str, policy: RunPolicy) -> Result<(), CompileFailure>`, where `CompileFailure { Syntax(CompileError), Unavailable(RunnerError) }`.
+  - `compile_check(&self, source: &str, policy: RunPolicy) -> Result<(), CompileFailure>`, where `CompileFailure { Syntax(CompileError), Unavailable(RunnerError), Timeout { timeout_s } }`. `Timeout` is a direct, data-free `script_limit {timeout_s}` (never `script_syntax`); the runner bounds the compile by 10 s or the submitted `timeout_s`, whichever is lower (PD-135).
   - `start` keeps its signature; `RunSpec` gains `policy: RunPolicy`.
-  - `pub struct RunPolicy { pub allow_degraded: bool }`.
+  - `pub struct RunPolicy { pub allow_degraded: bool }`. Core reads it from `Core::script_policy()` immediately before each use: in `check_available`, before the compile, and when the run's real slot is acquired (`RunSpec.policy`). It is never captured at submit (PD-141).
   - `RunnerError::SandboxUnavailable { reason: UnavailableReason /* AppUpgraded | FloorNotMet | ProbePending | SpawnFailed */ }` replaces the `app_upgraded: bool` field.
   - `RunEnd::HostLimit { name }` takes the closed set `timeout_s | heap_mb | process_mb | max_result_mb | sandbox_unavailable | app_upgraded`.
+  - `classify` maps the two spawn-time names `sandbox_unavailable` and `app_upgraded` to `SCRIPT_FAILED {reason: sandbox_unavailable, details: {reason}}` (`details.reason = app_upgraded` only for that name), never to the generic limit arm, both for a direct run and for a queued or dispatched one (whose record is then non-direct and goes to release, PD-133). Without this, `envelope.rs:734-742` would turn a direct spawn-time `app_upgraded` into `script_limit`.
   - `RunEnd::Error.elapsed_ms` is filled by the host (PD-134).
-  - Envelope: `sandbox_unavailable` carries `details.reason` (`app_upgraded`, else none) and `retryable: true` for `app_upgraded` (§4.3 row exit 8).
+  - Envelope: `sandbox_unavailable` carries `details.reason` (`app_upgraded`, else none) and `retryable: true` for `app_upgraded`, `false` otherwise (§4.3 row exit 8).
 - **Δ4 C.7 Running scripts.**
   - `RunningScriptView { request_id, agent_name: Option<String>, instances: Vec<String> /* aliases called so far */, started_at: String /* slot time, RFC 3339 ms */, elapsed_ms: u64 /* at list time, host clock */, host_calls: u32, bytes_fetched: u64 }`.
   - `Core::kill_script(&self, id) -> KillAnswer { Killed, NotRunning, AlreadyStopping }`.
 - **Δ5 C.6 `preview`.**
   - `PreviewBody::Script { kind: ScriptItemKind /* Result | ErrorDetails */, view: Box<PreviewBody> /* JsonTree or Table of the candidate */, source: String, provenance: Vec<ProvenanceRow { call_id, op_id, instance, target_display, outcome }>, logs: Vec<String>, logs_note: Option<String>, stderr: String }`.
-  - `Preview.preselect: Option<RedactionPreset>` (the redaction panel pre-selects it; M6 handoff).
-  - `PREVIEW_BUILDER_VERSION` render part `render5`.
+  - `Preview.preselect: Option<Preselect>` with a preview-local `pub enum Preselect { ErrorClassOnly }` (serde tag `"error_class_only"`). `preview` sits below `core` (§2.2) and never names `core::redact::RedactionPreset`; core maps `ScriptState.preselect_error_class_only` to `Preselect::ErrorClassOnly`, and the UI maps the tag to its preset (Task 24). The TS type and validator mirror the closed tag.
+  - `PREVIEW_BUILDER_VERSION` render part: the next one after the merged M7's (planned `render5`).
 - **Δ6 C.7 `SettingsAdmin`.**
   - `SettingChangeReq += ScriptLimits(ScriptLimitsReq /* the eight §9.4 keys, each Option<u32> */)` and `AllowDegradedScripts(bool)`.
   - `SettingsView.limits += script: ScriptLimits`.
   - `SettingsView += allow_degraded_scripts: bool`.
-- **Δ7 C.3 `audit`** (R2, audit-authoritative): `SettingChange += AllowDegradedScripts(bool)`; `Settings.allow_degraded_scripts: bool` in the view and in the `PRUNE` settings snapshot (additive JSON key; absent = `false`).
+  - Plumbing: `core::settings::MAX_CHANGES` (7) and `SETTING_KEYS` (7 entries, `settings/mod.rs:71,144`) grow by the two new change kinds. `Planned.dialog` stays one `Option<String>`: when one apply raises several script limits, the dialog text is one `raise_text` line per raised key, in §9.4 key order.
+- **Δ7 C.3 `audit`** (R2, audit-authoritative): `SettingChange += AllowDegradedScripts(bool)`; `Settings.allow_degraded_scripts: bool` in the view and in the `PRUNE` settings snapshot.
+  - `Settings::from_json` today refuses any object with `len() != 4` (`audit/src/settings.rs:117`). It accepts the four required keys plus the optional `allow_degraded_scripts: bool` (absent = `false`) and still refuses every other extra key. A pre-M8 `PRUNE` snapshot parses unchanged.
+  - `Settings::to_json` emits the key only when it is `true`, so existing snapshots and golden vectors stay byte-identical.
+  - `allow_degraded_scripts` joins the policy-key list (`is_policy_key`, `settings.rs:188-232`): a caller can no longer append a forged policy `CONFIG_CHANGED` with that key, and the overlay applies only the `SettingsAdmin` row.
+  - The toggle's `CONFIG_CHANGED` is an audit-policy `CONFIG_CHANGED`, so it writes the immediate anchor-dir line that §13 lists for those events, like the other policy keys.
+  - M10's `verify-export` reads `PRUNE` snapshots: handoff (M10 must accept the optional key).
 - **Δ8 C.10:**
   - `running_list {}` → `Vec<RunningScriptView>` (Δ4);
   - `running_kill {request_id}` → `{answer: killed|not_running|already_stopping}` (replaces `{killed}`);
@@ -275,13 +294,17 @@ Tags:
   The two exit codes are worker-reported, but they come from a process exit the host observed. They can affect only the "direct" decision of a run that the host's own state says is neither `queued` nor dispatched, and such a run holds no Atlassian data (§9.5), so trusting them cannot leak. A run that is queued or dispatched goes to release whatever the code says.
 
   How the codes arise in the worker:
-  - A global allocator wrapper turns a failed Rust allocation into `exit_group(EXIT_PROCESS_LIMIT)`, before `abort` could SIGSYS.
-  - The QuickJS allocator, `Runtime::new_with_alloc` with a byte-limited wrapper at `heap_mb`, sets a flag on refusal. The interrupt handler then interrupts uncatchably, and the loop exits `EXIT_HEAP_LIMIT`.
+  - **Process limit.** The worker library exports `pub struct ExitOnOomAlloc` (a `GlobalAlloc` over `System`). When `System` returns null, it calls `libc::_exit(EXIT_PROCESS_LIMIT)` on Unix (the `exit_group` syscall, already on the seccomp allowlist) or `ExitProcess`/`TerminateProcess(GetCurrentProcess(), EXIT_PROCESS_LIMIT)` on Windows. It allocates nothing and runs no Rust code after the failure: never `std::process::exit`, whose atexit handlers, stdio flush and TLS destructors can allocate again and, under seccomp, reach a non-allowed syscall (SIGSYS → `Crashed`). It does this before `handle_alloc_error` could `abort`. Only the worker binary (`app/src-tauri/src/bin/atlas-duck-sandbox.rs`) and the `confined_scripts` test binary declare `#[global_allocator] static A: ExitOnOomAlloc` (Global Constraints).
+  - **Heap limit.** The QuickJS allocator is `Runtime::new_with_alloc` with a byte-limited wrapper at `heap_mb`. QuickJS-NG checks its own `malloc_limit` in `js_malloc_rt`/`js_calloc_rt`/`js_realloc_rt` before it calls a custom allocator (`rquickjs-sys-0.14.0` `quickjs.c:1995,2018,2065`; the rquickjs doc "no effect with a custom allocator" at `runtime/base.rs:156` is stale for QuickJS-NG 0.16.2). So the worker **does not call `set_memory_limit`** (it stays 0, unlimited): the wrapper alone enforces `heap_mb`, and its refusal is the only signal. This deviates from §9.3's wording "`set_memory_limit`" (recorded in L167; the limit is the same `heap_mb`, enforced one layer lower).
+  - A refused QuickJS allocation makes QuickJS throw a catchable `InternalError: out of memory`, so the interrupt handler alone is not enough (it runs only at QuickJS's periodic checks). The wrapper keeps two flags: `heap_refused` (its own limit refused, → `EXIT_HEAP_LIMIT` 102) and `system_null` (the underlying allocation returned null below the wrapper's own limit; the wrapper allocates through the Rust global allocator, so in the worker binary `ExitOnOomAlloc` has already exited 103; where it is not installed, as in the in-process tests, the loop treats `system_null` like `heap_refused` but exits `EXIT_PROCESS_LIMIT`). Keeping the two apart keeps `linux_rlimit_as_reported_as_process_mb` right. The run loop checks `heap_refused` after every entry into QuickJS (`start`, each `execute_pending_job`, each `deliver`) and in every `HostPort` send. Once it is set, the worker sends nothing more (no `host.call`, no `host.log`, no terminal frame) and exits `EXIT_HEAP_LIMIT`. The interrupt handler also returns "interrupt" while it is set, and the panic hook exits `EXIT_HEAP_LIMIT` instead of `EXIT_PANIC` when it is set (a Rust panic on a failed allocation inside rquickjs).
+  - `rquickjs::Allocator::dealloc(ptr)` carries no size, and `usable_size` is an associated function without `self` (`allocator.rs:20-53`), so the wrapper keeps a size header in front of each block. Task 3 records the layout in its report.
 
   Other ends:
   - A SIGSYS death or any other signal the host did not send is `Crashed` (release item). It is never `protocol_violation` and never an attack verdict (go/no-go T17 note).
   - `RunEnd::Error.elapsed_ms` is the host's wall clock from spawn to the terminal frame. The worker's own value is dropped.
 - **PD-135 Timeout.** The host kills at `timeout_s` (wall clock from `script.run` sent, including awaits) → `HostLimit timeout_s`. The worker's interrupt handler uses `timeout_s + 2 s` as a backstop only. A worker-reported deadline is a runtime error. The op budget is a fixed interrupt-callback count per run: QuickJS calls the handler periodically, and the callback counter caps CPU-bound loops between deadline checks.
+  - §9.3 also says the interrupt handler checks a cancel flag. M8 has no cancel flag in the worker: a cancel, a user kill and a shutdown all kill the process through the `KillHandle` (PD-137), which needs no cooperation from the worker. The deviation is deliberate (L167).
+  - **Spawn and compile deadlines (plan values).** `start_run` and `compile_run` read the ready frame within 10 s, else they kill the worker and answer `Spawn(TimedOut)`. `compile_run` takes a deadline of 10 s or the submitted `timeout_s`, whichever is lower, covering spawn, ready, compile and reply; on expiry it kills and answers `CompileVerdict::Timeout`, which core classifies as a direct, data-free `script_limit {timeout_s}` (never `script_syntax`). Without the bound, a compile worker that never answers would hold one of the two dry-pool permits forever.
 - **PD-136 A result above the terminal-frame cap.** The worker checks `JSON.stringify(value)`'s UTF-8 length against `terminal_frame_max - 64 KiB`. Above it, the worker sends `script.error {class: "ResultTooLarge", message: "the result is above max_result_mb"}` (plan text), a runtime outcome, release-gated. A frame above any host cap is still a `protocol_violation` (§3.4). Core's `max_result_mb` check of a received result is unchanged.
 - **PD-137 Kill handles (M3 M-1).**
   - Windows: `TerminateJobObject` on a duplicated job handle owned by the `KillHandle`.
@@ -289,22 +312,37 @@ Tags:
   - macOS: the same `WNOWAIT` guard.
 
   `kill` takes only that short flag lock (never held across a syscall that can block) and returns at once. A second `kill` is a no-op. Probe workers keep their existing kill.
+  - The guarded-pid fallback is race-free only because `kill` holds the `reaped` flag lock across the `kill(2)` call (which does not block), and the reaper takes the same lock to set the flag after `waitid(WNOWAIT)` and before the reaping `waitpid`. So no signal can be sent between the reap and the flag.
+  - macOS `waitid(WNOWAIT)` has historical quirks. If CI shows them, the reaper may use `kqueue` `EVFILT_PROC`/`NOTE_EXIT` as its wake-up instead; the lock rule stays the same.
 - **PD-138 Probe consumption (§9.4 "on each app start, and before the first script"; R1, R10).**
   - One probe at start, as today.
-  - The glue awaits the startup report before its first spawn, at most 60 s (plan value) → `sandbox_unavailable {probe_pending}` (no `details.reason` on the wire; the reason is in `SCRIPT_FAILED` only).
-  - Scripts run when the floor is `Met`, or when it is `NotMet` and `allow_degraded` is on (degraded spawner on Windows, the same spawner elsewhere, PD-141).
-  - `SCRIPT_STARTED` gains `confinement: {mode: floor | degraded, worker_version}` (additive payload key, ledger).
-  - `APP_START` (R1): a bounded wait of at most 5 s for the report before `APP_START`; if it is not ready, `APP_START` carries `confinement: {state: "pending"}`. The reviewers of Tasks 20 and 21 must challenge this rule.
+  - The glue awaits the startup report before its first spawn, at most 60 s (plan value) → `sandbox_unavailable {probe_pending}` (no `details.reason` on the wire; the reason is in `SCRIPT_FAILED` only). This wait sits inside `check_available` and counts toward the agent's `--timeout`; the probe state carries no request data, so opacity is unaffected.
+  - The glue's synchronous `sandbox-host` calls (`start_run`: on Linux a round trip through the spawner thread; `compile_run`: spawn, ready, reply, reap; `recheck`) run through `tokio::task::spawn_blocking`, never on a runtime worker thread.
+  - Scripts run when the floor is `Met`, or when it is `NotMet` and `allow_degraded` is on (degraded spawner on Windows, the platform spawner elsewhere; what "degraded" means per OS is PD-141).
+  - `SCRIPT_STARTED` gains `confinement: {mode: floor | degraded, worker_version, report: <the worker's ready-frame ConfinementReport>}` (additive payload key, ledger): the record holds what the worker actually applied, not only the mode.
+  - `APP_START` (R1): a bounded wait of at most 5 s for the report before `APP_START`; if it is not ready, `APP_START` carries `confinement: {state: "pending"}`. The 5 s are measured from the probe's start, not from the wait's start. The probe thread starts at `app/src-tauri/src/lib.rs:254`, before `audit::open`, and `APP_START` is step 6 of `Core::start` (`crates/core/src/core.rs:369`), after `audit::open` and the verification. The wait therefore overlaps both and adds at most `max(0, 5 s − (open + verify time))` to a cold start. Task 21 adds a test that the §13 cold start (`--timeout 30` including launch) and the existing startup tests keep their budgets with the wait counted. The reviewers of Tasks 20 and 21 must challenge this rule.
   - The memory-read result is shown in Settings either way (S-05).
 - **PD-139 Script limit defaults (§9.4 "Defaults configurable in Settings").**
   - New `config.toml` table `[scripts]` with the eight §9.4 key names. Absent = the spec default.
-  - Each value is bounded: 1 ≤ v ≤ 4 × the spec default (plan bound), except `max_concurrent_calls` 1–16.
+  - Each value is bounded (plan bounds), the upper bounds by the spec's fixed caps first:
+    - `max_call_result_mb`: 1 ≤ v ≤ 16. §3.4 caps host→worker frames at 24 MiB (`MAX_FRAME_BYTES`, "call results are already bounded by `max_call_result_mb`"), and invariant 2's `+ 24 MiB` term depends on that. A larger value would make the host write frames the worker refuses (`EXIT_PROTOCOL`, a crash on every large call). 16 leaves room for the JSON-RPC envelope.
+    - `max_result_mb`: 1 ≤ v ≤ 16 (`registry::RELEASE_CAP_BYTES` / MiB, §2.3/§5.2): a script candidate is never larger than the release path and the §5.2 budget allow.
+    - `max_concurrent_calls`: 1–16.
+    - The other five keys: 1 ≤ v ≤ 4 × the spec default.
   - Raising any key is security-weakening (§10.3 "raise limits") and needs the native confirmation. Lowering is a plain `CONFIG_CHANGED`.
   - Changes apply at once to runs submitted afterwards. File edits apply at the next start (as M6 PD-76, L127 residual).
   - The configured set is the ceiling for `--limits` and the `script_limits` of `ops describe --instance` (`limits_source: "effective"`).
   - The per-script `max_pending_bytes` reservation follows the configured `max_result_mb` (§5.2 "its static `max_result_mb`").
-- **PD-140 Invariant 1 with a provisional `k` (§9.4).** `pub const SCRIPT_HEAP_K: u32 = 8` in `core::validate`, documented "provisional until M8 measures it (Tasks 25, 33)". `heap_mb ≥ SCRIPT_HEAP_K × max_call_result_mb` is checked on the effective set in Settings (rejected with the plan text "heap_mb must be at least k × max_call_result_mb (k = 8)") and on `--limits` (exit 2, `param: "limits.heap_mb"`). Task 33 replaces the constant with the measured value after the spec is amended. If the measured `k` exceeds 16, the spec defaults (256 / 16) violate the invariant: the lead rules then among the three options Task 33 records (R13).
+- **PD-140 Invariant 1 with a provisional `k` (§9.4).** `pub const SCRIPT_HEAP_K: u32 = 8` in `core::validate`, documented "provisional until M8 measures it (Tasks 25, 33)". `heap_mb ≥ SCRIPT_HEAP_K × max_call_result_mb` is checked on the effective set in Settings (rejected with the plan text "heap_mb must be at least k × max_call_result_mb (k = 8)") and on `--limits` (exit 2, `param: "limits.heap_mb"`). Task 33 replaces the constant with the measured value after the spec is amended. If the measured `k` exceeds 16, the spec defaults (256 / 16) violate the invariant: the lead rules then among the three options Task 33 records (R13), before the exit run (Task 30).
+  - `k` is the **peak** factor (`k_peak`): the peak QuickJS `malloc_size` during `deliver(frame_text)`, which holds the frame text as a QuickJS string and the tree `JSON.parse` builds from it at the same time, divided by the result's UTF-8 length. `k_retained` (after GC, the parsed value held) is recorded beside it but not used for invariant 1. Fixtures include non-Latin-1 text, because a QuickJS string with any non-Latin-1 character uses 16-bit code units.
+  - Spec gap for the lead (ledger, with L180): with `max_concurrent_calls = 4`, up to four call results can be live at once; invariant 1 covers one.
 - **PD-141 "Allow scripts with degraded confinement" (§9.4, §10.3; storage spec silent → R2).** Audit-authoritative like instance origins (L32), additive settings key, absent = off: `SettingChange::AllowDegradedScripts` (Δ7), set only through `SettingsAdmin::apply` after the native confirmation (dialog text, plan: "Allow scripts with degraded confinement? A compromised script worker could then act as your user (§8.9)."), logged `CONFIG_CHANGED {key: allow_degraded_scripts, old, new}`. Turning it off needs no confirmation. There is no `config.toml` key. While it is on and the floor is not met, a persistent caution status line `scripts_degraded` reads "scripts run with degraded confinement" (plan text) in tray, banner and Settings.
+  - **Read at each spawn.** The policy is read from `Core::script_policy()` immediately before each spawn (compile, real-slot acquisition) and again in `check_available`; it is never captured at submit. A queued run whose policy was degraded at submit but is off at its spawn is refused like any other spawn-time unavailability of a queued run: through the release flow (§3.4; `HostLimit {sandbox_unavailable}` → non-direct `SCRIPT_FAILED`). A security-weakening setting never outlives its revocation.
+  - **What "degraded" means per OS** (§9.4: "a worker compromise is equivalent to same-user code execution"):
+    - (a) The worker applies every confinement layer it can, in every mode. It never skips a layer because degraded is allowed.
+    - (b) Windows: the degraded spawner (lockdown token + job, Task 11). Linux and macOS: the platform spawner unchanged; "degraded" only means the host accepts a ready frame whose `confinement.applied` is false.
+    - (c) The bridge records the worker's actual `ConfinementReport` in `SCRIPT_STARTED.confinement` (PD-138), never just `mode: degraded`.
+    - (d) The toggle covers only a probe-time `NotMet`. A ready frame with `applied: false` while the startup probe report says the floor is `Met` is `FloorNotMet` even with the toggle on: a regression after start never silently runs unconfined.
 - **PD-142 Running list (§9.6, T30 M-3).**
   - `started_at` is recorded by the `SlotAcquired` step (the `SCRIPT_STARTED` time).
   - `elapsed_ms` is computed by Rust at list time.
@@ -320,24 +358,33 @@ Tags:
   - A rejection carries no partial data. Every page committed so far stays in the audit log (dispatched data, release-gated).
   - `SCRIPT_CALL_SENT` stays once per run.
 - **PD-145 Provenance and logs in the preview (§6.3 "provenance list, `atlas.log` output and captured stderr"; spec silent where they come from).**
-  - `ScriptState.calls: Vec<ProvenanceRow>` is kept in memory, bounded by the run's `max_calls` (+ pages of `atlas.all`). Each row has `call_id`, `op_id`, the instance alias, `target_display` from the agent's params (registry rule §2.3), and the outcome class the host recorded (`ok`, `rejected:<class>`, `cancelled_in_flight`). It has no fetched content.
+  - `ScriptState.calls: Vec<ProvenanceRow>` is kept in memory, bounded by the run's `max_calls` (+ pages of `atlas.all`). Each row has `call_id`, `op_id`, the instance alias, `target_display` from the host-call request params (registry rule §2.3), and the outcome class the host recorded (`ok`, `rejected:<class>`, `cancelled_in_flight`). It is built from the request, never from a response. The params are script-built and may carry values the script fetched in an earlier call; they are shown to the approver as the request was sent.
   - Logs and stderr of a **result** item are read from the committed `SCRIPT_FINISHED` payload when the preview is built (the decrypt path the rebuild already uses), never kept in memory.
   - Error items have them in the candidate already.
   - After a restart the item is `ABANDONED` (§11.3), so the in-memory list never needs a rebuild.
-- **PD-146 Script preview body.** `PreviewBody::Script` wraps the candidate view, using the M7 `generic::list_table` rule (PD-114) when the result is an array of objects or holds one under a common items key, else the JSON tree. Source, provenance, logs and stderr are display-escaped text sections (§6.4 "script source and logs … text nodes"; inside the sandboxed document they are escaped text). Plain release never includes logs or stderr in a result's released bytes (R7: logs and stderr are approver-only). `Preview.preselect = Some(ErrorClassOnly)` exactly when `ScriptState.preselect_error_class_only`.
+- **PD-146 Script preview body.** `PreviewBody::Script` wraps the candidate view, using the M7 `generic::list_table` rule (PD-114) when the result is an array of objects or holds one under a common items key, else the JSON tree. Source, provenance, logs and stderr are display-escaped text sections (§6.4 "script source and logs … text nodes"; inside the sandboxed document they are escaped text). Plain release never includes logs or stderr in a result's released bytes (R7: logs and stderr are approver-only). `Preview.preselect = Some(Preselect::ErrorClassOnly)` (the preview-local tag, Δ5) exactly when `ScriptState.preselect_error_class_only`.
 - **PD-147 Rulings kept.**
   - T27 ruling 4: `max_calls`/`max_fetch_mb` on a plain `atlas.call` stay catchable `script_limit` rejections, not kills (§9.5 "only limits the host enforces by terminating the run count as limit outcomes").
   - T27 ruling 9: a script candidate invalidated by a token or origin change keeps `approvable` (a human-gated new revision).
-  - M3 M-1 core half: verified landed (`engine/mod.rs:1414`). Task 19 adds the regression test.
+  - M3 M-1 core half: verified landed (`engine/mod.rs:1414`). Task 19a adds the regression test.
 - **PD-148 Host-call futures are never dropped.** The bridge runs each `HostCallSink::call` as its own tokio task that outlives the worker. A worker that dies mid-call does not cancel the fetch, the identity re-check or the `SCRIPT_CALL` record. The core's in-flight records still win the gate (M3 T27 I-2). This is the runner half of L101. The re-check half is M7 PD-113 (M7 lead ruling Q8, L151).
 - **PD-149 Evidence file (spec silent).** `docs/m8/script-sandbox-evidence.md` records the §15 findings (V02, V10, V11, V12, V15, V16, V21), the measured `k` per fixture and size, and CI run URLs. The M1 go/no-go record is not edited, except its "Open for later milestones" bullets, which the lead closes.
-- **PD-150 CI-07 shape (R6).** Defined in M8, run on packages in M10. Per shipped package job in `install-probes.yml`:
+- **PD-150 CI-07 shape (R6, re-ruled after the plan review, option (a)).** Defined in M8, run on packages in M10. A freshly installed release package is in the first-run state: with no store, `audit::open` gives `FirstRun` and serving installs `GateState::FirstRun` (`app/src-tauri/src/serve.rs:263-267, 809`), so no core serves until the wizard's `GENESIS`, and release builds have no headless setup path. A `script run` of any kind therefore cannot succeed on a fresh release install. Per shipped package job in `install-probes.yml`:
   1. Fresh install.
-  2. `floor=met failed=none`.
-  3. A script run with degraded confinement off.
+  2. `floor=met failed=none` (the existing `sandbox_probe` diag line).
+  3. **Release package:** the installed worker runs in probe mode through the app's own spawner (the installed `atlas-duck-app --background` startup probe, whose `sandbox_probe` line proves the confined worker spawned and answered; the install-probe jobs already wait for that line, `ci/install-probe-linux.sh`, `install-probe-windows.ps1`). No `script run` on the release package.
+  4. **Debug scripted-approver bundle from the same commit** (`e2e-bundle.yml`): `script run --dry-run` (confined worker, real engine, compile check; `succeeded`, exit 0) and a real run that is released and delivered, both with degraded confinement off.
 
-  Per R6: on the release package, `script run --dry-run` (confined worker, real engine, compile check, no approval needed; `succeeded`, exit 0); on the matching debug scripted-approver bundle from `e2e-bundle.yml`, a real run that is released and delivered.
-- **PD-151 Windows local time (R4).** QuickJS-NG on Windows ignores `TZ` (M1 V03), so §9.2 "local-time `Date` methods behave as UTC" is false there today. A worker prelude patches `Date` on every OS (local getters and setters, the component constructor and `Date.prototype.toString`/`toLocale*String`, mapped to their UTC forms; `getTimezoneOffset() === 0`) before `atlas`/`args` are frozen. The M1 self-test's UTC assertions then hold on Windows too.
+  The release package proves the floor and the worker; the debug bundle proves the dry run and the released real run. A release-safe non-GUI first-run path (option (b) of the review) is new scope and not taken.
+- **PD-151 Windows local time (R4).** QuickJS-NG on Windows ignores `TZ` (M1 V03), so §9.2 "local-time `Date` methods behave as UTC" is false there today. A worker prelude maps the whole local-time surface of `Date` to UTC on every OS before `atlas`/`args` are frozen. The M1 self-test's UTC assertions then hold on Windows too. The surface:
+  - the local getters and setters (`getHours`, `setMonth`, …) → their UTC forms; Annex B `getYear`/`setYear` too; `getTimezoneOffset() === 0`;
+  - the component constructor `new Date(y, m, …)` → `Date.UTC(…)`;
+  - `Date.parse(s)` and `new Date(s)` for date-time forms without an offset (ECMAScript reads `"2026-01-01T00:00"` as local time) → read as UTC;
+  - `toString`, `toDateString`, `toTimeString`, `toLocaleString`, `toLocaleDateString`, `toLocaleTimeString` → UTC renderings;
+  - `Date()` called as a function returns the UTC `toString` form;
+  - constructor identity is kept: `new Date() instanceof Date`, `Date.prototype.constructor === Date`, and the statics `Date.UTC`, `Date.now`, `Date.parse` exist on the wrapper.
+
+  Mechanism: patch the `Date.prototype` methods in place and wrap the constructor, with `Date.prototype.constructor` pointing at the wrapper and `wrapper.prototype === Date.prototype`.
 - **PD-152 `atlas.ops()` and `atlas.instances()`.** `atlas.ops()` returns `read_op_ids` (frozen array). `atlas.instances()` returns `WorkerInit.instances` (R9). Neither is a `host.call`.
 
 The spec deltas the lead records are listed under "Ledger entries the lead adds".
@@ -348,12 +395,12 @@ The spec deltas the lead records are listed under "Ledger entries the lead adds"
 
 Five failure modes most likely to bite users of M8's code. Each has named tests the reviewer must see pass.
 
-1. **(Tasks 7, 12, 13, 19) Classification by data exposure, decided by the host.**
+1. **(Tasks 7, 12, 13, 19a) Classification by data exposure, decided by the host.**
    - A run is direct only for a compile failure or a host-measured limit of a run neither queued nor dispatched.
    - `SCRIPT_CALL_SENT` precedes the first send.
    - Every dispatched call (each `atlas.all` page) ends in a committed `SCRIPT_CALL` before its result is written to the worker.
    - Nothing the worker says changes this.
-   - Tests: `i14_dispatch_rule_cases_1_to_5`, `i13_queued_timeout_before_call_is_release_with_preset`, `queued_run_spawn_time_app_upgraded_goes_to_release`, `all_each_page_is_a_script_call_counted`, `worker_reported_limit_never_direct_when_dispatched`.
+   - Tests: `i14_dispatch_rule_cases_1_to_5`, `i13_queued_timeout_before_call_is_release_with_preset`, `queued_run_spawn_time_app_upgraded_goes_to_release`, `nonqueued_run_spawn_time_app_upgraded_is_direct_sandbox_unavailable_retryable`, `all_each_page_is_a_script_call_counted`, `worker_reported_limit_never_direct_when_dispatched`.
 2. **(Tasks 6, 7, 8) The hostile channel.**
    - The host always drains stdout and stderr, writes from a separate thread and counts outstanding calls.
    - Caps hold; every violation kills and ends `protocol_violation`.
@@ -364,24 +411,24 @@ Five failure modes most likely to bite users of M8's code. Each has named tests 
    - Every spawn re-checks file identity and the embedded version.
    - A replaced binary gives `sandbox_unavailable {app_upgraded}`, never `protocol_violation`.
    - The worker sees three handles and the allowlisted environment.
-   - Tests: `floor_not_met_without_degraded_is_sandbox_unavailable`, `degraded_toggle_needs_native_confirmation_and_logs_config_changed`, `i41_replaced_sandbox_binary_is_app_upgraded` (CI), `v21_replaced_binary_detected_per_os` (CI), `s10_worker_sees_three_handles_and_allowlisted_env` (CI), `s11_containment_corpus` (CI).
+   - Tests: `floor_not_met_without_degraded_is_sandbox_unavailable`, `degraded_off_after_submit_refuses_the_queued_spawn`, `degraded_toggle_needs_native_confirmation_and_logs_config_changed`, `i41_replaced_sandbox_binary_is_app_upgraded` (CI), `v21_replaced_binary_detected_per_os` (CI), `s10_worker_sees_three_handles_and_allowlisted_env` (CI), `s11_containment_corpus` (CI).
 4. **(Tasks 3, 4, 9, 13, 14, 25) Limits and memory.**
    - Heap, process, timeout and op budget end the run with the right host-measured name.
    - An OOM is never an attack verdict.
    - `atlas.all` returns no partial data.
    - Both invariants are enforced in Settings and on `--limits`.
-   - Tests: `heap_limit_is_uncatchable_and_flags_heap_mb`, `exit_code_maps_to_heap_or_process_limit`, `sigsys_is_crashed_never_violation`, `i21_all_over_max_call_result_rejects_without_partial_data`, `invariants_enforced_in_settings`, `heap_k_invariant_on_limits_exit2`, `v10_macos_watchdog_kills_footprint_over_process_mb` (CI).
+   - Tests: `heap_limit_is_uncatchable_and_flags_heap_mb`, `oom_then_catch_and_return_still_exits_heap_limit`, `exit_code_maps_to_heap_or_process_limit`, `sigsys_is_crashed_never_violation`, `i21_all_over_max_call_result_rejects_without_partial_data`, `invariants_enforced_in_settings`, `heap_k_invariant_on_limits_exit2`, `v10_macos_watchdog_kills_footprint_over_process_mb` (CI).
 5. **(Tasks 16, 17, 18, 22, 24) What the approver sees.**
-   - The release preview shows source, provenance from agent params, logs and stderr as escaped text.
+   - The release preview shows source, provenance from the host-call request params (never from responses), logs and stderr as escaped text.
    - The lossy count comes from host state.
    - "Keep error class only" is pre-selected exactly for a queued run's data-free limit.
    - Drops never look empty in script results.
    - The kill button's answers are truthful.
-   - Tests: `script_preview_has_source_provenance_logs_stderr`, `provenance_from_agent_params_only`, `x12_lossy_count_only_truncated_or_lossy_meta_jira_half`, `s06_script_document_has_no_active_content`, `u29_script_result_drops_never_empty`, `kill_answer_not_running_vs_already_stopping`.
+   - Tests: `script_preview_has_source_provenance_logs_stderr`, `provenance_from_request_params_never_responses`, `x12_lossy_count_only_truncated_or_lossy_meta_jira_half`, `s06_script_document_has_no_active_content`, `u29_script_result_drops_never_empty`, `kill_answer_not_running_vs_already_stopping`.
 
 Master-plan Review Focus (copied; owners per the master plan):
 - **RF-1 Clock/retention** (M2): not M8.
-- **RF-2 Oracle** (M3): a script host call answered by a status- or header-decided `upstream_unavailable` rejects inside the script. A dispatched run is release-gated whatever the script does with it, so the one-bit residual stays the §10.2 one. Test `i23_script_call_3xx_html_nonjson401_upstream_unavailable_token_unchanged` (Task 19).
+- **RF-2 Oracle** (M3): a script host call answered by a status- or header-decided `upstream_unavailable` rejects inside the script. A dispatched run is release-gated whatever the script does with it, so the one-bit residual stays the §10.2 one. Test `i23_script_call_3xx_html_nonjson401_upstream_unavailable_token_unchanged` (Task 19b).
 - **RF-3 Cross-host** (M2/M3/M6): not M8.
 - **RF-4 Crash reconciliation** (M3/M6): `script.run` is never "similar" (`Similarity::None`). A crash before the decision gives `ABANDONED`, and a non-direct `SCRIPT_FAILED` candidate rebuilds with a matching hash (`i14_dispatch_rule_cases_1_to_5` case 5).
 - **RF-5 Identity/anonymous** (M5/M7): Jira host calls run the identity re-check (existing). The Confluence host-call identity step is Task 32 (M7 PD-93).
@@ -393,8 +440,8 @@ Master-plan Review Focus (copied; owners per the master plan):
 - **V15** (worker I/O loop; `futures`): PD-131, Tasks 4, 7, 8. The no-deadlock test with 4 concurrent calls and 1 MiB of `atlas.log` runs on Windows CI (`s10_four_calls_and_1mib_log_no_deadlock`).
 - **V16** (`k`): Task 25 (Jira `*all` search fixtures, in-process and real worker), finalized by Task 33 (Confluence storage bodies). The spec amendment is the lead's.
 - **V21** (identity re-check per OS after an in-place upgrade: file index on Windows, inode on Linux, bundle replacement on macOS): Tasks 10, 26 (`v21_replaced_binary_detected_per_os`, `i41_replaced_sandbox_binary_is_app_upgraded`).
-- **V11 (closure)** (the seccomp allowlist under the full worker suite incl. local-time `Date`, `toLocale*`, every enabled intrinsic; every thread confined; `PR_SET_PDEATHSIG` survival): Task 5 on Ubuntu 22.04 and Fedora 40 (userland), with the PDEATHSIG line the M1 record lacked.
-- **V12 (worker half)** (handles and descriptors a run worker inherits): Task 8 `s10_worker_sees_three_handles_and_allowlisted_env` through the run spawn path (the same routine as the probe).
+- **V11 (closure)** (the seccomp allowlist under the full worker suite incl. local-time `Date`, `toLocale*`, every enabled intrinsic; every thread confined; `PR_SET_PDEATHSIG` survival): Task 5 on Ubuntu 22.04 and Fedora 40 (userland) for the corpus; the PDEATHSIG line the M1 record lacked comes from Task 6's `v11_pdeathsig_spawner_thread_survives` in `sandbox_runs.rs`, because the host spawner sets `PR_SET_PDEATHSIG`, not the worker.
+- **V12 (worker half)** (handles and descriptors a run worker inherits): Task 8 `s10_worker_sees_three_handles_and_allowlisted_env` through the run spawn path (the same spawner object and `SpawnSpec` as `start_run`, with `probe.run {EnvNames}` / `{HandleSentinel}` as the first frame).
 - **V02 (confirmation)** (the Eval intrinsic is required for host-side source evaluation): Task 5 `v02_wrapper_eval_needs_eval_intrinsic_confirmed` in a confined worker; Task 3 locally.
 - **V10 (watchdog and `RLIMIT_AS` half)**: Task 9 (`ri_phys_footprint` watchdog, 100 ms, SIGKILL above `process_mb`; `RLIMIT_AS` no-op re-recorded), CI macOS arm64 and the Rosetta leg.
 
@@ -410,7 +457,8 @@ Master-plan Review Focus (copied; owners per the master plan):
 - L31 (body-decided failures release-gated, incl. script calls).
 - L101 (runner half, PD-148).
 - L105 (M-13).
-- L134 (`started_at`, `update_pending`, `keychain_prompt`).
+- L134 (`started_at`, `update_pending`; its `keychain_prompt` item is already closed on the base, commit `8fc44a9`).
+- L123, L217 (the engine-side redaction path check and the M-11 drop-flagged-items tree, Task 19c).
 
 ---
 
@@ -420,73 +468,77 @@ The local and CI columns follow the table above. "CI" = runs only on CI legs; co
 
 | Id | What M8 must show | Task | Test(s) (file :: fn) |
 |---|---|---|---|
-| U-03 (dry-run clause) | a script dry run makes no HTTP call and commits no `SCRIPT_CALL` | T19, T26 | `crates/core/tests/scripts.rs` :: `u03_dry_run_no_http_no_script_call`; `app/src-tauri/tests/script_flows/flows.rs` :: `u03_dry_run_no_http_real_worker` (CI) |
-| U-29 (script results) | a dropped field never yields `null`/`""`/`[]`; an upstream `null` survives | T19 | `crates/core/tests/redact.rs` :: `u29_script_result_drops_never_empty` (proptest), `u29_script_result_upstream_null_survives` |
-| I-07 (script case) | status streams identical: released vs denied-later vs upstream-error vs script-limit-after-data | T19, T26 | `crates/core/tests/opacity.rs` :: `i07_script_limit_after_data_stream_identical`; `script_flows/flows.rs` :: `i07_script_streams_identical_real_worker` (CI) |
-| I-10 | cancel of a `Running` script, a slot-waiting one, one in `AwaitingRelease`, a `Fetching` read and an `AwaitingRelease` read: identical envelope; no wait for the reap; `SCRIPT_FAILED {cancelled_by_client}` then `CANCELLED`; no release item | T19, T26 | `crates/core/tests/cancel.rs` :: `i10_cancel_identical_running_slotwait_awaiting_release_reads`; `script_flows/flows.rs` :: `i10_cancel_identical_every_phase_real_worker` (CI) |
-| I-13 | dry runs, `script_syntax` and direct failures never wait on a real slot; a queued run timing out before any call → release item with the preset; saturation never `busy` | T19, T26 | `scripts.rs` :: `i13_dry_runs_compile_and_direct_failures_never_wait_on_real_slot`, `i13_queued_timeout_before_call_is_release_with_preset`, `i13_slot_saturation_never_busy`; `script_flows/flows.rs` :: `i13_slot_timing_independent_real_worker` (CI) |
-| I-14 | the five dispatch-rule cases incl. rebuild of the kill and queued-limit candidates | T19, T26 | `scripts.rs` :: `i14_dispatch_rule_cases_1_to_5`; `script_flows/flows.rs` :: `i14_dispatch_rule_cases_real_worker` (CI) |
+| U-03 (dry-run clause) | a script dry run makes no HTTP call and commits no `SCRIPT_CALL` | T19b, T26 | `crates/core/tests/scripts.rs` :: `u03_dry_run_no_http_no_script_call`; `app/src-tauri/tests/script_flows/flows.rs` :: `u03_dry_run_no_http_real_worker` (CI) |
+| U-29 (script results) | a dropped field never yields `null`/`""`/`[]`; an upstream `null` survives | T19b | `crates/core/tests/redact.rs` :: `u29_script_result_drops_never_empty` (proptest), `u29_script_result_upstream_null_survives` |
+| I-07 (script case) | status streams identical: released vs denied-later vs upstream-error vs script-limit-after-data | T19a, T26 | `crates/core/tests/opacity.rs` :: `i07_script_limit_after_data_stream_identical`; `script_flows/flows.rs` :: `i07_script_streams_identical_real_worker` (CI) |
+| I-10 | cancel of a `Running` script, a slot-waiting one, one in `AwaitingRelease`, a `Fetching` read and an `AwaitingRelease` read: identical envelope; no wait for the reap; `SCRIPT_FAILED {cancelled_by_client}` then `CANCELLED`; no release item | T19a, T26 | `crates/core/tests/cancel.rs` :: `i10_cancel_identical_running_slotwait_awaiting_release_reads`; `script_flows/flows.rs` :: `i10_cancel_identical_every_phase_real_worker` (CI) |
+| I-13 | dry runs, `script_syntax` and direct failures never wait on a real slot; a queued run timing out before any call → release item with the preset; saturation never `busy` | T19a, T26 | `scripts.rs` :: `i13_dry_runs_compile_and_direct_failures_never_wait_on_real_slot`, `i13_queued_timeout_before_call_is_release_with_preset`, `i13_slot_saturation_never_busy`; `script_flows/flows.rs` :: `i13_slot_timing_independent_real_worker` (CI) |
+| I-14 | the five dispatch-rule cases incl. rebuild of the kill and queued-limit candidates | T19a, T26 | `scripts.rs` :: `i14_dispatch_rule_cases_1_to_5`; `script_flows/flows.rs` :: `i14_dispatch_rule_cases_real_worker` (CI) |
 | I-21 | an `atlas.all` result at `max_call_result_mb` completes within the default `heap_mb`; over the per-run caps rejects catchably without partial data; `max` above the hard cap rejected | T13, T25 | `crates/core/tests/scripts_all.rs` :: `i21_all_over_max_call_result_rejects_without_partial_data`, `i21_all_next_page_over_max_calls_rejects_script_limit`, `i21_all_fetch_bytes_reach_max_fetch_mb_rejects`, `i21_max_above_hard_cap_rejected_validation`; `app/src-tauri/tests/sandbox_runs.rs` :: `i21_all_result_at_cap_within_default_heap` (CI) |
 | I-22 (`atlas.all`, Jira half) | server totals unchanged, native shape, items concatenated | T13 | `scripts_all.rs` :: `i22_all_native_shape_items_concatenated_totals_unchanged` (Confluence context-path half: Task 34) |
-| I-23 (script-call path) | 3xx / HTML 200 / non-JSON 401 → in-script `upstream_unavailable`, token state unchanged; JSON 401 → `needs_token` only when the re-check fails | T19 | `scripts.rs` :: `i23_script_call_3xx_html_nonjson401_upstream_unavailable_token_unchanged`, `i23_script_call_json401_needs_token_only_after_recheck` |
-| I-37 (scripts) | identical admit/busy for scripts with very different actual result sizes; evicted script candidates rebuild | T14, T19 | `crates/core/tests/budget.rs` :: `i37_scripts_identical_admit_busy_different_actual_sizes`, `script_reservation_follows_configured_max_result_mb`; `scripts.rs` :: `evicted_script_candidates_are_rebuilt_from_their_records` (existing) (Confluence `user_resolutions` half: Task 32) |
-| I-41 | replacing the sandbox binary under a running app → `sandbox_unavailable`/`app_upgraded`, never `protocol_violation` | T10, T12, T26 | `scripts.rs` :: `submit_time_identity_mismatch_is_direct_app_upgraded_retryable`, `queued_run_spawn_time_app_upgraded_goes_to_release`; `script_flows/flows.rs` :: `i41_replaced_sandbox_binary_is_app_upgraded` (CI, every leg) |
+| I-23 (script-call path) | 3xx / HTML 200 / non-JSON 401 → in-script `upstream_unavailable`, token state unchanged; JSON 401 → `needs_token` only when the re-check fails | T19b | `scripts.rs` :: `i23_script_call_3xx_html_nonjson401_upstream_unavailable_token_unchanged`, `i23_script_call_json401_needs_token_only_after_recheck` |
+| I-37 (scripts) | identical admit/busy for scripts with very different actual result sizes; evicted script candidates rebuild | T14, T19b | `crates/core/tests/budget.rs` :: `i37_scripts_identical_admit_busy_different_actual_sizes`, `script_reservation_follows_configured_max_result_mb`; `scripts.rs` :: `evicted_script_candidates_are_rebuilt_from_their_records` (existing) (Confluence `user_resolutions` half: Task 32) |
+| I-41 | replacing the sandbox binary under a running app → `sandbox_unavailable`/`app_upgraded`, never `protocol_violation` | T10, T12, T26 | `scripts.rs` :: `submit_time_identity_mismatch_is_direct_app_upgraded_retryable`, `queued_run_spawn_time_app_upgraded_goes_to_release`, `nonqueued_run_spawn_time_app_upgraded_is_direct_sandbox_unavailable_retryable`; `script_flows/flows.rs` :: `i41_replaced_sandbox_binary_is_app_upgraded` (CI, every leg) |
 | S-05 (Windows/macOS) | memory-read probe recorded; the app still starts with a failed one | T21, T28 | `app/src-tauri/tests/startup_probe.rs` :: `s05_failed_memory_read_probe_recorded_and_app_starts` (CI); `commands_acl.rs` :: `s05_settings_shows_failed_memory_read_probe` (mock runtime, local) |
 | S-09 (Running scripts) | isolation invoke round-trips in the Running-scripts window with a live run; out-of-grant commands rejected | T22, T27 | `commands_acl.rs` :: `s09_running_scripts_grants_unchanged` (local); `app/src-tauri/tests/e2e/flows.rs` :: `s09_running_scripts_window_lists_live_run_and_kills` (CI) |
-| S-10 | malformed, oversize, out-of-order frames, log floods, host-call floods end in `protocol_violation` within caps; 4 calls + 1 MiB log finish well before `timeout_s` on Windows; the worker sees three handles and an empty (allowlisted) environment | T7, T8 | `crates/sandbox-host/tests/bridge_fuzz.rs` :: `s10_malformed_oversize_out_of_order_frames_end_in_violation`, `s10_log_flood_stays_within_caps`, `s10_host_call_flood_is_violation`; `sandbox_runs.rs` :: `s10_four_calls_and_1mib_log_no_deadlock`, `s10_worker_sees_three_handles_and_allowlisted_env` (CI) |
+| S-10 | malformed, oversize, out-of-order frames, log floods, host-call floods end in `protocol_violation` within caps; 4 calls + 1 MiB log finish well before `timeout_s` on Windows; the worker sees three handles and an empty (allowlisted) environment | T7, T8 | `crates/sandbox-host/tests/bridge_fuzz.rs` :: `s10_malformed_oversize_out_of_order_frames_end_in_violation`, `s10_log_flood_stays_within_caps`, `s10_host_call_flood_is_violation`; `sandbox_runs.rs` :: `s10_four_calls_and_1mib_log_no_deadlock`, `s10_worker_sees_three_handles_and_allowlisted_env`, `s10_run_and_probe_share_the_spawn_routine` (CI) |
 | S-11 | fs, net, `import`, infinite loops, memory bombs, deep recursion, write ops, error-message leaks, data-dependent limit errors → contained, data-dependent failures `pending`; per-OS probes | T3, T5, T26 | `crates/sandbox-worker/tests/script_engine.rs` :: `import_fails_no_module_loader`, `deep_recursion_is_a_range_error_not_a_crash`, `interrupt_deadline_and_op_budget_stop_cpu_loop`; `script_flows/flows.rs` :: `s11_containment_corpus` (CI); existing probe suites (CI) |
 | P-01 (script scenario) | 200-row script result: preview build + document ≤ budget; first screen ≤ ~1 s in the webview | T27 | `crates/core/tests/perf_sc3.rs` :: `p01_script_200_rows_preview_under_budget`; `e2e/flows.rs` :: `p01_script_first_screen_under_1s` (CI) |
-| X-04 (scripts) | append failure at `SCRIPT_STARTED`, `SCRIPT_CALL_SENT`, `SCRIPT_CALL`, `SCRIPT_FINISHED`, `SCRIPT_RELEASED`, `DELIVERED`: nothing released or delivered; `SCRIPT_FAILED {audit_failure}`, exit 1, `retryable: true` | T19 | `crates/core/tests/audit_faults.rs` :: `x04_script_points` |
+| X-04 (scripts) | append failure at `SCRIPT_STARTED`, `SCRIPT_CALL_SENT`, `SCRIPT_CALL`, `SCRIPT_FINISHED`, `SCRIPT_RELEASED`, `DELIVERED`: nothing released or delivered; `SCRIPT_FAILED {audit_failure}`, exit 1, `retryable: true` | T19b | `crates/core/tests/audit_faults.rs` :: `x04_script_points` |
 | X-11 | Running-scripts window lists agent, instance(s), start, elapsed, host calls, bytes fetched; kill → `SCRIPT_FAILED {killed_by_user, direct: false}` | T16, T22, T27 | `scripts.rs` :: `x11_running_view_lists_agent_instances_started_elapsed_calls_bytes`, `x11_user_kill_is_killed_by_user_direct_false_release_item`; `app/ui/src/running_scripts/Running.test.tsx` :: `x11_columns_agent_instances_started_elapsed_calls_bytes`; `e2e/flows.rs` :: `x11_kill_from_window_becomes_release_item` (CI) |
 | X-12 (Jira half) | "N host calls returned truncated or lossy data" counts only calls whose internal meta reported `page.truncated` or `conversion.lossy` | T17 | `scripts.rs` :: `x12_lossy_count_only_truncated_or_lossy_meta_jira_half` (the `conversion.lossy` half: Task 32) |
-| CI-02 (M8) | the Fedora 40 container job runs the confined-worker suites and `script_flows` | T5, T28 | `ci.yml` job `probe-evidence-fedora` + `core-suite-fedora` steps (CI) |
+| CI-02 (M8) | the Fedora 40 container jobs run the confined-worker suite and the core script suites (`script_flows` runs on the four `rust` legs, Ubuntu among them; the Fedora jobs run no app flow target today) | T5, T28 | `ci.yml` job `probe-evidence-fedora` (`confined_scripts`) + `core-suite-fedora` (`scripts_all`) steps (CI) |
 | CI-04 (script step) | one script run succeeds after the launching CLI has exited (AppImage) | T28 | `ci/appimage-smoke.sh` M8 section (CI) |
-| CI-07 (definition) | scripts-enabled matrix defined on every shipped package (run on packages in M10) | T28 | `install-probes.yml` script step per job + `ci/script-matrix-step.{sh,ps1}` (CI, M10) |
+| CI-07 (definition) | scripts-enabled matrix defined on every shipped package (run on packages in M10): release package = `floor=met failed=none` + the installed worker answering in probe mode through the app's spawner; debug scripted-approver bundle of the same commit = `script run --dry-run` and a released real run (PD-150, R6 option (a)) | T28 | `install-probes.yml` CI-07 step per package job + `e2e-bundle.yml` CI-07 step per debug bundle, `ci/script-matrix-step.{sh,ps1}` (CI, M10) |
 | Exit: per-package probes | "the per-OS confinement probes pass on every package built in M1's matrix" (master plan M8 exit criterion) | T28, T30 | `install-probes.yml` jobs `windows-per-user`, `windows-per-machine`, `macos-arm64`, `macos-x86_64-rosetta`, `ubuntu-deb`, `ubuntu-appimage`, `fedora-rpm` green on the M8 `bundle` run, each with `floor=met failed=none` in its `EVIDENCE_JSON` / `sandbox_probe` line (CI) |
-| V-items | V02, V10, V11, V12, V15, V16, V21 | T3, T5, T8, T9, T10, T25 | as listed under "§15 items resolved in M8"; evidence in `docs/m8/script-sandbox-evidence.md` (T29) |
-| M3 M-1 | `RunHandle::kill` never blocks; no kill under the state lock | T6, T19, T20 | `kill_handle.rs` :: `kill_never_blocks_while_reader_holds_its_lock`; `scripts.rs` :: `m1_kill_not_under_state_lock`; glue :: `glue_kill_never_blocks` |
+| V-items | V02, V10, V11, V12, V15, V16, V21 | T3, T5, T6, T8, T9, T10, T25, T33 | as listed under "§15 items resolved in M8"; evidence in `docs/m8/script-sandbox-evidence.md` (T29) |
+| M3 M-1 | `RunHandle::kill` never blocks; no kill under the state lock | T6, T19a, T20 | `kill_handle.rs` :: `kill_never_blocks_while_reader_holds_its_lock`; `scripts.rs` :: `m1_kill_not_under_state_lock`; glue :: `glue_kill_never_blocks` |
 | M5 M-13 | script candidates and the §5.3 mirror check (R8: documented residual + Caution) | T17 | `scripts.rs` :: `m13_rendered_fields_caution_when_run_called_rendered` |
 | T30 M-2, M-3 | kill answers; `started_at` = slot time | T16, T22 | `scripts.rs` :: `kill_answer_not_running_vs_already_stopping`, `started_at_is_slot_time_not_submit_time`; `Running.test.tsx` :: `kill_answers_texts` |
-| T27 rulings 4, 5, 9 | kept / built / kept | T13, T19 | `scripts.rs` :: `a_fetch_cap_overrun_is_a_script_limit_inside_the_script` (existing), `token_replacement_invalidates_a_script_candidate_that_called_the_instance` (existing); `scripts_all.rs` (ruling 5) |
-| L134 status inputs | `updated_restart` on an identity mismatch; `keychain_prompt` wired | T21 | `app/src-tauri/src/status.rs` :: `updated_restart_after_identity_mismatch`, `keychain_prompt_line_wired` |
+| T27 rulings 4, 5, 9 | kept / built / kept | T13, T19b | `scripts.rs` :: `a_fetch_cap_overrun_is_a_script_limit_inside_the_script` (existing), `token_replacement_invalidates_a_script_candidate_that_called_the_instance` (existing); `scripts_all.rs` (ruling 5) |
+| L134 status inputs | `updated_restart` on an identity mismatch (`update_pending` wired); `keychain_prompt` already wired on the base (`8fc44a9`, existing tests only) | T21 | `app/src-tauri/src/status.rs` :: `updated_restart_after_identity_mismatch`; existing: `serve.rs` :: `keychain_prompt_hint_after_10s`, `the_prompt_hint_is_up_only_while_open_blocks_past_the_limit`, `status.rs` :: `status_lines_table` |
+| L217 (M6 final-review handoffs to M8) | engine-side redaction path check (`existed = original \|\| current doc`); the M-11 mirror "drop flagged items" tree | T19c | `crates/core/tests/redact.rs` :: `drop_after_earlier_drops_checks_existence_against_current_doc`, `drop_absent_in_original_and_current_doc_is_refused`; `crates/core/tests/decisions_ui.rs` :: `m11_mirror_release_blocked_offers_drop_flagged_items_tree`, `m11_dropping_flagged_items_makes_the_mirror_candidate_releasable` |
 | PD-148 (L101 runner half) | host-call futures survive the worker's death | T7, T20 | `bridge.rs` :: `host_call_futures_run_to_completion_after_worker_death`; glue :: `glue_host_calls_spawned_never_dropped` |
 
-Tasks without a row: Task 1 (pins), Task 2 (protocol types, exercised by every row above), Task 11 (degraded spawner: row S-05/floor through T20 tests and CI `windows_degraded_spawner_runs_with_lockdown_token`), Task 23/24 (UI for rows owned by their Rust tasks), Task 28 (CI), Tasks 29–31 (docs, exit run, final review).
+Tasks without a row: Task 1 (pins, checker rules), Task 2 (protocol types, exercised by every row above), Task 11 (degraded spawner: row S-05/floor through T20 tests and CI `windows_degraded_spawner_runs_with_lockdown_token`), Task 23/24 (UI for rows owned by their Rust tasks), Task 28 (CI), Tasks 29–31 (docs, exit run, final review).
 
 ---
 
 ## File Structure
 
 ### Workspace root, CI, docs
-- Modify `crates/sandbox-host/Cargo.toml` (`tokio`, `async-trait`, `windows-sys` features), `Cargo.lock` (no new package expected) (T1, T9, T11).
-- Modify `ci/check-workspace.mjs` + test (T1).
-- Modify `.github/workflows/ci.yml`, `.github/workflows/install-probes.yml`, `.github/workflows/e2e-bundle.yml`, `ci/appimage-smoke.sh`; Create `ci/script-matrix-step.sh`, `ci/script-matrix-step.ps1` (T28).
-- Create `docs/m8/script-sandbox-evidence.md` (T29).
+- Modify `crates/sandbox-host/Cargo.toml` (`tokio`, `async-trait`, `windows-sys` features; dev: `tokio` test features (T1), `proptest` (T8)), `crates/ipc/Cargo.toml` (`serde_json` `raw_value`, T1), `Cargo.lock` (no new package expected) (T1, T8, T9, T11).
+- Modify `ci/check-workspace.mjs` + test (T1: `RQUICKJS_BANNED_FEATURES`, `WORKER_EXTERNAL_ALLOW`, `BANNED_IN_SANDBOX_HOST`, the `global_allocator` placement rule).
+- Modify `.github/workflows/ci.yml` (T5 `confined_scripts`; T6 `sandbox_runs`; T25 k step; T26 `script_flows`; T28 the rest), `.github/workflows/install-probes.yml`, `.github/workflows/e2e-bundle.yml`, `ci/appimage-smoke.sh`; Create `ci/script-matrix-step.sh`, `ci/script-matrix-step.ps1` (T28).
+- Create `docs/m8/script-sandbox-evidence.md` (T33 with the V16 section; T29 the rest).
 
 ### crates/ipc
 - Create `src/sandbox/script.rs`; Modify `src/sandbox/mod.rs` (T2). Test `tests/sandbox_script.rs`.
 
 ### crates/sandbox-worker
-- Create `src/script/{mod,shim,alloc,interrupt,loop_}.rs`, `src/script/shim.js`, `src/script/prelude.js` (T3, T4); Modify `src/lib.rs` (mode dispatch, exit codes), `src/engine.rs` (runtime builder with the allocator).
-- Tests: `tests/script_engine.rs` (T3), `tests/run_loop.rs` (T4), `tests/k_factor.rs` (T25), `tests/confined_scripts.rs` (`harness = false`, T5); `Cargo.toml` `[[test]]` entry.
+- Create `src/script/{mod,shim,alloc,interrupt,loop_}.rs`, `src/script/shim.js`, `src/script/prelude.js` (T3, T4), `src/oom.rs` (`ExitOnOomAlloc`, T4); Modify `src/lib.rs` (mode dispatch, exit codes, `pub use oom::ExitOnOomAlloc`; no `#[global_allocator]`), `src/engine.rs` (runtime builder with the allocator), `src/confine/windows.rs` (degraded mode: `RevertToSelf` before ready, T11).
+- Tests: `tests/script_engine.rs` (T3), `tests/run_loop.rs` (T4), `tests/k_factor.rs` + `tests/common/fixtures.rs` (seeded Jira and Confluence-shaped generators, T25, T33), `tests/confined_scripts.rs` (`harness = false`, declares the `ExitOnOomAlloc` global allocator, T5); `Cargo.toml` `[[test]]` entry.
 
 ### crates/sandbox-host
 - Modify `src/spawn.rs` (Δ2 parts), `src/linux/spawner.rs`, `src/macos/spawner.rs`, `src/windows/{spawner,job,pipes}.rs` (T6); Create `src/kill.rs` (T6), `src/bridge/{mod,reader,writer,state}.rs` (T7), `src/limits.rs`, `src/macos/watchdog.rs`, `src/windows/jobport.rs` (T9), `src/windows/degraded.rs` (T11); Modify `src/identity.rs` (T10), `src/lib.rs`.
 - Tests: `tests/kill_handle.rs` (T6), `tests/bridge.rs` (T7), `tests/bridge_fuzz.rs` (T8).
+- Create `src/watchdog.rs` (the OS-independent poll loop over a `FootprintReader`, T9); `src/macos/watchdog.rs` keeps only the `proc_pid_rusage` reader.
 
 ### crates/core
 - Modify `src/engine/script.rs` (T12, T13, T16, T17), `src/engine/envelope.rs` (T12), `src/payloads.rs` (T12, T13), `src/running.rs` (T16), `src/core.rs` (T16), `src/validate/mod.rs` (T14), `src/config/{mod,limits}.rs` or Create `src/config/scripts.rs` (T14), `src/settings/mod.rs` (T14, T15), `src/engine/handler.rs` (T14), `src/engine/queue.rs` (T14), `src/testing/runner.rs` (T12), `src/lib.rs`.
-- Tests: Create `tests/scripts_all.rs` (T13); Modify `tests/{scripts,settings,validate,handler,budget,cancel,opacity,redact,audit_faults,perf_sc3}.rs`.
+- Modify `src/redact/{apply,mirror,views}.rs` and `src/decision/{mod,redaction_preview}.rs` (the `raw_page`/`redaction_preview` path that refuses a `release_blocked` item) (T19c).
+- Tests: Create `tests/scripts_all.rs` (T13); Modify `tests/{scripts,settings,validate,handler,budget,cancel,opacity,redact,audit_faults,perf_sc3,decisions_ui}.rs`.
 
 ### crates/audit (R2, audit-authoritative)
 - Modify `src/settings.rs` (Δ7) (T15); test `tests/settings.rs`.
 
 ### crates/preview
-- Modify `src/model.rs` (Δ5), `src/render/{mod,body}.rs` (T18); test `tests/render.rs`.
+- Modify `src/model.rs` (Δ5 incl. `Preselect`, T17), `src/render/{mod,body}.rs` (T18); test `tests/render.rs`. `app/ui/public/preview.css` is not modified (inline-only stylesheet, L215; M7 plan review B-1).
 
 ### app/src-tauri
+- Modify `src/bin/atlas-duck-sandbox.rs` (`#[global_allocator] static A: ExitOnOomAlloc`, T4).
 - Create `src/script_glue/{mod,policy,map}.rs` (T20); Modify `src/compose.rs`, `src/sandbox_probe.rs`, `src/state.rs`, `src/status.rs`, `src/tray.rs` (T20, T21), `src/commands/{running,settings}.rs` (T22, T23), `src/diag/fields.rs` (allowlist).
-- Tests: Create `tests/sandbox_runs.rs` (T8, T9, T10, T11, T25), `tests/script_flows.rs` + `tests/script_flows/flows.rs` (T26); Modify `tests/{commands_acl,dto_fixtures,startup_probe}.rs`, `tests/e2e/flows.rs` (T27).
+- Tests: Create `tests/sandbox_runs.rs` (T6; extended by T8, T9, T10, T11, T25), `tests/script_flows.rs` + `tests/script_flows/flows.rs` (T26); Modify `tests/{commands_acl,dto_fixtures,startup_probe}.rs`, `tests/e2e/flows.rs` (T27).
 
 ### app/ui
 - Modify `src/running_scripts/{Running.tsx,Running.test.tsx}` (T22), `src/settings/{Limits.tsx,Settings.tsx,Settings.test.tsx}` + a new `src/settings/Scripts.tsx` (T23), `src/approvals/*` redaction preselect (T24), `src/shared/{strings.ts,ipc/types.ts,ipc/validate.ts,ipc/fixtures/*.json}`.
@@ -498,11 +550,13 @@ Tasks without a row: Task 1 (pins), Task 2 (protocol types, exercised by every r
 Phases:
 - **Phase A (Tasks 1–5):** pins, protocol, worker engine, run loop, confined CI suites.
 - **Phase B (Tasks 6–11):** host spawner split, bridge, fuzzing, memory limits, identity, Windows degraded spawner.
-- **Phase C (Tasks 12–19):** core seam, `atlas.all`, limits, degraded setting, Running model, preview model and renderer, test sweep.
+- **Phase C (Tasks 12–18, 19a, 19b, 19c):** core seam, `atlas.all`, limits, degraded setting, Running model, preview model and renderer, test sweep (two parts), redaction engine path check and the M-11 tree.
 - **Phase D (Tasks 20–24):** glue and app/UI.
-- **Phase E (Tasks 25–31):** `k`, flows, performance and E2E, CI, evidence, exit, review.
+- **Phase E (Tasks 25–28):** `k` (Jira half), flows, performance and E2E, CI.
+- **Phase F (Tasks 32–35, the M7-dependent tasks at the end of this file):** Confluence host calls, the final `k`, I-22's Confluence half, the conditional L101 task.
+- **Phase G (Tasks 29–31):** evidence, exit run, final review. They run last, after Phase F.
 
-"Execution order and dependencies" below gives the order.
+Task numbers are stable labels (other plans cite them); "Execution order and dependencies" below gives the order.
 
 Shared conventions (every task):
 - Run commands from `C:/Code/atlas-duck`.
@@ -515,18 +569,23 @@ Shared conventions (every task):
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Modify `crates/sandbox-host/Cargo.toml` (`tokio = { workspace = true, features = ["rt", "sync", "time"] }`, `async-trait = { workspace = true }`), `Cargo.lock`, `ci/check-workspace.mjs`, `ci/check-workspace.test.mjs`.
+**Files:** Modify `crates/sandbox-host/Cargo.toml` (`tokio = { workspace = true, features = ["rt", "sync", "time"] }`, `async-trait = { workspace = true }`; `[dev-dependencies]` `tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }`), `crates/ipc/Cargo.toml` (`serde_json = { workspace = true, features = ["raw_value"] }`), `Cargo.lock`, `ci/check-workspace.mjs`, `ci/check-workspace.test.mjs`.
 
 **Interfaces:**
-- Consumes: the M1 checker (`RQUICKJS_M1_BANNED_FEATURES`, the per-crate allowlists).
-- Produces: `RQUICKJS_BANNED_FEATURES = ["loader", "dyn-load", "parallel", "futures"]`, with the `futures` reason "decided off in M8 (PD-131, §9.3/§15 V15)". The M1-only list and its reason constant are removed. `sandbox-host` may depend on `tokio`/`async-trait`. `sandbox-worker`'s external set stays `{rquickjs, serde_json, libc, windows-sys, landlock, seccompiler, syscalls}`, and a test pins it.
+- Consumes: the M1 checker (`RQUICKJS_M1_BANNED_FEATURES`, `INTERNAL_RULES`, `REGISTRY_EXTERNAL_ALLOW`/`CONVERT_EXTERNAL_ALLOW`, `BANNED_IN_CLI_AND_WORKER`). No per-crate external allowlist for `sandbox-worker` and no rule for `sandbox-host` exist today (`INTERNAL_RULES` covers internal edges only).
+- Produces:
+  - `RQUICKJS_BANNED_FEATURES = ["loader", "dyn-load", "parallel", "futures"]`, with the `futures` reason "decided off in M8 (PD-131, §9.3/§15 V15)". The M1-only list and its reason constant are removed.
+  - New rule `WORKER_EXTERNAL_ALLOW = ["rquickjs", "serde_json", "libc", "windows-sys", "landlock", "seccompiler", "syscalls"]` (normal and build edges of `sandbox-worker`; the implementer confirms the set with `cargo tree` before pinning it).
+  - New rule `BANNED_IN_SANDBOX_HOST`: the HTTP, keyring, SQLite and `tauri`/`wry` names of `BANNED_IN_CLI_AND_WORKER` (§2.2 "nothing that reaches the network or the keychain"). `tokio` and `async-trait` are allowed.
+  - New rule `GLOBAL_ALLOCATOR_FILES`: a source scan that allows `#[global_allocator]` only in `app/src-tauri/src/bin/atlas-duck-sandbox.rs` and under `*/tests/` (the existing `core`/`ipc`/`preview`/`atlassian` alloc tests and `confined_scripts`); anywhere else under `src/` is a violation (PD-134, plan review B-2).
+  - Dev-dependencies stay ignored by the crate rules, by design (`check-workspace.mjs:33`).
 
 **Spec:** §9.3, §15 V15, §2.2.
 
-- [ ] **Step 1: Failing tests** (`ci/check-workspace.test.mjs`): `rquickjs futures is banned with the M8 reason`, `sandbox-worker gains no dependency (fixture adds tokio → violation)`, `sandbox-host may use tokio and async-trait`, real workspace passes.
-- [ ] **Step 2: Implement.** Run one unlocked `cargo build -j 4 -p atlas-duck-sandbox-host`, then `--locked` everywhere, then `cargo tree -j 4 -p atlas-duck-sandbox-worker -e normal --locked` (record: no tokio).
-- [ ] **Step 3: Run** `node ci/check-workspace.mjs && node --test "ci/*.test.mjs"`; `cargo clippy -j 4 -p atlas-duck-sandbox-host --all-targets --locked -- -D warnings`.
-- [ ] **Step 4: Commit** `build(sandbox-host): tokio and async-trait edges; check-workspace: futures decided off` (+ trailer), pathspecs `crates/sandbox-host/Cargo.toml Cargo.lock ci`.
+- [ ] **Step 1: Failing tests** (`ci/check-workspace.test.mjs`): `rquickjs futures is banned with the M8 reason`, `sandbox-worker gains no dependency (fixture adds tokio → violation)`, `sandbox-host may use tokio and async-trait`, `sandbox-host may not link an HTTP client or keyring (fixture adds reqwest → violation)`, `global_allocator outside the worker bin and tests is a violation (fixture: crates/sandbox-worker/src/lib.rs)`, real workspace passes.
+- [ ] **Step 2: Implement.** Run one unlocked `cargo build -j 4 -p atlas-duck-sandbox-host -p atlas-duck-ipc`, then `--locked` everywhere, then `cargo tree -j 4 -p atlas-duck-sandbox-worker -e normal --locked` (record: no tokio; the external set).
+- [ ] **Step 3: Run** `node ci/check-workspace.mjs && node --test "ci/*.test.mjs"`; `cargo clippy -j 4 -p atlas-duck-sandbox-host -p atlas-duck-ipc --all-targets --locked -- -D warnings`.
+- [ ] **Step 4: Commit** `build(sandbox-host): tokio and async-trait edges; check-workspace: futures decided off, worker and host rules` (+ trailer), pathspecs `crates/sandbox-host/Cargo.toml crates/ipc/Cargo.toml Cargo.lock ci`.
 
 ---
 
@@ -542,16 +601,17 @@ Shared conventions (every task):
   - `encode_request(method, id, params) -> Vec<u8>`;
   - `encode_response(id, &HostCallResult) -> Vec<u8>`;
   - `decode_worker_frame(bytes) -> Result<WorkerFrame, DecodeError>`, where `WorkerFrame { Call { id, call: HostCall }, Log { line }, Result { value: Box<RawJsonText> }, Error { class, message, stack }, Compiled, Syntax { line, column, message } }`.
-- `RawJsonText` is the frame's `value` member kept as text (the host forwards it to core without re-encoding; PD-131 keeps big values out of `Value` trees). The decoder rejects:
+- `RawJsonText` is the frame's `value` member kept as text (the host forwards it to core without re-encoding; PD-131 keeps big values out of `Value` trees). Mechanism: a newtype over `Box<serde_json::value::RawValue>` (the `raw_value` feature Task 1 turns on for `ipc`); the decoder never builds a `Value` of the result. The decoder rejects:
   - a frame that is not a JSON-RPC 2.0 object;
   - an unknown method;
-  - a `host.call` without a positive integer id;
+  - a `host.call` without a positive integer id, or whose envelope `id` differs from `params.id` (`HostCall.id`);
+  - a JSON-RPC response from the worker (an object with `result` or `error` and no `method`): the host issues no ids, so §3.4's "response to an id the host never issued" is every such frame;
   - extra top-level keys.
 - Size checks are the bridge's, not the decoder's.
 
 **Spec:** §3.3 (JSON-RPC 2.0), §3.4 (method names, frame caps), §9.1 step 3, PD-132, R9.
 
-- [ ] **Step 1: Failing tests:** `worker_init_round_trip_and_unknown_field_rejected`, `host_call_request_and_response_shapes` (golden bytes), `terminal_frame_cap_is_max_result_plus_64k` (16 MiB → 16 MiB + 65 536; 1 MiB → 1 MiB + 65 536), `script_method_names_are_fixed`, `compile_reply_shapes`, `decode_rejects_unknown_method_extra_keys_and_bad_ids`.
+- [ ] **Step 1: Failing tests:** `worker_init_round_trip_and_unknown_field_rejected`, `host_call_request_and_response_shapes` (golden bytes), `terminal_frame_cap_is_max_result_plus_64k` (16 MiB → 16 MiB + 65 536; 1 MiB → 1 MiB + 65 536), `script_method_names_are_fixed`, `compile_reply_shapes`, `decode_rejects_unknown_method_extra_keys_and_bad_ids`, `decode_rejects_jsonrpc_id_differing_from_hostcall_id`, `worker_sent_jsonrpc_response_is_rejected`, `result_value_kept_as_raw_text`.
 - [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-ipc --locked --test sandbox_script`; clippy. **Step 4: Commit** `feat(ipc): sandbox script protocol types (Δ1)` (+ trailer).
 
 ---
@@ -568,7 +628,7 @@ Shared conventions (every task):
   - `script::Engine::new(init: &WorkerInit, host: &mut dyn HostPort) -> Result<Engine, EngineError>`, with `HostPort { fn send_call(&mut self, id: u64, call: &HostCall) -> io::Result<()>; fn send_log(&mut self, line: &str) -> io::Result<()>; }`;
   - `Engine::start(&mut self)`, `Engine::drain_jobs(&mut self) -> Settled`, `Engine::deliver(&mut self, frame_text: &str)`;
   - `script::compile(source) -> Result<(), SyntaxPos { line, column, message }>`;
-  - `alloc::LimitAllocator` (bytes in use, the limit, a `hit` flag);
+  - `alloc::LimitAllocator` (bytes in use, the limit, a size header per block, the two flags `heap_refused` and `system_null` of PD-134, readable by the loop, the interrupt handler and the panic hook);
   - `interrupt::{Deadline, OpBudget}`.
 - `shim.js` defines:
   - `atlas.<product>.<…>` from `read_op_ids`, mapping `jira.issue.get` to `atlas.jira.issue.get`;
@@ -579,26 +639,29 @@ Shared conventions (every task):
 - `prelude.js` holds the PD-151 `Date` patch (R4).
 - The wrapper is `(async function main(args, atlas) {\n<source>\n})`, so a syntax position is reported as `line - 1` against the agent's source.
 
-**Spec:** §9.2 (API, concurrency, deep freeze, UTC), §9.3 (intrinsics, no loader, source only, `set_max_stack_size(1 MiB)`, `set_memory_limit`, `set_gc_threshold`, interrupt handler), §9.4 (`heap_mb`), PD-131, PD-134, PD-135, PD-151, PD-152.
+**Spec:** §9.2 (API, concurrency, deep freeze, UTC), §9.3 (intrinsics, no loader, source only, `set_max_stack_size(1 MiB)`, `set_memory_limit` (replaced by the wrapper, PD-134), `set_gc_threshold`, interrupt handler), §9.4 (`heap_mb`), PD-131, PD-134, PD-135, PD-151, PD-152.
 
-- [ ] **Step 1: Failing tests** (in-process, a fake `HostPort` recording frames; never `confine::apply`, never a child process):
+M1 already has, in `crates/sandbox-worker/tests/engine.rs`: `v02_host_side_eval_needs_the_eval_intrinsic` (:51), `excluded_intrinsics_are_undefined` (:62), `static_import_does_not_evaluate` (:114), `dynamic_import_rejects` (:121) and `deep_recursion_is_a_catchable_range_error` (:140, on an 8 MiB thread). That target is CI-only only because of the one re-exec test at :211 (`selftest_passes_in_a_child_with_tz_utc0`). Task 3 does not duplicate them: it moves those five into `script_engine.rs` (local) and leaves the re-exec test in `engine.rs`, or it re-runs them against the script engine's runtime builder and names them so. The names below that overlap say which.
+
+- [ ] **Step 1: Failing tests** (in-process, a fake `HostPort` recording frames; never `confine::apply`, never a child process; every JS-evaluating test body on an 8 MiB thread, see "Local-safe and CI-only tests"):
   - `wrapper_compiles_without_running_body`;
   - `syntax_error_position_maps_to_agent_source` (error on agent line 3 col 5 → `{line: 3, column: 5}`);
   - `atlas_and_args_deep_frozen` (assignments throw in strict mode, nested objects frozen);
   - `atlas_read_ops_generated_from_init`;
   - `write_op_names_absent_from_atlas` (`atlas.jira.issue.create === undefined`; the init carries only Read ids);
-  - `import_fails_no_module_loader`;
-  - `excluded_intrinsics_absent` (`typeof Proxy`, `WeakRef`, `ArrayBuffer`, `Uint8Array`, `Atomics`, `SharedArrayBuffer`, `performance` are `"undefined"`);
-  - `heap_limit_is_uncatchable_and_flags_heap_mb` (a `try { bomb() } catch {}` loop ends with the `hit` flag set and an uncatchable interrupt, at `heap_mb = 8`);
+  - `import_fails_no_module_loader` (static and dynamic `import`; supersedes M1's `static_import_does_not_evaluate`/`dynamic_import_rejects` if they move);
+  - `excluded_intrinsics_absent` (`typeof Proxy`, `WeakRef`, `ArrayBuffer`, `Uint8Array`, `Atomics`, `SharedArrayBuffer`, `performance` are `"undefined"`; the M1 `excluded_intrinsics_are_undefined` set on the script runtime);
+  - `heap_limit_is_uncatchable_and_flags_heap_mb` (a `try { bomb() } catch {}` loop: after the first refusal `heap_refused` is set and the engine reports it to the caller before any further `HostPort` send, at `heap_mb = 8`; `set_memory_limit` is never called);
+  - `system_null_is_not_heap_refused` (a fake `System` returning null sets only `system_null`);
   - `interrupt_deadline_and_op_budget_stop_cpu_loop` (`while(true){}` ends at the deadline);
-  - `deep_recursion_is_a_range_error_not_a_crash`;
+  - `deep_recursion_is_a_range_error_not_a_crash` (the M1 `deep_recursion_is_a_catchable_range_error` on the script runtime);
   - `local_concurrency_queue_caps_outstanding_calls` (8 calls with `max_concurrent_calls = 4` → 4 frames, then one more per settled call);
   - `all_sets_the_all_flag`;
-  - `date_local_methods_are_utc` (the M1 self-test assertions and `new Date(2026,0,1).getTimezoneOffset() === 0` on every OS, R4);
+  - `date_local_methods_are_utc` (R4, PD-151; runs on every OS, and on the Windows dev laptop the test process has a non-UTC zone, which makes it the real check): the M1 self-test assertions; `new Date(2026,0,1).getTimezoneOffset() === 0`; every local getter and setter equals its UTC form; `getYear`/`setYear`; `Date.parse("2026-01-01T00:00") === Date.UTC(2026,0,1)` and the same for `new Date("2026-01-01T00:00")`; `toString`, `toDateString`, `toTimeString`, `toLocaleString`, `toLocaleDateString`, `toLocaleTimeString` render UTC; `typeof Date() === "string"` and it renders UTC; `new Date() instanceof Date`; `Date.prototype.constructor === Date`; `Date.UTC`, `Date.now`, `Date.parse` are functions;
   - `atlas_log_stringifies_arguments`;
-  - `v02_host_side_eval_still_needs_eval` (the wrapper's evaluation fails without the Eval intrinsic).
-- [ ] **Step 2: Implement.** No `unwrap`/`expect`. The QuickJS allocator is installed with `Runtime::new_with_alloc` (verify the 0.14.0 API on docs.rs and record the method name in the report). Set `set_gc_threshold` to `heap/4` (plan value, recorded).
-- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --lib --test script_engine`; clippy.
+  - `v02_host_side_eval_still_needs_eval` (the wrapper's evaluation fails without the Eval intrinsic; the M1 `v02_host_side_eval_needs_the_eval_intrinsic` on the script runtime).
+- [ ] **Step 2: Implement.** No `unwrap`/`expect`. The QuickJS allocator is installed with `Runtime::new_with_alloc` (verified ungated in rquickjs 0.14.0 with features `["macro"]`; record the method name in the report). `set_memory_limit` is not called (PD-134); record the size-header layout in the report. Set `set_gc_threshold` to `heap/4` (plan value, recorded).
+- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --lib --test script_engine`; `--test engine --no-run` (if tests moved out of it); clippy.
 - [ ] **Step 4: Commit** `feat(sandbox-worker): script engine with limit allocator, interrupt handler and the atlas shim` (+ trailer).
 
 ---
@@ -607,7 +670,9 @@ Shared conventions (every task):
 
 **Model:** Opus. **Reviewer:** Opus (medium).
 
-**Files:** Create `crates/sandbox-worker/src/script/loop_.rs`; Modify `crates/sandbox-worker/src/lib.rs` (`run()` dispatches on the first host frame after `probe.ready`; `run_with` keeps the probe loop for tests; new `run_script_with(confinement, input, output) -> i32`; exit codes `EXIT_HEAP_LIMIT = 102`, `EXIT_PROCESS_LIMIT = 103`; a `#[global_allocator]` wrapper over `System` that calls `std::process::exit(EXIT_PROCESS_LIMIT)` on a refused allocation); Test `crates/sandbox-worker/tests/run_loop.rs`.
+**Files:** Create `crates/sandbox-worker/src/script/loop_.rs`, `crates/sandbox-worker/src/oom.rs`; Modify `crates/sandbox-worker/src/lib.rs` (`run()` dispatches on the first host frame after `probe.ready`; `run_with` keeps the probe loop for tests; new `run_script_with(confinement, input, output) -> i32`; exit codes `EXIT_HEAP_LIMIT = 102`, `EXIT_PROCESS_LIMIT = 103`; `pub use oom::ExitOnOomAlloc`; the panic hook exits `EXIT_HEAP_LIMIT` while `heap_refused` is set), `crates/sandbox-worker/Cargo.toml` (only if `ExitProcess` needs a `windows-sys` feature the worker lacks), `app/src-tauri/src/bin/atlas-duck-sandbox.rs` (`#[global_allocator] static A: ExitOnOomAlloc = ExitOnOomAlloc;` — the only `src/` declaration, PD-134); Test `crates/sandbox-worker/tests/run_loop.rs`, `app/src-tauri/src/lib.rs` `#[cfg(test)]` check.
+
+`ExitOnOomAlloc` (PD-134) is a `GlobalAlloc` over `System`: on a null return it calls `libc::_exit(EXIT_PROCESS_LIMIT)` (Unix) or `ExitProcess(EXIT_PROCESS_LIMIT)` (Windows; `TerminateProcess(GetCurrentProcess(), …)` if `ExitProcess` would run DLL detach code that allocates). It never calls `std::process::exit`, allocates nothing and runs no Rust code after the failure. The worker library never declares it as the global allocator: the app library links the worker crate, so a declaration there would become the allocator of `atlas-duck-app`, `atlas-duck` and every app test binary (and collide with test binaries that declare their own).
 
 **Interfaces:**
 - Consumes: Tasks 2, 3.
@@ -615,7 +680,8 @@ Shared conventions (every task):
 - Frames written by the worker:
   - everything except the terminal frame is ≤ 1 MiB (`WORKER_FRAME_MAX_BYTES`); a longer log line is cut to fit, with the marker `[line truncated]` (plan text);
   - one terminal frame ≤ `terminal_frame_max(limits)` (PD-136).
-- Exit codes: 0 after a terminal frame; `EXIT_IO` on a broken pipe; `EXIT_PROTOCOL` on an unknown first frame or a host frame that does not parse; `EXIT_HEAP_LIMIT`; `EXIT_PROCESS_LIMIT`; `EXIT_PANIC` (unchanged).
+- Exit codes: 0 after a terminal frame; `EXIT_IO` on a broken pipe; `EXIT_PROTOCOL` on an unknown first frame or a host frame that does not parse; `EXIT_HEAP_LIMIT`; `EXIT_PROCESS_LIMIT`; `EXIT_PANIC` (unchanged, except that a panic while `heap_refused` is set exits `EXIT_HEAP_LIMIT`).
+- Heap-limit discipline (PD-134): the loop checks `heap_refused` after every entry into QuickJS (`start`, each `execute_pending_job`, each `deliver`), and the `HostPort` checks it before every send. Once it is set, nothing more is written (no `host.call`, no `host.log`, no terminal frame) and the worker exits `EXIT_HEAP_LIMIT`. A script that catches the `InternalError: out of memory` therefore cannot turn the run into a result or an error.
 
 **Spec:** §3.4 (frames, exactly one terminal message, stdin EOF), §9.1 steps 3, 5, §9.2, §9.3 (main thread, no threads), PD-131, PD-132, PD-134, PD-136.
 
@@ -630,12 +696,15 @@ Shared conventions (every task):
   - `stdin_eof_exits_ok_before_init`;
   - `unknown_first_frame_exits_protocol`;
   - `heap_limit_exits_with_exit_heap_limit`;
+  - `oom_then_catch_and_return_still_exits_heap_limit` (`try { bomb() } catch { return 1 }` → no terminal frame, `EXIT_HEAP_LIMIT`);
+  - `oom_then_catch_and_atlas_call_sends_nothing` (`try { bomb() } catch { await atlas.call(…); atlas.log("x") }` → no `host.call` or `host.log` frame after the refusal, `EXIT_HEAP_LIMIT`);
   - `thrown_error_reports_class_message_stack`;
   - `rejection_object_is_catchable` (a rejected `atlas.call` caught in the script: the run continues);
   - `result_undefined_is_null` and `result_with_function_is_type_error` (JSON semantics, plan rule recorded);
   - `probe_mode_unchanged` (the M1 `run_with` tests still pass).
-- [ ] **Step 2: Implement.** The worker never starts a thread (assert it in a debug assertion: `std::thread::available_parallelism` is not used, and no `spawn` exists in `src/`; `ci/check-no-panic-macros.mjs` may gain a rule "no `thread::spawn` in sandbox-worker/src" with a test).
-- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --lib --test run_loop --test script_engine`; `--test engine --test confined_workload --test panic_hook --test probe_negative_control --no-run`; clippy.
+  - App library (`#[cfg(test)]` in `app/src-tauri/src/lib.rs`): `app_global_allocator_is_not_the_worker_wrapper`: `std::alloc::alloc` of a `Layout` the system refuses (size near `isize::MAX`) returns null to the test (with the wrapper installed, the test process would exit 103 instead). Together with Task 1's `GLOBAL_ALLOCATOR_FILES` rule this keeps the wrapper out of the app.
+- [ ] **Step 2: Implement.** The worker never starts a thread (assert it in a debug assertion: `std::thread::available_parallelism` is not used, and no `spawn` exists in `src/`; `ci/check-no-panic-macros.mjs` may gain a rule "no `thread::spawn` in sandbox-worker/src" with a test). `ExitOnOomAlloc`'s exit path has a unit test only for its pure parts (the exit code constant); the exit itself is proved in CI by Task 9's `linux_rlimit_as_reported_as_process_mb`.
+- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --lib --test run_loop --test script_engine`; `--test engine --test confined_workload --test panic_hook --test probe_negative_control --no-run`; `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --lib app_global_allocator`; `cargo build -j 4 -p atlas-duck-app --bin atlas-duck-sandbox --locked`; `node ci/check-workspace.mjs`; clippy.
 - [ ] **Step 4: Commit** `feat(sandbox-worker): single-threaded script loop with compile and run modes (V15)` (+ trailer).
 
 ---
@@ -644,9 +713,11 @@ Shared conventions (every task):
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Create `crates/sandbox-worker/tests/confined_scripts.rs` (`harness = false`, the `confined_workload.rs` pattern: the test binary re-executes itself as a child, the child confines itself with `confine::apply()`, runs `run_script_with` over pipes to the parent, and the parent asserts); Modify `crates/sandbox-worker/Cargo.toml` (`[[test]] name = "confined_scripts" harness = false`), `.github/workflows/ci.yml` (step "M8 confined script suite" on the Linux, macOS and Windows `rust` legs and in `probe-evidence-fedora`).
+**Files:** Create `crates/sandbox-worker/tests/confined_scripts.rs` (`harness = false`, the `confined_workload.rs` pattern: the test binary re-executes itself as a child, the child confines itself with `confine::apply()`, runs `run_script_with` over pipes to the parent, and the parent asserts; the file declares `#[global_allocator] static A: ExitOnOomAlloc`, PD-134); Modify `crates/sandbox-worker/Cargo.toml` (`[[test]] name = "confined_scripts" harness = false`), `.github/workflows/ci.yml` (step "M8 confined script suite" on the Linux, macOS and Windows `rust` legs and in `probe-evidence-fedora`).
 
-**Interfaces:** Consumes Tasks 3, 4. Produces CI evidence lines `V11 corpus=<n> passed=<n> killed_by_sigsys=<0>`, `V11 pdeathsig_survives_short_thread=true`, `V02 eval_required=true`.
+**Interfaces:** Consumes Tasks 3, 4. Produces CI evidence lines `V11 corpus=<n> passed=<n> killed_by_sigsys=<0>`, `V02 eval_required=true`. The PDEATHSIG line is Task 6's (the host spawner sets `PR_SET_PDEATHSIG`, `linux/spawner.rs:248-257`; a child the test binary starts with `std::process::Command` has none, so a survival check here would pass whatever the spawner does).
+
+`confined_scripts` is a Linux/macOS confinement test: there `confine::apply` installs seccomp/Landlock or `sandbox_init`. On Windows, `confine/windows.rs` only reports (`applied = app_container && in_job`) and a re-executed test child is in neither, so the Windows leg runs the same corpus **unconfined** (an engine corpus) and says so in its evidence line (`V11 os=windows confined=false`). The confined Windows evidence is the `sandbox_runs` real-worker tests through `WindowsSpawner` (Tasks 6, 8, 9, 11).
 
 **Spec:** §15 V11 ("the worker runs its full test suite under the filter, exercising every enabled intrinsic, including local-time `Date` methods … and `toLocale*String` … none may hit a KILL rule"; per-thread confinement; PDEATHSIG survival), V02, §9.4.
 
@@ -661,7 +732,7 @@ Shared conventions (every task):
   - a heap-limit hit (`EXIT_HEAP_LIMIT`, never SIGSYS);
   - deep recursion (`RangeError`).
 
-  Linux child only: the parent reads `/proc/<child>/task/*/status` and asserts `Seccomp: 2` and `NoNewPrivs: 1` for every task, the same check as `sandbox-host`'s `ProcTaskStatusHook`. It is re-implemented in the test, because `sandbox-worker` takes no edge to `sandbox-host`, not even a dev one. The PDEATHSIG survival check: the child is spawned from a thread that exits at once, and the child must still answer 2 s later.
+  Linux child only: the parent reads `/proc/<child>/task/*/status` and asserts `Seccomp: 2` and `NoNewPrivs: 1` for every task, the same check as `sandbox-host`'s `ProcTaskStatusHook`. It is re-implemented in the test, because `sandbox-worker` takes no edge to `sandbox-host`, not even a dev one.
 - [ ] **Step 2: Compile locally only:** `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --test confined_scripts --no-run`; clippy. **Never run it locally** (it confines a child of the test binary).
 - [ ] **Step 3: Commit** `test(sandbox-worker): confined script suite for V11/V02 (CI only)` (+ trailer). The lead pushes. The implementer records the CI lines in the report. A KILL rule hit is a finding for the lead; the allowlist stays unchanged (R3: SIGSYS is `Crashed`).
 
@@ -671,7 +742,7 @@ Shared conventions (every task):
 
 **Model:** Opus (unsafe per-OS code, the M3 M-1 hard handoff). **Reviewer:** Opus (medium).
 
-**Files:** Create `crates/sandbox-host/src/kill.rs`; Modify `crates/sandbox-host/src/spawn.rs` (Δ2 `into_parts`, `WorkerParts`, `KillHandle`, `Reaper`), `src/linux/spawner.rs` (pidfd after spawn; `LinuxReaper` with `waitid(WNOWAIT)` + guarded fallback), `src/macos/spawner.rs` (same guard), `src/windows/{spawner,job,pipes}.rs` (the job handle is duplicated into the `KillHandle`; the stderr drain thread hands over its reader). Test `crates/sandbox-host/tests/kill_handle.rs`.
+**Files:** Create `crates/sandbox-host/src/kill.rs`; Modify `crates/sandbox-host/src/spawn.rs` (Δ2 `into_parts`, `WorkerParts`, `KillHandle`, `Reaper`), `src/linux/spawner.rs` (pidfd after spawn; `LinuxReaper` with `waitid(WNOWAIT)` + guarded fallback), `src/macos/spawner.rs` (same guard), `src/windows/{spawner,job,pipes}.rs` (the job handle is duplicated into the `KillHandle`; the stderr drain thread hands over its reader), `.github/workflows/ci.yml` (step "M8 sandbox_runs" on the four `rust` legs: `ATLAS_DUCK_CLI_FLOWS=1 cargo test -p atlas-duck-app --features scripted-approver --locked --test sandbox_runs -- --nocapture --test-threads=1`, list + log through `node ci/check-no-skips.mjs` with the minimum count of the leg; the `jira_flows` step is the pattern), `ci/check-no-skips.mjs` (a `sandbox_runs` label, if the script needs one). Test `crates/sandbox-host/tests/kill_handle.rs`; Create `app/src-tauri/tests/sandbox_runs.rs`.
 
 **Interfaces:**
 - Consumes: the M1 spawners (unchanged spawn steps, env, rlimits, cwd, handle lists).
@@ -686,13 +757,14 @@ Shared conventions (every task):
   - `kill_after_reap_is_noop` (the guard: after the fake reaper set `reaped`, `kill` sends nothing);
   - `kill_is_idempotent`.
 
-  Per OS, `#[cfg]` modules in `app/src-tauri/tests/sandbox_runs.rs` (CI only, created here with these three):
+  Per OS, `#[cfg]` modules in `app/src-tauri/tests/sandbox_runs.rs` (CI only, created here with these four, opted in by `harness::opted_in(..)` like `cli_flows`):
   - `linux_pidfd_kill_reaches_worker`;
   - `windows_terminate_job_kills_worker`;
-  - `macos_kill_before_reap_only`.
+  - `macos_kill_before_reap_only`;
+  - `v11_pdeathsig_spawner_thread_survives` (Linux `#[cfg]`): a worker spawned through `LinuxSpawner` from a thread that exits at once still answers `probe.run` 2 s later (the long-lived spawner thread owns the parent-death signal, §3.4); prints `V11 pdeathsig_survives_short_thread=true`.
 - [ ] **Step 2: Implement.** Every `unsafe` block gets a `// SAFETY:` comment. A Linux `pidfd_open` failure other than `ENOSYS` fails the spawn (`Spawn(kind)`): the floor needs a killable worker.
 - [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-host --locked --lib --test kill_handle`; `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --test sandbox_runs --test probes_linux --test probes_macos --test probes_windows --no-run`; clippy (Windows; Linux/macOS type-check through CI).
-- [ ] **Step 4: Commit** `feat(sandbox-host): split worker into I/O, non-blocking kill handle and reaper (Δ2, M3 M-1)` (+ trailer).
+- [ ] **Step 4: Commit** `feat(sandbox-host): split worker into I/O, non-blocking kill handle and reaper (Δ2, M3 M-1)` (+ trailer). The lead pushes; the implementer records the run URL and the four tests' results per leg in the report (from here on every task that adds a `sandbox_runs` test does the same).
 
 ---
 
@@ -713,17 +785,19 @@ Shared conventions (every task):
   - ids strictly increasing; one call is outstanding from its frame until its response is queued;
   - a call beyond `max_concurrent_calls` outstanding → violation;
   - exactly one terminal; frames after it are ignored and the process is reaped;
-  - a response to an unknown id cannot occur (the host never issues one; the worker sends no responses);
-  - violations (invalid UTF-8/JSON, unknown method, oversize, duplicate or non-increasing id, a second terminal, a `host.call` beyond the limit) → `KillHandle::kill()` and `Violation(kind)`.
+  - a response to an id the host never issued (§3.4): the host issues no ids, so any JSON-RPC response from the worker is one, and Task 2's decoder rejects it → violation (test below);
+  - violations (invalid UTF-8/JSON, unknown method, oversize, duplicate or non-increasing id, an envelope id that differs from `HostCall.id`, a JSON-RPC response sent by the worker, a second terminal, a `host.call` beyond the limit) → `KillHandle::kill()` and `Violation(kind)`.
+  - the state machine tells Task 9's `attribute` whether a terminal frame was accepted (after one, a later exit code or job message is ignored unless a host kill cause was already set).
 - Logs: count bytes and lines against 1 MiB / 10 000; past the cap discard and keep one `[log truncated: N bytes]` (§3.4 verbatim form).
 - Timer: `timeout_s` from the moment `script.run` is written → kill, `Limit("timeout_s")` (PD-135).
 - Host calls go to `sink.call` as `rt.spawn(..)` tasks that are never aborted (PD-148). A result is written only if the run is still before its terminal; otherwise it is dropped (calls in flight at the terminal are cancelled for the worker; core records them).
-- `compile_run`:
+- `compile_run`, all within its deadline (PD-135; expiry → kill, `CompileVerdict::Timeout`):
   1. spawn;
-  2. ready check;
+  2. ready check (ready frame within 10 s);
   3. `script.compile`;
   4. one reply;
   5. kill, reap → `CompileVerdict`.
+- `start_run` reads the ready frame within 10 s (plan value), else kills and answers `Spawn(TimedOut)`.
 - Before any `script.*` frame the bridge checks `ProbeReady.worker_version == expect.identity.embedded_version` (PD-133) and `confinement.applied` (unless degraded) → `StartRunError::{IdentityMismatch, FloorNotMet}`.
 
 **Spec:** §3.4 (all channel rules), §9.1 steps 3–5, §9.4 (`max_concurrent_calls`, stderr, log caps), §9.5 (in-flight calls at the terminal), PD-132, PD-133, PD-135, PD-148.
@@ -746,7 +820,11 @@ Shared conventions (every task):
   - `host_call_futures_run_to_completion_after_worker_death`;
   - `ready_version_mismatch_is_identity_mismatch_before_any_source_sent`;
   - `unconfined_ready_is_floor_not_met_unless_degraded`;
-  - `compile_run_returns_syntax_position`.
+  - `compile_run_returns_syntax_position`;
+  - `compile_run_deadline_kills_and_returns_timeout` (a fake that never answers `script.compile`);
+  - `late_ready_frame_is_spawn_timed_out`;
+  - `jsonrpc_id_mismatch_is_violation`, `worker_sent_jsonrpc_response_is_violation`;
+  - `outcome_carries_ready_frame_confinement_report`.
 - [ ] **Step 2: Implement.** No lock is held across a blocking read or write. `wait` uses a `tokio::sync::watch`.
 - [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-host --locked --lib --test bridge`; clippy; `node ci/check-no-panic-macros.mjs`.
 - [ ] **Step 4: Commit** `feat(sandbox-host): host bridge with always-drain reader, separate writer and per-run state machine (C.8)` (+ trailer).
@@ -757,7 +835,7 @@ Shared conventions (every task):
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Create `crates/sandbox-host/tests/bridge_fuzz.rs`; Modify `app/src-tauri/tests/sandbox_runs.rs` (add the two real-worker tests).
+**Files:** Create `crates/sandbox-host/tests/bridge_fuzz.rs`; Modify `crates/sandbox-host/Cargo.toml` (`[dev-dependencies] proptest = { workspace = true }`), `app/src-tauri/tests/sandbox_runs.rs` (add the real-worker tests).
 
 **Interfaces:**
 - Consumes: Task 7 with the fake worker; for the real-worker tests, the built `atlas-duck-sandbox` next to the test binary's app dir (as `probes_*.rs` locate it) and the platform spawner.
@@ -778,9 +856,10 @@ Shared conventions (every task):
   - `bridge_fuzz.rs` (local): `s10_malformed_oversize_out_of_order_frames_end_in_violation` (every case ends `Violation`, the worker killed, memory held by the bridge ≤ 1 MiB + the frame being read), `s10_log_flood_stays_within_caps`, `s10_host_call_flood_is_violation`.
   - `sandbox_runs.rs` (CI only):
     - `s10_four_calls_and_1mib_log_no_deadlock` (a real worker run: 4 concurrent `atlas.call`s against a sink that answers after 200 ms each, while the script writes 1 MiB of `atlas.log`; finishes in < 10 s with `timeout_s = 60`; runs on every leg, required on Windows);
-    - `s10_worker_sees_three_handles_and_allowlisted_env` (through `start_run`'s spawner: the existing `HandleSentinel` and `EnvNames` probe logic is reused by a run-mode script that reports what it sees via `atlas.log` of `atlas.ops()`; the parent compares the env names with the per-OS allowlist, Windows incl. the M1 deviation names, R5).
+    - `s10_worker_sees_three_handles_and_allowlisted_env`: a JS script has no API that sees env or handles; `HandleSentinel` and `EnvNames` are `ProbeId`s (`crates/ipc/src/sandbox/probe.rs`) run in Rust by the worker's probe module (`sandbox-worker/src/probe/mod.rs:88-89`), and PD-132 keeps the mode selectable per worker. So the test spawns through exactly the spawner object and `SpawnSpec` that `start_run` uses (the platform spawner built as Task 20 builds it), and sends `probe.run {EnvNames}` and `probe.run {HandleSentinel}` as the first frames. It asserts the per-OS allowlist: Linux/macOS the spawner's env block; Windows the five observed names `WORKER_ENV_OBSERVED` (the block sets three, `LOCALAPPDATA`, `SystemRoot`, `TZ`; the OS adds `TEMP`/`TMP`; R5). It asserts the three-handle result of `HandleSentinel`.
+    - `s10_run_and_probe_share_the_spawn_routine` (run-mode leg): a `start_run` over the same spawner object answers a trivial script, proving the run path and the probe path share the spawn routine.
 - [ ] **Step 2: Run** `cargo test -j 4 -p atlas-duck-sandbox-host --locked --test bridge_fuzz` (record the runtime); `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --test sandbox_runs --no-run`.
-- [ ] **Step 3: Commit** `test(sandbox-host): S-10 channel fuzzing; real-worker deadlock and hygiene checks (CI)` (+ trailer).
+- [ ] **Step 3: Commit** `test(sandbox-host): S-10 channel fuzzing; real-worker deadlock and hygiene checks (CI)` (+ trailer). The lead pushes; the implementer records the run URL and the S-10 lines. The report states that the M6 env scrub list (`app/src-tauri/src/startup/hardening.rs` `SCRUBBED`, 8 names) applies to the app's own environment, while the worker's comes from the fixed spawner blocks, so M8 does not touch the scrub list.
 
 ---
 
@@ -788,17 +867,19 @@ Shared conventions (every task):
 
 **Model:** Opus. **Reviewer:** Opus (medium).
 
-**Files:** Create `crates/sandbox-host/src/limits.rs` (attribution), `crates/sandbox-host/src/macos/watchdog.rs`, `crates/sandbox-host/src/windows/jobport.rs` (`JOBOBJECT_ASSOCIATE_COMPLETION_PORT_INFORMATION` + a port thread per run); Modify `crates/sandbox-host/src/bridge/state.rs` (verdict), `crates/sandbox-host/Cargo.toml` (`Win32_System_IO`); no Linux watchdog (R3). Tests: unit in `limits.rs`, `watchdog.rs`; CI in `sandbox_runs.rs`.
+**Files:** Create `crates/sandbox-host/src/limits.rs` (attribution), `crates/sandbox-host/src/watchdog.rs` (the OS-independent poll loop, generic over a `FootprintReader`), `crates/sandbox-host/src/macos/watchdog.rs` (only the `proc_pid_rusage` reader), `crates/sandbox-host/src/windows/jobport.rs` (`JOBOBJECT_ASSOCIATE_COMPLETION_PORT_INFORMATION` + a port thread per run); Modify `crates/sandbox-host/src/bridge/state.rs` (verdict), `crates/sandbox-host/Cargo.toml` (`Win32_System_IO`); no Linux watchdog (R3). Tests: unit in `limits.rs`, `watchdog.rs` (both compile and run on every OS, so locally too); CI in `sandbox_runs.rs`.
 
 **Interfaces:**
-- Produces: `fn attribute(exit: ExitKind, host_killed: Option<KillCause>, os_signal: Option<OsMemorySignal>) -> HostVerdict`, with this precedence:
+- Produces: `fn attribute(exit: ExitKind, host_killed: Option<KillCause>, os_signal: Option<OsMemorySignal>, terminal_accepted: bool) -> HostVerdict`, with this precedence:
   1. a host kill cause;
-  2. a job memory message / watchdog kill → `Limit("process_mb")`;
-  3. `Code(EXIT_HEAP_LIMIT)` → `Limit("heap_mb")`;
-  4. `Code(EXIT_PROCESS_LIMIT)` → `Limit("process_mb")`;
-  5. `Signal(_)` not sent by the host → `Crashed`;
-  6. any other non-zero code without a terminal frame → `Crashed`.
-- macOS watchdog: a thread per run; `proc_pid_rusage(pid, RUSAGE_INFO_V2)` → `ri_phys_footprint` every 100 ms; above `process_mb` → kill through the run's `KillHandle`, reason `process_mb`, diag `sandbox_watchdog_kill`; stops at reap.
+  2. a terminal frame was accepted → no verdict from the exit (a later exit code or job message is ignored);
+  3. a job memory message / watchdog kill → `Limit("process_mb")`;
+  4. `Code(EXIT_HEAP_LIMIT)` → `Limit("heap_mb")`;
+  5. `Code(EXIT_PROCESS_LIMIT)` → `Limit("process_mb")`;
+  6. `Signal(_)` not sent by the host → `Crashed`;
+  7. any other code without a terminal frame, **0 included** → `Crashed`.
+- Watchdog: `watchdog::run(reader: &dyn FootprintReader, kill: &dyn KillHandle, limit_bytes, stop)` polls every 100 ms; above `process_mb` it kills through the run's `KillHandle` with reason `process_mb` and records `sandbox_watchdog_kill` in `RunOutcome.diag` (the glue logs it); it stops at reap. macOS supplies the reader: `proc_pid_rusage(pid, RUSAGE_INFO_V2)` → `ri_phys_footprint` (libc 0.2.190 has `proc_pid_rusage`, `RUSAGE_INFO_V2`, `rusage_info_v2.ri_phys_footprint`).
+- Windows: the job's completion port is associated before the worker is resumed (and so before `script.run` is sent), so no memory message can be missed.
 
 **Spec:** §9.4 `process_mb` row ("Windows job object / Linux `setrlimit(RLIMIT_AS)` / macOS host-side watchdog (polls … every 100 ms, SIGKILL above the limit; `RLIMIT_AS` is not enforced on Darwin)"), `heap_mb` ("OOM is terminal (host-decided)"), §9.5 (host-measured), go/no-go T17 notes, PD-134, R3.
 
@@ -807,14 +888,16 @@ Shared conventions (every task):
     - `exit_code_maps_to_heap_or_process_limit`;
     - `sigsys_is_crashed_never_violation`;
     - `host_kill_reason_wins`;
-    - `watchdog_kills_above_limit_after_poll` (a fake footprint reader and a fake kill handle);
+    - `exit_zero_without_terminal_is_crashed`;
+    - `exit_after_accepted_terminal_is_ignored`;
+    - `watchdog_kills_above_limit_after_poll` (a fake footprint reader and a fake kill handle; OS-independent module);
     - `watchdog_stops_at_reap`.
   - CI (`sandbox_runs.rs`):
     - `heap_limit_reported_as_heap_mb` (every OS);
-    - `v10_macos_watchdog_kills_footprint_over_process_mb` (macOS arm64 + Rosetta: `heap_mb = 512`, `process_mb = 200`, a script that grows arrays → `Limit("process_mb")` within 2 s of crossing; prints `V10 watchdog_kill_ms=<n>` and `V10 rlimit_as_enforced=false`);
+    - `v10_macos_watchdog_kills_footprint_over_process_mb` (macOS arm64 + Rosetta: `heap_mb = 512`, `process_mb = 200`, a script that grows arrays → `Limit("process_mb")`; no timing assertion (L26): it prints `V10 watchdog_kill_ms=<n>` as evidence only, and `V10 rlimit_as_enforced=false`. The values deliberately break core's invariant 2, which this test bypasses by calling `start_run` directly);
     - `windows_job_memory_limit_reported_as_process_mb`;
     - `linux_rlimit_as_reported_as_process_mb` (the worker's Rust allocation fails under `RLIMIT_AS` → `EXIT_PROCESS_LIMIT`, never SIGSYS: the evidence for PD-134).
-- [ ] **Step 2: Implement.** **Step 3: Run** local targets; `--no-run` for `sandbox_runs`; clippy. **Step 4: Commit** `feat(sandbox-host): host-measured memory limits per OS and the macOS footprint watchdog (V10)` (+ trailer).
+- [ ] **Step 2: Implement.** **Step 3: Run** local targets; `--no-run` for `sandbox_runs`; clippy. **Step 4: Commit** `feat(sandbox-host): host-measured memory limits per OS and the macOS footprint watchdog (V10)` (+ trailer). The lead pushes; the implementer records the run URL and the `V10` lines.
 
 ---
 
@@ -832,8 +915,8 @@ Shared conventions (every task):
 
 - [ ] **Step 1: Failing tests:**
   - Local, temp files only, nothing executed: `recheck_detects_replaced_file` (copy over), `recheck_detects_renamed_replacement` (rename a new file into place: a new inode/file index), `recheck_ok_for_untouched_file`, `missing_file_is_mismatch`.
-  - CI: `v21_replaced_binary_detected_per_os` (a copy of the worker in a temp install dir; probe; replace the copy with another build of the same version but different bytes, e.g. the worker with one appended zero byte (no execution needed for the file-id check); the next `start_run` → `IdentityMismatch`, nothing spawned; macOS: replace the file inside a copied `.app` bundle; prints `V21 os=<..> detected=true via=<file_id|size|mtime>`).
-- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-host --locked --lib`; `--no-run` for `sandbox_runs`. **Step 4: Commit** `feat(sandbox-host): binary identity re-check before every spawn (V21)` (+ trailer).
+  - CI: `v21_replaced_binary_detected_per_os` (a copy of the worker in a temp install dir; probe; replace the copy with another build of the same version but different bytes, e.g. the worker with one appended zero byte (no execution needed for the file-id check); the next `start_run` → `IdentityMismatch`, nothing spawned; macOS: two cases, (1) replace the file inside a copied `.app` bundle and (2) a real upgrade's shape, a new `.app` bundle renamed into place over the old one (a new inode for the worker); prints `V21 os=<..> case=<..> detected=true via=<file_id|size|mtime>`).
+- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-sandbox-host --locked --lib`; `--no-run` for `sandbox_runs`. **Step 4: Commit** `feat(sandbox-host): binary identity re-check before every spawn (V21)` (+ trailer). The lead pushes; the implementer records the run URL and the `V21` lines.
 
 ---
 
@@ -841,16 +924,17 @@ Shared conventions (every task):
 
 **Model:** Opus (security-relevant Win32 token code). **Reviewer:** Opus (medium).
 
-**Files:** Create `crates/sandbox-host/src/windows/degraded.rs`; Modify `crates/sandbox-host/src/windows/mod.rs`, `crates/sandbox-host/src/lib.rs` (`pub fn degraded_spawner() -> Option<Box<dyn WorkerSpawner>>`: Windows only), `crates/sandbox-host/Cargo.toml` (only features this task needs, listed in the report); Test unit (pure SID/flag builders); CI `sandbox_runs.rs::windows_degraded_spawner_runs_with_lockdown_token`.
+**Files:** Create `crates/sandbox-host/src/windows/degraded.rs`; Modify `crates/sandbox-host/src/windows/mod.rs`, `crates/sandbox-host/src/lib.rs` (`pub fn degraded_spawner() -> Option<Box<dyn WorkerSpawner>>`: Windows only), `crates/sandbox-host/Cargo.toml` (only features this task needs, listed in the report), `crates/sandbox-worker/src/confine/windows.rs` (degraded mode: `RevertToSelf()` after the DLLs are loaded and before `probe.ready`/the first stdin read; the `ConfinementReport` names the mechanism `lockdown_token` with `applied: false`), `crates/sandbox-worker/Cargo.toml` (a `windows-sys` feature for `RevertToSelf`, if missing); Test unit (pure SID/flag builders); CI `sandbox_runs.rs::windows_degraded_spawner_runs_with_lockdown_token`.
 
 **Interfaces:**
-- Produces a spawner for §9.4's degraded path: a restricted token (restricting SID = NULL SID), untrusted integrity applied after startup, the same job object limits, the same three-handle list and env.
+- Produces a spawner for §9.4's degraded path: a lockdown primary token (restricting SID = NULL SID, untrusted integrity), the same job object limits, the same three-handle list and env block.
+- "Applied after startup" (§9.4) needs worker code: a host cannot lower a running child's primary token, and a worker at untrusted integrity with a NULL restricting SID cannot load its DLLs. The standard construction: the child is created suspended with the lockdown primary token, its main thread gets a less-restricted impersonation token before resume, and the worker calls `RevertToSelf()` after its DLLs are loaded and before it reads stdin. The worker learns the mode from how it was started (a spawner-set argument or env name, recorded in the report), never from the host's later frames.
 - Used only when the run policy allows degraded and the AppContainer floor is not met (Task 20). It never feeds `run_probes` scoring as "floor": its report is always `degraded`.
 
 **Spec:** §9.4 Windows degraded path ("the only available configuration is then a lockdown token (restricting SID = NULL SID, untrusted integrity, applied after startup) + job object … below the floor"), §8.9, go/no-go "Open for later milestones" (degraded path).
 
-- [ ] **Step 1: Failing tests:** `degraded_token_has_null_restricting_sid_and_untrusted_label` (builder output); CI `windows_degraded_spawner_runs_with_lockdown_token` (a run-mode worker answers; `GetTokenInformation` on the child shows untrusted integrity; the job limits are those of the floor job).
-- [ ] **Step 2: Implement.** **Step 3: Run** local unit tests; `--no-run` for `sandbox_runs`; clippy on Windows. **Step 4: Commit** `feat(sandbox-host): Windows degraded spawner below the floor (§9.4)` (+ trailer).
+- [ ] **Step 1: Failing tests:** `degraded_token_has_null_restricting_sid_and_untrusted_label` (builder output); `degraded_report_names_lockdown_token_not_applied` (worker, pure report builder); CI `windows_degraded_spawner_runs_with_lockdown_token` (a run-mode worker answers; `GetTokenInformation` on the child shows untrusted integrity; the child's main thread has no impersonation token after `probe.ready` (`OpenThreadToken` fails with `ERROR_NO_TOKEN`); the job limits are those of the floor job; the degraded env set is asserted on its own, because the token path may not get `TEMP`/`TMP`: the test prints and asserts the observed names, it does not reuse R5's five blindly).
+- [ ] **Step 2: Implement.** **Step 3: Run** local unit tests; `--no-run` for `sandbox_runs`; clippy on Windows. **Step 4: Commit** `feat(sandbox-host,sandbox-worker): Windows degraded spawner below the floor (§9.4)` (+ trailer). The lead pushes; the implementer records the run URL and the observed degraded env names.
 
 ---
 
@@ -858,7 +942,7 @@ Shared conventions (every task):
 
 **Model:** Opus (classification and envelopes). **Reviewer:** Opus (medium).
 
-**Files:** Modify `crates/core/src/engine/script.rs` (`run_real`/`run_dry` call `check_available` before the compile step; `CompileFailure::Unavailable` → direct `SCRIPT_FAILED {sandbox_unavailable, details: {reason}}`; `RunSpec.policy`; `SCRIPT_STARTED` carries `confinement`), `crates/core/src/engine/envelope.rs` (`sandbox_unavailable` with `details.reason = app_upgraded` → `retryable: true`), `crates/core/src/payloads.rs` (`ScriptFailed.details` for unavailability; `script_started(.., confinement)`), `crates/core/src/testing/runner.rs` (`FakeScriptRunner`: availability script, compile failure kinds, policy capture), `crates/core/src/core.rs` (the policy source: `SettingsView.allow_degraded_scripts`, Task 15; until then `false`); Test `crates/core/tests/scripts.rs`.
+**Files:** Modify `crates/core/src/engine/script.rs` (`run_real`/`run_dry` call `check_available` before the compile step; `CompileFailure::Unavailable` → direct `SCRIPT_FAILED {sandbox_unavailable, details: {reason}}`; `CompileFailure::Timeout` → direct `SCRIPT_FAILED {timeout_s}` (`script_limit`); `classify` maps `HostLimit {sandbox_unavailable | app_upgraded}` to `SCRIPT_FAILED {reason: sandbox_unavailable, details: {reason}}` for direct and gated runs alike; `RunSpec.policy` read from the policy getter at slot acquisition; `SCRIPT_STARTED` carries `confinement`), `crates/core/src/engine/envelope.rs` (`sandbox_unavailable` with `details.reason = app_upgraded` → `retryable: true`), `crates/core/src/payloads.rs` (`ScriptFailed.details` for unavailability; `script_started(.., confinement)`), `crates/core/src/testing/runner.rs` (`FakeScriptRunner`: availability script, compile failure kinds, policy capture), `crates/core/src/core.rs` (the policy source: `SettingsView.allow_degraded_scripts`, Task 15; until then `false`); Test `crates/core/tests/scripts.rs`.
 
 **Interfaces:**
 - Consumes: Δ3.
@@ -872,6 +956,8 @@ Shared conventions (every task):
 
   A `check_available` failure is direct (the run is neither queued nor dispatched): `failed`, exit 8, `sandbox_unavailable`, `details.reason = app_upgraded` only for `AppUpgraded`.
 - A dry run follows the same order (no `SCRIPT_STARTED`). Its unavailability is `SCRIPT_FAILED {sandbox_unavailable, direct}` as today.
+- The run policy is read from the getter at each step that spawns or checks (`check_available`, the compile, the slot acquisition), never captured at submit (PD-141).
+- A spawn-time unavailability (`HostLimit {sandbox_unavailable | app_upgraded}` from `start`) of a run that got its slot at once (neither queued nor dispatched) is direct: `failed`, exit 8, `sandbox_unavailable`, with `details.reason = app_upgraded` and `retryable: true` for `app_upgraded`, `retryable: false` for the floor. The same end of a queued run goes to release (PD-133). Neither ever falls into the generic `script_limit` arm of `envelope.rs`.
 
 **Spec:** §3.4 (re-check at submit before the compile check; a queued run's spawn-time mismatch through the release flow), §4.3 exit-8 row (`retryable` true for `app_upgraded`), §8.3 `SCRIPT_FAILED`/`SCRIPT_STARTED`, §9.4 (floor rule, degraded toggle), PD-133, PD-138.
 
@@ -883,6 +969,9 @@ Shared conventions (every task):
   - `script_started_records_confinement`;
   - `sandbox_unavailable_envelope_details_reason`;
   - `compile_unavailable_is_direct_and_never_takes_a_real_slot`;
+  - `compile_timeout_frees_the_dry_slot_and_is_direct` (the fake's compile answers `Timeout`: direct `script_limit {timeout_s}`, never `script_syntax`; the dry-pool permit is free again: a following dry run answers);
+  - `nonqueued_run_spawn_time_app_upgraded_is_direct_sandbox_unavailable_retryable` (the fake's `start` answers `HostLimit {app_upgraded}` for a run that got a slot at once → `failed`, exit 8, `sandbox_unavailable`, `details.reason = app_upgraded`, `retryable: true`; not `script_limit`);
+  - `nonqueued_run_spawn_time_floor_not_met_is_direct_sandbox_unavailable` (the same with `sandbox_unavailable` → `retryable: false`, no `details.reason`);
   - `worker_reported_limit_never_direct_when_dispatched` (a `HostLimit` after `SCRIPT_CALL_SENT` → release item).
 
   All existing `scripts.rs` tests stay green with the updated fake.
@@ -932,7 +1021,9 @@ Shared conventions (every task):
   - `crates/core/src/engine/script.rs` (`parse` uses the engine's configured ceiling);
   - `crates/core/src/engine/handler.rs:324` (effective `script_limits`);
   - `crates/core/src/engine/queue.rs` (`Limits.script: ScriptLimits`; `Reservation::script` uses its `max_result_mb`);
-  - `crates/core/src/settings/mod.rs` (Δ6 `ScriptLimits` change: bounds, invariants on the resulting set, raise → native confirmation with `raise_text`, file write to `[scripts]`, apply at once).
+  - `crates/core/src/settings/mod.rs` (Δ6 `ScriptLimits` change: bounds, invariants on the resulting set, raise → native confirmation with one `raise_text` line per raised key, file write to `[scripts]`, apply at once; `MAX_CHANGES` and `SETTING_KEYS` grow).
+
+The bounds are PD-139's: `max_call_result_mb` and `max_result_mb` at most 16 (the §3.4 24 MiB host→worker frame cap and `registry::RELEASE_CAP_BYTES`), `max_concurrent_calls` 1–16, the other five at most 4 × the spec default. The same bounds apply to the `[scripts]` file table (an out-of-range file value is refused like other invalid config values) and to the Settings change.
 
 Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
@@ -942,7 +1033,9 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 - [ ] **Step 1: Failing tests:**
   - `script_limits_defaults_from_config`;
+  - `script_limit_bounds_respect_frame_and_release_caps` (`max_call_result_mb = 17` and `max_result_mb = 17` refused in Settings and in `[scripts]`; 16 accepted; `timeout_s` at 4 × default accepted, one above refused; `max_concurrent_calls` 0 and 17 refused);
   - `raising_script_limit_needs_native_confirmation`;
+  - `raising_two_script_limits_one_dialog_one_line_each`;
   - `lowering_script_limit_plain_config_changed`;
   - `invariants_enforced_in_settings` (process < heap + 88 refused; heap < 8 × call result refused; the view unchanged);
   - `limits_above_configured_default_rejected_exit2`;
@@ -958,20 +1051,26 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Opus (a security-weakening setting with its authority). **Reviewer:** Opus (medium).
 
-**Files:** Modify `crates/audit/src/settings.rs` (Δ7; view, snapshot key, `apply_setting`), `crates/core/src/settings/mod.rs` (Δ6 `AllowDegradedScripts`; on → native confirmation; off → plain), `crates/core/src/core.rs` (the policy getter Task 12 reads); Test `crates/audit/tests/settings.rs`, `crates/core/tests/settings.rs`. Per R2 there is no `config.toml` key: the audit settings key is additive and absent = off.
+**Files:** Modify `crates/audit/src/settings.rs` (Δ7: view; `from_json` accepts the four required keys plus the optional `allow_degraded_scripts`; `to_json` emits it only when `true`; `allow_degraded_scripts` in the policy-key list (`parse_key`/`is_policy_key`); `apply_setting`), `crates/audit/src/store.rs` (if `apply_setting`'s policy match needs the new arm; the immediate anchor-dir line follows the existing policy `CONFIG_CHANGED` path), `crates/core/src/settings/mod.rs` (Δ6 `AllowDegradedScripts`; on → native confirmation; off → plain; `MAX_CHANGES`/`SETTING_KEYS`), `crates/core/src/core.rs` (the policy getter Task 12 reads); Test `crates/audit/tests/settings.rs`, `crates/core/tests/settings.rs`, `crates/core/tests/scripts.rs`. Per R2 there is no `config.toml` key: the audit settings key is additive and absent = off.
 
-**Interfaces:** `Core::script_policy() -> RunPolicy`; `SettingsView.allow_degraded_scripts`.
+**Interfaces:** `Core::script_policy() -> RunPolicy` (read fresh at every call: `check_available`, compile, slot acquisition, PD-141); `SettingsView.allow_degraded_scripts`. Handoff (M10): `verify-export` reads `PRUNE` snapshots and must accept the optional key.
 
 **Spec:** §9.4 ("An explicit Settings toggle … re-enables them with a persistent warning and is audit-logged (`CONFIG_CHANGED`)"), §10.3 ("enable degraded script confinement" is security-weakening), L32 (audit-authoritative pattern), PD-141.
 
 - [ ] **Step 1: Failing tests:**
   - `allow_degraded_scripts_setting_round_trip_and_prune_snapshot` (audit);
+  - `pre_m8_prune_snapshot_still_parses` (audit: a four-key snapshot from the existing golden vectors parses, `allow_degraded_scripts == false`);
+  - `snapshot_without_the_toggle_is_byte_identical` (audit: `to_json` of a view with the toggle off equals the pre-M8 bytes);
+  - `snapshot_with_unknown_extra_key_still_refused` (audit: fail closed for any other key);
+  - `forged_allow_degraded_scripts_config_changed_refused` (audit: a caller-appended `CONFIG_CHANGED {key: allow_degraded_scripts}` is refused like the other policy keys, and the overlay ignores it);
+  - `degraded_toggle_writes_immediate_anchor_line` (audit: the policy `CONFIG_CHANGED` gets its anchor-dir line, §13);
   - `degraded_toggle_needs_native_confirmation_and_logs_config_changed`;
   - `degraded_toggle_cancel_changes_nothing`;
   - `degraded_toggle_off_needs_no_confirmation`;
   - `degraded_toggle_survives_restart`;
-  - `degraded_toggle_has_no_config_file_path`.
-- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-audit --locked --test settings`; core `--test settings --test scripts`; clippy. **Step 4: Commit** `feat(core,audit): confirmed degraded-confinement setting (PD-141)` (+ trailer).
+  - `degraded_toggle_has_no_config_file_path`;
+  - `degraded_off_after_submit_refuses_the_queued_spawn` (core `scripts.rs`: the toggle on at submit, the run queues behind two held slots, the toggle turns off, a slot frees: the fake's `start` sees `allow_degraded: false` and answers unavailable; the run ends through the release flow like the other spawn-time unavailabilities of a queued run, §3.4).
+- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-audit --locked`; core `--test settings --test scripts`; clippy. **Step 4: Commit** `feat(core,audit): confirmed degraded-confinement setting (PD-141)` (+ trailer).
 
 ---
 
@@ -990,26 +1089,26 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
   - `started_at_is_slot_time_not_submit_time` (a queued run's `started_at` > `submitted_at`);
   - `x11_user_kill_is_killed_by_user_direct_false_release_item` (extends `user_kill_becomes_a_release_item`: payload `{reason: killed_by_user, direct: false}` with its candidate, also before the first host call);
   - `kill_answer_not_running_vs_already_stopping` (after the end → `NotRunning`; after an agent `cancel` asked a kill, before its record → `AlreadyStopping`; a second click → `AlreadyStopping`);
-  - `running_list_leaves_out_dry_runs_and_ended_runs` (existing, kept).
+  - `running_list_empty_and_one` and `running_list_leaves_out_dry_runs_and_kill_ignores_non_scripts` (existing, `scripts.rs:946,974`, kept; the second is updated for `KillAnswer`).
 - [ ] **Step 2: Implement.** **Step 3: Run** core `--test scripts`; clippy. **Step 4: Commit** `feat(core): Running-scripts view with slot time, instances, bytes and kill answers (X-11)` (+ trailer).
 
 ---
 
 ### Task 17: Script release preview model; X-12 Jira half; M5 M-13
 
-**Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
+**Model:** Sonnet (medium). **Reviewer:** Opus (medium): the task builds what the approver sees, including the decrypt path for logs and stderr.
 
-**Files:** Modify `crates/core/src/engine/script.rs` (`ScriptState.calls` provenance rows per PD-145; `preview_model` builds `PreviewBody::Script`; logs/stderr of a result from the committed `SCRIPT_FINISHED` payload through the candidate cache's decrypt path; `Preview.preselect`; the lossy count unchanged in source but asserted per X-12; M-13 per R8), `crates/preview/src/model.rs` (Δ5 types only; the render arm is Task 18), `crates/core/src/ops/generic.rs` (only to reuse `list_table`, M7 PD-114); Test `crates/core/tests/scripts.rs`; Modify `app/src-tauri/tests/dto_fixtures.rs` + `app/ui/src/shared/ipc/fixtures/preview.json` (regenerated with `UPDATE_FIXTURES=1`).
+**Files:** Modify `crates/core/src/engine/script.rs` (`ScriptState.calls` provenance rows per PD-145; `preview_model` builds `PreviewBody::Script`; logs/stderr of a result from the committed `SCRIPT_FINISHED` payload through the candidate cache's decrypt path; `Preview.preselect` (core maps its flag to `preview::Preselect::ErrorClassOnly`, never a core type inside `preview`); the lossy count unchanged in source but asserted per X-12; M-13 per R8), `crates/preview/src/model.rs` (Δ5 types only, incl. `Preselect`; the render arm is Task 18), `crates/core/src/ops/generic.rs` (only to reuse `list_table`, M7 PD-114); Test `crates/core/tests/scripts.rs`; Modify `app/src-tauri/tests/dto_fixtures.rs` + `app/ui/src/shared/ipc/fixtures/preview.json` (regenerated with `UPDATE_FIXTURES=1`).
 
-**Interfaces:** Δ5, PD-145, PD-146. The provenance `target_display` uses `registry::target_display(spec, params)` on the agent's params only (§2.3); outcome strings `ok`, `rejected:<class>`, `cancelled_in_flight`.
+**Interfaces:** Δ5, PD-145, PD-146. The provenance `target_display` uses `registry::target_display(spec, params)` on the host-call request params only (§2.3), never on a response; outcome strings `ok`, `rejected:<class>`, `cancelled_in_flight`.
 
 **Spec:** §6.3 Script result / Script error details rows, §6.2 Info "N host calls returned truncated or lossy data" (scripts, §9.5), §9.5 ("Keep error class only" pre-selected; host-computed warning), §5.3 (mirrors; M5 M-13), PD-145, PD-146, R7, R8.
 
 - [ ] **Step 1: Failing tests:**
   - `script_preview_has_source_provenance_logs_stderr`;
-  - `provenance_from_agent_params_only` (a canary only in the mock response never appears in the provenance or in any preview field other than the candidate view);
+  - `provenance_from_request_params_never_responses` (a canary only in the mock response never appears in the provenance or in any preview field other than the candidate view; the test script does not pass fetched values into later call params, so the canary assertion stays valid);
   - `x12_lossy_count_only_truncated_or_lossy_meta_jira_half` (a truncated page counts; a full page, a rejection and a 4xx do not);
-  - `preselect_error_class_only_surfaced_for_queued_limit`;
+  - `preselect_error_class_only_surfaced_for_queued_limit` (the preview carries `Preselect::ErrorClassOnly`, serialized `"error_class_only"`);
   - `error_details_preview_has_class_message_stack_elapsed`;
   - `result_logs_read_from_committed_record` (evict the candidate; the preview still shows the logs; no mock hit);
   - `m13_rendered_fields_caution_when_run_called_rendered` (R8: a run whose host call used `expand=renderedFields` gets the Caution `script_rendered_copies` "this result may contain rendered copies of fields (renderedFields); dropping a field does not drop its copy; use mask in every occurrence" (plan text, a §6.2 amendment); without such a call, no Caution).
@@ -1022,7 +1121,8 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Opus (the TCB renderer). **Reviewer:** Opus (medium).
 
-**Files:** Modify `crates/preview/src/render/{mod.rs,body.rs}`, `crates/preview/src/model.rs` (`PREVIEW_BUILDER_VERSION` render part `render5`; `RENDER_VERSIONS` appends `("render5", <digest>)` after M7's `render4`); Test `crates/preview/tests/render.rs`.
+**Files:** Modify `crates/preview/src/render/{mod.rs,body.rs}`, `crates/preview/src/model.rs` (`PREVIEW_BUILDER_VERSION` takes the next render part after the one the merged M7 uses: planned `render5` after M7's `render4`; `RENDER_VERSIONS` appends `(<that part>, <digest>)` and never edits an entry); Test `crates/preview/tests/render.rs`.
+- **Not modified:** `app/ui/public/preview.css`, `app/src-tauri/tauri.conf.json`, `crates/preview/src/sanitize.rs`. The stylesheet is inlined as exactly one hashed `<style>` (L215); a new stylesheet path or a CSS change would need the CSP-hash procedure (M7 plan review B-1). If an arm seems to need a CSS rule, stop and report.
 
 **Interfaces:**
 - Consumes the Task 17 model.
@@ -1036,21 +1136,21 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
   - `script_source_and_logs_are_escaped_text` (`<script>`, `onerror=`, U+202E in source and logs → escaped, `⟨U+202E⟩`);
   - `script_error_document_fields`;
   - `s06_script_document_has_no_active_content` (the existing proptest gains the `Script` variant);
-  - `render_version_is_render5`;
+  - `render_version_is_render5` (named after the part actually taken, if the merged M7 moved);
   - `doc_caps_note_for_long_logs`.
-- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-preview --locked --test render`; core `--test scripts` (the version string); clippy. **Step 4: Commit** `feat(preview): script result and error documents (render5)` (+ trailer).
+- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-preview --locked --test render`; core `--test scripts` (the version string); `node ci/check-csp.mjs` (check mode, not `--write`); `git diff --quiet -- app/ui/public/preview.css app/src-tauri/tauri.conf.json crates/preview/src/sanitize.rs` must hold; clippy. **Step 4: Commit** `feat(preview): script result and error documents (render5)` (+ trailer), never staging `app/ui/public/preview.css`.
 
 ---
 
-### Task 19: Core script test sweep (I-07, I-10, I-13, I-14, I-23, I-37, U-03, U-29, X-04, M3 M-1)
+### Task 19a: Core script test sweep, part 1: opacity, cancel, slots, dispatch (I-07, I-10, I-13, I-14, M3 M-1)
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Modify `crates/core/tests/{scripts,opacity,cancel,budget,redact,audit_faults}.rs`; product fixes in their owning module with a separate `fix(core)` commit each.
+**Files:** Modify `crates/core/tests/{scripts,opacity,cancel}.rs`; product fixes in their owning module with a separate `fix(core)` commit each.
 
 **Interfaces:** Consumes Tasks 12, 13, 16 and the M3 fake runner. Produces tests only (fixes as found).
 
-**Spec:** §13 rows (lead phrases: "Opacity tests", "**Cancel** (§4.4)", "**Script slots** (§9.4, §9.5)", "**Dispatch rule** (§9.5)", "Upstream availability", "Memory budget", "a script dry run … makes no HTTP call at all", "a dropped field never yields `null`"), Table 3 X-04, L19, L20, L26 (structural checks, no timing assertions).
+**Spec:** §13 rows (lead phrases: "Opacity tests", "**Cancel** (§4.4)", "**Script slots** (§9.4, §9.5)", "**Dispatch rule** (§9.5)"), L19, L20, L26 (structural checks, no timing assertions).
 
 - [ ] **Step 1: Tests** (each name in the Traceability table):
   - `i07_script_limit_after_data_stream_identical`;
@@ -1059,14 +1159,53 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
   - `i13_queued_timeout_before_call_is_release_with_preset`;
   - `i13_slot_saturation_never_busy`;
   - `i14_dispatch_rule_cases_1_to_5` (one test per case as subtests; case 5 kills before the first call, then simulates a crash (`TempStore::reopen`) → `ABANDONED`, and the kill's and the queued limit's candidates rebuild with matching hashes);
+  - `m1_kill_not_under_state_lock` (a fake `RunHandle::kill` that tries `entry.state()` on another thread with a timeout: it must get the lock).
+- [ ] **Step 2: Run** core `--test scripts --test opacity --test cancel`. **Step 3: Commit** `test(core): script opacity, cancel, slot and dispatch sweep` (+ trailer).
+
+---
+
+### Task 19b: Core script test sweep, part 2: availability, budget, U-03, U-29, audit faults (I-23, I-37, U-03, U-29, X-04)
+
+**Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
+
+**Files:** Modify `crates/core/tests/{scripts,budget,redact,audit_faults}.rs`; product fixes in their owning module with a separate `fix(core)` commit each.
+
+**Interfaces:** Consumes Tasks 12, 13, 14, 16 and the M3 fake runner. Produces tests only (fixes as found).
+
+**Spec:** §13 rows (lead phrases: "Upstream availability", "Memory budget", "a script dry run … makes no HTTP call at all", "a dropped field never yields `null`"), Table 3 X-04, L26, L31.
+
+- [ ] **Step 1: Tests** (each name in the Traceability table):
   - `i23_script_call_3xx_html_nonjson401_upstream_unavailable_token_unchanged`;
   - `i23_script_call_json401_needs_token_only_after_recheck`;
   - `i37_scripts_identical_admit_busy_different_actual_sizes`;
   - `u03_dry_run_no_http_no_script_call` (wiremock received zero requests; no `SCRIPT_CALL`, no `SCRIPT_STARTED`);
   - `u29_script_result_drops_never_empty` (proptest over `{result: arb}` with `SCRIPT_SPEC`), `u29_script_result_upstream_null_survives`;
-  - `x04_script_points` (append failure at `SCRIPT_STARTED`, `SCRIPT_CALL_SENT`, `SCRIPT_CALL`, `SCRIPT_FINISHED`, `SCRIPT_RELEASED`, `DELIVERED`: nothing released/delivered/sent after the point; envelope `failed`, exit 1, `audit_failure`, `retryable: true`);
-  - `m1_kill_not_under_state_lock` (a fake `RunHandle::kill` that tries `entry.state()` on another thread with a timeout: it must get the lock).
-- [ ] **Step 2: Run** core `--test scripts --test opacity --test cancel --test budget --test redact --test audit_faults` (record the proptest time). **Step 3: Commit** `test(core): script opacity, cancel, slot, dispatch, availability, budget and audit-fault sweep` (+ trailer).
+  - `x04_script_points` (append failure at `SCRIPT_STARTED`, `SCRIPT_CALL_SENT`, `SCRIPT_CALL`, `SCRIPT_FINISHED`, `SCRIPT_RELEASED`, `DELIVERED`: nothing released/delivered/sent after the point; envelope `failed`, exit 1, `audit_failure`, `retryable: true`; one subtest per injection point).
+- [ ] **Step 2: Run** core `--test scripts --test budget --test redact --test audit_faults` (record the proptest time). **Step 3: Commit** `test(core): script availability, budget, dry-run, drop and audit-fault sweep` (+ trailer).
+
+---
+
+### Task 19c: Redaction engine path check and the M-11 drop-flagged-items tree (L217)
+
+**Model:** Opus (the release-time redaction engine). **Reviewer:** Opus (medium).
+
+**Files:** Modify `crates/core/src/redact/{apply,mirror,views}.rs` (the existence check), the core path that answers `raw_page`/`redaction_preview` for a `release_blocked` item (`crates/core/src/decision/{mod,redaction_preview}.rs`, which today answer `Invalid(NotApprovable)`), `app/src-tauri/src/commands/*` only if the command must carry the new tree; Test `crates/core/tests/redact.rs`, `crates/core/tests/decisions_ui.rs`. The UI half (lifting the panel's "no drop by bare index once the revision holds drops" rule, offering "drop the flagged items") is Task 24's.
+
+**Interfaces:**
+- **Engine-side path check** (L123, L217; M6 T17 fix `265d320`): today a `drop_field`/`drop_item` existence check runs against the original source only (`redact/apply.rs`), so a drop addressed by index after earlier drops in the same revision can be refused or checked against the wrong element, and the UI refuses such drops (fail closed). M8 checks `existed = original || current doc` (the document left by the earlier ops of the revision) and keeps the index semantics of the shown document (identity mapping, as built in T17's fix).
+- **M-11 mirror "drop flagged items"** (M5 M-11, L125, L134): a candidate blocked by the §5.3 mirror check is `release_blocked`, and `raw_page` refuses it, so the redaction panel has no Structured tree and the approver can only deny although `RELEASE_BLOCKED_INTERNAL` says "drop the flagged items". M8 gives such an item a tree of the source with the flagged paths reported by Rust (only paths, never values beyond what the preview already shows) so drops of those items can be sent, after which the mirror check runs again on the result.
+- Nothing else in the release gate changes: a hash mismatch stays "only Deny remains" (§5.2).
+
+**Spec:** §5.3 (round rules, mirror check), §5.2, §6.3, L123, L125, L134, L217, M6 final review (deferred-items table: both rows "Defer to M8").
+
+- [ ] **Step 1: Failing tests:**
+  - `drop_after_earlier_drops_checks_existence_against_current_doc` (`redact.rs`: a revision with a `drop_item` at `[2]` then a `drop_field` at `[3].x` of the shown document: applied, and the result equals applying them one by one to the shown candidate);
+  - `drop_absent_in_original_and_current_doc_is_refused` (`redact.rs`: fail closed);
+  - `a_drop_past_a_shifted_index_is_checked_on_another_element` (existing M6 test, `decisions_ui.rs:465`, updated to the new rule and kept);
+  - `m11_mirror_release_blocked_offers_drop_flagged_items_tree` (`decisions_ui.rs`: a mirror-blocked Jira candidate answers `preview_fetch`/`raw_page` with a tree and the flagged paths, not `NotApprovable`);
+  - `m11_dropping_flagged_items_makes_the_mirror_candidate_releasable` (`decisions_ui.rs`: after the drops, the mirror check passes and plain release succeeds; without them it stays blocked);
+  - `hash_mismatch_release_blocked_stays_deny_only` (`decisions_ui.rs`).
+- [ ] **Step 2: Implement.** **Step 3: Run** core `--test redact --test decisions_ui --test scripts`; the app gate if a command changed (`node ci/check-commands.mjs`); clippy. **Step 4: Commit** `feat(core): redaction existence check against the current document; drop-flagged-items tree for mirror-blocked items (L217)` (+ trailer).
 
 ---
 
@@ -1084,22 +1223,26 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
   - the install dir;
   - a `tokio::runtime::Handle`;
   - an `update_pending: Arc<AtomicBool>`.
-- Methods:
-  - `check_available(policy)`: probe report present (else wait ≤ 60 s, PD-138); floor or degraded; `recheck` → `AppUpgraded` (sets `update_pending`).
-  - `compile_check(source, policy)`: `compile_run` (a compile-only worker; the core already holds the dry-pool permit).
-  - `start(spec, calls)`: `start_run` with `SpawnSpec { exe, process_mb }`, `WorkerInit`, a `HostCallSink` adapter that forwards to `core::HostCalls` (`call` → `calls.call(run_id, c)`; `log` → no-op, logs are collected by the bridge).
+- Methods (every synchronous `sandbox-host` call goes through `tokio::task::spawn_blocking`, PD-138):
+  - `check_available(policy)`: probe report present (else wait ≤ 60 s, PD-138; the wait counts toward the agent's `--timeout`); floor or degraded; `recheck` → `AppUpgraded` (sets `update_pending`).
+  - `compile_check(source, policy)`: `compile_run` with the deadline `min(10 s, timeout_s)` (PD-135; a compile-only worker; the core already holds the dry-pool permit). `CompileVerdict::Timeout` → `CompileFailure::Timeout`.
+  - `start(spec, calls)`: `start_run` with `SpawnSpec { exe, process_mb }`, `WorkerInit`, a `HostCallSink` adapter that forwards to `core::HostCalls` (`call` → `calls.call(run_id, c)`; `log` → no-op, logs are collected by the bridge). The spawner is chosen from `spec.policy` as core read it at slot acquisition (PD-141).
+  - Unconfined ready frames (PD-141 (d)): the glue tells the bridge to accept `confinement.applied == false` only when the policy allows degraded **and** the startup probe report says `NotMet`. With a `Met` report, an unconfined ready frame is `FloorNotMet` whatever the toggle says.
+  - Logging: the glue logs `script_identity_mismatch` (from `StartRunError::IdentityMismatch`), `sandbox_watchdog_kill` (from `RunOutcome.diag`) and `script_spawn_failed {reason}`, constants only, and allowlists them in `diag/fields.rs`. No worker byte is logged.
 - Returns `Arc<RunHandleGlue>`:
   - `kill(why)` → `RunHandleImpl::kill(KillCause::from(why))` (non-blocking);
-  - `wait()` → `map::to_run_end(RunOutcome)`. The mapping follows PD-134/119/120: `WorkerEnd::Result` → `RunEnd::Result {value, logs, stderr}` (the value JSON text parsed once here, bounded by the terminal cap); `Error` → `RunEnd::Error` with host `elapsed`; `Limit(n)` → `HostLimit {name: n}`; `Killed(c)` → `Killed {reason}`; `Violation` → `ProtocolViolation`; `Crashed` → `Crashed`; `NotSpawned(IdentityMismatch)` → `HostLimit {app_upgraded}` (sets `update_pending`); `NotSpawned(FloorNotMet | Spawn)` → `HostLimit {sandbox_unavailable}`.
+  - `wait()` → `map::to_run_end(RunOutcome)`. The mapping follows PD-134 and Δ3: `WorkerEnd::Result` → `RunEnd::Result {value, logs, stderr}` (the value JSON text parsed once here, bounded by the terminal cap); `Error` → `RunEnd::Error` with host `elapsed`; `Limit(n)` → `HostLimit {name: n}`; `Killed(c)` → `Killed {reason}`; `Violation` → `ProtocolViolation`; `Crashed` → `Crashed`; `NotSpawned(IdentityMismatch)` → `HostLimit {app_upgraded}` (sets `update_pending`); `NotSpawned(FloorNotMet | Spawn)` → `HostLimit {sandbox_unavailable}`.
 - Environment and cwd per OS come from the M1 spawners unchanged.
 
-**Spec:** C.0 (who drives the sandbox), §3.4 (spawning, identity, stderr, logs), §9.1 steps 2–5, §9.4 (floor rule, degraded toggle), PD-133, PD-134, PD-138, PD-148, R1, R10.
+**Spec:** C.0 (who drives the sandbox), §3.4 (spawning, identity, stderr, logs), §9.1 steps 2–5, §9.4 (floor rule, degraded toggle), PD-133, PD-134, PD-135, PD-138, PD-141, PD-148, R1, R10.
 
 - [ ] **Step 1: Failing tests** (unit, fakes only):
   - `glue_maps_outcomes_to_run_end` (table-driven over every `RunOutcome` kind);
   - `glue_rechecks_identity_before_spawn` (a changed file id → `AppUpgraded`, the fake spawner never called, `update_pending` set);
   - `glue_awaits_startup_probe_then_refuses_when_floor_not_met`;
-  - `glue_degraded_policy_uses_degraded_spawner` (Windows `#[cfg]`; elsewhere the platform spawner with the policy flag);
+  - `glue_degraded_policy_uses_degraded_spawner` (Windows `#[cfg]`; elsewhere the platform spawner with the policy flag), with the PD-141 cases: (a) the worker's actual `ConfinementReport` reaches `SCRIPT_STARTED.confinement` (not only `mode: degraded`); (b) a ready frame with `applied: false` under a `Met` probe report is `FloorNotMet` with the toggle on; (c) with a `NotMet` report and the toggle on, the run starts and the record says `degraded`;
+  - `glue_compile_check_has_a_deadline` (a fake compile that never answers → `CompileFailure::Timeout` within `min(10 s, timeout_s)` of fake time);
+  - `glue_logs_host_diag_constants_only` (`sandbox_watchdog_kill`, `script_identity_mismatch` in the diag log; no worker text);
   - `glue_builds_worker_init_with_read_ops_and_instances` (only Read ids; aliases without URLs);
   - `glue_kill_never_blocks`;
   - `glue_host_calls_spawned_never_dropped`;
@@ -1111,22 +1254,25 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 ---
 
-### Task 21: Probe in `APP_START`, S-05 evidence path, status lines (`updated_restart`, `scripts_degraded`, `keychain_prompt`)
+### Task 21: Probe in `APP_START`, S-05 evidence path, status lines (`updated_restart`, `scripts_degraded`)
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Modify `app/src-tauri/src/compose.rs` (`app_start_extra` gains `confinement` per R1: report fields `floor`, `failed`, `extra_layers`, `mode`, `memory_read: blocked|allowed|inconclusive`, `sandbox_binary: {file_id, size, mtime, embedded_version}` or `{state: pending}`), `app/src-tauri/src/serve.rs` (the ≤ 5 s bounded wait, R1), `app/src-tauri/src/status.rs` (inputs `update_pending` from the glue, `scripts_degraded` (PD-141: degraded allowed and floor not met), `keychain_prompt` from `ServeSlot::keychain_prompt()`), `app/src-tauri/src/tray.rs`, `app/src-tauri/src/commands/settings.rs` (`ConfinementDto.scripts`, `degraded_allowed`; Δ8); Tests `status.rs` unit, `commands_acl.rs`, `startup_probe.rs` (CI).
+`keychain_prompt` is not part of this task: it is already wired on the base (`status.rs:278` `gather_gate` reads `ServeSlot::keychain_prompt()`; `serve.rs` sets the flag after `KEYCHAIN_PROMPT_AFTER` = 10 s; commit `8fc44a9`; tests `serve.rs::keychain_prompt_hint_after_10s`, `the_prompt_hint_is_up_only_while_open_blocks_past_the_limit`, `no_prompt_hint_where_the_platform_has_no_keychain_prompt`, `status.rs::status_lines_table`). Only `update_pending` is still unwired.
+
+**Files:** Modify `app/src-tauri/src/compose.rs` (`app_start_extra` gains `confinement` per R1: report fields `floor`, `failed`, `extra_layers`, `mode`, `memory_read: blocked|allowed|inconclusive`, `sandbox_binary: {file_id, size, mtime, embedded_version}` or `{state: pending}`), `app/src-tauri/src/serve.rs` (the ≤ 5 s bounded wait, R1, measured from the probe's start, PD-138), `app/src-tauri/src/status.rs` (inputs `update_pending` from the glue, `scripts_degraded` (PD-141: degraded allowed and floor not met)), `app/src-tauri/src/tray.rs`, `app/src-tauri/src/commands/settings.rs` (`ConfinementDto.scripts`, `degraded_allowed`; Δ8); Tests `status.rs` unit, `commands_acl.rs`, `startup_probe.rs` (CI).
 
 **Interfaces:** Δ8 `settings_get.confinement`. Status texts: `updated_restart` "Updated — restart to apply" (§12.2 verbatim, existing constant); `scripts_degraded` "scripts run with degraded confinement" (plan text, caution).
 
-**Spec:** §8.3 `APP_START` (sandbox binary identity, confinement status), §9.4 (results recorded in `APP_START`, shown in Settings, never block startup), §2.5 (memory-read self-test), §3.4 + §12.2 (status line), §13 S-05, L78, L134, PD-138, PD-141, R1, R14.
+**Spec:** §8.3 `APP_START` (sandbox binary identity, confinement status), §9.4 (results recorded in `APP_START`, shown in Settings, never block startup), §2.5 (memory-read self-test), §3.4 + §12.2 (status line), §13 S-05, §13 cold start (`--timeout 30` incl. launch), L134, PD-138, PD-141, R1.
 
 - [ ] **Step 1: Failing tests:**
   - `updated_restart_after_identity_mismatch`;
   - `status_scripts_degraded_line`;
-  - `keychain_prompt_line_wired`;
   - `app_start_records_probe_when_ready` (unit over `app_start_extra`);
   - `app_start_records_pending_when_probe_late`;
+  - `app_start_wait_is_measured_from_probe_start` (unit over the wait helper with injected instants: a probe that started 4 s before `audit::open` finished leaves at most 1 s to wait; one that started 6 s before leaves none);
+  - regression, no new test: the existing startup targets (`startup_ipc`, `startup_gate`) and the `cli_flows` cold-start case (§13 `--timeout 30` incl. launch) keep their budgets with the wait counted; they run in CI after the lead's push, and the implementer records the result in the report;
   - `s05_settings_shows_failed_memory_read_probe` (mock runtime with an injected report where `OpenProcessVmRead`/`TaskForPid` failed: Settings shows it, the core started);
   - CI `startup_probe.rs` :: `s05_failed_memory_read_probe_recorded_and_app_starts` (an injected failing probe job; the app serves IPC; `APP_START` carries the failure).
 - [ ] **Step 2: Implement.** **Step 3: Run** the app gate; `--test startup_probe --no-run`. **Step 4: Commit** `feat(app): probe in APP_START, S-05 path, script status lines` (+ trailer).
@@ -1137,14 +1283,14 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Modify `app/src-tauri/src/commands/running.rs` (Δ8 `{answer}`), `app/src-tauri/tests/{dto_fixtures,commands_acl}.rs`, `app/ui/src/running_scripts/{Running.tsx,Running.test.tsx}`, `app/ui/src/shared/{strings.ts,ipc/types.ts,ipc/validate.ts,ipc/fixtures/running*.json}`.
+**Files:** Modify `app/src-tauri/src/commands/running.rs` (Δ8 `{answer}`; new DTO string types follow the `commands/dto.rs` newtype pattern, e.g. `StepName`), `app/src-tauri/tests/{dto_fixtures,commands_acl}.rs`, `app/ui/src/running_scripts/{Running.tsx,Running.test.tsx}`, `app/ui/src/shared/{strings.ts,ipc/types.ts,ipc/validate.ts,ipc/fixtures/running_script.json,ipc/fixtures/kill_answer.json}`.
 
 **Interfaces:** columns per §9.6: agent (after the "unverified" badge, bidi-isolated), instance(s), started, elapsed, host calls, bytes fetched (human-readable from Rust's number), kill button. The answer texts follow PD-143. The window re-lists per PD-142.
 
 **Spec:** §9.6, §5.6 (agent strings), §6.4 (text nodes), PD-142, PD-143.
 
 - [ ] **Step 1: Failing tests:** vitest `x11_columns_agent_instances_started_elapsed_calls_bytes`, `kill_answers_texts`, `relists_on_event_and_every_second_while_visible`, `agent_name_after_unverified_badge_isolated`; Rust `running_kill_answer_shape`, `s09_running_scripts_grants_unchanged`.
-- [ ] **Step 2: Implement**, regenerate fixtures. **Step 3: Run** UI gates + the app gate. **Step 4: Commit** `feat(app,ui): Running-scripts columns and kill answers (X-11)` (+ trailer).
+- [ ] **Step 2: Implement**, regenerate fixtures. **Step 3: Run** UI gates + the app gate; `node ci/check-commands.mjs` (new DTO field names must pass its field-name word lists). **Step 4: Commit** `feat(app,ui): Running-scripts columns and kill answers (X-11)` (+ trailer).
 
 ---
 
@@ -1152,14 +1298,14 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Create `app/ui/src/settings/Scripts.tsx`; Modify `app/ui/src/settings/{Settings.tsx,Limits.tsx,Settings.test.tsx,text.tsx}`, `app/src-tauri/src/commands/settings.rs` (Δ6 DTO bounds), `app/src-tauri/tests/{dto_fixtures,commands_acl}.rs`, `app/ui/src/shared/ipc/*`.
+**Files:** Create `app/ui/src/settings/Scripts.tsx`; Modify `app/ui/src/settings/{Settings.tsx,Limits.tsx,Settings.test.tsx,text.tsx}`, `app/src-tauri/src/commands/settings.rs` (Δ6 DTO bounds: PD-139's, `max_call_result_mb`/`max_result_mb` ≤ 16; new DTO string types follow the `commands/dto.rs` newtype pattern), `app/src-tauri/tests/{dto_fixtures,commands_acl}.rs`, `app/ui/src/shared/ipc/*`.
 
 **Interfaces:** eight numeric inputs with the configured values and the spec defaults as hints; Rust's errors are shown as text; the degraded toggle shows the confinement state and, when on, the persistent caution text; all changes go through `settings_apply` (Rust confirms natively).
 
 **Spec:** §5.7 (Settings: limits, confinement status), §9.4, §10.3, PD-139, PD-141.
 
 - [ ] **Step 1: Failing tests:** vitest `script_limits_inputs_and_rust_errors`, `degraded_toggle_shows_persistent_warning`, `confinement_scripts_state_rendered`; Rust `settings_apply_script_limits_bounds_rejected_before_core`.
-- [ ] **Step 2: Implement.** **Step 3: Run** UI + app gates. **Step 4: Commit** `feat(app,ui): script limits and degraded confinement in Settings` (+ trailer).
+- [ ] **Step 2: Implement.** **Step 3: Run** UI + app gates; `node ci/check-commands.mjs`. **Step 4: Commit** `feat(app,ui): script limits and degraded confinement in Settings` (+ trailer).
 
 ---
 
@@ -1167,13 +1313,13 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Modify `app/ui/src/approvals/*` (the redaction panel pre-selects `Preview.preselect`; the Request tab shows the script's `target_display` and limits; nothing renders the source or logs outside the iframe except as text nodes), tests alongside.
+**Files:** Modify `app/ui/src/approvals/*` (the redaction panel pre-selects the preset that `Preview.preselect` names; the Request tab shows the script's `target_display` and limits; nothing renders the source or logs outside the iframe except as text nodes; Task 19c's follow-ups: index drops after earlier drops allowed again, and "drop the flagged items" offered for a mirror-blocked item), `app/ui/src/shared/ipc/{types.ts,validate.ts}` (`Preselect` as the closed tag `"error_class_only"`), tests alongside.
 
-**Interfaces:** consumes Δ5 through `preview_fetch`.
+**Interfaces:** consumes Δ5 through `preview_fetch` (the UI maps the tag to its own preset, the preview never sends a core preset type), and Task 19c's tree.
 
-**Spec:** §9.5 ("keep error class only" pre-selected), §5.6, §6.4, M6 handoff (preselect).
+**Spec:** §9.5 ("keep error class only" pre-selected), §5.3, §5.6, §6.4, M6 handoff (preselect), L217.
 
-- [ ] **Step 1: Failing tests:** `script_item_preset_preselected_from_preview`, `script_document_rendered_in_iframe_only`, `release_with_preset_sends_error_class_only`.
+- [ ] **Step 1: Failing tests:** `script_item_preset_preselected_from_preview`, `preselect_tag_validator_refuses_unknown_values`, `script_document_rendered_in_iframe_only`, `release_with_preset_sends_error_class_only`, `index_drop_after_earlier_drops_enabled`, `mirror_blocked_item_offers_drop_flagged_items`.
 - [ ] **Step 2: Implement.** **Step 3: Run** UI gates. **Step 4: Commit** `feat(ui): script release items in the Approvals window` (+ trailer).
 
 ---
@@ -1182,24 +1328,24 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Create `crates/sandbox-worker/tests/k_factor.rs`; Modify `crates/atlassian/src/testing/fixtures.rs` (a seeded generator of Jira `fields=*all` search pages: 50 custom fields per issue, nested objects, rendered fields, long descriptions; sizes 1, 4, 16 MiB), `app/src-tauri/tests/sandbox_runs.rs` (`i21_all_result_at_cap_within_default_heap`), `.github/workflows/ci.yml` (step "M8 k measurement": `--ignored` large sizes on the Linux leg).
+**Files:** Create `crates/sandbox-worker/tests/k_factor.rs`, `crates/sandbox-worker/tests/common/fixtures.rs` (a small seeded generator of Jira `fields=*all` search pages: 50 custom fields per issue, nested objects, rendered fields, long descriptions; text a seeded mix of ASCII, `äöü`, CJK and emoji in descriptions and comments; sizes 1, 4, 16 MiB). The generator lives in the worker's tests, not in `atlassian::testing`: a dev-dependency on `atlas-duck-atlassian` would pull the HTTP stack into the worker's test build. Modify `app/src-tauri/tests/sandbox_runs.rs` (`i21_all_result_at_cap_within_default_heap`), `.github/workflows/ci.yml` (step "M8 k measurement": `--ignored` large sizes on the Linux leg).
 
 **Interfaces:**
-- Measurement:
-  1. A fresh runtime with no limit.
-  2. `memory_usage().malloc_size` before.
-  3. `JSON.parse(text)` held in a global.
-  4. Run the GC; take the delta.
-  5. `k = delta / text.len()`.
-- Reported per fixture and size as `K fixture=<..> bytes=<..> heap_delta=<..> k=<..>`.
-- The max over the fixtures is the Jira candidate for `k`.
+- Measurement, through the real `deliver` path (PD-131: the whole host frame text is a QuickJS string while `JSON.parse` builds the tree, so both are live at the peak):
+  1. A fresh runtime with no limit (the counting wrapper of Task 3 without a limit, so the peak is observable).
+  2. `malloc_size` before.
+  3. `deliver(frame_text)` of a `host.call` response that carries the fixture as `HostCallResult`, the parsed value held by the script.
+  4. `k_peak` = (peak `malloc_size` during `deliver`, before any GC) − before, divided by the result's UTF-8 length.
+  5. Run the GC; `k_retained` = retained delta / length.
+- Reported per fixture and size as `K fixture=<..> bytes=<..> heap_peak=<..> k_peak=<..> k_retained=<..>`.
+- The max `k_peak` over the fixtures is the Jira candidate for `k` (invariant 1 uses `k_peak`, PD-140).
 - I-21: a real worker with the default limits runs `atlas.all` on a search whose concatenated result is just under 16 MiB (sink answers from the fixture) and completes. With `heap_mb = 8 × 16 = 128` (and a matching `process_mb`), the test records whether it completes (data for R13).
 
 **Spec:** §9.4 (`k`), §15 V16, §13 I-21, PD-140, R13.
 
-- [ ] **Step 1: Tests:** `k_jira_star_all_search_1_and_4_mib` (local, prints lines, asserts only `k > 1`), `k_jira_star_all_search_16_mib` (`#[ignore = "CI step M8 k measurement"]`), `k_records_line_format`; CI `i21_all_result_at_cap_within_default_heap`.
+- [ ] **Step 1: Tests:** `k_jira_star_all_search_1_and_4_mib` (local, 8 MiB thread, prints lines, asserts only `k_peak ≥ k_retained > 1`), `k_jira_star_all_search_16_mib` (`#[ignore = "CI step M8 k measurement"]`), `k_records_line_format`, `k_fixture_has_non_latin1_text`; CI `i21_all_result_at_cap_within_default_heap`.
 - [ ] **Step 2: Run** `cargo test -j 4 -p atlas-duck-sandbox-worker --locked --test k_factor -- --nocapture` (local, small sizes, record numbers); `--no-run` for `sandbox_runs`.
-- [ ] **Step 3: Commit** `test(sandbox-worker): heap expansion factor k on Jira *all searches (V16 Jira half)` (+ trailer). The report proposes the Jira `k` to the lead. The constant changes only in Task 33.
+- [ ] **Step 3: Commit** `test(sandbox-worker): heap expansion factor k on Jira *all searches (V16 Jira half)` (+ trailer). The lead pushes; the implementer records the run URL and the `K` lines. The report proposes the Jira `k` to the lead. The constant changes only in Task 33.
 
 ---
 
@@ -1207,7 +1353,7 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Create `app/src-tauri/tests/script_flows.rs` (`#![cfg(feature = "scripted-approver")]`; `#[path = "cli_flows/harness.rs"] pub mod harness;`; `#[path = "script_flows/flows.rs"] mod flows;`), `app/src-tauri/tests/script_flows/flows.rs`.
+**Files:** Create `app/src-tauri/tests/script_flows.rs` (`#![cfg(feature = "scripted-approver")]`; `#[path = "cli_flows/harness.rs"] pub mod harness;`; `#[path = "script_flows/flows.rs"] mod flows;`), `app/src-tauri/tests/script_flows/flows.rs`; Modify `.github/workflows/ci.yml` (step "M8 script_flows" on the four `rust` legs, `ATLAS_DUCK_CLI_FLOWS=1`, through `node ci/check-no-skips.mjs` with a minimum count, like Task 6's `sandbox_runs` step), `ci/check-no-skips.mjs` (label, if needed).
 
 **Interfaces:**
 - Consumes the `cli_flows` `World` (test home, file keystore, `MockDc`, CLI spawn, scripted approver directives `atlas-test:<directive>` in `--reason`) and `harness::opted_in(..)`.
@@ -1227,7 +1373,7 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
   - `s11_containment_corpus` (fs via `atlas`-less globals, network, `import`, an infinite loop, a memory bomb, deep recursion, a write op name, an error message carrying a data canary (only after release), a data-dependent limit (`pending`));
   - `i41_replaced_sandbox_binary_is_app_upgraded` (replace the copied worker; the next submit → exit 8 `sandbox_unavailable` `app_upgraded`, `retryable: true`; `app_status` shows `updated_restart`; never `protocol_violation`).
 - [ ] **Step 2: Compile only:** `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --test script_flows --no-run`. A plain run without `ATLAS_DUCK_CLI_FLOWS` prints `skipped:` lines (never set it).
-- [ ] **Step 3: Commit** `test(app): script_flows through the real binaries (CI)` (+ trailer).
+- [ ] **Step 3: Commit** `test(app): script_flows through the real binaries (CI)` (+ trailer). The lead pushes; the implementer records the run URL and the per-leg pass counts.
 
 ---
 
@@ -1243,7 +1389,8 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Spec:** §1.4 SC3 ("a 200-row script result"), §13 Performance, S-09 (Running scripts), X-11, master plan Placements "the 200-row-script SC3 scenario … land here".
 
-- [ ] **Step 1: Tests:** `p01_script_200_rows_preview_under_budget`; e2e `p01_script_first_screen_under_1s`, `s09_running_scripts_window_lists_live_run_and_kills` (a script that holds with a slow sink; the window lists it; kill → the item appears in Approvals), `x11_kill_from_window_becomes_release_item`.
+- [ ] **Step 1: Tests:** `p01_script_200_rows_preview_under_budget`; e2e `p01_script_first_screen_under_1s`, `s09_running_scripts_window_lists_live_run_and_kills` (a script that holds on a slow sink, i.e. a wiremock delay on its host call; the window lists it; the M6 S-09 helper asserts no CSP violation report for `<isolation-origin>` while the live run is listed and killed; kill → the item appears in Approvals), `x11_kill_from_window_becomes_release_item`.
+- [ ] **macOS checklist line** (WKWebView has no `tauri-driver`): Task 27 drafts "Running-scripts window lists a live run; Kill" for `docs/release/macos-gui-checklist.md`, beside the release-item line of Task 30 Step 3; the lead adds both on its go.
 - [ ] **Step 2: Run** `cargo test -j 4 -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test perf_sc3 -- --nocapture --test-threads=1` (debug, not enforced); `--test e2e --no-run`.
 - [ ] **Step 3: Commit** `perf,test: SC3 script scenario; e2e Running-scripts flows` (+ trailer).
 
@@ -1256,19 +1403,18 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 **Files:** Modify `.github/workflows/ci.yml`, `.github/workflows/e2e-bundle.yml` (a TEMPORARY `m8-*` push trigger, removed at merge, as M6 did), `.github/workflows/install-probes.yml`, `ci/appimage-smoke.sh` (M8 section), `ci/check-no-skips.mjs` (labels), `.gitlab-ci.yml` (comment: script flows are GitHub-only); Create `ci/script-matrix-step.sh`, `ci/script-matrix-step.ps1`.
 
 **Interfaces:**
-- `ci.yml`, on each `rust` leg (Windows, macOS arm64, Rosetta, Ubuntu):
-  - `sandbox_runs` and `script_flows` with `ATLAS_DUCK_CLI_FLOWS=1` + `check-no-skips` (minimum counts);
-  - `confined_scripts` (Task 5);
-  - the k step (Linux);
-  - evidence greps `V10 `, `V11 `, `V21 `, `K `.
-- `probe-evidence-fedora` runs `confined_scripts`; `core-suite-fedora` adds `scripts_all`.
+- `ci.yml`, on each `rust` leg (Windows, macOS arm64, Rosetta, Ubuntu): the `sandbox_runs` (Task 6), `script_flows` (Task 26), `confined_scripts` (Task 5) and k (Task 25) steps already exist. Task 28 raises the `check-no-skips` minimum counts to the final test counts and adds the evidence greps `V10 `, `V11 `, `V21 `, `K `.
+- CI-02 (M8): `probe-evidence-fedora` runs `confined_scripts`; `core-suite-fedora` adds `scripts_all`. `script_flows` is not added to the Fedora jobs (they run no app flow target; the Ubuntu `rust` leg is the Linux evidence); the CI-02 traceability row says so.
 - AppImage M8 section (debug scripted-approver AppImage, under the M6 section's `xvfb-run` + `dbus-run-session` + keyring):
   1. `script run` with `--timeout 0` through the wrapper;
   2. the CLI exits;
   3. the scripted approver releases (directive in `--reason`);
   4. `await` delivers `released`, exit 0;
   5. the app's executable is not under the CLI's mount.
-- `install-probes.yml`: each package job gains the CI-07 step script (PD-150, R6), committed and wired but `if: false` until M10 (the master plan runs it on packages in M10), with a dry self-test of the script syntax in CI.
+- CI-07 (PD-150, R6 option (a)), committed and wired but `if: false` until M10 (the master plan runs it on packages in M10), with a dry self-test of the script syntax in CI:
+  - `install-probes.yml`: each release package job gains a CI-07 step that asserts `floor=met failed=none` and that the installed worker answered in probe mode through the app's spawner (the `sandbox_probe` line the job already waits for). It runs no `script run`: a fresh release install is in the first-run state and has no serving core.
+  - `e2e-bundle.yml`: each debug scripted-approver bundle job gains the CI-07 script step: `script run --dry-run` (`succeeded`, exit 0) and a real run that is released by the scripted approver and delivered, with degraded confinement off.
+  - `ci/script-matrix-step.{sh,ps1}` takes the mode (`release` or `debug`) as an argument.
 
 **Spec:** §13 CI row (CI-02, CI-04 "one script run succeeds after the launching CLI has exited", "**Scripts-enabled matrix**"), master plan M8 exit criterion, PD-150, R6.
 
@@ -1282,24 +1428,26 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 **Model:** Haiku (xhigh). **Reviewer:** Sonnet (medium).
 
-**Files:** Create `docs/m8/script-sandbox-evidence.md` (PD-149).
+**Files:** Modify `docs/m8/script-sandbox-evidence.md` (PD-149; Task 33 created it with the final V16 section, which this task keeps).
 
 **Content:**
-- One section per §15 item (V02, V10, V11, V12, V15, V16 with the `K` table, V21): question, status (`partial` until a human signs, as in the M1 record), evidence lines and run URLs.
-- The Windows env deviation (five names ratified in §3.4, R5) and the TZ finding with the `Date` prelude that closes it (R4).
+- One section per §15 item (V02, V10, V11, V12, V15, V16 with the final `K` table that Task 33 wrote (Jira and Confluence fixtures, `k_peak` and `k_retained`, the fixed `k` and, if any, the R13 ruling), V21): question, status (`partial` until a human signs, as in the M1 record), evidence lines and run URLs.
+- The Windows env deviation (the spawner's block sets three names, `LOCALAPPDATA`, `SystemRoot`, `TZ`; the OS adds `TEMP`/`TMP`, so the worker observes five, ratified in §3.4, R5), the degraded path's observed env names (Task 11), and the TZ finding with the `Date` prelude that closes it (R4).
 - The `task_for_pid` caveat carried from M1 decision (b).
-- The clean-profile Windows image item (R11): the windows-2022 CI evidence, plus the manual clean Windows 10/11 run as a human checklist item in this file (steps: install the release package on a freshly created local user profile, record the probe report Settings shows (floor met, no failed probe) and the answer of one `script run --dry-run`; open until a human runs it).
+- The clean-profile Windows image item (R11): the windows-2022 CI evidence, plus the manual clean Windows 10/11 run as a human checklist item in this file (steps: install the release package on a freshly created local user profile, record the probe report Settings shows (floor met, no failed probe) and, after completing the first-run wizard by hand, the answer of one `script run --dry-run`; open until a human runs it).
 - A list of the M1 go/no-go "Open for later milestones" bullets M8 closes (watchdog; degraded path; job memory-limit test; I/O loop and `futures`; identity re-check; limits; classification), for the lead to strike in `docs/m1/go-no-go.md`.
 
 **Spec:** §15, PD-149.
 
-- [ ] **Step 1: Write** from the task reports and CI logs of Tasks 5, 8, 9, 10, 25, 26. **Step 2: Commit** `docs(m8): script sandbox evidence (V02 V10 V11 V12 V15 V16 V21)` (+ trailer).
+- [ ] **Step 1: Write** from the task reports and CI logs of Tasks 5, 6, 8, 9, 10, 11, 25, 26, 32 and 33 (it runs after Task 33, so the V16 table is final; Task 33 created the file's V16 section, and Task 29 keeps it). **Step 2: Commit** `docs(m8): script sandbox evidence (V02 V10 V11 V12 V15 V16 V21)` (+ trailer).
 
 ---
 
 ### Task 30: Exit-criterion run and evidence
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
+
+**Preconditions** (master-plan M8 exit criterion): Tasks 32–34 (and 35 if it applied) are merged; `k` is measured on the Jira and Confluence fixtures and fixed in the spec (Task 33; R13 ruled by the lead if `k > 16`); I-22 (incl. the context path), X-12 (incl. `conversion.lossy`) and I-37 (incl. the Confluence half) have their tests.
 
 - [ ] **Step 1: Locally on Windows:**
 
@@ -1321,8 +1469,8 @@ npm --prefix app/ui run lint && npm --prefix app/ui test && npm --prefix app/ui 
 
 Expected: every command exits 0. No spawning target is run. `cargo test --workspace` is **not** run locally: it would execute the spawning targets.
 
-- [ ] **Step 2: CI** on GitHub (GitLab for the non-GUI jobs): `rust` (four legs) incl. `sandbox_runs`, `script_flows`, `confined_scripts`, `cli_flows`, `jira_flows`, `confluence_flows`, with no skips; `probe-evidence-fedora`; `core-suite-fedora`; `supply-chain`; `ui`; `bundle`; `e2e-bundle` incl. the AppImage M8 section; `e2e`; and **`install-probes`** (all seven package jobs `floor=met failed=none`, the per-package half of the exit criterion). `install-probes` fires through `workflow_run` from the default branch's copy of the workflow and cross-checks `bundle_run_id`/`bundle_sha` (M1 T21), so on the M8 branch the lead triggers it with `workflow_dispatch` against the M8 `bundle` run. Record the run URLs, the commit SHA and the V/K evidence lines in the task report and in `.superpowers/sdd/<m8 plan>/progress.md`.
-- [ ] **Step 3: Human items for the lead:** sign the evidence file (it stays `partial` until then); the macOS GUI checklist gains "a script release item shows source, host calls, logs" (Task 29 adds the line to `docs/release/macos-gui-checklist.md` only on the lead's go); the manual clean-profile Windows run (R11).
+- [ ] **Step 2: CI** on GitHub (GitLab for the non-GUI jobs): `rust` (four legs) incl. `sandbox_runs`, `script_flows` (with Task 32's `confluence_page_get_in_script_real_worker`), `confined_scripts`, `cli_flows`, `jira_flows`, `confluence_flows`, with no skips; the core suite incl. `scripts_all` with Task 34's Confluence cases; `probe-evidence-fedora`; `core-suite-fedora`; `supply-chain`; `ui`; `bundle`; `e2e-bundle` incl. the AppImage M8 section; `e2e`; and **`install-probes`** (all seven package jobs `floor=met failed=none`, the per-package half of the exit criterion). `install-probes` fires through `workflow_run` from the default branch's copy of the workflow and cross-checks `bundle_run_id`/`bundle_sha` (M1 T21), so on the M8 branch the lead triggers it with `workflow_dispatch` against the M8 `bundle` run. Record the run URLs, the commit SHA and the V/K evidence lines in the task report and in `.superpowers/sdd/<m8 plan>/progress.md`.
+- [ ] **Step 3: Human items for the lead:** sign the evidence file (it stays `partial` until then); the macOS GUI checklist gains "a script release item shows source, host calls, logs" and Task 27's "Running-scripts window lists a live run; Kill" (added to `docs/release/macos-gui-checklist.md` only on the lead's go); the manual clean-profile Windows run (R11).
 - [ ] **Step 4:** Ask the lead to update the master plan M8 `Status:` after the final review and to apply the ledger entries.
 
 ---
@@ -1338,7 +1486,9 @@ Expected: every command exits 0. No spawning target is run. `cargo test --worksp
 - Opacity of every envelope path (no queued, slot, size, timing or error-class fact before a decision).
 - The kill path end to end (no lock across a blocking call; no bare-pid signal after reap).
 - The channel state machine against §3.4 line by line.
-- The degraded toggle's authority and confirmation.
+- The degraded toggle's authority and confirmation, and that the policy is read at each spawn (PD-141).
+- The global allocator placement (only the worker bin and test binaries declare `ExitOnOomAlloc`) and the heap-limit discipline after a refused allocation (PD-134).
+- The redaction engine path check and the M-11 tree (Task 19c) against §5.3.
 - Every fixed string verbatim with its doc comment.
 - No worker byte in the diagnostic log.
 - The traceability table (every row's tests exist, are not vacuous, and the CI-only ones ran with no skips).
@@ -1356,35 +1506,50 @@ All cargo work is sequential: one cargo process at a time. A task marked "parall
 T1 ─► T2 ─► T3 ─► T4 ─► T5 (CI-only; commit, verified on the next push)
 T2 ─► T6 ─► T7 ─► T8
 T6,T7 ─► T9 ─► T10 ─► T11
-T4,T7 ─► T12 ─► T13 ─► T14 ─► T15 ─► T16 ─► T17 ─► T18 ─► T19
+T4,T7 ─► T12 ─► T13 ─► T14 ─► T15 ─► T16 ─► T17 ─► T18 ─► T19a ─► T19b ─► T19c
 T9,T10,T11,T12,T15 ─► T20 ─► T21
-T16,T20 ─► T22;  T14,T15,T21 ─► T23;  T17,T18 ─► T24
+T16,T20 ─► T22;  T14,T15,T21 ─► T23;  T17,T18,T19c ─► T24
 T4,T7,T13 ─► T25
-T20,T21 ─► T26 ─► T27 ─► T28
-T5,T8,T9,T10,T25,T26 ─► T29 (docs; no cargo; parallel-safe)
-all ─► T30 ─► T31
-M7-dependent tail: T32..T35 after M7 has merged and T20/T26 exist (reconcile first)
+T20,T21 ─► T26;  T22,T24,T26 ─► T27 ─► T28
+T25,T26 ─► T32 ─► T33 ─► T34 (─► T35 only if A7 fails)
+T5,T6,T8,T9,T10,T11,T25,T26,T32,T33 ─► T29 (docs; no cargo; parallel-safe)
+all (T1–T28, T32–T34/T35, T29) ─► T30 ─► T31
 ```
 
-No task waits for a lead answer. R13 (`k` above 16) is ruled by the lead when Task 33 has recorded the measured `k` and the three options.
+The M7-dependent tasks are not a deferred tail: execution starts only after M7 has merged, so Tasks 32–35 run before the evidence file, the exit run and the final review. R13 (`k` above 16) is ruled by the lead when Task 33 has recorded the measured `k` and the three options, and before Task 30 starts. Task 33's V16 table is the one Task 29 writes into the evidence file. CI evidence of Tasks 6, 8, 9, 10, 11 and 25 exists from their own pushes (plan review I-14), not only after Task 28.
+
+**Execution order** (task numbers are stable labels; this is the order the lead dispatches them in):
+
+| # | Task | Note |
+|---|---|---|
+| 1–5 | T1, T2, T3, T4, T5 | Phase A |
+| 6–11 | T6, T7, T8, T9, T10, T11 | Phase B |
+| 12–21 | T12, T13, T14, T15, T16, T17, T18, T19a, T19b, T19c | Phase C |
+| 22–26 | T20, T21, T22, T23, T24 | Phase D |
+| 27–30 | T25, T26, T27, T28 | Phase E |
+| 31–34 | T32, T33, T34, (T35) | Phase F, M7-dependent; R13 ruled here if `k > 16` |
+| 35–37 | T29, T30, T31 | Phase G: evidence, exit run, final review |
+
+No task waits for a lead answer, except Task 33's Step 3 when `k > 16` (R13).
 
 ---
 
 ## Self-review checklist (run before handing the plan to implementers)
 
 - **Traceability:** every row of the Traceability table names a task that lists that test in its Step 1.
-  - U-03 T19/T26; U-29 T19; I-07 T19/T26; I-10 T19/T26; I-13 T19/T26; I-14 T19/T26; I-21 T13/T25; I-22 T13 (+T34); I-23 T19; I-37 T14/T19 (+T32); I-41 T10/T12/T26.
+  - U-03 T19b/T26; U-29 T19b; I-07 T19a/T26; I-10 T19a/T26; I-13 T19a/T26; I-14 T19a/T26; I-21 T13/T25; I-22 T13 (+T34); I-23 T19b; I-37 T14/T19b (+T32); I-41 T10/T12/T26.
   - S-05 T21; S-09 T22/T27; S-10 T7/T8; S-11 T3/T5/T26; P-01 T27.
-  - X-04 T19; X-11 T16/T22/T27; X-12 T17 (+T32).
-  - CI-02/CI-04/CI-07 T5/T28; the per-package probe line of the exit criterion T28/T30; V-items T3/T5/T8/T9/T10/T25.
-  - M3 M-1 T6/T19/T20; M-13 T17; T30 M-2/M-3 T16/T22; T27 rulings T13/T19; L134 T21; PD-148 T7/T20.
+  - X-04 T19b; X-11 T16/T22/T27; X-12 T17 (+T32).
+  - CI-02/CI-04/CI-07 T5/T28; the per-package probe line of the exit criterion T28/T30; V-items T3/T5/T6/T8/T9/T10/T25/T33.
+  - M3 M-1 T6/T19a/T20; M-13 T17; T30 M-2/M-3 T16/T22; T27 rulings T13/T19b; L134 T21; L217 T19c (+T24); PD-148 T7/T20.
 - **No forward dependencies:** no task depends on a later task's code, except:
   - Task 12 reads the degraded policy from a getter that returns `false` until Task 15;
-  - Task 17 reuses M7's `generic::list_table` (M7 PD-114; if M7 named it differently, the reconciling lead updates Task 17's text).
+  - Task 17 reuses M7's `generic::list_table` (M7 PD-114; if M7 named it differently, the reconciling lead updates Task 17's text);
+  - Task 29 (evidence) runs after Tasks 32 and 33 by the execution order (its label is lower).
 - **Before Task 1:** Δ1–Δ8 are applied to the master plan.
 - **Ledger before merge:** the ledger entries are recorded before the tasks that implement them merge.
-  - T2: L165. T4: L166. T9: L167. T10/T12: L168. T13: L169. T14: L170. T15: L171. T16: L172. T17: L173, L174. T21: L175. T28: L176. T32: L182.
-- **Models:** security-critical or complicated tasks run on Opus with Opus reviewers: T3, T4, T6, T7, T9, T11, T12, T13, T15, T18, T20 (+ T31). Haiku only for T29.
+  - T2: L165. T4: L166. T9: L167. T10/T12: L168. T13: L169. T14: L170. T15: L171. T16: L172. T17: L173, L174. T21: L175. T28: L176. T32: L182. T33: L180.
+- **Models:** security-critical or complicated tasks run on Opus with Opus reviewers: T3, T4, T6, T7, T9, T11, T12, T13, T15, T18, T19c, T20, T32, T35 (+ T31). Task 17 is Sonnet with an Opus reviewer. Haiku only for T29.
 - **Execution limits:** nothing asks an implementer to:
   - download or install anything, or change an ACL or the registry;
   - kill a process or write outside the repo/scratchpad;
@@ -1399,17 +1564,20 @@ No task waits for a lead answer. R13 (`k` above 16) is ruled by the lead when Ta
 ## Handoffs (to later milestones)
 
 - **M9:** `script_run {dry_run}` over the same `script.submit`. The MCP restart case of I-41 (`atlas-duck mcp` survives an app restart with a different `build_id` and re-handshakes). Tool descriptions carry the effective `script_limits` from `ops describe`.
-  - M9 Task 23's assumptions hold against this plan: dry runs answer from the examples with `meta.dry_run: true` (exit 0, or exit 8 with `script_error`, L14); real runs end in a release item; a released script error is `released` with `data.script_error`, exit 8; a client cancel of a `Running` script gives the identical `cancelled {by_client}` envelope (L19, Task 19); a replaced sandbox binary gives `failed`/`sandbox_unavailable` `{reason: app_upgraded}`, exit 8, `retryable: true` (L168, Task 10).
+  - M9 Task 23's assumptions hold against this plan: dry runs answer from the examples with `meta.dry_run: true` (exit 0, or exit 8 with `script_error`, L14); real runs end in a release item; a released script error is `released` with `data.script_error`, exit 8; a client cancel of a `Running` script gives the identical `cancelled {by_client}` envelope (L19, Task 19a); a replaced sandbox binary gives `failed`/`sandbox_unavailable` `{reason: app_upgraded}`, exit 8, `retryable: true` (L168, Task 10).
   - M9 can reuse the I-41 replacement path of Task 26 (`WorldOpts::copy_install`: the flow app runs from a copied install dir, so the test replaces the copied worker) instead of citing the M8 test only.
+  - M9 answers "tool descriptions carry the effective `script_limits`" with PD-120 (Task 5), not with effective values: `tools/list` never connects, so the `script_run` description states the `ScriptLimits::default()` values and points to `ops_describe` with an `instance` for the effective limits.
   - M9 Q6 (the CLI sends its global `--instance` with `script run`, while §4.4 says a script's `instance_id` is null) is not changed by M8; the lead's ruling on M9 Q6 applies to both front ends.
-- **M10:**
-  - CI-07 run on every shipped package: flip the `install-probes.yml` step on (shape per R6).
-  - The §12.4 script API reference with the effective limits, `atlas.all` shape and rejections, and UTC on every OS (the R4 `Date` prelude).
+- **M10** (each item with the M8 id it rests on, so citations stay stable):
+  - CI-07 run on every shipped package (PD-150, R6 option (a), L176): flip the `install-probes.yml` release-package step and the `e2e-bundle.yml` debug-bundle step on. On a release package the step proves `floor=met failed=none` and the probe-mode worker through the app's spawner; it runs no `script run` (a fresh install is in the first-run state). The dry run and the released real run are on the debug scripted-approver bundles of the same commit.
+  - The §12.4 script API reference with the effective limits, `atlas.all` shape and rejections (PD-144), `atlas.ops()`/`atlas.instances()` (PD-152), and UTC on every OS (the `Date` prelude, PD-151, R4).
   - The canary sweep over sandbox frames (the bridge's frames are capturable through the `HostCallSink` adapter; add a capture channel then).
   - S-04 re-run.
-  - macOS `task_for_pid` with a signed hardened build (M1 decision (b)).
+  - macOS `task_for_pid` with a signed hardened build (M1 decision (b)), recorded in the evidence file (PD-149).
   - The clean-profile Windows image re-check, if the R11 manual run is still open.
-- **From the M6 final review (L217; not yet in a task):** the engine-side redaction path check (`existed = original || current doc`, index drops after earlier drops) and the M-11 mirror "drop flagged items", which has no Structured tree. The lead places them in a task when M8 is executed.
+  - `verify-export` reads `PRUNE` settings snapshots that may carry the optional `allow_degraded_scripts` key (Δ7, PD-141, L171).
+  - Package upgrade under a running app: `sandbox_unavailable {app_upgraded}`, `retryable: true` (PD-133, L168); the degraded-confinement setting for the user docs (PD-141).
+- **From the M6 final review (L217):** the engine-side redaction path check and the M-11 mirror "drop flagged items" tree are Task 19c (core) and Task 24 (UI).
 - **Live (human):** sign `docs/m8/script-sandbox-evidence.md`. Re-run the macOS profile probes per new macOS major (V10).
 
 ---
@@ -1418,21 +1586,21 @@ No task waits for a lead answer. R13 (`k` above 16) is ruled by the lead when Ta
 
 - **L165** (Δ1, PD-132, §3.4, §9.1 step 3) Script protocol names (`script.run`, `script.compile`, `script.compiled`, `script.syntax`, `host.call` as a request, `host.log`, `script.result`, `script.error`), `probe.ready` as the ready frame in every mode, `WorkerInit.instances` (R9).
 - **L166** (PD-131, §9.3, §15 V15) The worker loop is single-threaded and blocking, with no `futures`; host results are parsed once inside QuickJS; an unsettlable script ends `ScriptStalled` (runtime, gated).
-- **L167** (PD-134, PD-135, §9.4, §9.5) Host-measured limit attribution: timer, Windows job memory message, macOS watchdog, worker exit codes `EXIT_HEAP_LIMIT`/`EXIT_PROCESS_LIMIT` (trusted only for the direct decision of a run the host saw as neither queued nor dispatched); SIGSYS and any other signal death = crash (release item); the worker's deadline is a +2 s backstop; `elapsed` is host-measured; no Linux watchdog and no seccomp allowlist change (R3).
-- **L168** (PD-133, §3.4, §4.3) Identity re-check: file identity at submit and before every spawn; embedded version from the per-run ready frame before any source is sent; `sandbox_unavailable {app_upgraded}`, `retryable: true`; `updated_restart` until restart.
+- **L167** (PD-134, PD-135, §9.4, §9.5) Host-measured limit attribution: timer, Windows job memory message, macOS watchdog, worker exit codes `EXIT_HEAP_LIMIT`/`EXIT_PROCESS_LIMIT` (trusted only for the direct decision of a run the host saw as neither queued nor dispatched); SIGSYS and any other signal death = crash (release item); the worker's deadline is a +2 s backstop; `elapsed` is host-measured; no Linux watchdog and no seccomp allowlist change (R3). Deviations from §9.3's wording (spec amendment): `heap_mb` is enforced by the QuickJS allocator wrapper, not by `set_memory_limit` (QuickJS-NG checks its own limit before a custom allocator is called, so the wrapper would never see the refusal); a refused allocation ends the run `EXIT_HEAP_LIMIT` with nothing more sent, even if the script catches the error; the interrupt handler checks no cancel flag (cancel, kill and shutdown kill the process). `ExitOnOomAlloc` is declared only in the worker binary; it exits with `_exit`/`ExitProcess`, never `std::process::exit`. Compile and ready-frame deadlines (10 s; compile `min(10 s, timeout_s)`) end as `Timeout` (direct `script_limit`) and `Spawn(TimedOut)`.
+- **L168** (PD-133, §3.4, §4.3; spec amendment) Identity re-check: file identity at submit and before every spawn; embedded version from the per-run ready frame before any source is sent; `sandbox_unavailable {app_upgraded}`, `retryable: true`; `updated_restart` until restart. §3.4 says the host "re-checks both at submit"; M8 checks only the file identity at submit and the embedded version per spawn from the ready frame (R12). New §3.4 sentence: "At submit the host compares the file identity; the embedded version is compared from each spawned worker's ready frame before any source is sent." A spawn-time unavailability of a run that was neither queued nor dispatched is direct `sandbox_unavailable` (never `script_limit`).
 - **L169** (PD-144, §9.2) `atlas.all` page order of checks, per-page `SCRIPT_CALL {page}`, totals from the last page, other keys from the first.
-- **L170** (PD-139, PD-140, §9.4, §10.3) `[scripts]` defaults, bounds, raises confirmed natively, file edits at the next start; provisional `k = 8` until V16 is closed (Task 33 amends §9.4).
-- **L171** (PD-141, §9.4, §10.3) Degraded toggle is audit-authoritative (R2: additive settings key, absent = off, on only after the native confirmation), with confirmation text and the `scripts_degraded` status line.
+- **L170** (PD-139, PD-140, §9.4, §10.3) `[scripts]` defaults, bounds, raises confirmed natively, file edits at the next start; provisional `k = 8` until V16 is closed (Task 33 amends §9.4). Bound sources: `max_call_result_mb` ≤ 16 because §3.4 caps host→worker frames at 24 MiB and invariant 2's `+ 24 MiB` term depends on it; `max_result_mb` ≤ 16 = `registry::RELEASE_CAP_BYTES` (§2.3/§5.2); `max_concurrent_calls` 1–16; the other five ≤ 4 × the spec default (plan bound). `k` is the peak factor during `deliver` (frame string plus parse tree).
+- **L171** (PD-141, §9.4, §10.3) Degraded toggle is audit-authoritative (R2: additive settings key, absent = off, on only after the native confirmation), with confirmation text and the `scripts_degraded` status line. `Settings::from_json` accepts the four required keys plus the optional one; `to_json` emits it only when `true`; the key is a policy key (no caller-appended `CONFIG_CHANGED` with it) and its `CONFIG_CHANGED` writes the immediate anchor-dir line; M10 `verify-export` must accept it.
 - **L172** (PD-142, PD-143, §9.6) Running-list fields, `started_at` = slot time, kill answer texts.
-- **L173** (PD-145, PD-146, §6.3) Script preview: provenance from agent params in memory, logs/stderr of results read from `SCRIPT_FINISHED`, table/tree rule, `render5`; logs and stderr are approver-only and never released with a result (R7).
+- **L173** (PD-145, PD-146, §6.3; spec amendment §9.5) Script preview: provenance from the host-call request params in memory (never from responses), logs/stderr of results read from `SCRIPT_FINISHED`, table/tree rule, the render part after the merged M7's (planned `render5`), `Preview.preselect` as the preview-local `Preselect::ErrorClassOnly` tag; logs and stderr are approver-only and never released with a result (R7). §9.5 says logs and stderr "never reach the agent unless the user includes them in a release"; R7 forbids including them with a result, a safe-direction narrowing recorded as a §9.5 amendment.
 - **L174** (M5 M-13, §5.3, §6.2) The documented residual (script candidates skip the mirror check) plus the Caution `script_rendered_copies` when the run made a host call with `renderedFields` (R8, §6.2 amendment).
-- **L175** (PD-138, §8.3, §9.4) Probe consumption: one probe per start, awaited by the first script (≤ 60 s) (R10); a ≤ 5 s bounded wait before `APP_START`, else `confinement: {state: "pending"}` (R1); `SCRIPT_STARTED.confinement`.
-- **L176** (PD-150, §13 CI-07) The CI-07 shape: dry run on the release package, released real run on the debug scripted-approver bundles (R6).
-- **L177** (PD-136, PD-152, PD-151) `ResultTooLarge` from the worker; `atlas.ops()`/`atlas.instances()` sources; the `Date` prelude on every OS (R4).
+- **L175** (PD-138, PD-141, §8.3, §9.4) Probe consumption: one probe per start, awaited by the first script (≤ 60 s, counted toward the agent's `--timeout`) (R10); a ≤ 5 s bounded wait before `APP_START`, measured from the probe's start so it overlaps `audit::open` and verification, else `confinement: {state: "pending"}` (R1); `SCRIPT_STARTED.confinement` with the worker's actual report. Degraded mode: every layer the worker can apply is applied; on Linux/macOS it only means accepting `applied: false`; the toggle covers only a probe-time `NotMet` (an unconfined ready frame under a `Met` report is `FloorNotMet`); the policy is read at each spawn, never captured at submit. Windows degraded token: the worker calls `RevertToSelf()` after loading its DLLs and before reading stdin.
+- **L176** (PD-150, §13 CI-07) The CI-07 shape (R6 re-ruled, option (a)): the release package proves `floor=met failed=none` and the installed worker answering in probe mode through the app's spawner (a fresh release install is in the first-run state and serves no core, so no `script run` there); the debug scripted-approver bundle of the same commit proves `script run --dry-run` and a released real run.
+- **L177** (PD-136, PD-152, PD-151) `ResultTooLarge` from the worker; `atlas.ops()`/`atlas.instances()` sources; the `Date` prelude on every OS (R4), covering getters/setters incl. `getYear`/`setYear`, the component constructor, `Date.parse`/`new Date(string)` without an offset, `toString`/`toDateString`/`toTimeString`/`toLocale*`, `Date()` as a function, with constructor identity kept.
 - **L178** (PD-147) T27 rulings 4 and 9 kept; M3 M-1 closed (core half landed, runner half by PD-137).
 - **L179** (PD-148, L101) The runner half of L101 is closed in M8; the re-check half is closed in M7 (L151, M7 lead ruling Q8).
-- **L180** (§15 V16) The measured `k` and, if the lead's R13 ruling needs it, new defaults (after Task 33).
-- **L181** (R5, M1 go/no-go) The Windows worker environment `LOCALAPPDATA`, `SystemRoot`, `TEMP`, `TMP`, `TZ` ratified in §3.4 (spec amendment).
+- **L180** (§15 V16) The measured `k` (`k_peak`) and, if the lead's R13 ruling needs it, new defaults (after Task 33). Spec gap: with `max_concurrent_calls = 4`, up to four call results can be live at once; invariant 1 covers one.
+- **L181** (R5, M1 go/no-go) The Windows worker environment ratified in §3.4 (spec amendment), worded exactly: the spawner's environment block sets `LOCALAPPDATA`, `SystemRoot` and `TZ`; Windows adds `TEMP` and `TMP` for the AppContainer, so the worker observes those five (`WORKER_ENV_OBSERVED`). The degraded path's observed set is recorded separately (Task 11).
 - **L182** (R15, M7 PD-93 handoff, §7.2, §8.3 `SCRIPT_CALL`) Confluence script host calls end with one `GET /rest/api/user/current` per host call under the run's request cover, after the call's pages and user lookups, recorded `PREVIEW_FETCH {purpose: identity}` before the call's `SCRIPT_CALL`; a non-match rejects the host call inside the script (`needs_token` after a failed `token_recheck`, else `upstream_unavailable`) and the body stays audit-only (Task 32).
 
 ---
@@ -1443,9 +1611,9 @@ PD-131 (loop, `futures`), PD-132 (protocol names, modes), PD-133 (identity mecha
 
 ---
 
-## M7-dependent tasks (reconcile when M7 has merged)
+## M7-dependent tasks
 
-These tasks need code that M7 builds. **Assumptions** (taken from the M7 plan `2026-10-16-atlas-duck-m07-confluence-adapter.md` as committed in `a1233dd` with the lead's rulings; re-check against what merged):
+These tasks need code that M7 builds. M7 has merged before M8 starts, so they are not deferred: they run after Task 28 and before Tasks 29–31 ("Execution order and dependencies"), and the lead reconciles the assumptions below against the merged M7 before Task 32. **Assumptions** (taken from the M7 plan `2026-10-16-atlas-duck-m07-confluence-adapter.md` as committed in `a1233dd` with the lead's rulings; re-check against what merged):
 
 - **A1:** M7 Task 10 gives `confluence.page.get`/`page.history` a `ReadShape::ConfluenceBody { format, historical }` with storage→Markdown conversion, and a `ReadView.conversion` / `meta.conversion = {lossy, lost}` produced by the shared read path (`read::run_plan`/`classify_read`/`result_value`), so a script host call of that shape sees the same normalization.
 - **A2:** M7 Task 11 already runs user resolution on the script host-call path and commits `user_resolutions` in `SCRIPT_CALL` (tested with the fake runner: `scripts.rs::script_host_call_commits_user_resolutions`), with `PREVIEW_FETCH {purpose: resolve}` under the run's request id.
@@ -1476,16 +1644,16 @@ If an assumption does not hold, the task stops at Step 1 and reports which one f
   - `confluence_host_call_identity_step_per_call` (anonymous `user/current` → in-script `needs_token` after the re-check; body only in `SCRIPT_CALL`);
   - `i37_script_confluence_markdown_candidate_rebuilds_from_committed_map` (a script returning the converted page; evict; rebuild → same hash, no mock hit);
   - flow `confluence_page_get_in_script_real_worker` (CI).
-- [ ] **Step 2: Implement.** **Step 3: Run** core `--test scripts`; `--test script_flows --no-run`. **Step 4: Commit** `feat(core): Confluence host calls: identity step, lossy count and rebuild (X-12, I-37, RF-5a)` (+ trailer).
+- [ ] **Step 2: Implement.** **Step 3: Run** core `--test scripts`; `--test script_flows --no-run`. **Step 4: Commit** `feat(core): Confluence host calls: identity step, lossy count and rebuild (X-12, I-37, RF-5a)` (+ trailer). The lead pushes; the implementer records the run URL and the `confluence_page_get_in_script_real_worker` result per leg.
 
 ### Task 33: `k` on Confluence storage bodies; the final `k` (V16 closure)
 
 **Model:** Sonnet (medium). **Reviewer:** Sonnet (medium).
 
-**Files:** Modify `crates/sandbox-worker/tests/k_factor.rs` (Confluence fixtures per A4: the 5,000-word page as `page.get` JSON with `body.storage.value`, a page list of 25 such pages, the Markdown form after conversion), `crates/core/src/validate/mod.rs` (`SCRIPT_HEAP_K` = the measured value, after the lead's spec amendment), `docs/m8/script-sandbox-evidence.md` (the V16 table).
+**Files:** Modify `crates/sandbox-worker/tests/k_factor.rs`, `crates/sandbox-worker/tests/common/fixtures.rs` (a seeded Confluence-shaped generator modelled on A4's fixture: a ~5,000-word page as `page.get` JSON with `body.storage.value`, a page list of 25 such pages, the Markdown form after conversion, with non-Latin-1 text; kept in the worker's tests for the same reason as Task 25's, no dev-dependency on `atlas-duck-atlassian`), `crates/core/src/validate/mod.rs` (`SCRIPT_HEAP_K` = the measured value, after the lead's spec amendment), Create `docs/m8/script-sandbox-evidence.md` with its V16 section only (the V16 table; Task 29 writes the rest of the file around it).
 
 **Interfaces:**
-- `k = max` over the Jira (Task 25) and Confluence fixtures, rounded up to an integer.
+- `k = max k_peak` over the Jira (Task 25) and Confluence fixtures, rounded up to an integer (PD-140).
 - If `k ≤ 16`, the spec defaults (`heap_mb` 256, `max_call_result_mb` 16) satisfy invariant 1 and only the constant changes.
 - If `k > 16`, the defaults violate invariant 1. The task records three options in the evidence file's V16 section, each with its numbers (the new defaults, the worst-case memory of two concurrent runs, and whether Task 25's I-21 run at those values completes):
   - (a) raise the `heap_mb` default (and `process_mb` with it) to at least `k × 16` MiB, keeping `max_call_result_mb` 16;
@@ -1498,7 +1666,7 @@ If an assumption does not hold, the task stops at Step 1 and reports which one f
 - [ ] **Step 1:** Tests `k_confluence_storage_body_1_and_4_mib` (local), `k_confluence_storage_body_16_mib` (`#[ignore]`, CI), `heap_k_constant_matches_evidence` (the constant equals the value recorded in the evidence file's V16 table).
 - [ ] **Step 2: Run** locally (small sizes); take the 16 MiB values from CI. Write the V16 table and, if `k > 16`, the three options with their numbers.
 - [ ] **Step 3: Stop for the lead** if `k > 16`: report the options and wait for the R13 ruling and the spec edit. Otherwise continue.
-- [ ] **Step 4: Commit** `feat(core): k fixed from Jira and Confluence measurements (V16)` (+ trailer).
+- [ ] **Step 4: Commit** `feat(core): k fixed from Jira and Confluence measurements (V16)` (+ trailer). The lead pushes; the implementer records the run URL and the 16 MiB `K` lines. Task 30 does not start before this commit and, if `k > 16`, the R13 ruling.
 
 ### Task 34: I-22 Confluence half: `atlas.all` under a context path
 
@@ -1534,14 +1702,14 @@ The lead ruled on the sixteen plan questions on 2026-10-16. The PDs, tasks and l
 3. **Linux OOM and process-limit attribution:** the PD-134 exit-code design (global allocator → `EXIT_PROCESS_LIMIT`, QuickJS allocator → `EXIT_HEAP_LIMIT`); any SIGSYS is `Crashed` (release item). No Linux statm watchdog, no seccomp allowlist change. PD-134, Tasks 5/9, L167.
 4. **Windows local time:** the `Date` prelude maps the local-time surface to UTC on every OS; no spec exception. PD-151, Task 3, L177.
 5. **Windows worker environment:** the five names `LOCALAPPDATA`, `SystemRoot`, `TEMP`, `TMP`, `TZ` are ratified in §3.4 (spec amendment). S-10's env test asserts them. Task 8, L181.
-6. **CI-07:** the release package proves the floor and runs `script run --dry-run` (succeeded, exit 0, confined real worker); the debug scripted-approver bundles (`e2e-bundle.yml`) prove a released real run. PD-150, Task 28, L176.
+6. **CI-07** (re-ruled after the plan review, I-12, option (a)): the release package proves the floor (`floor=met failed=none`) and runs the installed worker in probe mode through the app's spawner; it runs no `script run`, because a fresh release install is in the first-run state and serves no core until the wizard's `GENESIS` (release builds have no headless setup path). The debug scripted-approver bundle from the same commit (`e2e-bundle.yml`) proves `script run --dry-run` (succeeded, exit 0, confined real worker) and a released real run. The earlier text ("the release package runs `script run --dry-run`") is withdrawn. PD-150, Task 28, L176; M10 D1.
 7. **Logs and stderr:** shown to the approver only, never released with a result. Error-details items keep logs and stderr in `script_error` (redactable). PD-146, Tasks 17/24, L173.
 8. **M5 M-13:** the documented residual (script candidates skip the §5.3 mirror check) plus the new Caution `script_rendered_copies` when the run made a host call with `renderedFields` (a §6.2 amendment). Task 17, L174.
 9. **`atlas.instances()` source:** an additive `instances` field in the init frame (aliases, product, default flag; never URLs). Δ1, PD-152, Task 2, L165.
 10. **"Before the first script":** one probe per start, awaited by the first script (≤ 60 s). PD-138, Task 20, L175.
 11. **Clean-profile Windows image:** windows-2022 CI evidence, plus a manual run on a clean Windows 10/11 profile listed as a human item in the evidence file. Tasks 29/30.
 12. **Embedded-version check per run:** the version is checked from the spawned worker's ready frame before any source is sent; only the file identity is checked at submit and before every spawn. PD-133, Task 10, L168.
-13. **`k` above 16:** decided when `k` is measured. Task 33 records the three options (raise `heap_mb`/`process_mb`; lower `max_call_result_mb`; a mix) with their numbers, and the lead rules then. PD-140, Task 33, L180.
-14. **`keychain_prompt` (L78, listed under M8 by L134):** Task 21 wires it. Task 21.
+13. **`k` above 16:** decided when `k` is measured. Task 33 records the three options (raise `heap_mb`/`process_mb`; lower `max_call_result_mb`; a mix) with their numbers, and the lead rules then, before the exit run (Task 30). PD-140, Task 33, L180.
+14. **`keychain_prompt` (L78, listed under M8 by L134):** closed before M8. It is already wired on the base (`status.rs:278`, `serve.rs` `KEYCHAIN_PROMPT_AFTER`, commit `8fc44a9`, with tests); Task 21 does not touch it. Only `update_pending` stays with Task 21.
 15. **RF-5a for Confluence host calls:** once per host call, the same rule as M7 Q1 = A (PD-93). Task 32, L182.
 16. **Numbering:** the global allocation. This plan uses PD-131..PD-152 and L165–L182 inside M8's PD-131..155 and L165–L184.

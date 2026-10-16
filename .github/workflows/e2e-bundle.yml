@@ -1,26 +1,28 @@
 name: e2e-bundle
 
-# M6 plan Task 33: the packaged-app GUI runs that need tauri-driver (CI-03 Fedora no-tray-host,
-# CI-04 AppImage M6 steps). They run against a DEBUG `scripted-approver` Linux bundle, built here and
-# not in bundle.yml: a release build scrubs the WebDriver variables from its environment (§2.5, spec
-# §13 S-04) and tauri-driver cannot drive it, and bundle.yml builds shipped artifacts only (its
-# ci/check-release-build.sh refuses --debug, --features and scripted-approver in any
-# `cargo tauri build` line of that file). Nothing built here is ever shipped or uploaded as a
-# bundle-<target> artifact.
+# M6 plan Task 33: the packaged-app GUI runs (CI-03 Fedora no-tray-host, CI-04 AppImage M6 steps).
+# They run against a DEBUG `scripted-approver` Linux bundle, built here and not in bundle.yml: that
+# build takes its base folders from ATLAS_DUCK_TEST_HOME (PD-01), so the runs never touch the runner's
+# own pinned files, and bundle.yml builds shipped artifacts only (its ci/check-release-build.sh
+# refuses --debug, --features and scripted-approver in any `cargo tauri build` line of that file).
+# Nothing built here is ever shipped or uploaded as a bundle-<target> artifact.
+#
+# Driver-free (M6 CI ruling, task cifix6, run 38885675593): WebKitWebDriver cannot drive the
+# first-run wizard on Linux (the incognito Setup window gets an ephemeral WebKit context without
+# automation; the credential window has a context of its own, S-07), so both runs check what needs no
+# driver (ci/gui-no-driver.sh: xwininfo window titles, the diag log, doctor, forwarded launches,
+# SIGTERM) and the wizard, Install CLI to PATH and the store-backed windows are the manual rows of
+# docs/release/linux-gui-checklist.md.
 #
 # Jobs:
-#   bundle-linux-e2e      debug scripted-approver rpm + AppImage, tauri-driver built once
+#   bundle-linux-e2e      debug scripted-approver rpm + AppImage
 #   fedora-no-tray-host   CI-03: fedora:40 container, Xvfb, session bus without a StatusNotifierWatcher
-#   appimage-m6           CI-04 M6 steps: wizard and Install CLI to PATH through tauri-driver, wrapper, moved AppImage
+#   appimage-m6           CI-04 M6 steps: the AppImage through its FUSE runtime, no tray host, Setup window, doctor, forwarded launches, SIGTERM
 
 on:
   push:
     branches:
       - master
-      # REMOVE AT MERGE: TEMPORARY trigger for the M6 branch. workflow_dispatch runs only a workflow
-      # file that exists on the default branch (see install-probes.yml), and this file is new, so
-      # without this line the Fedora CI-03 and AppImage CI-04 jobs would first run after the merge.
-      - "m6-*"
     tags:
       - "v*"
   workflow_dispatch:
@@ -34,15 +36,10 @@ defaults:
 
 env:
   TAURI_CLI_VERSION: "2.12.1"
-  # tauri-driver is a WebDriver proxy that does not link tauri, so any 2.x pairs with Tauri 2.12.1.
-  # 2.0.6 (2026-05-06) is the release whose --port, --native-port and --native-driver options the e2e
-  # target was written against; 2.1.0 (2026-09-26, the crates.io max stable) is three weeks old and
-  # shipped the same day line as 3.0.0-alpha.1, so it was not chosen. First run confirms.
-  TAURI_DRIVER_VERSION: "2.0.6"
 
 jobs:
   bundle-linux-e2e:
-    name: bundle-linux-e2e (debug scripted-approver rpm + AppImage, tauri-driver)
+    name: bundle-linux-e2e (debug scripted-approver rpm + AppImage)
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
@@ -110,12 +107,6 @@ jobs:
       - name: Show the cargo-tauri version
         run: cargo tauri --version
 
-      - name: Install tauri-driver (exact version, locked)
-        run: |
-          set -euo pipefail
-          cargo install --locked tauri-driver --version "$TAURI_DRIVER_VERSION" --root "$RUNNER_TEMP/tauri-driver"
-          "$RUNNER_TEMP/tauri-driver/bin/tauri-driver" --help | head -n 20
-
       # Debug profile (debug assertions on: the compile_error! lock of scripted-approver is open
       # there and only there) with the test-only feature; rpm and AppImage like the shipped bundle.
       - name: Build the debug scripted-approver rpm and AppImage
@@ -125,15 +116,14 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
         run: cargo tauri build --ci --debug --features scripted-approver --target "$TARGET" --bundles rpm,appimage -- --locked
 
-      - name: Stage the artifact (rpm, AppImage, tools/tauri-driver)
+      - name: Stage the artifact (rpm, AppImage)
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/e2e-bundle"
           bundle="target/$TARGET/debug/bundle"
-          mkdir -p "$out/rpm" "$out/appimage" "$out/tools"
+          mkdir -p "$out/rpm" "$out/appimage"
           cp "$bundle"/rpm/*.rpm "$out/rpm/"
           cp "$bundle"/appimage/*.AppImage "$out/appimage/"
-          cp "$RUNNER_TEMP/tauri-driver/bin/tauri-driver" "$out/tools/"
           ls -lR "$out"
 
       - name: Upload bundle-linux-e2e
@@ -145,7 +135,7 @@ jobs:
           retention-days: 7
 
   fedora-no-tray-host:
-    name: fedora-no-tray-host (fedora:40, Xvfb, no StatusNotifierWatcher, tauri-driver, CI-03)
+    name: fedora-no-tray-host (fedora:40, Xvfb, no StatusNotifierWatcher, driver-free, CI-03)
     needs: bundle-linux-e2e
     runs-on: ubuntu-22.04
     timeout-minutes: 45
@@ -162,12 +152,12 @@ jobs:
           path: dist
 
       # /root is a runner directory, not the container's overlayfs: the app's locality checks (data
-      # dir, keyring dir) fail closed on overlayfs and read the passwd home, which is /root.
-      - name: Install the rpm on Fedora 40 and run the no-tray-host GUI flows
+      # dir, keyring dir) fail closed on overlayfs. CI goes in: ci/pinned-fixture.sh runs only in CI.
+      - name: Install the rpm on Fedora 40 and run the no-tray-host GUI checks
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/fedora-root"
-          docker run --rm --volume "$PWD:/work" --volume "$RUNNER_TEMP/fedora-root:/root" --workdir /work fedora:40 \
+          docker run --rm --env CI --volume "$PWD:/work" --volume "$RUNNER_TEMP/fedora-root:/root" --workdir /work fedora:40 \
             bash ci/fedora-no-tray-host.sh dist
 
       - name: Container logs (diagnostics)
@@ -175,7 +165,7 @@ jobs:
         run: |
           # The container ran as root: its files may be owner-only, so read them with sudo. The
           # script also copies its logs to /root/e2e-diag (here: fedora-root/e2e-diag) before its own cleanup.
-          sudo find "$RUNNER_TEMP/fedora-root" -maxdepth 6 \( -name 'diag.log' -o -name '*-driver.log' \) -print -exec tail -n 60 {} \; 2>/dev/null || true
+          sudo find "$RUNNER_TEMP/fedora-root" -maxdepth 6 -path "$RUNNER_TEMP/fedora-root/e2e-diag" -prune -o \( -name 'diag.log' -o -name 'app-*.log' \) -print -exec tail -n 60 {} \; 2>/dev/null || true
           sudo find "$RUNNER_TEMP/fedora-root/e2e-diag" -type f -print -exec tail -n 80 {} \; 2>/dev/null || true
 
       - name: Upload the Fedora diagnostics
@@ -192,7 +182,7 @@ jobs:
         run: sudo rm -rf "$RUNNER_TEMP/fedora-root"
 
   appimage-m6:
-    name: appimage-m6 (ubuntu-22.04, FUSE mount, tauri-driver, CI-04 M6 steps)
+    name: appimage-m6 (ubuntu-22.04, FUSE mount, driver-free, CI-04 M6 steps)
     needs: bundle-linux-e2e
     runs-on: ubuntu-22.04
     timeout-minutes: 45
@@ -208,17 +198,24 @@ jobs:
           name: bundle-linux-e2e
           path: dist
 
-      - name: Install libfuse2, Xvfb, D-Bus, a Secret Service and the WebKit driver
+      # libwebkit2gtk-4.1-0 is not what the app runs (the AppImage bundles its own WebKit, found first
+      # through the AppImage's library path): its Depends bring the host libraries the AppImage leaves
+      # out by linuxdeploy's exclude list (libEGL and the mesa EGL driver among them; task cifix7, run
+      # 38894075809: "libEGL.so.1: cannot open shared object file"). bundle.yml's appimage-smoke gets
+      # them from the deb's Depends; cifix6 round 1 got them through webkit2gtk-driver.
+      - name: Install libfuse2, Xvfb, D-Bus, a Secret Service, xwininfo and the host GL libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libfuse2 xvfb xauth dbus-x11 gnome-keyring libsecret-tools webkit2gtk-driver python3 \
-            libayatana-appindicator3-1 librsvg2-2
-          command -v WebKitWebDriver
+            libfuse2 xvfb xauth dbus-x11 gnome-keyring libsecret-tools x11-utils python3 \
+            libayatana-appindicator3-1 librsvg2-2 libwebkit2gtk-4.1-0
+          command -v xwininfo
+          ldconfig -p | grep -F 'libEGL.so.1 '
 
-      - name: AppImage M6 section (wizard, Install CLI to PATH, wrapper doctor, moved AppImage)
+      - name: AppImage M6 section (no tray host, Setup window, doctor, forwarded launches, SIGTERM)
         env:
-          # The script copies the diag log and the driver logs here before its cleanup trap deletes them.
+          # The script copies the diag log, the app logs and the doctor answers here before its cleanup
+          # trap deletes them.
           E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diag-appimage
         run: CI=true bash ci/appimage-smoke.sh --m6 dist
 
@@ -240,5 +237,3 @@ jobs:
         if: always()
         run: |
           pkill -x atlas-duck-app || true
-          pkill -x tauri-driver || true
-          pkill -x WebKitWebDriver || true
