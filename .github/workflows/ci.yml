@@ -297,6 +297,20 @@ jobs:
         env:
           ATLAS_DUCK_BIG_TESTS: "1"
 
+      # M6 T34 (§1.4 SC3, §13 Performance, M3 M-15): the thresholds of `perf_sc3` are regression
+      # bounds that apply in this optimized run only (the debug run of the same file, in the core
+      # suite above, checks the results and prints the numbers). The `testing` features refuse to
+      # compile without debug assertions, so the release profile gets them from the environment
+      # here, never from a Cargo.toml (ci/check-workspace.mjs). A filter that matches nothing
+      # would pass with zero tests, so the log must show the three passes.
+      - name: Core performance bounds (SC3 preview, 16 MiB paging, M-15 latency, release)
+        run: |
+          cargo test -p atlas-duck-core --release --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test perf_sc3 -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/perf-sc3.log"
+          grep -q 'test result: ok\. 3 passed' "$RUNNER_TEMP/perf-sc3.log"
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+          ATLAS_DUCK_PERF_ENFORCE: "1"
+
       - name: Audit OS keychain tests (Windows Credential Manager, RF-3a)
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-audit --test os_keystore --locked -- --ignored --test-threads=1 --nocapture

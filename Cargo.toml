@@ -144,3 +144,19 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.zstd-sys]
 opt-level = 3
+# M6 T34 (M3 M-15): the hot paths of a 16 MiB candidate (normalize, hash, compress, encrypt, JSON
+# tree, preview render) take seconds unoptimized; these crates and the codecs they spend their
+# time in are optimized in the dev profile, so the debug suites that build such candidates run
+# near release speed. Line tables stay; debug assertions stay on (opt-level does not change them).
+[profile.dev.package.atlas-duck-core]
+opt-level = 2
+[profile.dev.package.atlas-duck-preview]
+opt-level = 2
+[profile.dev.package.atlas-duck-convert]
+opt-level = 2
+[profile.dev.package.atlas-duck-audit]
+opt-level = 2
+[profile.dev.package.serde_json]
+opt-level = 3
+[profile.dev.package.zstd]
+opt-level = 3
