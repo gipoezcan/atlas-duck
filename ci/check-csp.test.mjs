@@ -6,7 +6,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   CREDENTIAL_POLICY,
+  ISOLATION_IFRAME_STYLE,
+  ISOLATION_STYLE_HASH,
   MAIN_POLICY,
+  cspHash,
   PLATFORMS,
   checkConfig,
   checkConfigs,
@@ -212,6 +215,38 @@ test("head_meta_csp_decodes_entities", () => {
   const html = page(CREDENTIAL_POLICY.replace(/'/g, "&#39;").replace("<isolation-origin>", "&lt;isolation-origin&gt;"));
   assert.equal(headMetaCsp(html).csp, CREDENTIAL_POLICY);
   assert.equal(checkPolicy(headMetaCsp(html).csp, CREDENTIAL_POLICY, "x").length, 0);
+});
+
+// ---------- the isolation style hash (M6 CI round 2, ruling B1) ----------
+
+test("isolation_style_hash_is_the_hash_of_tauris_style", () => {
+  assert.equal(ISOLATION_IFRAME_STYLE, "#__tauri_isolation__ { display: none !important }");
+  assert.equal(cspHash(ISOLATION_IFRAME_STYLE), "'sha256-YEercZJImS+vUX2bz7vkQ0aA4rtBIPLuCEWz+yraQ/g='");
+  assert.equal(ISOLATION_STYLE_HASH, cspHash(ISOLATION_IFRAME_STYLE));
+  for (const policy of [MAIN_POLICY, CREDENTIAL_POLICY]) {
+    assert.deepEqual(parsePolicy(policy).get("style-src"), ["'self'", ISOLATION_STYLE_HASH]);
+  }
+});
+
+test("style_src_admits_exactly_the_isolation_hash", () => {
+  const other = cspHash("body{display:none}");
+  for (const [policy, check] of [
+    [MAIN_POLICY, (csp) => checkConfig(baseConf({ csp }), "linux")],
+    [CREDENTIAL_POLICY, (csp) => checkCredentialPages({ "credential.html": page(csp) }, "app/ui")],
+  ]) {
+    // Without the hash, with another one beside it, with another one instead.
+    for (const style of [
+      "style-src 'self'",
+      `style-src 'self' ${ISOLATION_STYLE_HASH} ${other}`,
+      `style-src 'self' ${other}`,
+      `style-src 'self' ${ISOLATION_STYLE_HASH} 'unsafe-inline'`,
+    ]) {
+      const csp = policy.replace(`style-src 'self' ${ISOLATION_STYLE_HASH}`, style);
+      assertFails(check(csp), /style-src must be exactly/);
+    }
+    // A hash in another directive is a difference from the spec text too.
+    assertFails(check(policy.replace("script-src 'self'", `script-src 'self' ${other}`)), /differs from the spec text/);
+  }
 });
 
 test("no_unreadable_overlay_formats_in_the_repository", () => {

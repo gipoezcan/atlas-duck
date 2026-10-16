@@ -1,5 +1,6 @@
-/* The Tauri isolation iframe is hidden here because style-src 'self' blocks
-   the inline <style> that isolation.js injects (spec 6.4). */
+/* The Tauri isolation iframe is hidden by the inline <style> that isolation.js
+   injects, which both policies admit by its sha256 hash (spec 6.4, ruling B1);
+   this rule hides it too, should a Tauri release change that style. */
 #__tauri_isolation__ {
   display: none !important;
 }

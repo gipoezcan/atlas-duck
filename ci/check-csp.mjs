@@ -7,12 +7,15 @@
 // true; the app patches the placeholder with this build's isolation origin before it builds
 // (`csp::patch_context` in `run_gui`; Tauri 2.12.1 mints `isolation-<uuid>` per build, so no
 // static origin can be right); the credential page(s) carry the §10.3 policy as the first `<head>`
-// element, in the sources and, with `--dist`, in the built files.
+// element, in the sources and, with `--dist`, in the built files. Both policies admit exactly one
+// inline style besides 'self': the `<style>` Tauri's isolation.js injects into every page (its
+// sha256 hash, lead ruling B1 of the M6 CI round 2; `csp::tests` pins it to Tauri's own constant).
 //
 // Usage: node ci/check-csp.mjs [--dist app/ui/dist]
 // Exit 0 = ok. Exit 1 = violations (one per line on stdout).
-// No npm dependencies: node:fs, node:path, node:url only.
+// No npm dependencies: node:fs, node:path, node:url, node:crypto only.
 
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,15 +23,29 @@ import { fileURLToPath } from "node:url";
 /** The `frame-src` source the policies carry for the isolation origin (§6.4 notation). */
 export const ISOLATION_ORIGIN = "<isolation-origin>";
 
+/** A CSP hash source for an inline element whose text is `text` (UTF-8, sha256, base64). */
+export function cspHash(text) {
+  return `'sha256-${createHash("sha256").update(text, "utf8").digest("base64")}'`;
+}
+
+/**
+ * The text of the `<style>` Tauri 2.12.1's isolation.js appends to every page
+ * (`tauri::utils::pattern::isolation::IFRAME_STYLE`; `csp::tests` fails when Tauri changes it).
+ */
+export const ISOLATION_IFRAME_STYLE = "#__tauri_isolation__ { display: none !important }";
+
+/** Its hash source, the one inline style both policies admit. */
+export const ISOLATION_STYLE_HASH = cspHash(ISOLATION_IFRAME_STYLE);
+
 /** §6.4 main-window CSP (verbatim, `<isolation-origin>` kept). */
 export const MAIN_POLICY =
-  "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+  `default-src 'self'; script-src 'self'; style-src 'self' ${ISOLATION_STYLE_HASH}; img-src 'self' data:; ` +
   "connect-src ipc: http://ipc.localhost; frame-src 'self' <isolation-origin>; worker-src 'none'; " +
   "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 /** §10.3 credential-entry window meta CSP (verbatim, `<isolation-origin>` kept). */
 export const CREDENTIAL_POLICY =
-  "default-src 'none'; script-src 'self'; style-src 'self'; connect-src ipc: http://ipc.localhost; " +
+  `default-src 'none'; script-src 'self'; style-src 'self' ${ISOLATION_STYLE_HASH}; connect-src ipc: http://ipc.localhost; ` +
   "frame-src <isolation-origin>; worker-src 'none'; form-action 'none'; base-uri 'none'";
 
 export const PLATFORMS = ["windows", "macos", "linux"];
@@ -80,6 +97,12 @@ export function checkPolicy(text, expected, where) {
   }
   if (text.split(ISOLATION_ORIGIN).length !== 2) {
     errors.push(`${where}: ${ISOLATION_ORIGIN} must appear exactly once, in frame-src`);
+  }
+  // The inline styles the policy admits: exactly the expected hash sources, nothing else.
+  const style = (map.get("style-src") ?? []).join(" ");
+  const expectedStyle = (parsePolicy(expected)?.get("style-src") ?? []).join(" ");
+  if (style !== expectedStyle) {
+    errors.push(`${where}: style-src must be exactly "${expectedStyle}", is "${style}"`);
   }
   if (normalize(text) !== normalize(expected)) {
     errors.push(`${where}: CSP differs from the spec text: ${normalize(text)} != ${normalize(expected)}`);

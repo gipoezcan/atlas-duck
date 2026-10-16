@@ -116,6 +116,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", 
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 filetime = { workspace = true }
+# M6 CI round 2 (B1): `csp::tests` hashes Tauri's isolation style to pin the policies' hash source
+# (the workspace pin, already built for crates/audit).
+sha2 = { workspace = true }
 # M6 T32: the `e2e` target's WebDriver client talks plain http to `tauri-driver` on 127.0.0.1. The
 # workspace pin with no extra feature (crates/atlassian already builds it), so Cargo.lock gains no crate.
 reqwest = { workspace = true }

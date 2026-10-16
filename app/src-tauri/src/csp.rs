@@ -341,4 +341,47 @@ mod tests {
         // A second patch finds no placeholder: the origin is set once.
         assert_eq!(patch_context(&mut context), Err(CspError::Placeholder));
     }
+
+    /// The `style-src` sources of `policy`.
+    fn style_src(policy: &str) -> Vec<String> {
+        policy
+            .split(';')
+            .map(str::trim)
+            .find_map(|d| d.strip_prefix("style-src "))
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// M6 CI round 2, ruling B1 (§6.4's equivalent alternative): Tauri's isolation.js appends a
+    /// `<style>` with `IFRAME_STYLE` to every page, and tauri-codegen puts its hash into the
+    /// isolation page's policy only. Both of the app's policies admit exactly that style by its
+    /// sha256 hash; a Tauri release that changes the text fails here, not as a CSP violation in a
+    /// window.
+    #[test]
+    fn both_policies_admit_exactly_tauris_isolation_style() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let digest: [u8; 32] =
+            Sha256::digest(tauri::utils::pattern::isolation::IFRAME_STYLE.as_bytes()).into();
+        let hash = format!(
+            "'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        );
+        let expected = vec!["'self'".to_owned(), hash];
+        let context: Context<tauri::test::MockRuntime> =
+            tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
+        let Some(Csp::Policy(main)) = &context.config().app.security.csp else {
+            panic!("the CSP is a policy string");
+        };
+        assert_eq!(style_src(main), expected, "tauri.conf.json: {main}");
+        let page = include_str!("../../ui/credential.html");
+        let meta = page
+            .split("content=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default();
+        assert_eq!(style_src(meta), expected, "credential.html: {meta}");
+    }
 }
