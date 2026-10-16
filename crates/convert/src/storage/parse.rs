@@ -15,10 +15,11 @@
 //! from inside, or holds a `<!DOCTYPE`, an `<!ENTITY` or a processing instruction (`<?…?>`,
 //! the XML declaration included): quick-xml expands no DTD, so a declared entity would look
 //! literal and hide what Confluence expands it to. An element carrying an `xmlns`/`xmlns:*`
-//! attribute, or an element or attribute with a prefix other than `ac`/`ri`, is read but
-//! classified [`Ns::Other`] together with its whole subtree. After a DOCTYPE, a PI or the
-//! depth limit the reader keeps scanning (without building nodes) so that
-//! [`check_storage_body`] can name the most important reason; after a syntax error it stops.
+//! attribute, an element with a prefix other than `ac`/`ri`, or an attribute with a prefix other
+//! than `ac`/`ri`/`xml`, is read but classified [`Ns::Other`] together with its whole subtree.
+//! After a DOCTYPE, a PI or the depth limit the reader keeps scanning (without building nodes)
+//! so that [`check_storage_body`] can name the most important reason; after a syntax error it
+//! stops.
 //!
 //! Ranges are byte ranges of the original input (not the wrapped one), always on char
 //! boundaries. Recursion over the tree is bounded by [`MAX_DEPTH`].
@@ -52,8 +53,8 @@ pub enum Ns {
     Ac,
     /// `ri:`.
     Ri,
-    /// Any other prefix, an `xmlns` declaration on the element, a foreign-prefixed attribute,
-    /// or inside such an element (PD-94 (2)). Always counted as markup.
+    /// Any other prefix, an `xmlns` declaration on the element, an attribute prefixed other
+    /// than `ac`/`ri`/`xml`, or inside such an element (PD-94 (2)). Always counted as markup.
     Other,
 }
 
@@ -402,9 +403,9 @@ impl<'s> Builder<'s> {
             let attr = attr.ok()?;
             let key = attr.key.into_inner();
             let (key_prefix, _) = split_qname(key)?;
-            if key == "xmlns" || key_prefix == Some("xmlns") {
+            if is_ns_decl(key) {
                 ns_decl = true;
-            } else if key_prefix.is_some_and(|p| p != "ac" && p != "ri") {
+            } else if key_prefix.is_some_and(|p| !KNOWN_ATTR_PREFIXES.contains(&p)) {
                 foreign = true;
             }
             attrs.push((key.to_owned(), decode_attr(&attr.value)?));
@@ -506,6 +507,15 @@ impl<'s> Builder<'s> {
             self.reasons.not_well_formed = true;
         }
     }
+}
+
+/// Attribute prefixes that leave an element in its namespace: `ac`, `ri`, and `xml` (bound by
+/// the Namespaces spec, never rebindable).
+const KNOWN_ATTR_PREFIXES: [&str; 3] = ["ac", "ri", "xml"];
+
+/// `xmlns` or `xmlns:*`.
+fn is_ns_decl(key: &str) -> bool {
+    key == "xmlns" || key.starts_with("xmlns:")
 }
 
 fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
@@ -650,16 +660,18 @@ const SAFE_SCHEMES: [&str; 3] = ["http:", "https:", "mailto:"];
 ///   set or with attributes, are `Markup`;
 /// - an `<a>` whose `href` does not start with `http:`, `https:` or `mailto:` (or has other
 ///   attributes) is `Link`;
-/// - `ac:structured-macro` is `Include` (`include`, `excerpt-include`) or `Macro`; its
-///   `ac:parameter` and `ac:plain-text-body` children are part of it, while the content of its
-///   `ac:rich-text-body` (and any other child) is judged on its own;
+/// - `ac:structured-macro` is `Include` (`include`, `excerpt-include`) or `Macro`; the content
+///   of its `ac:parameter`, `ac:plain-text-body` and `ac:rich-text-body` children, and any other
+///   child, is judged on its own (so an element inside a recorded code macro's parameter or
+///   body is still a span; its CDATA is opaque);
 /// - `ac:image` is `Image`; `ac:link` is `Mention`/`Attachment` for a `ri:user`/`ri:attachment`
 ///   target, else `Link`; any other `ac:` element is `Macro`;
 /// - `ri:user` is `Mention`, `ri:attachment` `Attachment`, `ri:page`/`ri:space`/
 ///   `ri:content-entity` `Link`, any other `ri:` element `Macro`.
 ///
-/// Meaningful only with `doc.xml_ok` (the hard check fails closed otherwise). Public so the
-/// properties can be tested from outside, like [`crate::wiki::construct_spans`].
+/// Meaningful only with `doc.xml_ok` (the hard check fails closed otherwise). Public, though not
+/// in the Δ1 list (an addition, like [`crate::wiki::construct_spans`]), for the Task 6 hard
+/// check's tests and the properties tested from outside.
 pub fn construct_spans(doc: &StorageDoc) -> Vec<(ConstructKind, Range<usize>)> {
     let mut out = Vec::new();
     spans(&doc.nodes, &mut out);
@@ -685,9 +697,12 @@ fn span(e: &Element, out: &mut Vec<(ConstructKind, Range<usize>)>) {
             };
             out.push((kind, e.byte_range.clone()));
             for c in e.child_elements() {
-                if c.is(Ns::Ac, "rich-text-body") {
+                if c.is(Ns::Ac, "rich-text-body")
+                    || c.is(Ns::Ac, "parameter")
+                    || c.is(Ns::Ac, "plain-text-body")
+                {
                     spans(&c.children, out);
-                } else if !(c.is(Ns::Ac, "parameter") || c.is(Ns::Ac, "plain-text-body")) {
+                } else {
                     span(c, out);
                 }
             }
@@ -737,8 +752,9 @@ fn is_include(name: &str) -> bool {
 }
 
 /// `ac:` elements that structure content and are no construct of their own: the inventory
-/// descends into them without an entry.
-const AC_STRUCTURE: [&str; 10] = [
+/// descends into them without an entry. A macro's parameters and plain-text body are skipped
+/// together with the macro; standing elsewhere they are structure too.
+const AC_STRUCTURE: [&str; 13] = [
     "rich-text-body",
     "task-list",
     "task",
@@ -749,6 +765,9 @@ const AC_STRUCTURE: [&str; 10] = [
     "layout-section",
     "layout-cell",
     "link-body",
+    "plain-text-link-body",
+    "parameter",
+    "plain-text-body",
 ];
 
 /// The inventory of `storage` for the write previews (Δ1), each list in document order, one
@@ -759,15 +778,18 @@ const AC_STRUCTURE: [&str; 10] = [
 ///   not listed further);
 /// - `includes`: each `include`/`excerpt-include` macro by its target page
 ///   (`<space>:<title>`, or `<title>`), else by its name;
-/// - `mentions`: `ri:user` by `ri:userkey`, else legacy `ri:username`;
-/// - `links`: `ri:page` (`<space>:<title>` or `<title>`), `ri:space`, `ri:content-entity`,
-///   other `ri:` elements, an `ac:link` without a resource (`#anchor`), and `<a href>` values;
-/// - `images`: `ac:image` by its `ri:attachment` filename or `ri:url` value (and `<img src>`);
+/// - `mentions`: `ri:user` by a non-empty `ri:userkey`, else legacy `ri:username`;
+/// - `links`: `ri:page`/`ri:blog-post` (`<space>:<title>` or `<title>`), `ri:space`,
+///   `ri:content-entity`, `ri:url`, other `ri:` elements by qualified name, an `ac:link` without
+///   a resource (`#anchor`), and `<a href>` values;
+/// - `images`: `ac:image` by its `ri:attachment` filename or `ri:url` value (its other children,
+///   a caption, are content), and `<img src>`;
 /// - `attachments`: `ri:attachment` outside an `ac:image`.
 ///
-/// A macro's parameters belong to it and are not listed again; its rich-text body is content.
-/// When the parse is not `xml_ok`, the lexical scan of start tags (`lexical_constructs`) runs
-/// instead: it over-reports, never under-reports.
+/// HTML names compare ASCII case-insensitively. A macro's parameters belong to it and are not
+/// listed again; its rich-text body is content. When the parse is not `xml_ok`, the lexical
+/// scan of start tags (`lexical_constructs`) runs instead: it over-reports, never
+/// under-reports (on a well-formed body each of its lists is at least as long as this one).
 pub fn storage_constructs(storage: &str) -> WikiConstructs {
     let doc = parse(storage);
     if !doc.xml_ok {
@@ -815,13 +837,17 @@ fn inventory_element(e: &Element, out: &mut WikiConstructs) {
                 })
                 .unwrap_or("");
             out.images.push(label.to_owned());
+            // The `ri:` children are the image's source; anything else (a caption) is content.
+            for c in e.child_elements().filter(|c| c.ns != Ns::Ri) {
+                inventory_element(c, out);
+            }
         }
         (Ns::Ac, "link") => {
             let mut target = false;
             for c in e.child_elements() {
                 if c.ns == Ns::Ri {
                     target = true;
-                    resource(c, out);
+                    resource(&c.local, tree_attr(c), out);
                 } else if c.is(Ns::Ac, "link-body") {
                     inventory(&c.children, out);
                 }
@@ -837,10 +863,12 @@ fn inventory_element(e: &Element, out: &mut WikiConstructs) {
             }
             inventory(&e.children, out);
         }
-        (Ns::Ri, _) => resource(e, out),
-        (Ns::Html, "img") => out.images.push(e.attr("src").unwrap_or("").to_owned()),
+        (Ns::Ri, local) => resource(local, tree_attr(e), out),
+        (Ns::Html, local) if local.eq_ignore_ascii_case("img") => {
+            out.images.push(e.attr("src").unwrap_or("").to_owned());
+        }
         (Ns::Html, local) => {
-            if local == "a"
+            if local.eq_ignore_ascii_case("a")
                 && let Some(href) = e.attr("href")
             {
                 out.links.push(href.to_owned());
@@ -850,31 +878,37 @@ fn inventory_element(e: &Element, out: &mut WikiConstructs) {
     }
 }
 
-/// One `ri:` resource, outside an `ac:image`.
-fn resource(e: &Element, out: &mut WikiConstructs) {
-    let value = |k: &str| e.attr(k).unwrap_or("").to_owned();
-    match e.local.as_str() {
+/// The attribute reader of a tree element for [`resource`] and [`page_label`].
+fn tree_attr(e: &Element) -> impl Fn(&str) -> Option<String> + '_ {
+    |k| e.attr(k).map(str::to_owned)
+}
+
+/// The entry of the `ri:` resource `ri:<local>` outside an `ac:image`; `attr` reads a decoded
+/// attribute value. The tree and the lexical scan list a resource the same way.
+fn resource(local: &str, attr: impl Fn(&str) -> Option<String>, out: &mut WikiConstructs) {
+    let value = |k: &str| attr(k).unwrap_or_default();
+    match local {
         "user" => out.mentions.push(
-            e.attr("ri:userkey")
-                .or_else(|| e.attr("ri:username"))
-                .unwrap_or("")
-                .to_owned(),
+            attr("ri:userkey")
+                .filter(|k| !k.is_empty())
+                .or_else(|| attr("ri:username"))
+                .unwrap_or_default(),
         ),
         "attachment" => out.attachments.push(value("ri:filename")),
-        "page" | "blog-post" => out.links.push(page_label(e)),
+        "page" | "blog-post" => out.links.push(page_label(&attr)),
         "space" => out.links.push(value("ri:space-key")),
         "content-entity" => out.links.push(value("ri:content-id")),
         "url" => out.links.push(value("ri:value")),
-        _ => out.links.push(e.qname()),
+        _ => out.links.push(format!("ri:{local}")),
     }
 }
 
 /// `<space>:<title>` when a space key is given, else `<title>`.
-fn page_label(e: &Element) -> String {
-    let title = e.attr("ri:content-title").unwrap_or("");
-    match e.attr("ri:space-key") {
+fn page_label(attr: impl Fn(&str) -> Option<String>) -> String {
+    let title = attr("ri:content-title").unwrap_or_default();
+    match attr("ri:space-key") {
         Some(space) => format!("{space}:{title}"),
-        None => title.to_owned(),
+        None => title,
     }
 }
 
@@ -882,17 +916,17 @@ fn page_label(e: &Element) -> String {
 fn include_target(e: &Element) -> Option<String> {
     e.child_elements().find_map(|c| {
         if c.is(Ns::Ri, "page") {
-            Some(page_label(c))
+            Some(page_label(tree_attr(c)))
         } else {
             include_target(c)
         }
     })
 }
 
-/// The `ri:user` references of `storage` (Δ1), from the parsed tree: CDATA is opaque, and an
-/// `Ns::Other` subtree holds no `ri:` element. When the parse is not `xml_ok`, only what was
-/// read up to the failure point counts (`storage_to_markdown` then runs its fallback, which
-/// renders no mention).
+/// The `ri:user` references of `storage` (Δ1), from the parsed tree: CDATA is opaque, an
+/// `Ns::Other` subtree holds no `ri:` element, and an empty value is no reference (no lookup
+/// is issued for it). When the parse is not `xml_ok`, only what was read up to the failure
+/// point counts (`storage_to_markdown` then runs its fallback, which renders no mention).
 pub fn storage_user_refs(storage: &str) -> StorageUsers {
     user_refs(&parse(storage))
 }
@@ -908,10 +942,10 @@ fn users(nodes: &[Node], out: &mut StorageUsers) {
     for node in nodes {
         let Node::Element(e) = node else { continue };
         if e.is(Ns::Ri, "user") {
-            if let Some(key) = e.attr("ri:userkey") {
+            if let Some(key) = e.attr("ri:userkey").filter(|k| !k.is_empty()) {
                 out.keys.insert(key.to_owned());
             }
-            if let Some(name) = e.attr("ri:username") {
+            if let Some(name) = e.attr("ri:username").filter(|n| !n.is_empty()) {
                 out.usernames.insert(name.to_owned());
             }
         }
@@ -920,12 +954,21 @@ fn users(nodes: &[Node], out: &mut StorageUsers) {
 }
 
 /// The inventory of a body whose parse is not `xml_ok` (PD-94 (3)): a scan of every start tag
-/// (CDATA and comments included, since their bounds cannot be trusted either). Over-reports,
-/// never under-reports. A tag with the prefix `ac`/`ri` (exactly) is listed by the rules of
-/// [`storage_constructs`] that need no tree (`ac:structured-macro` by `ac:name`, includes by
-/// name, `ac:image` and `ac:link` with an empty label, every `ri:` resource by its attribute);
-/// any other prefix, and any tag holding `xmlns`, is listed under `macros` by its name as
-/// written. Attribute values are raw.
+/// (CDATA and comments included, since their bounds cannot be trusted either), each listed by
+/// the rules of [`storage_constructs`] that need no tree. It over-reports, never under-reports:
+/// on a well-formed body each list is at least as long as the tree's, because the scan sees
+/// every element the tree lists, in the same list, plus those inside macro parameters, foreign
+/// subtrees, CDATA and comments.
+/// - A tag the tree makes `Ns::Other` (a prefix other than `ac`/`ri`, an `xmlns`/`xmlns:*`
+///   attribute, an attribute prefixed other than `ac`/`ri`/`xml`) is listed under `macros` by
+///   its name as written, and by the rules below as well.
+/// - `ac:structured-macro` by its `ac:name` (an include by that name), `ac:image` and `ac:link`
+///   with an empty label (their children are listed on their own), any other `ac:` element
+///   outside the structure list by its local name, a `ri:` resource as in the tree, `<a>` by its
+///   `href` (else empty) and `<img>` by its `src`, the HTML names ASCII case-insensitive.
+///
+/// Attributes are read lexically (a quoted value may hold `>`; nothing runs past the next `<`)
+/// and decoded like the tree's, raw where the value is not well-formed.
 pub(crate) fn lexical_constructs(storage: &str) -> WikiConstructs {
     let mut out = WikiConstructs::default();
     for (i, _) in storage.match_indices('<') {
@@ -941,14 +984,31 @@ pub(crate) fn lexical_constructs(storage: &str) -> WikiConstructs {
         if name.is_empty() || name.starts_with(['!', '?', '/']) {
             continue;
         }
-        let tag = after
-            .get(..after.find(['>', '<']).unwrap_or(after.len()))
-            .unwrap_or("");
-        let attr = |k: &str| lex_attr(tag, k).unwrap_or("").to_owned();
-        match name.split_once(':') {
-            Some(("ac", local)) if !tag.contains("xmlns") => match local {
+        let attrs = lex_attrs(after);
+        let attr = |k: &str| {
+            attrs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| decode_attr(v).unwrap_or_else(|| (*v).to_owned()))
+        };
+        let (prefix, local) = match name.split_once(':') {
+            Some((p, l)) => (Some(p), l),
+            None => (None, name),
+        };
+        let foreign_attr = |k: &str| {
+            is_ns_decl(k)
+                || k.split_once(':')
+                    .is_some_and(|(p, _)| !KNOWN_ATTR_PREFIXES.contains(&p))
+        };
+        if prefix.is_some_and(|p| p != "ac" && p != "ri")
+            || attrs.iter().any(|(k, _)| foreign_attr(k))
+        {
+            out.macros.push(name.to_owned());
+        }
+        match prefix {
+            Some("ac") => match local {
                 "structured-macro" => {
-                    let macro_name = attr("ac:name");
+                    let macro_name = attr("ac:name").unwrap_or_default();
                     if is_include(&macro_name) {
                         out.includes.push(macro_name);
                     } else {
@@ -957,46 +1017,73 @@ pub(crate) fn lexical_constructs(storage: &str) -> WikiConstructs {
                 }
                 "image" => out.images.push(String::new()),
                 "link" => out.links.push(String::new()),
-                "parameter" | "plain-text-body" | "plain-text-link-body" => {}
                 l if AC_STRUCTURE.contains(&l) => {}
                 l => out.macros.push(l.to_owned()),
             },
-            Some(("ri", local)) if !tag.contains("xmlns") => match local {
-                "user" => {
-                    let key = lex_attr(tag, "ri:userkey").or_else(|| lex_attr(tag, "ri:username"));
-                    out.mentions.push(key.unwrap_or("").to_owned());
-                }
-                "attachment" => out.attachments.push(attr("ri:filename")),
-                "url" => out.images.push(attr("ri:value")),
-                "page" => {
-                    let title = attr("ri:content-title");
-                    out.links.push(match lex_attr(tag, "ri:space-key") {
-                        Some(space) => format!("{space}:{title}"),
-                        None => title,
-                    });
-                }
-                _ => out.links.push(name.to_owned()),
-            },
-            Some(_) => out.macros.push(name.to_owned()),
-            None if tag.contains("xmlns") => out.macros.push(name.to_owned()),
+            Some("ri") => resource(local, attr, &mut out),
+            Some(_) => {}
+            None if local.eq_ignore_ascii_case("img") => {
+                out.images.push(attr("src").unwrap_or_default());
+            }
+            None if local.eq_ignore_ascii_case("a") => {
+                out.links.push(attr("href").unwrap_or_default());
+            }
             None => {}
         }
     }
     out
 }
 
-/// The raw value of attribute `key` in the attribute text of a tag: `key`, optional
-/// whitespace, `=`, optional whitespace, a quote, the value up to the same quote.
-fn lex_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
-    tag.match_indices(key).find_map(|(i, _)| {
-        let before = tag.get(..i)?.chars().next_back()?;
-        if !before.is_whitespace() {
-            return None;
+/// The attributes of a start tag, read lexically from just after its name: each name with its
+/// raw value (empty without `=`), up to the `>` that ends the tag outside a quoted value, or up
+/// to the next `<` (which no well-formed value holds).
+fn lex_attrs(tag: &str) -> Vec<(&str, &str)> {
+    let name_end = |c: char| c.is_whitespace() || matches!(c, '=' | '>' | '<' | '/');
+    let mut out = Vec::new();
+    let mut rest = tag;
+    loop {
+        rest = rest.trim_start();
+        let Some(c) = rest.chars().next() else {
+            break;
+        };
+        if matches!(c, '>' | '<') {
+            break;
         }
-        let rest = tag.get(i + key.len()..)?.trim_start();
-        let rest = rest.strip_prefix('=')?.trim_start();
-        let quote = rest.chars().next().filter(|q| matches!(q, '"' | '\''))?;
-        let value = rest.get(1..)?;
-        value.get(..value.find(quote)?)
-    })
+        let len = rest.find(name_end).unwrap_or(rest.len());
+        if len == 0 {
+            // A `/` or a stray `=`.
+            rest = rest.get(c.len_utf8()..).unwrap_or("");
+            continue;
+        }
+        let name = rest.get(..len).unwrap_or("");
+        rest = rest.get(len..).unwrap_or("").trim_start();
+        let Some(value) = rest.strip_prefix('=') else {
+            out.push((name, ""));
+            continue;
+        };
+        let value = value.trim_start();
+        let (value, after) = match value.chars().next() {
+            Some(q @ ('"' | '\'')) => {
+                let body = value.get(1..).unwrap_or("");
+                let end = body.find([q, '<']).unwrap_or(body.len());
+                let after = body.get(end..).unwrap_or("");
+                (
+                    body.get(..end).unwrap_or(""),
+                    after.strip_prefix(q).unwrap_or(after),
+                )
+            }
+            _ => {
+                let end = value
+                    .find(|c: char| c.is_whitespace() || matches!(c, '>' | '<'))
+                    .unwrap_or(value.len());
+                (
+                    value.get(..end).unwrap_or(""),
+                    value.get(end..).unwrap_or(""),
+                )
+            }
+        };
+        out.push((name, value));
+        rest = after;
+    }
+    out
 }

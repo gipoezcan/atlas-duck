@@ -342,10 +342,117 @@ pub fn storage_fragment() -> impl Strategy<Value = String> {
     ]
 }
 
-/// Arbitrary strings, and fragment sequences biased to storage syntax.
+/// Well-formed storage (Task 2 review M-10): nested `ac:`, `ri:`, HTML and foreign elements,
+/// text with references, CDATA (split ones included) and comments; attribute values with a raw
+/// `>`, references and look-alike attribute text. Chains of 58 to 70 `<div>`s reach past
+/// `MAX_DEPTH`, so a few draws are refused as too deep.
+pub fn storage_well_formed() -> impl Strategy<Value = String> {
+    let leaf = prop::sample::select(vec![
+        "a",
+        " ",
+        "\n",
+        "Grüße 😀",
+        "&amp;",
+        "&lt;ri:user/&gt;",
+        "&nbsp;",
+        "&#252;",
+        "&foo;",
+        "]]&gt;",
+        "<![CDATA[x <ri:user ri:userkey=\"c\"/> <a href=\"h\">]]>",
+        "<![CDATA[a]]]]><![CDATA[>b]]>",
+        "<!-- <ri:user ri:userkey=\"m\"/> -->",
+        "<br/>",
+        "<hr/>",
+        "<img src=\"i.png\"/>",
+        "<IMG src=\"I.png\"/>",
+        "<ri:user ri:userkey=\"8a7f\"/>",
+        "<ri:user ri:username=\"jdoe\"/>",
+        "<ri:user ri:userkey=\"\" ri:username=\"legacy\"/>",
+        "<ri:page ri:space-key=\"DOC\" ri:content-title=\"T &amp; U\"/>",
+        "<ri:blog-post ri:content-title=\"B\"/>",
+        "<ri:attachment ri:filename=\"f.png\"/>",
+        "<ri:url ri:value=\"https://x.example/i.png\"/>",
+        "<ri:space ri:space-key=\"S\"/>",
+        "<ri:content-entity ri:content-id=\"1\"/>",
+        "<ri:shortcut ri:key=\"g\"/>",
+        "<ac:structured-macro ac:name=\"toc\"/>",
+        "<ac:structured-macro ac:name=\"inc&#108;ude\"/>",
+        "<ac:structured-macro ac:title=\"a > b\" ac:name=\"excerpt-include\"/>",
+        "<ac:structured-macro ac:title=' ac:name=\"include\"' ac:name=\"toc\"/>",
+        "<ac:structured-macro zz:x=\"1\" ac:name=\"include\"/>",
+        "<ac:emoticon ac:name=\"smile\"/>",
+        "<ac:placeholder>p</ac:placeholder>",
+        "<ac:parameter ac:name=\"stray\">v</ac:parameter>",
+        "<ac:plain-text-link-body><![CDATA[t]]></ac:plain-text-link-body>",
+        "<at:var at:name=\"x\"/>",
+        "<p zz:a=\"1\"/>",
+        "<p xml:lang=\"de\">x</p>",
+        "<p xmlns=\"u\"/>",
+        "<zz:x xmlns:zz=\"u\"><ri:user ri:userkey=\"z\"/></zz:x>",
+    ])
+    .prop_map(str::to_owned);
+    let wrappers = prop::sample::select(vec![
+        ("<p>", "</p>"),
+        ("<div>", "</div>"),
+        ("<span style=\"color: red;\">", "</span>"),
+        ("<a href=\"https://x.example/?a=1&amp;b\">", "</a>"),
+        ("<a title=\"x > y\" href=\"https://y.example/\">", "</a>"),
+        ("<A href=\"https://z.example/\">", "</A>"),
+        ("<a name=\"anchor\">", "</a>"),
+        ("<table><tbody><tr><td>", "</td></tr></tbody></table>"),
+        (
+            "<ac:structured-macro ac:name=\"code\">",
+            "</ac:structured-macro>",
+        ),
+        (
+            "<ac:structured-macro ac:name=\"info\">",
+            "</ac:structured-macro>",
+        ),
+        (
+            "<ac:structured-macro ac:name=\"include\">",
+            "</ac:structured-macro>",
+        ),
+        ("<ac:parameter ac:name=\"language\">", "</ac:parameter>"),
+        ("<ac:plain-text-body>", "</ac:plain-text-body>"),
+        ("<ac:rich-text-body>", "</ac:rich-text-body>"),
+        ("<ac:link>", "</ac:link>"),
+        ("<ac:link ac:anchor=\"top\">", "</ac:link>"),
+        ("<ac:link-body>", "</ac:link-body>"),
+        ("<ac:image ac:width=\"200\">", "</ac:image>"),
+        ("<ac:caption>", "</ac:caption>"),
+        (
+            "<ac:layout><ac:layout-section><ac:layout-cell>",
+            "</ac:layout-cell></ac:layout-section></ac:layout>",
+        ),
+        (
+            "<ac:task-list><ac:task><ac:task-body>",
+            "</ac:task-body></ac:task></ac:task-list>",
+        ),
+        (
+            "<ac:inline-comment-marker ac:ref=\"r\">",
+            "</ac:inline-comment-marker>",
+        ),
+        ("<ri:attachment ri:filename=\"g.png\">", "</ri:attachment>"),
+        ("<zz:x xmlns:zz=\"u\">", "</zz:x>"),
+        ("<p zz:a=\"1\">", "</p>"),
+    ]);
+    let tree = leaf.prop_recursive(8, 64, 4, move |inner| {
+        (wrappers.clone(), proptest::collection::vec(inner, 0..4))
+            .prop_map(|((open, close), kids)| format!("{open}{}{close}", kids.concat()))
+    });
+    let chain = (58..71usize, tree.clone())
+        .prop_map(|(n, inner)| format!("{}{inner}{}", "<div>".repeat(n), "</div>".repeat(n)));
+    prop_oneof![
+        4 => proptest::collection::vec(tree, 0..6).prop_map(|v| v.concat()),
+        1 => chain,
+    ]
+}
+
+/// Arbitrary strings, fragment sequences biased to storage syntax, and well-formed storage.
 pub fn storage_input() -> impl Strategy<Value = String> {
     prop_oneof![
         1 => any::<String>(),
         4 => proptest::collection::vec(storage_fragment(), 0..60).prop_map(|v| v.concat()),
+        3 => storage_well_formed(),
     ]
 }

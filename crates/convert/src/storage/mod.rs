@@ -5,6 +5,10 @@
 //! agent-supplied storage body, the conversion to Markdown ([`storage_to_markdown`]) and (later
 //! tasks) the hard check and the lossy count. Sibling modules reach the lexical fallback scan as
 //! `parse::lexical_constructs`.
+//!
+//! Public beyond the Δ1 list (additions, like `wiki::parse` and `wiki::construct_spans`): the
+//! tree ([`parse`], [`StorageDoc`], [`Node`], [`Element`], [`Ns`], [`MAX_DEPTH`]) and
+//! [`construct_spans`], for the hard check and the properties tested from outside.
 
 mod parse;
 mod to_md;

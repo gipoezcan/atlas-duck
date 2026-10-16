@@ -8,8 +8,8 @@ use std::ops::Range;
 
 use atlas_duck_convert::storage::{self, Element, Node, Ns, StorageDoc, construct_spans};
 use atlas_duck_convert::{
-    ConstructKind, StorageReject, StorageUsers, check_storage_body, storage_constructs,
-    storage_user_refs,
+    ConstructKind, StorageReject, StorageUsers, WikiConstructs, check_storage_body,
+    storage_constructs, storage_user_refs,
 };
 use proptest::prelude::*;
 
@@ -129,6 +129,7 @@ fn macro_inventory_names_and_params() -> TestResult {
         .collect();
     assert_eq!(params[0], (Some("language"), "java".to_owned()));
     assert_eq!(params[1], (Some("title"), "Note".to_owned()));
+    // The include targets inside the parameters are constructs of their own to the hard check.
     let spans = construct_spans(&doc);
     assert_eq!(
         kinds(&spans),
@@ -138,9 +139,46 @@ fn macro_inventory_names_and_params() -> TestResult {
             ConstructKind::Macro,
             ConstructKind::Macro,
             ConstructKind::Include,
-            ConstructKind::Include
+            ConstructKind::Link,
+            ConstructKind::Include,
+            ConstructKind::Link
         ]
     );
+    Ok(())
+}
+
+#[test]
+fn constructs_inside_code_macro_parts_are_spans() -> TestResult {
+    // A faulty converter output: the code macro is the recorded construct, what sits in its
+    // parameter or its plain-text body is not (review I-1).
+    let cases = [
+        concat!(
+            "<ac:structured-macro ac:name=\"code\"><ac:parameter ac:name=\"language\">",
+            "<ri:user ri:userkey=\"x\"/></ac:parameter>",
+            "<ac:plain-text-body><![CDATA[..]]></ac:plain-text-body></ac:structured-macro>"
+        ),
+        concat!(
+            "<ac:structured-macro ac:name=\"code\"><ac:plain-text-body>",
+            "<ri:user ri:userkey=\"x\"/><![CDATA[..]]></ac:plain-text-body></ac:structured-macro>"
+        ),
+    ];
+    for src in cases {
+        let doc = storage::parse(src);
+        assert!(doc.xml_ok, "{src}");
+        let user = src.find("<ri:user").ok_or("no user")?;
+        let user_end = user + "<ri:user ri:userkey=\"x\"/>".len();
+        assert_eq!(
+            construct_spans(&doc),
+            vec![
+                (ConstructKind::Macro, 0..src.len()),
+                (ConstructKind::Mention, user..user_end)
+            ],
+            "{src}"
+        );
+        // The inventory still lists the macro alone: its parameters and body belong to it.
+        assert_eq!(storage_constructs(src).macros, ["code"], "{src}");
+        assert!(storage_constructs(src).mentions.is_empty(), "{src}");
+    }
     Ok(())
 }
 
@@ -513,6 +551,145 @@ fn partial_parse_lexical_inventory_over_reports() {
     assert!(storage_constructs(dtd).mentions.iter().any(|m| m == "x"));
 }
 
+/// The inventory the lexical fallback gives for `src`: a trailing processing instruction makes
+/// the parse fail, and is no start tag itself, so the scan sees exactly the tags of `src`.
+fn lexical(src: &str) -> Result<WikiConstructs, String> {
+    let broken = format!("{src}<?x y?>");
+    if storage::parse(&broken).xml_ok {
+        return Err(format!("{broken:?} parsed"));
+    }
+    Ok(storage_constructs(&broken))
+}
+
+fn list_lens(inv: &WikiConstructs) -> [(&'static str, usize); 6] {
+    [
+        ("macros", inv.macros.len()),
+        ("includes", inv.includes.len()),
+        ("mentions", inv.mentions.len()),
+        ("links", inv.links.len()),
+        ("images", inv.images.len()),
+        ("attachments", inv.attachments.len()),
+    ]
+}
+
+/// Each list of the lexical inventory of `src` is at least as long as the tree's (PD-94 (3)).
+fn lexical_covers_tree(src: &str) -> Result<(), String> {
+    let tree = storage_constructs(src);
+    let lex = lexical(src)?;
+    for ((name, t), (_, l)) in list_lens(&tree).into_iter().zip(list_lens(&lex)) {
+        if l < t {
+            return Err(format!(
+                "lexical {name} {lex:?} shorter than tree {tree:?} for {src:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn lexical_inventory_follows_the_tree_categories() -> TestResult {
+    // Review I-2: the cases where the scan used to list less than the tree, or elsewhere.
+    type Expect = fn(&WikiConstructs) -> bool;
+    let cases: [(&str, Expect); 9] = [
+        ("<p><a href=\"https://x\">x</a></p>", |i| {
+            i.links == ["https://x"]
+        }),
+        ("<A href=\"https://x\">x</A>", |i| i.links == ["https://x"]),
+        ("<img src=\"i.png\"/><IMG src=\"j.png\"/>", |i| {
+            i.images == ["i.png", "j.png"]
+        }),
+        ("<ri:url ri:value=\"u\"/>", |i| {
+            i.links == ["u"] && i.images.is_empty()
+        }),
+        ("<ac:structured-macro ac:name=\"inc&#108;ude\"/>", |i| {
+            i.includes == ["include"] && i.macros.is_empty()
+        }),
+        ("<p zz:a=\"1\">x</p>", |i| i.macros == ["p"]),
+        (
+            "<ac:structured-macro zz:a=\"1\" ac:name=\"include\"/>",
+            |i| i.macros.iter().any(|m| m == "ac:structured-macro"),
+        ),
+        (
+            "<ac:structured-macro ac:title=\" ac:name='toc'\" ac:name=\"include\"/>",
+            |i| i.includes == ["include"] && i.macros.is_empty(),
+        ),
+        (
+            "<ac:parameter ac:name=\"x\">v</ac:parameter><ac:plain-text-body/><ac:plain-text-link-body/>",
+            |i| i.macros.is_empty(),
+        ),
+    ];
+    for (src, expect) in cases {
+        assert!(storage::parse(src).xml_ok, "{src}");
+        lexical_covers_tree(src)?;
+        let lex = lexical(src)?;
+        assert!(expect(&lex), "{src}: {lex:?}");
+    }
+    // A stray parameter or plain-text body is structure in the tree too.
+    let stray = "<ac:parameter ac:name=\"x\"><ac:emoticon ac:name=\"smile\"/></ac:parameter>";
+    assert_eq!(storage_constructs(stray).macros, ["emoticon"]);
+    // A raw `>` in an attribute value does not end the tag for the scan.
+    let gt = "<ac:structured-macro ac:title=\"a > b\" ac:name=\"excerpt-include\"/>";
+    assert_eq!(lexical(gt)?.includes, ["excerpt-include"]);
+    Ok(())
+}
+
+#[test]
+fn xml_prefix_on_attributes_is_known() -> TestResult {
+    // `xml` is bound by the Namespaces spec and cannot be rebound (review M-1).
+    let src = "<p xml:lang=\"de\" xml:space=\"preserve\">x</p>";
+    let doc = storage::parse(src);
+    assert!(doc.xml_ok);
+    let [Node::Element(p)] = doc.nodes.as_slice() else {
+        return Err(format!("unexpected nodes {:?}", doc.nodes).into());
+    };
+    assert_eq!(p.ns, Ns::Html);
+    assert_eq!(check_storage_body(src), Ok(()));
+    // Still not the converter's output: an attribute makes the element markup.
+    assert_eq!(
+        construct_spans(&doc),
+        vec![(ConstructKind::Markup, 0..src.len())]
+    );
+    assert!(storage_constructs(src).macros.is_empty());
+    // As an element prefix it stays foreign.
+    assert_eq!(
+        check_storage_body("<xml:x/>"),
+        Err(StorageReject::UnknownPrefix)
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_user_refs_are_skipped() {
+    let src = "<ri:user ri:userkey=\"\" ri:username=\"legacy\"/><ri:user ri:userkey=\"\"/>\
+               <ri:user ri:username=\"\"/><ri:user ri:userkey=\"k\"/>";
+    assert_eq!(
+        storage_user_refs(src),
+        StorageUsers {
+            keys: BTreeSet::from(["k".to_owned()]),
+            usernames: BTreeSet::from(["legacy".to_owned()]),
+        }
+    );
+    // Every mention is still listed, by its non-empty key, else its username.
+    assert_eq!(storage_constructs(src).mentions, ["legacy", "", "", "k"]);
+}
+
+#[test]
+fn image_children_and_html_case_are_inventoried() {
+    let src = concat!(
+        "<ac:image><ri:attachment ri:filename=\"a.png\"><ri:page ri:content-title=\"P\"/></ri:attachment>",
+        "<ac:caption><p>see <a href=\"https://x\">x</a> <ac:link><ri:page ri:content-title=\"Q\"/></ac:link></p></ac:caption>",
+        "</ac:image>",
+        "<IMG src=\"b.png\"/><A href=\"https://y\">y</A><Img/>",
+    );
+    assert!(storage::parse(src).xml_ok);
+    let inv = storage_constructs(src);
+    assert_eq!(inv.images, ["a.png", "b.png", ""]);
+    // The image's own resource is its label; the caption's content is listed.
+    assert_eq!(inv.links, ["https://x", "Q", "https://y"]);
+    assert_eq!(inv.macros, ["caption"]);
+    assert!(inv.attachments.is_empty());
+}
+
 #[test]
 fn check_storage_body_accepts_confluence_storage() {
     let page = concat!(
@@ -557,9 +734,15 @@ fn check_ranges(src: &str, nodes: &[Node], xml_ok: bool) -> Result<(), String> {
                 if !slice.starts_with(&open) {
                     return Err(format!("{slice:?} does not start with {open:?}"));
                 }
-                let close = format!("</{}>", e.qname());
-                if xml_ok && !(slice.ends_with("/>") || slice.ends_with(&close)) {
-                    return Err(format!("{slice:?} does not end the element"));
+                // In a complete parse the slice is exactly the element: it parses alone as one
+                // element of the same name (an inner `</p>` would leave the outer `<p>` open).
+                if xml_ok {
+                    let alone = storage::parse(slice);
+                    let one = matches!(alone.nodes.as_slice(),
+                        [Node::Element(x)] if x.qname() == e.qname() && x.byte_range == (0..slice.len()));
+                    if !(alone.xml_ok && one) {
+                        return Err(format!("{slice:?} is not one whole {}", e.qname()));
+                    }
                 }
                 check_ranges(src, &e.children, xml_ok)?;
                 for c in &e.children {
@@ -616,6 +799,19 @@ fn ranges_slice_the_original_input() -> TestResult {
     for (_, r) in construct_spans(&doc) {
         assert!(src.get(r).is_some());
     }
+    // Nested elements of one name: the outer range ends at its own end tag.
+    let nested = "<div>a<div>b</div>c<p><p/></p></div>";
+    let doc = storage::parse(nested);
+    check_ranges(nested, &doc.nodes, true)?;
+    let [Node::Element(outer)] = doc.nodes.as_slice() else {
+        return Err(format!("unexpected nodes {:?}", doc.nodes).into());
+    };
+    assert_eq!(outer.byte_range, 0..nested.len());
+    let inner: Vec<Range<usize>> = elements(&outer.children)
+        .iter()
+        .map(|e| e.byte_range.clone())
+        .collect();
+    assert_eq!(inner, [6..18, 19..30, 22..26]);
     // A failed parse still reports valid ranges for what it read.
     let bad = "<p>ü<ac:link>😀<ri:user ri:userkey=\"k\"/>";
     let doc = storage::parse(bad);
@@ -641,6 +837,18 @@ proptest! {
         let _ = storage_user_refs(&src);
         // Deterministic.
         prop_assert_eq!(storage::parse(&src), doc);
+    }
+
+    /// PD-94 (3): on a well-formed body the lexical fallback lists at least as much as the tree,
+    /// in every list (review I-2).
+    #[test]
+    fn lexical_inventory_never_under_reports(src in common::storage_well_formed()) {
+        if !storage::parse(&src).xml_ok {
+            // Too deep: nothing to compare against.
+            return Ok(());
+        }
+        let checked = lexical_covers_tree(&src);
+        prop_assert!(checked.is_ok(), "{:?}", checked);
     }
 }
 
