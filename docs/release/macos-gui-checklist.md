@@ -99,6 +99,13 @@ For each architecture:
 2. Expected: it opens as a private (incognito-style) session. Log in with the mock, then close the window and reopen it.
    - Expected: no stored session survives the reopen (no shared storage with the main window).
 3. Check that the window does not share session state with the approvals window (expected: logging in through the credential window does not sign the approvals window in).
+4. In a debug build (devtools exist in debug builds only), open the Web Inspector of the credential window after it loaded.
+   - Expected: the console shows no "Refused to ..." Content Security Policy message, and the token form is shown (its `credential_context` call answered through the isolation frame).
+
+Coverage of the credential window by OS (M6 CI ruling, run 38859187604): the e2e flows that drive this window (`credential_page_meta_csp_enforced`, `s07_credential_window_incognito_or_own_data_dir`, `s09_isolation_invoke_round_trips_credential_window`, `s09_main_frame_navigation_refused_in_credential_window`) run on Windows only (`WINDOWS_ONLY_FLOWS` in `app/src-tauri/tests/e2e/flows.rs`). The window has its own data directory (S-07), so its own browser context, and on Linux `tauri-runtime-wry` allows WebKit automation for the first web context only; no shared context is added for tests.
+
+- macOS: CI drives no webview at all. The credential window's CSP and its own data directory are checked by hand, steps 1 to 4 above.
+- Linux: covered only by the unit tests of Tasks 5, 6 and 20: `ci/check-csp.mjs` and its tests (the meta CSP of `credential.html`), `ci/check-credential-bundle.mjs` (no shared chunk, no web storage), `windows::credential_builder_incognito_or_own_dir` (own data directory), `csp::tests` (the isolation style hash in the credential policy) and `app/src-tauri/tests/credential.rs`. No real WebKitGTK webview checks the enforced policy on Linux.
 
 ## 7. Tray and menu
 
@@ -143,6 +150,7 @@ Fill one row per check, per architecture. Mark each item `PASS`, `FAIL` or `N/A`
 |      |        |      |  | 5.3 Cmd+Q with write on wire, waits, no hang |  |  |
 |      |        |      |  | 5.4 APP_STOP {quit} logged, Verify now |  |  |
 |      |        |      |  | 6. Credential window private (V35) |  |  |
+|      |        |      |  | 6.4 Credential window CSP: no violation, token form shown (debug build) |  |  |
 |      |        |      |  | 7. Tray show, tray quit |  |  |
 |      |        |      |  | 7.4 Cmd+Shift chords |  |  |
 

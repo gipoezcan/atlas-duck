@@ -15,8 +15,9 @@
 //! - A failed check is an `Err` (the `ensure!` macros), never a panic, so `Rig::finish` always
 //!   runs: screenshot, the world's diagnostics, the app's quit.
 //! - The credential window has its own data directory and so its own browser context (S-07). The
-//!   flows that need it through the driver may fail on a first CI run for that automation-context
-//!   reason alone (see [`CREDENTIAL_UNREACHABLE`]); no test-only shared context is ever added.
+//!   flows that need it through the driver run on Windows only ([`WINDOWS_ONLY_FLOWS`] says why;
+//!   `#[cfg(windows)]`, so the Linux test list does not hold them and `check-no-skips` counts what
+//!   exists); no test-only shared context is ever added.
 
 use std::time::{Duration, Instant};
 
@@ -93,18 +94,57 @@ const APP_ORIGIN: &str = if cfg!(windows) {
 } else {
     "tauri://localhost"
 };
-/// Appended to every failure to reach the credential window through the driver. The credential
-/// window has its own data directory (T6, S-07), hence its own browser context, and a driver may
-/// not be able to automate it: Linux (`tauri-runtime-wry` allows WebKit automation for the first
-/// web context only) and Windows (a data directory of its own is a browser process of its own, and
-/// only one owns the debugging port of the driver). A failure of this kind is no product finding:
-/// the T6 unit test and a manual check cover the window, and a test-only shared context is never
-/// the answer (it would defeat S-07).
+/// Appended to every failure to reach the credential window through the driver (Windows: a data
+/// directory of its own is a browser process of its own, which may not own the driver's debugging
+/// port). A failure of this kind is no product finding, and a test-only shared context is never the
+/// answer (it would defeat S-07).
+#[cfg(windows)]
 const CREDENTIAL_UNREACHABLE: &str = "the credential window could not be reached through the driver. \
      This may be the automation context, not the product: it has its own data directory and so its \
-     own browser context (Linux: tauri-runtime-wry allows WebKit automation for the first web \
-     context only; Windows: a data directory of its own is a browser process of its own that does \
-     not own the debugging port). Do not add a shared context for tests (S-07)";
+     own browser context (a browser process of its own that may not own the debugging port). Do not \
+     add a shared context for tests (S-07)";
+
+/// Why the credential-window flows do not run on Linux (M6 CI ruling, run 38859187604).
+const CREDENTIAL_NOT_ON_LINUX: &str = "the credential window has its own data directory (S-07), so \
+     its own WebKit web context, and tauri-runtime-wry allows WebKit automation for the first web \
+     context only: WebKitWebDriver cannot reach it. Linux keeps the unit tests (check-csp, \
+     check-credential-bundle, windows::credential_builder_incognito_or_own_dir, csp::tests, \
+     tests/credential.rs); macOS runs no driver at all (docs/release/macos-gui-checklist.md, \
+     section 6)";
+
+/// The flows that run on Windows only, each `#[cfg(windows)]`, with the reason. Every other flow
+/// runs on both OSes and is in [`COMMON_FLOWS`]; a pure test holds the two lists to the source.
+const WINDOWS_ONLY_FLOWS: [(&str, &str); 5] = [
+    (
+        "i40_wm_queryendsession_runs_shutdown_path",
+        "WM_QUERYENDSESSION is a Windows window message (I-40)",
+    ),
+    ("credential_page_meta_csp_enforced", CREDENTIAL_NOT_ON_LINUX),
+    (
+        "s07_credential_window_incognito_or_own_data_dir",
+        CREDENTIAL_NOT_ON_LINUX,
+    ),
+    (
+        "s09_isolation_invoke_round_trips_credential_window",
+        CREDENTIAL_NOT_ON_LINUX,
+    ),
+    (
+        "s09_main_frame_navigation_refused_in_credential_window",
+        CREDENTIAL_NOT_ON_LINUX,
+    ),
+];
+
+/// The flows that run on every OS the e2e job runs on (Windows and Linux).
+const COMMON_FLOWS: [&str; 8] = [
+    "ui06_create_approve_receipt_verify_now",
+    "s06_payloads_inert_in_real_webview",
+    "s08_preview_css_loads_inline_style_and_remote_image_blocked",
+    "s09_isolation_invoke_round_trips_every_window",
+    "s09_isolation_invoke_setup_window",
+    "s09_main_frame_navigation_refused_in_every_window",
+    "ui_chords_work_outside_the_preview_frame_and_stay_in_it",
+    "p01_first_screen_under_1s",
+];
 
 /// Strings an agent or a server could put into any text field: markup, handlers, URL schemes, a
 /// style block, a bidi override. Every one would change the page, the title or the `data-alive`
@@ -276,7 +316,8 @@ impl Rig {
 
     /// Approvals -> Settings -> the instance's token button -> the credential window, once its
     /// `credential_context` call succeeded: the token form is there and the failed-load page (an
-    /// `h1.title` too, with a `p.error` and no form) is not.
+    /// `h1.title` too, with a `p.error` and no form) is not. Windows only ([`WINDOWS_ONLY_FLOWS`]).
+    #[cfg(windows)]
     async fn open_credential(&self) -> Result<()> {
         self.open_window("Settings", "Settings").await?;
         let token = self
@@ -291,6 +332,7 @@ impl Rig {
     }
 
     /// Switches to the open credential window and waits for its loaded page.
+    #[cfg(windows)]
     async fn switch_to_credential(&self) -> Result<()> {
         let unreachable = |e: Box<dyn std::error::Error>| -> Box<dyn std::error::Error> {
             format!("{e}\n{CREDENTIAL_UNREACHABLE}").into()
@@ -717,7 +759,8 @@ async fn s06(rig: &Rig) -> Result<()> {
 /// absent from the credential window, before and after a reload of each. This evidences in-memory
 /// separation only: that the credential window has a data directory (or incognito mode) of its own
 /// is `windows::credential_builder_incognito_or_own_dir` (T6), and the driver cannot show a storage
-/// partition. Needs the credential window through the driver (see [`CREDENTIAL_UNREACHABLE`]).
+/// partition. Needs the credential window through the driver: Windows only ([`WINDOWS_ONLY_FLOWS`]).
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s07_credential_window_incognito_or_own_data_dir() -> Result<()> {
     if !opted_in("s07_credential_window_incognito_or_own_data_dir") {
@@ -735,6 +778,7 @@ async fn s07_credential_window_incognito_or_own_data_dir() -> Result<()> {
 /// sent at once it is dropped and the field stays empty. So the keys are sent again, only while the
 /// field is still empty, until they land or `WAIT` is over (a field that holds anything else is a
 /// failure: the keys were not all swallowed).
+#[cfg(windows)]
 async fn type_when_armed(wd: &WebDriver, field: &Element, text: &str) -> Result<()> {
     let deadline = Instant::now() + WAIT;
     loop {
@@ -748,6 +792,7 @@ async fn type_when_armed(wd: &WebDriver, field: &Element, text: &str) -> Result<
     }
 }
 
+#[cfg(windows)]
 async fn s07(rig: &Rig) -> Result<()> {
     const TYPED: &str = "S07-typed-in-approvals-5b7e1c";
     let wd = &rig.wd;
@@ -818,7 +863,8 @@ async fn s07(rig: &Rig) -> Result<()> {
 /// Â§10.3 policy of the shipped page with this build's isolation origin in `frame-src`. The counter
 /// starts from the page's module script, after Tauri's init scripts ran: it covers violations after
 /// page start only (a blocked isolation frame shows as the page never loading its context). Needs
-/// the credential window through the driver (see [`CREDENTIAL_UNREACHABLE`]).
+/// the credential window through the driver: Windows only ([`WINDOWS_ONLY_FLOWS`]).
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credential_page_meta_csp_enforced() -> Result<()> {
     if !opted_in("credential_page_meta_csp_enforced") {
@@ -864,6 +910,7 @@ fn is_isolation_origin(origin: &str) -> bool {
     id.is_some_and(|u| u.len() == 36 && u.bytes().all(|c| c.is_ascii_hexdigit() || c == b'-'))
 }
 
+#[cfg(windows)]
 async fn csp(rig: &Rig) -> Result<()> {
     let wd = &rig.wd;
     rig.open_credential().await?;
@@ -1048,13 +1095,13 @@ async fn s08(rig: &Rig) -> Result<()> {
 
 // ---- S-09: every window round-trips one granted call ---------------------------------------------------
 
-/// S-09 (webview half, V34): in a real webview behind the isolation pattern each window shows the
-/// result of one granted read-only call, shows no alert, and reports no `securitypolicyviolation`
-/// (every window counts them in `data-csp-violations`: the production listener of `shared/alive.ts`,
-/// and the credential page's own). The counters start from the page's module script, after Tauri's
+/// S-09 (webview half, V34): in a real webview behind the isolation pattern each main window shows
+/// the result of one granted read-only call, shows no alert, and reports no
+/// `securitypolicyviolation` (every window counts them in `data-csp-violations`: the production
+/// listener of `shared/alive.ts`). The counters start from the page's module script, after Tauri's
 /// init scripts: a blocked isolation frame (raised before) shows as the page never reaching its
-/// result, which the waits below fail on. The credential part needs that window through the driver
-/// (see [`CREDENTIAL_UNREACHABLE`]).
+/// result, which the waits below fail on. The credential window is its own flow,
+/// [`s09_isolation_invoke_round_trips_credential_window`] (Windows only).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s09_isolation_invoke_round_trips_every_window() -> Result<()> {
     if !opted_in("s09_isolation_invoke_round_trips_every_window") {
@@ -1107,11 +1154,27 @@ async fn s09(rig: &Rig) -> Result<()> {
         wd.switch_to_title(&window_title(title), WAIT).await?;
         no_alert_no_violation(wd, title).await?;
     }
-    // Credential, last (it may not be drivable, see above): credential_context answered
-    // (`open_credential` waits for the token form, which the failed-load page does not have).
-    rig.open_credential().await?;
-    no_alert_no_violation(wd, "Credential").await?;
     Ok(())
+}
+
+/// S-09 (credential window, V34): credential_context answered through the isolation pattern
+/// (`open_credential` waits for the token form, which the failed-load page does not have), no alert,
+/// and the page's own `data-csp-violations` counter reads 0. Needs the credential window through the
+/// driver: Windows only ([`WINDOWS_ONLY_FLOWS`]).
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s09_isolation_invoke_round_trips_credential_window() -> Result<()> {
+    if !opted_in("s09_isolation_invoke_round_trips_credential_window") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    let rig = Rig::approvals(world).await?;
+    let outcome: Result<()> = async {
+        rig.open_credential().await?;
+        no_alert_no_violation(&rig.wd, "Credential").await
+    }
+    .await;
+    rig.finish("s09_credential", outcome).await
 }
 
 /// The current window shows no `role=alert` and its violation counter reads exactly `0` (an absent
@@ -1236,7 +1299,8 @@ async fn navigation_main(rig: &Rig) -> Result<()> {
 }
 
 /// Navigation refusal in the credential window. Own flow: it needs that window through the driver
-/// (see [`CREDENTIAL_UNREACHABLE`]) and must not hide the main windows' result.
+/// (Windows only, [`WINDOWS_ONLY_FLOWS`]) and must not hide the main windows' result.
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s09_main_frame_navigation_refused_in_credential_window() -> Result<()> {
     if !opted_in("s09_main_frame_navigation_refused_in_credential_window") {
@@ -1829,6 +1893,85 @@ mod tests {
                 rest.lines().next().unwrap_or_default()
             );
         }
+    }
+
+    /// Every flow in the source with whether it is `#[cfg(windows)]`: the `async fn` directly under
+    /// a `#[tokio::test..]` attribute, the attribute lines above it read up to the first other line.
+    fn flows_in(source: &str) -> Vec<(String, bool)> {
+        let lines: Vec<&str> = source.lines().map(str::trim).collect();
+        let mut flows = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line.strip_prefix("async fn ") else {
+                continue;
+            };
+            let attrs: Vec<&str> = lines[..i]
+                .iter()
+                .rev()
+                .take_while(|l| l.starts_with("#["))
+                .copied()
+                .collect();
+            if !attrs
+                .first()
+                .is_some_and(|a| a.starts_with("#[tokio::test"))
+            {
+                continue;
+            }
+            let name = rest.split('(').next().unwrap_or_default().to_owned();
+            flows.push((name, attrs.contains(&"#[cfg(windows)]")));
+        }
+        flows
+    }
+
+    /// A flow is either common (both OSes) or Windows-only with its reason, and the source says the
+    /// same: a new flow fails here until it is put in one of the two lists, and a Windows-only flow
+    /// is compiled out elsewhere (never a silent skip: `check-no-skips` counts the `--list` of each OS).
+    #[test]
+    fn every_flow_is_common_or_windows_only_with_its_reason() {
+        let flows = flows_in(include_str!("flows.rs"));
+        assert!(flows.len() >= 13, "{} flows found", flows.len());
+        let windows_only: Vec<&str> = WINDOWS_ONLY_FLOWS.iter().map(|(n, _)| *n).collect();
+        for (name, cfg_windows) in &flows {
+            let common = COMMON_FLOWS.contains(&name.as_str());
+            let only = windows_only.contains(&name.as_str());
+            assert!(
+                common != only,
+                "{name}: in neither or both of COMMON_FLOWS and WINDOWS_ONLY_FLOWS"
+            );
+            assert_eq!(
+                *cfg_windows, only,
+                "{name}: #[cfg(windows)] differs from the lists"
+            );
+        }
+        let names: Vec<&str> = flows.iter().map(|(n, _)| n.as_str()).collect();
+        for listed in COMMON_FLOWS.iter().chain(&windows_only) {
+            assert!(names.contains(listed), "{listed} is listed but no flow");
+        }
+        for (name, reason) in WINDOWS_ONLY_FLOWS {
+            assert!(reason.len() > 20, "{name}: no reason");
+        }
+        // The rule above is not vacuous: the credential flows are among the Windows-only ones.
+        assert!(windows_only.contains(&"credential_page_meta_csp_enforced"));
+        assert!(COMMON_FLOWS.contains(&"s09_isolation_invoke_round_trips_every_window"));
+    }
+
+    #[test]
+    fn flows_in_reads_the_cfg_above_the_test_attribute() {
+        // One element per line, each quoted: the other source scans of this file see no flow here.
+        let source = [
+            "#[cfg(windows)]",
+            "#[tokio::test(flavor = \"multi_thread\")]",
+            "async fn a() {}",
+            "#[tokio::test]",
+            "async fn b() -> R {}",
+            "#[cfg(windows)]",
+            "async fn helper() {}",
+            "fn c() {}",
+        ]
+        .join("\n");
+        assert_eq!(
+            flows_in(&source),
+            vec![("a".to_owned(), true), ("b".to_owned(), false)]
+        );
     }
 
     #[test]
