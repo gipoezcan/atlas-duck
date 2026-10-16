@@ -533,6 +533,24 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: M8 confined script suite (§15 V11 closure, V02 confirmation)
+        run: |
+          set -euo pipefail
+          # Linux and macOS: the script worker loop runs in a confined child of the test binary
+          # (seccomp + Landlock, sandbox_init); no case may die by SIGSYS. Windows: the same
+          # corpus runs unconfined (`V11 os=windows confined=false`); the confined Windows
+          # evidence is the sandbox_runs step.
+          cargo test -p atlas-duck-sandbox-worker --test confined_scripts --locked 2>&1 | tee "$RUNNER_TEMP/confined-scripts.log"
+          grep -E '^V11 os=(linux|macos) confined=true$|^V11 os=windows confined=false$' "$RUNNER_TEMP/confined-scripts.log"
+          grep -E '^V11 corpus=[0-9]+ passed=[0-9]+ killed_by_sigsys=0$' "$RUNNER_TEMP/confined-scripts.log"
+          grep -E '^V02 eval_required=true$' "$RUNNER_TEMP/confined-scripts.log"
+          {
+            echo "### M8 confined script suite ($RUNNER_OS)"
+            echo '```'
+            grep -E '^V11 |^V02 |^confined_scripts' "$RUNNER_TEMP/confined-scripts.log" | cut -c1-400
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Fedora 40 probes (glibc 2.39, §15 V11)
         if: runner.os == 'Linux'
         run: |
@@ -1136,6 +1154,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/fedora"
           cp "$exe" "$RUNNER_TEMP/fedora/probe_evidence"
           cp target/debug/atlas-duck-sandbox "$RUNNER_TEMP/fedora/atlas-duck-sandbox"
+          # M8 Task 5: the confined script suite, run in the container below (glibc 2.39).
+          scripts_exe="$(cargo test -p atlas-duck-sandbox-worker --test confined_scripts --no-run --locked --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.name == "confined_scripts" and .executable != null) | .executable' \
+            | tail -n 1)"
+          test -x "$scripts_exe"
+          cp "$scripts_exe" "$RUNNER_TEMP/fedora/confined_scripts"
           ls -l "$RUNNER_TEMP/fedora"
 
       - name: Probe evidence (§9.4, go/no-go record)
@@ -1153,6 +1177,28 @@ jobs:
               fi
               /w/probe_evidence --nocapture --test-threads=1
             '
+
+      - name: M8 confined script suite on Fedora 40 (§15 V11 closure, V02 confirmation)
+        run: |
+          set -euo pipefail
+          # The container keeps Docker's default seccomp profile on purpose, as in the probe step.
+          # The suite re-executes /w/confined_scripts as the confined child (read-only mount).
+          docker run --rm \
+            -v "$RUNNER_TEMP/fedora:/w:ro" \
+            fedora:40 sh -c '
+              set -e
+              echo "RUNNER_FACT $(rpm -q glibc) on kernel $(uname -r)"
+              /w/confined_scripts
+            ' 2>&1 | tee "$RUNNER_TEMP/confined-scripts-fedora.log"
+          grep -E '^V11 os=linux confined=true$' "$RUNNER_TEMP/confined-scripts-fedora.log"
+          grep -E '^V11 corpus=[0-9]+ passed=[0-9]+ killed_by_sigsys=0$' "$RUNNER_TEMP/confined-scripts-fedora.log"
+          grep -E '^V02 eval_required=true$' "$RUNNER_TEMP/confined-scripts-fedora.log"
+          {
+            echo "### M8 confined script suite (Fedora 40, glibc 2.39)"
+            echo '```'
+            grep -E '^RUNNER_FACT |^V11 |^V02 |^confined_scripts' "$RUNNER_TEMP/confined-scripts-fedora.log" | cut -c1-400
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   core-suite-fedora:
     name: core-suite-fedora (M3 integration suite on Fedora 40, glibc 2.39, CI-02)
