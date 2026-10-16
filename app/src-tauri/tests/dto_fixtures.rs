@@ -430,6 +430,7 @@ fn bodies() -> Vec<PreviewBody> {
             replaces_version: Some(3),
             existing: Some("attachment att9001, version 2".into()),
             comment: None,
+            notes: vec!["extension and content type differ".into()],
             // The digest-only body view (M7 Δ2).
             requests: vec![RequestView {
                 index: 0,

@@ -266,9 +266,10 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
                 pre_text(doc, diff_text);
             }
             // §6.3: the diff from the agent's base to the current state and the agent's intended
-            // change (M7 Δ2); Jira computes neither, so an empty list has no section.
+            // change (M7 Δ2); Jira computes neither, so an empty list has no section. The heading
+            // names the rendered diff apart from the `diff_text` one above (T8 review m-1).
             if !base_to_current.is_empty() {
-                doc.el("h3", "Diff from the agent's base to the current state");
+                doc.el("h3", "Rendered diff: the agent's base → the current state");
                 diff(doc, base_to_current);
             }
             if !intended.is_empty() {
@@ -277,7 +278,12 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             }
             consequences(doc, &[&DENY], None);
             doc.close("section");
-            requests_section(doc, "Requests to be sent", requests);
+            // Only when there are requests (T8 review I-1): a hold found during enrichment has
+            // none built yet (Task 15 widens the engine's gate), and "none" would read as a
+            // write that sends nothing. The model still carries the list (§5.1 inv. 4).
+            if !requests.is_empty() {
+                requests_section(doc, "Requests to be sent", requests);
+            }
         }
         PreviewBody::CouldNotRecheck { class, requests } => {
             section(doc, warning::TEXT_COULD_NOT_RECHECK);
@@ -475,13 +481,14 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             doc.open("table");
             doc.open("tbody");
             text_row(doc, "page", page);
+            // PD-106: a fixed row next to the page (T8 review m-3).
+            fixed_row(doc, "body", PAGE_MOVE_BODY_NOT_SENT);
             doc.close("tbody");
             doc.close("table");
             doc.el("h3", "Old ancestor path");
             path_list(doc, from_path);
             doc.el("h3", "New ancestor path");
             path_list(doc, to_path);
-            doc.el("p", PAGE_MOVE_BODY_NOT_SENT);
             doc.close("section");
             requests_section(doc, "Requests to be sent", requests);
         }
@@ -494,6 +501,7 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             replaces_version,
             existing,
             comment,
+            notes,
             requests,
         } => {
             section(doc, "Attachment upload");
@@ -517,6 +525,11 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             }
             doc.close("tbody");
             doc.close("table");
+            // PD-110's facts about the file (e.g. "extension and content type differ"), T8
+            // review I-2.
+            if !notes.is_empty() {
+                text_list(doc, notes, "notes");
+            }
             if let Some(v) = replaces_version {
                 doc.el("p", &replaces_existing_attachment(*v));
             }
@@ -840,10 +853,16 @@ fn confluence_comments(doc: &mut Doc, comments: &[ConfluenceComment], count: Opt
     }
     if let Some(i) = left_out {
         let rest = &comments[i..];
-        doc.hide(rest.iter().map(|c| len_u64(c.body_html.len())).sum());
+        doc.hide(rest.iter().map(comment_len).sum());
         more_note(doc, rest.len(), "comments");
     }
     doc.close("section");
+}
+
+/// What a left-out comment would have shown (T8 review m-5, like [`request_len`]).
+fn comment_len(c: &ConfluenceComment) -> u64 {
+    let opt = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+    len_u64(c.id.len() + opt(&c.author) + opt(&c.created) + opt(&c.location) + c.body_html.len())
 }
 
 fn confluence_comment(doc: &mut Doc, c: &ConfluenceComment) {

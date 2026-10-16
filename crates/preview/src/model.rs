@@ -33,8 +33,9 @@ pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     ("render1", 0x50e0_b962_fa25_e8fa),
     ("render2", 0x5977_a808_67ef_8b73),
     ("render3", 0x18d6_262f_815e_9ad3),
-    // M7 Task 8 (Δ2): the Confluence arms, the conflict card's diffs and requests, the digest body.
-    ("render4", 0xe915_6a82_b227_895f),
+    // M7 Task 8 (Δ2): the Confluence arms, the conflict card's diffs and requests (only when
+    // there are any), the attachment notes, the digest body.
+    ("render4", 0x6c6a_b8ec_eb41_14a5),
 ];
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
@@ -295,7 +296,9 @@ pub enum PreviewBody {
         conversion: Option<ConversionFacts>,
     },
     /// §6.3 Confluence comments (M7 Δ2, PD-103): in thread order, each with its depth below the
-    /// top-level comment.
+    /// top-level comment. Core emits them depth-first (a reply right after its parent's earlier
+    /// replies): the renderer nests by `depth` and order alone, not by `parent_id` (T8 review
+    /// m-6).
     ConfluenceComments {
         comments: Vec<ConfluenceComment>,
         count: Option<ItemCount>,
@@ -323,6 +326,8 @@ pub enum PreviewBody {
     /// `thumbnail_data_uri` is rendered as an image only when it is a
     /// `data:image/{png,jpeg,gif,webp};base64,` URI; `existing` holds the facts of the attachment
     /// a collision hold found; `replaces_version` is the version a `replace` upload replaces.
+    /// `notes` are display-escaped facts about the file shown under the fact table, such as
+    /// PD-110's "extension and content type differ" (T8 review I-2); empty for none.
     AttachmentUpload {
         filename: String,
         size: u64,
@@ -332,6 +337,7 @@ pub enum PreviewBody {
         replaces_version: Option<u64>,
         existing: Option<String>,
         comment: Option<String>,
+        notes: Vec<String>,
         requests: Vec<RequestView>,
     },
 }
@@ -432,8 +438,9 @@ impl PreviewBody {
     }
 
     /// The warning this body's content implies: `CouldNotRecheck` for that card, `RawOnlyDiff`
-    /// for an edit diff with raw-only changes. The model must carry it: the Caution strip shows
-    /// exactly the model's warnings, and those are what `PREVIEW_SHOWN.warning_ids` records
+    /// for an edit diff with raw-only changes, `ServerRenderedView` for a Confluence page shown
+    /// in its `view` format (§6.2, T8 review I-3). The model must carry it: the Caution strip
+    /// shows exactly the model's warnings, and those are what `PREVIEW_SHOWN.warning_ids` records
     /// (shown = audited). Core asserts it where it assembles a `Preview`.
     pub fn implied_warning(&self) -> Option<WarningId> {
         match self {
@@ -441,6 +448,9 @@ impl PreviewBody {
             PreviewBody::EditDiff {
                 raw_only_changes, ..
             } if *raw_only_changes > 0 => Some(WarningId::RawOnlyDiff),
+            PreviewBody::ConfluencePage { format, .. } if format == "view" => {
+                Some(WarningId::ServerRenderedView)
+            }
             _ => None,
         }
     }

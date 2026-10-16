@@ -976,7 +976,7 @@ async fn i36_edit_expected_conflict_not_approvable() -> TestResult {
             diff_text,
             base_to_current,
             intended,
-            ..
+            requests,
         } => {
             assert_eq!(summary, &w.text);
             assert_eq!(
@@ -985,6 +985,10 @@ async fn i36_edit_expected_conflict_not_approvable() -> TestResult {
             );
             // M7 Δ2: Jira lists the differing fields in `diff_text`, no rendered diffs.
             assert!(base_to_current.is_empty() && intended.is_empty());
+            // M7 T8 review I-1 (today's behaviour, pinned): the engine builds requests only
+            // under `Hold::Preview`, so this enrichment-time conflict carries none and the card
+            // shows no requests section. Task 15 widens the gate; this becomes the `PUT`.
+            assert!(requests.is_empty(), "{requests:?}");
         }
         other => return Err(format!("not the conflict card: {other:?}").into()),
     }

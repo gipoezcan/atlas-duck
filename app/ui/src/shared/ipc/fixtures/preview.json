@@ -2663,6 +2663,9 @@
       "filename": "logo.png",
       "kind": "attachment_upload",
       "mime": "image/png",
+      "notes": [
+        "extension and content type differ"
+      ],
       "replaces_version": 3,
       "requests": [
         {

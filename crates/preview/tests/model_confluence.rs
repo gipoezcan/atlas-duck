@@ -92,6 +92,7 @@ fn bodies() -> Vec<PreviewBody> {
             replaces_version: Some(2),
             existing: None,
             comment: None,
+            notes: Vec::new(),
             requests: vec![digest_req()],
         },
     ]
@@ -144,6 +145,8 @@ fn confluence_bodies_serialize_with_kind_tags() -> TestResult {
     assert_eq!(v["replaces_version"], 2);
     assert_eq!(v["existing"], Value::Null);
     assert_eq!(v["comment"], Value::Null);
+    // T8 review I-2: `notes` is always on the wire, an empty list for none.
+    assert_eq!(v["notes"], json!([]));
     // Δ2: a request body shown as its size and digest only; the bytes are not in the DTO.
     assert_eq!(
         v["requests"][0]["body"],
@@ -173,6 +176,15 @@ fn conflict_serializes_its_diffs_and_requests() -> TestResult {
     );
     assert_eq!(v["intended"], json!([{"op": "add", "text": "c\n"}]));
     assert_eq!(v["requests"][0]["method"], "POST");
+    // T8 review I-1: the renderer leaves out an empty request list; the wire still carries it.
+    let b = PreviewBody::Conflict {
+        summary: String::new(),
+        diff_text: String::new(),
+        base_to_current: Vec::new(),
+        intended: Vec::new(),
+        requests: Vec::new(),
+    };
+    assert_eq!(serde_json::to_value(&b)?["requests"], json!([]));
     Ok(())
 }
 

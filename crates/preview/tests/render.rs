@@ -176,10 +176,11 @@ fn variants() -> Vec<(&'static str, Preview)> {
                 PreviewBody::Conflict {
                     summary: "conflict: fields changed since the agent read it: summary".into(),
                     diff_text: "summary: \"Old\" → \"New\"\n".into(),
-                    // Jira (M7 Δ2): the requests, no line lists.
+                    // Jira (M7 Δ2): no line lists. An enrichment-time hold carries no requests
+                    // yet (T8 review I-1), so the card has no requests section (render3's card).
                     base_to_current: Vec::new(),
                     intended: Vec::new(),
-                    requests: requests(),
+                    requests: Vec::new(),
                 },
                 vec![Warning::new(
                     WarningId::Conflict,
@@ -427,6 +428,7 @@ fn variants() -> Vec<(&'static str, Preview)> {
                     replaces_version: Some(3),
                     existing: None,
                     comment: Some("new logo".into()),
+                    notes: vec!["extension and content type differ".into()],
                     requests: vec![RequestView {
                         index: 0,
                         method: "POST".into(),
@@ -527,6 +529,7 @@ fn confluence_extras() -> Vec<(&'static str, Preview)> {
             replaces_version: None,
             existing: Some("attachment att9001, version 2, 1200 bytes".into()),
             comment: None,
+            notes: Vec::new(),
             requests: vec![RequestView {
                 index: 0,
                 method: "POST".into(),
@@ -1156,6 +1159,7 @@ fn arbitrary_preview(kind: usize, s: &[String]) -> Preview {
             replaces_version: Some(2),
             existing: Some(e(4)),
             comment: Some(e(5)),
+            notes: vec![e(6), e(7)],
             requests: vec![
                 req(6),
                 RequestView {
@@ -1874,6 +1878,9 @@ fn builder_version_names_the_render_version() {
     // M7 Task 8 (ruling B-1): `render4` is appended after the M6 versions, which never change.
     let names: Vec<&str> = RENDER_VERSIONS.iter().map(|(n, _)| *n).collect();
     assert_eq!(names, ["render1", "render2", "render3", "render4"]);
+    // Every M6 entry is pinned (T8 review m-8: "never edit an entry").
+    assert_eq!(RENDER_VERSIONS[0], ("render1", 0x50e0_b962_fa25_e8fa));
+    assert_eq!(RENDER_VERSIONS[1], ("render2", 0x5977_a808_67ef_8b73));
     assert_eq!(RENDER_VERSIONS[2], ("render3", 0x18d6_262f_815e_9ad3));
 }
 
@@ -2040,7 +2047,18 @@ fn render_page_view_labelled_secondary() {
         ],
     );
     assert!(!d.contains("confluence-information-macro") && !d.contains("alert(1)"));
-    // Only `view` is labelled.
+    // §6.2: a `view` body implies the Caution, so core cannot build one without it (T8 review
+    // I-3); the golden carries it.
+    let p = named("confluence_page_view");
+    assert_eq!(
+        p.body.implied_warning(),
+        Some(WarningId::ServerRenderedView)
+    );
+    assert!(p.body.implied_warning_present(&p.warnings));
+    let mut q = p.clone();
+    q.warnings.clear();
+    assert!(!q.body.implied_warning_present(&q.warnings));
+    // Only `view` is labelled, and only `view` implies the Caution.
     for format in ["markdown", "storage"] {
         let mut p = named("confluence_page_view");
         if let PreviewBody::ConfluencePage { format: f, .. } = &mut p.body {
@@ -2049,6 +2067,20 @@ fn render_page_view_labelled_secondary() {
         assert!(
             !doc(&p).contains("server-rendered view (secondary)"),
             "{format}"
+        );
+        assert_eq!(p.body.implied_warning(), None, "{format}");
+    }
+}
+
+/// Every golden carries the warning its body implies (the strip shows exactly the model's
+/// warnings, core asserts the same, T8 review I-3).
+#[test]
+fn goldens_carry_their_implied_warning() {
+    for (name, p) in variants().into_iter().chain(confluence_extras()) {
+        assert!(
+            p.body.implied_warning_present(&p.warnings),
+            "{name}: {:?}",
+            p.body.implied_warning()
         );
     }
 }
@@ -2127,6 +2159,28 @@ fn render_comments_thread_golden() {
     assert!(d.contains("</section></li><li><section><h4>Comment <bdi>1</bdi></h4>"));
     assert!(d.contains("</section><ul><li><section><h4>Comment <bdi>2</bdi></h4>"));
 
+    // Past the row cap: the comment left out counts every text it would have shown (T8 review
+    // m-5), not only its body.
+    let mut q = named("confluence_comments");
+    let last = comment_thread()[3].clone();
+    if let PreviewBody::ConfluenceComments { comments, .. } = &mut q.body {
+        *comments = vec![comment_thread()[0].clone(); DOC_MAX_ROWS];
+        comments.push(last.clone());
+    }
+    let d = doc(&q);
+    assert!(d.contains("<p>1 more comments not shown here; see Structured or Raw</p>"));
+    let want = last.id.len()
+        + last.author.as_ref().map_or(0, String::len)
+        + last.created.as_ref().map_or(0, String::len)
+        + last.body_html.len();
+    assert!(last.location.is_none());
+    assert!(
+        d.contains(&format!(
+            "<tr><th>hidden in preview</th><td>{want} bytes</td></tr>"
+        )),
+        "{want}"
+    );
+
     // No comments.
     if let PreviewBody::ConfluenceComments { comments, count } = &mut p.body {
         comments.clear();
@@ -2159,13 +2213,15 @@ fn render_page_move_paths_golden() {
     assert_has(
         &d,
         &[
+            // PD-106: the fixed row next to the page (T8 review m-3).
             "</header><section><h2>Page move</h2><table><tbody>\
-             <tr><th>page</th><td><bdi>Release plan</bdi></td></tr></tbody></table>\
+             <tr><th>page</th><td><bdi>Release plan</bdi></td></tr>\
+             <tr><th>body</th><td>body not sent; title and body kept by Confluence</td></tr>\
+             </tbody></table>\
              <h3>Old ancestor path</h3><ol><li><bdi>Home</bdi></li><li><bdi>Projects</bdi></li>\
              <li><bdi>Release plan</bdi></li></ol>\
              <h3>New ancestor path</h3><ol><li><bdi>Home</bdi></li><li><bdi>Archive</bdi></li>\
-             <li><bdi>Release plan</bdi></li></ol>\
-             <p>body not sent; title and body kept by Confluence</p></section>\
+             <li><bdi>Release plan</bdi></li></ol></section>\
              <section><h2>Requests to be sent</h2><h3>Request 0</h3>",
             "<tr><th>method</th><td><bdi>PUT</bdi></td></tr>",
         ],
@@ -2185,11 +2241,30 @@ fn render_attachment_card_thumbnail_data_uri_only() {
                 "<tr><th>SHA-256</th><td><bdi>{}</bdi></td></tr>",
                 "5a".repeat(32)
             ),
-            "<tr><th>comment</th><td><bdi>new logo</bdi></td></tr>",
+            // PD-110's note right after the fact table (T8 review I-2).
+            "<tr><th>comment</th><td><bdi>new logo</bdi></td></tr></tbody></table>\
+             <ul><li><bdi>extension and content type differ</bdi></li></ul>\
+             <p>replaces existing attachment v3</p>",
             &format!("<h3>Thumbnail</h3><img src=\"{PNG_DATA_URI}\" alt=\"\">"),
         ],
     );
     assert!(!d.contains("no thumbnail"));
+    // No notes, no list (and no "none").
+    let c = golden_doc("confluence_attachment_collision");
+    assert!(
+        c.contains("<tr><th>comment</th><td>none</td></tr></tbody></table><h3>Thumbnail</h3>"),
+        "{c}"
+    );
+    // A note is display text: escaped, never markup.
+    let mut p = named("confluence_attachment_card");
+    if let PreviewBody::AttachmentUpload { notes, .. } = &mut p.body {
+        *notes = vec!["<b>x.html</b> & more".into()];
+    }
+    let n = doc(&p);
+    assert!(
+        n.contains("<ul><li><bdi>&lt;b&gt;x.html&lt;/b&gt; &amp; more</bdi></li></ul>"),
+        "{n}"
+    );
     let thumb = |uri: Option<&str>| {
         let mut p = named("confluence_attachment_card");
         if let PreviewBody::AttachmentUpload {
@@ -2260,16 +2335,16 @@ fn render_attachment_collision_line() {
 fn conflict_card_shows_intended_change() {
     let d = golden_doc("confluence_conflict_intended");
     let base = d
-        .find("<h3>Diff from the agent's base to the current state</h3><table>")
+        .find("<h3>Rendered diff: the agent's base → the current state</h3><table>")
         .unwrap_or(usize::MAX);
     let intended = d
         .find("<h3>The agent's intended change</h3><table>")
         .unwrap_or(usize::MAX);
     let deny = d.find("<li><strong>Deny</strong>").unwrap_or(usize::MAX);
-    let requests = d
+    let sent = d
         .find("</section><section><h2>Requests to be sent</h2>")
         .unwrap_or(usize::MAX);
-    assert!(base < intended && intended < deny && deny < requests, "{d}");
+    assert!(base < intended && intended < deny && deny < sent, "{d}");
     assert_has(
         &d,
         &[
@@ -2280,10 +2355,42 @@ fn conflict_card_shows_intended_change() {
             "<tr><th>method</th><td><bdi>PUT</bdi></td></tr>",
         ],
     );
-    // Jira: no line lists, so no diff sections; the requests are shown (M6 T10 review M-5).
-    let j = doc(&named("conflict"));
-    assert!(!j.contains("Diff from the agent's base") && !j.contains("intended change"));
+    // The two headings differ (T8 review m-1): the `diff_text` one and the rendered one.
+    assert_has(
+        &d,
+        &[
+            "<h3>Agent's base against the current state</h3><pre><code><bdi>base version v5, \
+             current version v6</bdi></code></pre>\
+             <h3>Rendered diff: the agent's base → the current state</h3>",
+        ],
+    );
+    // Jira: no line lists, so no diff sections; an enrichment-time hold has no requests yet, so
+    // no requests section either (T8 review I-1: the card is render3's).
+    let j = golden_doc("conflict");
+    assert!(!j.contains("Rendered diff") && !j.contains("intended change"));
+    assert!(!j.contains("Requests to be sent"), "{j}");
+    assert!(
+        j.ends_with("+ your reason</li></ul></section></body></html>"),
+        "{j}"
+    );
+    // With requests (the send-time 409 hold) they are shown (M6 T10 review M-5).
+    let mut q = named("conflict");
+    if let PreviewBody::Conflict { requests: r, .. } = &mut q.body {
+        *r = requests();
+    }
+    let j = doc(&q);
     assert!(j.contains("</section><section><h2>Requests to be sent</h2><h3>Request 0</h3>"));
+    assert!(!j.contains("<p>none</p>"));
+    // Neither does a Confluence conflict without requests say "none".
+    let mut q = named("confluence_conflict_intended");
+    if let PreviewBody::Conflict { requests: r, .. } = &mut q.body {
+        r.clear();
+    }
+    let c = doc(&q);
+    assert!(
+        !c.contains("Requests to be sent") && !c.contains("<p>none</p>"),
+        "{c}"
+    );
     // Each list is capped on its own.
     let lines = |n: usize| -> Vec<DiffLine> {
         (0..n)
