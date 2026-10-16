@@ -625,6 +625,46 @@ async fn x13_recent_needs_attention_ack_resets_on_restart() -> TestResult {
     Ok(())
 }
 
+/// Whether the needs-attention count reached the UI before the `Failed` attention event (the
+/// toast and the tooltip line are built from the count known at that event; final review I-1).
+fn count_told_before_failed_attention(events: &[String]) -> bool {
+    let at = |needle: &str| events.iter().position(|j| j.contains(needle));
+    match (at("NeedsAttentionChanged"), at("\"Failed\"")) {
+        (Some(count), Some(attention)) => count < attention,
+        _ => false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_write_tells_the_count_before_the_attention_event() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    identity_ok(mock).await;
+    mount_comment_post(mock, 400, "Comment body can not be empty!").await;
+    failed_write(&h, "one").await?;
+    let events: Vec<String> = h
+        .capture()
+        .on(Channel::UiEvent)
+        .into_iter()
+        .map(|r| r.json)
+        .collect();
+    assert!(
+        events.iter().any(|j| j.contains("\"Failed\"")),
+        "no Failed attention event: {events:?}"
+    );
+    assert!(count_told_before_failed_attention(&events), "{events:?}");
+    // Negative control: the old order, and a run without the count, do not pass the check.
+    let mut reversed = events.clone();
+    reversed.reverse();
+    assert!(!count_told_before_failed_attention(&reversed));
+    let without: Vec<String> = events
+        .into_iter()
+        .filter(|j| !j.contains("NeedsAttentionChanged"))
+        .collect();
+    assert!(!count_told_before_failed_attention(&without));
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recent_error_text_only_while_deliverable() -> TestResult {
     let h = Harness::jira().await?;

@@ -1248,11 +1248,12 @@ async fn finish(
         .await;
     queue_changed(engine, entry);
     if let (Ok(_), Some(kind)) = (&applied, kind) {
-        attention(engine, kind);
-        // §5.6: listed under "Needs attention" until acknowledged.
+        // §5.6: listed under "Needs attention" until acknowledged. Told first: the UI builds the
+        // toast and the tooltip line from the count it knows when the attention event arrives.
         if matches!(kind, AttentionKind::Failed | AttentionKind::OutcomeUnknown) {
             engine.flag_attention(&entry.head.request_id);
         }
+        attention(engine, kind);
     }
     applied
 }

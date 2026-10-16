@@ -832,6 +832,13 @@ mod tests {
         r.engine.on_event(&queue(0), Counts::default(), false);
         submit(&r, counts(1, 0, 0), false);
         assert_eq!(r.mock.raises(), 4, "0 -> 1 again");
+        // The limit is "at most once per 60 s": exactly 60 s later is released, 1 ms short is not.
+        r.clock.advance(Duration::from_millis(59_999));
+        r.engine.on_event(&new_req(), counts(2, 0, 0), true);
+        assert_eq!(r.mock.raises(), 4, "59.999 s");
+        r.clock.advance(Duration::from_millis(1));
+        r.engine.on_event(&new_req(), counts(2, 0, 0), true);
+        assert_eq!(r.mock.raises(), 5, "exactly 60 s");
     }
 
     #[test]
@@ -899,9 +906,15 @@ mod tests {
                 r.mock.calls()
             );
         }
-        // Hidden and the limit released: the failure raises the window.
+        // Hidden and the limit released: the failure raises the window. The core tells the count
+        // first, then the attention event (final review I-1).
         r.clock.advance(Duration::from_secs(61));
         r.mock.take();
+        r.engine.on_event(
+            &UiEvent::NeedsAttentionChanged { count: 1 },
+            Counts::default(),
+            true,
+        );
         r.engine.on_event(
             &UiEvent::Attention {
                 kind: AttentionKind::Failed,
@@ -938,6 +951,55 @@ mod tests {
                 .all(|c| !matches!(c, Call::Raise(_) | Call::Flash))
         );
         assert_eq!(r.mock.toasts().len(), 1);
+    }
+
+    /// Final review I-1: a failed write has left the queue (pending 0), so the toast and the
+    /// tooltip line rest on the count the core told before the attention event, in every mode.
+    #[test]
+    fn ui03_failed_write_with_empty_queue_is_toasted_in_every_mode() {
+        enum Setup {
+            Mode(AttentionMode),
+            Presentation,
+        }
+        for setup in [
+            Setup::Mode(AttentionMode::ShowWithoutActivating),
+            Setup::Mode(AttentionMode::ShowAndFocus),
+            Setup::Mode(AttentionMode::BadgeOnly),
+            Setup::Presentation,
+        ] {
+            for kind in [AttentionKind::Failed, AttentionKind::OutcomeUnknown] {
+                let fail = UiEvent::Attention { kind, count: 1 };
+                let told = UiEvent::NeedsAttentionChanged { count: 1 };
+                let build = || {
+                    let r = rig();
+                    match &setup {
+                        Setup::Mode(m) => r.engine.set_configured_mode(*m),
+                        Setup::Presentation => {
+                            r.engine
+                                .set_presentation(true, &Recorder(Mutex::default()))
+                                .ok();
+                        }
+                    }
+                    r
+                };
+                // The core's order: the count, then the attention event.
+                let r = build();
+                r.engine.on_event(&told, Counts::default(), true);
+                r.engine.on_event(&fail, Counts::default(), true);
+                assert_eq!(
+                    r.mock.toasts(),
+                    vec!["1 need attention".to_owned()],
+                    "{kind:?}: {:?}",
+                    r.mock.calls()
+                );
+                // Negative control: the old order (attention first) sends no toast, which is
+                // what this test catches if the core ever reverts.
+                let r = build();
+                r.engine.on_event(&fail, Counts::default(), true);
+                r.engine.on_event(&told, Counts::default(), true);
+                assert!(r.mock.toasts().is_empty(), "{kind:?}: {:?}", r.mock.calls());
+            }
+        }
     }
 
     #[test]
