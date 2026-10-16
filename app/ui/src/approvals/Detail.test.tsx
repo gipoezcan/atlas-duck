@@ -213,6 +213,20 @@ describe('Detail', () => {
     expect(mockedPreview).toHaveBeenCalledTimes(1);
   });
 
+  it('a_write_approval_answered_pending_is_recorded_and_fetches_nothing', async () => {
+    // Core answers an approved write `pending` until it starts executing (its stale check runs
+    // first): a recorded decision, not a new revision to open (e2e UI-06, CI run 38859187604).
+    await opened('write_requests');
+    mockedDecide.mockResolvedValue({ request_id: item.request_id, status: 'pending' });
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+    await screen.findByText('Decision recorded: approved');
+    expect(mockedDecide).toHaveBeenCalledTimes(1);
+    expect(mockedDecide.mock.calls[0]?.[0]).toMatchObject({ decision: 'approve' });
+    expect(mockedPreview).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByTitle('Preview')).toBeNull();
+  });
+
   it('m11_release_blocked_internal_banner_text', async () => {
     // From the model: the banner is Rust's text, rendered as a text node; only Deny remains.
     const text = 'release blocked: the candidate could not be built exactly (internal); deny it';
@@ -245,8 +259,28 @@ describe('Detail', () => {
   it('a_failed_open_shows_one_fixed_text', async () => {
     mockedPreview.mockRejectedValue({ kind: 'decision', error: { kind: 'stale' } });
     render(<Detail item={item} openToken={1} />);
-    expect((await screen.findByRole('alert')).textContent).toBe('Could not load the preview');
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toBe('Could not load the preview');
     expect(screen.queryByText(/stale/)).toBeNull();
+    // The error's kinds, for a test driver that cannot read the console: identifiers only.
+    expect(alert.getAttribute('data-error')).toBe('decision/stale');
+  });
+
+  it('a_failed_open_names_no_text_of_the_error', async () => {
+    for (const [rejection, code] of [
+      [{ kind: 'not_ready' }, 'not_ready'],
+      [{ kind: 'decision', error: { kind: 'not_decidable' } }, 'decision/not_decidable'],
+      [{ kind: 'decision', error: { kind: '<b>x</b>' } }, 'decision/unknown'],
+      [{ kind: 'internal error at /home/user' }, 'unknown'],
+      ['a string', 'unknown'],
+      [null, 'unknown'],
+    ] as const) {
+      vi.resetAllMocks();
+      mockedPreview.mockRejectedValue(rejection);
+      const { unmount } = render(<Detail item={item} openToken={1} />);
+      expect((await screen.findByRole('alert')).getAttribute('data-error')).toBe(code);
+      unmount();
+    }
   });
 
   it('the_tabs_show_preview_structured_raw_and_request', async () => {

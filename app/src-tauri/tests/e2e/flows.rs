@@ -414,7 +414,8 @@ async fn decision_button(wd: &WebDriver) -> Result<Element> {
 }
 
 /// What the opened card says, for a failure text: its status and alert lines and its own buttons
-/// (an "Open" button means the shown revision went stale), never the preview frame.
+/// (an "Open" button means the shown revision went stale), never the preview frame. A failed
+/// preview load names the error's kinds (`data-error`, identifiers only, no error text).
 async fn detail_state(wd: &WebDriver) -> String {
     let lines = match wd
         .find_all(
@@ -427,11 +428,14 @@ async fn detail_state(wd: &WebDriver) -> String {
     };
     let mut texts = Vec::new();
     for e in &lines {
-        texts.push(
-            wd.text(e)
-                .await
-                .unwrap_or_else(|e| format!("unreadable ({e})")),
-        );
+        let text = wd
+            .text(e)
+            .await
+            .unwrap_or_else(|e| format!("unreadable ({e})"));
+        texts.push(match wd.attribute(e, "data-error").await {
+            Ok(Some(code)) => format!("{text} (error {code})"),
+            _ => text,
+        });
     }
     if texts.is_empty() {
         "the detail pane shows no status, alert or button of its own".to_owned()

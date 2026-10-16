@@ -143,6 +143,8 @@ export const DETAIL_TEXT = {
   deny: 'Deny',
   action_failed: 'The decision could not be applied',
   decided: 'Decision recorded',
+  /** A write's approval, answered `pending` until the write starts (its stale check runs first). */
+  decided_approved: 'approved',
   /** spec 6.3 (verbatim): the consequence lines next to the upstream error card actions. */
   consequence_release: 'agent receives `failed` (exit 6), HTTP <status> + the text below',
   consequence_status_only: 'agent receives `failed` (exit 6), HTTP <status>, no text',

@@ -41,7 +41,8 @@ const TABS: readonly { id: TabId; label: string }[] = [
 type OpenState =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'failed' }
+  /** `error`: the rejection's kinds only (`errorCode`), for the alert's `data-error`. */
+  | { kind: 'failed'; error: string }
   /** The candidate could not be built (M5 M-11): Rust's banner text, Deny only. */
   | { kind: 'blocked'; text: string }
   | { kind: 'open'; response: PreviewFetchResponse };
@@ -82,6 +83,26 @@ function blockedText(e: unknown): string | null {
     return typeof text === 'string' ? text : null;
   }
   return null;
+}
+
+/** A Rust error kind: a short snake_case identifier, never text. */
+const KIND = /^[a-z_]{1,40}$/;
+
+function kindOf(e: unknown): string {
+  if (typeof e !== 'object' || e === null || !('kind' in e)) return 'unknown';
+  const kind = (e as { kind?: unknown }).kind;
+  return typeof kind === 'string' && KIND.test(kind) ? kind : 'unknown';
+}
+
+/**
+ * The kinds of a rejected call as `kind` or `decision/<core kind>`, `unknown` for anything that is
+ * not an identifier. No text of the error: a test driver, which cannot read the console, reads it
+ * from the failed-load alert's `data-error`.
+ */
+function errorCode(e: unknown): string {
+  const kind = kindOf(e);
+  if (kind !== 'decision') return kind;
+  return `decision/${kindOf((e as { error?: unknown }).error)}`;
 }
 
 /**
@@ -162,7 +183,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
       (e: unknown) => {
         if (mine !== latest.current) return;
         const text = blockedText(e);
-        setState(text === null ? { kind: 'failed' } : { kind: 'blocked', text });
+        setState(text === null ? { kind: 'failed', error: errorCode(e) } : { kind: 'blocked', text });
       },
     );
   }, [item.request_id]);
@@ -299,7 +320,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           setState({ kind: 'idle' });
           setDrafts({});
           setEdited(true);
-        } else if (outcome.status === 'pending') {
+        } else if (outcome.status === 'pending' && args.redactions !== undefined) {
           // A redaction made a new revision (I-38). Ruling (T14 review I3): the fetch below
           // follows the user's own "Release status only" press, so it is not a navigation the user
           // did not ask for. The new revision is displayed once the queue re-read brings it, and
@@ -307,12 +328,18 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           // Task 17: the panel's release with ops takes the same path; the round is cleared by the
           // open, the new revision's own ops come with its preview.
           open();
-          if (args.redactions !== undefined) setRedactionApplied(true);
+          setRedactionApplied(true);
         } else {
           // No auto-advance: the decided item stays selected, its preview is cleared, nothing is fetched.
+          // Only a redaction makes a new revision: any other `pending` is an approved write that has
+          // not started yet (core's stale check runs first), recorded like every other decision.
           latest.current++;
           setState({ kind: 'idle' });
-          setDecided(outcome.status);
+          setDecided(
+            outcome.status === 'pending'
+              ? DETAIL_TEXT.decided_approved
+              : (own(STATUS_LABELS, outcome.status) ?? outcome.status),
+          );
         }
       },
       (e: unknown) => {
@@ -400,7 +427,13 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
     if (tab === 'request') return <RequestTab requestId={item.request_id} />;
     if (shown === null) {
       if (state.kind === 'loading') return <p role="status">{DETAIL_TEXT.loading}</p>;
-      if (state.kind === 'failed') return <p role="alert">{DETAIL_TEXT.load_failed}</p>;
+      if (state.kind === 'failed') {
+        return (
+          <p role="alert" data-error={state.error}>
+            {DETAIL_TEXT.load_failed}
+          </p>
+        );
+      }
       return <p>{DETAIL_TEXT.not_opened}</p>;
     }
     if (tab === 'preview') return <PreviewFrame srcdoc={shown.srcdoc} />;
@@ -485,7 +518,7 @@ export function Detail({ item, openToken = 0, gone = false, renderStructured, re
           {DETAIL_TEXT.open}
         </button>
       ) : null}
-      {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${own(STATUS_LABELS, decided) ?? decided}`}</p>}
+      {decided === null ? null : <p role="status">{`${DETAIL_TEXT.decided}: ${decided}`}</p>}
       {edited ? <p role="status">{EDIT_TEXT.applied}</p> : null}
       {unsentEdits ? <p role="status">{EDIT_TEXT.unsent}</p> : null}
       {redactionApplied ? <p role="status">{REDACTION_TEXT.applied}</p> : null}
