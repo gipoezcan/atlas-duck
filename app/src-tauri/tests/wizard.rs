@@ -6,7 +6,8 @@
 //! config dirs from its `WizardEnv` (never from `ATLAS_DUCK_TEST_HOME`, which is process-wide and
 //! would race between tests), so two simulated machines live in one test (RF-3b). Keystores are
 //! `MemKeyStore`s over a `MemKeyring` that records every call. No OS keychain, no spawned binary,
-//! nothing outside the scratch dirs under cargo's target dir.
+//! nothing outside the scratch dirs under cargo's target dir (Unix: and the short socket base under
+//! `/tmp`, `common::short_socket_base`).
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
