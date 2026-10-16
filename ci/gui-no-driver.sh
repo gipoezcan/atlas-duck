@@ -91,7 +91,8 @@ app_windows() {
     done | sort
 }
 
-has_window() { app_windows | grep -qxF "$1"; }
+# grep reads to the end (no -q): an early exit would SIGPIPE app_windows and fail the pipeline.
+has_window() { app_windows | grep -xF "$1" >/dev/null; }
 
 # diag_count <extended regex>: matching lines of the diag log (0 without a log).
 diag_count() {
