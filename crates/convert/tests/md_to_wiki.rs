@@ -905,3 +905,27 @@ proptest! {
         prop_assert_eq!(markdown_to_wiki(&md), markdown_to_wiki(&md));
     }
 }
+
+/// M5 final review M-4: a `&` in a link target that starts something shaped like a character
+/// reference is percent-encoded, so Jira cannot decode `&#123;` in the target. Both inputs reach
+/// `link_target` with a literal `&#123;` (pulldown decodes references in an inline link's
+/// destination, so the inline form encodes the `&` itself; an autolink is taken literally).
+#[test]
+fn m4_link_target_encodes_character_references() -> TestResult {
+    for md in [
+        "[x](https://x.example/?a=1&amp;#123;b)",
+        "<https://x.example/?a=1&#123;b>",
+        "![i](https://x.example/?a=1&amp;#123;b)",
+    ] {
+        let (out, _) = convert_checked(md)?;
+        assert!(!out.contains("&#123;"), "{md} -> {out}");
+        assert!(
+            out.contains("https://x.example/?a=1%26#123;b]"),
+            "{md} -> {out}"
+        );
+    }
+    // A `&` that does not start a reference stays as it is.
+    let (out, _) = convert_checked("[x](https://x.example/?a=1&b=2&c)")?;
+    assert_eq!(out, "[x|https://x.example/?a=1&b=2&c]\n");
+    Ok(())
+}

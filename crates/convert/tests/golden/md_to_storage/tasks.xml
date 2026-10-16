@@ -1,0 +1,3 @@
+<ul><li>[ ] open task</li><li>[x] done task</li><li>[x] upper done</li><li>plain item</li></ul>
+<ol><li>[ ] ordered task</li></ol>
+<p>Not a list [ ] and [x] in prose.</p>

@@ -1,0 +1,9 @@
+<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">rust</ac:parameter><ac:plain-text-body><![CDATA[fn main() { println!("{}", 1); }]]></ac:plain-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[]]]]><![CDATA[> twice ]]]]><![CDATA[> and ]]]]]]><![CDATA[>]]></ac:plain-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">xml</ac:parameter><ac:plain-text-body><![CDATA[<![CDATA[ x ]]]]><![CDATA[>
+<ac:structured-macro ac:name="toc"/>]]></ac:plain-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[no language & <tags>]]></ac:plain-text-body></ac:structured-macro>
+<p>Inline <code>]]&gt;</code> and <code>&lt;ri:user ri:userkey="x"/&gt;</code> code.</p>
+<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[indented block
+second line]]></ac:plain-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[]]></ac:plain-text-body></ac:structured-macro>

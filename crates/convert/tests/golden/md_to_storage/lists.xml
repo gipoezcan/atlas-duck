@@ -1,0 +1,4 @@
+<ul><li>one</li><li>two<ul><li>nested <em>a</em></li><li>nested b<ol><li>deep ordered</li></ol></li></ul></li><li>three</li></ul>
+<ol><li>first</li><li>second</li></ol>
+<ul><li><p>loose item</p><p>second paragraph</p></li><li><p>after</p></li></ul>
+<ol><li>starts at three</li><li>four</li></ol>

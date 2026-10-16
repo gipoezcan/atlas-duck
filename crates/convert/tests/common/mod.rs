@@ -41,6 +41,8 @@ pub fn spans_match_record(out: &str, e: &EmittedConstructs) -> Result<(), String
                 slice.starts_with("{noformat}") && slice.ends_with("{noformat}")
             }
             ContainerKind::Quote => slice.starts_with("{quote}") && slice.ends_with("{quote}"),
+            // The storage converter's container; never in wiki output.
+            ContainerKind::CodeMacro => false,
         };
         if !ok {
             return Err(format!("{:?} range slices {slice:?}", c.kind));
@@ -84,6 +86,7 @@ pub fn tags_only_at_containers(out: &str, e: &EmittedConstructs) -> Result<(), S
                 ContainerKind::Code => "{code}".len(),
                 ContainerKind::Noformat => "{noformat}".len(),
                 ContainerKind::Quote => "{quote}".len(),
+                ContainerKind::CodeMacro => return false,
             };
             let opaque = c.kind != ContainerKind::Quote && c.byte_range.contains(&i);
             opaque || i == c.byte_range.start || Some(i) == c.byte_range.end.checked_sub(close)

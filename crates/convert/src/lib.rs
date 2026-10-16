@@ -7,14 +7,17 @@
 
 pub mod escape;
 mod hard_check;
+mod md_to_storage;
 mod md_to_wiki;
 mod placeholders;
 pub mod storage;
 pub mod wiki;
 mod wiki_html;
 mod wiki_text;
+mod xml_escape;
 
 pub use hard_check::{Unrecorded, hard_check_wiki};
+pub use md_to_storage::markdown_to_storage;
 pub use md_to_wiki::{ContainerKind, EmittedCode, EmittedConstructs, markdown_to_wiki};
 pub use storage::{
     ConversionReport, LostCounts, StorageReject, StorageUsers, UserResolutions, check_storage_body,

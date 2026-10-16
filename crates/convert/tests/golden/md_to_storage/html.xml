@@ -1,0 +1,5 @@
+<p>&lt;div class="x"&gt;<br/>&lt;ac:structured-macro ac:name="toc"/&gt; &lt;ri:user ri:userkey="x"/&gt; &amp;nbsp;<br/>&lt;/div&gt;</p>
+<p>Inline &lt;b&gt;bold&lt;/b&gt; and &lt;script&gt;x&lt;/script&gt; and &lt;!-- c --&gt; and &amp; &lt; ü ]]&gt; "q".</p>
+<p>&lt;ac:structured-macro ac:name="include"&gt;&lt;ac:parameter ac:name=""&gt;X&lt;/ac:parameter&gt;&lt;/ac:structured-macro&gt;</p>
+<p>&lt;!DOCTYPE x [&lt;!ENTITY e "&lt;ri:user ri:userkey='x'/&gt;"&gt;]&gt;</p>
+<p>&lt;?php echo 1; ?&gt;</p>
