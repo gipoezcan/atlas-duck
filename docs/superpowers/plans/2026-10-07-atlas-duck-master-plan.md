@@ -794,7 +794,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Ledger:** L02, L03, L14, L18, L19, L20, L21, L26, L31.
 - **Handoff from M6** (M6 plan "Handoffs", review ledger L134; scope unchanged): `RunningScriptView.started_at` is `submitted_at` in M6 and may be refined; the Running window's kill ends a run through its own `SCRIPT_FAILED killed_by_user` path (`Core::kill_script`); the "Updated — restart to apply" status line id exists, its trigger is M8's.
 
-- **Status:** detailed plan: to be written after M7
+- **Status:** plan reviewed and revised 2026-10-16 (detailed plan: 2026-10-16-atlas-duck-m08-script-sandbox.md)
 
 ### M9 — MCP front end
 
@@ -816,7 +816,7 @@ Each milestone entry lists: scope (§14, with the placements this plan makes whe
 - **Handoff from M2:** anchor-dir writer writes the first unflagged `Record` line after `clock_behind` lines, header lines, tolerates a torn last line and a missing current-chain file, writes `RESTORE` lines; `Store::export` and key rotation/passphrase change live inside `audit` (`EXPORT`/`KEY_ROTATED` are store-owned); Windows rename durability (`sync_dir` is a no-op there) before release; the restore UI re-asks the rollback confirmation if the head moved and shows progress while the writer is blocked (M2 plan, "Handoff to later milestones").
 - **Handoff from M6** (M6 plan "Handoffs", review ledger L134; scope unchanged): Audit window shows `CREDENTIAL_CHANGED {store_failed|delete_failed}` and the incident count; Windows overlay icon and macOS dock badge (M6 has the tray item and tooltip only); `archive_and_start_fresh` records no `confirmed` and the archive link is re-derived from `<data>/archived/` after a crash (`previous_chain_found` exemption risk); orphaned old-install PAT entries after an archive; no token entry inside the wizard and no wizard command for the external anchor directory; "Prepare for removal" residuals (in-memory `recorded`, unknown token identity after a restart, retention shown as the setting, no compliance export); the M2 sleep/hibernate check; signing credentials; the macOS GUI checklist per release and the SC3 walkthrough.
 
-- **Status:** detailed plan: to be written after M9
+- **Status:** plan reviewed and revised 2026-10-16 (detailed plan: 2026-10-16-atlas-duck-m10-audit-export-packaging.md)
 
 ---
 
