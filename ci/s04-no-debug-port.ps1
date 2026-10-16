@@ -55,11 +55,12 @@ function Get-Descendants([int]$RootPid) {
             }
         }
     }
-    return , $found.ToArray()
+    # Callers wrap the call in @(): under StrictMode a bare ",array" return reaches Where-Object as ONE array object.
+    return $found.ToArray()
 }
 
 function Get-WebViewsOf([int]$RootPid) {
-    return @(Get-Descendants $RootPid | Where-Object { $_.Name -eq 'msedgewebview2.exe' })
+    return @(@(Get-Descendants $RootPid) | Where-Object { $_.Name -eq 'msedgewebview2.exe' })
 }
 
 $port = Get-FreePort
@@ -93,11 +94,11 @@ try {
     $seen = $false
     for ($i = 0; $i -lt 300; $i++) {
         if ($app.HasExited) { Fail "the release app exited ($($app.ExitCode)) before a webview process appeared" }
-        if ((Get-WebViewsOf $app.Id).Count -gt 0) { $seen = $true; break }
+        if (@(Get-WebViewsOf $app.Id).Count -gt 0) { $seen = $true; break }
         Start-Sleep -Milliseconds 200
     }
     if (-not $seen) { Fail 'no msedgewebview2 process in the app process tree within 60 s: no webview, the check would be vacuous' }
-    Write-Host "S04 webview_processes_in_app_tree=$((Get-WebViewsOf $app.Id).Count)"
+    Write-Host "S04 webview_processes_in_app_tree=$(@(Get-WebViewsOf $app.Id).Count)"
 
     Start-Sleep -Seconds 15
     if ($app.HasExited) { Fail "the release app died during the check ($($app.ExitCode))" }
