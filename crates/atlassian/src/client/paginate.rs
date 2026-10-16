@@ -378,13 +378,14 @@ impl InstanceClient {
             start = start.saturating_add(returned);
 
             // End-of-results signals (§7.2); the value of `_links.next` is never read, its absence
-            // from a `_links` object is a signal. A page is short against what was asked and what
+            // from a `_links` object is a signal for Confluence only (a Jira answer may carry a
+            // `_links` object and still have more pages). A page is short against what was asked and what
             // the server applies, whichever is smaller (V05: a server may echo a larger page size
             // than the request's).
             let ended = facts.items == 0
                 || returned == 0
                 || facts.is_last == Some(true)
-                || facts.links_without_next
+                || (facts.links_without_next && !jira_arithmetic)
                 || facts.limit.is_some_and(|l| returned < l.min(want))
                 || facts.total.is_some_and(|t| start >= t);
             if ended {

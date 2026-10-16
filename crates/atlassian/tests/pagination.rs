@@ -432,6 +432,101 @@ async fn page_without_links_object_is_no_end_signal() -> TestResult {
     Ok(())
 }
 
+/// The `_links` end signal is Confluence's (§7.2): a Jira answer with a `_links` object lacking
+/// `next` still pages by arithmetic, to the short page.
+#[tokio::test]
+async fn jira_links_object_without_next_is_no_end_signal() -> TestResult {
+    let dc = MockDc::start(Product::Jira, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/agile/1.0/board"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "startAt").unwrap_or(0);
+            let count = 2u64.min(5u64.saturating_sub(start));
+            let values: Vec<Value> = (start..start + count).map(|i| json!({"id": i})).collect();
+            let page = json!({
+                "maxResults": 2, "startAt": start, "values": values,
+                "_links": {"base": "https://jira.corp.example"}
+            });
+            ok.clone()
+                .set_body_raw(page.to_string(), "application/json")
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &board_call(2, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 5));
+    assert_eq!(
+        offsets(&dc.received().await, "startAt", "maxResults"),
+        [(Some(0), Some(2)), (Some(2), Some(2)), (Some(4), Some(2))]
+    );
+    Ok(())
+}
+
+/// `_links.next: null` is a present key: "more" (the value is never read).
+#[tokio::test]
+async fn links_next_null_means_more() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/api/space"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "start").unwrap_or(0);
+            let limit = param(req, "limit").unwrap_or(25);
+            let size = limit.min(40u64.saturating_sub(start));
+            let results: Vec<Value> = (start..start + size).map(|i| json!({"id": i})).collect();
+            ok.clone().set_body_raw(
+                json!({
+                    "results": results, "start": start, "limit": limit, "size": size,
+                    "_links": {"next": null}
+                })
+                .to_string(),
+                "application/json",
+            )
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 40));
+    assert_eq!(
+        offsets(&dc.received().await, "start", "limit"),
+        [(Some(0), Some(25)), (Some(25), Some(25))]
+    );
+    Ok(())
+}
+
+/// The last page fills `max` exactly and has no `next`: the results ended, there is no
+/// `next_start` to a range that is empty.
+#[tokio::test]
+async fn last_page_filling_max_without_next_has_no_next_start() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    Mock::given(path("/rest/api/space"))
+        .respond_with(space_pages(&dc, 50, 0))
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated_ctl(
+            &test_cover()?,
+            &space_call(25, 0),
+            &ReadBudget::default(),
+            50,
+            &FetchControl::new(),
+        )
+        .await;
+    assert_eq!(
+        (out.end, out.items_fetched, out.next_start),
+        (PageEnd::ResultsEnded, 50, None)
+    );
+    Ok(())
+}
+
 /// A present `_links.next` only says "more": its value (here another origin) is never requested,
 /// the next page is rebuilt from the template under the context path.
 #[tokio::test]
