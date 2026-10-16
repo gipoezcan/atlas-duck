@@ -323,3 +323,106 @@ fn result_value_kept_as_raw_text() {
         Err(DecodeError::BadParams { .. })
     ));
 }
+
+#[test]
+fn decode_rejects_malformed_payloads() {
+    let rej = |b: &[u8]| decode_worker_frame(b).unwrap_err();
+    let ok = r#"{"jsonrpc":"2.0","method":"host.log","params":{"line":"a"}}"#;
+    assert!(decode_worker_frame(ok.as_bytes()).is_ok());
+
+    // Empty and whitespace-only payloads, a truncated frame, trailing bytes.
+    assert!(matches!(rej(b""), DecodeError::Json(_)));
+    assert!(matches!(rej(b"   "), DecodeError::Json(_)));
+    assert!(matches!(
+        rej(&ok.as_bytes()[..ok.len() - 1]),
+        DecodeError::Json(_)
+    ));
+    assert!(matches!(
+        rej(format!("{ok}garbage").as_bytes()),
+        DecodeError::Json(_)
+    ));
+    assert!(matches!(
+        rej(format!("{ok}{ok}").as_bytes()),
+        DecodeError::Json(_)
+    ));
+
+    // Invalid UTF-8 inside a string and outside any token.
+    let mut in_string = ok.as_bytes().to_vec();
+    let at = in_string.iter().position(|b| *b == b'a').unwrap();
+    in_string[at] = 0xff;
+    assert!(matches!(rej(&in_string), DecodeError::Json(_)));
+    let mut outside = ok.as_bytes().to_vec();
+    outside.push(0xff);
+    assert!(matches!(rej(&outside), DecodeError::Json(_)));
+
+    // A UTF-8 BOM is not JSON whitespace.
+    let mut bom = vec![0xef, 0xbb, 0xbf];
+    bom.extend_from_slice(ok.as_bytes());
+    assert!(matches!(rej(&bom), DecodeError::Json(_)));
+
+    // `params` that is not an object.
+    for params in ["[]", "null", "1", "\"x\""] {
+        let text = format!(r#"{{"jsonrpc":"2.0","method":"host.log","params":{params}}}"#);
+        assert!(
+            matches!(rej(text.as_bytes()), DecodeError::BadParams { .. }),
+            "{params}"
+        );
+    }
+
+    // An id above u64::MAX is no host.call id.
+    let call = |id: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"host.call","params":{{"id":1,"op_id":"o","params":null,"instance":null,"all":false}}}}"#
+        )
+    };
+    assert!(matches!(
+        rej(call("18446744073709551616").as_bytes()),
+        DecodeError::BadId
+    ));
+    assert!(decode_worker_frame(call("1").as_bytes()).is_ok());
+
+    // `jsonrpc` as a number, or spelled with escapes: only the literal string "2.0" passes.
+    for v in ["2.0", "2", "\"2\\u002e0\"", "[\"2.0\"]", "null"] {
+        let text = format!(r#"{{"jsonrpc":{v},"method":"host.log","params":{{"line":"a"}}}}"#);
+        let r = rej(text.as_bytes());
+        assert!(
+            matches!(r, DecodeError::WrongVersion | DecodeError::Json(_)),
+            "{v}: {r}"
+        );
+    }
+}
+
+#[test]
+fn decode_depth_limit_applies_to_host_call_params_not_result_text() {
+    // Pins current behavior (serde_json's recursion limit of 128). A `script.result` value is
+    // kept as text and skipped without that limit, so even a very deep result decodes. A
+    // `host.call` `params` is a `Value`: nested 100 deep it decodes, nested 200 deep it is a
+    // `BadParams` error. The T4 worker loop must report an over-deep call as a script error,
+    // not as a protocol violation.
+    let nested = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let result = |depth: usize| {
+        format!(
+            r#"{{"jsonrpc":"2.0","method":"script.result","params":{{"value":{}}}}}"#,
+            nested(depth)
+        )
+    };
+    for depth in [100, 200, 5000] {
+        let frame = decode_worker_frame(result(depth).as_bytes()).unwrap();
+        assert!(
+            matches!(&frame, WorkerFrame::Result { value } if value.get() == nested(depth)),
+            "{depth}"
+        );
+    }
+
+    let call = |depth: usize| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"host.call","params":{{"id":1,"op_id":"o","params":{},"instance":null,"all":false}}}}"#,
+            nested(depth)
+        )
+    };
+    assert!(decode_worker_frame(call(100).as_bytes()).is_ok());
+    assert!(matches!(
+        decode_worker_frame(call(200).as_bytes()),
+        Err(DecodeError::BadParams { .. } | DecodeError::Json(_))
+    ));
+}

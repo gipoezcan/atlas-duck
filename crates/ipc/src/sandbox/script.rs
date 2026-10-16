@@ -6,6 +6,18 @@
 //! [`super::probe::encode_notification`]. The worker answers with the frames
 //! [`decode_worker_frame`] accepts; its `host.call` is a JSON-RPC request that the host answers
 //! with [`encode_response`]. Frame size checks belong to the bridge, not to the decoder.
+//!
+//! Limits of the decoder, by design:
+//! - Only top-level duplicate keys are detected. Below that, `HostCall.params` and
+//!   `WorkerInit.args` are `Value` trees that keep the last of a duplicate key, while a
+//!   `script.result` value keeps its text untouched. Do not use a `Value` for forensic
+//!   comparison of what a worker sent.
+//! - serde_json's recursion limit (128) applies to every `Value` built here: a `host.call` whose
+//!   `params` nest about 126 levels or more is rejected as a protocol violation. A
+//!   `script.result` value is skipped as text without that limit, so it decodes at any depth
+//!   (whoever parses it later must bound the depth). The worker run loop (M8 T4) must check
+//!   the depth of a call's params before it sends the frame and report an over-deep value as a
+//!   script error.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -113,6 +125,14 @@ pub struct ErrorParams {
 #[serde(deny_unknown_fields)]
 pub struct ResultParams {
     pub value: RawJsonText,
+}
+
+/// [`ResultParams`] as the decoder reads it: the value borrowed from the frame, copied once.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResultParamsIn<'a> {
+    #[serde(borrow)]
+    value: &'a RawValue,
 }
 
 /// A JSON value kept as its source text. The host forwards a script's result to core without
@@ -281,20 +301,20 @@ pub fn encode_response(id: u64, result: &HostCallResult) -> Vec<u8> {
 }
 
 /// The members of the top-level object, each value kept as raw text, in order.
-struct Members(Vec<(String, Box<RawValue>)>);
+struct Members<'a>(Vec<(String, &'a RawValue)>);
 
-impl<'de> Deserialize<'de> for Members {
+impl<'de> Deserialize<'de> for Members<'de> {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = Members;
+            type Value = Members<'de>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a JSON object")
             }
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Members, A::Error> {
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Members<'de>, A::Error> {
                 let mut out = Vec::new();
                 while let Some(key) = map.next_key::<String>()? {
-                    out.push((key, map.next_value::<Box<RawValue>>()?));
+                    out.push((key, map.next_value::<&'de RawValue>()?));
                 }
                 Ok(Members(out))
             }
@@ -342,10 +362,10 @@ pub fn decode_worker_frame(bytes: &[u8]) -> Result<WorkerFrame, DecodeError> {
             return Err(DecodeError::DuplicateKey(key.clone()));
         }
         match key.as_str() {
-            "jsonrpc" => jsonrpc = Some(value),
-            "method" => method = Some(value),
-            "params" => params = Some(value),
-            "id" => id = Some(value),
+            "jsonrpc" => jsonrpc = Some(*value),
+            "method" => method = Some(*value),
+            "params" => params = Some(*value),
+            "id" => id = Some(*value),
             "result" | "error" => response_key = true,
             other => return Err(DecodeError::ExtraKey(other.to_string())),
         }
@@ -372,7 +392,6 @@ pub fn decode_worker_frame(bytes: &[u8]) -> Result<WorkerFrame, DecodeError> {
     }
     let method: String =
         serde_json::from_str(method.get()).map_err(|_| DecodeError::MissingMethod)?;
-    let params = params.map(|p| &**p);
 
     if method == M_HOST_CALL {
         let envelope = id
@@ -403,9 +422,9 @@ pub fn decode_worker_frame(bytes: &[u8]) -> Result<WorkerFrame, DecodeError> {
             WorkerFrame::Log { line: p.line }
         }
         M_SCRIPT_RESULT => {
-            let p: ResultParams = parse_params(&method, params)?;
+            let p: ResultParamsIn = parse_params(&method, params)?;
             WorkerFrame::Result {
-                value: Box::new(p.value),
+                value: Box::new(RawJsonText(p.value.to_owned())),
             }
         }
         M_SCRIPT_ERROR => {
