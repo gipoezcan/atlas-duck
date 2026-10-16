@@ -9,9 +9,12 @@
 //! resolve}` is committed before the next GET leaves, as in the staged enrichment driver, so at
 //! most one is in flight; a cancel or a quit records that one (`cancelled_in_flight`). At most
 //! [`MAX_LOOKUPS`] fresh lookups run per read, none once fewer than [`LOOKUP_RESERVE`] of the read
-//! budget remain, and a key longer than [`MAX_KEY_CHARS`] or holding a control character is never
-//! looked up: those keys, and every answer that is not a 2xx JSON object with a usable
-//! `username`, become `null` (display only: a lookup never fails the read).
+//! budget remain or once another answer of [`MAX_LOOKUP_BYTES`] could pass the read's byte cap,
+//! and a key longer than [`MAX_KEY_CHARS`] or holding a control character is never looked up:
+//! those keys, and every answer that is not a 2xx JSON object for the key asked with a usable
+//! `username`, become `null` (display only: a lookup never fails the read). Each answer is cut at
+//! [`MAX_LOOKUP_BYTES`] and at the read's deadline (T11 review I-2), so the read ends within its
+//! budget.
 //!
 //! The map the pass returns is the one committed and the one the normalization converts with
 //! (`read::normalize`); the cache is never read again for that candidate, so a cache change after
@@ -46,10 +49,18 @@ pub const MAX_LOOKUPS: usize = 50;
 pub const LOOKUP_RESERVE: Duration = Duration::from_secs(20);
 /// PD-99: a longer key is not looked up (nor is one holding a control character).
 pub const MAX_KEY_CHARS: usize = 255;
+/// The most bytes of one lookup answer received (T11 review I-2): a Confluence DC user object is
+/// about 1 KiB. A longer answer is cut there (`too_large`), recorded with what arrived, and the
+/// key is `null`.
+pub const MAX_LOOKUP_BYTES: u64 = 64 * 1024;
 /// The longest username kept, the converter's own limit for a rendered mention (PD-95).
 const MAX_USERNAME_CHARS: usize = 255;
 /// `GET /rest/api/user?key=` (§7.6).
 const USER_PATH: &str = "/rest/api/user";
+
+/// A direct read's content (at most the 32 MiB response cap) and all its lookups fit in the
+/// 50 MiB read byte cap, so the byte rule never closes a direct read's pass early by default.
+const _: () = assert!(32 * 1024 * 1024 + MAX_LOOKUPS as u64 * MAX_LOOKUP_BYTES <= 50 * 1024 * 1024);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -69,6 +80,9 @@ struct InstanceUsers {
     /// tick → key; the first entry is the least recently used.
     order: BTreeMap<u64, String>,
     tick: u64,
+    /// Bumped by every [`UserCache::clear`]: an answer of a pass that began before the clear is
+    /// not stored (T11 review m-1).
+    generation: u64,
 }
 
 impl InstanceUsers {
@@ -86,6 +100,17 @@ impl InstanceUsers {
         if let Some(c) = self.map.remove(key) {
             self.order.remove(&c.tick);
         }
+    }
+
+    /// The cached answer for `key` (an expired one is dropped), refreshing its LRU position.
+    fn hit(&mut self, key: &str, now: UtcInstant) -> Option<Option<String>> {
+        let at = self.map.get(key)?.at;
+        if expired(at, now) {
+            self.remove(key);
+            return None;
+        }
+        self.touch(key);
+        self.map.get(key).map(|c| c.name.clone())
     }
 }
 
@@ -123,22 +148,51 @@ impl UserCache {
         key: &str,
         now: UtcInstant,
     ) -> Option<Option<String>> {
+        lock(&self.inner).get_mut(instance_id)?.hit(key, now)
+    }
+
+    /// The start of a pass, under one lock (T11 review m-6): the instance's current generation
+    /// and the cached answer of every key of `keys` that has one.
+    pub(crate) fn snapshot(
+        &self,
+        instance_id: &str,
+        keys: &BTreeSet<String>,
+        now: UtcInstant,
+    ) -> (u64, BTreeMap<String, Option<String>>) {
         let mut g = lock(&self.inner);
-        let users = g.get_mut(instance_id)?;
-        let at = users.map.get(key)?.at;
-        if expired(at, now) {
-            users.remove(key);
-            return None;
-        }
-        users.touch(key);
-        users.map.get(key).map(|c| c.name.clone())
+        let Some(users) = g.get_mut(instance_id) else {
+            return (0, BTreeMap::new());
+        };
+        let hits = keys
+            .iter()
+            .filter_map(|k| users.hit(k, now).map(|hit| (k.clone(), hit)))
+            .collect();
+        (users.generation, hits)
+    }
+
+    /// The instance's current generation (what a pass starting now would read).
+    pub(crate) fn generation(&self, instance_id: &str) -> u64 {
+        lock(&self.inner)
+            .get(instance_id)
+            .map_or(0, |u| u.generation)
     }
 
     /// Stores the answer for `key` that arrived at `now`, evicting the least recently used entry
-    /// beyond [`USER_CACHE_MAX`].
-    pub(crate) fn put(&self, instance_id: &str, key: &str, name: Option<String>, now: UtcInstant) {
+    /// beyond [`USER_CACHE_MAX`]. Dropped when the instance was cleared since `generation` was
+    /// read: the answer came under the old PAT or origin (T11 review m-1).
+    pub(crate) fn put(
+        &self,
+        instance_id: &str,
+        generation: u64,
+        key: &str,
+        name: Option<String>,
+        now: UtcInstant,
+    ) {
         let mut g = lock(&self.inner);
         let users = g.entry(instance_id.to_owned()).or_default();
+        if users.generation != generation {
+            return;
+        }
         users.remove(key);
         users.tick += 1;
         let tick = users.tick;
@@ -159,9 +213,14 @@ impl UserCache {
         }
     }
 
-    /// PD-99: forgets every entry of `instance_id` (its PAT or its origin changed).
+    /// PD-99: forgets every entry of `instance_id` (its PAT or its origin changed) and starts a
+    /// new generation, so a lookup still in flight from before stores nothing.
     pub(crate) fn clear(&self, instance_id: &str) {
-        lock(&self.inner).remove(instance_id);
+        let mut g = lock(&self.inner);
+        let users = g.entry(instance_id.to_owned()).or_default();
+        users.map.clear();
+        users.order.clear();
+        users.generation += 1;
     }
 }
 
@@ -170,21 +229,59 @@ fn lookable(key: &str) -> bool {
     key.chars().nth(MAX_KEY_CHARS).is_none() && !key.chars().any(char::is_control)
 }
 
-/// The username of a lookup answer: a 2xx JSON object whose `username` is a string the converter
-/// would render (non-empty, at most 255 chars, no control character); anything else is `None`.
-fn username(outcome: &FetchOutcome) -> Option<String> {
-    let FetchOutcome::Response(r) = outcome else {
-        return None;
-    };
-    if !(200..300).contains(&r.status) || !is_json(r) {
-        return None;
+/// What a lookup answer says about `key`.
+#[derive(Debug, PartialEq, Eq)]
+enum Answer {
+    /// A 2xx JSON object for `key` whose `username` the converter would render (non-empty, at
+    /// most 255 chars, no control character): cached.
+    Name(String),
+    /// A definitive "no usable name": a JSON 404, or a 2xx JSON object for `key` without a usable
+    /// `username` (T11 review m-3). Cached as `None`, so such a page does not cost its lookups on
+    /// every read.
+    NoUser,
+    /// Anything else (a timeout, a cut answer, a 5xx, a 401, a 404 without JSON, an object for
+    /// another key, T11 review m-2): `null`, not cached, so a transient failure does not hide a
+    /// user for an hour.
+    Unknown,
+}
+
+impl Answer {
+    fn name(&self) -> Option<String> {
+        match self {
+            Answer::Name(n) => Some(n.clone()),
+            Answer::NoUser | Answer::Unknown => None,
+        }
     }
-    let v: Value = serde_json::from_slice(&r.body).ok()?;
-    let name = v.get("username")?.as_str()?;
-    let usable = !name.is_empty()
-        && name.chars().nth(MAX_USERNAME_CHARS).is_none()
-        && !name.chars().any(char::is_control);
-    usable.then(|| name.to_owned())
+}
+
+fn answer(outcome: &FetchOutcome, key: &str) -> Answer {
+    let FetchOutcome::Response(r) = outcome else {
+        return Answer::Unknown;
+    };
+    if !is_json(r) {
+        return Answer::Unknown;
+    }
+    if r.status == 404 {
+        return Answer::NoUser;
+    }
+    if !(200..300).contains(&r.status) {
+        return Answer::Unknown;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(&r.body) else {
+        return Answer::Unknown;
+    };
+    if v.get("userKey").and_then(Value::as_str) != Some(key) {
+        return Answer::Unknown;
+    }
+    let usable = |name: &&str| {
+        !name.is_empty()
+            && name.chars().nth(MAX_USERNAME_CHARS).is_none()
+            && !name.chars().any(char::is_control)
+    };
+    match v.get("username").and_then(Value::as_str).filter(usable) {
+        Some(name) => Answer::Name(name.to_owned()),
+        None => Answer::NoUser,
+    }
 }
 
 fn is_json(r: &atlas_duck_atlassian::UpstreamResponse) -> bool {
@@ -193,10 +290,25 @@ fn is_json(r: &atlas_duck_atlassian::UpstreamResponse) -> bool {
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
 }
 
-/// The answer is a definitive "no such user" (a JSON 404), cached as `None`; a failure that may
-/// pass (a timeout, a 5xx, a 401, a 404 without JSON) is not cached.
-fn not_found(outcome: &FetchOutcome) -> bool {
-    matches!(outcome, FetchOutcome::Response(r) if r.status == 404 && is_json(r))
+/// The bytes of the answer a lookup received (what its record holds), for the byte rule.
+fn received_bytes(outcome: &FetchOutcome) -> u64 {
+    let n = match outcome {
+        FetchOutcome::Response(r) => r.body.len(),
+        FetchOutcome::Failed(f) => match f {
+            FetchFailure::StatusHeaderDecided { response, .. }
+            | FetchFailure::BodyDecided { response, .. }
+            | FetchFailure::IdentityCheckFailed { response, .. } => response.body.len(),
+            FetchFailure::PostSend { received, .. } => received.len(),
+            FetchFailure::CancelledInFlight { bytes_received } => bytes_received.len(),
+            FetchFailure::PreSendConnection(_)
+            | FetchFailure::OriginGuardRefused
+            | FetchFailure::CancelledBeforeSend
+            | FetchFailure::BudgetExpiredBeforeSend
+            | FetchFailure::NeedsToken
+            | FetchFailure::MethodGuardRefused => 0,
+        },
+    };
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// Where the pass runs, and so where its in-flight lookup and its records go.
@@ -232,13 +344,20 @@ impl Site<'_> {
     }
 
     /// The record of a finished lookup, kept until an append commits it (a cancel or the end of
-    /// the run in between commits it itself).
+    /// the run in between commits it itself). `TestHooks::pause_after_get` holds here, after the
+    /// park, at both sites.
     async fn park(&self, engine: &Arc<Engine>, record: &NewEvent) {
         match self {
             Site::Read(entry) => park(engine, entry, record).await,
             Site::Script {
                 shared, call_id, ..
-            } => shared.park_lookup(*call_id, record),
+            } => {
+                shared.park_lookup(*call_id, record);
+                #[cfg(feature = "testing")]
+                if let Some(pause) = engine.hooks().pause_after_get.clone() {
+                    pause.hold().await;
+                }
+            }
         }
     }
 
@@ -267,6 +386,15 @@ pub(crate) struct Pass<'a> {
     pub ctl: &'a FetchControl,
     /// The end of the read budget.
     pub deadline: Instant,
+    /// The bytes the lookups may receive in all: the read's byte cap less its content (a direct
+    /// read: the 50 MiB read cap; a host call: what is left of the run's `max_fetch_mb`).
+    pub max_bytes: u64,
+}
+
+/// What a pass gives: the map to commit and the bytes its lookups received.
+pub(crate) struct Resolved {
+    pub users: UserResolutions,
+    pub bytes: u64,
 }
 
 /// The request ended (a cancel, an expiry, a quit, an append that failed) while the pass ran.
@@ -277,19 +405,25 @@ pub(crate) struct Cancelled;
 pub(crate) async fn resolve_users(
     p: &Pass<'_>,
     keys: &BTreeSet<String>,
-) -> Result<UserResolutions, Cancelled> {
-    let cache = p.engine.user_cache();
+) -> Result<Resolved, Cancelled> {
+    let (generation, mut hits) =
+        p.engine
+            .user_cache()
+            .snapshot(p.instance_id, keys, p.engine.clock().now_utc());
     let mut map = UserResolutions::new();
     let mut sent = 0usize;
-    // Once closed (the cap, the budget's reserve), no lookup starts again in this read.
+    let mut used = 0u64;
+    // Once closed (the cap, the budget's reserve, the byte cap), no lookup starts again in this
+    // read.
     let mut open = true;
     for key in keys {
-        if let Some(hit) = cache.get(p.instance_id, key, p.engine.clock().now_utc()) {
+        if let Some(hit) = hits.remove(key) {
             map.insert(key.clone(), hit);
             continue;
         }
         if open
             && (sent >= MAX_LOOKUPS
+                || used.saturating_add(MAX_LOOKUP_BYTES) > p.max_bytes
                 || p.deadline.saturating_duration_since(Instant::now()) < LOOKUP_RESERVE)
         {
             open = false;
@@ -299,14 +433,27 @@ pub(crate) async fn resolve_users(
             continue;
         }
         sent += 1;
-        let name = lookup(p, key).await?;
+        let (name, bytes) = lookup(p, generation, key).await?;
+        used = used.saturating_add(bytes);
         map.insert(key.clone(), name);
     }
-    Ok(map)
+    #[cfg(feature = "testing")]
+    if let Some(pause) = p.engine.hooks().pause_after_lookups.clone() {
+        pause.hold().await;
+    }
+    Ok(Resolved {
+        users: map,
+        bytes: used,
+    })
 }
 
-/// One `GET /rest/api/user?key=<key>`, recorded and committed before the pass goes on.
-async fn lookup(p: &Pass<'_>, key: &str) -> Result<Option<String>, Cancelled> {
+/// One `GET /rest/api/user?key=<key>`, recorded and committed before the pass goes on; gives the
+/// name and the bytes received.
+async fn lookup(
+    p: &Pass<'_>,
+    generation: u64,
+    key: &str,
+) -> Result<(Option<String>, u64), Cancelled> {
     let call = GetCall {
         endpoint_template: USER_PATH.to_owned(),
         params: Value::Null,
@@ -317,15 +464,18 @@ async fn lookup(p: &Pass<'_>, key: &str) -> Result<Option<String>, Cancelled> {
         purpose: PreviewFetchPurpose::Resolve,
         path: call_path(base, &call),
     }));
-    let outcome = p.client.get_ctl(p.cover, &call, p.ctl).await;
-    p.site.in_flight(None);
+    let outcome = p
+        .client
+        .get_bounded_ctl(p.cover, &call, p.ctl, MAX_LOOKUP_BYTES, p.deadline)
+        .await;
     if matches!(
         outcome,
         FetchOutcome::Failed(
             FetchFailure::CancelledInFlight { .. } | FetchFailure::CancelledBeforeSend
         )
     ) {
-        // The cancel took the control in its gated section and recorded this GET.
+        // The cancel took the control in its gated section and recorded this GET. The in-flight
+        // mark stays: the request is ending (its terminal control drop clears it).
         return Err(Cancelled);
     }
     let record = get_record(
@@ -335,18 +485,28 @@ async fn lookup(p: &Pass<'_>, key: &str) -> Result<Option<String>, Cancelled> {
         &call,
         &outcome,
     );
+    #[cfg(feature = "testing")]
+    if let Some(pause) = p.engine.hooks().pause_before_lookup_park.clone() {
+        pause.hold().await;
+    }
+    // T11 review I-1: the in-flight mark is cleared only once the record is parked, so a cancel
+    // at any point records this GET once: before the park as in flight, after it from the parked
+    // record (which then skips the in-flight one). Never after the commit: the commit takes the
+    // parked record, and a cancel then would record the GET again from a stale mark.
     p.site.park(p.engine, &record).await;
+    p.site.in_flight(None);
     if !p.site.commit(p.engine, record).await {
         return Err(Cancelled);
     }
-    let name = username(&outcome);
-    let now = p.engine.clock().now_utc();
-    if name.is_some() || not_found(&outcome) {
+    let answer = answer(&outcome, key);
+    let name = answer.name();
+    if answer != Answer::Unknown {
+        let now = p.engine.clock().now_utc();
         p.engine
             .user_cache()
-            .put(p.instance_id, key, name.clone(), now);
+            .put(p.instance_id, generation, key, name.clone(), now);
     }
-    Ok(name)
+    Ok((name, received_bytes(&outcome)))
 }
 
 #[cfg(test)]
@@ -363,8 +523,8 @@ mod tests {
     fn get_put_ttl_and_clear() {
         let c = UserCache::default();
         assert_eq!(c.get(I, "k", at(0)), None);
-        c.put(I, "k", Some("jdoe".into()), at(0));
-        c.put(I, "gone", None, at(0));
+        c.put(I, 0, "k", Some("jdoe".into()), at(0));
+        c.put(I, 0, "gone", None, at(0));
         assert_eq!(c.get(I, "k", at(1)), Some(Some("jdoe".into())));
         assert_eq!(c.get(I, "gone", at(1)), Some(None));
         assert_eq!(c.get("inst-b", "k", at(1)), None, "per instance");
@@ -379,15 +539,57 @@ mod tests {
         assert_eq!(c.get(I, "gone", at(1)), None);
     }
 
+    /// T11 review m-1: an answer of a pass that began before a clear is not stored.
+    #[test]
+    fn put_after_a_clear_is_dropped() {
+        let c = UserCache::default();
+        let g0 = c.generation(I);
+        c.put(I, g0, "k", Some("old".into()), at(0));
+        c.clear(I);
+        c.put(I, g0, "k", Some("old".into()), at(1));
+        c.put(I, g0, "k2", None, at(1));
+        assert_eq!(c.get(I, "k", at(1)), None);
+        assert_eq!(c.get(I, "k2", at(1)), None);
+        let g1 = c.generation(I);
+        assert_ne!(g1, g0);
+        c.put(I, g1, "k", Some("new".into()), at(1));
+        assert_eq!(c.get(I, "k", at(1)), Some(Some("new".into())));
+        // Another instance's clear changes nothing here.
+        c.clear("inst-b");
+        assert_eq!(c.generation(I), g1);
+    }
+
+    #[test]
+    fn snapshot_is_the_hits_and_the_generation() {
+        let c = UserCache::default();
+        let keys: BTreeSet<String> = ["a", "b", "c"].iter().map(|k| (*k).to_owned()).collect();
+        assert_eq!(c.snapshot(I, &keys, at(0)), (0, BTreeMap::new()));
+        c.put(I, 0, "a", Some("x".into()), at(0));
+        c.put(I, 0, "c", None, at(0));
+        c.put(I, 0, "z", Some("z".into()), at(0));
+        c.clear("inst-b");
+        let (g, hits) = c.snapshot(I, &keys, at(1));
+        assert_eq!(g, 0);
+        let want: BTreeMap<String, Option<String>> = [
+            ("a".to_owned(), Some("x".to_owned())),
+            ("c".to_owned(), None),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(hits, want);
+        c.clear(I);
+        assert_eq!(c.snapshot(I, &keys, at(1)), (1, BTreeMap::new()));
+    }
+
     #[test]
     fn least_recently_used_goes_first() {
         let c = UserCache::default();
         for n in 0..USER_CACHE_MAX {
-            c.put(I, &format!("k{n}"), None, at(0));
+            c.put(I, 0, &format!("k{n}"), None, at(0));
         }
         // `k0` is used again, so `k1` is now the oldest.
         assert_eq!(c.get(I, "k0", at(0)), Some(None));
-        c.put(I, "new", None, at(0));
+        c.put(I, 0, "new", None, at(0));
         assert_eq!(c.get(I, "k0", at(0)), Some(None));
         assert_eq!(c.get(I, "k1", at(0)), None);
         assert_eq!(c.get(I, "new", at(0)), Some(None));
@@ -408,8 +610,8 @@ mod tests {
     }
 
     #[test]
-    fn usable_usernames_only() {
-        let answer = |status: u16, ct: Option<&str>, body: &str| {
+    fn answers() {
+        let reply = |status: u16, ct: Option<&str>, body: &str| {
             FetchOutcome::Response(atlas_duck_atlassian::UpstreamResponse {
                 status,
                 content_type: ct.map(str::to_owned),
@@ -417,24 +619,74 @@ mod tests {
             })
         };
         let json = Some("application/json;charset=UTF-8");
+        let k = "key-1";
+        let name = |n: &str| Answer::Name(n.to_owned());
         assert_eq!(
-            username(&answer(200, json, r#"{"username":"jdoe"}"#)),
-            Some("jdoe".to_owned())
+            answer(
+                &reply(200, json, r#"{"username":"jdoe","userKey":"key-1"}"#),
+                k
+            ),
+            name("jdoe")
         );
-        assert_eq!(username(&answer(200, None, r#"{"username":"jdoe"}"#)), None);
-        assert_eq!(username(&answer(404, json, r#"{"username":"jdoe"}"#)), None);
-        assert_eq!(username(&answer(200, json, r#"{"username":""}"#)), None);
-        assert_eq!(username(&answer(200, json, r#"{"username":7}"#)), None);
-        assert_eq!(username(&answer(200, json, r#"{"name":"jdoe"}"#)), None);
-        assert_eq!(username(&answer(200, json, "{")), None);
-        let long = format!(r#"{{"username":"{}"}}"#, "n".repeat(MAX_USERNAME_CHARS + 1));
-        assert_eq!(username(&answer(200, json, &long)), None);
         assert_eq!(
-            username(&answer(200, json, r#"{"username":"a\u0007b"}"#)),
-            None
+            answer(
+                &reply(200, None, r#"{"username":"jdoe","userKey":"key-1"}"#),
+                k
+            ),
+            Answer::Unknown
         );
-        assert!(not_found(&answer(404, json, "{}")));
-        assert!(!not_found(&answer(404, None, "")));
-        assert!(!not_found(&answer(503, json, "{}")));
+        // m-2: an object for another key (or for no key) is never taken for this one.
+        assert_eq!(
+            answer(
+                &reply(200, json, r#"{"username":"x","userKey":"other"}"#),
+                k
+            ),
+            Answer::Unknown
+        );
+        assert_eq!(
+            answer(&reply(200, json, r#"{"username":"jdoe"}"#), k),
+            Answer::Unknown
+        );
+        assert_eq!(
+            answer(&reply(200, json, r#"{"username":"jdoe","userKey":7}"#), k),
+            Answer::Unknown
+        );
+        // m-3: an object for this key without a usable username is definitive.
+        for body in [
+            r#"{"username":"","userKey":"key-1"}"#,
+            r#"{"username":7,"userKey":"key-1"}"#,
+            r#"{"name":"jdoe","userKey":"key-1"}"#,
+            r#"{"username":"a\u0007b","userKey":"key-1"}"#,
+        ] {
+            assert_eq!(answer(&reply(200, json, body), k), Answer::NoUser, "{body}");
+        }
+        let long = format!(
+            r#"{{"username":"{}","userKey":"key-1"}}"#,
+            "n".repeat(MAX_USERNAME_CHARS + 1)
+        );
+        assert_eq!(answer(&reply(200, json, &long), k), Answer::NoUser);
+        assert_eq!(answer(&reply(200, json, "{"), k), Answer::Unknown);
+        assert_eq!(answer(&reply(404, json, "{}"), k), Answer::NoUser);
+        assert_eq!(
+            answer(
+                &reply(404, json, r#"{"username":"jdoe","userKey":"key-1"}"#),
+                k
+            ),
+            Answer::NoUser
+        );
+        assert_eq!(answer(&reply(404, None, ""), k), Answer::Unknown);
+        assert_eq!(answer(&reply(503, json, "{}"), k), Answer::Unknown);
+        assert_eq!(answer(&reply(401, json, "{}"), k), Answer::Unknown);
+        let cut = FetchOutcome::Failed(FetchFailure::PostSend {
+            kind: atlas_duck_atlassian::PostSendKind::ResponseCap32MiB,
+            received: vec![b' '; 10],
+        });
+        assert_eq!(answer(&cut, k), Answer::Unknown);
+        assert_eq!(received_bytes(&cut), 10);
+        assert_eq!(received_bytes(&reply(200, json, "{}")), 2);
+        assert_eq!(
+            received_bytes(&FetchOutcome::Failed(FetchFailure::BudgetExpiredBeforeSend)),
+            0
+        );
     }
 }

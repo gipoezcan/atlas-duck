@@ -606,7 +606,9 @@ impl InstanceClient {
 }
 
 /// Appends every chunk to the control's shared buffer until the end, the cap, the deadline, a
-/// read error or a cancel; the bytes stay in the control.
+/// read error or a cancel; the bytes stay in the control. A body over the cap is kept up to
+/// `cap + 1` bytes (the byte that shows it is over), not up to the end of the chunk that crossed
+/// it (T11 review I-2).
 pub(crate) async fn read_body(
     mut resp: reqwest::Response,
     ctl: &FetchControl,
@@ -618,6 +620,7 @@ pub(crate) async fn read_body(
     if let Some(n) = resp.content_length() {
         ctl.reserve_partial(usize::try_from(n.min(cap)).unwrap_or(0));
     }
+    let limit = usize::try_from(cap.saturating_add(1)).unwrap_or(usize::MAX);
     loop {
         let next = tokio::select! {
             biased;
@@ -627,7 +630,7 @@ pub(crate) async fn read_body(
         };
         match next {
             Ok(Some(chunk)) => {
-                let len = ctl.append_partial(&chunk);
+                let len = ctl.append_partial_within(&chunk, limit);
                 if u64::try_from(len).unwrap_or(u64::MAX) > cap {
                     return BodyRead::OverCap;
                 }

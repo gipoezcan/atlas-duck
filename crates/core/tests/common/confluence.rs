@@ -56,10 +56,15 @@ pub fn page_with_view(html: &str) -> Value {
 
 /// `GET /rest/api/content/{id}?expand=body.storage,version,space,ancestors` answers `body`.
 pub async fn mount_page(mock: &MockDc, id: &str, body: &Value) {
+    mount_page_delayed(mock, id, body, Duration::ZERO).await;
+}
+
+/// [`mount_page`] answering `delay` after the request arrived.
+pub async fn mount_page_delayed(mock: &MockDc, id: &str, body: &Value, delay: Duration) {
     Mock::given(method("GET"))
         .and(path(mock.path(&content_path(id))))
         .and(query_param("expand", PAGE_EXPAND_STORAGE))
-        .respond_with(json_answer(mock, 200, body))
+        .respond_with(json_answer(mock, 200, body).set_delay(delay))
         .mount(mock.server())
         .await;
 }
@@ -134,6 +139,17 @@ pub async fn mount_users_delayed(mock: &MockDc, users: &[(&str, Option<&str>)], 
             .mount(mock.server())
             .await;
     }
+}
+
+/// `GET /rest/api/user?key=<key>` answers `status` with the JSON `body` (a lookup answer that is
+/// not a plain known user or a 404).
+pub async fn mount_user_answer(mock: &MockDc, key: &str, status: u16, body: &Value) {
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/user")))
+        .and(query_param("key", key))
+        .respond_with(json_answer(mock, status, body))
+        .mount(mock.server())
+        .await;
 }
 
 /// The user lookups (`GET /rest/api/user`) the mock received, in order.

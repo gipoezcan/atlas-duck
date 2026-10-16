@@ -21,7 +21,7 @@ pub use hard_check::hard_check_storage;
 pub use lossy::{lossy_update, storage_lines};
 pub use parse::{
     Element, MAX_DEPTH, Node, Ns, StorageDoc, StorageReject, StorageUsers, check_storage_body,
-    construct_spans, parse, storage_constructs, storage_user_refs,
+    construct_spans, parse, storage_constructs, storage_user_refs, user_refs,
 };
 pub use to_md::{
     ConversionReport, KNOWN_MACROS, LostCounts, MarkdownTooLarge, UserResolutions,

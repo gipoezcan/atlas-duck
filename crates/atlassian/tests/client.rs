@@ -347,16 +347,79 @@ async fn post_send_timeout_and_cap() -> TestResult {
     )? {
         FetchFailure::PostSend { kind, received } => {
             assert_eq!(kind, PostSendKind::ResponseCap32MiB);
-            // The chunk that crossed the cap is kept; hyper's read buffer bounds it (~400 KiB).
-            assert!(received.len() > 32 * MIB, "{}", received.len());
-            assert!(
-                received.len() <= 32 * MIB + 512 * 1024,
-                "{}",
-                received.len()
-            );
+            // Kept up to the byte that shows the body is over the cap (T11 review I-2), not to
+            // the end of the chunk that crossed it.
+            assert_eq!(received.len(), 32 * MIB + 1);
         }
         other => return Err(format!("{other:?}").into()),
     }
+    Ok(())
+}
+
+/// T11 review I-2: `get_bounded_ctl` cuts the answer at the caller's cap (kept up to cap + 1
+/// bytes) and ends the call at the caller's deadline, before or after the send.
+#[tokio::test]
+async fn bounded_get_cap_and_deadline() -> TestResult {
+    const KIB: usize = 1024;
+    let dc = MockDc::start(Product::Confluence, "").await;
+    Mock::given(path("/rest/api/user"))
+        .respond_with(
+            dc.response(200)
+                .set_body_raw(vec![b' '; 100 * KIB], "application/json"),
+        )
+        .mount(dc.server())
+        .await;
+    Mock::given(path("/rest/api/space"))
+        .respond_with(
+            dc.response(200)
+                .set_body_raw("{}", "application/json")
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let cover = test_cover()?;
+    let later = tokio::time::Instant::now() + Duration::from_secs(20);
+    let bounded = |c: &'static str, deadline| {
+        let (t, cover) = (&t, &cover);
+        async move {
+            t.client
+                .get_bounded_ctl(cover, &call(c), &FetchControl::new(), 64 * 1024, deadline)
+                .await
+        }
+    };
+    match failure(bounded("/rest/api/user", later).await)? {
+        FetchFailure::PostSend { kind, received } => {
+            assert_eq!(kind, PostSendKind::ResponseCap32MiB);
+            assert_eq!(received.len(), 64 * KIB + 1);
+        }
+        other => return Err(format!("{other:?}").into()),
+    }
+    // Within the cap: the answer.
+    let small = response(bounded("/rest/api/space", later).await);
+    assert!(small.is_ok(), "{small:?}");
+    // The deadline while the answer is awaited: post-send, the read budget's class.
+    let soon = tokio::time::Instant::now() + Duration::from_millis(300);
+    let began = tokio::time::Instant::now();
+    assert_eq!(
+        failure(bounded("/rest/api/space", soon).await)?,
+        FetchFailure::PostSend {
+            kind: PostSendKind::ReadBudget120s,
+            received: Vec::new(),
+        }
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        began.elapsed()
+    );
+    // A deadline already passed: nothing leaves.
+    let hits = dc.received().await.len();
+    assert_eq!(
+        failure(bounded("/rest/api/space", tokio::time::Instant::now()).await)?,
+        FetchFailure::BudgetExpiredBeforeSend
+    );
+    assert_eq!(dc.received().await.len(), hits);
     Ok(())
 }
 

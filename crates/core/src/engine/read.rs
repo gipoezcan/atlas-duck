@@ -29,7 +29,6 @@ use atlas_duck_atlassian::{
 use atlas_duck_audit::NewEvent;
 use atlas_duck_convert::{
     ConversionReport, MarkdownTooLarge, UserResolutions, storage_to_markdown_within,
-    storage_user_refs,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::invisible::escape_for_display;
@@ -337,10 +336,12 @@ async fn with_users(
         cover: &cover,
         ctl: &ctl,
         deadline,
+        // The content and the lookups share the read's byte cap (T11 review I-2).
+        max_bytes: engine.read_budget().max_bytes.saturating_sub(rec.size()),
     };
     match users::resolve_users(&pass, &keys).await {
-        Ok(map) => {
-            rec.users = Some(map);
+        Ok(resolved) => {
+            rec.users = Some(resolved.users);
             Classified::Item(rec)
         }
         Err(users::Cancelled) => Classified::Cancelled,
@@ -350,7 +351,7 @@ async fn with_users(
 /// The user keys a released result of the Markdown shape resolves (PD-99): the `ri:userkey`
 /// references of its `body.storage.value`, decided by the same parse the conversion uses, and
 /// none when that parse is not `xml_ok` (the fallback renders no mention) or the answer has no
-/// storage body.
+/// storage body. The storage is parsed once (T11 review m-6).
 pub(super) fn lookup_keys(spec: &OperationSpec, rec: &ItemRecord) -> BTreeSet<String> {
     let Ok((body, _)) = result_body(spec, rec.responses.iter().map(|r| &*r.body)) else {
         return BTreeSet::new();
@@ -358,11 +359,11 @@ pub(super) fn lookup_keys(spec: &OperationSpec, rec: &ItemRecord) -> BTreeSet<St
     let Some(storage) = body.pointer("/body/storage/value").and_then(Value::as_str) else {
         return BTreeSet::new();
     };
-    let keys = storage_user_refs(storage).keys;
-    if keys.is_empty() || !atlas_duck_convert::storage::parse(storage).xml_ok {
+    let doc = atlas_duck_convert::storage::parse(storage);
+    if !doc.xml_ok {
         return BTreeSet::new();
     }
-    keys
+    atlas_duck_convert::storage::user_refs(&doc).keys
 }
 
 /// The trigger of a read's fetch, if its answer failed the identity check or is a JSON 401.

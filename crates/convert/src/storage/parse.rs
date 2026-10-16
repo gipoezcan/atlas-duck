@@ -931,8 +931,9 @@ pub fn storage_user_refs(storage: &str) -> StorageUsers {
     user_refs(&parse(storage))
 }
 
-/// [`storage_user_refs`] of an already parsed fragment.
-pub(crate) fn user_refs(doc: &StorageDoc) -> StorageUsers {
+/// [`storage_user_refs`] of an already parsed fragment (a caller that also needs `xml_ok`
+/// parses once).
+pub fn user_refs(doc: &StorageDoc) -> StorageUsers {
     let mut out = StorageUsers::default();
     users(&doc.nodes, &mut out);
     out

@@ -787,9 +787,14 @@ impl Harness {
             return false;
         };
         let now = self.engine().clock().now_utc();
-        self.engine()
-            .user_cache()
-            .put(&id, key, username.map(str::to_owned), now);
+        let cache = self.engine().user_cache();
+        cache.put(
+            &id,
+            cache.generation(&id),
+            key,
+            username.map(str::to_owned),
+            now,
+        );
         true
     }
 

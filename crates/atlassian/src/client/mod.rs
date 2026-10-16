@@ -200,6 +200,16 @@ impl FetchControl {
         s.partial.len()
     }
 
+    /// [`Self::append_partial`] that keeps at most `limit` bytes in all (the rest of the chunk is
+    /// dropped); returns the new partial length.
+    pub(crate) fn append_partial_within(&self, chunk: &[u8], limit: usize) -> usize {
+        let mut s = self.state();
+        let room = limit.saturating_sub(s.partial.len());
+        s.partial
+            .extend_from_slice(chunk.get(..room.min(chunk.len())).unwrap_or_default());
+        s.partial.len()
+    }
+
     pub(crate) fn snapshot_partial(&self) -> Vec<u8> {
         self.state().partial.clone()
     }
@@ -315,6 +325,35 @@ impl InstanceClient {
             },
             overall: None,
             max_response_bytes: send::MAX_RESPONSE_BYTES,
+            cap_kind: PostSendKind::ResponseCap32MiB,
+        };
+        self.send_one(req, ctl).await
+    }
+
+    /// `get_ctl` for a small auxiliary GET of a read (`core`'s user lookups, PD-99): the answer is
+    /// cut at `max_response_bytes` and the call ends at `deadline` (the read's budget), so the
+    /// read ends within its budget whatever the server sends. A body over the cap is
+    /// `PostSend {ResponseCap32MiB}` (the variant names the default cap; the cap here is the
+    /// caller's), a deadline is `ReadBudget120s` (`BudgetExpiredBeforeSend` before the send).
+    pub async fn get_bounded_ctl(
+        &self,
+        cover: &AuditCover,
+        call: &GetCall,
+        ctl: &FetchControl,
+        max_response_bytes: u64,
+        deadline: tokio::time::Instant,
+    ) -> FetchOutcome {
+        let req = send::OneRequest {
+            target: send::Target::Template {
+                cover,
+                method: reqwest::Method::GET,
+                template: &call.endpoint_template,
+                params: &call.params,
+                query: &call.query,
+                json_body: None,
+            },
+            overall: Some((deadline, PostSendKind::ReadBudget120s)),
+            max_response_bytes,
             cap_kind: PostSendKind::ResponseCap32MiB,
         };
         self.send_one(req, ctl).await

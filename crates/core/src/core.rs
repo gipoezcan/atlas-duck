@@ -157,8 +157,15 @@ pub struct TestHooks {
     /// refused like in a release build (§7.1, I-02).
     pub allow_http: bool,
     /// A write holds after one of its app-initiated GETs finished and its record is parked, before
-    /// any append commits it (Task 24 review I-2).
+    /// any append commits it (Task 24 review I-2); so does a read's or a host call's user lookup
+    /// (PD-99, T11 review I-1).
     pub pause_after_get: Option<Arc<Pause>>,
+    /// A user lookup (PD-99) holds after its GET returned and its record is built, before the
+    /// record is parked (T11 review I-1: a cancel there records the GET as in flight).
+    pub pause_before_lookup_park: Option<Arc<Pause>>,
+    /// A user lookup pass (PD-99) holds after its last lookup was committed, before the read
+    /// goes on to its record (T11 review m-9 (a): a cancel there records no lookup again).
+    pub pause_after_lookups: Option<Arc<Pause>>,
     /// Replaces the 60 s that `shutdown` waits for writes that are `executing` (§2.5 step 4).
     pub shutdown_write_wait: Option<std::time::Duration>,
     /// Replaces the 5 s that `shutdown` lets the cancelled field fills and token re-checks end

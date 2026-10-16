@@ -18,19 +18,19 @@ use std::time::Duration;
 use atlas_duck_atlassian::ReadBudget;
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, UserKind};
 use atlas_duck_audit::EventType;
-use atlas_duck_core::Confirm;
 use atlas_duck_core::engine::cache::RebuildError;
 use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
 use atlas_duck_core::engine::queue::{Limits, MIB};
 use atlas_duck_core::engine::read::normalize;
 use atlas_duck_core::payloads::body_json;
 use atlas_duck_core::testing::Harness;
+use atlas_duck_core::{Confirm, Pause, TestHooks};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_preview::{OutcomeKind, PreviewBody};
 use common::confluence::{
     PAGE_EXPAND_STORAGE, PAGE_EXPAND_VIEW, amplified_storage, content_path, mount_history_summary,
-    mount_history_version, mount_page, mount_page_view, mount_users, mount_users_delayed,
-    page_with_storage, page_with_view, user_gets,
+    mount_history_version, mount_page, mount_page_delayed, mount_page_view, mount_user_answer,
+    mount_users, mount_users_delayed, page_with_storage, page_with_view, user, user_gets,
 };
 use common::jira::{gets_on, query};
 use common::{TestError, TestResult, code, de, request_id, test_hits};
@@ -905,13 +905,29 @@ async fn read_held_in_lookup(h: &Harness) -> Result<String, TestError> {
 
 /// The records of a read cancelled during its first lookup, for `reason`.
 async fn assert_cancelled_in_lookup(h: &Harness, id: &str, reason: &str) -> TestResult {
+    assert_ended_in_lookup(h, id, reason, EventType::CANCELLED).await?;
+    let cancelled = records(h, id, EventType::CANCELLED).await?;
+    assert_eq!(
+        cancelled.first().map(|c| c["reason"].clone()),
+        Some(json!(reason))
+    );
+    Ok(())
+}
+
+/// The records of a read that ended (`terminal`) during its first lookup, for `reason`.
+async fn assert_ended_in_lookup(
+    h: &Harness,
+    id: &str,
+    reason: &str,
+    terminal: EventType,
+) -> TestResult {
     assert_eq!(
         h.event_types(id).await?,
         [
             EventType::REQUEST_RECEIVED,
             EventType::PREVIEW_FETCH,
             EventType::READ_FETCHED,
-            EventType::CANCELLED,
+            terminal,
         ]
     );
     let fetch = records(h, id, EventType::PREVIEW_FETCH).await?;
@@ -931,11 +947,6 @@ async fn assert_cancelled_in_lookup(h: &Harness, id: &str, reason: &str) -> Test
         "{r}"
     );
     assert!(r["size"].as_u64() > Some(100), "{r}");
-    let cancelled = records(h, id, EventType::CANCELLED).await?;
-    assert_eq!(
-        cancelled.first().map(|c| c["reason"].clone()),
-        Some(json!(reason))
-    );
     Ok(())
 }
 
@@ -1150,9 +1161,14 @@ async fn storage_format_resolves_nothing() -> TestResult {
     old["version"]["number"] = json!(2);
     mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
     mount_history_version(mock, ID, 2, &old).await;
+    // A view answer that also carries the storage body with both mentions (T11 review m-9 (g)).
+    let mut view = page_with_view("<p>Owners</p>");
+    view["body"]["storage"] = json!({"value": TWO_USERS_STORAGE, "representation": "storage"});
+    mount_page_view(mock, ID, &view).await;
     mount_users(mock, &[JDOE, ASMITH]).await;
     for (op, params) in [
         (PAGE_GET, json!({ "id": ID, "format": "storage" })),
+        (PAGE_GET, json!({ "id": ID, "format": "view" })),
         (
             PAGE_HISTORY,
             json!({ "id": ID, "version": 2, "format": "storage" }),
@@ -1175,5 +1191,330 @@ async fn storage_format_resolves_nothing() -> TestResult {
     // The same body as Markdown resolves both.
     queued(&h, PAGE_HISTORY, json!({ "id": ID, "version": 2 })).await?;
     assert_eq!(user_gets(mock).await.len(), 2);
+    Ok(())
+}
+
+// ---- Task 11 fix round (T11 review I-1, I-2, m-2, m-3, m-9) ------------------------------------
+
+/// A harness with `hooks`, the two-user page and both users mounted; the read is submitted.
+async fn two_user_read(hooks: TestHooks) -> Result<(Harness, String), TestError> {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .hooks(hooks)
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    let env = h.submit(PAGE_GET, json!({ "id": ID })).await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    Ok((h, id))
+}
+
+/// Cancels `id` while a hook holds it, then lets the held task go on and waits for it.
+async fn cancel_held(h: &Harness, id: &str, pause: &Pause) -> TestResult {
+    let env = h.handler().cancel(id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    pause.release.notify_one();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(())
+}
+
+/// The records of a read cancelled after `answered` lookups had answered (none in flight): each
+/// lookup recorded once, with its answer, and as many records as the mock saw lookups.
+async fn assert_answered_once(h: &Harness, id: &str, answered: &[&str]) -> TestResult {
+    let mut want = vec![EventType::REQUEST_RECEIVED];
+    want.extend(answered.iter().map(|_| EventType::PREVIEW_FETCH));
+    want.extend([EventType::READ_FETCHED, EventType::CANCELLED]);
+    assert_eq!(h.event_types(id).await?, want);
+    let fetches = records(h, id, EventType::PREVIEW_FETCH).await?;
+    for (f, key) in fetches.iter().zip(answered) {
+        assert_eq!(f["purpose"], "resolve", "{f}");
+        assert_eq!(f["status"], 200, "{f}");
+        assert_ne!(f["outcome"], "cancelled_in_flight", "{f}");
+        assert_eq!(f["path"], format!("/wiki/rest/api/user?key={key}"));
+    }
+    assert_eq!(looked_up(wiki(h)?).await, answered);
+    assert_eq!(fetches.len(), user_gets(wiki(h)?).await.len());
+    let r = read_fetched(h, id).await?;
+    assert_eq!(r["outcome"], "cancelled_in_flight", "{r}");
+    assert_eq!(r["pages"], 1);
+    Ok(())
+}
+
+/// I-1: a cancel after the lookup's record is parked (its in-flight mark still set) records the
+/// lookup once, from the parked record, not again as in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_lookup_answered_records_it_once() -> TestResult {
+    let pause = Pause::new();
+    let (h, id) = two_user_read(TestHooks {
+        pause_after_get: Some(pause.clone()),
+        ..TestHooks::none()
+    })
+    .await?;
+    pause.reached.notified().await;
+    cancel_held(&h, &id, &pause).await?;
+    assert_answered_once(&h, &id, &["key-asmith"]).await
+}
+
+/// I-1: a cancel after the lookup's GET returned and before its record is parked still records
+/// the GET (as in flight; its body was already taken from the control), never nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_before_lookup_park_records_it_in_flight() -> TestResult {
+    let pause = Pause::new();
+    let (h, id) = two_user_read(TestHooks {
+        pause_before_lookup_park: Some(pause.clone()),
+        ..TestHooks::none()
+    })
+    .await?;
+    pause.reached.notified().await;
+    cancel_held(&h, &id, &pause).await?;
+    assert_cancelled_in_lookup(&h, &id, "by_client").await?;
+    let fetches = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(fetches.len(), user_gets(wiki(&h)?).await.len());
+    assert_eq!(looked_up(wiki(&h)?).await, ["key-asmith"]);
+    Ok(())
+}
+
+/// I-1, the second lookup: the first is committed, the second parked when the cancel lands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_second_lookup_answered_records_each_once() -> TestResult {
+    let pause = Pause::new();
+    let (h, id) = two_user_read(TestHooks {
+        pause_after_get: Some(pause.clone()),
+        ..TestHooks::none()
+    })
+    .await?;
+    pause.reached.notified().await;
+    pause.release.notify_one();
+    pause.reached.notified().await;
+    cancel_held(&h, &id, &pause).await?;
+    assert_answered_once(&h, &id, &["key-asmith", "key-jdoe"]).await
+}
+
+/// m-9 (a): a cancel after the last lookup was committed finds no lookup in flight (the mark was
+/// cleared), so nothing is recorded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_after_the_lookups_records_none_again() -> TestResult {
+    let pause = Pause::new();
+    let (h, id) = two_user_read(TestHooks {
+        pause_after_lookups: Some(pause.clone()),
+        ..TestHooks::none()
+    })
+    .await?;
+    pause.reached.notified().await;
+    cancel_held(&h, &id, &pause).await?;
+    assert_answered_once(&h, &id, &["key-asmith", "key-jdoe"]).await
+}
+
+/// m-9 (h): an expiry during a lookup is recorded like a cancel (`reason: expired`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn expiry_during_resolve_records_cancelled_in_flight() -> TestResult {
+    let h = Harness::confluence().await?;
+    let id = read_held_in_lookup(&h).await?;
+    assert!(h.expire_now(&id).await);
+    assert_ended_in_lookup(&h, &id, "expired", EventType::EXPIRED).await?;
+    let env = h.status(&id).await;
+    assert_eq!(env.status, Status::Expired, "{}", env.to_json_line());
+    Ok(())
+}
+
+/// I-2: an answer over the 64 KiB lookup cap is cut there (`too_large`, at most cap + 1 bytes
+/// recorded), `null` and not cached; the read goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oversized_lookup_answer_is_null_and_not_cached() -> TestResult {
+    const CAP: usize = 64 * 1024;
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p>Ask <ri:user ri:userkey="key-big"/>.</p>"#;
+    mount_page(mock, ID, &page_with_storage(storage)).await;
+    let big = json!({"userKey": "key-big", "username": "big", "pad": "x".repeat(100 * 1024)});
+    mount_user_answer(mock, "key-big", 200, &big).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let [f] = fetch.as_slice() else {
+        return Err(format!("{} lookup records", fetch.len()).into());
+    };
+    assert_eq!(f["outcome"], "too_large", "{f}");
+    let received = f["received"]["text"].as_str().ok_or("no received text")?;
+    assert_eq!(received.len(), CAP + 1);
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-big": null })
+    );
+    assert_eq!(h.user_cached("wiki", "key-big"), None);
+    let env = released(&h, &id).await?;
+    assert!(released_value(&env)?.contains("@user:key-big"));
+    Ok(())
+}
+
+/// I-2: a lookup is cut at the read's deadline (`timeout`): the read ends within its budget, not
+/// at the 30 s per-call timeout, and the next key is `null` (less than the reserve is left).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lookup_cut_at_the_read_budget() -> TestResult {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .read_budget(ReadBudget {
+            total: Duration::from_secs(21),
+            ..ReadBudget::default()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users_delayed(mock, &[JDOE, ASMITH], Duration::from_secs(40)).await;
+    let began = std::time::Instant::now();
+    let env = h.submit(PAGE_GET, json!({ "id": ID })).await;
+    let id = request_id(&env)?;
+    h.queued(&id, 40_000).await.ok_or("never queued")?;
+    let took = began.elapsed();
+    assert!(took < Duration::from_secs(26), "{took:?}");
+    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let [f] = fetch.as_slice() else {
+        return Err(format!("{} lookup records", fetch.len()).into());
+    };
+    assert_eq!(f["outcome"], "timeout", "{f}");
+    assert_eq!(f["path"], "/wiki/rest/api/user?key=key-asmith");
+    assert_eq!(looked_up(mock).await, ["key-asmith"]);
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-jdoe": null, "key-asmith": null })
+    );
+    assert_eq!(h.user_cached("wiki", "key-asmith"), None);
+    Ok(())
+}
+
+/// m-9 (e): the reserve is measured from the read's deadline, taken before the content GET: a
+/// 21 s budget with a content page that answers after 2 s leaves less than 20 s, so no lookup
+/// starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lookup_deadline_counts_from_the_read_start() -> TestResult {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .read_budget(ReadBudget {
+            total: Duration::from_secs(21),
+            ..ReadBudget::default()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    mount_page_delayed(
+        mock,
+        ID,
+        &page_with_storage(TWO_USERS_STORAGE),
+        Duration::from_secs(2),
+    )
+    .await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert!(user_gets(mock).await.is_empty());
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-jdoe": null, "key-asmith": null })
+    );
+    Ok(())
+}
+
+/// m-9 (c), m-2, m-3: what is cached. A 503 and an object for another key are `null` and not
+/// cached (looked up again by the next read); an object for the key without a username is a
+/// definitive `null`, cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_definitive_answers_are_cached() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p><ri:user ri:userkey="key-down"/> <ri:user ri:userkey="key-nameless"/> <ri:user ri:userkey="key-other"/></p>"#;
+    mount_page(mock, ID, &page_with_storage(storage)).await;
+    mount_user_answer(mock, "key-down", 503, &json!({"message": "down"})).await;
+    mount_user_answer(
+        mock,
+        "key-nameless",
+        200,
+        &json!({"type": "known", "userKey": "key-nameless", "displayName": "N"}),
+    )
+    .await;
+    // A front answering with another user's object.
+    mount_user_answer(mock, "key-other", 200, &user("key-someone", "someone")).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-down": null, "key-nameless": null, "key-other": null })
+    );
+    assert_eq!(h.user_cached("wiki", "key-down"), None);
+    assert_eq!(h.user_cached("wiki", "key-nameless"), Some(None));
+    assert_eq!(h.user_cached("wiki", "key-other"), None);
+    let env = released(&h, &id).await?;
+    assert!(!released_value(&env)?.contains("someone"));
+    queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(
+        looked_up(mock).await,
+        [
+            "key-down",
+            "key-nameless",
+            "key-other",
+            "key-down",
+            "key-other"
+        ]
+    );
+    Ok(())
+}
+
+/// m-9 (d): only lookups sent count toward the 50 per read: 50 cache hits and 5 keys that are
+/// never looked up (sorted first) leave room for all 50 fresh keys.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_hits_and_unlookable_keys_do_not_count_toward_the_cap() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let cached: Vec<String> = (0..50).map(|n| format!("c{n:02}")).collect();
+    let unlookable: Vec<String> = (0..5).map(|n| format!("a{n}{}", "k".repeat(300))).collect();
+    let fresh: Vec<String> = (0..50).map(|n| format!("u{n:02}")).collect();
+    for k in &cached {
+        assert!(h.user_cache_set("wiki", k, Some(&format!("name-{k}"))));
+    }
+    let storage: String = cached
+        .iter()
+        .chain(&unlookable)
+        .chain(&fresh)
+        .map(|k| format!(r#"<p><ri:user ri:userkey="{k}"/></p>"#))
+        .collect();
+    let names: Vec<String> = fresh.iter().map(|k| format!("name-{k}")).collect();
+    let users: Vec<(&str, Option<&str>)> = fresh
+        .iter()
+        .zip(&names)
+        .map(|(k, n)| (k.as_str(), Some(n.as_str())))
+        .collect();
+    mount_page(mock, ID, &page_with_storage(&storage)).await;
+    mount_users(mock, &users).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(looked_up(mock).await, fresh);
+    let map = read_fetched(&h, &id).await?["user_resolutions"].clone();
+    let map = map.as_object().ok_or("no map")?;
+    assert_eq!(map.len(), 105);
+    for k in cached.iter().chain(&fresh) {
+        assert_eq!(
+            map.get(k.as_str()),
+            Some(&json!(format!("name-{k}"))),
+            "{k}"
+        );
+    }
+    for k in &unlookable {
+        assert_eq!(map.get(k.as_str()), Some(&Value::Null));
+    }
+    assert_eq!(unresolved_users(&h, &id), Some(5));
+    Ok(())
+}
+
+/// m-9 (f): a body that is not `xml_ok` resolves nothing, even a mention before the bad
+/// character (which the partial tree holds).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn body_not_xml_ok_looks_nobody_up() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p><ri:user ri:userkey="key-jdoe"/></p><p>&#1;</p>"#;
+    mount_page(mock, ID, &page_with_storage(storage)).await;
+    mount_users(mock, &[JDOE]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert!(user_gets(mock).await.is_empty());
+    assert_eq!(read_fetched(&h, &id).await?["user_resolutions"], json!({}));
     Ok(())
 }

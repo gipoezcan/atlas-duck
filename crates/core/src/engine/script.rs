@@ -54,7 +54,10 @@ use super::envelope::{self, OpenStatus};
 use super::handler::{CoreHandler, excerpt, internal_error};
 use super::queue::{AgentKey, Reservation};
 use super::read::{self, Classified};
-use super::{Engine, NewEntry, OnAuditFailure, RequestEntry, RequestHead, audit_failure_retryable};
+use super::{
+    Engine, InstanceHttp, NewEntry, OnAuditFailure, RequestEntry, RequestHead,
+    audit_failure_retryable,
+};
 use crate::audit_port::commit_request_received;
 use crate::gate::{AttentionKind, GateState, UiEvent};
 use crate::identity;
@@ -1064,7 +1067,7 @@ impl LiveBackend {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.engine.read_budget().total)
             .unwrap_or_else(tokio::time::Instant::now);
-        let classified = match self.fetch(&call, &vc, &ctl).await {
+        let (classified, http) = match self.fetch(&call, &vc, &ctl).await {
             Ok(c) => c,
             Err(result) => {
                 self.shared.finish_in_flight(call.id);
@@ -1072,7 +1075,7 @@ impl LiveBackend {
             }
         };
         let classified = match self
-            .with_users(&call, &vc, &ctl, classified, deadline)
+            .with_users(&call, &vc, &ctl, &http, classified, deadline)
             .await
         {
             Ok(c) => c,
@@ -1108,14 +1111,17 @@ impl LiveBackend {
     /// PD-99 (§7.6 "also inside script runs"): the user lookups of a `confluence.page.get` host
     /// call of the Markdown shape, as for a direct read (`read::with_users`): after the content
     /// answered, before the call's `SCRIPT_CALL`, which commits the map. They are part of the
-    /// host call: they count toward the run's wall-clock limit and the call's read budget (the
-    /// 20 s reserve), not as host calls. `Err`: the run ended meanwhile (the end of the run
-    /// recorded the lookup in flight with the call).
+    /// host call: they count toward the run's wall-clock limit, the call's read budget (the
+    /// 20 s reserve) and the run's `max_fetch_mb` (their bytes are added to the run's counter
+    /// before the call returns; `SCRIPT_CALL.size` stays the content's), not as host calls
+    /// (`max_calls`). They run on the client of the call's fetch (T11 review m-4). `Err`: the run
+    /// ended meanwhile (the end of the run recorded the lookup in flight with the call).
     async fn with_users(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
         ctl: &FetchControl,
+        http: &InstanceHttp,
         classified: Classified,
         deadline: tokio::time::Instant,
     ) -> Result<Classified, HostCallResult> {
@@ -1138,16 +1144,19 @@ impl LiveBackend {
         if keys.is_empty() {
             return Ok(Classified::Item(rec));
         }
-        let http = self.engine.client(&vc.instance_id).await.ok();
         let cover = self
             .engine
             .covers()
             .for_request(&self.entry.head.request_id)
             .ok();
-        let (Some(http), Some(cover)) = (http, cover) else {
+        let Some(cover) = cover else {
             rec.users = Some(keys.into_iter().map(|k| (k, None)).collect());
             return Ok(Classified::Item(rec));
         };
+        let fetch_cap = u64::from(self.limits.max_fetch_mb).saturating_mul(MIB);
+        let max_bytes = fetch_cap
+            .saturating_sub(self.shared.fetched_bytes())
+            .saturating_sub(rec.size());
         let ctx = self.ctx_for(vc);
         let pass = crate::users::Pass {
             engine: &self.engine,
@@ -1162,10 +1171,13 @@ impl LiveBackend {
             cover: &cover,
             ctl,
             deadline,
+            max_bytes,
         };
         match crate::users::resolve_users(&pass, &keys).await {
-            Ok(map) => {
-                rec.users = Some(map);
+            Ok(resolved) => {
+                // Seen by the next call's `max_fetch_mb` check (T11 review I-2).
+                self.shared.add_fetched(resolved.bytes);
+                rec.users = Some(resolved.users);
                 Ok(Classified::Item(rec))
             }
             Err(crate::users::Cancelled) => {
@@ -1176,13 +1188,14 @@ impl LiveBackend {
 
     /// The call's fetch under the request's cover, with the identity handling of Task 26
     /// (§7.1): a failed header check or a JSON 401 runs the token re-check, and a rename
-    /// re-fetches once. `Err` = nothing was sent.
+    /// re-fetches once. The instance's client comes back with the classification (the user
+    /// lookups run on it, T11 review m-4). `Err` = nothing was sent.
     async fn fetch(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
         ctl: &FetchControl,
-    ) -> Result<Classified, HostCallResult> {
+    ) -> Result<(Classified, Arc<InstanceHttp>), HostCallResult> {
         let internal = || rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
         let http = self
             .engine
@@ -1227,7 +1240,7 @@ impl LiveBackend {
             let fetched =
                 read::run_plan(&http.client, &cover, &plan, &budget, ctl, start, keep).await;
             let Some(trigger) = read::fetched_trigger(&fetched) else {
-                return Ok(read::classify_read(fetched, &http.proxy));
+                return Ok((read::classify_read(fetched, &http.proxy), http));
             };
             let effect = if refetched {
                 identity::Effect::HeaderCheckFailed
@@ -1237,7 +1250,8 @@ impl LiveBackend {
             };
             match effect {
                 identity::Effect::Ordinary => {
-                    return Ok(read::classify_read(read::ordinary(fetched), &http.proxy));
+                    let classified = read::classify_read(read::ordinary(fetched), &http.proxy);
+                    return Ok((classified, http));
                 }
                 identity::Effect::Refetch => {
                     let (earlier, answer) = read::split_answer(fetched);
@@ -1272,7 +1286,7 @@ impl LiveBackend {
                     }
                     refetched = true;
                 }
-                other => return Ok(read::identity_classified(other, fetched)),
+                other => return Ok((read::identity_classified(other, fetched), http)),
             }
         }
     }
