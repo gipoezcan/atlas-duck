@@ -1617,29 +1617,37 @@ async fn chords(rig: &Rig) -> Result<()> {
     // key dispatched in the sandboxed frame), and the failure's screenshot shows the Approvals
     // heading focused: that click did not leave the focus in the frame. A click on the iframe
     // element from the top-level document is what a user does, and the focus check proves it took.
-    for (key, name) in [
-        (keys::ARROW_DOWN, "Ctrl+Shift+Down"),
-        (keys::ENTER, "Ctrl+Shift+Enter"),
-    ] {
-        focus_preview_frame(wd).await?;
-        let before = queue_state(wd).await;
-        enter_preview_frame(wd).await?;
-        // Sent while the driver is switched into the frame: the keys go where the focus is, and a
-        // driver that routes actions by browsing context still means the frame.
-        let sent = wd.chord(&ctrl_shift, key).await;
-        back_to_top(wd).await?;
-        sent?;
-        ensure!(
-            first_exit(&mut held, Duration::from_millis(1500))
-                .await?
-                .is_none(),
-            "a request was decided by {name} typed inside the preview frame (before it: {before})"
-        );
-        ensure_eq!(
-            queue_current(wd).await?,
-            vec![true, false],
-            "{name} typed inside the preview frame moved the opened row (before it: {before})"
-        );
+    //
+    // Windows only: CI run 38885675576 (e2e ubuntu) timed out after 30s waiting for the focus in
+    // the preview frame (focus stayed on Some("H1")): WebKitWebDriver / WebKitGTK does not move the
+    // focus into a sandboxed iframe on a click, so this step cannot be exercised there. The
+    // structural guarantee (sandboxed srcDoc frame, its key events cannot reach the host window
+    // listener) stays covered by the S-08 / sandbox assertions and by the Windows run.
+    if cfg!(windows) {
+        for (key, name) in [
+            (keys::ARROW_DOWN, "Ctrl+Shift+Down"),
+            (keys::ENTER, "Ctrl+Shift+Enter"),
+        ] {
+            focus_preview_frame(wd).await?;
+            let before = queue_state(wd).await;
+            enter_preview_frame(wd).await?;
+            // Sent while the driver is switched into the frame: the keys go where the focus is, and a
+            // driver that routes actions by browsing context still means the frame.
+            let sent = wd.chord(&ctrl_shift, key).await;
+            back_to_top(wd).await?;
+            sent?;
+            ensure!(
+                first_exit(&mut held, Duration::from_millis(1500))
+                    .await?
+                    .is_none(),
+                "a request was decided by {name} typed inside the preview frame (before it: {before})"
+            );
+            ensure_eq!(
+                queue_current(wd).await?,
+                vec![true, false],
+                "{name} typed inside the preview frame moved the opened row (before it: {before})"
+            );
+        }
     }
 
     // A click outside brings the chords back: next, then the decision chord on the neighbour.
