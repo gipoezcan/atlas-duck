@@ -3,19 +3,22 @@
 //! One parser ([`parse`]) is the ground truth for everything that reads storage: the construct
 //! inventory a write preview lists, the user references core resolves, the static check of an
 //! agent-supplied storage body, the conversion to Markdown ([`storage_to_markdown`]), the hard
-//! check of the Markdown converter's output ([`hard_check_storage`]) and (a later task) the
-//! lossy count. Sibling modules reach the lexical fallback scan as
-//! `parse::lexical_constructs`.
+//! check of the Markdown converter's output ([`hard_check_storage`]) and the lossy count of an
+//! update ([`lossy_update`], which shares the read's `lost` rules). Sibling modules reach the
+//! lexical fallback scan as `parse::lexical_constructs`; [`storage_lines`] is the lexical
+//! raw-diff projection.
 //!
 //! Public beyond the Δ1 list (additions, like `wiki::parse` and `wiki::construct_spans`): the
 //! tree ([`parse`], [`StorageDoc`], [`Node`], [`Element`], [`Ns`], [`MAX_DEPTH`]) and
 //! [`construct_spans`], for the hard check and the properties tested from outside.
 
 mod hard_check;
+mod lossy;
 mod parse;
 mod to_md;
 
 pub use hard_check::hard_check_storage;
+pub use lossy::{lossy_update, storage_lines};
 pub use parse::{
     Element, MAX_DEPTH, Node, Ns, StorageDoc, StorageReject, StorageUsers, check_storage_body,
     construct_spans, parse, storage_constructs, storage_user_refs,

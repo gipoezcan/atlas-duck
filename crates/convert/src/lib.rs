@@ -7,6 +7,7 @@
 
 pub mod escape;
 mod hard_check;
+mod md_preview;
 mod md_to_storage;
 mod md_to_wiki;
 mod placeholders;
@@ -17,12 +18,14 @@ mod wiki_text;
 mod xml_escape;
 
 pub use hard_check::{Unrecorded, hard_check_wiki};
+pub use md_preview::markdown_to_preview_html;
 pub use md_to_storage::markdown_to_storage;
 pub use md_to_wiki::{ContainerKind, EmittedCode, EmittedConstructs, markdown_to_wiki};
 pub use placeholders::{PlaceholderHit, PlaceholderKind, check_markdown_placeholders};
 pub use storage::{
     ConversionReport, LostCounts, StorageReject, StorageUsers, UserResolutions, check_storage_body,
-    hard_check_storage, storage_constructs, storage_to_markdown, storage_user_refs,
+    hard_check_storage, lossy_update, storage_constructs, storage_lines, storage_to_markdown,
+    storage_user_refs,
 };
 pub use wiki::{CodeKind, ConstructKind, WikiConstructs, wiki_constructs};
 pub use wiki_html::wiki_to_preview_html;
