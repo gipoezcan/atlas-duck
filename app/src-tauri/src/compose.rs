@@ -402,7 +402,8 @@ mod tests {
         // Not VmRSS: the other tests of this process run in parallel and allocate, so process RSS
         // is noise. `hblkhd` (bytes in mmapped blocks) grows by the block size while an allocation
         // above the threshold is held; a heap-served block never moves it. A concurrent test
-        // freeing a mapped block can mask one attempt, so one clean attempt of eight suffices.
+        // freeing a mapped block can mask one attempt, so each attempt holds sixteen blocks at once
+        // (masking needs fifteen concurrent frees) and one clean attempt of eight suffices.
         fn mapped_bytes() -> usize {
             // SAFETY: `mallinfo2` only reads allocator statistics.
             unsafe { libc::mallinfo2() }.hblkhd
@@ -410,8 +411,8 @@ mod tests {
         assert!(set_mmap_threshold(), "mallopt(M_MMAP_THRESHOLD) failed");
         let grew = (0..8).any(|_| {
             let before = mapped_bytes();
-            let v = vec![1u8; 2 << 20];
-            std::hint::black_box(&v);
+            let held: Vec<Vec<u8>> = (0..16).map(|_| vec![1u8; 2 << 20]).collect();
+            std::hint::black_box(&held);
             mapped_bytes().saturating_sub(before) >= 2 << 20
         });
         assert!(grew, "a 2 MiB block was not served by mmap");
