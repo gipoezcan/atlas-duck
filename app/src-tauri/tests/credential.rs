@@ -289,6 +289,8 @@ struct World {
     lock: Arc<InstanceLock>,
     location: EndpointLocation,
     tmp: tempfile::TempDir,
+    /// Unix: the short base the socket dir is under (removed with the World).
+    _sock: Option<tempfile::TempDir>,
 }
 
 impl World {
@@ -299,12 +301,13 @@ impl World {
         let data = local_data_dir(&dir)?;
         let lock = Arc::new(InstanceLock::acquire(&data, HOST)?);
         std::fs::create_dir(tmp.path().join("config"))?;
-        let location = location(&tmp, &data)?;
+        let (location, _sock) = location(&data)?;
         Ok(World {
             data,
             lock,
             location,
             tmp,
+            _sock,
         })
     }
 
@@ -453,22 +456,27 @@ impl World {
     }
 }
 
+/// The socket lives under a short base, not the scratch dir: `sun_path` holds 104 bytes on macOS
+/// and the scratch dir under a CI checkout's `target/tmp` is longer than that. Production picks
+/// its own short dir (`socket_dir`) and refuses one that does not fit; nothing there is relaxed.
 #[cfg(unix)]
 fn location(
-    tmp: &tempfile::TempDir,
     _data: &LocalDataDir,
-) -> Result<EndpointLocation, Box<dyn std::error::Error>> {
-    let dir = tmp.path().join("s");
+) -> Result<(EndpointLocation, Option<tempfile::TempDir>), Box<dyn std::error::Error>> {
+    let base = tempfile::Builder::new().prefix("ad").tempdir_in("/tmp")?;
+    let dir = base.path().join("s");
     atlas_duck_ipc::paths::ensure_socket_dir(&dir)?;
-    Ok(EndpointLocation::UnixSocket(dir.join("atlas-duck.sock")))
+    Ok((
+        EndpointLocation::UnixSocket(dir.join("atlas-duck.sock")),
+        Some(base),
+    ))
 }
 
 #[cfg(windows)]
 fn location(
-    _tmp: &tempfile::TempDir,
     data: &LocalDataDir,
-) -> Result<EndpointLocation, Box<dyn std::error::Error>> {
-    Ok(atlas_duck_ipc::paths::endpoint_location(data, HOST)?)
+) -> Result<(EndpointLocation, Option<tempfile::TempDir>), Box<dyn std::error::Error>> {
+    Ok((atlas_duck_ipc::paths::endpoint_location(data, HOST)?, None))
 }
 
 #[cfg(unix)]
