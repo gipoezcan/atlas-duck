@@ -1357,23 +1357,29 @@ async fn oversized_lookup_answer_is_null_and_not_cached() -> TestResult {
 /// at the 30 s per-call timeout, and the next key is `null` (less than the reserve is left).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lookup_cut_at_the_read_budget() -> TestResult {
+    // The reserve is shortened to 1 s (T11 fix review m-4): the 3 s budget leaves 2 s of margin for
+    // the first lookup to start, and a lookup that runs to the per-call timeout would take 10 s.
     let h = Harness::builder()
         .confluence("wiki")
-        .read_budget(ReadBudget {
-            total: Duration::from_secs(21),
-            ..ReadBudget::default()
+        .hooks(TestHooks {
+            read_budget: Some(ReadBudget {
+                total: Duration::from_secs(3),
+                ..ReadBudget::default()
+            }),
+            lookup_reserve: Some(Duration::from_secs(1)),
+            ..TestHooks::none()
         })
         .start()
         .await?;
     let mock = wiki(&h)?;
     mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
-    mount_users_delayed(mock, &[JDOE, ASMITH], Duration::from_secs(40)).await;
+    mount_users_delayed(mock, &[JDOE, ASMITH], Duration::from_secs(10)).await;
     let began = std::time::Instant::now();
     let env = h.submit(PAGE_GET, json!({ "id": ID })).await;
     let id = request_id(&env)?;
     h.queued(&id, 40_000).await.ok_or("never queued")?;
     let took = began.elapsed();
-    assert!(took < Duration::from_secs(26), "{took:?}");
+    assert!(took < Duration::from_secs(8), "{took:?}");
     let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
     let [f] = fetch.as_slice() else {
         return Err(format!("{} lookup records", fetch.len()).into());
@@ -1390,15 +1396,19 @@ async fn lookup_cut_at_the_read_budget() -> TestResult {
 }
 
 /// m-9 (e): the reserve is measured from the read's deadline, taken before the content GET: a
-/// 21 s budget with a content page that answers after 2 s leaves less than 20 s, so no lookup
-/// starts.
+/// 4 s budget with a 2 s reserve and a content page that answers after 2.5 s leaves less than the
+/// reserve, so no lookup starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lookup_deadline_counts_from_the_read_start() -> TestResult {
     let h = Harness::builder()
         .confluence("wiki")
-        .read_budget(ReadBudget {
-            total: Duration::from_secs(21),
-            ..ReadBudget::default()
+        .hooks(TestHooks {
+            read_budget: Some(ReadBudget {
+                total: Duration::from_secs(4),
+                ..ReadBudget::default()
+            }),
+            lookup_reserve: Some(Duration::from_secs(2)),
+            ..TestHooks::none()
         })
         .start()
         .await?;
@@ -1407,7 +1417,7 @@ async fn lookup_deadline_counts_from_the_read_start() -> TestResult {
         mock,
         ID,
         &page_with_storage(TWO_USERS_STORAGE),
-        Duration::from_secs(2),
+        Duration::from_millis(2500),
     )
     .await;
     mount_users(mock, &[JDOE, ASMITH]).await;
