@@ -1643,7 +1643,7 @@ If an assumption does not hold, the task stops at Step 1 and reports which one f
   - `confluence_host_call_identity_step_per_call` (anonymous `user/current` → in-script `needs_token` after the re-check; body only in `SCRIPT_CALL`);
   - `i37_script_confluence_markdown_candidate_rebuilds_from_committed_map` (a script returning the converted page; evict; rebuild → same hash, no mock hit);
   - flow `confluence_page_get_in_script_real_worker` (CI).
-- [ ] **Step 2: Implement.** **Step 3: Run** core `--test scripts`; `--test script_flows --no-run`. **Step 4: Commit** `feat(core): Confluence host calls: identity step, lossy count and rebuild (X-12, I-37, RF-5a)` (+ trailer).
+- [ ] **Step 2: Implement.** **Step 3: Run** core `--test scripts`; `--test script_flows --no-run`. **Step 4: Commit** `feat(core): Confluence host calls: identity step, lossy count and rebuild (X-12, I-37, RF-5a)` (+ trailer). The lead pushes; the implementer records the run URL and the `confluence_page_get_in_script_real_worker` result per leg.
 
 ### Task 33: `k` on Confluence storage bodies; the final `k` (V16 closure)
 
