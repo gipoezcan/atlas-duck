@@ -30,6 +30,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -55,14 +56,35 @@ def free_port():
     return port
 
 
+# The variables the clean-environment probe passes on: the names the Rust rig passes to tauri-driver
+# (app/src-tauri/tests/cli_flows/harness.rs PASS_THROUGH and the test home/keystore), where the
+# packaged-app sessions are created, plus the switches a container needs to run WebKit at all.
+CLEAN_ENV_NAMES = (
+    "PATH", "TMPDIR", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS",
+    "ATLAS_DUCK_TEST_HOME", "ATLAS_DUCK_TEST_KEYSTORE",
+    "WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS", "WEBKIT_DISABLE_COMPOSITING_MODE", "LIBGL_ALWAYS_SOFTWARE",
+)
+
+
+def driver_env(clean=False):
+    """tauri-driver's environment, inherited by WebKitWebDriver and the app it starts: this shell's
+    (or only CLEAN_ENV_NAMES of it), the E2E opt-in, and TAURI_WEBVIEW_AUTOMATION=true (without it
+    tauri-runtime-wry allows automation on no web context; tauri-driver sets it as well, here it is
+    explicit so the app's environment is known)."""
+    env = {k: v for k, v in os.environ.items() if not clean or k in CLEAN_ENV_NAMES}
+    env["ATLAS_DUCK_E2E_ALLOW_DRIVER"] = "1"
+    env["TAURI_WEBVIEW_AUTOMATION"] = "true"
+    return env
+
+
 class Driver:
     """A tauri-driver process on its own ports, killed on close."""
 
-    def __init__(self, exe, log):
+    def __init__(self, exe, log, clean=False):
+        self.exe = exe
         self.port = free_port()
         native = free_port()
-        env = dict(os.environ)
-        env["ATLAS_DUCK_E2E_ALLOW_DRIVER"] = "1"
+        env = driver_env(clean)
         self.log = open(log, "ab")
         self.proc = subprocess.Popen(
             [exe, "--port", str(self.port), "--native-port", str(native)],
@@ -91,12 +113,15 @@ class Driver:
             self.proc.wait()
         self.log.close()
 
-    def tail(self, lines=60):
-        """The end of the driver's log (tauri-driver and the native driver it starts write there)."""
+    def tail(self, lines=150):
+        """The end of the driver's log (tauri-driver, the native driver it starts and the app's own
+        stderr write there), without tauri-driver's per-request connection errors."""
         self.log.flush()
+        noise = re.compile(r"Error serving connection|^Caused by:|tcp connect error|Connection refused|^\s*$")
         try:
             with open(self.log.name, encoding="utf-8", errors="replace") as f:
-                return "".join(f.readlines()[-lines:])
+                kept = [l for l in f.readlines() if not noise.search(l)]
+            return "".join(kept[-lines:]) or "(nothing but connection errors)"
         except OSError as e:
             return "(the driver log is unreadable: %s)" % e
 
@@ -110,28 +135,108 @@ def run_text(cmd, timeout=20):
         return "(%s: %s)" % (cmd[0], e)
 
 
+def app_pids():
+    """The pids of the running atlas-duck-app processes (by /proc/<pid>/comm)."""
+    pids = []
+    for comm in glob.glob("/proc/[0-9]*/comm"):
+        try:
+            with open(comm, encoding="utf-8", errors="replace") as f:
+                if f.read().strip() == "atlas-duck-app":
+                    pids.append(int(comm.split("/")[2]))
+        except (OSError, ValueError):
+            pass
+    return pids
+
+
+# The environment variables AppWatch names (names only, never values, but for VALUES).
+WATCH_NAMES = re.compile(r"^(TAURI_|ATLAS_DUCK_|WEBKIT_|GTK_|GDK_|GIO_|LD_|APPIMAGE|APPDIR|ARGV0|XDG_|DISPLAY$|WAYLAND_|DBUS_|HOME$)")
+# Flags whose value says whether automation can be on; no secret is among them.
+WATCH_VALUES = ("TAURI_WEBVIEW_AUTOMATION", "ATLAS_DUCK_E2E_ALLOW_DRIVER")
+
+
+def describe_app(pid):
+    """One app process for a failure report: parent, command line, the names of the WATCH_NAMES
+    variables in its environment (values for WATCH_VALUES only), the WebKit libraries it mapped."""
+    def read(name, mode="rb"):
+        try:
+            with open("/proc/%d/%s" % (pid, name), mode) as f:
+                return f.read()
+        except OSError as e:
+            return e
+    stat = read("stat")
+    ppid = stat.rsplit(b")", 1)[1].split()[1].decode() if isinstance(stat, bytes) else "?"
+    cmd = read("cmdline")
+    cmd = cmd.replace(b"\0", b" ").decode(errors="replace").strip() if isinstance(cmd, bytes) else str(cmd)
+    environ = read("environ")
+    if isinstance(environ, bytes):
+        names = []
+        for entry in environ.split(b"\0"):
+            name, _, value = entry.decode(errors="replace").partition("=")
+            if WATCH_NAMES.match(name):
+                names.append("%s=%s" % (name, value) if name in WATCH_VALUES else name)
+        env = " ".join(sorted(names)) or "(none of the watched names)"
+    else:
+        env = "unreadable (%s)" % environ
+    maps = read("maps", "r")
+    libs = sorted({l.split()[-1] for l in maps.splitlines() if "libwebkit" in l}) if isinstance(maps, str) else []
+    return "pid %d ppid %s: %s\n  env: %s\n  webkit: %s" % (pid, ppid, cmd, env, " ".join(libs) or "(not mapped yet)")
+
+
+class AppWatch:
+    """While a session is being created: every atlas-duck-app process that appears, described once
+    its WebKit library is mapped (the app exits with a failed session, so it is looked at early)."""
+
+    def __init__(self):
+        self.seen = {}
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.done.is_set():
+            for pid in app_pids():
+                if "(not mapped yet)" in self.seen.get(pid, "(not mapped yet)"):
+                    self.seen[pid] = describe_app(pid)
+            self.done.wait(0.1)
+
+    def report(self):
+        self.done.set()
+        self.thread.join(2)
+        if not self.seen:
+            return "no atlas-duck-app process was seen while the session was created"
+        return "\n".join(self.seen[p] for p in sorted(self.seen))
+
+
+def end_app():
+    """Ends what a failed attempt left running, so the next one is not forwarded to it (single
+    instance)."""
+    run_text(["pkill", "-x", "atlas-duck-app"])
+    for _ in range(20):
+        if not app_pids():
+            return
+        time.sleep(0.5)
+
+
 def new_session(drv, app, args=()):
     """A session for `app`. On "session not created" the failure says what the driver and the
-    system showed: the driver log, the processes still running, the native driver's version, the
-    app's diag logs, and whether a session WITHOUT `browserName` can be created. WebKitWebDriver
-    answers "Failed to match capabilities" when the browser name the app's automation session
-    reports is not the requested one (wry reports "wry" only once its first webview is
-    registered), so that probe tells a name mismatch from a launch or connection failure."""
+    system showed: the app processes as they started (AppWatch), the processes still running, the
+    native driver's version, the app's diag logs, the driver log, and two probes: a session WITHOUT
+    `browserName`, and a session through a tauri-driver started with only CLEAN_ENV_NAMES (the Rust
+    rig's environment, where sessions are created). WebKitWebDriver answers "Failed to match
+    capabilities" when the browser name the app's automation session reports is not the requested
+    one, and "failed to create a new browsing context" when the session has no webview: wry sets the
+    name "wry" and hands out its webview only on a web context that allows automation."""
+    watch = AppWatch()
     try:
         return Session(drv.base, app, args)
     except Failed as e:
         if "session not created" not in str(e).lower():
             raise
         report = [str(e)]
+        report.append("--- the app as it started\n" + watch.report())
         report.append("--- processes\n" + run_text(["pgrep", "-a", "-f", "atlas-duck|WebKit|tauri-driver"]))
         report.append("--- WebKitWebDriver --version\n" + run_text(["WebKitWebDriver", "--version"]))
-        # The probe starts the app again: end what the failed attempt left running, so the probe is
-        # not forwarded to it (single instance).
-        run_text(["pkill", "-x", "atlas-duck-app"])
-        for _ in range(20):
-            if subprocess.run(["pgrep", "-x", "atlas-duck-app"], capture_output=True).returncode != 0:
-                break
-            time.sleep(0.5)
+        end_app()
         try:
             probe = Session(drv.base, app, args, browser_name=None)
             probe.quit()
@@ -139,13 +244,31 @@ def new_session(drv, app, args=()):
                           "session reports another browser name than \"wry\"")
         except Failed as p:
             report.append("--- probe: a session without browserName failed too: %s" % p)
-        report.append("--- driver log (end)\n" + drv.tail())
+        end_app()
+        try:
+            clean = Driver(drv.exe, drv.log.name + ".clean", clean=True)
+            try:
+                probe = Session(clean.base, app, args)
+                probe.quit()
+                report.append("--- probe: through a tauri-driver with only %s a session WAS created: "
+                              "this shell's environment is the difference" % ", ".join(CLEAN_ENV_NAMES))
+            except Failed as p:
+                report.append("--- probe: a session through a tauri-driver with the clean environment "
+                              "failed too: %s\n%s" % (p, clean.tail(40)))
+            finally:
+                clean.close()
+        except Failed as p:
+            report.append("--- probe: the clean-environment tauri-driver did not start: %s" % p)
+        end_app()
+        report.append("--- driver log (end, connection errors left out)\n" + drv.tail())
         home = os.environ.get("ATLAS_DUCK_TEST_HOME")
         if home:
             for path in sorted(glob.glob(os.path.join(home, "**", "logs", "diag.log"), recursive=True)):
                 with open(path, encoding="utf-8", errors="replace") as f:
                     report.append("--- %s\n%s" % (path, f.read()[-4000:]))
         raise Failed("\n".join(report))
+    finally:
+        watch.done.set()
 
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
