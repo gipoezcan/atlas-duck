@@ -762,7 +762,8 @@ These tasks use code from M7 (Confluence fixtures), M8 (scripts, Running-scripts
 ## Handoffs (to later work)
 
 - **Post-v1 / v1.1:** passphrase mode (L39); two-directory fork comparison in `verify-export` (PD-163; not in v1 per lead ruling Q9); selective-disclosure export (L41 option A); payload search (L38); key rotation (PD-174).
-- **Not owned by M10** (kept where L134 put them): the core `StoreFailed` gate state, distinct `AdminError` kinds, `crates/cli/src/discover.rs` `$APPIMAGE` trust pattern, the engine-side redaction path check, `settings_apply`/`retest_token` emit-on-error, M-11 "drop flagged items" tree (M7 or the M6 final review); `update_pending` status input and `RunningScriptView.started_at` (M8).
+- **From the M6 final review (L217, not yet in a task unless named):** distinct `AdminError` kinds (duplicate alias, second default per product, unusable CA bundle) and the CA items (the CA dialog opens before the core URL check); the skipped minors of L217 (owner M10 unless noted); CLI marker versions (PD-177, T19) and the Windows overlay icon / macOS dock badge (PD-173, T18) are already planned; no release-build CI step sets `TAURI_WEBVIEW_AUTOMATION`, so T31 adds it to the S-04 assertion next to the inspector variables (the scrub itself is in `4454185`).
+- **Not owned by M10** (kept where L134 and L217 put them): the core `StoreFailed` gate state (M9), the engine-side redaction path check and the M-11 "drop flagged items" tree (M8); `crates/cli/src/discover.rs` `$APPIMAGE` trust pattern and `settings_apply`/`retest_token` emit-on-error are closed (`2c7c7f8`, `b28cba8`); `update_pending` status input and `RunningScriptView.started_at` (M8).
 
 ---
 

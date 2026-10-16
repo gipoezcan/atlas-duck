@@ -682,6 +682,7 @@ No lead answer blocks a task (rulings R1–R13 of 2026-10-16 are applied). Gates
 ## Handoffs (to later milestones)
 
 - **M10:** the canary sweep (S-16) covers "all MCP messages incl. progress notifications": the `mcp_flows` driver keeps every stdout line per flow (Task 13), so the sweep adds its canary assertions over those transcripts; the onboarding page (§12.4, X-14) takes the MCP config snippet from `docs/release/mcp-client-config.md` (Task 18); installed-package checks run `atlas-duck mcp --help` and one `tools/list` through the installed binary (packaging); L73 stays a documented proxy (no MCP `doctor` tool in §4.6).
+- **From the M6 final review (L217; not yet in a task):** the core `StoreFailed` gate state: while the store failed, agents see the stale locked envelope; the proper fix is a gate state answering `unreachable`/`store_unavailable`, `retryable: false`. M9 is the first milestone that serves those answers to a second front end, so it owns the decision and the tests.
 - **Live (human):** none new; a manual check with one real MCP client (e.g. a desktop agent) listing 54 tools and approving one write is worth one line in the release checklist (lead's call).
 
 ---

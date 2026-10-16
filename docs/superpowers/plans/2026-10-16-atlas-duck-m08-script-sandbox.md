@@ -1409,6 +1409,7 @@ No task waits for a lead answer. R13 (`k` above 16) is ruled by the lead when Ta
   - S-04 re-run.
   - macOS `task_for_pid` with a signed hardened build (M1 decision (b)).
   - The clean-profile Windows image re-check, if the R11 manual run is still open.
+- **From the M6 final review (L217; not yet in a task):** the engine-side redaction path check (`existed = original || current doc`, index drops after earlier drops) and the M-11 mirror "drop flagged items", which has no Structured tree. The lead places them in a task when M8 is executed.
 - **Live (human):** sign `docs/m8/script-sandbox-evidence.md`. Re-run the macOS profile probes per new macOS major (V10).
 
 ---
