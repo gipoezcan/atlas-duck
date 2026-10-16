@@ -461,6 +461,26 @@ fn confluence_table_rules_hold() {
     );
 }
 
+/// Δ4 f (PD-100, plan review m-11): `ops describe` shows agents the default release of
+/// `confluence.page.get`, the Markdown body `{"format": "markdown", "value": …}`, and both
+/// examples validate against `PAGE_GET_RESULT` (U-05 checks the latter for every op).
+#[test]
+fn page_get_examples_show_the_markdown_release() {
+    let spec = get("confluence.page.get").expect("op");
+    let full = spec.result_example_json();
+    assert_eq!(
+        full["body"],
+        serde_json::json!({"format": "markdown", "value": "Version 1.4 fixes the login.\n"})
+    );
+    let sparse = spec.result_example_sparse_json();
+    assert_eq!(
+        sparse["body"],
+        serde_json::json!({"format": "markdown", "value": ""})
+    );
+    let schema = jsonschema::validator_for(&spec.result_schema_json()).expect("schema");
+    assert!(schema.is_valid(&full) && schema.is_valid(&sparse));
+}
+
 /// Does `pattern` (`*` one key, `name[]` every element, a leading `[]` the root array) address
 /// `path` (object keys; array elements are the marker `[]`)?
 fn pattern_matches(pattern: &str, path: &[String]) -> bool {

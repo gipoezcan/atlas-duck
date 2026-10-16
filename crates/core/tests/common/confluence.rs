@@ -253,6 +253,22 @@ fn read_example(op_id: &str) -> Result<Value, String> {
         .ok_or_else(|| format!("no registry op {op_id}"))
 }
 
+/// The storage body the registry's `confluence.page.get` example is the Markdown release of
+/// (Δ4 f, Task 12b).
+pub const PAGE_EXAMPLE_STORAGE: &str = "<p>Version 1.4 fixes the login.</p>";
+
+/// What the server answers for a read whose release is its `result_example`: the example itself,
+/// except that `confluence.page.get` (whose example shows the default Markdown release, Δ4 f)
+/// answers its `body.storage`.
+pub fn server_example(op_id: &str) -> Result<Value, String> {
+    let mut answer = read_example(op_id)?;
+    if op_id == "confluence.page.get" {
+        answer["body"] =
+            json!({"storage": {"value": PAGE_EXAMPLE_STORAGE, "representation": "storage"}});
+    }
+    Ok(answer)
+}
+
 /// The extra GETs of `spec` for `params`. Every Confluence op id is named here: an op whose
 /// GETs are not decided yet is an error, so X-09 fails for it instead of passing vacuously
 /// (the write tasks of M7 add their stages here).
@@ -277,7 +293,7 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
                 .ok_or("example params have no string id")?;
             Ok(vec![Aux {
                 path: content_path(id),
-                body: read_example("confluence.page.get")?,
+                body: server_example("confluence.page.get")?,
             }])
         }
         other => Err(format!(
@@ -288,7 +304,7 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
 
 /// Mounts everything `spec` needs to run once with `params`: the identity answer
 /// (`/rest/api/user/current`, known), the GETs of [`aux_gets`] and the op's own endpoint (a read
-/// answers its `result_example`, a write its declared success). Returns the GETs it mounted.
+/// answers its [`server_example`], a write its declared success). Returns the GETs it mounted.
 pub async fn mount_for_op(
     mock: &MockDc,
     spec: &OperationSpec,
@@ -302,7 +318,7 @@ pub async fn mount_for_op(
     }
     let own = fill_path(spec.endpoint.path, params)?;
     let answer = match spec.class {
-        OpClass::Read => json_answer(mock, 200, &spec.result_example_json()),
+        OpClass::Read => json_answer(mock, 200, &server_example(spec.id)?),
         OpClass::Write => declared_success(mock, spec),
     };
     Mock::given(method(http_method(spec.endpoint.method)))

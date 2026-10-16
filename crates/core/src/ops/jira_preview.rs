@@ -17,13 +17,18 @@ use atlas_duck_preview::invisible::{self, escape_for_display};
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    CommentView, ConstructList, FieldRow, IssueCard, ItemCount, JSON_STRING_COLLAPSE_BYTES,
-    PreviewBody, PreviewHeader, sanitize_html,
+    CommentView, ConstructList, FieldRow, IssueCard, JSON_STRING_COLLAPSE_BYTES, PreviewBody,
+    sanitize_html,
 };
-use atlas_duck_registry::TargetDisplay;
+use atlas_duck_registry::{Product, TargetDisplay};
 use serde_json::{Map, Value};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
+use super::generic::{
+    CELL_CAP_CHARS, COLUMN_SAMPLE_ITEMS, IDENT_CAP_BYTES, MAX_COLUMNS, TABLE_ROW_CAP, bytes_of,
+    capped_text, cell_of, column_name, cut_at, cut_chars, omitted_row, other_root_bytes,
+    pair_bytes, short_string, table_count,
+};
 use super::jira::{escaped_prefix, pretty};
 use super::jira_ext::{describe_started, describe_time_spent};
 use super::{JiraUser, PreviewCtx, PreviewInput, PreviewModel, generic};
@@ -377,18 +382,6 @@ fn value_text(id: &str, value: &Value, tree: Tree, hidden: &mut u64) -> String {
 
 // ---- description and comments ----------------------------------------------------------------
 
-/// `s` cut to at most `cap` bytes at a char boundary, and how many bytes were cut.
-fn cut_at(s: &str, cap: usize) -> (&str, u64) {
-    if s.len() <= cap {
-        return (s, 0);
-    }
-    let mut end = cap;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&s[..end], u64::try_from(s.len() - end).unwrap_or(u64::MAX))
-}
-
 /// Wiki text as preview HTML: rendered by the local renderer (never the server's HTML), sanitized,
 /// then display-escaped. Text over `cap` bytes is cut and says so; the cut bytes are added to
 /// `hidden`.
@@ -440,41 +433,6 @@ fn comment_views(
 
 // ---- tables: search and lists ----------------------------------------------------------------
 
-/// A table cell shows at most this many chars; Raw has the rest.
-const CELL_CAP_CHARS: usize = 200;
-
-/// A table has at most this many rows; the last row says how many items it leaves out.
-pub(super) const TABLE_ROW_CAP: usize = 500;
-
-/// The columns of a table come from this many first items.
-const COLUMN_SAMPLE_ITEMS: usize = 50;
-
-/// A table has at most this many columns; the keys beyond count as hidden.
-const MAX_COLUMNS: usize = 40;
-
-/// A column name shows at most this many chars; the cut bytes count as hidden.
-const COLUMN_NAME_CAP_CHARS: usize = 64;
-
-/// A page key or identifier is skipped (not counted as hidden) only when it has the expected
-/// type and, for a string, is at most this many bytes: nothing reaches the agent unshown and
-/// uncounted.
-const IDENT_CAP_BYTES: usize = 256;
-
-pub(super) fn short_string(v: &Value) -> bool {
-    matches!(v, Value::String(s) if s.len() <= IDENT_CAP_BYTES)
-}
-
-/// A key of a result root that is page mechanics (shown as the count), not content: a number, a
-/// bool or a short string of the expected kind.
-fn is_page_mechanic(key: &str, value: &Value) -> bool {
-    match key {
-        "startAt" | "maxResults" | "total" => value.is_number(),
-        "isLast" => value.is_boolean(),
-        "expand" => short_string(value),
-        _ => false,
-    }
-}
-
 /// A key of a search item that is not content: its identifiers (the key has its column) with a
 /// short value, and `fields` (shown by the columns, the rest counted apart).
 fn is_item_identifier(key: &str, value: &Value) -> bool {
@@ -484,104 +442,6 @@ fn is_item_identifier(key: &str, value: &Value) -> bool {
         "id" => short_string(value) || value.is_number(),
         _ => false,
     }
-}
-
-/// The item arrays of the list ops that are objects (the paginated ops name theirs in the spec).
-const LIST_KEYS: [&str; 5] = [
-    "values",
-    "issueLinkTypes",
-    "transitions",
-    "worklogs",
-    "comments",
-];
-
-/// The keys a list table puts first, in this order, where the items have them.
-const LEADING_KEYS: [&str; 4] = ["id", "key", "name", "displayName"];
-
-/// Bytes a key and its value take as compact JSON: what a layout that drops them hides.
-pub(super) fn pair_bytes(key: &str, value: &Value) -> u64 {
-    u64::try_from(key.len().saturating_add(value.to_string().len())).unwrap_or(u64::MAX)
-}
-
-pub(super) fn bytes_of(value: &Value) -> u64 {
-    u64::try_from(value.to_string().len()).unwrap_or(u64::MAX)
-}
-
-/// `s` cut to at most `cap` chars, and how many bytes were cut.
-fn cut_chars(s: &str, cap: usize) -> (&str, u64) {
-    match s.char_indices().nth(cap) {
-        None => (s, 0),
-        Some((at, _)) => (&s[..at], u64::try_from(s.len() - at).unwrap_or(u64::MAX)),
-    }
-}
-
-/// `raw` cut at `cap` chars, display-escaped and one line, then cut at `cap` chars again (the
-/// escape widens an invisible char to `⟨U+XXXX⟩`): the text, and the bytes cut in all.
-fn capped_text(raw: &str, cap: usize) -> (String, u64) {
-    let (kept, cut) = cut_chars(raw, cap);
-    let escaped = one_line(escape_for_display(kept));
-    let (shown, cut_escaped) = cut_chars(&escaped, cap);
-    (shown.to_owned(), cut.saturating_add(cut_escaped))
-}
-
-/// A table cell: the string itself, else compact JSON, cut at [`CELL_CAP_CHARS`] after escaping
-/// (said in the cell, the cut bytes added to `hidden`), display-escaped and one line.
-fn cell(value: &Value, hidden: &mut u64) -> String {
-    let full = match value {
-        Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        other => std::borrow::Cow::Owned(other.to_string()),
-    };
-    let (shown, cut) = capped_text(&full, CELL_CAP_CHARS);
-    if cut == 0 {
-        return shown;
-    }
-    *hidden = hidden.saturating_add(cut);
-    format!("{shown}… {cut} more bytes (see Raw)")
-}
-
-/// A column name (display-escaped, one line) cut at [`COLUMN_NAME_CAP_CHARS`]; the cut bytes are
-/// added to `hidden`.
-fn column_name(raw: &str, hidden: &mut u64) -> String {
-    let (shown, cut) = capped_text(raw, COLUMN_NAME_CAP_CHARS);
-    if cut == 0 {
-        return shown;
-    }
-    *hidden = hidden.saturating_add(cut);
-    format!("{shown}…")
-}
-
-/// A table cell of an item's member, or empty where the item has none.
-pub(super) fn cell_of(member: Option<&Value>, hidden: &mut u64) -> String {
-    member.map_or_else(String::new, |v| cell(v, hidden))
-}
-
-/// The row that says what the row cap left out; its text is in the first cell.
-pub(super) fn omitted_row(columns: usize, omitted: usize) -> Vec<String> {
-    let mut row = vec![format!("… {omitted} more items (see Raw)")];
-    row.resize(columns.max(1), String::new());
-    row
-}
-
-/// The result root's keys that are neither the item array nor page mechanics: hidden.
-fn other_root_bytes(root: &Value, items_key: Option<&str>) -> u64 {
-    let Some(map) = root.as_object() else {
-        return 0;
-    };
-    map.iter()
-        .filter(|(k, v)| Some(k.as_str()) != items_key && !is_page_mechanic(k, v))
-        .fold(0u64, |sum, (k, v)| sum.saturating_add(pair_bytes(k, v)))
-}
-
-/// The count of a table: the paging facts of the read, else what the list holds.
-pub(super) fn table_count(header: &mut PreviewHeader, shown: usize) -> Option<ItemCount> {
-    let shown = u64::try_from(shown).unwrap_or(u64::MAX);
-    let count = header.item_count.unwrap_or(ItemCount {
-        shown,
-        total: Some(shown),
-        more_available: false,
-    });
-    header.item_count = Some(count);
-    Some(count)
 }
 
 /// §6.3 "Jira search": a table of the key and the requested (or default) fields, a row per issue,
@@ -600,7 +460,7 @@ pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         return generic::fallback_preview(ctx);
     };
 
-    let mut hidden = other_root_bytes(view.candidate, items_key);
+    let mut hidden = other_root_bytes(Product::Jira, view.candidate, items_key);
     let ids = search_field_ids(ctx, issues);
     let columns = search_columns(ctx.field_names, &ids, &mut hidden);
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(issues.len().min(TABLE_ROW_CAP + 1));
@@ -734,85 +594,21 @@ fn search_columns(names: Option<&FieldNames>, ids: &[String], hidden: &mut u64) 
     out
 }
 
-/// §6.3 "Lists": an item list (an array root, or `values`/`issueLinkTypes`/`transitions`/
-/// `worklogs`/`comments`) as a table whose columns are the scalar keys of the first 50 items in
-/// first-seen order, a row per item. A result that is no list of objects (`jira.myself`,
-/// `project.get`, `attachment.meta`, `editmeta`) keeps the §6.3 Fallback (the JSON tree). What
-/// the table leaves out (nested values, later items' extra keys, other root keys) is counted in
-/// `hidden_in_preview_bytes`; Raw has the exact bytes.
+/// §6.3 "Lists": the shared list table (`generic::list_table`, PD-114: an array root, or
+/// `values`/`issueLinkTypes`/`transitions`/`worklogs`/`comments`, a row per item, the scalar keys
+/// of the first 50 items as columns). A result that is no list of objects (`jira.myself`,
+/// `project.get`, `attachment.meta`, `editmeta`) keeps the §6.3 Fallback (the JSON tree). A
+/// `jira.comment.list` with a restricted comment carries the Caution either way.
 pub fn list_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
-    let PreviewInput::Read(view) = &ctx.input else {
-        return generic::fallback_preview(ctx);
-    };
-    let spec_key = ctx.spec.paginated.map(|p| p.items_key);
-    let (items, items_key) = match view.candidate {
-        Value::Array(items) => (items, None),
-        Value::Object(map) => {
-            let found = spec_key
-                .into_iter()
-                .chain(LIST_KEYS)
-                .find_map(|k| map.get(k).and_then(Value::as_array).map(|a| (a, Some(k))));
-            match found {
-                Some(found) => found,
-                None => return generic::fallback_preview(ctx),
-            }
-        }
-        _ => return generic::fallback_preview(ctx),
-    };
-    let columns = scalar_columns(items);
-    let restricted_comments =
-        ctx.spec.id == "jira.comment.list" && items.iter().any(has_visibility);
-    if columns.is_empty() {
-        let mut model = generic::fallback_preview(ctx);
-        if restricted_comments {
-            model.warnings.push(restricted_comments_warning());
-        }
-        return model;
-    }
-
-    let mut hidden = other_root_bytes(view.candidate, items_key);
-    let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len().min(TABLE_ROW_CAP + 1));
-    for (n, item) in items.iter().enumerate() {
-        let (Some(map), true) = (item.as_object(), n < TABLE_ROW_CAP) else {
-            hidden = hidden.saturating_add(bytes_of(item));
-            continue;
-        };
-        rows.push(
-            columns
-                .iter()
-                .map(|c| cell_of(map.get(c).filter(|v| is_scalar(v)), &mut hidden))
-                .collect(),
-        );
-        for (k, v) in map {
-            if !(is_scalar(v) && columns.contains(k)) {
-                hidden = hidden.saturating_add(pair_bytes(k, v));
-            }
-        }
-    }
-    if items.len() > TABLE_ROW_CAP {
-        rows.push(omitted_row(columns.len(), items.len() - TABLE_ROW_CAP));
-    }
-
-    let columns: Vec<String> = columns
-        .iter()
-        .map(|c| column_name(c, &mut hidden))
-        .collect();
-    let (mut header, mut warnings) = generic::read_parts(ctx, view, hidden);
+    let mut model = generic::list_preview(ctx);
+    let restricted_comments = ctx.spec.id == "jira.comment.list"
+        && matches!(&ctx.input, PreviewInput::Read(view)
+            if generic::list_items(ctx.spec, view.candidate)
+                .is_some_and(|(items, _)| items.iter().any(has_visibility)));
     if restricted_comments {
-        warnings.push(restricted_comments_warning());
+        model.warnings.push(restricted_comments_warning());
     }
-    let count = table_count(&mut header, items.len());
-    let query = header.query.clone();
-    PreviewModel {
-        header,
-        body: PreviewBody::Table {
-            columns,
-            rows,
-            count,
-        },
-        warnings,
-        query,
-    }
+    model
 }
 
 fn restricted_comments_warning() -> Warning {
@@ -820,44 +616,6 @@ fn restricted_comments_warning() -> Warning {
         WarningId::RestrictedComments,
         warning::TEXT_RESTRICTED_COMMENTS,
     )
-}
-
-fn is_scalar(v: &Value) -> bool {
-    !matches!(v, Value::Array(_) | Value::Object(_))
-}
-
-/// The scalar keys of the first [`COLUMN_SAMPLE_ITEMS`] items, at most [`MAX_COLUMNS`]: the
-/// identifying keys of [`LEADING_KEYS`] first, then the rest in first-seen order. (A JSON object
-/// here has no insertion order, its keys come sorted, so "first seen" is per item in key order.)
-fn scalar_columns(items: &[Value]) -> Vec<String> {
-    let mut leading: [Option<&String>; LEADING_KEYS.len()] = [None; LEADING_KEYS.len()];
-    let mut rest: Vec<&String> = Vec::new();
-    let mut seen: HashSet<&String> = HashSet::new();
-    let keys = items
-        .iter()
-        .take(COLUMN_SAMPLE_ITEMS)
-        .filter_map(Value::as_object)
-        .flat_map(|m| m.iter().filter(|(_, v)| is_scalar(v)).map(|(k, _)| k));
-    for key in keys {
-        if let Some(slot) = LEADING_KEYS.iter().position(|l| *l == key.as_str()) {
-            if let Some(entry) = leading.get_mut(slot) {
-                entry.get_or_insert(key);
-            }
-        } else if rest.len() < MAX_COLUMNS && seen.insert(key) {
-            rest.push(key);
-        }
-        // Everything the columns can hold is known: the remaining keys are not scanned.
-        if rest.len() >= MAX_COLUMNS && leading.iter().all(Option::is_some) {
-            break;
-        }
-    }
-    leading
-        .into_iter()
-        .flatten()
-        .chain(rest)
-        .take(MAX_COLUMNS)
-        .cloned()
-        .collect()
 }
 
 // ---- write previews (Task 12) -----------------------------------------------------------------

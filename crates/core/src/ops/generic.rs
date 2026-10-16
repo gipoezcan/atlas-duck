@@ -1,6 +1,9 @@
 //! Registry-driven executors and previewers (PD-09): the template/paginated read plan every read
 //! uses, the `NotInThisBuild` write executor, the §6.3 Fallback (JSON tree) and the write-request
-//! preview, and the receipt projection (§4.2).
+//! preview, the receipt projection (§4.2), and the table cells and list tables both products'
+//! previewers share (§6.3 "Lists", PD-114).
+
+use std::collections::HashSet;
 
 use atlas_duck_atlassian::{GetCall, HttpRequestSpec, PagedCall, SearchCall};
 use atlas_duck_preview::invisible::{self, escape_for_display};
@@ -8,7 +11,7 @@ use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{BodyView, ItemCount, PreviewBody, PreviewHeader, RequestView, json_tree};
 use atlas_duck_registry::{
-    BodySource, Endpoint, OpClass, OperationSpec, Projection, QueryValue, TargetDisplay,
+    BodySource, Endpoint, OpClass, OperationSpec, Product, Projection, QueryValue, TargetDisplay,
 };
 use base64::Engine as _;
 use serde_json::{Map, Value};
@@ -18,6 +21,7 @@ use super::{
     WriteView, path_params, resolve_url,
 };
 use crate::lifecycle::model::Hold;
+use crate::metadata::one_line;
 
 /// §7.5: the agent's offset param of every paginated op.
 const START_PARAM: &str = "start";
@@ -409,6 +413,391 @@ pub(crate) fn read_parts(
         release_blocked: None,
     };
     (header, warnings)
+}
+
+// ---- tables: cells and lists (§6.3 "Lists", PD-114) ------------------------------------------
+
+/// A table cell shows at most this many chars; Raw has the rest.
+pub(crate) const CELL_CAP_CHARS: usize = 200;
+
+/// A table has at most this many rows; the last row says how many items it leaves out.
+pub(crate) const TABLE_ROW_CAP: usize = 500;
+
+/// The columns of a table come from this many first items.
+pub(crate) const COLUMN_SAMPLE_ITEMS: usize = 50;
+
+/// A table has at most this many columns; the keys beyond count as hidden.
+pub(crate) const MAX_COLUMNS: usize = 40;
+
+/// A column name shows at most this many chars; the cut bytes count as hidden.
+const COLUMN_NAME_CAP_CHARS: usize = 64;
+
+/// A page key or identifier is skipped (not counted as hidden) only when it has the expected
+/// type and, for a string, is at most this many bytes: nothing reaches the agent unshown and
+/// uncounted.
+pub(crate) const IDENT_CAP_BYTES: usize = 256;
+
+pub(crate) fn short_string(v: &Value) -> bool {
+    matches!(v, Value::String(s) if s.len() <= IDENT_CAP_BYTES)
+}
+
+/// A key of a result root that is page mechanics (shown as the count), not content: a number, a
+/// bool or a short string of the expected kind, as the product's list answers carry them (Jira
+/// `startAt`/`maxResults`/`total`/`isLast`/`expand`, Confluence `start`/`limit`/`size`/
+/// `totalSize`).
+fn is_page_mechanic(product: Product, key: &str, value: &Value) -> bool {
+    match (product, key) {
+        (Product::Jira, "startAt" | "maxResults" | "total") => value.is_number(),
+        (Product::Jira, "isLast") => value.is_boolean(),
+        (Product::Jira, "expand") => short_string(value),
+        (Product::Confluence, "start" | "limit" | "size" | "totalSize") => value.is_number(),
+        _ => false,
+    }
+}
+
+/// Bytes a key and its value take as compact JSON: what a layout that drops them hides.
+pub(crate) fn pair_bytes(key: &str, value: &Value) -> u64 {
+    u64::try_from(key.len().saturating_add(value.to_string().len())).unwrap_or(u64::MAX)
+}
+
+pub(crate) fn bytes_of(value: &Value) -> u64 {
+    u64::try_from(value.to_string().len()).unwrap_or(u64::MAX)
+}
+
+/// `s` cut to at most `cap` bytes at a char boundary, and how many bytes were cut.
+pub(crate) fn cut_at(s: &str, cap: usize) -> (&str, u64) {
+    if s.len() <= cap {
+        return (s, 0);
+    }
+    let mut end = cap;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], u64::try_from(s.len() - end).unwrap_or(u64::MAX))
+}
+
+/// `s` cut to at most `cap` chars, and how many bytes were cut.
+pub(crate) fn cut_chars(s: &str, cap: usize) -> (&str, u64) {
+    match s.char_indices().nth(cap) {
+        None => (s, 0),
+        Some((at, _)) => (&s[..at], u64::try_from(s.len() - at).unwrap_or(u64::MAX)),
+    }
+}
+
+/// `raw` cut at `cap` chars, display-escaped and one line, then cut at `cap` chars again (the
+/// escape widens an invisible char to `⟨U+XXXX⟩`): the text, and the bytes cut in all.
+pub(crate) fn capped_text(raw: &str, cap: usize) -> (String, u64) {
+    let (kept, cut) = cut_chars(raw, cap);
+    let escaped = one_line(escape_for_display(kept));
+    let (shown, cut_escaped) = cut_chars(&escaped, cap);
+    (shown.to_owned(), cut.saturating_add(cut_escaped))
+}
+
+/// A table cell: the string itself, else compact JSON, cut at [`CELL_CAP_CHARS`] after escaping
+/// (said in the cell, the cut bytes added to `hidden`), display-escaped and one line.
+fn cell(value: &Value, hidden: &mut u64) -> String {
+    let full = match value {
+        Value::String(s) => std::borrow::Cow::Borrowed(s.as_str()),
+        other => std::borrow::Cow::Owned(other.to_string()),
+    };
+    let (shown, cut) = capped_text(&full, CELL_CAP_CHARS);
+    if cut == 0 {
+        return shown;
+    }
+    *hidden = hidden.saturating_add(cut);
+    format!("{shown}… {cut} more bytes (see Raw)")
+}
+
+/// A column name (display-escaped, one line) cut at [`COLUMN_NAME_CAP_CHARS`]; the cut bytes are
+/// added to `hidden`.
+pub(crate) fn column_name(raw: &str, hidden: &mut u64) -> String {
+    let (shown, cut) = capped_text(raw, COLUMN_NAME_CAP_CHARS);
+    if cut == 0 {
+        return shown;
+    }
+    *hidden = hidden.saturating_add(cut);
+    format!("{shown}…")
+}
+
+/// A table cell of an item's member, or empty where the item has none.
+pub(crate) fn cell_of(member: Option<&Value>, hidden: &mut u64) -> String {
+    member.map_or_else(String::new, |v| cell(v, hidden))
+}
+
+/// The row that says what the row cap left out; its text is in the first cell.
+pub(crate) fn omitted_row(columns: usize, omitted: usize) -> Vec<String> {
+    let mut row = vec![format!("… {omitted} more items (see Raw)")];
+    row.resize(columns.max(1), String::new());
+    row
+}
+
+/// The result root's keys that are neither the item array nor page mechanics: hidden.
+pub(crate) fn other_root_bytes(product: Product, root: &Value, items_key: Option<&str>) -> u64 {
+    let Some(map) = root.as_object() else {
+        return 0;
+    };
+    map.iter()
+        .filter(|(k, v)| Some(k.as_str()) != items_key && !is_page_mechanic(product, k, v))
+        .fold(0u64, |sum, (k, v)| sum.saturating_add(pair_bytes(k, v)))
+}
+
+/// The count of a table: the paging facts of the read, else what the list holds.
+pub(crate) fn table_count(header: &mut PreviewHeader, shown: usize) -> Option<ItemCount> {
+    let shown = u64::try_from(shown).unwrap_or(u64::MAX);
+    let count = header.item_count.unwrap_or(ItemCount {
+        shown,
+        total: Some(shown),
+        more_available: false,
+    });
+    header.item_count = Some(count);
+    Some(count)
+}
+
+/// How a product's list answers are laid out as a table (PD-114).
+struct ListShape {
+    /// The item arrays tried after the registry's `items_key` (an array root needs none).
+    item_keys: &'static [&'static str],
+    /// The keys a table puts first, in this order, where the items have them.
+    leading: &'static [&'static str],
+    /// A nested object's `title`, `key` or `name` (scalar) becomes a column of its own, named
+    /// `<member>.<key>` (one level: `space.key`, `space.name`).
+    flatten: bool,
+}
+
+/// The M5 Jira lists: unchanged by PD-114 (no flattening).
+const JIRA_LISTS: ListShape = ListShape {
+    item_keys: &[
+        "values",
+        "issueLinkTypes",
+        "transitions",
+        "worklogs",
+        "comments",
+    ],
+    leading: &["id", "key", "name", "displayName"],
+    flatten: false,
+};
+
+/// PD-114: Confluence lists hold their items under `results` (also the unpaginated
+/// `label.list` and `attachment.list`) and name their nested containers (`space`, `container`).
+const CONFLUENCE_LISTS: ListShape = ListShape {
+    item_keys: &["results"],
+    leading: &["id", "key", "name", "title"],
+    flatten: true,
+};
+
+/// The nested members a [`ListShape::flatten`] table shows, in this order.
+const NESTED_COLUMN_KEYS: [&str; 3] = ["title", "key", "name"];
+
+fn list_shape(product: Product) -> &'static ListShape {
+    match product {
+        Product::Jira => &JIRA_LISTS,
+        Product::Confluence => &CONFLUENCE_LISTS,
+    }
+}
+
+fn is_scalar(v: &Value) -> bool {
+    !matches!(v, Value::Array(_) | Value::Object(_))
+}
+
+/// The items of a list answer (an array root, the registry's `items_key`, else the product's
+/// item arrays) and the root key holding them; `None` when the candidate holds no item list.
+pub(crate) fn list_items<'a>(
+    spec: &OperationSpec,
+    candidate: &'a Value,
+) -> Option<(&'a [Value], Option<&'static str>)> {
+    match candidate {
+        Value::Array(items) => Some((items, None)),
+        Value::Object(map) => spec
+            .paginated
+            .map(|p| p.items_key)
+            .into_iter()
+            .chain(list_shape(spec.product).item_keys.iter().copied())
+            .find_map(|k| {
+                map.get(k)
+                    .and_then(Value::as_array)
+                    .map(|a| (&a[..], Some(k)))
+            }),
+        _ => None,
+    }
+}
+
+/// One column of a list table: an item's scalar member, or (flattened) a scalar member of an
+/// item's nested object.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Column<'a> {
+    key: &'a str,
+    nested: Option<&'static str>,
+}
+
+impl Column<'_> {
+    /// The item's value this column shows, when it is a scalar.
+    fn value_in<'v>(&self, item: &'v Map<String, Value>) -> Option<&'v Value> {
+        let member = item.get(self.key)?;
+        match self.nested {
+            None => Some(member),
+            Some(sub) => member.as_object()?.get(sub),
+        }
+        .filter(|v| is_scalar(v))
+    }
+
+    fn name(&self) -> String {
+        match self.nested {
+            None => self.key.to_owned(),
+            Some(sub) => format!("{}.{sub}", self.key),
+        }
+    }
+}
+
+/// The columns one member of an item gives: itself when scalar; with `flatten`, the scalar
+/// `title`/`key`/`name` of a nested object.
+fn member_columns<'a>(
+    key: &'a str,
+    value: &'a Value,
+    flatten: bool,
+) -> impl Iterator<Item = Column<'a>> {
+    let direct = is_scalar(value).then_some(Column { key, nested: None });
+    let nested = value
+        .as_object()
+        .filter(|_| flatten)
+        .into_iter()
+        .flat_map(move |o| {
+            NESTED_COLUMN_KEYS
+                .iter()
+                .filter(move |sub| o.get(**sub).is_some_and(is_scalar))
+                .map(move |sub| Column {
+                    key,
+                    nested: Some(*sub),
+                })
+        });
+    direct.into_iter().chain(nested)
+}
+
+/// The columns of the first [`COLUMN_SAMPLE_ITEMS`] items, at most [`MAX_COLUMNS`]: the leading
+/// keys of the shape first (in its order), then the rest in first-seen order. (A JSON object
+/// here has no insertion order, its keys come sorted, so "first seen" is per item in key order.)
+fn list_columns<'a>(items: &'a [Value], shape: &ListShape) -> Vec<Column<'a>> {
+    let mut leading: Vec<Option<Column<'a>>> = vec![None; shape.leading.len()];
+    let mut rest: Vec<Column<'a>> = Vec::new();
+    let mut seen: HashSet<Column<'a>> = HashSet::new();
+    let columns = items
+        .iter()
+        .take(COLUMN_SAMPLE_ITEMS)
+        .filter_map(Value::as_object)
+        .flat_map(|m| {
+            m.iter()
+                .flat_map(|(k, v)| member_columns(k, v, shape.flatten))
+        });
+    for column in columns {
+        let slot = (column.nested.is_none())
+            .then(|| shape.leading.iter().position(|l| *l == column.key))
+            .flatten();
+        if let Some(slot) = slot {
+            if let Some(entry) = leading.get_mut(slot) {
+                entry.get_or_insert(column);
+            }
+        } else if rest.len() < MAX_COLUMNS && seen.insert(column) {
+            rest.push(column);
+        }
+        // Everything the columns can hold is known: the remaining keys are not scanned.
+        if rest.len() >= MAX_COLUMNS && leading.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    leading
+        .into_iter()
+        .flatten()
+        .chain(rest)
+        .take(MAX_COLUMNS)
+        .collect()
+}
+
+/// The bytes of an item's member that its row does not show: an unshown member in full; of a
+/// nested object with flattened columns, the members those columns do not show.
+fn unshown_member_bytes(key: &str, value: &Value, columns: &[Column<'_>]) -> u64 {
+    if is_scalar(value) {
+        return if columns.contains(&Column { key, nested: None }) {
+            0
+        } else {
+            pair_bytes(key, value)
+        };
+    }
+    let flattened = |sub: &str| {
+        columns
+            .iter()
+            .any(|c| c.key == key && c.nested.is_some_and(|n| n == sub))
+    };
+    match value {
+        Value::Object(nested) if columns.iter().any(|c| c.key == key && c.nested.is_some()) => {
+            nested
+                .iter()
+                .filter(|(k, v)| !(is_scalar(v) && flattened(k)))
+                .fold(0u64, |sum, (k, v)| sum.saturating_add(pair_bytes(k, v)))
+        }
+        _ => pair_bytes(key, value),
+    }
+}
+
+/// §6.3 "Lists" (PD-114): an item list (an array root, the registry's `items_key`, else the
+/// product's item arrays) as a table whose columns are the scalar keys of the first 50 items in
+/// first-seen order (the product's identifying keys first; for Confluence also a nested object's
+/// `title`/`key`/`name`, one level), a row per item. `None` for a result that is no list of
+/// objects with such keys: the caller keeps the §6.3 Fallback (the JSON tree). What the table
+/// leaves out (nested values, later items' extra keys, other root keys) is counted in
+/// `hidden_in_preview_bytes`; Raw has the exact bytes.
+pub(crate) fn list_table(ctx: &PreviewCtx<'_>) -> Option<PreviewModel> {
+    let PreviewInput::Read(view) = &ctx.input else {
+        return None;
+    };
+    let shape = list_shape(ctx.spec.product);
+    let (items, items_key) = list_items(ctx.spec, view.candidate)?;
+    let columns = list_columns(items, shape);
+    if columns.is_empty() {
+        return None;
+    }
+
+    let mut hidden = other_root_bytes(ctx.spec.product, view.candidate, items_key);
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(items.len().min(TABLE_ROW_CAP + 1));
+    for (n, item) in items.iter().enumerate() {
+        let (Some(map), true) = (item.as_object(), n < TABLE_ROW_CAP) else {
+            hidden = hidden.saturating_add(bytes_of(item));
+            continue;
+        };
+        rows.push(
+            columns
+                .iter()
+                .map(|c| cell_of(c.value_in(map), &mut hidden))
+                .collect(),
+        );
+        for (k, v) in map {
+            hidden = hidden.saturating_add(unshown_member_bytes(k, v, &columns));
+        }
+    }
+    if items.len() > TABLE_ROW_CAP {
+        rows.push(omitted_row(columns.len(), items.len() - TABLE_ROW_CAP));
+    }
+
+    let columns: Vec<String> = columns
+        .iter()
+        .map(|c| column_name(&c.name(), &mut hidden))
+        .collect();
+    let (mut header, warnings) = read_parts(ctx, view, hidden);
+    let count = table_count(&mut header, items.len());
+    let query = header.query.clone();
+    Some(PreviewModel {
+        header,
+        body: PreviewBody::Table {
+            columns,
+            rows,
+            count,
+        },
+        warnings,
+        query,
+    })
+}
+
+/// The list previewer (PD-114): [`list_table`], else the §6.3 Fallback.
+pub fn list_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    list_table(ctx).unwrap_or_else(|| fallback_preview(ctx))
 }
 
 /// Searches show their query (§6.3); keyed ops none.

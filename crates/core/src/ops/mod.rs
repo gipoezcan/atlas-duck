@@ -548,6 +548,12 @@ const READ: OpImpl = OpImpl {
     enrich_keys: &[],
 };
 
+/// PD-114: a read whose result is an item list (the Confluence list ops).
+const LIST: OpImpl = OpImpl {
+    previewer: generic::list_preview,
+    ..READ
+};
+
 /// PD-09: completed in M5/M7.
 const LATER_WRITE: OpImpl = OpImpl {
     executor: generic::not_in_this_build,
@@ -794,17 +800,19 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &[],
         },
     ),
+    // §6.3: a single object (the user, a space) keeps the JSON tree.
     ("confluence.user.current", READ),
-    ("confluence.space.list", READ),
+    ("confluence.space.list", LIST),
     ("confluence.space.get", READ),
     (
         "confluence.page.get",
         OpImpl {
             executor: confluence::page_get_executor,
+            previewer: confluence_preview::page_preview,
             ..READ
         },
     ),
-    ("confluence.page.find", READ),
+    ("confluence.page.find", LIST),
     (
         "confluence.search",
         OpImpl {
@@ -813,14 +821,22 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             ..READ
         },
     ),
-    ("confluence.page.children", READ),
-    ("confluence.comment.list", READ),
-    ("confluence.label.list", READ),
-    ("confluence.attachment.list", READ),
+    ("confluence.page.children", LIST),
+    (
+        "confluence.comment.list",
+        OpImpl {
+            previewer: confluence_preview::comments_preview,
+            ..READ
+        },
+    ),
+    ("confluence.label.list", LIST),
+    ("confluence.attachment.list", LIST),
     (
         "confluence.page.history",
         OpImpl {
             executor: confluence::page_history_executor,
+            // The summary (without `version`) keeps the JSON tree.
+            previewer: confluence_preview::page_preview,
             ..READ
         },
     ),
