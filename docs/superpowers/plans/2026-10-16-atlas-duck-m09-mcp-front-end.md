@@ -1,0 +1,726 @@
+# atlas-duck M9 (MCP front end) Implementation Plan
+
+**Draft status:** DRAFT with lead rulings, written 2026-10-16 by `m9-planner` while M6 awaits its merge and M7/M8 are being planned; the lead's rulings of 2026-10-16 on the former open questions are applied (section "Lead rulings (2026-10-16)"), no question blocks a task any more; uncommitted. The M7 draft (`2026-10-16-atlas-duck-m07-confluence-adapter.md`) was read; the M8 draft did not exist when this was written, so every M8 assumption is stated where it is used and collected in the final section "M7/M8-dependent tasks (reconcile when merged)". Numbering follows the lead's global allocation: M9 owns **PD-115..PD-130** and ledger entries **L155–L164** (M7: PD-93..114, L136–L154; M8: PD-131..155, L165–L184; M10: PD-156..190, L185–L214).
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. One implementer subagent per task, one reviewer after each task. Each task below is self-contained: it names every file it touches, the interfaces it consumes from earlier tasks and the ones it must produce, and the tests with the assertions that matter.
+>
+> **Model policy for the executing agents (memory `subagent-model-preference`; only 5.5 models, never Fable):** each task header names its implementer and its reviewer. **Haiku (effort xhigh)** for easy, mechanical work (docs, help text). **Sonnet (effort medium)** for normal tasks and their reviews. **Opus (effort medium)** only for the complicated or security-critical tasks (marked `Model: Opus`: the multiplexing IPC client, the MCP server core and result mapping, the session/reconnect manager, the waiting/progress/cancel path, the final whole-branch review) and for the reviews of those tasks. Opus `xhigh` is reserved for the case where everything else failed.
+>
+> **Hard execution limits (corporate AV, memory `agent-execution-limits`):** no subagent downloads or runs executables, toolchains or installers, runs `cargo install`, `pip install`, `npm install -g` or **any `npm install`/`npm ci`** (the one npm step of Task 15 is the lead's), runs `node` on anything but `ci/*.mjs` checkers and `node --test` of those checkers (never the conformance project, which spawns binaries), changes ACLs or the registry, kills processes (`taskkill`/`kill`; the S-02 tests do this and refuse to run without `CI=true`), or writes outside the repo and the session scratchpad (not `/tmp`, not `%TEMP%`). The one unlocked `cargo build` of Task 1 fetches crate *sources* from crates.io; that is the only fetch. **No agent starts `atlas-duck-app` or `atlas-duck mcp` locally, not even as a smoke test.** `cli_flows`, `jira_flows`, `confluence_flows` (M7), `e2e` and the new **`mcp_flows`** target spawn the real binaries and run in GitHub CI only: implementers compile them (`--no-run`) and unit-test their pure helpers; a plain run without `ATLAS_DUCK_CLI_FLOWS` only prints `skipped:` lines (never set the variable locally). Reading crates.io API metadata, the npm registry and docs.rs with WebFetch is allowed (Task 1, Task 15).
+>
+> **Test time and memory (corporate laptop, memory `disk-usage-target-dir`):** exactly **one cargo process at a time** across all agents (the lead serializes; a reviewer that wants to run a test waits for the implementer's cargo to end); every cargo command passes `-j 4`; implementers build in the repo `target/`; every reviewer and debug agent reuses **one** shared scratch dir `<scratchpad>/m9-target` (`CARGO_TARGET_DIR`), which the lead deletes at the end of the milestone. While iterating, run the task's own test filter (`cargo test -j 4 -p atlas-duck-cli --locked mcp::`), and the package suite once at the end of the task.
+>
+> **What runs where (binding for every task):**
+> - **Local-safe on the Windows dev machine:** `cargo test -j 4 -p atlas-duck-ipc --locked` (in-process `IpcServer` + client, the new `SharedClient` tests); `cargo test -j 4 -p atlas-duck-cli --locked` (argv, tool catalog, result mapping, and the **in-process MCP rig**: the MCP server over `tokio::io::duplex` against the real `IpcServer` serving `test_support::Fake`; no binary is spawned, no app is launched: the `TestConnector` launch double is used); `cargo test -j 4 -p atlas-duck-registry --locked`; `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --lib` (approver directive table, the build-id seam unit test); `--no-run` of every spawning target (`cli_flows`, `jira_flows`, `mcp_flows`); `cargo clippy -j 4 … -D warnings`; `node ci/check-*.mjs` and `node --test "ci/*.test.mjs"`; `node --check ci/mcp-conformance/*.mjs` (syntax only, no `node_modules`).
+> - **GitHub CI only:** `mcp_flows` (spawns `atlas-duck mcp` and `atlas-duck-app`), the S-02 MCP cases (Windows tree kill, job close; `#[ignore]`, `CI=true`), the TypeScript conformance project (needs `npm ci` and spawns binaries), X-05 (real binaries, mock DC), the macOS/Linux legs and the Rosetta leg. GitLab runs none of the spawning targets (same reason as `cli_flows`, master plan M4 status).
+
+**Goal:** Ship `atlas-duck mcp`: a stdio MCP server (official Rust SDK `rmcp`) that is one more long-lived client of the app's IPC, with the full tool set (one tool per registry op plus `script_run`, `request_await`, `request_status`, `request_cancel`, `request_list`, `ops_list`, `ops_describe`, `instances_list`) and the generic set (`call` plus the same eight), every result the §4.2 envelope as `structuredContent` with no `outputSchema`, `ATLAS_DUCK_MCP_TIMEOUT` waiting measured from tool-call receipt (launch and handshake included), progress notifications with heartbeats, `notifications/cancelled` that stops waiting only, survival of app restarts and upgrades with re-handshake, stdout that carries only JSON-RPC, and the conformance of the official TypeScript SDK client.
+
+**Architecture:** Everything lives in `crates/cli` (§2.2: `cli` depends only on `ipc` + `registry` inside the workspace) as a new module tree `crates/cli/src/mcp/`, dispatched from `atlas_duck_cli::run` (C.9 surface unchanged). The tool catalog is generated from `registry` at runtime with no app (`tools/list` never connects). One MCP server process holds **one** IPC connection (§3.3 "MCP connections are long-lived"; the core keys unnamed MCP agents and approval sessions by `connection_id`, `engine/queue.rs:118`, `decision/mod.rs:119`), so `ipc::client` gains a multiplexing `SharedClient` (Δ1) that serves concurrent tool calls over that connection. The CLI's connect/launch path (`connected::reach`, `launch::ensure_running`) and envelope rules (submit/await error mapping, L131 reply checks, `build_mismatch`) are refactored into reusable pieces so MCP and CLI cannot drift. Tests: an in-process MCP rig in `crates/cli` (local) for I-04/I-41 logic, a new `mcp_flows` target over the `cli_flows` harness (CI) for the real binaries, and a TypeScript conformance project driven by a Rust test (CI). No new workspace crate, no new process kind, no IPC wire change.
+
+**Tech Stack:** Rust 1.95.0 (edition 2024, MSRV 1.90). New: `rmcp` (candidate `=3.5.0`, `default-features = false`, features `server` + `transport-io`; dev-dependency features `client`; Task 1 verifies). TypeScript conformance (CI only): `@modelcontextprotocol/sdk` (candidate exact `1.32.1`) + its required peer `zod`, Node 22.13 / npm 11.6 (as `app/ui`). Existing pins otherwise (`tokio =1.53.2`, `tokio-util =0.7.19`, `serde_json`, `lexopt`).
+
+**Spec:** `docs/superpowers/specs/2026-10-07-atlas-duck-design.md` (§2.2, §2.3, §3.2, §3.3, §4.1–§4.7, §9.5 dry runs, §10.2, §12.4 MCP snippet, §13 I-04, I-05, I-16, I-17, I-41, S-02, canary sweep, §14 M9, §15 V13) + ledger `docs/superpowers/specs/2026-10-07-atlas-duck-review-ledger.md` (master-plan ids L04, L14, L16, L28; L63, L66, L67, L73, L81, L83/L118/L131). **Master plan:** `docs/superpowers/plans/2026-10-07-atlas-duck-master-plan.md` (M9 entry; C.1, C.2, C.9; Global Constraints "Names on the wire", "Wire, exit codes, envelope", "Limits and timing", "App launch"; P3, P4; Traceability R4, R8, R9, SC1, Table 2 I-04/I-05/I-16/I-17/I-41/S-02, Table 3 X-05). **Earlier plans:** M4 (`2026-10-07-atlas-duck-m04-ipc-cli.md`: PD-04, PD-08, PD-16, PD-17, PD-19, PD-21, PD-22, PD-24, the `cli_flows` harness and its CI steps), M6 (`2026-10-14-atlas-duck-m06-approvals-ui.md`: T34b L83 client checks, PD-80 onboarding text), M7 draft (`2026-10-16-atlas-duck-m07-confluence-adapter.md`: "Handoffs → M9", Q14 L81). **Ledgers (git-ignored):** `.superpowers/sdd/2026-10-14-atlas-duck-m06-approvals-ui/progress.md`, `.superpowers/sdd/2026-10-13-atlas-duck-m05-jira-adapter/progress.md` (no M9 handoff beyond the M7 one and L73).
+
+**Prerequisite:** M1–M8 merged on `master`; branch `m9-mcp-front-end`. Before Task 1 the lead (a) applies the contract deltas Δ1–Δ3 below to the master plan (C.1, C.2), (b) records the ledger entries L155–L164 listed under "Ledger entries the lead adds". The open questions are ruled (section "Lead rulings (2026-10-16)", R1–R13); the PDs and tasks below already follow the rulings.
+
+---
+
+## What exists on `master` and what M9 adds
+
+Checked in `crates/cli/src/{lib,argv,connected,local,help,exit,output,deadline,launch/mod,launch/env,test_support}.rs`, `crates/ipc/src/{client,server}.rs`, `crates/registry/src/{lib,describe,script,model}.rs`, `crates/core/src/{gate.rs,engine/handler.rs,engine/cancel.rs,engine/queue.rs}`, `app/src-tauri/{Cargo.toml,src/testing/approver.rs,tests/cli_flows*}`, `.github/workflows/ci.yml`, `ci/check-workspace.mjs`.
+
+| Area | On `master` | M9 adds |
+|---|---|---|
+| `mcp` command | argv classifies `mcp` as `Kind::NotInBuild("mcp")` (`argv.rs:172`), flags skipped (`argv.rs:222`); `local::not_in_this_build` answers `usage` "not available in this build"; `help.rs:109` says the same; `lib.rs` tests pin it (`mcp_and_verify_export_not_in_this_build`) | `Command::Mcp {tools, instance}`, `mcp::serve` (T3, T5) |
+| IPC client | `IpcClient` (`client.rs:240`): sequential (`&mut self`), one `waiting` route (`client.rs:728`), one progress route; a dropped call after its first byte tears the stream (`Tracked`) | `SharedClient` (Δ1, T2): concurrent calls by id, per-request progress, a writer task that never tears |
+| IPC server | one task per request, 64 in flight per connection (`server.rs:74`), progress only for `request.await`; drops await tasks on close | nothing (no wire change) |
+| Connected flow | `connected::reach` (discover → launch on a blocking thread → connect, one retry), `hello_for` hardcodes `ClientKind::Cli` and `opts.agent` (`connected.rs:342`); submit/await mapping incl. L131 checks private to `connected.rs` | refactor: `reach` takes a `Hello`; the mapping helpers move to `flow.rs` and serve both front ends (T4) |
+| Launch | `ensure_running` with the 20 s poll capped by the deadline; Windows stub wait a fixed 5 s (L81, not deadline-capped) | deadline cap of the stub wait (T11; owner moved from M7, M7 draft Q14) |
+| Registry | `describe`, `ops_list_json`, `GENERIC_COMMANDS` (no `mcp` row), `WRITE_GUIDANCE`, `PAGINATION_GUIDANCE`, `SCRIPT_RUN`; params schemas draft 2020-12, `additionalProperties: false`, no param named `reason`/`instance`/`dry_run`/`op_id` (grep) | `GENERIC_COMMANDS` `mcp` row (Δ2, T3); no op data change |
+| Core | `gate::hello` compares `h.build_id == BUILD_ID` (`gate.rs:164`); `Engine::expire_now` (`engine/cancel.rs:216`); MCP session/agent key by `connection_id` | test-build seams only (T12) |
+| Scripted approver | directives `release`, `release-status-only`, `deny`, `deny-details`, `approve`, `edit-preadded`, `deny-hint`, `hold` (`testing/approver.rs:62-76`) | `release-redacted`, `expire` (T12) |
+| Flow tests | `cli_flows`, `jira_flows`, `e2e` targets; `cli_flows/security.rs` S-02 CLI cases print `V13 tree_kill_case=…`, `V13 job_case=…` | `mcp_flows` target (T13–T16), the conformance driver (T15) |
+| CI | `ci.yml` M4/M5 flow steps with `check-no-skips`, the S-02 `#[ignore]` step | M9 steps (T17) |
+| MCP anywhere | none (only `ClientKind::Mcp`, `AgentNameSource::McpClientInfo`, and the `ATLAS_DUCK_MCP_TIMEOUT` name in a launch-env test) | everything below |
+
+---
+
+## Global Constraints
+
+The master plan's Global Constraints apply verbatim. The subset M9 touches most:
+
+- **Opacity (§4.5, §10.2):** the MCP server adds nothing to an envelope; `structuredContent` is the envelope exactly as the app (or the CLI-side rules shared with the CLI) produced it. Progress notifications carry only `{request_id, status}` (status changes) or nothing (heartbeats on a fixed timer started at tool-call receipt, never driven by app events). Nothing internal (queued, slots, sizes, timing) is derivable from MCP messages beyond what the CLI already shows.
+- **stdout is JSON-RPC only (§4.6, §4.7, §13 S-02):** in `mcp` mode nothing but `rmcp`'s transport writes to stdout; `crates/cli/src/mcp/` carries `#![deny(clippy::print_stdout, clippy::print_stderr)]`; the launched app's stdio is the null device (existing §4.7 rule, T10 audits the intermediate processes).
+- **Never cancel by accident (§4.4, §4.6):** a dropped tool call, a client `notifications/cancelled`, stdin EOF, a signal or a lost connection never sends `request.cancel`; only the `request_cancel` tool does.
+- **Never exit because of the app (§4.6):** `atlas-duck mcp` ends only on stdin EOF, a transport error on stdin/stdout, or a signal; an app restart, upgrade, mismatch or crash makes the next tool call reconnect.
+- **Deadline (§4.6, L04):** `ATLAS_DUCK_MCP_TIMEOUT` (default 50 s) is wall-clock from receipt of the tool call; discover, launch poll, the pipe-busy wait, connect and `hello` are each capped by the remaining time; a deadline that expires before submission is `unreachable {launch_timeout}` with nothing queued.
+- **Same rules as the CLI:** `params_sha256`, `build_id` exact match (L16), L63 `connection_lost` with an unknown id, L131 (a `pending` submit reply without `request_id` is `protocol_error`; an await reply naming another request is `protocol_error`), L66 (the `request_list` agent filter comes only from the tool's own `agent` argument), status exit-0 rule for known ids (§4.4). M9 reuses the CLI code for each (T4), never a copy.
+- **Lints:** `clippy -D warnings`; `unwrap_used`/`expect_used` denied in `crates/cli/src/mcp/` (module-level `#![deny]`, tests excepted).
+- **Tests:** each Rust test file starts with `type TestResult = Result<(), Box<dyn std::error::Error>>;`; async tests `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]` except the paused-clock heartbeat tests (`#[tokio::test(start_paused = true)]`, current-thread); OS-only tests are `#[cfg]` modules; `#[ignore]` reasons name the CI step.
+- **Commits:** one commit per task unless stated, `<type>(<scope>): <summary>`, trailer `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>` (Opus tasks `Claude Opus 5.5`, Haiku `Claude Haiku 5.5`); explicit pathspecs; `--locked` on every cargo command after Task 1's one unlocked build.
+
+---
+
+## Dependency pins
+
+| Package | Pin (candidate) | Features / notes | Added by | Used in | Why |
+|---|---|---|---|---|---|
+| `rmcp` | `=3.5.0` (published 2026-09-28, 18 days old on 2026-10-16; lead ruling R10; `3.5.1` of 2026-10-05 is not taken) | `default-features = false`, `features = ["server", "transport-io"]`; **never** `macros`, `__reqwest`, `reqwest*`, `auth*`, `server-side-http`, `transport-streamable-*`, `transport-child-process`, `client-side-sse` (they pull `reqwest`/`hyper`, banned for `cli` by `ci/check-workspace.mjs` `BANNED_IN_CLI_AND_WORKER`) | T1 | `crates/cli` | §4.6 "official Rust SDK `rmcp`" |
+| `rmcp` (dev) | same version | dev-dependency of `atlas-duck-cli` with `features = ["client", "transport-async-rw"]` for the in-process rig (T10); a dev-dependency is outside the normal-dependency closure the checker inspects | T1 | `crates/cli` tests | an independent MCP client for local I-04/I-41 tests |
+| `tokio` | `=1.53.2` (existing) | `atlas-duck-cli` gains `io-std` (stdin/stdout transport) and `rt-multi-thread`; dev-dependency `test-util` (paused clock) | T1 | `crates/cli` | stdio, concurrent tool calls, heartbeat tests |
+| `@modelcontextprotocol/sdk` | exact `1.32.1` (npm `latest` on 2026-10-16; Task 15 checks its `time` entry is ≥ 14 days old, else the newest older 1.x that is) | `ci/mcp-conformance/package.json` only; test-only, never shipped | T15 (lead installs) | conformance (CI) | §13 I-05 "the official TypeScript SDK client" |
+| `zod` | exact, the newest release satisfying the SDK's peer range `^3.25 \|\| ^4.0` and ≥ 14 days old | required peer of the SDK | T15 (lead installs) | conformance (CI) | peer dependency |
+
+`rmcp` `server` enables `schemars`, `uuid`, `pastey` and `transport-async-rw` (`tokio-util` codec, already pinned). Lead ruling R10: these crates are acceptable in the `cli` closure **only if `cargo deny check` passes with no new ignore, exception or `skip` entry in `deny.toml`**. Task 1 records the resolved tree, runs `cargo deny --locked check` and `cargo audit` over it, and confirms `rmcp 3.5.0`'s `rust-version` ≤ 1.90; it stops and reports (no workaround, no `deny.toml` edit) if any of the three fails.
+
+API facts the tasks rely on, confirmed only at the trait level from docs.rs on 2026-10-16 (Task 1 confirms the rest and records them in its report): `ServerHandler` (not dyn-compatible; `Arc<T>` implements it) with overridable `initialize`, `list_tools`, `call_tool`, `get_info`, `on_cancelled`; `call_tool(CallToolRequestParams, RequestContext<RoleServer>) -> Result<CallToolResponse, McpError>`; docs advise `CallToolResult::error(..)` over `Err(McpError)` for tool failures; `RequestContext` exposes `peer`. **To confirm in Task 1:** the field names on `Tool` (`output_schema: Option<..>`, `annotations`), `CallToolResult` (`structured_content`, `is_error`, `content`), how `RequestContext` carries the cancellation token and `_meta.progressToken`, the `Peer` progress-notification call, how the client's `clientInfo` is read (`peer_info()` or the `initialize` params), the stdio transport constructor (`rmcp::transport::stdio()` or equivalent), the protocol versions `supported_protocol_versions()` returns, and whether rmcp answers a request that `notifications/cancelled` cancelled (MCP says the receiver SHOULD NOT).
+
+---
+
+## Plan decisions and contract deltas
+
+Tagged **(spec silent)** or **(spec gap → ledger)** as in M5–M7. **Δ C.x** = master-plan contract change the lead applies before Task 1.
+
+**Contract deltas (applied before Task 1):**
+- **Δ1 C.2 `ipc::client::SharedClient`** (PD-115). Additive; `IpcClient` and its `&mut self` API stay for the CLI.
+  ```rust
+  impl IpcClient { pub fn into_shared(self) -> SharedClient; }          // after connect + hello
+  #[derive(Clone)] pub struct SharedClient { /* Arc<inner>: writer task (mpsc of encoded frames), routes HashMap<u64, oneshot>, progress HashMap<String /* request_id */, Vec<mpsc::Sender>>, closed: Option<Closed>, in-flight semaphore */ }
+  pub struct Sent<R> { pub result: Result<R, ClientError>, pub written: bool }   // `written`: this call's frame reached the writer's socket (PD-16 per call)
+  impl SharedClient {
+      pub async fn call<R: DeserializeOwned>(&self, method: &str, params: impl Serialize) -> Sent<R>;
+      pub async fn call_with_progress<R: DeserializeOwned>(&self, method: &str, params: impl Serialize,
+          on_progress: &mut (dyn FnMut(ProgressNotification) + Send)) -> Sent<R>;   // only notifications whose request_id = params.request_id
+      pub fn is_closed(&self) -> bool;                                     // the reader saw EOF, an error or a protocol violation
+  }
+  pub const SHARED_IN_FLIGHT: usize = 48;   // < server MAX_IN_FLIGHT_PER_CONNECTION (64); a call beyond it waits for a slot (its caller's deadline bounds the wait)
+  ```
+  A dropped call future never tears the stream (the writer task owns whole frames); its route is removed and a late answer is discarded. A `null`-id error answer is delivered to no call and closes the client (`Closed::Protocol`), since with several calls in flight it cannot be attributed (the sequential client's rule, "goes to the waiting call", has no equivalent).
+- **Δ2 C.1 `GENERIC_COMMANDS`** gains `{path: ["mcp"], usage: "atlas-duck mcp [--tools full|generic] [--instance ALIAS] [--agent NAME]", summary: "Serve the operations as MCP tools on stdio"}` (registry data, additive).
+- **Δ3 Global Constraints "Names on the wire":** unchanged names; add after the MCP tool list: "MCP tool input schemas are the op's `params_schema` with optional `reason` (string) and `instance` (string) added; the fixed tools' schemas are listed in the M9 plan (PD-118)."
+
+**Plan decisions:**
+- **PD-115 One multiplexed IPC connection per MCP server (spec: "MCP connections are long-lived", §3.3; how concurrent tool calls share it is silent → ledger).** The MCP server opens one IPC connection lazily, shares it through `SharedClient` (Δ1) among all concurrent tool calls, and opens a new one only after it closed. Reason: the core groups approval sessions and keys unnamed MCP agents by `connection_id`; one connection per tool call would split one agent into many sessions ("Deny all pending from this session" would miss requests) and bypass the per-agent pending limit of 32. Lead ruling R1 confirms the shared multiplexed connection over the alternative of one connection per in-flight tool call. Accepted cost (the reviewers of Tasks 2 and 7 must challenge it explicitly, see their review notes): the session key of an MCP agent includes the `connection_id` (`engine/mod.rs:414`) and `disconnected` calls `forget_session` (`engine/handler.rs:871`), so every reconnect (an app restart, but also a server-side close such as `frame_timeout`, L131) starts a new approval session for the same MCP server; under (a) that would happen on every tool call.
+- **PD-116 `mcp` argv (spec: `atlas-duck mcp [--tools full|generic] [--instance X]`, "overridable by `--agent`"; the other global flags are silent).** Accepted: `--tools full|generic` (default `full`), `--instance ALIAS`, `--agent NAME`, `--help`. Refused with `usage` (exit 2): `--timeout` (message "use ATLAS_DUCK_MCP_TIMEOUT"), `--reason` ("pass reason in each tool call"), `--output`, any positional, any other flag. `ATLAS_DUCK_MCP_TIMEOUT`: decimal seconds `0..`; `0` = submit and return `pending` at once (the CLI's `--timeout 0` rule incl. L67's own limits); values above `MAX_TIMEOUT` clamp; non-UTF-8, empty or non-numeric → `usage` naming the variable. `ATLAS_DUCK_MCP_TIMEOUT=0` meaning "pending at once" is confirmed by lead ruling R5.
+- **PD-117 Nothing on stdout before serving (spec: §4.2 one envelope per invocation names only `verify-export` as the exception; MCP stdout carries only JSON-RPC, §4.6/S-02 → ledger).** A usage error of `atlas-duck mcp` (bad flag, bad `ATLAS_DUCK_MCP_TIMEOUT`) prints its envelope as one line on **stderr** and exits 2; stdout stays empty. `atlas-duck mcp --help` prints the help envelope on stdout like every other `--help` (nothing is served). After serving starts, stdout carries only `rmcp`'s frames; the process exit code is 0 on stdin EOF, 1 when the runtime or transport fails. Usage errors only on stderr: lead ruling R5.
+- **PD-118 Tool catalog (spec §4.6; schemas of the fixed tools silent).** Generated by `mcp::tools::catalog(ToolSet)` from `registry::all()` on every `tools/list` (no connection, no app). Op tool: name = op id with `.` → `_`; input schema = `params_schema_json()` with `properties.reason = {"type":"string","maxLength":1000}` and `properties.instance = {"type":"string","minLength":1}` added (`required` unchanged, `additionalProperties: false` kept, `$schema` and `examples` kept); description = `"<op_id> (<read|write>; approval: <release|approve>). " + describe(spec)["description"] + " Result shapes: ops_describe."` (PD-120). Fixed tools:
+  - `script_run {source: string (required), args?: any JSON value (default {}), limits?: object (the §9.4 keys, integers ≥ 1, additionalProperties false), dry_run?: "full"|"sparse", reason?: string}`;
+  - `request_await {request_id}`, `request_status {request_id}`, `request_cancel {request_id}` (`request_id`: string, pattern `^req_[A-Za-z0-9_-]{20,64}$`);
+  - `request_list {agent?: string, state?: "pending"|"recent", match_params?: {op_id: string, params: object, instance?: string}}`;
+  - `ops_list {instance?: string}`, `ops_describe {op_id: string (enum of the registry ids), instance?: string}`, `instances_list {}`;
+  - generic set only: `call {op_id: string (enum of the registry ids), params: object, reason?: string, instance?: string}`.
+  Full set = 46 op tools + `script_run` + the seven `request_*`/`ops_*`/`instances_list` tools (54); generic set = `call` + the same eight (9). No tool declares an `outputSchema` (§4.6). The server declares only the `tools` capability (`listChanged: false`); no resources, prompts, logging or completions.
+- **PD-119 Annotations (spec: "Read ops `readOnlyHint: true`; Write ops `destructiveHint` as appropriate").** Every op tool and every fixed tool sets `readOnlyHint`, `destructiveHint`, `idempotentHint: false`, `openWorldHint: true` explicitly. Read ops, `script_run` (§2.3: scripts reach only Read ops), `request_await`, `request_status`, `request_list`, `ops_*`, `instances_list`: `readOnlyHint: true`. `request_cancel`: `readOnlyHint: false, destructiveHint: false`. `call`: `readOnlyHint: false, destructiveHint: true` (it can submit any write). Write ops: a CLI-side table `mcp::tools::DESTRUCTIVE` (unit test: it covers every Write op exactly once and no Read op): `destructiveHint: true` for writes that change or remove existing state (`jira.issue.edit`, `jira.issue.transition`, `jira.issue.assign`, `jira.sprint.move_issues`, `jira.backlog.move_issues`, `confluence.page.update`, `confluence.page.move`, `confluence.label.remove`, `confluence.attachment.upload` (it may replace an attachment, M7 PD on collisions)), `false` for purely additive ones (`jira.issue.create`, `jira.comment.add`, `jira.worklog.add`, `jira.issuelink.create`, `confluence.page.create`, `confluence.comment.add`, `confluence.label.add`). The table lives in `cli`, not `registry`, so C.1 is untouched (lead ruling R4: the table, incl. `confluence.attachment.upload` as destructive, is confirmed; no C.1 change).
+- **PD-120 Tool descriptions (spec: registry guidance; the registry has no per-op prose summary).** The description is the generated sentence of PD-118 plus the registry guidance (`WRITE_GUIDANCE`, `JIRA_VERBATIM_GUIDANCE`, "Paginated: continue only from meta.page.next_start."). For `script_run`: "Run a read-only script in the sandbox; the user approves only the final result. Run every new or changed script with dry_run sparse and full first (no approval; results come from documented examples, meta.dry_run: true)." (§12.4 wording); for `request_await`: "Wait for a request's decision (up to ATLAS_DUCK_MCP_TIMEOUT). Never resubmit a pending request." (§12.4); for `request_status`: "Never blocks and never returns data."; for `request_list`: "Metadata only; recover a lost id with match_params." All plan text except the quoted §12.4 fragments. Generated descriptions confirmed by lead ruling R4 (no `summary` field is added to `OperationSpec`).
+- **PD-121 Result mapping (spec §4.6: envelope as `structuredContent`; denials, expiries and failures `isError: true`; timeout text verbatim; edge statuses silent → ledger).** Every tool result is `CallToolResult { structured_content: <envelope>, is_error, content }`:
+  - `is_error` = the CLI exit code of the equivalent command (`exit::exit_for_kind`, T4) is neither 0 nor 4, **or** the envelope is `pending` with `error.details.reason = connection_lost`. So: `denied`, `expired`, `cancelled`, `failed` (every code incl. `busy`, `usage`), `outcome_unknown`, `abandoned`, `result_evicted` (exit 10), a released script error (exit 8) and a dry run with a runtime error (exit 8) are errors; `succeeded`, `released` (exit 0), `pending`/`executing` (exit 4) are not; `request_status` of a known id is never an error (the §4.4 exit-0 rule). Lead ruling R3 confirms that `isError` covers `cancelled`, `abandoned`, `outcome_unknown`, `result_evicted` and the script error (exit 8) besides the spec's "denials, expiries and failures".
+  - `content`: one or two text blocks. First the fixed sentence when one applies: the timeout text "Approval pending. Call request_await with request_id=<id>. Do not resubmit." (§4.6, `<id>` substituted) for a `pending` result of a submitting tool or `request_await`; the restart text "atlas-duck was restarted or upgraded; restart this MCP server (or your MCP client) if this persists" (§4.6 verbatim) per PD-123. Then always one block with the envelope as one JSON line (MCP's backwards-compatibility recommendation; a 16 MiB release therefore appears twice in the frame, accepted).
+- **PD-122 Agent name (spec: "MCP `clientInfo.name` (unverified), overridable by `--agent`"; `ATLAS_DUCK_AGENT` silent).** Precedence `--agent` (source `flag`) > `ATLAS_DUCK_AGENT` (source `env`, the CLI's rule) > `clientInfo.name` (source `mcp-clientInfo`) > none; empty strings count as absent (L118/L131 rule). The name is read once, at the first connect after `initialize`; a later reconnect reuses it. Precedence confirmed by lead ruling R2.
+- **PD-123 Restart text scope (spec: "On `protocol_mismatch`, `unreachable` (incl. `app_upgraded`, `app_shutting_down`, `store_newer`) or a dropped connection").** The restart text is added to every result whose envelope is `protocol_mismatch`, any `unreachable` reason (incl. `not_running`, `launch_timeout`, `no_gui_session`, `launch_blocked_by_job`), or `pending` + `connection_lost`, and to `server_identity` **not** (`server_identity` is its own error code, exit 5, §3.2, not an `unreachable` reason; an owner check, not a restart). Lead ruling R3: §4.6 names `protocol_mismatch`, `unreachable` "incl. `app_upgraded`, `app_shutting_down`, `store_newer`" and "a dropped connection"; where it names reasons the plan follows it, and since "incl." lists examples without excluding any reason, the text goes on **every** `unreachable` reason (also `launch_timeout`, `no_gui_session`, `not_running`, `launch_blocked_by_job`). Every such result is also `isError: true` (§4.6 "answers each tool call with an `isError: true` result"; for `pending` + `connection_lost` PD-121 already says so).
+- **PD-124 Default instance (spec: "`--instance X` sets the default instance for this MCP server").** Applied to every op tool and `call` whose arguments carry no `instance`, and to `request_list.match_params` without `instance` (so a match recomputes the same `params_sha256` as the submit); not to `ops_list`/`ops_describe` (they stay local and app-free unless the call names an instance) and not to `script_run` (§4.4: a script's `instance_id` is null). Lead ruling R6: MCP follows §4.4 even though the CLI today sends its global `--instance` with `script run`; M9 does **not** change the CLI's behaviour (no change to `connected.rs`'s script path, no CLI test changes), and the discrepancy goes to the lead as ledger proposal L164. An alias of the other product gets the app's own answer.
+- **PD-125 Waiting and progress (spec §4.6: notification "immediately after submit (message contains the `request_id`), a heartbeat at least every 10 s, and one on each agent-visible status change"; values and timer silent).** Only when the tool call carries `_meta.progressToken`. One counter per tool call, starting at 0 and incremented by 1 per notification (MCP requires increasing `progress`), never a `total`. Messages: after submit `"submitted request_id=<id> status=pending"`; on a status change relayed from `request.progress` `"request_id=<id> status=<status>"`; heartbeat: no message. Heartbeat period **5 s** (`HEARTBEAT_EVERY`; lead ruling R11), a fixed `tokio::time::interval` started at tool-call receipt (`MissedTickBehavior::Delay`), independent of anything the app sends (opacity). `request_await` gets heartbeats and status changes (no "submitted" notification). Short tools (`request_status`, `request_cancel`, `request_list`, `ops_*`, `instances_list`) send none.
+- **PD-126 Cancellation (spec: "`notifications/cancelled` … stops waiting only").** A cancelled tool call drops its waiting future (the `SharedClient` await call; its server-side await task then ends at its own `timeout_ms`, occupying one of the 48 slots until then: accepted); no `request.cancel` is ever sent; no result is sent for the cancelled id (Task 1 records whether rmcp suppresses it; if not, T9 suppresses it). A cancel that arrives during submission lets the submit call complete (its frame may already be written; C.2 drive-to-completion) and discards its answer.
+- **PD-127 No stderr submission notice in MCP mode (spec: §4.1 notice is a CLI rule; MCP carries the id in the progress notification and the timeout result).** `mcp` writes nothing to stderr after serving starts (MCP clients surface stderr as logs; a quiet channel keeps it content-free). A client that dropped the id recovers it with `request_list {match_params}` (§4.4). Confirmed by lead ruling R7.
+- **PD-128 Session lifecycle.** States `Idle` (no connection yet), `Connected(SharedClient)`, `Closed` (the client reports `is_closed()` or a call returned `ConnectionLost`). A connected tool call in `Idle`/`Closed` runs a single-flight `reach` (a `tokio::sync::Mutex` held across discover → launch → connect → hello; waiters bounded by their own deadlines) and stores the new client; a failure leaves the state unchanged and answers that call only. `ConnectError` maps through the CLI's `connect_error` (busy, `server_identity`, `launch_timeout`, `build_mismatch` with `client_newer` → `app_upgraded`, …). The MCP server never caches a negative answer: the next tool call retries (§4.6 "re-runs the §3.2 checks and `hello` on the next tool call").
+- **PD-129 Test-build seams (spec silent; test-only).** (a) Scripted-approver directives `release-redacted <path>` (open, then `ReleaseRedacted` with one field drop at the path given as the directive's trailing word, wire name `field_loc` (L123), e.g. `atlas-test:release-redacted fields.description` for `jira.issue.get`; the parser already ends the directive name at the first whitespace and the rest is the argument; a missing or refused path is a plain hold, logged as `scripted_approver_error`) and `expire` (the expiry path `Engine::expire_now`). The approver's `DecisionSource` yields only `Arc<dyn DecisionApi>` (`approver.rs:106`) and `Core::engine()` is testing-only, so T12 adds a `#[cfg(feature = "testing")] pub async fn Core::expire_now(&self, request_id: &str) -> bool` and the approver reaches it through the core the managed `ServeSlot` serves (the same handle `ScriptedApp::spawn_for_app` uses); `DecisionApi` is not widened. Both directives exist only under the `scripted-approver` feature like every directive. (b) `ATLAS_DUCK_TEST_SERVER_BUILD_ID`: in a `scripted-approver` build only, `gate::hello` compares against and answers with this value instead of `BUILD_ID`; compiled out otherwise (`#[cfg(feature = "testing")]` on the core side, set by the app only under `scripted-approver`); the feature-leak CI step and a `compile_error!` already keep it out of release builds. Used only by `i41_mcp_app_build_changed_is_error_then_rehandshake`. Lead ruling R9 confirms the test-only override (no second app build).
+- **PD-130 L81 closed in M9.** The Windows launch-stub wait (`launch/stub.rs`) is capped by the caller's remaining deadline (`deadline.cap(STUB_WAIT)`); an expired cap is `launch_timeout`, never a hang (MCP tool calls have a 50 s budget).
+
+Spec deltas the lead records (ledger entries L155–L164 at the end): PD-115, PD-117, PD-121, PD-122, PD-123, PD-125, PD-126, PD-127 (spec gaps); PD-116, PD-118, PD-119, PD-120, PD-128 are plan decisions only; PD-124 is a plan decision plus the CLI discrepancy L164; PD-129 is test-only; PD-130 closes L81.
+
+---
+
+## Review Focus
+
+Five failure modes most likely to bite users of M9's code; each has named tests the reviewer must see pass.
+
+1. **(Tasks 2, 7, 8, 9) No accidental cancel, no lost request.** A cancelled or dropped tool call, a dropped IPC connection, stdin EOF or a signal must never send `request.cancel`; a submit whose frame was written but got no answer is `pending` with `request_id: null` and the L63 message, never `launch_timeout`. Tests `i04_cancelled_notification_stops_waiting_never_cancels`, `shared_client_dropped_call_leaves_stream_framed`, `shared_client_written_flag_per_call`, `submit_lost_after_write_is_pending_unknown_id`, `stdin_eof_cancels_nothing`.
+2. **(Tasks 5, 6, 9) Opacity through MCP.** `structuredContent` equals the IPC envelope (`serde_json::Value` equality); progress notifications carry only the counter, the token and the two fixed message shapes; heartbeats come on the fixed timer whatever the app does. Tests `structured_content_is_the_envelope_unchanged`, `i04_progress_carries_only_request_id_and_status`, `i04_heartbeat_period_independent_of_app_events`, `no_notifications_without_progress_token`.
+3. **(Tasks 6, 13, 16) stdout carries only JSON-RPC.** Every byte the server writes to stdout parses as a JSON-RPC 2.0 message line, also across an auto-launch; the launched app does not hold the client's stdout open. Tests `serve_writes_only_jsonrpc_lines` (rig), `s02_mcp_stdout_only_jsonrpc_on_auto_launch` (CI), `s02_mcp_stdout_closes_when_mcp_exits` (CI), the `print_stdout` deny lint.
+4. **(Tasks 7, 10, 14) Survival and re-handshake.** After an app restart, an upgrade (different `build_id`), `app_shutting_down` or a crash mid-await, the server keeps serving, answers with `isError` + the restart text, re-runs §3.2 and `hello` on the next tool call and succeeds against a matching app; pending requests are recovered with `request_await`/`request_list`, never resubmitted. Tests `i41_mcp_survives_server_restart_and_rehandshakes`, `i41_build_mismatch_is_error_then_recovers`, `i41_connection_drop_mid_await_is_connection_lost`, `i41_mcp_app_restart_rehandshake` (CI), `i41_mcp_app_build_changed_is_error_then_rehandshake` (CI).
+5. **(Tasks 7, 8, 14) The wall-clock deadline from receipt.** A cold start inside a tool call returns within `ATLAS_DUCK_MCP_TIMEOUT` + slack incl. launch; a deadline that expires before submission is `launch_timeout` with nothing queued; the await's `timeout_ms` is the remaining time. Tests `deadline_from_tool_call_receipt_caps_launch_and_hello`, `deadline_before_submit_is_launch_timeout_nothing_queued`, `i17_mcp_cold_start_within_timeout` (CI), `l81_stub_wait_capped_by_deadline`.
+
+Master-plan Review Focus (copied; owners per the master plan):
+- **RF-1 Clock/retention** (M2) — not M9.
+- **RF-2 Oracle** (M3) — M9 must not add a channel: `busy.details.retry_after_s` passes through unchanged (`busy_envelope_passes_through_unchanged`, T8).
+- **RF-3 Cross-host** (M2/M3/M6) — not M9 (the MCP server reads only this host's pinned file through the shared `discover`).
+- **RF-4 Crash reconciliation** (M3/M6) — M9 only guarantees the agent recovers rather than resubmits: `pending_recovered_with_request_list_not_resubmitted` (T14).
+- **RF-5 Identity/anonymous** (M5/M7) — not M9.
+
+---
+
+## §15 items resolved in M9
+
+- **V13 (the `atlas-duck mcp` survival case)** → Task 16 `s02_app_survives_mcp_tree_kill` (Windows CI, `#[ignore]`, `CI=true`) prints `V13 mcp_tree_kill_case=<survived|blocked> app_pid=… shell_window=…`; the lead records the line next to M4's `tree_kill_case` and `job_case`.
+
+**Ledger entries M9 depends on** (master plan M9 "Ledger"): L04 (50 s default, T3/T7), L14 (`script_run {dry_run}` answered from the registry examples, T8, final section), L16 (exact `build_id`, re-handshake, T7, T14), L28 (Windows auto-launch from `atlas-duck mcp`, T16); plus L63 (unknown-id `connection_lost`, T4), L66 (`request_list` agent filter, T8), L67 (`timeout 0` own limits, T3/T7), L73 (`doctor.ipc_accepting` visible only on a long-lived connection: no MCP `doctor` tool in §4.6, so nothing to build; noted), L81 (T11), L131 (reply checks, T4).
+
+---
+
+## Traceability (M9 exit criterion → task → test)
+
+Master-plan exit criterion: `cargo test -p atlas-duck-cli --locked` and the TypeScript conformance project green: I-04, I-05, I-41 (the `atlas-duck mcp` restart case), I-17 (MCP cold start), S-02 (the `atlas-duck mcp` `taskkill /T /F` case and "stdout carries only JSON-RPC when it auto-launches the app"), X-05. "CI" = runs only on GitHub CI legs (compiled locally with `--no-run`). Paths relative to the repo root.
+
+| Id | What M9 must show | Task | Test(s) (file :: fn) |
+|---|---|---|---|
+| §4.6 tools | full set = one tool per op + 8; generic = `call` + 8; names; input schema = params + `reason`/`instance`; no `outputSchema`; annotations; guidance in descriptions; `tools/list` works with no app | T5, T6 | `crates/cli/src/mcp/tools.rs` :: `full_set_has_one_tool_per_op_plus_eight`, `generic_set_is_call_plus_eight`, `tool_names_match_mcp_charset_and_are_unique`, `no_op_param_named_reason_or_instance`, `input_schema_is_params_schema_plus_reason_and_instance`, `no_tool_declares_output_schema`, `annotations_read_only_and_destructive_table`, `descriptions_carry_registry_guidance`, `tool_catalog_golden`; `crates/cli/src/mcp/tests.rs` :: `tools_list_never_connects` |
+| I-04 | MCP test client: heartbeats, timeout result, cancel semantics | T9, T10, T14 | `crates/cli/src/mcp/tests.rs` :: `i04_progress_right_after_submit_names_request_id`, `i04_heartbeat_period_independent_of_app_events`, `no_notifications_without_progress_token`, `i04_status_change_relayed_once`, `i04_progress_carries_only_request_id_and_status`, `i04_timeout_result_is_pending_non_error_with_text`, `i04_cancelled_notification_stops_waiting_never_cancels`, `i04_request_cancel_cancels`, `i04_request_status_never_blocks`; `app/src-tauri/tests/mcp_flows/flows.rs` :: `i04_e2e_heartbeat_timeout_cancel` (CI) |
+| I-05 | official TS SDK client against pending, denied, expired, failed, redacted-released, script-error-released, write; `isError` results; no throw | T15 (+ T23 script case) | `app/src-tauri/tests/mcp_flows/conformance.rs` :: `i05_ts_sdk_conformance` driving `ci/mcp-conformance/conformance.mjs` (CI) |
+| I-16 (MCP) | `request_status` on pending, released, denied-with-details, upstream-error-released, failed-write ids returns at once, never an error | T8, T14 | `mcp/tests.rs` :: `status_of_known_id_is_not_error`; `mcp_flows/flows.rs` :: `i16_mcp_request_status_immediate` (CI) |
+| I-17 (MCP) | cold start: with no app running, a tool call with `ATLAS_DUCK_MCP_TIMEOUT=30` returns within 30 s + slack incl. launch (from receipt); a deadline expiring before submission → `launch_timeout`, nothing queued | T7, T14 | `mcp/tests.rs` :: `deadline_from_tool_call_receipt_caps_launch_and_hello`, `deadline_before_submit_is_launch_timeout_nothing_queued`; `mcp_flows/flows.rs` :: `i17_mcp_cold_start_within_timeout`, `i17_mcp_deadline_before_submit_launch_timeout` (CI) |
+| I-41 (MCP) | `atlas-duck mcp` survives an app restart with a different `build_id`, returns `isError` results and re-handshakes | T7, T10, T12, T14 | `mcp/tests.rs` :: `i41_mcp_survives_server_restart_and_rehandshakes`, `i41_build_mismatch_is_error_then_recovers`, `i41_connection_drop_mid_await_is_connection_lost`, `mcp_never_exits_because_of_the_app`; `mcp_flows/flows.rs` :: `i41_mcp_app_restart_rehandshake`, `i41_mcp_app_build_changed_is_error_then_rehandshake`, `i41_mcp_app_shutting_down_is_error` (CI) |
+| S-02 (MCP) | Windows: `taskkill /T /F` on a live `atlas-duck mcp` that auto-launched the app leaves the app and its pending items alive (or `launch_blocked_by_job` with no app left in the job); the app's parent is never `atlas-duck mcp`; stdout carries only JSON-RPC when it auto-launches | T16, T13 | `mcp_flows/security.rs` :: `s02_app_survives_mcp_tree_kill` (Windows CI, `#[ignore]`), `s02_app_parent_is_not_mcp`, `s02_mcp_stdout_only_jsonrpc_on_auto_launch`, `s02_mcp_stdout_closes_when_mcp_exits`, `s02_mcp_without_console_auto_launches` (Windows) (CI); `mcp/tests.rs` :: `serve_writes_only_jsonrpc_lines` |
+| X-05 | SC1 walk through CLI and MCP with the scripted approver and canaries | T19 (Jira half), T24 (complete) | `mcp_flows/flows.rs` :: `x05_sc1_walk_jira_cli_and_mcp` (CI); T24 `x05_sc1_walk_full_cli_and_mcp` (CI) |
+| V13 (MCP) | survival case evidence line | T16 | `V13 mcp_tree_kill_case=…` printed by `s02_app_survives_mcp_tree_kill` |
+| Δ1 | concurrent calls on one connection | T2 | `crates/ipc/tests/shared_client.rs` :: `shared_client_concurrent_calls_route_by_id`, `shared_client_progress_routed_per_request_id`, `shared_client_dropped_call_leaves_stream_framed`, `shared_client_written_flag_per_call`, `shared_client_closed_fails_all_waiters`, `shared_client_null_id_error_closes`, `shared_client_in_flight_cap` |
+| PD-115 | one connection, one `connection_id` for all tool calls; no reconnect (new approval session) on a per-call error (R1) | T7 | `mcp/tests.rs` :: `concurrent_tool_calls_share_one_connection`, `per_call_error_keeps_the_connection` |
+| PD-116/117 | argv, timeout env, nothing on stdout before serving | T3 | `crates/cli/src/argv.rs` :: `mcp_flags_parse`, `mcp_refuses_timeout_reason_output`; `crates/cli/src/mcp/config.rs` :: `mcp_timeout_env_parse_table`; `crates/cli/src/lib.rs` :: `mcp_usage_error_goes_to_stderr_only` |
+| PD-121/123 | result mapping and restart text | T6 | `crates/cli/src/mcp/result.rs` :: `is_error_table`, `pending_timeout_text_verbatim_with_id`, `restart_text_on_mismatch_unreachable_and_drop`, `structured_content_is_the_envelope_unchanged` |
+| PD-122 | agent-name precedence | T7 | `mcp/tests.rs` :: `hello_is_mcp_with_client_info_name`, `agent_flag_and_env_override_client_info` |
+| PD-124 | default instance | T8 | `mcp/tests.rs` :: `default_instance_fills_op_and_match_params_not_ops_or_script` |
+| L131 | reply checks reused | T4 | `crates/cli/src/flow.rs` :: existing `connected/tests.rs` cases moved unchanged + `mcp/tests.rs` :: `pending_reply_without_id_is_protocol_error`, `await_reply_naming_another_request_is_protocol_error` |
+| L81 | stub wait capped | T11 | `crates/cli/src/launch/stub.rs` :: `l81_stub_wait_capped_by_deadline` |
+| PD-129 | test seams | T12 | `app/src-tauri/src/testing/approver.rs` :: `directive_parsing_table` (extended), `expire_directive_expires_pending_read`, `release_redacted_directive_redacts`; `crates/core/src/gate.rs` :: `test_server_build_id_only_with_testing` |
+| R4/R8/R9/SC1 (MCP halves) | agents request operations, scripts, through MCP | T8, T19, T23, T24 | the I-04/I-05/X-05 rows above |
+
+No M9 task exists without a row here except Task 1 (pins), Task 3's help text, Task 17 (CI), Task 18 (docs and handoffs), Tasks 20–21 (exit run, final review).
+
+---
+
+## File Structure
+
+New and modified files (Create = new file; Modify = existing file).
+
+### Workspace root, CI, docs
+- Modify `Cargo.toml` (workspace pin `rmcp = { version = "=3.5.0", default-features = false }`), `Cargo.lock` (T1).
+- Modify `ci/check-workspace.mjs` + `.test.mjs` only if Task 1 finds a banned crate reachable through a default feature (expected: no change; T1 records the evidence).
+- Create `ci/mcp-conformance/package.json`, `ci/mcp-conformance/package-lock.json` (lead), `ci/mcp-conformance/conformance.mjs`, `ci/mcp-conformance/README.md` (T15).
+- Modify `.github/workflows/ci.yml`, `.gitlab-ci.yml` (comment only) (T17).
+- Modify `docs/superpowers/plans/2026-10-07-atlas-duck-master-plan.md`, the review ledger — **lead only**, never an implementer.
+
+### crates/ipc
+- Modify `src/client.rs` (`into_shared`; the multiplexing reader/writer may live in a new `src/client/shared.rs` if `client.rs` is split into a module dir) (T2).
+- Create `tests/shared_client.rs` (T2).
+
+### crates/registry
+- Modify `src/describe.rs` (`GENERIC_COMMANDS` `mcp` row, Δ2) (T3); Modify `tests/describe.rs` (T3).
+
+### crates/cli
+- Modify `Cargo.toml` (`rmcp`, tokio `io-std`, dev-dep `rmcp` client) (T1).
+- Modify `src/lib.rs` (dispatch `Command::Mcp` to `mcp::run` before the connected path; tests), `src/argv.rs` (`Kind::Mcp`, `Command::Mcp`), `src/local.rs` (drop `mcp` from `not_in_this_build`), `src/help.rs` (`mcp` help) (T3).
+- Create `src/flow.rs` (submit/await/connect envelope rules moved from `connected.rs`), Modify `src/connected.rs` (uses `flow`; `reach` takes a `Hello`), Modify `src/connected/tests.rs` (moved cases keep their names) (T4).
+- Create `src/mcp/mod.rs` (`run`, `serve<T: transport>`), `src/mcp/config.rs` (argv + env → `McpConfig`), `src/mcp/tools.rs` (catalog), `src/mcp/result.rs` (envelope → `CallToolResult`), `src/mcp/server.rs` (`ServerHandler` impl), `src/mcp/session.rs` (PD-128), `src/mcp/call.rs` (tool bodies), `src/mcp/progress.rs` (PD-125), `src/mcp/tests.rs` (rig tests), `src/mcp/rig.rs` (`#[cfg(test)]` in-process rig) (T5–T10).
+- Create `tests/fixtures/mcp_tools_full.json`, `tests/fixtures/mcp_tools_generic.json` (golden, T5).
+- Modify `src/test_support.rs` (Fake: progress notifications on await, a togglable hello refusal/build, restart helper) (T10).
+- Modify `src/launch/stub.rs` (+ the Windows caller in `launch/windows.rs`) (T11).
+
+### crates/core
+- Modify `src/gate.rs` (PD-129 b, `testing` only) (T12).
+
+### app/src-tauri
+- Modify `src/testing/approver.rs` (directives, T12), `src/serve.rs` or the startup path that builds `CoreDeps` (pass the test build id, `scripted-approver` only; T12 names the exact site).
+- Create `tests/mcp_flows.rs` (`#![cfg(feature = "scripted-approver")]`), `tests/mcp_flows/driver.rs` (in-house stdio JSON-RPC driver), `tests/mcp_flows/flows.rs`, `tests/mcp_flows/security.rs`, `tests/mcp_flows/conformance.rs` (T13–T16, T19); `#[path = "cli_flows/harness.rs"] pub mod harness;` (any harness helper added keeps `cli_flows`/`jira_flows`/`confluence_flows` compiling unchanged).
+
+---
+
+## Tasks
+
+Shared conventions (every task): run commands from `C:/Code/atlas-duck` with `-j 4`; the cli rig tests are `cargo test -j 4 -p atlas-duck-cli --locked mcp::`; spawning targets compile with `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --test mcp_flows --no-run` and never run locally; reviewers use `CARGO_TARGET_DIR=<scratchpad>/m9-target`.
+
+### Task 1: Pins (`rmcp`), features, checker evidence, API confirmation
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Modify: `Cargo.toml` (workspace `rmcp`), `Cargo.lock`, `crates/cli/Cargo.toml` (`rmcp = { workspace = true, features = ["server", "transport-io"] }`; tokio gains `io-std` and `rt-multi-thread` (today the crate enables `rt` only: `mcp::run` and the rig tests use the multi-thread flavor); `[dev-dependencies] rmcp = { workspace = true, features = ["client", "transport-async-rw"] }` and `tokio = { workspace = true, features = ["test-util"] }` for the paused-clock heartbeat tests). Record whether `ipc`'s tokio features already unify `rt-multi-thread` for `-p atlas-duck-cli`; do not rely on it.
+
+**Interfaces:**
+- Produces: the pin, the resolved tree, and a report section "rmcp API as pinned" with the exact paths/names of: `ServerHandler` methods used, `Tool` fields (`name`, `description`, `input_schema`, `output_schema`, `annotations`), `ToolAnnotations` fields, `CallToolResult` fields and constructors, how `RequestContext` exposes the cancellation token, the request `_meta.progressToken` and the peer, the progress-notification call and its param struct, how the client's `clientInfo` is read, the stdio transport constructor, `serve_server`/`ServiceExt::serve` entry and how it ends on stdin EOF, `supported_protocol_versions()`, and whether a request cancelled by `notifications/cancelled` still gets a response.
+
+**Spec:** §4.6 ("official Rust SDK `rmcp`"), §2.2 (cli dependency rule), master plan "Unverified, to be pinned … `rmcp` (M9)", Global Constraints "Supply chain".
+
+- [ ] **Step 1: Verify** with WebFetch: `https://crates.io/api/v1/crates/rmcp` (the chosen version is ≥ 14 days old on the day of the task, not yanked; record `rust-version`), `https://crates.io/api/v1/crates/rmcp/3.5.0/dependencies`, docs.rs pages for the items above. Stop and report if `rust-version` > 1.90, if the `server` feature pulls `reqwest`/`hyper`, or if any API fact the PDs rely on is absent (PD-121 `structured_content`, PD-125 progress notification, PD-126 cancellation token).
+- [ ] **Step 2:** One unlocked `cargo build -j 4 -p atlas-duck-cli`; then `--locked` everywhere. `cargo tree -j 4 -p atlas-duck-cli -e normal --locked --prefix none | sort -u` (record the new crates); `node ci/check-workspace.mjs && node --test "ci/*.test.mjs"` (must stay green with no checker change; if a banned crate appears, stop and report: the fix is a feature change, never a checker exemption).
+- [ ] **Step 3: Supply-chain gate (lead ruling R10).** `cargo deny --locked check` and `cargo audit` locally only if they are already installed (never install them); otherwise the gate is the CI `supply-chain` job on the pushed Task 1 commit, and Task 2 does not start before it is green. The gate passes only with **no new ignore, exception, `skip` or `allow` entry in `deny.toml`** (the reviewer checks `git diff master -- deny.toml` is empty); a failure that only a `deny.toml` change would fix is a stop-and-report to the lead, not a fix. `cargo clippy -j 4 -p atlas-duck-cli --all-targets --locked -- -D warnings`.
+- [ ] **Step 4: Commit** `build(cli): pin rmcp for the MCP front end` (+ trailer), pathspecs `Cargo.toml Cargo.lock crates/cli/Cargo.toml`.
+
+---
+
+### Task 2: `ipc::client::SharedClient` (Δ1, PD-115)
+
+**Model:** Opus. Reviewer: Opus.
+
+**Review note (lead ruling R1):** the reviewer must explicitly challenge the accepted cost of PD-115: every close of the shared connection (app restart, but also a server-side close such as `frame_timeout`, a protocol violation, a `null`-id error under Δ1) makes the next tool call open a new connection and therefore a new approval session. The review states which closes `SharedClient` can cause by itself (and whether any of them is avoidable in this task), and reports any close path that would fire in normal operation.
+
+**Files:**
+- Modify: `crates/ipc/src/client.rs` (or split into `crates/ipc/src/client/{mod,shared}.rs`; keep every existing public path)
+- Create: `crates/ipc/tests/shared_client.rs` (reuse `tests/common/mod.rs` server helpers)
+
+**Interfaces:**
+- Consumes: `IpcClient` internals (`read_loop`, `deliver`, `notify`, `encode_request`, `answer_of`, `Closed`), `rpc::frame::write_frame_async`.
+- Produces: Δ1 exactly (`into_shared`, `SharedClient: Clone + Send + Sync`, `Sent<R>`, `call`, `call_with_progress`, `is_closed`, `SHARED_IN_FLIGHT = 48`).
+
+**Spec:** §3.3 (JSON-RPC, 64 MCP-connection limit context, "MCP connections are long-lived"), §4.5 (progress per request), C.2 drive-to-completion rule, PD-16 (`written`), L131.
+
+- [ ] **Step 1: Failing tests** (`shared_client.rs`, in-process server with a scripted handler): `shared_client_concurrent_calls_route_by_id` (10 concurrent `request.status` calls with server-side delays in reverse order each get their own answer); `shared_client_progress_routed_per_request_id` (two concurrent awaits for different ids each see only their own notifications; two awaits for the same id both see them); `shared_client_dropped_call_leaves_stream_framed` (drop a call future mid-flight — before, during and after its frame write, using a slow writer — then a new call succeeds; the late answer is discarded); `shared_client_written_flag_per_call` (`written` false when the call is dropped before its frame was handed to the socket, true after); `shared_client_closed_fails_all_waiters` (server closes: every pending call gets `ConnectionLost`, `is_closed()` true, new calls fail at once); `shared_client_null_id_error_closes` (a `null`-id error with two calls in flight closes the client with `Protocol`); `shared_client_in_flight_cap` (49th concurrent call waits until one finishes; never more than 48 frames outstanding at the server); `shared_client_answer_of_wrong_shape_is_protocol_for_that_call_only`.
+- [ ] **Step 2: Implement.** A writer task owns the write half and writes whole frames from an mpsc queue (each queued item carries a oneshot that reports "handed to the socket", which sets `written`); the reader task routes responses by id from a `HashMap<u64, oneshot::Sender<Response>>` and `request.progress` to every subscriber of that `request_id`; routes are removed by a drop guard; the in-flight semaphore permit lives in the call future. The sequential `IpcClient` keeps its behaviour and tests unchanged.
+- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-ipc --locked` (local-safe: in-process server, no binary), clippy.
+- [ ] **Step 4: Commit** `feat(ipc): SharedClient multiplexes calls over one connection` (+ trailer).
+
+---
+
+### Task 3: `mcp` argv, `ATLAS_DUCK_MCP_TIMEOUT`, help, dispatch (PD-116, PD-117, Δ2)
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Modify: `crates/cli/src/argv.rs`, `crates/cli/src/local.rs`, `crates/cli/src/help.rs`, `crates/cli/src/lib.rs`, `crates/registry/src/describe.rs`, `crates/registry/tests/describe.rs`
+- Create: `crates/cli/src/mcp/mod.rs` (only `pub(crate) fn run(cfg: McpConfig) -> i32` returning a stub exit until Task 6), `crates/cli/src/mcp/config.rs`
+
+**Interfaces:**
+- Produces: `Command::Mcp { tools: ToolSet, instance: Option<String> }` with `GlobalOpts.agent/agent_source` filled (PD-122 flag/env part); `pub(crate) enum ToolSet { Full, Generic }`; `pub(crate) struct McpConfig { tools, instance, agent: Option<String>, agent_source: AgentNameSource, timeout: Option<Duration> /* None = 0 = return pending at once */ }`; `McpConfig::from_env(lookup)`; `lib::run` calls `mcp::run(cfg)` for `Command::Mcp` (no envelope printed on success); a usage failure of `mcp` prints its envelope on stderr only (PD-117).
+
+**Spec:** §4.1 synopsis line, §4.6 (`--tools`, `--instance`, `--agent`, `ATLAS_DUCK_MCP_TIMEOUT` 50 s), §4.2, L04, L67, L118.
+
+- [ ] **Step 1: Failing tests:** `argv.rs` :: `mcp_flags_parse` (`mcp`, `mcp --tools generic`, `mcp --instance x --agent a`, flags in any order), `mcp_refuses_timeout_reason_output` (each → `usage` with the PD-116 message and `details.arg`), `mcp_tools_value_must_be_full_or_generic`; replace `mcp_and_verify_export_parse_to_not_in_this_build` by a `verify-export`-only case; `config.rs` :: `mcp_timeout_env_parse_table` (unset → 50 s, `"0"` → `None`, `"7"`, huge → `MAX_TIMEOUT`, `""`/`"x"`/`"-1"`/`"1.5"`/non-UTF-8 → `usage` naming `ATLAS_DUCK_MCP_TIMEOUT`); `lib.rs` :: `mcp_usage_error_goes_to_stderr_only` (stdout empty, one stderr line, exit 2; through `output::emit_to` with captured writers), `mcp_help_prints_help_on_stdout`, `local_commands_never_connect` keeps `["mcp", "--help"]` and drops plain `["mcp"]`; `registry/tests/describe.rs` :: `generic_commands_include_mcp`.
+- [ ] **Step 2: Implement** (help text for `mcp`: usage, the two tool sets, `ATLAS_DUCK_MCP_TIMEOUT`, "after an atlas-duck upgrade, restart the MCP server" (§12.4 verbatim)).
+- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-cli -p atlas-duck-registry --locked` (local-safe), clippy.
+- [ ] **Step 4: Commit** `feat(cli): atlas-duck mcp argv, timeout variable and help` (+ trailer).
+
+---
+
+### Task 4: Reusable connect/submit/await rules (`flow.rs`); `reach` takes a `Hello`
+
+**Model:** Sonnet (medium). Reviewer: Opus (it moves the PD-16/L63/L131 rules every later task relies on).
+
+**Files:**
+- Create: `crates/cli/src/flow.rs`
+- Modify: `crates/cli/src/connected.rs`, `crates/cli/src/connected/tests.rs`, `crates/cli/src/doctor.rs` (if it calls `reach`)
+
+**Interfaces:**
+- Produces: `pub(crate) async fn reach(connector, hello: &Hello, deadline, intr) -> Result<IpcClient, Box<Envelope>>`; `Connector` gains the `Send` bound (`trait Connector: Send + Sync`) so the MCP server can hold `Arc<dyn Connector + Send + Sync>`; `exit.rs` gains `pub(crate) fn exit_for_kind(kind: CallKind, env: &Envelope) -> i32` (`CallKind::{Submit, Await, Status, Short}`; `exit_for(&Command, ..)` delegates to it) so MCP maps results without building a `Command`; in `flow.rs` (pure, no IO): `connect_error`, `build_mismatch`, `submit_error(ClientError, written)`, `no_reply(written)`, `await_error(ClientError, id, base)`, `connection_lost_pending`, `unknown_request_pending`, `pending_for`, `check_submit_reply(SubmitReply) -> Result<(Envelope, Option<String /* sha */>), Envelope>` (L131: pending without id → `protocol_error`), `check_await_reply(id, Envelope) -> Envelope` (L131: other id → `protocol_error`), `await_timeout_ms(deadline, zero_timeout)`, `script_params(source, args, limits, dry_run)` (unchanged shape). `connected.rs` behaviour is byte-identical.
+
+**Spec:** §4.1, §4.3, §4.4, PD-16, L63, L131, M4 PD-08.
+
+- [ ] **Step 1:** Move code only; the existing `connected/tests.rs` cases keep their names and assertions (the reviewer diffs them: no assertion may change). Add `flow.rs` unit tests for the two L131 checks and `no_reply` (`pending_reply_without_id_is_protocol_error`, `await_reply_naming_another_request_is_protocol_error`, `submit_lost_after_write_is_pending_unknown_id`).
+- [ ] **Step 2: Run** `cargo test -j 4 -p atlas-duck-cli --locked` (local-safe), clippy.
+- [ ] **Step 3: Commit** `refactor(cli): share the connect, submit and await rules with the MCP front end` (+ trailer).
+
+---
+
+### Task 5: Tool catalog from the registry (PD-118, PD-119, PD-120)
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Create: `crates/cli/src/mcp/tools.rs`, `crates/cli/tests/fixtures/mcp_tools_full.json`, `crates/cli/tests/fixtures/mcp_tools_generic.json`
+
+**Interfaces:**
+- Consumes: `registry::{all, get, describe, DescribeEnv, OpClass}`, `local::describe_env()`, rmcp `Tool`/`ToolAnnotations` (T1 report).
+- Produces: `pub(crate) fn catalog(set: ToolSet) -> Vec<Tool>`; `pub(crate) fn tool_name(op_id) -> String`; `pub(crate) fn op_for_tool(name) -> Option<&'static OperationSpec>`; `pub(crate) const FIXED_TOOLS: [&str; 8]`; `pub(crate) const DESTRUCTIVE: &[&str]`; `pub(crate) fn split_op_args(args: Map) -> Result<(Value /*params*/, Option<String> /*reason*/, Option<String> /*instance*/), Envelope /*usage*/>`.
+
+**Spec:** §4.6 tools, generic, annotations, no `outputSchema`, descriptions; §2.3 (generated from the registry, works without an app; guidance sentences), §7.5 (pagination sentence), §12.4.
+
+- [ ] **Step 1: Failing tests** (`tools.rs`): `full_set_has_one_tool_per_op_plus_eight` (54; every registry id present once), `generic_set_is_call_plus_eight` (9), `tool_names_match_mcp_charset_and_are_unique` (`^[A-Za-z0-9_-]{1,64}$`, disjoint from `FIXED_TOOLS` and `call`), `no_op_param_named_reason_or_instance` (and none named `op_id`/`dry_run`), `input_schema_is_params_schema_plus_reason_and_instance` (for every op: properties ⊇ params properties, `required` unchanged, `additionalProperties: false`), `no_tool_declares_output_schema`, `annotations_read_only_and_destructive_table` (every Read op `readOnlyHint: true`; `DESTRUCTIVE` ⊆ Write ops; every Write op either in `DESTRUCTIVE` or in the additive list of PD-119, exactly once), `descriptions_carry_registry_guidance` (each paginated op's description contains "continue only from meta.page.next_start"; each Write op's contains `WRITE_GUIDANCE`), `split_op_args_table` (reason/instance removed and typed; a non-string `reason` → `usage`), `tool_catalog_golden` (serialized `catalog(Full)`/`catalog(Generic)` equal the fixtures; `UPDATE_GOLDEN=1` rewrites them, as M6 PD-74).
+- [ ] **Step 2: Implement** (`schemars` is not used to build schemas: they are the registry JSON plus two properties).
+- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-cli --locked mcp::tools` then the package (local-safe), clippy.
+- [ ] **Step 4: Commit** `feat(cli): MCP tool catalog generated from the registry` (+ trailer).
+
+---
+
+### Task 6: MCP server core, result mapping, stdout discipline (PD-117, PD-121, PD-123)
+
+**Model:** Opus. Reviewer: Opus.
+
+**Files:**
+- Create: `crates/cli/src/mcp/server.rs`, `crates/cli/src/mcp/result.rs`, `crates/cli/src/mcp/rig.rs` (`#[cfg(test)]`), `crates/cli/src/mcp/tests.rs`
+- Modify: `crates/cli/src/mcp/mod.rs`
+
+**Interfaces:**
+- Consumes: T1 API report, T3 `McpConfig`, T5 catalog.
+- Produces: `pub(crate) fn run(cfg) -> i32` (builds a multi-thread tokio runtime with 2 workers, serves stdio until EOF); `pub(crate) async fn serve<R, W>(cfg, connector: Arc<dyn Connector + Send + Sync>, read: R, write: W) -> io::Result<()>` (transport-generic, used by the rig); `struct AtlasMcp` implementing `ServerHandler` (`get_info`: server name `atlas-duck`, version `APP_VERSION`, capabilities tools only; `initialize`: records `clientInfo.name`; `list_tools`: `catalog(cfg.tools)`; `call_tool`: dispatch table to the tool bodies of T8, local answers for `ops_list`/`ops_describe` without `instance` via `local::ops_list()`/`local::ops_describe()`); `result::to_tool_result(kind: ToolKind, env: Envelope) -> CallToolResult` (PD-121/PD-123); unknown tool → `CallToolResult` `isError` with a `usage` envelope (never `Err(McpError)` except for malformed JSON-RPC, which rmcp answers); module root `#![deny(clippy::print_stdout, clippy::print_stderr, clippy::unwrap_used, clippy::expect_used)]`.
+- Rig (`rig.rs`): starts the real `IpcServer` over `test_support::Fake` (Task 10 extends it), a `TestConnector` that reaches it (launch double: never spawns), `serve` over one `tokio::io::duplex` end and an rmcp client (dev-dep) over the other; records every raw line the server writes.
+
+**Spec:** §4.6 (all bullets), §4.2, §4.3 (exit codes behind `is_error`), §4.4 (status exit 0), §13 S-02 (stdout only JSON-RPC).
+
+- [ ] **Step 1: Failing tests:** `result.rs` :: `is_error_table` (one row per §4.3 row incl. `busy`, `result_evicted`, released script error exit 8, dry run exit 8, `cancelled {by_client}`, `abandoned`, `outcome_unknown`, `pending`, `pending + connection_lost`, `executing`; `request_status` of a known `denied` id → not an error), `pending_timeout_text_verbatim_with_id`, `restart_text_on_mismatch_unreachable_and_drop` (each `unreachable` reason, `protocol_mismatch`, `connection_lost`: text present; `server_identity`: absent), `structured_content_is_the_envelope_unchanged` (Value equality, also for an envelope with unknown extra keys), `envelope_json_text_block_always_last`; `tests.rs` (rig) :: `initialize_declares_tools_only`, `tools_list_never_connects` (connector `connect_count() == 0`, no launch), `ops_list_and_describe_answer_locally`, `unknown_tool_is_error_result_not_protocol_error`, `serve_writes_only_jsonrpc_lines` (every recorded server line parses as a JSON-RPC 2.0 response or notification), `stdin_eof_ends_serve_with_ok`.
+- [ ] **Step 2: Implement.** No `println!`/`eprintln!`/`tracing` subscriber in the mcp path.
+- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-cli --locked mcp::` then the package (local-safe: duplex + in-process server), clippy.
+- [ ] **Step 4: Commit** `feat(cli): MCP server core and envelope results` (+ trailer).
+
+---
+
+### Task 7: Session manager: lazy hello, single-flight reconnect, deadline from receipt (PD-115, PD-122, PD-128)
+
+**Model:** Opus. Reviewer: Opus.
+
+**Review note (lead ruling R1):** the reviewer must explicitly challenge the new-approval-session-per-reconnect cost of PD-115 from the session side: `mark_closed` may fire only when the connection is really gone (`is_closed()` or `ConnectionLost`), never on a per-call error (an error answer, a per-call `protocol_error` from a wrong-shaped reply, a deadline expiry, a cancelled tool call), since every spurious reconnect splits the agent's approval session. The test `per_call_error_keeps_the_connection` (below) is the evidence; the review lists every call site of `mark_closed` and why it is a real close.
+
+**Files:**
+- Create: `crates/cli/src/mcp/session.rs`
+- Modify: `crates/cli/src/mcp/server.rs`, `crates/cli/src/mcp/tests.rs`
+
+**Interfaces:**
+- Consumes: T2 `SharedClient`, T4 `flow::reach`/`connect_error`, `deadline::Deadline`, `interrupt::Never`.
+- Produces: `pub(crate) struct Session { state: Mutex<State>, hello: OnceLock<Hello> }` with `async fn client(&self, deadline: &Deadline) -> Result<SharedClient, Envelope>` (single-flight; `Idle`/`Closed` → `reach` → `into_shared`), `fn mark_closed(&self)`, `fn hello_for(cfg, client_info: Option<&str>) -> Hello` (`ClientKind::Mcp`, PD-122 precedence, `cwd_basename` of the process).
+
+**Spec:** §3.2 ("On every connection (including MCP reconnects)"), §3.3 hello, §4.6 waiting ("app launch polling, reconnect and the `hello` handshake count against it"), "App restarts and upgrades", §4.7 launch, L04, L16, L28.
+
+- [ ] **Step 1: Failing tests** (rig): `hello_is_mcp_with_client_info_name` (Fake records `client_kind: mcp`, `agent_name_source: mcp-clientInfo`), `agent_flag_and_env_override_client_info`, `lazy_connect_on_first_connected_tool_call` (no connect after `initialize` or `tools/list`), `concurrent_tool_calls_share_one_connection` (8 concurrent `request_status` calls → one hello, one `connection_id` at the Fake), `single_flight_reconnect` (after the Fake server restarts, 5 concurrent calls cause one new connection), `per_call_error_keeps_the_connection` (an error answer, a wrong-shaped reply for one call, a tool call whose deadline expires mid-await and a cancelled tool call each leave the same `connection_id` at the Fake for the next call: no new hello), `deadline_from_tool_call_receipt_caps_launch_and_hello` (a launch double that blocks for longer than the timeout: the call returns `unreachable {launch_timeout}` within timeout + 1 s), `deadline_before_submit_is_launch_timeout_nothing_queued` (Fake records no submit), `mcp_never_exits_because_of_the_app` (Fake server shut down: tool calls return results, `serve` keeps running until stdin EOF), `stdin_eof_cancels_nothing` (Fake records no `request.cancel` after EOF with an await in flight).
+- [ ] **Step 2: Implement.** `reach` runs in the tool call's task with `Never` interrupts (no CLI signal handlers in MCP mode); a failed attempt leaves `State` unchanged.
+- [ ] **Step 3: Run** rig tests then the package (local-safe), clippy.
+- [ ] **Step 4: Commit** `feat(cli): MCP session with lazy hello and single-flight reconnect` (+ trailer).
+
+---
+
+### Task 8: Tool bodies: op tools, `call`, `script_run`, `request_*`, `ops_*`, `instances_list` (PD-124)
+
+**Model:** Opus. Reviewer: Opus.
+
+**Files:**
+- Create: `crates/cli/src/mcp/call.rs`
+- Modify: `crates/cli/src/mcp/server.rs`, `crates/cli/src/mcp/tests.rs`
+
+**Interfaces:**
+- Consumes: T4 `flow::*`, T5 `split_op_args`, T7 `Session`, `ipc::rpc::{method, IdParams, OpsListParams, OpsDescribeParams, RequestsListParams, EmptyParams}`, `proto::{SubmitParams, AwaitParams, SubmitReply, MatchParams, ListState}`, `registry::SCRIPT_RUN`.
+- Produces: `async fn submit_and_wait(session, method, SubmitParams, deadline, progress: &mut Progress) -> Envelope` (submit; L131 check; `pending` + `timeout == 0` → return; else `request.await` with `timeout_ms` = remaining via `call_with_progress`; `AWAIT_SLACK` as the CLI); `async fn await_tool`, `status_tool`, `cancel_tool`, `list_tool` (agent filter only from the argument, L66), `ops_list_tool`, `ops_describe_tool`, `instances_tool`; every body returns an `Envelope` that T6's `to_tool_result` maps. A call that saw `ConnectionLost` marks the session closed.
+
+**Spec:** §4.6 tools and generic, §3.3 routing fields, §4.4 (`await`/`status`/`cancel`/`requests list`/`match_params`), §9.1/§9.5 (`script.submit` params `{source, args, limits, dry_run?}`), L14, L59, L63, L66, L67, P3, P4.
+
+- [ ] **Step 1: Failing tests** (rig): `op_tool_submits_op_id_params_reason_instance` (Fake `submits[0]` exact), `call_tool_submits_like_op_tool`, `script_run_submits_script_params_without_instance` (`op_id: "script.run"`, `params` = `{source, args, limits?, dry_run?}`, `instance: None`), `script_run_dry_run_values_full_and_sparse`, `default_instance_fills_op_and_match_params_not_ops_or_script`, `pending_reply_without_id_is_protocol_error`, `await_reply_naming_another_request_is_protocol_error`, `status_of_known_id_is_not_error`, `i04_request_status_never_blocks` (Fake status delay 0; returns before any await), `i04_request_cancel_cancels` (Fake records one cancel), `request_list_agent_only_from_argument` (cfg agent set, argument absent → `agent: None`), `busy_envelope_passes_through_unchanged` (`retry_after_s` untouched), `submit_lost_after_write_is_pending_unknown_id` (Fake closes after reading the submit: result `pending`, `request_id: null`, L63 message, `isError` per PD-121 + restart text), `instances_list_and_ops_with_instance_connect`.
+- [ ] **Step 2: Implement.**
+- [ ] **Step 3: Run** rig tests then the package (local-safe), clippy.
+- [ ] **Step 4: Commit** `feat(cli): MCP tool bodies over the shared IPC connection` (+ trailer).
+
+---
+
+### Task 9: Progress, heartbeats, `notifications/cancelled` (PD-125, PD-126)
+
+**Model:** Opus. Reviewer: Opus.
+
+**Files:**
+- Create: `crates/cli/src/mcp/progress.rs`
+- Modify: `crates/cli/src/mcp/call.rs`, `crates/cli/src/mcp/server.rs`, `crates/cli/src/mcp/tests.rs`
+
+**Interfaces:**
+- Consumes: T1 report (progress token, peer notification call, cancellation token), T8 bodies.
+- Produces: `pub(crate) struct Progress { token: Option<ProgressToken>, counter: u32, peer: … }` with `fn submitted(&mut self, id)`, `fn status(&mut self, n: &ProgressNotification)`, `fn heartbeat(&mut self)`; `pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(5)`; the waiting select in `submit_and_wait`/`await_tool`: `biased` cancellation token → heartbeat interval (only with a token) → the IPC call; on cancellation the future is dropped and no result is produced for that id.
+
+**Spec:** §4.5 (only `{request_id, status}`, only on change, content-free heartbeats on a fixed timer), §4.6 (progress after submit with the id, heartbeat ≤ 10 s, change notifications; cancelled stops waiting only).
+
+- [ ] **Step 1: Failing tests** (rig; heartbeat ones with `start_paused`): `i04_progress_right_after_submit_names_request_id`, `i04_heartbeat_period_independent_of_app_events` (Fake emits status changes at irregular times; heartbeats arrive at 5, 10, 15 s of paused time regardless; counter strictly increasing across all notifications), `no_notifications_without_progress_token`, `i04_status_change_relayed_once` (Fake sends `executing` twice: one notification), `i04_progress_carries_only_request_id_and_status` (every notification's params have exactly `progressToken`, `progress`, optional `message` matching the two PD-125 shapes), `i04_timeout_result_is_pending_non_error_with_text` (`ATLAS_DUCK_MCP_TIMEOUT=2`, Fake holds: result `pending`, `isError: false`, first text block is the §4.6 sentence with the id), `i04_cancelled_notification_stops_waiting_never_cancels` (client sends `notifications/cancelled` for the call; the Fake records no `request.cancel`, no response for that id arrives within 2 s, a following `request_await` still works), `cancel_during_submit_completes_submit` (Fake records exactly one submit; no result sent).
+- [ ] **Step 2: Implement.**
+- [ ] **Step 3: Run** rig tests then the package (local-safe), clippy.
+- [ ] **Step 4: Commit** `feat(cli): MCP progress, heartbeats and cancellation` (+ trailer).
+
+---
+
+### Task 10: Survival and restart in the rig (I-41 MCP case, local half)
+
+**Model:** Sonnet (medium). Reviewer: Opus (security-relevant survival semantics).
+
+**Files:**
+- Modify: `crates/cli/src/test_support.rs` (Fake: progress notifications during await on request; a togglable hello build so it can refuse with `protocol_mismatch {server_build}`; a helper that stops the `IpcServer` and binds a fresh one on the same data dir, i.e. an app restart with a new pipe name/socket), `crates/cli/src/mcp/tests.rs`
+
+**Interfaces:**
+- Consumes: T6–T9.
+- Produces: rig helpers `Rig::restart_server(build: &str)`, `Rig::drop_connections()`.
+
+**Spec:** §4.6 "App restarts and upgrades", §3.3 build mismatch texts, §13 I-41 (MCP clause), L16.
+
+- [ ] **Step 1: Failing tests:** `i41_mcp_survives_server_restart_and_rehandshakes` (call succeeds; server restarted same build; next call: one new hello, success), `i41_build_mismatch_is_error_then_recovers` (restart with another build where the client is older: `isError`, `protocol_mismatch`, restart text, `details.client_build/server_build`; client newer: `unreachable {app_upgraded}`; then restart with the matching build: next call succeeds without restarting `serve`), `i41_connection_drop_mid_await_is_connection_lost` (await in flight, server drops connections: result `pending` + `connection_lost`, `request_id` kept, restart text; a later `request_await` reconnects and gets the decision), `i41_app_shutting_down_is_error_with_restart_text` (Fake hello answers `unreachable {app_shutting_down}`).
+- [ ] **Step 2: Implement** the helpers; fix any defect the tests expose in T7/T8 (report it).
+- [ ] **Step 3: Run** `cargo test -j 4 -p atlas-duck-cli --locked` (local-safe), clippy.
+- [ ] **Step 4: Commit** `test(cli): MCP survival across app restarts and upgrades` (+ trailer).
+
+---
+
+### Task 11: L81: deadline-capped launch-stub wait (PD-130)
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Modify: `crates/cli/src/launch/stub.rs`, `crates/cli/src/launch/windows.rs` (the caller that waits for the stub), `crates/cli/src/launch/tests.rs`
+
+**Interfaces:**
+- Produces: the stub wait takes `&Deadline` and waits `deadline.cap(STUB_WAIT)`; an expired cap maps to `launch_timeout`.
+
+**Spec:** §4.1 (each step capped at `min(own limit, remaining)`), §4.6, §4.7 Windows step 2, L81.
+
+- [ ] **Step 1: Failing tests:** `l81_stub_wait_capped_by_deadline` (pure: a wait function over an injected waiter/clock returns after the remaining time, not 5 s), `l81_expired_deadline_never_waits` (Windows-only parts as `#[cfg(windows)]` unit tests that do not spawn a process).
+- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-cli --locked launch::` (local-safe; no process is spawned), clippy. **Step 4: Commit** `fix(cli): cap the launch-stub wait by the deadline (L81)` (+ trailer).
+
+---
+
+### Task 12: Test-build seams: approver directives, server build-id override (PD-129)
+
+**Model:** Sonnet (medium). Reviewer: Opus (it touches the `hello` check; must be provably absent from release builds).
+
+**Files:**
+- Modify: `app/src-tauri/src/testing/approver.rs`, `crates/core/src/gate.rs`, `crates/core/src/core.rs` (`Core::expire_now`, `testing` only), the app site that builds the core/gate dependencies (named in the report), `app/src-tauri/tests/bundle_config.rs` only if its feature-leak assertions need the new name
+
+**Interfaces:**
+- Produces: `Directive::ReleaseRedacted { path: String }`, `Directive::Expire` (the directive enum loses `Copy` if needed; adjust `directive_parsing_table`); `#[cfg(feature = "testing")] Core::expire_now(&self, request_id) -> bool` delegating to `Engine::expire_now`; the approver calls it through the `ServeSlot` core handle; `gate` reads the expected build id through a `testing`-only override set by the app from `ATLAS_DUCK_TEST_SERVER_BUILD_ID` under `scripted-approver` (every hello answer and comparison uses it). The override is read from the **app's own environment at start**: it is not on the §4.7 launch allowlist and the cli `test-env` feature forwards only `ATLAS_DUCK_TEST_HOME`/`ATLAS_DUCK_TEST_KEYSTORE`, so it only takes effect when the harness starts the app itself (`World::start_app` with `WorldOpts::with_env`), never through an auto-launch.
+
+**Spec:** §13 I-05 (expired, redacted-released cases), §13 I-41 (different `build_id`), §3.3; master plan "Test-only code" rule.
+
+- [ ] **Step 1: Failing tests:** `directive_parsing_table` (+ `atlas-test:release-redacted fields.description` → `ReleaseRedacted {path}`, `atlas-test:release-redacted` without a path → `Hold`, `atlas-test:expire`), `expire_directive_expires_pending_read` (core testing harness: the read ends `expired`, `EXPIRED` record), `release_redacted_directive_redacts` (delivered `redacted: true`, `meta.redactions.fields_dropped` non-empty), `test_server_build_id_only_with_testing` (core unit, `#[cfg(feature = "testing")]`; and a compile-time check that the symbol does not exist without the feature, e.g. a `cfg(not(feature = "testing"))` test asserting the plain path compares against `BUILD_ID`).
+- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --lib gate::` and `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --lib testing::` (local-safe), clippy (also `-p atlas-duck-app` without features). **Step 4: Commit** `test(app,core): approver directives and a test-only server build id for the MCP flows` (+ trailer).
+
+---
+
+### Task 13: `mcp_flows` target and the in-house stdio driver
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Create: `app/src-tauri/tests/mcp_flows.rs`, `app/src-tauri/tests/mcp_flows/driver.rs`, `app/src-tauri/tests/mcp_flows/flows.rs` (smoke only in this task)
+- Modify: `app/src-tauri/tests/cli_flows/harness.rs` only for a `World::mcp_spawn(args, extra_env) -> tokio::process::Child` helper (stdin/stdout/stderr piped; every existing test unchanged)
+
+**Interfaces:**
+- Produces: `driver::McpChild { initialize(client_name), list_tools(), call(name, args, progress_token: Option<&str>) -> CallOutcome { result: Value, notifications: Vec<Value> }, cancel(id), raw_stdout_lines() -> Vec<String>, close_stdin() }`; the driver writes newline-delimited JSON-RPC, reads stdout line by line, fails the test on any line that is not a JSON-RPC 2.0 message, and keeps every line (transcript printed on failure; kept for the M10 canary sweep).
+
+**Spec:** §13 I-04 ("via an MCP test client"), S-02, canary sweep "all MCP messages incl. progress notifications" (M10 handoff).
+
+- [ ] **Step 1: Write** `mcp_flows_smoke` (`if !opted_in("mcp_flows_smoke") { return Ok(()); }`; provision Jira; `mcp_spawn(["mcp"])`; initialize; `tools/list` has 54 tools; `jira_issue_get {key, reason: "atlas-test:release"}` → `released`, `isError: false`, envelope in `structuredContent`; close stdin → the child exits 0) and pure driver unit tests (`driver_rejects_non_jsonrpc_line`, `driver_matches_responses_by_id`).
+- [ ] **Step 2: Run locally only** `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --test mcp_flows --no-run` and the pure driver tests (they spawn nothing); a plain run without `ATLAS_DUCK_CLI_FLOWS` prints `skipped:` lines only.
+- [ ] **Step 3: Commit** `test(app): mcp_flows target and stdio MCP driver` (+ trailer).
+
+---
+
+### Task 14: `mcp_flows`: I-04, I-16, I-17, I-41 end to end (CI)
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Modify: `app/src-tauri/tests/mcp_flows/flows.rs`
+
+**Spec:** §13 I-04, I-16, I-17 (MCP), I-41 (MCP), §4.6.
+
+- [ ] **Step 1: Write** (each starts with `opted_in`): `i04_e2e_heartbeat_timeout_cancel` (`ATLAS_DUCK_MCP_TIMEOUT=12`, `atlas-test:hold`, with a progress token: a "submitted" notification naming the id first, ≥ 2 heartbeats, then the pending timeout result with the §4.6 text; `notifications/cancelled` on a second waiting call: no response for it, the request stays pending (`request_status`), `request_cancel` → `cancelled {by_client}` `isError: true`); `i16_mcp_request_status_immediate` (pending, released, denied-with-details, upstream-error-released (`release-status-only`), failed-write ids: each answers within 2 s, `isError: false`); `i17_mcp_cold_start_within_timeout` (no app running, `ATLAS_DUCK_MCP_TIMEOUT=30`, `jira_issue_get` with `atlas-test:release`: result within 30 s + 5 s slack measured from sending the call, app launched); `i17_mcp_deadline_before_submit_launch_timeout` (the M4 `DELAY_STARTUP_FILE` control longer than `ATLAS_DUCK_MCP_TIMEOUT=3`: `unreachable {launch_timeout}`, `isError`, restart text, `requests list` afterwards shows nothing queued); `i41_mcp_app_restart_rehandshake` (call OK; `world.quit_app()`; next call `isError` + restart text or a successful relaunch per the launch rules — assert one of the two and that `serve` still runs; app started again; next call OK); `i41_mcp_app_build_changed_is_error_then_rehandshake` (the harness quits the app and restarts it itself through `World::start_app` with `WorldOpts::with_env("ATLAS_DUCK_TEST_SERVER_BUILD_ID", …)`, never through an MCP auto-launch, which would drop the variable (PD-129); with the override set to another value: `protocol_mismatch`/`app_upgraded` `isError` + restart text; app restarted without it: next call OK, same `atlas-duck mcp` process); `i41_mcp_app_shutting_down_is_error` (quit during a held request: a later call gets `app_shutting_down` or `not_running`, `isError`); `pending_recovered_with_request_list_not_resubmitted` (submit held, kill the app, restart: `request_list {match_params}` finds the id, `request_await` answers `abandoned`; no second `REQUEST_RECEIVED` in the audit records).
+- [ ] **Step 2: Run locally only** `--no-run`. **Step 3: Commit** `test(app): MCP end-to-end flows I-04, I-16, I-17, I-41` (+ trailer).
+
+---
+
+### Task 15: TypeScript SDK conformance (I-05)
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Create: `ci/mcp-conformance/package.json` (`"private": true`, `"type": "module"`, exact pins, `"engines": {"node": ">=22.13"}`, no scripts that run on install), `ci/mcp-conformance/conformance.mjs`, `ci/mcp-conformance/README.md`, `app/src-tauri/tests/mcp_flows/conformance.rs`
+- Lead step: `ci/mcp-conformance/package-lock.json`
+
+**Interfaces:**
+- `conformance.mjs`: reads `ATLAS_DUCK_BIN` (path of `atlas-duck`) and the scenario list from argv/env; uses `Client` + `StdioClientTransport` from the SDK with `env` = the test env passed in by the Rust driver (test home, `ATLAS_DUCK_MCP_TIMEOUT=5`); runs `listTools` (asserts no tool has `outputSchema`) and, per scenario, `callTool` with the directive reason, catching nothing (an exception is a failure); prints one JSON line per scenario `{scenario, isError, status, error_code}` and exits 0 only if every expectation holds.
+- `conformance.rs` :: `i05_ts_sdk_conformance` (opted in **and** `ATLAS_DUCK_MCP_CONFORMANCE=1`, set only by the CI job that ran `npm ci`; provisions Jira, starts the app, spawns `node ci/mcp-conformance/conformance.mjs`, asserts its lines): scenarios `pending` (`hold`, timeout 5 s: `isError: false`, `status: pending`), `denied` (`deny`: `isError: true`), `expired` (`expire`: `expired`, `isError: true`), `failed` (`jira_issue_get` with a key the schema rejects: `failed`/`validation`, `isError: true`), `redacted_released` (`atlas-test:release-redacted fields.description` on `jira_issue_get`: `released`, `redacted: true`, `isError: false`), `write` (`jira_issue_create` with `approve`: `succeeded`, receipt, `isError: false`), `generic_call` (`--tools generic`, `call` of `jira.issue.get` with `release`); `script_error_released` is added in Task 23 (M8).
+
+**Spec:** §13 I-05, §4.6.
+
+- [ ] **Step 1: Verify pins** (WebFetch `https://registry.npmjs.org/@modelcontextprotocol/sdk` `time` map and `https://registry.npmjs.org/zod`): record exact versions ≥ 14 days old and their `dist.integrity`. **Step 2: Write** the files; `node --check ci/mcp-conformance/conformance.mjs` (no install, no run); `cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --test mcp_flows --no-run`. **Step 3: Commit** `test(ci): TypeScript SDK conformance project for the MCP server (I-05)` (+ trailer), pathspecs `ci/mcp-conformance app/src-tauri/tests`.
+- [ ] **Lead step (not the implementer):** `npm --prefix ci/mcp-conformance install --ignore-scripts --save-exact @modelcontextprotocol/sdk@<v> zod@<v>`; check the lockfile holds no install scripts that would need to run; commit `build(ci): lock the MCP conformance dependencies` with pathspecs `ci/mcp-conformance/package.json ci/mcp-conformance/package-lock.json`. The SDK's runtime dependencies (express, hono, …) are test-only and never shipped; `ci/` is their home (lead ruling R8). `npm audit` of this project runs in CI as an **advisory** step (Task 17; lead ruling R8: it reports, it never fails the build) and a finding there is triaged by the lead, not auto-fixed.
+
+---
+
+### Task 16: S-02 for `atlas-duck mcp` (V13 MCP case) (CI)
+
+**Model:** Sonnet (medium). Reviewer: Opus (process-tree and job semantics).
+
+**Files:**
+- Create: `app/src-tauri/tests/mcp_flows/security.rs` (reuse the Toolhelp/job helpers of `cli_flows/security.rs` through the shared harness or a `#[path]` include; move a helper into `harness.rs` only if both targets need it)
+- Audit (read, fix only if wrong): `crates/cli/src/launch/unix.rs`, `crates/cli/src/launch/windows.rs`, `crates/cli/src/launch/stub.rs` for inherited stdout/stderr handles of every intermediate process
+
+**Spec:** §13 S-02 (the `atlas-duck mcp` clauses), §4.7 (no inherited handles, stdio on the null device, detached from the tree and job), §15 V13, L28.
+
+- [ ] **Step 1: Write:** `s02_mcp_stdout_only_jsonrpc_on_auto_launch` (all OS: no app; the first tool call auto-launches; every stdout line of the whole session parses as JSON-RPC); `s02_mcp_stdout_closes_when_mcp_exits` (after the auto-launch, close stdin; the child exits and the stdout pipe reaches EOF within 5 s while the app still runs: no process holds the write end); `s02_app_parent_is_not_mcp` (the app's parent pid ≠ the mcp pid on every OS; Windows: the shell or the stub's exited pid); `s02_mcp_without_console_auto_launches` (Windows: the `atlas-duck mcp` child is spawned with `CREATE_NO_WINDOW`, as desktop MCP clients start servers without a console; the M4 CI step runs `cli_flows` "with pwsh for a console", so console presence matters to some launch/session check: runs in Windows CI, not `#[ignore]`d (lead ruling R13); it asserts that auto-launch succeeds exactly as in the console case and stdout carries only JSON-RPC; see Step 2b for a failure); `s02_app_survives_mcp_tree_kill` (Windows, `#[ignore = "CI: S-02 step"]`, refuses without `CI=true`: `atlas-duck mcp` auto-launches the app while a held request is pending, `taskkill /T /F /PID <mcp>`; the app and the pending item survive (`atlas-duck status <id>` through the CLI), or `launch_blocked_by_job` with no app left in the job; prints `V13 mcp_tree_kill_case=<survived|blocked> app_pid=… shell_window=<some|none>`).
+- [ ] **Step 2:** If the audit finds an inherited stdout handle, fix it in the launch code with a unit test and say so in the report (none expected: §4.7 is M4's).
+- [ ] **Step 2b (lead ruling R13, after the first CI run of Step 1):** if `s02_mcp_without_console_auto_launches` fails, the implementer diagnoses from the CI log (never by running it locally) and reports the cause to the lead. **Cheap fix** (a change confined to `crates/cli/src/launch/` or the MCP session, with a unit test, no new process kind, no change to §4.7's detach rules): fix it in M9 in this task and keep the test asserting success. **Otherwise:** the lead rules the fix out of M9; the test is changed to assert the observed `unreachable` reason (named in the assertion message as the documented limit), the limit and its workaround are added to `docs/release/mcp-client-config.md` (appended if Task 18 already committed it, else handed to Task 18) and to the "Handoffs" section, and a follow-up is recorded for the lead.
+- [ ] **Step 3: Run locally only** `--no-run` and `cargo test -j 4 -p atlas-duck-cli --locked launch::` if launch code changed. **Step 4: Commit** `test(app): S-02 and V13 for atlas-duck mcp` (+ trailer).
+
+---
+
+### Task 17: CI wiring
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Modify: `.github/workflows/ci.yml`, `.gitlab-ci.yml` (comment only: `mcp_flows` and the conformance run on GitHub only, same reason as `cli_flows`)
+
+**Spec:** §13 CI row, master plan "CI gates".
+
+- [ ] **Step 1:** Steps "M9 mcp_flows" on Linux (`CLI_FLOWS_TEST=mcp_flows bash ci/cli-flows-linux.sh`), macOS and Windows (copies of the M5 `jira_flows` steps with `--test mcp_flows`, own log/list/ignored files, `node ci/check-no-skips.mjs … mcp_flows`); the `rust-macos-x86_64-rosetta` job gains the same under `--target x86_64-apple-darwin`; the S-02 `#[ignore]` step on Windows gains `--test mcp_flows -- --ignored s02_` (same `check-no-skips` with an empty ignored list, `grep 'V13 '` echo); a new step on the Linux leg after `npm ci --ignore-scripts --prefix ci/mcp-conformance` (Node 22 via `actions/setup-node` as the `ui` job) sets `ATLAS_DUCK_MCP_CONFORMANCE=1` and runs `--test mcp_flows i05_ts_sdk_conformance` with `check-no-skips` requiring it ran; `npm audit --prefix ci/mcp-conformance --audit-level=high` as an **advisory** step in the supply-chain job (lead ruling R8): `continue-on-error: true`, its output appended to `$GITHUB_STEP_SUMMARY` under the heading "MCP conformance npm audit (advisory)", so a finding is reported and never fails the build; the Rust `cargo deny`/`cargo audit` steps stay blocking.
+- [ ] **Step 2:** `node ci/check-workspace.mjs`, `node --test "ci/*.test.mjs"` (local-safe); YAML reviewed by reading (no local runner). **Step 3: Commit** `ci: M9 mcp_flows, S-02 MCP cases and the TypeScript conformance job` (+ trailer).
+
+---
+
+### Task 18: Docs and handoff texts
+
+**Model:** Haiku (xhigh). Reviewer: Sonnet (medium).
+
+**Files:**
+- Create: `docs/release/mcp-client-config.md` (the §12.4 MCP server config snippet as plan text for M10's onboarding page: command `atlas-duck mcp`, `ATLAS_DUCK_MCP_TIMEOUT` below the client's tool timeout, `--tools generic` for tool-limited clients, "after an atlas-duck upgrade, restart the MCP server" verbatim, `--agent` / `clientInfo.name`, never resubmit a pending request, `request_list` with `match_params`)
+
+**Spec:** §12.4, §4.6.
+
+- [ ] **Step 1: Write**; every fixed sentence copied verbatim from §12.4/§4.6 and marked as such. **Step 2: Commit** `docs: MCP client configuration notes for the onboarding page (M10)` (+ trailer).
+
+---
+
+### Task 19: X-05 SC1 walk, Jira half, through CLI and MCP (CI)
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:**
+- Modify: `app/src-tauri/tests/mcp_flows/flows.rs`
+
+**Spec:** §1.4 SC1, master plan Table 3 X-05, §13 canary sweep (data canaries only in released bytes).
+
+- [ ] **Step 1: Write** `x05_sc1_walk_jira_cli_and_mcp`: the mock Jira serves fixtures carrying a data canary in fields the approver drops and in fields it releases; through the CLI and through MCP: `jira.search` (release), `jira.issue.get` (release-redacted: the dropped field's canary appears in no stdout byte, MCP message or stderr line), `jira.issue.create` and `jira.issue.edit` (approve: the mock received exactly the approved bytes, compared with the `WRITE_APPROVED` request set); a denied write sends nothing to the mock. Confluence and script legs are Task 24.
+- [ ] **Step 2: Run locally only** `--no-run`. **Step 3: Commit** `test(app): X-05 SC1 walk, Jira half, through CLI and MCP` (+ trailer).
+
+---
+
+### Task 20: Exit-criterion run and evidence
+
+**Model:** Sonnet (medium). Runs **after Tasks 22–24** (final section).
+
+- [ ] **Step 1: Locally on Windows** (one cargo at a time, `-j 4`):
+
+```bash
+cargo test -j 4 -p atlas-duck-ipc -p atlas-duck-cli -p atlas-duck-registry --locked
+cargo test -j 4 -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --lib
+cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --lib
+cargo test -j 4 -p atlas-duck-app --features scripted-approver --locked --test mcp_flows --test cli_flows --test jira_flows --test confluence_flows --no-run
+cargo clippy -j 4 --workspace --all-targets --locked -- -D warnings
+cargo clippy -j 4 -p atlas-duck-app --all-targets --features scripted-approver --locked -- -D warnings
+node ci/check-workspace.mjs && node ci/check-no-panic-macros.mjs && node --test "ci/*.test.mjs"
+node --check ci/mcp-conformance/conformance.mjs
+cargo tree -j 4 -p atlas-duck-cli -e normal --locked --prefix none
+```
+
+Expected: every command exits 0; the `atlas-duck-cli` tree contains none of `BANNED_IN_CLI_AND_WORKER`; the app tree shows none of `testing|insecure-test-http|test-paths|test-env|scripted-approver` in a release resolution (feature-leak step).
+- [ ] **Step 2: CI** on GitHub: `rust` (three legs) incl. `cli_flows`, `jira_flows`, `confluence_flows`, `mcp_flows` with no skips, the S-02 step with `mcp_flows` `s02_*` and the `V13 mcp_tree_kill_case` line, the conformance step (`i05_ts_sdk_conformance` ran and passed), `rust-macos-x86_64-rosetta`, `supply-chain` (`cargo deny`/`cargo audit` blocking; the advisory `npm audit` of the conformance project is read and its findings, if any, reported to the lead, R8), `ui`, `bundle`. GitLab for the non-flow jobs. Record run URLs, the commit SHA and the V13 line in the report and in `.superpowers/sdd/<m9 plan>/progress.md`.
+- [ ] **Step 3:** Ask the lead to update the master plan M9 `Status:` after the final review and to apply the ledger entries.
+
+---
+
+### Task 21: Final whole-branch review
+
+**Model:** Opus (read-only review; fixes go to a Sonnet/Opus fix round per finding). Runs last.
+
+**Scope:** `master..m9-mcp-front-end`. Re-check Review Focus 1–5 against code and tests; the §4.6 bullets one by one against `mcp/`; that nothing writes to stdout in MCP mode outside rmcp; that no path sends `request.cancel` except `request_cancel`; that `structuredContent` is never altered; the heartbeat timer's independence from app events; `SharedClient` cancellation safety (no torn frame, no leaked route, no stuck permit); the session single-flight and its deadline bounds; `--instance` and agent-name rules; the test seams' absence from release builds; the traceability table (every row's tests exist, are not vacuous, and the CI-only ones ran with no skips). Output `.superpowers/sdd/<m9 plan>/final-review.md` in the M5 format (Evidence, Critical, Important, Minor, deferred-items decisions, verdict).
+
+---
+
+## M7/M8-dependent tasks (reconcile when merged)
+
+The front end is generic: tools derive from `registry::all()` (which already holds all 46 ops, including the 18 Confluence ops) and `script_run` submits `script.submit` exactly as the CLI does, so Tasks 1–19 need neither M7 nor M8 code. What needs them is end-to-end evidence: Confluence executors (M7) and the real sandbox runner (M8). These tasks run after Tasks 1–19 and before Tasks 20–21. **Reconcile step for each:** before dispatching, the lead (or the implementer, reading only) checks the merged M7/M8 plans and code for the items marked "assumed" and adjusts the task text; any registry data correction M7 made changes the tool catalog golden (`UPDATE_GOLDEN=1` once, reviewed diff limited to the corrected ops).
+
+### Task 22 (M7): Confluence tools end to end
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Assumed from the M7 draft:** `confluence_flows` exists over the `cli_flows` harness with `MockDc` Confluence fixtures (`user/current` known, page `65537`), the approver directives `release`, `approve`, `deny`, `deny-hint` suffice (M7 draft Task 24), `confluence.page.update` needs `base_version`, Markdown bodies are converted and placeholder-checked app-side (`markdown_placeholders`, exit 2).
+
+**Files:** Modify `app/src-tauri/tests/mcp_flows/flows.rs`; `crates/cli/tests/fixtures/mcp_tools_*.json` only if M7 corrected registry data.
+
+- [ ] **Step 1:** `confluence_tools_end_to_end`: `confluence_page_get {id, format: "markdown"}` (release → `data.result.body.format == "markdown"`, `meta.conversion` present), `confluence_page_update` with a stale `base_version` (deny with the conflict hint → `denied`, `isError: true`), `confluence_page_update` Markdown body with a placeholder (`failed`/`markdown_placeholders`, `isError`), `confluence_search` (paginated: tool description carries the next_start sentence; `meta.page` passes through unchanged). **Step 2:** `--no-run` locally; CI evidence in Task 20. **Step 3: Commit** `test(app): Confluence tools through MCP` (+ trailer).
+
+### Task 23 (M8): `script_run` end to end; I-05 script case; I-41 sandbox case through MCP
+
+**Model:** Sonnet (medium). Reviewer: Opus (dry-run data-freeness, release-gated script errors).
+
+**Assumed (no M8 draft existed at writing time):** M8 delivers the real `ScriptRunner` in the app so that `script.submit` runs (dry runs from the dry-run pool, answered from `result_example`/`result_example_sparse`, `meta.dry_run: true`, exit 0 with `{result, logs}` or exit 8 with `{script_error}`, L14); real runs end in a release item; a released script error is `released` + `data.script_error`, exit 8; `request_cancel` of a `Running` script gives the identical `cancelled {by_client}` envelope (L19); a replaced sandbox binary gives `failed`/`sandbox_unavailable` `{reason: app_upgraded}`, exit 8, `retryable: true` (I-41 sandbox half, M8's test); the scripted approver's `approve`/`release` act on script items. If M8 names any of these differently, the reconcile step rewrites the assertions, never the PD-121 mapping without a lead ruling. **Lead ruling R12:** these assumptions stay as written and are each marked for reconciliation: before dispatch, the reconcile step checks every one against the merged M8 plan and code and records "confirmed" or the M8 name/shape next to it in the task report.
+
+**Files:** Modify `app/src-tauri/tests/mcp_flows/flows.rs`, `ci/mcp-conformance/conformance.mjs` (+ the scenario in `conformance.rs`), `crates/cli/src/mcp/tests.rs` (rig assertions for the exit-8 rows if M8 changed an envelope shape).
+
+- [ ] **Step 1:** `script_run_dry_run_full_and_sparse` (no approval, `succeeded`, `meta.dry_run: true`, `isError: false`; a script throwing at runtime: exit-8 class → `isError: true` with `data.script_error`; the mock records **no HTTP request**), `script_run_real_run_released` (multi-call read script, `release`: `released`, result), `script_error_released_is_error_result` (the approver releases error details: `released`, `isError: true`), `script_cancel_running_identical_envelope`, `i41_sandbox_replaced_is_error_with_retryable` (if M8's harness can replace the sandbox binary in CI; else cite M8's own I-41 test and assert only the PD-121 mapping in the rig); conformance scenario `script_error_released` (TS client does not throw on the `isError` result). **Step 2:** `--no-run` locally; `node --check`. **Step 3: Commit** `test(app): script_run through MCP; I-05 script case` (+ trailer).
+
+### Task 24 (M7 + M8): X-05 complete
+
+**Model:** Sonnet (medium). Reviewer: Sonnet (medium).
+
+**Files:** Modify `app/src-tauri/tests/mcp_flows/flows.rs`.
+
+- [ ] **Step 1:** `x05_sc1_walk_full_cli_and_mcp`: Task 19's Jira walk plus `confluence.page.get` (release), a multi-call read script over Jira and Confluence (release), `confluence.page.update` (approve; mock received exactly the approved storage bytes), through the CLI and through MCP, with canaries in dropped and released fields: canaries only in bytes equal to a `*_RELEASED` payload; no write without its `WRITE_APPROVED`. **Step 2:** `--no-run` locally; CI evidence in Task 20. **Step 3: Commit** `test(app): X-05 SC1 walk through CLI and MCP` (+ trailer).
+
+---
+
+## Execution order and dependencies
+
+All cargo work is sequential (one cargo process at a time); tasks marked parallel-safe may be written while another task's cargo runs only if they edit disjoint files and wait for the cargo slot before compiling.
+
+```
+T1 ─► T2 ─┐
+T1 ─► T3 ─┼─► T4 ─► T5 ─► T6 ─► T7 ─► T8 ─► T9 ─► T10
+          │
+T11 (launch; after T4, parallel-safe with T5–T10: different files)
+T12 (app/core seams; after T1, parallel-safe with T2–T11)
+T10, T12 ─► T13 ─► T14 ─┬─► T16
+                        ├─► T15 (+ lead npm step)
+                        └─► T19
+T14, T15, T16 ─► T17
+T18 (docs; any time, no cargo)
+T19 ─► T22 (M7) ─► T23 (M8) ─► T24 ─► T20 ─► T21
+```
+
+No lead answer blocks a task (rulings R1–R13 of 2026-10-16 are applied). Gates that remain: Task 2 starts only after Task 1's supply-chain gate is green (R10); Task 15's lead npm step precedes the conformance CI run; Task 16 Step 2b may need a lead decision after the first Windows CI run (R13).
+
+---
+
+## Self-review checklist (run before handing the plan to implementers)
+
+- Every row of the Traceability table names a task that lists that test in its Step 1 (§4.6 tools T5/T6; I-04 T9/T10/T14; I-05 T15/T23; I-16 T8/T14; I-17 T7/T14; I-41 T7/T10/T12/T14 (+T23 sandbox case); S-02 T6/T16; X-05 T19/T24; V13 T16; Δ1 T2; PD-115 T7; PD-116/117 T3; PD-121/123 T6; PD-122 T7; PD-124 T8; L131 T4/T8; L81 T11; PD-129 T12).
+- No task depends on a later task's code; T20/T21 run after the final section by design.
+- Contract deltas Δ1–Δ3 are applied to the master plan before Task 1; the ledger entries below are recorded before the tasks that implement them merge (T2: PD-115; T3: PD-116/117; T6: PD-121/123; T7: PD-122; T9: PD-125/126/127).
+- Opus tasks: T2, T6, T7, T8, T9, T21 (+ their reviews and the Opus reviews of T4, T10, T12, T16, T23). Haiku only for T18.
+- Nothing asks an implementer to run an installer, `npm install`/`npm ci`, `cargo install`, a registry/ACL change, a kill, `atlas-duck-app`, `atlas-duck mcp`, `node` on the conformance project, the spawning `cli_flows`/`jira_flows`/`confluence_flows`/`mcp_flows`/`e2e` flows, or the `#[ignore]`d S-02 cases; the one npm step is the lead's (Task 15).
+- Existing behaviour is reused, not rebuilt: `connected::reach`, `launch::ensure_running`, `connect_error`, `build_mismatch`, the L63/L131 rules, `exit::exit_for`, `local::ops_list`/`ops_describe`, `registry::describe`, the `cli_flows` harness, `MockDc`, the scripted approver.
+- Every spec-silent choice is a PD and, where it changes agent-visible behaviour, carries a lead ruling (section "Lead rulings (2026-10-16)").
+
+---
+
+## Handoffs (to later milestones)
+
+- **M10:** the canary sweep (S-16) covers "all MCP messages incl. progress notifications": the `mcp_flows` driver keeps every stdout line per flow (Task 13), so the sweep adds its canary assertions over those transcripts; the onboarding page (§12.4, X-14) takes the MCP config snippet from `docs/release/mcp-client-config.md` (Task 18); installed-package checks run `atlas-duck mcp --help` and one `tools/list` through the installed binary (packaging); L73 stays a documented proxy (no MCP `doctor` tool in §4.6).
+- **Live (human):** none new; a manual check with one real MCP client (e.g. a desktop agent) listing 54 tools and approving one write is worth one line in the release checklist (lead's call).
+
+---
+
+## Ledger entries the lead adds (L155–L164, the M9 allocation)
+
+- **L155** (PD-115, §3.3, §4.6; R1) One long-lived IPC connection per `atlas-duck mcp` process, shared by all concurrent tool calls through `ipc::client::SharedClient` (≤ 48 calls in flight); a new connection only after it closed (never on a per-call error). Keeps one approval session and one agent key per MCP server; accepted cost: every reconnect starts a new approval session for the same MCP server.
+- **L156** (PD-117, §4.2, §4.6, §13 S-02; R5) `atlas-duck mcp` prints nothing on stdout before serving: a usage error goes to stderr as one envelope line, exit 2; `--help` prints on stdout as every `--help`. After serving starts stdout carries only JSON-RPC; exit 0 on stdin EOF. `ATLAS_DUCK_MCP_TIMEOUT=0` returns `pending` at once.
+- **L157** (PD-121, PD-123, §4.6; R3) `isError` = the CLI exit code of the equivalent command is neither 0 nor 4 (so also `cancelled`, `abandoned`, `outcome_unknown`, `result_evicted`, script error exit 8), or the envelope is `pending` + `connection_lost`; `content` = the fixed §4.6 sentence when one applies, then the envelope as one JSON line; `structuredContent` = the envelope unchanged. The restart text accompanies `protocol_mismatch`, **every** `unreachable` reason (incl. `launch_timeout`, `no_gui_session`) and `pending` + `connection_lost`; not `server_identity` (exit 5, not an `unreachable` reason).
+- **L158** (PD-122, §4.6; R2) MCP agent name precedence: `--agent` > `ATLAS_DUCK_AGENT` > `clientInfo.name` > none; read once at the first connect.
+- **L159** (PD-125, §4.5, §4.6; R11) Progress only with a `progressToken`: a per-call counter, "submitted request_id=<id> status=pending", "request_id=<id> status=<status>", heartbeats without a message every 5 s on a timer started at tool-call receipt.
+- **L160** (PD-126, §4.6) A cancelled tool call drops its wait, sends no `request.cancel` and no result; an interrupted submit completes and its answer is discarded.
+- **L161** (PD-127, §4.1, §4.6; R7) No stderr submission notice in MCP mode.
+- **L162** (PD-130, L81) The launch-stub wait is capped by the caller's deadline; L81 closed in M9.
+- **L163** (PD-129; R9) Test-only seams: approver directives `release-redacted <path>`, `expire`; `ATLAS_DUCK_TEST_SERVER_BUILD_ID` under `scripted-approver`/`core/testing` only.
+- **L164** (PD-124, §4.4, §4.6; R6) **CLI discrepancy, open for a later milestone:** §4.4 says a script's `instance_id` is null, and MCP `script_run` follows it (no default instance applied), but the CLI sends its global `--instance` with `script run` (`crates/cli/src/connected.rs`). M9 leaves the CLI unchanged. Aligning the CLI would change the `params_sha256` of scripts submitted with `--instance` (a `request_list {match_params}` computed one way would not match a submit made the other way); the lead decides the owner milestone and whether the spec or the CLI moves.
+
+---
+
+## Spec-silent items for the lead (summary)
+
+PD-115 (one multiplexed connection, R1), PD-116 (`mcp` flags and the timeout variable, R5), PD-117 (nothing on stdout before serving, R5), PD-119 (destructive table, R4), PD-120 (descriptions, R4), PD-121 (`isError` and content blocks, R3), PD-122 (agent-name precedence, R2), PD-123 (restart-text scope, R3), PD-124 (default-instance scope, R6), PD-125 (progress values, heartbeat period and messages, R11), PD-126 (cancellation details), PD-127 (no stderr notice, R7), PD-129 (test seams, R9). All ruled; none is open.
+
+---
+
+## Lead rulings (2026-10-16)
+
+The lead ruled on the draft's open questions Q1–Q13 on 2026-10-16; ruling Rn answers Qn. The PDs, tasks and ledger proposals above already follow them; no ruling blocks a task.
+
+1. **R1 IPC connection model → PD-115, Δ1, Tasks 2 and 7.** One shared, multiplexed connection through `ipc::client::SharedClient`, as recommended (not one connection per tool call). The reviewers of Tasks 2 and 7 must challenge the accepted cost: every reconnect starts a new approval session for the same MCP server. Applied as the review notes of Tasks 2 and 7 and the test `per_call_error_keeps_the_connection`.
+2. **R2 Agent name → PD-122, Task 7.** Yes: `--agent` > `ATLAS_DUCK_AGENT` > `clientInfo.name`.
+3. **R3 `isError` and the restart text → PD-121, PD-123, Task 6.** `isError` also covers `cancelled`, `abandoned`, `outcome_unknown`, `result_evicted` and the script error (exit 8). The restart text follows §4.6 literally: where §4.6 names reasons, the plan follows it; where it is silent, the text goes on every `unreachable` reason, `launch_timeout` and `no_gui_session` included. Re-reading §4.6 confirms PD-123: it names `protocol_mismatch`, `unreachable` "incl. `app_upgraded`, `app_shutting_down`, `store_newer`" and "a dropped connection", and excludes no `unreachable` reason. `server_identity` keeps no restart text, because it is its own error code (exit 5, §3.2) and not an `unreachable` reason.
+4. **R4 Descriptions and `destructiveHint` → PD-119, PD-120, Task 5.** Generated descriptions are confirmed, and so is the PD-119 destructive table, with `confluence.attachment.upload` as destructive. No C.1 change.
+5. **R5 Usage errors and the timeout variable → PD-116, PD-117, Task 3.** Yes: usage errors go only to stderr, and `ATLAS_DUCK_MCP_TIMEOUT=0` returns `pending` at once.
+6. **R6 `--instance` scope → PD-124, Task 8.** MCP follows §4.4: a script's `instance_id` is null, and `--instance` is the default only where PD-124 lists it. CLI behaviour does **not** change in M9. The CLI discrepancy is ledger proposal L164.
+7. **R7 Stderr notice → PD-127.** No stderr submission notice in MCP mode.
+8. **R8 Conformance project → Tasks 15 and 17.** `npm audit` of `ci/mcp-conformance` is advisory: it reports and does not block. `ci/` is the right home. The lead does the npm install.
+9. **R9 Different `build_id` → PD-129, Task 12.** The test-only server build-id override, `ATLAS_DUCK_TEST_SERVER_BUILD_ID`, as recommended.
+10. **R10 Pins → Dependency pins, Task 1.** Take `rmcp =3.5.0`, which is 18 days old and passes the 14-day rule, with default features off. `schemars`, `uuid` and `pastey` are acceptable only if `cargo deny` passes with no new ignores. Task 1 verifies this (Step 3 is a gate before Task 2).
+11. **R11 Heartbeat → PD-125, Task 9.** A 5 s heartbeat is fine.
+12. **R12 M8 shape → Task 23.** Keep Task 23's assumptions and mark them for reconciliation. Task 23's reconcile step checks each one against the merged M8 plan and code.
+13. **R13 Windows without a console → Task 16.** Test the no-console variant in CI (`s02_mcp_without_console_auto_launches`, not ignored). Fix it in M9 if the fix is cheap, otherwise document the limit (Task 16 Step 2b).
