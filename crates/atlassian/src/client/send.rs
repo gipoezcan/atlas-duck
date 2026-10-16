@@ -615,12 +615,13 @@ pub(crate) async fn read_body(
     deadline: Instant,
     cap: u64,
 ) -> BodyRead {
-    // The announced length, never more than the cap allows: a server cannot make this reserve
-    // more than the read may hold anyway.
-    if let Some(n) = resp.content_length() {
-        ctl.reserve_partial(usize::try_from(n.min(cap)).unwrap_or(0));
-    }
+    // The announced length, never more than the read may hold (the cap plus the one byte that
+    // proves it was passed): a server cannot make this reserve more, and an over-cap body does
+    // not reallocate at its last byte.
     let limit = usize::try_from(cap.saturating_add(1)).unwrap_or(usize::MAX);
+    if let Some(n) = resp.content_length() {
+        ctl.reserve_partial(usize::try_from(n).unwrap_or(usize::MAX).min(limit));
+    }
     loop {
         let next = tokio::select! {
             biased;

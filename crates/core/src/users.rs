@@ -60,7 +60,8 @@ const USER_PATH: &str = "/rest/api/user";
 
 /// A direct read's content (at most the 32 MiB response cap) and all its lookups fit in the
 /// 50 MiB read byte cap, so the byte rule never closes a direct read's pass early by default.
-const _: () = assert!(32 * 1024 * 1024 + MAX_LOOKUPS as u64 * MAX_LOOKUP_BYTES <= 50 * 1024 * 1024);
+const _: () =
+    assert!(32 * 1024 * 1024 + MAX_LOOKUPS as u64 * (MAX_LOOKUP_BYTES + 1) <= 50 * 1024 * 1024);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -141,7 +142,9 @@ fn expired(at: UtcInstant, now: UtcInstant) -> bool {
 
 impl UserCache {
     /// The cached answer for `key` of `instance_id` (`Some(None)`: the user does not exist), or
-    /// `None` when nothing usable is cached. Never awaits.
+    /// `None` when nothing usable is cached. Never awaits. Tests only: a pass reads through
+    /// [`UserCache::snapshot`].
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn get(
         &self,
         instance_id: &str,
@@ -170,7 +173,8 @@ impl UserCache {
         (users.generation, hits)
     }
 
-    /// The instance's current generation (what a pass starting now would read).
+    /// The instance's current generation (what a pass starting now would read). Tests only.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn generation(&self, instance_id: &str) -> u64 {
         lock(&self.inner)
             .get(instance_id)
@@ -214,7 +218,9 @@ impl UserCache {
     }
 
     /// PD-99: forgets every entry of `instance_id` (its PAT or its origin changed) and starts a
-    /// new generation, so a lookup still in flight from before stores nothing.
+    /// new generation, so a lookup still in flight from before stores nothing. The (then empty)
+    /// entry stays for the life of the process: removing it would reset the generation to 0 and
+    /// let a stale lookup store its answer (ABA).
     pub(crate) fn clear(&self, instance_id: &str) {
         let mut g = lock(&self.inner);
         let users = g.entry(instance_id.to_owned()).or_default();
@@ -416,6 +422,7 @@ pub(crate) async fn resolve_users(
     // Once closed (the cap, the budget's reserve, the byte cap), no lookup starts again in this
     // read.
     let mut open = true;
+    let reserve = lookup_reserve(p);
     for key in keys {
         if let Some(hit) = hits.remove(key) {
             map.insert(key.clone(), hit);
@@ -423,8 +430,8 @@ pub(crate) async fn resolve_users(
         }
         if open
             && (sent >= MAX_LOOKUPS
-                || used.saturating_add(MAX_LOOKUP_BYTES) > p.max_bytes
-                || p.deadline.saturating_duration_since(Instant::now()) < LOOKUP_RESERVE)
+                || used.saturating_add(MAX_LOOKUP_BYTES + 1) > p.max_bytes
+                || p.deadline.saturating_duration_since(Instant::now()) < reserve)
         {
             open = false;
         }
@@ -445,6 +452,16 @@ pub(crate) async fn resolve_users(
         users: map,
         bytes: used,
     })
+}
+
+/// [`LOOKUP_RESERVE`]; a test hook shortens it (T11 fix review m-4).
+fn lookup_reserve(p: &Pass<'_>) -> Duration {
+    #[cfg(feature = "testing")]
+    if let Some(r) = p.engine.hooks().lookup_reserve {
+        return r;
+    }
+    let _ = p;
+    LOOKUP_RESERVE
 }
 
 /// One `GET /rest/api/user?key=<key>`, recorded and committed before the pass goes on; gives the

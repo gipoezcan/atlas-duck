@@ -1828,12 +1828,22 @@ async fn cancel_after_host_call_lookup_answered_records_it_once() -> TestResult 
 /// T11 review I-2: a host call's lookup bytes count toward `max_fetch_mb` (added to the run's
 /// counter before the call returns; the call's `bytes` stay the content's), and no lookup starts
 /// once another full lookup answer could pass what is left of the limit. The second page leaves
-/// one byte less than a lookup answer may hold, counting the first call's lookups.
+/// room for exactly one lookup answer (64 KiB); a cut answer holds `MAX_LOOKUP_BYTES + 1` bytes,
+/// so the rule asks for that much room (T11 fix review m-3). The first call's lookups count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_call_lookup_bytes_count_toward_max_fetch_mb() -> TestResult {
+    lookup_byte_rule(64 * 1024, false).await
+}
+
+/// The same with one byte more room: the lookup starts (kills `>` -> `>=` at the byte rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn host_call_lookup_starts_with_room_for_a_cut_answer() -> TestResult {
+    lookup_byte_rule(64 * 1024 + 1, true).await
+}
+
+/// `room`: the bytes of `max_fetch_mb` left to the second call.
+async fn lookup_byte_rule(room: usize, looked_up: bool) -> TestResult {
     use common::confluence::{mount_page, mount_users, page_with_storage, user, user_gets};
-    // `users::MAX_LOOKUP_BYTES`.
-    const LOOKUP_CAP: usize = 64 * 1024;
     const FETCH_CAP: usize = 1024 * 1024;
     let get = |call: u64, id: &str| host_call(call, "confluence.page.get", json!({ "id": id }));
     let runner = FakeScriptRunner::new(vec![ScriptPlan::new(
@@ -1863,7 +1873,7 @@ async fn host_call_lookup_bytes_count_toward_max_fetch_mb() -> TestResult {
     let mut second = page_with_storage(r#"<p><ri:user ri:userkey="key-third"/></p>"#);
     second["title"] = json!("");
     let base = second.to_string().len();
-    let s2 = FETCH_CAP - s1 - l1 - LOOKUP_CAP + 1;
+    let s2 = FETCH_CAP - s1 - l1 - room;
     second["title"] = json!("x".repeat(s2 - base));
     assert_eq!(second.to_string().len(), s2);
     mount_page(mock, "65538", &second).await;
@@ -1889,11 +1899,16 @@ async fn host_call_lookup_bytes_count_toward_max_fetch_mb() -> TestResult {
     );
     assert_eq!(one["bytes"], json!(s1), "the content only");
     assert_eq!(two["rejection"], Value::Null, "{two}");
-    assert_eq!(two["user_resolutions"], json!({ "key-third": null }));
+    let third = if looked_up {
+        json!("third")
+    } else {
+        Value::Null
+    };
+    assert_eq!(two["user_resolutions"], json!({ "key-third": third }));
     assert_eq!(
         user_gets(mock).await.len(),
-        2,
-        "key-third is never looked up"
+        if looked_up { 3 } else { 2 },
+        "key-third is looked up only with room for a cut answer"
     );
     Ok(())
 }

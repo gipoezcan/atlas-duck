@@ -368,20 +368,6 @@ async fn u04_pagination_stays_under_context_path() -> TestResult {
     Ok(())
 }
 
-/// The most the mock hands the client in one read: wiremock gives hyper the whole body, which
-/// writes it in pieces up to this size (no chunk constant exists in the mock itself).
-const MOCK_WRITE_CHUNK: usize = 512 * 1024;
-
-/// How far past the 50 MiB cap the cut page may reach: `max(512 KiB, 2 x MOCK_WRITE_CHUNK)`, which
-/// is 1 MiB with the chunk above. One read normally returns one written piece, but it can return
-/// several: the macOS arm64 CI run at `66fdca1` saw the cut 580 KB past 512 KiB, so the bound is
-/// twice the chunk.
-const FETCH_CAP_TOLERANCE: usize = if 2 * MOCK_WRITE_CHUNK > 512 * 1024 {
-    2 * MOCK_WRITE_CHUNK
-} else {
-    512 * 1024
-};
-
 #[tokio::test]
 async fn fetch_cap_50mib() -> TestResult {
     let dc = MockDc::start(Product::Confluence, "").await;
@@ -411,14 +397,10 @@ async fn fetch_cap_50mib() -> TestResult {
     match out.failure {
         Some(FetchFailure::PostSend { kind, received }) => {
             assert_eq!(kind, PostSendKind::FetchCap50MiB);
-            // Page 3 was cut where the 50 MiB were exceeded, by at most one read chunk.
+            // Page 3 was cut at the byte that shows the 50 MiB were exceeded (T11 review I-2),
+            // not at the end of the read chunk that crossed it.
             let left = 50 * MIB - complete;
-            assert!(received.len() > left, "{} vs {left}", received.len());
-            assert!(
-                received.len() <= left + FETCH_CAP_TOLERANCE,
-                "{} vs {left}",
-                received.len()
-            );
+            assert_eq!(received.len(), left + 1);
         }
         other => return Err(format!("{other:?}").into()),
     }

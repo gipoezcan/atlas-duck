@@ -166,6 +166,9 @@ pub struct TestHooks {
     /// A user lookup pass (PD-99) holds after its last lookup was committed, before the read
     /// goes on to its record (T11 review m-9 (a): a cancel there records no lookup again).
     pub pause_after_lookups: Option<Arc<Pause>>,
+    /// Replaces the 20 s of read budget that must remain for a user lookup to start
+    /// (`LOOKUP_RESERVE`; T11 fix review m-4: short budgets for the lookup cut tests).
+    pub lookup_reserve: Option<std::time::Duration>,
     /// Replaces the 60 s that `shutdown` waits for writes that are `executing` (§2.5 step 4).
     pub shutdown_write_wait: Option<std::time::Duration>,
     /// Replaces the 5 s that `shutdown` lets the cancelled field fills and token re-checks end
