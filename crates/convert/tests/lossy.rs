@@ -172,13 +172,21 @@ fn code_macros_are_not_lossy() -> TestResult {
 
 #[test]
 fn lossy_outgoing_side_counted_by_its_own_rules() -> TestResult {
-    // An unparsable outgoing side is counted lexically too (Δ1): what it still holds offsets
-    // what the current side loses. Converter output never gets here: the hard check refuses
-    // an unparsable conversion first (PD-97 e).
+    // An unparsable outgoing side counts as zero constructs (Δ1, T7 review I-1): its lexical
+    // scan would over-report and so offset what the update removes. Converter output never
+    // gets here either: the hard check refuses an unparsable conversion first (PD-97 e).
     let current = "<ac:structured-macro ac:name=\"toc\"/><ac:structured-macro ac:name=\"jira\"/>";
     let outgoing = "<p>a<b>c</p><ac:structured-macro ac:name=\"toc\"/>";
     assert!(!parse(outgoing).xml_ok);
-    assert_eq!(lossy_update(current, outgoing), lost(1, 0, 0, 0));
+    assert_eq!(lossy_update(current, outgoing), lost(2, 0, 0, 0));
+    // A macro quoted inside a code body of an unparsable outgoing side offsets nothing.
+    let quoted = format!(
+        "<ac:structured-macro ac:name=\"code\"><ac:plain-text-body>\
+         <![CDATA[<ac:structured-macro ac:name=\"toc\"/>]]></ac:plain-text-body>\
+         </ac:structured-macro>{BREAK}"
+    );
+    assert!(!parse(&quoted).xml_ok);
+    assert_eq!(lossy_update(current, &quoted), lost(2, 0, 0, 0));
     Ok(())
 }
 
@@ -233,6 +241,54 @@ fn storage_lines_split_at_block_ends() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn storage_lines_every_heading_level_ends_a_line() -> TestResult {
+    let s = "<h1>a</h1><h2>b</h2><h3>c</h3><h4>d</h4><h5>e</h5><h6>f</h6>g";
+    assert_eq!(
+        storage_lines(s),
+        vec![
+            "<h1>a</h1>",
+            "<h2>b</h2>",
+            "<h3>c</h3>",
+            "<h4>d</h4>",
+            "<h5>e</h5>",
+            "<h6>f</h6>",
+            "g"
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn storage_lines_tag_edge_cases() -> TestResult {
+    // An end tag with junk before its `>` is no end tag.
+    assert_eq!(storage_lines("<p>x</p junk>y"), vec!["<p>x</p junk>y"]);
+    // A `>` inside a quoted attribute value does not end the tag.
+    assert_eq!(
+        storage_lines("<br title=\"a>b\"/>x"),
+        vec!["<br title=\"a>b\"/>", "x"]
+    );
+    assert_eq!(
+        storage_lines("<br title='a>b'>x"),
+        vec!["<br title='a>b'>", "x"]
+    );
+    // A `\n` inside a line-ending tag ends the line, as the doc says; the tag does not.
+    assert_eq!(storage_lines("<p>x</p\n>y"), vec!["<p>x</p\n", ">y"]);
+    assert_eq!(storage_lines("a<br\n/>b"), vec!["a<br\n", "/>b"]);
+    assert_eq!(
+        storage_lines("<ac:structured-macro\nac:name=\"toc\"/>z"),
+        vec!["<ac:structured-macro\n", "ac:name=\"toc\"/>z"]
+    );
+    for s in ["<p>x</p\n>y", "a<br\n/>b", "<br title=\"a\nb\"/>c"] {
+        assert_eq!(storage_lines(s).concat(), s);
+        let lines = storage_lines(s);
+        let (last, init) = lines.split_last().ok_or("no lines")?;
+        assert!(init.iter().all(|l| l.ends_with('\n')), "{lines:?}");
+        assert!(!last.is_empty());
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 500, ..ProptestConfig::default() })]
 
@@ -270,11 +326,23 @@ proptest! {
         prop_assert!(lexical.layouts >= tree.layouts, "{:?} < {:?}", lexical, tree);
     }
 
+    /// An outgoing side that does not parse counts as zero: it never offsets a loss.
+    #[test]
+    fn unparsable_outgoing_counts_as_zero(s in common::storage_well_formed()) {
+        let broken = format!("{s}{BREAK}");
+        prop_assert!(!parse(&broken).xml_ok);
+        prop_assert_eq!(lossy_update(&s, &broken), lossy_update(&s, ""));
+    }
+
     #[test]
     fn lossy_and_lines_never_panic(a in common::storage_input(), b in common::storage_input()) {
         let first = lossy_update(&a, &b);
         prop_assert_eq!(first, lossy_update(&a, &b));
-        prop_assert_eq!(lossy_update(&a, &a), LostCounts::default());
+        // An unparsable body is over-counted as current and zero as outgoing, so only a body
+        // that parses loses nothing against itself.
+        if parse(&a).xml_ok {
+            prop_assert_eq!(lossy_update(&a, &a), LostCounts::default());
+        }
         prop_assert_eq!(storage_lines(&b).concat(), b.clone());
     }
 }

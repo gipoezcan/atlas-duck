@@ -11,12 +11,13 @@ use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const GOLDEN: [&str; 7] = [
+const GOLDEN: [&str; 8] = [
     "basics",
     "lists",
     "tables",
     "code",
     "links_images",
+    "image_labels",
     "html",
     "confluence",
 ];
@@ -159,6 +160,16 @@ fn every_text_is_escaped() -> TestResult {
     assert_eq!(
         markdown_to_preview_html("&lt;script&gt; &#60;x&#62;"),
         "<p>&lt;script&gt; &lt;x&gt;</p>\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn every_heading_level_has_its_own_tag() -> TestResult {
+    let md = "# a\n\n## b\n\n### c\n\n#### d\n\n##### e\n\n###### f\n";
+    assert_eq!(
+        markdown_to_preview_html(md),
+        "<h1>a</h1>\n<h2>b</h2>\n<h3>c</h3>\n<h4>d</h4>\n<h5>e</h5>\n<h6>f</h6>\n"
     );
     Ok(())
 }

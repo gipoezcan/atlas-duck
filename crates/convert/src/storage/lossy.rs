@@ -3,9 +3,11 @@
 //!
 //! **One rule set.** [`lossy_update`] counts each side with `to_md::lost_counts`, the function
 //! that fills `ConversionReport.lost`, so what a read reports in `meta.conversion.lost` and
-//! what an update's Caution says it removes can never disagree. A side whose parse is not
-//! `xml_ok` is counted by a lexical scan of its start tags (PD-94 (3)) that feeds each tag, as
-//! a childless element, to the same function: it over-reports, never under-reports.
+//! what an update's Caution says it removes cannot disagree on a body that parses. A current
+//! side whose parse is not `xml_ok` is counted by a lexical scan of its start tags (PD-94 (3))
+//! that feeds each tag, as a childless element, to the same function: it over-reports, never
+//! under-reports. An outgoing side that is not `xml_ok` counts as zero constructs, so its
+//! over-reporting can never offset what the update removes.
 
 use super::parse::{Element, Node, Ns, decode_attr, lex_attrs, parse};
 use super::to_md::{LostCounts, lost_counts};
@@ -19,10 +21,18 @@ const KNOWN_ATTR_PREFIXES: [&str; 3] = ["ac", "ri", "xml"];
 /// non-structural `ac:` element, each outermost `ac:task-list` (or stray `ac:task`) and each
 /// foreign element = 1 macro; each `ac:image` = 1 image; each `ac:link` = 1 link, and each `ri:`
 /// element outside an `ac:link`/`ac:image` = 1 link (a bare mention included); each
-/// `ac:layout` = 1 layout. A side whose parse is not `xml_ok` is counted lexically.
+/// `ac:layout` = 1 layout. A current side whose parse is not `xml_ok` is counted lexically
+/// (over-counting is the safe direction); an outgoing side that is not `xml_ok` counts as zero,
+/// since over-counting it would hide a loss.
 /// Pure and deterministic; never panics.
 pub fn lossy_update(current: &str, outgoing: &str) -> LostCounts {
-    let (c, o) = (count(current), count(outgoing));
+    let o = parse(outgoing);
+    let o = if o.xml_ok {
+        lost_counts(&o.nodes)
+    } else {
+        LostCounts::default()
+    };
+    let c = count(current);
     LostCounts {
         macros: c.macros.saturating_sub(o.macros),
         images: c.images.saturating_sub(o.images),
@@ -193,7 +203,8 @@ pub fn storage_lines(storage: &str) -> Vec<&str> {
 
 /// The length of the tag at the start of `tail` when it ends a line: `</name>` (whitespace
 /// allowed before `>`) for a [`LINE_END_TAGS`] name, a self-closing start tag of one, or any
-/// [`LINE_BREAK_TAGS`] start tag.
+/// [`LINE_BREAK_TAGS`] start tag. A tag whose text holds a `\n` is none of these: the `\n`
+/// ends the line first, so no line holds an interior newline.
 fn line_ending_tag(tail: &str) -> Option<usize> {
     let listed = |set: &[&str], name: &str| set.iter().any(|t| t.eq_ignore_ascii_case(name));
     let body = tail.strip_prefix('<')?;
@@ -204,7 +215,9 @@ fn line_ending_tag(tail: &str) -> Option<usize> {
         let trimmed = after.trim_start();
         let ws = after.len() - trimmed.len();
         let closed = trimmed.starts_with('>');
-        return (closed && listed(&LINE_END_TAGS, name)).then_some(2 + name_len + ws + 1);
+        let len = 2 + name_len + ws + 1;
+        let ends = closed && listed(&LINE_END_TAGS, name);
+        return (ends && !tail.get(..len)?.contains('\n')).then_some(len);
     }
     let name_len = body
         .find(|c: char| c.is_whitespace() || matches!(c, '/' | '>' | '<'))
@@ -213,7 +226,7 @@ fn line_ending_tag(tail: &str) -> Option<usize> {
     let len = tag_end(tail)?;
     let self_closing = tail.get(..len)?.ends_with("/>");
     let ends = listed(&LINE_BREAK_TAGS, name) || (self_closing && listed(&LINE_END_TAGS, name));
-    ends.then_some(len)
+    (ends && !tail.get(..len)?.contains('\n')).then_some(len)
 }
 
 /// The length of the tag at the start of `tail` through its `>` (outside quoted attribute
