@@ -64,7 +64,7 @@ For each architecture:
 2. Submit a request whose body contains a value the tester is told to redact (sample: **TBD by lead**). In the approvals window, open the redaction edit, mask the value, and approve.
    - Expected: the CLI read result shows `redacted: true`.
 3. Open the preview of a Confluence page update with a small diff.
-   - Expected: the preview renders in a sandboxed frame with the diff styling applied. Plain unstyled text in the diff means `preview.css` did not load: FAIL and report to the lead (sha256 contingency is the lead's ruling, PD-92 / V24).
+   - Expected: the preview renders in a sandboxed frame with the diff styling applied. Plain unstyled text in the diff means `preview.css` is not applied: FAIL and report to the lead (the sandboxed frame carries preview.css as one inline `<style>` admitted by its sha256 in both policies, PD-92 as built; V24 macOS WKWebView evidence).
 4. Expected: the approvals window opens and responds to clicks. A window that stays blank or hangs on the first click means the isolation origin is wrong on this build (V34 / §6.4): FAIL, record the Developer Tools console error.
 5. Batch approve with a held Enter. Select two or more requests, then press Approve. While the native Confirm dialog appears, hold Enter for about 2 s, then release it.
    - Expected: the dialog does not confirm while Enter is held or released before the dialog is shown. Nothing is approved.
