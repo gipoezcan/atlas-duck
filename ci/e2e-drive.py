@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """WebDriver steps for the packaged-app CI scripts (M6 plan Task 33): a small W3C client over the
-standard library, talking to `tauri-driver`, and the two flows the shell scripts need.
+standard library, talking to `tauri-driver`, and two flows.
+
+NOT CALLED by any job (M6 CI ruling, task cifix6, run 38885675593); kept for the open item below.
+  - `wizard` cannot run on Linux: on an empty test home the Setup window is incognito (windows.rs,
+    no data dir yet) and wry gives an incognito webview a fresh ephemeral WebKit context without
+    automation, so the session finds no "wry" browser ("Failed to match capabilities") and no
+    webview ("failed to create a new browsing context"); with the paths pinned first, the wizard's
+    passphrase step is the credential window, whose own web context (S-07) WebKitWebDriver cannot
+    reach (tests/e2e/flows.rs CREDENTIAL_NOT_ON_LINUX).
+  - `fedora` needs a store but no wizard: it would run on a store provisioned by the Rust harness
+    (`World::provision_store`) into the test home (open item: a provisioning helper shipped in the
+    bundle-linux-e2e artifact, together with tauri-driver again).
+The jobs run ci/gui-no-driver.sh instead.
 
   e2e-drive.py wizard --app <atlas-duck-app> --driver <tauri-driver> [--cli-install]
       Completes the first-run wizard through the real windows: default data folder, the recovery
@@ -225,7 +237,8 @@ def new_session(drv, app, args=()):
     rig's environment, where sessions are created). WebKitWebDriver answers "Failed to match
     capabilities" when the browser name the app's automation session reports is not the requested
     one, and "failed to create a new browsing context" when the session has no webview: wry sets the
-    name "wry" and hands out its webview only on a web context that allows automation."""
+    name "wry" and hands out its webview only on a web context that allows automation, which is the
+    first one Tauri creates, and never the ephemeral context of an incognito webview (cifix6)."""
     watch = AppWatch()
     try:
         return Session(drv.base, app, args)

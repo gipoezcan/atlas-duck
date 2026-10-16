@@ -8,8 +8,12 @@
 #
 # Needs no cargo and no built binary, so installed-package jobs can use it.
 #
-# Usage:  ci/pinned-fixture.sh [--data-dir DIR]
+# Usage:  ci/pinned-fixture.sh [--data-dir DIR] [--home DIR]
 # Output: exactly one line on stdout, the data directory path. Diagnostics go to stderr.
+#
+# --home DIR: write under DIR instead of the passwd home: the `scripted-approver` build reads its
+# base folders from ATLAS_DUCK_TEST_HOME (PD-01), so its pinned file is <DIR>/.config/atlas-duck/
+# (Linux). Pass the test home here; the host part is computed as without it.
 #
 # The <host> part must equal atlas_duck_ipc::paths::host_name(). This script mirrors the
 # host source (Linux: first non-blank, non-comment line of /etc/hostname, else uname -n; macOS: LocalHostName,
@@ -22,12 +26,18 @@ info() { printf 'pinned-fixture: %s\n' "$*" >&2; }
 die() { info "$*"; exit 2; }
 
 data_dir=""
+home_override=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --data-dir) [ $# -ge 2 ] || die "--data-dir needs a value"; data_dir="$2"; shift 2 ;;
-    *) die "usage: ci/pinned-fixture.sh [--data-dir DIR]" ;;
+    --home) [ $# -ge 2 ] || die "--home needs a value"; home_override="$2"; shift 2 ;;
+    *) die "usage: ci/pinned-fixture.sh [--data-dir DIR] [--home DIR]" ;;
   esac
 done
+case "$home_override" in
+  ""|/*) ;;
+  *) die "--home must be an absolute path" ;;
+esac
 
 if [ "${CI:-}" != "true" ] && [ "${ATLAS_DUCK_FIXTURE_FORCE:-}" != "1" ]; then
   die "refusing to replace the pinned paths file outside CI (set ATLAS_DUCK_FIXTURE_FORCE=1 to override)"
@@ -38,6 +48,7 @@ os="${ATLAS_DUCK_FIXTURE_OS:-$(uname -s)}"
 # The passwd home directory, not $HOME: the app never reads per-session environment (§7.7).
 passwd_home() {
   local user home=""
+  if [ -n "$home_override" ]; then printf '%s' "$home_override"; return; fi
   user="$(id -un)"
   case "$os" in
     Darwin) home="$(dscl . -read "/Users/$user" NFSHomeDirectory 2>/dev/null | sed 's/^NFSHomeDirectory: //' || true)" ;;

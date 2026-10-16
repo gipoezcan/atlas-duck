@@ -11,10 +11,10 @@ name: bundle
 #                                    common ancestor is .../bundle, so the sub-directories stay)
 # upload-artifact drops file modes, so every consumer runs chmod +x on the AppImage.
 #
-# M6 plan Task 33: the GUI runs that need tauri-driver (CI-03 Fedora no-tray-host, the CI-04 M6
-# AppImage steps) are in e2e-bundle.yml, on a debug scripted-approver bundle built there: the
-# shipped (release) bundles of this file scrub the WebDriver variables (§2.5, S-04) and cannot be
-# driven, and ci/check-release-build.sh keeps --debug and --features out of this file.
+# M6 plan Task 33: the packaged GUI runs (CI-03 Fedora no-tray-host, the CI-04 M6 AppImage steps)
+# are in e2e-bundle.yml, on a debug scripted-approver bundle built there (its test home keeps the runs
+# off the runner's own pinned files; they are driver-free, see that file), and
+# ci/check-release-build.sh keeps --debug and --features out of this file.
 
 on:
   push:

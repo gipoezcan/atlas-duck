@@ -15,8 +15,8 @@
 #     cold-starts `<AppImage> --background` (the CLI's launch plan, never a /tmp/.mount_* path)
 #     against a first-run fixture, `jira search` answers `not_configured {first_run}` (exit 9), and a
 #     directly started `<AppImage> --background` answers `doctor` with the same gate
-#   * (M6 plan Task 33, CI-04 M6 steps) `appimage-smoke.sh --m6 <e2e-artifact-dir>`: the M6 section
-#     on the debug scripted-approver AppImage (see m6_inner below for why it is not the release one)
+#   * (M6 plan Task 33, CI-04 M6 steps) `appimage-smoke.sh --m6 <e2e-artifact-dir>`: the driver-free
+#     M6 section on the debug scripted-approver AppImage (see m6_inner below)
 set -euo pipefail
 export LC_ALL=C
 
@@ -122,135 +122,52 @@ m4_inner() {
   echo "M4 direct start: doctor exit 0, gate=$gate2"
 }
 
-# --- M6 section (CI-04 M6 steps) ------------------------------------------------------------------
-# Runs against the DEBUG `scripted-approver` AppImage of the bundle-linux-e2e artifact: the release
-# AppImage scrubs the WebDriver variables from its environment (§2.5, S-04) and tauri-driver cannot
-# drive it, so "through tauri-driver" needs this build. The wrapper, `cli.toml` and `$APPIMAGE`
-# logic is the same code in both builds. The scripted build needs ATLAS_DUCK_TEST_HOME and uses the
-# file keystore (ATLAS_DUCK_TEST_KEYSTORE); the Secret Service below is unlocked as ci/keyring-ci.sh
-# does and keeps the shape of a real install.
-#   1. the wizard through tauri-driver (default data dir, passphrase twice, skip instances) and
-#      "Install CLI to PATH" on its CLI step
-#   2. `cli.toml` `app_path` is the AppImage file, never a /tmp/.mount_* path; the wrapper exists
-#   3. `doctor` through the wrapper cold-starts `<AppImage> --background` (alive, not under the mount)
-#   4. the AppImage moved: the wrapper exits 5 `not_running` with the re-install hint
-# NOT covered here (needs a mock Jira, a configured instance and a token, which the Rust e2e target
-# provides): releasing a request through the Approvals window and `await`; the Linux `e2e` job runs
-# that flow (ui06) against the same drive code.
+# --- M6 section (CI-04 M6 steps, driver-free) ----------------------------------------------------
+# Runs against the DEBUG `scripted-approver` AppImage of the bundle-linux-e2e artifact, which takes
+# its base folders from ATLAS_DUCK_TEST_HOME (PD-01), so nothing here touches the runner's passwd home.
+# No WebDriver (M6 CI ruling, task cifix6): WebKitWebDriver cannot drive the wizard on Linux, so the
+# wizard, Install CLI to PATH and what depends on it (cli.toml app_path, the ~/.local/bin wrapper and
+# its doctor cold start, the moved AppImage's exit 5) are rows of docs/release/linux-gui-checklist.md;
+# ci/gui-no-driver.sh says why. What runs here, through the real type-2 runtime (FUSE mount) on a
+# pinned data dir with no store: ci/gui-no-driver.sh (no tray host, a cold start that maps the Setup
+# window, `<AppImage> __cli doctor`, forwarded no-argument and `--background` launches, SIGTERM, a
+# clean next start). The M4 section above covers `__cli`'s cold start of `<AppImage> --background`.
 m6_inner() {
-  local appimage="$1" tools="$2" here="$3" work="$4" passwd_home wrapper cli_toml app_path code line cmdline pid gate
+  local appimage="$1" here="$2" work="$3"
   unset APPIMAGE_EXTRACT_AND_RUN
   trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true" EXIT
-  passwd_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
+  # A file-backed Secret Service, unlocked as ci/keyring-ci.sh does: the host shape of a real install
+  # (the scripted-approver build uses its own file keystore).
   if command -v gnome-keyring-daemon >/dev/null; then
     printf 'atlas-duck-ci' | gnome-keyring-daemon --components=secrets --daemonize --unlock >/dev/null || echo "M6: keyring daemon did not start (continuing)"
   fi
-
-  python3 -I "$here/e2e-drive.py" wizard --app "$appimage" --driver "$tools/tauri-driver" \
-    --driver-log "$work/wizard-driver.log" --cli-install || { tail -n 40 "$work/wizard-driver.log" >&2 || true; m4_fail "the wizard through tauri-driver failed"; }
-  echo "M6 wizard: completed through tauri-driver, Install CLI to PATH pressed"
-
-  # The wizard session ended the app; stop anything left before the wrapper cold-starts one.
-  m4_stop_app "$appimage"
-
-  cli_toml=""
-  for d in "$ATLAS_DUCK_TEST_HOME" "$passwd_home/.config/atlas-duck"; do
-    cli_toml="$(find "$d" -name 'cli*.toml' -type f 2>/dev/null | head -n 1 || true)"
-    [ -n "$cli_toml" ] && break
-  done
-  [ -n "$cli_toml" ] || m4_fail "no cli.toml under $ATLAS_DUCK_TEST_HOME or $passwd_home/.config/atlas-duck after Install CLI to PATH"
-  echo "--- $cli_toml"; cat "$cli_toml"
-  app_path="$(sed -n "s/^app_path *= *['\"]\(.*\)['\"] *$/\1/p" "$cli_toml" | head -n 1)"
-  echo "V14 cli_toml_app_path=$app_path"
-  case "$app_path" in
-    /tmp/.mount_*) m4_fail "cli.toml app_path points into the AppImage mount ($app_path)" ;;
-  esac
-  [ "$app_path" = "$appimage" ] || m4_fail "cli.toml app_path is '$app_path', expected '$appimage'"
-
-  wrapper=""
-  for d in "$ATLAS_DUCK_TEST_HOME" "$passwd_home"; do
-    if [ -x "$d/.local/bin/atlas-duck" ]; then wrapper="$d/.local/bin/atlas-duck"; break; fi
-  done
-  [ -n "$wrapper" ] || m4_fail "no executable ~/.local/bin/atlas-duck wrapper after Install CLI to PATH"
-  grep -qF '# atlas-duck-cli-wrapper v1' "$wrapper" || m4_fail "$wrapper has no wrapper marker"
-
-  set +e
-  timeout 180 "$wrapper" doctor --timeout 120 >"$work/m6-doctor.json" 2>"$work/m6-doctor.err"
-  code=$?
-  set -e
-  if [ "$code" -ne 0 ]; then
-    cat "$work/m6-doctor.json" "$work/m6-doctor.err" >&2 || true
-    m4_fail "doctor through the wrapper exited $code, expected 0"
-  fi
-  gate="$(m4_json_field "$work/m6-doctor.json" data.app.gate)" || m4_fail "doctor through the wrapper has no data.app.gate: $(cat "$work/m6-doctor.json")"
-  # After a completed wizard the gate is never first_run: the app the wrapper cold-started reads the
-  # store the wizard created under the same data dir.
-  [ -n "$gate" ] && [ "$gate" != first_run ] || m4_fail "doctor through the wrapper reports gate '$gate' after the wizard (the store was not seen)"
-  echo "M6 wrapper: doctor exit 0, gate=$gate"
-
-  pid="$(pgrep -f -x -- "$appimage --background" | head -n 1 || true)"
-  [ -n "$pid" ] || m4_fail "no process '$appimage --background' after the wrapper's cold start"
-  cmdline="$(tr '\0' ' ' </proc/"$pid"/cmdline | sed 's/ $//')"
-  echo "V14 wrapper_launched=$cmdline"
-  case "$cmdline" in
-    /tmp/.mount_*) m4_fail "the wrapper-launched command line points into the AppImage mount ($cmdline)" ;;
-  esac
-  [ "$cmdline" = "$appimage --background" ] || m4_fail "the wrapper-launched command line is '$cmdline', expected '$appimage --background'"
-  kill -0 "$pid" || m4_fail "the cold-started app is not alive"
-
-  # The CLI that launched the app has exited: a second call through the wrapper must reach the same
-  # instance (CI-04: the app outlives the CLI that started it).
-  set +e
-  timeout 120 "$wrapper" doctor --timeout 60 >"$work/m6-doctor2.json" 2>"$work/m6-doctor2.err"
-  code=$?
-  set -e
-  if [ "$code" -ne 0 ]; then
-    cat "$work/m6-doctor2.json" "$work/m6-doctor2.err" >&2 || true
-    m4_fail "the second doctor through the wrapper (after the launching CLI exited) exited $code, expected 0"
-  fi
-  [ "$(pgrep -f -x -- "$appimage --background" | head -n 1 || true)" = "$pid" ] || m4_fail "the second doctor started another app instead of reaching pid $pid"
-  echo "M6 wrapper: a second doctor after the launching CLI exited reached the same app, exit 0"
-
-  # The AppImage moves: the wrapper exits 5 with the not_running envelope and the re-install hint.
-  m4_stop_app "$appimage"
-  mv "$appimage" "$appimage.moved"
-  set +e
-  "$wrapper" doctor >"$work/m6-moved.json" 2>"$work/m6-moved.err"
-  code=$?
-  set -e
-  mv "$appimage.moved" "$appimage"
-  [ "$code" -eq 5 ] || m4_fail "the wrapper with the AppImage moved exited $code, expected 5; stdout: $(cat "$work/m6-moved.json")"
-  grep -qF '"reason":"not_running"' "$work/m6-moved.json" || m4_fail "moved-AppImage envelope lacks details.reason not_running: $(cat "$work/m6-moved.json")"
-  grep -qF 're-run Install CLI to PATH' "$work/m6-moved.json" || m4_fail "moved-AppImage envelope lacks the re-install hint: $(cat "$work/m6-moved.json")"
-  echo "M6 moved AppImage: exit 5 not_running with the re-install hint"
+  bash "$here/gui-no-driver.sh" appimage-m6 "$work" "$appimage" "$appimage" __cli
 }
 
-# m6_save_diag <work>: copies the diag log and the driver logs to $E2E_DIAG_DIR (the workflow prints and
-# uploads it on failure) before the EXIT trap deletes <work>.
+# m6_save_diag <work>: copies the diag log, the app logs and the doctor answers to $E2E_DIAG_DIR (the
+# workflow prints and uploads it) before the EXIT trap deletes <work>.
 m6_save_diag() {
   local work="$1" f
   [ -n "${E2E_DIAG_DIR:-}" ] || return 0
   mkdir -p "$E2E_DIAG_DIR" 2>/dev/null || return 0
   while IFS= read -r f; do
     cp "$f" "$E2E_DIAG_DIR/$(echo "${f#"$work"/}" | tr / _)" 2>/dev/null || true
-  done < <(find "$work" \( -name diag.log -o -name '*.log' -o -name 'm6-*.json' -o -name 'm6-*.err' \) -type f 2>/dev/null)
+  done < <(find "$work" \( -name diag.log -o -name '*.log' -o -name 'doctor-*.json' -o -name 'doctor-*.err' \) -type f 2>/dev/null)
 }
 
 # appimage-smoke.sh --m6 <e2e-artifact-dir>: the M6 section alone, CI only, on the downloaded
-# bundle-linux-e2e artifact (appimage/*.AppImage, tools/tauri-driver) with libfuse2, xvfb, dbus-x11 and
-# webkit2gtk-driver (WebKitWebDriver) installed. The workflow job `appimage-m6` (e2e-bundle.yml).
+# bundle-linux-e2e artifact (appimage/*.AppImage) with libfuse2, xvfb, dbus-x11 and x11-utils
+# (xwininfo) installed. The workflow job `appimage-m6` (e2e-bundle.yml).
 m6_outer() {
   local e2e_dist work m6_dir m6_code self_path
   e2e_dist="$(realpath "${1:?usage: appimage-smoke.sh --m6 <e2e-artifact-dir>}")"
   self_path="$(realpath "$0")"
   [ "${CI:-}" = true ] || m4_fail "the M6 AppImage section runs only with CI=true"
-  command -v WebKitWebDriver >/dev/null || m4_fail "WebKitWebDriver missing (apt: webkit2gtk-driver)"
+  command -v xwininfo >/dev/null || m4_fail "xwininfo missing (apt: x11-utils)"
   shopt -s nullglob
   local e2e_images=("$e2e_dist"/appimage/*.AppImage)
   shopt -u nullglob
   [ "${#e2e_images[@]}" -eq 1 ] || m4_fail "expected one AppImage in $e2e_dist/appimage, found ${#e2e_images[@]}"
-  [ -f "$e2e_dist/tools/tauri-driver" ] || m4_fail "no tools/tauri-driver in $e2e_dist"
-  chmod +x "$e2e_dist/tools/tauri-driver"
   work="$(mktemp -d)"
   # Expanded now: the EXIT trap runs after this function returned, when the local is gone (set -u).
   trap "m6_save_diag \"$work\"; pkill -x atlas-duck-app || true; rm -rf \"$work\"" EXIT
@@ -258,23 +175,13 @@ m6_outer() {
   mkdir -p "$m6_dir/home" "$m6_dir/keys" "$m6_dir/out"
   cp "${e2e_images[0]}" "$m6_dir/atlas-duck-e2e.AppImage"
   chmod +x "$m6_dir/atlas-duck-e2e.AppImage"
-  # The host's WebKitWebDriver drives the WebKit the AppImage bundles: both versions are printed, as
-  # "Failed to match capabilities" may be a mismatch between them.
-  WebKitWebDriver --version || true
-  dpkg-query -W webkit2gtk-driver libwebkit2gtk-4.1-0 || true
-  # The whole image is extracted (an extraction pattern's matching rules differ between runtimes).
-  local bundled=""
-  bundled="$(cd "$work" && "$m6_dir/atlas-duck-e2e.AppImage" --appimage-extract >/dev/null 2>&1 &&
-    find squashfs-root \( -name 'libwebkit2gtk*' -o -name 'libjavascriptcoregtk*' -o -name WebKitWebProcess \) -print)" || true
-  rm -rf "$work/squashfs-root"
-  echo "appimage-m6: bundled WebKit files: ${bundled:-none found (or the image could not be extracted)}"
   set +e
-  env ATLAS_DUCK_TEST_HOME="$m6_dir/home" ATLAS_DUCK_TEST_KEYSTORE="$m6_dir/keys" ATLAS_DUCK_E2E_ALLOW_DRIVER=1 \
-    timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" --m6-inner "$m6_dir/atlas-duck-e2e.AppImage" "$e2e_dist/tools" "$(dirname "$self_path")" "$m6_dir/out"
+  env ATLAS_DUCK_TEST_HOME="$m6_dir/home" ATLAS_DUCK_TEST_KEYSTORE="$m6_dir/keys" \
+    timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" --m6-inner "$m6_dir/atlas-duck-e2e.AppImage" "$(dirname "$self_path")" "$m6_dir/out"
   m6_code=$?
   set -e
   [ "$m6_code" -eq 0 ] || m4_fail "the M6 AppImage section failed (exit $m6_code)"
-  echo "OK: M6 AppImage section (wizard and Install CLI to PATH through tauri-driver, cli.toml, wrapper doctor, moved AppImage exit 5)"
+  echo "OK: M6 AppImage section (driver-free: no tray host, Setup window, __cli doctor, forwarded launches, SIGTERM, clean next start)"
 }
 
 if [ "${1:-}" = --m6 ]; then
@@ -287,8 +194,8 @@ if [ "${1:-}" = --m4-inner ]; then
   exit 0
 fi
 if [ "${1:-}" = --m6-inner ]; then
-  [ "$#" -eq 5 ] || m4_fail "usage: appimage-smoke.sh --m6-inner <appimage> <tools-dir> <ci-dir> <work-dir>"
-  m6_inner "$2" "$3" "$4" "$5"
+  [ "$#" -eq 4 ] || m4_fail "usage: appimage-smoke.sh --m6-inner <appimage> <ci-dir> <work-dir>"
+  m6_inner "$2" "$3" "$4"
   exit 0
 fi
 self="$(realpath "$0")"
