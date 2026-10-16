@@ -1461,6 +1461,16 @@ jobs:
       - name: Build the release app (S-04, no features)
         run: cargo build --release -p atlas-duck-app --bin atlas-duck-app --locked
 
+      - name: Kill stray driver, webview and app processes (before S-04)
+        if: always()
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            for p in atlas-duck-app tauri-driver msedgedriver msedgewebview2; do taskkill //F //IM "$p.exe" >/dev/null 2>&1 || true; done
+          else
+            for p in atlas-duck-app tauri-driver WebKitWebDriver; do pkill -x "$p" || true; done
+            # comm is cut at 15 characters (WebKitWebProces), so these two match the command line.
+            pkill -f 'WebKit(Web|Network)Process' || true
+          fi
       - name: S-04 no debug port with the inspector variables set (Linux, release build)
         if: runner.os == 'Linux'
         run: bash ci/s04-no-debug-port.sh target/release/atlas-duck-app
@@ -1470,14 +1480,18 @@ jobs:
         shell: pwsh
         run: ./ci/s04-no-debug-port.ps1 -Exe target\release\atlas-duck-app.exe
 
-      # The driver kills tauri-driver only; msedgedriver and an app a failed flow left are killed here.
-      - name: Kill stray driver and app processes
+      # The driver kills tauri-driver only; msedgedriver, the webview processes and an app a failed
+      # flow left are killed here, and again BEFORE S-04 (above): the S-04 scripts count webview
+      # processes of the app's own process tree and fail when any exist before the app starts.
+      - name: Kill stray driver, webview and app processes
         if: always()
         run: |
           if [ "$RUNNER_OS" = Windows ]; then
             for p in atlas-duck-app tauri-driver msedgedriver msedgewebview2; do taskkill //F //IM "$p.exe" >/dev/null 2>&1 || true; done
           else
             for p in atlas-duck-app tauri-driver WebKitWebDriver; do pkill -x "$p" || true; done
+            # comm is cut at 15 characters (WebKitWebProces), so these two match the command line.
+            pkill -f 'WebKit(Web|Network)Process' || true
           fi
 
       - name: Upload e2e screenshots and logs

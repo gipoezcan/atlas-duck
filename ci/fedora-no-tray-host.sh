@@ -14,8 +14,9 @@
 # org.kde.StatusNotifierWatcher owner, the wizard is completed through the real windows; then a cold
 # no-argument start opens Approvals, `doctor` reports tray_host missing, a forwarded no-argument
 # launch and a forwarded `--background` launch are logged and open nothing new, Settings opens from
-# the header, header Quit ends the process, and the next start comes up clean (the diag log has no
-# quit_wait_expired or quit_core_lost; the APP_STOP {quit} audit record has no diag line to match).
+# the header, header Quit ends the process (the diag log has the line app_stop reason=quit among the
+# lines written after the click, no quit_wait_expired or quit_core_lost, and the process is gone), and
+# the next start comes up clean.
 set -euo pipefail
 export LC_ALL=C
 
@@ -34,9 +35,26 @@ if [ "${1:-}" = --inner ]; then
     fail "the session bus has a StatusNotifierWatcher owner; this is not a no-tray-host run"
   fi
   echo "fedora-no-tray-host: no org.kde.StatusNotifierWatcher owner on the session bus"
-  trap 'pkill -x atlas-duck-app || true; pkill -x gnome-keyring-d || true; pkill -x tauri-driver || true; pkill -x WebKitWebDriver || true' EXIT
+  # Diagnostics first: the logs are copied to /root/e2e-diag (the runner's bind mount; the workflow
+  # prints and uploads it) before anything is stopped or cleaned up, on success and on failure.
+  save_diag() {
+    mkdir -p /root/e2e-diag
+    find /root -path /root/e2e-diag -prune -o \( -name diag.log -o -name '*-driver.log' \) -type f -print 2>/dev/null |
+      while read -r f; do cp "$f" "/root/e2e-diag/$(echo "${f#/}" | tr / _)" 2>/dev/null || true; done
+    chmod -R a+rX /root/e2e-diag 2>/dev/null || true
+  }
+  trap 'save_diag; pkill -x atlas-duck-app || true; pkill -x gnome-keyring-d || true; pkill -x tauri-driver || true; pkill -x WebKitWebDriver || true' EXIT
   here="$(cd "$(dirname "$0")" && pwd)"
   python3 -I "$here/e2e-drive.py" wizard --app /usr/bin/atlas-duck-app --driver "$dist/tools/tauri-driver" --driver-log "$ATLAS_DUCK_TEST_HOME/../wizard-driver.log"
+  # The wizard session's DELETE ends the app, but not necessarily before the next session starts: a
+  # new start would then be forwarded to the dying instance (single-instance plugin) and attach to
+  # nothing. Stop it and wait, as ci/appimage-smoke.sh does between its sessions.
+  pkill -TERM -x atlas-duck-app || true
+  for _ in $(seq 1 60); do
+    pgrep -x atlas-duck-app >/dev/null || break
+    sleep 1
+  done
+  ! pgrep -x atlas-duck-app >/dev/null || fail "atlas-duck-app is still running after the wizard session"
   python3 -I "$here/e2e-drive.py" fedora --app /usr/bin/atlas-duck-app --cli /usr/bin/atlas-duck --driver "$dist/tools/tauri-driver" \
     --driver-log "$ATLAS_DUCK_TEST_HOME/../fedora-driver.log" --home "$ATLAS_DUCK_TEST_HOME"
   echo "OK: Fedora 40 no-tray-host run (CI-03)"

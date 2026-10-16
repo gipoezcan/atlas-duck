@@ -74,6 +74,10 @@ pub const LOG_EVENT_QUIT_WAIT_EXPIRED: &str = "quit_wait_expired";
 pub const LOG_EVENT_UNLOCK_FAILED: &str = "credential_unlock_failed";
 /// `Core::shutdown` ended without a report (its task panicked).
 pub const LOG_EVENT_QUIT_CORE_LOST: &str = "quit_core_lost";
+/// T33 review I-4: the shutdown path ended in order: the core's `APP_STOP` is in the audit log
+/// (`reason` = `quit|os_shutdown|installer`, the same word as the record's). Absent after a crash
+/// and when the outer bound expired, so a support log tells an orderly stop from a killed app.
+pub const LOG_EVENT_APP_STOP: &str = "app_stop";
 
 /// L78: how long `audit::open` may block before the status line `keychain_prompt` says the app is
 /// waiting for a keychain authorization (an unsigned dev build re-prompts after every rebuild).
@@ -1197,15 +1201,34 @@ pub async fn quit(slot: &ServeSlot, reason: ShutdownReason, outer: Duration) -> 
             if let Some(starting) = starting {
                 bounded(starting, START_WAIT, deadline, "start").await;
             }
-            match slot.get() {
+            let outcome = match slot.get() {
                 Some(state) => shutdown_until(state, reason, deadline).await,
                 None => ShutdownOutcome {
                     report: None,
                     timed_out: false,
                 },
-            }
+            };
+            log_app_stop(&outcome, reason);
+            outcome
         })
         .await
+}
+
+/// Logs [`LOG_EVENT_APP_STOP`] when the core's shutdown finished inside its bound and appended
+/// `APP_STOP`. Nothing is logged without a core, after `timed_out`, a lost core task or a failed
+/// append: those end like a crash and the next start reconciles.
+fn log_app_stop(outcome: &ShutdownOutcome, reason: ShutdownReason) {
+    let logged = outcome
+        .report
+        .is_some_and(|report| report.app_stop_logged && !outcome.timed_out);
+    if logged {
+        let reason = match reason {
+            ShutdownReason::Quit => "quit",
+            ShutdownReason::OsShutdown => "os_shutdown",
+            ShutdownReason::Installer => "installer",
+        };
+        tracing::info!(event = LOG_EVENT_APP_STOP, reason);
+    }
 }
 
 /// The one shutdown path of the process (§2.5): every Quit (tray, the `quit` command, the error
@@ -2450,6 +2473,65 @@ mod tests {
         type Writer = Capture;
         fn make_writer(&'a self) -> Capture {
             self.clone()
+        }
+    }
+
+    /// T33 review I-4: `app_stop` passes the allowlist with its reason and nothing else, and only
+    /// an orderly shutdown logs it (negative controls: no core, timed out, append failed).
+    #[test]
+    fn app_stop_is_logged_only_after_an_orderly_shutdown() {
+        let report = |app_stop_logged| ShutdownReport {
+            cancelled: 0,
+            writes_waited: 0,
+            app_stop_logged,
+        };
+        let run = |outcome: ShutdownOutcome, reason| {
+            crate::diag::fields::extend_allowed(LOG_FIELDS);
+            let cap = Capture::default();
+            let subscriber =
+                Registry::default().with(crate::diag::fields::allowlist_layer(cap.clone()));
+            tracing::subscriber::with_default(subscriber, || log_app_stop(&outcome, reason));
+            String::from_utf8(cap.0.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .unwrap_or_default()
+        };
+        for (reason, word) in [
+            (ShutdownReason::Quit, "quit"),
+            (ShutdownReason::OsShutdown, "os_shutdown"),
+            (ShutdownReason::Installer, "installer"),
+        ] {
+            let out = run(
+                ShutdownOutcome {
+                    report: Some(report(true)),
+                    timed_out: false,
+                },
+                reason,
+            );
+            assert_eq!(out.lines().count(), 1, "{out}");
+            assert!(
+                out.contains(&format!("event=app_stop reason={word} dropped_fields=0")),
+                "{out}"
+            );
+        }
+        for outcome in [
+            ShutdownOutcome {
+                report: None,
+                timed_out: false,
+            },
+            ShutdownOutcome {
+                report: None,
+                timed_out: true,
+            },
+            ShutdownOutcome {
+                report: Some(report(false)),
+                timed_out: false,
+            },
+            ShutdownOutcome {
+                report: Some(report(true)),
+                timed_out: true,
+            },
+        ] {
+            let out = run(outcome, ShutdownReason::Quit);
+            assert!(out.is_empty(), "{outcome:?}: {out}");
         }
     }
 

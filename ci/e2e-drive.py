@@ -37,6 +37,8 @@ import urllib.request
 ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 WAIT = 30
 START_WAIT = 90
+# Seconds a forwarded launch gets to open (or not open) a window before the windows are counted.
+SETTLE = 4
 PASSPHRASE = "ci-recovery-passphrase-0123456789"
 TITLE_PREFIX = "atlas-duck: "
 
@@ -352,6 +354,9 @@ def fedora(args):
                 WAIT,
             )
             forwarded += 1
+            # tray.rs logs forwarded_launch before it acts on the launch: let a window that a
+            # mistaken --background open would have opened appear before it is counted.
+            time.sleep(SETTLE)
             if len(s.handles()) != windows:
                 raise Failed("the forwarded %s launch changed the window count (%d -> %d)" % (what, windows, len(s.handles())))
             s.switch(approvals)
@@ -366,6 +371,9 @@ def fedora(args):
         print("no-tray-host: Settings opened from the Approvals header")
         s.switch(approvals)
 
+        # Only the lines written from here on are the Quit's: the log is append-only and holds the
+        # whole run (and the wizard's).
+        quit_offset = len(diag_text(home))
         try:
             s.click(s.wait_xpath(header % "Quit"))
         except Failed as e:
@@ -377,28 +385,31 @@ def fedora(args):
             s.quit()
         drv.close()
 
-    # The next start: its diag log has the previous run's quit.
+    # The process is gone. Its orderly shutdown logged `app_stop reason=quit` (serve.rs, after the core
+    # appended APP_STOP; absent after a crash or a SIGKILL), and only in lines written after the click.
+    after = diag_text(home)[quit_offset:]
+    if not re.search(r"event=app_stop reason=quit\b", after):
+        print(after)
+        raise Failed("no app_stop reason=quit line in the diag log after header Quit")
+    for bad in ("quit_wait_expired", "quit_core_lost"):
+        if bad in after:
+            print(after)
+            raise Failed("the diag log shows %s after header Quit" % bad)
+    if app_running():
+        raise Failed("the app is running again after header Quit")
+    print("no-tray-host: header Quit logged app_stop reason=quit and the process exited")
+
+    # The next start comes up clean (the single-instance lock was released).
     drv = Driver(args.driver, args.driver_log)
     s = None
     try:
         s = Session(drv.base, args.app)
         s.switch_to_title("Approvals", START_WAIT)
-        # APP_STOP {reason: quit} is an audit record: the diag log has no line naming the reason
-        # (serve.rs logs only the failures, quit_wait_expired and quit_core_lost). The orderly shutdown
-        # is therefore shown by the absence of those two and a clean restart (the single-instance lock
-        # was released); the audit record itself is read by the Rust e2e target (i40) and the
-        # Verify-now flow.
-        text = diag_text(home)
-        for bad in ("quit_wait_expired", "quit_core_lost"):
-            if bad in text:
-                print(text)
-                raise Failed("the diag log shows %s after header Quit" % bad)
-        print("no-tray-host: header Quit shut down in order and the next start came up clean")
+        print("no-tray-host: the next start came up clean")
     finally:
         if s is not None:
             s.quit()
         drv.close()
-
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

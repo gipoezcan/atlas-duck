@@ -9,7 +9,11 @@
 # a real WebView2 webview (a cold `--background` start opens no window: the check would be vacuous).
 # The script requires an msedgewebview2 process, a listener on a control port it opened itself
 # (the probe sees listeners), no listener on the debug port, no `remote-debugging` switch on any
-# msedgewebview2 command line, and a `startup_env_scrubbed` line per variable set.
+# msedgewebview2 command line, and a `startup_env_scrubbed` line per variable set. Only msedgewebview2
+# processes in the app's own process tree count (a leftover from an earlier step, such as the
+# msedgedriver session of the e2e flows, would otherwise satisfy "a webview exists" or carry a
+# --remote-debugging-port of its own); any msedgewebview2 process that exists before the app starts
+# fails the script, and the CI job kills strays before this step.
 [CmdletBinding()]
 param([Parameter(Mandatory = $true)][string]$Exe)
 
@@ -34,6 +38,30 @@ function Test-Listening([int]$Port) {
     return ($null -ne $c)
 }
 
+# The descendants of a process (children, grandchildren, ...) by walking Win32_Process.ParentProcessId:
+# WebView2's browser process is a child of the app and its renderers are children of that.
+function Get-Descendants([int]$RootPid) {
+    $all = @(Get-CimInstance Win32_Process)
+    $found = New-Object System.Collections.Generic.List[object]
+    $queue = New-Object System.Collections.Generic.Queue[int]
+    $queue.Enqueue($RootPid)
+    $seenIds = New-Object System.Collections.Generic.HashSet[int]
+    while ($queue.Count -gt 0) {
+        $parent = $queue.Dequeue()
+        foreach ($p in $all) {
+            if ([int]$p.ParentProcessId -eq $parent -and $seenIds.Add([int]$p.ProcessId)) {
+                $found.Add($p)
+                $queue.Enqueue([int]$p.ProcessId)
+            }
+        }
+    }
+    return , $found.ToArray()
+}
+
+function Get-WebViewsOf([int]$RootPid) {
+    return @(Get-Descendants $RootPid | Where-Object { $_.Name -eq 'msedgewebview2.exe' })
+}
+
 $port = Get-FreePort
 $control = Get-FreePort
 while ($control -eq $port) { $control = Get-FreePort }
@@ -56,6 +84,8 @@ try {
     $env:WEBKIT_INSPECTOR_SERVER = "127.0.0.1:$port"
     $env:WEBKIT_INSPECTOR_HTTP_SERVER = "127.0.0.1:$port"
     $env:ATLAS_DUCK_E2E_ALLOW_DRIVER = '1'
+    $strays = @(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue)
+    if ($strays.Count -gt 0) { Fail "$($strays.Count) msedgewebview2 process(es) exist before the app starts (strays from an earlier step)" }
     $app = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $work 'app.out') -RedirectStandardError (Join-Path $work 'app.err')
 
@@ -63,17 +93,17 @@ try {
     $seen = $false
     for ($i = 0; $i -lt 300; $i++) {
         if ($app.HasExited) { Fail "the release app exited ($($app.ExitCode)) before a webview process appeared" }
-        if (@(Get-Process -Name msedgewebview2 -ErrorAction SilentlyContinue).Count -gt 0) { $seen = $true; break }
+        if ((Get-WebViewsOf $app.Id).Count -gt 0) { $seen = $true; break }
         Start-Sleep -Milliseconds 200
     }
-    if (-not $seen) { Fail 'no msedgewebview2 process within 60 s: no webview, the check would be vacuous' }
-    Write-Host 'S04 webview_process=msedgewebview2'
+    if (-not $seen) { Fail 'no msedgewebview2 process in the app process tree within 60 s: no webview, the check would be vacuous' }
+    Write-Host "S04 webview_processes_in_app_tree=$((Get-WebViewsOf $app.Id).Count)"
 
     Start-Sleep -Seconds 15
     if ($app.HasExited) { Fail "the release app died during the check ($($app.ExitCode))" }
     if (Test-Listening $port) { Fail "a debug port opened on $port with the WebView2 variables set (S-04)" }
-    $cmdlines = @(Get-CimInstance Win32_Process -Filter "Name = 'msedgewebview2.exe'" | ForEach-Object { $_.CommandLine })
-    Write-Host "S04 msedgewebview2 processes: $($cmdlines.Count)"
+    $cmdlines = @(Get-WebViewsOf $app.Id | ForEach-Object { $_.CommandLine })
+    Write-Host "S04 msedgewebview2 processes in the app tree: $($cmdlines.Count)"
     foreach ($c in $cmdlines) {
         if ($c -match 'remote-debugging') { Fail 'an msedgewebview2 process carries a remote-debugging switch (S-04)' }
     }

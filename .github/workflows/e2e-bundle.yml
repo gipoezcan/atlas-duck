@@ -17,6 +17,10 @@ on:
   push:
     branches:
       - master
+      # REMOVE AT MERGE: TEMPORARY trigger for the M6 branch. workflow_dispatch runs only a workflow
+      # file that exists on the default branch (see install-probes.yml), and this file is new, so
+      # without this line the Fedora CI-03 and AppImage CI-04 jobs would first run after the merge.
+      - "m6-*"
     tags:
       - "v*"
   workflow_dispatch:
@@ -169,7 +173,19 @@ jobs:
       - name: Container logs (diagnostics)
         if: always()
         run: |
-          find "$RUNNER_TEMP/fedora-root" -maxdepth 6 \( -name 'diag.log' -o -name '*-driver.log' \) -print -exec tail -n 60 {} \; 2>/dev/null || true
+          # The container ran as root: its files may be owner-only, so read them with sudo. The
+          # script also copies its logs to /root/e2e-diag (here: fedora-root/e2e-diag) before its own cleanup.
+          sudo find "$RUNNER_TEMP/fedora-root" -maxdepth 6 \( -name 'diag.log' -o -name '*-driver.log' \) -print -exec tail -n 60 {} \; 2>/dev/null || true
+          sudo find "$RUNNER_TEMP/fedora-root/e2e-diag" -type f -print -exec tail -n 80 {} \; 2>/dev/null || true
+
+      - name: Upload the Fedora diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-diag-fedora
+          path: ${{ runner.temp }}/fedora-root/e2e-diag
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Remove the root-owned container files
         if: always()
@@ -201,7 +217,24 @@ jobs:
           command -v WebKitWebDriver
 
       - name: AppImage M6 section (wizard, Install CLI to PATH, wrapper doctor, moved AppImage)
+        env:
+          # The script copies the diag log and the driver logs here before its cleanup trap deletes them.
+          E2E_DIAG_DIR: ${{ runner.temp }}/e2e-diag-appimage
         run: CI=true bash ci/appimage-smoke.sh --m6 dist
+
+      - name: AppImage diagnostics
+        if: always()
+        run: |
+          find "$RUNNER_TEMP/e2e-diag-appimage" -type f -print -exec tail -n 80 {} \; 2>/dev/null || true
+
+      - name: Upload the AppImage diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-diag-appimage
+          path: ${{ runner.temp }}/e2e-diag-appimage
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Kill stray processes
         if: always()

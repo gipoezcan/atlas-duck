@@ -12,7 +12,9 @@
 # itself (evidence that the probe can see a listener).
 #
 # Checks: no listener on the inspector port; `startup_env_scrubbed` for each variable set in
-# the app's diag log; a WebKitWebProcess is running.
+# the app's diag log; a WebKitWebProcess that is a CHILD of the app is running (a process left over
+# from an earlier step must neither satisfy the check nor go unnoticed: any WebKitWebProcess that
+# exists before the app starts fails the script, and the CI job kills strays before this step).
 set -euo pipefail
 export LC_ALL=C
 
@@ -85,6 +87,10 @@ export WEBKIT_INSPECTOR_HTTP_SERVER="127.0.0.1:$port"
 export WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS="--remote-debugging-port=$port"
 export WEBVIEW2_USER_DATA_FOLDER="$work/wv2"
 export ATLAS_DUCK_E2E_ALLOW_DRIVER=1
+if pgrep -f WebKitWebProcess >/dev/null; then
+  ps -eo pid,ppid,args | grep -F WebKitWebProcess >&2 || true
+  fail "a WebKitWebProcess exists before the app starts (a stray from an earlier step)"
+fi
 "$exe" >"$work/app.out" 2>&1 &
 pid=$!
 
@@ -95,11 +101,11 @@ for _ in $(seq 1 300); do
     cat "$work/app.out" >&2 || true
     fail "the release app exited before a webview process appeared"
   fi
-  if pgrep -f WebKitWebProcess >/dev/null; then seen=1; break; fi
+  if pgrep -P "$pid" -f WebKitWebProcess >/dev/null; then seen=1; break; fi
   sleep 0.2
 done
-[ -n "$seen" ] || { cat "$work/app.out" >&2 || true; fail "no WebKitWebProcess within 60 s: no webview, the check would be vacuous"; }
-echo "S04 webview_process=$(pgrep -f WebKitWebProcess | head -n 1)"
+[ -n "$seen" ] || { cat "$work/app.out" >&2 || true; fail "no WebKitWebProcess child of the app within 60 s: no webview, the check would be vacuous"; }
+echo "S04 webview_process=$(pgrep -P "$pid" -f WebKitWebProcess | head -n 1) (child of app pid $pid)"
 
 # Give the webview time to open a port, were one to be opened.
 sleep 15

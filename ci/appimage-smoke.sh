@@ -138,7 +138,7 @@ m4_inner() {
 # provides): releasing a request through the Approvals window and `await`; the Linux `e2e` job runs
 # that flow (ui06) against the same drive code.
 m6_inner() {
-  local appimage="$1" tools="$2" here="$3" work="$4" passwd_home wrapper cli_toml app_path code line cmdline pid
+  local appimage="$1" tools="$2" here="$3" work="$4" passwd_home wrapper cli_toml app_path code line cmdline pid gate
   unset APPIMAGE_EXTRACT_AND_RUN
   trap "m4_stop_app \"$appimage\" || true; pkill -x gnome-keyring-d || true" EXIT
   passwd_home="$(getent passwd "$(id -un)" | cut -d: -f6)"
@@ -182,8 +182,11 @@ m6_inner() {
     cat "$work/m6-doctor.json" "$work/m6-doctor.err" >&2 || true
     m4_fail "doctor through the wrapper exited $code, expected 0"
   fi
-  m4_json_field "$work/m6-doctor.json" data.app.gate >/dev/null || m4_fail "doctor through the wrapper has no data.app.gate: $(cat "$work/m6-doctor.json")"
-  echo "M6 wrapper: doctor exit 0"
+  gate="$(m4_json_field "$work/m6-doctor.json" data.app.gate)" || m4_fail "doctor through the wrapper has no data.app.gate: $(cat "$work/m6-doctor.json")"
+  # After a completed wizard the gate is never first_run: the app the wrapper cold-started reads the
+  # store the wizard created under the same data dir.
+  [ -n "$gate" ] && [ "$gate" != first_run ] || m4_fail "doctor through the wrapper reports gate '$gate' after the wizard (the store was not seen)"
+  echo "M6 wrapper: doctor exit 0, gate=$gate"
 
   pid="$(pgrep -f -x -- "$appimage --background" | head -n 1 || true)"
   [ -n "$pid" ] || m4_fail "no process '$appimage --background' after the wrapper's cold start"
@@ -194,6 +197,19 @@ m6_inner() {
   esac
   [ "$cmdline" = "$appimage --background" ] || m4_fail "the wrapper-launched command line is '$cmdline', expected '$appimage --background'"
   kill -0 "$pid" || m4_fail "the cold-started app is not alive"
+
+  # The CLI that launched the app has exited: a second call through the wrapper must reach the same
+  # instance (CI-04: the app outlives the CLI that started it).
+  set +e
+  timeout 120 "$wrapper" doctor --timeout 60 >"$work/m6-doctor2.json" 2>"$work/m6-doctor2.err"
+  code=$?
+  set -e
+  if [ "$code" -ne 0 ]; then
+    cat "$work/m6-doctor2.json" "$work/m6-doctor2.err" >&2 || true
+    m4_fail "the second doctor through the wrapper (after the launching CLI exited) exited $code, expected 0"
+  fi
+  [ "$(pgrep -f -x -- "$appimage --background" | head -n 1 || true)" = "$pid" ] || m4_fail "the second doctor started another app instead of reaching pid $pid"
+  echo "M6 wrapper: a second doctor after the launching CLI exited reached the same app, exit 0"
 
   # The AppImage moves: the wrapper exits 5 with the not_running envelope and the re-install hint.
   m4_stop_app "$appimage"
@@ -207,6 +223,17 @@ m6_inner() {
   grep -qF '"reason":"not_running"' "$work/m6-moved.json" || m4_fail "moved-AppImage envelope lacks details.reason not_running: $(cat "$work/m6-moved.json")"
   grep -qF 're-run Install CLI to PATH' "$work/m6-moved.json" || m4_fail "moved-AppImage envelope lacks the re-install hint: $(cat "$work/m6-moved.json")"
   echo "M6 moved AppImage: exit 5 not_running with the re-install hint"
+}
+
+# m6_save_diag <work>: copies the diag log and the driver logs to $E2E_DIAG_DIR (the workflow prints and
+# uploads it on failure) before the EXIT trap deletes <work>.
+m6_save_diag() {
+  local work="$1" f
+  [ -n "${E2E_DIAG_DIR:-}" ] || return 0
+  mkdir -p "$E2E_DIAG_DIR" 2>/dev/null || return 0
+  while IFS= read -r f; do
+    cp "$f" "$E2E_DIAG_DIR/$(echo "${f#"$work"/}" | tr / _)" 2>/dev/null || true
+  done < <(find "$work" \( -name diag.log -o -name '*.log' -o -name 'm6-*.json' -o -name 'm6-*.err' \) -type f 2>/dev/null)
 }
 
 # appimage-smoke.sh --m6 <e2e-artifact-dir>: the M6 section alone, CI only, on the downloaded
@@ -226,7 +253,7 @@ m6_outer() {
   chmod +x "$e2e_dist/tools/tauri-driver"
   work="$(mktemp -d)"
   # Expanded now: the EXIT trap runs after this function returned, when the local is gone (set -u).
-  trap "pkill -x atlas-duck-app || true; rm -rf \"$work\"" EXIT
+  trap "m6_save_diag \"$work\"; pkill -x atlas-duck-app || true; rm -rf \"$work\"" EXIT
   m6_dir="$work/m6"
   mkdir -p "$m6_dir/home" "$m6_dir/keys" "$m6_dir/out"
   cp "${e2e_images[0]}" "$m6_dir/atlas-duck-e2e.AppImage"
