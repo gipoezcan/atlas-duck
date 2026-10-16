@@ -404,8 +404,97 @@ async fn decision_button(wd: &WebDriver) -> Result<Element> {
         let _ = wd.click(&h).await;
     }
     let b = wd.wait_find("button[data-positive-decision]", WAIT).await?;
-    wait_enabled(wd, &b, INERT_WAIT).await?;
+    if let Err(e) = wait_enabled(wd, &b, INERT_WAIT).await {
+        return Err(format!("{e} (the decision button): {}", detail_state(wd).await).into());
+    }
     Ok(b)
+}
+
+/// What the opened card says, for a failure text: its status and alert lines and its own buttons
+/// (an "Open" button means the shown revision went stale), never the preview frame.
+async fn detail_state(wd: &WebDriver) -> String {
+    let lines = match wd
+        .find_all(
+            "article.detail [role=status], article.detail [role=alert], article.detail > button",
+        )
+        .await
+    {
+        Ok(found) => found,
+        Err(e) => return format!("the detail pane is unreadable ({e})"),
+    };
+    let mut texts = Vec::new();
+    for e in &lines {
+        texts.push(
+            wd.text(e)
+                .await
+                .unwrap_or_else(|e| format!("unreadable ({e})")),
+        );
+    }
+    if texts.is_empty() {
+        "the detail pane shows no status, alert or button of its own".to_owned()
+    } else {
+        format!("the detail pane shows {texts:?}")
+    }
+}
+
+/// How many clicks on the enabled positive button UI-06 makes before it gives up.
+const APPROVE_CLICKS: u32 = 3;
+/// A click that changed nothing on the page within this long was not taken.
+const NOT_TAKEN_AFTER: Duration = Duration::from_secs(3);
+
+/// Clicks the positive button `b` until the page records the decision. The page drops a click that
+/// falls into an inert period without a trace (spec 5.6: `send` re-reads the clock), and a driver
+/// may start such a period itself (its input can focus the window: a window focus restarts it). A
+/// click that was not taken leaves the page as it was: no decision, no alert, the button enabled
+/// (a call in flight disables it). Only such a click is repeated, after the inert period, at most
+/// [`APPROVE_CLICKS`] times; an alert, a stale revision or a decision ends the loop, and every
+/// failure names what the card shows.
+async fn click_until_decided(wd: &WebDriver, b: &Element) -> Result<()> {
+    for click in 1..=APPROVE_CLICKS {
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        if let Err(e) = wait_enabled(wd, b, INERT_WAIT).await {
+            return Err(format!("{e} (before click {click}): {}", detail_state(wd).await).into());
+        }
+        wd.click(b).await?;
+        let clicked = Instant::now();
+        loop {
+            if body_text(wd).await?.contains("Decision recorded") {
+                return Ok(());
+            }
+            // A decided card shows its Open button too (nothing is opened any more): the decision
+            // is read again after the check, so one landing in between is no refusal.
+            let refused = !wd.find_all("article.detail [role=alert]").await?.is_empty()
+                || !wd.find_all("article.detail > button").await?.is_empty();
+            if refused && body_text(wd).await?.contains("Decision recorded") {
+                return Ok(());
+            }
+            if refused {
+                return Err(format!(
+                    "click {click} on the enabled button was answered without a decision: {}",
+                    detail_state(wd).await
+                )
+                .into());
+            }
+            if clicked.elapsed() > WAIT {
+                return Err(format!(
+                    "timed out after {WAIT:?} waiting for the decision of click {click}: {}",
+                    detail_state(wd).await
+                )
+                .into());
+            }
+            // Still enabled: not in flight, so not taken. (Gone or disabled: in flight or decided.)
+            if clicked.elapsed() > NOT_TAKEN_AFTER && wd.is_enabled(b).await.unwrap_or(false) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    Err(format!(
+        "{APPROVE_CLICKS} clicks on the enabled button were not taken (no decision, no alert, the \
+         button stayed enabled): {}",
+        detail_state(wd).await
+    )
+    .into())
 }
 
 async fn click_tabs(wd: &WebDriver) -> Result<usize> {
@@ -499,15 +588,9 @@ async fn ui06(rig: &Rig) -> Result<()> {
         .iter()
         .any(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/rest/api/2/issue"));
     ensure!(!posted, "the mock saw the create POST after Enter or Space");
-    // The keys above focused the button: a focus the user did not request starts the inert period
-    // again (spec 5.6), and a click inside it is dropped. Wait it out, then click.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    wait_enabled(wd, &approve, INERT_WAIT).await?;
-    wd.click(&approve).await?;
-    wait_text(wd, "the decision to be recorded", WAIT, |t| {
-        t.contains("Decision recorded")
-    })
-    .await?;
+    // The keys above may have focused the window (a driver's input can): a window focus starts the
+    // inert period again (spec 5.6), and a click inside it is dropped. Wait it out, then click.
+    click_until_decided(wd, &approve).await?;
 
     let out = tokio::time::timeout(Duration::from_secs(120), cli.wait_with_output())
         .await
