@@ -208,6 +208,16 @@ pub async fn mount_title_lookup(mock: &MockDc, space: &str, title: &str, results
         .await;
 }
 
+/// `GET /rest/api/search` (any query) answers `body` (`confluence.search`).
+pub async fn mount_search(mock: &MockDc, body: &Value) {
+    mount_get(mock, "/rest/api/search", json_answer(mock, 200, body)).await;
+}
+
+/// The search GETs (`GET /rest/api/search`) the mock received, in order.
+pub async fn search_gets(mock: &MockDc) -> Vec<wiremock::Request> {
+    super::jira::gets_on(mock, "/rest/api/search").await
+}
+
 async fn mount_pages(mock: &MockDc, p: &str, pages: &[Value]) {
     for page in pages {
         let start = page["start"].as_u64().unwrap_or(0).to_string();

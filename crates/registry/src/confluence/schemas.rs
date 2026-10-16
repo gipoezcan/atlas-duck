@@ -79,10 +79,11 @@ pub(crate) const SEARCH_PARAMS: &str = r#"{"$schema":"https://json-schema.org/dr
   "max":{"type":"integer","minimum":1,"default":25},
   "excerpt":{"type":"string","enum":["none","indexed"],"default":"none"}},
  "examples":[{"cql":"space = ABC AND type = page AND title ~ \"Release\""}]}"#;
-pub(crate) const SEARCH_EXAMPLE: &str = r#"{"results":[{"content":{"id":"123456","type":"page","status":"current","_links":{"webui":"/display/ABC/Release+notes"}},"title":"Release notes","excerpt":"","url":"/display/ABC/Release+notes","resultGlobalContainer":{"title":"Alpha Beta Cooperation","displayUrl":"/display/ABC"},"lastModified":"2026-09-03T14:02:10.000+0200"}],"start":0,"limit":25,"size":1,"totalSize":1}"#;
+// PD-101 (Δ4 c): the §7.4 release list; core prunes every other key of the answer.
+pub(crate) const SEARCH_EXAMPLE: &str = r#"{"results":[{"content":{"id":"123456","type":"page"},"title":"Release notes","excerpt":"","url":"/display/ABC/Release+notes","resultGlobalContainer":{"title":"Alpha Beta Cooperation"},"lastModified":"2026-09-03T14:02:10.000+0200"}],"start":0,"limit":25,"size":1,"totalSize":1}"#;
 pub(crate) const SEARCH_EXAMPLE_SPARSE: &str =
     r#"{"results":[],"start":0,"limit":25,"size":0,"totalSize":0}"#;
-pub(crate) const SEARCH_RESULT: &str = r#"{"type":"object","required":["results"],"properties":{"results":{"type":"array","items":{"type":"object","properties":{"content":{"type":"object"},"title":{"type":"string"},"excerpt":{"type":"string"},"url":{"type":"string"},"resultGlobalContainer":{"type":"object"},"lastModified":{"type":"string"}}}},"start":{"type":"integer"},"limit":{"type":"integer"},"size":{"type":"integer"},"totalSize":{"type":"integer"}}}"#;
+pub(crate) const SEARCH_RESULT: &str = r#"{"type":"object","required":["results"],"properties":{"results":{"type":"array","items":{"type":"object","required":["content"],"properties":{"content":{"type":"object","properties":{"id":{"type":"string"},"type":{"type":"string"}}},"title":{"type":"string"},"excerpt":{"type":"string"},"url":{"type":"string"},"resultGlobalContainer":{"type":"object","properties":{"title":{"type":"string"}}},"lastModified":{"type":"string"}}}},"start":{"type":"integer"},"limit":{"type":"integer"},"size":{"type":"integer"},"totalSize":{"type":"integer"},"_links":{"type":"object"}}}"#;
 
 // ---- confluence.comment.list ------------------------------------------------------------------
 

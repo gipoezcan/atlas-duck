@@ -9,6 +9,9 @@
 //! `READ_FETCHED` from the per-instance cache and, for misses, by sequential
 //! `GET /rest/api/user?key=` lookups under the request's cover (`PREVIEW_FETCH {purpose:
 //! resolve}`); the map is committed in `READ_FETCHED` and is the only one a rebuild uses.
+//!
+//! Task 12a (PD-101, PD-102, §13 U-28, U-31): `confluence.search` releases only the §7.4 keys,
+//! previews as a table under the effective CQL, and raises the Info `cql_broad`.
 
 mod common;
 
@@ -29,8 +32,9 @@ use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_preview::{OutcomeKind, PreviewBody};
 use common::confluence::{
     PAGE_EXPAND_STORAGE, PAGE_EXPAND_VIEW, amplified_storage, content_path, mount_history_summary,
-    mount_history_version, mount_page, mount_page_delayed, mount_page_view, mount_user_answer,
-    mount_users, mount_users_delayed, page_with_storage, page_with_view, user, user_gets,
+    mount_history_version, mount_page, mount_page_delayed, mount_page_view, mount_search,
+    mount_user_answer, mount_users, mount_users_delayed, page_with_storage, page_with_view,
+    search_gets, user, user_gets,
 };
 use common::jira::{gets_on, query};
 use common::{TestError, TestResult, code, de, request_id, test_hits};
@@ -1516,5 +1520,449 @@ async fn body_not_xml_ok_looks_nobody_up() -> TestResult {
     let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
     assert!(user_gets(mock).await.is_empty());
     assert_eq!(read_fetched(&h, &id).await?["user_resolutions"], json!({}));
+    Ok(())
+}
+
+// ---- Task 12a: search release list, search table, cql_broad (PD-101, PD-102, U-28, U-31) ------
+
+const SEARCH: &str = "confluence.search";
+
+/// One `/rest/api/search` result as Confluence DC sends it, with the keys §7.4 does not release
+/// (`content.status`, `content.title`, `content._links`, `entityType`, `iconCssClass`,
+/// `friendlyLastModified`, `breadcrumbs`, `resultGlobalContainer.displayUrl`).
+fn search_hit(id: &str, title: &str, space: &str, kind: &str) -> Value {
+    let slug = title.replace(' ', "+");
+    json!({
+        "content": {
+            "id": id, "type": kind, "status": "current", "title": title,
+            "_links": {"webui": format!("/display/DOC/{slug}"), "self": format!("https://wiki.corp.example/rest/api/content/{id}")}
+        },
+        "title": title,
+        "excerpt": format!("About {title}"),
+        "url": format!("/display/DOC/{slug}"),
+        "resultGlobalContainer": {"title": space, "displayUrl": "/display/DOC"},
+        "breadcrumbs": [{"label": space, "url": "/display/DOC"}],
+        "entityType": "content",
+        "iconCssClass": "aui-icon content-type-page",
+        "lastModified": "2026-10-06T14:00:00.000+02:00",
+        "friendlyLastModified": "Oct 06, 2026"
+    })
+}
+
+/// A search answer page holding `results`, with `totalSize` and the root keys DC adds.
+fn search_answer(results: Vec<Value>, total: u64) -> Value {
+    json!({
+        "results": results.clone(),
+        "start": 0,
+        "limit": 25,
+        "size": results.len(),
+        "totalSize": total,
+        "cqlQuery": "secret effective query",
+        "searchDuration": 12,
+        "_links": {"base": "https://wiki.corp.example", "context": "/wiki"}
+    })
+}
+
+/// Every string of `v` (keys and values).
+fn strings_of(v: &Value) -> Vec<String> {
+    match v {
+        Value::String(s) => vec![s.clone()],
+        Value::Array(a) => a.iter().flat_map(strings_of).collect(),
+        Value::Object(m) => m
+            .iter()
+            .flat_map(|(k, v)| std::iter::once(k.clone()).chain(strings_of(v)))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// §13 U-28 (`confluence.search`): an every-occurrence mask of the title reaches the `url` (a
+/// URL field), whose `%`-encoded, lower-hex and entity forms all match; the release stays blocked
+/// until the user picks what happens to the URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u28_confluence_search_mask_reaches_url() -> TestResult {
+    use atlas_duck_core::redact::BlockReason;
+    use atlas_duck_core::redact::views::canonical_hit;
+    use atlas_duck_core::{RedactionOp, UrlMode};
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let title = "Falcon Müller Plan";
+    let mut hit = search_hit("65537", title, "Legal", "page");
+    hit["url"] = json!("/display/LEGAL/Falcon+M%C3%BCller+Plan");
+    hit["excerpt"] = json!("see Falcon%20M%c3%bcller%20Plan");
+    hit["resultGlobalContainer"]["title"] = json!("Falcon M&uuml;ller Plan space");
+    // Not released (PD-101): never part of the candidate, so never a path to mask.
+    hit["content"]["title"] = json!("Falcon M&#252;ller Plan");
+    let mut second = search_hit("65538", "Falcon M&#252;ller Plan (draft)", "Legal", "page");
+    second["url"] = json!("/display/LEGAL/Draft");
+    second["excerpt"] = json!("");
+    mount_search(mock, &search_answer(vec![hit, second], 2)).await;
+    let params = json!({ "cql": "space = LEGAL", "excerpt": "indexed" });
+    let mask = || RedactionOp::MaskText {
+        text: title.into(),
+        every_occurrence: true,
+        at: None,
+    };
+    let paths = [
+        "results[0].excerpt",
+        "results[0].resultGlobalContainer.title",
+        "results[0].title",
+        "results[0].url",
+        "results[1].title",
+    ];
+
+    let id = queued(&h, SEARCH, params.clone()).await?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    // No URL choice: every canonical form is listed and the URL blocks the release.
+    let report = ap.redaction_preview(&id, &[mask()]).map_err(de)?;
+    let mut listed = report.also_appears_in.clone();
+    listed.sort();
+    listed.dedup();
+    assert_eq!(listed, paths);
+    assert!(report.blocked.contains(&BlockReason::MaskStillOccurs {
+        path: "results[0].url".into()
+    }));
+    assert!(
+        ap.redact(&id, vec![mask()]).is_err(),
+        "release stays blocked"
+    );
+
+    // The URL replaced whole: nothing blocks, the release holds no form of the title.
+    let url = RedactionOp::UrlField {
+        mode: UrlMode::ReplaceWhole,
+    };
+    assert!(
+        ap.redaction_preview(&id, &[mask(), url.clone()])
+            .map_err(de)?
+            .blocked
+            .is_empty()
+    );
+    ap.redact(&id, vec![mask(), url]).map_err(de)?;
+    ap.open(&id).map_err(de)?;
+    let env = released(&h, &id).await?;
+    assert!(env.redacted);
+    let result = result_of(&env)?;
+    assert_eq!(result["results"][0]["url"], "[REDACTED]");
+    assert_eq!(result["results"][1]["url"], "/display/LEGAL/Draft");
+    for s in strings_of(&result) {
+        assert!(!canonical_hit(&s, title), "still in {s:?}");
+    }
+    assert!(result["results"][0]["content"].get("title").is_none());
+
+    // The URL dropped instead: gone, and named in `fields_dropped`.
+    let id = queued(&h, SEARCH, params).await?;
+    ap.open(&id).map_err(de)?;
+    let drop = RedactionOp::UrlField {
+        mode: UrlMode::Drop,
+    };
+    ap.redact(&id, vec![mask(), drop]).map_err(de)?;
+    ap.open(&id).map_err(de)?;
+    let env = released(&h, &id).await?;
+    let result = result_of(&env)?;
+    assert!(result["results"][0].get("url").is_none(), "{result}");
+    assert_eq!(
+        meta_of(&env)?["redactions"]["fields_dropped"],
+        json!(["url"])
+    );
+    for s in strings_of(&result) {
+        assert!(!canonical_hit(&s, title), "still in {s:?}");
+    }
+    Ok(())
+}
+
+/// §13 U-31: the rewritten CQL is what goes on the wire, and the preview header shows it
+/// display-escaped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u31_effective_cql_on_the_wire_and_in_preview() -> TestResult {
+    use atlas_duck_preview::invisible::escape_for_display;
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_search(
+        mock,
+        &search_answer(vec![search_hit("1", "A", "Docs", "page")], 1),
+    )
+    .await;
+    let cql = "space = DOC OR label = \"x\u{202E}y\" ORDER BY title";
+    let effective = "(space = DOC OR label = \"x\u{202E}y\") AND type in (page,blogpost,comment,attachment) ORDER BY title";
+    let id = queued(&h, SEARCH, json!({ "cql": cql })).await?;
+    let gets = search_gets(mock).await;
+    let [only] = gets.as_slice() else {
+        return Err(format!("{} search GETs", gets.len()).into());
+    };
+    assert_eq!(query(only, "cql").as_deref(), Some(effective));
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let shown = escape_for_display(effective);
+    assert!(shown.contains("⟨U+202E⟩"), "{shown}");
+    assert_eq!(preview.header.query.as_deref(), Some(shown.as_str()));
+    Ok(())
+}
+
+/// §13 U-31: a mid-query `ORDER BY`, an unterminated quote and a parenthesis escape are
+/// refused at validation: exit 2, `details.param == "cql"`, the CQL never echoed, nothing queued,
+/// nothing sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u31_rejections_exit2_nothing_queued() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_search(mock, &search_answer(Vec::new(), 0)).await;
+    for cql in [
+        "space = DOC ORDER BY title AND label = zebra",
+        "title ~ \"zebra unterminated",
+        "space=ZEBRA) OR (type=space",
+    ] {
+        let env = h.submit(SEARCH, json!({ "cql": cql })).await;
+        let line = env.to_json_line();
+        assert_eq!(env.status, Status::Failed, "{line}");
+        assert_eq!(code(&env), "validation", "{line}");
+        assert_eq!(common::exit(&env), 2);
+        assert_eq!(common::detail(&env, "param"), "cql", "{line}");
+        assert!(!line.to_lowercase().contains("zebra"), "CQL echoed: {line}");
+        let id = request_id(&env)?;
+        assert_eq!(
+            h.event_types(&id).await?,
+            [EventType::REQUEST_RECEIVED, EventType::REQUEST_REJECTED]
+        );
+        assert!(h.approver().item(&id).is_none(), "nothing queued");
+    }
+    assert!(test_hits(mock).await.is_empty(), "nothing sent");
+    Ok(())
+}
+
+/// PD-101 (lead ruling Q7): the released results carry only the §7.4 keys, the root only its
+/// paging keys; `totalSize` stays as sent; a result without `content` is removed and counted.
+/// The pruning is a function of the committed payload alone (a rebuild agrees).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_results_pruned_to_spec_fields() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let mut bare = search_hit("0", "a space, not content", "Docs", "page");
+    if let Some(o) = bare.as_object_mut() {
+        o.remove("content");
+    }
+    let mut odd = search_hit("65538", "Odd", "Docs", "blogpost");
+    odd["resultGlobalContainer"] = json!("not an object");
+    odd["content"]["id"] = json!(65538);
+    let answer = search_answer(
+        vec![
+            search_hit("65537", "Release checklist", "Docs", "page"),
+            bare,
+            odd,
+        ],
+        57,
+    );
+    mount_search(mock, &answer).await;
+    let params = json!({ "cql": "space = DOC", "excerpt": "indexed" });
+    let id = queued(&h, SEARCH, params.clone()).await?;
+    let env = released(&h, &id).await?;
+    let result = result_of(&env)?;
+    assert_eq!(
+        result,
+        json!({
+            "results": [
+                {
+                    "content": {"id": "65537", "type": "page"},
+                    "title": "Release checklist",
+                    "excerpt": "About Release checklist",
+                    "url": "/display/DOC/Release+checklist",
+                    "resultGlobalContainer": {"title": "Docs"},
+                    "lastModified": "2026-10-06T14:00:00.000+02:00"
+                },
+                {
+                    "content": {"id": 65538, "type": "blogpost"},
+                    "title": "Odd",
+                    "excerpt": "About Odd",
+                    "url": "/display/DOC/Odd",
+                    "lastModified": "2026-10-06T14:00:00.000+02:00"
+                }
+            ],
+            "start": 0,
+            "limit": 25,
+            "size": 3,
+            "totalSize": 57,
+            "_links": {"base": "https://wiki.corp.example", "context": "/wiki"}
+        })
+    );
+    let meta = meta_of(&env)?;
+    assert_eq!(meta["redactions"]["items_dropped"], 1);
+    // The record keeps every byte received; only the candidate is pruned.
+    let fetched = read_fetched(&h, &id).await?;
+    let spec = atlas_duck_registry::get(SEARCH).ok_or("no registry op")?;
+    let pruned = |payload: &Value| normalize(spec, &params, payload).map_err(|e| format!("{e:?}"));
+    assert_eq!(pruned(&fetched)?, result);
+    assert_eq!(pruned(&fetched)?, result, "deterministic");
+    assert_eq!(pruned(&fetched_payload(&answer, None))?, result);
+    Ok(())
+}
+
+/// PD-102 (provisional, lead ruling Q11): the Info `cql_broad` is raised when the agent's CQL
+/// names no narrowing field directly before an operator. The table pins what the one-place rule
+/// flags and what it misses (Task 12a report).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cql_broad_info_rule() -> TestResult {
+    use atlas_duck_core::ops::confluence::cql_broad;
+    use atlas_duck_preview::warning::{Level, WarningId};
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_search(
+        mock,
+        &search_answer(vec![search_hit("1", "A", "Docs", "page")], 1),
+    )
+    .await;
+    for (cql, broad) in [
+        ("text ~ \"x\"", true),
+        ("space = DOC AND text ~ \"x\"", false),
+    ] {
+        let id = queued(&h, SEARCH, json!({ "cql": cql })).await?;
+        let preview = h.approver().open(&id).map_err(de)?.preview;
+        let found: Vec<_> = preview
+            .warnings
+            .iter()
+            .filter(|w| w.id == WarningId::CqlBroad)
+            .collect();
+        if broad {
+            let [w] = found.as_slice() else {
+                return Err(format!("{cql}: {} cql_broad", found.len()).into());
+            };
+            assert_eq!(w.level, Level::Info);
+            assert_eq!(w.text, atlas_duck_preview::warning::TEXT_CQL_BROAD);
+        } else {
+            assert!(found.is_empty(), "{cql}");
+        }
+    }
+    // Flagged (broad): no narrowing field before an operator.
+    for cql in [
+        "text ~ \"x\"",
+        "type = page",
+        "type = page ORDER BY lastmodified desc",
+        "lastmodified > now(\"-1d\")",
+        "created >= \"2026-01-01\"",
+        "siteSearch ~ \"release\"",
+        "mention = currentUser()",
+        "text ~ \"space = DOC\"",
+        "\"space\" = DOC",
+        "TEXT ~ x ORDER BY title",
+        "macro = jira",
+    ] {
+        assert!(cql_broad(cql), "should flag: {cql}");
+    }
+    // Not flagged: a narrowing field directly before an operator, any case, `IN`/`NOT IN` too.
+    for cql in [
+        "space = DOC AND text ~ \"x\"",
+        "SPACE=DOC",
+        "space in (DOC, OPS)",
+        "label not in (draft)",
+        "ancestor = 65537",
+        "parent = 65537",
+        "id = 65537",
+        "content = 65537",
+        "title ~ \"Release\"",
+        "creator = currentUser()",
+        "contributor = jdoe",
+        "space.key = DOC",
+        "space.title ~ \"Docs\"",
+        // Misses (documented): the rule does no boolean analysis.
+        "space = DOC OR text ~ \"x\"",
+        "NOT space = DOC",
+        "space != DOC",
+    ] {
+        assert!(!cql_broad(cql), "should not flag: {cql}");
+    }
+    // A CQL the rewrite refuses raises nothing (validation rejected it already).
+    assert!(!cql_broad("text ~ \"x"));
+    Ok(())
+}
+
+/// §6.3 "Confluence search": columns `title`, `space`, `type`, `last modified` (and `excerpt`
+/// only with `excerpt=indexed`), a row per released result, the count "N of totalSize".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_table_columns_and_count() -> TestResult {
+    use atlas_duck_preview::ItemCount;
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let mut tricky = search_hit("65538", "Bidi \u{202E}title", "Ops", "blogpost");
+    tricky["excerpt"] = json!("line one\nline two");
+    let answer = search_answer(
+        vec![
+            search_hit("65537", "Release checklist", "Docs", "page"),
+            tricky,
+        ],
+        40,
+    );
+    mount_search(mock, &answer).await;
+
+    let table = |preview: atlas_duck_preview::Preview| match preview.body {
+        PreviewBody::Table {
+            columns,
+            rows,
+            count,
+        } => Ok((columns, rows, count, preview.header)),
+        other => Err(format!("not a table: {other:?}")),
+    };
+
+    let id = queued(&h, SEARCH, json!({ "cql": "space = DOC", "max": 2 })).await?;
+    let (columns, rows, count, header) = table(h.approver().open(&id).map_err(de)?.preview)?;
+    assert_eq!(columns, ["title", "space", "type", "last modified"]);
+    assert_eq!(
+        rows,
+        [
+            [
+                "Release checklist",
+                "Docs",
+                "page",
+                "2026-10-06T14:00:00.000+02:00"
+            ],
+            [
+                "Bidi ⟨U+202E⟩title",
+                "Ops",
+                "blogpost",
+                "2026-10-06T14:00:00.000+02:00"
+            ]
+        ]
+    );
+    let want = ItemCount {
+        shown: 2,
+        total: Some(40),
+        more_available: true,
+    };
+    assert_eq!(count, Some(want));
+    assert_eq!(header.item_count, Some(want));
+    // What the table leaves out (the excerpts, the URLs, the root's `_links`) is counted.
+    assert!(header.hidden_in_preview_bytes > 0);
+
+    let id = queued(
+        &h,
+        SEARCH,
+        json!({ "cql": "space = DOC", "max": 2, "excerpt": "indexed" }),
+    )
+    .await?;
+    let (columns, rows, count, _) = table(h.approver().open(&id).map_err(de)?.preview)?;
+    assert_eq!(
+        columns,
+        ["title", "space", "type", "last modified", "excerpt"]
+    );
+    assert_eq!(rows[0][4], "About Release checklist");
+    assert!(!rows[1][4].contains('\n'), "{}", rows[1][4]);
+    assert!(rows[1][4].starts_with("line one"), "{}", rows[1][4]);
+    assert_eq!(count, Some(want));
+
+    // An answer that is no result list keeps the Fallback.
+    let h = Harness::confluence().await?;
+    wiki(&h)?
+        .json(
+            "/rest/api/search",
+            400,
+            r#"{"statusCode":400,"message":"bad"}"#,
+        )
+        .await;
+    let env = h.submit(SEARCH, json!({ "cql": "space = DOC" })).await;
+    let id = request_id(&env)?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert!(
+        !matches!(preview.body, PreviewBody::Table { .. }),
+        "{:?}",
+        preview.body
+    );
     Ok(())
 }

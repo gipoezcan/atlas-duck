@@ -444,7 +444,7 @@ fn comment_views(
 const CELL_CAP_CHARS: usize = 200;
 
 /// A table has at most this many rows; the last row says how many items it leaves out.
-const TABLE_ROW_CAP: usize = 500;
+pub(super) const TABLE_ROW_CAP: usize = 500;
 
 /// The columns of a table come from this many first items.
 const COLUMN_SAMPLE_ITEMS: usize = 50;
@@ -460,7 +460,7 @@ const COLUMN_NAME_CAP_CHARS: usize = 64;
 /// uncounted.
 const IDENT_CAP_BYTES: usize = 256;
 
-fn short_string(v: &Value) -> bool {
+pub(super) fn short_string(v: &Value) -> bool {
     matches!(v, Value::String(s) if s.len() <= IDENT_CAP_BYTES)
 }
 
@@ -499,11 +499,11 @@ const LIST_KEYS: [&str; 5] = [
 const LEADING_KEYS: [&str; 4] = ["id", "key", "name", "displayName"];
 
 /// Bytes a key and its value take as compact JSON: what a layout that drops them hides.
-fn pair_bytes(key: &str, value: &Value) -> u64 {
+pub(super) fn pair_bytes(key: &str, value: &Value) -> u64 {
     u64::try_from(key.len().saturating_add(value.to_string().len())).unwrap_or(u64::MAX)
 }
 
-fn bytes_of(value: &Value) -> u64 {
+pub(super) fn bytes_of(value: &Value) -> u64 {
     u64::try_from(value.to_string().len()).unwrap_or(u64::MAX)
 }
 
@@ -551,12 +551,12 @@ fn column_name(raw: &str, hidden: &mut u64) -> String {
 }
 
 /// A table cell of an item's member, or empty where the item has none.
-fn cell_of(member: Option<&Value>, hidden: &mut u64) -> String {
+pub(super) fn cell_of(member: Option<&Value>, hidden: &mut u64) -> String {
     member.map_or_else(String::new, |v| cell(v, hidden))
 }
 
 /// The row that says what the row cap left out; its text is in the first cell.
-fn omitted_row(columns: usize, omitted: usize) -> Vec<String> {
+pub(super) fn omitted_row(columns: usize, omitted: usize) -> Vec<String> {
     let mut row = vec![format!("… {omitted} more items (see Raw)")];
     row.resize(columns.max(1), String::new());
     row
@@ -573,7 +573,7 @@ fn other_root_bytes(root: &Value, items_key: Option<&str>) -> u64 {
 }
 
 /// The count of a table: the paging facts of the read, else what the list holds.
-fn table_count(header: &mut PreviewHeader, shown: usize) -> Option<ItemCount> {
+pub(super) fn table_count(header: &mut PreviewHeader, shown: usize) -> Option<ItemCount> {
     let shown = u64::try_from(shown).unwrap_or(u64::MAX);
     let count = header.item_count.unwrap_or(ItemCount {
         shown,

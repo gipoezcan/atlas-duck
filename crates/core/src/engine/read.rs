@@ -1649,7 +1649,8 @@ fn outcome_code(outcome: &str) -> Option<ErrorCode> {
 
 /// The result: one response's JSON, or for a paged op the first page's object with the items of
 /// every page under `items_key` (server totals as sent, §4.2). `confluence.search` results
-/// without a `content` object are removed and counted (§7.4 defence in depth).
+/// without a `content` object are removed and counted (§7.4 defence in depth), and the rest is
+/// pruned to the §7.4 release list (PD-101).
 pub(super) fn result_body<'a>(
     spec: &OperationSpec,
     bodies: impl IntoIterator<Item = &'a [u8]>,
@@ -1675,6 +1676,7 @@ pub(super) fn result_body<'a>(
             let before = items.len();
             items.retain(|r| r.get("content").is_some_and(Value::is_object));
             dropped = u64::try_from(before - items.len()).unwrap_or(u64::MAX);
+            confluence::prune_search(&mut body, &mut items);
         }
         if let Some(o) = body.as_object_mut() {
             o.insert(paging.items_key.to_owned(), Value::Array(items));

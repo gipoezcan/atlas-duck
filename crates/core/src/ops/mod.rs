@@ -8,6 +8,7 @@
 
 pub mod confluence;
 pub(crate) mod confluence_body;
+pub(crate) mod confluence_preview;
 pub mod generic;
 pub mod jira;
 pub(crate) mod jira_body;

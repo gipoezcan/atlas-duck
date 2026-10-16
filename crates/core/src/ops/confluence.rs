@@ -1,5 +1,6 @@
 //! Confluence specifics: the `confluence.search` CQL type-filter rewrite (§7.4, part of the
-//! static validation of §5.2 step 1), `confluence.page.update`
+//! static validation of §5.2 step 1), its release list (PD-101) and `cql_broad` (PD-102),
+//! `confluence.page.update`
 //! (storage verbatim or Markdown converted, `confluence_body`) and, from M7, the `format` of the page reads (PD-100).
 
 use atlas_duck_atlassian::GetCall;
@@ -9,6 +10,7 @@ use atlas_duck_registry::OperationSpec;
 use serde_json::{Map, Value, json};
 
 use super::confluence_body::{EmptyBody, storage_text};
+use super::confluence_preview::search_table;
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
     PreviewCtx, PreviewModel, ReadPlan, generic, get_call, json_request, resolve_url, single_round,
@@ -206,6 +208,95 @@ fn is_sort_clause<'q>(tokens: &[(Tok, u32)], word: impl Fn(&Tok) -> Option<&'q s
     want != Want::Key
 }
 
+/// PD-102 (provisional, lead ruling Q11): the fields that narrow a search when the agent's CQL
+/// names one as a word directly before an operator. `space.key` and `space.title` name the space
+/// as `space` does.
+pub const CQL_NARROWING_FIELDS: [&str; 11] = [
+    "space",
+    "space.key",
+    "space.title",
+    "ancestor",
+    "parent",
+    "id",
+    "content",
+    "title",
+    "label",
+    "creator",
+    "contributor",
+];
+
+/// §6.2 Info `cql_broad` "CQL may enumerate many results" (PD-102): the one place of the rule.
+/// True when the agent's CQL (before the rewrite) names none of [`CQL_NARROWING_FIELDS`]
+/// (ASCII case-insensitive, tokens of the rewrite's tokenizer, so quoted text never counts) as a
+/// word directly before an operator: `=`, `!=`, `~`, `!~`, `<`, `>`, `<=`, `>=` (operator
+/// characters), `IN` or `NOT IN`. It does no boolean analysis: `space = A OR text ~ x`, `NOT space = A` and
+/// `space != A` name a field and are not flagged. A CQL the tokenizer refuses (rejected at
+/// validation) is not flagged.
+pub fn cql_broad(cql: &str) -> bool {
+    let Ok(tokens) = tokenize(cql) else {
+        return false;
+    };
+    let word = |i: usize| match tokens.get(i) {
+        Some(&(Tok::Word { start, end }, _)) => Some(&cql[start..end]),
+        _ => None,
+    };
+    let is = |i: usize, w: &str| word(i).is_some_and(|s| s.eq_ignore_ascii_case(w));
+    let operator_at = |i: usize| {
+        matches!(tokens.get(i), Some((Tok::Op, _)))
+            || is(i, "in")
+            || (is(i, "not") && is(i + 1, "in"))
+    };
+    let narrowing = |i: usize| {
+        word(i).is_some_and(|w| {
+            CQL_NARROWING_FIELDS
+                .iter()
+                .any(|f| w.eq_ignore_ascii_case(f))
+        }) && operator_at(i + 1)
+    };
+    !(0..tokens.len()).any(narrowing)
+}
+
+/// PD-101 (lead ruling Q7; §7.4 "releases `totalSize` and per result `content.id`,
+/// `content.type`, `title`, `resultGlobalContainer.title`, `url`, `lastModified`, `excerpt?`"):
+/// the root keys a search keeps, so the paging metadata stays as sent.
+const SEARCH_ROOT_KEYS: [&str; 6] = ["results", "start", "limit", "size", "totalSize", "_links"];
+
+/// PD-101: the keys a search result keeps, each with the keys its object keeps (`None`: the
+/// value as sent).
+const SEARCH_RESULT_KEYS: [(&str, Option<&[&str]>); 6] = [
+    ("content", Some(&["id", "type"])),
+    ("title", None),
+    ("resultGlobalContainer", Some(&["title"])),
+    ("url", None),
+    ("lastModified", None),
+    ("excerpt", None),
+];
+
+/// PD-101: a search answer pruned to the §7.4 release list: the root to [`SEARCH_ROOT_KEYS`],
+/// each result to [`SEARCH_RESULT_KEYS`] (a nested object keeps only its listed keys; a listed
+/// object key whose value is no object is removed). A function of the answer alone, so every
+/// rebuild agrees.
+pub(crate) fn prune_search(root: &mut Value, results: &mut [Value]) {
+    if let Some(map) = root.as_object_mut() {
+        map.retain(|k, _| SEARCH_ROOT_KEYS.contains(&k.as_str()));
+    }
+    for result in results {
+        let Some(map) = result.as_object_mut() else {
+            continue;
+        };
+        map.retain(
+            |key, value| match SEARCH_RESULT_KEYS.iter().find(|(k, _)| k == key) {
+                None => false,
+                Some((_, None)) => true,
+                Some((_, Some(keep))) => value.as_object_mut().is_some_and(|inner| {
+                    inner.retain(|k, _| keep.contains(&k.as_str()));
+                    true
+                }),
+            },
+        );
+    }
+}
+
 /// The generic read plan with the rewritten CQL; a CQL the rewrite refuses is `Invalid` before
 /// any fetch (the validation hook of this op: the engine's dry executor call).
 pub fn search_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
@@ -217,13 +308,19 @@ pub fn search_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     generic::read_plan(ctx, &params)
 }
 
-/// The Fallback with the effective CQL as sent (§6.3 "Confluence search").
+/// §6.3 "Confluence search": the result table ([`search_table`]) under the effective CQL as sent,
+/// and the Info `cql_broad` ([`cql_broad`], PD-102). An answer that is no result list (an
+/// upstream error) keeps the Fallback.
 pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
-    let mut model = generic::fallback_preview(ctx);
-    model.query = effective_cql(str_param(ctx.params, "cql"))
-        .ok()
-        .map(|q| escape_for_display(&q));
+    let mut model = search_table(ctx).unwrap_or_else(|| generic::fallback_preview(ctx));
+    let cql = str_param(ctx.params, "cql");
+    model.query = effective_cql(cql).ok().map(|q| escape_for_display(&q));
     model.header.query = model.query.clone();
+    if cql_broad(cql) {
+        model
+            .warnings
+            .push(Warning::new(WarningId::CqlBroad, warning::TEXT_CQL_BROAD));
+    }
     model
 }
 
