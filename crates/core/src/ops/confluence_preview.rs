@@ -1171,3 +1171,89 @@ fn inline_raster(src: &str) -> bool {
             .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
     })
 }
+
+// ---- the comment card (§6.3 add comment, PD-107, Task 18) --------------------------------------
+
+/// §6.3 add comment for `confluence.comment.add` (PD-107) over the exact request (§5.1 inv. 4):
+/// a sentence naming the content and the reply, the facts enrichment read (container, space,
+/// reply target), the outgoing storage rendered locally (read from the request that is sent, never
+/// from the params; what the render leaves out of the storage the agent sends counts as hidden and
+/// raises `source_formatting_removed`, T12b rules) and the storage constructs of that body
+/// (§7.6). Every other hold, or a request that is not the comment JSON, keeps the generic write
+/// preview.
+pub(crate) fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let facts = view
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref())
+        .and_then(|s| s.confluence.as_ref());
+    let (Some(facts), Some(storage), PreviewBody::WriteRequests { .. }) =
+        (facts, sent_storage(view.requests), &model.body)
+    else {
+        return model;
+    };
+    let mut hidden = 0u64;
+    let (body_html, notes) = render_storage(
+        &storage,
+        COMMENT_MARKDOWN_BUDGET,
+        COMMENT_BODY_CAP,
+        None,
+        &mut hidden,
+    );
+    notes.push(&mut model.warnings);
+
+    let mut cut = 0u64;
+    let mut line = |raw: &str| {
+        let (shown, bytes) = generic::capped_text(raw, generic::CELL_CAP_CHARS * 2);
+        cut = cut.saturating_add(bytes);
+        shown
+    };
+    let kind = facts.container_type.as_deref().unwrap_or("content");
+    let (id, title) = facts
+        .page
+        .as_ref()
+        .map_or(("", ""), |p| (p.id.as_str(), p.title.as_str()));
+    let reply = ctx.params.get("reply_to").and_then(Value::as_str);
+    let on = format!("the {kind} \"{title}\"");
+    let sentence = match reply {
+        Some(reply) => line(&format!("Add a reply to comment {reply} on {on}")),
+        None => line(&format!("Add a comment to {on}")),
+    };
+    let mut rows = vec![("Content".to_owned(), line(&format!("{kind} {id}")))];
+    let space = match (facts.space_name.as_deref(), facts.space_key.as_str()) {
+        (Some(name), "") => Some(name.to_owned()),
+        (Some(name), key) => Some(format!("{name} ({key})")),
+        (None, "") => None,
+        (None, key) => Some(key.to_owned()),
+    };
+    if let Some(space) = space {
+        rows.push(("Space".to_owned(), line(&space)));
+    }
+    if let Some(reply) = reply {
+        rows.push(("Reply to".to_owned(), line(&format!("comment {reply}"))));
+    }
+    count_card_text(&mut model, [title, facts.space_key.as_str()]);
+
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::ContentWrite {
+        sentence,
+        rows,
+        body_html: Some(body_html),
+        constructs: Some(storage_construct_list(&storage)),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden.saturating_add(cut);
+    model
+}

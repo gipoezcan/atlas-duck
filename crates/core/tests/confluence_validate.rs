@@ -530,3 +530,48 @@ async fn approver_edit_of_the_body_is_checked() -> TestResult {
     );
     Ok(())
 }
+
+/// Plan review I-5 (moved here from Task 9): `confluence.comment.add` runs the same body checks
+/// in the validation dry call, before any enrichment GET: a placeholder in a Markdown body is
+/// `markdown_placeholders`, exit 2, with zero wiremock hits (not even the container GET); so is
+/// a comment that converts to nothing (T9 ruling 1) and a refused storage body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn comment_add_markdown_rejected_before_enrichment() -> TestResult {
+    const COMMENT: &str = "confluence.comment.add";
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    page_server(mock).await;
+    let before = hits(mock).await;
+    let env = h
+        .submit(
+            COMMENT,
+            json!({"content_id": "65537", "body": "see @user:8a7f808a1"}),
+        )
+        .await;
+    assert_rejected(&h, &env, "markdown_placeholders").await?;
+    assert_eq!(
+        detail(&env, "placeholders"),
+        json!([{"kind": "user", "count": 1}])
+    );
+    assert_eq!(message(&env), PLACEHOLDER_MESSAGE);
+    assert_eq!(hits(mock).await, before, "no wiremock hit");
+    for (body, format, want) in [
+        (" ", None, "validation"),
+        ("<!DOCTYPE x><p>a</p>", Some("storage"), "validation"),
+    ] {
+        let mut params = json!({"content_id": "65537", "body": body});
+        if let Some(f) = format {
+            params["body_format"] = json!(f);
+        }
+        let env = h.submit(COMMENT, params).await;
+        assert_rejected(&h, &env, want).await?;
+        assert_eq!(detail(&env, "param"), json!("body"), "{body:?}");
+    }
+    assert_eq!(hits(mock).await, before, "no wiremock hit");
+    // A clean body is queued, and only then is the container read.
+    let env = h
+        .submit(COMMENT, json!({"content_id": "65537", "body": "fine"}))
+        .await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    Ok(())
+}

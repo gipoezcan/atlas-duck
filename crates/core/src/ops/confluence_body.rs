@@ -46,11 +46,10 @@ pub fn too_deep_message() -> String {
 }
 
 /// Whether a Markdown body that converts to nothing is refused (`validation`, [`EMPTY_MESSAGE`]).
-/// A page may be written empty; a comment may not (Task 18).
+/// A page may be written empty (`page.update`); a comment may not (`comment.add`, Task 18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmptyBody {
     Allow,
-    #[allow(dead_code)] // `confluence.comment.add` (Task 18)
     Refuse,
 }
 

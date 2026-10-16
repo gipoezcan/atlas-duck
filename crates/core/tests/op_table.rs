@@ -43,11 +43,14 @@ const M5_WRITES: [&str; 5] = [
 /// enrichment).
 const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_issues"];
 
+/// Confluence writes completed in M7 beyond `confluence.page.update` (each task moves its op here
+/// from [`LATER_WRITES`]). Each needs its enrichment verdict before it renders a request.
+const M7_WRITES: [&str; 1] = ["confluence.comment.add"];
+
 /// No Jira write is left after T18; the Confluence writes land in M7.
-const LATER_WRITES: [&str; 6] = [
+const LATER_WRITES: [&str; 5] = [
     "confluence.page.create",
     "confluence.page.move",
-    "confluence.comment.add",
     "confluence.label.add",
     "confluence.label.remove",
     "confluence.attachment.upload",
@@ -238,6 +241,8 @@ fn reads_have_no_enrich() -> TestResult {
         "jira.issuelink.create",
         "jira.sprint.move_issues",
         "confluence.page.update",
+        // M7 Task 18 (PD-107): the container, and the reply target.
+        "confluence.comment.add",
     ]
     .into_iter()
     .collect();
@@ -745,12 +750,13 @@ fn not_in_this_build_writes() -> TestResult {
         .count();
     assert_eq!(
         writes,
-        M3_WRITES.len() + M5_WRITES.len() + LATER_WRITES.len()
+        M3_WRITES.len() + M5_WRITES.len() + M7_WRITES.len() + LATER_WRITES.len()
     );
     // Each needs its enrichment verdict before it renders a request.
     for id in M5_WRITES
         .into_iter()
         .filter(|id| !M5_WITHOUT_ENRICH.contains(id))
+        .chain(M7_WRITES)
     {
         assert_eq!(
             exec(id, &example(op(id)?), None, None)?,
@@ -911,7 +917,30 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             json!({"id": "65537", "base_version": 5, "body": MARKDOWN}),
             Some(page_verdict()),
         ),
+        // M7 Task 18: a comment, and a reply, on a page.
+        (
+            "confluence.comment.add",
+            json!({"content_id": "65537", "body": MARKDOWN}),
+            Some(comment_verdict(None)),
+        ),
+        (
+            "confluence.comment.add",
+            json!({"content_id": "65537", "body": "<p>x</p>", "body_format": "storage",
+                   "reply_to": "790"}),
+            Some(comment_verdict(Some("790"))),
+        ),
     ]
+}
+
+/// What enrichment gives for a comment on page 65537, replying to `reply_to` when given.
+fn comment_verdict(reply_to: Option<&str>) -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("content_id".to_owned(), json!("65537"));
+    resolved.insert("container_type".to_owned(), json!("page"));
+    if let Some(reply) = reply_to {
+        resolved.insert("reply_to".to_owned(), json!(reply));
+    }
+    EnrichVerdict::preview(json!({"container_type": "page"}), resolved)
 }
 
 /// A Markdown body with a heading, emphasis, wiki specials, a quote and a code block.
@@ -1796,6 +1825,12 @@ fn fixtures_match_registry_schemas() -> TestResult {
         ("confluence.page.get", fixtures::CONFLUENCE_PAGE),
         ("confluence.page.history", fixtures::CONFLUENCE_PAGE),
         ("confluence.page.update", fixtures::CONFLUENCE_PAGE_UPDATED),
+        // What `POST /rest/api/content` answers for a comment (M7 Task 18), with the fields the
+        // receipt does not keep.
+        (
+            "confluence.comment.add",
+            r#"{"id":"792","type":"comment","status":"current","title":"Re: Release checklist","version":{"number":1,"when":"2026-10-07T10:00:00.000+02:00"},"container":{"id":"65537","type":"page"},"_links":{"webui":"/display/DOC/Release+checklist?focusedCommentId=792","self":"https://wiki.corp.example/rest/api/content/792"}}"#,
+        ),
     ];
     // PD-101: a search is released pruned, so its schema (strict) is checked on the normalized
     // fixture, not on the raw answer.
