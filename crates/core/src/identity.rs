@@ -44,7 +44,9 @@ use crate::payloads::{self, SystemFetchPurpose};
 /// What triggered the re-check: how the original call failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
-    /// The Jira `X-AUSERNAME` check failed (missing, `anonymous`, another name).
+    /// The Jira `X-AUSERNAME` check failed (missing, `anonymous`, another name); for Confluence,
+    /// the identity GET that ends a read did not match (PD-93: handled like a failed header
+    /// check, no `Trigger` of its own).
     HeaderCheck,
     /// A JSON 401 (Jira's arrives as a failed header check with `response.status == 401`).
     Json401,
@@ -267,6 +269,16 @@ fn judge_confluence(outcome: &FetchOutcome, stored: &StoredIdentity) -> RecheckR
     let FetchOutcome::Response(r) = outcome else {
         return RecheckResult::Inconclusive;
     };
+    judge_confluence_answer(r, stored)
+}
+
+/// [`judge`] of a Confluence `GET /rest/api/user/current` answer that arrived (a JSON one, or a
+/// non-JSON one the client did not decide from status and headers): the identity GET of a read
+/// and the `confluence.user.current` read's own answer (PD-93).
+pub(crate) fn judge_confluence_answer(
+    r: &UpstreamResponse,
+    stored: &StoredIdentity,
+) -> RecheckResult {
     if r.status == 401 {
         return RecheckResult::TokenFailure { other_user: None };
     }
@@ -430,6 +442,28 @@ fn known_state(engine: &Engine, instance_id: &str) -> Option<RecheckResult> {
 /// The token re-check of `instance_id` (§7.1), once per instance at a time. `seen` is the
 /// instance's epoch ([`Engine::identity_epoch`]) read before the failed call started.
 pub async fn recheck(engine: &Arc<Engine>, instance_id: &str, seen: u64) -> RecheckResult {
+    recheck_or(engine, instance_id, seen, None).await
+}
+
+/// [`recheck`] for an answer of the re-check's own endpoint that is already at hand: the
+/// `confluence.user.current` read is the identity answer (PD-93), so its verdict `observed` is
+/// applied as the re-check's would be, through the same gate (one in flight per instance, the
+/// epoch rule, the shutdown), without a second call.
+pub async fn conclude(
+    engine: &Arc<Engine>,
+    instance_id: &str,
+    seen: u64,
+    observed: RecheckResult,
+) -> RecheckResult {
+    recheck_or(engine, instance_id, seen, Some(observed)).await
+}
+
+async fn recheck_or(
+    engine: &Arc<Engine>,
+    instance_id: &str,
+    seen: u64,
+    observed: Option<RecheckResult>,
+) -> RecheckResult {
     if let Some(known) = known_state(engine, instance_id) {
         return known;
     }
@@ -445,11 +479,14 @@ pub async fn recheck(engine: &Arc<Engine>, instance_id: &str, seen: u64) -> Rech
             .get_or_insert_with(|| Arc::new(OnceCell::new()))
             .clone()
     };
-    cell.get_or_init(|| async {
+    cell.get_or_init(|| async move {
         // Its records (the `SYSTEM_FETCH` pair, a state change) end before `APP_STOP`.
         let result = match engine.identity_gates().enter(engine) {
             Some(entered) => {
-                let result = run(engine, instance_id, &entered.ctl).await;
+                let result = match observed {
+                    Some(r) => r,
+                    None => run(engine, instance_id, &entered.ctl).await,
+                };
                 on_result(engine, instance_id, &result).await;
                 result
             }

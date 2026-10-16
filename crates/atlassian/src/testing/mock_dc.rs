@@ -154,6 +154,22 @@ impl MockDc {
         self.mount_get("/rest/api/user/current", t).await;
     }
 
+    /// `GET /rest/api/user/current` for a known `username`/`key` at the lowest priority, so any
+    /// other mount of the path wins: the default answer to the identity GET that ends every
+    /// Confluence read (`core` PD-93) and to the token re-check.
+    pub async fn confluence_user_current_default(&self, username: &str, key: &str) {
+        let t = self.response(200).set_body_raw(
+            fixtures::confluence_user_current(username, key),
+            "application/json",
+        );
+        Mock::given(method("GET"))
+            .and(path(self.path("/rest/api/user/current")))
+            .respond_with(t)
+            .with_priority(u8::MAX)
+            .mount(&self.server)
+            .await;
+    }
+
     pub async fn applinks_manifest(&self, version: &str) {
         let t = self
             .response(200)

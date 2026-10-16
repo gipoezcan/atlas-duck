@@ -158,7 +158,7 @@ pub struct TestHooks {
     pub allow_http: bool,
     /// A write holds after one of its app-initiated GETs finished and its record is parked, before
     /// any append commits it (Task 24 review I-2); so does a read's or a host call's user lookup
-    /// (PD-99, T11 review I-1).
+    /// (PD-99, T11 review I-1) and a Confluence read's identity GET (PD-93).
     pub pause_after_get: Option<Arc<Pause>>,
     /// A user lookup (PD-99) holds after its GET returned and its record is built, before the
     /// record is parked (T11 review I-1: a cancel there records the GET as in flight).
@@ -166,6 +166,9 @@ pub struct TestHooks {
     /// A user lookup pass (PD-99) holds after its last lookup was committed, before the read
     /// goes on to its record (T11 review m-9 (a): a cancel there records no lookup again).
     pub pause_after_lookups: Option<Arc<Pause>>,
+    /// The identity GET of a Confluence read (PD-93) holds after it returned and its record is
+    /// built, before the record is parked (a cancel there records the GET as in flight).
+    pub pause_before_identity_park: Option<Arc<Pause>>,
     /// Replaces the 20 s of read budget that must remain for a user lookup to start
     /// (`LOOKUP_RESERVE`; T11 fix review m-4: short budgets for the lookup cut tests).
     pub lookup_reserve: Option<std::time::Duration>,

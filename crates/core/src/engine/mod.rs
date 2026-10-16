@@ -188,8 +188,9 @@ pub struct RequestEntry {
     /// The cancel handle and capture of the read in flight (Task 24 aborts through it); dropped
     /// once `READ_FETCHED` is committed and at terminal.
     fetch: Mutex<Option<FetchControl>>,
-    /// The app-initiated GET of a write in flight, or the user lookup of a read in flight (PD-99,
-    /// purpose and resolved path): what a `cancelled_in_flight` record of it names (Task 24).
+    /// The app-initiated GET of a write in flight, or the user lookup or identity GET of a read in
+    /// flight (PD-99, PD-93; purpose and resolved path): what a `cancelled_in_flight` record of it
+    /// names (Task 24).
     in_flight: Mutex<Option<InFlight>>,
     /// The record of a write's finished GET that no append has committed yet (Task 24 review
     /// I-2): a cancel or expiry commits it ahead of the terminal record. Every gated append
@@ -198,8 +199,8 @@ pub struct RequestEntry {
     parked: Mutex<Option<NewEvent>>,
 }
 
-/// The GET a write's control (or a read's user lookup, PD-99) is currently running
-/// (`PREVIEW_FETCH` `purpose` and `path`).
+/// The GET a write's control (or a read's user lookup or identity GET, PD-99, PD-93) is currently
+/// running (`PREVIEW_FETCH` `purpose` and `path`).
 #[derive(Debug, Clone)]
 pub(crate) struct InFlight {
     pub purpose: PreviewFetchPurpose,

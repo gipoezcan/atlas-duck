@@ -396,6 +396,8 @@ pub enum PreviewFetchPurpose {
     StaleCheck,
     Refresh,
     Resolve,
+    /// Δ5 (PD-93, RF-5a): the `GET /rest/api/user/current` that ends a Confluence read's fetch.
+    Identity,
 }
 
 impl PreviewFetchPurpose {
@@ -405,6 +407,7 @@ impl PreviewFetchPurpose {
             Self::StaleCheck => "stale_check",
             Self::Refresh => "refresh",
             Self::Resolve => "resolve",
+            Self::Identity => "identity",
         }
     }
 }

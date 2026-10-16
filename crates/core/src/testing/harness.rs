@@ -304,8 +304,14 @@ impl HarnessBuilder {
                 Product::Confluence => atlas_duck_atlassian::Product::Confluence,
             };
             let mock = MockDc::start(product, context).await;
-            if spec.product == Product::Jira {
-                mock.json_once("/rest/api/2/field", 200, JIRA_FIELDS).await;
+            match spec.product {
+                Product::Jira => mock.json_once("/rest/api/2/field", 200, JIRA_FIELDS).await,
+                // RF-5a (PD-93): every Confluence read ends with an identity GET; a test mounts
+                // its own answer to change it.
+                Product::Confluence => {
+                    mock.confluence_user_current_default(TEST_USER, TEST_USER_KEY)
+                        .await;
+                }
             }
             let id = InstanceId::new()?.0;
             let (base_url, bound) = match &spec.at {

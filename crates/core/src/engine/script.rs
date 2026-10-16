@@ -1177,6 +1177,8 @@ impl LiveBackend {
             Ok(resolved) => {
                 // Seen by the next call's `max_fetch_mb` check (T11 review I-2).
                 self.shared.add_fetched(resolved.bytes);
+                // A host call has no identity step yet (PD-93: M8), so its answers are cached now.
+                resolved.puts.apply(&self.engine, &vc.instance_id);
                 rec.users = Some(resolved.users);
                 Ok(Classified::Item(rec))
             }
@@ -1284,6 +1286,9 @@ impl LiveBackend {
                             return Err(internal());
                         }
                     }
+                    // The first answer is recorded: a cancel during the second attempt must not
+                    // record it again from the control (T11 review handoff).
+                    ctl.clear_pages();
                     refetched = true;
                 }
                 other => return Ok((read::identity_classified(other, fetched), http)),

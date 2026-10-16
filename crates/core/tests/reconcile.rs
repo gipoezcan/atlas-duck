@@ -823,6 +823,91 @@ async fn i26_pending_read_abandoned() -> TestResult {
     Ok(())
 }
 
+/// A Confluence read that crashed after the records of its user lookup and its identity GET
+/// (PD-99, PD-93) and before `READ_FETCHED`: `PREVIEW_FETCH` is no write's, so the read is
+/// abandoned like any pending read, never `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_after_identity_fetch_reconciles_as_read() -> TestResult {
+    let pause = atlas_duck_core::Pause::new();
+    let mut h = Harness::builder()
+        .confluence("wiki")
+        .hooks(TestHooks {
+            pause_after_lookups: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p>Owner <ri:user ri:userkey="key-jdoe"/>.</p>"#;
+    common::confluence::mount_page(
+        mock,
+        "65537",
+        &common::confluence::page_with_storage(storage),
+    )
+    .await;
+    common::confluence::mount_users(mock, &[("key-jdoe", Some("jdoe"))]).await;
+    let env = h
+        .submit("confluence.page.get", json!({ "id": "65537" }))
+        .await;
+    let id = request_id(&env)?;
+    // The lookup is committed; the identity GET's record is the crash point.
+    pause.reached.notified().await;
+    let freeze = h.plan().freeze_after(EventType::PREVIEW_FETCH);
+    pause.release.notify_one();
+    tripped(&freeze).await?;
+    let fetches = h.events_of(EventType::PREVIEW_FETCH).await?;
+    let purposes: Vec<&Value> = fetches.iter().map(|f| &f["purpose"]).collect();
+    assert_eq!(purposes, [&json!("resolve"), &json!("identity")]);
+    h.crash_and_restart().await?;
+    let env = h.await_(&id, 10_000).await;
+    assert_abandoned(&env);
+    assert_eq!(
+        types(&h, &id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::ABANDONED,
+        ]
+    );
+    assert!(h.core().startup_notice().is_empty());
+    Ok(())
+}
+
+/// The same after the user lookup's record alone (the identity GET never ran).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crash_after_resolve_fetch_reconciles_as_read() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p>Owner <ri:user ri:userkey="key-jdoe"/>.</p>"#;
+    common::confluence::mount_page(
+        mock,
+        "65537",
+        &common::confluence::page_with_storage(storage),
+    )
+    .await;
+    common::confluence::mount_users(mock, &[("key-jdoe", Some("jdoe"))]).await;
+    let freeze = h.plan().freeze_after(EventType::PREVIEW_FETCH);
+    let env = h
+        .submit("confluence.page.get", json!({ "id": "65537" }))
+        .await;
+    let id = request_id(&env)?;
+    tripped(&freeze).await?;
+    h.crash_and_restart().await?;
+    let env = h.await_(&id, 10_000).await;
+    assert_abandoned(&env);
+    assert_eq!(
+        types(&h, &id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::ABANDONED,
+        ]
+    );
+    assert!(h.core().startup_notice().is_empty());
+    Ok(())
+}
+
 /// A harness whose script runner plays `plan` once.
 async fn with_script(plan: ScriptPlan) -> Result<(Harness, Arc<FakeScriptRunner>), TestError> {
     let runner = FakeScriptRunner::new(vec![plan]);

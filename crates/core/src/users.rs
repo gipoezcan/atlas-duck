@@ -19,7 +19,8 @@
 //! The map the pass returns is the one committed and the one the normalization converts with
 //! (`read::normalize`); the cache is never read again for that candidate, so a cache change after
 //! the fetch changes no candidate (§5.2, I-37). The cache is display-only: nothing in validation
-//! reads it (§2.3), and it holds no request data.
+//! reads it (§2.3), and it holds no request data. A pass stores nothing itself: its answers
+//! ([`Puts`]) are cached once the read's identity GET matched (PD-93).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -290,7 +291,8 @@ fn answer(outcome: &FetchOutcome, key: &str) -> Answer {
     }
 }
 
-fn is_json(r: &atlas_duck_atlassian::UpstreamResponse) -> bool {
+/// The answer's `Content-Type` names JSON.
+pub(crate) fn is_json(r: &atlas_duck_atlassian::UpstreamResponse) -> bool {
     r.content_type
         .as_deref()
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("json"))
@@ -397,10 +399,31 @@ pub(crate) struct Pass<'a> {
     pub max_bytes: u64,
 }
 
-/// What a pass gives: the map to commit and the bytes its lookups received.
+/// What a pass gives: the map to commit, the bytes its lookups received and the answers to cache.
 pub(crate) struct Resolved {
     pub users: UserResolutions,
     pub bytes: u64,
+    pub puts: Puts,
+}
+
+/// The answers of a pass the cache keeps, stored only by [`Puts::apply`]: a direct read applies
+/// them once its identity GET matched (PD-93; lookups under the anonymous fallback answer for
+/// nobody, and a JSON 404 would hide a user for an hour), a host call right away (its identity
+/// step is M8's).
+#[derive(Default)]
+pub(crate) struct Puts {
+    /// The cache's generation when the pass began: a clear since then drops them all.
+    generation: u64,
+    answers: Vec<(String, Option<String>, UtcInstant)>,
+}
+
+impl Puts {
+    pub(crate) fn apply(self, engine: &Engine, instance_id: &str) {
+        let cache = engine.user_cache();
+        for (key, name, at) in self.answers {
+            cache.put(instance_id, self.generation, &key, name, at);
+        }
+    }
 }
 
 /// The request ended (a cancel, an expiry, a quit, an append that failed) while the pass ran.
@@ -417,6 +440,10 @@ pub(crate) async fn resolve_users(
             .user_cache()
             .snapshot(p.instance_id, keys, p.engine.clock().now_utc());
     let mut map = UserResolutions::new();
+    let mut puts = Puts {
+        generation,
+        answers: Vec::new(),
+    };
     let mut sent = 0usize;
     let mut used = 0u64;
     // Once closed (the cap, the budget's reserve, the byte cap), no lookup starts again in this
@@ -440,8 +467,13 @@ pub(crate) async fn resolve_users(
             continue;
         }
         sent += 1;
-        let (name, bytes) = lookup(p, generation, key).await?;
+        let (answer, bytes) = lookup(p, key).await?;
         used = used.saturating_add(bytes);
+        let name = answer.name();
+        if answer != Answer::Unknown {
+            let now = p.engine.clock().now_utc();
+            puts.answers.push((key.clone(), name.clone(), now));
+        }
         map.insert(key.clone(), name);
     }
     #[cfg(feature = "testing")]
@@ -451,6 +483,7 @@ pub(crate) async fn resolve_users(
     Ok(Resolved {
         users: map,
         bytes: used,
+        puts,
     })
 }
 
@@ -464,13 +497,9 @@ fn lookup_reserve(p: &Pass<'_>) -> Duration {
     LOOKUP_RESERVE
 }
 
-/// One `GET /rest/api/user?key=<key>`, recorded and committed before the pass goes on; gives the
-/// name and the bytes received.
-async fn lookup(
-    p: &Pass<'_>,
-    generation: u64,
-    key: &str,
-) -> Result<(Option<String>, u64), Cancelled> {
+/// One `GET /rest/api/user?key=<key>`, recorded and committed before the pass goes on; gives
+/// what it answered and the bytes received.
+async fn lookup(p: &Pass<'_>, key: &str) -> Result<(Answer, u64), Cancelled> {
     let call = GetCall {
         endpoint_template: USER_PATH.to_owned(),
         params: Value::Null,
@@ -515,15 +544,7 @@ async fn lookup(
     if !p.site.commit(p.engine, record).await {
         return Err(Cancelled);
     }
-    let answer = answer(&outcome, key);
-    let name = answer.name();
-    if answer != Answer::Unknown {
-        let now = p.engine.clock().now_utc();
-        p.engine
-            .user_cache()
-            .put(p.instance_id, generation, key, name.clone(), now);
-    }
-    Ok((name, received_bytes(&outcome)))
+    Ok((answer(&outcome, key), received_bytes(&outcome)))
 }
 
 #[cfg(test)]

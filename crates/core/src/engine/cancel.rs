@@ -256,9 +256,9 @@ impl Engine {
     ///    nothing; an `Expire` the phase refuses (`Illegal`) sets `expiry_due`.
     /// 2. Only now, with the model accepting the end, the control is cancelled and its capture
     ///    taken; bytes that were sent become `READ_FETCHED {cancelled_in_flight, ..}` (a read,
-    ///    after `PREVIEW_FETCH {resolve, cancelled_in_flight, ..}` for its user lookup in flight,
-    ///    PD-99) or `PREVIEW_FETCH {purpose, cancelled_in_flight, ..}` (the GET of a write in
-    ///    flight).
+    ///    after `PREVIEW_FETCH {resolve | identity, cancelled_in_flight, ..}` for its user lookup
+    ///    or identity GET in flight, PD-99, PD-93) or `PREVIEW_FETCH {purpose,
+    ///    cancelled_in_flight, ..}` (the GET of a write in flight).
     /// 3. One `append_batch` of `[in-flight record?, CANCELLED | EXPIRED]`; a failed append
     ///    fails the request (`audit_failure`, §11.1).
     /// 4. The model applies, the admission place is released ([`Engine::after_change`]).
@@ -340,9 +340,10 @@ impl Engine {
                     // Review I-1: only a read aborted in `Fetching` has an unrecorded fetch; in
                     // `AwaitingRelease` its `READ_FETCHED` is committed already.
                     Kind::Read if fetching => {
-                        // PD-99: a user lookup in flight (its record not parked yet: a parked
-                        // one is the same GET, finished) is recorded with the bytes it received,
-                        // before the read's record, which then holds the content pages.
+                        // PD-99, PD-93: a user lookup or identity GET in flight (its record not
+                        // parked yet: a parked one is the same GET, finished) is recorded with the
+                        // bytes it received, before the read's record, which then holds the
+                        // content pages.
                         let in_flight = entry.in_flight();
                         if let Some(f) = in_flight.as_ref().filter(|_| !had_parked) {
                             records.push(payloads::preview_fetch(
