@@ -91,26 +91,79 @@ class Driver:
             self.proc.wait()
         self.log.close()
 
+    def tail(self, lines=60):
+        """The end of the driver's log (tauri-driver and the native driver it starts write there)."""
+        self.log.flush()
+        try:
+            with open(self.log.name, encoding="utf-8", errors="replace") as f:
+                return "".join(f.readlines()[-lines:])
+        except OSError as e:
+            return "(the driver log is unreadable: %s)" % e
+
+
+def run_text(cmd, timeout=20):
+    """`cmd`'s output for a failure report, or why there is none (never raises)."""
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout + r.stderr).strip() or "(no output, exit %s)" % r.returncode
+    except (OSError, subprocess.SubprocessError) as e:
+        return "(%s: %s)" % (cmd[0], e)
+
+
+def new_session(drv, app, args=()):
+    """A session for `app`. On "session not created" the failure says what the driver and the
+    system showed: the driver log, the processes still running, the native driver's version, the
+    app's diag logs, and whether a session WITHOUT `browserName` can be created. WebKitWebDriver
+    answers "Failed to match capabilities" when the browser name the app's automation session
+    reports is not the requested one (wry reports "wry" only once its first webview is
+    registered), so that probe tells a name mismatch from a launch or connection failure."""
+    try:
+        return Session(drv.base, app, args)
+    except Failed as e:
+        if "session not created" not in str(e).lower():
+            raise
+        report = [str(e)]
+        report.append("--- processes\n" + run_text(["pgrep", "-a", "-f", "atlas-duck|WebKit|tauri-driver"]))
+        report.append("--- WebKitWebDriver --version\n" + run_text(["WebKitWebDriver", "--version"]))
+        # The probe starts the app again: end what the failed attempt left running, so the probe is
+        # not forwarded to it (single instance).
+        run_text(["pkill", "-x", "atlas-duck-app"])
+        for _ in range(20):
+            if subprocess.run(["pgrep", "-x", "atlas-duck-app"], capture_output=True).returncode != 0:
+                break
+            time.sleep(0.5)
+        try:
+            probe = Session(drv.base, app, args, browser_name=None)
+            probe.quit()
+            report.append("--- probe: a session WITHOUT browserName was created: the app's automation "
+                          "session reports another browser name than \"wry\"")
+        except Failed as p:
+            report.append("--- probe: a session without browserName failed too: %s" % p)
+        report.append("--- driver log (end)\n" + drv.tail())
+        home = os.environ.get("ATLAS_DUCK_TEST_HOME")
+        if home:
+            for path in sorted(glob.glob(os.path.join(home, "**", "logs", "diag.log"), recursive=True)):
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    report.append("--- %s\n%s" % (path, f.read()[-4000:]))
+        raise Failed("\n".join(report))
+
 
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class Session:
-    def __init__(self, base, app, args=()):
+    def __init__(self, base, app, args=(), browser_name="wry"):
         # The same body as the Rust client (app/src-tauri/tests/e2e/webdriver.rs session_request),
         # which creates sessions on the same tauri-driver and WebKitWebDriver. The native driver
         # answers "Failed to match capabilities" without saying which one, so the path is checked
         # first (an absolute, executable file) and the body is part of the failure text.
+        # `browser_name=None` is new_session's diagnostic probe only.
         if not os.path.isabs(app) or not os.path.isfile(app) or not os.access(app, os.X_OK):
             raise Failed("the app under test is not an absolute path to an executable file: %s" % app)
-        body = {
-            "capabilities": {
-                "alwaysMatch": {
-                    "browserName": "wry",
-                    "tauri:options": {"application": app, "args": list(args)},
-                }
-            }
-        }
+        match = {"tauri:options": {"application": app, "args": list(args)}}
+        if browser_name is not None:
+            match["browserName"] = browser_name
+        body = {"capabilities": {"alwaysMatch": match}}
         try:
             value = self._send("POST", base + "/session", body, timeout=120)
         except Failed as e:
@@ -248,7 +301,7 @@ def wizard(args):
     drv = Driver(args.driver, args.driver_log)
     s = None
     try:
-        s = Session(drv.base, args.app)
+        s = new_session(drv, args.app)
         setup = s.switch_to_title("Setup", START_WAIT)
         passphrase_done = False
         cli_done = not args.cli_install
@@ -342,7 +395,7 @@ def fedora(args):
     drv = Driver(args.driver, args.driver_log)
     s = None
     try:
-        s = Session(drv.base, args.app)
+        s = new_session(drv, args.app)
         approvals = s.switch_to_title("Approvals", START_WAIT)
         print("no-tray-host: a cold no-argument start opened the Approvals window")
 
@@ -412,7 +465,7 @@ def fedora(args):
     drv = Driver(args.driver, args.driver_log)
     s = None
     try:
-        s = Session(drv.base, args.app)
+        s = new_session(drv, args.app)
         s.switch_to_title("Approvals", START_WAIT)
         print("no-tray-host: the next start came up clean")
     finally:

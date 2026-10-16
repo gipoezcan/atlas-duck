@@ -106,6 +106,11 @@ if ! command -v WebKitWebDriver >/dev/null; then
   ln -sf "$found" /usr/local/bin/WebKitWebDriver
 fi
 echo "fedora-no-tray-host: WebKitWebDriver $(command -v WebKitWebDriver)"
+# The driver comes from whichever package ships it (webkitgtk6.0 on Fedora 40) while the app links
+# webkit2gtk-4.1: both versions are printed, as "Failed to match capabilities" may be a mismatch.
+WebKitWebDriver --version || true
+rpm -q webkit2gtk4.1 webkitgtk6.0 javascriptcoregtk4.1 || true
+ldd /usr/bin/atlas-duck-app | grep -i -E 'webkit|javascriptcore' || true
 
 # Locality: the container's /root is overlayfs and the app checks the passwd home, so the workflow
 # bind-mounts a runner directory over /root; the test home, the keystore and the temp dir live there.
