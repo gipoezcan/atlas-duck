@@ -2153,6 +2153,69 @@ async fn i22_confluence_context_path_direct_read() -> TestResult {
         meta_of(&env)?["page"],
         json!({"start": 0, "returned": 50, "total": null, "truncated": true, "next_start": 50})
     );
+    // Page 1's `next` is stale after the merge (no context path, a range already merged in).
+    let result = result_of(&env)?;
+    assert!(result["_links"].get("next").is_none(), "{result}");
+    Ok(())
+}
+
+/// A merged multi-page search drops page 1's `_links.next` (through the §7.4 pruning too) and keeps
+/// the rest of the root's `_links`; `meta.page` carries the continuation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merged_pages_release_no_stale_links_next() -> TestResult {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, Request};
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let ok = mock.response(200);
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/search")))
+        .respond_with(move |req: &Request| {
+            let start = query(req, "start")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0u64);
+            let size = 25u64.min(35 - start);
+            let hits = (start..start + size)
+                .map(|i| {
+                    search_hit(
+                        &format!("{}", 80_000 + i),
+                        &format!("Hit {i}"),
+                        "DOC",
+                        "page",
+                    )
+                })
+                .collect();
+            let mut answer = search_answer(hits, 35);
+            answer["start"] = json!(start);
+            if start + size < 35 {
+                answer["_links"]["next"] = json!("/rest/api/search?cql=x&start=25");
+            }
+            ok.clone()
+                .set_body_raw(answer.to_string(), "application/json")
+        })
+        .mount(mock.server())
+        .await;
+    let id = queued(&h, SEARCH, json!({ "cql": "space = DOC", "max": 50 })).await?;
+    let env = released(&h, &id).await?;
+    let result = result_of(&env)?;
+    assert_eq!(result["results"].as_array().map(Vec::len), Some(35));
+    assert!(result["_links"].get("next").is_none(), "{result}");
+    assert_eq!(result["_links"]["context"], "/wiki");
+    assert_eq!(meta_of(&env)?["page"]["next_start"], Value::Null);
+
+    // One page only: the answer's `_links.next` stays as it is.
+    use common::confluence::mount_children;
+    let h = Harness::confluence().await?;
+    mount_children(wiki(&h)?, ID, &[children_page(0, 10, 25)]).await;
+    let id = queued(
+        &h,
+        "confluence.page.children",
+        json!({ "id": ID, "max": 10 }),
+    )
+    .await?;
+    let env = released(&h, &id).await?;
+    let result = result_of(&env)?;
+    assert!(result["_links"].get("next").is_some(), "{result}");
     Ok(())
 }
 

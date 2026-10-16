@@ -164,38 +164,60 @@ fn key(name: &str) -> AgentKey {
 async fn x03_storage_low_refuses_nothing_queued() -> TestResult {
     let h = Harness::jira().await?;
     // The start fill of the field-name cache (T8) logs its own records: let it end first.
-    assert!(h.field_cache_filled().await);
+    // (60 s: under a loaded parallel run the fill's GET and its append can outlast the 10 s default.)
+    assert!(
+        h.field_cache_filled_within(Duration::from_secs(60)).await,
+        "the start fill of the field-name cache was still running after 60 s"
+    );
     mount_issue(&h, "ABC-1", 64, 'a').await?;
     let before = h.event_count().await?;
     h.free_space().set(0);
     let env = h.submit(ISSUE, issue("ABC-1")).await;
-    assert_eq!(env.status, Status::Failed);
-    assert_eq!(code(&env), "audit_storage_low");
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "audit_storage_low", "{}", env.to_json_line());
     assert_eq!(exit(&env), 1);
     assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
-    assert_eq!(env.request_id, None);
+    assert_eq!(env.request_id, None, "{}", env.to_json_line());
     // Nothing queued, nothing logged, nothing sent, nothing reserved.
-    assert!(h.engine().pending_entries().is_empty());
-    assert_eq!(h.event_count().await?, before);
-    assert_eq!(h.engine().admission().pending_total(), 0);
+    assert!(
+        h.engine().pending_entries().is_empty(),
+        "the refused submit left a queued entry"
+    );
+    let after = h.event_count().await?;
+    assert_eq!(
+        after,
+        before,
+        "the refused submit appended {} event(s)",
+        after.saturating_sub(before)
+    );
+    assert_eq!(
+        h.engine().admission().pending_total(),
+        0,
+        "the refused submit reserved admission bytes"
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         common::test_hits(h.mock("jira-main").ok_or("no mock")?)
             .await
-            .is_empty()
+            .is_empty(),
+        "a refused submit reached Jira"
     );
     // A failing probe refuses the same way (the store reports it as low space).
     h.free_space().set(u64::MAX);
     h.free_space().set_failing(true);
-    assert_eq!(
-        code(&h.submit(ISSUE, issue("ABC-1")).await),
-        "audit_storage_low"
-    );
+    let env = h.submit(ISSUE, issue("ABC-1")).await;
+    assert_eq!(code(&env), "audit_storage_low", "{}", env.to_json_line());
     h.free_space().set_failing(false);
-    assert_eq!(h.event_count().await?, before);
+    let after = h.event_count().await?;
+    assert_eq!(
+        after,
+        before,
+        "the failing probe appended {} event(s)",
+        after.saturating_sub(before)
+    );
     // Space back: admitted.
     let env = h.submit(ISSUE, issue("ABC-1")).await;
-    assert_eq!(env.status, Status::Pending);
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
     Ok(())
 }
 
