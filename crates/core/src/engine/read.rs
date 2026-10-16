@@ -2042,10 +2042,17 @@ pub(super) fn result_body<'a>(
             Some(Value::Array(a)) => a,
             _ => Vec::new(),
         };
+        let mut merged = false;
         for page in pages {
+            merged = true;
             if let Some(Value::Array(a)) = page?.get_mut(paging.items_key).map(Value::take) {
                 items.extend(a);
             }
+        }
+        if merged && let Some(links) = body.get_mut("_links").and_then(Value::as_object_mut) {
+            // Page 1's navigation links are stale after a merge and never followed.
+            links.remove("next");
+            links.remove("prev");
         }
         let mut dropped = 0u64;
         if spec.id == "confluence.search" {
