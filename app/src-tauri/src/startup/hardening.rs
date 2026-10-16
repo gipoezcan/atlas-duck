@@ -513,6 +513,8 @@ mod tests {
     fn scrub_plan_has_no_driver_exemption() {
         let mut pairs: Vec<(&str, &str)> = SCRUBBED.iter().map(|n| (*n, "x")).collect();
         pairs[0].1 = "--remote-debugging-port=0";
+        // The opt-in variable alone (here and in a build without the feature) changes nothing.
+        pairs.push(("ATLAS_DUCK_E2E_ALLOW_DRIVER", "1"));
         let plan = scrub_plan(&env_of(&pairs));
         assert_eq!(plan.log_names(), SCRUBBED);
     }

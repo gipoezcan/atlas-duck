@@ -46,6 +46,7 @@ pub mod keys {
     pub const CONTROL: &str = "\u{E009}";
     pub const ESCAPE: &str = "\u{E00C}";
     pub const SPACE: &str = "\u{E00D}";
+    pub const ARROW_UP: &str = "\u{E013}";
     pub const ARROW_DOWN: &str = "\u{E015}";
 }
 
@@ -63,6 +64,12 @@ pub const ENV_ARTIFACTS: &str = "ATLAS_DUCK_E2E_ARTIFACTS";
 const DRIVER_START_WAIT: Duration = Duration::from_secs(30);
 /// One WebDriver command (a new session starts the app: the longest one).
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+/// "Delete Session" at the end of a flow: the app is gone already, a blocked driver must not hold
+/// the teardown for the full command timeout.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// "Navigate To" a foreign URL: the app is expected to refuse it, and a driver may wait for a load
+/// that never comes.
+const NAVIGATE_TIMEOUT: Duration = Duration::from_secs(15);
 const POLL: Duration = Duration::from_millis(100);
 
 // ---- pure: request bodies ----------------------------------------------------------------------
@@ -106,6 +113,11 @@ pub fn find_request(using: Using, value: &str) -> Value {
 /// The body of "Element Send Keys".
 pub fn keys_request(text: &str) -> Value {
     json!({ "text": text })
+}
+
+/// The body of "Navigate To".
+pub fn navigate_request(url: &str) -> Value {
+    json!({ "url": url })
 }
 
 /// The body of "Switch To Window".
@@ -268,11 +280,19 @@ pub fn driver_args(port: u16, native_port: u16, native_driver: Option<&str>) -> 
 // ---- the driver process --------------------------------------------------------------------------
 
 /// A `tauri-driver` of one test: spawned with the world's environment plus the E2E opt-in, killed
-/// on drop. The app is started by the driver (the first "New Session"), so the app's environment is
-/// this one.
+/// on drop together with everything it started. The app is started by the driver (the first "New
+/// Session"), so the app's environment is this one.
+///
+/// The whole tree ends with the driver: on Windows `tauri-driver` is put in a kill-on-close job
+/// object right after the spawn (its `msedgedriver`, the app and the app's WebView2 processes are
+/// created inside it), on Unix it leads its own process group that is killed. The app of a world
+/// that has no store yet (the Setup window) records no pid and holds no `instance.lock`, so the
+/// world cannot stop it; this is what does.
 pub struct DriverProc {
     child: Option<Child>,
     base: String,
+    #[cfg(windows)]
+    job: Option<job::Job>,
 }
 
 impl DriverProc {
@@ -281,8 +301,7 @@ impl DriverProc {
     pub async fn start(env: Vec<(OsString, OsString)>, log: &Path) -> Result<DriverProc> {
         let exe = std::env::var_os(ENV_TAURI_DRIVER).unwrap_or_else(|| "tauri-driver".into());
         let native = std::env::var(ENV_NATIVE_DRIVER).ok();
-        let port = free_port()?;
-        let native_port = free_port()?;
+        let (port, native_port) = free_ports()?;
         let out = fs::File::create(log)?;
         let err = out.try_clone()?;
         let mut cmd = Command::new(exe);
@@ -295,42 +314,85 @@ impl DriverProc {
             cmd.env(k, v);
         }
         cmd.env(ENV_ALLOW_DRIVER, "1");
-        let mut child = cmd.spawn()?;
-        let base = format!("http://127.0.0.1:{port}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn()?;
+        // Assigned at once: the driver starts its native driver (and, on a session, the app) as
+        // its children, which join the job only when it is already in it.
+        #[cfg(windows)]
+        let job = {
+            use std::os::windows::io::AsRawHandle;
+            let assigned = job::Job::kill_on_close().and_then(|j| {
+                j.assign(child.as_raw_handle())?;
+                Ok(j)
+            });
+            match assigned {
+                Ok(j) => Some(j),
+                Err(e) => {
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(
+                        format!("tauri-driver could not be put in a job object: {e}").into(),
+                    );
+                }
+            }
+        };
+        let mut proc = DriverProc {
+            child: Some(child),
+            base: format!("http://127.0.0.1:{port}"),
+            #[cfg(windows)]
+            job,
+        };
         let http = client()?;
         let start = Instant::now();
         loop {
-            if let Some(status) = child.try_wait()? {
+            let ended = match proc.child.as_mut() {
+                Some(c) => c.try_wait()?,
+                None => None,
+            };
+            if let Some(status) = ended {
                 return Err(format!("tauri-driver ended at start: {status}; log {log:?}").into());
             }
-            if let Ok(resp) = http.get(format!("{base}/status")).send().await
+            if let Ok(resp) = http.get(format!("{}/status", proc.base)).send().await
                 && resp.status().is_success()
             {
                 break;
             }
             if start.elapsed() > DRIVER_START_WAIT {
-                let _ = child.kill();
-                let _ = child.wait();
+                proc.kill_tree();
                 return Err(
                     format!("tauri-driver answered no /status in 30 s; log {log:?}").into(),
                 );
             }
             tokio::time::sleep(POLL).await;
         }
-        Ok(DriverProc {
-            child: Some(child),
-            base,
-        })
+        Ok(proc)
     }
 
     /// `http://127.0.0.1:<port>`.
     pub fn base(&self) -> &str {
         &self.base
     }
-}
 
-impl Drop for DriverProc {
-    fn drop(&mut self) {
+    /// Ends the driver and every process it started (the native driver, the app, the app's
+    /// webview processes). Idempotent; also what the drop does.
+    pub fn kill_tree(&mut self) {
+        // Closing the last handle of the kill-on-close job ends every process in it.
+        #[cfg(windows)]
+        drop(self.job.take());
+        #[cfg(unix)]
+        if let Some(child) = &self.child {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -338,9 +400,72 @@ impl Drop for DriverProc {
     }
 }
 
-fn free_port() -> Result<u16> {
-    let l = TcpListener::bind("127.0.0.1:0")?;
-    Ok(l.local_addr()?.port())
+impl Drop for DriverProc {
+    fn drop(&mut self) {
+        self.kill_tree();
+    }
+}
+
+/// Two distinct free ports: both listeners are held until both are known (two separate
+/// bind-and-drop calls can answer the same port).
+fn free_ports() -> Result<(u16, u16)> {
+    let a = TcpListener::bind("127.0.0.1:0")?;
+    let b = TcpListener::bind("127.0.0.1:0")?;
+    Ok((a.local_addr()?.port(), b.local_addr()?.port()))
+}
+
+#[cfg(windows)]
+mod job {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    /// A job object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no breakaway flag: dropping it
+    /// closes the last handle, which ends every process in it.
+    pub struct Job(OwnedHandle);
+
+    impl Job {
+        pub fn kill_on_close() -> io::Result<Job> {
+            // SAFETY: plain call; null on failure.
+            let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if h.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: a fresh job handle nothing else owns.
+            let job = Job(unsafe { OwnedHandle::from_raw_handle(h) });
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            // Deliberately no JOB_OBJECT_LIMIT_BREAKAWAY_OK / SILENT_BREAKAWAY_OK.
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .map_err(io::Error::other)?;
+            // SAFETY: `info` is a local of the stated size and class.
+            let set = unsafe {
+                SetInformationJobObject(
+                    job.0.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&raw const info).cast(),
+                    size,
+                )
+            };
+            if set == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(job)
+        }
+
+        pub fn assign(&self, process: RawHandle) -> io::Result<()> {
+            // SAFETY: both handles are live (the process handle belongs to the caller's child).
+            if unsafe { AssignProcessToJobObject(self.0.as_raw_handle(), process) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
 }
 
 /// `reqwest`'s `rustls-no-provider` build panics in `ClientBuilder::build` without a process-wide
@@ -407,8 +532,22 @@ impl WebDriver {
     }
 
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
+        self.call_within(method, path, body, None).await
+    }
+
+    /// [`WebDriver::call`] with its own timeout instead of the client's.
+    async fn call_within(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        timeout: Option<Duration>,
+    ) -> Result<Value> {
         let url = format!("{}/session/{}{path}", self.base, self.session);
         let mut req = self.http.request(method, url);
+        if let Some(t) = timeout {
+            req = req.timeout(t);
+        }
         if let Some(b) = body {
             req = req
                 .header("content-type", "application/json; charset=utf-8")
@@ -435,7 +574,9 @@ impl WebDriver {
 
     /// "Delete Session": the driver closes the app's webviews.
     pub async fn quit(&self) -> Result<()> {
-        self.call(Method::DELETE, "", None).await.map(|_| ())
+        self.call_within(Method::DELETE, "", None, Some(QUIT_TIMEOUT))
+            .await
+            .map(|_| ())
     }
 
     // ---- elements ------------------------------------------------------------------------------
@@ -508,6 +649,19 @@ impl WebDriver {
         parse_nullable_string(&v)
     }
 
+    /// "Get Element Property": the live JavaScript property (an input's typed `value`), which the
+    /// attribute endpoint does not give on a spec-strict driver. `None` for `null`/absent.
+    pub async fn property(&self, e: &Element, name: &str) -> Result<Option<String>> {
+        let v = self
+            .get(&format!("/element/{}/property/{name}", e.0))
+            .await?;
+        Ok(match v {
+            Value::Null => None,
+            Value::String(s) => Some(s),
+            other => Some(other.to_string()),
+        })
+    }
+
     /// "Get Element CSS Value": the computed value of one property.
     pub async fn css_value(&self, e: &Element, property: &str) -> Result<String> {
         let v = self
@@ -527,6 +681,26 @@ impl WebDriver {
     pub async fn title(&self) -> Result<String> {
         let v = self.get("/title").await?;
         Ok(v.as_str().unwrap_or_default().to_owned())
+    }
+
+    /// "Get Current URL" of the current top-level browsing context.
+    pub async fn current_url(&self) -> Result<String> {
+        let v = self.get("/url").await?;
+        Ok(v.as_str().unwrap_or_default().to_owned())
+    }
+
+    /// "Navigate To" (not script injection: the W3C endpoint a user's address bar equals). The
+    /// result is the driver's: a refused navigation may answer ok, an error or nothing within
+    /// [`NAVIGATE_TIMEOUT`]; callers assert on the document afterwards, never on this.
+    pub async fn navigate(&self, url: &str) -> Result<()> {
+        self.call_within(
+            Method::POST,
+            "/url",
+            Some(navigate_request(url)),
+            Some(NAVIGATE_TIMEOUT),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn refresh(&self) -> Result<()> {
@@ -734,6 +908,11 @@ mod tests {
             json!({"using":"xpath","value":"//h1"})
         );
         assert_eq!(keys_request("ab"), json!({"text":"ab"}));
+        assert_eq!(
+            navigate_request("http://127.0.0.1:9/x"),
+            json!({"url":"http://127.0.0.1:9/x"})
+        );
+        assert_eq!(keys::ARROW_UP, "\u{E013}");
         assert_eq!(window_request("h1"), json!({"handle":"h1"}));
         assert_eq!(
             frame_request(Some(&Element("e1".into()))),
@@ -812,11 +991,9 @@ mod tests {
     /// The client has no "execute script" endpoint: not in a path, not in a method name.
     #[test]
     fn the_client_never_names_the_execute_script_endpoint() {
-        // The needles are built so that this file does not contain them itself.
-        let needles = [
-            ["/execute", "/sync"].concat(),
-            ["/execute", "/async"].concat(),
-        ];
+        // The needle is built so that this file does not contain it itself; `/exec` covers the
+        // sync and async spellings and any path built around them.
+        let needles = [["/exec", "ute"].concat()];
         for (name, source) in [
             ("webdriver.rs", include_str!("webdriver.rs")),
             ("flows.rs", include_str!("flows.rs")),

@@ -7,11 +7,16 @@
 //! - The scripted approver holds every request whose reason does not start with `atlas-test:`, so
 //!   these flows decide through the real window.
 //! - No script runs in a webview (the client has no execute-script call): the flows read the DOM
-//!   through element, attribute, CSS value and title commands. What that cannot observe is listed
-//!   in the T32 report (`window.__pwned`, navigation and `window.open` refusals, the native dialogs,
-//!   the order of an emit and a `show()`).
+//!   through element, attribute, property, CSS value, URL and title commands, and press keys
+//!   through the actions endpoint. What that cannot observe is listed in the T32 fix report
+//!   (`window.__pwned`, `window.open`, the native dialogs, the order of an emit and a `show()`).
 //! - The default `Rig` quits the app through the test control file first (the shutdown path runs),
-//!   then ends the WebDriver session.
+//!   then ends the WebDriver session; the driver's drop ends whatever is left of its process tree.
+//! - A failed check is an `Err` (the `ensure!` macros), never a panic, so `Rig::finish` always
+//!   runs: screenshot, the world's diagnostics, the app's quit.
+//! - The credential window has its own data directory and so its own browser context (S-07). The
+//!   flows that need it through the driver may fail on a first CI run for that automation-context
+//!   reason alone (see [`CREDENTIAL_UNREACHABLE`]); no test-only shared context is ever added.
 
 use std::time::{Duration, Instant};
 
@@ -23,6 +28,41 @@ use serde_json::{Value, json};
 
 use crate::harness::{APP_EXE, PAT_CANARY, Result, World, WorldOpts, opted_in, parse_envelope};
 use crate::webdriver::{DriverProc, Element, WebDriver, keys, wait_for};
+
+/// `return Err(..)` when the condition does not hold (the flows' `assert!`).
+macro_rules! ensure {
+    ($cond:expr, $($msg:tt)+) => {
+        if !$cond {
+            return Err(format!($($msg)+).into());
+        }
+    };
+    ($cond:expr) => {
+        if !$cond {
+            return Err(concat!("check failed: ", stringify!($cond)).into());
+        }
+    };
+}
+
+/// `return Err(..)` with both values when they differ (the flows' `assert_eq!`).
+macro_rules! ensure_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        ensure_eq!($left, $right, "values differ")
+    };
+    ($left:expr, $right:expr, $($msg:tt)+) => {
+        // A `match`, so the operands' temporaries live through the comparison.
+        match (&$left, &$right) {
+            (left, right) => {
+                if left != right {
+                    return Err(format!(
+                        "{}\n left: {left:?}\nright: {right:?}",
+                        format!($($msg)+)
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+}
 
 // ---- constants -----------------------------------------------------------------------------------
 
@@ -36,12 +76,34 @@ const INERT_WAIT: Duration = Duration::from_secs(20);
 const HOLD: &str = "120";
 /// P-01 (spec 13 Performance): the first screen of the preview within this long.
 const P01_BUDGET: Duration = Duration::from_millis(1000);
+/// S-08's summary: a newline and a run of spaces, so the renderer wraps the value in a `pre`.
+const S08_SUMMARY: &str = "S-08 first line\nsecond  line";
 /// The reason of the requests the flows decide by hand (no `atlas-test:` prefix: the scripted
 /// approver holds them).
 const BY_HAND: &str = "e2e: decided by hand";
-/// The §10.3 credential-page policy, from the shipped page (the placeholder is substituted by Rust).
+/// The Â§10.3 credential-page policy, from the shipped page (the placeholder is substituted by Rust).
 const CREDENTIAL_HTML: &str = include_str!("../../../ui/credential.html");
 const ISOLATION_PLACEHOLDER: &str = "<isolation-origin>";
+/// A URL no app window may navigate to (nothing listens on the discard port).
+const FOREIGN_URL: &str = "http://127.0.0.1:9/atlas-duck-e2e-foreign";
+/// The origin every window's page is served from.
+const APP_ORIGIN: &str = if cfg!(windows) {
+    "http://tauri.localhost"
+} else {
+    "tauri://localhost"
+};
+/// Appended to every failure to reach the credential window through the driver. The credential
+/// window has its own data directory (T6, S-07), hence its own browser context, and a driver may
+/// not be able to automate it: Linux (`tauri-runtime-wry` allows WebKit automation for the first
+/// web context only) and Windows (a data directory of its own is a browser process of its own, and
+/// only one owns the debugging port of the driver). A failure of this kind is no product finding:
+/// the T6 unit test and a manual check cover the window, and a test-only shared context is never
+/// the answer (it would defeat S-07).
+const CREDENTIAL_UNREACHABLE: &str = "the credential window could not be reached through the driver. \
+     This may be the automation context, not the product: it has its own data directory and so its \
+     own browser context (Linux: tauri-runtime-wry allows WebKit automation for the first web \
+     context only; Windows: a data directory of its own is a browser process of its own that does \
+     not own the debugging port). Do not add a shared context for tests (S-07)";
 
 /// Strings an agent or a server could put into any text field: markup, handlers, URL schemes, a
 /// style block, a bidi override. Every one would change the page, the title or the `data-alive`
@@ -123,11 +185,12 @@ fn hold_read(world: &World) -> Result<tokio::process::Child> {
 // ---- the rig -----------------------------------------------------------------------------------------
 
 /// One test: the world, the `tauri-driver` that owns the app, the WebDriver session. Dropped in this
-/// order: the session handle, the driver (killed), then the world (its drop stops an app that is
-/// still running, from its own records).
+/// order: the session handle, the driver (its whole process tree is killed: the app included, also
+/// an app of a world with no store, which has no lock or pid for the world to find), then the world
+/// (its drop stops an app that is still running, from its own records).
 struct Rig {
     wd: WebDriver,
-    _driver: DriverProc,
+    driver: DriverProc,
     world: World,
     /// The handle of the first window (Approvals for a provisioned world).
     first: String,
@@ -150,7 +213,7 @@ impl Rig {
         let first = wd.switch_to_title(window, START_WAIT).await?;
         Ok(Rig {
             wd,
-            _driver: driver,
+            driver,
             world,
             first,
         })
@@ -163,16 +226,32 @@ impl Rig {
     /// Ends the flow: on an error a screenshot and the world's diagnostics join the message; then the
     /// app quits through the test control file and the session ends.
     async fn finish(self, name: &str, outcome: Result<()>) -> Result<()> {
-        let outcome = match outcome {
+        let outcome = self.annotate(name, outcome).await;
+        let quit = self.world.quit_app().await;
+        let _ = self.wd.quit().await;
+        outcome.and(quit)
+    }
+
+    /// [`Rig::finish`] for a world with no store: before the wizard has finished the app serves
+    /// nothing, so it has no control dir to quit through, no pid record and no `instance.lock`.
+    /// The session ends and then the driver's whole process tree (the app too) is killed here,
+    /// before the world goes: nothing is left running for the next flow.
+    async fn finish_setup(mut self, name: &str, outcome: Result<()>) -> Result<()> {
+        let outcome = self.annotate(name, outcome).await;
+        let _ = self.wd.quit().await;
+        self.driver.kill_tree();
+        outcome
+    }
+
+    /// On an error: the message gains a screenshot and the world's diagnostics.
+    async fn annotate(&self, name: &str, outcome: Result<()>) -> Result<()> {
+        match outcome {
             Ok(()) => Ok(()),
             Err(e) => {
                 let shot = self.wd.screenshot_on_failure(name).await;
                 Err(format!("{e}\nscreenshot: {shot:?}\n{}", self.world.diagnostics()).into())
             }
-        };
-        let quit = self.world.quit_app().await;
-        let _ = self.wd.quit().await;
-        outcome.and(quit)
+        }
     }
 
     async fn to_approvals(&self) -> Result<()> {
@@ -194,7 +273,9 @@ impl Rig {
         Ok(())
     }
 
-    /// Approvals -> Settings -> the instance's token button -> the credential window.
+    /// Approvals -> Settings -> the instance's token button -> the credential window, once its
+    /// `credential_context` call succeeded: the token form is there and the failed-load page (an
+    /// `h1.title` too, with a `p.error` and no form) is not.
     async fn open_credential(&self) -> Result<()> {
         self.open_window("Settings", "Settings").await?;
         let token = self
@@ -205,10 +286,28 @@ impl Rig {
             )
             .await?;
         self.wd.click(&token).await?;
+        self.switch_to_credential().await
+    }
+
+    /// Switches to the open credential window and waits for its loaded page.
+    async fn switch_to_credential(&self) -> Result<()> {
+        let unreachable = |e: Box<dyn std::error::Error>| -> Box<dyn std::error::Error> {
+            format!("{e}\n{CREDENTIAL_UNREACHABLE}").into()
+        };
         self.wd
             .switch_to_title(&window_title("Credential"), WAIT)
-            .await?;
-        self.wd.wait_find("main#credential .title", WAIT).await?;
+            .await
+            .map_err(unreachable)?;
+        if let Err(e) = self.wd.wait_find("main#credential form.entry", WAIT).await {
+            // The window answers, but its call was refused: a product finding, not the driver.
+            if !self.wd.find_all("main#credential .error").await?.is_empty() {
+                return Err(
+                    "the credential window shows its failed-load error (credential_context refused)"
+                        .into(),
+                );
+            }
+            return Err(unreachable(e));
+        }
         Ok(())
     }
 }
@@ -260,6 +359,12 @@ async fn open_row(wd: &WebDriver, op_id: &str) -> Result<()> {
 /// Waits for the preview iframe to hold a table row, pressing "Open preview" when the detail pane
 /// offers it. The wait ends in the Approvals document (not the frame).
 async fn first_preview_row(wd: &WebDriver, within: Duration) -> Result<()> {
+    first_preview_text(wd, within, None).await.map(|_| ())
+}
+
+/// [`first_preview_row`] that also returns the frame's text, and (with `not`) does not accept a
+/// frame whose text is `not`: a previous request's frame that is still mounted cannot satisfy it.
+async fn first_preview_text(wd: &WebDriver, within: Duration, not: Option<&str>) -> Result<String> {
     let pressed = std::cell::Cell::new(false);
     wait_for("a table row in the preview frame", within, || async {
         let frames = wd.find_all("iframe[title='Preview']").await?;
@@ -276,9 +381,13 @@ async fn first_preview_row(wd: &WebDriver, within: Duration) -> Result<()> {
         };
         wd.switch_to_frame(frame).await?;
         let rows = wd.find_all("tr").await;
+        let text = match &rows {
+            Ok(r) if !r.is_empty() => Some(body_text(wd).await),
+            _ => None,
+        };
         wd.switch_to_parent().await?;
-        Ok(match rows {
-            Ok(r) if !r.is_empty() => Some(()),
+        Ok(match text {
+            Some(Ok(t)) if not != Some(t.as_str()) => Some(t),
             _ => None,
         })
     })
@@ -365,9 +474,28 @@ async fn ui06(rig: &Rig) -> Result<()> {
     wd.send_keys(&approve, keys::ENTER).await?;
     wd.send_keys(&approve, keys::SPACE).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    if cli.try_wait()?.is_some() {
-        return Err("the request was decided by Enter or Space on the Approve button".into());
-    }
+    // A wrongly accepted key would still be in its write, POST and reply here: the CLI's exit is
+    // not enough, so the page, the button and the mock are looked at too.
+    ensure!(
+        cli.try_wait()?.is_none(),
+        "the request was decided by Enter or Space on the Approve button"
+    );
+    ensure!(
+        !body_text(wd).await?.contains("Decision recorded"),
+        "the page recorded a decision after Enter or Space"
+    );
+    ensure!(
+        !wd.find_all("button[data-positive-decision]")
+            .await?
+            .is_empty(),
+        "the Approve button is gone after Enter or Space"
+    );
+    let posted = jira(&rig.world)?
+        .received()
+        .await
+        .iter()
+        .any(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/rest/api/2/issue"));
+    ensure!(!posted, "the mock saw the create POST after Enter or Space");
     wd.click(&approve).await?;
     wait_text(wd, "the decision to be recorded", WAIT, |t| {
         t.contains("Decision recorded")
@@ -378,15 +506,15 @@ async fn ui06(rig: &Rig) -> Result<()> {
         .await
         .map_err(|_| "the CLI did not end after the approval")??;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    assert_eq!(out.status.code(), Some(0), "stdout: {stdout}");
+    ensure_eq!(out.status.code(), Some(0), "stdout: {stdout}");
     let env: Value = serde_json::from_str(stdout.trim())?;
-    assert_eq!(env["status"], "succeeded", "{stdout}");
-    assert_eq!(env["data"]["receipt"]["key"], "ABC-3", "{stdout}");
-    assert!(
+    ensure_eq!(env["status"], "succeeded", "{stdout}");
+    ensure_eq!(env["data"]["receipt"]["key"], "ABC-3", "{stdout}");
+    ensure!(
         !stdout.contains(PAT_CANARY),
         "the token canary reached the CLI output"
     );
-    assert!(parse_envelope(&stdout).is_some(), "{stdout}");
+    ensure!(parse_envelope(&stdout).is_some(), "{stdout}");
 
     // Verify now, in the Audit window.
     rig.open_window("Audit", "Audit").await?;
@@ -398,7 +526,7 @@ async fn ui06(rig: &Rig) -> Result<()> {
         t.contains("verified") || t.contains("did not complete") || t.contains("integrity incident")
     })
     .await?;
-    assert!(
+    ensure!(
         text.contains("verified")
             && !text.contains("did not complete")
             && !text.contains("integrity incident"),
@@ -409,9 +537,10 @@ async fn ui06(rig: &Rig) -> Result<()> {
 
 // ---- S-06: payloads in a real webview ------------------------------------------------------------------
 
-/// S-06 (webview half): canary payloads in every field the mock serves and in the reason. After every
-/// tab of the request has rendered, the window title, the page's own `data-alive` marker and the
-/// number of windows are unchanged, and the document has no script, handler or link.
+/// S-06 (webview half): canary payloads in the summary and description the mock serves and in the
+/// reason. After every tab of the request has rendered, the window title, the page's own
+/// `data-alive` marker and the number of windows are unchanged, and the document has no script,
+/// handler or link.
 /// (`window.__pwned` itself cannot be read without a script: the payload sets the title as well.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s06_payloads_inert_in_real_webview() -> Result<()> {
@@ -428,11 +557,11 @@ async fn s06_payloads_inert_in_real_webview() -> Result<()> {
         )
         .await;
     let rig = Rig::approvals(world).await?;
-    let outcome = s06(&rig, &joined).await;
+    let outcome = s06(&rig).await;
     rig.finish("s06", outcome).await
 }
 
-async fn s06(rig: &Rig, joined: &str) -> Result<()> {
+async fn s06(rig: &Rig) -> Result<()> {
     let wd = &rig.wd;
     let _cli = rig.world.cli_spawn(&[
         "jira",
@@ -447,7 +576,7 @@ async fn s06(rig: &Rig, joined: &str) -> Result<()> {
     let title = wd.title().await?;
     let handles = wd.window_handles().await?;
     let alive = wd.find("html").await?;
-    assert_eq!(
+    ensure_eq!(
         wd.attribute(&alive, "data-alive").await?.as_deref(),
         Some("1")
     );
@@ -455,7 +584,7 @@ async fn s06(rig: &Rig, joined: &str) -> Result<()> {
     open_row(wd, "jira.issue.get").await?;
     first_preview_row(wd, WAIT).await?;
     let tabs = click_tabs(wd).await?;
-    assert!(tabs >= 4, "the detail pane has {tabs} tabs");
+    ensure!(tabs >= 4, "the detail pane has {tabs} tabs");
     // Back on the preview tab: the frame's own document.
     let preview = wd
         .wait_find_xpath("//button[@role='tab'][normalize-space()='Preview']", WAIT)
@@ -468,29 +597,30 @@ async fn s06(rig: &Rig, joined: &str) -> Result<()> {
     let in_frame = body_text(wd).await?;
     wd.switch_to_parent().await?;
     // The payload text is shown as text, not run: it is in the frame's text.
-    assert!(
+    ensure!(
         in_frame.contains("<script>") || in_frame.contains("&lt;script&gt;"),
         "the payload is not shown as text: {in_frame}"
     );
     assert_inert_document(wd, "approvals window").await?;
 
-    assert_eq!(wd.title().await?, title, "the window title changed");
-    assert!(!title.contains("pwned"));
+    ensure_eq!(wd.title().await?, title, "the window title changed");
+    ensure!(!title.contains("pwned"));
     let alive = wd.find("html").await?;
-    assert_eq!(
+    ensure_eq!(
         wd.attribute(&alive, "data-alive").await?.as_deref(),
         Some("1")
     );
-    assert_eq!(wd.window_handles().await?, handles, "a window appeared");
-    assert!(joined.contains(PAYLOADS[0]));
+    ensure_eq!(wd.window_handles().await?, handles, "a window appeared");
     Ok(())
 }
 
 // ---- S-07 and the credential page's CSP -----------------------------------------------------------------
 
 /// S-07 (webview half): a value typed into the Approvals window's in-memory state (the deny reason) is
-/// absent from the credential window, before and after a reload of each. The data-directory half is
-/// `windows::credential_builder_incognito_or_own_dir` (T6).
+/// absent from the credential window, before and after a reload of each. This evidences in-memory
+/// separation only: that the credential window has a data directory (or incognito mode) of its own
+/// is `windows::credential_builder_incognito_or_own_dir` (T6), and the driver cannot show a storage
+/// partition. Needs the credential window through the driver (see [`CREDENTIAL_UNREACHABLE`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s07_credential_window_incognito_or_own_data_dir() -> Result<()> {
     if !opted_in("s07_credential_window_incognito_or_own_data_dir") {
@@ -519,23 +649,27 @@ async fn s07(rig: &Rig) -> Result<()> {
         .wait_find(".deny-dialog input, .deny-dialog textarea", WAIT)
         .await?;
     wd.send_keys(&field, TYPED).await?;
-    assert_eq!(wd.attribute(&field, "value").await?.as_deref(), Some(TYPED));
+    // The typed value is the property (the content attribute stays empty on a strict driver).
+    ensure_eq!(wd.property(&field, "value").await?.as_deref(), Some(TYPED));
 
     rig.open_credential().await?;
     let absent = |text: &str| !text.contains(TYPED);
-    assert!(
+    ensure!(
         absent(&body_text(wd).await?),
         "typed text in the credential window"
     );
     wd.refresh().await?;
-    wd.wait_find("main#credential .title", WAIT).await?;
-    assert!(
+    wd.wait_find("main#credential form.entry", WAIT).await?;
+    ensure!(
         absent(&body_text(wd).await?),
         "typed text after the credential reload"
     );
-    for input in wd.find_all("input").await? {
-        let v = wd.attribute(&input, "value").await?;
-        assert!(
+    // The loop is not vacuous: the token form has inputs.
+    let inputs = wd.find_all("main#credential input").await?;
+    ensure!(!inputs.is_empty(), "the credential window has no input");
+    for input in inputs {
+        let v = wd.property(&input, "value").await?;
+        ensure!(
             v.as_deref().is_none_or(str::is_empty),
             "a credential field is not empty"
         );
@@ -544,20 +678,19 @@ async fn s07(rig: &Rig) -> Result<()> {
     rig.to_approvals().await?;
     wd.refresh().await?;
     wd.wait_find("h1", WAIT).await?;
-    assert!(
+    ensure!(
         wd.find_all(".deny-dialog").await?.is_empty(),
         "the deny dialog survived the reload"
     );
-    assert!(
+    ensure!(
         absent(&body_text(wd).await?),
         "typed text after the Approvals reload"
     );
 
-    wd.switch_to_title(&window_title("Credential"), WAIT)
-        .await?;
+    rig.switch_to_credential().await?;
     wd.refresh().await?;
-    wd.wait_find("main#credential .title", WAIT).await?;
-    assert!(
+    wd.wait_find("main#credential form.entry", WAIT).await?;
+    ensure!(
         absent(&body_text(wd).await?),
         "typed text in the credential window at the end"
     );
@@ -566,7 +699,10 @@ async fn s07(rig: &Rig) -> Result<()> {
 
 /// V35: the credential page counts `securitypolicyviolation` events in its own production listener
 /// (a `data-csp-violations` attribute on the root, no IPC): 0 in normal use. Its meta tag is the
-/// §10.3 policy of the shipped page with this build's isolation origin in `frame-src`.
+/// Â§10.3 policy of the shipped page with this build's isolation origin in `frame-src`. The counter
+/// starts from the page's module script, after Tauri's init scripts ran: it covers violations after
+/// page start only (a blocked isolation frame shows as the page never loading its context). Needs
+/// the credential window through the driver (see [`CREDENTIAL_UNREACHABLE`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn credential_page_meta_csp_enforced() -> Result<()> {
     if !opted_in("credential_page_meta_csp_enforced") {
@@ -625,20 +761,20 @@ async fn csp(rig: &Rig) -> Result<()> {
     let origin = frame_src_of(&observed)
         .ok_or("no frame-src in the page's policy")?
         .to_owned();
-    assert!(is_isolation_origin(&origin), "frame-src is {origin:?}");
+    ensure!(is_isolation_origin(&origin), "frame-src is {origin:?}");
     let template = shipped_credential_policy()?;
-    assert!(template.contains(ISOLATION_PLACEHOLDER), "{template}");
-    assert_eq!(
+    ensure!(template.contains(ISOLATION_PLACEHOLDER), "{template}");
+    ensure_eq!(
         observed,
         template.replace(ISOLATION_PLACEHOLDER, &origin),
-        "the page's policy differs from the shipped §10.3 policy"
+        "the page's policy differs from the shipped Â§10.3 policy"
     );
     // Used for a while (a reload and a second look), still no violation.
     wd.refresh().await?;
-    wd.wait_find("main#credential .title", WAIT).await?;
+    wd.wait_find("main#credential form.entry", WAIT).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let root = wd.find("html").await?;
-    assert_eq!(
+    ensure_eq!(
         wd.attribute(&root, "data-csp-violations").await?.as_deref(),
         Some("0"),
         "the credential page reported a CSP violation"
@@ -649,10 +785,14 @@ async fn csp(rig: &Rig) -> Result<()> {
 // ---- S-08 (V24): the preview iframe --------------------------------------------------------------------
 
 /// S-08 (webview half, V24): `preview.css` loads inside the sandboxed `srcdoc` frame (computed styles
-/// of `table`, `bdi` and `pre` reflect its rules); the mock body carries an inline `<style>`, a `style`
-/// attribute and a remote `<img>`, and the rendered document contains none of them while the page
-/// loaded and the mock saw no image request. (That the CSP would block such content if it survived the
-/// sanitizer is the CSP config check and V24 evidence: no test hook may inject unsanitized HTML.)
+/// of `table`, `bdi` and `pre` reflect its rules); the mock's summary is multi-line with a run of
+/// spaces, so the renderer emits a `bdi` in a `pre` (the flow fails when either is absent: the UA
+/// default of `pre` is `white-space: pre`, so `pre-wrap` shows the stylesheet applied). The mock body
+/// carries an inline `<style>`, a `style` attribute and a remote `<img>` and `<link>`, and the
+/// rendered document contains none of them (its one `<link>` is the renderer's own `preview.css`,
+/// compared to the exact href) while the page loaded and the mock saw no image request. (That the
+/// CSP would block such content if it survived the sanitizer is the CSP config check and V24
+/// evidence: no test hook may inject unsanitized HTML.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s08_preview_css_loads_inline_style_and_remote_image_blocked() -> Result<()> {
     if !opted_in("s08_preview_css_loads_inline_style_and_remote_image_blocked") {
@@ -668,7 +808,7 @@ async fn s08_preview_css_loads_inline_style_and_remote_image_blocked() -> Result
     mock.json(
         "/rest/api/2/issue/ABC-78",
         200,
-        &issue_json("ABC-78", "S-08 body", &body)?,
+        &issue_json("ABC-78", S08_SUMMARY, &body)?,
     )
     .await;
     let rig = Rig::approvals(world).await?;
@@ -691,52 +831,74 @@ async fn s08(rig: &Rig) -> Result<()> {
     open_row(wd, "jira.issue.get").await?;
     first_preview_row(wd, WAIT).await?;
     let frame = wd.find("iframe[title='Preview']").await?;
-    assert_eq!(
+    ensure_eq!(
         wd.attribute(&frame, "sandbox").await?.as_deref(),
         Some(""),
         "the preview iframe has a sandbox attribute with no tokens"
     );
-    assert!(
+    ensure!(
         wd.attribute(&frame, "src").await?.is_none(),
         "the preview iframe has a src"
     );
     wd.switch_to_frame(&frame).await?;
     // The stylesheet applied: element rules of preview.css (PD-92 contingency if this fails).
     let table = wd.find("table").await?;
-    assert_eq!(wd.css_value(&table, "border-collapse").await?, "collapse");
-    if let Some(bdi) = wd.find_all("bdi").await?.first() {
-        assert_eq!(wd.css_value(bdi, "white-space").await?, "pre-wrap");
-    }
-    if let Some(pre) = wd.find_all("pre").await?.first() {
-        assert_eq!(wd.css_value(pre, "white-space").await?, "pre-wrap");
-    }
-    // None of the active content is in the rendered document.
-    for css in [
-        "style",
-        "[style]",
-        "img",
-        "link[href]",
-        "script",
-        "iframe",
-        "[onerror]",
-    ] {
-        let hits = wd.find_all(css).await?;
-        if !hits.is_empty() {
+    ensure_eq!(wd.css_value(&table, "border-collapse").await?, "collapse");
+    // The multi-line summary is a `bdi` in a `pre`; both must exist and carry the stylesheet's rule.
+    for element in ["bdi", "pre"] {
+        let found = wd.find_all(element).await?;
+        let Some(first) = found.first() else {
             return Err(format!(
-                "the preview document holds {} element(s) of {css:?}",
-                hits.len()
+                "the preview document has no <{element}>: the multi-line value did not reach the renderer"
             )
             .into());
-        }
+        };
+        ensure_eq!(
+            wd.css_value(first, "white-space").await?,
+            "pre-wrap",
+            "white-space of the first <{element}>"
+        );
+    }
+    // None of the active content is in the rendered document. The one `<link>` is the renderer's
+    // own stylesheet, by its exact href; a `<style>` is allowed only in the head (the PD-92
+    // contingency), never in the body.
+    let expected_href = format!("{APP_ORIGIN}/preview.css");
+    for link in wd.find_all("link").await? {
+        ensure_eq!(
+            wd.attribute(&link, "href").await?.as_deref(),
+            Some(expected_href.as_str()),
+            "a <link> of the preview document is not the renderer's stylesheet"
+        );
+        ensure_eq!(
+            wd.attribute(&link, "rel").await?.as_deref(),
+            Some("stylesheet")
+        );
+    }
+    for css in [
+        "body link",
+        "body style",
+        "[style]",
+        "img",
+        "script",
+        "iframe,frame,object,embed,base,meta[http-equiv=refresh]",
+        "[onerror],[onload],[onclick]",
+        "[src],[srcset],[poster],[background],[action],[formaction],[data],[href]:not(link)",
+    ] {
+        let hits = wd.find_all(css).await?;
+        ensure!(
+            hits.is_empty(),
+            "the preview document holds {} element(s) of {css:?}",
+            hits.len()
+        );
     }
     let shown = body_text(wd).await?;
     wd.switch_to_parent().await?;
-    assert!(
+    ensure!(
         shown.contains("styled"),
         "the body text is shown as text: {shown}"
     );
     let seen = jira(&rig.world)?.received().await;
-    assert!(
+    ensure!(
         seen.iter().all(|r| !r.url.path().ends_with("/pixel.png")),
         "the remote image was requested"
     );
@@ -746,9 +908,12 @@ async fn s08(rig: &Rig) -> Result<()> {
 // ---- S-09: every window round-trips one granted call ---------------------------------------------------
 
 /// S-09 (webview half, V34): in a real webview behind the isolation pattern each window shows the
-/// result of one granted read-only call. A blocked isolation frame would leave every page on its
-/// loading text, so reaching the result is the observable (a reported `securitypolicyviolation` for
-/// the isolation origin is read for the credential page by `credential_page_meta_csp_enforced`).
+/// result of one granted read-only call, shows no alert, and reports no `securitypolicyviolation`
+/// (every window counts them in `data-csp-violations`: the production listener of `shared/alive.ts`,
+/// and the credential page's own). The counters start from the page's module script, after Tauri's
+/// init scripts: a blocked isolation frame (raised before) shows as the page never reaching its
+/// result, which the waits below fail on. The credential part needs that window through the driver
+/// (see [`CREDENTIAL_UNREACHABLE`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn s09_isolation_invoke_round_trips_every_window() -> Result<()> {
     if !opted_in("s09_isolation_invoke_round_trips_every_window") {
@@ -790,21 +955,35 @@ async fn s09(rig: &Rig) -> Result<()> {
     // Onboarding: onboarding_text answered.
     rig.open_window("Onboarding", "Onboarding").await?;
     wd.wait_find("pre.onboarding-text", WAIT).await?;
-    // Credential: credential_context answered (its title is the purpose's).
-    rig.open_credential().await?;
-    // No window is in an error state.
+    // No window is in an error state or reported a policy violation.
     for title in [
         "Approvals",
         "Settings",
         "Audit",
         "Running scripts",
         "Onboarding",
-        "Credential",
     ] {
         wd.switch_to_title(&window_title(title), WAIT).await?;
-        let alerts = wd.find_all("[role=alert]").await?;
-        assert!(alerts.is_empty(), "{title}: an alert is shown");
+        no_alert_no_violation(wd, title).await?;
     }
+    // Credential, last (it may not be drivable, see above): credential_context answered
+    // (`open_credential` waits for the token form, which the failed-load page does not have).
+    rig.open_credential().await?;
+    no_alert_no_violation(wd, "Credential").await?;
+    Ok(())
+}
+
+/// The current window shows no `role=alert` and its violation counter reads exactly `0` (an absent
+/// counter means the page's startup code did not run).
+async fn no_alert_no_violation(wd: &WebDriver, title: &str) -> Result<()> {
+    let alerts = wd.find_all("[role=alert]").await?;
+    ensure!(alerts.is_empty(), "{title}: an alert is shown");
+    let root = wd.find("html").await?;
+    ensure_eq!(
+        wd.attribute(&root, "data-csp-violations").await?.as_deref(),
+        Some("0"),
+        "{title}: securitypolicyviolation events were reported (or the counter is missing)"
+    );
     Ok(())
 }
 
@@ -817,22 +996,262 @@ async fn s09_isolation_invoke_setup_window() -> Result<()> {
     }
     let world = World::new(WorldOpts::default())?;
     let rig = Rig::start(world, &window_title("Setup"), false).await?;
+    let outcome = setup_window(&rig).await;
+    rig.finish_setup("s09_setup", outcome).await
+}
+
+async fn setup_window(rig: &Rig) -> Result<()> {
+    rig.wd.wait_find("section h2", WAIT).await?;
+    let text = body_text(&rig.wd).await?;
+    ensure!(!text.contains("Loading"), "{text}");
+    no_alert_no_violation(&rig.wd, "Setup").await?;
+    // Navigation refusal covers this window too (it is the one with a wizard behind it).
+    assert_navigation_refused(&rig.wd, "Setup", "data-alive").await
+}
+
+// ---- main-frame navigation refusal -----------------------------------------------------------------------
+
+/// The current window, asked by W3C "Navigate To" for a foreign URL, stays the app's page: the URL is
+/// still under the app origin, and the title, the set of windows and the page's own `marker`
+/// attribute (`data-alive`, or the credential page's `data-csp-violations`) are unchanged. The
+/// driver's answer to the command is not looked at (a refusal may be an error, an ok or a timeout).
+/// This is no script injection: it is the endpoint a user's address bar equals.
+async fn assert_navigation_refused(wd: &WebDriver, what: &str, marker: &str) -> Result<()> {
+    let title = wd.title().await?;
+    let handles = wd.window_handles().await?;
+    let before = wd.current_url().await?;
+    ensure!(
+        before.starts_with(APP_ORIGIN),
+        "{what}: the window starts at {before:?}, not under {APP_ORIGIN}"
+    );
+    let root = wd.find("html").await?;
+    let marked = wd.attribute(&root, marker).await?;
+    ensure!(
+        marked.is_some(),
+        "{what}: no {marker} before the navigation"
+    );
+    let _ = wd.navigate(FOREIGN_URL).await;
+    // A navigation that was not refused needs a moment to show.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after = wd.current_url().await?;
+    ensure!(
+        after.starts_with(APP_ORIGIN),
+        "{what}: the window navigated to {after:?}"
+    );
+    ensure_eq!(wd.title().await?, title, "{what}: the title changed");
+    ensure_eq!(
+        wd.window_handles().await?,
+        handles,
+        "{what}: a window appeared or went"
+    );
+    let root = wd.find("html").await?;
+    ensure_eq!(
+        wd.attribute(&root, marker).await?,
+        marked,
+        "{what}: the document was replaced ({marker} changed)"
+    );
+    Ok(())
+}
+
+/// Navigation refusal in the five main windows (every label the Approvals header opens, but the
+/// credential one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s09_main_frame_navigation_refused_in_every_window() -> Result<()> {
+    if !opted_in("s09_main_frame_navigation_refused_in_every_window") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    let rig = Rig::approvals(world).await?;
+    let outcome = navigation_main(&rig).await;
+    rig.finish("navigation", outcome).await
+}
+
+async fn navigation_main(rig: &Rig) -> Result<()> {
+    let wd = &rig.wd;
+    wd.wait_find("h1", WAIT).await?;
+    assert_navigation_refused(wd, "Approvals", "data-alive").await?;
+    for (button, title) in [
+        ("Settings", "Settings"),
+        ("Audit", "Audit"),
+        ("Running scripts", "Running scripts"),
+        ("Onboarding", "Onboarding"),
+    ] {
+        rig.open_window(button, title).await?;
+        wd.wait_find("h1", WAIT).await?;
+        assert_navigation_refused(wd, title, "data-alive").await?;
+    }
+    Ok(())
+}
+
+/// Navigation refusal in the credential window. Own flow: it needs that window through the driver
+/// (see [`CREDENTIAL_UNREACHABLE`]) and must not hide the main windows' result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s09_main_frame_navigation_refused_in_credential_window() -> Result<()> {
+    if !opted_in("s09_main_frame_navigation_refused_in_credential_window") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    let rig = Rig::approvals(world).await?;
     let outcome: Result<()> = async {
-        rig.wd.wait_find("section h2", WAIT).await?;
-        let text = body_text(&rig.wd).await?;
-        assert!(!text.contains("Loading"), "{text}");
-        assert!(rig.wd.find_all("[role=alert]").await?.is_empty());
-        Ok(())
+        rig.open_credential().await?;
+        assert_navigation_refused(&rig.wd, "Credential", "data-csp-violations").await
     }
     .await;
-    // No store: the app has no control dir to quit through before the wizard; the rig's drop stops it.
-    let shot = if outcome.is_err() {
-        rig.wd.screenshot_on_failure("s09_setup").await
-    } else {
-        None
+    rig.finish("navigation_credential", outcome).await
+}
+
+// ---- chords and the preview frame's focus (spec 5.6, PD-91) -------------------------------------------------
+
+/// Whether each queue row, in display (DOM) order, is the opened one (`aria-current`).
+async fn queue_current(wd: &WebDriver) -> Result<Vec<bool>> {
+    let mut out = Vec::new();
+    for row in wd.find_all(".queue-item").await? {
+        out.push(wd.attribute(&row, "aria-current").await?.as_deref() == Some("true"));
+    }
+    Ok(out)
+}
+
+/// Waits until exactly the row at `index` is the opened one.
+async fn wait_current(wd: &WebDriver, index: usize) -> Result<()> {
+    wait_for(
+        &format!("queue row {index} to be the opened one"),
+        WAIT,
+        || async {
+            let now = queue_current(wd).await?;
+            let only = now.iter().filter(|c| **c).count() == 1;
+            Ok((only && now.get(index) == Some(&true)).then_some(()))
+        },
+    )
+    .await
+}
+
+/// The first of `children` to end within `within`: its index and status, or `None`.
+async fn first_exit(
+    children: &mut [tokio::process::Child],
+    within: Duration,
+) -> Result<Option<(usize, std::process::ExitStatus)>> {
+    let start = Instant::now();
+    loop {
+        for (i, child) in children.iter_mut().enumerate() {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Some((i, status)));
+            }
+        }
+        if start.elapsed() > within {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// PD-91 in a real webview: Ctrl+Shift+Down / Up move the opened row, Ctrl+Shift+Enter decides it;
+/// while the focus is inside the sandboxed preview frame none of them reaches the page (keystrokes
+/// stay in the frame: a chord needs a click outside it), and after a click outside they work again.
+/// The window must report focus for the decision to be live (T19), as in UI-06.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ui_chords_work_outside_the_preview_frame_and_stay_in_it() -> Result<()> {
+    if !opted_in("ui_chords_work_outside_the_preview_frame_and_stay_in_it") {
+        return Ok(());
+    }
+    let world = jira_world().await?;
+    jira(&world)?
+        .json(
+            "/rest/api/2/issue/ABC-78",
+            200,
+            &issue_json("ABC-78", "Chords second", "second body")?,
+        )
+        .await;
+    let rig = Rig::approvals(world).await?;
+    let outcome = chords(&rig).await;
+    rig.finish("chords", outcome).await
+}
+
+async fn chords(rig: &Rig) -> Result<()> {
+    let wd = &rig.wd;
+    let ctrl_shift = [keys::CONTROL, keys::SHIFT];
+    let mut held = vec![
+        hold_read(&rig.world)?,
+        rig.world.cli_spawn(&[
+            "jira",
+            "issue",
+            "get",
+            "ABC-78",
+            "--reason",
+            BY_HAND,
+            "--timeout",
+            HOLD,
+        ])?,
+    ];
+    wait_for("two queue rows", START_WAIT, || async {
+        Ok((wd.find_all(".queue-item").await?.len() == 2).then_some(()))
+    })
+    .await?;
+    let opens = wd
+        .find_all(".queue-item button[aria-label^='Open ']")
+        .await?;
+    let Some(open_first) = opens.first() else {
+        return Err("no Open button on the first queue row".into());
     };
-    let _ = rig.wd.quit().await;
-    outcome.map_err(|e| format!("{e}\nscreenshot: {shot:?}\n{}", rig.world.diagnostics()).into())
+    wd.click(open_first).await?;
+    first_preview_row(wd, WAIT).await?;
+    wait_current(wd, 0).await?;
+    // Focus on the page, the inert period over: the chords below are live.
+    decision_button(wd).await?;
+
+    // Next and previous move the opened row.
+    wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
+    wait_current(wd, 1).await?;
+    first_preview_row(wd, WAIT).await?;
+    wd.chord(&ctrl_shift, keys::ARROW_UP).await?;
+    wait_current(wd, 0).await?;
+    first_preview_row(wd, WAIT).await?;
+
+    // Focus inside the preview frame: the same chords do nothing to the page.
+    let frame = wd.find("iframe[title='Preview']").await?;
+    wd.switch_to_frame(&frame).await?;
+    let inside = wd.find("body").await?;
+    wd.click(&inside).await?;
+    // Sent while the driver is switched into the frame: the keys go where the focus is, and a
+    // driver that routes actions by browsing context still means the frame.
+    wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
+    wd.chord(&ctrl_shift, keys::ENTER).await?;
+    wd.switch_to_parent().await?;
+    ensure!(
+        first_exit(&mut held, Duration::from_millis(1500))
+            .await?
+            .is_none(),
+        "a request was decided by a chord typed inside the preview frame"
+    );
+    ensure_eq!(
+        queue_current(wd).await?,
+        vec![true, false],
+        "a chord typed inside the preview frame moved the opened row"
+    );
+
+    // A click outside brings the chords back: next, then the decision chord on the neighbour.
+    decision_button(wd).await?;
+    wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
+    wait_current(wd, 1).await?;
+    first_preview_row(wd, WAIT).await?;
+    decision_button(wd).await?;
+    wd.chord(&ctrl_shift, keys::ENTER).await?;
+    let Some((decided, status)) = first_exit(&mut held, WAIT).await? else {
+        return Err("Ctrl+Shift+Enter outside the preview frame decided no request".into());
+    };
+    ensure_eq!(
+        status.code(),
+        Some(0),
+        "the CLI of the request decided by the chord"
+    );
+    // Exactly one request was decided.
+    let other = 1 - decided;
+    let still_held = held
+        .get_mut(other)
+        .ok_or("no second held request")?
+        .try_wait()?
+        .is_none();
+    ensure!(still_held, "the chord decided both requests");
+    Ok(())
 }
 
 // ---- P-01: first screen under 1 s ----------------------------------------------------------------------
@@ -900,6 +1319,9 @@ async fn p01(rig: &Rig) -> Result<()> {
     let mut slow = Vec::new();
     // Held children: killed on drop at the end of the flow.
     let mut children = Vec::new();
+    // The previous scenario's frame text: the next frame must differ from it, so a frame that is
+    // still mounted from the scenario before cannot satisfy the clock.
+    let mut previous: Option<String> = None;
     for (name, op_id, args) in scenarios {
         let mut full = args;
         full.extend(["--reason", BY_HAND, "--timeout", HOLD]);
@@ -910,15 +1332,16 @@ async fn p01(rig: &Rig) -> Result<()> {
             .await?;
         let started = Instant::now();
         wd.click(&open).await?;
-        first_preview_row(wd, Duration::from_secs(10)).await?;
+        let text = first_preview_text(wd, Duration::from_secs(10), previous.as_deref()).await?;
         let took = started.elapsed();
         println!("P01 {name} {} ms", took.as_millis());
         if took > P01_BUDGET {
             slow.push(format!("{name}: {} ms", took.as_millis()));
         }
+        previous = Some(text);
     }
     drop(children);
-    assert!(
+    ensure!(
         slow.is_empty(),
         "P-01 budget {P01_BUDGET:?} exceeded: {slow:?}"
     );
@@ -944,7 +1367,15 @@ async fn i40_wm_queryendsession_runs_shutdown_path() -> Result<()> {
     let mut app = world.start_app().await?;
     let pid = app.pid().ok_or("the app has no pid")?;
     let answer = tokio::task::spawn_blocking(move || end_session::query(pid)).await??;
-    assert_eq!(answer, 1, "WM_QUERYENDSESSION was not answered TRUE");
+    // FALSE (0) is also what the app answers when its path outlives its own 4 s wait (T29): on a
+    // slow runner that is a flake, not a finding, so the world's diagnostics come with it.
+    if answer != 1 {
+        return Err(format!(
+            "WM_QUERYENDSESSION was answered {answer}, not TRUE\n{}",
+            world.diagnostics()
+        )
+        .into());
+    }
     // The path ended before the answer; the process follows (or the control file ends it: the path
     // is a single run, a second request does not append a second stop).
     let exited = tokio::task::block_in_place(|| {
@@ -963,8 +1394,13 @@ async fn i40_wm_queryendsession_runs_shutdown_path() -> Result<()> {
     let _ = tokio::task::block_in_place(|| app.wait_exit());
     let records = world.audit_records()?;
     let (last, payload) = records.last().ok_or("the audit log is empty")?;
-    assert_eq!(*last, EventType::APP_STOP);
-    assert_eq!(payload["reason"], Value::from("os_shutdown"));
+    ensure_eq!(
+        *last,
+        EventType::APP_STOP,
+        "the last audit record\n{}",
+        world.diagnostics()
+    );
+    ensure_eq!(payload["reason"], Value::from("os_shutdown"));
     Ok(())
 }
 
@@ -1122,6 +1558,68 @@ mod tests {
         }
     }
 
+    fn passes() -> Result<()> {
+        let one = std::hint::black_box(1);
+        ensure!(one + 1 == 2);
+        ensure!(true, "never shown {}", 1);
+        let two = one + 1;
+        ensure_eq!(two, 2);
+        ensure_eq!(two.to_string(), "2", "never shown");
+        Ok(())
+    }
+
+    fn fails_plain() -> Result<()> {
+        let one = std::hint::black_box(1);
+        ensure!(one + 1 == 3);
+        Ok(())
+    }
+
+    fn fails_with_message() -> Result<()> {
+        ensure!(false, "the {} failed", "check");
+        Ok(())
+    }
+
+    fn fails_eq() -> Result<()> {
+        ensure_eq!(1, 2, "numbers of {}", "a");
+        Ok(())
+    }
+
+    #[test]
+    fn the_ensure_macros_return_errors_and_never_panic() {
+        assert!(passes().is_ok());
+        let plain = fails_plain().unwrap_err().to_string();
+        assert!(plain.contains("one + 1 == 3"), "{plain}");
+        assert_eq!(
+            fails_with_message().unwrap_err().to_string(),
+            "the check failed"
+        );
+        let eq = fails_eq().unwrap_err().to_string();
+        assert!(
+            eq.contains("numbers of a") && eq.contains("left: 1") && eq.contains("right: 2"),
+            "{eq}"
+        );
+    }
+
+    /// A failed check must reach `Rig::finish` (screenshot, diagnostics, quit): the flows' code has
+    /// no panicking assertion.
+    #[test]
+    fn the_flows_use_no_panicking_assertion() {
+        let source = include_str!("flows.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap_or_default();
+        for needle in [["assert", "!("].concat(), ["assert", "_eq!("].concat()] {
+            // The two macro doc comments name them; code lines do not.
+            for line in code.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                assert!(!line.contains(&needle), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_app_origin_and_foreign_url_differ() {
+        assert!(!FOREIGN_URL.starts_with(APP_ORIGIN));
+        assert!(APP_ORIGIN.ends_with("localhost"));
+    }
+
     #[test]
     fn window_titles_are_the_pages() {
         assert_eq!(window_title("Approvals"), "atlas-duck: Approvals");
@@ -1135,12 +1633,17 @@ mod tests {
             .match_indices("async fn ")
             .map(|(i, _)| &source[i..])
             .filter(|rest| {
-                // A flow is the `async fn` directly under a `#[tokio::test(..)]`.
+                // A flow is the `async fn` directly under a `#[tokio::test..]` attribute, whatever
+                // its arguments.
                 let before = &source[..source.len() - rest.len()];
-                before.trim_end().ends_with("worker_threads = 2)]")
+                before
+                    .trim_end()
+                    .lines()
+                    .next_back()
+                    .is_some_and(|l| l.trim_start().starts_with("#[tokio::test"))
             })
             .collect();
-        assert!(flows.len() >= 8, "{} flows found", flows.len());
+        assert!(flows.len() >= 12, "{} flows found", flows.len());
         for rest in flows {
             let open = rest.find('{').unwrap_or(0);
             let body = &rest[open + 1..];
