@@ -1,0 +1,11 @@
+<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">java</ac:parameter><ac:plain-text-body><![CDATA[class A {
+  String s = "]]]]><![CDATA[>";
+}]]></ac:plain-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="code"><ac:parameter ac:name="language">c sharp!</ac:parameter><ac:plain-text-body><![CDATA[x ``` y
+```]]></ac:plain-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="noformat"><ac:plain-text-body><![CDATA[<b>raw</b> [macro: x {}]]]></ac:plain-text-body></ac:structured-macro>
+<ul><li>item<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[a
+b]]></ac:plain-text-body></ac:structured-macro></li></ul>
+<table><tbody><tr><th>h</th></tr><tr><td><ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[x | y
+z]]></ac:plain-text-body></ac:structured-macro></td></tr></tbody></table>
+<ac:structured-macro ac:name="sql-query"><ac:parameter ac:name="db">main</ac:parameter><ac:plain-text-body><![CDATA[SELECT 1]]></ac:plain-text-body></ac:structured-macro>

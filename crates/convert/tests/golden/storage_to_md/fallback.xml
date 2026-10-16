@@ -1,0 +1,4 @@
+<p>Broken <b>tag</p>
+<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[let x = "<p>";
+]]]]><![CDATA[>]]></ac:plain-text-body></ac:structured-macro>
+<p>after @user:z</p>

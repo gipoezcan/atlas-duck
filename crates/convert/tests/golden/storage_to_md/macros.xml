@@ -1,0 +1,6 @@
+<p>Intro <ac:structured-macro ac:name="status" ac:schema-version="1"><ac:parameter ac:name="title">In [progress], 50%</ac:parameter><ac:parameter ac:name="colour">Yellow</ac:parameter></ac:structured-macro> done.</p>
+<ac:structured-macro ac:name="toc"/>
+<ac:structured-macro ac:name="info"><ac:parameter ac:name="title">Note</ac:parameter><ac:rich-text-body><p>Body <em>text</em>.</p></ac:rich-text-body></ac:structured-macro>
+<ac:structured-macro ac:name="roadmap-planner"><ac:parameter ac:name="source">a,b}c\d</ac:parameter></ac:structured-macro>
+<p>Smile <ac:emoticon ac:name="smile"/> please.</p>
+<ac:structured-macro ac:name="include"><ac:parameter ac:name=""><ac:link><ri:page ri:content-title="Other page"/></ac:link></ac:parameter></ac:structured-macro>

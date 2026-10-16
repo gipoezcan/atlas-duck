@@ -1,0 +1,3 @@
+<p>Prose [macro: toc {}] and @user:abc and \[macro: x {}] and \@user:def.</p>
+<p>A <a href="confluence:DOC/x">genuine link</a> and <a href="CONFLUENCE:y">upper</a>.</p>
+<p>Mail @user: alone and me@user:x.</p>

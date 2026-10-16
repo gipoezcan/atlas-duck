@@ -1,0 +1,3 @@
+<p>See <ac:link><ri:page ri:space-key="DOC" ri:content-title="Getting Started"/></ac:link>, <ac:link><ri:page ri:content-title="Local Page"/><ac:plain-text-link-body><![CDATA[the local page]]></ac:plain-text-link-body></ac:link> and <ac:link><ri:attachment ri:filename="report v2.pdf"/></ac:link>.</p>
+<p><ac:image ac:width="200"><ri:attachment ri:filename="diagram (1).png"/></ac:image> <ac:image><ri:url ri:value="https://example.com/x.png?a=1&amp;b=2"/></ac:image></p>
+<p>Jump to <ac:link ac:anchor="Install"><ac:link-body>Installation <strong>notes</strong></ac:link-body></ac:link> or <a href="https://example.com">the web</a>.</p>

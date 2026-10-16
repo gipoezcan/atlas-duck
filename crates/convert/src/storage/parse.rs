@@ -88,11 +88,11 @@ impl Element {
             .map(|(_, v)| v.as_str())
     }
 
-    fn is(&self, ns: Ns, local: &str) -> bool {
+    pub(crate) fn is(&self, ns: Ns, local: &str) -> bool {
         self.ns == ns && self.local == local
     }
 
-    fn child_elements(&self) -> impl Iterator<Item = &Element> {
+    pub(crate) fn child_elements(&self) -> impl Iterator<Item = &Element> {
         self.children.iter().filter_map(|n| match n {
             Node::Element(e) => Some(e),
             _ => None,
@@ -894,8 +894,13 @@ fn include_target(e: &Element) -> Option<String> {
 /// read up to the failure point counts (`storage_to_markdown` then runs its fallback, which
 /// renders no mention).
 pub fn storage_user_refs(storage: &str) -> StorageUsers {
+    user_refs(&parse(storage))
+}
+
+/// [`storage_user_refs`] of an already parsed fragment.
+pub(crate) fn user_refs(doc: &StorageDoc) -> StorageUsers {
     let mut out = StorageUsers::default();
-    users(&parse(storage).nodes, &mut out);
+    users(&doc.nodes, &mut out);
     out
 }
 
