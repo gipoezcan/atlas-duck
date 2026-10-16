@@ -379,7 +379,10 @@ async fn first_preview_text(wd: &WebDriver, within: Duration, not: Option<&str>)
             }
             return Ok(None);
         };
-        wd.switch_to_frame(frame).await?;
+        // A frame that is reloading (new srcdoc) answers "no such frame": look again.
+        if wd.switch_to_frame(frame).await.is_err() {
+            return Ok(None);
+        }
         let rows = wd.find_all("tr").await;
         let text = match &rows {
             Ok(r) if !r.is_empty() => Some(body_text(wd).await),
@@ -496,6 +499,10 @@ async fn ui06(rig: &Rig) -> Result<()> {
         .iter()
         .any(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/rest/api/2/issue"));
     ensure!(!posted, "the mock saw the create POST after Enter or Space");
+    // The keys above focused the button: a focus the user did not request starts the inert period
+    // again (spec 5.6), and a click inside it is dropped. Wait it out, then click.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    wait_enabled(wd, &approve, INERT_WAIT).await?;
     wd.click(&approve).await?;
     wait_text(wd, "the decision to be recorded", WAIT, |t| {
         t.contains("Decision recorded")
@@ -632,6 +639,25 @@ async fn s07_credential_window_incognito_or_own_data_dir() -> Result<()> {
     rig.finish("s07", outcome).await
 }
 
+/// Types `text` into a field of the Approvals window. The window swallows every key and text event
+/// for a second after a focus the user did not ask for (spec 5.6 "focus inert": a window focus, or
+/// the dialog field's own programmatic focus), and a driver's "Element Send Keys" is such input:
+/// sent at once it is dropped and the field stays empty. So the keys are sent again, only while the
+/// field is still empty, until they land or `WAIT` is over (a field that holds anything else is a
+/// failure: the keys were not all swallowed).
+async fn type_when_armed(wd: &WebDriver, field: &Element, text: &str) -> Result<()> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        wd.send_keys(field, text).await?;
+        match wd.property(field, "value").await?.as_deref() {
+            Some(v) if v == text => return Ok(()),
+            None | Some("") if Instant::now() < deadline => {}
+            other => return Err(format!("the field holds {other:?} after typing {text:?}").into()),
+        }
+    }
+}
+
 async fn s07(rig: &Rig) -> Result<()> {
     const TYPED: &str = "S07-typed-in-approvals-5b7e1c";
     let wd = &rig.wd;
@@ -648,7 +674,7 @@ async fn s07(rig: &Rig) -> Result<()> {
     let field = wd
         .wait_find(".deny-dialog input, .deny-dialog textarea", WAIT)
         .await?;
-    wd.send_keys(&field, TYPED).await?;
+    type_when_armed(wd, &field, TYPED).await?;
     // The typed value is the property (the content attribute stays empty on a strict driver).
     ensure_eq!(wd.property(&field, "value").await?.as_deref(), Some(TYPED));
 
@@ -774,10 +800,11 @@ async fn csp(rig: &Rig) -> Result<()> {
     wd.wait_find("main#credential form.entry", WAIT).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
     let root = wd.find("html").await?;
-    ensure_eq!(
-        wd.attribute(&root, "data-csp-violations").await?.as_deref(),
-        Some("0"),
-        "the credential page reported a CSP violation"
+    let count = wd.attribute(&root, "data-csp-violations").await?;
+    ensure!(
+        count.as_deref() == Some("0"),
+        "the credential page reported a CSP violation: count {count:?}, last: {}",
+        last_violation(wd, &root).await
     );
     Ok(())
 }
@@ -836,9 +863,14 @@ async fn s08(rig: &Rig) -> Result<()> {
         Some(""),
         "the preview iframe has a sandbox attribute with no tokens"
     );
+    // The renderer sets no `src` (PreviewFrame.tsx renders `sandbox` and `srcDoc` only). A driver's "Get Element
+    // Attribute" is the legacy atom on WebKit and WebView2: for `src` it answers the resolved
+    // property, "" for an iframe without one (or "about:srcdoc" for a srcdoc frame), not `null`. So
+    // the check is that no URL is there: absent, empty or the srcdoc document itself.
+    let src = wd.attribute(&frame, "src").await?;
     ensure!(
-        wd.attribute(&frame, "src").await?.is_none(),
-        "the preview iframe has a src"
+        matches!(src.as_deref(), None | Some("") | Some("about:srcdoc")),
+        "the preview iframe has a src: {src:?}"
     );
     wd.switch_to_frame(&frame).await?;
     // The stylesheet applied: element rules of preview.css (PD-92 contingency if this fails).
@@ -979,12 +1011,23 @@ async fn no_alert_no_violation(wd: &WebDriver, title: &str) -> Result<()> {
     let alerts = wd.find_all("[role=alert]").await?;
     ensure!(alerts.is_empty(), "{title}: an alert is shown");
     let root = wd.find("html").await?;
-    ensure_eq!(
-        wd.attribute(&root, "data-csp-violations").await?.as_deref(),
-        Some("0"),
-        "{title}: securitypolicyviolation events were reported (or the counter is missing)"
+    let count = wd.attribute(&root, "data-csp-violations").await?;
+    ensure!(
+        count.as_deref() == Some("0"),
+        "{title}: securitypolicyviolation events were reported (or the counter is missing): count {count:?}, last: {}",
+        last_violation(wd, &root).await
     );
     Ok(())
+}
+
+/// The page's `data-csp-last` (directive and blocked resource of the latest violation), for the
+/// failure text only.
+async fn last_violation(wd: &WebDriver, root: &Element) -> String {
+    match wd.attribute(root, "data-csp-last").await {
+        Ok(Some(v)) => v,
+        Ok(None) => "none recorded".to_owned(),
+        Err(e) => format!("unreadable ({e})"),
+    }
 }
 
 /// S-09 (setup window): a world with no store opens the Setup window, which shows the wizard's step
@@ -1207,8 +1250,15 @@ async fn chords(rig: &Rig) -> Result<()> {
     first_preview_row(wd, WAIT).await?;
 
     // Focus inside the preview frame: the same chords do nothing to the page.
-    let frame = wd.find("iframe[title='Preview']").await?;
-    wd.switch_to_frame(&frame).await?;
+    // The frame reloads when the opened row changes (new srcdoc): WebKit answers "no such frame" to
+    // a switch made while it does, so the switch is retried until it takes.
+    wait_for("the preview frame to be entered", WAIT, || async {
+        let Ok(frame) = wd.find("iframe[title='Preview']").await else {
+            return Ok(None);
+        };
+        Ok(wd.switch_to_frame(&frame).await.ok().map(|_| ()))
+    })
+    .await?;
     let inside = wd.find("body").await?;
     wd.click(&inside).await?;
     // Sent while the driver is switched into the frame: the keys go where the focus is, and a
