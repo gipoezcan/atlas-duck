@@ -877,6 +877,78 @@ fn host_rejection_is_a_catchable_atlas_error() -> TestResult {
     })
 }
 
+/// Every key the dispatcher reads from a host frame is checked as an own property first: with a
+/// throwing getter for each of them on `Object.prototype`, a frame that lacks exactly one key (the
+/// key count kept) is still a protocol halt. Without a `hasOwn` guard the dispatcher would read the
+/// inherited getter (which logs), and the run would end as an engine halt or the call would settle.
+#[test]
+fn malformed_frames_under_throwing_prototype_getters_are_protocol_halts() -> TestResult {
+    big_stack(|| {
+        let source = r#"
+            for (const k of ['jsonrpc', 'id', 'result', 'ok', 'rejected', 'class', 'details']) {
+              Object.defineProperty(Object.prototype, k, {
+                get() { atlas.log('getter ' + k); throw new Error('getter ' + k); },
+                configurable: true
+              });
+            }
+            return await atlas.call('jira.search', {});
+        "#;
+        let frames = [
+            r#"{"x":"2.0","id":1,"result":{"ok":1}}"#,
+            r#"{"jsonrpc":"2.0","x":1,"result":{"ok":1}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"x":{"ok":1}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"x":1}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"rejected":{"x":"a","details":1}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"rejected":{"class":"a","x":1}}}"#,
+        ];
+        let mut wrong = Vec::new();
+        for frame in frames {
+            let mut engine = Engine::new(&init(source), FakeHost::default()).map_err(e)?;
+            let started = start_and_drain(&mut engine);
+            let delivered = engine.deliver(frame);
+            let sent = engine.host().sent.clone();
+            let protocol = matches!(delivered, Err(Halt::Protocol(_)));
+            if !matches!(started, Settled::Pending { outstanding: 1 })
+                || !protocol
+                || call_ids(&sent) != [1]
+                || sent.len() != 1
+            {
+                wrong.push(format!(
+                    "{frame}: {started:?}, {delivered:?}, sent {sent:?}"
+                ));
+            }
+        }
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(wrong.join("\n"))
+        }
+    })
+}
+
+/// After the run settled, no host frame reaches the dispatcher (whose settlement could run agent
+/// code): a call still outstanding when main returned stays unanswered.
+#[test]
+fn deliver_after_the_run_settled_is_an_engine_halt() -> TestResult {
+    big_stack(|| {
+        let source = "atlas.call('jira.search', {}).then(() => atlas.log('late')); return 1;";
+        let mut engine = Engine::new(&init(source), FakeHost::default()).map_err(e)?;
+        let settled = start_and_drain(&mut engine);
+        if result_json(&settled)? != json!(1) {
+            return Err(format!("settled {settled:?}"));
+        }
+        match engine.deliver(&ok_frame(1, json!(1))?) {
+            Err(Halt::Engine(_)) => {}
+            other => return Err(format!("deliver: {other:?}")),
+        }
+        let sent = engine.host().sent.clone();
+        if call_ids(&sent) != [1] || sent.len() != 1 {
+            return Err(format!("sent {sent:?}"));
+        }
+        Ok(())
+    })
+}
+
 /// A host frame the dispatcher cannot use is a protocol halt, never a settlement.
 #[test]
 fn malformed_host_frames_are_protocol_halts() -> TestResult {
@@ -1031,6 +1103,50 @@ fn undecodable_or_oversized_calls_reject_in_script_and_send_nothing() -> TestRes
     })
 }
 
+/// The op id and the instance count toward the call's size like the params: a call whose
+/// identifiers alone pass the 1 MiB frame cap rejects inside the script and is never sent. The
+/// shim refuses it before the strings are copied out of QuickJS, whose UTF-8 copy would otherwise
+/// count against `heap_mb` (and its Rust copy and escaped frame against `process_mb`).
+#[test]
+fn oversized_call_identifiers_reject_in_script_and_send_nothing() -> TestResult {
+    big_stack(|| {
+        let refused = json!(["RangeError", CALL_TOO_LARGE]);
+        let source = r#"
+            const why = (p) => p.then(() => 'sent', (err) => [err.name, err.message]);
+            return [
+              await why(atlas.call('\x01'.repeat(5e7), {})),
+              await why(atlas.call('\x01'.repeat(2e6), {})),
+              await why(atlas.call('jira.search', {}, { instance: 'a'.repeat(2e6) })),
+              await why(atlas.call('jira.search', { s: 'x'.repeat(600000) },
+                                   { instance: 'a'.repeat(600000) })),
+            ];
+        "#;
+        let (settled, sent) = run(&init(source))?;
+        let got = result_json(&settled)?;
+        if got != json!([refused, refused, refused, refused]) || !sent.is_empty() {
+            return Err(format!("got {got}, sent {} frames", sent.len()));
+        }
+        // Each string fits the heap, its UTF-8 copy (two bytes per character) beside it does not.
+        let limits = ScriptLimits {
+            heap_mb: 24,
+            ..ScriptLimits::default()
+        };
+        for source in [
+            "return await atlas.call('\\u00e9'.repeat(9e6), {}) \
+               .then(() => 'sent', (err) => [err.name, err.message]);",
+            "return await atlas.call('jira.search', {}, { instance: '\\u00e9'.repeat(9e6) }) \
+               .then(() => 'sent', (err) => [err.name, err.message]);",
+        ] {
+            let (settled, sent) = run(&init_with(source, json!({}), limits))?;
+            match result_json(&settled) {
+                Ok(got) if got == refused && sent.is_empty() => {}
+                _ => return Err(format!("{source}: {settled:?}, sent {} frames", sent.len())),
+            }
+        }
+        Ok(())
+    })
+}
+
 /// An exception thrown out of a `queueMicrotask` callback (the only job that can throw past its
 /// own handler) ends the run as a script error, never as an engine halt; `main`'s own earlier
 /// settlement wins.
@@ -1071,6 +1187,15 @@ fn uncaught_microtask_exception_is_a_script_error() -> TestResult {
         if result_json(&settled)? != json!(7) {
             return Err(format!("early: {settled:?}"));
         }
+        // Once main's state decided the run, the thrown value is not described: its getters
+        // never run.
+        let (settled, sent) = run(&init(
+            "queueMicrotask(() => { throw { get message() { atlas.log('described'); return 'm'; } }; }); \
+             return 7;",
+        ))?;
+        if result_json(&settled)? != json!(7) || !sent.is_empty() {
+            return Err(format!("decided: {settled:?}, sent {sent:?}"));
+        }
         Ok(())
     })
 }
@@ -1078,14 +1203,14 @@ fn uncaught_microtask_exception_is_a_script_error() -> TestResult {
 /// The shim only uses intrinsics it captured and objects agent code cannot reach, so tampering
 /// with `Promise`, `Object.prototype`, the `AtlasError` class or `Error` changes what the script
 /// itself sees and never the dispatcher: every run ends as a result, a script error or pending,
-/// never as `Halt::Engine`, and call ids leave strictly increasing.
+/// never as `Halt::Engine`, and every call goes out with its id, in call order.
 #[test]
 fn shim_survives_intrinsic_tampering() -> TestResult {
     big_stack(|| {
         type Answer = fn(u64) -> Result<String, String>;
         let ok: Answer = |id| ok_frame(id, json!({"a": id}));
         let rejected: Answer = rejected_frame;
-        let cases: [(&str, &str, Answer, Settled); 7] = [
+        let cases: [(&str, &str, Answer, Settled, &[u64]); 6] = [
             (
                 "species getter",
                 r#"
@@ -1095,6 +1220,7 @@ fn shim_survives_intrinsic_tampering() -> TestResult {
                 "#,
                 ok,
                 Settled::Result(r#"{"a":1}"#.into()),
+                &[1],
             ),
             (
                 // QuickJS-NG rejects an async function's own promise (instead of throwing at the
@@ -1108,6 +1234,7 @@ fn shim_survives_intrinsic_tampering() -> TestResult {
                 "#,
                 ok,
                 Settled::Result("5".into()),
+                &[],
             ),
             (
                 "throwing Promise.prototype.constructor, main awaits",
@@ -1124,6 +1251,7 @@ fn shim_survives_intrinsic_tampering() -> TestResult {
                     message: "ctor".into(),
                     stack: String::new(),
                 }),
+                &[1],
             ),
             (
                 "Object.prototype setters",
@@ -1141,6 +1269,7 @@ fn shim_survives_intrinsic_tampering() -> TestResult {
                     r#"["AtlasError","validation",{"param":"key"},"host call rejected: validation"]"#
                         .into(),
                 ),
+                &[1],
             ),
             (
                 "prototype swap of err.constructor, Error statics",
@@ -1157,21 +1286,7 @@ fn shim_survives_intrinsic_tampering() -> TestResult {
                 "#,
                 rejected,
                 Settled::Result(r#"["TypeError","AtlasError","validation",true]"#.into()),
-            ),
-            (
-                "throwing Object.prototype getters",
-                r#"
-                for (const k of ['then', 'jsonrpc', 'id', 'result', 'ok', 'rejected', 'class',
-                                 'details', 'resolve', 'reject', 'length']) {
-                  Object.defineProperty(Object.prototype, k, {
-                    get() { throw new Error('getter ' + k); }, configurable: true
-                  });
-                }
-                try { return await atlas.call('jira.search', {}); }
-                catch (e) { return 'caught ' + e.message; }
-                "#,
-                ok,
-                Settled::Result(r#""caught getter then""#.into()),
+                &[1, 2],
             ),
             (
                 // The settlement of call 1 runs a then getter that makes call 4 while call 3 is
@@ -1190,20 +1305,24 @@ fn shim_survives_intrinsic_tampering() -> TestResult {
                 "#,
                 ok,
                 Settled::Result(r#"[{"a":1},{"a":2},{"a":3},{"a":4}]"#.into()),
+                &[1, 2, 3, 4],
             ),
         ];
         let limits = ScriptLimits {
             max_concurrent_calls: 2,
             ..ScriptLimits::default()
         };
-        for (name, source, answer, expected) in cases {
+        for (name, source, answer, expected, expected_ids) in cases {
             let (settled, sent) = drive(&init_with(source, json!({}), limits), answer)?;
             if matches!(settled, Settled::Halted(Halt::Engine(_))) {
                 return Err(format!("{name}: an engine halt: {settled:?}"));
             }
+            // The exact ids: every call went out, in call order (none was refused as out of order).
             let ids = call_ids(&sent);
-            if ids.windows(2).any(|w| w[0] >= w[1]) {
-                return Err(format!("{name}: ids not strictly increasing: {ids:?}"));
+            if ids != expected_ids {
+                return Err(format!(
+                    "{name}: sent ids {ids:?}, expected {expected_ids:?}"
+                ));
             }
             let settled = match settled {
                 // The stack is engine-formatted; only class and message are pinned here.

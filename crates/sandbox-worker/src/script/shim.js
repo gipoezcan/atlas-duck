@@ -55,8 +55,9 @@
   // The script.error frame cap in bytes, as a UTF-16 unit bound for each field of a thrown value.
   var maxErrorUnits = config.max_error_units;
   // The worker -> host frame cap in bytes, used as a UTF-16 unit bound (a text never has fewer
-  // UTF-8 bytes than UTF-16 units): a longer call is refused and a longer log line is cut here,
-  // before the text is copied to Rust outside the heap limit.
+  // UTF-8 bytes than UTF-16 units): a call whose params, op id and instance are longer together is
+  // refused and a longer log line is cut here, before the text is copied to Rust outside the heap
+  // limit.
   var maxFrameUnits = config.max_frame_units;
   var callTooLarge = config.call_too_large;
 
@@ -158,21 +159,22 @@
           if (typeof inst !== 'string') {
             throw new TypeErrorCtor('options.instance must be a string');
           }
-          instance = wellFormed(inst);
+          instance = inst;
         }
       }
       var text = jsonStringify(params === undefined ? {} : params);
       if (typeof text !== 'string') {
         throw new TypeErrorCtor('the params are not JSON-serializable');
       }
-      if (text.length > maxFrameUnits) {
+      // The op id and the instance go into the frame too, and every string is copied to Rust.
+      if (text.length + opId.length + (instance === null ? 0 : instance.length) > maxFrameUnits) {
         throw new RangeErrorCtor(callTooLarge);
       }
       var c = {
         id: nextId++,
         opId: wellFormed(opId),
         text: wellFormed(text),
-        instance: instance,
+        instance: instance === null ? null : wellFormed(instance),
         all: all,
         resolve: resolve,
         reject: reject

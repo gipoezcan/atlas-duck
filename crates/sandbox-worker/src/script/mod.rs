@@ -384,7 +384,12 @@ impl<H: HostPort + 'static> Engine<H> {
                 self.ctx.with(|ctx| {
                     let thrown = ctx.catch();
                     self.observe_main(&ctx);
-                    self.record(&ctx, &self.fail_fn, thrown);
+                    // Once main's state decided the run, describing the thrown value would only
+                    // run its getters for a settlement that is discarded.
+                    let undecided = self.shared.outcome.borrow().is_none();
+                    if undecided && self.shared.halted().is_none() {
+                        self.record(&ctx, &self.fail_fn, thrown);
+                    }
                 });
                 if let Some(halt) = self.shared.halted() {
                     return Settled::Halted(halt);
@@ -426,6 +431,11 @@ impl<H: HostPort + 'static> Engine<H> {
     pub fn deliver(&mut self, frame_text: &str) -> Result<(), Halt> {
         if let Some(halt) = self.shared.halted() {
             return Err(halt);
+        }
+        // As in `drain_jobs`: after the settlement no agent code runs (the loop never delivers
+        // then).
+        if self.finished {
+            return Err(Halt::Engine("the run already settled"));
         }
         let answer = self.ctx.with(|ctx| -> rquickjs::Result<i32> {
             let deliver = self.deliver_fn.clone().restore(&ctx)?;

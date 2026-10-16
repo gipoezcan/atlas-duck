@@ -197,7 +197,14 @@ fn send_call<H: HostPort>(
     if id <= shared.last_call_id.get() {
         return Err(Exception::throw_internal(ctx, "host call id out of order"));
     }
-    if params.len() > WORKER_FRAME_MAX_BYTES {
+    // Defence in depth behind the shim's own check (which bounds the copies out of QuickJS; these
+    // strings are already copied): the frame holds params, op id and instance at least verbatim,
+    // so a call above the cap here is refused before it is parsed and encoded.
+    let raw = params
+        .len()
+        .saturating_add(op_id.len())
+        .saturating_add(instance.as_ref().map_or(0, String::len));
+    if raw > WORKER_FRAME_MAX_BYTES {
         return Err(Exception::throw_range(ctx, CALL_TOO_LARGE));
     }
     // The text is the shim's `JSON.stringify` output, so the only way it fails to parse is
@@ -250,10 +257,10 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use atlas_duck_ipc::sandbox::HostCall;
-    use rquickjs::{CatchResultExt, Function};
+    use atlas_duck_ipc::sandbox::{HostCall, WORKER_FRAME_MAX_BYTES};
+    use rquickjs::{CatchResultExt, CaughtError, Function};
 
-    use super::natives;
+    use super::{CALL_TOO_LARGE, natives};
     use crate::engine::{new_context, new_runtime_with_heap_limit};
     use crate::script::interrupt::Deadline;
     use crate::script::{HostPort, Shared};
@@ -301,6 +308,54 @@ mod tests {
         assert_eq!(sent, [true, false, true, false, false, true]);
         assert_eq!(shared.host.borrow().0, [1, 3, 4]);
         assert_eq!(shared.outstanding.get(), 3);
+        assert!(shared.halted().is_none());
+        Ok(())
+    }
+
+    /// Defence in depth behind the shim's size check: the op id and the instance count toward the
+    /// 1 MiB cap with the params, before the params are parsed or the frame is encoded (params
+    /// nested too deep to decode are refused as too large here, not as undecodable).
+    #[test]
+    fn native_call_counts_the_identifiers_before_it_parses() -> Result<(), String> {
+        let (rt, meter) = new_runtime_with_heap_limit(64 << 20).map_err(|e| e.to_string())?;
+        let ctx = new_context(&rt).map_err(|e| e.to_string())?;
+        let shared = Rc::new(Shared {
+            host: RefCell::new(Recorder::default()),
+            meter,
+            halt: Cell::new(None),
+            outcome: RefCell::new(None),
+            outstanding: Cell::new(0),
+            last_call_id: Cell::new(0),
+            deadline: Deadline::after(Duration::from_secs(3600)),
+        });
+        let deep = format!("{}0{}", "[".repeat(200), "]".repeat(200));
+        let half = "x".repeat(WORKER_FRAME_MAX_BYTES / 2);
+        let cases = [
+            (half.clone() + &half, None),
+            ("jira.search".to_owned(), Some(half.clone() + &half)),
+            (half.clone(), Some(half.clone())),
+        ];
+        let refused = ctx
+            .with(|ctx| -> rquickjs::Result<Vec<Option<(String, String)>>> {
+                let call: Function = natives(&ctx, &shared)?.get("call")?;
+                let mut refused = Vec::new();
+                for (id, (op_id, instance)) in (1..).zip(cases) {
+                    let args = (f64::from(id), op_id, deep.as_str(), instance, false);
+                    refused.push(match call.call::<_, ()>(args).catch(&ctx) {
+                        Err(CaughtError::Exception(ex)) => {
+                            let name: Option<String> = ex.get("name").ok();
+                            Some((name.unwrap_or_default(), ex.message().unwrap_or_default()))
+                        }
+                        _ => None,
+                    });
+                }
+                Ok(refused)
+            })
+            .map_err(|e| e.to_string())?;
+        let too_large = Some(("RangeError".to_owned(), CALL_TOO_LARGE.to_owned()));
+        assert_eq!(refused, [too_large.clone(), too_large.clone(), too_large]);
+        assert!(shared.host.borrow().0.is_empty());
+        assert_eq!(shared.last_call_id.get(), 0);
         assert!(shared.halted().is_none());
         Ok(())
     }
