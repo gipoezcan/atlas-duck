@@ -463,6 +463,20 @@ async fn decision_button(wd: &WebDriver) -> Result<Element> {
         let _ = wd.click(&h).await;
     }
     let b = wd.wait_find("button[data-positive-decision]", WAIT).await?;
+    // A deny-only card (enrichment error, unresolved name, conflict) shows Approve disabled for
+    // good, and that placeholder is the one positive control without the chord's
+    // `aria-keyshortcuts` (DecisionBar): waiting for it to come on would only use up the time.
+    if wd
+        .find_all("button[data-positive-decision][aria-keyshortcuts]")
+        .await?
+        .is_empty()
+    {
+        return Err(format!(
+            "the card is deny-only (its Approve is the disabled placeholder): {}",
+            detail_state(wd).await
+        )
+        .into());
+    }
     if let Err(e) = wait_enabled(wd, &b, INERT_WAIT).await {
         return Err(format!("{e} (the decision button): {}", detail_state(wd).await).into());
     }
@@ -470,8 +484,11 @@ async fn decision_button(wd: &WebDriver) -> Result<Element> {
 }
 
 /// What the opened card says, for a failure text: its status and alert lines and its own buttons
-/// (an "Open" button means the shown revision went stale), never the preview frame. A failed
-/// preview load names the error's kinds (`data-error`, identifiers only, no error text).
+/// (an "Open" button means the shown revision went stale), its positive controls (label, enabled,
+/// whether it carries the chord) and the start of the preview frame's text (the body kind: an
+/// enrichment error names its status or outcome there). A failed preview load names the error's
+/// kinds (`data-error`, identifiers only, no error text). Leaves the driver in the top-level
+/// document.
 async fn detail_state(wd: &WebDriver) -> String {
     let lines = match wd
         .find_all(
@@ -493,11 +510,70 @@ async fn detail_state(wd: &WebDriver) -> String {
             _ => text,
         });
     }
-    if texts.is_empty() {
+    let own = if texts.is_empty() {
         "the detail pane shows no status, alert or button of its own".to_owned()
     } else {
         format!("the detail pane shows {texts:?}")
+    };
+    let mut positives = Vec::new();
+    match wd
+        .find_all("article.detail button[data-positive-decision]")
+        .await
+    {
+        Ok(found) => {
+            for b in &found {
+                let label = wd.text(b).await.unwrap_or_else(|e| format!("({e})"));
+                let enabled = wd.is_enabled(b).await.ok();
+                let chord = wd.attribute(b, "aria-keyshortcuts").await.ok().flatten();
+                positives.push(format!(
+                    "{label:?} enabled {enabled:?} chord {}",
+                    chord.is_some()
+                ));
+            }
+        }
+        Err(e) => positives.push(format!("unreadable ({e})")),
     }
+    format!(
+        "{own}; positive controls {positives:?}; preview frame: {}",
+        preview_frame_text(wd).await
+    )
+}
+
+/// The start of the preview frame's text (failure texts only: entering the frame moves the focus
+/// into it on WebKit). Ends in the top-level document.
+async fn preview_frame_text(wd: &WebDriver) -> String {
+    let Ok(frame) = wd.find("iframe[title='Preview']").await else {
+        return "none".to_owned();
+    };
+    if let Err(e) = wd.switch_to_frame(&frame).await {
+        return format!("not entered ({e})");
+    }
+    let text = body_text(wd).await;
+    if let Err(e) = back_to_top(wd).await {
+        return format!("not left ({e})");
+    }
+    match text {
+        Ok(t) => {
+            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            match t.char_indices().nth(600) {
+                Some((at, _)) => format!("{:?}...", &t[..at]),
+                None => format!("{t:?}"),
+            }
+        }
+        Err(e) => format!("unreadable ({e})"),
+    }
+}
+
+/// What the mock saw, for a failure text: method and path of each request, in order (no headers,
+/// no bodies).
+async fn mock_traffic(mock: &MockDc) -> String {
+    let seen: Vec<String> = mock
+        .received()
+        .await
+        .iter()
+        .map(|r| format!("{} {}", r.method.as_str(), r.url.path()))
+        .collect();
+    format!("{seen:?}")
 }
 
 /// How many clicks on the enabled positive button UI-06 makes before it gives up.
@@ -624,7 +700,16 @@ async fn ui06(rig: &Rig) -> Result<()> {
     ])?;
     open_row(wd, "jira.issue.create").await?;
     first_preview_row(wd, WAIT).await?;
-    let approve = decision_button(wd).await?;
+    // CI run 38879339595 (Windows): the button stayed disabled for 20 s on a loaded card with no
+    // status line. The failure now says which button it was, the body kind and what the mock saw
+    // (whether every enrichment fetch reached it).
+    let approve = match decision_button(wd).await {
+        Ok(b) => b,
+        Err(e) => {
+            let seen = mock_traffic(jira(&rig.world)?).await;
+            return Err(format!("{e}; the mock received {seen}").into());
+        }
+    };
     // PD-91: neither key approves.
     wd.send_keys(&approve, keys::ENTER).await?;
     wd.send_keys(&approve, keys::SPACE).await?;
@@ -1397,6 +1482,48 @@ async fn queue_state(wd: &WebDriver) -> String {
     )
 }
 
+/// The tag name of the top-level document's focused element (`IFRAME` while the focus is inside a
+/// frame); `None` when the driver cannot say.
+async fn focused_tag(wd: &WebDriver) -> Option<String> {
+    let active = wd.active_element().await.ok()?;
+    wd.property(&active, "tagName").await.ok().flatten()
+}
+
+/// Puts the focus into the (loaded) preview frame as a user does, with a click on the iframe
+/// element from the top-level document, and waits until that document reports the frame as its
+/// focused element. Only the click is repeated; no key is sent here.
+async fn focus_preview_frame(wd: &WebDriver) -> Result<()> {
+    let focused = wait_for("the focus in the preview frame", WAIT, || async {
+        let Ok(frame) = wd.find("iframe[title='Preview']").await else {
+            return Ok(None);
+        };
+        if wd.click(&frame).await.is_err() {
+            return Ok(None);
+        }
+        let tag = focused_tag(wd).await;
+        Ok(tag
+            .is_some_and(|t| t.eq_ignore_ascii_case("iframe"))
+            .then_some(()))
+    })
+    .await;
+    match focused {
+        Ok(()) => Ok(()),
+        Err(e) => Err(format!("{e}: {}", queue_state(wd).await).into()),
+    }
+}
+
+/// Switches the driver into the preview frame; only the switch is repeated (a frame that is
+/// reloading answers "no such frame" for a moment).
+async fn enter_preview_frame(wd: &WebDriver) -> Result<()> {
+    wait_for("a switch into the preview frame", WAIT, || async {
+        let Ok(frame) = wd.find("iframe[title='Preview']").await else {
+            return Ok(None);
+        };
+        Ok(wd.switch_to_frame(&frame).await.is_ok().then_some(()))
+    })
+    .await
+}
+
 /// The first of `children` to end within `within`: its index and status, or `None`.
 async fn first_exit(
     children: &mut [tokio::process::Child],
@@ -1482,49 +1609,38 @@ async fn chords(rig: &Rig) -> Result<()> {
     wait_current(wd, 0, "after Ctrl+Shift+Up").await?;
     first_preview_row(wd, WAIT).await?;
 
-    // Focus inside the preview frame: the same chords do nothing to the page.
-    // The frame reloads when the opened row changes (new srcdoc): WebKit answers "no such frame" to
-    // a switch made while it does, and to any command in a frame handle it invalidated after the
-    // switch (CI run 38865972537: `no such frame` here, step unnamed). So the whole sequence is one
-    // retried step: find the iframe element afresh, switch by that element, wait until the frame's
-    // document holds a table row (it is loaded), click inside, send both chords; any refusal
-    // returns to the top-level document and starts over. The chords are no-ops for the page, and
-    // the assertions below check that nothing was decided or moved.
-    wait_for(
-        "the chords typed inside the preview frame",
-        WAIT,
-        || async {
-            let attempt = async {
-                let frame = wd.find("iframe[title='Preview']").await?;
-                wd.switch_to_frame(&frame).await?;
-                if wd.find_all("tr").await?.is_empty() {
-                    return Ok::<bool, Box<dyn std::error::Error>>(false);
-                }
-                let inside = wd.find("body").await?;
-                wd.click(&inside).await?;
-                wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
-                wd.chord(&ctrl_shift, keys::ENTER).await?;
-                Ok(true)
-            }
-            .await;
-            // Always back to the top-level document; a frame that went away has no parent, and
-            // WebKit may refuse for a moment, so this is retried too.
-            back_to_top(wd).await?;
-            Ok(matches!(attempt, Ok(true)).then_some(()))
-        },
-    )
-    .await?;
-    ensure!(
-        first_exit(&mut held, Duration::from_millis(1500))
-            .await?
-            .is_none(),
-        "a request was decided by a chord typed inside the preview frame"
-    );
-    ensure_eq!(
-        queue_current(wd).await?,
-        vec![true, false],
-        "a chord typed inside the preview frame moved the opened row"
-    );
+    // Focus inside the preview frame: the same chords do nothing to the page. Each chord is sent
+    // once, never inside a retried step (a chord that reached the page moves the row, the frame
+    // reloads, and a retry would hide the first attempt), and only after the top-level document
+    // reports the frame as its focused element. CI run 38879339595 (Linux): after the earlier click
+    // on the frame's own `body` the chord reached the page (its window-level listener cannot see a
+    // key dispatched in the sandboxed frame), and the failure's screenshot shows the Approvals
+    // heading focused: that click did not leave the focus in the frame. A click on the iframe
+    // element from the top-level document is what a user does, and the focus check proves it took.
+    for (key, name) in [
+        (keys::ARROW_DOWN, "Ctrl+Shift+Down"),
+        (keys::ENTER, "Ctrl+Shift+Enter"),
+    ] {
+        focus_preview_frame(wd).await?;
+        let before = queue_state(wd).await;
+        enter_preview_frame(wd).await?;
+        // Sent while the driver is switched into the frame: the keys go where the focus is, and a
+        // driver that routes actions by browsing context still means the frame.
+        let sent = wd.chord(&ctrl_shift, key).await;
+        back_to_top(wd).await?;
+        sent?;
+        ensure!(
+            first_exit(&mut held, Duration::from_millis(1500))
+                .await?
+                .is_none(),
+            "a request was decided by {name} typed inside the preview frame (before it: {before})"
+        );
+        ensure_eq!(
+            queue_current(wd).await?,
+            vec![true, false],
+            "{name} typed inside the preview frame moved the opened row (before it: {before})"
+        );
+    }
 
     // A click outside brings the chords back: next, then the decision chord on the neighbour.
     decision_button(wd).await?;
