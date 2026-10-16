@@ -342,6 +342,80 @@ pub struct WriteSummaryFacts {
     pub link_type: Option<JiraLinkType>,
     /// `jira.sprint.move_issues` (T18, PD-54): the sprint enrichment read.
     pub sprint: Option<JiraSprint>,
+    /// M7 Δ3: what a Confluence write's enrichment read (Task 15: `confluence.page.update`).
+    pub confluence: Option<ConfluenceFacts>,
+}
+
+/// M7 Δ3: a Confluence write's enrichment facts (raw server text; the previewers escape what they
+/// show). Task 15 fills the `page.update` part; the later write tasks fill theirs.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConfluenceFacts {
+    pub space_key: String,
+    pub space_name: Option<String>,
+    /// The page the write is about, as the current page answered.
+    pub page: Option<PageRef>,
+    pub parent: Option<PageRef>,
+    pub from_path: Vec<String>,
+    pub to_path: Vec<String>,
+    pub container_type: Option<String>,
+    pub existing_attachment: Option<ExistingAttachment>,
+    pub duplicate_title: bool,
+    pub current_labels: Vec<String>,
+    /// Task 15 (PD-104; additive to Δ3, the judge has no executor output, T15 report): the
+    /// current page's storage (stage 1), which the update card diffs against the storage the
+    /// request sends and the lossy check counts.
+    pub current_storage: Option<String>,
+    /// Task 15: the agent's base version's storage (stage 2, a conflict only), the "before" of
+    /// both conflict diffs.
+    pub base_storage: Option<String>,
+    /// Task 15 (PD-94, plan review I-3 c): the current storage does not parse, so a Markdown
+    /// update cannot be counted: the judge holds it (`EnrichmentError`) and the card says why.
+    pub current_unparsable: bool,
+}
+
+/// Redacting `Debug` (§7.7): page bodies, titles and keys are Atlassian data.
+impl fmt::Debug for ConfluenceFacts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfluenceFacts")
+            .field(
+                "current_storage",
+                &self.current_storage.as_ref().map(String::len),
+            )
+            .field("base_storage", &self.base_storage.as_ref().map(String::len))
+            .field("current_unparsable", &self.current_unparsable)
+            .finish_non_exhaustive()
+    }
+}
+
+/// M7 Δ3: a Confluence page as enrichment named it (raw server text).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct PageRef {
+    pub id: String,
+    pub title: String,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for PageRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PageRef").finish_non_exhaustive()
+    }
+}
+
+/// M7 Δ3: the attachment an upload collides with or replaces (Task 20a).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ExistingAttachment {
+    pub id: String,
+    pub version: u64,
+    pub size: Option<u64>,
+}
+
+/// Redacting `Debug` (§7.7).
+impl fmt::Debug for ExistingAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExistingAttachment")
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
 }
 
 /// T18: the target sprint of a `jira.sprint.move_issues` as enrichment read it (raw server text).
@@ -845,10 +919,11 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         "confluence.page.update",
         OpImpl {
             executor: confluence::page_update_executor,
-            previewer: generic::write_preview,
+            previewer: confluence_preview::update_preview,
             stale_check: Some(&stale::PAGE_UPDATE),
             enrich: Some(&confluence::PAGE_UPDATE_ENRICH),
-            enrich_keys: &["body", "title"],
+            // PD-104 (plan review I-6 b): the lossy check depends on `body_format` too.
+            enrich_keys: &["body", "body_format", "title"],
         },
     ),
     ("confluence.page.move", LATER_WRITE),

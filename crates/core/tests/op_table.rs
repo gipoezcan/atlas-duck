@@ -1720,7 +1720,7 @@ fn page_update_conflict_and_stale_rule() -> TestResult {
     assert_eq!(plan[0].1.endpoint_template, "/rest/api/content/{id}");
     assert_eq!(
         query_of(&plan[0].1),
-        vec![("expand", "body.storage,version,space")]
+        vec![("expand", "body.storage,version,space,ancestors")]
     );
     assert_eq!(v.hold, Hold::Preview);
     assert_eq!(
@@ -1728,13 +1728,13 @@ fn page_update_conflict_and_stale_rule() -> TestResult {
         json!({"version": 7, "title": "Release checklist", "space_key": "DOC"})
     );
 
+    // M7 Task 15 (PD-104): a base behind the page asks for the base body (stage 2), and the
+    // judge takes both answers.
     let stale_base =
         json!({"id": "65537", "base_version": 5, "body": "b", "body_format": "storage"});
-    let (_, v) = enrich(
-        "confluence.page.update",
-        &stale_base,
-        std::slice::from_ref(&page),
-    )?;
+    let mut base = page.clone();
+    base["version"]["number"] = json!(5);
+    let (_, v) = enrich("confluence.page.update", &stale_base, &[page.clone(), base])?;
     assert_eq!(v.hold, Hold::Conflict);
     assert_eq!(
         v.conflict.as_deref(),
@@ -2152,7 +2152,9 @@ fn write_preview_hold_bodies() -> TestResult {
 
     let params = json!({"id": "65537", "base_version": 5, "body": "b", "body_format": "storage"});
     let page: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE)?;
-    let (_, v) = enrich("confluence.page.update", &params, &[page])?;
+    let mut base = page.clone();
+    base["version"]["number"] = json!(5);
+    let (_, v) = enrich("confluence.page.update", &params, &[page, base])?;
     let m = write_preview(
         "confluence.page.update",
         &params,

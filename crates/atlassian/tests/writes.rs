@@ -608,6 +608,32 @@ async fn write_400_version_message_conflict() -> TestResult {
     Ok(())
 }
 
+/// PD-111 (M3 T10 minor 7, accepted): a Confluence 400 whose JSON is cut off cannot be read as a
+/// version conflict, even though its text names one: it stays `Failed4xx` (`WRITE_FAILED`,
+/// nothing was written); only the conflict UX is lost.
+#[tokio::test]
+async fn truncated_conflict_400_is_failed4xx() -> TestResult {
+    let cut = &CONFLUENCE_VERSION_CONFLICT_400[..CONFLUENCE_VERSION_CONFLICT_400.len() - 12];
+    assert!(cut.contains("Version must be incremented"));
+    let dc = MockDc::start(Product::Confluence, "").await;
+    dc.json("/rest/api/content/65537", 400, cut).await;
+    let t = test_client(dc.client_config())?;
+    assert_eq!(
+        t.client
+            .send_approved(test_write_cover()?, &json_op(page_update(&dc)?))
+            .await,
+        WriteOutcome::Failed4xx {
+            response: UpstreamResponse {
+                status: 400,
+                content_type: Some("application/json".into()),
+                body: cut.as_bytes().to_vec(),
+            },
+            request_index: 0,
+        }
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn write_400_other_failed4xx() -> TestResult {
     let dc = MockDc::start(Product::Confluence, "").await;

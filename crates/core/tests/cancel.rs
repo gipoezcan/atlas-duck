@@ -637,7 +637,7 @@ async fn cancel_after_version_conflict_returns_executing() -> TestResult {
     let mock = wiki(&h)?;
     confluence_identity_ok(mock).await;
     let content = mock.path("/rest/api/content/65537");
-    let enrich_q = "body.storage,version,space";
+    let enrich_q = "body.storage,version,space,ancestors";
     for (version, once, priority) in [(5, true, 1u8), (6, false, 2u8)] {
         let mut m = Mock::given(method("GET"))
             .and(path(content.clone()))
@@ -652,6 +652,14 @@ async fn cancel_after_version_conflict_returns_executing() -> TestResult {
         }
         m.mount(mock.server()).await;
     }
+    // M7 Task 15: the refresh at v6 reads the agent's base body (stage 2).
+    common::confluence::mount_history_version(
+        mock,
+        "65537",
+        5,
+        &serde_json::from_str(&page_at(5))?,
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path(content.clone()))
         .and(query_param("expand", "version"))
@@ -729,7 +737,10 @@ async fn expiry_during_stale_check_expires_on_return() -> TestResult {
     let content = mock.path("/rest/api/content/65537");
     Mock::given(method("GET"))
         .and(path(content.clone()))
-        .and(query_param("expand", "body.storage,version,space"))
+        .and(query_param(
+            "expand",
+            "body.storage,version,space,ancestors",
+        ))
         .respond_with(
             mock.response(200)
                 .set_body_raw(page_at(5), "application/json"),

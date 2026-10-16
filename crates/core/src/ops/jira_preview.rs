@@ -1010,7 +1010,10 @@ fn user_text(user: &JiraUser, hidden: &mut u64) -> String {
 /// Adds the invisible characters of server text a write card shows beyond its request (T15
 /// review I1: a display name) to the §6.4 counts; the `bidi_controls` / `other_invisible`
 /// Cautions then follow the totals.
-fn count_card_text<'a>(model: &mut PreviewModel, texts: impl IntoIterator<Item = &'a str>) {
+pub(super) fn count_card_text<'a>(
+    model: &mut PreviewModel,
+    texts: impl IntoIterator<Item = &'a str>,
+) {
     let header = &mut model.header;
     for text in texts {
         let (bidi, other) = invisible::count(text);
@@ -1333,17 +1336,18 @@ const FIELD_HEADING_CAP_CHARS: usize = 256;
 /// list: the field-name cache never influences a warning.
 const PLAIN_TEXT_FIELDS: [&str; 1] = ["summary"];
 
-/// One view (rendered or raw) of an edit diff while it is built.
-struct DiffView {
-    lines: Vec<DiffLine>,
+/// One view (rendered or raw) of an edit diff while it is built (also the Confluence update
+/// card's, Task 15).
+pub(super) struct DiffView {
+    pub(super) lines: Vec<DiffLine>,
     /// Escaped bytes left for `Same`, `Del`, `Add` lines.
     left: [usize; 3],
     /// Bytes of either text the view does not show.
-    cut: u64,
+    pub(super) cut: u64,
 }
 
 impl DiffView {
-    fn new() -> DiffView {
+    pub(super) fn new() -> DiffView {
         DiffView {
             lines: Vec::new(),
             left: [EDIT_DIFF_KIND_BYTES; 3],
@@ -1381,7 +1385,7 @@ impl DiffView {
     }
 
     /// A whole [`line_diff`] of `old` against `new`; what its own caps dropped counts as cut.
-    fn extend(&mut self, diff: &LineDiff, old: &str, new: &str) {
+    pub(super) fn extend(&mut self, diff: &LineDiff, old: &str, new: &str) {
         let (mut same, mut del, mut add) = (0usize, 0usize, 0usize);
         for line in &diff.lines {
             match line.op {

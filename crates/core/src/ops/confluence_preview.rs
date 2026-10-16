@@ -16,24 +16,32 @@
 
 use std::collections::HashMap;
 
+use atlas_duck_atlassian::HttpRequestSpec;
 use atlas_duck_convert::storage::KNOWN_MACROS;
 use atlas_duck_convert::{
-    ConversionReport, MarkdownTooLarge, UserResolutions, markdown_to_preview_html,
-    storage_constructs, storage_to_markdown_within,
+    ConversionReport, LostCounts, MarkdownTooLarge, UserResolutions, lossy_update,
+    markdown_to_preview_html, storage_constructs, storage_lines, storage_to_markdown_within,
 };
+use atlas_duck_preview::diff::{hunks, line_diff, line_diff_lines};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::render::DOC_MAX_ROWS;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
-use atlas_duck_preview::{ConfluenceComment, ConversionFacts, PreviewBody, sanitize_html};
+use atlas_duck_preview::{
+    ConfluenceComment, ConstructList, ConversionFacts, PreviewBody, sanitize_html,
+};
 use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
 
-use super::confluence::{BodyFormat, body_format};
+use super::confluence::{BodyFormat, TEXT_CURRENT_UNPARSABLE, body_format};
+use super::confluence_body::is_markdown;
 use super::generic::{
     TABLE_ROW_CAP, bytes_of, cell_of, cut_at, omitted_row, other_root_bytes, pair_bytes,
     short_string, table_count,
 };
-use super::{PreviewCtx, PreviewInput, PreviewModel, generic};
+use super::jira_preview::{DiffView, count_card_text};
+use super::{ConfluenceFacts, PreviewCtx, PreviewInput, PreviewModel, WriteView, generic};
+use crate::lifecycle::model::Hold;
+use crate::metadata::one_line;
 
 /// §6.3 "Confluence search": the table's columns (plan text, Task 12a), in this order.
 const SEARCH_COLUMNS: [&str; 4] = ["title", "space", "type", "last modified"];
@@ -695,6 +703,233 @@ fn comment_unshown_bytes(comment: &Map<String, Value>) -> u64 {
         };
         sum.saturating_add(unshown)
     })
+}
+
+// ---- the update card (§6.3 Edit/update and Conflict, PD-104, Task 15) ---------------------------
+
+/// M7 Δ2 / PD-104: every Markdown projection of the update card converts within this many bytes
+/// (the host-call default, `max_call_result_mb` 16): `DIFF_MAX_LINES` caps after the conversion
+/// and does not bound its allocation (T10 review). A side past it is not projected: the rendered
+/// diff leaves it out (counted, `diff_truncated`) and the raw diff shows it.
+const UPDATE_MARKDOWN_BUDGET: usize = 16 * 1024 * 1024;
+
+/// §6.3 Edit/update and Conflict for `confluence.page.update` (PD-104), over the exact request
+/// (§5.1 inv. 4; the outgoing storage is read from the request that is sent, never from the
+/// params) and the bodies enrichment read ([`ConfluenceFacts`]):
+/// - `Preview`: the rendered diff of the Markdown projections (empty user map: mentions as
+///   keys) and the raw diff of `storage_lines` of the current and the sent storage, raw-only
+///   changes `max(0, raw hunks − rendered hunks)` with the Caution `raw_only_diff`, the outgoing
+///   storage constructs (§7.6, T9 review I-2), and for a Markdown update the Caution
+///   `lossy_update` (`convert::lossy_update`);
+/// - `Conflict`: the rendered diffs base → current and base → sent (M6 T10 review M-5); what
+///   their projections leave out of the base and current server bodies counts as hidden
+///   (T12b rules, Info `source_formatting_removed`), since the card has no raw view of them;
+/// - the judge's `EnrichmentError` over an unparsable current body: the PD-94 plan text.
+///
+/// The invisible characters of the server bodies the card shows count into the §6.4 header.
+/// Every other hold, or a request that is not the update JSON, keeps the generic write preview.
+pub(crate) fn update_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let Some(facts) = view
+        .enrichment
+        .and_then(|v| v.summary.as_ref())
+        .and_then(|s| s.confluence.as_ref())
+    else {
+        return model;
+    };
+    match view.hold {
+        Hold::EnrichmentError if view.failure.is_none() && facts.current_unparsable => {
+            model.body = PreviewBody::enrichment_error(None, TEXT_CURRENT_UNPARSABLE, None);
+            model
+        }
+        Hold::Conflict => conflict_card(model, view, facts),
+        Hold::Preview => edit_card(ctx, model, view, facts),
+        _ => model,
+    }
+}
+
+/// `body.storage.value` of the first request (the one `PUT`), as sent.
+fn sent_storage(requests: &[HttpRequestSpec]) -> Option<String> {
+    let body: Value = serde_json::from_slice(&requests.first()?.body).ok()?;
+    body.get("body")?
+        .get("storage")?
+        .get("value")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// The Markdown projection the rendered diffs compare (empty user map, PD-104), or `None` past
+/// [`UPDATE_MARKDOWN_BUDGET`].
+fn projection(storage: &str) -> Option<String> {
+    storage_to_markdown_within(storage, &UserResolutions::new(), UPDATE_MARKDOWN_BUDGET)
+        .ok()
+        .map(|(markdown, _, _)| markdown)
+}
+
+/// The rendered diff of `old` against `new` into `view`, display-escaped and capped; its hunks.
+/// A side past the budget is left out whole: both texts count as cut.
+fn rendered_into(view: &mut DiffView, old: &str, new: &str) -> u64 {
+    match (projection(old), projection(new)) {
+        (Some(o), Some(n)) => {
+            let d = line_diff(&o, &n);
+            view.extend(&d, &o, &n);
+            hunks(&d.lines)
+        }
+        _ => {
+            view.cut = view
+                .cut
+                .saturating_add(len_u64(old.len()))
+                .saturating_add(len_u64(new.len()));
+            0
+        }
+    }
+}
+
+/// §7.6: the storage constructs of the outgoing body, display-escaped, one line each.
+fn storage_construct_list(storage: &str) -> ConstructList {
+    let c = storage_constructs(storage);
+    let shown = |v: Vec<String>| -> Vec<String> {
+        v.iter().map(|s| one_line(escape_for_display(s))).collect()
+    };
+    ConstructList {
+        macros: shown(c.macros),
+        mentions: shown(c.mentions),
+        includes: shown(c.includes),
+        links: shown(c.links),
+        images: shown(c.images),
+        attachments: shown(c.attachments),
+    }
+}
+
+fn edit_card(
+    ctx: &PreviewCtx<'_>,
+    mut model: PreviewModel,
+    view: &WriteView<'_>,
+    facts: &ConfluenceFacts,
+) -> PreviewModel {
+    let (Some(current), Some(outgoing), PreviewBody::WriteRequests { .. }) = (
+        facts.current_storage.as_deref(),
+        sent_storage(view.requests),
+        &model.body,
+    ) else {
+        return model;
+    };
+    let mut rendered = DiffView::new();
+    let rendered_hunks = rendered_into(&mut rendered, current, &outgoing);
+    let raw_diff = line_diff_lines(&storage_lines(current), &storage_lines(&outgoing));
+    let mut raw = DiffView::new();
+    raw.extend(&raw_diff, current, &outgoing);
+    let raw_only = hunks(&raw_diff.lines).saturating_sub(rendered_hunks);
+    if raw_only > 0 {
+        model.warnings.push(Warning::new(
+            WarningId::RawOnlyDiff,
+            warning::raw_only_diff(raw_only),
+        ));
+    }
+    if is_markdown(ctx.params) {
+        let lost = lossy_update(current, &outgoing);
+        if lost != LostCounts::default() {
+            model.warnings.push(Warning::new(
+                WarningId::LossyUpdate,
+                warning::lossy_update(lost.macros, lost.images, lost.links, lost.layouts),
+            ));
+        }
+    }
+    let cut = raw.cut.max(rendered.cut);
+    if cut > 0 {
+        model.warnings.push(Warning::new(
+            WarningId::DiffTruncated,
+            warning::diff_truncated(cut),
+        ));
+    }
+    // The raw diff shows every byte of both bodies (its cut aside); what their renders leave out
+    // is not hidden, but it is formatting the rendered diff does not show (§6.4).
+    let stripped = [current, outgoing.as_str()]
+        .iter()
+        .any(|s| dropped_markup(s, Markup::Storage).stripped());
+    BodyNotes {
+        unknown_macros: false,
+        stripped,
+    }
+    .push(&mut model.warnings);
+    count_card_text(&mut model, [current]);
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::EditDiff {
+        rendered: rendered.lines,
+        raw: raw.lines,
+        raw_only_changes: raw_only,
+        constructs: Some(storage_construct_list(&outgoing)),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = cut;
+    model
+}
+
+fn conflict_card(
+    mut model: PreviewModel,
+    view: &WriteView<'_>,
+    facts: &ConfluenceFacts,
+) -> PreviewModel {
+    let (Some(base), Some(current)) = (
+        facts.base_storage.as_deref(),
+        facts.current_storage.as_deref(),
+    ) else {
+        return model;
+    };
+    let mut to_current = DiffView::new();
+    rendered_into(&mut to_current, base, current);
+    // The agent's intended change: from its base to what the request sends (none when the
+    // request could not be built).
+    let mut intended = DiffView::new();
+    let outgoing = sent_storage(view.requests);
+    if let Some(sent) = outgoing.as_deref() {
+        rendered_into(&mut intended, base, sent);
+    }
+    let cut = to_current.cut.max(intended.cut);
+    if cut > 0 {
+        model.warnings.push(Warning::new(
+            WarningId::DiffTruncated,
+            warning::diff_truncated(cut),
+        ));
+    }
+    // No raw view of the server bodies on this card: what their projections leave out is hidden.
+    let (base_dropped, current_dropped) = (
+        dropped_markup(base, Markup::Storage),
+        dropped_markup(current, Markup::Storage),
+    );
+    let sent_stripped = outgoing
+        .as_deref()
+        .is_some_and(|s| dropped_markup(s, Markup::Storage).stripped());
+    BodyNotes {
+        unknown_macros: false,
+        stripped: base_dropped.stripped() || current_dropped.stripped() || sent_stripped,
+    }
+    .push(&mut model.warnings);
+    count_card_text(&mut model, [base, current]);
+    if let PreviewBody::Conflict {
+        base_to_current,
+        intended: shown_intended,
+        ..
+    } = &mut model.body
+    {
+        *base_to_current = to_current.lines;
+        *shown_intended = intended.lines;
+    }
+    model.header.hidden_in_preview_bytes = cut
+        .saturating_add(base_dropped.bytes)
+        .saturating_add(current_dropped.bytes);
+    model
 }
 
 // ---- what the local render drops (T12b review I-1, m-1) -----------------------------------------

@@ -285,8 +285,9 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
         | "confluence.label.list"
         | "confluence.attachment.list"
         | "confluence.page.history" => Ok(Vec::new()),
-        // One enrichment round: the current page with its storage body (M3; Task 15 adds the
-        // historical base body).
+        // Stage 1: the current page with its storage body. Stage 2 (the agent's base body, Task
+        // 15) runs only when `base_version` is not the page's version; the registry example's
+        // `base_version` 3 is the example page's version 3, so there is none.
         "confluence.page.update" => {
             let id = params["id"]
                 .as_str()

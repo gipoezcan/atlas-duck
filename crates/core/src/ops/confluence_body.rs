@@ -54,12 +54,17 @@ pub(crate) enum EmptyBody {
     Refuse,
 }
 
+/// Whether `body` is Markdown: every `body_format` but `storage`, and none (§7.6: the default).
+pub(crate) fn is_markdown(params: &Value) -> bool {
+    params.get("body_format").and_then(Value::as_str) != Some("storage")
+}
+
 /// The storage to send for `body`: verbatim after [`check_storage_body`] for
 /// `body_format: storage`; otherwise the Markdown converted, after the placeholder check and the
 /// storage hard check passed.
 pub(crate) fn storage_text(ctx: &ExecCtx<'_>, empty: EmptyBody) -> Result<String, ExecError> {
     let text = str_param(ctx.params, BODY);
-    if ctx.params.get("body_format").and_then(Value::as_str) == Some("storage") {
+    if !is_markdown(ctx.params) {
         check_storage_body(text).map_err(|r| ExecError::Invalid(storage_rejected(r)))?;
         return Ok(text.to_owned());
     }

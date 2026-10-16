@@ -988,10 +988,15 @@ async fn i36_edit_expected_conflict_not_approvable() -> TestResult {
             );
             // M7 Δ2: Jira lists the differing fields in `diff_text`, no rendered diffs.
             assert!(base_to_current.is_empty() && intended.is_empty());
-            // M7 T8 review I-1 (today's behaviour, pinned): the engine builds requests only
-            // under `Hold::Preview`, so this enrichment-time conflict carries none and the card
-            // shows no requests section. Task 15 widens the gate; this becomes the `PUT`.
-            assert!(requests.is_empty(), "{requests:?}");
+            // M7 Task 15 (T8 review I-1): the enrichment-time conflict card carries the `PUT`
+            // an approval would have sent (§5.1 inv. 4), although it is not approvable.
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0].method, "PUT");
+            assert!(
+                requests[0]
+                    .resolved_url
+                    .ends_with("/rest/api/2/issue/ABC-1")
+            );
         }
         other => return Err(format!("not the conflict card: {other:?}").into()),
     }

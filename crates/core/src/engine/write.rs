@@ -260,8 +260,17 @@ fn expectation(spec: &OperationSpec) -> SuccessExpectation {
     }
 }
 
-/// The exact request list for `params` and a `Preview` verdict (§5.1 inv. 3). The executor sees
-/// the verdict only when it is `Preview` (T18 as built).
+/// The holds whose card shows the request list (M7 Task 15, T8 review I-1): `Preview`, and the
+/// unapprovable `Conflict` and `Collision`, whose cards show what an approval would have sent
+/// (Δ2: "every write body keeps its `requests`"). Approvability stays `Preview`-only
+/// ([`approvable`]).
+pub(crate) fn renders_requests(hold: Hold) -> bool {
+    matches!(hold, Hold::Preview | Hold::Conflict | Hold::Collision)
+}
+
+/// The exact request list for `params` and a verdict whose hold shows requests (§5.1 inv. 3,
+/// [`renders_requests`]). The executor sees the verdict only then (T18 as built; Task 15 adds
+/// the two unapprovable holds); an executor may still need a `Preview` verdict and refuse.
 pub(crate) fn render(
     engine: &Engine,
     spec: &'static OperationSpec,
@@ -271,7 +280,7 @@ pub(crate) fn render(
     effective_max: Option<u32>,
 ) -> Result<Vec<HttpRequestSpec>, ExecError> {
     let op = op_table().get(spec.id).ok_or(ExecError::NotInThisBuild)?;
-    let enrichment = verdict.filter(|v| v.hold == Hold::Preview);
+    let enrichment = verdict.filter(|v| renders_requests(v.hold));
     match (op.executor)(&engine.exec_ctx(spec, params, base, enrichment, effective_max, None))? {
         ExecPlan::Write(requests) => Ok(requests),
         ExecPlan::Read(_) => Err(ExecError::NotInThisBuild),
@@ -1824,7 +1833,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
         None => (EnrichVerdict::preview(Value::Null, Map::new()), None),
     };
     let effective_max = entry.validated.as_ref().and_then(|v| v.effective_max);
-    let rendered = if verdict.hold == Hold::Preview {
+    let rendered = if renders_requests(verdict.hold) {
         render(
             engine,
             spec,
@@ -1838,6 +1847,9 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
     };
     let (verdict, failure, requests) = match rendered {
         Ok(requests) => (verdict, None, requests),
+        // T8 review I-1: an unapprovable hold keeps its card when its list cannot be built (it
+        // shows no requests section); only a `Preview` becomes "unrenderable".
+        Err(_) if verdict.hold != Hold::Preview => (verdict, None, Vec::new()),
         Err(_) => (
             EnrichVerdict::unusable(),
             Some(Failure {

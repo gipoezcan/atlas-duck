@@ -1535,6 +1535,14 @@ async fn edit_write(
             write::render(engine, spec, base, &result.params, verdict, effective_max)
                 .map_err(exec_refused)?,
         )
+    } else if write::renders_requests(snap.write.verdict.hold) {
+        // M7 Task 15: an unapprovable hold's card shows the list the edit would send; one that
+        // cannot be built is shown as none (T8 review I-1), never refused here.
+        let verdict = Some(&snap.write.verdict);
+        Some(
+            write::render(engine, spec, base, &result.params, verdict, effective_max)
+                .unwrap_or_default(),
+        )
     } else {
         Some(Vec::new())
     };

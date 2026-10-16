@@ -330,7 +330,7 @@ async fn page_update_version_conflict_returns_to_queue() -> TestResult {
     let mock = wiki(&h)?;
     confluence_identity_ok(mock).await;
     let content = mock.path("/rest/api/content/65537");
-    let enrich_q = "body.storage,version,space";
+    let enrich_q = "body.storage,version,space,ancestors";
     // Enrichment sees v5 once, the refresh after the conflict sees v6; the stale check sees v5.
     Mock::given(method("GET"))
         .and(path(content.clone()))
@@ -353,6 +353,14 @@ async fn page_update_version_conflict_returns_to_queue() -> TestResult {
         .with_priority(2)
         .mount(mock.server())
         .await;
+    // M7 Task 15: the refresh at v6 reads the agent's base body (stage 2).
+    common::confluence::mount_history_version(
+        mock,
+        "65537",
+        5,
+        &serde_json::from_str(&page_at(5))?,
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path(content.clone()))
         .and(query_param("expand", "version"))
@@ -398,7 +406,8 @@ async fn page_update_version_conflict_returns_to_queue() -> TestResult {
         .into_iter()
         .filter(|r| r["purpose"] == "refresh")
         .collect();
-    assert_eq!(refresh.len(), 1);
+    // The current page, then the agent's base body (M7 Task 15, PD-104).
+    assert_eq!(refresh.len(), 2);
     // §4.5: `executing` was emitted and stays.
     assert_eq!(h.status(&id).await.status, Status::Executing);
     let preview = h.approver().open(&id).map_err(de)?.preview;
@@ -1119,7 +1128,7 @@ async fn refresh_survives_a_superseded_stale_fail() -> TestResult {
         .mount(mock.server())
         .await;
     let content = mock.path("/rest/api/content/65537");
-    let enrich_q = "body.storage,version,space";
+    let enrich_q = "body.storage,version,space,ancestors";
     Mock::given(method("GET"))
         .and(path(content.clone()))
         .and(query_param("expand", enrich_q))

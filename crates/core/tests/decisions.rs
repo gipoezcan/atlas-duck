@@ -515,6 +515,10 @@ async fn i06_page_update_conflict_not_approvable() -> TestResult {
     page["version"]["number"] = json!(6);
     mock.json("/rest/api/content/65537", 200, &page.to_string())
         .await;
+    // M7 Task 15: the conflict reads the agent's base body (stage 2).
+    let mut base = page.clone();
+    base["version"]["number"] = json!(5);
+    common::confluence::mount_history_version(mock, "65537", 5, &base).await;
     let id = queued_write(
         &h,
         "confluence.page.update",
@@ -761,7 +765,7 @@ async fn approve_racing_refresh_logged_stale() -> TestResult {
         p["version"]["number"] = json!(v);
         Ok(p.to_string())
     };
-    let enrich_q = "body.storage,version,space";
+    let enrich_q = "body.storage,version,space,ancestors";
     // The enrichment sees v5; the stale check sees v6 (changed); the refresh stalls.
     Mock::given(wiremock::matchers::method("GET"))
         .and(path(content.clone()))
@@ -793,6 +797,9 @@ async fn approve_racing_refresh_logged_stale() -> TestResult {
                 .set_body_raw(page(6)?, "application/json"),
         )
         .mount(mock.server())
+        .await;
+    // M7 Task 15: the refresh at v6 reads the agent's base body (stage 2).
+    common::confluence::mount_history_version(mock, "65537", 5, &serde_json::from_str(&page(5)?)?)
         .await;
     let id = queued_write(
         &h,

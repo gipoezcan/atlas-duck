@@ -725,7 +725,7 @@ async fn i26_control_after_write_stale_is_abandoned() -> TestResult {
     )
     .await;
     let content = mock.path("/rest/api/content/65537");
-    let enrich_q = "body.storage,version,space";
+    let enrich_q = "body.storage,version,space,ancestors";
     // Enrichment sees v5 once, the refresh after the conflict sees v6; the stale check sees v5.
     for (version, once, priority) in [(5, true, 1u8), (6, false, 2u8)] {
         let mut m = Mock::given(method("GET"))
@@ -741,6 +741,14 @@ async fn i26_control_after_write_stale_is_abandoned() -> TestResult {
         }
         m.mount(mock.server()).await;
     }
+    // M7 Task 15: the refresh at v6 reads the agent's base body (stage 2).
+    common::confluence::mount_history_version(
+        mock,
+        "65537",
+        5,
+        &serde_json::from_str(&page_at(5))?,
+    )
+    .await;
     Mock::given(method("GET"))
         .and(path(content.clone()))
         .and(query_param("expand", "version"))

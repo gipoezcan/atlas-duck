@@ -1,20 +1,21 @@
 //! Confluence specifics: the `confluence.search` CQL type-filter rewrite (§7.4, part of the
 //! static validation of §5.2 step 1), its release list (PD-101) and `cql_broad` (PD-102),
 //! `confluence.page.update`
-//! (storage verbatim or Markdown converted, `confluence_body`) and, from M7, the `format` of the page reads (PD-100).
+//! (storage verbatim or Markdown converted, `confluence_body`; two enrichment stages with the
+//! agent's base body on a conflict, PD-104) and, from M7, the `format` of the page reads (PD-100).
 
-use atlas_duck_atlassian::GetCall;
+use atlas_duck_convert::storage;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_registry::OperationSpec;
 use serde_json::{Map, Value, json};
 
-use super::confluence_body::{EmptyBody, storage_text};
+use super::confluence_body::{EmptyBody, is_markdown, storage_text};
 use super::confluence_preview::search_table;
 use super::{
-    EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    PreviewCtx, PreviewModel, ReadPlan, generic, get_call, json_request, resolve_url, single_round,
-    str_param,
+    ConfluenceFacts, EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx,
+    ExecError, ExecPlan, PageRef, PreviewCtx, PreviewModel, ReadPlan, WriteSummaryFacts, generic,
+    get_call, json_request, resolve_url, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::{ValidationError, invalid};
@@ -450,28 +451,66 @@ pub fn page_history_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
 
 // ---- confluence.page.update --------------------------------------------------------------------
 
+/// PD-104: two stages (Δ3): the current page, then (only when the agent's `base_version` is not
+/// the current version) the agent's base version's body; the judge holds the conflict, keeps both
+/// bodies for the card ([`ConfluenceFacts`]) and holds a Markdown update over a current body that
+/// does not parse.
 pub static PAGE_UPDATE_ENRICH: EnrichRule = EnrichRule {
     plan: page_update_plan,
     judge: page_update_judge,
 };
 
-/// One round (Δ3, wrapped mechanically): the page with its body, version and space.
+/// PD-104 stage 1: the page with its storage, version, space and ancestors.
+const PAGE_UPDATE_EXPAND: &str = "body.storage,version,space,ancestors";
+
+/// Stage 1, then stage 2 (§5.4 step 2 verbatim: `?version=<base_version>&status=historical&
+/// expand=body.storage`) when the current page answered a version other than the base.
 fn page_update_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
-    let calls: Vec<(EnrichPurpose, GetCall)> = vec![(
-        EnrichPurpose::Enrich,
-        get_call(
-            CONTENT_PATH,
-            ctx.params,
-            &[("expand", "body.storage,version,space")],
-        ),
-    )];
-    single_round(calls, answers)
+    match answers {
+        [] => EnrichStep::Fetch(vec![(
+            EnrichPurpose::Enrich,
+            get_call(CONTENT_PATH, ctx.params, &[("expand", PAGE_UPDATE_EXPAND)]),
+        )]),
+        [current] => match (base_version(ctx.params), content_version(current)) {
+            (Some(base), Some(now)) if base != now => {
+                let version = base.to_string();
+                EnrichStep::Fetch(vec![(
+                    EnrichPurpose::Enrich,
+                    get_call(
+                        CONTENT_PATH,
+                        ctx.params,
+                        &[
+                            ("version", version.as_str()),
+                            ("status", "historical"),
+                            ("expand", "body.storage"),
+                        ],
+                    ),
+                )])
+            }
+            _ => EnrichStep::Judge,
+        },
+        _ => EnrichStep::Judge,
+    }
+}
+
+fn base_version(params: &Value) -> Option<u64> {
+    params.get("base_version").and_then(Value::as_u64)
 }
 
 /// `version.number` of a content answer.
 pub(crate) fn content_version(v: &Value) -> Option<u64> {
     v.get("version")?.get("number")?.as_u64()
 }
+
+/// `body.storage.value` of a content answer.
+fn storage_of(v: &Value) -> Option<&str> {
+    v.get("body")?.get("storage")?.get("value")?.as_str()
+}
+
+/// PD-94 (plan text): the card of a Markdown update held because the current page's storage does
+/// not parse (plan review I-3 c).
+pub const TEXT_CURRENT_UNPARSABLE: &str =
+    "the current page storage could not be parsed; what this update removes cannot be counted";
 
 fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
     let Some(page) = responses.first() else {
@@ -483,8 +522,11 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
         page.get("space")
             .and_then(|s| s.get("key"))
             .and_then(Value::as_str),
+        storage_of(page),
+        base_version(ctx.params),
     );
-    let (Some(current), Some(title), Some(space_key)) = facts else {
+    let (Some(current), Some(title), Some(space_key), Some(current_storage), Some(base)) = facts
+    else {
         return EnrichVerdict::unusable();
     };
     // The op sends `"type": "page"`: a blog post or comment id is not this op's target.
@@ -494,27 +536,72 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
     let mut resolved = Map::new();
     resolved.insert("title".to_owned(), Value::from(title));
     resolved.insert("space_key".to_owned(), Value::from(space_key));
+    // The stale rule compares the version this answer read (`stale::PAGE_UPDATE`); the conflict
+    // below is judged on the same answer, so both name the same current version.
     let baseline = json!({"version": current, "title": title, "space_key": space_key});
     let mut verdict = EnrichVerdict::preview(baseline, resolved);
+    let mut facts = ConfluenceFacts {
+        space_key: space_key.to_owned(),
+        space_name: page
+            .get("space")
+            .and_then(|s| s.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        page: Some(PageRef {
+            id: str_param(ctx.params, "id").to_owned(),
+            title: title.to_owned(),
+        }),
+        current_storage: Some(current_storage.to_owned()),
+        ..ConfluenceFacts::default()
+    };
 
-    let base = ctx.params.get("base_version").and_then(Value::as_u64);
-    if base != Some(current) {
-        let base = base.unwrap_or(0);
+    if base != current {
+        // Stage 2 answered the agent's base version: its body is the "before" of both diffs.
+        // Fail closed when the answer is not that version of this page.
+        let Some(base_storage) = responses
+            .get(1)
+            .filter(|h| is_base_answer(h, str_param(ctx.params, "id"), base))
+            .and_then(storage_of)
+        else {
+            return EnrichVerdict::unusable();
+        };
+        facts.base_storage = Some(base_storage.to_owned());
         let text = warning::conflict(base, current);
         verdict.hold = Hold::Conflict;
         verdict
             .warnings
             .push(Warning::new(WarningId::Conflict, text.clone()));
         verdict.conflict = Some(text);
-        // The agent's base body (`?version=<base>&status=historical`) and its diff are M7.
         verdict.diff_text = format!("base version v{base}, current version v{current}");
+    } else if is_markdown(ctx.params) && !storage::parse(current_storage).xml_ok {
+        // PD-94: what a Markdown update removes cannot be counted (T7 review m-4: the judge
+        // parses itself; `lossy_update` does not say which path it took).
+        verdict.hold = Hold::EnrichmentError;
+        facts.current_unparsable = true;
     }
+    verdict.summary = Some(WriteSummaryFacts {
+        confluence: Some(facts),
+        ..WriteSummaryFacts::default()
+    });
     verdict
+}
+
+/// A stage-2 answer is the base version of the page: its `id`, and its `version.number` when it
+/// carries one (the expand names only the body: DC may leave the version out, so an answer
+/// without one is taken as the version asked for; T25's live run checks the shape).
+fn is_base_answer(answer: &Value, id: &str, base: u64) -> bool {
+    let same_page = answer.get("id").and_then(Value::as_str) == Some(id);
+    let same_version = answer
+        .get("version")
+        .is_none_or(|_| content_version(answer) == Some(base));
+    same_page && same_version
 }
 
 /// `PUT /rest/api/content/{id}` with `version.number = base_version + 1` (§7.4), the current
 /// title unless one is given, and the storage body (`confluence_body::storage_text`: storage
-/// verbatim, or the Markdown converted).
+/// verbatim, or the Markdown converted). Rendered under the conflict hold too (T8 review I-1:
+/// the conflict card shows the request, and its intended change is computed from it); that hold
+/// is never approvable.
 pub fn page_update_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     // Path check and body checks first, so the validation dry call reports a bad path
     // placeholder or a refused body before enrichment (§5.4 step 1).
@@ -522,7 +609,7 @@ pub fn page_update_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     let storage = storage_text(ctx, EmptyBody::Allow)?;
     let verdict = ctx
         .enrichment
-        .filter(|v| v.hold == Hold::Preview)
+        .filter(|v| matches!(v.hold, Hold::Preview | Hold::Conflict))
         .ok_or(ExecError::EnrichmentRequired)?;
     let current = |name: &str| verdict.resolved.get(name).and_then(Value::as_str);
     let (Some(current_title), Some(space_key)) = (current("title"), current("space_key")) else {
