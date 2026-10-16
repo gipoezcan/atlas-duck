@@ -647,24 +647,20 @@ fn u25_lookalike_round_trip() -> TestResult {
     assert!(md.contains("\\@user:8a7f"), "{md}");
     assert!(md.contains("\\[t\\](confluence:DOC/Page)"), "{md}");
     assert!(md.contains("!\\[i\\](confluence:attachment/f.png)"), "{md}");
-    // A genuine `<a href="confluence:…">` (PD-95: escaped text). The first Markdown escapes only
-    // its `[` (`\[a link](confluence:…)`), the storage → Markdown of that text escapes both
-    // brackets (`\[a link\](…)`): the same rendered text and placeholder-free both times, and
-    // stable from the second round on (Task 6 report: a Task 3 asymmetry, not a U-25 case).
+    // A genuine `<a href="confluence:…">` (PD-95: escaped text). The first Markdown escapes both
+    // brackets (`\[a link\](confluence:…)`), as the storage → Markdown of that text does, so the
+    // round trip is stable from round 1 (M7 T4/T5 fix round; it used to escape only the `[`).
     let storage = "<p>Also <a href=\"confluence:DOC/Page\">a link</a>.</p>";
     let (md1, _, _) = storage_to_markdown(storage, &users);
-    assert_eq!(md1, "Also \\[a link](confluence:DOC/Page).\n");
+    assert_eq!(md1, "Also \\[a link\\](confluence:DOC/Page).\n");
     let (out1, e1) = markdown_to_storage(&md1);
     assert_eq!(hard_check_storage(&out1, &e1), Ok(()));
     let (md2, _, _) = storage_to_markdown(&out1, &users);
-    assert_eq!(md2, "Also \\[a link\\](confluence:DOC/Page).\n");
+    assert_eq!(md2, md1);
     let (out2, e2) = markdown_to_storage(&md2);
     assert_eq!(out2, out1);
     assert_eq!(hard_check_storage(&out2, &e2), Ok(()));
-    for md in [&md1, &md2] {
-        assert_eq!(check_markdown_placeholders(md), Ok(()), "{md}");
-    }
-    assert_eq!(storage_to_markdown(&out2, &users).0, md2);
+    assert_eq!(check_markdown_placeholders(&md1), Ok(()), "{md1}");
     Ok(())
 }
 

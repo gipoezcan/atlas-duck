@@ -133,6 +133,107 @@ fn near_misses_are_not_hits() {
     }
 }
 
+/// Raw HTML is written out as text by `markdown_to_storage`, so a placeholder inside an HTML
+/// block or inline HTML reaches Confluence as prose and is a hit (fail closed, review I-1).
+#[test]
+fn raw_html_is_scanned_like_text() {
+    let hits = [
+        ("<div>\n[macro: toc {}]\n</div>", PlaceholderKind::Macro),
+        ("<div>\n@user:8a7f\n</div>", PlaceholderKind::User),
+        (
+            "<details>\n<summary>s</summary>\n\n@user:8a7f\n</details>",
+            PlaceholderKind::User,
+        ),
+        ("<b>@user:x</b>", PlaceholderKind::User),
+        ("a <i>[macro: toc {}]</i> b", PlaceholderKind::Macro),
+        ("<span>[macro: toc {}]", PlaceholderKind::Macro),
+    ];
+    for (md, kind) in hits {
+        assert_eq!(kinds(md), vec![(kind, 1)], "{md:?}");
+    }
+    // The block form really is raw HTML events, not text (the test is not vacuous).
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    assert!(
+        Parser::new_ext("<div>\n[macro: toc {}]\n</div>", opts)
+            .all(|e| !matches!(e, Event::Text(_)))
+    );
+    // HTML without a placeholder still passes.
+    for md in [
+        "<div>\nplain\n</div>",
+        "<!-- a comment -->",
+        "x <b>bold</b> y",
+        "<div>\n[macro: toc]\n@user: x\n</div>",
+    ] {
+        assert_eq!(check_markdown_placeholders(md), Ok(()), "{md:?}");
+    }
+}
+
+#[test]
+fn macro_name_bound_and_class() {
+    let x64 = "x".repeat(64);
+    let x65 = "x".repeat(65);
+    assert_eq!(
+        kinds(&format!("[macro: {x64} {{}}]")),
+        vec![(PlaceholderKind::Macro, 1)]
+    );
+    assert_eq!(kinds(&format!("[macro: {x65} {{}}]")), vec![]);
+    assert_eq!(kinds("[macro: x {}]"), vec![(PlaceholderKind::Macro, 1)]);
+    // `_` and `.` are name characters, like `-`.
+    assert_eq!(
+        kinds("[macro: a_b.c {}]"),
+        vec![(PlaceholderKind::Macro, 1)]
+    );
+    // Closing rule: `}]` is needed, a stray space or a missing brace is not a hit.
+    assert_eq!(kinds("[macro: toc {x]"), vec![]);
+    assert_eq!(kinds("[macro: toc {} ]"), vec![]);
+    // An inline tag in the parameters ends the run (documented, review m-4).
+    assert_eq!(kinds("[macro: a {k=*x*}]"), vec![]);
+}
+
+#[test]
+fn user_key_start_class() {
+    for md in ["@user:.a", "@user:_a", "@user:-a", "@user:%5Fa", "@user:9"] {
+        assert_eq!(kinds(md), vec![(PlaceholderKind::User, 1)], "{md:?}");
+    }
+    // ASCII only: a non-ASCII letter does not start a key.
+    assert_eq!(kinds("@user:\u{e9}"), vec![]);
+    assert_eq!(kinds("@user:\u{4e2d}"), vec![]);
+}
+
+#[test]
+fn link_scheme_needs_the_colon() {
+    for md in [
+        "[x](confluence-notes.md)",
+        "[x](confluence.html)",
+        "[x](confluence)",
+        "![x](confluence-a.png)",
+    ] {
+        assert_eq!(check_markdown_placeholders(md), Ok(()), "{md:?}");
+    }
+    assert_eq!(kinds("[x](confluence:p)"), vec![(PlaceholderKind::Link, 1)]);
+}
+
+#[test]
+fn autolink_and_reference_forms_are_found() {
+    assert_eq!(
+        kinds("<confluence:DOC/Page>"),
+        vec![(PlaceholderKind::Link, 1)]
+    );
+    assert_eq!(
+        kinds("[a][r]\n\n[r]: confluence:DOC/Page"),
+        vec![(PlaceholderKind::Link, 1)]
+    );
+    assert_eq!(
+        kinds("[x](<confluence:DOC/Page>)"),
+        vec![(PlaceholderKind::Link, 1)]
+    );
+    // An unreferenced definition emits no link event and is not a hit.
+    assert_eq!(
+        check_markdown_placeholders("[r]: confluence:DOC/Page"),
+        Ok(())
+    );
+}
+
 #[test]
 fn placeholder_hits_carry_no_text() {
     let md = "[macro: secretname {k=secretvalue}] @user:secretkey [t](confluence:secretspace/p)";

@@ -331,7 +331,7 @@ fn u23_lookalikes_escaped() -> TestResult {
     assert_eq!(md("<p>@user: alone</p>"), "@user: alone\n");
     assert_eq!(
         md("<p><a href=\"confluence:DOC/x\">t</a></p>"),
-        "\\[t](confluence:DOC/x)\n"
+        "\\[t\\](confluence:DOC/x)\n"
     );
     assert_eq!(
         md("<p><a href=\"https://x.example/\">confluence:DOC/x</a></p>"),
@@ -448,6 +448,42 @@ fn placeholder_adjacency_cannot_form_links_or_images() -> TestResult {
         md(&format!("<p>Look!{link}</p>")),
         "Look\\![T](confluence:D/T)\n"
     );
+    Ok(())
+}
+
+/// A genuine `<a href="confluence:…">` is prose, so the dead link's `]` is escaped with its `[`
+/// and the text is stable from round 1 (first and second round equal).
+#[test]
+fn look_alike_link_escape_is_stable_from_round_one() -> TestResult {
+    let cases = [
+        (
+            "<p>Also <a href=\"confluence:DOC/Page\">a link</a>.</p>",
+            "Also \\[a link\\](confluence:DOC/Page).\n",
+        ),
+        (
+            "<p><a href=\"CONFLUENCE:x\">[x]</a></p>",
+            "\\[\\[x\\]\\](CONFLUENCE:x)\n",
+        ),
+        (
+            "<p><a href=\"confluence:p/t\">a <b>bold</b> link</a></p>",
+            "\\[a **bold** link\\](confluence:p/t)\n",
+        ),
+        ("<p><a href=\"confluence:p/t\"></a></p>", ""),
+    ];
+    for (storage, expected) in cases {
+        let round1 = md(storage);
+        if !expected.is_empty() {
+            assert_eq!(round1, expected, "{storage}");
+        }
+        let (out, _) = atlas_duck_convert::markdown_to_storage(&round1);
+        let round2 = md(&out);
+        assert_eq!(round2, round1, "{storage} -> {round1:?} -> {out}");
+        assert_eq!(
+            atlas_duck_convert::check_markdown_placeholders(&round1),
+            Ok(()),
+            "{round1}"
+        );
+    }
     Ok(())
 }
 

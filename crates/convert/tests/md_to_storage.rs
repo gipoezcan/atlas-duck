@@ -16,7 +16,8 @@ use atlas_duck_convert::{
 };
 use common::{
     CODE_MACRO_CLOSE as MACRO_CLOSE, CODE_MACRO_OPEN as MACRO_OPEN,
-    check_storage_output as check_output, markdown, only_converter_markup,
+    check_storage_output as check_output, markdown, md_fragment, only_converter_markup,
+    storage_fragment,
 };
 use proptest::prelude::*;
 
@@ -321,7 +322,9 @@ fn emitted_code_macro_ranges() -> TestResult {
         assert_eq!(c.kind, ContainerKind::CodeMacro);
         assert!(c.byte_range.start >= prev_end, "sorted, disjoint");
         prev_end = c.byte_range.end;
-        let slice = &out[c.byte_range.clone()];
+        let slice = out
+            .get(c.byte_range.clone())
+            .ok_or("range is not a slice")?;
         assert!(slice.starts_with(MACRO_OPEN), "{slice}");
         assert!(slice.ends_with(MACRO_CLOSE), "{slice}");
         // Exactly one macro: the slice parses alone as one `ac:structured-macro`.
@@ -391,13 +394,96 @@ fn empty_and_blank_input() -> TestResult {
     Ok(())
 }
 
+/// Markdown fragments mixed with the storage alphabet (`ac:`/`ri:` elements, CDATA, DOCTYPE,
+/// namespace declarations, invalid characters) and pointy or unsafe link destinations.
+fn mixed_markdown() -> impl Strategy<Value = String> {
+    let destinations = prop::sample::select(vec![
+        "[l](<https://x.example/\u{1} a>)",
+        "[l](<https://x.example/b>)",
+        "<javascript:x>",
+        "<https://x.example/c>",
+        "[l](<confluence:DOC/Page>)",
+    ])
+    .prop_map(String::from);
+    proptest::collection::vec(
+        prop_oneof![md_fragment(), storage_fragment(), destinations],
+        0..60,
+    )
+    .prop_map(|v| v.concat())
+}
+
+#[test]
+fn raw_html_and_specials_in_every_position_become_text() -> TestResult {
+    let cases = [
+        "# <b>h</b> ]]> \u{1} <ac:link/>\n",
+        "> <div>x]]></div> \u{FFFF}\n",
+        "![a <b> ]]> \u{1} <ri:user/>](https://x.example/i.png)\n",
+        "- item <ac:structured-macro ac:name=\"toc\"/> ]]>\n",
+        "| h <b> |\n|---|\n| ]]> \u{1} <i> |\n",
+    ];
+    for md in cases {
+        let (out, e) = convert_checked(md)?;
+        assert!(e.code_blocks.is_empty(), "{md:?}");
+        let text = text_of(&out);
+        assert!(!text.is_empty(), "{md:?}");
+        assert!(!out.contains("<b>") && !out.contains("<div>"), "{out}");
+        assert!(!out.contains("<ac:") && !out.contains("<ri:"), "{out}");
+        assert!(!out.contains("]]>"), "{out}");
+        assert!(!out.contains(['\u{1}', '\u{FFFF}']), "{out:?}");
+    }
+    // A `~~~` fence whose body holds backtick fences, raw HTML and `]]>` is one code macro.
+    let (out, e) = convert_checked("~~~\n```\n<b>]]>\n```\n~~~\n")?;
+    assert_eq!(e.code_blocks.len(), 1, "{out}");
+    assert_eq!(text_of(&out), "```\n<b>]]>\n```");
+    Ok(())
+}
+
+#[test]
+fn autolink_inside_link_text_is_text() -> TestResult {
+    let (out, _) = convert_checked("[<https://a.example> x](https://b.example)\n")?;
+    assert_eq!(out.matches("<a ").count(), 1, "{out}");
+    assert!(out.contains("<a href=\"https://b.example\">"), "{out}");
+    assert!(!out.contains("href=\"https://a.example\""), "{out}");
+    assert!(text_of(&out).contains("https://a.example x"), "{out}");
+    Ok(())
+}
+
+#[test]
+fn unsafe_and_resource_destinations_become_text() -> TestResult {
+    let cases = [
+        ("JaVaScRiPt:alert(1)", "t (JaVaScRiPt:alert(1))"),
+        ("java&#9;script:x", "t (java\tscript:x)"),
+        ("//host/path", "t (//host/path)"),
+        ("confluence:DOC/Page", "t (confluence:DOC/Page)"),
+        (
+            "CONFLUENCE:attachment/a.png",
+            "t (CONFLUENCE:attachment/a.png)",
+        ),
+    ];
+    for (dest, text) in cases {
+        let (out, e) = convert_checked(&format!("[t]({dest})\n"))?;
+        assert!(e.code_blocks.is_empty());
+        assert_eq!(text_of(&out), text, "{dest}");
+        assert!(!out.contains("<a ") && !out.contains("ac:link"), "{out}");
+        assert!(!out.contains("ri:"), "{out}");
+    }
+    Ok(())
+}
+
+#[test]
+fn control_char_in_pointy_href_is_replaced() -> TestResult {
+    let (out, _) = convert_checked("[t](<https://x.example/\u{1}>)\n")?;
+    assert_eq!(out, "<p><a href=\"https://x.example/\u{FFFD}\">t</a></p>");
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 100, .. ProptestConfig::default() })]
 
     /// Same output twice; well-formed converter markup, or refused as too deep (only nesting
     /// past the parser's bound can do that).
     #[test]
-    fn deterministic_output(md in markdown()) {
+    fn deterministic_output(md in prop_oneof![markdown(), mixed_markdown()]) {
         let (a, ea) = markdown_to_storage(&md);
         let (b, eb) = markdown_to_storage(&md);
         prop_assert_eq!(&a, &b);

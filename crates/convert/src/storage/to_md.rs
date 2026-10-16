@@ -1189,22 +1189,35 @@ fn neutralize(mut md: String, mut genuine: BTreeSet<(usize, PlaceholderKind)>) -
     insert_backslashes(&mut md, &mut genuine, at);
     for _ in 0..MAX_PASSES {
         let mut at = tilde_fences(&md);
-        for hit in placeholders::scan(&md) {
+        let hits = placeholders::scan(&md);
+        let closers = if hits.iter().any(|h| !genuine.contains(&(h.at, h.kind))) {
+            link_closers(&md)
+        } else {
+            BTreeMap::new()
+        };
+        for hit in hits {
             if genuine.contains(&(hit.at, hit.kind)) {
                 continue;
             }
             // An image is neutralised at its `[`, unless that `[` is a genuine link (then the
             // `!` is escaped).
             let image_bracket = hit.at + 1;
-            at.push(
-                if hit.kind == PlaceholderKind::Image
-                    && !genuine.contains(&(image_bracket, PlaceholderKind::Link))
-                {
-                    image_bracket
-                } else {
-                    hit.at
-                },
-            );
+            if hit.kind == PlaceholderKind::Image
+                && genuine.contains(&(image_bracket, PlaceholderKind::Link))
+            {
+                at.push(hit.at);
+                continue;
+            }
+            at.push(if hit.kind == PlaceholderKind::Image {
+                image_bracket
+            } else {
+                hit.at
+            });
+            // The `]` that closed the dead link is escaped with its `[`, so that the text is
+            // already what `htmd` writes for it on a second round (`\[a\](…)`).
+            if let Some(&close) = closers.get(&hit.at) {
+                at.push(close);
+            }
         }
         if at.is_empty() {
             break;
@@ -1212,6 +1225,39 @@ fn neutralize(mut md: String, mut genuine: BTreeSet<(usize, PlaceholderKind)>) -
         insert_backslashes(&mut md, &mut genuine, at);
     }
     md
+}
+
+/// For each link or image written as `[text](…)` or `![alt](…)` (or a reference form), the
+/// offset of its closing `]`, keyed by the offset of the link's (or image's) start.
+fn link_closers(md: &str) -> BTreeMap<usize, usize> {
+    let mut closers = BTreeMap::new();
+    // (start, end of the last child seen so far, written with brackets)
+    let mut open: Vec<(usize, usize, bool)> = Vec::new();
+    for (event, range) in Parser::new_ext(md, placeholders::options()).into_offset_iter() {
+        if matches!(event, Event::End(TagEnd::Link | TagEnd::Image))
+            && let Some((start, child_end, bracketed)) = open.pop()
+            && bracketed
+            && let Some(inner) = md.get(child_end..range.end)
+            && let Some(i) = inner.find(']')
+        {
+            closers.insert(start, child_end + i);
+        }
+        if let Some(top) = open.last_mut() {
+            top.1 = top.1.max(range.end);
+        }
+        match event {
+            Event::Start(Tag::Link { .. }) => {
+                let bracketed = md.get(range.start..).is_some_and(|s| s.starts_with('['));
+                open.push((range.start, range.start + 1, bracketed));
+            }
+            Event::Start(Tag::Image { .. }) => {
+                let bracketed = md.get(range.start..).is_some_and(|s| s.starts_with("!["));
+                open.push((range.start, range.start + 2, bracketed));
+            }
+            _ => {}
+        }
+    }
+    closers
 }
 
 /// Offsets that stop every `~~~` fence from opening a code block. The converter and `htmd`

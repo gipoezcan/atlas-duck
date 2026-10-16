@@ -52,7 +52,8 @@ pub(crate) fn scan(md: &str) -> Vec<Hit> {
     let mut in_code_block = false;
     for (event, range) in Parser::new_ext(md, options()).into_offset_iter() {
         match event {
-            Event::Text(_) if !in_code_block => {
+            // Raw HTML is written out as text (`md_to_storage`), so it counts like text.
+            Event::Text(_) | Event::Html(_) | Event::InlineHtml(_) if !in_code_block => {
                 run = Some(match run.take() {
                     Some(r) if joins(md, r.end, range.start) => r.start..range.end,
                     Some(r) => {
