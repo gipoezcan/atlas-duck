@@ -17,6 +17,8 @@ export const FORBIDDEN = [
   'indexedDB',
   'BroadcastChannel',
   'serviceWorker',
+  'cookie',
+  'caches',
 ];
 
 /** Every file reachable from a manifest key: its chunk, static and dynamic imports, css, assets. */

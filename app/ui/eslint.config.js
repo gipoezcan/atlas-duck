@@ -31,7 +31,7 @@ const BLOB_URL_PROPERTY = {
   message: 'Blob URLs (blob workers) are banned in ui/ (spec §6.4).',
 };
 
-const WEB_STORAGE = ['localStorage', 'sessionStorage', 'indexedDB', 'BroadcastChannel'];
+const WEB_STORAGE = ['localStorage', 'sessionStorage', 'indexedDB', 'BroadcastChannel', 'cookie', 'caches'];
 const WEB_STORAGE_MESSAGE = 'No web storage or cross-context channels in the credential page (spec §10.3).';
 
 export default [

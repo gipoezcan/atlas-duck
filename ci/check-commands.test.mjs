@@ -309,6 +309,13 @@ test("pathbuf_and_byte_fields_fail", () => {
   assertFails(field("pub client_cert: String"), /client_cert/);
   assertFails(field("pub data_path: String"), /data_path/);
   assertFails(field("pub filePath: String"), /filePath/);
+  // M-3: a file, folder or blob named as such (whole snake_case word), not "profile" or "redirect".
+  for (const name of ["file", "dir", "folder", "bytes", "blob", "ca_file", "export_dir", "files"]) {
+    assertFails(field(`pub ${name}: String`), new RegExp(`no field named like a path, PEM or certificate`));
+  }
+  for (const name of ["profile", "redirect", "direction", "filename_hint"]) {
+    assert.deepEqual(field(`pub ${name}: String`).filter((m) => m.includes(name)), [], name);
+  }
   // In a nested DTO and in a hand-written `Deserialize` newtype as well.
   const nested = argErrors(`${ARGS_OK}\n#[derive(Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct Inner { pub target: PathBuf }\n`);
   assertFails(nested, /Inner has a field of a forbidden type/);

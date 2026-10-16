@@ -132,7 +132,9 @@ const FORBIDDEN_TYPES = [
   /\bKeyOrigin\b/,
   /\bInstanceConfig\b/,
 ];
-const FORBIDDEN_FIELD_NAME = /path|pem|cert/i;
+// path, PEM and certificate anywhere in a name; file, folder, directory, bytes and blob as a whole
+// snake_case word ("profile" and "redirect" stay allowed).
+const FORBIDDEN_FIELD_NAME = /path|pem|cert|(^|_)(file|dir|directory|folder|bytes|blob)s?(_|$)/i;
 
 export const BEGIN_MARKER = "// BEGIN GENERATED (node ci/check-commands.mjs --write)";
 export const END_MARKER = "// END GENERATED";

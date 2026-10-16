@@ -76,7 +76,7 @@ test('an entry keyed credential.html in the manifest is found too', () => {
   assert.match(checkBundle(m, none).join('\n'), /vendor\.js is shared/);
 });
 
-for (const word of ['localStorage', 'sessionStorage', 'indexedDB', 'BroadcastChannel', 'serviceWorker']) {
+for (const word of ['localStorage', 'sessionStorage', 'indexedDB', 'BroadcastChannel', 'serviceWorker', 'cookie', 'caches']) {
   test(`credential chunk containing ${word} fails`, () => {
     const problems = checkBundle(clean(), files({ 'assets/main.js': `x.${word}.get()` }));
     assert.deepEqual(problems, [`assets/main.js contains ${word}`]);
