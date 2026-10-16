@@ -9,7 +9,15 @@ import {
   ISOLATION_IFRAME_STYLE,
   ISOLATION_STYLE_HASH,
   MAIN_POLICY,
+  PREVIEW_CSS_FILE,
+  PREVIEW_CSS_HASH,
+  PREVIEW_CSS_INCLUDE,
+  SANITIZE_RS,
+  checkPreviewCss,
+  checkPreviewRust,
   cspHash,
+  mainPolicy,
+  writePreviewHash,
   PLATFORMS,
   checkConfig,
   checkConfigs,
@@ -223,9 +231,57 @@ test("isolation_style_hash_is_the_hash_of_tauris_style", () => {
   assert.equal(ISOLATION_IFRAME_STYLE, "#__tauri_isolation__ { display: none !important }");
   assert.equal(cspHash(ISOLATION_IFRAME_STYLE), "'sha256-YEercZJImS+vUX2bz7vkQ0aA4rtBIPLuCEWz+yraQ/g='");
   assert.equal(ISOLATION_STYLE_HASH, cspHash(ISOLATION_IFRAME_STYLE));
-  for (const policy of [MAIN_POLICY, CREDENTIAL_POLICY]) {
-    assert.deepEqual(parsePolicy(policy).get("style-src"), ["'self'", ISOLATION_STYLE_HASH]);
+  assert.deepEqual(parsePolicy(CREDENTIAL_POLICY).get("style-src"), ["'self'", ISOLATION_STYLE_HASH]);
+  assert.deepEqual(parsePolicy(MAIN_POLICY).get("style-src"), ["'self'", ISOLATION_STYLE_HASH, PREVIEW_CSS_HASH]);
+});
+
+// ---------- the preview stylesheet (PD-92 contingency, ruling C1) ----------
+
+const SANITIZE_OK = `pub const PREVIEW_CSS: &str = ${PREVIEW_CSS_INCLUDE};\npub const PREVIEW_CSS_HASH: &str = "${PREVIEW_CSS_HASH}";\n`;
+
+test("preview_hash_is_the_hash_of_the_repository_stylesheet", () => {
+  const css = readFileSync(join(REPO, PREVIEW_CSS_FILE), "utf8");
+  assert.equal(PREVIEW_CSS_HASH, cspHash(css));
+  assert.deepEqual(checkPreviewCss(css), []);
+  assert.deepEqual(checkPreviewRust(readFileSync(join(REPO, SANITIZE_RS), "utf8"), PREVIEW_CSS_HASH), []);
+  // Exactly one preview hash in the main policy: the shipped config is the expected text.
+  const conf = JSON.parse(readFileSync(join(SRC_TAURI, "tauri.conf.json"), "utf8"));
+  const style = parsePolicy(conf.app.security.csp).get("style-src");
+  assert.equal(style.filter((s) => s === PREVIEW_CSS_HASH).length, 1);
+  assert.equal(style.length, 3);
+});
+
+test("main_policy_without_or_with_a_stale_preview_hash_fails", () => {
+  const stale = cspHash("table{}");
+  for (const csp of [mainPolicy(stale), MAIN_POLICY.replace(` ${PREVIEW_CSS_HASH}`, ""), MAIN_POLICY.replace(PREVIEW_CSS_HASH, `${PREVIEW_CSS_HASH} ${stale}`)]) {
+    assertFails(checkConfig(baseConf({ csp }), "linux"), /style-src must be exactly/);
   }
+});
+
+test("preview_rust_constant_must_be_the_hash_and_embed_the_file", () => {
+  assert.deepEqual(checkPreviewRust(SANITIZE_OK, PREVIEW_CSS_HASH), []);
+  assertFails(checkPreviewRust(SANITIZE_OK, cspHash("x")), /PREVIEW_CSS_HASH is .* \(node ci\/check-csp\.mjs --write\)/);
+  assertFails(checkPreviewRust(SANITIZE_OK + SANITIZE_OK.split("\n")[1], PREVIEW_CSS_HASH), /found 2/);
+  assertFails(checkPreviewRust(SANITIZE_OK.replace(/pub const PREVIEW_CSS_HASH.*\n/, ""), PREVIEW_CSS_HASH), /found 0/);
+  assertFails(checkPreviewRust(SANITIZE_OK.replace(PREVIEW_CSS_INCLUDE, 'include_str!("other.css")'), PREVIEW_CSS_HASH), /PREVIEW_CSS must be/);
+});
+
+test("preview_css_must_be_inlinable", () => {
+  assertFails(checkPreviewCss("a{}</STYLE><script>x</script>"), /<\/style/);
+  assertFails(checkPreviewCss("a{}\r\nb{}"), /CR/);
+  assertFails(checkPreviewCss("  \n"), /empty/);
+});
+
+test("write_sets_the_preview_hash_in_both_places_and_nothing_else", () => {
+  const stale = cspHash("table{}");
+  const conf = JSON.stringify({ app: { security: { csp: mainPolicy(stale), freezePrototype: true } } }, null, 2);
+  const sanitize = SANITIZE_OK.replace(PREVIEW_CSS_HASH, stale);
+  const out = writePreviewHash(conf, sanitize, PREVIEW_CSS_HASH);
+  assert.equal(JSON.parse(out.conf).app.security.csp, MAIN_POLICY);
+  assert.equal(JSON.parse(out.conf).app.security.freezePrototype, true);
+  assert.equal(out.sanitize, SANITIZE_OK);
+  // Idempotent.
+  assert.deepEqual(writePreviewHash(out.conf, out.sanitize, PREVIEW_CSS_HASH), out);
 });
 
 test("style_src_admits_exactly_the_isolation_hash", () => {

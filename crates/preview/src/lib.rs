@@ -17,5 +17,7 @@ pub use model::{
     Preview, PreviewBody, PreviewHeader, RAW_PAGE_BYTES, RENDER_VERSIONS, RawPager, RequestView,
     cap_error_text,
 };
-pub use sanitize::{Platform, app_origin, iframe_document, sanitize_html};
+pub use sanitize::{
+    PREVIEW_CSS, PREVIEW_CSS_HASH, Platform, app_origin, iframe_document, sanitize_html,
+};
 pub use warning::{Level, Warning, WarningId};

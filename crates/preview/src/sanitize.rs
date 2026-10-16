@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-/// Platform-specific app origin (§6.4): where `preview.css` is served from.
+/// Platform-specific app origin (§6.4), where the app's pages are served from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
     MacOsLinux,
@@ -259,10 +259,11 @@ fn sanitize_document(html: &str) -> String {
 /// The `srcdoc` document: meta CSP is the first `<head>` element, then the bundled stylesheet.
 /// The body is sanitized again here (idempotent), so a caller that forgot cannot open a hole;
 /// this pass also keeps the renderer's `header`, `section` and `mark`. The UI sets `sandbox=""`
-/// on the iframe.
-pub fn iframe_document(body_html: &str, platform: Platform) -> String {
+/// on the iframe. The document is the same on every platform since the stylesheet is inline
+/// ([`Stylesheet`]); `platform` stays for the callers' sake.
+pub fn iframe_document(body_html: &str, _platform: Platform) -> String {
     let body = sanitize_document(body_html);
-    let style = Stylesheet::of(platform);
+    let style = Stylesheet::get();
     format!(
         "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" \
          content=\"default-src 'none'; style-src {}; img-src data:\">{}</head><body>{body}</body>\
@@ -271,28 +272,36 @@ pub fn iframe_document(body_html: &str, platform: Platform) -> String {
     )
 }
 
+/// `app/ui/public/preview.css`, the preview document's only stylesheet, as the renderer embeds it
+/// (`.gitattributes` keeps it LF-only: a browser hashes the `<style>` text after normalizing line
+/// ends, so a CR would break the hash).
+pub const PREVIEW_CSS: &str = include_str!("../../../app/ui/public/preview.css");
+
+/// The CSP hash source of [`PREVIEW_CSS`]: sha256, base64. Written by `node ci/check-csp.mjs
+/// --write`, which also puts it into the main policy (`tauri.conf.json`); `ci/check-csp.mjs` and
+/// the app's `csp::tests` fail when it is not the hash of the embedded text.
+pub const PREVIEW_CSS_HASH: &str = "'sha256-QjDb0ujXyJk4o6e18x54ga50tEBTqHBD+DgAUfAsG7I='";
+
 /// How the document gets `preview.css`: the meta CSP's `style-src` source and the `<head>`
-/// element that loads it, which must change together. The one place to switch for PD-92.
+/// element that carries it, which must change together.
 ///
-/// Primary path (today): a `<link>` to `<origin>/preview.css`, allowed by that path source here
-/// and by `style-src 'self'` of the inherited main policy. PD-92 contingency (lead ruling; the
-/// spec/plan text is being amended, T32 decides): a `sha256-` hash source matches inline
-/// `<style>` content only, never a `<link>`, so the switch is: `element` becomes `<style>` with
-/// the exact bytes of `preview.css`, `source` becomes `'sha256-…'` of those bytes, and the same
-/// hash goes into the main policy (`ci/check-csp.mjs` keeps them in step). The tests that check
-/// the whole document for `<style` (`tests/render.rs`: `head()`,
-/// `goldens_have_no_class_or_style_attribute`) then check the body only.
+/// PD-92 contingency (lead ruling C1, M6 CI round 2: on WebKitGTK the `<link>` to
+/// `<origin>/preview.css` was not applied in the sandboxed `srcdoc` frame, V24): one inline
+/// `<style>` with the exact text of `preview.css`, admitted by its hash, here and in the main
+/// policy the `srcdoc` document inherits. A hash source needs no fetch and matches the same
+/// whatever origin the browser gives the sandboxed document. The body never holds a `<style>`:
+/// the sanitizer drops every author-supplied one.
 struct Stylesheet {
-    source: String,
+    source: &'static str,
     element: String,
 }
 
 impl Stylesheet {
-    fn of(platform: Platform) -> Stylesheet {
-        let url = format!("{}/preview.css", app_origin(platform));
-        Stylesheet {
-            element: format!("<link rel=\"stylesheet\" href=\"{url}\">"),
-            source: url,
-        }
+    fn get() -> &'static Stylesheet {
+        static STYLE: OnceLock<Stylesheet> = OnceLock::new();
+        STYLE.get_or_init(|| Stylesheet {
+            source: PREVIEW_CSS_HASH,
+            element: format!("<style>{PREVIEW_CSS}</style>"),
+        })
     }
 }

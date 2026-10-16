@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use atlas_duck_atlassian::testing::fixtures;
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser};
 use atlas_duck_ipc::paths::ENDPOINT_FILE;
+use atlas_duck_preview::PREVIEW_CSS;
 use atlas_duck_registry::Product;
 use serde_json::{Value, json};
 
@@ -901,8 +902,9 @@ async fn csp(rig: &Rig) -> Result<()> {
 /// spaces, so the renderer emits a `bdi` in a `pre` (the flow fails when either is absent: the UA
 /// default of `pre` is `white-space: pre`, so `pre-wrap` shows the stylesheet applied). The mock body
 /// carries an inline `<style>`, a `style` attribute and a remote `<img>` and `<link>`, and the
-/// rendered document contains none of them (its one `<link>` is the renderer's own `preview.css`,
-/// compared to the exact href) while the page loaded and the mock saw no image request. (That the
+/// rendered document contains none of them (its one `<style>` is the renderer's own `preview.css`,
+/// PD-92 contingency, compared to the embedded text; no `<link>` at all) while the page loaded and
+/// the mock saw no image request. (That the
 /// CSP would block such content if it survived the sanitizer is the CSP config check and V24
 /// evidence: no test hook may inject unsanitized HTML.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -958,48 +960,66 @@ async fn s08(rig: &Rig) -> Result<()> {
         "the preview iframe has a src: {src:?}"
     );
     wd.switch_to_frame(&frame).await?;
-    // The stylesheet applied: element rules of preview.css (PD-92 contingency if this fails).
-    let table = wd.find("table").await?;
-    ensure_eq!(wd.css_value(&table, "border-collapse").await?, "collapse");
+    // The stylesheet applied (PD-92 contingency, ruling C1: `preview.css` is one inline `<style>`
+    // admitted by its hash). Every computed-style check is collected before the flow fails, so one
+    // run shows which rules applied.
+    let mut style_errors = Vec::new();
+    match wd.find_all("table").await?.first() {
+        Some(table) => {
+            let got = wd.css_value(table, "border-collapse").await?;
+            if got != "collapse" {
+                style_errors.push(format!("border-collapse of the first <table> is {got:?}"));
+            }
+        }
+        None => style_errors.push("the preview document has no <table>".to_owned()),
+    }
     // The multi-line summary is a `bdi` in a `pre`; both must exist and carry the stylesheet's rule.
     for element in ["bdi", "pre"] {
-        let found = wd.find_all(element).await?;
-        let Some(first) = found.first() else {
-            return Err(format!(
+        match wd.find_all(element).await?.first() {
+            Some(first) => {
+                let got = wd.css_value(first, "white-space").await?;
+                if got != "pre-wrap" {
+                    style_errors.push(format!("white-space of the first <{element}> is {got:?}"));
+                }
+            }
+            None => style_errors.push(format!(
                 "the preview document has no <{element}>: the multi-line value did not reach the renderer"
-            )
-            .into());
-        };
-        ensure_eq!(
-            wd.css_value(first, "white-space").await?,
-            "pre-wrap",
-            "white-space of the first <{element}>"
-        );
+            )),
+        }
     }
-    // None of the active content is in the rendered document. The one `<link>` is the renderer's
-    // own stylesheet, by its exact href; a `<style>` is allowed only in the head (the PD-92
-    // contingency), never in the body.
-    let expected_href = format!("{APP_ORIGIN}/preview.css");
-    for link in wd.find_all("link").await? {
-        ensure_eq!(
-            wd.attribute(&link, "href").await?.as_deref(),
-            Some(expected_href.as_str()),
-            "a <link> of the preview document is not the renderer's stylesheet"
-        );
-        ensure_eq!(
-            wd.attribute(&link, "rel").await?.as_deref(),
-            Some("stylesheet")
-        );
+    // Exactly one `<style>`: the renderer's own, in the head, with exactly the embedded text.
+    let styles = wd.find_all("style").await?;
+    if styles.len() != 1 {
+        style_errors.push(format!(
+            "the preview document holds {} <style> elements, not 1",
+            styles.len()
+        ));
     }
+    for style in &styles {
+        let text = wd.property(style, "textContent").await?.unwrap_or_default();
+        if text != PREVIEW_CSS {
+            style_errors.push(format!(
+                "a <style> is not the embedded preview.css ({} bytes, starts {:?})",
+                text.len(),
+                text.chars().take(60).collect::<String>()
+            ));
+        }
+    }
+    ensure!(
+        style_errors.is_empty(),
+        "preview.css in the sandboxed frame: {style_errors:?}"
+    );
+    // None of the active content is in the rendered document: no `<link>` at all (the stylesheet is
+    // inline), no `<style>` in the body.
     for css in [
-        "body link",
+        "link",
         "body style",
         "[style]",
         "img",
         "script",
         "iframe,frame,object,embed,base,meta[http-equiv=refresh]",
         "[onerror],[onload],[onclick]",
-        "[src],[srcset],[poster],[background],[action],[formaction],[data],[href]:not(link)",
+        "[src],[srcset],[poster],[background],[action],[formaction],[data],[href]",
     ] {
         let hits = wd.find_all(css).await?;
         ensure!(

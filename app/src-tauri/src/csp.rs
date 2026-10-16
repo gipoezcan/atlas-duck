@@ -359,29 +359,58 @@ mod tests {
     /// isolation page's policy only. Both of the app's policies admit exactly that style by its
     /// sha256 hash; a Tauri release that changes the text fails here, not as a CSP violation in a
     /// window.
-    #[test]
-    fn both_policies_admit_exactly_tauris_isolation_style() {
+    /// The CSP hash source of an inline element whose text is `text`.
+    fn hash_source(text: &str) -> String {
         use base64::Engine as _;
         use sha2::{Digest, Sha256};
-        let digest: [u8; 32] =
-            Sha256::digest(tauri::utils::pattern::isolation::IFRAME_STYLE.as_bytes()).into();
-        let hash = format!(
+        let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        format!(
             "'sha256-{}'",
             base64::engine::general_purpose::STANDARD.encode(digest)
-        );
-        let expected = vec!["'self'".to_owned(), hash];
+        )
+    }
+
+    fn main_policy() -> String {
         let context: Context<tauri::test::MockRuntime> =
             tauri::generate_context!(assets = tauri::test::noop_assets(), test = true);
-        let Some(Csp::Policy(main)) = &context.config().app.security.csp else {
-            panic!("the CSP is a policy string");
-        };
-        assert_eq!(style_src(main), expected, "tauri.conf.json: {main}");
+        match &context.config().app.security.csp {
+            Some(Csp::Policy(main)) => main.clone(),
+            other => panic!("the CSP is a policy string: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_policies_admit_exactly_tauris_isolation_style() {
+        let hash = hash_source(tauri::utils::pattern::isolation::IFRAME_STYLE);
+        let main = main_policy();
+        assert_eq!(
+            style_src(&main).get(..2),
+            Some(&["'self'".to_owned(), hash.clone()][..]),
+            "tauri.conf.json: {main}"
+        );
         let page = include_str!("../../ui/credential.html");
         let meta = page
             .split("content=\"")
             .nth(1)
             .and_then(|rest| rest.split('"').next())
             .unwrap_or_default();
-        assert_eq!(style_src(meta), expected, "credential.html: {meta}");
+        assert_eq!(
+            style_src(meta),
+            vec!["'self'".to_owned(), hash],
+            "credential.html: {meta}"
+        );
+    }
+
+    /// M6 CI round 2, ruling C1 (PD-92 contingency): the preview document carries `preview.css`
+    /// as one inline `<style>`; its hash, the renderer's `PREVIEW_CSS_HASH`, is the main policy's
+    /// third and last `style-src` source (the sandboxed `srcdoc` document inherits that policy).
+    #[test]
+    fn the_main_policy_admits_exactly_the_embedded_preview_css() {
+        let preview = hash_source(atlas_duck_preview::PREVIEW_CSS);
+        assert_eq!(preview, atlas_duck_preview::PREVIEW_CSS_HASH);
+        let main = main_policy();
+        let style = style_src(&main);
+        assert_eq!(style.len(), 3, "{main}");
+        assert_eq!(style.last(), Some(&preview), "{main}");
     }
 }

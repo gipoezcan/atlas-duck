@@ -15,8 +15,8 @@ use atlas_duck_preview::render::{self, DOC_MAX_BYTES, DOC_MAX_DIFF_LINES, DOC_MA
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     BodyView, CandidateRev, CommentView, ConstructList, FieldRow, IssueCard, ItemCount,
-    OutcomeKind, PREVIEW_BUILDER_VERSION, Platform, Preview, PreviewBody, PreviewHeader,
-    RENDER_VERSIONS, RawPager, RequestView, json_tree, sanitize_html,
+    OutcomeKind, PREVIEW_BUILDER_VERSION, PREVIEW_CSS, PREVIEW_CSS_HASH, Platform, Preview,
+    PreviewBody, PreviewHeader, RENDER_VERSIONS, RawPager, RequestView, json_tree, sanitize_html,
 };
 use proptest::prelude::*;
 use serde_json::json;
@@ -412,16 +412,25 @@ fn goldens_every_body_variant_and_the_header() -> TestResult {
     Ok(())
 }
 
+/// The head is exactly [`head`] (its one `<style>` is the renderer's `preview.css`, PD-92
+/// contingency); the body has no style, class, script, link or frame.
 #[test]
 fn goldens_have_no_class_or_style_attribute() -> TestResult {
     let mut n = 0;
     for entry in std::fs::read_dir(golden_dir())? {
         let path = entry?.path();
         let text = std::fs::read_to_string(&path)?;
+        assert!(
+            text.starts_with(&head(Platform::MacOsLinux)),
+            "{}: head",
+            path.display()
+        );
+        assert_eq!(text.matches("<style").count(), 1, "{}", path.display());
+        let body = body_of(&text);
         for bad in [
-            "class=", "style=", "<style", "<script", "<a ", "<a>", "<form", "<iframe",
+            "class=", "style=", "<style", "<script", "<a ", "<a>", "<form", "<iframe", "<link",
         ] {
-            assert!(!text.contains(bad), "{}: {bad}", path.display());
+            assert!(!body.contains(bad), "{}: {bad}", path.display());
         }
         n += 1;
     }
@@ -506,12 +515,13 @@ fn strict() -> ammonia::Builder<'static> {
     b
 }
 
-fn head(platform: Platform) -> String {
-    let origin = atlas_duck_preview::app_origin(platform);
+/// The head of every document (PD-92 contingency, ruling C1: `preview.css` inline, admitted by
+/// its hash; the same on every platform).
+fn head(_platform: Platform) -> String {
     format!(
         "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" \
-         content=\"default-src 'none'; style-src {origin}/preview.css; img-src data:\">\
-         <link rel=\"stylesheet\" href=\"{origin}/preview.css\"></head><body>"
+         content=\"default-src 'none'; style-src {PREVIEW_CSS_HASH}; img-src data:\">\
+         <style>{PREVIEW_CSS}</style></head><body>"
     )
 }
 
@@ -1408,21 +1418,23 @@ fn meta_csp_is_first_head_element() {
             let d = render::document(&p, platform);
             assert!(d.starts_with(&head(platform)));
             assert_eq!(d.matches("<meta").count(), 1);
-            assert_eq!(d.matches("<link").count(), 1);
+            assert_eq!(d.matches("<link").count(), 0);
+            // The renderer's one stylesheet (PD-92 contingency, ruling C1), nothing else.
+            assert_eq!(d.matches("<style").count(), 1);
         }
     }
 }
 
+/// Since the PD-92 contingency (ruling C1) the document names no origin: the stylesheet is inline
+/// and admitted by its hash, so both platforms get the same document.
 #[test]
 fn iframe_document_origin_per_platform() {
     let (_, p) = variants().swap_remove(0);
     let w = render::document(&p, Platform::Windows);
     let m = render::document(&p, Platform::MacOsLinux);
-    assert!(w.contains("style-src http://tauri.localhost/preview.css; img-src data:"));
-    assert!(w.contains("<link rel=\"stylesheet\" href=\"http://tauri.localhost/preview.css\">"));
-    assert!(m.contains("style-src tauri://localhost/preview.css; img-src data:"));
-    assert!(m.contains("<link rel=\"stylesheet\" href=\"tauri://localhost/preview.css\">"));
-    assert!(!w.contains("tauri://") && !m.contains("tauri.localhost"));
+    assert_eq!(w, m);
+    assert!(w.contains(&format!("style-src {PREVIEW_CSS_HASH}; img-src data:")));
+    assert!(!w.contains("tauri://") && !w.contains("tauri.localhost"));
     assert_eq!(body_of(&w), body_of(&m));
     let current = if cfg!(windows) {
         Platform::Windows
@@ -1470,7 +1482,7 @@ fn amp_8203_literal() {
 
 #[test]
 fn builder_version_names_the_render_version() {
-    assert_eq!(PREVIEW_BUILDER_VERSION, "pb2;render2;icu-17.0;emoji-17.0");
+    assert_eq!(PREVIEW_BUILDER_VERSION, "pb2;render3;icu-17.0;emoji-17.0");
 }
 
 /// FNV-1a 64 over every golden (by file name: the name, NUL, the bytes, NUL), then

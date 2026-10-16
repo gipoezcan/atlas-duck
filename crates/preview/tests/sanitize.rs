@@ -1,5 +1,6 @@
 use atlas_duck_preview::{
-    JsonNode, Platform, app_origin, iframe_document, json_tree, sanitize_html,
+    JsonNode, PREVIEW_CSS, PREVIEW_CSS_HASH, Platform, app_origin, iframe_document, json_tree,
+    sanitize_html,
 };
 use serde_json::json;
 
@@ -197,36 +198,61 @@ fn sanitize_is_idempotent() {
     assert_eq!(sanitize_html(&once), once);
 }
 
+/// PD-92 contingency (ruling C1): the head is the meta CSP, whose only style source is the hash of
+/// the embedded `preview.css`, then that stylesheet as one `<style>`; the same on every platform.
 #[test]
 fn iframe_document_meta_csp_first() {
     let w = iframe_document("<p>x</p>", Platform::Windows);
-    assert!(w.starts_with(
-        "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src http://tauri.localhost/preview.css; img-src data:\">"
-    ));
     let m = iframe_document("<p>x</p>", Platform::MacOsLinux);
-    assert!(m.starts_with(
-        "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src tauri://localhost/preview.css; img-src data:\">"
-    ));
-    for (doc, origin) in [(&w, "http://tauri.localhost"), (&m, "tauri://localhost")] {
-        assert!(doc.contains(&format!(
-            "><link rel=\"stylesheet\" href=\"{origin}/preview.css\"></head><body><p>x</p></body></html>"
-        )));
-        assert!(!doc.contains("<style"));
-        assert!(!doc.contains("style="));
-    }
+    assert_eq!(w, m, "the document no longer depends on the platform");
+    assert!(PREVIEW_CSS_HASH.starts_with("'sha256-") && PREVIEW_CSS_HASH.ends_with("='"));
+    assert_eq!(
+        w,
+        format!(
+            "<!doctype html><html><head><meta http-equiv=\"Content-Security-Policy\" \
+             content=\"default-src 'none'; style-src {PREVIEW_CSS_HASH}; img-src data:\">\
+             <style>{PREVIEW_CSS}</style></head><body><p>x</p></body></html>"
+        )
+    );
+    assert!(!w.contains("<link") && !w.contains("style="));
     assert_eq!(app_origin(Platform::Windows), "http://tauri.localhost");
     assert_eq!(app_origin(Platform::MacOsLinux), "tauri://localhost");
 }
 
+/// The embedded stylesheet can be one `<style>` element with a stable hash: it cannot end the
+/// element early, and it has no CR (a browser normalizes line ends before hashing).
+#[test]
+fn preview_css_is_safe_to_inline() {
+    assert!(!PREVIEW_CSS.is_empty());
+    assert!(!PREVIEW_CSS.to_ascii_lowercase().contains("</style"));
+    assert!(!PREVIEW_CSS.contains('\r'));
+    assert!(!PREVIEW_CSS.contains('\0'));
+}
+
+/// An author-supplied `<style>`, `style` attribute or `<link>` never survives: the document holds
+/// exactly one `<style>`, the renderer's own, with exactly the embedded text.
 #[test]
 fn iframe_document_sanitizes_hostile_body() {
     let d = iframe_document(
-        "<style>*{}</style><script>x</script><img src=https://evil onerror=x>t",
+        "<style>*{display:none}</style><link rel=stylesheet href=https://evil/x.css>\
+         <p style=\"color:red\">t</p><script>x</script><img src=https://evil onerror=x>t",
         Platform::Windows,
     );
     assert!(!d.contains("<script"));
     assert!(!d.contains("evil"));
-    assert!(!d.contains("<style"));
+    assert!(!d.contains("<link"));
+    assert!(!d.contains("style="));
+    assert_eq!(d.matches("<style").count(), 1, "{d}");
+    let head = d.split("</head>").next().unwrap_or_default();
+    assert!(
+        head.ends_with(&format!("<style>{PREVIEW_CSS}</style>")),
+        "{head}"
+    );
+    let body = d.split("<body>").nth(1).unwrap_or_default();
+    assert!(
+        !body.contains("<style") && !body.contains("display:none"),
+        "{body}"
+    );
     assert!(d.contains("</head><body>"));
     assert_eq!(d.matches("<meta").count(), 1);
 }

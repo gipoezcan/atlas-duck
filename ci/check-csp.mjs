@@ -11,12 +11,16 @@
 // inline style besides 'self': the `<style>` Tauri's isolation.js injects into every page (its
 // sha256 hash, lead ruling B1 of the M6 CI round 2; `csp::tests` pins it to Tauri's own constant).
 //
-// Usage: node ci/check-csp.mjs [--dist app/ui/dist]
+// The main policy also admits the preview document's one inline `<style>` (`preview.css`, PD-92
+// contingency, ruling C1) by its hash, which must equal the renderer's `PREVIEW_CSS_HASH`;
+// `--write` puts the current hash into tauri.conf.json and crates/preview/src/sanitize.rs.
+//
+// Usage: node ci/check-csp.mjs [--write] [--dist app/ui/dist]
 // Exit 0 = ok. Exit 1 = violations (one per line on stdout).
 // No npm dependencies: node:fs, node:path, node:url, node:crypto only.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,11 +41,33 @@ export const ISOLATION_IFRAME_STYLE = "#__tauri_isolation__ { display: none !imp
 /** Its hash source, the one inline style both policies admit. */
 export const ISOLATION_STYLE_HASH = cspHash(ISOLATION_IFRAME_STYLE);
 
-/** §6.4 main-window CSP (verbatim, `<isolation-origin>` kept). */
-export const MAIN_POLICY =
-  `default-src 'self'; script-src 'self'; style-src 'self' ${ISOLATION_STYLE_HASH}; img-src 'self' data:; ` +
-  "connect-src ipc: http://ipc.localhost; frame-src 'self' <isolation-origin>; worker-src 'none'; " +
-  "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+/** The preview document's stylesheet, as `crates/preview` embeds it (`include_str!`). */
+export const PREVIEW_CSS_FILE = "app/ui/public/preview.css";
+/** Where the renderer keeps its hash source (`PREVIEW_CSS_HASH`), written by `--write`. */
+export const SANITIZE_RS = "crates/preview/src/sanitize.rs";
+/** The renderer's embedding of `PREVIEW_CSS_FILE`, relative to `SANITIZE_RS`. */
+export const PREVIEW_CSS_INCLUDE = 'include_str!("../../../app/ui/public/preview.css")';
+
+/**
+ * PD-92 contingency (ruling C1, M6 CI round 2): the sandboxed `srcdoc` preview document carries
+ * `preview.css` as one inline `<style>`; the main policy, which that document inherits, admits it
+ * by this hash (the document's own meta CSP names the same hash, `PREVIEW_CSS_HASH` in Rust).
+ */
+export const PREVIEW_CSS_HASH = cspHash(readFileSync(join(REPO, PREVIEW_CSS_FILE), "utf8"));
+
+/** §6.4 main-window CSP with `previewHash` (verbatim otherwise, `<isolation-origin>` kept). */
+export function mainPolicy(previewHash) {
+  return (
+    `default-src 'self'; script-src 'self'; style-src 'self' ${ISOLATION_STYLE_HASH} ${previewHash}; ` +
+    "img-src 'self' data:; connect-src ipc: http://ipc.localhost; frame-src 'self' <isolation-origin>; " +
+    "worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  );
+}
+
+/** §6.4 main-window CSP for this repository's `preview.css`. */
+export const MAIN_POLICY = mainPolicy(PREVIEW_CSS_HASH);
 
 /** §10.3 credential-entry window meta CSP (verbatim, `<isolation-origin>` kept). */
 export const CREDENTIAL_POLICY =
@@ -250,9 +276,46 @@ function readPages(dir) {
   return pages;
 }
 
-// ---------- CLI ----------
+// ---------- the preview stylesheet (PD-92 contingency, ruling C1) ----------
 
-const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
+/** `css` can be one inline `<style>` with a stable hash: nothing ends it early, no CR (a browser
+ *  normalizes line ends before hashing), not empty. */
+export function checkPreviewCss(css) {
+  const errors = [];
+  if (css.trim() === "") errors.push(`${PREVIEW_CSS_FILE}: empty`);
+  if (/<\/style/i.test(css)) errors.push(`${PREVIEW_CSS_FILE}: contains "</style", which would end the inline element`);
+  if (css.includes("\r")) errors.push(`${PREVIEW_CSS_FILE}: contains a CR (the hash would not match the browser's)`);
+  return errors;
+}
+
+const HASH_CONST = /pub const PREVIEW_CSS_HASH: &str = "([^"]*)";/g;
+
+/** The renderer embeds `preview.css` from `PREVIEW_CSS_FILE` and names exactly `hash` once. */
+export function checkPreviewRust(sanitize, hash) {
+  const errors = [];
+  if (!sanitize.includes(PREVIEW_CSS_INCLUDE)) {
+    errors.push(`${SANITIZE_RS}: PREVIEW_CSS must be ${PREVIEW_CSS_INCLUDE}`);
+  }
+  const found = [...sanitize.matchAll(HASH_CONST)].map((m) => m[1]);
+  if (found.length !== 1) {
+    errors.push(`${SANITIZE_RS}: expected one PREVIEW_CSS_HASH constant, found ${found.length}`);
+  } else if (found[0] !== hash) {
+    errors.push(`${SANITIZE_RS}: PREVIEW_CSS_HASH is ${found[0]}, the hash of ${PREVIEW_CSS_FILE} is ${hash} (node ci/check-csp.mjs --write)`);
+  }
+  return errors;
+}
+
+/** `--write`: `conf` (tauri.conf.json text) and `sanitize` (sanitize.rs text) with `hash` as the
+ *  preview hash; the main policy's `style-src` is set to the expected one, nothing else changes. */
+export function writePreviewHash(conf, sanitize, hash) {
+  const style = parsePolicy(mainPolicy(hash)).get("style-src").join(" ");
+  return {
+    conf: conf.replace(/("csp":\s*"[^"]*?)style-src [^;"]*/, `$1style-src ${style}`),
+    sanitize: sanitize.replace(HASH_CONST, `pub const PREVIEW_CSS_HASH: &str = "${hash}";`),
+  };
+}
+
+// ---------- CLI ----------
 
 function rustFiles(dir, repo) {
   const out = {};
@@ -268,6 +331,18 @@ export function main(argv = process.argv.slice(2), repo = REPO) {
   const errors = [];
   const notes = [];
   const srcTauri = join(repo, "app", "src-tauri");
+  const css = readFileSync(join(repo, PREVIEW_CSS_FILE), "utf8");
+  const previewHash = cspHash(css);
+  if (argv.includes("--write")) {
+    const confPath = join(srcTauri, "tauri.conf.json");
+    const sanitizePath = join(repo, SANITIZE_RS);
+    const out = writePreviewHash(readFileSync(confPath, "utf8"), readFileSync(sanitizePath, "utf8"), previewHash);
+    writeFileSync(confPath, out.conf);
+    writeFileSync(sanitizePath, out.sanitize);
+    console.log(`check-csp: wrote the preview.css hash ${previewHash}`);
+  }
+  errors.push(...checkPreviewCss(css));
+  errors.push(...checkPreviewRust(readFileSync(join(repo, SANITIZE_RS), "utf8"), previewHash));
   const base = JSON.parse(readFileSync(join(srcTauri, "tauri.conf.json"), "utf8"));
   const { overlays, errors: overlayErrors } = readOverlays(srcTauri);
   errors.push(...overlayErrors, ...checkConfigs(base, overlays));
