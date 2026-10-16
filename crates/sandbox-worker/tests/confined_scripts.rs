@@ -244,16 +244,21 @@ fn run_case(name: &'static str, source: &str, args: Value, expect: Expect) -> Ca
     }
 }
 
-/// The M1 `confined_workload` script: allocation-heavy (`mmap`, `mremap`, `munmap`, many `brk`).
+/// The M1 `confined_workload` script, scaled to fit the default `heap_mb` (256 MiB): allocation-heavy
+/// (`mmap`, `mremap`, `munmap`, many `brk`). M1's 300 000 rows (`a` and the parsed `back` live
+/// together, about 250 B per row each in QuickJS, plus the JSON text and the Map) come to more than
+/// 256 MiB and ended in `EXIT_HEAP_LIMIT` (exit 102) in CI. 100 000 rows hold about 55 MiB for `a` and
+/// `back` together, about 6 MiB of JSON text, 2 MiB for `s` (about 4 MiB at the `realloc` peak) and
+/// about 30 MiB for the Map: roughly 100 MiB, so at least 2x headroom under the limit.
 const ALLOCATION_HEAVY_JS: &str = r#"
 const a = [];
-for (let i = 0; i < 300000; i++) a.push({ k: i, s: 'x' + i, arr: [i, i + 1, i + 2] });
+for (let i = 0; i < 100000; i++) a.push({ k: i, s: 'x' + i, arr: [i, i + 1, i + 2] });
 const back = JSON.parse(JSON.stringify(a));
 let s = '';
 for (let i = 0; i < 200000; i++) s += 'abcdefghij';
 const m = new Map();
 for (let i = 0; i < 200000; i++) m.set('k' + i, i);
-return [back.length, back[299999].arr[2], s.length, m.size];
+return [back.length, back[99999].arr[2], s.length, m.size];
 "#;
 
 /// Local-time `Date` methods and `toLocale*String` (§15 V11): none may hit a KILL rule. Local time
@@ -320,7 +325,7 @@ fn corpus() -> Vec<Case> {
             "allocation_heavy",
             ALLOCATION_HEAVY_JS,
             json!({}),
-            Expect::Result(json!([300_000, 300_001, 2_000_000, 200_000])),
+            Expect::Result(json!([100_000, 100_001, 2_000_000, 200_000])),
         ),
         run_case(
             "regexp_captures",
