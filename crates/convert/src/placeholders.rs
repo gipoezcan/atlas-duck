@@ -155,3 +155,42 @@ fn macro_grammar(s: &str) -> bool {
     let line = params.split('\n').next().unwrap_or("");
     line.contains("}]")
 }
+
+impl PlaceholderKind {
+    /// The snake_case name used in `details.placeholders`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Link => "link",
+            Self::Image => "image",
+            Self::Macro => "macro",
+            Self::User => "user",
+        }
+    }
+}
+
+/// The placeholders of one kind found in a Markdown body. Carries no text and no offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaceholderHit {
+    pub kind: PlaceholderKind,
+    pub count: u64,
+}
+
+/// Rejects a Markdown body that still holds `page get` placeholders (spec §7.6, PD-98): the
+/// agent should have fetched with `--format storage`. Hits are counted per kind and listed in
+/// the order link, image, macro, user; kinds without a hit are left out.
+pub fn check_markdown_placeholders(md: &str) -> Result<(), Vec<PlaceholderHit>> {
+    let found = scan(md);
+    let hits: Vec<PlaceholderHit> = [
+        PlaceholderKind::Link,
+        PlaceholderKind::Image,
+        PlaceholderKind::Macro,
+        PlaceholderKind::User,
+    ]
+    .into_iter()
+    .filter_map(|kind| {
+        let count = found.iter().filter(|h| h.kind == kind).count() as u64;
+        (count > 0).then_some(PlaceholderHit { kind, count })
+    })
+    .collect();
+    if hits.is_empty() { Ok(()) } else { Err(hits) }
+}

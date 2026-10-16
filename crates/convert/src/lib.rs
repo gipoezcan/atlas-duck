@@ -19,6 +19,7 @@ mod xml_escape;
 pub use hard_check::{Unrecorded, hard_check_wiki};
 pub use md_to_storage::markdown_to_storage;
 pub use md_to_wiki::{ContainerKind, EmittedCode, EmittedConstructs, markdown_to_wiki};
+pub use placeholders::{PlaceholderHit, PlaceholderKind, check_markdown_placeholders};
 pub use storage::{
     ConversionReport, LostCounts, StorageReject, StorageUsers, UserResolutions, check_storage_body,
     storage_constructs, storage_to_markdown, storage_user_refs,
