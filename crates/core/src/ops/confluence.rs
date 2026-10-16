@@ -1,6 +1,6 @@
 //! Confluence specifics: the `confluence.search` CQL type-filter rewrite (§7.4, part of the
-//! static validation of §5.2 step 1), `confluence.page.update` (PD-09) and, from M7, the
-//! `format` of the page reads (PD-100).
+//! static validation of §5.2 step 1), `confluence.page.update`
+//! (storage verbatim or Markdown converted, `confluence_body`) and, from M7, the `format` of the page reads (PD-100).
 
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_preview::invisible::escape_for_display;
@@ -8,7 +8,7 @@ use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_registry::OperationSpec;
 use serde_json::{Map, Value, json};
 
-use super::confluence_body::storage_text;
+use super::confluence_body::{EmptyBody, storage_text};
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
     PreviewCtx, PreviewModel, ReadPlan, generic, get_call, json_request, resolve_url, single_round,
@@ -384,7 +384,7 @@ pub fn page_update_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     // Path check and body checks first, so the validation dry call reports a bad path
     // placeholder or a refused body before enrichment (§5.4 step 1).
     resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
-    let storage = storage_text(ctx)?;
+    let storage = storage_text(ctx, EmptyBody::Allow)?;
     let verdict = ctx
         .enrichment
         .filter(|v| v.hold == Hold::Preview)

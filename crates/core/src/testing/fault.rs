@@ -7,7 +7,7 @@
 use atlas_duck_registry::Product;
 
 /// One unrecorded construct appended to converted text: the first three to Jira wiki text, the
-/// last three to Confluence storage (M7 Δ3).
+/// last four to Confluence storage (M7 Δ3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConverterFault {
     /// `{include:…}`: an unrecorded include.
@@ -22,6 +22,8 @@ pub enum ConverterFault {
     IncludeMacro,
     /// `<ac:link><ri:page …/></ac:link>`: an unrecorded link.
     AcLink,
+    /// `<img src="https://x"/>`: an unrecorded foreign element (`markup`).
+    Img,
 }
 
 impl ConverterFault {
@@ -35,6 +37,7 @@ impl ConverterFault {
             ConverterFault::RiUser => "<ri:user ri:userkey=\"injected\"/>",
             ConverterFault::IncludeMacro => "<ac:structured-macro ac:name=\"include\"/>",
             ConverterFault::AcLink => "<ac:link><ri:page ri:content-title=\"Injected\"/></ac:link>",
+            ConverterFault::Img => "<img src=\"https://x\"/>",
         }
     }
 
@@ -44,9 +47,10 @@ impl ConverterFault {
             ConverterFault::Include | ConverterFault::Mention | ConverterFault::Html => {
                 Product::Jira
             }
-            ConverterFault::RiUser | ConverterFault::IncludeMacro | ConverterFault::AcLink => {
-                Product::Confluence
-            }
+            ConverterFault::RiUser
+            | ConverterFault::IncludeMacro
+            | ConverterFault::AcLink
+            | ConverterFault::Img => Product::Confluence,
         }
     }
 

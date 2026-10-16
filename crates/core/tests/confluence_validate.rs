@@ -12,11 +12,11 @@ use atlas_duck_audit::request_set::requests_from_json;
 use atlas_duck_convert::{
     UserResolutions, markdown_to_storage, markdown_to_wiki, storage_to_markdown,
 };
-use atlas_duck_core::TestHooks;
 use atlas_duck_core::testing::{ConverterFault, Harness};
-use atlas_duck_ipc::envelope::{Envelope, Status};
+use atlas_duck_core::{DecisionError, Edits, TestHooks};
+use atlas_duck_ipc::envelope::{Envelope, ErrorCode, Status};
 use common::{TestError, TestResult, code, de, detail, exit, message, request_id, test_hits};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use wiremock::Mock;
 use wiremock::matchers::{method, path};
 
@@ -27,7 +27,8 @@ const CONTENT: &str = "/rest/api/content/65537";
 const HINT: &str = "fetch with `--format storage` and submit `body_format=storage`";
 /// The full message: the hint, then the escape guidance (T4 review m-6, lead ruling).
 const PLACEHOLDER_MESSAGE: &str = "fetch with `--format storage` and submit `body_format=storage`. \
-     To keep such text as prose, escape it: `\\@` before `@user:` and `\\[` before `[macro:`.";
+     To keep such text as prose, escape it: `\\@` before `@user:`, `\\[` before `[macro:` and \
+     before the `[` of a `confluence:` link or image, `\\<` before a `confluence:` autolink.";
 
 fn wiki(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("wiki").ok_or_else(|| "no confluence mock".into())
@@ -229,14 +230,17 @@ async fn u25_markdown_placeholders_rejected_exit2_counts() -> TestResult {
         "{released}"
     );
     assert_eq!(hits(mock).await, before, "no wiremock hit");
-    // Escaped look-alikes are prose and pass.
-    let env = h
-        .submit(
-            UPDATE,
-            update("\\@user:abc and \\[macro: toc {}] in text", None),
-        )
-        .await;
-    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    // Escaped look-alikes are prose and pass: `\@`, `\[` (also before a link) and `\<`; an image
+    // needs `!\[`.
+    for md in [
+        "\\@user:abc and \\[macro: toc {}] in text",
+        "\\[a](confluence:x)",
+        "!\\[a](confluence:attachment/x)",
+        "\\<confluence:x>",
+    ] {
+        let env = h.submit(UPDATE, update(md, None)).await;
+        assert_eq!(env.status, Status::Pending, "{md}: {}", env.to_json_line());
+    }
     Ok(())
 }
 
@@ -268,6 +272,7 @@ async fn u24_storage_injected_fault_fails_validation_exit2() -> TestResult {
         (ConverterFault::RiUser, "mention"),
         (ConverterFault::IncludeMacro, "include"),
         (ConverterFault::AcLink, "link"),
+        (ConverterFault::Img, "markup"),
     ] {
         let h = faulty(fault).await?;
         let mock = wiki(&h)?;
@@ -278,6 +283,9 @@ async fn u24_storage_injected_fault_fails_validation_exit2() -> TestResult {
         assert_eq!(detail(&env, "param"), json!("body"), "{construct}");
         assert_eq!(detail(&env, "construct"), json!(construct));
         assert_eq!(detail(&env, "count"), json!(1));
+        // A well-formed output with one foreign element is a converter fault (`construct:
+        // markup`), not a nesting error: no `storage` reason.
+        assert_eq!(detail(&env, "storage"), Value::Null, "{construct}");
         assert_eq!(
             message(&env),
             format!("markdown conversion produced an unrecorded {construct}")
@@ -321,6 +329,7 @@ async fn jira_fault_on_confluence_body_is_inert() -> TestResult {
         ConverterFault::RiUser,
         ConverterFault::IncludeMacro,
         ConverterFault::AcLink,
+        ConverterFault::Img,
     ] {
         let h = Harness::builder()
             .jira("jira-main")
@@ -435,7 +444,7 @@ async fn storage_body_unparsable_rejected_exit2() -> TestResult {
     .await
 }
 
-/// T6 review: Markdown that nests deeper than the storage parser's 64 levels makes the hard check
+/// T6 review: Markdown that nests deeper than the storage parser's 64 elements makes the hard check
 /// fail closed (`Markup`); validation names the nesting, not a converter fault.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn markdown_nesting_too_deep_rejected_exit2() -> TestResult {
@@ -450,9 +459,15 @@ async fn markdown_nesting_too_deep_rejected_exit2() -> TestResult {
         assert_eq!(detail(&env, "param"), json!("body"));
         assert_eq!(detail(&env, "storage"), json!("too_deep"));
         assert_eq!(detail(&env, "construct"), Value::Null);
+        let limit = atlas_duck_convert::storage::MAX_DEPTH;
+        assert_eq!(limit, 64);
         assert_eq!(
             message(&env),
-            "the Markdown nests deeper than Confluence storage allows (64 levels)"
+            format!(
+                "the Markdown nests too deeply: its storage would nest more than {limit} \
+                 elements deep, atlas-duck's parser limit (a nested list level takes two \
+                 elements, so about half as many levels)"
+            )
         );
         assert!(!env.to_json_line().contains("secret"));
     }
@@ -462,5 +477,56 @@ async fn markdown_nesting_too_deep_rejected_exit2() -> TestResult {
         .submit(UPDATE, update(&format!("{} ok\n", ">".repeat(20)), None))
         .await;
     assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    Ok(())
+}
+
+/// T9 review m-5: an approver edit goes through the same checks. A placeholder in the edited
+/// Markdown, or a DOCTYPE in the edited storage, is `EditRejected` with the validation error;
+/// nothing is logged as an edit and the queued request is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn approver_edit_of_the_body_is_checked() -> TestResult {
+    let h = Harness::confluence().await?;
+    page_server(wiki(&h)?).await;
+    let env = h.submit(UPDATE, update("plain text", None)).await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    h.queued(&id, 10_000).await.ok_or("never queued")?;
+    h.approver().open(&id).map_err(de)?;
+    let rev = h.approver().rev(&id).map_err(de)?;
+
+    let edit = |set: &[(&str, &str)]| {
+        let mut m = Map::new();
+        for (k, v) in set {
+            m.insert((*k).to_owned(), json!(v));
+        }
+        Edits {
+            set: m,
+            remove: Vec::new(),
+        }
+    };
+    let cases = [
+        (
+            vec![("body", "[macro: toc {}]")],
+            ErrorCode::MarkdownPlaceholders,
+        ),
+        (
+            vec![("body_format", "storage"), ("body", "<!DOCTYPE x><p>a</p>")],
+            ErrorCode::Validation,
+        ),
+    ];
+    for (set, want) in cases {
+        let res = h.approver().edit(&id, edit(&set));
+        let Err(DecisionError::EditRejected(e)) = res else {
+            return Err(format!("{set:?}: {res:?}").into());
+        };
+        assert_eq!(e.code, want, "{set:?}");
+    }
+    let types = h.event_types(&id).await?;
+    assert!(!types.contains(&EventType::WRITE_EDITED), "{types:?}");
+    assert_eq!(
+        h.approver().rev(&id).map_err(de)?.counter,
+        rev.counter,
+        "request untouched"
+    );
     Ok(())
 }
