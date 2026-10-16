@@ -38,8 +38,8 @@ enum Tok {
     /// A quoted string (`'…'`, `"…"`).
     Str,
     Comma,
-    /// An operator character (`=`, `!`, `~`, `<`, `>`).
-    Op,
+    /// An operator character (`=`, `!`, `~`, `<`, `>`), with its byte.
+    Op(u8),
 }
 
 /// Fixed rejection texts: an error never echoes the CQL (§7.4 "rejected locally").
@@ -96,7 +96,7 @@ fn tokenize(cql: &str) -> Result<Vec<(Tok, u32)>, ValidationError> {
                 i += 1;
             }
             b'=' | b'!' | b'~' | b'<' | b'>' => {
-                out.push((Tok::Op, depth));
+                out.push((Tok::Op(b), depth));
                 i += 1;
             }
             _ => {
@@ -208,15 +208,16 @@ fn is_sort_clause<'q>(tokens: &[(Tok, u32)], word: impl Fn(&Tok) -> Option<&'q s
     want != Want::Key
 }
 
-/// PD-102 (provisional, lead ruling Q11): the fields that narrow a search when the agent's CQL
-/// names one as a word directly before an operator. `space.key` and `space.title` name the space
-/// as `space` does.
-pub const CQL_NARROWING_FIELDS: [&str; 11] = [
+/// PD-102 (provisional, lead ruling Q11): the fields that narrow a search when a clause names one
+/// as `<field> = …` or `<field> IN (…)`. `space.key` and `space.title` name the space as `space`
+/// does; `container` is the content whose attachments and comments are searched.
+pub const CQL_NARROWING_FIELDS: [&str; 12] = [
     "space",
     "space.key",
     "space.title",
     "ancestor",
     "parent",
+    "container",
     "id",
     "content",
     "title",
@@ -226,34 +227,69 @@ pub const CQL_NARROWING_FIELDS: [&str; 11] = [
 ];
 
 /// §6.2 Info `cql_broad` "CQL may enumerate many results" (PD-102): the one place of the rule.
-/// True when the agent's CQL (before the rewrite) names none of [`CQL_NARROWING_FIELDS`]
-/// (ASCII case-insensitive, tokens of the rewrite's tokenizer, so quoted text never counts) as a
-/// word directly before an operator: `=`, `!=`, `~`, `!~`, `<`, `>`, `<=`, `>=` (operator
-/// characters), `IN` or `NOT IN`. It does no boolean analysis: `space = A OR text ~ x`, `NOT space = A` and
-/// `space != A` name a field and are not flagged. A CQL the tokenizer refuses (rejected at
-/// validation) is not flagged.
+/// True unless the agent's CQL (before the rewrite) narrows: every `OR` alternative of its outer
+/// level holds an operand that is a clause `<field> = …` or `<field> IN (…)` with a field of
+/// [`CQL_NARROWING_FIELDS`] (ASCII case-insensitive), or a parenthesized group that itself narrows.
+/// An operand directly after `NOT` never narrows, nor do `!=`, `~`, `!~`, `<`, `>`, `<=`, `>=` and
+/// `NOT IN`. Values are not analysed; tokens are those of the rewrite's tokenizer, so quoted text
+/// never counts. A CQL the tokenizer refuses (rejected at validation) is not flagged.
 pub fn cql_broad(cql: &str) -> bool {
     let Ok(tokens) = tokenize(cql) else {
         return false;
     };
-    let word = |i: usize| match tokens.get(i) {
-        Some(&(Tok::Word { start, end }, _)) => Some(&cql[start..end]),
-        _ => None,
-    };
-    let is = |i: usize, w: &str| word(i).is_some_and(|s| s.eq_ignore_ascii_case(w));
-    let operator_at = |i: usize| {
-        matches!(tokens.get(i), Some((Tok::Op, _)))
-            || is(i, "in")
-            || (is(i, "not") && is(i + 1, "in"))
-    };
-    let narrowing = |i: usize| {
-        word(i).is_some_and(|w| {
-            CQL_NARROWING_FIELDS
-                .iter()
-                .any(|f| w.eq_ignore_ascii_case(f))
-        }) && operator_at(i + 1)
-    };
-    !(0..tokens.len()).any(narrowing)
+    !narrows(cql, &tokens, 0)
+}
+
+fn word_is(cql: &str, tok: &Tok, w: &str) -> bool {
+    matches!(*tok, Tok::Word { start, end } if cql[start..end].eq_ignore_ascii_case(w))
+}
+
+/// PD-102: every `OR` alternative of one parenthesis level (`depth`) narrows.
+fn narrows(cql: &str, toks: &[(Tok, u32)], depth: u32) -> bool {
+    toks.split(|(t, d)| *d == depth && word_is(cql, t, "or"))
+        .all(|alt| alternative_narrows(cql, alt, depth))
+}
+
+/// One operand of `alt` at `depth`, not after `NOT`, is a narrowing clause or a narrowing group.
+fn alternative_narrows(cql: &str, alt: &[(Tok, u32)], depth: u32) -> bool {
+    let mut i = 0;
+    while i < alt.len() {
+        let prev = i.checked_sub(1).map(|p| &alt[p].0);
+        let negated = prev.is_some_and(|p| word_is(cql, p, "not"));
+        match alt[i] {
+            (Tok::Open, d)
+                if d == depth
+                    && prev.is_none_or(|p| word_is(cql, p, "and") || word_is(cql, p, "not")) =>
+            {
+                // A group (an `IN (…)` list or a function call `now(…)` has another word before it).
+                let close = alt[i + 1..]
+                    .iter()
+                    .position(|&(t, d)| d == depth && t == Tok::Close)
+                    .map_or(alt.len(), |p| i + 1 + p);
+                if !negated && narrows(cql, &alt[i + 1..close.min(alt.len())], depth + 1) {
+                    return true;
+                }
+                i = close + 1;
+                continue;
+            }
+            (Tok::Word { start, end }, d)
+                if d == depth
+                    && !negated
+                    && CQL_NARROWING_FIELDS
+                        .iter()
+                        .any(|f| cql[start..end].eq_ignore_ascii_case(f)) =>
+            {
+                match alt.get(i + 1) {
+                    Some((Tok::Op(b'='), _)) => return true,
+                    Some((t, _)) if word_is(cql, t, "in") => return true,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// PD-101 (lead ruling Q7; §7.4 "releases `totalSize` and per result `content.id`,
@@ -309,14 +345,16 @@ pub fn search_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
 }
 
 /// §6.3 "Confluence search": the result table ([`search_table`]) under the effective CQL as sent,
-/// and the Info `cql_broad` ([`cql_broad`], PD-102). An answer that is no result list (an
+/// and the Info `cql_broad` ([`cql_broad`], PD-102; not on a Fallback card). An answer that is no result list (an
 /// upstream error) keeps the Fallback.
 pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
-    let mut model = search_table(ctx).unwrap_or_else(|| generic::fallback_preview(ctx));
+    let table = search_table(ctx);
     let cql = str_param(ctx.params, "cql");
+    let broad = table.is_some() && cql_broad(cql);
+    let mut model = table.unwrap_or_else(|| generic::fallback_preview(ctx));
     model.query = effective_cql(cql).ok().map(|q| escape_for_display(&q));
     model.header.query = model.query.clone();
-    if cql_broad(cql) {
+    if broad {
         model
             .warnings
             .push(Warning::new(WarningId::CqlBroad, warning::TEXT_CQL_BROAD));

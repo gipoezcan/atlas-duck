@@ -25,16 +25,15 @@ use atlas_duck_core::engine::cache::RebuildError;
 use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
 use atlas_duck_core::engine::queue::{Limits, MIB};
 use atlas_duck_core::engine::read::normalize;
-use atlas_duck_core::payloads::body_json;
 use atlas_duck_core::testing::Harness;
 use atlas_duck_core::{Confirm, Pause, TestHooks};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_preview::{OutcomeKind, PreviewBody};
 use common::confluence::{
-    PAGE_EXPAND_STORAGE, PAGE_EXPAND_VIEW, amplified_storage, content_path, mount_history_summary,
-    mount_history_version, mount_page, mount_page_delayed, mount_page_view, mount_search,
-    mount_user_answer, mount_users, mount_users_delayed, page_with_storage, page_with_view,
-    search_gets, user, user_gets,
+    PAGE_EXPAND_STORAGE, PAGE_EXPAND_VIEW, amplified_storage, content_path, fetched_payload,
+    mount_history_summary, mount_history_version, mount_page, mount_page_delayed, mount_page_view,
+    mount_search, mount_user_answer, mount_users, mount_users_delayed, page_with_storage,
+    page_with_view, search_gets, user, user_gets,
 };
 use common::jira::{gets_on, query};
 use common::{TestError, TestResult, code, de, request_id, test_hits};
@@ -375,23 +374,6 @@ async fn markdown_without_storage_body_releases_raw() -> TestResult {
 }
 
 // ---- Task 10 fix round ---------------------------------------------------------------------------
-
-/// The `READ_FETCHED` payload `payloads::read_fetched` writes for one 2xx answer, with `users`
-/// as its `user_resolutions`.
-fn fetched_payload(content: &Value, users: Option<Value>) -> Value {
-    let mut payload = json!({
-        "pages": 1,
-        "responses": [{
-            "status": 200,
-            "content_type": "application/json",
-            "body": body_json(content.to_string().as_bytes()),
-        }],
-    });
-    if let Some(users) = users {
-        payload["user_resolutions"] = users;
-    }
-    payload
-}
 
 /// T10 review I-1: the normalization converts with the payload's committed map and nothing else,
 /// and a Markdown record without a usable map is malformed (fail closed).
@@ -1606,7 +1588,11 @@ async fn u28_confluence_search_mask_reaches_url() -> TestResult {
     let mut second = search_hit("65538", "Falcon M&#252;ller Plan (draft)", "Legal", "page");
     second["url"] = json!("/display/LEGAL/Draft");
     second["excerpt"] = json!("");
-    mount_search(mock, &search_answer(vec![hit, second], 2)).await;
+    let mut answer = search_answer(vec![hit, second], 2);
+    // DC echoes the effective CQL, percent-encoded, in `_links.next`: a URL field too.
+    answer["_links"]["next"] =
+        json!("/rest/api/search?cql=title%20~%20%22Falcon%20M%C3%BCller%20Plan%22&start=2");
+    mount_search(mock, &answer).await;
     let params = json!({ "cql": "space = LEGAL", "excerpt": "indexed" });
     let mask = || RedactionOp::MaskText {
         text: title.into(),
@@ -1614,6 +1600,7 @@ async fn u28_confluence_search_mask_reaches_url() -> TestResult {
         at: None,
     };
     let paths = [
+        "_links.next",
         "results[0].excerpt",
         "results[0].resultGlobalContainer.title",
         "results[0].title",
@@ -1630,9 +1617,15 @@ async fn u28_confluence_search_mask_reaches_url() -> TestResult {
     listed.sort();
     listed.dedup();
     assert_eq!(listed, paths);
-    assert!(report.blocked.contains(&BlockReason::MaskStillOccurs {
-        path: "results[0].url".into()
-    }));
+    for url_path in ["results[0].url", "_links.next"] {
+        assert!(
+            report.blocked.contains(&BlockReason::MaskStillOccurs {
+                path: url_path.into()
+            }),
+            "{url_path}: {:?}",
+            report.blocked
+        );
+    }
     assert!(
         ap.redact(&id, vec![mask()]).is_err(),
         "release stays blocked"
@@ -1655,6 +1648,7 @@ async fn u28_confluence_search_mask_reaches_url() -> TestResult {
     let result = result_of(&env)?;
     assert_eq!(result["results"][0]["url"], "[REDACTED]");
     assert_eq!(result["results"][1]["url"], "/display/LEGAL/Draft");
+    assert_eq!(result["_links"]["next"], "[REDACTED]");
     for s in strings_of(&result) {
         assert!(!canonical_hit(&s, title), "still in {s:?}");
     }
@@ -1671,10 +1665,16 @@ async fn u28_confluence_search_mask_reaches_url() -> TestResult {
     let env = released(&h, &id).await?;
     let result = result_of(&env)?;
     assert!(result["results"][0].get("url").is_none(), "{result}");
-    assert_eq!(
-        meta_of(&env)?["redactions"]["fields_dropped"],
-        json!(["url"])
-    );
+    assert!(result["_links"].get("next").is_none(), "{result}");
+    let dropped = meta_of(&env)?["redactions"]["fields_dropped"].clone();
+    let dropped: Vec<&str> = dropped
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    // `fields_dropped` names the leaf key (`_links.next` is `next`).
+    for path in ["url", "next"] {
+        assert!(dropped.contains(&path), "{path} not in {dropped:?}");
+    }
     for s in strings_of(&result) {
         assert!(!canonical_hit(&s, title), "still in {s:?}");
     }
@@ -1805,9 +1805,9 @@ async fn search_results_pruned_to_spec_fields() -> TestResult {
     Ok(())
 }
 
-/// PD-102 (provisional, lead ruling Q11): the Info `cql_broad` is raised when the agent's CQL
-/// names no narrowing field directly before an operator. The table pins what the one-place rule
-/// flags and what it misses (Task 12a report).
+/// PD-102 (provisional, lead ruling Q11): the Info `cql_broad` is raised unless the agent's CQL
+/// narrows (every `OR` alternative holds a `=`/`IN` clause on a narrowing field or a narrowing
+/// group; `NOT`, `!=`, `~` and comparisons never narrow). The tables pin the one-place rule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cql_broad_info_rule() -> TestResult {
     use atlas_duck_core::ops::confluence::cql_broad;
@@ -1822,6 +1822,7 @@ async fn cql_broad_info_rule() -> TestResult {
     for (cql, broad) in [
         ("text ~ \"x\"", true),
         ("space = DOC AND text ~ \"x\"", false),
+        ("space = DOC OR text ~ \"x\"", true),
     ] {
         let id = queued(&h, SEARCH, json!({ "cql": cql })).await?;
         let preview = h.approver().open(&id).map_err(de)?.preview;
@@ -1840,41 +1841,68 @@ async fn cql_broad_info_rule() -> TestResult {
             assert!(found.is_empty(), "{cql}");
         }
     }
-    // Flagged (broad): no narrowing field before an operator.
+    // Broad: the query does not narrow (an OR alternative, a negation, a comparison, a fuzzy match).
     for cql in [
         "text ~ \"x\"",
+        "siteSearch ~ \"release\"",
         "type = page",
         "type = page ORDER BY lastmodified desc",
         "lastmodified > now(\"-1d\")",
         "created >= \"2026-01-01\"",
-        "siteSearch ~ \"release\"",
+        "macro = jira",
         "mention = currentUser()",
+        "space.type = personal",
         "text ~ \"space = DOC\"",
         "\"space\" = DOC",
         "TEXT ~ x ORDER BY title",
-        "macro = jira",
+        "type in (page, space)",
+        "space = DOC OR text ~ \"x\"",
+        "text ~ \"x\" or space = DOC",
+        "(space = DOC OR text ~ \"x\") AND type = page",
+        "text ~ \"x\" OR space = DOC AND label = y",
+        "creator = currentUser() OR text ~ \"x\"",
+        "NOT space = DOC",
+        "type = page AND NOT space = DOC",
+        "NOT (space = DOC AND label = x)",
+        "label not in (draft)",
+        "space != DOC",
+        "label != x",
+        "creator != jdoe",
+        "id > 0",
+        "id >= 1",
+        "ancestor != 1",
+        "title ~ \"Release\"",
+        "space.title ~ \"Docs\"",
     ] {
         assert!(cql_broad(cql), "should flag: {cql}");
     }
-    // Not flagged: a narrowing field directly before an operator, any case, `IN`/`NOT IN` too.
+    // Narrowing: every OR alternative holds <field> = … or <field> IN (…) of a narrowing field.
     for cql in [
         "space = DOC AND text ~ \"x\"",
         "SPACE=DOC",
         "space in (DOC, OPS)",
-        "label not in (draft)",
+        "space IN (DOC) AND text ~ x",
+        "space.key = DOC",
+        "space.title = \"Docs\"",
         "ancestor = 65537",
         "parent = 65537",
+        "container = 65537",
         "id = 65537",
+        "id in (1, 2)",
         "content = 65537",
-        "title ~ \"Release\"",
+        "title = \"Release notes\"",
+        "label = draft",
         "creator = currentUser()",
         "contributor = jdoe",
-        "space.key = DOC",
-        "space.title ~ \"Docs\"",
-        // Misses (documented): the rule does no boolean analysis.
-        "space = DOC OR text ~ \"x\"",
-        "NOT space = DOC",
-        "space != DOC",
+        "space = DOC OR space = OPS",
+        "space = DOC OR (label = x AND text ~ \"y\")",
+        "(space = DOC OR label = x) AND text ~ \"y\"",
+        "text ~ \"x\" AND (space = DOC OR ancestor = 1)",
+        "((space = DOC))",
+        "text ~ \"x\" AND space = DOC OR label = y",
+        "space = DOC AND NOT label = draft",
+        "lastmodified > now(\"-1d\") AND space = DOC",
+        "space = DOC OR label = y ORDER BY title",
     ] {
         assert!(!cql_broad(cql), "should not flag: {cql}");
     }
@@ -1965,7 +1993,7 @@ async fn search_table_columns_and_count() -> TestResult {
             r#"{"statusCode":400,"message":"bad"}"#,
         )
         .await;
-    let env = h.submit(SEARCH, json!({ "cql": "space = DOC" })).await;
+    let env = h.submit(SEARCH, json!({ "cql": "text ~ \"x\"" })).await;
     let id = request_id(&env)?;
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     let preview = h.approver().open(&id).map_err(de)?.preview;
@@ -1973,6 +2001,15 @@ async fn search_table_columns_and_count() -> TestResult {
         !matches!(preview.body, PreviewBody::Table { .. }),
         "{:?}",
         preview.body
+    );
+    // No result list: the query's breadth is not what is released, so no `cql_broad`.
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .all(|w| w.id != atlas_duck_preview::warning::WarningId::CqlBroad),
+        "{:?}",
+        preview.warnings
     );
     Ok(())
 }

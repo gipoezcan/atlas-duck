@@ -1795,13 +1795,35 @@ fn fixtures_match_registry_schemas() -> TestResult {
         ),
         ("confluence.page.get", fixtures::CONFLUENCE_PAGE),
         ("confluence.page.history", fixtures::CONFLUENCE_PAGE),
-        ("confluence.search", fixtures::CONFLUENCE_SEARCH_PAGE),
         ("confluence.page.update", fixtures::CONFLUENCE_PAGE_UPDATED),
     ];
+    // PD-101: a search is released pruned, so its schema (strict) is checked on the normalized
+    // fixture, not on the raw answer.
+    let search = {
+        let raw: Value = serde_json::from_str(fixtures::CONFLUENCE_SEARCH_PAGE)?;
+        // The READ_FETCHED payload of one 2xx answer (as `common::confluence::fetched_payload`;
+        // this suite does not link `common`, which needs the `testing` feature).
+        let payload = json!({
+            "pages": 1,
+            "responses": [{
+                "status": 200,
+                "content_type": "application/json",
+                "body": atlas_duck_core::payloads::body_json(raw.to_string().as_bytes()),
+            }],
+        });
+        let released = atlas_duck_core::engine::read::normalize(
+            op("confluence.search")?,
+            &json!({ "cql": "space = DOC" }),
+            &payload,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        released.to_string()
+    };
     let cases = owned
         .iter()
         .map(|(id, body)| (*id, body.as_str()))
-        .chain(fixed);
+        .chain(fixed)
+        .chain([("confluence.search", search.as_str())]);
     for (id, body) in cases {
         let spec = op(id)?;
         let mut value: Value = serde_json::from_str(body)?;

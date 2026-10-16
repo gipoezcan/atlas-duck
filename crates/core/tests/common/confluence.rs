@@ -312,3 +312,20 @@ pub async fn mount_for_op(
         .await;
     Ok(aux)
 }
+
+/// The `READ_FETCHED` payload `payloads::read_fetched` writes for one 2xx answer, with `users`
+/// as its `user_resolutions`.
+pub fn fetched_payload(content: &Value, users: Option<Value>) -> Value {
+    let mut payload = json!({
+        "pages": 1,
+        "responses": [{
+            "status": 200,
+            "content_type": "application/json",
+            "body": atlas_duck_core::payloads::body_json(content.to_string().as_bytes()),
+        }],
+    });
+    if let Some(users) = users {
+        payload["user_resolutions"] = users;
+    }
+    payload
+}
