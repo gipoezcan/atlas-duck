@@ -11,14 +11,19 @@
 use super::{Artifact, InstallError, Kind, PlatformOps, Report, registry_error};
 
 /// `Some(dir)` of a Windows layout, as the PATH entry text: no trailing separator, and nothing a
-/// PATH list cannot carry (`;`, `"`, control characters), no empty path.
+/// PATH list cannot carry (`;`, `"`, control characters, `%`: the `REG_EXPAND_SZ` value expands
+/// it, like the Linux side refuses it), no empty path.
 fn entry(kind: &Kind) -> Result<String, InstallError> {
     let Kind::Windows { install_dir } = kind else {
         return Err(InstallError::Unsupported);
     };
     let text = install_dir.to_str().ok_or(InstallError::UnsafePath)?;
     let text = text.trim_end_matches(['\\', '/']);
-    if text.is_empty() || text.chars().any(|c| c.is_control() || c == ';' || c == '"') {
+    if text.is_empty()
+        || text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, ';' | '"' | '%'))
+    {
         return Err(InstallError::UnsafePath);
     }
     // `C:` alone is the current directory of drive C: a drive root keeps its separator.

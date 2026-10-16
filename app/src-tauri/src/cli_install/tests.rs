@@ -250,6 +250,21 @@ fn each_platform_resolves_to_its_own_artifacts() {
             ..inputs(Platform::Windows)
         };
         assert_eq!(Layout::resolve(&bad), Err(InstallError::UnsafePath));
+        // `%` would be expanded by the `REG_EXPAND_SZ` PATH value (M-11).
+        for exe in [
+            r"C:\Users\%USERNAME%\atlas-duck\atlas-duck-app.exe",
+            r"C:\a%b\atlas-duck-app.exe",
+        ] {
+            let bad = Inputs {
+                current_exe: PathBuf::from(exe),
+                ..inputs(Platform::Windows)
+            };
+            assert_eq!(
+                Layout::resolve(&bad),
+                Err(InstallError::UnsafePath),
+                "{exe}"
+            );
+        }
     }
     // An AppImage path the script cannot carry is refused at resolve time too.
     assert_eq!(
