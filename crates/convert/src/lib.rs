@@ -22,7 +22,7 @@ pub use md_to_wiki::{ContainerKind, EmittedCode, EmittedConstructs, markdown_to_
 pub use placeholders::{PlaceholderHit, PlaceholderKind, check_markdown_placeholders};
 pub use storage::{
     ConversionReport, LostCounts, StorageReject, StorageUsers, UserResolutions, check_storage_body,
-    storage_constructs, storage_to_markdown, storage_user_refs,
+    hard_check_storage, storage_constructs, storage_to_markdown, storage_user_refs,
 };
 pub use wiki::{CodeKind, ConstructKind, WikiConstructs, wiki_constructs};
 pub use wiki_html::wiki_to_preview_html;

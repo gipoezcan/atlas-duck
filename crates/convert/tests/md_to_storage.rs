@@ -9,12 +9,15 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
-use atlas_duck_convert::storage::{self, Element, Node, Ns, construct_spans};
+use atlas_duck_convert::storage::{self, Node, construct_spans};
 use atlas_duck_convert::{
     ConstructKind, ContainerKind, EmittedConstructs, StorageReject, UserResolutions,
     check_storage_body, markdown_to_storage, storage_constructs, storage_to_markdown,
 };
-use common::markdown;
+use common::{
+    CODE_MACRO_CLOSE as MACRO_CLOSE, CODE_MACRO_OPEN as MACRO_OPEN,
+    check_storage_output as check_output, markdown, only_converter_markup,
+};
 use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -22,35 +25,6 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const GOLDEN: [&str; 9] = [
     "basics", "lists", "tables", "code", "links", "html", "specials", "nested", "tasks",
 ];
-
-/// The HTML elements PD-96 lets the converter write (the parser's `CONVERTER_HTML`).
-const HTML: [&str; 22] = [
-    "p",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "em",
-    "strong",
-    "s",
-    "ul",
-    "ol",
-    "li",
-    "table",
-    "tbody",
-    "tr",
-    "th",
-    "td",
-    "blockquote",
-    "hr",
-    "br",
-    "code",
-];
-
-const MACRO_OPEN: &str = "<ac:structured-macro ac:name=\"code\">";
-const MACRO_CLOSE: &str = "</ac:structured-macro>";
 
 fn golden_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/md_to_storage")
@@ -85,93 +59,6 @@ fn diff(expected: &str, actual: &str) -> String {
         }
     }
     out
-}
-
-/// Every element of `nodes` is one the converter writes, with only the attributes it writes:
-/// HTML from [`HTML`] without attributes, `<a>` with exactly an `href`, and the code macro's
-/// own three `ac:` elements in their places. No `ri:` and no foreign element.
-fn only_converter_markup(nodes: &[Node], parent: Option<&Element>) -> Result<(), String> {
-    for n in nodes {
-        let Node::Element(e) = n else {
-            continue;
-        };
-        let attrs: Vec<(&str, &str)> = e
-            .attrs
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let parent_local = parent.map(|p| (p.ns, p.local.as_str()));
-        let ok = match (e.ns, e.local.as_str()) {
-            (Ns::Html, "a") => matches!(attrs.as_slice(), [("href", _)]),
-            (Ns::Html, local) => HTML.contains(&local) && attrs.is_empty(),
-            (Ns::Ac, "structured-macro") => attrs == [("ac:name", "code")],
-            (Ns::Ac, "parameter") => {
-                parent_local == Some((Ns::Ac, "structured-macro"))
-                    && attrs == [("ac:name", "language")]
-            }
-            (Ns::Ac, "plain-text-body") => {
-                parent_local == Some((Ns::Ac, "structured-macro")) && attrs.is_empty()
-            }
-            _ => false,
-        };
-        if !ok {
-            return Err(format!(
-                "element {} {attrs:?} is not converter markup",
-                e.qname()
-            ));
-        }
-        only_converter_markup(&e.children, Some(e))?;
-    }
-    Ok(())
-}
-
-/// The checks every conversion must pass: no trailing newline, `check_storage_body` is `Ok`,
-/// only converter markup, the construct spans are exactly the recorded code macros (each a
-/// `Macro` span), and each record slices one whole code macro.
-fn check_output(out: &str, e: &EmittedConstructs) -> Result<(), String> {
-    if out.ends_with('\n') {
-        return Err(format!("output ends with a newline: {out:?}"));
-    }
-    check_storage_body(out).map_err(|r| format!("check_storage_body: {r:?} for {out:?}"))?;
-    let doc = storage::parse(out);
-    if !doc.xml_ok {
-        return Err(format!("not xml_ok: {out:?}"));
-    }
-    only_converter_markup(&doc.nodes, None).map_err(|m| format!("{m} in {out:?}"))?;
-    let mut spans = Vec::new();
-    for (kind, r) in construct_spans(&doc) {
-        if kind != ConstructKind::Macro {
-            return Err(format!("unrecorded {kind:?} at {r:?} in {out:?}"));
-        }
-        spans.push(r);
-    }
-    let recorded: Vec<_> = e.code_blocks.iter().map(|c| c.byte_range.clone()).collect();
-    if spans != recorded {
-        return Err(format!(
-            "spans {spans:?} != recorded {recorded:?} in {out:?}"
-        ));
-    }
-    for c in &e.code_blocks {
-        if c.kind != ContainerKind::CodeMacro {
-            return Err(format!("record kind {:?}", c.kind));
-        }
-        let slice = out
-            .get(c.byte_range.clone())
-            .ok_or_else(|| format!("range {:?} not on char boundaries", c.byte_range))?;
-        if !(slice.starts_with(MACRO_OPEN) && slice.ends_with(MACRO_CLOSE)) {
-            return Err(format!("record slices {slice:?}"));
-        }
-    }
-    let inv = storage_constructs(out);
-    if !(inv.mentions.is_empty()
-        && inv.includes.is_empty()
-        && inv.images.is_empty()
-        && inv.attachments.is_empty()
-        && inv.macros.iter().all(|m| m == "code"))
-    {
-        return Err(format!("unexpected constructs {inv:?} in {out:?}"));
-    }
-    Ok(())
 }
 
 fn convert_checked(md: &str) -> Result<(String, EmittedConstructs), String> {
@@ -236,7 +123,7 @@ fn golden_outputs_use_only_converter_markup() -> TestResult {
         let (out, e) = markdown_to_storage(&md);
         let doc = storage::parse(&out);
         assert!(doc.xml_ok, "{name}");
-        only_converter_markup(&doc.nodes, None).map_err(|m| format!("{name}: {m}"))?;
+        only_converter_markup(&doc.nodes).map_err(|m| format!("{name}: {m}"))?;
         let spans = construct_spans(&doc);
         assert_eq!(spans.len(), e.code_blocks.len(), "{name}: {spans:?}");
         for ((kind, r), c) in spans.iter().zip(&e.code_blocks) {

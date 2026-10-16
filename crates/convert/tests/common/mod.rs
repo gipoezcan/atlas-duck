@@ -1,14 +1,180 @@
 //! Shared by the `md_to_wiki` and `hard_check` tests (and the wiki renderer's properties):
-//! the Markdown fuzz strategy and the strict span/record agreement check.
+//! the Markdown fuzz strategy and the strict span/record agreement check; and by the storage
+//! tests: the storage fuzz strategies and the strict check of Markdown → storage output.
 //!
 //! Each integration test binary compiles this module on its own and uses only part of it.
 #![allow(dead_code)]
 
 use std::ops::Range;
 
+use atlas_duck_convert::storage::{self, Element, Node, Ns};
 use atlas_duck_convert::wiki::{self, construct_spans};
-use atlas_duck_convert::{ConstructKind, ContainerKind, EmittedConstructs, wiki_constructs};
+use atlas_duck_convert::{
+    ConstructKind, ContainerKind, EmittedConstructs, check_storage_body, storage_constructs,
+    wiki_constructs,
+};
 use proptest::prelude::*;
+
+/// The HTML elements PD-96 lets the storage converter write (the parser's `CONVERTER_HTML`).
+pub const STORAGE_HTML: [&str; 22] = [
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "em",
+    "strong",
+    "s",
+    "ul",
+    "ol",
+    "li",
+    "table",
+    "tbody",
+    "tr",
+    "th",
+    "td",
+    "blockquote",
+    "hr",
+    "br",
+    "code",
+];
+
+pub const CODE_MACRO_OPEN: &str = "<ac:structured-macro ac:name=\"code\">";
+pub const CODE_MACRO_CLOSE: &str = "</ac:structured-macro>";
+
+/// The code-macro language pattern `[A-Za-z0-9+#-]{1,32}` (PD-95, PD-96).
+fn code_language(s: &str) -> bool {
+    (1..=32).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'#' | b'-'))
+}
+
+/// Every element of `nodes` is one the storage converter writes, with only the attributes it
+/// writes: HTML from [`STORAGE_HTML`] without attributes, `<a>` with exactly an `href`, and code
+/// macros of exactly the converter's shape (`ac:name="code"`, an optional first
+/// `ac:parameter ac:name="language"` holding one text matching the language pattern, then one
+/// `ac:plain-text-body` holding only CDATA sections; nothing else, no nesting). No `ri:` and no
+/// foreign element.
+pub fn only_converter_markup(nodes: &[Node]) -> Result<(), String> {
+    for n in nodes {
+        let Node::Element(e) = n else {
+            continue;
+        };
+        let attrs: Vec<(&str, &str)> = e
+            .attrs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        match (e.ns, e.local.as_str()) {
+            (Ns::Ac, "structured-macro") => {
+                code_macro_shape(e)?;
+                continue;
+            }
+            (Ns::Html, "a") if matches!(attrs.as_slice(), [("href", _)]) => {}
+            (Ns::Html, local) if STORAGE_HTML.contains(&local) && attrs.is_empty() => {}
+            _ => {
+                return Err(format!(
+                    "element {} {attrs:?} is not converter markup",
+                    e.qname()
+                ));
+            }
+        }
+        only_converter_markup(&e.children)?;
+    }
+    Ok(())
+}
+
+fn code_macro_shape(m: &Element) -> Result<(), String> {
+    let bad = || format!("code macro {m:?} is not the converter's shape");
+    let name_only = |e: &Element, v: &str| matches!(e.attrs.as_slice(), [(k, val)] if k == "ac:name" && val == v);
+    if !name_only(m, "code") {
+        return Err(bad());
+    }
+    let parts: Vec<&Element> = m
+        .children
+        .iter()
+        .map(|n| match n {
+            Node::Element(e) => Some(e),
+            _ => None,
+        })
+        .collect::<Option<_>>()
+        .ok_or_else(bad)?;
+    let body = match parts.as_slice() {
+        [body] => body,
+        [param, body] => {
+            let lang_ok = param.ns == Ns::Ac
+                && param.local == "parameter"
+                && name_only(param, "language")
+                && matches!(param.children.as_slice(), [Node::Text(t)] if code_language(t));
+            if !lang_ok {
+                return Err(bad());
+            }
+            body
+        }
+        _ => return Err(bad()),
+    };
+    let body_ok = body.ns == Ns::Ac
+        && body.local == "plain-text-body"
+        && body.attrs.is_empty()
+        && !body.children.is_empty()
+        && body
+            .children
+            .iter()
+            .all(|n| matches!(n, Node::CData { .. }));
+    if body_ok { Ok(()) } else { Err(bad()) }
+}
+
+/// The checks every Markdown → storage conversion must pass: no trailing newline,
+/// `check_storage_body` is `Ok`, only converter markup, the construct spans are exactly the
+/// recorded code macros (each a `Macro` span), each record slices one whole code macro, and the
+/// inventory holds no mention, include, image or attachment and no macro but `code`.
+pub fn check_storage_output(out: &str, e: &EmittedConstructs) -> Result<(), String> {
+    if out.ends_with('\n') {
+        return Err(format!("output ends with a newline: {out:?}"));
+    }
+    check_storage_body(out).map_err(|r| format!("check_storage_body: {r:?} for {out:?}"))?;
+    let doc = storage::parse(out);
+    if !doc.xml_ok {
+        return Err(format!("not xml_ok: {out:?}"));
+    }
+    only_converter_markup(&doc.nodes).map_err(|m| format!("{m} in {out:?}"))?;
+    let mut spans = Vec::new();
+    for (kind, r) in storage::construct_spans(&doc) {
+        if kind != ConstructKind::Macro {
+            return Err(format!("unrecorded {kind:?} at {r:?} in {out:?}"));
+        }
+        spans.push(r);
+    }
+    let recorded: Vec<_> = e.code_blocks.iter().map(|c| c.byte_range.clone()).collect();
+    if spans != recorded {
+        return Err(format!(
+            "spans {spans:?} != recorded {recorded:?} in {out:?}"
+        ));
+    }
+    for c in &e.code_blocks {
+        if c.kind != ContainerKind::CodeMacro {
+            return Err(format!("record kind {:?}", c.kind));
+        }
+        let slice = out
+            .get(c.byte_range.clone())
+            .ok_or_else(|| format!("range {:?} not on char boundaries", c.byte_range))?;
+        if !(slice.starts_with(CODE_MACRO_OPEN) && slice.ends_with(CODE_MACRO_CLOSE)) {
+            return Err(format!("record slices {slice:?}"));
+        }
+    }
+    let inv = storage_constructs(out);
+    if !(inv.mentions.is_empty()
+        && inv.includes.is_empty()
+        && inv.images.is_empty()
+        && inv.attachments.is_empty()
+        && inv.macros.iter().all(|m| m == "code"))
+    {
+        return Err(format!("unexpected constructs {inv:?} in {out:?}"));
+    }
+    Ok(())
+}
 
 /// The parser's view of `out` agrees with the record: every construct span is a `Macro`
 /// whose range is a recorded container, every recorded container is one span, and each
