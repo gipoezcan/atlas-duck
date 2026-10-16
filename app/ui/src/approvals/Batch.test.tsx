@@ -374,6 +374,28 @@ describe('batch approve and release', () => {
     ]);
   });
 
+  it('an_approved_write_answered_pending_reads_as_a_recorded_decision', async () => {
+    mockedBatch.mockResolvedValue({
+      batch_id: 'batch_0123456789abcdefghij',
+      items: [
+        { request_id: 'req_a', status: 'pending' },
+        { request_id: 'req_b', status: 'released' },
+      ],
+    });
+    view([A, B], [A, B]);
+    confirmation(2);
+    fireEvent.click(button('Confirm batch'));
+    await flush();
+    const status = screen.getAllByRole('status').find((s) => s.textContent?.includes('2 decided')) as HTMLElement;
+    const lines = within(status).getAllByRole('listitem').map((li) => li.textContent);
+    expect(lines).toEqual([
+      'jira.issue.get T-req_a: Decision recorded: approved',
+      'jira.issue.create T-req_b: released',
+    ]);
+    // Negative control: the raw status is not shown for the pending one.
+    expect(lines.join('\n')).not.toContain(': pending');
+  });
+
   it('a_cancelled_native_dialog_says_nothing_was_decided', async () => {
     mockedBatch.mockRejectedValue({ kind: 'decision', error: { kind: 'cancelled' } });
     view([A], [A]);

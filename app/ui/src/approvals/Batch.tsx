@@ -4,7 +4,13 @@ import { own } from '../shared/text/own';
 import { decideBatch, denyBatch, denySession } from '../shared/ipc/invoke';
 import type { BatchItem } from '../shared/ipc/invoke';
 import type { QueueItem } from '../shared/ipc/types';
-import { BATCH_FAILURE_TEXT, BATCH_FAILURE_UNKNOWN, BATCH_TEXT, CLASS_LABELS } from '../shared/strings';
+import {
+  BATCH_FAILURE_TEXT,
+  BATCH_FAILURE_UNKNOWN,
+  BATCH_TEXT,
+  CLASS_LABELS,
+  DETAIL_TEXT,
+} from '../shared/strings';
 import { AgentText } from '../shared/text/AgentText';
 import { useInert } from './inert';
 
@@ -423,6 +429,12 @@ export function Batch({ items, selectedIds, unsentId = null, onEngagedChange }: 
   );
 }
 
+/** An approved write answers `pending` until it starts (its stale check runs first): said as the
+ * Detail card says it, not as the raw status. */
+function itemStatus(status: string): string {
+  return status === 'pending' ? `${DETAIL_TEXT.decided}: ${DETAIL_TEXT.decided_approved}` : status;
+}
+
 function ResultView({ result }: { result: Result | null }) {
   if (result === null) return null;
   switch (result.kind) {
@@ -433,7 +445,7 @@ function ResultView({ result }: { result: Result | null }) {
           <ul>
             {result.items.map((i) => (
               <li key={i.request_id}>
-                {result.names.get(i.request_id) ?? i.request_id}: {i.status}
+                {result.names.get(i.request_id) ?? i.request_id}: {itemStatus(i.status)}
               </li>
             ))}
           </ul>
