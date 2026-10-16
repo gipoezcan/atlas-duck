@@ -291,6 +291,70 @@ async fn l83_frame_body_timeout_after_hello() {
     srv.stop().await;
 }
 
+/// L83 (T34b m-3): the bound is on the whole frame from its first byte, not on each read. A
+/// frame that arrives in pieces within the bound is answered; a body dripped one byte at a time
+/// is closed at the bound, so arriving bytes do not reset the timer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn l83_frame_body_timeout_is_not_reset_by_arriving_bytes() {
+    use atlas_duck_ipc::rpc::frame::read_frame_async;
+    use atlas_duck_ipc::sandbox::MAX_FRAME_BYTES;
+    use tokio::io::AsyncWriteExt;
+
+    let fake = Arc::new(Fake::new("A"));
+    let limits = ServerLimits {
+        frame_body_timeout: Duration::from_millis(400),
+        ..ServerLimits::default()
+    };
+    let srv = start_with(&fake, limits).await;
+
+    // (a) Four pieces, 50 ms apart (150 ms in all, inside the bound): answered.
+    let mut slow = Client::hello(&srv.name).await;
+    let body = serde_json::to_vec(&common::request(7, "ops.list", json!({}))).expect("encode");
+    let mut frame = u32::try_from(body.len())
+        .expect("small frame")
+        .to_be_bytes()
+        .to_vec();
+    frame.extend_from_slice(&body);
+    for piece in frame.chunks(frame.len().div_ceil(4)) {
+        slow.send_raw(piece).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let v = slow.recv().await.expect("an answer");
+    assert!(v.get("result").is_some(), "{v}");
+    assert_eq!(v["id"], json!(7), "{v}");
+
+    // (b) A 100-byte body at one byte per 100 ms would take 10 s: closed at the bound.
+    let mut drip = Client::hello(&srv.name).await;
+    let t0 = Instant::now();
+    drip.send_raw(&[0, 0, 0, 100]).await;
+    let (mut rd, mut wr) = tokio::io::split(drip.stream());
+    let dripping = async {
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if wr.write_all(b"a").await.is_err() {
+                break;
+            }
+        }
+    };
+    let closed = read_frame_async(&mut rd, MAX_FRAME_BYTES);
+    tokio::select! {
+        got = closed => {
+            assert!(matches!(got, Ok(None) | Err(_)), "an answer to a partial frame: {got:?}");
+        }
+        () = dripping => panic!("the dripped frame was never closed"),
+    }
+    let waited = t0.elapsed();
+    assert!(
+        waited >= Duration::from_millis(300),
+        "closed after {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_millis(1_500),
+        "closed after {waited:?}"
+    );
+    srv.stop().await;
+}
+
 // ---------- Windows: the hello_timeout answer follows the SID check ----------
 
 /// §3.1 / L83: the `hello_timeout` answer is written only to a client whose SID was checked.
