@@ -188,8 +188,8 @@ pub struct RequestEntry {
     /// The cancel handle and capture of the read in flight (Task 24 aborts through it); dropped
     /// once `READ_FETCHED` is committed and at terminal.
     fetch: Mutex<Option<FetchControl>>,
-    /// The app-initiated GET of a write in flight (purpose and resolved path): what a
-    /// `cancelled_in_flight` record of it names (Task 24).
+    /// The app-initiated GET of a write in flight, or the user lookup of a read in flight (PD-99,
+    /// purpose and resolved path): what a `cancelled_in_flight` record of it names (Task 24).
     in_flight: Mutex<Option<InFlight>>,
     /// The record of a write's finished GET that no append has committed yet (Task 24 review
     /// I-2): a cancel or expiry commits it ahead of the terminal record. Every gated append
@@ -198,7 +198,8 @@ pub struct RequestEntry {
     parked: Mutex<Option<NewEvent>>,
 }
 
-/// The GET a write's control is currently running (`PREVIEW_FETCH` `purpose` and `path`).
+/// The GET a write's control (or a read's user lookup, PD-99) is currently running
+/// (`PREVIEW_FETCH` `purpose` and `path`).
 #[derive(Debug, Clone)]
 pub(crate) struct InFlight {
     pub purpose: PreviewFetchPurpose,
@@ -345,7 +346,8 @@ impl RequestEntry {
         *lock(&self.fetch) = ctl;
     }
 
-    /// A write's GET finished and its record is built: park a copy until an append commits it.
+    /// A write's GET (or a read's user lookup) finished and its record is built: park a copy
+    /// until an append commits it.
     pub(crate) fn park_record(&self, record: &NewEvent) {
         *lock(&self.parked) = Some(record.clone());
     }
@@ -355,8 +357,8 @@ impl RequestEntry {
         lock(&self.parked).take()
     }
 
-    /// A write's GET starts (`Some`) or ended (`None`): only a GET that is in flight gets a
-    /// `cancelled_in_flight` record.
+    /// A write's GET (or a read's user lookup) starts (`Some`) or ended (`None`): only a GET that
+    /// is in flight gets a `cancelled_in_flight` record.
     pub(crate) fn set_in_flight(&self, f: Option<InFlight>) {
         if f.is_some() {
             // The next GET starts: the previous record was committed (or its task is gone).
@@ -668,6 +670,8 @@ pub struct Engine {
     identity: crate::identity::Gates,
     /// The Jira field-name cache (PD-46).
     field_cache: crate::metadata::FieldCache,
+    /// The Confluence user cache (PD-99).
+    user_cache: crate::users::UserCache,
     runtime: tokio::runtime::Handle,
     similarity: SimilarityIndex,
     expiry: Duration,
@@ -716,6 +720,7 @@ impl Engine {
             clients: Mutex::new(HashMap::new()),
             identity: crate::identity::Gates::default(),
             field_cache: crate::metadata::FieldCache::default(),
+            user_cache: crate::users::UserCache::default(),
             runtime: d.runtime,
             similarity: d.similarity,
             expiry,
@@ -859,6 +864,11 @@ impl Engine {
     /// The per-instance Jira field-name cache (PD-46).
     pub(crate) fn field_cache(&self) -> &crate::metadata::FieldCache {
         &self.field_cache
+    }
+
+    /// The per-instance Confluence user cache (PD-99).
+    pub(crate) fn user_cache(&self) -> &crate::users::UserCache {
+        &self.user_cache
     }
 
     /// The instance's identity epoch (Task 26): read before a call, passed to

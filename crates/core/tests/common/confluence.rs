@@ -2,6 +2,8 @@
 //! suites after it). Every mount answers through `MockDc::response`, so a `Date` header is set
 //! like on every other harness answer; paths are given without the `/wiki` context path.
 
+use std::time::Duration;
+
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, UserKind, fixtures};
 use atlas_duck_registry::{OpClass, OperationSpec};
 use serde_json::{Value, json};
@@ -110,6 +112,12 @@ pub fn user(key: &str, username: &str) -> Value {
 /// `GET /rest/api/user?key=<key>` per entry: a known user for `Some(username)`, a JSON 404
 /// for `None` (PD-99 user lookups, Task 11).
 pub async fn mount_users(mock: &MockDc, users: &[(&str, Option<&str>)]) {
+    mount_users_delayed(mock, users, Duration::ZERO).await;
+}
+
+/// [`mount_users`] with every answer sent `delay` after its request arrived (a lookup the test
+/// wants to see held in flight).
+pub async fn mount_users_delayed(mock: &MockDc, users: &[(&str, Option<&str>)], delay: Duration) {
     for (key, username) in users {
         let answer = match username {
             Some(name) => json_answer(mock, 200, &user(key, name)),
@@ -122,10 +130,15 @@ pub async fn mount_users(mock: &MockDc, users: &[(&str, Option<&str>)]) {
         Mock::given(method("GET"))
             .and(path(mock.path("/rest/api/user")))
             .and(query_param("key", *key))
-            .respond_with(answer)
+            .respond_with(answer.set_delay(delay))
             .mount(mock.server())
             .await;
     }
+}
+
+/// The user lookups (`GET /rest/api/user`) the mock received, in order.
+pub async fn user_gets(mock: &MockDc) -> Vec<wiremock::Request> {
+    super::jira::gets_on(mock, "/rest/api/user").await
 }
 
 /// The comment pages of content `id` (`confluence.comment.list`), each answering the GET whose

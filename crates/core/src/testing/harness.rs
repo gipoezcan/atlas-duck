@@ -780,6 +780,27 @@ impl Harness {
         true
     }
 
+    /// I-37 seam (PD-99): caches `username` for user `key` of `alias` (`None`: "no such user"),
+    /// as a lookup answered now would. `false`: no such instance.
+    pub fn user_cache_set(&self, alias: &str, key: &str, username: Option<&str>) -> bool {
+        let Some(id) = self.routed_id(alias) else {
+            return false;
+        };
+        let now = self.engine().clock().now_utc();
+        self.engine()
+            .user_cache()
+            .put(&id, key, username.map(str::to_owned), now);
+        true
+    }
+
+    /// What the user cache of `alias` holds for `key` now (PD-99): `None` when nothing usable is
+    /// cached, `Some(None)` for a cached "no such user".
+    pub fn user_cached(&self, alias: &str, key: &str) -> Option<Option<String>> {
+        let id = self.routed_id(alias)?;
+        let now = self.engine().clock().now_utc();
+        self.engine().user_cache().get(&id, key, now)
+    }
+
     /// The id the core routes `alias` to.
     fn routed_id(&self, alias: &str) -> Option<String> {
         self.engine()

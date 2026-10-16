@@ -67,8 +67,8 @@ use crate::ops::{
     ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table,
 };
 use crate::payloads::{
-    self, EventCtx, InFlightReason, OutcomeKind, ReadFetched, ScriptCallMeta, ScriptErrorDetails,
-    ScriptFailed,
+    self, EventCtx, FetchRecord, InFlightReason, OutcomeKind, ReadFetched, ScriptCallMeta,
+    ScriptErrorDetails, ScriptFailed,
 };
 use crate::redact::RedactionMeta;
 use crate::validate::{ValidateCtx, Validated, ValidationError, validate, validate_script_submit};
@@ -338,6 +338,18 @@ pub(crate) struct CallInfo {
 struct InFlight {
     info: CallInfo,
     ctl: FetchControl,
+    /// PD-99: the call's user lookup in flight (purpose and resolved path).
+    lookup: Option<super::InFlight>,
+    /// PD-99: the record of the call's last user lookup, finished but not committed yet.
+    parked: Option<NewEvent>,
+}
+
+/// One call the end of a run (or a cancel) takes from the in-flight table.
+pub(crate) struct TakenCall {
+    pub info: CallInfo,
+    pub ctl: FetchControl,
+    pub lookup: Option<super::InFlight>,
+    pub parked: Option<NewEvent>,
 }
 
 #[derive(Default)]
@@ -449,9 +461,15 @@ impl RunShared {
     }
 
     fn add_in_flight(&self, info: CallInfo, ctl: FetchControl) {
-        lock(&self.inner)
-            .in_flight
-            .insert(info.call_id, InFlight { info, ctl });
+        lock(&self.inner).in_flight.insert(
+            info.call_id,
+            InFlight {
+                info,
+                ctl,
+                lookup: None,
+                parked: None,
+            },
+        );
     }
 
     /// `false` = the end of the run took the call (it records it itself). Called under the
@@ -460,39 +478,101 @@ impl RunShared {
         lock(&self.inner).in_flight.remove(&call_id).is_some()
     }
 
-    /// The calls in flight, taken by the cancel path or the end of the run under the entry's gate.
-    pub(crate) fn take_in_flight(&self) -> Vec<(CallInfo, FetchControl)> {
+    /// PD-99: the call's user lookup starts (`Some`: the previous lookup's record is committed)
+    /// or ended (`None`).
+    pub(crate) fn set_lookup(&self, call_id: u64, f: Option<super::InFlight>) {
+        if let Some(call) = lock(&self.inner).in_flight.get_mut(&call_id) {
+            if f.is_some() {
+                call.parked = None;
+            }
+            call.lookup = f;
+        }
+    }
+
+    /// PD-99: the call's user lookup finished and its record is built: kept until
+    /// [`append_lookup`] commits it, or the end of the run records it with the call.
+    pub(crate) fn park_lookup(&self, call_id: u64, record: &NewEvent) {
+        if let Some(call) = lock(&self.inner).in_flight.get_mut(&call_id) {
+            call.parked = Some(record.clone());
+        }
+    }
+
+    /// The parked lookup record of a call still in flight (`Err`: the end of the run took the
+    /// call, and with it the record). Under the entry's gate only.
+    fn take_lookup_record(&self, call_id: u64) -> Result<Option<NewEvent>, ()> {
         let mut g = lock(&self.inner);
-        let mut calls: Vec<_> = g.in_flight.drain().map(|(_, f)| (f.info, f.ctl)).collect();
-        calls.sort_by_key(|(i, _)| i.call_id);
+        let call = g.in_flight.get_mut(&call_id).ok_or(())?;
+        Ok(call.parked.take())
+    }
+
+    /// The calls in flight, taken by the cancel path or the end of the run under the entry's gate.
+    pub(crate) fn take_in_flight(&self) -> Vec<TakenCall> {
+        let mut g = lock(&self.inner);
+        let mut calls: Vec<_> = g
+            .in_flight
+            .drain()
+            .map(|(_, f)| TakenCall {
+                info: f.info,
+                ctl: f.ctl,
+                lookup: f.lookup,
+                parked: f.parked,
+            })
+            .collect();
+        calls.sort_by_key(|c| c.info.call_id);
         calls
     }
 
     /// The `SCRIPT_CALL {cancelled_in_flight}` records of the calls in flight (§9.5): each call
     /// is taken, its control cancelled and the bytes received recorded. A call whose request was
-    /// never written has nothing to record. Under the entry's gate only.
+    /// never written has nothing to record. A call in its user lookups (PD-99) first gets the
+    /// record of its last finished lookup (if not committed yet) and `PREVIEW_FETCH {resolve,
+    /// cancelled_in_flight}` for the lookup in flight; its `SCRIPT_CALL` then holds the content
+    /// page. Under the entry's gate only.
     pub(crate) fn in_flight_records(
         &self,
         ctx: &EventCtx,
         reason: InFlightReason,
     ) -> Vec<NewEvent> {
         let mut records = Vec::new();
-        for (info, ctl) in self.take_in_flight() {
+        for TakenCall {
+            info,
+            ctl,
+            lookup,
+            parked,
+        } in self.take_in_flight()
+        {
             ctl.cancel();
             let cap = ctl.take_captured();
             if !cap.sent {
                 continue;
             }
+            let ctx = EventCtx {
+                instance_id: Some(info.instance_id.clone()),
+                ..ctx.clone()
+            };
+            // A parked record is the lookup in flight, finished.
+            let had_parked = parked.is_some();
+            records.extend(parked);
+            if let Some(f) = lookup.as_ref().filter(|_| !had_parked) {
+                records.push(payloads::preview_fetch(
+                    &ctx,
+                    f.purpose,
+                    "GET",
+                    &f.path,
+                    &FetchRecord::CancelledInFlight {
+                        reason,
+                        received: &cap.partial,
+                    },
+                ));
+            }
+            // During a lookup the partial bytes are the lookup's; the call's are its pages.
+            let partial: &[u8] = if lookup.is_some() { &[] } else { &cap.partial };
             let size = cap
                 .pages
                 .iter()
                 .map(|p| p.body.len() as u64)
                 .sum::<u64>()
-                .saturating_add(cap.partial.len() as u64);
-            let ctx = EventCtx {
-                instance_id: Some(info.instance_id.clone()),
-                ..ctx.clone()
-            };
+                .saturating_add(partial.len() as u64);
             records.push(payloads::script_call(
                 &ctx,
                 &ScriptCallMeta {
@@ -506,7 +586,7 @@ impl RunShared {
                 &ReadFetched::CancelledInFlight {
                     reason,
                     responses: &cap.pages,
-                    partial: &cap.partial,
+                    partial,
                     size,
                 },
                 size,
@@ -514,6 +594,42 @@ impl RunShared {
             ));
         }
         records
+    }
+}
+
+/// PD-99: commits the parked record of host call `call_id`'s last user lookup, under the entry's
+/// gate while the run is `Running` and the call still in flight (otherwise the end of the run
+/// took the call and records the lookup itself). `false`: the run ended, or the append failed
+/// (the request then fails `audit_failure`).
+pub(crate) async fn append_lookup(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    shared: &Arc<RunShared>,
+    call_id: u64,
+) -> bool {
+    let (e, en, sh) = (engine.clone(), entry.clone(), shared.clone());
+    let appended = tokio::spawn(async move {
+        let _gate = en.gate.clone().lock_owned().await;
+        if !matches!(en.state().model.phase(), Phase::Running) {
+            return Appended::Ended;
+        }
+        let Ok(Some(ev)) = sh.take_lookup_record(call_id) else {
+            return Appended::Ended;
+        };
+        match e.blocking(move |p| p.append(ev).map(|_| ())).await {
+            Ok(()) => Appended::Done,
+            Err(_) => Appended::Failed,
+        }
+    })
+    .await
+    .unwrap_or(Appended::Failed);
+    match appended {
+        Appended::Done => true,
+        Appended::Ended => false,
+        Appended::Failed => {
+            audit_failure(engine, entry, shared).await;
+            false
+        }
     }
 }
 
@@ -944,7 +1060,21 @@ impl LiveBackend {
         // The control first, then the cover: a cancel that took the control before it exists
         // finds nothing in flight and a request that ended mints no cover (Task 24 rule).
         self.shared.add_in_flight(info.clone(), ctl.clone());
+        // PD-99: the call's user lookups share its read budget, counted from its first GET.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(self.engine.read_budget().total)
+            .unwrap_or_else(tokio::time::Instant::now);
         let classified = match self.fetch(&call, &vc, &ctl).await {
+            Ok(c) => c,
+            Err(result) => {
+                self.shared.finish_in_flight(call.id);
+                return result;
+            }
+        };
+        let classified = match self
+            .with_users(&call, &vc, &ctl, classified, deadline)
+            .await
+        {
             Ok(c) => c,
             Err(result) => {
                 self.shared.finish_in_flight(call.id);
@@ -971,6 +1101,75 @@ impl LiveBackend {
             Appended::Failed => {
                 audit_failure(&self.engine, &self.entry, &self.shared).await;
                 rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE)
+            }
+        }
+    }
+
+    /// PD-99 (§7.6 "also inside script runs"): the user lookups of a `confluence.page.get` host
+    /// call of the Markdown shape, as for a direct read (`read::with_users`): after the content
+    /// answered, before the call's `SCRIPT_CALL`, which commits the map. They are part of the
+    /// host call: they count toward the run's wall-clock limit and the call's read budget (the
+    /// 20 s reserve), not as host calls. `Err`: the run ended meanwhile (the end of the run
+    /// recorded the lookup in flight with the call).
+    async fn with_users(
+        &self,
+        call: &HostCall,
+        vc: &ValidatedCall,
+        ctl: &FetchControl,
+        classified: Classified,
+        deadline: tokio::time::Instant,
+    ) -> Result<Classified, HostCallResult> {
+        let Classified::Item(rec) = classified else {
+            return Ok(classified);
+        };
+        let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
+        if rec.item != ReleaseItem::Result || !shape.commits_user_resolutions() {
+            return Ok(Classified::Item(rec));
+        }
+        let spec = vc.spec;
+        let found = tokio::task::spawn_blocking(move || {
+            let keys = read::lookup_keys(spec, &rec);
+            (rec, keys)
+        })
+        .await;
+        let Ok((mut rec, keys)) = found else {
+            return Err(rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE));
+        };
+        if keys.is_empty() {
+            return Ok(Classified::Item(rec));
+        }
+        let http = self.engine.client(&vc.instance_id).await.ok();
+        let cover = self
+            .engine
+            .covers()
+            .for_request(&self.entry.head.request_id)
+            .ok();
+        let (Some(http), Some(cover)) = (http, cover) else {
+            rec.users = Some(keys.into_iter().map(|k| (k, None)).collect());
+            return Ok(Classified::Item(rec));
+        };
+        let ctx = self.ctx_for(vc);
+        let pass = crate::users::Pass {
+            engine: &self.engine,
+            site: crate::users::Site::Script {
+                entry: &self.entry,
+                shared: &self.shared,
+                call_id: call.id,
+                ctx: &ctx,
+            },
+            instance_id: &vc.instance_id,
+            client: &http.client,
+            cover: &cover,
+            ctl,
+            deadline,
+        };
+        match crate::users::resolve_users(&pass, &keys).await {
+            Ok(map) => {
+                rec.users = Some(map);
+                Ok(Classified::Item(rec))
+            }
+            Err(crate::users::Cancelled) => {
+                Err(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED))
             }
         }
     }
@@ -1021,10 +1220,12 @@ impl LiveBackend {
             .get("start")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let keep = read::ReadShape::of(vc.spec, &vc.validated.params).commits_user_resolutions();
         let mut refetched = false;
         loop {
             let seen = self.engine.identity_epoch(&vc.instance_id);
-            let fetched = read::run_plan(&http.client, &cover, &plan, &budget, ctl, start).await;
+            let fetched =
+                read::run_plan(&http.client, &cover, &plan, &budget, ctl, start, keep).await;
             let Some(trigger) = read::fetched_trigger(&fetched) else {
                 return Ok(read::classify_read(fetched, &http.proxy));
             };
@@ -1090,7 +1291,7 @@ impl LiveBackend {
             Classified::Item(rec) => {
                 let size = rec.size();
                 let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
-                let users = read::user_resolutions(shape, rec.item);
+                let users = read::user_resolutions(shape, &rec);
                 let event = rec.record(&ctx, users.as_ref());
                 let (result, rejection, lossy) = match rec.item {
                     ReleaseItem::Result => {

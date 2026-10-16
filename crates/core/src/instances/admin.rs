@@ -561,8 +561,10 @@ impl CoreInstances {
         // (review I-4), and the first error is reported afterwards.
         let deleted = delete_stored(&self.engine, &id, false);
         self.engine.invalidate_client(&id);
-        // Another server's field names (PD-46, T8 review M-5).
+        // Another server's field names (PD-46, T8 review M-5) and users (PD-99:
+        // `instance_changed`).
         self.engine.field_cache().forget(&id);
+        self.engine.user_cache().clear(&id);
         let reloaded = self.reload();
         if reloaded.is_err() {
             // The table could not be rebuilt: the instance still moves to the confirmed origin,
@@ -938,6 +940,9 @@ impl InstanceAdmin for CoreInstances {
                 .await;
             return Err(e);
         }
+        // PD-99: users are looked up again under the new token (`credential_changed`); cleared
+        // before the instance is `ok` with it.
+        self.engine.user_cache().clear(&id);
         self.pat_stored(&id, identity, expires_at, tested.version);
         let change = if other_user {
             InstanceChange::TokenReplaced

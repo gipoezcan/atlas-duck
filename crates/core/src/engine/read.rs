@@ -18,6 +18,7 @@
 //! an upstream error is `{status, error_messages}`; an outcome item `{code, hint}`. Nothing of a
 //! candidate reaches an envelope before a release (§4.5): the agent sees `pending` throughout.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
@@ -28,6 +29,7 @@ use atlas_duck_atlassian::{
 use atlas_duck_audit::NewEvent;
 use atlas_duck_convert::{
     ConversionReport, MarkdownTooLarge, UserResolutions, storage_to_markdown_within,
+    storage_user_refs,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::invisible::escape_for_display;
@@ -37,6 +39,7 @@ use atlas_duck_preview::{
 use atlas_duck_registry::{OperationSpec, Product, RELEASE_CAP_BYTES};
 use serde_json::{Map, Value, json};
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Instant;
 
 use super::cache::{Candidate, RebuildError, build_candidate, build_unredacted, fetched_refs};
 use super::envelope::{MSG_IDENTITY_HEADER, OpenStatus};
@@ -54,6 +57,7 @@ use crate::ops::{
 use crate::payloads::{self, CapOrBudget, EventCtx, OutcomeKind, ReadFetched};
 use crate::proxy::{PAC_HINT, ResolvedProxy};
 use crate::redact::RedactionMeta;
+use crate::users;
 
 /// §5.2 step 6: the fixed hint a released outcome item carries. Plan wording: the spec names the
 /// hint ("narrow `fields`/`max`/`expand`") without fixing its text.
@@ -195,7 +199,13 @@ async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
         settle(&engine, &entry, Classified::Direct(d)).await;
         return;
     }
-    let classified = fetch_classified(&engine, &entry).await;
+    // PD-99: the user lookups share the read budget, counted from the first GET.
+    let budget = engine.read_budget().total;
+    let deadline = Instant::now()
+        .checked_add(budget)
+        .unwrap_or_else(Instant::now);
+    let (classified, http) = fetch_classified(&engine, &entry).await;
+    let classified = with_users(&engine, &entry, classified, http, deadline).await;
     settle(&engine, &entry, classified).await;
 }
 
@@ -219,17 +229,26 @@ pub(crate) fn state_refusal(state: InstanceState) -> Option<Direct> {
 /// The fetch and its classification, with the identity handling of Task 26 in between: a failed
 /// identity check or a JSON 401 runs the token re-check (§7.1) and the table of
 /// [`identity::effect`] decides what the read becomes. A rename re-fetches once under the same
-/// request id; the first answer is recorded audit-only before the second fetch.
-async fn fetch_classified(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) -> Classified {
+/// request id; the first answer is recorded audit-only before the second fetch. The instance's
+/// client comes back with the classification (`None` when nothing was sent).
+async fn fetch_classified(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+) -> (Classified, Option<Arc<InstanceHttp>>) {
     let mut refetched = false;
     loop {
         let seen = engine.identity_epoch(&entry.instance_id);
         let (fetched, http) = match fetch(engine, entry).await {
             Ok(f) => f,
-            Err(message) => return Classified::Direct(Direct::internal(message, Vec::new())),
+            Err(message) => {
+                return (
+                    Classified::Direct(Direct::internal(message, Vec::new())),
+                    None,
+                );
+            }
         };
         let Some(trigger) = fetched_trigger(&fetched) else {
-            return classify_read(fetched, &http.proxy);
+            return (classify_read(fetched, &http.proxy), Some(http));
         };
         // The re-fetch failed the check again: `upstream_unavailable`, retryable (§7.1).
         let effect = if refetched {
@@ -240,7 +259,7 @@ async fn fetch_classified(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) -> Cl
         };
         match effect {
             identity::Effect::Ordinary => {
-                return classify_read(ordinary(fetched), &http.proxy);
+                return (classify_read(ordinary(fetched), &http.proxy), Some(http));
             }
             identity::Effect::Refetch => {
                 let (earlier, answer) = split_answer(fetched);
@@ -255,13 +274,95 @@ async fn fetch_classified(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) -> Cl
                     None,
                 );
                 if !engine.append_pending(entry, vec![first], None).await {
-                    return Classified::Cancelled;
+                    return (Classified::Cancelled, Some(http));
                 }
                 refetched = true;
             }
-            other => return identity_classified(other, fetched),
+            other => return (identity_classified(other, fetched), Some(http)),
         }
     }
+}
+
+/// PD-99 (§7.6): the user lookups of a Markdown page body, in `Fetching` after the content
+/// answered and before its `READ_FETCHED`: the map they give is committed in that record
+/// ([`user_resolutions`]) and is the one the candidate is converted with. Only a released result
+/// of the Markdown shape whose storage parses (`xml_ok`) resolves anything; the storage and view
+/// formats, every other read and every other item pass through unchanged. A cancel, an expiry
+/// or a quit during a lookup ends the read here (`Classified::Cancelled`): the gated cancel
+/// section recorded the lookup in flight and the content received.
+async fn with_users(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    classified: Classified,
+    http: Option<Arc<InstanceHttp>>,
+    deadline: Instant,
+) -> Classified {
+    let Classified::Item(rec) = classified else {
+        return classified;
+    };
+    let spec = entry.spec;
+    let params = entry
+        .validated
+        .as_ref()
+        .map(|v| v.params.clone())
+        .unwrap_or(Value::Null);
+    let shape = ReadShape::of(spec, &params);
+    if rec.item != ReleaseItem::Result || !shape.commits_user_resolutions() {
+        return Classified::Item(rec);
+    }
+    // Parsing the page (up to 32 MiB of JSON) and its storage is CPU work.
+    let found = tokio::task::spawn_blocking(move || {
+        let keys = lookup_keys(spec, &rec);
+        (rec, keys)
+    })
+    .await;
+    let Ok((mut rec, keys)) = found else {
+        let d = Direct::internal("the response could not be processed", Vec::new());
+        return Classified::Direct(d);
+    };
+    if keys.is_empty() {
+        return Classified::Item(rec);
+    }
+    let cover = engine.covers().for_request(&entry.head.request_id).ok();
+    let (Some(http), Some(ctl), Some(cover)) = (http, entry.fetch_control(), cover) else {
+        // Nothing can be looked up (cannot happen after a fetch): every key unresolved.
+        rec.users = Some(keys.into_iter().map(|k| (k, None)).collect());
+        return Classified::Item(rec);
+    };
+    let pass = users::Pass {
+        engine,
+        site: users::Site::Read(entry),
+        instance_id: &entry.instance_id,
+        client: &http.client,
+        cover: &cover,
+        ctl: &ctl,
+        deadline,
+    };
+    match users::resolve_users(&pass, &keys).await {
+        Ok(map) => {
+            rec.users = Some(map);
+            Classified::Item(rec)
+        }
+        Err(users::Cancelled) => Classified::Cancelled,
+    }
+}
+
+/// The user keys a released result of the Markdown shape resolves (PD-99): the `ri:userkey`
+/// references of its `body.storage.value`, decided by the same parse the conversion uses, and
+/// none when that parse is not `xml_ok` (the fallback renders no mention) or the answer has no
+/// storage body.
+pub(super) fn lookup_keys(spec: &OperationSpec, rec: &ItemRecord) -> BTreeSet<String> {
+    let Ok((body, _)) = result_body(spec, rec.responses.iter().map(|r| &*r.body)) else {
+        return BTreeSet::new();
+    };
+    let Some(storage) = body.pointer("/body/storage/value").and_then(Value::as_str) else {
+        return BTreeSet::new();
+    };
+    let keys = storage_user_refs(storage).keys;
+    if keys.is_empty() || !atlas_duck_convert::storage::parse(storage).xml_ok {
+        return BTreeSet::new();
+    }
+    keys
 }
 
 /// The trigger of a read's fetch, if its answer failed the identity check or is a JSON 401.
@@ -385,7 +486,9 @@ pub(crate) enum Fetched {
 
 /// Runs `plan` under `cover` with `ctl` (the direct read and a script's host call). A composite
 /// read sends the issue GET, then the comment pages with what is left of the one read budget
-/// (time and bytes): `budget` bounds the read as a whole (§7.2).
+/// (time and bytes): `budget` bounds the read as a whole (§7.2). `keep`: a 2xx answer of a single
+/// GET is also kept in `ctl` (a Markdown page body, whose user lookups follow under the same
+/// control: a cancel during them records the page, every byte received, PD-99).
 pub(crate) async fn run_plan(
     client: &InstanceClient,
     cover: &AuditCover,
@@ -393,8 +496,10 @@ pub(crate) async fn run_plan(
     budget: &ReadBudget,
     ctl: &FetchControl,
     start: u64,
+    keep: bool,
 ) -> Fetched {
     match plan {
+        ReadPlan::Get(call) if keep => Fetched::Single(client.get_kept_ctl(cover, call, ctl).await),
         ReadPlan::Get(call) => Fetched::Single(client.get_ctl(cover, call, ctl).await),
         ReadPlan::Paged { call, max_items } => Fetched::Paged {
             outcome: client
@@ -476,7 +581,8 @@ async fn fetch(
         .get("start")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let fetched = run_plan(&http.client, &cover, &plan, &budget, &ctl, start).await;
+    let keep = ReadShape::of(entry.spec, &validated.params).commits_user_resolutions();
+    let fetched = run_plan(&http.client, &cover, &plan, &budget, &ctl, start, keep).await;
     Ok((fetched, http))
 }
 
@@ -501,6 +607,8 @@ pub(crate) struct ItemRecord {
     more_available: bool,
     /// A composite read's comments stopped at the cap: `(fetched, server total)` (PD-45).
     pub(super) comments_truncated: Option<(u64, u64)>,
+    /// PD-99: what the user lookups of a Markdown page body resolved (`None`: no lookup ran).
+    pub(super) users: Option<UserResolutions>,
 }
 
 pub(super) struct OutcomeFacts {
@@ -622,6 +730,7 @@ impl ItemRecord {
             server_total: None,
             more_available: false,
             comments_truncated: None,
+            users: None,
         }
     }
 }
@@ -648,6 +757,7 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
                 server_total: None,
                 more_available: false,
                 comments_truncated: None,
+                users: None,
             })
         }
         Fetched::Single(FetchOutcome::Failed(f)) => classify_failure(f, Vec::new(), proxy),
@@ -690,6 +800,7 @@ pub(crate) fn classify_read(fetched: Fetched, proxy: &ResolvedProxy) -> Classifi
                     server_total: outcome.server_total,
                     more_available: outcome.next_start.is_some(),
                     comments_truncated: None,
+                    users: None,
                 })
             };
             match (outcome.end, outcome.failure) {
@@ -1132,7 +1243,7 @@ fn build_item(
     let shape = ReadShape::of(cx.spec, cx.params);
     // §5.2 steps 3–4: the map is committed in the record the candidate is built from, so the
     // first build and every rebuild convert with the same map.
-    let users = user_resolutions(shape, rec.item);
+    let users = user_resolutions(shape, &rec);
     let mut record = rec.record(ctx, users.as_ref());
     // §5.3 mirror check on the unredacted candidate (T10 review I-1): a candidate that fails it
     // is still shown, but Release stays disabled (`rebuild_failed`: `internal` banner, only Deny
@@ -1256,11 +1367,19 @@ impl ReadShape {
 }
 
 /// The `user_resolutions` the `READ_FETCHED` of a released result (or the `SCRIPT_CALL` of a
-/// host call) commits (§7.6, §5.2 step 3): only a Markdown page body has one. No user lookup
-/// runs yet, so the map is empty and every mention converts to `@user:<key>`.
-pub(crate) fn user_resolutions(shape: ReadShape, item: ReleaseItem) -> Option<Value> {
-    (item == ReleaseItem::Result && shape.commits_user_resolutions())
-        .then(|| Value::Object(Map::new()))
+/// host call) commits (§7.6, §5.2 step 3): only a Markdown page body has one, always an object
+/// (`{}` when no key was resolved: no mention, or a storage the parse rejected), holding what
+/// the lookups resolved (PD-99: user key → username, `null` when unresolved).
+pub(crate) fn user_resolutions(shape: ReadShape, rec: &ItemRecord) -> Option<Value> {
+    (rec.item == ReleaseItem::Result && shape.commits_user_resolutions()).then(|| {
+        let map = rec.users.iter().flatten().map(|(key, name)| {
+            let name = name
+                .as_ref()
+                .map_or(Value::Null, |n| Value::String(n.clone()));
+            (key.clone(), name)
+        });
+        Value::Object(map.collect())
+    })
 }
 
 /// What a committed payload normalizes to.

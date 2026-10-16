@@ -4,14 +4,23 @@
 //! `body.storage`, converts it with the committed `user_resolutions` map and replaces `body` with
 //! `{"format": "markdown", "value": …}`, releasing `meta.conversion`; `storage` releases the body
 //! as sent; `view` expands `body.view` instead. The history summary ignores `format`.
+//!
+//! Task 11 (PD-99, §7.6, I-37): the user keys of a Markdown body are resolved before its
+//! `READ_FETCHED` from the per-instance cache and, for misses, by sequential
+//! `GET /rest/api/user?key=` lookups under the request's cover (`PREVIEW_FETCH {purpose:
+//! resolve}`); the map is committed in `READ_FETCHED` and is the only one a rebuild uses.
 
 mod common;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
-use atlas_duck_atlassian::testing::MockDc;
+use atlas_duck_atlassian::ReadBudget;
+use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, UserKind};
 use atlas_duck_audit::EventType;
+use atlas_duck_core::Confirm;
 use atlas_duck_core::engine::cache::RebuildError;
+use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
 use atlas_duck_core::engine::queue::{Limits, MIB};
 use atlas_duck_core::engine::read::normalize;
 use atlas_duck_core::payloads::body_json;
@@ -20,11 +29,13 @@ use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_preview::{OutcomeKind, PreviewBody};
 use common::confluence::{
     PAGE_EXPAND_STORAGE, PAGE_EXPAND_VIEW, amplified_storage, content_path, mount_history_summary,
-    mount_history_version, mount_page, mount_page_view, page_with_storage, page_with_view,
+    mount_history_version, mount_page, mount_page_view, mount_users, mount_users_delayed,
+    page_with_storage, page_with_view, user_gets,
 };
 use common::jira::{gets_on, query};
 use common::{TestError, TestResult, code, de, request_id, test_hits};
-use serde_json::{Value, json};
+use secrecy::SecretString;
+use serde_json::{Map, Value, json};
 
 const PAGE_GET: &str = "confluence.page.get";
 const PAGE_HISTORY: &str = "confluence.page.history";
@@ -312,7 +323,7 @@ async fn markdown_candidate_rebuild_hash_stable() -> TestResult {
         .ok_or("no Markdown value")?
         .to_owned();
     assert_eq!(value, markdown_of(MENTION_STORAGE));
-    // The committed map is empty until Task 11: the mention is its key.
+    // The mock knows no such user (Task 11: the lookup answered 404): the mention is its key.
     assert!(value.contains("@user:8a7f808a1"), "{value}");
     assert_eq!(
         meta_of(&env)?["conversion"],
@@ -329,9 +340,14 @@ async fn read_fetched_carries_user_resolutions() -> TestResult {
     mount_page(mock, ID, &page_with_storage(MENTION_STORAGE)).await;
     let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
     let fetched = read_fetched(&h, &id).await?;
-    // Committed before the candidate hash (§5.2 steps 3–4); empty until Task 11's lookups.
-    assert_eq!(fetched["user_resolutions"], json!({}));
+    // Committed before the candidate hash (§5.2 steps 3–4). Task 11: the one key was looked up;
+    // the mock knows no such user (an unmounted path), so it is unresolved.
+    assert_eq!(fetched["user_resolutions"], json!({ "8a7f808a1": null }));
     assert_eq!(fetched["pages"], 1);
+    // A page without mentions commits an empty map.
+    mount_page(mock, "65538", &page_with_storage(INFO_STORAGE)).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": "65538" })).await?;
+    assert_eq!(read_fetched(&h, &id).await?["user_resolutions"], json!({}));
     Ok(())
 }
 
@@ -582,5 +598,582 @@ async fn markdown_upstream_error_commits_no_map() -> TestResult {
     let fetched = read_fetched(&h, &id).await?;
     assert_eq!(fetched["upstream_error"], true, "{fetched}");
     assert!(fetched.get("user_resolutions").is_none(), "{fetched}");
+    Ok(())
+}
+
+// ---- Task 11: user resolution (PD-99, I-37) -------------------------------------------------------
+
+/// Two mentions by user key; sorted, `key-asmith` is looked up first.
+const TWO_USERS_STORAGE: &str = r#"<p>Owners <ac:link><ri:user ri:userkey="key-jdoe"/></ac:link> and <ac:link><ri:user ri:userkey="key-asmith"/></ac:link>.</p>"#;
+const JDOE: (&str, Option<&str>) = ("key-jdoe", Some("jdoe"));
+const ASMITH: (&str, Option<&str>) = ("key-asmith", Some("asmith"));
+
+/// What the converter makes of `storage` with `users` as the map.
+fn markdown_with(storage: &str, users: &[(&str, Option<&str>)]) -> String {
+    let map = users
+        .iter()
+        .map(|(k, n)| ((*k).to_owned(), n.map(str::to_owned)))
+        .collect();
+    atlas_duck_convert::storage_to_markdown(storage, &map).0
+}
+
+/// The payloads of `id`'s records of type `t`, in order.
+async fn records(h: &Harness, id: &str, t: EventType) -> Result<Vec<Value>, TestError> {
+    Ok(h.events(id)
+        .await?
+        .into_iter()
+        .filter(|(e, _)| *e == t)
+        .map(|(_, p)| p)
+        .collect())
+}
+
+/// The `key` query values of the user lookups the mock received, in order.
+async fn looked_up(mock: &MockDc) -> Vec<String> {
+    user_gets(mock)
+        .await
+        .iter()
+        .filter_map(|r| query(r, "key"))
+        .collect()
+}
+
+/// Polls until the mock received `n` user lookups.
+async fn wait_lookups(mock: &MockDc, n: usize) -> TestResult {
+    for _ in 0..2000 {
+        if user_gets(mock).await.len() >= n {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!("never {n} user lookups").into())
+}
+
+fn released_value(env: &Envelope) -> Result<String, TestError> {
+    Ok(result_of(env)?["body"]["value"]
+        .as_str()
+        .ok_or("no Markdown value")?
+        .to_owned())
+}
+
+/// The read's `ConversionReport.unresolved_users` (the preview's Info `unresolved_mention`
+/// reads it, Task 12b).
+fn unresolved_users(h: &Harness, id: &str) -> Option<u64> {
+    let entry = h.engine().entry(id)?;
+    let st = entry.state();
+    st.read
+        .as_ref()
+        .and_then(|r| r.conversion.as_ref())
+        .map(|c| c.unresolved_users)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolve_gets_are_preview_fetch_resolve_under_request() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(looked_up(mock).await, ["key-asmith", "key-jdoe"]);
+    // Every lookup after the request's `REQUEST_RECEIVED` (its cover) and recorded before the
+    // read's `READ_FETCHED`.
+    assert_eq!(
+        h.event_types(&id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::PREVIEW_FETCH,
+            EventType::READ_FETCHED,
+        ]
+    );
+    let fetches = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    for (f, key) in fetches.iter().zip(["key-asmith", "key-jdoe"]) {
+        assert_eq!(f["purpose"], "resolve", "{f}");
+        assert_eq!(f["method"], "GET");
+        assert_eq!(f["path"], format!("/wiki/rest/api/user?key={key}"));
+        assert_eq!(f["status"], 200);
+        assert!(f["response"].to_string().contains(key), "{f}");
+    }
+    let env = released(&h, &id).await?;
+    let value = released_value(&env)?;
+    assert!(
+        value.contains("@jdoe") && value.contains("@asmith"),
+        "{value}"
+    );
+    assert_eq!(value, markdown_with(TWO_USERS_STORAGE, &[JDOE, ASMITH]));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_resolutions_committed_in_read_fetched() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-jdoe": "jdoe", "key-asmith": "asmith" })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cache_hits_need_no_lookup() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(user_gets(mock).await.len(), 2);
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(
+        user_gets(mock).await.len(),
+        2,
+        "the second read looks nobody up"
+    );
+    assert_eq!(
+        h.event_types(&id).await?,
+        [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED]
+    );
+    // The map still lists every key of the body (cache hits included).
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-jdoe": "jdoe", "key-asmith": "asmith" })
+    );
+    let env = released(&h, &id).await?;
+    assert_eq!(
+        released_value(&env)?,
+        markdown_with(TWO_USERS_STORAGE, &[JDOE, ASMITH])
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unresolvable_user_is_null_and_info() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p>Ask <ri:user ri:userkey="key-gone"/>.</p>"#;
+    mount_page(mock, ID, &page_with_storage(storage)).await;
+    mount_users(mock, &[("key-gone", None)]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(fetch.len(), 1);
+    assert_eq!(fetch[0]["status"], 404);
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-gone": null })
+    );
+    // The preview's Info `unresolved_mention` counts it (Task 12b renders it).
+    assert_eq!(unresolved_users(&h, &id), Some(1));
+    let env = released(&h, &id).await?;
+    let value = released_value(&env)?;
+    assert!(value.contains("@user:key-gone"), "{value}");
+    // A JSON 404 is a definitive answer: cached, so the next read looks nobody up.
+    assert_eq!(h.user_cached("wiki", "key-gone"), Some(None));
+    queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(user_gets(mock).await.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolve_lookups_capped_per_read() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let keys: Vec<String> = (0..60).map(|n| format!("u{n:02}")).collect();
+    let names: Vec<String> = (0..60).map(|n| format!("name{n:02}")).collect();
+    let storage: String = keys
+        .iter()
+        .map(|k| format!(r#"<p><ri:user ri:userkey="{k}"/></p>"#))
+        .collect();
+    let users: Vec<(&str, Option<&str>)> = keys
+        .iter()
+        .zip(&names)
+        .map(|(k, n)| (k.as_str(), Some(n.as_str())))
+        .collect();
+    mount_page(mock, ID, &page_with_storage(&storage)).await;
+    mount_users(mock, &users).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(
+        looked_up(mock).await,
+        keys[..50],
+        "exactly 50, in key order"
+    );
+    let map = read_fetched(&h, &id).await?["user_resolutions"].clone();
+    let map = map.as_object().ok_or("no map")?;
+    assert_eq!(map.len(), 60);
+    for (n, key) in keys.iter().enumerate() {
+        let want = if n < 50 { json!(names[n]) } else { Value::Null };
+        assert_eq!(map.get(key.as_str()), Some(&want), "{key}");
+    }
+    assert_eq!(records(&h, &id, EventType::PREVIEW_FETCH).await?.len(), 50);
+    assert_eq!(unresolved_users(&h, &id), Some(10));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_confluence_markdown_rebuild_from_committed_map() -> TestResult {
+    // A cache smaller than any candidate: every preview and the release rebuild from the record.
+    let h = Harness::builder()
+        .confluence("wiki")
+        .limits(Limits {
+            candidate_cache_bytes: MIB / 1024,
+            ..Limits::default()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    assert!(h.user_cache_set("wiki", "key-jdoe", Some("jdoe")));
+    assert!(h.user_cache_set("wiki", "key-asmith", Some("asmith")));
+    let mut page = page_with_storage(TWO_USERS_STORAGE);
+    page["title"] = json!("x".repeat(2048));
+    mount_page(mock, ID, &page).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert!(
+        user_gets(mock).await.is_empty(),
+        "every mention a cache hit"
+    );
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-jdoe": "jdoe", "key-asmith": "asmith" })
+    );
+    let rev = h.approver().item(&id).ok_or("not queued")?.candidate_rev;
+    assert!(!h.engine().candidates().contains(&id));
+    let hits = test_hits(mock).await.len();
+    h.evict_candidate(&id);
+    let again = h.approver().open(&id).map_err(de)?.preview;
+    assert_eq!(test_hits(mock).await.len(), hits, "a rebuild makes no call");
+    assert_eq!(again.candidate_rev.candidate_hash, rev.candidate_hash);
+    assert!(again.approvable, "the rebuilt candidate matches its hash");
+    let env = released(&h, &id).await?;
+    assert_eq!(
+        released_value(&env)?,
+        markdown_with(TWO_USERS_STORAGE, &[JDOE, ASMITH])
+    );
+    assert_eq!(test_hits(mock).await.len(), hits);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_user_cache_change_does_not_change_hash() -> TestResult {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .limits(Limits {
+            candidate_cache_bytes: MIB / 1024,
+            ..Limits::default()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    let mut page = page_with_storage(TWO_USERS_STORAGE);
+    page["title"] = json!("x".repeat(2048));
+    mount_page(mock, ID, &page).await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let rev = h.approver().item(&id).ok_or("not queued")?.candidate_rev;
+    // After the fetch the cache learns another name for the same key.
+    assert!(h.user_cache_set("wiki", "key-jdoe", Some("renamed")));
+    h.evict_candidate(&id);
+    let again = h.approver().open(&id).map_err(de)?.preview;
+    assert_eq!(again.candidate_rev.candidate_hash, rev.candidate_hash);
+    assert!(again.approvable);
+    let env = released(&h, &id).await?;
+    let value = released_value(&env)?;
+    assert!(
+        value.contains("@jdoe") && !value.contains("renamed"),
+        "{value}"
+    );
+    // A new read takes the cache as it is now.
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let env = released(&h, &id).await?;
+    assert!(released_value(&env)?.contains("@renamed"));
+    Ok(())
+}
+
+/// Mounts the two-user page with lookups that answer only after a long delay, submits the read
+/// and waits until its first lookup is in flight.
+async fn read_held_in_lookup(h: &Harness) -> Result<String, TestError> {
+    let mock = wiki(h)?;
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users_delayed(mock, &[JDOE, ASMITH], Duration::from_secs(30)).await;
+    let env = h.submit(PAGE_GET, json!({ "id": ID })).await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    wait_lookups(mock, 1).await?;
+    // The GET has left; the answer is held by the mock.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(id)
+}
+
+/// The records of a read cancelled during its first lookup, for `reason`.
+async fn assert_cancelled_in_lookup(h: &Harness, id: &str, reason: &str) -> TestResult {
+    assert_eq!(
+        h.event_types(id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::READ_FETCHED,
+            EventType::CANCELLED,
+        ]
+    );
+    let fetch = records(h, id, EventType::PREVIEW_FETCH).await?;
+    let f = fetch.first().ok_or("no PREVIEW_FETCH")?;
+    assert_eq!(f["purpose"], "resolve", "{f}");
+    assert_eq!(f["outcome"], "cancelled_in_flight");
+    assert_eq!(f["reason"], reason);
+    assert_eq!(f["path"], "/wiki/rest/api/user?key=key-asmith");
+    // §5.2 step 3: every byte received, so the content page already received.
+    let r = read_fetched(h, id).await?;
+    assert_eq!(r["outcome"], "cancelled_in_flight", "{r}");
+    assert_eq!(r["reason"], reason);
+    assert_eq!(r["pages"], 1);
+    let text = r.to_string();
+    assert!(
+        text.contains("key-asmith") && text.contains("Owners"),
+        "{r}"
+    );
+    assert!(r["size"].as_u64() > Some(100), "{r}");
+    let cancelled = records(h, id, EventType::CANCELLED).await?;
+    assert_eq!(
+        cancelled.first().map(|c| c["reason"].clone()),
+        Some(json!(reason))
+    );
+    Ok(())
+}
+
+fn same(id: &str, env: &Envelope) -> String {
+    env.to_json_line().replace(id, "<id>")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_resolve_records_cancelled_in_flight() -> TestResult {
+    let h = Harness::confluence().await?;
+    let id = read_held_in_lookup(&h).await?;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    assert_cancelled_in_lookup(&h, &id, "by_client").await?;
+    // The second lookup never left.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(looked_up(wiki(&h)?).await, ["key-asmith"]);
+    // The envelope is the one of a cancel in `AwaitingRelease`.
+    mount_page(wiki(&h)?, "65538", &page_with_storage(INFO_STORAGE)).await;
+    let other = queued(&h, PAGE_GET, json!({ "id": "65538" })).await?;
+    let env2 = h.handler().cancel(&other).await;
+    assert_eq!(same(&id, &env), same(&other, &env2));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quit_during_resolve_records_cancelled_in_flight() -> TestResult {
+    let h = Harness::confluence().await?;
+    let id = read_held_in_lookup(&h).await?;
+    let env = h
+        .engine()
+        .cancel_and_wait(&id, CancelCause::Shutdown(ShutdownReason::AppQuit))
+        .await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    assert_cancelled_in_lookup(&h, &id, "app_quit").await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lookups_are_sequential() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let storage = r#"<p><ri:user ri:userkey="k1"/> <ri:user ri:userkey="k2"/> <ri:user ri:userkey="k3"/></p>"#;
+    mount_page(mock, ID, &page_with_storage(storage)).await;
+    mount_users_delayed(
+        mock,
+        &[
+            ("k1", Some("one")),
+            ("k2", Some("two")),
+            ("k3", Some("three")),
+        ],
+        Duration::from_millis(300),
+    )
+    .await;
+    let env = h.submit(PAGE_GET, json!({ "id": ID })).await;
+    let id = request_id(&env)?;
+    let mut seen = 0;
+    for _ in 0..2000 {
+        // Hits first, then the committed records: a record committed in between only helps.
+        let hits = user_gets(mock).await.len();
+        let types = h.event_types(&id).await?;
+        let committed = types
+            .iter()
+            .filter(|t| **t == EventType::PREVIEW_FETCH)
+            .count();
+        assert!(
+            hits <= committed + 1,
+            "{hits} lookups sent with {committed} recorded: two in flight"
+        );
+        seen = seen.max(hits);
+        if types.contains(&EventType::READ_FETCHED) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(seen, 3);
+    assert_eq!(looked_up(mock).await, ["k1", "k2", "k3"]);
+    assert_eq!(records(&h, &id, EventType::PREVIEW_FETCH).await?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lookup_key_is_a_query_pair() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let long = "k".repeat(300);
+    let storage = format!(
+        r#"<p><ri:user ri:userkey="a&amp;b#c/d e"/> <ri:user ri:userkey="{long}"/> <ri:user ri:userkey="x&#127;y"/></p>"#
+    );
+    mount_page(mock, ID, &page_with_storage(&storage)).await;
+    mount_users(mock, &[("a&b#c/d e", Some("odd"))]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let gets = user_gets(mock).await;
+    let [only] = gets.as_slice() else {
+        return Err(format!("{} lookups", gets.len()).into());
+    };
+    // A query pair, encoded by `build_url` (form encoding: the space is `+`); never in the path.
+    assert_eq!(only.url.query(), Some("key=a%26b%23c%2Fd+e"));
+    assert_eq!(only.url.path(), "/wiki/rest/api/user");
+    assert_eq!(query(only, "key").as_deref(), Some("a&b#c/d e"));
+    // The 300-char key and the one with U+007F (a control character XML allows) are not
+    // looked up: unresolved.
+    let mut want = Map::new();
+    want.insert("a&b#c/d e".into(), json!("odd"));
+    want.insert(long.clone(), Value::Null);
+    want.insert("x\u{7f}y".into(), Value::Null);
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        Value::Object(want)
+    );
+    let env = released(&h, &id).await?;
+    assert!(released_value(&env)?.contains("@odd"));
+    // U+0001 is not an XML character: the body does not parse (`xml_ok` false), the fallback
+    // renders no mention, and nothing is looked up.
+    mount_page(
+        mock,
+        "65538",
+        &page_with_storage(r#"<p><ri:user ri:userkey="a&#1;b"/></p>"#),
+    )
+    .await;
+    let id = queued(&h, PAGE_GET, json!({ "id": "65538" })).await?;
+    assert_eq!(user_gets(mock).await.len(), 1);
+    assert_eq!(read_fetched(&h, &id).await?["user_resolutions"], json!({}));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lookup_sub_budget_degrades_to_null() -> TestResult {
+    // Less than the 20 s reserve is left after the content page.
+    let h = Harness::builder()
+        .confluence("wiki")
+        .read_budget(ReadBudget {
+            total: Duration::from_secs(15),
+            ..ReadBudget::default()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert!(user_gets(mock).await.is_empty());
+    assert_eq!(
+        h.event_types(&id).await?,
+        [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED]
+    );
+    assert_eq!(
+        read_fetched(&h, &id).await?["user_resolutions"],
+        json!({ "key-jdoe": null, "key-asmith": null })
+    );
+    let env = released(&h, &id).await?;
+    let value = released_value(&env)?;
+    assert!(value.contains("@user:key-jdoe"), "{value}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_cache_cleared_on_credential_change() -> TestResult {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let a = wiki(&h)?;
+    // The connection test of `set_token`.
+    a.confluence_user_current(UserKind::Known, TEST_USER, TEST_USER_KEY)
+        .await;
+    a.applinks_manifest("9.2.1").await;
+    mount_page(a, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users(a, &[JDOE, ASMITH]).await;
+    queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(
+        user_gets(a).await.len(),
+        2,
+        "the second read used the cache"
+    );
+    // `credential_changed`: a new token (the same user's) is stored.
+    h.instances()
+        .set_token("wiki", SecretString::from("rotated-pat".to_owned()), None)
+        .await?;
+    assert_eq!(h.user_cached("wiki", "key-jdoe"), None);
+    queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(
+        user_gets(a).await.len(),
+        4,
+        "looked up again under the new token"
+    );
+    // `instance_changed`: the base URL moves to B (the PAT is deleted with it).
+    assert_eq!(h.user_cached("wiki", "key-jdoe"), Some(Some("jdoe".into())));
+    let b = MockDc::start(atlas_duck_atlassian::Product::Confluence, "/wiki2").await;
+    b.confluence_user_current(UserKind::Known, TEST_USER, TEST_USER_KEY)
+        .await;
+    b.applinks_manifest("9.2.1").await;
+    mount_page(&b, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_users(&b, &[JDOE, ASMITH]).await;
+    h.instances().change_base_url("wiki", &b.base_url())?;
+    assert_eq!(h.user_cached("wiki", "key-jdoe"), None);
+    h.instances()
+        .set_token("wiki", SecretString::from("new-pat".to_owned()), None)
+        .await?;
+    queued(&h, PAGE_GET, json!({ "id": ID })).await?;
+    assert_eq!(user_gets(&b).await.len(), 2, "B is asked for both users");
+    assert_eq!(user_gets(a).await.len(), 4);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn storage_format_resolves_nothing() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let mut old = page_with_storage(TWO_USERS_STORAGE);
+    old["version"]["number"] = json!(2);
+    mount_page(mock, ID, &page_with_storage(TWO_USERS_STORAGE)).await;
+    mount_history_version(mock, ID, 2, &old).await;
+    mount_users(mock, &[JDOE, ASMITH]).await;
+    for (op, params) in [
+        (PAGE_GET, json!({ "id": ID, "format": "storage" })),
+        (
+            PAGE_HISTORY,
+            json!({ "id": ID, "version": 2, "format": "storage" }),
+        ),
+    ] {
+        let id = queued(&h, op, params).await?;
+        assert_eq!(
+            h.event_types(&id).await?,
+            [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED],
+            "{op}"
+        );
+        assert!(
+            read_fetched(&h, &id)
+                .await?
+                .get("user_resolutions")
+                .is_none()
+        );
+    }
+    assert!(user_gets(mock).await.is_empty());
+    // The same body as Markdown resolves both.
+    queued(&h, PAGE_HISTORY, json!({ "id": ID, "version": 2 })).await?;
+    assert_eq!(user_gets(mock).await.len(), 2);
     Ok(())
 }

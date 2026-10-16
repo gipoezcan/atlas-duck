@@ -62,6 +62,9 @@ pub mod settings;
 pub(crate) mod shutdown;
 /// The "possible duplicate" and "similar request" flags and their RF-4 seeding (§5.6, L45).
 pub mod similarity;
+/// The per-instance Confluence user cache and the user lookups of a Markdown page read (§7.6,
+/// PD-99); crate-private (Δ3).
+pub(crate) mod users;
 /// Static params validation: schema, field rules, caps, move limit, `min_version` (§2.3, §5.2).
 pub mod validate;
 

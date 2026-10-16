@@ -1620,7 +1620,7 @@ pub(super) fn recheck(outcome: FetchOutcome) -> Result<Value, Recheck> {
 }
 
 /// The resolved path and query of a GET, for `PREVIEW_FETCH.path`.
-pub(super) fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
+pub(crate) fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
     match build_url(base, &call.endpoint_template, &call.params, &call.query) {
         Ok(u) => match u.query() {
             Some(q) => format!("{}?{q}", u.path()),
@@ -1632,7 +1632,7 @@ pub(super) fn call_path(base: &NormalizedBaseUrl, call: &GetCall) -> String {
 
 /// `PREVIEW_FETCH {purpose, method, path, status, response | outcome}` of one GET, with every
 /// byte received (§5.4 step 2); a GET that was refused or never left names its `class`.
-pub(super) fn get_record(
+pub(crate) fn get_record(
     ctx: &EventCtx,
     purpose: PreviewFetchPurpose,
     base: &NormalizedBaseUrl,
@@ -1842,7 +1842,7 @@ async fn enrich(engine: &Arc<Engine>, entry: &Arc<RequestEntry>) {
 
 /// The GET finished and its record is built: park it until an append commits it, so a cancel or
 /// expiry in between still logs it (Task 24 review I-2).
-pub(super) async fn park(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, record: &NewEvent) {
+pub(crate) async fn park(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, record: &NewEvent) {
     entry.park_record(record);
     #[cfg(feature = "testing")]
     if let Some(pause) = engine.hooks.pause_after_get.clone() {
