@@ -5,6 +5,7 @@
 //! (§7.7 Path stability). The machine-local pinned files `paths.toml` and
 //! `cli.toml` are host-qualified on macOS/Linux (§7.7 Machine-local files).
 
+mod appimage;
 mod base_dirs;
 mod endpoint;
 mod host;
@@ -13,6 +14,7 @@ mod locality;
 mod pinned;
 mod resolve;
 
+pub use appimage::{looks_absolute, runs_from_appimage, under_mount};
 pub use base_dirs::{BaseDirs, FirstRunDefaults, base_dirs, first_run_defaults};
 // T21 review I-1: exists only with `test-paths`, so the app's test build fails to compile if the
 // feature is not forwarded.

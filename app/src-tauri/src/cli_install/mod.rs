@@ -24,9 +24,9 @@ pub mod windows;
 
 use std::ffi::OsString;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
-use atlas_duck_ipc::paths::{CliToml, PinnedError, cli_file};
+use atlas_duck_ipc::paths::{self, CliToml, PinnedError, cli_file, looks_absolute, under_mount};
 use serde::Serialize;
 use serde::ser::SerializeMap;
 
@@ -196,29 +196,12 @@ pub struct Inputs {
     pub appdir: Option<PathBuf>,
 }
 
-/// A path that starts with `/` counts as absolute on every platform: the layouts of other
-/// platforms are resolved in tests too.
-fn looks_absolute(p: &Path) -> bool {
-    p.is_absolute() || p.to_str().is_some_and(|s| s.starts_with('/'))
-}
-
-/// An AppImage's mount point (`/tmp/.mount_<random>`): it vanishes with the process.
-pub fn under_mount(p: &Path) -> bool {
-    p.components().any(|c| match c {
-        Component::Normal(n) => n.to_str().is_some_and(|s| s.starts_with(".mount_")),
-        _ => false,
-    })
-}
-
-/// This process really runs from an AppImage: the binary is under `$APPDIR` or under the
-/// `.mount_*` point. Children of any AppImage inherit `$APPIMAGE` (a terminal or editor shipped as
-/// one, then a deb install started from it), so the variable alone proves nothing.
+/// This process really runs from an AppImage (the rule is shared with the CLI's app discovery:
+/// `atlas_duck_ipc::paths::runs_from_appimage`). Children of any AppImage inherit `$APPIMAGE`
+/// (a terminal or editor shipped as one, then a deb install started from it), so the variable alone
+/// proves nothing.
 fn runs_from_appimage(i: &Inputs) -> bool {
-    under_mount(&i.current_exe)
-        || i.appdir.as_ref().is_some_and(|dir| {
-            // The root has no parent: an `$APPDIR` of `/` would contain every path.
-            looks_absolute(dir) && dir.parent().is_some() && i.current_exe.starts_with(dir)
-        })
+    paths::runs_from_appimage(&i.current_exe, i.appdir.as_deref())
 }
 
 impl Layout {

@@ -142,7 +142,7 @@ fn locate_app(
     env: &dyn Fn(&str) -> Option<OsString>,
     exe: Option<&Path>,
 ) -> AppLocation {
-    if let Some(image) = appimage(env) {
+    if let Some(image) = appimage(env, exe) {
         return AppLocation::Found(image);
     }
     if let Some(next_to) = exe
@@ -164,17 +164,25 @@ fn locate_app(
     AppLocation::NotFound
 }
 
-/// `$APPIMAGE` when it names an existing file by absolute path. AppImages exist only on Linux;
-/// elsewhere the variable (which an agent can set) never chooses what the CLI launches.
+/// `$APPIMAGE` when it names an existing file by absolute path and this CLI really runs from an
+/// AppImage (M6 final review I-3). Children of any AppImage inherit the variable (an AppImage
+/// terminal or editor, then a deb or rpm `atlas-duck` run by an agent in it), so it only counts
+/// when the CLI binary is under a `.mount_*` point or a non-root `$APPDIR`: the rule the app's
+/// `cli_install` uses (`atlas_duck_ipc::paths::runs_from_appimage`). AppImages exist only on
+/// Linux; elsewhere the variable (which an agent can set) never chooses what the CLI launches.
 #[cfg(target_os = "linux")]
-fn appimage(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+fn appimage(env: &dyn Fn(&str) -> Option<OsString>, exe: Option<&Path>) -> Option<PathBuf> {
+    let appdir = env("APPDIR").filter(|v| !v.is_empty()).map(PathBuf::from);
+    if !exe.is_some_and(|exe| atlas_duck_ipc::paths::runs_from_appimage(exe, appdir.as_deref())) {
+        return None;
+    }
     env("APPIMAGE")
         .map(PathBuf::from)
         .filter(|image| image.is_absolute() && image.is_file())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn appimage(_env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+fn appimage(_env: &dyn Fn(&str) -> Option<OsString>, _exe: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
@@ -381,27 +389,62 @@ mod tests {
             AppLocation::Found(next_to.clone())
         );
 
-        // On Linux $APPIMAGE beats next-to, but only when it is an existing file; elsewhere it is
-        // never consulted.
+        // $APPIMAGE that is not an existing file is ignored.
         assert_eq!(
             discover_with(&b, HOST, &with_image, Some(&exe)).app,
             AppLocation::Found(next_to.clone())
         );
         touch(&image);
+        // Final review I-3: a leaked $APPIMAGE (this CLI is not inside an AppImage: no mount
+        // point, no $APPDIR around it) never chooses the app, on any platform.
+        assert_eq!(
+            discover_with(&b, HOST, &with_image, Some(&exe)).app,
+            AppLocation::Found(next_to.clone())
+        );
+        let leaked_with_appdir = |k: &str| match k {
+            "APPIMAGE" => Some(image.clone().into_os_string()),
+            "APPDIR" => Some(tmp.path().join("other-appimage-root").into_os_string()),
+            _ => None,
+        };
+        assert_eq!(
+            discover_with(&b, HOST, &leaked_with_appdir, Some(&exe)).app,
+            AppLocation::Found(next_to.clone())
+        );
+        // On Linux a CLI that does run from an AppImage (under its mount point, or under the
+        // extracted $APPDIR) launches that image, ahead of the app next to it; elsewhere never.
+        let mounted = tmp.path().join(".mount_atlasXYZ/usr/bin/atlas-duck");
+        let appdir = tmp.path().join("squashfs-root");
+        let extracted = appdir.join("usr/bin/atlas-duck");
+        let with_appdir = |k: &str| match k {
+            "APPIMAGE" => Some(image.clone().into_os_string()),
+            "APPDIR" => Some(appdir.clone().into_os_string()),
+            _ => None,
+        };
+        // Off Linux nothing sits next to those binaries, so cli.toml's listed app is what is left.
         let expected = if cfg!(target_os = "linux") {
             image.clone()
         } else {
-            next_to.clone()
+            listed.clone()
         };
-        assert_eq!(
-            discover_with(&b, HOST, &with_image, Some(&exe)).app,
-            AppLocation::Found(expected)
-        );
-        // A relative $APPIMAGE is ignored.
+        for (env, exe) in [
+            (&with_image as &dyn Fn(&str) -> Option<OsString>, &mounted),
+            (&with_appdir, &extracted),
+        ] {
+            assert_eq!(
+                discover_with(&b, HOST, env, Some(exe)).app,
+                AppLocation::Found(expected.clone()),
+                "{exe:?}"
+            );
+        }
+        // A relative $APPIMAGE is ignored, even inside an AppImage.
         let relative = |_: &str| Some(OsString::from("App.AppImage"));
         assert_eq!(
             discover_with(&b, HOST, &relative, Some(&exe)).app,
             AppLocation::Found(next_to)
+        );
+        assert_eq!(
+            discover_with(&b, HOST, &relative, Some(&mounted)).app,
+            AppLocation::Found(listed)
         );
     }
 
