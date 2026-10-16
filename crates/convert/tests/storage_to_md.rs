@@ -4,13 +4,15 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use atlas_duck_convert::storage::KNOWN_MACROS;
 use atlas_duck_convert::{ConversionReport, LostCounts, UserResolutions, storage_to_markdown};
 use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const GOLDEN: [&str; 10] = [
+const GOLDEN: [&str; 11] = [
     "basics",
     "macros",
     "code_cdata",
@@ -21,6 +23,7 @@ const GOLDEN: [&str; 10] = [
     "lookalikes",
     "lookalikes_code",
     "fallback",
+    "dates_tasks",
 ];
 
 fn golden_dir() -> PathBuf {
@@ -119,11 +122,7 @@ fn golden_reports() -> TestResult {
                 links: 0,
                 layouts: 0
             },
-            unknown_macros: vec![
-                "roadmap-planner".to_owned(),
-                "emoticon".to_owned(),
-                "include".to_owned()
-            ],
+            unknown_macros: vec!["roadmap-planner".to_owned(), "include".to_owned()],
             unresolved_users: 0,
             fallback: false,
         }
@@ -157,9 +156,28 @@ fn golden_reports() -> TestResult {
     );
     let (_, r, _) = storage_to_markdown(&read("tasks_layouts")?, &golden_users());
     assert_eq!(r.lost.layouts, 1);
+    assert_eq!(r.lost.macros, 1, "the task list (T3 review I-3)");
     assert!(r.lossy);
     let (_, r, _) = storage_to_markdown(&read("fallback")?, &golden_users());
     assert!(r.fallback && r.lossy, "{r:?}");
+    // status, the outer task list (the nested one is not counted again), the emoticon, `_x_`
+    // and details; the `ac:link` inside `<a>`; only `_x_` is unknown (Q11), dates are not lost.
+    let (_, r, _) = storage_to_markdown(&read("dates_tasks")?, &golden_users());
+    assert_eq!(
+        r,
+        ConversionReport {
+            lossy: true,
+            lost: LostCounts {
+                macros: 5,
+                images: 0,
+                links: 1,
+                layouts: 0
+            },
+            unknown_macros: vec!["_x_".to_owned()],
+            unresolved_users: 0,
+            fallback: false,
+        }
+    );
     for name in ["basics", "entities", "lookalikes", "lookalikes_code"] {
         let (_, r, _) = storage_to_markdown(&read(name)?, &golden_users());
         assert_eq!(r, ConversionReport::default(), "{name}");
@@ -388,7 +406,7 @@ fn unresolved_key_is_percent_encoded() -> TestResult {
         "<p><ri:user ri:userkey=\"a b%c_d.e-f\"/></p>",
         &UserResolutions::new(),
     );
-    assert_eq!(out, "@user:a%20b%25c_d.e-f\n");
+    assert_eq!(out, "@user:a%20b%25c%5Fd.e-f\n");
     Ok(())
 }
 
@@ -405,7 +423,7 @@ fn macro_params_escaped_and_on_one_line() -> TestResult {
     );
     // A name outside the placeholder grammar is made to fit it.
     let out = md("<ac:structured-macro ac:name=\"my macro/ü\"/>");
-    assert_eq!(out, "[macro: my_macro__ {}]\n");
+    assert_eq!(out, "[macro: my-macro-- {}]\n");
     let long = "m".repeat(70);
     let out = md(&format!("<ac:structured-macro ac:name=\"{long}\"/>"));
     assert_eq!(out, format!("[macro: {} {{}}]\n", "m".repeat(64)));
@@ -451,7 +469,10 @@ fn generic_ac_elements_keep_their_content() -> TestResult {
     assert_eq!(out, "Fill [macro: placeholder {}]your name in.\n");
     let r = report("<p><ac:placeholder>x</ac:placeholder></p>");
     assert_eq!(r.lost.macros, 1);
-    assert_eq!(r.unknown_macros, vec!["placeholder".to_owned()]);
+    assert!(
+        r.unknown_macros.is_empty(),
+        "no unknown-macros Info (Q11): {r:?}"
+    );
     // A foreign-namespace element is markup: a placeholder, never its content.
     let out = md(
         "<p>a <zz:structured-macro xmlns:zz=\"http://atlassian.com/content\" \
@@ -506,6 +527,212 @@ fn fallback_never_recurses_without_bound() -> TestResult {
     let (out, r, _) = storage_to_markdown(&ok, &UserResolutions::new());
     assert!(!r.fallback);
     assert!(out.trim_end().ends_with("deep"), "{out}");
+    Ok(())
+}
+
+/// Found by the fix round's property test (T3 review m-8 leaves): `htmd` leaves a `~~~` after
+/// a text's leading whitespace unescaped, and the tilde fence would hide the placeholder after
+/// it in a code block. Every tilde fence is escaped (the converter writes backtick fences only).
+#[test]
+fn prose_tilde_fences_cannot_hide_placeholders() -> TestResult {
+    let toc = "<ac:structured-macro ac:name=\"toc\"/>";
+    let out = md(&format!(
+        "<blockquote><ac:structured-macro ac:name=\"info\"><ac:rich-text-body><p> ~~~{toc}</p>\
+         </ac:rich-text-body></ac:structured-macro></blockquote>"
+    ));
+    assert_eq!(out, "> [macro: info {}]\n> \n> \\~~~[macro: toc {}]\n");
+    assert_eq!(oracle(&out).macros, 2, "{out}");
+    // A tilde block holding further tilde lines: none of them opens a fence afterwards.
+    let out = md(&format!(
+        "<p> ~~~~</p><p> ~~~</p><p>{toc}</p><p> ~~~</p><p>{toc}</p>"
+    ));
+    assert_eq!(oracle(&out).macros, 2, "{out}");
+    assert!(!out.lines().any(|l| l.starts_with("~~~")), "{out}");
+    // A code macro's fence is the converter's own and stays.
+    let code = md(
+        "<ac:structured-macro ac:name=\"code\"><ac:plain-text-body><![CDATA[~~~\nx]]>\
+                   </ac:plain-text-body></ac:structured-macro>",
+    );
+    assert_eq!(code, "```\n~~~\nx\n```\n");
+    Ok(())
+}
+
+/// Found by the fix round's property test (20 000 cases): `htmd` can leave a hard break's `\`
+/// without its newline right before a construct, where it would escape the placeholder.
+#[test]
+fn dangling_hard_break_backslash_cannot_hide_placeholders() -> TestResult {
+    let storage = "<ac:link-body><ac:link-body><br/></ac:link-body><a name=\"anchor\">\
+                   <ri:user ri:userkey=\"8a7f\"/></a></ac:link-body>";
+    let (out, r, _) = storage_to_markdown(storage, &UserResolutions::new());
+    assert_eq!(out, "\\\\@user:8a7f\n");
+    assert_eq!(oracle(&out).users, 1, "{out}");
+    assert_eq!(r.unresolved_users, 1);
+    let out = md("<p><span><br/></span><ac:structured-macro ac:name=\"toc\"/></p>");
+    assert_eq!(oracle(&out).macros, 1, "{out}");
+    Ok(())
+}
+
+/// T3 review B-1: misnested markup that `html5ever` would rebuild into a tree as deep (the
+/// adoption agency) or as large (formatting reconstruction with distinct attributes) as the
+/// input chooses never reaches an HTML parser: the fallback strips every tag.
+#[test]
+fn fallback_strips_misnested_markup() -> TestResult {
+    let started = Instant::now();
+    let adoption = "<b><div></b>".repeat(20_000);
+    let (out, r, users) = storage_to_markdown(&adoption, &UserResolutions::new());
+    assert!(r.fallback && r.lossy, "{r:?}");
+    assert!(users.is_empty());
+    assert_eq!(out, "");
+    let with_text = "<b><div>x</b>".repeat(20_000);
+    let (out, r, _) = storage_to_markdown(&with_text, &UserResolutions::new());
+    assert!(r.fallback);
+    assert_eq!(out.matches('x').count(), 20_000);
+    let classes: String = (0..3000)
+        .map(|k| format!("<p><b class=\"c{k}\">x</p>"))
+        .collect();
+    let a = storage_to_markdown(&classes, &UserResolutions::new());
+    assert!(a.1.fallback && a.1.lossy, "{:?}", a.1);
+    assert_eq!(a.0.matches('x').count(), 3000);
+    assert_eq!(a, storage_to_markdown(&classes, &UserResolutions::new()));
+    // The well-formed `<b><div/></b>`, forced into the fallback by a malformation at the end.
+    let self_closed = format!("{}<p>", "<b><div/>x</b>".repeat(20_000));
+    let (out, r, _) = storage_to_markdown(&self_closed, &UserResolutions::new());
+    assert!(r.fallback);
+    assert_eq!(out.matches('x').count(), 20_000);
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
+#[test]
+fn fallback_text_is_escaped_prose() -> TestResult {
+    let storage = "<p>a &amp; b &lt;c&gt; &uuml; &bogus; &#0; x<y 1 < 2</p>\
+                   <!-- <p>hidden</p> --><p># not a heading</p><p>1. not a list</p>\
+                   <p>- not an item</p><p>*not em* [macro: t {}] @user:q</p>\
+                   <p>Due <time datetime=\"2026-10-20\"/>.</p><p title=\"a>b\">attr</p>\
+                   <b>unclosed";
+    let (out, r, _) = storage_to_markdown(storage, &UserResolutions::new());
+    assert!(r.fallback);
+    let expected = r"a \& b \<c> ü \&bogus; \&#0; x\<y 1 \< 2
+
+\# not a heading
+
+1\. not a list
+
+\- not an item
+
+\*not em\* \[macro: t {}\] \@user:q
+
+Due 2026-10-20.
+
+attr
+
+unclosed
+";
+    assert_eq!(out, expected);
+    Ok(())
+}
+
+/// Lead ruling Q11: the known-macro list, and `ac:` elements that never raise the Info.
+#[test]
+fn known_macros_and_quiet_elements() -> TestResult {
+    let known = [
+        "code", "noformat", "info", "note", "tip", "warning", "panel", "expand", "excerpt", "toc",
+        "anchor", "status", "details", "section", "column", "toc-zone",
+    ];
+    assert_eq!(KNOWN_MACROS.len(), known.len());
+    for name in known {
+        let r = report(&format!("<ac:structured-macro ac:name=\"{name}\"/>"));
+        assert!(r.unknown_macros.is_empty(), "{name}: {r:?}");
+    }
+    for name in [
+        "children",
+        "jira",
+        "include",
+        "excerpt-include",
+        "pagetree",
+        "contentbylabel",
+        "jiraissues",
+        "html",
+        "recently-updated",
+    ] {
+        let r = report(&format!("<ac:structured-macro ac:name=\"{name}\"/>"));
+        assert_eq!(r.unknown_macros, vec![name.to_owned()]);
+        assert_eq!(r.lost.macros, 1);
+    }
+    // Emoticons and instructional placeholders stay placeholders and count, without the Info.
+    let storage = "<p><ac:emoticon ac:name=\"tick\"/> <ac:placeholder>x</ac:placeholder></p>";
+    assert_eq!(
+        md(storage),
+        "[macro: emoticon {}] [macro: placeholder {}]x\n"
+    );
+    let r = report(storage);
+    assert_eq!(r.lost.macros, 2);
+    assert!(r.lossy);
+    assert!(r.unknown_macros.is_empty(), "{r:?}");
+    // A nameless macro is listed by the name its placeholder shows (T3 review m-3).
+    let (out, r, _) = storage_to_markdown("<ac:structured-macro/>", &UserResolutions::new());
+    assert_eq!(out, "[macro: - {}]\n");
+    assert_eq!(r.unknown_macros, vec!["-".to_owned()]);
+    Ok(())
+}
+
+/// T3 review I-3: a Markdown round trip turns tasks into plain list items, so each outermost
+/// task list is one lost macro (a nested one is not counted again; a task's content is).
+#[test]
+fn task_lists_count_as_lost_macros() -> TestResult {
+    let task = |body: &str| {
+        format!(
+            "<ac:task><ac:task-status>incomplete</ac:task-status><ac:task-body>{body}\
+             </ac:task-body></ac:task>"
+        )
+    };
+    let list = |tasks: String| format!("<ac:task-list>{tasks}</ac:task-list>");
+    let storage = format!(
+        "{}{}",
+        list(task("a") + &task(&list(task("b")))),
+        list(task("<ac:link><ri:user ri:userkey=\"k\"/></ac:link>"))
+    );
+    let r = report(&storage);
+    assert_eq!(
+        r.lost,
+        LostCounts {
+            macros: 2,
+            images: 0,
+            links: 1,
+            layouts: 0
+        }
+    );
+    assert!(r.lossy);
+    assert!(r.unknown_macros.is_empty(), "{r:?}");
+    Ok(())
+}
+
+/// T3 review I-2: a date lozenge keeps its date, as text, and is not counted lost.
+#[test]
+fn time_lozenges_keep_their_date() -> TestResult {
+    assert_eq!(
+        md("<p>Due: <time datetime=\"2026-10-20\" /></p>"),
+        "Due: 2026-10-20\n"
+    );
+    assert_eq!(
+        md("<p><time datetime=\"2026-10-20\">20 Oct</time></p>"),
+        "20 Oct\n"
+    );
+    assert_eq!(
+        md(
+            "<table><tbody><tr><th>Due</th></tr><tr><td><time datetime=\"2026-10-20\"/></td>\
+            </tr></tbody></table>"
+        ),
+        "| Due        |\n| ---------- |\n| 2026-10-20 |\n"
+    );
+    assert_eq!(
+        report("<p><time datetime=\"2026-10-20\"/></p>"),
+        ConversionReport::default()
+    );
     Ok(())
 }
 
@@ -718,6 +945,22 @@ fn inline_leaf() -> impl Strategy<Value = (String, Counts)> {
         ("<ac:link ac:anchor=\"top\"/>", NONE),
         ("<ac:image><ri:attachment ri:filename=\"a].png\"/></ac:image>", image),
         ("<ac:image><ri:url ri:value=\"https://x/(a)\"/></ac:image>", image),
+        // T3 review I-1 and m-8: names and keys with `_`, block openers after a hard break.
+        ("<ac:structured-macro ac:name=\"_x_\"/>", mac),
+        ("<ac:structured-macro ac:name=\"a._b_\"/>", mac),
+        ("<ac:emoticon ac:name=\"__a__\"/>", mac),
+        ("<ac:_y_/>", mac),
+        ("<ri:user ri:userkey=\"_u_\"/>", user),
+        ("_x", NONE),
+        ("x_", NONE),
+        ("~~~", NONE),
+        ("<br/>~~~", NONE),
+        ("<br/>```", NONE),
+        ("<br/>---", NONE),
+        ("<br/>===", NONE),
+        ("<br/>    x", NONE),
+        ("<br/># x", NONE),
+        ("<time datetime=\"2026-10-20\"/>", NONE),
     ])
     .prop_map(|(s, c)| (s.to_owned(), c))
 }
@@ -830,5 +1073,22 @@ proptest! {
         prop_assert!(!report.fallback, "{}", storage);
         prop_assert_eq!(oracle(&out), expected, "storage {}\nmarkdown {}", storage, out);
         prop_assert_eq!(report.unresolved_users, expected.users);
+    }
+
+    /// T3 review I-1: whatever the macro names and the prose around them, each placeholder is
+    /// exactly one hit (the character class keeps the storage well-formed).
+    #[test]
+    fn any_macro_name_is_one_placeholder(
+        a in "[a-z0-9_*.üß -]{0,70}",
+        b in "[a-z_*ü]{0,8}",
+        prose in "[a-z_* ]{0,6}",
+    ) {
+        let storage = format!(
+            "<p>{prose}<ac:structured-macro ac:name=\"{a}\"/>{prose}\
+             <ac:structured-macro ac:name=\"{b}\"/>{prose}</p>"
+        );
+        let (out, report, _) = storage_to_markdown(&storage, &UserResolutions::new());
+        prop_assert!(!report.fallback, "{}", storage);
+        prop_assert_eq!(oracle(&out).macros, 2, "storage {}\nmarkdown {}", storage, out);
     }
 }

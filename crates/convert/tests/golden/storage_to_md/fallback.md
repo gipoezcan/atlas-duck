@@ -1,4 +1,4 @@
-Broken **tag**
+Broken tag
 
 ```
 let x = "<p>";

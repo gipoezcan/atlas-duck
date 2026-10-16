@@ -21,19 +21,21 @@
 //! `htmd` writes as is.
 //!
 //! **Fallback** (the parse is not `xml_ok`): the CDATA sections are cut out of the raw input
-//! first (adjacent ones joined, each a fenced code block at the top level), each part between
-//! them goes through `htmd` (whose parser is `html5ever`) on its own, and the look-alike pass
-//! runs as above. No mention is rendered, no user map is used and nothing is counted (`fallback`
-//! and `lossy` say so). A part nested deeper than [`MAX_DEPTH`] (counted lexically) loses its
-//! tags first, since `htmd` walks the tree recursively; U+FFFE and U+FFFF become U+FFFD.
+//! first (adjacent ones joined, each a fenced code block at the top level), and every part
+//! between them is read lexically: every tag is stripped (a block-level tag ends a paragraph),
+//! character references are decoded, and the text is Markdown-escaped. No HTML parser sees a
+//! body that failed the XML parse: `html5ever` would rebuild misnested markup into a tree as
+//! deep and as large as the input chooses (T3 review B-1). The look-alike pass runs as above.
+//! No mention is rendered, no user map is used and nothing is counted (`fallback` and `lossy`
+//! say so); U+FFFE and U+FFFF become U+FFFD.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use htmd::HtmlToMarkdown;
 use htmd::options::{BrStyle, BulletListMarker, HrStyle, Options};
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 
-use super::parse::{Element, MAX_DEPTH, Node, Ns, parse, user_refs};
+use super::parse::{Element, Node, Ns, decode_attr, lex_attrs, parse, resolve_ref, user_refs};
 use crate::placeholders::{self, PlaceholderKind, escaped};
 
 /// `user_resolutions` (§7.6, Δ1): user key → username, `None` when unresolved.
@@ -64,12 +66,20 @@ pub struct ConversionReport {
     pub fallback: bool,
 }
 
-/// Macros the conversion names without listing them in `unknown_macros` (plan text PD-95;
-/// provisional, lead ruling Q11). Every macro but `code` and `noformat` still counts as lost.
-pub const KNOWN_MACROS: [&str; 14] = [
-    "code", "noformat", "info", "note", "warning", "tip", "panel", "expand", "toc", "status",
-    "anchor", "excerpt", "children", "jira",
+/// Macros the conversion names without listing them in `unknown_macros` (PD-95, lead ruling
+/// Q11 after the Task 3 review): those whose placeholder and inlined body carry everything the
+/// macro stores and shows. A macro whose content the server generates (`children`, `jira`,
+/// `include`, `pagetree`, …) stays unknown, which is what the `unknown_macros` Info is for.
+/// Every macro but `code` and `noformat` still counts as lost.
+pub const KNOWN_MACROS: [&str; 16] = [
+    "code", "noformat", "info", "note", "tip", "warning", "panel", "expand", "excerpt", "toc",
+    "anchor", "status", "details", "section", "column", "toc-zone",
 ];
+
+/// `ac:` elements written as a `[macro: …]` placeholder and counted as lost, but never listed
+/// in `unknown_macros` (lead ruling Q11): a page with an emoticon or an instructional
+/// placeholder does not raise the "unknown macros" Info.
+const AC_QUIET: [&str; 2] = ["emoticon", "placeholder"];
 
 /// `ac:` elements that mark up content without being content: written as their content alone
 /// (no placeholder, no `unknown_macros` entry) but each counted as one lost macro, because a
@@ -79,11 +89,10 @@ pub const KNOWN_MACROS: [&str; 14] = [
 /// uncounted, removing it makes it a `[macro: …]` placeholder.
 const AC_MARKERS: [&str; 1] = ["inline-comment-marker"];
 
-/// `ac:` elements that structure content (descended into, never counted).
-const AC_STRUCTURE: [&str; 12] = [
+/// `ac:` elements that structure content (descended into, never counted). A task list is
+/// structure too, but counted ([`lost_counts`]).
+const AC_STRUCTURE: [&str; 10] = [
     "rich-text-body",
-    "task-list",
-    "task",
     "task-id",
     "task-status",
     "task-body",
@@ -199,8 +208,10 @@ const CDATA_CLOSE: &str = "]]>";
 /// Converts a storage body to Markdown (§7.6, PD-95) with the user map `users` and returns the
 /// Markdown (ending in exactly one newline, or empty), the report, and the map it used: every
 /// non-empty `ri:userkey` of the body (macro parameters included) with its value from `users`,
-/// `None` where `users` lacks it (legacy `ri:username` mentions need no entry). The fallback
-/// uses no map and returns an empty one.
+/// `None` where `users` lacks it (legacy `ri:username` mentions need no entry). A given value
+/// that is no usable username (empty, longer than 255 chars, a control character) is returned
+/// as given but rendered `@user:<key>` and counted unresolved. The fallback uses no map and
+/// returns an empty one.
 /// Pure and deterministic; never panics.
 pub fn storage_to_markdown(
     storage: &str,
@@ -350,6 +361,13 @@ impl<'u> Writer<'u> {
         let name = e.local.to_ascii_lowercase();
         let constructs = has_construct(&e.children);
         match name.as_str() {
+            // A Confluence date lozenge (`<time datetime="2026-10-20"/>`) has no text: its
+            // date is written as text (T3 review I-2; not counted lost).
+            "time" if !constructs && !has_text(&e.children) => {
+                if let Some(date) = e.attr("datetime") {
+                    self.text(date.trim());
+                }
+            }
             "pre" if !constructs => {
                 let mut t = String::new();
                 plain_text(&e.children, &mut t);
@@ -418,7 +436,9 @@ impl<'u> Writer<'u> {
             "task-id" | "task-status" => {}
             local => {
                 if ac_rule(local) == AcRule::Placeholder {
-                    self.unknown(local);
+                    if !AC_QUIET.contains(&local) {
+                        self.unknown(local);
+                    }
                     self.placeholder(local, &[]);
                 }
                 self.nodes(&e.children);
@@ -464,7 +484,10 @@ impl<'u> Writer<'u> {
                 body: plain.unwrap_or_default(),
             });
         } else {
-            if !KNOWN_MACROS.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+            if name.is_empty() {
+                // Listed by the name its placeholder shows (T3 review m-3).
+                self.unknown(&fit_name(name));
+            } else if !KNOWN_MACROS.iter().any(|k| k.eq_ignore_ascii_case(name)) {
                 self.unknown(name);
             }
             let md = macro_placeholder(name, &params);
@@ -683,24 +706,10 @@ fn valid_username(n: &str) -> bool {
             .all(|c| !c.is_control() && c != TOKEN_OPEN && c != TOKEN_CLOSE)
 }
 
-/// `[macro: <name> {<k>=<v>, …}]`: the name made to fit `[A-Za-z0-9_.-]{1,64}` (any other
-/// character becomes `_`), keys and values escaped by [`escape_param`].
+/// `[macro: <name> {<k>=<v>, …}]`: the name made to fit the grammar ([`fit_name`]), keys and
+/// values escaped by [`escape_param`].
 fn macro_placeholder(name: &str, params: &[(String, String)]) -> String {
-    let mut fitted: String = name
-        .chars()
-        .take(MAX_MACRO_NAME)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if fitted.is_empty() {
-        fitted.push('_');
-    }
-    let mut out = format!("[macro: {fitted} {{");
+    let mut out = format!("[macro: {} {{", fit_name(name));
     for (i, (k, v)) in params.iter().enumerate() {
         if i > 0 {
             out.push_str(", ");
@@ -710,6 +719,43 @@ fn macro_placeholder(name: &str, params: &[(String, String)]) -> String {
         out.push_str(&escape_param(v));
     }
     out.push_str("}]");
+    out
+}
+
+/// A placeholder name: `[A-Za-z0-9_.-]{1,64}` (PD-98), the first 64 characters with every
+/// other character as `-`, and every `_` that does not stand between two ASCII alphanumerics
+/// as `-` too (T3 review I-1): only an intraword `_` can neither open nor close emphasis, and
+/// emphasis inside a placeholder would hide it from the placeholder check. Empty → `-`.
+fn fit_name(name: &str) -> String {
+    let chars: Vec<char> = name
+        .chars()
+        .take(MAX_MACRO_NAME)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let alnum = |i: Option<usize>| {
+        i.and_then(|i| chars.get(i))
+            .is_some_and(char::is_ascii_alphanumeric)
+    };
+    let mut out: String = chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            if c == '_' && !(alnum(i.checked_sub(1)) && alnum(Some(i + 1))) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push('-');
+    }
     out
 }
 
@@ -763,8 +809,10 @@ fn url_safe(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-')
 }
 
+/// A user key keeps `[A-Za-z0-9.-]`; `_` is percent-encoded too (`%5F`), so no key can open or
+/// close emphasis and hide a mention from the placeholder check (T3 review I-1).
 fn key_safe(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-')
 }
 
 /// Percent-encodes every byte of `s` that is not `safe`.
@@ -806,6 +854,14 @@ fn has_construct(nodes: &[Node]) -> bool {
         Node::Text(_) => false,
         Node::CData { .. } => true,
         Node::Element(e) => e.ns != Ns::Html || has_construct(&e.children),
+    })
+}
+
+/// Whether `nodes` hold any text that is not whitespace.
+fn has_text(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Text(t) | Node::CData { text: t, .. } => !t.trim().is_empty(),
+        Node::Element(e) => has_text(&e.children),
     })
 }
 
@@ -853,52 +909,61 @@ fn push_html_attr(out: &mut String, t: &str) {
 
 /// The constructs a Markdown round trip of `nodes` loses (PD-104 counting, shared with the
 /// lossy-update check): each `ac:structured-macro` other than `code`/`noformat`, each other
-/// `ac:` element that is not structure (`ac:emoticon`, `ac:inline-comment-marker`, …) and each
-/// foreign element = 1 macro; each `ac:image` = 1 image (its resource is not counted again);
-/// each `ac:link` = 1 link (likewise), and each `ri:` element outside them = 1 link (a bare
-/// `ri:user` mention included); each `ac:layout` = 1 layout. A macro's parameters belong to it;
-/// its rich-text body is content and counted on its own.
+/// `ac:` element that is not structure (`ac:emoticon`, `ac:inline-comment-marker`, …), each
+/// outermost `ac:task-list` (Markdown task items are plain text, T3 review I-3; a stray
+/// `ac:task` likewise) and each foreign element = 1 macro; each `ac:image` = 1 image (its
+/// resource is not counted again); each `ac:link` = 1 link (likewise), and each `ri:` element
+/// outside them = 1 link (a bare `ri:user` mention included); each `ac:layout` = 1 layout. A
+/// macro's parameters belong to it; its rich-text body is content and counted on its own, as
+/// is a task's body.
 pub(crate) fn lost_counts(nodes: &[Node]) -> LostCounts {
     let mut c = LostCounts::default();
-    count_nodes(nodes, &mut c);
+    count_nodes(nodes, &mut c, false);
     c
 }
 
-fn count_nodes(nodes: &[Node], c: &mut LostCounts) {
+/// `in_tasks`: inside a counted task list, whose nested task lists are not counted again.
+fn count_nodes(nodes: &[Node], c: &mut LostCounts, in_tasks: bool) {
     for n in nodes {
         if let Node::Element(e) = n {
-            count_element(e, c);
+            count_element(e, c, in_tasks);
         }
     }
 }
 
-fn count_element(e: &Element, c: &mut LostCounts) {
+fn count_element(e: &Element, c: &mut LostCounts, in_tasks: bool) {
     match (e.ns, e.local.as_str()) {
         (Ns::Other, _) => c.macros += 1,
-        (Ns::Html, _) => count_nodes(&e.children, c),
+        (Ns::Html, _) => count_nodes(&e.children, c, in_tasks),
         (Ns::Ac, "structured-macro" | "macro") => {
             if !is_code(e.attr("ac:name").unwrap_or("")) {
                 c.macros += 1;
             }
             for b in e.child_elements() {
                 if b.is(Ns::Ac, "rich-text-body") {
-                    count_nodes(&b.children, c);
+                    count_nodes(&b.children, c, in_tasks);
                 } else if !(b.is(Ns::Ac, "parameter") || b.is(Ns::Ac, "plain-text-body")) {
-                    count_element(b, c);
+                    count_element(b, c, in_tasks);
                 }
             }
+        }
+        (Ns::Ac, "task-list" | "task") => {
+            if !in_tasks {
+                c.macros += 1;
+            }
+            count_nodes(&e.children, c, true);
         }
         (Ns::Ac, "image") => c.images += 1,
         (Ns::Ac, "link") => c.links += 1,
         (Ns::Ac, "layout") => {
             c.layouts += 1;
-            count_nodes(&e.children, c);
+            count_nodes(&e.children, c, in_tasks);
         }
         (Ns::Ac, local) => {
             if ac_rule(local) != AcRule::Structure {
                 c.macros += 1;
             }
-            count_nodes(&e.children, c);
+            count_nodes(&e.children, c, in_tasks);
         }
         (Ns::Ri, _) => c.links += 1,
     }
@@ -941,13 +1006,17 @@ fn finalize(md: String, genuine: BTreeSet<(usize, PlaceholderKind)>) -> String {
 }
 
 /// Replaces the tokens in `src` by their fragments and returns the result with the offsets of
-/// the converter's own placeholders. A macro placeholder followed by `(` or `:` gets that
+/// the converter's own placeholders. A fragment after an odd run of backslashes gets one more
+/// (the run stays literal text). A macro placeholder followed by `(` or `:` gets that
 /// character escaped (it would otherwise make the placeholder the text of a link or a link
 /// reference definition); a link placeholder after a `!` gets the `!` escaped (an image).
 fn substitute(src: &str, frags: &[Frag]) -> (String, BTreeSet<(usize, PlaceholderKind)>) {
     let mut out = String::with_capacity(src.len());
     let mut genuine = BTreeSet::new();
     let mut rest = src;
+    // The start of the last line of `out`, from what has been scanned up to `scanned`
+    // (incremental, so many code tokens on one line stay linear; T3 review m-4).
+    let (mut line_start, mut scanned) = (0, 0);
     while let Some(open) = rest.find(TOKEN_OPEN) {
         push_clean(&mut out, rest.get(..open).unwrap_or(""));
         let after = rest.get(open + TOKEN_OPEN.len_utf8()..).unwrap_or("");
@@ -960,6 +1029,12 @@ fn substitute(src: &str, frags: &[Frag]) -> (String, BTreeSet<(usize, Placeholde
             .and_then(|i| i.parse::<usize>().ok())
             .and_then(|i| frags.get(i));
         rest = after.get(close + TOKEN_CLOSE.len_utf8()..).unwrap_or("");
+        // `htmd` can end a hard break's `\` without its newline right before a token
+        // (`<span><br></span><a>…`); that backslash would escape the fragment's first
+        // character and hide a placeholder, so it becomes a literal one.
+        if frag.is_some() && escaped(&out, out.len()) {
+            out.push('\\');
+        }
         match frag {
             Some(Frag::Inline { md, genuine: kind }) => {
                 if *kind == Some(PlaceholderKind::Link)
@@ -977,7 +1052,11 @@ fn substitute(src: &str, frags: &[Frag]) -> (String, BTreeSet<(usize, Placeholde
                 }
             }
             Some(Frag::Code { language, body }) => {
-                code_block(&mut out, rest, language.as_deref(), body);
+                if let Some(nl) = out.get(scanned..).and_then(|s| s.rfind('\n')) {
+                    line_start = scanned + nl + 1;
+                }
+                scanned = out.len();
+                code_block(&mut out, line_start, rest, language.as_deref(), body);
             }
             None => {}
         }
@@ -991,15 +1070,19 @@ fn push_clean(out: &mut String, s: &str) {
     out.extend(s.chars().filter(|&c| c != TOKEN_OPEN && c != TOKEN_CLOSE));
 }
 
-/// A code block at the end of `out`: fenced when its line holds only a list or quote prefix
+/// A code block at the end of `out`, whose last line starts at `line_start`: fenced when that
+/// line holds only a list or quote prefix and the rest of the line in `rest` is blank
 /// (continuation lines get the same prefix), else inline code.
-fn code_block(out: &mut String, rest: &str, language: Option<&str>, body: &str) {
-    let line_start = out.rfind('\n').map_or(0, |i| i + 1);
-    let prefix = out.get(line_start..).unwrap_or("").to_owned();
-    let line_rest = rest.split('\n').next().unwrap_or("");
-    match continuation(&prefix) {
-        Some(cont) if line_rest.trim().is_empty() => fenced(out, &cont, language, body),
-        _ => inline_code(out, body, prefix.starts_with('|')),
+fn code_block(out: &mut String, line_start: usize, rest: &str, language: Option<&str>, body: &str) {
+    let prefix = out.get(line_start..).unwrap_or("");
+    let table = prefix.starts_with('|');
+    let rest_blank = rest
+        .chars()
+        .take_while(|&c| c != '\n')
+        .all(char::is_whitespace);
+    match continuation(prefix) {
+        Some(cont) if rest_blank => fenced(out, &cont, language, body),
+        _ => inline_code(out, body, table),
     }
 }
 
@@ -1105,7 +1188,7 @@ fn neutralize(mut md: String, mut genuine: BTreeSet<(usize, PlaceholderKind)>) -
     let at = reference_escapes(&md);
     insert_backslashes(&mut md, &mut genuine, at);
     for _ in 0..MAX_PASSES {
-        let mut at = Vec::new();
+        let mut at = tilde_fences(&md);
         for hit in placeholders::scan(&md) {
             if genuine.contains(&(hit.at, hit.kind)) {
                 continue;
@@ -1129,6 +1212,41 @@ fn neutralize(mut md: String, mut genuine: BTreeSet<(usize, PlaceholderKind)>) -
         insert_backslashes(&mut md, &mut genuine, at);
     }
     md
+}
+
+/// Offsets that stop every `~~~` fence from opening a code block. The converter and `htmd`
+/// write backtick fences only, so a tilde fence is prose: `htmd` escapes a text's leading `~`
+/// but not one after leading whitespace it then trims (`<p> ~~~</p>`), and the code block
+/// would hide what follows, a genuine placeholder included (found by the T3 fix round's
+/// property test). Each line of such a block that starts with `~~~` is escaped too, so that no
+/// fence inside it opens once the outer one is gone.
+fn tilde_fences(md: &str) -> Vec<usize> {
+    let mut at = Vec::new();
+    for (event, range) in Parser::new_ext(md, placeholders::options()).into_offset_iter() {
+        let Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_))) = event else {
+            continue;
+        };
+        let Some(block) = md.get(range.clone()) else {
+            continue;
+        };
+        // The fence is the first backtick or tilde (a list marker or `>` may precede it).
+        let Some(fence) = block.find(['`', '~']) else {
+            continue;
+        };
+        if !block.get(fence..).is_some_and(|f| f.starts_with('~')) {
+            continue;
+        }
+        at.push(range.start + fence);
+        let mut line_start = range.start;
+        for line in block.split_inclusive('\n') {
+            let indent = line.len() - line.trim_start_matches([' ', '\t', '>']).len();
+            if line.get(indent..).is_some_and(|l| l.starts_with("~~~")) {
+                at.push(line_start + indent);
+            }
+            line_start += line.len();
+        }
+    }
+    at
 }
 
 /// Offsets of prose character references (`&lt;`), outside code; `&#124;` is `htmd`'s own
@@ -1181,7 +1299,8 @@ fn insert_backslashes(
         .collect();
 }
 
-/// The §7.6 fallback: CDATA bodies first, then `htmd` over the rest.
+/// The §7.6 fallback: CDATA bodies first (fenced code), then the text of the rest with every
+/// tag stripped ([`stripped_paragraphs`]).
 fn fallback(storage: &str) -> String {
     let clean: String = storage
         .chars()
@@ -1217,18 +1336,12 @@ fn fallback(storage: &str) -> String {
         rest = tail;
     }
     html_parts.push(rest);
-    // Each part is converted on its own and the code blocks stand between them at the top
-    // level, so markup left open in one part (an unclosed `<b>`) cannot wrap a code block.
+    // The code blocks stand between the parts' paragraphs at the top level.
     let mut md = String::new();
     for (i, part) in html_parts.iter().enumerate() {
-        let part_md = if too_deep(part) {
-            let mut text = String::new();
-            strip_tags(part, &mut text);
-            html_to_md(&text)
-        } else {
-            html_to_md(part)
-        };
-        push_block(&mut md, part_md.trim_matches('\n'));
+        for paragraph in stripped_paragraphs(part) {
+            push_block(&mut md, &paragraph);
+        }
         if let Some(body) = bodies.get(i) {
             let mut code = String::new();
             fenced(&mut code, "", None, body);
@@ -1249,52 +1362,290 @@ fn push_block(md: &mut String, block: &str) {
     md.push_str(block);
 }
 
-/// Whether `html` opens more than [`MAX_DEPTH`] elements at once, read the way an HTML parser
-/// would: a non-void start tag opens (`/>` does not close it), an end tag closes back to the
-/// nearest open element of its name.
-fn too_deep(html: &str) -> bool {
-    let mut open: Vec<String> = Vec::new();
-    let mut rest = html;
-    while let Some(i) = rest.find('<') {
-        rest = rest.get(i + 1..).unwrap_or("");
-        let (end, name_src) = match rest.strip_prefix('/') {
-            Some(r) => (true, r),
-            None => (false, rest),
-        };
-        let len = name_src
-            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '>' | '<'))
-            .unwrap_or(name_src.len());
-        let name = name_src.get(..len).unwrap_or("").to_ascii_lowercase();
-        if !name.starts_with(|c: char| c.is_ascii_alphabetic()) {
-            continue;
-        }
-        if end {
-            if let Some(p) = open.iter().rposition(|n| *n == name) {
-                open.truncate(p);
-            }
-        } else if !VOID_HTML.contains(&name.as_str()) {
-            open.push(name);
-            if open.len() > MAX_DEPTH {
-                return true;
-            }
-        }
-    }
-    false
+/// HTML elements whose start or end tag ends a paragraph of the fallback's text.
+const BREAK_HTML: [&str; 41] = [
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "body",
+    "br",
+    "caption",
+    "center",
+    "dd",
+    "details",
+    "div",
+    "dl",
+    "dt",
+    "figcaption",
+    "figure",
+    "footer",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "ul",
+];
+
+/// `ac:` elements that sit inside a line; every other `ac:` element ends a paragraph.
+const INLINE_AC: [&str; 7] = [
+    "link",
+    "link-body",
+    "plain-text-link-body",
+    "emoticon",
+    "inline-comment-marker",
+    "image",
+    "placeholder",
+];
+
+/// The longest reference name the fallback decodes (HTML5 names are at most 31 characters).
+const MAX_REFERENCE: usize = 40;
+
+/// What the fallback makes of a tag.
+enum Lexed {
+    /// Nothing (inline markup, a comment, a declaration).
+    Inline,
+    /// The end of a paragraph.
+    Break,
+    /// Text in place of the tag (a date lozenge's date).
+    Text(String),
 }
 
-/// `s` without its tags; a `<` that starts no tag is escaped.
-fn strip_tags(s: &str, out: &mut String) {
-    let mut rest = s;
-    while let Some(i) = rest.find('<') {
-        out.push_str(rest.get(..i).unwrap_or(""));
-        let after = rest.get(i + 1..).unwrap_or("");
-        match after.find('>') {
-            Some(j) => rest = after.get(j + 1..).unwrap_or(""),
+/// The text of `src` (a part of a body that failed the XML parse) as Markdown paragraphs: every
+/// tag stripped, a block-level tag ending a paragraph, references decoded, whitespace collapsed,
+/// Markdown specials escaped. One linear pass: a `<` starts a tag only when a letter, `_`, `/`,
+/// `!` or `?` follows and a `>` ends it (outside a quoted value) before the next `<`; any other
+/// `<` is text.
+fn stripped_paragraphs(src: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut cur = String::new();
+    // Whether a `-->` may still follow (an unterminated comment makes its `<` text).
+    let mut comment_end = true;
+    let mut rest = src;
+    while let Some(i) = rest.find(['<', '&']) {
+        cur.push_str(rest.get(..i).unwrap_or(""));
+        let at = rest.get(i..).unwrap_or("");
+        if let Some(after) = at.strip_prefix('&') {
+            match reference(after) {
+                Some((text, len)) => {
+                    cur.push_str(&text);
+                    rest = after.get(len..).unwrap_or("");
+                }
+                None => {
+                    cur.push('&');
+                    rest = after;
+                }
+            }
+            continue;
+        }
+        match lex_tag(at, &mut comment_end) {
+            Some((lexed, len)) => {
+                match lexed {
+                    Lexed::Inline => {}
+                    Lexed::Break => end_paragraph(&mut paragraphs, &mut cur),
+                    Lexed::Text(t) => cur.push_str(&t),
+                }
+                rest = at.get(len..).unwrap_or("");
+            }
             None => {
-                out.push_str("&lt;");
-                rest = after;
+                cur.push('<');
+                rest = at.get(1..).unwrap_or("");
             }
         }
     }
-    out.push_str(rest);
+    cur.push_str(rest);
+    end_paragraph(&mut paragraphs, &mut cur);
+    paragraphs
+}
+
+/// The decoded text of the reference that `after` (the text after a `&`) starts with, and the
+/// bytes it takes (through the `;`); `None` when it is no reference the parser would resolve.
+fn reference(after: &str) -> Option<(String, usize)> {
+    let (semi, _) = after
+        .char_indices()
+        .take(MAX_REFERENCE)
+        .find(|&(_, c)| c == ';')?;
+    let text = resolve_ref(after.get(..semi)?)?;
+    Some((text.into_owned(), semi + 1))
+}
+
+/// The tag `at` starts with (`at` starts with `<`) and its length, or `None` when that `<` is
+/// text.
+fn lex_tag(at: &str, comment_end: &mut bool) -> Option<(Lexed, usize)> {
+    let body = at.get(1..)?;
+    if let Some(comment) = body.strip_prefix("!--") {
+        if !*comment_end {
+            return None;
+        }
+        return match comment.find("-->") {
+            Some(j) => Some((Lexed::Inline, "<!--".len() + j + "-->".len())),
+            None => {
+                *comment_end = false;
+                None
+            }
+        };
+    }
+    let name_src = body.strip_prefix('/').unwrap_or(body);
+    let declaration = body.starts_with(['!', '?']);
+    if !declaration && !name_src.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        return None;
+    }
+    let mut quote: Option<char> = None;
+    let mut end = None;
+    for (j, c) in body.char_indices() {
+        match (quote, c) {
+            (_, '<') => break,
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '>') => {
+                end = Some(j);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let end = end?;
+    let len = end + 2;
+    if declaration {
+        return Some((Lexed::Inline, len));
+    }
+    let inner = body.get(..end)?;
+    let closing = inner.starts_with('/');
+    let tag = inner.strip_prefix('/').unwrap_or(inner);
+    let name_len = tag
+        .find(|c: char| c.is_whitespace() || c == '/')
+        .unwrap_or(tag.len());
+    let name = tag.get(..name_len)?.to_ascii_lowercase();
+    // A date lozenge (`<time datetime="…"/>`) has no text but its date.
+    if name == "time" && !closing && tag.trim_end().ends_with('/') {
+        let date = lex_attrs(tag.get(name_len..)?)
+            .into_iter()
+            .find(|(k, _)| *k == "datetime")
+            .map(|(_, v)| decode_attr(v).unwrap_or_else(|| v.to_owned()));
+        if let Some(date) = date {
+            return Some((Lexed::Text(date), len));
+        }
+    }
+    let breaks = match name.split_once(':') {
+        Some(("ac", local)) => !INLINE_AC.contains(&local),
+        Some(_) => false,
+        None => BREAK_HTML.contains(&name.as_str()),
+    };
+    Some((if breaks { Lexed::Break } else { Lexed::Inline }, len))
+}
+
+/// Ends the paragraph in `cur`: whitespace collapsed, Markdown specials escaped, and a line
+/// start that would open a block (a heading, a list item, a quote) escaped too.
+fn end_paragraph(paragraphs: &mut Vec<String>, cur: &mut String) {
+    let text = collapse(cur);
+    cur.clear();
+    if text.is_empty() {
+        return;
+    }
+    let mut out = escape_text(&text);
+    if out.starts_with(['#', '-', '+', '>', '=']) {
+        out.insert(0, '\\');
+    } else {
+        let digits = out.bytes().take_while(u8::is_ascii_digit).count();
+        if (1..=9).contains(&digits) && matches!(out.as_bytes().get(digits), Some(b'.' | b')')) {
+            out.insert(digits, '\\');
+        }
+    }
+    paragraphs.push(out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::placeholders::scan;
+
+    fn convert(storage: &str) -> (String, ConversionReport) {
+        let (md, report, _) = storage_to_markdown(storage, &UserResolutions::new());
+        (md, report)
+    }
+
+    fn kinds(md: &str) -> Vec<PlaceholderKind> {
+        scan(md).into_iter().map(|h| h.kind).collect()
+    }
+
+    /// T3 review I-1: no name turns a placeholder into emphasis that hides it from the check.
+    #[test]
+    fn placeholder_names_are_found_by_the_scan() {
+        for (name, fitted) in [
+            ("_x_", "-x-"),
+            ("__init__", "--init--"),
+            ("a._b_", "a.-b-"),
+            ("*x*", "-x-"),
+            ("a_b", "a_b"),
+            ("_", "-"),
+            ("", "-"),
+            ("üx", "-x"),
+        ] {
+            let (md, report) = convert(&format!(
+                "<p>a <ac:structured-macro ac:name=\"{name}\"/> b</p>"
+            ));
+            assert_eq!(kinds(&md), vec![PlaceholderKind::Macro], "{name}: {md}");
+            assert_eq!(md, format!("a [macro: {fitted} {{}}] b\n"), "{name}");
+            assert_eq!(report.lost.macros, 1, "{name}");
+        }
+        // A pair whose fitted names would make `_x … x_` across two placeholders.
+        let (md, _) = convert(
+            "<p><ac:structured-macro ac:name=\"üx\"/> and <ac:structured-macro ac:name=\"xü\"/>\
+             </p>",
+        );
+        assert_eq!(kinds(&md), vec![PlaceholderKind::Macro; 2], "{md}");
+        assert_eq!(md, "[macro: -x {}] and [macro: x- {}]\n");
+        // `ac:`, `ri:` and foreign local names.
+        for storage in [
+            "<p>a <ac:_x_/> b</p>",
+            "<p>a <ri:_x_/> b</p>",
+            "<p>a <zz:_x_ xmlns:zz=\"urn:z\"/> b</p>",
+        ] {
+            let (md, _) = convert(storage);
+            assert_eq!(kinds(&md), vec![PlaceholderKind::Macro], "{storage}: {md}");
+            assert_eq!(md, "a [macro: -x- {}] b\n", "{storage}");
+        }
+        // Parameter keys and values are escaped, so `_` there never forms emphasis either.
+        let (md, _) = convert(
+            "<p><ac:structured-macro ac:name=\"m\"><ac:parameter ac:name=\"_k_\">_v_ __w__\
+             </ac:parameter></ac:structured-macro> x_</p>",
+        );
+        assert_eq!(kinds(&md), vec![PlaceholderKind::Macro], "{md}");
+        // A name 64 characters long ending in `_` at the cut.
+        let long = format!("{}_x", "a".repeat(63));
+        let (md, _) = convert(&format!("<ac:structured-macro ac:name=\"{long}\"/>"));
+        assert_eq!(md, format!("[macro: {}- {{}}]\n", "a".repeat(63)));
+        assert_eq!(kinds(&md), vec![PlaceholderKind::Macro]);
+    }
+
+    /// T3 review I-1: `_` in a user key is `%5F`, so `@user:_a @user:b_` is two mentions.
+    #[test]
+    fn user_keys_with_underscores_are_two_mentions() {
+        let (md, report) =
+            convert("<p><ri:user ri:userkey=\"_a\"/> <ri:user ri:userkey=\"b_\"/> __c__</p>");
+        assert_eq!(kinds(&md), vec![PlaceholderKind::User; 2], "{md}");
+        assert_eq!(md, "@user:%5Fa @user:b%5F \\_\\_c\\_\\_\n");
+        assert_eq!(report.unresolved_users, 2);
+    }
 }

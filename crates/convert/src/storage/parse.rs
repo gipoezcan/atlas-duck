@@ -560,7 +560,7 @@ fn split_qname(q: &str) -> Option<(Option<&str>, &str)> {
 /// The text of a reference (`name` is what sits between `&` and `;`): a character reference
 /// to a char XML allows, an HTML5 named entity, or an unknown name kept literal. `None` for
 /// anything else (not well-formed).
-fn resolve_ref(name: &str) -> Option<Cow<'static, str>> {
+pub(crate) fn resolve_ref(name: &str) -> Option<Cow<'static, str>> {
     if name.starts_with('#') {
         return match BytesRef::new(name).resolve_char_ref() {
             Ok(Some(c)) if xml_char(c) => Some(Cow::Owned(c.to_string())),
@@ -578,7 +578,7 @@ fn resolve_ref(name: &str) -> Option<Cow<'static, str>> {
 
 /// Decodes a raw attribute value with [`resolve_ref`] and normalises raw TAB, CR, LF and CRLF
 /// to one space each. `None` when not well-formed (a raw `<`, a bad reference or char).
-fn decode_attr(raw: &str) -> Option<String> {
+pub(crate) fn decode_attr(raw: &str) -> Option<String> {
     let mut out = String::with_capacity(raw.len());
     let mut i = 0;
     while let Some(c) = raw.get(i..).and_then(|s| s.chars().next()) {
@@ -1037,7 +1037,7 @@ pub(crate) fn lexical_constructs(storage: &str) -> WikiConstructs {
 /// The attributes of a start tag, read lexically from just after its name: each name with its
 /// raw value (empty without `=`), up to the `>` that ends the tag outside a quoted value, or up
 /// to the next `<` (which no well-formed value holds).
-fn lex_attrs(tag: &str) -> Vec<(&str, &str)> {
+pub(crate) fn lex_attrs(tag: &str) -> Vec<(&str, &str)> {
     let name_end = |c: char| c.is_whitespace() || matches!(c, '=' | '>' | '<' | '/');
     let mut out = Vec::new();
     let mut rest = tag;
