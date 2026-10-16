@@ -1,7 +1,8 @@
 // node --test ci/check-csp.test.mjs  (node:test, no npm dependencies)
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -16,7 +17,9 @@ import {
   checkPreviewCss,
   checkPreviewRust,
   cspHash,
+  main,
   mainPolicy,
+  previewWriteErrors,
   writePreviewHash,
   PLATFORMS,
   checkConfig,
@@ -282,6 +285,54 @@ test("write_sets_the_preview_hash_in_both_places_and_nothing_else", () => {
   assert.equal(out.sanitize, SANITIZE_OK);
   // Idempotent.
   assert.deepEqual(writePreviewHash(out.conf, out.sanitize, PREVIEW_CSS_HASH), out);
+});
+
+test("write_refuses_bad_inputs_before_writing_either_file", () => {
+  const conf = JSON.stringify({ app: { security: { csp: MAIN_POLICY } } });
+  assert.deepEqual(previewWriteErrors("table{}", conf, SANITIZE_OK), []);
+  assertFails(previewWriteErrors("a{}</style>", conf, SANITIZE_OK), /<\/style/);
+  assertFails(previewWriteErrors("table{}", "{not json", SANITIZE_OK), /not JSON/);
+  assertFails(previewWriteErrors("table{}", JSON.stringify({ app: { security: { csp: "default-src 'self'" } } }), SANITIZE_OK), /no style-src/);
+  assertFails(previewWriteErrors("table{}", conf, SANITIZE_OK.replace(/pub const PREVIEW_CSS_HASH.*\n/, "")), /found 0/);
+  assertFails(previewWriteErrors("table{}", conf, SANITIZE_OK + SANITIZE_OK.split("\n")[1]), /found 2/);
+});
+
+/** A copy of what `main` reads, under a temporary root, with `css` as preview.css. */
+function scratchRepo(css) {
+  const root = mkdtempSync(join(tmpdir(), "check-csp-"));
+  for (const rel of ["app/src-tauri/tauri.conf.json", SANITIZE_RS, "app/ui/credential.html"]) {
+    mkdirSync(dirname(join(root, rel)), { recursive: true });
+    cpSync(join(REPO, rel), join(root, rel));
+  }
+  cpSync(join(SRC_TAURI, "src"), join(root, "app/src-tauri/src"), { recursive: true });
+  mkdirSync(dirname(join(root, PREVIEW_CSS_FILE)), { recursive: true });
+  writeFileSync(join(root, PREVIEW_CSS_FILE), css);
+  return root;
+}
+
+test("main_checks_the_policy_against_the_repository_it_is_given", () => {
+  const root = scratchRepo("table{border-collapse:collapse}\n");
+  try {
+    // Before --write the copied config names this repository's hash, not the copy's.
+    assert.equal(main([], root), 1);
+    assert.equal(main(["--write"], root), 0);
+    assert.equal(main([], root), 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("main_write_with_a_refused_stylesheet_writes_nothing", () => {
+  const root = scratchRepo("table{}</style><script>x</script>\n");
+  try {
+    const conf = readFileSync(join(root, "app/src-tauri/tauri.conf.json"), "utf8");
+    const sanitize = readFileSync(join(root, SANITIZE_RS), "utf8");
+    assert.equal(main(["--write"], root), 1);
+    assert.equal(readFileSync(join(root, "app/src-tauri/tauri.conf.json"), "utf8"), conf);
+    assert.equal(readFileSync(join(root, SANITIZE_RS), "utf8"), sanitize);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("style_src_admits_exactly_the_isolation_hash", () => {

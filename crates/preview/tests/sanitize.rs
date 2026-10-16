@@ -257,6 +257,39 @@ fn iframe_document_sanitizes_hostile_body() {
     assert_eq!(d.matches("<meta").count(), 1);
 }
 
+/// A `<style>` in foreign content (SVG, MathML) is parsed as an element of that namespace, not as
+/// HTML's raw-text style: neither survives either, only the renderer's own `<style>` in the head.
+#[test]
+fn iframe_document_drops_style_in_svg_and_math() {
+    for (hostile, canary) in [
+        ("<svg><style>*{display:none}</style></svg>t", "display:none"),
+        ("<math><style>body{color:red}</style></math>t", "color:red"),
+        (
+            "<svg><foreignObject><style>p{x:1}</style></foreignObject></svg>t",
+            "p{x:1}",
+        ),
+        (
+            "<math><mtext><style>q{y:2}</style></mtext></math><svg><desc><style>r{z:3}</style></desc></svg>",
+            "q{y:2}",
+        ),
+    ] {
+        let d = iframe_document(hostile, Platform::MacOsLinux);
+        assert_eq!(d.matches("<style").count(), 1, "{hostile}: {d}");
+        let head = d.split("</head>").next().unwrap_or_default();
+        assert!(
+            head.ends_with(&format!("<style>{PREVIEW_CSS}</style>")),
+            "{hostile}: {head}"
+        );
+        let body = d.split("<body>").nth(1).unwrap_or_default();
+        assert!(
+            !body.contains("<style") && !body.contains("<svg") && !body.contains("<math"),
+            "{hostile}: {body}"
+        );
+        assert!(!body.contains(canary), "{hostile}: {body}");
+        assert!(!d.contains("r{z:3}"), "{hostile}: {d}");
+    }
+}
+
 #[test]
 fn json_tree_hidden_bytes() {
     let big = "x".repeat(10 * 1024);

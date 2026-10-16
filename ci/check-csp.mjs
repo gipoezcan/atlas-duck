@@ -160,12 +160,13 @@ function findKeys(value, names, path = "") {
   return hits;
 }
 
-/** Violations of one platform's merged config. */
-export function checkConfig(conf, platform) {
+/** Violations of one platform's merged config; `expected` is the main policy for the repository's
+ *  own `preview.css` (`main` passes the one of the repository it checks). */
+export function checkConfig(conf, platform, expected = MAIN_POLICY) {
   const where = `tauri config (${platform})`;
   const errors = [];
   const security = conf?.app?.security ?? {};
-  errors.push(...checkPolicy(security.csp, MAIN_POLICY, `${where} app.security.csp`));
+  errors.push(...checkPolicy(security.csp, expected, `${where} app.security.csp`));
   if (security.devCsp !== undefined) errors.push(`${where}: app.security.devCsp must not be set (dev builds use the same policy)`);
   if (security.dangerousDisableAssetCspModification !== undefined && security.dangerousDisableAssetCspModification !== false) {
     errors.push(`${where}: app.security.dangerousDisableAssetCspModification must not be set`);
@@ -203,11 +204,11 @@ export function readOverlays(srcTauri) {
   return { overlays, errors };
 }
 
-/** Every platform's merged config checked. */
-export function checkConfigs(base, overlays) {
+/** Every platform's merged config checked against `expected` (see `checkConfig`). */
+export function checkConfigs(base, overlays, expected = MAIN_POLICY) {
   const errors = [];
   for (const platform of PLATFORMS) {
-    errors.push(...checkConfig(mergePatch(base, overlays[platform] ?? {}), platform));
+    errors.push(...checkConfig(mergePatch(base, overlays[platform] ?? {}), platform, expected));
   }
   return errors;
 }
@@ -305,12 +306,30 @@ export function checkPreviewRust(sanitize, hash) {
   return errors;
 }
 
+const CONF_STYLE_SRC = /("csp":\s*"[^"]*?)style-src [^;"]*/;
+
+/** What keeps `--write` from writing either file: a `css` that cannot be one inline `<style>`, a
+ *  `conf` (tauri.conf.json text) that is no JSON or has no `style-src` in its `csp`, a `sanitize`
+ *  (sanitize.rs text) without exactly one `PREVIEW_CSS_HASH` constant. */
+export function previewWriteErrors(css, conf, sanitize) {
+  const errors = checkPreviewCss(css);
+  try {
+    JSON.parse(conf);
+  } catch (e) {
+    errors.push(`tauri.conf.json: not JSON (${e.message})`);
+  }
+  if (!CONF_STYLE_SRC.test(conf)) errors.push("tauri.conf.json: no style-src in app.security.csp to write");
+  const consts = [...sanitize.matchAll(HASH_CONST)].length;
+  if (consts !== 1) errors.push(`${SANITIZE_RS}: expected one PREVIEW_CSS_HASH constant to write, found ${consts}`);
+  return errors;
+}
+
 /** `--write`: `conf` (tauri.conf.json text) and `sanitize` (sanitize.rs text) with `hash` as the
  *  preview hash; the main policy's `style-src` is set to the expected one, nothing else changes. */
 export function writePreviewHash(conf, sanitize, hash) {
   const style = parsePolicy(mainPolicy(hash)).get("style-src").join(" ");
   return {
-    conf: conf.replace(/("csp":\s*"[^"]*?)style-src [^;"]*/, `$1style-src ${style}`),
+    conf: conf.replace(CONF_STYLE_SRC, `$1style-src ${style}`),
     sanitize: sanitize.replace(HASH_CONST, `pub const PREVIEW_CSS_HASH: &str = "${hash}";`),
   };
 }
@@ -336,7 +355,16 @@ export function main(argv = process.argv.slice(2), repo = REPO) {
   if (argv.includes("--write")) {
     const confPath = join(srcTauri, "tauri.conf.json");
     const sanitizePath = join(repo, SANITIZE_RS);
-    const out = writePreviewHash(readFileSync(confPath, "utf8"), readFileSync(sanitizePath, "utf8"), previewHash);
+    const conf = readFileSync(confPath, "utf8");
+    const sanitize = readFileSync(sanitizePath, "utf8");
+    // Everything is checked before either file is written: a refused input leaves both as they were.
+    const refused = previewWriteErrors(css, conf, sanitize);
+    if (refused.length > 0) {
+      for (const e of refused) console.log(e);
+      console.log("check-csp: --write wrote nothing");
+      return 1;
+    }
+    const out = writePreviewHash(conf, sanitize, previewHash);
     writeFileSync(confPath, out.conf);
     writeFileSync(sanitizePath, out.sanitize);
     console.log(`check-csp: wrote the preview.css hash ${previewHash}`);
@@ -345,7 +373,7 @@ export function main(argv = process.argv.slice(2), repo = REPO) {
   errors.push(...checkPreviewRust(readFileSync(join(repo, SANITIZE_RS), "utf8"), previewHash));
   const base = JSON.parse(readFileSync(join(srcTauri, "tauri.conf.json"), "utf8"));
   const { overlays, errors: overlayErrors } = readOverlays(srcTauri);
-  errors.push(...overlayErrors, ...checkConfigs(base, overlays));
+  errors.push(...overlayErrors, ...checkConfigs(base, overlays, mainPolicy(previewHash)));
   errors.push(...checkRust(rustFiles(join(srcTauri, "src"), repo)));
 
   const uiDir = join(repo, "app", "ui");

@@ -354,11 +354,6 @@ mod tests {
             .collect()
     }
 
-    /// M6 CI round 2, ruling B1 (§6.4's equivalent alternative): Tauri's isolation.js appends a
-    /// `<style>` with `IFRAME_STYLE` to every page, and tauri-codegen puts its hash into the
-    /// isolation page's policy only. Both of the app's policies admit exactly that style by its
-    /// sha256 hash; a Tauri release that changes the text fails here, not as a CSP violation in a
-    /// window.
     /// The CSP hash source of an inline element whose text is `text`.
     fn hash_source(text: &str) -> String {
         use base64::Engine as _;
@@ -379,6 +374,11 @@ mod tests {
         }
     }
 
+    /// M6 CI round 2, ruling B1 (§6.4's equivalent alternative): Tauri's isolation.js appends a
+    /// `<style>` with `IFRAME_STYLE` to every page, and tauri-codegen puts its hash into the
+    /// isolation page's policy only. Both of the app's policies admit exactly that style by its
+    /// sha256 hash; a Tauri release that changes the text fails here, not as a CSP violation in a
+    /// window.
     #[test]
     fn both_policies_admit_exactly_tauris_isolation_style() {
         let hash = hash_source(tauri::utils::pattern::isolation::IFRAME_STYLE);
