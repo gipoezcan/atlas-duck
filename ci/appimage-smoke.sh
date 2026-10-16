@@ -262,8 +262,12 @@ m6_outer() {
   # "Failed to match capabilities" may be a mismatch between them.
   WebKitWebDriver --version || true
   dpkg-query -W webkit2gtk-driver libwebkit2gtk-4.1-0 || true
-  (cd "$work" && "$m6_dir/atlas-duck-e2e.AppImage" --appimage-extract '*libwebkit2gtk*' >/dev/null 2>&1 &&
-    find squashfs-root -name 'libwebkit2gtk*' -print && rm -rf squashfs-root) || echo "appimage-m6: could not list the bundled WebKit"
+  # The whole image is extracted (an extraction pattern's matching rules differ between runtimes).
+  local bundled=""
+  bundled="$(cd "$work" && "$m6_dir/atlas-duck-e2e.AppImage" --appimage-extract >/dev/null 2>&1 &&
+    find squashfs-root \( -name 'libwebkit2gtk*' -o -name 'libjavascriptcoregtk*' -o -name WebKitWebProcess \) -print)" || true
+  rm -rf "$work/squashfs-root"
+  echo "appimage-m6: bundled WebKit files: ${bundled:-none found (or the image could not be extracted)}"
   set +e
   env ATLAS_DUCK_TEST_HOME="$m6_dir/home" ATLAS_DUCK_TEST_KEYSTORE="$m6_dir/keys" ATLAS_DUCK_E2E_ALLOW_DRIVER=1 \
     timeout 900 xvfb-run -a dbus-run-session -- bash "$self_path" --m6-inner "$m6_dir/atlas-duck-e2e.AppImage" "$e2e_dist/tools" "$(dirname "$self_path")" "$m6_dir/out"
