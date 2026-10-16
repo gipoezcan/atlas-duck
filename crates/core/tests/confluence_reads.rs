@@ -12,6 +12,10 @@
 //!
 //! Task 12a (PD-101, PD-102, §13 U-28, U-31): `confluence.search` releases only the §7.4 keys,
 //! previews as a table under the effective CQL, and raises the Info `cql_broad`.
+//!
+//! Every read here also ends with the identity GET of Task 13 (PD-93, `PREVIEW_FETCH {purpose:
+//! identity}` after the lookups; the harness answers it as the stored user). Its own cases are in
+//! `confluence_identity.rs`.
 
 mod common;
 
@@ -43,6 +47,8 @@ use serde_json::{Map, Value, json};
 const PAGE_GET: &str = "confluence.page.get";
 const PAGE_HISTORY: &str = "confluence.page.history";
 const ID: &str = "65537";
+/// The identity GET that ends every Confluence read (PD-93, Task 13; `confluence_identity.rs`).
+const IDENTITY_PATH: &str = "/rest/api/user/current";
 
 /// A page body with one `info` macro (one lost macro) and plain prose.
 const INFO_STORAGE: &str = r#"<p>Check the build.</p><ac:structured-macro ac:name="info"><ac:rich-text-body><p>Read me first.</p></ac:rich-text-body></ac:structured-macro>"#;
@@ -133,7 +139,16 @@ async fn page_get_markdown_replaces_body_and_reports_conversion() -> TestResult 
         return Err(format!("{} content GETs", gets.len()).into());
     };
     assert_eq!(query(only, "expand").as_deref(), Some(PAGE_EXPAND_STORAGE));
-    assert_eq!(test_hits(mock).await.len(), 1, "nothing else was sent");
+    // Nothing else was sent but the identity GET that ends every Confluence read (PD-93).
+    let hits: Vec<String> = test_hits(mock)
+        .await
+        .iter()
+        .map(|r| r.url.path().to_owned())
+        .collect();
+    assert_eq!(
+        hits,
+        [mock.path(&content_path(ID)), mock.path(IDENTITY_PATH)]
+    );
 
     // `format: markdown` given explicitly is the same read.
     let id = queued(&h, PAGE_GET, json!({ "id": ID, "format": "markdown" })).await?;
@@ -613,6 +628,23 @@ async fn records(h: &Harness, id: &str, t: EventType) -> Result<Vec<Value>, Test
         .collect())
 }
 
+/// The user lookups' `PREVIEW_FETCH {purpose: resolve}` records of `id`, in order (the read's
+/// identity GET, PD-93, has its own `PREVIEW_FETCH {purpose: identity}` after them).
+async fn resolves(h: &Harness, id: &str) -> Result<Vec<Value>, TestError> {
+    let mut fetches = records(h, id, EventType::PREVIEW_FETCH).await?;
+    fetches.retain(|f| f["purpose"] == "resolve");
+    Ok(fetches)
+}
+
+/// The record types of a read whose lookups recorded `lookups` records: the identity GET's record
+/// comes after them, before `READ_FETCHED` (PD-93).
+fn checked_read(lookups: usize) -> Vec<EventType> {
+    let mut want = vec![EventType::REQUEST_RECEIVED];
+    want.extend((0..=lookups).map(|_| EventType::PREVIEW_FETCH));
+    want.push(EventType::READ_FETCHED);
+    want
+}
+
 /// The `key` query values of the user lookups the mock received, in order.
 async fn looked_up(mock: &MockDc) -> Vec<String> {
     user_gets(mock)
@@ -660,17 +692,11 @@ async fn resolve_gets_are_preview_fetch_resolve_under_request() -> TestResult {
     let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
     assert_eq!(looked_up(mock).await, ["key-asmith", "key-jdoe"]);
     // Every lookup after the request's `REQUEST_RECEIVED` (its cover) and recorded before the
-    // read's `READ_FETCHED`.
-    assert_eq!(
-        h.event_types(&id).await?,
-        [
-            EventType::REQUEST_RECEIVED,
-            EventType::PREVIEW_FETCH,
-            EventType::PREVIEW_FETCH,
-            EventType::READ_FETCHED,
-        ]
-    );
+    // read's `READ_FETCHED`, ahead of the identity GET's record (PD-93).
+    assert_eq!(h.event_types(&id).await?, checked_read(2));
     let fetches = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(fetches.len(), 3);
+    assert_eq!(fetches[2]["purpose"], "identity", "{}", fetches[2]);
     for (f, key) in fetches.iter().zip(["key-asmith", "key-jdoe"]) {
         assert_eq!(f["purpose"], "resolve", "{f}");
         assert_eq!(f["method"], "GET");
@@ -716,10 +742,7 @@ async fn cache_hits_need_no_lookup() -> TestResult {
         2,
         "the second read looks nobody up"
     );
-    assert_eq!(
-        h.event_types(&id).await?,
-        [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED]
-    );
+    assert_eq!(h.event_types(&id).await?, checked_read(0));
     // The map still lists every key of the body (cache hits included).
     assert_eq!(
         read_fetched(&h, &id).await?["user_resolutions"],
@@ -741,7 +764,7 @@ async fn unresolvable_user_is_null_and_info() -> TestResult {
     mount_page(mock, ID, &page_with_storage(storage)).await;
     mount_users(mock, &[("key-gone", None)]).await;
     let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
-    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let fetch = resolves(&h, &id).await?;
     assert_eq!(fetch.len(), 1);
     assert_eq!(fetch[0]["status"], 404);
     assert_eq!(
@@ -790,7 +813,7 @@ async fn resolve_lookups_capped_per_read() -> TestResult {
         let want = if n < 50 { json!(names[n]) } else { Value::Null };
         assert_eq!(map.get(key.as_str()), Some(&want), "{key}");
     }
-    assert_eq!(records(&h, &id, EventType::PREVIEW_FETCH).await?.len(), 50);
+    assert_eq!(resolves(&h, &id).await?.len(), 50);
     assert_eq!(unresolved_users(&h, &id), Some(10));
     Ok(())
 }
@@ -1009,7 +1032,7 @@ async fn lookups_are_sequential() -> TestResult {
     }
     assert_eq!(seen, 3);
     assert_eq!(looked_up(mock).await, ["k1", "k2", "k3"]);
-    assert_eq!(records(&h, &id, EventType::PREVIEW_FETCH).await?.len(), 3);
+    assert_eq!(resolves(&h, &id).await?.len(), 3);
     Ok(())
 }
 
@@ -1074,10 +1097,7 @@ async fn lookup_sub_budget_degrades_to_null() -> TestResult {
     mount_users(mock, &[JDOE, ASMITH]).await;
     let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
     assert!(user_gets(mock).await.is_empty());
-    assert_eq!(
-        h.event_types(&id).await?,
-        [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED]
-    );
+    assert_eq!(h.event_types(&id).await?, checked_read(0));
     assert_eq!(
         read_fetched(&h, &id).await?["user_resolutions"],
         json!({ "key-jdoe": null, "key-asmith": null })
@@ -1161,11 +1181,7 @@ async fn storage_format_resolves_nothing() -> TestResult {
         ),
     ] {
         let id = queued(&h, op, params).await?;
-        assert_eq!(
-            h.event_types(&id).await?,
-            [EventType::REQUEST_RECEIVED, EventType::READ_FETCHED],
-            "{op}"
-        );
+        assert_eq!(h.event_types(&id).await?, checked_read(0), "{op}");
         assert!(
             read_fetched(&h, &id)
                 .await?
@@ -1318,7 +1334,7 @@ async fn oversized_lookup_answer_is_null_and_not_cached() -> TestResult {
     let big = json!({"userKey": "key-big", "username": "big", "pad": "x".repeat(100 * 1024)});
     mount_user_answer(mock, "key-big", 200, &big).await;
     let id = queued(&h, PAGE_GET, json!({ "id": ID })).await?;
-    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let fetch = resolves(&h, &id).await?;
     let [f] = fetch.as_slice() else {
         return Err(format!("{} lookup records", fetch.len()).into());
     };
@@ -1336,7 +1352,9 @@ async fn oversized_lookup_answer_is_null_and_not_cached() -> TestResult {
 }
 
 /// I-2: a lookup is cut at the read's deadline (`timeout`): the read ends within its budget, not
-/// at the 30 s per-call timeout, and the next key is `null` (less than the reserve is left).
+/// at the 30 s per-call timeout, and the next key is `null` (less than the reserve is left). The
+/// identity GET that follows (PD-93) finds the budget spent: the read is the read-budget outcome
+/// item, with the content and nothing cached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lookup_cut_at_the_read_budget() -> TestResult {
     // The reserve is shortened to 1 s (T11 fix review m-4): the 3 s budget leaves 2 s of margin for
@@ -1362,17 +1380,18 @@ async fn lookup_cut_at_the_read_budget() -> TestResult {
     h.queued(&id, 40_000).await.ok_or("never queued")?;
     let took = began.elapsed();
     assert!(took < Duration::from_secs(8), "{took:?}");
-    let fetch = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    let fetch = resolves(&h, &id).await?;
     let [f] = fetch.as_slice() else {
         return Err(format!("{} lookup records", fetch.len()).into());
     };
     assert_eq!(f["outcome"], "timeout", "{f}");
     assert_eq!(f["path"], "/wiki/rest/api/user?key=key-asmith");
     assert_eq!(looked_up(mock).await, ["key-asmith"]);
-    assert_eq!(
-        read_fetched(&h, &id).await?["user_resolutions"],
-        json!({ "key-jdoe": null, "key-asmith": null })
-    );
+    assert_eq!(h.event_types(&id).await?, checked_read(1));
+    let r = read_fetched(&h, &id).await?;
+    assert_eq!(r["outcome"], "timeout", "{r}");
+    assert_eq!(r["cap_or_budget"], "read_budget_120s", "{r}");
+    assert!(r.to_string().contains("Owners"), "{r}");
     assert_eq!(h.user_cached("wiki", "key-asmith"), None);
     Ok(())
 }
