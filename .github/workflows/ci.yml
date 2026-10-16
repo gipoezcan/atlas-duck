@@ -1472,7 +1472,9 @@ jobs:
 
       # S-04 (spec §13): the release build, no features, with the debugging variables set, opens no
       # debug port while a real webview runs (the scripts fail on a vacuous run).
+      # always(): S-04 must run (and be seen to run) even when an e2e flow above failed (T37 M-18).
       - name: Build the release app (S-04, no features)
+        if: always()
         run: cargo build --release -p atlas-duck-app --bin atlas-duck-app --locked
 
       - name: Kill stray driver, webview and app processes (before S-04)
@@ -1486,11 +1488,11 @@ jobs:
             pkill -f 'WebKit(Web|Network)Process' || true
           fi
       - name: S-04 no debug port with the inspector variables set (Linux, release build)
-        if: runner.os == 'Linux'
+        if: always() && runner.os == 'Linux'
         run: bash ci/s04-no-debug-port.sh target/release/atlas-duck-app
 
       - name: S-04 no debug port with the WebView2 variables set (Windows, release build)
-        if: runner.os == 'Windows'
+        if: always() && runner.os == 'Windows'
         shell: pwsh
         run: ./ci/s04-no-debug-port.ps1 -Exe target\release\atlas-duck-app.exe
 
