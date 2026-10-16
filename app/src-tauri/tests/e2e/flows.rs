@@ -399,6 +399,20 @@ async fn open_row(wd: &WebDriver, op_id: &str) -> Result<()> {
     wd.click(&open).await
 }
 
+/// Back to the top-level document, retried: WebKitWebDriver answers "no such frame" for a moment after
+/// the frame it was in was replaced.
+async fn back_to_top(wd: &WebDriver) -> Result<()> {
+    let mut last = None;
+    for _ in 0..20 {
+        match wd.switch_to_top().await {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(last.unwrap_or_else(|| "switch to the top-level document failed".into()))
+}
+
 /// Waits for the preview iframe to hold a table row, pressing "Open preview" when the detail pane
 /// offers it. The wait ends in the Approvals document (not the frame).
 async fn first_preview_row(wd: &WebDriver, within: Duration) -> Result<()> {
@@ -433,7 +447,7 @@ async fn first_preview_text(wd: &WebDriver, within: Duration, not: Option<&str>)
         };
         // Back to the top-level document, not "the parent": a frame that went away while the
         // driver was in it has none (WebKit answers "no such frame").
-        wd.switch_to_top().await?;
+        back_to_top(wd).await?;
         Ok(match text {
             Some(Ok(t)) if not != Some(t.as_str()) => Some(t),
             _ => None,
@@ -1470,35 +1484,36 @@ async fn chords(rig: &Rig) -> Result<()> {
 
     // Focus inside the preview frame: the same chords do nothing to the page.
     // The frame reloads when the opened row changes (new srcdoc): WebKit answers "no such frame" to
-    // a switch made while it does (or to a command in a frame that went away after the switch), so
-    // the switch and the click inside are retried from the top-level document until both take.
+    // a switch made while it does, and to any command in a frame handle it invalidated after the
+    // switch (CI run 38865972537: `no such frame` here, step unnamed). So the whole sequence is one
+    // retried step: find the iframe element afresh, switch by that element, wait until the frame's
+    // document holds a table row (it is loaded), click inside, send both chords; any refusal
+    // returns to the top-level document and starts over. The chords are no-ops for the page, and
+    // the assertions below check that nothing was decided or moved.
     wait_for(
-        "the preview frame to be entered and clicked",
+        "the chords typed inside the preview frame",
         WAIT,
         || async {
-            let Ok(frame) = wd.find("iframe[title='Preview']").await else {
-                return Ok(None);
-            };
-            if wd.switch_to_frame(&frame).await.is_err() {
-                return Ok(None);
+            let attempt = async {
+                let frame = wd.find("iframe[title='Preview']").await?;
+                wd.switch_to_frame(&frame).await?;
+                if wd.find_all("tr").await?.is_empty() {
+                    return Ok::<bool, Box<dyn std::error::Error>>(false);
+                }
+                let inside = wd.find("body").await?;
+                wd.click(&inside).await?;
+                wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
+                wd.chord(&ctrl_shift, keys::ENTER).await?;
+                Ok(true)
             }
-            let clicked = match wd.find("body").await {
-                Ok(inside) => wd.click(&inside).await.is_ok(),
-                Err(_) => false,
-            };
-            if clicked {
-                return Ok(Some(()));
-            }
-            wd.switch_to_top().await?;
-            Ok(None)
+            .await;
+            // Always back to the top-level document; a frame that went away has no parent, and
+            // WebKit may refuse for a moment, so this is retried too.
+            back_to_top(wd).await?;
+            Ok(matches!(attempt, Ok(true)).then_some(()))
         },
     )
     .await?;
-    // Sent while the driver is switched into the frame: the keys go where the focus is, and a
-    // driver that routes actions by browsing context still means the frame.
-    wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
-    wd.chord(&ctrl_shift, keys::ENTER).await?;
-    wd.switch_to_top().await?;
     ensure!(
         first_exit(&mut held, Duration::from_millis(1500))
             .await?
