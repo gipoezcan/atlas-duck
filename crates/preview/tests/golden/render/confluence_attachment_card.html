@@ -1,0 +1,145 @@
+<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'sha256-QjDb0ujXyJk4o6e18x54ga50tEBTqHBD+DgAUfAsG7I='; img-src data:"><style>/* The sandboxed preview iframe's only stylesheet (spec 6.4, PD-67, PD-92).
+   The document comes from preview::render (Rust): semantic elements only, never
+   a class or style attribute, so every rule here selects by element and position.
+   Layout of the body: <header> (the Caution strip <section>, the facts <table>,
+   the Info <div>), then one <section> per part of the preview.
+   Colour is never the only signal: the Caution strip has a text label, diff lines
+   carry a text marker column (+, -, space), escapes like <U+202E> are text.
+   Whitespace never depends on this file: diff lines, and values whose spaces, tabs
+   or newlines would collapse, come in a <pre> (T10 review I-1). */
+
+body {
+  font-family: system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.4;
+  margin: 8px;
+}
+
+h2 {
+  font-size: 1.15em;
+  margin: 12px 0 4px;
+}
+
+h3,
+h4 {
+  font-size: 1em;
+  margin: 8px 0 4px;
+}
+
+/* Header block: the Caution strip first, framed and bold; the Info line muted. */
+body > header {
+  border-bottom: 1px solid currentColor;
+  padding-bottom: 6px;
+  margin-bottom: 8px;
+}
+
+body > header > section {
+  border: 2px solid currentColor;
+  padding: 4px 8px;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+body > header > section > h2 {
+  margin: 0 0 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+body > header > section > ul {
+  margin: 0;
+  padding-left: 20px;
+}
+
+body > header > div {
+  opacity: 0.75;
+  margin: 4px 0 0;
+}
+
+/* Tables: header facts, field tables, results, diffs. */
+table {
+  border-collapse: collapse;
+  margin: 4px 0;
+}
+
+th,
+td {
+  border: 1px solid currentColor;
+  padding: 2px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  font-weight: 700;
+}
+
+caption {
+  text-align: left;
+  font-style: italic;
+}
+
+/* Every server- or agent-derived string is in a <bdi>: isolated, whitespace kept
+   (newlines and runs of spaces are part of the value). */
+bdi {
+  unicode-bidi: isolate;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+pre,
+code {
+  font-family: ui-monospace, Consolas, monospace;
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 4px 0;
+}
+
+/* A value's <pre> in a cell or list item (every diff line, a multi-line value). */
+td > pre,
+th > pre,
+li > pre {
+  margin: 0;
+}
+
+/* Diffs: the first cell of a row is the text marker; a hunk is its own <tbody>. */
+tbody + tbody {
+  border-top: 3px double currentColor;
+}
+
+ins {
+  text-decoration: none;
+  font-weight: 700;
+}
+
+del {
+  text-decoration: line-through;
+}
+
+/* Escapes of flagged characters and whitespace (<U+202E>, <U+0020>, <no newline at end>). */
+mark {
+  background: transparent;
+  color: inherit;
+  font-weight: 700;
+  outline: 1px solid currentColor;
+  outline-offset: -1px;
+}
+
+/* JSON tree. */
+ul ul {
+  padding-left: 18px;
+}
+
+img {
+  max-width: 100%;
+}
+</style></head><body><header><table><tbody><tr><th>instance</th><td><bdi>wiki</bdi></td></tr><tr><th>operation</th><td><bdi>confluence.attachment.upload</bdi></td></tr><tr><th>class</th><td><bdi>write</bdi></td></tr><tr><th>size</th><td>1234 bytes</td></tr><tr><th>fields included</th><td><bdi>summary</bdi>, <bdi>status</bdi></td></tr><tr><th>hidden in preview</th><td>0 bytes</td></tr><tr><th>bidi controls</th><td>0</td></tr><tr><th>other invisible</th><td>0</td></tr><tr><th>executes as</th><td><bdi>jdoe</bdi></td></tr><tr><th>agent receives</th><td><bdi>id</bdi>, <bdi>key</bdi></td></tr></tbody></table></header><section><h2>Attachment upload</h2><table><tbody><tr><th>file name</th><td><bdi>logo<mark>⟨U+200B⟩</mark>.png</bdi></td></tr><tr><th>size</th><td>70 bytes</td></tr><tr><th>MIME type</th><td><bdi>image/png</bdi></td></tr><tr><th>SHA-256</th><td><bdi>5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a</bdi></td></tr><tr><th>comment</th><td><bdi>new logo</bdi></td></tr></tbody></table><p>replaces existing attachment v3</p><h3>Thumbnail</h3><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" alt=""></section><section><h2>Requests to be sent</h2><h3>Request 0</h3><table><tbody><tr><th>method</th><td><bdi>POST</bdi></td></tr><tr><th>URL</th><td><bdi>https://wiki.example/wiki/rest/api/content/65537/child/attachment/att9001/data</bdi></td></tr><tr><th>Content-Type</th><td><bdi>multipart/form-data; boundary=atlas-duck-5a5a</bdi></td></tr></tbody></table><p>Body:</p><pre><code><bdi>--atlas-duck-5a5a<mark>⟨U+000D⟩</mark>
+Content-Disposition: form-data; name="file"; filename="logo.png"<mark>⟨U+000D⟩</mark>
+Content-Type: image/png<mark>⟨U+000D⟩</mark>
+<mark>⟨U+000D⟩</mark>
+70 bytes, SHA-256 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a (not shown)<mark>⟨U+000D⟩</mark>
+--atlas-duck-5a5a--<mark>⟨U+000D⟩</mark>
+</bdi></code></pre></section></body></html>

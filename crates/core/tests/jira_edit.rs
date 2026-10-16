@@ -242,9 +242,17 @@ fn conflict_diff_is_the_raw_diff_of_expected_and_current() -> TestResult {
     // The conflict card shows it.
     let m = preview_of(&params, &v)?;
     match &m.body {
-        PreviewBody::Conflict { summary, diff_text } => {
+        PreviewBody::Conflict {
+            summary,
+            diff_text,
+            base_to_current,
+            intended,
+            ..
+        } => {
             assert_eq!(Some(summary.as_str()), v.conflict.as_deref());
             assert_eq!(diff_text, &v.diff_text);
+            // M7 Δ2: Jira lists the differing fields in `diff_text`, no rendered diffs.
+            assert!(base_to_current.is_empty() && intended.is_empty());
         }
         other => return Err(format!("not the conflict card: {other:?}").into()),
     }
@@ -963,12 +971,20 @@ async fn i36_edit_expected_conflict_not_approvable() -> TestResult {
         "conflict: fields changed since the agent read it: summary"
     );
     match &p.body {
-        PreviewBody::Conflict { summary, diff_text } => {
+        PreviewBody::Conflict {
+            summary,
+            diff_text,
+            base_to_current,
+            intended,
+            ..
+        } => {
             assert_eq!(summary, &w.text);
             assert_eq!(
                 diff_text,
                 "summary (- read, + current)\n- \"Login page time out\"\n+ \"Login page times out\"\n"
             );
+            // M7 Δ2: Jira lists the differing fields in `diff_text`, no rendered diffs.
+            assert!(base_to_current.is_empty() && intended.is_empty());
         }
         other => return Err(format!("not the conflict card: {other:?}").into()),
     }

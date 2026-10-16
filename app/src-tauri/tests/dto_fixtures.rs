@@ -48,9 +48,9 @@ use atlas_duck_preview::diff::{DiffLine, DiffOp};
 use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    BodyView, CommentView, ConstructList, DenyOffer, DenyOfferKind, FieldRow, IssueCard, ItemCount,
-    OutcomeKind, PREVIEW_BUILDER_VERSION, Preview, PreviewBody, PreviewHeader, RawPager,
-    RequestView, json_tree,
+    BodyView, CommentView, ConfluenceComment, ConstructList, ConversionFacts, DenyOffer,
+    DenyOfferKind, FieldRow, IssueCard, ItemCount, OutcomeKind, PREVIEW_BUILDER_VERSION, Preview,
+    PreviewBody, PreviewHeader, RawPager, RequestView, json_tree,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -271,6 +271,22 @@ fn bodies() -> Vec<PreviewBody> {
         PreviewBody::Conflict {
             summary: "the issue changed since the preview".into(),
             diff_text: "- old\n+ new\n".into(),
+            // M7 Δ2: the base → current diff, the agent's intended change and the requests.
+            base_to_current: vec![
+                DiffLine {
+                    op: DiffOp::Del,
+                    text: "old\n".into(),
+                },
+                DiffLine {
+                    op: DiffOp::Add,
+                    text: "current\n".into(),
+                },
+            ],
+            intended: vec![DiffLine {
+                op: DiffOp::Add,
+                text: "new".into(),
+            }],
+            requests: requests(),
         },
         PreviewBody::CouldNotRecheck {
             class: "network".into(),
@@ -350,6 +366,83 @@ fn bodies() -> Vec<PreviewBody> {
             constructs: None,
             requests: requests(),
         },
+        // M7 Δ2: the Confluence bodies.
+        PreviewBody::ConfluencePage {
+            title: "Release plan".into(),
+            space: "Development (DEV)".into(),
+            version: Some(7),
+            ancestors: vec!["Home".into(), "Projects".into()],
+            format: "markdown".into(),
+            body_html: "<p>sanitized</p>".into(),
+            conversion: Some(ConversionFacts {
+                lossy: true,
+                macros: 1,
+                images: 0,
+                links: 2,
+                layouts: 0,
+                unresolved_users: 1,
+                fallback: false,
+            }),
+        },
+        PreviewBody::ConfluenceComments {
+            comments: vec![
+                ConfluenceComment {
+                    id: "11".into(),
+                    author: Some("jdoe".into()),
+                    created: Some("2026-10-16T10:00:00.000Z".into()),
+                    location: Some("footer".into()),
+                    depth: 0,
+                    parent_id: None,
+                    body_html: "<p>a comment</p>".into(),
+                },
+                // Every `Option` null: no author, date or location reported.
+                ConfluenceComment {
+                    id: "12".into(),
+                    author: None,
+                    created: None,
+                    location: None,
+                    depth: 1,
+                    parent_id: Some("11".into()),
+                    body_html: "<p>a reply</p>".into(),
+                },
+            ],
+            count: None,
+        },
+        PreviewBody::ContentWrite {
+            sentence: "Create page 'Release plan' in Development (DEV)".into(),
+            rows: vec![("title".into(), "Release plan".into())],
+            body_html: Some("<p>sanitized</p>".into()),
+            constructs: Some(constructs()),
+            requests: requests(),
+        },
+        PreviewBody::PageMove {
+            page: "Release plan".into(),
+            from_path: vec!["Home".into(), "Release plan".into()],
+            to_path: vec!["Home".into(), "Archive".into(), "Release plan".into()],
+            requests: requests(),
+        },
+        PreviewBody::AttachmentUpload {
+            filename: "logo.png".into(),
+            size: 70,
+            mime: "image/png".into(),
+            sha256: "5a".repeat(32),
+            thumbnail_data_uri: Some("data:image/png;base64,AAAA".into()),
+            replaces_version: Some(3),
+            existing: Some("attachment att9001, version 2".into()),
+            comment: None,
+            // The digest-only body view (M7 Δ2).
+            requests: vec![RequestView {
+                index: 0,
+                method: "POST".into(),
+                resolved_url: "https://wiki.example.com/wiki/rest/api/content/1/child/attachment"
+                    .into(),
+                content_type: Some("multipart/form-data; boundary=atlas-duck-5a".into()),
+                body: BodyView::Digest {
+                    bytes: 2_000_000,
+                    sha256: "5a".repeat(32),
+                },
+            }],
+        },
     ]
 }
 
@@ -365,6 +458,8 @@ fn previews() -> Vec<Preview> {
                     | PreviewBody::UpstreamError { .. }
                     | PreviewBody::JiraIssue { .. }
                     | PreviewBody::Table { .. }
+                    | PreviewBody::ConfluencePage { .. }
+                    | PreviewBody::ConfluenceComments { .. }
             );
             let mut header = header(if write { "write" } else { "read" });
             // M5 M-11: a read whose rebuild failed shows the banner and cannot be approved.
@@ -1184,9 +1279,10 @@ fn every_preview_body_variant_has_a_fixture() -> TestResult {
         })
         .unwrap_or_default();
     let unique: std::collections::BTreeSet<&String> = kinds.iter().collect();
-    // Thirteen `PreviewBody` variants (C.6), one fixture each; a new one must get a fixture.
-    assert_eq!(kinds.len(), 13, "{kinds:?}");
-    assert_eq!(unique.len(), 13, "{kinds:?}");
+    // Eighteen `PreviewBody` variants (C.6, M7 Δ2), one fixture each; a new one must get a
+    // fixture.
+    assert_eq!(kinds.len(), 18, "{kinds:?}");
+    assert_eq!(unique.len(), 18, "{kinds:?}");
     Ok(())
 }
 

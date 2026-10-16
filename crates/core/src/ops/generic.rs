@@ -516,6 +516,11 @@ fn write_model(ctx: &PreviewCtx<'_>, view: &WriteView<'_>) -> PreviewModel {
                 .enrichment
                 .map(|v| v.diff_text.clone())
                 .unwrap_or_default(),
+            // M7 Δ2 (M6 T10 review M-5): the card shows the requests; the rendered diffs base →
+            // current and base → outgoing are Confluence's (Task 15), empty until then.
+            base_to_current: Vec::new(),
+            intended: Vec::new(),
+            requests: views,
         },
         Hold::UnresolvedName => match view.enrichment.and_then(|v| v.unresolved.as_ref()) {
             Some((param, value, matches, candidates)) => PreviewBody::UnresolvedName {

@@ -12,10 +12,10 @@ pub mod warning;
 
 pub use json_tree::{JSON_STRING_COLLAPSE_BYTES, JsonNode, json_tree};
 pub use model::{
-    BodyView, CandidateRev, CommentView, ConstructList, DenyOffer, DenyOfferKind,
-    ERROR_TEXT_CAP_BYTES, FieldRow, IssueCard, ItemCount, OutcomeKind, PREVIEW_BUILDER_VERSION,
-    Preview, PreviewBody, PreviewHeader, RAW_PAGE_BYTES, RENDER_VERSIONS, RawPager, RequestView,
-    cap_error_text,
+    BodyView, CandidateRev, CommentView, ConfluenceComment, ConstructList, ConversionFacts,
+    DenyOffer, DenyOfferKind, ERROR_TEXT_CAP_BYTES, FieldRow, IssueCard, ItemCount, OutcomeKind,
+    PREVIEW_BUILDER_VERSION, Preview, PreviewBody, PreviewHeader, RAW_PAGE_BYTES, RENDER_VERSIONS,
+    RawPager, RequestView, body_digest_line, cap_error_text,
 };
 pub use sanitize::{
     PREVIEW_CSS, PREVIEW_CSS_HASH, Platform, app_origin, iframe_document, sanitize_html,

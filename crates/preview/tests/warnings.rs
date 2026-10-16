@@ -5,7 +5,7 @@ use atlas_duck_preview::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const C6_CAUTION: [&str; 23] = [
+const C6_CAUTION: [&str; 24] = [
     "restricted_comments",
     "security_level",
     "all_fields",
@@ -29,6 +29,8 @@ const C6_CAUTION: [&str; 23] = [
     "diff_truncated",
     "no_current_value",
     "link_type_inward_phrase",
+    // M7 Δ2 (PD-105): a page with the create's title exists in the space.
+    "duplicate_title",
 ];
 const C6_INFO: [&str; 9] = [
     "linked_issue_summaries",
@@ -62,7 +64,7 @@ fn every_warning_id_has_exactly_one_level() -> TestResult {
     assert_eq!(info, C6_INFO);
     let mut all = WarningId::ALL.to_vec();
     all.dedup();
-    assert_eq!(all.len(), 32);
+    assert_eq!(all.len(), 33);
     Ok(())
 }
 
@@ -157,6 +159,12 @@ fn parameterized_texts() {
         lossy_update(1, 2, 3),
         "this update will remove 1 macros / 2 images / 3 links"
     );
+    // M7 PD-105: a page with the create's title exists.
+    assert_eq!(
+        duplicate_title("Release plan", "DEV"),
+        "a page titled 'Release plan' already exists in DEV"
+    );
+    assert_eq!(WarningId::DuplicateTitle.level(), Level::Caution);
 }
 
 #[test]

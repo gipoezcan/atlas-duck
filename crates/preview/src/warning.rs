@@ -43,6 +43,9 @@ pub enum WarningId {
     /// M5 T16 review I1: a `jira.issuelink.create` type named only by its inward phrase, so the
     /// link reads the other way round from the agent's wording.
     LinkTypeInwardPhrase,
+    /// M7 Δ2 (PD-105, §6.3 "duplicate-title warning (Confluence)"): a page with the title of a
+    /// `confluence.page.create` already exists in its space; Approve stays enabled.
+    DuplicateTitle,
     // Info
     LinkedIssueSummaries,
     CustomFields,
@@ -57,7 +60,7 @@ pub enum WarningId {
 }
 
 impl WarningId {
-    pub const ALL: [WarningId; 32] = [
+    pub const ALL: [WarningId; 33] = [
         WarningId::RestrictedComments,
         WarningId::SecurityLevel,
         WarningId::AllFields,
@@ -81,6 +84,7 @@ impl WarningId {
         WarningId::DiffTruncated,
         WarningId::NoCurrentValue,
         WarningId::LinkTypeInwardPhrase,
+        WarningId::DuplicateTitle,
         WarningId::LinkedIssueSummaries,
         WarningId::CustomFields,
         WarningId::TruncatedByCap,
@@ -116,7 +120,8 @@ impl WarningId {
             | WarningId::InstanceUrlChanged
             | WarningId::DiffTruncated
             | WarningId::NoCurrentValue
-            | WarningId::LinkTypeInwardPhrase => Level::Caution,
+            | WarningId::LinkTypeInwardPhrase
+            | WarningId::DuplicateTitle => Level::Caution,
             WarningId::LinkedIssueSummaries
             | WarningId::CustomFields
             | WarningId::TruncatedByCap
@@ -269,6 +274,12 @@ pub fn link_type_inward_phrase(inward: &str, outward: &str) -> String {
     format!(
         "link type named by its inward phrase '{inward}': the inward issue gets the outward phrase '{outward}'"
     )
+}
+
+/// plan text (PD-105): "a page titled '<title>' already exists in <space>"; the caller
+/// display-escapes both.
+pub fn duplicate_title(title: &str, space: &str) -> String {
+    format!("a page titled '{title}' already exists in {space}")
 }
 
 /// "this update will remove N macros / M images / K links" (§7.6)

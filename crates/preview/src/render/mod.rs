@@ -13,9 +13,11 @@
 //! - `*_html` strings pass `sanitize_html` again; flagged characters in their text are escaped,
 //!   in their attribute values (an `alt`) too.
 //! - Semantic elements only (`header`, `section`, `table`, `th`, `td`, `ins`, `del`, `h2`–`h4`,
-//!   `ul`, `li`, `p`, `div`, `pre`, `code`, `bdi`, `mark`, `strong`), never a `class` or `style`
-//!   attribute: `preview.css` styles by element and position. A value that may need a `<pre>`
-//!   sits in a `div`, never a `p` (which cannot hold one).
+//!   `ul`, `ol`, `li`, `p`, `div`, `pre`, `code`, `bdi`, `mark`, `strong`), never a `class` or
+//!   `style` attribute: `preview.css` styles by element and position. A value that may need a
+//!   `<pre>` sits in a `div`, never a `p` (which cannot hold one). The one attribute-bearing
+//!   element is the attachment thumbnail (M7 Δ2, PD-110): `<img src="data:image/<raster>;base64,…"
+//!   alt="">`, emitted through the sanitizer and only for a raster `data:` URI.
 //! - Display caps: [`DOC_MAX_ROWS`] rows per table or list, [`DOC_MAX_DIFF_LINES`] lines per diff,
 //!   [`DOC_MAX_BYTES`] for the whole body. What a cap leaves out is replaced by the PD-67 note and
 //!   counted in the header's "hidden in preview" bytes.

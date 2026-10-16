@@ -21,7 +21,7 @@ pub const RAW_PAGE_BYTES: u64 = 256 * 1024;
 /// - `emoji-17.0`: `emojis` 0.9.0 README "Uses Unicode v17.0 emoji specification"
 ///   (`emojis::UNICODE_VERSION`).
 pub const PREVIEW_BUILDER_VERSION: &str =
-    concat!("pb2;render", "3", ";icu-", "17.0", ";emoji-", "17.0");
+    concat!("pb2;render", "4", ";icu-", "17.0", ";emoji-", "17.0");
 
 /// Each `renderN` with the FNV-1a 64 digest of what it renders: the goldens in
 /// `tests/golden/render` and `app/ui/public/preview.css` (`tests/render.rs` recomputes it and
@@ -33,6 +33,8 @@ pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     ("render1", 0x50e0_b962_fa25_e8fa),
     ("render2", 0x5977_a808_67ef_8b73),
     ("render3", 0x18d6_262f_815e_9ad3),
+    // M7 Task 8 (Δ2): the Confluence arms, the conflict card's diffs and requests, the digest body.
+    ("render4", 0xe915_6a82_b227_895f),
 ];
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
@@ -158,6 +160,19 @@ pub enum BodyView {
     None,
     Text(String),
     Base64(String),
+    /// M7 Δ2 (PD-109, plan review I-4): a body shown as its size and SHA-256 only (lowercase
+    /// hex), so the preview never carries the bytes; `WRITE_APPROVED` and `request_set_hash`
+    /// still cover them. Rendered as the one line of [`body_digest_line`].
+    Digest {
+        bytes: u64,
+        sha256: String,
+    },
+}
+
+/// plan text (M7 Δ2): the one line that stands for a body (or a multipart part body) the preview
+/// does not show: "<bytes> bytes, SHA-256 <hex> (not shown)".
+pub fn body_digest_line(bytes: u64, sha256: &str) -> String {
+    format!("{bytes} bytes, SHA-256 {sha256} (not shown)")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -200,9 +215,17 @@ pub enum PreviewBody {
         matches: u64,
         candidates: Vec<String>,
     },
+    /// §6.3 Conflict. `summary` and `diff_text` are display text; M7 Δ2 (M6 T10 review M-5) adds
+    /// the rendered diff from the agent's base to the current state, the agent's intended change
+    /// (base → outgoing) and the requests. Jira leaves both line lists empty (its card lists the
+    /// differing `expected` fields in `diff_text`); the renderer shows a diff section only when
+    /// its list is not empty.
     Conflict {
         summary: String,
         diff_text: String,
+        base_to_current: Vec<DiffLine>,
+        intended: Vec<DiffLine>,
+        requests: Vec<RequestView>,
     },
     CouldNotRecheck {
         class: String,
@@ -258,6 +281,87 @@ pub enum PreviewBody {
         constructs: Option<ConstructList>,
         requests: Vec<RequestView>,
     },
+    /// §6.3 Confluence page (M7 Δ2). `title`, `space`, `ancestors` (titles, root first) and
+    /// `format` (`markdown`, `storage` or `view`) are display-escaped text; `body_html` is
+    /// sanitized HTML (by core). A `view` body is the server-rendered HTML and is labelled a
+    /// secondary view (§6.4, PD-100). `conversion`: the storage→Markdown facts of a Markdown body.
+    ConfluencePage {
+        title: String,
+        space: String,
+        version: Option<u64>,
+        ancestors: Vec<String>,
+        format: String,
+        body_html: String,
+        conversion: Option<ConversionFacts>,
+    },
+    /// §6.3 Confluence comments (M7 Δ2, PD-103): in thread order, each with its depth below the
+    /// top-level comment.
+    ConfluenceComments {
+        comments: Vec<ConfluenceComment>,
+        count: Option<ItemCount>,
+    },
+    /// §6.3 create page and add comment (M7 Δ2): the sentence and rows are display-escaped text,
+    /// `body_html` the sanitized rendering of the outgoing body, `constructs` its storage
+    /// constructs.
+    ContentWrite {
+        sentence: String,
+        rows: Vec<(String, String)>,
+        body_html: Option<String>,
+        constructs: Option<ConstructList>,
+        requests: Vec<RequestView>,
+    },
+    /// §6.3 page move (M7 Δ2, PD-106): the old and the new ancestor path (titles, root first,
+    /// the page last), display-escaped.
+    PageMove {
+        page: String,
+        from_path: Vec<String>,
+        to_path: Vec<String>,
+        requests: Vec<RequestView>,
+    },
+    /// §6.3 attachment upload (M7 Δ2, PD-109, PD-110): digest, size, file name, sniffed MIME
+    /// type and the capped thumbnail only, never the file bytes (plan review I-4).
+    /// `thumbnail_data_uri` is rendered as an image only when it is a
+    /// `data:image/{png,jpeg,gif,webp};base64,` URI; `existing` holds the facts of the attachment
+    /// a collision hold found; `replaces_version` is the version a `replace` upload replaces.
+    AttachmentUpload {
+        filename: String,
+        size: u64,
+        mime: String,
+        sha256: String,
+        thumbnail_data_uri: Option<String>,
+        replaces_version: Option<u64>,
+        existing: Option<String>,
+        comment: Option<String>,
+        requests: Vec<RequestView>,
+    },
+}
+
+/// One Confluence comment (M7 Δ2, PD-103). `id`, `author`, `created`, `location` (`inline` or
+/// `footer` as Confluence sent it; `None` when the answer did not say) and `parent_id` are
+/// display-escaped text; `body_html` is sanitized HTML; `depth` is 0 for a top-level comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfluenceComment {
+    pub id: String,
+    pub author: Option<String>,
+    pub created: Option<String>,
+    pub location: Option<String>,
+    pub depth: u32,
+    pub parent_id: Option<String>,
+    pub body_html: String,
+}
+
+/// The storage→Markdown conversion facts of a Confluence body (M7 Δ2, from `ConversionReport`):
+/// the constructs the Markdown lost per kind, the mentions left unresolved, and whether the XML
+/// parse failed and the fallback ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConversionFacts {
+    pub lossy: bool,
+    pub macros: u64,
+    pub images: u64,
+    pub links: u64,
+    pub layouts: u64,
+    pub unresolved_users: u64,
+    pub fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

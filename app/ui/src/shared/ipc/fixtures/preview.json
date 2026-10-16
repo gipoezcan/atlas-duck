@@ -81,7 +81,7 @@
       ],
       "release_blocked": "release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items"
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -294,7 +294,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -354,7 +354,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -415,7 +415,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -591,7 +591,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -776,7 +776,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -801,8 +801,55 @@
     ],
     "approvable": true,
     "body": {
+      "base_to_current": [
+        {
+          "op": "del",
+          "text": "old\n"
+        },
+        {
+          "op": "add",
+          "text": "current\n"
+        }
+      ],
       "diff_text": "- old\n+ new\n",
+      "intended": [
+        {
+          "op": "add",
+          "text": "new"
+        }
+      ],
       "kind": "conflict",
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ],
       "summary": "the issue changed since the preview"
     },
     "candidate_rev": {
@@ -951,7 +998,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -1156,7 +1203,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -1241,7 +1288,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -1314,7 +1361,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -1546,7 +1593,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -1775,7 +1822,7 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
@@ -1989,7 +2036,800 @@
       ],
       "release_blocked": null
     },
-    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "ancestors": [
+        "Home",
+        "Projects"
+      ],
+      "body_html": "<p>sanitized</p>",
+      "conversion": {
+        "fallback": false,
+        "images": 0,
+        "layouts": 0,
+        "links": 2,
+        "lossy": true,
+        "macros": 1,
+        "unresolved_users": 1
+      },
+      "format": "markdown",
+      "kind": "confluence_page",
+      "space": "Development (DEV)",
+      "title": "Release plan",
+      "version": 7
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "deny_offers": [],
+    "deny_prefill": null,
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "read",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ],
+      "release_blocked": null
+    },
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "comments": [
+        {
+          "author": "jdoe",
+          "body_html": "<p>a comment</p>",
+          "created": "2026-10-16T10:00:00.000Z",
+          "depth": 0,
+          "id": "11",
+          "location": "footer",
+          "parent_id": null
+        },
+        {
+          "author": null,
+          "body_html": "<p>a reply</p>",
+          "created": null,
+          "depth": 1,
+          "id": "12",
+          "location": null,
+          "parent_id": "11"
+        }
+      ],
+      "count": null,
+      "kind": "confluence_comments"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "deny_offers": [],
+    "deny_prefill": null,
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "read",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ],
+      "release_blocked": null
+    },
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "body_html": "<p>sanitized</p>",
+      "constructs": {
+        "attachments": [
+          "a.txt"
+        ],
+        "images": [],
+        "includes": [],
+        "links": [
+          "https://example.com"
+        ],
+        "macros": [
+          "code"
+        ],
+        "mentions": [
+          "jdoe"
+        ]
+      },
+      "kind": "content_write",
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ],
+      "rows": [
+        [
+          "title",
+          "Release plan"
+        ]
+      ],
+      "sentence": "Create page 'Release plan' in Development (DEV)"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "deny_offers": [],
+    "deny_prefill": null,
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ],
+      "release_blocked": null
+    },
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": true,
+    "body": {
+      "from_path": [
+        "Home",
+        "Release plan"
+      ],
+      "kind": "page_move",
+      "page": "Release plan",
+      "requests": [
+        {
+          "body": {
+            "data": "{\"fields\":{}}",
+            "kind": "text"
+          },
+          "content_type": "application/json",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue"
+        },
+        {
+          "body": {
+            "data": "AAEC",
+            "kind": "base64"
+          },
+          "content_type": null,
+          "index": 1,
+          "method": "PUT",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-1"
+        },
+        {
+          "body": {
+            "kind": "none"
+          },
+          "content_type": null,
+          "index": 2,
+          "method": "DELETE",
+          "resolved_url": "https://jira.example.com/rest/api/2/issue/PROJ-2"
+        }
+      ],
+      "to_path": [
+        "Home",
+        "Archive",
+        "Release plan"
+      ]
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "deny_offers": [],
+    "deny_prefill": null,
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ],
+      "release_blocked": null
+    },
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "comment": null,
+      "existing": "attachment att9001, version 2",
+      "filename": "logo.png",
+      "kind": "attachment_upload",
+      "mime": "image/png",
+      "replaces_version": 3,
+      "requests": [
+        {
+          "body": {
+            "data": {
+              "bytes": 2000000,
+              "sha256": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+            },
+            "kind": "digest"
+          },
+          "content_type": "multipart/form-data; boundary=atlas-duck-5a",
+          "index": 0,
+          "method": "POST",
+          "resolved_url": "https://wiki.example.com/wiki/rest/api/content/1/child/attachment"
+        }
+      ],
+      "sha256": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "size": 70,
+      "thumbnail_data_uri": "data:image/png;base64,AAAA"
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "deny_offers": [],
+    "deny_prefill": null,
+    "edit_form": {
+      "inputs": [
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Summary",
+          "path": "summary",
+          "pre_added": false,
+          "read_only": false,
+          "required": true,
+          "value": "Fix the thing"
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "High",
+              "Low"
+            ],
+            "kind": "choice"
+          },
+          "label": "Priority",
+          "path": "fields.priority",
+          "pre_added": true,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "text"
+          },
+          "label": "Issue",
+          "path": "issue_key",
+          "pre_added": false,
+          "read_only": true,
+          "required": true,
+          "value": "PROJ-1"
+        },
+        {
+          "kind": {
+            "kind": "long_text"
+          },
+          "label": "description",
+          "path": "description",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": "A\nB"
+        },
+        {
+          "kind": {
+            "kind": "integer"
+          },
+          "label": "max_results",
+          "path": "max_results",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": 50
+        },
+        {
+          "kind": {
+            "kind": "number"
+          },
+          "label": "ratio",
+          "path": "ratio",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": null
+        },
+        {
+          "kind": {
+            "kind": "boolean"
+          },
+          "label": "notify",
+          "path": "notify",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": true
+        },
+        {
+          "kind": {
+            "kind": "json"
+          },
+          "label": "update",
+          "path": "update",
+          "pre_added": false,
+          "read_only": false,
+          "required": false,
+          "value": {
+            "labels": [
+              "x"
+            ]
+          }
+        },
+        {
+          "kind": {
+            "allowed_values": [
+              "UI",
+              "API"
+            ],
+            "kind": "choice",
+            "multiple": true
+          },
+          "label": "Areas (customfield_10300)",
+          "path": "fields.customfield_10300",
+          "pre_added": true,
+          "read_only": false,
+          "required": true,
+          "value": null
+        }
+      ]
+    },
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "write",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ],
+      "release_blocked": null
+    },
+    "preview_builder_version": "pb2;render4;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
       "page_count": 2,
