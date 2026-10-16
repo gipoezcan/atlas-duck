@@ -41,7 +41,9 @@ use crate::proto::{
     AwaitParams, BUSY_RETRY_CONNECTION_S, ConnectionMeta, Hello, PeerInfo, ProgressNotification,
     ProgressSink, RequestHandler, SubmitParams, busy_envelope,
 };
-use crate::rpc::frame::{FrameError, read_frame_async, write_frame_async};
+use crate::rpc::frame::{
+    FrameError, TimedFrameError, read_frame_async, read_frame_timed, write_frame_async,
+};
 use crate::rpc::{
     EmptyParams, IdParams, Notification, OpsDescribeParams, OpsListParams, ProtocolReason, Request,
     RequestsListParams, Response, TwoPointZero, codes, error_response, method, protocol_error,
@@ -56,6 +58,12 @@ pub const MAX_CONNECTIONS: usize = 64;
 pub const MAX_PER_ORIGIN: usize = 16;
 /// The `hello` frame must arrive within this time after accept (§3.3).
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+/// Peer walks (blocking process lookups) that may run at once before `hello` (L83); a
+/// connection beyond it waits for a free one, bounded by the hello deadline.
+pub const HELLO_WALKS: usize = 128;
+/// After `hello`, a frame must be complete this long after its first byte arrived (L83): a
+/// peer that stalls inside a frame is closed. An idle connection is not affected.
+pub const FRAME_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 /// The first frame (the `hello`) may be at most this large; a larger one is `frame_too_large`.
 pub const HELLO_MAX_BYTES: usize = 64 * 1024;
 /// Requests one connection may have in flight (backpressure, bounded memory). With all of
@@ -154,6 +162,10 @@ pub struct ServerLimits {
     pub max_connections: usize,
     pub per_origin: usize,
     pub hello_timeout: Duration,
+    /// Concurrent pre-`hello` peer walks ([`HELLO_WALKS`]).
+    pub hello_walks: usize,
+    /// Bound on one frame after `hello` ([`FRAME_BODY_TIMEOUT`]).
+    pub frame_body_timeout: Duration,
 }
 
 impl Default for ServerLimits {
@@ -162,6 +174,8 @@ impl Default for ServerLimits {
             max_connections: MAX_CONNECTIONS,
             per_origin: MAX_PER_ORIGIN,
             hello_timeout: HELLO_TIMEOUT,
+            hello_walks: HELLO_WALKS,
+            frame_body_timeout: FRAME_BODY_TIMEOUT,
         }
     }
 }
@@ -174,9 +188,17 @@ pub struct IpcServer {
     name: String,
     data: LocalDataDir,
     limits: ServerLimits,
+    walker: PeerWalker,
     /// Windows: the server's user SID, which every client must run as (§3.1).
     #[cfg(windows)]
     sid: String,
+}
+
+/// The blocking peer lookup of a connection (PD-36): the OS walk, a fresh source per call.
+type PeerWalker = Arc<dyn Fn(Option<u32>) -> PeerInfo + Send + Sync>;
+
+fn os_walker() -> PeerWalker {
+    Arc::new(|pid| peer_info(pid, &OsPeerSource::default()))
 }
 
 impl IpcServer {
@@ -231,6 +253,7 @@ impl IpcServer {
             name,
             data: data.clone(),
             limits: ServerLimits::default(),
+            walker: os_walker(),
             #[cfg(windows)]
             sid,
         })
@@ -239,6 +262,17 @@ impl IpcServer {
     /// Replaces the limits (tests scale them down).
     pub fn with_limits(mut self, limits: ServerLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Replaces the peer walk (tests count and hold walks). The walk is advisory (§2.4), never
+    /// part of peer authentication; the feature exists in test builds only (lib.rs).
+    #[cfg(feature = "test-paths")]
+    pub fn with_peer_walker(
+        mut self,
+        walker: impl Fn(Option<u32>) -> PeerInfo + Send + Sync + 'static,
+    ) -> Self {
+        self.walker = Arc::new(walker);
         self
     }
 
@@ -262,12 +296,15 @@ impl IpcServer {
             name: _,
             data,
             limits,
+            walker,
             #[cfg(windows)]
             sid,
         } = self;
         let shared = Arc::new(Shared {
             cell: handler,
             limits,
+            walks: Arc::new(Semaphore::new(limits.hello_walks)),
+            walker,
             slots: Arc::new(Mutex::new(Slots::default())),
             stop: shutdown.0.clone(),
             stopped_at: OnceLock::new(),
@@ -486,6 +523,9 @@ impl Endpoint {
 struct Shared {
     cell: Arc<HandlerCell>,
     limits: ServerLimits,
+    /// Free pre-`hello` peer walks (L83).
+    walks: Arc<Semaphore>,
+    walker: PeerWalker,
     slots: Arc<Mutex<Slots>>,
     stop: CancellationToken,
     /// When the stop signal was first seen (by `serve` or a connection).
@@ -568,9 +608,9 @@ struct Writer {
 }
 
 /// A task handle that aborts the task when dropped.
-struct AbortOnDrop(JoinHandle<()>);
+struct AbortOnDrop<T = ()>(JoinHandle<T>);
 
-impl Drop for AbortOnDrop {
+impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
@@ -783,9 +823,25 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
 
     // The peer walk (blocking process lookups, a new source per walk: PD-36) runs while the
     // first frame is read; neither may hold the first answer past the hello deadline. A walk
-    // that has not finished by then leaves the peer with its pid only. Losing the race to
-    // `stop` ends the connection, so a half-read frame is never resumed.
-    let walk = tokio::task::spawn_blocking(move || peer_info(pid, &OsPeerSource::default()));
+    // that has not finished by then leaves the peer with its pid only. At most
+    // `hello_walks` walks run at once (L83): a connection beyond it waits for a permit, which
+    // the walk itself holds until it ends, so a connection that gives up leaves nothing
+    // queued and never more walks than the cap. Losing the race to `stop` ends the
+    // connection, so a half-read frame is never resumed.
+    let mut walk = {
+        let walks = shared.walks.clone();
+        let walker = shared.walker.clone();
+        AbortOnDrop(tokio::spawn(async move {
+            let permit = walks.acquire_owned().await.ok()?;
+            tokio::task::spawn_blocking(move || {
+                let info = walker(pid);
+                drop(permit);
+                info
+            })
+            .await
+            .ok()
+        }))
+    };
     let first = tokio::select! {
         biased;
         () = shared.stop.cancelled() => return,
@@ -801,26 +857,26 @@ async fn connection(shared: Arc<Shared>, acc: Accepted) {
     let peer = tokio::select! {
         biased;
         () = shared.stop.cancelled() => return,
-        p = tokio::time::timeout_at(deadline, walk) => match p {
-            Ok(Ok(p)) => p,
-            Ok(Err(_)) | Err(_) => PeerInfo {
+        p = tokio::time::timeout_at(deadline, &mut walk.0) => match p {
+            Ok(Ok(Some(p))) => p,
+            Ok(Ok(None) | Err(_)) | Err(_) => PeerInfo {
                 peer_pid: pid,
                 ..PeerInfo::default()
             },
         },
     };
+    // A walk still waiting for a permit is dropped here: it must not start after the deadline.
+    drop(walk);
     let meta = Arc::new(ConnectionMeta {
         connection_id,
         peer,
     });
 
     // §3.1: data was read, so the client can be impersonated; nothing is answered before its
-    // SID matched. A timeout may have read nothing (impersonation would fail); its fixed
-    // `hello_timeout` answer is sent without the check.
+    // SID matched, the `hello_timeout` answer included (L83). A client that cannot be
+    // impersonated (anonymous level, or no read happened) is closed unanswered.
     #[cfg(windows)]
-    if !matches!(first, Err(ProtocolReason::HelloTimeout))
-        && !client_sid_ok(pipe, &shared.sid, &meta).await
-    {
+    if !client_sid_ok(pipe, &shared.sid, &meta).await {
         return writer.close(&shared, Instant::now()).await;
     }
 
@@ -1024,13 +1080,27 @@ async fn request_loop(
         let read = tokio::select! {
             biased;
             () = shared.stop.cancelled() => return End::Stop,
-            r = read_frame_async(rd, MAX_FRAME_BYTES) => r,
+            r = read_frame_timed(rd, MAX_FRAME_BYTES, shared.limits.frame_body_timeout) => r,
         };
         // A refusal that closes the connection waits for queue room until `flush_by`; one
         // that keeps it open waits like any answer (backpressure) until the stop signal.
         let bytes = match read {
             Ok(Some(bytes)) => bytes,
-            Err(FrameError::TooLarge { .. }) => {
+            // L83: stalled inside a frame. The stream is mid-frame, so there is nothing to
+            // answer on; close.
+            Err(TimedFrameError::BodyTimeout) => {
+                tracing::warn!(
+                    event = diag::EVENT_PROTOCOL_ERROR,
+                    connection_id = %meta.connection_id,
+                    peer_pid = meta.peer.peer_pid,
+                    reason = diag::REASON_FRAME_TIMEOUT,
+                    "ipc protocol error"
+                );
+                return End::Closed {
+                    flush_by: closing(),
+                };
+            }
+            Err(TimedFrameError::Frame(FrameError::TooLarge { .. })) => {
                 let flush_by = closing();
                 let reason = ProtocolReason::FrameTooLarge;
                 refuse(shared, writer, meta, reason, None, Some(flush_by)).await;

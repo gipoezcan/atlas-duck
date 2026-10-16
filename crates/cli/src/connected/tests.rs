@@ -99,6 +99,62 @@ async fn submit_wait_returns_await_answer() {
     running.stop().await;
 }
 
+/// L83: a `pending` submit reply without a request id is a protocol failure (exit 1): no notice,
+/// no await, nothing echoed.
+#[tokio::test]
+async fn l83_submit_null_request_id_rejected() {
+    let mut broken = Fake::new();
+    broken.submit_null_id = true;
+    let fake = Arc::new(broken);
+    let (running, connector) = setup(&fake).await;
+    let (env, exit) = run(&op(), &opts(), &within(5_000), &connector).await;
+    assert_eq!(status_of(&env), Status::Failed);
+    assert_eq!(code(&env), Some(ErrorCode::ProtocolError));
+    assert_eq!(env.request_id, None);
+    assert_eq!(exit, 1);
+    assert!(connector.notice_lines().is_empty());
+    assert_eq!(fake.count(Kind::AwaitStart), 0);
+    // `--timeout 0` takes the same path: the id check comes before the early return.
+    let mut o = opts();
+    o.timeout = Some(0);
+    let deadline = Deadline::from_timeout(Instant::now(), Some(0));
+    let (env, exit) = run(&op(), &o, &deadline, &connector).await;
+    assert_eq!((code(&env), exit), (Some(ErrorCode::ProtocolError), 1));
+    running.stop().await;
+}
+
+/// L83: the answer to `request.await` names the request that was asked; another id is a protocol
+/// failure (exit 1), for the submit-wait flow and the `await` command alike. An answer without an
+/// id (an error envelope) and one with the asked id pass.
+#[tokio::test]
+async fn l83_await_reply_id_compared() {
+    let mut wrong = Fake::new();
+    wrong.await_reply_id = Some("req_00000000000000000000000000000002");
+    let fake = Arc::new(wrong);
+    let (running, connector) = setup(&fake).await;
+    let (env, exit) = run(&op(), &opts(), &within(5_000), &connector).await;
+    assert_eq!(code(&env), Some(ErrorCode::ProtocolError));
+    assert_eq!(
+        (status_of(&env), env.request_id.clone(), exit),
+        (Status::Failed, None, 1)
+    );
+    let cmd = Command::Await {
+        id: REQ_ID.to_owned(),
+    };
+    let (env, exit) = run(&cmd, &opts(), &within(5_000), &connector).await;
+    assert_eq!((code(&env), exit), (Some(ErrorCode::ProtocolError), 1));
+    running.stop().await;
+
+    let mut right = Fake::new();
+    right.await_reply_id = Some(REQ_ID);
+    let fake = Arc::new(right);
+    let (running, connector) = setup(&fake).await;
+    let (env, exit) = run(&op(), &opts(), &within(5_000), &connector).await;
+    assert_eq!((status_of(&env), exit), (Status::Succeeded, 0));
+    assert_eq!(env.request_id.as_deref(), Some(REQ_ID));
+    running.stop().await;
+}
+
 #[tokio::test]
 async fn submit_params_carry_instance_reason_and_op() {
     let fake = Arc::new(Fake::new());

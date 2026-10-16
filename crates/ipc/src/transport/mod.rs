@@ -38,6 +38,9 @@ pub mod diag {
     pub const REASON_LIMIT: &str = "limit";
     /// The server could not serve the connection (no connection id: the OS CSPRNG failed).
     pub const REASON_INTERNAL: &str = "internal";
+    /// A frame began but its last byte did not arrive in time (L83); the connection was closed
+    /// without an answer.
+    pub const REASON_FRAME_TIMEOUT: &str = "frame_timeout";
 
     // `ipc_bind_failed` reasons. The diag log never writes the message, so `reason` is what
     // tells these cases apart.

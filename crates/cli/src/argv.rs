@@ -310,6 +310,7 @@ pub(crate) fn parse(
     let mut flags = Flags::default();
     // `requests list --agent` filters by the explicit flag only, not the environment fallback.
     let mut agent_flag: Option<String> = None;
+    let mut agent_given = false;
     let mut output_flag: Option<OutputMode> = None;
     let mut pos: Vec<String> = Vec::new();
     // The first unknown flag: reported after the loop unless `--help` is also present, so
@@ -337,8 +338,14 @@ pub(crate) fn parse(
                     "agent" => {
                         let v = value(&mut parser)?;
                         set_once(&mut agent_flag, &flag, v.clone())?;
-                        opts.agent = Some(v);
-                        opts.agent_source = AgentNameSource::Flag;
+                        // L83: `--agent ""` is no name (as an empty `ATLAS_DUCK_AGENT` is),
+                        // sent as `None`; it still counts as given, so the environment does
+                        // not fill the gap.
+                        agent_given = true;
+                        if !v.is_empty() {
+                            opts.agent = Some(v);
+                            opts.agent_source = AgentNameSource::Flag;
+                        }
                     }
                     "reason" => set_once(&mut opts.reason, &flag, value(&mut parser)?)?,
                     "instance" => set_once(&mut opts.instance, &flag, value(&mut parser)?)?,
@@ -429,7 +436,7 @@ pub(crate) fn parse(
     if let Some(mode) = output_flag {
         opts.output = mode;
     }
-    if opts.agent.is_none() {
+    if !agent_given {
         opts.agent = env("ATLAS_DUCK_AGENT")
             .map(text)
             .transpose()
@@ -455,7 +462,7 @@ pub(crate) fn parse(
     let rest = pos.get(path_len..).unwrap_or_default();
     let ctx = Ctx {
         opts: &opts,
-        explicit_agent: agent_flag,
+        explicit_agent: agent_flag.filter(|a| !a.is_empty()),
         op_flags,
     };
     let command = build(kind, &pos, rest, flags, ctx, inputs)?;
@@ -906,6 +913,27 @@ mod tests {
         // An empty environment value is no name at all.
         let empty = |k: &str| (k == "ATLAS_DUCK_AGENT").then(|| OsString::from(""));
         assert_eq!(source(&["instances"], &empty), AgentNameSource::None);
+    }
+
+    /// L83: an empty `--agent` is no name: the hello carries `None` and the source is `None`,
+    /// even with `ATLAS_DUCK_AGENT` set; `requests list --agent ""` adds no filter.
+    #[test]
+    fn empty_agent_flag_sent_as_none() {
+        let env = |k: &str| (k == "ATLAS_DUCK_AGENT").then(|| OsString::from("from-env"));
+        for e in [&env as &dyn Fn(&str) -> Option<OsString>, &|_| None] {
+            let (o, _) = ok_env(&["--agent", "", "instances"], e);
+            assert_eq!(o.agent, None);
+            assert_eq!(o.agent_source, AgentNameSource::None);
+            let (o, _) = ok_env(&["--agent=", "instances"], e);
+            assert_eq!(o.agent, None);
+            assert_eq!(o.agent_source, AgentNameSource::None);
+            let (o, c) = ok_env(&["--agent", "", "requests", "list"], e);
+            assert_eq!(o.agent, None);
+            assert!(
+                matches!(c, Command::RequestsList { agent: None, .. }),
+                "{c:?}"
+            );
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! bytes against the sync writer.
 
 use std::io;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -65,6 +66,41 @@ pub async fn read_frame_async<R: AsyncRead + Unpin>(
         }
     }
     Ok(Some(body))
+}
+
+/// Why [`read_frame_timed`] gave no frame.
+#[derive(Debug)]
+pub enum TimedFrameError {
+    Frame(FrameError),
+    /// The frame began (its first length byte arrived) but its last byte did not arrive within
+    /// the bound.
+    BodyTimeout,
+}
+
+/// [`read_frame_async`] with a bound on one frame: the wait for the first length byte has none
+/// (an idle connection is fine), but once it arrived the whole frame, header and body, must
+/// have arrived within `within`. Same `Ok(None)` and `TooLarge` rules; the same cancel-safety
+/// caveat, and after `BodyTimeout` the stream is inside a frame and must not be read again.
+pub async fn read_frame_timed<R: AsyncRead + Unpin>(
+    r: &mut R,
+    max: usize,
+    within: Duration,
+) -> Result<Option<Vec<u8>>, TimedFrameError> {
+    let mut first = [0u8; 1];
+    loop {
+        match r.read(&mut first).await {
+            Ok(0) => return Ok(None),
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(TimedFrameError::Frame(FrameError::Io(e))),
+        }
+    }
+    let mut framed = io::Cursor::new(first).chain(&mut *r);
+    match tokio::time::timeout(within, read_frame_async(&mut framed, max)).await {
+        Ok(Ok(frame)) => Ok(frame),
+        Ok(Err(e)) => Err(TimedFrameError::Frame(e)),
+        Err(_elapsed) => Err(TimedFrameError::BodyTimeout),
+    }
 }
 
 /// Writes one frame and flushes. A payload above [`MAX_FRAME_BYTES`] is refused with

@@ -631,12 +631,14 @@ async fn submit_wait(
         Wait::Interrupted | Wait::TimedOut => return no_reply(client.written_request()),
     };
     let envelope = reply.envelope;
-    let Some(request_id) = envelope.request_id.clone() else {
-        return envelope;
-    };
     if envelope.status != Status::Pending {
         return envelope;
     }
+    // L83: a `pending` reply names the request; one without an id cannot be awaited, noticed
+    // or recovered, so the app broke the protocol.
+    let Some(request_id) = envelope.request_id.clone() else {
+        return protocol_failure();
+    };
     // PD-19: only from the returned reply, before any wait.
     connector.notice(&request_id, reply.params_sha256.as_deref());
     if opts.timeout == Some(0) {
@@ -711,6 +713,10 @@ async fn await_request(
     )
     .await
     {
+        // L83: an answer naming another request is not the answer to this one.
+        Wait::Done(Ok(env)) if env.request_id.as_deref().is_some_and(|got| got != id) => {
+            protocol_failure()
+        }
         Wait::Done(Ok(env)) => env,
         Wait::Done(Err(e)) => await_error(e, id, base),
         // The wait ended undecided; the request lives on (`await` it again).
