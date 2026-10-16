@@ -3,11 +3,15 @@
 //! One fresh [`Runtime`] per run, on the worker's main thread. The worker
 //! creates no other threads, so nothing here needs `parallel`, and the
 //! `futures` feature stays off: pending promise jobs are drained by the
-//! blocking loop (`Runtime::execute_pending_job`). Whether M8 needs `futures`
-//! for the real `atlas.*` host calls is decided there (§15).
+//! blocking loop (`Runtime::execute_pending_job`), also for the real `atlas.*`
+//! host calls (decided off in M8, PD-131, §15 V15).
+
+use std::sync::Arc;
 
 use rquickjs::context::intrinsic::{Date, Eval, Json, MapSet, Promise, RegExp};
 use rquickjs::{CatchResultExt, Context, Function, Runtime};
+
+use crate::script::alloc::{LimitAllocator, LimitState};
 
 /// QuickJS-NG version bundled by `rquickjs-sys` 0.14.0. Pinned against the
 /// linked engine's own `JS_GetVersion()` by `tests/engine.rs`.
@@ -27,6 +31,21 @@ pub fn new_runtime() -> rquickjs::Result<Runtime> {
     let rt = Runtime::new()?;
     rt.set_max_stack_size(MAX_STACK_BYTES);
     Ok(rt)
+}
+
+/// A fresh script runtime (§9.3, §9.4; plan M8 PD-134): its allocations go through a
+/// [`LimitAllocator`] that refuses anything above `heap_bytes` (installed with
+/// `Runtime::new_with_alloc`), with the 1 MiB JS stack guard and a GC threshold of a quarter of
+/// the heap (plan value). `set_memory_limit` is not called: QuickJS-NG would check its own limit
+/// before the wrapper is reached, so the wrapper's refusal would never happen.
+pub fn new_runtime_with_heap_limit(
+    heap_bytes: usize,
+) -> rquickjs::Result<(Runtime, Arc<LimitState>)> {
+    let (allocator, state) = LimitAllocator::new(heap_bytes);
+    let rt = Runtime::new_with_alloc(allocator)?;
+    rt.set_max_stack_size(MAX_STACK_BYTES);
+    rt.set_gc_threshold(heap_bytes / 4);
+    Ok((rt, state))
 }
 
 /// A context with the §9.3 minimal intrinsics: base objects (always present),

@@ -11,6 +11,7 @@
 pub mod confine;
 pub mod engine;
 pub mod probe;
+pub mod script;
 
 use std::io::{self, Read, Write};
 
