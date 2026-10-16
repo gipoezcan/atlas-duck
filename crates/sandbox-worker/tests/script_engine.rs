@@ -482,7 +482,8 @@ fn interrupt_deadline_and_op_budget_stop_cpu_loop() -> TestResult {
             let mut engine = Engine::with_interrupts(
                 &init(source),
                 FakeHost::default(),
-                Deadline::after(Duration::from_millis(100)),
+                // Wide enough that building the engine on a slow CI runner never reaches it.
+                Deadline::after(Duration::from_secs(1)),
                 OpBudget::default(),
             )
             .map_err(e)?;
@@ -894,6 +895,42 @@ fn undecodable_or_oversized_calls_reject_in_script_and_send_nothing() -> TestRes
             "]".repeat(first as usize)
         );
         serde_json::from_str::<Json_>(&text).map_err(|err| format!("bare parse: {err}"))?;
+        Ok(())
+    })
+}
+
+/// An exception thrown out of a `queueMicrotask` callback (the only job that can throw past its
+/// own handler) ends the run as a script error, never as an engine halt; `main`'s own earlier
+/// settlement wins.
+#[test]
+fn uncaught_microtask_exception_is_a_script_error() -> TestResult {
+    big_stack(|| {
+        let source = "queueMicrotask(() => { throw new TypeError('from a microtask'); }); \
+                      await new Promise(() => {});";
+        let mut engine = Engine::new(&init(source), FakeHost::default()).map_err(e)?;
+        match start_and_drain(&mut engine) {
+            Settled::Error(err)
+                if err.class == "TypeError" && err.message == "from a microtask" => {}
+            other => return Err(format!("object: {other:?}")),
+        }
+        // The run is over: no later drain turns it into something else.
+        if !matches!(engine.drain_jobs(), Settled::Halted(Halt::Engine(_))) {
+            return Err("second drain".into());
+        }
+        let (settled, _) = run(&init(
+            "queueMicrotask(() => { throw 42; }); await new Promise(() => {});",
+        ))?;
+        match settled {
+            Settled::Error(err) if err.class == "Error" && err.message == "42" => {}
+            other => return Err(format!("primitive: {other:?}")),
+        }
+        // `main` settles in the job before the throwing microtask runs.
+        let (settled, _) = run(&init(
+            "Promise.resolve().then(() => queueMicrotask(() => { throw new Error('late'); })); return 7;",
+        ))?;
+        if result_json(&settled)? != json!(7) {
+            return Err(format!("late: {settled:?}"));
+        }
         Ok(())
     })
 }

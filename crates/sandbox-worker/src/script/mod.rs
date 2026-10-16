@@ -30,8 +30,8 @@ use atlas_duck_ipc::sandbox::{HostCall, ScriptLimits};
 use rquickjs::function::This;
 use rquickjs::runtime::MemoryUsage;
 use rquickjs::{
-    CatchResultExt, CaughtError, Context, Ctx, Exception, Function, Object, Persistent, Runtime,
-    Value,
+    CatchResultExt, CaughtError, Coerced, Context, Ctx, Exception, Function, Object, Persistent,
+    Runtime, Value,
 };
 
 use crate::engine::{new_context, new_runtime_with_heap_limit};
@@ -60,6 +60,9 @@ pub const NUL_IN_SOURCE: &str = "the source contains a NUL character";
 
 /// Plan text (PD-136): the result's JSON text does not fit the terminal frame.
 pub const RESULT_TOO_LARGE: &str = "the result is above max_result_mb";
+
+/// Plan text: a thrown value whose text could not be read (as in the shim's `describe`).
+pub const UNDESCRIBABLE: &str = "the thrown value could not be described";
 
 /// The wrapper the agent's source is compiled in (Â§9.2): the body of
 /// `async function main(args, atlas)`.
@@ -342,13 +345,18 @@ impl<H: HostPort + 'static> Engine<H> {
                 break;
             }
             if self.rt.execute_pending_job().is_err() {
-                // Promise jobs turn exceptions into rejections; one escapes only when the
-                // interrupt handler stopped the script or an allocation failed.
-                return Settled::Halted(
-                    self.shared
-                        .halted()
-                        .unwrap_or(Halt::Engine("a promise job failed")),
-                );
+                if let Some(halt) = self.shared.halted() {
+                    return Settled::Halted(halt);
+                }
+                // Promise reactions turn exceptions into rejections; an exception escapes a job
+                // only from a `queueMicrotask` callback. Like an uncaught exception it ends the
+                // run as a script error, unless `main` settled first.
+                let thrown = self.ctx.with(|ctx| describe_thrown(ctx.catch()));
+                if let Some(halt) = self.shared.halted() {
+                    return Settled::Halted(halt);
+                }
+                self.shared.settle(Outcome::Error(thrown));
+                break;
             }
         }
         if self.finished {
@@ -608,6 +616,26 @@ fn position_of(source: &str, at: usize) -> (u32, u32) {
         u32::try_from(line).unwrap_or(u32::MAX),
         u32::try_from(column).unwrap_or(u32::MAX),
     )
+}
+
+/// A value thrown past every handler, as untrusted payload (§9.5): `name`, `message` and `stack`
+/// when they are strings, else the defaults the shim's `describe` uses.
+fn describe_thrown(value: Value<'_>) -> ScriptError {
+    let field = |obj: &Object<'_>, key: &str| obj.get::<_, Option<String>>(key).ok().flatten();
+    match value.as_object() {
+        Some(obj) => ScriptError {
+            class: field(obj, "name").unwrap_or_else(|| "Error".to_owned()),
+            message: field(obj, "message").unwrap_or_default(),
+            stack: field(obj, "stack").unwrap_or_default(),
+        },
+        None => ScriptError {
+            class: "Error".to_owned(),
+            message: value
+                .get::<Coerced<String>>()
+                .map_or_else(|_| UNDESCRIBABLE.to_owned(), |text| text.0),
+            stack: String::new(),
+        },
+    }
 }
 
 /// An init failure: the JS exception's text when there is one.
