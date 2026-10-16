@@ -34,25 +34,29 @@ pub const CALL_TOO_LARGE: &str = "the host call is above the 1 MiB frame limit";
 pub const CALL_NOT_DECODABLE: &str = "the host call params nest too deeply";
 
 /// The JSON text of the init data the shim reads (`JSON.parse`d once in JS). `max_result_units`
-/// is the terminal-frame budget for the result text in bytes, and `max_frame_units` the worker →
-/// host frame cap, both used by the shim as UTF-16 unit bounds (a UTF-8 text is never shorter in
-/// bytes than in UTF-16 units): a call text above the cap is refused with [`CALL_TOO_LARGE`] and
-/// a log line is cut to it before either is copied to Rust (outside the heap limit).
+/// is the terminal-frame budget for the result text in bytes, `max_error_units` the cap of the
+/// `script.error` frame, and `max_frame_units` the worker → host frame cap, all used by the shim
+/// as UTF-16 unit bounds (a UTF-8 text is never shorter in bytes than in UTF-16 units): a call
+/// text above the frame cap is refused with [`CALL_TOO_LARGE`], and a log line and each field of
+/// a thrown error are cut to their cap before they are copied to Rust (outside the heap limit).
 pub(crate) fn config_json(
     read_op_ids: &[String],
     instances: &[InstanceInfo],
     args: &Value,
     max_concurrent_calls: u32,
     max_result_units: usize,
+    max_error_units: usize,
 ) -> serde_json::Result<String> {
     Ok(format!(
         "{{\"read_op_ids\":{},\"instances\":{},\"args\":{},\"max_concurrent_calls\":{},\
-         \"max_result_units\":{},\"max_frame_units\":{},\"call_too_large\":{}}}",
+         \"max_result_units\":{},\"max_error_units\":{},\"max_frame_units\":{},\
+         \"call_too_large\":{}}}",
         serde_json::to_string(read_op_ids)?,
         serde_json::to_string(instances)?,
         serde_json::to_string(args)?,
         max_concurrent_calls,
         max_result_units,
+        max_error_units,
         WORKER_FRAME_MAX_BYTES,
         serde_json::to_string(CALL_TOO_LARGE)?,
     ))
@@ -76,15 +80,33 @@ pub(crate) fn install_prelude(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     prelude.call::<_, ()>(())
 }
 
+/// Why the shim was not installed.
+pub(crate) enum ShimError {
+    /// The init data names an op id the shim cannot place under `atlas` (the host's fault): the
+    /// shim's message.
+    Refused(String),
+    /// Anything else: an engine fault.
+    Engine,
+}
+
+impl From<rquickjs::Error> for ShimError {
+    fn from(_: rquickjs::Error) -> Self {
+        ShimError::Engine
+    }
+}
+
 /// Evaluates the shim, calls it with the natives and the config, and returns its functions.
 pub(crate) fn install_shim<'js, H: HostPort + 'static>(
     ctx: &Ctx<'js>,
     shared: &Rc<Shared<H>>,
     config: &str,
-) -> rquickjs::Result<ShimApi<'js>> {
+) -> Result<ShimApi<'js>, ShimError> {
     let natives = natives(ctx, shared)?;
     let shim: Function = ctx.eval(SHIM_JS)?;
     let api: Object = shim.call((natives, config))?;
+    if let Some(refused) = api.get::<_, Option<String>>("refused")? {
+        return Err(ShimError::Refused(refused));
+    }
     Ok(ShimApi {
         start: api.get("start")?,
         deliver: api.get("deliver")?,

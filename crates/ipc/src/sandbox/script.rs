@@ -15,14 +15,15 @@
 //! - serde_json's recursion limit (128) applies to every `Value` built here: a `host.call` whose
 //!   `params` nest about 126 levels or more is rejected as a protocol violation. A
 //!   `script.result` value is skipped as text without that limit, so it decodes at any depth
-//!   (whoever parses it later must bound the depth). The worker run loop (M8 T4) must check
+//!   (whoever parses it later must bound the depth; the worker sends only a value that
+//!   [`RawJsonText::reads_as_value`] accepts). The worker run loop (M8 T4) must check
 //!   the depth of a call's params before it sends the frame and report an over-deep value as a
 //!   script error.
 
 use std::collections::HashSet;
 use std::fmt;
 
-use serde::de::{IgnoredAny, MapAccess, Visitor};
+use serde::de::{Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -150,6 +151,108 @@ impl RawJsonText {
     /// The value's JSON text, exactly as received.
     pub fn get(&self) -> &str {
         self.0.get()
+    }
+
+    /// Whether `serde_json::from_str::<Value>(self.get())` (the core's result type) reads the
+    /// text as this same value, checked without building it: serde_json's recursion limit (127
+    /// nested arrays or objects read, 128 do not), strings and keys whose `\u` escapes are valid
+    /// UTF-16 (a lone surrogate is refused), and no object whose first key is one of serde_json's
+    /// private tokens (`Value` fails on `{"$serde_json::private::RawValue":5}` and reads
+    /// `{"$serde_json::private::RawValue":"[1]"}` as `[1]`). [`RawJsonText::from_string`] checks
+    /// none of this. Duplicate keys pass (a `Value` keeps the last one).
+    ///
+    /// The only allocation is serde_json's scratch buffer, as long as the longest string or key
+    /// that contains an escape.
+    pub fn reads_as_value(&self) -> bool {
+        serde_json::from_str::<ValueShape>(self.get()).is_ok()
+    }
+}
+
+/// The keys serde_json's `Value` reads specially when they come first in an object (its
+/// `raw_value` and `arbitrary_precision` features).
+const SERDE_JSON_TOKENS: [&str; 2] = [
+    "$serde_json::private::RawValue",
+    "$serde_json::private::Number",
+];
+
+/// Accepts what `Value` accepts and keeps nothing. Every value, element and key goes through
+/// `deserialize_any`, so serde_json applies its recursion limit and validates strings (unlike
+/// `IgnoredAny`, which skips them unchecked).
+struct ValueShape;
+
+impl<'de> Deserialize<'de> for ValueShape {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(ValueShape)
+    }
+}
+
+impl<'de> Visitor<'de> for ValueShape {
+    type Value = ValueShape;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_i64<E>(self, _: i64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_u64<E>(self, _: u64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_f64<E>(self, _: f64) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_str<E>(self, _: &str) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self, E> {
+        Ok(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self, A::Error> {
+        while seq.next_element::<ValueShape>()?.is_some() {}
+        Ok(self)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        let mut first = true;
+        while let Some(key) = map.next_key::<KeyShape>()? {
+            if first && key.0 {
+                return Err(A::Error::custom(
+                    "a serde_json private token as the first key",
+                ));
+            }
+            first = false;
+            map.next_value::<ValueShape>()?;
+        }
+        Ok(self)
+    }
+}
+
+/// An object key, validated like a `Value` key; `true` when it is one of [`SERDE_JSON_TOKENS`].
+struct KeyShape(bool);
+
+impl<'de> Deserialize<'de> for KeyShape {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl Visitor<'_> for V {
+            type Value = KeyShape;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a string key")
+            }
+            fn visit_str<E>(self, key: &str) -> Result<KeyShape, E> {
+                Ok(KeyShape(SERDE_JSON_TOKENS.contains(&key)))
+            }
+        }
+        d.deserialize_str(V)
     }
 }
 

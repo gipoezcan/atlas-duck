@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_duck_ipc::sandbox::script::{WorkerInit, terminal_frame_max};
-use atlas_duck_ipc::sandbox::{HostCall, ScriptLimits};
+use atlas_duck_ipc::sandbox::{HostCall, MAX_FRAME_BYTES, ScriptLimits};
 use rquickjs::function::This;
 use rquickjs::promise::PromiseState;
 use rquickjs::runtime::MemoryUsage;
@@ -125,7 +125,9 @@ pub enum EngineError {
     /// runtime outcome of the run).
     Syntax(SyntaxPos),
     Halted(Halt),
-    /// The init data does not fit the shim (an op id that cannot be placed under `atlas`).
+    /// The init data does not fit the shim: an op id that cannot be placed under `atlas` (a
+    /// reserved or single segment, an empty segment, a duplicate). The host's fault; every other
+    /// set-up failure is `Halted(Halt::Engine(_))`.
     Init(String),
 }
 
@@ -260,6 +262,8 @@ impl<H: HostPort + 'static> Engine<H> {
         let heap = (init.limits.heap_mb as usize).saturating_mul(MIB);
         let (rt, meter) = new_runtime_with_heap_limit(heap)
             .map_err(|_| EngineError::Halted(Halt::Engine("the runtime could not be created")))?;
+        // From here on a panic after a heap refusal exits `EXIT_HEAP_LIMIT` (PD-134).
+        crate::set_run_meter(Arc::clone(&meter));
         let shared = Rc::new(Shared {
             host: RefCell::new(host),
             meter,
@@ -274,22 +278,31 @@ impl<H: HostPort + 'static> Engine<H> {
         let ctx = new_context(&rt).map_err(|_| halted_or(&shared, Halt::Engine("no context")))?;
 
         let result_max = terminal_frame_max(&init.limits).saturating_sub(TERMINAL_FRAME_SLACK);
+        // The loop's cap for a `script.error` frame (`write_frame` refuses anything above the
+        // channel's general cap).
+        let error_max = terminal_frame_max(&init.limits).min(MAX_FRAME_BYTES);
         let config = shim::config_json(
             &init.read_op_ids,
             &init.instances,
             &init.args,
             init.limits.max_concurrent_calls,
             result_max,
+            error_max,
         )
-        .map_err(|_| EngineError::Init("the init data does not serialize".to_owned()))?;
+        .map_err(|_| EngineError::Halted(Halt::Engine("the init data does not serialize")))?;
 
         type Handles = [Persistent<Function<'static>>; 5];
         let built = ctx.with(|ctx| -> Result<Handles, EngineError> {
             // Captured before any agent code can run (the wrapper's own evaluation included).
-            let to_string = function_to_string(&ctx).map_err(|err| init_error(&ctx, err))?;
-            shim::install_prelude(&ctx).map_err(|err| init_error(&ctx, err))?;
-            let api =
-                shim::install_shim(&ctx, &shared, &config).map_err(|err| init_error(&ctx, err))?;
+            let to_string = function_to_string(&ctx)
+                .map_err(|_| engine_fault(&ctx, "Function.prototype.toString"))?;
+            shim::install_prelude(&ctx)
+                .map_err(|_| engine_fault(&ctx, "the prelude could not be installed"))?;
+            // Only the shim's refusal of the init data is the host's fault (`EXIT_PROTOCOL`).
+            let api = shim::install_shim(&ctx, &shared, &config).map_err(|err| match err {
+                shim::ShimError::Refused(message) => EngineError::Init(message),
+                shim::ShimError::Engine => engine_fault(&ctx, "the shim could not be installed"),
+            })?;
             let main =
                 compile_wrapper(&ctx, &to_string, &init.source).map_err(|err| match err {
                     CompileError::Syntax(pos) => EngineError::Syntax(pos),
@@ -533,6 +546,8 @@ pub fn compile(source: &str) -> Result<(), CompileError> {
     let heap = (ScriptLimits::default().heap_mb as usize).saturating_mul(MIB);
     let (rt, meter) = new_runtime_with_heap_limit(heap)
         .map_err(|_| CompileError::Halted(Halt::Engine("the runtime could not be created")))?;
+    // As in a run: a panic after a heap refusal exits `EXIT_HEAP_LIMIT` (PD-134).
+    crate::set_run_meter(Arc::clone(&meter));
     let deadline = Deadline::after(COMPILE_BACKSTOP);
     let fired: Rc<Cell<Option<Halt>>> = Rc::new(Cell::new(None));
     {
@@ -692,16 +707,11 @@ fn position_of(source: &str, at: usize) -> (u32, u32) {
     )
 }
 
-/// An init failure: the JS exception's text when there is one.
-fn init_error(ctx: &Ctx<'_>, err: rquickjs::Error) -> EngineError {
-    let text = match err {
-        rquickjs::Error::Exception => match ctx.catch().into_exception() {
-            Some(ex) => ex.message().unwrap_or_default(),
-            None => "a non-error value was thrown".to_owned(),
-        },
-        other => other.to_string(),
-    };
-    EngineError::Init(text)
+/// A set-up failure that is neither the script's nor the host's; a pending exception is
+/// cleared. A halt recorded meanwhile (a heap refusal) is reported instead by the caller.
+fn engine_fault(ctx: &Ctx<'_>, what: &'static str) -> EngineError {
+    let _ = ctx.catch();
+    EngineError::Halted(Halt::Engine(what))
 }
 
 fn halted_or<H>(shared: &Shared<H>, fallback: Halt) -> EngineError {

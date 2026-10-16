@@ -324,6 +324,85 @@ fn result_value_kept_as_raw_text() {
     ));
 }
 
+/// `reads_as_value` accepts exactly what `serde_json::from_str::<Value>` accepts (the core's
+/// result type), without building the tree: the 128-level recursion limit (127 nested containers
+/// read, 128 do not) and paired surrogate escapes in strings and keys. `RawJsonText::from_string`
+/// alone accepts all of these texts.
+#[test]
+fn result_text_reads_as_value_like_serde_json() {
+    let arrays = |depth: usize| format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+    let objects = |depth: usize| format!("{}1{}", r#"{"k":"#.repeat(depth), "}".repeat(depth));
+    let texts = [
+        "1".to_owned(),
+        "null".to_owned(),
+        r#""plain""#.to_owned(),
+        r#""😀""#.to_owned(),
+        r#""\ud800""#.to_owned(),
+        r#""\udc00""#.to_owned(),
+        r#""\ud800A""#.to_owned(),
+        r#""\ud800\n""#.to_owned(),
+        r#"{"\ud800":1}"#.to_owned(),
+        r#"{"a":["x","\udfff"]}"#.to_owned(),
+        r#"{"a":1,"a":2}"#.to_owned(),
+        "1e400".to_owned(),
+        arrays(127),
+        arrays(128),
+        arrays(200),
+        objects(127),
+        objects(128),
+        format!("[{}]", objects(126)),
+        format!("[{}]", objects(127)),
+    ];
+    for text in texts {
+        let Ok(raw) = RawJsonText::from_string(text.clone()) else {
+            // Not even JSON grammar: nothing to compare.
+            continue;
+        };
+        let as_value = serde_json::from_str::<serde_json::Value>(&text).is_ok();
+        assert_eq!(raw.reads_as_value(), as_value, "{text:.60}");
+    }
+    assert!(
+        RawJsonText::from_string(arrays(127))
+            .unwrap()
+            .reads_as_value()
+    );
+    assert!(
+        !RawJsonText::from_string(arrays(128))
+            .unwrap()
+            .reads_as_value()
+    );
+    assert!(
+        !RawJsonText::from_string(r#""\ud800""#.to_owned())
+            .unwrap()
+            .reads_as_value()
+    );
+}
+
+/// An object whose first key is one of serde_json's private tokens is refused: `Value` either
+/// fails on it or reads it as a different value (`{"$serde_json::private::RawValue":"[1]"}` is
+/// `[1]`). The token as a later key is an ordinary key.
+#[test]
+fn result_text_with_a_serde_json_token_key_is_refused() {
+    let raw_token = r#"{"$serde_json::private::RawValue":"[1]"}"#;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(raw_token).unwrap(),
+        json!([1])
+    );
+    for text in [
+        raw_token,
+        r#"{"$serde_json::private::RawValue":5}"#,
+        r#"{"$serde_json::private::Number":"1"}"#,
+        r#"[{"$serde_json::private::RawValue":"1"}]"#,
+    ] {
+        let raw = RawJsonText::from_string(text.to_owned()).unwrap();
+        assert!(!raw.reads_as_value(), "{text}");
+    }
+    let later =
+        RawJsonText::from_string(r#"{"a":1,"$serde_json::private::RawValue":"[1]"}"#.to_owned())
+            .unwrap();
+    assert!(later.reads_as_value());
+}
+
 #[test]
 fn decode_rejects_malformed_payloads() {
     let rej = |b: &[u8]| decode_worker_frame(b).unwrap_err();
@@ -395,7 +474,8 @@ fn decode_rejects_malformed_payloads() {
 #[test]
 fn decode_depth_limit_applies_to_host_call_params_not_result_text() {
     // Pins current behavior (serde_json's recursion limit of 128). A `script.result` value is
-    // kept as text and skipped without that limit, so even a very deep result decodes. A
+    // kept as text and skipped without that limit, so even a very deep result decodes (the
+    // worker refuses to send one, `RawJsonText::reads_as_value`). A
     // `host.call` `params` is a `Value`: nested 100 deep it decodes, nested 200 deep it is a
     // `BadParams` error. The T4 worker loop must report an over-deep call as a script error,
     // not as a protocol violation.

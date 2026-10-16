@@ -31,9 +31,9 @@ use atlas_duck_ipc::sandbox::{MAX_FRAME_BYTES, WORKER_FRAME_MAX_BYTES};
 
 pub use oom::ExitOnOomAlloc;
 pub use script::loop_::{
-    FIELD_TRUNCATED, LINE_TRUNCATED, RESULT_TOO_LARGE_CLASS, SCRIPT_DEADLINE,
-    SCRIPT_DEADLINE_MESSAGE, SCRIPT_OP_BUDGET, SCRIPT_OP_BUDGET_MESSAGE, SCRIPT_STALLED,
-    SCRIPT_STALLED_MESSAGE, SYNTAX_ERROR_CLASS,
+    FIELD_TRUNCATED, LINE_TRUNCATED, RESULT_NOT_REPRESENTABLE, RESULT_TOO_LARGE_CLASS,
+    SCRIPT_DEADLINE, SCRIPT_DEADLINE_MESSAGE, SCRIPT_OP_BUDGET, SCRIPT_OP_BUDGET_MESSAGE,
+    SCRIPT_STALLED, SCRIPT_STALLED_MESSAGE, SYNTAX_ERROR_CLASS,
 };
 
 use script::alloc::LimitState;
@@ -58,7 +58,8 @@ pub const EXIT_HEAP_LIMIT: i32 = 102;
 pub const EXIT_PROCESS_LIMIT: i32 = 103;
 
 /// The allocator state of the current run, for the panic hook (PD-134). The
-/// worker runs one script per process; the run loop replaces it per run.
+/// worker runs one script (or one compile) per process; the engine and
+/// compile mode register their meter as soon as their runtime exists.
 static RUN_METER: Mutex<Option<Arc<LimitState>>> = Mutex::new(None);
 
 /// Registers the run's allocator state with the panic hook.
@@ -388,6 +389,52 @@ mod tests {
         assert!(failing.alloc(64).is_null());
         assert!(exhausted.system_null() && !exhausted.heap_refused());
         assert_eq!(panic_exit_code(Some(&exhausted)), EXIT_PROCESS_LIMIT);
+    }
+
+    /// M-1: the engine and compile mode register their meter with the panic hook as soon as
+    /// their runtime exists, so a panic right after a heap refusal while the engine is built or
+    /// the source compiled exits `EXIT_HEAP_LIMIT`, not `EXIT_PANIC`. The only lib test that
+    /// builds an engine or compiles (`RUN_METER` is process-wide).
+    #[test]
+    fn engine_and_compile_register_their_meter_with_the_panic_hook() {
+        use atlas_duck_ipc::sandbox::HostCall;
+        use atlas_duck_ipc::sandbox::ScriptLimits;
+        use script::alloc::LimitAllocator;
+        use script::{Engine, HostPort, compile};
+
+        struct NoHost;
+        impl HostPort for NoHost {
+            fn send_call(&mut self, _id: u64, _call: &HostCall) -> io::Result<()> {
+                Ok(())
+            }
+            fn send_log(&mut self, _line: &str) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let registered = || {
+            RUN_METER
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        };
+
+        let (_, sentinel) = LimitAllocator::new(1024);
+        set_run_meter(Arc::clone(&sentinel));
+        compile("return 1;").expect("compiles");
+        let after_compile = registered().expect("a meter");
+        assert!(!Arc::ptr_eq(&after_compile, &sentinel));
+
+        let init = WorkerInit {
+            source: "return 1;".to_owned(),
+            args: serde_json::json!({}),
+            limits: ScriptLimits::default(),
+            read_op_ids: Vec::new(),
+            instances: Vec::new(),
+        };
+        let engine = Engine::new(&init, NoHost).expect("an engine");
+        let after_engine = registered().expect("a meter");
+        assert!(Arc::ptr_eq(&after_engine, engine.meter()));
+        assert!(!Arc::ptr_eq(&after_engine, &after_compile));
     }
 
     #[test]

@@ -14,8 +14,10 @@
 //    text tripwire against mistakes, not against a malicious contributor: macro-generated impls
 //    and identifiers pasted together by a macro are not seen.
 // 3. No threads in the sandbox worker (spec §9.3, plan M8 Task 4): `crates/sandbox-worker/src`
-//    outside `#[cfg(test)]` must not name `thread::spawn`, `thread::Builder` or `thread::scope`
-//    (the Linux seccomp filter would kill the `clone`, and confinement covers one thread).
+//    outside `#[cfg(test)]` must not name `thread::spawn`, `thread::Builder` or `thread::scope`,
+//    import `std::thread` renamed (`as`) or by glob, or call `pthread_create`, `CreateThread` or
+//    `_beginthread(ex)` (the Linux seccomp filter would kill the `clone`, and confinement covers
+//    one thread).
 //
 // Usage: node ci/check-no-panic-macros.mjs
 // Exit 0 = ok. Exit 1 = violations (one `file:line: text` per line on stdout).
@@ -50,6 +52,14 @@ export const NO_THREAD_ROOT = "crates/sandbox-worker/src";
 const THREAD_PATTERNS = [
   /\bthread\s*::\s*(?:spawn|Builder|scope)\b/g,
   /\bthread\s*::\s*\{[^}]*\b(?:spawn|Builder|scope)\b/g,
+  // A renamed or glob import hides the later `spawn` from the two patterns above.
+  /\bthread\s+as\b/g,
+  /\bthread\s*::\s*\*/g,
+  /\bthread\s*::\s*\{[^}]*\bself\s+as\b/g,
+  // Threads started through the OS, not std.
+  /\bpthread_create\b/g,
+  /\bCreateThread\b/g,
+  /\b_beginthread(?:ex)?\b/g,
 ];
 
 const posix = (p) => p.split(sep).join("/");

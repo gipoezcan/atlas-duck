@@ -19,8 +19,8 @@ use atlas_duck_ipc::sandbox::probe::{
     ProbeRequest, decode_notification, encode_notification,
 };
 use atlas_duck_ipc::sandbox::script::{
-    CompileRequest, InstanceInfo, M_SCRIPT_COMPILE, M_SCRIPT_RUN, WorkerFrame, WorkerInit,
-    decode_worker_frame, encode_response, terminal_frame_max,
+    CompileRequest, HOST_TO_WORKER_MAX, InstanceInfo, M_SCRIPT_COMPILE, M_SCRIPT_RUN, WorkerFrame,
+    WorkerInit, decode_worker_frame, encode_response, terminal_frame_max,
 };
 use atlas_duck_ipc::sandbox::{
     HostCallResult, MAX_FRAME_BYTES, ScriptLimits, WORKER_FRAME_MAX_BYTES,
@@ -28,8 +28,8 @@ use atlas_duck_ipc::sandbox::{
 use atlas_duck_sandbox_worker::script::RESULT_TOO_LARGE;
 use atlas_duck_sandbox_worker::{
     EXIT_HEAP_LIMIT, EXIT_IO, EXIT_OK, EXIT_PANIC, EXIT_PROCESS_LIMIT, EXIT_PROTOCOL,
-    FIELD_TRUNCATED, LINE_TRUNCATED, SCRIPT_DEADLINE, SCRIPT_DEADLINE_MESSAGE, SCRIPT_STALLED,
-    SCRIPT_STALLED_MESSAGE, run_script_with, run_with,
+    FIELD_TRUNCATED, LINE_TRUNCATED, RESULT_NOT_REPRESENTABLE, SCRIPT_DEADLINE,
+    SCRIPT_DEADLINE_MESSAGE, SCRIPT_STALLED, SCRIPT_STALLED_MESSAGE, run_script_with, run_with,
 };
 use serde_json::{Value, json};
 
@@ -719,6 +719,74 @@ fn host_frames_during_a_run() -> TestResult {
     let eof = run_script(&init(source), vec![])?;
     eof.expect_code(EXIT_OK)?;
     assert_eq!(eof.trace()?, strs(&["ready", "host#0", "call 1"]));
+
+    // A header announcing more than 24 MiB is refused before any body is read or allocated.
+    let header = u32::try_from(HOST_TO_WORKER_MAX + 1)?
+        .to_be_bytes()
+        .to_vec();
+    let oversized = run_script(&init(source), vec![header])?;
+    oversized.expect_code(EXIT_IO)?;
+    assert_eq!(
+        oversized.trace()?,
+        strs(&["ready", "host#0", "call 1", "host#1"])
+    );
+    Ok(())
+}
+
+/// Host frames that are well-formed responses but answer no outstanding call: a second answer to
+/// the same id, an answer to a call the shim has queued but not sent, and a JSON-RPC error
+/// response (the host answers every call with `result`). Each is a protocol exit, with nothing
+/// written after the frame.
+#[test]
+fn responses_to_no_outstanding_call_exit_protocol() -> TestResult {
+    let two = "const a = atlas.call('jira.search', {n: 1});\n\
+               const b = atlas.call('jira.search', {n: 2});\n\
+               return await Promise.all([a, b]);";
+    let run = run_script(&init(two), vec![answer(1, json!(1))?, answer(1, json!(1))?])?;
+    run.expect_code(EXIT_PROTOCOL)?;
+    assert_eq!(
+        run.trace()?,
+        strs(&["ready", "host#0", "call 1", "call 2", "host#1", "host#2"])
+    );
+
+    let one_at_a_time = ScriptLimits {
+        max_concurrent_calls: 1,
+        ..ScriptLimits::default()
+    };
+    let run = run_script(
+        &init_with(two, json!({}), one_at_a_time),
+        vec![answer(2, json!(2))?],
+    )?;
+    run.expect_code(EXIT_PROTOCOL)?;
+    assert_eq!(run.trace()?, strs(&["ready", "host#0", "call 1", "host#1"]));
+
+    let error = framed(br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"no"}}"#)?;
+    let run = run_script(
+        &init("return await atlas.call('jira.search', {});"),
+        vec![error],
+    )?;
+    run.expect_code(EXIT_PROTOCOL)?;
+    assert_eq!(run.trace()?, strs(&["ready", "host#0", "call 1", "host#1"]));
+    Ok(())
+}
+
+/// M-2: init data the shim cannot place under `atlas` (an op id under a reserved name, a
+/// duplicate) is the host's fault: a protocol exit right after the init frame, nothing written.
+#[test]
+fn init_op_ids_the_shim_cannot_place_exit_protocol() -> TestResult {
+    let cases: [&[&str]; 3] = [
+        &["call.x"],
+        &["jira.search", "jira.search"],
+        &["jira..search"],
+    ];
+    for op_ids in cases {
+        let mut init = init("return 1;");
+        init.read_op_ids = strs(op_ids);
+        let run = run_script(&init, vec![])?;
+        run.expect_code(EXIT_PROTOCOL)
+            .map_err(|e| format!("{op_ids:?}: {e}"))?;
+        assert_eq!(run.trace()?, strs(&["ready", "host#0"]), "{op_ids:?}");
+    }
     Ok(())
 }
 
@@ -858,6 +926,42 @@ fn oversized_error_fields_are_cut_to_the_terminal_cap() -> TestResult {
     Ok(())
 }
 
+/// M-3: a thrown error whose fields are many times the terminal cap is cut inside the shim before
+/// its text is copied out of QuickJS. Uncut, the UTF-8 copy of a 6 Mi-unit two-byte string (18
+/// MiB) next to the string itself (12 MiB) would pass a 24 MiB heap and end the run as a heap
+/// limit; cut, it is a script error with the marker.
+#[test]
+fn huge_error_fields_are_cut_before_they_leave_quickjs() -> TestResult {
+    let limits = ScriptLimits {
+        heap_mb: 24,
+        max_result_mb: 1,
+        ..ScriptLimits::default()
+    };
+    let sources = [
+        "throw new Error('\\u20ac'.repeat(6 * 1024 * 1024));",
+        "const e = new Error('m'); e.name = '\\u20ac'.repeat(6 * 1024 * 1024); throw e;",
+        "const e = new Error('m'); e.stack = '\\u20ac'.repeat(6 * 1024 * 1024); throw e;",
+    ];
+    for source in sources {
+        let run = run_script(&init_with(source, json!({}), limits), vec![])?;
+        run.expect_code(EXIT_OK)
+            .map_err(|e| format!("{source}: {e}"))?;
+        let (class, message, stack) = run.error()?;
+        let cut = [class, message, stack]
+            .into_iter()
+            .find(|field| field.len() > 1024)
+            .ok_or("no long field")?;
+        assert!(cut.ends_with(FIELD_TRUNCATED), "{source}: not marked");
+        assert!(
+            cut.trim_end_matches(FIELD_TRUNCATED)
+                .chars()
+                .all(|c| c == '\u{20ac}'),
+            "{source}: the kept part changed"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn rejection_object_is_catchable() -> TestResult {
     let source = "let caught;\n\
@@ -889,20 +993,53 @@ fn result_undefined_is_null() -> TestResult {
         vec![],
     )?;
     assert_eq!(run.result()?, json!({"b": [null]}));
-    // A result nested deeper than serde_json's `Value` limit still leaves as one result frame
-    // (the frame keeps it as raw text, T2); whoever parses it later bounds the depth.
-    let run = run_script(
-        &init("let v = []; for (let i = 0; i < 300; i++) v = [v]; return v;"),
-        vec![],
-    )?;
-    run.expect_code(EXIT_OK)?;
-    match run.terminal()? {
-        WorkerFrame::Result { value } => {
-            assert_eq!(value.get().len(), 602);
-            assert!(value.get().starts_with("[[[["));
+    Ok(())
+}
+
+/// I-1: a result the core cannot read into a `serde_json::Value` (nested 128 levels or more, a
+/// lone surrogate in a string or a key) is a `TypeError` script error, never a result frame the
+/// host would have to refuse. 127 levels and a paired surrogate are results.
+#[test]
+fn result_the_host_cannot_read_is_a_type_error() -> TestResult {
+    assert_eq!(
+        RESULT_NOT_REPRESENTABLE,
+        "the result is not representable as JSON the host can read"
+    );
+    let nested =
+        |depth: usize| format!("let v = 1; for (let i = 0; i < {depth}; i++) v = [v]; return v;");
+    for depth in [120, 127] {
+        let run = run_script(&init(&nested(depth)), vec![])?;
+        run.expect_code(EXIT_OK)?;
+        let mut value = run.result()?;
+        for _ in 0..depth {
+            value = value.get(0).cloned().ok_or("not nested")?;
         }
-        other => return Err(format!("unexpected {other:?}").into()),
+        assert_eq!(value, json!(1), "{depth}");
     }
+    let refused = [
+        nested(128),
+        nested(200),
+        nested(300),
+        "return '\\ud800';".to_owned(),
+        "return ['a', 'b\\udc00'];".to_owned(),
+        "return {['k\\ud83d']: 1};".to_owned(),
+    ];
+    for source in refused {
+        let run = run_script(&init(&source), vec![])?;
+        run.expect_code(EXIT_OK)
+            .map_err(|e| format!("{source}: {e}"))?;
+        assert_eq!(
+            run.error()?,
+            (
+                "TypeError".to_owned(),
+                RESULT_NOT_REPRESENTABLE.to_owned(),
+                String::new()
+            ),
+            "{source}"
+        );
+    }
+    let run = run_script(&init("return '\\ud83d\\ude00';"), vec![])?;
+    assert_eq!(run.result()?, json!("\u{1f600}"));
     Ok(())
 }
 

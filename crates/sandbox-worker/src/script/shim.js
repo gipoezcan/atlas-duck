@@ -4,7 +4,8 @@
 // - natives.call(id, opId, paramsJson, instance, all) writes a host.call frame (synchronously);
 // - natives.log(line) writes a host.log frame (synchronously);
 // - natives.ok(json) / natives.err(class, message, stack) record how main settled.
-// It returns { start, deliver, fulfilled, fail }. Every intrinsic it relies on is captured here,
+// It returns { start, deliver, fulfilled, fail }, or { refused } when the init data names an op id
+// it cannot place under atlas. Every intrinsic it relies on is captured here,
 // before any agent code runs; the natives and the dispatcher are closure captures, never globals.
 //
 // Rule for everything that runs once main has started: agent code can rewrite every intrinsic
@@ -51,6 +52,8 @@
   var config = jsonParse(configJson);
   var maxConcurrent = config.max_concurrent_calls;
   var maxResultUnits = config.max_result_units;
+  // The script.error frame cap in bytes, as a UTF-16 unit bound for each field of a thrown value.
+  var maxErrorUnits = config.max_error_units;
   // The worker -> host frame cap in bytes, used as a UTF-16 unit bound (a text never has fewer
   // UTF-8 bytes than UTF-16 units): a longer call is refused and a longer log line is cut here,
   // before the text is copied to Rust outside the heap limit.
@@ -273,19 +276,26 @@
     return obj;
   }
 
+  // The init data names an op id the shim cannot place: the host's fault, not the engine's. The
+  // shim then returns { refused: message } instead of its API (the worker exits EXIT_PROTOCOL);
+  // any other failure while it installs is an engine fault.
+  function InitRefused(message) {
+    this.message = message;
+  }
+
   function buildAtlas(opIds, instances) {
     var root = { kids: create(null), op: null };
     for (var i = 0; i < opIds.length; i++) {
       var id = opIds[i];
       var parts = split(id, '.');
       if (parts.length < 2 || isReserved(parts[0])) {
-        throw new ErrorCtor('op id cannot be placed under atlas: ' + id);
+        throw new InitRefused('op id cannot be placed under atlas: ' + id);
       }
       var node = root;
       for (var j = 0; j < parts.length; j++) {
         var part = parts[j];
         if (part === '') {
-          throw new ErrorCtor('op id with an empty segment: ' + id);
+          throw new InitRefused('op id with an empty segment: ' + id);
         }
         var next = node.kids[part];
         if (next === undefined) {
@@ -295,7 +305,7 @@
         node = next;
       }
       if (node.op !== null) {
-        throw new ErrorCtor('duplicate op id: ' + id);
+        throw new InitRefused('duplicate op id: ' + id);
       }
       node.op = id;
     }
@@ -330,8 +340,25 @@
     return deepFreeze(atlas);
   }
 
-  var atlas = buildAtlas(config.read_op_ids, config.instances);
+  // No agent code has run yet: `instanceof` and the error's fields are the shim's own.
+  var atlas;
+  try {
+    atlas = buildAtlas(config.read_op_ids, config.instances);
+  } catch (e) {
+    if (e instanceof InitRefused) {
+      return { refused: e.message };
+    }
+    throw e;
+  }
   var args = deepFreeze(config.args);
+
+  // A field of a thrown value, cut to the error frame cap before it is copied out of QuickJS (the
+  // copy would otherwise count against heap_mb, and its Rust copy against process_mb); the run
+  // loop cuts it to the exact byte cap and adds the marker. Cut before wellFormed: the cut may
+  // split a surrogate pair.
+  function errorField(s) {
+    return wellFormed(s.length > maxErrorUnits ? slice(s, 0, maxErrorUnits) : s);
+  }
 
   // The rejection of main, as untrusted payload: class, message, stack (spec 9.5).
   function describe(e) {
@@ -356,7 +383,7 @@
     } catch (x) {
       message = 'the thrown value could not be described';
     }
-    return [wellFormed(cls), wellFormed(message), wellFormed(stack)];
+    return [errorField(cls), errorField(message), errorField(stack)];
   }
 
   function fail(e) {

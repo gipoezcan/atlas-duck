@@ -344,6 +344,24 @@ test("worker threads in cfg(test), comments, strings and tests/ are not violatio
   assert.deepEqual(scanWorkerThreads("crates/sandbox-worker/tests/run_loop.rs", "std::thread::spawn(|| {});"), []);
 });
 
+test("renamed and glob thread imports and OS thread calls in sandbox-worker/src are violations", () => {
+  const f = "crates/sandbox-worker/src/probe/mod.rs";
+  const src = [
+    "use std::thread as t;",
+    "use std::thread::*;",
+    "use std::thread::{self as t2};",
+    "    let rc = libc::pthread_create(&mut tid, ptr::null(), start, arg);",
+    "    let h = windows_sys::Win32::System::Threading::CreateThread(a, 0, f, p, 0, ptr::null_mut());",
+    "    let h = _beginthreadex(ptr::null_mut(), 0, f, p, 0, ptr::null_mut());",
+    "    let h = _beginthread(f, 0, p);",
+    "fn fine() { std::thread::sleep(d); let t = thread_count(); }",
+  ].join("\n");
+  assert.deepEqual(
+    scanWorkerThreads(f, src),
+    [1, 2, 3, 4, 5, 6, 7].map((n) => `${f}:${n}: thread start in the sandbox worker (§9.3: one thread)`),
+  );
+});
+
 // ---------- the real workspace ----------
 
 test("the real workspace passes: node ci/check-no-panic-macros.mjs exits 0", () => {

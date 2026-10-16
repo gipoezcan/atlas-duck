@@ -51,7 +51,6 @@ use super::{
 };
 use crate::{
     EXIT_HEAP_LIMIT, EXIT_IO, EXIT_OK, EXIT_PANIC, EXIT_PROCESS_LIMIT, EXIT_PROTOCOL, send,
-    set_run_meter,
 };
 
 /// Plan text (PD-131): the class of the error sent when the script awaits a promise nothing can
@@ -60,19 +59,27 @@ pub const SCRIPT_STALLED: &str = "ScriptStalled";
 /// Plan text (PD-131).
 pub const SCRIPT_STALLED_MESSAGE: &str = "the script awaited a promise that can never settle";
 
-/// Plan text (PD-135, T4): the class of the runtime error sent when the worker's backstop deadline
-/// (`timeout_s + 2 s`) stops the script. The host's own timer normally kills the worker first.
+/// Plan value (T4): the class of the runtime error sent when the worker's backstop deadline
+/// (`timeout_s + 2 s`, PD-135) stops the script. The host's own timer normally kills the worker
+/// first.
 pub const SCRIPT_DEADLINE: &str = "ScriptDeadline";
-/// Plan text (PD-135, T4).
+/// Plan value (T4).
 pub const SCRIPT_DEADLINE_MESSAGE: &str = "the script ran past the worker's deadline";
 
-/// Plan text (PD-135, T4): the class of the runtime error sent when the run used up its op budget.
+/// Plan value (T4): the class of the runtime error sent when the run used up its op budget
+/// (PD-135).
 pub const SCRIPT_OP_BUDGET: &str = "ScriptOpBudget";
-/// Plan text (PD-135, T4).
+/// Plan value (T4).
 pub const SCRIPT_OP_BUDGET_MESSAGE: &str = "the script used up its op budget";
 
 /// Plan text (PD-136): the class of the error sent instead of a result that does not fit.
 pub const RESULT_TOO_LARGE_CLASS: &str = "ResultTooLarge";
+
+/// Plan value (T4 review I-1): the message of the `TypeError` sent instead of a result whose JSON
+/// text the core cannot read into a `serde_json::Value` (nested 128 levels or more, a lone
+/// surrogate; [`RawJsonText::reads_as_value`]).
+pub const RESULT_NOT_REPRESENTABLE: &str =
+    "the result is not representable as JSON the host can read";
 
 /// The class of the error sent when the source does not compile in run mode.
 pub const SYNTAX_ERROR_CLASS: &str = "SyntaxError";
@@ -160,9 +167,9 @@ pub(crate) fn run_script<R: Read, W: Write + 'static>(
         // The init data does not fit the shim (an op id that cannot be placed under `atlas`).
         Err(EngineError::Init(_)) => return EXIT_PROTOCOL,
     };
+    // The engine registered the same meter with the panic hook when it built its runtime.
     let meter = Arc::clone(engine.meter());
     engine.host_mut().meter = Some(Arc::clone(&meter));
-    set_run_meter(Arc::clone(&meter));
 
     let mut settled = match engine.start() {
         Ok(()) => engine.drain_jobs(),
@@ -214,16 +221,21 @@ pub(crate) fn compile_mode<W: Write>(request: &CompileRequest, output: &mut W) -
     let frame = match compile(&request.source) {
         Ok(()) => encode_notification(M_SCRIPT_COMPILED, &EmptyParams {}),
         Err(CompileError::Syntax(pos)) => syntax_frame(&pos),
-        Err(CompileError::Halted(halt)) => {
-            return match halt_end(halt) {
-                Ok(_) => EXIT_PANIC,
-                Err(code) => code,
-            };
-        }
+        Err(CompileError::Halted(halt)) => return compile_halt_code(halt),
     };
     match send(output, &frame) {
         Ok(()) => EXIT_OK,
         Err(_) => EXIT_IO,
+    }
+}
+
+/// The exit code of a compile that stopped without a verdict: the limit and fault codes of
+/// [`halt_end`], and [`EXIT_PANIC`] where a run would report a runtime error (the deadline, the
+/// op budget), since compile mode has no error frame.
+fn compile_halt_code(halt: Halt) -> i32 {
+    match halt_end(halt) {
+        Ok(_) => EXIT_PANIC,
+        Err(code) => code,
     }
 }
 
@@ -277,20 +289,20 @@ fn write_terminal<W: Write>(
             let Ok(value) = RawJsonText::from_string(text) else {
                 return EXIT_PANIC;
             };
-            let frame = encode_notification(M_SCRIPT_RESULT, &ResultParams { value });
-            if frame.len() <= cap {
-                frame
+            if value.reads_as_value() {
+                let frame = encode_notification(M_SCRIPT_RESULT, &ResultParams { value });
+                if frame.len() <= cap {
+                    frame
+                } else {
+                    // The engine checked the text against `terminal_frame_max - 64 KiB`; this
+                    // catches a `max_result_mb` whose frame is above the channel's general cap.
+                    result_error_frame(RESULT_TOO_LARGE_CLASS, RESULT_TOO_LARGE, cap)
+                }
             } else {
-                // The engine checked the text against `terminal_frame_max - 64 KiB`; this catches
-                // a `max_result_mb` whose frame is above the channel's general cap.
-                error_frame(
-                    &ScriptError {
-                        class: RESULT_TOO_LARGE_CLASS.to_owned(),
-                        message: RESULT_TOO_LARGE.to_owned(),
-                        stack: String::new(),
-                    },
-                    cap,
-                )
+                // Valid JSON text the core cannot read into a `Value` (`JSON.stringify` escapes a
+                // lone surrogate as `\udXXX` and nests as deep as the script likes) is the
+                // script's error, never a frame the host would have to refuse (review I-1).
+                result_error_frame("TypeError", RESULT_NOT_REPRESENTABLE, cap)
             }
         }
         Terminal::Error(error) => error_frame(&error, cap),
@@ -302,6 +314,18 @@ fn write_terminal<W: Write>(
         Ok(()) => EXIT_OK,
         Err(_) => EXIT_IO,
     }
+}
+
+/// The `script.error` sent instead of a result: a plan class and message, no stack.
+fn result_error_frame(class: &str, message: &str, cap: usize) -> Vec<u8> {
+    error_frame(
+        &ScriptError {
+            class: class.to_owned(),
+            message: message.to_owned(),
+            stack: String::new(),
+        },
+        cap,
+    )
 }
 
 /// `script.error` within `cap`: the stack is cut first, then the message, then the class.
@@ -428,7 +452,143 @@ fn prefix_within(s: &str, budget: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use rquickjs::allocator::Allocator;
+
+    use super::super::alloc::LimitAllocator;
     use super::*;
+
+    /// A meter whose heap limit refused a request (`heap_refused`).
+    fn refused_meter() -> Arc<LimitState> {
+        let (mut refusing, meter) = LimitAllocator::new(0);
+        assert!(refusing.alloc(64).is_null());
+        meter
+    }
+
+    /// A meter whose backing allocator failed below the limit (`system_null`).
+    #[allow(unsafe_code)]
+    fn exhausted_meter() -> Arc<LimitState> {
+        struct NullInner;
+        // SAFETY: never hands out a block, so there is nothing to free or size.
+        unsafe impl Allocator for NullInner {
+            fn alloc(&mut self, _size: usize) -> *mut u8 {
+                std::ptr::null_mut()
+            }
+            fn calloc(&mut self, _count: usize, _size: usize) -> *mut u8 {
+                std::ptr::null_mut()
+            }
+            unsafe fn dealloc(&mut self, _ptr: *mut u8) {}
+            unsafe fn realloc(&mut self, _ptr: *mut u8, _new_size: usize) -> *mut u8 {
+                std::ptr::null_mut()
+            }
+            unsafe fn usable_size(_ptr: *mut u8) -> usize {
+                0
+            }
+        }
+        let (mut failing, meter) = LimitAllocator::with_inner(1024, NullInner);
+        assert!(failing.alloc(64).is_null());
+        meter
+    }
+
+    /// PD-134, second layer: the port writes nothing once a memory limit was hit, even when the
+    /// engine's own check was skipped.
+    #[test]
+    fn port_refuses_every_write_after_a_memory_limit() {
+        let out: Out<Vec<u8>> = Rc::new(RefCell::new(Vec::new()));
+        let mut port = StreamPort {
+            out: Rc::clone(&out),
+            meter: None,
+        };
+        assert!(port.send_log("before").is_ok());
+        let written = out.borrow().len();
+        assert!(written > 0);
+        let call = HostCall {
+            id: 1,
+            op_id: "jira.search".to_owned(),
+            params: serde_json::json!({}),
+            instance: None,
+            all: false,
+        };
+        for meter in [refused_meter(), exhausted_meter()] {
+            port.meter = Some(meter);
+            assert!(port.send_log("after").is_err());
+            assert!(port.send_call(1, &call).is_err());
+            assert_eq!(out.borrow().len(), written);
+        }
+    }
+
+    /// PD-134, last layer: no terminal frame after a memory limit; the exit code names the limit.
+    #[test]
+    fn write_terminal_writes_nothing_after_a_memory_limit() {
+        let cap = MAX_FRAME_BYTES;
+        for (meter, code) in [
+            (refused_meter(), EXIT_HEAP_LIMIT),
+            (exhausted_meter(), EXIT_PROCESS_LIMIT),
+        ] {
+            for terminal in [
+                Terminal::Result("1".to_owned()),
+                Terminal::Error(ScriptError {
+                    class: "Error".to_owned(),
+                    message: "m".to_owned(),
+                    stack: String::new(),
+                }),
+            ] {
+                let out: Out<Vec<u8>> = Rc::new(RefCell::new(Vec::new()));
+                assert_eq!(write_terminal(&out, cap, Some(&meter), terminal), code);
+                assert!(out.borrow().is_empty());
+            }
+        }
+        // A clean meter lets the frame out.
+        let (_, clean) = LimitAllocator::new(1024);
+        let out: Out<Vec<u8>> = Rc::new(RefCell::new(Vec::new()));
+        let terminal = Terminal::Result("1".to_owned());
+        assert_eq!(write_terminal(&out, cap, Some(&clean), terminal), EXIT_OK);
+        assert!(!out.borrow().is_empty());
+    }
+
+    /// Every halt: the memory limits, I/O, protocol and engine faults are exit codes with nothing
+    /// written; the worker's deadline and op budget are runtime script errors (PD-135).
+    #[test]
+    fn halt_end_maps_every_halt() {
+        let error = |class: &str, message: &str| {
+            Ok(ScriptError {
+                class: class.to_owned(),
+                message: message.to_owned(),
+                stack: String::new(),
+            })
+        };
+        assert_eq!(halt_end(Halt::HeapLimit), Err(EXIT_HEAP_LIMIT));
+        assert_eq!(halt_end(Halt::ProcessLimit), Err(EXIT_PROCESS_LIMIT));
+        assert_eq!(halt_end(Halt::Io(io::ErrorKind::BrokenPipe)), Err(EXIT_IO));
+        assert_eq!(halt_end(Halt::Protocol("p")), Err(EXIT_PROTOCOL));
+        assert_eq!(halt_end(Halt::Engine("e")), Err(EXIT_PANIC));
+        assert_eq!(
+            halt_end(Halt::Deadline),
+            error(
+                "ScriptDeadline",
+                "the script ran past the worker's deadline"
+            )
+        );
+        assert_eq!(
+            halt_end(Halt::OpBudget),
+            error("ScriptOpBudget", "the script used up its op budget")
+        );
+    }
+
+    /// Compile mode never reports a stop without a verdict as a syntax error (PD-135): the
+    /// worker's backstop, its op budget and an engine fault exit 101, the limits 102/103.
+    #[test]
+    fn compile_without_a_verdict_exits_without_a_frame() {
+        assert_eq!(compile_halt_code(Halt::Deadline), EXIT_PANIC);
+        assert_eq!(compile_halt_code(Halt::OpBudget), EXIT_PANIC);
+        assert_eq!(compile_halt_code(Halt::Engine("e")), EXIT_PANIC);
+        assert_eq!(compile_halt_code(Halt::HeapLimit), EXIT_HEAP_LIMIT);
+        assert_eq!(compile_halt_code(Halt::ProcessLimit), EXIT_PROCESS_LIMIT);
+        assert_eq!(
+            compile_halt_code(Halt::Io(io::ErrorKind::BrokenPipe)),
+            EXIT_IO
+        );
+        assert_eq!(compile_halt_code(Halt::Protocol("p")), EXIT_PROTOCOL);
+    }
 
     #[test]
     fn escaped_lengths_match_serde_json() -> serde_json::Result<()> {
