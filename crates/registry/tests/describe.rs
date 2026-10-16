@@ -164,3 +164,51 @@ fn jira_writes_state_verbatim_rule() {
     let text = out["description"].as_str().unwrap_or("");
     assert!(text.contains(WRITE_GUIDANCE) && !text.contains(sentence));
 }
+
+#[test]
+fn confluence_describe_documents_cql_placeholders_lossy() {
+    // PD-112 (plan texts, verbatim; the placeholder sentence is §12.4's onboarding sentence).
+    let cql = "The CQL is sent as `(<your CQL>) AND type in (page,blogpost,comment,attachment)` \
+               plus your trailing ORDER BY; an ORDER BY elsewhere, an unterminated quote or \
+               unbalanced parentheses are rejected.";
+    let placeholders = "A Markdown body that still contains `page get` placeholders \
+                        (`[macro: …]`, `confluence:` links or images, `@user:<key>`) is rejected \
+                        with `markdown_placeholders`: fetch with `--format storage` and submit \
+                        `body_format=storage`.";
+    let lossy = "If `page get` reported `meta.conversion.lossy = true`, edit with \
+                 `body_format=storage`; a Markdown update that would remove macros (task lists \
+                 included), images or links (mentions included) is flagged to the approver.";
+    assert_eq!(CONFLUENCE_CQL_GUIDANCE, cql);
+    assert_eq!(CONFLUENCE_PLACEHOLDER_GUIDANCE, placeholders);
+    assert_eq!(CONFLUENCE_LOSSY_GUIDANCE, lossy);
+    let body_ops = [
+        "confluence.page.create",
+        "confluence.page.update",
+        "confluence.comment.add",
+    ];
+    let mut seen = [0; 3];
+    for spec in all() {
+        let out = describe(spec, &env());
+        let text = out["description"].as_str().unwrap_or("");
+        let id = spec.id;
+        assert_eq!(text.contains(cql), id == "confluence.search", "{id}");
+        assert_eq!(text.contains(placeholders), body_ops.contains(&id), "{id}");
+        assert_eq!(text.contains(lossy), id == "confluence.page.update", "{id}");
+        for (n, s) in seen.iter_mut().zip([cql, placeholders, lossy]) {
+            if text.contains(s) {
+                *n += 1;
+                // Each text appears once.
+                assert_eq!(text.matches(s).count(), 1, "{id}");
+            }
+        }
+        if body_ops.contains(&id) {
+            // After the write guidance; the lossy text after the placeholder text.
+            let at = text.find(placeholders).unwrap_or(0);
+            assert!(text[..at].contains(WRITE_GUIDANCE), "{id}");
+            if let Some(l) = text.find(lossy) {
+                assert!(l > at, "{id}");
+            }
+        }
+    }
+    assert_eq!(seen, [1, 3, 1]);
+}

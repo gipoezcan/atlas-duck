@@ -8,6 +8,7 @@ use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_registry::OperationSpec;
 use serde_json::{Map, Value, json};
 
+use super::confluence_body::storage_text;
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
     PreviewCtx, PreviewModel, ReadPlan, generic, get_call, json_request, resolve_url, single_round,
@@ -377,10 +378,13 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
 }
 
 /// `PUT /rest/api/content/{id}` with `version.number = base_version + 1` (§7.4), the current
-/// title unless one is given, and the storage body (PD-09: `body_format = storage` only).
+/// title unless one is given, and the storage body (`confluence_body::storage_text`: storage
+/// verbatim, or the Markdown converted).
 pub fn page_update_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
-    // Path check first, so the validation dry call reports a bad placeholder before enrichment.
+    // Path check and body checks first, so the validation dry call reports a bad path
+    // placeholder or a refused body before enrichment (§5.4 step 1).
     resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
+    let storage = storage_text(ctx)?;
     let verdict = ctx
         .enrichment
         .filter(|v| v.hold == Hold::Preview)
@@ -405,7 +409,7 @@ pub fn page_update_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
         "type": "page",
         "title": title,
         "space": {"key": space_key},
-        "body": {"storage": {"value": str_param(ctx.params, "body"), "representation": "storage"}},
+        "body": {"storage": {"value": storage, "representation": "storage"}},
         "version": {"number": next},
     });
     json_request(ctx, &body)

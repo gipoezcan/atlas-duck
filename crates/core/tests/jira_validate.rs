@@ -133,19 +133,16 @@ async fn u33_jira_markdown_body_format_accepted() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn u33_confluence_markdown_still_rejected() -> TestResult {
+async fn u33_confluence_markdown_now_accepted() -> TestResult {
+    // M7 (Task 9): Confluence converts Markdown too; the M3 refusal is gone (absent counts as
+    // Markdown, as for Jira). `tests/confluence_validate.rs` covers the conversion itself.
     let h = Harness::confluence().await?;
     for params in [
         json!({ "id": "65537", "base_version": 5, "body": "**hi**" }),
         json!({ "id": "65537", "base_version": 5, "body": "**hi**", "body_format": "markdown" }),
     ] {
         let env = h.submit("confluence.page.update", params).await;
-        assert_rejected_at_validation(&h, &env).await?;
-        assert_eq!(detail(&env, "param"), json!("body_format"));
-        assert_eq!(
-            detail(&env, "message"),
-            json!("markdown conversion is not available in this build")
-        );
+        assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
     }
     Ok(())
 }

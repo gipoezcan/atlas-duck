@@ -905,6 +905,12 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             json!({"key": "ABC-1", "body": MARKDOWN, "body_format": "markdown"}),
             None,
         ),
+        // M7 Task 9: a Markdown page body converts to storage in the executor too.
+        (
+            "confluence.page.update",
+            json!({"id": "65537", "base_version": 5, "body": MARKDOWN}),
+            Some(page_verdict()),
+        ),
     ]
 }
 
@@ -933,6 +939,15 @@ fn executors_deterministic() -> TestResult {
     let comment = json!({"key": "ABC-1", "body": MARKDOWN});
     let r = &write_requests("jira.comment.add", &comment, None)?[0];
     assert_eq!(body_json(r)?["body"], wiki);
+    // M7 Task 9: the page body is the storage converter's output, never the agent's Markdown.
+    let storage = json!(atlas_duck_convert::markdown_to_storage(MARKDOWN).0);
+    let page = json!({"id": "65537", "base_version": 5, "body": MARKDOWN});
+    let r = &write_requests("confluence.page.update", &page, Some(&page_verdict()))?[0];
+    assert_eq!(body_json(r)?["body"]["storage"]["value"], storage);
+    assert_eq!(
+        body_json(r)?["body"]["storage"]["representation"],
+        json!("storage")
+    );
     // M5 M-6: the two executors that write enrichment facts send the resolved names, never the
     // agent's spelling: the link type `blocks` resolved to `Blocks`, the assignee `Jane` to the
     // user name `jdoe`.

@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_preview::invisible;
-use atlas_duck_registry::{OperationSpec, Product, Version};
+use atlas_duck_registry::{OperationSpec, Version};
 use jsonschema::Validator;
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -142,8 +142,6 @@ pub(crate) fn invalid(param: &str, message: &str, value: Option<&str>) -> Valida
 
 struct Compiled {
     validator: Validator,
-    /// The params schema declares `body_format` (a write that carries a body).
-    has_body_format: bool,
 }
 
 fn compiled(spec: &OperationSpec) -> Result<&'static Compiled, ValidationError> {
@@ -167,14 +165,7 @@ fn compiled(spec: &OperationSpec) -> Result<&'static Compiled, ValidationError> 
 fn compile(spec: &OperationSpec) -> Result<Compiled, ()> {
     let schema = spec.params_schema_json();
     let validator = jsonschema::validator_for(&schema).map_err(|_| ())?;
-    let has_body_format = schema
-        .get("properties")
-        .and_then(|p| p.get("body_format"))
-        .is_some();
-    Ok(Compiled {
-        validator,
-        has_body_format,
-    })
+    Ok(Compiled { validator })
 }
 
 /// First schema violation as `params/<path>: <keyword>`; never the offending value.
@@ -237,36 +228,6 @@ fn check_min_version(spec: &OperationSpec, ctx: &ValidateCtx<'_>) -> Result<(), 
     })
 }
 
-/// PD-09: markdown conversion is not in this build for Confluence (M7); an absent `body_format`
-/// is `markdown`. Jira converts from M5 on (PD-43: the executor converts and hard-checks, so the
-/// validation dry call rejects a failed check).
-fn check_body_format(
-    spec: &OperationSpec,
-    compiled: &Compiled,
-    params: &Value,
-) -> Result<(), ValidationError> {
-    if spec.class != atlas_duck_registry::OpClass::Write || !compiled.has_body_format {
-        return Ok(());
-    }
-    // Nothing to convert without a body. Jira's `description` needs no guard: Jira is exempt
-    // below, and only Jira ops carry `description` (T7 review M-3).
-    if params.get("body").is_none() {
-        return Ok(());
-    }
-    let markdown = match params.get("body_format") {
-        None => true,
-        Some(value) => value.as_str() == Some("markdown"),
-    };
-    if markdown && spec.product != Product::Jira {
-        return Err(invalid(
-            "body_format",
-            "markdown conversion is not available in this build",
-            None,
-        ));
-    }
-    Ok(())
-}
-
 /// Validate agent `params` for `spec` (§5.2 step 1 / §5.4 step 1).
 pub fn validate(
     spec: &OperationSpec,
@@ -281,7 +242,10 @@ pub fn validate(
     }
     check_min_version(spec, ctx)?;
     field_rules::check(spec, params)?;
-    check_body_format(spec, compiled, params)?;
+    // `body_format` (PD-09, PD-43, M7 Task 9): both products convert Markdown (an absent
+    // `body_format` is `markdown`); the conversion, the placeholder check and the hard check are
+    // the executor's, so the validation dry call rejects a failure (`jira_body`,
+    // `confluence_body`).
     caps::upload_size(spec, params)?;
     let (effective_max, truncated_by_clamp) = caps::effective_max(spec, params, ctx)?;
     Ok(Validated {

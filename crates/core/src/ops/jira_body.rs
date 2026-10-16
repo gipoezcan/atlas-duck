@@ -34,7 +34,7 @@ pub(crate) fn wiki_text(ctx: &ExecCtx<'_>, param: &str) -> Result<Option<String>
     }
     #[cfg(feature = "testing")]
     let wiki = match ctx.test_fault {
-        Some(fault) => fault.apply(&wiki),
+        Some(fault) => fault.apply(ctx.spec.product, &wiki),
         None => wiki,
     };
     hard_check_wiki(&wiki, &emitted).map_err(|e| ExecError::Invalid(unrecorded(param, e)))?;
@@ -42,7 +42,8 @@ pub(crate) fn wiki_text(ctx: &ExecCtx<'_>, param: &str) -> Result<Option<String>
 }
 
 /// `validation`, `details {param, construct, count}`: the kind and the number, never the text.
-fn unrecorded(param: &str, e: Unrecorded) -> ValidationError {
+/// Also the storage hard check's error (`confluence_body`).
+pub(crate) fn unrecorded(param: &str, e: Unrecorded) -> ValidationError {
     let construct = e.kind.as_str();
     let mut details = Map::new();
     details.insert("param".to_owned(), Value::from(param));

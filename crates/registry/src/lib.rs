@@ -30,6 +30,19 @@ pub const WRITE_GUIDANCE: &str = "Submit human names (project, issue type, trans
 /// (which params convert from Markdown, which are sent verbatim).
 pub const JIRA_VERBATIM_GUIDANCE: &str = "Text in `fields`, `update` and `comment` is sent as Jira wiki markup unchanged; only `description`/`body` with `body_format=markdown` are converted.";
 
+/// plan text (PD-112): the sentence `describe` adds to `confluence.search` (§7.4 "`ops describe`
+/// documents the rewrite").
+pub const CONFLUENCE_CQL_GUIDANCE: &str = "The CQL is sent as `(<your CQL>) AND type in (page,blogpost,comment,attachment)` plus your trailing ORDER BY; an ORDER BY elsewhere, an unterminated quote or unbalanced parentheses are rejected.";
+
+/// plan text (PD-112; §12.4 onboarding sentence, verbatim): the sentence `describe` adds to the
+/// Confluence ops that take a Markdown body (§7.6 "`ops describe` for these ops documents the
+/// check").
+pub const CONFLUENCE_PLACEHOLDER_GUIDANCE: &str = "A Markdown body that still contains `page get` placeholders (`[macro: …]`, `confluence:` links or images, `@user:<key>`) is rejected with `markdown_placeholders`: fetch with `--format storage` and submit `body_format=storage`.";
+
+/// plan text (PD-112): the sentence `describe` adds to `confluence.page.update` (§7.6 "advises
+/// `body_format=storage`").
+pub const CONFLUENCE_LOSSY_GUIDANCE: &str = "If `page get` reported `meta.conversion.lossy = true`, edit with `body_format=storage`; a Markdown update that would remove macros (task lists included), images or links (mentions included) is flagged to the approver.";
+
 /// §7.5 (verbatim): the rule `describe` states for paginated ops.
 pub const PAGINATION_GUIDANCE: &str = "continue only from meta.page.next_start";
 

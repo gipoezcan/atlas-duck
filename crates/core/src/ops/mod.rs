@@ -7,6 +7,7 @@
 //! deterministic (same context, same bytes): `WRITE_APPROVED` hashes their output.
 
 pub mod confluence;
+pub(crate) mod confluence_body;
 pub mod generic;
 pub mod jira;
 pub(crate) mod jira_body;
@@ -175,8 +176,9 @@ pub struct ExecCtx<'a> {
     /// `Validated::comments_cap` (Δ7): at most this many comments for `jira.issue.get
     /// --comments`; `None` for every other op and for writes.
     pub comments_cap: Option<u32>,
-    /// U-24 (PD-64): the engine copies `TestHooks::converter_fault` here; `jira_body` appends it
-    /// to converted Markdown before the hard check. Absent from production builds.
+    /// U-24 (PD-64): the engine copies `TestHooks::converter_fault` here; `jira_body` and
+    /// `confluence_body` append it to converted Markdown of its product before the hard check.
+    /// Absent from production builds.
     #[cfg(feature = "testing")]
     pub test_fault: Option<crate::testing::ConverterFault>,
 }
