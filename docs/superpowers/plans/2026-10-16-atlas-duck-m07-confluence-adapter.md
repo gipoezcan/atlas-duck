@@ -37,7 +37,7 @@ Checked in `crates/registry/src/confluence/{reads,writes,schemas}.rs`, `crates/c
 | `confluence.page.move` | complete (`parent` is "the change itself") | **`LATER_WRITE`** | — | — (spec: version unchanged) | fallback | everything (T17) |
 | `confluence.comment.add` | complete | **`LATER_WRITE`** | — | none | fallback | everything (T18) |
 | `confluence.label.add`, `confluence.label.remove` | complete (`AgentLabels` receipt; remove `{[204], Empty}`) | **`LATER_WRITE`** | — | none | fallback | executors and cards (T19) |
-| `confluence.attachment.upload` | complete (`upload_max_bytes` 10 MiB; registry comment says `replace` is a **PUT**, the spec says **POST** `…/{attachmentId}/data`) | **`LATER_WRITE`** | — | — (spec: replace = attachment version unchanged) | fallback | everything (T20a executor, T20b card); the last write lands here and T20b flips `WRITES_STILL_LATER` |
+| `confluence.attachment.upload` | complete (`upload_max_bytes` 10 MiB; registry comment says `replace` is a **PUT**, the spec says **POST** `…/{attachmentId}/data`) | **`LATER_WRITE`** | — | — (spec: replace = attachment version unchanged) | fallback | everything (T20a executor, T20b card); the last write lands here and T20a flips `WRITES_STILL_LATER` |
 
 **Already built, only re-used (do not redo):**
 - The CQL rewrite and its unit tests (`ops/confluence.rs::effective_cql`, `tests/op_table.rs::cql_*`, incl. `A OR B` precedence at `op_table.rs:600-605`), the removal and count of search results without `content` (`engine/read.rs::result_body`).
@@ -190,7 +190,7 @@ Every id in the M7 exit criterion (master plan, M7 entry) and every carried item
 | P-01 (Confluence scenarios) | ~5,000-word page and small `page.update` diff: Rust build + document within the P-01 bound; webview first screen ≤ 1 s (CI) | T23, T24 | `crates/core/tests/perf_sc3.rs` :: `p01_confluence_page_and_update_diff_under_budget`; `app/src-tauri/tests/e2e/flows.rs` :: `p01_first_screen_under_1s` (two scenarios added, CI only) |
 | L-01 (Confluence) | env-gated live tests for V04, V06 (Confluence), V23 (Confluence), V25 (Confluence) | T25 | `crates/core/tests/live_confluence.rs` :: `v04_confluence_endpoints_and_cql_rewrite`, `v06_confluence_write_success_shapes`, `v23_confluence_sso_front_classification`, `v25_confluence_anonymous_fallback_and_header`, `v_storage_render_probes`, `v_page_move_keeps_body` (all `#[ignore]`, manual) |
 | `confluence_flows` | the real binaries end to end on the Confluence paths (exit-criterion target) | T24 | `app/src-tauri/tests/confluence_flows/flows.rs` :: `confluence_flows_smoke`, `md_page_update_sent_as_storage`, `placeholders_rejected_exit2`, `page_update_conflict_denied_exit3`, `attachment_collision_denied_exit3`, `cql_rewrite_on_the_wire`, `page_get_markdown_released_with_conversion_meta`, `label_remove_204_succeeded` |
-| `WRITES_STILL_LATER` flip | no write is `NotInThisBuild` any more; the tripwire is retired as documented | T20b | `crates/core/tests/handler.rs` :: `not_in_this_build_rejected_internal` (flag `false`), `crates/core/tests/op_table.rs` :: `not_in_this_build_writes` (`LATER_WRITES` empty), `u05_only_writes_have_stale_check` (gains `page.move`, `attachment.upload`) |
+| `WRITES_STILL_LATER` flip | no write is `NotInThisBuild` any more; the tripwire is retired as documented | T20a | `crates/core/tests/handler.rs` :: `not_in_this_build_rejected_internal` (flag `false`), `crates/core/tests/op_table.rs` :: `not_in_this_build_writes` (`LATER_WRITES` empty), `u05_only_writes_have_stale_check` (gains `page.move`, `attachment.upload`) |
 | U-33 (Confluence completion) | Markdown accepted for Confluence bodies | T09 | `confluence_validate.rs` :: `u33_confluence_markdown_body_format_accepted`; `crates/core/tests/jira_validate.rs` :: `u33_confluence_markdown_still_rejected` → renamed `u33_confluence_markdown_now_accepted` |
 | M5 M-4 (L105) | Jira `link_target` encodes a `&` that starts a character reference | T05 | `crates/convert/tests/md_to_wiki.rs` :: `m4_link_target_encodes_character_references` |
 | M3 T10 minor 7 | truncated Confluence conflict 400 stays `WRITE_FAILED` (PD-111) | T15 | `crates/atlassian/tests/writes.rs` :: `truncated_conflict_400_is_failed4xx` |
@@ -247,7 +247,7 @@ New and modified files per crate (Create = new file; Modify = existing file).
 
 ## Tasks
 
-**32 tasks under 30 numbers:** Tasks 12 and 20 are each split into a/b (plan review I-13); every other number is unchanged (the M8 draft cites M7 task numbers). Phase A (Tasks 1–8): `convert` and `preview` foundations (pure, no I/O; all tests run locally on Windows). Phase B (Tasks 9, 10, 11, 12a, 12b, 13, 14): validation wiring and the read side. Phase C (Tasks 15–17): the stale-ruled and resolution-heavy writes. Phase D (Tasks 18, 19, 20a, 20b, 21): the remaining writes, the last-write flip (20b), the identity sweep. Phase E (Tasks 22–30): generated catalog test, performance, flows, live tests, docs, CI, exit criterion, final review (Task 26 is dropped and kept as a numbered deferral note).
+**32 tasks under 30 numbers:** Tasks 12 and 20 are each split into a/b (plan review I-13); every other number is unchanged (the M8 draft cites M7 task numbers). Phase A (Tasks 1–8): `convert` and `preview` foundations (pure, no I/O; all tests run locally on Windows). Phase B (Tasks 9, 10, 11, 12a, 12b, 13, 14): validation wiring and the read side. Phase C (Tasks 15–17): the stale-ruled and resolution-heavy writes. Phase D (Tasks 18, 19, 20a, 20b, 21): the remaining writes, the last-write flip (20a), the identity sweep. Phase E (Tasks 22–30): generated catalog test, performance, flows, live tests, docs, CI, exit criterion, final review (Task 26 is dropped and kept as a numbered deferral note).
 
 Shared conventions (every task): run commands from `C:/Code/atlas-duck` with `-j 4`; core test runs use `cargo test -j 4 -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked`; a Confluence harness is `core::testing::Harness::confluence()` (context path `/wiki`) or `Harness::both()`, with `MockDc` fixtures from `atlassian::testing` plus the `tests/common/confluence.rs` mounts (Task 10 creates them; later tasks add helpers there, never duplicate them); writes are decided through `core::testing::ScriptedApprover` (`open` before `approve`/`release`; `approve_unopened` only to prove the refusal).
 
@@ -585,7 +585,7 @@ Shared conventions (every task): run commands from `C:/Code/atlas-duck` with `-j
 - Test: `crates/core/tests/confluence_update.rs`, `crates/atlassian/tests/writes.rs` (minor 7 pin)
 
 **Interfaces:**
-- Consumes: Tasks 3, 7, 8, 9; M5 staged driver (`engine/enrich.rs`), `preview::diff::{line_diff, hunks}`, `CONFLICT_DENY_PREFILL`, `warning::conflict`, `stale::PAGE_UPDATE` (unchanged).
+- Consumes: Tasks 3, 7, 8, 9, 12a (`confluence_preview.rs`); M5 staged driver (`engine/enrich.rs`), `preview::diff::{line_diff, hunks}`, `CONFLICT_DENY_PREFILL`, `warning::conflict`, `stale::PAGE_UPDATE` (unchanged).
 - Produces: per PD-104 and PD-111. The verdict's `baseline` stays `{version, title, space_key}` (the stale rule reads it).
 
 **Spec:** §5.4 step 2 (conflict incl. "the agent's base version body (`GET /rest/api/content/{id}?version=<base_version>&status=historical&expand=body.storage`)"), step 4 (baselines read-only), step 6 (409/400 → `WRITE_STALE {version_conflict}` → conflict state), §6.2 (`conflict`, `lossy_update`, `raw_only_diff`), §6.3 Edit/update and Conflict, §7.4 `page.update`, §7.6 lossy updates, §13 I-36, I-06, I-32, S-12, PD-104, PD-111, L12.
@@ -651,7 +651,7 @@ Shared conventions (every task): run commands from `C:/Code/atlas-duck` with `-j
 - Modify tests: `crates/core/tests/op_table.rs`
 - Test: `crates/core/tests/confluence_writes.rs` (add), `crates/core/tests/confluence_validate.rs` (add)
 
-**Interfaces:** Consumes Tasks 8, 9, 16 (staged rule shape). Produces per PD-107; `comment_add_executor` calls `confluence_body::storage_text` before any `EnrichmentRequired` return (the Task 9 rule, applied here; plan review I-5).
+**Interfaces:** Consumes Tasks 8, 9, 12a (`confluence_preview.rs`), 16 (staged rule shape, `confluence_ext.rs`). Produces per PD-107; `comment_add_executor` calls `confluence_body::storage_text` before any `EnrichmentRequired` return (the Task 9 rule, applied here; plan review I-5).
 
 **Spec:** §7.4 `comment.add` (payload verbatim), §5.4 step 5 (rule "none"; the identity call still runs), §6.3, PD-107.
 
@@ -671,7 +671,7 @@ Shared conventions (every task): run commands from `C:/Code/atlas-duck` with `-j
 - Modify tests: `crates/core/tests/op_table.rs`
 - Test: `crates/core/tests/confluence_writes.rs` (add)
 
-**Interfaces:** Consumes Task 8. Produces per PD-108.
+**Interfaces:** Consumes Tasks 8, 12a (`confluence_preview.rs`), 16 (`confluence_ext.rs`). Produces per PD-108.
 
 **Spec:** §7.4 labels, §1.3 (the only DELETE), §4.2 (labels receipt: only the agent's labels), §7.2 declared success (`label.remove` `{[204], Empty}`), §6.3 labels, PD-108.
 
