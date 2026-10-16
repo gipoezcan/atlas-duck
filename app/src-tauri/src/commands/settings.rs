@@ -786,9 +786,7 @@ pub async fn settings_apply<R: Runtime>(
         Err(e) => Err(e),
     };
     note_failure(&response);
-    if response.is_ok() {
-        emit_settings_changed(&app);
-    }
+    emit_settings_changed(&app);
     finish(&app, response)
 }
 
@@ -917,9 +915,7 @@ pub async fn retest_token<R: Runtime>(
         Err(e) => Err(e),
     };
     note_failure(&response);
-    if response.is_ok() {
-        emit_settings_changed(&app);
-    }
+    emit_settings_changed(&app);
     finish(&app, response)
 }
 
@@ -979,9 +975,7 @@ pub async fn prune_backlog_now<R: Runtime>(
         Err(e) => Err(e),
     };
     note_failure(&response);
-    if response.is_ok() {
-        emit_settings_changed(&app);
-    }
+    emit_settings_changed(&app);
     finish(&app, response)
 }
 

@@ -2485,6 +2485,55 @@ mod settings_commands {
         Ok(())
     }
 
+    /// Final review I-2: `settings_apply`, `retest_token` and `prune_backlog_now` can commit and
+    /// then answer an error, so each is followed by `settings_changed` whatever it answered. The
+    /// app serves no core here: all three answer `not_ready`, which the old `is_ok()` guard
+    /// would have left without the event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn settings_apply_retest_and_prune_emit_settings_changed_on_error() -> TestResult {
+        use atlas_duck_app_lib::commands;
+        use atlas_duck_app_lib::commands::dto::Args;
+        use atlas_duck_app_lib::commands::settings::{
+            PruneBacklogNowArgs, SettingsApplyArgs, prune_backlog_now, retest_token, settings_apply,
+        };
+        use atlas_duck_core::testing::capture::Channel;
+
+        let app = mock_builder().build(tauri::test::mock_context(tauri::test::noop_assets()))?;
+        let handle = app.handle();
+        let cap = commands::capture::bounded();
+        assert!(commands::capture::install(handle, cap.clone()));
+        let changes = parse::<SettingsApplyArgs>(
+            &json!({"changes": [{"key": "retention_days", "value": 400}]}),
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        let alias = parse::<RetestTokenArgs>(&json!({"alias": "jira-main"}))
+            .map_err(|e| format!("{e:?}"))?;
+        let prune = parse::<PruneBacklogNowArgs>(&json!({})).map_err(|e| format!("{e:?}"))?;
+        assert_eq!(
+            settings_apply(handle.clone(), Args(changes)).await.err(),
+            Some(CommandError::NotReady)
+        );
+        assert_eq!(cap.on(Channel::TauriEvent).len(), 1, "settings_apply");
+        assert_eq!(
+            retest_token(handle.clone(), Args(alias)).await.err(),
+            Some(CommandError::NotReady)
+        );
+        assert_eq!(cap.on(Channel::TauriEvent).len(), 2, "retest_token");
+        assert_eq!(
+            prune_backlog_now(handle.clone(), Args(prune)).await.err(),
+            Some(CommandError::NotReady)
+        );
+        let events = cap.on(Channel::TauriEvent);
+        assert_eq!(events.len(), 3, "prune_backlog_now");
+        for e in &events {
+            assert_eq!(
+                serde_json::from_str::<Value>(&e.json)?,
+                json!({"event": "settings_changed", "payload": null})
+            );
+        }
+        Ok(())
+    }
+
     /// I-31 through the commands for the two gates of an instance `config.toml` proposed:
     /// `instance_confirm_config` (an instance added in `config.toml`) and
     /// `instance_accept_url_change` (a URL change `config.toml` asked for). A `Cancel` is
