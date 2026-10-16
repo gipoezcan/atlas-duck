@@ -212,6 +212,9 @@ pub const LIST_MAX: usize = 1_000;
 /// plan text (PD-66): a string of one redaction op (and the value of a `drop_item`) is at most
 /// 64 KiB.
 pub const OP_STRING_MAX_BYTES: usize = 64 << 10;
+/// Defence in depth (final review M-15): all redaction ops of one call together are at most 2 MiB of
+/// serialized JSON, the isolation hook's own payload cap; each op is bounded on its own as well.
+pub const REDACTION_OPS_MAX_BYTES: usize = 2 << 20;
 /// PD-86: a session id is the lowercase hex SHA-256 of the session key.
 pub const SESSION_ID_LEN: usize = 64;
 
@@ -427,6 +430,9 @@ fn redaction_ops<'de, D: Deserializer<'de>>(
 ) -> Result<Vec<RedactionOp>, D::Error> {
     let bad = || refuse::<D::Error>(field);
     let v = Value::deserialize(d).map_err(|_| bad())?;
+    if !bounded_json(&v, REDACTION_OPS_MAX_BYTES) {
+        return Err(bad());
+    }
     let Value::Array(items) = v else {
         return Err(bad());
     };
@@ -701,6 +707,19 @@ mod tests {
         assert!(!bounded_json(&v, len - 1));
         assert!(bounded_json(&Value::Null, 4));
         assert!(!bounded_json(&Value::Null, 3));
+    }
+
+    /// M-15: each op is within 64 KiB, but all ops of one call together are capped.
+    #[test]
+    fn redaction_ops_are_capped_in_total() {
+        let op = |n: usize| json!({"mask_text": {"text": "x".repeat(n), "every_occurrence": true, "at": null}});
+        // 20 ops of 60 000 bytes (1.2 MB) pass; 40 (2.4 MB, each op inside its own bound) do not.
+        let few: Vec<Value> = (0..20).map(|_| op(60_000)).collect();
+        let many: Vec<Value> = (0..40).map(|_| op(60_000)).collect();
+        assert!(serde_json::from_value::<RedactionOpsDto>(Value::Array(few.clone())).is_ok());
+        assert!(serde_json::from_value::<PreviewOpsDto>(Value::Array(few)).is_ok());
+        assert!(serde_json::from_value::<RedactionOpsDto>(Value::Array(many.clone())).is_err());
+        assert!(serde_json::from_value::<PreviewOpsDto>(Value::Array(many)).is_err());
     }
 
     #[test]
