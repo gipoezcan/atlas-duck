@@ -481,6 +481,9 @@ pub struct ReadView<'a> {
     /// total)`, shown as Info `truncated_by_cap(N, total)` (PD-45). `None` otherwise. For such a
     /// read `more_available`/`server_total` describe the comment pages, not the issue.
     pub comments_truncated: Option<(u64, u64)>,
+    /// Δ3 (PD-100): what the storage → Markdown conversion of a Confluence page body reduced;
+    /// `None` for every other read (and for a page read without a storage body).
+    pub conversion: Option<atlas_duck_convert::ConversionReport>,
 }
 
 pub struct WriteView<'a> {
@@ -791,7 +794,13 @@ static ENTRIES: &[(&str, OpImpl)] = &[
     ("confluence.user.current", READ),
     ("confluence.space.list", READ),
     ("confluence.space.get", READ),
-    ("confluence.page.get", READ),
+    (
+        "confluence.page.get",
+        OpImpl {
+            executor: confluence::page_get_executor,
+            ..READ
+        },
+    ),
     ("confluence.page.find", READ),
     (
         "confluence.search",
@@ -805,7 +814,13 @@ static ENTRIES: &[(&str, OpImpl)] = &[
     ("confluence.comment.list", READ),
     ("confluence.label.list", READ),
     ("confluence.attachment.list", READ),
-    ("confluence.page.history", READ),
+    (
+        "confluence.page.history",
+        OpImpl {
+            executor: confluence::page_history_executor,
+            ..READ
+        },
+    ),
     ("confluence.page.create", LATER_WRITE),
     (
         "confluence.page.update",

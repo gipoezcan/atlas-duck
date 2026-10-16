@@ -1089,11 +1089,18 @@ impl LiveBackend {
         match classified {
             Classified::Item(rec) => {
                 let size = rec.size();
-                let event = rec.record(&ctx);
+                let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
+                let users = read::user_resolutions(shape, rec.item);
+                let event = rec.record(&ctx, users.as_ref());
                 let (result, rejection, lossy) = match rec.item {
-                    ReleaseItem::Result => {
-                        settle_result(vc.spec, &vc.validated.params, &rec, call.all, max_result)
-                    }
+                    ReleaseItem::Result => settle_result(
+                        vc.spec,
+                        &vc.validated.params,
+                        &rec,
+                        call.all,
+                        max_result,
+                        event.payload.get("user_resolutions"),
+                    ),
                     ReleaseItem::UpstreamError => {
                         let (status, text) = rec.responses.last().map_or((0, String::new()), |r| {
                             (r.status, read::error_text(&r.body))
@@ -1210,16 +1217,19 @@ struct Settled {
 }
 
 /// A 2xx answer: its body as the script's result, unless it is over `max_call_result_mb`.
+/// `user_resolutions` is the map the call's `SCRIPT_CALL` commits (§7.6).
 fn settle_result(
     spec: &'static OperationSpec,
     params: &Value,
     rec: &read::ItemRecord,
     all: bool,
     max_result: u64,
+    user_resolutions: Option<&Value>,
 ) -> (HostCallResult, Option<&'static str>, bool) {
     let shape = read::ReadShape::of(spec, params);
-    match read::result_value(spec, shape, rec.responses.iter().map(|r| r.body.as_slice())) {
-        Ok((body, _)) => {
+    let bodies = rec.responses.iter().map(|r| r.body.as_slice());
+    match read::result_value(spec, shape, bodies, user_resolutions) {
+        Ok(read::Normalized { body, .. }) => {
             let len = serde_json::to_vec(&body).map_or(u64::MAX, |b| b.len() as u64);
             if len > max_result {
                 (
@@ -1391,6 +1401,7 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
         more_available: false,
         clamped: false,
         comments_truncated: None,
+        conversion: None,
     };
     let mut m = fallback_preview(&PreviewCtx {
         spec: &SCRIPT_SPEC,

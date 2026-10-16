@@ -1856,6 +1856,7 @@ fn read_preview(
             more_available: more,
             clamped,
             comments_truncated: None,
+            conversion: None,
         }),
         field_names: None,
     };

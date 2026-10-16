@@ -26,6 +26,7 @@ use atlas_duck_atlassian::{
     PageEnd, PagedOutcome, PostSendKind, ReadBudget, UnavailableReason, UpstreamResponse,
 };
 use atlas_duck_audit::NewEvent;
+use atlas_duck_convert::{ConversionReport, UserResolutions, storage_to_markdown};
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::{
@@ -43,6 +44,7 @@ use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
 use crate::lifecycle::model::{Event, ReleaseItem};
 use crate::metadata::{FieldCache, FieldNames};
+use crate::ops::confluence::{self, BodyFormat};
 use crate::ops::generic::{count_value, fallback_preview, invisible_warnings, query_display};
 use crate::ops::{
     ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, jira, op_table,
@@ -111,6 +113,9 @@ pub struct ReadState {
     /// Results the normalization removed (§7.4: `confluence.search` results without a `content`
     /// object), counted in `meta.redactions.items_dropped`.
     pub normalized_dropped: u64,
+    /// Δ3 (PD-100): what the Markdown conversion of a Confluence page body reduced; released as
+    /// `meta.conversion` (§4.2). `None` for every other read.
+    pub conversion: Option<ConversionReport>,
     /// What the current revision's redaction ops did (`None` without ops).
     pub redaction_meta: Option<RedactionMeta>,
     /// "also appears in" of the current revision's masks (§6.3; UI only).
@@ -127,6 +132,7 @@ impl fmt::Debug for ReadState {
             .field("pages", &self.pages)
             .field("page", &self.page)
             .field("normalized_dropped", &self.normalized_dropped)
+            .field("converted", &self.conversion.is_some())
             .field("redacted", &self.redaction_meta.is_some())
             .finish_non_exhaustive()
     }
@@ -565,7 +571,9 @@ impl ItemRecord {
             .fold(0u64, u64::saturating_add)
     }
 
-    pub(super) fn record(&self, ctx: &EventCtx) -> NewEvent {
+    /// The `READ_FETCHED` of this item, with the `user_resolutions` it commits (§7.6; see
+    /// [`user_resolutions`]).
+    pub(super) fn record(&self, ctx: &EventCtx, user_resolutions: Option<&Value>) -> NewEvent {
         let fetched = match (&self.outcome, self.item) {
             (Some(o), _) => ReadFetched::Outcome {
                 outcome: o.kind,
@@ -581,7 +589,7 @@ impl ItemRecord {
                 responses: &self.responses,
             },
         };
-        let mut ev = payloads::read_fetched(ctx, &fetched, None);
+        let mut ev = payloads::read_fetched(ctx, &fetched, user_resolutions);
         if let (Some((k, v)), Some(o)) = (
             self.outcome.as_ref().and_then(|o| o.cause),
             ev.payload.as_object_mut(),
@@ -1120,16 +1128,18 @@ fn build_item(
     clamped: bool,
 ) -> Result<Built, Vec<UpstreamResponse>> {
     let shape = ReadShape::of(cx.spec, cx.params);
-    let mut record = rec.record(ctx);
+    // §5.2 steps 3–4: the map is committed in the record the candidate is built from, so the
+    // first build and every rebuild convert with the same map.
+    let users = user_resolutions(shape, rec.item);
+    let mut record = rec.record(ctx, users.as_ref());
     // §5.3 mirror check on the unredacted candidate (T10 review I-1): a candidate that fails it
     // is still shown, but Release stays disabled (`rebuild_failed`: `internal` banner, only Deny
     // remains) until a redaction drops the orphan entry.
-    let built =
-        normalize_with_drops(cx.spec, shape, &record.payload).and_then(|(body, dropped)| {
-            let (c, blocked) = build_unredacted(cx.spec, body)?;
-            Ok((c, dropped, blocked))
-        });
-    let (mut candidate, mut dropped, mut mirror_blocked) = match built {
+    let built = normalize_with_drops(cx.spec, shape, &record.payload).and_then(|n| {
+        let (c, blocked) = build_unredacted(cx.spec, n.body)?;
+        Ok((c, n.dropped, n.conversion, blocked))
+    });
+    let (mut candidate, mut dropped, mut conversion, mut mirror_blocked) = match built {
         Ok(b) => b,
         Err(_) => return Err(rec.responses),
     };
@@ -1144,14 +1154,15 @@ fn build_item(
             CardKind::ReleaseCap16,
             Vec::new(),
         );
-        record = rec.record(ctx);
+        record = rec.record(ctx, None);
         let built = normalize_with_drops(cx.spec, shape, &record.payload)
-            .and_then(|(body, _)| build_candidate(cx.spec, body, &[]));
+            .and_then(|n| build_candidate(cx.spec, n.body, &[]));
         candidate = match built {
             Ok(c) => c,
             Err(_) => return Err(rec.responses),
         };
         dropped = 0;
+        conversion = None;
         mirror_blocked = false;
     }
     let state = ReadState {
@@ -1165,6 +1176,7 @@ fn build_item(
         clamped,
         comments_truncated: rec.comments_truncated,
         normalized_dropped: dropped,
+        conversion,
         redaction_meta: None,
         also_appears_in: Vec::new(),
     };
@@ -1198,6 +1210,14 @@ pub enum ReadShape {
     /// `jira.issue.get --comments`: the issue, then the comment pages, merged into
     /// `fields.comment` (and with `rendered`, `renderedFields.comment`).
     IssueWithComments { rendered: bool },
+    /// Δ3 (PD-100): `confluence.page.get`, and `confluence.page.history` with `version`
+    /// (`historical`). `Markdown` replaces `body` with `{"format": "markdown", "value": …}`,
+    /// converted from `body.storage` with the record's committed `user_resolutions`; `Storage`
+    /// and `View` are the answer as sent.
+    ConfluenceBody {
+        format: BodyFormat,
+        historical: bool,
+    },
 }
 
 impl ReadShape {
@@ -1206,21 +1226,63 @@ impl ReadShape {
             ReadShape::IssueWithComments {
                 rendered: jira::comments_rendered(params),
             }
+        } else if let Some((format, historical)) = confluence::body_format(spec.id, params) {
+            ReadShape::ConfluenceBody { format, historical }
         } else {
             ReadShape::Plain
+        }
+    }
+
+    /// The shape converts with a committed `user_resolutions` map (§7.6): a Markdown page body.
+    pub fn commits_user_resolutions(self) -> bool {
+        matches!(
+            self,
+            ReadShape::ConfluenceBody {
+                format: BodyFormat::Markdown,
+                ..
+            }
+        )
+    }
+}
+
+/// The `user_resolutions` the `READ_FETCHED` of a released result (or the `SCRIPT_CALL` of a
+/// host call) commits (§7.6, §5.2 step 3): only a Markdown page body has one. No user lookup
+/// runs yet, so the map is empty and every mention converts to `@user:<key>`.
+pub(crate) fn user_resolutions(shape: ReadShape, item: ReleaseItem) -> Option<Value> {
+    (item == ReleaseItem::Result && shape.commits_user_resolutions())
+        .then(|| Value::Object(Map::new()))
+}
+
+/// What a committed payload normalizes to.
+pub(crate) struct Normalized {
+    /// The bare candidate body.
+    pub(crate) body: Value,
+    /// Results the normalization removed (§7.4).
+    pub(crate) dropped: u64,
+    /// The report of a Markdown page body's conversion (PD-100).
+    pub(crate) conversion: Option<ConversionReport>,
+}
+
+impl Normalized {
+    fn plain(body: Value) -> Normalized {
+        Normalized {
+            body,
+            dropped: 0,
+            conversion: None,
         }
     }
 }
 
 /// The bare candidate body of a committed `READ_FETCHED` payload: the one normalization the
-/// first build and every rebuild use (`cache`'s contract). Reads nothing but the payload and the
-/// request's validated `params` (which decide the [`ReadShape`]).
+/// first build and every rebuild use (`cache`'s contract). Reads nothing but the payload (its
+/// responses and its committed `user_resolutions`) and the request's validated `params` (which
+/// decide the [`ReadShape`]).
 pub fn normalize(
     spec: &OperationSpec,
     params: &Value,
     payload: &Value,
 ) -> Result<Value, RebuildError> {
-    normalize_with_drops(spec, ReadShape::of(spec, params), payload).map(|(body, _)| body)
+    normalize_with_drops(spec, ReadShape::of(spec, params), payload).map(|n| n.body)
 }
 
 /// [`normalize`] for `Engine::candidate`, with the shape decided from `params` up front.
@@ -1229,22 +1291,24 @@ pub(crate) fn normalizer(
     params: &Value,
 ) -> impl FnOnce(&Value) -> Result<Value, RebuildError> + Send + 'static {
     let shape = ReadShape::of(spec, params);
-    move |payload| normalize_with_drops(spec, shape, payload).map(|(body, _)| body)
+    move |payload| normalize_with_drops(spec, shape, payload).map(|n| n.body)
 }
 
-/// [`normalize`] plus the number of results it removed (§7.4).
+/// [`normalize`] plus the number of results it removed (§7.4) and the conversion report.
 fn normalize_with_drops(
     spec: &OperationSpec,
     shape: ReadShape,
     payload: &Value,
-) -> Result<(Value, u64), RebuildError> {
+) -> Result<Normalized, RebuildError> {
     if let Some(outcome) = payload.get("outcome") {
         let code = outcome
             .as_str()
             .and_then(outcome_code)
             .ok_or(RebuildError::Malformed)?;
         let code = serde_json::to_value(code).map_err(|_| RebuildError::Malformed)?;
-        return Ok((json!({ "code": code, "hint": OUTCOME_HINT }), 0));
+        return Ok(Normalized::plain(
+            json!({ "code": code, "hint": OUTCOME_HINT }),
+        ));
     }
     // A direct failure's answer is never a candidate.
     if payload.get("unavailable").is_some() {
@@ -1253,24 +1317,79 @@ fn normalize_with_drops(
     let responses = fetched_refs(payload)?;
     if payload.get("upstream_error") == Some(&Value::Bool(true)) {
         let last = responses.last().ok_or(RebuildError::Malformed)?;
-        return Ok((error_candidate(last.status, &last.body), 0));
+        return Ok(Normalized::plain(error_candidate(last.status, &last.body)));
     }
-    result_value(spec, shape, responses.iter().map(|r| &*r.body))
+    result_value(
+        spec,
+        shape,
+        responses.iter().map(|r| &*r.body),
+        payload.get("user_resolutions"),
+    )
 }
 
 /// The result of a read's 2xx pages in its [`ReadShape`] (the direct read's candidate, a script
-/// host call's result).
+/// host call's result). `user_resolutions` is the committed map of the record (§7.6).
 pub(super) fn result_value<'a>(
     spec: &OperationSpec,
     shape: ReadShape,
     bodies: impl IntoIterator<Item = &'a [u8]>,
-) -> Result<(Value, u64), RebuildError> {
+    user_resolutions: Option<&Value>,
+) -> Result<Normalized, RebuildError> {
     match shape {
-        ReadShape::Plain => result_body(spec, bodies),
+        ReadShape::Plain => result_body(spec, bodies).map(|(body, dropped)| Normalized {
+            body,
+            dropped,
+            conversion: None,
+        }),
         ReadShape::IssueWithComments { rendered } => {
-            merge_comments(bodies, rendered).map(|body| (body, 0))
+            merge_comments(bodies, rendered).map(Normalized::plain)
+        }
+        ReadShape::ConfluenceBody { format, .. } => {
+            let (body, _) = result_body(spec, bodies)?;
+            match format {
+                BodyFormat::Markdown => markdown_body(body, user_resolutions),
+                BodyFormat::Storage | BodyFormat::View => Ok(Normalized::plain(body)),
+            }
         }
     }
+}
+
+/// PD-100: the content with `body` replaced by `{"format": "markdown", "value": …}` (§4.2),
+/// converted with the committed map only, never the live user cache (§5.2, I-37). A content
+/// answer without a `body.storage.value` string (e.g. an id that is not a page) is the answer as
+/// sent, unconverted and without a report.
+fn markdown_body(mut body: Value, users: Option<&Value>) -> Result<Normalized, RebuildError> {
+    let users = committed_users(users)?;
+    let Some(storage) = body.pointer("/body/storage/value").and_then(Value::as_str) else {
+        return Ok(Normalized::plain(body));
+    };
+    let (markdown, report, _) = storage_to_markdown(storage, &users);
+    let root = body.as_object_mut().ok_or(RebuildError::Malformed)?;
+    root.insert(
+        "body".into(),
+        json!({ "format": "markdown", "value": markdown }),
+    );
+    Ok(Normalized {
+        body,
+        dropped: 0,
+        conversion: Some(report),
+    })
+}
+
+/// The committed `user_resolutions` (§7.6): user key → username, or `null` when unresolved. The
+/// record of a Markdown page body always carries the object; a record without it, or with any
+/// other value in it, is malformed (fail closed: nothing stands in for the committed map).
+fn committed_users(users: Option<&Value>) -> Result<UserResolutions, RebuildError> {
+    let map = users
+        .and_then(Value::as_object)
+        .ok_or(RebuildError::Malformed)?;
+    map.iter()
+        .map(|(key, name)| match name {
+            Value::String(s) => Ok((key.clone(), Some(s.clone()))),
+            Value::Null => Ok((key.clone(), None)),
+            _ => Err(RebuildError::Malformed),
+        })
+        .collect()
 }
 
 /// PD-45: the issue (the first body) with `fields.comment = {startAt, maxResults, total,
@@ -1445,6 +1564,7 @@ pub(crate) fn preview_model(cx: &ReadContext<'_>, read: &ReadState, c: &Candidat
                     more_available: read.more_available,
                     clamped: read.clamped,
                     comments_truncated: read.comments_truncated,
+                    conversion: read.conversion.clone(),
                 }),
                 field_names: cx.field_names.as_deref(),
             })
@@ -1529,11 +1649,27 @@ fn card(cx: &ReadContext<'_>, value: &Value, byte_size: u64, body: PreviewBody) 
     }
 }
 
-/// `meta.page` (§7.5, paged ops) and `meta.redactions` (§4.2) of a release, stored in its
-/// `READ_RELEASED` so a delivery needs nothing but the record. `returned` counts the released
-/// items, so `returned + items_dropped` equals the items fetched.
+/// `meta.page` (§7.5, paged ops), `meta.redactions` and `meta.conversion` (§4.2) of a release,
+/// stored in its `READ_RELEASED` so a delivery needs nothing but the record. `returned` counts
+/// the released items, so `returned + items_dropped` equals the items fetched.
 pub(crate) fn release_meta(spec: &OperationSpec, read: &ReadState, released: &Value) -> Value {
     let mut meta = Map::new();
+    // §4.2: `{lossy, lost: {macros, images, links, layouts}}` of a released Markdown body; the
+    // rest of the report (macro names, unresolved mentions) is preview-only.
+    if let (ReleaseItem::Result, Some(c)) = (read.item, &read.conversion) {
+        meta.insert(
+            "conversion".into(),
+            json!({
+                "lossy": c.lossy,
+                "lost": {
+                    "macros": c.lost.macros,
+                    "images": c.lost.images,
+                    "links": c.lost.links,
+                    "layouts": c.lost.layouts,
+                },
+            }),
+        );
+    }
     // An upstream error's details have no items: `meta.page` belongs to a released result.
     if let (ReleaseItem::Result, Some(p), Some(paging)) = (read.item, read.page, spec.paginated) {
         let returned = released

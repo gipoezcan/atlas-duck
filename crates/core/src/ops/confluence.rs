@@ -1,5 +1,6 @@
-//! Confluence specifics in M3: the `confluence.search` CQL type-filter rewrite (§7.4, part of the
-//! static validation of §5.2 step 1) and `confluence.page.update` (PD-09).
+//! Confluence specifics: the `confluence.search` CQL type-filter rewrite (§7.4, part of the
+//! static validation of §5.2 step 1), `confluence.page.update` (PD-09) and, from M7, the
+//! `format` of the page reads (PD-100).
 
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_preview::invisible::escape_for_display;
@@ -8,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use super::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan,
-    PreviewCtx, PreviewModel, generic, get_call, json_request, resolve_url, single_round,
+    PreviewCtx, PreviewModel, ReadPlan, generic, get_call, json_request, resolve_url, single_round,
     str_param,
 };
 use crate::lifecycle::model::Hold;
@@ -222,6 +223,78 @@ pub fn search_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         .map(|q| escape_for_display(&q));
     model.header.query = model.query.clone();
     model
+}
+
+// ---- page formats (PD-100) ---------------------------------------------------------------------
+
+/// The `format` of `confluence.page.get` and of `confluence.page.history` with `version` (§7.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BodyFormat {
+    /// The default: `body.storage` converted to Markdown with the committed user map.
+    Markdown,
+    /// `body.storage` as sent.
+    Storage,
+    /// `body.view` (the server-rendered HTML) instead of `body.storage`.
+    View,
+}
+
+impl BodyFormat {
+    /// The validated `format` param; absent means `markdown` (validation applies no defaults,
+    /// and the schema enum admits nothing else).
+    fn of(params: &Value) -> BodyFormat {
+        match params.get("format").and_then(Value::as_str) {
+            Some("storage") => BodyFormat::Storage,
+            Some("view") => BodyFormat::View,
+            _ => BodyFormat::Markdown,
+        }
+    }
+}
+
+/// The body format of a read that carries a page body, with whether it is a historical version
+/// (`confluence.page.history` with `version`); `None` for every other read, the history summary
+/// included (it has no body and ignores `format`, PD-100). Decided from the op and the validated
+/// params alone: the request's `expand` and the normalization (`ReadShape`) both ask here.
+pub fn body_format(op_id: &str, params: &Value) -> Option<(BodyFormat, bool)> {
+    match op_id {
+        "confluence.page.get" => Some((BodyFormat::of(params), false)),
+        "confluence.page.history" if params.get("version").is_some_and(|v| !v.is_null()) => {
+            Some((BodyFormat::of(params), true))
+        }
+        _ => None,
+    }
+}
+
+/// The registry read plan, with `body.storage` swapped for `body.view` in its `expand` for
+/// `format=view` (PD-100: `body.view,version,space,ancestors`, history `body.view,version`).
+fn body_read_plan(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let plan = generic::read_plan(ctx, ctx.params)?;
+    if body_format(ctx.spec.id, ctx.params).map(|(f, _)| f) != Some(BodyFormat::View) {
+        return Ok(plan);
+    }
+    let ExecPlan::Read(ReadPlan::Get(mut call)) = plan else {
+        return Ok(plan);
+    };
+    for (name, value) in &mut call.query {
+        if name.as_str() == "expand" {
+            *value = value
+                .split(',')
+                .map(|e| if e == "body.storage" { "body.view" } else { e })
+                .collect::<Vec<_>>()
+                .join(",");
+        }
+    }
+    Ok(ExecPlan::Read(ReadPlan::Get(call)))
+}
+
+/// `confluence.page.get`: the content with the expand of its `format` (PD-100).
+pub fn page_get_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    body_read_plan(ctx)
+}
+
+/// `confluence.page.history`: the summary, or with `version` the historical content with the
+/// expand of its `format` (PD-100).
+pub fn page_history_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    body_read_plan(ctx)
 }
 
 // ---- confluence.page.update --------------------------------------------------------------------
