@@ -45,6 +45,8 @@ libc = "=0.2.190"
 lexopt = "=0.3.2"
 # CommonMark parser for convert (§7.6); no CLI (getopts) or HTML renderer.
 pulldown-cmark = { version = "=0.13.4", default-features = false }
+quick-xml = { version = "=0.42.0", default-features = false, features = ["escape-html"] }
+htmd = "=0.5.5"
 landlock = "=0.4.7"
 seccompiler = "=0.5.0"
 syscalls = { version = "=0.8.1", default-features = false, features = ["x86_64", "aarch64"] }

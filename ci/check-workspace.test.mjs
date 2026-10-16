@@ -669,6 +669,12 @@ test("convert external dependency outside allowlist is rejected", () => {
   assert.deepEqual(graph(e), ["atlas-duck-convert: external dependency reqwest not allowed"]);
 });
 
+test("convert may depend on quick-xml and htmd", () => {
+  const e = baseEdges();
+  e["atlas-duck-convert"] = ["pulldown-cmark", "quick-xml", "htmd", { name: "proptest", kind: "dev" }];
+  assert.deepEqual(graph(e), []);
+});
+
 test("convert and preview depend on no workspace crate", () => {
   for (const leaf of ["atlas-duck-convert", "atlas-duck-preview"]) {
     const e = baseEdges();

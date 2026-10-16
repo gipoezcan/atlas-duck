@@ -69,8 +69,9 @@ export const TEST_FEATURE_FORWARDERS = [
 // The registry stays a plain data crate: its normal dependencies are these and nothing else.
 export const REGISTRY_EXTERNAL_ALLOW = ["serde", "serde_json"];
 
-// §2.2: convert is pure; its only normal dependency is the CommonMark parser.
-export const CONVERT_EXTERNAL_ALLOW = ["pulldown-cmark"];
+// §2.2: convert is pure; its normal dependencies are the CommonMark parser, the
+// storage-format XML reader and the HTML-to-Markdown converter (§7.6).
+export const CONVERT_EXTERNAL_ALLOW = ["pulldown-cmark", "quick-xml", "htmd"];
 
 export const TAURI_CRATES = ["tauri", "wry"];
 
