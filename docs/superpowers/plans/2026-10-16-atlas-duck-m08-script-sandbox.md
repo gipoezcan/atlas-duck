@@ -2,7 +2,7 @@
 
 **Draft status:** DRAFT of 2026-10-16 with the lead's rulings applied (section "Lead rulings (2026-10-16)"; no task waits for an answer); uncommitted. Written while M7 is planned but not built, against `m6-approvals-ui` at `6e35de4` (M1–M5 on `master`, M6 implemented with its final review pending) and the M7 plan `2026-10-16-atlas-duck-m07-confluence-adapter.md` (committed in `a1233dd` with the lead's rulings). Tasks 1–31 need no Confluence code and are planned in full. They do build on four generic M7 artifacts:
 - Task 17 reuses M7's `generic::list_table` (M7 PD-114);
-- Task 18 bumps M7's `render3` to `render4`;
+- Task 18 bumps M7's `render4` to `render5` (`render3` is the M6 CI fix round's, M7 owns `render4`);
 - Task 27 extends `perf_sc3` and `e2e/flows.rs` after M7's additions;
 - Task 30 runs M7's `confluence_flows` in its CI list.
 
@@ -54,7 +54,7 @@ All of it is proved by in-process tests where the code allows and by CI runs on 
   - Promise jobs are drained with `execute_pending_job`, so rquickjs `futures` stays off (V15).
 - **`sandbox-host`** splits a spawned worker into I/O (stdin writer, stdout reader, stderr reader), a non-blocking `KillHandle` and a reaper (Δ2). On top it adds the C.8 bridge `start_run`/`compile_run`: one reader thread that always drains, one stderr thread, one writer thread, and a per-run state machine whose host calls go to a `HostCallSink` as tokio tasks that are never dropped. It also adds memory-limit attribution (Windows job messages, the macOS watchdog, worker exit codes), the identity re-check, and the Windows degraded spawner.
 - **`core`** keeps the M3 lifecycle. It changes at the seam (Δ3: submit-time availability, compile failure kinds, run policy, `app_upgraded`). It also gains per-page `atlas.all`, configured script limits with invariants, the audit-authoritative degraded toggle, the Running-scripts view with kill answers, and the script preview model.
-- **`preview`** gains a `Script` body and its render arm (`render4`).
+- **`preview`** gains a `Script` body and its render arm (`render5`).
 - **`app/src-tauri`** gains `script_glue` (C.0: `ScriptRunner` over `sandbox-host`), probe consumption and status lines, plus the Running-scripts and Settings window content.
 
 No new workspace crate. No new process kind.
@@ -234,7 +234,7 @@ Tags:
 - **Δ5 C.6 `preview`.**
   - `PreviewBody::Script { kind: ScriptItemKind /* Result | ErrorDetails */, view: Box<PreviewBody> /* JsonTree or Table of the candidate */, source: String, provenance: Vec<ProvenanceRow { call_id, op_id, instance, target_display, outcome }>, logs: Vec<String>, logs_note: Option<String>, stderr: String }`.
   - `Preview.preselect: Option<RedactionPreset>` (the redaction panel pre-selects it; M6 handoff).
-  - `PREVIEW_BUILDER_VERSION` render part `render4`.
+  - `PREVIEW_BUILDER_VERSION` render part `render5`.
 - **Δ6 C.7 `SettingsAdmin`.**
   - `SettingChangeReq += ScriptLimits(ScriptLimitsReq /* the eight §9.4 keys, each Option<u32> */)` and `AllowDegradedScripts(bool)`.
   - `SettingsView.limits += script: ScriptLimits`.
@@ -1018,11 +1018,11 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
 
 ---
 
-### Task 18: `preview::render` arm for script items (Δ5, `render4`)
+### Task 18: `preview::render` arm for script items (Δ5, `render5`)
 
 **Model:** Opus (the TCB renderer). **Reviewer:** Opus (medium).
 
-**Files:** Modify `crates/preview/src/render/{mod.rs,body.rs}`, `crates/preview/src/model.rs` (`PREVIEW_BUILDER_VERSION` render part `render4`); Test `crates/preview/tests/render.rs`.
+**Files:** Modify `crates/preview/src/render/{mod.rs,body.rs}`, `crates/preview/src/model.rs` (`PREVIEW_BUILDER_VERSION` render part `render5`; `RENDER_VERSIONS` appends `("render5", <digest>)` after M7's `render4`); Test `crates/preview/tests/render.rs`.
 
 **Interfaces:**
 - Consumes the Task 17 model.
@@ -1036,9 +1036,9 @@ Tests: `crates/core/tests/{settings,validate,handler,budget}.rs`.
   - `script_source_and_logs_are_escaped_text` (`<script>`, `onerror=`, U+202E in source and logs → escaped, `⟨U+202E⟩`);
   - `script_error_document_fields`;
   - `s06_script_document_has_no_active_content` (the existing proptest gains the `Script` variant);
-  - `render_version_is_render4`;
+  - `render_version_is_render5`;
   - `doc_caps_note_for_long_logs`.
-- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-preview --locked --test render`; core `--test scripts` (the version string); clippy. **Step 4: Commit** `feat(preview): script result and error documents (render4)` (+ trailer).
+- [ ] **Step 2: Implement.** **Step 3: Run** `cargo test -j 4 -p atlas-duck-preview --locked --test render`; core `--test scripts` (the version string); clippy. **Step 4: Commit** `feat(preview): script result and error documents (render5)` (+ trailer).
 
 ---
 
@@ -1424,7 +1424,7 @@ No task waits for a lead answer. R13 (`k` above 16) is ruled by the lead when Ta
 - **L170** (PD-139, PD-140, §9.4, §10.3) `[scripts]` defaults, bounds, raises confirmed natively, file edits at the next start; provisional `k = 8` until V16 is closed (Task 33 amends §9.4).
 - **L171** (PD-141, §9.4, §10.3) Degraded toggle is audit-authoritative (R2: additive settings key, absent = off, on only after the native confirmation), with confirmation text and the `scripts_degraded` status line.
 - **L172** (PD-142, PD-143, §9.6) Running-list fields, `started_at` = slot time, kill answer texts.
-- **L173** (PD-145, PD-146, §6.3) Script preview: provenance from agent params in memory, logs/stderr of results read from `SCRIPT_FINISHED`, table/tree rule, `render4`; logs and stderr are approver-only and never released with a result (R7).
+- **L173** (PD-145, PD-146, §6.3) Script preview: provenance from agent params in memory, logs/stderr of results read from `SCRIPT_FINISHED`, table/tree rule, `render5`; logs and stderr are approver-only and never released with a result (R7).
 - **L174** (M5 M-13, §5.3, §6.2) The documented residual (script candidates skip the mirror check) plus the Caution `script_rendered_copies` when the run made a host call with `renderedFields` (R8, §6.2 amendment).
 - **L175** (PD-138, §8.3, §9.4) Probe consumption: one probe per start, awaited by the first script (≤ 60 s) (R10); a ≤ 5 s bounded wait before `APP_START`, else `confinement: {state: "pending"}` (R1); `SCRIPT_STARTED.confinement`.
 - **L176** (PD-150, §13 CI-07) The CI-07 shape: dry run on the release package, released real run on the debug scripted-approver bundles (R6).
