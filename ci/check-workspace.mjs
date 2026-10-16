@@ -135,7 +135,11 @@ export const WORKER_EXTERNAL_ALLOW = [
 export const BANNED_IN_SANDBOX_HOST = BANNED_IN_CLI_AND_WORKER;
 
 // PD-134 (plan review B-2): `#[global_allocator]` lives only in the sandbox binary and in tests.
-export const GLOBAL_ALLOCATOR_BIN = "app/src-tauri/src/bin/atlas-duck-sandbox.rs";
+export const GLOBAL_ALLOCATOR_FILES = ["app/src-tauri/src/bin/atlas-duck-sandbox.rs"];
+
+// A `tests/` directory directly under a crate root (an integration-test target, never part of the
+// library). `src/tests/` modules compile into the crate and are not exempt.
+const CRATE_TESTS_DIR = /^(?:crates\/[^/]+|app\/src-tauri)\/tests\//;
 
 export const LINT_PACKAGES = [PKG.core, PKG.atlassian, PKG.convert];
 export const REQUIRED_DENY_LINTS = ["unwrap_used", "expect_used"];
@@ -257,10 +261,17 @@ export function checkGraph(metadata) {
     if (d.name === PKG.ipc && isNormalOrBuild(d.kind) && d.uses_default_features !== false) {
       violations.push(`${PKG.sandboxWorker}: dependency on ${PKG.ipc} must set default-features = false`);
     }
-    if (isNormalOrBuild(d.kind) && !memberNames.has(d.name) && !WORKER_EXTERNAL_ALLOW.includes(d.name)) {
-      violations.push(
-        `${PKG.sandboxWorker}: external dependency ${d.name} is not allowed; only ${WORKER_EXTERNAL_ALLOW.join(", ")} (M8 T1)`,
-      );
+    if (isNormalOrBuild(d.kind) && !memberNames.has(d.name)) {
+      if (!WORKER_EXTERNAL_ALLOW.includes(d.name)) {
+        violations.push(
+          `${PKG.sandboxWorker}: external dependency ${d.name} is not allowed; only ${WORKER_EXTERNAL_ALLOW.join(", ")} (M8 T1)`,
+        );
+      } else if (!d.source?.startsWith("registry+")) {
+        // A path or git dependency (source null / git+...) named like an allowed crate is not it.
+        violations.push(
+          `${PKG.sandboxWorker}: external dependency ${d.name} must come from a registry, found ${d.source ?? "a path"} (M8 T1)`,
+        );
+      }
     }
   }
 
@@ -483,34 +494,92 @@ export function checkManifests({ root, members }) {
 
 /**
  * `#[global_allocator]` source scan (PD-134). `files`: [{ path, text }] with repo-relative paths.
- * Allowed only in GLOBAL_ALLOCATOR_BIN and in files under a `tests/` directory.
+ * Allowed only in GLOBAL_ALLOCATOR_FILES and in files under a crate's own `tests/` directory
+ * (`crates/<name>/tests/`, `app/src-tauri/tests/`).
  */
 export function checkGlobalAllocators(files) {
   const violations = [];
   for (const { path, text } of files) {
     const p = path.replace(/\\/g, "/");
-    if (p === GLOBAL_ALLOCATOR_BIN || p.startsWith("tests/") || p.includes("/tests/")) continue;
-    if (/^[^/\n]*#\[\s*global_allocator\s*\]/m.test(stripLineComments(text))) {
+    if (GLOBAL_ALLOCATOR_FILES.includes(p) || CRATE_TESTS_DIR.test(p)) continue;
+    // Any attribute that names `global_allocator`: plain, path-qualified, or inside `cfg_attr(...)`.
+    if (/#\s*!?\s*\[[^\]]*\bglobal_allocator\b/.test(blankCommentsAndStrings(text))) {
       violations.push(
-        `${p}: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_BIN} and under tests/ (PD-134)`,
+        `${p}: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_FILES.join(", ")} and under tests/ (PD-134)`,
       );
     }
   }
   return violations;
 }
 
-const stripLineComments = (text) => text.replace(/^\s*\/\/.*$/gm, "");
+/**
+ * Rust source with comments (line, nested block) and string/char literal contents blanked, so a
+ * commented-out or quoted `#[global_allocator]` does not count and `"//"` or `"/*"` in a string
+ * does not start a comment. Newlines are kept. Raw strings (`r#"..."#`) are handled.
+ */
+export function blankCommentsAndStrings(text) {
+  let out = "";
+  let i = 0;
+  const n = text.length;
+  const blank = (s) => s.replace(/[^\n]/g, " ");
+  while (i < n) {
+    const rest = text.slice(i, i + 2);
+    if (rest === "//") {
+      const end = text.indexOf("\n", i);
+      const stop = end < 0 ? n : end;
+      out += blank(text.slice(i, stop));
+      i = stop;
+    } else if (rest === "/*") {
+      let depth = 1;
+      let j = i + 2;
+      while (j < n && depth > 0) {
+        if (text.startsWith("/*", j)) (depth++, (j += 2));
+        else if (text.startsWith("*/", j)) (depth--, (j += 2));
+        else j++;
+      }
+      out += blank(text.slice(i, j));
+      i = j;
+    } else {
+      const raw = /^b?r(#*)"/.exec(text.slice(i, i + 20));
+      if (raw && !/[A-Za-z0-9_]/.test(text[i - 1] ?? "")) {
+        const close = `"${raw[1]}`;
+        const end = text.indexOf(close, i + raw[0].length);
+        const stop = end < 0 ? n : end + close.length;
+        out += blank(text.slice(i, stop));
+        i = stop;
+      } else if (text[i] === '"') {
+        let j = i + 1;
+        while (j < n && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+        out += blank(text.slice(i, j + 1));
+        i = j + 1;
+      } else {
+        // A char literal ('x', '\n', '"') is blanked; a lifetime ('a) is left alone.
+        const ch = /^'(?:\\[^']+|[^\\'])'/.exec(text.slice(i, i + 12));
+        if (ch) {
+          out += blank(ch[0]);
+          i += ch[0].length;
+        } else {
+          out += text[i];
+          i++;
+        }
+      }
+    }
+  }
+  return out;
+}
 
-const SCAN_SKIP_DIRS = new Set(["target", "node_modules", ".git", "dist"]);
+// Never scanned: build output and dependency trees. Matched against repo-relative paths from the
+// repo root, so a crate directory that happens to be named `target` or `dist` is still scanned.
+const SCAN_SKIP_PATHS = new Set(["target", "node_modules", ".git", "app/ui/dist", "app/ui/node_modules"]);
 
 /** Every `.rs` file under `root` (repo-relative paths), skipping build and dependency dirs. */
 export function collectRustFiles(root, rel = "") {
   const out = [];
   for (const e of readdirSync(join(root, rel), { withFileTypes: true })) {
+    const path = rel === "" ? e.name : `${rel}/${e.name}`;
     if (e.isDirectory()) {
-      if (!SCAN_SKIP_DIRS.has(e.name)) out.push(...collectRustFiles(root, rel === "" ? e.name : `${rel}/${e.name}`));
+      if (!SCAN_SKIP_PATHS.has(path)) out.push(...collectRustFiles(root, path));
     } else if (e.name.endsWith(".rs")) {
-      const path = rel === "" ? e.name : `${rel}/${e.name}`;
       out.push({ path, text: readFileSync(join(root, path), "utf8") });
     }
   }

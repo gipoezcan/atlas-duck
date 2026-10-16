@@ -2,17 +2,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   BANNED_IN_SANDBOX_HOST,
-  GLOBAL_ALLOCATOR_BIN,
+  GLOBAL_ALLOCATOR_FILES,
   TEST_FEATURE_FORWARDERS,
   TEST_ONLY_FEATURES,
   WORKER_EXTERNAL_ALLOW,
   checkGlobalAllocators,
   checkGraph,
   checkManifests,
+  collectRustFiles,
   lintLevel,
   scanToml,
 } from "./check-workspace.mjs";
@@ -88,7 +90,12 @@ function makeMetadata(edges, { extraMembers = [], resolvedFeatures = {} } = {}) 
       const n = norm(d);
       return {
         name: n.name,
-        source: isMember(n.name) ? null : "registry+https://github.com/rust-lang/crates.io-index",
+        source:
+          n.source !== undefined
+            ? n.source
+            : isMember(n.name)
+              ? null
+              : "registry+https://github.com/rust-lang/crates.io-index",
         req: n.req,
         kind: n.kind,
         rename: null,
@@ -385,6 +392,27 @@ test("sandbox-worker gains no dependency (fixture adds tokio -> violation)", () 
   ]);
 });
 
+test("sandbox-worker with a build-dependency on tokio is a violation too", () => {
+  const e = baseEdges();
+  e["atlas-duck-sandbox-worker"].push({ name: "tokio", kind: "build" });
+  assert.deepEqual(graph(e), [
+    `atlas-duck-sandbox-worker: external dependency tokio is not allowed; only ${WORKER_EXTERNAL_ALLOW.join(", ")} (M8 T1)`,
+  ]);
+});
+
+test("an allowed worker crate name from a path or git source is a violation", () => {
+  for (const [source, found] of [
+    [null, "a path"],
+    ["git+https://example.com/serde_json?rev=abc#abc", "git+https://example.com/serde_json?rev=abc#abc"],
+  ]) {
+    const e = baseEdges();
+    e["atlas-duck-sandbox-worker"].push({ name: "serde_json", source });
+    assert.deepEqual(graph(e), [
+      `atlas-duck-sandbox-worker: external dependency serde_json must come from a registry, found ${found} (M8 T1)`,
+    ]);
+  }
+});
+
 test("sandbox-host may use tokio and async-trait", () => {
   const e = baseEdges();
   e["atlas-duck-sandbox-host"].push("tokio", "async-trait", "serde", "serde_json", "libc", "windows-sys");
@@ -415,6 +443,9 @@ test("sandbox-host with tauri in its closure is reported once, by the Tauri rule
 });
 
 const ALLOC = "#[global_allocator]\nstatic A: Counting = Counting;\n";
+const ALLOC_MSG = (p) =>
+  `${p}: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_FILES.join(", ")} and under tests/ (PD-134)`;
+const alloc = (path, text) => checkGlobalAllocators([{ path, text }]);
 
 test("global_allocator outside the worker bin and tests is a violation", () => {
   assert.deepEqual(
@@ -422,23 +453,83 @@ test("global_allocator outside the worker bin and tests is a violation", () => {
       { path: "crates/sandbox-worker/src/lib.rs", text: ALLOC },
       { path: "crates\\core\\src\\lib.rs", text: `fn x() {}\n    ${ALLOC}` },
     ]),
-    [
-      `crates/sandbox-worker/src/lib.rs: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_BIN} and under tests/ (PD-134)`,
-      `crates/core/src/lib.rs: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_BIN} and under tests/ (PD-134)`,
-    ],
+    [ALLOC_MSG("crates/sandbox-worker/src/lib.rs"), ALLOC_MSG("crates/core/src/lib.rs")],
   );
 });
 
-test("global_allocator is allowed in the sandbox bin and under tests/; comments do not count", () => {
+test("global_allocator is allowed in the sandbox bin and under a crate's tests/; comments and strings do not count", () => {
   assert.deepEqual(
     checkGlobalAllocators([
-      { path: GLOBAL_ALLOCATOR_BIN, text: ALLOC },
+      ...GLOBAL_ALLOCATOR_FILES.map((path) => ({ path, text: ALLOC })),
       { path: "crates/core/tests/budget.rs", text: ALLOC },
       { path: "crates/sandbox-worker/tests/confined_scripts.rs", text: ALLOC },
+      { path: "crates/core/tests/common/mod.rs", text: ALLOC },
+      { path: "app/src-tauri/tests/app_alloc.rs", text: ALLOC },
       { path: "crates/sandbox-worker/src/lib.rs", text: "// #[global_allocator] lives in the bin\n" },
+      { path: "crates/a/src/b.rs", text: "/*\n#[global_allocator]\n*/\nfn f() {}\n" },
+      { path: "crates/a/src/c.rs", text: "/* outer /* nested */ #[global_allocator] */\n" },
+      { path: "crates/a/src/d.rs", text: 'const S: &str = "#[global_allocator]";\n' },
+      { path: "crates/a/src/e.rs", text: 'const S: &str = r#"\n#[global_allocator]\n"#;\n' },
     ]),
     [],
   );
+});
+
+test("a tests directory that is not directly under a crate root is not exempt", () => {
+  for (const path of [
+    "crates/sandbox-worker/src/tests/x.rs",
+    "crates/sandbox-worker/src/tests.rs/x.rs",
+    "app/src-tauri/src/tests/x.rs",
+    "crates/core/benches/tests/x.rs",
+    "tests/x.rs",
+    "other/tests/x.rs",
+  ]) {
+    assert.deepEqual(alloc(path, ALLOC), [ALLOC_MSG(path)], path);
+  }
+});
+
+test("global_allocator bypasses: a slash before the attribute, cfg_attr, path-qualified", () => {
+  for (const text of [
+    `/* c */ ${ALLOC}`,
+    `let u = a / b; ${ALLOC}`,
+    "// c\n#[cfg_attr(not(test), global_allocator)]\nstatic A: Counting = Counting;\n",
+    "#[core::prelude::v1::global_allocator]\nstatic A: Counting = Counting;\n",
+    "#[ global_allocator ]\nstatic A: Counting = Counting;\n",
+    '"//"; #[global_allocator] static A: Counting = Counting;\n',
+    "fn f() {} // x\n/* y */ #[global_allocator] static A: Counting = Counting;\n",
+    "fn f<'a>(x: &'a str) {}\n#[global_allocator] static A: Counting = Counting;\n",
+    "const C: char = '\"';\n#[global_allocator] static A: Counting = Counting;\n",
+  ]) {
+    assert.deepEqual(alloc("crates/a/src/lib.rs", text), [ALLOC_MSG("crates/a/src/lib.rs")], text);
+  }
+});
+
+test("collectRustFiles skips target/node_modules/.git at the root and app/ui/dist, not same-named crate dirs", () => {
+  const root = mkdtempSync(join(REPO, "ci", ".scan-fixture-"));
+  try {
+    for (const p of [
+      "target/a.rs",
+      "node_modules/a.rs",
+      ".git/a.rs",
+      "app/ui/dist/a.rs",
+      "app/ui/node_modules/a.rs",
+      "crates/dist/src/a.rs",
+      "crates/target/src/a.rs",
+      "crates/x/target/a.rs",
+      "crates/x/src/lib.rs",
+    ]) {
+      mkdirSync(dirname(join(root, p)), { recursive: true });
+      writeFileSync(join(root, p), "");
+    }
+    assert.deepEqual(
+      collectRustFiles(root)
+        .map((f) => f.path)
+        .sort(),
+      ["crates/dist/src/a.rs", "crates/target/src/a.rs", "crates/x/src/lib.rs", "crates/x/target/a.rs"],
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ---------- manifest rules ----------
