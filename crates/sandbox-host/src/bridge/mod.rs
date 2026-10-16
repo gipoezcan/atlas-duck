@@ -239,11 +239,10 @@ impl RunHandleImpl {
 
     /// Kills the worker without waiting. The first decision wins: a cause given after the run
     /// was decided (terminal frame, timeout, violation, earlier kill) is not recorded. Never
-    /// blocks: a short state lock, then the non-blocking [`KillHandle`].
+    /// blocks: a short state lock, then the non-blocking [`KillHandle`]. The run timer stays
+    /// armed until the reap and kills again if this kill did not take.
     pub fn kill(&self, cause: KillCause) {
-        if self.run.update(|inner| inner.state.on_kill(cause)) {
-            self.run.decided.send_replace(true);
-        }
+        self.run.update(|inner| inner.state.on_kill(cause));
         self.run.kill.kill();
     }
 
@@ -272,7 +271,9 @@ impl fmt::Debug for RunHandleImpl {
 /// `rt` runs the host-call tasks and the run timer, so it needs tokio's time driver
 /// (`enable_time`/`enable_all`). The timer (`timeout_s`, PD-135) starts when `script.run` is
 /// handed to the writer, the moment it is written at the latest; on expiry the worker is killed
-/// and the verdict is `Limit("timeout_s")`.
+/// and the verdict is `Limit("timeout_s")` unless something decided the run first. It runs until
+/// the worker is reaped, so it is also the backstop for an earlier kill that did not take (T6: a
+/// failed kill shows only as a worker that never ends).
 pub fn start_run(
     spawner: &dyn WorkerSpawner,
     spec: &SpawnSpec,
@@ -307,7 +308,7 @@ pub fn start_run(
     }
     let _ = frames_tx.send(init_frame);
 
-    let (decided, decided_rx) = watch::channel(false);
+    let (finished, finished_rx) = watch::channel(false);
     let (outcome_tx, outcome) = watch::channel(None);
     let run = Arc::new(Run {
         run_id: next_run_id(),
@@ -322,7 +323,7 @@ pub fn start_run(
         started,
         confinement: ready.confinement,
         read_cap: RunState::read_cap(&init.limits),
-        decided,
+        finished,
     });
     let reading = Arc::clone(&run);
     let continuation: Continuation = Box::new(move |stdout| {
@@ -334,7 +335,7 @@ pub fn start_run(
         return Err(StartRunError::Spawn(io::ErrorKind::BrokenPipe));
     }
     let limit = Duration::from_secs(u64::from(init.limits.timeout_s));
-    rt.spawn(run_timer(Arc::clone(&run), decided_rx, limit));
+    rt.spawn(run_timer(Arc::clone(&run), finished_rx, limit));
     Ok(RunHandleImpl { run, outcome })
 }
 
@@ -557,8 +558,8 @@ struct Run {
     started: Instant,
     confinement: ConfinementReport,
     read_cap: usize,
-    /// Set once the run is decided or over; stops the timer.
-    decided: watch::Sender<bool>,
+    /// Set once the worker is reaped and the outcome is known; stops the timer.
+    finished: watch::Sender<bool>,
 }
 
 struct Inner {
@@ -621,12 +622,10 @@ impl Run {
             Step::Nothing => {}
             Step::Log(line) => self.sink.log(&self.run_id, &line),
             Step::Call(call) => self.dispatch(call),
-            // The run is decided: the timer stops, and the worker is killed (after a terminal
-            // frame without a cause, so that it is reaped even if it does not exit).
-            Step::Terminal | Step::Violation => {
-                self.decided.send_replace(true);
-                self.kill.kill();
-            }
+            // The run is decided: the worker is killed (after a terminal frame without a cause,
+            // so that it is reaped even if it does not exit). The timer stays armed until the
+            // reap, the backstop if this kill does not take.
+            Step::Terminal | Step::Violation => self.kill.kill(),
         }
     }
 
@@ -684,7 +683,7 @@ impl Run {
                 diag,
             }
         };
-        self.decided.send_replace(true);
+        self.finished.send_replace(true);
         outcome.send_replace(Some(done));
     }
 
@@ -703,19 +702,18 @@ impl Run {
     }
 }
 
-/// PD-135: kills the run `limit` after `script.run` was handed to the writer, unless it was
-/// decided first.
-async fn run_timer(run: Arc<Run>, mut decided: watch::Receiver<bool>, limit: Duration) {
-    if tokio::time::timeout(limit, decided.wait_for(|d| *d))
+/// PD-135: kills the run `limit` after `script.run` was handed to the writer, unless the worker
+/// was reaped first. The cause `timeout_s` is recorded only if nothing decided the run before; the
+/// kill is sent either way (a no-op unless an earlier kill did not take).
+async fn run_timer(run: Arc<Run>, mut finished: watch::Receiver<bool>, limit: Duration) {
+    if tokio::time::timeout(limit, finished.wait_for(|f| *f))
         .await
         .is_ok()
     {
         return;
     }
-    if run.update(|inner| inner.state.on_timeout()) {
-        run.decided.send_replace(true);
-        run.kill.kill();
-    }
+    run.update(|inner| inner.state.on_timeout());
+    run.kill.kill();
 }
 
 #[cfg(test)]

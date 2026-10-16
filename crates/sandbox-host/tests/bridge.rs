@@ -37,7 +37,7 @@ use atlas_duck_sandbox_host::bridge::{
 use atlas_duck_sandbox_host::identity::{FileId, IdentityPart, SandboxBinaryIdentity};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
 use atlas_duck_sandbox_host::spawn::{
-    ExitKind, Reaper, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner,
+    ExitKind, KillHandle, Reaper, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner,
 };
 use serde_json::{Value, json};
 
@@ -62,6 +62,8 @@ struct Observed {
     killed_cv: Condvar,
     /// Signals the kill handle sent (at most one).
     signals: AtomicU32,
+    /// Calls of the kill handle, including no-ops and a swallowed one.
+    kill_calls: AtomicU32,
     spawns: AtomicU32,
     finished: Mutex<bool>,
     finished_cv: Condvar,
@@ -215,17 +217,54 @@ type Script = Box<dyn FnOnce(&mut FakeWorker) -> io::Result<i32> + Send>;
 struct FakeSpawner {
     script: Mutex<Option<Script>>,
     observed: Arc<Observed>,
+    /// The kill handle swallows its first call (an OS call that failed without a sign).
+    flaky_kill: bool,
 }
 
 fn fake(
+    script: impl FnOnce(&mut FakeWorker) -> io::Result<i32> + Send + 'static,
+) -> (Arc<FakeSpawner>, Arc<Observed>) {
+    fake_with(false, script)
+}
+
+fn fake_with(
+    flaky_kill: bool,
     script: impl FnOnce(&mut FakeWorker) -> io::Result<i32> + Send + 'static,
 ) -> (Arc<FakeSpawner>, Arc<Observed>) {
     let observed = Arc::new(Observed::default());
     let spawner = FakeSpawner {
         script: Mutex::new(Some(Box::new(script))),
         observed: Arc::clone(&observed),
+        flaky_kill,
     };
     (Arc::new(spawner), observed)
+}
+
+/// A kill handle whose first call does nothing, then behaves like the real one.
+struct FlakyKill {
+    inner: GuardedKill,
+    observed: Arc<Observed>,
+}
+
+impl KillHandle for FlakyKill {
+    fn kill(&self) {
+        if self.observed.kill_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+            self.inner.kill();
+        }
+    }
+}
+
+/// Counts every call of the real fake kill handle.
+struct CountedKill {
+    inner: GuardedKill,
+    observed: Arc<Observed>,
+}
+
+impl KillHandle for CountedKill {
+    fn kill(&self) {
+        self.observed.kill_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.kill();
+    }
 }
 
 impl WorkerSpawner for FakeSpawner {
@@ -265,6 +304,7 @@ impl WorkerSpawner for FakeSpawner {
             stderr: stderr_r,
             exit: exit_rx,
             observed: Arc::clone(&self.observed),
+            flaky_kill: self.flaky_kill,
         }))
     }
 }
@@ -275,6 +315,7 @@ struct FakeProcess {
     stderr: io::PipeReader,
     exit: Receiver<i32>,
     observed: Arc<Observed>,
+    flaky_kill: bool,
 }
 
 impl WorkerProcess for FakeProcess {
@@ -298,7 +339,13 @@ impl WorkerProcess for FakeProcess {
     fn into_parts(self: Box<Self>) -> io::Result<WorkerParts> {
         let guard = ReapGuard::new();
         let observed = Arc::clone(&self.observed);
-        let kill = GuardedKill::new(Arc::clone(&guard), move || observed.kill());
+        let inner = GuardedKill::new(Arc::clone(&guard), move || observed.kill());
+        let observed = Arc::clone(&self.observed);
+        let kill: Arc<dyn KillHandle> = if self.flaky_kill {
+            Arc::new(FlakyKill { inner, observed })
+        } else {
+            Arc::new(CountedKill { inner, observed })
+        };
         Ok(WorkerParts {
             pid: 4242,
             io: WorkerIo {
@@ -306,7 +353,7 @@ impl WorkerProcess for FakeProcess {
                 stdout: Box::new(self.stdout),
                 stderr: Box::new(self.stderr),
             },
-            kill: Arc::new(kill),
+            kill,
             reaper: Box::new(FakeReaper {
                 guard,
                 exit: self.exit,
@@ -885,6 +932,44 @@ async fn timeout_kills_and_reports_timeout_s() -> TestResult {
     assert_eq!(outcome.logs, vec!["before".to_string()]);
     assert_eq!(observed.signals(), 1);
     assert!(outcome.elapsed >= Duration::from_secs(1));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_timer_kills_again_when_an_earlier_kill_did_not_take() -> TestResult {
+    // T6: a kill whose OS call failed shows only as a worker that never ends. The run timer stays
+    // armed until the reap and kills again at `timeout_s`, without changing the verdict.
+    let one_second = limits_with(|l| l.timeout_s = 1);
+    let (spawner, observed) = fake_with(true, |w| {
+        w.ready()?;
+        w.read()?;
+        w.send(b"not json")?;
+        w.until_killed()
+    });
+    let outcome = run_to_end(spawner, one_second, sink()).await?;
+    assert_eq!(
+        outcome.host,
+        HostVerdict::Violation(ViolationKind::Malformed)
+    );
+    assert!(observed.kill_calls.load(Ordering::SeqCst) >= 2);
+    assert_eq!(observed.signals(), 1);
+    assert!(
+        outcome.elapsed < Duration::from_secs(10),
+        "ended by the timer's kill"
+    );
+
+    // The caller's kill did not take either.
+    let (spawner, observed) = fake_with(true, |w| {
+        w.ready()?;
+        w.read()?;
+        w.until_killed()
+    });
+    let handle = start(spawner, expect(false), init(one_second), sink()).await??;
+    handle.kill(KillCause::Shutdown);
+    let outcome = tokio::time::timeout(WAIT_BOUND, handle.wait()).await?;
+    assert_eq!(outcome.host, HostVerdict::Killed(KillCause::Shutdown));
+    assert_eq!(observed.signals(), 1);
+    assert!(outcome.elapsed < Duration::from_secs(10));
     Ok(())
 }
 
