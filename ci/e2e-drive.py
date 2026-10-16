@@ -97,6 +97,12 @@ opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 class Session:
     def __init__(self, base, app, args=()):
+        # The same body as the Rust client (app/src-tauri/tests/e2e/webdriver.rs session_request),
+        # which creates sessions on the same tauri-driver and WebKitWebDriver. The native driver
+        # answers "Failed to match capabilities" without saying which one, so the path is checked
+        # first (an absolute, executable file) and the body is part of the failure text.
+        if not os.path.isabs(app) or not os.path.isfile(app) or not os.access(app, os.X_OK):
+            raise Failed("the app under test is not an absolute path to an executable file: %s" % app)
         body = {
             "capabilities": {
                 "alwaysMatch": {
@@ -105,7 +111,10 @@ class Session:
                 }
             }
         }
-        value = self._send("POST", base + "/session", body, timeout=120)
+        try:
+            value = self._send("POST", base + "/session", body, timeout=120)
+        except Failed as e:
+            raise Failed("%s (new session body: %s)" % (e, json.dumps(body)))
         self.base = base
         self.id = value["sessionId"]
 
