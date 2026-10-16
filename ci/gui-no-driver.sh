@@ -164,7 +164,8 @@ doctor() {
   fi
   gate="$(json_field "$work/doctor-$1.json" data.app.gate)" || report "doctor ($1) has no data.app.gate: $(cat "$work/doctor-$1.json")"
   [ "$gate" = first_run ] || report "doctor ($1) gate is '$gate', expected first_run"
-  tray="$(json_field "$work/doctor-$1.json" data.tray_host)" || report "doctor ($1) has no data.tray_host: $(cat "$work/doctor-$1.json")"
+  # The app's own answers (gate, tray_host, ...) sit under data.app; data.local is the CLI's side.
+  tray="$(json_field "$work/doctor-$1.json" data.app.tray_host)" || report "doctor ($1) has no data.app.tray_host: $(cat "$work/doctor-$1.json")"
   [ "$tray" = missing ] || report "doctor ($1) tray_host is '$tray', expected missing"
   say "$1: doctor exit 0, gate=first_run, tray_host=missing"
 }

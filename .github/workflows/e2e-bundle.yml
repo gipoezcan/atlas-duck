@@ -202,13 +202,19 @@ jobs:
           name: bundle-linux-e2e
           path: dist
 
-      - name: Install libfuse2, Xvfb, D-Bus, a Secret Service and xwininfo
+      # libwebkit2gtk-4.1-0 is not what the app runs (the AppImage bundles its own WebKit, found first
+      # through the AppImage's library path): its Depends bring the host libraries the AppImage leaves
+      # out by linuxdeploy's exclude list (libEGL and the mesa EGL driver among them; task cifix7, run
+      # 38894075809: "libEGL.so.1: cannot open shared object file"). bundle.yml's appimage-smoke gets
+      # them from the deb's Depends; cifix6 round 1 got them through webkit2gtk-driver.
+      - name: Install libfuse2, Xvfb, D-Bus, a Secret Service, xwininfo and the host GL libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfuse2 xvfb xauth dbus-x11 gnome-keyring libsecret-tools x11-utils python3 \
-            libayatana-appindicator3-1 librsvg2-2
+            libayatana-appindicator3-1 librsvg2-2 libwebkit2gtk-4.1-0
           command -v xwininfo
+          ldconfig -p | grep -F 'libEGL.so.1 '
 
       - name: AppImage M6 section (no tray host, Setup window, doctor, forwarded launches, SIGTERM)
         env:

@@ -156,8 +156,9 @@ m6_save_diag() {
 }
 
 # appimage-smoke.sh --m6 <e2e-artifact-dir>: the M6 section alone, CI only, on the downloaded
-# bundle-linux-e2e artifact (appimage/*.AppImage) with libfuse2, xvfb, dbus-x11 and x11-utils
-# (xwininfo) installed. The workflow job `appimage-m6` (e2e-bundle.yml).
+# bundle-linux-e2e artifact (appimage/*.AppImage) with libfuse2, xvfb, dbus-x11, x11-utils
+# (xwininfo) and the host GL libraries the AppImage does not bundle (libEGL: the job installs
+# libwebkit2gtk-4.1-0 for its Depends) installed. The workflow job `appimage-m6` (e2e-bundle.yml).
 m6_outer() {
   local e2e_dist work m6_dir m6_code self_path
   e2e_dist="$(realpath "${1:?usage: appimage-smoke.sh --m6 <e2e-artifact-dir>}")"
