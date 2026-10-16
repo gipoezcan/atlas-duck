@@ -8,14 +8,21 @@
 //! or for `format=view` the server's HTML; either way through `preview::sanitize_html` (S-12) and
 //! display-escaped afterwards (invisible and bidi characters show as `⟨U+XXXX⟩`), as the Jira
 //! previews do with wiki markup.
+//!
+//! Server markup released verbatim (`format=storage`, `format=view`, comment bodies) reaches the
+//! agent whole, while the local render drops parts of it (comments, script and style content,
+//! attributes): those bytes count as hidden and raise the Info `source_formatting_removed`
+//! (T12b review I-1, m-1; [`dropped_markup`]).
 
 use std::collections::HashMap;
 
+use atlas_duck_convert::storage::KNOWN_MACROS;
 use atlas_duck_convert::{
     ConversionReport, MarkdownTooLarge, UserResolutions, markdown_to_preview_html,
-    storage_to_markdown_within,
+    storage_constructs, storage_to_markdown_within,
 };
 use atlas_duck_preview::invisible::escape_for_display;
+use atlas_duck_preview::render::DOC_MAX_ROWS;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{ConfluenceComment, ConversionFacts, PreviewBody, sanitize_html};
 use atlas_duck_registry::Product;
@@ -145,9 +152,38 @@ const COMMENT_MARKDOWN_BUDGET: usize = 64 * 1024;
 /// format, then the body: the released Markdown rendered locally (with the conversion facts),
 /// the released storage rendered locally (labelled), or the server's `view` HTML sanitized (with
 /// the Caution `server_rendered_view`). A candidate without the format's body text (an id that
-/// is not a page, an upstream answer) keeps the Fallback.
+/// is not a page, an upstream answer) keeps the Fallback; a `view` read whose `body.view` is
+/// there without text keeps the Caution on it (T12b review m-5).
 pub(crate) fn page_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
-    page_model(ctx).unwrap_or_else(|| generic::fallback_preview(ctx))
+    page_model(ctx).unwrap_or_else(|| {
+        let mut model = generic::fallback_preview(ctx);
+        if has_view_body(ctx) {
+            model.warnings.push(view_caution());
+        }
+        model
+    })
+}
+
+/// A `view` read whose candidate has a `body.view` member.
+fn has_view_body(ctx: &PreviewCtx<'_>) -> bool {
+    let PreviewInput::Read(view) = &ctx.input else {
+        return false;
+    };
+    matches!(
+        body_format(ctx.spec, ctx.params),
+        Some((BodyFormat::View, _))
+    ) && view
+        .candidate
+        .get("body")
+        .and_then(|b| b.get("view"))
+        .is_some()
+}
+
+fn view_caution() -> Warning {
+    Warning::new(
+        WarningId::ServerRenderedView,
+        warning::TEXT_SERVER_RENDERED_VIEW,
+    )
 }
 
 fn page_model(ctx: &PreviewCtx<'_>) -> Option<PreviewModel> {
@@ -174,7 +210,7 @@ fn page_model(ctx: &PreviewCtx<'_>) -> Option<PreviewModel> {
             let markdown = body.get("value")?.as_str()?;
             let report = view.conversion.as_ref();
             if let Some(r) = report {
-                info_warnings(r, true, &mut warnings_after);
+                info_warnings(r, &mut warnings_after);
             }
             (
                 "markdown",
@@ -184,7 +220,7 @@ fn page_model(ctx: &PreviewCtx<'_>) -> Option<PreviewModel> {
         }
         BodyFormat::Storage => {
             let storage = text("storage")?;
-            let (html, report) = render_storage(
+            let (html, notes) = render_storage(
                 storage,
                 STORAGE_MARKDOWN_BUDGET,
                 PAGE_BODY_CAP,
@@ -193,23 +229,26 @@ fn page_model(ctx: &PreviewCtx<'_>) -> Option<PreviewModel> {
             );
             // Mentions are not looked up for storage (PD-99): `unresolved_mention` is the
             // Markdown release's alone.
-            if let Some(r) = &report {
-                info_warnings(r, false, &mut warnings_after);
-            }
+            notes.push(&mut warnings_after);
             ("storage", html, None)
         }
         BodyFormat::View => {
             let html = text("view")?;
             let (kept, cut) = cut_at(html, PAGE_BODY_CAP);
+            // What the sanitizer drops of the kept part; the cut part counts whole.
+            let dropped = dropped_markup(kept, Markup::View);
+            hidden = hidden.saturating_add(dropped.bytes);
             let mut shown = sanitize_html(kept);
             if cut > 0 {
                 hidden = hidden.saturating_add(cut);
                 shown.push_str(&more_bytes(cut));
             }
-            warnings_after.push(Warning::new(
-                WarningId::ServerRenderedView,
-                warning::TEXT_SERVER_RENDERED_VIEW,
-            ));
+            warnings_after.push(view_caution());
+            BodyNotes {
+                unknown_macros: false,
+                stripped: dropped.stripped(),
+            }
+            .push(&mut warnings_after);
             ("view", escape_for_display(&shown), None)
         }
     };
@@ -260,20 +299,52 @@ fn space_text(space: Option<&Value>) -> String {
     }
 }
 
-/// The Info warnings a conversion report implies (§6.2): `unknown_macros` when it names any,
-/// and (`mentions`: a Markdown release) `unresolved_mention` when a mention stayed a key.
-fn info_warnings(report: &ConversionReport, mentions: bool, warnings: &mut Vec<Warning>) {
-    if !report.unknown_macros.is_empty() {
-        warnings.push(Warning::new(
-            WarningId::UnknownMacros,
-            warning::TEXT_UNKNOWN_MACROS,
-        ));
+/// The Info warnings the Markdown release's conversion report implies (§6.2): `unknown_macros`
+/// when it names any, `unresolved_mention` when a mention stayed a key.
+fn info_warnings(report: &ConversionReport, warnings: &mut Vec<Warning>) {
+    BodyNotes {
+        unknown_macros: !report.unknown_macros.is_empty(),
+        stripped: false,
     }
-    if mentions && report.unresolved_users > 0 {
+    .push(warnings);
+    if report.unresolved_users > 0 {
         warnings.push(Warning::new(
             WarningId::UnresolvedMention,
             warning::TEXT_UNRESOLVED_MENTION,
         ));
+    }
+}
+
+/// The §6.2 Info facts of server markup the card renders locally (a storage or `view` body, a
+/// comment thread); each raises its Info once.
+#[derive(Clone, Copy, Default)]
+struct BodyNotes {
+    /// The body names a macro the converter does not know: `unknown_macros`.
+    unknown_macros: bool,
+    /// The render left out markup the agent receives, or styling it does not apply
+    /// ([`Dropped::stripped`]): `source_formatting_removed`.
+    stripped: bool,
+}
+
+impl BodyNotes {
+    fn merge(&mut self, other: BodyNotes) {
+        self.unknown_macros |= other.unknown_macros;
+        self.stripped |= other.stripped;
+    }
+
+    fn push(self, warnings: &mut Vec<Warning>) {
+        if self.unknown_macros {
+            warnings.push(Warning::new(
+                WarningId::UnknownMacros,
+                warning::TEXT_UNKNOWN_MACROS,
+            ));
+        }
+        if self.stripped {
+            warnings.push(Warning::new(
+                WarningId::SourceFormattingRemoved,
+                warning::TEXT_SOURCE_FORMATTING_REMOVED,
+            ));
+        }
     }
 }
 
@@ -306,31 +377,68 @@ fn render_markdown(markdown: &str, cap: usize, hidden: &mut u64) -> String {
 }
 
 /// Storage rendered locally (PD-103, Task 12b): converted with an empty user map within
-/// `budget` bytes of Markdown, then as [`render_markdown`] with `cap`, after `label` when given.
-/// A storage whose Markdown passes the budget is not rendered (its bytes count as hidden).
+/// `budget` bytes of Markdown, then as [`render_markdown`] with `cap`, after `label` when given;
+/// what the conversion drops of the storage counts as hidden ([`dropped_markup`]). A storage
+/// whose Markdown passes the budget is not rendered (its bytes count as hidden); its macros
+/// still come from its construct inventory (T12b review m-3).
 fn render_storage(
     storage: &str,
     budget: usize,
     cap: usize,
     label: Option<&str>,
     hidden: &mut u64,
-) -> (String, Option<ConversionReport>) {
+) -> (String, BodyNotes) {
     let mut html = label.map_or_else(String::new, |l| format!("<p><strong>{l}</strong></p>"));
     let empty = UserResolutions::new();
     match storage_to_markdown_within(storage, &empty, budget) {
         Ok((markdown, report, _)) => {
+            let dropped = dropped_markup(storage, Markup::Storage);
+            *hidden = hidden.saturating_add(dropped.bytes);
             html.push_str(&render_markdown(&markdown, cap, hidden));
-            (html, Some(report))
+            let notes = BodyNotes {
+                unknown_macros: !report.unknown_macros.is_empty(),
+                stripped: dropped.stripped(),
+            };
+            (html, notes)
         }
         Err(MarkdownTooLarge) => {
-            let bytes = u64::try_from(storage.len()).unwrap_or(u64::MAX);
-            *hidden = hidden.saturating_add(bytes);
-            html.push_str(&format!(
-                "<p>… {bytes} bytes not rendered here (see Raw)</p>"
-            ));
-            (html, None)
+            *hidden = hidden.saturating_add(len_u64(storage.len()));
+            html.push_str(&not_rendered(storage.len()));
+            let notes = BodyNotes {
+                unknown_macros: names_unknown_macros(storage),
+                stripped: false,
+            };
+            (html, notes)
         }
     }
+}
+
+fn len_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+fn not_rendered(bytes: usize) -> String {
+    format!("<p>… {bytes} bytes not rendered here (see Raw)</p>")
+}
+
+/// `ac:` elements the converter writes as a placeholder (or as their content) without listing
+/// them in `unknown_macros` (`convert::storage::to_md` `AC_QUIET`, `AC_MARKERS`).
+const QUIET_AC: [&str; 3] = ["emoticon", "placeholder", "inline-comment-marker"];
+
+/// Whether `storage` names a macro the converter would list in `unknown_macros`, read from its
+/// construct inventory (no Markdown is built): an include, a macro outside
+/// [`KNOWN_MACROS`], any other non-structural `ac:` element but [`QUIET_AC`], a foreign
+/// element. It may over-report (an old `ac:macro` is listed by its element name), never misses
+/// a structured macro.
+fn names_unknown_macros(storage: &str) -> bool {
+    let constructs = storage_constructs(storage);
+    !constructs.includes.is_empty()
+        || constructs.macros.iter().any(|name| {
+            !KNOWN_MACROS
+                .iter()
+                .chain(QUIET_AC.iter())
+                .any(|k| k.eq_ignore_ascii_case(name))
+        })
 }
 
 /// The bytes of the page the card does not show: every member but the title, a short `id`, the
@@ -387,7 +495,9 @@ fn body_unshown_bytes(body: &Map<String, Value>, format: BodyFormat) -> u64 {
 /// entry of its `ancestors` (its parent) when that comment is in the list, else at the top level;
 /// the thread is emitted depth-first, so the renderer can nest by `depth` and order alone (T8
 /// review m-6). `location` is `extensions.location` as sent (the renderer says "location not
-/// reported" without it). A candidate without a `results` list keeps the Fallback.
+/// reported" without it). The thread raises `unknown_macros` and `source_formatting_removed`
+/// once each when any rendered body does (T12b review m-1, m-2). A candidate without a
+/// `results` list keeps the Fallback.
 pub(crate) fn comments_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     comments_model(ctx).unwrap_or_else(|| generic::fallback_preview(ctx))
 }
@@ -402,15 +512,27 @@ fn comments_model(ctx: &PreviewCtx<'_>) -> Option<PreviewModel> {
         .iter()
         .filter(|c| !c.is_object())
         .fold(hidden, |sum, c| sum.saturating_add(bytes_of(c)));
+    let mut notes = BodyNotes::default();
+    // The renderer shows the first `DOC_MAX_ROWS` comments of the thread: only their bodies
+    // are rendered here (T12b review m-7); the bodies of the rest count as hidden.
     let comments: Vec<ConfluenceComment> = thread_order(results)
         .into_iter()
-        .filter_map(|(i, depth)| {
+        .enumerate()
+        .filter_map(|(n, (i, depth))| {
             let comment = results.get(i)?.as_object()?;
-            Some(comment_view(comment, depth, &mut hidden))
+            let render = n < DOC_MAX_ROWS;
+            Some(comment_view(
+                comment,
+                depth,
+                render,
+                &mut hidden,
+                &mut notes,
+            ))
         })
         .collect();
 
-    let (mut header, warnings) = generic::read_parts(ctx, view, hidden);
+    let (mut header, mut warnings) = generic::read_parts(ctx, view, hidden);
+    notes.push(&mut warnings);
     let count = table_count(&mut header, results.len());
     let query = header.query.clone();
     Some(PreviewModel {
@@ -438,9 +560,10 @@ fn parent_id(comment: &Map<String, Value>) -> Option<String> {
 
 /// The comments (object entries of `results`, by index) in thread order with their depth: each
 /// top-level comment (no parent in the list) in list order, each followed depth-first by its
-/// replies in list order. A comment whose parent chain never reaches the top level (a cycle in
-/// the server's `ancestors`) starts a thread of its own where it first appears; every comment
-/// is emitted exactly once.
+/// replies in list order. The comments whose parent chain never reaches the top level (a cycle
+/// in the server's `ancestors`) follow after the top-level threads, in list order, each
+/// starting a thread of its own unless an earlier one took it in; every comment is emitted
+/// exactly once.
 fn thread_order(results: &[Value]) -> Vec<(usize, u32)> {
     let mut index: HashMap<String, usize> = HashMap::new();
     for (i, c) in results.iter().enumerate() {
@@ -498,17 +621,34 @@ fn person(user: Option<&Value>) -> Option<String> {
     }
 }
 
-/// One comment of the thread; what it does not show is added to `hidden`.
-fn comment_view(comment: &Map<String, Value>, depth: u32, hidden: &mut u64) -> ConfluenceComment {
+/// One comment of the thread; what it does not show is added to `hidden`, its body's Info facts
+/// to `notes`. Without `render` the body is left out (empty) and its storage counts as hidden.
+fn comment_view(
+    comment: &Map<String, Value>,
+    depth: u32,
+    render: bool,
+    hidden: &mut u64,
+    notes: &mut BodyNotes,
+) -> ConfluenceComment {
     let history = comment.get("history");
     let storage = comment
         .get("body")
         .and_then(|b| b.get("storage"))
         .and_then(|s| s.get("value"))
         .and_then(Value::as_str);
-    let body_html = storage.map_or_else(String::new, |s| {
-        render_storage(s, COMMENT_MARKDOWN_BUDGET, COMMENT_BODY_CAP, None, hidden).0
-    });
+    let body_html = match storage {
+        Some(s) if render => {
+            let (html, body_notes) =
+                render_storage(s, COMMENT_MARKDOWN_BUDGET, COMMENT_BODY_CAP, None, hidden);
+            notes.merge(body_notes);
+            html
+        }
+        Some(s) => {
+            *hidden = hidden.saturating_add(len_u64(s.len()));
+            String::new()
+        }
+        None => String::new(),
+    };
     *hidden = hidden.saturating_add(comment_unshown_bytes(comment));
     ConfluenceComment {
         id: id_text(comment.get("id"))
@@ -525,7 +665,8 @@ fn comment_view(comment: &Map<String, Value>, depth: u32, hidden: &mut u64) -> C
 
 /// The bytes of a comment its view does not show: every member but a short `id`, the storage
 /// text, the author's display and user names, the creation date and the location. `ancestors`
-/// (the thread places the comment, its entries are not shown) counts in full.
+/// (the thread places the comment, its entries are not shown) counts in full. What the render
+/// drops of the storage text is counted where it is rendered ([`render_storage`]).
 fn comment_unshown_bytes(comment: &Map<String, Value>) -> u64 {
     comment.iter().fold(0u64, |sum, (key, value)| {
         let unshown = match (key.as_str(), value) {
@@ -553,5 +694,214 @@ fn comment_unshown_bytes(comment: &Map<String, Value>) -> u64 {
             _ => pair_bytes(key, value),
         };
         sum.saturating_add(unshown)
+    })
+}
+
+// ---- what the local render drops (T12b review I-1, m-1) -----------------------------------------
+
+/// Which parser reads the server markup the card renders.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Markup {
+    /// Storage XHTML, read by the converter (`storage_to_markdown_within`).
+    Storage,
+    /// `view` HTML, read by `preview::sanitize_html` (an HTML parser).
+    View,
+}
+
+/// What the local render of released server markup leaves out although the agent receives it.
+#[derive(Default)]
+struct Dropped {
+    /// The bytes dropped: comments; in `view` also script and style element content and every
+    /// attribute the sanitizer does not keep.
+    bytes: u64,
+    /// Styling the render does not apply: a `style` attribute or a `<style>` element.
+    styled: bool,
+}
+
+impl Dropped {
+    /// The render stripped something: §6.2 / §6.4 Info `source_formatting_removed`.
+    fn stripped(&self) -> bool {
+        self.bytes > 0 || self.styled
+    }
+
+    fn add(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_add(len_u64(bytes));
+    }
+}
+
+/// What the local render of `markup` drops, read lexically (as `convert::storage_lines` reads
+/// storage), so it works on any input, parsable or not:
+/// - a comment `<!--…-->`; unterminated, it runs to the end in `view` (HTML), while in storage
+///   it is not XML and the converter's fallback shows it as text;
+/// - in storage a CDATA section is text the converter keeps (a code body): nothing inside it
+///   counts;
+/// - in `view`: any other `<!…>` or `<?…>` (HTML reads them as comments); the content of a
+///   `<script>` or `<style>` element up to its end tag (or the end); every attribute
+///   `sanitize_html` does not keep ([`view_keeps`]), from its name to the end of its value.
+///
+/// Storage attributes the converter drops are not counted (T12b fix report); a storage `style`
+/// attribute or `<style>` element still sets `styled`. Pure; never panics.
+fn dropped_markup(markup: &str, kind: Markup) -> Dropped {
+    let mut out = Dropped::default();
+    let mut i = 0;
+    while let Some(off) = markup.get(i..).and_then(|r| r.find('<')) {
+        let at = i + off;
+        let tail = markup.get(at..).unwrap_or("");
+        i = at + 1;
+        if let Some(after) = tail.strip_prefix("<!--") {
+            match after.find("-->") {
+                Some(end) => {
+                    let len = "<!--".len() + end + "-->".len();
+                    out.add(len);
+                    i = at + len;
+                }
+                None if kind == Markup::View => {
+                    out.add(tail.len());
+                    i = markup.len();
+                }
+                None => {}
+            }
+        } else if kind == Markup::Storage
+            && let Some(after) = tail.strip_prefix("<![CDATA[")
+        {
+            i = after.find("]]>").map_or(markup.len(), |end| {
+                at + "<![CDATA[".len() + end + "]]>".len()
+            });
+        } else if kind == Markup::View && (tail.starts_with("<!") || tail.starts_with("<?")) {
+            let len = tail.find('>').map_or(tail.len(), |end| end + 1);
+            out.add(len);
+            i = at + len;
+        } else if tail.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic) {
+            let (name, attrs, len) = start_tag(tail);
+            for (attr, value, bytes) in attrs {
+                out.styled |= attr.eq_ignore_ascii_case("style");
+                if kind == Markup::View && !view_keeps(name, attr, value) {
+                    out.add(bytes);
+                }
+            }
+            i = at + len;
+            out.styled |= name.eq_ignore_ascii_case("style");
+            let raw_text =
+                name.eq_ignore_ascii_case("script") || name.eq_ignore_ascii_case("style");
+            if kind == Markup::View && raw_text {
+                let rest = markup.get(i..).unwrap_or("");
+                let (content, skip) = end_tag(rest, name).unwrap_or((rest.len(), rest.len()));
+                out.add(content);
+                i += skip;
+            }
+        }
+    }
+    out
+}
+
+/// The start tag at the start of `tail` (`<` and a letter): its name, its attributes as
+/// `(name, raw value, bytes)` (from the name to the end of the value, quotes included; an
+/// unterminated quoted value runs to the end), and its length up to and with the `>` that ends
+/// it outside a quoted value (all of `tail` when none does). ASCII whitespace separates, as in
+/// HTML; a `/` between attributes is skipped.
+fn start_tag(tail: &str) -> (&str, Vec<(&str, &str, usize)>, usize) {
+    let space = |c: char| c.is_ascii_whitespace();
+    let rest_at = |p: usize| tail.get(p..).unwrap_or("");
+    let body = rest_at(1);
+    let name_len = body
+        .find(|c: char| space(c) || matches!(c, '/' | '>'))
+        .unwrap_or(body.len());
+    let name = body.get(..name_len).unwrap_or("");
+    let mut attrs = Vec::new();
+    let mut p = 1 + name_len;
+    loop {
+        let rest = rest_at(p);
+        p += rest.len()
+            - rest
+                .trim_start_matches(|c: char| space(c) || c == '/')
+                .len();
+        let rest = rest_at(p);
+        if rest.is_empty() {
+            return (name, attrs, tail.len());
+        }
+        if rest.starts_with('>') {
+            return (name, attrs, p + 1);
+        }
+        let start = p;
+        // An attribute name may start with `=` in HTML: always take one character.
+        let first = rest.chars().next().map_or(1, char::len_utf8);
+        let name_len = rest
+            .get(first..)
+            .and_then(|r| r.find(|c: char| space(c) || matches!(c, '=' | '>' | '/')))
+            .map_or(rest.len(), |n| first + n);
+        let attr = rest.get(..name_len).unwrap_or("");
+        p += name_len;
+        let after = rest_at(p);
+        let gap = after.len() - after.trim_start_matches(space).len();
+        if !after.get(gap..).unwrap_or("").starts_with('=') {
+            attrs.push((attr, "", name_len));
+            continue;
+        }
+        p += gap + 1;
+        let after = rest_at(p);
+        p += after.len() - after.trim_start_matches(space).len();
+        let value = rest_at(p);
+        let (raw, len) = match value.chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let inner = value.get(1..).unwrap_or("");
+                match inner.find(quote) {
+                    Some(end) => (inner.get(..end).unwrap_or(""), end + 2),
+                    None => (inner, value.len()),
+                }
+            }
+            _ => {
+                let end = value
+                    .find(|c: char| space(c) || c == '>')
+                    .unwrap_or(value.len());
+                (value.get(..end).unwrap_or(""), end)
+            }
+        };
+        p += len;
+        attrs.push((attr, raw, p - start));
+    }
+}
+
+/// Where the raw text of a `name` element in `rest` ends: the bytes before its end tag
+/// (`</name` followed by whitespace, `/`, `>` or the end, ASCII case-insensitive), and the
+/// bytes up to and with that tag's `>` (or the end).
+fn end_tag(rest: &str, name: &str) -> Option<(usize, usize)> {
+    rest.match_indices("</").find_map(|(j, _)| {
+        let after = rest.get(j + 2..)?;
+        let named = after.get(..name.len())?.eq_ignore_ascii_case(name);
+        let ends = after
+            .get(name.len()..)?
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_ascii_whitespace() || matches!(c, '/' | '>'));
+        (named && ends).then(|| {
+            let close = rest.get(j..).and_then(|r| r.find('>'));
+            (j, close.map_or(rest.len(), |c| j + c + 1))
+        })
+    })
+}
+
+/// The attributes `preview::sanitize_html` keeps (or shows: a link's URL becomes text), by
+/// element: `img` `alt` and an inline raster `src`, `td`/`th` `colspan`/`rowspan`, `ol` `start`,
+/// `a` `href`. Names compare ASCII case-insensitively.
+fn view_keeps(tag: &str, attr: &str, value: &str) -> bool {
+    let tag = tag.to_ascii_lowercase();
+    let attr = attr.to_ascii_lowercase();
+    match (tag.as_str(), attr.as_str()) {
+        ("img", "alt") | ("td" | "th", "colspan" | "rowspan") | ("ol", "start") | ("a", "href") => {
+            true
+        }
+        ("img", "src") => inline_raster(value),
+        _ => false,
+    }
+}
+
+/// `preview::sanitize_html`'s image rule: only a `data:image/{png,jpeg,gif,webp};base64,`
+/// source survives (compared on the raw value, so an entity-encoded one counts as dropped).
+fn inline_raster(src: &str) -> bool {
+    let src = src.trim_start();
+    ["png", "jpeg", "gif", "webp"].iter().any(|t| {
+        let prefix = format!("data:image/{t};base64,");
+        src.get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(&prefix))
     })
 }

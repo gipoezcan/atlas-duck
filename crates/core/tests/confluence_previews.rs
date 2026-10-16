@@ -318,6 +318,11 @@ async fn s12_view_format_server_html_sanitized() -> TestResult {
     assert!(!card.body_html.contains("class="), "{}", card.body_html);
     assert!(!card.body_html.contains("onclick"), "{}", card.body_html);
     assert!(card.body_html.contains("styled") && card.body_html.contains("link"));
+    // The sanitizer stripped styling and attributes the agent receives (§6.2, §6.4).
+    assert_eq!(
+        ids_at(&preview.warnings, Level::Info),
+        [WarningId::SourceFormattingRemoved]
+    );
     Ok(())
 }
 
@@ -364,6 +369,9 @@ async fn page_history_version_is_a_page_card_and_the_summary_a_tree() -> TestRes
     let card = page_card(&preview.body)?;
     assert_eq!(card.version, Some(3));
     assert_eq!(card.body_html, "<p>Old text.</p>\n");
+    // The historical Markdown release carries its conversion facts too (T12b review m-6).
+    let facts = card.conversion.ok_or("no conversion facts")?;
+    assert!(!facts.lossy && !facts.fallback, "{facts:?}");
     released(&h, &id).await?;
 
     let summary = atlas_duck_registry::get(PAGE_HISTORY)
@@ -775,5 +783,381 @@ fn page_without_its_body_text_keeps_the_json_tree() -> TestResult {
         );
         assert!(model.warnings.is_empty(), "{:?}", model.warnings);
     }
+    Ok(())
+}
+
+/// T12b review m-5: a `view` read whose `body.view` is there but carries no text keeps the JSON
+/// tree, and the server-rendered content in it keeps the Caution.
+#[test]
+fn view_fallback_with_a_view_body_keeps_the_caution() -> TestResult {
+    let mut page = page_with_view("");
+    page["body"]["view"]["value"] = json!({ "not": "text" });
+    let model = model_of(
+        PAGE_GET,
+        &json!({ "id": ID, "format": "view" }),
+        &page,
+        None,
+    )?;
+    assert!(
+        matches!(model.body, PreviewBody::JsonTree { .. }),
+        "{:?}",
+        model.body
+    );
+    assert_eq!(
+        ids_at(&model.warnings, Level::Caution),
+        [WarningId::ServerRenderedView]
+    );
+    Ok(())
+}
+
+// ---- what the local render drops (T12b review I-1, m-1..m-3, m-6, m-7) -----------------------
+
+/// The agent instruction the tests hide in server markup: 35 bytes.
+const AGENT_NOTE: &str = "<!-- instructions for the agent -->";
+
+fn infos(model: &PreviewModel) -> Vec<WarningId> {
+    ids_at(&model.warnings, Level::Info)
+}
+
+/// The page card of `page` read with `format`.
+fn page_model(format: &str, page: &Value) -> Result<PreviewModel, TestError> {
+    model_of(PAGE_GET, &json!({ "id": ID, "format": format }), page, None)
+}
+
+/// I-1, m-1: an HTML comment in released storage reaches the agent, the local render drops it:
+/// its bytes count as hidden, and the Info `source_formatting_removed` says the render stripped
+/// something.
+#[test]
+fn storage_comment_is_counted_hidden_and_flagged() -> TestResult {
+    let plain = page_model("storage", &page_with_storage("<p>LGTM</p>"))?;
+    let noted = page_model(
+        "storage",
+        &page_with_storage(&format!("<p>LGTM</p>{AGENT_NOTE}")),
+    )?;
+    assert_eq!(AGENT_NOTE.len(), 35);
+    assert_eq!(
+        noted.header.hidden_in_preview_bytes - plain.header.hidden_in_preview_bytes,
+        35
+    );
+    let card = page_card(&noted.body)?;
+    assert!(
+        !card.body_html.contains("instructions"),
+        "{}",
+        card.body_html
+    );
+    assert_eq!(infos(&plain), []);
+    assert_eq!(infos(&noted), [WarningId::SourceFormattingRemoved]);
+    assert_eq!(
+        noted
+            .warnings
+            .iter()
+            .find(|w| w.id == WarningId::SourceFormattingRemoved)
+            .map(|w| w.text.as_str()),
+        Some("source formatting removed (hidden/colour styling present)")
+    );
+    // An unterminated comment is not XML: the converter's fallback shows it as text, so it is
+    // not counted.
+    let open = page_model("storage", &page_with_storage("<p>LGTM</p><!-- to the end"))?;
+    assert!(
+        page_card(&open.body)?.body_html.contains("to the end"),
+        "{:?}",
+        open.body
+    );
+    // A CDATA section (a code body) is shown: `<!--` inside it is text, not a comment.
+    let code = r#"<ac:structured-macro ac:name="code"><ac:plain-text-body><![CDATA[<!-- kept -->]]></ac:plain-text-body></ac:structured-macro>"#;
+    let shown = page_model("storage", &page_with_storage(code))?;
+    assert_eq!(infos(&shown), []);
+    assert!(
+        page_card(&shown.body)?.body_html.contains("kept"),
+        "{:?}",
+        shown.body
+    );
+    Ok(())
+}
+
+/// m-1: styling in released storage (a `style` attribute, a `<style>` element) is not applied by
+/// the local render: the Info says so.
+#[test]
+fn storage_styling_raises_source_formatting_removed() -> TestResult {
+    for storage in [
+        r#"<p style="display:none">secret</p>"#,
+        "<style>p { color: white }</style><p>secret</p>",
+    ] {
+        let model = page_model("storage", &page_with_storage(storage))?;
+        assert_eq!(
+            infos(&model),
+            [WarningId::SourceFormattingRemoved],
+            "{storage}"
+        );
+    }
+    Ok(())
+}
+
+/// I-1, m-1: in `view`, comments, script and style content and every attribute the sanitizer
+/// does not keep reach the agent and not the card: each counts as hidden, and the Info is raised.
+/// What the card shows (an allowed attribute, a link's URL, an inline raster image) is not.
+#[test]
+fn view_drops_are_counted_hidden_and_flagged() -> TestResult {
+    let base = page_model("view", &page_with_view("<p>LGTM</p>"))?;
+    assert_eq!(infos(&base), []);
+    let delta = |html: &str| -> Result<(u64, Vec<WarningId>), TestError> {
+        let model = page_model("view", &page_with_view(html))?;
+        Ok((
+            model.header.hidden_in_preview_bytes - base.header.hidden_in_preview_bytes,
+            infos(&model),
+        ))
+    };
+    let flagged = vec![WarningId::SourceFormattingRemoved];
+    assert_eq!(
+        delta(&format!("<p>LGTM</p>{AGENT_NOTE}"))?,
+        (35, flagged.clone())
+    );
+    // HTML ends an unterminated comment at the end of the body: all of it is dropped.
+    assert_eq!(delta("<p>LGTM</p><!-- to the end")?, (15, flagged.clone()));
+    // `title="ignore prior"`: 20 bytes.
+    assert_eq!(
+        delta(r#"<p title="ignore prior">LGTM</p>"#)?,
+        (20, flagged.clone())
+    );
+    // Script and style content (`steal()`, `p{display:none}`).
+    assert_eq!(
+        delta("<p>LGTM</p><script>steal()</script>")?,
+        (7, flagged.clone())
+    );
+    assert_eq!(
+        delta("<style>p{display:none}</style><p>LGTM</p>")?,
+        (15, flagged.clone())
+    );
+    // A remote image source is dropped: `src="https://evil.example/x.png"`, 32 bytes.
+    assert_eq!(
+        delta(r#"<p>LGTM</p><img src="https://evil.example/x.png">"#)?,
+        (32, flagged.clone())
+    );
+    // Kept or shown: `colspan`, `alt`, an inline raster `src`, a link's URL (shown as text).
+    for kept in [
+        r#"<p>LGTM</p><table><tr><td colspan="2">c</td></tr></table>"#,
+        r#"<p>LGTM</p><img alt="a" src="data:image/png;base64,AAAA">"#,
+        r#"<p>LGTM <a href="https://example.com/x">x</a></p>"#,
+        "<p>LGTM</p><ol start=\"3\"><li>x</li></ol>",
+    ] {
+        let (bytes, warnings) = delta(kept)?;
+        assert_eq!(warnings, [], "{kept}");
+        // The shown text itself grows the candidate, never the hidden count.
+        assert_eq!(bytes, 0, "{kept}");
+    }
+    Ok(())
+}
+
+/// I-1, m-1, m-2: comment bodies (released as storage, PD-103) count a dropped comment as hidden,
+/// and the thread raises each Info once.
+#[test]
+fn comment_drops_and_macros_raise_one_info_each() -> TestResult {
+    let plain = comment_page(vec![
+        comment("1", &[], None, "<p>LGTM</p>"),
+        comment("2", &[], None, "<p>ok</p>"),
+    ]);
+    let noted = comment_page(vec![
+        comment("1", &[], None, &format!("<p>LGTM</p>{AGENT_NOTE}")),
+        comment("2", &[], None, "<p>ok</p>"),
+    ]);
+    let params = json!({ "id": ID });
+    let plain = model_of(COMMENT_LIST, &params, &plain, None)?;
+    let noted = model_of(COMMENT_LIST, &params, &noted, None)?;
+    assert_eq!(
+        noted.header.hidden_in_preview_bytes - plain.header.hidden_in_preview_bytes,
+        35
+    );
+    assert_eq!(infos(&plain), []);
+    assert_eq!(infos(&noted), [WarningId::SourceFormattingRemoved]);
+
+    let macros = comment_page(vec![
+        comment(
+            "1",
+            &[],
+            None,
+            r#"<ac:structured-macro ac:name="jira"/><!-- a -->"#,
+        ),
+        comment(
+            "2",
+            &[],
+            None,
+            r#"<ac:structured-macro ac:name="include"/><!-- b -->"#,
+        ),
+        comment("3", &[], None, r#"<ac:structured-macro ac:name="toc"/>"#),
+    ]);
+    let model = model_of(COMMENT_LIST, &params, &macros, None)?;
+    assert_eq!(
+        infos(&model),
+        [WarningId::UnknownMacros, WarningId::SourceFormattingRemoved]
+    );
+    // A known macro alone raises nothing.
+    let known = comment_page(vec![comment(
+        "3",
+        &[],
+        None,
+        r#"<ac:structured-macro ac:name="toc"/>"#,
+    )]);
+    assert_eq!(infos(&model_of(COMMENT_LIST, &params, &known, None)?), []);
+    Ok(())
+}
+
+/// m-3, m-6: a storage page whose Markdown passes the 1 MiB budget is not rendered; its bytes
+/// count as hidden, the label stays first, and its unknown macro still raises the Info.
+#[test]
+fn storage_too_large_is_not_rendered_and_keeps_the_info() -> TestResult {
+    let storage = format!(
+        "<p>{}</p><ac:structured-macro ac:name=\"jira\"/>",
+        "Lorem ipsum dolor sit amet. ".repeat(55_000)
+    );
+    assert!(storage.len() > 1_500_000);
+    let model = page_model("storage", &page_with_storage(&storage))?;
+    let card = page_card(&model.body)?;
+    assert!(
+        card.body_html
+            .starts_with("<p><strong>rendered locally from storage</strong></p>"),
+        "label not first"
+    );
+    assert!(card.body_html.contains("bytes not rendered here (see Raw)"));
+    assert!(model.header.hidden_in_preview_bytes >= storage.len() as u64);
+    assert_eq!(infos(&model), [WarningId::UnknownMacros]);
+    // A known macro alone raises nothing.
+    let known = format!(
+        "<p>{}</p><ac:structured-macro ac:name=\"toc\"/>",
+        "Lorem ipsum dolor sit amet. ".repeat(55_000)
+    );
+    assert_eq!(
+        infos(&page_model("storage", &page_with_storage(&known))?),
+        []
+    );
+    Ok(())
+}
+
+/// m-6: a `view` body over the 256 KiB cap is cut before sanitizing, here inside a tag: the card
+/// says so, stays inert, and counts the cut bytes (the attribute's kept part counts once).
+#[test]
+fn view_cut_inside_a_tag_is_inert_and_counted() -> TestResult {
+    let cap = 256 * 1024;
+    let lead = format!("<p>{}</p>", "a".repeat(cap - 20));
+    let html = format!(
+        "{lead}<img src=\"https://evil.example/{}.png\"><p>tail</p>",
+        "x".repeat(64)
+    );
+    assert!(lead.len() < cap && html.len() > cap);
+    let model = page_model("view", &page_with_view(&html))?;
+    let card = page_card(&model.body)?;
+    assert_inert(card.body_html);
+    let cut = (html.len() - cap) as u64;
+    assert!(
+        card.body_html
+            .ends_with(&format!("<p>… {cut} more bytes (see Raw)</p>")),
+        "{}",
+        card.body_html
+            .get(card.body_html.len().saturating_sub(200)..)
+            .unwrap_or("")
+    );
+    assert!(!card.body_html.contains("tail"));
+    let base = page_model("view", &page_with_view("<p>a</p>"))?;
+    let page_bytes = html.len() as u64 - "<p>a</p>".len() as u64;
+    let hidden = model.header.hidden_in_preview_bytes - base.header.hidden_in_preview_bytes;
+    // The cut part, plus the kept part of the dropped `src` attribute, never more than the body.
+    assert!(
+        hidden > cut && hidden < page_bytes,
+        "{hidden} {cut} {page_bytes}"
+    );
+    Ok(())
+}
+
+/// m-6: each comment body is rendered up to 16 KiB of Markdown and converted within 64 KiB.
+#[test]
+fn comment_render_caps() -> TestResult {
+    let page = comment_page(vec![
+        comment("1", &[], None, &format!("<p>{}</p>", "word ".repeat(5_000))),
+        comment(
+            "2",
+            &[],
+            None,
+            &format!("<p>{}</p>", "word ".repeat(20_000)),
+        ),
+    ]);
+    let model = model_of(COMMENT_LIST, &json!({ "id": ID }), &page, None)?;
+    let comments = thread(&model.body)?;
+    let [cut, large] = comments else {
+        return Err("two comments expected".into());
+    };
+    assert!(
+        cut.body_html.contains("more bytes (see Raw)"),
+        "cut not said"
+    );
+    assert!(cut.body_html.len() < 20_000);
+    assert!(
+        large
+            .body_html
+            .contains("bytes not rendered here (see Raw)"),
+        "{}",
+        large.body_html
+    );
+    // The second body's storage, and the first one's Markdown past 16 KiB.
+    assert!(model.header.hidden_in_preview_bytes >= 100_000 + 8_000);
+    Ok(())
+}
+
+/// m-6: `page.history` with a `version` read with `format=view` is a view card under the Caution.
+#[test]
+fn page_history_version_view_has_the_caution() -> TestResult {
+    let model = model_of(
+        PAGE_HISTORY,
+        &json!({ "id": ID, "version": 3, "format": "view" }),
+        &page_with_view("<p>Old.</p>"),
+        None,
+    )?;
+    let card = page_card(&model.body)?;
+    assert_eq!(card.format, "view");
+    assert_eq!(card.body_html, "<p>Old.</p>");
+    assert_eq!(
+        ids_at(&model.warnings, Level::Caution),
+        [WarningId::ServerRenderedView]
+    );
+    Ok(())
+}
+
+/// m-7: the renderer shows at most 2 000 comments; core renders the bodies of those only and
+/// counts the bodies of the rest as hidden (the renderer notes them as more comments).
+#[test]
+fn comments_past_the_display_cap_are_not_rendered() -> TestResult {
+    let rows = atlas_duck_preview::render::DOC_MAX_ROWS;
+    let comments: Vec<Value> = (0..=rows)
+        .map(|n| comment(&format!("{}", n + 1), &[], None, "<p>body text</p>"))
+        .collect();
+    let model = model_of(
+        COMMENT_LIST,
+        &json!({ "id": ID }),
+        &comment_page(comments),
+        None,
+    )?;
+    let shown = thread(&model.body)?;
+    assert_eq!(shown.len(), rows + 1);
+    assert!(
+        shown
+            .iter()
+            .take(rows)
+            .all(|c| c.body_html == "<p>body text</p>\n")
+    );
+    let last = shown.last().ok_or("no comment")?;
+    assert_eq!(last.body_html, "");
+    assert_eq!(last.id, format!("{}", rows + 1));
+    // That body's storage (`<p>body text</p>`, 16 bytes) is counted.
+    let fewer: Vec<Value> = (0..rows)
+        .map(|n| comment(&format!("{}", n + 1), &[], None, "<p>body text</p>"))
+        .collect();
+    let fewer = model_of(
+        COMMENT_LIST,
+        &json!({ "id": ID }),
+        &comment_page(fewer),
+        None,
+    )?;
+    assert!(
+        model.header.hidden_in_preview_bytes
+            >= fewer.header.hidden_in_preview_bytes + "<p>body text</p>".len() as u64
+    );
     Ok(())
 }
