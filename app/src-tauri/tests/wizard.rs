@@ -10,6 +10,8 @@
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -266,7 +268,8 @@ struct TestStarter {
     host: &'static str,
     keys: Arc<RecordingKeys>,
     confirmer: Arc<Answers>,
-    root: PathBuf,
+    /// The machine's [`Machine::sock_base`].
+    sock_base: PathBuf,
     /// The start never ends (a store still opening).
     idle: bool,
     /// What the wizard's `in_flight` was each time a start began.
@@ -281,7 +284,7 @@ impl TestStarter {
         lock: Arc<InstanceLock>,
         pinned: &PinnedPaths,
     ) -> Result<StartInputs, Box<dyn std::error::Error>> {
-        let location = location(&self.root, &data, self.host)?;
+        let location = location(&self.sock_base, &data, self.host)?;
         let quit = app
             .try_state::<ServeSlot>()
             .map(|s| s.quit().clone())
@@ -356,18 +359,16 @@ impl ServeStarter<MockRuntime> for TestStarter {
 
 #[cfg(unix)]
 fn location(
-    root: &Path,
+    sock_base: &Path,
     _data: &LocalDataDir,
     _host: &str,
 ) -> Result<EndpointLocation, Box<dyn std::error::Error>> {
-    let dir = root.join("s");
-    paths::ensure_socket_dir(&dir)?;
-    Ok(EndpointLocation::UnixSocket(dir.join("atlas-duck.sock")))
+    common::socket_location(sock_base)
 }
 
 #[cfg(windows)]
 fn location(
-    _root: &Path,
+    _sock_base: &Path,
     data: &LocalDataDir,
     host: &str,
 ) -> Result<EndpointLocation, Box<dyn std::error::Error>> {
@@ -388,6 +389,11 @@ fn same_user() -> Result<atlas_duck_ipc::transport::windows::SameUser, Box<dyn s
 struct Machine {
     host: &'static str,
     root: PathBuf,
+    /// Where the endpoint lives (Unix: `<sock_base>/s/`, a short dir outside the scratch dir,
+    /// [`common::short_socket_base`]; Windows: unused, the pipe name comes from the data dir).
+    sock_base: PathBuf,
+    /// Unix: holds [`Machine::sock_base`] until the machine is dropped.
+    _sock: Option<tempfile::TempDir>,
     pinned_file: PathBuf,
     default_dir: PathBuf,
     config_dir: PathBuf,
@@ -420,8 +426,17 @@ impl Machine {
                 dir
             }
         };
+        #[cfg(unix)]
+        let sock = Some(common::short_socket_base()?);
+        #[cfg(windows)]
+        let sock: Option<tempfile::TempDir> = None;
+        let sock_base = sock
+            .as_ref()
+            .map_or_else(|| root.clone(), |s| s.path().to_path_buf());
         Ok(Machine {
             host,
+            sock_base,
+            _sock: sock,
             pinned_file: root.join("home").join("paths.toml"),
             default_dir: root.join("data"),
             config_dir,
@@ -449,7 +464,7 @@ impl Machine {
             host: self.host,
             keys: self.keys.clone(),
             confirmer: self.confirmer.clone(),
-            root: self.root.clone(),
+            sock_base: self.sock_base.clone(),
             idle: self.idle_start,
             in_flight_at_start: self.in_flight_at_start.clone(),
         })
@@ -546,7 +561,7 @@ async fn connect(
         agent_name_source: AgentNameSource::Flag,
         cwd_basename: "work".into(),
     };
-    let location = location(&m.root, data, m.host)?;
+    let location = location(&m.sock_base, data, m.host)?;
     IpcClient::connect_at(
         &location,
         data,

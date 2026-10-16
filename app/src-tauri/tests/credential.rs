@@ -8,6 +8,8 @@
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+mod common;
+
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -456,20 +458,13 @@ impl World {
     }
 }
 
-/// The socket lives under a short base, not the scratch dir: `sun_path` holds 104 bytes on macOS
-/// and the scratch dir under a CI checkout's `target/tmp` is longer than that. Production picks
-/// its own short dir (`socket_dir`) and refuses one that does not fit; nothing there is relaxed.
+/// The socket lives under a short base, not the scratch dir ([`common::short_socket_base`]).
 #[cfg(unix)]
 fn location(
     _data: &LocalDataDir,
 ) -> Result<(EndpointLocation, Option<tempfile::TempDir>), Box<dyn std::error::Error>> {
-    let base = tempfile::Builder::new().prefix("ad").tempdir_in("/tmp")?;
-    let dir = base.path().join("s");
-    atlas_duck_ipc::paths::ensure_socket_dir(&dir)?;
-    Ok((
-        EndpointLocation::UnixSocket(dir.join("atlas-duck.sock")),
-        Some(base),
-    ))
+    let base = common::short_socket_base()?;
+    Ok((common::socket_location(base.path())?, Some(base)))
 }
 
 #[cfg(windows)]
