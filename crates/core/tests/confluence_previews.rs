@@ -890,6 +890,21 @@ fn storage_styling_raises_source_formatting_removed() -> TestResult {
             "{storage}"
         );
     }
+    // Unlike the sanitizer (`view`), the converter shows script and style element content as
+    // text: in storage it is not dropped, so not counted.
+    let base = page_model("storage", &page_with_storage("<p>secret</p>"))?;
+    let script = "<p>secret</p><script>steal()</script><style>p { color: white }</style>";
+    let model = page_model("storage", &page_with_storage(script))?;
+    let card = page_card(&model.body)?;
+    assert!(
+        card.body_html.contains("steal()") && card.body_html.contains("color: white"),
+        "{}",
+        card.body_html
+    );
+    assert_eq!(
+        model.header.hidden_in_preview_bytes,
+        base.header.hidden_in_preview_bytes
+    );
     Ok(())
 }
 
