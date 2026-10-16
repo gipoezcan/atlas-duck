@@ -2,9 +2,9 @@
 //! spawners, and their hand-over to the bridge ([`WorkerIo`], Δ2).
 //!
 //! - [`StderrDrain`] (every OS): reads the worker's stderr to EOF so the worker
-//!   never blocks on it (§3.4), keeping the head or the tail.
-//!   [`StderrDrain::hand_over`] turns what it kept plus everything it reads from
-//!   then on into a byte stream.
+//!   never blocks on it (§3.4), keeping the head (and on macOS the tail).
+//!   [`StderrDrain::hand_over`] turns the head, the kept bytes first, into a
+//!   byte stream capped at the head size; the thread discards the rest.
 //! - `ChunkReader` (Windows, macOS): a pipe read has no timeout there, so one
 //!   thread forwards raw stdout chunks through a bounded channel and
 //!   `next_frame` assembles frames with a deadline over the whole frame (a
@@ -24,7 +24,8 @@ use std::thread::{self, JoinHandle};
 
 /// Size of one raw read from a worker pipe.
 const READ_CHUNK: usize = 16 * 1024;
-/// Chunks buffered between a reader thread and its consumer (1 MiB).
+/// Chunks buffered between the stdout reader thread and its consumer (1 MiB).
+#[cfg(any(windows, target_os = "macos"))]
 const CHANNEL_CHUNKS: usize = 64;
 
 /// What a reader thread forwards.
@@ -78,34 +79,76 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Which bytes of stderr a [`StderrDrain`] keeps before a hand-over.
+/// Which bytes of stderr a [`StderrDrain`] keeps.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum Keep {
-    /// The first n bytes (§3.4: 64 KiB; Linux, Windows).
+pub(crate) struct Keep {
+    /// The first `head` bytes: [`StderrDrain::kept`], and the cap of the
+    /// handed-over stream (§3.4: 64 KiB).
+    head: usize,
+    /// The last `tail` bytes, for [`StderrDrain::tail`] (macOS: 4 KiB, where
+    /// the `sandbox_init` error text is); 0 keeps no tail.
+    tail: usize,
+}
+
+impl Keep {
+    /// The first `head` bytes (Linux, Windows).
     #[cfg_attr(target_os = "macos", allow(dead_code))]
-    Head(usize),
-    /// The last n bytes (macOS: 4 KiB, where the `sandbox_init` error text is).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Tail(usize),
+    pub(crate) const fn head(head: usize) -> Keep {
+        Keep { head, tail: 0 }
+    }
+
+    /// The first `head` bytes and the last `tail` bytes (macOS).
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+    pub(crate) const fn head_and_tail(head: usize, tail: usize) -> Keep {
+        Keep { head, tail }
+    }
+}
+
+/// What a [`StderrDrain`] kept before a hand-over.
+#[derive(Default)]
+struct Kept {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+}
+
+impl Kept {
+    fn add(&mut self, bytes: &[u8], keep: Keep) {
+        let room = keep.head.saturating_sub(self.head.len());
+        self.head.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        if keep.tail > 0 {
+            self.tail.extend_from_slice(bytes);
+            if self.tail.len() > keep.tail {
+                let excess = self.tail.len() - keep.tail;
+                self.tail.drain(..excess);
+            }
+        }
+    }
 }
 
 /// Where the drain thread puts the next chunk.
 enum Sink {
     /// Before the hand-over: keep per [`Keep`].
-    Keep(Vec<u8>),
-    /// After the hand-over: forward to the [`ChannelRead`].
-    Forward(mpsc::SyncSender<Chunk>),
+    Keep(Kept),
+    /// After the hand-over: forward to the [`ChannelRead`] while the stream
+    /// has `left` bytes of room, discard the rest, and send the EOF at the
+    /// worker's EOF. Unbounded: at most `head` bytes ever go through it.
+    Forward {
+        tx: mpsc::Sender<Chunk>,
+        left: usize,
+    },
     /// The stream was dropped: read and discard.
     Discard,
     /// The thread reached EOF before any hand-over; what it kept.
-    Ended(Vec<u8>),
+    Ended(Kept),
 }
 
 /// Drains a worker's stderr on a thread of its own (§3.4: read continuously,
-/// keep a capped part, discard the rest).
+/// keep a capped part, discard the rest). The cap holds after a hand-over too,
+/// so the worker never blocks on stderr whatever the stream's reader does.
 pub(crate) struct StderrDrain {
     sink: Arc<Mutex<Sink>>,
     thread: Option<JoinHandle<()>>,
+    keep: Keep,
 }
 
 impl StderrDrain {
@@ -115,7 +158,7 @@ impl StderrDrain {
         keep: Keep,
         name: &str,
     ) -> io::Result<StderrDrain> {
-        let sink = Arc::new(Mutex::new(Sink::Keep(Vec::new())));
+        let sink = Arc::new(Mutex::new(Sink::Keep(Kept::default())));
         let shared = Arc::clone(&sink);
         let thread = thread::Builder::new()
             .name(name.to_string())
@@ -123,15 +166,27 @@ impl StderrDrain {
         Ok(StderrDrain {
             sink,
             thread: Some(thread),
+            keep,
         })
     }
 
-    /// The bytes kept so far (empty after a hand-over). For test diagnostics;
-    /// never logged.
+    /// The first bytes kept so far, at most `head` (empty after a hand-over).
+    /// For test diagnostics; never logged.
+    #[cfg_attr(all(not(test), target_os = "macos"), allow(dead_code))]
     pub(crate) fn kept(&self) -> Vec<u8> {
         match &*lock(&self.sink) {
-            Sink::Keep(kept) | Sink::Ended(kept) => kept.clone(),
-            Sink::Forward(_) | Sink::Discard => Vec::new(),
+            Sink::Keep(kept) | Sink::Ended(kept) => kept.head.clone(),
+            Sink::Forward { .. } | Sink::Discard => Vec::new(),
+        }
+    }
+
+    /// The last bytes kept so far, at most `tail` (empty after a hand-over or
+    /// without a tail). For diagnostics; never logged.
+    #[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
+    pub(crate) fn tail(&self) -> Vec<u8> {
+        match &*lock(&self.sink) {
+            Sink::Keep(kept) | Sink::Ended(kept) => kept.tail.clone(),
+            Sink::Forward { .. } | Sink::Discard => Vec::new(),
         }
     }
 
@@ -144,20 +199,23 @@ impl StderrDrain {
         }
     }
 
-    /// Hands the reader over: the bytes kept so far, then every chunk the
-    /// thread reads from now on. The thread keeps running (detached); once the
-    /// returned stream is dropped it discards.
+    /// Hands the reader over: the first `head` bytes of stderr, contiguous
+    /// (those kept so far, then those the thread reads from now on), then EOF
+    /// at the worker's EOF. The thread keeps running (detached) and discards
+    /// what is past the cap, or everything once the stream is dropped.
     pub(crate) fn hand_over(&mut self) -> ChannelRead {
-        let (tx, rx) = mpsc::sync_channel(CHANNEL_CHUNKS);
+        let (tx, rx) = mpsc::channel();
         let mut sink = lock(&self.sink);
         let (kept, done) = match std::mem::replace(&mut *sink, Sink::Discard) {
             Sink::Keep(kept) => {
-                *sink = Sink::Forward(tx);
-                (kept, false)
+                // While the head had room, it holds every byte read so far.
+                let left = self.keep.head.saturating_sub(kept.head.len());
+                *sink = Sink::Forward { tx, left };
+                (kept.head, false)
             }
             // EOF already reached: the stream ends after the kept bytes.
-            Sink::Ended(kept) => (kept, true),
-            Sink::Forward(_) | Sink::Discard => (Vec::new(), true),
+            Sink::Ended(kept) => (kept.head, true),
+            Sink::Forward { .. } | Sink::Discard => (Vec::new(), true),
         };
         drop(sink);
         self.thread = None;
@@ -183,22 +241,27 @@ fn drain(mut stderr: impl Read, sink: &Mutex<Sink>, keep: Keep) {
                 break;
             }
         };
-        // The decision is taken under the lock, the send outside it: a full
-        // channel blocks only this thread, never `hand_over` or `kept`.
+        // At most `head` bytes are ever forwarded, so the unbounded channel
+        // holds at most that much and a send never waits for the stream's
+        // reader: the worker never blocks on stderr, read or not.
         let forward = match &mut *lock(sink) {
             Sink::Keep(kept) => {
-                keep_bytes(kept, &chunk[..n], keep);
+                kept.add(&chunk[..n], keep);
                 None
             }
-            Sink::Forward(tx) => Some(tx.clone()),
+            Sink::Forward { tx, left } => {
+                let take = n.min(*left);
+                *left -= take;
+                (take > 0).then(|| (tx.clone(), take))
+            }
             Sink::Discard | Sink::Ended(_) => None,
         };
-        if let Some(tx) = forward
-            && tx.send(Chunk::Data(chunk[..n].to_vec())).is_err()
+        if let Some((tx, take)) = forward
+            && tx.send(Chunk::Data(chunk[..take].to_vec())).is_err()
         {
             // The stream was dropped: keep draining so the worker never blocks.
             let mut sink = lock(sink);
-            if matches!(*sink, Sink::Forward(_)) {
+            if matches!(*sink, Sink::Forward { .. }) {
                 *sink = Sink::Discard;
             }
         }
@@ -210,7 +273,7 @@ fn drain(mut stderr: impl Read, sink: &Mutex<Sink>, keep: Keep) {
                 *sink = Sink::Ended(kept);
                 None
             }
-            Sink::Forward(tx) => Some(tx),
+            Sink::Forward { tx, .. } => Some(tx),
             other => {
                 *sink = other;
                 None
@@ -219,22 +282,6 @@ fn drain(mut stderr: impl Read, sink: &Mutex<Sink>, keep: Keep) {
     };
     if let Some(tx) = forward {
         let _ = tx.send(failed.map_or(Chunk::Eof, Chunk::Failed));
-    }
-}
-
-fn keep_bytes(kept: &mut Vec<u8>, bytes: &[u8], keep: Keep) {
-    match keep {
-        Keep::Head(cap) => {
-            let room = cap.saturating_sub(kept.len());
-            kept.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        }
-        Keep::Tail(cap) => {
-            kept.extend_from_slice(bytes);
-            if kept.len() > cap {
-                let excess = kept.len() - cap;
-                kept.drain(..excess);
-            }
-        }
     }
 }
 
@@ -562,6 +609,215 @@ mod chunks {
             assert_eq!(stream.read(&mut buf).ok(), Some(0));
         }
 
+        /// The Windows stdout reader of M1 (`windows::pipes::FrameReader`,
+        /// replaced by `ChunkReader` in M8 T6 because the split needs raw
+        /// bytes), kept verbatim apart from the generic reader: the oracle for
+        /// what the probe runner sees from `read_frame_timeout` (m-4).
+        mod m1_frame_reader {
+            use std::io::{self, Read};
+            use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+            use std::time::Duration;
+
+            use atlas_duck_ipc::sandbox::WORKER_FRAME_MAX_BYTES;
+            use atlas_duck_ipc::sandbox::frame::{FrameError, read_frame};
+
+            enum FrameEvent {
+                Frame(Vec<u8>),
+                Eof,
+                Invalid,
+                Io(io::ErrorKind, String),
+            }
+
+            pub(super) struct FrameReader {
+                rx: Receiver<FrameEvent>,
+            }
+
+            impl FrameReader {
+                pub(super) fn start(mut stdout: impl Read + Send + 'static) -> io::Result<Self> {
+                    let (tx, rx) = channel();
+                    std::thread::Builder::new()
+                        .name("m1-frame-reader".into())
+                        .spawn(move || {
+                            loop {
+                                let event = match read_frame(&mut stdout, WORKER_FRAME_MAX_BYTES) {
+                                    Ok(Some(payload)) => FrameEvent::Frame(payload),
+                                    Ok(None) => FrameEvent::Eof,
+                                    Err(FrameError::TooLarge { .. } | FrameError::Truncated) => {
+                                        FrameEvent::Invalid
+                                    }
+                                    Err(FrameError::Io(e)) => {
+                                        FrameEvent::Io(e.kind(), e.to_string())
+                                    }
+                                };
+                                let last = !matches!(event, FrameEvent::Frame(_));
+                                if tx.send(event).is_err() || last {
+                                    break;
+                                }
+                            }
+                        })?;
+                    Ok(Self { rx })
+                }
+
+                pub(super) fn recv(
+                    &mut self,
+                    max: usize,
+                    d: Duration,
+                ) -> io::Result<Option<Vec<u8>>> {
+                    match self.rx.recv_timeout(d) {
+                        Ok(FrameEvent::Frame(p)) if p.len() > max => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "worker frame larger than the allowed maximum",
+                        )),
+                        Ok(FrameEvent::Frame(p)) => Ok(Some(p)),
+                        Ok(FrameEvent::Eof) | Err(RecvTimeoutError::Disconnected) => Ok(None),
+                        Ok(FrameEvent::Invalid) => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "oversize or truncated worker frame",
+                        )),
+                        Ok(FrameEvent::Io(kind, msg)) => Err(io::Error::new(kind, msg)),
+                        Err(RecvTimeoutError::Timeout) => Err(io::ErrorKind::TimedOut.into()),
+                    }
+                }
+            }
+        }
+
+        /// One step of a scripted worker stdout.
+        enum Step {
+            Write(Vec<u8>),
+            Close,
+            Read(Duration),
+        }
+
+        /// What one `read_frame_timeout` call returned, as far as a caller can
+        /// tell (the probe runner matches on these; messages are not used).
+        #[derive(Debug, PartialEq)]
+        enum Seen {
+            Frame(Vec<u8>),
+            Eof,
+            Error(io::ErrorKind),
+        }
+
+        fn seen(r: io::Result<Option<Vec<u8>>>) -> Seen {
+            match r {
+                Ok(Some(p)) => Seen::Frame(p),
+                Ok(None) => Seen::Eof,
+                Err(e) => Seen::Error(e.kind()),
+            }
+        }
+
+        /// Plays `steps` against one reader: the writes and the close run on a
+        /// writer thread of their own (a large frame fills the pipe), the reads
+        /// here. The writer thread is not joined: it ends once the reader's
+        /// end closes.
+        fn play(
+            pw: io::PipeWriter,
+            steps: &[Step],
+            mut read: impl FnMut(Duration) -> io::Result<Option<Vec<u8>>>,
+        ) -> Vec<Seen> {
+            let (tx, rx) = mpsc::channel::<Option<Vec<u8>>>();
+            thread::spawn(move || {
+                let mut pw = Some(pw);
+                for cmd in rx {
+                    match (cmd, pw.as_mut()) {
+                        (Some(bytes), Some(w)) => {
+                            let _ = io::Write::write_all(w, &bytes);
+                        }
+                        (None, _) => pw = None,
+                        (Some(_), None) => {}
+                    }
+                }
+            });
+            let mut out = Vec::new();
+            for step in steps {
+                match step {
+                    Step::Write(bytes) => {
+                        let _ = tx.send(Some(bytes.clone()));
+                    }
+                    Step::Close => {
+                        let _ = tx.send(None);
+                    }
+                    Step::Read(d) => out.push(seen(read(*d))),
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn the_probe_runner_sees_what_the_m1_frame_reader_showed() -> io::Result<()> {
+            use atlas_duck_ipc::sandbox::WORKER_FRAME_MAX_BYTES as WMAX;
+
+            let mut two = frame(b"probe.ready");
+            two.extend(frame(b"probe.result"));
+            let big = frame(&vec![0x5A; WMAX]);
+            let late = frame(b"late frame");
+            let mut oversize = u32::try_from(WMAX + 1)
+                .unwrap_or(u32::MAX)
+                .to_be_bytes()
+                .to_vec();
+            oversize.extend_from_slice(b"xyz");
+            let mut truncated = frame(b"abcdef");
+            truncated.truncate(7);
+            let scripts: Vec<(&str, Vec<Step>)> = vec![
+                (
+                    "ready, result, EOF",
+                    vec![
+                        Step::Write(two),
+                        Step::Close,
+                        Step::Read(LONG),
+                        Step::Read(LONG),
+                        Step::Read(LONG),
+                    ],
+                ),
+                ("EOF at once", vec![Step::Close, Step::Read(LONG)]),
+                (
+                    "zero-length frame",
+                    vec![Step::Write(frame(b"")), Step::Read(LONG)],
+                ),
+                (
+                    "a frame of exactly the limit",
+                    vec![Step::Write(big), Step::Read(LONG)],
+                ),
+                (
+                    "a header over the limit, worker still running",
+                    vec![Step::Write(oversize), Step::Read(LONG)],
+                ),
+                (
+                    "EOF inside the payload",
+                    vec![Step::Write(truncated), Step::Close, Step::Read(LONG)],
+                ),
+                (
+                    "EOF inside the header",
+                    vec![Step::Write(vec![0, 0]), Step::Close, Step::Read(LONG)],
+                ),
+                (
+                    "silence, then the frame",
+                    vec![
+                        Step::Write(late[..6].to_vec()),
+                        Step::Read(SHORT),
+                        Step::Write(late[6..].to_vec()),
+                        Step::Read(LONG),
+                    ],
+                ),
+                (
+                    "one byte per write",
+                    late.iter()
+                        .map(|b| Step::Write(vec![*b]))
+                        .chain([Step::Read(LONG)])
+                        .collect(),
+                ),
+            ];
+            for (name, steps) in &scripts {
+                let (pr, pw) = io::pipe()?;
+                let mut m1 = m1_frame_reader::FrameReader::start(pr)?;
+                let expected = play(pw, steps, |d| m1.recv(WMAX, d));
+                let (pr, pw) = io::pipe()?;
+                let mut now = ChunkReader::spawn(pr, "test-chunks")?;
+                let got = play(pw, steps, |d| now.next_frame(WMAX, d));
+                assert_eq!(got, expected, "{name}");
+            }
+            Ok(())
+        }
+
         #[test]
         fn the_thread_forwards_a_real_pipe() -> io::Result<()> {
             let (pr, mut pw) = io::pipe()?;
@@ -598,33 +854,114 @@ mod tests {
         }
     }
 
+    /// How long a test waits for a write or a read that must not block.
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// Runs `f` on a thread of its own and returns its result, or `TimedOut`
+    /// once [`BOUND`] has passed (the thread is left behind, the test fails
+    /// instead of hanging).
+    fn within<T: Send + 'static>(
+        f: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(BOUND)
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "blocked"))?
+    }
+
     #[test]
     fn the_head_is_kept_and_the_rest_drained() -> io::Result<()> {
         let (pr, mut pw) = io::pipe()?;
-        let mut d = StderrDrain::start(pr, Keep::Head(64 * 1024), "test-err")?;
+        let mut d = StderrDrain::start(pr, Keep::head(64 * 1024), "test-err")?;
         // more than a pipe holds: without the drain this write would block
         pw.write_all(&vec![b'e'; 200_000])?;
         drop(pw);
         d.join();
         assert_eq!(d.kept(), vec![b'e'; 64 * 1024]);
+        assert!(d.tail().is_empty(), "no tail kept");
         Ok(())
     }
 
     #[test]
-    fn the_tail_is_kept() -> io::Result<()> {
+    fn the_tail_is_kept_next_to_the_head() -> io::Result<()> {
         let (pr, mut pw) = io::pipe()?;
-        let mut d = StderrDrain::start(pr, Keep::Tail(4), "test-err")?;
+        let mut d = StderrDrain::start(pr, Keep::head_and_tail(3, 4), "test-err")?;
         pw.write_all(b"0123456789")?;
         drop(pw);
         d.join();
-        assert_eq!(d.kept(), b"6789");
+        assert_eq!(d.tail(), b"6789");
+        assert_eq!(d.kept(), b"012");
+        Ok(())
+    }
+
+    #[test]
+    fn the_stream_is_exactly_the_head_when_handed_over_below_the_cap() -> io::Result<()> {
+        let (pr, mut pw) = io::pipe()?;
+        let mut d = StderrDrain::start(pr, Keep::head(8), "test-err")?;
+        pw.write_all(b"0123")?;
+        wait_kept(&d, 4);
+        let stream = d.hand_over();
+        pw.write_all(b"456789abcdef")?;
+        drop(pw);
+        assert_eq!(within(move || read_all(stream))?, b"01234567");
+        Ok(())
+    }
+
+    #[test]
+    fn the_stream_is_the_head_without_a_gap_when_handed_over_past_the_cap() -> io::Result<()> {
+        // macOS keeps the tail for its diagnostics; the stream is still the
+        // head, never the tail or a piece after a gap.
+        let (pr, mut pw) = io::pipe()?;
+        let mut d = StderrDrain::start(pr, Keep::head_and_tail(8, 4), "test-err")?;
+        pw.write_all(b"0123456789abcdef")?;
+        let deadline = Instant::now() + BOUND;
+        while d.tail() != b"cdef" && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(d.tail(), b"cdef");
+        let stream = d.hand_over();
+        pw.write_all(b"XYZ")?;
+        drop(pw);
+        assert_eq!(within(move || read_all(stream))?, b"01234567");
+        Ok(())
+    }
+
+    #[test]
+    fn an_unread_stream_does_not_block_the_worker() -> io::Result<()> {
+        let (pr, mut pw) = io::pipe()?;
+        let mut d = StderrDrain::start(pr, Keep::head(64 * 1024), "test-err")?;
+        let stream = d.hand_over();
+        // The stream is kept but never read: far more than the cap, the pipe
+        // and any channel hold together must still be written.
+        within(move || pw.write_all(&vec![b'x'; 4 * 1024 * 1024]))?;
+        drop(stream);
+        Ok(())
+    }
+
+    #[test]
+    fn many_small_writes_to_an_unread_stream_do_not_block_the_worker() -> io::Result<()> {
+        let (pr, pw) = io::pipe()?;
+        let mut d = StderrDrain::start(pr, Keep::head(1024), "test-err")?;
+        let stream = d.hand_over();
+        // One byte per write: up to one chunk per byte below the cap, far more
+        // chunks than a bounded channel would hold.
+        within(move || {
+            let mut pw = pw;
+            for _ in 0..20_000 {
+                pw.write_all(b"y")?;
+            }
+            Ok(())
+        })?;
+        drop(stream);
         Ok(())
     }
 
     #[test]
     fn hand_over_yields_the_kept_bytes_then_the_rest() -> io::Result<()> {
         let (pr, mut pw) = io::pipe()?;
-        let mut d = StderrDrain::start(pr, Keep::Head(1024), "test-err")?;
+        let mut d = StderrDrain::start(pr, Keep::head(1024), "test-err")?;
         pw.write_all(b"before ")?;
         wait_kept(&d, 7);
         let stream = d.hand_over();
@@ -638,7 +975,7 @@ mod tests {
     #[test]
     fn hand_over_after_eof_yields_the_kept_bytes() -> io::Result<()> {
         let (pr, mut pw) = io::pipe()?;
-        let mut d = StderrDrain::start(pr, Keep::Head(1024), "test-err")?;
+        let mut d = StderrDrain::start(pr, Keep::head(1024), "test-err")?;
         pw.write_all(b"all of it")?;
         drop(pw);
         d.join();
@@ -649,10 +986,10 @@ mod tests {
     #[test]
     fn a_dropped_stream_does_not_block_the_worker() -> io::Result<()> {
         let (pr, mut pw) = io::pipe()?;
-        let mut d = StderrDrain::start(pr, Keep::Head(16), "test-err")?;
+        let mut d = StderrDrain::start(pr, Keep::head(16), "test-err")?;
         drop(d.hand_over());
         // far more than the channel and a pipe hold together
-        pw.write_all(&vec![b'x'; 4 * 1024 * 1024])?;
+        within(move || pw.write_all(&vec![b'x'; 4 * 1024 * 1024]))?;
         Ok(())
     }
 }

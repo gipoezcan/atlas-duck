@@ -8,11 +8,24 @@
 //!   waits for the exit without reaping, holding no lock; then it marks the
 //!   guard and only then reaps with `waitpid`. If `waitid` fails, it falls back
 //!   to the poll below. (The Linux kill handle normally signals through a pidfd
-//!   and needs no guard; the guard covers the `ENOSYS` fallback.)
-//! - macOS: Darwin's `waitid` is not reliable (Go's `os` package does not use it
-//!   there, golang.org/issue/19314), which is PD-137's "historical quirks". The
-//!   reaper polls `waitpid(WNOHANG)` every 10 ms inside the guard's lock
-//!   ([`reap_polling_until`]); the call never blocks, so the lock rule holds.
+//!   and needs no guard; the guard covers the pid kill used without a pidfd,
+//!   `ENOSYS`/`EPERM`, or when the pidfd call fails.)
+//! - macOS: the reaper polls `waitpid(WNOHANG)` every 10 ms inside the guard's
+//!   lock ([`reap_polling_until`]); the call never blocks, so the lock rule
+//!   holds. Darwin's `waitid(WEXITED | WNOWAIT)` also returns for a *stopped*
+//!   child (Go's `os` package avoids it there, golang.org/issue/19314): a worker
+//!   that stopped itself would wake the reaper, which would mark the guard and
+//!   block in `waitpid` while the worker lives on and can no longer be killed.
+//!   `waitpid(WNOHANG)` without `WUNTRACED` never reports a stop, and `SIGKILL`
+//!   ends a stopped process.
+//!
+//! Precondition (I-1): sandbox-host is the worker's sole reaper. If `SIGCHLD`
+//! were `SIG_IGN` or had `SA_NOCLDWAIT`, the kernel would reap the worker at its
+//! exit and free the pid before any `waitpid`, and a pid kill (macOS, the Linux
+//! fallback) could reach a recycled pid. The spawners therefore refuse to spawn
+//! in that state ([`ensure_sole_reaper`]); nothing else in the process may wait
+//! for the worker either (no `waitpid(-1)`). A wait that fails with `ECHILD`
+//! anyway marks the guard reaped (`crate::kill::reaped_elsewhere`).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -41,12 +54,47 @@ fn decode(status: libc::c_int) -> ExitKind {
     }
 }
 
+/// True when the kernel reaps children by itself: `SIGCHLD` is `SIG_IGN` or
+/// has `SA_NOCLDWAIT`.
+fn children_auto_reaped(handler: libc::sighandler_t, flags: libc::c_int) -> bool {
+    handler == libc::SIG_IGN || flags & libc::SA_NOCLDWAIT != 0
+}
+
+/// The sole-reaper precondition (I-1, see the module documentation): `Err`
+/// when `SIGCHLD` is `SIG_IGN` or has `SA_NOCLDWAIT`, so no worker is spawned.
+/// A host that may inherit an ignored `SIGCHLD` resets it to `SIG_DFL` before
+/// its first spawn.
+pub(crate) fn ensure_sole_reaper() -> io::Result<()> {
+    // SAFETY: an all-zero `sigaction` is a valid out-buffer.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null new action only reads the current one into `old`.
+    if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if children_auto_reaped(old.sa_sigaction, old.sa_flags) {
+        return Err(io::Error::other(
+            "SIGCHLD is ignored (SIG_IGN or SA_NOCLDWAIT), so the kernel would reap \
+             sandbox workers and free their pids; reset SIGCHLD to SIG_DFL before spawning",
+        ));
+    }
+    Ok(())
+}
+
 /// `kill(pid, SIGKILL)`. The caller holds the reap guard's lock, so `pid` is
-/// an unreaped child (a zombie keeps its pid). `kill(2)` does not block.
-pub(crate) fn sigkill_pid(pid: libc::pid_t) {
+/// an unreaped child (a zombie keeps its pid; the sole-reaper precondition).
+/// `kill(2)` does not block. `ESRCH` counts as success: the worker is gone.
+pub(crate) fn sigkill_pid(pid: libc::pid_t) -> io::Result<()> {
     // SAFETY: `kill` takes two integers and touches no memory of ours; the pid
     // is our unreaped child (see above), so the signal reaches no other process.
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    if unsafe { libc::kill(pid, libc::SIGKILL) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 /// `waitpid(pid, WNOHANG)`: `Some` once `pid` is reaped; never blocks.
@@ -128,6 +176,10 @@ pub(crate) use linux_wait::reap_fallbacks;
 
 /// The reaper of a split Unix worker (Δ2). Dropped without `wait`, it kills the
 /// worker and reaps it for up to 2 s, as the unsplit worker's drop did.
+///
+/// `wait` fails with `ECHILD` when someone else reaped the worker (the
+/// sole-reaper precondition was broken): the exit status is lost, and the
+/// guard is marked so the kill handle never signals the pid again.
 pub(crate) struct UnixReaper {
     pid: libc::pid_t,
     kill: Arc<GuardedKill>,
@@ -174,7 +226,8 @@ impl UnixReaper {
         ) {
             Ok(exit) => Ok(exit),
             // `waitid` failed before anything was reaped (the guard is marked
-            // only after it returned): poll inside the lock instead.
+            // only after it returned, or at once on `ECHILD`): poll inside the
+            // lock instead.
             Err(_) if !self.guard().is_reaped() => {
                 linux_wait::REAP_FALLBACKS.fetch_add(1, Ordering::Relaxed);
                 self.reap_polling()
@@ -216,5 +269,34 @@ impl Drop for UnixReaper {
         ) {
             self.exit = Some(exit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_ignored_sigchld_or_nocldwait_means_the_kernel_reaps() {
+        assert!(!children_auto_reaped(libc::SIG_DFL, 0));
+        assert!(!children_auto_reaped(libc::SIG_DFL, libc::SA_RESTART));
+        assert!(children_auto_reaped(libc::SIG_IGN, 0));
+        assert!(children_auto_reaped(libc::SIG_DFL, libc::SA_NOCLDWAIT));
+        // a handler that is installed with SA_NOCLDWAIT still loses the zombies
+        assert!(children_auto_reaped(
+            1234 as libc::sighandler_t,
+            libc::SA_NOCLDWAIT | libc::SA_SIGINFO
+        ));
+        assert!(!children_auto_reaped(
+            1234 as libc::sighandler_t,
+            libc::SA_SIGINFO
+        ));
+    }
+
+    #[test]
+    fn the_test_process_meets_the_sole_reaper_precondition() {
+        // The spawning tests in this crate rely on it; SIGCHLD is never
+        // changed here (the other tests spawn children concurrently).
+        assert!(ensure_sole_reaper().is_ok());
     }
 }

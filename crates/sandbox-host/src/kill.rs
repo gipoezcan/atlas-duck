@@ -17,6 +17,18 @@
 //! - Where that wait is unavailable, [`reap_polling_until`] holds the lock
 //!   across each non-blocking reap attempt (`waitpid(WNOHANG)`), which gives the
 //!   same order.
+//! - `killed` is set only after the OS call succeeded (a worker that already
+//!   exited counts as success). A failed call leaves the handle armed, so the
+//!   next `kill` (the bridge's timer, the macOS watchdog) tries again.
+//!
+//! Precondition on Unix: sandbox-host is the worker's sole reaper. `SIGCHLD`
+//! is neither `SIG_IGN` nor `SA_NOCLDWAIT` (the spawners refuse to spawn
+//! otherwise, `crate::unix::ensure_sole_reaper`), and nothing else in the
+//! process waits for the worker (no `waitpid(-1)`). Without it the kernel or a
+//! foreign wait could reap the worker and free its pid before the reaper marks
+//! the guard. A wait that fails with `ECHILD` shows such a violation: the guard
+//! is then marked reaped at once ([`reaped_elsewhere`]), so no later kill
+//! signals the pid.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -50,15 +62,30 @@ impl ReapGuard {
     }
 
     /// Runs `send` with the flag lock held, unless the worker was already
-    /// killed or reaped. `send` must not block. Returns whether it ran.
+    /// killed or reaped. `send` must not block and cannot fail. Returns whether
+    /// it ran.
     pub fn kill_with(&self, send: impl FnOnce()) -> bool {
+        matches!(
+            self.try_kill_with(|| {
+                send();
+                Ok(())
+            }),
+            Ok(true)
+        )
+    }
+
+    /// Runs `send` with the flag lock held, unless the worker was already
+    /// killed or reaped (`Ok(false)`). `send` must not block. The worker counts
+    /// as killed only when `send` succeeded; its error is returned and the next
+    /// call tries again.
+    pub fn try_kill_with(&self, send: impl FnOnce() -> io::Result<()>) -> io::Result<bool> {
         let mut flags = self.flags();
         if flags.killed || flags.reaped {
-            return false;
+            return Ok(false);
         }
+        send()?;
         flags.killed = true;
-        send();
-        true
+        Ok(true)
     }
 
     /// Records that the worker is about to be reaped. The reaper calls it
@@ -78,31 +105,77 @@ impl ReapGuard {
     }
 
     /// Runs one reap attempt with the flag lock held and marks the worker
-    /// reaped when it reaped. `try_reap` must not block (`waitpid(WNOHANG)`).
+    /// reaped when it reaped, or when the attempt shows that someone else
+    /// reaped it ([`reaped_elsewhere`]). `try_reap` must not block
+    /// (`waitpid(WNOHANG)`).
     pub fn reap_locked<T>(
         &self,
         try_reap: impl FnOnce() -> io::Result<Option<T>>,
     ) -> io::Result<Option<T>> {
         let mut flags = self.flags();
         let reaped = try_reap();
-        if matches!(reaped, Ok(Some(_))) {
-            flags.reaped = true;
+        match &reaped {
+            Ok(Some(_)) => flags.reaped = true,
+            Err(e) if reaped_elsewhere(e) => flags.reaped = true,
+            _ => {}
         }
         reaped
     }
 }
 
+/// `ECHILD`: the worker is no longer our child. Something else reaped it
+/// (`SIGCHLD` ignored, `SA_NOCLDWAIT`, a foreign `waitpid(-1)`), so its pid may
+/// already name another process and must never be signalled again. This breaks
+/// the sole-reaper precondition (see the module documentation); the reap that
+/// sees it marks the guard and passes the error on.
+pub fn reaped_elsewhere(e: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        e.raw_os_error() == Some(libc::ECHILD)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = e;
+        false
+    }
+}
+
 /// The PD-137 reap: `wait_exited` blocks until the worker exited without
 /// reaping it (no lock held), then the guard is marked, then `reap` collects
-/// the exit status.
+/// the exit status. A `wait_exited` that fails with [`reaped_elsewhere`] marks
+/// the guard too.
 pub fn reap_after_wait<T>(
     guard: &ReapGuard,
     wait_exited: impl FnOnce() -> io::Result<()>,
     reap: impl FnOnce() -> io::Result<T>,
 ) -> io::Result<T> {
-    wait_exited()?;
+    if let Err(e) = wait_exited() {
+        if reaped_elsewhere(&e) {
+            guard.mark_reaped();
+        }
+        return Err(e);
+    }
     guard.mark_reaped();
     reap()
+}
+
+/// One kill through `primary`, and through `fallback` when `primary` fails
+/// (I-2): Linux `pidfd_send_signal`, then the guarded `kill(pid)`; Windows
+/// `TerminateJobObject`, then `TerminateProcess`. Both run under the caller's
+/// guard lock and must not block. The error of `fallback` is returned when both
+/// fail.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+pub(crate) fn signal_or_fallback(
+    primary: impl FnOnce() -> io::Result<()>,
+    fallback: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    match primary() {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            eprintln!("sandbox worker kill failed ({e}); trying the fallback");
+            fallback()
+        }
+    }
 }
 
 /// The fallback reap: one [`ReapGuard::reap_locked`] attempt every `poll`
@@ -132,16 +205,33 @@ pub fn reap_polling_until<T>(
     }
 }
 
+/// The OS call of a [`GuardedKill`].
+type Signal = Box<dyn Fn() -> io::Result<()> + Send + Sync>;
+
 /// A [`KillHandle`] that sends one non-blocking signal under a [`ReapGuard`].
 pub struct GuardedKill {
     guard: Arc<ReapGuard>,
-    signal: Box<dyn Fn() + Send + Sync>,
+    signal: Signal,
 }
 
 impl GuardedKill {
-    /// `signal` is the OS call (it must not block); it runs at most once, and
-    /// never after the guard is marked reaped.
+    /// `signal` is an OS call that cannot fail (it must not block); it runs at
+    /// most once, and never after the guard is marked reaped.
     pub fn new(guard: Arc<ReapGuard>, signal: impl Fn() + Send + Sync + 'static) -> GuardedKill {
+        GuardedKill::fallible(guard, move || {
+            signal();
+            Ok(())
+        })
+    }
+
+    /// `signal` is the OS call (it must not block). It reports success also
+    /// when the worker had already exited (`ESRCH`, a zombie, an empty job).
+    /// It runs until it succeeds once, and never after the guard is marked
+    /// reaped.
+    pub fn fallible(
+        guard: Arc<ReapGuard>,
+        signal: impl Fn() -> io::Result<()> + Send + Sync + 'static,
+    ) -> GuardedKill {
         GuardedKill {
             guard,
             signal: Box::new(signal),
@@ -152,11 +242,20 @@ impl GuardedKill {
     pub fn guard(&self) -> &Arc<ReapGuard> {
         &self.guard
     }
+
+    /// [`KillHandle::kill`] with its outcome: `Ok(true)` the signal was sent,
+    /// `Ok(false)` nothing to do (already killed or reaped), `Err` the OS call
+    /// failed and the next kill tries again.
+    pub fn try_kill(&self) -> io::Result<bool> {
+        self.guard.try_kill_with(|| (self.signal)())
+    }
 }
 
 impl KillHandle for GuardedKill {
     fn kill(&self) {
-        self.guard.kill_with(|| (self.signal)());
+        if let Err(e) = self.try_kill() {
+            eprintln!("sandbox worker kill failed ({e}); the next kill tries again");
+        }
     }
 }
 
@@ -204,6 +303,99 @@ mod tests {
             },
         );
         assert_eq!(exit.ok(), Some(7));
+    }
+
+    #[test]
+    fn a_failed_signal_leaves_the_handle_armed() {
+        let guard = ReapGuard::new();
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let attempt = || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(
+            guard.try_kill_with(attempt).err().map(|e| e.kind()),
+            Some(io::ErrorKind::PermissionDenied)
+        );
+        assert!(!guard.is_killed(), "a failed call is not a kill");
+        assert_eq!(guard.try_kill_with(attempt).ok(), Some(true), "retried");
+        assert!(guard.is_killed());
+        assert_eq!(guard.try_kill_with(attempt).ok(), Some(false), "no-op now");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn the_fallback_runs_only_when_the_primary_call_fails() {
+        let ran = std::cell::Cell::new(0);
+        let ok = signal_or_fallback(
+            || Ok(()),
+            || {
+                ran.set(ran.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(ok.is_ok());
+        assert_eq!(ran.get(), 0);
+        let ok = signal_or_fallback(
+            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            || {
+                ran.set(ran.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(ok.is_ok());
+        assert_eq!(ran.get(), 1);
+        let both = signal_or_fallback(
+            || Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            || Err(io::Error::from(io::ErrorKind::InvalidInput)),
+        );
+        assert_eq!(
+            both.err().map(|e| e.kind()),
+            Some(io::ErrorKind::InvalidInput)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn echild_marks_the_guard_so_no_later_kill_signals() {
+        let echild = || io::Error::from_raw_os_error(libc::ECHILD);
+        // the polling reap
+        let guard = ReapGuard::new();
+        let signals = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&signals);
+        let kill = GuardedKill::new(Arc::clone(&guard), move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let err = reap_polling_until(
+            &guard,
+            || Err::<Option<i32>, _>(echild()),
+            Duration::from_millis(1),
+            None,
+        )
+        .err();
+        assert!(err.as_ref().is_some_and(reaped_elsewhere), "{err:?}");
+        assert!(guard.is_reaped());
+        kill.kill();
+        assert_eq!(signals.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // the waitid reap
+        let guard = ReapGuard::new();
+        let exit = reap_after_wait(&guard, || Err(echild()), || Ok(0));
+        assert!(exit.is_err());
+        assert!(guard.is_reaped());
+        // any other error leaves the worker unreaped (and killable)
+        let guard = ReapGuard::new();
+        let other = || io::Error::from_raw_os_error(libc::EINVAL);
+        assert!(
+            guard
+                .reap_locked(|| Err::<Option<i32>, _>(other()))
+                .is_err()
+        );
+        assert!(reap_after_wait(&guard, || Err(other()), || Ok(0)).is_err());
+        assert!(!guard.is_reaped());
     }
 
     #[test]

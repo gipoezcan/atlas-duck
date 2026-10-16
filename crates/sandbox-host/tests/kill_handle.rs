@@ -2,8 +2,8 @@
 //! handle and a reaper, with fakes only (no process is spawned).
 //!
 //! The kill handles of the real spawners are [`GuardedKill`]s over one OS call each
-//! (`TerminateJobObject`, `pidfd_send_signal`, `kill(2)`), and their reapers follow the
-//! [`ReapGuard`] protocol. The fakes below build their parts from the same crate types with a
+//! (`TerminateJobObject`, `pidfd_send_signal`, `kill(2)`; with a fallback call when the first
+//! fails), and their reapers follow the [`ReapGuard`] protocol. The fakes below build their parts from the same crate types with a
 //! recording signal, so these tests pin the protocol itself; the real calls run in CI
 //! (`app/src-tauri/tests/sandbox_runs.rs`).
 
@@ -316,6 +316,70 @@ fn a_failed_reap_attempt_is_reported_and_leaves_the_worker_unreaped() -> TestRes
     .ok_or("the error is passed on")?;
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     assert!(!guard.is_reaped());
+    Ok(())
+}
+
+#[test]
+fn a_failed_kill_is_not_a_kill_and_the_next_kill_tries_again() -> TestResult {
+    // I-2: the bridge's timer and the macOS watchdog call the same handle, so a failed OS call
+    // must leave it armed.
+    let guard = ReapGuard::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&attempts);
+    let kill = Arc::new(GuardedKill::fallible(Arc::clone(&guard), move || {
+        if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        } else {
+            Ok(())
+        }
+    }));
+    assert_eq!(
+        kill.try_kill().err().map(|e| e.kind()),
+        Some(io::ErrorKind::PermissionDenied)
+    );
+    assert!(!guard.is_killed(), "a failed call is not a kill");
+
+    let handle: Arc<dyn KillHandle> = kill.clone();
+    let started = Instant::now();
+    handle.kill();
+    assert!(started.elapsed() < KILL_BOUND);
+    assert!(guard.is_killed());
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "the second kill tried again"
+    );
+    handle.kill();
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "a no-op once a kill succeeded"
+    );
+    assert!(!kill.try_kill()?, "nothing left to kill");
+    Ok(())
+}
+
+#[test]
+fn a_kill_that_keeps_failing_is_disarmed_by_the_reap() -> TestResult {
+    let guard = ReapGuard::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&attempts);
+    let kill = GuardedKill::fallible(Arc::clone(&guard), move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    });
+    kill.kill();
+    kill.kill();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "every kill tried");
+    assert!(!guard.is_killed());
+    let exit = reap_after_wait(&guard, || Ok(()), || Ok(ExitKind::Code(0)))?;
+    assert_eq!(exit, ExitKind::Code(0));
+    kill.kill();
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "no OS call after the reap"
+    );
     Ok(())
 }
 

@@ -565,10 +565,25 @@ jobs:
           cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.list"
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/sandbox-runs.log" "$RUNNER_TEMP/sandbox-runs.list" "$RUNNER_TEMP/sandbox-runs.ignored" sandbox_runs
+          # Evidence gates (M8 T6 review m-3). libtest prints `test <name> ... ` before a test's
+          # own output, so an evidence line may follow it on the same line.
+          log="$RUNNER_TEMP/sandbox-runs.log"
+          case "$RUNNER_OS" in
+            Linux)
+              grep -E '(^|[[:space:]])M8 linux_pidfd_kill uses_pidfd=true exit=Signal\(9\) reap_fallbacks=0([^0-9]|$)' "$log" || { echo "::error::no pidfd kill without reap fallbacks"; exit 1; }
+              grep -E '(^|[[:space:]])V11 pdeathsig_survives_short_thread=true ' "$log" || { echo "::error::V11 pdeathsig_survives_short_thread=true missing"; exit 1; }
+              ;;
+            Windows)
+              grep -E '(^|[[:space:]])M8 windows_terminate_job exit=Code\(1\)([^0-9]|$)' "$log" || { echo "::error::M8 windows_terminate_job exit=Code(1) missing"; exit 1; }
+              ;;
+            macOS)
+              grep -E '(^|[[:space:]])M8 macos_kill_before_reap_only exit=Signal\(9\) ' "$log" || { echo "::error::M8 macos_kill_before_reap_only exit=Signal(9) missing"; exit 1; }
+              ;;
+          esac
           {
             echo "### M8 sandbox_runs ($RUNNER_OS)"
             echo '```'
-            grep -E '^(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            grep -E '(^|[[:space:]])(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -873,10 +888,11 @@ jobs:
           cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.list"
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/sandbox-runs.log" "$RUNNER_TEMP/sandbox-runs.list" "$RUNNER_TEMP/sandbox-runs.ignored" sandbox_runs
+          grep -E '(^|[[:space:]])M8 macos_kill_before_reap_only exit=Signal\(9\) ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 macos_kill_before_reap_only exit=Signal(9) missing"; exit 1; }
           {
             echo "### M8 sandbox_runs (x86_64-apple-darwin under Rosetta)"
             echo '```'
-            grep -E '^(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            grep -E '(^|[[:space:]])(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

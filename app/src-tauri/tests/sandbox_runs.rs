@@ -240,7 +240,9 @@ mod macos {
         let exit = kill_and_reap(kill.as_ref(), &reaped)?;
         assert_eq!(exit, ExitKind::Signal(libc::SIGKILL));
         // SAFETY: signal 0 only asks whether the pid exists.
-        let gone = unsafe { libc::kill(pid, 0) } == -1;
+        let rc = unsafe { libc::kill(pid, 0) };
+        // ESRCH only: EPERM would mean the pid exists (recycled to another user's process).
+        let gone = rc == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
         assert!(gone, "the reaped worker's pid still exists");
         // After the reap the guard holds: the pid may belong to anyone now, and no signal is
         // sent (the local `kill_handle` tests prove the guard; here it must not block either).

@@ -17,9 +17,9 @@ use super::{
     child_exit,
 };
 use crate::drain::{Keep, StderrDrain};
-use crate::kill::{GuardedKill, ReapGuard};
+use crate::kill::{GuardedKill, ReapGuard, signal_or_fallback};
 use crate::spawn::{ExitKind, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner};
-use crate::unix::{UnixReaper, sigkill_pid};
+use crate::unix::{UnixReaper, ensure_sole_reaper, sigkill_pid};
 
 /// How often `wait_timeout` polls `waitpid(WNOHANG)`.
 const WAIT_POLL: Duration = Duration::from_millis(5);
@@ -66,7 +66,11 @@ impl LinuxSpawner {
     /// Starts the spawner thread, once per process. Every later call returns
     /// a handle to the same thread, so exactly one thread named
     /// [`SPAWNER_THREAD_NAME`] ever exists.
+    ///
+    /// Fails while `SIGCHLD` is ignored or has `SA_NOCLDWAIT` (the host must be
+    /// the worker's sole reaper, see `crate::unix`); every spawn checks again.
     pub fn start() -> io::Result<Self> {
+        ensure_sole_reaper()?;
         let mut slot = SPAWNER.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(tx) = slot.as_ref() {
             return Ok(Self { tx: tx.clone() });
@@ -111,6 +115,7 @@ impl LinuxSpawner {
                 "process_mb must be greater than 0",
             ));
         }
+        ensure_sole_reaper()?;
         let exe = CString::new(spec.exe.as_os_str().as_bytes()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -361,17 +366,25 @@ fn above_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
 
 // ------------------------------------------------------------- worker handle
 
-/// `pidfd_open(pid, 0)` (Linux 5.3). `None` on `ENOSYS` (an older kernel: the
-/// kill handle then falls back to the guarded pid kill, PD-137); any other
-/// failure is an error, which fails the spawn (the floor needs a killable
-/// worker).
+/// True when a `pidfd_open` error means "no pidfd here", not "broken":
+/// `ENOSYS` (a kernel before 5.3) or `EPERM` (a seccomp profile that refuses
+/// the call, e.g. an old container runtime). The kill handle then falls back to
+/// the guarded pid kill, which is race-free under the sole-reaper precondition
+/// (PD-137, `crate::unix`).
+fn pidfd_unavailable(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::ENOSYS | libc::EPERM))
+}
+
+/// `pidfd_open(pid, 0)` (Linux 5.3). `None` when pidfds are unavailable
+/// ([`pidfd_unavailable`]); any other failure is an error.
 fn pidfd_open(pid: libc::pid_t) -> io::Result<Option<OwnedFd>> {
     // SAFETY: the syscall takes a pid and zero flags, touches no memory of
     // ours, and returns a new descriptor or -1.
     let rc = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
     if rc < 0 {
         let err = io::Error::last_os_error();
-        return if err.raw_os_error() == Some(libc::ENOSYS) {
+        return if pidfd_unavailable(&err) {
+            eprintln!("pidfd_open: {err}; the kill handle uses the guarded pid kill (PD-137)");
             Ok(None)
         } else {
             Err(err)
@@ -385,12 +398,12 @@ fn pidfd_open(pid: libc::pid_t) -> io::Result<Option<OwnedFd>> {
 
 /// `pidfd_send_signal(pidfd, SIGKILL, NULL, 0)`. A pidfd never refers to
 /// another process, even after the worker was reaped, and the call does not
-/// block.
-fn pidfd_sigkill(pidfd: &OwnedFd) {
+/// block. `ESRCH` (the worker has exited) counts as success.
+fn pidfd_sigkill(pidfd: &OwnedFd) -> io::Result<()> {
     // SAFETY: the syscall takes a descriptor, a signal number, a null
     // `siginfo_t` pointer (the kernel fills a default one) and zero flags;
     // `pidfd` is an open pidfd owned by the caller for the whole call.
-    unsafe {
+    let rc = unsafe {
         libc::syscall(
             libc::SYS_pidfd_send_signal,
             pidfd.as_raw_fd(),
@@ -399,16 +412,34 @@ fn pidfd_sigkill(pidfd: &OwnedFd) {
             0 as libc::c_uint,
         )
     };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// The split worker's kill (I-2): through the pidfd, and through the guarded
+/// pid kill when there is no pidfd or the pidfd call fails. Both run under the
+/// guard lock, so the pid still names the unreaped worker.
+fn kill_split_worker(pidfd: Option<&OwnedFd>, pid: libc::pid_t) -> io::Result<()> {
+    match pidfd {
+        Some(fd) => signal_or_fallback(|| pidfd_sigkill(fd), || sigkill_pid(pid)),
+        None => sigkill_pid(pid),
+    }
 }
 
 /// A running worker. Dropping it kills and reaps the process, unless it was
 /// split by [`WorkerProcess::into_parts`]: the parts own the worker then.
 pub struct LinuxProcess {
     pid: libc::pid_t,
-    /// The worker's pidfd, opened right after the fork (`None`: kernel < 5.3).
-    /// Moved into the kill handle by `into_parts`; the probe path does not use
-    /// it.
-    pidfd: Option<OwnedFd>,
+    /// Test switch: `into_parts` opens no pidfd, as on a kernel without
+    /// `pidfd_open`.
+    pid_kill_only: bool,
     stdin: Option<File>,
     closed_stdin: ClosedStdin,
     /// `None` only after `into_parts`.
@@ -440,7 +471,7 @@ impl LinuxProcess {
     fn new(spawned: Spawned) -> io::Result<Self> {
         let mut process = Self {
             pid: spawned.pid,
-            pidfd: None,
+            pid_kill_only: false,
             stdin: Some(File::from(spawned.stdin)),
             closed_stdin: ClosedStdin,
             stdout: Some(File::from(spawned.stdout)),
@@ -453,11 +484,9 @@ impl LinuxProcess {
         // On error `process` is dropped, which kills and reaps the worker.
         process.stderr = Some(StderrDrain::start(
             File::from(spawned.stderr),
-            Keep::Head(STDERR_CAP_BYTES),
+            Keep::head(STDERR_CAP_BYTES),
             "atlas-duck-worker-stderr",
         )?);
-        // Nothing reaps the child before its reaper, so the pid still names it.
-        process.pidfd = pidfd_open(process.pid)?;
         Ok(process)
     }
 
@@ -471,10 +500,11 @@ impl LinuxProcess {
             .unwrap_or_default()
     }
 
-    /// True when the worker's kill handle will use a pidfd (Linux 5.3+); false
-    /// on the guarded pid fallback (PD-137).
+    /// True when [`WorkerProcess::into_parts`] would now give the worker a kill
+    /// handle that signals through a pidfd (Linux 5.3+); false on the guarded
+    /// pid fallback (PD-137). For evidence: it opens a pidfd and closes it.
     pub fn uses_pidfd(&self) -> bool {
-        self.pidfd.is_some()
+        self.exit.is_none() && !self.pid_kill_only && matches!(pidfd_open(self.pid), Ok(Some(_)))
     }
 
     /// Splits one complete frame off the front of `buf`.
@@ -632,20 +662,34 @@ impl WorkerProcess for LinuxProcess {
         }
     }
 
-    /// The kill handle sends through the pidfd (the guarded pid kill without
-    /// one); the reaper is `waitid(WNOWAIT)` + `waitpid` (see `crate::unix`).
-    /// stdout starts with the bytes `read_frame_timeout` buffered.
+    /// The kill handle sends through a pidfd opened here (the guarded pid kill
+    /// without one, or when the pidfd call fails); the reaper is
+    /// `waitid(WNOWAIT)` + `waitpid` (see `crate::unix`). stdout starts with
+    /// the bytes `read_frame_timeout` buffered.
+    ///
+    /// The pidfd is opened here rather than at the spawn, so the probe path
+    /// spawns exactly as in M1 (m-4). It is as race-free: until the worker is
+    /// reaped (`exit` is `None`) its pid still names it, because this process
+    /// is its sole reaper (`crate::unix`).
     fn into_parts(mut self: Box<Self>) -> io::Result<WorkerParts> {
+        // The fallible steps first: on an error `self` is dropped whole, which
+        // kills and reaps the worker as before.
+        if self.stdout.is_none() {
+            return Err(io::Error::other("the worker's stdout is gone"));
+        }
+        let pidfd = if self.exit.is_none() && !self.pid_kill_only {
+            pidfd_open(self.pid)?
+        } else {
+            None
+        };
         let Some(stdout) = self.stdout.take() else {
             return Err(io::Error::other("the worker's stdout is gone"));
         };
         // From here on nothing fails, and the drop leaves the worker alone.
         self.parted = true;
         let pid = self.pid;
-        let pidfd = self.pidfd.take();
-        let kill = Arc::new(GuardedKill::new(ReapGuard::new(), move || match &pidfd {
-            Some(fd) => pidfd_sigkill(fd),
-            None => sigkill_pid(pid),
+        let kill = Arc::new(GuardedKill::fallible(ReapGuard::new(), move || {
+            kill_split_worker(pidfd.as_ref(), pid)
         }));
         let stdout = io::Cursor::new(std::mem::take(&mut self.buf)).chain(stdout);
         let stdin: Box<dyn Write + Send> = match self.stdin.take() {
@@ -938,6 +982,52 @@ mod tests {
         !Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    /// How long a split test waits for a reap or a stream end before it fails
+    /// (a failed kill must fail the test, never hang it).
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// Starts `f` on a thread of its own; [`finish`] takes its result.
+    fn background<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> mpsc::Receiver<T> {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx
+    }
+
+    /// The result of a [`background`] call, or a failed test once [`BOUND`]
+    /// has passed.
+    fn finish<T>(rx: mpsc::Receiver<T>, what: &str) -> T {
+        rx.recv_timeout(BOUND)
+            .unwrap_or_else(|_| panic!("{what} did not finish within {BOUND:?}"))
+    }
+
+    #[test]
+    fn eperm_and_enosys_mean_no_pidfd_and_other_errors_fail_the_split() {
+        let err = |code| io::Error::from_raw_os_error(code);
+        assert!(pidfd_unavailable(&err(libc::ENOSYS)));
+        assert!(pidfd_unavailable(&err(libc::EPERM)));
+        assert!(!pidfd_unavailable(&err(libc::EINVAL)));
+        assert!(!pidfd_unavailable(&err(libc::EMFILE)));
+        assert!(!pidfd_unavailable(&err(libc::ESRCH)));
+    }
+
+    #[test]
+    fn a_failing_pidfd_kill_falls_back_to_the_pid_kill() {
+        let spawner = LinuxSpawner::start().expect("start");
+        let mut p = spawner.spawn_process(&spec(CAT)).expect("spawn");
+        wait_until_running(&mut p);
+        // Not a pidfd: `pidfd_send_signal` fails with EBADF, as an injected
+        // failure; the worker must still die by the pid kill.
+        let not_a_pidfd = OwnedFd::from(File::open("/dev/null").expect("open /dev/null"));
+        assert!(pidfd_sigkill(&not_a_pidfd).is_err());
+        kill_split_worker(Some(&not_a_pidfd), p.pid).expect("the fallback kill");
+        assert_eq!(
+            p.wait_timeout(BOUND).expect("wait"),
+            Some(ExitKind::Signal(libc::SIGKILL))
+        );
+    }
+
     #[test]
     fn a_split_worker_is_killed_through_its_pidfd_and_reaped() {
         let spawner = LinuxSpawner::start().expect("start");
@@ -965,21 +1055,25 @@ mod tests {
         io.stdout.read_exact(&mut rest).expect("the buffered frame");
         assert_eq!(rest, [0, 0, 0, 2, b'b', b'c']);
 
-        let reaper = thread::spawn(move || reaper.wait());
+        let reaped = background(move || reaper.wait());
         let started = Instant::now();
         kill.kill();
         kill.kill();
         assert!(started.elapsed() < Duration::from_millis(50));
         assert_eq!(
-            reaper.join().expect("reaper thread").expect("wait"),
+            finish(reaped, "the reap").expect("wait"),
             ExitKind::Signal(libc::SIGKILL)
         );
         assert!(proc_gone(pid), "zombie left behind");
         kill.kill(); // after the reap: a no-op
-        let mut tail = Vec::new();
-        io.stdout
-            .read_to_end(&mut tail)
-            .expect("EOF after the kill");
+        let tail = finish(
+            background(move || {
+                let mut tail = Vec::new();
+                io.stdout.read_to_end(&mut tail).map(|_| tail)
+            }),
+            "stdout to EOF",
+        )
+        .expect("EOF after the kill");
         assert!(tail.is_empty());
     }
 
@@ -987,13 +1081,15 @@ mod tests {
     fn the_guarded_pid_fallback_kills_and_reaps() {
         let spawner = LinuxSpawner::start().expect("start");
         let mut p = spawner.spawn_process(&spec(CAT)).expect("spawn");
-        p.pidfd = None; // as on a kernel without pidfd_open (ENOSYS)
+        p.pid_kill_only = true; // as on a kernel without pidfd_open (ENOSYS)
+        assert!(!p.uses_pidfd());
         let pid = p.pid();
         let parts = Box::new(p).into_parts().expect("split");
-        let reaper = thread::spawn(move || parts.reaper.wait());
+        let reaper = parts.reaper;
+        let reaped = background(move || reaper.wait());
         parts.kill.kill();
         assert_eq!(
-            reaper.join().expect("reaper thread").expect("wait"),
+            finish(reaped, "the reap").expect("wait"),
             ExitKind::Signal(libc::SIGKILL)
         );
         assert!(proc_gone(pid));
@@ -1010,15 +1106,31 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(p.stderr_head(), b"err");
-        let WorkerParts { mut io, reaper, .. } = Box::new(p).into_parts().expect("split");
+        let WorkerParts {
+            mut io,
+            kill,
+            reaper,
+            ..
+        } = Box::new(p).into_parts().expect("split");
+        let reaped = background(move || reaper.wait());
         io.stdin
             .write_all(b"printf more >&2\nexit 4\n")
             .expect("script 2");
         drop(io.stdin);
-        let mut stderr = Vec::new();
-        io.stderr.read_to_end(&mut stderr).expect("stderr to EOF");
-        assert_eq!(stderr, b"errmore");
-        assert_eq!(reaper.wait().expect("wait"), ExitKind::Code(4));
+        let mut stderr_stream = io.stderr;
+        let stderr = background(move || {
+            let mut stderr = Vec::new();
+            stderr_stream.read_to_end(&mut stderr).map(|_| stderr)
+        });
+        let exit = reaped.recv_timeout(BOUND);
+        if exit.is_err() {
+            kill.kill(); // unblocks the stderr read before the test fails
+        }
+        assert_eq!(
+            exit.expect("the reap within the bound").expect("wait"),
+            ExitKind::Code(4)
+        );
+        assert_eq!(finish(stderr, "stderr to EOF").expect("stderr"), b"errmore");
     }
 
     #[test]

@@ -20,11 +20,13 @@
 //!   it (same rule as the Linux routine).
 //! - stderr is a pipe drained by a second thread that keeps the last 4 KiB;
 //!   [`MacWorker::stderr_tail`] shows it. The `sandbox_init` error text goes
-//!   there.
+//!   there. The thread also keeps the first 64 KiB for the split (§3.4).
 //! - M8 (Δ2, PD-137): `into_parts` hands both threads' streams over; the kill
 //!   handle is a `kill(SIGKILL)` guarded by the reap flag, and the reaper polls
-//!   `waitpid(WNOHANG)` inside the same lock (Darwin's `waitid(WNOWAIT)` is not
-//!   relied on; see `crate::unix`).
+//!   `waitpid(WNOHANG)` inside the same lock (Darwin's `waitid(WNOWAIT)` also
+//!   wakes for a stopped child; see `crate::unix`). A pid kill is only safe
+//!   while the host is the worker's sole reaper, so `spawn_mac` refuses to spawn
+//!   while `SIGCHLD` is ignored or has `SA_NOCLDWAIT`.
 //! - `pipe()` plus `fcntl` is not atomic. `POSIX_SPAWN_CLOEXEC_DEFAULT` makes
 //!   this routine immune to its own race; a foreign `fork`/`spawn` that runs
 //!   inside the same microsecond window could still inherit a pipe end.
@@ -44,14 +46,16 @@ use std::time::{Duration, Instant};
 use crate::drain::{ChunkReader, Keep, StderrDrain};
 use crate::kill::{GuardedKill, ReapGuard};
 use crate::spawn::{ExitKind, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner};
-use crate::unix::{UnixReaper, sigkill_pid};
+use crate::unix::{UnixReaper, ensure_sole_reaper, sigkill_pid};
 
 /// The worker's whole environment (§3.4: `TZ=UTC0` keeps libc from opening a
 /// time-zone file under the confinement).
 pub const WORKER_ENV: [(&str, &str); 1] = [("TZ", "UTC0")];
 
-/// How much of the worker's stderr is kept.
+/// How much of the worker's stderr is kept for [`MacWorker::stderr_tail`].
 const STDERR_TAIL_BYTES: usize = 4096;
+/// The stderr cap of a split worker's stream (§3.4: 64 KiB).
+const STDERR_CAP_BYTES: usize = 64 * 1024;
 /// Poll interval of `wait_timeout` (macOS has no pidfd).
 const WAIT_POLL: Duration = Duration::from_millis(10);
 /// How long `Drop` waits for the killed worker to be reaped.
@@ -76,7 +80,11 @@ impl MacSpawner {
 
     /// Like [`WorkerSpawner::spawn`], but returns the concrete worker, which
     /// also offers [`MacWorker::stderr_tail`] (used by the probe tests).
+    ///
+    /// Fails while `SIGCHLD` is ignored or has `SA_NOCLDWAIT` (the host must be
+    /// the worker's sole reaper, see `crate::unix`).
     pub fn spawn_mac(&self, spec: &SpawnSpec) -> io::Result<MacWorker> {
+        ensure_sole_reaper()?;
         let exe = CString::new(spec.exe.as_os_str().as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "exe path contains NUL"))?;
         let env: Vec<CString> = WORKER_ENV
@@ -96,7 +104,7 @@ impl MacSpawner {
         let frames = ChunkReader::spawn(File::from(host_stdout), "atlas-duck-worker-out")?;
         let stderr = StderrDrain::start(
             File::from(host_stderr),
-            Keep::Tail(STDERR_TAIL_BYTES),
+            Keep::head_and_tail(STDERR_CAP_BYTES, STDERR_TAIL_BYTES),
             "atlas-duck-worker-err",
         )?;
 
@@ -300,7 +308,7 @@ impl MacWorker {
         if self.exit.is_some() {
             self.stderr.join();
         }
-        String::from_utf8_lossy(&self.stderr.kept()).into_owned()
+        String::from_utf8_lossy(&self.stderr.tail()).into_owned()
     }
 
     /// Non-blocking `waitpid`.
@@ -387,8 +395,8 @@ impl WorkerProcess for MacWorker {
         // Nothing below fails, and the drop leaves the worker alone.
         self.parted = true;
         let pid = self.pid;
-        let kill = Arc::new(GuardedKill::new(ReapGuard::new(), move || {
-            sigkill_pid(pid);
+        let kill = Arc::new(GuardedKill::fallible(ReapGuard::new(), move || {
+            sigkill_pid(pid)
         }));
         let stdin = StdinPipe(self.stdin.0.take());
         Ok(WorkerParts {
@@ -570,6 +578,26 @@ mod tests {
         rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
 
+    /// Starts `f` on a thread of its own; [`finish`] takes its result.
+    fn background<T: Send + 'static>(
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx
+    }
+
+    /// The result of a [`background`] call, or a failed test once `LONG` has
+    /// passed (a failed kill must fail the test, never hang it).
+    fn finish<T>(rx: std::sync::mpsc::Receiver<T>, what: &str) -> T {
+        match rx.recv_timeout(LONG) {
+            Ok(value) => value,
+            Err(_) => panic!("{what} did not finish within {LONG:?}"),
+        }
+    }
+
     #[test]
     fn a_split_worker_is_killed_before_the_reap_only() {
         use std::io::Read;
@@ -600,18 +628,24 @@ mod tests {
         assert!(io.stdout.read_exact(&mut rest).is_ok());
         assert_eq!(rest, [0, 0, 0, 2, b'b', b'c']);
 
-        let reaper = thread::spawn(move || reaper.wait());
+        let reaped = background(move || reaper.wait());
         let started = Instant::now();
         kill.kill();
         kill.kill();
         assert!(started.elapsed() < Duration::from_millis(50));
-        let exit = reaper.join().ok().and_then(Result::ok);
+        let exit = finish(reaped, "the reap").ok();
         assert_eq!(exit, Some(ExitKind::Signal(libc::SIGKILL)));
         assert!(pid_gone(pid), "zombie left behind");
         kill.kill(); // after the reap: no signal, whoever has the pid now
-        let mut tail = Vec::new();
-        assert!(io.stdout.read_to_end(&mut tail).is_ok());
-        assert!(tail.is_empty());
+        let mut stdout = io.stdout;
+        let tail = finish(
+            background(move || {
+                let mut tail = Vec::new();
+                stdout.read_to_end(&mut tail).map(|_| tail)
+            }),
+            "stdout to EOF",
+        );
+        assert_eq!(tail.ok(), Some(Vec::new()));
     }
 
     #[test]
@@ -631,16 +665,32 @@ mod tests {
         while w.stderr.kept().len() < 3 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        let WorkerParts { mut io, reaper, .. } = match Box::new(w).into_parts() {
+        let WorkerParts {
+            mut io,
+            kill,
+            reaper,
+            ..
+        } = match Box::new(w).into_parts() {
             Ok(parts) => parts,
             Err(e) => panic!("split: {e}"),
         };
+        let reaped = background(move || reaper.wait());
         assert!(io.stdin.write_all(b"printf more >&2\nexit 4\n").is_ok());
         drop(io.stdin);
-        let mut stderr = Vec::new();
-        assert!(io.stderr.read_to_end(&mut stderr).is_ok());
-        assert_eq!(stderr, b"errmore");
-        assert_eq!(reaper.wait().ok(), Some(ExitKind::Code(4)));
+        let mut stderr_stream = io.stderr;
+        let stderr = background(move || {
+            let mut stderr = Vec::new();
+            stderr_stream.read_to_end(&mut stderr).map(|_| stderr)
+        });
+        let exit = reaped.recv_timeout(LONG);
+        if exit.is_err() {
+            kill.kill(); // unblocks the stderr read before the test fails
+        }
+        assert_eq!(exit.ok().and_then(Result::ok), Some(ExitKind::Code(4)));
+        assert_eq!(
+            finish(stderr, "stderr to EOF").ok(),
+            Some(b"errmore".to_vec())
+        );
     }
 
     #[test]

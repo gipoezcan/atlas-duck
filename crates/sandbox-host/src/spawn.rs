@@ -81,7 +81,12 @@ pub trait WorkerProcess {
     /// first bytes of [`WorkerIo::stdout`].
     ///
     /// The default is `Unsupported`: only the real spawners split (the probe
-    /// runner's fakes do not need to).
+    /// runner's fakes do not need to). Every real process type must override
+    /// it: a script run on a type that inherits the default fails with
+    /// `StartRunError::Spawn(Unsupported)`. Requirement for M8 T11: the
+    /// degraded Windows process type overrides `into_parts` (as
+    /// `WindowsProcess` does), and a `sandbox_runs` test splits a degraded
+    /// worker through `Box<dyn WorkerProcess>`.
     fn into_parts(self: Box<Self>) -> io::Result<WorkerParts> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
@@ -116,12 +121,13 @@ pub struct WorkerIo {
     /// Host end of the worker's stdout, starting with any bytes the spawner
     /// had already read and not returned as a frame.
     pub stdout: Box<dyn Read + Send>,
-    /// Host end of the worker's stderr. The spawner's drain thread hands its
-    /// reader over: the bytes it kept so far come first (the head, at most
-    /// 64 KiB, on Linux and Windows; the last 4 KiB on macOS), then everything it
-    /// reads from then on. The thread keeps reading, so the worker never blocks
-    /// on stderr while the stream is read, and discards once the stream is
-    /// dropped.
+    /// Host end of the worker's stderr: exactly its first 64 KiB (§3.4), in
+    /// order and without gaps, on every OS, then EOF once the worker's stderr
+    /// closes. The spawner's drain thread hands its reader over: the bytes it
+    /// kept so far come first, then what it reads from then on, until the
+    /// stream holds 64 KiB. The thread reads to the worker's EOF and discards
+    /// the rest, so the worker never blocks on stderr, whether the stream is
+    /// read, left unread, or dropped.
     pub stderr: Box<dyn Read + Send>,
 }
 
@@ -131,14 +137,26 @@ pub struct WorkerIo {
 /// kernel has no pidfd), macOS `kill(SIGKILL)` guarded by the reap flag.
 ///
 /// `kill` never waits for the exit, takes no lock that a reader, writer or
-/// reaper thread holds across a blocking call, never signals a reaped pid, and
-/// a second call is a no-op. See [`crate::kill`].
+/// reaper thread holds across a blocking call, and never signals a reaped pid.
+/// Once one OS call succeeded, a further call is a no-op; a failed OS call is
+/// logged and leaves the handle armed, so the next call tries again (Linux
+/// falls back to the guarded pid kill and Windows to `TerminateProcess` within
+/// the same call). See [`crate::kill`].
+///
+/// Precondition on Unix: sandbox-host is the worker's sole reaper. `SIGCHLD`
+/// must be neither `SIG_IGN` nor `SA_NOCLDWAIT` (the Linux and macOS spawners
+/// refuse to spawn otherwise), and nothing else in the process may wait for the
+/// worker (no `waitpid(-1)`). A reaper that finds the worker reaped elsewhere
+/// (`ECHILD`) returns that error and disarms the handle.
 pub trait KillHandle: Send + Sync {
     /// Kills the worker (see the trait documentation).
     fn kill(&self);
 }
 
 /// Waits for a worker's exit and reaps it, on a thread of its own.
+///
+/// On Unix `wait` fails with `ECHILD` when something else reaped the worker
+/// (the [`KillHandle`] precondition was broken); the exit status is then lost.
 pub trait Reaper: Send {
     /// Blocks until the worker exited, reaps it and returns how it ended.
     fn wait(self: Box<Self>) -> io::Result<ExitKind>;

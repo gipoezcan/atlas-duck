@@ -27,8 +27,8 @@ use windows_sys::Win32::System::Threading::{
     InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
-    WaitForSingleObject,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
@@ -38,7 +38,7 @@ use super::job::{Job, JobLimits, JobSnapshot, terminate_job};
 use super::pipes::{STDERR_CAP_BYTES, StdinPipe, create_stdio_pipes};
 use super::{APPCONTAINER_NAME, WORKER_ENV_NAMES, WORKER_ENV_OS_REQUIRED, wide};
 use crate::drain::{ChunkReader, Keep, StderrDrain};
-use crate::kill::{GuardedKill, ReapGuard, reap_after_wait};
+use crate::kill::{GuardedKill, ReapGuard, reap_after_wait, signal_or_fallback};
 use crate::spawn::{
     ExitKind, Reaper, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner,
 };
@@ -240,7 +240,7 @@ impl WindowsSpawner {
         let frames = ChunkReader::spawn(host.stdout, "atlas-duck-sbx-out")?;
         let stderr = StderrDrain::start(
             host.stderr,
-            Keep::Head(STDERR_CAP_BYTES),
+            Keep::head(STDERR_CAP_BYTES),
             "atlas-duck-sbx-err",
         )?;
         Ok(WindowsProcess {
@@ -358,8 +358,10 @@ impl WorkerProcess for WindowsProcess {
     }
 
     /// The kill handle owns a duplicate of the job handle (`TerminateJobObject`,
-    /// PD-137); the reaper owns a duplicate of the process handle, the job
-    /// handle itself and the run directory, which it removes after the exit.
+    /// PD-137) and one of the process handle (`TerminateProcess`, the fallback
+    /// when the job call fails); the reaper owns a duplicate of the process
+    /// handle, the job handle itself and the run directory, which it removes
+    /// after the exit.
     fn into_parts(mut self: Box<Self>) -> io::Result<WorkerParts> {
         // The fallible steps first: on an error `self` is dropped whole, which
         // kills the worker as before.
@@ -367,16 +369,21 @@ impl WorkerProcess for WindowsProcess {
             Some(job) => job.duplicate_handle()?,
             None => return Err(io::Error::other("the worker's job is already closed")),
         };
+        let kill_process = self.process.try_clone()?;
         let process = self.process.try_clone()?;
 
         let guard = ReapGuard::new();
         if self.exit.is_some() {
             guard.mark_reaped();
         }
-        let kill = GuardedKill::new(Arc::clone(&guard), move || {
-            // Does not wait for the exit, so it never blocks. A failure leaves
-            // the worker to the timer, the reaper's drop and KILL_ON_JOB_CLOSE.
-            let _ = terminate_job(&kill_job);
+        // Neither call waits for the exit, so the kill never blocks. A handle
+        // keeps its object, so neither can reach another process. If both
+        // fail, the next kill tries again (I-2).
+        let kill = GuardedKill::fallible(Arc::clone(&guard), move || {
+            signal_or_fallback(
+                || terminate_job(&kill_job),
+                || terminate_process(&kill_process),
+            )
         });
         let reaper = WindowsReaper {
             process,
@@ -423,6 +430,23 @@ fn wait_process(process: &OwnedHandle, ms: u32) -> io::Result<bool> {
         WAIT_FAILED => Err(io::Error::last_os_error()),
         other => Err(io::Error::other(format!("unexpected wait result {other}"))),
     }
+}
+
+/// `TerminateProcess(process, 1)`, the fallback of the split worker's kill
+/// when `TerminateJobObject` fails (I-2). It does not wait for the exit. A
+/// process that has already exited (the call then fails with
+/// `ERROR_ACCESS_DENIED`) counts as success.
+fn terminate_process(process: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: `process` is an open process handle owned by the caller for the
+    // whole call; `TerminateProcess` only reads the handle value.
+    if unsafe { TerminateProcess(process.as_raw_handle().cast(), 1) } != 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if wait_process(process, 0)? {
+        return Ok(());
+    }
+    Err(err)
 }
 
 /// The exit code of an exited process. NTSTATUS exit codes such as
