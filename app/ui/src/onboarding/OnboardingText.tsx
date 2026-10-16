@@ -13,16 +13,20 @@ export function OnboardingText() {
   const [text, setText] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
   const live = useRef(true);
+  const inFlight = useRef(false);
 
   const load = useCallback(() => {
+    // One request at a time: a second click on "Try again" must not start a second load.
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setFailed(false);
     onboardingText().then(
       (answer) => {
-        if (live.current) {
-          setText(answer.text);
-          setFailed(false);
-        }
+        inFlight.current = false;
+        if (live.current) setText(answer.text);
       },
       () => {
+        inFlight.current = false;
         if (live.current) setFailed(true);
       },
     );

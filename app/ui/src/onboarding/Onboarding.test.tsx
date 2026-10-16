@@ -48,4 +48,27 @@ describe('Onboarding shell', () => {
     expect(screen.getByLabelText('Instructions for your agents').textContent).toBe('second try');
     expect(screen.queryByRole('alert')).toBeNull();
   });
+
+  it('two clicks on retry in one tick start one load, and the alert gives way to the status', async () => {
+    vi.mocked(onboardingText).mockRejectedValueOnce({ kind: 'internal' });
+    render(<Onboarding />);
+    await flush();
+    let resolve: (v: { text: string }) => void = () => undefined;
+    vi.mocked(onboardingText).mockImplementationOnce(
+      () => new Promise((r) => { resolve = r; }),
+    );
+    const retry = screen.getByRole('button', { name: 'Try again' });
+    act(() => {
+      retry.click();
+      retry.click();
+    });
+    expect(onboardingText).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('status').textContent).toBe('Loading the instructions');
+    await act(async () => {
+      resolve({ text: 'late' });
+    });
+    await flush();
+    expect(screen.getByLabelText('Instructions for your agents').textContent).toBe('late');
+  });
 });
