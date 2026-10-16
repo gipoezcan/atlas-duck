@@ -586,10 +586,12 @@ dependencies = [
 name = "atlas-duck-sandbox-host"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "atlas-duck-ipc",
  "libc",
  "serde",
  "serde_json",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

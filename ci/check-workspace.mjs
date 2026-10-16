@@ -12,7 +12,7 @@
 // No npm dependencies: node:child_process, node:fs, node:path, node:url only.
 
 import { spawnSync } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -109,12 +109,33 @@ export const BANNED_IN_CLI_AND_WORKER = [
 
 // §9.3: rquickjs pinned exact; never loader, dyn-load or parallel.
 export const RQUICKJS_REQ = "=0.14.0";
-export const RQUICKJS_BANNED_FEATURES = ["loader", "dyn-load", "parallel"];
-// Not a §9.3 ban: §9.3 leaves `futures` to the implementation plan together
-// with the M8 loop design (§15, M8). M1 keeps it off (Task 14). M8 lifts this
-// rule by emptying the list.
-export const RQUICKJS_M1_BANNED_FEATURES = ["futures"];
-export const RQUICKJS_M1_BAN_REASON = "not allowed in M1: M8 decides (§9.3/§15)";
+// `futures` is not a §9.3 ban: §9.3 left it to the M8 loop design, which decided it off.
+export const RQUICKJS_BANNED_FEATURES = ["loader", "dyn-load", "parallel", "futures"];
+export const RQUICKJS_BAN_REASONS = {
+  futures: "decided off in M8 (PD-131, §9.3/§15 V15)",
+};
+
+const rquickjsBanMessage = (subject, f, what = "rquickjs feature") =>
+  `${subject}: ${what} ${f} is ${RQUICKJS_BAN_REASONS[f] ?? "not allowed (§9.3)"}`;
+
+// M8 T1: the sandbox worker links these external crates and nothing else (normal and build
+// edges). It gains no dependency in M8: no tokio, no async runtime.
+export const WORKER_EXTERNAL_ALLOW = [
+  "rquickjs",
+  "serde_json",
+  "libc",
+  "windows-sys",
+  "landlock",
+  "seccompiler",
+  "syscalls",
+];
+
+// §2.2 "nothing that reaches the network or the keychain": the host may use tokio and
+// async-trait, but links no HTTP client, keyring, SQLite or Tauri/wry.
+export const BANNED_IN_SANDBOX_HOST = BANNED_IN_CLI_AND_WORKER;
+
+// PD-134 (plan review B-2): `#[global_allocator]` lives only in the sandbox binary and in tests.
+export const GLOBAL_ALLOCATOR_BIN = "app/src-tauri/src/bin/atlas-duck-sandbox.rs";
 
 export const LINT_PACKAGES = [PKG.core, PKG.atlassian, PKG.convert];
 export const REQUIRED_DENY_LINTS = ["unwrap_used", "expect_used"];
@@ -236,6 +257,11 @@ export function checkGraph(metadata) {
     if (d.name === PKG.ipc && isNormalOrBuild(d.kind) && d.uses_default_features !== false) {
       violations.push(`${PKG.sandboxWorker}: dependency on ${PKG.ipc} must set default-features = false`);
     }
+    if (isNormalOrBuild(d.kind) && !memberNames.has(d.name) && !WORKER_EXTERNAL_ALLOW.includes(d.name)) {
+      violations.push(
+        `${PKG.sandboxWorker}: external dependency ${d.name} is not allowed; only ${WORKER_EXTERNAL_ALLOW.join(", ")} (M8 T1)`,
+      );
+    }
   }
 
   for (const pkg of members) {
@@ -255,6 +281,14 @@ export function checkGraph(metadata) {
         }
       }
     }
+    if (pkg.name === PKG.sandboxHost) {
+      for (const b of BANNED_IN_SANDBOX_HOST) {
+        if (TAURI_CRATES.includes(b) && closure.has(b)) continue; // reported above
+        if (closure.has(b)) {
+          violations.push(`${pkg.name}: banned crate ${b} in normal-dependency closure (§2.2)`);
+        }
+      }
+    }
     for (const d of pkg.dependencies) {
       if (pkg.name === APP_PACKAGE && APP_BANNED_DEPS.includes(d.name)) {
         violations.push(`${APP_PACKAGE}: dependency ${d.name} is banned (§10.3)`);
@@ -271,11 +305,7 @@ export function checkGraph(metadata) {
         violations.push(`${pkg.name}: rquickjs version req must be ${RQUICKJS_REQ} (§9.3), found ${d.req}`);
       }
       for (const f of d.features ?? []) {
-        if (RQUICKJS_BANNED_FEATURES.includes(f)) {
-          violations.push(`${pkg.name}: rquickjs feature ${f} is not allowed (§9.3)`);
-        } else if (RQUICKJS_M1_BANNED_FEATURES.includes(f)) {
-          violations.push(`${pkg.name}: rquickjs feature ${f} is ${RQUICKJS_M1_BAN_REASON}`);
-        }
+        if (RQUICKJS_BANNED_FEATURES.includes(f)) violations.push(rquickjsBanMessage(pkg.name, f));
       }
     }
   }
@@ -286,9 +316,7 @@ export function checkGraph(metadata) {
     if (byId.get(node.id)?.name !== "rquickjs") continue;
     for (const f of node.features ?? []) {
       if (RQUICKJS_BANNED_FEATURES.includes(f)) {
-        violations.push(`rquickjs: resolved feature ${f} is not allowed (§9.3)`);
-      } else if (RQUICKJS_M1_BANNED_FEATURES.includes(f)) {
-        violations.push(`rquickjs: resolved feature ${f} is ${RQUICKJS_M1_BAN_REASON}`);
+        violations.push(rquickjsBanMessage("rquickjs", f, "resolved feature"));
       }
     }
   }
@@ -453,6 +481,42 @@ export function checkManifests({ root, members }) {
   return violations;
 }
 
+/**
+ * `#[global_allocator]` source scan (PD-134). `files`: [{ path, text }] with repo-relative paths.
+ * Allowed only in GLOBAL_ALLOCATOR_BIN and in files under a `tests/` directory.
+ */
+export function checkGlobalAllocators(files) {
+  const violations = [];
+  for (const { path, text } of files) {
+    const p = path.replace(/\\/g, "/");
+    if (p === GLOBAL_ALLOCATOR_BIN || p.startsWith("tests/") || p.includes("/tests/")) continue;
+    if (/^[^/\n]*#\[\s*global_allocator\s*\]/m.test(stripLineComments(text))) {
+      violations.push(
+        `${p}: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_BIN} and under tests/ (PD-134)`,
+      );
+    }
+  }
+  return violations;
+}
+
+const stripLineComments = (text) => text.replace(/^\s*\/\/.*$/gm, "");
+
+const SCAN_SKIP_DIRS = new Set(["target", "node_modules", ".git", "dist"]);
+
+/** Every `.rs` file under `root` (repo-relative paths), skipping build and dependency dirs. */
+export function collectRustFiles(root, rel = "") {
+  const out = [];
+  for (const e of readdirSync(join(root, rel), { withFileTypes: true })) {
+    if (e.isDirectory()) {
+      if (!SCAN_SKIP_DIRS.has(e.name)) out.push(...collectRustFiles(root, rel === "" ? e.name : `${rel}/${e.name}`));
+    } else if (e.name.endsWith(".rs")) {
+      const path = rel === "" ? e.name : `${rel}/${e.name}`;
+      out.push({ path, text: readFileSync(join(root, path), "utf8") });
+    }
+  }
+  return out;
+}
+
 export function cargoMetadata(manifestPath) {
   const res = spawnSync(
     "cargo",
@@ -482,6 +546,7 @@ export function main() {
   const violations = [
     ...checkGraph(metadata),
     ...checkManifests({ root: readFileSync(join(metadata.workspace_root, "Cargo.toml"), "utf8"), members }),
+    ...checkGlobalAllocators(collectRustFiles(metadata.workspace_root)),
   ];
   for (const v of violations) console.log(v);
   if (violations.length > 0) return 1;

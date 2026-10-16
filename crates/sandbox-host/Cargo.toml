@@ -13,6 +13,8 @@ path = "src/lib.rs"
 atlas-duck-ipc = { path = "../ipc" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+async-trait = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -32,3 +34,6 @@ windows-sys = { workspace = true, features = [
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

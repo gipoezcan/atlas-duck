@@ -5,8 +5,12 @@ import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  BANNED_IN_SANDBOX_HOST,
+  GLOBAL_ALLOCATOR_BIN,
   TEST_FEATURE_FORWARDERS,
   TEST_ONLY_FEATURES,
+  WORKER_EXTERNAL_ALLOW,
+  checkGlobalAllocators,
   checkGraph,
   checkManifests,
   lintLevel,
@@ -268,15 +272,22 @@ for (const pkg of ["atlas-duck-cli", "atlas-duck-sandbox-worker"]) {
   for (const banned of BANNED) {
     test(`${pkg} with ${banned} in its closure (transitively) is a violation`, () => {
       const e = baseEdges();
-      e[pkg].push("some-wrapper");
-      e["some-wrapper"] = [banned];
+      // The worker's direct external edges are allow-listed (M8 T1), so the wrapper is an allowed name.
+      const wrapper = pkg === "atlas-duck-sandbox-worker" ? "serde_json" : "some-wrapper";
+      e[pkg].push(wrapper);
+      e[wrapper] = [banned];
       assert.deepEqual(graph(e), [`${pkg}: banned crate ${banned} in normal-dependency closure (§2.1)`]);
     });
   }
   for (const crate of ["tauri", "wry"]) {
     test(`${pkg} with ${crate} in its closure is a violation`, () => {
       const e = baseEdges();
-      e[pkg].push(crate);
+      if (pkg === "atlas-duck-sandbox-worker") {
+        e[pkg].push("serde_json");
+        e["serde_json"] = [crate];
+      } else {
+        e[pkg].push(crate);
+      }
       assert.deepEqual(graph(e), [
         `${pkg}: ${crate} in normal-dependency closure; nothing but app depends on Tauri (§2.2)`,
       ]);
@@ -331,21 +342,102 @@ for (const feature of ["loader", "dyn-load", "parallel"]) {
   });
 }
 
-// `futures` is not a §9.3 ban: §9.3 leaves it to the plan with the M8 loop
-// design. It is an M1-only rule, with its own message and no bare "(§9.3)".
-test("rquickjs feature futures (declared or resolved) is an M1-only violation, not a §9.3 ban", () => {
+// `futures` is not a §9.3 ban: §9.3 left it to the M8 loop design, which decided it off. It has
+// its own reason and no bare "(§9.3)".
+test("rquickjs futures is banned with the M8 reason", () => {
   const declared = baseEdges();
   declared["atlas-duck-sandbox-worker"].push({ name: "rquickjs", req: "=0.14.0", features: ["macro", "futures"] });
   assert.deepEqual(graph(declared), [
-    "atlas-duck-sandbox-worker: rquickjs feature futures is not allowed in M1: M8 decides (§9.3/§15)",
+    "atlas-duck-sandbox-worker: rquickjs feature futures is decided off in M8 (PD-131, §9.3/§15 V15)",
   ]);
 
   const resolved = baseEdges();
   resolved["atlas-duck-sandbox-worker"].push({ name: "rquickjs", req: "=0.14.0", features: ["full"] });
   assert.ok(
     graph(resolved, { resolvedFeatures: { rquickjs: ["full", "futures"] } }).includes(
-      "rquickjs: resolved feature futures is not allowed in M1: M8 decides (§9.3/§15)",
+      "rquickjs: resolved feature futures is decided off in M8 (PD-131, §9.3/§15 V15)",
     ),
+  );
+});
+
+// ---------- M8 Task 1: worker allow-list, host ban list, global allocator scan ----------
+
+test("sandbox-worker may link exactly the allowed external crates", () => {
+  const e = baseEdges();
+  e["atlas-duck-sandbox-worker"].push(
+    { name: "rquickjs", req: "=0.14.0", features: ["macro"], uses_default_features: false },
+    "serde_json",
+    "libc",
+    "windows-sys",
+    "landlock",
+    "seccompiler",
+    "syscalls",
+    { name: "proptest", kind: "dev" },
+  );
+  assert.deepEqual(graph(e), []);
+});
+
+test("sandbox-worker gains no dependency (fixture adds tokio -> violation)", () => {
+  const e = baseEdges();
+  e["atlas-duck-sandbox-worker"].push("tokio");
+  assert.deepEqual(graph(e), [
+    `atlas-duck-sandbox-worker: external dependency tokio is not allowed; only ${WORKER_EXTERNAL_ALLOW.join(", ")} (M8 T1)`,
+  ]);
+});
+
+test("sandbox-host may use tokio and async-trait", () => {
+  const e = baseEdges();
+  e["atlas-duck-sandbox-host"].push("tokio", "async-trait", "serde", "serde_json", "libc", "windows-sys");
+  assert.deepEqual(graph(e), []);
+});
+
+for (const banned of [...BANNED_IN_SANDBOX_HOST.filter((b) => !["tauri", "wry"].includes(b))]) {
+  test(`sandbox-host may not link ${banned} (fixture adds it through a wrapper -> violation)`, () => {
+    const e = baseEdges();
+    e["atlas-duck-sandbox-host"].push("some-wrapper");
+    e["some-wrapper"] = [banned];
+    assert.deepEqual(graph(e), [`atlas-duck-sandbox-host: banned crate ${banned} in normal-dependency closure (§2.2)`]);
+  });
+}
+
+test("sandbox-host may not link an HTTP client (fixture adds reqwest -> violation)", () => {
+  const e = baseEdges();
+  e["atlas-duck-sandbox-host"].push("reqwest");
+  assert.deepEqual(graph(e), ["atlas-duck-sandbox-host: banned crate reqwest in normal-dependency closure (§2.2)"]);
+});
+
+test("sandbox-host with tauri in its closure is reported once, by the Tauri rule", () => {
+  const e = baseEdges();
+  e["atlas-duck-sandbox-host"].push("tauri");
+  assert.deepEqual(graph(e), [
+    "atlas-duck-sandbox-host: tauri in normal-dependency closure; nothing but app depends on Tauri (§2.2)",
+  ]);
+});
+
+const ALLOC = "#[global_allocator]\nstatic A: Counting = Counting;\n";
+
+test("global_allocator outside the worker bin and tests is a violation", () => {
+  assert.deepEqual(
+    checkGlobalAllocators([
+      { path: "crates/sandbox-worker/src/lib.rs", text: ALLOC },
+      { path: "crates\\core\\src\\lib.rs", text: `fn x() {}\n    ${ALLOC}` },
+    ]),
+    [
+      `crates/sandbox-worker/src/lib.rs: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_BIN} and under tests/ (PD-134)`,
+      `crates/core/src/lib.rs: #[global_allocator] is allowed only in ${GLOBAL_ALLOCATOR_BIN} and under tests/ (PD-134)`,
+    ],
+  );
+});
+
+test("global_allocator is allowed in the sandbox bin and under tests/; comments do not count", () => {
+  assert.deepEqual(
+    checkGlobalAllocators([
+      { path: GLOBAL_ALLOCATOR_BIN, text: ALLOC },
+      { path: "crates/core/tests/budget.rs", text: ALLOC },
+      { path: "crates/sandbox-worker/tests/confined_scripts.rs", text: ALLOC },
+      { path: "crates/sandbox-worker/src/lib.rs", text: "// #[global_allocator] lives in the bin\n" },
+    ]),
+    [],
   );
 });
 
