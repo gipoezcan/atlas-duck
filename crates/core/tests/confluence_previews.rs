@@ -908,6 +908,88 @@ fn storage_styling_raises_source_formatting_removed() -> TestResult {
     Ok(())
 }
 
+/// Lead ruling on T12b fix departure 1: released storage reaches the agent verbatim, so an
+/// attribute the converter does not write into the card is a hidden-instruction vector like a
+/// comment: counted (name to the end of the value) and flagged. An attribute the card shows (a
+/// link's `href`, `ac:name`, an image's `alt`) is not.
+#[test]
+fn storage_attributes_the_card_drops_are_counted_hidden() -> TestResult {
+    let base = page_model("storage", &page_with_storage("<p>LGTM</p>"))?;
+    assert_eq!(infos(&base), []);
+    let delta = |storage: &str| -> Result<(u64, Vec<WarningId>), TestError> {
+        let model = page_model("storage", &page_with_storage(storage))?;
+        Ok((
+            model.header.hidden_in_preview_bytes - base.header.hidden_in_preview_bytes,
+            infos(&model),
+        ))
+    };
+    let flagged = vec![WarningId::SourceFormattingRemoved];
+    // `title="instructions for the agent"`: 5 + 1 + 1 + 26 + 1 = 34 bytes.
+    let title = r#"title="instructions for the agent""#;
+    assert_eq!(title.len(), 34);
+    let (bytes, warnings) = delta(&format!("<p {title}>LGTM</p>"))?;
+    assert_eq!((bytes, warnings), (34, flagged.clone()));
+    // Shown in the card: a link's `href`, an image's `alt`, a macro's `ac:name`.
+    for shown in [
+        r#"<p>LGTM <a href="https://example.com/x">x</a></p>"#,
+        r#"<p>LGTM</p><img src="https://example.com/x.png" alt="a">"#,
+        r#"<p>LGTM</p><ac:structured-macro ac:name="toc"/>"#,
+    ] {
+        assert_eq!(delta(shown)?, (0, vec![]), "{shown}");
+    }
+    // Mixed: `class="c"` (9) and `title="t"` (9) are counted, the `href` is not.
+    assert_eq!(
+        delta(r#"<p class="c">LGTM <a href="https://e.example/" title="t">x</a></p>"#)?,
+        (18, flagged.clone())
+    );
+    // On a macro, `ac:name` is shown and `ac:macro-id="m1"` (11 + 1 + 1 + 2 + 1 = 16) is not.
+    assert_eq!(
+        delta(r#"<p>LGTM</p><ac:structured-macro ac:name="toc" ac:macro-id="m1"/>"#)?,
+        (16, flagged)
+    );
+    Ok(())
+}
+
+/// The same rule for comment bodies (released as storage): the thread counts the dropped
+/// attribute and raises the Info once.
+#[test]
+fn comment_attributes_the_card_drops_are_counted_hidden() -> TestResult {
+    let page = |first: &str| {
+        comment_page(vec![
+            comment("1", &[], None, first),
+            comment("2", &[], None, "<p>ok</p>"),
+        ])
+    };
+    let params = json!({ "id": ID });
+    let plain = model_of(COMMENT_LIST, &params, &page("<p>LGTM</p>"), None)?;
+    let title = r#"title="instructions for the agent""#;
+    let noted = model_of(
+        COMMENT_LIST,
+        &params,
+        &page(&format!("<p {title}>LGTM</p>")),
+        None,
+    )?;
+    assert_eq!(
+        noted.header.hidden_in_preview_bytes - plain.header.hidden_in_preview_bytes,
+        34
+    );
+    assert_eq!(infos(&plain), []);
+    assert_eq!(infos(&noted), [WarningId::SourceFormattingRemoved]);
+    // A shown attribute (a link's `href`) is not counted.
+    let linked = model_of(
+        COMMENT_LIST,
+        &params,
+        &page(r#"<p>LGTM <a href="https://example.com/x">x</a></p>"#),
+        None,
+    )?;
+    assert_eq!(
+        linked.header.hidden_in_preview_bytes,
+        plain.header.hidden_in_preview_bytes
+    );
+    assert_eq!(infos(&linked), []);
+    Ok(())
+}
+
 /// I-1, m-1: in `view`, comments, script and style content and every attribute the sanitizer
 /// does not keep reach the agent and not the card: each counts as hidden, and the Info is raised.
 /// What the card shows (an allowed attribute, a link's URL, an inline raster image) is not.

@@ -711,8 +711,8 @@ enum Markup {
 /// What the local render of released server markup leaves out although the agent receives it.
 #[derive(Default)]
 struct Dropped {
-    /// The bytes dropped: comments; in `view` also script and style element content and every
-    /// attribute the sanitizer does not keep.
+    /// The bytes dropped: comments; every attribute the render does not show (in `view` the
+    /// sanitizer's, in storage the converter's); in `view` also script and style element content.
     bytes: u64,
     /// Styling the render does not apply: a `style` attribute or a `<style>` element.
     styled: bool,
@@ -739,8 +739,10 @@ impl Dropped {
 ///   `<script>` or `<style>` element up to its end tag (or the end); every attribute
 ///   `sanitize_html` does not keep ([`view_keeps`]), from its name to the end of its value.
 ///
-/// Storage attributes the converter drops are not counted (T12b fix report); a storage `style`
-/// attribute or `<style>` element still sets `styled`. Pure; never panics.
+/// In storage every attribute the converter does not write into the card counts too, from its
+/// name to the end of its value ([`storage_surfaces`] lists the ones it shows), since the agent
+/// receives the storage verbatim: `<p title="x">` counts `title="x"`. A storage `style` attribute
+/// or `<style>` element also sets `styled`. Pure; never panics.
 fn dropped_markup(markup: &str, kind: Markup) -> Dropped {
     let mut out = Dropped::default();
     let mut i = 0;
@@ -775,7 +777,11 @@ fn dropped_markup(markup: &str, kind: Markup) -> Dropped {
             let (name, attrs, len) = start_tag(tail);
             for (attr, value, bytes) in attrs {
                 out.styled |= attr.eq_ignore_ascii_case("style");
-                if kind == Markup::View && !view_keeps(name, attr, value) {
+                let surfaced = match kind {
+                    Markup::View => view_keeps(name, attr, value),
+                    Markup::Storage => storage_surfaces(name, attr),
+                };
+                if !surfaced {
                     out.add(bytes);
                 }
             }
@@ -891,6 +897,31 @@ fn view_keeps(tag: &str, attr: &str, value: &str) -> bool {
             true
         }
         ("img", "src") => inline_raster(value),
+        _ => false,
+    }
+}
+
+/// The storage attributes whose value the converter writes into the card (`convert::storage`
+/// `to_md.rs`): `a href`, `img src` and `img alt`; `ac:name` (a macro's name, a parameter's key);
+/// `ac:anchor` of a link; `time datetime` (a date lozenge's date); on an `ri:` element the
+/// attribute its target text is built from (`ri:userkey`, `ri:username`, `ri:space-key`,
+/// `ri:content-title`, `ri:filename`, `ri:value`, `ri:content-id`). Names compare exactly (XML).
+/// Every other attribute (`title`, `class`, `style`, `data-*`, `ac:macro-id`, any other `href` or
+/// `alt`, ...) reaches the agent in the storage and not the card.
+fn storage_surfaces(tag: &str, attr: &str) -> bool {
+    match (tag, attr) {
+        ("a", "href") | ("img", "src" | "alt") | ("time", "datetime") => true,
+        (_, "ac:name" | "ac:anchor") => true,
+        (t, a) if t.starts_with("ri:") => matches!(
+            a,
+            "ri:userkey"
+                | "ri:username"
+                | "ri:space-key"
+                | "ri:content-title"
+                | "ri:filename"
+                | "ri:value"
+                | "ri:content-id"
+        ),
         _ => false,
     }
 }
