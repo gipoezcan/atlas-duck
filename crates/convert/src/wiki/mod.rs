@@ -128,7 +128,9 @@ pub enum CodeKind {
     Noformat,
 }
 
-/// Construct kinds the hard check counts (Δ1, PD-44).
+/// Construct kinds the hard checks count (Δ1, PD-44, PD-97). `Link` and `Markup` are
+/// storage-only (`ac:link`/`ri:page`/an unsafe `<a>`; an element the storage converter never
+/// writes or a foreign namespace): the wiki parser never reports them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConstructKind {
     Macro,
@@ -136,11 +138,13 @@ pub enum ConstructKind {
     Include,
     Image,
     Attachment,
+    Link,
+    Markup,
 }
 
 impl ConstructKind {
     /// Lowercase name for messages and `details` (`macro`, `mention`, `include`, `image`,
-    /// `attachment`).
+    /// `attachment`, `link`, `markup`).
     pub fn as_str(self) -> &'static str {
         match self {
             ConstructKind::Macro => "macro",
@@ -148,6 +152,8 @@ impl ConstructKind {
             ConstructKind::Include => "include",
             ConstructKind::Image => "image",
             ConstructKind::Attachment => "attachment",
+            ConstructKind::Link => "link",
+            ConstructKind::Markup => "markup",
         }
     }
 }
@@ -211,7 +217,9 @@ pub fn wiki_constructs(wiki: &str) -> WikiConstructs {
             SpanKind::Construct(ConstructKind::Include) => &mut out.includes,
             SpanKind::Construct(ConstructKind::Image) => &mut out.images,
             SpanKind::Construct(ConstructKind::Attachment) => &mut out.attachments,
-            SpanKind::Link => &mut out.links,
+            // Never recorded by the wiki parser; listed where a reader would look for them.
+            SpanKind::Construct(ConstructKind::Link) | SpanKind::Link => &mut out.links,
+            SpanKind::Construct(ConstructKind::Markup) => &mut out.macros,
         };
         list.push(s.label);
     }
