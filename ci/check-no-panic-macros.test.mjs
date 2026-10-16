@@ -4,7 +4,15 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { PANIC_ROOTS, removeCfgTest, scanCoverMinting, scanPanicMacros, stripNonCode } from "./check-no-panic-macros.mjs";
+import {
+  NO_THREAD_ROOT,
+  PANIC_ROOTS,
+  removeCfgTest,
+  scanCoverMinting,
+  scanPanicMacros,
+  scanWorkerThreads,
+  stripNonCode,
+} from "./check-no-panic-macros.mjs";
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CORE = "crates/core/src/ops/read.rs";
@@ -297,6 +305,43 @@ test("test code is exempt from the write-cover rules", () => {
   assert.deepEqual(scanCoverMinting("crates/atlassian/src/testing/mod.rs", src), []);
   assert.deepEqual(scanCoverMinting("crates/atlassian/tests/cover.rs", src), []);
   assert.deepEqual(scanCoverMinting("crates/core/src/engine/mod.rs", `#[cfg(test)]\nmod tests {\n${src}\n}`), []);
+});
+
+// ---------- no threads in the sandbox worker (M8 Task 4) ----------
+
+test("thread::spawn, Builder and scope in sandbox-worker/src are violations", () => {
+  assert.equal(NO_THREAD_ROOT, "crates/sandbox-worker/src");
+  const f = "crates/sandbox-worker/src/script/loop_.rs";
+  const src = [
+    "fn a() {",
+    "    std::thread::spawn(|| {});",
+    "    let b = thread::Builder::new();",
+    "    thread::scope(|s| {});",
+    "}",
+    "use std::thread::{self, spawn};",
+    "use std::thread::sleep;",
+  ].join("\n");
+  assert.deepEqual(scanWorkerThreads(f, src), [
+    `${f}:2: thread start in the sandbox worker (§9.3: one thread)`,
+    `${f}:3: thread start in the sandbox worker (§9.3: one thread)`,
+    `${f}:4: thread start in the sandbox worker (§9.3: one thread)`,
+    `${f}:6: thread start in the sandbox worker (§9.3: one thread)`,
+  ]);
+});
+
+test("worker threads in cfg(test), comments, strings and tests/ are not violations", () => {
+  const f = "crates/sandbox-worker/src/confine/linux.rs";
+  const src = [
+    "// thread::spawn is not allowed here",
+    'const S: &str = "thread::spawn";',
+    "#[cfg(test)]",
+    "mod tests {",
+    "    fn helper() { std::thread::spawn(|| {}); }",
+    "}",
+    "fn sleepy() { std::thread::sleep(d); }",
+  ].join("\n");
+  assert.deepEqual(scanWorkerThreads(f, src), []);
+  assert.deepEqual(scanWorkerThreads("crates/sandbox-worker/tests/run_loop.rs", "std::thread::spawn(|| {});"), []);
 });
 
 // ---------- the real workspace ----------

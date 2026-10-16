@@ -17,6 +17,7 @@
 #[allow(unsafe_code)]
 pub mod alloc;
 pub mod interrupt;
+pub(crate) mod loop_;
 mod shim;
 
 use std::cell::{Cell, Ref, RefCell, RefMut};

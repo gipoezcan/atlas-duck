@@ -1,19 +1,24 @@
 //! The atlas-duck sandbox worker (§9.3, §9.4, §3.4).
 //!
-//! A single-threaded process: it confines itself, announces `probe.ready`, then
-//! answers `probe.run` frames on stdin/stdout until stdin reaches EOF. It links
-//! no HTTP client, keychain or database code (§2.1) and never starts a thread
-//! or an async runtime: on Linux the seccomp filter kills `clone` after setup.
-//! A panic ends the process with `EXIT_PANIC` from inside a panic hook, so a
+//! A single-threaded process: it confines itself, announces `probe.ready`, and
+//! the host's first frame picks the mode (plan M8 PD-132): `probe.run` (answer
+//! probes until stdin reaches EOF), `script.compile` (compile only, one reply)
+//! or `script.run` (one script run, [`script`]). It links no HTTP client,
+//! keychain or database code (§2.1) and never starts a thread or an async
+//! runtime: on Linux the seccomp filter kills `clone` after setup
+//! (`ci/check-no-panic-macros.mjs` also refuses `thread::spawn` in `src/`). A
+//! panic ends the process with `EXIT_PANIC` from inside a panic hook, so a
 //! panicking worker never dies by SIGSYS (`abort()` needs `tgkill`, which the
 //! allowlist lacks) and is never scored `Blocked`.
 
 pub mod confine;
 pub mod engine;
+mod oom;
 pub mod probe;
 pub mod script;
 
 use std::io::{self, Read, Write};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::sandbox::frame::{read_frame, write_frame};
@@ -21,37 +26,84 @@ use atlas_duck_ipc::sandbox::probe::{
     ConfinementReport, M_PROBE_READY, M_PROBE_RESULT, M_PROBE_RUN, ProbeReady, ProbeRequest,
     decode_notification, encode_notification,
 };
+use atlas_duck_ipc::sandbox::script::{CompileRequest, M_SCRIPT_COMPILE, M_SCRIPT_RUN, WorkerInit};
 use atlas_duck_ipc::sandbox::{MAX_FRAME_BYTES, WORKER_FRAME_MAX_BYTES};
 
-/// Exit code: clean end (stdin EOF).
+pub use oom::ExitOnOomAlloc;
+pub use script::loop_::{
+    FIELD_TRUNCATED, LINE_TRUNCATED, RESULT_TOO_LARGE_CLASS, SCRIPT_DEADLINE,
+    SCRIPT_DEADLINE_MESSAGE, SCRIPT_OP_BUDGET, SCRIPT_OP_BUDGET_MESSAGE, SCRIPT_STALLED,
+    SCRIPT_STALLED_MESSAGE, SYNTAX_ERROR_CLASS,
+};
+
+use script::alloc::LimitState;
+
+/// Exit code: clean end (stdin EOF, or the one reply of a compile or a run was written).
 pub const EXIT_OK: i32 = 0;
 /// Exit code: stdin or stdout failed (broken pipe, oversized or truncated frame).
 pub const EXIT_IO: i32 = 1;
-/// Exit code: a frame that is not a well-formed `probe.run` notification.
+/// Exit code: a first frame that picks no mode, a malformed `probe.run`, or a
+/// host frame during a run that is not a response to an outstanding call.
 pub const EXIT_PROTOCOL: i32 = 3;
 /// Exit code: a panic (the Rust default panic exit code). Set by the hook
-/// from [`install_panic_hook`]; T15's `score` reads it as `Error`.
+/// from [`install_panic_hook`]; T15's `score` reads it as `Error`. Also an
+/// engine failure that is neither the script's nor the host's.
 pub const EXIT_PANIC: i32 = 101;
+/// Exit code (plan M8 PD-134): the QuickJS allocator refused a request above
+/// `heap_mb`. Nothing is written after the refusal (no terminal frame).
+pub const EXIT_HEAP_LIMIT: i32 = 102;
+/// Exit code (plan M8 PD-134): the process itself is out of memory
+/// ([`ExitOnOomAlloc`] in the worker binary; in-process, an allocation that
+/// failed below `heap_mb`).
+pub const EXIT_PROCESS_LIMIT: i32 = 103;
+
+/// The allocator state of the current run, for the panic hook (PD-134). The
+/// worker runs one script per process; the run loop replaces it per run.
+static RUN_METER: Mutex<Option<Arc<LimitState>>> = Mutex::new(None);
+
+/// Registers the run's allocator state with the panic hook.
+pub(crate) fn set_run_meter(meter: Arc<LimitState>) {
+    *RUN_METER.lock().unwrap_or_else(PoisonError::into_inner) = Some(meter);
+}
+
+/// The exit code of a panic: [`EXIT_HEAP_LIMIT`] while the run's heap limit
+/// was hit (a Rust panic on a failed allocation inside rquickjs must not hide
+/// the limit), [`EXIT_PROCESS_LIMIT`] after a failed allocation below it,
+/// else [`EXIT_PANIC`].
+fn panic_exit_code(meter: Option<&LimitState>) -> i32 {
+    match meter {
+        Some(meter) if meter.heap_refused() => EXIT_HEAP_LIMIT,
+        Some(meter) if meter.system_null() => EXIT_PROCESS_LIMIT,
+        _ => EXIT_PANIC,
+    }
+}
 
 /// Replaces the panic hook with one that ends the process with
-/// [`EXIT_PANIC`] and prints nothing.
+/// [`EXIT_PANIC`] (or a limit code, [`panic_exit_code`]) and prints nothing.
 ///
 /// With the release `panic = "abort"` a panic would call `abort()`, whose
 /// `tgkill` the Linux seccomp allowlist does not allow (T17): the worker would
 /// die by SIGSYS, and a panic before a probe's forbidden call would be scored
 /// `Blocked`. `exit_group` is allowed, so the exit code stays visible to the
 /// host. `process::exit` only tries the stdout lock, so the hook is safe while
-/// [`run`] holds it.
+/// [`run`] holds it; the hook only tries the run-meter lock too.
 pub fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|_info| std::process::exit(EXIT_PANIC)));
+    std::panic::set_hook(Box::new(|_info| {
+        let code = match RUN_METER.try_lock() {
+            Ok(meter) => panic_exit_code(meter.as_deref()),
+            Err(TryLockError::Poisoned(meter)) => panic_exit_code(meter.get_ref().as_deref()),
+            Err(TryLockError::WouldBlock) => EXIT_PANIC,
+        };
+        std::process::exit(code)
+    }));
 }
 
 /// The worker entry point. Runs on the process's main thread.
 ///
 /// The panic hook is installed first, and confinement is applied before the
-/// first stdin read (§9.4). Neither happens inside [`run_with`]: the unit tests
-/// call `run_with` in the test process, which must never confine itself and
-/// must keep its normal panic reporting.
+/// first stdin read (§9.4). Neither happens inside [`run_script_with`] or
+/// [`run_with`]: the tests call them in the test process, which must never
+/// confine itself and must keep its normal panic reporting.
 pub fn run() -> i32 {
     install_panic_hook();
     // A failed confinement is not fatal: the worker still reports
@@ -69,40 +121,103 @@ pub fn run() -> i32 {
         },
     };
     let stdin = io::stdin();
-    let stdout = io::stdout();
-    run_with(confinement, &mut stdin.lock(), &mut stdout.lock())
+    run_script_with(confinement, &mut stdin.lock(), io::stdout().lock())
 }
 
-/// The worker loop over any reader and writer: the `probe.ready` frame
+/// The worker over any reader and writer (PD-132): the `probe.ready` frame
+/// carrying `confinement`, then the host's first frame picks the mode:
+/// - `probe.run`: the probe loop of [`run_with`], from that frame on;
+/// - `script.compile`: `script.compiled` or `script.syntax`, then exit;
+/// - `script.run`: one run (PD-131), then exit;
+/// - stdin EOF: exit 0; anything else: [`EXIT_PROTOCOL`].
+///
+/// The writer is owned and `'static` because the script engine's host port
+/// must be (its natives are `'static`); `io::stdout().lock()` is.
+pub fn run_script_with<R: Read, W: Write + 'static>(
+    confinement: ConfinementReport,
+    input: &mut R,
+    mut output: W,
+) -> i32 {
+    if send_ready(confinement, &mut output).is_err() {
+        return EXIT_IO;
+    }
+    let frame = match read_frame(input, MAX_FRAME_BYTES) {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return EXIT_OK,
+        Err(_) => return EXIT_IO,
+    };
+    let Ok((method, params)) = decode_notification(&frame) else {
+        return EXIT_PROTOCOL;
+    };
+    drop(frame);
+    match method.as_str() {
+        M_PROBE_RUN => match serde_json::from_value::<ProbeRequest>(params) {
+            Ok(request) => probe_loop(Some(request), input, &mut output),
+            Err(_) => EXIT_PROTOCOL,
+        },
+        M_SCRIPT_COMPILE => match serde_json::from_value::<CompileRequest>(params) {
+            Ok(request) => script::loop_::compile_mode(&request, &mut output),
+            Err(_) => EXIT_PROTOCOL,
+        },
+        M_SCRIPT_RUN => match serde_json::from_value::<WorkerInit>(params) {
+            Ok(init) => script::loop_::run_script(init, input, output),
+            Err(_) => EXIT_PROTOCOL,
+        },
+        _ => EXIT_PROTOCOL,
+    }
+}
+
+/// The M1 probe loop over any reader and writer: the `probe.ready` frame
 /// carrying `confinement`, then one `probe.result` per `probe.run`, until EOF.
+/// It runs no scripts (any other frame is [`EXIT_PROTOCOL`]).
 pub fn run_with<R: Read, W: Write>(
     confinement: ConfinementReport,
     input: &mut R,
     output: &mut W,
 ) -> i32 {
+    if send_ready(confinement, output).is_err() {
+        return EXIT_IO;
+    }
+    probe_loop(None, input, output)
+}
+
+/// `probe.ready`, sent before anything is read in every mode (PD-132).
+fn send_ready<W: Write>(confinement: ConfinementReport, output: &mut W) -> io::Result<()> {
     let ready = ProbeReady {
         worker_version: BUILD_ID.to_owned(),
         engine_version: engine::ENGINE_VERSION.to_owned(),
         confinement,
     };
-    if send(output, &encode_notification(M_PROBE_READY, &ready)).is_err() {
-        return EXIT_IO;
-    }
+    send(output, &encode_notification(M_PROBE_READY, &ready))
+}
 
+/// Answers `first` (a request already read) and then one `probe.run` per
+/// frame until EOF.
+fn probe_loop<R: Read, W: Write>(
+    mut first: Option<ProbeRequest>,
+    input: &mut R,
+    output: &mut W,
+) -> i32 {
     loop {
-        let frame = match read_frame(input, MAX_FRAME_BYTES) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return EXIT_OK,
-            Err(_) => return EXIT_IO,
-        };
-        let Ok((method, params)) = decode_notification(&frame) else {
-            return EXIT_PROTOCOL;
-        };
-        if method != M_PROBE_RUN {
-            return EXIT_PROTOCOL;
-        }
-        let Ok(request) = serde_json::from_value::<ProbeRequest>(params) else {
-            return EXIT_PROTOCOL;
+        let request = match first.take() {
+            Some(request) => request,
+            None => {
+                let frame = match read_frame(input, MAX_FRAME_BYTES) {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => return EXIT_OK,
+                    Err(_) => return EXIT_IO,
+                };
+                let Ok((method, params)) = decode_notification(&frame) else {
+                    return EXIT_PROTOCOL;
+                };
+                if method != M_PROBE_RUN {
+                    return EXIT_PROTOCOL;
+                }
+                let Ok(request) = serde_json::from_value::<ProbeRequest>(params) else {
+                    return EXIT_PROTOCOL;
+                };
+                request
+            }
         };
         let reply = probe::run_probe(&request);
         if send(output, &encode_notification(M_PROBE_RESULT, &reply)).is_err() {
@@ -112,7 +227,8 @@ pub fn run_with<R: Read, W: Write>(
 }
 
 /// Writes one frame, refusing a payload above the worker-to-host limit (§3.4).
-fn send<W: Write>(output: &mut W, payload: &[u8]) -> io::Result<()> {
+/// The terminal frame of a run is written by the run loop against its own cap.
+pub(crate) fn send<W: Write>(output: &mut W, payload: &[u8]) -> io::Result<()> {
     if payload.len() > WORKER_FRAME_MAX_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -233,6 +349,45 @@ mod tests {
             &mut Vec::new(),
         );
         assert_eq!(code, EXIT_PROTOCOL);
+    }
+
+    /// PD-134: a panic after a heap refusal exits `EXIT_HEAP_LIMIT`, after a
+    /// failed allocation below the limit `EXIT_PROCESS_LIMIT`, else `EXIT_PANIC`.
+    #[test]
+    fn panic_exit_code_follows_the_run_meter() {
+        use rquickjs::allocator::Allocator;
+        use script::alloc::LimitAllocator;
+
+        assert_eq!(panic_exit_code(None), EXIT_PANIC);
+        let (_, untouched) = LimitAllocator::new(1024);
+        assert_eq!(panic_exit_code(Some(&untouched)), EXIT_PANIC);
+
+        let (mut refusing, refused) = LimitAllocator::new(0);
+        assert!(refusing.alloc(64).is_null());
+        assert!(refused.heap_refused());
+        assert_eq!(panic_exit_code(Some(&refused)), EXIT_HEAP_LIMIT);
+
+        struct NullInner;
+        // SAFETY: never hands out a block, so there is nothing to free or size.
+        unsafe impl Allocator for NullInner {
+            fn alloc(&mut self, _size: usize) -> *mut u8 {
+                std::ptr::null_mut()
+            }
+            fn calloc(&mut self, _count: usize, _size: usize) -> *mut u8 {
+                std::ptr::null_mut()
+            }
+            unsafe fn dealloc(&mut self, _ptr: *mut u8) {}
+            unsafe fn realloc(&mut self, _ptr: *mut u8, _new_size: usize) -> *mut u8 {
+                std::ptr::null_mut()
+            }
+            unsafe fn usable_size(_ptr: *mut u8) -> usize {
+                0
+            }
+        }
+        let (mut failing, exhausted) = LimitAllocator::with_inner(1024, NullInner);
+        assert!(failing.alloc(64).is_null());
+        assert!(exhausted.system_null() && !exhausted.heap_refused());
+        assert_eq!(panic_exit_code(Some(&exhausted)), EXIT_PROCESS_LIMIT);
     }
 
     #[test]

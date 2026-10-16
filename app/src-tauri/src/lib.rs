@@ -291,3 +291,28 @@ pub fn run_gui(background: bool) -> ! {
     app.run(tray::on_run_event);
     std::process::exit(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::{Layout, LayoutError, alloc};
+
+    /// Plan M8 PD-134: the app links the worker crate, which only exports `ExitOnOomAlloc`; the
+    /// app's global allocator stays the system one. With the worker's wrapper installed, the
+    /// refused allocation below would end this test process with exit code 103 instead of
+    /// returning null (with `ci/check-workspace.mjs` `GLOBAL_ALLOCATOR_FILES` this keeps the
+    /// wrapper out of the app).
+    #[test]
+    fn app_global_allocator_is_not_the_worker_wrapper() -> Result<(), LayoutError> {
+        // Larger than any address space: every system allocator refuses it at once.
+        let layout = Layout::from_size_align(isize::MAX as usize, 1)?;
+        // SAFETY: a non-zero size; the only possible block would be freed below, but the system
+        // refuses this size, so `alloc` returns null and nothing is allocated.
+        let block = unsafe { alloc(layout) };
+        if !block.is_null() {
+            // SAFETY: `block` came from `alloc` with this layout.
+            unsafe { std::alloc::dealloc(block, layout) };
+        }
+        assert!(block.is_null());
+        Ok(())
+    }
+}

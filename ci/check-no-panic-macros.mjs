@@ -13,6 +13,9 @@
 //    type may not be renamed (`use .. as`, `type X = ..`) outside the files allowed to mint. A
 //    text tripwire against mistakes, not against a malicious contributor: macro-generated impls
 //    and identifiers pasted together by a macro are not seen.
+// 3. No threads in the sandbox worker (spec §9.3, plan M8 Task 4): `crates/sandbox-worker/src`
+//    outside `#[cfg(test)]` must not name `thread::spawn`, `thread::Builder` or `thread::scope`
+//    (the Linux seccomp filter would kill the `clone`, and confinement covers one thread).
 //
 // Usage: node ci/check-no-panic-macros.mjs
 // Exit 0 = ok. Exit 1 = violations (one `file:line: text` per line on stdout).
@@ -41,6 +44,13 @@ export const ATLASSIAN_COVER_FILE = "crates/atlassian/src/cover.rs";
 export const ENGINE_WRITE_FILE = "crates/core/src/engine/write.rs";
 export const FOR_WRITE_CALLER_FN = "execute";
 export const FOR_WRITE_ALLOWED = [ATLASSIAN_COVER_FILE, ENGINE_WRITE_FILE];
+
+/// M8 Task 4: the worker sources that may start no thread.
+export const NO_THREAD_ROOT = "crates/sandbox-worker/src";
+const THREAD_PATTERNS = [
+  /\bthread\s*::\s*(?:spawn|Builder|scope)\b/g,
+  /\bthread\s*::\s*\{[^}]*\b(?:spawn|Builder|scope)\b/g,
+];
 
 const posix = (p) => p.split(sep).join("/");
 
@@ -208,6 +218,23 @@ export function scanPanicMacros(file, src) {
   return found.sort((a, b) => a.line - b.line).map((f) => f.text);
 }
 
+/** Thread starts in a sandbox-worker source file outside test code (see the header). */
+export function scanWorkerThreads(file, src) {
+  if (isTestFile(file)) return [];
+  const code = removeCfgTest(stripNonCode(src));
+  const found = [];
+  for (const re of THREAD_PATTERNS) {
+    re.lastIndex = 0;
+    let m;
+    while ((m = re.exec(code)) !== null) {
+      found.push(lineOf(code, m.index));
+    }
+  }
+  return [...new Set(found)]
+    .sort((a, b) => a - b)
+    .map((line) => `${posix(file)}:${line}: thread start in the sandbox worker (§9.3: one thread)`);
+}
+
 /** Cover-minting violations of one file (see the header). */
 export function scanCoverMinting(file, src) {
   if (isTestFile(file)) return [];
@@ -312,6 +339,9 @@ export function main(repo = join(dirname(fileURLToPath(import.meta.url)), ".."))
     for (const file of rustFiles(join(repo, root))) {
       violations.push(...scanCoverMinting(relative(repo, file), readFileSync(file, "utf8")));
     }
+  }
+  for (const file of rustFiles(join(repo, NO_THREAD_ROOT))) {
+    violations.push(...scanWorkerThreads(relative(repo, file), readFileSync(file, "utf8")));
   }
   for (const v of violations) console.log(v);
   if (violations.length > 0) return 1;
