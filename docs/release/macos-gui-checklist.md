@@ -30,12 +30,17 @@ For each architecture:
 2. Drag atlas-duck to Applications, then launch it from Applications.
    - Expected: no "damaged" or unidentified-developer dialog. If Gatekeeper blocks it, stop and record the dialog text as FAIL.
 3. Expected: the first-run wizard opens. If the approvals window opens instead, FAIL.
+4. Hardening check (read-only; run once, after the first launch that creates a webview). Run `codesign -dvv` and `codesign -d --entitlements -` on the installed `atlas-duck-app` binary.
+   - Expected: the signature flags include the hardened runtime (`runtime`), and the entitlements output does not contain `com.apple.security.get-task-allow`. The repo's bundle check script is `ci/check-macos-bundle.sh`; compare its result with this step. Any other entitlement key is recorded as a note, not a FAIL, unless the lead rules otherwise: **TBD by lead**.
 
 ## 2. First-run wizard
 
 1. Work through the wizard in its order: create the store, add the mock Jira instance (URL from 0.1), paste the PAT.
 2. Expected: the connection test succeeds against the mock. The PAT is stored in the macOS Keychain; it does not appear in any log or on screen after entry.
 3. Expected: the wizard finishes and the approvals window stays closed until something is submitted.
+4. Setup window rebuild. Stop at step 2 of the wizard (or any later step) with non-secret values entered (for example the instance alias and URL). Close the setup window with the red button. Reopen it from the tray icon.
+   - Expected: the wizard resumes at the same step, and the non-secret values are still filled in.
+   - Expected: the passphrase field is empty. No passphrase is retained across the close and reopen. A retained passphrase is FAIL.
 
 ## 3. CLI submit, toast, reopen, approve
 
@@ -44,6 +49,10 @@ For each architecture:
 3. Click the toast. Expected: the approvals window opens and shows the request.
 4. Close the approvals window with the red button. Expected: the window hides, and atlas-duck keeps running (menu bar icon remains).
 5. Click the Dock icon. Expected: the approvals window reopens (`RunEvent::Reopen`). Note any delay.
+5a. Raise paths show the current queue on the first frame (emit before show). Repeat the raise through each path: the tray icon, the Dock icon (step 5), and the toast click (step 3). Each time, watch the first painted frame of the window.
+   - Expected: the first painted frame already lists the current queue. No stale first frame (an empty or older list that is replaced a moment later) is FAIL.
+   - Expected: the window is shown only after the queue is loaded, so the three paths behave the same.
+   - Stale-frame timing on this build: **TBD by lead** (the test covers the order of emit and show; it does not measure the painted frame on a real WebKit window).
 6. Find the request again and try to approve it **immediately** after it appears. Expected: the Approve button is disabled for the first 1 s after focus or after the candidate changes (inert period, §5.6). Record the observed delay.
 7. Wait until the inert period passes, then approve.
 8. Expected: the CLI process that submitted the request exits with code **0** and prints a receipt. Check with `echo $?`.
@@ -57,11 +66,25 @@ For each architecture:
 3. Open the preview of a Confluence page update with a small diff.
    - Expected: the preview renders in a sandboxed frame with the diff styling applied. Plain unstyled text in the diff means `preview.css` did not load: FAIL and report to the lead (sha256 contingency is the lead's ruling, PD-92 / V24).
 4. Expected: the approvals window opens and responds to clicks. A window that stays blank or hangs on the first click means the isolation origin is wrong on this build (V34 / §6.4): FAIL, record the Developer Tools console error.
+5. Batch approve with a held Enter. Select two or more requests, then press Approve. While the native Confirm dialog appears, hold Enter for about 2 s, then release it.
+   - Expected: the dialog does not confirm while Enter is held or released before the dialog is shown. Nothing is approved.
+   - Expected: only a deliberate press of Enter (or the default button) after the dialog is visible confirms the batch.
+   - Expected: if the batch was not confirmed, the requests stay pending.
+   - The exact hold duration and the key the tester should use to confirm: **TBD by lead** (the existing test covers Enter and Space on a single Approve button, not the native Confirm dialog).
+6. Bidi control characters. Create or edit a request whose editable value field contains a right-to-left override (U+202E) and an isolate character (for example U+2067 ... U+2069). The sample value: **TBD by lead**.
+   - Expected: the control characters are shown visibly neutralised (as a visible marker, not as invisible or as reordering).
+   - Expected: the surrounding text does not reorder. Check the same value in the Detail view as well.
+   - Expected: nothing in the value is executed or rendered as active content.
+7. Window open refusal and canary. In the preview, use the injection payload from the corpus (`window.__pwned=1`, or the payload the lead names: **TBD by lead**). Ask the lead for the payload preview before running this step if it has not been provided.
+   - Expected: no new window opens. Nothing runs (the canary `window.__pwned` stays unset). The window title is unchanged.
+   - Release builds have no devtools, so check the title and the window count only. Do not use devtools to check the canary.
 
 ## 5. Quit, shutdown and restart
 
 1. With no write in flight, press Cmd+Q.
    - Expected: atlas-duck quits without a dialog. The shutdown screen (if shown) says "atlas-duck is saving its log before shutdown".
+   - Expected: the shutdown screen never says "atlas-duck is finishing an approved write" while no write is on the wire.
+   - Logout or system shutdown reason text on macOS: **TBD by lead** (the repo documents the two texts, not the macOS logout path).
 2. Relaunch. Expected: the approvals window and tray behave as in section 3.
 3. Start an approved write, then press Cmd+Q **while the write is on the wire** (use the mock's delay setting, if the lead provides one: **TBD by lead**).
    - Expected: the shutdown screen says "atlas-duck is finishing an approved write".
@@ -93,17 +116,29 @@ Fill one row per check, per architecture. Mark each item `PASS`, `FAIL` or `N/A`
 | Date | Tester | Arch | Build id | Item | Result | Evidence (file name outside repo) |
 |------|--------|------|----------|------|--------|-----------------------------------|
 |      |        | arm64 / x86_64 |  | 1. Install and Gatekeeper |  |  |
+|      |        |      |  | 1.4 Hardening: no get-task-allow (codesign) |  |  |
 |      |        |      |  | 2. Wizard and Keychain PAT |  |  |
+|      |        |      |  | 2.4 Setup window rebuild, no passphrase kept |  |  |
 |      |        |      |  | 3.1 CLI submit and toast |  |  |
 |      |        |      |  | 3.3 Toast opens approvals |  |  |
 |      |        |      |  | 3.5 Hide keeps running |  |  |
 |      |        |      |  | 3.5 Dock reopen (RunEvent::Reopen) |  |  |
+|      |        |      |  | 3.5a Raise paths: current queue on first frame |  |  |
 |      |        |      |  | 3.6 Inert period (1 s) |  |  |
 |      |        |      |  | 3.8 Approve exit 0 with receipt |  |  |
 |      |        |      |  | 4.1 Deny exit 3 |  |  |
 |      |        |      |  | 4.2 Redaction gives `redacted: true` |  |  |
 |      |        |      |  | 4.3 preview.css loads (V24) |  |  |
 |      |        |      |  | 4.4 Isolation origin, no hang (V34) |  |  |
+|      |        |      |  | 4.5 Batch approve, held Enter does not confirm |  |  |
+|      |        |      |  | 4.6 Bidi controls neutralised, no reorder |  |  |
+|      |        |      |  | 4.7 window.open refused, canary unset, title unchanged |  |  |
+|      |        | x64 / arm64 |  | 9.6 Hardening policies on first webview (Windows) |  |  |
+|      |        | x64 / arm64 |  | 9.7 Setup window rebuild (Windows) |  |  |
+|      |        | x64 / arm64 |  | 9.8 Raise paths, current queue on first frame (Windows) |  |  |
+|      |        | x64 / arm64 |  | 9.9 Batch approve, held Enter (Windows) |  |  |
+|      |        | x64 / arm64 |  | 9.10 Bidi controls neutralised (Windows) |  |  |
+|      |        | x64 / arm64 |  | 9.11 window.open refused, canary unset (Windows) |  |  |
 |      |        |      |  | 5.1 Cmd+Q idle, shutdown text |  |  |
 |      |        |      |  | 5.3 Cmd+Q with write on wire, waits, no hang |  |  |
 |      |        |      |  | 5.4 APP_STOP {quit} logged, Verify now |  |  |
@@ -122,6 +157,17 @@ These run on Windows, not on the macOS hosts, and are listed here so they are no
 3. **WebView2 fixed-version runtime on a local disk.** A runtime on a UNC share is blocked by NoRemoteImages. Expected: the app starts with the runtime on a local disk, and fails visibly with the runtime path if the runtime is on a share.
 4. **Hardening DLL restrictions.** Expected: no DLL-load failure dialog during normal use.
 5. **Crash-report directory.** After a forced WebView2 renderer crash (if you can produce one safely), check that the Crashpad reports directory is cleared at next start (V30). Record whether reports were written locally.
+6. **Hardening DLL proof on the first real webview.** Start atlas-duck until the first webview is shown, then read the process mitigation policies of the app process (`atlas-duck-app.exe`) with Process Explorer, or with `Get-ProcessMitigation -Id <pid>` (read-only). Record the output.
+   - Expected: these policies are active, as set in `app\src-tauri\src\startup\hardening.rs` and spec §2.5: `SetDefaultDllDirectories`, `ProcessExtensionPointDisablePolicy`, and `ProcessImageLoadPolicy` with `NoRemoteImages`, `NoLowMandatoryLabelImages`, and `PreferSystem32Images`.
+   - The exact on/off value expected for each policy, and the exact field names in the `Get-ProcessMitigation` output: **TBD by lead** (the spec does not quote them).
+   - Whether the same policies are visible on the `msedgewebview2` child processes: **TBD by lead** (the repo sets them on the app process only; do not record a child-process result as PASS or FAIL without the lead's ruling).
+   - If `ProcessImageLoadPolicy` is not active, record FAIL with the output and the build id. The startup log then contains `startup_mitigation_failed`.
+7. **Setup window rebuild.** Close the setup window mid-wizard with non-secret values entered, then reopen it from the tray. Expected: the wizard resumes at the same step, the non-secret values are filled in, and the passphrase field is empty. Same expectations as §2 step 4 on macOS.
+8. **Raise paths show the current queue (emit before show).** Raise the approvals window through the tray icon, the taskbar, and the toast click. Expected: the first painted frame already lists the current queue. Same expectations as §3 step 5a on macOS.
+9. **Batch approve with a held Enter.** On the native Confirm dialog, hold Enter while the dialog appears. Expected: it does not confirm. Only a deliberate press after the dialog is shown confirms the batch. Hold duration and the key to use: **TBD by lead**. Same expectations as §4 step 5.
+10. **Bidi control characters.** Use the sample value from §4 step 6 in an editable value field and in the Detail view. Expected: the RLO and isolate characters are shown visibly neutralised, and the surrounding text does not reorder. Sample value: **TBD by lead**.
+11. **window.open refusal and canary.** Use the payload from §4 step 7. Expected: no new window opens, `window.__pwned` stays unset, and the window title is unchanged. Release builds have no devtools. Payload preview: **TBD by lead**.
+12. **Shutdown texts.** Covered by item 2 above. Not repeated here.
 
 ## 10. Reporting
 
