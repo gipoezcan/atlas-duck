@@ -1063,6 +1063,14 @@ fn uncaught_microtask_exception_is_a_script_error() -> TestResult {
         if result_json(&settled)? != json!(7) {
             return Err(format!("late: {settled:?}"));
         }
+        // `main` fulfilled before the microtask threw, though its observer's job runs after the
+        // throwing one: main's promise state at the throw decides, not job order.
+        let (settled, _) = run(&init(
+            "queueMicrotask(() => { throw new Error('early'); }); return 7;",
+        ))?;
+        if result_json(&settled)? != json!(7) {
+            return Err(format!("early: {settled:?}"));
+        }
         Ok(())
     })
 }
