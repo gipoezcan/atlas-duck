@@ -23,10 +23,6 @@ on:
   push:
     branches:
       - master
-      # REMOVE AT MERGE: TEMPORARY trigger for the M6 branch. workflow_dispatch runs only a workflow
-      # file that exists on the default branch (see install-probes.yml), and this file is new, so
-      # without this line the Fedora CI-03 and AppImage CI-04 jobs would first run after the merge.
-      - "m6-*"
     tags:
       - "v*"
   workflow_dispatch:
