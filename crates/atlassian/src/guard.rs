@@ -75,6 +75,7 @@ mod tests {
     /// there, add its path here.
     const REGISTRY_PATHS: &[&str] = &[
         "/rest/api/2/myself",
+        "/rest/api/user",
         "/rest/api/2/project",
         "/rest/api/2/project/{key}",
         "/rest/api/2/issue",

@@ -368,6 +368,119 @@ async fn u04_pagination_stays_under_context_path() -> TestResult {
     Ok(())
 }
 
+/// T14 (M3 T10 minor 8): an answer whose `_links` object has no `next` key is the last page, even
+/// when it is full and carries no `total`.
+#[tokio::test]
+async fn links_next_absent_ends_paging() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    // 50 spaces in all, 25 per page: the second page is full and its `_links` has no `next`.
+    Mock::given(path("/rest/api/space"))
+        .respond_with(space_pages(&dc, 50, 0))
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 50));
+    assert_eq!(
+        (out.failure, out.next_start, out.server_total),
+        (None, None, None)
+    );
+    assert_eq!(
+        offsets(&dc.received().await, "start", "limit"),
+        [(Some(0), Some(25)), (Some(25), Some(25))]
+    );
+    Ok(())
+}
+
+/// An endpoint that omits `_links` altogether gives no end signal: paging goes on to the short
+/// page, as before.
+#[tokio::test]
+async fn page_without_links_object_is_no_end_signal() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "").await;
+    let ok = dc.response(200);
+    Mock::given(path("/rest/api/space"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "start").unwrap_or(0);
+            let limit = param(req, "limit").unwrap_or(25);
+            let size = limit.min(60u64.saturating_sub(start));
+            let results: Vec<Value> = (start..start + size).map(|i| json!({"id": i})).collect();
+            ok.clone().set_body_raw(
+                json!({"results": results, "start": start, "limit": limit, "size": size})
+                    .to_string(),
+                "application/json",
+            )
+        })
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 60));
+    assert_eq!(
+        offsets(&dc.received().await, "start", "limit"),
+        [
+            (Some(0), Some(25)),
+            (Some(25), Some(25)),
+            (Some(50), Some(25))
+        ]
+    );
+    Ok(())
+}
+
+/// A present `_links.next` only says "more": its value (here another origin) is never requested,
+/// the next page is rebuilt from the template under the context path.
+#[tokio::test]
+async fn links_next_present_never_followed() -> TestResult {
+    let dc = MockDc::start(Product::Confluence, "/confluence").await;
+    let ok = dc.response(200);
+    Mock::given(path("/confluence/rest/api/space"))
+        .respond_with(move |req: &Request| {
+            let start = param(req, "start").unwrap_or(0);
+            let limit = param(req, "limit").unwrap_or(25);
+            let size = limit.min(40u64.saturating_sub(start));
+            let next = (start + size < 40).then_some("https://elsewhere.example/other?start=999");
+            ok.clone().set_body_raw(
+                confluence_space_page(start, limit, size, next),
+                "application/json",
+            )
+        })
+        .with_priority(1)
+        .mount(dc.server())
+        .await;
+    Mock::given(any())
+        .respond_with(
+            dc.response(200)
+                .set_body_raw(r#"{"results":[]}"#, "application/json"),
+        )
+        .with_priority(10)
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let out = t
+        .client
+        .read_paginated(&test_cover()?, &space_call(25, 0), &ReadBudget::default())
+        .await;
+    assert_eq!((out.end, out.items_fetched), (PageEnd::ResultsEnded, 40));
+    let got = dc.received().await;
+    assert!(
+        got.iter()
+            .all(|r| r.url.path() == "/confluence/rest/api/space"
+                && r.url.host_str() == got[0].url.host_str()),
+        "{:?}",
+        got.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        offsets(&got, "start", "limit"),
+        [(Some(0), Some(25)), (Some(25), Some(25))]
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn fetch_cap_50mib() -> TestResult {
     let dc = MockDc::start(Product::Confluence, "").await;

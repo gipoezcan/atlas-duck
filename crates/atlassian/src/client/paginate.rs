@@ -1,5 +1,6 @@
 //! Offset pagination (§7.2, §7.5). Every page is rebuilt from the op's own endpoint template (or
-//! the search body template) under the configured base URL; `_links.next` is never read. The
+//! the search body template) under the configured base URL; the value of `_links.next` is never
+//! read (its absence in an answer that has a `_links` object is an end signal). The
 //! page arithmetic is the server's: Confluence `start += size`, Jira `startAt += returned items`.
 
 use std::fmt;
@@ -42,6 +43,9 @@ struct PageFacts {
     /// `total` (Jira) or `totalSize` (Confluence search).
     total: Option<u64>,
     is_last: Option<bool>,
+    /// The answer has a `_links` object that holds no `next` key (T14, M3 T10 minor 8). Only the
+    /// key's presence is looked at, never its value; no `_links` object is no signal.
+    links_without_next: bool,
 }
 
 impl PageFacts {
@@ -102,6 +106,7 @@ impl<'de> Visitor<'de> for PageFactsSeed<'_> {
                 "total" => total = leaf.num,
                 "totalSize" => total_size = leaf.num,
                 "isLast" => facts.is_last = leaf.flag,
+                "_links" => facts.links_without_next = leaf.has_next == Some(false),
                 _ => {}
             }
         }
@@ -118,6 +123,8 @@ struct Leaf {
     num: Option<u64>,
     flag: Option<bool>,
     len: Option<u64>,
+    /// For an object: whether it has a `next` key.
+    has_next: Option<bool>,
 }
 
 impl<'de> Deserialize<'de> for Leaf {
@@ -180,8 +187,15 @@ impl<'de> Visitor<'de> for LeafVisitor {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Leaf, A::Error> {
-        while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(Leaf::default())
+        let mut has_next = false;
+        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+            has_next |= key == "next";
+            map.next_value::<IgnoredAny>()?;
+        }
+        Ok(Leaf {
+            has_next: Some(has_next),
+            ..Leaf::default()
+        })
     }
 }
 
@@ -363,12 +377,14 @@ impl InstanceClient {
             };
             start = start.saturating_add(returned);
 
-            // End-of-results signals (§7.2); `_links.next` is not one we read. A page is short
-            // against what was asked and what the server applies, whichever is smaller (V05: a
-            // server may echo a larger page size than the request's).
+            // End-of-results signals (§7.2); the value of `_links.next` is never read, its absence
+            // from a `_links` object is a signal. A page is short against what was asked and what
+            // the server applies, whichever is smaller (V05: a server may echo a larger page size
+            // than the request's).
             let ended = facts.items == 0
                 || returned == 0
                 || facts.is_last == Some(true)
+                || facts.links_without_next
                 || facts.limit.is_some_and(|l| returned < l.min(want))
                 || facts.total.is_some_and(|t| start >= t);
             if ended {
@@ -432,6 +448,10 @@ mod tests {
             limit: num("limit").or_else(|| num("maxResults")),
             total: num("total").or_else(|| num("totalSize")),
             is_last: v.get("isLast").and_then(Value::as_bool),
+            links_without_next: v
+                .get("_links")
+                .and_then(Value::as_object)
+                .is_some_and(|l| !l.contains_key("next")),
         }
     }
 
@@ -451,6 +471,12 @@ mod tests {
             r#""text""#,
             r#"{}"#,
             r#"{"results":[1]} trailing"#,
+            r#"{"results":[1],"_links":{"base":"x"}}"#,
+            r#"{"results":[1],"_links":{"base":"x","next":null}}"#,
+            r#"{"results":[1],"_links":{"nested":{"next":"y"}}}"#,
+            r#"{"results":[1],"_links":["next"]}"#,
+            r#"{"results":[1],"_links":{}}"#,
+            r#"{"_links":{"next":"/a"},"results":[1],"_links":{"base":"x"}}"#,
             "",
         ];
         for key in ["results", "values", "issues", "size"] {
@@ -460,8 +486,22 @@ mod tests {
                     by_value(body.as_bytes(), key),
                 );
                 assert_eq!(
-                    (got.items, got.size, got.limit, got.total, got.is_last),
-                    (want.items, want.size, want.limit, want.total, want.is_last),
+                    (
+                        got.items,
+                        got.size,
+                        got.limit,
+                        got.total,
+                        got.is_last,
+                        got.links_without_next
+                    ),
+                    (
+                        want.items,
+                        want.size,
+                        want.limit,
+                        want.total,
+                        want.is_last,
+                        want.links_without_next
+                    ),
                     "{key} in {body}"
                 );
             }

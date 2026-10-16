@@ -1954,13 +1954,15 @@ async fn search_table_columns_and_count() -> TestResult {
     let mock = wiki(&h)?;
     let mut tricky = search_hit("65538", "Bidi \u{202E}title", "Ops", "blogpost");
     tricky["excerpt"] = json!("line one\nline two");
-    let answer = search_answer(
+    let mut answer = search_answer(
         vec![
             search_hit("65537", "Release checklist", "Docs", "page"),
             tricky,
         ],
         40,
     );
+    // 38 more results: DC sends `_links.next`, its absence would end the results (Task 14).
+    answer["_links"]["next"] = json!("/rest/api/search?cql=space+%3D+DOC&start=2");
     mount_search(mock, &answer).await;
 
     let table = |preview: atlas_duck_preview::Preview| match preview.body {
@@ -2045,5 +2047,201 @@ async fn search_table_columns_and_count() -> TestResult {
         "{:?}",
         preview.warnings
     );
+    Ok(())
+}
+
+// ---- Task 14: paging end signal, I-22 context path and `meta.page` ----------------------------
+
+/// `RedactionOp::DropItem` of the `results` item whose `id` is `id`.
+fn drop_result(id: &str) -> atlas_duck_core::RedactionOp {
+    atlas_duck_core::RedactionOp::DropItem {
+        array_path: "results".into(),
+        key: "id".into(),
+        value: json!(id),
+    }
+}
+
+/// Releases `id` after `ops` redacted the read; returns the released `meta` and `data.result`.
+async fn release_with(
+    h: &Harness,
+    id: &str,
+    ops: Vec<atlas_duck_core::RedactionOp>,
+) -> Result<(Value, Value), TestError> {
+    h.approver().release_redacted(id, ops).map_err(de)?;
+    let env = h.await_(id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    Ok((meta_of(&env)?, result_of(&env)?))
+}
+
+/// The child-page pages of 25 children (`ID`), by `start`: `size` children of `start..` with
+/// `_links.next` on every page but the last (Confluence DC: absent on the last page).
+fn children_page(start: u64, limit: u64, total: u64) -> Value {
+    let size = limit.min(total.saturating_sub(start));
+    let results: Vec<Value> = (start..start + size)
+        .map(|i| {
+            json!({
+                "id": format!("{}", 70_000 + i), "type": "page", "status": "current",
+                "title": format!("Child {i}"), "_links": {"webui": format!("/display/DOC/Child+{i}")}
+            })
+        })
+        .collect();
+    let mut links = json!({"base": "https://wiki.corp.example", "context": "/wiki"});
+    if start + size < total {
+        links["next"] = json!(format!(
+            "/rest/api/content/{ID}/child/page?limit={limit}&start={}",
+            start + size
+        ));
+    }
+    json!({"results": results, "start": start, "limit": limit, "size": size, "_links": links})
+}
+
+/// §13 I-22 (Confluence, direct read): the server answers `_links.next` without the context path
+/// (`/rest/api/space?limit=25&start=25`); page 2 is rebuilt from the template under `/wiki`, and
+/// nothing is requested outside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_confluence_context_path_direct_read() -> TestResult {
+    use atlas_duck_atlassian::testing::fixtures::confluence_space_page;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, Request};
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let ok = mock.response(200);
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/space")))
+        .respond_with(move |req: &Request| {
+            let start = query(req, "start")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0u64);
+            // The server clamps the page size to 25 whatever is asked.
+            let size = 25u64.min(100 - start);
+            ok.clone().set_body_raw(
+                confluence_space_page(
+                    start,
+                    25,
+                    size,
+                    Some("/rest/api/space?limit=25&start=25").filter(|_| start + size < 100),
+                ),
+                "application/json",
+            )
+        })
+        .mount(mock.server())
+        .await;
+
+    let id = queued(&h, "confluence.space.list", json!({ "max": 50 })).await?;
+    let env = released(&h, &id).await?;
+    assert_eq!(
+        result_of(&env)?["results"].as_array().map(Vec::len),
+        Some(25 + 25)
+    );
+    let hits = gets_on(mock, "/rest/api/space").await;
+    let starts: Vec<_> = hits.iter().map(|r| query(r, "start")).collect();
+    assert_eq!(starts, [Some("0".to_owned()), Some("25".to_owned())]);
+    assert!(
+        hits.iter()
+            .all(|r| r.url.path() == mock.path("/rest/api/space")),
+        "{:?}",
+        hits.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
+    );
+    // Nothing was requested outside `/wiki` (the identity GET included).
+    let all = mock.received().await;
+    assert!(
+        all.iter().all(|r| r.url.path().starts_with("/wiki/")),
+        "{:?}",
+        all.iter().map(|r| r.url.to_string()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        meta_of(&env)?["page"],
+        json!({"start": 0, "returned": 50, "total": null, "truncated": true, "next_start": 50})
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_confluence_drops_keep_totals_and_next_start() -> TestResult {
+    use common::confluence::mount_children;
+    let h = Harness::confluence().await?;
+    let pages = [
+        children_page(0, 10, 25),
+        children_page(10, 10, 25),
+        children_page(20, 10, 25),
+    ];
+    mount_children(wiki(&h)?, ID, &pages).await;
+    let id = queued(
+        &h,
+        "confluence.page.children",
+        json!({ "id": ID, "max": 10 }),
+    )
+    .await?;
+    let (meta, result) =
+        release_with(&h, &id, vec![drop_result("70002"), drop_result("70003")]).await?;
+    // §7.5: the page is what the server answered; the drops only lower `returned`.
+    assert_eq!(
+        meta["page"],
+        json!({"start": 0, "returned": 8, "total": null, "truncated": true, "next_start": 10})
+    );
+    assert_eq!(meta["redactions"]["items_dropped"], 2);
+    assert_eq!(result["results"].as_array().map(Vec::len), Some(8));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i22_confluence_next_start_loop_rerequests_no_dropped_item() -> TestResult {
+    use common::confluence::{content_path, mount_children};
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    let pages = [
+        children_page(0, 10, 25),
+        children_page(10, 10, 25),
+        children_page(20, 10, 25),
+    ];
+    mount_children(mock, ID, &pages).await;
+    let mut next = Some(0u64);
+    let mut dropped: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(start) = next {
+        let id = queued(
+            &h,
+            "confluence.page.children",
+            json!({ "id": ID, "max": 10, "start": start }),
+        )
+        .await?;
+        // Every page drops its first two children.
+        let first = |n: u64| format!("{}", 70_000 + start + n);
+        dropped.extend([first(0), first(1)]);
+        let (meta, result) = release_with(
+            &h,
+            &id,
+            vec![drop_result(&first(0)), drop_result(&first(1))],
+        )
+        .await?;
+        seen.extend(
+            result["results"]
+                .as_array()
+                .ok_or("no results")?
+                .iter()
+                .filter_map(|c| c["id"].as_str().map(str::to_owned)),
+        );
+        next = meta["page"]["next_start"].as_u64();
+        assert_eq!(meta["page"]["start"], start);
+    }
+    // The agent followed `next_start` only: it never asked for a range holding a dropped item.
+    let starts: Vec<_> = gets_on(mock, &format!("{}/child/page", content_path(ID)))
+        .await
+        .iter()
+        .map(|r| query(r, "start"))
+        .collect();
+    assert_eq!(
+        starts,
+        [
+            Some("0".to_owned()),
+            Some("10".to_owned()),
+            Some("20".to_owned())
+        ]
+    );
+    assert!(
+        seen.iter().all(|k| !dropped.contains(k)),
+        "a dropped child came back: {seen:?}"
+    );
+    assert_eq!(seen.len(), 25 - 6);
     Ok(())
 }
