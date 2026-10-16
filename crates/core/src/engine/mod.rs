@@ -878,6 +878,18 @@ impl Engine {
         self.identity.epoch(instance_id)
     }
 
+    /// The instance's credential generation (T13 review B-1): it moves before the stored PAT is
+    /// replaced or deleted, so a Confluence read can tell that its identity GET may have run under
+    /// another PAT than its content.
+    pub(crate) fn credential_generation(&self, instance_id: &str) -> u64 {
+        self.identity.credential_generation(instance_id)
+    }
+
+    /// Bumps the credential generation; called right before the keychain changes.
+    pub(crate) fn credential_changing(&self, instance_id: &str) {
+        self.identity.credential_changing(instance_id);
+    }
+
     /// Drops the cached client of `instance_id` (its origin, CA or proxy changed): the next use
     /// builds a new one.
     pub(crate) fn invalidate_client(&self, instance_id: &str) {

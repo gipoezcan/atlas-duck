@@ -21,6 +21,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use atlas_duck_atlassian::{
     AuditCover, BodyFailure, ConnClass, FetchControl, FetchFailure, FetchOutcome, InstanceClient,
@@ -241,6 +242,8 @@ async fn fetch_classified(
     let mut refetched = false;
     loop {
         let seen = engine.identity_epoch(&entry.instance_id);
+        // Taken before the first GET of this attempt (T13 review B-1).
+        let cred_gen = engine.credential_generation(&entry.instance_id);
         let (fetched, http) = match fetch(engine, entry).await {
             Ok(f) => f,
             Err(message) => return Classified::Direct(Direct::internal(message, Vec::new())),
@@ -272,7 +275,12 @@ async fn fetch_classified(
             }
         };
         let (classified, puts) = with_users(engine, entry, classified, &http, deadline).await;
-        match with_identity(engine, entry, classified, &http, deadline, seen, refetched).await {
+        let attempt = Attempt {
+            seen,
+            cred_gen,
+            refetched,
+        };
+        match with_identity(engine, entry, classified, &http, deadline, attempt).await {
             Checked::Proceed(classified) => {
                 puts.apply(engine, &entry.instance_id);
                 return classified;
@@ -289,7 +297,9 @@ async fn fetch_classified(
 }
 
 /// The answer of a read that fetches again after a rename (§7.1): `READ_FETCHED {unavailable:
-/// identity_check}`, audit-only. `false`: the request ended meanwhile.
+/// identity_check}`, audit-only. The pages kept in the control are dropped under the same entry
+/// gate, so a cancel before the second fetch replaces the control does not record them again
+/// (T13 review m-1). `false`: the request ended meanwhile.
 async fn record_first(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
@@ -303,7 +313,19 @@ async fn record_first(
         },
         None,
     );
-    engine.append_pending(entry, vec![first], None).await
+    let ctl = entry.fetch_control();
+    let recorded = engine
+        .append_pending_then(entry, vec![first], None, || {
+            if let Some(c) = ctl {
+                c.clear_pages();
+            }
+        })
+        .await;
+    #[cfg(feature = "testing")]
+    if recorded && let Some(pause) = engine.hooks().pause_before_refetch.clone() {
+        pause.hold().await;
+    }
+    recorded
 }
 
 /// PD-99 (§7.6): the user lookups of a Markdown page body, in `Fetching` after the content
@@ -360,7 +382,11 @@ async fn with_users(
         client: &http.client,
         cover: &cover,
         ctl: &ctl,
-        deadline,
+        // The identity GET that follows keeps its reserve: a slow lookup degrades the text, it
+        // never costs the read (L141, T13 review I-2).
+        deadline: deadline
+            .checked_sub(identity_reserve(engine))
+            .unwrap_or_else(Instant::now),
         // The content and the lookups share the read's byte cap (T11 review I-2).
         max_bytes: engine.read_budget().max_bytes.saturating_sub(rec.size()),
     };
@@ -384,8 +410,33 @@ enum Checked {
     Refetch(Vec<UpstreamResponse>),
 }
 
+/// What [`with_identity`] needs from the fetch attempt it checks.
+#[derive(Clone, Copy)]
+struct Attempt {
+    /// The identity epoch, read before the attempt's first GET.
+    seen: u64,
+    /// The credential generation, read before the attempt's first GET (T13 review B-1).
+    cred_gen: u64,
+    /// The attempt is the re-fetch after a rename.
+    refetched: bool,
+}
+
 /// The op whose answer is the identity answer itself (PD-93: judged, no second GET).
 const USER_CURRENT_OP: &str = "confluence.user.current";
+/// PD-93 (T13 review I-2): the read budget kept for the identity GET of a direct Confluence read.
+/// Its user lookups end this much before the read's deadline; the identity GET runs to the
+/// deadline.
+pub const IDENTITY_RESERVE: Duration = Duration::from_secs(10);
+
+/// [`IDENTITY_RESERVE`]; a test hook replaces it.
+fn identity_reserve(engine: &Engine) -> Duration {
+    #[cfg(feature = "testing")]
+    if let Some(r) = engine.hooks().identity_reserve {
+        return r;
+    }
+    let _ = engine;
+    IDENTITY_RESERVE
+}
 /// The most bytes of an identity answer received (a `user/current` object is about 1 KiB); a
 /// longer one is cut there (`too_large` in its record) and confirms nobody.
 const MAX_IDENTITY_BYTES: u64 = 64 * 1024;
@@ -428,15 +479,26 @@ const _: () = assert!(
 /// Its record follows the T11 review I-1 order (in flight, GET, record, park, in-flight cleared,
 /// commit), so a cancel, an expiry or a quit at any point records it once, with the content kept
 /// in the control (`READ_FETCHED {cancelled_in_flight}`).
+///
+/// Every call loads the stored PAT when it is sent, so a PAT stored or deleted between the
+/// content GET and the identity GET would let the identity GET vouch for a token the content never
+/// used (T13 review B-1). The credential generation of the attempt is compared once the identity
+/// answer is recorded (for `confluence.user.current`, before its answer is judged): any change is
+/// `upstream_unavailable {identity_check}`, retryable, with no re-check and nothing cached.
 async fn with_identity(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
     classified: Classified,
     http: &InstanceHttp,
     deadline: Instant,
-    seen_fetch: u64,
-    refetched: bool,
+    attempt: Attempt,
 ) -> Checked {
+    let Attempt {
+        seen: seen_fetch,
+        cred_gen,
+        refetched,
+    } = attempt;
+    let credential_changed = || engine.credential_generation(&entry.instance_id) != cred_gen;
     let Classified::Item(rec) = classified else {
         return Checked::Proceed(classified);
     };
@@ -455,6 +517,10 @@ async fn with_identity(
         })
     };
     if entry.spec.id == USER_CURRENT_OP {
+        // Fetched under a PAT that may be gone: judged against nobody (B-1).
+        if credential_changed() {
+            return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
+        }
         // Only a 2xx is an identity answer; an upstream error confirms nobody (fail closed).
         let verdict = match rec.responses.last() {
             Some(r) if rec.item == ReleaseItem::Result => judged(r),
@@ -512,6 +578,11 @@ async fn with_identity(
     entry.set_in_flight(None);
     if !engine.append_pending(entry, vec![record], None).await {
         return Checked::Ended(Classified::Cancelled);
+    }
+    // The content and the identity answer may have been fetched under different PATs (B-1):
+    // whatever the answer says, it is not attributed to the content.
+    if credential_changed() {
+        return Checked::Ended(Classified::Direct(unconfirmed(rec.responses)));
     }
     let answer = match outcome {
         FetchOutcome::Response(r) => r,

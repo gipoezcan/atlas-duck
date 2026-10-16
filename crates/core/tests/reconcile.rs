@@ -850,8 +850,11 @@ async fn crash_after_identity_fetch_reconciles_as_read() -> TestResult {
         .submit("confluence.page.get", json!({ "id": "65537" }))
         .await;
     let id = request_id(&env)?;
-    // The lookup is committed; the identity GET's record is the crash point.
-    pause.reached.notified().await;
+    // The lookup is committed; the identity GET's record is the crash point. Bounded: a change that
+    // skips the hook fails here instead of hanging (T13 review I-3).
+    tokio::time::timeout(Duration::from_secs(20), pause.reached.notified())
+        .await
+        .map_err(|_| "hook never reached")?;
     let freeze = h.plan().freeze_after(EventType::PREVIEW_FETCH);
     pause.release.notify_one();
     tripped(&freeze).await?;

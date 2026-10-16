@@ -1351,22 +1351,25 @@ async fn oversized_lookup_answer_is_null_and_not_cached() -> TestResult {
     Ok(())
 }
 
-/// I-2: a lookup is cut at the read's deadline (`timeout`): the read ends within its budget, not
-/// at the 30 s per-call timeout, and the next key is `null` (less than the reserve is left). The
-/// identity GET that follows (PD-93) finds the budget spent: the read is the read-budget outcome
-/// item, with the content and nothing cached.
+/// I-2: a lookup is cut at the read's deadline less the identity GET's reserve (`timeout`): the
+/// read ends within its budget, not at the 30 s per-call timeout, and the next key is `null` (less
+/// than the reserve is left). A failed lookup never fails the read (L141): the identity GET that
+/// follows (PD-93) has its reserve left, and the read releases with the names `null` (T13 review
+/// I-2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lookup_cut_at_the_read_budget() -> TestResult {
-    // The reserve is shortened to 1 s (T11 fix review m-4): the 3 s budget leaves 2 s of margin for
-    // the first lookup to start, and a lookup that runs to the per-call timeout would take 10 s.
+    // Both reserves are shortened to 1 s (T11 fix review m-4): the 4 s budget cuts the lookups at
+    // 3 s, leaving 2 s of margin for the first one to start and 1 s for the identity GET; a lookup
+    // that runs to the per-call timeout would take 10 s.
     let h = Harness::builder()
         .confluence("wiki")
         .hooks(TestHooks {
             read_budget: Some(ReadBudget {
-                total: Duration::from_secs(3),
+                total: Duration::from_secs(4),
                 ..ReadBudget::default()
             }),
             lookup_reserve: Some(Duration::from_secs(1)),
+            identity_reserve: Some(Duration::from_secs(1)),
             ..TestHooks::none()
         })
         .start()
@@ -1388,17 +1391,28 @@ async fn lookup_cut_at_the_read_budget() -> TestResult {
     assert_eq!(f["path"], "/wiki/rest/api/user?key=key-asmith");
     assert_eq!(looked_up(mock).await, ["key-asmith"]);
     assert_eq!(h.event_types(&id).await?, checked_read(1));
+    let identity = records(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(
+        identity.last().map(|f| &f["purpose"]),
+        Some(&json!("identity"))
+    );
+    assert_eq!(identity.last().map(|f| &f["status"]), Some(&json!(200)));
     let r = read_fetched(&h, &id).await?;
-    assert_eq!(r["outcome"], "timeout", "{r}");
-    assert_eq!(r["cap_or_budget"], "read_budget_120s", "{r}");
-    assert!(r.to_string().contains("Owners"), "{r}");
+    assert!(r.get("outcome").is_none(), "{r}");
+    assert_eq!(
+        r["user_resolutions"],
+        json!({ "key-jdoe": null, "key-asmith": null })
+    );
     assert_eq!(h.user_cached("wiki", "key-asmith"), None);
+    let env = released(&h, &id).await?;
+    assert!(released_value(&env)?.contains("@user:key-asmith"));
     Ok(())
 }
 
 /// m-9 (e): the reserve is measured from the read's deadline, taken before the content GET: a
 /// 4 s budget with a 2 s reserve and a content page that answers after 2.5 s leaves less than the
-/// reserve, so no lookup starts.
+/// reserve, so no lookup starts. (The identity GET's reserve is 0 here, so only the lookup reserve
+/// decides.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lookup_deadline_counts_from_the_read_start() -> TestResult {
     let h = Harness::builder()
@@ -1409,6 +1423,7 @@ async fn lookup_deadline_counts_from_the_read_start() -> TestResult {
                 ..ReadBudget::default()
             }),
             lookup_reserve: Some(Duration::from_secs(2)),
+            identity_reserve: Some(Duration::ZERO),
             ..TestHooks::none()
         })
         .start()

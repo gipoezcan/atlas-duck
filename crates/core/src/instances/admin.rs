@@ -204,6 +204,9 @@ fn delete_stored(engine: &Engine, id: &str, on_request: bool) -> Result<bool, Ad
         None,
     );
     engine.port().append(ev).map_err(AdminError::Audit)?;
+    // Before the keychain changes: a Confluence read in flight concludes nothing from an identity
+    // GET that may run without the token its content was fetched with (T13 review B-1).
+    engine.credential_changing(id);
     if let Err(e) = creds.delete(id) {
         // The record above said the token went; it did not: say so (as `set_token`'s
         // `store_failed`).
@@ -920,6 +923,9 @@ impl InstanceAdmin for CoreInstances {
             identity: identity.clone(),
             expires_at,
         };
+        // Before the keychain changes: a Confluence read in flight concludes nothing from an
+        // identity GET that may run under the new token (T13 review B-1).
+        self.engine.credential_changing(&id);
         let (creds, store_id) = (self.engine.credentials().clone(), id.clone());
         let stored = tokio::task::spawn_blocking(move || creds.store(&store_id, cred))
             .await

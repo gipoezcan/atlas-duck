@@ -17,13 +17,14 @@ use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, fixtures};
 use atlas_duck_audit::EventType;
 use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
 use atlas_duck_core::testing::Harness;
-use atlas_duck_core::{Pause, TestHooks};
+use atlas_duck_core::{Confirm, Pause, TestHooks};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use common::confluence::{content_path, mount_page, mount_users, page_with_storage, user_gets};
 use common::jira::gets_on;
 use common::{TestError, TestResult, code, exit, request_id};
+use secrecy::SecretString;
 use serde_json::{Value, json};
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
 const PAGE_GET: &str = "confluence.page.get";
@@ -35,7 +36,7 @@ const IDENTITY: &str = "/rest/api/user/current";
 const PLAIN: &str = "<p>Quarterly numbers: confidential.</p>";
 const MARKER: &str = "Quarterly numbers";
 /// One mention, looked up before the identity GET.
-const MENTION: &str = r#"<p>Owner <ri:user ri:userkey="key-gone"/>: quarterly numbers.</p>"#;
+const MENTION: &str = r#"<p>Owner <ri:user ri:userkey="key-gone"/>. Quarterly numbers.</p>"#;
 
 fn wiki(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("wiki").ok_or_else(|| "no wiki mock".into())
@@ -457,6 +458,31 @@ async fn rf5a_identity_get_json_401_rechecks() -> TestResult {
     Ok(())
 }
 
+/// Decision 4 (T13 review I-1): a JSON 401 on the identity GET whose re-check finds the token fine
+/// (`Effect::Ordinary`) is no release: the answer is still not attributed to the user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_identity_get_json_401_recheck_passes_is_upstream_unavailable() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(PLAIN)).await;
+    identity_answers_once(mock, json_answer(mock, 401, r#"{"statusCode":401}"#)).await;
+    let id = submit(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let env = failed(&h, &id).await?;
+    assert_eq!(code(&env), "upstream_unavailable", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 6);
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
+    assert_identity_record(&one(&h, &id, EventType::PREVIEW_FETCH).await?, 401);
+    assert_content_audit_only(&h, &id, "identity_check").await?;
+    assert_eq!(rechecks(&h, "start").await?.len(), 1);
+    assert_eq!(state_of(&h), "ok");
+    assert!(
+        h.events_of(EventType::INSTANCE_STATE_CHANGED)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
 /// A body-decided failure of the identity GET (truncated JSON) is gated like every body-decided
 /// read failure: an outcome item, never `READ_FAILED`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -761,6 +787,15 @@ async fn held_read(hooks: TestHooks) -> Result<(Harness, String), TestError> {
     Ok((h, id))
 }
 
+/// Waits until a hook holds, for at most 20 s: a change that skips or moves the hooked step fails
+/// the test instead of hanging it (T13 review I-3).
+async fn reached(pause: &Pause) -> TestResult {
+    tokio::time::timeout(Duration::from_secs(20), pause.reached.notified())
+        .await
+        .map_err(|_| "hook never reached")?;
+    Ok(())
+}
+
 /// Cancels `id` while a hook holds it, then lets the held task go on and waits for it.
 async fn cancel_held(h: &Harness, id: &str, pause: &Pause) -> TestResult {
     let env = h.handler().cancel(id).await;
@@ -780,7 +815,7 @@ async fn cancel_before_identity_park_records_it_in_flight() -> TestResult {
         ..TestHooks::none()
     })
     .await?;
-    pause.reached.notified().await;
+    reached(&pause).await?;
     cancel_held(&h, &id, &pause).await?;
     assert_ended_in_identity(&h, &id, "by_client", EventType::CANCELLED).await?;
     assert_eq!(identity_gets(wiki(&h)?).await.len(), 1);
@@ -797,7 +832,7 @@ async fn cancel_after_identity_answered_records_it_once() -> TestResult {
         ..TestHooks::none()
     })
     .await?;
-    pause.reached.notified().await;
+    reached(&pause).await?;
     cancel_held(&h, &id, &pause).await?;
     assert_eq!(
         types(&h, &id).await?,
@@ -844,4 +879,363 @@ async fn cancel_during_identity_get_of_an_upstream_error_keeps_it() -> TestResul
     let env = h.handler().cancel(&id).await;
     assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
     assert_ended_in_identity(&h, &id, "by_client", EventType::CANCELLED).await
+}
+
+/// m-1: the first answer of a rename re-fetch is recorded once. A cancel after its record
+/// committed and before the second fetch finds the control's kept pages cleared, so the content
+/// is in no second `READ_FETCHED`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_before_rename_refetch_records_the_first_answer_once() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .confluence("wiki")
+        .hooks(TestHooks {
+            pause_before_refetch: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(PLAIN)).await;
+    identity_answers(mock, known(mock, "jdoe2")).await;
+    let id = submit(&h, PAGE_GET, json!({ "id": ID })).await?;
+    reached(&pause).await?;
+    cancel_held(&h, &id, &pause).await?;
+    let fetched = records(&h, &id, EventType::READ_FETCHED).await?;
+    let with_content: Vec<&Value> = fetched
+        .iter()
+        .filter(|r| r.to_string().contains(MARKER))
+        .collect();
+    let [first] = with_content.as_slice() else {
+        return Err(format!(
+            "{} records hold the content: {fetched:?}",
+            with_content.len()
+        )
+        .into());
+    };
+    assert_eq!(first["unavailable"], "identity_check", "{first}");
+    assert_eq!(
+        types(&h, &id).await?.last(),
+        Some(&EventType::CANCELLED),
+        "{fetched:?}"
+    );
+    assert_eq!(gets_on(mock, &content_path(ID)).await.len(), 1);
+    Ok(())
+}
+
+// ---- answers decided from status and headers, oversize (T13 review m-2) ------------------------
+
+/// An identity GET answered `t`, decided from status and headers (`reason`): direct
+/// `upstream_unavailable`, no re-check, the content audit-only, the instance `ok`.
+async fn assert_header_decided(t: fn(&MockDc) -> ResponseTemplate, reason: &str) -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(PLAIN)).await;
+    identity_answers(mock, t(mock)).await;
+    let id = submit(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let env = failed(&h, &id).await?;
+    assert_eq!(code(&env), "upstream_unavailable", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 6);
+    let f = one(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(f["purpose"], "identity", "{f}");
+    assert_eq!(f["class"], reason, "{f}");
+    assert_content_audit_only(&h, &id, reason).await?;
+    assert!(rechecks(&h, "start").await?.is_empty());
+    assert_eq!(identity_gets(mock).await.len(), 1);
+    assert_eq!(state_of(&h), "ok");
+    Ok(())
+}
+
+/// An HTML login page answered with 200 (an SSO front) confirms nobody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_identity_get_html_200_is_direct_upstream_unavailable() -> TestResult {
+    assert_header_decided(
+        |m| {
+            m.response(200)
+                .set_body_raw("<html>Log in</html>", "text/html")
+        },
+        "non_json_2xx",
+    )
+    .await
+}
+
+/// A non-JSON 401 confirms nobody, without a re-check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_identity_get_non_json_401_is_direct_upstream_unavailable() -> TestResult {
+    assert_header_decided(
+        |m| {
+            m.response(401)
+                .set_body_raw("<html>Log in</html>", "text/html")
+        },
+        "non_json_401",
+    )
+    .await
+}
+
+/// Decision 2: an identity answer over 64 KiB is cut there (`too_large` in its record) and
+/// confirms nobody: a direct `upstream_unavailable {identity_check}`, not the 32 MiB card.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_identity_get_oversize_is_direct_upstream_unavailable() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(PLAIN)).await;
+    let big = json!({
+        "type": "known",
+        "username": TEST_USER,
+        "userKey": TEST_USER_KEY,
+        "pad": "x".repeat(100 * 1024),
+    });
+    identity_answers(mock, json_answer(mock, 200, &big.to_string())).await;
+    let id = submit(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let env = failed(&h, &id).await?;
+    assert_eq!(code(&env), "upstream_unavailable", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 6);
+    let f = one(&h, &id, EventType::PREVIEW_FETCH).await?;
+    assert_eq!(f["purpose"], "identity", "{f}");
+    assert_eq!(f["outcome"], "too_large", "{f}");
+    // No outcome card: the content is audit-only, nothing waits for a release.
+    assert_content_audit_only(&h, &id, "identity_check").await?;
+    assert!(rechecks(&h, "start").await?.is_empty());
+    assert_eq!(state_of(&h), "ok");
+    Ok(())
+}
+
+/// A re-fetch whose identity answer fails again (`HeaderCheckFailed`): one re-check only, then
+/// `upstream_unavailable`, both content answers audit-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_refetch_whose_identity_fails_again_is_upstream_unavailable() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(PLAIN)).await;
+    // The identity GET and the re-check see the rename; the re-fetch's identity GET is anonymous.
+    Mock::given(method("GET"))
+        .and(path(mock.path(IDENTITY)))
+        .respond_with(known(mock, "jdoe2"))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    identity_answers(mock, anonymous(mock)).await;
+    let id = submit(&h, PAGE_GET, json!({ "id": ID })).await?;
+    let env = failed(&h, &id).await?;
+    assert_eq!(code(&env), "upstream_unavailable", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 6);
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
+    assert_eq!(
+        types(&h, &id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::PREVIEW_FETCH,
+            EventType::READ_FETCHED,
+            EventType::PREVIEW_FETCH,
+            EventType::READ_FETCHED,
+            EventType::READ_FAILED,
+        ]
+    );
+    for r in records(&h, &id, EventType::READ_FETCHED).await? {
+        assert_eq!(r["unavailable"], "identity_check", "{r}");
+        assert!(r.to_string().contains(MARKER), "{r}");
+    }
+    assert!(h.approver().item(&id).is_none());
+    assert_eq!(rechecks(&h, "start").await?.len(), 1);
+    assert_eq!(gets_on(mock, &content_path(ID)).await.len(), 2);
+    assert_eq!(identity_gets(mock).await.len(), 3);
+    assert_eq!(state_of(&h), "ok");
+    Ok(())
+}
+
+// ---- confluence.user.current answers (T13 review m-2) ------------------------------------------
+
+/// Decision 6: a JSON upstream error of `confluence.user.current` confirms nobody: a direct
+/// `upstream_unavailable`, no upstream-error card, no re-check, the instance `ok`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_user_current_op_upstream_error_is_upstream_unavailable() -> TestResult {
+    for status in [404, 503] {
+        let h = Harness::confluence().await?;
+        let mock = wiki(&h)?;
+        identity_answers(
+            mock,
+            json_answer(
+                mock,
+                status,
+                &json!({"statusCode": status, "message": format!("{MARKER} not here")}).to_string(),
+            ),
+        )
+        .await;
+        let id = submit(&h, USER_CURRENT, json!({})).await?;
+        let env = failed(&h, &id).await?;
+        assert_eq!(
+            code(&env),
+            "upstream_unavailable",
+            "{status}: {}",
+            env.to_json_line()
+        );
+        assert_eq!(exit(&env), 6);
+        assert_eq!(
+            types(&h, &id).await?,
+            [
+                EventType::REQUEST_RECEIVED,
+                EventType::READ_FETCHED,
+                EventType::READ_FAILED,
+            ]
+        );
+        let r = one(&h, &id, EventType::READ_FETCHED).await?;
+        assert_eq!(r["unavailable"], "identity_check", "{r}");
+        assert!(h.approver().item(&id).is_none());
+        assert_eq!(identity_gets(mock).await.len(), 1);
+        assert!(rechecks(&h, "start").await?.is_empty());
+        assert_eq!(state_of(&h), "ok");
+        assert!(
+            h.events_of(EventType::INSTANCE_STATE_CHANGED)
+                .await?
+                .is_empty()
+        );
+    }
+    Ok(())
+}
+
+/// Decision 6: a rename in `confluence.user.current`'s own answer is applied and the op fetches
+/// once more (2 GETs, no re-check GET), then releases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_user_current_op_rename_refetches_once() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    identity_answers(mock, known(mock, "jdoe2")).await;
+    let id = queued(&h, USER_CURRENT, json!({})).await?;
+    assert_eq!(identity_gets(mock).await.len(), 2);
+    assert_eq!(
+        types(&h, &id).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::READ_FETCHED,
+            EventType::READ_FETCHED,
+        ]
+    );
+    let fetched = records(&h, &id, EventType::READ_FETCHED).await?;
+    assert_eq!(
+        fetched[0]["unavailable"], "identity_check",
+        "{}",
+        fetched[0]
+    );
+    assert!(fetched[1].get("unavailable").is_none(), "{}", fetched[1]);
+    assert!(rechecks(&h, "start").await?.is_empty());
+    let changes = h.events_of(EventType::INSTANCE_STATE_CHANGED).await?;
+    assert_eq!(changes.len(), 1, "{changes:?}");
+    assert_eq!(changes[0]["state"], "user_renamed");
+    assert_eq!(changes[0]["new"], "jdoe2");
+    h.approver().release(&id).map_err(common::de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    Ok(())
+}
+
+// ---- a PAT replaced during a read (T13 review B-1) ---------------------------------------------
+
+/// Stores `pat` for the wiki instance, for at most 20 s.
+async fn store_token(h: &Harness, pat: &str) -> TestResult {
+    tokio::time::timeout(
+        Duration::from_secs(20),
+        h.instances()
+            .set_token("wiki", SecretString::from(pat.to_owned()), None),
+    )
+    .await
+    .map_err(|_| "set_token never returned")??;
+    Ok(())
+}
+
+/// B-1: a PAT stored while a read is between its content GET and its identity GET. The identity
+/// GET runs under the new PAT, so its match says nothing about the credential the content was
+/// fetched with: `upstream_unavailable {identity_check}`, retryable, no re-check, nothing cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_token_replaced_during_read_is_upstream_unavailable() -> TestResult {
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .confluence("wiki")
+        .hooks(TestHooks {
+            pause_after_lookups: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(MENTION)).await;
+    mount_users(mock, &[("key-gone", None)]).await;
+    // The connection test of `set_token` (its `user/current` is the harness's known answer).
+    mock.applinks_manifest("9.2.1").await;
+    let id = submit(&h, PAGE_GET, json!({ "id": ID })).await?;
+    reached(&pause).await?;
+    // The same user's fresh PAT, stored while the read holds after its lookups.
+    store_token(&h, "rotated-pat").await?;
+    pause.release.notify_one();
+    let env = failed(&h, &id).await?;
+    assert_eq!(code(&env), "upstream_unavailable", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 6);
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(true));
+    let purposes: Vec<Value> = records(&h, &id, EventType::PREVIEW_FETCH)
+        .await?
+        .iter()
+        .map(|f| f["purpose"].clone())
+        .collect();
+    assert_eq!(purposes, [json!("resolve"), json!("identity")]);
+    assert_content_audit_only(&h, &id, "identity_check").await?;
+    assert!(rechecks(&h, "start").await?.is_empty());
+    assert_eq!(h.user_cached("wiki", "key-gone"), None);
+    assert_eq!(state_of(&h), "ok");
+    assert!(
+        h.events_of(EventType::INSTANCE_STATE_CHANGED)
+            .await?
+            .is_empty()
+    );
+    // The connection test's GET and the read's identity GET.
+    assert_eq!(identity_gets(mock).await.len(), 2);
+    Ok(())
+}
+
+/// B-1 for `confluence.user.current`: its answer was fetched under the PAT that a `set_token`
+/// replaced with another user's. It is not judged against the new identity, so the freshly stored
+/// token is not marked `needs_token`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rf5a_user_current_op_token_replaced_is_upstream_unavailable() -> TestResult {
+    let h = Harness::builder()
+        .confluence("wiki")
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    // The connection test of `set_token` with another user's PAT.
+    Mock::given(method("GET"))
+        .and(path(mock.path(IDENTITY)))
+        .and(header("authorization", "Bearer other-pat"))
+        .respond_with(json_answer(
+            mock,
+            200,
+            &fixtures::confluence_user_current("asmith", "key-asmith"),
+        ))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    mock.applinks_manifest("9.2.1").await;
+    // The op's own GET, under the stored PAT: the stored user, held by the mock.
+    identity_answers(
+        mock,
+        known(mock, TEST_USER).set_delay(Duration::from_secs(5)),
+    )
+    .await;
+    let id = submit(&h, USER_CURRENT, json!({})).await?;
+    wait_identity_gets(mock, 1).await?;
+    store_token(&h, "other-pat").await?;
+    let env = failed(&h, &id).await?;
+    assert_eq!(code(&env), "upstream_unavailable", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 6);
+    let r = one(&h, &id, EventType::READ_FETCHED).await?;
+    assert_eq!(r["unavailable"], "identity_check", "{r}");
+    assert!(rechecks(&h, "start").await?.is_empty());
+    assert!(
+        h.events_of(EventType::INSTANCE_STATE_CHANGED)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(state_of(&h), "ok");
+    assert_eq!(identity_gets(mock).await.len(), 2);
+    Ok(())
 }

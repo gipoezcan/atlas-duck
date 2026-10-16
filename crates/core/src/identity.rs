@@ -323,6 +323,8 @@ struct Gate {
     /// A rename (`user_key`, new name) that is recorded but could not be stored in the
     /// keychain: the next answer under the new name does not record it again (review M-1).
     unstored_rename: Option<(String, String)>,
+    /// Bumped before the stored PAT is replaced or deleted (T13 review B-1).
+    credential: u64,
 }
 
 /// The per-instance gates of [`recheck`].
@@ -422,6 +424,21 @@ impl Gates {
     /// The instance's epoch: a caller reads it before its fetch and passes it to [`recheck`].
     pub(crate) fn epoch(&self, instance_id: &str) -> u64 {
         self.lock().get(instance_id).map_or(0, |g| g.epoch)
+    }
+
+    /// The instance's credential generation: a read takes it before its first GET and compares
+    /// it once its identity GET answered (PD-93, T13 review B-1).
+    pub(crate) fn credential_generation(&self, instance_id: &str) -> u64 {
+        self.lock().get(instance_id).map_or(0, |g| g.credential)
+    }
+
+    /// Called before the stored PAT is replaced or deleted. Every call made after the change
+    /// loads the new PAT after this bump, so a read that compares after its last GET returned sees
+    /// it; a store or delete that then fails only costs one retryable read.
+    pub(crate) fn credential_changing(&self, instance_id: &str) {
+        let mut gates = self.lock();
+        let gate = gates.entry(instance_id.to_owned()).or_default();
+        gate.credential = gate.credential.wrapping_add(1);
     }
 }
 

@@ -687,8 +687,21 @@ impl Engine {
     pub(crate) async fn append_pending(
         self: &Arc<Self>,
         entry: &Arc<RequestEntry>,
+        evs: Vec<NewEvent>,
+        approval: Option<Approval>,
+    ) -> bool {
+        self.append_pending_then(entry, evs, approval, || {}).await
+    }
+
+    /// [`Engine::append_pending`] that runs `committed` once the records committed, still under
+    /// the entry gate: a cancel sees the state from before the append or the one `committed`
+    /// left, never one between them.
+    pub(crate) async fn append_pending_then(
+        self: &Arc<Self>,
+        entry: &Arc<RequestEntry>,
         mut evs: Vec<NewEvent>,
         approval: Option<Approval>,
+        committed: impl FnOnce(),
     ) -> bool {
         let _gate = entry.gate.clone().lock_owned().await;
         {
@@ -711,6 +724,7 @@ impl Engine {
             return false;
         }
         entry.take_parked();
+        committed();
         true
     }
 

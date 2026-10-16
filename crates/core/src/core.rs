@@ -169,9 +169,16 @@ pub struct TestHooks {
     /// The identity GET of a Confluence read (PD-93) holds after it returned and its record is
     /// built, before the record is parked (a cancel there records the GET as in flight).
     pub pause_before_identity_park: Option<Arc<Pause>>,
+    /// A direct read that fetches again after a rename (§7.1) holds after its first answer's
+    /// record committed, before the second fetch (T13 review m-1: a cancel there records that
+    /// answer once).
+    pub pause_before_refetch: Option<Arc<Pause>>,
     /// Replaces the 20 s of read budget that must remain for a user lookup to start
     /// (`LOOKUP_RESERVE`; T11 fix review m-4: short budgets for the lookup cut tests).
     pub lookup_reserve: Option<std::time::Duration>,
+    /// Replaces the 10 s of read budget kept for a direct Confluence read's identity GET: its user
+    /// lookups end that much before the read's deadline (`IDENTITY_RESERVE`, T13 review I-2).
+    pub identity_reserve: Option<std::time::Duration>,
     /// Replaces the 60 s that `shutdown` waits for writes that are `executing` (§2.5 step 4).
     pub shutdown_write_wait: Option<std::time::Duration>,
     /// Replaces the 5 s that `shutdown` lets the cancelled field fills and token re-checks end
