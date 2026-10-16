@@ -7,8 +7,10 @@
 //! `windows`). [`platform_spawner`] returns the one for the running OS.
 //!
 //! M8 (Δ2, PD-137) splits a spawned worker into its pipes, a non-blocking kill
-//! handle and a reaper ([`spawn::WorkerProcess::into_parts`], [`kill`]).
+//! handle and a reaper ([`spawn::WorkerProcess::into_parts`], [`kill`]), and
+//! runs scripts and compile checks over the split worker ([`bridge`], C.8).
 
+pub mod bridge;
 mod drain;
 pub mod identity;
 pub mod kill;

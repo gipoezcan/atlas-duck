@@ -32,6 +32,21 @@ pub struct SandboxBinaryIdentity {
     pub embedded_version: String,
 }
 
+/// The part of the recorded identity that no longer matches (§3.4 "Binary identity re-check",
+/// PD-133): the file parts are M8 Task 10's re-check of the binary on disk; the embedded version
+/// is the bridge's check of a spawned worker's ready frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityPart {
+    FileId,
+    Size,
+    Mtime,
+    /// The binary is gone.
+    Missing,
+    /// The ready frame's `worker_version` differs from the recorded `embedded_version`.
+    EmbeddedVersion,
+}
+
 /// Returns `(file id, size, mtime)` of `path`, following symlinks.
 #[cfg(unix)]
 pub fn file_identity(path: &Path) -> io::Result<(FileId, u64, SystemTime)> {
