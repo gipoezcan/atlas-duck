@@ -1327,10 +1327,10 @@ async fn queue_current(wd: &WebDriver) -> Result<Vec<bool>> {
     Ok(out)
 }
 
-/// Waits until exactly the row at `index` is the opened one.
-async fn wait_current(wd: &WebDriver, index: usize) -> Result<()> {
-    wait_for(
-        &format!("queue row {index} to be the opened one"),
+/// Waits until exactly the row at `index` is the opened one; `step` names the place in the flow.
+async fn wait_current(wd: &WebDriver, index: usize, step: &str) -> Result<()> {
+    let waited = wait_for(
+        &format!("queue row {index} to be the opened one ({step})"),
         WAIT,
         || async {
             let now = queue_current(wd).await?;
@@ -1338,7 +1338,49 @@ async fn wait_current(wd: &WebDriver, index: usize) -> Result<()> {
             Ok((only && now.get(index) == Some(&true)).then_some(()))
         },
     )
-    .await
+    .await;
+    match waited {
+        Ok(()) => Ok(()),
+        Err(e) => Err(format!("{e}: {}", queue_state(wd).await).into()),
+    }
+}
+
+/// The queue rows and the open card, for a failure text: each row's op id and raw `aria-current`,
+/// the card's op id, and where the focus is (the active element's tag and title).
+async fn queue_state(wd: &WebDriver) -> String {
+    let mut rows = Vec::new();
+    match wd.find_all(".queue-item").await {
+        Ok(found) => {
+            for row in &found {
+                let op = match wd.find_all_in(row, ".op-id").await {
+                    Ok(ops) => match ops.first() {
+                        Some(op) => wd.text(op).await.unwrap_or_else(|e| format!("({e})")),
+                        None => "(no op id)".to_owned(),
+                    },
+                    Err(e) => format!("({e})"),
+                };
+                let current = wd.attribute(row, "aria-current").await;
+                rows.push(format!("{op} aria-current={current:?}"));
+            }
+        }
+        Err(e) => rows.push(format!("the rows are unreadable ({e})")),
+    }
+    let card = match wd.find("article.detail .detail-summary .op-id").await {
+        Ok(op) => wd.text(&op).await.unwrap_or_else(|e| format!("({e})")),
+        Err(_) => "none".to_owned(),
+    };
+    let focus = match wd.active_element().await {
+        Ok(active) => {
+            let tag = wd.property(&active, "tagName").await.ok().flatten();
+            let title = wd.attribute(&active, "title").await.ok().flatten();
+            format!("{tag:?} title {title:?}")
+        }
+        Err(e) => format!("unreadable ({e})"),
+    };
+    format!(
+        "{} rows {rows:?}, open card {card}, focus on {focus}",
+        rows.len()
+    )
 }
 
 /// The first of `children` to end within `within`: its index and status, or `None`.
@@ -1410,16 +1452,20 @@ async fn chords(rig: &Rig) -> Result<()> {
     };
     wd.click(open_first).await?;
     first_preview_row(wd, WAIT).await?;
-    wait_current(wd, 0).await?;
+    wait_current(wd, 0, "after Open on the first row").await?;
     // Focus on the page, the inert period over: the chords below are live.
     decision_button(wd).await?;
 
-    // Next and previous move the opened row.
+    // Next and previous move the opened row. `first_preview_row` switches the driver into the
+    // frame, and WebKitWebDriver's frame switch focuses that frame (its "switch to browsing
+    // context" focuses the frame it enters): as for a user, a click outside the frame comes before
+    // the next chord (`decision_button` clicks the heading and waits out the inert period).
     wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
-    wait_current(wd, 1).await?;
+    wait_current(wd, 1, "after the first Ctrl+Shift+Down").await?;
     first_preview_row(wd, WAIT).await?;
+    decision_button(wd).await?;
     wd.chord(&ctrl_shift, keys::ARROW_UP).await?;
-    wait_current(wd, 0).await?;
+    wait_current(wd, 0, "after Ctrl+Shift+Up").await?;
     first_preview_row(wd, WAIT).await?;
 
     // Focus inside the preview frame: the same chords do nothing to the page.
@@ -1468,7 +1514,7 @@ async fn chords(rig: &Rig) -> Result<()> {
     // A click outside brings the chords back: next, then the decision chord on the neighbour.
     decision_button(wd).await?;
     wd.chord(&ctrl_shift, keys::ARROW_DOWN).await?;
-    wait_current(wd, 1).await?;
+    wait_current(wd, 1, "after Ctrl+Shift+Down outside the frame").await?;
     first_preview_row(wd, WAIT).await?;
     decision_button(wd).await?;
     wd.chord(&ctrl_shift, keys::ENTER).await?;

@@ -604,6 +604,24 @@ impl WebDriver {
         self.find_by(Using::XPath, xpath).await
     }
 
+    /// "Find Elements From Element" (CSS): the matches under `e`.
+    pub async fn find_all_in(&self, e: &Element, css: &str) -> Result<Vec<Element>> {
+        let v = self
+            .post(
+                &format!("/element/{}/elements", e.0),
+                find_request(Using::Css, css),
+            )
+            .await?;
+        parse_elements(&v)
+    }
+
+    /// "Get Active Element": the focused element of the current browsing context's document (for
+    /// failure texts: where a key would go).
+    pub async fn active_element(&self) -> Result<Element> {
+        let v = self.get("/element/active").await?;
+        parse_element(&v)
+    }
+
     /// Waits until some element matches (CSS), at most `within`.
     pub async fn wait_find(&self, css: &str, within: Duration) -> Result<Element> {
         wait_for(css, within, || async {
