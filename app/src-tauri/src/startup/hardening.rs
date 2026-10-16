@@ -33,7 +33,11 @@ pub const WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: &str = "WEBVIEW2_ADDITIONAL_BRO
 /// environment and log a warning: `--remote-debugging*` inside
 /// `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, `WEBVIEW2_USER_DATA_FOLDER`, `WEBKIT_INSPECTOR_SERVER`,
 /// `WEBKIT_INSPECTOR_HTTP_SERVER`, `LD_PRELOAD`, `GTK_MODULES`, `GIO_EXTRA_MODULES`."
-pub const SCRUBBED: [&str; 7] = [
+///
+/// Plus [`ENV_WEBVIEW_AUTOMATION`] (M6 final review): `tauri-runtime-wry` reads it in every build
+/// (no `debug_assertions` gate) and, set to `true`, lets WebKitGTK be automated for the first web
+/// context. It opens no port alone, but a release build should not answer a driver.
+pub const SCRUBBED: [&str; 8] = [
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS,
     "WEBVIEW2_USER_DATA_FOLDER",
     "WEBKIT_INSPECTOR_SERVER",
@@ -41,7 +45,11 @@ pub const SCRUBBED: [&str; 7] = [
     "LD_PRELOAD",
     "GTK_MODULES",
     "GIO_EXTRA_MODULES",
+    ENV_WEBVIEW_AUTOMATION,
 ];
+
+/// The variable `tauri-runtime-wry` reads to allow WebKit automation.
+pub const ENV_WEBVIEW_AUTOMATION: &str = "TAURI_WEBVIEW_AUTOMATION";
 
 /// §2.5 (verbatim): "`WEBVIEW2_BROWSER_EXECUTABLE_FOLDER` is kept for fixed-version enterprise
 /// deployments."
@@ -160,10 +168,11 @@ pub const ENV_E2E_ALLOW_DRIVER: &str = "ATLAS_DUCK_E2E_ALLOW_DRIVER";
 /// What the E2E opt-in leaves alone: the webview driver variables only. `LD_PRELOAD`, `GTK_MODULES`
 /// and `GIO_EXTRA_MODULES` are scrubbed whatever the opt-in says.
 #[cfg(feature = "scripted-approver")]
-pub const DRIVER_EXEMPT: [&str; 3] = [
+pub const DRIVER_EXEMPT: [&str; 4] = [
     WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS,
     "WEBVIEW2_USER_DATA_FOLDER",
     "WEBKIT_INSPECTOR_SERVER",
+    ENV_WEBVIEW_AUTOMATION,
 ];
 
 /// The names the E2E opt-in exempts for this environment: [`DRIVER_EXEMPT`] when
@@ -391,6 +400,7 @@ mod tests {
                 "LD_PRELOAD",
                 "GTK_MODULES",
                 "GIO_EXTRA_MODULES",
+                "TAURI_WEBVIEW_AUTOMATION",
             ]
         );
         assert!(!SCRUBBED.contains(&KEPT));
@@ -507,6 +517,21 @@ mod tests {
         assert!(plan.actions.is_empty());
     }
 
+    /// A release build has no exemption (the feature is compiled out), so it scrubs
+    /// `TAURI_WEBVIEW_AUTOMATION` even with the opt-in variable set: `scrub_plan` is what
+    /// `apply_early` uses there.
+    #[test]
+    fn webview_automation_is_scrubbed_without_an_exemption() {
+        let env = env_of(&[
+            (ENV_WEBVIEW_AUTOMATION, "true"),
+            ("ATLAS_DUCK_E2E_ALLOW_DRIVER", "1"),
+        ]);
+        assert_eq!(
+            scrub_plan(&env).actions,
+            [(ENV_WEBVIEW_AUTOMATION, EnvAction::Remove)]
+        );
+    }
+
     /// Without the E2E opt-in (every build but `scripted-approver` + the variable) the plan is
     /// exactly the §2.5 scrub: `scrub_plan` takes no exemption.
     #[test]
@@ -548,6 +573,34 @@ mod tests {
                     "GIO_EXTRA_MODULES"
                 ]
             );
+        }
+
+        /// The e2e rigs set `TAURI_WEBVIEW_AUTOMATION=true` themselves (`ci/e2e-drive.py`, next to
+        /// the opt-in): under the opt-in the scrub leaves it, without the opt-in it goes.
+        #[test]
+        fn the_opt_in_keeps_the_webview_automation_variable() {
+            let with = env_of(&[
+                (ENV_E2E_ALLOW_DRIVER, "1"),
+                (ENV_WEBVIEW_AUTOMATION, "true"),
+            ]);
+            assert!(
+                scrub_plan_exempting(&with, driver_exemptions(&with))
+                    .actions
+                    .is_empty()
+            );
+            // Negative control: without the opt-in (or with a wrong value of it) it is removed.
+            for opt_in in [None, Some("0"), Some("true")] {
+                let mut pairs = vec![(ENV_WEBVIEW_AUTOMATION, "true")];
+                if let Some(v) = opt_in {
+                    pairs.push((ENV_E2E_ALLOW_DRIVER, v));
+                }
+                let env = env_of(&pairs);
+                assert_eq!(
+                    scrub_plan_exempting(&env, driver_exemptions(&env)).actions,
+                    [(ENV_WEBVIEW_AUTOMATION, EnvAction::Remove)],
+                    "{opt_in:?}"
+                );
+            }
         }
 
         #[test]
