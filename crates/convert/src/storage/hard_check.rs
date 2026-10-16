@@ -9,7 +9,8 @@
 //! - (a)–(c) every `ac:`/`ri:` element, every element outside the converter's own set (or with
 //!   attributes it never writes) and every `<a>` whose `href` is not `http`, `https` or `mailto`
 //!   is unrecorded unless it is a trusted code macro; so is a comment (the converter writes
-//!   none outside CDATA), as `Markup`;
+//!   none outside CDATA), as `Markup`; and so is a CDATA section outside every construct (the
+//!   converter writes CDATA only inside a code macro);
 //! - (d) a record is trusted only when its range is exactly one `ac:structured-macro` element of
 //!   the tree written byte for byte as the converter writes a code macro: `ac:name="code"` and
 //!   no other attribute, an optional first `ac:parameter ac:name="language"` holding one word of
@@ -53,12 +54,19 @@ pub fn hard_check_storage(s: &str, e: &EmittedConstructs) -> Result<(), Unrecord
         });
     }
     let trusted = trusted_ranges(s, &doc, e);
-    let mut spans: Vec<(ConstructKind, Range<usize>)> = construct_spans(&doc)
-        .into_iter()
+    let all = construct_spans(&doc);
+    let mut spans: Vec<(ConstructKind, Range<usize>)> = all
+        .iter()
         .filter(|(kind, r)| !(*kind == ConstructKind::Macro && trusted.contains(&(r.start, r.end))))
+        .cloned()
         .collect();
     spans.extend(
         comments(s, &doc)
+            .into_iter()
+            .map(|r| (ConstructKind::Markup, r)),
+    );
+    spans.extend(
+        stray_cdata(&doc, &all)
             .into_iter()
             .map(|r| (ConstructKind::Markup, r)),
     );
@@ -187,6 +195,26 @@ fn comments(s: &str, doc: &StorageDoc) -> Vec<Range<usize>> {
         out.push(at..end);
     }
     out
+}
+
+/// The CDATA sections that lie in no construct span: the converter writes CDATA only in the
+/// body of a code macro (a construct itself, trusted or reported), so any other section is
+/// escaping gone wrong, and counts as `Markup` like a comment. `all` holds the outermost,
+/// disjoint construct spans.
+fn stray_cdata(doc: &StorageDoc, all: &[(ConstructKind, Range<usize>)]) -> Vec<Range<usize>> {
+    let mut spans: Vec<&Range<usize>> = all.iter().map(|(_, r)| r).collect();
+    spans.sort_by_key(|r| r.start);
+    let mut cdata = Vec::new();
+    cdata_ranges(&doc.nodes, &mut cdata);
+    cdata
+        .into_iter()
+        .filter(|c| {
+            let idx = spans.partition_point(|r| r.start <= c.start);
+            !idx.checked_sub(1)
+                .and_then(|i| spans.get(i))
+                .is_some_and(|r| r.start <= c.start && c.end <= r.end)
+        })
+        .collect()
 }
 
 fn cdata_ranges(nodes: &[Node], out: &mut Vec<Range<usize>>) {

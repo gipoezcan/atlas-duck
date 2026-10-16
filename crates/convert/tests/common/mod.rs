@@ -59,8 +59,11 @@ fn code_language(s: &str) -> bool {
 /// foreign element.
 pub fn only_converter_markup(nodes: &[Node]) -> Result<(), String> {
     for n in nodes {
-        let Node::Element(e) = n else {
-            continue;
+        let e = match n {
+            Node::Element(e) => e,
+            Node::Text(_) => continue,
+            // Code macro bodies are `code_macro_shape`'s; CDATA anywhere else is stray.
+            Node::CData { .. } => return Err("CDATA outside a code macro body".to_owned()),
         };
         let attrs: Vec<(&str, &str)> = e
             .attrs
@@ -126,6 +129,36 @@ fn code_macro_shape(m: &Element) -> Result<(), String> {
     if body_ok { Ok(()) } else { Err(bad()) }
 }
 
+fn cdata_ranges(nodes: &[Node], out: &mut Vec<Range<usize>>) {
+    for n in nodes {
+        match n {
+            Node::CData { byte_range, .. } => out.push(byte_range.clone()),
+            Node::Element(e) => cdata_ranges(&e.children, out),
+            Node::Text(_) => {}
+        }
+    }
+}
+
+/// Defence in depth (T6 review m-3): every `&` outside CDATA begins a reference the converter
+/// writes: `&amp;`, `&lt;`, `&gt;`, `&quot;` or a numeric `&#`.
+fn only_known_references(out: &str, nodes: &[Node]) -> Result<(), String> {
+    let mut cdata = Vec::new();
+    cdata_ranges(nodes, &mut cdata);
+    for (i, _) in out.match_indices('&') {
+        if cdata.iter().any(|r| r.contains(&i)) {
+            continue;
+        }
+        let rest = out.get(i..).unwrap_or("");
+        if !["&amp;", "&lt;", "&gt;", "&quot;", "&#"]
+            .iter()
+            .any(|p| rest.starts_with(p))
+        {
+            return Err(format!("unknown reference at {i} in {out:?}"));
+        }
+    }
+    Ok(())
+}
+
 /// The checks every Markdown → storage conversion must pass: no trailing newline,
 /// `check_storage_body` is `Ok`, only converter markup, the construct spans are exactly the
 /// recorded code macros (each a `Macro` span), each record slices one whole code macro, and the
@@ -140,6 +173,7 @@ pub fn check_storage_output(out: &str, e: &EmittedConstructs) -> Result<(), Stri
         return Err(format!("not xml_ok: {out:?}"));
     }
     only_converter_markup(&doc.nodes).map_err(|m| format!("{m} in {out:?}"))?;
+    only_known_references(out, &doc.nodes)?;
     let mut spans = Vec::new();
     for (kind, r) in storage::construct_spans(&doc) {
         if kind != ConstructKind::Macro {

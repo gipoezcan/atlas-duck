@@ -92,6 +92,31 @@ fn u24_storage_code_body_containers() -> TestResult {
     Ok(())
 }
 
+/// T6 review m-2: the converter and the hard check agree on the language pattern's boundaries
+/// (`-` allowed, 32 characters kept, 33 dropped to a plain code macro).
+#[test]
+fn code_language_boundaries_agree() -> TestResult {
+    let max = "a".repeat(32);
+    let over = "a".repeat(33);
+    for (info, lang) in [
+        ("objective-c", Some("objective-c".to_owned())),
+        ("c#", Some("c#".to_owned())),
+        ("x-y z", Some("x-y".to_owned())),
+        (max.as_str(), Some(max.clone())),
+        (over.as_str(), None),
+    ] {
+        let (out, e) = markdown_to_storage(&format!("```{info}\nx\n```\n"));
+        assert_eq!(hard_check_storage(&out, &e), Ok(()), "{info}: {out}");
+        check_storage_output(&out, &e)?;
+        let param = "<ac:parameter ac:name=\"language\">";
+        match lang {
+            Some(l) => assert!(out.contains(&format!("{param}{l}</ac:parameter>")), "{out}"),
+            None => assert!(!out.contains(param), "{out}"),
+        }
+    }
+    Ok(())
+}
+
 /// The faults core's `testing` hook appends (Task 9: `RiUser`, `IncludeMacro`, `AcLink`) and
 /// the markup case, each with the kind it must be reported as.
 const PLAN_FAULTS: [(&str, ConstructKind); 4] = [
@@ -109,7 +134,14 @@ const PLAN_FAULTS: [(&str, ConstructKind); 4] = [
 
 /// More faults, one per PD-97 rule (and the T2 refinement that an `ac:link` to a user or an
 /// attachment is reported as `Mention`/`Attachment`, not `Link`).
-const MORE_FAULTS: [(&str, ConstructKind); 22] = [
+const MORE_FAULTS: [(&str, ConstructKind); 24] = [
+    // T6 review I-1: CDATA is text to a conforming parser, but the converter never writes it
+    // outside a code macro.
+    ("<p><![CDATA[x]]></p>", ConstructKind::Markup),
+    (
+        "<p><![CDATA[<ri:user ri:userkey=\"x\"/>]]></p>",
+        ConstructKind::Markup,
+    ),
     (
         "<ac:structured-macro ac:name=\"excerpt-include\"/>",
         ConstructKind::Include,
@@ -246,6 +278,36 @@ fn hard_check_storage_counts_images_and_links() -> TestResult {
         ),
         unrecorded(ConstructKind::Include, 1)
     );
+    // Document order decides the kind, comments and stray CDATA included (T6 review I-2).
+    for (s, kind) in [
+        (
+            "<p><!-- c --><ri:user ri:userkey=\"x\"/></p>",
+            ConstructKind::Markup,
+        ),
+        (
+            "<p><ri:user ri:userkey=\"x\"/><!-- c --></p>",
+            ConstructKind::Mention,
+        ),
+        (
+            "<p><![CDATA[x]]><ri:user ri:userkey=\"x\"/></p>",
+            ConstructKind::Markup,
+        ),
+        (
+            "<p><ri:user ri:userkey=\"x\"/><![CDATA[x]]></p>",
+            ConstructKind::Mention,
+        ),
+    ] {
+        assert_eq!(hard_check_storage(s, &none), unrecorded(kind, 1), "{s}");
+    }
+    // A CDATA section inside another construct is not counted twice.
+    assert_eq!(
+        hard_check_storage(
+            "<p><ri:user ri:userkey=\"x\"/><ac:structured-macro ac:name=\"html\">\
+             <ac:plain-text-body><![CDATA[x]]></ac:plain-text-body></ac:structured-macro></p>",
+            &none
+        ),
+        unrecorded(ConstructKind::Mention, 1)
+    );
     // Converter output alone passes.
     assert_eq!(
         hard_check_storage(
@@ -270,6 +332,20 @@ fn recorded_code_macro_passes() -> TestResult {
         ),
         code_macro("<ac:plain-text-body><![CDATA[]]></ac:plain-text-body>"),
         code_macro("<ac:plain-text-body><![CDATA[<!-- c --> <!DOCTYPE x>]]></ac:plain-text-body>"),
+        // The language pattern's boundaries (T6 review m-2).
+        code_macro(
+            "<ac:parameter ac:name=\"language\">objective-c</ac:parameter><ac:plain-text-body>\
+             <![CDATA[x]]></ac:plain-text-body>",
+        ),
+        code_macro(
+            "<ac:parameter ac:name=\"language\">c#</ac:parameter><ac:plain-text-body>\
+             <![CDATA[x]]></ac:plain-text-body>",
+        ),
+        code_macro(&format!(
+            "<ac:parameter ac:name=\"language\">{}</ac:parameter><ac:plain-text-body>\
+             <![CDATA[x]]></ac:plain-text-body>",
+            "a".repeat(32)
+        )),
     ];
     for s in &goods {
         assert_eq!(hard_check_storage(s, &whole(s)), Ok(()), "{s}");
@@ -817,6 +893,10 @@ const INFO: &[&str] = &[
     "&lt;",
     "xml",
     "<ri:user/>",
+    "objective-c",
+    "x-y z",
+    "abcdefghijklmnopqrstuvwxyz012345",
+    "abcdefghijklmnopqrstuvwxyz0123456",
 ];
 
 /// A fenced block: backticks or tildes, 3 to 12 long, an info string, a body from the
@@ -989,6 +1069,51 @@ proptest! {
             "md {:?} -> {:?}", md, faulty
         );
     }
+
+    /// The same fault inserted at a random tag boundary (right after a `>` or before a `</`)
+    /// outside the code macros, so nested in lists, cells and links too: still found first,
+    /// with its kind, counted once (T6 review m-1).
+    #[test]
+    fn u24_storage_fuzz_inserted_fault_detected(
+        md in storage_markdown(),
+        fault in prop::sample::select(
+            PLAN_FAULTS.iter().chain(MORE_FAULTS.iter()).copied().collect::<Vec<_>>()
+        ),
+        pick in any::<prop::sample::Index>(),
+    ) {
+        let (out, e) = markdown_to_storage(&md);
+        let points: Vec<usize> = out
+            .char_indices()
+            .filter(|&(i, _)| {
+                let boundary = (i > 0 && out.as_bytes().get(i - 1) == Some(&b'>'))
+                    || out.get(i..).is_some_and(|r| r.starts_with("</"));
+                boundary
+                    && !e
+                        .code_blocks
+                        .iter()
+                        .any(|b| b.byte_range.start < i && i < b.byte_range.end)
+            })
+            .map(|(i, _)| i)
+            .chain([0, out.len()])
+            .collect();
+        let at = points[pick.index(points.len())];
+        let faulty = format!("{}{}{}", &out[..at], fault.0, &out[at..]);
+        // The records after the insertion point move with their macros.
+        let shifted = record(
+            e.code_blocks
+                .iter()
+                .map(|c| {
+                    let by = if c.byte_range.start >= at { fault.0.len() } else { 0 };
+                    rec(c.kind, c.byte_range.start + by..c.byte_range.end + by)
+                })
+                .collect(),
+        );
+        prop_assert_eq!(
+            hard_check_storage(&faulty, &shifted),
+            unrecorded(fault.1, 1),
+            "md {:?} -> {:?} (at {})", md, faulty, at
+        );
+    }
 }
 
 /// The deepest nesting of `blockquote`/`ul`/`ol` elements in parsed storage.
@@ -1018,6 +1143,7 @@ fn fuzz_strategy_reaches_nesting_and_code() -> TestResult {
     let strategy = nested_markdown();
     let mut runner = TestRunner::deterministic();
     let (mut rejected, mut deep, mut code, mut split, mut links, mut cells) = (0, 0, 0, 0, 0, 0);
+    let (mut esc_user, mut esc_macro, mut esc_cdata) = (0, 0, 0);
     for _ in 0..DRAWS {
         let md = strategy
             .new_tree(&mut runner)
@@ -1044,11 +1170,24 @@ fn fuzz_strategy_reaches_nesting_and_code() -> TestResult {
         if out.contains("<td>&lt;") || out.contains("<th>&lt;") {
             cells += 1;
         }
+        if out.contains("&lt;ri:user") {
+            esc_user += 1;
+        }
+        if out.contains("&lt;ac:structured-macro") {
+            esc_macro += 1;
+        }
+        if out.contains("&lt;![CDATA[") {
+            esc_cdata += 1;
+        }
     }
     eprintln!(
         "{DRAWS} draws: rejected {rejected}, container depth >= 10 {deep}, code macros {code}, \
-         split CDATA {split}, links {links}, raw HTML in cells {cells}"
+         split CDATA {split}, links {links}, raw HTML in cells {cells}, escaped constructs: \
+         ri:user {esc_user}, structured-macro {esc_macro}, CDATA {esc_cdata}"
     );
+    assert!(esc_user >= DRAWS / 10, "escaped ri:user: {esc_user}");
+    assert!(esc_macro >= DRAWS / 10, "escaped macro: {esc_macro}");
+    assert!(esc_cdata >= DRAWS / 10, "escaped CDATA: {esc_cdata}");
     assert!(rejected <= DRAWS / 10, "rejected: {rejected}");
     assert!(deep >= DRAWS / 10, "deep: {deep}");
     assert!(code >= DRAWS / 5, "code: {code}");
