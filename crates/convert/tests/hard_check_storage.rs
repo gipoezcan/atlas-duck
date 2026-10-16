@@ -489,6 +489,11 @@ fn hard_check_fails_closed_on_unparsable_output() -> TestResult {
         "<?xml version=\"1.0\"?><p>a</p>",
         "</ad-storage-root><p>a</p>",
         "<p a=\"<\">x</p>",
+        // A comment cannot hold `--`, so a `<!--` inside one is never `xml_ok` (the comment
+        // scan relies on it: each `<!--` outside CDATA starts exactly one comment).
+        "<p>a<!-- x <!-- y --></p>",
+        "<p>a<!-- x -- y --></p>",
+        "<p>a<!-- x</p>",
     ] {
         assert_eq!(
             hard_check_storage(bad, &none),
