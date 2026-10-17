@@ -713,6 +713,67 @@ fn cql_paren_escape_attempt_rejected() -> TestResult {
     Ok(())
 }
 
+/// `n` parentheses around `inner`.
+fn nested(n: usize, inner: &str) -> String {
+    format!("{}{inner}{}", "(".repeat(n), ")".repeat(n))
+}
+
+/// Runs `f` on a thread with a 256 KiB stack (an eighth of a tokio worker's 2 MiB).
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T, String> {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(f)
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "the small-stack thread panicked".to_owned())
+}
+
+/// T30 review I-1: `cql_broad` recurses once per parenthesis level, so a balanced CQL nested
+/// thousands deep (the 20 000-char schema cap allows about 10 000 levels) overflowed the stack and
+/// aborted the app. The tokenizer refuses more than `CQL_MAX_DEPTH` levels: a fixed validation
+/// error before anything is sent, and `cql_broad` never walks such a query.
+#[test]
+fn cql_nesting_deeper_than_the_cap_rejected() -> TestResult {
+    let deep = nested(9_000, "space = DOC");
+    assert!(deep.len() < 20_000);
+    // The preview's rule on the same text, on a small stack: not flagged, no overflow.
+    let walked = deep.clone();
+    assert!(!on_small_stack(move || confluence::cql_broad(&walked))?);
+    let over = nested(confluence::CQL_MAX_DEPTH as usize + 1, "space = DOC");
+    for cql in [&deep, &over] {
+        let e = rejected_cql(cql)?;
+        assert_eq!(e.code, ErrorCode::Validation);
+        assert_eq!(e.details.get("param"), Some(&json!("cql")));
+        assert!(!serde_json::to_string(&e)?.contains("space"));
+        assert!(
+            e.message.contains(&confluence::CQL_MAX_DEPTH.to_string()),
+            "{}",
+            e.message
+        );
+    }
+    // The executor is the validator hook: the same rejection, before any fetch.
+    let r = exec("confluence.search", &json!({ "cql": deep }), None, Some(25))?;
+    assert!(matches!(r, Err(ExecError::Invalid(e)) if e.code == ErrorCode::Validation));
+    Ok(())
+}
+
+/// I-1: exactly `CQL_MAX_DEPTH` levels still parse, and `cql_broad` walks them on a small stack
+/// (the recursion at the cap leaves a wide margin below a worker's stack).
+#[test]
+fn cql_nesting_at_the_cap_parses() -> TestResult {
+    let cap = confluence::CQL_MAX_DEPTH as usize;
+    let narrow = nested(cap, "space = DOC");
+    assert_eq!(
+        confluence::effective_cql(&narrow)?,
+        format!("({narrow}) AND {TYPES}")
+    );
+    let broad = nested(cap, "title ~ x OR label = a");
+    confluence::effective_cql(&broad)?;
+    assert!(!on_small_stack(move || confluence::cql_broad(&narrow))?);
+    assert!(on_small_stack(move || confluence::cql_broad(&broad))?);
+    Ok(())
+}
+
 #[test]
 fn cql_quoted_parens_and_order_by_are_text() -> TestResult {
     assert_eq!(

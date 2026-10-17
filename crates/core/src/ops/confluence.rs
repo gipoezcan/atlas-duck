@@ -51,6 +51,11 @@ const MSG_BACKSLASH: &str = "backslash outside a quoted string";
 const MSG_PARENS: &str = "parentheses do not balance";
 const MSG_ORDER_BY: &str = "ORDER BY is allowed once, at the end, outside parentheses";
 const MSG_EMPTY: &str = "query is empty";
+const MSG_TOO_DEEP: &str = "parentheses nest deeper than 64 levels";
+
+/// The deepest parenthesis nesting a CQL may have (T30 review I-1): [`cql_broad`] recurses once
+/// per level, so the tokenizer bounds it far below what a worker stack holds.
+pub const CQL_MAX_DEPTH: u32 = 64;
 
 fn cql_error(message: &str) -> ValidationError {
     invalid("cql", message, None)
@@ -58,8 +63,8 @@ fn cql_error(message: &str) -> ValidationError {
 
 /// Splits `cql` into tokens with their parenthesis depth (before the token). Quoted strings
 /// (`'…'`, `"…"`, backslash escapes inside) are opaque. Fails closed on an unterminated string,
-/// a backslash outside a string (the server might read the next paren or quote differently) and
-/// parentheses that close below depth 0 or stay open.
+/// a backslash outside a string (the server might read the next paren or quote differently),
+/// parentheses that close below depth 0 or stay open, and nesting deeper than [`CQL_MAX_DEPTH`].
 fn tokenize(cql: &str) -> Result<Vec<(Tok, u32)>, ValidationError> {
     let bytes = cql.as_bytes();
     let mut out = Vec::new();
@@ -86,6 +91,9 @@ fn tokenize(cql: &str) -> Result<Vec<(Tok, u32)>, ValidationError> {
             b'(' => {
                 out.push((Tok::Open, depth));
                 depth += 1;
+                if depth > CQL_MAX_DEPTH {
+                    return Err(cql_error(MSG_TOO_DEEP));
+                }
                 i += 1;
             }
             b')' => {
@@ -247,7 +255,8 @@ fn word_is(cql: &str, tok: &Tok, w: &str) -> bool {
     matches!(*tok, Tok::Word { start, end } if cql[start..end].eq_ignore_ascii_case(w))
 }
 
-/// PD-102: every `OR` alternative of one parenthesis level (`depth`) narrows.
+/// PD-102: every `OR` alternative of one parenthesis level (`depth`) narrows. Recurses once per
+/// level (through [`alternative_narrows`]), at most [`CQL_MAX_DEPTH`] deep: `tokenize` refuses more.
 fn narrows(cql: &str, toks: &[(Tok, u32)], depth: u32) -> bool {
     toks.split(|(t, d)| *d == depth && word_is(cql, t, "or"))
         .all(|alt| alternative_narrows(cql, alt, depth))
