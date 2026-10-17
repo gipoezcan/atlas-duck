@@ -2160,6 +2160,55 @@ fn a_single_mask_of_a_mirror_key_masks_the_mirrored_key() -> TestResult {
     Ok(())
 }
 
+/// Review T19c fix2 n-1: the bare drop of an orphan's mirror key blocks with the entry, and the
+/// entry is tracked like the ones the source flags: once a later op drops it whole nothing is left
+/// to block, and while it stays it is reported where it is. The block used to keep the path of the
+/// key drop's time: an index that no longer existed, or (two orphans) the paired comment 8.
+#[test]
+fn an_orphan_dropped_after_its_key_drop_does_not_block() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let key = |id: &str| drop_field(&format!("{RENDERED}[id={id}].id"), DropScope::PerItem);
+    for (source, ops) in [
+        (one_orphan(), vec![key("9"), drop_id(RENDERED, json!("9"))]),
+        (
+            two_orphans(),
+            vec![
+                key("9"),
+                drop_id(RENDERED, json!("9")),
+                drop_id(RENDERED, json!("11")),
+            ],
+        ),
+        (
+            two_orphans(),
+            vec![
+                drop_field(&format!("{RENDERED}[].id"), DropScope::AllItems),
+                drop_id(RENDERED, json!("9")),
+                drop_id(RENDERED, json!("11")),
+            ],
+        ),
+    ] {
+        let out = apply(&source, r, None, &ops);
+        assert!(out.blocked.is_empty(), "{ops:?}: {:?}", out.blocked);
+        assert!(!released_text(&out, "orphan"), "{ops:?}: {}", out.released);
+    }
+    // The orphan 11 stays: it blocks where the drop of 9 moved it, not at its old `[3]`.
+    let out = apply(
+        &two_orphans(),
+        r,
+        None,
+        &[key("11"), drop_id(RENDERED, json!("9"))],
+    );
+    assert!(has_block(&out, &rendered_orphan(2)), "{:?}", out.blocked);
+    assert!(
+        out.blocked
+            .iter()
+            .all(|b| b.path() != format!("{RENDERED}[3]")),
+        "{:?}",
+        out.blocked
+    );
+    Ok(())
+}
+
 /// Review T19c fix2 n-3: a single-occurrence mask applies to the entry the mirrored entry pairs
 /// with as the drops left them, not as earlier masks left the keys. With both comments' ids masked
 /// on both sides (single masks at the ids, or every occurrence) the keys all read `[REDACTED]`, and

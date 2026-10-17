@@ -255,7 +255,8 @@ struct Redactor<'a> {
     blocked: Vec<BlockReason>,
     also: Vec<String>,
     dropped_on_entries: Vec<DroppedOnEntry>,
-    /// The entries the source's mirror check flags that are still in `doc`, where they now are.
+    /// The entries the source's mirror check flags, and those whose mirror key alone a drop took
+    /// while they had no counterpart, that are still in `doc`, where they now are.
     flagged: Vec<Flagged>,
     /// Every location the drop phase removed, in order: what follows a source location to where
     /// it is now (review T19c I-1').
@@ -451,11 +452,13 @@ impl Redactor<'_> {
                 self.mirrored(&loc, &mut remove);
             }
         }
-        // The key alone of an entry without counterpart: the entry stays, so it blocks.
+        // The key alone of an entry without counterpart: the entry stays, so it blocks, where it
+        // is after the drops and only if a later op does not drop it whole (review T19c fix2 n-1).
         for loc in &remove {
-            if let Some(entry) = mirror::unpaired_key(&self.doc, self.rules.mirrors, loc) {
-                self.blocked.push(BlockReason::MirrorOrphan {
-                    path: path::display(&entry),
+            if let Some(at) = mirror::unpaired_key(&self.doc, self.rules.mirrors, loc) {
+                self.flagged.push(Flagged {
+                    at,
+                    unmatchable: false,
                 });
             }
         }
