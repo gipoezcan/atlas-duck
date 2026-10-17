@@ -1,11 +1,12 @@
 //! U-33 (core half), X-10 (min_version gate), §9.1 step 2 static script checks.
 
 use atlas_duck_core::validate::{
-    EffectiveCaps, JIRA_SYSTEM_FIELDS, MAX_SCRIPT_ARGS_NESTING, MOVE_LIMIT_HINT, SCRIPT_HEAP_K,
-    ValidateCtx, ValidationError, validate, validate_script_submit as validate_script_submit_with,
+    EffectiveCaps, JIRA_SYSTEM_FIELDS, MOVE_LIMIT_HINT, SCRIPT_HEAP_K, ValidateCtx,
+    ValidationError, validate, validate_script_submit as validate_script_submit_with,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_ipc::sandbox::ScriptLimits;
+use atlas_duck_ipc::sandbox::script::MAX_ARGS_NESTING as MAX_SCRIPT_ARGS_NESTING;
 use atlas_duck_registry::{OperationSpec, Product, Version};
 use serde_json::{Value, json};
 

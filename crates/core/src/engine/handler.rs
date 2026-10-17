@@ -319,7 +319,7 @@ fn describe_env(available: bool, script: &ScriptLimits) -> DescribeEnv {
     DescribeEnv {
         limits_source: LimitsSource::Effective,
         available: Some(available),
-        // The configured hard caps are the registry defaults until Settings exist (M6).
+        // No Settings key changes the per-operation hard caps: they are the registry's.
         caps: Value::Null,
         // §2.3: the configured script limits in force (PD-139), what `--limits` may lower.
         script_limits: serde_json::to_value(script).unwrap_or(Value::Null),

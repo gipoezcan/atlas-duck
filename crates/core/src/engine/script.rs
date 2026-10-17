@@ -1554,10 +1554,11 @@ pub(crate) async fn submit(
     );
     // A dry run has no result to release: it reserves nothing (§5.2 names reads and scripts
     // that wait for a release).
+    let live = engine.admission().script_limits();
     let reservation = if peek_dry_run(&p.params) {
         Reservation::none()
     } else {
-        Reservation::script(&engine.admission().script_limits())
+        Reservation::script(&live)
     };
     let ticket = match engine.admission().admit(agent, reservation) {
         Ok(t) => t,
@@ -1579,6 +1580,7 @@ pub(crate) async fn submit(
         conn: conn.clone(),
         ticket,
         gate,
+        live,
     };
     tokio::spawn(record_and_validate(engine.clone(), job))
         .await
@@ -1596,6 +1598,9 @@ struct Received {
     /// Held until the request is registered (shutdown barrier, review I-1).
     #[allow(dead_code)]
     gate: tokio::sync::OwnedRwLockReadGuard<()>,
+    /// The configured limits read once at submit: the reservation was made from them and the
+    /// run is validated against them, whatever Settings changes in between.
+    live: ScriptLimits,
 }
 
 /// The reservation needs the kind before validation: a lenient look at `dry_run`.
@@ -1736,7 +1741,7 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         unlogged_terminal: None,
         ticket: Some(j.ticket),
     };
-    let parsed = match parse(&j.params, &engine.admission().script_limits()) {
+    let parsed = match parse(&j.params, &j.live) {
         Ok(p) => p,
         Err(err) => {
             let _ = step(&mut new.model, Event::ValidationFailed);

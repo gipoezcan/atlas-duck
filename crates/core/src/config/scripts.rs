@@ -115,6 +115,16 @@ impl fmt::Display for ScriptsError {
 
 impl std::error::Error for ScriptsError {}
 
+/// The limits the core starts with: the configured set, or the spec defaults. A refused table is
+/// logged (the key and the reason class, never a value, as `reconcile` does for `[audit]`):
+/// the whole table falls back, so a hand-set cap would otherwise drop without a trace.
+pub fn start_limits(cfg: &ConfigState) -> ScriptLimits {
+    scripts_config(cfg).unwrap_or_else(|e| {
+        tracing::warn!("{e}; the script limits run with the spec defaults");
+        ScriptLimits::default()
+    })
+}
+
 /// The configured script limits: the spec defaults with the `[scripts]` keys applied; the defaults
 /// for an absent or unreadable config or a missing table.
 pub fn scripts_config(cfg: &ConfigState) -> Result<ScriptLimits, ScriptsError> {

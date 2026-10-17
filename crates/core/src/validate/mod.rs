@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_ipc::sandbox::ScriptLimits;
+use atlas_duck_ipc::sandbox::script::MAX_ARGS_NESTING;
 use atlas_duck_preview::invisible;
 use atlas_duck_registry::{OperationSpec, Product, Version};
 use jsonschema::Validator;
@@ -31,13 +32,6 @@ pub const MOVE_LIMIT_HINT: &str =
 pub const MAX_SCRIPT_SOURCE_BYTES: usize = 256 * 1024;
 /// §9.1 step 2: the largest `--args` JSON (compact form).
 pub const MAX_SCRIPT_ARGS_BYTES: usize = 1024 * 1024;
-
-/// The deepest nesting of arrays and objects in a script's `args` (a scalar is 0): what the
-/// worker's first-frame decoder reads inside `script.run` (serde_json's 128 levels minus the
-/// frame's own wrapper). The bridge refuses deeper `args` with `Spawn(InvalidInput)`
-/// (`sandbox-host`'s `MAX_ARGS_NESTING`, pinned there against the worker's decoder); bounding it
-/// here keeps that an input error (exit 2) instead of `sandbox_unavailable` (M8 T7/T12 hand-off).
-pub const MAX_SCRIPT_ARGS_NESTING: usize = 125;
 
 /// §9.4: `process_mb >= heap_mb + 24 MiB (host frame) + 64 MiB margin`.
 const PROCESS_OVER_HEAP_MB: u64 = 88;
@@ -305,7 +299,7 @@ pub fn validate(
 }
 
 /// §9.1 step 2, the static part: source ≤ 256 KiB, args ≤ 1 MiB and at most
-/// [`MAX_SCRIPT_ARGS_NESTING`] levels deep, limits per §9.4 against `ceiling` (the configured
+/// [`MAX_ARGS_NESTING`] levels deep, limits per §9.4 against `ceiling` (the configured
 /// defaults, PD-139).
 pub fn validate_script_submit(
     source: &str,
@@ -320,10 +314,10 @@ pub fn validate_script_submit(
     if args_len > MAX_SCRIPT_ARGS_BYTES {
         return Err(invalid("args", "script args are above 1 MiB", None));
     }
-    if nesting(args) > MAX_SCRIPT_ARGS_NESTING {
+    if nesting(args) > MAX_ARGS_NESTING {
         return Err(invalid(
             "args",
-            "script args are nested deeper than 125 levels",
+            &format!("script args are nested deeper than {MAX_ARGS_NESTING} levels"),
             None,
         ));
     }

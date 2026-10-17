@@ -542,6 +542,70 @@ async fn script_reservation_follows_configured_max_result_mb() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raise_between_reservation_and_validation_cannot_outgrow_the_reservation() -> TestResult {
+    use atlas_duck_core::{Confirm, Pause, TestHooks};
+    // Review I-4: the reservation and the ceiling the run is validated against are one snapshot.
+    let pause = Pause::new();
+    let runner = FakeScriptRunner::new(vec![
+        ScriptPlan::new(
+            Vec::new(),
+            RunEnd::Result {
+                value: json!(1),
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+        )
+        .holding(30_000),
+    ]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner.clone())
+        .extra_config("[scripts]\nmax_result_mb = 4\n")
+        .hooks(TestHooks {
+            pause_before_received: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let raise = async {
+        // The run is admitted (4 MiB reserved) and waits before `REQUEST_RECEIVED`.
+        pause.reached.notified().await;
+        h.confirmer().push(Confirm::Ok);
+        let s = h.core().settings();
+        tokio::task::spawn_blocking(move || {
+            s.apply(vec![SettingChangeReq::ScriptLimits(ScriptLimitsReq {
+                max_result_mb: Some(8),
+                ..ScriptLimitsReq::default()
+            })])
+        })
+        .await?
+        .map_err(|e| format!("{e:?}"))?;
+        pause.release.notify_one();
+        Ok::<_, TestError>(())
+    };
+    let (env, raised) = tokio::join!(h.submit_script(json!({ "source": "return 1;" })), raise);
+    raised?;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    assert_eq!(h.engine().admission().script_limits().max_result_mb, 8);
+    assert_eq!(h.engine().admission().reserved_bytes(), 4 * MIB);
+    let mut specs = Vec::new();
+    for _ in 0..500 {
+        specs = runner.specs();
+        if !specs.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let [spec] = specs.as_slice() else {
+        return Err(format!("{} runs started", specs.len()).into());
+    };
+    // The run's ceiling is the one it reserved for.
+    assert_eq!(u64::from(spec.limits.max_result_mb) * MIB, 4 * MIB);
+    h.handler().cancel(&request_id(&env)?).await;
+    Ok(())
+}
+
 #[test]
 fn admission_tickets_release_exactly_once() -> TestResult {
     let adm = Admission::new(limits_with(|l| {

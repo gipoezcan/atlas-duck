@@ -51,6 +51,13 @@ pub const M_SCRIPT_ERROR: &str = "script.error";
 /// §3.3/§3.4: the host → worker cap is the channel's general frame cap.
 pub const HOST_TO_WORKER_MAX: usize = MAX_FRAME_BYTES;
 
+/// The deepest nesting of arrays and objects in a script's `args` (a scalar is 0): serde_json
+/// reads at most 127 nested arrays or objects into a `Value`, and the worker decodes the whole
+/// `script.run` frame into one, where `args` sits two objects deep. The single definition: the
+/// core refuses deeper `args` as a validation error (exit 2) and the bridge before any spawn
+/// (the bridge test pins it against the worker's decoder).
+pub const MAX_ARGS_NESTING: usize = 125;
+
 const MIB: usize = 1024 * 1024;
 const TERMINAL_FRAME_SLACK: usize = 64 * 1024;
 

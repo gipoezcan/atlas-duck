@@ -10,7 +10,7 @@ use std::sync::Arc;
 use atlas_duck_audit::EventType;
 use atlas_duck_core::config::limits::limits_config;
 use atlas_duck_core::config::requests::expiry_hours;
-use atlas_duck_core::config::scripts::scripts_config;
+use atlas_duck_core::config::scripts::{scripts_config, start_limits};
 use atlas_duck_core::config::ui::attention_mode_config;
 use atlas_duck_core::config::{ConfigState, load_config};
 use atlas_duck_core::engine::queue::MIB;
@@ -1036,5 +1036,150 @@ async fn file_edit_applies_at_next_start() -> TestResult {
     let v = view(&h.core().settings()).await?;
     assert_eq!(v.limits.script, want);
     assert!(v.restart_pending.is_empty());
+    Ok(())
+}
+
+/// The `[scripts]` table as the next start would read it, which must load.
+fn next_start(h: &Harness) -> Result<ScriptLimits, TestError> {
+    file_scripts(h).map_err(|e| format!("the file would not load at the next start: {e}").into())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_change_repairs_a_refused_scripts_table() -> TestResult {
+    // Review I-2 scenario A: the table is refused (defaults live), a Settings change must not
+    // leave the bad key behind to revert it at the next start.
+    let h = Harness::builder()
+        .jira("jira-main")
+        .extra_config("[scripts]\nmax_result_mb = 17\n")
+        .start()
+        .await?;
+    let s = h.core().settings();
+    let v = apply(&s, vec![script_req(|r| r.timeout_s = Some(60))]).await??;
+    let want = ScriptLimits {
+        timeout_s: 60,
+        ..ScriptLimits::default()
+    };
+    assert_eq!(v.limits.script, want);
+    assert_eq!(next_start(&h)?, want);
+    assert!(v.restart_pending.is_empty(), "{:?}", v.restart_pending);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn settings_change_cannot_pair_with_a_pending_file_edit() -> TestResult {
+    // Review I-2 scenario B: the file holds a valid pending pair (heap 1024, process 2048); a
+    // process_mb of 600 passes against the live heap (256) but not against the file's.
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let mut text = std::fs::read_to_string(h.config_path())?;
+    text.push_str("\n[scripts]\nheap_mb = 1024\nprocess_mb = 2048\n");
+    std::fs::write(h.config_path(), text)?;
+    let v = view(&s).await?;
+    assert_eq!(v.restart_pending, ["script_limits"]);
+    h.confirmer().push(Confirm::Ok);
+    let v = apply(&s, vec![script_req(|r| r.process_mb = Some(600))]).await??;
+    assert_eq!(v.limits.script.process_mb, 600);
+    assert_eq!(next_start(&h)?, v.limits.script);
+    assert!(v.restart_pending.is_empty(), "{:?}", v.restart_pending);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setting_the_live_value_clears_a_pending_file_edit() -> TestResult {
+    // Review I-2 scenario C: the file says 300, the live value is 120; setting 120 is not "no
+    // change" for the file.
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let mut text = std::fs::read_to_string(h.config_path())?;
+    text.push_str("\n[scripts]\ntimeout_s = 300\n");
+    std::fs::write(h.config_path(), text)?;
+    assert_eq!(view(&s).await?.restart_pending, ["script_limits"]);
+    let v = apply(&s, vec![script_req(|r| r.timeout_s = Some(120))]).await??;
+    assert!(v.restart_pending.is_empty(), "{:?}", v.restart_pending);
+    assert_eq!(next_start(&h)?, ScriptLimits::default());
+    // Nothing changed live: no dialog, no record.
+    assert!(h.confirmer().texts().is_empty());
+    assert!(config_changed(&h, "script_limits").await?.is_empty());
+
+    // A hand edit that does not load is cleared the same way.
+    let text = std::fs::read_to_string(h.config_path())?;
+    let broken = text.replace("max_result_mb = 16", "max_result_mb = 17");
+    assert_ne!(broken, text, "the table holds max_result_mb");
+    std::fs::write(h.config_path(), broken)?;
+    assert!(file_scripts(&h).is_err());
+    apply(&s, vec![script_req(|r| r.timeout_s = Some(120))]).await??;
+    assert_eq!(next_start(&h)?, ScriptLimits::default());
+    Ok(())
+}
+
+/// Every `tracing` event of the calling thread, as text (message and fields).
+struct ThreadLog(std::sync::Mutex<Vec<String>>);
+
+struct Fields<'a>(&'a mut String);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+struct ThreadSink(Arc<ThreadLog>);
+
+impl tracing::Subscriber for ThreadSink {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut line = String::new();
+        event.record(&mut Fields(&mut line));
+        self.0
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line);
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[test]
+fn a_refused_scripts_table_is_logged_at_start() -> TestResult {
+    // Review I-1: the `[audit]` precedent logs a malformed value; the table is refused as a
+    // whole and the limits fall back to the defaults, so the start says so (key, no value).
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.toml");
+    let load = |text: &str| -> Result<_, TestError> {
+        std::fs::write(&path, format!("schema_version = 1\n[scripts]\n{text}"))?;
+        Ok(load_config(&path)?)
+    };
+    let log = Arc::new(ThreadLog(std::sync::Mutex::new(Vec::new())));
+    let _guard = tracing::subscriber::set_default(ThreadSink(log.clone()));
+    let lines = || log.0.lock().unwrap_or_else(|e| e.into_inner()).clone();
+
+    // A table that loads logs nothing.
+    let ok = load("timeout_s = 90\n")?;
+    assert_eq!(start_limits(&ok).timeout_s, 90);
+    assert!(lines().is_empty(), "{:?}", lines());
+
+    for (text, class) in [
+        ("max_result_mb = 17\ntimeout_s = 91\n", "max_result_mb"),
+        ("heap_mb = 100\n", "heap_mb"),
+    ] {
+        let before = lines().len();
+        assert_eq!(start_limits(&load(text)?), ScriptLimits::default());
+        let l = lines();
+        let [.., last] = l.as_slice() else {
+            return Err(format!("{text}: nothing logged").into());
+        };
+        assert_eq!(l.len(), before + 1, "{l:?}");
+        assert!(last.contains("scripts") && last.contains(class), "{last}");
+        assert!(last.contains("spec defaults"), "{last}");
+        assert!(!last.contains("17") && !last.contains("91"), "{last}");
+    }
     Ok(())
 }

@@ -61,8 +61,8 @@ use atlas_duck_ipc::sandbox::probe::{
     ConfinementReport, M_PROBE_READY, ProbeReady, decode_notification, encode_notification,
 };
 use atlas_duck_ipc::sandbox::script::{
-    CompileRequest, M_SCRIPT_COMPILE, M_SCRIPT_RUN, RawJsonText, WorkerFrame, WorkerInit,
-    decode_worker_frame,
+    CompileRequest, M_SCRIPT_COMPILE, M_SCRIPT_RUN, MAX_ARGS_NESTING, RawJsonText, WorkerFrame,
+    WorkerInit, decode_worker_frame,
 };
 use atlas_duck_ipc::sandbox::{
     EXIT_PROTOCOL, HOST_TO_WORKER_MAX, HostCall, HostCallResult, ScriptLimits,
@@ -144,10 +144,6 @@ const WATCH_GRACE: Duration = Duration::from_secs(2);
 /// (review m-4: a worker that closed stdout usually exits, and on Windows a kill between its
 /// handles closing and its exit code being set would replace that code).
 const EXIT_GRACE: Duration = Duration::from_secs(1);
-/// serde_json reads at most 127 nested arrays or objects into a `Value`, and the worker decodes
-/// the whole `script.run` frame into one, where `args` sits two objects deep.
-const MAX_ARGS_NESTING: usize = 125;
-
 /// The most bytes of frames queued for the worker and not yet written (T8 finding 1, T7 review
 /// m-6): `max_fetch_mb` plus one 24 MiB host → worker frame. §3.4 counts a call as outstanding
 /// only until its result is queued, so a worker that keeps calling without reading its stdin

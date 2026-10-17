@@ -575,6 +575,9 @@ struct Current {
     legal_hold: bool,
     /// In force (live).
     script: ScriptLimits,
+    /// The `[scripts]` table is not what is in force: a hand edit not yet started with, or a
+    /// table that does not load. A script limits change then rewrites the table from `script`.
+    script_file_stale: bool,
 }
 
 /// One change that does something.
@@ -727,8 +730,18 @@ fn int(n: u64) -> toml_edit::Value {
 /// One `config.toml` edit: the table, the key and its value (`None` removes the key).
 type FileEdit = (&'static str, &'static str, Option<toml_edit::Value>);
 
-/// The file edits of a file-backed change.
-fn file_values(req: &SettingChangeReq) -> Vec<FileEdit> {
+/// All eight `[scripts]` keys of `l`: the table is always written whole, so that after a
+/// Settings write it loads and equals what is in force (a hand edit left in it, valid or not,
+/// would otherwise decide the next start).
+fn script_edits(l: &ScriptLimits) -> Vec<FileEdit> {
+    SCRIPT_KEYS
+        .into_iter()
+        .filter_map(|key| Some((KEY_SCRIPTS, key, Some(int(u64::from(get(l, key)?))))))
+        .collect()
+}
+
+/// The file edits of a file-backed change; `live` is the script limits in force.
+fn file_values(req: &SettingChangeReq, live: &ScriptLimits) -> Vec<FileEdit> {
     let one = |table, v| vec![(table, req.key(), v)];
     match req {
         SettingChangeReq::JiraCommentsCap(n) => one(KEY_LIMITS, Some(int(u64::from(*n)))),
@@ -737,12 +750,8 @@ fn file_values(req: &SettingChangeReq) -> Vec<FileEdit> {
         SettingChangeReq::ExpiryHours(h) => one(KEY_REQUESTS, Some(int(u64::from(*h)))),
         SettingChangeReq::AttentionMode(m) => one(KEY_UI, Some(toml_edit::Value::from(m.as_str()))),
         SettingChangeReq::RetentionDays(_) | SettingChangeReq::LegalHold(_) => Vec::new(),
-        // One key of `[scripts]` per requested limit (`apply` plans only the changed ones).
-        SettingChangeReq::ScriptLimits(r) => r
-            .fields()
-            .into_iter()
-            .filter_map(|(key, v)| Some((KEY_SCRIPTS, key, Some(int(u64::from(v?))))))
-            .collect(),
+        // The whole resolved set (`apply` checked it against the bounds and both invariants).
+        SettingChangeReq::ScriptLimits(r) => script_edits(&r.resolve(live)),
     }
 }
 
@@ -906,6 +915,7 @@ impl CoreSettings {
     fn current(&self, cfg: &ConfigState) -> Current {
         let limits = limits_config(cfg).unwrap_or_default();
         let settings = self.engine.port().settings();
+        let script = self.engine.admission().script_limits();
         Current {
             comments_cap: self.comments_cap(),
             candidate_cache_mb: limits.candidate_cache_mb.unwrap_or(CANDIDATE_CACHE_MB),
@@ -918,7 +928,8 @@ impl CoreSettings {
             attention_mode: *lock(&self.attention),
             retention_days: settings.retention_days,
             legal_hold: settings.legal_hold,
-            script: self.engine.admission().script_limits(),
+            script,
+            script_file_stale: scripts_config(cfg).as_ref() != Ok(&script),
         }
     }
 
@@ -990,6 +1001,7 @@ impl CoreSettings {
         &self,
         planned: &[Planned],
         confirmations: &[Option<Confirmed>],
+        repair_scripts: bool,
     ) -> Result<(), SettingsError> {
         let port = self.engine.port().clone();
         // Audit-authoritative values: the store logs each change itself (`source: app`).
@@ -1006,16 +1018,27 @@ impl CoreSettings {
             .filter(|(p, _)| p.req.file_backed())
             .map(|(p, c)| (p, c.as_ref()))
             .collect();
-        if file.is_empty() {
+        if file.is_empty() && !repair_scripts {
             return Ok(());
         }
         let path = self.require_writable(&self.load())?;
-        // Audit before effect: the records commit, then the file is written.
-        let records = file.iter().map(|(p, c)| record(p, *c, true)).collect();
-        port.append_batch(records).map_err(SettingsError::Audit)?;
+        let live = self.engine.admission().script_limits();
+        // Audit before effect: the records commit, then the file is written. A table repair
+        // changes nothing in force, so it has no record.
+        if !file.is_empty() {
+            let records = file.iter().map(|(p, c)| record(p, *c, true)).collect();
+            port.append_batch(records).map_err(SettingsError::Audit)?;
+        }
         let written = update_config(path, |doc| {
+            if repair_scripts {
+                for (table, key, v) in script_edits(&live) {
+                    if !set_key(doc, table, key, v) {
+                        return Err(SettingsError::ConfigWrite);
+                    }
+                }
+            }
             for (p, _) in &file {
-                for (table, key, v) in file_values(&p.req) {
+                for (table, key, v) in file_values(&p.req, &live) {
                     if set_key(doc, table, key, v) {
                         continue;
                     }
@@ -1037,8 +1060,8 @@ impl CoreSettings {
         };
         if let Some(e) = failed {
             // The records above said the change applied; it did not: say so (best effort).
-            let undo = file.iter().map(|(p, c)| record(p, *c, false)).collect();
-            if port.append_batch(undo).is_err() {
+            let undo: Vec<_> = file.iter().map(|(p, c)| record(p, *c, false)).collect();
+            if !undo.is_empty() && port.append_batch(undo).is_err() {
                 tracing::warn!("a failed config.toml write could not be recorded");
             }
             return Err(e);
@@ -1110,7 +1133,17 @@ impl SettingsAdmin for CoreSettings {
                     .map_err(|v| SettingsError::Invalid { key: v.key() })?;
             }
         }
+        let asked_scripts = changes
+            .iter()
+            .any(|c| matches!(c, SettingChangeReq::ScriptLimits(_)));
         let planned: Vec<Planned> = changes.into_iter().filter_map(|c| plan(c, &cur)).collect();
+        // Setting what is in force still clears a `[scripts]` table that differs from it
+        // (a pending hand edit, or one that does not load): the file is what the next start reads.
+        let repair_scripts = asked_scripts
+            && cur.script_file_stale
+            && !planned
+                .iter()
+                .any(|p| matches!(p.req, SettingChangeReq::ScriptLimits(_)));
         // Every dialog first, with no lock held: one `Cancel` applies nothing.
         let mut confirmations = Vec::with_capacity(planned.len());
         for p in &planned {
@@ -1126,7 +1159,7 @@ impl SettingsAdmin for CoreSettings {
             if self.current(&self.load()) != cur {
                 return Err(SettingsError::Conflict);
             }
-            self.apply_planned(&planned, &confirmations)?;
+            self.apply_planned(&planned, &confirmations, repair_scripts)?;
         }
         Ok(self.view())
     }
@@ -1207,6 +1240,17 @@ mod tests {
             parse(r#"{"key":"attention_mode","value":"badge_only"}"#).ok(),
             Some(SettingChangeReq::AttentionMode(AttentionMode::BadgeOnly))
         );
+        // The script limits: the app's tag/content shape, absent keys unchanged.
+        assert_eq!(
+            parse(r#"{"key":"script_limits","value":{"timeout_s":60,"max_calls":100}}"#).ok(),
+            Some(SettingChangeReq::ScriptLimits(ScriptLimitsReq {
+                timeout_s: Some(60),
+                max_calls: Some(100),
+                ..ScriptLimitsReq::default()
+            }))
+        );
+        assert!(parse(r#"{"key":"script_limits","value":{"timeout":60}}"#).is_err());
+        assert!(parse(r#"{"key":"script_limits","value":{"timeout_s":"60"}}"#).is_err());
         // Unknown fields, unknown keys and wrong types are refused.
         assert!(parse(r#"{"key":"legal_hold","value":true,"extra":1}"#).is_err());
         assert!(parse(r#"{"key":"audit_enabled","value":false}"#).is_err());
@@ -1291,6 +1335,7 @@ mod tests {
             retention_days: 100,
             legal_hold: true,
             script: ScriptLimits::default(),
+            script_file_stale: false,
         };
         let dialog = |r| plan(r, &cur).and_then(|p| p.dialog);
         assert_eq!(
