@@ -546,6 +546,30 @@ fn admission_tickets_release_exactly_once() -> TestResult {
     Ok(())
 }
 
+/// T23 (T15 review I-1 residual): a pending `confluence.page.update` reserves its two enrichment
+/// bodies (2 x 16 MiB) against `max_pending_bytes`; the other Confluence writes reserve nothing.
+#[test]
+fn page_update_reserves_its_two_bodies() -> TestResult {
+    let update = Reservation::for_op(
+        atlas_duck_registry::get("confluence.page.update").ok_or("no page.update")?,
+    );
+    assert_eq!(update.bytes(), 32 * MIB);
+    for other in [
+        "confluence.page.create",
+        "confluence.label.add",
+        "jira.issue.create",
+    ] {
+        let spec = atlas_duck_registry::get(other).ok_or("op")?;
+        assert_eq!(Reservation::for_op(spec).bytes(), 0, "{other}");
+    }
+    let adm = Admission::new(limits_with(|l| l.max_pending_bytes = Some(48 * MIB)));
+    let t = adm.admit(key("a"), update).map_err(|_| "busy")?;
+    assert!(adm.admit(key("b"), update).is_err(), "32 + 32 > 48");
+    drop(t);
+    assert!(adm.admit(key("b"), update).is_ok());
+    Ok(())
+}
+
 #[test]
 fn agent_key_rules() {
     let origin = PeerInfo {

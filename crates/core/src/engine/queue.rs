@@ -25,6 +25,7 @@ use atlas_duck_registry::{OpClass, OperationSpec, RELEASE_CAP_BYTES};
 
 use super::envelope;
 use crate::config::limits::LimitsConfig;
+use crate::ops::confluence::PAGE_BODY_LIMIT;
 
 pub const MIB: u64 = 1024 * 1024;
 /// §3.3: pending requests per agent key.
@@ -144,15 +145,24 @@ impl Reservation {
         Reservation(u64::from(limits.max_result_mb).saturating_mul(MIB))
     }
 
-    /// Writes reserve nothing (§5.2 names reads and scripts).
+    /// Writes reserve nothing (§5.2 names reads and scripts), except `confluence.page.update`.
     pub fn none() -> Reservation {
         Reservation(0)
     }
 
-    /// The reservation of a registry op: reads reserve, writes do not.
+    /// `confluence.page.update` (T23, T15 review I-1): a pending update keeps the current page's
+    /// storage and, behind a conflict, the base version's, each up to
+    /// [`PAGE_BODY_LIMIT`](crate::ops::confluence::PAGE_BODY_LIMIT) bytes.
+    pub fn page_update() -> Reservation {
+        Reservation(2 * PAGE_BODY_LIMIT as u64)
+    }
+
+    /// The reservation of a registry op: reads reserve, writes do not, except a page update
+    /// (its enrichment bodies, [`Reservation::page_update`]).
     pub fn for_op(spec: &OperationSpec) -> Reservation {
         match spec.class {
             OpClass::Read => Reservation::read(spec),
+            OpClass::Write if spec.id == "confluence.page.update" => Reservation::page_update(),
             OpClass::Write => Reservation::none(),
         }
     }
