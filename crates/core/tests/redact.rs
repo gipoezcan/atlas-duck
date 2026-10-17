@@ -2160,6 +2160,49 @@ fn a_single_mask_of_a_mirror_key_masks_the_mirrored_key() -> TestResult {
     Ok(())
 }
 
+/// Review T19c fix2 n-3: a single-occurrence mask applies to the entry the mirrored entry pairs
+/// with as the drops left them, not as earlier masks left the keys. With both comments' ids masked
+/// on both sides (single masks at the ids, or every occurrence) the keys all read `[REDACTED]`, and
+/// the body mask of comment 7 also masked the rendered body of comment 8.
+#[test]
+fn a_single_mask_after_key_masks_applies_to_the_paired_entry_only() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = mirrored(
+        json!([{"id": "7", "body": "tok one"}, {"id": "8", "body": "tok two"}]),
+        json!([
+            {"id": "7", "body": "<p>tok one</p>"},
+            {"id": "8", "body": "<p>tok two</p>"}
+        ]),
+    );
+    for keys in [
+        vec![
+            single_at("7", &format!("{SOURCE}[0].id")),
+            single_at("8", &format!("{SOURCE}[1].id")),
+        ],
+        vec![mask("7"), mask("8")],
+    ] {
+        let mut ops = keys.clone();
+        ops.push(single_at("tok", &format!("{SOURCE}[0].body")));
+        let out = apply(&source, r, None, &ops);
+        assert!(out.blocked.is_empty(), "{keys:?}: {:?}", out.blocked);
+        let rendered = &out.released["renderedFields"]["comment"]["comments"];
+        assert_eq!(rendered[0]["id"], REDACTED, "{keys:?}");
+        assert_eq!(rendered[1]["id"], REDACTED, "{keys:?}");
+        assert_eq!(rendered[0]["body"], "<p>[REDACTED] one</p>", "{keys:?}");
+        assert_eq!(rendered[1]["body"], "<p>tok two</p>", "{keys:?}");
+        assert_eq!(
+            out.released["fields"]["comment"]["comments"][1]["body"], "tok two",
+            "{keys:?}"
+        );
+        assert_eq!(
+            out.needs_confirmation,
+            vec!["2 other occurrences remain"],
+            "{keys:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Review T19c fix m-6: the flagged-entry tracking follows an item-level shift (`jira.search`):
 /// an orphan in the second issue is reported where it is after the first issue's drop.
 #[test]

@@ -264,7 +264,7 @@ struct Redactor<'a> {
     /// index of each element still there. What maps a location back to the source in O(depth);
     /// undoing `removed` cost O(removals) per lookup (review T19c fix2 I-2).
     origin: HashMap<Loc, Vec<usize>>,
-    /// The mirror keys the pairing computed since `doc` last changed (review T19c fix2 I-2).
+    /// The mirror keys the pairing computed since the last removal (review T19c fix2 I-2).
     keys: mirror::Keys,
     /// String values rewritten or removed by a mask.
     dirty: HashSet<Loc>,
@@ -561,7 +561,6 @@ impl Redactor<'_> {
                 path::remove(&mut self.doc, loc);
                 self.note_field(&k);
                 self.dirty.insert(loc.to_vec());
-                self.keys.clear();
                 true
             }
             (Some(_), _) => {
@@ -569,7 +568,6 @@ impl Redactor<'_> {
                     *v = Value::String(REDACTED.into());
                     self.meta.spans_masked += 1;
                     self.dirty.insert(loc.to_vec());
-                    self.keys.clear();
                 }
                 true
             }
@@ -591,7 +589,6 @@ impl Redactor<'_> {
         if let Some(v) = path::get_mut(&mut self.doc, loc) {
             *v = Value::String(s);
             self.dirty.insert(loc.to_vec());
-            self.keys.clear();
         }
     }
 
@@ -710,9 +707,9 @@ impl Redactor<'_> {
                 .push(BlockReason::MaskStillOccurs { path: display });
             return;
         }
-        // §5.3: a per-item mask also applies to the mirrored entry (every hit in that value). Its
-        // counterparts are looked up before the rewrite: a masked key pairs with nothing (review
-        // T19c fix m-1).
+        // §5.3: a per-item mask also applies to the mirrored entry (every hit in that value). It
+        // pairs by the source's key, so neither this rewrite nor an earlier mask decides which
+        // entry that is (review T19c fix m-1, fix2 n-3).
         let counterparts = self.counterparts(&loc);
         self.set_string(&loc, masked);
         for c in counterparts {

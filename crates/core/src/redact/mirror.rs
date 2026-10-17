@@ -8,8 +8,9 @@
 //! The pairing cannot be spoofed (review T19c I-1): the check runs before any mask, a bare drop
 //! of the key of an entry without counterpart blocks ([`unpaired_key`]), and an entry the check
 //! flags in the source blocks until it is dropped whole ([`flagged`], tracked by `apply`). A drop
-//! that names an entry pairs it by the source's key where an earlier drop took the key (review
-//! T19c I-1'); the check itself uses only the keys still there.
+//! or a mask that names an entry pairs it by the source's key, also where an earlier drop took the
+//! key or an earlier mask rewrote it (review T19c I-1', fix2 n-3); the check itself uses only the
+//! keys still there.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -44,21 +45,13 @@ fn starts_with_keys(loc: &[Step], at: usize, keys: &[Step]) -> bool {
     loc.get(at..at + keys.len()) == Some(keys)
 }
 
-/// The mirror key of the entry `arr[i]`: its own, or through `ident` if a drop removed it.
-fn key_of(e: &Value, key: &str, arr: &[Step], i: usize, ident: &Ident<'_>) -> Option<Value> {
-    match e.get(key) {
-        Some(v) => Some(v.clone()),
-        None => ident(&path::with(arr, Step::Index(i)), key),
-    }
-}
-
 type KeyMap = HashMap<(Loc, &'static str), Rc<[Option<Value>]>>;
 
-/// The mirror keys of every entry of the arrays [`counterparts`] looked at, by array and key:
-/// computed once per array, not once per entry and target (review T19c fix2 I-2: a drop across
-/// all items looked up every key of the other side for each target, through `ident` once the
-/// keys were dropped). Valid while the document and the removal log stay as they were: `apply`
-/// clears it whenever either changes.
+/// The mirror keys of every entry of the arrays [`counterparts`] looked at, by array and key, as
+/// the source has them (through `ident`): computed once per array, not once per entry and target
+/// (review T19c fix2 I-2: a drop across all items looked up every key of the other side for each
+/// target). Valid while the removal log stays as it is (`apply` clears it on every removal): masks
+/// change no array's length and no source key.
 #[derive(Default)]
 pub(crate) struct Keys(RefCell<KeyMap>);
 
@@ -67,11 +60,11 @@ impl Keys {
         self.0.get_mut().clear();
     }
 
-    /// [`key_of`] for every entry of `entries`, the array at `arr`.
+    /// The key of each of the `len` entries of the array at `arr`.
     fn of(
         &self,
         arr: &[Step],
-        entries: &[Value],
+        len: usize,
         key: &'static str,
         ident: &Ident<'_>,
     ) -> Rc<[Option<Value>]> {
@@ -79,10 +72,8 @@ impl Keys {
         if let Some(known) = self.0.borrow().get(&at) {
             return Rc::clone(known);
         }
-        let keys: Rc<[Option<Value>]> = entries
-            .iter()
-            .enumerate()
-            .map(|(i, e)| key_of(e, key, arr, i, ident))
+        let keys: Rc<[Option<Value>]> = (0..len)
+            .map(|i| ident(&path::with(arr, Step::Index(i)), key))
             .collect();
         self.0.borrow_mut().insert(at, Rc::clone(&keys));
         keys
@@ -90,8 +81,9 @@ impl Keys {
 }
 
 /// Counterparts of `loc` in the current document, for every mirror and both directions. Entries
-/// pair by their key, or the source's key through `ident` where a drop removed it (review T19c
-/// I-1': the identity of an entry is the source's).
+/// pair by the source's key, through `ident` (review T19c I-1': the identity of an entry is the
+/// source's). A drop never rewrites a key, so where the entry still has it, it is the same; a mask
+/// does (review T19c fix2 n-3: masked keys must not pair the wrong entries).
 pub(crate) fn counterparts(
     doc: &Value,
     mirrors: &[Mirror],
@@ -126,7 +118,7 @@ pub(crate) fn counterparts(
                 let Some(Value::Array(src)) = path::get(doc, &side_arr) else {
                     continue;
                 };
-                let side_keys = keys.of(&side_arr, src, m.key, ident);
+                let side_keys = keys.of(&side_arr, src.len(), m.key, ident);
                 let Some(entry_key) = side_keys.get(i) else {
                     continue;
                 };
@@ -134,7 +126,7 @@ pub(crate) fn counterparts(
                 let (key_value, js) = match entry_key {
                     Some(kv) => {
                         let js = keys
-                            .of(&other_arr, dst, m.key, ident)
+                            .of(&other_arr, dst.len(), m.key, ident)
                             .iter()
                             .enumerate()
                             .filter(|(_, k)| k.as_ref() == Some(kv))

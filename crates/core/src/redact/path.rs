@@ -37,8 +37,9 @@ struct Seg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Pattern(Vec<Seg>);
 
-/// The value of field `key` of the element at a location, where the element itself no longer has
-/// it: the source's (an element's identity is the source's, review T19c I-1').
+/// The value of field `key` of the element at a location as the source has it (an element's
+/// identity is the source's, review T19c I-1'): asked where the element no longer has it, and by
+/// the mirror pairing for every entry.
 pub(crate) type Ident<'a> = dyn Fn(&[Step], &str) -> Option<Value> + 'a;
 
 /// No identity beyond the document itself.
