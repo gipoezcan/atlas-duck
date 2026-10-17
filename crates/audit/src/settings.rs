@@ -71,8 +71,9 @@ impl Default for Settings {
     }
 }
 
-/// The optional fifth key of a settings snapshot (M8 Δ7).
-const KEY_ALLOW_DEGRADED_SCRIPTS: &str = "allow_degraded_scripts";
+/// The optional fifth key of a settings snapshot and the policy key of its `CONFIG_CHANGED` (M8
+/// Δ7); core's Settings names the change by it too.
+pub const KEY_ALLOW_DEGRADED_SCRIPTS: &str = "allow_degraded_scripts";
 
 const BAD_SNAPSHOT: AuditError = AuditError::Invalid("settings snapshot is malformed");
 

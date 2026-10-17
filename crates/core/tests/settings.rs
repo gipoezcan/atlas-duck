@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use atlas_duck_audit::EventType;
 use atlas_duck_core::config::limits::limits_config;
@@ -1272,6 +1273,31 @@ async fn degraded_toggle_off_needs_no_confirmation() -> TestResult {
             "new": false, "applied": true, "confirmed": null,
         })
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_flipped_while_its_dialog_is_open_is_a_conflict() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let inner = s.clone();
+    let once = AtomicBool::new(false);
+    // While this window's dialog is open, another window turns it on first (its own dialog,
+    // answered by the first `Ok`).
+    h.confirmer().set_hook(Arc::new(move |_| {
+        if !once.swap(true, Ordering::SeqCst) {
+            let _ = inner.apply(vec![AllowDegradedScripts(true)]);
+        }
+    }));
+    h.confirmer().push(Confirm::Ok);
+    h.confirmer().push(Confirm::Ok);
+    let r = apply(&s, vec![AllowDegradedScripts(true)]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Conflict));
+    assert_eq!(h.confirmer().texts(), [ALLOW_DEGRADED_TEXT; 2]);
+    assert!(view(&s).await?.allow_degraded_scripts);
+    assert!(degraded_policy(&h));
+    let recs = config_changed(&h, "allow_degraded_scripts").await?;
+    assert_eq!(recs.len(), 1, "only the other window's");
     Ok(())
 }
 

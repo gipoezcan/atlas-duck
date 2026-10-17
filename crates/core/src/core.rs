@@ -193,6 +193,9 @@ pub struct TestHooks {
     /// PD-141; the audit settings otherwise): read at each use, so a test can flip it while a run
     /// waits.
     pub allow_degraded_scripts: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// A real run holds after its slot-time policy read, before its `SCRIPT_STARTED` append (M8
+    /// T15 review I-1: a setting change committed meanwhile is logged before that record).
+    pub pause_before_script_started: Option<Arc<Pause>>,
 }
 
 #[cfg(feature = "testing")]

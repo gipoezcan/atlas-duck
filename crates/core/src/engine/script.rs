@@ -138,8 +138,8 @@ pub enum CompileFailure {
 
 /// What a run may accept from the sandbox (Δ3, PD-141). Read from [`Engine::script_policy`]
 /// immediately before each use (`check_available`, the compile check, the real-slot
-/// acquisition), never captured at submit: a security-weakening setting never outlives its
-/// revocation.
+/// acquisition, and again before a real run's spawn), never captured at submit: a
+/// security-weakening setting never outlives its revocation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunPolicy {
     /// "Allow scripts with degraded confinement" (§9.4). It covers only a probe-time floor
@@ -166,7 +166,10 @@ impl ConfinementMode {
 }
 
 /// `SCRIPT_STARTED.confinement` (PD-138, R1): the mode and worker version a run is spawned under,
-/// with the confinement report the runner holds for it.
+/// with the confinement report the runner holds for it. Computed from the slot-time policy, before
+/// the record is appended: a revocation logged before the record narrows the spawn, so the record
+/// can say `degraded` for a run whose `start` is then refused; the `SCRIPT_FAILED
+/// {sandbox_unavailable, details.reason: floor_not_met}` that follows keeps the trail true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfinement {
     pub mode: ConfinementMode,
@@ -240,8 +243,9 @@ pub struct RunSpec {
     pub args: Value,
     pub limits: ScriptLimits,
     pub dry_run: bool,
-    /// Read right before the spawn (PD-141): when a real run acquired its slot, after a dry
-    /// run's compile check.
+    /// Read right before the spawn (PD-141): for a real run, the policy read when it acquired its
+    /// slot AND the one read again after its `SCRIPT_STARTED` committed (narrowing only, T15
+    /// review I-1); for a dry run, after its compile check.
     pub policy: RunPolicy,
 }
 
@@ -262,7 +266,8 @@ pub trait ScriptRunner: Send + Sync {
         policy: RunPolicy,
     ) -> Result<(), CompileFailure>;
     /// What a run spawned now under `policy` runs with, for `SCRIPT_STARTED.confinement`
-    /// (PD-138). `None`: the runner states nothing and the record has no `confinement` key.
+    /// (PD-138; the slot-time policy, see [`RunConfinement`]). `None`: the runner states nothing
+    /// and the record has no `confinement` key.
     fn confinement(&self, policy: RunPolicy) -> Option<RunConfinement>;
     /// Starts a worker; its `host.call`s arrive at `calls`.
     async fn start(
@@ -1970,12 +1975,17 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         return;
     }
     // 3. A real slot; `queued` = it was not immediately available (§9.5). The run policy is read
-    //    here, when the slot is acquired (PD-141).
+    //    here, when the slot is acquired (PD-141), and `confinement` is this slot-time admission;
+    //    the spawn below reads it again and may only narrow it.
     let Some((permit, queued)) = slot(&engine.script_slots, entry, true).await else {
         return;
     };
     let policy = engine.script_policy();
     let confinement = runner.confinement(policy).map(|c| c.to_value());
+    #[cfg(feature = "testing")]
+    if let Some(pause) = engine.hooks.pause_before_script_started.clone() {
+        pause.hold().await;
+    }
     // 4. `SCRIPT_STARTED` is the record of the slot (§9.1 step 2). The run's shared state is
     //    installed by the step that enters `Running`, under the gate: a cancel or a kill that
     //    comes after finds it, one that came before ended the request and this step is refused.
@@ -2018,6 +2028,12 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         validator,
         limits,
     ));
+    // The policy again, now that `SCRIPT_STARTED` is committed (T15 review I-1): a revocation
+    // with a lower seq is in the store's view by now, so no worker spawns degraded after a logged
+    // revocation. It only narrows the slot's admission, never widens it.
+    let policy = RunPolicy {
+        allow_degraded: policy.allow_degraded && engine.script_policy().allow_degraded,
+    };
     let spec = RunSpec {
         run_id: entry.head.request_id.clone(),
         source,

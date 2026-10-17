@@ -91,8 +91,8 @@ pub use requests::{ReconcileReport, ReconciledWrite, ScriptFailedFlags, is_termi
 pub use restore::{RestoreReport, finish_restore, restore_from_source};
 pub use schema::{DB_FILE, SCHEMA_HEAD};
 pub use settings::{
-    FilePolicy, InstancePolicy, RETENTION_DEFAULT, RETENTION_MIN, SettingChange, Settings,
-    is_policy_key,
+    FilePolicy, InstancePolicy, KEY_ALLOW_DEGRADED_SCRIPTS, RETENTION_DEFAULT, RETENTION_MIN,
+    SettingChange, Settings, is_policy_key,
 };
 pub use store::{Hooks, OpenConfig, Store, StoreHealth};
 pub use types::{

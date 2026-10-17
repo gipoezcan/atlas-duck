@@ -59,9 +59,9 @@ use crate::validate::check_script_invariants;
 const RAISE_TAIL: &str = "Higher limits let agents fetch more data before you review it.";
 /// plan text (PD-76).
 pub const LIFT_HOLD_TEXT: &str = "Lift the legal hold? Pruning and key destruction resume.";
-/// plan text (PD-141), verbatim.
+/// plan text (PD-141), without its spec citation (T15 review m-1).
 pub const ALLOW_DEGRADED_TEXT: &str = "Allow scripts with degraded confinement? A compromised \
-                                       script worker could then act as your user (§8.9).";
+                                       script worker could then act as your user.";
 /// plan text (PD-76, L37).
 pub const PRUNE_BACKLOG_TEXT: &str =
     "Prune the backlog now? Records beyond the retention period are deleted in one run.";
@@ -79,9 +79,9 @@ pub const MAX_RETENTION_DAYS: u32 = 36_500;
 pub const MAX_CHANGES: usize = 9;
 /// `CONFIG_CHANGED.key` and view name of the script limits change (M8 Δ6, PD-139).
 pub const KEY_SCRIPT_LIMITS: &str = "script_limits";
-/// `CONFIG_CHANGED.key` and view name of the degraded-confinement toggle (M8 Δ6, Δ7, PD-141); the
-/// store's policy key of the same name.
-pub const KEY_ALLOW_DEGRADED_SCRIPTS: &str = "allow_degraded_scripts";
+/// `CONFIG_CHANGED.key` and view name of the degraded-confinement toggle (M8 Δ6, Δ7, PD-141): the
+/// store's policy key itself, so the two cannot drift (T15 review m-5).
+pub use atlas_duck_audit::KEY_ALLOW_DEGRADED_SCRIPTS;
 /// The longest key `record_app_change` accepts.
 const MAX_APP_KEY_CHARS: usize = 64;
 /// The largest serialized `old` / `new` of `record_app_change`.

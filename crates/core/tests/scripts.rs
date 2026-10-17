@@ -2098,10 +2098,14 @@ fn policies_of(runner: &FakeScriptRunner, call: &str) -> Vec<bool> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn degraded_off_after_submit_refuses_the_queued_spawn() -> TestResult {
-    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(3000);
+    // Each of the first two runs holds its slot inside `start` until the test releases it.
+    let gates = [pause(), pause()];
+    let hold = |g: &Arc<Pause>| {
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).with_start_pause(g.clone())
+    };
     let (h, runner) = harness(vec![
-        hold(),
-        hold(),
+        hold(&gates[0]),
+        hold(&gates[1]),
         ScriptPlan::new(Vec::new(), result_end(json!(3))),
     ])
     .await?;
@@ -2110,7 +2114,10 @@ async fn degraded_off_after_submit_refuses_the_queued_spawn() -> TestResult {
     set_degraded(&h, true).await?;
     let first = submit(&h, json!({ "source": SRC })).await?;
     let second = submit(&h, json!({ "source": SRC })).await?;
-    wait_for("both slots", || runner.starts() == 2).await?;
+    for g in &gates {
+        g.reached.notified().await;
+    }
+    assert_eq!(runner.starts(), 2, "both slots");
     // The third run passes its submit-time checks with the toggle on, then waits for a slot.
     let third = submit(&h, json!({ "source": SRC })).await?;
     wait_for("the third compile check", || runner.compile_checks() == 3).await?;
@@ -2123,6 +2130,9 @@ async fn degraded_off_after_submit_refuses_the_queued_spawn() -> TestResult {
     );
     set_degraded(&h, false).await?;
     // A slot frees: the spawn reads the setting as it is now, not as it was at submit.
+    for g in &gates {
+        g.release.notify_one();
+    }
     h.queued(&third, 30_000).await.ok_or("third never queued")?;
     assert_eq!(policies_of(&runner, "available"), [true, true, true]);
     assert_eq!(policies_of(&runner, "compile"), [true, true, true]);
@@ -2156,5 +2166,83 @@ async fn degraded_off_after_submit_refuses_the_queued_spawn() -> TestResult {
         h.queued(id, 30_000).await.ok_or("never queued")?;
         assert!(record(&h, id, EventType::SCRIPT_FINISHED).await.is_ok());
     }
+    Ok(())
+}
+
+/// The seq of every record of `t` the store holds (any request, system records too).
+fn seqs_of(h: &Harness, t: EventType) -> Result<Vec<u64>, TestError> {
+    Ok(h.store()
+        .recent_headers(Duration::from_secs(24 * 3600))?
+        .iter()
+        .filter(|e| e.event_type == t)
+        .map(|e| e.seq)
+        .collect())
+}
+
+/// T15 review I-1: the policy is read again once `SCRIPT_STARTED` is committed, and only narrows
+/// the slot's: a revocation logged before that record is honoured, a grant made since is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_changed_before_script_started_only_narrows_the_spawn() -> TestResult {
+    let hold = pause();
+    let hooks = TestHooks {
+        pause_before_script_started: Some(hold.clone()),
+        ..TestHooks::none()
+    };
+    let (h, runner) = harness_with(
+        vec![
+            ScriptPlan::new(Vec::new(), result_end(json!(1))),
+            ScriptPlan::new(Vec::new(), result_end(json!(2))),
+        ],
+        hooks,
+        FaultPlan::new(),
+    )
+    .await?;
+    runner.require_degraded();
+    // What the runner states for the slot's policy (the fake states it for any policy).
+    runner.set_confinement(Some(RunConfinement {
+        mode: ConfinementMode::Degraded,
+        worker_version: "0.8.0+abc".to_owned(),
+        report: confinement_report(),
+    }));
+
+    // Revoked: the slot is taken with the toggle on, the off commits before `SCRIPT_STARTED`.
+    set_degraded(&h, true).await?;
+    let revoked = submit(&h, json!({ "source": SRC })).await?;
+    hold.reached.notified().await;
+    set_degraded(&h, false).await?;
+    hold.release.notify_one();
+    let env = h.await_(&revoked, 10_000).await;
+    let off_seq = seqs_of(&h, EventType::CONFIG_CHANGED)?
+        .into_iter()
+        .max()
+        .ok_or("no CONFIG_CHANGED")?;
+    let started_seq = seqs_of(&h, EventType::SCRIPT_STARTED)?
+        .into_iter()
+        .max()
+        .ok_or("no SCRIPT_STARTED")?;
+    assert!(off_seq < started_seq, "{off_seq} < {started_seq}");
+    assert_eq!(policies_of(&runner, "start"), [false]);
+    assert_eq!(runner.specs()[0].policy, RunPolicy::default());
+    // `confinement` is the slot-time admission; the refusal that follows keeps the trail true.
+    let started = record(&h, &revoked, EventType::SCRIPT_STARTED).await?;
+    assert_eq!(started["confinement"]["mode"], "degraded");
+    assert_eq!(started["queued"], false);
+    assert_unavailable(&env, false);
+    let failed = record(&h, &revoked, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "sandbox_unavailable");
+    assert_eq!(failed["details"], json!({ "reason": "floor_not_met" }));
+    assert_eq!(failed["direct"], true);
+
+    // Granted: the slot is taken with the toggle off, the on commits before `SCRIPT_STARTED`;
+    // it never widens what the slot admitted.
+    let granted = submit(&h, json!({ "source": SRC })).await?;
+    hold.reached.notified().await;
+    set_degraded(&h, true).await?;
+    hold.release.notify_one();
+    let env = h.await_(&granted, 10_000).await;
+    assert_eq!(policies_of(&runner, "start"), [false, false]);
+    assert_unavailable(&env, false);
+    let failed = record(&h, &granted, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["details"], json!({ "reason": "floor_not_met" }));
     Ok(())
 }
