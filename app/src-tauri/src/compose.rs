@@ -16,6 +16,7 @@ use atlas_duck_core::{Core, CoreDeps, KeychainCredentials, NativeConfirmer, Star
 use atlas_duck_sandbox_worker::engine::ENGINE_VERSION;
 use serde_json::{Map, Value};
 
+use crate::script_glue::{ScriptGlue, ScriptInputs};
 use crate::tray_host::TrayHost;
 
 /// Everything the app hands to the core at start.
@@ -29,6 +30,9 @@ pub struct CoreInputs {
     pub confirmer: Arc<dyn NativeConfirmer>,
     /// `None` off Linux (no check there).
     pub tray_host: Option<TrayHost>,
+    /// M8 Task 20: what the script glue takes from the app (the startup probe's holder, the
+    /// update flag, the core's instance list).
+    pub scripts: ScriptInputs,
 }
 
 /// PD-34: the app's part of the `APP_START` payload. The probe report and the sandbox binary
@@ -78,8 +82,8 @@ pub fn core_deps(i: CoreInputs) -> io::Result<CoreDeps> {
         http,
         app_start_extra: app_start_extra(i.tray_host),
         pats_deleted: i.pats_deleted,
-        // M8: scripts answer `sandbox_unavailable`, exit 8.
-        scripts: None,
+        // C.0: the real `ScriptRunner` (M8 Task 20). It creates no spawner until a script runs.
+        scripts: Some(Arc::new(ScriptGlue::new(i.scripts))),
     })
 }
 
@@ -314,6 +318,7 @@ mod tests {
             ui: Arc::new(NoUi),
             confirmer: Arc::new(NoConfirm),
             tray_host,
+            scripts: ScriptInputs::default(),
         };
         Ok((dir, lock, inputs))
     }
@@ -326,7 +331,7 @@ mod tests {
             deps.config_path.as_deref(),
             Some(dir.path().join("config.toml").as_path())
         );
-        assert!(deps.scripts.is_none());
+        assert!(deps.scripts.is_some());
         assert_eq!(
             deps.app_start_extra.get("engine_version"),
             Some(&Value::String(ENGINE_VERSION.to_owned()))
@@ -342,6 +347,61 @@ mod tests {
         );
         deps.audit.shutdown();
         drop((lock, lock2, dir, dir2));
+        Ok(())
+    }
+
+    /// C.0 (M8 Task 20): the core gets the real runner, over the app's probe holder: what the
+    /// startup probe reports there is what the runner admits runs under. Composing it spawns
+    /// nothing and creates no spawner.
+    #[test]
+    fn compose_wires_scripts_some() -> TestResult {
+        use atlas_duck_core::{ConfinementMode, RunPolicy};
+        use atlas_duck_ipc::sandbox::probe::ConfinementReport;
+        use atlas_duck_sandbox_host::identity::{SandboxBinaryIdentity, file_identity};
+        use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
+
+        let (_dir, _lock, mut inputs) = temp_inputs(None)?;
+        let scripts = ScriptInputs::default();
+        inputs.scripts = scripts.clone();
+        let deps = core_deps(inputs)?;
+        let runner = deps.scripts.clone().ok_or("no script runner")?;
+        // No probe report yet: the runner states no confinement.
+        assert!(runner.confinement(RunPolicy::default()).is_none());
+        let (file_id, size, mtime) =
+            file_identity(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))?;
+        let report = ConfinementReport {
+            applied: true,
+            mechanism: "probe".to_owned(),
+            no_new_privs: None,
+            landlock_abi: None,
+            seccomp: None,
+            lpac: None,
+            os_error: None,
+        };
+        let _ = scripts.probe.set(ProbeReport {
+            worker_version: Some("v1".to_owned()),
+            engine_version: None,
+            identity: Some(SandboxBinaryIdentity {
+                file_id,
+                size,
+                mtime,
+                embedded_version: "v1".to_owned(),
+            }),
+            confinement: Some(report.clone()),
+            threads: None,
+            records: Vec::new(),
+            floor: FloorVerdict::Met,
+            extra_layers: Vec::new(),
+            control: None,
+            lpac_failed: None,
+        });
+        let admitted = runner
+            .confinement(RunPolicy::default())
+            .ok_or("the probe report did not reach the runner")?;
+        assert_eq!(admitted.mode, ConfinementMode::Floor);
+        assert_eq!(admitted.worker_version, "v1");
+        assert_eq!(admitted.probe_report, report);
+        deps.audit.shutdown();
         Ok(())
     }
 

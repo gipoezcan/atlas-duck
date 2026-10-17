@@ -432,6 +432,7 @@ impl World {
             ui: Arc::new(NullUi),
             confirmer: confirmer.clone(),
             tray_host: None,
+            scripts: Default::default(),
         })
         .await?;
 

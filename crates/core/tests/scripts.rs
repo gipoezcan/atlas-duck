@@ -2336,6 +2336,88 @@ async fn script_started_records_confinement() -> TestResult {
     Ok(())
 }
 
+/// M8 T20 (Δ1, R9, PD-152): `atlas.instances()`'s list is the `instances.list` rows without
+/// `state` (and so never a URL).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_instances_are_the_instances_list_rows_without_state() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .confluence("wiki")
+        .start()
+        .await?;
+    let listed = h.handler().instances_list().await;
+    let rows = listed.data.ok_or("no data")?["instances"].clone();
+    let expected: Vec<Value> = rows
+        .as_array()
+        .ok_or("no rows")?
+        .iter()
+        .map(|r| json!({ "alias": r["alias"], "product": r["product"], "is_default": r["is_default"] }))
+        .collect();
+    assert_eq!(expected.len(), 2, "{rows}");
+    assert_eq!(
+        serde_json::to_value(h.core().script_instances())?,
+        Value::Array(expected)
+    );
+    Ok(())
+}
+
+/// M8 T20 (PD-141 (c), T12 review I-1 (c)): the end record of a run whose worker answered its
+/// ready frame names that worker's own report (`worker_confinement`), beside `SCRIPT_STARTED`'s
+/// `probe_report`; a run with no worker has no such key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn end_records_carry_the_workers_own_confinement_report() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))),
+        ScriptPlan::new(vec![issue_call(1)], error_end()),
+        ScriptPlan::new(Vec::new(), RunEnd::Crashed),
+        ScriptPlan::new(Vec::new(), host_limit("timeout_s")),
+        ScriptPlan::new(Vec::new(), result_end(json!(2))),
+        ScriptPlan::new(Vec::new(), result_end(json!(3))),
+    ])
+    .await?;
+    let worker = ConfinementReport {
+        mechanism: "lockdown_token".to_owned(),
+        ..confinement_report()
+    };
+    let expected = serde_json::to_value(&worker)?;
+    runner.set_worker_confinement(Some(worker));
+    // A result and a worker-reported error: `SCRIPT_FINISHED`.
+    for _ in 0..2 {
+        let id = submit(&h, json!({ "source": SRC })).await?;
+        h.queued(&id, 20_000).await.ok_or("never queued")?;
+        let finished = record(&h, &id, EventType::SCRIPT_FINISHED).await?;
+        assert_eq!(finished["worker_confinement"], expected, "{finished}");
+    }
+    // A crash: a non-direct `SCRIPT_FAILED`.
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["direct"], false);
+    assert_eq!(failed["worker_confinement"], expected, "{failed}");
+    // A host-measured limit before any call: a direct `SCRIPT_FAILED`.
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["direct"], true);
+    assert_eq!(failed["worker_confinement"], expected, "{failed}");
+    // A runner that states no worker report: the key is absent, never invented.
+    runner.set_worker_confinement(None);
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let finished = record(&h, &id, EventType::SCRIPT_FINISHED).await?;
+    assert!(finished.get("worker_confinement").is_none(), "{finished}");
+    // No worker at all (`start` refused): nothing to name.
+    runner.set_worker_confinement(Some(confinement_report()));
+    runner.fail_start(unavailable(UnavailableReason::SpawnFailed));
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let env = h.await_(&id, 5000).await;
+    assert_unavailable(&env, false);
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert!(failed.get("worker_confinement").is_none(), "{failed}");
+    Ok(())
+}
+
 #[test]
 fn sandbox_unavailable_envelope_details_reason() -> TestResult {
     use atlas_duck_core::engine::envelope::record_status;

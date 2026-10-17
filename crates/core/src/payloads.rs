@@ -1070,6 +1070,23 @@ pub fn script_failed(ctx: &EventCtx, f: &ScriptFailed<'_>) -> NewEvent {
     event(ctx, EventType::SCRIPT_FAILED, Value::Object(m))
 }
 
+/// A real run's end record (`SCRIPT_FINISHED`, `SCRIPT_FAILED`) with the additive key
+/// `worker_confinement` (PD-141 (c), M8 T12 review I-1 (c)): the confinement report of the
+/// worker that ran, from its own ready frame, beside `SCRIPT_STARTED`'s `probe_report` (the
+/// startup probe's). Unchanged when `report` is `None` (no worker sent a ready frame).
+pub fn with_worker_confinement(
+    mut ev: NewEvent,
+    report: Option<&atlas_duck_ipc::sandbox::probe::ConfinementReport>,
+) -> NewEvent {
+    if let (Some(report), Some(m)) = (report, ev.payload.as_object_mut()) {
+        m.insert(
+            "worker_confinement".into(),
+            serde_json::to_value(report).unwrap_or(Value::Null),
+        );
+    }
+    ev
+}
+
 /// What a `SCRIPT_RELEASED` hands over (§4.3): the result, or the error details.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScriptReleasedItem {

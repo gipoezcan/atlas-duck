@@ -78,6 +78,9 @@ pub use atlas_duck_preview::CandidateRev;
 /// The product of `AddInstance` (M6 T25: the app parses the add-instance form's `product` into it
 /// without a registry dependency of its own).
 pub use atlas_duck_registry::Product;
+/// The registry's Read op ids, the `WorkerInit.read_op_ids` of every script run (§9.1 step 3; M8
+/// T20: the worker glue builds the init frame without a registry dependency of its own).
+pub use atlas_duck_registry::read_op_ids;
 /// The date type of `InstanceAdmin::set_token`'s expiry (M6 T20: the app parses the credential
 /// window's "token expires on" into it without a chrono dependency of its own).
 pub use chrono::NaiveDate;

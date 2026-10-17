@@ -43,8 +43,9 @@ use crate::credential::FirstRunPassphrase;
 use crate::credential::follow::AppWatcher;
 use crate::credential::raise::{RaiseGate, RaiseHandle, RaiseSink, TauriRaiseEnv};
 use crate::os_hooks;
+use crate::script_glue::{InstanceSource, ScriptInputs};
 use crate::secret_service::{CachedSecretService, SecretServiceCheck};
-use crate::state::ServeSlot;
+use crate::state::{AppState, ServeSlot};
 use crate::tray;
 use crate::tray_host::TrayHost;
 use crate::ui_sink::TauriUiSink;
@@ -119,6 +120,10 @@ pub struct ServeHooks {
     pub keychain_prompt_after: Duration,
     /// [`PLATFORM_HAS_KEYCHAIN_PROMPT`] in production; without it the hint is never raised.
     pub keychain_prompt_enabled: bool,
+    /// M8 Task 20: the startup probe's holder and the update flag the app's `AppState` owns, for
+    /// the script glue of every core this state starts. `Default`: no probe report ever arrives,
+    /// so every script is refused (`probe_pending`).
+    pub scripts: ScriptInputs,
     /// Tests: the next `n` `Core::start`s of this serving state fail (the store is shut down).
     #[doc(hidden)]
     pub fail_core_start: Option<Arc<AtomicU32>>,
@@ -134,6 +139,7 @@ impl Default for ServeHooks {
             keychain_prompt: Arc::new(AtomicBool::new(false)),
             keychain_prompt_after: KEYCHAIN_PROMPT_AFTER,
             keychain_prompt_enabled: PLATFORM_HAS_KEYCHAIN_PROMPT,
+            scripts: ScriptInputs::default(),
             fail_core_start: None,
             fail_retry_open: None,
         }
@@ -1342,11 +1348,21 @@ pub fn start(
     ));
     app.manage(RaiseHandle(raise.clone()));
     ui = ui.with_raise(Arc::new(RaiseSink::new(raise)));
+    // M8 Task 20: the glue awaits the report of the probe `setup` started, through `AppState`.
+    let scripts = app
+        .try_state::<AppState>()
+        .map(|s| ScriptInputs {
+            probe: s.probe.clone(),
+            update_pending: s.update_pending_flag(),
+            instances: InstanceSource::default(),
+        })
+        .unwrap_or_default();
     let hooks = ServeHooks {
         watcher: Some(Arc::new(AppWatcher::new(app.clone()))),
         keychain_prompt: slot
             .as_ref()
             .map_or_else(Arc::default, |s| s.keychain_prompt_flag()),
+        scripts,
         ..ServeHooks::default()
     };
     let inputs = StartInputs {
@@ -1412,6 +1428,7 @@ pub async fn start_with(i: StartInputs) -> Result<Arc<ServeState>, StartupFailur
         ui: i.ui.clone(),
         confirmer: i.confirmer.clone(),
         tray_host: i.tray_host,
+        scripts: i.hooks.scripts.clone(),
         fail_next: i.hooks.fail_core_start.clone(),
     });
 
@@ -1726,6 +1743,8 @@ struct CoreStarter {
     ui: Arc<dyn UiSink>,
     confirmer: Arc<dyn NativeConfirmer>,
     tray_host: Option<TrayHost>,
+    /// [`ServeHooks::scripts`].
+    scripts: ScriptInputs,
     /// Tests ([`ServeHooks::fail_core_start`]): how many of the next starts fail.
     fail_next: Option<Arc<AtomicU32>>,
 }
@@ -1747,6 +1766,8 @@ impl CoreStarter {
             shutdown_store(store).await;
             return Err(StoreFailure::CoreStart);
         }
+        // The glue of this core reads this core's instances (`atlas.instances()`), once it runs.
+        let instances = InstanceSource::default();
         let inputs = CoreInputs {
             store: store.clone(),
             keys,
@@ -1755,10 +1776,21 @@ impl CoreStarter {
             ui: self.ui.clone(),
             confirmer: self.confirmer.clone(),
             tray_host: self.tray_host,
+            scripts: ScriptInputs {
+                instances: instances.clone(),
+                ..self.scripts.clone()
+            },
         };
         match compose::start_core(inputs).await {
             Ok(core) => {
                 let core = Arc::new(core);
+                // Weak: the glue is the core's own (`CoreDeps.scripts`).
+                let weak = Arc::downgrade(&core);
+                instances.set(move || {
+                    weak.upgrade()
+                        .map(|core| core.script_instances())
+                        .unwrap_or_default()
+                });
                 compose::spawn_offset_updater(core.clone());
                 Ok(core)
             }

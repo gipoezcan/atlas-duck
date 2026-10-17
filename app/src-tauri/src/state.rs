@@ -9,6 +9,7 @@ use atlas_duck_ipc::server::ShutdownSignal;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 use tauri::async_runtime::JoinHandle;
 
+use crate::sandbox_probe::ProbeHolder;
 use crate::serve::{ServeState, ShutdownOutcome};
 use crate::tray_host::TrayHost;
 
@@ -52,8 +53,13 @@ pub struct AppState {
     /// Linux: the §2.5 startup check (`present|missing`); `None` elsewhere. M2 records it
     /// in `APP_START`, M4 reports it in `doctor` (§4.7).
     tray_host: Option<TrayHost>,
-    /// The §9.4 probe report; set once by the `atlas-duck-probe` thread.
-    pub probe: OnceLock<ProbeReport>,
+    /// The §9.4 probe report; set once by the `atlas-duck-probe` thread. Shared with the script
+    /// glue, which awaits it before its first spawn (M8 Task 20, PD-138).
+    pub probe: Arc<ProbeHolder>,
+    /// PD-133: the script glue found the sandbox binary replaced since the probe (an upgrade
+    /// under the running app): scripts stay refused until restart, and the status line
+    /// `updated_restart` is due (M8 Task 21 wires the line).
+    update_pending: Arc<AtomicBool>,
     /// The startup error text (`startup::startup_message`) of the four data-dir error states,
     /// re-shown on a GUI relaunch (§2.5, PD-85).
     startup_text: Option<String>,
@@ -68,7 +74,8 @@ impl AppState {
         AppState {
             startup,
             tray_host,
-            probe: OnceLock::new(),
+            probe: Arc::default(),
+            update_pending: Arc::default(),
             startup_text: None,
             pending: AtomicU32::new(0),
             tray_hint_shown: AtomicBool::new(false),
@@ -112,6 +119,17 @@ impl AppState {
     /// floor cannot be applied and verified, scripts are disabled).
     pub fn scripts_floor_met(&self) -> bool {
         matches!(self.probe.get().map(|r| &r.floor), Some(FloorVerdict::Met))
+    }
+
+    /// The flag the script glue sets on an identity mismatch (PD-133); the serving start hands
+    /// a clone to the glue.
+    pub fn update_pending_flag(&self) -> Arc<AtomicBool> {
+        self.update_pending.clone()
+    }
+
+    /// The sandbox binary was replaced under the running app (PD-133).
+    pub fn update_pending(&self) -> bool {
+        self.update_pending.load(Ordering::SeqCst)
     }
 }
 

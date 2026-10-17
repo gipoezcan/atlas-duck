@@ -7,7 +7,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use atlas_duck_ipc::paths::base_dirs;
 use atlas_duck_ipc::sandbox::probe::ProbeId;
@@ -17,6 +19,7 @@ use atlas_duck_sandbox_host::probe::{
 use atlas_duck_sandbox_host::spawn::{SpawnHook, SpawnSpec, WorkerProcess, WorkerSpawner};
 use atlas_duck_sandbox_host::{fallback_spawner, platform_spawner};
 use tauri::Manager;
+use tokio::sync::watch;
 
 use crate::state::AppState;
 
@@ -55,6 +58,52 @@ pub use atlas_duck_sandbox_host::windows::AceEnsure;
 #[cfg(not(windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AceEnsure {}
+
+/// The startup probe's report, set once per process by the probe thread and shared with the
+/// script glue (M8 Task 20, PD-138: "the glue awaits the startup report before its first spawn").
+/// Reading never blocks; [`ProbeHolder::wait`] awaits the report with a bound.
+#[derive(Debug)]
+pub struct ProbeHolder {
+    report: OnceLock<ProbeReport>,
+    /// Flipped to `true` right after `report` is set.
+    ready: watch::Sender<bool>,
+}
+
+impl Default for ProbeHolder {
+    fn default() -> Self {
+        ProbeHolder {
+            report: OnceLock::new(),
+            ready: watch::channel(false).0,
+        }
+    }
+}
+
+impl ProbeHolder {
+    /// The report, `None` until the probe has finished.
+    pub fn get(&self) -> Option<&ProbeReport> {
+        self.report.get()
+    }
+
+    /// Sets the report once; `false` (and the report dropped) when one was set before.
+    pub fn set(&self, report: ProbeReport) -> bool {
+        if self.report.set(report).is_err() {
+            return false;
+        }
+        self.ready.send_replace(true);
+        true
+    }
+
+    /// The report, awaited for at most `bound`; `None` if it did not arrive in time.
+    pub async fn wait(&self, bound: Duration) -> Option<&ProbeReport> {
+        if let Some(report) = self.get() {
+            return Some(report);
+        }
+        let mut ready = self.ready.subscribe();
+        // The sender lives in `self`, so the channel cannot close while this borrows it.
+        let _ = tokio::time::timeout(bound, ready.wait_for(|set| *set)).await;
+        self.get()
+    }
+}
 
 /// `<install_dir>/atlas-duck-sandbox` (`.exe` on Windows).
 pub fn sandbox_worker_path(install_dir: &Path) -> PathBuf {
@@ -269,8 +318,8 @@ where
             log_probe_report(&report, ace.as_ref());
             match handle.try_state::<AppState>() {
                 Some(state) => {
-                    // The report is set once per process; a second run (M8's
-                    // "before the first script") needs its own storage.
+                    // The report is set once per process (R10: one probe per start, which
+                    // the first script awaits through the same holder).
                     let _ = state.probe.set(report);
                 }
                 None => tracing::warn!(

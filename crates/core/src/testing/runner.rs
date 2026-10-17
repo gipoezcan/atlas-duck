@@ -4,14 +4,16 @@
 //! `kill` interrupts the call in flight or the hold, and `wait` then answers
 //! `RunEnd::Killed { reason }`. The runner-wide answers (Δ3): `check_available` (Ok unless
 //! [`FakeScriptRunner::fail_available`], held by [`FakeScriptRunner::pause_available`]),
-//! `confinement` ([`FakeScriptRunner::set_confinement`]), and every policy it was handed
-//! ([`FakeScriptRunner::policies`]).
+//! `confinement` ([`FakeScriptRunner::set_confinement`]), every policy it was handed
+//! ([`FakeScriptRunner::policies`]), and each handle's worker report
+//! ([`FakeScriptRunner::set_worker_confinement`]).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use tokio::sync::watch;
 
@@ -142,6 +144,8 @@ struct Inner {
     availability_checks: u32,
     /// What `confinement` answers.
     confinement: Option<RunConfinement>,
+    /// What every later started run's `worker_confinement` answers.
+    worker_confinement: Option<ConfinementReport>,
     /// The policy each runner call was handed, in call order (`available`, `compile`,
     /// `confinement`, `start`).
     policies: Vec<(&'static str, RunPolicy)>,
@@ -193,6 +197,12 @@ impl FakeScriptRunner {
     /// What every later `confinement` answers (`None`: the runner states nothing).
     pub fn set_confinement(&self, c: Option<RunConfinement>) {
         self.lock().confinement = c;
+    }
+
+    /// What the handle of every later started run answers for its worker's own ready-frame
+    /// report (`None`: the runner states none).
+    pub fn set_worker_confinement(&self, report: Option<ConfinementReport>) {
+        self.lock().worker_confinement = report;
     }
 
     pub fn availability_checks(&self) -> u32 {
@@ -310,7 +320,7 @@ impl ScriptRunner for FakeScriptRunner {
                         },
                     )
                 });
-            let fake = Arc::new(FakeRun::new());
+            let fake = Arc::new(FakeRun::new(g.worker_confinement.clone()));
             g.handles.push(fake.clone());
             (plan, fake)
         };
@@ -390,14 +400,16 @@ pub struct FakeRun {
     kill: watch::Sender<Option<KillReason>>,
     end: watch::Sender<Option<RunEnd>>,
     answers: Mutex<Vec<HostCallResult>>,
+    worker: Option<ConfinementReport>,
 }
 
 impl FakeRun {
-    fn new() -> FakeRun {
+    fn new(worker: Option<ConfinementReport>) -> FakeRun {
         FakeRun {
             kill: watch::channel(None).0,
             end: watch::channel(None).0,
             answers: Mutex::new(Vec::new()),
+            worker,
         }
     }
 
@@ -453,5 +465,9 @@ impl RunHandle for FakeRun {
             Ok(v) => v.clone().unwrap_or(RunEnd::Crashed),
             Err(_) => RunEnd::Crashed,
         }
+    }
+
+    fn worker_confinement(&self) -> Option<ConfinementReport> {
+        self.worker.clone()
     }
 }

@@ -312,6 +312,14 @@ pub trait RunHandle: Send + Sync {
     /// The run's end. Core calls it exactly once per handle; it settles when the worker is gone
     /// and answers the same `RunEnd` however often it is awaited.
     async fn wait(&self) -> RunEnd;
+    /// The confinement report of the run's own worker, from its ready frame (PD-141 (c), T12
+    /// review I-1 (c)): what the worker that ran reported applying, as opposed to
+    /// `SCRIPT_STARTED`'s `probe_report`. Core reads it once `wait` returned and records it on the
+    /// run's end record (`worker_confinement`). `None`: no worker sent a ready frame, or the
+    /// runner states none (the default).
+    fn worker_confinement(&self) -> Option<ConfinementReport> {
+        None
+    }
 }
 
 // ---- the script's place in the registry-shaped world --------------------------------------------
@@ -2604,13 +2612,27 @@ async fn fail_direct(
     queued: bool,
     details: Option<Value>,
 ) {
+    fail_direct_with(engine, entry, event, reason, queued, details, None).await;
+}
+
+/// [`fail_direct`] for a run whose worker sent a ready frame: the record also names the
+/// worker's own confinement report (`worker_confinement`, PD-141 (c)).
+async fn fail_direct_with(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    event: Event,
+    reason: &str,
+    queued: bool,
+    details: Option<Value>,
+    worker: Option<ConfinementReport>,
+) {
     let (ctx, reason) = (entry.ctx.clone(), reason.to_owned());
     let _ = engine
         .transition_with(
             entry,
             event,
             move |_| {
-                vec![payloads::script_failed(
+                let record = payloads::script_failed(
                     &ctx,
                     &ScriptFailed {
                         reason: &reason,
@@ -2620,7 +2642,8 @@ async fn fail_direct(
                         details: details.as_ref(),
                         candidate: None,
                     },
-                )]
+                );
+                vec![payloads::with_worker_confinement(record, worker.as_ref())]
             },
             OnAuditFailure::FailRequest,
             |_| {},
@@ -2793,6 +2816,8 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
     let began = Instant::now();
     // The cause of a spawn-time unavailability `start` reported (kept in the record).
     let mut cause = None;
+    // The run's own worker's ready-frame report (PD-141 (c)), for the end record.
+    let mut worker = None;
     // A kill asked for before the worker exists (a cancel, a user kill in this window): no
     // worker is started for it.
     let end = if let Some(reason) = shared.kill_reason() {
@@ -2803,6 +2828,7 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
             Ok(handle) => {
                 shared.set_handle(handle.clone());
                 let end = handle.wait().await;
+                worker = handle.worker_confinement();
                 shared.mark_ended();
                 end
             }
@@ -2822,6 +2848,7 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         cause,
         queued,
         elapsed: began.elapsed(),
+        worker,
     };
     finish_real(engine, entry, &shared, end, &limits).await;
 }
@@ -2878,6 +2905,8 @@ struct Ended {
     cause: Option<UnavailableReason>,
     queued: bool,
     elapsed: Duration,
+    /// The run's own worker's ready-frame report ([`RunHandle::worker_confinement`]).
+    worker: Option<ConfinementReport>,
 }
 
 /// What the host makes of a run's end (§9.5).
@@ -2925,6 +2954,7 @@ fn classify(ended: Ended, shared: &RunShared, ctx: &EventCtx, limits: &ScriptLim
         cause,
         queued,
         elapsed,
+        worker: _,
     } = ended;
     if shared.audit_failed() {
         return Finish::Ignore;
@@ -3047,6 +3077,8 @@ async fn finish_real(
     limits: &ScriptLimits,
 ) {
     let (dispatched, queued) = (shared.dispatched(), ended.queued);
+    // PD-141 (c): every end record of a run whose worker sent a ready frame names what it applied.
+    let worker = ended.worker.clone();
     match classify(ended, shared, &entry.ctx, limits) {
         Finish::Ignore => {}
         Finish::Item {
@@ -3055,6 +3087,7 @@ async fn finish_real(
             body,
             output,
         } => {
+            let record = payloads::with_worker_confinement(record, worker.as_ref());
             commit_item(engine, entry, item, record, (body, output), false, shared).await;
         }
         Finish::Failed {
@@ -3067,7 +3100,7 @@ async fn finish_real(
                 direct: true,
                 item: ReleaseItem::ScriptErrorDetails,
             };
-            fail_direct(engine, entry, event, &reason, queued, details).await;
+            fail_direct_with(engine, entry, event, &reason, queued, details, worker).await;
         }
         Finish::Failed {
             reason,
@@ -3088,6 +3121,7 @@ async fn finish_real(
                     candidate: Some(&candidate),
                 },
             );
+            let record = payloads::with_worker_confinement(record, worker.as_ref());
             let body = json!({ "script_error": candidate });
             // §9.5: the data-free limit outcome of a `queued` run pre-selects the preset.
             let preselect = limit && queued && !dispatched;

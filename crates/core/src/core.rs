@@ -467,6 +467,26 @@ impl Core {
         self.engine.kill_script(request_id)
     }
 
+    /// The configured instances as a script's `atlas.instances()` shows them (Δ1, R9, PD-152):
+    /// the `instances.list` rows without `state`, never a URL; empty while `config.toml` is
+    /// unreadable (`instances.list` answers `not_configured` then). Cheap: it reads the instance
+    /// table only (no OS proxy reading), so the worker glue calls it before each spawn.
+    pub fn script_instances(&self) -> Vec<atlas_duck_ipc::sandbox::script::InstanceInfo> {
+        let table = self.engine.instances();
+        if table.config_unreadable() {
+            return Vec::new();
+        }
+        table
+            .list()
+            .iter()
+            .map(|i| atlas_duck_ipc::sandbox::script::InstanceInfo {
+                alias: i.alias.clone(),
+                product: crate::config::instances::product_str(i.product).to_owned(),
+                is_default: i.is_default,
+            })
+            .collect()
+    }
+
     /// The script run policy (Δ3, PD-141) as it is now: core reads it before each runner call
     /// (`check_available`, the compile check, the real-slot acquisition). `allow_degraded` is the
     /// audit-authoritative `SettingsView.allow_degraded_scripts` (Δ7), read from the store's view
