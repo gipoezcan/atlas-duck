@@ -22,7 +22,7 @@ use atlas_duck_convert::{
     ConversionReport, LostCounts, MarkdownTooLarge, UserResolutions, lossy_update,
     markdown_to_preview_html, storage_constructs, storage_lines, storage_to_markdown_within,
 };
-use atlas_duck_preview::diff::{hunks, line_diff, line_diff_lines};
+use atlas_duck_preview::diff::{DiffLine, DiffOp, LineDiff, hunks, line_diff, line_diff_lines};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::render::DOC_MAX_ROWS;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
@@ -32,7 +32,9 @@ use atlas_duck_preview::{
 use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
 
-use super::confluence::{BodyFormat, TEXT_CURRENT_UNPARSABLE, body_format};
+use super::confluence::{
+    BodyFormat, PAGE_BODY_LIMIT, TEXT_CURRENT_UNPARSABLE, TEXT_PAGE_TOO_LARGE, body_format,
+};
 use super::confluence_body::is_markdown;
 use super::generic::{
     TABLE_ROW_CAP, bytes_of, cell_of, cut_at, omitted_row, other_root_bytes, pair_bytes,
@@ -710,8 +712,11 @@ fn comment_unshown_bytes(comment: &Map<String, Value>) -> u64 {
 /// M7 Δ2 / PD-104: every Markdown projection of the update card converts within this many bytes
 /// (the host-call default, `max_call_result_mb` 16): `DIFF_MAX_LINES` caps after the conversion
 /// and does not bound its allocation (T10 review). A side past it is not projected: the rendered
-/// diff leaves it out (counted, `diff_truncated`) and the raw diff shows it.
-const UPDATE_MARKDOWN_BUDGET: usize = 16 * 1024 * 1024;
+/// diff leaves it out (counted, `diff_truncated`) and the raw diff shows it. The judge keeps no
+/// server body of more storage bytes (T15 review I-1): the same number, but this one bounds the
+/// Markdown a projection writes, so a side past it stays possible (an outgoing body, a projection
+/// longer than its storage).
+const UPDATE_MARKDOWN_BUDGET: usize = PAGE_BODY_LIMIT;
 
 /// §6.3 Edit/update and Conflict for `confluence.page.update` (PD-104), over the exact request
 /// (§5.1 inv. 4; the outgoing storage is read from the request that is sent, never from the
@@ -724,11 +729,20 @@ const UPDATE_MARKDOWN_BUDGET: usize = 16 * 1024 * 1024;
 /// - `Conflict`: the rendered diffs base → current and base → sent (M6 T10 review M-5); what
 ///   their projections leave out of the base and current server bodies counts as hidden
 ///   (T12b rules, Info `source_formatting_removed`), since the card has no raw view of them;
-/// - the judge's `EnrichmentError` over an unparsable current body: the PD-94 plan text.
+/// - the judge's `EnrichmentError` over an unparsable current body: the PD-94 plan text; over a
+///   body past the diff budget: [`TEXT_PAGE_TOO_LARGE`] (T15 review I-1).
 ///
-/// The invisible characters of the server bodies the card shows count into the §6.4 header.
-/// Every other hold, or a request that is not the update JSON, keeps the generic write preview.
+/// A title the request changes heads both diffs of the edit card with a `title` section, then a
+/// `body` section (T15 review m-5). The invisible characters of the server text the card shows
+/// count into the §6.4 header. Every other hold, or a request that is not the update JSON, keeps
+/// the generic write preview.
 pub(crate) fn update_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    update_preview_within(ctx, UPDATE_MARKDOWN_BUDGET)
+}
+
+/// [`update_preview`] with the Markdown projections held to `budget` bytes (T15 review m-1: the
+/// tests reach the over-budget path with small bodies).
+pub(crate) fn update_preview_within(ctx: &PreviewCtx<'_>, budget: usize) -> PreviewModel {
     let mut model = generic::write_preview(ctx);
     let PreviewInput::Write(view) = &ctx.input else {
         return model;
@@ -741,38 +755,47 @@ pub(crate) fn update_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         return model;
     };
     match view.hold {
+        Hold::EnrichmentError if view.failure.is_none() && facts.page_too_large => {
+            model.body = PreviewBody::enrichment_error(None, TEXT_PAGE_TOO_LARGE, None);
+            model
+        }
         Hold::EnrichmentError if view.failure.is_none() && facts.current_unparsable => {
             model.body = PreviewBody::enrichment_error(None, TEXT_CURRENT_UNPARSABLE, None);
             model
         }
-        Hold::Conflict => conflict_card(model, view, facts),
-        Hold::Preview => edit_card(ctx, model, view, facts),
+        Hold::Conflict => conflict_card(model, view, facts, budget),
+        Hold::Preview => edit_card(ctx, model, view, facts, budget),
         _ => model,
     }
 }
 
+/// The JSON body of the first request (the one `PUT`), as sent.
+fn sent_json(requests: &[HttpRequestSpec]) -> Option<Value> {
+    serde_json::from_slice(&requests.first()?.body).ok()
+}
+
+/// `body.storage.value` of a sent update body.
+fn storage_in(body: &Value) -> Option<&str> {
+    body.get("body")?.get("storage")?.get("value")?.as_str()
+}
+
 /// `body.storage.value` of the first request (the one `PUT`), as sent.
 fn sent_storage(requests: &[HttpRequestSpec]) -> Option<String> {
-    let body: Value = serde_json::from_slice(&requests.first()?.body).ok()?;
-    body.get("body")?
-        .get("storage")?
-        .get("value")?
-        .as_str()
-        .map(str::to_owned)
+    storage_in(&sent_json(requests)?).map(str::to_owned)
 }
 
 /// The Markdown projection the rendered diffs compare (empty user map, PD-104), or `None` past
-/// [`UPDATE_MARKDOWN_BUDGET`].
-fn projection(storage: &str) -> Option<String> {
-    storage_to_markdown_within(storage, &UserResolutions::new(), UPDATE_MARKDOWN_BUDGET)
+/// `budget` ([`UPDATE_MARKDOWN_BUDGET`]).
+fn projection(storage: &str, budget: usize) -> Option<String> {
+    storage_to_markdown_within(storage, &UserResolutions::new(), budget)
         .ok()
         .map(|(markdown, _, _)| markdown)
 }
 
 /// The rendered diff of `old` against `new` into `view`, display-escaped and capped; its hunks.
 /// A side past the budget is left out whole: both texts count as cut.
-fn rendered_into(view: &mut DiffView, old: &str, new: &str) -> u64 {
-    match (projection(old), projection(new)) {
+fn rendered_into(view: &mut DiffView, old: &str, new: &str, budget: usize) -> u64 {
+    match (projection(old, budget), projection(new, budget)) {
         (Some(o), Some(n)) => {
             let d = line_diff(&o, &n);
             view.extend(&d, &o, &n);
@@ -804,24 +827,58 @@ fn storage_construct_list(storage: &str) -> ConstructList {
     }
 }
 
+/// T15 review m-5: the `title` section (the current title deleted, the sent one added) and the
+/// heading of the `body` section after it, for a request that renames the page.
+fn title_section(current: &str, sent: &str) -> LineDiff {
+    let line = |op: DiffOp, text: &str| DiffLine {
+        op,
+        text: text.to_owned(),
+    };
+    LineDiff {
+        lines: vec![
+            line(DiffOp::Field, "title"),
+            line(DiffOp::Del, current),
+            line(DiffOp::Add, sent),
+            line(DiffOp::Field, "body"),
+        ],
+        truncated: false,
+    }
+}
+
 fn edit_card(
     ctx: &PreviewCtx<'_>,
     mut model: PreviewModel,
     view: &WriteView<'_>,
     facts: &ConfluenceFacts,
+    budget: usize,
 ) -> PreviewModel {
+    let sent = sent_json(view.requests);
     let (Some(current), Some(outgoing), PreviewBody::WriteRequests { .. }) = (
         facts.current_storage.as_deref(),
-        sent_storage(view.requests),
+        sent.as_ref().and_then(storage_in),
         &model.body,
     ) else {
         return model;
     };
-    let mut rendered = DiffView::new();
-    let rendered_hunks = rendered_into(&mut rendered, current, &outgoing);
-    let raw_diff = line_diff_lines(&storage_lines(current), &storage_lines(&outgoing));
-    let mut raw = DiffView::new();
-    raw.extend(&raw_diff, current, &outgoing);
+    // The title the request sends, against the one the page has (§5.1 inv. 4: never the params).
+    let renamed = match (
+        facts.page.as_ref(),
+        sent.as_ref()
+            .and_then(|b| b.get("title"))
+            .and_then(Value::as_str),
+    ) {
+        (Some(page), Some(title)) if page.title != title => Some((page.title.as_str(), title)),
+        _ => None,
+    };
+    let (mut rendered, mut raw) = (DiffView::new(), DiffView::new());
+    if let Some((was, title)) = renamed {
+        let section = title_section(was, title);
+        rendered.extend(&section, "", "");
+        raw.extend(&section, "", "");
+    }
+    let rendered_hunks = rendered_into(&mut rendered, current, outgoing, budget);
+    let raw_diff = line_diff_lines(&storage_lines(current), &storage_lines(outgoing));
+    raw.extend(&raw_diff, current, outgoing);
     let raw_only = hunks(&raw_diff.lines).saturating_sub(rendered_hunks);
     if raw_only > 0 {
         model.warnings.push(Warning::new(
@@ -830,7 +887,7 @@ fn edit_card(
         ));
     }
     if is_markdown(ctx.params) {
-        let lost = lossy_update(current, &outgoing);
+        let lost = lossy_update(current, outgoing);
         if lost != LostCounts::default() {
             model.warnings.push(Warning::new(
                 WarningId::LossyUpdate,
@@ -847,7 +904,7 @@ fn edit_card(
     }
     // The raw diff shows every byte of both bodies (its cut aside); what their renders leave out
     // is not hidden, but it is formatting the rendered diff does not show (§6.4).
-    let stripped = [current, outgoing.as_str()]
+    let stripped = [current, outgoing]
         .iter()
         .any(|s| dropped_markup(s, Markup::Storage).stripped());
     BodyNotes {
@@ -855,7 +912,12 @@ fn edit_card(
         stripped,
     }
     .push(&mut model.warnings);
-    count_card_text(&mut model, [current]);
+    count_card_text(
+        &mut model,
+        [Some(current), renamed.map(|(was, _)| was)]
+            .into_iter()
+            .flatten(),
+    );
     let requests = match std::mem::replace(
         &mut model.body,
         PreviewBody::WriteRequests {
@@ -869,7 +931,7 @@ fn edit_card(
         rendered: rendered.lines,
         raw: raw.lines,
         raw_only_changes: raw_only,
-        constructs: Some(storage_construct_list(&outgoing)),
+        constructs: Some(storage_construct_list(outgoing)),
         requests,
     };
     model.header.hidden_in_preview_bytes = cut;
@@ -880,6 +942,7 @@ fn conflict_card(
     mut model: PreviewModel,
     view: &WriteView<'_>,
     facts: &ConfluenceFacts,
+    budget: usize,
 ) -> PreviewModel {
     let (Some(base), Some(current)) = (
         facts.base_storage.as_deref(),
@@ -888,13 +951,13 @@ fn conflict_card(
         return model;
     };
     let mut to_current = DiffView::new();
-    rendered_into(&mut to_current, base, current);
+    rendered_into(&mut to_current, base, current, budget);
     // The agent's intended change: from its base to what the request sends (none when the
     // request could not be built).
     let mut intended = DiffView::new();
     let outgoing = sent_storage(view.requests);
     if let Some(sent) = outgoing.as_deref() {
-        rendered_into(&mut intended, base, sent);
+        rendered_into(&mut intended, base, sent, budget);
     }
     let cut = to_current.cut.max(intended.cut);
     if cut > 0 {

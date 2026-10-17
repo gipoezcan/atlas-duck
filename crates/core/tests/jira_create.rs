@@ -11,6 +11,7 @@ use std::time::Duration;
 use atlas_duck_atlassian::GetCall;
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_audit::EventType;
+use atlas_duck_core::lifecycle::model::Hold;
 use atlas_duck_core::ops::{
     EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, MAX_ENRICH_STAGES,
 };
@@ -21,6 +22,7 @@ use atlas_duck_core::{
 };
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_preview::form::{EditInput, InputKind};
+use atlas_duck_preview::warning::Warning;
 use atlas_duck_preview::{Level, Preview, PreviewBody, WarningId};
 use common::jira::{PROJECTS_PATH, gets_on, issuetypes_path, mount_create_stages, query};
 use common::{TestError, TestResult, code, de, exit, message, request_id, test_hits};
@@ -1016,6 +1018,95 @@ async fn enrich_round_limit_fails_closed() -> TestResult {
         "{res:?}"
     );
     assert_eq!(h.status(&id).await.status, Status::Pending);
+    Ok(())
+}
+
+// ---- a render failure under an unapprovable hold (T15 review m-7) ------------------------------
+
+/// The Caution the colliding rule's verdict carries, so the card shows that verdict was kept.
+const COLLIDING_TEXT: &str = "collision (test rule)";
+
+fn colliding_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    match answers {
+        [] => endless_plan(ctx, answers),
+        _ => EnrichStep::Judge,
+    }
+}
+
+fn colliding_judge(_: &EnrichCtx<'_>, _: &[Value]) -> EnrichVerdict {
+    let mut v = EnrichVerdict::preview(Value::Null, Map::new());
+    v.hold = Hold::Collision;
+    v.warnings
+        .push(Warning::new(WarningId::Conflict, COLLIDING_TEXT));
+    v
+}
+
+/// One GET, then a `Collision` verdict, which the create executor refuses (it builds its request
+/// under `Preview` only).
+static COLLIDING: EnrichRule = EnrichRule {
+    plan: colliding_plan,
+    judge: colliding_judge,
+};
+
+/// M7 Task 15 (T8 review I-1): a hold that is never approvable keeps its card when its request
+/// list cannot be built: no "unrenderable" card, no requests, Approve disabled; an edit that
+/// re-runs no enrichment renders under the same hold and is taken the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn render_failure_under_an_unapprovable_hold_keeps_the_card() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .hooks(TestHooks {
+            enrich_rule: Some(&COLLIDING),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    mount_create_stages(mock).await;
+    approvable_server(mock).await;
+    let id = queued(&h, params("Collides")).await?;
+    let held = |p: &Preview| -> TestResult {
+        assert!(!p.approvable);
+        assert!(
+            p.warnings.iter().any(|w| w.text == COLLIDING_TEXT),
+            "{:?}",
+            p.warnings
+        );
+        match &p.body {
+            PreviewBody::WriteRequests { requests } => assert!(requests.is_empty()),
+            PreviewBody::WriteSummary { requests, .. } => assert!(requests.is_empty()),
+            other => return Err(format!("not the kept card: {other:?}").into()),
+        }
+        Ok(())
+    };
+    assert!(!h.approver().item(&id).ok_or("not queued")?.approvable);
+    held(&preview(&h, &id)?)?;
+    not_approvable(h.approver().approve(&id))?;
+
+    // `summary` is no enrich key: the edit renders under the kept hold.
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let mut set = Map::new();
+    set.insert("summary".into(), json!("Still collides"));
+    h.approver()
+        .edit(
+            &id,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )
+        .map_err(de)?;
+    rev_after(&h, &id, rev.counter).await?;
+    assert_eq!(records(&h, &id, EventType::WRITE_EDITED).await?.len(), 1);
+    held(&preview(&h, &id)?)?;
+    not_approvable(h.approver().approve(&id))?;
+    assert!(
+        mock.received()
+            .await
+            .iter()
+            .all(|r| r.method.as_str() != "POST"),
+        "nothing sent"
+    );
     Ok(())
 }
 

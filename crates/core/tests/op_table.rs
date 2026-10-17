@@ -1734,6 +1734,7 @@ fn page_update_conflict_and_stale_rule() -> TestResult {
         json!({"id": "65537", "base_version": 5, "body": "b", "body_format": "storage"});
     let mut base = page.clone();
     base["version"]["number"] = json!(5);
+    base["status"] = json!("historical");
     let (_, v) = enrich("confluence.page.update", &stale_base, &[page.clone(), base])?;
     assert_eq!(v.hold, Hold::Conflict);
     assert_eq!(
@@ -2154,6 +2155,7 @@ fn write_preview_hold_bodies() -> TestResult {
     let page: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE)?;
     let mut base = page.clone();
     base["version"]["number"] = json!(5);
+    base["status"] = json!("historical");
     let (_, v) = enrich("confluence.page.update", &params, &[page, base])?;
     let m = write_preview(
         "confluence.page.update",

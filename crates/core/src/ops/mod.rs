@@ -18,7 +18,7 @@ pub mod stale;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use atlas_duck_atlassian::{
     GetCall, HttpRequestSpec, NormalizedBaseUrl, PagedCall, SearchCall, TemplateError, build_url,
@@ -363,14 +363,20 @@ pub struct ConfluenceFacts {
     pub current_labels: Vec<String>,
     /// Task 15 (PD-104; additive to Δ3, the judge has no executor output, T15 report): the
     /// current page's storage (stage 1), which the update card diffs against the storage the
-    /// request sends and the lossy check counts.
-    pub current_storage: Option<String>,
+    /// request sends and the lossy check counts. Shared (T15 review I-1): every clone of the
+    /// write's state (an open, an edit snapshot) points at the one copy, of at most
+    /// `confluence::PAGE_BODY_LIMIT` bytes.
+    pub current_storage: Option<Arc<str>>,
     /// Task 15: the agent's base version's storage (stage 2, a conflict only), the "before" of
-    /// both conflict diffs.
-    pub base_storage: Option<String>,
+    /// both conflict diffs. Shared and bounded like `current_storage`.
+    pub base_storage: Option<Arc<str>>,
     /// Task 15 (PD-94, plan review I-3 c): the current storage does not parse, so a Markdown
     /// update cannot be counted: the judge holds it (`EnrichmentError`) and the card says why.
     pub current_unparsable: bool,
+    /// T15 review I-1 (lead ruling c): the current or the base storage is longer than
+    /// `confluence::PAGE_BODY_LIMIT`; neither body is kept, the judge holds the update
+    /// (`EnrichmentError`) and the card says why.
+    pub page_too_large: bool,
 }
 
 /// Redacting `Debug` (§7.7): page bodies, titles and keys are Atlassian data.
@@ -379,10 +385,11 @@ impl fmt::Debug for ConfluenceFacts {
         f.debug_struct("ConfluenceFacts")
             .field(
                 "current_storage",
-                &self.current_storage.as_ref().map(String::len),
+                &self.current_storage.as_ref().map(|s| s.len()),
             )
-            .field("base_storage", &self.base_storage.as_ref().map(String::len))
+            .field("base_storage", &self.base_storage.as_ref().map(|s| s.len()))
             .field("current_unparsable", &self.current_unparsable)
+            .field("page_too_large", &self.page_too_large)
             .finish_non_exhaustive()
     }
 }

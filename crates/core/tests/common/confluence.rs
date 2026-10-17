@@ -80,13 +80,19 @@ pub async fn mount_page_view(mock: &MockDc, id: &str, body: &Value) {
 }
 
 /// `GET /rest/api/content/{id}?version=<version>&status=historical` (any `expand`) answers
-/// `body`, ahead of a [`mount_page`] of the same path.
+/// `body` as a historical version (`"status": "historical"`, which the page update's stage 2
+/// requires when the answer carries a status; T15 review I-2), ahead of a [`mount_page`] of the
+/// same path.
 pub async fn mount_history_version(mock: &MockDc, id: &str, version: u64, body: &Value) {
+    let mut body = body.clone();
+    if let Some(o) = body.as_object_mut() {
+        o.insert("status".to_owned(), json!("historical"));
+    }
     Mock::given(method("GET"))
         .and(path(mock.path(&content_path(id))))
         .and(query_param("version", version.to_string().as_str()))
         .and(query_param("status", "historical"))
-        .respond_with(json_answer(mock, 200, body))
+        .respond_with(json_answer(mock, 200, &body))
         .with_priority(1)
         .mount(mock.server())
         .await;

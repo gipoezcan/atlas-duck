@@ -4,6 +4,8 @@
 //! (storage verbatim or Markdown converted, `confluence_body`; two enrichment stages with the
 //! agent's base body on a conflict, PD-104) and, from M7, the `format` of the page reads (PD-100).
 
+use std::sync::Arc;
+
 use atlas_duck_convert::storage;
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
@@ -453,8 +455,9 @@ pub fn page_history_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
 
 /// PD-104: two stages (Δ3): the current page, then (only when the agent's `base_version` is not
 /// the current version) the agent's base version's body; the judge holds the conflict, keeps both
-/// bodies for the card ([`ConfluenceFacts`]) and holds a Markdown update over a current body that
-/// does not parse.
+/// bodies for the card ([`ConfluenceFacts`]), holds an update whose bodies are past
+/// [`PAGE_BODY_LIMIT`] (T15 review I-1) and a Markdown update over a current body that does not
+/// parse.
 pub static PAGE_UPDATE_ENRICH: EnrichRule = EnrichRule {
     plan: page_update_plan,
     judge: page_update_judge,
@@ -464,13 +467,17 @@ pub static PAGE_UPDATE_ENRICH: EnrichRule = EnrichRule {
 const PAGE_UPDATE_EXPAND: &str = "body.storage,version,space,ancestors";
 
 /// Stage 1, then stage 2 (§5.4 step 2 verbatim: `?version=<base_version>&status=historical&
-/// expand=body.storage`) when the current page answered a version other than the base.
+/// expand=body.storage`) when the current page answered a version other than the base and a
+/// body the card can keep ([`PAGE_BODY_LIMIT`]; past it the judge holds the update anyway).
 fn page_update_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
     match answers {
         [] => EnrichStep::Fetch(vec![(
             EnrichPurpose::Enrich,
             get_call(CONTENT_PATH, ctx.params, &[("expand", PAGE_UPDATE_EXPAND)]),
         )]),
+        [current] if storage_of(current).is_some_and(|s| s.len() > PAGE_BODY_LIMIT) => {
+            EnrichStep::Judge
+        }
         [current] => match (base_version(ctx.params), content_version(current)) {
             (Some(base), Some(now)) if base != now => {
                 let version = base.to_string();
@@ -512,6 +519,23 @@ fn storage_of(v: &Value) -> Option<&str> {
 pub const TEXT_CURRENT_UNPARSABLE: &str =
     "the current page storage could not be parsed; what this update removes cannot be counted";
 
+/// T15 review I-1 (lead ruling c): the most storage bytes an update keeps of the current page and
+/// of its base version for the card, the update card's diff budget (16 MiB, the host-call default
+/// `max_call_result_mb`). A longer body is held (`EnrichmentError`, [`TEXT_PAGE_TOO_LARGE`]), so a
+/// pending update holds at most two bodies of this size.
+pub const PAGE_BODY_LIMIT: usize = 16 * 1024 * 1024;
+
+/// T15 review I-1: the card of an update held because a page body is past [`PAGE_BODY_LIMIT`].
+pub const TEXT_PAGE_TOO_LARGE: &str = "the page storage is larger than 16 MiB, the preview's \
+     diff budget; this update cannot be previewed or approved here";
+
+/// T15 review m-1: `confluence.page.update`'s previewer with its Markdown projections held to
+/// `budget` bytes (the op table's previewer uses the 16 MiB diff budget).
+#[cfg(feature = "testing")]
+pub fn update_preview_within(ctx: &PreviewCtx<'_>, budget: usize) -> PreviewModel {
+    super::confluence_preview::update_preview_within(ctx, budget)
+}
+
 fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict {
     let Some(page) = responses.first() else {
         return EnrichVerdict::unusable();
@@ -551,11 +575,16 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
             id: str_param(ctx.params, "id").to_owned(),
             title: title.to_owned(),
         }),
-        current_storage: Some(current_storage.to_owned()),
         ..ConfluenceFacts::default()
     };
+    let too_large = |s: &str| s.len() > PAGE_BODY_LIMIT;
 
-    if base != current {
+    if too_large(current_storage) {
+        // T15 review I-1 (lead ruling c): a body past the diff budget is not kept (fail closed;
+        // judged first: the plan asked for no base body then).
+        verdict.hold = Hold::EnrichmentError;
+        facts.page_too_large = true;
+    } else if base != current {
         // Stage 2 answered the agent's base version: its body is the "before" of both diffs.
         // Fail closed when the answer is not that version of this page.
         let Some(base_storage) = responses
@@ -565,19 +594,28 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
         else {
             return EnrichVerdict::unusable();
         };
-        facts.base_storage = Some(base_storage.to_owned());
-        let text = warning::conflict(base, current);
-        verdict.hold = Hold::Conflict;
-        verdict
-            .warnings
-            .push(Warning::new(WarningId::Conflict, text.clone()));
-        verdict.conflict = Some(text);
-        verdict.diff_text = format!("base version v{base}, current version v{current}");
+        if too_large(base_storage) {
+            // No conflict card without the base body: the hold says why instead.
+            verdict.hold = Hold::EnrichmentError;
+            facts.page_too_large = true;
+        } else {
+            facts.current_storage = Some(Arc::from(current_storage));
+            facts.base_storage = Some(Arc::from(base_storage));
+            let text = warning::conflict(base, current);
+            verdict.hold = Hold::Conflict;
+            verdict
+                .warnings
+                .push(Warning::new(WarningId::Conflict, text.clone()));
+            verdict.conflict = Some(text);
+            verdict.diff_text = format!("base version v{base}, current version v{current}");
+        }
     } else if is_markdown(ctx.params) && !storage::parse(current_storage).xml_ok {
         // PD-94: what a Markdown update removes cannot be counted (T7 review m-4: the judge
         // parses itself; `lossy_update` does not say which path it took).
         verdict.hold = Hold::EnrichmentError;
         facts.current_unparsable = true;
+    } else {
+        facts.current_storage = Some(Arc::from(current_storage));
     }
     verdict.summary = Some(WriteSummaryFacts {
         confluence: Some(facts),
@@ -586,15 +624,20 @@ fn page_update_judge(ctx: &EnrichCtx<'_>, responses: &[Value]) -> EnrichVerdict 
     verdict
 }
 
-/// A stage-2 answer is the base version of the page: its `id`, and its `version.number` when it
+/// A stage-2 answer is the base version of the page: its `id`, its `version.number` when it
 /// carries one (the expand names only the body: DC may leave the version out, so an answer
-/// without one is taken as the version asked for; T25's live run checks the shape).
+/// without one is taken as the version asked for), and its `status` `historical` when it carries
+/// one (T15 review I-2: a server or proxy that ignored `version` / `status=historical` answers
+/// the current page, which is no base). T25's live run checks the shape.
 fn is_base_answer(answer: &Value, id: &str, base: u64) -> bool {
     let same_page = answer.get("id").and_then(Value::as_str) == Some(id);
     let same_version = answer
         .get("version")
         .is_none_or(|_| content_version(answer) == Some(base));
-    same_page && same_version
+    let historical = answer
+        .get("status")
+        .is_none_or(|s| s.as_str() == Some("historical"));
+    same_page && same_version && historical
 }
 
 /// `PUT /rest/api/content/{id}` with `version.number = base_version + 1` (§7.4), the current

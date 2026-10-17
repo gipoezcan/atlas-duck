@@ -22,11 +22,11 @@ use atlas_duck_convert::{
 use atlas_duck_core::lifecycle::model::Hold;
 use atlas_duck_core::ops::{
     EnrichCtx, EnrichFailure, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan, PreviewCtx,
-    PreviewInput, PreviewModel, WriteView, op_table,
+    PreviewInput, PreviewModel, WriteView, confluence, op_table,
 };
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::Harness;
-use atlas_duck_core::{BatchFailure, BatchItem, Confirm, DecisionError, Edits};
+use atlas_duck_core::{BatchFailure, BatchItem, Confirm, DecisionError, Edits, Pause, TestHooks};
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff, line_diff_lines};
 use atlas_duck_preview::invisible::escape_for_display;
@@ -153,6 +153,41 @@ fn preview_of(
     Ok((imp.previewer)(&ctx))
 }
 
+/// [`preview_of`] with the update card's Markdown projections held to `budget` bytes (T15 review
+/// m-1: the over-budget path with a small body).
+fn preview_within(
+    params: &Value,
+    v: &EnrichVerdict,
+    reqs: &[HttpRequestSpec],
+    budget: usize,
+) -> Result<PreviewModel, TestError> {
+    let ctx = PreviewCtx {
+        spec: spec()?,
+        instance_alias: "wiki",
+        params,
+        input: PreviewInput::Write(WriteView {
+            requests: reqs,
+            hold: v.hold,
+            enrichment: Some(v),
+            failure: None,
+        }),
+        field_names: None,
+    };
+    Ok(confluence::update_preview_within(&ctx, budget))
+}
+
+/// `reqs` with the first request's JSON body changed by `edit` (what is sent, not the params).
+fn swapped(
+    mut reqs: Vec<HttpRequestSpec>,
+    edit: impl FnOnce(&mut Value),
+) -> Result<Vec<HttpRequestSpec>, TestError> {
+    let first = reqs.first_mut().ok_or("no request")?;
+    let mut body: Value = serde_json::from_slice(&first.body)?;
+    edit(&mut body);
+    first.body = serde_json::to_vec(&body)?;
+    Ok(reqs)
+}
+
 /// Judge, executor and previewer over `answers`.
 fn preview(params: &Value, answers: &[Value]) -> Result<(EnrichVerdict, PreviewModel), TestError> {
     let (_, v) = staged(params, answers)?;
@@ -266,17 +301,99 @@ fn stage2_answer_that_is_not_the_base_is_unusable() -> TestResult {
     other_page["id"] = json!("99999");
     let mut no_body = historical(5, "<p>b</p>");
     no_body["body"] = json!({});
-    for wrong in [historical(6, "<p>b</p>"), other_page, no_body] {
+    // T15 review I-2: an answer that says it is the current page is no historical version (a
+    // server or proxy that ignored `version` / `status=historical`), with or without `version`.
+    let mut current_status = historical(5, "<p>b</p>");
+    current_status["status"] = json!("current");
+    let mut bare_current = current_status.clone();
+    bare_current
+        .as_object_mut()
+        .ok_or("not an object")?
+        .remove("version");
+    for wrong in [
+        historical(6, "<p>b</p>"),
+        other_page,
+        no_body,
+        current_status,
+        bare_current,
+    ] {
         let (_, v) = staged(&p, &[page(7, "<p>a</p>"), wrong])?;
         assert_eq!(v.hold, Hold::EnrichmentError);
     }
-    // An answer without `version` (the expand names only the body) is taken as asked for.
+    // An answer without `version` (the expand names only the body) is taken as asked for; so is
+    // one without `status`.
     let mut bare = historical(5, "<p>b</p>");
     bare.as_object_mut()
         .ok_or("not an object")?
         .remove("version");
+    let (_, v) = staged(&p, &[page(7, "<p>a</p>"), bare.clone()])?;
+    assert_eq!(v.hold, Hold::Conflict);
+    bare.as_object_mut()
+        .ok_or("not an object")?
+        .remove("status");
     let (_, v) = staged(&p, &[page(7, "<p>a</p>"), bare])?;
     assert_eq!(v.hold, Hold::Conflict);
+    Ok(())
+}
+
+/// The bodies an update keeps for its card (T15 review I-1, lead ruling c).
+fn kept_bodies(v: &EnrichVerdict) -> Result<(Option<String>, Option<String>), TestError> {
+    let facts = v
+        .summary
+        .as_ref()
+        .and_then(|s| s.confluence.as_ref())
+        .ok_or("no Confluence facts")?;
+    let owned = |s: &Option<std::sync::Arc<str>>| s.as_deref().map(str::to_owned);
+    Ok((owned(&facts.current_storage), owned(&facts.base_storage)))
+}
+
+/// T15 review I-1 (lead ruling c): a current or base body longer than the 16 MiB diff budget is
+/// not kept: the judge holds "enrichment failed" with the plan text, Approve disabled, and no
+/// body stays in the write's state. A current body past it needs no base body either.
+#[test]
+fn page_over_the_diff_budget_is_held() -> TestResult {
+    const BUDGET: usize = 16 * 1024 * 1024;
+    let body = |len: usize| format!("<p>{}</p>", "a".repeat(len - "<p></p>".len()));
+    let p = params(7, "<p>x</p>", Some("storage"));
+    let (_, v) = staged(&p, &[page(7, &body(BUDGET))])?;
+    assert_eq!(v.hold, Hold::Preview, "exactly the budget is kept");
+
+    let (rounds, v) = staged(&p, &[page(7, &body(BUDGET + 1))])?;
+    assert_eq!(rounds.len(), 1);
+    assert_eq!(v.hold, Hold::EnrichmentError);
+    assert_eq!(kept_bodies(&v)?, (None, None));
+    let m = preview_of(&p, &v, &requests(&p, &v)?, None)?;
+    match &m.body {
+        PreviewBody::EnrichmentError { text, status, .. } => {
+            assert_eq!(text, confluence::TEXT_PAGE_TOO_LARGE);
+            assert_eq!(*status, None);
+        }
+        other => return Err(format!("not the enrichment card: {other:?}").into()),
+    }
+    assert!(
+        confluence::TEXT_PAGE_TOO_LARGE.contains("16 MiB"),
+        "{}",
+        confluence::TEXT_PAGE_TOO_LARGE
+    );
+
+    // A base behind: the current body past the budget asks for no base body.
+    let p = params(5, "<p>x</p>", Some("storage"));
+    let (rounds, v) = staged(&p, &[page(7, &body(BUDGET + 1))])?;
+    assert_eq!(rounds.len(), 1, "no stage 2");
+    assert_eq!(v.hold, Hold::EnrichmentError);
+    assert_eq!(kept_bodies(&v)?, (None, None));
+    // The base body past it: held the same way, no conflict Caution beside it.
+    let (rounds, v) = staged(&p, &[page(7, "<p>a</p>"), historical(5, &body(BUDGET + 1))])?;
+    assert_eq!(rounds.len(), 2);
+    assert_eq!(v.hold, Hold::EnrichmentError);
+    assert_eq!(kept_bodies(&v)?, (None, None));
+    assert!(v.warnings.is_empty(), "{:?}", v.warnings);
+    assert!(v.conflict.is_none());
+    let m = preview_of(&p, &v, &[], None)?;
+    assert!(matches!(
+        &m.body,
+        PreviewBody::EnrichmentError { text, .. } if text == confluence::TEXT_PAGE_TOO_LARGE
+    ));
     Ok(())
 }
 
@@ -429,6 +546,165 @@ fn edit_diff_reads_the_sent_body() -> TestResult {
             .any(|l| l.op == DiffOp::Add && l.text == "<p>on the wire</p>")
     );
     assert!(!raw.iter().any(|l| l.text.contains("from params")));
+    Ok(())
+}
+
+/// T15 review m-6: the lossy Caution and the construct list follow the storage that is sent too:
+/// a request whose body keeps the macro the params' Markdown would drop has no Caution, and its
+/// construct list names the macro.
+#[test]
+fn lossy_and_constructs_read_the_sent_body() -> TestResult {
+    let current = "<ac:structured-macro ac:name=\"toc\"/><p>a</p>";
+    let p = params(7, "a", None);
+    let (v, m) = preview(&p, &[page(7, current)])?;
+    assert_eq!(
+        warning_text(&m, WarningId::LossyUpdate).as_deref(),
+        Some("this update will remove 1 macros / 0 images / 0 links")
+    );
+    let PreviewBody::EditDiff { constructs, .. } = &m.body else {
+        return Err("not the edit diff".into());
+    };
+    assert!(constructs.as_ref().ok_or("no list")?.macros.is_empty());
+
+    let reqs = swapped(requests(&p, &v)?, |b| {
+        b["body"]["storage"]["value"] = json!("<ac:structured-macro ac:name=\"toc\"/><p>b</p>");
+    })?;
+    let m = preview_of(&p, &v, &reqs, None)?;
+    assert!(!ids(&m).contains(&WarningId::LossyUpdate), "{:?}", ids(&m));
+    let PreviewBody::EditDiff { constructs, .. } = &m.body else {
+        return Err("not the edit diff".into());
+    };
+    let macros = &constructs.as_ref().ok_or("no list")?.macros;
+    assert!(macros.iter().any(|s| s.contains("toc")), "{macros:?}");
+    Ok(())
+}
+
+/// T15 review m-5: a title the request changes heads the diffs with a `title` section (the
+/// current title deleted, the sent one added), then the body's section; the title is read from
+/// the request (§5.1 inv. 4). An unchanged title adds nothing.
+#[test]
+fn title_change_heads_the_diff() -> TestResult {
+    let current = "<p>one</p><p>two</p>";
+    let mut p = params(7, "<p>one</p><p>2</p>", Some("storage"));
+    p["title"] = json!("Renamed");
+    let (v, m) = preview(&p, &[page(7, current)])?;
+    let outgoing = sent_storage(&requests(&p, &v)?[0])?;
+    let head = |new: &str| {
+        vec![
+            DiffLine {
+                op: DiffOp::Field,
+                text: "title".to_owned(),
+            },
+            DiffLine {
+                op: DiffOp::Del,
+                text: "Release checklist".to_owned(),
+            },
+            DiffLine {
+                op: DiffOp::Add,
+                text: new.to_owned(),
+            },
+            DiffLine {
+                op: DiffOp::Field,
+                text: "body".to_owned(),
+            },
+        ]
+    };
+    let PreviewBody::EditDiff {
+        rendered,
+        raw,
+        raw_only_changes,
+        ..
+    } = &m.body
+    else {
+        return Err(format!("not the edit diff: {:?}", m.body).into());
+    };
+    let mut want = head("Renamed");
+    want.extend(rendered_diff(current, &outgoing)?);
+    assert_eq!(rendered, &want);
+    let mut want = head("Renamed");
+    want.extend(raw_diff(current, &outgoing));
+    assert_eq!(raw, &want);
+    assert_eq!(*raw_only_changes, 0);
+
+    // What is sent, not the params.
+    let reqs = swapped(requests(&p, &v)?, |b| b["title"] = json!("On the wire"))?;
+    let m = preview_of(&p, &v, &reqs, None)?;
+    let PreviewBody::EditDiff { rendered, .. } = &m.body else {
+        return Err("not the edit diff".into());
+    };
+    assert_eq!(rendered.get(..4), Some(head("On the wire").as_slice()));
+
+    // The current title given again: no section.
+    p["title"] = json!("Release checklist");
+    let (_, m) = preview(&p, &[page(7, current)])?;
+    let PreviewBody::EditDiff { rendered, .. } = &m.body else {
+        return Err("not the edit diff".into());
+    };
+    assert_eq!(rendered, &rendered_diff(current, &outgoing)?);
+
+    // The current title is server text the card shows: its invisible characters count.
+    let mut tricky = page(7, current);
+    tricky["title"] = json!("Release\u{202E}checklist");
+    p["title"] = json!("Renamed");
+    let (_, m) = preview(&p, &[tricky])?;
+    assert!(m.header.bidi_controls >= 1);
+    let PreviewBody::EditDiff { rendered, .. } = &m.body else {
+        return Err("not the edit diff".into());
+    };
+    assert_eq!(
+        rendered.get(1).map(|l| l.text.clone()),
+        Some(escape_for_display("Release\u{202E}checklist"))
+    );
+    Ok(())
+}
+
+/// T15 review m-1: a side whose Markdown projection is past the budget is not projected: no
+/// rendered lines, both texts counted as cut (`diff_truncated`, the header count), the raw diff
+/// still there and every raw hunk raw-only (`raw_only_diff`; truthful, nothing is rendered);
+/// the lossy count does not depend on the projection.
+#[test]
+fn update_card_past_the_projection_budget() -> TestResult {
+    let current = "<p>a</p><ac:structured-macro ac:name=\"toc\"/>";
+    let p = params(7, "b", None);
+    let (v, full) = preview(&p, &[page(7, current)])?;
+    let reqs = requests(&p, &v)?;
+    let outgoing = sent_storage(&reqs[0])?;
+    let m = preview_within(&p, &v, &reqs, 1)?;
+    let PreviewBody::EditDiff {
+        rendered,
+        raw,
+        raw_only_changes,
+        ..
+    } = &m.body
+    else {
+        return Err(format!("not the edit diff: {:?}", m.body).into());
+    };
+    assert!(rendered.is_empty(), "{rendered:?}");
+    assert_eq!(raw, &raw_diff(current, &outgoing));
+    let raw_hunks = atlas_duck_preview::diff::hunks(raw);
+    assert!(raw_hunks > 0);
+    assert_eq!(*raw_only_changes, raw_hunks);
+    let cut = (current.len() + outgoing.len()) as u64;
+    assert_eq!(m.header.hidden_in_preview_bytes, cut);
+    assert_eq!(
+        warning_text(&m, WarningId::DiffTruncated).as_deref(),
+        Some(warning::diff_truncated(cut).as_str())
+    );
+    assert_eq!(
+        warning_text(&m, WarningId::RawOnlyDiff).as_deref(),
+        Some(warning::raw_only_diff(raw_hunks).as_str())
+    );
+    assert_eq!(
+        warning_text(&m, WarningId::LossyUpdate),
+        warning_text(&full, WarningId::LossyUpdate)
+    );
+    assert!(warning_text(&m, WarningId::LossyUpdate).is_some());
+    // The full budget projects both sides.
+    let PreviewBody::EditDiff { rendered, .. } = &full.body else {
+        return Err("not the edit diff".into());
+    };
+    assert!(!rendered.is_empty());
+    assert!(!ids(&full).contains(&WarningId::DiffTruncated));
     Ok(())
 }
 
@@ -1089,36 +1365,47 @@ async fn stage2_historical_3xx_direct() -> TestResult {
 }
 
 /// T13 identity rule for the base GETs: both stages run in the one enrichment, so another user's
-/// PAT stored between them (here: while stage 2 is in flight) does not let the answers of two
-/// identities make one verdict: the verdict that met the change is followed by
-/// `WRITE_STALE {credential_changed}` and both stages again under the new PAT, before it can be
-/// approved (the M3 rule, `route_change`).
+/// PAT stored between them (here: after stage 1 answered, before stage 2 starts; T15 review m-2:
+/// held there by `pause_after_get`, no timing) does not let the answers of two identities make
+/// one verdict: the verdict that met the change is followed by `WRITE_STALE {credential_changed}`
+/// and both stages again under the new PAT, before it can be approved (the M3 rule,
+/// `route_change`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn token_replaced_between_the_stages_refreshes() -> TestResult {
+    let pause = Pause::new();
     let h = Harness::builder()
         .confluence("wiki")
         .confirm(vec![Confirm::Ok])
+        .hooks(TestHooks {
+            pause_after_get: Some(pause.clone()),
+            ..TestHooks::none()
+        })
         .start()
         .await?;
     let mock = wiki(&h)?;
     mock.applinks_manifest("9.2.1").await;
     mount_page(mock, ID, &page(6, "<p>c</p>")).await;
-    // The base body is slow, so the token is replaced while stage 2 is in flight.
-    Mock::given(method("GET"))
-        .and(path(mock.path(&content_path(ID))))
-        .and(query_param("status", "historical"))
-        .respond_with(
-            json_answer(mock, 200, &historical(5, "<p>b</p>"))
-                .set_delay(Duration::from_millis(800)),
-        )
-        .with_priority(1)
-        .mount(mock.server())
-        .await;
+    mount_history_version(mock, ID, 5, &historical(5, "<p>b</p>")).await;
     let env = h
         .submit(UPDATE, params(5, "<p>x</p>", Some("storage")))
         .await;
     let id = request_id(&env)?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Stage 1 answered and its record is parked; stage 2 has not started.
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .map_err(|_| "stage 1 never held")?;
+    assert_eq!(records(&h, &id, EventType::PREVIEW_FETCH).await?.len(), 0);
+    let historical = mock
+        .received()
+        .await
+        .iter()
+        .filter(|r| {
+            r.url
+                .query()
+                .is_some_and(|q| q.contains("status=historical"))
+        })
+        .count();
+    assert_eq!(historical, 0, "stage 2 has not started");
     // Another user's PAT (`TokenReplaced`; the same user's is `TokenStored`, which changes no
     // identity and so nothing to re-read).
     Mock::given(method("GET"))
@@ -1133,6 +1420,16 @@ async fn token_replaced_between_the_stages_refreshes() -> TestResult {
     h.instances()
         .set_token("wiki", SecretString::from("bobs-pat".to_owned()), None)
         .await?;
+    // Every later GET (stage 2, then both stages of the refresh) goes on when it holds.
+    let releaser = {
+        let pause = pause.clone();
+        tokio::spawn(async move {
+            loop {
+                pause.release.notify_one();
+                pause.reached.notified().await;
+            }
+        })
+    };
     // The verdict that met the change is followed by `WRITE_STALE {credential_changed}` and a
     // refresh (both stages again, under the new PAT).
     let mut stale = Vec::new();
@@ -1164,6 +1461,7 @@ async fn token_replaced_between_the_stages_refreshes() -> TestResult {
     assert_eq!(refreshed, 2, "both stages again");
     assert!(!h.approver().item(&id).ok_or("gone")?.approvable);
     assert!(puts(mock).await.is_empty());
+    releaser.abort();
     Ok(())
 }
 
