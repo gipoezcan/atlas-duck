@@ -3690,9 +3690,8 @@ async fn dispatch_case_2(close: bool) -> TestResult {
     Ok(())
 }
 
-/// I-14 case 3: a `max_fetch_mb` overrun on the first response (of a paged op: only paged reads
-/// apply the run's remaining fetch budget to a response here; the same for a plain
-/// `jira.issue.get` is T13's plain-call window, not on this branch).
+/// I-14 case 3: a `max_fetch_mb` overrun on the first response, of a paged op (paged reads
+/// apply the run's remaining fetch budget to a response: the call itself is refused).
 async fn dispatch_case_3() -> TestResult {
     let end = RunEnd::HostLimit {
         name: "max_fetch_mb".to_owned(),
@@ -3739,7 +3738,76 @@ async fn dispatch_case_3() -> TestResult {
     Ok(())
 }
 
-/// I-14 case 4: a compile error, or a host-measured limit before any request was sent by a run
+/// I-14 case 3 for a plain (non-paged) call: the first response of a `jira.issue.get` takes
+/// the run's fetched bytes past `max_fetch_mb`; its record keeps every byte, the run's next
+/// call is refused `script_limit` before it is sent, and the run ends `pending`, then a release
+/// item. What the first call itself answers is not asserted: a plain GET's body is not cut at
+/// the run's remaining fetch budget (only the paged reads apply it).
+async fn dispatch_case_3_plain() -> TestResult {
+    const SUMMARY: usize = 1_300_000;
+    let end = RunEnd::HostLimit {
+        name: "max_fetch_mb".to_owned(),
+    };
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![issue_call(1), issue_call(2)],
+        end,
+    )])
+    .await?;
+    let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+    issue["fields"]["summary"] = json!("s".repeat(SUMMARY));
+    let mock = requests_of(&h)?;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(issue.to_string(), "application/json"),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    match runner.results().as_slice() {
+        [_, HostCallResult::Rejected { class, .. }] => assert_eq!(class, "script_limit"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let sent = mock
+        .received()
+        .await
+        .iter()
+        .filter(|r| r.url.path() == mock.path("/rest/api/2/issue/ABC-1"))
+        .count();
+    assert_eq!(sent, 1, "the refused call was sent");
+    let types = h.event_types(&id).await?;
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+        ]
+    );
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert!(
+        call["bytes"].as_u64().is_some_and(|b| b > 1024 * 1024),
+        "{}",
+        call["bytes"]
+    );
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "max_fetch_mb");
+    assert_eq!(failed["dispatched"], true);
+    assert_eq!(failed["direct"], false);
+    Ok(())
+}
+
+/// I-14 case 4:a compile error, or a host-measured limit before any request was sent by a run
 /// that did not wait for a slot, is direct, exit 8.
 async fn dispatch_case_4() -> TestResult {
     let limited = RunEnd::HostLimit {
@@ -3854,6 +3922,10 @@ async fn i14_dispatch_rule_cases_1_to_5() -> TestResult {
         (
             "case 3: max_fetch_mb overrun on the first response",
             dispatch_case_3().await,
+        ),
+        (
+            "case 3: max_fetch_mb overrun on a plain call's first response",
+            dispatch_case_3_plain().await,
         ),
         (
             "case 4: compile error or direct limit",

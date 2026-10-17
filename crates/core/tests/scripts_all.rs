@@ -16,7 +16,9 @@ use atlas_duck_core::testing::{FakeScriptRunner, Harness, ScriptPlan, host_call}
 use atlas_duck_core::{KillReason, RunEnd};
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult};
-use common::{TestError, TestResult, request_id};
+use atlas_duck_preview::warning::WarningId;
+use atlas_duck_preview::{PreviewBody, ProvenanceRow};
+use common::{TestError, TestResult, de, request_id};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, Request, Respond, ResponseTemplate};
@@ -844,5 +846,161 @@ async fn all_dry_run_answers_from_the_example() -> TestResult {
             .await
             .is_empty()
     );
+    Ok(())
+}
+
+// ---- merge of T13 into T17's preview (T17 review I-1): one provenance row per call_id ----------
+
+/// The provenance rows and the warning ids of a queued request's release preview.
+fn provenance(h: &Harness, id: &str) -> Result<(Vec<ProvenanceRow>, Vec<WarningId>), TestError> {
+    let p = h.approver().open(id).map_err(de)?.preview;
+    let warnings = p.warnings.iter().map(|w| w.id).collect();
+    match p.body {
+        PreviewBody::Script { provenance, .. } => Ok((provenance, warnings)),
+        other => Err(format!("not a script body: {other:?}").into()),
+    }
+}
+
+fn row(call_id: u64, op: &str, target: &str, outcome: &str) -> ProvenanceRow {
+    ProvenanceRow {
+        call_id,
+        op_id: op.to_owned(),
+        instance: "jira-main".to_owned(),
+        target_display: target.to_owned(),
+        outcome: outcome.to_owned(),
+    }
+}
+
+/// A seven-page `atlas.all` call is one provenance row with the call's answer (no page rows),
+/// beside a plain call's row. Paged to the end, it is not lossy (X-12), and without
+/// `renderedFields` it raises no R8 Caution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_call_is_one_provenance_row() -> TestResult {
+    let plain = host_call(2, "jira.issue.get", json!({ "key": "ABC-1" }));
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![search_all(1, 100), plain],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let hits = Pages::new(&h, 700)?.mount(&h).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(outline(&runner.results()), ["ok", "ok"]);
+    assert_eq!(hits_of(&hits).len(), 7);
+    assert_eq!(script_calls(&h, &id).await?.len(), 8);
+    let (rows, warnings) = provenance(&h, &id)?;
+    assert_eq!(
+        rows,
+        [
+            row(1, "jira.search", "project = ABC", "ok"),
+            row(2, "jira.issue.get", "ABC-1", "ok"),
+        ]
+    );
+    assert!(
+        !warnings.contains(&WarningId::HostCallsLossy),
+        "{warnings:?}"
+    );
+    assert!(
+        !warnings.contains(&WarningId::ScriptRenderedCopies),
+        "{warnings:?}"
+    );
+    Ok(())
+}
+
+/// R8 for `atlas.all`: a `jira.search` asking `expand: ['renderedFields']` raises the Caution
+/// `script_rendered_copies` (search results carry `renderedFields` per issue).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_rendered_fields_raises_the_caution() -> TestResult {
+    let call = all_call(
+        1,
+        json!({ "jql": "project = ABC", "max": 100, "expand": ["renderedFields"] }),
+    );
+    let (h, runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
+    Pages::new(&h, 200)?.mount(&h).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(outline(&runner.results()), ["ok"]);
+    let (rows, warnings) = provenance(&h, &id)?;
+    assert_eq!(rows, [row(1, "jira.search", "project = ABC", "ok")]);
+    assert!(
+        warnings.contains(&WarningId::ScriptRenderedCopies),
+        "{warnings:?}"
+    );
+    Ok(())
+}
+
+/// The run ends (a timeout) with page 1 in flight: the call is one `cancelled_in_flight` row,
+/// not page 0's row plus the end's row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_cancelled_at_a_later_page_is_one_cancelled_in_flight_row() -> TestResult {
+    let end = RunEnd::HostLimit {
+        name: "timeout_s".to_owned(),
+    };
+    let (h, _runner) = harness(vec![
+        ScriptPlan::new(vec![search_all(1, 100)], result_end(json!(1)))
+            .interrupted(3500, end)
+            .keeping_calls(),
+    ])
+    .await?;
+    let mut pages = Pages::new(&h, 700)?;
+    pages.stall_at = Some((100, Duration::from_secs(10)));
+    pages.mount(&h).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let calls = script_calls(&h, &id).await?;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1]["outcome"], "cancelled_in_flight");
+    let (rows, _) = provenance(&h, &id)?;
+    assert_eq!(
+        rows,
+        [row(
+            1,
+            "jira.search",
+            "project = ABC",
+            "cancelled_in_flight"
+        )]
+    );
+    Ok(())
+}
+
+/// A call that ends with a rejection after some pages were committed is one row with that
+/// rejection: refused before a later page (`max_calls`, no record of its own), and rejected on
+/// the page that would make the result too large (that page's record).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_rejected_after_committed_pages_is_one_rejected_row() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(vec![search_all(1, 100)], result_end(json!(1))),
+        ScriptPlan::new(vec![search_all(1, 100)], result_end(json!(1))),
+    ])
+    .await?;
+    // About 260 KB per page: five of them are over 1 MiB.
+    let mut pages = Pages::new(&h, 700)?;
+    pages.pad = 2500;
+    pages.mount(&h).await?;
+    let limited = submit(&h, json!({ "source": SRC, "limits": { "max_calls": 3 } })).await?;
+    h.queued(&limited, 20_000).await.ok_or("never queued")?;
+    let too_large = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_call_result_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&too_large, 20_000).await.ok_or("never queued")?;
+    assert_eq!(
+        outline(&runner.results()),
+        ["script_limit", "result_too_large"]
+    );
+    assert_eq!(script_calls(&h, &limited).await?.len(), 3);
+    assert_eq!(script_calls(&h, &too_large).await?.len(), 5);
+    for (id, outcome) in [
+        (&limited, "rejected:script_limit"),
+        (&too_large, "rejected:result_too_large"),
+    ] {
+        let (rows, _) = provenance(&h, id)?;
+        assert_eq!(
+            rows,
+            [row(1, "jira.search", "project = ABC", outcome)],
+            "{id}"
+        );
+    }
     Ok(())
 }
