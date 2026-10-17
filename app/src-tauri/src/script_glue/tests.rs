@@ -1629,6 +1629,25 @@ fn log_scenario() -> TestResult {
         );
         replace(&worker)?;
         let _ = g.start(spec(off()), GatedCalls::new()).await;
+        // Refused at admission with no usable worker (T20 review m-1): no recorded identity, the
+        // holder's own record unreadable, no install dir.
+        let g = glue(
+            &FakePort::new(),
+            &worker_file(),
+            Some(bare_report(FloorVerdict::Met)),
+        );
+        let _ = g.check_available(off()).await;
+        let missing = dir.file("not-there");
+        let g = glue_recording(&FakePort::new(), &missing, &missing, bare_report(not_met()));
+        let _ = g.check_available(on()).await;
+        let g = glue_recording(&FakePort::new(), &missing, &worker, bare_report(not_met()));
+        let _ = g.check_available(on()).await;
+        let inputs = ScriptInputs::default();
+        let _ = inputs
+            .probe
+            .set(report_for(&worker_file(), FloorVerdict::Met)?);
+        let g = ScriptGlue::with_port(FakePort::new(), None, inputs);
+        let _ = g.start(spec(off()), GatedCalls::new()).await;
         Ok(())
     })
 }
@@ -1690,8 +1709,15 @@ fn glue_logs_host_diag_constants_only() -> TestResult {
         );
     }
     assert_eq!(mismatches.len(), 3, "{out}");
-    assert!(out.contains("event=script_spawn_failed"), "{out}");
-    assert!(out.contains("reason=TimedOut"), "{out}");
+    for line in [
+        "event=script_spawn_failed reason=TimedOut dropped_fields",
+        "event=script_spawn_failed reason=no_identity dropped_fields",
+        "event=script_spawn_failed reason=fallback_unreadable dropped_fields",
+        "event=script_spawn_failed reason=fallback_other_path dropped_fields",
+        "event=script_spawn_failed reason=no_install_dir request_id=req-1",
+    ] {
+        assert!(out.contains(line), "{line}: {out}");
+    }
     assert!(out.contains("request_id=req-1"), "{out}");
     assert!(!out.contains("SENTINEL"), "worker text in the log: {out}");
     // Constants and ids only: no field was dropped from any line.

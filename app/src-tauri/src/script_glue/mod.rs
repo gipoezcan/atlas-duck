@@ -66,13 +66,20 @@ pub const COMPILE_DEADLINE_MAX: Duration = Duration::from_secs(10);
 /// the part ([`map::identity_reason`]: `file_id`, `size`, `mtime`, `missing`,
 /// `embedded_version`).
 pub const LOG_EVENT_IDENTITY_MISMATCH: &str = "script_identity_mismatch";
-/// Log event: no usable worker (`reason` is a fixed token: `floor_not_met`, or the spawn's
-/// `io::ErrorKind` name).
+/// Log event: no usable worker (`reason` is a fixed token: one of the `REASON_*` below, a refusal
+/// of the floor rule's admission (`policy::Refusal::log_token`), or the spawn's `io::ErrorKind`
+/// name).
 pub const LOG_EVENT_SPAWN_FAILED: &str = "script_spawn_failed";
 /// Log event: the startup probe's report did not arrive within [`PROBE_WAIT`].
 pub const LOG_EVENT_PROBE_PENDING: &str = "script_probe_pending";
 /// `reason` of [`LOG_EVENT_SPAWN_FAILED`] for a ready frame without the confinement the run needs.
 const REASON_FLOOR_NOT_MET: &str = "floor_not_met";
+/// `reason` of [`LOG_EVENT_SPAWN_FAILED`]: the install dir (so the worker's path) is unknown.
+const REASON_NO_INSTALL_DIR: &str = "no_install_dir";
+/// `reason` of [`LOG_EVENT_SPAWN_FAILED`]: the blocking identity re-check did not return.
+const REASON_BLOCKING_CALL_LOST: &str = "blocking_call_lost";
+/// `reason` of [`LOG_EVENT_SPAWN_FAILED`]: `start` was not called on a tokio runtime.
+const REASON_NO_RUNTIME: &str = "no_runtime";
 
 /// The PD-135 bound of one compile check: `min(10 s, timeout_s)`.
 pub fn compile_deadline(limits: &ScriptLimits) -> Duration {
@@ -361,8 +368,17 @@ impl ScriptGlue {
             self.inputs.probe.fallback(),
             self.worker.as_deref(),
             policy,
-        )?;
-        let exe = self.worker.clone().ok_or(UnavailableReason::SpawnFailed)?;
+        )
+        .map_err(|refusal| {
+            if let Some(reason) = refusal.log_token() {
+                spawn_failed(reason, request_id);
+            }
+            refusal.reason()
+        })?;
+        let Some(exe) = self.worker.clone() else {
+            spawn_failed(REASON_NO_INSTALL_DIR, request_id);
+            return Err(UnavailableReason::SpawnFailed);
+        };
         self.recheck(&admission.expect, &exe, request_id).await?;
         Ok((admission, exe))
     }
@@ -381,7 +397,10 @@ impl ScriptGlue {
                 upgraded(&self.inputs.update_pending, m.what, request_id);
                 Err(UnavailableReason::AppUpgraded)
             }
-            Err(_) => Err(UnavailableReason::SpawnFailed),
+            Err(_) => {
+                spawn_failed(REASON_BLOCKING_CALL_LOST, request_id);
+                Err(UnavailableReason::SpawnFailed)
+            }
         }
     }
 
@@ -391,13 +410,7 @@ impl ScriptGlue {
             StartRunError::IdentityMismatch { what } => {
                 upgraded(&self.inputs.update_pending, *what, request_id);
             }
-            StartRunError::FloorNotMet => {
-                tracing::warn!(
-                    event = LOG_EVENT_SPAWN_FAILED,
-                    reason = REASON_FLOOR_NOT_MET,
-                    request_id
-                );
-            }
+            StartRunError::FloorNotMet => spawn_failed(REASON_FLOOR_NOT_MET, request_id),
             StartRunError::Spawn(kind) => {
                 tracing::warn!(event = LOG_EVENT_SPAWN_FAILED, reason = ?kind, request_id);
             }
@@ -468,8 +481,10 @@ impl ScriptRunner for ScriptGlue {
             .await
             .map_err(map::runner_error)?;
         // The runtime core runs on (the app's, with the time driver) runs the host-call tasks.
-        let rt =
-            Handle::try_current().map_err(|_| map::runner_error(UnavailableReason::SpawnFailed))?;
+        let Ok(rt) = Handle::try_current() else {
+            spawn_failed(REASON_NO_RUNTIME, Some(&request_id));
+            return Err(map::runner_error(UnavailableReason::SpawnFailed));
+        };
         let spec = SpawnSpec {
             exe,
             process_mb: run.limits.process_mb,
@@ -563,6 +578,11 @@ impl RunHandle for RunHandleGlue {
     fn worker_confinement(&self) -> Option<ConfinementReport> {
         self.worker.get().cloned()
     }
+}
+
+/// No usable worker: one `script_spawn_failed` line with a fixed `reason` token.
+fn spawn_failed(reason: &'static str, request_id: Option<&str>) {
+    tracing::warn!(event = LOG_EVENT_SPAWN_FAILED, reason, request_id);
 }
 
 /// PD-133: the binary was replaced (or could not be confirmed); the flag stays set until restart.

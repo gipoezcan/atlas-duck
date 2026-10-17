@@ -40,9 +40,46 @@ pub struct Admission {
     pub probe_report: Option<ConfinementReport>,
 }
 
+/// Why [`admit`] refused a spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The floor is not met and degraded confinement is not allowed.
+    FloorNotMet,
+    /// No identity of the worker binary to check the spawn against: the probe recorded none, and
+    /// the holder recorded none either or the spawn is not degraded (a `Met` report).
+    NoIdentity,
+    /// The holder's own record is of another path than the spawn's.
+    FallbackOtherPath,
+    /// The holder could not read the binary's identity when it resolved.
+    FallbackUnreadable,
+}
+
+impl Refusal {
+    /// In core's words: every refusal but the floor rule's is `SpawnFailed` (fail closed).
+    pub fn reason(self) -> UnavailableReason {
+        match self {
+            Refusal::FloorNotMet => UnavailableReason::FloorNotMet,
+            Refusal::NoIdentity | Refusal::FallbackOtherPath | Refusal::FallbackUnreadable => {
+                UnavailableReason::SpawnFailed
+            }
+        }
+    }
+
+    /// The `reason` token of the `script_spawn_failed` log line (T20 review m-1); `None` for the
+    /// floor rule, a policy answer rather than a failure.
+    pub fn log_token(self) -> Option<&'static str> {
+        match self {
+            Refusal::FloorNotMet => None,
+            Refusal::NoIdentity => Some("no_identity"),
+            Refusal::FallbackOtherPath => Some("fallback_other_path"),
+            Refusal::FallbackUnreadable => Some("fallback_unreadable"),
+        }
+    }
+}
+
 /// The floor rule under `policy` (§9.4, PD-141), for a spawn of `worker`. A refusal names why: the
 /// floor is not met and degraded confinement is not allowed (`FloorNotMet`), or there is no
-/// identity of the worker binary to check the spawn against (`SpawnFailed`; fail closed).
+/// identity of the worker binary to check the spawn against (the others; fail closed).
 ///
 /// The identity is the probe's. When no probe worker sent its ready frame the probe recorded none,
 /// and only a degraded spawn (degraded allowed AND the floor `NotMet`) may use the one the holder
@@ -53,11 +90,11 @@ pub fn admit(
     fallback: Option<&FallbackIdentity>,
     worker: Option<&Path>,
     policy: RunPolicy,
-) -> Result<Admission, UnavailableReason> {
+) -> Result<Admission, Refusal> {
     let degraded = match &report.floor {
         FloorVerdict::Met => false,
         FloorVerdict::NotMet { .. } if policy.allow_degraded => true,
-        FloorVerdict::NotMet { .. } => return Err(UnavailableReason::FloorNotMet),
+        FloorVerdict::NotMet { .. } => return Err(Refusal::FloorNotMet),
     };
     // §9.4: a run uses the spawner whose probe workers reached ready (they gave the identity),
     // also when the floor is `NotMet` (a floor probe was not blocked, or the control re-run
@@ -66,14 +103,15 @@ pub fn admit(
     // blocked), i.e. exactly when the holder's own record stands in.
     let (identity, spawner) = match &report.identity {
         Some(identity) => (identity.clone(), probe_spawner_kind(report)),
-        None if degraded => (
-            fallback
-                .filter(|f| Some(f.worker.as_path()) == worker)
-                .and_then(|f| f.identity.clone())
-                .ok_or(UnavailableReason::SpawnFailed)?,
-            degraded_spawner_kind(),
-        ),
-        None => return Err(UnavailableReason::SpawnFailed),
+        None if degraded => {
+            let record = fallback.ok_or(Refusal::NoIdentity)?;
+            if Some(record.worker.as_path()) != worker {
+                return Err(Refusal::FallbackOtherPath);
+            }
+            let identity = record.identity.clone().ok_or(Refusal::FallbackUnreadable)?;
+            (identity, degraded_spawner_kind())
+        }
+        None => return Err(Refusal::NoIdentity),
     };
     let mode = if degraded {
         ConfinementMode::Degraded
