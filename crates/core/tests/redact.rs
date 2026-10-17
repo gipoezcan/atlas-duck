@@ -855,8 +855,40 @@ fn arb_root() -> impl Strategy<Value = Value> {
         .prop_map(|m| Value::Object(m.into_iter().collect::<Map<String, Value>>()))
 }
 
+/// What a script may return: an object, or a list of objects with unique `id`s (scalars have no
+/// addressable node, so a property over them would only be discarded).
+fn arb_script_root() -> impl Strategy<Value = Value> {
+    prop_oneof![
+        3 => arb_root(),
+        1 => prop::collection::vec(arb_root(), 1..4).prop_map(|items| {
+            Value::Array(
+                items
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, mut o)| {
+                        if let Value::Object(m) = &mut o {
+                            m.insert("id".into(), json!(format!("i{i}")));
+                        }
+                        o
+                    })
+                    .collect(),
+            )
+        }),
+    ]
+}
+
 /// Every addressable node: (grammar path, is an array element, value).
 fn nodes(v: &Value, prefix: &str, out: &mut Vec<(String, bool, Value)>) {
+    if let (Value::Array(a), false) = (v, prefix.is_empty()) {
+        // An array root (a script returning a list): its elements are addressed on `prefix`.
+        for e in a {
+            if let Some(id) = e.get("id").and_then(Value::as_str) {
+                let ep = format!("{prefix}[id={id}]");
+                out.push((ep.clone(), true, e.clone()));
+                nodes(e, &ep, out);
+            }
+        }
+    }
     if let Value::Object(o) = v {
         // `id` is what element paths select by; dropping it is not what this property is about.
         for (k, x) in o.iter().filter(|(k, _)| k.as_str() != "id") {
@@ -1005,7 +1037,7 @@ proptest! {
     /// A script's candidate is `{result: <anything the script returned>}` (§9.3): the same
     /// property below `result`, with the rules of `script.run` (U-29, script results).
     #[test]
-    fn u29_script_result_drops_never_empty(result in arb_root(), picks in prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 1..4)) {
+    fn u29_script_result_drops_never_empty(result in arb_script_root(), picks in prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 1..4)) {
         let candidate = json!({ "result": result });
         drops_never_look_empty(&candidate, &result, "result", &SCRIPT_SPEC.redaction_rules, &picks)?;
     }

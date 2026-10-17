@@ -4764,6 +4764,9 @@ async fn u03_dry_run_no_http_no_script_call() -> TestResult {
     assert!(h.field_cache_filled().await);
     let mock = requests_of(&h)?;
     let before = mock.received().await.len();
+    // Positive control: `received` falls back to an empty list when recording fails, which would
+    // make the "no request" check below vacuous. The startup requests prove the counter counts.
+    assert!(before > 0, "the request counter saw no startup request");
     let fetches = h.events_of(EventType::SYSTEM_FETCH).await?.len();
     let mut ids = Vec::new();
     for dry in [json!(true), json!("sparse"), json!(true)] {

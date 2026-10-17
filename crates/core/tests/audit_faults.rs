@@ -497,29 +497,38 @@ async fn script_point_delivered() -> TestResult {
     Ok(())
 }
 
+// X-04, one test per script injection point, so a failure is named by its test. Nothing is sent
+// before `SCRIPT_CALL_SENT` commits; the call's request left before its own record
+// (`SCRIPT_CALL`) failed; the run's end follows the call.
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn x04_script_points() -> TestResult {
-    // Nothing is sent before `SCRIPT_CALL_SENT` commits; the call's request left before its own
-    // record (`SCRIPT_CALL`) failed; the run's end follows the call.
-    script_point_in_run(EventType::SCRIPT_STARTED, true, 0)
-        .await
-        .map_err(|e| format!("SCRIPT_STARTED: {e}"))?;
-    script_point_in_run(EventType::SCRIPT_CALL_SENT, true, 0)
-        .await
-        .map_err(|e| format!("SCRIPT_CALL_SENT: {e}"))?;
-    script_point_in_run(EventType::SCRIPT_CALL, true, 1)
-        .await
-        .map_err(|e| format!("SCRIPT_CALL: {e}"))?;
-    script_point_in_run(EventType::SCRIPT_FINISHED, false, 1)
-        .await
-        .map_err(|e| format!("SCRIPT_FINISHED: {e}"))?;
-    script_point_released()
-        .await
-        .map_err(|e| format!("SCRIPT_RELEASED: {e}"))?;
-    script_point_delivered()
-        .await
-        .map_err(|e| format!("DELIVERED: {e}"))?;
-    Ok(())
+async fn x04_script_started() -> TestResult {
+    script_point_in_run(EventType::SCRIPT_STARTED, true, 0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x04_script_call_sent() -> TestResult {
+    script_point_in_run(EventType::SCRIPT_CALL_SENT, true, 0).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x04_script_call() -> TestResult {
+    script_point_in_run(EventType::SCRIPT_CALL, true, 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x04_script_finished() -> TestResult {
+    script_point_in_run(EventType::SCRIPT_FINISHED, false, 1).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x04_script_released() -> TestResult {
+    script_point_released().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x04_script_delivered() -> TestResult {
+    script_point_delivered().await
 }
 
 // ---- X-06 -------------------------------------------------------------------------------------------
