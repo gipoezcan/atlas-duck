@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use atlas_duck_audit::{
     AuditError, Confirmed, NewEvent, PruneOutcome, PruneSkip, SettingChange, Store, StoreHealth,
 };
+use atlas_duck_ipc::sandbox::ScriptLimits;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::{Value, json};
@@ -41,6 +42,7 @@ use crate::config::limits::{
 use crate::config::requests::{
     DEFAULT_EXPIRY_HOURS, EXPIRY_HOURS_RANGE, KEY_EXPIRY_HOURS, KEY_REQUESTS, expiry_hours,
 };
+use crate::config::scripts::{KEY_SCRIPTS, SCRIPT_KEYS, bound, get, scripts_config};
 use crate::config::ui::{AttentionMode, KEY_ATTENTION_MODE, KEY_UI, attention_mode};
 use crate::config::{ConfigReadOnly, ConfigState, ConfigWriteError, load_config, update_config};
 use crate::core::Confirm;
@@ -49,6 +51,7 @@ use crate::engine::queue::{CANDIDATE_CACHE_MB, MIB};
 use crate::instances::work::{AdminWork, Job};
 use crate::payloads::{self, ConfigSource};
 use crate::reconcile::{KEY_AUDIT, KEY_LEGAL_HOLD, KEY_RETENTION_DAYS};
+use crate::validate::check_script_invariants;
 
 /// plan text (PD-76): the tail of every limit-raise dialog.
 const RAISE_TAIL: &str = "Higher limits let agents fetch more data before you review it.";
@@ -68,7 +71,9 @@ pub const INCIDENT_TEXT: &str = "integrity incident: see Audit";
 /// minimum).
 pub const MAX_RETENTION_DAYS: u32 = 36_500;
 /// The most changes one `apply` takes (one per key).
-pub const MAX_CHANGES: usize = 7;
+pub const MAX_CHANGES: usize = 8;
+/// `CONFIG_CHANGED.key` and view name of the script limits change (M8 Δ6, PD-139).
+pub const KEY_SCRIPT_LIMITS: &str = "script_limits";
 /// The longest key `record_app_change` accepts.
 const MAX_APP_KEY_CHARS: usize = 64;
 /// The largest serialized `old` / `new` of `record_app_change`.
@@ -97,6 +102,106 @@ pub enum SettingChangeReq {
     /// The audit retention, 92–36500 days (§8.8).
     RetentionDays(u32),
     LegalHold(bool),
+    /// `[scripts]`, the §9.4 defaults of the script limits (M8 Δ6, PD-139): the named keys change,
+    /// the others stay. Applies at once to runs submitted afterwards.
+    ScriptLimits(ScriptLimitsReq),
+}
+
+/// The eight §9.4 script limits of one change, each `None` = unchanged (M8 Δ6). JSON: an object
+/// with the keys to change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ScriptLimitsReq {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_fetch_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_call_result_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_result_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_calls: Option<u32>,
+}
+
+impl ScriptLimitsReq {
+    /// The keys and their requested values, in §9.4 order.
+    fn fields(&self) -> [(&'static str, Option<u32>); 8] {
+        [
+            ("timeout_s", self.timeout_s),
+            ("heap_mb", self.heap_mb),
+            ("process_mb", self.process_mb),
+            ("max_calls", self.max_calls),
+            ("max_fetch_mb", self.max_fetch_mb),
+            ("max_call_result_mb", self.max_call_result_mb),
+            ("max_result_mb", self.max_result_mb),
+            ("max_concurrent_calls", self.max_concurrent_calls),
+        ]
+    }
+
+    /// `base` with the requested keys applied.
+    pub fn resolve(&self, base: &ScriptLimits) -> ScriptLimits {
+        ScriptLimits {
+            timeout_s: self.timeout_s.unwrap_or(base.timeout_s),
+            heap_mb: self.heap_mb.unwrap_or(base.heap_mb),
+            process_mb: self.process_mb.unwrap_or(base.process_mb),
+            max_calls: self.max_calls.unwrap_or(base.max_calls),
+            max_fetch_mb: self.max_fetch_mb.unwrap_or(base.max_fetch_mb),
+            max_call_result_mb: self.max_call_result_mb.unwrap_or(base.max_call_result_mb),
+            max_result_mb: self.max_result_mb.unwrap_or(base.max_result_mb),
+            max_concurrent_calls: self
+                .max_concurrent_calls
+                .unwrap_or(base.max_concurrent_calls),
+        }
+    }
+
+    /// The request that turns `old` into `new`: only the keys that differ.
+    fn diff(old: &ScriptLimits, new: &ScriptLimits) -> ScriptLimitsReq {
+        let d = |o: u32, n: u32| (o != n).then_some(n);
+        ScriptLimitsReq {
+            timeout_s: d(old.timeout_s, new.timeout_s),
+            heap_mb: d(old.heap_mb, new.heap_mb),
+            process_mb: d(old.process_mb, new.process_mb),
+            max_calls: d(old.max_calls, new.max_calls),
+            max_fetch_mb: d(old.max_fetch_mb, new.max_fetch_mb),
+            max_call_result_mb: d(old.max_call_result_mb, new.max_call_result_mb),
+            max_result_mb: d(old.max_result_mb, new.max_result_mb),
+            max_concurrent_calls: d(old.max_concurrent_calls, new.max_concurrent_calls),
+        }
+    }
+
+    /// Every requested value is inside its PD-139 bound (`Invalid` names the key, never the
+    /// value). The memory invariants need the resulting set and are checked by `apply`.
+    fn validate(&self) -> Result<(), SettingsError> {
+        for (key, v) in self.fields() {
+            if let Some(v) = v
+                && !bound(key).is_some_and(|b| b.contains(&v))
+            {
+                return Err(SettingsError::Invalid { key });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The dialog name of a script limit in its `raise_text` line.
+fn script_label(key: &str) -> &'static str {
+    match key {
+        "timeout_s" => "the script timeout (s)",
+        "heap_mb" => "the script heap limit (MiB)",
+        "process_mb" => "the script process limit (MiB)",
+        "max_calls" => "the script call limit",
+        "max_fetch_mb" => "the script fetch limit (MiB)",
+        "max_call_result_mb" => "the script call result limit (MiB)",
+        "max_result_mb" => "the script result limit (MiB)",
+        _ => "the script concurrent calls limit",
+    }
 }
 
 impl SettingChangeReq {
@@ -111,6 +216,7 @@ impl SettingChangeReq {
             Self::AttentionMode(_) => KEY_ATTENTION_MODE,
             Self::RetentionDays(_) => KEY_RETENTION_DAYS,
             Self::LegalHold(_) => KEY_LEGAL_HOLD,
+            Self::ScriptLimits(_) => KEY_SCRIPT_LIMITS,
         }
     }
 
@@ -126,6 +232,7 @@ impl SettingChangeReq {
                 (atlas_duck_audit::RETENTION_MIN..=MAX_RETENTION_DAYS).contains(d)
             }
             Self::AttentionMode(_) | Self::LegalHold(_) => true,
+            Self::ScriptLimits(r) => return r.validate(),
         };
         if ok {
             Ok(())
@@ -141,7 +248,7 @@ impl SettingChangeReq {
 }
 
 /// Every key a `SettingChangeReq` can name (`record_app_change` refuses them).
-const SETTING_KEYS: [&str; 7] = [
+const SETTING_KEYS: [&str; 8] = [
     KEY_JIRA_COMMENTS_CAP,
     KEY_CANDIDATE_CACHE_MB,
     KEY_MAX_PENDING_BYTES_MB,
@@ -149,16 +256,25 @@ const SETTING_KEYS: [&str; 7] = [
     KEY_ATTENTION_MODE,
     KEY_RETENTION_DAYS,
     KEY_LEGAL_HOLD,
+    KEY_SCRIPT_LIMITS,
 ];
 
-/// The limits as Settings shows them: the comments cap in force, and for the three that apply at
-/// the next start the value `config.toml` holds (defaults when absent).
+/// The limits as Settings shows them: the comments cap and the script limits in force, and for
+/// the three that apply at the next start the value `config.toml` holds (defaults when absent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct LimitsView {
     pub jira_comments_cap: u32,
     pub candidate_cache_mb: u64,
     pub max_pending_bytes_mb: Option<u64>,
     pub expiry_hours: u32,
+    /// The configured script limits in force (§9.4, M8 Δ6): a Settings change applies at once, a
+    /// file edit at the next start (then `restart_pending` names `script_limits`).
+    ///
+    /// Not on the wire yet: the UI's `settings_get` validator and fixture are closed over the four
+    /// keys above, so the Settings UI task (Δ6 DTO, Task 24) removes this `skip_serializing`
+    /// together with its fixture regeneration and the TS type.
+    #[serde(skip_serializing)]
+    pub script: ScriptLimits,
 }
 
 /// The §7.7 banner of a `config.toml` this binary does not write. `kind`: `read_only` (a newer
@@ -457,6 +573,8 @@ struct Current {
     /// The audit settings.
     retention_days: u32,
     legal_hold: bool,
+    /// In force (live).
+    script: ScriptLimits,
 }
 
 /// One change that does something.
@@ -566,6 +684,39 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
             let dialog = (!on).then(|| LIFT_HOLD_TEXT.to_owned());
             p(json!(cur.legal_hold), json!(on), dialog)
         }
+        SettingChangeReq::ScriptLimits(r) => {
+            // Only what changes is planned, recorded and written; the memory invariants were
+            // checked on the resulting set by `apply`.
+            let new = r.resolve(&cur.script);
+            let delta = ScriptLimitsReq::diff(&cur.script, &new);
+            if delta == ScriptLimitsReq::default() {
+                return None;
+            }
+            let (mut old_obj, mut new_obj, mut lines) =
+                (serde_json::Map::new(), serde_json::Map::new(), Vec::new());
+            for key in SCRIPT_KEYS {
+                let (o, n) = (get(&cur.script, key)?, get(&new, key)?);
+                if o == n {
+                    continue;
+                }
+                old_obj.insert(key.to_owned(), json!(o));
+                new_obj.insert(key.to_owned(), json!(n));
+                // §10.3 "raise limits": one line per raised key, in §9.4 key order.
+                if n > o {
+                    lines.push(raise_text(
+                        script_label(key),
+                        &o.to_string(),
+                        &n.to_string(),
+                    ));
+                }
+            }
+            Some(Planned {
+                req: SettingChangeReq::ScriptLimits(delta),
+                old: Value::Object(old_obj),
+                new: Value::Object(new_obj),
+                dialog: (!lines.is_empty()).then(|| lines.join("\n")),
+            })
+        }
     }
 }
 
@@ -573,16 +724,26 @@ fn int(n: u64) -> toml_edit::Value {
     toml_edit::Value::from(i64::try_from(n).unwrap_or(i64::MAX))
 }
 
-/// The file value of a file-backed change; `None` removes the key.
-fn file_value(req: &SettingChangeReq) -> Option<(&'static str, Option<toml_edit::Value>)> {
-    Some(match req {
-        SettingChangeReq::JiraCommentsCap(n) => (KEY_LIMITS, Some(int(u64::from(*n)))),
-        SettingChangeReq::CandidateCacheMb(n) => (KEY_LIMITS, Some(int(*n))),
-        SettingChangeReq::MaxPendingBytesMb(n) => (KEY_LIMITS, n.map(int)),
-        SettingChangeReq::ExpiryHours(h) => (KEY_REQUESTS, Some(int(u64::from(*h)))),
-        SettingChangeReq::AttentionMode(m) => (KEY_UI, Some(toml_edit::Value::from(m.as_str()))),
-        SettingChangeReq::RetentionDays(_) | SettingChangeReq::LegalHold(_) => return None,
-    })
+/// One `config.toml` edit: the table, the key and its value (`None` removes the key).
+type FileEdit = (&'static str, &'static str, Option<toml_edit::Value>);
+
+/// The file edits of a file-backed change.
+fn file_values(req: &SettingChangeReq) -> Vec<FileEdit> {
+    let one = |table, v| vec![(table, req.key(), v)];
+    match req {
+        SettingChangeReq::JiraCommentsCap(n) => one(KEY_LIMITS, Some(int(u64::from(*n)))),
+        SettingChangeReq::CandidateCacheMb(n) => one(KEY_LIMITS, Some(int(*n))),
+        SettingChangeReq::MaxPendingBytesMb(n) => one(KEY_LIMITS, n.map(int)),
+        SettingChangeReq::ExpiryHours(h) => one(KEY_REQUESTS, Some(int(u64::from(*h)))),
+        SettingChangeReq::AttentionMode(m) => one(KEY_UI, Some(toml_edit::Value::from(m.as_str()))),
+        SettingChangeReq::RetentionDays(_) | SettingChangeReq::LegalHold(_) => Vec::new(),
+        // One key of `[scripts]` per requested limit (`apply` plans only the changed ones).
+        SettingChangeReq::ScriptLimits(r) => r
+            .fields()
+            .into_iter()
+            .filter_map(|(key, v)| Some((KEY_SCRIPTS, key, Some(int(u64::from(v?))))))
+            .collect(),
+    }
 }
 
 /// Sets (or removes) `table.key`, creating the table; `false` when `table` is not a table (the
@@ -757,6 +918,7 @@ impl CoreSettings {
             attention_mode: *lock(&self.attention),
             retention_days: settings.retention_days,
             legal_hold: settings.legal_hold,
+            script: self.engine.admission().script_limits(),
         }
     }
 
@@ -770,7 +932,7 @@ impl CoreSettings {
     }
 
     /// The keys whose file value differs from the one this run started with (PD-76).
-    fn restart_pending(&self, cur: &Current) -> Vec<&'static str> {
+    fn restart_pending(&self, cur: &Current, cfg: &ConfigState) -> Vec<&'static str> {
         let running = self.engine.limits();
         let mut out = Vec::new();
         if cur.candidate_cache_mb.saturating_mul(MIB) != running.candidate_cache_bytes {
@@ -781,6 +943,11 @@ impl CoreSettings {
         }
         if u64::from(cur.expiry_hours) * 3600 != self.engine.expiry().as_secs() {
             out.push(KEY_EXPIRY_HOURS);
+        }
+        // PD-139: a Settings change applies at once and writes the file, so only a file edit
+        // since the start leaves the two apart. A refused table runs the defaults.
+        if scripts_config(cfg).unwrap_or_default() != cur.script {
+            out.push(KEY_SCRIPT_LIMITS);
         }
         out
     }
@@ -848,9 +1015,10 @@ impl CoreSettings {
         port.append_batch(records).map_err(SettingsError::Audit)?;
         let written = update_config(path, |doc| {
             for (p, _) in &file {
-                if let Some((table, v)) = file_value(&p.req)
-                    && !set_key(doc, table, p.req.key(), v)
-                {
+                for (table, key, v) in file_values(&p.req) {
+                    if set_key(doc, table, key, v) {
+                        continue;
+                    }
                     // The table is not a table: the records already committed, so this is a
                     // failed write, not "nothing happened".
                     return Err(SettingsError::ConfigWrite);
@@ -875,13 +1043,19 @@ impl CoreSettings {
             }
             return Err(e);
         }
-        // PD-76: these two apply at once; the rest at the next start.
+        // PD-76 and PD-139: these apply at once; the rest at the next start.
         for (p, _) in &file {
             match p.req {
                 SettingChangeReq::JiraCommentsCap(n) => {
                     self.engine.admission().set_comments_cap(Some(n));
                 }
                 SettingChangeReq::AttentionMode(m) => *lock(&self.attention) = m,
+                SettingChangeReq::ScriptLimits(r) => {
+                    // `apply` held the effects lock since it compared with the live set, so the
+                    // request resolves against what the dialogs showed.
+                    let adm = self.engine.admission();
+                    adm.set_script_limits(r.resolve(&adm.script_limits()));
+                }
                 _ => {}
             }
         }
@@ -900,6 +1074,7 @@ impl SettingsAdmin for CoreSettings {
                 candidate_cache_mb: cur.candidate_cache_mb,
                 max_pending_bytes_mb: cur.max_pending_bytes_mb,
                 expiry_hours: cur.expiry_hours,
+                script: cur.script,
             },
             attention_mode: cur.attention_mode,
             retention_days: settings.retention_days,
@@ -907,7 +1082,7 @@ impl SettingsAdmin for CoreSettings {
             anchor_dir: settings.anchor_dir,
             health: health_view(&self.store.health()),
             config_read_only: banner(&cfg),
-            restart_pending: self.restart_pending(&cur),
+            restart_pending: self.restart_pending(&cur, &cfg),
         }
     }
 
@@ -927,6 +1102,14 @@ impl SettingsAdmin for CoreSettings {
             self.require_writable(&cfg)?;
         }
         let cur = self.current(&cfg);
+        // §9.4 memory invariants on the set the call leaves behind (PD-139, PD-140): refused
+        // before any dialog, record or write.
+        for c in &changes {
+            if let SettingChangeReq::ScriptLimits(r) = c {
+                check_script_invariants(&r.resolve(&cur.script))
+                    .map_err(|v| SettingsError::Invalid { key: v.key() })?;
+            }
+        }
         let planned: Vec<Planned> = changes.into_iter().filter_map(|c| plan(c, &cur)).collect();
         // Every dialog first, with no lock held: one `Cancel` applies nothing.
         let mut confirmations = Vec::with_capacity(planned.len());
@@ -1107,6 +1290,7 @@ mod tests {
             attention_mode: AttentionMode::ShowWithoutActivating,
             retention_days: 100,
             legal_hold: true,
+            script: ScriptLimits::default(),
         };
         let dialog = |r| plan(r, &cur).and_then(|p| p.dialog);
         assert_eq!(

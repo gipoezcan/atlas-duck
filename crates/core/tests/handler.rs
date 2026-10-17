@@ -10,18 +10,20 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use atlas_duck_audit::EventType;
-use atlas_duck_core::ShutdownReason;
 use atlas_duck_core::engine::MAX_SESSIONS;
 use atlas_duck_core::engine::queue::Limits;
 use atlas_duck_core::ops::{ExecCtx, ExecError, op_table};
-use atlas_duck_core::testing::{FaultPlan, Harness, NoProgress};
+use atlas_duck_core::settings::ScriptLimitsReq;
+use atlas_duck_core::testing::{FakeScriptRunner, FaultPlan, Harness, NoProgress, ScriptPlan};
 use atlas_duck_core::validate::{EffectiveCaps, ValidateCtx, validate};
+use atlas_duck_core::{RunEnd, SettingChangeReq, ShutdownReason};
 use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_ipc::proto::{
     AgentNameSource, AwaitParams, ClientKind, ConnectionMeta, Hello, ListState, MatchParams,
     PeerInfo, ProgressNotification, ProgressSink, SubmitParams, params_sha256_hex,
 };
+use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_registry::OpClass;
 use common::{TestResult, code, detail, exit, json, request_id};
 use serde_json::{Value, json};
@@ -649,6 +651,88 @@ async fn instances_list_no_urls() -> TestResult {
             {"alias": "wiki", "product": "confluence", "is_default": true, "state": "ok"},
         ])
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn describe_instance_reports_effective_script_limits() -> TestResult {
+    let h = Harness::builder()
+        .jira("jira-main")
+        .extra_config("[scripts]\ntimeout_s = 240\nmax_calls = 100\n")
+        .start()
+        .await?;
+    let effective = ScriptLimits {
+        timeout_s: 240,
+        max_calls: 100,
+        ..ScriptLimits::default()
+    };
+    let describe = |inst: Option<&'static str>| {
+        let handler = h.handler();
+        async move {
+            let env = handler.ops_describe("jira.issue.get", inst).await;
+            json(&env).map(|v| v["data"].clone())
+        }
+    };
+    // With `--instance`: what runs (`limits_source: effective`), the configured set.
+    let d = describe(Some("jira-main")).await?;
+    assert_eq!(d["limits_source"], "effective");
+    assert_eq!(d["script_limits"], serde_json::to_value(effective)?);
+    // Without an instance (the gate handler, no core): the built-in defaults.
+    let local = describe(None).await?;
+    assert_eq!(local["limits_source"], "default");
+    assert_eq!(
+        local["script_limits"],
+        serde_json::to_value(ScriptLimits::default())?
+    );
+    // A Settings change applies to the next describe at once.
+    let s = h.core().settings();
+    tokio::task::spawn_blocking(move || {
+        s.apply(vec![SettingChangeReq::ScriptLimits(ScriptLimitsReq {
+            max_calls: Some(50),
+            ..ScriptLimitsReq::default()
+        })])
+    })
+    .await?
+    .map_err(|e| format!("{e:?}"))?;
+    let d = describe(Some("jira-main")).await?;
+    assert_eq!(d["script_limits"]["max_calls"], 50);
+    assert_eq!(d["script_limits"]["timeout_s"], 240);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_limits_follow_the_configured_ceiling() -> TestResult {
+    let hold = || {
+        ScriptPlan::new(
+            Vec::new(),
+            RunEnd::Result {
+                value: json!(1),
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+        )
+        .holding(30_000)
+    };
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(FakeScriptRunner::new(vec![hold()]))
+        .extra_config("[scripts]\ntimeout_s = 60\n")
+        .start()
+        .await?;
+    // Above the configured default, though below the spec's 120: exit 2.
+    let env = h
+        .submit_script(json!({ "source": "return 1;", "limits": { "timeout_s": 100 } }))
+        .await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "validation");
+    assert_eq!(exit(&env), 2);
+    assert_eq!(detail(&env, "param"), json!("limits.timeout_s"));
+    // At the configured default: admitted.
+    let env = h
+        .submit_script(json!({ "source": "return 1;", "limits": { "timeout_s": 60 } }))
+        .await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    h.handler().cancel(&request_id(&env)?).await;
     Ok(())
 }
 

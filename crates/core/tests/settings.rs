@@ -9,17 +9,19 @@ use std::sync::Arc;
 
 use atlas_duck_audit::EventType;
 use atlas_duck_core::config::limits::limits_config;
-use atlas_duck_core::config::load_config;
 use atlas_duck_core::config::requests::expiry_hours;
+use atlas_duck_core::config::scripts::scripts_config;
 use atlas_duck_core::config::ui::attention_mode_config;
+use atlas_duck_core::config::{ConfigState, load_config};
 use atlas_duck_core::engine::queue::MIB;
-use atlas_duck_core::settings::{LIFT_HOLD_TEXT, PRUNE_BACKLOG_TEXT};
+use atlas_duck_core::settings::{LIFT_HOLD_TEXT, PRUNE_BACKLOG_TEXT, ScriptLimitsReq};
 use atlas_duck_core::testing::Harness;
 use atlas_duck_core::{
     AttentionMode, Confirm, SettingChangeReq, SettingsAdmin, SettingsError, SettingsView,
     ShutdownReason, VerifyNow,
 };
 use atlas_duck_ipc::envelope::Status;
+use atlas_duck_ipc::sandbox::ScriptLimits;
 use common::jira::{comment_page, comments_path, gets_on, mount_comments, mount_issue, query};
 use common::{TestError, TestResult, request_id};
 use serde_json::{Value, json};
@@ -27,7 +29,7 @@ use sha2::{Digest, Sha256};
 
 use SettingChangeReq::{
     AttentionMode as Mode, CandidateCacheMb, ExpiryHours, JiraCommentsCap, LegalHold,
-    MaxPendingBytesMb, RetentionDays,
+    MaxPendingBytesMb, RetentionDays, ScriptLimits as Scripts,
 };
 
 /// `apply` off the async workers, as the app calls it (PD-13).
@@ -698,5 +700,341 @@ async fn view_reports_store_health_and_settings() -> TestResult {
     let json = serde_json::to_value(&v)?;
     assert_eq!(json["limits"]["jira_comments_cap"], 100);
     assert_eq!(json["attention_mode"], "show_without_activating");
+    // The script limits in force (M8 Δ6): the eight §9.4 keys at their defaults.
+    assert_eq!(v.limits.script, ScriptLimits::default());
+    // Not on the wire until the Settings UI task widens its closed validator and fixture.
+    assert!(json["limits"].get("script").is_none());
+    Ok(())
+}
+
+// ---- M8 Task 14: script limits (PD-139, PD-140) ----------------------------------------------
+
+fn script_req(f: impl FnOnce(&mut ScriptLimitsReq)) -> SettingChangeReq {
+    let mut r = ScriptLimitsReq::default();
+    f(&mut r);
+    Scripts(r)
+}
+
+fn file_scripts(h: &Harness) -> Result<ScriptLimits, TestError> {
+    Ok(scripts_config(&load_config(&h.config_path())?)?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_limits_defaults_from_config() -> TestResult {
+    // No `[scripts]` table: the spec's defaults, in the view, the engine and admission.
+    let h = Harness::jira().await?;
+    let v = view(&h.core().settings()).await?;
+    assert_eq!(v.limits.script, ScriptLimits::default());
+    assert_eq!(h.engine().limits().script, ScriptLimits::default());
+    assert_eq!(
+        h.engine().admission().script_limits(),
+        ScriptLimits::default()
+    );
+    assert_eq!(
+        scripts_config(&ConfigState::Absent)?,
+        ScriptLimits::default()
+    );
+
+    // A partial table: the named keys, the defaults for the rest.
+    let h = Harness::builder()
+        .jira("jira-main")
+        .extra_config("[scripts]\ntimeout_s = 240\nmax_calls = 100\n")
+        .start()
+        .await?;
+    let want = ScriptLimits {
+        timeout_s: 240,
+        max_calls: 100,
+        ..ScriptLimits::default()
+    };
+    assert_eq!(view(&h.core().settings()).await?.limits.script, want);
+    assert_eq!(h.engine().limits().script, want);
+    assert_eq!(h.engine().admission().script_limits(), want);
+    assert!(view(&h.core().settings()).await?.restart_pending.is_empty());
+
+    // A table that is refused as a whole: the core runs with the defaults (fail safe).
+    let h = Harness::builder()
+        .jira("jira-main")
+        .extra_config("[scripts]\ntimeout_s = 240\nmax_result_mb = 17\n")
+        .start()
+        .await?;
+    assert_eq!(h.engine().limits().script, ScriptLimits::default());
+    Ok(())
+}
+
+#[test]
+fn script_limit_bounds_respect_frame_and_release_caps() -> TestResult {
+    // Settings: the frame cap (24 MiB host -> worker) and the release cap (16 MiB) bound the two
+    // result keys at 16; everything else at 4 x the spec default.
+    type Set = fn(&mut ScriptLimitsReq);
+    let refused: [(Set, &str); 10] = [
+        (|r| r.max_call_result_mb = Some(17), "max_call_result_mb"),
+        (|r| r.max_result_mb = Some(17), "max_result_mb"),
+        (|r| r.max_call_result_mb = Some(0), "max_call_result_mb"),
+        (|r| r.timeout_s = Some(481), "timeout_s"),
+        (|r| r.heap_mb = Some(1025), "heap_mb"),
+        (|r| r.process_mb = Some(2049), "process_mb"),
+        (|r| r.max_calls = Some(801), "max_calls"),
+        (|r| r.max_fetch_mb = Some(201), "max_fetch_mb"),
+        (|r| r.max_concurrent_calls = Some(0), "max_concurrent_calls"),
+        (
+            |r| r.max_concurrent_calls = Some(17),
+            "max_concurrent_calls",
+        ),
+    ];
+    for (f, key) in refused {
+        assert_eq!(
+            script_req(f).validate(),
+            Err(SettingsError::Invalid { key }),
+            "{key}"
+        );
+    }
+    let accepted: [Set; 9] = [
+        |r| r.max_call_result_mb = Some(16),
+        |r| r.max_result_mb = Some(16),
+        |r| r.timeout_s = Some(480),
+        |r| r.heap_mb = Some(1024),
+        |r| r.process_mb = Some(2048),
+        |r| r.max_calls = Some(800),
+        |r| r.max_fetch_mb = Some(200),
+        |r| r.max_concurrent_calls = Some(1),
+        |r| r.max_concurrent_calls = Some(16),
+    ];
+    for f in accepted {
+        assert_eq!(script_req(f).validate(), Ok(()));
+    }
+
+    // The `[scripts]` file table: the same bounds, refused like any other invalid config value
+    // (the key named, never the value).
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("config.toml");
+    let load = |text: &str| -> Result<_, TestError> {
+        std::fs::write(&path, format!("schema_version = 1\n[scripts]\n{text}"))?;
+        Ok(scripts_config(&load_config(&path)?))
+    };
+    for (text, key) in [
+        ("max_call_result_mb = 17\n", "max_call_result_mb"),
+        ("max_result_mb = 17\n", "max_result_mb"),
+        ("timeout_s = 481\n", "timeout_s"),
+        ("max_concurrent_calls = 0\n", "max_concurrent_calls"),
+        ("max_concurrent_calls = 17\n", "max_concurrent_calls"),
+        ("max_calls = \"many\"\n", "max_calls"),
+        ("max_calls = -1\n", "max_calls"),
+    ] {
+        match load(text)? {
+            Err(e) => {
+                let shown = e.to_string();
+                assert!(shown.contains(key), "{text}: {shown}");
+                assert!(!shown.contains("481") && !shown.contains("many"), "{shown}");
+            }
+            Ok(l) => return Err(format!("{text}: accepted as {l:?}").into()),
+        }
+    }
+    let top = load(
+        "max_call_result_mb = 16\nmax_result_mb = 16\ntimeout_s = 480\nmax_concurrent_calls = 16\n",
+    )?;
+    assert_eq!(top?.timeout_s, 480);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounds_are_checked_by_apply_before_anything_happens() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    for req in [
+        script_req(|r| r.max_call_result_mb = Some(17)),
+        script_req(|r| r.max_result_mb = Some(17)),
+        script_req(|r| r.timeout_s = Some(481)),
+        script_req(|r| r.max_concurrent_calls = Some(17)),
+    ] {
+        let r = apply(&s, vec![req]).await?;
+        assert!(matches!(r, Err(SettingsError::Invalid { .. })), "{r:?}");
+    }
+    assert!(h.confirmer().texts().is_empty());
+    assert!(config_changed(&h, "script_limits").await?.is_empty());
+    assert_eq!(view(&s).await?.limits.script, ScriptLimits::default());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raising_script_limit_needs_native_confirmation() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let text = raise("the script timeout (s)", "120", "240");
+    // Cancel: no record, no file key, the limit in force unchanged.
+    h.confirmer().push(Confirm::Cancel);
+    let r = apply(&s, vec![script_req(|r| r.timeout_s = Some(240))]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Cancelled));
+    assert_eq!(h.confirmer().texts(), [text.as_str()]);
+    assert!(config_changed(&h, "script_limits").await?.is_empty());
+    assert_eq!(file_scripts(&h)?, ScriptLimits::default());
+    assert_eq!(h.engine().admission().script_limits().timeout_s, 120);
+
+    // Ok: recorded with the dialog hash, written to `[scripts]`, in force at once.
+    h.confirmer().push(Confirm::Ok);
+    let v = apply(&s, vec![script_req(|r| r.timeout_s = Some(240))]).await??;
+    assert_eq!(v.limits.script.timeout_s, 240);
+    assert_eq!(file_scripts(&h)?.timeout_s, 240);
+    assert_eq!(h.engine().admission().script_limits().timeout_s, 240);
+    assert!(v.restart_pending.is_empty(), "{:?}", v.restart_pending);
+    let recs = config_changed(&h, "script_limits").await?;
+    let [r] = recs.as_slice() else {
+        return Err(format!("{} records", recs.len()).into());
+    };
+    assert_eq!(r["source"], "app");
+    assert_eq!(r["old"], json!({ "timeout_s": 120 }));
+    assert_eq!(r["new"], json!({ "timeout_s": 240 }));
+    assert_eq!(r["applied"], true);
+    assert_eq!(r["confirmed"]["dialog_text_sha256"], sha_hex(&text));
+    // An unchanged value is no change: no dialog, no record.
+    let shown = h.confirmer().texts().len();
+    apply(&s, vec![script_req(|r| r.timeout_s = Some(240))]).await??;
+    assert_eq!(h.confirmer().texts().len(), shown);
+    assert_eq!(config_changed(&h, "script_limits").await?.len(), 1);
+    // A Settings key is not an app-owned key.
+    let reserved = s.record_app_change("script_limits", json!(1), json!(2));
+    assert_eq!(reserved.err(), Some(SettingsError::Invalid { key: "key" }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raising_two_script_limits_one_dialog_one_line_each() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    // Two raised keys and one lowered one: one dialog, a line per raised key in §9.4 key order.
+    let text = [
+        raise("the script timeout (s)", "120", "240"),
+        raise("the script call limit", "200", "300"),
+    ]
+    .join("\n");
+    h.confirmer().push(Confirm::Ok);
+    let v = apply(
+        &s,
+        vec![script_req(|r| {
+            r.max_calls = Some(300);
+            r.max_fetch_mb = Some(10);
+            r.timeout_s = Some(240);
+        })],
+    )
+    .await??;
+    assert_eq!(h.confirmer().texts(), [text.as_str()]);
+    let want = ScriptLimits {
+        timeout_s: 240,
+        max_calls: 300,
+        max_fetch_mb: 10,
+        ..ScriptLimits::default()
+    };
+    assert_eq!(v.limits.script, want);
+    assert_eq!(file_scripts(&h)?, want);
+    let recs = config_changed(&h, "script_limits").await?;
+    let [r] = recs.as_slice() else {
+        return Err(format!("{} records", recs.len()).into());
+    };
+    assert_eq!(r["confirmed"]["dialog_text_sha256"], sha_hex(&text));
+    assert_eq!(
+        r["new"],
+        json!({ "timeout_s": 240, "max_calls": 300, "max_fetch_mb": 10 })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lowering_script_limit_plain_config_changed() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let v = apply(
+        &s,
+        vec![script_req(|r| {
+            r.timeout_s = Some(60);
+            r.max_calls = Some(100);
+        })],
+    )
+    .await??;
+    assert!(h.confirmer().texts().is_empty(), "no dialog for a lowering");
+    assert_eq!(
+        (v.limits.script.timeout_s, v.limits.script.max_calls),
+        (60, 100)
+    );
+    assert_eq!(h.engine().admission().script_limits(), v.limits.script);
+    assert_eq!(file_scripts(&h)?, v.limits.script);
+    let recs = config_changed(&h, "script_limits").await?;
+    let [r] = recs.as_slice() else {
+        return Err(format!("{} records", recs.len()).into());
+    };
+    assert_eq!(r["confirmed"], Value::Null);
+    assert_eq!(r["old"], json!({ "timeout_s": 120, "max_calls": 200 }));
+    assert_eq!(r["new"], json!({ "timeout_s": 60, "max_calls": 100 }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn invariants_enforced_in_settings() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    // Invariant 2 on the resulting set: process_mb >= heap_mb + 88 (default heap 256: 344).
+    let r = apply(&s, vec![script_req(|r| r.process_mb = Some(343))]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Invalid { key: "process_mb" }));
+    // Raising the heap alone breaks it against the unchanged process limit (512 < 513 + 88).
+    let r = apply(&s, vec![script_req(|r| r.heap_mb = Some(513))]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Invalid { key: "process_mb" }));
+    // Invariant 1 (PD-140, k = 8): heap_mb >= 8 x max_call_result_mb (default 16: 128).
+    let r = apply(&s, vec![script_req(|r| r.heap_mb = Some(127))]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Invalid { key: "heap_mb" }));
+    // Nothing happened: no dialog, no record, no file key, the view unchanged.
+    assert!(h.confirmer().texts().is_empty());
+    assert!(config_changed(&h, "script_limits").await?.is_empty());
+    assert_eq!(file_scripts(&h)?, ScriptLimits::default());
+    assert_eq!(view(&s).await?.limits.script, ScriptLimits::default());
+
+    // The boundaries are accepted, and the check is on the set the call leaves behind.
+    let v = apply(&s, vec![script_req(|r| r.heap_mb = Some(128))]).await??;
+    assert_eq!(v.limits.script.heap_mb, 128);
+    let v = apply(&s, vec![script_req(|r| r.process_mb = Some(216))]).await??;
+    assert_eq!(v.limits.script.process_mb, 216);
+    let v = apply(
+        &s,
+        vec![script_req(|r| {
+            r.heap_mb = Some(64);
+            r.max_call_result_mb = Some(8);
+        })],
+    )
+    .await??;
+    assert_eq!(
+        (v.limits.script.heap_mb, v.limits.script.max_call_result_mb),
+        (64, 8)
+    );
+    // Raising the call result back needs the heap to follow in the same call.
+    let r = apply(&s, vec![script_req(|r| r.max_call_result_mb = Some(16))]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Invalid { key: "heap_mb" }));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn file_edit_applies_at_next_start() -> TestResult {
+    let mut h = Harness::jira().await?;
+    let s = h.core().settings();
+    let path = h.config_path();
+    let mut text = std::fs::read_to_string(&path)?;
+    text.push_str("\n[scripts]\ntimeout_s = 90\n");
+    std::fs::write(&path, text)?;
+    // This run keeps what it started with; the view says the file differs ("applies after
+    // restart", PD-76 as for the memory limits).
+    let v = view(&s).await?;
+    assert_eq!(v.limits.script, ScriptLimits::default());
+    assert_eq!(v.restart_pending, ["script_limits"]);
+    assert_eq!(
+        h.engine().admission().script_limits(),
+        ScriptLimits::default()
+    );
+
+    h.restart().await?;
+    let want = ScriptLimits {
+        timeout_s: 90,
+        ..ScriptLimits::default()
+    };
+    assert_eq!(h.engine().limits().script, want);
+    assert_eq!(h.engine().admission().script_limits(), want);
+    let v = view(&h.core().settings()).await?;
+    assert_eq!(v.limits.script, want);
+    assert!(v.restart_pending.is_empty());
     Ok(())
 }

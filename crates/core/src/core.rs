@@ -19,6 +19,7 @@ use crate::config::ConfigState;
 use crate::config::instances::ensure_ids;
 use crate::config::limits::limits_config;
 use crate::config::load_config;
+use crate::config::scripts::scripts_config;
 use crate::decision::{CoreDecisions, DecisionApi};
 use crate::engine::cancel::ShutdownReason as CancelWhy;
 use crate::engine::handler::CoreHandler;
@@ -259,8 +260,11 @@ impl Core {
             None => deps.config,
         };
         // §5.2 Settings keys; a malformed `[limits]` table runs with the spec's defaults.
-        let limits = limits.unwrap_or_else(|| {
-            limits_config(&config)
+        let limits = limits.unwrap_or_else(|| Limits {
+            // PD-139: `[scripts]`, bounded; a table that is refused as a whole runs with the
+            // spec's defaults, whatever `[limits]` says.
+            script: scripts_config(&config).unwrap_or_default(),
+            ..limits_config(&config)
                 .map(|c| Limits::from_config(&c))
                 .unwrap_or_default()
         });

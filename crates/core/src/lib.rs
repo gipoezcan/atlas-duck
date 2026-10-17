@@ -103,6 +103,6 @@ pub use instances::{
 pub use ops::{OpImpl, op_table};
 pub use redact::{DropScope, RedactionOp, RedactionPreset, UrlMode};
 pub use settings::{
-    ConfigBanner, LimitsView, PruneReport, SettingChangeReq, SettingsAdmin, SettingsError,
-    SettingsView, StoreHealthView, VerifyNow,
+    ConfigBanner, LimitsView, PruneReport, ScriptLimitsReq, SettingChangeReq, SettingsAdmin,
+    SettingsError, SettingsView, StoreHealthView, VerifyNow,
 };

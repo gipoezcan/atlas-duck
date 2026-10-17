@@ -1557,7 +1557,7 @@ pub(crate) async fn submit(
     let reservation = if peek_dry_run(&p.params) {
         Reservation::none()
     } else {
-        Reservation::script(engine.limits())
+        Reservation::script(&engine.admission().script_limits())
     };
     let ticket = match engine.admission().admit(agent, reservation) {
         Ok(t) => t,
@@ -1624,7 +1624,7 @@ fn invalid(param: &str, message: &str) -> ValidationError {
     }
 }
 
-fn parse(params: &Value) -> Result<Parsed, ValidationError> {
+fn parse(params: &Value, ceiling: &ScriptLimits) -> Result<Parsed, ValidationError> {
     let Some(map) = params.as_object() else {
         return Err(invalid("params", "must be an object"));
     };
@@ -1642,7 +1642,7 @@ fn parse(params: &Value) -> Result<Parsed, ValidationError> {
     };
     let args = map.get("args").cloned().unwrap_or_else(|| json!({}));
     let limits_in = map.get("limits").cloned().unwrap_or(Value::Null);
-    let limits = validate_script_submit(source, &args, &limits_in)?;
+    let limits = validate_script_submit(source, &args, &limits_in, ceiling)?;
     let dry = match map.get("dry_run") {
         None | Some(Value::Null | Value::Bool(false)) => None,
         Some(Value::Bool(true)) => Some(ExampleMode::Full),
@@ -1736,7 +1736,7 @@ async fn record_and_validate(engine: Arc<Engine>, j: Received) -> Envelope {
         unlogged_terminal: None,
         ticket: Some(j.ticket),
     };
-    let parsed = match parse(&j.params) {
+    let parsed = match parse(&j.params, &engine.admission().script_limits()) {
         Ok(p) => p,
         Err(err) => {
             let _ = step(&mut new.model, Event::ValidationFailed);

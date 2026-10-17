@@ -315,13 +315,14 @@ fn available(spec: &OperationSpec, version: Option<Version>) -> bool {
     }
 }
 
-fn describe_env(available: bool) -> DescribeEnv {
+fn describe_env(available: bool, script: &ScriptLimits) -> DescribeEnv {
     DescribeEnv {
         limits_source: LimitsSource::Effective,
         available: Some(available),
         // The configured hard caps are the registry defaults until Settings exist (M6).
         caps: Value::Null,
-        script_limits: serde_json::to_value(ScriptLimits::default()).unwrap_or(Value::Null),
+        // §2.3: the configured script limits in force (PD-139), what `--limits` may lower.
+        script_limits: serde_json::to_value(script).unwrap_or(Value::Null),
     }
 }
 
@@ -804,11 +805,12 @@ impl RequestHandler for CoreHandler {
         let Some(inst) = table.by_alias(alias) else {
             return envelope::unknown_instance(alias);
         };
+        let script = self.engine.admission().script_limits();
         let ops: Vec<Value> = atlas_duck_registry::all()
             .iter()
             .filter(|spec| spec.product == inst.product)
             .map(|spec| {
-                let d = describe(spec, &describe_env(available(spec, inst.version)));
+                let d = describe(spec, &describe_env(available(spec, inst.version), &script));
                 json!({
                     "op_id": d["op_id"],
                     "class": d["class"],
@@ -831,7 +833,9 @@ impl RequestHandler for CoreHandler {
         let table = self.engine.instances();
         match table.resolve(spec.product, Some(alias)) {
             Ok(inst) => {
-                envelope::succeeded(describe(spec, &describe_env(available(spec, inst.version))))
+                let script = self.engine.admission().script_limits();
+                let env = describe_env(available(spec, inst.version), &script);
+                envelope::succeeded(describe(spec, &env))
             }
             Err(e) => route_refusal(e, spec.product, Some(alias)),
         }

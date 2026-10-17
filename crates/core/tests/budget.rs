@@ -25,8 +25,9 @@ use atlas_duck_core::engine::cache::{
 use atlas_duck_core::engine::queue::{Admission, AgentKey, KeyOrigin, Limits, MIB, Reservation};
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::payloads::{ReadFetched, read_fetched};
-use atlas_duck_core::testing::{FaultPlan, Harness, ReadFault};
-use atlas_duck_core::{Decision, DecisionError, DecisionKind};
+use atlas_duck_core::settings::ScriptLimitsReq;
+use atlas_duck_core::testing::{FakeScriptRunner, FaultPlan, Harness, ReadFault, ScriptPlan};
+use atlas_duck_core::{Decision, DecisionError, DecisionKind, RunEnd, SettingChangeReq};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::proto::{
     BUSY_RETRY_PENDING_S, ClientKind, ConnectionMeta, PeerInfo, busy_envelope,
@@ -473,14 +474,15 @@ async fn i37_max_pending_bytes_busy() -> TestResult {
     let limits = Limits::default();
     let read = Reservation::read(atlas_duck_registry::get(ISSUE).ok_or("op")?);
     assert_eq!(read.bytes(), RELEASE_CAP_BYTES);
-    assert_eq!(Reservation::script(&limits).bytes(), 16 * MIB);
+    assert_eq!(Reservation::script(&limits.script).bytes(), 16 * MIB);
     let write = Reservation::for_op(atlas_duck_registry::get("jira.issue.create").ok_or("op")?);
     assert_eq!(write.bytes(), 0);
     let adm = Admission::new(limits_with(|l| {
         l.max_pending_bytes = Some(32 * MIB);
-        l.max_result_mb = 20;
+        // Above the configurable 16 MiB bound on purpose: the reservation only multiplies.
+        l.script.max_result_mb = 20;
     }));
-    let script = Reservation::script(adm.limits());
+    let script = Reservation::script(&adm.script_limits());
     assert_eq!(script.bytes(), 20 * MIB);
     let t = adm.admit(key("s"), script).map_err(|_| "busy")?;
     // 20 + 16 > 32: the read does not fit beside the script.
@@ -493,6 +495,50 @@ async fn i37_max_pending_bytes_busy() -> TestResult {
     drop(t);
     assert_eq!(adm.reserved_bytes(), 0);
     let _r = adm.admit(key("r"), read).map_err(|_| "busy")?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_reservation_follows_configured_max_result_mb() -> TestResult {
+    let hold = || {
+        ScriptPlan::new(
+            Vec::new(),
+            RunEnd::Result {
+                value: json!(1),
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+        )
+        .holding(30_000)
+    };
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(FakeScriptRunner::new(vec![hold(), hold()]))
+        .extra_config("[scripts]\nmax_result_mb = 4\n")
+        .start()
+        .await?;
+    // §5.2 "its static `max_result_mb`": the configured value, not the 16 MiB spec default.
+    assert_eq!(h.engine().limits().script.max_result_mb, 4);
+    let first = h.submit_script(json!({ "source": "return 1;" })).await;
+    assert_eq!(first.status, Status::Pending, "{}", first.to_json_line());
+    assert_eq!(h.engine().admission().reserved_bytes(), 4 * MIB);
+    // A Settings change applies to the runs submitted afterwards, never to a pending one.
+    let s = h.core().settings();
+    tokio::task::spawn_blocking(move || {
+        s.apply(vec![SettingChangeReq::ScriptLimits(ScriptLimitsReq {
+            max_result_mb: Some(2),
+            ..ScriptLimitsReq::default()
+        })])
+    })
+    .await?
+    .map_err(|e| format!("{e:?}"))?;
+    let second = h.submit_script(json!({ "source": "return 1;" })).await;
+    assert_eq!(second.status, Status::Pending, "{}", second.to_json_line());
+    assert_eq!(h.engine().admission().reserved_bytes(), 6 * MIB);
+    for env in [&first, &second] {
+        h.handler().cancel(&request_id(env)?).await;
+    }
+    assert_eq!(h.engine().admission().reserved_bytes(), 0);
     Ok(())
 }
 

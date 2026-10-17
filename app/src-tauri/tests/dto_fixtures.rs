@@ -44,6 +44,7 @@ use atlas_duck_core::{
     UrlMode, VerifyNow,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
+use atlas_duck_ipc::sandbox::ScriptLimits;
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
 use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
@@ -834,6 +835,7 @@ fn settings_views() -> Vec<SettingsView> {
                 candidate_cache_mb: 256,
                 max_pending_bytes_mb: Some(512),
                 expiry_hours: 24,
+                script: ScriptLimits::default(),
             },
             attention_mode: AttentionMode::BadgeOnly,
             retention_days: 365,
@@ -853,6 +855,7 @@ fn settings_views() -> Vec<SettingsView> {
                 candidate_cache_mb: 256,
                 max_pending_bytes_mb: None,
                 expiry_hours: 24,
+                script: ScriptLimits::default(),
             },
             attention_mode: AttentionMode::default(),
             retention_days: 100,
