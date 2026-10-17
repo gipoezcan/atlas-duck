@@ -19,9 +19,10 @@
 //! **Host calls** ([`LiveBackend`]). Validated by [`EngineValidator`] (Read class, schema, field
 //! rules, caps with `for_script`, instance routing, the op's own static checks); the first
 //! accepted call commits `SCRIPT_CALL_SENT` before anything is sent (the run is *dispatched*);
-//! each call commits `SCRIPT_CALL` and only then returns its result. An append that fails kills
-//! the run (`SCRIPT_FAILED {audit_failure}`, terminal). Dry runs ([`DryRunBackend`]) answer from
-//! the registry's examples and hold no client handle.
+//! each call commits `SCRIPT_CALL` and only then returns its result (`atlas.all`: one
+//! `SCRIPT_CALL {page}` per page, each before the next page is requested). An append that fails
+//! kills the run (`SCRIPT_FAILED {audit_failure}`, terminal). Dry runs ([`DryRunBackend`]) answer
+//! from the registry's examples and hold no client handle.
 //!
 //! **Ends** ([`classify`]). Decided by the host from its own state (§9.5): a compile failure, or
 //! a host-measured limit or a spawn-time unavailability of a run that neither queued nor
@@ -38,7 +39,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use atlas_duck_atlassian::{FetchControl, ReadBudget};
+use atlas_duck_atlassian::{
+    AuditCover, FetchControl, InstanceClient, PagedCall, ReadBudget, SearchCall,
+};
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use atlas_duck_ipc::proto::{ConnectionMeta, SubmitParams, params_sha256};
@@ -167,25 +170,30 @@ impl ConfinementMode {
     }
 }
 
-/// `SCRIPT_STARTED.confinement` (PD-138, R1): the mode and worker version a run is spawned under,
-/// with the confinement report the runner holds for it. Computed from the slot-time policy, before
-/// the record is appended: a revocation logged before the record narrows the spawn, so the record
-/// can say `degraded` for a run whose `start` is then refused; the `SCRIPT_FAILED
-/// {sandbox_unavailable, details.reason: floor_not_met}` that follows keeps the trail true.
+/// `SCRIPT_STARTED.confinement` (PD-138, R1): the confinement a run is admitted under (the mode
+/// and the expected worker version), with the startup probe's report. It is stated before any
+/// worker exists, so `probe_report` is never that run's own ready-frame report (T12 review I-1).
+/// It is computed from the slot-time policy, before the record is appended: a revocation logged
+/// before the record narrows the spawn (T15 review I-1), so the record can say `degraded` for a
+/// run whose `start` is then refused; the `SCRIPT_FAILED {sandbox_unavailable, details.reason:
+/// floor_not_met}` that follows keeps the trail true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfinement {
     pub mode: ConfinementMode,
+    /// The embedded worker version the run expects; the bridge refuses a worker whose ready
+    /// frame names another (PD-133).
     pub worker_version: String,
-    pub report: ConfinementReport,
+    /// The startup probe's report, not the run's worker's.
+    pub probe_report: ConfinementReport,
 }
 
 impl RunConfinement {
-    /// The record's `{mode, worker_version, report}`.
+    /// The record's `{mode, worker_version, probe_report}`.
     pub fn to_value(&self) -> Value {
         json!({
             "mode": self.mode.as_str(),
             "worker_version": self.worker_version,
-            "report": serde_json::to_value(&self.report).unwrap_or(Value::Null),
+            "probe_report": serde_json::to_value(&self.probe_report).unwrap_or(Value::Null),
         })
     }
 }
@@ -267,9 +275,15 @@ pub trait ScriptRunner: Send + Sync {
         limits: &ScriptLimits,
         policy: RunPolicy,
     ) -> Result<(), CompileFailure>;
-    /// What a run spawned now under `policy` runs with, for `SCRIPT_STARTED.confinement`
-    /// (PD-138; the slot-time policy, see [`RunConfinement`]). `None`: the runner states nothing
-    /// and the record has no `confinement` key.
+    /// The confinement a run is admitted under now with `policy` (the slot-time policy, see
+    /// [`RunConfinement`]), for `SCRIPT_STARTED.confinement` (PD-138): the mode, the expected
+    /// worker version and the startup probe's report (never the run's own worker's: none exists
+    /// yet). `None`: the record has no `confinement` key. Contract:
+    /// - `None` while no probe report exists, and when the floor is not met and
+    ///   `policy.allow_degraded` is off (`start` then refuses with `FloorNotMet`; the mode would
+    ///   be neither `Floor` nor `Degraded`).
+    /// - Never blocks: it is a sync call on a runtime thread, between the real slot and the
+    ///   `SCRIPT_STARTED` append. It reads what the runner already holds.
     fn confinement(&self, policy: RunPolicy) -> Option<RunConfinement>;
     /// Starts a worker; its `host.call`s arrive at `calls`.
     async fn start(
@@ -471,11 +485,41 @@ pub(crate) struct CallInfo {
     pub alias: String,
     pub instance_id: String,
     pub user_key: Option<String>,
+    /// The page of an `atlas.all` call (PD-144).
+    pub page: Option<u32>,
 }
 
 struct InFlight {
     info: CallInfo,
     ctl: FetchControl,
+}
+
+/// Whether a call or the next page of an `atlas.all` call may be requested
+/// ([`RunShared::begin_page`]).
+enum PageStart {
+    Go,
+    /// The run ended or its kill was asked.
+    Stopped,
+    MaxCalls,
+    MaxFetch,
+}
+
+impl PageStart {
+    /// What the script sees of a call or page that does not start; `None` = it goes.
+    fn refusal(self) -> Option<HostCallResult> {
+        match self {
+            PageStart::Go => None,
+            PageStart::Stopped => Some(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED)),
+            PageStart::MaxCalls => Some(rejected_msg(
+                ErrorCode::ScriptLimit,
+                "the run would exceed max_calls",
+            )),
+            PageStart::MaxFetch => Some(rejected_msg(
+                ErrorCode::ScriptLimit,
+                "the run's fetched bytes reached max_fetch_mb",
+            )),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -595,10 +639,33 @@ impl RunShared {
         lock(&self.inner).aliases.clone()
     }
 
-    fn add_in_flight(&self, info: CallInfo, ctl: FetchControl) {
-        lock(&self.inner)
-            .in_flight
-            .insert(info.call_id, InFlight { info, ctl });
+    /// Puts a call, or the next page of an `atlas.all` call (PD-144), in flight, in one critical
+    /// section with the checks that may refuse it: the run ended or a kill was asked (the end,
+    /// which takes the calls in flight only after one of the two, would never see it), then with
+    /// `limits = Some((max_calls, fetch_cap))` the page that would exceed `max_calls` and the
+    /// run's fetched bytes at the cap. Only a page that goes is counted. `limits = None` (a plain
+    /// call, page 0, both counted by `accept_call`) answers `Go` or `Stopped` only.
+    fn begin_page(
+        &self,
+        info: CallInfo,
+        ctl: FetchControl,
+        limits: Option<(u32, u64)>,
+    ) -> PageStart {
+        let mut g = lock(&self.inner);
+        if g.ended || g.kill.is_some() {
+            return PageStart::Stopped;
+        }
+        if let Some((max_calls, fetch_cap)) = limits {
+            if g.calls.saturating_add(1) > max_calls {
+                return PageStart::MaxCalls;
+            }
+            if g.fetched_bytes >= fetch_cap {
+                return PageStart::MaxFetch;
+            }
+            g.calls = g.calls.saturating_add(1);
+        }
+        g.in_flight.insert(info.call_id, InFlight { info, ctl });
+        PageStart::Go
     }
 
     /// `false` = the end of the run took the call (it records it itself). Called under the
@@ -660,6 +727,7 @@ impl RunShared {
                     instance: Some(&info.alias),
                     user_key: info.user_key.as_deref(),
                     rejection: Some("cancelled_in_flight"),
+                    page: info.page,
                 },
                 &ReadFetched::CancelledInFlight {
                     reason,
@@ -1093,6 +1161,9 @@ impl LiveBackend {
         if let Err(r) = self.ensure_dispatched(&call, &vc).await {
             return r;
         }
+        if call.all {
+            return self.execute_all(call, vc).await;
+        }
         self.execute(call, vc).await
     }
 
@@ -1104,12 +1175,21 @@ impl LiveBackend {
             alias: vc.alias.clone(),
             instance_id: vc.instance_id.clone(),
             user_key: vc.user_key.clone(),
+            page: None,
         };
         let ctl = FetchControl::new();
         // The control first, then the cover: a cancel that took the control before it exists
-        // finds nothing in flight and a request that ended mints no cover (Task 24 rule).
-        self.shared.add_in_flight(info.clone(), ctl.clone());
-        let classified = match self.fetch(&call, &vc, &ctl).await {
+        // finds nothing in flight and a request that ended mints no cover (Task 24 rule). It is
+        // registered under the run's lock with the ended/kill check: a run that ended after
+        // `live_call`'s `running()` check refuses it here, so it is never sent (T13 review I-1).
+        if let Some(refused) = self
+            .shared
+            .begin_page(info.clone(), ctl.clone(), None)
+            .refusal()
+        {
+            return refused;
+        }
+        let classified = match self.fetch(&call, &vc, &ctl, None).await {
             Ok(c) => c,
             Err(result) => {
                 self.shared.finish_in_flight(call.id);
@@ -1159,14 +1239,190 @@ impl LiveBackend {
         }
     }
 
+    /// `atlas.all` (PD-144, §9.2): the op's pages, one request at a time. Each page is in flight
+    /// like a call (a cancel records it `cancelled_in_flight`) and commits its own
+    /// `SCRIPT_CALL {call_id, page}` before the next page is requested; every page counts
+    /// against `max_calls` and `max_fetch_mb`. The script gets the op's native shape or a
+    /// catchable rejection with no partial data; the pages committed so far stay in the log.
+    async fn execute_all(&self, call: HostCall, vc: ValidatedCall) -> HostCallResult {
+        let Some(paging) = vc.spec.paginated else {
+            return rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
+        };
+        let fetch_cap = u64::from(self.limits.max_fetch_mb).saturating_mul(MIB);
+        let max_result = u64::from(self.limits.max_call_result_mb).saturating_mul(MIB);
+        let mut all = AllResult::new(paging.items_key, max_result);
+        let mut start = vc
+            .validated
+            .params
+            .get("start")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut page: u32 = 0;
+        loop {
+            let info = CallInfo {
+                call_id: call.id,
+                op: call.op_id.clone(),
+                params: call.params.clone(),
+                alias: vc.alias.clone(),
+                instance_id: vc.instance_id.clone(),
+                user_key: vc.user_key.clone(),
+                page: Some(page),
+            };
+            let ctl = FetchControl::new();
+            // Page 0 was counted and checked as the call itself (`live_call`). Before any later
+            // page: `max_calls`, then the fetched bytes (PD-144 order).
+            let limits = (page > 0).then_some((self.limits.max_calls, fetch_cap));
+            if let Some(refused) = self
+                .shared
+                .begin_page(info.clone(), ctl.clone(), limits)
+                .refusal()
+            {
+                self.answer_row(call.id, &refused);
+                return refused;
+            }
+            let classified = match self.fetch(&call, &vc, &ctl, Some((page, start))).await {
+                Ok(c) => c,
+                Err(result) => {
+                    self.shared.finish_in_flight(call.id);
+                    self.answer_row(call.id, &result);
+                    return result;
+                }
+            };
+            // R8: the first page went out asking for `renderedFields` (the later pages ask the
+            // same).
+            if page == 0
+                && requests_rendered(&call.params)
+                && let Some(s) = self.entry.state().script.as_mut()
+            {
+                s.rendered_call = true;
+            }
+            // M3 T27 ruling 5: after a first page, a direct class is a gated outcome.
+            let classified = match classified {
+                Classified::Direct(d) if page > 0 => read::gate_later(d, true),
+                c => c,
+            };
+            let Some(settled) = self.settle_page(&call, &vc, &info, classified, &mut all) else {
+                self.shared.finish_in_flight(call.id);
+                return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
+            };
+            self.shared.add_fetched(settled.size);
+            let ended = Some((self.shared.clone(), call.id));
+            // One provenance row per call (PD-145), from the request as sent: it goes in with the
+            // first page's record and takes the answer with the last one. Until then it reads
+            // `cancelled_in_flight`, which is what a run that ends between two pages leaves.
+            let outcome = match &settled.next {
+                PageNext::Continue(_) => CANCELLED_IN_FLIGHT.to_owned(),
+                PageNext::Answer(result) => outcome_of(result),
+            };
+            let row = provenance_row(call.id, vc.spec, &vc.alias, &call.params, &outcome);
+            let note = move |entry: &RequestEntry| {
+                if let Some(s) = entry.state().script.as_mut() {
+                    set_row(&mut s.calls, row);
+                }
+            };
+            match append_gated_call(&self.engine, &self.entry, ended, settled.record, note).await {
+                Appended::Done => {}
+                Appended::Ended => return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED),
+                Appended::Failed => {
+                    audit_failure(&self.engine, &self.entry, &self.shared).await;
+                    return rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
+                }
+            }
+            match settled.next {
+                PageNext::Continue(at) => {
+                    start = at;
+                    page = page.saturating_add(1);
+                }
+                PageNext::Answer(result) => return result,
+            }
+        }
+    }
+
+    /// An `atlas.all` call answered without a page record (a later page refused or not sent):
+    /// its row, there since its first page, takes the answer, under the state lock while the
+    /// run is live (the end of the run commits the item under it). A call refused at its first
+    /// page sent nothing and has no row.
+    fn answer_row(&self, call_id: u64, result: &HostCallResult) {
+        let mut st = self.entry.state();
+        if !matches!(st.model.phase(), Phase::Running) {
+            return;
+        }
+        if let Some(r) = st
+            .script
+            .as_mut()
+            .and_then(|s| s.calls.iter_mut().find(|r| r.call_id == call_id))
+        {
+            r.outcome = outcome_of(result);
+        }
+    }
+
+    /// One page of an `atlas.all` call: a 2xx page joins the result unless the result would
+    /// exceed `max_call_result_mb` (`result_too_large`, before concatenating); any other answer
+    /// ends the call with the rejection a single call gets. `None` = cancelled (the end of the
+    /// run records the page).
+    fn settle_page(
+        &self,
+        call: &HostCall,
+        vc: &ValidatedCall,
+        info: &CallInfo,
+        classified: Classified,
+        all: &mut AllResult,
+    ) -> Option<PageSettled> {
+        let rec = match classified {
+            Classified::Item(rec) if rec.item == ReleaseItem::Result => rec,
+            other => {
+                let s = self.settle(call, vc, info, other)?;
+                return Some(PageSettled {
+                    record: s.record,
+                    size: s.size,
+                    next: PageNext::Answer(s.result),
+                });
+            }
+        };
+        let size = rec.size();
+        let event = rec.record(&self.ctx_for(vc));
+        let next_start = rec.page.and_then(|p| p.next_start);
+        let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
+        let bodies = rec.responses.iter().map(|r| r.body.as_slice());
+        let added = read::result_value(vc.spec, shape, bodies)
+            .map(|(page, _)| all.add(page, next_start.is_none()));
+        let (next, rejection) = match added {
+            Ok(true) => match next_start {
+                Some(at) => (PageNext::Continue(at), None),
+                None => (PageNext::Answer(HostCallResult::Ok(all.take())), None),
+            },
+            Ok(false) => (
+                PageNext::Answer(rejected_msg(
+                    ErrorCode::ResultTooLarge,
+                    "the result is above max_call_result_mb",
+                )),
+                Some("result_too_large"),
+            ),
+            Err(_) => (
+                PageNext::Answer(rejected_msg(
+                    ErrorCode::UpstreamUnavailable,
+                    "the answer of the server could not be read",
+                )),
+                Some("upstream_unavailable"),
+            ),
+        };
+        Some(PageSettled {
+            record: payloads::script_call_from(event, &call_meta(call, info, rejection), size),
+            size,
+            next,
+        })
+    }
+
     /// The call's fetch under the request's cover, with the identity handling of Task 26
     /// (§7.1): a failed header check or a JSON 401 runs the token re-check, and a rename
-    /// re-fetches once. `Err` = nothing was sent.
+    /// re-fetches once. `page = Some((n, start))`: page `n` of an `atlas.all` call, one request
+    /// at `start` (PD-144). `Err` = nothing was sent.
     async fn fetch(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
         ctl: &FetchControl,
+        page: Option<(u32, u64)>,
     ) -> Result<Classified, HostCallResult> {
         let internal = || rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
         let http = self
@@ -1186,8 +1442,16 @@ impl LiveBackend {
         let Ok(ExecPlan::Read(plan)) = plan else {
             return Err(internal());
         };
-        // `atlas.all` pages to the end; the host's own counters bound it.
-        let plan = if call.all { widen(plan) } else { plan };
+        let start = vc
+            .validated
+            .params
+            .get("start")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let plan = match page {
+            None => CallPlan::Whole(plan, start),
+            Some((_, at)) => CallPlan::Page(PagePlan::of(plan).ok_or_else(internal)?, at),
+        };
         let cover = self
             .engine
             .covers()
@@ -1199,16 +1463,10 @@ impl LiveBackend {
             max_response_bytes: u64::from(self.limits.max_call_result_mb).saturating_mul(MIB),
             ..self.engine.read_budget()
         };
-        let start = vc
-            .validated
-            .params
-            .get("start")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
         let mut refetched = false;
         loop {
             let seen = self.engine.identity_epoch(&vc.instance_id);
-            let fetched = read::run_plan(&http.client, &cover, &plan, &budget, ctl, start).await;
+            let fetched = plan.run(&http.client, &cover, &budget, ctl).await;
             let Some(trigger) = read::fetched_trigger(&fetched) else {
                 return Ok(read::classify_read(fetched, &http.proxy));
             };
@@ -1235,6 +1493,7 @@ impl LiveBackend {
                             instance: Some(&vc.alias),
                             user_key: vc.user_key.as_deref(),
                             rejection: Some("identity_check_retried"),
+                            page: page.map(|(n, _)| n),
                         },
                         &ReadFetched::Unavailable {
                             responses: &responses,
@@ -1381,6 +1640,7 @@ fn call_meta<'a>(
         instance: Some(&info.alias),
         user_key: info.user_key.as_deref(),
         rejection,
+        page: info.page,
     }
 }
 
@@ -1442,22 +1702,204 @@ impl HostCalls for LiveBackend {
     fn log(&self, _run_id: &str, _line: &str) {}
 }
 
-fn widen(plan: ReadPlan) -> ReadPlan {
-    match plan {
-        ReadPlan::Get(g) => ReadPlan::Get(g),
-        ReadPlan::Paged { call, .. } => ReadPlan::Paged {
-            call,
-            max_items: u64::MAX,
-        },
-        ReadPlan::Search {
-            call, items_key, ..
-        } => ReadPlan::Search {
-            call,
+/// What one fetch of a host call runs: the op's whole read plan (`atlas.call`, from the agent's
+/// `start`), or one page of an `atlas.all` call at an offset.
+enum CallPlan {
+    Whole(ReadPlan, u64),
+    Page(PagePlan, u64),
+}
+
+impl CallPlan {
+    async fn run(
+        &self,
+        client: &InstanceClient,
+        cover: &AuditCover,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+    ) -> read::Fetched {
+        match self {
+            CallPlan::Whole(plan, start) => {
+                read::run_plan(client, cover, plan, budget, ctl, *start).await
+            }
+            CallPlan::Page(plan, start) => plan.run(client, cover, budget, ctl, *start).await,
+        }
+    }
+}
+
+/// The paged request of a paginated op (PD-144: `atlas.all` asks for one page at a time, of the
+/// size the op's plan asks for, `max` or the op's default).
+enum PagePlan {
+    Paged(PagedCall),
+    Search { call: SearchCall, items_key: String },
+}
+
+impl PagePlan {
+    /// `None`: the op is not paginated (the validator refuses `atlas.all` for it).
+    fn of(plan: ReadPlan) -> Option<PagePlan> {
+        match plan {
+            ReadPlan::Paged { call, .. } => Some(PagePlan::Paged(call)),
+            ReadPlan::Search {
+                call, items_key, ..
+            } => Some(PagePlan::Search { call, items_key }),
+            ReadPlan::Get(_) | ReadPlan::IssueWithComments { .. } => None,
+        }
+    }
+
+    /// One request at `start`: a page the server clamped or cut short is never followed by a
+    /// second request here.
+    async fn run(
+        &self,
+        client: &InstanceClient,
+        cover: &AuditCover,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+        start: u64,
+    ) -> read::Fetched {
+        let outcome = match self {
+            PagePlan::Paged(call) => {
+                let call = PagedCall {
+                    start,
+                    ..call.clone()
+                };
+                client.read_page_ctl(cover, &call, budget, ctl).await
+            }
+            PagePlan::Search { call, items_key } => {
+                let mut call = call.clone();
+                // The search client reads the page's offset from the body (`startAt`).
+                if let Some(body) = call.body.as_object_mut() {
+                    body.insert("startAt".to_owned(), start.into());
+                }
+                client
+                    .read_search_page_ctl(cover, &call, items_key, budget, ctl)
+                    .await
+            }
+        };
+        read::Fetched::Paged { outcome, start }
+    }
+}
+
+/// One page of an `atlas.all` call settled: its record, the bytes received and what comes next.
+struct PageSettled {
+    record: NewEvent,
+    size: u64,
+    next: PageNext,
+}
+
+enum PageNext {
+    /// The next page's offset.
+    Continue(u64),
+    /// What the script sees: the concatenated result or a rejection.
+    Answer(HostCallResult),
+}
+
+/// The keys of a page that say where the results stand (PD-144: the result takes them from the
+/// last page): the server totals the paging client reads, and the Agile `isLast` (T13 review
+/// I-2: page 0's `false` would tell the script more results follow a complete `atlas.all`).
+const TOTAL_KEYS: [&str; 3] = ["total", "totalSize", "isLast"];
+
+/// The result of an `atlas.all` call while its pages arrive (PD-144): the first page's object
+/// with an empty items array (the skeleton), the normalized items of every page so far, and the
+/// exact size of the result they make, `skeleton + items + separators`, so the size is checked
+/// before a page is concatenated and no result over the limit is ever built.
+struct AllResult {
+    items_key: &'static str,
+    max_bytes: u64,
+    skeleton: Option<Value>,
+    skeleton_bytes: u64,
+    items: Vec<Value>,
+    items_bytes: u64,
+}
+
+impl AllResult {
+    fn new(items_key: &'static str, max_bytes: u64) -> AllResult {
+        AllResult {
             items_key,
-            max_items: u64::MAX,
-        },
-        // The comments cap is a hard cap, not the agent's `max`: `atlas.all` keeps it.
-        composite @ ReadPlan::IssueWithComments { .. } => composite,
+            max_bytes,
+            skeleton: None,
+            skeleton_bytes: 0,
+            items: Vec::new(),
+            items_bytes: 0,
+        }
+    }
+
+    /// Adds one page's normalized object; `last` = the page ended the results, so its
+    /// [`TOTAL_KEYS`] become the result's. `false` = the result would exceed `max_bytes`: nothing of the page
+    /// is added.
+    fn add(&mut self, mut page: Value, last: bool) -> bool {
+        let items = match page.get_mut(self.items_key).map(Value::take) {
+            Some(Value::Array(a)) => a,
+            _ => Vec::new(),
+        };
+        let mut skeleton = match &self.skeleton {
+            None => {
+                if let Some(o) = page.as_object_mut() {
+                    o.insert(self.items_key.to_owned(), Value::Array(Vec::new()));
+                }
+                page.clone()
+            }
+            Some(s) => s.clone(),
+        };
+        if last && let (Some(to), Some(from)) = (skeleton.as_object_mut(), page.as_object()) {
+            for key in TOTAL_KEYS {
+                if let Some(v) = from.get(key) {
+                    to.insert(key.to_owned(), v.clone());
+                }
+            }
+        }
+        let skeleton_bytes = json_len(&skeleton);
+        let separators = if self.items.is_empty() {
+            items.len().saturating_sub(1)
+        } else {
+            items.len()
+        };
+        let added = items.iter().map(json_len).fold(
+            u64::try_from(separators).unwrap_or(u64::MAX),
+            u64::saturating_add,
+        );
+        let total = skeleton_bytes
+            .saturating_add(self.items_bytes)
+            .saturating_add(added);
+        if total > self.max_bytes {
+            return false;
+        }
+        self.skeleton = Some(skeleton);
+        self.skeleton_bytes = skeleton_bytes;
+        self.items.extend(items);
+        self.items_bytes = self.items_bytes.saturating_add(added);
+        true
+    }
+
+    /// The op's native shape: the skeleton with every page's items.
+    fn take(&mut self) -> Value {
+        let mut result = self.skeleton.take().unwrap_or(Value::Null);
+        if let Some(o) = result.as_object_mut() {
+            o.insert(
+                self.items_key.to_owned(),
+                Value::Array(std::mem::take(&mut self.items)),
+            );
+        }
+        result
+    }
+}
+
+/// The length of `v` as `serde_json::to_vec` writes it, without the bytes.
+fn json_len(v: &Value) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    match serde_json::to_writer(&mut n, v) {
+        Ok(()) => n.0,
+        Err(_) => u64::MAX,
     }
 }
 
@@ -1595,6 +2037,9 @@ fn provenance_row(
     }
 }
 
+/// The provenance outcome of a call the end of the run cancelled (PD-145).
+const CANCELLED_IN_FLIGHT: &str = "cancelled_in_flight";
+
 /// The provenance row of a call the end of the run cancelled in flight.
 fn cancelled_row(info: &CallInfo) -> ProvenanceRow {
     let target_display = atlas_duck_registry::get(&info.op).map_or_else(
@@ -1606,7 +2051,16 @@ fn cancelled_row(info: &CallInfo) -> ProvenanceRow {
         op_id: info.op.clone(),
         instance: info.alias.clone(),
         target_display,
-        outcome: "cancelled_in_flight".to_owned(),
+        outcome: CANCELLED_IN_FLIGHT.to_owned(),
+    }
+}
+
+/// Puts `row` in the run's provenance: it replaces the row of the same call (an `atlas.all`
+/// call has one row for all its pages), else it is added.
+fn set_row(calls: &mut Vec<ProvenanceRow>, row: ProvenanceRow) {
+    match calls.iter_mut().find(|r| r.call_id == row.call_id) {
+        Some(r) => *r = row,
+        None => calls.push(row),
     }
 }
 
@@ -2084,7 +2538,9 @@ async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
     }
 }
 
-/// A slot of `sem`, or `None` once the request is terminal (cancel, expiry) meanwhile.
+/// A slot of `sem`, or `None` once the request is terminal (cancel, expiry) meanwhile. An end
+/// wins over a free permit (`biased`): a request cancelled during `check_available` gets no
+/// compile worker (T12 review M-3).
 async fn slot(
     sem: &Arc<Semaphore>,
     entry: &RequestEntry,
@@ -2106,8 +2562,9 @@ async fn slot(
         }
     };
     tokio::select! {
-        permit = sem.clone().acquire_owned() => permit.ok().map(|p| (p, true)),
+        biased;
         () = ended => None,
+        permit = sem.clone().acquire_owned() => permit.ok().map(|p| (p, true)),
     }
 }
 
@@ -2244,8 +2701,9 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         return;
     }
     // 3. A real slot; `queued` = it was not immediately available (§9.5). The run policy is read
-    //    here, when the slot is acquired (PD-141), and `confinement` is this slot-time admission;
-    //    the spawn below reads it again and may only narrow it.
+    //    here, when the slot is acquired (PD-141), with the confinement the run is admitted under
+    //    (`confinement` is this slot-time admission); the spawn below reads it again and may only
+    //    narrow it.
     let Some((permit, queued)) = slot(&engine.script_slots, entry, true).await else {
         return;
     };
@@ -2705,14 +3163,28 @@ async fn commit_item(
                 st.rebuild_failed = false;
                 let rows: Vec<ProvenanceRow> =
                     lock(&cancelled_rows).iter().map(cancelled_row).collect();
+                // An `atlas.all` call cancelled at a later page has its row (and its texts in the
+                // model) since its first page: only its outcome changes.
+                let has_row = |id: u64| {
+                    st.script
+                        .as_ref()
+                        .is_some_and(|s| s.calls.iter().any(|r| r.call_id == id))
+                };
+                let new_texts: Vec<&str> = rows
+                    .iter()
+                    .filter(|r| !has_row(r.call_id))
+                    .flat_map(row_texts)
+                    .collect();
                 st.caution_count = model.map_or(0, |mut m| {
-                    count_shown_text(&mut m, rows.iter().flat_map(row_texts));
+                    count_shown_text(&mut m, new_texts);
                     super::read::caution_count(&m)
                 });
                 if let Some(s) = st.script.as_mut() {
                     s.item = Some(item);
                     s.preselect_error_class_only = preselect;
-                    s.calls.extend(rows);
+                    for row in rows {
+                        set_row(&mut s.calls, row);
+                    }
                     s.instances = called;
                     s.shared = None;
                 }
@@ -3106,6 +3578,211 @@ mod tests {
         };
         let ids: Vec<u64> = provenance.iter().map(|r| r.call_id).collect();
         assert_eq!(ids, [1, 2, 3]);
+        Ok(())
+    }
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn page(start: u64, n: u64, total: u64) -> Value {
+        let issues: Vec<Value> = (start..start + n)
+            .map(|i| json!({ "key": format!("ABC-{i}"), "f": { "s": "é\u{1}\"", "n": [i, null] } }))
+            .collect();
+        json!({ "startAt": start, "maxResults": 2, "total": total, "issues": issues })
+    }
+
+    /// The running size of an `atlas.all` result is the exact length of the value it builds,
+    /// across empty pages, escapes and a last page that changes the totals (PD-144).
+    #[test]
+    fn all_result_counts_the_exact_bytes_of_the_result() -> TestResult {
+        let pages = [
+            vec![page(0, 0, 9), page(0, 2, 9), page(2, 1, 1000)],
+            vec![page(0, 2, 5), page(2, 0, 5), page(2, 2, 5), page(4, 1, 5)],
+            vec![page(0, 1, 1)],
+        ];
+        for set in pages {
+            let mut all = AllResult::new("issues", u64::MAX);
+            let last = set.len() - 1;
+            for (n, p) in set.iter().enumerate() {
+                assert!(all.add(p.clone(), n == last));
+            }
+            let counted = all.skeleton_bytes + all.items_bytes;
+            let built = all.take();
+            assert_eq!(counted, u64::try_from(serde_json::to_vec(&built)?.len())?);
+            let want = set.last().map(|p| p["total"].clone());
+            assert_eq!(Some(built["total"].clone()), want);
+            assert_eq!(built["startAt"], 0);
+        }
+        Ok(())
+    }
+
+    /// A result of exactly `max_bytes` is accepted, one byte less refuses the page and keeps
+    /// nothing of it.
+    #[test]
+    fn all_result_refuses_a_page_past_the_limit() -> TestResult {
+        let set = [page(0, 2, 4), page(2, 2, 4)];
+        let mut exact = AllResult::new("issues", u64::MAX);
+        exact.add(set[0].clone(), false);
+        exact.add(set[1].clone(), true);
+        let size = u64::try_from(serde_json::to_vec(&exact.take())?.len())?;
+        let mut fits = AllResult::new("issues", size);
+        assert!(fits.add(set[0].clone(), false) && fits.add(set[1].clone(), true));
+        let mut over = AllResult::new("issues", size - 1);
+        assert!(over.add(set[0].clone(), false));
+        assert!(!over.add(set[1].clone(), true));
+        assert_eq!(over.take()["issues"].as_array().map(Vec::len), Some(2));
+        Ok(())
+    }
+
+    fn info(call_id: u64) -> CallInfo {
+        CallInfo {
+            call_id,
+            op: "jira.search".to_owned(),
+            params: Value::Null,
+            alias: "jira-main".to_owned(),
+            instance_id: "i1".to_owned(),
+            user_key: None,
+            page: Some(1),
+        }
+    }
+
+    /// A run with `calls` host calls and `fetched` bytes so far.
+    fn run_at(calls: u32, fetched: u64) -> RunShared {
+        let s = RunShared::default();
+        {
+            let mut g = lock(&s.inner);
+            g.calls = calls;
+            g.fetched_bytes = fetched;
+        }
+        s
+    }
+
+    fn start(s: &RunShared, call_id: u64, limits: Option<(u32, u64)>) -> &'static str {
+        match s.begin_page(info(call_id), FetchControl::new(), limits) {
+            PageStart::Go => "go",
+            PageStart::Stopped => "stopped",
+            PageStart::MaxCalls => "max_calls",
+            PageStart::MaxFetch => "max_fetch",
+        }
+    }
+
+    fn in_flight(s: &RunShared) -> Vec<u64> {
+        let mut ids: Vec<u64> = lock(&s.inner).in_flight.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// T13 review m-1: a run that ended or whose kill was asked admits nothing, with or without
+    /// limits, and nothing is counted or put in flight.
+    #[test]
+    fn begin_page_refuses_an_ended_or_killed_run() {
+        for limits in [None, Some((10, 100))] {
+            let ended = run_at(1, 0);
+            ended.mark_ended();
+            assert_eq!(start(&ended, 1, limits), "stopped");
+            let killed = run_at(1, 0);
+            assert!(killed.request_kill(KillReason::Client));
+            assert_eq!(start(&killed, 1, limits), "stopped");
+            for s in [ended, killed] {
+                assert!(in_flight(&s).is_empty());
+                assert_eq!(s.calls(), 1);
+            }
+        }
+    }
+
+    /// T13 review m-1: the limits of a later page (PD-144): `max_calls` first, then the fetched
+    /// bytes at the cap; only a page that goes is counted and put in flight. Without limits (a
+    /// plain call, page 0) nothing is checked or counted here.
+    #[test]
+    fn begin_page_checks_max_calls_then_fetched_bytes() {
+        let limits = Some((3, 100));
+        let below = run_at(2, 99);
+        assert_eq!(start(&below, 1, limits), "go");
+        assert_eq!((below.calls(), in_flight(&below)), (3, vec![1]));
+        let at_calls = run_at(3, 0);
+        assert_eq!(start(&at_calls, 1, limits), "max_calls");
+        assert_eq!((at_calls.calls(), in_flight(&at_calls)), (3, vec![]));
+        let at_cap = run_at(0, 100);
+        assert_eq!(start(&at_cap, 1, limits), "max_fetch");
+        assert_eq!((at_cap.calls(), in_flight(&at_cap)), (0, vec![]));
+        // Both over: `max_calls` is named.
+        let both = run_at(3, 100);
+        assert_eq!(start(&both, 1, limits), "max_calls");
+        let plain = run_at(3, 100);
+        assert_eq!(start(&plain, 7, None), "go");
+        assert_eq!((plain.calls(), in_flight(&plain)), (3, vec![7]));
+    }
+
+    /// T13 review I-1: a plain call whose run ended, or whose kill was asked, after `live_call`'s
+    /// `running()` check is refused when it registers (one lock with the end's drain): nothing
+    /// is sent, so no request leaves without its `SCRIPT_CALL` (§5.1 inv. 1, §9.5). The run's
+    /// state at that moment is a fresh `RunShared`, ended or killed; the request stays `Running`
+    /// (its worker is held at start), so the cover would be minted.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_registering_after_the_run_ended_is_never_sent() -> TestResult {
+        use crate::testing::{FakeScriptRunner, Harness, ScriptPlan, host_call};
+        let end = RunEnd::Result {
+            value: json!(1),
+            logs: Vec::new(),
+            stderr: String::new(),
+        };
+        let hold = crate::Pause::new();
+        let runner = FakeScriptRunner::new(vec![
+            ScriptPlan::new(Vec::new(), end).with_start_pause(hold.clone()),
+        ]);
+        let h = Harness::builder()
+            .jira("jira-main")
+            .scripts(runner)
+            .start()
+            .await?;
+        let mock = h.mock("jira-main").ok_or("no jira mock")?;
+        let fixture = atlas_duck_atlassian::testing::fixtures::JIRA_ISSUE;
+        mock.json("/rest/api/2/issue/ABC-1", 200, fixture).await;
+        let issue = mock.path("/rest/api/2/issue/ABC-1");
+        let env = h.submit_script(json!({ "source": "return 1;" })).await;
+        let id = env.request_id.clone().ok_or("no request_id")?;
+        hold.reached.notified().await;
+        let engine = h.engine().clone();
+        let entry = engine.entry(&id).ok_or("no entry")?;
+        let limits = entry
+            .state()
+            .script
+            .as_ref()
+            .map(|s| s.limits)
+            .ok_or("no script state")?;
+        let ended = Arc::new(RunShared::default());
+        ended.mark_ended();
+        let killed = Arc::new(RunShared::default());
+        killed.request_kill(KillReason::Client);
+        for shared in [ended, killed] {
+            let validator = Arc::new(EngineValidator::new(engine.clone()));
+            let call = host_call(1, "jira.issue.get", json!({ "key": "ABC-1" }));
+            let vc = match validator.validate(&call) {
+                Ok(vc) => vc,
+                Err(r) => return Err(format!("validation: {r:?}").into()),
+            };
+            let backend = LiveBackend::new(
+                engine.clone(),
+                entry.clone(),
+                shared.clone(),
+                validator,
+                limits,
+            );
+            match backend.execute(call, vc).await {
+                HostCallResult::Rejected { class, .. } => assert_eq!(class, "cancelled"),
+                other => return Err(format!("expected cancelled, got {other:?}").into()),
+            }
+            assert!(shared.take_in_flight().is_empty());
+        }
+        let sent = mock
+            .received()
+            .await
+            .iter()
+            .filter(|r| r.url.path() == issue)
+            .count();
+        assert_eq!(sent, 0, "a request left after the run ended");
+        hold.release.notify_one();
+        h.queued(&id, 5000).await.ok_or("never queued")?;
         Ok(())
     }
 }

@@ -3,8 +3,9 @@
 //! each awaited, as the worker's single-threaded loop does), a hold, then the scripted end. A
 //! `kill` interrupts the call in flight or the hold, and `wait` then answers
 //! `RunEnd::Killed { reason }`. The runner-wide answers (Δ3): `check_available` (Ok unless
-//! [`FakeScriptRunner::fail_available`]), `confinement` ([`FakeScriptRunner::set_confinement`]),
-//! and every policy it was handed ([`FakeScriptRunner::policies`]).
+//! [`FakeScriptRunner::fail_available`], held by [`FakeScriptRunner::pause_available`]),
+//! `confinement` ([`FakeScriptRunner::set_confinement`]), and every policy it was handed
+//! ([`FakeScriptRunner::policies`]).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -136,10 +137,13 @@ struct Inner {
     start_error: Option<RunnerError>,
     /// `check_available` answers this (submit-time unavailability); `None` = available.
     available_error: Option<RunnerError>,
+    /// `check_available` holds here (after recording its policy) until released.
+    available_pause: Option<Arc<Pause>>,
     availability_checks: u32,
     /// What `confinement` answers.
     confinement: Option<RunConfinement>,
-    /// The policy each runner call was handed, in call order (`available`, `compile`, `start`).
+    /// The policy each runner call was handed, in call order (`available`, `compile`,
+    /// `confinement`, `start`).
     policies: Vec<(&'static str, RunPolicy)>,
 }
 
@@ -181,6 +185,11 @@ impl FakeScriptRunner {
         self.lock().available_error = Some(err);
     }
 
+    /// Makes every later `check_available` hold at `pause` (`None`: answer at once).
+    pub fn pause_available(&self, pause: Option<Arc<Pause>>) {
+        self.lock().available_pause = pause;
+    }
+
     /// What every later `confinement` answers (`None`: the runner states nothing).
     pub fn set_confinement(&self, c: Option<RunConfinement>) {
         self.lock().confinement = c;
@@ -190,8 +199,8 @@ impl FakeScriptRunner {
         self.lock().availability_checks
     }
 
-    /// The policy each `check_available` (`"available"`), `compile_check` (`"compile"`) and
-    /// `start` (`"start"`) was handed, in call order.
+    /// The policy each `check_available` (`"available"`), `compile_check` (`"compile"`),
+    /// `confinement` (`"confinement"`) and `start` (`"start"`) was handed, in call order.
     pub fn policies(&self) -> Vec<(&'static str, RunPolicy)> {
         self.lock().policies.clone()
     }
@@ -224,10 +233,16 @@ impl FakeScriptRunner {
 #[async_trait]
 impl ScriptRunner for FakeScriptRunner {
     async fn check_available(&self, policy: RunPolicy) -> Result<(), RunnerError> {
-        let mut g = self.lock();
-        g.availability_checks += 1;
-        g.policies.push(("available", policy));
-        g.available_error.map_or(Ok(()), Err)
+        let pause = {
+            let mut g = self.lock();
+            g.availability_checks += 1;
+            g.policies.push(("available", policy));
+            g.available_pause.clone()
+        };
+        if let Some(p) = pause {
+            p.hold().await;
+        }
+        self.lock().available_error.map_or(Ok(()), Err)
     }
 
     async fn compile_check(
@@ -256,8 +271,10 @@ impl ScriptRunner for FakeScriptRunner {
         verdict
     }
 
-    fn confinement(&self, _policy: RunPolicy) -> Option<RunConfinement> {
-        self.lock().confinement.clone()
+    fn confinement(&self, policy: RunPolicy) -> Option<RunConfinement> {
+        let mut g = self.lock();
+        g.policies.push(("confinement", policy));
+        g.confinement.clone()
     }
 
     async fn start(

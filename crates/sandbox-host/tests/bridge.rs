@@ -33,11 +33,11 @@ use atlas_duck_ipc::sandbox::{
 };
 use atlas_duck_sandbox_host::bridge::{
     CompileVerdict, DIAG_CALL_RESULT_REPLACED, DIAG_HOST_PROTOCOL_EXIT, DIAG_JOB_MEMORY_LIMIT,
-    DIAG_MEMORY_WATCH_FAILED, DIAG_OUTCOME_LOST, DIAG_REAP_FAILED, DIAG_STDOUT_HELD,
-    DIAG_UNREAD_RESULTS, DIAG_WATCHDOG_KILL, ExpectedWorker, HostCallSink, HostVerdict, KillCause,
-    LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl, RunOutcome, STDERR_CAP,
-    STDOUT_GRACE, StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker,
-    start_run, unread_results_cap,
+    DIAG_MEMORY_WATCH_FAILED, DIAG_OUTCOME_LOST, DIAG_REAP_FAILED, DIAG_STDIN_HELD,
+    DIAG_STDOUT_HELD, DIAG_UNREAD_RESULTS, DIAG_WATCHDOG_KILL, ExpectedWorker, HostCallSink,
+    HostVerdict, KillCause, LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl,
+    RunOutcome, STDERR_CAP, STDOUT_GRACE, StartRunError, ViolationKind, WorkerEnd, compile_run,
+    log_truncated_marker, start_run, unread_results_cap,
 };
 use atlas_duck_sandbox_host::identity::{
     FileId, IdentityPart, SandboxBinaryIdentity, file_identity,
@@ -225,6 +225,17 @@ impl FakeWorker {
             }
         });
         written
+    }
+
+    /// Hands a copy of stdin to a "child" that outlives the fake (a degraded worker that forked):
+    /// it holds the read end, never reading, until `go` receives (at most `hold`).
+    fn fork_child_holding_stdin(&mut self, go: Receiver<()>, hold: Duration) -> io::Result<()> {
+        let stdin = self.stdin.try_clone()?;
+        thread::spawn(move || {
+            let _ = go.recv_timeout(hold);
+            drop(stdin);
+        });
+        Ok(())
     }
 
     /// The OS reports the fake above its memory limit (the Windows job message, the macOS
@@ -2615,6 +2626,39 @@ async fn the_outcome_does_not_wait_for_a_stdout_held_past_the_exit() -> TestResu
     drop(handle);
     eventually(|| Arc::strong_count(&test_sink) == 1).await?;
     assert!(test_sink.logs().is_empty(), "{:?}", test_sink.logs());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_outcome_does_not_wait_for_a_stdin_held_past_the_exit() -> TestResult {
+    // M8 fuzz fix, review M-2: a (degraded) worker forks a child that holds its stdin without
+    // reading it and exits, while an answer is queued for it. The writer stays blocked, so the
+    // outcome is published WRITER_GRACE after the reap, with the diag.
+    let hold = Duration::from_secs(20);
+    let (release_tx, release_rx) = mpsc::channel();
+    let sink = TestSink::padded(2 * MIB);
+    let seen = Arc::clone(&sink);
+    let (spawner, _) = fake(move |w| {
+        w.ready()?;
+        w.read()?; // script.run; nothing after it is ever read
+        w.fork_child_holding_stdin(release_rx, hold)?;
+        w.call(1)?;
+        // The answer (2 MiB, more than the pipe holds) is queued once the sink completed it.
+        let started = Instant::now();
+        while seen.completed() < 1 && started.elapsed() < WAIT_BOUND {
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(Duration::from_millis(500));
+        Ok(0)
+    });
+    let handle = start(spawner, expect(false), init(ScriptLimits::default()), sink).await??;
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), handle.wait()).await?;
+    let took = started.elapsed();
+    let _ = release_tx.send(());
+    assert!(took < hold, "published before the child let go ({took:?})");
+    assert_eq!(outcome.host, HostVerdict::Crashed(Some(ExitKind::Code(0))));
+    assert_eq!(outcome.diag, vec![DIAG_STDIN_HELD], "after {took:?}");
     Ok(())
 }
 

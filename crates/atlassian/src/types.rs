@@ -283,7 +283,8 @@ impl fmt::Debug for FetchFailure {
 pub enum PageEnd {
     /// The server reported the end of the results (`next_start` is `None`).
     ResultsEnded,
-    /// `max_items` reached before the results ended.
+    /// `max_items` reached before the results ended (or the one page of `read_page_ctl` was
+    /// fetched).
     MaxReached,
     /// The 50 MiB fetch cap (`ReadBudget.max_bytes`) was exceeded during a page.
     FetchCap50MiB,

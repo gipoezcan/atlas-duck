@@ -367,40 +367,76 @@ mod chunks {
         ) -> io::Result<Option<Vec<u8>>> {
             let deadline = deadline_after(d);
             loop {
-                if let Some(frame) = self.take_frame(max)? {
-                    return Ok(Some(frame));
+                if let Some(end) = self.frame_end(max)? {
+                    let payload = self.buf[4..end].to_vec();
+                    self.buf.drain(..end);
+                    return Ok(Some(payload));
                 }
-                if self.eof {
-                    return if self.buf.is_empty() {
-                        Ok(None)
-                    } else {
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "truncated frame",
-                        ))
-                    };
+                if self.at_eof()? {
+                    return Ok(None);
                 }
-                let left = deadline.saturating_duration_since(Instant::now());
-                match self.rx.recv_timeout(left) {
-                    Ok(Chunk::Data(bytes)) => self.buf.extend_from_slice(&bytes),
-                    Ok(Chunk::Eof) | Err(RecvTimeoutError::Disconnected) => self.eof = true,
-                    Ok(Chunk::Failed(kind)) => {
-                        self.eof = true;
-                        return Err(io::Error::new(kind, "reading the worker's stdout failed"));
-                    }
-                    Err(RecvTimeoutError::Timeout) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "no complete frame in time",
-                        ));
-                    }
-                }
+                self.receive(deadline)?;
             }
         }
 
-        /// Removes and returns one complete frame from the buffer, if there is
-        /// one.
-        fn take_frame(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
+        /// Waits up to `d` until one complete frame is buffered, without
+        /// taking it: the next `next_frame`, or the stream of `hand_over`,
+        /// still starts with it (the Windows degraded spawner waits for the
+        /// worker's first frame this way, M8 Task 11). `Ok(false)`: EOF
+        /// before any byte; the errors are those of `next_frame`.
+        #[cfg_attr(not(windows), allow(dead_code))]
+        pub(crate) fn wait_frame(&mut self, max: usize, d: Duration) -> io::Result<bool> {
+            let deadline = deadline_after(d);
+            loop {
+                if self.frame_end(max)?.is_some() {
+                    return Ok(true);
+                }
+                if self.at_eof()? {
+                    return Ok(false);
+                }
+                self.receive(deadline)?;
+            }
+        }
+
+        /// `true` at EOF with an empty buffer; `InvalidData` at EOF inside a
+        /// frame; `false` before EOF.
+        fn at_eof(&self) -> io::Result<bool> {
+            if !self.eof {
+                return Ok(false);
+            }
+            if self.buf.is_empty() {
+                Ok(true)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated frame",
+                ))
+            }
+        }
+
+        /// Adds the next chunk to the buffer, waiting until `deadline`.
+        fn receive(&mut self, deadline: Instant) -> io::Result<()> {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(Chunk::Data(bytes)) => self.buf.extend_from_slice(&bytes),
+                Ok(Chunk::Eof) | Err(RecvTimeoutError::Disconnected) => self.eof = true,
+                Ok(Chunk::Failed(kind)) => {
+                    self.eof = true;
+                    return Err(io::Error::new(kind, "reading the worker's stdout failed"));
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "no complete frame in time",
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        /// The end (header included) of the complete frame at the start of
+        /// the buffer, if there is one.
+        fn frame_end(&self, max: usize) -> io::Result<Option<usize>> {
             let Some(header) = self.buf.first_chunk::<4>() else {
                 return Ok(None);
             };
@@ -414,12 +450,7 @@ mod chunks {
             let Some(end) = 4usize.checked_add(len) else {
                 return Ok(None);
             };
-            if self.buf.len() < end {
-                return Ok(None);
-            }
-            let payload = self.buf[4..end].to_vec();
-            self.buf.drain(..end);
-            Ok(Some(payload))
+            Ok((self.buf.len() >= end).then_some(end))
         }
 
         /// Hands the stream over: the bytes not yet returned as a frame, then
@@ -550,6 +581,46 @@ mod chunks {
                 r.next_frame(MAX, Duration::MAX).ok(),
                 Some(Some(b"x".to_vec()))
             );
+        }
+
+        #[test]
+        fn waiting_for_a_frame_leaves_it_for_the_next_read() -> io::Result<()> {
+            let bytes = frame(b"probe.ready");
+            let (tx, rx) = mpsc::sync_channel(64);
+            let mut r = ChunkReader::from_channel(rx);
+            assert!(tx.send(Chunk::Data(bytes[..5].to_vec())).is_ok());
+            let err = r.wait_frame(MAX, Duration::from_millis(50)).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::TimedOut));
+            assert!(tx.send(Chunk::Data(bytes[5..].to_vec())).is_ok());
+            assert!(r.wait_frame(MAX, LONG)?);
+            // Twice: still buffered.
+            assert!(r.wait_frame(MAX, SHORT)?);
+            assert_eq!(r.next_frame(MAX, LONG)?, Some(b"probe.ready".to_vec()));
+            // The stream of a hand-over also starts with a frame that was waited for.
+            let second = frame(b"second");
+            assert!(tx.send(Chunk::Data(second.clone())).is_ok());
+            assert!(r.wait_frame(MAX, LONG)?);
+            let stream = r.hand_over();
+            drop(tx);
+            assert_eq!(read_all(stream)?, second);
+            Ok(())
+        }
+
+        #[test]
+        fn waiting_for_a_frame_reports_eof_truncation_and_oversize() {
+            let mut r = reader(vec![Chunk::Eof]);
+            assert_eq!(r.wait_frame(MAX, SHORT).ok(), Some(false));
+            let mut cut = frame(b"abcdef");
+            cut.truncate(5);
+            let mut r = reader(vec![Chunk::Data(cut), Chunk::Eof]);
+            let err = r.wait_frame(MAX, SHORT).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+            let mut r = reader(vec![Chunk::Data(frame(&[1u8; 10]))]);
+            let err = r.wait_frame(9, SHORT).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::InvalidData));
+            let mut r = reader(vec![Chunk::Failed(io::ErrorKind::BrokenPipe)]);
+            let err = r.wait_frame(MAX, SHORT).err();
+            assert_eq!(err.map(|e| e.kind()), Some(io::ErrorKind::BrokenPipe));
         }
 
         #[test]

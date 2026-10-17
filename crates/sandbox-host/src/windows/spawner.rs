@@ -32,10 +32,12 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::WindowsProgramming::PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
 
+use atlas_duck_ipc::sandbox::WORKER_FRAME_MAX_BYTES;
+
 use super::aces::{AceStatus, check_aces, worker_ace_files_for_exe};
 use super::appcontainer::AppContainer;
 use super::job::{Job, JobLimits, JobSnapshot, terminate_job};
-use super::pipes::{STDERR_CAP_BYTES, StdinPipe, create_stdio_pipes};
+use super::pipes::{HostEnds, STDERR_CAP_BYTES, StdinPipe, create_stdio_pipes};
 use super::{APPCONTAINER_NAME, WORKER_ENV_NAMES, WORKER_ENV_OS_REQUIRED, wide};
 use crate::drain::{ChunkReader, Keep, StderrDrain};
 use crate::kill::{GuardedKill, ReapGuard, reap_after_wait, signal_or_fallback};
@@ -50,13 +52,13 @@ use crate::spawn::{
 /// the job's `ACTIVE_PROCESS = 1`). If the first CI run shows the worker never
 /// sends `probe.ready` with this flag, the documented alternative is
 /// `CREATE_NO_WINDOW`.
-const WORKER_CREATION_FLAGS: u32 =
+pub(super) const WORKER_CREATION_FLAGS: u32 =
     EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS;
 
 /// Names the spawn stage that failed on stderr and passes the error on
 /// unchanged (the raw OS code is what the probes report). The first CI run
 /// (windows-2022) failed every spawn with a bare 87.
-fn stage(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
+pub(super) fn stage(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
     move |e| {
         eprintln!("spawn stage `{name}` failed: {e}");
         e
@@ -70,8 +72,8 @@ fn stage(name: &'static str) -> impl FnOnce(io::Error) -> io::Error {
 /// another part of the app creates inside that window (one `CreateProcessW`
 /// call) with inheritance on and no handle list could still receive a copy of
 /// the three ends. The worker itself only ever gets the three handles of its own
-/// `HANDLE_LIST`.
-static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+/// `HANDLE_LIST`. The degraded spawner (M8 Task 11) holds it too.
+pub(super) static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 static RUN_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// How a worker is started.
@@ -238,24 +240,29 @@ impl WindowsSpawner {
         drop(child);
         drop(_guard);
 
-        let frames = ChunkReader::spawn(host.stdout, "atlas-duck-sbx-out")?;
-        let stderr = StderrDrain::start(
-            host.stderr,
-            Keep::head(STDERR_CAP_BYTES),
-            "atlas-duck-sbx-err",
-        )?;
-        Ok(WindowsProcess {
-            stdin: StdinPipe::new(host.stdin),
-            frames,
-            stderr,
-            job: Some(job),
-            process,
-            pid: pi.dwProcessId,
-            exit: None,
-            lpac,
-            run_dir: Some(run_dir),
-        })
+        WindowsProcess::start(
+            host,
+            Started {
+                job,
+                process,
+                pid: pi.dwProcessId,
+                main_thread: None,
+                lpac,
+                run_dir: Some(run_dir),
+            },
+        )
     }
+}
+
+/// A worker `CreateProcess*` just created, with the host's own handles to it.
+pub(super) struct Started {
+    pub(super) job: Job,
+    pub(super) process: OwnedHandle,
+    pub(super) pid: u32,
+    /// The degraded worker's main thread (M8 Task 11); `None` otherwise.
+    pub(super) main_thread: Option<OwnedHandle>,
+    pub(super) lpac: bool,
+    pub(super) run_dir: Option<RunDir>,
 }
 
 impl WorkerSpawner for WindowsSpawner {
@@ -281,14 +288,53 @@ pub struct WindowsProcess {
     pid: u32,
     exit: Option<ExitKind>,
     lpac: bool,
-    /// `None` only after `into_parts`.
+    /// `None` after `into_parts`, and for a degraded worker (it has no
+    /// AppContainer folder to put one in).
     run_dir: Option<RunDir>,
+    /// The degraded worker's main thread (M8 Task 11), kept for the checks
+    /// from outside; `None` for an AppContainer worker.
+    main_thread: Option<OwnedHandle>,
 }
 
 impl WindowsProcess {
+    /// Starts the host's stdout and stderr threads for a worker `CreateProcess*`
+    /// just created. On an error the job is dropped, which kills the worker.
+    pub(super) fn start(host: HostEnds, started: Started) -> io::Result<WindowsProcess> {
+        let frames = ChunkReader::spawn(host.stdout, "atlas-duck-sbx-out")?;
+        let stderr = StderrDrain::start(
+            host.stderr,
+            Keep::head(STDERR_CAP_BYTES),
+            "atlas-duck-sbx-err",
+        )?;
+        Ok(WindowsProcess {
+            stdin: StdinPipe::new(host.stdin),
+            frames,
+            stderr,
+            job: Some(started.job),
+            process: started.process,
+            pid: started.pid,
+            exit: None,
+            lpac: started.lpac,
+            run_dir: started.run_dir,
+            main_thread: started.main_thread,
+        })
+    }
+
+    /// Waits up to `d` for the worker's first frame without taking it (the
+    /// degraded spawner, M8 Task 11): `Ok(false)` at EOF.
+    pub(super) fn wait_first_frame(&mut self, d: Duration) -> io::Result<bool> {
+        self.frames.wait_frame(WORKER_FRAME_MAX_BYTES, d)
+    }
+
     /// True when the worker was started with the LPAC opt-out.
     pub fn is_lpac(&self) -> bool {
         self.lpac
+    }
+
+    /// The main thread of a worker the degraded spawner started (for the
+    /// checks from outside, M8 Task 11); `None` for an AppContainer worker.
+    pub fn main_thread_handle(&self) -> Option<RawHandle> {
+        self.main_thread.as_ref().map(AsRawHandle::as_raw_handle)
     }
 
     /// The worker's current directory (an empty per-run directory).
@@ -526,7 +572,7 @@ impl Drop for WindowsReaper {
 }
 
 /// An empty directory below the container's `AC` folder, removed on drop.
-struct RunDir(PathBuf);
+pub(super) struct RunDir(PathBuf);
 
 impl RunDir {
     fn create(root: &Path) -> io::Result<Self> {
@@ -566,6 +612,19 @@ impl Drop for RunDir {
 /// `LOCALAPPDATA`, `TEMP` and `TMP` from it (all three end up inside
 /// `Packages\<name>\AC`). The worker therefore sees [`super::WORKER_ENV_OBSERVED`].
 fn environment_block(local_app_data: &Path) -> io::Result<Vec<u16>> {
+    let lad: Vec<u16> = local_app_data.as_os_str().encode_wide().collect();
+    block_with(Some(&lad))
+}
+
+/// The degraded worker's environment (M8 Task 11): `SystemRoot` and `TZ=UTC0`
+/// only, §3.4's two names. Without an AppContainer, process creation needs no
+/// `LOCALAPPDATA` and adds no `TEMP`/`TMP`.
+pub(super) fn degraded_environment_block() -> io::Result<Vec<u16>> {
+    block_with(None)
+}
+
+/// The sorted block: `LOCALAPPDATA` when given, then `SystemRoot` and `TZ`.
+fn block_with(local_app_data: Option<&[u16]>) -> io::Result<Vec<u16>> {
     let mut buf = vec![0u16; 260];
     // SAFETY: `buf` is writable for `buf.len()` elements.
     let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
@@ -583,8 +642,9 @@ fn environment_block(local_app_data: &Path) -> io::Result<Vec<u16>> {
         block.extend_from_slice(value);
         block.push(0);
     };
-    let lad: Vec<u16> = local_app_data.as_os_str().encode_wide().collect();
-    entry(WORKER_ENV_OS_REQUIRED, &lad);
+    if let Some(lad) = local_app_data {
+        entry(WORKER_ENV_OS_REQUIRED, lad);
+    }
     entry(WORKER_ENV_NAMES[0], &buf[..n]);
     entry(
         WORKER_ENV_NAMES[1],
@@ -595,7 +655,7 @@ fn environment_block(local_app_data: &Path) -> io::Result<Vec<u16>> {
 }
 
 /// A `PROC_THREAD_ATTRIBUTE_LIST` and the values it points at.
-struct ProcAttrs {
+pub(super) struct ProcAttrs {
     /// Backing store of the list (8-byte aligned).
     buf: Vec<u64>,
     _handles: Box<[HANDLE; 3]>,
@@ -607,8 +667,9 @@ struct ProcAttrs {
 
 impl ProcAttrs {
     /// `sid = None` leaves out `SECURITY_CAPABILITIES`: no AppContainer (the
-    /// unconfined scoring control); `lpac` is then `false`.
-    fn new(
+    /// unconfined scoring control and the degraded worker); `lpac` is then
+    /// `false`.
+    pub(super) fn new(
         handles: [HANDLE; 3],
         sid: Option<*mut c_void>,
         job: HANDLE,
@@ -686,7 +747,7 @@ impl ProcAttrs {
         Ok(me)
     }
 
-    fn list(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
+    pub(super) fn list(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
         self.buf.as_mut_ptr().cast()
     }
 }
@@ -725,5 +786,17 @@ mod tests {
                 WORKER_ENV_NAMES[1]
             ]
         );
+    }
+
+    #[test]
+    fn degraded_environment_block_is_systemroot_and_tz_only() {
+        let block = degraded_environment_block().expect("environment block");
+        assert_eq!(&block[block.len() - 2..], &[0, 0], "double NUL terminator");
+        let text = String::from_utf16_lossy(&block[..block.len() - 2]);
+        let entries: Vec<&str> = text.split('\0').collect();
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries[0].starts_with("SystemRoot="), "{entries:?}");
+        assert!(entries[0].len() > "SystemRoot=".len(), "{entries:?}");
+        assert_eq!(entries[1], "TZ=UTC0");
     }
 }

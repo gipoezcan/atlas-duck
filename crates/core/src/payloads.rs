@@ -924,8 +924,12 @@ impl ScriptErrorDetails {
 }
 
 /// `SCRIPT_STARTED {source, args, limits, queued, confinement?}` (§9.1 step 2): the full source,
-/// so the log can show what ran, and (additive, PD-138) the `{mode, worker_version, report}` the
-/// run is spawned under when the runner states it.
+/// so the log can show what ran, and (additive, PD-138) the confinement the run is admitted
+/// under when the runner states it: `{mode, worker_version, probe_report}`, where `probe_report`
+/// is the startup probe's report (the run's worker does not exist yet). It records the slot-time
+/// admission: the spawn may still be narrowed by a later revocation, which a following
+/// `SCRIPT_FAILED {sandbox_unavailable, details.reason: floor_not_met}` records (see
+/// `RunConfinement`).
 pub fn script_started(
     ctx: &EventCtx,
     source: &str,
@@ -975,10 +979,14 @@ pub struct ScriptCallMeta<'a> {
     /// The class the script saw when the call was rejected (`upstream_http`, `result_too_large`,
     /// ...); `None` when the result was handed over.
     pub rejection: Option<&'a str>,
+    /// The page of an `atlas.all` call (0-based, PD-144); `None` for `atlas.call`, whose record
+    /// has no `page` key.
+    pub page: Option<u32>,
 }
 
 /// `SCRIPT_CALL` (§8.3): the op, params, instance and user, with every byte received laid out as
-/// `READ_FETCHED` does (`responses`, or `outcome` with the partial bytes), then `bytes`.
+/// `READ_FETCHED` does (`responses`, or `outcome` with the partial bytes), then `bytes`; one
+/// record per page of an `atlas.all` call, with its `page` (PD-144).
 pub fn script_call(
     ctx: &EventCtx,
     meta: &ScriptCallMeta<'_>,
@@ -1001,6 +1009,9 @@ pub fn script_call_from(mut ev: NewEvent, meta: &ScriptCallMeta<'_>, bytes: u64)
         m.insert("user_key".into(), json!(meta.user_key));
         m.insert("rejection".into(), json!(meta.rejection));
         m.insert("bytes".into(), bytes.into());
+        if let Some(page) = meta.page {
+            m.insert("page".into(), page.into());
+        }
     }
     ev
 }

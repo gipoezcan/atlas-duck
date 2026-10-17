@@ -1720,6 +1720,75 @@ fn s10_unread_results_are_capped() -> TestResult {
     Ok(())
 }
 
+/// Nothing of a run outlives its outcome: the answers queued for a worker that never read them
+/// are released before `RunHandleImpl::wait` answers, not a moment later by the writer thread.
+/// Measured at once, without a settle: the CI failure of the fuzz run above was the queue of
+/// `s10_worker_that_never_reads_stdin_is_killed_at_the_timer` still being freed while the next
+/// fuzz case ran.
+#[test]
+fn s10_queued_answers_are_released_before_the_outcome() -> TestResult {
+    let _serial = serial();
+    let rt = runtime()?;
+    const CALLS: u64 = 12;
+    const ANSWER: usize = 512 * 1024;
+    const SEND_DEADLINE: Duration = Duration::from_secs(1);
+    let sink = TestSink::padded(ANSWER);
+    let seen = Arc::clone(&sink);
+    // The calls the fake sent before the timer (a slow runner may not get through all of them).
+    let sent = Arc::new(AtomicU64::new(0));
+    let fake_sent = Arc::clone(&sent);
+    let (spawner, observed) = fake(move |w| {
+        w.ready()?;
+        w.read()?; // script.run; nothing after it is ever read
+        let begun = Instant::now();
+        // One call at a time, each answered (and queued) before the next. No call is started
+        // after SEND_DEADLINE, well inside the timer, and the loop waits for each answer, so on a
+        // slow runner no call task is still in flight when the timer ends the run.
+        for id in 1..=CALLS {
+            if begun.elapsed() > SEND_DEADLINE {
+                break;
+            }
+            w.send(&call_frame(id))?;
+            fake_sent.store(id, Ordering::SeqCst);
+            let started = Instant::now();
+            while u64::from(seen.completed()) < id {
+                if w.observed.is_killed() || started.elapsed() > WAIT_BOUND {
+                    return w.until_killed();
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        w.until_killed()
+    });
+    let base = live();
+    let (outcome, held) = measure(|| {
+        run_to_end(
+            &rt,
+            &spawner,
+            limits_with(|l| l.timeout_s = 2),
+            sink.clone(),
+        )
+    });
+    let left = live() - base;
+    let outcome = outcome?;
+    assert_eq!(outcome.host, HostVerdict::Limit("timeout_s"));
+    // The answers were queued (the first one blocks the writer on the full pipe, the rest wait):
+    // at least one whole answer, more than the slack below, was held while the run lasted. Checked
+    // first, so a run that was too slow reports that and not a leak.
+    let sent = sent.load(Ordering::SeqCst);
+    assert!(sent >= 2, "only {sent} calls were sent before the timer");
+    assert!(
+        held >= (sent as usize - 1) * ANSWER,
+        "the host held {held} bytes at most for {sent} answers, so they were never queued"
+    );
+    assert!(
+        left <= CASE_LEAK_SLACK as isize,
+        "the run's outcome is out while {left} bytes of it are still on the heap"
+    );
+    observed.wait_finished()?;
+    Ok(())
+}
+
 /// T7 hand-off (T3 re-review N-b): frames sent by `toJSON` / `describe` getters can precede the
 /// terminal frame, and a call may still be unanswered when the terminal arrives: all of it is
 /// accepted, the run ends with the result.

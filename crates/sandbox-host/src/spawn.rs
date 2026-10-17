@@ -85,10 +85,9 @@ pub trait WorkerProcess {
     /// The default is `Unsupported`: only the real spawners split (the probe
     /// runner's fakes do not need to). Every real process type must override
     /// it: a script run on a type that inherits the default fails with
-    /// `StartRunError::Spawn(Unsupported)`. Requirement for M8 T11: the
-    /// degraded Windows process type overrides `into_parts` (as
-    /// `WindowsProcess` does), and a `sandbox_runs` test splits a degraded
-    /// worker through `Box<dyn WorkerProcess>`.
+    /// `StartRunError::Spawn(Unsupported)`. The Windows degraded spawner (M8
+    /// T11) returns a `WindowsProcess` too, and its `sandbox_runs` test runs a
+    /// script over a degraded worker through `Box<dyn WorkerProcess>`.
     fn into_parts(self: Box<Self>) -> io::Result<WorkerParts> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
@@ -98,8 +97,9 @@ pub trait WorkerProcess {
     /// watchdog. The bridge takes it once, before [`WorkerProcess::into_parts`].
     ///
     /// The default is `None`: Linux needs none (`RLIMIT_AS` makes the worker
-    /// exit `EXIT_PROCESS_LIMIT`, R3), nor do the fakes. Requirement for M8 T11:
-    /// the degraded Windows process type overrides it like `WindowsProcess`.
+    /// exit `EXIT_PROCESS_LIMIT`, R3), nor do the fakes. The Windows degraded
+    /// spawner (M8 T11) returns a `WindowsProcess` in the floor's job, so its
+    /// workers have the same watch.
     fn memory_watch(&mut self) -> io::Result<Option<Box<dyn MemoryWatch>>> {
         Ok(None)
     }

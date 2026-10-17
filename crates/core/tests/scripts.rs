@@ -1943,9 +1943,114 @@ async fn queued_run_spawn_time_app_upgraded_goes_to_release() -> TestResult {
             .as_ref()
             .is_some_and(|s| s.preselect_error_class_only)
     );
+    // Released under the pre-selected preset: exit 8, only the class (review M-5).
+    h.approver()
+        .release_redacted(
+            &third,
+            vec![atlas_duck_core::RedactionOp::Preset(
+                atlas_duck_core::RedactionPreset::ErrorClassOnly,
+            )],
+        )
+        .map_err(de)?;
+    let env = h.await_(&third, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    assert_eq!(exit(&env), 8);
+    assert!(env.redacted);
+    let data = env.data.clone().ok_or("no data")?;
+    assert_eq!(
+        data["script_error"],
+        json!({ "class": "sandbox_unavailable" })
+    );
     for id in [&first, &second] {
         let _ = h.await_(id, 100).await;
     }
+    Ok(())
+}
+
+/// A queued run whose `start` refuses for the floor (non-direct, the cause from `start`): a
+/// release item with the generic sandbox message, the cause kept in the record (review M-5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_run_spawn_time_floor_not_met_goes_to_release() -> TestResult {
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(1500);
+    let (h, runner) = harness(vec![
+        hold(),
+        hold(),
+        ScriptPlan::new(Vec::new(), result_end(json!(1))),
+    ])
+    .await?;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("both slots", || runner.starts() == 2).await?;
+    runner.fail_start(unavailable(UnavailableReason::FloorNotMet));
+    let third = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&third, 30_000).await.ok_or("third never queued")?;
+    let st = h.status(&third).await;
+    assert_eq!(st.status, Status::Pending);
+    assert_eq!(st.error, None);
+    let failed = record(&h, &third, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "sandbox_unavailable");
+    assert_eq!(failed["details"], json!({ "reason": "floor_not_met" }));
+    assert_eq!(failed["queued"], true);
+    assert_eq!(failed["dispatched"], false);
+    assert_eq!(failed["direct"], false);
+    assert_eq!(failed["candidate"]["class"], "sandbox_unavailable");
+    assert_eq!(
+        failed["candidate"]["message"],
+        "scripts are not available: the sandbox cannot be started on this system"
+    );
+    assert!(
+        h.engine()
+            .entry(&third)
+            .ok_or("no entry")?
+            .state()
+            .script
+            .as_ref()
+            .is_some_and(|s| s.preselect_error_class_only)
+    );
+    for id in [&first, &second] {
+        let _ = h.await_(id, 100).await;
+    }
+    Ok(())
+}
+
+/// A dry run whose compile check finds no sandbox: a direct `SCRIPT_FAILED sandbox_unavailable`,
+/// never a `SCRIPT_DRY_RUN` outcome, and the dry-pool permit is freed (review M-5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dry_run_compile_unavailable_is_direct_sandbox_unavailable() -> TestResult {
+    let unavailable_compile = || {
+        ScriptPlan::compile_failure(CompileFailure::Unavailable(unavailable(
+            UnavailableReason::SpawnFailed,
+        )))
+    };
+    // More failures than the dry pool has permits (2): a leaked permit would starve the last run.
+    let (h, runner) = harness(vec![
+        unavailable_compile(),
+        unavailable_compile(),
+        unavailable_compile(),
+        ScriptPlan::new(Vec::new(), result_end(json!(7))),
+    ])
+    .await?;
+    for _ in 0..3 {
+        let id = submit(&h, json!({ "source": SRC, "dry_run": true })).await?;
+        let env = h.await_(&id, 5000).await;
+        assert_unavailable(&env, false);
+        assert_eq!(
+            h.event_types(&id).await?,
+            [
+                EventType::REQUEST_RECEIVED,
+                EventType::SCRIPT_FAILED,
+                EventType::DELIVERED
+            ]
+        );
+        let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+        assert_eq!(failed["reason"], "sandbox_unavailable");
+        assert_eq!(failed["direct"], true);
+        assert_eq!(failed["details"], json!({ "reason": "spawn_failed" }));
+    }
+    let id = submit(&h, json!({ "source": SRC, "dry_run": true })).await?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    assert_eq!(runner.starts(), 1);
     Ok(())
 }
 
@@ -1981,11 +2086,13 @@ async fn degraded_policy_passed_to_runner() -> TestResult {
         allow_degraded_scripts: Some(degraded.clone()),
         ..TestHooks::none()
     };
+    let available_hold = pause();
     let (h, runner) = harness_with(
         vec![
             ScriptPlan::new(Vec::new(), result_end(json!(1))),
             ScriptPlan::new(Vec::new(), result_end(json!(2)))
                 .with_compile_pause(compile_hold.clone()),
+            ScriptPlan::new(Vec::new(), result_end(json!(3))),
         ],
         hooks,
         FaultPlan::new(),
@@ -1997,26 +2104,186 @@ async fn degraded_policy_passed_to_runner() -> TestResult {
     let off = RunPolicy {
         allow_degraded: false,
     };
-    // The toggle on: every step that checks or spawns gets it.
+    // The toggle on: every step that checks, states the confinement or spawns gets it.
     let first = submit(&h, json!({ "source": SRC })).await?;
     h.queued(&first, 20_000).await.ok_or("never queued")?;
     assert_eq!(
         runner.policies(),
-        [("available", on), ("compile", on), ("start", on)]
+        [
+            ("available", on),
+            ("compile", on),
+            ("confinement", on),
+            ("start", on)
+        ]
     );
     assert_eq!(runner.specs()[0].policy, on);
-    // Revoked while the second run compiles: its spawn reads the new value (never captured at
-    // submit, PD-141).
+    // Revoked while the second run compiles: its slot-time read sees the new value (never
+    // captured at submit, PD-141).
     let second = submit(&h, json!({ "source": SRC })).await?;
     compile_hold.reached.notified().await;
     degraded.store(false, Ordering::SeqCst);
     compile_hold.release.notify_one();
     h.queued(&second, 20_000).await.ok_or("never queued")?;
     assert_eq!(
-        runner.policies()[3..],
-        [("available", on), ("compile", on), ("start", off)]
+        runner.policies()[4..],
+        [
+            ("available", on),
+            ("compile", on),
+            ("confinement", off),
+            ("start", off)
+        ]
     );
     assert_eq!(runner.specs()[1].policy, off);
+    // Revoked while the third run's availability check runs: the compile check reads it anew.
+    degraded.store(true, Ordering::SeqCst);
+    runner.pause_available(Some(available_hold.clone()));
+    let third = submit(&h, json!({ "source": SRC })).await?;
+    available_hold.reached.notified().await;
+    degraded.store(false, Ordering::SeqCst);
+    runner.pause_available(None);
+    available_hold.release.notify_one();
+    h.queued(&third, 20_000).await.ok_or("never queued")?;
+    assert_eq!(
+        runner.policies()[8..],
+        [
+            ("available", on),
+            ("compile", off),
+            ("confinement", off),
+            ("start", off)
+        ]
+    );
+    Ok(())
+}
+
+/// The compile check's policy is read once a dry-pool permit is held, not before the wait for
+/// one (review M-2): a revocation while a real and a dry run wait for the pool reaches both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_policy_is_read_after_the_dry_pool_wait() -> TestResult {
+    let degraded = Arc::new(AtomicBool::new(true));
+    let (a, b) = (pause(), pause());
+    let hooks = TestHooks {
+        allow_degraded_scripts: Some(degraded.clone()),
+        ..TestHooks::none()
+    };
+    let (h, runner) = harness_with(
+        vec![
+            ScriptPlan::new(Vec::new(), result_end(json!(1))).with_compile_pause(a.clone()),
+            ScriptPlan::new(Vec::new(), result_end(json!(2))).with_compile_pause(b.clone()),
+            ScriptPlan::new(Vec::new(), result_end(json!(3))),
+            ScriptPlan::new(Vec::new(), result_end(json!(4))),
+        ],
+        hooks,
+        FaultPlan::new(),
+    )
+    .await?;
+    let on = RunPolicy {
+        allow_degraded: true,
+    };
+    let off = RunPolicy {
+        allow_degraded: false,
+    };
+    // Both dry-pool permits are held by paused compile checks.
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    a.reached.notified().await;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    b.reached.notified().await;
+    let third = submit(&h, json!({ "source": SRC })).await?;
+    let fourth = submit(&h, json!({ "source": SRC, "dry_run": true })).await?;
+    wait_for("both availability checks", || {
+        runner.availability_checks() == 4
+    })
+    .await?;
+    // Both now wait for a permit; the setting is revoked meanwhile.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    degraded.store(false, Ordering::SeqCst);
+    a.release.notify_one();
+    b.release.notify_one();
+    for id in [&first, &second, &third] {
+        h.queued(id, 20_000).await.ok_or("never queued")?;
+    }
+    let env = h.await_(&fourth, 5000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let compiles: Vec<RunPolicy> = runner
+        .policies()
+        .into_iter()
+        .filter(|(step, _)| *step == "compile")
+        .map(|(_, p)| p)
+        .collect();
+    assert_eq!(compiles, [on, on, off, off]);
+    Ok(())
+}
+
+/// `check_available` holds no dry-pool permit (review M-1): with both permits held by paused
+/// compile checks, an unavailable sandbox still answers a real and a dry run at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_availability_check_holds_no_dry_pool_permit() -> TestResult {
+    let (a, b) = (pause(), pause());
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).with_compile_pause(a.clone()),
+        ScriptPlan::new(Vec::new(), result_end(json!(2))).with_compile_pause(b.clone()),
+    ])
+    .await?;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    a.reached.notified().await;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    b.reached.notified().await;
+    runner.fail_available(unavailable(UnavailableReason::ProbePending));
+    for params in [
+        json!({ "source": SRC }),
+        json!({ "source": SRC, "dry_run": true }),
+    ] {
+        let id = submit(&h, params).await?;
+        let env = h.await_(&id, 5000).await;
+        assert_unavailable(&env, false);
+        assert_eq!(
+            h.event_types(&id).await?,
+            [
+                EventType::REQUEST_RECEIVED,
+                EventType::SCRIPT_FAILED,
+                EventType::DELIVERED
+            ]
+        );
+        let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+        assert_eq!(failed["details"], json!({ "reason": "probe_pending" }));
+    }
+    assert_eq!(runner.compile_checks(), 2);
+    a.release.notify_one();
+    b.release.notify_one();
+    for id in [&first, &second] {
+        h.queued(id, 20_000).await.ok_or("never queued")?;
+    }
+    Ok(())
+}
+
+/// A cancel during `check_available` ends the request; no compile worker is spawned for it
+/// afterwards (review M-3). The dry pool is free, so an unbiased wait for a permit would race
+/// the end: the scenario repeats to make that race show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_the_availability_check_never_compiles() -> TestResult {
+    let hold = pause();
+    let (h, runner) = harness(Vec::new()).await?;
+    runner.pause_available(Some(hold.clone()));
+    for _ in 0..10 {
+        for params in [
+            json!({ "source": SRC }),
+            json!({ "source": SRC, "dry_run": true }),
+        ] {
+            let id = submit(&h, params).await?;
+            hold.reached.notified().await;
+            let env = h.handler().cancel(&id).await;
+            assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+            hold.release.notify_one();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert_eq!(
+                h.event_types(&id).await?,
+                [EventType::REQUEST_RECEIVED, EventType::CANCELLED]
+            );
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(runner.availability_checks(), 20);
+    assert_eq!(runner.compile_checks(), 0, "a compile for an ended request");
+    assert_eq!(runner.starts(), 0);
     Ok(())
 }
 
@@ -2042,17 +2309,19 @@ async fn script_started_records_confinement() -> TestResult {
     runner.set_confinement(Some(RunConfinement {
         mode: ConfinementMode::Degraded,
         worker_version: "0.8.0+abc".to_owned(),
-        report: confinement_report(),
+        probe_report: confinement_report(),
     }));
     let id = submit(&h, json!({ "source": SRC })).await?;
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     let started = record(&h, &id, EventType::SCRIPT_STARTED).await?;
+    // The report is the startup probe's, and the key says so (review I-1): the worker's own
+    // ready-frame report does not exist yet when the run is admitted.
     assert_eq!(
         started["confinement"],
         json!({
             "mode": "degraded",
             "worker_version": "0.8.0+abc",
-            "report": serde_json::to_value(confinement_report())?,
+            "probe_report": serde_json::to_value(confinement_report())?,
         })
     );
     // A runner that states nothing: the key is absent, never invented.
@@ -2429,7 +2698,7 @@ async fn degraded_toggle_changed_before_script_started_only_narrows_the_spawn() 
     runner.set_confinement(Some(RunConfinement {
         mode: ConfinementMode::Degraded,
         worker_version: "0.8.0+abc".to_owned(),
-        report: confinement_report(),
+        probe_report: confinement_report(),
     }));
 
     // Revoked: the slot is taken with the toggle on, the off commits before `SCRIPT_STARTED`.
