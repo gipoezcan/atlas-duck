@@ -4,12 +4,14 @@
 //! AppContainer when every file has the `S-1-15-2-2` ACE), inside a job object
 //! (`ACTIVE_PROCESS = 1`, `KILL_ON_JOB_CLOSE`, `DIE_ON_UNHANDLED_EXCEPTION`,
 //! process memory limit, `UILIMIT_ALL`), with exactly three inherited handles
-//! (its stdio pipes). There is no fallback to a lockdown token here: if the
-//! AppContainer cannot be used the spawn fails and the floor is not met (the
-//! degraded path is M8).
+//! (its stdio pipes). There is no fallback to a lockdown token in this
+//! spawner: if the AppContainer cannot be used the spawn fails and the floor is
+//! not met. The degraded path below the floor is a spawner of its own
+//! ([`DegradedSpawner`], M8 Task 11: lockdown token + the same job object).
 
 mod aces;
 mod appcontainer;
+mod degraded;
 mod job;
 mod jobport;
 mod pipes;
@@ -24,6 +26,10 @@ pub use aces::{
     pe_import_names, worker_ace_files, worker_ace_files_for_exe,
 };
 pub use appcontainer::delete_appcontainer_profile;
+pub use degraded::{
+    DegradedSpawner, LOW_INTEGRITY, LockdownState, NULL_SID, ThreadToken, UNTRUSTED_INTEGRITY,
+    lockdown_state,
+};
 pub use job::{JobLimits, JobSnapshot};
 pub use spawner::{WindowsProcess, WindowsSpawner};
 

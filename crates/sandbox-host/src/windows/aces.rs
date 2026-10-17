@@ -69,10 +69,10 @@ pub enum AceEnsure {
 }
 
 /// A SID parsed from its string form, freed with `LocalFree`.
-struct LocalSid(PSID);
+pub(super) struct LocalSid(PSID);
 
 impl LocalSid {
-    fn parse(s: &str) -> io::Result<Self> {
+    pub(super) fn parse(s: &str) -> io::Result<Self> {
         let w = wide(std::ffi::OsStr::new(s));
         let mut sid: PSID = null_mut();
         // SAFETY: `w` is NUL-terminated and `sid` is a valid out-pointer.
@@ -80,6 +80,11 @@ impl LocalSid {
             return Err(io::Error::last_os_error());
         }
         Ok(Self(sid))
+    }
+
+    /// The SID, valid while `self` lives.
+    pub(super) fn psid(&self) -> PSID {
+        self.0
     }
 }
 

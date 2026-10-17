@@ -20,3 +20,9 @@ pub const MAX_FRAME_BYTES: usize = 24 * 1024 * 1024;
 /// §3.4: "worker→host frames ≤ 1 MiB". The terminal-frame exception
 /// (`max_result_mb` + 64 KiB) is [`script::terminal_frame_max`].
 pub const WORKER_FRAME_MAX_BYTES: usize = 1024 * 1024;
+
+/// The one command-line argument of a worker that the Windows degraded spawner started (§9.4,
+/// plan M8 Task 11): its process token is the lockdown token and its main thread starts with an
+/// impersonation token that the worker drops before `probe.ready`. The worker learns its mode
+/// only from how it was started, never from a host frame.
+pub const LOCKDOWN_TOKEN_ARG: &str = "--lockdown-token";

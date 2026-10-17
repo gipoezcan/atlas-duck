@@ -1,7 +1,11 @@
 //! OS confinement of the worker (§9.4). `apply` is called by `run()` on the
 //! worker's main thread before the first stdin read. T17 fills Linux; T18
-//! (macOS) and T19 (Windows) add their arms.
+//! (macOS) and T19 (Windows) add their arms. M8 Task 11 adds the Windows
+//! degraded start ([`StartMode`], [`apply_mode`]).
 
+use std::ffi::OsString;
+
+use atlas_duck_ipc::sandbox::LOCKDOWN_TOKEN_ARG;
 use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 
 #[cfg(target_os = "linux")]
@@ -33,6 +37,48 @@ impl std::fmt::Display for ConfineError {
 }
 
 impl std::error::Error for ConfineError {}
+
+/// The mechanism a worker started by the Windows degraded spawner reports (§9.4, plan M8 Task 11).
+pub const LOCKDOWN_TOKEN: &str = "lockdown_token";
+
+/// How the spawner started the worker (plan M8 Task 11). Read from the command line only, never
+/// from a host frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartMode {
+    /// The OS confinement of [`apply`].
+    Default,
+    /// Windows degraded path (§9.4): a lockdown process token, and a startup impersonation token
+    /// on the main thread that the worker drops before its first frame ([`apply_mode`]).
+    LockdownToken,
+}
+
+impl StartMode {
+    /// The mode for the process arguments after the program name: exactly
+    /// [`LOCKDOWN_TOKEN_ARG`] is [`StartMode::LockdownToken`], anything else (no argument, other
+    /// or more arguments) [`StartMode::Default`].
+    pub fn from_args<I: IntoIterator<Item = OsString>>(args: I) -> StartMode {
+        let mut args = args.into_iter();
+        match (args.next(), args.next()) {
+            (Some(only), None) if only == LOCKDOWN_TOKEN_ARG => StartMode::LockdownToken,
+            _ => StartMode::Default,
+        }
+    }
+}
+
+/// The report of a worker in [`StartMode::LockdownToken`]: below the floor (§9.4), so `applied`
+/// is always false, whatever the token steps found. `os_error` is the error of a step that did
+/// not find what the degraded spawner sets up (for example no startup impersonation token).
+pub fn lockdown_token_report(os_error: Option<i64>) -> ConfinementReport {
+    ConfinementReport {
+        applied: false,
+        mechanism: LOCKDOWN_TOKEN.to_owned(),
+        no_new_privs: None,
+        landlock_abi: None,
+        seccomp: None,
+        lpac: None,
+        os_error,
+    }
+}
 
 /// The report of a worker that applied nothing.
 pub fn unconfined() -> ConfinementReport {
@@ -75,5 +121,76 @@ pub fn apply() -> Result<ConfinementReport, ConfineError> {
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         Ok(unconfined())
+    }
+}
+
+/// [`apply`] for the mode the worker was started in.
+///
+/// [`StartMode::LockdownToken`] on Windows (§9.4 degraded, plan M8 Task 11): the main thread
+/// still runs on the startup impersonation token the degraded spawner gave it, so that the loader
+/// could open the worker's DLLs. This loads what Rust loads lazily, drops that token with
+/// `RevertToSelf` and checks that the thread no longer impersonates; from then on the worker runs
+/// on its lockdown process token. `Err` means the thread may still impersonate: the worker must
+/// exit without writing a frame or reading stdin. On the other OSes the argument means nothing
+/// and the mode is [`apply`].
+pub fn apply_mode(mode: StartMode) -> Result<ConfinementReport, ConfineError> {
+    match mode {
+        StartMode::Default => apply(),
+        #[cfg(windows)]
+        StartMode::LockdownToken => windows::drop_startup_token(),
+        #[cfg(not(windows))]
+        StartMode::LockdownToken => apply(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn only_the_lockdown_argument_alone_selects_the_lockdown_mode() {
+        assert_eq!(
+            StartMode::from_args(args(&[LOCKDOWN_TOKEN_ARG])),
+            StartMode::LockdownToken
+        );
+        assert_eq!(StartMode::from_args(args(&[])), StartMode::Default);
+        assert_eq!(
+            StartMode::from_args(args(&["--lockdown"])),
+            StartMode::Default
+        );
+        assert_eq!(
+            StartMode::from_args(args(&[LOCKDOWN_TOKEN_ARG, "x"])),
+            StartMode::Default
+        );
+        assert_eq!(
+            StartMode::from_args(args(&["x", LOCKDOWN_TOKEN_ARG])),
+            StartMode::Default
+        );
+    }
+
+    #[test]
+    fn degraded_report_names_lockdown_token_not_applied() {
+        let report = lockdown_token_report(None);
+        assert_eq!(
+            report,
+            ConfinementReport {
+                applied: false,
+                mechanism: "lockdown_token".to_owned(),
+                no_new_privs: None,
+                landlock_abi: None,
+                seccomp: None,
+                lpac: None,
+                os_error: None,
+            }
+        );
+        // A step that found something else is evidence, never "applied".
+        let report = lockdown_token_report(Some(1008));
+        assert!(!report.applied);
+        assert_eq!(report.mechanism, LOCKDOWN_TOKEN);
+        assert_eq!(report.os_error, Some(1008));
     }
 }
