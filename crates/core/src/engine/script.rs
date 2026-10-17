@@ -2698,9 +2698,9 @@ impl Engine {
         shared.is_some_and(|s| s.request_kill(KillReason::User))
     }
 
-    /// The run policy (Δ3, PD-141), read immediately before each use and never cached. Task 15
-    /// sources it from the audit-authoritative "Allow scripts with degraded confinement" setting;
-    /// until then degraded confinement is never allowed.
+    /// The run policy (Δ3, PD-141), read immediately before each use and never cached: the
+    /// audit-authoritative "Allow scripts with degraded confinement" setting as the store's view
+    /// holds it now (L32; off while that view could not be rebuilt from the log).
     pub fn script_policy(&self) -> RunPolicy {
         #[cfg(feature = "testing")]
         if let Some(flag) = &self.hooks.allow_degraded_scripts {
@@ -2708,7 +2708,9 @@ impl Engine {
                 allow_degraded: flag.load(std::sync::atomic::Ordering::SeqCst),
             };
         }
-        RunPolicy::default()
+        RunPolicy {
+            allow_degraded: self.port().settings().allow_degraded_scripts,
+        }
     }
 }
 

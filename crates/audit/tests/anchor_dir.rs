@@ -568,6 +568,60 @@ fn immediate_line_event_type_mismatch() {
     assert!(full_verify_fresh(&f).is_empty());
 }
 
+/// M8 T15 (PD-141, Δ7, §8.5, §13): the degraded toggle's `CONFIG_CHANGED` is an audit-policy
+/// record, so it is on the one policy-key list the M10 writer uses to pick its immediate lines
+/// (PD-157), and its immediate line is checked like the other policy keys' lines.
+#[test]
+fn degraded_toggle_writes_immediate_anchor_line() {
+    let (store, f, dir) = anchored_store();
+    corroborate(&store);
+    let on = store
+        .apply_setting(SettingChange::AllowDegradedScripts(true), Some(confirmed()))
+        .expect("on");
+    let off = store
+        .apply_setting(SettingChange::AllowDegradedScripts(false), None)
+        .expect("off");
+    store.append_batch(mixed(3)).expect("append");
+    for c in [&on, &off] {
+        let p: serde_json::Value =
+            serde_json::from_slice(&store.read_payload(c.seq).expect("read_payload"))
+                .expect("json");
+        let key = p["key"].as_str().expect("key");
+        assert_eq!(key, "allow_degraded_scripts");
+        assert!(
+            atlas_duck_audit::is_policy_key(key),
+            "an immediate-line key"
+        );
+    }
+    store.shutdown();
+    let rows = dump_rows(&f);
+    let on_row = rows.iter().find(|r| r.seq == on.seq).expect("row");
+    let off_row = rows.iter().find(|r| r.seq == off.seq).expect("row");
+    write_lines(
+        dir.path(),
+        &f.chain_id,
+        &[header(&f), immediate_line(on_row), immediate_line(off_row)],
+    );
+    let fs = full_verify_fresh(&f);
+    assert!(fs.is_empty(), "{fs:?}");
+
+    // A line that names the toggle's record with another record_hash, or as another event type,
+    // contradicts the store.
+    let mut rehashed = immediate_line(on_row);
+    if let AnchorLine::Immediate { record_hash, .. } = &mut rehashed {
+        record_hash[0] ^= 1;
+    }
+    let mut retyped = immediate_line(off_row);
+    if let AnchorLine::Immediate { event_type, .. } = &mut retyped {
+        *event_type = "LEGAL_HOLD_CHANGED".into();
+    }
+    write_lines(dir.path(), &f.chain_id, &[header(&f), rehashed, retyped]);
+    let fs = full_verify_fresh(&f);
+    assert!(has(&fs, FindingKind::AnchorDirMismatch, on.seq), "{fs:?}");
+    assert!(has(&fs, FindingKind::AnchorDirMismatch, off.seq), "{fs:?}");
+    assert_eq!(anchor_dir_findings(&fs).len(), 2, "{fs:?}");
+}
+
 #[test]
 fn record_line_must_match_flag_and_chain() {
     let (store, f, dir) = anchored_store();

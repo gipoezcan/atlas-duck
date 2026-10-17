@@ -190,7 +190,8 @@ pub struct TestHooks {
     /// M-14: a change made meanwhile must survive the swap).
     pub pause_in_reload: Option<Arc<Pause>>,
     /// Replaces the "Allow scripts with degraded confinement" source of the run policy (Δ3,
-    /// PD-141): read at each use, so a test can flip it while a run waits.
+    /// PD-141; the audit settings otherwise): read at each use, so a test can flip it while a run
+    /// waits.
     pub allow_degraded_scripts: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -464,8 +465,9 @@ impl Core {
     }
 
     /// The script run policy (Δ3, PD-141) as it is now: core reads it before each runner call
-    /// (`check_available`, the compile check, the real-slot acquisition). Task 15 sources it from
-    /// `SettingsView.allow_degraded_scripts`; until then it is off.
+    /// (`check_available`, the compile check, the real-slot acquisition). `allow_degraded` is the
+    /// audit-authoritative `SettingsView.allow_degraded_scripts` (Δ7), read from the store's view
+    /// at each call.
     pub fn script_policy(&self) -> RunPolicy {
         self.engine.script_policy()
     }

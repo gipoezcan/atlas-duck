@@ -867,10 +867,12 @@ impl Writer {
         let mut st = WriterState::new(parts, ClockState::from_head(epoch, ts, flags), head);
         st.settings = view.clone();
         st.settings_trusted = trusted;
-        // An untrusted view is published without instance policy: nothing counts as confirmed.
+        // An untrusted view is published without instance policy: nothing counts as confirmed;
+        // nor is a security-weakening grant read from it (PD-141: degraded scripts stay off).
         let mut published = view.clone();
         if !trusted {
             published.instances.clear();
+            published.allow_degraded_scripts = false;
         }
         *lock(&st.shared.settings) = published;
         st.shared

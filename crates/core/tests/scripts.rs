@@ -20,7 +20,7 @@ use atlas_duck_core::testing::{
 };
 use atlas_duck_core::{
     BatchItem, CompileFailure, ConfinementMode, Confirm, HostCalls, KillReason, Pause,
-    RunConfinement, RunEnd, RunPolicy, RunnerError, TestHooks, UnavailableReason,
+    RunConfinement, RunEnd, RunPolicy, RunnerError, SettingChangeReq, TestHooks, UnavailableReason,
 };
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::sandbox::probe::ConfinementReport;
@@ -2067,6 +2067,94 @@ async fn worker_reported_limit_never_direct_when_dispatched() -> TestResult {
                 .as_ref()
                 .is_some_and(|s| s.preselect_error_class_only)
         );
+    }
+    Ok(())
+}
+
+// ---- M8 Task 15: the degraded toggle is read when the run's slot is taken (PD-141) ----------
+
+/// The "Allow scripts with degraded confinement" setting through Settings (on: the native
+/// confirmation is answered OK).
+async fn set_degraded(h: &Harness, on: bool) -> TestResult {
+    if on {
+        h.confirmer().push(Confirm::Ok);
+    }
+    let s = h.core().settings();
+    tokio::task::spawn_blocking(move || s.apply(vec![SettingChangeReq::AllowDegradedScripts(on)]))
+        .await?
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(())
+}
+
+/// The policies one kind of runner call was handed, in call order.
+fn policies_of(runner: &FakeScriptRunner, call: &str) -> Vec<bool> {
+    runner
+        .policies()
+        .into_iter()
+        .filter(|(c, _)| *c == call)
+        .map(|(_, p)| p.allow_degraded)
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_off_after_submit_refuses_the_queued_spawn() -> TestResult {
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(3000);
+    let (h, runner) = harness(vec![
+        hold(),
+        hold(),
+        ScriptPlan::new(Vec::new(), result_end(json!(3))),
+    ])
+    .await?;
+    // The startup probe said `NotMet`: a worker spawns only under a policy that allows it.
+    runner.require_degraded();
+    set_degraded(&h, true).await?;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("both slots", || runner.starts() == 2).await?;
+    // The third run passes its submit-time checks with the toggle on, then waits for a slot.
+    let third = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the third compile check", || runner.compile_checks() == 3).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !h.event_types(&third)
+            .await?
+            .contains(&EventType::SCRIPT_STARTED),
+        "the third run waits for a slot"
+    );
+    set_degraded(&h, false).await?;
+    // A slot frees: the spawn reads the setting as it is now, not as it was at submit.
+    h.queued(&third, 30_000).await.ok_or("third never queued")?;
+    assert_eq!(policies_of(&runner, "available"), [true, true, true]);
+    assert_eq!(policies_of(&runner, "compile"), [true, true, true]);
+    assert_eq!(policies_of(&runner, "start"), [true, true, false]);
+    assert_eq!(runner.specs()[2].policy, RunPolicy::default());
+    // The spawn-time unavailability of a queued run: through the release flow (§3.4, §9.5).
+    let st = h.status(&third).await;
+    assert_eq!(st.status, Status::Pending);
+    assert_eq!(st.error, None);
+    let started = record(&h, &third, EventType::SCRIPT_STARTED).await?;
+    assert_eq!(started["queued"], true);
+    let failed = record(&h, &third, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "sandbox_unavailable");
+    assert_eq!(failed["details"], json!({ "reason": "floor_not_met" }));
+    assert_eq!(failed["queued"], true);
+    assert_eq!(failed["dispatched"], false);
+    assert_eq!(failed["direct"], false);
+    assert_eq!(failed["candidate"]["class"], "sandbox_unavailable");
+    assert!(h.approver().item(&third).is_some_and(|i| i.approvable));
+    assert!(
+        h.engine()
+            .entry(&third)
+            .ok_or("no entry")?
+            .state()
+            .script
+            .as_ref()
+            .is_some_and(|s| s.preselect_error_class_only)
+    );
+    // The runs that spawned while it was on are unaffected.
+    for id in [&first, &second] {
+        h.queued(id, 30_000).await.ok_or("never queued")?;
+        assert!(record(&h, id, EventType::SCRIPT_FINISHED).await.is_ok());
     }
     Ok(())
 }

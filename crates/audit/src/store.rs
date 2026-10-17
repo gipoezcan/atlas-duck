@@ -629,13 +629,14 @@ impl Store {
         }
     }
 
-    /// The audit-authoritative settings (C.3): retention, legal hold, anchor directory and the
-    /// per-instance policy, from the log (see `settings.rs`). A store exists only with its KEK,
-    /// so nothing reads them while locked.
+    /// The audit-authoritative settings (C.3): retention, legal hold, anchor directory, the
+    /// per-instance policy and the degraded-scripts toggle, from the log (see `settings.rs`). A
+    /// store exists only with its KEK, so nothing reads them while locked.
     ///
     /// While `health().settings_unreadable` is set (a settings row of the log could not be
-    /// read) the instance policy is withheld (`instances` empty: nothing is confirmed) and the
-    /// rest is best effort; prune and setting changes are refused then.
+    /// read) the instance policy is withheld (`instances` empty: nothing is confirmed), the
+    /// degraded-scripts toggle reads off, and the rest is best effort; prune and setting changes
+    /// are refused then.
     pub fn settings(&self) -> Settings {
         lock(&self.inner.shared.settings).clone()
     }
@@ -643,7 +644,8 @@ impl Store {
     /// One settings change (C.3, §8.8, §10.3), logged as `CONFIG_CHANGED` /
     /// `LEGAL_HOLD_CHANGED {source: "app"}` with the confirmation's dialog hash. Needs
     /// `Some(Confirmed)`: a lower retention, lifting the legal hold, any anchor directory or
-    /// instance origin change, setting or changing a CA fingerprint. Without it:
+    /// instance origin change, setting or changing a CA fingerprint, allowing degraded script
+    /// confinement. Without it:
     /// `NeedsConfirmation(<what>)` and nothing is logged. `Invalid`: retention below 92, an
     /// empty value, or a value the setting already has.
     pub fn apply_setting(
