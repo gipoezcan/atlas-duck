@@ -26,8 +26,9 @@ pub const PREVIEW_BUILDER_VERSION: &str =
 /// Each `renderN` with the FNV-1a 64 digest of what it renders: the goldens in
 /// `tests/golden/render` and `app/ui/public/preview.css` (`tests/render.rs` recomputes it and
 /// fails on a mismatch, T10 review M-8). When the document's output or the stylesheet changes,
-/// bump `renderN` in [`PREVIEW_BUILDER_VERSION`] and APPEND its pair here; never edit an entry.
-/// The last entry is the current version.
+/// bump `renderN` in [`PREVIEW_BUILDER_VERSION`] and APPEND its pair here; never edit an entry
+/// (an entry no merged branch carries yet may be re-pinned in place by lead ruling, as render4
+/// was in M7). The last entry is the current version.
 #[doc(hidden)]
 pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     ("render1", 0x50e0_b962_fa25_e8fa),

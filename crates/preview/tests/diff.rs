@@ -314,6 +314,42 @@ fn line_diff_lines_keeps_the_projection() {
     }
 }
 
+/// M7 T15 review m-4: storage-sized middles (4 MiB a side) of long lines that share all but
+/// their last bytes. The search compares interned line ids, not the line text, so its cost does
+/// not grow with the line length (measured on the dev profile: the text comparisons took about
+/// 170 ms for the first case, the ids about 30 ms); the script is still the minimal,
+/// byte-faithful one.
+/// - 1 000 lines a side, each differing from every line of the other side only after a common
+///   4 000-byte run: an edit distance of exactly the search bound, every step of the search a
+///   mismatch over the whole run.
+/// - long equal lines, one side 1 990 lines shorter and both framed by a line the other lacks
+///   (neither the prefix nor the suffix cut takes them): a snake over almost the whole middle.
+#[test]
+fn line_diff_long_equal_lines_stay_fast() {
+    let run = "x".repeat(4_000);
+    let old: String = (0..1_000).map(|i| format!("{run}a{i}\n")).collect();
+    let new: String = (0..1_000).map(|i| format!("{run}b{i}\n")).collect();
+    let started = std::time::Instant::now();
+    let out = line_diff(&old, &new);
+    let took = started.elapsed();
+    assert!(!out.truncated);
+    assert_eq!(check_script(&old, &new, &out.lines), 2_000);
+    assert!(took < std::time::Duration::from_millis(100), "{took:?}");
+
+    let line = format!("{}\n", "x".repeat(199));
+    let side = |head: &str, n: usize, tail: &str| format!("{head}\n{}{tail}\n", line.repeat(n));
+    let (old, new) = (
+        side("old", 19_990, "end old"),
+        side("new", 18_000, "end new"),
+    );
+    let started = std::time::Instant::now();
+    let out = line_diff(&old, &new);
+    let took = started.elapsed();
+    assert!(!out.truncated);
+    assert_eq!(check_script(&old, &new, &out.lines), 1_994);
+    assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+}
+
 #[test]
 fn hunks_counts_runs() {
     assert_eq!(hunks(&[]), 0);
