@@ -1396,6 +1396,17 @@ async fn hash_mismatch_script_takes_no_redaction() -> TestResult {
         ),
         "{res:?}"
     );
+    let invalid = || async {
+        let events = h.events(&id).await?;
+        Ok::<_, TestError>(
+            events
+                .into_iter()
+                .filter(|(t, _)| *t == EventType::DECISION_INVALID)
+                .map(|(_, p)| p)
+                .collect::<Vec<Value>>(),
+        )
+    };
+    let before = invalid().await?.len();
     let res = ap.redact(&id, ops);
     assert!(
         matches!(
@@ -1403,6 +1414,23 @@ async fn hash_mismatch_script_takes_no_redaction() -> TestResult {
             Err(DecisionError::Invalid(InvalidReason::NotApprovable))
         ),
         "{res:?}"
+    );
+    let logged = invalid().await?;
+    assert_eq!(logged.len(), before + 1, "the refused redaction is logged");
+    let last = logged.last().ok_or("no DECISION_INVALID")?;
+    assert_eq!(
+        (
+            &last["reason"],
+            &last["decision"],
+            &last["submitted_rev"],
+            &last["batch"]
+        ),
+        (
+            &json!("not_approvable"),
+            &json!("release"),
+            &json!(rev.counter),
+            &json!(false)
+        )
     );
     assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
     assert!(!ap.item(&id).ok_or("not queued")?.approvable);

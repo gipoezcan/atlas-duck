@@ -556,6 +556,29 @@ fn orphan_at(i: usize) -> BlockReason {
     }
 }
 
+/// The last `DECISION_INVALID` of `id`: a refused (non-batch) release of revision `counter`, not
+/// approvable.
+async fn last_invalid_is_not_approvable(h: &Harness, id: &str, counter: u64) -> TestResult {
+    let logged = records(h, id, EventType::DECISION_INVALID).await?;
+    let last = logged.last().ok_or("no DECISION_INVALID")?;
+    assert_eq!(
+        (
+            &last["reason"],
+            &last["decision"],
+            &last["submitted_rev"],
+            &last["batch"]
+        ),
+        (
+            &json!("not_approvable"),
+            &json!("release"),
+            &json!(counter),
+            &json!(false)
+        ),
+        "{id}"
+    );
+    Ok(())
+}
+
 /// A plain release of `id` is refused as not approvable and nothing is released.
 async fn plain_release_refused(h: &Harness, id: &str) -> TestResult {
     let res = h.approver().release_unopened(id);
@@ -786,6 +809,7 @@ async fn hash_mismatch_release_blocked_stays_deny_only() -> TestResult {
                 invalid + 1,
                 "the refused redaction is logged"
             );
+            last_invalid_is_not_approvable(&h, &id, rev.counter).await?;
             assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
             assert!(!ap.item(&id).ok_or("not queued")?.approvable);
         }
@@ -818,6 +842,8 @@ async fn failed_closed_without_a_mirror_block_takes_no_redaction() -> TestResult
         ),
         "{res:?}"
     );
+    let rev = ap.rev(&id).map_err(de)?;
+    let invalid = records(&h, &id, EventType::DECISION_INVALID).await?.len();
     let res = ap.redact(&id, ops);
     assert!(
         matches!(
@@ -826,6 +852,13 @@ async fn failed_closed_without_a_mirror_block_takes_no_redaction() -> TestResult
         ),
         "{res:?}"
     );
+    assert_eq!(
+        records(&h, &id, EventType::DECISION_INVALID).await?.len(),
+        invalid + 1,
+        "the refused redaction is logged"
+    );
+    last_invalid_is_not_approvable(&h, &id, rev.counter).await?;
+    assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
     assert!(!ap.item(&id).ok_or("not queued")?.approvable);
     Ok(())
 }
@@ -879,10 +912,7 @@ async fn m11_mirror_key_drop_or_mask_collision_is_refused() -> TestResult {
         );
         let logged = records(&h, &id, EventType::DECISION_INVALID).await?;
         assert_eq!(logged.len(), invalid + 1, "the refused redaction is logged");
-        assert_eq!(
-            logged.last().map(|p| (&p["reason"], &p["decision"])),
-            Some((&json!("not_approvable"), &json!("release")))
-        );
+        last_invalid_is_not_approvable(&h, &id, rev.counter).await?;
         assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
         assert!(!ap.item(&id).ok_or("not queued")?.approvable);
         plain_release_refused(&h, &id).await?;
