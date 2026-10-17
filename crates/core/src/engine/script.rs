@@ -1341,8 +1341,13 @@ impl LiveBackend {
     /// An `atlas.all` call answered without a page record (a later page refused or not sent):
     /// its row, there since its first page, takes the answer, under the state lock while the
     /// run is live (the end of the run commits the item under it). A call refused at its first
-    /// page sent nothing and has no row.
+    /// page sent nothing and has no row. A cancellation is the end of the run's to record: the
+    /// row keeps `cancelled_in_flight`, whether the kill came before or after the commit.
     fn answer_row(&self, call_id: u64, result: &HostCallResult) {
+        let cancelled = class_name(ErrorCode::Cancelled);
+        if matches!(result, HostCallResult::Rejected { class, .. } if *class == cancelled) {
+            return;
+        }
         let mut st = self.entry.state();
         if !matches!(st.model.phase(), Phase::Running) {
             return;
