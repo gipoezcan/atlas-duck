@@ -41,7 +41,8 @@ pub enum IdentityPart {
     FileId,
     Size,
     Mtime,
-    /// The binary is gone.
+    /// The binary is gone, or its metadata cannot be read (a transient error, such as a Windows
+    /// sharing violation, also lands here).
     Missing,
     /// The ready frame's `worker_version` differs from the recorded `embedded_version`.
     EmbeddedVersion,
@@ -69,8 +70,9 @@ impl std::error::Error for IdentityMismatch {}
 /// Re-checks the file identity of `path` against `recorded` (§3.4, PD-133): nothing is spawned
 /// from a binary that was replaced, renamed over or removed since the probe.
 ///
-/// A file that cannot be examined at all (gone, or unreadable) is `Missing`: an identity that
-/// cannot be confirmed is a mismatch. The embedded version is not part of this check; the bridge
+/// A file whose metadata cannot be read (gone, or any `stat` error) is `Missing`: an identity
+/// that cannot be confirmed is a mismatch. On Unix an unreadable file still stats, so it fails
+/// later as a spawn error instead. The embedded version is not part of this check; the bridge
 /// compares it with the spawned worker's ready frame.
 pub fn recheck(recorded: &SandboxBinaryIdentity, path: &Path) -> Result<(), IdentityMismatch> {
     let (file_id, size, mtime) = file_identity(path).map_err(|_| IdentityMismatch {
