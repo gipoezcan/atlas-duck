@@ -552,7 +552,8 @@ async fn i21_all_fetch_bytes_reach_max_fetch_mb_rejects() -> TestResult {
 
 /// T13 review m-2: a page's fetch budget is `max_fetch_mb` minus the bytes the run already
 /// fetched. With 600 KiB pages and `max_fetch_mb = 1`, page 1 has 424 KiB left: it is cut inside
-/// the page (its record names the fetch cap) and page 2 is never requested.
+/// the page (its record names the fetch cap, no complete page) and page 2 is never requested.
+/// With the full cap as the budget, page 1 would complete and page 2 be refused between pages.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn all_page_fetch_budget_is_the_cap_minus_the_bytes_fetched() -> TestResult {
     const PAGE: u64 = 600 * 1024;
@@ -584,7 +585,10 @@ async fn all_page_fetch_budget_is_the_cap_minus_the_bytes_fetched() -> TestResul
     assert_eq!(cut["page"], 1);
     assert_eq!(cut["rejection"], "max_fetch_mb", "{cut}");
     assert_eq!(cut["cap_or_budget"], "fetch_cap_50mib", "{cut}");
-    assert!(cut["bytes"].as_u64().is_some_and(|b| b < PAGE), "{cut}");
+    // No complete page. The record counts every byte received, which can be the whole body
+    // when it arrived in one read before the budget check.
+    assert_eq!(cut["outcome"], "too_large", "{cut}");
+    assert_eq!(cut["pages"], 0, "{cut}");
     Ok(())
 }
 
