@@ -45,7 +45,7 @@ use atlas_duck_ipc::sandbox::script::{InstanceInfo, WorkerInit};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_sandbox_host::bridge::{
     self, CompileVerdict, ExpectedWorker, HostCallSink, HostVerdict, KillCause, RunHandleImpl,
-    RunOutcome, StartRunError,
+    RunOutcome, StartRunError, WorkerEnd,
 };
 use atlas_duck_sandbox_host::identity::{self, IdentityPart};
 use atlas_duck_sandbox_host::spawn::{SpawnSpec, WorkerSpawner};
@@ -584,10 +584,28 @@ impl RunHandleGlue {
                 upgraded(&self.update_pending, what, Some(&self.request_id));
             }
         }
-        // One parse of a result up to `max_result_mb`: CPU work, off the runtime threads.
-        tokio::task::spawn_blocking(move || map::to_run_end(outcome))
-            .await
-            .unwrap_or(RunEnd::Crashed)
+        // Only a result needs the one parse (up to `max_result_mb`: CPU work, off the runtime
+        // threads); every other end maps from the host's facts at once (T20 review m-5).
+        if !matches!(
+            (&outcome.host, &outcome.end),
+            (HostVerdict::None, WorkerEnd::Result { .. })
+        ) {
+            return map::to_run_end(outcome);
+        }
+        parsed_end(tokio::task::spawn_blocking(move || map::to_run_end(outcome)).await)
+    }
+}
+
+/// A result's parse as it came back from its blocking task. A task that never ran was cancelled
+/// by the runtime shutting down (the glue never aborts it): the run ends as the shutdown's kill.
+/// A parse that panicked is a crash (a release item).
+fn parsed_end(joined: Result<RunEnd, tokio::task::JoinError>) -> RunEnd {
+    match joined {
+        Ok(end) => end,
+        Err(e) if e.is_cancelled() => RunEnd::Killed {
+            reason: KillReason::Shutdown,
+        },
+        Err(_) => RunEnd::Crashed,
     }
 }
 

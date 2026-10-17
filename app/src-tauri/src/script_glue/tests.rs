@@ -1702,6 +1702,81 @@ async fn dropped_waiter(cap: &Capture) -> TestResult {
     Ok(())
 }
 
+/// T20 review m-5: only a result's parse goes to a blocking thread; an end the host decided maps
+/// at once, also when no blocking thread is free (the runtime shutting down, a busy pool).
+#[test]
+fn glue_wait_maps_a_host_verdict_without_a_blocking_thread() -> TestResult {
+    let rt = one_blocking_thread()?;
+    rt.block_on(async {
+        tokio::time::timeout(TEST_BOUND, host_verdict_without_a_blocking_thread())
+            .await
+            .map_err(|_| "the test body did not finish within its bound")?
+    })
+}
+
+async fn host_verdict_without_a_blocking_thread() -> TestResult {
+    let port = FakePort::new();
+    let g = glue(
+        &port,
+        &worker_file(),
+        Some(report_for(&worker_file(), FloorVerdict::Met)?),
+    );
+    let handle = started(&g, spec(off()), GatedCalls::new()).await?;
+    port.control(0).ok_or("no run")?.finish(outcome(
+        WorkerEnd::None,
+        HostVerdict::Killed(KillCause::Shutdown),
+    ));
+    let pool = occupy_blocking_pool();
+    let end = tokio::time::timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .map_err(|_| "a host-decided end waited for a blocking thread")?;
+    assert_eq!(
+        end,
+        RunEnd::Killed {
+            reason: KillReason::Shutdown
+        }
+    );
+    drop(pool);
+    Ok(())
+}
+
+/// T20 review m-5: a result's parse that never ran because the runtime shut down (its blocking
+/// task cancelled) is the shutdown's kill, not a crash; a parse that panicked is a crash. A
+/// `JoinError` cannot be built by hand: these are a real cancelled and a real panicked task's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn glue_lost_parse_maps_shutdown_to_killed() -> TestResult {
+    bounded(lost_parse_maps_shutdown_to_killed()).await
+}
+
+async fn lost_parse_maps_shutdown_to_killed() -> TestResult {
+    let parsed = RunEnd::Result {
+        value: json!(1),
+        logs: Vec::new(),
+        stderr: String::new(),
+    };
+    assert_eq!(parsed_end(Ok(parsed.clone())), parsed);
+    let cancelled = tokio::spawn(std::future::pending::<RunEnd>());
+    cancelled.abort();
+    let cancelled = cancelled.await.err().ok_or("an aborted task answered")?;
+    assert!(cancelled.is_cancelled());
+    assert_eq!(
+        parsed_end(Err(cancelled)),
+        RunEnd::Killed {
+            reason: KillReason::Shutdown
+        }
+    );
+    let panicked = tokio::spawn(async {
+        let end: RunEnd = std::panic::resume_unwind(Box::new("parse"));
+        end
+    })
+    .await
+    .err()
+    .ok_or("a panicking task answered")?;
+    assert!(panicked.is_panic());
+    assert_eq!(parsed_end(Err(panicked)), RunEnd::Crashed);
+    Ok(())
+}
+
 /// What the logging test runs: a run whose outcome carries worker text and host facts, a spawn
 /// refused for the embedded version, a compile worker that failed to spawn. On one thread, so the
 /// thread's scoped subscriber sees every event.
