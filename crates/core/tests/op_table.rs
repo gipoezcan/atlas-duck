@@ -45,11 +45,10 @@ const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_iss
 
 /// Confluence writes completed in M7 beyond `confluence.page.update` (each task moves its op here
 /// from [`LATER_WRITES`]). Each needs its enrichment verdict before it renders a request.
-const M7_WRITES: [&str; 1] = ["confluence.comment.add"];
+const M7_WRITES: [&str; 2] = ["confluence.page.create", "confluence.comment.add"];
 
 /// No Jira write is left after T18; the Confluence writes land in M7.
-const LATER_WRITES: [&str; 5] = [
-    "confluence.page.create",
+const LATER_WRITES: [&str; 4] = [
     "confluence.page.move",
     "confluence.label.add",
     "confluence.label.remove",
@@ -241,6 +240,8 @@ fn reads_have_no_enrich() -> TestResult {
         "jira.issuelink.create",
         "jira.sprint.move_issues",
         "confluence.page.update",
+        // M7 Task 16 (PD-105): the space, the parent page, the duplicate-title check.
+        "confluence.page.create",
         // M7 Task 18 (PD-107): the container, and the reply target.
         "confluence.comment.add",
     ]
@@ -929,7 +930,32 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
                    "reply_to": "790"}),
             Some(comment_verdict(Some("790"))),
         ),
+        // M7 Task 16: a page created under a parent, Markdown and storage.
+        (
+            "confluence.page.create",
+            json!({"space": "DOC", "title": "Notes", "body": MARKDOWN, "parent": "Home"}),
+            Some(create_page_verdict(Some(("Home", "65536")))),
+        ),
+        (
+            "confluence.page.create",
+            json!({"space": "DOC", "title": "Notes", "body": "<p>x</p>",
+                   "body_format": "storage"}),
+            Some(create_page_verdict(None)),
+        ),
     ]
+}
+
+/// What enrichment gives for a page `Notes` in `DOC`, under `(parent param, resolved id)`.
+fn create_page_verdict(parent: Option<(&str, &str)>) -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("space".to_owned(), json!("DOC"));
+    resolved.insert("space_key".to_owned(), json!("DOC"));
+    resolved.insert("title".to_owned(), json!("Notes"));
+    if let Some((param, id)) = parent {
+        resolved.insert("parent".to_owned(), json!(param));
+        resolved.insert("parent_id".to_owned(), json!(id));
+    }
+    EnrichVerdict::preview(json!({"space_key": "DOC"}), resolved)
 }
 
 /// What enrichment gives for a comment on page 65537, replying to `reply_to` when given.
@@ -1830,6 +1856,12 @@ fn fixtures_match_registry_schemas() -> TestResult {
         (
             "confluence.comment.add",
             r#"{"id":"792","type":"comment","status":"current","title":"Re: Release checklist","version":{"number":1,"when":"2026-10-07T10:00:00.000+02:00"},"container":{"id":"65537","type":"page"},"_links":{"webui":"/display/DOC/Release+checklist?focusedCommentId=792","self":"https://wiki.corp.example/rest/api/content/792"}}"#,
+        ),
+        // What `POST /rest/api/content` answers for a new page (M7 Task 16), with the fields the
+        // receipt does not keep.
+        (
+            "confluence.page.create",
+            r#"{"id":"123500","type":"page","status":"current","title":"Release 1.5 notes","space":{"key":"DOC","name":"Documentation"},"version":{"number":1,"when":"2026-10-17T10:00:00.000+02:00"},"ancestors":[{"id":"123400"}],"body":{"storage":{"value":"<p>x</p>","representation":"storage"}},"_links":{"webui":"/display/DOC/Release+1.5+notes","self":"https://wiki.corp.example/rest/api/content/123500"}}"#,
         ),
     ];
     // PD-101: a search is released pruned, so its schema (strict) is checked on the normalized

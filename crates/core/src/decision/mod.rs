@@ -1598,6 +1598,11 @@ fn resolution_message(op: &str, params: &Value, param: &str, value: &str) -> Str
         }
         // PD-62 (plan text).
         ("jira.issuelink.create", "type") => format!("no issue link type named '{value}'"),
+        // PD-105 (plan text): the space key, and the parent page within that space.
+        ("confluence.page.create", "space") => format!("no space '{value}'"),
+        ("confluence.page.create", "parent") => {
+            format!("no page '{value}' in space {}", of("space"))
+        }
         // PD-107 (plan text): a reply target that is no comment on this content.
         ("confluence.comment.add", "reply_to") => {
             format!("no comment {value} on content {}", of("content_id"))

@@ -915,7 +915,19 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             ..READ
         },
     ),
-    ("confluence.page.create", LATER_WRITE),
+    (
+        "confluence.page.create",
+        OpImpl {
+            executor: confluence_ext::page_create_executor,
+            previewer: confluence_preview::create_preview,
+            // §5.4 step 5: an additive write has no stale rule; the identity call still runs.
+            stale_check: None,
+            enrich: Some(&confluence_ext::PAGE_CREATE_ENRICH),
+            // PD-105: space and parent are target params (read-only); a new title re-runs the
+            // duplicate check.
+            enrich_keys: &["title", "body"],
+        },
+    ),
     (
         "confluence.page.update",
         OpImpl {
