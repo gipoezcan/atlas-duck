@@ -353,6 +353,18 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
                 },
             ])
         }
+        // Task 20a (PD-109): the attachments of that filename (none: the example has no
+        // `replace`, so nothing collides and there is no stale rule); the multipart `POST` is
+        // the op's own endpoint.
+        "confluence.attachment.upload" => {
+            let id = params["id"]
+                .as_str()
+                .ok_or("example params have no string id")?;
+            Ok(vec![Aux {
+                path: format!("{}/child/attachment", content_path(id)),
+                body: json!({"results": [], "start": 0, "limit": 50, "size": 0}),
+            }])
+        }
         other => Err(format!(
             "{other}: no X-09 mount rule in common::confluence::aux_gets (a new op needs its GETs decided)"
         )),

@@ -9,20 +9,27 @@
 //! - `confluence.comment.add` (Task 18, PD-107): the container type from the enrichment and the
 //!   `reply_to` resolution (a comment on this very content), so a reply is never sent unchecked;
 //! - the label writes (Task 19, PD-108): one request each, the content's current labels read for
-//!   the card only.
+//!   the card only;
+//! - `confluence.attachment.upload` (Task 20a, PD-109): the filename lookup (the collision hold
+//!   without `replace`, the one attachment a replace targets), the deterministic multipart body
+//!   and the sniffed type of its file part.
 
 use atlas_duck_atlassian::{GetCall, HttpRequestSpec};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
+use base64::Engine as _;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use super::confluence::content_version;
 use super::confluence_body::{EmptyBody, storage_text};
+use super::generic::find_bytes;
 use super::jira::{MAX_CANDIDATES, capped, unresolved};
 use super::{
     ConfluenceFacts, EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx,
-    ExecError, ExecPlan, PageRef, WriteSummaryFacts, get_call, json_request, method_name,
-    resolve_url, str_param,
+    ExecError, ExecPlan, ExistingAttachment, PageRef, WriteSummaryFacts, get_call, json_request,
+    method_name, resolve_url, single_round, str_param,
 };
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
@@ -871,5 +878,306 @@ pub fn label_remove_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
         resolved_url,
         content_type: None,
         body: Vec::new(),
+    }]))
+}
+
+// ---- confluence.attachment.upload --------------------------------------------------------------
+
+/// Stage 1 and the replace stale check: the content's attachments of one filename.
+const ATTACHMENTS_PATH: &str = "/rest/api/content/{id}/child/attachment";
+
+/// §7.4 / PD-109: `replace=true` posts the new bytes to the `/data` endpoint of the attachment.
+const ATTACHMENT_DATA_PATH: &str = "/rest/api/content/{id}/child/attachment/{attachmentId}/data";
+
+/// PD-109: one GET (`enrich`) lists the content's attachments of the filename with their
+/// versions. Without `replace`, an attachment of that name (exactly, or differing only in case)
+/// is the collision hold (`Hold::Collision`, Approve disabled, no deny detail applies, §7.4
+/// "attachment already exists"); with `replace`, exactly one attachment of exactly that name is
+/// the one replaced (its id and version are the stale baseline, `stale::ATTACHMENT_REPLACE`),
+/// none is `UnresolvedName {filename, 0}`. `filename` and `replace` are the params an approver
+/// edit re-enriches (`id` is the target param, read-only).
+pub static ATTACHMENT_ENRICH: EnrichRule = EnrichRule {
+    plan: attachment_plan,
+    judge: attachment_judge,
+};
+
+/// The lookup of the content's attachments named like the `filename` param (a query value
+/// encoded by `build_url`, never spliced into the path), with their versions.
+pub(crate) fn attachment_call(params: &Value) -> GetCall {
+    get_call(
+        ATTACHMENTS_PATH,
+        params,
+        &[
+            ("filename", str_param(params, "filename")),
+            ("expand", "version"),
+        ],
+    )
+}
+
+/// The agent asked to replace the attachment of that name (`replace: true`; absent is `false`).
+pub(crate) fn wants_replace(params: &Value) -> bool {
+    params.get("replace") == Some(&Value::Bool(true))
+}
+
+/// An attachment of a lookup answer (raw server text).
+pub(crate) struct Listed {
+    pub id: String,
+    pub title: String,
+    pub version: u64,
+    pub size: Option<u64>,
+}
+
+/// The attachments of a lookup answer; `None` (fail closed) when it is no list, an entry is not
+/// a current attachment with an id, a title and a version, or a further page may hold more (a
+/// collision could lie beyond it).
+pub(crate) fn listed_attachments(answer: &Value) -> Option<Vec<Listed>> {
+    if answer.pointer("/_links/next").is_some() {
+        return None;
+    }
+    answer
+        .get("results")?
+        .as_array()?
+        .iter()
+        .map(|a| {
+            let current =
+                text_of(a, "type") == Some("attachment") && text_of(a, "status") == Some("current");
+            current.then_some(())?;
+            Some(Listed {
+                id: id_text(a.get("id"))?,
+                title: text_of(a, "title")?.to_owned(),
+                version: content_version(a)?,
+                size: a.pointer("/extensions/fileSize").and_then(Value::as_u64),
+            })
+        })
+        .collect()
+}
+
+/// An attachment id fit for the `/data` path segment (`att3001`, or digits): anything else from
+/// the server fails closed.
+fn is_attachment_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Two names Confluence may take for one attachment: equal, or equal ignoring case.
+fn same_name_any_case(a: &str, b: &str) -> bool {
+    a == b || a.to_lowercase() == b.to_lowercase()
+}
+
+fn attachment_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    single_round(
+        vec![(EnrichPurpose::Enrich, attachment_call(ctx.params))],
+        answers,
+    )
+}
+
+fn attachment_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
+    let params = ctx.params;
+    let Some(listed) = answers.first().and_then(listed_attachments) else {
+        return EnrichVerdict::unusable();
+    };
+    let filename = str_param(params, "filename");
+    let replace = wants_replace(params);
+    let exact: Vec<&Listed> = listed.iter().filter(|a| a.title == filename).collect();
+    let variants: Vec<&Listed> = listed
+        .iter()
+        .filter(|a| a.title != filename && same_name_any_case(&a.title, filename))
+        .collect();
+
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), Value::from(str_param(params, "id")));
+    resolved.insert("filename".to_owned(), Value::from(filename));
+    resolved.insert("replace".to_owned(), Value::Bool(replace));
+    let facts = |a: Option<&Listed>| WriteSummaryFacts {
+        confluence: Some(ConfluenceFacts {
+            existing_attachment: a.map(|a| ExistingAttachment {
+                id: a.id.clone(),
+                version: a.version,
+                size: a.size,
+            }),
+            ..ConfluenceFacts::default()
+        }),
+        ..WriteSummaryFacts::default()
+    };
+
+    if !replace {
+        let existing = exact.first().or(variants.first()).copied();
+        let mut verdict = EnrichVerdict::preview(Value::Null, resolved);
+        if existing.is_some() {
+            verdict.hold = Hold::Collision;
+        }
+        verdict.summary = Some(facts(existing));
+        return verdict;
+    }
+    match exact.as_slice() {
+        [] => unresolved(
+            "filename",
+            filename,
+            0,
+            variants
+                .iter()
+                .map(|a| capped(&a.title))
+                .take(MAX_CANDIDATES)
+                .collect(),
+        ),
+        [one] if is_attachment_id(&one.id) => {
+            resolved.insert("attachment_id".to_owned(), Value::from(one.id.as_str()));
+            let baseline = json!({"attachment_id": one.id, "version": one.version});
+            let mut verdict = EnrichVerdict::preview(baseline, resolved);
+            verdict.summary = Some(facts(Some(one)));
+            verdict
+        }
+        // A server id unfit for the path, or two attachments of exactly that name (which one?):
+        // fail closed.
+        _ => EnrichVerdict::unusable(),
+    }
+}
+
+/// The agent's content: standard base64, padding optional (the schema's pattern).
+const CONTENT_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true),
+);
+
+/// PD-109: the filename goes into the part header as sent (`filename="<name>"`, UTF-8), so a
+/// double quote or a control character (CR, LF, tab, C0, DEL, C1) cannot be written there and is
+/// refused; `..`, `/`-free names and any other character are ordinary (attachments are stored by
+/// name, not by path; the schema refuses `/` and `\`). The message never echoes the name.
+fn check_filename(filename: &str) -> Result<(), ExecError> {
+    if filename.chars().any(|c| c == '"' || c.is_control()) {
+        return Err(ExecError::Invalid(invalid(
+            "filename",
+            "must not contain a double quote or a control character",
+            None,
+        )));
+    }
+    Ok(())
+}
+
+/// PD-110 (the part's `Content-Type`): the type the file part is sent as, sniffed from its magic
+/// bytes for `png`, `jpeg`, `gif`, `webp`, `pdf` and `zip`; anything else is
+/// `application/octet-stream` (never a type the agent names, never `text/html` or SVG).
+pub(crate) fn sniff_mime(content: &[u8]) -> &'static str {
+    let at = |range: std::ops::Range<usize>, magic: &[u8]| content.get(range) == Some(magic);
+    if content.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if content.starts_with(b"\xff\xd8\xff") {
+        "image/jpeg"
+    } else if content.starts_with(b"GIF87a") || content.starts_with(b"GIF89a") {
+        "image/gif"
+    } else if content.starts_with(b"RIFF") && at(8..12, b"WEBP") {
+        "image/webp"
+    } else if content.starts_with(b"%PDF-") {
+        "application/pdf"
+    } else if content.starts_with(b"PK\x03\x04") || content.starts_with(b"PK\x05\x06") {
+        "application/zip"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+/// PD-109: `atlas-duck-` and the first 32 hex chars of SHA-256(file bytes); while that string
+/// occurs in the file bytes, the filename or the comment, `-1`, `-2`, … is appended (the first
+/// that occurs in none). A pure function of the params, so two renders give the same bytes.
+fn multipart_boundary(content: &[u8], filename: &str, comment: Option<&str>) -> String {
+    let digest = hex::encode(Sha256::digest(content));
+    let base = format!("atlas-duck-{}", digest.get(..32).unwrap_or(&digest));
+    let parts = [
+        content,
+        filename.as_bytes(),
+        comment.unwrap_or("").as_bytes(),
+    ];
+    let free = |b: &String| {
+        parts
+            .iter()
+            .all(|hay| find_bytes(hay, b.as_bytes()).is_none())
+    };
+    std::iter::once(base.clone())
+        .chain((1u64..).map(|n| format!("{base}-{n}")))
+        .find(free)
+        .unwrap_or(base)
+}
+
+/// PD-109: the `multipart/form-data` body (RFC 7578): the `file` part (`Content-Disposition:
+/// form-data; name="file"; filename="<filename>"`, `Content-Type` sniffed) and, when given, the
+/// `comment` part (`text/plain; charset=utf-8`), CRLF line ends, closed by `--<b>--` CRLF; and
+/// the request's content type with the boundary, so `request_set_hash` covers both.
+pub(crate) fn multipart(
+    filename: &str,
+    content: &[u8],
+    comment: Option<&str>,
+) -> (String, Vec<u8>) {
+    let b = multipart_boundary(content, filename, comment);
+    let mut body = Vec::with_capacity(content.len().saturating_add(512));
+    body.extend_from_slice(
+        format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+             Content-Type: {}\r\n\r\n",
+            sniff_mime(content)
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(content);
+    if let Some(comment) = comment {
+        body.extend_from_slice(
+            format!(
+                "\r\n--{b}\r\nContent-Disposition: form-data; name=\"comment\"\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\n{comment}"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("\r\n--{b}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={b}"), body)
+}
+
+/// The one multipart `POST` of PD-109: a new attachment to `…/child/attachment?allowDuplicated=
+/// false`, a replace to `…/child/attachment/{attachmentId}/data`. The static checks answer first
+/// (the validation dry call, no verdict yet): the filename rule and content that is no base64 are
+/// `validation` (exit 2). Then only a verdict for these very params renders a request: a
+/// `Preview` (a new attachment, or the replace of the one attachment enrichment found, its id
+/// from that verdict), or the `Collision` hold's card, which shows the new-attachment request an
+/// approval would have sent (Approve stays disabled, `engine::write::approvable`).
+pub fn attachment_upload_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let params = ctx.params;
+    resolve_url(ctx.base, ctx.spec.endpoint.path, params, &[])?;
+    let filename = str_param(params, "filename");
+    check_filename(filename)?;
+    let content = CONTENT_BASE64
+        .decode(str_param(params, "content_base64"))
+        .map_err(|_| ExecError::Invalid(invalid("content_base64", "not valid base64", None)))?;
+    let replace = wants_replace(params);
+    let verdict = ctx
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview || (v.hold == Hold::Collision && !replace))
+        .ok_or(ExecError::EnrichmentRequired)?;
+    let resolved = |name: &str| verdict.resolved.get(name);
+    let id = str_param(params, "id");
+    if resolved("id").and_then(Value::as_str) != Some(id)
+        || resolved("filename").and_then(Value::as_str) != Some(filename)
+        || resolved("replace") != Some(&Value::Bool(replace))
+    {
+        return Err(ExecError::EnrichmentRequired);
+    }
+    let resolved_url = if replace {
+        let attachment = resolved("attachment_id")
+            .and_then(Value::as_str)
+            .filter(|a| is_attachment_id(a))
+            .ok_or(ExecError::EnrichmentRequired)?;
+        let at = json!({"id": id, "attachmentId": attachment});
+        resolve_url(ctx.base, ATTACHMENT_DATA_PATH, &at, &[])?
+    } else {
+        let query = [("allowDuplicated".to_owned(), "false".to_owned())];
+        resolve_url(ctx.base, ctx.spec.endpoint.path, params, &query)?
+    };
+    let comment = params.get("comment").and_then(Value::as_str);
+    let (content_type, body) = multipart(filename, &content, comment);
+    Ok(ExecPlan::Write(vec![HttpRequestSpec {
+        index: 0,
+        method: method_name(ctx.spec.endpoint.method).to_owned(),
+        resolved_url,
+        content_type: Some(content_type),
+        body,
     }]))
 }

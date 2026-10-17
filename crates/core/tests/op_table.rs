@@ -45,16 +45,17 @@ const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_iss
 
 /// Confluence writes completed in M7 beyond `confluence.page.update` (each task moves its op here
 /// from [`LATER_WRITES`]). Each needs its enrichment verdict before it renders a request.
-const M7_WRITES: [&str; 5] = [
+const M7_WRITES: [&str; 6] = [
     "confluence.page.create",
     "confluence.comment.add",
     "confluence.label.add",
     "confluence.label.remove",
     "confluence.page.move",
+    "confluence.attachment.upload",
 ];
 
-/// No Jira write is left after T18; the Confluence writes land in M7.
-const LATER_WRITES: [&str; 1] = ["confluence.attachment.upload"];
+/// No write is left after M7 Task 20a (the attachment upload was the last).
+const LATER_WRITES: [&str; 0] = [];
 
 fn op(id: &str) -> Result<&'static OperationSpec, String> {
     atlas_duck_registry::get(id).ok_or_else(|| format!("no op {id}"))
@@ -216,6 +217,8 @@ fn u05_only_writes_have_stale_check() -> TestResult {
         "confluence.page.update",
         // M7 T17 (PD-106): `version.number` unchanged, as for the update.
         "confluence.page.move",
+        // M7 T20a (PD-109): the replaced attachment's id and version unchanged (replace only).
+        "confluence.attachment.upload",
     ]
     .into_iter()
     .collect();
@@ -252,6 +255,8 @@ fn reads_have_no_enrich() -> TestResult {
         // M7 Task 19 (PD-108): the content's current labels, for the card.
         "confluence.label.add",
         "confluence.label.remove",
+        // M7 Task 20a (PD-109): the attachments of that filename (collision, replace target).
+        "confluence.attachment.upload",
     ]
     .into_iter()
     .collect();
@@ -967,7 +972,36 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             json!({"id": "65537", "parent": "Release notes"}),
             Some(move_verdict()),
         ),
+        // M7 Task 20a: a new attachment with a comment, and a replace (PD-109: the multipart body
+        // and its boundary are pure functions of the params).
+        (
+            "confluence.attachment.upload",
+            json!({"id": "65537", "filename": "notes.txt", "content_base64": "aGVsbG8gd29ybGQ=",
+                   "comment": "Meeting notes"}),
+            Some(upload_verdict(false)),
+        ),
+        (
+            "confluence.attachment.upload",
+            json!({"id": "65537", "filename": "notes.txt", "content_base64": "aGVsbG8gd29ybGQ=",
+                   "replace": true}),
+            Some(upload_verdict(true)),
+        ),
     ]
+}
+
+/// What enrichment gives for `notes.txt` on page 65537: no attachment of that name, or (replace)
+/// `att3001` at version 2.
+fn upload_verdict(replace: bool) -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), json!("65537"));
+    resolved.insert("filename".to_owned(), json!("notes.txt"));
+    resolved.insert("replace".to_owned(), json!(replace));
+    if replace {
+        resolved.insert("attachment_id".to_owned(), json!("att3001"));
+        EnrichVerdict::preview(json!({"attachment_id": "att3001", "version": 2}), resolved)
+    } else {
+        EnrichVerdict::preview(Value::Null, resolved)
+    }
 }
 
 /// What enrichment gives for moving page 65537 (version 7) under `Release notes` (123400).
@@ -1039,6 +1073,15 @@ fn executors_deterministic() -> TestResult {
                 "only the label remove may DELETE"
             );
             assert!(a[0].content_type.is_none() && a[0].body.is_empty(), "{id}");
+            continue;
+        }
+        if id == "confluence.attachment.upload" {
+            // PD-109: the one multipart write; its boundary comes from the file's SHA-256.
+            let ct = a[0].content_type.as_deref().unwrap_or_default();
+            assert!(
+                ct.starts_with("multipart/form-data; boundary=atlas-duck-"),
+                "{ct}"
+            );
             continue;
         }
         assert_eq!(a[0].content_type.as_deref(), Some("application/json"));
@@ -1933,6 +1976,12 @@ fn fixtures_match_registry_schemas() -> TestResult {
             r#"{"results":[{"prefix":"global","name":"release","id":"10"},{"prefix":"global","name":"docs","id":"11"}],"start":0,"limit":200,"size":2}"#,
         ),
         ("confluence.label.remove", "null"),
+        // M7 Task 20a (Δ4 b): a new attachment answers `{"results":[…]}`; the receipt is
+        // `results[0]`'s projection.
+        (
+            "confluence.attachment.upload",
+            r#"{"results":[{"id":"att3002","type":"attachment","status":"current","title":"notes.txt","version":{"number":1,"when":"2026-10-17T10:00:00.000+02:00"},"extensions":{"mediaType":"text/plain","fileSize":11},"_links":{"webui":"/display/DOC/Release+checklist?preview=/65537/3002/notes.txt","download":"/download/attachments/65537/notes.txt"}}],"size":1}"#,
+        ),
     ];
     // PD-101: a search is released pruned, so its schema (strict) is checked on the normalized
     // fixture, not on the raw answer.

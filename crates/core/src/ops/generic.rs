@@ -9,7 +9,9 @@ use atlas_duck_atlassian::{GetCall, HttpRequestSpec, PagedCall, SearchCall};
 use atlas_duck_preview::invisible::{self, escape_for_display};
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
-use atlas_duck_preview::{BodyView, ItemCount, PreviewBody, PreviewHeader, RequestView, json_tree};
+use atlas_duck_preview::{
+    BodyView, ItemCount, PreviewBody, PreviewHeader, RequestView, body_digest_line, json_tree,
+};
 use atlas_duck_registry::{
     BodySource, Endpoint, OpClass, OperationSpec, Product, Projection, QueryValue, TargetDisplay,
 };
@@ -70,7 +72,7 @@ pub fn read_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     read_plan(ctx, ctx.params)
 }
 
-/// PD-09: writes completed in M5/M7.
+/// PD-09: an op the build does not run (no registry write since M7 Task 20a).
 pub fn not_in_this_build(_ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     Err(ExecError::NotInThisBuild)
 }
@@ -264,7 +266,8 @@ fn search_body(
 // ---- receipts ----------------------------------------------------------------------------------
 
 /// §4.2 / §5.6: the receipt the agent gets from a write response (`result_projection`): the
-/// listed fields (dotted paths) that exist, the agent's own labels, or `{}`.
+/// listed fields (dotted paths) that exist (of `results[0]` for `FirstResultFields` when the
+/// answer is `{"results":[…]}`, M7 Δ4 b), the agent's own labels, or `{}`.
 pub fn project_receipt(spec: &OperationSpec, response: &Value, params: &Value) -> Value {
     match spec.result_projection {
         Projection::Empty => Value::Object(Map::new()),
@@ -277,21 +280,32 @@ pub fn project_receipt(spec: &OperationSpec, response: &Value, params: &Value) -
             out.insert("labels".to_owned(), labels);
             Value::Object(out)
         }
-        Projection::Fields(paths) => {
-            let mut out = Map::new();
-            for path in paths {
-                let segments: Vec<&str> = path.split('.').collect();
-                let mut at = Some(response);
-                for seg in &segments {
-                    at = at.and_then(|v| v.get(*seg));
-                }
-                if let Some(value) = at {
-                    insert_path(&mut out, &segments, value.clone());
-                }
-            }
-            Value::Object(out)
+        Projection::Fields(paths) => project_fields(response, paths),
+        Projection::FirstResultFields(paths) => {
+            // An empty `results` projects to `{}`: no object is the receipt's.
+            let first = match response.get("results").and_then(Value::as_array) {
+                Some(results) => results.first().unwrap_or(&Value::Null),
+                None => response,
+            };
+            project_fields(first, paths)
         }
     }
+}
+
+/// The listed fields (dotted paths) of `response` that exist.
+fn project_fields(response: &Value, paths: &[&str]) -> Value {
+    let mut out = Map::new();
+    for path in paths {
+        let segments: Vec<&str> = path.split('.').collect();
+        let mut at = Some(response);
+        for seg in &segments {
+            at = at.and_then(|v| v.get(*seg));
+        }
+        if let Some(value) = at {
+            insert_path(&mut out, &segments, value.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 fn insert_path(out: &mut Map<String, Value>, segments: &[&str], value: Value) {
@@ -315,7 +329,9 @@ fn insert_path(out: &mut Map<String, Value>, segments: &[&str], value: Value) {
 /// "agent receives: id, key" (§5.6).
 pub fn receipt_fields(spec: &OperationSpec) -> Vec<String> {
     match spec.result_projection {
-        Projection::Fields(paths) => paths.iter().map(|p| (*p).to_owned()).collect(),
+        Projection::Fields(paths) | Projection::FirstResultFields(paths) => {
+            paths.iter().map(|p| (*p).to_owned()).collect()
+        }
         Projection::AgentLabels => vec!["labels".to_owned()],
         Projection::Empty => Vec::new(),
     }
@@ -887,10 +903,11 @@ fn fields_included(spec: &OperationSpec, params: &Value, candidate: &Value) -> V
 
 fn write_model(ctx: &PreviewCtx<'_>, view: &WriteView<'_>) -> PreviewModel {
     let spec = ctx.spec;
-    let views: Vec<RequestView> = view.requests.iter().map(request_view).collect();
+    let (views, hidden): (Vec<RequestView>, Vec<u64>) =
+        view.requests.iter().map(request_view).unzip();
     let (mut bidi, mut other) = (0, 0);
     for r in view.requests {
-        let (b, o) = count_body(&r.body);
+        let (b, o) = count_request(r);
         bidi += b;
         other += o;
     }
@@ -965,7 +982,8 @@ fn write_model(ctx: &PreviewCtx<'_>, view: &WriteView<'_>) -> PreviewModel {
                 .as_object()
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default(),
-            hidden_in_preview_bytes: 0,
+            // M7 Δ2 (T8 review m-2): the request bytes the views replace by digest lines.
+            hidden_in_preview_bytes: hidden.into_iter().fold(0, u64::saturating_add),
             bidi_controls: bidi,
             other_invisible: other,
             executes_as: None,
@@ -979,22 +997,181 @@ fn write_model(ctx: &PreviewCtx<'_>, view: &WriteView<'_>) -> PreviewModel {
     }
 }
 
-/// Raw view of one request: the body as UTF-8 text, or base64 for anything else (§5.4 step 4).
-fn request_view(r: &HttpRequestSpec) -> RequestView {
-    let body = if r.body.is_empty() {
-        BodyView::None
-    } else {
-        match std::str::from_utf8(&r.body) {
-            Ok(text) => BodyView::Text(text.to_owned()),
-            Err(_) => BodyView::Base64(base64::engine::general_purpose::STANDARD.encode(&r.body)),
-        }
-    };
-    RequestView {
+/// M7 Δ2 (PD-109): a part body of a multipart request is shown as sent only when it is UTF-8, at
+/// most this many bytes and no file part; otherwise its one size and SHA-256 line stands for it.
+const PART_SHOWN_MAX_BYTES: usize = 4 * 1024;
+
+/// M7 Δ2 backstop: any other request body above this size is shown as its size and SHA-256 only.
+const BODY_SHOWN_MAX_BYTES: usize = 1024 * 1024;
+
+/// The view of one request (§5.4 step 4, M7 Δ2, plan review I-4) and the bytes of its body the
+/// view does not show (`hidden_in_preview_bytes`, T8 review m-2). A `multipart/form-data` body is
+/// the text envelope as sent (boundary lines, part headers, the parts that are UTF-8 and at most
+/// [`PART_SHOWN_MAX_BYTES`]) with every file part, and every other part, replaced by
+/// [`body_digest_line`]: the preview never carries a file. A multipart body that does not split
+/// exactly into its parts, and any other body above [`BODY_SHOWN_MAX_BYTES`], is a
+/// [`BodyView::Digest`] (fail closed: never text, never base64). Anything else is the UTF-8 text,
+/// or base64. `WRITE_APPROVED` and `request_set_hash` still cover the real bytes.
+fn request_view(r: &HttpRequestSpec) -> (RequestView, u64) {
+    let (body, hidden) = body_view(r);
+    let view = RequestView {
         index: r.index,
         method: r.method.clone(),
         resolved_url: r.resolved_url.clone(),
         content_type: r.content_type.clone(),
         body,
+    };
+    (view, hidden)
+}
+
+fn body_view(r: &HttpRequestSpec) -> (BodyView, u64) {
+    let len = len_u64(r.body.len());
+    let digest = || {
+        let view = BodyView::Digest {
+            bytes: len,
+            sha256: crate::payloads::sha256_hex(&r.body),
+        };
+        (view, len)
+    };
+    if r.body.is_empty() {
+        return (BodyView::None, 0);
+    }
+    if let Some(ct) = r.content_type.as_deref().filter(|ct| is_multipart(ct)) {
+        return match multipart_parts(ct, &r.body) {
+            Some(split) => {
+                let (text, hidden) = split.envelope();
+                (BodyView::Text(text), hidden)
+            }
+            None => digest(),
+        };
+    }
+    if r.body.len() > BODY_SHOWN_MAX_BYTES {
+        return digest();
+    }
+    match std::str::from_utf8(&r.body) {
+        Ok(text) => (BodyView::Text(text.to_owned()), 0),
+        Err(_) => (
+            BodyView::Base64(base64::engine::general_purpose::STANDARD.encode(&r.body)),
+            0,
+        ),
+    }
+}
+
+fn len_u64(n: usize) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
+}
+
+/// The media type of `content_type` is `multipart/form-data` (ASCII case-insensitive).
+fn is_multipart(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|m| m.trim().eq_ignore_ascii_case("multipart/form-data"))
+}
+
+/// The `boundary` parameter of a multipart content type (quotes removed); `None` when absent or
+/// empty.
+fn multipart_boundary(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("boundary") {
+            return None;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+/// The first occurrence of `needle` in `hay`.
+pub(crate) fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// A multipart body split exactly into its parts: `--b CRLF headers CRLF CRLF body` per part, each
+/// followed by `CRLF --b`, the last by `--` CRLF (the layout `confluence_ext::multipart` writes).
+struct MultipartSplit<'a> {
+    boundary: &'a str,
+    /// `(headers, body)` per part, in order.
+    parts: Vec<(&'a str, &'a [u8])>,
+}
+
+/// [`MultipartSplit`] of `body`, or `None` when it does not follow that layout exactly (no
+/// boundary, a missing delimiter, header bytes that are not UTF-8 or longer than
+/// [`PART_SHOWN_MAX_BYTES`], anything after the closing delimiter).
+fn multipart_parts<'a>(content_type: &'a str, body: &'a [u8]) -> Option<MultipartSplit<'a>> {
+    let boundary = multipart_boundary(content_type)?;
+    let open = format!("--{boundary}\r\n");
+    let next = format!("\r\n--{boundary}");
+    let mut rest = body.strip_prefix(open.as_bytes())?;
+    let mut parts = Vec::new();
+    loop {
+        let head_end = find_bytes(rest, b"\r\n\r\n")?;
+        if head_end > PART_SHOWN_MAX_BYTES {
+            return None;
+        }
+        let headers = std::str::from_utf8(rest.get(..head_end)?).ok()?;
+        let after = rest.get(head_end + 4..)?;
+        let end = find_bytes(after, next.as_bytes())?;
+        parts.push((headers, after.get(..end)?));
+        let tail = after.get(end + next.len()..)?;
+        if tail == b"--\r\n" {
+            return Some(MultipartSplit { boundary, parts });
+        }
+        rest = tail.strip_prefix(b"\r\n")?;
+    }
+}
+
+impl MultipartSplit<'_> {
+    /// A part whose headers name a file (`filename` in its `Content-Disposition`): never shown.
+    fn is_file(headers: &str) -> bool {
+        headers.lines().any(|line| {
+            let line = line.to_ascii_lowercase();
+            line.starts_with("content-disposition:") && line.contains("filename")
+        })
+    }
+
+    /// The text envelope and the bytes it replaces by digest lines.
+    fn envelope(&self) -> (String, u64) {
+        let b = self.boundary;
+        let mut out = format!("--{b}\r\n");
+        let mut hidden = 0u64;
+        for (i, (headers, body)) in self.parts.iter().enumerate() {
+            if i > 0 {
+                out.push_str(&format!("\r\n--{b}\r\n"));
+            }
+            out.push_str(headers);
+            out.push_str("\r\n\r\n");
+            match std::str::from_utf8(body) {
+                Ok(text) if !Self::is_file(headers) && body.len() <= PART_SHOWN_MAX_BYTES => {
+                    out.push_str(text);
+                }
+                _ => {
+                    let n = len_u64(body.len());
+                    out.push_str(&body_digest_line(n, &crate::payloads::sha256_hex(body)));
+                    hidden = hidden.saturating_add(n);
+                }
+            }
+        }
+        out.push_str(&format!("\r\n--{b}--\r\n"));
+        (out, hidden)
+    }
+
+    /// §6.4 counts over the part headers and every part body that is UTF-8 (shown or not).
+    fn count(&self) -> (u64, u64) {
+        self.parts
+            .iter()
+            .map(|(headers, body)| {
+                let body = std::str::from_utf8(body).map_or((0, 0), invisible::count);
+                add(invisible::count(headers), body)
+            })
+            .fold((0, 0), add)
     }
 }
 
@@ -1018,11 +1195,21 @@ fn add(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
     (a.0 + b.0, a.1 + b.1)
 }
 
-/// A request body: decoded JSON strings, else the UTF-8 text, else nothing (binary).
-fn count_body(body: &[u8]) -> (u64, u64) {
-    match serde_json::from_slice::<Value>(body) {
+/// A request body: a multipart body per part (its headers, a filename and a comment included,
+/// even beside a binary file), else decoded JSON strings, else the UTF-8 text, else nothing
+/// (binary).
+fn count_request(r: &HttpRequestSpec) -> (u64, u64) {
+    let split = r
+        .content_type
+        .as_deref()
+        .filter(|ct| is_multipart(ct))
+        .and_then(|ct| multipart_parts(ct, &r.body));
+    if let Some(split) = split {
+        return split.count();
+    }
+    match serde_json::from_slice::<Value>(&r.body) {
         Ok(v) => count_value(&v),
-        Err(_) => std::str::from_utf8(body).map_or((0, 0), invisible::count),
+        Err(_) => std::str::from_utf8(&r.body).map_or((0, 0), invisible::count),
     }
 }
 

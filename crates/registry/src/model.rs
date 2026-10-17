@@ -226,6 +226,9 @@ pub struct Caps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Projection {
     Fields(&'static [&'static str]),
+    /// M7 Δ4 b: the listed fields of `results[0]` when the answer is `{"results":[…]}` (a new
+    /// Confluence attachment), else of the object itself (a replaced attachment's `/data`).
+    FirstResultFields(&'static [&'static str]),
     AgentLabels,
     Empty,
 }

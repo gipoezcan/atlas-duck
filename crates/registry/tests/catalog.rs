@@ -438,6 +438,11 @@ fn confluence_table_rules_hold() {
         spec("confluence.label.add").result_projection,
         Projection::AgentLabels
     );
+    // M7 Δ4 b: a new attachment answers `{"results":[…]}`; the receipt is `results[0]`'s.
+    assert_eq!(
+        spec("confluence.attachment.upload").result_projection,
+        Projection::FirstResultFields(&["id", "type", "status", "version.number", "_links.webui"])
+    );
     let history = spec("confluence.page.history");
     let alt = history.alt_endpoint.expect("alt_endpoint");
     assert_eq!(alt.when_param_present, "version");

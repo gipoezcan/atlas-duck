@@ -1612,6 +1612,10 @@ fn resolution_message(op: &str, params: &Value, param: &str, value: &str) -> Str
         ("confluence.comment.add", "reply_to") => {
             format!("no comment {value} on content {}", of("content_id"))
         }
+        // PD-109 (plan text): a replace without an attachment of that name.
+        ("confluence.attachment.upload", "filename") => {
+            format!("no attachment '{value}' on content {}", of("id"))
+        }
         _ => format!("no {param} named '{value}'"),
     }
 }

@@ -39,6 +39,7 @@ const TRANSITION: &str = "jira.issue.transition";
 const ASSIGN: &str = "jira.issue.assign";
 const PAGE_UPDATE: &str = "confluence.page.update";
 const PAGE_MOVE: &str = "confluence.page.move";
+const ATTACHMENT_UPLOAD: &str = "confluence.attachment.upload";
 
 fn jira(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("jira-main").ok_or_else(|| "no jira mock".into())
@@ -148,6 +149,35 @@ async fn queued_page_move(h: &Harness) -> Result<String, TestError> {
     mock.json("/rest/api/content/123400", 200, &parent.to_string())
         .await;
     queued(h, PAGE_MOVE, json!({ "id": "65537", "parent": "123400" })).await
+}
+
+/// A replace of `notes.txt` (attachment `att3001`, version 2) on page 65537 in the queue (the
+/// lookup done); the next `PREVIEW_FETCH` is the stale check's identity call.
+async fn queued_attachment_replace(h: &Harness) -> Result<String, TestError> {
+    let mock = wiki(h)?;
+    mock.confluence_user_current(
+        atlas_duck_atlassian::testing::UserKind::Known,
+        TEST_USER,
+        TEST_USER_KEY,
+    )
+    .await;
+    let found = json!({"results": [{
+        "id": "att3001", "type": "attachment", "status": "current", "title": "notes.txt",
+        "version": {"number": 2},
+    }], "start": 0, "limit": 50, "size": 1});
+    mock.json(
+        "/rest/api/content/65537/child/attachment",
+        200,
+        &found.to_string(),
+    )
+    .await;
+    queued(
+        h,
+        ATTACHMENT_UPLOAD,
+        json!({ "id": "65537", "filename": "notes.txt", "content_base64": "aGVsbG8gd29ybGQ=",
+                "replace": true }),
+    )
+    .await
 }
 
 fn assert_outcome_unknown(env: &Envelope) {
@@ -654,6 +684,34 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_move() 
         .filter(|r| r.method.as_str() == "PUT")
         .count();
     assert_eq!(puts, 0);
+    Ok(())
+}
+
+/// I-26 for the attachment stale rule M7 adds (T20a, `stale::ATTACHMENT_REPLACE`): the replace's
+/// stale-check record committed, the crash comes before anything else, and the restart reconciles
+/// it as `outcome_unknown` like the update; nothing was sent before the crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_replace() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let id = queued_attachment_replace(&h).await?;
+    crash_after_stale_check(&mut h, &id).await?;
+    assert_listed_unknown(&h, &id, "65537").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    let unknown = h.events_of(EventType::WRITE_OUTCOME_UNKNOWN).await?;
+    assert_eq!(
+        unknown
+            .last()
+            .map(|p| (p["request_index"].clone(), p["reason"].clone())),
+        Some((json!(0), json!("crash")))
+    );
+    let posts = wiki(&h)?
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .count();
+    assert_eq!(posts, 0);
     Ok(())
 }
 

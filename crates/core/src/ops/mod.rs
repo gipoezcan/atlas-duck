@@ -139,7 +139,9 @@ pub enum ReadPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExecError {
-    /// PD-09: a write completed in M5/M7; answered at validation as `internal`.
+    /// PD-09: an op the build does not run; answered at validation as `internal`. Every registry
+    /// write has its executor since M7 Task 20a (`generic::not_in_this_build` stays for an op
+    /// without one).
     NotInThisBuild,
     /// A static check only the op knows (e.g. the `confluence.search` CQL rules): answered at
     /// validation with the error's code, never echoing the offending value.
@@ -413,7 +415,7 @@ impl fmt::Debug for PageRef {
     }
 }
 
-/// M7 Δ3: the attachment an upload collides with or replaces (Task 20a).
+/// M7 Δ3: the attachment an upload collides with or replaces (Task 20a, raw server text).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ExistingAttachment {
     pub id: String,
@@ -638,15 +640,6 @@ const READ: OpImpl = OpImpl {
 const LIST: OpImpl = OpImpl {
     previewer: generic::list_preview,
     ..READ
-};
-
-/// PD-09: completed in M5/M7.
-const LATER_WRITE: OpImpl = OpImpl {
-    executor: generic::not_in_this_build,
-    previewer: generic::fallback_preview,
-    stale_check: None,
-    enrich: None,
-    enrich_keys: &[],
 };
 
 /// One entry per registry id, in registry order (U-05: `tests/op_table.rs` checks the set).
@@ -997,7 +990,21 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &[],
         },
     ),
-    ("confluence.attachment.upload", LATER_WRITE),
+    (
+        "confluence.attachment.upload",
+        OpImpl {
+            executor: confluence_ext::attachment_upload_executor,
+            // The request list (its multipart body as the Δ2 envelope); Task 20b's card follows.
+            previewer: generic::write_preview,
+            // PD-109 / §5.4 step 5: with `replace`, the attachment's id and `version.number`
+            // unchanged; a new attachment plans no GET (the identity call still runs).
+            stale_check: Some(&stale::ATTACHMENT_REPLACE),
+            enrich: Some(&confluence_ext::ATTACHMENT_ENRICH),
+            // `id` is the target param (read-only); an edited filename or `replace` looks up the
+            // attachments again (the collision, the replaced attachment).
+            enrich_keys: &["filename", "replace"],
+        },
+    ),
 ];
 
 /// The rows of the explicit table before deduplication: U-05 checks it equals `op_table().len()`,
