@@ -267,6 +267,44 @@ jobs:
           node ci/check-no-skips.mjs $log $list $ignored jira_flows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      # M7 plan Task 28: the Confluence flows (app/src-tauri/tests/confluence_flows.rs, 8 flows) on the
+      # same harness and with the same rules as the jira_flows above. `--features scripted-approver`
+      # is required: without it the test crate is empty and runs 0 tests (check-no-skips fails on
+      # the empty list).
+      - name: M7 confluence_flows (Linux, Xvfb + private session bus)
+        if: runner.os == 'Linux'
+        env:
+          CLI_FLOWS_TEST: confluence_flows
+        run: bash ci/cli-flows-linux.sh
+
+      - name: M7 confluence_flows (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --test confluence_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/confluence-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/confluence-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/confluence-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/confluence-flows.log" "$RUNNER_TEMP/confluence-flows.list" "$RUNNER_TEMP/confluence-flows.ignored" confluence_flows
+
+      - name: M7 confluence_flows (Windows, pwsh)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $env:ATLAS_DUCK_CLI_FLOWS = '1'
+          $a = @('test', '-p', 'atlas-duck-app', '--features', 'scripted-approver', '--locked', '--test', 'confluence_flows')
+          $log = Join-Path $env:RUNNER_TEMP 'confluence-flows.log'
+          $list = Join-Path $env:RUNNER_TEMP 'confluence-flows.list'
+          $ignored = Join-Path $env:RUNNER_TEMP 'confluence-flows.ignored'
+          cargo @a -- --nocapture --test-threads=2 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo @a -- --list 2>$null | Set-Content -Path $list -Encoding utf8
+          cargo @a -- --list --ignored 2>$null | Set-Content -Path $ignored -Encoding utf8
+          node ci/check-no-skips.mjs $log $list $ignored confluence_flows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Core PAT keychain test (Windows Credential Manager, RF-3a, #[ignore]d)
         if: runner.os == 'Windows'
         run: cargo test -p atlas-duck-core --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test keychain_windows -- --ignored --test-threads=1 --nocapture
@@ -302,14 +340,27 @@ jobs:
       # suite above, checks the results and prints the numbers). The `testing` features refuse to
       # compile without debug assertions, so the release profile gets them from the environment
       # here, never from a Cargo.toml (ci/check-workspace.mjs). A filter that matches nothing
-      # would pass with zero tests, so the log must show the three passes.
+      # would pass with zero tests, so the log must show the four passes (M7 T23 added the Confluence
+      # scenarios) and the one ignored measurement test.
       - name: Core performance bounds (SC3 preview, 16 MiB paging, M-15 latency, release)
         run: |
           cargo test -p atlas-duck-core --release --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test perf_sc3 -- --nocapture --test-threads=1 | tee "$RUNNER_TEMP/perf-sc3.log"
-          grep -q 'test result: ok\. 3 passed' "$RUNNER_TEMP/perf-sc3.log"
+          grep -q 'test result: ok\. 4 passed; 0 failed; 1 ignored' "$RUNNER_TEMP/perf-sc3.log"
         env:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
           ATLAS_DUCK_PERF_ENFORCE: "1"
+
+      # M7 T23 review m-1: the measurement of the largest page update (~15 MiB) and upload (10 MiB)
+      # is #[ignore]d so a plain `cargo test` never runs it; this step runs it once on the release
+      # build and keeps the printed numbers as the record. It asserts what the test itself asserts
+      # (the exact-name filter must match, so the log must show the one pass); it adds no timing bound.
+      - name: Core performance measurement (page update and upload, release, #[ignore]d, record)
+        run: |
+          set -o pipefail
+          cargo test -p atlas-duck-core --release --features atlas-duck-atlassian/testing,atlas-duck-core/testing --locked --test perf_sc3 -- --ignored --exact t23_largest_page_update_and_upload_measured --nocapture --test-threads=1 | tee "$RUNNER_TEMP/perf-sc3-measured.log"
+          grep -q 'test result: ok\. 1 passed' "$RUNNER_TEMP/perf-sc3-measured.log"
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
 
       - name: Audit OS keychain tests (Windows Credential Manager, RF-3a)
         if: runner.os == 'Windows'
@@ -822,6 +873,17 @@ jobs:
           cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/jira-flows.list"
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/jira-flows.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/jira-flows.log" "$RUNNER_TEMP/jira-flows.list" "$RUNNER_TEMP/jira-flows.ignored" jira_flows
+
+      # M7 plan Task 28: the confluence_flows target (8 flows), x86_64 under Rosetta, as the jira_flows above.
+      - name: M7 confluence_flows x86_64-apple-darwin (no skips, pass-count minimum)
+        run: |
+          set -euo pipefail
+          export ATLAS_DUCK_CLI_FLOWS=1
+          args=(test -p atlas-duck-app --features scripted-approver --locked --target x86_64-apple-darwin --test confluence_flows)
+          cargo "${args[@]}" -- --nocapture --test-threads=2 2>&1 | tee "$RUNNER_TEMP/confluence-flows.log"
+          cargo "${args[@]}" -- --list 2>/dev/null > "$RUNNER_TEMP/confluence-flows.list"
+          cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/confluence-flows.ignored"
+          node ci/check-no-skips.mjs "$RUNNER_TEMP/confluence-flows.log" "$RUNNER_TEMP/confluence-flows.list" "$RUNNER_TEMP/confluence-flows.ignored" confluence_flows
 
       - name: M4 OS keychain smoke (macOS login keychain, x86_64 under Rosetta)
         env:
