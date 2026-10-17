@@ -43,6 +43,9 @@ pub enum WarningId {
     /// M5 T16 review I1: a `jira.issuelink.create` type named only by its inward phrase, so the
     /// link reads the other way round from the agent's wording.
     LinkTypeInwardPhrase,
+    /// M8 T17 (M5 M-13, R8): a script run read with `renderedFields`; a drop of a field leaves
+    /// its rendered copy (a plan text, a §6.2 amendment).
+    ScriptRenderedCopies,
     // Info
     LinkedIssueSummaries,
     CustomFields,
@@ -57,7 +60,7 @@ pub enum WarningId {
 }
 
 impl WarningId {
-    pub const ALL: [WarningId; 32] = [
+    pub const ALL: [WarningId; 33] = [
         WarningId::RestrictedComments,
         WarningId::SecurityLevel,
         WarningId::AllFields,
@@ -81,6 +84,7 @@ impl WarningId {
         WarningId::DiffTruncated,
         WarningId::NoCurrentValue,
         WarningId::LinkTypeInwardPhrase,
+        WarningId::ScriptRenderedCopies,
         WarningId::LinkedIssueSummaries,
         WarningId::CustomFields,
         WarningId::TruncatedByCap,
@@ -116,7 +120,8 @@ impl WarningId {
             | WarningId::InstanceUrlChanged
             | WarningId::DiffTruncated
             | WarningId::NoCurrentValue
-            | WarningId::LinkTypeInwardPhrase => Level::Caution,
+            | WarningId::LinkTypeInwardPhrase
+            | WarningId::ScriptRenderedCopies => Level::Caution,
             WarningId::LinkedIssueSummaries
             | WarningId::CustomFields
             | WarningId::TruncatedByCap
@@ -174,6 +179,9 @@ pub const TEXT_CQL_BROAD: &str = "CQL may enumerate many results";
 /// §6.2 (verbatim)
 pub const TEXT_SOURCE_FORMATTING_REMOVED: &str =
     "source formatting removed (hidden/colour styling present)";
+
+/// plan text (M8 T17, M5 M-13, R8; a §6.2 amendment)
+pub const TEXT_SCRIPT_RENDERED_COPIES: &str = "this result may contain rendered copies of fields (renderedFields); dropping a field does not drop its copy; use mask in every occurrence";
 
 // Parameterized texts, §6.2 (verbatim templates).
 

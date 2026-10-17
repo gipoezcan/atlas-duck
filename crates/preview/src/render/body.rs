@@ -364,6 +364,9 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             doc.close("section");
             requests_section(doc, "Requests to be sent", requests);
         }
+        // Task 18 renders the script sections (source, host calls, atlas.log, stderr); until
+        // then only the candidate view shows, through its own arm.
+        PreviewBody::Script { view, .. } => self::body(doc, view),
     }
 }
 

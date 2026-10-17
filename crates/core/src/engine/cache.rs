@@ -492,6 +492,13 @@ pub fn source_body<N>(
 where
     N: FnOnce(&Value) -> Result<Value, RebuildError>,
 {
+    normalize(&source_payload(port, request_id)?)
+}
+
+/// The decrypted payload of `request_id`'s last committed candidate record (blocking): what
+/// [`source_body`] normalizes. A script's preview reads the logs and stderr of a result from it
+/// (T17: they are in the record, not in the candidate).
+pub fn source_payload(port: &dyn AuditPort, request_id: &str) -> Result<Value, RebuildError> {
     let headers = port
         .headers_for_request(request_id)
         .map_err(RebuildError::from_audit)?;
@@ -503,7 +510,5 @@ where
     let bytes = port
         .read_payload(source.seq)
         .map_err(RebuildError::from_audit)?;
-    let payload: Value = serde_json::from_slice(&bytes).map_err(|_| RebuildError::Malformed)?;
-    drop(bytes);
-    normalize(&payload)
+    serde_json::from_slice(&bytes).map_err(|_| RebuildError::Malformed)
 }

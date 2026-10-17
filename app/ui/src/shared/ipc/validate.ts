@@ -21,6 +21,7 @@ import type {
   Preview,
   PreviewFetchResponse,
   PruneReport,
+  ProvenanceRow,
   QueueDetail,
   QueueItem,
   RawPage,
@@ -201,12 +202,30 @@ export const isEditInput = (v: unknown): v is EditInput =>
 
 const isEditForm = (v: unknown): v is EditForm => fields(v, { inputs: arrayOf(isEditInput) });
 
+const isProvenanceRow = (v: unknown): v is ProvenanceRow =>
+  fields(v, { call_id: isNum, op_id: isStr, instance: isStr, target_display: isStr, outcome: isStr });
+
+/** The `kind: 'script'` body (Δ5) is checked whole; every other kind only by its tag, as before. */
+function isPreviewBody(b: unknown): boolean {
+  if (!fields(b, { kind: isStr })) return false;
+  if (b.kind !== 'script') return true;
+  return fields(b, {
+    item: (i) => i === 'result' || i === 'error_details',
+    view: isPreviewBody,
+    source: isStr,
+    provenance: arrayOf(isProvenanceRow),
+    logs: arrayOf(isStr),
+    logs_note: strOrNull,
+    stderr: isStr,
+  });
+}
+
 export const isPreview = (v: unknown): v is Preview =>
   fields(v, {
     approvable: isBool,
     edit_form: (f) => f === null || isEditForm(f),
     candidate_rev: isCandidateRev,
-    body: (b) => fields(b, { kind: isStr }),
+    body: isPreviewBody,
     header: (h) =>
       fields(h, {
         class: isStr,
@@ -218,6 +237,7 @@ export const isPreview = (v: unknown): v is Preview =>
     deny_offers: arrayOf(isDenyOffer),
     also_appears_in: arrayOf(isStr),
     deny_prefill: strOrNull,
+    preselect: (p) => p === null || p === 'error_class_only',
   });
 
 /** Exactly `keys`, no other key (a wire op is closed, like `RedactionOpWire`). */

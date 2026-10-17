@@ -37,7 +37,8 @@ use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::invisible::{escape_for_display, strip};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
-    CandidateRev, PREVIEW_BUILDER_VERSION, Preview, RAW_PAGE_BYTES, RawPager, cap_error_text,
+    CandidateRev, PREVIEW_BUILDER_VERSION, Preselect, Preview, RAW_PAGE_BYTES, RawPager,
+    cap_error_text,
 };
 use serde::ser::SerializeMap;
 use serde::{Serialize, Serializer};
@@ -59,12 +60,13 @@ pub const RELEASE_BLOCKED_INTERNAL: &str = "release blocked: the candidate could
 pub const SESSION_NO_AGENT_NAME: &str = "(no agent name)";
 
 use crate::edit::{EditError, Edits, apply_edits};
-use crate::engine::cache::{Candidate, RebuildError, build_redacted, source_body};
+use crate::engine::cache::{Candidate, RebuildError, build_redacted, source_body, source_payload};
 use crate::engine::read::{
     OUTCOME_HINT, ReadContext, caution_count, normalizer, preview_field_names, preview_model,
     release_meta,
 };
 use crate::engine::script;
+use crate::engine::script::RunOutput;
 use crate::engine::write;
 use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, TransitionError};
 use crate::gate::UiEvent;
@@ -718,6 +720,7 @@ async fn read_preview(
         edit_form: None,
         deny_offers: Vec::new(),
         deny_prefill: None,
+        preselect: None,
     };
     Ok(Some((preview, shown, opened, redaction)))
 }
@@ -773,6 +776,7 @@ async fn write_preview(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, submitte
         edit_form: Some(write::edit_form(entry.spec, &w)),
         deny_offers: offers::deny_offers(entry.spec.id, &w, Some(hold)),
         deny_prefill: (hold == Hold::Conflict).then(|| write::CONFLICT_DENY_PREFILL.to_owned()),
+        preselect: None,
     };
     Some((preview, shown, opened, None))
 }
@@ -1206,7 +1210,21 @@ async fn script_preview(
     let Some((script, (shown, approvable, opened), failed, redaction)) = built else {
         return Ok(None);
     };
-    let model = script::preview_model(&script, &c);
+    let mut model = script::preview_model(&script, &c);
+    // A result's logs and stderr are in its committed record, not in its candidate (PD-145):
+    // read through the same decrypt path as a rebuild, nothing kept in memory.
+    if c.value().get("result").is_some() {
+        let id = entry.head.request_id.clone();
+        let payload = engine
+            .blocking(move |p| Ok(source_payload(p, &id)))
+            .await
+            .map_err(DecisionError::Audit)?;
+        match payload {
+            Ok(payload) => script::with_record_output(&mut model, RunOutput::from_value(&payload)),
+            Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
+            Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
+        }
+    }
     let mut warnings = model.warnings;
     warnings.extend(Flags::of(engine, entry).warnings());
     let preview = Preview {
@@ -1221,6 +1239,10 @@ async fn script_preview(
         edit_form: None,
         deny_offers: Vec::new(),
         deny_prefill: None,
+        // §9.5: core's flag, as the preview-local tag the UI maps to its own preset.
+        preselect: script
+            .preselect_error_class_only
+            .then_some(Preselect::ErrorClassOnly),
     };
     Ok(Some((preview, shown, opened, Some(redaction))))
 }

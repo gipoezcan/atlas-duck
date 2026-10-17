@@ -45,6 +45,7 @@ use atlas_duck_ipc::proto::{ConnectionMeta, SubmitParams, params_sha256};
 use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
+use atlas_duck_preview::{PreviewBody, ProvenanceRow, ScriptItemKind};
 use atlas_duck_registry::{
     BodySource, CliBinding, OpClass, OperationSpec, Product, Projection, RELEASE_CAP_BYTES,
     SCRIPT_RUN, Similarity, StatusSet, SuccessBody, SuccessShape, TargetDisplay,
@@ -410,6 +411,14 @@ pub struct ScriptState {
     pub instances: BTreeSet<String>,
     /// Host calls whose results were truncated or lossy (§9.5 preview warning), host-counted.
     pub lossy_calls: u64,
+    /// PD-145: the run's host calls that were sent, for the release preview. Built from each
+    /// request as the script sent it, never from a response; at most `max_calls` rows (a call
+    /// over the limit is refused before it is sent). In memory only: after a restart the item
+    /// is `ABANDONED` (§11.3).
+    pub calls: Vec<ProvenanceRow>,
+    /// R8 (M5 M-13): a host call's request asked for `renderedFields`, so the candidate may hold
+    /// rendered copies a field drop leaves behind (the Caution `script_rendered_copies`).
+    pub rendered_call: bool,
     pub redaction_meta: Option<RedactionMeta>,
     pub also_appears_in: Vec<String>,
 }
@@ -428,6 +437,8 @@ impl ScriptState {
             slot: None,
             instances: BTreeSet::new(),
             lossy_calls: 0,
+            calls: Vec::new(),
+            rendered_call: false,
             redaction_meta: None,
             also_appears_in: Vec::new(),
         }
@@ -442,6 +453,7 @@ impl fmt::Debug for ScriptState {
             .field("queued", &self.queued)
             .field("item", &self.item)
             .field("lossy_calls", &self.lossy_calls)
+            .field("calls", &self.calls.len())
             .finish_non_exhaustive()
     }
 }
@@ -611,7 +623,18 @@ impl RunShared {
         ctx: &EventCtx,
         reason: InFlightReason,
     ) -> Vec<NewEvent> {
+        self.in_flight_records_with_calls(ctx, reason).0
+    }
+
+    /// [`Self::in_flight_records`] with the calls it recorded, in `call_id` order (the release
+    /// preview lists them as `cancelled_in_flight`, PD-145).
+    pub(crate) fn in_flight_records_with_calls(
+        &self,
+        ctx: &EventCtx,
+        reason: InFlightReason,
+    ) -> (Vec<NewEvent>, Vec<CallInfo>) {
         let mut records = Vec::new();
+        let mut recorded = Vec::new();
         for (info, ctl) in self.take_in_flight() {
             ctl.cancel();
             let cap = ctl.take_captured();
@@ -647,8 +670,9 @@ impl RunShared {
                 size,
                 None,
             ));
+            recorded.push(info);
         }
-        records
+        (records, recorded)
     }
 }
 
@@ -1075,6 +1099,12 @@ impl LiveBackend {
             instance_id: vc.instance_id.clone(),
             user_key: vc.user_key.clone(),
         };
+        // R8: asked for with the request, whatever the answer turns out to be.
+        if requests_rendered(&call.params)
+            && let Some(s) = self.entry.state().script.as_mut()
+        {
+            s.rendered_call = true;
+        }
         let ctl = FetchControl::new();
         // The control first, then the cover: a cancel that took the control before it exists
         // finds nothing in flight and a request that ended mints no cover (Task 24 rule).
@@ -1095,10 +1125,18 @@ impl LiveBackend {
         let ended = Some((self.shared.clone(), call.id));
         match append_gated_call(&self.engine, &self.entry, ended, settled.record).await {
             Appended::Done => {
-                if settled.lossy
-                    && let Some(s) = self.entry.state().script.as_mut()
-                {
-                    s.lossy_calls += 1;
+                if let Some(s) = self.entry.state().script.as_mut() {
+                    if settled.lossy {
+                        s.lossy_calls += 1;
+                    }
+                    // From the request as sent (`call.params`), never from the response.
+                    s.calls.push(provenance_row(
+                        call.id,
+                        vc.spec,
+                        &info.alias,
+                        &call.params,
+                        &outcome_of(&settled.result),
+                    ));
                 }
                 settled.result
             }
@@ -1515,9 +1553,106 @@ pub(crate) fn normalizer() -> impl FnOnce(&Value) -> Result<Value, RebuildError>
     |payload| normalize(payload)
 }
 
-/// The preview of a script's release item: the JSON tree of the candidate (§6.3 fallback), the
-/// header of a script (no instance), and the host-computed "N host calls returned truncated or
-/// lossy data" warning (§9.5).
+/// R8: whether a host call's request asks for `renderedFields` (`rendered: true`, or
+/// `expand` naming it), judged from the request params alone.
+fn requests_rendered(params: &Value) -> bool {
+    crate::ops::jira::comments_rendered(params)
+}
+
+/// The class the host recorded for a call's answer: `ok` or `rejected:<class>` (PD-145).
+fn outcome_of(result: &HostCallResult) -> String {
+    match result {
+        HostCallResult::Ok(_) => "ok".to_owned(),
+        HostCallResult::Rejected { class, .. } => format!("rejected:{class}"),
+    }
+}
+
+/// One provenance row, from the host-call request (§2.3 `target_display` of the request params).
+fn provenance_row(
+    call_id: u64,
+    spec: &OperationSpec,
+    alias: &str,
+    params: &Value,
+    outcome: &str,
+) -> ProvenanceRow {
+    ProvenanceRow {
+        call_id,
+        op_id: spec.id.to_owned(),
+        instance: alias.to_owned(),
+        target_display: atlas_duck_registry::target_display(spec, params),
+        outcome: outcome.to_owned(),
+    }
+}
+
+/// The provenance row of a call the end of the run cancelled in flight.
+fn cancelled_row(info: &CallInfo) -> ProvenanceRow {
+    let target_display = atlas_duck_registry::get(&info.op).map_or_else(
+        || info.op.clone(),
+        |spec| atlas_duck_registry::target_display(spec, &info.params),
+    );
+    ProvenanceRow {
+        call_id: info.call_id,
+        op_id: info.op.clone(),
+        instance: info.alias.clone(),
+        target_display,
+        outcome: "cancelled_in_flight".to_owned(),
+    }
+}
+
+/// What the preview of a script's release item says about the run's text output beside the
+/// candidate: `atlas.log` lines and stderr, within the error candidate's bounds (§9.5, I-3).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RunOutput {
+    logs: Vec<String>,
+    stderr: String,
+    cut: bool,
+}
+
+/// Said beside logs, stderr or error text that was cut at its size bound.
+const OUTPUT_CUT_NOTE: &str =
+    "output was cut at its size bound; the audit record keeps the full text";
+
+impl RunOutput {
+    /// Read out of `{logs, stderr}` (a committed `SCRIPT_FINISHED` payload, or a candidate's
+    /// `script_error`) and bounded like an error candidate; anything but strings is dropped.
+    pub(crate) fn from_value(v: &Value) -> RunOutput {
+        let logs: Vec<Value> = v
+            .get("logs")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l.as_str().map(|s| Value::String(s.to_owned())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let stderr = v.get("stderr").and_then(Value::as_str).unwrap_or_default();
+        let bounded = bound_error(json!({ "logs": logs, "stderr": stderr }));
+        RunOutput {
+            logs: bounded
+                .get("logs")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            stderr: bounded
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            cut: bounded.get("truncated") == Some(&Value::Bool(true)),
+        }
+    }
+}
+
+/// The preview of a script's release item: the candidate view (§6.3 fallback JSON tree), the
+/// header of a script (no instance), what only the approver sees (source, provenance, and for
+/// an error item its logs and stderr), the host-computed "N host calls returned truncated or
+/// lossy data" warning (§9.5) and the R8 Caution. The logs and stderr of a *result* are not in
+/// its candidate: [`with_record_output`] adds them from the committed record.
 pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
     let view = ReadView {
         candidate: c.value(),
@@ -1535,13 +1670,57 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
         field_names: None,
     });
     m.header.class = "script".to_owned();
+    if st.rendered_call {
+        m.warnings.push(Warning::new(
+            WarningId::ScriptRenderedCopies,
+            warning::TEXT_SCRIPT_RENDERED_COPIES,
+        ));
+    }
     if st.lossy_calls > 0 {
         m.warnings.push(Warning::new(
             WarningId::HostCallsLossy,
             warning::host_calls_lossy(st.lossy_calls),
         ));
     }
+    // An error item has its logs and stderr in the candidate (redactable with it); a result's
+    // are not, and stay empty here.
+    let error = c.value().get("script_error");
+    let item = if error.is_some() {
+        ScriptItemKind::ErrorDetails
+    } else {
+        ScriptItemKind::Result
+    };
+    let out = error.map(RunOutput::from_value).unwrap_or_default();
+    let cut = error.is_some_and(|e| e.get("truncated") == Some(&Value::Bool(true)));
+    let view = m.body;
+    m.body = PreviewBody::Script {
+        item,
+        view: Box::new(view),
+        source: st.source.clone(),
+        provenance: st.calls.clone(),
+        logs: out.logs,
+        logs_note: cut.then(|| OUTPUT_CUT_NOTE.to_owned()),
+        stderr: out.stderr,
+    };
     m
+}
+
+/// A result item's logs and stderr, read from its committed `SCRIPT_FINISHED` record, into the
+/// preview `m` of [`preview_model`] (R7: never part of the released bytes). An error item keeps
+/// the ones its candidate has.
+pub(crate) fn with_record_output(m: &mut PreviewModel, out: RunOutput) {
+    if let PreviewBody::Script {
+        item: ScriptItemKind::Result,
+        logs,
+        logs_note,
+        stderr,
+        ..
+    } = &mut m.body
+    {
+        *logs = out.logs;
+        *stderr = out.stderr;
+        *logs_note = out.cut.then(|| OUTPUT_CUT_NOTE.to_owned());
+    }
 }
 
 // ---- submit -------------------------------------------------------------------------------------
@@ -2408,6 +2587,9 @@ async fn commit_item(
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
     let (called, in_flight) = (shared.instances(), shared.clone());
     let ctx = entry.ctx.clone();
+    // The calls the end of the run recorded as cancelled, for the preview's provenance (PD-145).
+    let cancelled = Arc::new(Mutex::new(Vec::new()));
+    let (took, cancelled_rows) = (cancelled.clone(), cancelled);
     let applied = engine
         .transition_with(
             entry,
@@ -2418,7 +2600,9 @@ async fn commit_item(
             // Host calls still in flight when the run ended by itself (timeout, kill, crash,
             // limit) are taken under this gate and recorded before the end (§9.5).
             move |_| {
-                let mut records = in_flight.in_flight_records(&ctx, InFlightReason::RunEnded);
+                let (mut records, calls) =
+                    in_flight.in_flight_records_with_calls(&ctx, InFlightReason::RunEnded);
+                *lock(&took) = calls;
                 records.push(record);
                 records
             },
@@ -2431,6 +2615,8 @@ async fn commit_item(
                 if let Some(s) = st.script.as_mut() {
                     s.item = Some(item);
                     s.preselect_error_class_only = preselect;
+                    s.calls
+                        .extend(lock(&cancelled_rows).iter().map(cancelled_row));
                     s.instances = called;
                     s.shared = None;
                 }

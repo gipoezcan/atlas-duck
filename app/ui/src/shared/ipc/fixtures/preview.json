@@ -81,6 +81,7 @@
       ],
       "release_blocked": "release blocked: the candidate could not be built exactly (internal); deny it, or drop the flagged items"
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -294,6 +295,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -354,6 +356,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -415,6 +418,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -591,6 +595,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -776,6 +781,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -951,6 +957,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -1156,6 +1163,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -1241,6 +1249,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -1314,6 +1323,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -1546,6 +1556,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -1775,6 +1786,7 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,
@@ -1989,6 +2001,129 @@
       ],
       "release_blocked": null
     },
+    "preselect": null,
+    "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
+    "raw": {
+      "page_bytes": 262144,
+      "page_count": 2,
+      "total_bytes": 307200
+    },
+    "warnings": [
+      {
+        "id": "possible_duplicate",
+        "level": "caution",
+        "text": "possible duplicate of req_abcdefghij0123456789"
+      },
+      {
+        "id": "custom_fields",
+        "level": "info",
+        "text": "contains 1 custom fields"
+      }
+    ]
+  },
+  {
+    "also_appears_in": [
+      "fields.description"
+    ],
+    "approvable": false,
+    "body": {
+      "item": "error_details",
+      "kind": "script",
+      "logs": [
+        "step 1",
+        "step 2"
+      ],
+      "logs_note": "output was cut at its size bound",
+      "provenance": [
+        {
+          "call_id": 1,
+          "instance": "work",
+          "op_id": "jira.issue.get",
+          "outcome": "ok",
+          "target_display": "PROJ-1"
+        },
+        {
+          "call_id": 2,
+          "instance": "work",
+          "op_id": "jira.search",
+          "outcome": "rejected:upstream_http",
+          "target_display": "project = PROJ"
+        },
+        {
+          "call_id": 3,
+          "instance": "work",
+          "op_id": "jira.issue.get",
+          "outcome": "cancelled_in_flight",
+          "target_display": "PROJ-2"
+        }
+      ],
+      "source": "const r = await atlas.call('jira.issue.get', {key: 'PROJ-1'});\nreturn r;",
+      "stderr": "warning: slow",
+      "view": {
+        "kind": "json_tree",
+        "tree": {
+          "entries": [
+            [
+              "script_error",
+              {
+                "entries": [
+                  [
+                    "class",
+                    {
+                      "kind": "string",
+                      "text": "TypeError"
+                    }
+                  ],
+                  [
+                    "elapsed",
+                    {
+                      "kind": "number",
+                      "text": "12"
+                    }
+                  ]
+                ],
+                "kind": "object",
+                "size": 34
+              }
+            ]
+          ],
+          "kind": "object",
+          "size": 51
+        }
+      }
+    },
+    "candidate_rev": {
+      "candidate_hash": "abababababababababababababababababababababababababababababababab",
+      "counter": 2
+    },
+    "deny_offers": [],
+    "deny_prefill": null,
+    "edit_form": null,
+    "header": {
+      "bidi_controls": 0,
+      "byte_size": 2048,
+      "class": "script",
+      "executes_as": "jdoe",
+      "fields_included": [
+        "summary",
+        "status"
+      ],
+      "hidden_in_preview_bytes": 0,
+      "instance_alias": "work",
+      "item_count": {
+        "more_available": true,
+        "shown": 1,
+        "total": 3
+      },
+      "op_id": "jira.issue.get",
+      "other_invisible": 1,
+      "query": null,
+      "receipt_fields": [
+        "key"
+      ],
+      "release_blocked": null
+    },
+    "preselect": "error_class_only",
     "preview_builder_version": "pb2;render3;icu-17.0;emoji-17.0",
     "raw": {
       "page_bytes": 262144,

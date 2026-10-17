@@ -2454,3 +2454,324 @@ async fn degraded_toggle_changed_before_script_started_only_narrows_the_spawn() 
     assert_eq!(failed["details"], json!({ "reason": "floor_not_met" }));
     Ok(())
 }
+
+// ---- the release preview model (Task 17: X-12, PD-145, PD-146, R8) --------------------------------
+
+use atlas_duck_preview::warning::{TEXT_SCRIPT_RENDERED_COPIES, WarningId};
+use atlas_duck_preview::{Preselect, Preview, PreviewBody, ProvenanceRow, ScriptItemKind};
+
+/// The script preview of `id`, opened as the approver does.
+fn script_preview(h: &Harness, id: &str) -> Result<Preview, TestError> {
+    Ok(h.approver().open(id).map_err(de)?.preview)
+}
+
+/// A `PreviewBody::Script` taken apart.
+struct ScriptBody {
+    item: ScriptItemKind,
+    view: PreviewBody,
+    source: String,
+    provenance: Vec<ProvenanceRow>,
+    logs: Vec<String>,
+    logs_note: Option<String>,
+    stderr: String,
+}
+
+fn script_body(p: &Preview) -> Result<ScriptBody, TestError> {
+    match &p.body {
+        PreviewBody::Script {
+            item,
+            view,
+            source,
+            provenance,
+            logs,
+            logs_note,
+            stderr,
+        } => Ok(ScriptBody {
+            item: *item,
+            view: (**view).clone(),
+            source: source.clone(),
+            provenance: provenance.clone(),
+            logs: logs.clone(),
+            logs_note: logs_note.clone(),
+            stderr: stderr.clone(),
+        }),
+        other => Err(format!("not a script body: {other:?}").into()),
+    }
+}
+
+fn row(call_id: u64, op: &str, target: &str, outcome: &str) -> ProvenanceRow {
+    ProvenanceRow {
+        call_id,
+        op_id: op.to_owned(),
+        instance: "jira-main".to_owned(),
+        target_display: target.to_owned(),
+        outcome: outcome.to_owned(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_preview_has_source_provenance_logs_stderr() -> TestResult {
+    let end = RunEnd::Result {
+        value: json!({ "n": 1 }),
+        logs: vec!["first line".to_owned(), "second line".to_owned()],
+        stderr: "a warning on stderr".to_owned(),
+    };
+    let (h, _runner) = harness(vec![ScriptPlan::new(vec![issue_call(1)], end)]).await?;
+    let source = "const r = await atlas.call('jira.issue.get', {key: 'ABC-1'});\nreturn {n: 1};";
+    let id = submit(&h, json!({ "source": source })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let p = script_preview(&h, &id)?;
+    let b = script_body(&p)?;
+    assert_eq!(b.item, ScriptItemKind::Result);
+    assert!(
+        matches!(b.view, PreviewBody::JsonTree { .. }),
+        "{:?}",
+        b.view
+    );
+    assert_eq!(b.source, source);
+    assert_eq!(b.provenance, [row(1, "jira.issue.get", "ABC-1", "ok")]);
+    assert_eq!(b.logs, ["first line", "second line"]);
+    assert_eq!(b.logs_note, None);
+    assert_eq!(b.stderr, "a warning on stderr");
+    assert_eq!(p.header.class, "script");
+    assert_eq!(p.preselect, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provenance_from_request_params_never_responses() -> TestResult {
+    let (h, _runner) = harness(vec![ScriptPlan::new(
+        vec![issue_call(1)],
+        result_end(json!({ "n": 1 })),
+    )])
+    .await?;
+    // The server answers with an issue whose key, summary and self link carry a canary. The
+    // request named ABC-1; the script's call params never include a fetched value.
+    let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+    issue["key"] = json!("CANARY-KEY-9");
+    issue["self"] = json!("https://jira.corp.example/rest/api/2/issue/CANARY-SELF-9");
+    issue["fields"]["summary"] = json!("CANARY-SUMMARY-9");
+    // Above the harness's own answer for this path (priority 1 beats the default).
+    let mock = requests_of(&h)?;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
+        .respond_with(
+            mock.response(200)
+                .set_body_raw(issue.to_string(), "application/json"),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let p = script_preview(&h, &id)?;
+    // The positive control: the call is there, labelled from the request.
+    assert_eq!(
+        script_body(&p)?.provenance,
+        [row(1, "jira.issue.get", "ABC-1", "ok")]
+    );
+    // The response, however, is nowhere in the preview, not even in the candidate view (the
+    // script returned a value of its own).
+    let shown = serde_json::to_string(&p)?;
+    assert!(
+        !shown.contains("CANARY"),
+        "a response value reached the preview: {shown}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x12_lossy_count_only_truncated_or_lossy_meta_jira_half() -> TestResult {
+    let calls = vec![
+        // A truncated page: five issues exist, one came back.
+        host_call(
+            1,
+            "jira.search",
+            json!({ "jql": "project = ABC", "max": 1 }),
+        ),
+        // A full answer.
+        issue_call(2),
+        // A 4xx: the script saw a rejection, no data.
+        host_call(3, "jira.issue.get", json!({ "key": "ABC-404" })),
+    ];
+    let (h, runner) = harness(vec![ScriptPlan::new(calls, result_end(json!(1)))]).await?;
+    let mock = requests_of(&h)?;
+    mock.json(
+        "/rest/api/2/search",
+        200,
+        &fixtures::jira_search_page(0, 1, 5, 1),
+    )
+    .await;
+    mock.json("/rest/api/2/issue/ABC-404", 404, fixtures::JIRA_ERROR_400)
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let results = runner.results();
+    assert_eq!(results.len(), 3, "{results:?}");
+    assert!(matches!(&results[0], HostCallResult::Ok(_)));
+    assert!(matches!(&results[1], HostCallResult::Ok(_)));
+    assert!(matches!(&results[2], HostCallResult::Rejected { .. }));
+    let p = script_preview(&h, &id)?;
+    let lossy: Vec<_> = p
+        .warnings
+        .iter()
+        .filter(|w| w.id == WarningId::HostCallsLossy)
+        .collect();
+    assert_eq!(lossy.len(), 1, "{:?}", p.warnings);
+    assert_eq!(
+        lossy[0].text,
+        "1 host calls returned truncated or lossy data"
+    );
+    // The rejection is a provenance row, not a lossy call.
+    let b = script_body(&p)?;
+    let outcomes: Vec<&str> = b.provenance.iter().map(|r| r.outcome.as_str()).collect();
+    assert_eq!(outcomes, ["ok", "ok", "rejected:upstream_http"]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn preselect_error_class_only_surfaced_for_queued_limit() -> TestResult {
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(1500);
+    let limited = ScriptPlan::new(
+        Vec::new(),
+        RunEnd::HostLimit {
+            name: "timeout_s".to_owned(),
+        },
+    );
+    let (h, runner) = harness(vec![hold(), hold(), limited]).await?;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("both slots", || runner.starts() == 2).await?;
+    let third = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&third, 30_000).await.ok_or("third never queued")?;
+    let p = script_preview(&h, &third)?;
+    assert_eq!(p.preselect, Some(Preselect::ErrorClassOnly));
+    let wire = serde_json::to_value(&p)?;
+    assert_eq!(wire["preselect"], "error_class_only");
+    assert_eq!(script_body(&p)?.item, ScriptItemKind::ErrorDetails);
+    for id in [&first, &second] {
+        let _ = h.await_(id, 100).await;
+    }
+    // A result that is not that limit outcome pre-selects nothing (`null` on the wire).
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(json!(1)))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let wire = serde_json::to_value(script_preview(&h, &id)?)?;
+    assert_eq!(wire["preselect"], Value::Null);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn error_details_preview_has_class_message_stack_elapsed() -> TestResult {
+    let end = RunEnd::Error {
+        class: "TypeError".to_owned(),
+        message: "x is not a function".to_owned(),
+        stack: "at main (script:3)".to_owned(),
+        elapsed_ms: 12,
+        logs: vec!["step 1".to_owned()],
+        stderr: "boom".to_owned(),
+    };
+    let (h, _runner) = harness(vec![ScriptPlan::new(vec![issue_call(1)], end)]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let p = script_preview(&h, &id)?;
+    let b = script_body(&p)?;
+    assert_eq!(b.item, ScriptItemKind::ErrorDetails);
+    let view = serde_json::to_string(&b.view)?;
+    for part in [
+        "TypeError",
+        "x is not a function",
+        "at main (script:3)",
+        "\"elapsed\"",
+        "\"12\"",
+    ] {
+        assert!(view.contains(part), "{part} missing from {view}");
+    }
+    assert_eq!(b.logs, ["step 1"]);
+    assert_eq!(b.stderr, "boom");
+    assert_eq!(b.provenance, [row(1, "jira.issue.get", "ABC-1", "ok")]);
+    assert_eq!(b.source, SRC);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn result_logs_read_from_committed_record() -> TestResult {
+    let end = RunEnd::Result {
+        value: json!({ "n": 1 }),
+        logs: vec!["from the record".to_owned()],
+        stderr: "stderr from the record".to_owned(),
+    };
+    let (h, _runner) = harness(vec![ScriptPlan::new(vec![issue_call(1)], end)]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let hits = common::test_hits(requests_of(&h)?).await.len();
+    h.evict_candidate(&id);
+    let p = script_preview(&h, &id)?;
+    let b = script_body(&p)?;
+    assert_eq!(b.logs, ["from the record"]);
+    assert_eq!(b.stderr, "stderr from the record");
+    // The rebuild reads the audit record only.
+    assert_eq!(common::test_hits(requests_of(&h)?).await.len(), hits);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn result_logs_over_the_bound_are_cut_with_a_note() -> TestResult {
+    let long = "x".repeat(600 * 1024);
+    let end = RunEnd::Result {
+        value: json!(1),
+        logs: vec![long.clone(), long],
+        stderr: String::new(),
+    };
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), end)]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let b = script_body(&script_preview(&h, &id)?)?;
+    let shown: usize = b.logs.iter().map(String::len).sum();
+    assert!(shown < 1200 * 1024, "{shown}");
+    assert!(b.logs.last().is_some_and(|l| l.contains("[truncated")));
+    assert!(b.logs_note.is_some());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m13_rendered_fields_caution_when_run_called_rendered() -> TestResult {
+    let (h, _runner) = harness(vec![
+        ScriptPlan::new(
+            vec![host_call(
+                1,
+                "jira.issue.get",
+                json!({ "key": "ABC-1", "rendered": true }),
+            )],
+            result_end(json!(1)),
+        ),
+        ScriptPlan::new(
+            vec![host_call(
+                1,
+                "jira.issue.get",
+                json!({ "key": "ABC-1", "expand": ["renderedFields"] }),
+            )],
+            result_end(json!(1)),
+        ),
+        ScriptPlan::new(vec![issue_call(1)], result_end(json!(1))),
+    ])
+    .await?;
+    let caution = |p: &Preview| {
+        p.warnings
+            .iter()
+            .filter(|w| w.id == WarningId::ScriptRenderedCopies)
+            .map(|w| w.text.clone())
+            .collect::<Vec<_>>()
+    };
+    for _ in 0..2 {
+        let id = submit(&h, json!({ "source": SRC })).await?;
+        h.queued(&id, 20_000).await.ok_or("never queued")?;
+        let p = script_preview(&h, &id)?;
+        assert_eq!(caution(&p), [TEXT_SCRIPT_RENDERED_COPIES]);
+    }
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let p = script_preview(&h, &id)?;
+    assert!(caution(&p).is_empty(), "{:?}", p.warnings);
+    Ok(())
+}

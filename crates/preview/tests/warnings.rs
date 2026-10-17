@@ -5,7 +5,7 @@ use atlas_duck_preview::{
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-const C6_CAUTION: [&str; 23] = [
+const C6_CAUTION: [&str; 24] = [
     "restricted_comments",
     "security_level",
     "all_fields",
@@ -29,6 +29,7 @@ const C6_CAUTION: [&str; 23] = [
     "diff_truncated",
     "no_current_value",
     "link_type_inward_phrase",
+    "script_rendered_copies",
 ];
 const C6_INFO: [&str; 9] = [
     "linked_issue_summaries",
@@ -62,7 +63,7 @@ fn every_warning_id_has_exactly_one_level() -> TestResult {
     assert_eq!(info, C6_INFO);
     let mut all = WarningId::ALL.to_vec();
     all.dedup();
-    assert_eq!(all.len(), 32);
+    assert_eq!(all.len(), 33);
     Ok(())
 }
 
@@ -83,6 +84,10 @@ fn fixed_texts_verbatim() {
     assert_eq!(
         TEXT_SERVER_RENDERED_VIEW,
         "server-rendered view: macros may include content from other pages"
+    );
+    assert_eq!(
+        TEXT_SCRIPT_RENDERED_COPIES,
+        "this result may contain rendered copies of fields (renderedFields); dropping a field does not drop its copy; use mask in every occurrence"
     );
     assert_eq!(TEXT_UNKNOWN_MACROS, "body contains unknown macros");
     assert_eq!(TEXT_UNRESOLVED_MENTION, "mention could not be resolved");

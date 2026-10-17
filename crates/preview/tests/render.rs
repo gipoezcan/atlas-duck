@@ -65,6 +65,7 @@ fn preview(class: &str, body: PreviewBody, warnings: Vec<Warning>) -> Preview {
         edit_form: None,
         deny_offers: Vec::new(),
         deny_prefill: None,
+        preselect: None,
     }
 }
 

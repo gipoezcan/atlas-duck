@@ -134,6 +134,38 @@ export interface PreviewBody {
   [field: string]: unknown;
 }
 
+/** One host call of a script run (PD-145): from the request as the script sent it, never a response. */
+export interface ProvenanceRow {
+  call_id: number;
+  op_id: string;
+  /** The instance alias the call named. */
+  instance: string;
+  target_display: string;
+  /** `ok`, `rejected:<class>` or `cancelled_in_flight`. */
+  outcome: string;
+}
+
+export type ScriptItemKind = 'result' | 'error_details';
+
+/**
+ * A script's release item (`PreviewBody` with `kind: 'script'`, Δ5/PD-146): the candidate `view`,
+ * then what only the approver sees. `source`, `logs` and `stderr` are untrusted text, never markup.
+ */
+export interface ScriptPreviewBody extends PreviewBody {
+  kind: 'script';
+  item: ScriptItemKind;
+  view: PreviewBody;
+  source: string;
+  provenance: ProvenanceRow[];
+  logs: string[];
+  /** Set when logs, stderr or the error text was cut at its size bound. */
+  logs_note: string | null;
+  stderr: string;
+}
+
+/** The redaction a preview pre-selects (Δ5): the UI maps the tag to its own preset. */
+export type PreselectTag = 'error_class_only';
+
 export type DenyOfferKind =
   | 'upstream_http'
   | 'outcome_hint'
@@ -193,6 +225,8 @@ export interface Preview {
   also_appears_in: string[];
   /** Pre-filled deny reason (a conflict hold), or null. */
   deny_prefill: string | null;
+  /** A script's data-free limit outcome of a queued run pre-selects "keep error class only" (§9.5). */
+  preselect: PreselectTag | null;
   [field: string]: unknown;
 }
 

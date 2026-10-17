@@ -84,6 +84,17 @@ pub struct Preview {
     pub deny_offers: Vec<DenyOffer>,
     /// PD-70: the text the deny reason field starts with (a conflict hold's fixed prefill).
     pub deny_prefill: Option<String>,
+    /// Δ5: the redaction the approver's choice starts on, as a preview-local tag (§9.5: the
+    /// data-free limit outcome of a queued script pre-selects "keep error class only"). `preview`
+    /// sits below `core` and never names a core preset; the UI maps the tag to its own.
+    pub preselect: Option<Preselect>,
+}
+
+/// What a preview pre-selects (Δ5); serialized `"error_class_only"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Preselect {
+    ErrorClassOnly,
 }
 
 /// One deny detail the approver may attach (PD-70, C.7 `DenyDetails`).
@@ -258,6 +269,44 @@ pub enum PreviewBody {
         constructs: Option<ConstructList>,
         requests: Vec<RequestView>,
     },
+    /// §6.3 Script result / Script error details (Δ5, PD-146): the candidate view (`view`, today
+    /// the JSON tree; a table where the M7 list rule applies), then what only the approver sees.
+    /// `source`, every provenance field, `logs` and `stderr` are untrusted text (the script's own
+    /// or the worker's): the renderer escapes them, nothing here is markup. `target_display` in
+    /// a provenance row comes from the host-call request, never from a response.
+    Script {
+        /// Named `item`, not `kind`: the body's own serde tag is `kind`.
+        item: ScriptItemKind,
+        view: Box<PreviewBody>,
+        source: String,
+        provenance: Vec<ProvenanceRow>,
+        logs: Vec<String>,
+        /// Set when `logs`, `stderr` or the error text was cut at its size bound (the audit
+        /// record keeps the full text).
+        logs_note: Option<String>,
+        stderr: String,
+    },
+}
+
+/// Which release item a [`PreviewBody::Script`] shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScriptItemKind {
+    Result,
+    ErrorDetails,
+}
+
+/// One host call of a script run (PD-145): built from the request as the script sent it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProvenanceRow {
+    pub call_id: u64,
+    pub op_id: String,
+    /// The instance alias the call named.
+    pub instance: String,
+    /// `registry::target_display` of the request params (§2.3).
+    pub target_display: String,
+    /// `ok`, `rejected:<class>` or `cancelled_in_flight`.
+    pub outcome: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

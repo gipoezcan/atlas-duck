@@ -50,8 +50,8 @@ use atlas_duck_preview::form::{AllowedValues, EditForm, EditInput, InputKind};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     BodyView, CommentView, ConstructList, DenyOffer, DenyOfferKind, FieldRow, IssueCard, ItemCount,
-    OutcomeKind, PREVIEW_BUILDER_VERSION, Preview, PreviewBody, PreviewHeader, RawPager,
-    RequestView, json_tree,
+    OutcomeKind, PREVIEW_BUILDER_VERSION, Preselect, Preview, PreviewBody, PreviewHeader,
+    ProvenanceRow, RawPager, RequestView, ScriptItemKind, json_tree,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -351,6 +351,41 @@ fn bodies() -> Vec<PreviewBody> {
             constructs: None,
             requests: requests(),
         },
+        // M8 T17 (Δ5): a script's error-details item with every section.
+        PreviewBody::Script {
+            item: ScriptItemKind::ErrorDetails,
+            view: Box::new(PreviewBody::JsonTree {
+                tree: json_tree(&json!({"script_error": {"class": "TypeError", "elapsed": 12}})),
+            }),
+            source: "const r = await atlas.call('jira.issue.get', {key: 'PROJ-1'});\nreturn r;"
+                .into(),
+            provenance: vec![
+                ProvenanceRow {
+                    call_id: 1,
+                    op_id: "jira.issue.get".into(),
+                    instance: "work".into(),
+                    target_display: "PROJ-1".into(),
+                    outcome: "ok".into(),
+                },
+                ProvenanceRow {
+                    call_id: 2,
+                    op_id: "jira.search".into(),
+                    instance: "work".into(),
+                    target_display: "project = PROJ".into(),
+                    outcome: "rejected:upstream_http".into(),
+                },
+                ProvenanceRow {
+                    call_id: 3,
+                    op_id: "jira.issue.get".into(),
+                    instance: "work".into(),
+                    target_display: "PROJ-2".into(),
+                    outcome: "cancelled_in_flight".into(),
+                },
+            ],
+            logs: vec!["step 1".into(), "step 2".into()],
+            logs_note: Some("output was cut at its size bound".into()),
+            stderr: "warning: slow".into(),
+        },
     ]
 }
 
@@ -366,8 +401,16 @@ fn previews() -> Vec<Preview> {
                     | PreviewBody::UpstreamError { .. }
                     | PreviewBody::JiraIssue { .. }
                     | PreviewBody::Table { .. }
+                    | PreviewBody::Script { .. }
             );
-            let mut header = header(if write { "write" } else { "read" });
+            let script = matches!(body, PreviewBody::Script { .. });
+            let mut header = header(if write {
+                "write"
+            } else if script {
+                "script"
+            } else {
+                "read"
+            });
             // M5 M-11: a read whose rebuild failed shows the banner and cannot be approved.
             let blocked = matches!(body, PreviewBody::JsonTree { .. });
             if blocked {
@@ -463,6 +506,7 @@ fn previews() -> Vec<Preview> {
                 }),
                 deny_offers,
                 deny_prefill,
+                preselect: script.then_some(Preselect::ErrorClassOnly),
             }
         })
         .collect()
@@ -1195,9 +1239,10 @@ fn every_preview_body_variant_has_a_fixture() -> TestResult {
         })
         .unwrap_or_default();
     let unique: std::collections::BTreeSet<&String> = kinds.iter().collect();
-    // Thirteen `PreviewBody` variants (C.6), one fixture each; a new one must get a fixture.
-    assert_eq!(kinds.len(), 13, "{kinds:?}");
-    assert_eq!(unique.len(), 13, "{kinds:?}");
+    // Fourteen `PreviewBody` variants (C.6, Δ5 `script`), one fixture each; a new one must get a
+    // fixture.
+    assert_eq!(kinds.len(), 14, "{kinds:?}");
+    assert_eq!(unique.len(), 14, "{kinds:?}");
     Ok(())
 }
 
