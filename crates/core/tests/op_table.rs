@@ -966,7 +966,13 @@ fn move_verdict() -> EnrichVerdict {
     resolved.insert("parent".to_owned(), json!("Release notes"));
     resolved.insert("parent_id".to_owned(), json!("123400"));
     EnrichVerdict::preview(
-        json!({"version": 7, "title": "Release checklist", "space_key": "DOC"}),
+        json!({
+            "version": 7,
+            "title": "Release checklist",
+            "space_key": "DOC",
+            "from_parent_id": "65536",
+            "to_parent_id": "123400",
+        }),
         resolved,
     )
 }

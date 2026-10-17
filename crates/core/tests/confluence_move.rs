@@ -267,6 +267,11 @@ fn page_move_plan_stages() -> TestResult {
     assert_eq!(query(the_parent), [("expand", "space,ancestors")]);
     // The stale baseline is the version enrichment read; the executor's inputs are resolved.
     assert_eq!(v.baseline["version"], json!(7));
+    // The baseline names both ends of the move: the page's current parent (its last ancestor) and
+    // the destination; neither is the other's value under a vague key.
+    assert_eq!(v.baseline["from_parent_id"], json!(HOME_ID));
+    assert_eq!(v.baseline["to_parent_id"], json!(PARENT_ID));
+    assert!(v.baseline.get("parent_id").is_none(), "{:?}", v.baseline);
     assert_eq!(v.resolved.get("id"), Some(&json!(PAGE_ID)));
     assert_eq!(v.resolved.get("parent"), Some(&json!(PARENT_ID)));
     assert_eq!(v.resolved.get("parent_id"), Some(&json!(PARENT_ID)));
@@ -308,6 +313,13 @@ fn page_move_plan_stages() -> TestResult {
     blog["type"] = json!("blogpost");
     let (rounds, v) = staged(&params(PARENT_ID), &[blog])?;
     assert_eq!((rounds.len(), v.hold), (1, Hold::EnrichmentError));
+
+    // A root page has no current parent.
+    let mut root = moved_page(7);
+    root["ancestors"] = json!([]);
+    let (_, v) = staged(&params(PARENT_ID), &[root, parent_answer()])?;
+    assert_eq!(v.hold, Hold::Preview, "{v:?}");
+    assert_eq!(v.baseline["from_parent_id"], Value::Null);
     Ok(())
 }
 
@@ -805,6 +817,30 @@ fn page_move_card_counts_what_it_shows() -> TestResult {
     let (_, _, to) = move_card(&m)?;
     assert!(to.iter().all(|t| t.len() < long.len()), "the title is cut");
     assert!(m.header.hidden_in_preview_bytes > 0);
+    Ok(())
+}
+
+/// The old path (`from_path`, the moved page's own ancestors) is shown too, so an invisible
+/// character in one of its titles is counted, not only escaped. The new path is plain here, so
+/// only the old path can account for the character.
+#[test]
+fn page_move_card_counts_invisibles_in_the_old_path() -> TestResult {
+    let p = params(PARENT_ID);
+    let card_with = |ancestor: &str| -> Result<PreviewModel, TestError> {
+        let mut moved = moved_page(7);
+        moved["ancestors"] = json!([{"id": HOME_ID, "type": "page", "title": ancestor}]);
+        let v = staged(&p, &[moved, parent_answer()])?.1;
+        preview_of(&p, &v, &requests(&p, &v)?)
+    };
+    let plain = card_with("Home")?;
+    let m = card_with("Ho\u{200b}me")?;
+    let from = move_card(&m)?.1;
+    assert!(from.iter().all(|t| !t.contains('\u{200b}')), "{from:?}");
+    assert_eq!(
+        m.header.other_invisible,
+        plain.header.other_invisible + 1,
+        "one ZWSP in the old path"
+    );
     Ok(())
 }
 
@@ -1373,6 +1409,14 @@ async fn page_move_409_returns_refreshed_at_the_new_version() -> TestResult {
     }
     assert!(item.approvable, "{item:?}");
     assert_eq!(stale_reasons(&h, &id).await?, [json!("version_conflict")]);
+    // No Caution marks the return, so the cleared opened flag is what forces a fresh look: the
+    // earlier approval is gone and the item is flagged stale until it is re-opened.
+    assert!(item.stale, "{item:?}");
+    let res = h.approver().approve_unopened(&id);
+    assert!(
+        matches!(res, Err(DecisionError::Invalid(InvalidReason::NotOpened))),
+        "{res:?}"
+    );
     let p = opened(&h, &id)?;
     match &p.body {
         PreviewBody::PageMove { page, .. } => {

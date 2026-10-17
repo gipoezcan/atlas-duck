@@ -500,11 +500,14 @@ fn move_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
     }
     resolved.insert("parent_id".to_owned(), Value::from(parent.id.as_str()));
     // The stale rule compares `version` (`stale::PAGE_MOVE`); the `PUT` sends it + 1.
+    // `from_parent_id` is the page's current parent (its last ancestor, none for a root page),
+    // `to_parent_id` the destination.
     let baseline = json!({
         "version": page.version,
         "title": page.title,
         "space_key": page.space_key,
-        "parent_id": parent.id,
+        "from_parent_id": page.ancestors.last().map(|a| a.id.as_str()),
+        "to_parent_id": parent.id,
     });
     let mut verdict = EnrichVerdict::preview(baseline, resolved);
     facts.from_path = page.ancestors.into_iter().map(|a| a.title).collect();
