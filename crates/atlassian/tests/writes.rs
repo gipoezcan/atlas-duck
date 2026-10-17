@@ -587,6 +587,55 @@ async fn write_409_version_conflict() -> TestResult {
     Ok(())
 }
 
+/// M7 Task 16 (lead ruling): the optimistic lock is a PUT notion (`page.update`/`page.move` carry
+/// `version.number`). A Confluence POST (`page.create`, `comment.add`, labels, attachments)
+/// answered 409, or 400 with a version text, is a plain refusal: `Failed4xx` with the server's
+/// message, never a conflict that would return the write to the queue.
+#[tokio::test]
+async fn write_409_on_post_is_failed4xx() -> TestResult {
+    let duplicate = r#"{"statusCode":409,"data":{"authorized":false,"valid":true,"errors":[],"successful":false},"message":"A page with this title already exists: A page already exists with the title Notes in the space with key DOC"}"#;
+    for (template, status, body) in [
+        ("/rest/api/content", 409, duplicate),
+        (
+            "/rest/api/content/65537/child/comment",
+            409,
+            CONFLUENCE_VERSION_CONFLICT_409,
+        ),
+        ("/rest/api/content/65537/label", 409, "{}"),
+        (
+            "/rest/api/content/65537/child/attachment",
+            409,
+            CONFLUENCE_VERSION_CONFLICT_409,
+        ),
+        ("/rest/api/content", 400, CONFLUENCE_VERSION_CONFLICT_400),
+    ] {
+        let dc = MockDc::start(Product::Confluence, "").await;
+        dc.json(template, status, body).await;
+        let t = test_client(dc.client_config())?;
+        let s = spec(
+            "POST",
+            &url_for(&dc, template, json!({}))?,
+            Some("application/json"),
+            b"{}",
+        );
+        assert_eq!(
+            t.client
+                .send_approved(test_write_cover()?, &json_op(s))
+                .await,
+            WriteOutcome::Failed4xx {
+                response: UpstreamResponse {
+                    status,
+                    content_type: Some("application/json".into()),
+                    body: body.as_bytes().to_vec(),
+                },
+                request_index: 0,
+            },
+            "{template} {status}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn write_400_version_message_conflict() -> TestResult {
     for body in [
@@ -670,17 +719,20 @@ async fn write_400_other_failed4xx() -> TestResult {
         WriteOutcome::Failed4xx { .. }
     ));
 
-    // Version conflicts are a Confluence notion (§5.4 step 6): Jira 400/409 are plain failures.
-    for (status, body) in [
-        (400, JIRA_ERROR_400),
-        (400, r#"{"errorMessages":["version conflict"]}"#),
-        (409, "{}"),
+    // Version conflicts are a Confluence notion (§5.4 step 6): Jira 400/409 are plain failures,
+    // on a PUT as on a POST.
+    for (verb, status, body) in [
+        ("POST", 400, JIRA_ERROR_400),
+        ("POST", 400, r#"{"errorMessages":["version conflict"]}"#),
+        ("POST", 409, "{}"),
+        ("PUT", 409, CONFLUENCE_VERSION_CONFLICT_409),
+        ("PUT", 400, r#"{"errorMessages":["version conflict"]}"#),
     ] {
         let dc = MockDc::start(Product::Jira, "").await;
         dc.json("/rest/api/2/issue", status, body).await;
         let t = test_client(dc.client_config())?;
         let s = spec(
-            "POST",
+            verb,
             &url_for(&dc, "/rest/api/2/issue", json!({}))?,
             Some("application/json"),
             b"{}",
@@ -699,7 +751,7 @@ async fn write_400_other_failed4xx() -> TestResult {
                     (status, body.as_bytes())
                 );
             }
-            other => return Err(format!("{status} {body}: {other:?}").into()),
+            other => return Err(format!("{verb} {status} {body}: {other:?}").into()),
         }
     }
     Ok(())

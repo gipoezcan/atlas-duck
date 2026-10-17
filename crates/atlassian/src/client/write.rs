@@ -229,8 +229,11 @@ impl InstanceClient {
         if (200..300).contains(&status) {
             return unknown(UnknownReason::UndeclaredSuccess);
         }
-        // Lost-update protection is Confluence's optimistic lock (§5.4 steps 2 and 6).
+        // Lost-update protection is Confluence's optimistic lock (§5.4 steps 2 and 6), which only a
+        // PUT carries (`version.number`). A POST (create, comment, label, attachment) answered 409
+        // is a plain refusal, `Failed4xx` with the server's message (M7 Task 16).
         if self.cfg.product == Product::Confluence
+            && spec.method == "PUT"
             && (status == 409 || (status == 400 && is_version_conflict(&response.body)))
         {
             return WriteOutcome::VersionConflict { request_index };
