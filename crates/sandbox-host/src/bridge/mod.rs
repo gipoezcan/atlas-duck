@@ -28,7 +28,8 @@
 //! never across a blocking read, write or wait, nor across a parse of a frame's payload;
 //! [`RunHandleImpl::kill`] takes it briefly and then calls the non-blocking [`KillHandle`] (M3
 //! M-1). Host calls run as tasks on the caller's runtime that are never aborted (PD-148); a result
-//! is queued for the worker only while the run is undecided.
+//! is queued for the worker only while the run is undecided and the worker not yet reaped; the
+//! outcome is published only after the writer thread ended (or [`WRITER_GRACE`] passed).
 //!
 //! Spawn-time checks (PD-132, PD-133, PD-141): the ready frame (`probe.ready`) is read within
 //! [`READY_TIMEOUT`]; its `worker_version` must equal the recorded identity's embedded version,
@@ -124,6 +125,12 @@ pub const DIAG_MEMORY_WATCH_FAILED: &str = "sandbox_memory_watch_failed";
 /// [`STDOUT_GRACE`], or it was still open [`STDOUT_DRAIN_MAX`] after the reap; the outcome was
 /// published without stdout's end, and later frames are ignored.
 pub const DIAG_STDOUT_HELD: &str = "sandbox_stdout_held_after_exit";
+/// Host fact for [`RunOutcome::diag`] (M8 fuzz fix, review M-2): the writer thread was still alive
+/// [`WRITER_GRACE`] after the reap, so something else holds the worker's stdin without reading it
+/// (or the reap failed, [`DIAG_REAP_FAILED`]). The outcome was published anyway; the frame being
+/// written and the queue behind it (at most [`unread_results_cap`]) stay with the thread for as
+/// long as the holder lives.
+pub const DIAG_STDIN_HELD: &str = "sandbox_stdin_held_after_exit";
 /// How often a kill is sent again until the worker is reaped (see the module documentation).
 pub const KILL_RETRY: Duration = Duration::from_secs(1);
 /// How long, after the reap, the outcome waits for stdout's EOF while the reader sits in a read
@@ -142,7 +149,8 @@ pub const STDOUT_DRAIN_MAX: Duration = Duration::from_secs(30);
 const STDERR_GRACE: Duration = Duration::from_secs(2);
 /// How long the outcome waits after the reap for the writer thread to end and drop the frames
 /// still queued. The worker's end of stdin is closed by then, so a blocked write fails at once;
-/// only a stdin that something else holds without reading takes this long.
+/// only a stdin that something else holds without reading takes this long ([`DIAG_STDIN_HELD`]),
+/// or a failed reap, where the worker may still be alive. Counted from the reap.
 const WRITER_GRACE: Duration = Duration::from_secs(2);
 /// How long the outcome waits after the reap for the memory watch to end.
 const WATCH_GRACE: Duration = Duration::from_secs(2);
@@ -551,7 +559,9 @@ pub fn compile_run(
     let (frames_tx, frames_rx) = mpsc::channel();
     let queued = Arc::new(AtomicUsize::new(0));
     // The writer's end is not awaited: `compile_run` returns before the reap, and its queue holds
-    // the one request.
+    // the one request (the source, at most `HOST_TO_WORKER_MAX`). On the verdict path the worker
+    // read it whole before it answered; on the deadline and EOF paths it may outlive the verdict
+    // until the kill closes the pipe.
     if let Err(e) = writer::spawn(stdin, frames_rx, Arc::clone(&queued)) {
         give_up(kill, exit);
         return Err(spawn_error(&e));
@@ -795,7 +805,8 @@ struct Run {
 
 struct Inner {
     state: RunState,
-    /// The writer's queue; dropped once the run is decided (the worker's stdin closes).
+    /// The writer's queue; dropped once the run is decided or the worker is reaped (the writer
+    /// then ends and the worker's stdin closes).
     writer: Option<Sender<Vec<u8>>>,
     terminal_at: Option<Instant>,
     /// A call result was replaced by a rejection ([`DIAG_CALL_RESULT_REPLACED`]).
@@ -960,7 +971,8 @@ impl Run {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Runs `f` under the run lock; once the run is decided, the writer's queue is dropped.
+    /// Runs `f` under the run lock; once the run is decided, the writer's queue is dropped (the
+    /// finisher drops it too, at the reap).
     fn update<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
         let mut inner = self.lock();
         let out = f(&mut inner);
@@ -1056,7 +1068,9 @@ impl Run {
             // Under the lock: every addition to `queued` happens here (or before the run
             // exists), so the check and the addition are one step; the writer only subtracts.
             let unwritten = self.queued.load(Ordering::SeqCst);
-            if unwritten.saturating_add(frame.len()) > self.unread_cap {
+            // `writer` is gone once the run is decided or the worker reaped: nothing is queued
+            // then, so a held writer's backlog must not decide the run as `UnreadResults`.
+            if inner.writer.is_some() && unwritten.saturating_add(frame.len()) > self.unread_cap {
                 return inner.state.on_unread_results();
             }
             if inner.state.complete_call()
@@ -1112,19 +1126,23 @@ impl Run {
         let watch_failed = memory.is_some_and(|m| !m.stop(WATCH_GRACE));
         let stdout_ended =
             await_stdout_end(&self.ends, &self.progress, STDOUT_GRACE, STDOUT_DRAIN_MAX);
+        if !stdout_ended {
+            // From here on the reader ignores what whatever holds stdout still sends.
+            self.lock().stdout_cut = true;
+        }
         let stderr = stderr.recv_timeout(STDERR_GRACE).unwrap_or_default();
         // The writer never sends: `Disconnected` is its end, `Timeout` a stdin that something
         // else holds without reading (the frame being written and the queue stay with the thread).
-        let _ = writer_ended.recv_timeout(WRITER_GRACE);
+        // Its sender was dropped at the reap, so the waits since then count against its grace.
+        let stdin_held = writer_ended
+            .recv_timeout(WRITER_GRACE.saturating_sub(reaped_at.elapsed()))
+            == Err(mpsc::RecvTimeoutError::Timeout);
         let mut diag = Vec::new();
         if exit.is_none() {
             diag.push(DIAG_REAP_FAILED);
         }
         let done = {
             let mut inner = self.lock();
-            if !stdout_ended {
-                inner.stdout_cut = true;
-            }
             if !inner.state.terminal() && exit == Some(ExitKind::Code(EXIT_PROTOCOL)) {
                 diag.push(DIAG_HOST_PROTOCOL_EXIT);
             }
@@ -1146,6 +1164,9 @@ impl Run {
             }
             if !stdout_ended {
                 diag.push(DIAG_STDOUT_HELD);
+            }
+            if stdin_held {
+                diag.push(DIAG_STDIN_HELD);
             }
             let (logs, logs_truncated) = inner.state.take_logs();
             let ended = inner.terminal_at.unwrap_or(reaped_at);
