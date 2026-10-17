@@ -275,6 +275,91 @@ pub fn server_example(op_id: &str) -> Result<Value, String> {
     Ok(answer)
 }
 
+/// The id of the attachment a `replace` upload finds (the `confluence.attachment.list` example's).
+pub const REPLACE_ATTACHMENT_ID: &str = "att3001";
+
+/// `params[key]` as text, or an error naming it.
+fn text_param<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
+    params[key]
+        .as_str()
+        .ok_or_else(|| format!("example params have no string {key}"))
+}
+
+/// The params carry `key` with a value (an optional param the case sets).
+fn has_param(params: &Value, key: &str) -> bool {
+    params.get(key).is_some_and(|v| !v.is_null())
+}
+
+/// An upload that replaces the attachment of its filename.
+pub fn is_replace(params: &Value) -> bool {
+    params["replace"] == json!(true)
+}
+
+/// The attachment lookup of a `replace` upload: the `confluence.attachment.list` example's one
+/// attachment, named like the upload and with the version the expand asks for.
+fn replace_lookup(filename: &str) -> Result<Value, String> {
+    let mut list = read_example("confluence.attachment.list")?;
+    let entry = list
+        .pointer_mut("/results/0")
+        .and_then(Value::as_object_mut)
+        .ok_or("the attachment list example has no entry")?;
+    entry.insert("title".to_owned(), json!(filename));
+    entry.insert("version".to_owned(), json!({"number": 1}));
+    Ok(list)
+}
+
+/// The method and path of the op's own request for `params`: the alternative endpoint of a
+/// `page.history` with `version`, the `/data` endpoint of the attachment a `replace` upload
+/// targets (core builds it from the lookup, §7.4), the registry's endpoint otherwise.
+pub fn own_request(spec: &OperationSpec, params: &Value) -> Result<(&'static str, String), String> {
+    let endpoint = match spec.alt_endpoint {
+        Some(alt) if has_param(params, alt.when_param_present) => alt.endpoint,
+        _ => spec.endpoint,
+    };
+    let mut path = fill_path(endpoint.path, params)?;
+    if spec.id == "confluence.attachment.upload" && is_replace(params) {
+        path = format!("{path}/{REPLACE_ATTACHMENT_ID}/data");
+    }
+    Ok((http_method(endpoint.method), path))
+}
+
+/// What the server answers the op's own read with: [`server_example`], the `body.view` of the
+/// same page for `format: view`, and the page itself for `page.history` with `version` (the
+/// historical content, not the summary).
+pub fn server_answer(spec: &OperationSpec, params: &Value) -> Result<Value, String> {
+    if spec.id == "confluence.page.history" && has_param(params, "version") {
+        return server_example("confluence.page.get");
+    }
+    let mut answer = server_example(spec.id)?;
+    if spec.id == "confluence.page.get" && params["format"] == json!("view") {
+        answer["body"] = json!({"view": {"value": PAGE_EXAMPLE_STORAGE, "representation": "view"}});
+    }
+    Ok(answer)
+}
+
+/// What the server answers a write with: its declared success; for the upload the wrapped
+/// `{"results":[receipt]}` of a new attachment (Δ4 b) or the attachment itself for a replace, for
+/// `label.add` the page of labels the server now has (the `confluence.label.list` example).
+fn write_answer(
+    mock: &MockDc,
+    spec: &OperationSpec,
+    params: &Value,
+) -> Result<ResponseTemplate, String> {
+    Ok(match spec.id {
+        "confluence.attachment.upload" => {
+            let receipt = spec.result_example_json();
+            let body = if is_replace(params) {
+                receipt
+            } else {
+                json!({"results": [receipt], "size": 1})
+            };
+            json_answer(mock, 200, &body)
+        }
+        "confluence.label.add" => json_answer(mock, 200, &read_example("confluence.label.list")?),
+        _ => declared_success(mock, spec),
+    })
+}
+
 /// The extra GETs of `spec` for `params`. Every Confluence op id is named here: an op whose
 /// GETs are not decided yet is an error, so X-09 fails for it instead of passing vacuously
 /// (the write tasks of M7 add their stages here).
@@ -307,27 +392,55 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
         // and a duplicate-title lookup that finds nothing (`GET /rest/api/content`; the POST of
         // the create is the op's own endpoint).
         "confluence.page.create" => {
-            let field = |k: &str| {
-                params[k]
-                    .as_str()
-                    .ok_or(format!("example params have no string {k}"))
-            };
-            let (space, parent) = (field("space")?, field("parent")?);
-            Ok(vec![
+            let space = text_param(params, "space")?;
+            let mut aux = vec![
                 Aux {
                     path: format!("/rest/api/space/{space}"),
                     body: json!({"key": space, "name": space, "type": "global"}),
                 },
                 Aux {
-                    path: content_path(parent),
-                    body: json!({"id": parent, "type": "page", "status": "current",
-                                 "title": "Parent", "space": {"key": space}, "ancestors": []}),
-                },
-                Aux {
                     path: "/rest/api/content".to_owned(),
                     body: json!({"results": [], "start": 0, "limit": 1, "size": 0}),
                 },
-            ])
+            ];
+            // Without a `parent` the page goes to the space root: no parent GET.
+            if has_param(params, "parent") {
+                let parent = text_param(params, "parent")?;
+                aux.push(Aux {
+                    path: content_path(parent),
+                    body: json!({"id": parent, "type": "page", "status": "current",
+                                 "title": "Parent", "space": {"key": space}, "ancestors": []}),
+                });
+            }
+            Ok(aux)
+        }
+        // Task 18 (PD-107): the content the comment goes on (its type is the container type), and
+        // with `reply_to` the comment replied to, which must sit on that content.
+        "confluence.comment.add" => {
+            let content_id = text_param(params, "content_id")?;
+            let mut aux = vec![Aux {
+                path: content_path(content_id),
+                body: server_example("confluence.page.get")?,
+            }];
+            if has_param(params, "reply_to") {
+                let reply = text_param(params, "reply_to")?;
+                aux.push(Aux {
+                    path: content_path(reply),
+                    body: json!({"id": reply, "type": "comment", "status": "current",
+                                 "container": {"id": content_id, "type": "page"}}),
+                });
+            }
+            Ok(aux)
+        }
+        // Task 19 (PD-108): the content with the labels it has now (`expand=metadata.labels`):
+        // the page example carrying the `confluence.label.list` example as its label page.
+        "confluence.label.add" | "confluence.label.remove" => {
+            let mut content = server_example("confluence.page.get")?;
+            content["metadata"] = json!({"labels": read_example("confluence.label.list")?});
+            Ok(vec![Aux {
+                path: content_path(text_param(params, "id")?),
+                body: content,
+            }])
         }
         // Task 17 (PD-106): the page with its version, space and ancestors (stage 1, and the
         // stale check's `?expand=version` on the same path), and the parent by id (all digits in
@@ -353,16 +466,21 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
                 },
             ])
         }
-        // Task 20a (PD-109): the attachments of that filename (none: the example has no
-        // `replace`, so nothing collides and there is no stale rule); the multipart `POST` is
-        // the op's own endpoint.
+        // Task 20a (PD-109): the attachments of that filename, a non-full page (`limit` 50, the
+        // lookup's own; the stale re-read of a replace is the same GET). A new attachment finds
+        // none (the example has no `replace`, nothing collides); a replace finds the one it
+        // replaces, from the `confluence.attachment.list` example. The multipart `POST` is the
+        // op's own request.
         "confluence.attachment.upload" => {
-            let id = params["id"]
-                .as_str()
-                .ok_or("example params have no string id")?;
+            let id = text_param(params, "id")?;
+            let body = if is_replace(params) {
+                replace_lookup(text_param(params, "filename")?)?
+            } else {
+                json!({"results": [], "start": 0, "limit": 50, "size": 0})
+            };
             Ok(vec![Aux {
                 path: format!("{}/child/attachment", content_path(id)),
-                body: json!({"results": [], "start": 0, "limit": 50, "size": 0}),
+                body,
             }])
         }
         other => Err(format!(
@@ -385,12 +503,12 @@ pub async fn mount_for_op(
     for a in &aux {
         mount_get(mock, &a.path, json_answer(mock, 200, &a.body)).await;
     }
-    let own = fill_path(spec.endpoint.path, params)?;
+    let (own_method, own) = own_request(spec, params)?;
     let answer = match spec.class {
-        OpClass::Read => json_answer(mock, 200, &server_example(spec.id)?),
-        OpClass::Write => declared_success(mock, spec),
+        OpClass::Read => json_answer(mock, 200, &server_answer(spec, params)?),
+        OpClass::Write => write_answer(mock, spec, params)?,
     };
-    Mock::given(method(http_method(spec.endpoint.method)))
+    Mock::given(method(own_method))
         .and(path(mock.path(&own)))
         .respond_with(answer)
         .mount(mock.server())

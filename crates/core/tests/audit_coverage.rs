@@ -8,9 +8,14 @@ mod common;
 use atlas_duck_audit::EventType;
 use atlas_duck_audit::request_set::requests_from_json;
 use atlas_duck_audit::request_set_hash;
+use atlas_duck_core::testing::Harness;
 use atlas_duck_core::testing::flows::flow_sequences;
 use atlas_duck_ipc::envelope::Status;
-use common::flows::{check_coverage, check_preview_shown, flow_harness, mount_jira, run_flow};
+use common::flows::{
+    ConfluenceFlow, check_coverage, check_coverage_on, check_preview_shown,
+    confluence_flow_sequences, flow_harness, mount_confluence_flows, mount_jira,
+    run_confluence_flow, run_flow,
+};
 use common::{TestResult, de, request_id};
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
 use serde_json::json;
@@ -146,6 +151,133 @@ fn i19_every_flow_kind_is_covered() -> TestResult {
         // reads, comment write (+ stale check), edit (3 GETs + PUT), stale (3 GETs), enrichment
         // cancel, and the connection test's two calls: well over 15 in all.
         assert!(hits >= 15, "only {hits} authenticated hits");
+        drop(h);
+        Ok::<_, common::TestError>(())
+    })?;
+    Ok(())
+}
+
+/// I-19 and U-32 over random sequences of the Confluence flows (a Markdown page get with two user
+/// lookups, a page update, an update that conflicts at stage 2, a move, an upload, a label
+/// remove), each case on a fresh Confluence harness.
+#[test]
+fn i19_confluence_every_hit_is_covered() -> TestResult {
+    let rt = runtime()?;
+    let mut runner = TestRunner::new(Config {
+        cases: 12,
+        failure_persistence: None,
+        max_shrink_iters: 32,
+        ..Config::default()
+    });
+    let hits = std::cell::Cell::new(0usize);
+    runner
+        .run(&confluence_flow_sequences(), |flows| {
+            rt.block_on(async {
+                let h = Harness::confluence().await.map_err(fail)?;
+                mount_confluence_flows(&h).await.map_err(fail)?;
+                for (n, f) in flows.iter().enumerate() {
+                    run_confluence_flow(&h, *f, n)
+                        .await
+                        .map_err(|e| fail(format!("{f:?}: {e}")))?;
+                }
+                hits.set(hits.get() + check_coverage_on(&h, "wiki").await.map_err(fail)?);
+                check_preview_shown(&h).await.map_err(fail)?;
+                Ok::<_, TestCaseError>(())
+            })
+        })
+        .map_err(|e| format!("{e}"))?;
+    assert!(hits.get() > 0, "no authenticated hit was covered");
+    Ok(())
+}
+
+/// The Confluence flows, each once, reach the instance's endpoints (the page and its user
+/// lookups, the identity GET, stage 2 of an update, the stale checks, the attachment lookup, the
+/// multipart `POST`, the label `DELETE`), and every one of those hits has its covering record and
+/// a response record with the app's `User-Agent` (I-19). The paths are asserted, so a flow that
+/// stopped sending a call cannot leave the property vacuous for it.
+#[test]
+fn i19_m7_flows_cover_their_hits() -> TestResult {
+    let rt = runtime()?;
+    rt.block_on(async {
+        let h = Harness::confluence().await?;
+        mount_confluence_flows(&h).await?;
+        let mock = h.mock("wiki").ok_or("no wiki mock")?;
+        for (n, f) in ConfluenceFlow::ALL.iter().enumerate() {
+            run_confluence_flow(&h, *f, n).await?;
+        }
+        let seen: Vec<(String, String, Option<String>)> = mock
+            .received()
+            .await
+            .iter()
+            .map(|r| {
+                (
+                    r.method.to_string(),
+                    r.url.path().to_owned(),
+                    r.url.query().map(str::to_owned),
+                )
+            })
+            .collect();
+        let sent = |m: &str, p: &str, q: Option<&str>| {
+            let full = mock.path(p);
+            seen.iter().any(|(sm, sp, sq)| {
+                sm == m
+                    && *sp == full
+                    && q.is_none_or(|q| sq.as_deref().is_some_and(|s| s.contains(q)))
+            })
+        };
+        for (m, p, q) in [
+            ("GET", "/rest/api/user/current", None),
+            ("GET", "/rest/api/content/65543", None),
+            ("GET", "/rest/api/user", Some("key=key-jdoe")),
+            ("GET", "/rest/api/user", Some("key=key-asmith")),
+            ("GET", "/rest/api/content/65538", Some("expand=version")),
+            ("PUT", "/rest/api/content/65538", None),
+            ("GET", "/rest/api/content/65537", Some("status=historical")),
+            ("GET", "/rest/api/content/65539", None),
+            ("GET", "/rest/api/content/65540", None),
+            ("PUT", "/rest/api/content/65539", None),
+            (
+                "GET",
+                "/rest/api/content/65541/child/attachment",
+                Some("limit=50"),
+            ),
+            (
+                "POST",
+                "/rest/api/content/65541/child/attachment",
+                Some("allowDuplicated=false"),
+            ),
+            (
+                "GET",
+                "/rest/api/content/65542",
+                Some("expand=metadata.labels"),
+            ),
+            ("DELETE", "/rest/api/content/65542/label/release", None),
+        ] {
+            assert!(sent(m, p, q), "{m} {p} {q:?} was never sent: {seen:?}");
+        }
+        // Nothing the flows did not plan.
+        let planned = [
+            "/rest/api/user/current",
+            "/rest/api/user",
+            "/rest/api/content/65543",
+            "/rest/api/content/65538",
+            "/rest/api/content/65537",
+            "/rest/api/content/65539",
+            "/rest/api/content/65540",
+            "/rest/api/content/65541/child/attachment",
+            "/rest/api/content/65542",
+            "/rest/api/content/65542/label/release",
+        ];
+        for (m, p, _) in &seen {
+            assert!(
+                planned.iter().any(|x| mock.path(x) == *p),
+                "unplanned request {m} {p}"
+            );
+        }
+        let covered = check_coverage_on(&h, "wiki").await?;
+        assert!(covered >= 14, "only {covered} authenticated hits");
+        let shown = check_preview_shown(&h).await?;
+        assert!(shown >= 5, "only {shown} positive decisions");
         drop(h);
         Ok::<_, common::TestError>(())
     })?;
