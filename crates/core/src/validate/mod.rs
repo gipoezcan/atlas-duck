@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use atlas_duck_ipc::envelope::ErrorCode;
 use atlas_duck_ipc::sandbox::ScriptLimits;
+use atlas_duck_ipc::sandbox::script::MAX_ARGS_NESTING;
 use atlas_duck_preview::invisible;
 use atlas_duck_registry::{OperationSpec, Product, Version};
 use jsonschema::Validator;
@@ -34,6 +35,11 @@ pub const MAX_SCRIPT_ARGS_BYTES: usize = 1024 * 1024;
 
 /// §9.4: `process_mb >= heap_mb + 24 MiB (host frame) + 64 MiB margin`.
 const PROCESS_OVER_HEAP_MB: u64 = 88;
+
+/// §9.4 memory invariant 1: `heap_mb >= k x max_call_result_mb`. Provisional until M8 measures
+/// the real peak factor on Jira `*all` search and Confluence storage-body fixtures (Tasks 25, 33;
+/// PD-140). Task 33 replaces the constant with the measured value after the spec is amended.
+pub const SCRIPT_HEAP_K: u32 = 8;
 
 /// At most this many characters of an agent string are echoed in an error.
 const ECHO_MAX_CHARS: usize = 64;
@@ -292,11 +298,14 @@ pub fn validate(
     })
 }
 
-/// §9.1 step 2, the static part: source ≤ 256 KiB, args ≤ 1 MiB, limits per §9.4.
+/// §9.1 step 2, the static part: source ≤ 256 KiB, args ≤ 1 MiB and at most
+/// [`MAX_ARGS_NESTING`] levels deep, limits per §9.4 against `ceiling` (the configured
+/// defaults, PD-139).
 pub fn validate_script_submit(
     source: &str,
     args: &Value,
     limits: &Value,
+    ceiling: &ScriptLimits,
 ) -> Result<ScriptLimits, ValidationError> {
     if source.len() > MAX_SCRIPT_SOURCE_BYTES {
         return Err(invalid("source", "script source is above 256 KiB", None));
@@ -305,7 +314,73 @@ pub fn validate_script_submit(
     if args_len > MAX_SCRIPT_ARGS_BYTES {
         return Err(invalid("args", "script args are above 1 MiB", None));
     }
-    validate_script_limits(limits, &ScriptLimits::default())
+    if nesting(args) > MAX_ARGS_NESTING {
+        return Err(invalid(
+            "args",
+            &format!("script args are nested deeper than {MAX_ARGS_NESTING} levels"),
+            None,
+        ));
+    }
+    validate_script_limits(limits, ceiling)
+}
+
+/// The deepest nesting of arrays and objects in `v` (a scalar is 0), without recursion.
+fn nesting(v: &Value) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(v, 0usize)];
+    while let Some((v, depth)) = stack.pop() {
+        match v {
+            Value::Array(items) => {
+                deepest = deepest.max(depth + 1);
+                stack.extend(items.iter().map(|c| (c, depth + 1)));
+            }
+            Value::Object(map) => {
+                deepest = deepest.max(depth + 1);
+                stack.extend(map.values().map(|c| (c, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// A §9.4 memory invariant that a set of script limits breaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptInvariant {
+    /// Invariant 2: `process_mb >= heap_mb + 88` (the heap, one 24 MiB host frame, a 64 MiB margin).
+    ProcessOverHeap,
+    /// Invariant 1 (PD-140): `heap_mb >= SCRIPT_HEAP_K x max_call_result_mb`.
+    HeapOverCallResult,
+}
+
+impl ScriptInvariant {
+    /// The limit key the violation is reported on.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::ProcessOverHeap => "process_mb",
+            Self::HeapOverCallResult => "heap_mb",
+        }
+    }
+
+    /// The text of the violation (plan text for invariant 1, PD-140).
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::ProcessOverHeap => "process_mb must be at least heap_mb + 88",
+            Self::HeapOverCallResult => "heap_mb must be at least k × max_call_result_mb (k = 8)",
+        }
+    }
+}
+
+/// Both §9.4 memory invariants on one set of limits (the configured defaults in Settings and
+/// `[scripts]`, the effective set of a run's `--limits`).
+pub fn check_script_invariants(l: &ScriptLimits) -> Result<(), ScriptInvariant> {
+    if u64::from(l.process_mb) < u64::from(l.heap_mb) + PROCESS_OVER_HEAP_MB {
+        return Err(ScriptInvariant::ProcessOverHeap);
+    }
+    if u64::from(l.heap_mb) < u64::from(SCRIPT_HEAP_K) * u64::from(l.max_call_result_mb) {
+        return Err(ScriptInvariant::HeapOverCallResult);
+    }
+    Ok(())
 }
 
 /// `--limits`: known keys, positive integers, never above `ceiling` (the configured defaults,
@@ -341,14 +416,9 @@ pub fn validate_script_limits(
         }
         *slot = u32::try_from(wanted).unwrap_or(max);
     }
-    // §9.4 memory invariant 2: the process must hold the heap, one host frame (24 MiB) and a
-    // 64 MiB margin. (Invariant 1, `heap_mb >= k x max_call_result_mb`, waits for M8's `k`.)
-    if u64::from(out.process_mb) < u64::from(out.heap_mb) + PROCESS_OVER_HEAP_MB {
-        return Err(invalid(
-            "limits.process_mb",
-            "process_mb must be at least heap_mb + 88",
-            None,
-        ));
+    // §9.4 memory invariants on the effective set: exit 2 naming the limit that is too low.
+    if let Err(v) = check_script_invariants(&out) {
+        return Err(invalid(&format!("limits.{}", v.key()), v.message(), None));
     }
     Ok(out)
 }

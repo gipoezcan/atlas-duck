@@ -1,10 +1,12 @@
 //! U-33 (core half), X-10 (min_version gate), §9.1 step 2 static script checks.
 
 use atlas_duck_core::validate::{
-    EffectiveCaps, JIRA_SYSTEM_FIELDS, MOVE_LIMIT_HINT, ValidateCtx, ValidationError, validate,
-    validate_script_submit,
+    EffectiveCaps, JIRA_SYSTEM_FIELDS, MOVE_LIMIT_HINT, SCRIPT_HEAP_K, ValidateCtx,
+    ValidationError, validate, validate_script_submit as validate_script_submit_with,
 };
 use atlas_duck_ipc::envelope::ErrorCode;
+use atlas_duck_ipc::sandbox::ScriptLimits;
+use atlas_duck_ipc::sandbox::script::MAX_ARGS_NESTING as MAX_SCRIPT_ARGS_NESTING;
 use atlas_duck_registry::{OperationSpec, Product, Version};
 use serde_json::{Value, json};
 
@@ -45,6 +47,15 @@ fn rejected(
 
 fn param(e: &ValidationError) -> Option<&str> {
     e.details.get("param").and_then(Value::as_str)
+}
+
+/// `validate_script_submit` against the built-in defaults as the ceiling.
+fn validate_script_submit(
+    source: &str,
+    args: &Value,
+    limits: &Value,
+) -> Result<ScriptLimits, ValidationError> {
+    validate_script_submit_with(source, args, limits, &ScriptLimits::default())
 }
 
 #[test]
@@ -602,8 +613,9 @@ fn script_submit_limits() -> TestResult {
         Some(&json!("agents may only lower limits"))
     );
 
-    let lowered = validate_script_submit("1", &args, &json!({"heap_mb": 64}))?;
-    assert_eq!(lowered.heap_mb, 64);
+    // 128 = k (8) x the default `max_call_result_mb` (16): the lowest heap the invariant allows.
+    let lowered = validate_script_submit("1", &args, &json!({"heap_mb": 128}))?;
+    assert_eq!(lowered.heap_mb, 128);
     assert_eq!(lowered.timeout_s, 120);
 
     // At the default is "not above".
@@ -642,13 +654,105 @@ fn script_limits_process_must_hold_the_heap() -> TestResult {
     assert_eq!(param(&e), Some("limits.process_mb"));
     // Lowering heap together with process is fine; heap alone only helps.
     assert!(
-        validate_script_submit("1", &args, &json!({"heap_mb": 64, "process_mb": 152}))?.heap_mb
-            == 64
+        validate_script_submit("1", &args, &json!({"heap_mb": 128, "process_mb": 216}))?.heap_mb
+            == 128
     );
-    let e = validate_script_submit("1", &args, &json!({"heap_mb": 64, "process_mb": 151}))
+    let e = validate_script_submit("1", &args, &json!({"heap_mb": 128, "process_mb": 215}))
         .err()
         .ok_or("accepted")?;
     assert_eq!(param(&e), Some("limits.process_mb"));
+    Ok(())
+}
+
+#[test]
+fn limits_above_configured_default_rejected_exit2() -> TestResult {
+    let args = json!({});
+    // The configured set is the ceiling (PD-139), not the spec default.
+    let ceiling = ScriptLimits {
+        timeout_s: 240,
+        max_calls: 50,
+        ..ScriptLimits::default()
+    };
+    let go = |limits: Value| validate_script_submit_with("1", &args, &limits, &ceiling);
+    // Absent keys take the ceiling's value, not the spec's.
+    let ok = go(Value::Null)?;
+    assert_eq!((ok.timeout_s, ok.max_calls), (240, 50));
+    assert_eq!(go(json!({"timeout_s": 240}))?.timeout_s, 240);
+    assert_eq!(go(json!({"timeout_s": 10}))?.timeout_s, 10);
+    // Above the configured default, though below the spec's: exit 2 (`validation`).
+    let e = go(json!({"max_calls": 51})).err().ok_or("accepted")?;
+    assert_eq!(e.code, ErrorCode::Validation);
+    assert_eq!(param(&e), Some("limits.max_calls"));
+    assert_eq!(
+        e.details.get("message"),
+        Some(&json!("agents may only lower limits"))
+    );
+    // And above the spec default when the configured one is raised: still "above".
+    let e = go(json!({"timeout_s": 241})).err().ok_or("accepted")?;
+    assert_eq!(param(&e), Some("limits.timeout_s"));
+    Ok(())
+}
+
+#[test]
+fn heap_k_invariant_on_limits_exit2() -> TestResult {
+    assert_eq!(SCRIPT_HEAP_K, 8, "provisional until M8 measures it");
+    let args = json!({});
+    // heap_mb >= k x max_call_result_mb on the effective set (default call result: 16).
+    assert_eq!(
+        validate_script_submit("1", &args, &json!({"heap_mb": 128}))?.heap_mb,
+        128
+    );
+    let e = validate_script_submit("1", &args, &json!({"heap_mb": 127}))
+        .err()
+        .ok_or("accepted")?;
+    assert_eq!(e.code, ErrorCode::Validation);
+    assert_eq!(param(&e), Some("limits.heap_mb"));
+    assert_eq!(
+        e.details.get("message"),
+        Some(&json!(
+            "heap_mb must be at least k × max_call_result_mb (k = 8)"
+        ))
+    );
+    // Lowering the call result lowers the heap the run needs.
+    let ok = validate_script_submit("1", &args, &json!({"heap_mb": 64, "max_call_result_mb": 8}))?;
+    assert_eq!((ok.heap_mb, ok.max_call_result_mb), (64, 8));
+    let e = validate_script_submit("1", &args, &json!({"heap_mb": 63, "max_call_result_mb": 8}))
+        .err()
+        .ok_or("accepted")?;
+    assert_eq!(param(&e), Some("limits.heap_mb"));
+    // Against a configured set: a raised call result is above the ceiling, a lowered one is not.
+    let ceiling = ScriptLimits {
+        heap_mb: 64,
+        max_call_result_mb: 8,
+        ..ScriptLimits::default()
+    };
+    assert!(
+        validate_script_submit_with("1", &args, &json!({"max_call_result_mb": 4}), &ceiling)
+            .is_ok()
+    );
+    Ok(())
+}
+
+#[test]
+fn args_nested_past_the_workers_decoder_are_a_validation_error() -> TestResult {
+    fn nested(depth: usize) -> Value {
+        (0..depth).fold(json!(1), |inner, _| json!([inner]))
+    }
+    let limits = Value::Null;
+    // 125 levels is the deepest the worker's first-frame decoder reads (T4 fix hand-off, T7).
+    assert_eq!(MAX_SCRIPT_ARGS_NESTING, 125);
+    assert!(validate_script_submit("1", &nested(MAX_SCRIPT_ARGS_NESTING), &limits).is_ok());
+    let e = validate_script_submit("1", &nested(MAX_SCRIPT_ARGS_NESTING + 1), &limits)
+        .err()
+        .ok_or("126 levels accepted")?;
+    // Exit 2, an input error: not `sandbox_unavailable`.
+    assert_eq!(e.code, ErrorCode::Validation);
+    assert_eq!(param(&e), Some("args"));
+    // Objects count like arrays, and the bound is on the deepest branch.
+    let mut deep = json!({ "k": nested(MAX_SCRIPT_ARGS_NESTING) });
+    assert!(validate_script_submit("1", &deep, &limits).is_err());
+    deep = json!({ "shallow": [1, 2], "k": nested(MAX_SCRIPT_ARGS_NESTING - 1) });
+    assert!(validate_script_submit("1", &deep, &limits).is_ok());
     Ok(())
 }
 

@@ -19,6 +19,7 @@ pub mod instances;
 pub mod limits;
 mod migrate;
 pub mod requests;
+pub mod scripts;
 pub mod ui;
 
 use std::ffi::OsString;

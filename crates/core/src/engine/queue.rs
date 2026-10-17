@@ -41,9 +41,11 @@ pub const DRY_SLOTS: usize = 2;
 pub const CANDIDATE_CACHE_MB: u64 = 512;
 
 /// The limits the engine runs with (§3.3, §5.2). Only `max_pending_bytes`,
-/// `candidate_cache_bytes` and `comments_cap` come from `config.toml` (`config::limits`); the rest
-/// are the spec's constants (tests scale them through `TestHooks`). Fixed for the run, except the
-/// comments cap: Settings changes it live ([`Admission::set_comments_cap`], PD-76).
+/// `candidate_cache_bytes` and `comments_cap` come from `config.toml` (`config::limits`), and
+/// `script` from `[scripts]` (`config::scripts`); the rest are the spec's constants (tests scale
+/// them through `TestHooks`). Fixed for the run, except the comments cap and the script limits:
+/// Settings changes them live ([`Admission::set_comments_cap`], PD-76;
+/// [`Admission::set_script_limits`], PD-139).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub per_agent: u32,
@@ -52,8 +54,10 @@ pub struct Limits {
     pub max_pending_bytes: Option<u64>,
     pub fetching: usize,
     pub candidate_cache_bytes: u64,
-    /// A script's static reservation in MiB (§9.4 `max_result_mb`; Settings arrive in M6).
-    pub max_result_mb: u32,
+    /// The configured script limits at start (`[scripts]`, §9.4, PD-139): the ceiling of an
+    /// agent's `--limits`, and the source of a script's static reservation (`max_result_mb`). The
+    /// set in force is [`Admission::script_limits`].
+    pub script: ScriptLimits,
     /// The configured `jira.issue.get --comments` cap at start (Δ7, PD-63; `[limits]
     /// jira_comments_cap`). `None` = the registry's `caps.comments_cap` (100). The one in force is
     /// [`Admission::comments_cap`].
@@ -68,7 +72,7 @@ impl Default for Limits {
             max_pending_bytes: None,
             fetching: FETCH_SLOTS,
             candidate_cache_bytes: CANDIDATE_CACHE_MB * MIB,
-            max_result_mb: ScriptLimits::default().max_result_mb,
+            script: ScriptLimits::default(),
             comments_cap: None,
         }
     }
@@ -139,8 +143,8 @@ impl Reservation {
         Reservation(spec.caps.static_result_cap_bytes.min(RELEASE_CAP_BYTES))
     }
 
-    /// A script: its static `max_result_mb` (§9.4).
-    pub fn script(limits: &Limits) -> Reservation {
+    /// A script: its static `max_result_mb` (§9.4), the configured one (PD-139).
+    pub fn script(limits: &ScriptLimits) -> Reservation {
         Reservation(u64::from(limits.max_result_mb).saturating_mul(MIB))
     }
 
@@ -180,6 +184,8 @@ pub struct Admission {
     counts: Arc<Mutex<Counts>>,
     /// The comments cap in force (0 = `None`): `limits.comments_cap` until Settings changes it.
     comments_cap: AtomicU32,
+    /// The configured script limits in force: `limits.script` until Settings changes them.
+    script: Mutex<ScriptLimits>,
 }
 
 impl Admission {
@@ -188,7 +194,21 @@ impl Admission {
             limits,
             counts: Arc::new(Mutex::new(Counts::default())),
             comments_cap: AtomicU32::new(limits.comments_cap.unwrap_or(0)),
+            script: Mutex::new(limits.script),
         }
+    }
+
+    /// The configured script limits in force (§9.4, PD-139): the ceiling of a submitted run's
+    /// `--limits`, the `script_limits` of `ops describe --instance` and the base of a script's
+    /// static reservation.
+    pub fn script_limits(&self) -> ScriptLimits {
+        *self.script.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// PD-139: a Settings change of the script limits applies to every run submitted from now on
+    /// (the caller logged it first); a pending run keeps the limits it was validated with.
+    pub fn set_script_limits(&self, limits: ScriptLimits) {
+        *self.script.lock().unwrap_or_else(PoisonError::into_inner) = limits;
     }
 
     /// The limits of the run as started (the comments cap in force is [`Self::comments_cap`]).
