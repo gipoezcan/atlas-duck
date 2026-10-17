@@ -11,7 +11,11 @@ use std::path::PathBuf;
 
 use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff};
 use atlas_duck_preview::invisible::{self, escape_for_display};
-use atlas_duck_preview::render::{self, DOC_MAX_BYTES, DOC_MAX_DIFF_LINES, DOC_MAX_ROWS, ws};
+use atlas_duck_preview::render::{
+    self, DOC_MAX_BYTES, DOC_MAX_DIFF_LINES, DOC_MAX_ROWS, DOC_SCRIPT_CALLS_BYTES,
+    DOC_SCRIPT_LOG_BYTES, DOC_SCRIPT_RESERVE_BYTES, DOC_SCRIPT_SOURCE_BYTES,
+    DOC_SCRIPT_STDERR_BYTES, ws,
+};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     BodyView, CandidateRev, CommentView, ConstructList, FieldRow, IssueCard, ItemCount,
@@ -1694,10 +1698,11 @@ fn script_result_document_table_and_tree() {
     let p = script_preview(ScriptItemKind::Result);
     let d = doc(&p);
     assert_inert(&d, Platform::MacOsLinux);
-    // The item heading leads the body; the candidate view (the tree) is inside it.
+    // The item heading leads the body; the candidate view (the tree) is inside it, one heading
+    // level down (T18 review M-2).
     assert!(
         d.contains(
-            "</header><section><h2>Script result</h2><section><h2>Result (JSON tree)</h2>\
+            "</header><section><h2>Script result</h2><section><h3>Result (JSON tree)</h3>\
              <ul><li>object, 2 keys"
         ),
         "{d}"
@@ -1709,7 +1714,7 @@ fn script_result_document_table_and_tree() {
     // The sections in plan order, each once.
     let titles = [
         "<h2>Script result</h2>",
-        "<h2>Result (JSON tree)</h2>",
+        "<h3>Result (JSON tree)</h3>",
         "<h2>Script source</h2>",
         "<h2>Host calls</h2>",
         "<h2>atlas.log</h2>",
@@ -1783,7 +1788,7 @@ fn script_result_document_table_and_tree() {
     let d = doc(&t);
     assert!(
         d.contains(
-            "<section><h2>Script result</h2><section><h2>Results</h2><table><thead><tr>\
+            "<section><h2>Script result</h2><section><h3>Results</h3><table><thead><tr>\
              <th><bdi>key</bdi></th></tr></thead><tbody><tr><td><bdi>PROJ-1</bdi></td></tr>"
         ),
         "{d}"
@@ -1875,7 +1880,7 @@ fn script_error_document_fields() {
     assert!(
         d.contains(
             "</header><section><h2>Script error details</h2><section>\
-             <h2>Result (JSON tree)</h2>"
+             <h3>Result (JSON tree)</h3>"
         ),
         "{d}"
     );
@@ -1940,6 +1945,66 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    /// S-06 over the cap paths of the script sections (T18 review M-7): every section past its
+    /// row cap or its byte share (a long text first: cut inside it; last: left out by the row
+    /// cap), with the notes after it.
+    #[test]
+    fn s06_script_caps_have_no_active_content(
+        strings in prop::collection::vec(text(), 12),
+        windows in any::<bool>(),
+        long_first in any::<bool>(),
+    ) {
+        let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
+        let mut p = arbitrary_preview(13, &strings);
+        let s = |i: usize| strings[i % strings.len()].as_str();
+        // Each text long enough to cross its share whatever the strings are (they may be empty),
+        // with markup, a lone `⟨` and a bidi control between them.
+        let long = |i: usize, bytes: usize| {
+            let mut t = String::new();
+            let mut k = i;
+            while t.len() < bytes {
+                t.push_str(s(k));
+                t.push_str("<b>⟨\u{202E}");
+                k += 1;
+            }
+            t
+        };
+        if let PreviewBody::Script { source, provenance, logs, stderr, .. } = &mut p.body {
+            *source = (0..20_000).map(|i| format!("{}\n", s(i))).collect::<String>()
+                + &long(0, DOC_SCRIPT_SOURCE_BYTES);
+            *provenance = (0..=DOC_MAX_ROWS as u64)
+                .map(|i| ProvenanceRow {
+                    call_id: i,
+                    op_id: s(i as usize).into(),
+                    instance: s(i as usize + 1).into(),
+                    target_display: s(i as usize + 2).into(),
+                    outcome: s(i as usize + 3).into(),
+                })
+                .collect();
+            provenance.push(ProvenanceRow {
+                call_id: 0,
+                op_id: long(4, DOC_SCRIPT_CALLS_BYTES),
+                instance: s(5).into(),
+                target_display: s(6).into(),
+                outcome: s(7).into(),
+            });
+            *logs = (0..=DOC_MAX_ROWS).map(|i| s(i).to_owned()).collect();
+            logs.push(long(8, DOC_SCRIPT_LOG_BYTES));
+            if long_first {
+                provenance.rotate_right(1);
+                logs.rotate_right(1);
+            }
+            *stderr = long(11, DOC_SCRIPT_STDERR_BYTES);
+        }
+        let d = render::document(&p, platform);
+        prop_assert!(d.matches(IN_RECORD).count() >= 4);
+        assert_inert(&d, platform);
+    }
+}
+
 /// Changes a script body's source, provenance, logs and stderr.
 type ScriptEdit<'a> =
     &'a dyn Fn(&mut String, &mut Vec<ProvenanceRow>, &mut Vec<String>, &mut String);
@@ -1962,14 +2027,17 @@ fn doc_caps_note_for_long_logs() {
         p
     };
 
-    // atlas.log past its row cap: two lines left out, noted and counted.
+    // atlas.log past its row cap: two lines left out, noted (in the section, naming the audit
+    // record: T18 review I-2) and counted.
     let p = with(&|_, _, logs, _| {
         *logs = (0..DOC_MAX_ROWS + 2).map(|i| format!("log {i}")).collect();
     });
     let d = doc(&p);
     let logs = script_section(&d, "atlas.log");
     assert!(
-        logs.contains("<li><bdi>log 1999</bdi></li></ul><p>2 more lines not shown here; see Structured or Raw</p>"),
+        logs.contains(&format!(
+            "<li><bdi>log 1999</bdi></li></ul><p>2 more lines {IN_RECORD}</p>"
+        )),
         "{logs}"
     );
     assert!(!logs.contains("<bdi>log 2000</bdi>"));
@@ -1977,37 +2045,29 @@ fn doc_caps_note_for_long_logs() {
         hidden_bytes(&d),
         ("log 2000".len() + "log 2001".len()) as u64
     );
+    assert!(!d.contains("Structured or Raw"), "{d}");
     assert_inert(&d, Platform::MacOsLinux);
 
-    // The source past its line cap: the rest (with its line ends) left out.
-    let p = with(&|source, _, _, _| {
-        *source = (0..=DOC_MAX_DIFF_LINES)
-            .map(|i| format!("x{i}\n"))
-            .collect();
-    });
-    let d = doc(&p);
-    let source = script_section(&d, "Script source");
-    assert!(
-        source.contains(
-            "<tr><td>5000</td><td><pre><bdi>x4999</bdi></pre></td></tr></tbody></table>\
-             <p>1 more lines not shown here; see Structured or Raw</p>"
-        ),
-        "{}",
-        &source[source.len().saturating_sub(400)..]
-    );
-    assert_eq!(hidden_bytes(&d), "x5000\n".len() as u64);
-    // A source line that fills the byte budget: it is cut, the lines after it left out whole.
+    // A source line past the source's byte cap: it is cut and noted in the section, the lines
+    // after it left out whole.
     let p = with(&|source, _, _, _| {
         *source = format!("{}\nafter1\nafter2", "s".repeat(DOC_MAX_BYTES));
     });
     let d = doc(&p);
     let source = script_section(&d, "Script source");
+    let cut = DOC_MAX_BYTES
+        - (DOC_SCRIPT_SOURCE_BYTES - "<table><tbody><tr><td>1</td><td><pre><bdi>".len());
     assert!(
-        source.ends_with("…</bdi></pre></td></tr></tbody></table><p>2 more lines not shown here; see Structured or Raw</p>"),
+        source.ends_with(&format!(
+            "…</bdi></pre></td></tr></tbody></table><p>2 more lines {IN_RECORD}</p>\
+             <p>{cut} more bytes {IN_RECORD}</p>"
+        )),
         "{}",
         &source[source.len().saturating_sub(400)..]
     );
     assert!(!source.contains("<td>2</td>"));
+    assert_eq!(hidden_bytes(&d), (cut + "after1\nafter2".len()) as u64);
+    assert!(!d.contains("Structured or Raw"), "{d}");
 
     // Host calls past the row cap.
     let p = with(&|_, provenance, _, _| {
@@ -2024,7 +2084,7 @@ fn doc_caps_note_for_long_logs() {
     let d = doc(&p);
     let calls = script_section(&d, "Host calls");
     assert!(
-        calls.contains("</tbody></table><p>1 more rows not shown here; see Structured or Raw</p>"),
+        calls.contains(&format!("</tbody></table><p>1 more rows {IN_RECORD}</p>")),
         "{}",
         &calls[calls.len().saturating_sub(400)..]
     );
@@ -2034,25 +2094,239 @@ fn doc_caps_note_for_long_logs() {
         ("jira.issue.get".len() + "jira-main".len() + "PROJ-2000".len() + "ok".len()) as u64
     );
 
-    // stderr past the byte budget: cut, counted, noted at the end of the body; nothing after it
-    // in the document is lost silently.
+    // stderr past its share: cut, counted, noted in its own section (not at the end of the body,
+    // whose note sends the approver to Structured or Raw).
     let p = with(&|_, _, _, stderr| {
         *stderr = "e".repeat(DOC_MAX_BYTES + 10);
     });
     let d = doc(&p);
-    assert!(d.contains("…</bdi></code></pre></section>"), "cut");
-    assert!(hidden_bytes(&d) >= 10);
-    assert!(d.contains(&format!(
-        "<p>{} more bytes not shown here; see Structured or Raw</p></body></html>",
-        hidden_bytes(&d)
-    )));
+    let stderr = script_section(&d, "stderr");
+    assert!(
+        stderr.ends_with(&format!(
+            "…</bdi></code></pre><p>{} more bytes {IN_RECORD}</p>",
+            hidden_bytes(&d)
+        )),
+        "{}",
+        &stderr[stderr.len().saturating_sub(400)..]
+    );
+    assert!(hidden_bytes(&d) >= (DOC_MAX_BYTES - DOC_SCRIPT_STDERR_BYTES) as u64);
+    assert!(stderr.len() < DOC_SCRIPT_STDERR_BYTES + 1024);
+    assert!(!d.contains("Structured or Raw"), "end-of-body note");
+    assert!(d.ends_with("</section></body></html>"), "end-of-body note");
 
-    // A huge log fills the budget: the log lines after it are left out and counted.
-    let p = with(&|_, _, logs, _| {
+    // A huge log fills the log lines' share: it is cut, the lines after it are left out and
+    // counted, and core's note after them still shows whole.
+    let mut p = with(&|_, _, logs, _| {
         *logs = vec!["l".repeat(DOC_MAX_BYTES), "after".into(), "after2".into()];
     });
+    if let PreviewBody::Script { logs_note, .. } = &mut p.body {
+        *logs_note = Some("output was cut".into());
+    }
     let d = doc(&p);
-    assert!(!script_section(&d, "atlas.log").contains("<bdi>after"));
-    assert!(script_section(&d, "atlas.log").contains("<p>2 more lines not shown here"));
+    let logs = script_section(&d, "atlas.log");
+    assert!(!logs.contains("<bdi>after"));
+    assert!(
+        logs.contains(&format!(
+            "…</bdi></li></ul><p>2 more lines {IN_RECORD}</p><p>"
+        )),
+        "{}",
+        &logs[logs.len().saturating_sub(400)..]
+    );
+    assert!(
+        logs.ends_with(&format!(
+            " more bytes {IN_RECORD}</p><div><bdi>output was cut</bdi></div>"
+        )),
+        "{}",
+        &logs[logs.len().saturating_sub(400)..]
+    );
+    assert!(logs.len() < DOC_SCRIPT_LOG_BYTES + 1024);
+    assert!(body_of(&d).len() < DOC_SCRIPT_RESERVE_BYTES + 64 * 1024);
+}
+
+/// The wording of a cap note in a script's own sections (T18 review I-2): source, Host calls,
+/// logs and stderr are in no other tab of the preview.
+const IN_RECORD: &str = "not shown here; the audit record keeps the full text";
+
+/// T18 review I-1: a candidate view the agent padded to fill the whole budget leaves the script's
+/// own sections (source, Host calls, atlas.log, stderr) exactly as they are; over its own share,
+/// each is cut with its own note while the next still shows, and the body stays bounded.
+#[test]
+fn script_sections_keep_their_reserve_against_a_padded_view() {
+    let base = script_preview(ScriptItemKind::Result);
+    let small = doc(&base);
+    let padded = |p: &Preview| {
+        let mut p = p.clone();
+        set_script(&mut p, |view, _| {
+            *view = PreviewBody::JsonTree {
+                tree: json_tree(&json!({ "pad": vec!["pad"; 300_000] })),
+            };
+        });
+        p
+    };
+    let d = doc(&padded(&base));
+    // The view is cut where its share ends; its note names the candidate's tabs.
+    assert!(
+        d.contains("more items not shown here; see Structured or Raw</li>"),
+        "view not cut"
+    );
+    for title in ["Script source", "Host calls", "atlas.log", "stderr"] {
+        assert_eq!(
+            script_section(&d, title),
+            script_section(&small, title),
+            "{title}"
+        );
+    }
+    let body = body_of(&d).len();
+    assert!(
+        body > DOC_MAX_BYTES - DOC_SCRIPT_RESERVE_BYTES,
+        "the view gets the rest: {body}"
+    );
+    assert!(body < DOC_MAX_BYTES + 64 * 1024, "{body}");
+
+    // Every section over its own share as well (a 256 KiB source of short lines, 2 000 long host
+    // calls, 2 000 long log lines with core's note, a long stderr).
+    let mut q = padded(&base);
+    if let PreviewBody::Script {
+        source,
+        provenance,
+        logs,
+        logs_note,
+        stderr,
+        ..
+    } = &mut q.body
+    {
+        *source = "x\n".repeat(128 * 1024);
+        *provenance = (0..DOC_MAX_ROWS as u64)
+            .map(|i| ProvenanceRow {
+                call_id: i,
+                op_id: "jira.search".into(),
+                instance: "jira-main".into(),
+                target_display: format!("{i} {}", "t".repeat(400)),
+                outcome: "ok".into(),
+            })
+            .collect();
+        *logs = (0..DOC_MAX_ROWS)
+            .map(|i| format!("log {i} {}", "l".repeat(300)))
+            .collect();
+        *logs_note = Some("output was cut".into());
+        *stderr = "e".repeat(DOC_SCRIPT_STDERR_BYTES + 10);
+    }
+    let d = doc(&q);
+    // (The row the share ends in may be cut inside its text: then a bytes note follows the rows
+    // note.)
+    let tail = |s: &str| s[s.len().saturating_sub(400)..].to_owned();
+    let source = script_section(&d, "Script source");
+    assert!(source.contains("<tr><td>1</td><td><pre><bdi>x</bdi></pre></td></tr>"));
+    assert!(
+        source.contains("</tbody></table><p>")
+            && source.contains(&format!(" more lines {IN_RECORD}</p>"))
+            && source.ends_with(&format!("{IN_RECORD}</p>")),
+        "{}",
+        tail(source)
+    );
+    assert!(
+        source.len() < DOC_SCRIPT_SOURCE_BYTES + 1024,
+        "{}",
+        source.len()
+    );
+    let calls = script_section(&d, "Host calls");
+    assert!(calls.contains("<tr><td>0</td>"));
+    assert!(
+        calls.contains(&format!(" more rows {IN_RECORD}</p>"))
+            && calls.ends_with(&format!("{IN_RECORD}</p>")),
+        "{}",
+        tail(calls)
+    );
+    assert!(
+        calls.len() < DOC_SCRIPT_CALLS_BYTES + 2048,
+        "{}",
+        calls.len()
+    );
+    let logs = script_section(&d, "atlas.log");
+    assert!(logs.contains("<li><bdi>log 0 "));
+    assert!(
+        logs.contains(&format!(" more lines {IN_RECORD}</p>"))
+            && logs.ends_with(&format!(
+                "{IN_RECORD}</p><div><bdi>output was cut</bdi></div>"
+            )),
+        "{}",
+        tail(logs)
+    );
+    assert!(logs.len() < DOC_SCRIPT_LOG_BYTES + 2048, "{}", logs.len());
+    let stderr = script_section(&d, "stderr");
+    assert!(
+        stderr.contains("<pre><code><bdi>eee")
+            && stderr.ends_with(&format!(" more bytes {IN_RECORD}</p>")),
+        "{}",
+        tail(stderr)
+    );
+    assert!(
+        stderr.len() < DOC_SCRIPT_STDERR_BYTES + 1024,
+        "{}",
+        stderr.len()
+    );
     assert!(body_of(&d).len() < DOC_MAX_BYTES + 64 * 1024);
+    // The end-of-body note counts only the view's cut text (the candidate: Structured or Raw).
+    assert!(
+        d.ends_with("</section></body></html>")
+            || d.ends_with("not shown here; see Structured or Raw</p></body></html>"),
+        "{}",
+        tail(&d)
+    );
+}
+
+/// T18 review I-2: the source is capped by the bytes of its markup, not by a line count: 6 000
+/// short lines show whole; 256 KiB of empty lines stop at the byte cap with a note naming the
+/// audit record, and the sections after it are untouched.
+#[test]
+fn script_source_cap_is_bytes_not_lines() {
+    let base = script_preview(ScriptItemKind::Result);
+    let small = doc(&base);
+    let with_source = |s: String| {
+        let mut p = base.clone();
+        if let PreviewBody::Script { source, .. } = &mut p.body {
+            *source = s;
+        }
+        p
+    };
+    let d = doc(&with_source(
+        (0..6_000).map(|i| format!("x{i}\n")).collect(),
+    ));
+    let source = script_section(&d, "Script source");
+    assert!(
+        source.ends_with(
+            "<tr><td>6000</td><td><pre><bdi>x5999</bdi></pre></td></tr></tbody></table>"
+        ),
+        "{}",
+        &source[source.len().saturating_sub(400)..]
+    );
+    assert_eq!(hidden_bytes(&d), 0);
+
+    let lines = 256 * 1024;
+    let d = doc(&with_source("\n".repeat(lines)));
+    let source = script_section(&d, "Script source");
+    let shown = source.matches("<tr>").count();
+    assert!(shown > 5_000 && shown < lines, "{shown}");
+    assert!(
+        source.ends_with(&format!(
+            "</tbody></table><p>{} more lines {IN_RECORD}</p>",
+            lines - shown
+        )),
+        "{}",
+        &source[source.len().saturating_sub(400)..]
+    );
+    assert!(source.len() >= DOC_SCRIPT_SOURCE_BYTES, "{}", source.len());
+    assert!(
+        source.len() < DOC_SCRIPT_SOURCE_BYTES + 1024,
+        "{}",
+        source.len()
+    );
+    assert_eq!(hidden_bytes(&d), (lines - shown) as u64);
+    for title in ["Host calls", "atlas.log", "stderr"] {
+        assert_eq!(
+            script_section(&d, title),
+            script_section(&small, title),
+            "{title}"
+        );
+    }
 }

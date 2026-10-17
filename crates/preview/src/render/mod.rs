@@ -18,7 +18,9 @@
 //!   sits in a `div`, never a `p` (which cannot hold one).
 //! - Display caps: [`DOC_MAX_ROWS`] rows per table or list, [`DOC_MAX_DIFF_LINES`] lines per diff,
 //!   [`DOC_MAX_BYTES`] for the whole body. What a cap leaves out is replaced by the PD-67 note and
-//!   counted in the header's "hidden in preview" bytes.
+//!   counted in the header's "hidden in preview" bytes. A script item's own sections have a
+//!   reserved share of the body each ([`DOC_SCRIPT_RESERVE_BYTES`]; the source capped by bytes,
+//!   not lines) and notes that name the audit record ([`more_in_audit_record`]).
 //! - The document is [`crate::iframe_document`]: meta CSP first, then `preview.css`, and the body
 //!   sanitized once more under the document allowlist.
 
@@ -42,10 +44,38 @@ pub const DOC_MAX_DIFF_LINES: usize = 5_000;
 /// Most bytes of the document body (PD-67).
 pub const DOC_MAX_BYTES: usize = 4 << 20;
 
+/// Bytes of the body reserved for a script item's own sections (M8 T18 review I-1): the source,
+/// Host calls, atlas.log (with its note) and stderr are in no other tab, so a candidate view the
+/// agent sized cannot crowd them out. Each section has its own share; the view gets the rest of
+/// [`DOC_MAX_BYTES`].
+pub const DOC_SCRIPT_RESERVE_BYTES: usize = DOC_SCRIPT_SOURCE_BYTES
+    + DOC_SCRIPT_CALLS_BYTES
+    + DOC_SCRIPT_LOG_BYTES
+    + DOC_SCRIPT_NOTE_BYTES
+    + DOC_SCRIPT_STDERR_BYTES;
+/// Most bytes of the "Script source" section's markup (T18 review I-2: a byte cap, so padding
+/// lines cannot hide the tail behind a line count, and empty lines cannot grow the markup past it).
+pub const DOC_SCRIPT_SOURCE_BYTES: usize = 1 << 20;
+/// Most bytes of the "Host calls" table.
+pub const DOC_SCRIPT_CALLS_BYTES: usize = 512 << 10;
+/// Most bytes of the atlas.log lines.
+pub const DOC_SCRIPT_LOG_BYTES: usize = 384 << 10;
+/// Most bytes of the atlas.log note (core's fixed sentence, shown even when the lines filled
+/// their share).
+pub const DOC_SCRIPT_NOTE_BYTES: usize = 4 << 10;
+/// Most bytes of the stderr section.
+pub const DOC_SCRIPT_STDERR_BYTES: usize = 128 << 10;
+
 /// plan text (PD-67): "N more rows / lines not shown here; see Structured or Raw", with the unit
 /// of what was left out.
 pub fn more_not_shown(n: u64, unit: &str) -> String {
     format!("{n} more {unit} not shown here; see Structured or Raw")
+}
+
+/// [`more_not_shown`] for a script's own sections (T18 review I-2): the source, Host calls, logs
+/// and stderr are in no other tab, the audit record has them.
+pub fn more_in_audit_record(n: u64, unit: &str) -> String {
+    format!("{n} more {unit} not shown here; the audit record keeps the full text")
 }
 
 /// The whole `srcdoc` document for `p` (Δ5).
@@ -74,7 +104,6 @@ pub fn document(p: &Preview, platform: Platform) -> String {
 
 /// The document being written: HTML text, the bytes a cap left out, and the part of them cut
 /// from inside a text.
-#[derive(Default)]
 pub(crate) struct Doc {
     out: String,
     /// Every byte a cap left out (rows, lines, items, cut texts).
@@ -83,6 +112,19 @@ pub(crate) struct Doc {
     cut_text: u64,
     /// `<pre>` elements open.
     pre: u32,
+    /// Most bytes of `out`: the body budget, or the share of one part of it.
+    limit: usize,
+    /// A script's own section ([`Doc::record`]): its notes name the audit record.
+    record: bool,
+    /// Inside a section of the document (a script item's candidate view): headings one level
+    /// down.
+    nested: bool,
+}
+
+impl Default for Doc {
+    fn default() -> Self {
+        Self::with_limit(DOC_MAX_BYTES)
+    }
 }
 
 /// How [`Doc::value`] frames a value.
@@ -102,9 +144,62 @@ fn collapses(shown: &str) -> bool {
 }
 
 impl Doc {
-    /// The byte budget of the body is used up.
+    /// A part of the document with its own byte budget `limit`.
+    pub(crate) fn with_limit(limit: usize) -> Self {
+        Self {
+            out: String::new(),
+            cut: 0,
+            cut_text: 0,
+            pre: 0,
+            limit,
+            record: false,
+            nested: false,
+        }
+    }
+
+    /// A script's own section (source, Host calls, atlas.log, stderr) with its share `limit` of
+    /// the body (T18 review I-1). What its caps leave out is in no other tab: its notes name the
+    /// audit record, a text cut inside it is noted in it ([`Doc::append`]), not at the end of the
+    /// body.
+    pub(crate) fn record(limit: usize) -> Self {
+        Self {
+            record: true,
+            ..Self::with_limit(limit)
+        }
+    }
+
+    /// Writes `part` here and counts what its caps left out. A [`Doc::record`] part notes its cut
+    /// text at its end first.
+    pub(crate) fn append(&mut self, mut part: Doc) {
+        if part.record && part.cut_text > 0 {
+            let note = part.more(part.cut_text, "bytes");
+            part.open("p");
+            part.fixed(&note);
+            part.close("p");
+            part.cut_text = 0;
+        }
+        self.out.push_str(&part.out);
+        self.cut = self.cut.saturating_add(part.cut);
+        self.cut_text = self.cut_text.saturating_add(part.cut_text);
+    }
+
+    /// The PD-67 note for `n` `unit` left out here.
+    pub(crate) fn more(&self, n: u64, unit: &str) -> String {
+        if self.record {
+            more_in_audit_record(n, unit)
+        } else {
+            more_not_shown(n, unit)
+        }
+    }
+
+    /// The heading of a section: `h2`, or `h3` inside a section.
+    pub(crate) fn heading(&self) -> &'static str {
+        if self.nested { "h3" } else { "h2" }
+    }
+
+    /// The byte budget of the body (or of this part) is used up.
     pub(crate) fn full(&self) -> bool {
-        self.out.len() >= DOC_MAX_BYTES
+        self.out.len() >= self.limit
     }
 
     /// Bytes a cap left out.
@@ -207,7 +302,7 @@ impl Doc {
 
     fn bdi(&mut self, shown: &str) {
         self.open("bdi");
-        let left = push_marked(&mut self.out, shown, DOC_MAX_BYTES);
+        let left = push_marked(&mut self.out, shown, self.limit);
         if left > 0 {
             self.out.push('…');
             self.cut_text = self.cut_text.saturating_add(left);
@@ -220,11 +315,11 @@ impl Doc {
     /// escaped and marked. Left out whole (and noted) when it does not fit the budget.
     pub(crate) fn html(&mut self, html: &str) {
         let clean = sanitize_html(html);
-        if self.out.len().saturating_add(clean.len()) > DOC_MAX_BYTES {
+        if self.out.len().saturating_add(clean.len()) > self.limit {
             let n = len_u64(html.len());
             self.hide(n);
             self.open("p");
-            self.fixed(&more_not_shown(n, "bytes"));
+            self.fixed(&self.more(n, "bytes"));
             self.close("p");
             return;
         }

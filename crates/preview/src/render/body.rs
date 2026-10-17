@@ -1,6 +1,10 @@
 //! The body of the preview document, one layout per `PreviewBody` variant (§6.3, PD-67).
 
-use super::{DOC_MAX_DIFF_LINES, DOC_MAX_ROWS, Doc, item_count_text, len_u64, more_not_shown};
+use super::{
+    DOC_MAX_DIFF_LINES, DOC_MAX_ROWS, DOC_SCRIPT_CALLS_BYTES, DOC_SCRIPT_LOG_BYTES,
+    DOC_SCRIPT_NOTE_BYTES, DOC_SCRIPT_SOURCE_BYTES, DOC_SCRIPT_STDERR_BYTES, Doc, item_count_text,
+    len_u64, more_not_shown,
+};
 use crate::diff::{DiffLine, DiffOp};
 use crate::json_tree::JsonNode;
 use crate::model::{
@@ -373,30 +377,45 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             logs_note,
             stderr,
         } => {
-            section(doc, script_item_heading(*item));
-            self::body(doc, view);
-            doc.close("section");
-            script_source(doc, source);
-            host_calls(doc, provenance);
-            section(doc, "atlas.log");
-            raw_list(doc, logs, "lines");
+            // T18 review I-1: the script's own sections are in no other tab, so each has its
+            // reserved share of the body; the candidate view (sized by the agent) gets the rest.
+            // They are written first to know the rest, and shown after the view (plan order).
+            let mut own = Doc::default();
+            section(&mut own, "Script source");
+            own.append(record(DOC_SCRIPT_SOURCE_BYTES, |d| {
+                script_source(d, source)
+            }));
+            own.close("section");
+            section(&mut own, "Host calls");
+            own.append(record(DOC_SCRIPT_CALLS_BYTES, |d| {
+                host_calls(d, provenance)
+            }));
+            own.close("section");
+            section(&mut own, "atlas.log");
+            own.append(record(DOC_SCRIPT_LOG_BYTES, |d| raw_list(d, logs, "lines")));
             if let Some(note) = logs_note {
-                doc.open("div");
-                doc.raw_text(note);
-                doc.close("div");
+                // Its own share: it shows even when the lines filled theirs.
+                own.append(record(DOC_SCRIPT_NOTE_BYTES, |d| {
+                    d.open("div");
+                    d.raw_text(note);
+                    d.close("div");
+                }));
             }
+            own.close("section");
+            section(&mut own, "stderr");
+            own.append(record(DOC_SCRIPT_STDERR_BYTES, |d| pre_raw_text(d, stderr)));
+            own.close("section");
+
+            section(doc, script_item_heading(*item));
+            let rest = doc
+                .limit
+                .saturating_sub(doc.out.len().saturating_add(own.out.len()));
+            let mut shown = Doc::with_limit(rest);
+            shown.nested = true;
+            self::body(&mut shown, view);
+            doc.append(shown);
             doc.close("section");
-            section(doc, "stderr");
-            if stderr.is_empty() {
-                doc.el("p", "none");
-            } else {
-                doc.open("pre");
-                doc.open("code");
-                doc.raw_text(stderr);
-                doc.close("code");
-                doc.close("pre");
-            }
-            doc.close("section");
+            doc.append(own);
         }
     }
 }
@@ -405,12 +424,12 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
 
 fn section(doc: &mut Doc, title: &str) {
     doc.open("section");
-    doc.el("h2", title);
+    doc.el(doc.heading(), title);
 }
 
 fn more_note(doc: &mut Doc, n: usize, unit: &str) {
     doc.open("p");
-    doc.fixed(&more_not_shown(len_u64(n), unit));
+    doc.fixed(&doc.more(len_u64(n), unit));
     doc.close("p");
 }
 
@@ -901,23 +920,29 @@ fn script_item_heading(item: ScriptItemKind) -> &'static str {
     }
 }
 
+/// A script's own section written by `write` into a [`Doc::record`] part with its share `limit`
+/// of the body.
+fn record(limit: usize, write: impl FnOnce(&mut Doc)) -> Doc {
+    let mut part = Doc::record(limit);
+    write(&mut part);
+    part
+}
+
 /// The script source, one table row per line (`\n`-terminated), numbered from 1: the number in
 /// the first cell, the line (without its `\n`) in a `<pre>` as a raw value (PD-69: a CR and
-/// trailing spaces and tabs are marked; tabs inside a line stay). At most [`DOC_MAX_DIFF_LINES`]
-/// lines.
+/// trailing spaces and tabs are marked; tabs inside a line stay). Capped by the bytes of its part
+/// ([`DOC_SCRIPT_SOURCE_BYTES`], T18 review I-2), not by a line count.
 fn script_source(doc: &mut Doc, source: &str) {
-    section(doc, "Script source");
     if source.is_empty() {
         doc.el("p", "none");
-        doc.close("section");
         return;
     }
     doc.open("table");
     doc.open("tbody");
-    // Bytes of `source` shown so far; the rest is left out when a cap stops the loop.
+    // Bytes of `source` shown so far; the rest is left out when the cap stops the loop.
     let mut at = 0;
     for (i, line) in source.split_inclusive('\n').enumerate() {
-        if i >= DOC_MAX_DIFF_LINES || doc.full() {
+        if doc.full() {
             break;
         }
         doc.open("tr");
@@ -937,16 +962,13 @@ fn script_source(doc: &mut Doc, source: &str) {
         doc.hide(len_u64(rest.len()));
         more_note(doc, rest.split_inclusive('\n').count(), "lines");
     }
-    doc.close("section");
 }
 
 /// PD-145 provenance: one row per host call, every field a raw string of the request (never of a
 /// response). At most [`DOC_MAX_ROWS`] rows.
 fn host_calls(doc: &mut Doc, rows: &[ProvenanceRow]) {
-    section(doc, "Host calls");
     if rows.is_empty() {
         doc.el("p", "none");
-        doc.close("section");
         return;
     }
     doc.open("table");
@@ -995,7 +1017,19 @@ fn host_calls(doc: &mut Doc, rows: &[ProvenanceRow]) {
         );
         more_note(doc, rest.len(), "rows");
     }
-    doc.close("section");
+}
+
+/// A raw text (stderr) in `<pre><code>`; `none` when empty.
+fn pre_raw_text(doc: &mut Doc, text: &str) {
+    if text.is_empty() {
+        doc.el("p", "none");
+        return;
+    }
+    doc.open("pre");
+    doc.open("code");
+    doc.raw_text(text);
+    doc.close("code");
+    doc.close("pre");
 }
 
 /// A `<ul>` of raw texts (display-escaped here), at most [`DOC_MAX_ROWS`]; `none` when empty.
