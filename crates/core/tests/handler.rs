@@ -182,7 +182,7 @@ async fn pd09_markdown_body_converted_or_placeholder_rejected() -> TestResult {
 }
 
 /// Whether any write is still `NotInThisBuild`: true while one is (the Confluence writes of M7,
-/// e.g. `confluence.page.move`, are), so the test below keeps picking one of them. Flip it to
+/// e.g. `confluence.attachment.upload`, are), so the test below keeps picking one of them. Flip it to
 /// false in M7's last Confluence write task; only then is an empty pick the documented outcome.
 const WRITES_STILL_LATER: bool = true;
 

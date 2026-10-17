@@ -378,6 +378,9 @@ pub struct ConfluenceFacts {
     /// `confluence::PAGE_BODY_LIMIT`; neither body is kept, the judge holds the update
     /// (`EnrichmentError`) and the card says why.
     pub page_too_large: bool,
+    /// Task 17 (PD-106): the new parent of a `page.move` is the page itself or one of its
+    /// descendants: the judge holds it (`EnrichmentError`) and the card says why.
+    pub into_own_subtree: bool,
 }
 
 /// Redacting `Debug` (§7.7): page bodies, titles and keys are Atlassian data.
@@ -391,6 +394,7 @@ impl fmt::Debug for ConfluenceFacts {
             .field("base_storage", &self.base_storage.as_ref().map(|s| s.len()))
             .field("current_unparsable", &self.current_unparsable)
             .field("page_too_large", &self.page_too_large)
+            .field("into_own_subtree", &self.into_own_subtree)
             .finish_non_exhaustive()
     }
 }
@@ -946,7 +950,19 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &["body", "body_format", "title"],
         },
     ),
-    ("confluence.page.move", LATER_WRITE),
+    (
+        "confluence.page.move",
+        OpImpl {
+            executor: confluence_ext::page_move_executor,
+            previewer: confluence_preview::move_preview,
+            // PD-106 / §5.4 step 5: `version.number` unchanged.
+            stale_check: Some(&stale::PAGE_MOVE),
+            enrich: Some(&confluence_ext::PAGE_MOVE_ENRICH),
+            // `id` is the target param (read-only); an edited `parent` re-runs the resolution
+            // and the cycle check (plan review I-6 c).
+            enrich_keys: &["parent"],
+        },
+    ),
     (
         "confluence.comment.add",
         OpImpl {

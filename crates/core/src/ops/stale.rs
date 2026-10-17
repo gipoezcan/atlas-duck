@@ -1,5 +1,5 @@
-//! §5.4 step 5 per-op stale rules in M3 (PD-10), and M5's assignee (PD-52) and sprint (PD-54)
-//! rules. The identity call that precedes every write is not one of these (C.7); an op without a
+//! §5.4 step 5 per-op stale rules in M3 (PD-10), M5's assignee (PD-52) and sprint (PD-54) rules,
+//! and M7's page move (PD-106). The identity call that precedes every write is not one of these (C.7); an op without a
 //! rule here has `stale_check: None`.
 
 use atlas_duck_atlassian::GetCall;
@@ -46,6 +46,13 @@ pub static SPRINT_MOVE: StaleRule = StaleRule {
 
 /// `confluence.page.update`: `version.number` unchanged.
 pub static PAGE_UPDATE: StaleRule = StaleRule {
+    plan: page_plan,
+    judge: page_judge,
+};
+
+/// `confluence.page.move` (T17, PD-106): `version.number` unchanged, the rule of the update; the
+/// `PUT` sends that version + 1, so a change after this check is Confluence's 409.
+pub static PAGE_MOVE: StaleRule = StaleRule {
     plan: page_plan,
     judge: page_judge,
 };

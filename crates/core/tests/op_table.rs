@@ -45,15 +45,16 @@ const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_iss
 
 /// Confluence writes completed in M7 beyond `confluence.page.update` (each task moves its op here
 /// from [`LATER_WRITES`]). Each needs its enrichment verdict before it renders a request.
-const M7_WRITES: [&str; 4] = [
+const M7_WRITES: [&str; 5] = [
     "confluence.page.create",
     "confluence.comment.add",
     "confluence.label.add",
     "confluence.label.remove",
+    "confluence.page.move",
 ];
 
 /// No Jira write is left after T18; the Confluence writes land in M7.
-const LATER_WRITES: [&str; 2] = ["confluence.page.move", "confluence.attachment.upload"];
+const LATER_WRITES: [&str; 1] = ["confluence.attachment.upload"];
 
 fn op(id: &str) -> Result<&'static OperationSpec, String> {
     atlas_duck_registry::get(id).ok_or_else(|| format!("no op {id}"))
@@ -213,6 +214,8 @@ fn u05_only_writes_have_stale_check() -> TestResult {
         // T18 (PD-54): the sprint is still future or active.
         "jira.sprint.move_issues",
         "confluence.page.update",
+        // M7 T17 (PD-106): `version.number` unchanged, as for the update.
+        "confluence.page.move",
     ]
     .into_iter()
     .collect();
@@ -242,6 +245,8 @@ fn reads_have_no_enrich() -> TestResult {
         "confluence.page.update",
         // M7 Task 16 (PD-105): the space, the parent page, the duplicate-title check.
         "confluence.page.create",
+        // M7 Task 17 (PD-106): the page, and the new parent in its space.
+        "confluence.page.move",
         // M7 Task 18 (PD-107): the container, and the reply target.
         "confluence.comment.add",
         // M7 Task 19 (PD-108): the content's current labels, for the card.
@@ -956,7 +961,32 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
             json!({"id": "65537", "label": "release"}),
             Some(label_verdict()),
         ),
+        // M7 Task 17: a page moved under a parent named by title.
+        (
+            "confluence.page.move",
+            json!({"id": "65537", "parent": "Release notes"}),
+            Some(move_verdict()),
+        ),
     ]
+}
+
+/// What enrichment gives for moving page 65537 (version 7) under `Release notes` (123400).
+fn move_verdict() -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), json!("65537"));
+    resolved.insert("title".to_owned(), json!("Release checklist"));
+    resolved.insert("parent".to_owned(), json!("Release notes"));
+    resolved.insert("parent_id".to_owned(), json!("123400"));
+    EnrichVerdict::preview(
+        json!({
+            "version": 7,
+            "title": "Release checklist",
+            "space_key": "DOC",
+            "from_parent_id": "65536",
+            "to_parent_id": "123400",
+        }),
+        resolved,
+    )
 }
 
 /// What enrichment gives for a page `Notes` in `DOC`, under `(parent param, resolved id)`.
@@ -1882,6 +1912,8 @@ fn fixtures_match_registry_schemas() -> TestResult {
         ("confluence.page.get", fixtures::CONFLUENCE_PAGE),
         ("confluence.page.history", fixtures::CONFLUENCE_PAGE),
         ("confluence.page.update", fixtures::CONFLUENCE_PAGE_UPDATED),
+        // A move answers the `PUT` like an update (M7 Task 17).
+        ("confluence.page.move", fixtures::CONFLUENCE_PAGE_UPDATED),
         // What `POST /rest/api/content` answers for a comment (M7 Task 18), with the fields the
         // receipt does not keep.
         (

@@ -36,6 +36,7 @@ use super::confluence::{
     BodyFormat, PAGE_BODY_LIMIT, TEXT_CURRENT_UNPARSABLE, TEXT_PAGE_TOO_LARGE, body_format,
 };
 use super::confluence_body::is_markdown;
+use super::confluence_ext::TEXT_MOVE_INTO_OWN_SUBTREE;
 use super::generic::{
     TABLE_ROW_CAP, bytes_of, cell_of, cut_at, omitted_row, other_root_bytes, pair_bytes,
     short_string, table_count,
@@ -1536,6 +1537,125 @@ pub(crate) fn labels_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         sentence,
         rows,
         constructs: None,
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = model.header.hidden_in_preview_bytes.saturating_add(cut);
+    model
+}
+
+// ---- the move card (§6.3 Page move, PD-106, Task 17) --------------------------------------------
+
+/// The keys of the PD-106 move body, exactly: a request with any other key (a `body` above all,
+/// which the card's fixed row says is not sent) keeps the generic card.
+const MOVE_BODY_KEYS: [&str; 5] = ["id", "type", "title", "version", "ancestors"];
+
+/// §6.3 Page move for `confluence.page.move` (PD-106) over the exact request (§5.1 inv. 4): the
+/// page row "<title> (page <id>, version <current> → <sent>)", the old path (the page's ancestors,
+/// then the page) and the new path (the parent's ancestors, the parent, then the page). The page,
+/// its title, the version and the parent are read from the request that is sent; the names around
+/// them are what enrichment resolved for exactly those, else the generic card stays. The renderer
+/// adds the fixed row "body not sent; title and body kept by Confluence" (plan review m-14). The
+/// judge's hold of a move under the page's own subtree shows the PD-106 text; every other hold
+/// keeps the generic write preview.
+pub(crate) fn move_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let Some(verdict) = view.enrichment else {
+        return model;
+    };
+    let Some(facts) = verdict.summary.as_ref().and_then(|s| s.confluence.as_ref()) else {
+        return model;
+    };
+    match view.hold {
+        Hold::EnrichmentError if view.failure.is_none() && facts.into_own_subtree => {
+            model.body = PreviewBody::enrichment_error(None, TEXT_MOVE_INTO_OWN_SUBTREE, None);
+            return model;
+        }
+        Hold::Preview if verdict.hold == Hold::Preview => {}
+        _ => return model,
+    }
+    let ([request], PreviewBody::WriteRequests { .. }) = (view.requests, &model.body) else {
+        return model;
+    };
+    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&request.body) else {
+        return model;
+    };
+    let (Some(page), Some(parent)) = (facts.page.as_ref(), facts.parent.as_ref()) else {
+        return model;
+    };
+    let text = |k: &str| sent.get(k).and_then(Value::as_str);
+    let sent_parent = match sent
+        .get("ancestors")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    {
+        Some([one]) => one.get("id").and_then(Value::as_str),
+        _ => None,
+    };
+    let sent_version = sent
+        .get("version")
+        .and_then(|v| v.get("number"))
+        .and_then(Value::as_u64);
+    let current = verdict.baseline.get("version").and_then(Value::as_u64);
+    let is_this_move = sent.len() == MOVE_BODY_KEYS.len()
+        && MOVE_BODY_KEYS.iter().all(|k| sent.contains_key(*k))
+        && text("id") == Some(page.id.as_str())
+        && text("type") == Some("page")
+        && text("title") == Some(page.title.as_str())
+        && sent_parent == Some(parent.id.as_str());
+    let (true, Some(current), Some(next)) = (is_this_move, current, sent_version) else {
+        return model;
+    };
+    if current.checked_add(1) != Some(next) {
+        return model;
+    }
+
+    let mut cut = 0u64;
+    let mut line = |raw: &str| {
+        let (shown, bytes) = generic::capped_text(raw, generic::CELL_CAP_CHARS * 2);
+        cut = cut.saturating_add(bytes);
+        shown
+    };
+    let title = page.title.as_str();
+    let page_row = line(&format!(
+        "{title} (page {}, version {current} → {next})",
+        page.id
+    ));
+    let mut from_path = Vec::with_capacity(facts.from_path.len() + 1);
+    for t in &facts.from_path {
+        from_path.push(line(t));
+    }
+    from_path.push(line(title));
+    let mut to_path = Vec::with_capacity(facts.to_path.len() + 1);
+    for t in &facts.to_path {
+        to_path.push(line(t));
+    }
+    to_path.push(line(title));
+    // Server text the card shows beyond the request (§6.4 counts): the ancestors and the parent.
+    count_card_text(
+        &mut model,
+        facts
+            .from_path
+            .iter()
+            .chain(&facts.to_path)
+            .map(String::as_str),
+    );
+
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::PageMove {
+        page: page_row,
+        from_path,
+        to_path,
         requests,
     };
     model.header.hidden_in_preview_bytes = model.header.hidden_in_preview_bytes.saturating_add(cut);

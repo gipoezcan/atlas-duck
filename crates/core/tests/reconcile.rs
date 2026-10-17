@@ -38,6 +38,7 @@ const COMMENT: &str = "jira.comment.add";
 const TRANSITION: &str = "jira.issue.transition";
 const ASSIGN: &str = "jira.issue.assign";
 const PAGE_UPDATE: &str = "confluence.page.update";
+const PAGE_MOVE: &str = "confluence.page.move";
 
 fn jira(h: &Harness) -> Result<&MockDc, TestError> {
     h.mock("jira-main").ok_or_else(|| "no jira mock".into())
@@ -126,6 +127,27 @@ async fn queued_page_update(h: &Harness) -> Result<String, TestError> {
         json!({ "id": "65537", "base_version": 5, "body": "<p>New text.</p>", "body_format": "storage" }),
     )
     .await
+}
+
+/// A move of page 65537 (version 5, under `Home`) under page 123400, a sibling, in the queue
+/// (both enrichment GETs done); the next `PREVIEW_FETCH` is the stale check's identity call.
+async fn queued_page_move(h: &Harness) -> Result<String, TestError> {
+    let mock = wiki(h)?;
+    mock.confluence_user_current(
+        atlas_duck_atlassian::testing::UserKind::Known,
+        TEST_USER,
+        TEST_USER_KEY,
+    )
+    .await;
+    mock.json("/rest/api/content/65537", 200, &page_at(5)).await;
+    let parent = json!({
+        "id": "123400", "type": "page", "status": "current", "title": "Release notes",
+        "space": {"key": "DOC", "name": "Documentation"},
+        "ancestors": [{"id": "65536", "type": "page", "status": "current", "title": "Home"}],
+    });
+    mock.json("/rest/api/content/123400", 200, &parent.to_string())
+        .await;
+    queued(h, PAGE_MOVE, json!({ "id": "65537", "parent": "123400" })).await
 }
 
 fn assert_outcome_unknown(env: &Envelope) {
@@ -605,6 +627,34 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_update(
     let id = queued_page_update(&h).await?;
     crash_after_stale_check(&mut h, &id).await?;
     assert_listed_unknown(&h, &id, "65537").await
+}
+
+/// I-26 for the stale rule M7 adds (T17, `stale::PAGE_MOVE`): the move's stale-check record
+/// committed, the crash comes before anything else, and the restart reconciles it as
+/// `outcome_unknown` like the update; nothing was sent before the crash.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_move() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let id = queued_page_move(&h).await?;
+    crash_after_stale_check(&mut h, &id).await?;
+    assert_listed_unknown(&h, &id, "65537").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    let unknown = h.events_of(EventType::WRITE_OUTCOME_UNKNOWN).await?;
+    assert_eq!(
+        unknown
+            .last()
+            .map(|p| (p["request_index"].clone(), p["reason"].clone())),
+        Some((json!(0), json!("crash")))
+    );
+    let puts = wiki(&h)?
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PUT")
+        .count();
+    assert_eq!(puts, 0);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

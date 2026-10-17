@@ -3,6 +3,9 @@
 //!   id or by title within that space ([`resolve_parent`], shared with `page.move`), and the
 //!   duplicate-title check, so a create is sent only into the space and under the page the
 //!   approver saw;
+//! - `confluence.page.move` (Task 17, PD-106): the page with its version, the new parent resolved
+//!   within the page's own space (the same `resolve_parent`), and the hold of a move under the
+//!   page itself or one of its descendants, so a move is sent only as the approver saw it;
 //! - `confluence.comment.add` (Task 18, PD-107): the container type from the enrichment and the
 //!   `reply_to` resolution (a comment on this very content), so a reply is never sent unchecked;
 //! - the label writes (Task 19, PD-108): one request each, the content's current labels read for
@@ -13,6 +16,7 @@ use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use serde_json::{Map, Value, json};
 
+use super::confluence::content_version;
 use super::confluence_body::{EmptyBody, storage_text};
 use super::jira::{MAX_CANDIDATES, capped, unresolved};
 use super::{
@@ -174,10 +178,21 @@ pub(crate) fn resolve_parent(
     if !key.eq_ignore_ascii_case(space_key) {
         return Err(no_match(Vec::new()));
     }
-    let Some(ancestors) = found.get("ancestors").and_then(Value::as_array) else {
-        return Err(Box::new(EnrichVerdict::unusable()));
-    };
-    let ancestors = ancestors
+    let ancestors = page_refs(found).ok_or_else(|| Box::new(EnrichVerdict::unusable()))?;
+    Ok(Parent {
+        id,
+        title: title.to_owned(),
+        ancestors,
+    })
+}
+
+/// The `ancestors` of a content answer (`expand=ancestors`), root first, titles cut to the name
+/// cap; `None` (fail closed) when it is no array or an entry lacks an all-digit page id, since the
+/// `page.move` cycle check reads every id.
+fn page_refs(content: &Value) -> Option<Vec<PageRef>> {
+    content
+        .get("ancestors")?
+        .as_array()?
         .iter()
         .map(|a| {
             Some(PageRef {
@@ -185,13 +200,7 @@ pub(crate) fn resolve_parent(
                 title: text_of(a, "title").map(capped).unwrap_or_default(),
             })
         })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| Box::new(EnrichVerdict::unusable()))?;
-    Ok(Parent {
-        id,
-        title: title.to_owned(),
-        ancestors,
-    })
+        .collect()
 }
 
 /// The space the `space` param names, from the stage-1 answer: its key (the server's spelling,
@@ -369,6 +378,192 @@ pub fn page_create_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     if let (Some(id), Some(map)) = (parent_id, body.as_object_mut()) {
         map.insert("ancestors".to_owned(), json!([{ "id": id }]));
     }
+    json_request(ctx, &body)
+}
+
+// ---- confluence.page.move ----------------------------------------------------------------------
+
+/// Stage 1: the page that moves.
+const PAGE_PATH: &str = "/rest/api/content/{id}";
+
+/// `expand` of stage 1: the version the `PUT` increments (and the stale rule compares), the space
+/// the parent must be in, the ancestors of the old path.
+const PAGE_EXPAND: &str = "version,space,ancestors";
+
+/// PD-106 (plan text): the card of a move under the page itself or one of its descendants.
+pub(crate) const TEXT_MOVE_INTO_OWN_SUBTREE: &str =
+    "a page cannot be moved under itself or one of its descendants";
+
+/// PD-106: stage 1 reads the page with its version, space and ancestors (`enrich`); stage 2
+/// resolves the `parent` param within that page's own space ([`parent_call`], `resolve`): a page
+/// of another space is no match (cross-space moves are a non-goal, §1.3). A parent that is the
+/// page itself or has it among its ancestors is held ([`TEXT_MOVE_INTO_OWN_SUBTREE`]). A stage-1
+/// answer the judge cannot use ends the plan (`Judge`, no parent lookup). The stale rule is
+/// `stale::PAGE_MOVE` (`version.number` unchanged); `parent` is the one param an approver edit
+/// re-enriches (`id` is the target param, read-only).
+pub static PAGE_MOVE_ENRICH: EnrichRule = EnrichRule {
+    plan: move_plan,
+    judge: move_judge,
+};
+
+/// The page a move is about, as stage 1 read it (raw server text).
+struct MovedPage {
+    title: String,
+    version: u64,
+    space_key: String,
+    space_name: Option<String>,
+    ancestors: Vec<PageRef>,
+}
+
+/// Stage 1's answer when it is this very page (the `id` param, as a string or a number), a
+/// current `page` with a version, a title, a space key and ancestors that all carry a page id;
+/// `None` otherwise (fail closed: the old path and the version the `PUT` increments come from it).
+fn moved_page(params: &Value, answer: &Value) -> Option<MovedPage> {
+    let is_this_page = id_text(answer.get("id")).as_deref() == Some(str_param(params, "id"))
+        && text_of(answer, "type") == Some("page")
+        && text_of(answer, "status") == Some("current");
+    if !is_this_page {
+        return None;
+    }
+    let space = answer.get("space")?;
+    Some(MovedPage {
+        title: text_of(answer, "title")?.to_owned(),
+        version: content_version(answer)?,
+        space_key: text_of(space, "key")?.to_owned(),
+        space_name: text_of(space, "name").map(str::to_owned),
+        ancestors: page_refs(answer)?,
+    })
+}
+
+/// Two all-digit page ids name the same page (leading zeros aside: the cycle check must not miss
+/// the page over a spelling).
+fn same_page(a: &str, b: &str) -> bool {
+    a.trim_start_matches('0') == b.trim_start_matches('0')
+}
+
+fn move_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    let params = ctx.params;
+    match answers {
+        [] => fetch(
+            EnrichPurpose::Enrich,
+            get_call(PAGE_PATH, params, &[("expand", PAGE_EXPAND)]),
+        ),
+        [page] => match moved_page(params, page).and_then(|p| parent_call(params, &p.space_key)) {
+            Some(parent) => EnrichStep::Fetch(vec![parent]),
+            None => EnrichStep::Judge,
+        },
+        _ => EnrichStep::Judge,
+    }
+}
+
+fn move_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
+    let params = ctx.params;
+    let Some(page) = answers.first().and_then(|a| moved_page(params, a)) else {
+        return EnrichVerdict::unusable();
+    };
+    // The plan asked for the parent only after a usable page, so a missing answer is a short
+    // response list: fail closed.
+    let Some(answer) = answers.get(1) else {
+        return EnrichVerdict::unusable();
+    };
+    let parent = match resolve_parent(params, &page.space_key, answer) {
+        Ok(p) => p,
+        Err(held) => return *held,
+    };
+    let id = str_param(params, "id");
+    let mut facts = ConfluenceFacts {
+        space_key: capped(&page.space_key),
+        space_name: page.space_name.as_deref().map(capped),
+        page: Some(PageRef {
+            id: id.to_owned(),
+            title: page.title.clone(),
+        }),
+        ..ConfluenceFacts::default()
+    };
+    // PD-106: under the page itself or one of its descendants. `resolve_parent` guarantees every
+    // ancestor carries a page id (T16 review m-5), so the whole chain is compared.
+    if same_page(&parent.id, id) || parent.ancestors.iter().any(|a| same_page(&a.id, id)) {
+        facts.into_own_subtree = true;
+        let mut held = EnrichVerdict {
+            hold: Hold::EnrichmentError,
+            ..EnrichVerdict::preview(Value::Null, Map::new())
+        };
+        held.summary = Some(WriteSummaryFacts {
+            confluence: Some(facts),
+            ..WriteSummaryFacts::default()
+        });
+        return held;
+    }
+
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), Value::from(id));
+    resolved.insert("title".to_owned(), Value::from(page.title.as_str()));
+    if let Some(value) = parent_param(params) {
+        resolved.insert("parent".to_owned(), Value::from(value));
+    }
+    resolved.insert("parent_id".to_owned(), Value::from(parent.id.as_str()));
+    // The stale rule compares `version` (`stale::PAGE_MOVE`); the `PUT` sends it + 1.
+    // `from_parent_id` is the page's current parent (its last ancestor, none for a root page),
+    // `to_parent_id` the destination.
+    let baseline = json!({
+        "version": page.version,
+        "title": page.title,
+        "space_key": page.space_key,
+        "from_parent_id": page.ancestors.last().map(|a| a.id.as_str()),
+        "to_parent_id": parent.id,
+    });
+    let mut verdict = EnrichVerdict::preview(baseline, resolved);
+    facts.from_path = page.ancestors.into_iter().map(|a| a.title).collect();
+    facts.to_path = parent
+        .ancestors
+        .iter()
+        .map(|a| a.title.clone())
+        .chain([parent.title.clone()])
+        .collect();
+    facts.parent = Some(PageRef {
+        id: parent.id,
+        title: parent.title,
+    });
+    verdict.summary = Some(WriteSummaryFacts {
+        confluence: Some(facts),
+        ..WriteSummaryFacts::default()
+    });
+    verdict
+}
+
+/// `PUT /rest/api/content/{id}` with the PD-106 body: `{"id","type":"page","title":<current
+/// title>,"version":{"number":<current + 1>},"ancestors":[{"id":<resolved parent id>}]}`, no
+/// `body` (lead ruling Q4; the live probe `v_page_move_keeps_body` decides). Only a `Preview`
+/// verdict for these very params renders it: the parent id is the one enrichment resolved (and
+/// checked against the cycle) for this `parent`, the version the one the stale rule compares.
+pub fn page_move_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
+    let verdict = ctx
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .ok_or(ExecError::EnrichmentRequired)?;
+    let resolved = |name: &str| verdict.resolved.get(name).and_then(Value::as_str);
+    let id = str_param(ctx.params, "id");
+    if resolved("id") != Some(id) || resolved("parent") != parent_param(ctx.params) {
+        return Err(ExecError::EnrichmentRequired);
+    }
+    let parent_id = resolved("parent_id")
+        .filter(|p| is_page_id(p) && !same_page(p, id))
+        .ok_or(ExecError::EnrichmentRequired)?;
+    let title = resolved("title").ok_or(ExecError::EnrichmentRequired)?;
+    let next = verdict
+        .baseline
+        .get("version")
+        .and_then(Value::as_u64)
+        .and_then(|v| v.checked_add(1))
+        .ok_or(ExecError::EnrichmentRequired)?;
+    let body = json!({
+        "id": id,
+        "type": "page",
+        "title": title,
+        "version": {"number": next},
+        "ancestors": [{ "id": parent_id }],
+    });
     json_request(ctx, &body)
 }
 

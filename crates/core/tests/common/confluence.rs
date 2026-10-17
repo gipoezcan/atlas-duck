@@ -329,6 +329,30 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
                 },
             ])
         }
+        // Task 17 (PD-106): the page with its version, space and ancestors (stage 1, and the
+        // stale check's `?expand=version` on the same path), and the parent by id (all digits in
+        // the example) in that space; the `PUT` is the op's own endpoint.
+        "confluence.page.move" => {
+            let field = |k: &str| {
+                params[k]
+                    .as_str()
+                    .ok_or(format!("example params have no string {k}"))
+            };
+            let (id, parent) = (field("id")?, field("parent")?);
+            Ok(vec![
+                Aux {
+                    path: content_path(id),
+                    body: json!({"id": id, "type": "page", "status": "current", "title": "Page",
+                                 "space": {"key": "DOC"}, "version": {"number": 3},
+                                 "ancestors": []}),
+                },
+                Aux {
+                    path: content_path(parent),
+                    body: json!({"id": parent, "type": "page", "status": "current",
+                                 "title": "Parent", "space": {"key": "DOC"}, "ancestors": []}),
+                },
+            ])
+        }
         other => Err(format!(
             "{other}: no X-09 mount rule in common::confluence::aux_gets (a new op needs its GETs decided)"
         )),
