@@ -5,7 +5,11 @@
 //!
 //! A run needs `ATLAS_DUCK_LIVE_CONFLUENCE_URL` (https, with the context path if any),
 //! `ATLAS_DUCK_LIVE_CONFLUENCE_PAT` and `ATLAS_DUCK_LIVE_CONFLUENCE_SPACE` (a scratch space: every
-//! write goes only there, and the scratch pages it creates stay). Optional:
+//! write goes only there). SPACE must be a personal space (key starting with `~`) unless
+//! `ATLAS_DUCK_LIVE_CONFLUENCE_SPACE_OK=1` says the operator knows it is safe to fill with test
+//! pages; host and space are printed before the first write. At the end (and after a failed probe)
+//! a test makes a best-effort raw `DELETE /rest/api/content/{id}` of every page it created (they
+//! land in the space trash; comments and attachments go with their page). Optional:
 //! `ATLAS_DUCK_LIVE_CONFLUENCE_SSO_URL` (an SSO front, V23) and
 //! `ATLAS_DUCK_LIVE_CONFLUENCE_BAD_PAT` (a revoked or expired token, V25). Without the three
 //! required variables a test prints `skipped: live env not set` and returns `Ok(())`.
@@ -27,7 +31,7 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atlas_duck_atlassian::testing::{RecordingDates, test_cover, test_write_cover};
@@ -138,9 +142,35 @@ struct Live {
     space: String,
     user: String,
     tag: String,
+    /// Ids of the pages this run created, for `cleanup`.
+    created: Mutex<Vec<String>>,
+}
+
+/// The host part of `url`, for the guard line.
+fn host_of(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    rest.split(['/', '?', '#']).next().unwrap_or(rest)
+}
+
+/// Refuses a SPACE that is neither personal nor explicitly approved; prints host and space.
+fn space_guard(env: &Env) -> Result<(), TestError> {
+    println!(
+        "live: host={} space={} (scratch pages are created here)",
+        host_of(&env.url),
+        shown(&env.space)
+    );
+    if env.space.starts_with('~')
+        || var("ATLAS_DUCK_LIVE_CONFLUENCE_SPACE_OK").as_deref() == Some("1")
+    {
+        return Ok(());
+    }
+    Err("SPACE is not a personal space (key starting with ~): set \
+         ATLAS_DUCK_LIVE_CONFLUENCE_SPACE_OK=1 to write test pages there"
+        .into())
 }
 
 async fn start_live(env: &Env) -> Result<Live, TestError> {
+    space_guard(env)?;
     let h = Harness::builder()
         .live_confluence(&env.url, &env.pat)
         .start()
@@ -160,7 +190,55 @@ async fn start_live(env: &Env) -> Result<Live, TestError> {
         space: env.space.clone(),
         user: report.atlassian_user,
         tag: tag(),
+        created: Mutex::new(Vec::new()),
     })
+}
+
+/// Best-effort removal of the pages the test created (children first): a raw DELETE each. Every
+/// outcome is a printed line; nothing here fails the test.
+async fn cleanup(l: &Live) {
+    let ids = l.created.lock().map(|g| g.clone()).unwrap_or_default();
+    if ids.is_empty() {
+        return;
+    }
+    let raw = match Raw::new(
+        &l.h,
+        LIVE_CONFLUENCE_ALIAS,
+        &l.url,
+        &l.user,
+        WireProduct::Confluence,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            println!(
+                "cleanup: no client ({e}); {} pages left in the space",
+                ids.len()
+            );
+            return;
+        }
+    };
+    let mut deleted = 0usize;
+    for id in ids.iter().rev() {
+        match raw
+            .send_json(
+                "DELETE",
+                "/rest/api/content/{id}",
+                &json!({"id": id}),
+                &[],
+                None,
+                ExpectedBody::Empty,
+            )
+            .await
+        {
+            Ok(WriteOutcome::Executed { .. }) => deleted += 1,
+            Ok(o) => println!("cleanup: page {id} not deleted: {}", describe_write(&o)),
+            Err(e) => println!("cleanup: page {id} not deleted: {e}"),
+        }
+    }
+    println!(
+        "cleanup: deleted {deleted} of {} created pages (now in the space trash)",
+        ids.len()
+    );
 }
 
 /// One request of the app, end to end.
@@ -304,6 +382,9 @@ async fn create_page(
         .as_str()
         .ok_or_else(|| format!("create '{title}' failed: {}", r.summary()))?
         .to_owned();
+    if let Ok(mut g) = l.created.lock() {
+        g.push(id.clone());
+    }
     Ok((id, r))
 }
 
@@ -554,15 +635,16 @@ impl Raw {
         }
     }
 
-    /// A read's answer as a finding: status, content type and, for a client built for the Jira
-    /// product, what the identity check made of `X-AUSERNAME` (a parsed answer passed it, so the
-    /// header was present and the configured user's exact bytes). A Confluence-product client
-    /// checks nothing, so its line says nothing about the header.
+    /// A read's answer as a finding: status, content type and what the identity check made of
+    /// `X-AUSERNAME`. A Confluence-product client checks nothing, so a `Response` line says nothing
+    /// about the header there; a Jira-product client only checks JSON answers, so for it a
+    /// `Response` means no identity failure, and the header is exact only when the answer was JSON
+    /// (its content type is in the line).
     fn describe_fetch(&self, o: &FetchOutcome) -> String {
         match o {
             FetchOutcome::Response(r) => format!(
-                "status={} content_type={:?} body_len={} (no identity failure: for a Jira-product \
-                 client X-AUSERNAME was present, <configured user>, exact bytes)",
+                "status={} content_type={:?} body_len={} (no identity failure; whether \
+                 X-AUSERNAME was checked depends on the client's product and a JSON answer)",
                 r.status,
                 r.content_type,
                 r.body.len()
@@ -701,12 +783,26 @@ async fn walk(
              totalSize={} links_next_present={next}",
             a.status, v["limit"], v["totalSize"]
         );
-        if !next || size == 0 {
+        if size == 0 {
             println!(
-                "V04 paging {label} ended at page {n}: next absent={} (an empty page with next \
-                 present would end the walk here too: size={size})",
-                !next
+                "V04 paging {label} inconclusive: empty page {n} (next present={next}); no data \
+                 page was walked"
             );
+            return Ok(());
+        }
+        if !next {
+            if n == 1 {
+                println!(
+                    "V04 paging {label} inconclusive: the only page had next absent (a single page \
+                     shows nothing about `_links.next` on non-last pages)"
+                );
+            } else {
+                println!(
+                    "V04 paging {label} ended at page {n} with data (size={size}): next absent \
+                     on the last page, present on pages 1..{}",
+                    n - 1
+                );
+            }
             return Ok(());
         }
         start += size;
@@ -725,6 +821,49 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
         return Ok(());
     };
     let l = start_live(&env).await?;
+    let res = v04_body(&l).await;
+    cleanup(&l).await;
+    res
+}
+
+/// Prints a failed probe as a line and counts it, so later probes still run.
+fn probe(label: &str, r: TestResult, failed: &mut usize) {
+    if let Err(e) = r {
+        *failed += 1;
+        println!("V04 {label} error: {e}");
+    }
+}
+
+/// Polls the search (up to 60 s, 2 s apart) until it reports `totalSize >= want`: the index lags
+/// behind writes. `false` if it never got there.
+async fn wait_indexed(raw: &Raw, cql: &str, want: u64) -> bool {
+    let start = Instant::now();
+    let mut seen = None;
+    for _ in 0..=30 {
+        if let Ok(a) = raw
+            .get_any(
+                "/rest/api/search",
+                json!({}),
+                &[("cql", cql), ("limit", "1")],
+            )
+            .await
+        {
+            seen = a.json()["totalSize"].as_u64();
+            if seen.is_some_and(|n| n >= want) {
+                println!(
+                    "V04 search index ready after {} s (totalSize={seen:?})",
+                    start.elapsed().as_secs()
+                );
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    println!("V04 search index NOT ready after 60 s (totalSize={seen:?}, wanted {want})");
+    false
+}
+
+async fn v04_body(l: &Live) -> TestResult {
     let raw = Raw::new(
         &l.h,
         LIVE_CONFLUENCE_ALIAS,
@@ -743,7 +882,7 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
 
     // A page with a version 2 (so version 1 is historical) and two children (paging).
     let (page, _) = create_page(
-        &l,
+        l,
         &format!("atlas-duck live V04 {t}"),
         "V04 first body",
         "markdown",
@@ -751,7 +890,7 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
     )
     .await?;
     let r = write(
-        &l,
+        l,
         "confluence.page.update",
         json!({"id": page, "base_version": 1, "body": "V04 second body"}),
     )
@@ -759,7 +898,7 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
     println!("V04 page {page} updated to v2: {}", r.summary());
     for n in 1..=2 {
         create_page(
-            &l,
+            l,
             &format!("atlas-duck live V04 child {n} {t}"),
             "child",
             "markdown",
@@ -768,6 +907,28 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
         .await?;
     }
 
+    let mut failed = 0usize;
+    probe("comments", v04_comments(&raw, &page).await, &mut failed);
+    probe(
+        "history and manifest",
+        v04_history(&raw, &page).await,
+        &mut failed,
+    );
+    probe("search", v04_search(l, &raw).await, &mut failed);
+    probe("paging", v04_paging(l, &raw, &page).await, &mut failed);
+    probe(
+        "stale PUT",
+        v04_stale_put(&raw, &jraw, &page).await,
+        &mut failed,
+    );
+    println!("V04 scratch page {page} and its children: cleanup follows");
+    if failed > 0 {
+        return Err(format!("{failed} V04 probes failed (see the `error:` lines)").into());
+    }
+    Ok(())
+}
+
+async fn v04_comments(raw: &Raw, page: &str) -> TestResult {
     // Comment create payload (PD-107): `container.type` and a reply through `ancestors`.
     let comment = json!({
         "type": "comment",
@@ -857,6 +1018,10 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
         a.json()["results"][0]["extensions"]["location"]
     );
 
+    Ok(())
+}
+
+async fn v04_history(raw: &Raw, page: &str) -> TestResult {
     // The historical body (page.history --version).
     let a = raw
         .get_any(
@@ -892,11 +1057,20 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
         !v["version"].is_null()
     );
 
-    // Search: `excerpt=indexed`, `totalSize`, the rewritten CQL (trailing ORDER BY included).
+    Ok(())
+}
+
+async fn v04_search(l: &Live, raw: &Raw) -> TestResult {
+    // Search: `excerpt=indexed`, `totalSize`, the rewritten CQL (trailing ORDER BY included). The
+    // index lags behind the writes, so wait until the three V04 pages are searchable.
     let plain = format!(
         "space = \"{}\" AND title ~ \"atlas-duck live V04\"",
         l.space
     );
+    if !wait_indexed(raw, &effective_cql(&plain)?, 3).await {
+        println!("V04 search probes skipped: index not ready (rerun later)");
+        return Ok(());
+    }
     let ordered = format!("{plain} ORDER BY created DESC");
     for (label, cql) in [("plain", plain.as_str()), ("order-by", ordered.as_str())] {
         let effective = effective_cql(cql)?;
@@ -936,39 +1110,72 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
         }
     }
 
-    // `_links.next` exactly on the last page (PD-111 minor 8).
+    Ok(())
+}
+
+async fn v04_paging(l: &Live, raw: &Raw, page: &str) -> TestResult {
+    // `_links.next` exactly on the last page (PD-111 minor 8). A walk error does not stop the
+    // later walks.
+    let mut failed = 0usize;
     let effective = effective_cql(&format!(
         "space = \"{}\" AND title ~ \"atlas-duck live V04\"",
         l.space
     ))?;
-    walk(
-        &raw,
-        "search",
-        "/rest/api/search",
-        &json!({}),
-        &[("cql", effective.as_str())],
-    )
-    .await?;
-    walk(
-        &raw,
-        "child/comment",
-        "/rest/api/content/{id}/child/comment",
-        &json!({"id": page}),
-        &[("depth", "all")],
-    )
-    .await?;
-    walk(
-        &raw,
-        "child/page",
-        "/rest/api/content/{id}/child/page",
-        &json!({"id": page}),
-        &[],
-    )
-    .await?;
-    walk(&raw, "space", "/rest/api/space", &json!({}), &[]).await?;
+    // The search walk only means something once the index holds the pages.
+    if wait_indexed(raw, &effective, 3).await {
+        probe(
+            "paging search",
+            walk(
+                raw,
+                "search",
+                "/rest/api/search",
+                &json!({}),
+                &[("cql", effective.as_str())],
+            )
+            .await,
+            &mut failed,
+        );
+    } else {
+        println!("V04 paging search skipped: index not ready");
+    }
+    probe(
+        "paging child/comment",
+        walk(
+            raw,
+            "child/comment",
+            "/rest/api/content/{id}/child/comment",
+            &json!({"id": page}),
+            &[("depth", "all")],
+        )
+        .await,
+        &mut failed,
+    );
+    probe(
+        "paging child/page",
+        walk(
+            raw,
+            "child/page",
+            "/rest/api/content/{id}/child/page",
+            &json!({"id": page}),
+            &[],
+        )
+        .await,
+        &mut failed,
+    );
+    probe(
+        "paging space",
+        walk(raw, "space", "/rest/api/space", &json!({}), &[]).await,
+        &mut failed,
+    );
+    if failed > 0 {
+        return Err(format!("{failed} paging walks failed").into());
+    }
+    Ok(())
+}
 
+async fn v04_stale_put(raw: &Raw, jraw: &Raw, page: &str) -> TestResult {
     // A PUT with a stale version: 409 or 400, and its text (PD-111, `is_version_conflict`).
-    let (now, title, _) = page_now(&raw, &page).await?;
+    let (now, title, _) = page_now(raw, page).await?;
     let stale = json!({
         "id": page,
         "type": "page",
@@ -1004,7 +1211,6 @@ async fn v04_confluence_endpoints_and_cql_rewrite() -> TestResult {
         "V04 stale PUT, wire status and message (Jira-product client keeps the refusal): {}",
         describe_write(&o)
     );
-    println!("V04 scratch page {page} and its children left in the space");
     Ok(())
 }
 
@@ -1018,19 +1224,25 @@ async fn v06_confluence_write_success_shapes() -> TestResult {
         return Ok(());
     };
     let l = start_live(&env).await?;
+    let res = v06_confluence_write_success_shapes_body(&l).await;
+    cleanup(&l).await;
+    res
+}
+
+async fn v06_confluence_write_success_shapes_body(l: &Live) -> TestResult {
     let t = &l.tag;
 
     let (a, created) = create_page(
-        &l,
+        l,
         &format!("atlas-duck live V06 A {t}"),
         "V06 body A",
         "markdown",
         None,
     )
     .await?;
-    report_write(&l, "confluence.page.create", &created);
+    report_write(l, "confluence.page.create", &created);
     let (b, _) = create_page(
-        &l,
+        l,
         &format!("atlas-duck live V06 B {t}"),
         "V06 body B",
         "markdown",
@@ -1038,7 +1250,7 @@ async fn v06_confluence_write_success_shapes() -> TestResult {
     )
     .await?;
     let (c, _) = create_page(
-        &l,
+        l,
         &format!("atlas-duck live V06 C {t}"),
         "V06 body C",
         "markdown",
@@ -1047,63 +1259,63 @@ async fn v06_confluence_write_success_shapes() -> TestResult {
     .await?;
 
     let r = write(
-        &l,
+        l,
         "confluence.page.update",
         json!({"id": a, "base_version": 1, "body": "V06 body A (edited)", "title": format!("atlas-duck live V06 A edited {t}")}),
     )
     .await?;
-    report_write(&l, "confluence.page.update", &r);
+    report_write(l, "confluence.page.update", &r);
 
-    let r = write(&l, "confluence.page.move", json!({"id": b, "parent": c})).await?;
-    report_write(&l, "confluence.page.move", &r);
+    let r = write(l, "confluence.page.move", json!({"id": b, "parent": c})).await?;
+    report_write(l, "confluence.page.move", &r);
 
     let r = write(
-        &l,
+        l,
         "confluence.comment.add",
         json!({"content_id": a, "body": "V06 comment"}),
     )
     .await?;
-    report_write(&l, "confluence.comment.add", &r);
+    report_write(l, "confluence.comment.add", &r);
     if let Some(cid) = r.receipt()["id"].as_str() {
         let r = write(
-            &l,
+            l,
             "confluence.comment.add",
             json!({"content_id": a, "body": "V06 reply", "reply_to": cid}),
         )
         .await?;
-        report_write(&l, "confluence.comment.add (reply)", &r);
+        report_write(l, "confluence.comment.add (reply)", &r);
     }
 
     let r = write(
-        &l,
+        l,
         "confluence.label.add",
         json!({"id": a, "labels": ["atlas-duck-live", "atlas-duck-live-2"]}),
     )
     .await?;
-    report_write(&l, "confluence.label.add", &r);
+    report_write(l, "confluence.label.add", &r);
     let r = write(
-        &l,
+        l,
         "confluence.label.remove",
         json!({"id": a, "label": "atlas-duck-live"}),
     )
     .await?;
-    report_write(&l, "confluence.label.remove", &r);
+    report_write(l, "confluence.label.remove", &r);
 
     let r = write(
-        &l,
+        l,
         "confluence.attachment.upload",
         json!({"id": a, "filename": "v06.txt", "content_base64": base64(b"V06 one"), "comment": "V06"}),
     )
     .await?;
-    report_write(&l, "confluence.attachment.upload (new)", &r);
+    report_write(l, "confluence.attachment.upload (new)", &r);
     let r = write(
-        &l,
+        l,
         "confluence.attachment.upload",
         json!({"id": a, "filename": "v06.txt", "content_base64": base64(b"V06 two"), "replace": true}),
     )
     .await?;
-    report_write(&l, "confluence.attachment.upload (replace)", &r);
-    println!("V06 scratch pages {a}, {b} and {c} left in the space");
+    report_write(l, "confluence.attachment.upload (replace)", &r);
+    println!("V06 scratch pages {a}, {b} and {c}: cleanup follows");
     Ok(())
 }
 
@@ -1305,6 +1517,12 @@ async fn v_storage_render_probes() -> TestResult {
         return Ok(());
     };
     let l = start_live(&env).await?;
+    let res = v_storage_render_probes_body(&l).await;
+    cleanup(&l).await;
+    res
+}
+
+async fn v_storage_render_probes_body(l: &Live) -> TestResult {
     let raw = Raw::new(
         &l.h,
         LIVE_CONFLUENCE_ALIAS,
@@ -1333,14 +1551,14 @@ async fn v_storage_render_probes() -> TestResult {
     ];
     for (label, body) in probes {
         let title = format!("atlas-duck live render {label} {}", l.tag);
-        let (id, run_) = match create_page(&l, &title, body, "markdown", None).await {
+        let (id, run_) = match create_page(l, &title, body, "markdown", None).await {
             Ok(v) => v,
             Err(e) => {
                 println!("W {label} not created: {e}");
                 continue;
             }
         };
-        report_write(&l, "confluence.page.create", &run_);
+        report_write(l, "confluence.page.create", &run_);
         let v = raw
             .get_json(
                 "/rest/api/content/{id}",
@@ -1361,7 +1579,7 @@ async fn v_storage_render_probes() -> TestResult {
     // `@user:abc` and the two tags as text (no TOC, no mention); `pd96-strike` renders a
     // strikethrough element (`<del>` or `<s>`); `pd96-code-cdata` shows `]]>` in the code block
     // (`]]&gt;` in the HTML); `pd96-links` keeps the `javascript:` target out of any `href`.
-    println!("W scratch pages left in the space");
+    println!("W scratch pages: cleanup follows");
     Ok(())
 }
 
@@ -1375,6 +1593,12 @@ async fn v_page_move_keeps_body() -> TestResult {
         return Ok(());
     };
     let l = start_live(&env).await?;
+    let res = v_page_move_keeps_body_body(&l).await;
+    cleanup(&l).await;
+    res
+}
+
+async fn v_page_move_keeps_body_body(l: &Live) -> TestResult {
     let raw = Raw::new(
         &l.h,
         LIVE_CONFLUENCE_ALIAS,
@@ -1386,7 +1610,7 @@ async fn v_page_move_keeps_body() -> TestResult {
     let marker = format!("MOVE-KEEP-{t}");
     let title = format!("atlas-duck live move subject {t}");
     let (page, _) = create_page(
-        &l,
+        l,
         &title,
         &format!("body marker {marker}"),
         "markdown",
@@ -1394,7 +1618,7 @@ async fn v_page_move_keeps_body() -> TestResult {
     )
     .await?;
     let (target, _) = create_page(
-        &l,
+        l,
         &format!("atlas-duck live move target {t}"),
         "target",
         "markdown",
@@ -1410,13 +1634,13 @@ async fn v_page_move_keeps_body() -> TestResult {
 
     // The app's request: a PUT without `body` (PD-106).
     let r = write(
-        &l,
+        l,
         "confluence.page.move",
         json!({"id": page, "parent": target}),
     )
     .await?;
     println!("W(move) app run: {}", r.summary());
-    report_write(&l, "confluence.page.move", &r);
+    report_write(l, "confluence.page.move", &r);
 
     let v = raw
         .get_json(
@@ -1439,11 +1663,22 @@ async fn v_page_move_keeps_body() -> TestResult {
             .and_then(|a| a.last())
             .is_some_and(|a| a["id"].as_str() == Some(target.as_str()))
     );
+    let title_kept = v["title"].as_str() == Some(title.as_str());
+    let verdict = if r.receipt()["id"].is_null() {
+        "refused"
+    } else if body1.is_empty() {
+        "emptied"
+    } else if title_kept && body1.contains(&marker) {
+        "kept"
+    } else {
+        "changed"
+    };
     println!(
-        "W(move) verdict inputs: kept = title_kept and body_has_marker; emptied = body_emptied; \
-         400 = the app run above ended refused (see its V06 line)"
+        "W(move) VERDICT {verdict} (kept = title and marker survive; emptied = body is empty; \
+         refused = the app run ended without a receipt, see its V06 line; changed = anything \
+         else)"
     );
-    println!("W(move) scratch pages {page} and {target} left in the space");
+    println!("W(move) scratch pages {page} and {target}: cleanup follows");
     Ok(())
 }
 
@@ -1457,6 +1692,12 @@ async fn v_parent_title_lookup() -> TestResult {
         return Ok(());
     };
     let l = start_live(&env).await?;
+    let res = v_parent_title_lookup_body(&l).await;
+    cleanup(&l).await;
+    res
+}
+
+async fn v_parent_title_lookup_body(l: &Live) -> TestResult {
     let raw = Raw::new(
         &l.h,
         LIVE_CONFLUENCE_ALIAS,
@@ -1468,12 +1709,12 @@ async fn v_parent_title_lookup() -> TestResult {
     let plain = format!("Atlas Duck Lookup {t}");
     let odd = format!("Atlas+Duck & Lookup \u{fc}ber {t}");
     for title in [&plain, &odd] {
-        let (id, _) = create_page(&l, title, "lookup probe", "markdown", None).await?;
+        let (id, _) = create_page(l, title, "lookup probe", "markdown", None).await?;
         println!("W(105) created page {id}");
     }
     // Is a title that differs only in case a duplicate for the server?
     let lower = plain.to_lowercase();
-    match create_page(&l, &lower, "lookup probe lower-case twin", "markdown", None).await {
+    match create_page(l, &lower, "lookup probe lower-case twin", "markdown", None).await {
         Ok((id, _)) => println!(
             "W(105) a page whose title differs only in case was created ({id}): titles are case-sensitive on create"
         ),
@@ -1533,7 +1774,7 @@ async fn v_parent_title_lookup() -> TestResult {
         )
         .await?;
     println!("W(105) title lookup digits-only '12345': {}", a.line());
-    println!("W(105) scratch pages left in the space");
+    println!("W(105) scratch pages: cleanup follows");
     Ok(())
 }
 
@@ -1547,6 +1788,12 @@ async fn v_upload_allow_duplicated_and_replace() -> TestResult {
         return Ok(());
     };
     let l = start_live(&env).await?;
+    let res = v_upload_allow_duplicated_and_replace_body(&l).await;
+    cleanup(&l).await;
+    res
+}
+
+async fn v_upload_allow_duplicated_and_replace_body(l: &Live) -> TestResult {
     let raw = Raw::new(
         &l.h,
         LIVE_CONFLUENCE_ALIAS,
@@ -1555,7 +1802,7 @@ async fn v_upload_allow_duplicated_and_replace() -> TestResult {
         WireProduct::Confluence,
     )?;
     let (page, _) = create_page(
-        &l,
+        l,
         &format!("atlas-duck live upload {}", l.tag),
         "upload probe",
         "markdown",
@@ -1572,13 +1819,13 @@ async fn v_upload_allow_duplicated_and_replace() -> TestResult {
     ];
     for name in names {
         let r = write(
-            &l,
+            l,
             "confluence.attachment.upload",
             json!({"id": page, "filename": name, "content_base64": base64(b"first bytes"), "comment": "probe"}),
         )
         .await?;
         println!("W(109) app upload {name:?}: {}", r.summary());
-        report_write(&l, "confluence.attachment.upload", &r);
+        report_write(l, "confluence.attachment.upload", &r);
     }
     let list = |filename: &'static str| {
         let raw = &raw;
@@ -1645,13 +1892,13 @@ async fn v_upload_allow_duplicated_and_replace() -> TestResult {
         .unwrap_or_default()
         .to_owned();
     let r = write(
-        &l,
+        l,
         "confluence.attachment.upload",
         json!({"id": page, "filename": "Bericht-\u{fc}.pdf", "content_base64": base64(b"second bytes"), "replace": true}),
     )
     .await?;
     println!("W(109) app replace of the non-ASCII name: {}", r.summary());
-    report_write(&l, "confluence.attachment.upload (replace)", &r);
+    report_write(l, "confluence.attachment.upload (replace)", &r);
     let v = list("Bericht-\u{fc}.pdf").await?.json();
     println!(
         "W(109) after replace: size={} version={} same_attachment_id={}",
@@ -1679,6 +1926,6 @@ async fn v_upload_allow_duplicated_and_replace() -> TestResult {
             att == id_before
         );
     }
-    println!("W(109) scratch page {page} left in the space");
+    println!("W(109) scratch page {page}: cleanup follows");
     Ok(())
 }
