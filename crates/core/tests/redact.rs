@@ -2117,6 +2117,46 @@ fn an_identity_op_is_a_no_op_only_when_its_elements_went() -> TestResult {
     Ok(())
 }
 
+/// Review T19c fix m-1: a single-occurrence mask of a paired entry's mirror key masks the mirrored
+/// entry's key too (§5.3: a per-item mask also applies to the mirrored entry). The counterpart was
+/// looked up after the key was rewritten, found none, and the other side's id stayed with "1 other
+/// occurrence remains".
+#[test]
+fn a_single_mask_of_a_mirror_key_masks_the_mirrored_key() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    for at in [format!("{SOURCE}[1].id"), format!("{RENDERED}[1].id")] {
+        let ops = [
+            drop_id(RENDERED, json!("9")),
+            drop_id(RENDERED, json!("11")),
+            single_at("8", &at),
+        ];
+        let out = apply(&two_orphans(), r, None, &ops);
+        assert!(out.blocked.is_empty(), "{at}: {:?}", out.blocked);
+        assert!(
+            out.needs_confirmation.is_empty(),
+            "{at}: {:?}",
+            out.needs_confirmation
+        );
+        assert_eq!(
+            out.released["fields"]["comment"]["comments"][1]["id"], REDACTED,
+            "{at}"
+        );
+        assert_eq!(
+            out.released["renderedFields"]["comment"]["comments"][1]["id"], REDACTED,
+            "{at}"
+        );
+    }
+    // The orphan's key is still not paired by a single mask (it has no counterpart to mask).
+    let out = apply(
+        &one_orphan(),
+        r,
+        None,
+        &[single_at("9", &format!("{RENDERED}[1].id"))],
+    );
+    assert!(has_block(&out, &rendered_orphan(1)), "{:?}", out.blocked);
+    Ok(())
+}
+
 #[test]
 fn whatwg_reference_details() -> TestResult {
     // windows-1252 remap of numeric references 0x80-0x9F.

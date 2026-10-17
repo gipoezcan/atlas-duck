@@ -661,9 +661,12 @@ impl Redactor<'_> {
                 .push(BlockReason::MaskStillOccurs { path: display });
             return;
         }
+        // §5.3: a per-item mask also applies to the mirrored entry (every hit in that value). Its
+        // counterparts are looked up before the rewrite: a masked key pairs with nothing (review
+        // T19c fix m-1).
+        let counterparts = self.counterparts(&loc);
         self.set_string(&loc, masked);
-        // §5.3: a per-item mask also applies to the mirrored entry (every hit in that value).
-        for c in self.counterparts(&loc) {
+        for c in counterparts {
             match c {
                 Counterpart::Found(target, Some(_)) => {
                     if let Some(Value::String(t)) = path::get(&self.doc, &target) {
