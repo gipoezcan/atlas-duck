@@ -265,6 +265,11 @@ mod macos {
 #[path = "sandbox_runs/v10.rs"]
 mod v10;
 
+/// The Windows degraded spawner (M8 Task 11, §9.4): lockdown token + the floor's job object.
+#[cfg(windows)]
+#[path = "sandbox_runs/degraded.rs"]
+mod degraded;
+
 /// S-10 (M8 Task 8; §3.4 pipes and handles, §15 V12 worker half, V15): the channel against the
 /// real worker, started through the platform spawner object, on every leg.
 mod s10 {

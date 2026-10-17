@@ -90,15 +90,21 @@ pub fn install_panic_hook() {
 /// The worker entry point. Runs on the process's main thread.
 ///
 /// The panic hook is installed first, and confinement is applied before the
-/// first stdin read (§9.4). Neither happens inside [`run_script_with`] or
-/// [`run_with`]: the tests call them in the test process, which must never
-/// confine itself and must keep its normal panic reporting.
+/// first stdin read (§9.4), in the mode the command line names
+/// ([`confine::StartMode`]: the Windows degraded spawner's argument, plan M8
+/// Task 11). Neither happens inside [`run_script_with`] or [`run_with`]: the
+/// tests call them in the test process, which must never confine itself and
+/// must keep its normal panic reporting.
 pub fn run() -> i32 {
     install_panic_hook();
+    let mode = confine::StartMode::from_args(std::env::args_os().skip(1));
     // A failed confinement is not fatal: the worker still reports
-    // `applied: false`, so that the host scores the floor as not met.
-    let confinement = match confine::apply() {
+    // `applied: false`, so that the host scores the floor as not met. The one
+    // exception: a degraded worker whose thread may still hold its startup
+    // token ends here, before any frame (`EXIT_PANIC`; the spawner sees EOF).
+    let confinement = match confine::apply_mode(mode) {
         Ok(report) => report,
+        Err(_) if cfg!(windows) && mode == confine::StartMode::LockdownToken => return EXIT_PANIC,
         Err(e) => ConfinementReport {
             applied: false,
             mechanism: e.mechanism.to_owned(),

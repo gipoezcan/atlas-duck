@@ -5,20 +5,28 @@
 //! The report is read from the OS, never hardcoded, so a worker that was
 //! started without the AppContainer (for example by hand) reports
 //! `applied: false` and the host scores the floor as not met.
+//!
+//! The degraded start (§9.4, M8 Task 11, [`drop_startup_token`]) is the one
+//! step the worker takes itself: it drops the startup impersonation token of
+//! its main thread before its first frame.
 
 use std::ffi::c_void;
 use std::ptr::null_mut;
 
 use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_TOKEN, FALSE, GetLastError, HANDLE,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenIsAppContainer,
+    GetTokenInformation, RevertToSelf, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenIsAppContainer,
     TokenSecurityAttributes,
 };
 use windows_sys::Win32::System::JobObjects::IsProcessInJob;
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+};
+
+use super::{ConfineError, LOCKDOWN_TOKEN, lockdown_token_report};
 
 /// Reads one `DWORD` token flag of the current process; `Err` is the Win32
 /// error code.
@@ -170,6 +178,76 @@ fn in_job() -> Result<bool, u32> {
     Ok(result != 0)
 }
 
+/// Whether the calling thread impersonates: `Ok(true)` when it has a token,
+/// `Ok(false)` on `ERROR_NO_TOKEN`, `Err` with any other error code.
+fn thread_impersonates() -> Result<bool, u32> {
+    let mut token: HANDLE = null_mut();
+    // SAFETY: the pseudo handle of the current thread is always valid and
+    // `token` is a valid out-pointer. `OpenAsSelf = FALSE`: while the thread
+    // impersonates, the check is made with its own token (the lockdown process
+    // token would be refused); without a token there is nothing to check.
+    if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, FALSE, &mut token) } == 0 {
+        // SAFETY: no preconditions.
+        let e = unsafe { GetLastError() };
+        return if e == ERROR_NO_TOKEN {
+            Ok(false)
+        } else {
+            Err(e)
+        };
+    }
+    // SAFETY: `token` was opened above and is closed once.
+    unsafe { CloseHandle(token) };
+    Ok(true)
+}
+
+/// Loads, while the startup token can still open files, what Rust's std loads
+/// on first use and the worker uses later: the source of the hash keys
+/// (`ProcessPrng`) and the clocks. The DLLs the worker imports are loaded
+/// before `main`, and the script engine is plain C on the CRT.
+fn warm_up() {
+    use std::hash::BuildHasher;
+    let keys = std::collections::hash_map::RandomState::new();
+    std::hint::black_box(keys.hash_one(0u8));
+    std::hint::black_box(std::time::SystemTime::now());
+    std::hint::black_box(std::time::Instant::now());
+}
+
+/// The degraded start (§9.4 "applied after startup", M8 Task 11). The process
+/// token is the lockdown token (restricting SID = NULL SID), which can open
+/// nothing; the main thread was resumed on a startup impersonation token so
+/// that the loader could open the worker's DLLs. This drops that token with
+/// `RevertToSelf` before the first frame and checks that the thread no longer
+/// impersonates. The host lowers the process token to untrusted integrity once
+/// it has the first frame, and checks both before it sends anything.
+///
+/// `Err` (the token could not be dropped, or the thread still has one) is
+/// fatal: the worker must exit without a frame. A missing startup token is no
+/// error (nothing to drop), but the report carries `ERROR_NO_TOKEN`.
+pub(super) fn drop_startup_token() -> Result<ConfinementReport, ConfineError> {
+    let fatal = |os_error: Option<u32>| ConfineError {
+        mechanism: LOCKDOWN_TOKEN,
+        os_error: os_error.map(i64::from),
+    };
+    let startup = thread_impersonates();
+    warm_up();
+    // SAFETY: no preconditions; ends the calling thread's impersonation.
+    if unsafe { RevertToSelf() } == 0 {
+        // SAFETY: no preconditions.
+        return Err(fatal(Some(unsafe { GetLastError() })));
+    }
+    match thread_impersonates() {
+        Ok(false) => {}
+        Ok(true) => return Err(fatal(None)),
+        Err(e) => return Err(fatal(Some(e))),
+    }
+    let os_error = match startup {
+        Ok(true) => None,
+        Ok(false) => Some(ERROR_NO_TOKEN),
+        Err(e) => Some(e),
+    };
+    Ok(lockdown_token_report(os_error.map(i64::from)))
+}
+
 /// What the worker's own token and job membership say.
 pub(super) fn apply() -> ConfinementReport {
     let app_container = token_flag(TokenIsAppContainer);
@@ -198,6 +276,19 @@ mod tests {
     /// The test process is neither an AppContainer nor in a worker job, so it
     /// must not claim to be confined. (The AppContainer case is covered by
     /// `probes_windows.rs`, where the host spawns the real worker.)
+    /// The test thread never impersonates: dropping "the startup token" is a
+    /// no-op that succeeds, and the report says that none was there.
+    #[test]
+    fn a_thread_without_a_startup_token_reports_no_token() {
+        assert_eq!(thread_impersonates(), Ok(false));
+        let report = drop_startup_token();
+        assert_eq!(
+            report,
+            Ok(lockdown_token_report(Some(i64::from(ERROR_NO_TOKEN))))
+        );
+        assert_eq!(thread_impersonates(), Ok(false));
+    }
+
     #[test]
     fn an_unconfined_process_does_not_report_applied() {
         let report = apply();

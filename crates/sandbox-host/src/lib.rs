@@ -11,7 +11,8 @@
 //! runs scripts and compile checks over the split worker ([`bridge`], C.8).
 //! M8 Task 9 attributes a run's end from host-measured facts ([`limits`]) and
 //! watches a worker's memory per OS (Windows job completion port, macOS
-//! footprint [`watchdog`]).
+//! footprint [`watchdog`]). M8 Task 11 adds the Windows degraded spawner below
+//! the floor ([`degraded_spawner`]).
 
 pub mod bridge;
 mod drain;
@@ -44,6 +45,24 @@ pub fn fallback_spawner() -> Option<Box<dyn WorkerSpawner>> {
         windows::WindowsSpawner::new_plain()
             .ok()
             .map(|s| Box::new(s) as Box<dyn WorkerSpawner>)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The degraded spawner of §9.4 (M8 Task 11), below the floor: Windows only, a
+/// lockdown token (restricting SID = NULL SID, untrusted integrity after
+/// startup) and the floor's job object, no AppContainer. For a run whose
+/// policy allows degraded confinement when the AppContainer floor is not met;
+/// its workers always report `applied: false`, so its runs need
+/// `ExpectedWorker::accept_unconfined`. `None` on every other OS: there
+/// "degraded" means the platform spawner's worker with `applied: false`.
+pub fn degraded_spawner() -> Option<Box<dyn WorkerSpawner>> {
+    #[cfg(windows)]
+    {
+        Some(Box::new(windows::DegradedSpawner::new()))
     }
     #[cfg(not(windows))]
     {
