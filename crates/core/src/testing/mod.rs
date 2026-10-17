@@ -21,7 +21,7 @@ pub use fault::ConverterFault;
 pub use flows::Flow;
 pub use harness::{
     AuditRecord, HARNESS_AGENT, Harness, HarnessBuilder, HarnessInstance, InstanceAt, JIRA_FIELDS,
-    LIVE_ALIAS, NoProgress,
+    LIVE_ALIAS, LIVE_CONFLUENCE_ALIAS, NoProgress,
 };
 pub use runner::{FakeScriptRunner, ScriptPlan, host_call};
 pub use store::{FaultPlan, FaultyAudit, Freeze, ReadFault, RecordedEvent, TempStore};

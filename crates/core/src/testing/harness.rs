@@ -59,6 +59,8 @@ pub const HARNESS_CWD: &str = "workdir";
 pub const JIRA_FIELDS: &str = r#"[{"id":"summary","name":"Summary","custom":false,"schema":{"type":"string","system":"summary"}},{"id":"customfield_10100","name":"Story Points","custom":true,"schema":{"type":"number","custom":"com.atlassian.jira.plugin.system.customfieldtypes:float","customId":10100}}]"#;
 /// The alias of the instance `HarnessBuilder::live` configures.
 pub const LIVE_ALIAS: &str = "jira-live";
+/// The alias of the instance `HarnessBuilder::live_confluence` configures.
+pub const LIVE_CONFLUENCE_ALIAS: &str = "confluence-live";
 /// How long the harness waits for field-name cache fills it started (start, token set).
 const FIELD_CACHE_WAIT: Duration = Duration::from_secs(10);
 
@@ -113,6 +115,8 @@ pub struct HarnessBuilder {
     pats_deleted: Vec<String>,
     app_start_extra: Map<String, Value>,
     live: LiveState,
+    /// The alias of the live instance (`LIVE_ALIAS` unless `live_confluence` set it).
+    live_alias: &'static str,
 }
 
 /// Where `HarnessBuilder::live` stands: not asked for, set up, or refused (not https).
@@ -162,17 +166,33 @@ impl HarnessBuilder {
     /// the instance admin's token set (so the identity it keeps is the one the server reports),
     /// and `strict_https` on so no release lock is weakened. A `url` that is not `https://` makes
     /// `start` fail. The PAT is never printed or written to the config.
-    pub fn live(mut self, url: &str, pat: &str) -> Self {
+    pub fn live(self, url: &str, pat: &str) -> Self {
+        self.live_instance(LIVE_ALIAS, Product::Jira, url, pat)
+    }
+
+    /// `live` for a real Confluence Data Center instance (alias `LIVE_CONFLUENCE_ALIAS`, M7 T25).
+    pub fn live_confluence(self, url: &str, pat: &str) -> Self {
+        self.live_instance(LIVE_CONFLUENCE_ALIAS, Product::Confluence, url, pat)
+    }
+
+    fn live_instance(
+        mut self,
+        alias: &'static str,
+        product: Product,
+        url: &str,
+        pat: &str,
+    ) -> Self {
         if !url.to_ascii_lowercase().starts_with("https://") {
             self.live = LiveState::Refused;
             return self;
         }
         self.live = LiveState::On;
+        self.live_alias = alias;
         self.strict_https = true;
         self.pat = pat.to_owned();
         self.instance_at(
-            LIVE_ALIAS,
-            Product::Jira,
+            alias,
+            product,
             InstanceAt {
                 base_url: url.to_owned(),
                 ..InstanceAt::default()
@@ -322,7 +342,7 @@ impl HarnessBuilder {
                 None => (mock.base_url(), url_hash(&mock.base())),
             };
             // The live instance gets the token and the identity the server's own answer names.
-            if !(live && spec.alias == LIVE_ALIAS) {
+            if !(live && spec.alias == self.live_alias) {
                 credentials.put(&id, &self.pat, bound, TEST_USER, TEST_USER_KEY);
             }
             let ca_bundle = match spec.at.as_ref().and_then(|a| a.ca_pem.as_ref()) {
@@ -406,7 +426,7 @@ impl HarnessBuilder {
         let at_raw = self
             .instances
             .iter()
-            .any(|i| i.at.is_some() && !(live && i.alias == LIVE_ALIAS));
+            .any(|i| i.at.is_some() && !(live && i.alias == self.live_alias));
         let hooks = TestHooks {
             limits: self.limits,
             allow_http: !self.strict_https,
@@ -449,7 +469,7 @@ impl HarnessBuilder {
         let h = Harness { default_conn, ..h };
         if live {
             h.instances()
-                .set_token(LIVE_ALIAS, secrecy::SecretString::from(self.pat), None)
+                .set_token(self.live_alias, secrecy::SecretString::from(self.pat), None)
                 .await
                 .map_err(|e| format!("live token set failed: {e:?}"))?;
         }
@@ -601,6 +621,7 @@ impl Harness {
             pats_deleted: Vec::new(),
             app_start_extra: Map::new(),
             live: LiveState::Off,
+            live_alias: LIVE_ALIAS,
         }
     }
 
