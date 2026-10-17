@@ -395,7 +395,15 @@ export const isVerifyNow = (v: unknown): v is VerifyNow => {
 };
 
 export const isRunningScriptView = (v: unknown): v is RunningScriptView =>
-  closed(v, { request_id: isStr, agent_name: strOrNull, started_at: isStr, host_calls: isNum });
+  closed(v, {
+    request_id: isStr,
+    agent_name: strOrNull,
+    instances: arrayOf(isStr),
+    started_at: isStr,
+    elapsed_ms: isNum,
+    host_calls: isNum,
+    bytes_fetched: isNum,
+  });
 
 export const isKillAnswer = (v: unknown): v is KillAnswer => closed(v, { killed: isBool });
 

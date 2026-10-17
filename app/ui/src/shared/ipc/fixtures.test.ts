@@ -125,6 +125,9 @@ describe('fixtures validate against their TS types', () => {
     expect(isRunningScriptView({ ...runningScript[0], agent_name: undefined })).toBe(false);
     expect(isRunningScriptView({ ...runningScript[0], host_calls: '4' })).toBe(false);
     expect(isRunningScriptView({ ...runningScript[0], extra: 1 })).toBe(false);
+    expect(isRunningScriptView({ ...runningScript[0], instances: [1] })).toBe(false);
+    expect(isRunningScriptView({ ...runningScript[0], elapsed_ms: undefined })).toBe(false);
+    expect(isRunningScriptView({ ...runningScript[0], bytes_fetched: '0' })).toBe(false);
     expect(killAnswer.map((k) => k.killed)).toEqual([true, false]);
     expect(isKillAnswer({ killed: 'yes' })).toBe(false);
     expect(isKillAnswer({ killed: true, extra: 1 })).toBe(false);

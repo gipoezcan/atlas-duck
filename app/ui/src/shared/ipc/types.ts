@@ -362,8 +362,13 @@ export type VerifyNow =
 export interface RunningScriptView {
   request_id: string;
   agent_name: string | null;
+  /** Aliases of the instances the run called so far, sorted. */
+  instances: string[];
   started_at: string;
+  /** Host clock since the slot, at list time. */
+  elapsed_ms: number;
   host_calls: number;
+  bytes_fetched: number;
 }
 
 /** `running_kill`: `killed: false` = no such live run (it ended meanwhile). */

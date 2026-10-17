@@ -15,8 +15,11 @@ const REQ_2 = 'req_abcdefghij0123456789';
 const run = (over: Partial<RunningScriptView> = {}): RunningScriptView => ({
   request_id: REQ,
   agent_name: 'claude-code-billing-api',
+  instances: ['jira-main', 'wiki'],
   started_at: '2026-10-15T08:30:00.000Z',
+  elapsed_ms: 93_500,
   host_calls: 4,
+  bytes_fetched: 182_400,
   ...over,
 });
 
