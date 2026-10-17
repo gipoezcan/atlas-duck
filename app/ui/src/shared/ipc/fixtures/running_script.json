@@ -1,13 +1,22 @@
 [
   {
     "agent_name": "claude-code-billing-api",
+    "bytes_fetched": 182400,
+    "elapsed_ms": 93500,
     "host_calls": 4,
+    "instances": [
+      "jira-main",
+      "wiki"
+    ],
     "request_id": "req_0123456789abcdefghij",
     "started_at": "2026-10-15T08:30:00.000Z"
   },
   {
     "agent_name": null,
+    "bytes_fetched": 0,
+    "elapsed_ms": 0,
     "host_calls": 0,
+    "instances": [],
     "request_id": "req_abcdefghij0123456789",
     "started_at": "2026-10-15T08:31:12.250Z"
   }

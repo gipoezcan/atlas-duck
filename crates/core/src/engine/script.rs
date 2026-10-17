@@ -75,6 +75,7 @@ use crate::payloads::{
     ScriptFailed,
 };
 use crate::redact::RedactionMeta;
+use crate::running::KillAnswer;
 use crate::validate::{ValidateCtx, Validated, ValidationError, validate, validate_script_submit};
 
 const MIB: u64 = 1024 * 1024;
@@ -402,6 +403,9 @@ pub struct ScriptState {
     pub item: Option<ReleaseItem>,
     /// The run's host-side facts while it lives.
     pub shared: Option<Arc<RunShared>>,
+    /// The slot instant, set by the `SlotAcquired` step (PD-142): the wall time as RFC 3339 ms
+    /// beside the suspend-aware monotonic reading `elapsed_ms` is measured from.
+    pub slot: Option<(String, Duration)>,
     /// The instance ids the run called (§7.1: a PAT or origin change invalidates the candidate).
     pub instances: BTreeSet<String>,
     /// Host calls whose results were truncated or lossy (§9.5 preview warning), host-counted.
@@ -421,6 +425,7 @@ impl ScriptState {
             preselect_error_class_only: false,
             item: None,
             shared: None,
+            slot: None,
             instances: BTreeSet::new(),
             lossy_calls: 0,
             redaction_meta: None,
@@ -471,6 +476,8 @@ struct SharedInner {
     calls: u32,
     fetched_bytes: u64,
     instances: BTreeSet<String>,
+    /// The aliases of the instances the run called (PD-142), as the calls named them.
+    aliases: BTreeSet<String>,
     in_flight: HashMap<u64, InFlight>,
 }
 
@@ -548,14 +555,16 @@ impl RunShared {
     }
 
     /// Counts a validated call against `max_calls`; `false` = over the limit.
-    fn accept_call(&self, instance_id: &str, max_calls: u32) -> bool {
+    fn accept_call(&self, instance_id: &str, alias: &str, max_calls: u32) -> bool {
         let mut g = lock(&self.inner);
         g.calls = g.calls.saturating_add(1);
         g.instances.insert(instance_id.to_owned());
+        g.aliases.insert(alias.to_owned());
         g.calls <= max_calls
     }
 
-    fn fetched_bytes(&self) -> u64 {
+    /// Bytes the run's host calls fetched so far (host counter).
+    pub(crate) fn fetched_bytes(&self) -> u64 {
         lock(&self.inner).fetched_bytes
     }
 
@@ -567,6 +576,11 @@ impl RunShared {
     /// The instances (ids) the run called, for `CandidateChanged` (Task 25 handoff).
     pub(crate) fn instances(&self) -> BTreeSet<String> {
         lock(&self.inner).instances.clone()
+    }
+
+    /// The aliases of the instances the run called, for the Running-scripts view (PD-142).
+    pub(crate) fn aliases(&self) -> BTreeSet<String> {
+        lock(&self.inner).aliases.clone()
     }
 
     fn add_in_flight(&self, info: CallInfo, ctl: FetchControl) {
@@ -1038,7 +1052,7 @@ impl LiveBackend {
         let fetch_cap = u64::from(self.limits.max_fetch_mb).saturating_mul(MIB);
         let over = !self
             .shared
-            .accept_call(&vc.instance_id, self.limits.max_calls)
+            .accept_call(&vc.instance_id, &vc.alias, self.limits.max_calls)
             || self.shared.fetched_bytes() >= fetch_cap;
         if over {
             return rejected_msg(
@@ -1991,6 +2005,12 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
     //    comes after finds it, one that came before ended the request and this step is refused.
     let shared = Arc::new(RunShared::default());
     let installed = shared.clone();
+    // The slot instant (PD-142): read once, before the step, so the view's `started_at` and the
+    // `elapsed_ms` origin are one moment.
+    let slot_at = (
+        engine.clock().now_utc().to_rfc3339_ms(),
+        engine.clock().suspend_aware_elapsed(),
+    );
     let (ctx, s, a) = (entry.ctx.clone(), source.clone(), args.clone());
     let started = engine
         .transition_with(
@@ -2010,6 +2030,7 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
             move |st| {
                 if let Some(s) = st.script.as_mut() {
                     s.queued = queued;
+                    s.slot = Some(slot_at);
                     s.shared = Some(installed);
                 }
             },
@@ -2699,19 +2720,34 @@ async fn dry_end(
 
 impl Engine {
     /// §9.6 kill button: the run becomes a release item (`SCRIPT_FAILED {killed_by_user,
-    /// direct: false}`). `false` = no such run is alive.
-    pub fn kill_script(&self, request_id: &str) -> bool {
+    /// direct: false}`). `NotRunning` = no such live real run; `AlreadyStopping` = a kill reason
+    /// was already set or the worker ended and its record is not appended yet (PD-143).
+    pub fn kill_script(&self, request_id: &str) -> KillAnswer {
         let Some(entry) = self.entry(request_id) else {
-            return false;
+            return KillAnswer::NotRunning;
         };
-        // A dry run has no release item to end in: only a real run can be killed by the user.
-        let shared = entry
-            .state()
-            .script
-            .as_ref()
-            .filter(|s| s.dry.is_none())
-            .and_then(|s| s.shared.clone());
-        shared.is_some_and(|s| s.request_kill(KillReason::User))
+        // A dry run has no release item to end in: only a real run can be killed by the user. A
+        // run is alive while its model is in `Running`: before the slot it is not running, after
+        // its end record it is a release item.
+        let shared = {
+            let st = entry.state();
+            if st.model.phase() != Phase::Running {
+                return KillAnswer::NotRunning;
+            }
+            st.script
+                .as_ref()
+                .filter(|s| s.dry.is_none())
+                .and_then(|s| s.shared.clone())
+        };
+        let Some(shared) = shared else {
+            return KillAnswer::NotRunning;
+        };
+        // In `Running` and not asked: the kill was set already or the worker ended.
+        if shared.request_kill(KillReason::User) {
+            KillAnswer::Killed
+        } else {
+            KillAnswer::AlreadyStopping
+        }
     }
 
     /// The run policy (Δ3, PD-141), read immediately before each use and never cached: the

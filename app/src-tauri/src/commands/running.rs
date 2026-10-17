@@ -8,7 +8,7 @@
 //! not a live real run is `{killed: false}`, not an error: the list the page showed was a moment
 //! old and the page re-reads it.
 
-use atlas_duck_core::running::RunningScriptView;
+use atlas_duck_core::running::{KillAnswer as CoreKillAnswer, RunningScriptView};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 
@@ -60,7 +60,8 @@ pub async fn running_kill<R: Runtime>(
         Ok(core) => {
             blocking(move || {
                 Ok(KillAnswer {
-                    killed: core.kill_script(request_id.as_str()),
+                    // The three-way answer (Δ8, PD-143) reaches the window with Task 22.
+                    killed: core.kill_script(request_id.as_str()) == CoreKillAnswer::Killed,
                 })
             })
             .await
