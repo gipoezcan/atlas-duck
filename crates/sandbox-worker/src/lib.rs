@@ -38,24 +38,12 @@ pub use script::loop_::{
 
 use script::alloc::LimitState;
 
-/// Exit code: clean end (stdin EOF, or the one reply of a compile or a run was written).
-pub const EXIT_OK: i32 = 0;
-/// Exit code: stdin or stdout failed (broken pipe, oversized or truncated frame).
-pub const EXIT_IO: i32 = 1;
-/// Exit code: a first frame that picks no mode, a malformed `probe.run`, or a
-/// host frame during a run that is not a response to an outstanding call.
-pub const EXIT_PROTOCOL: i32 = 3;
-/// Exit code: a panic (the Rust default panic exit code). Set by the hook
-/// from [`install_panic_hook`]; T15's `score` reads it as `Error`. Also an
-/// engine failure that is neither the script's nor the host's.
-pub const EXIT_PANIC: i32 = 101;
-/// Exit code (plan M8 PD-134): the QuickJS allocator refused a request above
-/// `heap_mb`. Nothing is written after the refusal (no terminal frame).
-pub const EXIT_HEAP_LIMIT: i32 = 102;
-/// Exit code (plan M8 PD-134): the process itself is out of memory
-/// ([`ExitOnOomAlloc`] in the worker binary; in-process, an allocation that
-/// failed below `heap_mb`).
-pub const EXIT_PROCESS_LIMIT: i32 = 103;
+/// The exit codes live in `ipc::sandbox` (M8 T7 fix I-2), where the host reads them too. A panic
+/// exits [`EXIT_PANIC`] through the hook from [`install_panic_hook`]; [`ExitOnOomAlloc`] exits
+/// [`EXIT_PROCESS_LIMIT`].
+pub use atlas_duck_ipc::sandbox::{
+    EXIT_HEAP_LIMIT, EXIT_IO, EXIT_OK, EXIT_PANIC, EXIT_PROCESS_LIMIT, EXIT_PROTOCOL,
+};
 
 /// The allocator state of the current run, for the panic hook (PD-134). The
 /// worker runs one script (or one compile) per process; the engine and

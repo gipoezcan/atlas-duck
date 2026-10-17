@@ -506,3 +506,23 @@ fn decode_depth_limit_applies_to_host_call_params_not_result_text() {
         Err(DecodeError::BadParams { .. } | DecodeError::Json(_))
     ));
 }
+
+/// M8 T7 fix (review I-2): the worker's exit codes live in `ipc::sandbox`, so the host (T7, T9)
+/// reads the same values the worker exits with.
+#[test]
+fn exit_codes_are_shared_with_the_host() {
+    use atlas_duck_ipc::sandbox::{
+        EXIT_HEAP_LIMIT, EXIT_IO, EXIT_OK, EXIT_PANIC, EXIT_PROCESS_LIMIT, EXIT_PROTOCOL,
+    };
+    assert_eq!(
+        [
+            EXIT_OK,
+            EXIT_IO,
+            EXIT_PROTOCOL,
+            EXIT_PANIC,
+            EXIT_HEAP_LIMIT,
+            EXIT_PROCESS_LIMIT
+        ],
+        [0, 1, 3, 101, 102, 103]
+    );
+}

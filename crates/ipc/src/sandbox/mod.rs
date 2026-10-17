@@ -1,11 +1,14 @@
-//! Sandbox channel (spec §3.3, §3.4): framing limits, framing, probe-protocol types.
+//! Sandbox channel (spec §3.3, §3.4): framing limits, framing, probe-protocol types, the
+//! worker's exit codes.
 
+pub mod exit;
 pub mod frame;
 pub mod host_call;
 pub mod limits;
 pub mod probe;
 pub mod script;
 
+pub use exit::{EXIT_HEAP_LIMIT, EXIT_IO, EXIT_OK, EXIT_PANIC, EXIT_PROCESS_LIMIT, EXIT_PROTOCOL};
 pub use host_call::{HostCall, HostCallResult};
 pub use limits::ScriptLimits;
 pub use script::{HOST_TO_WORKER_MAX, terminal_frame_max};

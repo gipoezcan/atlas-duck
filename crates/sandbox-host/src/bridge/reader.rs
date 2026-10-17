@@ -8,16 +8,20 @@
 //! - stderr: one thread per worker keeps the first [`super::STDERR_CAP`] bytes and reads and
 //!   discards the rest until EOF.
 //! - The reaper: one thread per worker blocks in [`Reaper::wait`] (T6: never dropped unwaited).
+//! - A worker the bridge gave up on without a run timer (refused, compile done) gets a thread
+//!   that kills it again until it is reaped ([`rekill_until_reaped`]).
 
 use std::io::{self, Read};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
+use std::time::Duration;
 
 use atlas_duck_ipc::sandbox::WORKER_FRAME_MAX_BYTES;
 use atlas_duck_ipc::sandbox::frame::{FrameError, read_frame};
 
 use super::STDERR_CAP;
-use crate::spawn::{ExitKind, Reaper};
+use crate::spawn::{ExitKind, KillHandle, Reaper};
 
 /// The worker's stdout, as the reader thread holds it.
 pub(crate) type Stdout = Box<dyn Read + Send>;
@@ -116,6 +120,24 @@ pub(crate) fn spawn_reaper(reaper: Box<dyn Reaper>) -> io::Result<Receiver<io::R
     Ok(rx)
 }
 
+/// After the caller's kill: kills again every `every` until the worker is reaped (`exit`
+/// answers, or its reaper thread is gone), on a thread of its own. The backstop for a kill that
+/// did not take (T6: that shows only as a worker that never ends) where no run timer is armed.
+/// Without that thread the caller's kill is all there is.
+pub(crate) fn rekill_until_reaped(
+    kill: Arc<dyn KillHandle>,
+    exit: Receiver<io::Result<ExitKind>>,
+    every: Duration,
+) {
+    let _ = thread::Builder::new()
+        .name("sandbox-rekill".to_owned())
+        .spawn(move || {
+            while let Err(mpsc::RecvTimeoutError::Timeout) = exit.recv_timeout(every) {
+                kill.kill();
+            }
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +160,47 @@ mod tests {
         assert!(matches!(next_frame(&mut cut, 10), Frame::End));
         let mut big: Stdout = Box::new(io::Cursor::new(vec![0, 0, 0, 11]));
         assert!(matches!(next_frame(&mut big, 10), Frame::TooLarge));
+    }
+
+    struct Counted(std::sync::atomic::AtomicU32);
+
+    impl KillHandle for Counted {
+        fn kill(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Waits (bounded) until `cond` holds.
+    fn within(cond: impl Fn() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        while !cond() {
+            if started.elapsed() > Duration::from_secs(10) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        true
+    }
+
+    #[test]
+    fn the_rekill_thread_kills_until_the_reap() {
+        let kill = Arc::new(Counted(Default::default()));
+        let calls = || kill.0.load(std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = mpsc::sync_channel(1);
+        rekill_until_reaped(kill.clone(), rx, Duration::from_millis(5));
+        assert!(within(|| calls() >= 3), "killed again and again");
+        let _ = tx.send(Ok(ExitKind::Code(0)));
+        assert!(
+            within(|| Arc::strong_count(&kill) == 1),
+            "the thread ended at the reap"
+        );
+
+        // A reaper thread that is gone (its sender dropped) ends the loop as well.
+        let kill = Arc::new(Counted(Default::default()));
+        let (tx, rx) = mpsc::sync_channel::<io::Result<ExitKind>>(1);
+        drop(tx);
+        rekill_until_reaped(kill.clone(), rx, Duration::from_millis(5));
+        assert!(within(|| Arc::strong_count(&kill) == 1));
+        assert_eq!(kill.0.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }

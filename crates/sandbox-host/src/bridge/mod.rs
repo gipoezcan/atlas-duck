@@ -10,15 +10,19 @@
 //! - a **reaper** thread waits for the exit (T6: never on a runtime thread, never dropped).
 //!
 //! The per-run state machine is [`state`]. The run lock is held only for short state updates,
-//! never across a blocking read, write or wait; [`RunHandleImpl::kill`] takes it briefly and
-//! then calls the non-blocking [`KillHandle`] (M3 M-1). Host calls run as tasks on the caller's
-//! runtime that are never aborted (PD-148); a result is queued for the worker only while the run
-//! is undecided.
+//! never across a blocking read, write or wait, nor across a parse of a frame's payload;
+//! [`RunHandleImpl::kill`] takes it briefly and then calls the non-blocking [`KillHandle`] (M3
+//! M-1). Host calls run as tasks on the caller's runtime that are never aborted (PD-148); a result
+//! is queued for the worker only while the run is undecided.
 //!
 //! Spawn-time checks (PD-132, PD-133, PD-141): the ready frame (`probe.ready`) is read within
 //! [`READY_TIMEOUT`]; its `worker_version` must equal the recorded identity's embedded version,
 //! and `confinement.applied` must be true unless [`ExpectedWorker::accept_unconfined`]. Either
 //! failure kills the worker before it was sent any frame.
+//!
+//! A kill can fail without a sign (T6: the worker then never ends), so a kill is never sent just
+//! once: a run's timer kills again from `timeout_s` on until the reap, and a refused or finished
+//! compile worker is killed again every [`KILL_RETRY`] until it is reaped.
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
@@ -29,10 +33,13 @@ mod writer;
 pub use state::ViolationKind;
 
 use std::fmt;
+use std::future::{Future, poll_fn};
 use std::io;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -44,14 +51,15 @@ use atlas_duck_ipc::sandbox::script::{
     decode_worker_frame,
 };
 use atlas_duck_ipc::sandbox::{
-    HOST_TO_WORKER_MAX, HostCall, HostCallResult, WORKER_FRAME_MAX_BYTES,
+    EXIT_PROTOCOL, HOST_TO_WORKER_MAX, HostCall, HostCallResult, WORKER_FRAME_MAX_BYTES,
 };
 use serde_json::Value;
 use tokio::runtime::Handle;
 use tokio::sync::watch;
+use tokio::time::Sleep;
 
 use self::reader::{Continuation, Frame, Stdout};
-use self::state::{REAP_FAILED_CODE, RunState, Step};
+use self::state::{Incoming, RunState, Step};
 use crate::identity::{IdentityPart, SandboxBinaryIdentity};
 use crate::spawn::{ExitKind, KillHandle, SpawnSpec, WorkerParts, WorkerSpawner};
 
@@ -72,11 +80,22 @@ pub const RESULT_NOT_REPRESENTABLE: &str =
 pub const DIAG_REAP_FAILED: &str = "sandbox_reap_failed";
 /// Host fact for [`RunOutcome::diag`]: the bridge's reader ended without an outcome.
 pub const DIAG_OUTCOME_LOST: &str = "sandbox_outcome_lost";
+/// Host fact for [`RunOutcome::diag`]: the worker exited `EXIT_PROTOCOL` without a terminal
+/// frame ([`HostVerdict::HostFault`]).
+pub const DIAG_HOST_PROTOCOL_EXIT: &str = "sandbox_host_protocol_exit";
+/// Host fact for [`RunOutcome::diag`]: a call's result was above the 24 MiB host → worker cap,
+/// so the worker got a `result_too_large` rejection while core recorded the result (unreachable
+/// while `max_call_result_mb` ≤ 16, PD-139).
+pub const DIAG_CALL_RESULT_REPLACED: &str = "sandbox_call_result_replaced";
+/// How often a kill is sent again until the worker is reaped (see the module documentation).
+pub const KILL_RETRY: Duration = Duration::from_secs(1);
 
 /// How long the outcome waits for the stderr thread after the reap (its pipe is closed by then).
 const STDERR_GRACE: Duration = Duration::from_secs(2);
-/// How long `compile_run` waits for the reap after its kill.
-const REAP_GRACE: Duration = Duration::from_secs(2);
+/// How long the bridge waits for the worker's own exit after its stdout ended, before it kills
+/// (review m-4: a worker that closed stdout usually exits, and on Windows a kill between its
+/// handles closing and its exit code being set would replace that code).
+const EXIT_GRACE: Duration = Duration::from_secs(1);
 /// serde_json reads at most 127 nested arrays or objects into a `Value`, and the worker decodes
 /// the whole `script.run` frame into one, where `args` sits two objects deep.
 const MAX_ARGS_NESTING: usize = 125;
@@ -91,6 +110,9 @@ pub fn log_truncated_marker(discarded_bytes: u64) -> String {
 pub trait HostCallSink: Send + Sync {
     /// Runs one call. It runs as its own task and is never cancelled (PD-148); its result
     /// reaches the worker only if the run is undecided when it is ready.
+    ///
+    /// Return only after the call's `SCRIPT_CALL` record is committed: the bridge queues the
+    /// result for the worker as soon as this returns.
     async fn call(&self, run_id: &str, c: HostCall) -> HostCallResult;
     /// One log line within the per-run caps, called on the bridge's reader thread: it must not
     /// block. The lines are also collected in [`RunOutcome::logs`].
@@ -196,8 +218,13 @@ pub enum HostVerdict {
     Killed(KillCause),
     /// The host killed the worker for a channel violation (`protocol_violation`).
     Violation(ViolationKind),
+    /// The worker exited `EXIT_PROTOCOL` without a terminal frame: it could not read what the
+    /// host sent. A host bug, never the script's doing (T4); the diag is
+    /// [`DIAG_HOST_PROTOCOL_EXIT`].
+    HostFault,
     /// The worker ended without a terminal frame (exit 0 included) and nothing above applies.
-    Crashed(ExitKind),
+    /// `None`: the exit is unknown ([`DIAG_REAP_FAILED`], [`DIAG_OUTCOME_LOST`]).
+    Crashed(Option<ExitKind>),
     /// For the glue: the run never started.
     NotSpawned(StartRunError),
 }
@@ -212,8 +239,7 @@ pub struct RunOutcome {
     pub logs: Vec<String>,
     /// Bytes of the discarded log lines, when any was discarded.
     pub logs_truncated: Option<u64>,
-    /// The first [`STDERR_CAP`] bytes of stderr, lossily decoded (on macOS T6's drain hands
-    /// over its last 4 KiB first).
+    /// The first [`STDERR_CAP`] bytes of stderr, lossily decoded.
     pub stderr: String,
     /// Host clock from before the spawn to the accepted terminal frame (to the reap without
     /// one); PD-134.
@@ -239,21 +265,26 @@ impl RunHandleImpl {
 
     /// Kills the worker without waiting. The first decision wins: a cause given after the run
     /// was decided (terminal frame, timeout, violation, earlier kill) is not recorded. Never
-    /// blocks: a short state lock, then the non-blocking [`KillHandle`]. The run timer stays
-    /// armed until the reap and kills again if this kill did not take.
+    /// blocks: a short state lock (never held across a parse), then the non-blocking
+    /// [`KillHandle`]. The run timer stays armed until the reap and kills again from `timeout_s`
+    /// on if this kill did not take.
     pub fn kill(&self, cause: KillCause) {
         self.run.update(|inner| inner.state.on_kill(cause));
         self.run.kill.kill();
     }
 
-    /// The run's outcome, once the worker is reaped; the same outcome every time.
+    /// The run's outcome, once the worker is reaped; the same outcome every time. If the reader
+    /// thread ended without one ([`DIAG_OUTCOME_LOST`]), the worker is killed.
     pub async fn wait(&self) -> RunOutcome {
         let mut rx = self.outcome.clone();
         let outcome = match rx.wait_for(Option::is_some).await {
             Ok(value) => value.clone(),
             Err(_) => None,
         };
-        outcome.unwrap_or_else(|| self.run.lost_outcome())
+        outcome.unwrap_or_else(|| {
+            self.run.kill.kill();
+            self.run.lost_outcome()
+        })
     }
 }
 
@@ -269,11 +300,13 @@ impl fmt::Debug for RunHandleImpl {
 ///
 /// Synchronous (spawn and the ready wait): the glue calls it through `spawn_blocking` (PD-138).
 /// `rt` runs the host-call tasks and the run timer, so it needs tokio's time driver
-/// (`enable_time`/`enable_all`). The timer (`timeout_s`, PD-135) starts when `script.run` is
-/// handed to the writer, the moment it is written at the latest; on expiry the worker is killed
-/// and the verdict is `Limit("timeout_s")` unless something decided the run first. It runs until
-/// the worker is reaped, so it is also the backstop for an earlier kill that did not take (T6: a
-/// failed kill shows only as a worker that never ends).
+/// (`enable_time`/`enable_all`); without it `start_run` panics before it spawns anything. The
+/// timer (`timeout_s`, PD-135) is set just before `script.run` is handed to the writer, so the
+/// worker never gets more than `timeout_s` from that moment; on expiry the worker is killed and
+/// the verdict is `Limit("timeout_s")` unless something decided the run first. It runs until the
+/// worker is reaped and kills again every [`KILL_RETRY`] from its expiry on, so it is also the
+/// backstop for an earlier kill that did not take (T6: a failed kill shows only as a worker that
+/// never ends).
 pub fn start_run(
     spawner: &dyn WorkerSpawner,
     spec: &SpawnSpec,
@@ -283,6 +316,12 @@ pub fn start_run(
     rt: Handle,
 ) -> Result<RunHandleImpl, StartRunError> {
     let started = Instant::now();
+    // Created first: a `Sleep` panics at creation when `rt` has no time driver, so that happens
+    // here, before the spawn, and not unseen in the timer task. Set below.
+    let mut expiry = {
+        let _rt = rt.enter();
+        Box::pin(tokio::time::sleep(Duration::MAX))
+    };
     let init_frame = encode_init(&init)?;
     let launched = launch(spawner, spec)?;
     let ready = match launched.ready(READY_TIMEOUT) {
@@ -303,12 +342,13 @@ pub fn start_run(
 
     let (frames_tx, frames_rx) = mpsc::channel();
     if let Err(e) = writer::spawn(stdin, frames_rx) {
-        kill.kill();
+        give_up(kill, exit);
         return Err(spawn_error(&e));
     }
+    let limit = Duration::from_secs(u64::from(init.limits.timeout_s));
+    expiry.as_mut().reset(tokio::time::Instant::now() + limit);
     let _ = frames_tx.send(init_frame);
 
-    let (finished, finished_rx) = watch::channel(false);
     let (outcome_tx, outcome) = watch::channel(None);
     let run = Arc::new(Run {
         run_id: next_run_id(),
@@ -316,6 +356,7 @@ pub fn start_run(
             state: RunState::new(&init.limits),
             writer: Some(frames_tx),
             terminal_at: None,
+            result_replaced: false,
         }),
         kill,
         sink,
@@ -323,7 +364,6 @@ pub fn start_run(
         started,
         confinement: ready.confinement,
         read_cap: RunState::read_cap(&init.limits),
-        finished,
     });
     let reading = Arc::clone(&run);
     let continuation: Continuation = Box::new(move |stdout| {
@@ -331,19 +371,24 @@ pub fn start_run(
         reading.finish(&exit, &stderr, &outcome_tx);
     });
     if go.send(continuation).is_err() {
+        // Unreachable while the stdout thread lives (it waits for this continuation). The
+        // reaper's receiver went with the continuation, so this kill is not retried.
         run.kill.kill();
         return Err(StartRunError::Spawn(io::ErrorKind::BrokenPipe));
     }
-    let limit = Duration::from_secs(u64::from(init.limits.timeout_s));
-    rt.spawn(run_timer(Arc::clone(&run), finished_rx, limit));
+    rt.spawn(run_timer(Arc::clone(&run), outcome.clone(), expiry));
     Ok(RunHandleImpl { run, outcome })
 }
 
 /// One compile check in a compile-only worker (PD-132): spawn, ready frame, `script.compile`, one
-/// reply, kill and reap. Everything is bounded by `deadline` (PD-135); on expiry the worker is
-/// killed and the verdict is [`CompileVerdict::Timeout`]. A worker that ends without a verdict
-/// (T4: exit 101, 102, 103 or EOF) is `Timeout` too, never `Syntax`; a reply that is no verdict
-/// is `Spawn(InvalidData)`. Synchronous: the glue calls it through `spawn_blocking`.
+/// reply, kill. The ready frame, the compile and the reply are bounded by `deadline` (PD-135); on
+/// expiry the worker is killed and the verdict is [`CompileVerdict::Timeout`]. Outside it are the
+/// spawn call itself and, when the worker ended without a verdict, a wait of at most 1 s for its
+/// exit code. A worker that ends without a verdict (T4: exit 101, 102, 103 or EOF) is `Timeout`
+/// too, never `Syntax`; one that exits `EXIT_PROTOCOL` could not read the host's request (a host
+/// fault, T4) and is `Spawn(InvalidData)`, like a reply that is no verdict. The worker is killed
+/// again every [`KILL_RETRY`] until it is reaped, on a thread of its own: `compile_run` returns
+/// without waiting for the reap. Synchronous: the glue calls it through `spawn_blocking`.
 pub fn compile_run(
     spawner: &dyn WorkerSpawner,
     spec: &SpawnSpec,
@@ -384,7 +429,7 @@ pub fn compile_run(
 
     let (frames_tx, frames_rx) = mpsc::channel();
     if let Err(e) = writer::spawn(stdin, frames_rx) {
-        kill.kill();
+        give_up(kill, exit);
         return Err(spawn_error(&e));
     }
     let _ = frames_tx.send(request);
@@ -395,7 +440,9 @@ pub fn compile_run(
     });
     let _ = go.send(continuation);
 
-    let verdict = match reply_rx.recv_timeout(deadline.saturating_sub(started.elapsed())) {
+    let reply = reply_rx.recv_timeout(deadline.saturating_sub(started.elapsed()));
+    drop(frames_tx);
+    let verdict = match reply {
         Ok(Frame::Bytes(bytes)) => match decode_worker_frame(&bytes) {
             Ok(WorkerFrame::Compiled) => Ok(CompileVerdict::Compiled),
             Ok(WorkerFrame::Syntax {
@@ -410,12 +457,20 @@ pub fn compile_run(
             _ => Err(StartRunError::Spawn(io::ErrorKind::InvalidData)),
         },
         Ok(Frame::TooLarge) => Err(StartRunError::Spawn(io::ErrorKind::InvalidData)),
-        // The deadline expired, or the worker ended without a verdict.
-        Ok(Frame::End) | Err(_) => Ok(CompileVerdict::Timeout),
+        // The worker ended without a verdict. Its own exit code is read before any kill (m-4):
+        // only `EXIT_PROTOCOL` is no `Timeout`. Once it is reaped (or its reap failed) there is
+        // nothing left to kill.
+        Ok(Frame::End) => match exit.recv_timeout(EXIT_GRACE) {
+            Ok(Ok(ExitKind::Code(EXIT_PROTOCOL))) => {
+                return Err(StartRunError::Spawn(io::ErrorKind::InvalidData));
+            }
+            Ok(_) => return Ok(CompileVerdict::Timeout),
+            Err(_) => Ok(CompileVerdict::Timeout),
+        },
+        // The deadline expired.
+        Err(_) => Ok(CompileVerdict::Timeout),
     };
-    drop(frames_tx);
-    kill.kill();
-    let _ = exit.recv_timeout(REAP_GRACE);
+    give_up(kill, exit);
     verdict
 }
 
@@ -446,10 +501,10 @@ impl Launched {
         }
     }
 
-    /// Kills the worker and lets it go: stdin closes, the stdout thread discards to EOF and the
-    /// reaper thread reaps.
+    /// Kills the worker and lets it go ([`give_up`]): stdin closes, the stdout thread discards to
+    /// EOF and the reaper thread reaps.
     fn abandon(self) {
-        self.kill.kill();
+        give_up(self.kill, self.exit);
     }
 
     fn refuse(self, e: StartRunError) -> StartRunError {
@@ -463,19 +518,21 @@ fn launch(spawner: &dyn WorkerSpawner, spec: &SpawnSpec) -> Result<Launched, Sta
     let WorkerParts {
         io, kill, reaper, ..
     } = process.into_parts().map_err(|e| spawn_error(&e))?;
-    // The reaper first: from here on, a failure kills and the reaper thread reaps.
+    // The reaper first: from here on, a failure kills and the reaper thread reaps. (Without the
+    // reaper thread, the reaper's own drop kills and reaps.)
     let exit = reader::spawn_reaper(reaper).map_err(|e| {
         kill.kill();
         spawn_error(&e)
     })?;
-    let (ready, go) = reader::spawn_stdout(io.stdout).map_err(|e| {
-        kill.kill();
-        spawn_error(&e)
-    })?;
-    let stderr = reader::spawn_stderr(io.stderr).map_err(|e| {
-        kill.kill();
-        spawn_error(&e)
-    })?;
+    let readers = reader::spawn_stdout(io.stdout)
+        .and_then(|(ready, go)| Ok((ready, go, reader::spawn_stderr(io.stderr)?)));
+    let (ready, go, stderr) = match readers {
+        Ok(readers) => readers,
+        Err(e) => {
+            give_up(kill, exit);
+            return Err(spawn_error(&e));
+        }
+    };
     Ok(Launched {
         kill,
         stdin: io.stdin,
@@ -484,6 +541,13 @@ fn launch(spawner: &dyn WorkerSpawner, spec: &SpawnSpec) -> Result<Launched, Sta
         exit,
         stderr,
     })
+}
+
+/// Kills a worker the bridge no longer uses, and kills it again every [`KILL_RETRY`] until its
+/// reaper thread reports the reap (`exit`), without waiting for that.
+fn give_up(kill: Arc<dyn KillHandle>, exit: Receiver<io::Result<ExitKind>>) {
+    kill.kill();
+    reader::rekill_until_reaped(kill, exit, KILL_RETRY);
 }
 
 fn spawn_error(e: &io::Error) -> StartRunError {
@@ -558,8 +622,6 @@ struct Run {
     started: Instant,
     confinement: ConfinementReport,
     read_cap: usize,
-    /// Set once the worker is reaped and the outcome is known; stops the timer.
-    finished: watch::Sender<bool>,
 }
 
 struct Inner {
@@ -567,6 +629,8 @@ struct Inner {
     /// The writer's queue; dropped once the run is decided (the worker's stdin closes).
     writer: Option<Sender<Vec<u8>>>,
     terminal_at: Option<Instant>,
+    /// A call result was replaced by a rejection ([`DIAG_CALL_RESULT_REPLACED`]).
+    result_replaced: bool,
 }
 
 impl Run {
@@ -584,8 +648,8 @@ impl Run {
         out
     }
 
-    /// The reader thread's run loop: decodes every frame until EOF; after a violation it
-    /// discards the rest of the stream.
+    /// The reader thread's run loop: decodes and classifies every frame until EOF, both before
+    /// the run lock is taken (I-1); after a violation it discards the rest of the stream.
     fn read_until_end(self: &Arc<Self>, mut stdout: Stdout) {
         loop {
             match reader::next_frame(&mut stdout, self.read_cap) {
@@ -598,7 +662,7 @@ impl Run {
                 }
                 Frame::Bytes(bytes) => {
                     let len = bytes.len();
-                    let decoded = decode_worker_frame(&bytes);
+                    let decoded = decode_worker_frame(&bytes).map(Incoming::from);
                     drop(bytes);
                     let (step, violated) = self.update(|inner| {
                         let step = inner.state.on_frame(len, decoded);
@@ -643,25 +707,25 @@ impl Run {
     /// Queues a call's result while the run is undecided; the call stops counting as
     /// outstanding in the same locked step (§3.4 "until its result has been queued").
     fn answer(&self, id: u64, result: &HostCallResult) {
-        let frame = writer::call_response(id, result);
+        let (frame, replaced) = writer::call_response(id, result);
         let mut inner = self.lock();
         if inner.state.complete_call()
             && let Some(writer) = &inner.writer
         {
             let _ = writer.send(frame);
+            inner.result_replaced |= replaced;
         }
     }
 
-    /// After stdout's EOF: kill (the worker exited, or closed its stdout and must not outlive
-    /// it; a no-op after the exit), wait for the reap, then publish the outcome.
+    /// After stdout's EOF: wait for the reap (the worker exited, or it closed its stdout and is
+    /// killed, [`exit_after_eof`]), then publish the outcome. The run timer stops at that.
     fn finish(
         &self,
         exit: &Receiver<io::Result<ExitKind>>,
         stderr: &Receiver<String>,
         outcome: &watch::Sender<Option<RunOutcome>>,
     ) {
-        self.kill.kill();
-        let exit = exit.recv().ok().and_then(Result::ok);
+        let exit = exit_after_eof(self.kill.as_ref(), exit);
         let stderr = stderr.recv_timeout(STDERR_GRACE).unwrap_or_default();
         let mut diag = Vec::new();
         if exit.is_none() {
@@ -670,6 +734,12 @@ impl Run {
         let done = {
             let mut inner = self.lock();
             inner.writer = None;
+            if !inner.state.terminal() && exit == Some(ExitKind::Code(EXIT_PROTOCOL)) {
+                diag.push(DIAG_HOST_PROTOCOL_EXIT);
+            }
+            if inner.result_replaced {
+                diag.push(DIAG_CALL_RESULT_REPLACED);
+            }
             let (logs, logs_truncated) = inner.state.take_logs();
             let ended = inner.terminal_at.unwrap_or_else(Instant::now);
             RunOutcome {
@@ -683,7 +753,6 @@ impl Run {
                 diag,
             }
         };
-        self.finished.send_replace(true);
         outcome.send_replace(Some(done));
     }
 
@@ -691,7 +760,7 @@ impl Run {
     fn lost_outcome(&self) -> RunOutcome {
         RunOutcome {
             end: WorkerEnd::None,
-            host: HostVerdict::Crashed(ExitKind::Code(REAP_FAILED_CODE)),
+            host: HostVerdict::Crashed(None),
             logs: Vec::new(),
             logs_truncated: None,
             stderr: String::new(),
@@ -702,18 +771,68 @@ impl Run {
     }
 }
 
-/// PD-135: kills the run `limit` after `script.run` was handed to the writer, unless the worker
-/// was reaped first. The cause `timeout_s` is recorded only if nothing decided the run before; the
-/// kill is sent either way (a no-op unless an earlier kill did not take).
-async fn run_timer(run: Arc<Run>, mut finished: watch::Receiver<bool>, limit: Duration) {
-    if tokio::time::timeout(limit, finished.wait_for(|f| *f))
+/// The worker's exit once its stdout ended (`None` when the reap failed). It usually exited, so
+/// its own exit code is awaited first, for [`EXIT_GRACE`]; only a worker still running after that
+/// is killed (it closed its stdout and must not outlive it). A kill right at EOF could replace
+/// the exit code on Windows (m-4). After that kill the wait is unbounded: the run timer kills
+/// again until the reap.
+fn exit_after_eof(
+    kill: &dyn KillHandle,
+    exit: &Receiver<io::Result<ExitKind>>,
+) -> Option<ExitKind> {
+    let reaped = match exit.recv_timeout(EXIT_GRACE) {
+        Ok(reaped) => reaped,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            kill.kill();
+            exit.recv().ok()?
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+    };
+    reaped.ok()
+}
+
+/// PD-135: kills the run at `expiry` (`timeout_s` after `script.run` was handed to the writer),
+/// unless the outcome was published first (it is, after the reap). The cause `timeout_s` is
+/// recorded only if nothing decided the run before. From the expiry on it kills every
+/// [`KILL_RETRY`] until the reap (a no-op unless an earlier kill did not take, T6). If the reader
+/// thread ends without an outcome, the worker is killed at once (review m-5).
+async fn run_timer(
+    run: Arc<Run>,
+    mut outcome: watch::Receiver<Option<RunOutcome>>,
+    mut expiry: Pin<Box<Sleep>>,
+) {
+    let before_expiry = {
+        let mut published = pin!(published(&mut outcome));
+        poll_fn(|cx| match published.as_mut().poll(cx) {
+            Poll::Ready(published) => Poll::Ready(Some(published)),
+            Poll::Pending => expiry.as_mut().poll(cx).map(|()| None),
+        })
         .await
-        .is_ok()
-    {
-        return;
+    };
+    match before_expiry {
+        Some(true) => return,
+        Some(false) => {
+            run.kill.kill();
+            return;
+        }
+        None => {}
     }
     run.update(|inner| inner.state.on_timeout());
-    run.kill.kill();
+    loop {
+        run.kill.kill();
+        if tokio::time::timeout(KILL_RETRY, published(&mut outcome))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+}
+
+/// `true` once the outcome is published, `false` once it never will be (the reader thread ended
+/// without one).
+async fn published(outcome: &mut watch::Receiver<Option<RunOutcome>>) -> bool {
+    outcome.wait_for(Option::is_some).await.is_ok()
 }
 
 #[cfg(test)]

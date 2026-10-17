@@ -10,7 +10,7 @@
 //! structural (L26), except the plan's 50 ms bound for a kill.
 
 use std::cell::Cell;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -28,9 +28,12 @@ use atlas_duck_ipc::sandbox::script::{
     M_SCRIPT_COMPILED, M_SCRIPT_ERROR, M_SCRIPT_RUN, M_SCRIPT_SYNTAX, SyntaxParams, WorkerInit,
     encode_request,
 };
-use atlas_duck_ipc::sandbox::{HOST_TO_WORKER_MAX, HostCall, HostCallResult, ScriptLimits};
+use atlas_duck_ipc::sandbox::{
+    EXIT_PROTOCOL, HOST_TO_WORKER_MAX, HostCall, HostCallResult, ScriptLimits, terminal_frame_max,
+};
 use atlas_duck_sandbox_host::bridge::{
-    CompileVerdict, ExpectedWorker, HostCallSink, HostVerdict, KillCause, LOG_CAP_BYTES,
+    CompileVerdict, DIAG_CALL_RESULT_REPLACED, DIAG_HOST_PROTOCOL_EXIT, DIAG_OUTCOME_LOST,
+    DIAG_REAP_FAILED, ExpectedWorker, HostCallSink, HostVerdict, KillCause, LOG_CAP_BYTES,
     LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl, RunOutcome, STDERR_CAP, StartRunError,
     ViolationKind, WorkerEnd, compile_run, log_truncated_marker, start_run,
 };
@@ -60,6 +63,8 @@ struct Observed {
     received: Mutex<Vec<Value>>,
     killed: Mutex<bool>,
     killed_cv: Condvar,
+    /// When the kill signal reached the running fake.
+    killed_at: Mutex<Option<Instant>>,
     /// Signals the kill handle sent (at most one).
     signals: AtomicU32,
     /// Calls of the kill handle, including no-ops and a swallowed one.
@@ -77,9 +82,20 @@ impl Observed {
         if let Ok(mut k) = self.killed.lock()
             && !dead
         {
+            if !*k && let Ok(mut at) = self.killed_at.lock() {
+                *at = Some(Instant::now());
+            }
             *k = true;
         }
         self.killed_cv.notify_all();
+    }
+
+    fn killed_at(&self) -> Option<Instant> {
+        self.killed_at.lock().ok().and_then(|at| *at)
+    }
+
+    fn kill_calls(&self) -> u32 {
+        self.kill_calls.load(Ordering::SeqCst)
     }
 
     fn is_killed(&self) -> bool {
@@ -107,10 +123,16 @@ impl Observed {
 
     /// Waits until the fake's thread ended (its pipes are closed).
     fn wait_finished(&self) -> Result<(), String> {
+        self.wait_finished_within(WAIT_BOUND)
+    }
+
+    /// [`Observed::wait_finished`] with a shorter bound: the fake ends within `bound` only if the
+    /// host killed it (a fake waiting for its kill gives up after [`WAIT_BOUND`]).
+    fn wait_finished_within(&self, bound: Duration) -> Result<(), String> {
         let guard = self.finished.lock().map_err(|_| "poisoned")?;
         let (guard, _) = self
             .finished_cv
-            .wait_timeout_while(guard, WAIT_BOUND, |f| !*f)
+            .wait_timeout_while(guard, bound, |f| !*f)
             .map_err(|_| "poisoned")?;
         if *guard {
             Ok(())
@@ -123,7 +145,8 @@ impl Observed {
 /// The worker side of the three pipes, with helpers that speak the script protocol.
 struct FakeWorker {
     stdin: io::PipeReader,
-    stdout: io::PipeWriter,
+    /// `None` once the fake closed its stdout ([`FakeWorker::close_stdout`]).
+    stdout: Option<io::PipeWriter>,
     stderr: io::PipeWriter,
     observed: Arc<Observed>,
 }
@@ -146,21 +169,39 @@ impl FakeWorker {
         self.send(&encode_notification(M_PROBE_READY, &ready))
     }
 
-    /// One frame, unless the fake was killed.
-    fn send(&mut self, payload: &[u8]) -> io::Result<()> {
+    /// The open stdout, unless the fake was killed.
+    fn stdout(&mut self) -> io::Result<&mut io::PipeWriter> {
         if self.observed.is_killed() {
             return Err(killed_error());
         }
-        write_frame(&mut self.stdout, payload)
+        self.stdout
+            .as_mut()
+            .ok_or_else(|| io::Error::other("stdout is closed"))
+    }
+
+    /// One frame, unless the fake was killed.
+    fn send(&mut self, payload: &[u8]) -> io::Result<()> {
+        write_frame(self.stdout()?, payload)
     }
 
     /// Raw bytes in one write (several frames land before the host can react).
     fn send_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
-        if self.observed.is_killed() {
-            return Err(killed_error());
-        }
-        self.stdout.write_all(bytes)?;
-        self.stdout.flush()
+        let stdout = self.stdout()?;
+        stdout.write_all(bytes)?;
+        stdout.flush()
+    }
+
+    /// Closes stdout while the fake keeps running (the host reads EOF).
+    fn close_stdout(&mut self) {
+        self.stdout = None;
+    }
+
+    /// Reads the 4-byte header of the next host frame and nothing more: the writer stays blocked
+    /// in that frame once the pipe is full.
+    fn read_header(&mut self) -> io::Result<u32> {
+        let mut header = [0u8; 4];
+        self.stdin.read_exact(&mut header)?;
+        Ok(u32::from_be_bytes(header))
     }
 
     /// Reads one host frame and records it; `None` at stdin EOF.
@@ -217,38 +258,59 @@ type Script = Box<dyn FnOnce(&mut FakeWorker) -> io::Result<i32> + Send>;
 struct FakeSpawner {
     script: Mutex<Option<Script>>,
     observed: Arc<Observed>,
-    /// The kill handle swallows its first call (an OS call that failed without a sign).
-    flaky_kill: bool,
+    opts: FakeOpts,
+}
+
+/// How the fake's process handles misbehave.
+#[derive(Clone, Copy, Default)]
+struct FakeOpts {
+    /// The kill handle swallows this many calls first (OS calls that failed without a sign).
+    swallow_kills: u32,
+    /// The reaper reaps, then reports an error (the exit status is lost).
+    reap_fails: bool,
 }
 
 fn fake(
     script: impl FnOnce(&mut FakeWorker) -> io::Result<i32> + Send + 'static,
 ) -> (Arc<FakeSpawner>, Arc<Observed>) {
-    fake_with(false, script)
+    fake_opts(FakeOpts::default(), script)
 }
 
+/// A fake whose kill handle swallows its first call.
 fn fake_with(
     flaky_kill: bool,
+    script: impl FnOnce(&mut FakeWorker) -> io::Result<i32> + Send + 'static,
+) -> (Arc<FakeSpawner>, Arc<Observed>) {
+    let opts = FakeOpts {
+        swallow_kills: u32::from(flaky_kill),
+        ..FakeOpts::default()
+    };
+    fake_opts(opts, script)
+}
+
+fn fake_opts(
+    opts: FakeOpts,
     script: impl FnOnce(&mut FakeWorker) -> io::Result<i32> + Send + 'static,
 ) -> (Arc<FakeSpawner>, Arc<Observed>) {
     let observed = Arc::new(Observed::default());
     let spawner = FakeSpawner {
         script: Mutex::new(Some(Box::new(script))),
         observed: Arc::clone(&observed),
-        flaky_kill,
+        opts,
     };
     (Arc::new(spawner), observed)
 }
 
-/// A kill handle whose first call does nothing, then behaves like the real one.
+/// A kill handle whose first `swallow` calls do nothing, then behaves like the real one.
 struct FlakyKill {
     inner: GuardedKill,
     observed: Arc<Observed>,
+    swallow: u32,
 }
 
 impl KillHandle for FlakyKill {
     fn kill(&self) {
-        if self.observed.kill_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+        if self.observed.kill_calls.fetch_add(1, Ordering::SeqCst) >= self.swallow {
             self.inner.kill();
         }
     }
@@ -282,7 +344,7 @@ impl WorkerSpawner for FakeSpawner {
         let (exit_tx, exit_rx) = mpsc::channel();
         let mut worker = FakeWorker {
             stdin: stdin_r,
-            stdout: stdout_w,
+            stdout: Some(stdout_w),
             stderr: stderr_w,
             observed: Arc::clone(&self.observed),
         };
@@ -304,7 +366,7 @@ impl WorkerSpawner for FakeSpawner {
             stderr: stderr_r,
             exit: exit_rx,
             observed: Arc::clone(&self.observed),
-            flaky_kill: self.flaky_kill,
+            opts: self.opts,
         }))
     }
 }
@@ -315,7 +377,7 @@ struct FakeProcess {
     stderr: io::PipeReader,
     exit: Receiver<i32>,
     observed: Arc<Observed>,
-    flaky_kill: bool,
+    opts: FakeOpts,
 }
 
 impl WorkerProcess for FakeProcess {
@@ -341,8 +403,12 @@ impl WorkerProcess for FakeProcess {
         let observed = Arc::clone(&self.observed);
         let inner = GuardedKill::new(Arc::clone(&guard), move || observed.kill());
         let observed = Arc::clone(&self.observed);
-        let kill: Arc<dyn KillHandle> = if self.flaky_kill {
-            Arc::new(FlakyKill { inner, observed })
+        let kill: Arc<dyn KillHandle> = if self.opts.swallow_kills > 0 {
+            Arc::new(FlakyKill {
+                inner,
+                observed,
+                swallow: self.opts.swallow_kills,
+            })
         } else {
             Arc::new(CountedKill { inner, observed })
         };
@@ -358,6 +424,7 @@ impl WorkerProcess for FakeProcess {
                 guard,
                 exit: self.exit,
                 observed: self.observed,
+                fails: self.opts.reap_fails,
             }),
         })
     }
@@ -367,12 +434,13 @@ struct FakeReaper {
     guard: Arc<ReapGuard>,
     exit: Receiver<i32>,
     observed: Arc<Observed>,
+    fails: bool,
 }
 
 impl Reaper for FakeReaper {
     fn wait(self: Box<Self>) -> io::Result<ExitKind> {
         let code = Cell::new(None);
-        reap_after_wait(
+        let reaped = reap_after_wait(
             &self.guard,
             || {
                 code.set(Some(
@@ -389,7 +457,11 @@ impl Reaper for FakeReaper {
                         .ok_or_else(|| io::Error::other("no code"))
                 }
             },
-        )
+        );
+        if self.fails {
+            return reaped.and(Err(io::Error::other("the exit status was lost")));
+        }
+        reaped
     }
 }
 
@@ -441,6 +513,15 @@ fn result_frame_of_len(len: usize) -> Vec<u8> {
     let empty = result_frame("\"\"");
     let pad = len - empty.len();
     result_frame(&format!("\"{}\"", "x".repeat(pad))).into_bytes()
+}
+
+/// A `script.result` frame of exactly `len` bytes whose value is an array of zeros: per byte, the
+/// text the host's representability check (a visitor call per element) takes longest for.
+fn zeros_result_frame_of_len(len: usize) -> Vec<u8> {
+    let room = len - result_frame("[0]").len();
+    let more = room / 2;
+    let value = format!("[0{}{}]", ",0".repeat(more), " ".repeat(room - 2 * more));
+    result_frame(&value).into_bytes()
 }
 
 // ---- host side -----------------------------------------------------------------------------------
@@ -717,6 +798,26 @@ async fn outstanding_counted_until_result_queued() -> TestResult {
     assert_eq!(gated.calls(), vec![1]);
     assert_eq!(observed.signals(), 1);
     gate.add_permits(1);
+
+    // Queued is enough, written is not needed: the fake reads only the header of call 1's 2 MiB
+    // answer, so the writer stays blocked inside that frame, and call 2 is still within the limit.
+    let padded = TestSink::padded(2 * MIB);
+    let (spawner, observed) = fake(move |w| {
+        w.ready()?;
+        w.read()?;
+        w.call(1)?;
+        let len = w.read_header()?;
+        assert!(len as usize > 2 * MIB, "call 1's answer is being written");
+        w.call(2)?;
+        w.result("2")?;
+        Ok(0)
+    });
+    let outcome = run_to_end(spawner, one, padded.clone()).await?;
+    assert_eq!(outcome.host, HostVerdict::None);
+    assert_eq!(result_text(&outcome), Some("2"));
+    eventually(|| padded.calls().len() == 2).await?;
+    assert_eq!(padded.calls(), vec![1, 2]);
+    observed.wait_finished()?;
     Ok(())
 }
 
@@ -895,23 +996,38 @@ async fn stderr_cap_64k_drained() -> TestResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_flight_calls_cancelled_at_terminal() -> TestResult {
     // N-b (T3 re-review): a terminal may follow unanswered host.calls. The run ends with the
-    // result; the late answer is never written to the worker.
+    // result; the call's answer, ready only after the terminal decided the run, is never written,
+    // although the worker still reads its stdin then: it reads EOF and nothing else.
     let (gated, gate) = TestSink::gated();
     let seen = gated.watch();
+    let (answered_tx, answered_rx) = mpsc::channel::<()>();
     let (spawner, observed) = fake(move |w| {
         w.ready()?;
         w.read()?;
         w.call(1)?;
         seen.recv_timeout(WAIT_BOUND).map_err(io::Error::other)?;
         w.result("\"done\"")?;
+        answered_rx
+            .recv_timeout(WAIT_BOUND)
+            .map_err(io::Error::other)?;
         w.drain_stdin()?;
         Ok(0)
     });
-    let outcome = run_to_end(spawner, ScriptLimits::default(), gated.clone()).await?;
-    assert_eq!(result_text(&outcome), Some("\"done\""));
-    assert_eq!(outcome.host, HostVerdict::None);
+    let handle = start(
+        spawner,
+        expect(false),
+        init(ScriptLimits::default()),
+        gated.clone(),
+    )
+    .await??;
+    // The terminal decided the run (its kill reached the fake); only now the call completes.
+    eventually(|| observed.is_killed()).await?;
     gate.add_permits(1);
     eventually(|| gated.completed() == 1).await?;
+    answered_tx.send(())?;
+    let outcome = tokio::time::timeout(WAIT_BOUND, handle.wait()).await?;
+    assert_eq!(result_text(&outcome), Some("\"done\""));
+    assert_eq!(outcome.host, HostVerdict::None);
     observed.wait_finished()?;
     assert_eq!(observed.received_methods(), vec![M_SCRIPT_RUN.to_string()]);
     Ok(())
@@ -1099,7 +1215,7 @@ async fn host_call_futures_run_to_completion_after_worker_death() -> TestResult 
         Ok(5) // dies without a terminal frame
     });
     let outcome = run_to_end(spawner, ScriptLimits::default(), gated.clone()).await?;
-    assert_eq!(outcome.host, HostVerdict::Crashed(ExitKind::Code(5)));
+    assert_eq!(outcome.host, HostVerdict::Crashed(Some(ExitKind::Code(5))));
     assert_eq!(gated.completed(), 0);
     gate.add_permits(1);
     eventually(|| gated.completed() == 1).await?;
@@ -1417,7 +1533,7 @@ async fn exit_zero_without_terminal_is_crashed() -> TestResult {
     });
     let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
     assert_eq!(outcome.end, WorkerEnd::None);
-    assert_eq!(outcome.host, HostVerdict::Crashed(ExitKind::Code(0)));
+    assert_eq!(outcome.host, HostVerdict::Crashed(Some(ExitKind::Code(0))));
     assert_eq!(outcome.logs, vec!["bye".to_string()]);
     Ok(())
 }
@@ -1568,5 +1684,412 @@ async fn compile_run_refuses_like_start_run() -> TestResult {
         Err(StartRunError::Spawn(io::ErrorKind::InvalidData))
     );
     assert_eq!(observed.signals(), 1);
+
+    // A reply above the 1 MiB frame cap: its header is refused, no body byte is read.
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        w.send_raw(&(MIB as u32 + 1).to_be_bytes())?;
+        w.until_killed()
+    });
+    assert_eq!(
+        compile(spawner, Duration::from_secs(10)).await?,
+        Err(StartRunError::Spawn(io::ErrorKind::InvalidData))
+    );
+    assert_eq!(observed.signals(), 1);
+    Ok(())
+}
+
+// ---- M8 T7 review fixes ----------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cap_size_result_never_holds_up_a_kill() -> TestResult {
+    // I-1: whether a `script.result` reads as a `Value` takes a full parse of up to
+    // `max_result_mb` + 64 KiB. It runs before the run lock is taken, so a kill that lands while
+    // the reader handles that frame never waits for it. A kill decides the run (and the frame is
+    // then ignored) unless the reader took the lock first, so the kills start at several points of
+    // the time the host takes for the frame, measured first.
+    let limits = ScriptLimits::default();
+    let frame = Arc::new(framed(&zeros_result_frame_of_len(terminal_frame_max(
+        &limits,
+    ))));
+    let handling = {
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let frame = Arc::clone(&frame);
+        let (spawner, observed) = fake(move |w| {
+            w.ready()?;
+            w.read()?;
+            w.send_raw(&frame)?;
+            let _ = sent_tx.send(Instant::now());
+            w.until_killed()
+        });
+        let outcome = run_to_end(spawner, limits, sink()).await?;
+        assert_eq!(outcome.host, HostVerdict::None);
+        let sent = sent_rx.recv_timeout(WAIT_BOUND)?;
+        let killed = observed
+            .killed_at()
+            .ok_or("the terminal's kill never came")?;
+        killed.saturating_duration_since(sent)
+    };
+
+    let mut slowest = Duration::ZERO;
+    for tenths in [2u32, 4, 6, 8] {
+        let (sent_tx, sent_rx) = mpsc::channel::<Instant>();
+        let frame = Arc::clone(&frame);
+        let (spawner, _) = fake(move |w| {
+            w.ready()?;
+            w.read()?;
+            w.send_raw(&frame)?;
+            let _ = sent_tx.send(Instant::now());
+            w.until_killed()
+        });
+        let handle = Arc::new(start(spawner, expect(false), init(limits), sink()).await??);
+        let killer = {
+            let handle = Arc::clone(&handle);
+            thread::spawn(move || -> Result<Duration, String> {
+                let sent = sent_rx
+                    .recv_timeout(WAIT_BOUND)
+                    .map_err(|e| e.to_string())?;
+                let from = sent + handling * tenths / 10;
+                thread::sleep(from.saturating_duration_since(Instant::now()));
+                let mut slowest = Duration::ZERO;
+                for _ in 0..20 {
+                    let started = Instant::now();
+                    handle.kill(KillCause::User);
+                    slowest = slowest.max(started.elapsed());
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Ok(slowest)
+            })
+        };
+        let outcome = tokio::time::timeout(WAIT_BOUND, handle.wait()).await?;
+        assert!(
+            matches!(
+                outcome.host,
+                HostVerdict::None | HostVerdict::Killed(KillCause::User)
+            ),
+            "{:?}",
+            outcome.host
+        );
+        let took = killer.join().map_err(|_| "the killer panicked")??;
+        slowest = slowest.max(took);
+    }
+    eprintln!("I-1 frame_handling={handling:?} slowest_kill={slowest:?}");
+    assert!(
+        slowest < KILL_BOUND,
+        "a kill took {slowest:?} (the host took {handling:?} for the frame)"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exit_protocol_without_terminal_is_a_host_fault() -> TestResult {
+    // T4 hand-off: exit 3 means the worker could not read what the host sent. That is a host bug,
+    // never the script's doing: its own verdict plus a diag, never `Crashed`.
+    let (spawner, _) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        Ok(EXIT_PROTOCOL)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(outcome.host, HostVerdict::HostFault);
+    assert_eq!(outcome.end, WorkerEnd::None);
+    assert_eq!(outcome.diag, vec![DIAG_HOST_PROTOCOL_EXIT]);
+
+    // After an accepted terminal frame the exit does not matter (the terminal's kill is swallowed,
+    // so the fake's own exit is reported).
+    let opts = FakeOpts {
+        swallow_kills: 1,
+        ..FakeOpts::default()
+    };
+    let (spawner, _) = fake_opts(opts, |w| {
+        w.ready()?;
+        w.read()?;
+        w.result("1")?;
+        w.drain_stdin()?;
+        Ok(EXIT_PROTOCOL)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(outcome.host, HostVerdict::None);
+    assert_eq!(result_text(&outcome), Some("1"));
+    assert!(outcome.diag.is_empty(), "{:?}", outcome.diag);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compile_exit_protocol_is_unavailable_never_timeout() -> TestResult {
+    // T4: "Exit 3 from a compile worker can only be a host protocol fault."
+    let (spawner, _) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        Ok(EXIT_PROTOCOL)
+    });
+    assert_eq!(
+        compile(spawner, Duration::from_secs(10)).await?,
+        Err(StartRunError::Spawn(io::ErrorKind::InvalidData))
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_timer_kills_until_the_worker_is_reaped() -> TestResult {
+    // m-1: from `timeout_s` on, the timer kills again and again until the reap, not just once.
+    let opts = FakeOpts {
+        swallow_kills: 3,
+        ..FakeOpts::default()
+    };
+    let (spawner, observed) = fake_opts(opts, |w| {
+        w.ready()?;
+        w.read()?;
+        w.send(b"not json")?;
+        w.until_killed()
+    });
+    let one_second = limits_with(|l| l.timeout_s = 1);
+    let handle = start(spawner, expect(false), init(one_second), sink()).await??;
+    let outcome = tokio::time::timeout(Duration::from_secs(10), handle.wait()).await?;
+    assert_eq!(
+        outcome.host,
+        HostVerdict::Violation(ViolationKind::Malformed)
+    );
+    assert!(observed.kill_calls() >= 4, "{}", observed.kill_calls());
+    assert_eq!(observed.signals(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_and_compile_workers_are_killed_until_reaped() -> TestResult {
+    // m-1: a refused worker and a compile worker get no run timer; their kill is retried until the
+    // reap as well.
+    let opts = FakeOpts {
+        swallow_kills: 2,
+        ..FakeOpts::default()
+    };
+    let (spawner, observed) = fake_opts(opts, |w| {
+        w.ready_with("another-build", report(true))?;
+        w.until_killed()
+    });
+    let refused = start(
+        spawner,
+        expect(false),
+        init(ScriptLimits::default()),
+        sink(),
+    )
+    .await?;
+    assert_eq!(
+        refused.err(),
+        Some(StartRunError::IdentityMismatch {
+            what: IdentityPart::EmbeddedVersion
+        })
+    );
+    observed.wait_finished_within(Duration::from_secs(10))?;
+    assert!(observed.kill_calls() >= 3, "{}", observed.kill_calls());
+    assert_eq!(observed.signals(), 1);
+
+    let (spawner, observed) = fake_opts(opts, |w| {
+        w.ready()?;
+        w.read()?;
+        w.until_killed()
+    });
+    assert_eq!(
+        compile(spawner, Duration::from_millis(300)).await??,
+        CompileVerdict::Timeout
+    );
+    observed.wait_finished_within(Duration::from_secs(10))?;
+    assert!(observed.kill_calls() >= 3, "{}", observed.kill_calls());
+    assert_eq!(observed.signals(), 1);
+    Ok(())
+}
+
+#[test]
+fn start_run_needs_the_time_driver_before_it_spawns() -> TestResult {
+    // m-2: the run timer needs tokio's time driver. Without it `start_run` panics before it
+    // spawns anything, not in a timer task where nobody sees it (and no timeout is enforced).
+    let rt = tokio::runtime::Builder::new_current_thread().build()?;
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        w.until_killed()
+    });
+    let handle = rt.handle().clone();
+    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        start_run(
+            spawner.as_ref(),
+            &spec(),
+            &expect(false),
+            init(ScriptLimits::default()),
+            sink(),
+            handle,
+        )
+    }));
+    assert!(started.is_err(), "start_run must panic");
+    assert_eq!(observed.spawns.load(Ordering::SeqCst), 0, "nothing spawned");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_closed_stdout_keeps_its_own_exit_code() -> TestResult {
+    // m-4: on Windows a process's handles close before its exit code is set, and a kill in that
+    // window would replace the code (102 by 1). At stdout EOF the bridge waits for the exit first.
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        w.close_stdout();
+        thread::sleep(Duration::from_millis(300));
+        Ok(102)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(
+        outcome.host,
+        HostVerdict::Crashed(Some(ExitKind::Code(102)))
+    );
+    assert_eq!(observed.signals(), 0, "not killed");
+
+    // A worker that closed its stdout and keeps running is killed after that wait.
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        w.close_stdout();
+        w.until_killed()
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(
+        outcome.host,
+        HostVerdict::Crashed(Some(ExitKind::Signal(9)))
+    );
+    assert_eq!(observed.signals(), 1);
+    Ok(())
+}
+
+/// A sink whose `log` fails: the bridge's reader thread unwinds with it.
+struct FailingLogSink;
+
+#[async_trait]
+impl HostCallSink for FailingLogSink {
+    async fn call(&self, _run_id: &str, _c: HostCall) -> HostCallResult {
+        HostCallResult::Ok(Value::Null)
+    }
+
+    fn log(&self, _run_id: &str, _line: &str) {
+        std::panic::resume_unwind(Box::new("the sink failed"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_outcome_kills_the_worker() -> TestResult {
+    // m-5: the reader thread ended without an outcome; the worker is killed at once, not at
+    // `timeout_s`.
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        w.log("boom")?;
+        w.until_killed()
+    });
+    let handle = start(
+        spawner,
+        expect(false),
+        init(ScriptLimits::default()),
+        Arc::new(FailingLogSink),
+    )
+    .await??;
+    let outcome = tokio::time::timeout(WAIT_BOUND, handle.wait()).await?;
+    assert_eq!(outcome.diag, vec![DIAG_OUTCOME_LOST]);
+    assert_eq!(outcome.host, HostVerdict::Crashed(None));
+    observed.wait_finished_within(Duration::from_secs(10))?;
+    assert_eq!(observed.signals(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_ends_before_ready_is_unexpected_eof() -> TestResult {
+    let (spawner, observed) = fake(|_| Ok(0));
+    let refused = start(
+        spawner,
+        expect(false),
+        init(ScriptLimits::default()),
+        sink(),
+    )
+    .await?;
+    assert_eq!(
+        refused.err(),
+        Some(StartRunError::Spawn(io::ErrorKind::UnexpectedEof))
+    );
+    observed.wait_finished()?;
+    assert!(observed.received().is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_first_frame_is_invalid_data() -> TestResult {
+    // A first frame that is no `probe.ready`, and one above the 1 MiB cap (no body byte read).
+    let not_ready: Script = Box::new(|w| {
+        w.log("first")?;
+        w.until_killed()
+    });
+    let oversize: Script = Box::new(|w| {
+        w.send_raw(&(MIB as u32 + 1).to_be_bytes())?;
+        w.until_killed()
+    });
+    for script in [not_ready, oversize] {
+        let (spawner, observed) = fake(script);
+        let refused = start(
+            spawner,
+            expect(false),
+            init(ScriptLimits::default()),
+            sink(),
+        )
+        .await?;
+        assert_eq!(
+            refused.err(),
+            Some(StartRunError::Spawn(io::ErrorKind::InvalidData))
+        );
+        observed.wait_finished()?;
+        assert!(observed.received().is_empty());
+        assert_eq!(observed.signals(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_reap_is_reported() -> TestResult {
+    let opts = FakeOpts {
+        reap_fails: true,
+        ..FakeOpts::default()
+    };
+    let (spawner, _) = fake_opts(opts, |w| {
+        w.ready()?;
+        w.read()?;
+        Ok(5)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(
+        outcome.host,
+        HostVerdict::Crashed(None),
+        "the exit is unknown"
+    );
+    assert_eq!(outcome.diag, vec![DIAG_REAP_FAILED]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_result_above_the_host_cap_is_rejected_and_logged() -> TestResult {
+    // Deviation 9 (unreachable while `max_call_result_mb` <= 16): the worker sees the rejection,
+    // and the diag tells the glue that core recorded a result the worker never got.
+    let (spawner, _) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        w.call(1)?;
+        let answer = w.read()?.ok_or_else(|| io::Error::other("no answer"))?;
+        assert_eq!(answer["result"]["rejected"]["class"], "result_too_large");
+        w.result("1")?;
+        Ok(0)
+    });
+    let outcome = run_to_end(
+        spawner,
+        ScriptLimits::default(),
+        TestSink::padded(HOST_TO_WORKER_MAX),
+    )
+    .await?;
+    assert_eq!(result_text(&outcome), Some("1"));
+    assert_eq!(outcome.diag, vec![DIAG_CALL_RESULT_REPLACED]);
     Ok(())
 }

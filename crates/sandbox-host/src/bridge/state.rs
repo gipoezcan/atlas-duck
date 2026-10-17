@@ -15,11 +15,17 @@
 //!   reader cannot know the method before it read the body, so the check runs after decoding.
 //! - Logs: 1 MiB and 10 000 lines per run; past either cap every line is discarded and counted.
 //!
+//! Every step is cheap: the one costly check, whether a result reads as a `Value` (a parse of up
+//! to `max_result_mb` + 64 KiB), runs in [`Incoming::from`] on the reader thread before the run
+//! lock is taken (review I-1: a kill never waits for it).
+//!
 //! The run's verdict from these facts and the worker's exit is [`RunState::verdict`]; M8 Task 9
 //! replaces it with the host-measured attribution (`attribute`, PD-134).
 
 use atlas_duck_ipc::sandbox::script::{DecodeError, WorkerFrame};
-use atlas_duck_ipc::sandbox::{HostCall, ScriptLimits, WORKER_FRAME_MAX_BYTES, terminal_frame_max};
+use atlas_duck_ipc::sandbox::{
+    EXIT_PROTOCOL, HostCall, ScriptLimits, WORKER_FRAME_MAX_BYTES, terminal_frame_max,
+};
 
 use super::{HostVerdict, KillCause, LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE};
 use super::{WorkerEnd, log_truncated_marker};
@@ -68,10 +74,57 @@ pub(crate) enum Step {
     Log(String),
     /// A call to hand to [`super::HostCallSink::call`].
     Call(HostCall),
-    /// The terminal frame decided the run: stop writing, stop the timer, kill (no cause).
+    /// The terminal frame decided the run: stop writing, kill (no cause). The timer stays armed
+    /// until the reap.
     Terminal,
-    /// A violation decided the run: stop writing, stop the timer, kill, discard the rest.
+    /// A violation decided the run: stop writing, kill, discard the rest.
     Violation,
+}
+
+/// A decoded worker frame, its terminal payload already classified.
+#[derive(Debug)]
+pub(crate) enum Incoming {
+    Call {
+        id: u64,
+        call: HostCall,
+    },
+    Log {
+        line: String,
+    },
+    /// `script.result` or `script.error`, as the payload the run reports.
+    Terminal(WorkerEnd),
+    /// `script.compiled` / `script.syntax`: frames of the compile mode.
+    CompileReply,
+}
+
+impl From<WorkerFrame> for Incoming {
+    /// Runs on the reader thread, outside the run lock: for a `script.result` it parses the whole
+    /// value (T4 fix I-1, binding fallback: a result the core cannot read into a `Value` is a
+    /// worker-reported runtime error, never a violation or a crash).
+    fn from(frame: WorkerFrame) -> Incoming {
+        match frame {
+            WorkerFrame::Call { id, call } => Incoming::Call { id, call },
+            WorkerFrame::Log { line } => Incoming::Log { line },
+            WorkerFrame::Result { value } if value.reads_as_value() => {
+                Incoming::Terminal(WorkerEnd::Result { value_json: value })
+            }
+            WorkerFrame::Result { .. } => Incoming::Terminal(WorkerEnd::Error {
+                class: "TypeError".to_owned(),
+                message: RESULT_NOT_REPRESENTABLE.to_owned(),
+                stack: String::new(),
+            }),
+            WorkerFrame::Error {
+                class,
+                message,
+                stack,
+            } => Incoming::Terminal(WorkerEnd::Error {
+                class,
+                message,
+                stack,
+            }),
+            WorkerFrame::Compiled | WorkerFrame::Syntax { .. } => Incoming::CompileReply,
+        }
+    }
 }
 
 /// Log lines kept within the per-run caps.
@@ -153,17 +206,16 @@ impl RunState {
         matches!(self.cause, Some(HostCause::Violation(_)))
     }
 
-    /// One frame of `len` payload bytes, as the decoder read it.
-    pub(crate) fn on_frame(&mut self, len: usize, frame: Result<WorkerFrame, DecodeError>) -> Step {
+    /// One frame of `len` payload bytes, as the decoder read it and [`Incoming::from`] classified
+    /// it. No parse and no copy of the payload happens here.
+    pub(crate) fn on_frame(&mut self, len: usize, frame: Result<Incoming, DecodeError>) -> Step {
         if self.cause.is_some() {
             return Step::Nothing;
         }
         if self.terminal {
             // Frames after the terminal are ignored; a second terminal is a violation.
             return match frame {
-                Ok(WorkerFrame::Result { .. } | WorkerFrame::Error { .. }) => {
-                    self.violate(ViolationKind::SecondTerminal)
-                }
+                Ok(Incoming::Terminal(_)) => self.violate(ViolationKind::SecondTerminal),
                 _ => Step::Nothing,
             };
         }
@@ -172,14 +224,14 @@ impl RunState {
             Err(e) => return self.violate(violation_of(&e)),
         };
         let cap = match frame {
-            WorkerFrame::Result { .. } | WorkerFrame::Error { .. } => self.terminal_cap,
+            Incoming::Terminal(_) => self.terminal_cap,
             _ => WORKER_FRAME_MAX_BYTES,
         };
         if len > cap {
             return self.violate(ViolationKind::Oversize);
         }
         match frame {
-            WorkerFrame::Call { id, call } => {
+            Incoming::Call { id, call } => {
                 if id <= self.last_call_id {
                     return self.violate(ViolationKind::IdNotIncreasing);
                 }
@@ -190,44 +242,19 @@ impl RunState {
                 self.outstanding += 1;
                 Step::Call(call)
             }
-            WorkerFrame::Log { line } => {
+            Incoming::Log { line } => {
                 if self.logs.push(&line) {
                     Step::Log(line)
                 } else {
                     Step::Nothing
                 }
             }
-            WorkerFrame::Result { value } => {
+            Incoming::Terminal(end) => {
                 self.terminal = true;
-                // T4 fix I-1 (binding fallback): a result the core cannot read into a `Value`
-                // is a worker-reported runtime error, never a violation or a crash.
-                self.end = if value.reads_as_value() {
-                    WorkerEnd::Result { value_json: value }
-                } else {
-                    WorkerEnd::Error {
-                        class: "TypeError".to_owned(),
-                        message: RESULT_NOT_REPRESENTABLE.to_owned(),
-                        stack: String::new(),
-                    }
-                };
+                self.end = end;
                 Step::Terminal
             }
-            WorkerFrame::Error {
-                class,
-                message,
-                stack,
-            } => {
-                self.terminal = true;
-                self.end = WorkerEnd::Error {
-                    class,
-                    message,
-                    stack,
-                };
-                Step::Terminal
-            }
-            WorkerFrame::Compiled | WorkerFrame::Syntax { .. } => {
-                self.violate(ViolationKind::UnexpectedFrame)
-            }
+            Incoming::CompileReply => self.violate(ViolationKind::UnexpectedFrame),
         }
     }
 
@@ -270,9 +297,16 @@ impl RunState {
         std::mem::replace(&mut self.end, WorkerEnd::None)
     }
 
+    /// Whether a terminal frame was accepted.
+    pub(crate) fn terminal(&self) -> bool {
+        self.terminal
+    }
+
     /// The host's verdict: its own cause first, then an accepted terminal frame (the exit no
-    /// longer matters), else the exit without a terminal frame, `Code(0)` included, is a crash
-    /// (T4: stdin EOF exits 0 with no frame). `exit` is `None` when the reap failed.
+    /// longer matters), then `EXIT_PROTOCOL` (the worker could not read what the host sent: a
+    /// host fault, T4), else the exit without a terminal frame, `Code(0)` included, is a crash
+    /// (T4: stdin EOF exits 0 with no frame). `exit` is `None` when it is unknown (the reap
+    /// failed).
     ///
     /// M8 Task 9 replaces this with `attribute` (heap / process limits from the exit, the
     /// Windows job message, the macOS watchdog).
@@ -282,7 +316,8 @@ impl RunState {
             Some(HostCause::Violation(kind)) => HostVerdict::Violation(*kind),
             Some(HostCause::Killed(cause)) => HostVerdict::Killed(cause.clone()),
             None if self.terminal => HostVerdict::None,
-            None => HostVerdict::Crashed(exit.unwrap_or(ExitKind::Code(REAP_FAILED_CODE))),
+            None if exit == Some(ExitKind::Code(EXIT_PROTOCOL)) => HostVerdict::HostFault,
+            None => HostVerdict::Crashed(exit),
         }
     }
 
@@ -301,9 +336,6 @@ impl RunState {
         Step::Violation
     }
 }
-
-/// The exit reported as `Crashed` when the reaper failed (the diag says so).
-pub(crate) const REAP_FAILED_CODE: i32 = -1;
 
 fn violation_of(e: &DecodeError) -> ViolationKind {
     match e {
@@ -328,8 +360,11 @@ mod tests {
 
     use super::*;
 
-    fn frame(text: &str) -> (usize, Result<WorkerFrame, DecodeError>) {
-        (text.len(), decode_worker_frame(text.as_bytes()))
+    fn frame(text: &str) -> (usize, Result<Incoming, DecodeError>) {
+        (
+            text.len(),
+            decode_worker_frame(text.as_bytes()).map(Incoming::from),
+        )
     }
 
     fn call(id: u64) -> String {
@@ -419,16 +454,36 @@ mod tests {
         let s = state(4);
         assert_eq!(
             s.verdict(Some(ExitKind::Code(0))),
-            HostVerdict::Crashed(ExitKind::Code(0))
+            HostVerdict::Crashed(Some(ExitKind::Code(0)))
         );
         assert_eq!(
             s.verdict(Some(ExitKind::Signal(31))),
-            HostVerdict::Crashed(ExitKind::Signal(31))
+            HostVerdict::Crashed(Some(ExitKind::Signal(31)))
         );
+        assert_eq!(s.verdict(None), HostVerdict::Crashed(None), "exit unknown");
+        // -1 is a legal Windows exit code, distinct from an unknown exit.
         assert_eq!(
-            s.verdict(None),
-            HostVerdict::Crashed(ExitKind::Code(REAP_FAILED_CODE))
+            s.verdict(Some(ExitKind::Code(-1))),
+            HostVerdict::Crashed(Some(ExitKind::Code(-1)))
         );
+    }
+
+    /// T4 hand-off: `EXIT_PROTOCOL` without a terminal is the host's fault; a host cause and an
+    /// accepted terminal still come first.
+    #[test]
+    fn exit_protocol_is_a_host_fault_unless_decided() {
+        let protocol = Some(ExitKind::Code(EXIT_PROTOCOL));
+        assert_eq!(state(4).verdict(protocol), HostVerdict::HostFault);
+        assert!(!state(4).terminal());
+
+        let mut s = state(4);
+        assert_eq!(feed(&mut s, RESULT), Step::Terminal);
+        assert!(s.terminal());
+        assert_eq!(s.verdict(protocol), HostVerdict::None);
+
+        let mut s = state(4);
+        assert!(s.on_kill(KillCause::User));
+        assert_eq!(s.verdict(protocol), HostVerdict::Killed(KillCause::User));
     }
 
     #[test]
