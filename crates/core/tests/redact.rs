@@ -1411,6 +1411,130 @@ fn ops_that_match_nothing_block() -> TestResult {
     Ok(())
 }
 
+/// A list whose `[3]` has no `x` while the `[4]` after it has one: once `[2]` is dropped, the
+/// shown `[3]` is the source's `[4]`.
+fn shifted_list() -> Value {
+    json!({"list": [
+        {"id": 0, "x": "a0"},
+        {"id": 1},
+        {"id": 2, "x": "a2"},
+        {"id": 3},
+        {"id": 4, "x": "a4"}
+    ]})
+}
+
+fn drop_id(array_path: &str, id: Value) -> RedactionOp {
+    RedactionOp::DropItem {
+        array_path: array_path.into(),
+        key: "id".into(),
+        value: id,
+    }
+}
+
+/// M8 T19c (L123, L217): a drop appended after earlier drops of the same revision is checked for
+/// existence against the source **or** the document the earlier drops left, and acts on that
+/// document (the index semantics of the shown candidate): the set gives what applying the ops one
+/// by one to the shown candidate gives.
+#[test]
+fn drop_after_earlier_drops_checks_existence_against_current_doc() -> TestResult {
+    let source = shifted_list();
+    let tail = drop_field("list[3].x", DropScope::PerItem);
+    for first in [
+        drop_field("list[2]", DropScope::PerItem),
+        drop_id("list", json!(2)),
+    ] {
+        let shown = apply(&source, &NO_RULES, None, std::slice::from_ref(&first));
+        assert!(shown.blocked.is_empty(), "{:?}", shown.blocked);
+        let one_by_one = apply(
+            &shown.released,
+            &NO_RULES,
+            None,
+            std::slice::from_ref(&tail),
+        );
+        assert!(one_by_one.blocked.is_empty(), "{:?}", one_by_one.blocked);
+        let out = apply(&source, &NO_RULES, None, &[first.clone(), tail.clone()]);
+        assert!(out.blocked.is_empty(), "{first:?}: {:?}", out.blocked);
+        assert_eq!(out.released, one_by_one.released, "{first:?}");
+        assert_eq!(
+            out.released,
+            json!({"list": [
+                {"id": 0, "x": "a0"}, {"id": 1}, {"id": 3}, {"id": 4}
+            ]})
+        );
+        assert_eq!(out.meta.items_dropped, 1);
+        assert_eq!(out.meta.fields_dropped, vec!["x"]);
+    }
+    // An item drop whose array is named past a shifted index: the source's `groups[1].items` has
+    // no `c`, the shown one (the source's `groups[2]`) has.
+    let groups = json!({"groups": [
+        {"g": 0, "items": [{"id": "a"}]},
+        {"g": 1, "items": [{"id": "b"}]},
+        {"g": 2, "items": [{"id": "c"}, {"id": "d"}]}
+    ]});
+    let ops = [
+        drop_field("groups[0]", DropScope::PerItem),
+        drop_id("groups[1].items", json!("c")),
+    ];
+    let shown = apply(&groups, &NO_RULES, None, &ops[..1]);
+    let one_by_one = apply(&shown.released, &NO_RULES, None, &ops[1..]);
+    let out = apply(&groups, &NO_RULES, None, &ops);
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(out.released, one_by_one.released);
+    assert_eq!(
+        out.released,
+        json!({"groups": [
+            {"g": 1, "items": [{"id": "b"}]},
+            {"g": 2, "items": [{"id": "d"}]}
+        ]})
+    );
+    Ok(())
+}
+
+/// M8 T19c: fail closed. A drop that names nothing in the source **and** nothing in the document
+/// the earlier drops left is refused (`OpTargetMissing`); one the earlier ops already removed (it
+/// named something in the source) is not a mismatch.
+#[test]
+fn drop_absent_in_original_and_current_doc_is_refused() -> TestResult {
+    let source = shifted_list();
+    let first = drop_field("list[2]", DropScope::PerItem);
+    for (op, at) in [
+        // `[1]` has no `x` in either document.
+        (drop_field("list[1].x", DropScope::PerItem), "list[1].x"),
+        // Past the end of both.
+        (drop_field("list[7]", DropScope::PerItem), "list[7]"),
+        (drop_field("list[].y", DropScope::AllItems), "list[].y"),
+        // No element with that key value in either.
+        (drop_id("list", json!(9)), "list"),
+        (drop_id("list[3].sub", json!(1)), "list[3].sub"),
+    ] {
+        let out = apply(&source, &NO_RULES, None, &[first.clone(), op.clone()]);
+        assert!(
+            has_block(&out, &BlockReason::OpTargetMissing { path: at.into() }),
+            "{op:?}: {:?}",
+            out.blocked
+        );
+    }
+    // Control: a repeat of an earlier drop names something in the source; the earlier op
+    // removed it, nothing more goes and nothing blocks.
+    for repeat in [
+        drop_id("list", json!(2)),
+        drop_field("list[2].x", DropScope::PerItem),
+    ] {
+        let ops = [
+            drop_id("list", json!(2)),
+            drop_field("list[].x", DropScope::AllItems),
+            repeat,
+        ];
+        let out = apply(&source, &NO_RULES, None, &ops);
+        assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+        assert_eq!(
+            out.released,
+            json!({"list": [{"id": 0}, {"id": 1}, {"id": 3}, {"id": 4}]})
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn whatwg_reference_details() -> TestResult {
     // windows-1252 remap of numeric references 0x80-0x9F.

@@ -711,13 +711,16 @@ fn redaction_contexts() -> Vec<RedactionContextDto> {
         RedactionOp::Preset(RedactionPreset::ErrorClassOnly),
     ];
     [
+        // `flagged` (M8 T19c) is not on the wire yet: the UI half is M8 Task 24.
         RedactionContext {
             ops: Vec::new(),
             url_fields: vec!["self", "fields.attachment[].content"],
+            flagged: Vec::new(),
         },
         RedactionContext {
             ops,
             url_fields: Vec::new(),
+            flagged: Vec::new(),
         },
     ]
     .iter()

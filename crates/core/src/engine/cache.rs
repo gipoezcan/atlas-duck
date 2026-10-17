@@ -376,9 +376,10 @@ pub struct RedactionReport {
 }
 
 /// The candidate of `body` without ops, and whether the §5.3 mirror check blocks its release (a
-/// mirror entry without a counterpart). A read's first build shows such a candidate with only
-/// Deny left (T10 review I-1); every other build refuses it ([`build_redacted`]). The same bytes
-/// either way, so the hash a rebuild compares is this one.
+/// mirror entry without a counterpart). A read's first build and the [`rebuild`] of that revision
+/// show such a candidate with Release disabled (T10 review I-1; M-11: its flagged entries can be
+/// dropped); a new revision refuses it ([`build_redacted`]: undoing every redaction). The same
+/// bytes either way, so the hash a rebuild compares is this one.
 pub fn build_unredacted(
     spec: &OperationSpec,
     body: Value,
@@ -464,6 +465,12 @@ pub fn check_redacted(
 /// Rebuilds `request_id`'s candidate from its last committed candidate record (blocking: call it
 /// off the async runtime). `normalize` maps the decrypted payload to the bare body exactly as the
 /// first build did; it must read nothing but the payload.
+///
+/// The `bool` is `true` for a revision without ops whose candidate the §5.3 mirror check blocks
+/// (M5 M-11, M8 T19c): rebuilt like the first build ([`build_unredacted`]), so the approver keeps
+/// its tree and can drop the flagged entries; its release stays disabled (the caller's
+/// `rebuild_failed`). The hash comparison applies to it as to every rebuild: a mismatch is
+/// `HashMismatch`, never a tree.
 pub fn rebuild<N>(
     port: &dyn AuditPort,
     request_id: &str,
@@ -471,15 +478,20 @@ pub fn rebuild<N>(
     ops: &[RedactionOp],
     expected: &[u8; 32],
     normalize: N,
-) -> Result<Candidate, RebuildError>
+) -> Result<(Candidate, bool), RebuildError>
 where
     N: FnOnce(&Value) -> Result<Value, RebuildError>,
 {
-    let c = build_candidate(spec, source_body(port, request_id, normalize)?, ops)?;
+    let body = source_body(port, request_id, normalize)?;
+    let (c, mirror_blocked) = if ops.is_empty() {
+        build_unredacted(spec, body)?
+    } else {
+        (build_candidate(spec, body, ops)?, false)
+    };
     if &c.hash != expected {
         return Err(RebuildError::HashMismatch);
     }
-    Ok(c)
+    Ok((c, mirror_blocked))
 }
 
 /// The normalized body of `request_id`'s last committed candidate record, before any redaction

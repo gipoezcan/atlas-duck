@@ -305,12 +305,14 @@ impl Redactor<'_> {
         let Some(pat) = path::parse(array_path) else {
             return self.missing(array_path);
         };
-        // The UI offers only what is there: matching nothing in the candidate is a mismatch
-        // (e.g. a key holding `.`), not a no-op. An earlier op may have removed it already.
-        if Self::elements(self.original, &pat, key, value).is_empty() {
+        let targets = Self::elements(&self.doc, &pat, key, value);
+        // The UI offers only what is there: matching nothing is a mismatch (e.g. a key holding
+        // `.`), not a no-op. "There" is the source (an earlier op may have removed it already)
+        // or the document the earlier ops left, which an op built on the shown revision names
+        // (L123, M8 T19c).
+        if targets.is_empty() && Self::elements(self.original, &pat, key, value).is_empty() {
             return self.missing(array_path);
         }
-        let targets = Self::elements(&self.doc, &pat, key, value);
         self.drop_locs(targets, BTreeSet::new());
     }
 
@@ -334,18 +336,21 @@ impl Redactor<'_> {
             }
             copied
         };
-        let existed = !pat.resolve(self.original).is_empty()
+        let mut remove = BTreeSet::new();
+        let copied = copies_in(&self.doc, &mut remove);
+        let targets = pat.resolve(&self.doc);
+        // As for an item drop: it must name something in the source or in the document the
+        // earlier ops left (index paths resolve against the latter, the shown revision).
+        let existed = !targets.is_empty()
+            || copied
+            || !pat.resolve(self.original).is_empty()
             || copies_in(self.original, &mut BTreeSet::new());
         if !existed {
             return self.missing(field_path);
         }
-        let mut remove = BTreeSet::new();
-        if copies_in(&self.doc, &mut remove)
-            && let Some((_, x)) = &suffix
-        {
+        if copied && let Some((_, x)) = &suffix {
             self.note_field(x);
         }
-        let targets = pat.resolve(&self.doc);
         self.drop_locs(targets, remove);
     }
 

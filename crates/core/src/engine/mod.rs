@@ -1456,14 +1456,23 @@ impl Engine {
             .await
             .unwrap_or_else(|e| Err(RebuildError::Transient(e)));
         match rebuilt {
-            Ok(c) => {
+            Ok((c, mirror_blocked)) => {
                 let c = Arc::new(c);
                 // A newer revision or a terminal state meanwhile: do not cache stale bytes.
                 // Under the entry lock, so a terminal step cannot slip between the check and the
                 // insert (`after_change` removes the candidate after the model turned terminal).
-                let st = entry.state();
-                if &st.candidate_hash == c.hash() && is_pending(st.model.phase()) {
-                    self.candidates.insert(&id, c.clone());
+                let mut st = entry.state();
+                if &st.candidate_hash == c.hash() {
+                    // M-11: a revision without ops the mirror check blocks keeps its tree, never
+                    // Release. Its first build disabled Release (`read::item`); the rebuild
+                    // disables it again rather than rely on that mark.
+                    if mirror_blocked {
+                        st.rebuild_failed = true;
+                        st.model.set_approvable(false);
+                    }
+                    if is_pending(st.model.phase()) {
+                        self.candidates.insert(&id, c.clone());
+                    }
                 }
                 drop(st);
                 Ok(c)

@@ -73,7 +73,7 @@ use crate::gate::UiEvent;
 use crate::lifecycle::model::{Event, Hold, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
 use crate::ops::{ExecError, MissingField, PreviewModel, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
-use crate::redact::RedactionOp;
+use crate::redact::{BlockReason, RedactionOp};
 use crate::similarity::SimHit;
 use crate::validate::{ValidateCtx, ValidationError, echo};
 
@@ -195,6 +195,11 @@ pub struct RedactionContext {
     pub ops: Vec<RedactionOp>,
     /// The op's URL-valued field patterns (§5.3 rule 2, `RedactionRules::url_fields`).
     pub url_fields: Vec<&'static str>,
+    /// M8 T19c (M5 M-11, L217): on a revision whose candidate the §5.3 mirror check blocks
+    /// (`release_blocked`), the entries it flags (`MirrorOrphan` / `MirrorUnmatchable`, in
+    /// document order): what "drop the flagged items" drops. Paths into the shown candidate only,
+    /// never a value. Empty on every other revision.
+    pub flagged: Vec<BlockReason>,
 }
 
 impl RedactionContext {
@@ -202,6 +207,7 @@ impl RedactionContext {
         RedactionContext {
             ops,
             url_fields: spec.redaction_rules.url_fields.to_vec(),
+            flagged: Vec::new(),
         }
     }
 }
@@ -684,7 +690,9 @@ async fn read_preview(
         Ok(c) => c,
         Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
         // §5.2: the item failed closed; only Deny remains. No candidate, so no preview: the UI
-        // shows `RELEASE_BLOCKED_INTERNAL` for this refusal itself (M5 M-11).
+        // shows `RELEASE_BLOCKED_INTERNAL` for this refusal itself. A candidate the §5.3 mirror
+        // check blocks is not refused here (M-11): it is rebuilt and shown with its flagged
+        // entries, Release disabled.
         Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
     };
     let built = {
@@ -701,9 +709,14 @@ async fn read_preview(
             })
         }
     };
-    let Some((read, (shown, approvable, opened), failed, redaction)) = built else {
+    let Some((read, (shown, approvable, opened), failed, mut redaction)) = built else {
         return Ok(None);
     };
+    // M-11: a revision the mirror check failed closed shows the entries it flags (from the bytes
+    // this delivery shows), so "drop the flagged items" can be offered on its tree.
+    if failed && let Some(r) = redaction.as_mut() {
+        r.flagged = crate::redact::mirror_reasons(c.value(), &entry.spec.redaction_rules);
+    }
     let (_, cx) = read_context(engine, entry);
     let model = preview_model(&cx, &read, &c);
     let mut warnings = model.warnings;

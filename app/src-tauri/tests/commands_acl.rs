@@ -1419,9 +1419,11 @@ mod approvals_commands {
         Ok(())
     }
 
-    /// A read whose candidate was evicted and cannot be rebuilt (an orphan restricted comment)
-    /// answers `release_blocked` through the commands, on `preview_fetch` and on `raw_page`, and
-    /// the refusal logs nothing and releases nothing; a candidate that is there answers as usual.
+    /// A read whose candidate cannot be rebuilt exactly (a rebuild hash mismatch) answers
+    /// `release_blocked` through the commands, on `preview_fetch` and on `raw_page`, and the
+    /// refusal logs nothing and releases nothing. A candidate the §5.3 mirror check blocks (an
+    /// orphan restricted comment) answers both, cached or rebuilt after an eviction (M8 T19c,
+    /// M-11: its tree, where the flagged entries can be dropped), Release staying disabled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failed_rebuild_answers_release_blocked_through_the_commands() -> TestResult {
         use atlas_duck_app_lib::commands::approvals::raw_page_dto;
@@ -1451,11 +1453,22 @@ mod approvals_commands {
         )
         .await?;
         let rev = queue_get_dto(&*d, &id)?.candidate_rev;
-        // Control: while the candidate is cached both commands answer.
-        preview_fetch_dto(&*d, &id, Some(rev))?;
-        raw_page_dto(&*d, &id, rev, 0)?;
+        // The mirror-blocked candidate answers while cached and after an eviction (M-11).
+        for evict in [false, true] {
+            if evict {
+                h.evict_candidate(&id);
+            }
+            let shown = preview_fetch_dto(&*d, &id, Some(rev))?;
+            assert!(!shown.preview.approvable);
+            assert_eq!(
+                shown.preview.header.release_blocked,
+                Some(atlas_duck_core::RELEASE_BLOCKED_INTERNAL)
+            );
+            raw_page_dto(&*d, &id, rev, 0)?;
+        }
 
-        h.evict_candidate(&id);
+        assert!(h.corrupt_candidate_hash(&id));
+        let rev = queue_get_dto(&*d, &id)?.candidate_rev;
         let events = h.event_count().await?;
         assert_eq!(
             preview_fetch_dto(&*d, &id, Some(rev)).err(),

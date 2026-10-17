@@ -456,11 +456,13 @@ fn a_later_drop_moves_a_revision_single_occurrence_mask() -> TestResult {
     Ok(())
 }
 
-/// M6 T17 review I1: a drop built on what a revision shows is checked against the source as well
-/// (apply.rs `drop_field`/`drop_item`: "matching nothing in the candidate is a mismatch"). Where
-/// the path continues past an element named by index whose list the revision shortened, that
-/// check reads another element than the one shown and blocks; a path ending in that index, or
-/// one that names elements by identity, reads the same element. The panel offers only those.
+/// M6 T17 review I1, as M8 T19c changed it (L123, L217): a drop built on what a revision shows,
+/// appended to its ops, is checked for existence against the source **or** the document the
+/// earlier drops left (apply.rs `drop_field`/`drop_item`). Where the path continues past an
+/// element named by index whose list the revision shortened, the source check alone read another
+/// element than the one shown and blocked; the check against the shown document now finds the
+/// element the approver saw, and the drop acts as it does on the shown candidate. A path that
+/// names nothing in either document still blocks (fail closed).
 #[test]
 fn a_drop_past_a_shifted_index_is_checked_on_another_element() -> TestResult {
     let spec = atlas_duck_registry::get(ISSUE).ok_or("no spec")?;
@@ -477,19 +479,28 @@ fn a_drop_past_a_shifted_index_is_checked_on_another_element() -> TestResult {
     let appended =
         |round: &[RedactionOp]| -> Vec<RedactionOp> { base.iter().chain(round).cloned().collect() };
 
-    // The shown list[0] has an author, the source's list[0] has none: blocked.
+    // The shown list[0] has an author, the source's list[0] has none: the shown one goes.
     let tail = [drop_at("list[0].author")];
     let on_shown = apply(&shown.released, rules, None, &tail);
     assert!(on_shown.blocked.is_empty(), "{:?}", on_shown.blocked);
     let on_source = apply(&source, rules, None, &appended(&tail));
+    assert!(on_source.blocked.is_empty(), "{:?}", on_source.blocked);
+    assert_eq!(on_source.released, on_shown.released);
+    assert_eq!(
+        on_source.released,
+        json!({"list": [{"body": "y"}, {"body": "z", "author": "Bo"}]})
+    );
+    // A field neither the source's nor the shown list[0] has: blocked.
+    let tail = [drop_at("list[0].editor")];
+    let on_source = apply(&source, rules, None, &appended(&tail));
     assert!(
-        op_target_missing(&on_source.blocked, "list[0].author"),
+        op_target_missing(&on_source.blocked, "list[0].editor"),
         "{:?}",
         on_source.blocked
     );
 
-    // Offered: the element itself by index (again `list[0]`, a repeat of the base op) and a
-    // field across all items (no index left to read).
+    // The element itself by index (again `list[0]`, a repeat of the base op) and a field across
+    // all items (no index left to read) act as on the shown candidate too.
     for round in [
         vec![drop_at("list[0]")],
         vec![RedactionOp::DropField {
@@ -511,6 +522,244 @@ fn a_drop_past_a_shifted_index_is_checked_on_another_element() -> TestResult {
         repeat.released,
         json!({"list": [{"body": "z", "author": "Bo"}]})
     );
+    Ok(())
+}
+
+// ---- M-11: a mirror-blocked item offers its tree and the flagged entries (M8 T19c, L217) ---------
+
+/// The read params that fetch an issue with its comments and their rendered mirror.
+fn rendered_comments(key: &str) -> Value {
+    json!({ "key": key, "fields": ["summary", "comment"], "rendered": true })
+}
+
+/// An issue whose rendered comment mirror holds two entries (ids 9 and 11, at `[1]` and `[3]`)
+/// that `fields.comment.comments` lacks (§5.3 "a mirror entry … which has no counterpart at
+/// all"); the first is restricted.
+fn two_orphans(key: &str) -> Value {
+    let mut issue = full_issue(key);
+    issue["fields"]["comment"] = json!({
+        "total": 2, "startAt": 0, "maxResults": 50,
+        "comments": [{"id": "7", "body": "plain"}, {"id": "8", "body": "other"}]
+    });
+    issue["renderedFields"] = json!({"comment": {"comments": [
+        {"id": "7", "body": "<p>plain</p>"},
+        {"id": "9", "body": "<p>orphan</p>", "visibility": common::jira::restriction()},
+        {"id": "8", "body": "<p>other</p>"},
+        {"id": "11", "body": "<p>second orphan</p>"}
+    ]}});
+    issue
+}
+
+fn orphan_at(i: usize) -> BlockReason {
+    BlockReason::MirrorOrphan {
+        path: format!("renderedFields.comment.comments[{i}]"),
+    }
+}
+
+/// A plain release of `id` is refused as not approvable and nothing is released.
+async fn plain_release_refused(h: &Harness, id: &str) -> TestResult {
+    let res = h.approver().release_unopened(id);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    assert!(records(h, id, EventType::READ_RELEASED).await?.is_empty());
+    Ok(())
+}
+
+/// M5 M-11 as M8 closes it: a candidate the §5.3 mirror check blocks is `release_blocked`
+/// (`internal` banner, not approvable) and still answers `preview_fetch` and `raw_page`, also when
+/// it was evicted and is rebuilt: the tree of the source (the candidate of a revision without ops)
+/// and, in the delivery's redaction context, the entries the check flags, as paths only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_mirror_release_blocked_offers_drop_flagged_items_tree() -> TestResult {
+    use atlas_duck_core::RELEASE_BLOCKED_INTERNAL;
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &two_orphans(KEY)).await;
+    let id = queued(&h, ISSUE, rendered_comments(KEY)).await?;
+    let ap = h.approver();
+    let flagged = vec![orphan_at(1), orphan_at(3)];
+    // The banner text M6 shows for it (L125): it names the way out this test offers.
+    assert!(RELEASE_BLOCKED_INTERNAL.ends_with("drop the flagged items"));
+    let mut trees = Vec::new();
+    for evicted in [false, true] {
+        if evicted {
+            h.evict_candidate(&id);
+        }
+        let delivery = ap.open(&id).map_err(de)?;
+        let preview = &delivery.preview;
+        assert!(!preview.approvable, "evicted {evicted}");
+        assert_eq!(
+            preview.header.release_blocked,
+            Some(RELEASE_BLOCKED_INTERNAL)
+        );
+        let ctx = delivery
+            .redaction
+            .ok_or("a read result has a redaction context")?;
+        assert!(ctx.ops.is_empty());
+        assert_eq!(ctx.flagged, flagged, "evicted {evicted}");
+        // Paths only: nothing of the flagged entries' content is in what is reported.
+        let reported = serde_json::to_string(&ctx.flagged)?;
+        for value in ["<p>", "Administrators", "role", "\"9\"", "\"11\""] {
+            assert!(!reported.contains(value), "{value} in {reported}");
+        }
+        // The tree: the source as fetched, the flagged entries at the reported places.
+        let tree = candidate(&h, &id)?;
+        let mirrored = &tree["renderedFields"]["comment"]["comments"];
+        assert_eq!(mirrored[1]["id"], json!("9"));
+        assert_eq!(mirrored[3]["id"], json!("11"));
+        assert_eq!(preview.candidate_rev, ap.rev(&id).map_err(de)?);
+        trees.push(tree);
+    }
+    assert_eq!(trees[0], trees[1], "the rebuild is the same tree");
+    assert!(
+        h.engine().candidates().contains(&id),
+        "the rebuild is cached"
+    );
+    // Still failed closed: not approvable, a plain release refused, Deny works.
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+    plain_release_refused(&h, &id).await?;
+    // Defence: a rebuild the mirror check fails disables Release itself, also were the first
+    // build's mark lost.
+    let entry = h.engine().entry(&id).ok_or("not in memory")?;
+    entry.state().rebuild_failed = false;
+    h.evict_candidate(&id);
+    let again = ap.open(&id).map_err(de)?.preview;
+    assert_eq!(again.header.release_blocked, Some(RELEASE_BLOCKED_INTERNAL));
+    assert!(entry.state().rebuild_failed);
+    // A clean candidate flags nothing.
+    mount_issue(jira(&h)?, "ABC-8", &full_issue("ABC-8")).await;
+    let clean = queued(&h, ISSUE, json!({ "key": "ABC-8" })).await?;
+    let delivery = ap.open(&clean).map_err(de)?;
+    assert!(delivery.preview.approvable);
+    assert!(delivery.redaction.ok_or("read")?.flagged.is_empty());
+    ap.deny_unopened(&id, "cannot be released").map_err(de)?;
+    assert_eq!(h.await_(&id, 5000).await.status, Status::Denied);
+    Ok(())
+}
+
+/// M-11: dropping the flagged entries (in one round, by index on the shown candidate, highest
+/// index first, so each index still names the entry it was reported for) gives a revision the
+/// mirror check passes: approvable, no banner, nothing flagged, released without them. Without
+/// the drops, or with drops of other entries, or with the index drops in ascending order (the
+/// second then names nothing on the document the first left), it stays blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m11_dropping_flagged_items_makes_the_mirror_candidate_releasable() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &two_orphans(KEY)).await;
+    let id = queued(&h, ISSUE, rendered_comments(KEY)).await?;
+    let ap = h.approver();
+    let ctx = ap.open(&id).map_err(de)?.redaction.ok_or("read")?;
+    let mut paths: Vec<String> = ctx.flagged.iter().map(|b| b.path().to_owned()).collect();
+    assert_eq!(paths.len(), 2);
+    // Without drops: the same reasons, and a plain release is refused.
+    let report = ap.redaction_preview(&id, &[]).map_err(de)?;
+    assert_eq!(report.blocked, ctx.flagged);
+    plain_release_refused(&h, &id).await?;
+    // Other entries dropped: the mirror check runs on the result and still blocks.
+    for other in [
+        vec![drop_at("fields.comment.comments[0]")],
+        vec![drop_at("renderedFields.comment.comments[2]")],
+    ] {
+        let report = ap.redaction_preview(&id, &other).map_err(de)?;
+        assert!(
+            !report.blocked.is_empty()
+                && report
+                    .blocked
+                    .iter()
+                    .all(|b| matches!(b, BlockReason::MirrorOrphan { .. })),
+            "{other:?}: {report:?}"
+        );
+        let res = ap.redact(&id, other);
+        assert!(
+            matches!(
+                res,
+                Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+            ),
+            "{res:?}"
+        );
+    }
+    // Ascending: the second index drop names the source's [3], gone from the shown document.
+    let ascending: Vec<RedactionOp> = paths.iter().map(|p| drop_at(p)).collect();
+    let report = ap.redaction_preview(&id, &ascending).map_err(de)?;
+    assert_eq!(report.blocked, vec![orphan_at(2)], "{report:?}");
+    // Descending: both flagged entries go; the check passes.
+    paths.reverse();
+    let drops: Vec<RedactionOp> = paths.iter().map(|p| drop_at(p)).collect();
+    let report = ap.redaction_preview(&id, &drops).map_err(de)?;
+    assert!(report.blocked.is_empty(), "{report:?}");
+    // Sent after an eviction (the source is rebuilt from the record): a new revision.
+    h.evict_candidate(&id);
+    let rev = ap.redact(&id, drops.clone()).map_err(de)?;
+    let shown = h.decisions().preview_fetch(&id, Some(rev)).map_err(de)?;
+    assert!(shown.preview.approvable);
+    assert_eq!(shown.preview.header.release_blocked, None);
+    let ctx = shown.redaction.ok_or("read")?;
+    assert_eq!(ctx.ops, drops);
+    assert!(ctx.flagged.is_empty());
+    let mirrored = &candidate(&h, &id)?["renderedFields"]["comment"]["comments"];
+    assert_eq!(
+        mirrored,
+        &json!([
+            {"id": "7", "body": "<p>plain</p>"},
+            {"id": "8", "body": "<p>other</p>"}
+        ])
+    );
+    // A plain release of the redacted revision goes through.
+    ap.release(&id).map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    let text = env.to_json_line();
+    for gone in ["orphan", "Administrators"] {
+        assert!(!text.contains(gone), "{gone}: {text}");
+    }
+    Ok(())
+}
+
+/// §5.2 unchanged by M-11: a revision whose rebuild does not reproduce its hash (here a corrupted
+/// revision hash; a clean candidate and a mirror-blocked one alike) answers no tree and nothing
+/// flagged: `preview_fetch` and `raw_page` are refused as not approvable, a release too, the item
+/// is not approvable and only Deny remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_mismatch_release_blocked_stays_deny_only() -> TestResult {
+    let h = Harness::jira().await?;
+    let mock = jira(&h)?;
+    mount_issue(mock, KEY, &full_issue(KEY)).await;
+    mount_issue(mock, "ABC-8", &two_orphans("ABC-8")).await;
+    let ap = h.approver();
+    for params in [json!({ "key": KEY }), rendered_comments("ABC-8")] {
+        let id = queued(&h, ISSUE, params).await?;
+        ap.open(&id).map_err(de)?;
+        assert!(h.corrupt_candidate_hash(&id));
+        let rev = ap.rev(&id).map_err(de)?;
+        let count = h.event_count().await?;
+        let res = h.decisions().preview_fetch(&id, Some(rev));
+        assert!(
+            matches!(
+                res,
+                Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+            ),
+            "{id}: {res:?}"
+        );
+        let res = h.decisions().raw_page(&id, rev, 0);
+        assert!(
+            matches!(
+                res,
+                Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+            ),
+            "{id}: {res:?}"
+        );
+        assert_eq!(h.event_count().await?, count, "the refusals log nothing");
+        assert!(!h.engine().candidates().contains(&id), "nothing cached");
+        assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+        plain_release_refused(&h, &id).await?;
+        assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+        ap.deny_unopened(&id, "rebuild failed").map_err(de)?;
+        assert_eq!(h.await_(&id, 5000).await.status, Status::Denied);
+    }
     Ok(())
 }
 
