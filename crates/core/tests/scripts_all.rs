@@ -9,6 +9,7 @@ mod common;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use atlas_duck_atlassian::testing::fixtures;
 use atlas_duck_audit::EventType;
 use atlas_duck_core::audit_port::AuditPort;
 use atlas_duck_core::testing::{FakeScriptRunner, Harness, ScriptPlan, host_call};
@@ -273,6 +274,90 @@ async fn i22_all_native_shape_items_concatenated_totals_unchanged() -> TestResul
     assert_eq!(
         names,
         ["expand", "issues", "maxResults", "startAt", "total"]
+    );
+    Ok(())
+}
+
+/// The paged `GET /rest/agile/1.0/board` answer, keyed on the query's `startAt`/`maxResults`:
+/// `total` boards, `isLast` true only on the page that ends them.
+struct Boards {
+    template: ResponseTemplate,
+    total: u64,
+    /// `(startAt, maxResults)` of each request.
+    hits: Arc<Mutex<Vec<(u64, u64)>>>,
+}
+
+impl Respond for Boards {
+    fn respond(&self, r: &Request) -> ResponseTemplate {
+        let query = |key: &str| {
+            r.url
+                .query_pairs()
+                .find(|(k, _)| k == key)
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        };
+        let start = query("startAt").unwrap_or(0);
+        let max = query("maxResults").unwrap_or(50);
+        self.hits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((start, max));
+        let count = max.min(self.total.saturating_sub(start));
+        let body = fixtures::jira_board_page(start, max, Some(self.total), count);
+        self.template.clone().set_body_raw(body, "application/json")
+    }
+}
+
+/// T13 review I-2: an Agile `values` op over several pages answers `isLast` as the last page sent
+/// it, like the totals: after a complete `atlas.all` the script is never told more results follow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_agile_values_take_is_last_from_the_last_page() -> TestResult {
+    let mut call = host_call(1, "jira.board.list", json!({ "max": 2 }));
+    call.all = true;
+    let (h, runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
+    let mock = h.mock("jira-main").ok_or("no jira mock")?;
+    let hits = Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/agile/1.0/board")))
+        .respond_with(Boards {
+            template: mock.response(200),
+            total: 5,
+            hits: hits.clone(),
+        })
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(
+        hits.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+        [(0, 2), (2, 2), (4, 2)]
+    );
+    let result = match runner.results().as_slice() {
+        [HostCallResult::Ok(v)] => v.clone(),
+        other => return Err(format!("unexpected answers: {:?}", outline(other)).into()),
+    };
+    // Page 0 said `isLast: false`; the last page ended the results.
+    assert_eq!(result["isLast"], true, "{result}");
+    let names: Vec<&str> = result["values"]
+        .as_array()
+        .ok_or("no values")?
+        .iter()
+        .filter_map(|b| b["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["Board 1", "Board 2", "Board 3", "Board 4", "Board 5"]
+    );
+    assert_eq!(result["total"], 5);
+    assert_eq!(result["startAt"], 0);
+    assert_eq!(result["maxResults"], 2);
+    let mut keys: Vec<&String> = result.as_object().ok_or("not an object")?.keys().collect();
+    keys.sort();
+    assert_eq!(keys, ["isLast", "maxResults", "startAt", "total", "values"]);
+    let calls = script_calls(&h, &id).await?;
+    assert_eq!(
+        calls.iter().map(|c| c["page"].clone()).collect::<Vec<_>>(),
+        [json!(0), json!(1), json!(2)]
     );
     Ok(())
 }

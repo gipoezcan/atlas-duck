@@ -1683,9 +1683,10 @@ enum PageNext {
     Answer(HostCallResult),
 }
 
-/// The keys of a page that are server totals (PD-144: the result takes them from the last page);
-/// the paging client reads the same two.
-const TOTAL_KEYS: [&str; 2] = ["total", "totalSize"];
+/// The keys of a page that say where the results stand (PD-144: the result takes them from the
+/// last page): the server totals the paging client reads, and the Agile `isLast` (T13 review
+/// I-2: page 0's `false` would tell the script more results follow a complete `atlas.all`).
+const TOTAL_KEYS: [&str; 3] = ["total", "totalSize", "isLast"];
 
 /// The result of an `atlas.all` call while its pages arrive (PD-144): the first page's object
 /// with an empty items array (the skeleton), the normalized items of every page so far, and the
@@ -1712,8 +1713,8 @@ impl AllResult {
         }
     }
 
-    /// Adds one page's normalized object; `last` = the page ended the results, so its totals
-    /// become the result's. `false` = the result would exceed `max_bytes`: nothing of the page
+    /// Adds one page's normalized object; `last` = the page ended the results, so its
+    /// [`TOTAL_KEYS`] become the result's. `false` = the result would exceed `max_bytes`: nothing of the page
     /// is added.
     fn add(&mut self, mut page: Value, last: bool) -> bool {
         let items = match page.get_mut(self.items_key).map(Value::take) {
