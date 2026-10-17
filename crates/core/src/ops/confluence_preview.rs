@@ -1363,6 +1363,6 @@ pub(crate) fn labels_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: None,
         requests,
     };
-    model.header.hidden_in_preview_bytes = cut;
+    model.header.hidden_in_preview_bytes = model.header.hidden_in_preview_bytes.saturating_add(cut);
     model
 }

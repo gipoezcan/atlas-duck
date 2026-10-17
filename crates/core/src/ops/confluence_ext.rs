@@ -166,6 +166,9 @@ pub fn comment_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
 /// The content the labels go on or come off: one GET with its labels (`metadata.labels`).
 const LABELS_PATH: &str = "/rest/api/content/{id}";
 
+/// The embedded label list's page size when the answer names none (the server's default).
+const LABELS_PAGE_CAP: u64 = 200;
+
 /// PD-108: one enrichment GET (`enrich`) reads the content's title and its current labels, for the
 /// card only (the "already present" / "not present" rows). Nothing sent depends on it, but a write
 /// is rendered only after a usable answer for this very id. No stale rule (§5.4 step 5: additive
@@ -213,6 +216,27 @@ fn labels_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
         return EnrichVerdict::unusable();
     };
     let id = str_param(ctx.params, "id");
+    // The answer must be about this content, and the label list must be all of it: a full page
+    // (the server's `limit`, 200 when it names none) or a further page means labels are unread,
+    // so no "not present" can be claimed (T19 review M-5, M-7).
+    let list = content.pointer("/metadata/labels");
+    let count = |key: &str| {
+        list.and_then(|l| l.get(key))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let limit = list
+        .and_then(|l| l.get("limit"))
+        .and_then(Value::as_u64)
+        .unwrap_or(LABELS_PAGE_CAP);
+    let shown = u64::try_from(results.len()).unwrap_or(u64::MAX);
+    let more = list.is_some_and(|l| l.pointer("/_links/next").is_some())
+        || count("size") > shown
+        || count("totalSize") > shown
+        || shown >= limit;
+    if content.get("id").and_then(Value::as_str) != Some(id) || more {
+        return EnrichVerdict::unusable();
+    }
     let title = content.get("title").and_then(Value::as_str).map(capped);
     let mut resolved = Map::new();
     resolved.insert("id".to_owned(), Value::from(id));
@@ -249,14 +273,32 @@ fn labels_verdict<'a>(ctx: &'a ExecCtx<'_>) -> Result<&'a EnrichVerdict, ExecErr
 /// params' order (§7.4, PD-108): one entry per label, exactly as the agent wrote it.
 pub fn label_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
     resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
-    let labels: Vec<&str> = ctx
+    let items = ctx
         .params
         .get("labels")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .map(Vec::as_slice)
         .unwrap_or_default();
+    let labels: Vec<&str> = items.iter().filter_map(Value::as_str).collect();
     if labels.is_empty() {
         return Err(ExecError::Invalid(invalid("labels", "required", None)));
+    }
+    // The body is the approver's contract: nothing is dropped from it (a non-string entry), and
+    // one label is not sent twice under two cases. Validation checks both; this is the second line.
+    if labels.len() != items.len() {
+        return Err(ExecError::Invalid(invalid(
+            "labels",
+            "labels must be strings",
+            None,
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !labels.iter().all(|l| seen.insert(l.to_ascii_lowercase())) {
+        return Err(ExecError::Invalid(invalid(
+            "labels",
+            "labels must be distinct ignoring case",
+            None,
+        )));
     }
     labels_verdict(ctx)?;
     let body: Vec<Value> = labels

@@ -75,6 +75,27 @@ pub(super) fn check(spec: &OperationSpec, params: &Value) -> Result<(), Validati
     if spec.conflict_baselines.contains(&"expected") {
         check_map_keys("expected", params, false)?;
     }
+    if spec.id == "confluence.label.add" {
+        check_distinct_labels(params)?;
+    }
+    Ok(())
+}
+
+/// T19 review M-1: Confluence folds label names to lower case, so `Release` and `release` in one
+/// add are one label shown as two (card, receipt). The schema's `uniqueItems` is case-sensitive;
+/// the names themselves are never rewritten.
+pub(crate) fn check_distinct_labels(params: &Value) -> Result<(), ValidationError> {
+    let mut seen = std::collections::HashSet::new();
+    let labels = params.get("labels").and_then(Value::as_array);
+    for text in labels.into_iter().flatten().filter_map(Value::as_str) {
+        if !seen.insert(text.to_ascii_lowercase()) {
+            return Err(invalid(
+                "labels",
+                "labels must be distinct ignoring case",
+                None,
+            ));
+        }
+    }
     Ok(())
 }
 

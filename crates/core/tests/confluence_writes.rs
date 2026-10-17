@@ -966,8 +966,10 @@ fn labelled_page() -> Value {
                 {"prefix": "global", "name": "release", "id": "1"},
                 {"prefix": "global", "name": "Docs", "id": "2"},
                 {"prefix": "my", "name": "mine", "id": "3"},
+                {"name": "bare", "id": "4"},
+                {"prefix": "global", "name": "team:alpha", "id": "5"},
             ],
-            "start": 0, "limit": 200, "size": 3,
+            "start": 0, "limit": 200, "size": 5,
         }},
     })
 }
@@ -1128,7 +1130,11 @@ fn label_judge_keeps_global_labels_and_fails_closed() -> TestResult {
         .as_ref()
         .and_then(|s| s.confluence.as_ref())
         .ok_or("no facts")?;
-    assert_eq!(facts.current_labels, ["release", "Docs"], "no `my:` label");
+    assert_eq!(
+        facts.current_labels,
+        ["release", "Docs", "bare", "team:alpha"],
+        "no `my:` label; a label without a prefix counts as global"
+    );
     assert_eq!(
         facts
             .page
@@ -1141,6 +1147,34 @@ fn label_judge_keeps_global_labels_and_fails_closed() -> TestResult {
         json!({"id": ID, "type": "page", "title": "T"}),
         json!({"id": ID, "metadata": {"labels": {"results": "x"}}}),
         json!([]),
+        // Not this content: the answer's own id is not the param's (T19 review M-7).
+        {
+            let mut other = labelled_page();
+            other["id"] = json!("999");
+            other
+        },
+        // A full or further page: absence cannot be claimed (T19 review M-5).
+        {
+            let mut full = labelled_page();
+            full["metadata"]["labels"]["limit"] = json!(5);
+            full
+        },
+        {
+            let mut next = labelled_page();
+            next["metadata"]["labels"]["_links"] =
+                json!({"next": "/rest/api/content/1/label?start=5"});
+            next
+        },
+        {
+            let mut total = labelled_page();
+            total["metadata"]["labels"]["totalSize"] = json!(6);
+            total
+        },
+        {
+            let mut size = labelled_page();
+            size["metadata"]["labels"]["size"] = json!(6);
+            size
+        },
     ] {
         let v = label_staged(LABEL_ADD, &p, &[bad])?;
         assert_eq!(v.hold, Hold::EnrichmentError);
@@ -1296,6 +1330,41 @@ fn label_cards() -> TestResult {
     // A personal label of the same name is not the global one a remove by name touches.
     let m = label_card(LABEL_REMOVE, &remove_params("mine"))?;
     assert_eq!(summary(&m)?.1.len(), 2);
+
+    // A colon label travels as `team%3Aalpha`; the card shows and compares the decoded name.
+    let m = label_card(LABEL_REMOVE, &remove_params("Team:alpha"))?;
+    let (sentence, rows) = summary(&m)?;
+    assert_eq!(sentence, "Remove label Team:alpha from 'Release checklist'");
+    assert_eq!(rows.len(), 1, "present (case-insensitively): {rows:?}");
+    let m = label_card(LABEL_REMOVE, &remove_params("team:beta"))?;
+    assert_eq!(
+        summary(&m)?.1.last(),
+        Some(&("Not present".to_owned(), "team:beta".to_owned()))
+    );
+    // A label the server lists without a prefix is a global one.
+    let m = label_card(LABEL_ADD, &add_params(&["bare"]))?;
+    assert_eq!(
+        summary(&m)?.1.last(),
+        Some(&("Already present".to_owned(), "bare".to_owned()))
+    );
+    Ok(())
+}
+
+/// A non-string entry would be dropped from the body the approver sees: the executor refuses it
+/// (T19 review M-6), as it refuses labels that differ only in case (M-1; an edit reaches the
+/// executor through the same validation, this is the second line).
+#[test]
+fn label_add_executor_refuses_what_it_would_drop() -> TestResult {
+    for labels in [json!(["a", 1]), json!(["a", null]), json!(["a", "A"])] {
+        let p = json!({"id": ID, "labels": labels});
+        let v = label_verdict(LABEL_ADD, &add_params(&["a"]))?;
+        match label_exec(LABEL_ADD, &p, Some(&v)) {
+            Err(ExecError::Invalid(e)) => {
+                assert_eq!(e.details.get("param"), Some(&json!("labels")), "{labels}");
+            }
+            other => return Err(format!("{labels}: {other:?}").into()),
+        }
+    }
     Ok(())
 }
 
@@ -1595,9 +1664,9 @@ async fn label_remove_missing_label_is_the_servers_404() -> TestResult {
 }
 
 /// Label names are checked by the params schema before anything is fetched: the allowed
-/// characters, 255 characters, 1 to 20 distinct labels (distinct case-sensitively: Confluence folds
-/// case, so `A` and `a` are sent as two entries and the server keeps one), and `.`/`..` for a
-/// remove (the URL builder).
+/// characters (a trailing newline included), 255 characters, 1 to 20 labels distinct ignoring case
+/// (Confluence folds case, so `A` and `a` would be one label shown as two; the names are never
+/// lower-cased, the agent's text is what is sent), and `.`/`..` for a remove (the URL builder).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn label_names_validated_before_any_hit() -> TestResult {
     let h = Harness::confluence().await?;
@@ -1612,6 +1681,13 @@ async fn label_names_validated_before_any_hit() -> TestResult {
         (LABEL_ADD, json!({"id": ID, "labels": ["slash/x"]})),
         (LABEL_ADD, json!({"id": ID, "labels": ["tab\t"]})),
         (LABEL_ADD, json!({"id": ID, "labels": ["a", "a"]})),
+        (LABEL_ADD, json!({"id": ID, "labels": ["A", "a"]})),
+        (
+            LABEL_ADD,
+            json!({"id": ID, "labels": ["x", "Release", "b", "release"]}),
+        ),
+        (LABEL_ADD, json!({"id": ID, "labels": ["a\n"]})),
+        (LABEL_REMOVE, json!({"id": ID, "label": "a\n"})),
         (LABEL_ADD, json!({"id": ID, "labels": [long.clone()]})),
         (LABEL_ADD, json!({"id": ID, "labels": many})),
         (LABEL_ADD, json!({"id": "abc", "labels": ["a"]})),
@@ -1633,11 +1709,18 @@ async fn label_names_validated_before_any_hit() -> TestResult {
         assert_eq!(code(&env), "validation", "{op} {params}");
         assert_eq!(exit(&env), 2, "{op} {params}");
     }
+    let env = h.submit(LABEL_ADD, add_params(&["A", "a"])).await;
+    assert_eq!(
+        detail(&env, "param"),
+        json!("labels"),
+        "{}",
+        env.to_json_line()
+    );
     assert_eq!(mock.received().await.len(), before, "no wiremock hit");
     Ok(())
 }
 
-/// §5.4 step 5: no stale rule, but the pre-write identity call still runs for a label write.
+///§5.4 step 5: no stale rule, but the pre-write identity call still runs for a label write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn label_write_identity_call_runs() -> TestResult {
     let h = Harness::confluence().await?;

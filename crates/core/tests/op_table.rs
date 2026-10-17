@@ -980,6 +980,10 @@ fn executors_deterministic() -> TestResult {
         assert_eq!(a[0].index, 0);
         if a[0].method == "DELETE" {
             // The only DELETE (§1.3): no body and no content type.
+            assert_eq!(
+                id, "confluence.label.remove",
+                "only the label remove may DELETE"
+            );
             assert!(a[0].content_type.is_none() && a[0].body.is_empty(), "{id}");
             continue;
         }
