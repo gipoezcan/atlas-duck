@@ -208,7 +208,22 @@ impl InstanceClient {
         max_items: u64,
         ctl: &FetchControl,
     ) -> PagedOutcome {
-        self.paginate(cover, PageSource::Get(call), budget, max_items, ctl)
+        self.paginate(cover, PageSource::Get(call), budget, max_items, ctl, false)
+            .await
+    }
+
+    /// One page of `call` at `call.start` (`call.page_size` items asked), as `read_paginated_ctl`
+    /// would fetch it, and never a second request: a page the server clamped or cut short ends
+    /// with `PageEnd::MaxReached` and the continuation in `next_start` (`atlas.all` commits each
+    /// page before it asks for the next, M8 PD-144).
+    pub async fn read_page_ctl(
+        &self,
+        cover: &AuditCover,
+        call: &PagedCall,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+    ) -> PagedOutcome {
+        self.paginate(cover, PageSource::Get(call), budget, u64::MAX, ctl, true)
             .await
     }
 
@@ -225,9 +240,25 @@ impl InstanceClient {
         ctl: &FetchControl,
     ) -> PagedOutcome {
         let source = PageSource::Search { call, items_key };
-        self.paginate(cover, source, budget, max_items, ctl).await
+        self.paginate(cover, source, budget, max_items, ctl, false)
+            .await
     }
 
+    /// [`Self::read_page_ctl`] for `jira.search`: one page at the body's `startAt`.
+    pub async fn read_search_page_ctl(
+        &self,
+        cover: &AuditCover,
+        call: &SearchCall,
+        items_key: &str,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+    ) -> PagedOutcome {
+        let source = PageSource::Search { call, items_key };
+        self.paginate(cover, source, budget, u64::MAX, ctl, true)
+            .await
+    }
+
+    /// `one_page`: stop after the first 2xx page whatever it says about the results.
     async fn paginate(
         &self,
         cover: &AuditCover,
@@ -235,6 +266,7 @@ impl InstanceClient {
         budget: &ReadBudget,
         max_items: u64,
         ctl: &FetchControl,
+        one_page: bool,
     ) -> PagedOutcome {
         // One deadline for all pages and every 429 wait (§7.2: 120 s per read request).
         let deadline = Instant::now() + budget.total;
@@ -374,6 +406,11 @@ impl InstanceClient {
             if ended {
                 out.end = PageEnd::ResultsEnded;
                 out.next_start = None;
+                return out;
+            }
+            if one_page {
+                out.end = PageEnd::MaxReached;
+                out.next_start = Some(start);
                 return out;
             }
             // The server clamped the page: ask for its size from now on.

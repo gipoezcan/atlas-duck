@@ -727,8 +727,9 @@ fn classify_failure(
     }
 }
 
-/// A direct failure on a later page becomes an outcome item (`internal` stays direct).
-fn gate_later(d: Direct, later_page: bool) -> Classified {
+/// A direct failure on a later page becomes an outcome item (`internal` stays direct); also each
+/// later page of a script's `atlas.all` (M8 PD-144).
+pub(super) fn gate_later(d: Direct, later_page: bool) -> Classified {
     if later_page && d.code != ErrorCode::Internal {
         Classified::Item(gated(d))
     } else {

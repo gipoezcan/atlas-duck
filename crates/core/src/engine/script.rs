@@ -19,9 +19,10 @@
 //! **Host calls** ([`LiveBackend`]). Validated by [`EngineValidator`] (Read class, schema, field
 //! rules, caps with `for_script`, instance routing, the op's own static checks); the first
 //! accepted call commits `SCRIPT_CALL_SENT` before anything is sent (the run is *dispatched*);
-//! each call commits `SCRIPT_CALL` and only then returns its result. An append that fails kills
-//! the run (`SCRIPT_FAILED {audit_failure}`, terminal). Dry runs ([`DryRunBackend`]) answer from
-//! the registry's examples and hold no client handle.
+//! each call commits `SCRIPT_CALL` and only then returns its result (`atlas.all`: one
+//! `SCRIPT_CALL {page}` per page, each before the next page is requested). An append that fails
+//! kills the run (`SCRIPT_FAILED {audit_failure}`, terminal). Dry runs ([`DryRunBackend`]) answer
+//! from the registry's examples and hold no client handle.
 //!
 //! **Ends** ([`classify`]). Decided by the host from its own state (§9.5): a compile failure, or
 //! a host-measured limit or a spawn-time unavailability of a run that neither queued nor
@@ -38,7 +39,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use atlas_duck_atlassian::{FetchControl, ReadBudget};
+use atlas_duck_atlassian::{
+    AuditCover, FetchControl, InstanceClient, PagedCall, ReadBudget, SearchCall,
+};
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use atlas_duck_ipc::proto::{ConnectionMeta, SubmitParams, params_sha256};
@@ -460,11 +463,22 @@ pub(crate) struct CallInfo {
     pub alias: String,
     pub instance_id: String,
     pub user_key: Option<String>,
+    /// The page of an `atlas.all` call (PD-144).
+    pub page: Option<u32>,
 }
 
 struct InFlight {
     info: CallInfo,
     ctl: FetchControl,
+}
+
+/// Whether the next page of an `atlas.all` call may be requested ([`RunShared::begin_page`]).
+enum PageStart {
+    Go,
+    /// The run ended or its kill was asked.
+    Stopped,
+    MaxCalls,
+    MaxFetch,
 }
 
 #[derive(Default)]
@@ -581,6 +595,34 @@ impl RunShared {
             .insert(info.call_id, InFlight { info, ctl });
     }
 
+    /// Puts the next page of an `atlas.all` call in flight (PD-144), in one critical section with
+    /// the checks that may refuse it: the run ended or a kill was asked (the end, which takes the
+    /// calls in flight only after one of the two, would never see this page), then with
+    /// `limits = Some((max_calls, fetch_cap))` the page that would exceed `max_calls` and the
+    /// run's fetched bytes at the cap. Only a page that goes is counted.
+    fn begin_page(
+        &self,
+        info: CallInfo,
+        ctl: FetchControl,
+        limits: Option<(u32, u64)>,
+    ) -> PageStart {
+        let mut g = lock(&self.inner);
+        if g.ended || g.kill.is_some() {
+            return PageStart::Stopped;
+        }
+        if let Some((max_calls, fetch_cap)) = limits {
+            if g.calls.saturating_add(1) > max_calls {
+                return PageStart::MaxCalls;
+            }
+            if g.fetched_bytes >= fetch_cap {
+                return PageStart::MaxFetch;
+            }
+            g.calls = g.calls.saturating_add(1);
+        }
+        g.in_flight.insert(info.call_id, InFlight { info, ctl });
+        PageStart::Go
+    }
+
     /// `false` = the end of the run took the call (it records it itself). Called under the
     /// entry's gate, right before the call's own record is appended.
     fn finish_in_flight(&self, call_id: u64) -> bool {
@@ -629,6 +671,7 @@ impl RunShared {
                     instance: Some(&info.alias),
                     user_key: info.user_key.as_deref(),
                     rejection: Some("cancelled_in_flight"),
+                    page: info.page,
                 },
                 &ReadFetched::CancelledInFlight {
                     reason,
@@ -1055,6 +1098,9 @@ impl LiveBackend {
         if let Err(r) = self.ensure_dispatched(&call, &vc).await {
             return r;
         }
+        if call.all {
+            return self.execute_all(call, vc).await;
+        }
         self.execute(call, vc).await
     }
 
@@ -1066,12 +1112,13 @@ impl LiveBackend {
             alias: vc.alias.clone(),
             instance_id: vc.instance_id.clone(),
             user_key: vc.user_key.clone(),
+            page: None,
         };
         let ctl = FetchControl::new();
         // The control first, then the cover: a cancel that took the control before it exists
         // finds nothing in flight and a request that ended mints no cover (Task 24 rule).
         self.shared.add_in_flight(info.clone(), ctl.clone());
-        let classified = match self.fetch(&call, &vc, &ctl).await {
+        let classified = match self.fetch(&call, &vc, &ctl, None).await {
             Ok(c) => c,
             Err(result) => {
                 self.shared.finish_in_flight(call.id);
@@ -1102,14 +1149,157 @@ impl LiveBackend {
         }
     }
 
+    /// `atlas.all` (PD-144, §9.2): the op's pages, one request at a time. Each page is in flight
+    /// like a call (a cancel records it `cancelled_in_flight`) and commits its own
+    /// `SCRIPT_CALL {call_id, page}` before the next page is requested; every page counts
+    /// against `max_calls` and `max_fetch_mb`. The script gets the op's native shape or a
+    /// catchable rejection with no partial data; the pages committed so far stay in the log.
+    async fn execute_all(&self, call: HostCall, vc: ValidatedCall) -> HostCallResult {
+        let Some(paging) = vc.spec.paginated else {
+            return rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
+        };
+        let fetch_cap = u64::from(self.limits.max_fetch_mb).saturating_mul(MIB);
+        let max_result = u64::from(self.limits.max_call_result_mb).saturating_mul(MIB);
+        let mut all = AllResult::new(paging.items_key, max_result);
+        let mut start = vc
+            .validated
+            .params
+            .get("start")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let mut page: u32 = 0;
+        loop {
+            let info = CallInfo {
+                call_id: call.id,
+                op: call.op_id.clone(),
+                params: call.params.clone(),
+                alias: vc.alias.clone(),
+                instance_id: vc.instance_id.clone(),
+                user_key: vc.user_key.clone(),
+                page: Some(page),
+            };
+            let ctl = FetchControl::new();
+            // Page 0 was counted and checked as the call itself (`live_call`). Before any later
+            // page: `max_calls`, then the fetched bytes (PD-144 order).
+            let limits = (page > 0).then_some((self.limits.max_calls, fetch_cap));
+            match self.shared.begin_page(info.clone(), ctl.clone(), limits) {
+                PageStart::Go => {}
+                PageStart::Stopped => {
+                    return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
+                }
+                PageStart::MaxCalls => {
+                    return rejected_msg(ErrorCode::ScriptLimit, "the run would exceed max_calls");
+                }
+                PageStart::MaxFetch => {
+                    return rejected_msg(
+                        ErrorCode::ScriptLimit,
+                        "the run's fetched bytes reached max_fetch_mb",
+                    );
+                }
+            }
+            let classified = match self.fetch(&call, &vc, &ctl, Some((page, start))).await {
+                Ok(c) => c,
+                Err(result) => {
+                    self.shared.finish_in_flight(call.id);
+                    return result;
+                }
+            };
+            // M3 T27 ruling 5: after a first page, a direct class is a gated outcome.
+            let classified = match classified {
+                Classified::Direct(d) if page > 0 => read::gate_later(d, true),
+                c => c,
+            };
+            let Some(settled) = self.settle_page(&call, &vc, &info, classified, &mut all) else {
+                self.shared.finish_in_flight(call.id);
+                return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
+            };
+            self.shared.add_fetched(settled.size);
+            let ended = Some((self.shared.clone(), call.id));
+            match append_gated_call(&self.engine, &self.entry, ended, settled.record).await {
+                Appended::Done => {}
+                Appended::Ended => return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED),
+                Appended::Failed => {
+                    audit_failure(&self.engine, &self.entry, &self.shared).await;
+                    return rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
+                }
+            }
+            match settled.next {
+                PageNext::Continue(at) => {
+                    start = at;
+                    page = page.saturating_add(1);
+                }
+                PageNext::Answer(result) => return result,
+            }
+        }
+    }
+
+    /// One page of an `atlas.all` call: a 2xx page joins the result unless the result would
+    /// exceed `max_call_result_mb` (`result_too_large`, before concatenating); any other answer
+    /// ends the call with the rejection a single call gets. `None` = cancelled (the end of the
+    /// run records the page).
+    fn settle_page(
+        &self,
+        call: &HostCall,
+        vc: &ValidatedCall,
+        info: &CallInfo,
+        classified: Classified,
+        all: &mut AllResult,
+    ) -> Option<PageSettled> {
+        let rec = match classified {
+            Classified::Item(rec) if rec.item == ReleaseItem::Result => rec,
+            other => {
+                let s = self.settle(call, vc, info, other)?;
+                return Some(PageSettled {
+                    record: s.record,
+                    size: s.size,
+                    next: PageNext::Answer(s.result),
+                });
+            }
+        };
+        let size = rec.size();
+        let event = rec.record(&self.ctx_for(vc));
+        let next_start = rec.page.and_then(|p| p.next_start);
+        let shape = read::ReadShape::of(vc.spec, &vc.validated.params);
+        let bodies = rec.responses.iter().map(|r| r.body.as_slice());
+        let added = read::result_value(vc.spec, shape, bodies)
+            .map(|(page, _)| all.add(page, next_start.is_none()));
+        let (next, rejection) = match added {
+            Ok(true) => match next_start {
+                Some(at) => (PageNext::Continue(at), None),
+                None => (PageNext::Answer(HostCallResult::Ok(all.take())), None),
+            },
+            Ok(false) => (
+                PageNext::Answer(rejected_msg(
+                    ErrorCode::ResultTooLarge,
+                    "the result is above max_call_result_mb",
+                )),
+                Some("result_too_large"),
+            ),
+            Err(_) => (
+                PageNext::Answer(rejected_msg(
+                    ErrorCode::UpstreamUnavailable,
+                    "the answer of the server could not be read",
+                )),
+                Some("upstream_unavailable"),
+            ),
+        };
+        Some(PageSettled {
+            record: payloads::script_call_from(event, &call_meta(call, info, rejection), size),
+            size,
+            next,
+        })
+    }
+
     /// The call's fetch under the request's cover, with the identity handling of Task 26
     /// (§7.1): a failed header check or a JSON 401 runs the token re-check, and a rename
-    /// re-fetches once. `Err` = nothing was sent.
+    /// re-fetches once. `page = Some((n, start))`: page `n` of an `atlas.all` call, one request
+    /// at `start` (PD-144). `Err` = nothing was sent.
     async fn fetch(
         &self,
         call: &HostCall,
         vc: &ValidatedCall,
         ctl: &FetchControl,
+        page: Option<(u32, u64)>,
     ) -> Result<Classified, HostCallResult> {
         let internal = || rejected_msg(ErrorCode::Internal, MSG_RUN_NOT_POSSIBLE);
         let http = self
@@ -1129,8 +1319,16 @@ impl LiveBackend {
         let Ok(ExecPlan::Read(plan)) = plan else {
             return Err(internal());
         };
-        // `atlas.all` pages to the end; the host's own counters bound it.
-        let plan = if call.all { widen(plan) } else { plan };
+        let start = vc
+            .validated
+            .params
+            .get("start")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let plan = match page {
+            None => CallPlan::Whole(plan, start),
+            Some((_, at)) => CallPlan::Page(PagePlan::of(plan).ok_or_else(internal)?, at),
+        };
         let cover = self
             .engine
             .covers()
@@ -1142,16 +1340,10 @@ impl LiveBackend {
             max_response_bytes: u64::from(self.limits.max_call_result_mb).saturating_mul(MIB),
             ..self.engine.read_budget()
         };
-        let start = vc
-            .validated
-            .params
-            .get("start")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
         let mut refetched = false;
         loop {
             let seen = self.engine.identity_epoch(&vc.instance_id);
-            let fetched = read::run_plan(&http.client, &cover, &plan, &budget, ctl, start).await;
+            let fetched = plan.run(&http.client, &cover, &budget, ctl).await;
             let Some(trigger) = read::fetched_trigger(&fetched) else {
                 return Ok(read::classify_read(fetched, &http.proxy));
             };
@@ -1178,6 +1370,7 @@ impl LiveBackend {
                             instance: Some(&vc.alias),
                             user_key: vc.user_key.as_deref(),
                             rejection: Some("identity_check_retried"),
+                            page: page.map(|(n, _)| n),
                         },
                         &ReadFetched::Unavailable {
                             responses: &responses,
@@ -1324,6 +1517,7 @@ fn call_meta<'a>(
         instance: Some(&info.alias),
         user_key: info.user_key.as_deref(),
         rejection,
+        page: info.page,
     }
 }
 
@@ -1385,22 +1579,203 @@ impl HostCalls for LiveBackend {
     fn log(&self, _run_id: &str, _line: &str) {}
 }
 
-fn widen(plan: ReadPlan) -> ReadPlan {
-    match plan {
-        ReadPlan::Get(g) => ReadPlan::Get(g),
-        ReadPlan::Paged { call, .. } => ReadPlan::Paged {
-            call,
-            max_items: u64::MAX,
-        },
-        ReadPlan::Search {
-            call, items_key, ..
-        } => ReadPlan::Search {
-            call,
+/// What one fetch of a host call runs: the op's whole read plan (`atlas.call`, from the agent's
+/// `start`), or one page of an `atlas.all` call at an offset.
+enum CallPlan {
+    Whole(ReadPlan, u64),
+    Page(PagePlan, u64),
+}
+
+impl CallPlan {
+    async fn run(
+        &self,
+        client: &InstanceClient,
+        cover: &AuditCover,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+    ) -> read::Fetched {
+        match self {
+            CallPlan::Whole(plan, start) => {
+                read::run_plan(client, cover, plan, budget, ctl, *start).await
+            }
+            CallPlan::Page(plan, start) => plan.run(client, cover, budget, ctl, *start).await,
+        }
+    }
+}
+
+/// The paged request of a paginated op (PD-144: `atlas.all` asks for one page at a time, of the
+/// size the op's plan asks for, `max` or the op's default).
+enum PagePlan {
+    Paged(PagedCall),
+    Search { call: SearchCall, items_key: String },
+}
+
+impl PagePlan {
+    /// `None`: the op is not paginated (the validator refuses `atlas.all` for it).
+    fn of(plan: ReadPlan) -> Option<PagePlan> {
+        match plan {
+            ReadPlan::Paged { call, .. } => Some(PagePlan::Paged(call)),
+            ReadPlan::Search {
+                call, items_key, ..
+            } => Some(PagePlan::Search { call, items_key }),
+            ReadPlan::Get(_) | ReadPlan::IssueWithComments { .. } => None,
+        }
+    }
+
+    /// One request at `start`: a page the server clamped or cut short is never followed by a
+    /// second request here.
+    async fn run(
+        &self,
+        client: &InstanceClient,
+        cover: &AuditCover,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+        start: u64,
+    ) -> read::Fetched {
+        let outcome = match self {
+            PagePlan::Paged(call) => {
+                let call = PagedCall {
+                    start,
+                    ..call.clone()
+                };
+                client.read_page_ctl(cover, &call, budget, ctl).await
+            }
+            PagePlan::Search { call, items_key } => {
+                let mut call = call.clone();
+                // The search client reads the page's offset from the body (`startAt`).
+                if let Some(body) = call.body.as_object_mut() {
+                    body.insert("startAt".to_owned(), start.into());
+                }
+                client
+                    .read_search_page_ctl(cover, &call, items_key, budget, ctl)
+                    .await
+            }
+        };
+        read::Fetched::Paged { outcome, start }
+    }
+}
+
+/// One page of an `atlas.all` call settled: its record, the bytes received and what comes next.
+struct PageSettled {
+    record: NewEvent,
+    size: u64,
+    next: PageNext,
+}
+
+enum PageNext {
+    /// The next page's offset.
+    Continue(u64),
+    /// What the script sees: the concatenated result or a rejection.
+    Answer(HostCallResult),
+}
+
+/// The keys of a page that are server totals (PD-144: the result takes them from the last page);
+/// the paging client reads the same two.
+const TOTAL_KEYS: [&str; 2] = ["total", "totalSize"];
+
+/// The result of an `atlas.all` call while its pages arrive (PD-144): the first page's object
+/// with an empty items array (the skeleton), the normalized items of every page so far, and the
+/// exact size of the result they make, `skeleton + items + separators`, so the size is checked
+/// before a page is concatenated and no result over the limit is ever built.
+struct AllResult {
+    items_key: &'static str,
+    max_bytes: u64,
+    skeleton: Option<Value>,
+    skeleton_bytes: u64,
+    items: Vec<Value>,
+    items_bytes: u64,
+}
+
+impl AllResult {
+    fn new(items_key: &'static str, max_bytes: u64) -> AllResult {
+        AllResult {
             items_key,
-            max_items: u64::MAX,
-        },
-        // The comments cap is a hard cap, not the agent's `max`: `atlas.all` keeps it.
-        composite @ ReadPlan::IssueWithComments { .. } => composite,
+            max_bytes,
+            skeleton: None,
+            skeleton_bytes: 0,
+            items: Vec::new(),
+            items_bytes: 0,
+        }
+    }
+
+    /// Adds one page's normalized object; `last` = the page ended the results, so its totals
+    /// become the result's. `false` = the result would exceed `max_bytes`: nothing of the page
+    /// is added.
+    fn add(&mut self, mut page: Value, last: bool) -> bool {
+        let items = match page.get_mut(self.items_key).map(Value::take) {
+            Some(Value::Array(a)) => a,
+            _ => Vec::new(),
+        };
+        let mut skeleton = match &self.skeleton {
+            None => {
+                if let Some(o) = page.as_object_mut() {
+                    o.insert(self.items_key.to_owned(), Value::Array(Vec::new()));
+                }
+                page.clone()
+            }
+            Some(s) => s.clone(),
+        };
+        if last && let (Some(to), Some(from)) = (skeleton.as_object_mut(), page.as_object()) {
+            for key in TOTAL_KEYS {
+                if let Some(v) = from.get(key) {
+                    to.insert(key.to_owned(), v.clone());
+                }
+            }
+        }
+        let skeleton_bytes = json_len(&skeleton);
+        let separators = if self.items.is_empty() {
+            items.len().saturating_sub(1)
+        } else {
+            items.len()
+        };
+        let added = items.iter().map(json_len).fold(
+            u64::try_from(separators).unwrap_or(u64::MAX),
+            u64::saturating_add,
+        );
+        let total = skeleton_bytes
+            .saturating_add(self.items_bytes)
+            .saturating_add(added);
+        if total > self.max_bytes {
+            return false;
+        }
+        self.skeleton = Some(skeleton);
+        self.skeleton_bytes = skeleton_bytes;
+        self.items.extend(items);
+        self.items_bytes = self.items_bytes.saturating_add(added);
+        true
+    }
+
+    /// The op's native shape: the skeleton with every page's items.
+    fn take(&mut self) -> Value {
+        let mut result = self.skeleton.take().unwrap_or(Value::Null);
+        if let Some(o) = result.as_object_mut() {
+            o.insert(
+                self.items_key.to_owned(),
+                Value::Array(std::mem::take(&mut self.items)),
+            );
+        }
+        result
+    }
+}
+
+/// The length of `v` as `serde_json::to_vec` writes it, without the bytes.
+fn json_len(v: &Value) -> u64 {
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    match serde_json::to_writer(&mut n, v) {
+        Ok(()) => n.0,
+        Err(_) => u64::MAX,
     }
 }
 
@@ -2750,5 +3125,62 @@ pub(crate) async fn on_instance_changed(
         engine.ui().emit(UiEvent::QueueChanged {
             request_ids: vec![entry.head.request_id.clone()],
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn page(start: u64, n: u64, total: u64) -> Value {
+        let issues: Vec<Value> = (start..start + n)
+            .map(|i| json!({ "key": format!("ABC-{i}"), "f": { "s": "é\u{1}\"", "n": [i, null] } }))
+            .collect();
+        json!({ "startAt": start, "maxResults": 2, "total": total, "issues": issues })
+    }
+
+    /// The running size of an `atlas.all` result is the exact length of the value it builds,
+    /// across empty pages, escapes and a last page that changes the totals (PD-144).
+    #[test]
+    fn all_result_counts_the_exact_bytes_of_the_result() -> TestResult {
+        let pages = [
+            vec![page(0, 0, 9), page(0, 2, 9), page(2, 1, 1000)],
+            vec![page(0, 2, 5), page(2, 0, 5), page(2, 2, 5), page(4, 1, 5)],
+            vec![page(0, 1, 1)],
+        ];
+        for set in pages {
+            let mut all = AllResult::new("issues", u64::MAX);
+            let last = set.len() - 1;
+            for (n, p) in set.iter().enumerate() {
+                assert!(all.add(p.clone(), n == last));
+            }
+            let counted = all.skeleton_bytes + all.items_bytes;
+            let built = all.take();
+            assert_eq!(counted, u64::try_from(serde_json::to_vec(&built)?.len())?);
+            let want = set.last().map(|p| p["total"].clone());
+            assert_eq!(Some(built["total"].clone()), want);
+            assert_eq!(built["startAt"], 0);
+        }
+        Ok(())
+    }
+
+    /// A result of exactly `max_bytes` is accepted, one byte less refuses the page and keeps
+    /// nothing of it.
+    #[test]
+    fn all_result_refuses_a_page_past_the_limit() -> TestResult {
+        let set = [page(0, 2, 4), page(2, 2, 4)];
+        let mut exact = AllResult::new("issues", u64::MAX);
+        exact.add(set[0].clone(), false);
+        exact.add(set[1].clone(), true);
+        let size = u64::try_from(serde_json::to_vec(&exact.take())?.len())?;
+        let mut fits = AllResult::new("issues", size);
+        assert!(fits.add(set[0].clone(), false) && fits.add(set[1].clone(), true));
+        let mut over = AllResult::new("issues", size - 1);
+        assert!(over.add(set[0].clone(), false));
+        assert!(!over.add(set[1].clone(), true));
+        assert_eq!(over.take()["issues"].as_array().map(Vec::len), Some(2));
+        Ok(())
     }
 }
