@@ -1079,28 +1079,41 @@ async fn deny(
 /// remains, and a new revision built from the record would switch Release back on. The one
 /// exception is M-11: a revision without ops whose exact candidate (hash checked by
 /// [`candidate`]) the §5.3 mirror check blocks, where dropping the flagged entries gives a new
-/// revision the check runs on again. `Ok(false)`: refuse as not approvable.
+/// revision the check runs on again. `Ok(None)`: refuse as not approvable; `Ok(Some(failed))`:
+/// allowed with `rebuild_failed` as it was read, which the new revision's step re-checks under the
+/// gate ([`unchanged_failure`]).
 async fn takes_redactions(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
-) -> Result<bool, DecisionError> {
+) -> Result<Option<bool>, DecisionError> {
     let (failed, no_ops) = {
         let st = entry.state();
         (st.rebuild_failed, st.redaction_ops.is_empty())
     };
     if !failed {
-        return Ok(true);
+        return Ok(Some(false));
     }
     if !no_ops {
-        return Ok(false);
+        return Ok(None);
     }
     match candidate(engine, entry).await {
-        Ok(c) => Ok(crate::redact::mirror_blocked(
-            c.value(),
-            &entry.spec.redaction_rules,
-        )),
+        Ok(c) => Ok(
+            crate::redact::mirror_blocked(c.value(), &entry.spec.redaction_rules).then_some(true),
+        ),
         Err(RebuildError::Transient(e)) => Err(DecisionError::Audit(e)),
-        Err(_) => Ok(false),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The step guard of a redaction [`takes_redactions`] allowed with `failed`: a rebuild failure
+/// marked since (review T19c m-2) refuses it as not approvable.
+fn unchanged_failure(failed: bool) -> impl FnOnce(&EntryState) -> Result<(), Rejection> {
+    move |st| {
+        if st.rebuild_failed == failed {
+            Ok(())
+        } else {
+            Err(Rejection::NotApprovable)
+        }
     }
 }
 
@@ -1119,12 +1132,12 @@ async fn redact(
         Ok(snap) => snap,
         Err(rej) => return Err(rejected(engine, entry, rej, rev.counter, dec).await),
     };
-    if !takes_redactions(engine, entry).await? {
+    let Some(failed) = takes_redactions(engine, entry).await? else {
         let rej = (Rejection::NotApprovable, at);
         return Err(rejected(engine, entry, rej, rev.counter, dec).await);
-    }
+    };
     if entry.kind() == Kind::Script {
-        return redact_script(engine, entry, rev, ops, at).await;
+        return redact_script(engine, entry, rev, ops, at, failed).await;
     }
     let read = entry.state().read.clone();
     let Some(read) = read else {
@@ -1201,10 +1214,11 @@ async fn redact(
     let c = Arc::new(c);
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
     let applied = engine
-        .step_unlogged(
+        .step_unlogged_if(
             entry,
             Event::CandidateChanged,
             Some(rev.counter),
+            unchanged_failure(failed),
             move |st| {
                 st.candidate_hash = *c.hash();
                 st.redaction_ops = ops;
@@ -1360,6 +1374,7 @@ async fn redact_script(
     rev: CandidateRev,
     ops: Vec<RedactionOp>,
     at: Snapshot,
+    failed: bool,
 ) -> Result<DecisionOutcome, DecisionError> {
     let dec = SubmittedDecision::Release;
     let Some(script) = entry.state().script.clone() else {
@@ -1414,10 +1429,11 @@ async fn redact_script(
     let c = Arc::new(c);
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
     let applied = engine
-        .step_unlogged(
+        .step_unlogged_if(
             entry,
             Event::CandidateChanged,
             Some(rev.counter),
+            unchanged_failure(failed),
             move |st| {
                 st.candidate_hash = *c.hash();
                 st.redaction_ops = ops;

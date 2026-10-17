@@ -863,6 +863,47 @@ async fn failed_closed_without_a_mirror_block_takes_no_redaction() -> TestResult
     Ok(())
 }
 
+/// Review T19c m-2: the failed-closed gate holds up to the step. A rebuild failure marked while a
+/// redaction that passed the gate waits for the entry's transition gate (a concurrent
+/// `preview_fetch` whose rebuild mismatches) refuses it there: no new revision switches Release
+/// back on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failure_marked_before_the_redaction_step_refuses_it() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &full_issue(KEY)).await;
+    let id = queued(&h, ISSUE, json!({ "key": KEY })).await?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    let rev = ap.rev(&id).map_err(de)?;
+    let entry = h.engine().entry(&id).ok_or("not in memory")?;
+    let gate = entry.hold_gate().await;
+    let (waiting, at) = (h.approver(), id.clone());
+    let pending =
+        tokio::task::spawn_blocking(move || waiting.redact(&at, vec![drop_at("fields.labels")]));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Past the gate check, which would have answered at once: parked at the step.
+    assert!(!pending.is_finished(), "the redaction waits for the gate");
+    {
+        let mut st = entry.state();
+        st.rebuild_failed = true;
+        st.model.set_approvable(false);
+    }
+    drop(gate);
+    let res = tokio::time::timeout(Duration::from_secs(10), pending).await??;
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    last_invalid_is_not_approvable(&h, &id, rev.counter).await?;
+    assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+    assert!(entry.state().rebuild_failed);
+    Ok(())
+}
+
 /// One rendered comment (id 55509, restricted) without a source counterpart, in arrays of the
 /// same length (the source's 55508 has no rendered counterpart).
 fn one_orphan(key: &str) -> Value {

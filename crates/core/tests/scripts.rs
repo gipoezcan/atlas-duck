@@ -1439,6 +1439,48 @@ async fn hash_mismatch_script_takes_no_redaction() -> TestResult {
     Ok(())
 }
 
+/// Review T19c m-2 for a script result: a rebuild failure marked while a redaction that passed
+/// the failed-closed gate waits for the transition gate refuses it at the step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn script_failure_marked_before_the_redaction_step_refuses_it() -> TestResult {
+    use atlas_duck_core::DecisionError;
+    use atlas_duck_core::payloads::InvalidReason;
+    let value = json!({ "keep": 1, "secret": "hunter2" });
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(value))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    let rev = ap.rev(&id).map_err(de)?;
+    let entry = h.engine().entry(&id).ok_or("not in memory")?;
+    let gate = entry.hold_gate().await;
+    let (waiting, at) = (h.approver(), id.clone());
+    let ops = vec![atlas_duck_core::RedactionOp::DropField {
+        path: "result.secret".to_owned(),
+        scope: atlas_duck_core::DropScope::PerItem,
+    }];
+    let pending = tokio::task::spawn_blocking(move || waiting.redact(&at, ops));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!pending.is_finished(), "the redaction waits for the gate");
+    {
+        let mut st = entry.state();
+        st.rebuild_failed = true;
+        st.model.set_approvable(false);
+    }
+    drop(gate);
+    let res = tokio::time::timeout(std::time::Duration::from_secs(10), pending).await??;
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scripts_release_in_a_batch() -> TestResult {
     let runner = FakeScriptRunner::new(vec![

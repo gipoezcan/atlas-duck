@@ -281,6 +281,12 @@ impl RequestEntry {
         lock(&self.state)
     }
 
+    /// Takes the transition gate as a transition does: a test parks a gated step behind it.
+    #[cfg(feature = "testing")]
+    pub async fn hold_gate(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.gate.clone().lock_owned().await
+    }
+
     pub fn kind(&self) -> Kind {
         self.kind
     }
@@ -1336,21 +1342,40 @@ impl Engine {
     where
         A: FnOnce(&mut EntryState),
     {
+        self.step_unlogged_if(entry, event, expect_rev, |_| Ok(()), on_apply)
+            .await
+    }
+
+    /// [`Engine::step_unlogged`] that first asks `guard`, under the gate and the state lock, for
+    /// a precondition a caller checked before (review T19c m-2).
+    pub(crate) async fn step_unlogged_if<G, A>(
+        &self,
+        entry: &Arc<RequestEntry>,
+        event: Event,
+        expect_rev: Option<u64>,
+        guard: G,
+        on_apply: A,
+    ) -> Result<Applied, Rejection>
+    where
+        G: FnOnce(&EntryState) -> Result<(), Rejection>,
+        A: FnOnce(&mut EntryState),
+    {
         let _gate = entry.gate.clone().lock_owned().await;
         let applied = {
             let mut st = entry.state();
-            match expect_rev {
+            let allowed = match expect_rev {
                 Some(rev) if st.model.rev() != rev => Err(Rejection::StaleRev {
                     current: st.model.rev(),
                 }),
-                _ => {
-                    let applied = step(&mut st.model, event);
-                    if applied.is_ok() {
-                        on_apply(&mut st);
-                    }
-                    applied
+                _ => guard(&st),
+            };
+            allowed.and_then(|()| {
+                let applied = step(&mut st.model, event);
+                if applied.is_ok() {
+                    on_apply(&mut st);
                 }
-            }
+                applied
+            })
         };
         self.after_change(entry);
         applied

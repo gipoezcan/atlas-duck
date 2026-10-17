@@ -91,7 +91,7 @@ pub(super) async fn redaction_preview(
         }
     }
     // A revision that failed closed takes no redaction, so none is previewed (M-11 aside).
-    if !takes_redactions(&engine, &entry).await? {
+    if takes_redactions(&engine, &entry).await?.is_none() {
         return Err(DecisionError::Invalid(InvalidReason::NotApprovable));
     }
     let (spec, rid) = (entry.spec, id.clone());
