@@ -1538,6 +1538,34 @@ fn drop_absent_in_original_and_current_doc_is_refused() -> TestResult {
     Ok(())
 }
 
+/// Review T19c fix2 n-4 (T24: a stale index is a silent no-op): after `list[2]` the shown `[3]`
+/// is the source's `[4]`, which has no `x`; the source's `[3]` has one and is still there (now at
+/// `[2]`). An index-only field drop there does nothing and is not refused: only an op that names
+/// by identity must prove that what it names went.
+#[test]
+fn a_stale_index_field_drop_is_a_no_op() -> TestResult {
+    let source = json!({"list": [
+        {"id": 0, "x": "a0"},
+        {"id": 1},
+        {"id": 2, "x": "a2"},
+        {"id": 3, "x": "a3"},
+        {"id": 4}
+    ]});
+    let ops = [
+        drop_field("list[2]", DropScope::PerItem),
+        drop_field("list[3].x", DropScope::PerItem),
+    ];
+    let out = apply(&source, &NO_RULES, None, &ops);
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(
+        out.released,
+        json!({"list": [{"id": 0, "x": "a0"}, {"id": 1}, {"id": 3, "x": "a3"}, {"id": 4}]})
+    );
+    assert_eq!(out.meta.items_dropped, 1);
+    assert!(out.meta.fields_dropped.is_empty(), "{:?}", out.meta);
+    Ok(())
+}
+
 // ---- §5.3 mirror pairing cannot be spoofed (M8 T19c review I-1) ----------------------------------
 
 const RENDERED: &str = "renderedFields.comment.comments";
