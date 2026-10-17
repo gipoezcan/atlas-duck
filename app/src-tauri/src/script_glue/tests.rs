@@ -1616,6 +1616,92 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     }
 }
 
+/// The capture of a test's own thread (`with_default` is thread-scoped: an event written on
+/// another thread, a `spawn_blocking` closure's say, is not captured).
+fn capture_on_this_thread(
+    body: impl FnOnce(&Capture) -> TestResult,
+) -> Result<String, Box<dyn std::error::Error>> {
+    // While exactly one subscriber exists, tracing computes a callsite's interest from the
+    // subscriber of the thread that hits it first; a glue callsite first hit by another test's
+    // thread (none) would then stay "never" for the capture too. A second, idle subscriber keeps
+    // every callsite's interest computed over all live subscribers.
+    let _idle = tracing::Dispatch::new(tracing_subscriber::Registry::default());
+    let cap = Capture::default();
+    let subscriber = tracing_subscriber::layer::SubscriberExt::with(
+        tracing_subscriber::Registry::default(),
+        crate::diag::fields::allowlist_layer(cap.clone()),
+    );
+    tracing::subscriber::with_default(subscriber, || body(&cap))?;
+    Ok(String::from_utf8(lock(&cap.0).clone())?)
+}
+
+/// A current-thread runtime with a single blocking thread (see [`occupy_blocking_pool`]).
+fn one_blocking_thread() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+}
+
+/// Holds the runtime's only blocking thread until the returned sender is dropped (also when the
+/// test fails: dropping a runtime waits for its running blocking tasks, which then end at once).
+fn occupy_blocking_pool() -> mpsc::Sender<()> {
+    let (release, released) = mpsc::channel::<()>();
+    drop(tokio::task::spawn_blocking(move || {
+        let _ = released.recv_timeout(TEST_BOUND);
+    }));
+    release
+}
+
+/// T20 review m-4: a waiter dropped while `wait` maps the end (here: while the result's parse
+/// waits for a blocking thread) does not make the next `wait` log the run's host facts again.
+#[test]
+fn glue_wait_logs_once_when_a_waiter_is_dropped() -> TestResult {
+    let out = capture_on_this_thread(|cap| {
+        let rt = one_blocking_thread()?;
+        rt.block_on(async {
+            tokio::time::timeout(TEST_BOUND, dropped_waiter(cap))
+                .await
+                .map_err(|_| "the test body did not finish within its bound")?
+        })
+    })?;
+    assert_eq!(
+        out.matches("event=sandbox_watchdog_kill").count(),
+        1,
+        "{out}"
+    );
+    Ok(())
+}
+
+async fn dropped_waiter(cap: &Capture) -> TestResult {
+    let port = FakePort::new();
+    let g = glue(
+        &port,
+        &worker_file(),
+        Some(report_for(&worker_file(), FloorVerdict::Met)?),
+    );
+    let handle = started(&g, spec(off()), GatedCalls::new()).await?;
+    let mut end = outcome(result_end("1")?, HostVerdict::None);
+    end.diag = vec![DIAG_WATCHDOG_KILL];
+    port.control(0).ok_or("no run")?.finish(end);
+    let pool = occupy_blocking_pool();
+    let first = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.wait().await })
+    };
+    // The first waiter has logged the run's host facts and waits for the parse; it goes away.
+    while !String::from_utf8_lossy(&lock(&cap.0)).contains("event=sandbox_watchdog_kill") {
+        tokio::task::yield_now().await;
+    }
+    first.abort();
+    assert!(first.await.is_err_and(|e| e.is_cancelled()));
+    drop(pool);
+    let end = tokio::time::timeout(BOUND, handle.wait()).await?;
+    assert!(matches!(end, RunEnd::Result { .. }), "{end:?}");
+    assert_eq!(handle.worker_confinement(), Some(conf(true, "worker")));
+    Ok(())
+}
+
 /// What the logging test runs: a run whose outcome carries worker text and host facts, a spawn
 /// refused for the embedded version, a compile worker that failed to spawn. On one thread, so the
 /// thread's scoped subscriber sees every event.

@@ -574,11 +574,16 @@ struct RunHandleGlue {
 impl RunHandleGlue {
     async fn finish(&self) -> RunEnd {
         let outcome = self.control.wait().await;
-        log_diag(&self.request_id, &outcome.diag);
-        if let HostVerdict::NotSpawned(StartRunError::IdentityMismatch { what }) = outcome.host {
-            upgraded(&self.update_pending, what, Some(&self.request_id));
+        // Once per run, by the first waiter to get here: a waiter dropped further on (while the
+        // result is parsed) leaves `end` empty, and the next one must not log the run's host
+        // facts again (T20 review m-4).
+        if self.worker.set(outcome.confinement.clone()).is_ok() {
+            log_diag(&self.request_id, &outcome.diag);
+            if let HostVerdict::NotSpawned(StartRunError::IdentityMismatch { what }) = outcome.host
+            {
+                upgraded(&self.update_pending, what, Some(&self.request_id));
+            }
         }
-        let _ = self.worker.set(outcome.confinement.clone());
         // One parse of a result up to `max_result_mb`: CPU work, off the runtime threads.
         tokio::task::spawn_blocking(move || map::to_run_end(outcome))
             .await
