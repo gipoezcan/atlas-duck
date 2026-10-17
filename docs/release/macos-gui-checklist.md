@@ -59,19 +59,21 @@ For each architecture:
 
 ## 3a. Confluence: get, update, attachment collision
 
-Run on each architecture. Every command carries `--reason`; the reason text below is the checklist's own. Page ID, base version and file path: **TBD by lead**. Instance alias flag (if the lead's mock needs one, from 0.1): **TBD by lead**; run `atlas-duck confluence page get --help` to confirm whether it exists, and do not invent one.
+Run on each architecture. Every command carries `--reason`; the reason text below is the checklist's own. Every command also carries the global flag `--instance <alias>` (the Confluence instance alias from 0.1; the flag is accepted anywhere before `--`, see `atlas-duck --help`). The Confluence instance must be set up in the wizard or settings like the Jira one (section 2).
+
+TBD by lead for all of 3a: `<PAGE_ID>`, the instance alias, base version `<N>`, the redaction value (3a.1), the collision file path (3a.3).
 
 1. **Page get, release with redaction.** In a Terminal:
-   `atlas-duck confluence page get <PAGE_ID> --reason "M7 checklist: read Confluence page for release"`
+   `atlas-duck confluence page get <PAGE_ID> --instance <alias> --reason "M7 checklist: read Confluence page for release"`
    - Expected: a toast appears and the approvals window shows the request. Open the **Preview** tab (default) and check the page renders in the sandboxed frame.
-   - Expected: open the redaction edit, mask the value the lead names (**TBD by lead**), then release.
-   - Expected: the CLI read result shows `redacted: true`, and the CLI exits with code **0**.
-2. **Page update with Markdown, approve.** In a Terminal:
-   `atlas-duck confluence page update <PAGE_ID> --base-version <N> --body "**done**" --reason "M7 checklist: approve Confluence page update"`
+   - Expected: open the redaction edit, mask the value the lead names, then release the edit. A redaction creates a new revision of the request: open the new revision, review it, and release it a second time. The CLI is still waiting after the first release; that is not a FAIL.
+   - Expected: after the second release the CLI read result shows `redacted: true`, and the CLI exits with code **0**.
+2. **Page update with Markdown, approve.** In a Terminal (`<N>` must equal the current version of the page, otherwise the flow becomes a conflict card instead of the diff):
+   `atlas-duck confluence page update <PAGE_ID> --instance <alias> --base-version <N> --body "**done**" --reason "M7 checklist: approve Confluence page update"`
    - Expected: the approvals window shows the request. On the **Preview** tab the diff renders with its styling (see 4.3, `preview.css`). Plain unstyled text is FAIL.
    - Expected: approve after the inert period (1 s). The CLI exits with code **0** and prints a receipt.
 3. **Attachment collision, deny.** In a Terminal, with a local file whose name collides with an existing attachment on the page (file path: **TBD by lead**):
-   `atlas-duck confluence attachment upload <PAGE_ID> --content-base64-file <path> --reason "M7 checklist: deny attachment collision"`
+   `atlas-duck confluence attachment upload <PAGE_ID> --instance <alias> --content-base64-file <path> --reason "M7 checklist: deny attachment collision"`
    - Expected: the approvals window shows the request. Deny it in the UI.
    - Expected: the CLI exits with code **3**. The attachment on the page is unchanged.
 
@@ -151,6 +153,9 @@ Fill one row per check, per architecture. Mark each item `PASS`, `FAIL` or `N/A`
 |      |        |      |  | 3.5a Raise paths: current queue on first frame |  |  |
 |      |        |      |  | 3.6 Inert period (1 s) |  |  |
 |      |        |      |  | 3.8 Approve exit 0 with receipt |  |  |
+|      |        | arm64 / x86_64 |  | 3a.1 Confluence page get, two releases (redaction), `redacted: true`, exit 0 |  |  |
+|      |        | arm64 / x86_64 |  | 3a.2 Confluence page update (Markdown), approve exit 0 |  |  |
+|      |        | arm64 / x86_64 |  | 3a.3 Attachment collision, deny exit 3 |  |  |
 |      |        |      |  | 4.1 Deny exit 3 |  |  |
 |      |        |      |  | 4.2 Redaction gives `redacted: true` |  |  |
 |      |        |      |  | 4.3 preview.css loads (V24) |  |  |
@@ -158,12 +163,6 @@ Fill one row per check, per architecture. Mark each item `PASS`, `FAIL` or `N/A`
 |      |        |      |  | 4.5 Batch approve, held Enter does not confirm |  |  |
 |      |        |      |  | 4.6 Bidi controls neutralised, no reorder |  |  |
 |      |        |      |  | 4.7 window.open refused, canary unset, title unchanged |  |  |
-|      |        | arm64 |  | 3a.1 Confluence page get, release with redaction (`redacted: true`) |  |  |
-|      |        | arm64 |  | 3a.2 Confluence page update (Markdown), approve exit 0 |  |  |
-|      |        | arm64 |  | 3a.3 Attachment collision, deny exit 3 |  |  |
-|      |        | x86_64 |  | 3a.1 Confluence page get, release with redaction (`redacted: true`) |  |  |
-|      |        | x86_64 |  | 3a.2 Confluence page update (Markdown), approve exit 0 |  |  |
-|      |        | x86_64 |  | 3a.3 Attachment collision, deny exit 3 |  |  |
 |      |        | x64 / arm64 |  | 9.6 Hardening policies on first webview (Windows) |  |  |
 |      |        | x64 / arm64 |  | 9.7 Setup window rebuild (Windows) |  |  |
 |      |        | x64 / arm64 |  | 9.8 Raise paths, current queue on first frame (Windows) |  |  |

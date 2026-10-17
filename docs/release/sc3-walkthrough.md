@@ -7,7 +7,7 @@ This is a small, informal check with a few reviewers. It is not a benchmark. Rec
 ## 1. Setup
 
 1. Use a build from the same release candidate as the macOS checklist. Record the build id in the results table.
-2. Use the mock Jira endpoint the lead provides (ask the lead; there is no cargo-free start command yet, see `docs/release/macos-gui-checklist.md` section 0.1).
+2. Use the mock Jira endpoint and, for S4 and S5, the Confluence instance (alias) the lead provides (ask the lead; there is no cargo-free start command yet, see `docs/release/macos-gui-checklist.md` section 0.1).
 3. Each reviewer sees the approvals window cold: close it, and make sure no request is currently focused.
 4. Use a stopwatch (phone or desktop timer). The tester runs it, not the reviewer.
 5. Keep the reviewer's hands off the keyboard until the stopwatch starts.
@@ -31,10 +31,10 @@ Run each scenario once per reviewer. Use the same order for every reviewer, and 
 | S1 | Approve a Jira create | A `jira.issue.create` request with a short summary and description | Approve |
 | S2 | Approve a comment with a redaction edit | A comment on a Jira issue containing one value to mask | Edit the redaction, then approve |
 | S3 | Deny a batch | A batch of several operations (count: **TBD by lead**) | Deny the whole batch |
-| S4 | Release a Confluence page read | A Confluence page of about 5,000 words (the fixture page the scenario reads; the word count describes the fixture, not this document). Submit with `atlas-duck confluence page get <PAGE_ID> --reason "M7 SC3 walkthrough: read Confluence page"` | Release. The reviewer opens the request on the **Preview** tab (default), reads the page render, then decides |
-| S5 | Approve a small Confluence page update | A `confluence.page.update` with a small Markdown diff. Submit with `atlas-duck confluence page update <PAGE_ID> --base-version <N> --body "<markdown>" --reason "M7 SC3 walkthrough: approve Confluence page update"` (`<PAGE_ID>`, `<N>` and the body: **TBD by lead**) | Approve. The reviewer opens the request on the **Preview** tab (default) and checks the diff styling, then decides |
+| S4 | Release a Confluence page read | A Confluence page of about 5,000 words (the fixture page the scenario reads; the word count describes the fixture, not this document). Submit with `atlas-duck confluence page get <PAGE_ID> --instance <alias> --reason "M7 SC3 walkthrough: read Confluence page"` (`<PAGE_ID>` and the alias: **TBD by lead**) | Release. The reviewer opens the request on the **Preview** tab (default), opens the preview, reads the page render, then decides |
+| S5 | Approve a small Confluence page update | A `confluence.page.update` with a small Markdown diff. Submit with `atlas-duck confluence page update <PAGE_ID> --instance <alias> --base-version <N> --body "<markdown>" --reason "M7 SC3 walkthrough: approve Confluence page update"` (`<PAGE_ID>`, the alias, `<N>` and the body: **TBD by lead**; `<N>` must equal the page's current version) | Approve. The reviewer opens the request on the **Preview** tab (default), opens the preview, and checks the diff styling, then decides |
 
-S4 and S5 follow the same timing rule (section 2). Tab labels in the approvals window are Preview, Structured, Raw and Request; Preview is the default. The reviewer may switch tabs, and a tab switch counts as a re-read of the preview (record it as Y).
+S4 and S5 follow the same timing rule (section 2). Tab labels in the approvals window are Preview, Structured, Raw and Request; Preview is the default. The preview is behind an **Open preview** button. Whether that click is inside the timed window: **TBD by lead** (suggestion: yes, included, since section 2 starts the timer at focus). The re-read column stays the reviewer's own yes/no answer, as in section 2.
 
 Substitution if the lead prefers the spec's SC3 reference list instead: **TBD by lead**. The spec list (§1.4) includes `jira.issue.get`, `jira.search` with 50 rows, a Confluence page of about 5,000 words, `jira.issue.create`, a small `confluence.page.update` diff, and a 200-row script result. Only use it if the lead names it.
 
