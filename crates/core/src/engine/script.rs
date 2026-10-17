@@ -472,13 +472,32 @@ struct InFlight {
     ctl: FetchControl,
 }
 
-/// Whether the next page of an `atlas.all` call may be requested ([`RunShared::begin_page`]).
+/// Whether a call or the next page of an `atlas.all` call may be requested
+/// ([`RunShared::begin_page`]).
 enum PageStart {
     Go,
     /// The run ended or its kill was asked.
     Stopped,
     MaxCalls,
     MaxFetch,
+}
+
+impl PageStart {
+    /// What the script sees of a call or page that does not start; `None` = it goes.
+    fn refusal(self) -> Option<HostCallResult> {
+        match self {
+            PageStart::Go => None,
+            PageStart::Stopped => Some(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED)),
+            PageStart::MaxCalls => Some(rejected_msg(
+                ErrorCode::ScriptLimit,
+                "the run would exceed max_calls",
+            )),
+            PageStart::MaxFetch => Some(rejected_msg(
+                ErrorCode::ScriptLimit,
+                "the run's fetched bytes reached max_fetch_mb",
+            )),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -589,17 +608,12 @@ impl RunShared {
         lock(&self.inner).instances.clone()
     }
 
-    fn add_in_flight(&self, info: CallInfo, ctl: FetchControl) {
-        lock(&self.inner)
-            .in_flight
-            .insert(info.call_id, InFlight { info, ctl });
-    }
-
-    /// Puts the next page of an `atlas.all` call in flight (PD-144), in one critical section with
-    /// the checks that may refuse it: the run ended or a kill was asked (the end, which takes the
-    /// calls in flight only after one of the two, would never see this page), then with
+    /// Puts a call, or the next page of an `atlas.all` call (PD-144), in flight, in one critical
+    /// section with the checks that may refuse it: the run ended or a kill was asked (the end,
+    /// which takes the calls in flight only after one of the two, would never see it), then with
     /// `limits = Some((max_calls, fetch_cap))` the page that would exceed `max_calls` and the
-    /// run's fetched bytes at the cap. Only a page that goes is counted.
+    /// run's fetched bytes at the cap. Only a page that goes is counted. `limits = None` (a plain
+    /// call, page 0, both counted by `accept_call`) answers `Go` or `Stopped` only.
     fn begin_page(
         &self,
         info: CallInfo,
@@ -1116,8 +1130,16 @@ impl LiveBackend {
         };
         let ctl = FetchControl::new();
         // The control first, then the cover: a cancel that took the control before it exists
-        // finds nothing in flight and a request that ended mints no cover (Task 24 rule).
-        self.shared.add_in_flight(info.clone(), ctl.clone());
+        // finds nothing in flight and a request that ended mints no cover (Task 24 rule). It is
+        // registered under the run's lock with the ended/kill check: a run that ended after
+        // `live_call`'s `running()` check refuses it here, so it is never sent (T13 review I-1).
+        if let Some(refused) = self
+            .shared
+            .begin_page(info.clone(), ctl.clone(), None)
+            .refusal()
+        {
+            return refused;
+        }
         let classified = match self.fetch(&call, &vc, &ctl, None).await {
             Ok(c) => c,
             Err(result) => {
@@ -1182,20 +1204,12 @@ impl LiveBackend {
             // Page 0 was counted and checked as the call itself (`live_call`). Before any later
             // page: `max_calls`, then the fetched bytes (PD-144 order).
             let limits = (page > 0).then_some((self.limits.max_calls, fetch_cap));
-            match self.shared.begin_page(info.clone(), ctl.clone(), limits) {
-                PageStart::Go => {}
-                PageStart::Stopped => {
-                    return rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED);
-                }
-                PageStart::MaxCalls => {
-                    return rejected_msg(ErrorCode::ScriptLimit, "the run would exceed max_calls");
-                }
-                PageStart::MaxFetch => {
-                    return rejected_msg(
-                        ErrorCode::ScriptLimit,
-                        "the run's fetched bytes reached max_fetch_mb",
-                    );
-                }
+            if let Some(refused) = self
+                .shared
+                .begin_page(info.clone(), ctl.clone(), limits)
+                .refusal()
+            {
+                return refused;
             }
             let classified = match self.fetch(&call, &vc, &ctl, Some((page, start))).await {
                 Ok(c) => c,
@@ -3186,6 +3200,80 @@ mod tests {
         assert!(over.add(set[0].clone(), false));
         assert!(!over.add(set[1].clone(), true));
         assert_eq!(over.take()["issues"].as_array().map(Vec::len), Some(2));
+        Ok(())
+    }
+
+    /// T13 review I-1: a plain call whose run ended, or whose kill was asked, after `live_call`'s
+    /// `running()` check is refused when it registers (one lock with the end's drain): nothing
+    /// is sent, so no request leaves without its `SCRIPT_CALL` (§5.1 inv. 1, §9.5). The run's
+    /// state at that moment is a fresh `RunShared`, ended or killed; the request stays `Running`
+    /// (its worker is held at start), so the cover would be minted.
+    #[cfg(feature = "testing")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_registering_after_the_run_ended_is_never_sent() -> TestResult {
+        use crate::testing::{FakeScriptRunner, Harness, ScriptPlan, host_call};
+        let end = RunEnd::Result {
+            value: json!(1),
+            logs: Vec::new(),
+            stderr: String::new(),
+        };
+        let hold = crate::Pause::new();
+        let runner = FakeScriptRunner::new(vec![
+            ScriptPlan::new(Vec::new(), end).with_start_pause(hold.clone()),
+        ]);
+        let h = Harness::builder()
+            .jira("jira-main")
+            .scripts(runner)
+            .start()
+            .await?;
+        let mock = h.mock("jira-main").ok_or("no jira mock")?;
+        let fixture = atlas_duck_atlassian::testing::fixtures::JIRA_ISSUE;
+        mock.json("/rest/api/2/issue/ABC-1", 200, fixture).await;
+        let issue = mock.path("/rest/api/2/issue/ABC-1");
+        let env = h.submit_script(json!({ "source": "return 1;" })).await;
+        let id = env.request_id.clone().ok_or("no request_id")?;
+        hold.reached.notified().await;
+        let engine = h.engine().clone();
+        let entry = engine.entry(&id).ok_or("no entry")?;
+        let limits = entry
+            .state()
+            .script
+            .as_ref()
+            .map(|s| s.limits)
+            .ok_or("no script state")?;
+        let ended = Arc::new(RunShared::default());
+        ended.mark_ended();
+        let killed = Arc::new(RunShared::default());
+        killed.request_kill(KillReason::Client);
+        for shared in [ended, killed] {
+            let validator = Arc::new(EngineValidator::new(engine.clone()));
+            let call = host_call(1, "jira.issue.get", json!({ "key": "ABC-1" }));
+            let vc = match validator.validate(&call) {
+                Ok(vc) => vc,
+                Err(r) => return Err(format!("validation: {r:?}").into()),
+            };
+            let backend = LiveBackend::new(
+                engine.clone(),
+                entry.clone(),
+                shared.clone(),
+                validator,
+                limits,
+            );
+            match backend.execute(call, vc).await {
+                HostCallResult::Rejected { class, .. } => assert_eq!(class, "cancelled"),
+                other => return Err(format!("expected cancelled, got {other:?}").into()),
+            }
+            assert!(shared.take_in_flight().is_empty());
+        }
+        let sent = mock
+            .received()
+            .await
+            .iter()
+            .filter(|r| r.url.path() == issue)
+            .count();
+        assert_eq!(sent, 0, "a request left after the run ended");
+        hold.release.notify_one();
+        h.queued(&id, 5000).await.ok_or("never queued")?;
         Ok(())
     }
 }
