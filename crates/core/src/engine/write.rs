@@ -1429,6 +1429,22 @@ pub(super) async fn gate_get(
     let Some(trigger) = identity::trigger(&outcome) else {
         return Gated::Proceed(outcome);
     };
+    match gate_trigger(engine, instance_id, seen, trigger, mode, allow_rerun).await {
+        Some(gated) => gated,
+        None => Gated::Proceed(identity::as_response(outcome)),
+    }
+}
+
+/// [`gate_get`] once the GET is a trigger: the re-check and its [`identity::effect`]; `None` is
+/// a JSON 401 the re-check passed (the GET's answer is an ordinary one).
+async fn gate_trigger(
+    engine: &Arc<Engine>,
+    instance_id: &str,
+    seen: u64,
+    trigger: identity::Trigger,
+    mode: GetMode,
+    allow_rerun: bool,
+) -> Option<Gated> {
     let effect = if allow_rerun {
         let path = match mode {
             GetMode::Enrich => identity::Path::Enrichment,
@@ -1440,8 +1456,8 @@ pub(super) async fn gate_get(
         identity::Effect::HeaderCheckFailed
     };
     let enrich = mode == GetMode::Enrich;
-    match effect {
-        identity::Effect::Ordinary => Gated::Proceed(identity::as_response(outcome)),
+    Some(match effect {
+        identity::Effect::Ordinary => return None,
         identity::Effect::Refetch => Gated::Rerun,
         identity::Effect::HeaderCheckFailed if enrich => {
             Gated::Held(Effect::Direct(identity_unavailable()))
@@ -1459,7 +1475,7 @@ pub(super) async fn gate_get(
         }
         identity::Effect::NeedsToken if enrich => Gated::Held(Effect::Direct(needs_token_direct())),
         identity::Effect::NeedsToken => Gated::Stale((StaleReason::IdentityMismatch, None)),
-    }
+    })
 }
 
 /// An instance already `needs_token` or in an identity-header state is not called (PD-03):
@@ -2081,26 +2097,43 @@ pub(crate) fn identity_call(product: Product) -> GetCall {
     }
 }
 
+/// What the identity call's answer showed (§5.4 step 5, §7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentityCall {
+    Match,
+    /// Confluence: the stored `userKey` under another `username` (§7.1 *Username rename*).
+    Renamed,
+}
+
 /// An identity match (§5.4 step 5, §7.1): Jira 200 JSON whose `key` is the stored user key (the
-/// client already checked `X-AUSERNAME` against the stored name); Confluence 200 JSON with
-/// `type == "known"` and the stored `userKey`. A parsed answer that is not a match is
+/// client already checked `X-AUSERNAME` against the stored name); Confluence 200 JSON judged by
+/// the re-check's own rule (`type == "known"`, a `username`, the stored `userKey`; L99), where
+/// the stored key under another `username` is a rename. A parsed answer that is not a match is
 /// `identity_mismatch`; anything else is `recheck_failed {class}`.
-fn identity_check(outcome: FetchOutcome, product: Product, user_key: &str) -> Result<(), Recheck> {
+fn identity_check(
+    outcome: FetchOutcome,
+    product: Product,
+    stored: &StoredIdentity,
+) -> Result<IdentityCall, Recheck> {
+    const MISMATCH: Recheck = (StaleReason::IdentityMismatch, None);
     // §7.1: a match is a 200; another parsed 2xx JSON answer is not one (review M-4).
     let ok_status = matches!(&outcome, FetchOutcome::Response(r) if r.status == 200);
     let v = recheck(outcome)?;
-    let matched = ok_status
-        && match product {
-            Product::Jira => v.get("key").and_then(Value::as_str) == Some(user_key),
-            Product::Confluence => {
-                v.get("type").and_then(Value::as_str) == Some("known")
-                    && v.get("userKey").and_then(Value::as_str) == Some(user_key)
-            }
-        };
-    if matched {
-        Ok(())
-    } else {
-        Err((StaleReason::IdentityMismatch, None))
+    if !ok_status {
+        return Err(MISMATCH);
+    }
+    match product {
+        Product::Jira
+            if v.get("key").and_then(Value::as_str) == Some(&stored.atlassian_user_key) =>
+        {
+            Ok(IdentityCall::Match)
+        }
+        Product::Jira => Err(MISMATCH),
+        Product::Confluence => match identity::judge_confluence_body(&v, stored) {
+            identity::RecheckResult::IdentityMatch => Ok(IdentityCall::Match),
+            identity::RecheckResult::Renamed { .. } => Ok(IdentityCall::Renamed),
+            _ => Err(MISMATCH),
+        },
     }
 }
 
@@ -2166,7 +2199,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
         stale_fail(engine, entry, approval, None, fail).await;
         return;
     }
-    let Some(identity) = stored_identity(engine, entry).await else {
+    let Some(mut identity) = stored_identity(engine, entry).await else {
         stale_fail(engine, entry, approval, None, recheck_failed("needs_token")).await;
         return;
     };
@@ -2213,10 +2246,43 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
                     return;
                 }
             }
-            Gated::Proceed(outcome) => {
-                if let Err(fail) =
-                    identity_check(outcome, spec.product, &identity.atlassian_user_key)
-                {
+            Gated::Proceed(outcome) => match identity_check(outcome, spec.product, &identity) {
+                Ok(IdentityCall::Match) => break record,
+                // §7.1 *Username rename* (L99): the token re-check confirms the rename and stores
+                // the new name, then the identity call runs once more, as after a Jira header
+                // check; it is judged against the name stored now.
+                Ok(IdentityCall::Renamed) => {
+                    let gated = gate_trigger(
+                        engine,
+                        &entry.instance_id,
+                        seen,
+                        identity::Trigger::HeaderCheck,
+                        GetMode::Recheck,
+                        attempt == 0,
+                    )
+                    .await;
+                    let fail = match gated {
+                        Some(Gated::Rerun) => match stored_identity(engine, entry).await {
+                            Some(now) => {
+                                identity = now;
+                                attempt += 1;
+                                if !engine
+                                    .append_pending(entry, vec![record], Some(approval))
+                                    .await
+                                {
+                                    return;
+                                }
+                                continue;
+                            }
+                            None => recheck_failed("needs_token"),
+                        },
+                        Some(Gated::Stale(fail)) => fail,
+                        _ => (StaleReason::IdentityMismatch, None),
+                    };
+                    stale_fail(engine, entry, approval, Some(record), fail).await;
+                    return;
+                }
+                Err(fail) => {
                     // A parsed answer for another user (or an anonymous one) is the §7.1
                     // trigger the identity call itself is the only place to notice for
                     // Confluence: the token re-check runs and decides the instance state.
@@ -2226,8 +2292,7 @@ async fn stale_check(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, approval: 
                     stale_fail(engine, entry, approval, Some(record), fail).await;
                     return;
                 }
-                break record;
-            }
+            },
             Gated::Stale(fail) => {
                 stale_fail(engine, entry, approval, Some(record), fail).await;
                 return;
@@ -2962,29 +3027,116 @@ mod tests {
 
     #[test]
     fn identity_match_rules() {
+        let stored = StoredIdentity {
+            atlassian_user: "jdoe".into(),
+            atlassian_user_key: "JIRAUSER1".into(),
+        };
         let ok = |body: &str, product| {
             identity_check(
                 FetchOutcome::Response(resp(200, "application/json", body.as_bytes())),
                 product,
-                "JIRAUSER1",
+                &stored,
             )
         };
-        assert_eq!(ok(r#"{"key":"JIRAUSER1"}"#, Product::Jira), Ok(()));
+        assert_eq!(
+            ok(r#"{"key":"JIRAUSER1"}"#, Product::Jira),
+            Ok(IdentityCall::Match)
+        );
         assert_eq!(
             ok(r#"{"key":"JIRAUSER9"}"#, Product::Jira),
             Err((StaleReason::IdentityMismatch, None))
         );
         assert_eq!(
             ok(
+                r#"{"type":"known","username":"jdoe","userKey":"JIRAUSER1"}"#,
+                Product::Confluence
+            ),
+            Ok(IdentityCall::Match)
+        );
+        // §7.1 (review M-4): a match is a 200, never another parsed 2xx.
+        for (body, product) in [
+            (r#"{"key":"JIRAUSER1"}"#, Product::Jira),
+            (
+                r#"{"type":"known","username":"jdoe","userKey":"JIRAUSER1"}"#,
+                Product::Confluence,
+            ),
+        ] {
+            assert_eq!(
+                identity_check(
+                    FetchOutcome::Response(resp(201, "application/json", body.as_bytes())),
+                    product,
+                    &stored,
+                ),
+                Err((StaleReason::IdentityMismatch, None))
+            );
+        }
+        // L99: without a `username` the re-check sees no user; the identity call agrees.
+        assert_eq!(
+            ok(
                 r#"{"type":"known","userKey":"JIRAUSER1"}"#,
                 Product::Confluence
             ),
-            Ok(())
+            Err((StaleReason::IdentityMismatch, None))
         );
         assert_eq!(
             ok(r#"{"type":"anonymous"}"#, Product::Confluence),
             Err((StaleReason::IdentityMismatch, None))
         );
+    }
+
+    /// L99 (L153, plan review I-10): the same `user/current` answers give the same verdict class
+    /// through the pre-write identity call and through the re-check's `judge_confluence`.
+    #[test]
+    fn l99_confluence_identity_call_and_recheck_agree() {
+        let stored = StoredIdentity {
+            atlassian_user: "jdoe".into(),
+            atlassian_user_key: "JIRAUSER1".into(),
+        };
+        let answer = |body: &Value| {
+            FetchOutcome::Response(resp(200, "application/json", body.to_string().as_bytes()))
+        };
+        let known =
+            |name: &str, key: &str| json!({"type": "known", "username": name, "userKey": key});
+        let cases = [
+            (
+                "known, same key, same name",
+                known("jdoe", "JIRAUSER1"),
+                "match",
+            ),
+            ("known, other key", known("bob", "JIRAUSER9"), "mismatch"),
+            ("anonymous", json!({"type": "anonymous"}), "mismatch"),
+            (
+                "known, no userKey",
+                json!({"type": "known", "username": "jdoe"}),
+                "mismatch",
+            ),
+            (
+                "known, same key, no username",
+                json!({"type": "known", "userKey": "JIRAUSER1"}),
+                "mismatch",
+            ),
+            (
+                "known, same key, other username",
+                known("jdoe2", "JIRAUSER1"),
+                "rename",
+            ),
+        ];
+        for (what, body, want) in cases {
+            use identity::RecheckResult as R;
+            let recheck = match identity::judge(Product::Confluence, &answer(&body), &stored) {
+                R::IdentityMatch => "match".to_owned(),
+                R::Renamed { .. } => "rename".to_owned(),
+                R::TokenFailure { .. } => "mismatch".to_owned(),
+                other => format!("{other:?}"),
+            };
+            let call = match identity_check(answer(&body), Product::Confluence, &stored) {
+                Ok(IdentityCall::Match) => "match".to_owned(),
+                Ok(IdentityCall::Renamed) => "rename".to_owned(),
+                Err((StaleReason::IdentityMismatch, None)) => "mismatch".to_owned(),
+                Err(other) => format!("{other:?}"),
+            };
+            assert_eq!((recheck.as_str(), call.as_str()), (want, want), "{what}");
+        }
     }
 
     #[test]

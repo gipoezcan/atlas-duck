@@ -9,10 +9,13 @@
 //! [`effect`], what the triggering call becomes; each driver (read, enrichment, stale check,
 //! write response) maps the [`Effect`] onto its own failure shape.
 //!
-//! * At most one re-check is in flight per instance: later triggers await the same result
-//!   (`OnceCell` per epoch). A re-check that changed the instance bumps the instance's epoch;
-//!   a trigger whose call started before that (`seen < epoch`) is answered with that result
-//!   without a new call, so the 10th of ten concurrent failures still sees the rename.
+//! * At most one re-check is in flight per instance: later triggers await the same result. The
+//!   re-check runs as its own spawned task, started in the critical section that found none in
+//!   flight, and every waiter only watches it (PD-113, L101): a dropped waiter can neither leave
+//!   a `token_recheck` start without its result nor make the next waiter start a second fetch.
+//!   A re-check that changed the instance bumps the instance's epoch; a trigger whose call
+//!   started before that (`seen < epoch`) is answered with that result without a new call, so the
+//!   10th of ten concurrent failures still sees the rename.
 //! * An instance already in `needs_token` or an identity-header state answers from its state.
 //! * A re-check that is not a parsed JSON 2xx (or a JSON 401) is [`RecheckResult::Inconclusive`]:
 //!   it changes no state. The §7.1 branches do not name this case (a rate-limited `/myself`);
@@ -32,7 +35,7 @@ use atlas_duck_atlassian::{
 };
 use atlas_duck_registry::Product;
 use serde_json::{Map, Value};
-use tokio::sync::OnceCell;
+use tokio::sync::watch;
 
 use crate::audit_port::commit_system_fetch_start;
 use crate::engine::Engine;
@@ -288,11 +291,17 @@ pub(crate) fn judge_confluence_answer(
     let Ok(body) = serde_json::from_slice::<Value>(&r.body) else {
         return RecheckResult::Inconclusive;
     };
+    judge_confluence_body(&body, stored)
+}
+
+/// The verdict on the parsed body of a Confluence `user/current` 200: `type == "known"`, a
+/// `username` and the stored `userKey` (§7.1). The pre-write identity call judges its answer by
+/// this same rule (L99, L153).
+pub(crate) fn judge_confluence_body(body: &Value, stored: &StoredIdentity) -> RecheckResult {
     if body.get("type").and_then(Value::as_str) != Some("known") {
         return RecheckResult::TokenFailure { other_user: None };
     }
-    let (Some(name), Some(key)) = (str_field(&body, "username"), str_field(&body, "userKey"))
-    else {
+    let (Some(name), Some(key)) = (str_field(body, "username"), str_field(body, "userKey")) else {
         return RecheckResult::TokenFailure { other_user: None };
     };
     if key != stored.atlassian_user_key {
@@ -319,7 +328,8 @@ struct Gate {
     epoch: u64,
     /// The result that last bumped `epoch`, with the epoch it produced.
     last_change: Option<(u64, RecheckResult)>,
-    in_flight: Option<Arc<OnceCell<RecheckResult>>>,
+    /// The re-check running now: its task publishes the result here once (`None` until then).
+    in_flight: Option<watch::Receiver<Option<RecheckResult>>>,
     /// A rename (`user_key`, new name) that is recorded but could not be stored in the
     /// keychain: the next answer under the new name does not record it again (review M-1).
     unstored_rename: Option<(String, String)>,
@@ -484,7 +494,7 @@ async fn recheck_or(
     if let Some(known) = known_state(engine, instance_id) {
         return known;
     }
-    let cell = {
+    let mut rx = {
         let mut gates = engine.identity_gates().lock();
         let gate = gates.entry(instance_id.to_owned()).or_default();
         if let Some((epoch, result)) = &gate.last_change
@@ -492,34 +502,67 @@ async fn recheck_or(
         {
             return result.clone();
         }
-        gate.in_flight
-            .get_or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
-    };
-    cell.get_or_init(|| async move {
-        // Its records (the `SYSTEM_FETCH` pair, a state change) end before `APP_STOP`.
-        let result = match engine.identity_gates().enter(engine) {
-            Some(entered) => {
-                let result = match observed {
-                    Some(r) => r,
-                    None => run(engine, instance_id, &entered.ctl).await,
-                };
-                on_result(engine, instance_id, &result).await;
-                result
+        match gate.in_flight.as_ref().filter(|rx| running(rx)) {
+            Some(rx) => rx.clone(),
+            None => {
+                // Started in this critical section: a trigger that finds no re-check in flight
+                // and the one that starts it are the same (L101).
+                let (tx, rx) = watch::channel(None);
+                gate.in_flight = Some(rx.clone());
+                tokio::spawn(run_gated(
+                    engine.clone(),
+                    instance_id.to_owned(),
+                    observed,
+                    tx,
+                ));
+                rx
             }
-            None => RecheckResult::Inconclusive,
-        };
+        }
+    };
+    // A task that ended without a result (only a runtime shutdown aborts one) concluded nothing.
+    match rx.wait_for(Option::is_some).await {
+        Ok(result) => result.clone().unwrap_or(RecheckResult::Inconclusive),
+        Err(_) => RecheckResult::Inconclusive,
+    }
+}
+
+/// Whether the re-check behind `rx` is still running: a task that was aborted before it cleared
+/// its handle (only a runtime shutdown aborts one) left it behind, and the next trigger starts a
+/// new one.
+fn running(rx: &watch::Receiver<Option<RecheckResult>>) -> bool {
+    rx.has_changed().is_ok()
+}
+
+/// The spawned re-check (PD-113): it owns its records (the `SYSTEM_FETCH` pair and a state
+/// change), which end before `APP_STOP` (§2.5 step 5: it runs under [`Gates::enter`], the
+/// shutdown cancels its GET), then the gate update, then the result for every waiter.
+async fn run_gated(
+    engine: Arc<Engine>,
+    instance_id: String,
+    observed: Option<RecheckResult>,
+    tx: watch::Sender<Option<RecheckResult>>,
+) {
+    let result = match engine.identity_gates().enter(&engine) {
+        Some(entered) => {
+            let result = match observed {
+                Some(r) => r,
+                None => run(&engine, &instance_id, &entered.ctl).await,
+            };
+            on_result(&engine, &instance_id, &result).await;
+            result
+        }
+        None => RecheckResult::Inconclusive,
+    };
+    {
         let mut gates = engine.identity_gates().lock();
-        let gate = gates.entry(instance_id.to_owned()).or_default();
+        let gate = gates.entry(instance_id).or_default();
         gate.in_flight = None;
         if result.changes_state() {
             gate.epoch += 1;
             gate.last_change = Some((gate.epoch, result.clone()));
         }
-        result
-    })
-    .await
-    .clone()
+    }
+    tx.send_replace(Some(result));
 }
 
 /// The re-check's own call, under `SYSTEM_FETCH {purpose: token_recheck}`: the start record
