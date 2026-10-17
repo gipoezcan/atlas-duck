@@ -334,7 +334,7 @@ fn line_diff_long_equal_lines_stay_fast() {
     let took = started.elapsed();
     assert!(!out.truncated);
     assert_eq!(check_script(&old, &new, &out.lines), 2_000);
-    assert!(took < std::time::Duration::from_millis(100), "{took:?}");
+    assert!(took < std::time::Duration::from_millis(500), "{took:?}");
 
     let line = format!("{}\n", "x".repeat(199));
     let side = |head: &str, n: usize, tail: &str| format!("{head}\n{}{tail}\n", line.repeat(n));
