@@ -57,6 +57,24 @@ For each architecture:
 7. Wait until the inert period passes, then approve.
 8. Expected: the CLI process that submitted the request exits with code **0** and prints a receipt. Check with `echo $?`.
 
+## 3a. Confluence: get, update, attachment collision
+
+Run on each architecture. Every command carries `--reason`; the reason text below is the checklist's own. Page ID, base version and file path: **TBD by lead**. Instance alias flag (if the lead's mock needs one, from 0.1): **TBD by lead**; run `atlas-duck confluence page get --help` to confirm whether it exists, and do not invent one.
+
+1. **Page get, release with redaction.** In a Terminal:
+   `atlas-duck confluence page get <PAGE_ID> --reason "M7 checklist: read Confluence page for release"`
+   - Expected: a toast appears and the approvals window shows the request. Open the **Preview** tab (default) and check the page renders in the sandboxed frame.
+   - Expected: open the redaction edit, mask the value the lead names (**TBD by lead**), then release.
+   - Expected: the CLI read result shows `redacted: true`, and the CLI exits with code **0**.
+2. **Page update with Markdown, approve.** In a Terminal:
+   `atlas-duck confluence page update <PAGE_ID> --base-version <N> --body "**done**" --reason "M7 checklist: approve Confluence page update"`
+   - Expected: the approvals window shows the request. On the **Preview** tab the diff renders with its styling (see 4.3, `preview.css`). Plain unstyled text is FAIL.
+   - Expected: approve after the inert period (1 s). The CLI exits with code **0** and prints a receipt.
+3. **Attachment collision, deny.** In a Terminal, with a local file whose name collides with an existing attachment on the page (file path: **TBD by lead**):
+   `atlas-duck confluence attachment upload <PAGE_ID> --content-base64-file <path> --reason "M7 checklist: deny attachment collision"`
+   - Expected: the approvals window shows the request. Deny it in the UI.
+   - Expected: the CLI exits with code **3**. The attachment on the page is unchanged.
+
 ## 4. Deny, redaction, preview
 
 1. Submit a second request, then deny it in the UI.
@@ -140,6 +158,12 @@ Fill one row per check, per architecture. Mark each item `PASS`, `FAIL` or `N/A`
 |      |        |      |  | 4.5 Batch approve, held Enter does not confirm |  |  |
 |      |        |      |  | 4.6 Bidi controls neutralised, no reorder |  |  |
 |      |        |      |  | 4.7 window.open refused, canary unset, title unchanged |  |  |
+|      |        | arm64 |  | 3a.1 Confluence page get, release with redaction (`redacted: true`) |  |  |
+|      |        | arm64 |  | 3a.2 Confluence page update (Markdown), approve exit 0 |  |  |
+|      |        | arm64 |  | 3a.3 Attachment collision, deny exit 3 |  |  |
+|      |        | x86_64 |  | 3a.1 Confluence page get, release with redaction (`redacted: true`) |  |  |
+|      |        | x86_64 |  | 3a.2 Confluence page update (Markdown), approve exit 0 |  |  |
+|      |        | x86_64 |  | 3a.3 Attachment collision, deny exit 3 |  |  |
 |      |        | x64 / arm64 |  | 9.6 Hardening policies on first webview (Windows) |  |  |
 |      |        | x64 / arm64 |  | 9.7 Setup window rebuild (Windows) |  |  |
 |      |        | x64 / arm64 |  | 9.8 Raise paths, current queue on first frame (Windows) |  |  |

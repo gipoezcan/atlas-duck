@@ -31,6 +31,10 @@ Run each scenario once per reviewer. Use the same order for every reviewer, and 
 | S1 | Approve a Jira create | A `jira.issue.create` request with a short summary and description | Approve |
 | S2 | Approve a comment with a redaction edit | A comment on a Jira issue containing one value to mask | Edit the redaction, then approve |
 | S3 | Deny a batch | A batch of several operations (count: **TBD by lead**) | Deny the whole batch |
+| S4 | Release a Confluence page read | A Confluence page of about 5,000 words (the fixture page the scenario reads; the word count describes the fixture, not this document). Submit with `atlas-duck confluence page get <PAGE_ID> --reason "M7 SC3 walkthrough: read Confluence page"` | Release. The reviewer opens the request on the **Preview** tab (default), reads the page render, then decides |
+| S5 | Approve a small Confluence page update | A `confluence.page.update` with a small Markdown diff. Submit with `atlas-duck confluence page update <PAGE_ID> --base-version <N> --body "<markdown>" --reason "M7 SC3 walkthrough: approve Confluence page update"` (`<PAGE_ID>`, `<N>` and the body: **TBD by lead**) | Approve. The reviewer opens the request on the **Preview** tab (default) and checks the diff styling, then decides |
+
+S4 and S5 follow the same timing rule (section 2). Tab labels in the approvals window are Preview, Structured, Raw and Request; Preview is the default. The reviewer may switch tabs, and a tab switch counts as a re-read of the preview (record it as Y).
 
 Substitution if the lead prefers the spec's SC3 reference list instead: **TBD by lead**. The spec list (§1.4) includes `jira.issue.get`, `jira.search` with 50 rows, a Confluence page of about 5,000 words, `jira.issue.create`, a small `confluence.page.update` diff, and a 200-row script result. Only use it if the lead names it.
 
@@ -51,6 +55,8 @@ Fill one row per reviewer per scenario. Times are in seconds, to one decimal pla
 |  |  | S1 |  |  |  |  |  |  |  |
 |  |  | S2 |  |  |  |  |  |  |  |
 |  |  | S3 |  |  |  |  |  |  |  |
+|  |  | S4 |  |  |  |  |  |  |  |
+|  |  | S5 |  |  |  |  |  |  |  |
 
 Summary to record after all reviewers:
 
