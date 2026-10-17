@@ -924,8 +924,9 @@ impl ScriptErrorDetails {
 }
 
 /// `SCRIPT_STARTED {source, args, limits, queued, confinement?}` (§9.1 step 2): the full source,
-/// so the log can show what ran, and (additive, PD-138) the `{mode, worker_version, report}` the
-/// run is spawned under when the runner states it.
+/// so the log can show what ran, and (additive, PD-138) the confinement the run is admitted
+/// under when the runner states it: `{mode, worker_version, probe_report}`, where `probe_report`
+/// is the startup probe's report (the run's worker does not exist yet).
 pub fn script_started(
     ctx: &EventCtx,
     source: &str,

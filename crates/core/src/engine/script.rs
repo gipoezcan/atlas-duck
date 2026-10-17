@@ -165,22 +165,26 @@ impl ConfinementMode {
     }
 }
 
-/// `SCRIPT_STARTED.confinement` (PD-138, R1): the mode and worker version a run is spawned under,
-/// with the confinement report the runner holds for it.
+/// `SCRIPT_STARTED.confinement` (PD-138, R1): the confinement a run is admitted under (the mode
+/// and the expected worker version), with the startup probe's report. It is stated before any
+/// worker exists, so `probe_report` is never that run's own ready-frame report (T12 review I-1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunConfinement {
     pub mode: ConfinementMode,
+    /// The embedded worker version the run expects; the bridge refuses a worker whose ready
+    /// frame names another (PD-133).
     pub worker_version: String,
-    pub report: ConfinementReport,
+    /// The startup probe's report, not the run's worker's.
+    pub probe_report: ConfinementReport,
 }
 
 impl RunConfinement {
-    /// The record's `{mode, worker_version, report}`.
+    /// The record's `{mode, worker_version, probe_report}`.
     pub fn to_value(&self) -> Value {
         json!({
             "mode": self.mode.as_str(),
             "worker_version": self.worker_version,
-            "report": serde_json::to_value(&self.report).unwrap_or(Value::Null),
+            "probe_report": serde_json::to_value(&self.probe_report).unwrap_or(Value::Null),
         })
     }
 }
@@ -261,8 +265,15 @@ pub trait ScriptRunner: Send + Sync {
         limits: &ScriptLimits,
         policy: RunPolicy,
     ) -> Result<(), CompileFailure>;
-    /// What a run spawned now under `policy` runs with, for `SCRIPT_STARTED.confinement`
-    /// (PD-138). `None`: the runner states nothing and the record has no `confinement` key.
+    /// The confinement a run is admitted under now with `policy`, for
+    /// `SCRIPT_STARTED.confinement` (PD-138): the mode, the expected worker version and the
+    /// startup probe's report (never the run's own worker's: none exists yet). `None`: the record
+    /// has no `confinement` key. Contract:
+    /// - `None` while no probe report exists, and when the floor is not met and
+    ///   `policy.allow_degraded` is off (`start` then refuses with `FloorNotMet`; the mode would
+    ///   be neither `Floor` nor `Degraded`).
+    /// - Never blocks: it is a sync call on a runtime thread, between the real slot and the
+    ///   `SCRIPT_STARTED` append. It reads what the runner already holds.
     fn confinement(&self, policy: RunPolicy) -> Option<RunConfinement>;
     /// Starts a worker; its `host.call`s arrive at `calls`.
     async fn start(
@@ -1805,7 +1816,9 @@ async fn run(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
     }
 }
 
-/// A slot of `sem`, or `None` once the request is terminal (cancel, expiry) meanwhile.
+/// A slot of `sem`, or `None` once the request is terminal (cancel, expiry) meanwhile. An end
+/// wins over a free permit (`biased`): a request cancelled during `check_available` gets no
+/// compile worker (T12 review M-3).
 async fn slot(
     sem: &Arc<Semaphore>,
     entry: &RequestEntry,
@@ -1827,8 +1840,9 @@ async fn slot(
         }
     };
     tokio::select! {
-        permit = sem.clone().acquire_owned() => permit.ok().map(|p| (p, true)),
+        biased;
         () = ended => None,
+        permit = sem.clone().acquire_owned() => permit.ok().map(|p| (p, true)),
     }
 }
 
@@ -1965,7 +1979,7 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         return;
     }
     // 3. A real slot; `queued` = it was not immediately available (§9.5). The run policy is read
-    //    here, when the slot is acquired (PD-141).
+    //    here, when the slot is acquired (PD-141), with the confinement the run is admitted under.
     let Some((permit, queued)) = slot(&engine.script_slots, entry, true).await else {
         return;
     };
