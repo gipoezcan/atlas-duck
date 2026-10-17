@@ -926,11 +926,19 @@ impl InstanceAdmin for CoreInstances {
         // Before the keychain changes: a Confluence read in flight concludes nothing from an
         // identity GET that may run under the new token (T13 review B-1).
         self.engine.credential_changing(&id);
-        let (creds, store_id) = (self.engine.credentials().clone(), id.clone());
-        let stored = tokio::task::spawn_blocking(move || creds.store(&store_id, cred))
-            .await
-            .map_err(|_| AdminError::Keychain(CredentialError::Unavailable))
-            .and_then(|r| r.map_err(AdminError::Keychain));
+        let (engine, store_id) = (self.engine.clone(), id.clone());
+        let stored = tokio::task::spawn_blocking(move || {
+            let stored = engine.credentials().store(&store_id, cred);
+            // Again as soon as the store returned, on its thread (T30 review I-2): a read that
+            // took the generation while the store ran may have fetched its content under the old
+            // token and send its identity GET under the new one; its compare now differs. Also
+            // after a failed store (fail closed: one retryable read).
+            engine.credential_changing(&store_id);
+            stored
+        })
+        .await
+        .map_err(|_| AdminError::Keychain(CredentialError::Unavailable))
+        .and_then(|r| r.map_err(AdminError::Keychain));
         if let Err(e) = stored {
             // The record above said the token changed; it did not (review M-1): say so.
             let failed = payloads::credential_changed(

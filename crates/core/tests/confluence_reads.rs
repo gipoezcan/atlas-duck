@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use atlas_duck_atlassian::ReadBudget;
-use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, UserKind};
+use atlas_duck_atlassian::testing::{MockDc, TEST_PAT, TEST_USER, TEST_USER_KEY, UserKind};
 use atlas_duck_audit::EventType;
 use atlas_duck_core::engine::cache::RebuildError;
 use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
@@ -40,7 +40,7 @@ use common::confluence::{
     page_with_view, search_gets, user, user_gets,
 };
 use common::jira::{gets_on, query};
-use common::{TestError, TestResult, code, de, request_id, test_hits};
+use common::{TestError, TestResult, code, de, exit, request_id, test_hits};
 use secrecy::SecretString;
 use serde_json::{Map, Value, json};
 
@@ -1156,6 +1156,93 @@ async fn user_cache_cleared_on_credential_change() -> TestResult {
     queued(&h, PAGE_GET, json!({ "id": ID })).await?;
     assert_eq!(user_gets(&b).await.len(), 2, "B is asked for both users");
     assert_eq!(user_gets(a).await.len(), 4);
+    Ok(())
+}
+
+/// The `authorization` header of every request on `p`, in arrival order.
+async fn bearers(mock: &MockDc, p: &str) -> Vec<String> {
+    gets_on(mock, p)
+        .await
+        .iter()
+        .map(|r| {
+            r.headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect()
+}
+
+/// T30 review I-2 (the T13 review B-1 cases are in `confluence_identity.rs`): a read that starts
+/// while `set_token` writes the keychain takes the credential generation after the bump before
+/// the store, fetches its content under the old PAT and sends its identity GET under the new one
+/// (the same user's, so it matches). The bump after the store still tells the two apart:
+/// `upstream_unavailable {identity_check}`, nothing released, nothing cached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_started_during_the_token_store_is_upstream_unavailable() -> TestResult {
+    const MENTION: &str = r#"<p>Owner <ri:user ri:userkey="key-jdoe"/>. Secret plan.</p>"#;
+    let pause = Pause::new();
+    let h = Harness::builder()
+        .confluence("wiki")
+        .hooks(TestHooks {
+            pause_after_lookups: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page_with_storage(MENTION)).await;
+    mount_users(mock, &[JDOE]).await;
+    // The connection test of `set_token` (its `user/current` is the harness's known answer).
+    mock.applinks_manifest("9.2.1").await;
+    // The keychain write holds until the read has its content and its lookups.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    h.credentials().on_next_store(move || {
+        let _ = entered_tx.send(());
+        let _ = go_rx.recv_timeout(Duration::from_secs(20));
+    });
+    let instances = h.instances();
+    let store = instances.set_token("wiki", SecretString::from("rotated-pat".to_owned()), None);
+    let mut store = std::pin::pin!(store);
+    tokio::select! {
+        _ = &mut store => return Err("set_token returned before its keychain write".into()),
+        entered = tokio::time::timeout(Duration::from_secs(20), entered_rx) => {
+            entered?.map_err(|_| "the store hook never ran")?;
+        }
+    }
+    let env = h.submit(PAGE_GET, json!({ "id": ID })).await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    tokio::time::timeout(Duration::from_secs(20), pause.reached.notified()).await?;
+    go_tx.send(())?;
+    tokio::time::timeout(Duration::from_secs(20), &mut store).await??;
+    pause.release.notify_one();
+    if !h.settled(&id, 20_000).await {
+        let held = h.approver().item(&id).is_some();
+        return Err(format!("the read was not ended (waits for release: {held})").into());
+    }
+    let env = h.await_(&id, 1000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "upstream_unavailable", "{}", env.to_json_line());
+    assert_eq!(exit(&env), 6);
+    assert!(!env.to_json_line().contains("Secret plan"));
+    assert_eq!(
+        read_fetched(&h, &id).await?["unavailable"],
+        "identity_check"
+    );
+    assert!(h.approver().item(&id).is_none(), "no release item");
+    assert_eq!(h.user_cached("wiki", "key-jdoe"), None);
+    // The window was hit: the content and the lookup under the old PAT, the read's identity GET
+    // (after the connection test's) under the new one.
+    let old = format!("Bearer {TEST_PAT}");
+    assert_eq!(bearers(mock, &content_path(ID)).await, [old.clone()]);
+    assert_eq!(bearers(mock, "/rest/api/user").await, [old]);
+    assert_eq!(
+        bearers(mock, IDENTITY_PATH).await,
+        ["Bearer rotated-pat", "Bearer rotated-pat"]
+    );
     Ok(())
 }
 

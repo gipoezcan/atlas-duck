@@ -447,9 +447,14 @@ impl Gates {
         self.lock().get(instance_id).map_or(0, |g| g.credential)
     }
 
-    /// Called before the stored PAT is replaced or deleted. Every call made after the change
-    /// loads the new PAT after this bump, so a read that compares after its last GET returned sees
-    /// it; a store or delete that then fails only costs one retryable read.
+    /// Called before the stored PAT is replaced or deleted, and again on the storing thread as
+    /// soon as a store returned (T30 review I-2). A read takes the generation before its first GET and compares it after its
+    /// last GET returned. Taken before the first bump: the compare sees that bump whenever a GET
+    /// ran under the new PAT. Taken between the two (the keychain write in progress, so its
+    /// content may load the old PAT and its identity GET the new one): the second bump differs.
+    /// Taken after the second: every GET loads the new PAT. A delete needs no second bump: once
+    /// it is done the identity GET finds no PAT and fails. A store or delete that fails only
+    /// costs one retryable read.
     pub(crate) fn credential_changing(&self, instance_id: &str) {
         let mut gates = self.lock();
         let gate = gates.entry(instance_id.to_owned()).or_default();
