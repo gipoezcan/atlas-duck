@@ -6,8 +6,9 @@
 //! parent-death signal (the worker exits on stdin EOF instead).
 //!
 //! Plan decisions (the spec is silent):
-//! - Memory: `SpawnSpec::process_mb` is not applied here. `RLIMIT_AS` is not
-//!   enforced on Darwin (§9.4); the host-side `ri_phys_footprint` watchdog is M8.
+//! - Memory: `SpawnSpec::process_mb` is not applied at the spawn. `RLIMIT_AS`
+//!   is not enforced on Darwin (§9.4); the host-side `ri_phys_footprint`
+//!   watchdog (M8 Task 9, `super::watchdog`) enforces it for a script run.
 //! - The signal state is reset (`POSIX_SPAWN_SETSIGDEF` for every signal,
 //!   `POSIX_SPAWN_SETSIGMASK` empty), so the worker does not inherit the
 //!   host's ignored `SIGPIPE` or a blocked signal mask.
@@ -43,8 +44,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::watchdog::FootprintWatch;
 use crate::drain::{ChunkReader, Keep, StderrDrain};
 use crate::kill::{GuardedKill, ReapGuard};
+use crate::limits::MemoryWatch;
 use crate::spawn::{ExitKind, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner};
 use crate::unix::{UnixReaper, ensure_sole_reaper, sigkill_pid};
 
@@ -126,6 +129,8 @@ impl MacSpawner {
             stderr,
             exit: None,
             parted: false,
+            guard: ReapGuard::new(),
+            process_mb: spec.process_mb,
         })
     }
 }
@@ -298,6 +303,12 @@ pub struct MacWorker {
     exit: Option<ExitKind>,
     /// Set by `into_parts`: the drop then leaves the worker to the parts.
     parted: bool,
+    /// The reap guard the split worker's kill handle, reaper and footprint
+    /// watchdog share (created at the spawn, so the watchdog can take it before
+    /// the split).
+    guard: Arc<ReapGuard>,
+    /// `SpawnSpec::process_mb`: the watchdog's limit (M8 Task 9).
+    process_mb: u32,
 }
 
 impl MacWorker {
@@ -387,6 +398,18 @@ impl WorkerProcess for MacWorker {
         Ok(())
     }
 
+    /// The footprint watchdog (M8 Task 9, §9.4: `RLIMIT_AS` is not enforced
+    /// on Darwin, so this routine sets no memory rlimit): `ri_phys_footprint`
+    /// above `process_mb` kills. It reads under the reap guard the split's kill
+    /// handle and reaper share.
+    fn memory_watch(&mut self) -> io::Result<Option<Box<dyn MemoryWatch>>> {
+        Ok(Some(Box::new(FootprintWatch::new(
+            self.pid,
+            Arc::clone(&self.guard),
+            self.process_mb,
+        ))))
+    }
+
     /// The kill handle is a `kill(SIGKILL)` guarded by the reap flag (macOS
     /// has no pidfd); the reaper polls `waitpid(WNOHANG)` inside the guard's
     /// lock (see `crate::unix`). Unlike [`WorkerProcess::kill`] above, the
@@ -395,7 +418,7 @@ impl WorkerProcess for MacWorker {
         // Nothing below fails, and the drop leaves the worker alone.
         self.parted = true;
         let pid = self.pid;
-        let kill = Arc::new(GuardedKill::fallible(ReapGuard::new(), move || {
+        let kill = Arc::new(GuardedKill::fallible(Arc::clone(&self.guard), move || {
             sigkill_pid(pid)
         }));
         let stdin = StdinPipe(self.stdin.0.take());

@@ -32,14 +32,16 @@ use atlas_duck_ipc::sandbox::{
     EXIT_PROTOCOL, HOST_TO_WORKER_MAX, HostCall, HostCallResult, ScriptLimits, terminal_frame_max,
 };
 use atlas_duck_sandbox_host::bridge::{
-    CompileVerdict, DIAG_CALL_RESULT_REPLACED, DIAG_HOST_PROTOCOL_EXIT, DIAG_OUTCOME_LOST,
-    DIAG_REAP_FAILED, DIAG_UNREAD_RESULTS, ExpectedWorker, HostCallSink, HostVerdict, KillCause,
+    CompileVerdict, DIAG_CALL_RESULT_REPLACED, DIAG_HOST_PROTOCOL_EXIT, DIAG_JOB_MEMORY_LIMIT,
+    DIAG_MEMORY_WATCH_FAILED, DIAG_OUTCOME_LOST, DIAG_REAP_FAILED, DIAG_STDOUT_HELD,
+    DIAG_UNREAD_RESULTS, DIAG_WATCHDOG_KILL, ExpectedWorker, HostCallSink, HostVerdict, KillCause,
     LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl, RunOutcome, STDERR_CAP,
-    StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker, start_run,
-    unread_results_cap,
+    STDOUT_GRACE, StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker,
+    start_run, unread_results_cap,
 };
 use atlas_duck_sandbox_host::identity::{FileId, IdentityPart, SandboxBinaryIdentity};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
+use atlas_duck_sandbox_host::limits::{MemoryWatch, OsMemorySignal};
 use atlas_duck_sandbox_host::spawn::{
     ExitKind, KillHandle, Reaper, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner,
 };
@@ -73,6 +75,9 @@ struct Observed {
     spawns: AtomicU32,
     finished: Mutex<bool>,
     finished_cv: Condvar,
+    /// M8 Task 9: whether the worker was reaped when its memory watch was stopped (`None`: not
+    /// stopped).
+    watch_stopped_after_reap: Mutex<Option<bool>>,
 }
 
 impl Observed {
@@ -109,6 +114,10 @@ impl Observed {
 
     fn received(&self) -> Vec<Value> {
         self.received.lock().map(|r| r.clone()).unwrap_or_default()
+    }
+
+    fn watch_stopped_after_reap(&self) -> Option<bool> {
+        self.watch_stopped_after_reap.lock().ok().and_then(|s| *s)
     }
 
     fn received_methods(&self) -> Vec<String> {
@@ -150,6 +159,8 @@ struct FakeWorker {
     stdout: Option<io::PipeWriter>,
     stderr: io::PipeWriter,
     observed: Arc<Observed>,
+    /// Plays the OS's memory reports to the fake's memory watch (M8 Task 9).
+    os: mpsc::Sender<WatchMsg>,
 }
 
 fn killed_error() -> io::Error {
@@ -195,6 +206,34 @@ impl FakeWorker {
     /// Closes stdout while the fake keeps running (the host reads EOF).
     fn close_stdout(&mut self) {
         self.stdout = None;
+    }
+
+    /// Hands stdout to a "child" that outlives the fake (a degraded worker that forked): the
+    /// child sends one log frame after `late`, then holds the pipe until `hold` has passed.
+    /// Returns a receiver told once that frame was written.
+    fn fork_child_holding_stdout(&mut self, late: Duration, hold: Duration) -> Receiver<()> {
+        let stdout = self.stdout.take();
+        let (written_tx, written) = mpsc::channel();
+        thread::spawn(move || {
+            let started = Instant::now();
+            thread::sleep(late);
+            if let Some(mut stdout) = stdout {
+                if write_frame(&mut stdout, &log_frame("from the child")).is_ok() {
+                    let _ = written_tx.send(());
+                }
+                thread::sleep(hold.saturating_sub(started.elapsed()));
+                drop(stdout);
+            }
+        });
+        written
+    }
+
+    /// The OS reports the fake above its memory limit (the Windows job message, the macOS
+    /// watchdog's reading).
+    fn os_memory_report(&self) -> io::Result<()> {
+        self.os
+            .send(WatchMsg::Report)
+            .map_err(|_| io::Error::other("no memory watch"))
     }
 
     /// Reads the 4-byte header of the next host frame and nothing more: the writer stays blocked
@@ -269,6 +308,62 @@ struct FakeOpts {
     swallow_kills: u32,
     /// The reaper reaps, then reports an error (the exit status is lost).
     reap_fails: bool,
+    /// M8 Task 9: the fake has a memory watch reporting this signal.
+    watch: Option<OsMemorySignal>,
+    /// The memory watch cannot observe the fake (it ends at once with an error).
+    watch_fails: bool,
+}
+
+/// What the fake's memory watch receives.
+enum WatchMsg {
+    /// The OS reported the worker above its limit.
+    Report,
+    /// The bridge stopped the watch.
+    Stop,
+}
+
+/// The fake's memory watch: each [`WatchMsg::Report`] kills through the bridge's limit handle;
+/// it records whether the worker was reaped when it was stopped.
+struct FakeWatch {
+    signal: OsMemorySignal,
+    rx: Receiver<WatchMsg>,
+    stop: Option<mpsc::Sender<WatchMsg>>,
+    guard: Arc<ReapGuard>,
+    observed: Arc<Observed>,
+    fails: bool,
+}
+
+impl MemoryWatch for FakeWatch {
+    fn signal(&self) -> OsMemorySignal {
+        self.signal
+    }
+
+    fn stopper(&mut self) -> Box<dyn FnOnce() + Send> {
+        let stop = self.stop.take();
+        Box::new(move || {
+            if let Some(stop) = stop {
+                let _ = stop.send(WatchMsg::Stop);
+            }
+        })
+    }
+
+    fn run(self: Box<Self>, limit: &dyn KillHandle) -> io::Result<()> {
+        if self.fails {
+            return Err(io::Error::other("cannot observe the fake"));
+        }
+        loop {
+            match self.rx.recv_timeout(WAIT_BOUND) {
+                Ok(WatchMsg::Report) => limit.kill(),
+                Ok(WatchMsg::Stop) => {
+                    if let Ok(mut s) = self.observed.watch_stopped_after_reap.lock() {
+                        *s = Some(self.guard.is_reaped());
+                    }
+                    return Ok(());
+                }
+                Err(_) => return Err(io::Error::other("never stopped")),
+            }
+        }
+    }
 }
 
 fn fake(
@@ -343,11 +438,13 @@ impl WorkerSpawner for FakeSpawner {
         let (stdout_r, stdout_w) = io::pipe()?;
         let (stderr_r, stderr_w) = io::pipe()?;
         let (exit_tx, exit_rx) = mpsc::channel();
+        let (os_tx, os_rx) = mpsc::channel();
         let mut worker = FakeWorker {
             stdin: stdin_r,
             stdout: Some(stdout_w),
             stderr: stderr_w,
             observed: Arc::clone(&self.observed),
+            os: os_tx.clone(),
         };
         let observed = Arc::clone(&self.observed);
         thread::spawn(move || {
@@ -368,6 +465,8 @@ impl WorkerSpawner for FakeSpawner {
             exit: exit_rx,
             observed: Arc::clone(&self.observed),
             opts: self.opts,
+            guard: ReapGuard::new(),
+            os: Some((os_tx, os_rx)),
         }))
     }
 }
@@ -379,6 +478,9 @@ struct FakeProcess {
     exit: Receiver<i32>,
     observed: Arc<Observed>,
     opts: FakeOpts,
+    guard: Arc<ReapGuard>,
+    /// The memory watch's channel, until the watch is taken.
+    os: Option<(mpsc::Sender<WatchMsg>, Receiver<WatchMsg>)>,
 }
 
 impl WorkerProcess for FakeProcess {
@@ -399,8 +501,22 @@ impl WorkerProcess for FakeProcess {
         Err(io::ErrorKind::Unsupported.into())
     }
 
+    fn memory_watch(&mut self) -> io::Result<Option<Box<dyn MemoryWatch>>> {
+        let (Some(signal), Some((tx, rx))) = (self.opts.watch, self.os.take()) else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(FakeWatch {
+            signal,
+            rx,
+            stop: Some(tx),
+            guard: Arc::clone(&self.guard),
+            observed: Arc::clone(&self.observed),
+            fails: self.opts.watch_fails,
+        })))
+    }
+
     fn into_parts(self: Box<Self>) -> io::Result<WorkerParts> {
-        let guard = ReapGuard::new();
+        let guard = Arc::clone(&self.guard);
         let observed = Arc::clone(&self.observed);
         let inner = GuardedKill::new(Arc::clone(&guard), move || observed.kill());
         let observed = Arc::clone(&self.observed);
@@ -1939,10 +2055,8 @@ async fn a_worker_that_closed_stdout_keeps_its_own_exit_code() -> TestResult {
         Ok(102)
     });
     let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
-    assert_eq!(
-        outcome.host,
-        HostVerdict::Crashed(Some(ExitKind::Code(102)))
-    );
+    // M8 Task 9: the kept code is the heap limit.
+    assert_eq!(outcome.host, HostVerdict::Limit("heap_mb"));
     assert_eq!(observed.signals(), 0, "not killed");
 
     // A worker that closed its stdout and keeps running is killed after that wait.
@@ -2139,5 +2253,194 @@ async fn unread_results_beyond_the_cap_are_a_violation() -> TestResult {
     assert_eq!(outcome.host, HostVerdict::None);
     assert_eq!(result_text(&outcome), Some("16"));
     assert!(outcome.diag.is_empty(), "{:?}", outcome.diag);
+    Ok(())
+}
+
+// ---- host-measured memory limits (M8 Task 9, PD-134) ---------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn limit_exit_codes_are_heap_and_process_limits() -> TestResult {
+    // The worker's own exit after a refused allocation, no terminal frame, no kill.
+    for (code, limit) in [(102, "heap_mb"), (103, "process_mb")] {
+        let (spawner, observed) = fake(move |w| {
+            w.ready()?;
+            w.read()?;
+            w.log("growing")?;
+            Ok(code)
+        });
+        let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+        assert_eq!(outcome.host, HostVerdict::Limit(limit), "exit {code}");
+        assert_eq!(outcome.end, WorkerEnd::None);
+        assert!(outcome.diag.is_empty(), "{:?}", outcome.diag);
+        assert_eq!(observed.signals(), 0, "the worker ended on its own");
+    }
+    // After an accepted terminal frame the exit code no longer matters.
+    let (spawner, _) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        w.result("7")?;
+        Ok(102)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(outcome.host, HostVerdict::None);
+    assert_eq!(result_text(&outcome), Some("7"));
+    Ok(())
+}
+
+fn watched(signal: OsMemorySignal) -> FakeOpts {
+    FakeOpts {
+        watch: Some(signal),
+        ..FakeOpts::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_os_memory_report_is_process_mb_and_kills() -> TestResult {
+    // The Windows job message and the macOS watchdog's reading: the host decides `process_mb`
+    // and kills; the watch stops only after the reap.
+    for (signal, fact) in [
+        (OsMemorySignal::JobMemoryLimit, DIAG_JOB_MEMORY_LIMIT),
+        (OsMemorySignal::WatchdogKill, DIAG_WATCHDOG_KILL),
+    ] {
+        let (spawner, observed) = fake_opts(watched(signal), |w| {
+            w.ready()?;
+            w.read()?;
+            w.os_memory_report()?;
+            w.until_killed()
+        });
+        let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+        assert_eq!(outcome.host, HostVerdict::Limit("process_mb"), "{signal:?}");
+        assert_eq!(outcome.end, WorkerEnd::None);
+        assert_eq!(outcome.diag, vec![fact]);
+        assert_eq!(observed.signals(), 1);
+        assert_eq!(
+            observed.watch_stopped_after_reap(),
+            Some(true),
+            "the watch stops at the reap"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_os_memory_report_decides_before_a_late_terminal() -> TestResult {
+    // The report's kill is swallowed (a kill that did not take), so the fake lives on and sends
+    // its result after the report decided the run: the frame is ignored.
+    let opts = FakeOpts {
+        swallow_kills: 1,
+        ..watched(OsMemorySignal::WatchdogKill)
+    };
+    let (spawner, observed) = fake_opts(opts, |w| {
+        w.ready()?;
+        w.read()?;
+        w.os_memory_report()?;
+        let started = Instant::now();
+        while w.observed.kill_calls() == 0 && started.elapsed() < WAIT_BOUND {
+            thread::sleep(Duration::from_millis(2));
+        }
+        w.result("1")?;
+        Ok(0)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(outcome.host, HostVerdict::Limit("process_mb"));
+    assert_eq!(outcome.end, WorkerEnd::None, "the late terminal is ignored");
+    assert_eq!(outcome.diag, vec![DIAG_WATCHDOG_KILL]);
+    observed.wait_finished()?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_os_memory_report_after_the_terminal_is_ignored() -> TestResult {
+    // Rule 2 before rule 4: the result stands; the report stays a fact in the diag. The report
+    // comes once the host accepted the terminal (its kill reached the fake), before the exit.
+    let (spawner, observed) = fake_opts(watched(OsMemorySignal::JobMemoryLimit), |w| {
+        w.ready()?;
+        w.read()?;
+        w.result("5")?;
+        let started = Instant::now();
+        while !w.observed.is_killed() && started.elapsed() < WAIT_BOUND {
+            thread::sleep(Duration::from_millis(2));
+        }
+        w.os_memory_report()?;
+        Err(killed_error())
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(outcome.host, HostVerdict::None);
+    assert_eq!(result_text(&outcome), Some("5"));
+    assert_eq!(outcome.diag, vec![DIAG_JOB_MEMORY_LIMIT]);
+    assert_eq!(observed.signals(), 1, "the terminal's kill");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_memory_watch_that_cannot_observe_is_reported() -> TestResult {
+    let opts = FakeOpts {
+        watch_fails: true,
+        ..watched(OsMemorySignal::WatchdogKill)
+    };
+    let (spawner, _) = fake_opts(opts, |w| {
+        w.ready()?;
+        w.read()?;
+        w.result("3")?;
+        Ok(0)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(outcome.host, HostVerdict::None);
+    assert_eq!(result_text(&outcome), Some("3"));
+    assert_eq!(outcome.diag, vec![DIAG_MEMORY_WATCH_FAILED]);
+
+    // A watched run that ends normally carries no memory diag, and the watch stopped at the reap.
+    let (spawner, observed) = fake_opts(watched(OsMemorySignal::JobMemoryLimit), |w| {
+        w.ready()?;
+        w.read()?;
+        w.result("4")?;
+        Ok(0)
+    });
+    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
+    assert_eq!(result_text(&outcome), Some("4"));
+    assert!(outcome.diag.is_empty(), "{:?}", outcome.diag);
+    assert_eq!(observed.watch_stopped_after_reap(), Some(true));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_outcome_does_not_wait_for_a_stdout_held_past_the_exit() -> TestResult {
+    // T7 review m-3: a (degraded) worker forks a child that holds its stdout and exits. The
+    // outcome is published STDOUT_GRACE after the reap, and a frame the child sends later is
+    // ignored.
+    let late = STDOUT_GRACE + Duration::from_secs(2);
+    let hold = Duration::from_secs(20);
+    let (written_tx, written_rx) = mpsc::channel();
+    let (spawner, _) = fake(move |w| {
+        w.ready()?;
+        w.read()?;
+        let written = w.fork_child_holding_stdout(late, hold);
+        thread::spawn(move || {
+            if written.recv_timeout(WAIT_BOUND).is_ok() {
+                let _ = written_tx.send(());
+            }
+        });
+        Ok(0)
+    });
+    let test_sink = sink();
+    let handle = start(
+        spawner,
+        expect(false),
+        init(ScriptLimits::default()),
+        test_sink.clone(),
+    )
+    .await??;
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), handle.wait()).await?;
+    assert!(
+        started.elapsed() < hold,
+        "published before the child let go"
+    );
+    assert_eq!(outcome.host, HostVerdict::Crashed(Some(ExitKind::Code(0))));
+    assert_eq!(outcome.diag, vec![DIAG_STDOUT_HELD]);
+    let written = tokio::task::spawn_blocking(move || written_rx.recv_timeout(WAIT_BOUND)).await?;
+    assert!(written.is_ok(), "the child wrote its late frame");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(test_sink.logs().is_empty(), "{:?}", test_sink.logs());
     Ok(())
 }

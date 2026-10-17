@@ -39,6 +39,7 @@ use super::pipes::{STDERR_CAP_BYTES, StdinPipe, create_stdio_pipes};
 use super::{APPCONTAINER_NAME, WORKER_ENV_NAMES, WORKER_ENV_OS_REQUIRED, wide};
 use crate::drain::{ChunkReader, Keep, StderrDrain};
 use crate::kill::{GuardedKill, ReapGuard, reap_after_wait, signal_or_fallback};
+use crate::limits::MemoryWatch;
 use crate::spawn::{
     ExitKind, Reaper, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner,
 };
@@ -354,6 +355,18 @@ impl WorkerProcess for WindowsProcess {
         match &self.job {
             Some(job) => job.terminate(),
             None => Ok(()),
+        }
+    }
+
+    /// The job's completion port (M8 Task 9): the port was associated before
+    /// the worker was created in the job, so the watch sees every memory
+    /// message. `None` when the port could not be associated.
+    fn memory_watch(&mut self) -> io::Result<Option<Box<dyn MemoryWatch>>> {
+        match &self.job {
+            Some(job) => Ok(job
+                .memory_watch()?
+                .map(|w| Box::new(w) as Box<dyn MemoryWatch>)),
+            None => Err(io::Error::other("the worker's job is already closed")),
         }
     }
 

@@ -9,11 +9,15 @@
 //! M8 (Δ2, PD-137) splits a spawned worker into its pipes, a non-blocking kill
 //! handle and a reaper ([`spawn::WorkerProcess::into_parts`], [`kill`]), and
 //! runs scripts and compile checks over the split worker ([`bridge`], C.8).
+//! M8 Task 9 attributes a run's end from host-measured facts ([`limits`]) and
+//! watches a worker's memory per OS (Windows job completion port, macOS
+//! footprint [`watchdog`]).
 
 pub mod bridge;
 mod drain;
 pub mod identity;
 pub mod kill;
+pub mod limits;
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "macos")]
@@ -22,6 +26,7 @@ pub mod probe;
 pub mod spawn;
 #[cfg(unix)]
 mod unix;
+pub mod watchdog;
 #[cfg(windows)]
 pub mod windows;
 pub mod winscore;

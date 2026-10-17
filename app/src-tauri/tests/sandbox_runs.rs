@@ -261,6 +261,10 @@ mod macos {
     }
 }
 
+/// V10 (M8 Task 9): host-measured memory limits per OS against the real worker.
+#[path = "sandbox_runs/v10.rs"]
+mod v10;
+
 /// S-10 (M8 Task 8; §3.4 pipes and handles, §15 V12 worker half, V15): the channel against the
 /// real worker, started through the platform spawner object, on every leg.
 mod s10 {

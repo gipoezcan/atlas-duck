@@ -8,7 +8,15 @@
 //! - a **stderr** thread keeps the first 64 KiB and reads and discards the rest;
 //! - a **writer** thread owns stdin and writes the queued frames (`script.run`, call results);
 //!   the bytes queued and not yet written are capped ([`unread_results_cap`]);
-//! - a **reaper** thread waits for the exit (T6: never on a runtime thread, never dropped).
+//! - a **reaper** thread waits for the exit (T6: never on a runtime thread, never dropped);
+//! - a **finisher** thread publishes the run's outcome once the worker is reaped (M8 Task 9, T7
+//!   review m-3): it waits a bounded [`STDOUT_GRACE`] for the reader to reach stdout's EOF, so a
+//!   worker whose stdout outlives it (a degraded Linux/macOS worker that forked a child holding
+//!   the pipe) cannot keep [`RunHandleImpl::wait`] pending; the reader then drains on, ignored;
+//! - a **memory** thread, where the spawner gives one ([`WorkerProcess::memory_watch`]): the
+//!   Windows job's completion port or the macOS footprint watchdog. An OS memory report decides
+//!   the run as `Limit("process_mb")` (unless something decided it first) and kills; it stops at
+//!   the reap.
 //!
 //! The per-run state machine is [`state`]. The run lock is held only for short state updates,
 //! never across a blocking read, write or wait, nor across a parse of a frame's payload;
@@ -39,8 +47,9 @@ use std::io;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -63,6 +72,9 @@ use tokio::time::Sleep;
 use self::reader::{Continuation, Frame, Stdout};
 use self::state::{Incoming, RunState, Step};
 use crate::identity::{IdentityPart, SandboxBinaryIdentity};
+use crate::limits::{MemoryWatch, OsMemorySignal};
+#[cfg(doc)]
+use crate::spawn::WorkerProcess;
 use crate::spawn::{ExitKind, KillHandle, SpawnSpec, WorkerParts, WorkerSpawner};
 
 /// Plan value (PD-135): the ready frame must arrive within 10 s of the spawn, else the worker is
@@ -92,11 +104,30 @@ pub const DIAG_CALL_RESULT_REPLACED: &str = "sandbox_call_result_replaced";
 /// Host fact for [`RunOutcome::diag`]: the run ended because the worker left more call results
 /// unread than [`unread_results_cap`] ([`ViolationKind::UnreadResults`]).
 pub const DIAG_UNREAD_RESULTS: &str = "sandbox_unread_results";
+/// Host fact for [`RunOutcome::diag`] (plan constant, M8 Task 9): the macOS watchdog saw the
+/// worker's footprint above `process_mb` and killed it.
+pub const DIAG_WATCHDOG_KILL: &str = "sandbox_watchdog_kill";
+/// Host fact for [`RunOutcome::diag`] (M8 Task 9): the Windows job reported the worker above its
+/// memory limit on the job's completion port.
+pub const DIAG_JOB_MEMORY_LIMIT: &str = "sandbox_job_memory_limit";
+/// Host fact for [`RunOutcome::diag`] (M8 Task 9): the memory watch could not observe the worker
+/// (no footprint reading at all, the port failed) or did not end within its grace after the reap.
+pub const DIAG_MEMORY_WATCH_FAILED: &str = "sandbox_memory_watch_failed";
+/// Host fact for [`RunOutcome::diag`] (M8 Task 9, T7 review m-3): the worker's stdout stayed open
+/// [`STDOUT_GRACE`] past its reap (something else holds the pipe); the outcome was published
+/// without stdout's end, and later frames are ignored.
+pub const DIAG_STDOUT_HELD: &str = "sandbox_stdout_held_after_exit";
 /// How often a kill is sent again until the worker is reaped (see the module documentation).
 pub const KILL_RETRY: Duration = Duration::from_secs(1);
+/// How long the outcome waits after the reap for the reader to reach stdout's EOF (T7 review
+/// m-3). The worker's own end of the pipe is closed by then, so only a stdout that something else
+/// holds takes this long.
+pub const STDOUT_GRACE: Duration = Duration::from_secs(2);
 
 /// How long the outcome waits for the stderr thread after the reap (its pipe is closed by then).
 const STDERR_GRACE: Duration = Duration::from_secs(2);
+/// How long the outcome waits after the reap for the memory watch to end.
+const WATCH_GRACE: Duration = Duration::from_secs(2);
 /// How long the bridge waits for the worker's own exit after its stdout ended, before it kills
 /// (review m-4: a worker that closed stdout usually exits, and on Windows a kill between its
 /// handles closing and its exit code being set would replace that code).
@@ -230,7 +261,9 @@ pub enum WorkerEnd {
 pub enum HostVerdict {
     /// A terminal frame decided the run; how the process exited after it does not matter.
     None,
-    /// A limit the host measured (`timeout_s` here; M8 Task 9 adds the memory limits).
+    /// A limit the host measured (PD-134, [`crate::limits::attribute`]): `timeout_s` (the run
+    /// timer), `heap_mb` (exit `EXIT_HEAP_LIMIT`), `process_mb` (the Windows job message, the
+    /// macOS watchdog kill, exit `EXIT_PROCESS_LIMIT`).
     Limit(&'static str),
     /// The caller killed the run.
     Killed(KillCause),
@@ -341,7 +374,7 @@ pub fn start_run(
         Box::pin(tokio::time::sleep(Duration::MAX))
     };
     let init_frame = encode_init(&init)?;
-    let launched = launch(spawner, spec)?;
+    let launched = launch(spawner, spec, true)?;
     let ready = match launched.ready(READY_TIMEOUT) {
         Ok(ready) => ready,
         Err(kind) => return Err(launched.refuse(StartRunError::Spawn(kind))),
@@ -355,6 +388,7 @@ pub fn start_run(
         go,
         exit,
         stderr,
+        memory,
         ..
     } = launched;
 
@@ -364,9 +398,6 @@ pub fn start_run(
         give_up(kill, exit);
         return Err(spawn_error(&e));
     }
-    let limit = Duration::from_secs(u64::from(init.limits.timeout_s));
-    expiry.as_mut().reset(tokio::time::Instant::now() + limit);
-    queue(&frames_tx, &queued, init_frame);
 
     let (outcome_tx, outcome) = watch::channel(None);
     let run = Arc::new(Run {
@@ -376,6 +407,8 @@ pub fn start_run(
             writer: Some(frames_tx),
             terminal_at: None,
             result_replaced: false,
+            memory: MemoryFacts::default(),
+            stdout_cut: false,
         }),
         kill,
         sink,
@@ -385,15 +418,54 @@ pub fn start_run(
         read_cap: RunState::read_cap(&init.limits),
         queued,
         unread_cap: unread_results_cap(&init.limits),
+        outcome_tx: Mutex::new(Some(outcome_tx)),
+        ends: Ends::default(),
     });
+    // The memory watch runs before `script.run` is sent (the Windows port was associated with the
+    // job before the worker started, so no report is lost either way).
+    let memory = match memory.map(|m| start_watch(&run, m)).transpose() {
+        Ok(memory) => memory,
+        Err(e) => {
+            give_up(Arc::clone(&run.kill), exit);
+            return Err(spawn_error(&e));
+        }
+    };
+    let finishing = Arc::clone(&run);
+    let finisher = thread::Builder::new()
+        .name("sandbox-finish".to_owned())
+        .spawn(move || {
+            let _lost = LostOnUnwind(&finishing);
+            finishing.finish(&exit, &stderr, memory);
+        });
+    if let Err(e) = finisher {
+        // The reaper's receiver went with the closure, so this kill is not retried; the memory
+        // watch was stopped when the closure dropped.
+        run.kill.kill();
+        return Err(spawn_error(&e));
+    }
+
+    let limit = Duration::from_secs(u64::from(init.limits.timeout_s));
+    expiry.as_mut().reset(tokio::time::Instant::now() + limit);
+    if let Some(writer) = &run.lock().writer {
+        queue(writer, &run.queued, init_frame);
+    }
+
     let reading = Arc::clone(&run);
     let continuation: Continuation = Box::new(move |stdout| {
+        let lost = LostOnUnwind(&reading);
         reading.read_until_end(stdout);
-        reading.finish(&exit, &stderr, &outcome_tx);
+        reading.ends.update(|ends| ends.stdout_ended = true);
+        // A worker that closed its stdout usually exits: its own exit code is awaited first, for
+        // `EXIT_GRACE`; only a worker still running after that is killed (it must not outlive
+        // its stdout). A kill right at EOF could replace the exit code on Windows (m-4).
+        if !reading.ends.wait_for(|ends| ends.reaped, EXIT_GRACE) {
+            reading.kill.kill();
+        }
+        drop(lost);
     });
     if go.send(continuation).is_err() {
         // Unreachable while the stdout thread lives (it waits for this continuation). The
-        // reaper's receiver went with the continuation, so this kill is not retried.
+        // finisher publishes once the killed worker is reaped.
         run.kill.kill();
         return Err(StartRunError::Spawn(io::ErrorKind::BrokenPipe));
     }
@@ -427,7 +499,7 @@ pub fn compile_run(
     if request.len() > HOST_TO_WORKER_MAX {
         return Err(StartRunError::Spawn(io::ErrorKind::InvalidInput));
     }
-    let launched = launch(spawner, spec)?;
+    let launched = launch(spawner, spec, false)?;
     let left = deadline.saturating_sub(started.elapsed());
     let ready = match launched.ready(left.min(READY_TIMEOUT)) {
         Ok(ready) => ready,
@@ -508,6 +580,8 @@ struct Launched {
     go: mpsc::SyncSender<Continuation>,
     exit: Receiver<io::Result<ExitKind>>,
     stderr: Receiver<String>,
+    /// The spawner's memory watch, when asked for and the OS has one.
+    memory: Option<Box<dyn MemoryWatch>>,
 }
 
 impl Launched {
@@ -535,8 +609,21 @@ impl Launched {
     }
 }
 
-fn launch(spawner: &dyn WorkerSpawner, spec: &SpawnSpec) -> Result<Launched, StartRunError> {
-    let process = spawner.spawn(spec).map_err(|e| spawn_error(&e))?;
+/// Spawns and splits a worker. `with_memory`: take its memory watch too (runs; a compile worker
+/// is bounded by its deadline and `heap_mb` and gets none).
+fn launch(
+    spawner: &dyn WorkerSpawner,
+    spec: &SpawnSpec,
+    with_memory: bool,
+) -> Result<Launched, StartRunError> {
+    let mut process = spawner.spawn(spec).map_err(|e| spawn_error(&e))?;
+    // Before the split, which consumes the process. On an error the process is dropped whole,
+    // which kills it.
+    let memory = if with_memory {
+        process.memory_watch().map_err(|e| spawn_error(&e))?
+    } else {
+        None
+    };
     let WorkerParts {
         io, kill, reaper, ..
     } = process.into_parts().map_err(|e| spawn_error(&e))?;
@@ -562,6 +649,7 @@ fn launch(spawner: &dyn WorkerSpawner, spec: &SpawnSpec) -> Result<Launched, Sta
         go,
         exit,
         stderr,
+        memory,
     })
 }
 
@@ -658,6 +746,11 @@ struct Run {
     queued: Arc<AtomicUsize>,
     /// [`unread_results_cap`] of the run.
     unread_cap: usize,
+    /// Publishes the outcome once (the finisher); taken and dropped unsent when a reading or
+    /// finishing thread unwinds ([`DIAG_OUTCOME_LOST`]).
+    outcome_tx: Mutex<Option<watch::Sender<Option<RunOutcome>>>>,
+    /// Where the reader and the finisher meet: stdout's EOF and the reap.
+    ends: Ends,
 }
 
 struct Inner {
@@ -667,6 +760,130 @@ struct Inner {
     terminal_at: Option<Instant>,
     /// A call result was replaced by a rejection ([`DIAG_CALL_RESULT_REPLACED`]).
     result_replaced: bool,
+    /// What the memory watch reported.
+    memory: MemoryFacts,
+    /// The outcome was published before stdout's EOF ([`DIAG_STDOUT_HELD`]): the reader ignores
+    /// every later frame.
+    stdout_cut: bool,
+}
+
+/// The OS memory reports of a run (host facts for [`RunOutcome::diag`]).
+#[derive(Debug, Default)]
+struct MemoryFacts {
+    job_limit: bool,
+    watchdog_kill: bool,
+}
+
+/// stdout's EOF (the reader) and the reap (the finisher), each waited for with a bound.
+#[derive(Default)]
+struct Ends {
+    flags: Mutex<EndFlags>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct EndFlags {
+    stdout_ended: bool,
+    reaped: bool,
+}
+
+impl Ends {
+    fn update(&self, f: impl FnOnce(&mut EndFlags)) {
+        let mut flags = self.flags.lock().unwrap_or_else(PoisonError::into_inner);
+        f(&mut flags);
+        drop(flags);
+        self.changed.notify_all();
+    }
+
+    /// Waits up to `bound` until `cond` holds; whether it does.
+    fn wait_for(&self, cond: impl Fn(&EndFlags) -> bool, bound: Duration) -> bool {
+        let flags = self.flags.lock().unwrap_or_else(PoisonError::into_inner);
+        let (flags, _) = self
+            .changed
+            .wait_timeout_while(flags, bound, |f| !cond(f))
+            .unwrap_or_else(PoisonError::into_inner);
+        cond(&flags)
+    }
+}
+
+/// Held by the reading and the finishing thread: if one of them unwinds (a panic in the glue's
+/// `sink.log` on the reader), the outcome sender is dropped unsent, so [`RunHandleImpl::wait`]
+/// answers at once with [`DIAG_OUTCOME_LOST`] and kills, and the run timer kills once (m-5).
+struct LostOnUnwind<'a>(&'a Run);
+
+impl Drop for LostOnUnwind<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let sender = self
+                .0
+                .outcome_tx
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            drop(sender);
+            self.0.ends.update(|ends| ends.stdout_ended = true);
+        }
+    }
+}
+
+/// A running memory watch: stopped at the reap, or when dropped.
+struct RunningWatch {
+    stop: Option<Box<dyn FnOnce() + Send>>,
+    /// The watch thread's end: `Ok` unless it could not observe the worker.
+    done: Receiver<io::Result<()>>,
+}
+
+impl RunningWatch {
+    /// Stops the watch and waits up to `bound` for it to end. False when it could not observe
+    /// the worker or did not end in time.
+    fn stop(mut self, bound: Duration) -> bool {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+        matches!(self.done.recv_timeout(bound), Ok(Ok(())))
+    }
+}
+
+impl Drop for RunningWatch {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+    }
+}
+
+/// The [`KillHandle`] a memory watch kills through: it records the OS report in the run (it
+/// decides the run as `process_mb` unless something decided it first), then kills the worker.
+struct MemoryLimitKill {
+    run: Arc<Run>,
+    signal: OsMemorySignal,
+}
+
+impl KillHandle for MemoryLimitKill {
+    fn kill(&self) {
+        self.run.on_memory_limit(self.signal);
+    }
+}
+
+/// Starts `watch` on a thread of its own.
+fn start_watch(run: &Arc<Run>, mut watch: Box<dyn MemoryWatch>) -> io::Result<RunningWatch> {
+    let stop = watch.stopper();
+    let limit = MemoryLimitKill {
+        run: Arc::clone(run),
+        signal: watch.signal(),
+    };
+    let (done_tx, done) = mpsc::sync_channel(1);
+    // On a failed spawn the closure, and with it the watch, is dropped; the stopper is dropped
+    // with the returned error.
+    thread::Builder::new()
+        .name("sandbox-memory".to_owned())
+        .spawn(move || {
+            let _ = done_tx.send(watch.run(&limit));
+        })?;
+    Ok(RunningWatch {
+        stop: Some(stop),
+        done,
+    })
 }
 
 impl Run {
@@ -686,13 +903,19 @@ impl Run {
 
     /// The reader thread's run loop: decodes and classifies every frame until EOF, both before
     /// the run lock is taken (I-1); after a violation it discards the rest of the stream.
+    /// Once the outcome was published without stdout's end ([`DIAG_STDOUT_HELD`]), every later
+    /// frame is discarded unread by the state machine.
     fn read_until_end(self: &Arc<Self>, mut stdout: Stdout) {
         loop {
             match reader::next_frame(&mut stdout, self.read_cap) {
                 Frame::End => return,
                 Frame::TooLarge => {
-                    let step = self.update(|inner| inner.state.on_oversize_header());
-                    self.act(step);
+                    let step = self.update(|inner| {
+                        (!inner.stdout_cut).then(|| inner.state.on_oversize_header())
+                    });
+                    if let Some(step) = step {
+                        self.act(step);
+                    }
                     reader::discard(stdout);
                     return;
                 }
@@ -700,13 +923,20 @@ impl Run {
                     let len = bytes.len();
                     let decoded = decode_worker_frame(&bytes).map(Incoming::from);
                     drop(bytes);
-                    let (step, violated) = self.update(|inner| {
+                    let stepped = self.update(|inner| {
+                        if inner.stdout_cut {
+                            return None;
+                        }
                         let step = inner.state.on_frame(len, decoded);
                         if step == Step::Terminal {
                             inner.terminal_at = Some(Instant::now());
                         }
-                        (step, inner.state.violated())
+                        Some((step, inner.state.violated()))
                     });
+                    let Some((step, violated)) = stepped else {
+                        reader::discard(stdout);
+                        return;
+                    };
                     self.act(step);
                     if violated {
                         reader::discard(stdout);
@@ -766,15 +996,36 @@ impl Run {
         }
     }
 
-    /// After stdout's EOF: wait for the reap (the worker exited, or it closed its stdout and is
-    /// killed, [`exit_after_eof`]), then publish the outcome. The run timer stops at that.
+    /// An OS memory report ([`MemoryLimitKill`]): recorded (it decides the run unless something
+    /// decided it first), then the worker is killed. Repeated reports kill again (a no-op once a
+    /// kill took).
+    fn on_memory_limit(&self, signal: OsMemorySignal) {
+        self.update(|inner| {
+            match signal {
+                OsMemorySignal::JobMemoryLimit => inner.memory.job_limit = true,
+                OsMemorySignal::WatchdogKill => inner.memory.watchdog_kill = true,
+            }
+            inner.state.on_os_memory(signal);
+        });
+        self.kill.kill();
+    }
+
+    /// The finisher thread (T7 review m-3: the outcome is published from the reap side): waits
+    /// for the reap (the timer kills from `timeout_s` on, the reader after stdout's EOF), stops
+    /// the memory watch (an OS report it already received is recorded first), waits up to
+    /// [`STDOUT_GRACE`] for the reader to reach stdout's EOF, then publishes. The run timer stops
+    /// at that.
     fn finish(
         &self,
         exit: &Receiver<io::Result<ExitKind>>,
         stderr: &Receiver<String>,
-        outcome: &watch::Sender<Option<RunOutcome>>,
+        memory: Option<RunningWatch>,
     ) {
-        let exit = exit_after_eof(self.kill.as_ref(), exit);
+        // A reaper thread that is gone (`Disconnected`) or a failed reap: the exit is unknown.
+        let exit = exit.recv().ok().and_then(Result::ok);
+        self.ends.update(|ends| ends.reaped = true);
+        let watch_failed = memory.is_some_and(|m| !m.stop(WATCH_GRACE));
+        let stdout_ended = self.ends.wait_for(|ends| ends.stdout_ended, STDOUT_GRACE);
         let stderr = stderr.recv_timeout(STDERR_GRACE).unwrap_or_default();
         let mut diag = Vec::new();
         if exit.is_none() {
@@ -783,6 +1034,9 @@ impl Run {
         let done = {
             let mut inner = self.lock();
             inner.writer = None;
+            if !stdout_ended {
+                inner.stdout_cut = true;
+            }
             if !inner.state.terminal() && exit == Some(ExitKind::Code(EXIT_PROTOCOL)) {
                 diag.push(DIAG_HOST_PROTOCOL_EXIT);
             }
@@ -792,6 +1046,18 @@ impl Run {
             let host = inner.state.verdict(exit);
             if host == HostVerdict::Violation(ViolationKind::UnreadResults) {
                 diag.push(DIAG_UNREAD_RESULTS);
+            }
+            if inner.memory.job_limit {
+                diag.push(DIAG_JOB_MEMORY_LIMIT);
+            }
+            if inner.memory.watchdog_kill {
+                diag.push(DIAG_WATCHDOG_KILL);
+            }
+            if watch_failed {
+                diag.push(DIAG_MEMORY_WATCH_FAILED);
+            }
+            if !stdout_ended {
+                diag.push(DIAG_STDOUT_HELD);
             }
             let (logs, logs_truncated) = inner.state.take_logs();
             let ended = inner.terminal_at.unwrap_or_else(Instant::now);
@@ -806,10 +1072,17 @@ impl Run {
                 diag,
             }
         };
-        outcome.send_replace(Some(done));
+        let sender = self
+            .outcome_tx
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(sender) = sender {
+            sender.send_replace(Some(done));
+        }
     }
 
-    /// The outcome when the reader thread ended without publishing one.
+    /// The outcome when the reader or the finisher thread ended without publishing one.
     fn lost_outcome(&self) -> RunOutcome {
         RunOutcome {
             end: WorkerEnd::None,
@@ -822,26 +1095,6 @@ impl Run {
             diag: vec![DIAG_OUTCOME_LOST],
         }
     }
-}
-
-/// The worker's exit once its stdout ended (`None` when the reap failed). It usually exited, so
-/// its own exit code is awaited first, for [`EXIT_GRACE`]; only a worker still running after that
-/// is killed (it closed its stdout and must not outlive it). A kill right at EOF could replace
-/// the exit code on Windows (m-4). After that kill the wait is unbounded: the run timer kills
-/// again until the reap.
-fn exit_after_eof(
-    kill: &dyn KillHandle,
-    exit: &Receiver<io::Result<ExitKind>>,
-) -> Option<ExitKind> {
-    let reaped = match exit.recv_timeout(EXIT_GRACE) {
-        Ok(reaped) => reaped,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            kill.kill();
-            exit.recv().ok()?
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => return None,
-    };
-    reaped.ok()
 }
 
 /// PD-135: kills the run at `expiry` (`timeout_s` after `script.run` was handed to the writer),

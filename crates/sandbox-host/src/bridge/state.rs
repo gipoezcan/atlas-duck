@@ -19,16 +19,18 @@
 //! to `max_result_mb` + 64 KiB), runs in [`Incoming::from`] on the reader thread before the run
 //! lock is taken (review I-1: a kill never waits for it).
 //!
-//! The run's verdict from these facts and the worker's exit is [`RunState::verdict`]; M8 Task 9
-//! replaces it with the host-measured attribution (`attribute`, PD-134).
+//! - An OS memory report (the Windows job message, the macOS watchdog kill; M8 Task 9) decides
+//!   the run like a host cause: the first decision wins, and frames after it are ignored.
+//!
+//! The run's verdict from these facts and the worker's exit is [`RunState::verdict`], the
+//! host-measured attribution of PD-134 ([`crate::limits::attribute`]).
 
 use atlas_duck_ipc::sandbox::script::{DecodeError, WorkerFrame};
-use atlas_duck_ipc::sandbox::{
-    EXIT_PROTOCOL, HostCall, ScriptLimits, WORKER_FRAME_MAX_BYTES, terminal_frame_max,
-};
+use atlas_duck_ipc::sandbox::{HostCall, ScriptLimits, WORKER_FRAME_MAX_BYTES, terminal_frame_max};
 
 use super::{HostVerdict, KillCause, LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE};
 use super::{WorkerEnd, log_truncated_marker};
+use crate::limits::{HostCause, OsMemorySignal, attribute};
 use crate::spawn::ExitKind;
 
 /// Why the host ended a run as a `protocol_violation` (§3.4 "Violations").
@@ -57,17 +59,6 @@ pub enum ViolationKind {
     /// call that replaces it, so it never has more than `max_concurrent_calls` unread (T8
     /// finding 1).
     UnreadResults,
-}
-
-/// What the host itself did to end the run, first one wins.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HostCause {
-    /// The run timer (`timeout_s`, PD-135).
-    Timeout,
-    /// The bridge killed the worker for a channel violation.
-    Violation(ViolationKind),
-    /// The caller killed the run ([`super::RunHandleImpl::kill`]).
-    Killed(KillCause),
 }
 
 /// What the bridge must do after a frame, outside the run lock.
@@ -179,6 +170,8 @@ pub(crate) struct RunState {
     terminal: bool,
     end: WorkerEnd,
     cause: Option<HostCause>,
+    /// An OS memory report that decided the run (never set after another decision).
+    os_signal: Option<OsMemorySignal>,
     logs: Logs,
 }
 
@@ -192,6 +185,7 @@ impl RunState {
             terminal: false,
             end: WorkerEnd::None,
             cause: None,
+            os_signal: None,
             logs: Logs::default(),
         }
     }
@@ -201,9 +195,9 @@ impl RunState {
         terminal_frame_max(limits).max(WORKER_FRAME_MAX_BYTES)
     }
 
-    /// A terminal frame or a host cause decided the run.
+    /// A terminal frame, a host cause or an OS memory report decided the run.
     pub(crate) fn decided(&self) -> bool {
-        self.terminal || self.cause.is_some()
+        self.terminal || self.cause.is_some() || self.os_signal.is_some()
     }
 
     /// The host killed the worker for a violation: the reader discards the rest of the stream.
@@ -214,7 +208,7 @@ impl RunState {
     /// One frame of `len` payload bytes, as the decoder read it and [`Incoming::from`] classified
     /// it. No parse and no copy of the payload happens here.
     pub(crate) fn on_frame(&mut self, len: usize, frame: Result<Incoming, DecodeError>) -> Step {
-        if self.cause.is_some() {
+        if self.cause.is_some() || self.os_signal.is_some() {
             return Step::Nothing;
         }
         if self.terminal {
@@ -282,6 +276,15 @@ impl RunState {
         self.decide_by(HostCause::Killed(cause))
     }
 
+    /// The OS reported the worker above `process_mb` (M8 Task 9). True if this decided the run.
+    pub(crate) fn on_os_memory(&mut self, signal: OsMemorySignal) -> bool {
+        if self.decided() {
+            return false;
+        }
+        self.os_signal = Some(signal);
+        true
+    }
+
     /// A call's result would take the bytes queued for the worker above the cap. True if this
     /// decided the run (as a violation).
     pub(crate) fn on_unread_results(&mut self) -> bool {
@@ -313,23 +316,13 @@ impl RunState {
         self.terminal
     }
 
-    /// The host's verdict: its own cause first, then an accepted terminal frame (the exit no
-    /// longer matters), then `EXIT_PROTOCOL` (the worker could not read what the host sent: a
-    /// host fault, T4), else the exit without a terminal frame, `Code(0)` included, is a crash
-    /// (T4: stdin EOF exits 0 with no frame). `exit` is `None` when it is unknown (the reap
-    /// failed).
-    ///
-    /// M8 Task 9 replaces this with `attribute` (heap / process limits from the exit, the
-    /// Windows job message, the macOS watchdog).
+    /// The host's verdict from these facts and the worker's exit ([`attribute`], PD-134): its own
+    /// cause first, then an accepted terminal frame (the exit no longer matters), then
+    /// `EXIT_PROTOCOL` (a host fault, T4), then an OS memory report, the heap and process limit
+    /// exit codes, else a crash (`Code(0)` included: T4, stdin EOF exits 0 with no frame). `exit`
+    /// is `None` when it is unknown (the reap failed).
     pub(crate) fn verdict(&self, exit: Option<ExitKind>) -> HostVerdict {
-        match &self.cause {
-            Some(HostCause::Timeout) => HostVerdict::Limit("timeout_s"),
-            Some(HostCause::Violation(kind)) => HostVerdict::Violation(*kind),
-            Some(HostCause::Killed(cause)) => HostVerdict::Killed(cause.clone()),
-            None if self.terminal => HostVerdict::None,
-            None if exit == Some(ExitKind::Code(EXIT_PROTOCOL)) => HostVerdict::HostFault,
-            None => HostVerdict::Crashed(exit),
-        }
+        attribute(exit, self.cause.as_ref(), self.os_signal, self.terminal)
     }
 
     fn decide_by(&mut self, cause: HostCause) -> bool {
@@ -368,6 +361,7 @@ fn violation_of(e: &DecodeError) -> ViolationKind {
 #[cfg(test)]
 mod tests {
     use atlas_duck_ipc::sandbox::script::{RawJsonText, decode_worker_frame};
+    use atlas_duck_ipc::sandbox::{EXIT_HEAP_LIMIT, EXIT_PROCESS_LIMIT, EXIT_PROTOCOL};
 
     use super::*;
 
@@ -513,6 +507,51 @@ mod tests {
         let mut s = state(4);
         assert!(s.on_kill(KillCause::User));
         assert_eq!(s.verdict(protocol), HostVerdict::Killed(KillCause::User));
+    }
+
+    /// M8 Task 9: the limit exit codes, and an OS memory report that decides the run like a host
+    /// cause (first decision wins; later frames are ignored).
+    #[test]
+    fn memory_limits_are_host_measured_and_decide_first() {
+        let s = state(4);
+        assert_eq!(
+            s.verdict(Some(ExitKind::Code(EXIT_HEAP_LIMIT))),
+            HostVerdict::Limit("heap_mb")
+        );
+        assert_eq!(
+            s.verdict(Some(ExitKind::Code(EXIT_PROCESS_LIMIT))),
+            HostVerdict::Limit("process_mb")
+        );
+
+        let mut s = state(4);
+        assert!(s.on_os_memory(OsMemorySignal::WatchdogKill));
+        assert!(s.decided() && !s.violated());
+        assert!(!s.on_os_memory(OsMemorySignal::JobMemoryLimit));
+        assert!(!s.on_timeout());
+        assert!(!s.on_kill(KillCause::User));
+        assert!(!s.complete_call(), "nothing is queued after the decision");
+        assert_eq!(feed(&mut s, RESULT), Step::Nothing, "a late terminal");
+        assert_eq!(feed(&mut s, "garbage"), Step::Nothing);
+        assert_eq!(s.take_end(), WorkerEnd::None);
+        assert_eq!(
+            s.verdict(Some(ExitKind::Signal(9))),
+            HostVerdict::Limit("process_mb")
+        );
+
+        // A terminal accepted first wins over a later report.
+        let mut s = state(4);
+        assert_eq!(feed(&mut s, RESULT), Step::Terminal);
+        assert!(!s.on_os_memory(OsMemorySignal::JobMemoryLimit));
+        assert_eq!(s.verdict(Some(ExitKind::Code(1))), HostVerdict::None);
+
+        // A kill first wins over a later report.
+        let mut s = state(4);
+        assert!(s.on_kill(KillCause::Shutdown));
+        assert!(!s.on_os_memory(OsMemorySignal::WatchdogKill));
+        assert_eq!(
+            s.verdict(Some(ExitKind::Signal(9))),
+            HostVerdict::Killed(KillCause::Shutdown)
+        );
     }
 
     #[test]

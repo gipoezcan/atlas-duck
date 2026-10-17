@@ -99,6 +99,18 @@ impl ReapGuard {
         self.flags().reaped
     }
 
+    /// Runs `look` with the flag lock held unless the worker is (about to be)
+    /// reaped (`None`). While it runs the worker cannot be reaped, so its pid
+    /// still names the worker (a zombie keeps its pid). `look` must not block
+    /// (the macOS footprint reading, M8 Task 9).
+    pub fn while_unreaped<T>(&self, look: impl FnOnce() -> T) -> Option<T> {
+        let flags = self.flags();
+        if flags.reaped {
+            return None;
+        }
+        Some(look())
+    }
+
     /// True once a kill was sent.
     pub fn is_killed(&self) -> bool {
         self.flags().killed
@@ -289,6 +301,18 @@ mod tests {
         assert!(!reaped.kill_with(|| ran = true));
         assert!(!ran);
         assert!(!reaped.is_killed());
+    }
+
+    #[test]
+    fn a_look_runs_only_before_the_reap() {
+        let guard = ReapGuard::new();
+        assert_eq!(guard.while_unreaped(|| 7), Some(7));
+        assert!(guard.kill_with(|| {}));
+        assert_eq!(guard.while_unreaped(|| 8), Some(8), "killed is not reaped");
+        guard.mark_reaped();
+        let mut ran = false;
+        assert_eq!(guard.while_unreaped(|| ran = true), None);
+        assert!(!ran);
     }
 
     #[test]

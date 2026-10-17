@@ -3,8 +3,10 @@
 //!
 //! The confinement itself (`sandbox_init` with the embedded SBPL profile,
 //! §9.4) is applied by the worker to itself; see
-//! `atlas_duck_sandbox_worker::confine::macos`.
+//! `atlas_duck_sandbox_worker::confine::macos`. The memory limit is the
+//! host-side footprint watchdog (M8 Task 9, `watchdog`).
 
 mod spawner;
+mod watchdog;
 
 pub use spawner::{MacSpawner, MacWorker, WORKER_ENV};

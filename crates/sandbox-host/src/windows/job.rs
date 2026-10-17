@@ -1,5 +1,6 @@
 //! The job object (§9.4): `ACTIVE_PROCESS = 1`, `KILL_ON_JOB_CLOSE`,
-//! `DIE_ON_UNHANDLED_EXCEPTION`, process memory limit, `UILIMIT_ALL`.
+//! `DIE_ON_UNHANDLED_EXCEPTION`, process memory limit, `UILIMIT_ALL`, and (M8
+//! Task 9) its completion port for the memory-limit messages (`jobport`).
 //!
 //! Measured behaviour of `ACTIVE_PROCESS = 1` (T14 experiment, Windows 11): a
 //! second `CreateProcess` by the worker fails with `ERROR_NOT_ENOUGH_QUOTA`
@@ -19,6 +20,8 @@ use windows_sys::Win32::System::JobObjects::{
     SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::SystemServices::JOB_OBJECT_UILIMIT_ALL;
+
+use super::jobport::{JobPort, JobPortWatch};
 
 /// Limits applied to a worker's job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,9 +82,17 @@ fn set_ui_restrictions(job: *mut core::ffi::c_void, class: u32) -> io::Result<()
 
 /// An unnamed job object. Closing the last handle kills every process in it
 /// (`KILL_ON_JOB_CLOSE`).
-pub(crate) struct Job(OwnedHandle);
+pub(crate) struct Job {
+    handle: OwnedHandle,
+    /// The job's completion port (M8 Task 9), `None` when it could not be
+    /// associated: the memory limit then holds all the same (the worker exits
+    /// `EXIT_PROCESS_LIMIT`), only the job's own report is missing.
+    port: Option<JobPort>,
+}
 
 impl Job {
+    /// Creates the job with its limits and associates its completion port,
+    /// before any process is put in it.
     pub(crate) fn create(limits: JobLimits) -> io::Result<Self> {
         // SAFETY: no security attributes, no name.
         let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
@@ -90,8 +101,11 @@ impl Job {
             eprintln!("CreateJobObjectW failed: {err}");
             return Err(err);
         }
-        // SAFETY: `h` is a fresh, owned job handle.
-        let job = Self(unsafe { OwnedHandle::from_raw_handle(h as RawHandle) });
+        let mut job = Self {
+            // SAFETY: `h` is a fresh, owned job handle.
+            handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) },
+            port: None,
+        };
 
         // SAFETY: an all-zero JOBOBJECT_EXTENDED_LIMIT_INFORMATION is valid.
         let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -147,23 +161,36 @@ impl Job {
             })?;
             eprintln!("job UI restrictions: applied {applied:#x}, refused {refused:#x}");
         }
+
+        // The memory-limit messages (M8 Task 9). Not fatal: the limit itself is
+        // enforced by the job either way.
+        match JobPort::create().and_then(|port| port.associate(job.raw()).map(|()| port)) {
+            Ok(port) => job.port = Some(port),
+            Err(e) => eprintln!("job completion port not associated: {e}"),
+        }
         Ok(job)
     }
 
+    /// The memory watch of a split worker in this job (M8 Task 9); `None`
+    /// when the job has no port.
+    pub(crate) fn memory_watch(&self) -> io::Result<Option<JobPortWatch>> {
+        self.port.as_ref().map(JobPort::watch).transpose()
+    }
+
     pub(crate) fn raw(&self) -> *mut core::ffi::c_void {
-        self.0.as_raw_handle().cast()
+        self.handle.as_raw_handle().cast()
     }
 
     /// `TerminateJobObject`: kills every process in the job.
     pub(crate) fn terminate(&self) -> io::Result<()> {
-        terminate_job(&self.0)
+        terminate_job(&self.handle)
     }
 
     /// A second, non-inheritable handle to the same job (`DuplicateHandle`
     /// with the same access), for the run's kill handle (PD-137). The job
     /// lives, and `KILL_ON_JOB_CLOSE` waits, until the last handle closes.
     pub(crate) fn duplicate_handle(&self) -> io::Result<OwnedHandle> {
-        self.0.try_clone()
+        self.handle.try_clone()
     }
 
     pub(crate) fn snapshot(&self) -> io::Result<JobSnapshot> {

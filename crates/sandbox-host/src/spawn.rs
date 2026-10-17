@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+use crate::limits::MemoryWatch;
+
 /// `process_mb` default from the §9.4 limits table.
 pub const DEFAULT_PROCESS_MB: u32 = 512;
 
@@ -89,6 +91,17 @@ pub trait WorkerProcess {
     /// worker through `Box<dyn WorkerProcess>`.
     fn into_parts(self: Box<Self>) -> io::Result<WorkerParts> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    /// The host's watch of this worker's memory for a script run (M8 Task 9, §9.4
+    /// `process_mb`): Windows the job's completion port, macOS the footprint
+    /// watchdog. The bridge takes it once, before [`WorkerProcess::into_parts`].
+    ///
+    /// The default is `None`: Linux needs none (`RLIMIT_AS` makes the worker
+    /// exit `EXIT_PROCESS_LIMIT`, R3), nor do the fakes. Requirement for M8 T11:
+    /// the degraded Windows process type overrides it like `WindowsProcess`.
+    fn memory_watch(&mut self) -> io::Result<Option<Box<dyn MemoryWatch>>> {
+        Ok(None)
     }
 }
 
