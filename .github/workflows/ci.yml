@@ -29,7 +29,8 @@ jobs:
   rust:
     name: rust (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The Windows leg hit the old 60 minute limit once confluence_flows joined it (M7 T28).
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
