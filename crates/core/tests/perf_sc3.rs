@@ -181,9 +181,20 @@ async fn p01_confluence_page_and_update_diff_under_budget() -> TestResult {
         doc.contains("Check the build twice"),
         "the diff shows the changed line"
     );
+    Ok(())
+}
 
-    // T23 measurements (T15 m-3, T20a m-6): print-only, no bound. The same builds run under the
-    // entry lock (`refresh_caution`) on every enrichment, so these are the lock-held costs.
+/// T23 measurements (T15 m-3, T20a m-6), print-only, no bound: the card of a page update near
+/// the 16 MiB body limit and of a 10 MiB upload. Every enrichment builds the same card once more
+/// for the queue row's caution count (off the entry lock since T23b). Ignored (T23 review I-3):
+/// in a debug build it takes about a minute and waits up to 60 s for each enrichment, which must
+/// not make the enforced P-01 test red. Run it alone:
+/// `cargo test -p atlas-duck-core --features testing --test perf_sc3 -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "print-only measurement of the largest bodies; about a minute in a debug build"]
+async fn t23_largest_page_update_and_upload_measured() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
     let mut big = page_with_storage(&"<p>Release note line.</p>".repeat(15 * 1024 * 1024 / 26));
     big["id"] = json!("65539");
     println!(
@@ -200,6 +211,7 @@ async fn p01_confluence_page_and_update_diff_under_budget() -> TestResult {
     .await?;
     measure(&h, &id, "confluence.page.update ~15 MiB page")?;
 
+    mount_page(mock, "65537", &page_with_storage("<p>Attachments.</p>")).await;
     mount_attachments(
         mock,
         "65537",

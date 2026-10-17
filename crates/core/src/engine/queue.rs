@@ -40,6 +40,10 @@ pub const SCRIPT_SLOTS: usize = 2;
 pub const DRY_SLOTS: usize = 2;
 /// §5.2: `candidate_cache_mb` default.
 pub const CANDIDATE_CACHE_MB: u64 = 512;
+/// An upload's multipart part headers beside the file (PD-109, [`Reservation::upload`]): two
+/// part headers and the closing line, each boundary under 64 bytes, the filename at most 255
+/// characters and the comment at most 1000 (4 UTF-8 bytes each at most): under 8 KiB.
+pub const UPLOAD_PART_HEADERS: u64 = 8 * 1024;
 
 /// The limits the engine runs with (§3.3, §5.2). Only `max_pending_bytes`,
 /// `candidate_cache_bytes` and `comments_cap` come from `config.toml` (`config::limits`); the rest
@@ -145,25 +149,58 @@ impl Reservation {
         Reservation(u64::from(limits.max_result_mb).saturating_mul(MIB))
     }
 
-    /// Writes reserve nothing (§5.2 names reads and scripts), except `confluence.page.update`.
+    /// Writes reserve nothing (§5.2 names reads and scripts), except the two that hold a large
+    /// body while pending ([`Reservation::page_update`], [`Reservation::upload`]).
     pub fn none() -> Reservation {
         Reservation(0)
     }
 
     /// `confluence.page.update` (T23, T15 review I-1): a pending update keeps the current page's
     /// storage and, behind a conflict, the base version's, each up to
-    /// [`PAGE_BODY_LIMIT`](crate::ops::confluence::PAGE_BODY_LIMIT) bytes.
-    pub fn page_update() -> Reservation {
-        Reservation(2 * PAGE_BODY_LIMIT as u64)
+    /// [`PAGE_BODY_LIMIT`](crate::ops::confluence::PAGE_BODY_LIMIT) bytes. Never more than the
+    /// cap (T23 review I-1): under a `max_pending_bytes` below 32 MiB one update still fits an
+    /// empty queue instead of being `busy` for good.
+    pub fn page_update(limits: &Limits) -> Reservation {
+        Reservation(2 * PAGE_BODY_LIMIT as u64).within(limits)
+    }
+
+    /// `confluence.attachment.upload` (T23 review I-2), from the op's static `upload_max_bytes`
+    /// (`n`): a pending upload keeps the base64 content in the validated params and again in the
+    /// write's params, a third time in the delivery view of an edited upload
+    /// (`EditView::executed_params`), each up to `4 * ceil(n / 3)` characters (the schema's
+    /// `maxLength`), and the multipart wire body in its request list: the decoded file (`n`) plus
+    /// [`UPLOAD_PART_HEADERS`]. Never more than the cap, like a page update.
+    pub fn upload(n: u64, limits: &Limits) -> Reservation {
+        let base64 = n.div_ceil(3).saturating_mul(4);
+        let held = base64
+            .saturating_mul(3)
+            .saturating_add(n)
+            .saturating_add(UPLOAD_PART_HEADERS);
+        Reservation(held).within(limits)
+    }
+
+    /// At most the cap in force (no cap: unchanged, `admit` ignores bytes then).
+    fn within(self, limits: &Limits) -> Reservation {
+        Reservation(
+            limits
+                .max_pending_bytes
+                .map_or(self.0, |cap| self.0.min(cap)),
+        )
     }
 
     /// The reservation of a registry op: reads reserve, writes do not, except a page update
-    /// (its enrichment bodies, [`Reservation::page_update`]).
-    pub fn for_op(spec: &OperationSpec) -> Reservation {
+    /// (its enrichment bodies, [`Reservation::page_update`]) and an upload (its file,
+    /// [`Reservation::upload`]).
+    pub fn for_op(spec: &OperationSpec, limits: &Limits) -> Reservation {
         match spec.class {
             OpClass::Read => Reservation::read(spec),
-            OpClass::Write if spec.id == "confluence.page.update" => Reservation::page_update(),
-            OpClass::Write => Reservation::none(),
+            OpClass::Write if spec.id == "confluence.page.update" => {
+                Reservation::page_update(limits)
+            }
+            OpClass::Write => spec
+                .caps
+                .upload_max_bytes
+                .map_or(Reservation::none(), |n| Reservation::upload(n, limits)),
         }
     }
 
