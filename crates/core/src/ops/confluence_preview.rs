@@ -1236,7 +1236,14 @@ pub(crate) fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     if let Some(reply) = reply {
         rows.push(("Reply to".to_owned(), line(&format!("comment {reply}"))));
     }
-    count_card_text(&mut model, [title, facts.space_key.as_str()]);
+    count_card_text(
+        &mut model,
+        [
+            title,
+            facts.space_key.as_str(),
+            facts.space_name.as_deref().unwrap_or(""),
+        ],
+    );
 
     let requests = match std::mem::replace(
         &mut model.body,

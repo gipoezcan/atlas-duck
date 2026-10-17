@@ -480,6 +480,72 @@ fn comment_add_card_counts_what_the_render_drops() -> TestResult {
     Ok(())
 }
 
+/// The card shows what is sent (the request), not what the params say: a request whose storage
+/// differs from `params.body` is rendered and counted from the request.
+#[test]
+fn comment_add_card_renders_the_request_not_the_params() -> TestResult {
+    let mut p = params("<p>param text</p>", None);
+    p["body_format"] = json!("storage");
+    let v = verdict(&p)?;
+    let mut reqs = requests(&p, &v)?;
+    let [one] = reqs.as_mut_slice() else {
+        return Err("not one request".into());
+    };
+    let mut body = sent(std::slice::from_ref(one))?;
+    body["body"]["storage"]["value"] = json!("<p title=\"x\">other</p>");
+    one.body = serde_json::to_vec(&body)?;
+    let m = preview_of(&p, &v, &reqs)?;
+    let html = card(&m)?.html.ok_or("no body")?;
+    assert!(
+        html.contains("other") && !html.contains("param text"),
+        "{html}"
+    );
+    assert_eq!(m.header.hidden_in_preview_bytes, "title=\"x\"".len() as u64);
+
+    // A Markdown body shows its rendering, never the raw Markdown.
+    let p = params("**bold** words", None);
+    let v = verdict(&p)?;
+    let reqs = requests(&p, &v)?;
+    let m = preview_of(&p, &v, &reqs)?;
+    let html = card(&m)?.html.ok_or("no body")?;
+    assert!(html.contains("bold") && !html.contains("**"), "{html}");
+    Ok(())
+}
+
+/// The space name the Space row shows takes part in the invisible-character count.
+#[test]
+fn comment_add_card_counts_invisible_characters_in_the_space_name() -> TestResult {
+    let p = params("Looks good.", None);
+    let mut page = container("page");
+    page["space"]["name"] = json!("Docs\u{202e}Team");
+    let v = staged(&p, &[page])?.1;
+    let reqs = requests(&p, &v)?;
+    let m = preview_of(&p, &v, &reqs)?;
+    assert_eq!(m.header.bidi_controls, 1);
+    assert!(
+        m.warnings.iter().any(|w| w.id == WarningId::BidiControls),
+        "{:?}",
+        m.warnings
+    );
+    Ok(())
+}
+
+/// An unknown macro in the outgoing storage raises the Info `unknown_macros` on the comment card.
+#[test]
+fn comment_add_card_notes_unknown_macros() -> TestResult {
+    let mut p = params("<ac:structured-macro ac:name=\"made-up\"/><p>Hi</p>", None);
+    p["body_format"] = json!("storage");
+    let v = verdict(&p)?;
+    let reqs = requests(&p, &v)?;
+    let m = preview_of(&p, &v, &reqs)?;
+    assert!(
+        m.warnings.iter().any(|w| w.id == WarningId::UnknownMacros),
+        "{:?}",
+        m.warnings
+    );
+    Ok(())
+}
+
 #[test]
 fn comment_add_card_keeps_the_generic_body_without_a_verdict() -> TestResult {
     // Another hold has no request list: the generic write card stays.

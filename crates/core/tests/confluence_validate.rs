@@ -558,6 +558,7 @@ async fn comment_add_markdown_rejected_before_enrichment() -> TestResult {
     for (body, format, want) in [
         (" ", None, "validation"),
         ("<!DOCTYPE x><p>a</p>", Some("storage"), "validation"),
+        (" ", Some("storage"), "validation"),
     ] {
         let mut params = json!({"content_id": "65537", "body": body});
         if let Some(f) = format {

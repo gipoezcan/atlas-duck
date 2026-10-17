@@ -45,7 +45,8 @@ pub fn too_deep_message() -> String {
     )
 }
 
-/// Whether a Markdown body that converts to nothing is refused (`validation`, [`EMPTY_MESSAGE`]).
+/// Whether a body that is empty (Markdown that converts to nothing, or blank storage) is refused
+/// (`validation`, [`EMPTY_MESSAGE`]).
 /// A page may be written empty (`page.update`); a comment may not (`comment.add`, Task 18).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EmptyBody {
@@ -64,6 +65,13 @@ pub(crate) fn is_markdown(params: &Value) -> bool {
 pub(crate) fn storage_text(ctx: &ExecCtx<'_>, empty: EmptyBody) -> Result<String, ExecError> {
     let text = str_param(ctx.params, BODY);
     if !is_markdown(ctx.params) {
+        if empty == EmptyBody::Refuse && text.trim().is_empty() {
+            return Err(ExecError::Invalid(invalid(
+                BODY,
+                "is empty: the storage body has no content",
+                None,
+            )));
+        }
         check_storage_body(text).map_err(|r| ExecError::Invalid(storage_rejected(r)))?;
         return Ok(text.to_owned());
     }
@@ -166,7 +174,7 @@ mod tests {
     }
 
     /// Whitespace-only Markdown converts to nothing: `Allow` sends it, `Refuse` answers with the
-    /// static message before any fault could mask it; a verbatim storage body is never checked.
+    /// static message before any fault could mask it; blank storage is refused the same way.
     #[test]
     fn empty_markdown_body_allowed_or_refused() -> Result<(), String> {
         for body in ["", " ", " \n\n "] {
@@ -185,10 +193,21 @@ mod tests {
                 }
             }
         }
-        // Text that converts to something, and verbatim storage, pass in both modes.
+        // Whitespace-only storage is sent verbatim when empty is allowed, refused otherwise.
+        assert!(matches!(run(" ", Some("storage"), EmptyBody::Allow)?, Ok(s) if s == " "));
+        match run(" ", Some("storage"), EmptyBody::Refuse)? {
+            Err(ExecError::Invalid(e)) => {
+                assert_eq!(
+                    e.message,
+                    "params/body: is empty: the storage body has no content"
+                );
+            }
+            _ => return Err("Refuse did not refuse blank storage".to_owned()),
+        }
+        // Text that converts to something passes in both modes.
         for empty in [EmptyBody::Allow, EmptyBody::Refuse] {
             assert!(matches!(run("hi", None, empty)?, Ok(s) if s == "<p>hi</p>"));
-            assert!(matches!(run(" ", Some("storage"), empty)?, Ok(s) if s == " "));
+            assert!(matches!(run("<p>hi</p>", Some("storage"), empty)?, Ok(s) if s == "<p>hi</p>"));
         }
         Ok(())
     }
