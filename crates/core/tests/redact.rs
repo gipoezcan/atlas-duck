@@ -1,6 +1,9 @@
 //! U-26 (redaction engine, copies, mirrors, mask everywhere), U-28 (canonical match form, the
 //! "Falcon Müller Plan" fixture), U-29 core half (drops never look empty, upstream `null`s stay).
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
 use atlas_duck_core::engine::script::SCRIPT_SPEC;
 use atlas_duck_core::redact::views::{canonical_hit, views};
 use atlas_duck_core::redact::{
@@ -1567,6 +1570,34 @@ fn drop_absent_in_original_and_current_doc_is_refused() -> TestResult {
     Ok(())
 }
 
+/// Review T19c fix2 n-4 (T24: a stale index is a silent no-op): after `list[2]` the shown `[3]`
+/// is the source's `[4]`, which has no `x`; the source's `[3]` has one and is still there (now at
+/// `[2]`). An index-only field drop there does nothing and is not refused: only an op that names
+/// by identity must prove that what it names went.
+#[test]
+fn a_stale_index_field_drop_is_a_no_op() -> TestResult {
+    let source = json!({"list": [
+        {"id": 0, "x": "a0"},
+        {"id": 1},
+        {"id": 2, "x": "a2"},
+        {"id": 3, "x": "a3"},
+        {"id": 4}
+    ]});
+    let ops = [
+        drop_field("list[2]", DropScope::PerItem),
+        drop_field("list[3].x", DropScope::PerItem),
+    ];
+    let out = apply(&source, &NO_RULES, None, &ops);
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert_eq!(
+        out.released,
+        json!({"list": [{"id": 0, "x": "a0"}, {"id": 1}, {"id": 3, "x": "a3"}, {"id": 4}]})
+    );
+    assert_eq!(out.meta.items_dropped, 1);
+    assert!(out.meta.fields_dropped.is_empty(), "{:?}", out.meta);
+    Ok(())
+}
+
 // ---- §5.3 mirror pairing cannot be spoofed (M8 T19c review I-1) ----------------------------------
 
 const RENDERED: &str = "renderedFields.comment.comments";
@@ -2189,6 +2220,98 @@ fn a_single_mask_of_a_mirror_key_masks_the_mirrored_key() -> TestResult {
     Ok(())
 }
 
+/// Review T19c fix2 n-1: the bare drop of an orphan's mirror key blocks with the entry, and the
+/// entry is tracked like the ones the source flags: once a later op drops it whole nothing is left
+/// to block, and while it stays it is reported where it is. The block used to keep the path of the
+/// key drop's time: an index that no longer existed, or (two orphans) the paired comment 8.
+#[test]
+fn an_orphan_dropped_after_its_key_drop_does_not_block() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let key = |id: &str| drop_field(&format!("{RENDERED}[id={id}].id"), DropScope::PerItem);
+    for (source, ops) in [
+        (one_orphan(), vec![key("9"), drop_id(RENDERED, json!("9"))]),
+        (
+            two_orphans(),
+            vec![
+                key("9"),
+                drop_id(RENDERED, json!("9")),
+                drop_id(RENDERED, json!("11")),
+            ],
+        ),
+        (
+            two_orphans(),
+            vec![
+                drop_field(&format!("{RENDERED}[].id"), DropScope::AllItems),
+                drop_id(RENDERED, json!("9")),
+                drop_id(RENDERED, json!("11")),
+            ],
+        ),
+    ] {
+        let out = apply(&source, r, None, &ops);
+        assert!(out.blocked.is_empty(), "{ops:?}: {:?}", out.blocked);
+        assert!(!released_text(&out, "orphan"), "{ops:?}: {}", out.released);
+    }
+    // The orphan 11 stays: it blocks where the drop of 9 moved it, not at its old `[3]`.
+    let out = apply(
+        &two_orphans(),
+        r,
+        None,
+        &[key("11"), drop_id(RENDERED, json!("9"))],
+    );
+    assert!(has_block(&out, &rendered_orphan(2)), "{:?}", out.blocked);
+    assert!(
+        out.blocked
+            .iter()
+            .all(|b| b.path() != format!("{RENDERED}[3]")),
+        "{:?}",
+        out.blocked
+    );
+    Ok(())
+}
+
+/// Review T19c fix2 n-3: a single-occurrence mask applies to the entry the mirrored entry pairs
+/// with as the drops left them, not as earlier masks left the keys. With both comments' ids masked
+/// on both sides (single masks at the ids, or every occurrence) the keys all read `[REDACTED]`, and
+/// the body mask of comment 7 also masked the rendered body of comment 8.
+#[test]
+fn a_single_mask_after_key_masks_applies_to_the_paired_entry_only() -> TestResult {
+    let r = rules("jira.issue.get")?;
+    let source = mirrored(
+        json!([{"id": "7", "body": "tok one"}, {"id": "8", "body": "tok two"}]),
+        json!([
+            {"id": "7", "body": "<p>tok one</p>"},
+            {"id": "8", "body": "<p>tok two</p>"}
+        ]),
+    );
+    for keys in [
+        vec![
+            single_at("7", &format!("{SOURCE}[0].id")),
+            single_at("8", &format!("{SOURCE}[1].id")),
+        ],
+        vec![mask("7"), mask("8")],
+    ] {
+        let mut ops = keys.clone();
+        ops.push(single_at("tok", &format!("{SOURCE}[0].body")));
+        let out = apply(&source, r, None, &ops);
+        assert!(out.blocked.is_empty(), "{keys:?}: {:?}", out.blocked);
+        let rendered = &out.released["renderedFields"]["comment"]["comments"];
+        assert_eq!(rendered[0]["id"], REDACTED, "{keys:?}");
+        assert_eq!(rendered[1]["id"], REDACTED, "{keys:?}");
+        assert_eq!(rendered[0]["body"], "<p>[REDACTED] one</p>", "{keys:?}");
+        assert_eq!(rendered[1]["body"], "<p>tok two</p>", "{keys:?}");
+        assert_eq!(
+            out.released["fields"]["comment"]["comments"][1]["body"], "tok two",
+            "{keys:?}"
+        );
+        assert_eq!(
+            out.needs_confirmation,
+            vec!["2 other occurrences remain"],
+            "{keys:?}"
+        );
+    }
+    Ok(())
+}
+
 /// Review T19c fix m-6: the flagged-entry tracking follows an item-level shift (`jira.search`):
 /// an orphan in the second issue is reported where it is after the first issue's drop.
 #[test]
@@ -2231,6 +2354,95 @@ fn a_flagged_entry_follows_an_item_level_shift() -> TestResult {
     );
     assert!(out.blocked.is_empty(), "{:?}", out.blocked);
     assert!(!released_text(&out, "orphan secret"), "{}", out.released);
+    Ok(())
+}
+
+// ---- the cost of pairing by the source key (M8 T19c fix2 review I-2) ----------------------------
+
+/// `n` paired comments, ids `0..n`.
+fn numbered(n: usize) -> Value {
+    mirrored(
+        (0..n)
+            .map(|i| json!({"id": i.to_string(), "body": format!("body {i}")}))
+            .collect(),
+        (0..n)
+            .map(|i| json!({"id": i.to_string(), "body": format!("<p>body {i}</p>")}))
+            .collect(),
+    )
+}
+
+/// `apply` with the `jira.issue.get` rules on a thread: a regression fails by assertion on
+/// `bound` instead of hanging the suite.
+fn apply_within(
+    bound: Duration,
+    source: Value,
+    ops: Vec<RedactionOp>,
+) -> Result<RedactionOutcome, Box<dyn std::error::Error>> {
+    let r = rules("jira.issue.get")?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let out = apply(&source, r, None, &ops);
+        let _ = tx.send((out, started.elapsed()));
+    });
+    match rx.recv_timeout(bound) {
+        Ok((out, took)) => {
+            eprintln!("apply: {took:?}");
+            Ok(out)
+        }
+        Err(RecvTimeoutError::Timeout) => Err(format!("not done within {bound:?}").into()),
+        Err(RecvTimeoutError::Disconnected) => Err("the apply thread panicked".into()),
+    }
+}
+
+/// The comments left on each side, all without `id`; and `blocked` is empty.
+fn keyless_comments_left(out: &RedactionOutcome, n: usize) -> TestResult {
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    for side in ["fields", "renderedFields"] {
+        let entries = out.released[side]["comment"]["comments"]
+            .as_array()
+            .ok_or("no comments")?;
+        assert_eq!(entries.len(), n, "{side}");
+        assert!(entries.iter().all(|e| e.get("id").is_none()), "{side}");
+    }
+    Ok(())
+}
+
+/// Review T19c fix2 I-2: once the mirror keys were dropped across all items (one click), a later
+/// drop across all items paired each target by looking up the source key of every entry of the
+/// other side, each lookup replaying the removal log: cubic, 16 s at 1600 comments and minutes at
+/// 3200. The keys of an array are now looked up once per batch of drops.
+#[test]
+fn a_drop_after_a_mirror_key_drop_across_all_items_is_not_cubic() -> TestResult {
+    const N: usize = 8000;
+    let ops = vec![
+        drop_field(&format!("{SOURCE}[].id"), DropScope::AllItems),
+        drop_field(&format!("{SOURCE}[].body"), DropScope::AllItems),
+    ];
+    let out = apply_within(Duration::from_secs(30), numbered(N), ops)?;
+    keyless_comments_left(&out, N)?;
+    assert!(!released_text(&out, "body"));
+    Ok(())
+}
+
+/// The same for item drops by identity after the one-click key drop: every element they look at
+/// has no key, and each lookup of the source's undid the whole removal log (two entries per
+/// comment after the key drop). It is now found through the source index of the elements left.
+#[test]
+fn item_drops_after_a_mirror_key_drop_across_all_items_stay_fast() -> TestResult {
+    const N: usize = 3200;
+    const K: usize = 400;
+    let gone: Vec<usize> = (0..K).map(|i| i * 8).collect();
+    let mut ops = vec![drop_field(&format!("{SOURCE}[].id"), DropScope::AllItems)];
+    ops.extend(gone.iter().map(|i| drop_id(SOURCE, json!(i.to_string()))));
+    let out = apply_within(Duration::from_secs(30), numbered(N), ops)?;
+    keyless_comments_left(&out, N - K)?;
+    let left = strings(&out.released);
+    for i in gone {
+        let raw = format!("body {i}");
+        let rendered = format!("<p>body {i}</p>");
+        assert!(!left.iter().any(|s| *s == raw || *s == rendered), "{i}");
+    }
     Ok(())
 }
 

@@ -8,8 +8,13 @@
 //! The pairing cannot be spoofed (review T19c I-1): the check runs before any mask, a bare drop
 //! of the key of an entry without counterpart blocks ([`unpaired_key`]), and an entry the check
 //! flags in the source blocks until it is dropped whole ([`flagged`], tracked by `apply`). A drop
-//! that names an entry pairs it by the source's key where an earlier drop took the key (review
-//! T19c I-1'); the check itself uses only the keys still there.
+//! or a mask that names an entry pairs it by the source's key, also where an earlier drop took the
+//! key or an earlier mask rewrote it (review T19c I-1', fix2 n-3); the check itself uses only the
+//! keys still there.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use atlas_duck_registry::Mirror;
 use serde_json::Value;
@@ -40,22 +45,51 @@ fn starts_with_keys(loc: &[Step], at: usize, keys: &[Step]) -> bool {
     loc.get(at..at + keys.len()) == Some(keys)
 }
 
-/// The mirror key of the entry `arr[i]`: its own, or through `ident` if a drop removed it.
-fn key_of(e: &Value, key: &str, arr: &[Step], i: usize, ident: &Ident<'_>) -> Option<Value> {
-    match e.get(key) {
-        Some(v) => Some(v.clone()),
-        None => ident(&path::with(arr, Step::Index(i)), key),
+type KeyMap = HashMap<(Loc, &'static str), Rc<[Option<Value>]>>;
+
+/// The mirror keys of every entry of the arrays [`counterparts`] looked at, by array and key, as
+/// the source has them (through `ident`): computed once per array, not once per entry and target
+/// (review T19c fix2 I-2: a drop across all items looked up every key of the other side for each
+/// target). Valid while the removal log stays as it is (`apply` clears it on every removal): masks
+/// change no array's length and no source key.
+#[derive(Default)]
+pub(crate) struct Keys(RefCell<KeyMap>);
+
+impl Keys {
+    pub(crate) fn clear(&mut self) {
+        self.0.get_mut().clear();
+    }
+
+    /// The key of each of the `len` entries of the array at `arr`.
+    fn of(
+        &self,
+        arr: &[Step],
+        len: usize,
+        key: &'static str,
+        ident: &Ident<'_>,
+    ) -> Rc<[Option<Value>]> {
+        let at = (arr.to_vec(), key);
+        if let Some(known) = self.0.borrow().get(&at) {
+            return Rc::clone(known);
+        }
+        let keys: Rc<[Option<Value>]> = (0..len)
+            .map(|i| ident(&path::with(arr, Step::Index(i)), key))
+            .collect();
+        self.0.borrow_mut().insert(at, Rc::clone(&keys));
+        keys
     }
 }
 
 /// Counterparts of `loc` in the current document, for every mirror and both directions. Entries
-/// pair by their key, or the source's key through `ident` where a drop removed it (review T19c
-/// I-1': the identity of an entry is the source's).
+/// pair by the source's key, through `ident` (review T19c I-1': the identity of an entry is the
+/// source's). A drop never rewrites a key, so where the entry still has it, it is the same; a mask
+/// does (review T19c fix2 n-3: masked keys must not pair the wrong entries).
 pub(crate) fn counterparts(
     doc: &Value,
     mirrors: &[Mirror],
     loc: &[Step],
     ident: &Ident<'_>,
+    keys: &Keys,
 ) -> Vec<Counterpart> {
     let mut out = Vec::new();
     for m in mirrors {
@@ -84,19 +118,21 @@ pub(crate) fn counterparts(
                 let Some(Value::Array(src)) = path::get(doc, &side_arr) else {
                     continue;
                 };
-                let Some(entry) = src.get(i) else { continue };
+                let side_keys = keys.of(&side_arr, src.len(), m.key, ident);
+                let Some(entry_key) = side_keys.get(i) else {
+                    continue;
+                };
                 let rest = &loc[at + side.len() + 1..];
-                let (key_value, js) = match key_of(entry, m.key, &side_arr, i, ident) {
+                let (key_value, js) = match entry_key {
                     Some(kv) => {
-                        let js = dst
+                        let js = keys
+                            .of(&other_arr, dst.len(), m.key, ident)
                             .iter()
                             .enumerate()
-                            .filter(|(j, e)| {
-                                key_of(e, m.key, &other_arr, *j, ident).as_ref() == Some(&kv)
-                            })
+                            .filter(|(_, k)| k.as_ref() == Some(kv))
                             .map(|(j, _)| j)
                             .collect::<Vec<_>>();
-                        (Some(kv), js)
+                        (Some(kv.clone()), js)
                     }
                     None if src.len() == dst.len() => (None, vec![i]),
                     None => {

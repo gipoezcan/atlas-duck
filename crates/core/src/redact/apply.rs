@@ -38,6 +38,8 @@ pub fn apply(
         dropped_on_entries: Vec::new(),
         flagged: mirror::flagged(candidate, rules.mirrors),
         removed: Vec::new(),
+        origin: HashMap::new(),
+        keys: mirror::Keys::default(),
         dirty: HashSet::new(),
         budget: Budget::for_apply(text_bytes(candidate)),
         url_patterns: rules
@@ -253,11 +255,18 @@ struct Redactor<'a> {
     blocked: Vec<BlockReason>,
     also: Vec<String>,
     dropped_on_entries: Vec<DroppedOnEntry>,
-    /// The entries the source's mirror check flags that are still in `doc`, where they now are.
+    /// The entries the source's mirror check flags, and those whose mirror key alone a drop took
+    /// while they had no counterpart, that are still in `doc`, where they now are.
     flagged: Vec<Flagged>,
     /// Every location the drop phase removed, in order: what follows a source location to where
-    /// it is now, or back (review T19c I-1').
+    /// it is now (review T19c I-1').
     removed: Vec<Loc>,
+    /// Every array the drop phase removed elements from, by its source location: the source
+    /// index of each element still there. What maps a location back to the source in O(depth);
+    /// undoing `removed` cost O(removals) per lookup (review T19c fix2 I-2).
+    origin: HashMap<Loc, Vec<usize>>,
+    /// The mirror keys the pairing computed since the last removal (review T19c fix2 I-2).
+    keys: mirror::Keys,
     /// String values rewritten or removed by a mask.
     dirty: HashSet<Loc>,
     /// The canonical-form work budget of this call (shared by every text).
@@ -298,13 +307,32 @@ impl Redactor<'_> {
         });
     }
 
-    /// The source location of `cur`, a location in `doc`: the drop phase's removals undone.
+    /// The source location of `cur`, a location in `doc`: the drop phase's removals undone
+    /// through `origin` (only a removed element moves a location).
     fn source_loc(&self, cur: &[Step]) -> Loc {
-        let mut at = cur.to_vec();
-        for removed in self.removed.iter().rev() {
-            path::before_removal(&mut at, removed);
+        let mut at = Vec::with_capacity(cur.len());
+        for step in cur {
+            let step = match step {
+                Step::Index(i) => Step::Index(match self.origin.get(&at) {
+                    Some(left) => match left.get(*i) {
+                        Some(&s) => s,
+                        // Past the end: as far past the source's.
+                        None => i - left.len() + self.source_len(&at),
+                    },
+                    None => *i,
+                }),
+                Step::Key(_) => step.clone(),
+            };
+            at.push(step);
         }
         at
+    }
+
+    /// The length of the source's array at `src`.
+    fn source_len(&self, src: &[Step]) -> usize {
+        path::get(self.original, src)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
     }
 
     /// Field `key` of the element at `cur` as the source has it. The drop phase only removes,
@@ -424,11 +452,13 @@ impl Redactor<'_> {
                 self.mirrored(&loc, &mut remove);
             }
         }
-        // The key alone of an entry without counterpart: the entry stays, so it blocks.
+        // The key alone of an entry without counterpart: the entry stays, so it blocks, where it
+        // is after the drops and only if a later op does not drop it whole (review T19c fix2 n-1).
         for loc in &remove {
-            if let Some(entry) = mirror::unpaired_key(&self.doc, self.rules.mirrors, loc) {
-                self.blocked.push(BlockReason::MirrorOrphan {
-                    path: path::display(&entry),
+            if let Some(at) = mirror::unpaired_key(&self.doc, self.rules.mirrors, loc) {
+                self.flagged.push(Flagged {
+                    at,
+                    unmatchable: false,
                 });
             }
         }
@@ -439,17 +469,36 @@ impl Redactor<'_> {
 
     /// Removes `loc`, follows the flagged entries across it and logs it.
     fn remove(&mut self, loc: &[Step]) {
+        // An element's array: where it is in the source (its own removal does not move it).
+        let array = match loc.split_last() {
+            Some((Step::Index(i), parent)) => Some((*i, self.source_loc(parent))),
+            _ => None,
+        };
         if path::remove(&mut self.doc, loc).is_some() {
             self.flagged
                 .retain_mut(|f| path::after_removal(&mut f.at, loc));
             self.removed.push(loc.to_vec());
+            if let Some((i, src)) = array {
+                let len = self.source_len(&src);
+                let left = self.origin.entry(src).or_insert_with(|| (0..len).collect());
+                if i < left.len() {
+                    left.remove(i);
+                }
+            }
+            self.keys.clear();
         }
     }
 
+    /// Within one batch of drops (`drop_locs` resolves every counterpart before it removes
+    /// anything) the mirror keys are computed once per array.
     fn counterparts(&self, loc: &[Step]) -> Vec<Counterpart> {
-        mirror::counterparts(&self.doc, self.rules.mirrors, loc, &|l, k| {
-            self.source_field(l, k)
-        })
+        mirror::counterparts(
+            &self.doc,
+            self.rules.mirrors,
+            loc,
+            &|l, k| self.source_field(l, k),
+            &self.keys,
+        )
     }
 
     fn mirrored(&mut self, loc: &[Step], remove: &mut BTreeSet<Loc>) {
@@ -661,9 +710,9 @@ impl Redactor<'_> {
                 .push(BlockReason::MaskStillOccurs { path: display });
             return;
         }
-        // §5.3: a per-item mask also applies to the mirrored entry (every hit in that value). Its
-        // counterparts are looked up before the rewrite: a masked key pairs with nothing (review
-        // T19c fix m-1).
+        // §5.3: a per-item mask also applies to the mirrored entry (every hit in that value). It
+        // pairs by the source's key, so neither this rewrite nor an earlier mask decides which
+        // entry that is (review T19c fix m-1, fix2 n-3).
         let counterparts = self.counterparts(&loc);
         self.set_string(&loc, masked);
         for c in counterparts {

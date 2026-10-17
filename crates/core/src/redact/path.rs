@@ -37,8 +37,9 @@ struct Seg {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Pattern(Vec<Seg>);
 
-/// The value of field `key` of the element at a location, where the element itself no longer has
-/// it: the source's (an element's identity is the source's, review T19c I-1').
+/// The value of field `key` of the element at a location as the source has it (an element's
+/// identity is the source's, review T19c I-1'): asked where the element no longer has it, and by
+/// the mirror pairing for every entry.
 pub(crate) type Ident<'a> = dyn Fn(&[Step], &str) -> Option<Value> + 'a;
 
 /// No identity beyond the document itself.
@@ -358,18 +359,6 @@ pub(crate) fn after_removal(at: &mut Loc, removed: &[Step]) -> bool {
         *j -= 1;
     }
     true
-}
-
-/// The inverse of [`after_removal`] for a location that survived the removal of `removed`: where
-/// it was before.
-pub(crate) fn before_removal(at: &mut Loc, removed: &[Step]) {
-    if let Some((Step::Index(i), parent)) = removed.split_last()
-        && at.starts_with(parent)
-        && let Some(Step::Index(j)) = at.get_mut(parent.len())
-        && *j >= *i
-    {
-        *j += 1;
-    }
 }
 
 /// Every node of `v` with its location, in document order (keys sorted, elements in order).
