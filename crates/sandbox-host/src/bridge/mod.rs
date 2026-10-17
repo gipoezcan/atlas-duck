@@ -7,6 +7,7 @@
 //!   against a host blocked writing;
 //! - a **stderr** thread keeps the first 64 KiB and reads and discards the rest;
 //! - a **writer** thread owns stdin and writes the queued frames (`script.run`, call results);
+//!   the bytes queued and not yet written are capped ([`unread_results_cap`]);
 //! - a **reaper** thread waits for the exit (T6: never on a runtime thread, never dropped).
 //!
 //! The per-run state machine is [`state`]. The run lock is held only for short state updates,
@@ -36,7 +37,7 @@ use std::fmt;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
@@ -51,7 +52,8 @@ use atlas_duck_ipc::sandbox::script::{
     decode_worker_frame,
 };
 use atlas_duck_ipc::sandbox::{
-    EXIT_PROTOCOL, HOST_TO_WORKER_MAX, HostCall, HostCallResult, WORKER_FRAME_MAX_BYTES,
+    EXIT_PROTOCOL, HOST_TO_WORKER_MAX, HostCall, HostCallResult, ScriptLimits,
+    WORKER_FRAME_MAX_BYTES,
 };
 use serde_json::Value;
 use tokio::runtime::Handle;
@@ -87,6 +89,9 @@ pub const DIAG_HOST_PROTOCOL_EXIT: &str = "sandbox_host_protocol_exit";
 /// so the worker got a `result_too_large` rejection while core recorded the result (unreachable
 /// while `max_call_result_mb` ≤ 16, PD-139).
 pub const DIAG_CALL_RESULT_REPLACED: &str = "sandbox_call_result_replaced";
+/// Host fact for [`RunOutcome::diag`]: the run ended because the worker left more call results
+/// unread than [`unread_results_cap`] ([`ViolationKind::UnreadResults`]).
+pub const DIAG_UNREAD_RESULTS: &str = "sandbox_unread_results";
 /// How often a kill is sent again until the worker is reaped (see the module documentation).
 pub const KILL_RETRY: Duration = Duration::from_secs(1);
 
@@ -99,6 +104,19 @@ const EXIT_GRACE: Duration = Duration::from_secs(1);
 /// serde_json reads at most 127 nested arrays or objects into a `Value`, and the worker decodes
 /// the whole `script.run` frame into one, where `args` sits two objects deep.
 const MAX_ARGS_NESTING: usize = 125;
+
+/// The most bytes of frames queued for the worker and not yet written (T8 finding 1, T7 review
+/// m-6): `max_fetch_mb` plus one 24 MiB host → worker frame. §3.4 counts a call as outstanding
+/// only until its result is queued, so a worker that keeps calling without reading its stdin
+/// would make the host buffer every result until `timeout_s`. A worker that reads its answers
+/// never comes near: the shim has at most `max_concurrent_calls` unread, and the results of a run
+/// are bounded by `max_fetch_mb` (core) plus their encoding, which the one frame covers. Above
+/// the cap the run ends as [`ViolationKind::UnreadResults`] with a kill.
+pub fn unread_results_cap(limits: &ScriptLimits) -> usize {
+    (limits.max_fetch_mb as usize)
+        .saturating_mul(1024 * 1024)
+        .saturating_add(HOST_TO_WORKER_MAX)
+}
 
 /// §3.4 (verbatim form): the one marker kept when log lines were discarded past the caps.
 pub fn log_truncated_marker(discarded_bytes: u64) -> String {
@@ -341,13 +359,14 @@ pub fn start_run(
     } = launched;
 
     let (frames_tx, frames_rx) = mpsc::channel();
-    if let Err(e) = writer::spawn(stdin, frames_rx) {
+    let queued = Arc::new(AtomicUsize::new(0));
+    if let Err(e) = writer::spawn(stdin, frames_rx, Arc::clone(&queued)) {
         give_up(kill, exit);
         return Err(spawn_error(&e));
     }
     let limit = Duration::from_secs(u64::from(init.limits.timeout_s));
     expiry.as_mut().reset(tokio::time::Instant::now() + limit);
-    let _ = frames_tx.send(init_frame);
+    queue(&frames_tx, &queued, init_frame);
 
     let (outcome_tx, outcome) = watch::channel(None);
     let run = Arc::new(Run {
@@ -364,6 +383,8 @@ pub fn start_run(
         started,
         confinement: ready.confinement,
         read_cap: RunState::read_cap(&init.limits),
+        queued,
+        unread_cap: unread_results_cap(&init.limits),
     });
     let reading = Arc::clone(&run);
     let continuation: Continuation = Box::new(move |stdout| {
@@ -428,11 +449,12 @@ pub fn compile_run(
     } = launched;
 
     let (frames_tx, frames_rx) = mpsc::channel();
-    if let Err(e) = writer::spawn(stdin, frames_rx) {
+    let queued = Arc::new(AtomicUsize::new(0));
+    if let Err(e) = writer::spawn(stdin, frames_rx, Arc::clone(&queued)) {
         give_up(kill, exit);
         return Err(spawn_error(&e));
     }
-    let _ = frames_tx.send(request);
+    queue(&frames_tx, &queued, request);
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
     let continuation: Continuation = Box::new(move |mut stdout: Stdout| {
         let _ = reply_tx.send(reader::next_frame(&mut stdout, WORKER_FRAME_MAX_BYTES));
@@ -543,6 +565,16 @@ fn launch(spawner: &dyn WorkerSpawner, spec: &SpawnSpec) -> Result<Launched, Sta
     })
 }
 
+/// Hands `frame` to the writer, counted in `queued` until the writer has written it.
+fn queue(writer: &Sender<Vec<u8>>, queued: &AtomicUsize, frame: Vec<u8>) {
+    let len = frame.len();
+    queued.fetch_add(len, Ordering::SeqCst);
+    if writer.send(frame).is_err() {
+        // The writer thread is gone; the frame was never queued.
+        queued.fetch_sub(len, Ordering::SeqCst);
+    }
+}
+
 /// Kills a worker the bridge no longer uses, and kills it again every [`KILL_RETRY`] until its
 /// reaper thread reports the reap (`exit`), without waiting for that.
 fn give_up(kill: Arc<dyn KillHandle>, exit: Receiver<io::Result<ExitKind>>) {
@@ -622,6 +654,10 @@ struct Run {
     started: Instant,
     confinement: ConfinementReport,
     read_cap: usize,
+    /// Bytes queued for the worker and not yet written (the writer takes them off).
+    queued: Arc<AtomicUsize>,
+    /// [`unread_results_cap`] of the run.
+    unread_cap: usize,
 }
 
 struct Inner {
@@ -705,15 +741,28 @@ impl Run {
     }
 
     /// Queues a call's result while the run is undecided; the call stops counting as
-    /// outstanding in the same locked step (§3.4 "until its result has been queued").
+    /// outstanding in the same locked step (§3.4 "until its result has been queued"). A result
+    /// that would take the unwritten bytes above [`unread_results_cap`] is not queued: the run
+    /// ends as [`ViolationKind::UnreadResults`] and the worker is killed.
     fn answer(&self, id: u64, result: &HostCallResult) {
         let (frame, replaced) = writer::call_response(id, result);
-        let mut inner = self.lock();
-        if inner.state.complete_call()
-            && let Some(writer) = &inner.writer
-        {
-            let _ = writer.send(frame);
-            inner.result_replaced |= replaced;
+        let violated = self.update(|inner| {
+            // Under the lock: every addition to `queued` happens here (or before the run
+            // exists), so the check and the addition are one step; the writer only subtracts.
+            let unwritten = self.queued.load(Ordering::SeqCst);
+            if unwritten.saturating_add(frame.len()) > self.unread_cap {
+                return inner.state.on_unread_results();
+            }
+            if inner.state.complete_call()
+                && let Some(writer) = &inner.writer
+            {
+                queue(writer, &self.queued, frame);
+                inner.result_replaced |= replaced;
+            }
+            false
+        });
+        if violated {
+            self.kill.kill();
         }
     }
 
@@ -740,10 +789,14 @@ impl Run {
             if inner.result_replaced {
                 diag.push(DIAG_CALL_RESULT_REPLACED);
             }
+            let host = inner.state.verdict(exit);
+            if host == HostVerdict::Violation(ViolationKind::UnreadResults) {
+                diag.push(DIAG_UNREAD_RESULTS);
+            }
             let (logs, logs_truncated) = inner.state.take_logs();
             let ended = inner.terminal_at.unwrap_or_else(Instant::now);
             RunOutcome {
-                host: inner.state.verdict(exit),
+                host,
                 end: inner.state.take_end(),
                 logs,
                 logs_truncated,

@@ -5,6 +5,8 @@
 //! stdin blocks only this thread; the reader keeps draining.
 
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread;
 
@@ -17,17 +19,26 @@ use serde_json::json;
 /// class.
 pub(crate) const RESULT_TOO_LARGE: &str = "result_too_large";
 
-/// Starts the writer thread over `stdin`.
-pub(crate) fn spawn(mut stdin: Box<dyn Write + Send>, frames: Receiver<Vec<u8>>) -> io::Result<()> {
+/// Starts the writer thread over `stdin`. `queued` counts the payload bytes queued and not yet
+/// written: the sender adds a frame's length before it queues the frame, and the writer takes it
+/// off once the frame is written.
+pub(crate) fn spawn(
+    mut stdin: Box<dyn Write + Send>,
+    frames: Receiver<Vec<u8>>,
+    queued: Arc<AtomicUsize>,
+) -> io::Result<()> {
     thread::Builder::new()
         .name("sandbox-writer".to_owned())
         .spawn(move || {
+            // After a failed write the worker's end is gone (it is dying or dead; the reader and
+            // reaper report how it ended): later frames are taken off the count unwritten, so a
+            // dead worker's queue never counts as unread results.
+            let mut broken = false;
             for frame in frames {
-                // A failed write means the worker's end is gone; it is dying or dead, and the
-                // reader and reaper report how it ended.
-                if write_frame(&mut stdin, &frame).is_err() {
-                    break;
+                if !broken {
+                    broken = write_frame(&mut stdin, &frame).is_err();
                 }
+                queued.fetch_sub(frame.len(), Ordering::SeqCst);
             }
         })?;
     Ok(())
@@ -40,8 +51,11 @@ pub(crate) fn spawn(mut stdin: Box<dyn Write + Send>, frames: Receiver<Vec<u8>>)
 /// unreadable frame. The caller records the replacement ([`super::DIAG_CALL_RESULT_REPLACED`]):
 /// core recorded the call's result, the worker saw a rejection.
 pub(crate) fn call_response(id: u64, result: &HostCallResult) -> (Vec<u8>, bool) {
-    let frame = encode_response(id, result);
+    let mut frame = encode_response(id, result);
     if frame.len() <= HOST_TO_WORKER_MAX {
+        // The encoder's buffer grows by doubling; a frame waiting in the writer queue holds
+        // only its length, which is what the unread-results cap counts.
+        frame.shrink_to_fit();
         return (frame, false);
     }
     let rejected = encode_response(

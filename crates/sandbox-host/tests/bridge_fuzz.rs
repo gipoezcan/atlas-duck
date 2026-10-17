@@ -33,8 +33,8 @@ use atlas_duck_ipc::sandbox::{
     HOST_TO_WORKER_MAX, HostCall, HostCallResult, ScriptLimits, terminal_frame_max,
 };
 use atlas_duck_sandbox_host::bridge::{
-    ExpectedWorker, HostCallSink, HostVerdict, LOG_CAP_BYTES, LOG_CAP_LINES, RunOutcome,
-    ViolationKind, WorkerEnd, log_truncated_marker, start_run,
+    DIAG_UNREAD_RESULTS, ExpectedWorker, HostCallSink, HostVerdict, LOG_CAP_BYTES, LOG_CAP_LINES,
+    RunOutcome, ViolationKind, WorkerEnd, log_truncated_marker, start_run, unread_results_cap,
 };
 use atlas_duck_sandbox_host::identity::{FileId, SandboxBinaryIdentity};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
@@ -962,7 +962,9 @@ proptest! {
 
 /// T7 review m-6: the worker never reads its stdin while the host answers a flood of calls. The
 /// writer blocks on the full pipe; the reader keeps decoding (every call reaches the sink), and
-/// the run ends at `timeout_s` with a kill, never as a deadlock.
+/// the run ends at `timeout_s` with a kill, never as a deadlock. The 32 MiB of answers stay below
+/// the default unread-results cap (`max_fetch_mb` 50 MiB plus one 24 MiB frame); the cap itself is
+/// `s10_unread_results_are_capped`.
 #[test]
 fn s10_worker_that_never_reads_stdin_is_killed_at_the_timer() -> TestResult {
     let _serial = serial();
@@ -1021,6 +1023,64 @@ fn s10_worker_that_never_reads_stdin_is_killed_at_the_timer() -> TestResult {
     println!(
         "S-10 unread_stdin calls={CALLS} answer_bytes={} queued_peak_bytes={held}",
         512 * 1024
+    );
+    Ok(())
+}
+
+/// T8 finding 1: the worker of the test above against a cap it reaches. The answers not yet
+/// written to the worker stay within `max_fetch_mb` plus one frame: the flood offers twice that,
+/// and the run ends as `UnreadResults` with one kill, while the host held about the cap only.
+#[test]
+fn s10_unread_results_are_capped() -> TestResult {
+    let _serial = serial();
+    let rt = runtime()?;
+    const ANSWER: usize = 512 * 1024;
+    const BURST: u64 = 4;
+    let limits = limits_with(|l| {
+        l.max_fetch_mb = 1;
+        l.max_concurrent_calls = 2 * BURST as u32;
+    });
+    let cap = unread_results_cap(&limits);
+    let calls = (2 * cap / ANSWER) as u64;
+    let sink = TestSink::padded(ANSWER);
+    let seen = Arc::clone(&sink);
+    let (spawner, observed) = fake(move |w| {
+        w.ready()?;
+        w.read()?; // script.run; nothing after it is ever read
+        for burst in 0..calls / BURST {
+            for id in burst * BURST + 1..=(burst + 1) * BURST {
+                w.send(&call_frame(id))?;
+            }
+            let started = Instant::now();
+            while u64::from(seen.completed()) < (burst + 1) * BURST {
+                if w.observed.is_killed() || started.elapsed() > WAIT_BOUND {
+                    return w.until_killed();
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        w.until_killed()
+    });
+    let (outcome, held) = measure(|| run_to_end(&rt, &spawner, limits, sink.clone()));
+    let outcome = outcome?;
+    assert_eq!(
+        outcome.host,
+        HostVerdict::Violation(ViolationKind::UnreadResults)
+    );
+    assert_eq!(outcome.end, WorkerEnd::None);
+    assert_eq!(outcome.diag, vec![DIAG_UNREAD_RESULTS]);
+    assert_eq!(observed.signals(), 1);
+    // The queue (at most the cap), each answer's value and encoding while it is built (one burst),
+    // and the fixed allowance.
+    let allowed = cap + 2 * BURST as usize * ANSWER + HELD_ALLOWANCE;
+    assert!(
+        held <= allowed,
+        "the run held {held} bytes at once, allowed {allowed}"
+    );
+    observed.wait_finished()?;
+    println!(
+        "S-10 unread_results_cap cap_bytes={cap} offered_calls={calls} held_peak_bytes={held}"
     );
     Ok(())
 }

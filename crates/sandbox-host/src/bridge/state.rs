@@ -52,6 +52,11 @@ pub enum ViolationKind {
     SecondTerminal,
     /// A frame of the other mode (`script.compiled` / `script.syntax` during a run).
     UnexpectedFrame,
+    /// The worker left more call results unread than [`super::unread_results_cap`] allows: it
+    /// kept calling without reading its stdin. The shim reads every answer before it sends the
+    /// call that replaces it, so it never has more than `max_concurrent_calls` unread (T8
+    /// finding 1).
+    UnreadResults,
 }
 
 /// What the host itself did to end the run, first one wins.
@@ -277,6 +282,12 @@ impl RunState {
         self.decide_by(HostCause::Killed(cause))
     }
 
+    /// A call's result would take the bytes queued for the worker above the cap. True if this
+    /// decided the run (as a violation).
+    pub(crate) fn on_unread_results(&mut self) -> bool {
+        self.decide_by(HostCause::Violation(ViolationKind::UnreadResults))
+    }
+
     /// A call's result is ready. True if it is to be queued for the worker (the run is not
     /// decided); the call stops counting as outstanding in the same step.
     pub(crate) fn complete_call(&mut self) -> bool {
@@ -466,6 +477,24 @@ mod tests {
             s.verdict(Some(ExitKind::Code(-1))),
             HostVerdict::Crashed(Some(ExitKind::Code(-1)))
         );
+    }
+
+    #[test]
+    fn unread_results_decide_only_an_undecided_run() {
+        let mut s = state(4);
+        assert!(matches!(feed(&mut s, &call(1)), Step::Call(_)));
+        assert!(s.on_unread_results());
+        assert!(s.decided() && s.violated());
+        assert_eq!(
+            s.verdict(Some(ExitKind::Signal(9))),
+            HostVerdict::Violation(ViolationKind::UnreadResults)
+        );
+        assert!(!s.complete_call(), "nothing is queued after the decision");
+
+        let mut s = state(4);
+        assert_eq!(feed(&mut s, RESULT), Step::Terminal);
+        assert!(!s.on_unread_results());
+        assert_eq!(s.verdict(None), HostVerdict::None);
     }
 
     /// T4 hand-off: `EXIT_PROTOCOL` without a terminal is the host's fault; a host cause and an

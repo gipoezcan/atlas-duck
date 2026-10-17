@@ -33,9 +33,10 @@ use atlas_duck_ipc::sandbox::{
 };
 use atlas_duck_sandbox_host::bridge::{
     CompileVerdict, DIAG_CALL_RESULT_REPLACED, DIAG_HOST_PROTOCOL_EXIT, DIAG_OUTCOME_LOST,
-    DIAG_REAP_FAILED, ExpectedWorker, HostCallSink, HostVerdict, KillCause, LOG_CAP_BYTES,
-    LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl, RunOutcome, STDERR_CAP, StartRunError,
-    ViolationKind, WorkerEnd, compile_run, log_truncated_marker, start_run,
+    DIAG_REAP_FAILED, DIAG_UNREAD_RESULTS, ExpectedWorker, HostCallSink, HostVerdict, KillCause,
+    LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl, RunOutcome, STDERR_CAP,
+    StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker, start_run,
+    unread_results_cap,
 };
 use atlas_duck_sandbox_host::identity::{FileId, IdentityPart, SandboxBinaryIdentity};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
@@ -2091,5 +2092,52 @@ async fn a_call_result_above_the_host_cap_is_rejected_and_logged() -> TestResult
     .await?;
     assert_eq!(result_text(&outcome), Some("1"));
     assert_eq!(outcome.diag, vec![DIAG_CALL_RESULT_REPLACED]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unread_results_beyond_the_cap_are_a_violation() -> TestResult {
+    // T8 finding 1 (T7 review m-6): the answers to a worker that never reads its stdin queue for
+    // the writer. Above `max_fetch_mb` plus one frame of unwritten bytes the run ends as a
+    // violation with one kill, never as a queue that grows until `timeout_s`.
+    let limits = limits_with(|l| {
+        l.max_fetch_mb = 1;
+        l.max_concurrent_calls = 16;
+    });
+    assert_eq!(unread_results_cap(&limits), MIB + HOST_TO_WORKER_MAX);
+    // 16 answers of 2 MiB: the 13th goes above the 25 MiB cap.
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.read()?; // script.run; nothing after it is ever read
+        for id in 1..=16 {
+            w.call(id)?;
+        }
+        w.until_killed()
+    });
+    let outcome = run_to_end(spawner, limits, TestSink::padded(2 * MIB)).await?;
+    assert_eq!(
+        outcome.host,
+        HostVerdict::Violation(ViolationKind::UnreadResults)
+    );
+    assert_eq!(outcome.end, WorkerEnd::None);
+    assert_eq!(outcome.diag, vec![DIAG_UNREAD_RESULTS]);
+    assert_eq!(observed.signals(), 1);
+
+    // The cap counts bytes not yet written, not bytes ever sent: a worker that reads each answer
+    // gets far more than the cap over the run.
+    let (spawner, _) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        for id in 1..=16 {
+            w.call(id)?;
+            w.read()?.ok_or_else(|| io::Error::other("no answer"))?;
+        }
+        w.result("16")?;
+        Ok(0)
+    });
+    let outcome = run_to_end(spawner, limits, TestSink::padded(2 * MIB)).await?;
+    assert_eq!(outcome.host, HostVerdict::None);
+    assert_eq!(result_text(&outcome), Some("16"));
+    assert!(outcome.diag.is_empty(), "{:?}", outcome.diag);
     Ok(())
 }
