@@ -1,6 +1,7 @@
-//! GUI / `--background` startup: crash-artifact settings (T09), the data-dir gate (T10) and the
-//! startup hardening (M6 T2).
+//! GUI / `--background` startup: crash-artifact settings (T09), the data-dir gate (T10), the
+//! startup hardening (M6 T2) and the `SIGCHLD` disposition the sandbox spawners need (M8 T8).
 
+pub mod child_reaping;
 pub mod crash;
 pub mod gate;
 pub mod hardening;

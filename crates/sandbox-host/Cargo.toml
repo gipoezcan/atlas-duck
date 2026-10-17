@@ -37,3 +37,5 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+# M8 T8 (S-10): `tests/bridge_fuzz.rs` draws the hostile frame sequences.
+proptest = { workspace = true }

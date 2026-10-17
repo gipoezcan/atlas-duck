@@ -5,6 +5,7 @@
 use std::ffi::OsString;
 
 use atlas_duck_app_lib::early_argv::{EarlyMode, classify_argv, verify_export_stub};
+use atlas_duck_app_lib::startup::child_reaping::restore_default_sigchld;
 use atlas_duck_app_lib::startup::crash::apply_process_crash_settings;
 use atlas_duck_app_lib::startup::hardening;
 
@@ -36,6 +37,12 @@ fn main() {
             // §2.5 Crash artifacts: GUI and `--background` launches only, before any webview.
             // The report is kept for later logging (`applied_report`); no failure blocks startup.
             let _ = apply_process_crash_settings();
+            // M8 T6 review I-1: the sandbox spawners refuse to spawn while `SIGCHLD` is ignored
+            // (an inherited `SIG_IGN` / `SA_NOCLDWAIT` would let the kernel reap workers and free
+            // their pids under the kill handle). Still single-threaded here, so the
+            // process-wide reset is safe; a failure is not fatal, the spawners then refuse
+            // (`sandbox_unavailable`).
+            let _ = restore_default_sigchld();
             atlas_duck_app_lib::run_gui(background)
         }
     }

@@ -589,6 +589,7 @@ dependencies = [
  "async-trait",
  "atlas-duck-ipc",
  "libc",
+ "proptest",
  "serde",
  "serde_json",
  "tokio",

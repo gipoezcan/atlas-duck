@@ -568,6 +568,12 @@ jobs:
           # Evidence gates (M8 T6 review m-3). libtest prints `test <name> ... ` before a test's
           # own output, so an evidence line may follow it on the same line.
           log="$RUNNER_TEMP/sandbox-runs.log"
+          # M8 T8 (S-10): the real-worker channel checks run on every leg (the deadlock case is
+          # required on Windows too; it asserts its own 10 s bound).
+          os="$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
+          for ev in 'M8 s10_four_calls_and_1mib_log elapsed_ms=' 'M8 s10_env_names os='"$os " 'M8 s10_handles os='"$os " 'M8 s10_run_and_probe_share_the_spawn_routine result=42 '; do
+            grep -F -- "$ev" "$log" || { echo "::error::S-10 evidence missing: $ev"; exit 1; }
+          done
           case "$RUNNER_OS" in
             Linux)
               grep -E '(^|[[:space:]])M8 linux_pidfd_kill uses_pidfd=true exit=Signal\(9\) reap_fallbacks=0([^0-9]|$)' "$log" || { echo "::error::no pidfd kill without reap fallbacks"; exit 1; }
@@ -889,6 +895,9 @@ jobs:
           cargo "${args[@]}" -- --list --ignored 2>/dev/null > "$RUNNER_TEMP/sandbox-runs.ignored"
           node ci/check-no-skips.mjs "$RUNNER_TEMP/sandbox-runs.log" "$RUNNER_TEMP/sandbox-runs.list" "$RUNNER_TEMP/sandbox-runs.ignored" sandbox_runs
           grep -E '(^|[[:space:]])M8 macos_kill_before_reap_only exit=Signal\(9\) ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::M8 macos_kill_before_reap_only exit=Signal(9) missing"; exit 1; }
+          for ev in 'M8 s10_four_calls_and_1mib_log elapsed_ms=' 'M8 s10_env_names os=macos ' 'M8 s10_handles os=macos ' 'M8 s10_run_and_probe_share_the_spawn_routine result=42 '; do
+            grep -F -- "$ev" "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::S-10 evidence missing: $ev"; exit 1; }
+          done
           {
             echo "### M8 sandbox_runs (x86_64-apple-darwin under Rosetta)"
             echo '```'
