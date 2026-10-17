@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# No failure has been recorded yet: the fuzz runs of `bridge_fuzz.rs` use fixed seeds, so a red
+# run replays from the seed, and the cases that matter most are the named `s10_fixed_*` tests.

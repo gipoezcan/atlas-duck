@@ -574,6 +574,16 @@ jobs:
           for ev in 'M8 s10_four_calls_and_1mib_log elapsed_ms=' 'M8 s10_env_names os='"$os " 'M8 s10_handles os='"$os " 'M8 s10_run_and_probe_share_the_spawn_routine result=42 '; do
             grep -F -- "$ev" "$log" || { echo "::error::S-10 evidence missing: $ev"; exit 1; }
           done
+          # The values, not only the presence: the run took under 10 s, and the worker held
+          # descriptors 0, 1, 2 (Linux, macOS) or never had the sentinel handle (Windows).
+          ms="$(grep -F -- 'M8 s10_four_calls_and_1mib_log elapsed_ms=' "$log" | head -n 1 | sed -E 's/.*elapsed_ms=([0-9]+).*/\1/')"
+          case "$ms" in ''|*[!0-9]*) echo "::error::S-10 elapsed_ms is not a number: $ms"; exit 1;; esac
+          [ "$ms" -lt 10000 ] || { echo "::error::S-10 deadlock case took $ms ms"; exit 1; }
+          if [ "$os" = windows ]; then
+            grep -E 'M8 s10_handles os=windows sentinel=0x[0-9a-f]+ (STATUS_INVALID_HANDLE|Blocked)' "$log" || { echo "::error::S-10 windows handle evidence has no accepted outcome"; exit 1; }
+          else
+            grep -F -- "M8 s10_handles os=$os fds=[0, 1, 2]" "$log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
+          fi
           case "$RUNNER_OS" in
             Linux)
               grep -E '(^|[[:space:]])M8 linux_pidfd_kill uses_pidfd=true exit=Signal\(9\) reap_fallbacks=0([^0-9]|$)' "$log" || { echo "::error::no pidfd kill without reap fallbacks"; exit 1; }
@@ -898,6 +908,10 @@ jobs:
           for ev in 'M8 s10_four_calls_and_1mib_log elapsed_ms=' 'M8 s10_env_names os=macos ' 'M8 s10_handles os=macos ' 'M8 s10_run_and_probe_share_the_spawn_routine result=42 '; do
             grep -F -- "$ev" "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::S-10 evidence missing: $ev"; exit 1; }
           done
+          ms="$(grep -F -- 'M8 s10_four_calls_and_1mib_log elapsed_ms=' "$RUNNER_TEMP/sandbox-runs.log" | head -n 1 | sed -E 's/.*elapsed_ms=([0-9]+).*/\1/')"
+          case "$ms" in ''|*[!0-9]*) echo "::error::S-10 elapsed_ms is not a number: $ms"; exit 1;; esac
+          [ "$ms" -lt 10000 ] || { echo "::error::S-10 deadlock case took $ms ms"; exit 1; }
+          grep -F -- 'M8 s10_handles os=macos fds=[0, 1, 2]' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
           {
             echo "### M8 sandbox_runs (x86_64-apple-darwin under Rosetta)"
             echo '```'

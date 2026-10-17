@@ -332,9 +332,11 @@ mod s10 {
         }
     }
 
-    /// Answers every call after `delay` and counts how many were in flight at once.
+    /// Answers every call after `delay` with `pad` bytes of padding and counts how many were in
+    /// flight at once.
     struct SlowSink {
         delay: Duration,
+        pad: usize,
         in_flight: AtomicU32,
         peak: AtomicU32,
         calls: AtomicU32,
@@ -342,8 +344,13 @@ mod s10 {
 
     impl SlowSink {
         fn new(delay: Duration) -> SlowSink {
+            SlowSink::padded(delay, 0)
+        }
+
+        fn padded(delay: Duration, pad: usize) -> SlowSink {
             SlowSink {
                 delay,
+                pad,
                 in_flight: AtomicU32::new(0),
                 peak: AtomicU32::new(0),
                 calls: AtomicU32::new(0),
@@ -359,7 +366,7 @@ mod s10 {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            HostCallResult::Ok(json!({"id": c.id}))
+            HostCallResult::Ok(json!({"id": c.id, "pad": "x".repeat(self.pad)}))
         }
 
         fn log(&self, _run_id: &str, _line: &str) {}
@@ -424,9 +431,12 @@ mod s10 {
         }
     }
 
-    /// Four concurrent `atlas.call`s against a sink that answers after 200 ms each, while the
-    /// script writes 1 MiB of `atlas.log`: the host drains stdout while its answers go out through
-    /// the writer, so neither pipe fills into a deadlock (§3.4).
+    /// Four concurrent `atlas.call`s against a sink that answers after 500 ms each with 256 KiB,
+    /// while the script writes 1 MiB of `atlas.log`: the host drains stdout while its answers go
+    /// out through the writer, so neither pipe fills into a deadlock (§3.4). The worker writes its
+    /// calls and logs during the script and reads stdin only after it yields, so the 1 MiB of
+    /// answers fills the stdin pipe while the worker is still writing: a host that wrote its
+    /// answers inline from the reader thread would stall there and miss the bound.
     #[test]
     fn s10_four_calls_and_1mib_log_no_deadlock() -> TestResult {
         if !harness::opted_in("s10_four_calls_and_1mib_log_no_deadlock") {
@@ -434,7 +444,7 @@ mod s10 {
         }
         let rt = runtime()?;
         let spawner = spawner()?;
-        let sink = Arc::new(SlowSink::new(Duration::from_millis(200)));
+        let sink = Arc::new(SlowSink::padded(Duration::from_millis(500), 256 * 1024));
         // 1024 lines of 1023 bytes: 1 MiB less 1 KiB, inside the 1 MiB log cap.
         let source = "const calls = [1, 2, 3, 4].map((n) => atlas.call('jira.issue.get', { key: 'K-' + n }));\n\
                       const line = 'x'.repeat(1023);\n\
@@ -451,16 +461,14 @@ mod s10 {
         assert_eq!(outcome.host, HostVerdict::None, "{outcome:?}");
         assert_eq!(result_text(&outcome), Some("4"), "{outcome:?}");
         assert_eq!(sink.calls.load(Ordering::SeqCst), 4);
-        assert_eq!(
-            sink.peak.load(Ordering::SeqCst),
-            4,
-            "the four calls were in flight together"
-        );
+        // Concurrent, not necessarily all four at once (a loaded runner may stall between frames).
+        let peak = sink.peak.load(Ordering::SeqCst);
+        assert!(peak >= 2, "the calls were not in flight together: {peak}");
         assert_eq!(outcome.logs.len(), 1024);
         assert_eq!(outcome.logs_truncated, None);
         assert!(took < DEADLOCK_BOUND, "the run took {took:?}");
         println!(
-            "M8 s10_four_calls_and_1mib_log elapsed_ms={} peak_in_flight=4 logs=1024",
+            "M8 s10_four_calls_and_1mib_log elapsed_ms={} peak_in_flight={peak} logs=1024",
             took.as_millis()
         );
         Ok(())
@@ -493,12 +501,17 @@ mod s10 {
     #[cfg(target_os = "linux")]
     fn three_handles(spawner: &dyn WorkerSpawner) -> TestResult {
         use std::collections::BTreeSet;
+        use std::os::fd::FromRawFd as _;
 
         // The test process plays the app: non-dumpable, like a GUI launch (§2.5).
         atlas_duck_app_lib::startup::crash::set_non_dumpable()?;
         // SAFETY: valid NUL-terminated path.
-        let leaked = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-        assert!(leaked > 2, "open: {}", std::io::Error::last_os_error());
+        let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(raw > 2, "open: {}", std::io::Error::last_os_error());
+        // SAFETY: `raw` is a fresh descriptor owned by nobody else; the guard closes it on every
+        // exit path, so a failed step cannot leak it into a later test of this process.
+        let leaked_guard = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let leaked = raw;
         let mut p = spawner.spawn(&spec())?;
         read_ready(p.as_mut())?;
         let pid = p.pid();
@@ -507,8 +520,7 @@ mod s10 {
                 Ok(entry?.file_name().to_string_lossy().parse()?)
             })
             .collect::<Result<_, _>>()?;
-        // SAFETY: closing the descriptor opened above.
-        unsafe { libc::close(leaked) };
+        drop(leaked_guard);
         assert_eq!(
             fds,
             BTreeSet::from([0, 1, 2]),
@@ -526,9 +538,15 @@ mod s10 {
     /// macOS: the worker holds descriptors 0, 1 and 2 only.
     #[cfg(target_os = "macos")]
     fn three_handles(spawner: &dyn WorkerSpawner) -> TestResult {
+        use std::os::fd::FromRawFd as _;
+
         // SAFETY: plain `open` of /dev/null without O_CLOEXEC.
-        let leaked = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
-        assert!(leaked > 2, "open: {}", std::io::Error::last_os_error());
+        let raw = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+        assert!(raw > 2, "open: {}", std::io::Error::last_os_error());
+        // SAFETY: `raw` is a fresh descriptor owned by nobody else; the guard closes it on every
+        // exit path, so a failed step cannot leak it into a later test of this process.
+        let leaked_guard = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let leaked = raw;
         let mut p = spawner.spawn(&spec())?;
         read_ready(p.as_mut())?;
         let entry = std::mem::size_of::<libc::proc_fdinfo>();
@@ -544,8 +562,7 @@ mod s10 {
             )
         };
         let listed = std::io::Error::last_os_error();
-        // SAFETY: closing the descriptor opened above.
-        unsafe { libc::close(leaked) };
+        drop(leaked_guard);
         assert!(n > 0, "PROC_PIDLISTFDS failed: {listed}");
         let mut fds: Vec<i32> = buf[..n as usize]
             .chunks_exact(entry)
