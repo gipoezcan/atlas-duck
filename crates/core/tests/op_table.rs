@@ -45,15 +45,15 @@ const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_iss
 
 /// Confluence writes completed in M7 beyond `confluence.page.update` (each task moves its op here
 /// from [`LATER_WRITES`]). Each needs its enrichment verdict before it renders a request.
-const M7_WRITES: [&str; 2] = ["confluence.page.create", "confluence.comment.add"];
-
-/// No Jira write is left after T18; the Confluence writes land in M7.
-const LATER_WRITES: [&str; 4] = [
-    "confluence.page.move",
+const M7_WRITES: [&str; 4] = [
+    "confluence.page.create",
+    "confluence.comment.add",
     "confluence.label.add",
     "confluence.label.remove",
-    "confluence.attachment.upload",
 ];
+
+/// No Jira write is left after T18; the Confluence writes land in M7.
+const LATER_WRITES: [&str; 2] = ["confluence.page.move", "confluence.attachment.upload"];
 
 fn op(id: &str) -> Result<&'static OperationSpec, String> {
     atlas_duck_registry::get(id).ok_or_else(|| format!("no op {id}"))
@@ -244,6 +244,9 @@ fn reads_have_no_enrich() -> TestResult {
         "confluence.page.create",
         // M7 Task 18 (PD-107): the container, and the reply target.
         "confluence.comment.add",
+        // M7 Task 19 (PD-108): the content's current labels, for the card.
+        "confluence.label.add",
+        "confluence.label.remove",
     ]
     .into_iter()
     .collect();
@@ -942,6 +945,17 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
                    "body_format": "storage"}),
             Some(create_page_verdict(None)),
         ),
+        // M7 Task 19: the label writes, rendered after the enrichment read of the content.
+        (
+            "confluence.label.add",
+            json!({"id": "65537", "labels": ["release", "docs"]}),
+            Some(label_verdict()),
+        ),
+        (
+            "confluence.label.remove",
+            json!({"id": "65537", "label": "release"}),
+            Some(label_verdict()),
+        ),
     ]
 }
 
@@ -956,6 +970,13 @@ fn create_page_verdict(parent: Option<(&str, &str)>) -> EnrichVerdict {
         resolved.insert("parent_id".to_owned(), json!(id));
     }
     EnrichVerdict::preview(json!({"space_key": "DOC"}), resolved)
+}
+
+/// What enrichment gives for the labels of page 65537.
+fn label_verdict() -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), json!("65537"));
+    EnrichVerdict::preview(Value::Null, resolved)
 }
 
 /// What enrichment gives for a comment on page 65537, replying to `reply_to` when given.
@@ -981,6 +1002,15 @@ fn executors_deterministic() -> TestResult {
         assert_eq!(a, b, "{id}");
         assert_eq!(a.len(), 1, "{id}");
         assert_eq!(a[0].index, 0);
+        if a[0].method == "DELETE" {
+            // The only DELETE (§1.3): no body and no content type.
+            assert_eq!(
+                id, "confluence.label.remove",
+                "only the label remove may DELETE"
+            );
+            assert!(a[0].content_type.is_none() && a[0].body.is_empty(), "{id}");
+            continue;
+        }
         assert_eq!(a[0].content_type.as_deref(), Some("application/json"));
         // Key order is fixed (serde_json's ordered map): re-serializing gives the same bytes.
         assert_eq!(serde_json::to_vec(&body_json(&a[0])?)?, a[0].body, "{id}");
@@ -1864,6 +1894,13 @@ fn fixtures_match_registry_schemas() -> TestResult {
             "confluence.page.create",
             r#"{"id":"123500","type":"page","status":"current","title":"Release 1.5 notes","space":{"key":"DOC","name":"Documentation"},"version":{"number":1,"when":"2026-10-17T10:00:00.000+02:00"},"ancestors":[{"id":"123400"}],"body":{"storage":{"value":"<p>x</p>","representation":"storage"}},"_links":{"webui":"/display/DOC/Release+1.5+notes","self":"https://wiki.corp.example/rest/api/content/123500"}}"#,
         ),
+        // M7 Task 19: the labels the server now has (the receipt keeps the agent's), and the
+        // empty 204 of a remove.
+        (
+            "confluence.label.add",
+            r#"{"results":[{"prefix":"global","name":"release","id":"10"},{"prefix":"global","name":"docs","id":"11"}],"start":0,"limit":200,"size":2}"#,
+        ),
+        ("confluence.label.remove", "null"),
     ];
     // PD-101: a search is released pruned, so its schema (strict) is checked on the normalized
     // fixture, not on the raw answer.
