@@ -1398,8 +1398,9 @@ async fn stale_return(
             tokio::spawn(follow_task(engine.clone(), entry.clone(), missed));
         }
         // T23b: the row's caution count of the hold the write is back in, built off the entry
-        // lock after the return (none while a refresh runs: its `Enriched` counts).
-        recount(engine, entry).await;
+        // lock after the return (none while a refresh runs: its `Enriched` counts). A task of its
+        // own: the caller (`instance_changed` walks every queued write) does not wait for a build.
+        recount_later(engine.clone(), entry.clone());
     }
     applied
 }
