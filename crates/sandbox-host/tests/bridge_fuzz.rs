@@ -15,7 +15,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
@@ -965,6 +965,11 @@ proptest! {
 /// the run ends at `timeout_s` with a kill, never as a deadlock. The 32 MiB of answers stay below
 /// the default unread-results cap (`max_fetch_mb` 50 MiB plus one 24 MiB frame); the cap itself is
 /// `s10_unread_results_are_capped`.
+///
+/// How many calls the fake sends before the timer depends on the runner's speed (a slow macOS
+/// runner sent 48 of the 64), so the calls are checked against what the fake reports: every call
+/// of a burst the sink answered reached it, nothing the fake did not send did, and at least two
+/// bursts were answered (the second one only while the writer was blocked on the first answer).
 #[test]
 fn s10_worker_that_never_reads_stdin_is_killed_at_the_timer() -> TestResult {
     let _serial = serial();
@@ -974,6 +979,10 @@ fn s10_worker_that_never_reads_stdin_is_killed_at_the_timer() -> TestResult {
     // Every answer is 512 KiB: the first fills the pipe, the writer blocks, the rest queue.
     let sink = TestSink::padded(512 * 1024);
     let seen = Arc::clone(&sink);
+    // The calls the fake sent, and those of the bursts the sink answered before the next one.
+    let sent = Arc::new(AtomicU64::new(0));
+    let answered = Arc::new(AtomicU64::new(0));
+    let (fake_sent, fake_answered) = (Arc::clone(&sent), Arc::clone(&answered));
     let (spawner, observed) = fake(move |w| {
         w.ready()?;
         w.read()?; // script.run; nothing after it is ever read
@@ -982,14 +991,19 @@ fn s10_worker_that_never_reads_stdin_is_killed_at_the_timer() -> TestResult {
         for burst in 0..CALLS / BURST {
             for id in burst * BURST + 1..=(burst + 1) * BURST {
                 w.send(&call_frame(id))?;
+                fake_sent.store(id, Ordering::SeqCst);
             }
             let started = Instant::now();
             while u64::from(seen.completed()) < (burst + 1) * BURST {
+                if w.observed.is_killed() {
+                    return w.until_killed();
+                }
                 if started.elapsed() > WAIT_BOUND {
                     return Err(io::Error::other("the sink never answered"));
                 }
                 thread::sleep(Duration::from_millis(2));
             }
+            fake_answered.store((burst + 1) * BURST, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(50));
         }
         w.until_killed()
@@ -1009,19 +1023,44 @@ fn s10_worker_that_never_reads_stdin_is_killed_at_the_timer() -> TestResult {
     assert_eq!(outcome.host, HostVerdict::Limit("timeout_s"));
     assert_eq!(outcome.end, WorkerEnd::None);
     assert_eq!(observed.signals(), 1);
-    assert_eq!(
-        sink.calls(),
-        (1..=CALLS).collect::<Vec<_>>(),
-        "the reader kept decoding while the writer was blocked"
-    );
     assert!(
         outcome.elapsed < Duration::from_secs(10),
         "ended by the timer: {:?}",
         outcome.elapsed
     );
     observed.wait_finished()?;
+
+    // The fake has ended: what it sent and saw answered is final. The calls run as tasks of their
+    // own, so wait (bounded) until the sink saw every call sent or its list stopped growing.
+    let (sent, answered) = (sent.load(Ordering::SeqCst), answered.load(Ordering::SeqCst));
+    let started = Instant::now();
+    let mut last = (sink.calls().len(), Instant::now());
+    while (last.0 as u64) < sent && started.elapsed() < Duration::from_secs(10) {
+        thread::sleep(Duration::from_millis(10));
+        let len = sink.calls().len();
+        if len != last.0 {
+            last = (len, Instant::now());
+        } else if last.1.elapsed() > Duration::from_millis(500) {
+            break;
+        }
+    }
+    let calls = sink.calls();
+    assert!(
+        answered >= 2 * BURST,
+        "only {answered} calls were answered before the timer"
+    );
+    assert_eq!(
+        calls.get(..answered as usize),
+        Some((1..=answered).collect::<Vec<_>>().as_slice()),
+        "the reader kept decoding while the writer was blocked: {calls:?}"
+    );
+    assert!(
+        calls.windows(2).all(|w| w[0] < w[1]) && calls.iter().all(|&id| id <= sent),
+        "the sink saw only the calls sent, once each: sent {sent}, saw {calls:?}"
+    );
     println!(
-        "S-10 unread_stdin calls={CALLS} answer_bytes={} queued_peak_bytes={held}",
+        "S-10 unread_stdin sent={sent} answered={answered} decoded={} answer_bytes={} queued_peak_bytes={held}",
+        calls.len(),
         512 * 1024
     );
     Ok(())
