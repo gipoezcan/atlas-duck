@@ -75,7 +75,7 @@ use tokio::time::Sleep;
 
 use self::reader::{Continuation, Frame, Progress, Stdout, Tracked};
 use self::state::{Incoming, RunState, Step};
-use crate::identity::{IdentityPart, SandboxBinaryIdentity};
+use crate::identity::{IdentityPart, SandboxBinaryIdentity, recheck};
 use crate::limits::{MemoryWatch, OsMemorySignal};
 #[cfg(doc)]
 use crate::spawn::WorkerProcess;
@@ -210,8 +210,9 @@ pub enum KillCause {
 /// nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartRunError {
-    /// The binary is not the one the probe recorded (PD-133); the bridge itself reports
-    /// [`IdentityPart::EmbeddedVersion`] from the ready frame.
+    /// The binary is not the one the probe recorded (PD-133, V21): the file on disk differs
+    /// ([`crate::identity::recheck`], before the spawn, nothing spawned), or the ready frame
+    /// shows [`IdentityPart::EmbeddedVersion`].
     IdentityMismatch { what: IdentityPart },
     /// The ready frame shows no confinement and none was accepted (PD-141).
     FloorNotMet,
@@ -385,6 +386,7 @@ pub fn start_run(
         let _rt = rt.enter();
         Box::pin(tokio::time::sleep(Duration::MAX))
     };
+    recheck_binary(expect, spec)?;
     let init_frame = encode_init(&init)?;
     let launched = launch(spawner, spec, true)?;
     let ready = match launched.ready(READY_TIMEOUT) {
@@ -515,6 +517,7 @@ pub fn compile_run(
     if request.len() > HOST_TO_WORKER_MAX {
         return Err(StartRunError::Spawn(io::ErrorKind::InvalidInput));
     }
+    recheck_binary(expect, spec)?;
     let launched = launch(spawner, spec, false)?;
     let left = deadline.saturating_sub(started.elapsed());
     let ready = match launched.ready(left.min(READY_TIMEOUT)) {
@@ -696,6 +699,14 @@ fn parse_ready(bytes: &[u8]) -> Option<ProbeReady> {
         return None;
     }
     serde_json::from_value(params).ok()
+}
+
+/// V21, PD-133: the binary on disk is still the one the probe recorded (file id, size, mtime),
+/// checked before every spawn. What happens between this check and the OS spawn is not covered;
+/// the ready frame's embedded version ([`check_ready`]) is the second line.
+fn recheck_binary(expect: &ExpectedWorker, spec: &SpawnSpec) -> Result<(), StartRunError> {
+    recheck(&expect.identity, &spec.exe)
+        .map_err(|m| StartRunError::IdentityMismatch { what: m.what })
 }
 
 /// PD-133 (embedded version) and PD-141 (confinement), before any frame is sent.

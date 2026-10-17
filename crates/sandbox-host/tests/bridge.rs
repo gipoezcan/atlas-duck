@@ -39,7 +39,9 @@ use atlas_duck_sandbox_host::bridge::{
     STDOUT_GRACE, StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker,
     start_run, unread_results_cap,
 };
-use atlas_duck_sandbox_host::identity::{FileId, IdentityPart, SandboxBinaryIdentity};
+use atlas_duck_sandbox_host::identity::{
+    FileId, IdentityPart, SandboxBinaryIdentity, file_identity,
+};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
 use atlas_duck_sandbox_host::limits::{MemoryWatch, OsMemorySignal};
 use atlas_duck_sandbox_host::spawn::{
@@ -652,9 +654,22 @@ fn report(applied: bool) -> ConfinementReport {
     }
 }
 
+/// The "worker binary" of these tests: a plain file that exists (the bridge re-checks the file
+/// identity of `SpawnSpec.exe` before it spawns, V21); the fake spawner never executes it.
+fn worker_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
+}
+
 fn expect(accept_unconfined: bool) -> ExpectedWorker {
-    ExpectedWorker {
-        identity: SandboxBinaryIdentity {
+    let identity = match file_identity(&worker_file()) {
+        Ok((file_id, size, mtime)) => SandboxBinaryIdentity {
+            file_id,
+            size,
+            mtime,
+            embedded_version: VERSION.to_string(),
+        },
+        // Unreadable: the identity of no file, so the re-check refuses and the test fails.
+        Err(_) => SandboxBinaryIdentity {
             file_id: FileId::FileIndex {
                 volume_serial: 7,
                 index: 42,
@@ -663,13 +678,16 @@ fn expect(accept_unconfined: bool) -> ExpectedWorker {
             mtime: SystemTime::UNIX_EPOCH,
             embedded_version: VERSION.to_string(),
         },
+    };
+    ExpectedWorker {
+        identity,
         accept_unconfined,
     }
 }
 
 fn spec() -> SpawnSpec {
     SpawnSpec {
-        exe: PathBuf::from("fake-worker"),
+        exe: worker_file(),
         process_mb: 512,
     }
 }
@@ -1410,6 +1428,111 @@ async fn ready_version_mismatch_is_identity_mismatch_before_any_source_sent() ->
         "no frame reached the worker"
     );
     assert_eq!(observed.signals(), 1, "the worker was killed");
+    Ok(())
+}
+
+/// An expectation whose recorded file identity is not the file at `spec().exe` (a replaced
+/// binary), in the part named.
+fn expect_changed(part: IdentityPart) -> ExpectedWorker {
+    let mut e = expect(false);
+    match part {
+        IdentityPart::Size => e.identity.size += 1,
+        IdentityPart::Mtime => e.identity.mtime = SystemTime::UNIX_EPOCH,
+        _ => {
+            e.identity.file_id = FileId::FileIndex {
+                volume_serial: 7,
+                index: 42,
+            }
+        }
+    }
+    e
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_run_rechecks_the_file_identity_before_the_spawn() -> TestResult {
+    for part in [
+        IdentityPart::FileId,
+        IdentityPart::Size,
+        IdentityPart::Mtime,
+    ] {
+        let (spawner, observed) = fake(|w| {
+            w.ready()?;
+            w.drain_stdin()?;
+            Ok(0)
+        });
+        let refused = start(
+            spawner,
+            expect_changed(part),
+            init(ScriptLimits::default()),
+            sink(),
+        )
+        .await?;
+        assert_eq!(
+            refused.err(),
+            Some(StartRunError::IdentityMismatch { what: part })
+        );
+        assert_eq!(observed.spawns.load(Ordering::SeqCst), 0, "nothing spawned");
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn start_run_with_a_missing_binary_is_identity_mismatch_nothing_spawned() -> TestResult {
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.drain_stdin()?;
+        Ok(0)
+    });
+    let rt = tokio::runtime::Handle::current();
+    let gone = SpawnSpec {
+        exe: worker_file().with_file_name("no-such-worker"),
+        process_mb: 512,
+    };
+    let refused = tokio::task::spawn_blocking(move || {
+        start_run(
+            spawner.as_ref(),
+            &gone,
+            &expect(false),
+            init(ScriptLimits::default()),
+            sink(),
+            rt,
+        )
+    })
+    .await?;
+    assert_eq!(
+        refused.err(),
+        Some(StartRunError::IdentityMismatch {
+            what: IdentityPart::Missing
+        })
+    );
+    assert_eq!(observed.spawns.load(Ordering::SeqCst), 0, "nothing spawned");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compile_run_rechecks_the_file_identity_before_the_spawn() -> TestResult {
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.drain_stdin()?;
+        Ok(0)
+    });
+    let refused = tokio::task::spawn_blocking(move || {
+        compile_run(
+            spawner.as_ref(),
+            &spec(),
+            &expect_changed(IdentityPart::FileId),
+            "function main() {}",
+            Duration::from_secs(10),
+        )
+    })
+    .await?;
+    assert_eq!(
+        refused,
+        Err(StartRunError::IdentityMismatch {
+            what: IdentityPart::FileId
+        })
+    );
+    assert_eq!(observed.spawns.load(Ordering::SeqCst), 0, "nothing spawned");
     Ok(())
 }
 

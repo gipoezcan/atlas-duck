@@ -587,6 +587,14 @@ jobs:
           # M8 T9 (V10, PD-134): host-measured memory limits. The tests assert their verdicts;
           # these gates make a missing evidence line fail too.
           grep -E "(^|[[:space:]])V10 heap_limit os=$os verdict=heap_mb " "$log" || { echo "::error::V10 heap_limit os=$os evidence missing"; exit 1; }
+          # M8 T10 (V21, PD-133): a replaced worker binary is detected before the spawn; macOS
+          # also covers a replaced file inside a copied .app and a new bundle renamed into place.
+          grep -E "(^|[[:space:]])V21 os=$os case=copy_over detected=true via=size([^[:alnum:]_]|$)" "$log" || { echo "::error::V21 os=$os case=copy_over evidence missing"; exit 1; }
+          grep -E "(^|[[:space:]])V21 os=$os case=rename_over detected=true via=file_id([^[:alnum:]_]|$)" "$log" || { echo "::error::V21 os=$os case=rename_over evidence missing"; exit 1; }
+          if [ "$os" = macos ]; then
+            grep -E '(^|[[:space:]])V21 os=macos case=app_bundle_copy_over detected=true via=size([^[:alnum:]_]|$)' "$log" || { echo "::error::V21 app_bundle_copy_over evidence missing"; exit 1; }
+            grep -E '(^|[[:space:]])V21 os=macos case=app_bundle_rename_over detected=true via=file_id([^[:alnum:]_]|$)' "$log" || { echo "::error::V21 app_bundle_rename_over evidence missing"; exit 1; }
+          fi
           case "$RUNNER_OS" in
             Linux)
               grep -E '(^|[[:space:]])M8 linux_pidfd_kill uses_pidfd=true exit=Signal\(9\) reap_fallbacks=0([^0-9]|$)' "$log" || { echo "::error::no pidfd kill without reap fallbacks"; exit 1; }
@@ -605,7 +613,7 @@ jobs:
           {
             echo "### M8 sandbox_runs ($RUNNER_OS)"
             echo '```'
-            grep -E '(^|[[:space:]])(M8|V10|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            grep -E '(^|[[:space:]])(M8|V10|V11|V21) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -921,10 +929,14 @@ jobs:
           # M8 T9 (V10, PD-134): the heap limit and the footprint watchdog under Rosetta.
           grep -E '(^|[[:space:]])V10 heap_limit os=macos verdict=heap_mb ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 heap_limit os=macos evidence missing"; exit 1; }
           grep -E '(^|[[:space:]])V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=[0-9]+ arch=x86_64([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 watchdog_kill evidence missing"; exit 1; }
+          # M8 T10 (V21, PD-133): the replaced-binary cases under Rosetta.
+          for case_via in copy_over:size rename_over:file_id app_bundle_copy_over:size app_bundle_rename_over:file_id; do
+            grep -E "(^|[[:space:]])V21 os=macos case=${case_via%%:*} detected=true via=${case_via##*:}([^[:alnum:]_]|$)" "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V21 ${case_via%%:*} evidence missing"; exit 1; }
+          done
           {
             echo "### M8 sandbox_runs (x86_64-apple-darwin under Rosetta)"
             echo '```'
-            grep -E '(^|[[:space:]])(M8|V10|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            grep -E '(^|[[:space:]])(M8|V10|V11|V21) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

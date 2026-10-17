@@ -265,6 +265,10 @@ mod macos {
 #[path = "sandbox_runs/v10.rs"]
 mod v10;
 
+/// V21 (M8 Task 10): a replaced worker binary is detected before the next spawn, per OS.
+#[path = "sandbox_runs/v21.rs"]
+mod v21;
+
 /// S-10 (M8 Task 8; §3.4 pipes and handles, §15 V12 worker half, V15): the channel against the
 /// real worker, started through the platform spawner object, on every leg.
 mod s10 {

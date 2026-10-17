@@ -44,7 +44,7 @@ use atlas_duck_sandbox_host::bridge::{
     DIAG_UNREAD_RESULTS, ExpectedWorker, HostCallSink, HostVerdict, LOG_CAP_BYTES, LOG_CAP_LINES,
     RunOutcome, ViolationKind, WorkerEnd, log_truncated_marker, start_run, unread_results_cap,
 };
-use atlas_duck_sandbox_host::identity::{FileId, SandboxBinaryIdentity};
+use atlas_duck_sandbox_host::identity::{FileId, SandboxBinaryIdentity, file_identity};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
 use atlas_duck_sandbox_host::spawn::{
     ExitKind, KillHandle, Reaper, SpawnSpec, WorkerIo, WorkerParts, WorkerProcess, WorkerSpawner,
@@ -532,9 +532,22 @@ fn report() -> ConfinementReport {
     }
 }
 
+/// The "worker binary" of these tests: a plain file that exists (the bridge re-checks the file
+/// identity of `SpawnSpec.exe` before it spawns, V21); the fake spawner never executes it.
+fn worker_file() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")
+}
+
 fn expect() -> ExpectedWorker {
-    ExpectedWorker {
-        identity: SandboxBinaryIdentity {
+    let identity = match file_identity(&worker_file()) {
+        Ok((file_id, size, mtime)) => SandboxBinaryIdentity {
+            file_id,
+            size,
+            mtime,
+            embedded_version: VERSION.to_string(),
+        },
+        // Unreadable: the identity of no file, so the re-check refuses and the test fails.
+        Err(_) => SandboxBinaryIdentity {
             file_id: FileId::FileIndex {
                 volume_serial: 7,
                 index: 42,
@@ -543,13 +556,16 @@ fn expect() -> ExpectedWorker {
             mtime: SystemTime::UNIX_EPOCH,
             embedded_version: VERSION.to_string(),
         },
+    };
+    ExpectedWorker {
+        identity,
         accept_unconfined: false,
     }
 }
 
 fn spec() -> SpawnSpec {
     SpawnSpec {
-        exe: PathBuf::from("fake-worker"),
+        exe: worker_file(),
         process_mb: 512,
     }
 }
