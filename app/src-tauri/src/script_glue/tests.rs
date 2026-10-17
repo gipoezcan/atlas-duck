@@ -962,8 +962,10 @@ async fn compile_check_has_a_deadline() -> TestResult {
     let answer = tokio::time::timeout(BOUND, g.compile_check("return 1;", &limits, off())).await?;
     let took = started.elapsed();
     assert_eq!(answer, Err(CompileFailure::Timeout { timeout_s: 1 }));
+    // Not before the bound; the upper end leaves a stalled runner room and stays below the
+    // 10 s a bound that ignored `timeout_s` would take.
     assert!(
-        took >= Duration::from_secs(1) && took < Duration::from_secs(3),
+        took >= Duration::from_secs(1) && took < Duration::from_secs(8),
         "{took:?}"
     );
     // The bridge is given the same bound.
