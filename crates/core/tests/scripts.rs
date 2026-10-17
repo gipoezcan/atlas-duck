@@ -27,6 +27,9 @@ use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult};
 use atlas_duck_registry::Product;
+use common::jira::{
+    comment_page, comments_path, gets_on, mount_comment_page_delayed, mount_comments,
+};
 use common::{TestError, TestResult, code, de, detail, exit, request_id};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
@@ -4090,6 +4093,213 @@ async fn plain_call_with_comments_cuts_the_issue_at_the_fetch_budget() -> TestRe
         .filter(|r| r.url.path().ends_with("/comment"))
         .count();
     assert_eq!(comment_pages, 0);
+    Ok(())
+}
+
+/// `key`'s issue as a body of exactly `len` bytes (the summary takes up the rest).
+fn issue_of_len(key: &str, len: usize) -> Result<String, TestError> {
+    let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+    issue["key"] = json!(key);
+    issue["fields"]["summary"] = json!("");
+    let rest = len
+        .checked_sub(issue.to_string().len())
+        .ok_or("the issue is longer than len")?;
+    issue["fields"]["summary"] = json!("s".repeat(rest));
+    let body = issue.to_string();
+    assert_eq!(body.len(), len);
+    Ok(body)
+}
+
+/// `GET` of `key`'s issue answers `body`, ahead of the harness's fixture.
+async fn mount_issue_body(h: &Harness, key: &str, body: String) -> TestResult {
+    let mock = requests_of(h)?;
+    Mock::given(method("GET"))
+        .and(path(mock.path(&format!("/rest/api/2/issue/{key}"))))
+        .respond_with(mock.response(200).set_body_raw(body, "application/json"))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Ok(())
+}
+
+/// T19d review M-7: a plain call's body of exactly the run's remaining fetch budget is read
+/// whole (`ok`, the cut is past the budget, not at it), and it leaves nothing: the next call is
+/// refused before it is sent. One byte more is cut (`script_limit`), every byte kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_call_body_of_exactly_the_fetch_budget_is_read_whole() -> TestResult {
+    let at = |id, key: &str| host_call(id, "jira.issue.get", json!({ "key": key }));
+    let budget = usize::try_from(MIB)?;
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(vec![at(1, "ABC-5"), at(2, "ABC-7")], result_end(json!(1))),
+        ScriptPlan::new(vec![at(1, "ABC-6")], result_end(json!(1))),
+    ])
+    .await?;
+    mount_issue_body(&h, "ABC-5", issue_of_len("ABC-5", budget)?).await?;
+    mount_issue_body(&h, "ABC-6", issue_of_len("ABC-6", budget + 1)?).await?;
+    let limits = json!({ "max_fetch_mb": 1, "max_call_result_mb": 2 });
+    let exact = submit(&h, json!({ "source": SRC, "limits": limits.clone() })).await?;
+    h.queued(&exact, 30_000).await.ok_or("never queued")?;
+    assert_eq!(outline(&runner.results()), ["ok", "script_limit"]);
+    assert_eq!(sent_to(&h, "ABC-7").await?, 0, "the refused call was sent");
+    let calls = script_calls(&h, &exact).await?;
+    let [call] = calls.as_slice() else {
+        return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
+    };
+    assert_eq!(call["rejection"], Value::Null, "{call}");
+    assert_eq!(call["bytes"], MIB, "{call}");
+    let over = submit(&h, json!({ "source": SRC, "limits": limits })).await?;
+    h.queued(&over, 30_000).await.ok_or("never queued")?;
+    assert_eq!(
+        outline(runner.results().get(2..).ok_or("no third answer")?),
+        ["script_limit"]
+    );
+    let calls = script_calls(&h, &over).await?;
+    let [call] = calls.as_slice() else {
+        return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
+    };
+    assert_eq!(call["rejection"], "max_fetch_mb", "{call}");
+    assert_eq!(call["cap_or_budget"], "fetch_cap_50mib", "{call}");
+    assert_eq!(call["bytes"], MIB + 1, "{call}");
+    Ok(())
+}
+
+/// T19d review I-1: a rename seen on a call's first answer (§7.1) re-fetches it once. The
+/// first answer's bytes were received (they are in its `identity_check_retried` record), so
+/// they count against `max_fetch_mb`, and the re-fetch is cut at what is left after them
+/// (`script_limit`), not at the budget the first attempt had: with `max_call_result_mb` equal to
+/// `max_fetch_mb`, that stale budget would be a cut at the result cap, `result_too_large`. The
+/// run's next call is refused before it is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rename_refetch_counts_the_first_answer_and_is_cut_at_the_rest() -> TestResult {
+    let second = host_call(2, "jira.issue.get", json!({ "key": "ABC-2" }));
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![issue_call(1), second],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let mock = requests_of(&h)?;
+    // The mock renamed the user (same key): every answer names the new user.
+    let answer = |summary: usize| -> Result<ResponseTemplate, TestError> {
+        let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
+        issue["fields"]["summary"] = json!("s".repeat(summary));
+        Ok(ResponseTemplate::new(200)
+            .insert_header("X-AUSERNAME", "jdoe2")
+            .set_body_raw(issue.to_string(), "application/json"))
+    };
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
+        .respond_with(answer(600 * 1024)?)
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
+        .respond_with(answer(BIG_BODY)?)
+        .with_priority(2)
+        .mount(mock.server())
+        .await;
+    mock.jira_myself("jdoe2", TEST_USER_KEY, XAuser::Same).await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1, "max_call_result_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    let renames = h
+        .events_of(EventType::INSTANCE_STATE_CHANGED)
+        .await?
+        .into_iter()
+        .filter(|c| c["state"] == "user_renamed")
+        .count();
+    assert_eq!(renames, 1, "the first answer was not a rename");
+    assert_eq!(outline(&runner.results()), ["script_limit", "script_limit"]);
+    assert_eq!(sent_to(&h, "ABC-1").await?, 2);
+    assert_eq!(sent_to(&h, "ABC-2").await?, 0, "the refused call was sent");
+    let calls = script_calls(&h, &id).await?;
+    let [retried, refetched] = calls.as_slice() else {
+        return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
+    };
+    assert_eq!(retried["rejection"], "identity_check_retried", "{retried}");
+    let first = retried["bytes"].as_u64().ok_or("no bytes")?;
+    assert!(first > 600 * 1024 && first < MIB, "{first}");
+    assert_cut(refetched, "max_fetch_mb", "fetch_cap_50mib", MIB - first)?;
+    Ok(())
+}
+
+/// T19d review M-1: a script's `jira.issue.get {comments: true}` under its budgets answers the
+/// issue with the comment pages merged; its record counts the issue and every page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_call_with_comments_merges_the_pages() -> TestResult {
+    let call = host_call(
+        1,
+        "jira.issue.get",
+        json!({ "key": "ABC-1", "comments": true }),
+    );
+    let (h, runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
+    let pages = [
+        comment_page(0, 50, 70, 50, false),
+        comment_page(50, 50, 70, 20, false),
+    ];
+    mount_comments(requests_of(&h)?, "ABC-1", &pages).await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    let results = runner.results();
+    let [HostCallResult::Ok(issue)] = results.as_slice() else {
+        return Err(format!("unexpected answers: {:?}", outline(&results)).into());
+    };
+    let comments = issue["fields"]["comment"]["comments"]
+        .as_array()
+        .ok_or("no merged comments")?;
+    assert_eq!(comments.len(), 70);
+    assert_eq!(comments[69]["id"], "30069");
+    assert_eq!(issue["key"], "ABC-1");
+    let asked = gets_on(requests_of(&h)?, &comments_path("ABC-1")).await;
+    assert_eq!(asked.len(), 2);
+    let calls = script_calls(&h, &id).await?;
+    let [call] = calls.as_slice() else {
+        return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
+    };
+    assert_eq!(call["rejection"], Value::Null, "{call}");
+    let want =
+        fixtures::JIRA_ISSUE.len() + pages.iter().map(|p| p.to_string().len()).sum::<usize>();
+    assert_eq!(call["bytes"], want, "{call}");
+    Ok(())
+}
+
+/// T19d review M-1: a cancel while a script's composite read waits for its comment page records
+/// the call `cancelled_in_flight` with the issue it already received (kept in the call's
+/// control), not only the bytes of the page in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_during_the_comment_pages_records_the_issue() -> TestResult {
+    let call = host_call(
+        1,
+        "jira.issue.get",
+        json!({ "key": "ABC-1", "comments": true }),
+    );
+    let (h, _runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
+    let mock = requests_of(&h)?;
+    let page = comment_page(0, 50, 70, 50, false);
+    mount_comment_page_delayed(mock, "ABC-1", &page, Duration::from_secs(120)).await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while gets_on(mock, &comments_path("ABC-1")).await.is_empty() {
+        if Instant::now() > deadline {
+            return Err("the comment page was never requested".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
+    assert_eq!(call["outcome"], "cancelled_in_flight", "{call}");
+    assert_eq!(call["reason"], "by_client", "{call}");
+    assert!(
+        call.to_string().contains("Login page times out"),
+        "the issue received is recorded: {call}"
+    );
+    let bytes = call["bytes"].as_u64().ok_or("no bytes")?;
+    assert!(bytes >= fixtures::JIRA_ISSUE.len() as u64, "{bytes}");
     Ok(())
 }
 
