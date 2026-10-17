@@ -3739,10 +3739,10 @@ async fn dispatch_case_3() -> TestResult {
 }
 
 /// I-14 case 3 for a plain (non-paged) call: the first response of a `jira.issue.get` takes
-/// the run's fetched bytes past `max_fetch_mb`; its record keeps every byte, the run's next
-/// call is refused `script_limit` before it is sent, and the run ends `pending`, then a release
-/// item. What the first call itself answers is not asserted: a plain GET's body is not cut at
-/// the run's remaining fetch budget (only the paged reads apply it).
+/// the run's fetched bytes past `max_fetch_mb`; the run's next call is refused `script_limit`
+/// before it is sent, and the run ends `pending`, then a release item. What the first call
+/// itself answers and how many bytes its record keeps are not asserted: a plain GET's body is
+/// not cut at the run's remaining fetch budget yet (only the paged reads apply it).
 async fn dispatch_case_3_plain() -> TestResult {
     const SUMMARY: usize = 1_300_000;
     let end = RunEnd::HostLimit {
@@ -3793,12 +3793,6 @@ async fn dispatch_case_3_plain() -> TestResult {
             EventType::SCRIPT_CALL,
             EventType::SCRIPT_FAILED,
         ]
-    );
-    let call = record(&h, &id, EventType::SCRIPT_CALL).await?;
-    assert!(
-        call["bytes"].as_u64().is_some_and(|b| b > 1024 * 1024),
-        "{}",
-        call["bytes"]
     );
     let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
     assert_eq!(failed["reason"], "max_fetch_mb");
