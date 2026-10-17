@@ -57,7 +57,7 @@ use super::read::{
 use super::{
     Engine, EntryState, InFlight, InstanceHttp, OnAuditFailure, RequestEntry, TransitionError,
 };
-use crate::edit::{EditedKeys, Edits};
+use crate::edit::{EditedKeys, Edits, is_not_inlined};
 use crate::gate::{AttentionKind, UiEvent};
 use crate::identity::{self, Lost};
 use crate::instances::InstanceState;
@@ -542,7 +542,9 @@ pub(crate) fn choice_edits(
 /// read-only, then one pre-added input per missing required field of the latest verdict. A missing
 /// field that is a param of its own (a create's `description`) marks that param's input required
 /// instead (`fields.description` would duplicate the param, which validation refuses). Labels
-/// from the server are display-escaped; values are the params as they are.
+/// from the server are display-escaped; values are the params as they are, except a param the
+/// form never inlines (`edit::NOT_INLINED`, PD-110): read-only, value `null`, labelled with what
+/// it holds ([`file_content_label`]).
 pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
     let schema = spec.params_schema_json();
     let required: Vec<&str> = schema
@@ -557,14 +559,24 @@ pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .map(|(name, prop)| EditInput {
-            path: name.clone(),
-            label: name.clone(),
-            kind: param_kind(name, prop),
-            read_only: fixed(name),
-            required: required.contains(&name.as_str()),
-            pre_added: false,
-            value: w.params.get(name).cloned().unwrap_or(Value::Null),
+        .map(|(name, prop)| {
+            let opaque = is_not_inlined(spec, name);
+            EditInput {
+                path: name.clone(),
+                label: if opaque {
+                    file_content_label(w.params.get(name))
+                } else {
+                    name.clone()
+                },
+                kind: param_kind(name, prop),
+                read_only: fixed(name) || opaque,
+                required: required.contains(&name.as_str()),
+                pre_added: false,
+                value: match w.params.get(name) {
+                    Some(v) if !opaque => v.clone(),
+                    _ => Value::Null,
+                },
+            }
         })
         .collect();
     for f in &w.verdict.missing_fields {
@@ -584,6 +596,20 @@ pub(crate) fn edit_form(spec: &OperationSpec, w: &WriteState) -> EditForm {
         });
     }
     EditForm { inputs }
+}
+
+/// plan text (PD-110): the label of a not-inlined input (the upload's `content_base64`), naming
+/// the decoded file's size and the first 8 hex of its SHA-256 (`confluence_ext::file_digest`, the
+/// Request tab's facts too).
+fn file_content_label(value: Option<&Value>) -> String {
+    const NOT_EDITABLE: &str = "not editable here; deny and resubmit to change it";
+    match value.and_then(crate::ops::confluence_ext::file_digest) {
+        Some((len, sha)) => format!(
+            "file content ({len} bytes, SHA-256 {}…): {NOT_EDITABLE}",
+            sha.get(..8).unwrap_or(&sha)
+        ),
+        None => format!("file content: {NOT_EDITABLE}"),
+    }
 }
 
 /// The queue row's "caution (N)" of the current revision (§5.6).

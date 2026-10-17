@@ -7,6 +7,10 @@
 //! SHA-256, never inside any part), the filename rules, the receipt from `results[0]`
 //! (`Projection::FirstResultFields`) and the request view that never carries the file bytes
 //! (Δ2, plan review I-4), while `WRITE_APPROVED` stores and hashes the exact wire bytes.
+//! Task 20b (PD-110): the `AttachmentUpload` card over the request sent (sniffed type, SHA-256,
+//! the thumbnail capped at 2 MiB, the extension fact row, the collision and replace lines), the
+//! edit form that never inlines `content_base64` (a `null` edit of it is "unchanged") and the
+//! bounded preview of a 10 MiB upload.
 //!
 //! Checked twice: as pure functions of the op table (plan, judge, executor, stale rule, previewer
 //! as the engine calls them) and end to end through the harness.
@@ -21,18 +25,23 @@ use atlas_duck_core::ops::{
     EnrichCtx, EnrichPurpose, EnrichStep, EnrichVerdict, ExecCtx, ExecError, ExecPlan, PreviewCtx,
     PreviewInput, PreviewModel, StaleCtx, StaleVerdict, WriteView, generic, op_table,
 };
+use std::time::Instant;
+
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::Harness;
 use atlas_duck_core::{
     BatchFailure, BatchItem, DecisionError, DecisionOutcome, DenyDetails, Edits,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
-use atlas_duck_preview::{BodyView, Platform, PreviewBody, WarningId, body_digest_line, render};
+use atlas_duck_preview::render::DOC_MAX_BYTES;
+use atlas_duck_preview::{
+    BodyView, Platform, PreviewBody, RequestView, WarningId, body_digest_line, render,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use common::confluence::content_path;
 use common::{TestError, TestResult, code, de, detail, exit, request_id};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -625,8 +634,8 @@ fn upload_non_ascii_and_dotdot_filenames_sent_as_given() -> TestResult {
 /// Δ2 / plan review I-4: the preview's request body is the text envelope (boundary lines, part
 /// headers and the comment as sent), the file part replaced by its one size and SHA-256 line,
 /// whatever its size or encoding; neither the model, its serialization nor the rendered
-/// document carries the bytes, and the replaced bytes count as hidden. The edit form is Task
-/// 20b's (PD-110); `WRITE_APPROVED` and the Raw pages keep the real bytes.
+/// document carries the bytes (the card's raster thumbnail aside, PD-110), and the replaced bytes
+/// count as hidden. `WRITE_APPROVED` and the Raw pages keep the real bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn request_view_never_carries_file_bytes() -> TestResult {
     let mut binary = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -637,10 +646,8 @@ async fn request_view_never_carries_file_bytes() -> TestResult {
         let v = verdict(&p, &[])?;
         let r = one_request(&p, &v)?;
         let m = preview_of(&p, &v, std::slice::from_ref(&r))?;
-        let PreviewBody::WriteRequests { requests } = &m.body else {
-            return Err(format!("not the request list: {:?}", m.body).into());
-        };
-        let [view] = requests.as_slice() else {
+        let requests = card_requests(&m.body)?;
+        let [view] = requests else {
             return Err("not one request".into());
         };
         let boundary = boundary_of(&r)?;
@@ -653,8 +660,12 @@ async fn request_view_never_carries_file_bytes() -> TestResult {
         assert_eq!(view.content_type, r.content_type);
         assert_eq!(m.header.hidden_in_preview_bytes, content.len() as u64);
         assert_eq!(m.header.byte_size, r.body.len() as u64, "the real size");
-        let serialized = serde_json::to_string(&m.body)?;
-        no_file_bytes(&serialized, &content)?;
+        no_file_bytes(&serde_json::to_string(requests)?, &content)?;
+        // Task 20b: the card's only copy of the bytes is a raster thumbnail (PD-110).
+        no_file_bytes(
+            &serde_json::to_string(&without_thumbnail(&m.body))?,
+            &content,
+        )?;
     }
 
     // A collision card shows the request an approval would have sent, under the same rule.
@@ -823,9 +834,7 @@ async fn i06_attachment_collision_not_approvable_individual_and_batch() -> TestR
     let p = h.approver().open(&collision).map_err(de)?.preview;
     assert!(!p.approvable);
     assert!(p.deny_offers.is_empty(), "{:?}", p.deny_offers);
-    let PreviewBody::WriteRequests { requests } = &p.body else {
-        return Err(format!("not the request list: {:?}", p.body).into());
-    };
+    let requests = card_requests(&p.body)?;
     assert_eq!(
         requests.len(),
         1,
@@ -1412,6 +1421,534 @@ async fn request_tab_digests_the_file_and_raw_stays_paged_10mib() -> TestResult 
         STANDARD.decode(raw[0]["body_b64"].as_str().ok_or("no body_b64")?)?,
         sent.body
     );
+    Ok(())
+}
+
+// ---- the attachment card (Task 20b, PD-110) --------------------------------------------------
+
+/// A 1×1 PNG.
+const PIXEL_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+const MIB: usize = 1024 * 1024;
+/// plan text (PD-110): the card without a thumbnail.
+const NO_THUMBNAIL: &str = "no thumbnail (not an image, or larger than 2 MiB)";
+/// plan text (PD-110): the fact row of an active or mismatched extension.
+const MISMATCH: &str = "extension and content type differ";
+
+/// The fields of the `AttachmentUpload` card.
+struct Card<'a> {
+    filename: &'a str,
+    size: u64,
+    mime: &'a str,
+    sha256: &'a str,
+    thumbnail: Option<&'a str>,
+    replaces: Option<u64>,
+    existing: Option<&'a str>,
+    comment: Option<&'a str>,
+    notes: &'a [String],
+    requests: &'a [RequestView],
+}
+
+fn card(body: &PreviewBody) -> Result<Card<'_>, TestError> {
+    match body {
+        PreviewBody::AttachmentUpload {
+            filename,
+            size,
+            mime,
+            sha256,
+            thumbnail_data_uri,
+            replaces_version,
+            existing,
+            comment,
+            notes,
+            requests,
+        } => Ok(Card {
+            filename,
+            size: *size,
+            mime,
+            sha256,
+            thumbnail: thumbnail_data_uri.as_deref(),
+            replaces: *replaces_version,
+            existing: existing.as_deref(),
+            comment: comment.as_deref(),
+            notes,
+            requests,
+        }),
+        other => Err(format!("not the attachment card: {other:?}").into()),
+    }
+}
+
+/// The requests the attachment card shows.
+fn card_requests(body: &PreviewBody) -> Result<&[RequestView], TestError> {
+    Ok(card(body)?.requests)
+}
+
+/// `body` without its thumbnail.
+fn without_thumbnail(body: &PreviewBody) -> PreviewBody {
+    let mut body = body.clone();
+    if let PreviewBody::AttachmentUpload {
+        thumbnail_data_uri, ..
+    } = &mut body
+    {
+        *thumbnail_data_uri = None;
+    }
+    body
+}
+
+/// The preview of the upload `p` after a lookup that found `found`.
+fn card_model(p: &Value, found: &[Value]) -> Result<PreviewModel, TestError> {
+    let v = verdict(p, found)?;
+    let r = one_request(p, &v)?;
+    preview_of(p, &v, std::slice::from_ref(&r))
+}
+
+/// `len` bytes that start with `magic`.
+fn headed(magic: &[u8], len: usize) -> Vec<u8> {
+    let mut out = magic.to_vec();
+    out.extend((0..len.saturating_sub(magic.len())).map(|i| (i % 251) as u8));
+    out
+}
+
+fn is_generic(m: &PreviewModel) -> bool {
+    matches!(m.body, PreviewBody::WriteRequests { .. })
+}
+
+async fn opened_doc(
+    h: &Harness,
+    id: &str,
+) -> Result<(atlas_duck_preview::Preview, String), TestError> {
+    let preview = h.approver().open(id).map_err(de)?.preview;
+    let doc = render::document(&preview, Platform::current());
+    Ok((preview, doc))
+}
+
+/// §6.3 Attachment upload / PD-110: the card shows the file name, the size, the sniffed MIME type,
+/// the SHA-256 and, for a raster image (png, jpeg, gif, webp) of at most 2 MiB, a `data:`
+/// thumbnail in standard base64, unwrapped (T8 review m-7), that renders as an `<img>`; any other
+/// type, and a larger image, shows the PD-110 text. The file part's bytes count as hidden once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_card_size_mime_sha256_thumbnail() -> TestResult {
+    let png = STANDARD.decode(PIXEL_PNG)?;
+    let p = params("pixel.png", &png, false, Some(COMMENT));
+    let m = card_model(&p, &[])?;
+    let c = card(&m.body)?;
+    assert_eq!(c.filename, "pixel.png");
+    assert_eq!(c.size, png.len() as u64);
+    assert_eq!(c.mime, "image/png");
+    assert_eq!(c.sha256, sha256_hex(&png));
+    let uri = format!("data:image/png;base64,{}", STANDARD.encode(&png));
+    assert_eq!(c.thumbnail, Some(uri.as_str()));
+    assert_eq!(c.comment, Some(COMMENT));
+    assert_eq!((c.replaces, c.existing), (None, None));
+    assert!(c.notes.is_empty(), "{:?}", c.notes);
+    assert_eq!(c.requests.len(), 1, "the request list stays on the card");
+    assert_eq!(
+        m.header.hidden_in_preview_bytes,
+        png.len() as u64,
+        "the file part's bytes, counted once"
+    );
+
+    // Each raster type is its own `data:` type; other types and other content get no thumbnail.
+    let webp = [b"RIFF\x24\x00\x00\x00WEBPVP8 ".as_slice(), &[0u8; 24]].concat();
+    let cases: [(&str, Vec<u8>, &str, Option<&str>); 7] = [
+        (
+            "a.jpg",
+            headed(b"\xff\xd8\xff\xe0", 64),
+            "image/jpeg",
+            Some("image/jpeg"),
+        ),
+        (
+            "a.gif",
+            headed(b"GIF89a", 64),
+            "image/gif",
+            Some("image/gif"),
+        ),
+        ("a.webp", webp, "image/webp", Some("image/webp")),
+        ("a.pdf", headed(b"%PDF-1.7\n", 64), "application/pdf", None),
+        ("a.zip", headed(b"PK\x03\x04", 64), "application/zip", None),
+        (FILENAME, TEXT.to_vec(), "application/octet-stream", None),
+        (
+            "a.svg",
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>".to_vec(),
+            "application/octet-stream",
+            None,
+        ),
+    ];
+    for (name, content, mime, raster) in cases {
+        let m = card_model(&params(name, &content, false, None), &[])?;
+        let c = card(&m.body)?;
+        assert_eq!((c.filename, c.mime), (name, mime));
+        assert_eq!(c.sha256, sha256_hex(&content), "{name}");
+        let want = raster.map(|t| format!("data:{t};base64,{}", STANDARD.encode(&content)));
+        assert_eq!(c.thumbnail, want.as_deref(), "{name}");
+        assert_eq!(c.comment, None);
+    }
+    // The cap: an image of exactly 2 MiB has a thumbnail, one byte more has none.
+    for (len, thumbnail) in [(2 * MIB, true), (2 * MIB + 1, false), (3 * MIB, false)] {
+        let content = headed(PNG_MAGIC, len);
+        let m = card_model(&params("big.png", &content, false, None), &[])?;
+        let c = card(&m.body)?;
+        assert_eq!((c.mime, c.size), ("image/png", len as u64));
+        assert_eq!(c.thumbnail.is_some(), thumbnail, "{len}");
+    }
+
+    // End to end: the rendered card.
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[]).await;
+    let id = queued(&h, params("pixel.png", &png, false, Some(COMMENT))).await?;
+    let (_, doc) = opened_doc(&h, &id).await?;
+    assert!(
+        doc.contains(&format!("<img src=\"{uri}\"")),
+        "the thumbnail renders as an image"
+    );
+    let size = format!("{} bytes", png.len());
+    for text in ["pixel.png", "image/png", &sha256_hex(&png), &size, COMMENT] {
+        assert!(doc.contains(text), "{text}");
+    }
+    assert!(!doc.contains(NO_THUMBNAIL));
+    let big = headed(PNG_MAGIC, 3 * MIB);
+    let id = queued(&h, params("big.png", &big, false, None)).await?;
+    let (_, doc) = opened_doc(&h, &id).await?;
+    assert!(doc.contains(NO_THUMBNAIL), "a 3 MiB PNG");
+    assert!(!doc.contains("<img"), "no image for a 3 MiB PNG");
+    let id = queued(&h, params(FILENAME, TEXT, false, None)).await?;
+    let (_, doc) = opened_doc(&h, &id).await?;
+    assert!(doc.contains(NO_THUMBNAIL), "a text file");
+    assert!(doc.contains("application/octet-stream"));
+    Ok(())
+}
+
+/// PD-109 / §7.4: the collision hold's card says "attachment already exists" with the facts of
+/// the attachment the lookup found (its id, version and size), and still shows the request an
+/// approval would have sent; Approve stays disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collision_card_line() -> TestResult {
+    let p = params(FILENAME, TEXT, false, Some(COMMENT));
+    let m = card_model(&p, &[attachment(ATT_ID, FILENAME, 2)])?;
+    let c = card(&m.body)?;
+    assert_eq!(c.existing, Some("attachment att3001, version 2, 11 bytes"));
+    assert_eq!(c.replaces, None);
+    assert_eq!(c.requests.len(), 1);
+    assert_eq!(c.sha256, sha256_hex(TEXT));
+    // A case variant without a reported size.
+    let mut variant = attachment(ATT_ID, "Notes.TXT", 4);
+    variant["extensions"] = json!({});
+    let m = card_model(&p, &[variant])?;
+    assert_eq!(
+        card(&m.body)?.existing,
+        Some("attachment att3001, version 4, size not reported")
+    );
+
+    // End to end.
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[attachment(ATT_ID, FILENAME, 2)]).await;
+    let id = queued(&h, p).await?;
+    let (preview, doc) = opened_doc(&h, &id).await?;
+    assert!(!preview.approvable);
+    let c = card(&preview.body)?;
+    assert_eq!(c.existing, Some("attachment att3001, version 2, 11 bytes"));
+    assert!(doc.contains("attachment already exists"), "{doc}");
+    assert!(doc.contains("attachment att3001, version 2, 11 bytes"));
+    not_approvable(h.approver().approve(&id))?;
+    Ok(())
+}
+
+/// §6.3 "replaces existing attachment vN" when `replace`: N is the version of the one attachment
+/// of that name, and the card's request is that attachment's `/data` endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replace_card_line() -> TestResult {
+    let p = params(FILENAME, TEXT, true, None);
+    let m = card_model(&p, &[attachment(ATT_ID, FILENAME, 3)])?;
+    let c = card(&m.body)?;
+    assert_eq!((c.replaces, c.existing), (Some(3), None));
+    assert!(c.requests[0].resolved_url.ends_with(DATA_PATH));
+    // A new attachment replaces nothing.
+    let new = params(FILENAME, TEXT, false, None);
+    assert_eq!(card(&card_model(&new, &[])?.body)?.replaces, None);
+    // A request to another attachment's endpoint, or a new-attachment request under the replace
+    // verdict, keeps the generic list (§5.1 inv. 4: the card states what is sent).
+    let v = verdict(&p, &[attachment(ATT_ID, FILENAME, 3)])?;
+    let mut other = one_request(&p, &v)?;
+    other.resolved_url = other.resolved_url.replace(ATT_ID, "att3009");
+    assert!(is_generic(&preview_of(&p, &v, &[other])?));
+    let as_new = one_request(&new, &verdict(&new, &[])?)?;
+    assert!(is_generic(&preview_of(&p, &v, &[as_new])?));
+
+    // End to end.
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[attachment(ATT_ID, FILENAME, 3)]).await;
+    let id = queued(&h, p).await?;
+    let (preview, doc) = opened_doc(&h, &id).await?;
+    assert!(preview.approvable);
+    assert_eq!(card(&preview.body)?.replaces, Some(3));
+    assert!(doc.contains("replaces existing attachment v3"), "{doc}");
+    Ok(())
+}
+
+/// §5.1 inv. 4: the card states the facts of the request that is sent (file name, bytes, comment
+/// and the type the part is sent as); a request list that is not exactly one multipart upload in
+/// the executor's layout keeps the generic request list.
+#[test]
+fn card_is_built_over_the_request_sent() -> TestResult {
+    let p = params(FILENAME, TEXT, false, Some(COMMENT));
+    let v = verdict(&p, &[])?;
+    let other = params("other.txt", b"other bytes", false, Some("another comment"));
+    let sent = one_request(&other, &verdict(&other, &[])?)?;
+    let m = preview_of(&p, &v, std::slice::from_ref(&sent))?;
+    let c = card(&m.body)?;
+    assert_eq!(
+        (c.filename, c.size, c.sha256, c.comment),
+        (
+            "other.txt",
+            11,
+            sha256_hex(b"other bytes").as_str(),
+            Some("another comment")
+        )
+    );
+
+    let r = one_request(&p, &v)?;
+    let boundary = boundary_of(&r)?;
+    let swap = |from: &str, to: &str| {
+        let mut x = r.clone();
+        let body = String::from_utf8_lossy(&x.body).replace(from, to);
+        x.body = body.into_bytes();
+        x
+    };
+    let mut no_type = r.clone();
+    no_type.content_type = None;
+    let mut extra = r.clone();
+    extra.body.extend_from_slice(b"trailing");
+    let cases = [
+        vec![r.clone(), r.clone()],
+        vec![],
+        vec![no_type],
+        vec![extra],
+        // The part is not sent as the sniffed type.
+        vec![swap("application/octet-stream", "text/html")],
+        // Another part name, another boundary in the body.
+        vec![swap("name=\"file\"", "name=\"data\"")],
+        vec![swap(&format!("--{boundary}--"), "--x--")],
+    ];
+    for reqs in cases {
+        let m = preview_of(&p, &v, &reqs)?;
+        assert!(is_generic(&m), "{:?}", m.body);
+    }
+    Ok(())
+}
+
+/// PD-110 (plan review m-9): a fact row "extension and content type differ" when the file name's
+/// extension names an active type, or disagrees with the sniffed type; none when they agree.
+#[test]
+fn active_extension_fact_row() -> TestResult {
+    let png = STANDARD.decode(PIXEL_PNG)?;
+    let zip = headed(b"PK\x03\x04", 64);
+    let jpeg = headed(b"\xff\xd8\xff\xe0", 64);
+    let cases: [(&str, &[u8], bool); 16] = [
+        ("x.svg", &png, true),
+        ("x.html", b"<p>hi</p>", true),
+        ("x.HTM", TEXT, true),
+        ("x.js", TEXT, true),
+        ("x.xhtml", TEXT, true),
+        // Windows drops a trailing dot or space when the file is saved.
+        ("x.html.", TEXT, true),
+        // An image named as text, and a name of a sniffed type over other bytes.
+        ("x.txt", &png, true),
+        ("x.pdf", TEXT, true),
+        ("x.jpg", &png, true),
+        ("x.png", &png, false),
+        ("X.PNG", &png, false),
+        ("photo.jpeg", &jpeg, false),
+        ("report.docx", &zip, false),
+        ("archive.zip", &zip, false),
+        (FILENAME, TEXT, false),
+        ("README", TEXT, false),
+    ];
+    for (name, content, row) in cases {
+        let m = card_model(&params(name, content, false, None), &[])?;
+        let c = card(&m.body)?;
+        assert_eq!(
+            c.notes.iter().any(|n| n.starts_with(MISMATCH)),
+            row,
+            "{name}: {:?}",
+            c.notes
+        );
+        if !row {
+            assert!(c.notes.is_empty(), "{name}: {:?}", c.notes);
+        }
+        // A row, no warning of its own (the §6.4 counts of the part bodies stay as they are).
+        assert!(
+            m.warnings
+                .iter()
+                .all(|w| matches!(w.id, WarningId::OtherInvisible | WarningId::BidiControls)),
+            "{name}: {:?}",
+            m.warnings
+        );
+    }
+    Ok(())
+}
+
+/// PD-110: the edit form shows `content_base64` read-only with the value `null` and the plan-text
+/// label naming the size and the first 8 hex of the SHA-256; the other inputs keep their values,
+/// and the serialized preview holds no base64 of the content.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn edit_form_content_not_inlined() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[]).await;
+    let id = queued(&h, params(FILENAME, TEXT, false, Some(COMMENT))).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let form = preview.edit_form.as_ref().ok_or("no edit form")?;
+    let input = |name: &str| {
+        form.inputs
+            .iter()
+            .find(|i| i.path == name)
+            .ok_or_else(|| TestError::from(format!("no {name} input")))
+    };
+    let content = input("content_base64")?;
+    assert!(content.read_only);
+    assert_eq!(content.value, Value::Null);
+    assert_eq!(
+        content.label,
+        format!(
+            "file content ({} bytes, SHA-256 {}…): not editable here; deny and resubmit to change it",
+            TEXT.len(),
+            &sha256_hex(TEXT)[..8]
+        )
+    );
+    assert_eq!(input("filename")?.value, json!(FILENAME));
+    assert!(!input("filename")?.read_only);
+    assert_eq!(input("comment")?.value, json!(COMMENT));
+    assert!(input("id")?.read_only);
+    no_file_bytes(&serde_json::to_string(&preview)?, TEXT)?;
+    Ok(())
+}
+
+/// PD-110 (plan review m-17): the raw-JSON editor is seeded from the form, so a save sends
+/// `content_base64: null`: that is "unchanged" (the stored content stays, its SHA-256 too), while
+/// the rest of the edit applies; any other value is validated as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn content_base64_null_edit_is_unchanged() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[]).await;
+    let id = queued(&h, params(FILENAME, TEXT, false, Some(COMMENT))).await?;
+    h.approver().open(&id).map_err(de)?;
+    let edit = |pairs: &[(&str, Value)]| Edits {
+        set: pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), v.clone()))
+            .collect::<Map<String, Value>>(),
+        remove: Vec::new(),
+    };
+
+    // Not base64: refused, nothing changes.
+    let res = h.approver().edit(
+        &id,
+        edit(&[
+            ("content_base64", json!("not base64!")),
+            ("comment", json!("x")),
+        ]),
+    );
+    assert!(
+        matches!(res, Err(DecisionError::EditRejected(_))),
+        "{res:?}"
+    );
+
+    let rev = h.approver().rev(&id).map_err(de)?.counter;
+    h.approver()
+        .edit(
+            &id,
+            edit(&[
+                ("content_base64", Value::Null),
+                ("comment", json!("Revised notes")),
+            ]),
+        )
+        .map_err(de)?;
+    item_after(&h, &id, rev).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    let c = card(&preview.body)?;
+    assert_eq!(c.comment, Some("Revised notes"));
+    assert_eq!(
+        (c.size, c.sha256),
+        (TEXT.len() as u64, sha256_hex(TEXT).as_str())
+    );
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let posts = requests_with(mock, "POST").await;
+    let [sent] = posts.as_slice() else {
+        return Err(format!("{} POSTs", posts.len()).into());
+    };
+    let got = parts(&sent.body, &first_boundary(TEXT))?;
+    assert_eq!(got[0].1, TEXT, "the file bytes stayed");
+    assert_eq!(got[1].1, b"Revised notes");
+
+    // Another value is an edit of the content like any other.
+    let id = queued(&h, params(FILENAME, TEXT, false, None)).await?;
+    h.approver().open(&id).map_err(de)?;
+    let rev = h.approver().rev(&id).map_err(de)?.counter;
+    let new = b"new bytes".as_slice();
+    h.approver()
+        .edit(
+            &id,
+            edit(&[("content_base64", json!(STANDARD.encode(new)))]),
+        )
+        .map_err(de)?;
+    item_after(&h, &id, rev).await?;
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert_eq!(card(&preview.body)?.sha256, sha256_hex(new));
+    Ok(())
+}
+
+/// Plan review I-4 (T8 review m-2): a 10 MiB upload (a PNG, so only the 2 MiB cap keeps the
+/// thumbnail out) opens with a serialized preview DTO below 64 KiB (body, header and edit form),
+/// a document of at most `DOC_MAX_BYTES` + 4 KiB that names the SHA-256, the file's bytes counted
+/// as hidden, and no slice or base64 of the file anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_10mib_preview_is_bounded() -> TestResult {
+    let content = headed(PNG_MAGIC, 10 * MIB);
+    let sha = sha256_hex(&content);
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[]).await;
+    let id = queued(&h, params("big.png", &content, false, Some(COMMENT))).await?;
+    h.approver().open(&id).map_err(de)?;
+    let t = Instant::now();
+    let preview = h.decisions().preview_fetch(&id, None).map_err(de)?.preview;
+    let build = t.elapsed();
+    let t = Instant::now();
+    let doc = render::document(&preview, Platform::current());
+    let render_took = t.elapsed();
+    println!(
+        "P01-style upload_10mib preview {:.1} ms (build), render::document {:.1} ms",
+        build.as_secs_f64() * 1000.0,
+        render_took.as_secs_f64() * 1000.0
+    );
+    let dto = serde_json::to_string(&preview)?;
+    assert!(dto.len() < 64 * 1024, "preview DTO {} bytes", dto.len());
+    assert!(
+        doc.len() <= DOC_MAX_BYTES + 4 * 1024,
+        "document {} bytes",
+        doc.len()
+    );
+    assert!(doc.contains(&sha), "the SHA-256 line");
+    assert!(doc.contains(&body_digest_line(content.len() as u64, &sha)));
+    let c = card(&preview.body)?;
+    assert_eq!(
+        (c.size, c.mime, c.thumbnail),
+        (content.len() as u64, "image/png", None)
+    );
+    assert!(doc.contains(NO_THUMBNAIL));
+    assert_eq!(
+        preview.header.hidden_in_preview_bytes,
+        content.len() as u64,
+        "the file's bytes are hidden, once"
+    );
+    no_file_bytes(&dto, &content)?;
+    no_file_bytes(&doc, &content)?;
     Ok(())
 }
 

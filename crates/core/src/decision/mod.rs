@@ -1876,7 +1876,7 @@ impl DecisionApi for CoreDecisions {
         Some(RequestDetail {
             // T20a review I-2: an upload's file is its size and SHA-256 here, never its base64.
             params: e.params().map_or(Value::Null, |p| {
-                escape_json(request_tab_params(e.spec.id, p).as_ref().unwrap_or(p))
+                escape_json(request_tab_params(e.spec, p).as_ref().unwrap_or(p))
             }),
             params_sha256: e.params_sha256.clone(),
             reason: e.reason.as_deref().map(escape_for_display),

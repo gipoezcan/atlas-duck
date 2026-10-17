@@ -17,6 +17,7 @@
 use atlas_duck_atlassian::{GetCall, HttpRequestSpec};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
+use atlas_duck_registry::OperationSpec;
 use base64::Engine as _;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use serde_json::{Map, Value, json};
@@ -31,6 +32,7 @@ use super::{
     ExecError, ExecPlan, ExistingAttachment, PageRef, WriteSummaryFacts, get_call, json_request,
     method_name, resolve_url, single_round, str_param,
 };
+use crate::edit::is_not_inlined;
 use crate::lifecycle::model::Hold;
 use crate::validate::invalid;
 
@@ -1081,39 +1083,33 @@ const CONTENT_BASE64: GeneralPurpose = GeneralPurpose::new(
         .with_decode_allow_trailing_bits(true),
 );
 
-/// The `(op, param)` pairs whose value is a base64 file the Request tab shows as its size and
-/// SHA-256 only (T20a review I-2, plan review I-4). The same pairs as the edit form's PD-110
-/// `null` rule (T20b `edit::NOT_INLINED`): the merge can make this that one list.
-pub(crate) const REQUEST_TAB_DIGESTED: [(&str, &str); 1] =
-    [("confluence.attachment.upload", "content_base64")];
+/// The size and SHA-256 (hex) of the file a not-inlined param holds (`edit::NOT_INLINED`,
+/// PD-110), decoded as the executor decodes it; `None` when the value is no string or no base64.
+/// The edit form's label and the Request tab both name the file by these two facts.
+pub(crate) fn file_digest(value: &Value) -> Option<(usize, String)> {
+    let decoded = CONTENT_BASE64.decode(value.as_str()?).ok()?;
+    Some((decoded.len(), hex::encode(Sha256::digest(&decoded))))
+}
 
-/// The Request tab's copy of `params` (T20a review I-2, lead ruling): each
-/// [`REQUEST_TAB_DIGESTED`] param of `op_id` replaced by `{"content": null, "bytes", "sha256"}`
-/// of the decoded file (the digest line the request view shows; both `null` for content that
-/// does not decode), so the file never reaches the webview through that DTO. `None` when no
-/// pair applies (the params are shown as they are). The executor renders from the real params,
-/// and `params_sha256` covers them.
-pub(crate) fn request_tab_params(op_id: &str, params: &Value) -> Option<Value> {
+/// The Request tab's copy of `params` (T20a review I-2, lead ruling): each `edit::NOT_INLINED`
+/// param of `spec` (the edit form's PD-110 list) replaced by `{"content": null, "bytes",
+/// "sha256"}` of the decoded file ([`file_digest`], the digest line the request view shows; both
+/// `null` for content that does not decode), so the file never reaches the webview through that
+/// DTO. `None` when no such param is present (the params are shown as they are). The executor
+/// renders from the real params, and `params_sha256` covers them.
+pub(crate) fn request_tab_params(spec: &OperationSpec, params: &Value) -> Option<Value> {
     let map = params.as_object()?;
-    let digested: Vec<&str> = REQUEST_TAB_DIGESTED
-        .iter()
-        .filter(|(op, param)| *op == op_id && map.contains_key(*param))
-        .map(|(_, param)| *param)
-        .collect();
-    if digested.is_empty() {
+    if !map.keys().any(|k| is_not_inlined(spec, k)) {
         return None;
     }
-    let file = |v: &Value| {
-        let decoded = v.as_str().and_then(|c| CONTENT_BASE64.decode(c).ok());
-        json!({
-            "content": null,
-            "bytes": decoded.as_ref().map(Vec::len),
-            "sha256": decoded.as_deref().map(|d| hex::encode(Sha256::digest(d))),
-        })
-    };
     let shown = map.iter().map(|(k, v)| {
-        let v = if digested.contains(&k.as_str()) {
-            file(v)
+        let v = if is_not_inlined(spec, k) {
+            let digest = file_digest(v);
+            json!({
+                "content": null,
+                "bytes": digest.as_ref().map(|(len, _)| *len),
+                "sha256": digest.map(|(_, sha)| sha),
+            })
         } else {
             v.clone()
         };
