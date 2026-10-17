@@ -961,14 +961,20 @@ fn running_scripts() -> Vec<RunningScriptView> {
         RunningScriptView {
             request_id: REQ.into(),
             agent_name: Some("claude-code-billing-api".into()),
+            instances: vec!["jira-main".into(), "wiki".into()],
             started_at: "2026-10-15T08:30:00.000Z".into(),
+            elapsed_ms: 93_500,
             host_calls: 4,
+            bytes_fetched: 182_400,
         },
         RunningScriptView {
             request_id: REQ_2.into(),
             agent_name: None,
+            instances: Vec::new(),
             started_at: "2026-10-15T08:31:12.250Z".into(),
+            elapsed_ms: 0,
             host_calls: 0,
+            bytes_fetched: 0,
         },
     ]
 }

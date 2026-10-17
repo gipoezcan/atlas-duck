@@ -15,6 +15,7 @@ use atlas_duck_atlassian::testing::{
 };
 use atlas_duck_audit::EventType;
 use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
+use atlas_duck_core::running::KillAnswer;
 use atlas_duck_core::testing::{
     FakeScriptRunner, FaultPlan, Harness, InstanceAt, ScriptPlan, host_call,
 };
@@ -926,7 +927,7 @@ async fn user_kill_becomes_a_release_item() -> TestResult {
     .await?;
     let id = submit(&h, json!({ "source": SRC })).await?;
     wait_for("the run to start", || runner.starts() == 1).await?;
-    assert!(h.engine().kill_script(&id));
+    assert_eq!(h.engine().kill_script(&id), KillAnswer::Killed);
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     assert_eq!(h.status(&id).await.status, Status::Pending);
     let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
@@ -959,14 +960,21 @@ async fn running_list_empty_and_one() -> TestResult {
     assert_eq!(rows[0].host_calls, 0);
     assert!(!rows[0].started_at.is_empty());
     // The kill goes through the run's own audited path; an unknown id kills nothing.
-    assert!(!h.core().kill_script("no-such-request"));
-    assert!(h.core().kill_script(&id));
+    assert_eq!(
+        h.core().kill_script("no-such-request"),
+        KillAnswer::NotRunning
+    );
+    assert_eq!(h.core().kill_script(&id), KillAnswer::Killed);
     // The row is gone at once: the end record is appended later, and a page that re-reads right
     // after the kill answer must not see a run with an enabled Kill button.
     assert!(h.core().running_scripts().is_empty());
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     assert!(h.core().running_scripts().is_empty());
-    assert!(!h.core().kill_script(&id), "a run that ended is not killed");
+    assert_eq!(
+        h.core().kill_script(&id),
+        KillAnswer::NotRunning,
+        "a run that ended is not killed"
+    );
     let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
     assert_eq!(failed["reason"], "killed_by_user");
     Ok(())
@@ -984,11 +992,211 @@ async fn running_list_leaves_out_dry_runs_and_kill_ignores_non_scripts() -> Test
         h.core().running_scripts().is_empty(),
         "a dry run is not listed"
     );
-    assert!(!h.core().kill_script(&dry), "a dry run has no kill");
+    assert_eq!(
+        h.core().kill_script(&dry),
+        KillAnswer::NotRunning,
+        "a dry run has no kill"
+    );
     // A read request (finished) names no script run either.
     let read = h.submit("jira.issue.get", json!({ "key": "ABC-1" })).await;
-    assert!(!h.core().kill_script(&request_id(&read)?));
+    assert_eq!(
+        h.core().kill_script(&request_id(&read)?),
+        KillAnswer::NotRunning
+    );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x11_running_view_lists_agent_instances_started_elapsed_calls_bytes() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(vec![issue_call(1)], result_end(json!(1))).holding(30_000),
+    ])
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the run to start", || runner.starts() == 1).await?;
+    wait_for("the host call to be counted", || {
+        h.core()
+            .running_scripts()
+            .first()
+            .is_some_and(|r| r.host_calls == 1 && r.bytes_fetched > 0)
+    })
+    .await?;
+    h.clock().advance(Duration::from_millis(2500));
+    let rows = h.core().running_scripts();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.request_id, id);
+    assert_eq!(row.instances, ["jira-main"], "aliases, not instance ids");
+    assert_eq!(row.host_calls, 1);
+    assert!(row.bytes_fetched >= 1, "{row:?}");
+    assert_eq!(row.elapsed_ms, 2500, "host clock since the slot");
+    assert!(row.started_at.ends_with('Z'), "{}", row.started_at);
+    // The serialized keys are the Δ4 set.
+    let keys: Vec<String> = serde_json::to_value(row)?
+        .as_object()
+        .ok_or("not an object")?
+        .keys()
+        .cloned()
+        .collect();
+    for k in [
+        "request_id",
+        "agent_name",
+        "instances",
+        "started_at",
+        "elapsed_ms",
+        "host_calls",
+        "bytes_fetched",
+    ] {
+        assert!(keys.iter().any(|x| x == k), "missing {k}: {keys:?}");
+    }
+    assert_eq!(keys.len(), 7, "{keys:?}");
+    assert_eq!(h.core().kill_script(&id), KillAnswer::Killed);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn started_at_is_slot_time_not_submit_time() -> TestResult {
+    let hold = |ms| ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(ms);
+    let (h, runner) = harness(vec![hold(700), hold(700), hold(30_000)]).await?;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("both slots", || runner.starts() == 2).await?;
+    let third = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the third compile check", || runner.compile_checks() == 3).await?;
+    let submitted = h
+        .engine()
+        .entry(&third)
+        .ok_or("no entry")?
+        .submitted_at
+        .clone();
+    // The queued run waits 40 s on the host clock before a slot frees.
+    h.clock().advance(Duration::from_secs(40));
+    wait_for("the third run to get a slot", || {
+        h.core()
+            .running_scripts()
+            .iter()
+            .any(|r| r.request_id == third)
+    })
+    .await?;
+    h.clock().advance(Duration::from_secs(3));
+    let rows = h.core().running_scripts();
+    let row = rows
+        .iter()
+        .find(|r| r.request_id == third)
+        .ok_or("third not listed")?;
+    assert!(
+        row.started_at > submitted,
+        "slot time {} must be after submit time {submitted}",
+        row.started_at
+    );
+    assert_eq!(
+        row.elapsed_ms, 3000,
+        "elapsed counts from the slot, not the submit"
+    );
+    for id in [&first, &second, &third] {
+        h.handler().cancel(id).await;
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x11_user_kill_is_killed_by_user_direct_false_release_item() -> TestResult {
+    // Before the first host call, and after one.
+    for with_call in [false, true] {
+        let calls = if with_call {
+            vec![issue_call(1)]
+        } else {
+            Vec::new()
+        };
+        let (h, runner) = harness(vec![
+            ScriptPlan::new(calls, result_end(json!(1))).holding(30_000),
+        ])
+        .await?;
+        let id = submit(&h, json!({ "source": SRC })).await?;
+        wait_for("the run to start", || runner.starts() == 1).await?;
+        if with_call {
+            wait_for("the call", || {
+                h.core()
+                    .running_scripts()
+                    .first()
+                    .is_some_and(|r| r.host_calls == 1)
+            })
+            .await?;
+        }
+        assert_eq!(h.core().kill_script(&id), KillAnswer::Killed);
+        h.queued(&id, 20_000).await.ok_or("never queued")?;
+        let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+        assert_eq!(failed["reason"], "killed_by_user");
+        assert_eq!(failed["direct"], false);
+        assert_eq!(failed["candidate"]["class"], "killed_by_user");
+        assert_eq!(runner.kills(), [Some(KillReason::User)]);
+        let item = h.approver().item(&id).ok_or("not in the queue")?;
+        assert!(item.approvable);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_answer_not_running_vs_already_stopping() -> TestResult {
+    let hold = pause();
+    let hooks = TestHooks {
+        pause_in_transition: Some(hold.clone()),
+        ..TestHooks::none()
+    };
+    let (h, runner) = harness_with(
+        vec![ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(30_000)],
+        hooks,
+        FaultPlan::new(),
+    )
+    .await?;
+    assert_eq!(h.core().kill_script("no-such"), KillAnswer::NotRunning);
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    // `SCRIPT_STARTED` is committed, the model not yet applied: not running yet.
+    hold.reached.notified().await;
+    hold.release.notify_one();
+    wait_for("the run to start", || runner.starts() == 1).await?;
+    wait_for("the run to be listed", || {
+        !h.core().running_scripts().is_empty()
+    })
+    .await?;
+    assert_eq!(h.core().kill_script(&id), KillAnswer::Killed);
+    // The end record is committed, its model transition is held: the worker is being stopped.
+    wait_for_record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(h.core().kill_script(&id), KillAnswer::AlreadyStopping);
+    assert_eq!(h.core().kill_script(&id), KillAnswer::AlreadyStopping);
+    hold.release.notify_one();
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(h.core().kill_script(&id), KillAnswer::NotRunning);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kill_answer_after_an_agent_cancel_is_not_running() -> TestResult {
+    // The cancel path commits its kill, its records and the model move under one gate hold with
+    // no test hook inside it, so "kill asked, record not yet applied" is only reachable through
+    // the run task's end transition (the test above). Once the cancel answered, the request is
+    // terminal: the click is `NotRunning`, never `Killed`.
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(30_000),
+    ])
+    .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the run to start", || runner.starts() == 1).await?;
+    let env = h.handler().cancel(&id).await;
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    assert_eq!(h.core().kill_script(&id), KillAnswer::NotRunning);
+    assert_eq!(runner.kills(), [Some(KillReason::Client)]);
+    Ok(())
+}
+
+async fn wait_for_record(h: &Harness, id: &str, t: EventType) -> TestResult {
+    for _ in 0..1000 {
+        if h.events(id).await?.iter().any(|(e, _)| *e == t) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err(format!("timed out waiting for the {t:?} record").into())
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn call_append_failure_ends_audit_failure_after_the_send() -> TestResult {
@@ -1451,7 +1659,7 @@ async fn run_ended_with_a_call_in_flight(
     wait_for("the connection", || server.connections() >= 1).await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
     if end.is_none() {
-        assert!(h.engine().kill_script(&id));
+        assert_eq!(h.engine().kill_script(&id), KillAnswer::Killed);
     }
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     tokio::time::sleep(Duration::from_millis(300)).await;

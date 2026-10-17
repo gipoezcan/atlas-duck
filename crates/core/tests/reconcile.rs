@@ -894,7 +894,10 @@ async fn i26_killed_script_in_the_queue_is_abandoned() -> TestResult {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     // The user kills the run: a non-terminal `SCRIPT_FAILED` and a release item.
-    assert!(h.engine().kill_script(&id));
+    assert_eq!(
+        h.engine().kill_script(&id),
+        atlas_duck_core::running::KillAnswer::Killed
+    );
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     let t = types(&h, &id).await?;
     assert!(t.contains(&EventType::SCRIPT_FAILED), "{t:?}");

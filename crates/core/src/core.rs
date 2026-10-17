@@ -32,7 +32,7 @@ use crate::instances::state::DeriveCtx;
 use crate::instances::{CoreInstances, InstanceAdmin, InstanceState, InstanceTable};
 use crate::metadata::FieldCache;
 use crate::payloads::{self, AppStopReason, ConfigSource};
-use crate::running::RunningScriptView;
+use crate::running::{KillAnswer, RunningScriptView};
 use crate::settings::{CoreSettings, SettingsAdmin};
 use crate::similarity::SimilarityIndex;
 
@@ -461,9 +461,9 @@ impl Core {
 
     /// The window's kill button (§9.6): the run's worker is asked to die; the run's own path then
     /// records `SCRIPT_FAILED {killed_by_user}` and the request becomes a release item (audit
-    /// before effect stays with that path). `false` = no such live real run (or a kill is already
-    /// on its way).
-    pub fn kill_script(&self, request_id: &str) -> bool {
+    /// before effect stays with that path). The answer says whether a kill was asked for, the run
+    /// is not alive, or it is already stopping (PD-143).
+    pub fn kill_script(&self, request_id: &str) -> KillAnswer {
         self.engine.kill_script(request_id)
     }
 
