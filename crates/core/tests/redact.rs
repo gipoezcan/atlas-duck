@@ -2157,6 +2157,51 @@ fn a_single_mask_of_a_mirror_key_masks_the_mirrored_key() -> TestResult {
     Ok(())
 }
 
+/// Review T19c fix m-6: the flagged-entry tracking follows an item-level shift (`jira.search`):
+/// an orphan in the second issue is reported where it is after the first issue's drop.
+#[test]
+fn a_flagged_entry_follows_an_item_level_shift() -> TestResult {
+    let r = rules("jira.search")?;
+    let mut source = search_fixture();
+    if let Some(a) = source["issues"][1]["renderedFields"]["comment"]["comments"].as_array_mut() {
+        a.push(json!({"id": "99", "body": "<p>orphan secret</p>"}));
+    }
+    let orphan = |i: usize| BlockReason::MirrorOrphan {
+        path: format!("issues[{i}].renderedFields.comment.comments[1]"),
+    };
+    assert_eq!(
+        apply(&source, r, Some("issues"), &[]).blocked,
+        vec![orphan(1)]
+    );
+    for first in [
+        drop_field("issues[0]", DropScope::PerItem),
+        RedactionOp::DropItem {
+            array_path: "issues".into(),
+            key: "key".into(),
+            value: json!("ABC-1"),
+        },
+    ] {
+        let out = apply(&source, r, Some("issues"), std::slice::from_ref(&first));
+        assert_eq!(out.blocked, vec![orphan(0)], "{first:?}");
+    }
+    // The orphan named where it now is: nothing blocks, and it is gone.
+    let out = apply(
+        &source,
+        r,
+        Some("issues"),
+        &[
+            drop_field("issues[0]", DropScope::PerItem),
+            drop_field(
+                "issues[0].renderedFields.comment.comments[1]",
+                DropScope::PerItem,
+            ),
+        ],
+    );
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    assert!(!released_text(&out, "orphan secret"), "{}", out.released);
+    Ok(())
+}
+
 #[test]
 fn whatwg_reference_details() -> TestResult {
     // windows-1252 remap of numeric references 0x80-0x9F.
