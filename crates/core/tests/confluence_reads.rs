@@ -1237,8 +1237,8 @@ async fn read_started_during_the_token_store_is_upstream_unavailable() -> TestRe
     // The window was hit: the content and the lookup under the old PAT, the read's identity GET
     // (after the connection test's) under the new one.
     let old = format!("Bearer {TEST_PAT}");
-    assert_eq!(bearers(mock, &content_path(ID)).await, [old.clone()]);
-    assert_eq!(bearers(mock, "/rest/api/user").await, [old]);
+    assert_eq!(bearers(mock, &content_path(ID)).await, [old.as_str()]);
+    assert_eq!(bearers(mock, "/rest/api/user").await, [old.as_str()]);
     assert_eq!(
         bearers(mock, IDENTITY_PATH).await,
         ["Bearer rotated-pat", "Bearer rotated-pat"]
