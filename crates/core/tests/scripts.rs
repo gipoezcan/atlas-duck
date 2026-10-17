@@ -1361,6 +1361,56 @@ async fn raw_page_and_redacted_release_of_a_result() -> TestResult {
     Ok(())
 }
 
+/// §5.2 (M8 T19c): a script result whose rebuild does not reproduce its hash fails closed for
+/// good: no redaction is previewed or taken (a new revision built from the record would switch
+/// Release back on), only Deny remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hash_mismatch_script_takes_no_redaction() -> TestResult {
+    use atlas_duck_core::DecisionError;
+    use atlas_duck_core::payloads::InvalidReason;
+    let value = json!({ "keep": 1, "secret": "hunter2" });
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(value))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    assert!(h.corrupt_candidate_hash(&id));
+    let res = ap.release_unopened(&id);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let rev = ap.rev(&id).map_err(de)?;
+    let ops = vec![atlas_duck_core::RedactionOp::DropField {
+        path: "result.secret".to_owned(),
+        scope: atlas_duck_core::DropScope::PerItem,
+    }];
+    let res = ap.redaction_preview(&id, &ops);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let res = ap.redact(&id, ops);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+    ap.deny_unopened(&id, "rebuild failed").map_err(de)?;
+    assert_eq!(h.await_(&id, 5000).await.status, Status::Denied);
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn scripts_release_in_a_batch() -> TestResult {
     let runner = FakeScriptRunner::new(vec![

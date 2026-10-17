@@ -722,7 +722,8 @@ async fn m11_dropping_flagged_items_makes_the_mirror_candidate_releasable() -> T
 /// §5.2 unchanged by M-11: a revision whose rebuild does not reproduce its hash (here a corrupted
 /// revision hash; a clean candidate and a mirror-blocked one alike) answers no tree and nothing
 /// flagged: `preview_fetch` and `raw_page` are refused as not approvable, a release too, the item
-/// is not approvable and only Deny remains.
+/// is not approvable and only Deny remains: no redaction is previewed or taken either (a new
+/// revision built from the record would switch Release back on).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hash_mismatch_release_blocked_stays_deny_only() -> TestResult {
     let h = Harness::jira().await?;
@@ -757,9 +758,75 @@ async fn hash_mismatch_release_blocked_stays_deny_only() -> TestResult {
         assert!(!ap.item(&id).ok_or("not queued")?.approvable);
         plain_release_refused(&h, &id).await?;
         assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+        // No redaction either: the drops of the mirror case's flagged entries included.
+        let drops = vec![
+            drop_at("renderedFields.comment.comments[3]"),
+            drop_at("renderedFields.comment.comments[1]"),
+        ];
+        for ops in [vec![drop_at("fields.labels")], drops] {
+            let res = ap.redaction_preview(&id, &ops);
+            assert!(
+                matches!(
+                    res,
+                    Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+                ),
+                "{id}: {res:?}"
+            );
+            let invalid = records(&h, &id, EventType::DECISION_INVALID).await?.len();
+            let res = ap.redact(&id, ops);
+            assert!(
+                matches!(
+                    res,
+                    Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+                ),
+                "{id}: {res:?}"
+            );
+            assert_eq!(
+                records(&h, &id, EventType::DECISION_INVALID).await?.len(),
+                invalid + 1,
+                "the refused redaction is logged"
+            );
+            assert_eq!(ap.rev(&id).map_err(de)?, rev, "no new revision");
+            assert!(!ap.item(&id).ok_or("not queued")?.approvable);
+        }
+        assert!(records(&h, &id, EventType::READ_RELEASED).await?.is_empty());
         ap.deny_unopened(&id, "rebuild failed").map_err(de)?;
         assert_eq!(h.await_(&id, 5000).await.status, Status::Denied);
     }
+    Ok(())
+}
+
+/// The M-11 exception is decided on the candidate: a revision failed closed for another reason
+/// (here marked directly, its exact candidate still cached and passing the mirror check) takes
+/// no redaction either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_closed_without_a_mirror_block_takes_no_redaction() -> TestResult {
+    let h = Harness::jira().await?;
+    mount_issue(jira(&h)?, KEY, &full_issue(KEY)).await;
+    let id = queued(&h, ISSUE, json!({ "key": KEY })).await?;
+    let ap = h.approver();
+    ap.open(&id).map_err(de)?;
+    let entry = h.engine().entry(&id).ok_or("not in memory")?;
+    entry.state().rebuild_failed = true;
+    assert!(h.engine().candidates().contains(&id));
+    let ops = vec![drop_at("fields.labels")];
+    let res = ap.redaction_preview(&id, &ops);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    let res = ap.redact(&id, ops);
+    assert!(
+        matches!(
+            res,
+            Err(DecisionError::Invalid(InvalidReason::NotApprovable))
+        ),
+        "{res:?}"
+    );
+    assert!(!ap.item(&id).ok_or("not queued")?.approvable);
     Ok(())
 }
 

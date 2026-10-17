@@ -1075,9 +1075,39 @@ async fn deny(
     }
 }
 
+/// §5.2: a revision that failed closed (`rebuild_failed`) takes no new redaction ops: only Deny
+/// remains, and a new revision built from the record would switch Release back on. The one
+/// exception is M-11: a revision without ops whose exact candidate (hash checked by
+/// [`candidate`]) the §5.3 mirror check blocks, where dropping the flagged entries gives a new
+/// revision the check runs on again. `Ok(false)`: refuse as not approvable.
+async fn takes_redactions(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+) -> Result<bool, DecisionError> {
+    let (failed, no_ops) = {
+        let st = entry.state();
+        (st.rebuild_failed, st.redaction_ops.is_empty())
+    };
+    if !failed {
+        return Ok(true);
+    }
+    if !no_ops {
+        return Ok(false);
+    }
+    match candidate(engine, entry).await {
+        Ok(c) => Ok(crate::redact::mirror_blocked(
+            c.value(),
+            &entry.spec.redaction_rules,
+        )),
+        Err(RebuildError::Transient(e)) => Err(DecisionError::Audit(e)),
+        Err(_) => Ok(false),
+    }
+}
+
 /// A new set of redaction ops on the normalized body: a new revision (`CandidateChanged`, inv.
 /// 5) that must be opened before it can be released. No record: the ops are recorded with the
-/// release (`READ_RELEASED.redaction_ops`).
+/// release (`READ_RELEASED.redaction_ops`). A revision that failed closed takes none
+/// ([`takes_redactions`]).
 async fn redact(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
@@ -1089,6 +1119,10 @@ async fn redact(
         Ok(snap) => snap,
         Err(rej) => return Err(rejected(engine, entry, rej, rev.counter, dec).await),
     };
+    if !takes_redactions(engine, entry).await? {
+        let rej = (Rejection::NotApprovable, at);
+        return Err(rejected(engine, entry, rej, rev.counter, dec).await);
+    }
     if entry.kind() == Kind::Script {
         return redact_script(engine, entry, rev, ops, at).await;
     }
