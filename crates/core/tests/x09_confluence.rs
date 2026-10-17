@@ -11,7 +11,8 @@
 //!
 //! * `x09_confluence_every_op_once`: submit, release (reads) or approve (writes), the released
 //!   result validates against `result_schema` or the receipt equals the registry example, and the
-//!   requests the instance saw match the spec's declared method, path, query and body source.
+//!   requests the instance saw match the spec's declared method, path, query and body source;
+//!   every hit of a write has its records (I-19, `check_coverage_on`).
 //! * `x09_confluence_writes_wait_for_approval` and
 //!   `x09_confluence_reads_hold_their_result_until_released`: the gates of the same generated
 //!   cases (nothing is sent before an approval, nothing is delivered before a release, a denial
@@ -31,6 +32,7 @@ use atlas_duck_registry::{
 use common::confluence::{
     Aux, REPLACE_ATTACHMENT_ID, aux_gets, is_replace, mount_for_op, own_request, server_answer,
 };
+use common::flows::check_coverage_on;
 use common::jira::{example_params, fill_path, http_method};
 use common::{TestError, TestResult, de, exit, json, request_id};
 use serde_json::{Value, json as j};
@@ -640,6 +642,18 @@ async fn run_case(case: &Case) -> Result<(), String> {
                 return Err(format!("WRITE_EXECUTED without a status: {payload}"));
             }
             write_response = Some(payload["response"].clone());
+            // I-19 (T30 review M-1): every hit of the write (its enrichment, lookup, identity and
+            // stale-check GETs and its own request) has its covering and response records, so
+            // `page.create`, `comment.add`, `label.add` and a replace upload are checked too.
+            let covered = check_coverage_on(&h, ALIAS)
+                .await
+                .map_err(|e| format!("I-19: {e}"))?;
+            if covered <= aux.len() {
+                return Err(format!(
+                    "I-19: only {covered} authenticated hits for {} GETs",
+                    aux.len()
+                ));
+            }
         }
     }
     let mock = h.mock(ALIAS).ok_or("no confluence mock")?;
