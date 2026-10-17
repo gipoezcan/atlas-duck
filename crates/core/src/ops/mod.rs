@@ -8,6 +8,7 @@
 
 pub mod confluence;
 pub(crate) mod confluence_body;
+pub(crate) mod confluence_ext;
 pub(crate) mod confluence_preview;
 pub mod generic;
 pub mod jira;
@@ -934,7 +935,19 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         },
     ),
     ("confluence.page.move", LATER_WRITE),
-    ("confluence.comment.add", LATER_WRITE),
+    (
+        "confluence.comment.add",
+        OpImpl {
+            executor: confluence_ext::comment_add_executor,
+            previewer: confluence_preview::comment_preview,
+            // §5.4 step 5: an additive write has no stale rule; the identity call still runs.
+            stale_check: None,
+            enrich: Some(&confluence_ext::COMMENT_ADD_ENRICH),
+            // `reply_to` is resolved in stage 2 and is no target param: an edit of it re-runs the
+            // resolution (plan review I-6 a).
+            enrich_keys: &["reply_to"],
+        },
+    ),
     ("confluence.label.add", LATER_WRITE),
     ("confluence.label.remove", LATER_WRITE),
     ("confluence.attachment.upload", LATER_WRITE),
