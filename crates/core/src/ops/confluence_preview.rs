@@ -1327,3 +1327,115 @@ pub(crate) fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model.header.hidden_in_preview_bytes = hidden.saturating_add(cut);
     model
 }
+
+// ---- the create card (§6.3 Create, PD-105, Task 16) --------------------------------------------
+
+/// §6.3 Create for `confluence.page.create` (PD-105) over the exact request (§5.1 inv. 4): the
+/// sentence "Create page '<title>' in <space name> (<KEY>) under '<parent title>'" (the title,
+/// the space key and the parent id read from the request that is sent, the names from what
+/// enrichment resolved for them), rows for the space, the parent and its path, the outgoing
+/// storage rendered locally (what the render leaves out of it counts as hidden and raises
+/// `source_formatting_removed`, T12b rules) and its storage constructs (§7.6). The
+/// duplicate-title Caution comes with the verdict. Every other hold, or a request that is not the
+/// create JSON, keeps the generic write preview.
+pub(crate) fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let facts = view
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref())
+        .and_then(|s| s.confluence.as_ref());
+    let sent: Option<Value> = view
+        .requests
+        .first()
+        .and_then(|r| serde_json::from_slice(&r.body).ok());
+    let (Some(facts), Some(sent), PreviewBody::WriteRequests { .. }) = (facts, sent, &model.body)
+    else {
+        return model;
+    };
+    let (Some(title), Some(key), Some(storage)) = (
+        sent.get("title").and_then(Value::as_str),
+        sent.pointer("/space/key").and_then(Value::as_str),
+        sent.pointer("/body/storage/value").and_then(Value::as_str),
+    ) else {
+        return model;
+    };
+    // The parent the request sends, named only when it is the one enrichment resolved.
+    let sent_parent = sent.pointer("/ancestors/0/id").and_then(Value::as_str);
+    let parent = facts
+        .parent
+        .as_ref()
+        .filter(|p| sent_parent == Some(p.id.as_str()));
+    if sent_parent.is_some() && parent.is_none() {
+        return model;
+    }
+    // The space name is shown only for the key it was resolved for (the executor sends the
+    // server's spelling, so they are equal), and the card says "page" only for a page.
+    if facts.space_key != key || sent.get("type").and_then(Value::as_str) != Some("page") {
+        return model;
+    }
+
+    let mut hidden = 0u64;
+    let (body_html, notes) = render_storage(
+        storage,
+        STORAGE_MARKDOWN_BUDGET,
+        PAGE_BODY_CAP,
+        None,
+        &mut hidden,
+    );
+    notes.push(&mut model.warnings);
+
+    let mut cut = 0u64;
+    let mut line = |raw: &str| {
+        let (shown, bytes) = generic::capped_text(raw, generic::CELL_CAP_CHARS * 2);
+        cut = cut.saturating_add(bytes);
+        shown
+    };
+    let space = match facts.space_name.as_deref() {
+        Some(name) => format!("{name} ({key})"),
+        None => key.to_owned(),
+    };
+    let mut sentence = format!("Create page '{title}' in {space}");
+    if let Some(p) = parent {
+        sentence.push_str(&format!(" under '{}'", p.title));
+    }
+    let sentence = line(&sentence);
+    let mut rows = vec![("Space".to_owned(), line(&space))];
+    if let Some(p) = parent {
+        rows.push((
+            "Parent".to_owned(),
+            line(&format!("{} (page {})", p.title, p.id)),
+        ));
+        rows.push(("Path".to_owned(), line(&facts.to_path.join(" / "))));
+    }
+    // Server text the card shows beyond the request (§6.4 counts), each once: the space name and
+    // the path (the parent's ancestors, then the parent).
+    let shown = facts
+        .space_name
+        .iter()
+        .chain(parent.map_or(&[][..], |_| facts.to_path.as_slice()))
+        .map(String::as_str);
+    count_card_text(&mut model, shown);
+
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::ContentWrite {
+        sentence,
+        rows,
+        body_html: Some(body_html),
+        constructs: Some(storage_construct_list(storage)),
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = hidden.saturating_add(cut);
+    model
+}

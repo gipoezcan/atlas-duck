@@ -130,7 +130,7 @@ pub(crate) const PAGE_CREATE_PARAMS: &str = r#"{"$schema":"https://json-schema.o
   "title":{"type":"string","minLength":1,"maxLength":255},
   "body":{"type":"string","maxLength":1048576},
   "body_format":{"type":"string","enum":["markdown","storage"],"default":"markdown"},
-  "parent":{"type":"string","pattern":"^[0-9]+$","description":"Parent page id."}},
+  "parent":{"type":"string","minLength":1,"maxLength":255,"description":"Parent page id or title (same space); a value of digits only is always a page id."}},
  "examples":[{"space":"ABC","title":"Release notes 1.5","body":"Release 1.5 fixes the login.","parent":"123400"}]}"#;
 
 pub(crate) const PAGE_UPDATE_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,

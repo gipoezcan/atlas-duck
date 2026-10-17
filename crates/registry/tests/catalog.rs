@@ -461,6 +461,36 @@ fn confluence_table_rules_hold() {
     );
 }
 
+/// Δ4 a (lead ruling Q2, PD-105): the `parent` of `confluence.page.create` is a page id or a
+/// page title (an ambiguous title is the I-35 ambiguous case); empty is refused.
+#[test]
+fn parent_schema_accepts_id_and_title() {
+    let spec = get("confluence.page.create").expect("op");
+    let schema = jsonschema::validator_for(&spec.params_schema_json()).expect("schema");
+    let with = |parent: Value| serde_json::json!({"space": "DOC", "title": "T", "body": "b", "parent": parent});
+    let longest = "x".repeat(255);
+    for ok in [
+        "123400",
+        "Release notes",
+        "Notes / 2026 (draft)",
+        longest.as_str(),
+    ] {
+        assert!(schema.is_valid(&with(Value::from(ok))), "{ok}");
+    }
+    for bad in [
+        Value::from(""),
+        Value::from("x".repeat(256)),
+        Value::from(123_400),
+        Value::Null,
+    ] {
+        assert!(!schema.is_valid(&with(bad.clone())), "{bad}");
+    }
+    assert_eq!(
+        spec.params_schema_json()["properties"]["parent"]["description"],
+        "Parent page id or title (same space); a value of digits only is always a page id."
+    );
+}
+
 /// Δ4 f (PD-100, plan review m-11): `ops describe` shows agents the default release of
 /// `confluence.page.get`, the Markdown body `{"format": "markdown", "value": …}`, and both
 /// examples validate against `PAGE_GET_RESULT` (U-05 checks the latter for every op).

@@ -303,6 +303,32 @@ pub fn aux_gets(spec: &OperationSpec, params: &Value) -> Result<Vec<Aux>, String
                 body: server_example("confluence.page.get")?,
             }])
         }
+        // Task 16 (PD-105): the space, the parent by id (all digits in the example) in that space,
+        // and a duplicate-title lookup that finds nothing (`GET /rest/api/content`; the POST of
+        // the create is the op's own endpoint).
+        "confluence.page.create" => {
+            let field = |k: &str| {
+                params[k]
+                    .as_str()
+                    .ok_or(format!("example params have no string {k}"))
+            };
+            let (space, parent) = (field("space")?, field("parent")?);
+            Ok(vec![
+                Aux {
+                    path: format!("/rest/api/space/{space}"),
+                    body: json!({"key": space, "name": space, "type": "global"}),
+                },
+                Aux {
+                    path: content_path(parent),
+                    body: json!({"id": parent, "type": "page", "status": "current",
+                                 "title": "Parent", "space": {"key": space}, "ancestors": []}),
+                },
+                Aux {
+                    path: "/rest/api/content".to_owned(),
+                    body: json!({"results": [], "start": 0, "limit": 1, "size": 0}),
+                },
+            ])
+        }
         other => Err(format!(
             "{other}: no X-09 mount rule in common::confluence::aux_gets (a new op needs its GETs decided)"
         )),
