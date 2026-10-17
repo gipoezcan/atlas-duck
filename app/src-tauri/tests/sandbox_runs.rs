@@ -404,7 +404,7 @@ mod s10 {
 
     /// Sends one `probe.run`, closes stdin and returns the worker's answer; `None` if the worker
     /// ended without one.
-    fn ask(
+    pub(super) fn ask(
         p: &mut dyn WorkerProcess,
         probe: ProbeId,
         handle_value: Option<u64>,

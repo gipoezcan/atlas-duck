@@ -551,7 +551,7 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # M8 plan Task 6 (and Tasks 8-11 later): the real worker through the platform spawner,
+      # M8 plan Task 6 (Tasks 8-11 added; later tasks follow): the real worker through the platform spawner,
       # split into pipes, kill handle and reaper (app/src-tauri/tests/sandbox_runs.rs). Same rules
       # as jira_flows: ATLAS_DUCK_CLI_FLOWS=1, no "skipped:" line, pass count of at least
       # listed - #[ignore]d; the #[cfg] modules make the list (and so the minimum) per leg.
@@ -596,6 +596,9 @@ jobs:
             Windows)
               grep -E '(^|[[:space:]])M8 windows_terminate_job exit=Code\(1\)([^0-9]|$)' "$log" || { echo "::error::M8 windows_terminate_job exit=Code(1) missing"; exit 1; }
               grep -E '(^|[[:space:]])V10 windows_job_memory_limit verdict=process_mb job_message=(true|false) ' "$log" || { echo "::error::V10 windows_job_memory_limit evidence missing"; exit 1; }
+              grep -E '(^|[[:space:]])M8 windows_degraded env_names=\["SystemRoot", "TZ"\]([^[:alnum:]_]|$)' "$log" || { echo "::error::M8 windows_degraded env_names evidence missing"; exit 1; }
+              grep -E '(^|[[:space:]])M8 windows_degraded_spawner mechanism=lockdown_token applied=false integrity_rid=0x0 restricting=\["S-1-0-0"\] thread_token=none job_same_as_floor=true result=42 ' "$log" || { echo "::error::M8 windows_degraded_spawner evidence missing"; exit 1; }
+              grep -E '(^|[[:space:]])M8 windows_degraded_refused_without_accept_unconfined=true([^[:alnum:]_]|$)' "$log" || { echo "::error::M8 windows_degraded_refused evidence missing"; exit 1; }
               ;;
             macOS)
               grep -E '(^|[[:space:]])M8 macos_kill_before_reap_only exit=Signal\(9\) ' "$log" || { echo "::error::M8 macos_kill_before_reap_only exit=Signal(9) missing"; exit 1; }

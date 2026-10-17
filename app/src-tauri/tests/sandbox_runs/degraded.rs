@@ -14,11 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use atlas_duck_ipc::build_info::BUILD_ID;
-use atlas_duck_ipc::sandbox::frame::write_frame;
-use atlas_duck_ipc::sandbox::probe::{
-    LOOPBACK_PROBE_ADDR, M_PROBE_RESULT, M_PROBE_RUN, PUBLIC_PROBE_ADDR, ProbeId, ProbeOutcome,
-    ProbeRequest, ProbeResultMsg, encode_notification,
-};
+use atlas_duck_ipc::sandbox::probe::{ProbeId, ProbeOutcome};
 use atlas_duck_ipc::sandbox::script::{InstanceInfo, WorkerInit};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_sandbox_host::bridge::{
@@ -107,7 +103,11 @@ fn integrity_rid(
     let rid = unsafe {
         let sid = (*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid;
         let count = *GetSidSubAuthorityCount(sid);
-        *GetSidSubAuthority(sid, u32::from(count) - 1)
+        // A label SID always has its RID; an empty one is no label.
+        let last = u32::from(count)
+            .checked_sub(1)
+            .ok_or("the label SID has no sub-authority")?;
+        *GetSidSubAuthority(sid, last)
     };
     Ok(rid)
 }
@@ -130,35 +130,6 @@ fn thread_has_no_token(thread: std::os::windows::io::RawHandle) -> Result<(), St
             "OpenThreadToken failed with {other}, not ERROR_NO_TOKEN"
         )),
     }
-}
-
-/// Sends one `probe.run` for `probe`, closes stdin and returns the worker's answer.
-fn ask(
-    p: &mut dyn WorkerProcess,
-    probe: ProbeId,
-) -> Result<ProbeResultMsg, Box<dyn std::error::Error>> {
-    let request = ProbeRequest {
-        probe,
-        app_pid: std::process::id(),
-        profile_path: std::env::temp_dir().to_string_lossy().into_owned(),
-        public_addr: PUBLIC_PROBE_ADDR.to_string(),
-        loopback_addr: LOOPBACK_PROBE_ADDR.to_string(),
-        handle_value: None,
-    };
-    {
-        let mut stdin = p.stdin();
-        write_frame(&mut stdin, &encode_notification(M_PROBE_RUN, &request))?;
-        std::io::Write::flush(&mut stdin)?;
-    }
-    p.close_stdin();
-    let frame = p
-        .read_frame_timeout(WORKER_FRAME_MAX_BYTES, WAIT)?
-        .ok_or("the degraded worker ended without a probe.result")?;
-    let (method, params) = decode_notification(&frame)?;
-    if method != M_PROBE_RESULT {
-        return Err(format!("{method} instead of {M_PROBE_RESULT}").into());
-    }
-    Ok(serde_json::from_value(params)?)
 }
 
 #[test]
@@ -204,7 +175,8 @@ fn windows_degraded_spawner_runs_with_lockdown_token() -> TestResult {
     assert_eq!(job.pids, vec![p.pid()], "{job:?}");
 
     // The environment, as the worker itself lists it (names only).
-    let answer = ask(&mut p, ProbeId::EnvNames)?;
+    let answer = s10::ask(&mut p, ProbeId::EnvNames, None)?
+        .ok_or("the degraded worker ended without a probe.result")?;
     assert_eq!(answer.outcome, ProbeOutcome::Allowed, "{answer:?}");
     let mut names = answer.env_names.ok_or("EnvNames returned no names")?;
     names.sort();

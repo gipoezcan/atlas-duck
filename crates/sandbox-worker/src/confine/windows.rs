@@ -273,9 +273,6 @@ pub(super) fn apply() -> ConfinementReport {
 mod tests {
     use super::*;
 
-    /// The test process is neither an AppContainer nor in a worker job, so it
-    /// must not claim to be confined. (The AppContainer case is covered by
-    /// `probes_windows.rs`, where the host spawns the real worker.)
     /// The test thread never impersonates: dropping "the startup token" is a
     /// no-op that succeeds, and the report says that none was there.
     #[test]
@@ -289,6 +286,9 @@ mod tests {
         assert_eq!(thread_impersonates(), Ok(false));
     }
 
+    /// The test process is neither an AppContainer nor in a worker job, so it
+    /// must not claim to be confined. (The AppContainer case is covered by
+    /// `probes_windows.rs`, where the host spawns the real worker.)
     #[test]
     fn an_unconfined_process_does_not_report_applied() {
         let report = apply();

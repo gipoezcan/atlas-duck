@@ -311,6 +311,7 @@ impl DegradedSpawner {
         if unsafe { SetThreadToken(&thread_raw, tokens.startup.as_raw_handle().cast()) } == 0 {
             return Err(stage("SetThreadToken")(io::Error::last_os_error()));
         }
+        let untrusted = tokens.untrusted;
         drop(tokens);
         // SAFETY: `thread_raw` is the open handle of the suspended main thread.
         if unsafe { ResumeThread(thread_raw) } == u32::MAX {
@@ -332,7 +333,8 @@ impl DegradedSpawner {
                 return Err(e);
             }
         }
-        lower_to_untrusted(worker.process_handle()).map_err(stage("lower to untrusted"))?;
+        lower_to_untrusted(worker.process_handle(), untrusted)
+            .map_err(stage("lower to untrusted"))?;
         let state = lockdown_state(worker.process_handle(), thread_raw as RawHandle)
             .map_err(stage("read the lockdown state"))?;
         if let Err(what) = check_lockdown(&state) {
@@ -355,6 +357,8 @@ struct Tokens {
     lockdown: OwnedHandle,
     /// Impersonation, for `SetThreadToken`.
     startup: OwnedHandle,
+    /// The integrity label the lockdown plan names for after startup.
+    untrusted: &'static str,
 }
 
 impl Tokens {
@@ -370,8 +374,12 @@ impl Tokens {
         let user = token_user(&host)?;
         let groups = token_groups(&host, TokenGroups)?;
 
-        let lockdown = restricted_token(&host, &lockdown_plan(&user, &groups))?;
-        set_integrity(&lockdown, LOW_INTEGRITY)?;
+        let lockdown_plan = lockdown_plan(&user, &groups);
+        let lockdown = restricted_token(&host, &lockdown_plan)?;
+        set_integrity(&lockdown, lockdown_plan.integrity)?;
+        let untrusted = lockdown_plan.integrity_after_startup.ok_or_else(|| {
+            io::Error::other("the lockdown plan has no integrity for after startup")
+        })?;
 
         let plan = startup_plan(&user, &groups);
         let primary = restricted_token(&host, &plan)?;
@@ -394,7 +402,11 @@ impl Tokens {
         // SAFETY: `raw` is a fresh token handle owned here.
         let startup = unsafe { OwnedHandle::from_raw_handle(raw as RawHandle) };
         set_integrity(&startup, plan.integrity)?;
-        Ok(Tokens { lockdown, startup })
+        Ok(Tokens {
+            lockdown,
+            startup,
+            untrusted,
+        })
     }
 }
 
@@ -486,9 +498,9 @@ fn process_token(process: RawHandle, access: u32) -> io::Result<OwnedHandle> {
 
 /// Step 5: the worker's process token goes to untrusted integrity (lowering needs no
 /// privilege). The host's own token has the access to it: the host created it.
-fn lower_to_untrusted(process: RawHandle) -> io::Result<()> {
+fn lower_to_untrusted(process: RawHandle, label: &str) -> io::Result<()> {
     let token = process_token(process, TOKEN_ADJUST_DEFAULT | TOKEN_QUERY)?;
-    set_integrity(&token, UNTRUSTED_INTEGRITY)
+    set_integrity(&token, label)
 }
 
 /// Reads a degraded worker's token state back from the OS: `process` and `thread` are the
@@ -640,6 +652,8 @@ mod tests {
         SE_GROUP_MANDATORY,
     };
 
+    use windows_sys::Win32::Security::{TOKEN_PRIVILEGES, TokenPrivileges};
+
     use super::*;
 
     const USER: &str = "S-1-5-21-1-2-3-1001";
@@ -745,15 +759,9 @@ mod tests {
     #[test]
     fn both_tokens_build_from_the_host_token_and_read_back_as_planned() -> io::Result<()> {
         let tokens = Tokens::create()?;
-        let label = token_info(
-            &tokens.lockdown,
-            TokenIntegrityLevel,
-            std::mem::size_of::<TOKEN_MANDATORY_LABEL>(),
-        )?;
-        // SAFETY: as in `lockdown_state`.
-        let integrity =
-            sid_string(unsafe { (*label.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid })?;
-        assert_eq!(integrity, LOW_INTEGRITY);
+        assert_eq!(integrity_of(&tokens.lockdown)?, LOW_INTEGRITY);
+        // The startup token is low too: a thread may not impersonate above its process.
+        assert_eq!(integrity_of(&tokens.startup)?, LOW_INTEGRITY);
         let restricting: Vec<String> = token_groups(&tokens.lockdown, TokenRestrictedSids)?
             .into_iter()
             .map(|g| g.sid)
@@ -765,8 +773,65 @@ mod tests {
             .collect();
         assert!(startup.len() >= 2, "{startup:?}");
         assert!(!startup.contains(&NULL_SID.to_owned()), "{startup:?}");
-        // Lowering further needs no privilege.
-        set_integrity(&tokens.lockdown, UNTRUSTED_INTEGRITY)?;
+
+        // Deny-only: the user and every group but the integrity label (Chromium USER_LOCKDOWN).
+        let buf = token_info(
+            &tokens.lockdown,
+            TokenUser,
+            std::mem::size_of::<TOKEN_USER>(),
+        )?;
+        // SAFETY: on success the buffer starts with a TOKEN_USER.
+        let user_attributes = unsafe { (*buf.as_ptr().cast::<TOKEN_USER>()).User.Attributes };
+        assert_ne!(
+            user_attributes & GROUP_DENY_ONLY,
+            0,
+            "user {user_attributes:#x}"
+        );
+        for group in token_groups(&tokens.lockdown, TokenGroups)? {
+            if group.attributes & GROUP_INTEGRITY == 0 {
+                assert_ne!(group.attributes & GROUP_DENY_ONLY, 0, "{group:?}");
+            }
+        }
+        // DISABLE_MAX_PRIVILEGE: nothing but SeChangeNotify (LUID 23), on both tokens.
+        for token in [&tokens.lockdown, &tokens.startup] {
+            assert_eq!(privilege_luids(token)?, vec![SE_CHANGE_NOTIFY_LUID]);
+        }
+
+        // Lowering further needs no privilege, and the readback sees it.
+        // The label production lowers to is the plan's, and it is untrusted.
+        assert_eq!(tokens.untrusted, UNTRUSTED_INTEGRITY);
+        set_integrity(&tokens.lockdown, tokens.untrusted)?;
+        assert_eq!(integrity_of(&tokens.lockdown)?, UNTRUSTED_INTEGRITY);
         Ok(())
+    }
+
+    /// `SeChangeNotifyPrivilege`, the one privilege `DISABLE_MAX_PRIVILEGE` leaves.
+    const SE_CHANGE_NOTIFY_LUID: u32 = 23;
+
+    fn integrity_of(token: &OwnedHandle) -> io::Result<String> {
+        let label = token_info(
+            token,
+            TokenIntegrityLevel,
+            std::mem::size_of::<TOKEN_MANDATORY_LABEL>(),
+        )?;
+        // SAFETY: as in `lockdown_state`.
+        sid_string(unsafe { (*label.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid })
+    }
+
+    /// The low parts of the LUIDs of the privileges the token still has.
+    fn privilege_luids(token: &OwnedHandle) -> io::Result<Vec<u32>> {
+        let buf = token_info(
+            token,
+            TokenPrivileges,
+            std::mem::size_of::<TOKEN_PRIVILEGES>(),
+        )?;
+        // SAFETY: the buffer is at least one TOKEN_PRIVILEGES long and, on success, starts with
+        // one followed by `PrivilegeCount` entries.
+        let head = unsafe { &*buf.as_ptr().cast::<TOKEN_PRIVILEGES>() };
+        let first = head.Privileges.as_ptr();
+        Ok((0..head.PrivilegeCount as usize)
+            // SAFETY: `PrivilegeCount` entries follow inside the buffer.
+            .map(|i| unsafe { (*first.add(i)).Luid.LowPart })
+            .collect())
     }
 }
