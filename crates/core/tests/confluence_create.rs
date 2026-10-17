@@ -1124,6 +1124,43 @@ async fn parent_by_title_resolves_to_id() -> TestResult {
     Ok(())
 }
 
+/// The one value enrichment rewrites reaches the wire: a space given as `doc` that the server
+/// names `DOC` is looked up and sent as `DOC` (the card shows the same key).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolved_space_key_is_what_is_sent() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    create_server(mock).await;
+    mount_space(mock, "doc", &space_answer(SPACE)).await;
+    let mut p = params("Hello.", Some(PARENT_TITLE));
+    p["space"] = json!("doc");
+    let id = queued(&h, p).await?;
+    let preview = opened(&h, &id)?;
+    match &preview.body {
+        PreviewBody::ContentWrite { sentence, .. } => {
+            assert!(sentence.contains("(DOC)"), "{sentence}");
+        }
+        other => return Err(format!("not a content-write card: {other:?}").into()),
+    }
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    assert_eq!(sent_post(mock).await?["space"], json!({"key": SPACE}));
+    let lookups: Vec<String> = mock
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == mock.path("/rest/api/content"))
+        .filter_map(|r| r.url.query().map(str::to_owned))
+        .collect();
+    assert_eq!(lookups.len(), 2, "the parent and the duplicate lookup");
+    assert!(
+        lookups.iter().all(|q| q.contains("spaceKey=DOC&")),
+        "{lookups:?}"
+    );
+    Ok(())
+}
+
 /// A space the server does not know (JSON 404) holds the write as an enrichment error; an
 /// answer for another key is no match (`UnresolvedName {param: space}`, "no space '<v>'").
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
