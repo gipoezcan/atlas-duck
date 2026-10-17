@@ -1302,6 +1302,11 @@ pub(crate) fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     if sent_parent.is_some() && parent.is_none() {
         return model;
     }
+    // The space name is shown only for the key it was resolved for (the executor sends the
+    // server's spelling, so they are equal), and the card says "page" only for a page.
+    if facts.space_key != key || sent.get("type").and_then(Value::as_str) != Some("page") {
+        return model;
+    }
 
     let mut hidden = 0u64;
     let (body_html, notes) = render_storage(

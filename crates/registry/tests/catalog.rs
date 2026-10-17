@@ -487,7 +487,7 @@ fn parent_schema_accepts_id_and_title() {
     }
     assert_eq!(
         spec.params_schema_json()["properties"]["parent"]["description"],
-        "Parent page id or title (same space)."
+        "Parent page id or title (same space); a value of digits only is always a page id."
     );
 }
 

@@ -238,7 +238,7 @@ fn page_create_plan_stages() -> TestResult {
         ]
     );
 
-    // A parent title: the lookup by title in the resolved space, at most two answers.
+    // A parent title: the lookup by title in the resolved space, current pages, at most fifty.
     let p = params("Hello.", Some(PARENT_TITLE));
     let (rounds, v) = staged(
         &p,
@@ -260,8 +260,9 @@ fn page_create_plan_stages() -> TestResult {
             ("spaceKey", SPACE),
             ("title", PARENT_TITLE),
             ("type", "page"),
+            ("status", "current"),
             ("expand", "space,ancestors"),
-            ("limit", "2")
+            ("limit", "50")
         ]
     );
     assert_eq!(v.resolved.get("parent_id"), Some(&json!(PARENT_ID)));
@@ -376,6 +377,20 @@ fn parent_resolution_holds_what_it_cannot_pin() -> TestResult {
     let mut trashed = page(PARENT_ID, PARENT_TITLE, SPACE);
     trashed["status"] = json!("trashed");
     assert_eq!(judge(PARENT_ID, trashed)?.hold, Hold::UnresolvedName);
+    // T16 review m-8: a page without a `status` is not current, by id as by title.
+    let mut no_status = page(PARENT_ID, PARENT_TITLE, SPACE);
+    no_status
+        .as_object_mut()
+        .ok_or("not an object")?
+        .remove("status");
+    assert_eq!(
+        unresolved_of(&judge(PARENT_ID, no_status.clone())?),
+        Some(("parent", PARENT_ID, 0, Vec::new()))
+    );
+    assert_eq!(
+        unresolved_of(&judge(PARENT_TITLE, lookup(&[no_status]))?),
+        Some(("parent", PARENT_TITLE, 0, Vec::new()))
+    );
     // The space matches case-insensitively, as the stage-1 key does.
     assert_eq!(
         judge(PARENT_ID, page(PARENT_ID, PARENT_TITLE, "doc"))?.hold,
@@ -386,8 +401,49 @@ fn parent_resolution_holds_what_it_cannot_pin() -> TestResult {
     numeric["id"] = json!(123_400);
     assert_eq!(judge(PARENT_ID, numeric)?.hold, Hold::Preview);
 
+    // T16 review m-4: the match count is the real one and the candidates stop at ten.
+    let twelve: Vec<Value> = (1..=12)
+        .map(|i| page(&i.to_string(), PARENT_TITLE, SPACE))
+        .collect();
+    let v = judge(PARENT_TITLE, lookup(&twelve))?;
+    let (_, _, n, candidates) = unresolved_of(&v).ok_or("not unresolved")?;
+    assert_eq!((n, candidates.len()), (12, 10));
+    // A full lookup page (the limit, 50) that pins no match is held: a current page titled
+    // like the value may lie beyond it. One short of the limit resolves.
+    let blogs = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| {
+                let mut b = page(&format!("{}", 500 + i), PARENT_TITLE, SPACE);
+                b["type"] = json!("blogpost");
+                b
+            })
+            .collect()
+    };
+    let mut full = blogs(49);
+    full.push(page(PARENT_ID, PARENT_TITLE, SPACE));
+    assert_eq!(
+        judge(PARENT_TITLE, lookup(&full))?.hold,
+        Hold::EnrichmentError
+    );
+    let mut short = blogs(48);
+    short.push(page(PARENT_ID, PARENT_TITLE, SPACE));
+    assert_eq!(judge(PARENT_TITLE, lookup(&short))?.hold, Hold::Preview);
+
     // Malformed answers fail closed (enrichment error): another id, no space, no title, no
-    // results array.
+    // results array, ancestors that are not an array of entries with page ids (T16 review m-5:
+    // `page.move`'s cycle check reads them).
+    let with_ancestors = |a: Value| -> Result<Value, TestError> {
+        let mut p = page(PARENT_ID, PARENT_TITLE, SPACE);
+        match a {
+            Value::Null => {
+                p.as_object_mut()
+                    .ok_or("not an object")?
+                    .remove("ancestors");
+            }
+            a => p["ancestors"] = a,
+        }
+        Ok(p)
+    };
     let mut wrong_id = page(PARENT_ID, PARENT_TITLE, SPACE);
     wrong_id["id"] = json!("999");
     let mut no_space = page(PARENT_ID, PARENT_TITLE, SPACE);
@@ -406,6 +462,27 @@ fn parent_resolution_holds_what_it_cannot_pin() -> TestResult {
         ("no title", PARENT_ID, no_title),
         ("no results", PARENT_TITLE, json!({"size": 0})),
         ("a result without space", PARENT_TITLE, lookup(&[no_space])),
+        ("no ancestors", PARENT_ID, with_ancestors(Value::Null)?),
+        (
+            "ancestors not a list",
+            PARENT_ID,
+            with_ancestors(json!({}))?,
+        ),
+        (
+            "an ancestor without id",
+            PARENT_ID,
+            with_ancestors(json!([{"id": "65536", "title": "Home"}, {"title": "Mid"}]))?,
+        ),
+        (
+            "an ancestor id that is no page id",
+            PARENT_ID,
+            with_ancestors(json!([{"id": "x1", "title": "Home"}]))?,
+        ),
+        (
+            "a title match with an ancestor without id",
+            PARENT_TITLE,
+            lookup(&[with_ancestors(json!([{"title": "Home"}]))?]),
+        ),
     ] {
         let v = judge(parent, answer)?;
         assert_eq!(v.hold, Hold::EnrichmentError, "{what}");
@@ -719,6 +796,38 @@ fn page_create_card_reads_the_sent_request() -> TestResult {
         "{:?}",
         c.html
     );
+
+    // T16 review m-1: a request whose parent, space key or type is not what enrichment resolved
+    // never gets the named card (it would put the resolved names over other bytes).
+    let generic = |p: &Value, v: &EnrichVerdict, edit: &dyn Fn(&mut Value)| -> TestResult {
+        let mut reqs = requests(p, v)?;
+        let mut body = sent(&reqs)?;
+        edit(&mut body);
+        if let Some(r) = reqs.first_mut() {
+            r.body = serde_json::to_vec(&body)?;
+        }
+        let m = preview_of(p, v, &reqs)?;
+        assert!(
+            !matches!(m.body, PreviewBody::ContentWrite { .. }),
+            "{body}: {:?}",
+            m.body
+        );
+        Ok(())
+    };
+    let with_parent = params("x", Some(PARENT_ID));
+    let resolved_parent = staged(&with_parent, &by_id_answers())?.1;
+    card(&preview_of(
+        &with_parent,
+        &resolved_parent,
+        &requests(&with_parent, &resolved_parent)?,
+    )?)?;
+    generic(&with_parent, &resolved_parent, &|b| {
+        b["ancestors"] = json!([{"id": "999"}]);
+    })?;
+    generic(&p, &v, &|b| b["ancestors"] = json!([{"id": PARENT_ID}]))?;
+    generic(&p, &v, &|b| b["space"]["key"] = json!("OPS"))?;
+    generic(&p, &v, &|b| b["space"]["key"] = json!("doc"))?;
+    generic(&p, &v, &|b| b["type"] = json!("blogpost"))?;
     Ok(())
 }
 
@@ -768,16 +877,52 @@ fn page_create_card_counts_what_it_hides() -> TestResult {
     Ok(())
 }
 
+/// T16 review m-2: only a Preview verdict gives the named card, even with the very requests a
+/// Preview would show (a stale or identity-mismatch view keeps the generic body).
 #[test]
 fn page_create_card_keeps_the_generic_body_without_a_verdict() -> TestResult {
     let p = params("x", None);
-    let mut held = staged(&p, &[space_answer(SPACE), lookup(&[])])?.1;
-    held.hold = Hold::EnrichmentError;
-    let m = preview_of(&p, &held, &[])?;
+    let v = staged(&p, &[space_answer(SPACE), lookup(&[])])?.1;
+    let reqs = requests(&p, &v)?;
+    card(&preview_of(&p, &v, &reqs)?)?;
+    for hold in [
+        Hold::EnrichmentError,
+        Hold::Collision,
+        Hold::UnresolvedName,
+        Hold::Conflict,
+        Hold::IdentityMismatch,
+    ] {
+        let mut held = v.clone();
+        held.hold = hold;
+        let m = preview_of(&p, &held, &reqs)?;
+        assert!(
+            !matches!(m.body, PreviewBody::ContentWrite { .. }),
+            "{hold:?}: {:?}",
+            m.body
+        );
+    }
+    let m = preview_of(&p, &v, &[])?;
     assert!(
         !matches!(m.body, PreviewBody::ContentWrite { .. }),
         "{:?}",
         m.body
+    );
+    Ok(())
+}
+
+/// T16 review m-7 (as T18 M-4): a storage body with a macro the converter does not know raises
+/// the `unknown_macros` Info on the create card.
+#[test]
+fn page_create_card_says_unknown_macros() -> TestResult {
+    let mut p = params("<p>a</p><ac:structured-macro ac:name=\"made-up\"/>", None);
+    p["body_format"] = json!("storage");
+    let v = staged(&p, &[space_answer(SPACE), lookup(&[])])?.1;
+    let m = preview_of(&p, &v, &requests(&p, &v)?)?;
+    assert_eq!(card(&m)?.constructs.macros, ["made-up"]);
+    assert!(
+        m.warnings.iter().any(|w| w.id == WarningId::UnknownMacros),
+        "{:?}",
+        m.warnings
     );
     Ok(())
 }
@@ -815,6 +960,12 @@ fn created() -> Value {
 /// The server side of a create in `DOC`: the identity call, the space, the parent by id and by
 /// title, no page titled `TITLE` yet, and the answer of the POST.
 async fn create_server(mock: &MockDc) {
+    create_reads(mock).await;
+    mount_post(mock, 200, &created()).await;
+}
+
+/// Everything `create_server` mounts but the POST.
+async fn create_reads(mock: &MockDc) {
     mock.confluence_user_current(UserKind::Known, TEST_USER, TEST_USER_KEY)
         .await;
     mount_space(mock, SPACE, &space_answer(SPACE)).await;
@@ -827,7 +978,6 @@ async fn create_server(mock: &MockDc) {
     )
     .await;
     mount_title_lookup(mock, SPACE, TITLE, &[]).await;
-    mount_post(mock, 200, &created()).await;
 }
 
 async fn mount_post(mock: &MockDc, status: u16, body: &Value) {
@@ -1106,7 +1256,7 @@ async fn parent_by_title_resolves_to_id() -> TestResult {
     assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
     let sent = sent_post(mock).await?;
     assert_eq!(sent["ancestors"], json!([{"id": PARENT_ID}]));
-    // The lookup asked within the space, for pages only, at most two.
+    // The lookup asked within the space, for current pages only, at most fifty.
     let lookups: Vec<String> = mock
         .received()
         .await
@@ -1118,7 +1268,8 @@ async fn parent_by_title_resolves_to_id() -> TestResult {
         lookups.iter().any(|q| q.contains("title=Release+notes")
             && q.contains("spaceKey=DOC")
             && q.contains("type=page")
-            && q.contains("limit=2")),
+            && q.contains("status=current")
+            && q.contains("limit=50")),
         "{lookups:?}"
     );
     Ok(())
@@ -1247,6 +1398,37 @@ async fn duplicate_title_caution_approve_enabled() -> TestResult {
     let env = h.await_(&id, 10_000).await;
     assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
     assert_eq!(code(&env), "upstream_http");
+    let types = h.event_types(&id).await?;
+    assert!(types.contains(&EventType::WRITE_FAILED), "{types:?}");
+    assert!(!types.contains(&EventType::WRITE_STALE), "{types:?}");
+    assert_eq!(posts(mock).await.len(), 1, "one POST, no retry");
+    Ok(())
+}
+
+/// Lead ruling (T16): should DC refuse a duplicate title with a 409 (the race after the check),
+/// the POST is no optimistic-lock conflict: `WRITE_FAILED` with the server's message, never
+/// `WRITE_STALE` back to the queue (V06/T25 confirm which status real DC sends).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_post_409_is_write_failed_not_conflict() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    create_reads(mock).await;
+    let message = "A page with this title already exists: A page already exists with the title Release 1.5 notes in the space with key DOC";
+    let refusal = json!({
+        "statusCode": 409,
+        "data": {"authorized": false, "valid": true, "errors": [], "successful": false},
+        "message": message,
+    });
+    mount_post(mock, 409, &refusal).await;
+    let id = queued(&h, params("x", None)).await?;
+    let p = opened(&h, &id)?;
+    assert!(p.approvable, "{:?}", p.body);
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "upstream_http");
+    assert_eq!(detail(&env, "status"), json!(409));
+    assert_eq!(detail(&env, "error_messages"), json!(message));
     let types = h.event_types(&id).await?;
     assert!(types.contains(&EventType::WRITE_FAILED), "{types:?}");
     assert!(!types.contains(&EventType::WRITE_STALE), "{types:?}");

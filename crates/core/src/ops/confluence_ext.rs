@@ -35,6 +35,10 @@ const CONTENT_LOOKUP_PATH: &str = "/rest/api/content";
 /// ancestors give the card's path (and `page.move` its cycle check).
 const PARENT_EXPAND: &str = "space,ancestors";
 
+/// `limit` of the parent lookup by title (T16 review m-4): enough for a real match count and the
+/// [`MAX_CANDIDATES`] cap; a full page that pins no match is held (a match may lie beyond it).
+const PARENT_LOOKUP_LIMIT: usize = 50;
+
 /// PD-105: stage 1 resolves the space by its key (`resolve`); stage 2, only with `parent`, the
 /// parent page within that space ([`parent_call`], `resolve`); stage 3 looks for a page of the
 /// same title in the space (`enrich`, the duplicate-title Caution). An unresolved space or parent
@@ -77,13 +81,14 @@ fn space_key_of(v: &Value) -> Option<&str> {
 }
 
 /// PD-105 stage 2: the GET that resolves the `parent` param within the space `space_key` (the
-/// key the space answer named): an all-digit value by id, any other by title (at most two
-/// answers: one resolves, two are ambiguous). `None` without a `parent`.
+/// key the space answer named): an all-digit value by id, any other by title (current pages, at
+/// most [`PARENT_LOOKUP_LIMIT`]: one resolves, more are ambiguous). `None` without a `parent`.
 pub(crate) fn parent_call(params: &Value, space_key: &str) -> Option<(EnrichPurpose, GetCall)> {
     let parent = parent_param(params)?;
     let call = if is_page_id(parent) {
         get_call(PARENT_PATH, params, &[("expand", PARENT_EXPAND)])
     } else {
+        let limit = PARENT_LOOKUP_LIMIT.to_string();
         get_call(
             CONTENT_LOOKUP_PATH,
             params,
@@ -91,8 +96,9 @@ pub(crate) fn parent_call(params: &Value, space_key: &str) -> Option<(EnrichPurp
                 ("spaceKey", space_key),
                 ("title", parent),
                 ("type", "page"),
+                ("status", "current"),
                 ("expand", PARENT_EXPAND),
-                ("limit", "2"),
+                ("limit", limit.as_str()),
             ],
         )
     };
@@ -103,13 +109,16 @@ pub(crate) fn parent_call(params: &Value, space_key: &str) -> Option<(EnrichPurp
 /// [`parent_call`]; otherwise the verdict that holds the write. Never a guess:
 /// - by id: the answer must be that id; a page that is not `current`, not a `page` or in another
 ///   space is no match ("no page '<v>' in space <KEY>");
-/// - by title: only `current` pages of the answer count; none, or one whose title is not exactly
-///   the value, is no match (its title the candidate); two or more are ambiguous (the candidates
-///   are their titles); the one match must be in the space too.
+/// - by title: only `current` pages of the answer count (the query asks for them; the filter is a
+///   backstop); none, or one whose title is not exactly the value, is no match (its title the
+///   candidate); two or more are ambiguous (the count is theirs, the candidates their titles, at
+///   most [`MAX_CANDIDATES`]); the one match must be in the space too.
 ///
-/// An answer that lacks what the rule reads (the id, the space, the title, `results`) fails
-/// closed (`unusable`, an "enrichment failed" hold). A JSON 404 never reaches here: the engine
-/// holds a non-2xx enrichment answer before the judge.
+/// A page without a `status` is not current (T16 review m-8). An answer that lacks what the rule
+/// reads (the id, the space, the title, `results`, an `ancestors` array whose entries all carry a
+/// page id: `page.move`'s cycle check reads them), or a full lookup page that pins no match,
+/// fails closed (`unusable`, an "enrichment failed" hold). A JSON 404 never reaches here: the
+/// engine holds a non-2xx enrichment answer before the judge.
 pub(crate) fn resolve_parent(
     params: &Value,
     space_key: &str,
@@ -117,9 +126,8 @@ pub(crate) fn resolve_parent(
 ) -> Result<Parent, Box<EnrichVerdict>> {
     let value = str_param(params, "parent");
     let no_match = |candidates: Vec<String>| Box::new(unresolved("parent", value, 0, candidates));
-    let is_current_page = |p: &Value| {
-        text_of(p, "type") == Some("page") && text_of(p, "status").is_none_or(|s| s == "current")
-    };
+    let is_current_page =
+        |p: &Value| text_of(p, "type") == Some("page") && text_of(p, "status") == Some("current");
     let found = if is_page_id(value) {
         if id_text(answer.get("id")).as_deref() != Some(value) {
             return Err(Box::new(EnrichVerdict::unusable()));
@@ -133,6 +141,9 @@ pub(crate) fn resolve_parent(
             return Err(Box::new(EnrichVerdict::unusable()));
         };
         let pages: Vec<&Value> = results.iter().filter(|p| is_current_page(p)).collect();
+        if results.len() >= PARENT_LOOKUP_LIMIT && pages.len() < 2 {
+            return Err(Box::new(EnrichVerdict::unusable()));
+        }
         let titles = |pages: &[&Value]| -> Vec<String> {
             pages
                 .iter()
@@ -160,16 +171,19 @@ pub(crate) fn resolve_parent(
     if !key.eq_ignore_ascii_case(space_key) {
         return Err(no_match(Vec::new()));
     }
-    let ancestors = found
-        .get("ancestors")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|a| PageRef {
-            id: id_text(a.get("id")).unwrap_or_default(),
-            title: text_of(a, "title").map(capped).unwrap_or_default(),
+    let Some(ancestors) = found.get("ancestors").and_then(Value::as_array) else {
+        return Err(Box::new(EnrichVerdict::unusable()));
+    };
+    let ancestors = ancestors
+        .iter()
+        .map(|a| {
+            Some(PageRef {
+                id: id_text(a.get("id")).filter(|id| is_page_id(id))?,
+                title: text_of(a, "title").map(capped).unwrap_or_default(),
+            })
         })
-        .collect();
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Box::new(EnrichVerdict::unusable()))?;
     Ok(Parent {
         id,
         title: title.to_owned(),
