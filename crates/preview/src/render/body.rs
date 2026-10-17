@@ -5,7 +5,7 @@ use crate::diff::{DiffLine, DiffOp};
 use crate::json_tree::JsonNode;
 use crate::model::{
     BodyView, CommentView, ConstructList, FieldRow, IssueCard, OutcomeKind, PreviewBody,
-    RequestView,
+    ProvenanceRow, RequestView, ScriptItemKind,
 };
 use crate::warning;
 
@@ -364,9 +364,40 @@ pub(super) fn body(doc: &mut Doc, body: &PreviewBody) {
             doc.close("section");
             requests_section(doc, "Requests to be sent", requests);
         }
-        // Task 18 renders the script sections (source, host calls, atlas.log, stderr); until
-        // then only the candidate view shows, through its own arm.
-        PreviewBody::Script { view, .. } => self::body(doc, view),
+        PreviewBody::Script {
+            item,
+            view,
+            source,
+            provenance,
+            logs,
+            logs_note,
+            stderr,
+        } => {
+            section(doc, script_item_heading(*item));
+            self::body(doc, view);
+            doc.close("section");
+            script_source(doc, source);
+            host_calls(doc, provenance);
+            section(doc, "atlas.log");
+            raw_list(doc, logs, "lines");
+            if let Some(note) = logs_note {
+                doc.open("div");
+                doc.raw_text(note);
+                doc.close("div");
+            }
+            doc.close("section");
+            section(doc, "stderr");
+            if stderr.is_empty() {
+                doc.el("p", "none");
+            } else {
+                doc.open("pre");
+                doc.open("code");
+                doc.raw_text(stderr);
+                doc.close("code");
+                doc.close("pre");
+            }
+            doc.close("section");
+        }
     }
 }
 
@@ -857,5 +888,136 @@ fn jira_issue(
         doc.close("div");
         doc.html(&c.body_html);
         doc.close("section");
+    }
+}
+
+// ---- scripts (§6.3 Script result / Script error details, M8 T18) ------------------------------
+
+/// §6.3 row names: the heading of the section the candidate view sits in.
+fn script_item_heading(item: ScriptItemKind) -> &'static str {
+    match item {
+        ScriptItemKind::Result => "Script result",
+        ScriptItemKind::ErrorDetails => "Script error details",
+    }
+}
+
+/// The script source, one table row per line (`\n`-terminated), numbered from 1: the number in
+/// the first cell, the line (without its `\n`) in a `<pre>` as a raw value (PD-69: a CR and
+/// trailing spaces and tabs are marked; tabs inside a line stay). At most [`DOC_MAX_DIFF_LINES`]
+/// lines.
+fn script_source(doc: &mut Doc, source: &str) {
+    section(doc, "Script source");
+    if source.is_empty() {
+        doc.el("p", "none");
+        doc.close("section");
+        return;
+    }
+    doc.open("table");
+    doc.open("tbody");
+    // Bytes of `source` shown so far; the rest is left out when a cap stops the loop.
+    let mut at = 0;
+    for (i, line) in source.split_inclusive('\n').enumerate() {
+        if i >= DOC_MAX_DIFF_LINES || doc.full() {
+            break;
+        }
+        doc.open("tr");
+        doc.el("td", &(i + 1).to_string());
+        doc.open("td");
+        doc.open("pre");
+        doc.raw_text(line.strip_suffix('\n').unwrap_or(line));
+        doc.close("pre");
+        doc.close("td");
+        doc.close("tr");
+        at += line.len();
+    }
+    doc.close("tbody");
+    doc.close("table");
+    let rest = &source[at..];
+    if !rest.is_empty() {
+        doc.hide(len_u64(rest.len()));
+        more_note(doc, rest.split_inclusive('\n').count(), "lines");
+    }
+    doc.close("section");
+}
+
+/// PD-145 provenance: one row per host call, every field a raw string of the request (never of a
+/// response). At most [`DOC_MAX_ROWS`] rows.
+fn host_calls(doc: &mut Doc, rows: &[ProvenanceRow]) {
+    section(doc, "Host calls");
+    if rows.is_empty() {
+        doc.el("p", "none");
+        doc.close("section");
+        return;
+    }
+    doc.open("table");
+    doc.open("thead");
+    doc.open("tr");
+    for label in ["call", "operation", "instance", "target", "outcome"] {
+        doc.el("th", label);
+    }
+    doc.close("tr");
+    doc.close("thead");
+    doc.open("tbody");
+    let mut left_out = None;
+    for (i, r) in rows.iter().enumerate() {
+        if i >= DOC_MAX_ROWS || doc.full() {
+            left_out = Some(i);
+            break;
+        }
+        doc.open("tr");
+        doc.el("td", &r.call_id.to_string());
+        doc.open("td");
+        doc.raw_code_text(&r.op_id);
+        doc.close("td");
+        doc.open("td");
+        doc.raw_text(&r.instance);
+        doc.close("td");
+        doc.open("td");
+        doc.raw_text(&r.target_display);
+        doc.close("td");
+        doc.open("td");
+        doc.raw_code_text(&r.outcome);
+        doc.close("td");
+        doc.close("tr");
+    }
+    doc.close("tbody");
+    doc.close("table");
+    if let Some(i) = left_out {
+        let rest = &rows[i..];
+        doc.hide(
+            rest.iter()
+                .map(|r| {
+                    len_u64(
+                        r.op_id.len() + r.instance.len() + r.target_display.len() + r.outcome.len(),
+                    )
+                })
+                .sum(),
+        );
+        more_note(doc, rest.len(), "rows");
+    }
+    doc.close("section");
+}
+
+/// A `<ul>` of raw texts (display-escaped here), at most [`DOC_MAX_ROWS`]; `none` when empty.
+fn raw_list(doc: &mut Doc, items: &[String], unit: &str) {
+    if items.is_empty() {
+        doc.el("p", "none");
+        return;
+    }
+    doc.open("ul");
+    let mut left_out = None;
+    for (i, item) in items.iter().enumerate() {
+        if i >= DOC_MAX_ROWS || doc.full() {
+            left_out = Some(i);
+            break;
+        }
+        doc.open("li");
+        doc.raw_text(item);
+        doc.close("li");
+    }
+    doc.close("ul");
+    if let Some(i) = left_out {
+        doc.hide(strings_len(&items[i..]));
+        more_note(doc, items.len() - i, unit);
     }
 }

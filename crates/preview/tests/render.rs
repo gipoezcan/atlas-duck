@@ -16,7 +16,8 @@ use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
     BodyView, CandidateRev, CommentView, ConstructList, FieldRow, IssueCard, ItemCount,
     OutcomeKind, PREVIEW_BUILDER_VERSION, PREVIEW_CSS, PREVIEW_CSS_HASH, Platform, Preview,
-    PreviewBody, PreviewHeader, RENDER_VERSIONS, RawPager, RequestView, json_tree, sanitize_html,
+    PreviewBody, PreviewHeader, ProvenanceRow, RENDER_VERSIONS, RawPager, RequestView,
+    ScriptItemKind, json_tree, sanitize_html,
 };
 use proptest::prelude::*;
 use serde_json::json;
@@ -102,7 +103,7 @@ fn edit_lines() -> Vec<DiffLine> {
     lines
 }
 
-/// One preview per `PreviewBody` variant (13), each with strings that exercise escaping.
+/// One preview per `PreviewBody` variant (14), each with strings that exercise escaping.
 fn variants() -> Vec<(&'static str, Preview)> {
     let tree = json_tree(&json!({
         "key": "PROJ-1",
@@ -317,7 +318,78 @@ fn variants() -> Vec<(&'static str, Preview)> {
                 Vec::new(),
             ),
         ),
+        ("script_result", script_preview(ScriptItemKind::Result)),
     ]
+}
+
+/// The source of the script fixtures: a tab inside a line, a trailing space before `\r\n`, a
+/// markup-looking string, no final newline.
+const SCRIPT_SOURCE: &str = "const r = atlas.call(\"jira.search\", {jql: \"project = PROJ\"});\n\
+                             \tif (r.total > 0) {\n\
+                             \x20 atlas.log(\"<b>found</b>\"); \r\n\
+                             }\n\
+                             return r;";
+
+/// A script release item as core builds it (M8 T17): the candidate view (the JSON tree of the
+/// result, or of `{script_error}`), then the raw source, host calls, logs and stderr.
+fn script_preview(item: ScriptItemKind) -> Preview {
+    let candidate = match item {
+        ScriptItemKind::Result => json!({ "count": 1, "keys": ["PROJ-1"] }),
+        ScriptItemKind::ErrorDetails => json!({ "script_error": {
+            "class": "TypeError",
+            "message": "cannot read property 'key' of undefined",
+            "stack": "    at main (script.js:3:12)\n    at <anonymous>",
+            "elapsed": 412,
+            "logs": ["fetched 0 issues"],
+        }}),
+    };
+    let mut p = preview(
+        "script",
+        PreviewBody::Script {
+            item,
+            view: Box::new(PreviewBody::JsonTree {
+                tree: json_tree(&candidate),
+            }),
+            source: SCRIPT_SOURCE.into(),
+            provenance: vec![
+                ProvenanceRow {
+                    call_id: 1,
+                    op_id: "jira.search".into(),
+                    instance: "jira-main".into(),
+                    target_display: "project = PROJ".into(),
+                    outcome: "ok".into(),
+                },
+                ProvenanceRow {
+                    call_id: 2,
+                    op_id: "jira.issue.get".into(),
+                    instance: "jira-main".into(),
+                    target_display: "PROJ-1".into(),
+                    outcome: "rejected:upstream_http".into(),
+                },
+            ],
+            logs: vec!["fetched 0 issues".into(), "two  spaces".into()],
+            logs_note: (item == ScriptItemKind::ErrorDetails).then(|| {
+                "output was cut at its size bound; the audit record keeps the full text".into()
+            }),
+            stderr: "warning: deprecated\n".into(),
+        },
+        vec![Warning::new(
+            WarningId::HostCallsLossy,
+            warning::host_calls_lossy(1),
+        )],
+    );
+    p.header.instance_alias = String::new();
+    p.header.op_id = "script.run".into();
+    p.header.fields_included = Vec::new();
+    p
+}
+
+/// The part of `d` from `<h2>{title}</h2>` up to the end of its section (the next `</section>`).
+fn script_section<'a>(d: &'a str, title: &str) -> &'a str {
+    let open = format!("<h2>{title}</h2>");
+    let at = d.find(&open).unwrap_or(d.len());
+    let end = d[at..].find("</section>").map_or(d.len(), |i| at + i);
+    &d[at..end]
 }
 
 /// The header and both warning levels at once: every header row, the release-blocked banner, a
@@ -386,7 +458,11 @@ fn text_outside_tags(html: &str) -> String {
 #[test]
 fn goldens_every_body_variant_and_the_header() -> TestResult {
     let mut all = variants();
-    assert_eq!(all.len(), 13, "one golden per PreviewBody variant");
+    assert_eq!(all.len(), 14, "one golden per PreviewBody variant");
+    all.push((
+        "script_error_details",
+        script_preview(ScriptItemKind::ErrorDetails),
+    ));
     all.push(("header_and_strip", header_and_strip()));
     let update = std::env::var_os("UPDATE_GOLDENS").is_some();
     let dir = golden_dir();
@@ -435,7 +511,10 @@ fn goldens_have_no_class_or_style_attribute() -> TestResult {
         }
         n += 1;
     }
-    assert_eq!(n, 14, "13 variants + the header golden");
+    assert_eq!(
+        n, 16,
+        "14 variants + the script error details + the header golden"
+    );
     Ok(())
 }
 
@@ -779,13 +858,35 @@ fn arbitrary_preview(kind: usize, s: &[String]) -> Preview {
             raw_only_changes: 1,
             requests: vec![req(3)],
         },
-        _ => PreviewBody::Transition {
+        12 => PreviewBody::Transition {
             transition: e(0),
             from: e(1),
             to: e(2),
             fields: vec![(e(3), e(4))],
             constructs: Some(constructs(5)),
             requests: vec![req(4)],
+        },
+        // M8 T18: the script item; source, provenance, logs and stderr are raw (T17).
+        _ => PreviewBody::Script {
+            item: if r(0).len().is_multiple_of(2) {
+                ScriptItemKind::Result
+            } else {
+                ScriptItemKind::ErrorDetails
+            },
+            view: Box::new(PreviewBody::JsonTree {
+                tree: json_tree(&json!({ r(0): [r(1), { "script_error": r(2) }] })),
+            }),
+            source: format!("{}\n{}\r\n{}", r(2), r(3), r(4)),
+            provenance: vec![ProvenanceRow {
+                call_id: 7,
+                op_id: r(4),
+                instance: r(5),
+                target_display: r(6),
+                outcome: r(7),
+            }],
+            logs: vec![r(8), r(9)],
+            logs_note: Some(r(10)),
+            stderr: r(11),
         },
     };
     let mut p = preview(
@@ -809,7 +910,7 @@ proptest! {
 
     #[test]
     fn s06_document_has_no_active_content(
-        kind in 0usize..13,
+        kind in 0usize..14,
         strings in prop::collection::vec(text(), 12),
         windows in any::<bool>(),
     ) {
@@ -1553,4 +1654,392 @@ fn literal_escape_text_is_never_a_marked_escape() {
         ),
         "{d}"
     );
+}
+
+// ---- M8 T18: script items (§6.3 Script result / Script error details, Δ5) ---------------------
+
+/// The "hidden in preview" bytes of the document `d`.
+fn hidden_bytes(d: &str) -> u64 {
+    let label = "<tr><th>hidden in preview</th><td>";
+    let at = d.find(label).map_or(0, |i| i + label.len());
+    d[at..]
+        .split(' ')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+fn set_script(p: &mut Preview, f: impl FnOnce(&mut PreviewBody, &mut Vec<ProvenanceRow>)) {
+    let mut body = p.body.clone();
+    if let PreviewBody::Script {
+        view, provenance, ..
+    } = &mut body
+    {
+        f(view, provenance);
+    }
+    p.body = body;
+}
+
+#[test]
+fn script_result_document_table_and_tree() {
+    let p = script_preview(ScriptItemKind::Result);
+    let d = doc(&p);
+    assert_inert(&d, Platform::MacOsLinux);
+    // The item heading leads the body; the candidate view (the tree) is inside it.
+    assert!(
+        d.contains(
+            "</header><section><h2>Script result</h2><section><h2>Result (JSON tree)</h2>\
+             <ul><li>object, 2 keys"
+        ),
+        "{d}"
+    );
+    assert!(
+        d.contains("<li><code><bdi>count</bdi></code>: <code><bdi>1</bdi></code></li>"),
+        "{d}"
+    );
+    // The sections in plan order, each once.
+    let titles = [
+        "<h2>Script result</h2>",
+        "<h2>Result (JSON tree)</h2>",
+        "<h2>Script source</h2>",
+        "<h2>Host calls</h2>",
+        "<h2>atlas.log</h2>",
+        "<h2>stderr</h2>",
+    ];
+    let mut last = 0;
+    for t in titles {
+        assert_eq!(d.matches(t).count(), 1, "{t}\n{d}");
+        let at = d.find(t).unwrap_or(0);
+        assert!(at > last, "{t} out of order\n{d}");
+        last = at;
+    }
+    // The source, line-numbered; a tab inside a line stays, trailing space and CR are marked.
+    let source = script_section(&d, "Script source");
+    for row in [
+        // (The document's last sanitizer pass serializes a text `"` as is.)
+        "<tr><td>1</td><td><pre><bdi>const r = atlas.call(\"jira.search\", \
+         {jql: \"project = PROJ\"});</bdi></pre></td></tr>",
+        "<tr><td>2</td><td><pre><bdi>\tif (r.total &gt; 0) {</bdi></pre></td></tr>",
+        "<tr><td>3</td><td><pre><bdi>  atlas.log(\"&lt;b&gt;found&lt;/b&gt;\");\
+         <mark>⟨U+0020⟩</mark><mark>⟨U+000D⟩</mark></bdi></pre></td></tr>",
+        "<tr><td>4</td><td><pre><bdi>}</bdi></pre></td></tr>",
+        "<tr><td>5</td><td><pre><bdi>return r;</bdi></pre></td></tr></tbody></table>",
+    ] {
+        assert!(source.contains(row), "{row}\n{source}");
+    }
+    assert!(!source.contains("<td>6</td>"), "{source}");
+    // The leading spaces of line 3 show without the stylesheet.
+    assert!(
+        shown_without_css(source).contains("3  atlas.log"),
+        "{source}"
+    );
+    // Host calls: one row per call, from the request.
+    let calls = script_section(&d, "Host calls");
+    for want in [
+        "<thead><tr><th>call</th><th>operation</th><th>instance</th><th>target</th>\
+         <th>outcome</th></tr></thead>",
+        "<tr><td>1</td><td><code><bdi>jira.search</bdi></code></td><td><bdi>jira-main</bdi></td>\
+         <td><bdi>project = PROJ</bdi></td><td><code><bdi>ok</bdi></code></td></tr>",
+        "<tr><td>2</td><td><code><bdi>jira.issue.get</bdi></code></td>\
+         <td><bdi>jira-main</bdi></td><td><bdi>PROJ-1</bdi></td>\
+         <td><code><bdi>rejected:upstream_http</bdi></code></td></tr>",
+    ] {
+        assert!(calls.contains(want), "{want}\n{calls}");
+    }
+    // atlas.log: one item per line, a run of spaces kept; a result's logs here are cut by no note.
+    let logs = script_section(&d, "atlas.log");
+    assert!(
+        logs.contains(
+            "<ul><li><bdi>fetched 0 issues</bdi></li><li><pre><bdi>two  spaces</bdi></pre></li></ul>"
+        ),
+        "{logs}"
+    );
+    assert!(!logs.contains("audit record"), "{logs}");
+    assert!(
+        d.contains("<h2>stderr</h2><pre><code><bdi>warning: deprecated\n</bdi></code></pre>"),
+        "{d}"
+    );
+    // The host-computed lossy warning is on the Info line.
+    assert!(d.contains(&warning::host_calls_lossy(1)), "{d}");
+
+    // A table view (the M7 list rule) goes through the table arm.
+    let mut t = p.clone();
+    set_script(&mut t, |view, _| {
+        *view = PreviewBody::Table {
+            columns: vec!["key".into()],
+            rows: vec![vec!["PROJ-1".into()]],
+            count: None,
+        };
+    });
+    let d = doc(&t);
+    assert!(
+        d.contains(
+            "<section><h2>Script result</h2><section><h2>Results</h2><table><thead><tr>\
+             <th><bdi>key</bdi></th></tr></thead><tbody><tr><td><bdi>PROJ-1</bdi></td></tr>"
+        ),
+        "{d}"
+    );
+    assert_inert(&d, Platform::Windows);
+
+    // Nothing to show: `none` in each section.
+    let mut e = p.clone();
+    if let PreviewBody::Script {
+        source,
+        provenance,
+        logs,
+        stderr,
+        ..
+    } = &mut e.body
+    {
+        source.clear();
+        provenance.clear();
+        logs.clear();
+        stderr.clear();
+    }
+    let d = doc(&e);
+    for t in ["Script source", "Host calls", "atlas.log", "stderr"] {
+        assert!(d.contains(&format!("<h2>{t}</h2><p>none</p>")), "{t}\n{d}");
+    }
+}
+
+#[test]
+fn script_source_and_logs_are_escaped_text() {
+    let evil = "<script>alert(1)</script><img src=x onerror=alert(1)>\u{202E}⟨U+202E⟩";
+    // Escaped, the flagged character marked, the literal escape text escaped delimiter by
+    // delimiter (so it cannot pass for a marked escape: the renderer display-escapes these raw
+    // strings itself).
+    let shown = "&lt;script&gt;alert(1)&lt;/script&gt;&lt;img src=x onerror=alert(1)&gt;\
+                 <mark>⟨U+202E⟩</mark><mark>⟨U+27E8⟩</mark>U+202E<mark>⟨U+27E9⟩</mark>";
+    for item in [ScriptItemKind::Result, ScriptItemKind::ErrorDetails] {
+        let mut p = script_preview(item);
+        if let PreviewBody::Script {
+            source,
+            provenance,
+            logs,
+            logs_note,
+            stderr,
+            ..
+        } = &mut p.body
+        {
+            *source = format!("{evil}\n{evil}");
+            *provenance = vec![ProvenanceRow {
+                call_id: 1,
+                op_id: evil.into(),
+                instance: evil.into(),
+                target_display: evil.into(),
+                outcome: evil.into(),
+            }];
+            *logs = vec![evil.into()];
+            *logs_note = Some(evil.into());
+            *stderr = evil.into();
+        }
+        let d = doc(&p);
+        for platform in [Platform::MacOsLinux, Platform::Windows] {
+            assert_inert(&render::document(&p, platform), platform);
+        }
+        assert!(!d.contains('\u{202E}'));
+        let body = body_of(&d).to_ascii_lowercase();
+        assert!(!body.contains("<script") && !body.contains("<img"), "{d}");
+        for (title, n) in [
+            ("Script source", 2),
+            ("Host calls", 4),
+            ("atlas.log", 2),
+            ("stderr", 1),
+        ] {
+            let s = script_section(&d, title);
+            assert_eq!(s.matches(shown).count(), n, "{title}\n{s}");
+            // Each one bidi-isolated.
+            assert_eq!(
+                s.matches(&format!("<bdi>{shown}</bdi>")).count(),
+                n,
+                "{title}\n{s}"
+            );
+        }
+    }
+}
+
+#[test]
+fn script_error_document_fields() {
+    let p = script_preview(ScriptItemKind::ErrorDetails);
+    let d = doc(&p);
+    assert_inert(&d, Platform::MacOsLinux);
+    assert!(
+        d.contains(
+            "</header><section><h2>Script error details</h2><section>\
+             <h2>Result (JSON tree)</h2>"
+        ),
+        "{d}"
+    );
+    assert!(!d.contains("<h2>Script result</h2>"));
+    // Class, message, stack (its leading spaces and line break kept) and elapsed time.
+    for want in [
+        "<li><code><bdi>class</bdi></code>: \"<bdi>TypeError</bdi>\"</li>",
+        "<li><code><bdi>message</bdi></code>: \
+         \"<bdi>cannot read property 'key' of undefined</bdi>\"</li>",
+        "<li><code><bdi>stack</bdi></code>: <pre>\"<bdi>    at main (script.js:3:12)\n    \
+         at &lt;anonymous&gt;</bdi>\"</pre></li>",
+        "<li><code><bdi>elapsed</bdi></code>: <code><bdi>412</bdi></code></li>",
+    ] {
+        assert!(d.contains(want), "{want}\n{d}");
+    }
+    // Provenance, the logs with the cut note, stderr.
+    assert!(
+        script_section(&d, "Host calls").contains("<td><code><bdi>rejected:upstream_http</bdi>"),
+        "{d}"
+    );
+    let logs = script_section(&d, "atlas.log");
+    assert!(
+        logs.contains(
+            "</ul><div><bdi>output was cut at its size bound; the audit record keeps the full \
+             text</bdi></div>"
+        ),
+        "{logs}"
+    );
+    assert!(
+        logs.contains("<li><bdi>fetched 0 issues</bdi></li>"),
+        "{logs}"
+    );
+    assert!(script_section(&d, "stderr").contains("warning: deprecated"));
+    // The note shows even with no log line (it may be about stderr or the error text).
+    let mut q = p.clone();
+    if let PreviewBody::Script { logs, .. } = &mut q.body {
+        logs.clear();
+    }
+    let d = doc(&q);
+    assert!(
+        script_section(&d, "atlas.log")
+            .contains("<p>none</p><div><bdi>output was cut at its size bound;"),
+        "{d}"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// S-06 for the script item alone (the variant is also among the kinds of
+    /// `s06_document_has_no_active_content`).
+    #[test]
+    fn s06_script_document_has_no_active_content(
+        strings in prop::collection::vec(text(), 12),
+        windows in any::<bool>(),
+    ) {
+        let platform = if windows { Platform::Windows } else { Platform::MacOsLinux };
+        let p = arbitrary_preview(13, &strings);
+        let is_script = matches!(p.body, PreviewBody::Script { .. });
+        prop_assert!(is_script);
+        assert_inert(&render::document(&p, platform), platform);
+    }
+}
+
+#[test]
+fn doc_caps_note_for_long_logs() {
+    let base = script_preview(ScriptItemKind::Result);
+    let with = |f: &dyn Fn(&mut String, &mut Vec<ProvenanceRow>, &mut Vec<String>, &mut String)| {
+        let mut p = base.clone();
+        if let PreviewBody::Script {
+            source,
+            provenance,
+            logs,
+            stderr,
+            ..
+        } = &mut p.body
+        {
+            f(source, provenance, logs, stderr);
+        }
+        p
+    };
+
+    // atlas.log past its row cap: two lines left out, noted and counted.
+    let p = with(&|_, _, logs, _| {
+        *logs = (0..DOC_MAX_ROWS + 2).map(|i| format!("log {i}")).collect();
+    });
+    let d = doc(&p);
+    let logs = script_section(&d, "atlas.log");
+    assert!(
+        logs.contains("<li><bdi>log 1999</bdi></li></ul><p>2 more lines not shown here; see Structured or Raw</p>"),
+        "{logs}"
+    );
+    assert!(!logs.contains("<bdi>log 2000</bdi>"));
+    assert_eq!(
+        hidden_bytes(&d),
+        ("log 2000".len() + "log 2001".len()) as u64
+    );
+    assert_inert(&d, Platform::MacOsLinux);
+
+    // The source past its line cap: the rest (with its line ends) left out.
+    let p = with(&|source, _, _, _| {
+        *source = (0..=DOC_MAX_DIFF_LINES)
+            .map(|i| format!("x{i}\n"))
+            .collect();
+    });
+    let d = doc(&p);
+    let source = script_section(&d, "Script source");
+    assert!(
+        source.contains(
+            "<tr><td>5000</td><td><pre><bdi>x4999</bdi></pre></td></tr></tbody></table>\
+             <p>1 more lines not shown here; see Structured or Raw</p>"
+        ),
+        "{}",
+        &source[source.len().saturating_sub(400)..]
+    );
+    assert_eq!(hidden_bytes(&d), "x5000\n".len() as u64);
+    // A source line that fills the byte budget: it is cut, the lines after it left out whole.
+    let p = with(&|source, _, _, _| {
+        *source = format!("{}\nafter1\nafter2", "s".repeat(DOC_MAX_BYTES));
+    });
+    let d = doc(&p);
+    let source = script_section(&d, "Script source");
+    assert!(
+        source.ends_with("…</bdi></pre></td></tr></tbody></table><p>2 more lines not shown here; see Structured or Raw</p>"),
+        "{}",
+        &source[source.len().saturating_sub(400)..]
+    );
+    assert!(!source.contains("<td>2</td>"));
+
+    // Host calls past the row cap.
+    let p = with(&|_, provenance, _, _| {
+        *provenance = (0..=DOC_MAX_ROWS as u64)
+            .map(|i| ProvenanceRow {
+                call_id: i,
+                op_id: "jira.issue.get".into(),
+                instance: "jira-main".into(),
+                target_display: format!("PROJ-{i}"),
+                outcome: "ok".into(),
+            })
+            .collect();
+    });
+    let d = doc(&p);
+    let calls = script_section(&d, "Host calls");
+    assert!(
+        calls.contains("</tbody></table><p>1 more rows not shown here; see Structured or Raw</p>"),
+        "{}",
+        &calls[calls.len().saturating_sub(400)..]
+    );
+    assert!(calls.contains("PROJ-1999") && !calls.contains("PROJ-2000"));
+    assert_eq!(
+        hidden_bytes(&d),
+        ("jira.issue.get".len() + "jira-main".len() + "PROJ-2000".len() + "ok".len()) as u64
+    );
+
+    // stderr past the byte budget: cut, counted, noted at the end of the body; nothing after it
+    // in the document is lost silently.
+    let p = with(&|_, _, _, stderr| {
+        *stderr = "e".repeat(DOC_MAX_BYTES + 10);
+    });
+    let d = doc(&p);
+    assert!(d.contains("…</bdi></code></pre></section>"), "cut");
+    assert!(hidden_bytes(&d) >= 10);
+    assert!(d.contains(&format!(
+        "<p>{} more bytes not shown here; see Structured or Raw</p></body></html>",
+        hidden_bytes(&d)
+    )));
+
+    // A huge log fills the budget: the log lines after it are left out and counted.
+    let p = with(&|_, _, logs, _| {
+        *logs = vec!["l".repeat(DOC_MAX_BYTES), "after".into(), "after2".into()];
+    });
+    let d = doc(&p);
+    assert!(!script_section(&d, "atlas.log").contains("<bdi>after"));
+    assert!(script_section(&d, "atlas.log").contains("<p>2 more lines not shown here"));
+    assert!(body_of(&d).len() < DOC_MAX_BYTES + 64 * 1024);
 }
