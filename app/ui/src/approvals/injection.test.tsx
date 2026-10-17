@@ -427,11 +427,11 @@ function credential(k: number): Scenario {
   };
 }
 const SCENARIOS: Scenario[] = [
-  // The fourteen preview kinds, alternately blocked as Rust built them and made approvable. The
+  // The nineteen preview kinds, alternately blocked as Rust built them and made approvable. The
   // corpus runs take the kinds that differ in what the window draws: a read with the redaction
   // panel (0), a write with the edit form, blocked (1) and approvable (4), a read with an
   // "also appears in" note (8); the others only join the wide runs.
-  ...Array.from({ length: 14 }, (_, i): Scenario => ({
+  ...Array.from({ length: 19 }, (_, i): Scenario => ({
     name: `approvals preview ${i}`,
     wide: ![0, 1, 4, 8].includes(i),
     modes: i === 0 ? ['free', 'all'] : ['free'],
