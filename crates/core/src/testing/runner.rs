@@ -2,25 +2,28 @@
 //! run follows a [`ScriptPlan`]: the compile verdict, the host calls in order (one at a time,
 //! each awaited, as the worker's single-threaded loop does), a hold, then the scripted end. A
 //! `kill` interrupts the call in flight or the hold, and `wait` then answers
-//! `RunEnd::Killed { reason }`.
+//! `RunEnd::Killed { reason }`. The runner-wide answers (Δ3): `check_available` (Ok unless
+//! [`FakeScriptRunner::fail_available`]), `confinement` ([`FakeScriptRunner::set_confinement`]),
+//! and every policy it was handed ([`FakeScriptRunner::policies`]).
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use atlas_duck_ipc::sandbox::{HostCall, HostCallResult};
+use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use tokio::sync::watch;
 
 use crate::core::Pause;
 use crate::engine::script::{
-    CompileError, HostCalls, KillReason, RunEnd, RunHandle, RunSpec, RunnerError, ScriptRunner,
+    CompileError, CompileFailure, HostCalls, KillReason, RunConfinement, RunEnd, RunHandle,
+    RunPolicy, RunSpec, RunnerError, ScriptRunner,
 };
 
 /// One scripted run.
 #[derive(Debug, Clone)]
 pub struct ScriptPlan {
-    pub compile: Result<(), CompileError>,
+    pub compile: Result<(), CompileFailure>,
     /// Issued in order, each after the previous one's answer.
     pub calls: Vec<HostCall>,
     /// How the run ends unless it is killed first.
@@ -56,12 +59,18 @@ impl ScriptPlan {
 
     /// A source that does not compile.
     pub fn syntax_error(line: u32, column: u32, message: &str) -> ScriptPlan {
+        ScriptPlan::compile_failure(CompileFailure::Syntax(CompileError {
+            line,
+            column,
+            message: message.to_owned(),
+        }))
+    }
+
+    /// A compile check that fails with `failure` (Δ3: syntax, unavailable, timeout); the run is
+    /// never started.
+    pub fn compile_failure(failure: CompileFailure) -> ScriptPlan {
         ScriptPlan {
-            compile: Err(CompileError {
-                line,
-                column,
-                message: message.to_owned(),
-            }),
+            compile: Err(failure),
             calls: Vec::new(),
             end: RunEnd::Crashed,
             hold_ms: 0,
@@ -122,6 +131,13 @@ struct Inner {
     handles: Vec<Arc<FakeRun>>,
     /// `start` answers this instead of starting (spawn-time `sandbox_unavailable`).
     start_error: Option<RunnerError>,
+    /// `check_available` answers this (submit-time unavailability); `None` = available.
+    available_error: Option<RunnerError>,
+    availability_checks: u32,
+    /// What `confinement` answers.
+    confinement: Option<RunConfinement>,
+    /// The policy each runner call was handed, in call order (`available`, `compile`, `start`).
+    policies: Vec<(&'static str, RunPolicy)>,
 }
 
 /// The fake runner: plans are consumed in submit order (compile check, then start).
@@ -151,6 +167,26 @@ impl FakeScriptRunner {
         self.lock().start_error = Some(err);
     }
 
+    /// Makes every later `check_available` fail with `err`.
+    pub fn fail_available(&self, err: RunnerError) {
+        self.lock().available_error = Some(err);
+    }
+
+    /// What every later `confinement` answers (`None`: the runner states nothing).
+    pub fn set_confinement(&self, c: Option<RunConfinement>) {
+        self.lock().confinement = c;
+    }
+
+    pub fn availability_checks(&self) -> u32 {
+        self.lock().availability_checks
+    }
+
+    /// The policy each `check_available` (`"available"`), `compile_check` (`"compile"`) and
+    /// `start` (`"start"`) was handed, in call order.
+    pub fn policies(&self) -> Vec<(&'static str, RunPolicy)> {
+        self.lock().policies.clone()
+    }
+
     pub fn compile_checks(&self) -> u32 {
         self.lock().compile_checks
     }
@@ -178,10 +214,23 @@ impl FakeScriptRunner {
 
 #[async_trait]
 impl ScriptRunner for FakeScriptRunner {
-    async fn compile_check(&self, _source: &str) -> Result<(), CompileError> {
+    async fn check_available(&self, policy: RunPolicy) -> Result<(), RunnerError> {
+        let mut g = self.lock();
+        g.availability_checks += 1;
+        g.policies.push(("available", policy));
+        g.available_error.map_or(Ok(()), Err)
+    }
+
+    async fn compile_check(
+        &self,
+        _source: &str,
+        _limits: &ScriptLimits,
+        policy: RunPolicy,
+    ) -> Result<(), CompileFailure> {
         let (verdict, pause) = {
             let mut g = self.lock();
             g.compile_checks += 1;
+            g.policies.push(("compile", policy));
             let Some(plan) = g.plans.pop_front() else {
                 return Ok(());
             };
@@ -198,6 +247,10 @@ impl ScriptRunner for FakeScriptRunner {
         verdict
     }
 
+    fn confinement(&self, _policy: RunPolicy) -> Option<RunConfinement> {
+        self.lock().confinement.clone()
+    }
+
     async fn start(
         &self,
         run: RunSpec,
@@ -206,6 +259,7 @@ impl ScriptRunner for FakeScriptRunner {
         let (plan, fake) = {
             let mut g = self.lock();
             g.starts += 1;
+            g.policies.push(("start", run.policy));
             g.specs.push(run.clone());
             if let Some(e) = g.start_error {
                 return Err(e);

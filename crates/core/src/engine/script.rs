@@ -5,10 +5,13 @@
 //! [`RunHandle`]. Δ C.7: `RunHandle` is `Send + Sync` and `wait(&self)`, because the cancel path
 //! kills a run while the task that drives it awaits its end.
 //!
-//! **Flow** (`submit` → `run_real` / `run_dry`). `REQUEST_RECEIVED`, static checks, then a
-//! compile check in the dry pool (`SCRIPT_FAILED {script_syntax, direct}` on failure), a wait
-//! for one of the two real slots (`queued` = the permit was not immediately available),
-//! `SCRIPT_STARTED`, the run. Every record-bearing step goes through [`Engine::transition_with`]
+//! **Flow** (`submit` → `run_real` / `run_dry`). `REQUEST_RECEIVED`, static checks, the §3.4
+//! availability re-check (`check_available`, no slot; `SCRIPT_FAILED {sandbox_unavailable,
+//! direct}` on failure), then a compile check in the dry pool (`SCRIPT_FAILED {script_syntax |
+//! sandbox_unavailable | timeout_s, direct}` on failure), a wait for one of the two real slots
+//! (`queued` = the permit was not immediately available), `SCRIPT_STARTED`, the run. The run
+//! policy ([`RunPolicy`]) is read before each of those runner calls, never captured at submit
+//! (PD-141). Every record-bearing step goes through [`Engine::transition_with`]
 //! (so an expiry that fired while the run could not expire takes effect right after its
 //! release item), and every host-call record through [`append_gated`] (the entry's gate, and
 //! only while the run is `Running`: a cancel that ended the request first gets nothing more).
@@ -21,8 +24,8 @@
 //! the registry's examples and hold no client handle.
 //!
 //! **Ends** ([`classify`]). Decided by the host from its own state (§9.5): a compile failure, or
-//! a host-measured limit of a run that neither queued nor dispatched, is direct (`failed`,
-//! exit 8); every other end is one release item (`SCRIPT_FINISHED` / non-direct
+//! a host-measured limit or a spawn-time unavailability of a run that neither queued nor
+//! dispatched, is direct (`failed`, exit 8); every other end is one release item (`SCRIPT_FINISHED` / non-direct
 //! `SCRIPT_FAILED`) except client cancels and the shutdown path, which end in `CANCELLED`.
 //!
 //! **Candidates.** `{"result": value}` for a result, `{"script_error": {class, message, stack,
@@ -39,6 +42,7 @@ use atlas_duck_atlassian::{FetchControl, ReadBudget};
 use atlas_duck_audit::{AuditError, NewEvent};
 use atlas_duck_ipc::envelope::{Envelope, ErrorCode};
 use atlas_duck_ipc::proto::{ConnectionMeta, SubmitParams, params_sha256};
+use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_registry::{
@@ -85,12 +89,100 @@ pub struct CompileError {
     pub message: String,
 }
 
+/// Why the sandbox cannot run a script (Δ3). Only `AppUpgraded` reaches the wire (`details.reason`,
+/// `retryable: true`, §4.3 exit-8 row); every reason is kept in `SCRIPT_FAILED.details` (PD-138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// §3.4: the sandbox binary's identity changed since the probe (an upgrade under a running
+    /// app); scripts stay refused until restart.
+    AppUpgraded,
+    /// §9.4: the confinement floor cannot be applied, and degraded confinement is not allowed.
+    FloorNotMet,
+    /// PD-138: the startup probe report did not arrive in time.
+    ProbePending,
+    /// The worker could not be spawned (or never sent its ready frame).
+    SpawnFailed,
+}
+
+impl UnavailableReason {
+    /// The `SCRIPT_FAILED.details.reason` value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AppUpgraded => REASON_APP_UPGRADED,
+            Self::FloorNotMet => "floor_not_met",
+            Self::ProbePending => "probe_pending",
+            Self::SpawnFailed => "spawn_failed",
+        }
+    }
+}
+
 /// Why no worker could be started.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerError {
-    /// §9.4: the confinement floor cannot be applied (or the sandbox binary is missing).
-    /// `app_upgraded`: the app changed since the last probe (M8 words the message).
-    SandboxUnavailable { app_upgraded: bool },
+    /// §9.4, §3.4: `failed`, exit 8, `sandbox_unavailable`.
+    SandboxUnavailable { reason: UnavailableReason },
+}
+
+/// Why the submit-time compile check did not pass (Δ3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileFailure {
+    /// The source does not compile: direct `script_syntax`.
+    Syntax(CompileError),
+    /// No compile worker could run: direct `sandbox_unavailable`.
+    Unavailable(RunnerError),
+    /// PD-135: the compile worker did not answer within its bound (10 s or the submitted
+    /// `timeout_s`, whichever is lower): a direct, data-free `script_limit {timeout_s}`, never
+    /// `script_syntax`.
+    Timeout { timeout_s: u32 },
+}
+
+/// What a run may accept from the sandbox (Δ3, PD-141). Read from [`Engine::script_policy`]
+/// immediately before each use (`check_available`, the compile check, the real-slot
+/// acquisition), never captured at submit: a security-weakening setting never outlives its
+/// revocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunPolicy {
+    /// "Allow scripts with degraded confinement" (§9.4). It covers only a probe-time floor
+    /// failure (PD-141 (d)).
+    pub allow_degraded: bool,
+}
+
+/// Which confinement a run gets (PD-138).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfinementMode {
+    /// The §9.4 floor is met.
+    Floor,
+    /// The floor is not met and degraded confinement is allowed (§9.4, PD-141).
+    Degraded,
+}
+
+impl ConfinementMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Floor => "floor",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+/// `SCRIPT_STARTED.confinement` (PD-138, R1): the mode and worker version a run is spawned under,
+/// with the confinement report the runner holds for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunConfinement {
+    pub mode: ConfinementMode,
+    pub worker_version: String,
+    pub report: ConfinementReport,
+}
+
+impl RunConfinement {
+    /// The record's `{mode, worker_version, report}`.
+    pub fn to_value(&self) -> Value {
+        json!({
+            "mode": self.mode.as_str(),
+            "worker_version": self.worker_version,
+            "report": serde_json::to_value(&self.report).unwrap_or(Value::Null),
+        })
+    }
 }
 
 /// Why a run is killed.
@@ -121,11 +213,15 @@ pub enum RunEnd {
         class: String,
         message: String,
         stack: String,
+        /// The host's clock from the spawn to the terminal frame (PD-134), never the worker's.
         elapsed_ms: u64,
         logs: Vec<String>,
         stderr: String,
     },
-    /// A limit the host itself measured (timer, job-object or rlimit kill reason, OOM).
+    /// A limit the host itself measured (timer, job-object or rlimit kill reason, OOM), or a
+    /// spawn-time unavailability (Δ3). `name` is one of the closed set `timeout_s`, `heap_mb`,
+    /// `process_mb`, `max_result_mb`, `sandbox_unavailable`, `app_upgraded`; the last two end as
+    /// `SCRIPT_FAILED {reason: sandbox_unavailable}`, never as a `script_limit`.
     HostLimit {
         name: String,
     },
@@ -144,13 +240,30 @@ pub struct RunSpec {
     pub args: Value,
     pub limits: ScriptLimits,
     pub dry_run: bool,
+    /// Read right before the spawn (PD-141): when a real run acquired its slot, after a dry
+    /// run's compile check.
+    pub policy: RunPolicy,
 }
 
 /// C.7: implemented by `app` over `sandbox-host` (M8); `testing::FakeScriptRunner` in M3.
 #[async_trait]
 pub trait ScriptRunner: Send + Sync {
-    /// The submit-time compile check, in a compile-only worker of the dry-run pool.
-    async fn compile_check(&self, source: &str) -> Result<(), CompileError>;
+    /// §3.4 re-check at submit, after static validation and before the compile check: the
+    /// sandbox binary's file identity, the probe report and the floor rule under `policy`. Needs
+    /// no slot; a failure is a direct `sandbox_unavailable`.
+    async fn check_available(&self, policy: RunPolicy) -> Result<(), RunnerError>;
+    /// The submit-time compile check, in a compile-only worker of the dry-run pool. `limits` are
+    /// the run's (the worker's memory limits; the compile is bounded by 10 s or
+    /// `limits.timeout_s`, whichever is lower, PD-135).
+    async fn compile_check(
+        &self,
+        source: &str,
+        limits: &ScriptLimits,
+        policy: RunPolicy,
+    ) -> Result<(), CompileFailure>;
+    /// What a run spawned now under `policy` runs with, for `SCRIPT_STARTED.confinement`
+    /// (PD-138). `None`: the runner states nothing and the record has no `confinement` key.
+    fn confinement(&self, policy: RunPolicy) -> Option<RunConfinement>;
     /// Starts a worker; its `host.call`s arrive at `calls`.
     async fn start(
         &self,
@@ -237,6 +350,9 @@ pub static SCRIPT_SPEC: OperationSpec = OperationSpec {
 /// are the other host-decided ones.
 const REASON_SCRIPT_SYNTAX: &str = "script_syntax";
 const REASON_SANDBOX_UNAVAILABLE: &str = "sandbox_unavailable";
+/// The `HostLimit` name and `details.reason` of an identity mismatch (§3.4, PD-133).
+const REASON_APP_UPGRADED: &str = "app_upgraded";
+const LIMIT_TIMEOUT_S: &str = "timeout_s";
 const REASON_KILLED_BY_USER: &str = "killed_by_user";
 const REASON_PROTOCOL_VIOLATION: &str = "protocol_violation";
 const REASON_WORKER_CRASH: &str = "worker_crash";
@@ -1793,24 +1909,53 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
     {
         return;
     }
-    // 1. The submit-time compile check, in the dry pool (never a real slot, §9.1 step 2).
+    // 1. The §3.4 re-check at submit (no slot needed): a failure is direct.
+    if let Err(RunnerError::SandboxUnavailable { reason }) =
+        runner.check_available(engine.script_policy()).await
+    {
+        fail_unavailable(engine, entry, Event::CompileFailed, reason).await;
+        return;
+    }
+    // 2. The submit-time compile check, in the dry pool (never a real slot, §9.1 step 2).
     let Some((dry_permit, _)) = slot(&engine.dry_slots, entry, false).await else {
         return;
     };
-    let compiled = runner.compile_check(&source).await;
-    drop(dry_permit);
-    if let Err(e) = compiled {
-        let details = syntax_details(&e);
-        fail_direct(
-            engine,
-            entry,
-            Event::CompileFailed,
-            REASON_SCRIPT_SYNTAX,
-            false,
-            Some(details),
-        )
+    let compiled = runner
+        .compile_check(&source, &limits, engine.script_policy())
         .await;
-        return;
+    drop(dry_permit);
+    match compiled {
+        Ok(()) => {}
+        Err(CompileFailure::Syntax(e)) => {
+            let details = syntax_details(&e);
+            fail_direct(
+                engine,
+                entry,
+                Event::CompileFailed,
+                REASON_SCRIPT_SYNTAX,
+                false,
+                Some(details),
+            )
+            .await;
+            return;
+        }
+        Err(CompileFailure::Unavailable(RunnerError::SandboxUnavailable { reason })) => {
+            fail_unavailable(engine, entry, Event::CompileFailed, reason).await;
+            return;
+        }
+        // PD-135: a data-free `script_limit {timeout_s}`, never `script_syntax`.
+        Err(CompileFailure::Timeout { .. }) => {
+            fail_direct(
+                engine,
+                entry,
+                Event::CompileFailed,
+                LIMIT_TIMEOUT_S,
+                false,
+                None,
+            )
+            .await;
+            return;
+        }
     }
     if engine
         .step_unlogged(entry, Event::CompileOk, None, |_| {})
@@ -1819,11 +1964,14 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
     {
         return;
     }
-    // 2. A real slot; `queued` = it was not immediately available (§9.5).
+    // 3. A real slot; `queued` = it was not immediately available (§9.5). The run policy is read
+    //    here, when the slot is acquired (PD-141).
     let Some((permit, queued)) = slot(&engine.script_slots, entry, true).await else {
         return;
     };
-    // 3. `SCRIPT_STARTED` is the record of the slot (§9.1 step 2). The run's shared state is
+    let policy = engine.script_policy();
+    let confinement = runner.confinement(policy).map(|c| c.to_value());
+    // 4. `SCRIPT_STARTED` is the record of the slot (§9.1 step 2). The run's shared state is
     //    installed by the step that enters `Running`, under the gate: a cancel or a kill that
     //    comes after finds it, one that came before ended the request and this step is refused.
     let shared = Arc::new(RunShared::default());
@@ -1833,7 +1981,16 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         .transition_with(
             entry,
             Event::SlotAcquired,
-            move |_| vec![payloads::script_started(&ctx, &s, &a, &limits, queued)],
+            move |_| {
+                vec![payloads::script_started(
+                    &ctx,
+                    &s,
+                    &a,
+                    &limits,
+                    queued,
+                    confinement.as_ref(),
+                )]
+            },
             OnAuditFailure::FailRequest,
             move |st| {
                 if let Some(s) = st.script.as_mut() {
@@ -1847,7 +2004,7 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         return;
     }
     engine.ui().emit(UiEvent::RunningScriptsChanged);
-    // 4. The worker.
+    // 5. The worker.
     let validator = Arc::new(EngineValidator::new(engine.clone()));
     let backend = Arc::new(LiveBackend::new(
         engine.clone(),
@@ -1862,8 +2019,11 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
         args,
         limits,
         dry_run: false,
+        policy,
     };
     let began = Instant::now();
+    // The cause of a spawn-time unavailability `start` reported (kept in the record).
+    let mut cause = None;
     // A kill asked for before the worker exists (a cancel, a user kill in this window): no
     // worker is started for it.
     let end = if let Some(reason) = shared.kill_reason() {
@@ -1877,27 +2037,78 @@ async fn run_real(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, runner: &dyn 
                 shared.mark_ended();
                 end
             }
-            // §3.4: a spawn-time `sandbox_unavailable` counts like a host-measured limit.
-            Err(RunnerError::SandboxUnavailable { .. }) => {
+            // §3.4: a spawn-time unavailability counts like a host-measured limit: direct for a
+            // run that neither queued nor dispatched, else through release (PD-133).
+            Err(RunnerError::SandboxUnavailable { reason }) => {
                 shared.mark_ended();
-                RunEnd::HostLimit {
-                    name: REASON_SANDBOX_UNAVAILABLE.to_owned(),
-                }
+                cause = Some(reason);
+                spawn_unavailable(reason)
             }
         }
     };
     drop(permit);
     engine.ui().emit(UiEvent::RunningScriptsChanged);
-    finish_real(
+    let end = Ended {
+        end,
+        cause,
+        queued,
+        elapsed: began.elapsed(),
+    };
+    finish_real(engine, entry, &shared, end, &limits).await;
+}
+
+/// `start`'s refusal as the run's end: the `HostLimit` name of the closed set (Δ3).
+fn spawn_unavailable(reason: UnavailableReason) -> RunEnd {
+    let name = match reason {
+        UnavailableReason::AppUpgraded => REASON_APP_UPGRADED,
+        _ => REASON_SANDBOX_UNAVAILABLE,
+    };
+    RunEnd::HostLimit {
+        name: name.to_owned(),
+    }
+}
+
+/// The two spawn-time names of `RunEnd::HostLimit` (Δ3), with the reason the name itself
+/// carries; `None` for any other name.
+fn unavailable_name(name: &str) -> Option<Option<UnavailableReason>> {
+    match name {
+        REASON_APP_UPGRADED => Some(Some(UnavailableReason::AppUpgraded)),
+        REASON_SANDBOX_UNAVAILABLE => Some(None),
+        _ => None,
+    }
+}
+
+/// `SCRIPT_FAILED.details` of an unavailability: `{reason}` when the cause is known (PD-138; only
+/// `app_upgraded` is delivered, `envelope.rs`).
+fn unavailable_details(reason: Option<UnavailableReason>) -> Option<Value> {
+    reason.map(|r| json!({ "reason": r.as_str() }))
+}
+
+/// A direct `sandbox_unavailable` (§3.4, §9.4): `failed`, exit 8, nothing queued or dispatched.
+async fn fail_unavailable(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    event: Event,
+    reason: UnavailableReason,
+) {
+    fail_direct(
         engine,
         entry,
-        &shared,
-        end,
-        queued,
-        &limits,
-        began.elapsed(),
+        event,
+        REASON_SANDBOX_UNAVAILABLE,
+        false,
+        unavailable_details(Some(reason)),
     )
     .await;
+}
+
+/// A real run's end with the host's facts about it.
+struct Ended {
+    end: RunEnd,
+    /// The cause of a spawn-time unavailability `start` answered.
+    cause: Option<UnavailableReason>,
+    queued: bool,
+    elapsed: Duration,
 }
 
 /// What the host makes of a run's end (§9.5).
@@ -1916,8 +2127,11 @@ enum Finish {
         reason: String,
         direct: bool,
         candidate: Option<Value>,
-        /// A limit the host measured (the "keep error class only" preset applies).
+        /// A limit the host measured or a spawn-time unavailability (the "keep error class only"
+        /// preset applies).
         limit: bool,
+        /// `SCRIPT_FAILED.details` (`{reason}` of an unavailability).
+        details: Option<Value>,
     },
 }
 
@@ -1934,15 +2148,13 @@ fn host_error(class: &str, message: &str, elapsed: Duration) -> Value {
 }
 
 /// The single place a run's end becomes a release item, a direct failure or nothing (§9.5).
-#[allow(clippy::too_many_arguments)]
-fn classify(
-    end: RunEnd,
-    shared: &RunShared,
-    ctx: &EventCtx,
-    queued: bool,
-    limits: &ScriptLimits,
-    elapsed: Duration,
-) -> Finish {
+fn classify(ended: Ended, shared: &RunShared, ctx: &EventCtx, limits: &ScriptLimits) -> Finish {
+    let Ended {
+        end,
+        cause,
+        queued,
+        elapsed,
+    } = ended;
     if shared.audit_failed() {
         return Finish::Ignore;
     }
@@ -1962,6 +2174,25 @@ fn classify(
             direct,
             candidate,
             limit: true,
+            details: None,
+        }
+    };
+    // Δ3: a spawn-time unavailability is `sandbox_unavailable` for a direct and a gated run alike,
+    // never the generic limit (which the envelope would deliver as `script_limit`).
+    let unavailable = |reason: Option<UnavailableReason>| -> Finish {
+        let direct = !queued && !dispatched;
+        let message = if reason == Some(UnavailableReason::AppUpgraded) {
+            envelope::MSG_APP_UPGRADED
+        } else {
+            envelope::MSG_SANDBOX_UNAVAILABLE
+        };
+        let candidate = (!direct).then(|| host_error(REASON_SANDBOX_UNAVAILABLE, message, elapsed));
+        Finish::Failed {
+            reason: REASON_SANDBOX_UNAVAILABLE.to_owned(),
+            direct,
+            candidate,
+            limit: true,
+            details: unavailable_details(reason),
         }
     };
     let failed = |reason: &str, message: &str| Finish::Failed {
@@ -1969,6 +2200,7 @@ fn classify(
         direct: false,
         candidate: Some(host_error(reason, message, elapsed)),
         limit: false,
+        details: None,
     };
     match end {
         RunEnd::Result {
@@ -2013,8 +2245,11 @@ fn classify(
                 body: json!({ "script_error": bound_error(d.to_value()) }),
             }
         }
-        RunEnd::HostLimit { name }
-        | RunEnd::Killed {
+        RunEnd::HostLimit { name } => match unavailable_name(&name) {
+            Some(named) => unavailable(named.or(cause)),
+            None => limit(name),
+        },
+        RunEnd::Killed {
             reason: KillReason::Limit(name),
         } => limit(name),
         RunEnd::Killed {
@@ -2035,13 +2270,11 @@ async fn finish_real(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
     shared: &Arc<RunShared>,
-    end: RunEnd,
-    queued: bool,
+    ended: Ended,
     limits: &ScriptLimits,
-    elapsed: Duration,
 ) {
-    let dispatched = shared.dispatched();
-    match classify(end, shared, &entry.ctx, queued, limits, elapsed) {
+    let (dispatched, queued) = (shared.dispatched(), ended.queued);
+    match classify(ended, shared, &entry.ctx, limits) {
         Finish::Ignore => {}
         Finish::Item { item, record, body } => {
             commit_item(engine, entry, item, record, body, false, shared).await;
@@ -2049,18 +2282,20 @@ async fn finish_real(
         Finish::Failed {
             reason,
             direct: true,
+            details,
             ..
         } => {
             let event = Event::RunEnded {
                 direct: true,
                 item: ReleaseItem::ScriptErrorDetails,
             };
-            fail_direct(engine, entry, event, &reason, queued, None).await;
+            fail_direct(engine, entry, event, &reason, queued, details).await;
         }
         Finish::Failed {
             reason,
             candidate,
             limit,
+            details,
             ..
         } => {
             let candidate = candidate.unwrap_or(Value::Null);
@@ -2071,7 +2306,7 @@ async fn finish_real(
                     queued,
                     dispatched,
                     direct: false,
-                    details: None,
+                    details: details.as_ref(),
                     candidate: Some(&candidate),
                 },
             );
@@ -2184,6 +2419,19 @@ async fn run_dry(
     mode: ExampleMode,
 ) {
     let (source, args, limits) = limits_of(entry);
+    // The §3.4 re-check at submit, before the dry pool (it needs no slot): a failure is direct.
+    if let Err(RunnerError::SandboxUnavailable { reason }) =
+        runner.check_available(engine.script_policy()).await
+    {
+        if engine
+            .step_unlogged(entry, Event::DryRunStarted, None, |_| {})
+            .await
+            .is_ok()
+        {
+            fail_unavailable(engine, entry, Event::DryRunEnded { ok: false }, reason).await;
+        }
+        return;
+    }
     // The dry pool: a dry run never waits on a real slot (§9.4, §9.5).
     let Some((permit, _)) = slot(&engine.dry_slots, entry, false).await else {
         return;
@@ -2203,25 +2451,52 @@ async fn run_dry(
     {
         return;
     }
-    let compiled = runner.compile_check(&source).await;
+    let compiled = runner
+        .compile_check(&source, &limits, engine.script_policy())
+        .await;
     if shared.kill_reason().is_some() {
         // The cancel path ended the request.
         return;
     }
-    if let Err(e) = compiled {
-        let details = syntax_details(&e);
-        dry_end(
-            engine,
-            entry,
-            mode,
-            &[],
-            "script_syntax",
-            ("details", &details),
-            &[],
-            false,
-        )
-        .await;
-        return;
+    match compiled {
+        Ok(()) => {}
+        Err(CompileFailure::Syntax(e)) => {
+            let details = syntax_details(&e);
+            dry_end(
+                engine,
+                entry,
+                mode,
+                &[],
+                "script_syntax",
+                ("details", &details),
+                &[],
+                false,
+            )
+            .await;
+            return;
+        }
+        Err(CompileFailure::Unavailable(RunnerError::SandboxUnavailable { reason })) => {
+            shared.mark_ended();
+            drop(permit);
+            fail_unavailable(engine, entry, Event::DryRunEnded { ok: false }, reason).await;
+            return;
+        }
+        // PD-135: the dry run's own data-free limit outcome, never `script_syntax`.
+        Err(CompileFailure::Timeout { .. }) => {
+            let d = json!({ "limit": LIMIT_TIMEOUT_S });
+            dry_end(
+                engine,
+                entry,
+                mode,
+                &[],
+                "script_limit",
+                ("details", &d),
+                &[],
+                false,
+            )
+            .await;
+            return;
+        }
     }
     let validator = Arc::new(EngineValidator::new(engine.clone()));
     let backend = Arc::new(DryRunBackend::new(mode, validator).with_max_calls(limits.max_calls));
@@ -2231,6 +2506,7 @@ async fn run_dry(
         args,
         limits,
         dry_run: true,
+        policy: engine.script_policy(),
     };
     let began = Instant::now();
     let end = match runner.start(spec, backend.clone()).await {
@@ -2240,18 +2516,10 @@ async fn run_dry(
             shared.mark_ended();
             end
         }
-        Err(RunnerError::SandboxUnavailable { .. }) => {
+        Err(RunnerError::SandboxUnavailable { reason }) => {
             shared.mark_ended();
             drop(permit);
-            fail_direct(
-                engine,
-                entry,
-                Event::DryRunEnded { ok: false },
-                REASON_SANDBOX_UNAVAILABLE,
-                false,
-                None,
-            )
-            .await;
+            fail_unavailable(engine, entry, Event::DryRunEnded { ok: false }, reason).await;
             return;
         }
     };
@@ -2325,6 +2593,18 @@ async fn run_dry(
                 ("error", &d),
                 &logs,
                 true,
+            )
+            .await;
+        }
+        // Δ3: the spawn found the sandbox unavailable: the direct answer of every dry run.
+        RunEnd::HostLimit { name } if unavailable_name(&name).is_some() => {
+            fail_direct(
+                engine,
+                entry,
+                Event::DryRunEnded { ok: false },
+                REASON_SANDBOX_UNAVAILABLE,
+                false,
+                unavailable_details(unavailable_name(&name).flatten()),
             )
             .await;
         }
@@ -2411,6 +2691,19 @@ impl Engine {
             .filter(|s| s.dry.is_none())
             .and_then(|s| s.shared.clone());
         shared.is_some_and(|s| s.request_kill(KillReason::User))
+    }
+
+    /// The run policy (Δ3, PD-141), read immediately before each use and never cached. Task 15
+    /// sources it from the audit-authoritative "Allow scripts with degraded confinement" setting;
+    /// until then degraded confinement is never allowed.
+    pub fn script_policy(&self) -> RunPolicy {
+        #[cfg(feature = "testing")]
+        if let Some(flag) = &self.hooks.allow_degraded_scripts {
+            return RunPolicy {
+                allow_degraded: flag.load(std::sync::atomic::Ordering::SeqCst),
+            };
+        }
+        RunPolicy::default()
     }
 }
 

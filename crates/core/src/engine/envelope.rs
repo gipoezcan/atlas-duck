@@ -45,6 +45,10 @@ pub(crate) const MSG_SCRIPT_SYNTAX: &str = "the script does not compile";
 pub(crate) const MSG_SCRIPT_LIMIT: &str = "the script hit a resource limit";
 pub(crate) const MSG_SANDBOX_UNAVAILABLE: &str =
     "scripts are not available: the sandbox cannot be started on this system";
+/// §3.3 (verbatim): the upgrade message, here for a sandbox binary replaced under the running app
+/// (§3.4, `details.reason = app_upgraded`).
+pub(crate) const MSG_APP_UPGRADED: &str = "atlas-duck was upgraded; restart the app";
+const REASON_APP_UPGRADED: &str = "app_upgraded";
 const MSG_DELIVERY_INTEGRITY: &str = "the released result could not be delivered";
 
 /// The only statuses a request shows before it is terminal (§4.5).
@@ -720,15 +724,31 @@ pub fn record_status(
                     details,
                 ),
             ),
-            "sandbox_unavailable" => (
-                Status::Failed,
-                fail(
-                    ErrorCode::SandboxUnavailable,
-                    false,
-                    Some(MSG_SANDBOX_UNAVAILABLE.to_owned()),
-                    None,
-                ),
-            ),
+            // §4.3 exit-8 row (Δ3): only an upgrade is delivered with its reason, and it is
+            // retryable (after a restart); every other cause stays in the record (PD-138).
+            "sandbox_unavailable" => {
+                let upgraded = details
+                    .as_ref()
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str)
+                    == Some(REASON_APP_UPGRADED);
+                let (message, details) = if upgraded {
+                    let mut d = Map::new();
+                    d.insert("reason".into(), REASON_APP_UPGRADED.into());
+                    (MSG_APP_UPGRADED, Some(d))
+                } else {
+                    (MSG_SANDBOX_UNAVAILABLE, None)
+                };
+                (
+                    Status::Failed,
+                    fail(
+                        ErrorCode::SandboxUnavailable,
+                        upgraded,
+                        Some(message.to_owned()),
+                        details,
+                    ),
+                )
+            }
             // Any other direct failure is a host-measured limit of a run that neither queued
             // nor dispatched (§9.5); the limit's name stays in the record.
             _ => (

@@ -923,25 +923,29 @@ impl ScriptErrorDetails {
     }
 }
 
-/// `SCRIPT_STARTED {source, args, limits, queued}` (§9.1 step 2): the full source, so the log
-/// can show what ran.
+/// `SCRIPT_STARTED {source, args, limits, queued, confinement?}` (§9.1 step 2): the full source,
+/// so the log can show what ran, and (additive, PD-138) the `{mode, worker_version, report}` the
+/// run is spawned under when the runner states it.
 pub fn script_started(
     ctx: &EventCtx,
     source: &str,
     args: &Value,
     limits: &atlas_duck_ipc::sandbox::ScriptLimits,
     queued: bool,
+    confinement: Option<&Value>,
 ) -> NewEvent {
-    event(
-        ctx,
-        EventType::SCRIPT_STARTED,
-        json!({
-            "source": source,
-            "args": args,
-            "limits": serde_json::to_value(limits).unwrap_or(Value::Null),
-            "queued": queued,
-        }),
-    )
+    let mut m = Map::new();
+    m.insert("source".into(), source.into());
+    m.insert("args".into(), args.clone());
+    m.insert(
+        "limits".into(),
+        serde_json::to_value(limits).unwrap_or(Value::Null),
+    );
+    m.insert("queued".into(), queued.into());
+    if let Some(c) = confinement {
+        m.insert("confinement".into(), c.clone());
+    }
+    event(ctx, EventType::SCRIPT_STARTED, Value::Object(m))
 }
 
 /// `SCRIPT_CALL_SENT {call_id, op_id, instance}` (non-terminal): the run is now dispatched.
@@ -1031,7 +1035,8 @@ pub struct ScriptFailed<'a> {
     pub queued: bool,
     pub dispatched: bool,
     pub direct: bool,
-    /// `{line, column, message}` of a syntax error.
+    /// `{line, column, message}` of a syntax error; `{reason}` of a `sandbox_unavailable` whose
+    /// cause is known (Δ3: `app_upgraded`, `floor_not_met`, `probe_pending`, `spawn_failed`).
     pub details: Option<&'a Value>,
     /// The error-details candidate of a non-direct failure that is a release item.
     pub candidate: Option<&'a Value>,

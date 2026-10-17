@@ -23,7 +23,7 @@ use crate::decision::{CoreDecisions, DecisionApi};
 use crate::engine::cancel::ShutdownReason as CancelWhy;
 use crate::engine::handler::CoreHandler;
 use crate::engine::queue::Limits;
-use crate::engine::script::ScriptRunner;
+use crate::engine::script::{RunPolicy, ScriptRunner};
 use crate::engine::{Engine, EngineDeps};
 use crate::gate::{UiEvent, UiSink};
 use crate::http_factory::HttpFactory;
@@ -188,6 +188,9 @@ pub struct TestHooks {
     /// An instance-table rebuild (`reload`) holds after its derivation, before its swap (M3
     /// M-14: a change made meanwhile must survive the swap).
     pub pause_in_reload: Option<Arc<Pause>>,
+    /// Replaces the "Allow scripts with degraded confinement" source of the run policy (Δ3,
+    /// PD-141): read at each use, so a test can flip it while a run waits.
+    pub allow_degraded_scripts: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(feature = "testing")]
@@ -454,6 +457,13 @@ impl Core {
     /// on its way).
     pub fn kill_script(&self, request_id: &str) -> bool {
         self.engine.kill_script(request_id)
+    }
+
+    /// The script run policy (Δ3, PD-141) as it is now: core reads it before each runner call
+    /// (`check_available`, the compile check, the real-slot acquisition). Task 15 sources it from
+    /// `SettingsView.allow_degraded_scripts`; until then it is off.
+    pub fn script_policy(&self) -> RunPolicy {
+        self.engine.script_policy()
     }
 
     /// The local UTC offset in minutes the similarity notice text uses (Δ6); `None` is UTC.
