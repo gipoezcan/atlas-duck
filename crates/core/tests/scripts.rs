@@ -1636,12 +1636,21 @@ async fn queued_with_a_call_in_flight(
     end: Option<RunEnd>,
     keep_calls: bool,
 ) -> Result<(Harness, String, RawHttpServer), TestError> {
+    queued_with_the_call_in_flight(issue_call(1), end, keep_calls).await
+}
+
+/// [`queued_with_a_call_in_flight`] for the run's first call `call`.
+async fn queued_with_the_call_in_flight(
+    call: HostCall,
+    end: Option<RunEnd>,
+    keep_calls: bool,
+) -> Result<(Harness, String, RawHttpServer), TestError> {
     let server = RawHttpServer::serve_sequence(vec![vec![
         RawStep::Send(raw_answer(br#"{"key":"ABC-1","fi"#, 1_000_000)),
         RawStep::Sleep(120_000),
     ]])
     .await?;
-    let mut plan = ScriptPlan::new(vec![issue_call(1)], result_end(json!(1)));
+    let mut plan = ScriptPlan::new(vec![call], result_end(json!(1)));
     if let Some(end) = end.clone() {
         plan = plan.interrupted(1500, end);
     }
@@ -2947,5 +2956,133 @@ async fn error_item_logs_keep_the_candidates_truncation_markers() -> TestResult 
     );
     assert_eq!(b.logs[2], "[truncated 2 log lines]");
     assert!(b.logs_note.is_some());
+    Ok(())
+}
+
+// ---- T19a (added scope): the Caution count everywhere the preview's Cautions are read ------------
+
+/// The number of Caution-level warnings of `p`: what the queue's `caution_count` stands for.
+fn caution_warnings(p: &Preview) -> u32 {
+    let n = p
+        .warnings
+        .iter()
+        .filter(|w| w.level == atlas_duck_preview::warning::Level::Caution)
+        .count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// A result item's logs and stderr are in its record, not its candidate: a bidi control in them
+/// raises the Caution in the opened preview, and so in the queue's `caution_count` and in the
+/// batch dialog's line of the item (the same preview, one count).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn result_output_bidi_raises_the_queue_count_and_the_batch_line() -> TestResult {
+    use atlas_duck_preview::warning::bidi_controls;
+    let end = RunEnd::Result {
+        value: json!(1),
+        logs: vec!["log \u{202E}".to_owned()],
+        stderr: String::new(),
+    };
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(Vec::new(), end)]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner)
+        .confirm(vec![Confirm::Ok])
+        .start()
+        .await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let item = h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let preview = script_preview(&h, &id)?;
+    assert!(
+        preview
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::BidiControls),
+        "{:?}",
+        preview.warnings
+    );
+    assert!(caution_warnings(&preview) >= 1);
+    assert_eq!(item.caution_count, caution_warnings(&preview));
+    let rev = h.approver().rev(&id).map_err(de)?;
+    h.decisions()
+        .decide_batch(vec![BatchItem {
+            request_id: id.clone(),
+            candidate_rev: rev,
+        }])
+        .map_err(de)?;
+    let texts = h.confirmer().texts();
+    assert_eq!(texts.len(), 1);
+    assert!(texts[0].contains(&bidi_controls(1)), "{}", texts[0]);
+    Ok(())
+}
+
+/// The same after a redaction: the new revision's `caution_count` still counts the result's
+/// logs, which a redaction of the candidate never touches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn result_output_bidi_stays_in_the_count_after_a_redaction() -> TestResult {
+    let end = RunEnd::Result {
+        value: json!({ "keep": 1, "secret": "x" }),
+        logs: vec!["log \u{202E}".to_owned()],
+        stderr: String::new(),
+    };
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), end)]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    h.approver().open(&id).map_err(de)?;
+    h.approver()
+        .redact(
+            &id,
+            vec![atlas_duck_core::RedactionOp::DropField {
+                path: "result.secret".to_owned(),
+                scope: atlas_duck_core::DropScope::PerItem,
+            }],
+        )
+        .map_err(de)?;
+    let item = h.approver().item(&id).ok_or("not in the queue")?;
+    let p = script_preview(&h, &id)?;
+    assert!(
+        p.warnings.iter().any(|w| w.id == WarningId::BidiControls),
+        "{:?}",
+        p.warnings
+    );
+    assert!(caution_warnings(&p) >= 1);
+    assert_eq!(item.caution_count, caution_warnings(&p));
+    Ok(())
+}
+
+/// A call the end of the run cancelled in flight is a provenance row of the preview, and its
+/// text counts for the Cautions (§6.4) in the queue's `caution_count` as it does in the opened
+/// preview.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_call_row_invisible_text_raises_the_queue_count() -> TestResult {
+    let search = host_call(
+        1,
+        "jira.search",
+        json!({ "jql": "summary ~ \"x\u{00AD}y\"", "max": 1 }),
+    );
+    let (h, id, _server) = queued_with_the_call_in_flight(
+        search,
+        Some(RunEnd::HostLimit {
+            name: "timeout_s".to_owned(),
+        }),
+        false,
+    )
+    .await?;
+    let item = h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let p = script_preview(&h, &id)?;
+    let b = script_body(&p)?;
+    assert_eq!(b.provenance.len(), 1, "{:?}", b.provenance);
+    assert_eq!(b.provenance[0].outcome, "cancelled_in_flight");
+    assert!(
+        b.provenance[0].target_display.contains('\u{00AD}'),
+        "{:?}",
+        b.provenance
+    );
+    assert!(
+        p.warnings.iter().any(|w| w.id == WarningId::OtherInvisible),
+        "{:?}",
+        p.warnings
+    );
+    assert!(caution_warnings(&p) >= 1);
+    assert_eq!(item.caution_count, caution_warnings(&p));
     Ok(())
 }

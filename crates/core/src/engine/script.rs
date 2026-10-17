@@ -1660,6 +1660,16 @@ impl RunOutput {
             })
             .unwrap_or_default();
         let stderr = v.get("stderr").and_then(Value::as_str).unwrap_or_default();
+        RunOutput::bounded(logs, stderr)
+    }
+
+    /// The same for the `logs` and `stderr` a run ended with, before they are committed.
+    fn from_run(logs: &[String], stderr: &str) -> RunOutput {
+        let logs = logs.iter().map(|l| Value::String(l.clone())).collect();
+        RunOutput::bounded(logs, stderr)
+    }
+
+    fn bounded(logs: Vec<Value>, stderr: &str) -> RunOutput {
         let bounded = bound_error(json!({ "logs": logs, "stderr": stderr }));
         RunOutput {
             logs: bounded
@@ -1730,14 +1740,7 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
     provenance.sort_by_key(|r| r.call_id);
     // T18 review I-3: the §6.4 counts and Cautions cover what the document shows beyond the
     // candidate (an error item's logs and stderr are in the candidate, counted once above).
-    let calls = provenance.iter().flat_map(|r| {
-        [
-            r.op_id.as_str(),
-            r.instance.as_str(),
-            r.target_display.as_str(),
-            r.outcome.as_str(),
-        ]
-    });
+    let calls = provenance.iter().flat_map(row_texts);
     count_shown_text(&mut m, std::iter::once(st.source.as_str()).chain(calls));
     let view = m.body;
     m.body = PreviewBody::Script {
@@ -1750,6 +1753,16 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
         stderr: out.stderr,
     };
     m
+}
+
+/// The texts of a provenance row the §6.4 counts and Cautions cover.
+fn row_texts(r: &ProvenanceRow) -> [&str; 4] {
+    [
+        r.op_id.as_str(),
+        r.instance.as_str(),
+        r.target_display.as_str(),
+        r.outcome.as_str(),
+    ]
 }
 
 /// A result item's logs and stderr, read from its committed `SCRIPT_FINISHED` record, into the
@@ -2405,6 +2418,8 @@ enum Finish {
         item: ReleaseItem,
         record: NewEvent,
         body: Value,
+        /// A result's logs and stderr, which are in `record` and not in `body`.
+        output: Option<RunOutput>,
     },
     /// `SCRIPT_FAILED`: direct, or a release item built from its candidate.
     Failed {
@@ -2505,6 +2520,7 @@ fn classify(ended: Ended, shared: &RunShared, ctx: &EventCtx, limits: &ScriptLim
                 item: ReleaseItem::ScriptResult,
                 record: payloads::script_finished_result(ctx, &value, &logs, &stderr),
                 body: json!({ "result": value }),
+                output: Some(RunOutput::from_run(&logs, &stderr)),
             }
         }
         RunEnd::Error {
@@ -2527,6 +2543,7 @@ fn classify(ended: Ended, shared: &RunShared, ctx: &EventCtx, limits: &ScriptLim
                 item: ReleaseItem::ScriptErrorDetails,
                 record: payloads::script_finished_error(ctx, &d),
                 body: json!({ "script_error": bound_error(d.to_value()) }),
+                output: None,
             }
         }
         RunEnd::HostLimit { name } => match unavailable_name(&name) {
@@ -2560,8 +2577,13 @@ async fn finish_real(
     let (dispatched, queued) = (shared.dispatched(), ended.queued);
     match classify(ended, shared, &entry.ctx, limits) {
         Finish::Ignore => {}
-        Finish::Item { item, record, body } => {
-            commit_item(engine, entry, item, record, body, false, shared).await;
+        Finish::Item {
+            item,
+            record,
+            body,
+            output,
+        } => {
+            commit_item(engine, entry, item, record, (body, output), false, shared).await;
         }
         Finish::Failed {
             reason,
@@ -2602,7 +2624,7 @@ async fn finish_real(
                 entry,
                 ReleaseItem::ScriptErrorDetails,
                 record,
-                body,
+                (body, None),
                 preselect,
                 shared,
             )
@@ -2618,7 +2640,7 @@ async fn commit_item(
     entry: &Arc<RequestEntry>,
     item: ReleaseItem,
     record: NewEvent,
-    body: Value,
+    (body, output): (Value, Option<RunOutput>),
     preselect: bool,
     shared: &Arc<RunShared>,
 ) {
@@ -2641,10 +2663,17 @@ async fn commit_item(
             return;
         }
     };
-    let caution = {
+    // The preview as the approver will see it, for the queue's `caution_count`: a result's logs
+    // and stderr (in its record, not its candidate) included, the rows of calls this very end
+    // cancels added under the gate below.
+    let model = {
         let st = entry.state();
-        st.script.as_ref().map_or(0, |s| {
-            super::read::caution_count(&preview_model(s, &candidate))
+        st.script.as_ref().map(|s| {
+            let mut m = preview_model(s, &candidate);
+            if let Some(out) = output {
+                with_record_output(&mut m, out);
+            }
+            m
         })
     };
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
@@ -2674,12 +2703,16 @@ async fn commit_item(
                 st.candidate_hash = *candidate.hash();
                 st.redaction_ops = Vec::new();
                 st.rebuild_failed = false;
-                st.caution_count = caution;
+                let rows: Vec<ProvenanceRow> =
+                    lock(&cancelled_rows).iter().map(cancelled_row).collect();
+                st.caution_count = model.map_or(0, |mut m| {
+                    count_shown_text(&mut m, rows.iter().flat_map(row_texts));
+                    super::read::caution_count(&m)
+                });
                 if let Some(s) = st.script.as_mut() {
                     s.item = Some(item);
                     s.preselect_error_class_only = preselect;
-                    s.calls
-                        .extend(lock(&cancelled_rows).iter().map(cancelled_row));
+                    s.calls.extend(rows);
                     s.instances = called;
                     s.shared = None;
                 }

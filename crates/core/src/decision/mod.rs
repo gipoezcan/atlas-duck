@@ -71,7 +71,7 @@ use crate::engine::write;
 use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, TransitionError};
 use crate::gate::UiEvent;
 use crate::lifecycle::model::{Event, Hold, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
-use crate::ops::{ExecError, MissingField, op_table};
+use crate::ops::{ExecError, MissingField, PreviewModel, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
 use crate::redact::RedactionOp;
 use crate::similarity::SimHit;
@@ -1210,26 +1210,16 @@ async fn script_preview(
     let Some((script, (shown, approvable, opened), failed, redaction)) = built else {
         return Ok(None);
     };
-    let mut model = script::preview_model(&script, &c);
-    // A result's logs and stderr are in its committed record, not in its candidate (PD-145):
-    // read through the same decrypt path as a rebuild, nothing kept in memory.
-    if c.value().get("result").is_some() {
-        let id = entry.head.request_id.clone();
-        let payload = engine
-            .blocking(move |p| Ok(source_payload(p, &id)))
-            .await
-            .map_err(DecisionError::Audit)?;
-        match payload {
-            Ok(payload) => script::with_record_output(&mut model, RunOutput::from_value(&payload)),
-            Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
-            // Unreadable for good: the banner and Release disabled, as for a failed rebuild.
-            Err(_) => {
-                mark_candidate_failed(entry, c.hash());
-                queue_changed(engine, entry);
-                return Err(DecisionError::Invalid(InvalidReason::NotApprovable));
-            }
+    let model = match script_model(engine, entry, &script, &c).await {
+        Ok(m) => m,
+        Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
+        // Unreadable for good: the banner and Release disabled, as for a failed rebuild.
+        Err(_) => {
+            mark_candidate_failed(entry, c.hash());
+            queue_changed(engine, entry);
+            return Err(DecisionError::Invalid(InvalidReason::NotApprovable));
         }
-    }
+    };
     let mut warnings = model.warnings;
     warnings.extend(Flags::of(engine, entry).warnings());
     let preview = Preview {
@@ -1250,6 +1240,28 @@ async fn script_preview(
             .then_some(Preselect::ErrorClassOnly),
     };
     Ok(Some((preview, shown, opened, Some(redaction))))
+}
+
+/// The preview model of a script's candidate `c` as the approver sees it, for every reader of
+/// its Cautions (the opened preview, a redaction's `caution_count`, a batch line). A result's
+/// logs and stderr are in its committed record, not in its candidate (PD-145): read through the
+/// same decrypt path as a rebuild, nothing kept in memory.
+async fn script_model(
+    engine: &Arc<Engine>,
+    entry: &Arc<RequestEntry>,
+    script: &script::ScriptState,
+    c: &Candidate,
+) -> Result<PreviewModel, RebuildError> {
+    let mut model = script::preview_model(script, c);
+    if c.value().get("result").is_some() {
+        let id = entry.head.request_id.clone();
+        let payload = engine
+            .blocking(move |p| Ok(source_payload(p, &id)))
+            .await
+            .map_err(RebuildError::Transient)??;
+        script::with_record_output(&mut model, RunOutput::from_value(&payload));
+    }
+    Ok(model)
 }
 
 /// `SCRIPT_RELEASED` of the current revision's exact candidate `c` with its redaction ops.
@@ -1342,7 +1354,16 @@ async fn redact_script(
         also_appears_in,
         ..script
     };
-    let caution = caution_count(&script::preview_model(&new_script, &c));
+    let caution = match script_model(engine, entry, &new_script, &c).await {
+        Ok(m) => caution_count(&m),
+        Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
+        Err(_) => {
+            mark_rebuild_failed(entry, &rev);
+            queue_changed(engine, entry);
+            let rej = (Rejection::NotApprovable, snapshot(&entry.state()));
+            return Err(rejected(engine, entry, rej, rev.counter, dec).await);
+        }
+    };
     let c = Arc::new(c);
     let (cache, id) = (engine.clone(), entry.head.request_id.clone());
     let applied = engine

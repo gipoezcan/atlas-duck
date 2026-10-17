@@ -258,7 +258,15 @@ async fn check(engine: &Arc<Engine>, item: &BatchItem) -> Result<Checked, Fail> 
                 let Some(script) = entry.state().script.clone() else {
                     return Err(Fail::Item(BatchFailure::NotPending));
                 };
-                crate::engine::script::preview_model(&script, &c).warnings
+                // The same model as the opened preview, a result's logs and stderr included.
+                match super::script_model(engine, &entry, &script, &c).await {
+                    Ok(m) => m.warnings,
+                    Err(RebuildError::Transient(e)) => return Err(Fail::Audit(e)),
+                    Err(_) => {
+                        let f = BatchFailure::Invalid(InvalidReason::NotApprovable);
+                        return Err(failed(engine, &entry, f, rev.counter).await);
+                    }
+                }
             } else {
                 let Some(read) = entry.state().read.clone() else {
                     return Err(Fail::Item(BatchFailure::NotPending));
