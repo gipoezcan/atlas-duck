@@ -1779,89 +1779,96 @@ async fn lost_parse_maps_shutdown_to_killed() -> TestResult {
 
 /// What the logging test runs: a run whose outcome carries worker text and host facts, a spawn
 /// refused for the embedded version, a compile worker that failed to spawn. On one thread, so the
-/// thread's scoped subscriber sees every event.
+/// thread's scoped subscriber sees every event (the glue logs nothing from a blocking thread), and
+/// under [`TEST_BOUND`].
 fn log_scenario() -> TestResult {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     rt.block_on(async {
-        let port = FakePort::new();
-        let g = glue(
-            &port,
-            &worker_file(),
-            Some(report_for(&worker_file(), FloorVerdict::Met)?),
-        );
-        let handle = started(&g, spec(off()), GatedCalls::new()).await?;
-        let mut end = outcome(
-            WorkerEnd::Error {
-                class: "SENTINEL-CLASS".to_owned(),
-                message: "SENTINEL-MESSAGE".to_owned(),
-                stack: "SENTINEL-STACK".to_owned(),
-            },
-            HostVerdict::Limit("process_mb"),
-        );
-        end.logs = vec!["SENTINEL-LOG".to_owned()];
-        end.stderr = "SENTINEL-STDERR".to_owned();
-        end.diag = vec![DIAG_WATCHDOG_KILL, DIAG_STDIN_HELD, "sandbox_new_fact"];
-        port.control(0).ok_or("no run")?.finish(end);
-        handle.wait().await;
-        // A refused spawn: the ready frame names another version, then a spawn error.
-        port.set_ready("SENTINEL-VERSION", conf(true, "SENTINEL-MECHANISM"));
-        let _ = g.start(spec(off()), GatedCalls::new()).await;
-        let fresh = FakePort::new();
-        let g = glue(
-            &fresh,
-            &worker_file(),
-            Some(report_for(&worker_file(), FloorVerdict::Met)?),
-        );
-        fresh.set_compile(CompileAnswer::Verdict(Err(StartRunError::Spawn(
-            io::ErrorKind::TimedOut,
-        ))));
-        let _ = g
-            .compile_check("SENTINEL-SOURCE", &ScriptLimits::default(), off())
-            .await;
-        // The part that no longer matches (lead ruling L152): the binary gone at a submit check
-        // (`Missing`, also what a transient stat error gives), then renamed over before a run's
-        // spawn (`FileId`).
-        let dir = Scratch::new("log-identity")?;
-        let worker = dir.file("atlas-duck-sandbox");
-        fs::write(&worker, b"worker")?;
-        let g = glue(
-            &FakePort::new(),
-            &worker,
-            Some(report_for(&worker, FloorVerdict::Met)?),
-        );
-        fs::remove_file(&worker)?;
-        let _ = g.check_available(off()).await;
-        fs::write(&worker, b"worker")?;
-        let g = glue(
-            &FakePort::new(),
-            &worker,
-            Some(report_for(&worker, FloorVerdict::Met)?),
-        );
-        replace(&worker)?;
-        let _ = g.start(spec(off()), GatedCalls::new()).await;
-        // Refused at admission with no usable worker (T20 review m-1): no recorded identity, the
-        // holder's own record unreadable, no install dir.
-        let g = glue(
-            &FakePort::new(),
-            &worker_file(),
-            Some(bare_report(FloorVerdict::Met)),
-        );
-        let _ = g.check_available(off()).await;
-        let missing = dir.file("not-there");
-        let g = glue_recording(&FakePort::new(), &missing, &missing, bare_report(not_met()));
-        let _ = g.check_available(on()).await;
-        let g = glue_recording(&FakePort::new(), &missing, &worker, bare_report(not_met()));
-        let _ = g.check_available(on()).await;
-        let inputs = ScriptInputs::default();
-        let _ = inputs
-            .probe
-            .set(report_for(&worker_file(), FloorVerdict::Met)?);
-        let g = ScriptGlue::with_port(FakePort::new(), None, inputs);
-        let _ = g.start(spec(off()), GatedCalls::new()).await;
-        Ok(())
+        tokio::time::timeout(TEST_BOUND, log_scenario_body())
+            .await
+            .map_err(|_| "the test body did not finish within its bound")?
     })
+}
+
+async fn log_scenario_body() -> TestResult {
+    let port = FakePort::new();
+    let g = glue(
+        &port,
+        &worker_file(),
+        Some(report_for(&worker_file(), FloorVerdict::Met)?),
+    );
+    let handle = started(&g, spec(off()), GatedCalls::new()).await?;
+    let mut end = outcome(
+        WorkerEnd::Error {
+            class: "SENTINEL-CLASS".to_owned(),
+            message: "SENTINEL-MESSAGE".to_owned(),
+            stack: "SENTINEL-STACK".to_owned(),
+        },
+        HostVerdict::Limit("process_mb"),
+    );
+    end.logs = vec!["SENTINEL-LOG".to_owned()];
+    end.stderr = "SENTINEL-STDERR".to_owned();
+    end.diag = vec![DIAG_WATCHDOG_KILL, DIAG_STDIN_HELD, "sandbox_new_fact"];
+    port.control(0).ok_or("no run")?.finish(end);
+    handle.wait().await;
+    // A refused spawn: the ready frame names another version, then a spawn error.
+    port.set_ready("SENTINEL-VERSION", conf(true, "SENTINEL-MECHANISM"));
+    let _ = g.start(spec(off()), GatedCalls::new()).await;
+    let fresh = FakePort::new();
+    let g = glue(
+        &fresh,
+        &worker_file(),
+        Some(report_for(&worker_file(), FloorVerdict::Met)?),
+    );
+    fresh.set_compile(CompileAnswer::Verdict(Err(StartRunError::Spawn(
+        io::ErrorKind::TimedOut,
+    ))));
+    let _ = g
+        .compile_check("SENTINEL-SOURCE", &ScriptLimits::default(), off())
+        .await;
+    // The part that no longer matches (lead ruling L152): the binary gone at a submit check
+    // (`Missing`, also what a transient stat error gives), then renamed over before a run's
+    // spawn (`FileId`).
+    let dir = Scratch::new("log-identity")?;
+    let worker = dir.file("atlas-duck-sandbox");
+    fs::write(&worker, b"worker")?;
+    let g = glue(
+        &FakePort::new(),
+        &worker,
+        Some(report_for(&worker, FloorVerdict::Met)?),
+    );
+    fs::remove_file(&worker)?;
+    let _ = g.check_available(off()).await;
+    fs::write(&worker, b"worker")?;
+    let g = glue(
+        &FakePort::new(),
+        &worker,
+        Some(report_for(&worker, FloorVerdict::Met)?),
+    );
+    replace(&worker)?;
+    let _ = g.start(spec(off()), GatedCalls::new()).await;
+    // Refused at admission with no usable worker (T20 review m-1): no recorded identity, the
+    // holder's own record unreadable, no install dir.
+    let g = glue(
+        &FakePort::new(),
+        &worker_file(),
+        Some(bare_report(FloorVerdict::Met)),
+    );
+    let _ = g.check_available(off()).await;
+    let missing = dir.file("not-there");
+    let g = glue_recording(&FakePort::new(), &missing, &missing, bare_report(not_met()));
+    let _ = g.check_available(on()).await;
+    let g = glue_recording(&FakePort::new(), &missing, &worker, bare_report(not_met()));
+    let _ = g.check_available(on()).await;
+    let inputs = ScriptInputs::default();
+    let _ = inputs
+        .probe
+        .set(report_for(&worker_file(), FloorVerdict::Met)?);
+    let g = ScriptGlue::with_port(FakePort::new(), None, inputs);
+    let _ = g.start(spec(off()), GatedCalls::new()).await;
+    Ok(())
 }
 
 /// §3.4, §7.7: the glue logs constants and the request id only: the host facts of an outcome,
@@ -1887,18 +1894,7 @@ fn glue_logs_host_diag_constants_only() -> TestResult {
         assert!(SCRIPT_GLUE_EVENTS.contains(&d), "{d} not allowlisted");
     }
 
-    // While exactly one subscriber exists, tracing computes a callsite's interest from the
-    // subscriber of the thread that hits it first; a glue callsite first hit by another test's
-    // thread (none) would then stay "never" for the capture too. A second, idle subscriber keeps
-    // every callsite's interest computed over all live subscribers.
-    let _idle = tracing::Dispatch::new(tracing_subscriber::Registry::default());
-    let cap = Capture::default();
-    let subscriber = tracing_subscriber::layer::SubscriberExt::with(
-        tracing_subscriber::Registry::default(),
-        crate::diag::fields::allowlist_layer(cap.clone()),
-    );
-    tracing::subscriber::with_default(subscriber, log_scenario)?;
-    let out = String::from_utf8(lock(&cap.0).clone())?;
+    let out = capture_on_this_thread(|_| log_scenario())?;
     assert!(out.contains("event=sandbox_watchdog_kill"), "{out}");
     assert!(out.contains("event=sandbox_stdin_held_after_exit"), "{out}");
     assert!(out.contains("event=sandbox_diag_unlisted"), "{out}");
