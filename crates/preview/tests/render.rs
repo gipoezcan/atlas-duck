@@ -1582,9 +1582,18 @@ fn amp_8203_literal() {
     assert!(!d.contains('\u{200B}') && !d.contains("U+200B"));
 }
 
+/// M8 T18: the script documents are `render5`, the next part after M7's `render4` (M8 plan Δ5).
+/// `render4` is M7's and is not on this branch: the M7 merge inserts it before `render5` and
+/// re-pins `render5` over the union of the goldens (this branch's entry is not merged yet).
 #[test]
-fn builder_version_names_the_render_version() {
-    assert_eq!(PREVIEW_BUILDER_VERSION, "pb2;render3;icu-17.0;emoji-17.0");
+fn render_version_is_render5() {
+    assert_eq!(PREVIEW_BUILDER_VERSION, "pb2;render5;icu-17.0;emoji-17.0");
+    let names: Vec<&str> = RENDER_VERSIONS.iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["render1", "render2", "render3", "render5"]);
+    // The M6 entries never change.
+    assert_eq!(RENDER_VERSIONS[0], ("render1", 0x50e0_b962_fa25_e8fa));
+    assert_eq!(RENDER_VERSIONS[1], ("render2", 0x5977_a808_67ef_8b73));
+    assert_eq!(RENDER_VERSIONS[2], ("render3", 0x18d6_262f_815e_9ad3));
 }
 
 /// FNV-1a 64 over every golden (by file name: the name, NUL, the bytes, NUL), then

@@ -21,7 +21,7 @@ pub const RAW_PAGE_BYTES: u64 = 256 * 1024;
 /// - `emoji-17.0`: `emojis` 0.9.0 README "Uses Unicode v17.0 emoji specification"
 ///   (`emojis::UNICODE_VERSION`).
 pub const PREVIEW_BUILDER_VERSION: &str =
-    concat!("pb2;render", "3", ";icu-", "17.0", ";emoji-", "17.0");
+    concat!("pb2;render", "5", ";icu-", "17.0", ";emoji-", "17.0");
 
 /// Each `renderN` with the FNV-1a 64 digest of what it renders: the goldens in
 /// `tests/golden/render` and `app/ui/public/preview.css` (`tests/render.rs` recomputes it and
@@ -33,6 +33,9 @@ pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     ("render1", 0x50e0_b962_fa25_e8fa),
     ("render2", 0x5977_a808_67ef_8b73),
     ("render3", 0x18d6_262f_815e_9ad3),
+    // M8 Task 18 (Δ5): the script result and error documents. `render4` is M7's (not on this
+    // branch); the M7 merge puts it before this entry and re-pins this one over all the goldens.
+    ("render5", 0xa388_29fc_5505_18c2),
 ];
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
