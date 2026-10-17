@@ -113,8 +113,8 @@ pub trait WorkerProcess {
 /// [`Reaper::wait`] kills the worker and reaps it for up to 2 s. A bridge
 /// always drives the reaper to the end.
 pub struct WorkerParts {
-    /// OS process id of the worker (for the macOS footprint watchdog and the
-    /// Linux `/proc` check; never signalled directly).
+    /// OS process id of the worker (for checks from outside such as the
+    /// Linux `/proc` one; never signalled directly).
     pub pid: u32,
     /// The worker's stdin, stdout and stderr.
     pub io: WorkerIo,

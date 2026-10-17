@@ -36,8 +36,8 @@ use atlas_duck_sandbox_host::bridge::{
     DIAG_MEMORY_WATCH_FAILED, DIAG_OUTCOME_LOST, DIAG_REAP_FAILED, DIAG_STDOUT_HELD,
     DIAG_UNREAD_RESULTS, DIAG_WATCHDOG_KILL, ExpectedWorker, HostCallSink, HostVerdict, KillCause,
     LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl, RunOutcome, STDERR_CAP,
-    STDOUT_GRACE, StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker,
-    start_run, unread_results_cap,
+    StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker, start_run,
+    unread_results_cap,
 };
 use atlas_duck_sandbox_host::identity::{FileId, IdentityPart, SandboxBinaryIdentity};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
@@ -209,14 +209,14 @@ impl FakeWorker {
     }
 
     /// Hands stdout to a "child" that outlives the fake (a degraded worker that forked): the
-    /// child sends one log frame after `late`, then holds the pipe until `hold` has passed.
+    /// child sends one log frame once `go` receives, then holds the pipe until `hold` has passed.
     /// Returns a receiver told once that frame was written.
-    fn fork_child_holding_stdout(&mut self, late: Duration, hold: Duration) -> Receiver<()> {
+    fn fork_child_holding_stdout(&mut self, go: Receiver<()>, hold: Duration) -> Receiver<()> {
         let stdout = self.stdout.take();
         let (written_tx, written) = mpsc::channel();
         thread::spawn(move || {
             let started = Instant::now();
-            thread::sleep(late);
+            let _ = go.recv_timeout(hold);
             if let Some(mut stdout) = stdout {
                 if write_frame(&mut stdout, &log_frame("from the child")).is_ok() {
                     let _ = written_tx.send(());
@@ -2408,13 +2408,14 @@ async fn the_outcome_does_not_wait_for_a_stdout_held_past_the_exit() -> TestResu
     // T7 review m-3: a (degraded) worker forks a child that holds its stdout and exits. The
     // outcome is published STDOUT_GRACE after the reap, and a frame the child sends later is
     // ignored.
-    let late = STDOUT_GRACE + Duration::from_secs(2);
+    // The child writes its frame only once the outcome is out (no timing race with the grace).
     let hold = Duration::from_secs(20);
+    let (published_tx, published_rx) = mpsc::channel();
     let (written_tx, written_rx) = mpsc::channel();
     let (spawner, _) = fake(move |w| {
         w.ready()?;
         w.read()?;
-        let written = w.fork_child_holding_stdout(late, hold);
+        let written = w.fork_child_holding_stdout(published_rx, hold);
         thread::spawn(move || {
             if written.recv_timeout(WAIT_BOUND).is_ok() {
                 let _ = written_tx.send(());
@@ -2432,12 +2433,11 @@ async fn the_outcome_does_not_wait_for_a_stdout_held_past_the_exit() -> TestResu
     .await??;
     let started = Instant::now();
     let outcome = tokio::time::timeout(Duration::from_secs(10), handle.wait()).await?;
-    assert!(
-        started.elapsed() < hold,
-        "published before the child let go"
-    );
+    let took = started.elapsed();
+    assert!(took < hold, "published before the child let go ({took:?})");
+    let _ = published_tx.send(());
     assert_eq!(outcome.host, HostVerdict::Crashed(Some(ExitKind::Code(0))));
-    assert_eq!(outcome.diag, vec![DIAG_STDOUT_HELD]);
+    assert_eq!(outcome.diag, vec![DIAG_STDOUT_HELD], "after {took:?}");
     let written = tokio::task::spawn_blocking(move || written_rx.recv_timeout(WAIT_BOUND)).await?;
     assert!(written.is_ok(), "the child wrote its late frame");
     tokio::time::sleep(Duration::from_millis(500)).await;
