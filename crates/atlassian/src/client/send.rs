@@ -28,6 +28,17 @@ use crate::url::build_url;
 
 /// §7.2: 32 MiB per HTTP response.
 pub(crate) const MAX_RESPONSE_BYTES: u64 = 32 * 1024 * 1024;
+/// §7.2: the cap of one response under a byte budget, `left` of a read's fetch budget or
+/// `max_response` per response, whichever is closer, and the class of a body over it
+/// (`ResponseCap32MiB` on a tie).
+pub(crate) fn response_cap(left: u64, max_response: u64) -> (u64, PostSendKind) {
+    if left < max_response {
+        (left, PostSendKind::FetchCap50MiB)
+    } else {
+        (max_response, PostSendKind::ResponseCap32MiB)
+    }
+}
+
 /// §7.2: at most 3 retries of a `429`.
 const MAX_429_RETRIES: u32 = 3;
 /// How long the body of a `429` that is about to be retried is read (in addition to the attempt

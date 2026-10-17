@@ -1724,7 +1724,7 @@ impl CallPlan {
     ) -> read::Fetched {
         match self {
             CallPlan::Whole(plan, start) => {
-                read::run_plan(client, cover, plan, budget, ctl, *start).await
+                read::run_plan(client, cover, plan, budget, ctl, *start, true).await
             }
             CallPlan::Page(plan, start) => plan.run(client, cover, budget, ctl, *start).await,
         }

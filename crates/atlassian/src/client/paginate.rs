@@ -9,7 +9,7 @@ use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess,
 use serde_json::Value;
 use tokio::time::Instant;
 
-use super::send::{OneRequest, Target};
+use super::send::{OneRequest, Target, response_cap};
 use super::{FetchControl, InstanceClient, Product};
 use crate::cover::AuditCover;
 use crate::types::{
@@ -311,11 +311,7 @@ impl InstanceClient {
             let want = (max_items - out.items_fetched).min(page_limit);
             // §7.2: 32 MiB per response, 50 MiB per paginated read; whichever is closer cuts.
             let left = budget.max_bytes.saturating_sub(fetched_bytes);
-            let (cap, cap_kind) = if left < budget.max_response_bytes {
-                (left, PostSendKind::FetchCap50MiB)
-            } else {
-                (budget.max_response_bytes, PostSendKind::ResponseCap32MiB)
-            };
+            let (cap, cap_kind) = response_cap(left, budget.max_response_bytes);
             let overall = Some((deadline, PostSendKind::ReadBudget120s));
 
             let outcome = match &source {

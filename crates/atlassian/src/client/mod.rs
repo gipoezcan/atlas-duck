@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use crate::cover::{AuditCover, DateObserver};
 use crate::credentials::CredentialProvider;
 use crate::types::{
-    FetchFailure, FetchOutcome, GetCall, PostSendKind, SearchCall, UpstreamResponse,
+    FetchFailure, FetchOutcome, GetCall, PostSendKind, ReadBudget, SearchCall, UpstreamResponse,
 };
 use crate::url::NormalizedBaseUrl;
 
@@ -304,6 +304,35 @@ impl InstanceClient {
         call: &GetCall,
         ctl: &FetchControl,
     ) -> FetchOutcome {
+        let cap = (send::MAX_RESPONSE_BYTES, PostSendKind::ResponseCap32MiB);
+        self.get_capped(cover, call, cap, ctl).await
+    }
+
+    /// `get_ctl` under the byte limits of `budget` (M8 T19d, §9.5: a script's host call): the
+    /// body is cut while it streams at the rest of the fetch budget (`max_bytes`,
+    /// `FetchCap50MiB`) or the per-response cap (`max_response_bytes`, `ResponseCap32MiB`),
+    /// whichever is smaller, as a page is. Only the bytes apply: the call keeps the per-call
+    /// deadline of `get_ctl`, not the read's time budget.
+    pub async fn get_budget_ctl(
+        &self,
+        cover: &AuditCover,
+        call: &GetCall,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+    ) -> FetchOutcome {
+        let cap = send::response_cap(budget.max_bytes, budget.max_response_bytes);
+        self.get_capped(cover, call, cap, ctl).await
+    }
+
+    /// One `GET` whose body is cut at `cap` (the bytes and the class of a body over them).
+    async fn get_capped(
+        &self,
+        cover: &AuditCover,
+        call: &GetCall,
+        cap: (u64, PostSendKind),
+        ctl: &FetchControl,
+    ) -> FetchOutcome {
+        let (max_response_bytes, cap_kind) = cap;
         let req = send::OneRequest {
             target: send::Target::Template {
                 cover,
@@ -314,8 +343,8 @@ impl InstanceClient {
                 json_body: None,
             },
             overall: None,
-            max_response_bytes: send::MAX_RESPONSE_BYTES,
-            cap_kind: PostSendKind::ResponseCap32MiB,
+            max_response_bytes,
+            cap_kind,
         };
         self.send_one(req, ctl).await
     }
@@ -334,13 +363,18 @@ impl InstanceClient {
         call: &GetCall,
         ctl: &FetchControl,
     ) -> FetchOutcome {
-        let out = self.get_ctl(cover, call, ctl).await;
-        if let FetchOutcome::Response(r) = &out
-            && (200..300).contains(&r.status)
-        {
-            ctl.push_page(r.clone());
-        }
-        out
+        kept(self.get_ctl(cover, call, ctl).await, ctl)
+    }
+
+    /// [`Self::get_kept_ctl`] under the byte limits of `budget`, as [`Self::get_budget_ctl`].
+    pub async fn get_kept_budget_ctl(
+        &self,
+        cover: &AuditCover,
+        call: &GetCall,
+        budget: &ReadBudget,
+        ctl: &FetchControl,
+    ) -> FetchOutcome {
+        kept(self.get_budget_ctl(cover, call, budget, ctl).await, ctl)
     }
 
     /// The one allowlisted read `POST` (`jira.search`); the method guard refuses any other path.
@@ -372,6 +406,16 @@ impl InstanceClient {
     pub fn base(&self) -> &NormalizedBaseUrl {
         &self.cfg.base
     }
+}
+
+/// A 2xx answer is also kept in `ctl` (the first leg of a composite read).
+fn kept(out: FetchOutcome, ctl: &FetchControl) -> FetchOutcome {
+    if let FetchOutcome::Response(r) = &out
+        && (200..300).contains(&r.status)
+    {
+        ctl.push_page(r.clone());
+    }
+    out
 }
 
 /// `http://host:port` with nothing else: a host that would smuggle userinfo, a path or a query

@@ -377,7 +377,9 @@ pub(crate) enum Fetched {
 
 /// Runs `plan` under `cover` with `ctl` (the direct read and a script's host call). A composite
 /// read sends the issue GET, then the comment pages with what is left of the one read budget
-/// (time and bytes): `budget` bounds the read as a whole (§7.2).
+/// (time and bytes): `budget` bounds the read as a whole (§7.2). `script`: a script's host call,
+/// whose single GETs (a composite's issue included) are cut at the budget's bytes too (§9.5,
+/// M8 T19d); a direct read's are cut at the fixed 32 MiB alone.
 pub(crate) async fn run_plan(
     client: &InstanceClient,
     cover: &AuditCover,
@@ -385,8 +387,12 @@ pub(crate) async fn run_plan(
     budget: &ReadBudget,
     ctl: &FetchControl,
     start: u64,
+    script: bool,
 ) -> Fetched {
     match plan {
+        ReadPlan::Get(call) if script => {
+            Fetched::Single(client.get_budget_ctl(cover, call, budget, ctl).await)
+        }
         ReadPlan::Get(call) => Fetched::Single(client.get_ctl(cover, call, ctl).await),
         ReadPlan::Paged { call, max_items } => Fetched::Paged {
             outcome: client
@@ -412,7 +418,12 @@ pub(crate) async fn run_plan(
         } => {
             let began = tokio::time::Instant::now();
             // A 2xx issue answer is kept in `ctl`: a cancel during the comment pages records it.
-            let issue = match client.get_kept_ctl(cover, issue, ctl).await {
+            let issue = if script {
+                client.get_kept_budget_ctl(cover, issue, budget, ctl).await
+            } else {
+                client.get_kept_ctl(cover, issue, ctl).await
+            };
+            let issue = match issue {
                 FetchOutcome::Response(r) if status_2xx(&r) => r,
                 other => return Fetched::Single(other),
             };
@@ -468,7 +479,7 @@ async fn fetch(
         .get("start")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let fetched = run_plan(&http.client, &cover, &plan, &budget, &ctl, start).await;
+    let fetched = run_plan(&http.client, &cover, &plan, &budget, &ctl, start, false).await;
     Ok((fetched, http))
 }
 
