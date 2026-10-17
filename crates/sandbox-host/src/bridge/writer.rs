@@ -7,7 +7,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use atlas_duck_ipc::sandbox::frame::write_frame;
@@ -22,11 +22,16 @@ pub(crate) const RESULT_TOO_LARGE: &str = "result_too_large";
 /// Starts the writer thread over `stdin`. `queued` counts the payload bytes queued and not yet
 /// written: the sender adds a frame's length before it queues the frame, and the writer takes it
 /// off once the frame is written.
+///
+/// The returned receiver is never sent on: it disconnects when the thread ends (also when it
+/// unwinds), after every sender is gone and the queue and stdin are dropped. A run publishes its
+/// outcome only after that, so its queue does not outlive it.
 pub(crate) fn spawn(
     mut stdin: Box<dyn Write + Send>,
     frames: Receiver<Vec<u8>>,
     queued: Arc<AtomicUsize>,
-) -> io::Result<()> {
+) -> io::Result<Receiver<()>> {
+    let (ended_tx, ended) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("sandbox-writer".to_owned())
         .spawn(move || {
@@ -40,8 +45,10 @@ pub(crate) fn spawn(
                 }
                 queued.fetch_sub(frame.len(), Ordering::SeqCst);
             }
+            drop(stdin);
+            drop(ended_tx);
         })?;
-    Ok(())
+    Ok(ended)
 }
 
 /// The JSON-RPC response to call `id`, and whether `result` had to be replaced. A response above

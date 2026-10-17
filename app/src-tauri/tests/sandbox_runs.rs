@@ -539,7 +539,10 @@ mod s10 {
             BTreeSet::from([0, 1, 2]),
             "descriptor {leaked} leaked into the worker"
         );
-        println!("M8 s10_handles os=linux fds={fds:?}");
+        println!(
+            "M8 s10_handles os=linux fds={:?}",
+            fds.iter().collect::<Vec<_>>()
+        );
         p.close_stdin();
         assert!(
             p.wait_timeout(WAIT)?.is_some(),
