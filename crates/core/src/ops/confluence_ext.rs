@@ -1081,29 +1081,39 @@ const CONTENT_BASE64: GeneralPurpose = GeneralPurpose::new(
         .with_decode_allow_trailing_bits(true),
 );
 
-/// T20a review I-2 (lead ruling, plan review I-4): the Request tab's copy of an upload's params,
-/// `content_base64` replaced by `{"content": null, "bytes", "sha256"}` of the decoded file (the
-/// digest line the request view shows; both `null` for content that does not decode), so the
-/// file never reaches the webview through that DTO. `None` for any other op or params without
-/// the key (shown as they are). The executor renders from the real params, and `params_sha256`
-/// covers them.
+/// The `(op, param)` pairs whose value is a base64 file the Request tab shows as its size and
+/// SHA-256 only (T20a review I-2, plan review I-4). The same pairs as the edit form's PD-110
+/// `null` rule (T20b `edit::NOT_INLINED`): the merge can make this that one list.
+pub(crate) const REQUEST_TAB_DIGESTED: [(&str, &str); 1] =
+    [("confluence.attachment.upload", "content_base64")];
+
+/// The Request tab's copy of `params` (T20a review I-2, lead ruling): each
+/// [`REQUEST_TAB_DIGESTED`] param of `op_id` replaced by `{"content": null, "bytes", "sha256"}`
+/// of the decoded file (the digest line the request view shows; both `null` for content that
+/// does not decode), so the file never reaches the webview through that DTO. `None` when no
+/// pair applies (the params are shown as they are). The executor renders from the real params,
+/// and `params_sha256` covers them.
 pub(crate) fn request_tab_params(op_id: &str, params: &Value) -> Option<Value> {
-    if op_id != "confluence.attachment.upload" {
+    let map = params.as_object()?;
+    let digested: Vec<&str> = REQUEST_TAB_DIGESTED
+        .iter()
+        .filter(|(op, param)| *op == op_id && map.contains_key(*param))
+        .map(|(_, param)| *param)
+        .collect();
+    if digested.is_empty() {
         return None;
     }
-    let map = params.as_object()?;
-    let decoded = map
-        .get("content_base64")?
-        .as_str()
-        .and_then(|c| CONTENT_BASE64.decode(c).ok());
-    let file = json!({
-        "content": null,
-        "bytes": decoded.as_ref().map(Vec::len),
-        "sha256": decoded.as_deref().map(|d| hex::encode(Sha256::digest(d))),
-    });
+    let file = |v: &Value| {
+        let decoded = v.as_str().and_then(|c| CONTENT_BASE64.decode(c).ok());
+        json!({
+            "content": null,
+            "bytes": decoded.as_ref().map(Vec::len),
+            "sha256": decoded.as_deref().map(|d| hex::encode(Sha256::digest(d))),
+        })
+    };
     let shown = map.iter().map(|(k, v)| {
-        let v = if k == "content_base64" {
-            file.clone()
+        let v = if digested.contains(&k.as_str()) {
+            file(v)
         } else {
             v.clone()
         };

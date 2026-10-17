@@ -1336,12 +1336,13 @@ async fn upload_over_10mib_rejected_exit2() -> TestResult {
     Ok(())
 }
 
-/// Plan review I-4 / T20a review I-2 (lead ruling): a 10 MiB upload puts the file into neither
-/// the Request tab's params (`content_base64` is its size and SHA-256, the content `null`) nor
-/// the Raw pages (PD-109: Raw names the hashes, never a base64 of the body); the executor still
-/// sends the real bytes, and Raw's hashes are the ones `WRITE_APPROVED` and the wire carry.
+/// Plan review I-4 / T20a review I-2 (lead rulings): a 10 MiB upload never puts the file into
+/// the Request tab's params (`content_base64` is its size and SHA-256, the content `null`); Raw
+/// stays the exact request list `WRITE_APPROVED` stores (option B), fetched on demand in pages
+/// of at most `page_bytes` (256 KiB) per `raw_page` call, never as one DTO; the executor still
+/// sends the real bytes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn request_tab_and_raw_never_carry_the_file_10mib() -> TestResult {
+async fn request_tab_digests_the_file_and_raw_stays_paged_10mib() -> TestResult {
     let h = Harness::confluence().await?;
     let mock = wiki(&h)?;
     upload_server(mock, &[]).await;
@@ -1364,21 +1365,26 @@ async fn request_tab_and_raw_never_carry_the_file_10mib() -> TestResult {
     assert_eq!(detail.params["filename"], json!(FILENAME));
     assert_eq!(detail.params["comment"], json!(COMMENT));
 
+    // Raw: only the pager metadata is in the preview; each page is one bounded call.
     let preview = h.approver().open(&id).map_err(de)?.preview;
+    let pager = preview.raw;
+    assert_eq!(pager.page_bytes, 256 * 1024);
     assert!(
-        preview.raw.total_bytes < 4096,
-        "{} bytes",
-        preview.raw.total_bytes
+        pager.total_bytes > 10 * 1024 * 1024,
+        "the whole stored list"
+    );
+    assert_eq!(
+        pager.page_count,
+        pager.total_bytes.div_ceil(pager.page_bytes)
     );
     let rev = h.approver().rev(&id).map_err(de)?;
     let mut raw = Vec::new();
-    for page in 0..preview.raw.page_count {
-        raw.extend(h.decisions().raw_page(&id, rev, page).map_err(de)?.bytes);
+    for page in 0..pager.page_count {
+        let p = h.decisions().raw_page(&id, rev, page).map_err(de)?;
+        assert!(p.bytes.len() as u64 <= pager.page_bytes, "page {page}");
+        raw.extend(p.bytes);
     }
-    no_file_bytes(&String::from_utf8(raw.clone())?, &content)?;
-    let raw: Value = serde_json::from_slice(&raw)?;
-    let shown = &raw["requests"][0];
-    assert_eq!(shown["body_b64"], Value::Null, "{raw}");
+    assert_eq!(raw.len() as u64, pager.total_bytes);
 
     h.approver().approve(&id).map_err(de)?;
     let env = h.await_(&id, 20_000).await;
@@ -1394,13 +1400,18 @@ async fn request_tab_and_raw_never_carry_the_file_10mib() -> TestResult {
         .and_then(|ct| ct.strip_prefix("multipart/form-data; boundary="))
         .ok_or("no multipart content type")?;
     assert_eq!(parts(&sent.body, boundary)?[0].1, content, "the real bytes");
-    assert_eq!(shown["body_bytes"], json!(sent.body.len()));
-    assert_eq!(shown["body_sha256"], json!(sha256_hex(&sent.body)));
+    // Raw is exactly the list `WRITE_APPROVED` stores (the stored array, `body_b64` the wire
+    // bytes).
     let approved = records_of(&h, &id, EventType::WRITE_APPROVED).await?;
     let [approved] = approved.as_slice() else {
         return Err("not one WRITE_APPROVED".into());
     };
-    assert_eq!(raw["request_set_hash"], approved["request_set_hash"]);
+    assert_eq!(raw, serde_json::to_vec(&approved["requests"])?);
+    let raw: Value = serde_json::from_slice(&raw)?;
+    assert_eq!(
+        STANDARD.decode(raw[0]["body_b64"].as_str().ok_or("no body_b64")?)?,
+        sent.body
+    );
     Ok(())
 }
 
