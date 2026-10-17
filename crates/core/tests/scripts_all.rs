@@ -535,13 +535,56 @@ async fn i21_all_fetch_bytes_reach_max_fetch_mb_rejects() -> TestResult {
     )
     .await?;
     h.queued(&id, 20_000).await.ok_or("never queued")?;
-    let (class, _) = single_rejection(&runner.results())?;
+    let (class, details) = single_rejection(&runner.results())?;
     assert_eq!(class, "script_limit");
+    // Refused between pages, not inside one.
+    assert_eq!(
+        details["message"],
+        "the run's fetched bytes reached max_fetch_mb"
+    );
     // The fetched bytes reached `max_fetch_mb` with page 1: page 2 is never requested.
     assert_eq!(hits_of(&hits).len(), 2);
     let calls = script_calls(&h, &id).await?;
     assert_eq!(calls.len(), 2);
     assert!(calls.iter().all(|c| c["bytes"] == 512 * 1024), "{calls:?}");
+    Ok(())
+}
+
+/// T13 review m-2: a page's fetch budget is `max_fetch_mb` minus the bytes the run already
+/// fetched. With 600 KiB pages and `max_fetch_mb = 1`, page 1 has 424 KiB left: it is cut inside
+/// the page (its record names the fetch cap) and page 2 is never requested.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_page_fetch_budget_is_the_cap_minus_the_bytes_fetched() -> TestResult {
+    const PAGE: u64 = 600 * 1024;
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![search_all(1, 100)],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let mut pages = Pages::new(&h, 700)?;
+    pages.exact = Some(usize::try_from(PAGE)?);
+    let hits = pages.mount(&h).await?;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let (class, details) = single_rejection(&runner.results())?;
+    assert_eq!(class, "script_limit");
+    // Cut inside page 1, not refused before page 2.
+    assert_eq!(details["message"], "the run exceeded a call or fetch limit");
+    assert_eq!(hits_of(&hits).len(), 2);
+    let calls = script_calls(&h, &id).await?;
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls[0]["page"], 0);
+    assert_eq!(calls[0]["rejection"], Value::Null, "{}", calls[0]);
+    assert_eq!(calls[0]["bytes"], PAGE);
+    let cut = &calls[1];
+    assert_eq!(cut["page"], 1);
+    assert_eq!(cut["rejection"], "max_fetch_mb", "{cut}");
+    assert_eq!(cut["cap_or_budget"], "fetch_cap_50mib", "{cut}");
+    assert!(cut["bytes"].as_u64().is_some_and(|b| b < PAGE), "{cut}");
     Ok(())
 }
 
@@ -620,7 +663,7 @@ async fn all_run_end_mid_page_records_the_page_and_stops_paging() -> TestResult 
     };
     let (h, _runner) = harness(vec![
         ScriptPlan::new(vec![search_all(1, 100)], result_end(json!(1)))
-            .interrupted(1500, end)
+            .interrupted(3500, end)
             .keeping_calls(),
     ])
     .await?;

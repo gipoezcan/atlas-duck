@@ -3204,6 +3204,85 @@ mod tests {
         Ok(())
     }
 
+    fn info(call_id: u64) -> CallInfo {
+        CallInfo {
+            call_id,
+            op: "jira.search".to_owned(),
+            params: Value::Null,
+            alias: "jira-main".to_owned(),
+            instance_id: "i1".to_owned(),
+            user_key: None,
+            page: Some(1),
+        }
+    }
+
+    /// A run with `calls` host calls and `fetched` bytes so far.
+    fn run_at(calls: u32, fetched: u64) -> RunShared {
+        let s = RunShared::default();
+        {
+            let mut g = lock(&s.inner);
+            g.calls = calls;
+            g.fetched_bytes = fetched;
+        }
+        s
+    }
+
+    fn start(s: &RunShared, call_id: u64, limits: Option<(u32, u64)>) -> &'static str {
+        match s.begin_page(info(call_id), FetchControl::new(), limits) {
+            PageStart::Go => "go",
+            PageStart::Stopped => "stopped",
+            PageStart::MaxCalls => "max_calls",
+            PageStart::MaxFetch => "max_fetch",
+        }
+    }
+
+    fn in_flight(s: &RunShared) -> Vec<u64> {
+        let mut ids: Vec<u64> = lock(&s.inner).in_flight.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// T13 review m-1: a run that ended or whose kill was asked admits nothing, with or without
+    /// limits, and nothing is counted or put in flight.
+    #[test]
+    fn begin_page_refuses_an_ended_or_killed_run() {
+        for limits in [None, Some((10, 100))] {
+            let ended = run_at(1, 0);
+            ended.mark_ended();
+            assert_eq!(start(&ended, 1, limits), "stopped");
+            let killed = run_at(1, 0);
+            assert!(killed.request_kill(KillReason::Client));
+            assert_eq!(start(&killed, 1, limits), "stopped");
+            for s in [ended, killed] {
+                assert!(in_flight(&s).is_empty());
+                assert_eq!(s.calls(), 1);
+            }
+        }
+    }
+
+    /// T13 review m-1: the limits of a later page (PD-144): `max_calls` first, then the fetched
+    /// bytes at the cap; only a page that goes is counted and put in flight. Without limits (a
+    /// plain call, page 0) nothing is checked or counted here.
+    #[test]
+    fn begin_page_checks_max_calls_then_fetched_bytes() {
+        let limits = Some((3, 100));
+        let below = run_at(2, 99);
+        assert_eq!(start(&below, 1, limits), "go");
+        assert_eq!((below.calls(), in_flight(&below)), (3, vec![1]));
+        let at_calls = run_at(3, 0);
+        assert_eq!(start(&at_calls, 1, limits), "max_calls");
+        assert_eq!((at_calls.calls(), in_flight(&at_calls)), (3, vec![]));
+        let at_cap = run_at(0, 100);
+        assert_eq!(start(&at_cap, 1, limits), "max_fetch");
+        assert_eq!((at_cap.calls(), in_flight(&at_cap)), (0, vec![]));
+        // Both over: `max_calls` is named.
+        let both = run_at(3, 100);
+        assert_eq!(start(&both, 1, limits), "max_calls");
+        let plain = run_at(3, 100);
+        assert_eq!(start(&plain, 7, None), "go");
+        assert_eq!((plain.calls(), in_flight(&plain)), (3, vec![7]));
+    }
+
     /// T13 review I-1: a plain call whose run ended, or whose kill was asked, after `live_call`'s
     /// `running()` check is refused when it registers (one lock with the end's drain): nothing
     /// is sent, so no request leaves without its `SCRIPT_CALL` (§5.1 inv. 1, §9.5). The run's
