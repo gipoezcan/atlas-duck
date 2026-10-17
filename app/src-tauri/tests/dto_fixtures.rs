@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use atlas_duck_app_lib::cli_install::InstallError;
 use atlas_duck_app_lib::commands::CommandError;
 use atlas_duck_app_lib::commands::approvals::{
-    DenyCount, QueueDetail, RawPageDto, RedactionContextDto,
+    DenyCount, QueueDetail, RawPageDto, RedactionContextDto, preview_fetch_response,
 };
 use atlas_duck_app_lib::commands::credential::{
     ArchiveOutcome, CLASS_CONTEXT_CHANGED, Connected, CredentialContextDto, NoteSaved,
@@ -38,10 +38,10 @@ use atlas_duck_core::running::RunningScriptView;
 use atlas_duck_core::validate::ValidationError;
 use atlas_duck_core::{
     AdminError, AttentionMode, BatchFailure, BatchOutcome, CandidateRev, ConfigBanner,
-    ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView, Product,
-    PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext, RedactionOp,
-    RedactionReport, RequestDetail, SessionKey, SettingsError, SettingsView, StoreHealthView,
-    UrlMode, VerifyNow,
+    ConnectionFailure, DecisionError, DecisionOutcome, InstanceView, LimitsView, PreviewDelivery,
+    Product, PruneReport, QueueItem, RELEASE_BLOCKED_INTERNAL, RecentItem, RedactionContext,
+    RedactionOp, RedactionReport, RequestDetail, SessionKey, SettingsError, SettingsView,
+    StoreHealthView, UrlMode, VerifyNow,
 };
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::diff::{DiffLine, DiffOp};
@@ -1285,6 +1285,37 @@ fn every_preview_body_variant_has_a_fixture() -> TestResult {
     // fixture.
     assert_eq!(kinds.len(), 18, "{kinds:?}");
     assert_eq!(unique.len(), 18, "{kinds:?}");
+    Ok(())
+}
+
+/// T20b review m-1: the attachment thumbnail reaches the screen only through the `srcdoc` (no UI
+/// code reads `thumbnail_data_uri`), so `preview_fetch` sends it once: in the document, never in
+/// the preview DTO beside it. Everything else in the preview is sent as core built it.
+#[test]
+fn preview_fetch_sends_the_thumbnail_in_the_srcdoc_only() -> TestResult {
+    let uri = "data:image/png;base64,AAAA";
+    for preview in previews() {
+        let upload = matches!(preview.body, PreviewBody::AttachmentUpload { .. });
+        let mut want = preview.clone();
+        if let PreviewBody::AttachmentUpload {
+            thumbnail_data_uri, ..
+        } = &mut want.body
+        {
+            assert_eq!(thumbnail_data_uri.as_deref(), Some(uri));
+            *thumbnail_data_uri = None;
+        }
+        let r = preview_fetch_response(PreviewDelivery {
+            preview,
+            redaction: None,
+        });
+        assert_eq!(r.preview, want);
+        assert_eq!(
+            r.srcdoc.contains(&format!("<img src=\"{uri}\"")),
+            upload,
+            "the document shows the thumbnail"
+        );
+        assert!(!serde_json::to_string(&r.preview)?.contains(uri));
+    }
     Ok(())
 }
 

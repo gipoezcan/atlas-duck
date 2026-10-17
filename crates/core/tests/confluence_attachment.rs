@@ -8,7 +8,8 @@
 //! (`Projection::FirstResultFields`) and the request view that never carries the file bytes
 //! (Δ2, plan review I-4), while `WRITE_APPROVED` stores and hashes the exact wire bytes.
 //! Task 20b (PD-110): the `AttachmentUpload` card over the request sent (sniffed type, SHA-256,
-//! the thumbnail capped at 2 MiB, the extension fact row, the collision and replace lines), the
+//! the PNG or JPEG thumbnail capped at 2 MiB and at 8192 px per side and 2^24 px read from the
+//! header, the extension fact row, the collision and replace lines), the
 //! edit form that never inlines `content_base64` (a `null` edit of it is "unchanged") and the
 //! bounded preview of a 10 MiB upload.
 //!
@@ -167,6 +168,16 @@ fn preview_of(
     v: &EnrichVerdict,
     reqs: &[HttpRequestSpec],
 ) -> Result<PreviewModel, TestError> {
+    preview_held(params, v, reqs, v.hold)
+}
+
+/// [`preview_of`] with the view's own `hold` (a verdict that is stale against the view).
+fn preview_held(
+    params: &Value,
+    v: &EnrichVerdict,
+    reqs: &[HttpRequestSpec],
+    hold: Hold,
+) -> Result<PreviewModel, TestError> {
     let imp = op_table().get(UPLOAD).ok_or("no OpImpl")?;
     let ctx = PreviewCtx {
         spec: spec()?,
@@ -174,7 +185,7 @@ fn preview_of(
         params,
         input: PreviewInput::Write(WriteView {
             requests: reqs,
-            hold: v.hold,
+            hold,
             enrichment: Some(v),
             failure: None,
         }),
@@ -1509,6 +1520,47 @@ fn headed(magic: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
+/// A PNG whose header declares `w`×`h` pixels: the signature, the `IHDR` chunk (8-bit RGBA, the
+/// CRC not computed: the core reads the header, it does not decode), then filler up to `len`
+/// bytes.
+fn png_of(w: u32, h: u32, len: usize) -> Vec<u8> {
+    let head = [
+        PNG_MAGIC,
+        &13u32.to_be_bytes(),
+        b"IHDR",
+        &w.to_be_bytes(),
+        &h.to_be_bytes(),
+        &[8, 6, 0, 0, 0],
+        &[0; 4],
+    ]
+    .concat();
+    headed(&head, len)
+}
+
+/// A JPEG of `w`×`h` pixels with the frame header `sof` (`0xc0` baseline, `0xc2` progressive):
+/// SOI, a JFIF APP0, the frame header (three components), the scan header, entropy-coded bytes
+/// (a stuffed `ff 00` and a restart marker among them), EOI.
+fn jpeg_of(sof: u8, w: u16, h: u16) -> Vec<u8> {
+    let [h1, h0] = h.to_be_bytes();
+    let [w1, w0] = w.to_be_bytes();
+    [
+        b"\xff\xd8".as_slice(),
+        b"\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00",
+        &[0xff, sof, 0x00, 0x11, 0x08, h1, h0, w1, w0, 0x03],
+        b"\x01\x22\x00\x02\x11\x01\x03\x11\x01",
+        b"\xff\xda\x00\x0c\x03\x01\x00\x02\x11\x03\x11\x00\x3f\x00",
+        b"\x12\x34\xff\x00\x56\xff\xd0\x78",
+        b"\xff\xd9",
+    ]
+    .concat()
+}
+
+/// A GIF whose logical screen is `w`×`h`.
+fn gif_of(w: u16, h: u16) -> Vec<u8> {
+    let head = [b"GIF89a".as_slice(), &w.to_le_bytes(), &h.to_le_bytes()].concat();
+    headed(&head, 64)
+}
+
 fn is_generic(m: &PreviewModel) -> bool {
     matches!(m.body, PreviewBody::WriteRequests { .. })
 }
@@ -1523,9 +1575,10 @@ async fn opened_doc(
 }
 
 /// §6.3 Attachment upload / PD-110: the card shows the file name, the size, the sniffed MIME type,
-/// the SHA-256 and, for a raster image (png, jpeg, gif, webp) of at most 2 MiB, a `data:`
-/// thumbnail in standard base64, unwrapped (T8 review m-7), that renders as an `<img>`; any other
-/// type, and a larger image, shows the PD-110 text. The file part's bytes count as hidden once.
+/// the SHA-256 and, for a PNG or a JPEG of at most 2 MiB (T20b review I-1; the pixel cap is
+/// `thumbnail_pixel_cap`'s), a `data:` thumbnail in standard base64, unwrapped (T8 review m-7),
+/// that renders as an `<img>`; any other type, and a larger image, shows the PD-110 text. The
+/// file part's bytes count as hidden once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_card_size_mime_sha256_thumbnail() -> TestResult {
     let png = STANDARD.decode(PIXEL_PNG)?;
@@ -1548,22 +1601,26 @@ async fn upload_card_size_mime_sha256_thumbnail() -> TestResult {
         "the file part's bytes, counted once"
     );
 
-    // Each raster type is its own `data:` type; other types and other content get no thumbnail.
+    // A PNG or a JPEG is its own `data:` type (T20b review I-1: those two only); a GIF or a WebP
+    // is still sent as its type but gets no thumbnail, nor does a JPEG without a readable frame
+    // header, any other type or other content.
     let webp = [b"RIFF\x24\x00\x00\x00WEBPVP8 ".as_slice(), &[0u8; 24]].concat();
-    let cases: [(&str, Vec<u8>, &str, Option<&str>); 7] = [
+    let cases: [(&str, Vec<u8>, &str, Option<&str>); 9] = [
         (
             "a.jpg",
-            headed(b"\xff\xd8\xff\xe0", 64),
+            jpeg_of(0xc0, 640, 480),
             "image/jpeg",
             Some("image/jpeg"),
         ),
+        ("b.jpg", headed(b"\xff\xd8\xff\xe0", 64), "image/jpeg", None),
+        ("a.gif", gif_of(16, 16), "image/gif", None),
+        ("a.webp", webp, "image/webp", None),
         (
-            "a.gif",
-            headed(b"GIF89a", 64),
-            "image/gif",
-            Some("image/gif"),
+            "a.png",
+            png_of(640, 480, 64),
+            "image/png",
+            Some("image/png"),
         ),
-        ("a.webp", webp, "image/webp", Some("image/webp")),
         ("a.pdf", headed(b"%PDF-1.7\n", 64), "application/pdf", None),
         ("a.zip", headed(b"PK\x03\x04", 64), "application/zip", None),
         (FILENAME, TEXT.to_vec(), "application/octet-stream", None),
@@ -1585,7 +1642,7 @@ async fn upload_card_size_mime_sha256_thumbnail() -> TestResult {
     }
     // The cap: an image of exactly 2 MiB has a thumbnail, one byte more has none.
     for (len, thumbnail) in [(2 * MIB, true), (2 * MIB + 1, false), (3 * MIB, false)] {
-        let content = headed(PNG_MAGIC, len);
+        let content = png_of(1, 1, len);
         let m = card_model(&params("big.png", &content, false, None), &[])?;
         let c = card(&m.body)?;
         assert_eq!((c.mime, c.size), ("image/png", len as u64));
@@ -1607,7 +1664,23 @@ async fn upload_card_size_mime_sha256_thumbnail() -> TestResult {
         assert!(doc.contains(text), "{text}");
     }
     assert!(!doc.contains(NO_THUMBNAIL));
-    let big = headed(PNG_MAGIC, 3 * MIB);
+    // T20b review m-3: an image of exactly 2 MiB renders its thumbnail (before the requests) and
+    // the document still names the request's digest line within the render cap.
+    let at_cap = png_of(1, 1, 2 * MIB);
+    let id = queued(&h, params("cap.png", &at_cap, false, None)).await?;
+    let (_, doc) = opened_doc(&h, &id).await?;
+    let uri = format!("data:image/png;base64,{}", STANDARD.encode(&at_cap));
+    assert!(
+        doc.contains(&format!("<img src=\"{uri}\"")),
+        "the 2 MiB thumbnail renders as an image"
+    );
+    assert!(
+        doc.contains(&body_digest_line(at_cap.len() as u64, &sha256_hex(&at_cap))),
+        "the request's digest line"
+    );
+    assert!(doc.len() <= DOC_MAX_BYTES, "document {} bytes", doc.len());
+    assert!(!doc.contains(NO_THUMBNAIL));
+    let big = png_of(1, 1, 3 * MIB);
     let id = queued(&h, params("big.png", &big, false, None)).await?;
     let (_, doc) = opened_doc(&h, &id).await?;
     assert!(doc.contains(NO_THUMBNAIL), "a 3 MiB PNG");
@@ -1616,6 +1689,110 @@ async fn upload_card_size_mime_sha256_thumbnail() -> TestResult {
     let (_, doc) = opened_doc(&h, &id).await?;
     assert!(doc.contains(NO_THUMBNAIL), "a text file");
     assert!(doc.contains("application/octet-stream"));
+    Ok(())
+}
+
+/// T20b review I-1 (lead ruling): the webview decodes the thumbnail, so core reads the pixel size
+/// from the image header first and fails closed: a thumbnail only for at most 8192 px per side
+/// and at most 2^24 px in all, from a PNG's `IHDR` (the first chunk, whole) or a JPEG's one
+/// frame header (SOFn, reached by walking the marker segments up to the scan). A header that does
+/// not parse, is cut short, declares a zero side or a second frame gets none.
+#[test]
+fn thumbnail_pixel_cap() -> TestResult {
+    let png_cut = |at: usize| png_of(1, 1, 0)[..at].to_vec();
+    let mut png_ihdr_12 = png_of(1, 1, 64);
+    png_ihdr_12[8..12].copy_from_slice(&12u32.to_be_bytes());
+    let mut png_text_first = png_of(1, 1, 64);
+    png_text_first[12..16].copy_from_slice(b"tEXt");
+    let pngs: [(&str, Vec<u8>, bool); 16] = [
+        ("8192x2048", png_of(8192, 2048, 64), true),
+        ("2048x8192", png_of(2048, 8192, 64), true),
+        ("4096x4096", png_of(4096, 4096, 64), true),
+        ("8193x1", png_of(8193, 1, 64), false),
+        ("1x8193", png_of(1, 8193, 64), false),
+        ("4097x4096", png_of(4097, 4096, 64), false),
+        ("8192x2049", png_of(8192, 2049, 64), false),
+        ("8192x8192", png_of(8192, 8192, 64), false),
+        ("0x1", png_of(0, 1, 64), false),
+        ("1x0", png_of(1, 0, 64), false),
+        ("max", png_of(u32::MAX, u32::MAX, 64), false),
+        // The whole IHDR chunk (33 bytes with its CRC) or nothing.
+        ("whole IHDR", png_cut(33), true),
+        ("cut IHDR", png_cut(32), false),
+        ("cut size", png_cut(20), false),
+        ("IHDR of 12", png_ihdr_12, false),
+        ("tEXt first", png_text_first, false),
+    ];
+    for (name, content, thumbnail) in pngs {
+        let m = card_model(&params("x.png", &content, false, None), &[])?;
+        let c = card(&m.body)?;
+        assert_eq!(c.mime, "image/png", "{name}");
+        assert_eq!(c.thumbnail.is_some(), thumbnail, "PNG {name}");
+    }
+
+    let jpeg = jpeg_of(0xc0, 8, 8);
+    let sof_at = find(&jpeg, b"\xff\xc0").ok_or("no SOF0")?;
+    let sos_at = find(&jpeg, b"\xff\xda").ok_or("no SOS")?;
+    // `bytes` between the APP0 and the frame header.
+    let with = |bytes: &[u8]| [&jpeg[..sof_at], bytes, &jpeg[sof_at..]].concat();
+    let second_frame = with(&jpeg[sof_at..sof_at + 19]);
+    let scan_first = [
+        &jpeg[..sof_at],
+        &jpeg[sos_at..sos_at + 14],
+        &jpeg[sof_at..sos_at],
+        &jpeg[sos_at + 14..],
+    ]
+    .concat();
+    // A huffman table (`c4`), the reserved `c8` and an arithmetic-coding table (`cc`) are no
+    // frame headers, whatever their bytes look like; neither is a frame header inside an APP1.
+    let tables = [
+        b"\xff\xc4\x00\x09\x00\xff\xff\xff\xff\x03\x01".as_slice(),
+        b"\xff\xc8\x00\x09\x00\xff\xff\xff\xff\x03\x01",
+        b"\xff\xcc\x00\x09\x00\xff\xff\xff\xff\x03\x01",
+        b"\xff\xe1\x00\x0b\xff\xc0\x00\x11\x08\xff\xff\xff\xff",
+    ]
+    .concat();
+    let jpegs: [(&str, Vec<u8>, bool); 20] = [
+        ("baseline 8192x2048", jpeg_of(0xc0, 8192, 2048), true),
+        ("progressive 2048x8192", jpeg_of(0xc2, 2048, 8192), true),
+        ("extended 4096x4096", jpeg_of(0xc1, 4096, 4096), true),
+        ("8193x1", jpeg_of(0xc0, 8193, 1), false),
+        ("1x8193", jpeg_of(0xc0, 1, 8193), false),
+        ("4097x4096", jpeg_of(0xc2, 4097, 4096), false),
+        ("zero height (DNL)", jpeg_of(0xc0, 8, 0), false),
+        ("zero width", jpeg_of(0xc0, 0, 8), false),
+        ("tables and APP1 before the frame", with(&tables), true),
+        ("fill bytes before a marker", with(b"\xff\xff"), true),
+        ("two frame headers", second_frame, false),
+        ("scan before the frame", scan_first, false),
+        // A marker without a length, even where the next bytes would read as one.
+        ("EOI before the frame", with(b"\xff\xd9\x00\x02"), false),
+        ("a second SOI", with(b"\xff\xd8\x00\x02"), false),
+        (
+            "a restart marker in the header",
+            with(b"\xff\xd0\x00\x02"),
+            false,
+        ),
+        ("TEM in the header", with(b"\xff\x01\x00\x02"), false),
+        (
+            "a stuffed zero in the header",
+            with(b"\xff\x00\x00\x02"),
+            false,
+        ),
+        ("no marker where one belongs", with(b"\x12\x00\x02"), false),
+        (
+            "cut in the frame header",
+            jpeg[..sof_at + 8].to_vec(),
+            false,
+        ),
+        ("cut before the scan", jpeg[..sos_at].to_vec(), false),
+    ];
+    for (name, content, thumbnail) in jpegs {
+        let m = card_model(&params("x.jpg", &content, false, None), &[])?;
+        let c = card(&m.body)?;
+        assert_eq!(c.mime, "image/jpeg", "{name}");
+        assert_eq!(c.thumbnail.is_some(), thumbnail, "JPEG {name}");
+    }
     Ok(())
 }
 
@@ -1721,21 +1898,71 @@ fn card_is_built_over_the_request_sent() -> TestResult {
     no_type.content_type = None;
     let mut extra = r.clone();
     extra.body.extend_from_slice(b"trailing");
+    // T20b review m-5: the executor sends the upload as a POST; another method is not it.
+    let mut put = r.clone();
+    put.method = "PUT".to_owned();
     let cases = [
         vec![r.clone(), r.clone()],
         vec![],
         vec![no_type],
         vec![extra],
+        vec![put],
         // The part is not sent as the sniffed type.
         vec![swap("application/octet-stream", "text/html")],
         // Another part name, another boundary in the body.
         vec![swap("name=\"file\"", "name=\"data\"")],
         vec![swap(&format!("--{boundary}--"), "--x--")],
+        // T20b review m-3: a file name the executor refuses (a double quote, a control char),
+        // and a comment that holds the delimiter, so the body no longer splits into its parts.
+        vec![swap("filename=\"notes.txt\"", "filename=\"no\"tes.txt\"")],
+        vec![swap("filename=\"notes.txt\"", "filename=\"no\ttes.txt\"")],
+        vec![swap(COMMENT, &format!("{COMMENT}\r\n--{boundary}x"))],
     ];
     for reqs in cases {
         let m = preview_of(&p, &v, &reqs)?;
         assert!(is_generic(&m), "{:?}", m.body);
     }
+    // The request as built still gets the card.
+    assert!(!is_generic(&preview_of(&p, &v, std::slice::from_ref(&r))?));
+    Ok(())
+}
+
+/// T20b review m-3: the card needs the view's hold and the verdict's to agree (a verdict that is
+/// stale against the view keeps the generic list), whichever of the two says Collision.
+#[test]
+fn card_needs_view_and_verdict_hold_to_agree() -> TestResult {
+    let p = params(FILENAME, TEXT, false, None);
+    let collision = verdict(&p, &[attachment(ATT_ID, FILENAME, 2)])?;
+    assert_eq!(collision.hold, Hold::Collision);
+    let r = one_request(&p, &collision)?;
+    let reqs = std::slice::from_ref(&r);
+    assert!(!is_generic(&preview_held(
+        &p,
+        &collision,
+        reqs,
+        Hold::Collision
+    )?));
+    assert!(is_generic(&preview_held(
+        &p,
+        &collision,
+        reqs,
+        Hold::Preview
+    )?));
+    let mut cleared = collision.clone();
+    cleared.hold = Hold::Preview;
+    assert!(is_generic(&preview_held(
+        &p,
+        &cleared,
+        reqs,
+        Hold::Collision
+    )?));
+
+    let new = verdict(&p, &[])?;
+    assert_eq!(new.hold, Hold::Preview);
+    let r = one_request(&p, &new)?;
+    let reqs = std::slice::from_ref(&r);
+    assert!(!is_generic(&preview_held(&p, &new, reqs, Hold::Preview)?));
+    assert!(is_generic(&preview_held(&p, &new, reqs, Hold::Collision)?));
     Ok(())
 }
 
@@ -1746,7 +1973,7 @@ fn active_extension_fact_row() -> TestResult {
     let png = STANDARD.decode(PIXEL_PNG)?;
     let zip = headed(b"PK\x03\x04", 64);
     let jpeg = headed(b"\xff\xd8\xff\xe0", 64);
-    let cases: [(&str, &[u8], bool); 16] = [
+    let cases: [(&str, &[u8], bool); 18] = [
         ("x.svg", &png, true),
         ("x.html", b"<p>hi</p>", true),
         ("x.HTM", TEXT, true),
@@ -1754,6 +1981,8 @@ fn active_extension_fact_row() -> TestResult {
         ("x.xhtml", TEXT, true),
         // Windows drops a trailing dot or space when the file is saved.
         ("x.html.", TEXT, true),
+        ("x.html ", TEXT, true),
+        ("x.html. .", TEXT, true),
         // An image named as text, and a name of a sniffed type over other bytes.
         ("x.txt", &png, true),
         ("x.pdf", TEXT, true),
@@ -1787,6 +2016,17 @@ fn active_extension_fact_row() -> TestResult {
             m.warnings
         );
     }
+
+    // T20b review m-3: the row shows at most 32 chars of the extension; the cut bytes count as
+    // hidden beside the file part's.
+    let ext = "abcdefghij".repeat(4);
+    let m = card_model(&params(&format!("x.{ext}"), &png, false, None), &[])?;
+    let c = card(&m.body)?;
+    assert_eq!(
+        c.notes,
+        [format!("{MISMATCH}: .{}, sent as image/png", &ext[..32])]
+    );
+    assert_eq!(m.header.hidden_in_preview_bytes, png.len() as u64 + 8);
     Ok(())
 }
 
@@ -1903,13 +2143,15 @@ async fn content_base64_null_edit_is_unchanged() -> TestResult {
     Ok(())
 }
 
-/// Plan review I-4 (T8 review m-2): a 10 MiB upload (a PNG, so only the 2 MiB cap keeps the
+/// Plan review I-4 (T8 review m-2): a 10 MiB upload (a 1×1 PNG, so only the 2 MiB cap keeps the
 /// thumbnail out) opens with a serialized preview DTO below 64 KiB (body, header and edit form),
 /// a document of at most `DOC_MAX_BYTES` + 4 KiB that names the SHA-256, the file's bytes counted
-/// as hidden, and no slice or base64 of the file anywhere.
+/// as hidden, and no slice or base64 of the file anywhere. T20b review I-2, on the merged tree:
+/// the Request tab's DTO is below 4 KiB without the file, and Raw page 0 is one page of at most
+/// 256 KiB, fetched on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_10mib_preview_is_bounded() -> TestResult {
-    let content = headed(PNG_MAGIC, 10 * MIB);
+    let content = png_of(1, 1, 10 * MIB);
     let sha = sha256_hex(&content);
     let h = Harness::confluence().await?;
     let mock = wiki(&h)?;
@@ -1949,6 +2191,24 @@ async fn upload_10mib_preview_is_bounded() -> TestResult {
     );
     no_file_bytes(&dto, &content)?;
     no_file_bytes(&doc, &content)?;
+
+    // The Request tab.
+    let detail = h
+        .decisions()
+        .request_detail(&id)
+        .ok_or("no request detail")?;
+    let detail = serde_json::to_string(&detail)?;
+    assert!(detail.len() < 4096, "Request tab {} bytes", detail.len());
+    no_file_bytes(&detail, &content)?;
+    // Raw: the preview holds the pager only, page 0 is one bounded page.
+    assert_eq!(preview.raw.page_bytes, 256 * 1024);
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let page = h.decisions().raw_page(&id, rev, 0).map_err(de)?;
+    assert_eq!(
+        page.bytes.len() as u64,
+        preview.raw.page_bytes,
+        "a full first page"
+    );
     Ok(())
 }
 

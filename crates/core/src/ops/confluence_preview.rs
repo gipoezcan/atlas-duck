@@ -1675,9 +1675,16 @@ pub(crate) fn move_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
 
 // ---- the attachment card (§6.3 Attachment upload, PD-109, PD-110, Task 20b) -------------------
 
-/// PD-110: a raster image of at most this many bytes gets a `data:` thumbnail. Its base64 (about
-/// 2.7 MiB) fits the 4 MiB `DOC_MAX_BYTES` render cap together with the rest of the card.
+/// PD-110: a PNG or JPEG of at most this many bytes may get a `data:` thumbnail. Its base64
+/// (about 2.7 MiB) fits the 4 MiB `DOC_MAX_BYTES` render cap together with the rest of the card;
+/// the app sends it once, in the document (T20b review m-1: the preview DTO's copy is dropped).
 const THUMBNAIL_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// T20b review I-1 (lead ruling): the webview decodes the thumbnail, and a few header bytes can
+/// declare gigapixels whatever the file size, so its header must declare at most this many
+/// pixels per side, and at most [`THUMBNAIL_MAX_PIXELS`] in all (64 MiB as RGBA).
+const THUMBNAIL_MAX_SIDE: u32 = 8192;
+const THUMBNAIL_MAX_PIXELS: u64 = 1 << 24;
 
 /// plan text (PD-110, plan review m-9): the fact row of an active or mismatched extension.
 pub const TEXT_EXTENSION_MISMATCH: &str = "extension and content type differ";
@@ -1729,11 +1736,15 @@ struct SentUpload<'a> {
     comment: Option<&'a str>,
 }
 
-/// The upload `request` sends when its body is exactly the layout `confluence_ext::multipart`
-/// writes: the file part (a file name without a double quote or control character, sent as the
-/// type sniffed from its bytes), then the comment part when given, then the closing delimiter.
-/// Anything else is `None` (the card keeps the generic request list).
+/// The upload `request` sends when it is a POST whose body is exactly the layout
+/// `confluence_ext::multipart` writes: the file part (a file name without a double quote or
+/// control character, sent as the type sniffed from its bytes), then the comment part when
+/// given, then the closing delimiter. Anything else is `None` (the card keeps the generic request
+/// list).
 fn sent_upload(request: &HttpRequestSpec) -> Option<SentUpload<'_>> {
+    if request.method != "POST" {
+        return None;
+    }
     let b = request
         .content_type
         .as_deref()?
@@ -1777,20 +1788,87 @@ fn sent_upload(request: &HttpRequestSpec) -> Option<SentUpload<'_>> {
     })
 }
 
-/// The `data:` thumbnail of a raster image of at most [`THUMBNAIL_MAX_BYTES`] (PD-110): standard
-/// base64, unwrapped (T8 review m-7), typed by the sniffed type, never by the extension; never SVG.
+/// The `data:` thumbnail of a PNG or JPEG of at most [`THUMBNAIL_MAX_BYTES`] (PD-110) whose header
+/// declares at most [`THUMBNAIL_MAX_SIDE`] pixels per side and [`THUMBNAIL_MAX_PIXELS`] in all
+/// (T20b review I-1, lead ruling: a GIF or WebP gets none, nor does a header that does not parse
+/// or declares a zero side): standard base64, unwrapped (T8 review m-7), typed by the sniffed
+/// type, never by the extension; never SVG.
 fn thumbnail(mime: &str, content: &[u8]) -> Option<String> {
     use base64::Engine as _;
-    let raster = matches!(
-        mime,
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-    );
-    (raster && content.len() <= THUMBNAIL_MAX_BYTES).then(|| {
+    if content.len() > THUMBNAIL_MAX_BYTES {
+        return None;
+    }
+    let (width, height) = match mime {
+        "image/png" => png_size(content)?,
+        "image/jpeg" => jpeg_size(content)?,
+        _ => return None,
+    };
+    let side = 1..=THUMBNAIL_MAX_SIDE;
+    let fits = side.contains(&width)
+        && side.contains(&height)
+        && u64::from(width) * u64::from(height) <= THUMBNAIL_MAX_PIXELS;
+    fits.then(|| {
         format!(
             "data:{mime};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(content)
         )
     })
+}
+
+/// The width and height a PNG's header declares: after the signature, `IHDR` must be the first
+/// chunk, 13 bytes long and whole (its CRC included, 33 bytes in all). `None` otherwise.
+fn png_size(content: &[u8]) -> Option<(u32, u32)> {
+    let word = |at: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(
+            content.get(at..at + 4)?.try_into().ok()?,
+        ))
+    };
+    if content.len() < 33 || word(8)? != 13 || content.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    Some((word(16)?, word(20)?))
+}
+
+/// The width and height of a JPEG's one frame header. The marker segments after SOI are walked by
+/// their lengths up to the first scan (SOS), and exactly one frame header (SOFn: `c0` to `cf`
+/// but the tables `c4` and `cc` and the reserved `c8`) must come before it. A segment cut short,
+/// a byte that is no marker where one belongs, a marker without a length (SOI, EOI, RSTn, TEM)
+/// before the scan, no frame header or a second one: `None`.
+fn jpeg_size(content: &[u8]) -> Option<(u32, u32)> {
+    let half = |b: &[u8], at: usize| -> Option<u16> {
+        Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    };
+    let mut at = 2;
+    let mut size = None;
+    loop {
+        if *content.get(at)? != 0xff {
+            return None;
+        }
+        // Any number of fill bytes may precede a marker.
+        while *content.get(at)? == 0xff {
+            at += 1;
+        }
+        let marker = *content.get(at)?;
+        at += 1;
+        match marker {
+            0xda => return size,
+            0x00 | 0x01 | 0xd0..=0xd9 => return None,
+            _ => {}
+        }
+        // The length counts its own two bytes.
+        let len = usize::from(half(content, at)?);
+        let segment = content.get(at..at + len).filter(|s| s.len() >= 2)?;
+        if (0xc0..=0xcf).contains(&marker) && !matches!(marker, 0xc4 | 0xc8 | 0xcc) {
+            if size.is_some() {
+                return None;
+            }
+            // The sample precision, then the height and the width.
+            let height = half(segment, 3)?;
+            let width = half(segment, 5)?;
+            size = Some((u32::from(width), u32::from(height)));
+        }
+        at += len;
+    }
 }
 
 /// PD-110 (plan review m-9): the extension of `filename` when it names an active type, names a
