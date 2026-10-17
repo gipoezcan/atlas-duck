@@ -277,6 +277,89 @@ async fn i07_script_streams_identical_result_error_failed_call() -> TestResult {
     Ok(())
 }
 
+/// I-07 for a script limit after data (§13 Opacity tests): a script that fetched data and then
+/// hit a limit, one whose host call the instance answered 404, one that returned a result and
+/// one that threw look the same to the agent until the decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i07_script_limit_after_data_stream_identical() -> TestResult {
+    let result = |n: u64| RunEnd::Result {
+        value: json!({ "n": n }),
+        logs: Vec::new(),
+        stderr: String::new(),
+    };
+    let call = |key: &str| vec![host_call(1, ISSUE, json!({ "key": key }))];
+    let runner = FakeScriptRunner::new(vec![
+        // Released.
+        ScriptPlan::new(call("ABC-1"), result(1)),
+        // Data, then a limit: denied later.
+        ScriptPlan::new(
+            call("ABC-1"),
+            RunEnd::HostLimit {
+                name: "max_fetch_mb".to_owned(),
+            },
+        ),
+        // An upstream error inside the run.
+        ScriptPlan::new(call("ABC-9"), result(2)),
+        ScriptPlan::new(Vec::new(), script_error()),
+    ]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner)
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    mock.json(
+        "/rest/api/2/issue/ABC-9",
+        404,
+        r#"{"errorMessages":["Issue does not exist"],"errors":{}}"#,
+    )
+    .await;
+    let mut streams = Vec::new();
+    let mut ids = Vec::new();
+    for n in 0..4 {
+        let env = h
+            .submit_script(json!({ "source": "return 1;", "args": { "n": n } }))
+            .await;
+        let id = request_id(&env)?;
+        streams.push(pending_stream(&h, env.to_json_line(), &id).await?);
+        ids.push(id);
+    }
+    let first = streams.first().ok_or("no streams")?;
+    for (n, s) in streams.iter().enumerate() {
+        assert_eq!(s, first, "script {n} differs before its decision");
+        assert!(s.iter().all(|l| {
+            !l.contains("max_fetch_mb")
+                && !l.contains("script_limit")
+                && !l.contains("TypeError")
+                && !l.contains("does not exist")
+        }));
+    }
+    let ap = h.approver();
+    let [a, b, c, d] = ids.as_slice() else {
+        return Err("four ids".into());
+    };
+    ap.release(a).map_err(de)?;
+    ap.deny(b, "no").map_err(de)?;
+    ap.release(c).map_err(de)?;
+    ap.release(d).map_err(de)?;
+    let mut got = Vec::new();
+    for id in [a, b, c, d] {
+        got.push(h.await_(id, 5000).await.status);
+    }
+    assert_eq!(
+        got,
+        [
+            Status::Released,
+            Status::Denied,
+            Status::Released,
+            Status::Released
+        ]
+    );
+    Ok(())
+}
+
 /// I-07 for writes over what enrichment learned (M3 T29 M-10): three `jira.issue.edit`, one whose
 /// `expected` matches the instance, one that conflicts with it and one whose enrichment GET
 /// answers 404, look the same to the agent until the decision: the instance's answer to the read

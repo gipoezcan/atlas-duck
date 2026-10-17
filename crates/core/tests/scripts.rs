@@ -2959,6 +2959,742 @@ async fn error_item_logs_keep_the_candidates_truncation_markers() -> TestResult 
     Ok(())
 }
 
+// ---- Task 19a: cancel, slots and dispatch sweep (I-10, I-13, I-14, M3 M-1) -----------------------
+//
+// Structural checks only (L26): every wait below is a hang guard, no test asserts how long
+// something took. Runs that must not end hold for ten minutes and are cancelled or killed.
+
+use std::sync::atomic::AtomicU32;
+use std::sync::{Mutex, PoisonError};
+
+use async_trait::async_trait;
+use atlas_duck_core::lifecycle::model::Phase;
+use atlas_duck_core::{RunHandle, RunSpec, ScriptRunner};
+use atlas_duck_ipc::sandbox::ScriptLimits;
+
+/// A check run inside `RunHandle::kill`.
+type KillProbe = Box<dyn Fn() + Send + Sync>;
+
+/// The fake runner with the two things a [`ScriptPlan`] cannot say: from the `hang_from`th start
+/// on, `wait` never settles (a reaper that never comes), and a probe runs inside every `kill`.
+struct WrappedRunner {
+    inner: Arc<FakeScriptRunner>,
+    hang_from: u32,
+    started: AtomicU32,
+    on_kill: Arc<Mutex<Option<KillProbe>>>,
+}
+
+impl WrappedRunner {
+    fn new(plans: Vec<ScriptPlan>, hang_from: u32) -> Arc<WrappedRunner> {
+        Arc::new(WrappedRunner {
+            inner: FakeScriptRunner::new(plans),
+            hang_from,
+            started: AtomicU32::new(0),
+            on_kill: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    fn probe_kill(&self, probe: KillProbe) {
+        *self.on_kill.lock().unwrap_or_else(PoisonError::into_inner) = Some(probe);
+    }
+}
+
+#[async_trait]
+impl ScriptRunner for WrappedRunner {
+    async fn check_available(&self, policy: RunPolicy) -> Result<(), RunnerError> {
+        self.inner.check_available(policy).await
+    }
+
+    async fn compile_check(
+        &self,
+        source: &str,
+        limits: &ScriptLimits,
+        policy: RunPolicy,
+    ) -> Result<(), CompileFailure> {
+        self.inner.compile_check(source, limits, policy).await
+    }
+
+    fn confinement(&self, policy: RunPolicy) -> Option<RunConfinement> {
+        self.inner.confinement(policy)
+    }
+
+    async fn start(
+        &self,
+        run: RunSpec,
+        calls: Arc<dyn HostCalls>,
+    ) -> Result<Arc<dyn RunHandle>, RunnerError> {
+        let inner = self.inner.start(run, calls).await?;
+        let n = self.started.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(WrappedRun {
+            inner,
+            hang: n >= self.hang_from,
+            on_kill: self.on_kill.clone(),
+        }))
+    }
+}
+
+struct WrappedRun {
+    inner: Arc<dyn RunHandle>,
+    hang: bool,
+    on_kill: Arc<Mutex<Option<KillProbe>>>,
+}
+
+#[async_trait]
+impl RunHandle for WrappedRun {
+    fn kill(&self, why: KillReason) {
+        if let Some(probe) = self
+            .on_kill
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            probe();
+        }
+        self.inner.kill(why);
+    }
+
+    async fn wait(&self) -> RunEnd {
+        if self.hang {
+            std::future::pending::<()>().await;
+        }
+        self.inner.wait().await
+    }
+}
+
+/// `fut`, or an error after a minute: a hang guard, never a speed assertion.
+async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> Result<T, TestError> {
+    tokio::time::timeout(Duration::from_secs(60), fut)
+        .await
+        .map_err(|_| format!("{what} hung").into())
+}
+
+async fn wait_slot_wait(h: &Harness, id: &str) -> TestResult {
+    wait_for("the wait for a real slot", || {
+        h.engine()
+            .entry(id)
+            .is_some_and(|e| matches!(e.state().model.phase(), Phase::SlotWait))
+    })
+    .await
+}
+
+/// A Jira instance at a raw server (`steps[i]` answers connection `i`) and `runner`; calls
+/// never time out on their own unless `per_call` says so.
+async fn raw_scripts(
+    steps: Vec<Vec<RawStep>>,
+    runner: Arc<dyn ScriptRunner>,
+    per_call: Duration,
+) -> Result<(Harness, RawHttpServer), TestError> {
+    let server = RawHttpServer::serve_sequence(steps).await?;
+    let h = Harness::builder()
+        .instance_at(
+            "jira-main",
+            Product::Jira,
+            InstanceAt {
+                base_url: server.base_url(),
+                ..InstanceAt::default()
+            },
+        )
+        .timeouts(Timeouts {
+            per_call,
+            ..Timeouts::default()
+        })
+        .scripts(runner)
+        .start()
+        .await?;
+    Ok((h, server))
+}
+
+/// Waits until the fetch of `id` has received at least `bytes` of a body.
+async fn wait_partial(h: &Harness, id: &str, bytes: usize) -> TestResult {
+    wait_for("the fetch's bytes", || {
+        h.engine()
+            .entry(id)
+            .and_then(|e| e.fetch_control())
+            .is_some_and(|c| c.take_captured().partial.len() >= bytes)
+    })
+    .await
+}
+
+fn assert_cancelled(env: &Envelope) {
+    assert_eq!(env.status, Status::Cancelled, "{}", env.to_json_line());
+    assert_eq!(exit(env), 7);
+    assert_eq!(code(env), "cancelled");
+    assert_eq!(detail(env, "reason"), json!("by_client"));
+    assert_eq!(env.error.as_ref().map(|e| e.retryable), Some(false));
+}
+
+/// I-10 (§13 Cancel, §4.4): cancelling a running script, a script waiting for a slot, a finished
+/// script in `AwaitingRelease`, a read in `Fetching` and a read in `AwaitingRelease` gives one
+/// envelope; no release item appears; the killed run logs `SCRIPT_FAILED {cancelled_by_client}`
+/// then `CANCELLED`. The reaper never answers here (`wait` of the two running scripts never
+/// settles), and every cancel still answers: no response path waits on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i10_cancel_identical_running_slotwait_awaiting_release_reads() -> TestResult {
+    let issue = fixtures::JIRA_ISSUE.as_bytes();
+    let steps = vec![
+        vec![
+            RawStep::Send(raw_answer(br#"{"key":"#, 1_000_000)),
+            RawStep::Sleep(120_000),
+        ],
+        vec![RawStep::Send(raw_answer(issue, issue.len()))],
+    ];
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(600_000);
+    // The first run finishes (its `wait` answers); the next two hang in `wait`.
+    let runner = WrappedRunner::new(
+        vec![
+            ScriptPlan::new(Vec::new(), result_end(json!(1))),
+            hold(),
+            hold(),
+            hold(),
+        ],
+        1,
+    );
+    let (h, server) = raw_scripts(steps, runner.clone(), Duration::from_secs(300)).await?;
+    let finished = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&finished, 20_000).await.ok_or("never queued")?;
+    let running_a = submit(&h, json!({ "source": SRC })).await?;
+    let running_b = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("both real slots", || runner.inner.starts() == 3).await?;
+    let waiting = submit(&h, json!({ "source": SRC })).await?;
+    wait_slot_wait(&h, &waiting).await?;
+    let fetching = request_id(&h.submit("jira.issue.get", json!({ "key": "ABC-1" })).await)?;
+    wait_for("the connection", || server.connections() >= 1).await?;
+    wait_partial(&h, &fetching, 1).await?;
+    let read_item = request_id(&h.submit("jira.issue.get", json!({ "key": "ABC-2" })).await)?;
+    h.queued(&read_item, 20_000).await.ok_or("never queued")?;
+    let ids = [
+        &running_a, &running_b, &waiting, &finished, &fetching, &read_item,
+    ];
+    let mut lines = Vec::new();
+    for id in ids {
+        let env = bounded("cancel", h.handler().cancel(id)).await?;
+        assert_cancelled(&env);
+        lines.push(without_ids(env).to_json_line());
+        assert_eq!(h.status(id).await.status, Status::Cancelled);
+        assert!(h.approver().item(id).is_none(), "{id} is still queued");
+    }
+    assert!(lines.iter().all(|l| *l == lines[0]), "{lines:?}");
+    // The killed runs: `SCRIPT_FAILED {cancelled_by_client}`, then `CANCELLED`, no release item.
+    for id in [&running_a, &running_b] {
+        let events = h.events(id).await?;
+        let types: Vec<EventType> = events.iter().map(|(t, _)| *t).collect();
+        assert_eq!(
+            types,
+            [
+                EventType::REQUEST_RECEIVED,
+                EventType::SCRIPT_STARTED,
+                EventType::SCRIPT_FAILED,
+                EventType::CANCELLED,
+            ]
+        );
+        assert_eq!(events[2].1["reason"], "cancelled_by_client");
+        assert_eq!(events[2].1["direct"], false);
+    }
+    assert_eq!(
+        runner.inner.kills(),
+        [None, Some(KillReason::Client), Some(KillReason::Client)]
+    );
+    assert_eq!(
+        h.event_types(&waiting).await?,
+        [EventType::REQUEST_RECEIVED, EventType::CANCELLED]
+    );
+    assert_eq!(
+        h.event_types(&finished).await?,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_FINISHED,
+            EventType::CANCELLED,
+        ]
+    );
+    for id in ids {
+        let types = h.event_types(id).await?;
+        assert!(
+            !types.contains(&EventType::SCRIPT_RELEASED)
+                && !types.contains(&EventType::READ_RELEASED),
+            "{types:?}"
+        );
+        assert_eq!(types.last(), Some(&EventType::CANCELLED));
+    }
+    Ok(())
+}
+
+/// I-13 (§13 Script slots): with both real slots held by runs that never end, a dry run, a
+/// submit-time syntax failure, a compile timeout and an unavailability still answer: none of
+/// them waits on a real-run slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i13_dry_runs_compile_and_direct_failures_never_wait_on_real_slot() -> TestResult {
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(600_000);
+    let (h, runner) = harness(vec![
+        hold(),
+        hold(),
+        ScriptPlan::new(vec![issue_call(1)], result_end(json!({ "dry": true }))),
+        ScriptPlan::syntax_error(1, 1, "unexpected token"),
+        ScriptPlan::compile_failure(CompileFailure::Timeout { timeout_s: 10 }),
+    ])
+    .await?;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("both real slots", || runner.starts() == 2).await?;
+    // A dry run.
+    let id = submit(&h, json!({ "source": SRC, "dry_run": true })).await?;
+    let env = h.await_(&id, 30_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    assert_eq!(
+        runner.specs().iter().map(|s| s.dry_run).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    // A syntax failure.
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let env = h.await_(&id, 30_000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "script_syntax");
+    // A compile timeout: a data-free `script_limit`.
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let env = h.await_(&id, 30_000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "script_limit");
+    // An unavailable sandbox, before any compile.
+    runner.fail_available(unavailable(UnavailableReason::FloorNotMet));
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    let env = h.await_(&id, 30_000).await;
+    assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+    assert_eq!(code(&env), "sandbox_unavailable");
+    assert_eq!(runner.compile_checks(), 5);
+    // The two real runs held their slots throughout and no other real run started.
+    assert_eq!(runner.starts(), 3);
+    for id in [&first, &second] {
+        assert_eq!(h.status(id).await.status, Status::Pending);
+        let types = h.event_types(id).await?;
+        assert!(!types.contains(&EventType::SCRIPT_FINISHED), "{types:?}");
+    }
+    for id in [&first, &second] {
+        h.handler().cancel(id).await;
+    }
+    Ok(())
+}
+
+/// I-13: a real run that waited for a slot and then hits `timeout_s` before any host call is
+/// `pending` and a release item with "keep error class only" pre-selected (§9.5).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i13_queued_timeout_before_call_is_release_with_preset() -> TestResult {
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(600_000);
+    let limited = ScriptPlan::new(
+        Vec::new(),
+        RunEnd::HostLimit {
+            name: "timeout_s".to_owned(),
+        },
+    );
+    let (h, runner) = harness(vec![hold(), hold(), limited]).await?;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("both real slots", || runner.starts() == 2).await?;
+    let third = submit(&h, json!({ "source": SRC })).await?;
+    wait_slot_wait(&h, &third).await?;
+    // A slot frees: the waiting run starts and hits its limit before any call.
+    h.handler().cancel(&first).await;
+    h.queued(&third, 30_000).await.ok_or("never queued")?;
+    assert_eq!(h.status(&third).await.status, Status::Pending);
+    let started = record(&h, &third, EventType::SCRIPT_STARTED).await?;
+    assert_eq!(started["queued"], true);
+    let failed = record(&h, &third, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "timeout_s");
+    assert_eq!(failed["queued"], true);
+    assert_eq!(failed["dispatched"], false);
+    assert_eq!(failed["direct"], false);
+    assert_eq!(failed["candidate"]["class"], "script_limit");
+    let types = h.event_types(&third).await?;
+    assert!(!types.contains(&EventType::SCRIPT_CALL_SENT), "{types:?}");
+    assert_eq!(types.last(), Some(&EventType::SCRIPT_FAILED));
+    let p = script_preview(&h, &third)?;
+    assert_eq!(p.preselect, Some(Preselect::ErrorClassOnly));
+    h.approver()
+        .release_redacted(
+            &third,
+            vec![atlas_duck_core::RedactionOp::Preset(
+                atlas_duck_core::RedactionPreset::ErrorClassOnly,
+            )],
+        )
+        .map_err(de)?;
+    let env = h.await_(&third, 10_000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    assert_eq!(exit(&env), 8);
+    assert!(env.redacted);
+    assert_eq!(
+        env.data.clone().ok_or("no data")?["script_error"],
+        json!({ "class": "script_limit" })
+    );
+    h.handler().cancel(&second).await;
+    Ok(())
+}
+
+/// I-13: slot saturation never yields `busy`: more scripts than slots are all `pending` and the
+/// ones past the slots wait for one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i13_slot_saturation_never_busy() -> TestResult {
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(600_000);
+    let (h, runner) = harness((0..8).map(|_| hold()).collect()).await?;
+    let mut ids = Vec::new();
+    for _ in 0..8 {
+        let env = h.submit_script(json!({ "source": SRC })).await;
+        assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+        assert_ne!(code(&env), "busy");
+        ids.push(request_id(&env)?);
+    }
+    wait_for("both real slots", || runner.starts() == 2).await?;
+    wait_for("every compile check", || runner.compile_checks() == 8).await?;
+    for id in &ids[2..] {
+        wait_slot_wait(&h, id).await?;
+    }
+    assert_eq!(runner.starts(), 2);
+    for id in &ids {
+        assert_eq!(h.status(id).await.status, Status::Pending);
+    }
+    // The waiting runs first, so no cancel hands a slot on.
+    for id in ids.iter().rev() {
+        let env = h.handler().cancel(id).await;
+        assert_cancelled(&env);
+    }
+    Ok(())
+}
+
+/// I-14 case 1 (§9.5): `timeout_s` fires while the first host call is in flight.
+async fn dispatch_case_1() -> TestResult {
+    let (h, id, _server) = queued_with_a_call_in_flight(
+        Some(RunEnd::HostLimit {
+            name: "timeout_s".to_owned(),
+        }),
+        false,
+    )
+    .await?;
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    assert_in_flight_then_failed(&h.events(&id).await?, "timeout_s")?;
+    let item = h.approver().item(&id).ok_or("no release item")?;
+    assert!(item.approvable);
+    Ok(())
+}
+
+/// I-14 case 2: the first call fails (a network error, or the per-call timeout), the script
+/// catches it and spins until `timeout_s`.
+async fn dispatch_case_2(close: bool) -> TestResult {
+    let (steps, per_call) = if close {
+        (vec![vec![RawStep::Close]; 4], Duration::from_secs(300))
+    } else {
+        (
+            vec![vec![RawStep::Sleep(120_000)]; 4],
+            Duration::from_millis(300),
+        )
+    };
+    let limited = RunEnd::HostLimit {
+        name: "timeout_s".to_owned(),
+    };
+    let runner = FakeScriptRunner::new(vec![ScriptPlan::new(vec![issue_call(1)], limited)]);
+    let (h, _server) = raw_scripts(steps, runner.clone(), per_call).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 60_000).await.ok_or("never queued")?;
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    assert!(
+        matches!(
+            runner.results().as_slice(),
+            [HostCallResult::Rejected { .. }]
+        ),
+        "{:?}",
+        runner.results()
+    );
+    let types = h.event_types(&id).await?;
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+        ]
+    );
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "timeout_s");
+    assert_eq!(failed["dispatched"], true);
+    assert_eq!(failed["queued"], false);
+    assert_eq!(failed["direct"], false);
+    assert!(h.approver().item(&id).is_some());
+    Ok(())
+}
+
+/// I-14 case 3: a `max_fetch_mb` overrun on the first response (of a paged op: only paged reads
+/// apply the run's remaining fetch budget to a response here; the same for a plain
+/// `jira.issue.get` is T13's plain-call window, not on this branch).
+async fn dispatch_case_3() -> TestResult {
+    let end = RunEnd::HostLimit {
+        name: "max_fetch_mb".to_owned(),
+    };
+    let search = host_call(
+        1,
+        "jira.search",
+        json!({ "jql": "project = ABC", "max": 1 }),
+    );
+    let (h, runner) = harness(vec![ScriptPlan::new(vec![search], end)]).await?;
+    let page = json!({
+        "startAt": 0, "maxResults": 1, "total": 100_000,
+        "issues": [{ "id": "1", "key": "ABC-1", "fields": { "summary": "s".repeat(1_300_000) } }]
+    });
+    requests_of(&h)?
+        .json("/rest/api/2/search", 200, &page.to_string())
+        .await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    match runner.results().as_slice() {
+        [HostCallResult::Rejected { class, .. }] => assert_eq!(class, "script_limit"),
+        other => return Err(format!("unexpected answers: {other:?}").into()),
+    }
+    let types = h.event_types(&id).await?;
+    assert_eq!(
+        types,
+        [
+            EventType::REQUEST_RECEIVED,
+            EventType::SCRIPT_STARTED,
+            EventType::SCRIPT_CALL_SENT,
+            EventType::SCRIPT_CALL,
+            EventType::SCRIPT_FAILED,
+        ]
+    );
+    let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "max_fetch_mb");
+    assert_eq!(failed["dispatched"], true);
+    assert_eq!(failed["direct"], false);
+    Ok(())
+}
+
+/// I-14 case 4: a compile error, or a host-measured limit before any request was sent by a run
+/// that did not wait for a slot, is direct, exit 8.
+async fn dispatch_case_4() -> TestResult {
+    let limited = RunEnd::HostLimit {
+        name: "max_calls".to_owned(),
+    };
+    let (h, _runner) = harness(vec![
+        ScriptPlan::syntax_error(1, 2, "unexpected token"),
+        ScriptPlan::new(Vec::new(), limited),
+    ])
+    .await?;
+    for (reason, want) in [
+        ("script_syntax", "script_syntax"),
+        ("max_calls", "script_limit"),
+    ] {
+        let id = submit(&h, json!({ "source": SRC })).await?;
+        let env = h.await_(&id, 30_000).await;
+        assert_eq!(env.status, Status::Failed, "{}", env.to_json_line());
+        assert_eq!(exit(&env), 8);
+        assert_eq!(code(&env), want);
+        let failed = record(&h, &id, EventType::SCRIPT_FAILED).await?;
+        assert_eq!(failed["reason"], reason);
+        assert_eq!(failed["direct"], true);
+        assert_eq!(failed["queued"], false);
+        assert_eq!(failed["dispatched"], false);
+        assert!(h.approver().item(&id).is_none());
+    }
+    Ok(())
+}
+
+/// I-14 case 5: a user kill of a non-queued run before its first host call is `pending` and a
+/// release item with `SCRIPT_FAILED {direct: false}` and no terminal event; a crash before the
+/// decision gives `ABANDONED`; the evicted candidates of that kill and of a `queued` run's
+/// pre-dispatch limit rebuild from their `SCRIPT_FAILED` payloads with matching hashes.
+async fn dispatch_case_5() -> TestResult {
+    let hold = || ScriptPlan::new(Vec::new(), result_end(json!(1))).holding(600_000);
+    let limited = ScriptPlan::new(
+        Vec::new(),
+        RunEnd::HostLimit {
+            name: "timeout_s".to_owned(),
+        },
+    );
+    let (mut h, runner) = harness(vec![hold(), hold(), hold(), limited]).await?;
+    // The kill of a run that never queued and never called.
+    let killed = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the run", || runner.starts() == 1).await?;
+    assert_eq!(h.engine().kill_script(&killed), KillAnswer::Killed);
+    h.queued(&killed, 30_000).await.ok_or("never queued")?;
+    let failed = record(&h, &killed, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "killed_by_user");
+    assert_eq!(failed["direct"], false);
+    assert_eq!(failed["queued"], false);
+    assert_eq!(failed["dispatched"], false);
+    // A queued run's limit before its first call.
+    let holder_a = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the second run", || runner.starts() == 2).await?;
+    let holder_b = submit(&h, json!({ "source": SRC })).await?;
+    wait_for("the third run", || runner.starts() == 3).await?;
+    let queued = submit(&h, json!({ "source": SRC })).await?;
+    wait_slot_wait(&h, &queued).await?;
+    assert_eq!(h.engine().kill_script(&holder_a), KillAnswer::Killed);
+    h.queued(&queued, 30_000).await.ok_or("never queued")?;
+    let failed = record(&h, &queued, EventType::SCRIPT_FAILED).await?;
+    assert_eq!(failed["reason"], "timeout_s");
+    assert_eq!(failed["queued"], true);
+    assert_eq!(failed["dispatched"], false);
+    assert_eq!(failed["direct"], false);
+    // No terminal event until release or deny.
+    for id in [&killed, &queued] {
+        assert_eq!(h.status(id).await.status, Status::Pending);
+        assert_eq!(
+            h.event_types(id).await?.last(),
+            Some(&EventType::SCRIPT_FAILED)
+        );
+    }
+    // Evicted, both rebuild from the `SCRIPT_FAILED` payload with the hash they had.
+    for id in [&killed, &queued] {
+        let before = h.approver().rev(id).map_err(de)?;
+        h.evict_candidate(id);
+        let delivery = h.approver().open(id).map_err(de)?;
+        assert!(delivery.preview.approvable, "{id} is not releasable");
+        let after = h.approver().rev(id).map_err(de)?;
+        assert_eq!(before.candidate_hash, after.candidate_hash, "{id}");
+    }
+    // A crash before any decision: every one of them is `ABANDONED`.
+    h.reopen_and_restart().await?;
+    for id in [&killed, &queued, &holder_a, &holder_b] {
+        assert_eq!(
+            h.event_types(id).await?.last(),
+            Some(&EventType::ABANDONED),
+            "{id}"
+        );
+    }
+    Ok(())
+}
+
+/// I-14 (§13 Dispatch rule, §9.5): the five cases, one subtest each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i14_dispatch_rule_cases_1_to_5() -> TestResult {
+    let results = [
+        (
+            "case 1: timeout while the first call is in flight",
+            dispatch_case_1().await,
+        ),
+        (
+            "case 2: the first call fails with a network error",
+            dispatch_case_2(true).await,
+        ),
+        (
+            "case 2: the first call fails with the per-call timeout",
+            dispatch_case_2(false).await,
+        ),
+        (
+            "case 3: max_fetch_mb overrun on the first response",
+            dispatch_case_3().await,
+        ),
+        (
+            "case 4: compile error or direct limit",
+            dispatch_case_4().await,
+        ),
+        (
+            "case 5: user kill before the first call",
+            dispatch_case_5().await,
+        ),
+    ];
+    for (name, result) in results {
+        if let Err(e) = result {
+            return Err(format!("{name}: {e}").into());
+        }
+    }
+    Ok(())
+}
+
+/// M3 final review M-1: a worker is killed after the request's state lock is dropped. The
+/// `kill` of the fake handle takes the lock on another thread and must get it, on each path
+/// that kills a live run: the end of its request by an audit failure, a client cancel and a
+/// user kill.
+#[derive(Clone, Copy)]
+enum KillPath {
+    AuditFailure,
+    ClientCancel,
+    UserKill,
+}
+
+async fn kill_does_not_hold_the_state_lock(path: KillPath) -> TestResult {
+    let faults = FaultPlan::new();
+    let start = pause();
+    let mut plan = ScriptPlan::new(vec![issue_call(1)], result_end(json!(1))).holding(600_000);
+    if matches!(path, KillPath::AuditFailure) {
+        faults.fail_nth(EventType::SCRIPT_CALL_SENT, 1);
+        plan = plan.with_start_pause(start.clone());
+    }
+    let runner = WrappedRunner::new(vec![plan], u32::MAX);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner.clone())
+        .faults(faults)
+        .start()
+        .await?;
+    requests_of(&h)?
+        .json(
+            "/rest/api/2/issue/ABC-1",
+            200,
+            atlas_duck_atlassian::testing::fixtures::JIRA_ISSUE,
+        )
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    if matches!(path, KillPath::AuditFailure) {
+        start.reached.notified().await;
+    } else {
+        wait_for("the run", || runner.inner.starts() == 1).await?;
+    }
+    let entry = h.engine().entry(&id).ok_or("no entry")?;
+    let (got, missed) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    runner.probe_kill({
+        let (got, missed) = (got.clone(), missed.clone());
+        Box::new(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let probed = entry.clone();
+            std::thread::spawn(move || {
+                let _lock = probed.state();
+                let _ = tx.send(());
+            });
+            let counter = if rx.recv_timeout(Duration::from_secs(10)).is_ok() {
+                &got
+            } else {
+                &missed
+            };
+            counter.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    match path {
+        KillPath::AuditFailure => {
+            start.release.notify_one();
+            let env = h.await_(&id, 30_000).await;
+            assert_eq!(code(&env), "audit_failure", "{}", env.to_json_line());
+        }
+        KillPath::ClientCancel => {
+            let env = h.handler().cancel(&id).await;
+            assert_cancelled(&env);
+        }
+        KillPath::UserKill => {
+            assert_eq!(h.engine().kill_script(&id), KillAnswer::Killed);
+        }
+    }
+    wait_for("the kill", || {
+        got.load(Ordering::SeqCst) + missed.load(Ordering::SeqCst) >= 1
+    })
+    .await?;
+    assert_eq!(
+        missed.load(Ordering::SeqCst),
+        0,
+        "kill ran under the state lock"
+    );
+    assert!(got.load(Ordering::SeqCst) >= 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn m1_kill_not_under_state_lock() -> TestResult {
+    kill_does_not_hold_the_state_lock(KillPath::AuditFailure).await?;
+    kill_does_not_hold_the_state_lock(KillPath::ClientCancel).await?;
+    kill_does_not_hold_the_state_lock(KillPath::UserKill).await
+}
+
 // ---- T19a (added scope): the Caution count everywhere the preview's Cautions are read ------------
 
 /// The number of Caution-level warnings of `p`: what the queue's `caution_count` stands for.
