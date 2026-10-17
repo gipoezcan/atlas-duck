@@ -1222,7 +1222,12 @@ async fn script_preview(
         match payload {
             Ok(payload) => script::with_record_output(&mut model, RunOutput::from_value(&payload)),
             Err(RebuildError::Transient(e)) => return Err(DecisionError::Audit(e)),
-            Err(_) => return Err(DecisionError::Invalid(InvalidReason::NotApprovable)),
+            // Unreadable for good: the banner and Release disabled, as for a failed rebuild.
+            Err(_) => {
+                mark_candidate_failed(entry, c.hash());
+                queue_changed(engine, entry);
+                return Err(DecisionError::Invalid(InvalidReason::NotApprovable));
+            }
         }
     }
     let mut warnings = model.warnings;
@@ -1277,8 +1282,13 @@ fn script_release_record(
 /// failure, internal banner, Release disabled), as `Engine::candidate` does for a rebuild; a newer
 /// revision is left alone.
 fn mark_rebuild_failed(entry: &Arc<RequestEntry>, rev: &CandidateRev) {
+    mark_candidate_failed(entry, &rev.candidate_hash);
+}
+
+/// [`mark_rebuild_failed`] for the candidate with hash `hash`.
+fn mark_candidate_failed(entry: &Arc<RequestEntry>, hash: &[u8; 32]) {
     let mut st = entry.state();
-    if st.candidate_hash == rev.candidate_hash {
+    if &st.candidate_hash == hash {
         st.rebuild_failed = true;
         st.model.set_approvable(false);
     }

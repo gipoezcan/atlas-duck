@@ -929,7 +929,7 @@ enum Appended {
 }
 
 async fn append_gated(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, ev: NewEvent) -> Appended {
-    append_gated_call(engine, entry, None, ev).await
+    append_gated_call(engine, entry, None, ev, |_| {}).await
 }
 
 /// [`append_gated`] for the record of host call `call.1`: the call leaves the run's in-flight
@@ -937,11 +937,14 @@ async fn append_gated(engine: &Arc<Engine>, entry: &Arc<RequestEntry>, ev: NewEv
 /// timeout, kill, crash) takes the calls still in the table under the same gate and records
 /// them itself, so a call is recorded exactly once, by whoever holds the gate first. The body
 /// runs in its own task: a dropped call future cannot release the gate while the append runs.
+/// `on_done` runs under the gate once the record is appended, so what it adds to the model is
+/// there before the end of the run can take the gate.
 async fn append_gated_call(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
     call: Option<(Arc<RunShared>, u64)>,
     ev: NewEvent,
+    on_done: impl FnOnce(&RequestEntry) + Send + 'static,
 ) -> Appended {
     let (engine, entry) = (engine.clone(), entry.clone());
     tokio::spawn(async move {
@@ -955,7 +958,10 @@ async fn append_gated_call(
             return Appended::Ended;
         }
         match engine.blocking(move |p| p.append(ev).map(|_| ())).await {
-            Ok(()) => Appended::Done,
+            Ok(()) => {
+                on_done(&entry);
+                Appended::Done
+            }
             Err(_) => Appended::Failed,
         }
     })
@@ -1099,12 +1105,6 @@ impl LiveBackend {
             instance_id: vc.instance_id.clone(),
             user_key: vc.user_key.clone(),
         };
-        // R8: asked for with the request, whatever the answer turns out to be.
-        if requests_rendered(&call.params)
-            && let Some(s) = self.entry.state().script.as_mut()
-        {
-            s.rendered_call = true;
-        }
         let ctl = FetchControl::new();
         // The control first, then the cover: a cancel that took the control before it exists
         // finds nothing in flight and a request that ended mints no cover (Task 24 rule).
@@ -1116,6 +1116,13 @@ impl LiveBackend {
                 return result;
             }
         };
+        // R8: the request went out asking for `renderedFields`, whatever the answer turns out to
+        // be (`Err` above = nothing was sent).
+        if requests_rendered(&call.params)
+            && let Some(s) = self.entry.state().script.as_mut()
+        {
+            s.rendered_call = true;
+        }
         // The control was cancelled by the end of the run, which took the call and records it.
         let Some(settled) = self.settle(&call, &vc, &info, classified) else {
             self.shared.finish_in_flight(call.id);
@@ -1123,23 +1130,27 @@ impl LiveBackend {
         };
         self.shared.add_fetched(settled.size);
         let ended = Some((self.shared.clone(), call.id));
-        match append_gated_call(&self.engine, &self.entry, ended, settled.record).await {
-            Appended::Done => {
-                if let Some(s) = self.entry.state().script.as_mut() {
-                    if settled.lossy {
-                        s.lossy_calls += 1;
-                    }
-                    // From the request as sent (`call.params`), never from the response.
-                    s.calls.push(provenance_row(
-                        call.id,
-                        vc.spec,
-                        &info.alias,
-                        &call.params,
-                        &outcome_of(&settled.result),
-                    ));
+        // From the request as sent (`call.params`), never from the response.
+        let row = provenance_row(
+            call.id,
+            vc.spec,
+            &info.alias,
+            &call.params,
+            &outcome_of(&settled.result),
+        );
+        let lossy = settled.lossy;
+        // The row and the lossy count go in under the gate, with the record: the end of the run
+        // cannot commit the item between the two.
+        let note = move |entry: &RequestEntry| {
+            if let Some(s) = entry.state().script.as_mut() {
+                if lossy {
+                    s.lossy_calls += 1;
                 }
-                settled.result
+                s.calls.push(row);
             }
+        };
+        match append_gated_call(&self.engine, &self.entry, ended, settled.record, note).await {
+            Appended::Done => settled.result,
             Appended::Ended => rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED),
             Appended::Failed => {
                 audit_failure(&self.engine, &self.entry, &self.shared).await;
@@ -1613,8 +1624,31 @@ const OUTPUT_CUT_NOTE: &str =
     "output was cut at its size bound; the audit record keeps the full text";
 
 impl RunOutput {
-    /// Read out of `{logs, stderr}` (a committed `SCRIPT_FINISHED` payload, or a candidate's
-    /// `script_error`) and bounded like an error candidate; anything but strings is dropped.
+    /// Read out of an error candidate's `script_error`, as it is: [`bound_error`] already cut it
+    /// (cutting again would show wrong truncation markers); anything but strings is dropped.
+    fn from_candidate(error: &Value) -> RunOutput {
+        RunOutput {
+            logs: error
+                .get("logs")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            stderr: error
+                .get("stderr")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            cut: error.get("truncated") == Some(&Value::Bool(true)),
+        }
+    }
+
+    /// Read out of the `{logs, stderr}` of a committed `SCRIPT_FINISHED` payload and bounded
+    /// like an error candidate; anything but strings is dropped.
     pub(crate) fn from_value(v: &Value) -> RunOutput {
         let logs: Vec<Value> = v
             .get("logs")
@@ -1690,16 +1724,18 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
     } else {
         ScriptItemKind::Result
     };
-    let out = error.map(RunOutput::from_value).unwrap_or_default();
-    let cut = error.is_some_and(|e| e.get("truncated") == Some(&Value::Bool(true)));
+    let out = error.map(RunOutput::from_candidate).unwrap_or_default();
+    // Completion order is not the order the script made its calls in.
+    let mut provenance = st.calls.clone();
+    provenance.sort_by_key(|r| r.call_id);
     let view = m.body;
     m.body = PreviewBody::Script {
         item,
         view: Box::new(view),
         source: st.source.clone(),
-        provenance: st.calls.clone(),
+        provenance,
         logs: out.logs,
-        logs_note: cut.then(|| OUTPUT_CUT_NOTE.to_owned()),
+        logs_note: out.cut.then(|| OUTPUT_CUT_NOTE.to_owned()),
         stderr: out.stderr,
     };
     m
@@ -2981,5 +3017,35 @@ pub(crate) async fn on_instance_changed(
         engine.ui().emit(UiEvent::QueueChanged {
             request_ids: vec![entry.head.request_id.clone()],
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(call_id: u64, outcome: &str) -> ProvenanceRow {
+        ProvenanceRow {
+            call_id,
+            op_id: "jira.issue.get".to_owned(),
+            instance: "jira-main".to_owned(),
+            target_display: "ABC-1".to_owned(),
+            outcome: outcome.to_owned(),
+        }
+    }
+
+    /// T17 review M-2: rows land in completion order (and cancelled ones at the end of the run);
+    /// the preview lists them by `call_id`.
+    #[test]
+    fn preview_provenance_is_ordered_by_call_id() -> Result<(), String> {
+        let mut st = ScriptState::new(String::new(), Value::Null, ScriptLimits::default(), None);
+        st.calls = vec![row(3, "ok"), row(1, "cancelled_in_flight"), row(2, "ok")];
+        let c = Candidate::from_value(json!({ "result": 1 })).map_err(|e| e.to_string())?;
+        let PreviewBody::Script { provenance, .. } = preview_model(&st, &c).body else {
+            return Err("not a script body".to_owned());
+        };
+        let ids: Vec<u64> = provenance.iter().map(|r| r.call_id).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        Ok(())
     }
 }

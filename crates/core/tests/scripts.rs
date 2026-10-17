@@ -1626,6 +1626,16 @@ async fn run_ended_with_a_call_in_flight(
     end: Option<RunEnd>,
     keep_calls: bool,
 ) -> Result<Vec<(EventType, Value)>, TestError> {
+    let (h, id, _server) = queued_with_a_call_in_flight(end, keep_calls).await?;
+    h.events(&id).await
+}
+
+/// [`run_ended_with_a_call_in_flight`] up to the queued item: the harness, the request id and
+/// the stalling server (kept alive by the caller).
+async fn queued_with_a_call_in_flight(
+    end: Option<RunEnd>,
+    keep_calls: bool,
+) -> Result<(Harness, String, RawHttpServer), TestError> {
     let server = RawHttpServer::serve_sequence(vec![vec![
         RawStep::Send(raw_answer(br#"{"key":"ABC-1","fi"#, 1_000_000)),
         RawStep::Sleep(120_000),
@@ -1663,7 +1673,7 @@ async fn run_ended_with_a_call_in_flight(
     }
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    h.events(&id).await
+    Ok((h, id, server))
 }
 
 fn assert_in_flight_then_failed(events: &[(EventType, Value)], reason: &str) -> TestResult {
@@ -2773,5 +2783,84 @@ async fn m13_rendered_fields_caution_when_run_called_rendered() -> TestResult {
     h.queued(&id, 20_000).await.ok_or("never queued")?;
     let p = script_preview(&h, &id)?;
     assert!(caution(&p).is_empty(), "{:?}", p.warnings);
+    Ok(())
+}
+
+/// T17 review I-2 (X-12): an answer that is a complete page does not count as lossy; only a
+/// truncated page (a next start) does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x12_a_full_page_does_not_count_as_lossy() -> TestResult {
+    let calls = vec![host_call(
+        1,
+        "jira.search",
+        json!({ "jql": "project = ABC", "max": 50 }),
+    )];
+    let (h, _runner) = harness(vec![ScriptPlan::new(calls, result_end(json!(1)))]).await?;
+    requests_of(&h)?
+        .json(
+            "/rest/api/2/search",
+            200,
+            &fixtures::jira_search_page(0, 50, 1, 1),
+        )
+        .await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let p = script_preview(&h, &id)?;
+    assert!(
+        !p.warnings.iter().any(|w| w.id == WarningId::HostCallsLossy),
+        "{:?}",
+        p.warnings
+    );
+    let b = script_body(&p)?;
+    assert_eq!(b.provenance.len(), 1, "{:?}", b.provenance);
+    assert_eq!(b.provenance[0].outcome, "ok");
+    Ok(())
+}
+
+/// T17 review I-3: a call still in flight when the run ends is a `cancelled_in_flight` row,
+/// labelled from its request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_cancelled_in_flight_is_a_provenance_row() -> TestResult {
+    let (h, id, _server) = queued_with_a_call_in_flight(
+        Some(RunEnd::HostLimit {
+            name: "timeout_s".to_owned(),
+        }),
+        false,
+    )
+    .await?;
+    let p = script_preview(&h, &id)?;
+    assert_eq!(
+        script_body(&p)?.provenance,
+        [row(1, "jira.issue.get", "ABC-1", "cancelled_in_flight")]
+    );
+    Ok(())
+}
+
+/// T17 review M-1: an error item's logs were bounded once, by the candidate; the preview shows
+/// the candidate's own markers (the real counts), not a second cut of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn error_item_logs_keep_the_candidates_truncation_markers() -> TestResult {
+    let long = "x".repeat(600 * 1024);
+    let end = RunEnd::Error {
+        class: "Error".to_owned(),
+        message: "boom".to_owned(),
+        stack: String::new(),
+        elapsed_ms: 1,
+        logs: vec![long.clone(), long.clone(), long.clone(), long],
+        stderr: String::new(),
+    };
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), end)]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let b = script_body(&script_preview(&h, &id)?)?;
+    assert_eq!(b.item, ScriptItemKind::ErrorDetails);
+    assert_eq!(b.logs.len(), 3, "{}", b.logs.len());
+    assert!(
+        b.logs[1].ends_with("\n[truncated 180224 bytes]"),
+        "{}",
+        &b.logs[1][b.logs[1].len().saturating_sub(40)..]
+    );
+    assert_eq!(b.logs[2], "[truncated 2 log lines]");
+    assert!(b.logs_note.is_some());
     Ok(())
 }
