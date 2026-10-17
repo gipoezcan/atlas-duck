@@ -5,12 +5,12 @@
 use std::time::Duration;
 
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, UserKind, fixtures};
-use atlas_duck_registry::{OpClass, OperationSpec};
+use atlas_duck_registry::{OpClass, OperationSpec, SuccessBody};
 use serde_json::{Value, json};
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
-use super::jira::{declared_success, fill_path, http_method};
+use super::jira::{fill_path, http_method};
 
 /// The `expand` of a `confluence.page.get` in `markdown` or `storage` format (PD-100).
 pub const PAGE_EXPAND_STORAGE: &str = "body.storage,version,space,ancestors";
@@ -356,7 +356,49 @@ fn write_answer(
             json_answer(mock, 200, &body)
         }
         "confluence.label.add" => json_answer(mock, 200, &read_example("confluence.label.list")?),
-        _ => declared_success(mock, spec),
+        _ => confluence_success(mock, spec)?,
+    })
+}
+
+/// The status real Confluence DC answers `spec` with (V06; the registry declares `Any2xx` for the
+/// JSON writes, so its own set cannot say which one): `200` for the content writes (`page.create`,
+/// `page.update`, `page.move`, `comment.add`, `label.add`, `attachment.upload`), `204` for
+/// `label.remove`. An op not listed is an error, so a new write is decided here.
+pub fn real_dc_status(spec: &OperationSpec) -> Result<u16, String> {
+    match spec.id {
+        "confluence.page.create"
+        | "confluence.page.update"
+        | "confluence.page.move"
+        | "confluence.comment.add"
+        | "confluence.label.add"
+        | "confluence.attachment.upload" => Ok(200),
+        "confluence.label.remove" => Ok(204),
+        other => Err(format!(
+            "{other}: no real DC write status in real_dc_status"
+        )),
+    }
+}
+
+/// A write's declared success in the form Confluence DC answers it: [`real_dc_status`], an empty
+/// body for a declared empty success, the registry receipt example plus a `self` link a projection
+/// must drop for a JSON one.
+fn confluence_success(mock: &MockDc, spec: &OperationSpec) -> Result<ResponseTemplate, String> {
+    let status = real_dc_status(spec)?;
+    Ok(match spec.success.body {
+        SuccessBody::Empty if status == 204 => mock.response(204),
+        SuccessBody::Empty => mock
+            .response(status)
+            .set_body_raw(String::new(), "text/html;charset=UTF-8"),
+        SuccessBody::Json => {
+            let mut body = spec.result_example_json();
+            if let Some(m) = body.as_object_mut() {
+                m.insert(
+                    "self".into(),
+                    json!("https://wiki.corp.example/rest/api/content/1"),
+                );
+            }
+            json_answer(mock, status, &body)
+        }
     })
 }
 

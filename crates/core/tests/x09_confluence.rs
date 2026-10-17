@@ -26,7 +26,7 @@ use atlas_duck_audit::EventType;
 use atlas_duck_core::testing::Harness;
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use atlas_duck_registry::{
-    BodySource, OpClass, OperationSpec, Product, QueryValue, StatusSet, Version,
+    BodySource, OpClass, OperationSpec, Product, QueryValue, StatusSet, SuccessBody, Version,
 };
 use common::confluence::{
     Aux, REPLACE_ATTACHMENT_ID, aux_gets, is_replace, mount_for_op, own_request, server_answer,
@@ -226,6 +226,34 @@ fn query_of(r: &Request, name: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
+/// Every whole value a request carries: its path segments, its query values, the scalar leaves of
+/// a JSON body and the file names of a multipart one. A target param must be one of these, not a
+/// substring of the URL or the body.
+fn wire_values(r: &Request, body_text: &str) -> Vec<String> {
+    fn leaves(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Array(a) => a.iter().for_each(|x| leaves(x, out)),
+            Value::Object(m) => m.values().for_each(|x| leaves(x, out)),
+            other => out.extend(scalar(other)),
+        }
+    }
+    let mut out: Vec<String> = r
+        .url
+        .path_segments()
+        .map(|s| s.map(str::to_owned).collect())
+        .unwrap_or_default();
+    out.extend(r.url.query_pairs().map(|(_, v)| v.into_owned()));
+    if let Ok(body) = serde_json::from_str::<Value>(body_text) {
+        leaves(&body, &mut out);
+    }
+    for part in body_text.split("filename=\"").skip(1) {
+        if let Some((name, _)) = part.split_once('"') {
+            out.push(name.to_owned());
+        }
+    }
+    out
+}
+
 /// The registry endpoint the case's own request uses: the alternative one for `page.history`
 /// with `version`.
 fn used_endpoint(case: &Case) -> atlas_duck_registry::Endpoint {
@@ -251,7 +279,7 @@ async fn check_shape(
     case: &Case,
     mock: &MockDc,
     aux: &[Aux],
-    status: Option<u16>,
+    response: Option<&Value>,
 ) -> Result<(), String> {
     let spec = case.spec;
     let ep = used_endpoint(case);
@@ -422,7 +450,7 @@ async fn check_shape(
             }
         }
     }
-    let wire = format!("{} {body_text}", r.url);
+    let wire = wire_values(r, &body_text);
     for t in spec.target_params {
         let values: Vec<String> = match &case.params[*t] {
             Value::Array(a) => a.iter().filter_map(scalar).collect(),
@@ -430,7 +458,10 @@ async fn check_shape(
         };
         for v in values {
             if !wire.contains(&v) {
-                return Err(format!("target param {t}={v} is not on the wire: {wire}"));
+                return Err(format!(
+                    "target param {t}={v} is not a path segment, query value, body value or file \
+                     name of the request: {wire:?}"
+                ));
             }
         }
     }
@@ -449,17 +480,79 @@ async fn check_shape(
             return Err(format!("labels sent {sent:?}, the agent wrote {want:?}"));
         }
     }
-    // The answer the mock gave a write is the registry's declared success.
-    if let (OpClass::Write, Some(got)) = (spec.class, status) {
-        let ok = match spec.success.statuses {
-            StatusSet::Exactly(list) => list.contains(&got),
-            StatusSet::Any2xx => (200..300).contains(&got),
-        };
-        if !ok {
-            return Err(format!("WRITE_EXECUTED recorded status {got}"));
-        }
+    // The answer the instance gave a write is what real DC answers (V06), and the registry's
+    // declared success covers it, in status and shape.
+    if let (OpClass::Write, Some(response)) = (spec.class, response) {
+        check_declared_success(spec, response)?;
     }
     Ok(())
+}
+
+/// Spec §7.2/V06: the status real Confluence DC answers each write with, typed here and not taken
+/// from the registry (which declares `Any2xx` for the JSON writes, so its set cannot say which).
+const DC_WRITE_STATUS: [(&str, u16); 7] = [
+    ("confluence.page.create", 200),
+    ("confluence.page.update", 200),
+    ("confluence.page.move", 200),
+    ("confluence.comment.add", 200),
+    ("confluence.label.add", 200),
+    ("confluence.label.remove", 204),
+    ("confluence.attachment.upload", 200),
+];
+
+fn dc_write_status(op_id: &str) -> Result<u16, String> {
+    DC_WRITE_STATUS
+        .iter()
+        .find(|(id, _)| *id == op_id)
+        .map(|(_, st)| *st)
+        .ok_or_else(|| format!("{op_id} has no real DC write status in DC_WRITE_STATUS"))
+}
+
+/// The registry declares `status` (and the `Empty`/`Json` shape) as `spec`'s success.
+fn declares(spec: &OperationSpec, status: u16) -> bool {
+    match spec.success.statuses {
+        StatusSet::Exactly(list) => list.contains(&status),
+        StatusSet::Any2xx => (200..300).contains(&status),
+    }
+}
+
+/// `response` is the `WRITE_EXECUTED` response of `spec`: exactly the status real DC answers, a
+/// status the registry declares (a registry that contradicts real DC fails here, reported, not
+/// edited), and the declared body shape (empty text for `Empty`, a JSON object for `Json`).
+fn check_declared_success(spec: &OperationSpec, response: &Value) -> Result<(), String> {
+    let want = dc_write_status(spec.id)?;
+    if !declares(spec, want) {
+        return Err(format!(
+            "the registry's declared success {:?} does not cover the {want} real DC answers",
+            spec.success.statuses
+        ));
+    }
+    let got = response["status"].as_u64();
+    if got != Some(u64::from(want)) {
+        return Err(format!(
+            "WRITE_EXECUTED recorded status {got:?}, real DC answers {want}"
+        ));
+    }
+    let text = response["body"]["text"].as_str();
+    match spec.success.body {
+        SuccessBody::Empty if text == Some("") || response["body"]["b64"].as_str() == Some("") => {
+            Ok(())
+        }
+        SuccessBody::Empty => Err(format!("a declared empty success recorded {response}")),
+        SuccessBody::Json => {
+            let json_type = response["content_type"]
+                .as_str()
+                .is_some_and(|c| c.contains("json"));
+            let object = text
+                .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                .is_some_and(|v| v.is_object());
+            if json_type && object {
+                Ok(())
+            } else {
+                Err(format!("a declared JSON success recorded {response}"))
+            }
+        }
+    }
 }
 
 /// What a read releases: the body its mock answers, except that a Markdown page body is the
@@ -485,7 +578,7 @@ async fn run_case(case: &Case) -> Result<(), String> {
     let spec = case.spec;
     let (h, aux) = start(case).await?;
     let id = submit_queued(&h, case).await?;
-    let mut write_status = None;
+    let mut write_response = None;
     match spec.class {
         OpClass::Read => {
             h.approver().release(&id).map_err(|e| s(de(e)))?;
@@ -516,6 +609,11 @@ async fn run_case(case: &Case) -> Result<(), String> {
             }
         }
         OpClass::Write => {
+            // Nothing is on the wire while the write waits (I-4): a short continuous watch
+            // before the approval.
+            let mock = h.mock(ALIAS).ok_or("no confluence mock")?;
+            let held = mock.received().await.len();
+            watch_wire(mock, held, 150).await?;
             h.approver().approve(&id).map_err(|e| s(de(e)))?;
             let env = h.await_(&id, 10_000).await;
             if (env.status, exit(&env)) != (Status::Succeeded, 0) {
@@ -538,14 +636,14 @@ async fn run_case(case: &Case) -> Result<(), String> {
                 .find(|(t, _)| *t == EventType::WRITE_EXECUTED)
                 .map(|(_, p)| p.clone())
                 .ok_or("no WRITE_EXECUTED record")?;
-            write_status = payload["response"]["status"].as_u64().map(|n| n as u16);
-            if write_status.is_none() {
+            if payload["response"]["status"].as_u64().is_none() {
                 return Err(format!("WRITE_EXECUTED without a status: {payload}"));
             }
+            write_response = Some(payload["response"].clone());
         }
     }
     let mock = h.mock(ALIAS).ok_or("no confluence mock")?;
-    check_shape(case, mock, &aux, write_status).await
+    check_shape(case, mock, &aux, write_response.as_ref()).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -610,6 +708,35 @@ fn x09_confluence_generator_covers_the_registry() -> TestResult {
             spec.alt_endpoint.is_some(),
             spec.id == "confluence.page.history",
             "{}: only page.history has an alternative endpoint",
+            spec.id
+        );
+    }
+    // Every write has its real DC status (typed here and in the mock's `real_dc_status`, which
+    // must agree), and the registry's declared success covers it, in status and body shape.
+    let writes: Vec<_> = specs.iter().filter(|s| s.class == OpClass::Write).collect();
+    assert_eq!(
+        writes.len(),
+        DC_WRITE_STATUS.len(),
+        "a write without a DC status"
+    );
+    for spec in writes {
+        let want = dc_write_status(spec.id)?;
+        assert_eq!(
+            common::confluence::real_dc_status(spec)?,
+            want,
+            "{}: the mock answers another status than real DC",
+            spec.id
+        );
+        assert!(
+            declares(spec, want),
+            "{}: the registry declares {:?}, real DC answers {want}",
+            spec.id,
+            spec.success.statuses
+        );
+        assert_eq!(
+            spec.success.body == SuccessBody::Empty,
+            want == 204,
+            "{}: the declared body shape and the status disagree",
             spec.id
         );
     }
@@ -686,8 +813,31 @@ fn x09_confluence_generator_covers_the_registry() -> TestResult {
     Ok(())
 }
 
-/// Gate: a write is held for the human: nothing is sent while it waits, and a denial sends
-/// nothing and records no execution.
+/// Polls the mock every 20 ms for `ms`: no request but GETs, and no request at all beyond the
+/// `held` ones that were there when the request was queued. A write sent late by a task that
+/// outlives a snapshot is seen by a later poll.
+async fn watch_wire(mock: &MockDc, held: usize, ms: u64) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+    loop {
+        let hits = mock.received().await;
+        if let Some(r) = hits.iter().find(|r| r.method.as_str() != "GET") {
+            return Err(format!("{} {} was sent", r.method, r.url.path()));
+        }
+        if hits.len() != held {
+            return Err(format!(
+                "{} requests on the wire, {held} when queued",
+                hits.len()
+            ));
+        }
+        if tokio::time::Instant::now() > deadline {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Gate: a write is held for the human: nothing is sent while it waits (watched at every poll of
+/// the wait), and a denial sends nothing and records no execution.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn x09_confluence_writes_wait_for_approval() -> TestResult {
     let mut failed = Vec::new();
@@ -701,21 +851,20 @@ async fn x09_confluence_writes_wait_for_approval() -> TestResult {
             let (h, _) = start(case).await?;
             let id = submit_queued(&h, case).await?;
             let mock = h.mock(ALIAS).ok_or("no confluence mock")?;
-            let sent =
-                |hits: Vec<Request>| hits.iter().filter(|r| r.method.as_str() != "GET").count();
-            let before = sent(mock.received().await);
-            if before != 0 {
-                return Err(format!("{before} writes sent before the approval"));
-            }
+            // Every poll of the whole wait: no write, and no request of any kind beyond the
+            // reads the preview needed (a task that sends late is caught by a later poll).
+            let held = mock.received().await.len();
+            watch_wire(mock, held, 400)
+                .await
+                .map_err(|e| format!("before the decision: {e}"))?;
             h.approver().deny(&id, "no").map_err(|e| s(de(e)))?;
             let env = h.await_(&id, 10_000).await;
             if env.status != Status::Denied {
                 return Err(format!("not denied: {}", env.to_json_line()));
             }
-            let after = sent(mock.received().await);
-            if after != 0 {
-                return Err(format!("{after} writes sent after a denial"));
-            }
+            watch_wire(mock, held, 300)
+                .await
+                .map_err(|e| format!("after a denial: {e}"))?;
             let types = h.event_types(&id).await.map_err(s)?;
             if types.iter().any(|t| {
                 matches!(
@@ -749,6 +898,49 @@ fn envelope_text(env: &Envelope) -> Result<String, TestError> {
     Ok(json(env)?.to_string())
 }
 
+/// What the instance answered `case`'s read, as far as the agent must not see it before a
+/// release: the distinctive strings of the body the mock serves ([`server_answer`], decoded, so
+/// the storage XML of a page and not the Markdown of its example), and for `user.current` the
+/// identity the identity mock serves. The op id and the params are the agent's own words and are
+/// left out (`comment` is a `type` value and sits in the op id).
+fn answer_markers(case: &Case) -> Result<Vec<String>, String> {
+    let own = format!("{} {}", case.spec.id, case.params);
+    let mut markers = Vec::new();
+    if case.spec.id == "confluence.user.current" {
+        markers.push(TEST_USER.to_owned());
+        markers.push(TEST_USER_KEY.to_owned());
+    } else {
+        marker_strings(&server_answer(case.spec, &case.params)?, &own, &mut markers);
+        marker_strings(&case.spec.result_example_json(), &own, &mut markers);
+    }
+    markers.sort();
+    markers.dedup();
+    if markers.is_empty() {
+        return Err("the answer has no distinctive string to look for".to_owned());
+    }
+    Ok(markers)
+}
+
+/// The first marker that is part of a string value of `v`, compared decoded (a quote or a line
+/// break in a value is not JSON-escaped here).
+fn find_marker<'a>(v: &Value, markers: &'a [String]) -> Option<&'a String> {
+    match v {
+        Value::String(t) => markers.iter().find(|m| t.contains(m.as_str())),
+        Value::Array(a) => a.iter().find_map(|x| find_marker(x, markers)),
+        Value::Object(m) => m.values().find_map(|x| find_marker(x, markers)),
+        _ => None,
+    }
+}
+
+/// `env` carries none of `markers`.
+fn no_answer(markers: &[String], env: &Envelope, what: &str) -> Result<(), String> {
+    let v = json(env).map_err(s)?;
+    match find_marker(&v, markers) {
+        Some(m) => Err(format!("{what} carries the instance's answer ({m})")),
+        None => Ok(()),
+    }
+}
+
 /// Gate: a read's bytes reach the agent only through a release: the pending and the denied
 /// envelope carry none of the instance's answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -761,34 +953,53 @@ async fn x09_confluence_reads_hold_their_result_until_released() -> TestResult {
     assert!(reads.len() >= 11, "{} read cases", reads.len());
     for case in &reads {
         let run = async {
+            let markers = answer_markers(case)?;
             let (h, _) = start(case).await?;
             let env = h.submit(case.spec.id, case.params.clone()).await;
-            let pending = envelope_text(&env).map_err(s)?;
             if env.status != Status::Pending {
-                return Err(format!("not pending: {pending}"));
+                return Err(format!("not pending: {}", env.to_json_line()));
             }
+            no_answer(&markers, &env, "the submit envelope")?;
             let id = request_id(&env).map_err(s)?;
             h.queued(&id, 20_000).await.ok_or("never queued")?;
+            // The read is fetched and waits for the human: `await` (bounded) and `status` answer
+            // pending and carry nothing of the instance's answer.
+            let waiting = h.await_(&id, 300).await;
+            if waiting.status != Status::Pending || waiting.data.is_some() {
+                return Err(format!(
+                    "await while queued is not a data-free pending: {}",
+                    waiting.to_json_line()
+                ));
+            }
+            no_answer(&markers, &waiting, "await while queued")?;
+            let status = h.status(&id).await;
+            if status.data.is_some() {
+                return Err(format!(
+                    "status while queued has data: {}",
+                    status.to_json_line()
+                ));
+            }
+            no_answer(&markers, &status, "status while queued")?;
             h.approver().deny(&id, "no").map_err(|e| s(de(e)))?;
             let denied = h.await_(&id, 10_000).await;
             if denied.status != Status::Denied {
                 return Err(format!("not denied: {}", denied.to_json_line()));
             }
-            // The op id and the params are the agent's own words: a `type` value like `comment`
-            // is in the pending envelope as part of the op id, not as the instance's answer.
-            let mut markers = Vec::new();
-            marker_strings(
-                &case.spec.result_example_json(),
-                &format!("{} {}", case.spec.id, case.params),
-                &mut markers,
-            );
-            if markers.is_empty() {
-                return Err("the example has no distinctive string to look for".to_owned());
+            no_answer(&markers, &denied, "the denied envelope")?;
+            // Control: the same markers are in the envelope of a release, so a clean envelope
+            // above is not a marker that cannot match.
+            let (h2, _) = start(case).await?;
+            let id2 = submit_queued(&h2, case).await?;
+            h2.approver().release(&id2).map_err(|e| s(de(e)))?;
+            let released = h2.await_(&id2, 10_000).await;
+            if released.status != Status::Released {
+                return Err(format!("not released: {}", released.to_json_line()));
             }
-            for text in [pending, envelope_text(&denied).map_err(s)?] {
-                if let Some(m) = markers.iter().find(|m| text.contains(m.as_str())) {
-                    return Err(format!("the envelope carries the instance's answer ({m})"));
-                }
+            if find_marker(&json(&released).map_err(s)?, &markers).is_none() {
+                return Err(format!(
+                    "no marker {markers:?} in the released envelope: the gate's markers do not \
+                     match what a release carries"
+                ));
             }
             Ok::<(), String>(())
         };
@@ -850,6 +1061,28 @@ async fn harness_at(version: &str) -> Result<Harness, TestError> {
     Ok(h)
 }
 
+/// A structured version field in `v`: a non-null `min_version`, `instance_version` or
+/// `server_version`, or an object that is a version (`major`, `minor` and `patch`). A version that
+/// leaks as numbers carries no `7.9` text, so the text check alone would miss it.
+fn version_field(v: &Value) -> Option<String> {
+    match v {
+        Value::Object(m) => {
+            if ["min_version", "instance_version", "server_version"]
+                .iter()
+                .any(|k| m.get(*k).is_some_and(|x| !x.is_null()))
+                || ["major", "minor", "patch"]
+                    .iter()
+                    .all(|k| m.contains_key(*k))
+            {
+                return Some(v.to_string());
+            }
+            m.values().find_map(version_field)
+        }
+        Value::Array(a) => a.iter().find_map(version_field),
+        _ => None,
+    }
+}
+
 fn available(env: &Envelope) -> Result<Value, TestError> {
     let v = json(env)?;
     Ok(v["data"]["available"].clone())
@@ -873,12 +1106,14 @@ async fn x10_confluence_every_op_available_on_floor() -> TestResult {
         assert_eq!(v["data"]["available"], true, "{}: {v}", spec.id);
         assert_eq!(v["data"]["op_id"], spec.id);
         assert!(!v.to_string().contains("7.9"), "{}: {v}", spec.id);
+        assert_eq!(version_field(&v), None, "{}: a structured version", spec.id);
     }
     let list = json(&h.handler().ops_list(Some(ALIAS)).await)?;
     let ops = list["data"]["ops"].as_array().ok_or("no ops")?;
     assert_eq!(ops.len(), confluence_specs().len());
     assert!(ops.iter().all(|o| o["available"] == true), "{list}");
     assert!(!list.to_string().contains("7.9"), "{list}");
+    assert_eq!(version_field(&list), None, "a structured version: {list}");
     Ok(())
 }
 
@@ -1002,11 +1237,13 @@ async fn x10_confluence_catalog_has_no_version_gate() -> TestResult {
             spec.id,
             env.to_json_line()
         );
+        let v = json(&env)?;
         assert!(
-            !json(&env)?.to_string().contains("7.0.3"),
+            !v.to_string().contains("7.0.3"),
             "{}: the instance's version is in the envelope",
             spec.id
         );
+        assert_eq!(version_field(&v), None, "{}: a structured version", spec.id);
     }
     Ok(())
 }
