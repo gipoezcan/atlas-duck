@@ -1661,3 +1661,244 @@ pub(crate) fn move_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model.header.hidden_in_preview_bytes = model.header.hidden_in_preview_bytes.saturating_add(cut);
     model
 }
+
+// ---- the attachment card (§6.3 Attachment upload, PD-109, PD-110, Task 20b) -------------------
+
+/// PD-110: a raster image of at most this many bytes gets a `data:` thumbnail. Its base64 (about
+/// 2.7 MiB) fits the 4 MiB `DOC_MAX_BYTES` render cap together with the rest of the card.
+const THUMBNAIL_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+/// plan text (PD-110, plan review m-9): the fact row of an active or mismatched extension.
+pub const TEXT_EXTENSION_MISMATCH: &str = "extension and content type differ";
+
+/// Extensions a browser renders or runs as active content when the file is served under them:
+/// PD-110's `html`, `htm`, `svg`, `js` and their siblings (XHTML, server-side includes, SVGZ, ES
+/// modules, XML with XSLT, MHTML archives).
+const ACTIVE_EXTENSIONS: [&str; 14] = [
+    "html", "htm", "xhtml", "xht", "shtml", "svg", "svgz", "js", "mjs", "xml", "xsl", "xslt",
+    "mht", "mhtml",
+];
+
+/// The extensions that name each type `confluence_ext::sniff_mime` knows. A zip is also every
+/// container format built on it (Office Open XML, OpenDocument, Java, EPUB), so an Office file
+/// carries no fact row.
+const TYPE_EXTENSIONS: [(&str, &[&str]); 6] = [
+    ("image/png", &["png"]),
+    ("image/jpeg", &["jpg", "jpeg", "jpe", "jfif"]),
+    ("image/gif", &["gif"]),
+    ("image/webp", &["webp"]),
+    ("application/pdf", &["pdf"]),
+    (
+        "application/zip",
+        &[
+            "zip", "docx", "docm", "dotx", "xlsx", "xlsm", "xltx", "pptx", "pptm", "potx", "odt",
+            "ods", "odp", "odg", "jar", "epub",
+        ],
+    ),
+];
+
+/// The fact row shows at most this many chars of the extension.
+const EXTENSION_CAP_CHARS: usize = 32;
+
+/// The comment shows at most this many chars (the schema's `maxLength`).
+const COMMENT_CAP_CHARS: usize = 1000;
+
+/// The file part's headers and the comment part's, exactly as `confluence_ext::multipart` writes
+/// them (the boundary and the file name around them).
+const FILE_PART_HEAD: &str = "\r\nContent-Disposition: form-data; name=\"file\"; filename=\"";
+const FILE_TYPE_HEAD: &str = "\"\r\nContent-Type: ";
+const COMMENT_PART_HEAD: &str = "\r\nContent-Disposition: form-data; name=\"comment\"\r\n\
+                                 Content-Type: text/plain; charset=utf-8\r\n\r\n";
+
+/// The upload one request sends, read back from its multipart body.
+struct SentUpload<'a> {
+    filename: &'a str,
+    mime: &'static str,
+    content: &'a [u8],
+    comment: Option<&'a str>,
+}
+
+/// The upload `request` sends when its body is exactly the layout `confluence_ext::multipart`
+/// writes: the file part (a file name without a double quote or control character, sent as the
+/// type sniffed from its bytes), then the comment part when given, then the closing delimiter.
+/// Anything else is `None` (the card keeps the generic request list).
+fn sent_upload(request: &HttpRequestSpec) -> Option<SentUpload<'_>> {
+    let b = request
+        .content_type
+        .as_deref()?
+        .strip_prefix("multipart/form-data; boundary=")?;
+    if b.is_empty() {
+        return None;
+    }
+    let rest = request
+        .body
+        .strip_prefix(format!("--{b}{FILE_PART_HEAD}").as_bytes())?;
+    let name_end = generic::find_bytes(rest, FILE_TYPE_HEAD.as_bytes())?;
+    let filename = std::str::from_utf8(rest.get(..name_end)?).ok()?;
+    let rest = rest.get(name_end + FILE_TYPE_HEAD.len()..)?;
+    let type_end = generic::find_bytes(rest, b"\r\n\r\n")?;
+    let part_type = rest.get(..type_end)?;
+    let rest = rest.get(type_end + 4..)?;
+    let delimiter = format!("\r\n--{b}");
+    let end = generic::find_bytes(rest, delimiter.as_bytes())?;
+    let content = rest.get(..end)?;
+    let tail = rest.get(end + delimiter.len()..)?;
+    let comment = if tail == b"--\r\n" {
+        None
+    } else {
+        let text = tail
+            .strip_prefix(COMMENT_PART_HEAD.as_bytes())?
+            .strip_suffix(format!("{delimiter}--\r\n").as_bytes())?;
+        let text = std::str::from_utf8(text).ok()?;
+        // A comment holding the delimiter would not split back into these parts.
+        if text.contains(&delimiter) {
+            return None;
+        }
+        Some(text)
+    };
+    let mime = super::confluence_ext::sniff_mime(content);
+    let plain_name = !filename.chars().any(|c| c == '"' || c.is_control());
+    (plain_name && part_type == mime.as_bytes()).then_some(SentUpload {
+        filename,
+        mime,
+        content,
+        comment,
+    })
+}
+
+/// The `data:` thumbnail of a raster image of at most [`THUMBNAIL_MAX_BYTES`] (PD-110): standard
+/// base64, unwrapped (T8 review m-7), typed by the sniffed type, never by the extension; never SVG.
+fn thumbnail(mime: &str, content: &[u8]) -> Option<String> {
+    use base64::Engine as _;
+    let raster = matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    );
+    (raster && content.len() <= THUMBNAIL_MAX_BYTES).then(|| {
+        format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(content)
+        )
+    })
+}
+
+/// PD-110 (plan review m-9): the extension of `filename` when it names an active type, names a
+/// sniffable type other than `mime`, or `mime` is a sniffed type the extension does not name.
+/// Trailing dots and spaces are dropped first (Windows drops them when the file is saved, so
+/// `x.html.` opens as `x.html`); a name without an extension has none.
+fn mismatched_extension<'a>(filename: &'a str, mime: &str) -> Option<&'a str> {
+    let (_, ext) = filename.trim_end_matches(['.', ' ']).rsplit_once('.')?;
+    let lower = ext.to_ascii_lowercase();
+    let named = TYPE_EXTENSIONS
+        .iter()
+        .find(|(_, exts)| exts.contains(&lower.as_str()))
+        .map(|(t, _)| *t);
+    let of_sniffed = TYPE_EXTENSIONS
+        .iter()
+        .find(|(t, _)| *t == mime)
+        .map(|(_, exts)| *exts);
+    let differs = ACTIVE_EXTENSIONS.contains(&lower.as_str())
+        || named.is_some_and(|t| t != mime)
+        || of_sniffed.is_some_and(|exts| !exts.contains(&lower.as_str()));
+    differs.then_some(ext)
+}
+
+/// §6.3 Attachment upload for `confluence.attachment.upload` (PD-109, PD-110) over the exact
+/// request (§5.1 inv. 4): the file name, size, the type the part is sent as (sniffed), the
+/// SHA-256, the capped thumbnail, the comment, PD-110's fact row; the collision hold's "attachment
+/// already exists" with the facts of the attachment found, or a replace's "replaces existing
+/// attachment vN". The card never carries the file beyond the thumbnail, and the request list
+/// keeps the Δ2 envelope (the file part as its size and SHA-256 line, counted as hidden by
+/// `generic`). A request that is not exactly the upload the verdict calls for (another endpoint,
+/// another layout), and every other hold, keeps the generic write preview.
+pub(crate) fn attachment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let Some(verdict) = view.enrichment else {
+        return model;
+    };
+    let existing = verdict
+        .summary
+        .as_ref()
+        .and_then(|s| s.confluence.as_ref())
+        .and_then(|c| c.existing_attachment.as_ref());
+    let replace = verdict.resolved.get("replace") == Some(&Value::Bool(true));
+    // The collision names the attachment found; a replace's preview the one it replaces; a new
+    // attachment's preview found none.
+    let (collision, replaced) = match (view.hold, verdict.hold, replace, existing) {
+        (Hold::Collision, Hold::Collision, false, Some(e)) => (Some(e), None),
+        (Hold::Preview, Hold::Preview, true, Some(e)) => (None, Some(e)),
+        (Hold::Preview, Hold::Preview, false, None) => (None, None),
+        _ => return model,
+    };
+    let ([request], PreviewBody::WriteRequests { .. }) = (view.requests, &model.body) else {
+        return model;
+    };
+    let Some(content_id) = verdict.resolved.get("id").and_then(Value::as_str) else {
+        return model;
+    };
+    let endpoint = match replaced {
+        Some(e) => format!(
+            "/rest/api/content/{content_id}/child/attachment/{}/data",
+            e.id
+        ),
+        None => format!("/rest/api/content/{content_id}/child/attachment?allowDuplicated=false"),
+    };
+    let Some(sent) = sent_upload(request).filter(|_| request.resolved_url.ends_with(&endpoint))
+    else {
+        return model;
+    };
+
+    let mut cut = 0u64;
+    let mut line = |raw: &str, cap: usize| {
+        let (shown, bytes) = generic::capped_text(raw, cap);
+        cut = cut.saturating_add(bytes);
+        shown
+    };
+    let filename = line(sent.filename, generic::CELL_CAP_CHARS * 2);
+    let comment = sent.comment.map(|c| line(c, COMMENT_CAP_CHARS));
+    let notes: Vec<String> = mismatched_extension(sent.filename, sent.mime)
+        .map(|ext| {
+            let ext = line(ext, EXTENSION_CAP_CHARS);
+            format!("{TEXT_EXTENSION_MISMATCH}: .{ext}, sent as {}", sent.mime)
+        })
+        .into_iter()
+        .collect();
+    let existing = collision.map(|e| {
+        let size = e
+            .size
+            .map_or_else(|| "size not reported".to_owned(), |n| format!("{n} bytes"));
+        line(
+            &format!("attachment {}, version {}, {size}", e.id, e.version),
+            generic::CELL_CAP_CHARS,
+        )
+    });
+    // Server text the card shows beyond the request (§6.4 counts): the attachment found.
+    count_card_text(&mut model, collision.map(|e| e.id.as_str()));
+
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::AttachmentUpload {
+        filename,
+        size: len_u64(sent.content.len()),
+        mime: sent.mime.to_owned(),
+        sha256: crate::payloads::sha256_hex(sent.content),
+        thumbnail_data_uri: thumbnail(sent.mime, sent.content),
+        replaces_version: replaced.map(|e| e.version),
+        existing,
+        comment,
+        notes,
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = model.header.hidden_in_preview_bytes.saturating_add(cut);
+    model
+}

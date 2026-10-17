@@ -1040,6 +1040,14 @@ const CONTENT_BASE64: GeneralPurpose = GeneralPurpose::new(
         .with_decode_allow_trailing_bits(true),
 );
 
+/// The agent's file as the executor decodes it (PD-110: the edit form names its size and
+/// SHA-256); `None` when `content_base64` is absent or no base64.
+pub(crate) fn decoded_content(params: &Value) -> Option<Vec<u8>> {
+    CONTENT_BASE64
+        .decode(params.get("content_base64")?.as_str()?)
+        .ok()
+}
+
 /// PD-109: the filename goes into the part header as sent (`filename="<name>"`, UTF-8), so a
 /// double quote or a control character (CR, LF, tab, C0, DEL, C1) cannot be written there and is
 /// refused; `..`, `/`-free names and any other character are ordinary (attachments are stored by

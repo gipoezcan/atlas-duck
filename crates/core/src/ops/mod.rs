@@ -994,8 +994,9 @@ static ENTRIES: &[(&str, OpImpl)] = &[
         "confluence.attachment.upload",
         OpImpl {
             executor: confluence_ext::attachment_upload_executor,
-            // The request list (its multipart body as the Δ2 envelope); Task 20b's card follows.
-            previewer: generic::write_preview,
+            // §6.3 Attachment upload (Task 20b, PD-110) over the request list (its multipart
+            // body as the Δ2 envelope).
+            previewer: confluence_preview::attachment_preview,
             // PD-109 / §5.4 step 5: with `replace`, the attachment's id and `version.number`
             // unchanged; a new attachment plans no GET (the identity call still runs).
             stale_check: Some(&stale::ATTACHMENT_REPLACE),
