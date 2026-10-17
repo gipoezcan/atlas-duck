@@ -1463,7 +1463,7 @@ impl LiveBackend {
             .for_request(&self.entry.head.request_id)
             .map_err(|_| internal())?;
         let fetch_cap = u64::from(self.limits.max_fetch_mb).saturating_mul(MIB);
-        let budget = ReadBudget {
+        let mut budget = ReadBudget {
             max_bytes: fetch_cap.saturating_sub(self.shared.fetched_bytes()),
             max_response_bytes: u64::from(self.limits.max_call_result_mb).saturating_mul(MIB),
             ..self.engine.read_budget()
@@ -1489,6 +1489,7 @@ impl LiveBackend {
                     let (earlier, answer) = read::split_answer(fetched);
                     let mut responses = earlier;
                     responses.extend(answer);
+                    let first_bytes: u64 = responses.iter().map(|r| r.body.len() as u64).sum();
                     let first = payloads::script_call(
                         &self.ctx_for(vc),
                         &ScriptCallMeta {
@@ -1504,11 +1505,19 @@ impl LiveBackend {
                             responses: &responses,
                             reason: "identity_check",
                         },
-                        responses.iter().map(|r| r.body.len() as u64).sum(),
+                        first_bytes,
                         None,
                     );
                     match append_gated(&self.engine, &self.entry, first).await {
-                        Appended::Done => {}
+                        // The first answer was received: its bytes count against `max_fetch_mb`
+                        // (T19d review I-1), and the re-fetch is cut at what is left. At 0 it is
+                        // still sent and cut at its first byte (`script_limit`, a committed
+                        // record): `Err` here would mean nothing was sent.
+                        Appended::Done => {
+                            self.shared.add_fetched(first_bytes);
+                            budget.max_bytes =
+                                fetch_cap.saturating_sub(self.shared.fetched_bytes());
+                        }
                         Appended::Ended => {
                             return Err(rejected_msg(ErrorCode::Cancelled, MSG_CALL_CANCELLED));
                         }
