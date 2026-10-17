@@ -1564,7 +1564,10 @@ async fn edit_write(
         executed_params: result.executed_params,
         edited_keys: result.edited_keys,
     };
-    let apply = write::edit_apply(engine.clone(), entry, result.params, view, rendered, pat);
+    // T23b: the new revision's caution count, built off the entry lock before the transition.
+    let (params, rendered, caution) =
+        write::edit_caution(engine, entry, snap, result.params, rendered).await;
+    let apply = write::edit_apply(engine.clone(), entry, params, view, rendered, pat, caution);
     match engine
         .transition_with(entry, event, record, OnAuditFailure::FailRequest, apply)
         .await

@@ -72,11 +72,11 @@ pub mod validate;
 #[cfg(feature = "testing")]
 pub mod testing;
 
+#[cfg(feature = "testing")]
+pub use crate::core::{BuildPause, HookPoint, Pause, TestHooks};
 pub use crate::core::{
     Confirm, Core, CoreDeps, NativeConfirmer, ShutdownReason, ShutdownReport, StartError,
 };
-#[cfg(feature = "testing")]
-pub use crate::core::{HookPoint, Pause, TestHooks};
 pub use atlas_duck_preview::CandidateRev;
 /// The product of `AddInstance` (M6 T25: the app parses the add-instance form's `product` into it
 /// without a registry dependency of its own).

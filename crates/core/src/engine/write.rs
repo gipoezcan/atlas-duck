@@ -612,17 +612,155 @@ fn file_content_label(value: Option<&Value>) -> String {
     }
 }
 
-/// The queue row's "caution (N)" of the current revision (§5.6).
-fn refresh_caution(st: &mut EntryState, spec: &'static OperationSpec, alias: &str) {
-    let (Phase::AwaitingApproval(hold), Some(w)) = (st.model.phase(), st.write.as_ref()) else {
-        return;
-    };
+/// The queue row's "caution (N)" of `w` in `hold` (§5.6): the Caution warnings of the card the
+/// previewer builds. A whole card (seconds for a body near `PAGE_BODY_LIMIT` in a debug build,
+/// T23), so it never runs under the entry lock (T23b): see [`caution_off_lock`].
+fn caution_of(spec: &'static OperationSpec, alias: &str, w: &WriteState, hold: Hold) -> u32 {
     let n = preview_model(spec, alias, w, hold, None)
         .warnings
         .iter()
         .filter(|w| w.level == Level::Caution)
         .count();
-    st.caution_count = u32::try_from(n).unwrap_or(u32::MAX);
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// A caution count built off the entry lock and what it was built for (T23b): the revision and
+/// candidate the entry was at when its write state was read, and the hold it was counted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Caution {
+    pub count: u32,
+    pub hold: Hold,
+    pub rev: u64,
+    pub candidate_hash: [u8; 32],
+}
+
+impl Caution {
+    /// Stores the count in a closure that applies an event bumping the revision by one (`Enriched`,
+    /// `Edit`), called before the closure sets a new candidate hash: only if the entry was still
+    /// at the revision and candidate the count was built from and is now in its hold. Otherwise
+    /// nothing is stored and `false` tells the caller to [`recount`].
+    fn store_bumped(self, st: &mut EntryState, hash_before: [u8; 32]) -> bool {
+        let current = st.model.rev() == self.rev.saturating_add(1)
+            && hash_before == self.candidate_hash
+            && st.model.phase() == Phase::AwaitingApproval(self.hold);
+        if current {
+            st.caution_count = self.count;
+        }
+        current
+    }
+}
+
+/// The test hold of a caution build (`TestHooks::hold_caution_build`); nothing in a release.
+#[cfg(feature = "testing")]
+#[derive(Clone)]
+struct BuildHook(Option<Arc<crate::core::BuildPause>>);
+#[cfg(not(feature = "testing"))]
+#[derive(Clone)]
+struct BuildHook;
+
+impl BuildHook {
+    #[cfg(feature = "testing")]
+    fn of(engine: &Engine) -> BuildHook {
+        BuildHook(engine.hooks.hold_caution_build.clone())
+    }
+
+    #[cfg(not(feature = "testing"))]
+    fn of(_: &Engine) -> BuildHook {
+        BuildHook
+    }
+
+    /// Holds this blocking thread while a test's armed pause says so; whether it held.
+    #[cfg(feature = "testing")]
+    fn hold(&self) -> bool {
+        self.0.as_ref().is_some_and(|p| p.hold())
+    }
+
+    #[cfg(not(feature = "testing"))]
+    fn hold(&self) -> bool {
+        false
+    }
+
+    /// The flow of a held build stored or dropped its result (`BuildPause::settled`).
+    #[cfg(feature = "testing")]
+    fn settled(&self, held: bool) {
+        if let Some(pause) = self.0.as_ref().filter(|_| held) {
+            pause.settled.notify_one();
+        }
+    }
+
+    #[cfg(not(feature = "testing"))]
+    fn settled(&self, _: bool) {}
+}
+
+/// [`caution_of`] on a blocking thread, off every lock (T23b), so neither the entry lock nor an
+/// async worker waits for the card. `w` comes back unchanged (moved, not copied); the count is
+/// `None` if the build did not finish (a panic in the previewer), and the caller stores nothing.
+/// The `bool`: a test's `BuildPause` held this build.
+async fn caution_off_lock(
+    engine: &Engine,
+    spec: &'static OperationSpec,
+    alias: String,
+    w: WriteState,
+    hold: Hold,
+) -> (WriteState, Option<u32>, bool) {
+    let w = Arc::new(w);
+    let (basis, hook) = (w.clone(), BuildHook::of(engine));
+    let built = tokio::task::spawn_blocking(move || {
+        let held = hook.hold();
+        (caution_of(spec, &alias, &basis, hold), held)
+    })
+    .await
+    .ok();
+    // The blocking closure dropped its handle when it returned (or unwound).
+    let w = Arc::try_unwrap(w).unwrap_or_else(|w| (*w).clone());
+    match built {
+        Some((n, held)) => (w, Some(n), held),
+        None => (w, None, false),
+    }
+}
+
+/// T23b: the queue row's caution count of the entry's current revision, built off the entry
+/// lock: the write state is read under it, the card is built on a blocking thread, and the count
+/// is stored only if the entry is still at that revision and candidate (`rev` and
+/// `candidate_hash`) in that hold. A newer revision's own path counts it, so a result for an
+/// older one is dropped, never stored. Until the count is stored the row shows the previous
+/// revision's count; the card itself (`write_preview`) is always built fresh from the current
+/// revision, and approvability never reads the count.
+pub(crate) async fn recount(engine: &Engine, entry: &RequestEntry) {
+    let basis = {
+        let st = entry.state();
+        match (st.model.phase(), st.write.as_ref()) {
+            (Phase::AwaitingApproval(hold), Some(w)) => {
+                Some((w.clone(), hold, st.model.rev(), st.candidate_hash))
+            }
+            _ => None,
+        }
+    };
+    let Some((w, hold, rev, candidate_hash)) = basis else {
+        return;
+    };
+    let alias = entry.head.instance.clone();
+    let (_, count, held) = caution_off_lock(engine, entry.spec, alias, w, hold).await;
+    let stored = count.is_some_and(|n| {
+        let mut st = entry.state();
+        let current = st.model.rev() == rev
+            && st.candidate_hash == candidate_hash
+            && st.model.phase() == Phase::AwaitingApproval(hold);
+        if current {
+            st.caution_count = n;
+        }
+        current
+    });
+    BuildHook::of(engine).settled(held);
+    if stored {
+        queue_changed(engine, entry);
+    }
+}
+
+/// [`recount`] as a task of its own: a closure that could not store its precomputed count
+/// starts it (it runs once that closure released the lock).
+fn recount_later(engine: Arc<Engine>, entry: Arc<RequestEntry>) {
+    tokio::spawn(async move { recount(&engine, &entry).await });
 }
 
 /// The instance's stored identity, if it has a usable PAT (§5.1 inv. 6; Task 26 adds the
@@ -1190,7 +1328,8 @@ fn attention(engine: &Engine, kind: AttentionKind) {
 /// ("the user may approve again later", §5.4 step 5). Every other return stays not approvable
 /// (review I-2): a refresh decides at its `Enriched`, `instance_changed` waits for the new PAT,
 /// an identity mismatch for a matching identity call. The control of the GET or send it
-/// replaces is cancelled. `approval`: the stale-check task making the return (review I-1).
+/// replaces is cancelled, and the row's caution count follows off the lock ([`recount`]).
+/// `approval`: the stale-check task making the return (review I-1).
 async fn stale_return(
     engine: &Arc<Engine>,
     entry: &Arc<RequestEntry>,
@@ -1201,7 +1340,6 @@ async fn stale_return(
     approval: Option<Approval>,
 ) -> Result<Applied, TransitionError> {
     let credential = stored_identity(engine, entry).await.is_some();
-    let (spec, alias) = (entry.spec, entry.head.instance.clone());
     let (eng, id) = (engine.clone(), entry.instance_id.clone());
     let recompute = returned == Returned::RecheckFailed && !refresh;
     let pending = Arc::new(std::sync::Mutex::new(None));
@@ -1235,9 +1373,6 @@ async fn stale_return(
                 *pending_out
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = missed;
-                if !refreshing {
-                    refresh_caution(st, spec, &alias);
-                }
             },
             bound(approval),
         )
@@ -1262,6 +1397,9 @@ async fn stale_return(
             // A task of its own: `follow_pending` can return the write again (recursion).
             tokio::spawn(follow_task(engine.clone(), entry.clone(), missed));
         }
+        // T23b: the row's caution count of the hold the write is back in, built off the entry
+        // lock after the return (none while a refresh runs: its `Enriched` counts).
+        recount(engine, entry).await;
     }
     applied
 }
@@ -1992,11 +2130,46 @@ async fn enriched(
     let hash = list_hash(&requests);
     let credential = stored_identity(engine, entry).await.is_some();
     let (eng, id) = (engine.clone(), entry.instance_id.clone());
-    let (spec, alias) = (entry.spec, entry.head.instance.clone());
-    let refresh = entry.state().model.refreshing();
+    // T23b: the row's caution count of the new revision, built here off the entry lock from the
+    // write as the verdict leaves it. While `Enriching` nothing else changes the write (an edit,
+    // a decision and an instance change are refused or deferred; a cancel or an expiry makes
+    // `Enriched` illegal), so the params and return reason read now are the ones the closure
+    // keeps; the closure checks the revision and candidate it was built from all the same.
+    let (refresh, basis) = {
+        let st = entry.state();
+        let basis = st.write.as_ref().map(|w| {
+            let mut next = WriteState::new(w.params.clone());
+            next.returned = w.returned.clone();
+            (next, st.model.rev(), st.candidate_hash)
+        });
+        (st.model.refreshing(), basis)
+    };
+    let (verdict, failure, requests, caution) = match basis {
+        Some((next, rev, candidate_hash)) => {
+            let next = WriteState {
+                verdict,
+                failure,
+                requests,
+                ..next
+            };
+            let alias = entry.head.instance.clone();
+            let (next, count, _) = caution_off_lock(engine, entry.spec, alias, next, hold).await;
+            let caution = count.map(|count| Caution {
+                count,
+                hold,
+                rev,
+                candidate_hash,
+            });
+            (next.verdict, next.failure, next.requests, caution)
+        }
+        None => (verdict, failure, requests, None),
+    };
+    let (eng_later, entry_later) = (engine.clone(), entry.clone());
     let pending = Arc::new(std::sync::Mutex::new(None));
     let pending_out = pending.clone();
     let apply = move |st: &mut EntryState| {
+        let before = st.candidate_hash;
+        let stored = caution.is_some_and(|c| c.store_bumped(st, before));
         st.candidate_hash = hash;
         if let Some(w) = st.write.as_mut() {
             w.verdict = verdict;
@@ -2006,7 +2179,9 @@ async fn enriched(
         let missed = take_pending(st);
         let ok = missed.is_none() && approvable(st, pat_now(&eng, &id, credential));
         st.model.set_approvable(ok);
-        refresh_caution(st, spec, &alias);
+        if !stored && matches!(st.model.phase(), Phase::AwaitingApproval(_)) {
+            recount_later(eng_later, entry_later);
+        }
         *pending_out
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = missed;
@@ -2680,6 +2855,9 @@ async fn settle_execution(
 pub(crate) struct Snapshot {
     pub write: WriteState,
     pub hold: Option<Hold>,
+    /// The revision and candidate the entry was at (T23b: what an edit's caution count is for).
+    pub rev: u64,
+    pub candidate_hash: [u8; 32],
 }
 
 pub(crate) fn snapshot(entry: &RequestEntry) -> Option<Snapshot> {
@@ -2688,25 +2866,63 @@ pub(crate) fn snapshot(entry: &RequestEntry) -> Option<Snapshot> {
         Phase::AwaitingApproval(h) => Some(h),
         _ => None,
     };
-    st.write.clone().map(|write| Snapshot { write, hold })
+    st.write.clone().map(|write| Snapshot {
+        write,
+        hold,
+        rev: st.model.rev(),
+        candidate_hash: st.candidate_hash,
+    })
+}
+
+/// T23b: the caution count of an edit that does not re-enrich (`rendered`), built off the entry
+/// lock from `snap` as the edit leaves it: the edited params, the re-rendered list, no return
+/// reason, the same hold. `params` and `rendered` come back unchanged. `None` for an edit that
+/// re-enriches (its `Enriched` counts) or when the build did not finish.
+pub(crate) async fn edit_caution(
+    engine: &Engine,
+    entry: &RequestEntry,
+    snap: Snapshot,
+    params: Value,
+    rendered: Option<Vec<HttpRequestSpec>>,
+) -> (Value, Option<Vec<HttpRequestSpec>>, Option<Caution>) {
+    let (hold, requests) = match (snap.hold, rendered) {
+        (Some(hold), Some(requests)) => (hold, requests),
+        (_, rendered) => return (params, rendered, None),
+    };
+    let next = WriteState {
+        params,
+        requests,
+        returned: None,
+        ..snap.write
+    };
+    let alias = entry.head.instance.clone();
+    let (next, count, _) = caution_off_lock(engine, entry.spec, alias, next, hold).await;
+    let caution = count.map(|count| Caution {
+        count,
+        hold,
+        rev: snap.rev,
+        candidate_hash: snap.candidate_hash,
+    });
+    (next.params, Some(next.requests), caution)
 }
 
 /// The new revision of an edit that does not re-enrich, applied with the `Edit` event: the list
-/// rendered from the edited params and the latest verdict (§5.4 step 4, inv. 5).
+/// rendered from the edited params and the latest verdict (§5.4 step 4, inv. 5), and its caution
+/// count from [`edit_caution`] (T23b: built before, off the lock; counted again off the lock if
+/// the entry is no longer at the revision it was built for).
 pub(crate) fn edit_apply(
     engine: Arc<Engine>,
-    entry: &RequestEntry,
+    entry: &Arc<RequestEntry>,
     params: Value,
     view: EditView,
     rendered: Option<Vec<HttpRequestSpec>>,
     credential: bool,
+    caution: Option<Caution>,
 ) -> impl FnOnce(&mut EntryState) + Send + 'static {
-    let (spec, alias, instance_id) = (
-        entry.spec,
-        entry.head.instance.clone(),
-        entry.instance_id.clone(),
-    );
+    let (later, instance_id) = (entry.clone(), entry.instance_id.clone());
     move |st: &mut EntryState| {
+        let before = st.candidate_hash;
+        let stored = caution.is_some_and(|c| c.store_bumped(st, before));
         if let Some(w) = st.write.as_mut() {
             w.params = params;
             w.edit = Some(view);
@@ -2722,7 +2938,10 @@ pub(crate) fn edit_apply(
         }
         let ok = approvable(st, pat_now(&engine, &instance_id, credential));
         st.model.set_approvable(ok);
-        refresh_caution(st, spec, &alias);
+        // A re-enriching edit is `Enriching`: its `Enriched` counts.
+        if !stored && matches!(st.model.phase(), Phase::AwaitingApproval(_)) {
+            recount_later(engine, later);
+        }
     }
 }
 
