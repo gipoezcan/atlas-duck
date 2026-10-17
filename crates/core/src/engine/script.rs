@@ -67,7 +67,7 @@ use crate::ids::RequestId;
 use crate::instances::{InstanceState, RouteError};
 use crate::lifecycle::model::{Event, Kind, Model, Phase, ReleaseItem, step};
 use crate::normalize::normalize_reason;
-use crate::ops::generic::fallback_preview;
+use crate::ops::generic::{count_shown_text, fallback_preview};
 use crate::ops::{
     ExecError, ExecPlan, PreviewCtx, PreviewInput, PreviewModel, ReadPlan, ReadView, op_table,
 };
@@ -1728,6 +1728,17 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
     // Completion order is not the order the script made its calls in.
     let mut provenance = st.calls.clone();
     provenance.sort_by_key(|r| r.call_id);
+    // T18 review I-3: the §6.4 counts and Cautions cover what the document shows beyond the
+    // candidate (an error item's logs and stderr are in the candidate, counted once above).
+    let calls = provenance.iter().flat_map(|r| {
+        [
+            r.op_id.as_str(),
+            r.instance.as_str(),
+            r.target_display.as_str(),
+            r.outcome.as_str(),
+        ]
+    });
+    count_shown_text(&mut m, std::iter::once(st.source.as_str()).chain(calls));
     let view = m.body;
     m.body = PreviewBody::Script {
         item,
@@ -1742,9 +1753,25 @@ pub(crate) fn preview_model(st: &ScriptState, c: &Candidate) -> PreviewModel {
 }
 
 /// A result item's logs and stderr, read from its committed `SCRIPT_FINISHED` record, into the
-/// preview `m` of [`preview_model`] (R7: never part of the released bytes). An error item keeps
-/// the ones its candidate has.
+/// preview `m` of [`preview_model`] (R7: never part of the released bytes), counted for §6.4.
+/// An error item keeps the ones its candidate has.
 pub(crate) fn with_record_output(m: &mut PreviewModel, out: RunOutput) {
+    if !matches!(
+        m.body,
+        PreviewBody::Script {
+            item: ScriptItemKind::Result,
+            ..
+        }
+    ) {
+        return;
+    }
+    count_shown_text(
+        m,
+        out.logs
+            .iter()
+            .map(String::as_str)
+            .chain([out.stderr.as_str()]),
+    );
     if let PreviewBody::Script {
         item: ScriptItemKind::Result,
         logs,

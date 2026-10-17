@@ -647,6 +647,39 @@ pub(crate) fn invisible_warnings(warnings: &mut Vec<Warning>, bidi: u64, other: 
     }
 }
 
+/// Adds the invisible characters of `texts`, text a preview shows beyond its candidate or
+/// request, to the §6.4 counts of `model`; its `bidi_controls` / `other_invisible` Cautions then
+/// follow the totals.
+pub(crate) fn count_shown_text<'a>(
+    model: &mut PreviewModel,
+    texts: impl IntoIterator<Item = &'a str>,
+) {
+    let header = &mut model.header;
+    for text in texts {
+        let (bidi, other) = invisible::count(text);
+        header.bidi_controls = header.bidi_controls.saturating_add(bidi);
+        header.other_invisible = header.other_invisible.saturating_add(other);
+    }
+    for (id, n, text) in [
+        (
+            WarningId::BidiControls,
+            header.bidi_controls,
+            warning::bidi_controls(header.bidi_controls),
+        ),
+        (
+            WarningId::OtherInvisible,
+            header.other_invisible,
+            warning::other_invisible(header.other_invisible),
+        ),
+    ] {
+        match model.warnings.iter_mut().find(|w| w.id == id) {
+            Some(w) => *w = Warning::new(id, text),
+            None if n > 0 => model.warnings.push(Warning::new(id, text)),
+            None => {}
+        }
+    }
+}
+
 /// Mixed-script hits (§6.4), only on identifiers: issue/project/space keys, usernames and URL
 /// hosts. Names of statuses, projects or components are prose and never checked.
 #[derive(Default)]

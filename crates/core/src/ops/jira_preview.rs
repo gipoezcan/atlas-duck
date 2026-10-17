@@ -13,7 +13,7 @@
 
 use atlas_duck_convert::{wiki_constructs, wiki_to_preview_html, wiki_to_text};
 use atlas_duck_preview::diff::{DiffLine, DiffOp, LineDiff, hunks, line_diff};
-use atlas_duck_preview::invisible::{self, escape_for_display};
+use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::mixed_script::is_mixed_script;
 use atlas_duck_preview::warning::{self, Warning, WarningId};
 use atlas_duck_preview::{
@@ -1253,30 +1253,7 @@ fn user_text(user: &JiraUser, hidden: &mut u64) -> String {
 /// review I1: a display name) to the §6.4 counts; the `bidi_controls` / `other_invisible`
 /// Cautions then follow the totals.
 fn count_card_text<'a>(model: &mut PreviewModel, texts: impl IntoIterator<Item = &'a str>) {
-    let header = &mut model.header;
-    for text in texts {
-        let (bidi, other) = invisible::count(text);
-        header.bidi_controls = header.bidi_controls.saturating_add(bidi);
-        header.other_invisible = header.other_invisible.saturating_add(other);
-    }
-    for (id, n, text) in [
-        (
-            WarningId::BidiControls,
-            header.bidi_controls,
-            warning::bidi_controls(header.bidi_controls),
-        ),
-        (
-            WarningId::OtherInvisible,
-            header.other_invisible,
-            warning::other_invisible(header.other_invisible),
-        ),
-    ] {
-        match model.warnings.iter_mut().find(|w| w.id == id) {
-            Some(w) => *w = Warning::new(id, text),
-            None if n > 0 => model.warnings.push(Warning::new(id, text)),
-            None => {}
-        }
-    }
+    generic::count_shown_text(model, texts);
 }
 
 /// The mixed-script Caution (§6.4) for an identifier a write card sends that the agent may not

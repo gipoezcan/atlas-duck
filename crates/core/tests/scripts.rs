@@ -2704,6 +2704,91 @@ async fn error_details_preview_has_class_message_stack_elapsed() -> TestResult {
     Ok(())
 }
 
+/// The header's §6.4 counts of `p` and the texts of its bidi / other-invisible Cautions.
+fn invisible_counts(p: &Preview) -> ((u64, u64), Vec<String>) {
+    let cautions = p
+        .warnings
+        .iter()
+        .filter(|w| matches!(w.id, WarningId::BidiControls | WarningId::OtherInvisible))
+        .map(|w| w.text.clone())
+        .collect();
+    ((p.header.bidi_controls, p.header.other_invisible), cautions)
+}
+
+/// T18 review I-3: the §6.4 counts and their Cautions cover what the script document shows
+/// beyond the candidate: the source, the provenance, and a result's logs and stderr (from its
+/// record). An error item's logs and stderr are in its candidate already and count once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bidi_counts_cover_source_provenance_logs_and_stderr() -> TestResult {
+    use atlas_duck_preview::warning::{bidi_controls, other_invisible};
+    let error_end = RunEnd::Error {
+        class: "Error".to_owned(),
+        message: "failed".to_owned(),
+        stack: String::new(),
+        elapsed_ms: 1,
+        logs: vec!["error log \u{202E}".to_owned()],
+        stderr: String::new(),
+    };
+    let output_end = RunEnd::Result {
+        value: json!(1),
+        logs: vec!["log \u{202E}".to_owned()],
+        stderr: "stderr \u{200B}".to_owned(),
+    };
+    // A search whose JQL carries a soft hyphen (Cf: the registry's label filter keeps it).
+    let search = host_call(
+        1,
+        "jira.search",
+        json!({ "jql": "summary ~ \"x\u{00AD}y\"", "max": 1 }),
+    );
+    let (h, _runner) = harness(vec![
+        ScriptPlan::new(Vec::new(), result_end(json!(1))),
+        ScriptPlan::new(Vec::new(), output_end),
+        ScriptPlan::new(Vec::new(), error_end),
+        ScriptPlan::new(vec![search], result_end(json!(1))),
+    ])
+    .await?;
+    let mut previews = Vec::new();
+    for source in [
+        "return 1; // \u{202E}\u{2066}",
+        SRC,
+        SRC,
+        "return await atlas.call('jira.search', {});",
+    ] {
+        let id = submit(&h, json!({ "source": source })).await?;
+        h.queued(&id, 20_000).await.ok_or("never queued")?;
+        previews.push(script_preview(&h, &id)?);
+    }
+    // The source: two bidi controls.
+    assert_eq!(
+        invisible_counts(&previews[0]),
+        ((2, 0), vec![bidi_controls(2)])
+    );
+    // A result's log and stderr, read from its record.
+    assert_eq!(
+        invisible_counts(&previews[1]),
+        ((1, 1), vec![bidi_controls(1), other_invisible(1)])
+    );
+    // An error item's log: in its candidate and in atlas.log, counted once.
+    assert_eq!(
+        invisible_counts(&previews[2]),
+        ((1, 0), vec![bidi_controls(1)])
+    );
+    // The provenance row's target.
+    let b = script_body(&previews[3])?;
+    assert!(
+        b.provenance
+            .iter()
+            .any(|r| r.target_display.contains('\u{00AD}')),
+        "{:?}",
+        b.provenance
+    );
+    assert_eq!(
+        invisible_counts(&previews[3]),
+        ((0, 1), vec![other_invisible(1)])
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn result_logs_read_from_committed_record() -> TestResult {
     let end = RunEnd::Result {
