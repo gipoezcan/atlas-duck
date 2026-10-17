@@ -10,8 +10,8 @@ use std::time::Duration;
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, XAuser, fixtures};
 use atlas_duck_audit::EventType;
 use atlas_duck_core::payloads::{InvalidReason, body_from_json, sha256_hex};
-use atlas_duck_core::testing::{FaultPlan, Harness};
-use atlas_duck_core::{AdminError, BatchItem, Confirm, DecisionError, Edits};
+use atlas_duck_core::testing::{FakeScriptRunner, FaultPlan, Harness, ScriptPlan, host_call};
+use atlas_duck_core::{AdminError, BatchItem, Confirm, DecisionError, Edits, RunEnd};
 use atlas_duck_ipc::envelope::{Envelope, Status};
 use common::{TestError, TestResult, code, de, exit, request_id};
 use serde_json::{Map, Value, json};
@@ -317,6 +317,208 @@ async fn x04_append_failure_at_every_gated_point() -> TestResult {
     row_system_fetch_start()
         .await
         .map_err(|e| format!("SYSTEM_FETCH start: {e}"))?;
+    Ok(())
+}
+
+// ---- X-04, scripts ----------------------------------------------------------------------------------
+
+const SCRIPT_TYPES: [EventType; 6] = [
+    EventType::SCRIPT_STARTED,
+    EventType::SCRIPT_CALL_SENT,
+    EventType::SCRIPT_CALL,
+    EventType::SCRIPT_FINISHED,
+    EventType::SCRIPT_RELEASED,
+    EventType::DELIVERED,
+];
+
+/// A harness with a script runner whose one run makes one host call; `plan` fails the append
+/// the test names. `hold` keeps the run alive after its call, so a kill from the failure
+/// reaches it.
+async fn script_rig(
+    hold: bool,
+) -> Result<
+    (
+        Harness,
+        std::sync::Arc<FaultPlan>,
+        std::sync::Arc<FakeScriptRunner>,
+    ),
+    TestError,
+> {
+    let plan = FaultPlan::new();
+    let mut run = ScriptPlan::new(
+        vec![host_call(1, ISSUE, json!({ "key": "ABC-1" }))],
+        RunEnd::Result {
+            value: json!({ "n": 1 }),
+            logs: Vec::new(),
+            stderr: String::new(),
+        },
+    );
+    if hold {
+        run = run.holding(30_000);
+    }
+    let runner = FakeScriptRunner::new(vec![run]);
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(runner.clone())
+        .faults(plan.clone())
+        .start()
+        .await?;
+    let mock = jira(&h)?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    mock.jira_server_info("9.12.0").await;
+    mock.json("/rest/api/2/issue/ABC-1", 200, fixtures::JIRA_ISSUE)
+        .await;
+    Ok((h, plan, runner))
+}
+
+/// How many issue reads the instance has received.
+async fn issue_reads(h: &Harness) -> Result<usize, TestError> {
+    Ok(common::test_hits(jira(h)?).await.len())
+}
+
+/// The script request's record types, without the request's own and its preview's.
+async fn script_records(h: &Harness, id: &str) -> Result<Vec<EventType>, TestError> {
+    Ok(h.event_types(id)
+        .await?
+        .into_iter()
+        .filter(|t| SCRIPT_TYPES.contains(t))
+        .collect())
+}
+
+/// The script ended `audit_failure`, retryable, with no data and no release item, and none of
+/// the records that follow `point` exist: nothing was released, delivered or sent after it.
+async fn script_stopped_at(
+    h: &Harness,
+    id: &str,
+    point: EventType,
+    sent: usize,
+) -> Result<(), TestError> {
+    let after = SCRIPT_TYPES
+        .iter()
+        .position(|t| *t == point)
+        .ok_or("not a script point")?;
+    let types = script_records(h, id).await?;
+    for later in &SCRIPT_TYPES[after..] {
+        // Before the release, the one `DELIVERED` is the `audit_failure` envelope's own.
+        if *later == EventType::DELIVERED && after < 4 {
+            continue;
+        }
+        assert!(
+            !types.contains(later),
+            "{later:?} after the failed {point:?}: {types:?}"
+        );
+    }
+    assert!(
+        h.approver().item(id).is_none(),
+        "a release item for {point:?}"
+    );
+    assert_eq!(count_of(h, EventType::SCRIPT_RELEASED).await?, 0);
+    assert_eq!(issue_reads(h).await?, sent, "requests sent at {point:?}");
+    Ok(())
+}
+
+/// A failed append before the run's end: the agent gets `audit_failure` (retryable) and no data,
+/// the run is killed for the audit failure, and `later` records never exist.
+async fn script_point_in_run(point: EventType, hold: bool, sent: usize) -> TestResult {
+    let (h, plan, runner) = script_rig(hold).await?;
+    plan.fail_nth(point, 1);
+    let env = h.submit_script(json!({ "source": "return 1;" })).await;
+    assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+    let id = request_id(&env)?;
+    audit_failure(&h.await_(&id, 10_000).await, true);
+    audit_failure(&h.status(&id).await, true);
+    if point == EventType::SCRIPT_STARTED {
+        // The record gates the spawn: no worker ever existed.
+        assert_eq!(runner.starts(), 0);
+        assert!(runner.kills().is_empty());
+    } else if hold {
+        for _ in 0..1000 {
+            if runner.kills().iter().any(Option::is_some) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            runner.kills(),
+            [Some(atlas_duck_core::KillReason::AuditFailure)],
+            "{point:?}"
+        );
+    }
+    script_stopped_at(&h, &id, point, sent).await
+}
+
+/// `SCRIPT_RELEASED`: the release fails, the candidate is not delivered, the request is not
+/// decidable again.
+async fn script_point_released() -> TestResult {
+    let (h, plan, _runner) = script_rig(false).await?;
+    let env = h.submit_script(json!({ "source": "return 1;" })).await;
+    let id = request_id(&env)?;
+    h.queued(&id, 10_000).await.ok_or("never queued")?;
+    plan.fail_nth(EventType::SCRIPT_RELEASED, 1);
+    let res = h.approver().release(&id);
+    assert!(matches!(res, Err(DecisionError::Audit(_))), "{res:?}");
+    audit_failure(&h.await_(&id, 5000).await, true);
+    assert!(h.approver().item(&id).is_none());
+    let again = h.approver().release_unopened(&id);
+    assert!(
+        matches!(
+            again,
+            Err(DecisionError::NotDecidable | DecisionError::Stale { .. })
+        ),
+        "{again:?}"
+    );
+    let types = script_records(&h, &id).await?;
+    assert!(!types.contains(&EventType::SCRIPT_RELEASED), "{types:?}");
+    assert!(!types.contains(&EventType::DELIVERED), "{types:?}");
+    assert_eq!(issue_reads(&h).await?, 1);
+    Ok(())
+}
+
+/// `DELIVERED`: the result stays in the core; the next `await` delivers it.
+async fn script_point_delivered() -> TestResult {
+    let (h, plan, _runner) = script_rig(false).await?;
+    let env = h.submit_script(json!({ "source": "return 1;" })).await;
+    let id = request_id(&env)?;
+    h.queued(&id, 10_000).await.ok_or("never queued")?;
+    h.approver().release(&id).map_err(de)?;
+    plan.fail_nth(EventType::DELIVERED, 1);
+    audit_failure(&h.await_(&id, 5000).await, true);
+    assert_eq!(count_of(&h, EventType::DELIVERED).await?, 0);
+    assert_eq!(issue_reads(&h).await?, 1);
+    let again = h.await_(&id, 5000).await;
+    assert_eq!(again.status, Status::Released, "{}", again.to_json_line());
+    assert_eq!(
+        again.data.ok_or("no data")?["result"],
+        json!({ "n": 1 }),
+        "the second await delivers what the first held back"
+    );
+    assert_eq!(count_of(&h, EventType::DELIVERED).await?, 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn x04_script_points() -> TestResult {
+    // Nothing is sent before `SCRIPT_CALL_SENT` commits; the call's request left before its own
+    // record (`SCRIPT_CALL`) failed; the run's end follows the call.
+    script_point_in_run(EventType::SCRIPT_STARTED, true, 0)
+        .await
+        .map_err(|e| format!("SCRIPT_STARTED: {e}"))?;
+    script_point_in_run(EventType::SCRIPT_CALL_SENT, true, 0)
+        .await
+        .map_err(|e| format!("SCRIPT_CALL_SENT: {e}"))?;
+    script_point_in_run(EventType::SCRIPT_CALL, true, 1)
+        .await
+        .map_err(|e| format!("SCRIPT_CALL: {e}"))?;
+    script_point_in_run(EventType::SCRIPT_FINISHED, false, 1)
+        .await
+        .map_err(|e| format!("SCRIPT_FINISHED: {e}"))?;
+    script_point_released()
+        .await
+        .map_err(|e| format!("SCRIPT_RELEASED: {e}"))?;
+    script_point_delivered()
+        .await
+        .map_err(|e| format!("DELIVERED: {e}"))?;
     Ok(())
 }
 

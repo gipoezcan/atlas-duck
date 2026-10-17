@@ -542,6 +542,73 @@ async fn script_reservation_follows_configured_max_result_mb() -> TestResult {
     Ok(())
 }
 
+/// What admission did for two scripts, a third that does not fit beside them and a fourth after
+/// one was released: the reservation after each step and the third's answer. The runs end with
+/// `result`.
+async fn script_admission_trace(result: Value) -> Result<(Vec<u64>, String), TestError> {
+    let run = || {
+        ScriptPlan::new(
+            Vec::new(),
+            RunEnd::Result {
+                value: result.clone(),
+                logs: Vec::new(),
+                stderr: String::new(),
+            },
+        )
+    };
+    let h = Harness::builder()
+        .jira("jira-main")
+        .scripts(FakeScriptRunner::new(vec![run(), run(), run(), run()]))
+        .extra_config("[limits]\nmax_pending_bytes_mb = 32\n")
+        .start()
+        .await?;
+    let reserved = || h.engine().admission().reserved_bytes();
+    let submit = || h.submit_script(json!({ "source": "return 1;" }));
+    let mut trace = Vec::new();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let env = submit().await;
+        assert_eq!(env.status, Status::Pending, "{}", env.to_json_line());
+        ids.push(request_id(&env)?);
+        trace.push(reserved());
+    }
+    // Both runs have ended and their candidates are built: their actual size is known now.
+    for id in &ids {
+        h.queued(id, 20_000).await.ok_or("never queued")?;
+    }
+    trace.push(reserved());
+    let third = submit().await;
+    assert_busy(&third)?;
+    trace.push(reserved());
+    let first = ids.first().ok_or("no run")?;
+    h.approver().release(first).map_err(|e| format!("{e:?}"))?;
+    assert_eq!(h.await_(first, 5000).await.status, Status::Released);
+    trace.push(reserved());
+    let fourth = submit().await;
+    assert_eq!(fourth.status, Status::Pending, "{}", fourth.to_json_line());
+    Ok((trace, third.to_json_line()))
+}
+
+/// I-37 (scripts, §5.2): a script reserves its static `max_result_mb`, not what it returned, so
+/// two scripts whose actual results differ by orders of magnitude are admitted and refused
+/// identically: the same reservation at every step and the same constant `busy` envelope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i37_scripts_identical_admit_busy_different_actual_sizes() -> TestResult {
+    let small = json!(1);
+    let big = json!("x".repeat(3 * 1024 * 1024));
+    assert_ne!(small.to_string().len(), big.to_string().len());
+    let (small_trace, small_busy) = script_admission_trace(small).await?;
+    let (big_trace, big_busy) = script_admission_trace(big).await?;
+    assert_eq!(small_trace, big_trace);
+    assert_eq!(small_busy, big_busy);
+    // The static 16 MiB per script: two admitted, the third refused (32 MiB cap), one released.
+    assert_eq!(
+        small_trace,
+        [16 * MIB, 32 * MIB, 32 * MIB, 32 * MIB, 16 * MIB]
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_raise_between_reservation_and_validation_cannot_outgrow_the_reservation() -> TestResult {
     use atlas_duck_core::{Confirm, Pause, TestHooks};

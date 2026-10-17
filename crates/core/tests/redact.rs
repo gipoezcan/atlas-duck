@@ -1,6 +1,7 @@
 //! U-26 (redaction engine, copies, mirrors, mask everywhere), U-28 (canonical match form, the
 //! "Falcon Müller Plan" fixture), U-29 core half (drops never look empty, upstream `null`s stay).
 
+use atlas_duck_core::engine::script::SCRIPT_SPEC;
 use atlas_duck_core::redact::views::{canonical_hit, views};
 use atlas_duck_core::redact::{
     BlockReason, DropScope, REDACTED, RedactionOp, RedactionOutcome, RedactionPreset, UrlMode,
@@ -920,53 +921,136 @@ fn looks_empty(v: &Value) -> bool {
     }
 }
 
+/// The U-29 property over `candidate`, whose addressable nodes are those of `root` below
+/// `prefix` (`""`: `root` is the candidate): whatever drops are applied, no dropped path holds
+/// `null`, `""`, `[]` or `{}` afterwards, and an `null` the drops did not target is still there.
+fn drops_never_look_empty(
+    candidate: &Value,
+    root: &Value,
+    prefix: &str,
+    rules: &RedactionRules,
+    picks: &[(prop::sample::Index, bool)],
+) -> Result<(), TestCaseError> {
+    let mut all = Vec::new();
+    nodes(root, prefix, &mut all);
+    prop_assume!(!all.is_empty());
+    let mut ops = Vec::new();
+    let mut targeted: Vec<String> = Vec::new();
+    for (ix, per_item) in picks {
+        let (path, is_elem, _) = &all[ix.index(all.len())];
+        targeted.push(path.clone());
+        if *is_elem {
+            let (array_path, id) = path
+                .rsplit_once("[id=")
+                .ok_or_else(|| TestCaseError::fail("element path"))?;
+            ops.push(RedactionOp::DropItem {
+                array_path: array_path.to_owned(),
+                key: "id".into(),
+                value: json!(id.trim_end_matches(']')),
+            });
+        } else {
+            let scope = if *per_item {
+                DropScope::PerItem
+            } else {
+                DropScope::AllItems
+            };
+            ops.push(RedactionOp::DropField {
+                path: path.clone(),
+                scope,
+            });
+        }
+    }
+    let out = apply(candidate, rules, None, &ops);
+    for t in &targeted {
+        for v in lookup(&out.released, t) {
+            prop_assert!(!looks_empty(v), "{t} looks empty: {v}");
+        }
+    }
+    // A `PerItem` drop of a plain path and every `DropItem` target only what was named, so
+    // every `null` outside a targeted subtree is still there.
+    let widened = ops.iter().any(|o| {
+        matches!(
+            o,
+            RedactionOp::DropField {
+                scope: DropScope::AllItems,
+                ..
+            }
+        )
+    });
+    for (path, _, v) in &all {
+        let inside = |t: &String| {
+            path == t || path.starts_with(&format!("{t}.")) || path.starts_with(&format!("{t}["))
+        };
+        if v.is_null() && !targeted.iter().any(inside) {
+            let now = lookup(&out.released, path);
+            if !widened {
+                prop_assert_eq!(now, vec![&Value::Null], "untargeted null at {}", path);
+            } else {
+                prop_assert!(now.iter().all(|x| x.is_null()), "null changed at {}", path);
+            }
+        }
+    }
+    prop_assert!(out.blocked.is_empty());
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 512, ..ProptestConfig::default() })]
 
     #[test]
     fn u29_drops_never_look_empty(doc in arb_root(), picks in prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 1..4)) {
-        let mut all = Vec::new();
-        nodes(&doc, "", &mut all);
-        prop_assume!(!all.is_empty());
-        let mut ops = Vec::new();
-        let mut targeted: Vec<String> = Vec::new();
-        for (ix, per_item) in &picks {
-            let (path, is_elem, _) = &all[ix.index(all.len())];
-            targeted.push(path.clone());
-            if *is_elem {
-                let (array_path, id) = path.rsplit_once("[id=")
-                    .ok_or_else(|| TestCaseError::fail("element path"))?;
-                ops.push(RedactionOp::DropItem {
-                    array_path: array_path.to_owned(),
-                    key: "id".into(),
-                    value: json!(id.trim_end_matches(']')),
-                });
-            } else {
-                let scope = if *per_item { DropScope::PerItem } else { DropScope::AllItems };
-                ops.push(RedactionOp::DropField { path: path.clone(), scope });
-            }
-        }
-        let out = apply(&doc, &NO_RULES, None, &ops);
-        for t in &targeted {
-            for v in lookup(&out.released, t) {
-                prop_assert!(!looks_empty(v), "{t} looks empty: {v}");
-            }
-        }
-        // A `PerItem` drop of a plain path and every `DropItem` target only what was named, so
-        // every `null` outside a targeted subtree is still there.
-        let widened = ops.iter().any(|o| matches!(o, RedactionOp::DropField { scope: DropScope::AllItems, .. }));
-        for (path, _, v) in &all {
-            if v.is_null() && !targeted.iter().any(|t| path == t || path.starts_with(&format!("{t}.")) || path.starts_with(&format!("{t}["))) {
-                let now = lookup(&out.released, path);
-                if !widened {
-                    prop_assert_eq!(now, vec![&Value::Null], "untargeted null at {}", path);
-                } else {
-                    prop_assert!(now.iter().all(|x| x.is_null()), "null changed at {}", path);
-                }
-            }
-        }
-        prop_assert!(out.blocked.is_empty());
+        drops_never_look_empty(&doc, &doc, "", &NO_RULES, &picks)?;
     }
+
+    /// A script's candidate is `{result: <anything the script returned>}` (§9.3): the same
+    /// property below `result`, with the rules of `script.run` (U-29, script results).
+    #[test]
+    fn u29_script_result_drops_never_empty(result in arb_root(), picks in prop::collection::vec((any::<prop::sample::Index>(), any::<bool>()), 1..4)) {
+        let candidate = json!({ "result": result });
+        drops_never_look_empty(&candidate, &result, "result", &SCRIPT_SPEC.redaction_rules, &picks)?;
+    }
+}
+
+/// U-29 (script results): an upstream `null` in a script's result survives drops and masks, and so
+/// does a result that is `null` itself.
+#[test]
+fn u29_script_result_upstream_null_survives() -> TestResult {
+    let rules = &SCRIPT_SPEC.redaction_rules;
+    let candidate = json!({"result": {
+        "assignee": null, "secret": "x", "duedate": null,
+        "labels": [null, "ACME"], "parent": {"summary": null}
+    }});
+    let out = apply(
+        &candidate,
+        rules,
+        None,
+        &[
+            drop_field("result.secret", DropScope::AllItems),
+            mask("ACME"),
+        ],
+    );
+    let r = &out.released["result"];
+    assert_eq!(r.get("assignee"), Some(&Value::Null));
+    assert_eq!(r.get("duedate"), Some(&Value::Null));
+    assert_eq!(r["labels"], json!([null, "[REDACTED]"]));
+    assert_eq!(r["parent"].get("summary"), Some(&Value::Null));
+    assert!(r.get("secret").is_none());
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    // A script that returned `null`: nothing to drop or mask, and the `null` is not touched.
+    let out = apply(&json!({"result": null}), rules, None, &[mask("ACME")]);
+    assert_eq!(out.released, json!({"result": null}));
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    // A drop of the result itself is not `null`: nothing of it stays (or the drop is refused).
+    let out = apply(
+        &json!({"result": {"a": 1}}),
+        rules,
+        None,
+        &[drop_field("result", DropScope::PerItem)],
+    );
+    if let Some(r) = out.released.get("result") {
+        assert!(!looks_empty(r), "{r}");
+    }
+    Ok(())
 }
 
 #[test]

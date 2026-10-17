@@ -9,10 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use atlas_duck_atlassian::Timeouts;
 use atlas_duck_atlassian::testing::{
     RawHttpServer, RawStep, TEST_USER, TEST_USER_KEY, XAuser, fixtures,
 };
+use atlas_duck_atlassian::{CredentialProvider, Timeouts};
 use atlas_duck_audit::EventType;
 use atlas_duck_core::engine::cancel::{CancelCause, ShutdownReason};
 use atlas_duck_core::running::KillAnswer;
@@ -4310,5 +4310,250 @@ async fn cancelled_call_row_invisible_text_raises_the_queue_count() -> TestResul
     );
     assert!(caution_warnings(&p) >= 1);
     assert_eq!(item.caution_count, caution_warnings(&p));
+    Ok(())
+}
+
+// ---- Task 19b: availability on the script-call path, dry runs, redaction ------------------------------
+
+/// The rejection classes the script saw, in call order.
+fn rejected_classes(runner: &FakeScriptRunner) -> Vec<String> {
+    runner
+        .results()
+        .iter()
+        .map(|r| match r {
+            HostCallResult::Rejected { class, .. } => class.clone(),
+            HostCallResult::Ok(_) => "ok".to_owned(),
+        })
+        .collect()
+}
+
+/// The `rejection` of every `SCRIPT_CALL` record of `id`, in order.
+async fn call_rejections(h: &Harness, id: &str) -> Result<Vec<Value>, TestError> {
+    Ok(h.events(id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::SCRIPT_CALL)
+        .map(|(_, p)| p["rejection"].clone())
+        .collect())
+}
+
+fn instance_state(h: &Harness) -> &'static str {
+    h.instances().list().first().map_or("?", |i| i.state)
+}
+
+/// I-23 on the script-call path (§7.2, RF-2): an answer decided from status and headers alone (a
+/// 3xx, an HTML 200, a non-JSON 401) rejects the call inside the script as
+/// `upstream_unavailable`. Nothing about the instance or its token changes, the answer's body is
+/// in the `SCRIPT_CALL` record only, and the run still ends in a release item.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_script_call_3xx_html_nonjson401_upstream_unavailable_token_unchanged() -> TestResult {
+    let calls: Vec<HostCall> = ["R-1", "H-1", "U-1"]
+        .iter()
+        .zip(1..)
+        .map(|(key, id)| host_call(id, "jira.issue.get", json!({ "key": key })))
+        .collect();
+    let (h, runner) = harness(vec![ScriptPlan::new(calls, result_end(json!(1)))]).await?;
+    let mock = requests_of(&h)?;
+    mock.redirect("/rest/api/2/issue/R-1", "https://sso.corp.example/login")
+        .await;
+    mock.html("/rest/api/2/issue/H-1", 200).await;
+    mock.html("/rest/api/2/issue/U-1", 401).await;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    assert_eq!(rejected_classes(&runner), ["upstream_unavailable"; 3]);
+    // The record names why, per call; the page is audit-only.
+    assert_eq!(
+        call_rejections(&h, &id).await?,
+        [
+            json!("redirect_3xx"),
+            json!("non_json_2xx"),
+            json!("non_json_401")
+        ]
+    );
+    for r in runner.results() {
+        assert!(
+            !format!("{r:?}").contains("Please log in"),
+            "the page reached the script: {r:?}"
+        );
+    }
+    let page = h
+        .events(&id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::SCRIPT_CALL)
+        .any(|(_, p)| p.to_string().contains("Please log in"));
+    assert!(page, "the HTML page is in a SCRIPT_CALL record");
+    // Not a token failure (§7.2): the instance is `ok`, the PAT is stored, no re-check ran.
+    assert_eq!(instance_state(&h), "ok");
+    let inst = h.instance("jira-main").ok_or("no instance")?;
+    assert!(h.credentials().load(&inst.id)?.is_some());
+    let rechecks = h
+        .events_of(EventType::SYSTEM_FETCH)
+        .await?
+        .into_iter()
+        .filter(|p| p["purpose"] == "token_recheck")
+        .count();
+    assert_eq!(rechecks, 0);
+    // The run is release-gated whatever the script did with the rejections.
+    let item = h.approver().item(&id).ok_or("not in the queue")?;
+    assert_eq!(item.class, "script");
+    assert_eq!(h.status(&id).await.status, Status::Pending);
+    Ok(())
+}
+
+/// A Jira JSON 401 for `ABC-1`: it carries `X-AUSERNAME: anonymous` by nature.
+async fn mount_json_401(h: &Harness) -> Result<&atlas_duck_atlassian::testing::MockDc, TestError> {
+    let mock = requests_of(h)?;
+    Mock::given(method("GET"))
+        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("X-AUSERNAME", "anonymous")
+                .set_body_raw(
+                    r#"{"errorMessages":["You are not authenticated"],"errors":{}}"#,
+                    "application/json",
+                ),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    Ok(mock)
+}
+
+/// I-23, JSON 401 (§7.1): the call is `needs_token` for the script only when the token re-check
+/// fails; when it passes, the 401 is an ordinary upstream error and the token state is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i23_script_call_json401_needs_token_only_after_recheck() -> TestResult {
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(vec![issue_call(1)], result_end(json!(1))),
+        ScriptPlan::new(vec![issue_call(1)], result_end(json!(1))),
+    ])
+    .await?;
+    // The re-check passes: an ordinary 4xx, the token is fine.
+    let mock = mount_json_401(&h).await?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Same)
+        .await;
+    let first = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&first, 20_000).await.ok_or("never queued")?;
+    assert_eq!(rejected_classes(&runner), ["upstream_http"]);
+    assert_eq!(call_rejections(&h, &first).await?, [json!("upstream_http")]);
+    assert_eq!(instance_state(&h), "ok");
+    let sid = h.instance("jira-main").ok_or("instance")?.id.clone();
+    assert!(h.credentials().load(&sid)?.is_some());
+    // The re-check fails too: `needs_token`, the PAT stays.
+    mock.server().reset().await;
+    let mock = mount_json_401(&h).await?;
+    mock.jira_myself(TEST_USER, TEST_USER_KEY, XAuser::Anonymous)
+        .await;
+    let second = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&second, 20_000).await.ok_or("never queued")?;
+    assert_eq!(rejected_classes(&runner), ["upstream_http", "needs_token"]);
+    assert_eq!(call_rejections(&h, &second).await?, [json!("needs_token")]);
+    assert_eq!(instance_state(&h), "needs_token");
+    assert!(h.credentials().load(&sid)?.is_some());
+    Ok(())
+}
+
+/// U-03 (dry-run clause, §13): a script dry run makes no HTTP call at all (no read, no identity
+/// check, no re-check), commits no `SCRIPT_STARTED`, `SCRIPT_CALL_SENT` or `SCRIPT_CALL`, and
+/// leaves the instance's state alone. Every mode, a paged `atlas.all` call, a failing op and a
+/// script error included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u03_dry_run_no_http_no_script_call() -> TestResult {
+    let mut all = host_call(2, "jira.search", json!({ "jql": "project = ABC" }));
+    all.all = true;
+    let calls = || {
+        vec![
+            issue_call(1),
+            all.clone(),
+            host_call(3, "jira.issue.get", json!({ "key": "NOPE-9" })),
+            host_call(
+                4,
+                "jira.comment.add",
+                json!({ "key": "ABC-1", "body": "x" }),
+            ),
+        ]
+    };
+    let (h, runner) = harness(vec![
+        ScriptPlan::new(calls(), result_end(json!({ "ok": true }))),
+        ScriptPlan::new(calls(), result_end(json!({ "ok": true }))),
+        ScriptPlan::new(calls(), error_end()),
+    ])
+    .await?;
+    assert!(h.field_cache_filled().await);
+    let mock = requests_of(&h)?;
+    let before = mock.received().await.len();
+    let fetches = h.events_of(EventType::SYSTEM_FETCH).await?.len();
+    let mut ids = Vec::new();
+    for dry in [json!(true), json!("sparse"), json!(true)] {
+        let id = submit(&h, json!({ "source": SRC, "dry_run": dry })).await?;
+        let env = h.await_(&id, 10_000).await;
+        assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+        assert_eq!(env.meta.clone().ok_or("no meta")?["dry_run"], true);
+        ids.push(id);
+    }
+    // Four answered calls per run, none of them from the instance.
+    assert_eq!(runner.results().len(), 12);
+    assert_eq!(
+        mock.received().await.len(),
+        before,
+        "a dry run sent a request"
+    );
+    assert_eq!(h.events_of(EventType::SYSTEM_FETCH).await?.len(), fetches);
+    for t in [
+        EventType::SCRIPT_STARTED,
+        EventType::SCRIPT_CALL_SENT,
+        EventType::SCRIPT_CALL,
+    ] {
+        assert!(h.events_of(t).await?.is_empty(), "{t:?} was committed");
+    }
+    for id in &ids {
+        assert_eq!(
+            h.event_types(id).await?,
+            [
+                EventType::REQUEST_RECEIVED,
+                EventType::SCRIPT_DRY_RUN,
+                EventType::DELIVERED,
+            ]
+        );
+    }
+    assert_eq!(runner.specs().iter().filter(|s| s.dry_run).count(), 3);
+    assert_eq!(instance_state(&h), "ok");
+    Ok(())
+}
+
+/// U-29 through the engine (§5.3): a script result released with drops keeps the `null`s the
+/// script itself returned, and a dropped field is absent, not `null`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn u29_script_release_redacted_keeps_upstream_null() -> TestResult {
+    let value = json!({
+        "assignee": null,
+        "labels": [null, "x"],
+        "nested": { "due": null, "secret": "hunter2" },
+        "secret": "hunter2"
+    });
+    let (h, _runner) = harness(vec![ScriptPlan::new(Vec::new(), result_end(value))]).await?;
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let drop = |p: &str| atlas_duck_core::RedactionOp::DropField {
+        path: p.to_owned(),
+        scope: atlas_duck_core::DropScope::PerItem,
+    };
+    h.approver()
+        .release_redacted(
+            &id,
+            vec![drop("result.secret"), drop("result.nested.secret")],
+        )
+        .map_err(de)?;
+    let env = h.await_(&id, 5000).await;
+    assert_eq!(env.status, Status::Released, "{}", env.to_json_line());
+    assert_eq!(
+        env.data.clone().ok_or("no data")?["result"],
+        json!({
+            "assignee": null,
+            "labels": [null, "x"],
+            "nested": { "due": null }
+        })
+    );
     Ok(())
 }
