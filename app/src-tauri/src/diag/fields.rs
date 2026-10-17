@@ -43,8 +43,8 @@ pub const ALLOWED_FIELDS: &[&str] = &[
 
 /// M8 Task 20: the `event` values the script glue (`script_glue`) writes. Its own three, and every
 /// host fact `sandbox-host` reports in `RunOutcome.diag` (the bridge's `DIAG_*` constants). The glue
-/// writes only these, with the run's `request_id` and, for `script_spawn_failed`, a fixed `reason`
-/// token; never a worker byte (§3.4: stderr, logs, results and error texts stay in the encrypted
+/// writes only these, with the run's `request_id` and, for `script_spawn_failed` and
+/// `script_identity_mismatch`, a fixed `reason` token; never a worker byte (§3.4: stderr, logs, results and error texts stay in the encrypted
 /// run record). A `diag` value missing here is written as [`SCRIPT_DIAG_UNLISTED`].
 pub const SCRIPT_GLUE_EVENTS: &[&str] = &[
     "script_identity_mismatch",

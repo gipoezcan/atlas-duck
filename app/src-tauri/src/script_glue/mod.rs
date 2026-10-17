@@ -47,7 +47,7 @@ use atlas_duck_sandbox_host::bridge::{
     self, CompileVerdict, ExpectedWorker, HostCallSink, HostVerdict, KillCause, RunHandleImpl,
     RunOutcome, StartRunError,
 };
-use atlas_duck_sandbox_host::identity;
+use atlas_duck_sandbox_host::identity::{self, IdentityPart};
 use atlas_duck_sandbox_host::spawn::{SpawnSpec, WorkerSpawner};
 use tokio::runtime::Handle;
 
@@ -62,7 +62,9 @@ pub const PROBE_WAIT: Duration = Duration::from_secs(60);
 /// whichever is lower.
 pub const COMPILE_DEADLINE_MAX: Duration = Duration::from_secs(10);
 
-/// Log event: the sandbox binary no longer matches the probe's record (PD-133).
+/// Log event: the sandbox binary no longer matches the probe's record (PD-133); `reason` names
+/// the part ([`map::identity_reason`]: `file_id`, `size`, `mtime`, `missing`,
+/// `embedded_version`).
 pub const LOG_EVENT_IDENTITY_MISMATCH: &str = "script_identity_mismatch";
 /// Log event: no usable worker (`reason` is a fixed token: `floor_not_met`, or the spawn's
 /// `io::ErrorKind` name).
@@ -375,24 +377,20 @@ impl ScriptGlue {
         let (recorded, path) = (expect.identity.clone(), exe.to_path_buf());
         match tokio::task::spawn_blocking(move || identity::recheck(&recorded, &path)).await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => {
-                self.upgraded(request_id);
+            Ok(Err(m)) => {
+                upgraded(&self.inputs.update_pending, m.what, request_id);
                 Err(UnavailableReason::AppUpgraded)
             }
             Err(_) => Err(UnavailableReason::SpawnFailed),
         }
     }
 
-    /// PD-133: the binary was replaced; the flag stays set until restart.
-    fn upgraded(&self, request_id: Option<&str>) {
-        self.inputs.update_pending.store(true, Ordering::SeqCst);
-        tracing::warn!(event = LOG_EVENT_IDENTITY_MISMATCH, request_id);
-    }
-
     /// Logs a bridge refusal (constants only) and names it in core's words.
     fn refused(&self, e: &StartRunError, request_id: Option<&str>) -> UnavailableReason {
         match e {
-            StartRunError::IdentityMismatch { .. } => self.upgraded(request_id),
+            StartRunError::IdentityMismatch { what } => {
+                upgraded(&self.inputs.update_pending, *what, request_id);
+            }
             StartRunError::FloorNotMet => {
                 tracing::warn!(
                     event = LOG_EVENT_SPAWN_FAILED,
@@ -541,15 +539,8 @@ impl RunHandleGlue {
     async fn finish(&self) -> RunEnd {
         let outcome = self.control.wait().await;
         log_diag(&self.request_id, &outcome.diag);
-        if matches!(
-            outcome.host,
-            HostVerdict::NotSpawned(StartRunError::IdentityMismatch { .. })
-        ) {
-            self.update_pending.store(true, Ordering::SeqCst);
-            tracing::warn!(
-                event = LOG_EVENT_IDENTITY_MISMATCH,
-                request_id = self.request_id.as_str()
-            );
+        if let HostVerdict::NotSpawned(StartRunError::IdentityMismatch { what }) = outcome.host {
+            upgraded(&self.update_pending, what, Some(&self.request_id));
         }
         let _ = self.worker.set(outcome.confinement.clone());
         // One parse of a result up to `max_result_mb`: CPU work, off the runtime threads.
@@ -572,6 +563,17 @@ impl RunHandle for RunHandleGlue {
     fn worker_confinement(&self) -> Option<ConfinementReport> {
         self.worker.get().cloned()
     }
+}
+
+/// PD-133: the binary was replaced (or could not be confirmed); the flag stays set until restart.
+/// The log line names the part that did not match ([`map::identity_reason`]).
+fn upgraded(update_pending: &AtomicBool, what: IdentityPart, request_id: Option<&str>) {
+    update_pending.store(true, Ordering::SeqCst);
+    tracing::warn!(
+        event = LOG_EVENT_IDENTITY_MISMATCH,
+        reason = map::identity_reason(what),
+        request_id
+    );
 }
 
 /// The host facts of a run's outcome (`RunOutcome::diag`), one line each: the constant and the

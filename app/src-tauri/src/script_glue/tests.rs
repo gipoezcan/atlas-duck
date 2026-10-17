@@ -1609,6 +1609,27 @@ fn log_scenario() -> TestResult {
         let _ = g
             .compile_check("SENTINEL-SOURCE", &ScriptLimits::default(), off())
             .await;
+        // The part that no longer matches (lead ruling L152): the binary gone at a submit check
+        // (`Missing`, also what a transient stat error gives), then renamed over before a run's
+        // spawn (`FileId`).
+        let dir = Scratch::new("log-identity")?;
+        let worker = dir.file("atlas-duck-sandbox");
+        fs::write(&worker, b"worker")?;
+        let g = glue(
+            &FakePort::new(),
+            &worker,
+            Some(report_for(&worker, FloorVerdict::Met)?),
+        );
+        fs::remove_file(&worker)?;
+        let _ = g.check_available(off()).await;
+        fs::write(&worker, b"worker")?;
+        let g = glue(
+            &FakePort::new(),
+            &worker,
+            Some(report_for(&worker, FloorVerdict::Met)?),
+        );
+        replace(&worker)?;
+        let _ = g.start(spec(off()), GatedCalls::new()).await;
         Ok(())
     })
 }
@@ -1652,7 +1673,24 @@ fn glue_logs_host_diag_constants_only() -> TestResult {
     assert!(out.contains("event=sandbox_stdin_held_after_exit"), "{out}");
     assert!(out.contains("event=sandbox_diag_unlisted"), "{out}");
     assert!(!out.contains("sandbox_new_fact"), "{out}");
-    assert!(out.contains("event=script_identity_mismatch"), "{out}");
+    // Each identity mismatch names the part that did not match, so a missing or unreadable binary
+    // (possibly transient) and a ready frame of another build read apart from a replaced file.
+    let mismatches: Vec<&str> = out
+        .lines()
+        .filter(|l| l.contains("event=script_identity_mismatch"))
+        .collect();
+    for (reason, request) in [
+        ("embedded_version", " request_id=req-1"),
+        ("missing", " dropped_fields"),
+        ("file_id", " request_id=req-1"),
+    ] {
+        let line = format!("event=script_identity_mismatch reason={reason}{request}");
+        assert!(
+            mismatches.iter().any(|l| l.contains(&line)),
+            "{line}: {out}"
+        );
+    }
+    assert_eq!(mismatches.len(), 3, "{out}");
     assert!(out.contains("event=script_spawn_failed"), "{out}");
     assert!(out.contains("reason=TimedOut"), "{out}");
     assert!(out.contains("request_id=req-1"), "{out}");

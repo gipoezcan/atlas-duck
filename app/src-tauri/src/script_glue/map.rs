@@ -15,6 +15,7 @@ use atlas_duck_sandbox_host::bridge::{
     CompileVerdict, HostVerdict, KillCause, RESULT_NOT_REPRESENTABLE, RunOutcome, StartRunError,
     WorkerEnd,
 };
+use atlas_duck_sandbox_host::identity::IdentityPart;
 use serde_json::Value;
 
 /// `RunEnd::HostLimit` name of a binary replaced since the probe (Δ3, PD-133).
@@ -56,6 +57,20 @@ pub fn unavailable_reason(e: &StartRunError) -> UnavailableReason {
         StartRunError::IdentityMismatch { .. } => UnavailableReason::AppUpgraded,
         StartRunError::FloorNotMet => UnavailableReason::FloorNotMet,
         StartRunError::Spawn(_) => UnavailableReason::SpawnFailed,
+    }
+}
+
+/// The `reason` token of an identity mismatch's log line (lead ruling L152): the part that did not
+/// match, so a binary that is gone or could not be read (`missing`, which a transient stat error
+/// also gives) and a ready frame of another build (`embedded_version`) read apart from a replaced
+/// file. A fixed token per part, nothing read from the file or the worker.
+pub fn identity_reason(what: IdentityPart) -> &'static str {
+    match what {
+        IdentityPart::FileId => "file_id",
+        IdentityPart::Size => "size",
+        IdentityPart::Mtime => "mtime",
+        IdentityPart::Missing => "missing",
+        IdentityPart::EmbeddedVersion => "embedded_version",
     }
 }
 
