@@ -217,9 +217,130 @@ pub const CONFLUENCE_VERSION_CONFLICT_400: &str = r#"{"statusCode":400,"data":{"
 /// A Confluence 400 that is not about versions.
 pub const CONFLUENCE_ERROR_400: &str = r#"{"statusCode":400,"data":{"authorized":false,"valid":true,"errors":[],"successful":false},"message":"A page with this title already exists in this space"}"#;
 
+/// The user keys of the four mentions in [`confluence_page_5000_words`].
+pub const PAGE_5000_MENTION_KEYS: [&str; 4] = ["key-jdoe", "key-asmith", "key-bwayne", "key-ckent"];
+
+/// Words in the prose of [`confluence_page_5000_words`] (tags, macro bodies and headings aside).
+pub const PAGE_5000_WORDS: usize = 5000;
+
+/// A ~5,000-word Confluence storage body (SC3, P-01): a heading per section, paragraphs, a list
+/// and a table every few sections, two `code` macros, four user mentions
+/// ([`PAGE_5000_MENTION_KEYS`]) and one attached image. Deterministic: the words come from a
+/// xorshift stream over `seed`, no clock, no file.
+pub fn confluence_page_5000_words(seed: u64) -> String {
+    const VOCAB: [&str; 24] = [
+        "release", "build", "pipeline", "review", "deploy", "branch", "version", "check", "owner",
+        "ticket", "module", "rollback", "staging", "metric", "report", "window", "change", "test",
+        "approve", "merge", "schedule", "service", "queue", "notes",
+    ];
+    struct Xorshift(u64);
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+    let mut rng = Xorshift(seed | 1);
+    let sentence = |rng: &mut Xorshift, words: usize| {
+        let mut s = String::new();
+        for i in 0..words {
+            let w = VOCAB[(rng.next() % VOCAB.len() as u64) as usize];
+            if i == 0 {
+                let mut c = w.chars();
+                s.extend(c.next().map(|f| f.to_ascii_uppercase()));
+                s.push_str(c.as_str());
+            } else {
+                s.push(' ');
+                s.push_str(w);
+            }
+        }
+        s.push('.');
+        s
+    };
+    let mut out = String::new();
+    let mut words = 0usize;
+    let mut section = 0usize;
+    while words < PAGE_5000_WORDS {
+        section += 1;
+        out.push_str(&format!("<h2>Section {section}</h2>"));
+        for _ in 0..4 {
+            let n = 12 + (rng.next() % 9) as usize;
+            let mut p = String::new();
+            for _ in 0..4 {
+                p.push_str(&sentence(&mut rng, n));
+                p.push(' ');
+            }
+            words += 4 * n;
+            out.push_str(&format!("<p>{}</p>", p.trim_end()));
+        }
+        if section.is_multiple_of(3) {
+            out.push_str("<ul>");
+            for _ in 0..5 {
+                out.push_str(&format!("<li>{}</li>", sentence(&mut rng, 6)));
+                words += 6;
+            }
+            out.push_str("</ul>");
+        }
+        if section.is_multiple_of(5) {
+            out.push_str("<table><tbody><tr><th>Step</th><th>Owner</th><th>Status</th></tr>");
+            for r in 0..4 {
+                out.push_str(&format!(
+                    "<tr><td>Step {r}</td><td>{}</td><td>Done</td></tr>",
+                    sentence(&mut rng, 2)
+                ));
+                words += 4;
+            }
+            out.push_str("</tbody></table>");
+        }
+        match section {
+            2 => {
+                for (i, key) in PAGE_5000_MENTION_KEYS.iter().enumerate() {
+                    out.push_str(&format!(
+                        "<p>Owner {i}: <ac:link><ri:user ri:userkey=\"{key}\"/></ac:link></p>"
+                    ));
+                }
+                out.push_str(
+                    "<p><ac:image><ri:attachment ri:filename=\"diagram.png\"/></ac:image></p>",
+                );
+            }
+            4 | 7 => out.push_str(
+                "<ac:structured-macro ac:name=\"code\"><ac:parameter ac:name=\"language\">\
+                 bash</ac:parameter><ac:plain-text-body><![CDATA[make release\nmake deploy]]>\
+                 </ac:plain-text-body></ac:structured-macro>",
+            ),
+            _ => {}
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_5000_words_has_the_documented_shape() {
+        let page = confluence_page_5000_words(7);
+        assert_eq!(page, confluence_page_5000_words(7), "deterministic");
+        assert_ne!(page, confluence_page_5000_words(8), "the seed matters");
+        let text = page.replace("<", " <");
+        let prose: usize = text
+            .split('<')
+            .filter_map(|chunk| chunk.split_once('>').map(|(_, t)| t))
+            .map(|t| t.split_whitespace().count())
+            .sum();
+        assert!(
+            (PAGE_5000_WORDS..PAGE_5000_WORDS + 400).contains(&prose),
+            "{prose}"
+        );
+        assert!(page.matches("<h2>").count() >= 10);
+        assert!(page.contains("<table>") && page.contains("<ul>"));
+        assert_eq!(page.matches("ac:name=\"code\"").count(), 2);
+        assert_eq!(page.matches("<ri:user ").count(), 4);
+        assert_eq!(page.matches("<ac:image>").count(), 1);
+    }
 
     #[test]
     fn every_fixture_is_json() {

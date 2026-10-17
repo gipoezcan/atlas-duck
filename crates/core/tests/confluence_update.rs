@@ -11,6 +11,7 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_duck_atlassian::testing::{MockDc, TEST_USER, TEST_USER_KEY, UserKind, fixtures};
@@ -26,12 +27,14 @@ use atlas_duck_core::ops::{
 };
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::Harness;
-use atlas_duck_core::{BatchFailure, BatchItem, Confirm, DecisionError, Edits, Pause, TestHooks};
+use atlas_duck_core::{
+    BatchFailure, BatchItem, BuildPause, Confirm, DecisionError, Edits, Pause, TestHooks,
+};
 use atlas_duck_ipc::envelope::Status;
 use atlas_duck_preview::diff::{DiffLine, DiffOp, line_diff, line_diff_lines};
 use atlas_duck_preview::invisible::escape_for_display;
 use atlas_duck_preview::warning;
-use atlas_duck_preview::{PreviewBody, WarningId};
+use atlas_duck_preview::{Level, PreviewBody, WarningId};
 use common::confluence::{content_path, mount_history_version, mount_page, page_with_storage};
 use common::{TestError, TestResult, code, de, exit, request_id};
 use secrecy::SecretString;
@@ -1573,6 +1576,374 @@ async fn i32_markdown_update_rerendered_under_new_origin() -> TestResult {
         a.received().await.len(),
         received_at_a,
         "A receives nothing after the change"
+    );
+    Ok(())
+}
+
+// ---- T23b: the caution card is built off the entry lock ------------------------------------------
+
+/// Releases the held build when the test ends, passed or not, so a failing test never leaves a
+/// thread waiting on the pause.
+struct ReleaseOnDrop(Arc<BuildPause>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// A Confluence harness whose caution builds hold on the returned pause once it is armed. Shared,
+/// so every engine call made while a build may be held runs on a task of its own ([`bounded`],
+/// [`bounded_async`]): the test thread itself never waits on an entry lock.
+async fn held_builds() -> Result<(Arc<Harness>, Arc<BuildPause>, ReleaseOnDrop), TestError> {
+    let pause = BuildPause::new();
+    let h = Harness::builder()
+        .confluence("wiki")
+        .hooks(TestHooks {
+            hold_caution_build: Some(pause.clone()),
+            ..TestHooks::none()
+        })
+        .start()
+        .await?;
+    let release = ReleaseOnDrop(pause.clone());
+    Ok((Arc::new(h), pause, release))
+}
+
+const PROBE_WAIT: Duration = Duration::from_secs(10);
+
+async fn reached(pause: &BuildPause) -> TestResult {
+    tokio::time::timeout(PROBE_WAIT, pause.reached.notified())
+        .await
+        .map_err(|_| "the caution build never started")?;
+    Ok(())
+}
+
+/// `f` (a synchronous engine call) on a blocking thread, bounded: one that waits behind the
+/// entry lock fails the test (and the guard then releases the held build) instead of hanging it.
+async fn bounded<T: Send + 'static>(
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, TestError> {
+    match tokio::time::timeout(PROBE_WAIT, tokio::task::spawn_blocking(f)).await {
+        Ok(done) => Ok(done?),
+        Err(_) => Err(format!("{what} waited for the caution build").into()),
+    }
+}
+
+/// [`bounded`] for an async engine call, driven on a blocking thread too: a call that blocks its
+/// thread on the entry lock must not take a runtime worker with it (the timeout itself needs the
+/// workers).
+async fn bounded_async<T: Send + 'static>(
+    what: &str,
+    f: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, TestError> {
+    let runtime = tokio::runtime::Handle::current();
+    bounded(what, move || runtime.block_on(f)).await
+}
+
+/// The Caution warnings of a card: what the queue row's count counts (§5.6).
+fn cautions(p: &atlas_duck_preview::Preview) -> u32 {
+    let n = p
+        .warnings
+        .iter()
+        .filter(|w| w.level == Level::Caution)
+        .count();
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// T23b (T23 review I-4): the card build behind the queue row's caution count runs off the entry
+/// lock. A lossy Markdown update's enrichment build is held (the pause stands in for the seconds a
+/// body near the 16 MiB limit takes, so the page is small); meanwhile the queue listing (it takes
+/// every entry's lock), a status poll of the same request and a decision on another request
+/// answer. Released, the revision is queued with its count stored in the same critical section
+/// as its verdict: the pause is armed again and no later build is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn caution_build_does_not_hold_the_entry_lock() -> TestResult {
+    let (h, pause, _release) = held_builds().await?;
+    let mock = wiki(&h)?;
+    mount_page(
+        mock,
+        ID,
+        &page(7, "<ac:structured-macro ac:name=\"toc\"/><p>a</p>"),
+    )
+    .await;
+    let mut other = page(7, "<p>o</p>");
+    other["id"] = json!("65538");
+    mount_page(mock, "65538", &other).await;
+    let mut other_params = params(7, "<p>y</p>", Some("storage"));
+    other_params["id"] = json!("65538");
+    let other_id = queued(&h, other_params).await?;
+
+    pause.arm();
+    let submit = h.clone();
+    let env = bounded_async("the submit", async move {
+        submit.submit(UPDATE, params(7, "a", None)).await
+    })
+    .await?;
+    let id = request_id(&env)?;
+    reached(&pause).await?;
+    let decisions = h.decisions();
+    let listed = bounded("the queue listing", move || decisions.queue_list()).await?;
+    assert!(listed.iter().any(|i| i.request_id == other_id));
+    assert!(
+        !listed.iter().any(|i| i.request_id == id),
+        "still enriching"
+    );
+    let (handler, poll) = (h.handler(), id.clone());
+    let status = bounded_async(
+        "the status poll",
+        async move { handler.status(&poll).await },
+    )
+    .await?;
+    assert_eq!(status.status, Status::Pending);
+    let (approver, deny) = (h.approver(), other_id.clone());
+    bounded("a decision on another request", move || {
+        approver.deny_unopened(&deny, "no")
+    })
+    .await?
+    .map_err(de)?;
+
+    // Released, armed again: a count not stored with the verdict would need a build that now
+    // holds, and the row would show none.
+    pause.release();
+    pause.arm();
+    let (queued_h, wait) = (h.clone(), id.clone());
+    let item = bounded_async(
+        "the queue",
+        async move { queued_h.queued(&wait, 5_000).await },
+    )
+    .await?
+    .ok_or("never queued")?;
+    let (approver, open) = (h.approver(), id.clone());
+    let card = bounded("opening the card", move || approver.open(&open))
+        .await?
+        .map_err(de)?
+        .preview;
+    assert!(card.warnings.iter().any(|w| w.id == WarningId::LossyUpdate));
+    assert!(cautions(&card) >= 1);
+    assert_eq!(item.caution_count, cautions(&card));
+    Ok(())
+}
+
+/// T23b: a caution count built for a revision the entry has left is dropped, never stored. A
+/// failed stale check returns an approved update to the queue (`recheck_failed`: a new revision
+/// whose card leads with the "could not re-check" Caution) and its count is built after the
+/// return. While that build is held the approver opens the card and edits the body; the edit's
+/// re-enrichment makes a newer revision whose count (no re-check Caution) is stored with it. The
+/// held build then finishes for the revision the entry left, and its count is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn caution_of_a_left_revision_is_dropped() -> TestResult {
+    let (h, pause, _release) = held_builds().await?;
+    let mock = wiki(&h)?;
+    mount_page(mock, ID, &page(7, "<p>a</p>")).await;
+    // The stale check's GET fails: back to the queue as `recheck_failed`.
+    Mock::given(method("GET"))
+        .and(path(mock.path(&content_path(ID))))
+        .and(query_param("expand", "version"))
+        .respond_with(mock.response(503))
+        .mount(mock.server())
+        .await;
+    let id = queued(&h, params(7, "<p>b</p>", Some("storage"))).await?;
+    let first = h.approver().rev(&id).map_err(de)?;
+
+    pause.arm();
+    let (approver, approve) = (h.approver(), id.clone());
+    bounded("the approval", move || approver.approve(&approve))
+        .await?
+        .map_err(de)?;
+    reached(&pause).await?;
+    let (approver, item) = (h.approver(), id.clone());
+    let returned = bounded("the queue row", move || approver.item(&item))
+        .await?
+        .ok_or("not back in the queue")?;
+    assert!(returned.stale);
+    assert_eq!(returned.candidate_rev.counter, first.counter + 1);
+    let (approver, open) = (h.approver(), id.clone());
+    let card = bounded("opening the card", move || approver.open(&open))
+        .await?
+        .map_err(de)?
+        .preview;
+    assert_eq!(
+        card.warnings.first().map(|w| w.id),
+        Some(WarningId::CouldNotRecheck)
+    );
+    let left_count = cautions(&card);
+
+    let mut set = Map::new();
+    set.insert("body".into(), json!("<p>c</p>"));
+    let (approver, edit) = (h.approver(), id.clone());
+    bounded("an edit", move || {
+        approver.edit(
+            &edit,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )
+    })
+    .await?
+    .map_err(de)?;
+    // `body` re-runs the enrichment: the newer revision is queued with its own count.
+    let (later, wait, counter) = (h.clone(), id.clone(), returned.candidate_rev.counter);
+    let edited = bounded_async("the edited revision", async move {
+        rev_after(&later, &wait, counter)
+            .await
+            .map_err(|e| e.to_string())
+    })
+    .await??;
+    let (approver, open) = (h.approver(), id.clone());
+    let card = bounded("opening the edited card", move || approver.open(&open))
+        .await?
+        .map_err(de)?
+        .preview;
+    assert!(
+        !card
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::CouldNotRecheck)
+    );
+    assert_eq!(edited.caution_count, cautions(&card));
+    assert!(edited.caution_count < left_count, "the counts differ");
+
+    pause.release();
+    tokio::time::timeout(PROBE_WAIT, pause.settled.notified())
+        .await
+        .map_err(|_| "the held build never settled")?;
+    let now = h.approver().item(&id).ok_or("not in the queue")?;
+    assert_eq!(now.candidate_rev, edited.candidate_rev);
+    assert_eq!(
+        now.caution_count, edited.caution_count,
+        "the count of the revision the entry left was stored"
+    );
+    Ok(())
+}
+
+/// The queue row of `id` once `ready` holds for it, polled (every read bounded) for at most
+/// [`PROBE_WAIT`]: a count that is never stored fails by timeout, never by a hang.
+async fn row_when(
+    h: &Arc<Harness>,
+    id: &str,
+    what: &str,
+    ready: impl Fn(&atlas_duck_core::QueueItem) -> bool,
+) -> Result<atlas_duck_core::QueueItem, TestError> {
+    let deadline = std::time::Instant::now() + PROBE_WAIT;
+    loop {
+        let (approver, item) = (h.approver(), id.to_owned());
+        let row = bounded("the queue row", move || approver.item(&item)).await?;
+        if let Some(row) = row
+            && ready(&row)
+        {
+            return Ok(row);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("the queue row never showed {what}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// An approved update whose stale check fails (GET 503) and is queued again as `recheck_failed`,
+/// with the harness' caution builds unarmed: the row, the card that leads with the "could not
+/// re-check" Caution and that card's count.
+async fn recheck_failed_return(
+    h: &Arc<Harness>,
+) -> Result<(String, atlas_duck_core::QueueItem, u32), TestError> {
+    let mock = wiki(h)?;
+    mount_page(mock, ID, &page(7, "<p>a</p>")).await;
+    Mock::given(method("GET"))
+        .and(path(mock.path(&content_path(ID))))
+        .and(query_param("expand", "version"))
+        .respond_with(mock.response(503))
+        .mount(mock.server())
+        .await;
+    let id = queued(h, params(7, "<p>b</p>", Some("storage"))).await?;
+    let (approver, approve) = (h.approver(), id.clone());
+    bounded("the approval", move || approver.approve(&approve))
+        .await?
+        .map_err(de)?;
+    let returned = row_when(h, &id, "the return", |r| r.stale).await?;
+    let (approver, open) = (h.approver(), id.clone());
+    let card = bounded("opening the card", move || approver.open(&open))
+        .await?
+        .map_err(de)?
+        .preview;
+    assert_eq!(
+        card.warnings.first().map(|w| w.id),
+        Some(WarningId::CouldNotRecheck)
+    );
+    Ok((id, returned, cautions(&card)))
+}
+
+/// T23b review I-1: a write returned to the queue gets the count of its new revision stored. The
+/// count is built after the return (`recount`), so the row first shows the previous revision's
+/// count and then the card's (the stored count is what separates "stored" from "never stored").
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn returned_write_row_shows_the_count_of_its_card() -> TestResult {
+    let (h, _pause, _release) = held_builds().await?;
+    let (id, _, card_count) = recheck_failed_return(&h).await?;
+    assert!(card_count >= 1, "the return adds a Caution");
+    let row = row_when(&h, &id, "the card's count", |r| {
+        r.caution_count == card_count
+    })
+    .await?;
+    assert!(row.stale);
+    Ok(())
+}
+
+/// T23b review I-1: an edit that does not re-enrich stores the count of its new revision with the
+/// edit. A `body` set to the value it already has changes no enrichment key, and the edit clears
+/// the return reason (the "could not re-check" Caution), so the count falls. The pause is armed
+/// after the edit was applied: a count not stored with the edit would need a build that now holds,
+/// and the row would keep the returned revision's count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn edit_without_enrichment_stores_the_count_with_the_edit() -> TestResult {
+    let (h, pause, _release) = held_builds().await?;
+    let (id, returned, returned_count) = recheck_failed_return(&h).await?;
+    assert!(returned_count >= 1);
+    row_when(&h, &id, "the returned count", |r| {
+        r.caution_count == returned_count
+    })
+    .await?;
+
+    let mut set = Map::new();
+    set.insert("body".into(), json!("<p>b</p>"));
+    let (approver, edit) = (h.approver(), id.clone());
+    bounded("an edit", move || {
+        approver.edit(
+            &edit,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )
+    })
+    .await?
+    .map_err(de)?;
+    pause.arm();
+    let (approver, item) = (h.approver(), id.clone());
+    let edited = bounded("the queue row", move || approver.item(&item))
+        .await?
+        .ok_or("not in the queue")?;
+    assert!(
+        edited.candidate_rev.counter > returned.candidate_rev.counter,
+        "a new revision"
+    );
+    let (approver, open) = (h.approver(), id.clone());
+    let card = bounded("opening the edited card", move || approver.open(&open))
+        .await?
+        .map_err(de)?
+        .preview;
+    assert!(
+        !card
+            .warnings
+            .iter()
+            .any(|w| w.id == WarningId::CouldNotRecheck)
+    );
+    assert!(cautions(&card) < returned_count, "the counts differ");
+    assert_eq!(
+        edited.caution_count,
+        cautions(&card),
+        "the edit left the returned revision's count"
     );
     Ok(())
 }

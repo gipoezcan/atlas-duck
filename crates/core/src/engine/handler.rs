@@ -736,7 +736,8 @@ impl CoreHandler {
             session.hello.client_kind,
             conn,
         );
-        let ticket = match engine.admission().admit(agent, Reservation::for_op(spec)) {
+        let reservation = Reservation::for_op(spec, engine.admission().limits());
+        let ticket = match engine.admission().admit(agent, reservation) {
             Ok(t) => t,
             Err(busy) => return busy.envelope(),
         };
