@@ -28,7 +28,7 @@ use atlas_duck_ipc::sandbox::probe::ConfinementReport;
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult};
 use atlas_duck_registry::Product;
 use common::jira::{
-    comment_page, comments_path, gets_on, mount_comment_page_delayed, mount_comments,
+    comment, comment_page, comments_path, gets_on, mount_comment_page_delayed, mount_comments,
 };
 use common::{TestError, TestResult, code, de, detail, exit, request_id};
 use serde_json::{Value, json};
@@ -4177,42 +4177,15 @@ async fn rename_refetch_counts_the_first_answer_and_is_cut_at_the_rest() -> Test
         result_end(json!(1)),
     )])
     .await?;
-    let mock = requests_of(&h)?;
-    // The mock renamed the user (same key): every answer names the new user.
-    let answer = |summary: usize| -> Result<ResponseTemplate, TestError> {
-        let mut issue: Value = serde_json::from_str(fixtures::JIRA_ISSUE)?;
-        issue["fields"]["summary"] = json!("s".repeat(summary));
-        Ok(ResponseTemplate::new(200)
-            .insert_header("X-AUSERNAME", "jdoe2")
-            .set_body_raw(issue.to_string(), "application/json"))
-    };
-    Mock::given(method("GET"))
-        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
-        .respond_with(answer(600 * 1024)?)
-        .up_to_n_times(1)
-        .with_priority(1)
-        .mount(mock.server())
-        .await;
-    Mock::given(method("GET"))
-        .and(path(mock.path("/rest/api/2/issue/ABC-1")))
-        .respond_with(answer(BIG_BODY)?)
-        .with_priority(2)
-        .mount(mock.server())
-        .await;
-    mock.jira_myself("jdoe2", TEST_USER_KEY, XAuser::Same).await;
+    let first = issue_of_len("ABC-1", 600 * 1024)?;
+    mount_renamed(&h, first, issue_of_len("ABC-1", BIG_BODY)?).await?;
     let id = submit(
         &h,
         json!({ "source": SRC, "limits": { "max_fetch_mb": 1, "max_call_result_mb": 1 } }),
     )
     .await?;
     h.queued(&id, 30_000).await.ok_or("never queued")?;
-    let renames = h
-        .events_of(EventType::INSTANCE_STATE_CHANGED)
-        .await?
-        .into_iter()
-        .filter(|c| c["state"] == "user_renamed")
-        .count();
-    assert_eq!(renames, 1, "the first answer was not a rename");
+    assert_eq!(renames(&h).await?, 1, "the first answer was not a rename");
     assert_eq!(outline(&runner.results()), ["script_limit", "script_limit"]);
     assert_eq!(sent_to(&h, "ABC-1").await?, 2);
     assert_eq!(sent_to(&h, "ABC-2").await?, 0, "the refused call was sent");
@@ -4221,10 +4194,76 @@ async fn rename_refetch_counts_the_first_answer_and_is_cut_at_the_rest() -> Test
         return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
     };
     assert_eq!(retried["rejection"], "identity_check_retried", "{retried}");
-    let first = retried["bytes"].as_u64().ok_or("no bytes")?;
-    assert!(first > 600 * 1024 && first < MIB, "{first}");
-    assert_cut(refetched, "max_fetch_mb", "fetch_cap_50mib", MIB - first)?;
+    assert_eq!(retried["bytes"], 600 * 1024, "{retried}");
+    let left = MIB - 600 * 1024;
+    assert_cut(refetched, "max_fetch_mb", "fetch_cap_50mib", left)?;
     Ok(())
+}
+
+/// I-1 at the edge: a first answer of exactly the run's fetch budget leaves nothing. The
+/// re-fetch is still sent (the call was dispatched, §9.5) and cut at its first bytes
+/// (`script_limit`, a committed record), not read under the budget the first attempt had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rename_refetch_with_no_budget_left_is_sent_and_cut() -> TestResult {
+    let (h, runner) = harness(vec![ScriptPlan::new(
+        vec![issue_call(1)],
+        result_end(json!(1)),
+    )])
+    .await?;
+    let budget = usize::try_from(MIB)?;
+    let first = issue_of_len("ABC-1", budget)?;
+    mount_renamed(&h, first, issue_of_len("ABC-1", BIG_BODY)?).await?;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1, "max_call_result_mb": 2 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    assert_eq!(renames(&h).await?, 1, "the first answer was not a rename");
+    assert_eq!(outline(&runner.results()), ["script_limit"]);
+    assert_eq!(sent_to(&h, "ABC-1").await?, 2, "the re-fetch was not sent");
+    let calls = script_calls(&h, &id).await?;
+    let [retried, refetched] = calls.as_slice() else {
+        return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
+    };
+    assert_eq!(retried["rejection"], "identity_check_retried", "{retried}");
+    assert_eq!(retried["bytes"], MIB, "{retried}");
+    assert_cut(refetched, "max_fetch_mb", "fetch_cap_50mib", 0)?;
+    Ok(())
+}
+
+/// The mock renamed the user (same key, §7.1): the first `GET` of `ABC-1` answers `first`, every
+/// later one `then`, and every answer, `/myself` too, names the new user.
+async fn mount_renamed(h: &Harness, first: String, then: String) -> TestResult {
+    let mock = requests_of(h)?;
+    let answer = |body: String| {
+        ResponseTemplate::new(200)
+            .insert_header("X-AUSERNAME", "jdoe2")
+            .set_body_raw(body, "application/json")
+    };
+    let get = || Mock::given(method("GET")).and(path(mock.path("/rest/api/2/issue/ABC-1")));
+    get()
+        .respond_with(answer(first))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    get()
+        .respond_with(answer(then))
+        .with_priority(2)
+        .mount(mock.server())
+        .await;
+    mock.jira_myself("jdoe2", TEST_USER_KEY, XAuser::Same).await;
+    Ok(())
+}
+
+/// The `user_renamed` records of the harness's instances.
+async fn renames(h: &Harness) -> Result<usize, TestError> {
+    Ok(h.events_of(EventType::INSTANCE_STATE_CHANGED)
+        .await?
+        .into_iter()
+        .filter(|c| c["state"] == "user_renamed")
+        .count())
 }
 
 /// T19d review M-1: a script's `jira.issue.get {comments: true}` under its budgets answers the
@@ -4264,6 +4303,38 @@ async fn plain_call_with_comments_merges_the_pages() -> TestResult {
     let want =
         fixtures::JIRA_ISSUE.len() + pages.iter().map(|p| p.to_string().len()).sum::<usize>();
     assert_eq!(call["bytes"], want, "{call}");
+    Ok(())
+}
+
+/// T19d review M-1: a script composite's comment pages are read under the run's fetch budget
+/// minus the issue's bytes: a 600 KiB issue and a 600 KiB page with `max_fetch_mb: 1` cut the
+/// page (`script_limit`); under the whole budget the page would be read and the call answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plain_call_with_comments_reads_the_pages_under_the_rest_of_the_budget() -> TestResult {
+    let call = host_call(
+        1,
+        "jira.issue.get",
+        json!({ "key": "ABC-1", "comments": true }),
+    );
+    let (h, runner) = harness(vec![ScriptPlan::new(vec![call], result_end(json!(1)))]).await?;
+    mount_big_issue(&h, "ABC-1", 600 * 1024).await?;
+    let page = json!({
+        "startAt": 0, "maxResults": 50, "total": 1,
+        "comments": [comment(30_000, &"c".repeat(600 * 1024))]
+    });
+    mount_comments(requests_of(&h)?, "ABC-1", &[page]).await;
+    let id = submit(
+        &h,
+        json!({ "source": SRC, "limits": { "max_fetch_mb": 1 } }),
+    )
+    .await?;
+    h.queued(&id, 30_000).await.ok_or("never queued")?;
+    assert_eq!(outline(&runner.results()), ["script_limit"]);
+    let calls = script_calls(&h, &id).await?;
+    let [call] = calls.as_slice() else {
+        return Err(format!("{} SCRIPT_CALL records", calls.len()).into());
+    };
+    assert_cut(call, "max_fetch_mb", "fetch_cap_50mib", MIB)?;
     Ok(())
 }
 
