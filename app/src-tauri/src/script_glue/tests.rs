@@ -1748,6 +1748,11 @@ async fn glue_lost_parse_maps_shutdown_to_killed() -> TestResult {
     bounded(lost_parse_maps_shutdown_to_killed()).await
 }
 
+/// A parse that panics (without the panic hook's message).
+fn parse_that_panics() -> RunEnd {
+    std::panic::resume_unwind(Box::new("parse"))
+}
+
 async fn lost_parse_maps_shutdown_to_killed() -> TestResult {
     let parsed = RunEnd::Result {
         value: json!(1),
@@ -1765,13 +1770,10 @@ async fn lost_parse_maps_shutdown_to_killed() -> TestResult {
             reason: KillReason::Shutdown
         }
     );
-    let panicked = tokio::spawn(async {
-        let end: RunEnd = std::panic::resume_unwind(Box::new("parse"));
-        end
-    })
-    .await
-    .err()
-    .ok_or("a panicking task answered")?;
+    let panicked = tokio::spawn(async { parse_that_panics() })
+        .await
+        .err()
+        .ok_or("a panicking task answered")?;
     assert!(panicked.is_panic());
     assert_eq!(parsed_end(Err(panicked)), RunEnd::Crashed);
     Ok(())
