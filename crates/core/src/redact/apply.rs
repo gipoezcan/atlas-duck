@@ -38,6 +38,8 @@ pub fn apply(
         dropped_on_entries: Vec::new(),
         flagged: mirror::flagged(candidate, rules.mirrors),
         removed: Vec::new(),
+        origin: HashMap::new(),
+        keys: mirror::Keys::default(),
         dirty: HashSet::new(),
         budget: Budget::for_apply(text_bytes(candidate)),
         url_patterns: rules
@@ -256,8 +258,14 @@ struct Redactor<'a> {
     /// The entries the source's mirror check flags that are still in `doc`, where they now are.
     flagged: Vec<Flagged>,
     /// Every location the drop phase removed, in order: what follows a source location to where
-    /// it is now, or back (review T19c I-1').
+    /// it is now (review T19c I-1').
     removed: Vec<Loc>,
+    /// Every array the drop phase removed elements from, by its source location: the source
+    /// index of each element still there. What maps a location back to the source in O(depth);
+    /// undoing `removed` cost O(removals) per lookup (review T19c fix2 I-2).
+    origin: HashMap<Loc, Vec<usize>>,
+    /// The mirror keys the pairing computed since `doc` last changed (review T19c fix2 I-2).
+    keys: mirror::Keys,
     /// String values rewritten or removed by a mask.
     dirty: HashSet<Loc>,
     /// The canonical-form work budget of this call (shared by every text).
@@ -298,13 +306,32 @@ impl Redactor<'_> {
         });
     }
 
-    /// The source location of `cur`, a location in `doc`: the drop phase's removals undone.
+    /// The source location of `cur`, a location in `doc`: the drop phase's removals undone
+    /// through `origin` (only a removed element moves a location).
     fn source_loc(&self, cur: &[Step]) -> Loc {
-        let mut at = cur.to_vec();
-        for removed in self.removed.iter().rev() {
-            path::before_removal(&mut at, removed);
+        let mut at = Vec::with_capacity(cur.len());
+        for step in cur {
+            let step = match step {
+                Step::Index(i) => Step::Index(match self.origin.get(&at) {
+                    Some(left) => match left.get(*i) {
+                        Some(&s) => s,
+                        // Past the end: as far past the source's.
+                        None => i - left.len() + self.source_len(&at),
+                    },
+                    None => *i,
+                }),
+                Step::Key(_) => step.clone(),
+            };
+            at.push(step);
         }
         at
+    }
+
+    /// The length of the source's array at `src`.
+    fn source_len(&self, src: &[Step]) -> usize {
+        path::get(self.original, src)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len)
     }
 
     /// Field `key` of the element at `cur` as the source has it. The drop phase only removes,
@@ -439,17 +466,36 @@ impl Redactor<'_> {
 
     /// Removes `loc`, follows the flagged entries across it and logs it.
     fn remove(&mut self, loc: &[Step]) {
+        // An element's array: where it is in the source (its own removal does not move it).
+        let array = match loc.split_last() {
+            Some((Step::Index(i), parent)) => Some((*i, self.source_loc(parent))),
+            _ => None,
+        };
         if path::remove(&mut self.doc, loc).is_some() {
             self.flagged
                 .retain_mut(|f| path::after_removal(&mut f.at, loc));
             self.removed.push(loc.to_vec());
+            if let Some((i, src)) = array {
+                let len = self.source_len(&src);
+                let left = self.origin.entry(src).or_insert_with(|| (0..len).collect());
+                if i < left.len() {
+                    left.remove(i);
+                }
+            }
+            self.keys.clear();
         }
     }
 
+    /// Within one batch of drops (`drop_locs` resolves every counterpart before it removes
+    /// anything) the mirror keys are computed once per array.
     fn counterparts(&self, loc: &[Step]) -> Vec<Counterpart> {
-        mirror::counterparts(&self.doc, self.rules.mirrors, loc, &|l, k| {
-            self.source_field(l, k)
-        })
+        mirror::counterparts(
+            &self.doc,
+            self.rules.mirrors,
+            loc,
+            &|l, k| self.source_field(l, k),
+            &self.keys,
+        )
     }
 
     fn mirrored(&mut self, loc: &[Step], remove: &mut BTreeSet<Loc>) {
@@ -515,6 +561,7 @@ impl Redactor<'_> {
                 path::remove(&mut self.doc, loc);
                 self.note_field(&k);
                 self.dirty.insert(loc.to_vec());
+                self.keys.clear();
                 true
             }
             (Some(_), _) => {
@@ -522,6 +569,7 @@ impl Redactor<'_> {
                     *v = Value::String(REDACTED.into());
                     self.meta.spans_masked += 1;
                     self.dirty.insert(loc.to_vec());
+                    self.keys.clear();
                 }
                 true
             }
@@ -543,6 +591,7 @@ impl Redactor<'_> {
         if let Some(v) = path::get_mut(&mut self.doc, loc) {
             *v = Value::String(s);
             self.dirty.insert(loc.to_vec());
+            self.keys.clear();
         }
     }
 

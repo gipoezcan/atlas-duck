@@ -360,18 +360,6 @@ pub(crate) fn after_removal(at: &mut Loc, removed: &[Step]) -> bool {
     true
 }
 
-/// The inverse of [`after_removal`] for a location that survived the removal of `removed`: where
-/// it was before.
-pub(crate) fn before_removal(at: &mut Loc, removed: &[Step]) {
-    if let Some((Step::Index(i), parent)) = removed.split_last()
-        && at.starts_with(parent)
-        && let Some(Step::Index(j)) = at.get_mut(parent.len())
-        && *j >= *i
-    {
-        *j += 1;
-    }
-}
-
 /// Every node of `v` with its location, in document order (keys sorted, elements in order).
 pub(crate) fn walk<'a>(v: &'a Value, loc: &mut Loc, f: &mut impl FnMut(&[Step], &'a Value)) {
     f(loc, v);

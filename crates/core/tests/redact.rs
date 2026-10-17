@@ -1,6 +1,9 @@
 //! U-26 (redaction engine, copies, mirrors, mask everywhere), U-28 (canonical match form, the
 //! "Falcon Müller Plan" fixture), U-29 core half (drops never look empty, upstream `null`s stay).
 
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
 use atlas_duck_core::engine::script::SCRIPT_SPEC;
 use atlas_duck_core::redact::views::{canonical_hit, views};
 use atlas_duck_core::redact::{
@@ -2199,6 +2202,95 @@ fn a_flagged_entry_follows_an_item_level_shift() -> TestResult {
     );
     assert!(out.blocked.is_empty(), "{:?}", out.blocked);
     assert!(!released_text(&out, "orphan secret"), "{}", out.released);
+    Ok(())
+}
+
+// ---- the cost of pairing by the source key (M8 T19c fix2 review I-2) ----------------------------
+
+/// `n` paired comments, ids `0..n`.
+fn numbered(n: usize) -> Value {
+    mirrored(
+        (0..n)
+            .map(|i| json!({"id": i.to_string(), "body": format!("body {i}")}))
+            .collect(),
+        (0..n)
+            .map(|i| json!({"id": i.to_string(), "body": format!("<p>body {i}</p>")}))
+            .collect(),
+    )
+}
+
+/// `apply` with the `jira.issue.get` rules on a thread: a regression fails by assertion on
+/// `bound` instead of hanging the suite.
+fn apply_within(
+    bound: Duration,
+    source: Value,
+    ops: Vec<RedactionOp>,
+) -> Result<RedactionOutcome, Box<dyn std::error::Error>> {
+    let r = rules("jira.issue.get")?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let out = apply(&source, r, None, &ops);
+        let _ = tx.send((out, started.elapsed()));
+    });
+    match rx.recv_timeout(bound) {
+        Ok((out, took)) => {
+            eprintln!("apply: {took:?}");
+            Ok(out)
+        }
+        Err(RecvTimeoutError::Timeout) => Err(format!("not done within {bound:?}").into()),
+        Err(RecvTimeoutError::Disconnected) => Err("the apply thread panicked".into()),
+    }
+}
+
+/// The comments left on each side, all without `id`; and `blocked` is empty.
+fn keyless_comments_left(out: &RedactionOutcome, n: usize) -> TestResult {
+    assert!(out.blocked.is_empty(), "{:?}", out.blocked);
+    for side in ["fields", "renderedFields"] {
+        let entries = out.released[side]["comment"]["comments"]
+            .as_array()
+            .ok_or("no comments")?;
+        assert_eq!(entries.len(), n, "{side}");
+        assert!(entries.iter().all(|e| e.get("id").is_none()), "{side}");
+    }
+    Ok(())
+}
+
+/// Review T19c fix2 I-2: once the mirror keys were dropped across all items (one click), a later
+/// drop across all items paired each target by looking up the source key of every entry of the
+/// other side, each lookup replaying the removal log: cubic, 16 s at 1600 comments and minutes at
+/// 3200. The keys of an array are now looked up once per batch of drops.
+#[test]
+fn a_drop_after_a_mirror_key_drop_across_all_items_is_not_cubic() -> TestResult {
+    const N: usize = 8000;
+    let ops = vec![
+        drop_field(&format!("{SOURCE}[].id"), DropScope::AllItems),
+        drop_field(&format!("{SOURCE}[].body"), DropScope::AllItems),
+    ];
+    let out = apply_within(Duration::from_secs(30), numbered(N), ops)?;
+    keyless_comments_left(&out, N)?;
+    assert!(!released_text(&out, "body"));
+    Ok(())
+}
+
+/// The same for item drops by identity after the one-click key drop: every element they look at
+/// has no key, and each lookup of the source's undid the whole removal log (two entries per
+/// comment after the key drop). It is now found through the source index of the elements left.
+#[test]
+fn item_drops_after_a_mirror_key_drop_across_all_items_stay_fast() -> TestResult {
+    const N: usize = 3200;
+    const K: usize = 400;
+    let gone: Vec<usize> = (0..K).map(|i| i * 8).collect();
+    let mut ops = vec![drop_field(&format!("{SOURCE}[].id"), DropScope::AllItems)];
+    ops.extend(gone.iter().map(|i| drop_id(SOURCE, json!(i.to_string()))));
+    let out = apply_within(Duration::from_secs(30), numbered(N), ops)?;
+    keyless_comments_left(&out, N - K)?;
+    let left = strings(&out.released);
+    for i in gone {
+        let raw = format!("body {i}");
+        let rendered = format!("<p>body {i}</p>");
+        assert!(!left.iter().any(|s| *s == raw || *s == rendered), "{i}");
+    }
     Ok(())
 }
 

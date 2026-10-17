@@ -11,6 +11,10 @@
 //! that names an entry pairs it by the source's key where an earlier drop took the key (review
 //! T19c I-1'); the check itself uses only the keys still there.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
 use atlas_duck_registry::Mirror;
 use serde_json::Value;
 
@@ -48,6 +52,43 @@ fn key_of(e: &Value, key: &str, arr: &[Step], i: usize, ident: &Ident<'_>) -> Op
     }
 }
 
+type KeyMap = HashMap<(Loc, &'static str), Rc<[Option<Value>]>>;
+
+/// The mirror keys of every entry of the arrays [`counterparts`] looked at, by array and key:
+/// computed once per array, not once per entry and target (review T19c fix2 I-2: a drop across
+/// all items looked up every key of the other side for each target, through `ident` once the
+/// keys were dropped). Valid while the document and the removal log stay as they were: `apply`
+/// clears it whenever either changes.
+#[derive(Default)]
+pub(crate) struct Keys(RefCell<KeyMap>);
+
+impl Keys {
+    pub(crate) fn clear(&mut self) {
+        self.0.get_mut().clear();
+    }
+
+    /// [`key_of`] for every entry of `entries`, the array at `arr`.
+    fn of(
+        &self,
+        arr: &[Step],
+        entries: &[Value],
+        key: &'static str,
+        ident: &Ident<'_>,
+    ) -> Rc<[Option<Value>]> {
+        let at = (arr.to_vec(), key);
+        if let Some(known) = self.0.borrow().get(&at) {
+            return Rc::clone(known);
+        }
+        let keys: Rc<[Option<Value>]> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| key_of(e, key, arr, i, ident))
+            .collect();
+        self.0.borrow_mut().insert(at, Rc::clone(&keys));
+        keys
+    }
+}
+
 /// Counterparts of `loc` in the current document, for every mirror and both directions. Entries
 /// pair by their key, or the source's key through `ident` where a drop removed it (review T19c
 /// I-1': the identity of an entry is the source's).
@@ -56,6 +97,7 @@ pub(crate) fn counterparts(
     mirrors: &[Mirror],
     loc: &[Step],
     ident: &Ident<'_>,
+    keys: &Keys,
 ) -> Vec<Counterpart> {
     let mut out = Vec::new();
     for m in mirrors {
@@ -84,19 +126,21 @@ pub(crate) fn counterparts(
                 let Some(Value::Array(src)) = path::get(doc, &side_arr) else {
                     continue;
                 };
-                let Some(entry) = src.get(i) else { continue };
+                let side_keys = keys.of(&side_arr, src, m.key, ident);
+                let Some(entry_key) = side_keys.get(i) else {
+                    continue;
+                };
                 let rest = &loc[at + side.len() + 1..];
-                let (key_value, js) = match key_of(entry, m.key, &side_arr, i, ident) {
+                let (key_value, js) = match entry_key {
                     Some(kv) => {
-                        let js = dst
+                        let js = keys
+                            .of(&other_arr, dst, m.key, ident)
                             .iter()
                             .enumerate()
-                            .filter(|(j, e)| {
-                                key_of(e, m.key, &other_arr, *j, ident).as_ref() == Some(&kv)
-                            })
+                            .filter(|(_, k)| k.as_ref() == Some(kv))
                             .map(|(j, _)| j)
                             .collect::<Vec<_>>();
-                        (Some(kv), js)
+                        (Some(kv.clone()), js)
                     }
                     None if src.len() == dst.len() => (None, vec![i]),
                     None => {
