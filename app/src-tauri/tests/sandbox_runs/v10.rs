@@ -3,8 +3,8 @@
 //!
 //! - every OS: a QuickJS heap above `heap_mb` ends the run as `Limit("heap_mb")` (exit 102);
 //! - macOS (arm64 and Rosetta): the footprint watchdog kills a worker above `process_mb`
-//!   (`Limit("process_mb")`, diag `sandbox_watchdog_kill`); no timing assertion (L26), the kill
-//!   time is printed as evidence only;
+//!   (`Limit("process_mb")`, diag `sandbox_watchdog_kill`); no timing assertion (L26), the time
+//!   from the spawn to the reap is printed as evidence only;
 //! - Windows: the job refuses memory above `process_mb` (`Limit("process_mb")`; the job's
 //!   completion-port message, if delivered, is the diag `sandbox_job_memory_limit`);
 //! - Linux: the worker's allocation fails under `RLIMIT_AS` and it exits `EXIT_PROCESS_LIMIT`,
@@ -21,7 +21,7 @@ use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::sandbox::script::{InstanceInfo, WorkerInit};
 use atlas_duck_ipc::sandbox::{HostCall, HostCallResult, ScriptLimits};
 use atlas_duck_sandbox_host::bridge::{
-    ExpectedWorker, HostCallSink, HostVerdict, RunOutcome, start_run,
+    DIAG_MEMORY_WATCH_FAILED, ExpectedWorker, HostCallSink, HostVerdict, RunOutcome, start_run,
 };
 use atlas_duck_sandbox_host::identity::{SandboxBinaryIdentity, file_identity};
 use atlas_duck_sandbox_host::platform_spawner;
@@ -134,6 +134,13 @@ fn heap_limit_reported_as_heap_mb() -> TestResult {
     };
     let outcome = run_limited(GROW, limits)?;
     assert_eq!(outcome.host, HostVerdict::Limit("heap_mb"), "{outcome:?}");
+    // Every run on macOS and Windows carries the memory watch: it must have observed the worker
+    // (on macOS a refused `proc_pid_rusage` would show here; T9 review m-5).
+    assert!(
+        !outcome.diag.contains(&DIAG_MEMORY_WATCH_FAILED),
+        "{:?}",
+        outcome.diag
+    );
     println!(
         "V10 heap_limit os={} verdict=heap_mb elapsed_ms={} diag={:?}",
         std::env::consts::OS,
@@ -162,15 +169,16 @@ fn v10_macos_watchdog_kills_footprint_over_process_mb() -> TestResult {
         "{:?}",
         outcome.diag
     );
-    // Evidence only (L26): the time from the spawn to the reap of the killed worker.
+    // Evidence only (L26): `elapsed` without a terminal frame runs from before the spawn to the
+    // reap, so it holds the ready wait and the growth up to `process_mb` as well as the kill;
+    // it is not the time from the kill to the reap. The macOS spawner sets no RLIMIT_AS (§9.4);
+    // that Darwin does not enforce it is measured by `probes_macos`
+    // (`V10 arch=... rlimit_as_enforced=<measured>`), not here.
     println!(
-        "V10 watchdog_kill_ms={} arch={}",
+        "V10 watchdog_kill verdict=process_mb spawn_to_reap_ms={} arch={}",
         outcome.elapsed.as_millis(),
         std::env::consts::ARCH
     );
-    // The macOS spawner sets no RLIMIT_AS (§9.4: Darwin does not enforce it); the watchdog is
-    // the only process limit.
-    println!("V10 rlimit_as_enforced=false");
     Ok(())
 }
 

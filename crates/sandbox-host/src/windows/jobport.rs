@@ -12,15 +12,21 @@
 //!   the port is the host's extra evidence, never the only one: the exit code stands on its own.
 //! - The watch ends at `JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO` (the worker is gone) or at the stop
 //!   packet the bridge posts at the reap. Packets are dequeued in order, so a memory message the
-//!   job posted before the worker exited is handled before the stop.
+//!   job posted before the worker exited is handled before the stop. The stop also sets a flag
+//!   the watch checks whenever the port stays empty for [`STOP_POLL`], so a stop packet that
+//!   could not be posted, with no `ACTIVE_PROCESS_ZERO` either (job messages are not
+//!   guaranteed), still ends the watch's thread (T9 review m-6).
 
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
 use windows_sys::Win32::System::IO::{
     CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED, PostQueuedCompletionStatus,
 };
@@ -32,7 +38,6 @@ use windows_sys::Win32::System::SystemServices::{
     JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO, JOB_OBJECT_MSG_JOB_MEMORY_LIMIT,
     JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT,
 };
-use windows_sys::Win32::System::Threading::INFINITE;
 
 use crate::limits::{MemoryWatch, OsMemorySignal};
 use crate::spawn::KillHandle;
@@ -41,6 +46,8 @@ use crate::spawn::KillHandle;
 const KEY_JOB: usize = 1;
 /// The completion key of the bridge's stop packet.
 const KEY_STOP: usize = 2;
+/// How long the watch waits for a packet before it looks at the stop flag.
+pub(crate) const STOP_POLL: Duration = Duration::from_secs(1);
 
 /// What one dequeued packet means for the watch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +124,8 @@ impl JobPort {
         Ok(JobPortWatch {
             port: self.0.try_clone()?,
             stop: Some(self.0.try_clone()?),
+            stopped: Arc::default(),
+            poll: STOP_POLL,
         })
     }
 
@@ -136,11 +145,12 @@ fn post(port: &OwnedHandle, msg: u32, key: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// Blocks for the next packet: `(msg, key)`.
-fn next(port: &OwnedHandle) -> io::Result<(u32, usize)> {
+/// Waits up to `wait` for the next packet: `(msg, key)`, or `None` when the port stayed empty.
+fn next(port: &OwnedHandle, wait: Duration) -> io::Result<Option<(u32, usize)>> {
     let mut msg = 0u32;
     let mut key = 0usize;
     let mut overlapped: *mut OVERLAPPED = null_mut();
+    let wait_ms = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX - 1);
     // SAFETY: `port` is an open completion port handle owned by the caller for the call; the
     // three out-pointers refer to locals. For a job message `overlapped` receives the process id
     // (a value, never dereferenced here).
@@ -150,19 +160,28 @@ fn next(port: &OwnedHandle) -> io::Result<(u32, usize)> {
             &mut msg,
             &mut key,
             &mut overlapped,
-            INFINITE,
+            wait_ms,
         )
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        // No packet within `wait`: FALSE, `WAIT_TIMEOUT`, and no OVERLAPPED.
+        if overlapped.is_null() && e.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
+            return Ok(None);
+        }
+        return Err(e);
     }
-    Ok((msg, key))
+    Ok(Some((msg, key)))
 }
 
 /// The bridge's watch of one worker's job port ([`MemoryWatch`]).
 pub(crate) struct JobPortWatch {
     port: OwnedHandle,
     stop: Option<OwnedHandle>,
+    /// Set by the stopper before it posts the stop packet.
+    stopped: Arc<AtomicBool>,
+    /// How long one wait for a packet lasts ([`STOP_POLL`]).
+    poll: Duration,
 }
 
 impl MemoryWatch for JobPortWatch {
@@ -172,12 +191,14 @@ impl MemoryWatch for JobPortWatch {
 
     fn stopper(&mut self) -> Box<dyn FnOnce() + Send> {
         let port = self.stop.take();
+        let stopped = Arc::clone(&self.stopped);
         Box::new(move || {
+            stopped.store(true, Ordering::SeqCst);
             if let Some(port) = port
                 && let Err(e) = post(&port, 0, KEY_STOP)
             {
-                // The watch then ends at `ACTIVE_PROCESS_ZERO`, and the bridge stops waiting for
-                // it after its grace.
+                // The watch then ends at `ACTIVE_PROCESS_ZERO`, or at its next empty wait; the
+                // bridge stops waiting for it after its grace.
                 eprintln!("sandbox memory watch: posting the stop packet failed: {e}");
             }
         })
@@ -185,7 +206,13 @@ impl MemoryWatch for JobPortWatch {
 
     fn run(self: Box<Self>, limit: &dyn KillHandle) -> io::Result<()> {
         loop {
-            let (msg, key) = next(&self.port)?;
+            let Some((msg, key)) = next(&self.port, self.poll)? else {
+                // The port is empty, so no memory message is left unread.
+                if self.stopped.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                continue;
+            };
             match classify(msg, key) {
                 PortEvent::MemoryLimit => limit.kill(),
                 PortEvent::Gone | PortEvent::Stop => return Ok(()),
@@ -263,6 +290,33 @@ mod tests {
         let kills = Counted::default();
         watch.run(&kills)?;
         assert_eq!(kills.0.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// T9 review m-6: a stop whose packet never arrives (here: the stopper has no handle to
+    /// post with, as after a failed post) still ends the watch at its next empty wait, after the
+    /// memory messages already queued were handled.
+    #[test]
+    fn a_stop_without_its_packet_still_ends_the_watch() -> io::Result<()> {
+        let port = JobPort::create()?;
+        let mut watch = Box::new(port.watch()?);
+        watch.stop = None;
+        watch.poll = Duration::from_millis(50);
+        let stop = watch.stopper();
+        post(&port.0, JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, KEY_JOB)?;
+        stop();
+        let kills = Counted::default();
+        let started = std::time::Instant::now();
+        watch.run(&kills)?;
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(
+            kills.0.load(Ordering::SeqCst),
+            1,
+            "the queued message first"
+        );
+
+        // An empty wait before the stop is no error and does not end the watch.
+        assert_eq!(next(&port.0, Duration::from_millis(1))?, None);
         Ok(())
     }
 

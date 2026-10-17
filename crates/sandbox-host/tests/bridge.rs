@@ -36,8 +36,8 @@ use atlas_duck_sandbox_host::bridge::{
     DIAG_MEMORY_WATCH_FAILED, DIAG_OUTCOME_LOST, DIAG_REAP_FAILED, DIAG_STDOUT_HELD,
     DIAG_UNREAD_RESULTS, DIAG_WATCHDOG_KILL, ExpectedWorker, HostCallSink, HostVerdict, KillCause,
     LOG_CAP_BYTES, LOG_CAP_LINES, RESULT_NOT_REPRESENTABLE, RunHandleImpl, RunOutcome, STDERR_CAP,
-    StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker, start_run,
-    unread_results_cap,
+    STDOUT_GRACE, StartRunError, ViolationKind, WorkerEnd, compile_run, log_truncated_marker,
+    start_run, unread_results_cap,
 };
 use atlas_duck_sandbox_host::identity::{FileId, IdentityPart, SandboxBinaryIdentity};
 use atlas_duck_sandbox_host::kill::{GuardedKill, ReapGuard, reap_after_wait};
@@ -209,20 +209,17 @@ impl FakeWorker {
     }
 
     /// Hands stdout to a "child" that outlives the fake (a degraded worker that forked): the
-    /// child sends one log frame once `go` receives, then holds the pipe until `hold` has passed.
-    /// Returns a receiver told once that frame was written.
+    /// child holds the pipe, silent, until `go` receives (at most `hold`), then sends one log
+    /// frame and closes the pipe. Returns a receiver told once that frame was written.
     fn fork_child_holding_stdout(&mut self, go: Receiver<()>, hold: Duration) -> Receiver<()> {
         let stdout = self.stdout.take();
         let (written_tx, written) = mpsc::channel();
         thread::spawn(move || {
-            let started = Instant::now();
             let _ = go.recv_timeout(hold);
-            if let Some(mut stdout) = stdout {
-                if write_frame(&mut stdout, &log_frame("from the child")).is_ok() {
-                    let _ = written_tx.send(());
-                }
-                thread::sleep(hold.saturating_sub(started.elapsed()));
-                drop(stdout);
+            if let Some(mut stdout) = stdout
+                && write_frame(&mut stdout, &log_frame("from the child")).is_ok()
+            {
+                let _ = written_tx.send(());
             }
         });
         written
@@ -765,6 +762,49 @@ impl HostCallSink for TestSink {
     }
 }
 
+/// A sink whose `log` of the line "first" waits (bounded) until `ready` holds, and whose every
+/// `log` then takes `delay` (a slow glue on the reader thread). It counts the calls it sees.
+struct GatedLogSink {
+    ready: Box<dyn Fn() -> bool + Send + Sync>,
+    delay: Duration,
+    logs: Mutex<Vec<String>>,
+    calls: AtomicU32,
+}
+
+impl GatedLogSink {
+    fn new(ready: impl Fn() -> bool + Send + Sync + 'static, delay: Duration) -> Arc<Self> {
+        Arc::new(GatedLogSink {
+            ready: Box::new(ready),
+            delay,
+            logs: Mutex::default(),
+            calls: AtomicU32::new(0),
+        })
+    }
+
+    fn calls(&self) -> u32 {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl HostCallSink for GatedLogSink {
+    async fn call(&self, _run_id: &str, c: HostCall) -> HostCallResult {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        HostCallResult::Ok(json!(c.id))
+    }
+
+    fn log(&self, _run_id: &str, line: &str) {
+        let started = Instant::now();
+        while line == "first" && !(self.ready)() && started.elapsed() < WAIT_BOUND {
+            thread::sleep(Duration::from_millis(2));
+        }
+        thread::sleep(self.delay);
+        if let Ok(mut logs) = self.logs.lock() {
+            logs.push(line.to_string());
+        }
+    }
+}
+
 /// `start_run` on a blocking thread, as the glue calls it.
 async fn start(
     spawner: Arc<FakeSpawner>,
@@ -957,9 +997,12 @@ async fn call_beyond_max_concurrent_is_violation() -> TestResult {
     );
     assert_eq!(outcome.end, WorkerEnd::None);
     assert_eq!(observed.signals(), 1, "the worker was killed");
-    // Calls 1 and 2 reached the sink, call 3 never did.
+    // Calls 1 and 2 reached the sink, call 3 never did. Each call is its own task, so the two
+    // may reach the sink in either order (T9 review m-1).
     eventually(|| gated.calls().len() == 2).await?;
-    assert_eq!(gated.calls(), vec![1, 2]);
+    let mut calls = gated.calls();
+    calls.sort_unstable();
+    assert_eq!(calls, vec![1, 2]);
     gate.add_permits(2);
     Ok(())
 }
@@ -2323,28 +2366,31 @@ async fn an_os_memory_report_is_process_mb_and_kills() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_os_memory_report_decides_before_a_late_terminal() -> TestResult {
-    // The report's kill is swallowed (a kill that did not take), so the fake lives on and sends
-    // its result after the report decided the run: the frame is ignored.
-    let opts = FakeOpts {
-        swallow_kills: 1,
-        ..watched(OsMemorySignal::WatchdogKill)
-    };
-    let (spawner, observed) = fake_opts(opts, |w| {
+async fn a_terminal_already_in_the_pipe_wins_over_an_os_memory_report() -> TestResult {
+    // T9 review I-2: the worker wrote a log, a call and its result, then the OS reported it above
+    // the limit before the host read past the log (the sink holds the reader in that log until
+    // the report's kill reached the fake, which comes after the report is recorded). The report
+    // kills, but the terminal read after it decides the run: no verdict, the result stands, the
+    // report stays a diag fact. The call read after the report is not dispatched.
+    let (spawner, observed) = fake_opts(watched(OsMemorySignal::WatchdogKill), |w| {
         w.ready()?;
         w.read()?;
+        let mut tail = framed(&log_frame("first"));
+        tail.extend(framed(&call_frame(1)));
+        tail.extend(framed(result_frame("1").as_bytes()));
+        w.send_raw(&tail)?;
         w.os_memory_report()?;
-        let started = Instant::now();
-        while w.observed.kill_calls() == 0 && started.elapsed() < WAIT_BOUND {
-            thread::sleep(Duration::from_millis(2));
-        }
-        w.result("1")?;
-        Ok(0)
+        w.until_killed()
     });
-    let outcome = run_to_end(spawner, ScriptLimits::default(), sink()).await?;
-    assert_eq!(outcome.host, HostVerdict::Limit("process_mb"));
-    assert_eq!(outcome.end, WorkerEnd::None, "the late terminal is ignored");
+    let seen = Arc::clone(&observed);
+    let gated = GatedLogSink::new(move || seen.kill_calls() > 0, Duration::ZERO);
+    let outcome = run_to_end(spawner, ScriptLimits::default(), gated.clone()).await?;
+    assert_eq!(outcome.host, HostVerdict::None, "{outcome:?}");
+    assert_eq!(result_text(&outcome), Some("1"));
+    assert_eq!(outcome.logs, vec!["first".to_string()]);
     assert_eq!(outcome.diag, vec![DIAG_WATCHDOG_KILL]);
+    assert_eq!(observed.signals(), 1, "the report's kill");
+    assert_eq!(gated.calls(), 0, "no call after the report");
     observed.wait_finished()?;
     Ok(())
 }
@@ -2440,7 +2486,83 @@ async fn the_outcome_does_not_wait_for_a_stdout_held_past_the_exit() -> TestResu
     assert_eq!(outcome.diag, vec![DIAG_STDOUT_HELD], "after {took:?}");
     let written = tokio::task::spawn_blocking(move || written_rx.recv_timeout(WAIT_BOUND)).await?;
     assert!(written.is_ok(), "the child wrote its late frame");
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The child closed the pipe after its frame, so the reader read that frame, reached EOF and
+    // ended; once every thread and task of the run let go of the sink, the frame was read and
+    // ignored, not merely not read yet (T9 review m-4).
+    drop(handle);
+    eventually(|| Arc::strong_count(&test_sink) == 1).await?;
     assert!(test_sink.logs().is_empty(), "{:?}", test_sink.logs());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timer_expiring_after_the_reap_does_not_replace_the_exit() -> TestResult {
+    // T9 review m-2: the worker exits 102 at once (well within its 1 s `timeout_s`) and leaves a
+    // child holding its stdout, so the outcome comes STDOUT_GRACE after the reap. The timer
+    // expires in between; the worker is gone by then, so its own exit decides.
+    let (go_tx, go_rx) = mpsc::channel();
+    let (spawner, observed) = fake(move |w| {
+        w.ready()?;
+        w.read()?;
+        let _written = w.fork_child_holding_stdout(go_rx, WAIT_BOUND);
+        Ok(102)
+    });
+    let one_second = limits_with(|l| l.timeout_s = 1);
+    let outcome = run_to_end(spawner, one_second, sink()).await?;
+    let _ = go_tx.send(());
+    assert_eq!(outcome.host, HostVerdict::Limit("heap_mb"), "{outcome:?}");
+    assert_eq!(outcome.diag, vec![DIAG_STDOUT_HELD]);
+    assert_eq!(observed.signals(), 0, "the worker ended on its own");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_still_draining_after_the_reap_keeps_the_result() -> TestResult {
+    // T9 review I-1: the worker wrote its tail (log lines, a call, the result; about 2 KiB, so it
+    // fits any pipe buffer and the worker exits at once) and exited. The glue's `log` is slow,
+    // and the first one is held until the worker ended, so the reader drains for about 3 s past
+    // the reap. STDOUT_GRACE counts only while the reader waits on the pipe with nothing
+    // arriving, so the result stands. The call, read more than 1 s after the reap, is not
+    // dispatched: its result could never reach the worker (T9 review m-3).
+    const LINES: usize = 30;
+    let (spawner, observed) = fake(|w| {
+        w.ready()?;
+        w.read()?;
+        let mut tail = framed(&log_frame("first"));
+        for i in 1..LINES {
+            if i == 15 {
+                tail.extend(framed(&call_frame(1)));
+            }
+            tail.extend(framed(&log_frame(&format!("line {i}"))));
+        }
+        tail.extend(framed(result_frame("1").as_bytes()));
+        w.send_raw(&tail)?;
+        Ok(0)
+    });
+    let seen = Arc::clone(&observed);
+    let slow = GatedLogSink::new(
+        move || seen.finished.lock().map(|f| *f).unwrap_or(true),
+        Duration::from_millis(100),
+    );
+    let started = Instant::now();
+    let outcome = run_to_end(spawner, ScriptLimits::default(), slow.clone()).await?;
+    let took = started.elapsed();
+    assert_eq!(
+        outcome.host,
+        HostVerdict::None,
+        "after {took:?}: {outcome:?}"
+    );
+    assert_eq!(result_text(&outcome), Some("1"));
+    assert!(outcome.diag.is_empty(), "{:?}", outcome.diag);
+    assert_eq!(outcome.logs.len(), LINES);
+    assert!(
+        took > STDOUT_GRACE,
+        "the drain outlasted the grace ({took:?})"
+    );
+    assert_eq!(
+        slow.calls(),
+        0,
+        "the call read after the reap was not dispatched"
+    );
     Ok(())
 }

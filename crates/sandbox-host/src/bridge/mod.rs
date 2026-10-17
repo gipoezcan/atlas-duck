@@ -10,13 +10,17 @@
 //!   the bytes queued and not yet written are capped ([`unread_results_cap`]);
 //! - a **reaper** thread waits for the exit (T6: never on a runtime thread, never dropped);
 //! - a **finisher** thread publishes the run's outcome once the worker is reaped (M8 Task 9, T7
-//!   review m-3): it waits a bounded [`STDOUT_GRACE`] for the reader to reach stdout's EOF, so a
-//!   worker whose stdout outlives it (a degraded Linux/macOS worker that forked a child holding
-//!   the pipe) cannot keep [`RunHandleImpl::wait`] pending; the reader then drains on, ignored;
+//!   review m-3): it waits for the reader to reach stdout's EOF while the reader makes progress,
+//!   and gives up after [`STDOUT_GRACE`] with the reader stalled on the pipe or after
+//!   [`STDOUT_DRAIN_MAX`] in all, so a worker whose stdout outlives it (a degraded Linux/macOS
+//!   worker that forked a child holding the pipe) cannot keep [`RunHandleImpl::wait`] pending,
+//!   while a reader still working through the pipe's tail keeps the result it is about to read
+//!   (T9 review I-1); after giving up, the reader drains on, ignored;
 //! - a **memory** thread, where the spawner gives one ([`WorkerProcess::memory_watch`]): the
-//!   Windows job's completion port or the macOS footprint watchdog. An OS memory report decides
-//!   the run as `Limit("process_mb")` (unless something decided it first) and kills; it stops at
-//!   the reap.
+//!   Windows job's completion port or the macOS footprint watchdog. An OS memory report kills,
+//!   and stops the run's calls and later host causes; it decides the run as `Limit("process_mb")`
+//!   unless something decided it first or a terminal frame is accepted after it (one already in
+//!   the pipe, T9 review I-2). The watch stops at the reap.
 //!
 //! The per-run state machine is [`state`]. The run lock is held only for short state updates,
 //! never across a blocking read, write or wait, nor across a parse of a frame's payload;
@@ -69,7 +73,7 @@ use tokio::runtime::Handle;
 use tokio::sync::watch;
 use tokio::time::Sleep;
 
-use self::reader::{Continuation, Frame, Stdout};
+use self::reader::{Continuation, Frame, Progress, Stdout, Tracked};
 use self::state::{Incoming, RunState, Step};
 use crate::identity::{IdentityPart, SandboxBinaryIdentity};
 use crate::limits::{MemoryWatch, OsMemorySignal};
@@ -114,15 +118,23 @@ pub const DIAG_JOB_MEMORY_LIMIT: &str = "sandbox_job_memory_limit";
 /// (no footprint reading at all, the port failed) or did not end within its grace after the reap.
 pub const DIAG_MEMORY_WATCH_FAILED: &str = "sandbox_memory_watch_failed";
 /// Host fact for [`RunOutcome::diag`] (M8 Task 9, T7 review m-3): the worker's stdout stayed open
-/// [`STDOUT_GRACE`] past its reap (something else holds the pipe); the outcome was published
-/// without stdout's end, and later frames are ignored.
+/// past its reap (something else holds the pipe) and the reader stalled on it for
+/// [`STDOUT_GRACE`], or it was still open [`STDOUT_DRAIN_MAX`] after the reap; the outcome was
+/// published without stdout's end, and later frames are ignored.
 pub const DIAG_STDOUT_HELD: &str = "sandbox_stdout_held_after_exit";
 /// How often a kill is sent again until the worker is reaped (see the module documentation).
 pub const KILL_RETRY: Duration = Duration::from_secs(1);
-/// How long the outcome waits after the reap for the reader to reach stdout's EOF (T7 review
-/// m-3). The worker's own end of the pipe is closed by then, so only a stdout that something else
-/// holds takes this long.
+/// How long, after the reap, the outcome waits for stdout's EOF while the reader sits in a read
+/// of the pipe with nothing arriving (T7 review m-3). The worker's own end of the pipe is closed
+/// by then, so only a stdout that something else holds, silent, takes this long. A reader that
+/// is still reading the pipe's tail or busy with a frame (the glue's `log`) is not counted
+/// against it (T9 review I-1).
 pub const STDOUT_GRACE: Duration = Duration::from_secs(2);
+/// The longest the outcome waits after the reap for stdout's EOF, progress or not (T9 review
+/// I-1): something that keeps writing to the pipe, or a glue `log` that never returns, cannot
+/// hold the outcome longer. A worker's own tail (at most one pipe buffer, 64 KiB) is read well
+/// within it.
+pub const STDOUT_DRAIN_MAX: Duration = Duration::from_secs(30);
 
 /// How long the outcome waits for the stderr thread after the reap (its pipe is closed by then).
 const STDERR_GRACE: Duration = Duration::from_secs(2);
@@ -420,6 +432,7 @@ pub fn start_run(
         unread_cap: unread_results_cap(&init.limits),
         outcome_tx: Mutex::new(Some(outcome_tx)),
         ends: Ends::default(),
+        progress: Arc::default(),
     });
     // The memory watch runs before `script.run` is sent (the Windows port was associated with the
     // job before the worker started, so no report is lost either way).
@@ -453,7 +466,10 @@ pub fn start_run(
     let reading = Arc::clone(&run);
     let continuation: Continuation = Box::new(move |stdout| {
         let lost = LostOnUnwind(&reading);
-        reading.read_until_end(stdout);
+        reading.read_until_end(Box::new(Tracked::new(
+            stdout,
+            Arc::clone(&reading.progress),
+        )));
         reading.ends.update(|ends| ends.stdout_ended = true);
         // A worker that closed its stdout usually exits: its own exit code is awaited first, for
         // `EXIT_GRACE`; only a worker still running after that is killed (it must not outlive
@@ -751,6 +767,8 @@ struct Run {
     outcome_tx: Mutex<Option<watch::Sender<Option<RunOutcome>>>>,
     /// Where the reader and the finisher meet: stdout's EOF and the reap.
     ends: Ends,
+    /// How far the reader got, for the finisher's wait for stdout's EOF (T9 review I-1).
+    progress: Arc<Progress>,
 }
 
 struct Inner {
@@ -804,6 +822,35 @@ impl Ends {
             .unwrap_or_else(PoisonError::into_inner);
         cond(&flags)
     }
+
+    /// Whether the worker is reaped.
+    fn reaped(&self) -> bool {
+        self.flags
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reaped
+    }
+}
+
+/// Waits after the reap for stdout's EOF; whether the reader reached it (T7 review m-3, T9 review
+/// I-1). Each round waits up to `grace`. It gives up when the reader spent a whole round inside a
+/// read with nothing arriving (something other than the worker holds the pipe, silent), or after
+/// `cap` in all (something keeps writing, or the glue's `log` never returns). A reader still
+/// working through the pipe's tail, or busy with a frame, is waited for.
+fn await_stdout_end(ends: &Ends, progress: &Progress, grace: Duration, cap: Duration) -> bool {
+    let started = Instant::now();
+    let mut seen = progress.ticks();
+    loop {
+        let left = cap.saturating_sub(started.elapsed());
+        if ends.wait_for(|ends| ends.stdout_ended, grace.min(left)) {
+            return true;
+        }
+        let now = progress.ticks();
+        if left <= grace || (now == seen && progress.in_read()) {
+            return false;
+        }
+        seen = now;
+    }
 }
 
 /// Held by the reading and the finishing thread: if one of them unwinds (a panic in the glue's
@@ -852,8 +899,8 @@ impl Drop for RunningWatch {
     }
 }
 
-/// The [`KillHandle`] a memory watch kills through: it records the OS report in the run (it
-/// decides the run as `process_mb` unless something decided it first), then kills the worker.
+/// The [`KillHandle`] a memory watch kills through: it records the OS report in the run (see
+/// [`Run::on_memory_limit`]), then kills the worker.
 struct MemoryLimitKill {
     run: Arc<Run>,
     signal: OsMemorySignal,
@@ -938,6 +985,7 @@ impl Run {
                         return;
                     };
                     self.act(step);
+                    self.progress.tick();
                     if violated {
                         reader::discard(stdout);
                         return;
@@ -951,7 +999,13 @@ impl Run {
         match step {
             Step::Nothing => {}
             Step::Log(line) => self.sink.log(&self.run_id, &line),
-            Step::Call(call) => self.dispatch(call),
+            // A call read after the reap (from the pipe's tail, or from whatever holds the pipe)
+            // is not dispatched: its result can never reach the worker (T9 review m-3).
+            Step::Call(call) => {
+                if !self.ends.reaped() {
+                    self.dispatch(call);
+                }
+            }
             // The run is decided: the worker is killed (after a terminal frame without a cause,
             // so that it is reaped even if it does not exit). The timer stays armed until the
             // reap, the backstop if this kill does not take.
@@ -996,9 +1050,11 @@ impl Run {
         }
     }
 
-    /// An OS memory report ([`MemoryLimitKill`]): recorded (it decides the run unless something
-    /// decided it first), then the worker is killed. Repeated reports kill again (a no-op once a
-    /// kill took).
+    /// An OS memory report ([`MemoryLimitKill`]): recorded, then the worker is killed. Unless
+    /// something decided the run first, the report stops the run's calls (no new one is
+    /// dispatched, no result is queued: the writer's queue is dropped) and later host causes, and
+    /// it decides the run as `process_mb` unless a terminal frame is accepted after it (T9 review
+    /// I-2). Repeated reports kill again (a no-op once a kill took).
     fn on_memory_limit(&self, signal: OsMemorySignal) {
         self.update(|inner| {
             match signal {
@@ -1012,8 +1068,8 @@ impl Run {
 
     /// The finisher thread (T7 review m-3: the outcome is published from the reap side): waits
     /// for the reap (the timer kills from `timeout_s` on, the reader after stdout's EOF), stops
-    /// the memory watch (an OS report it already received is recorded first), waits up to
-    /// [`STDOUT_GRACE`] for the reader to reach stdout's EOF, then publishes. The run timer stops
+    /// the memory watch (an OS report it already received is recorded first), waits for the
+    /// reader to reach stdout's EOF ([`await_stdout_end`]), then publishes. The run timer stops
     /// at that.
     fn finish(
         &self,
@@ -1023,9 +1079,11 @@ impl Run {
     ) {
         // A reaper thread that is gone (`Disconnected`) or a failed reap: the exit is unknown.
         let exit = exit.recv().ok().and_then(Result::ok);
+        let reaped_at = Instant::now();
         self.ends.update(|ends| ends.reaped = true);
         let watch_failed = memory.is_some_and(|m| !m.stop(WATCH_GRACE));
-        let stdout_ended = self.ends.wait_for(|ends| ends.stdout_ended, STDOUT_GRACE);
+        let stdout_ended =
+            await_stdout_end(&self.ends, &self.progress, STDOUT_GRACE, STDOUT_DRAIN_MAX);
         let stderr = stderr.recv_timeout(STDERR_GRACE).unwrap_or_default();
         let mut diag = Vec::new();
         if exit.is_none() {
@@ -1060,7 +1118,7 @@ impl Run {
                 diag.push(DIAG_STDOUT_HELD);
             }
             let (logs, logs_truncated) = inner.state.take_logs();
-            let ended = inner.terminal_at.unwrap_or_else(Instant::now);
+            let ended = inner.terminal_at.unwrap_or(reaped_at);
             RunOutcome {
                 host,
                 end: inner.state.take_end(),
@@ -1099,9 +1157,11 @@ impl Run {
 
 /// PD-135: kills the run at `expiry` (`timeout_s` after `script.run` was handed to the writer),
 /// unless the outcome was published first (it is, after the reap). The cause `timeout_s` is
-/// recorded only if nothing decided the run before. From the expiry on it kills every
-/// [`KILL_RETRY`] until the reap (a no-op unless an earlier kill did not take, T6). If the reader
-/// thread ends without an outcome, the worker is killed at once (review m-5).
+/// recorded only if nothing decided the run before and the worker is not reaped yet (T9 review
+/// m-2: an expiry while the finisher still waits after the reap leaves the verdict to the
+/// worker's own exit). From the expiry on it kills every [`KILL_RETRY`] until the reap (a no-op
+/// unless an earlier kill did not take, T6). If the reader thread ends without an outcome, the
+/// worker is killed at once (review m-5).
 async fn run_timer(
     run: Arc<Run>,
     mut outcome: watch::Receiver<Option<RunOutcome>>,
@@ -1122,6 +1182,9 @@ async fn run_timer(
             return;
         }
         None => {}
+    }
+    if run.ends.reaped() {
+        return;
     }
     run.update(|inner| inner.state.on_timeout());
     loop {
@@ -1243,5 +1306,64 @@ mod tests {
     #[test]
     fn run_ids_are_unique() {
         assert_ne!(next_run_id(), next_run_id());
+    }
+
+    /// T9 review I-1: the wait for stdout's EOF after the reap gives up after one grace only for
+    /// a reader stalled inside a read; a busy reader, or one whose reads keep returning bytes, is
+    /// waited for up to the cap; an EOF ends the wait at once.
+    #[test]
+    fn the_stdout_wait_counts_only_a_stalled_reader_against_the_grace() {
+        // The grace is well above a sleep's granularity (about 16 ms on Windows).
+        let grace = Duration::from_millis(100);
+        let cap = Duration::from_millis(600);
+
+        // Stalled: inside a read, nothing arriving. One grace (the cap is far away).
+        let (ends, progress) = (Ends::default(), Progress::default());
+        progress.set_in_read(true);
+        let started = Instant::now();
+        assert!(!await_stdout_end(
+            &ends,
+            &progress,
+            grace,
+            Duration::from_secs(20)
+        ));
+        let took = started.elapsed();
+        assert!(took >= grace && took < Duration::from_secs(20), "{took:?}");
+
+        // Busy outside a read (a long `log`, a decode): waited for up to the cap.
+        let (ends, progress) = (Ends::default(), Progress::default());
+        let started = Instant::now();
+        assert!(!await_stdout_end(&ends, &progress, grace, cap));
+        assert!(started.elapsed() >= cap);
+
+        // Inside reads that keep returning bytes (something keeps writing): up to the cap.
+        let (ends, progress) = (Arc::new(Ends::default()), Arc::new(Progress::default()));
+        progress.set_in_read(true);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ticking, stopped) = (Arc::clone(&progress), Arc::clone(&stop));
+        let ticker = thread::spawn(move || {
+            while !stopped.load(Ordering::SeqCst) {
+                ticking.tick();
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        assert!(!await_stdout_end(&ends, &progress, grace, cap));
+        assert!(started.elapsed() >= cap);
+        stop.store(true, Ordering::SeqCst);
+        let _ = ticker.join();
+
+        // The EOF ends the wait.
+        let (ends, progress) = (Arc::new(Ends::default()), Progress::default());
+        progress.set_in_read(true);
+        let ending = Arc::clone(&ends);
+        let eof = thread::spawn(move || ending.update(|e| e.stdout_ended = true));
+        assert!(await_stdout_end(
+            &ends,
+            &progress,
+            grace,
+            Duration::from_secs(20)
+        ));
+        let _ = eof.join();
     }
 }

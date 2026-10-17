@@ -13,6 +13,7 @@
 
 use std::io::{self, Read};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::thread;
 use std::time::Duration;
@@ -39,6 +40,61 @@ pub(crate) enum Frame {
     TooLarge,
     /// EOF, a truncated frame or a read error: nothing more can be read.
     End,
+}
+
+/// How far a run's reader got (T9 review I-1), for the finisher's bounded wait for stdout's EOF:
+/// a counter that moves with every read that returned bytes and every frame the reader finished
+/// with, and whether the reader is inside a read right now. A reader that waits inside a read
+/// while the counter stands still is stalled on the pipe; one outside a read is busy (decoding a
+/// frame, in the glue's `log`).
+#[derive(Debug, Default)]
+pub(crate) struct Progress {
+    ticks: AtomicU64,
+    in_read: AtomicBool,
+}
+
+impl Progress {
+    /// The reader moved on (bytes read, a frame finished).
+    pub(crate) fn tick(&self) {
+        self.ticks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn ticks(&self) -> u64 {
+        self.ticks.load(Ordering::SeqCst)
+    }
+
+    /// The reader is inside a read of the pipe.
+    pub(crate) fn in_read(&self) -> bool {
+        self.in_read.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_in_read(&self, in_read: bool) {
+        self.in_read.store(in_read, Ordering::SeqCst);
+    }
+}
+
+/// The worker's stdout, reporting each read to a [`Progress`].
+pub(crate) struct Tracked {
+    inner: Stdout,
+    progress: Arc<Progress>,
+}
+
+impl Tracked {
+    pub(crate) fn new(inner: Stdout, progress: Arc<Progress>) -> Tracked {
+        Tracked { inner, progress }
+    }
+}
+
+impl Read for Tracked {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.progress.set_in_read(true);
+        let read = self.inner.read(buf);
+        self.progress.set_in_read(false);
+        if matches!(read, Ok(n) if n > 0) {
+            self.progress.tick();
+        }
+        read
+    }
 }
 
 /// Reads one frame of at most `cap` payload bytes.

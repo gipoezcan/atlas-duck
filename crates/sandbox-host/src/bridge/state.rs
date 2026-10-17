@@ -19,8 +19,12 @@
 //! to `max_result_mb` + 64 KiB), runs in [`Incoming::from`] on the reader thread before the run
 //! lock is taken (review I-1: a kill never waits for it).
 //!
-//! - An OS memory report (the Windows job message, the macOS watchdog kill; M8 Task 9) decides
-//!   the run like a host cause: the first decision wins, and frames after it are ignored.
+//! - An OS memory report (the Windows job message, the macOS watchdog kill; M8 Task 9) after
+//!   which the worker is killed: unless a terminal frame or a host cause came first, it stops
+//!   the run's calls (none is dispatched, no result is queued) and every later host cause, and
+//!   it decides the run as `process_mb`, unless a terminal frame read after it (one already in
+//!   the pipe) is accepted, which then decides (T9 review I-2). Log lines after it are kept; a
+//!   frame that would be a violation is ignored.
 //!
 //! The run's verdict from these facts and the worker's exit is [`RunState::verdict`], the
 //! host-measured attribution of PD-134 ([`crate::limits::attribute`]).
@@ -170,7 +174,8 @@ pub(crate) struct RunState {
     terminal: bool,
     end: WorkerEnd,
     cause: Option<HostCause>,
-    /// An OS memory report that decided the run (never set after another decision).
+    /// An OS memory report that came before any terminal frame or host cause (never set after
+    /// one); a terminal frame accepted later still decides.
     os_signal: Option<OsMemorySignal>,
     logs: Logs,
 }
@@ -195,7 +200,9 @@ impl RunState {
         terminal_frame_max(limits).max(WORKER_FRAME_MAX_BYTES)
     }
 
-    /// A terminal frame, a host cause or an OS memory report decided the run.
+    /// A terminal frame, a host cause or an OS memory report closed the run: no result is
+    /// queued and no later host cause is recorded. (After a report alone, a terminal frame is
+    /// still accepted; see [`RunState::on_frame`].)
     pub(crate) fn decided(&self) -> bool {
         self.terminal || self.cause.is_some() || self.os_signal.is_some()
     }
@@ -208,7 +215,7 @@ impl RunState {
     /// One frame of `len` payload bytes, as the decoder read it and [`Incoming::from`] classified
     /// it. No parse and no copy of the payload happens here.
     pub(crate) fn on_frame(&mut self, len: usize, frame: Result<Incoming, DecodeError>) -> Step {
-        if self.cause.is_some() || self.os_signal.is_some() {
+        if self.cause.is_some() {
             return Step::Nothing;
         }
         if self.terminal {
@@ -217,6 +224,9 @@ impl RunState {
                 Ok(Incoming::Terminal(_)) => self.violate(ViolationKind::SecondTerminal),
                 _ => Step::Nothing,
             };
+        }
+        if self.os_signal.is_some() {
+            return self.after_os_memory(len, frame);
         }
         let frame = match frame {
             Ok(frame) => frame,
@@ -241,19 +251,37 @@ impl RunState {
                 self.outstanding += 1;
                 Step::Call(call)
             }
-            Incoming::Log { line } => {
-                if self.logs.push(&line) {
-                    Step::Log(line)
-                } else {
-                    Step::Nothing
-                }
-            }
+            Incoming::Log { line } => self.log(line),
             Incoming::Terminal(end) => {
                 self.terminal = true;
                 self.end = end;
                 Step::Terminal
             }
             Incoming::CompileReply => self.violate(ViolationKind::UnexpectedFrame),
+        }
+    }
+
+    /// A frame read after an OS memory report and before any terminal (T9 review I-2): the
+    /// worker is being killed, but what it wrote before is still in the pipe. A terminal frame
+    /// within its cap is accepted (it then decides the run) and log lines are kept; a call is
+    /// not dispatched, and nothing is a violation any more.
+    fn after_os_memory(&mut self, len: usize, frame: Result<Incoming, DecodeError>) -> Step {
+        match frame {
+            Ok(Incoming::Terminal(end)) if len <= self.terminal_cap => {
+                self.terminal = true;
+                self.end = end;
+                Step::Terminal
+            }
+            Ok(Incoming::Log { line }) if len <= WORKER_FRAME_MAX_BYTES => self.log(line),
+            _ => Step::Nothing,
+        }
+    }
+
+    fn log(&mut self, line: String) -> Step {
+        if self.logs.push(&line) {
+            Step::Log(line)
+        } else {
+            Step::Nothing
         }
     }
 
@@ -276,7 +304,9 @@ impl RunState {
         self.decide_by(HostCause::Killed(cause))
     }
 
-    /// The OS reported the worker above `process_mb` (M8 Task 9). True if this decided the run.
+    /// The OS reported the worker above `process_mb` (M8 Task 9). True if it was recorded (no
+    /// terminal frame, host cause or report came first); the run is then `process_mb` unless a
+    /// terminal frame is accepted after it (T9 review I-2).
     pub(crate) fn on_os_memory(&mut self, signal: OsMemorySignal) -> bool {
         if self.decided() {
             return false;
@@ -380,6 +410,7 @@ mod tests {
 
     const RESULT: &str = r#"{"jsonrpc":"2.0","method":"script.result","params":{"value":[1]}}"#;
     const ERROR: &str = r#"{"jsonrpc":"2.0","method":"script.error","params":{"class":"E","message":"m","stack":""}}"#;
+    const LOG: &str = r#"{"jsonrpc":"2.0","method":"host.log","params":{"line":"x"}}"#;
 
     fn feed(state: &mut RunState, text: &str) -> Step {
         let (len, f) = frame(text);
@@ -509,10 +540,11 @@ mod tests {
         assert_eq!(s.verdict(protocol), HostVerdict::Killed(KillCause::User));
     }
 
-    /// M8 Task 9: the limit exit codes, and an OS memory report that decides the run like a host
-    /// cause (first decision wins; later frames are ignored).
+    /// M8 Task 9: the limit exit codes, and an OS memory report (T9 review I-2): it closes the
+    /// run to new calls and to later host causes, and decides it as `process_mb` unless a
+    /// terminal frame is accepted, before or after it (one already in the pipe).
     #[test]
-    fn memory_limits_are_host_measured_and_decide_first() {
+    fn memory_limits_are_host_measured_and_a_terminal_still_wins() {
         let s = state(4);
         assert_eq!(
             s.verdict(Some(ExitKind::Code(EXIT_HEAP_LIMIT))),
@@ -523,20 +555,45 @@ mod tests {
             HostVerdict::Limit("process_mb")
         );
 
+        // A report without a terminal: process_mb. No call, cause or violation after it; the
+        // log lines still in the pipe are kept.
         let mut s = state(4);
         assert!(s.on_os_memory(OsMemorySignal::WatchdogKill));
         assert!(s.decided() && !s.violated());
         assert!(!s.on_os_memory(OsMemorySignal::JobMemoryLimit));
         assert!(!s.on_timeout());
         assert!(!s.on_kill(KillCause::User));
-        assert!(!s.complete_call(), "nothing is queued after the decision");
-        assert_eq!(feed(&mut s, RESULT), Step::Nothing, "a late terminal");
+        assert!(!s.complete_call(), "nothing is queued after the report");
+        assert_eq!(
+            feed(&mut s, &call(1)),
+            Step::Nothing,
+            "no call after the report"
+        );
         assert_eq!(feed(&mut s, "garbage"), Step::Nothing);
+        assert_eq!(feed(&mut s, LOG), Step::Log("x".to_owned()));
+        assert_eq!(s.on_oversize_header(), Step::Nothing);
         assert_eq!(s.take_end(), WorkerEnd::None);
         assert_eq!(
             s.verdict(Some(ExitKind::Signal(9))),
             HostVerdict::Limit("process_mb")
         );
+
+        // A terminal read after the report is accepted and wins; its cap still applies.
+        let mut s = state(4);
+        assert!(s.on_os_memory(OsMemorySignal::WatchdogKill));
+        let (_, f) = frame(RESULT);
+        assert_eq!(
+            s.on_frame(s.terminal_cap + 1, f),
+            Step::Nothing,
+            "above the cap"
+        );
+        assert!(!s.terminal());
+        assert_eq!(feed(&mut s, RESULT), Step::Terminal);
+        assert!(s.terminal());
+        assert_eq!(s.verdict(Some(ExitKind::Signal(9))), HostVerdict::None);
+        assert_eq!(s.verdict(None), HostVerdict::None);
+        assert!(matches!(s.take_end(), WorkerEnd::Result { .. }));
+        assert_eq!(feed(&mut s, ERROR), Step::Violation, "second terminal");
 
         // A terminal accepted first wins over a later report.
         let mut s = state(4);

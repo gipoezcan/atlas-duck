@@ -584,22 +584,28 @@ jobs:
           else
             grep -F -- "M8 s10_handles os=$os fds=[0, 1, 2]" "$log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
           fi
+          # M8 T9 (V10, PD-134): host-measured memory limits. The tests assert their verdicts;
+          # these gates make a missing evidence line fail too.
+          grep -E "(^|[[:space:]])V10 heap_limit os=$os verdict=heap_mb " "$log" || { echo "::error::V10 heap_limit os=$os evidence missing"; exit 1; }
           case "$RUNNER_OS" in
             Linux)
               grep -E '(^|[[:space:]])M8 linux_pidfd_kill uses_pidfd=true exit=Signal\(9\) reap_fallbacks=0([^0-9]|$)' "$log" || { echo "::error::no pidfd kill without reap fallbacks"; exit 1; }
               grep -E '(^|[[:space:]])V11 pdeathsig_survives_short_thread=true ' "$log" || { echo "::error::V11 pdeathsig_survives_short_thread=true missing"; exit 1; }
+              grep -E '(^|[[:space:]])V10 linux_rlimit_as verdict=process_mb via=exit_103 sigsys=false([^[:alnum:]_]|$)' "$log" || { echo "::error::V10 linux_rlimit_as evidence missing"; exit 1; }
               ;;
             Windows)
               grep -E '(^|[[:space:]])M8 windows_terminate_job exit=Code\(1\)([^0-9]|$)' "$log" || { echo "::error::M8 windows_terminate_job exit=Code(1) missing"; exit 1; }
+              grep -E '(^|[[:space:]])V10 windows_job_memory_limit verdict=process_mb job_message=(true|false) ' "$log" || { echo "::error::V10 windows_job_memory_limit evidence missing"; exit 1; }
               ;;
             macOS)
               grep -E '(^|[[:space:]])M8 macos_kill_before_reap_only exit=Signal\(9\) ' "$log" || { echo "::error::M8 macos_kill_before_reap_only exit=Signal(9) missing"; exit 1; }
+              grep -E '(^|[[:space:]])V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=[0-9]+ arch=aarch64([^[:alnum:]_]|$)' "$log" || { echo "::error::V10 watchdog_kill evidence missing"; exit 1; }
               ;;
           esac
           {
             echo "### M8 sandbox_runs ($RUNNER_OS)"
             echo '```'
-            grep -E '(^|[[:space:]])(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            grep -E '(^|[[:space:]])(M8|V10|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -912,10 +918,13 @@ jobs:
           case "$ms" in ''|*[!0-9]*) echo "::error::S-10 elapsed_ms is not a number: $ms"; exit 1;; esac
           [ "$ms" -lt 10000 ] || { echo "::error::S-10 deadlock case took $ms ms"; exit 1; }
           grep -F -- 'M8 s10_handles os=macos fds=[0, 1, 2]' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::S-10 worker held descriptors other than 0, 1, 2"; exit 1; }
+          # M8 T9 (V10, PD-134): the heap limit and the footprint watchdog under Rosetta.
+          grep -E '(^|[[:space:]])V10 heap_limit os=macos verdict=heap_mb ' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 heap_limit os=macos evidence missing"; exit 1; }
+          grep -E '(^|[[:space:]])V10 watchdog_kill verdict=process_mb spawn_to_reap_ms=[0-9]+ arch=x86_64([^[:alnum:]_]|$)' "$RUNNER_TEMP/sandbox-runs.log" || { echo "::error::V10 watchdog_kill evidence missing"; exit 1; }
           {
             echo "### M8 sandbox_runs (x86_64-apple-darwin under Rosetta)"
             echo '```'
-            grep -E '(^|[[:space:]])(M8|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
+            grep -E '(^|[[:space:]])(M8|V10|V11) |^test |^test result' "$RUNNER_TEMP/sandbox-runs.log" | cut -c1-400 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

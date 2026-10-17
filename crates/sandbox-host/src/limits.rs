@@ -54,10 +54,13 @@ pub enum OsMemorySignal {
 
 /// The host's verdict on a run's end (M8 Task 9, PD-134), by this precedence:
 /// 1. a host cause (the timer, a channel violation, the caller's kill);
-/// 2. an accepted terminal frame: no verdict, whatever the exit or a later OS report says;
+/// 2. an accepted terminal frame: no verdict, whatever the exit or an OS report says, before or
+///    after the frame (T9 review I-2: the report kills the worker, but a terminal frame it had
+///    already written, read from the pipe after the report, still decides);
 /// 3. `EXIT_PROTOCOL` without a terminal frame: the worker could not read what the host sent, a
 ///    host fault (T4, T7 review I-2), checked before any limit;
-/// 4. an OS memory report (the Windows job message, the macOS watchdog kill) → `process_mb`;
+/// 4. an OS memory report (the Windows job message, the macOS watchdog kill) without an accepted
+///    terminal frame → `process_mb`;
 /// 5. `EXIT_HEAP_LIMIT` → `heap_mb`;
 /// 6. `EXIT_PROCESS_LIMIT` → `process_mb`;
 /// 7. a signal the host did not send (SIGSYS included) → `Crashed`, never a violation;
