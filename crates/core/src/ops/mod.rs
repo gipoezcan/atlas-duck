@@ -941,8 +941,27 @@ static ENTRIES: &[(&str, OpImpl)] = &[
             enrich_keys: &["reply_to"],
         },
     ),
-    ("confluence.label.add", LATER_WRITE),
-    ("confluence.label.remove", LATER_WRITE),
+    (
+        "confluence.label.add",
+        OpImpl {
+            executor: confluence_ext::label_add_executor,
+            previewer: confluence_preview::labels_preview,
+            // §5.4 step 5: an additive write has no stale rule; the identity call still runs.
+            stale_check: None,
+            enrich: Some(&confluence_ext::LABELS_ENRICH),
+            enrich_keys: &[],
+        },
+    ),
+    (
+        "confluence.label.remove",
+        OpImpl {
+            executor: confluence_ext::label_remove_executor,
+            previewer: confluence_preview::labels_preview,
+            stale_check: None,
+            enrich: Some(&confluence_ext::LABELS_ENRICH),
+            enrich_keys: &[],
+        },
+    ),
     ("confluence.attachment.upload", LATER_WRITE),
 ];
 

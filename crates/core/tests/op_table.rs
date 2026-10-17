@@ -45,14 +45,16 @@ const M5_WITHOUT_ENRICH: [&str; 2] = ["jira.worklog.add", "jira.backlog.move_iss
 
 /// Confluence writes completed in M7 beyond `confluence.page.update` (each task moves its op here
 /// from [`LATER_WRITES`]). Each needs its enrichment verdict before it renders a request.
-const M7_WRITES: [&str; 1] = ["confluence.comment.add"];
-
-/// No Jira write is left after T18; the Confluence writes land in M7.
-const LATER_WRITES: [&str; 5] = [
-    "confluence.page.create",
-    "confluence.page.move",
+const M7_WRITES: [&str; 3] = [
+    "confluence.comment.add",
     "confluence.label.add",
     "confluence.label.remove",
+];
+
+/// No Jira write is left after T18; the Confluence writes land in M7.
+const LATER_WRITES: [&str; 3] = [
+    "confluence.page.create",
+    "confluence.page.move",
     "confluence.attachment.upload",
 ];
 
@@ -243,6 +245,9 @@ fn reads_have_no_enrich() -> TestResult {
         "confluence.page.update",
         // M7 Task 18 (PD-107): the container, and the reply target.
         "confluence.comment.add",
+        // M7 Task 19 (PD-108): the content's current labels, for the card.
+        "confluence.label.add",
+        "confluence.label.remove",
     ]
     .into_iter()
     .collect();
@@ -929,7 +934,25 @@ fn fixture_cases() -> Vec<(&'static str, Value, Option<EnrichVerdict>)> {
                    "reply_to": "790"}),
             Some(comment_verdict(Some("790"))),
         ),
+        // M7 Task 19: the label writes, rendered after the enrichment read of the content.
+        (
+            "confluence.label.add",
+            json!({"id": "65537", "labels": ["release", "docs"]}),
+            Some(label_verdict()),
+        ),
+        (
+            "confluence.label.remove",
+            json!({"id": "65537", "label": "release"}),
+            Some(label_verdict()),
+        ),
     ]
+}
+
+/// What enrichment gives for the labels of page 65537.
+fn label_verdict() -> EnrichVerdict {
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), json!("65537"));
+    EnrichVerdict::preview(Value::Null, resolved)
 }
 
 /// What enrichment gives for a comment on page 65537, replying to `reply_to` when given.
@@ -955,6 +978,11 @@ fn executors_deterministic() -> TestResult {
         assert_eq!(a, b, "{id}");
         assert_eq!(a.len(), 1, "{id}");
         assert_eq!(a[0].index, 0);
+        if a[0].method == "DELETE" {
+            // The only DELETE (§1.3): no body and no content type.
+            assert!(a[0].content_type.is_none() && a[0].body.is_empty(), "{id}");
+            continue;
+        }
         assert_eq!(a[0].content_type.as_deref(), Some("application/json"));
         // Key order is fixed (serde_json's ordered map): re-serializing gives the same bytes.
         assert_eq!(serde_json::to_vec(&body_json(&a[0])?)?, a[0].body, "{id}");
@@ -1831,6 +1859,13 @@ fn fixtures_match_registry_schemas() -> TestResult {
             "confluence.comment.add",
             r#"{"id":"792","type":"comment","status":"current","title":"Re: Release checklist","version":{"number":1,"when":"2026-10-07T10:00:00.000+02:00"},"container":{"id":"65537","type":"page"},"_links":{"webui":"/display/DOC/Release+checklist?focusedCommentId=792","self":"https://wiki.corp.example/rest/api/content/792"}}"#,
         ),
+        // M7 Task 19: the labels the server now has (the receipt keeps the agent's), and the
+        // empty 204 of a remove.
+        (
+            "confluence.label.add",
+            r#"{"results":[{"prefix":"global","name":"release","id":"10"},{"prefix":"global","name":"docs","id":"11"}],"start":0,"limit":200,"size":2}"#,
+        ),
+        ("confluence.label.remove", "null"),
     ];
     // PD-101: a search is released pruned, so its schema (strict) is checked on the normalized
     // fixture, not on the raw answer.

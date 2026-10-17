@@ -1264,3 +1264,105 @@ pub(crate) fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
     model.header.hidden_in_preview_bytes = hidden.saturating_add(cut);
     model
 }
+
+// ---- the label cards (§6.3 labels, PD-108, Task 19) --------------------------------------------
+
+/// The label names the request sends: the `name` of each entry of an add's JSON array, or the
+/// last (percent-decoded) path segment of a remove's URL. `None`: not a label request.
+fn sent_labels(remove: bool, requests: &[HttpRequestSpec]) -> Option<Vec<String>> {
+    let request = requests.first()?;
+    if remove {
+        let last = request.resolved_url.rsplit('/').next()?;
+        let name = percent_encoding::percent_decode_str(last)
+            .decode_utf8()
+            .ok()?;
+        return Some(vec![name.into_owned()]);
+    }
+    let body: Value = serde_json::from_slice(&request.body).ok()?;
+    body.as_array()?
+        .iter()
+        .map(|e| e.get("name").and_then(Value::as_str).map(str::to_owned))
+        .collect()
+}
+
+/// §6.3 labels for `confluence.label.add` and `confluence.label.remove` (PD-108) over the exact
+/// request (§5.1 inv. 4): a sentence naming the labels the request sends and the content's title,
+/// the content, and a row for the labels the content already has (add) or does not have (remove).
+/// Labels compare case-insensitively (Confluence folds label names to lower case); the sentence
+/// and the request show them as sent. Every other hold, or a request that is not a label request,
+/// keeps the generic write preview.
+pub(crate) fn labels_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
+    let mut model = generic::write_preview(ctx);
+    let PreviewInput::Write(view) = &ctx.input else {
+        return model;
+    };
+    let remove = ctx.spec.id == "confluence.label.remove";
+    let facts = view
+        .enrichment
+        .filter(|v| v.hold == Hold::Preview)
+        .and_then(|v| v.summary.as_ref())
+        .and_then(|s| s.confluence.as_ref());
+    let (Some(facts), Some(labels), PreviewBody::WriteRequests { .. }) =
+        (facts, sent_labels(remove, view.requests), &model.body)
+    else {
+        return model;
+    };
+    let mut cut = 0u64;
+    let mut line = |raw: &str| {
+        let (shown, bytes) = generic::capped_text(raw, generic::CELL_CAP_CHARS * 2);
+        cut = cut.saturating_add(bytes);
+        shown
+    };
+    let (id, title) = facts
+        .page
+        .as_ref()
+        .map_or(("", ""), |p| (p.id.as_str(), p.title.as_str()));
+    let has = |label: &String| {
+        facts
+            .current_labels
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(label))
+    };
+    let listed = labels.join(", ");
+    let noun = if labels.len() == 1 { "label" } else { "labels" };
+    let sentence = line(&if remove {
+        format!("Remove {noun} {listed} from '{title}'")
+    } else {
+        format!("Add {noun} {listed} to '{title}'")
+    });
+    let kind = facts.container_type.as_deref().unwrap_or("content");
+    let mut rows = vec![("Content".to_owned(), line(&format!("{kind} {id}")))];
+    // Add: the labels the content already has. Remove: the label the content does not have.
+    let flagged: Vec<&str> = labels
+        .iter()
+        .filter(|l| has(l) != remove)
+        .map(String::as_str)
+        .collect();
+    if !flagged.is_empty() {
+        let name = if remove {
+            "Not present"
+        } else {
+            "Already present"
+        };
+        rows.push((name.to_owned(), line(&flagged.join(", "))));
+    }
+    count_card_text(&mut model, [title]);
+
+    let requests = match std::mem::replace(
+        &mut model.body,
+        PreviewBody::WriteRequests {
+            requests: Vec::new(),
+        },
+    ) {
+        PreviewBody::WriteRequests { requests } => requests,
+        _ => Vec::new(),
+    };
+    model.body = PreviewBody::WriteSummary {
+        sentence,
+        rows,
+        constructs: None,
+        requests,
+    };
+    model.header.hidden_in_preview_bytes = cut;
+    model
+}

@@ -1,18 +1,20 @@
 //! The Confluence writes M7 completes beyond `confluence.page.update`: `confluence.comment.add`
 //! (Task 18, PD-107): the container type from the enrichment and the `reply_to` resolution (a
-//! comment on this very content), so a reply is never sent unchecked.
+//! comment on this very content), so a reply is never sent unchecked; and the label writes
+//! (Task 19, PD-108): one request each, the content's current labels read for the card only.
 
-use atlas_duck_atlassian::GetCall;
+use atlas_duck_atlassian::{GetCall, HttpRequestSpec};
 use serde_json::{Map, Value, json};
 
 use super::confluence_body::{EmptyBody, storage_text};
 use super::jira::{capped, unresolved};
 use super::{
     ConfluenceFacts, EnrichCtx, EnrichPurpose, EnrichRule, EnrichStep, EnrichVerdict, ExecCtx,
-    ExecError, ExecPlan, PageRef, WriteSummaryFacts, get_call, json_request, resolve_url,
-    str_param,
+    ExecError, ExecPlan, PageRef, WriteSummaryFacts, get_call, json_request, method_name,
+    resolve_url, str_param,
 };
 use crate::lifecycle::model::Hold;
+use crate::validate::invalid;
 
 // ---- confluence.comment.add --------------------------------------------------------------------
 
@@ -157,4 +159,124 @@ pub fn comment_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
         map.insert("ancestors".to_owned(), json!([{ "id": reply }]));
     }
     json_request(ctx, &body)
+}
+
+// ---- confluence.label.add / confluence.label.remove --------------------------------------------
+
+/// The content the labels go on or come off: one GET with its labels (`metadata.labels`).
+const LABELS_PATH: &str = "/rest/api/content/{id}";
+
+/// PD-108: one enrichment GET (`enrich`) reads the content's title and its current labels, for the
+/// card only (the "already present" / "not present" rows). Nothing sent depends on it, but a write
+/// is rendered only after a usable answer for this very id. No stale rule (§5.4 step 5: additive
+/// or idempotent writes); the only param an approver edit changes is `labels`, which the facts do
+/// not depend on.
+pub static LABELS_ENRICH: EnrichRule = EnrichRule {
+    plan: labels_plan,
+    judge: labels_judge,
+};
+
+fn labels_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
+    match answers {
+        [] => fetch(
+            EnrichPurpose::Enrich,
+            get_call(LABELS_PATH, ctx.params, &[("expand", "metadata.labels")]),
+        ),
+        _ => EnrichStep::Judge,
+    }
+}
+
+/// The names of the global labels the content has. Labels with another prefix (`my`, `team`) are
+/// not what a `global` add or a remove by name touches.
+fn global_labels(results: &[Value]) -> Vec<String> {
+    results
+        .iter()
+        .filter(|l| {
+            l.get("prefix")
+                .and_then(Value::as_str)
+                .is_none_or(|p| p == "global")
+        })
+        .filter_map(|l| l.get("name").and_then(Value::as_str))
+        .map(capped)
+        .collect()
+}
+
+fn labels_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
+    let Some(content) = answers.first() else {
+        return EnrichVerdict::unusable();
+    };
+    // Fail closed on an answer without the label list (not a content answer).
+    let Some(results) = content
+        .pointer("/metadata/labels/results")
+        .and_then(Value::as_array)
+    else {
+        return EnrichVerdict::unusable();
+    };
+    let id = str_param(ctx.params, "id");
+    let title = content.get("title").and_then(Value::as_str).map(capped);
+    let mut resolved = Map::new();
+    resolved.insert("id".to_owned(), Value::from(id));
+    let mut verdict = EnrichVerdict::preview(Value::Null, resolved);
+    verdict.summary = Some(WriteSummaryFacts {
+        confluence: Some(ConfluenceFacts {
+            page: Some(PageRef {
+                id: id.to_owned(),
+                title: title.unwrap_or_default(),
+            }),
+            container_type: content
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            current_labels: global_labels(results),
+            ..ConfluenceFacts::default()
+        }),
+        ..WriteSummaryFacts::default()
+    });
+    verdict
+}
+
+/// Only a `Preview` verdict for this content id renders a label request.
+fn labels_verdict<'a>(ctx: &'a ExecCtx<'_>) -> Result<&'a EnrichVerdict, ExecError> {
+    let id = str_param(ctx.params, "id");
+    ctx.enrichment
+        .filter(|v| {
+            v.hold == Hold::Preview && v.resolved.get("id").and_then(Value::as_str) == Some(id)
+        })
+        .ok_or(ExecError::EnrichmentRequired)
+}
+
+/// `POST /rest/api/content/{id}/label` with `[{"prefix":"global","name":<label>}, …]` in the
+/// params' order (§7.4, PD-108): one entry per label, exactly as the agent wrote it.
+pub fn label_add_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
+    let labels: Vec<&str> = ctx
+        .params
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if labels.is_empty() {
+        return Err(ExecError::Invalid(invalid("labels", "required", None)));
+    }
+    labels_verdict(ctx)?;
+    let body: Vec<Value> = labels
+        .into_iter()
+        .map(|name| json!({"prefix": "global", "name": name}))
+        .collect();
+    json_request(ctx, &Value::Array(body))
+}
+
+/// `DELETE /rest/api/content/{id}/label/{label}`, no body and no content type (§1.3: the only
+/// DELETE). `resolve_url` refuses a `.`/`..` label (it would act as a dot segment and name another
+/// resource) before anything is rendered.
+pub fn label_remove_executor(ctx: &ExecCtx<'_>) -> Result<ExecPlan, ExecError> {
+    let resolved_url = resolve_url(ctx.base, ctx.spec.endpoint.path, ctx.params, &[])?;
+    labels_verdict(ctx)?;
+    Ok(ExecPlan::Write(vec![HttpRequestSpec {
+        index: 0,
+        method: method_name(ctx.spec.endpoint.method).to_owned(),
+        resolved_url,
+        content_type: None,
+        body: Vec::new(),
+    }]))
 }
