@@ -125,6 +125,9 @@ impl Flagged {
 /// Every `dst` entry (under any base) the §5.3 check fails, in document order.
 pub(crate) fn flagged(doc: &Value, mirrors: &[Mirror]) -> Vec<Flagged> {
     let mut found = Vec::new();
+    if mirrors.is_empty() {
+        return found;
+    }
     path::walk(doc, &mut Vec::new(), &mut |loc, v| {
         if !v.is_object() {
             return;
