@@ -13,7 +13,8 @@ use atlas_duck_atlassian::testing::{
 use atlas_duck_atlassian::{
     BodyFailure, CommitProbe, ConnClass, CoverIssuer, CredentialProvider, FetchControl,
     FetchFailure, FetchOutcome, GetCall, IdentityObserved, NotCommitted, PostSendKind, Product,
-    ProxyChoice, SearchCall, UnavailableReason, UpstreamResponse, normalize_base_url, url_hash,
+    ProxyChoice, ReadBudget, SearchCall, UnavailableReason, UpstreamResponse, normalize_base_url,
+    url_hash,
 };
 use serde_json::json;
 use wiremock::matchers::{path, query_param_contains};
@@ -357,6 +358,71 @@ async fn post_send_timeout_and_cap() -> TestResult {
         }
         other => return Err(format!("{other:?}").into()),
     }
+    Ok(())
+}
+
+/// M8 T19d: `get_budget_ctl` cuts a body while it streams at the smaller of the budget's two byte
+/// limits: the rest of the fetch budget (`max_bytes`, `FetchCap50MiB`) or the per-response cap
+/// (`max_response_bytes`, `ResponseCap32MiB`, also on a tie, as for a page). Under both it answers
+/// in full, and `get_ctl` keeps the fixed 32 MiB cap.
+#[tokio::test]
+async fn get_budget_ctl_cuts_the_body_at_the_smaller_byte_limit() -> TestResult {
+    const MIB: u64 = 1024 * 1024;
+    // How far past the cut the bytes received may reach: the chunk that crossed it, up to two of
+    // the mock's 512 KiB writes (pagination.rs, `FETCH_CAP_TOLERANCE`).
+    const TOLERANCE: u64 = MIB;
+    let dc = MockDc::start(Product::Confluence, "").await;
+    let body = format!(r#"{{"a":"{}"}}"#, "x".repeat(4 * 1024 * 1024));
+    Mock::given(path("/rest/api/content"))
+        .respond_with(
+            dc.response(200)
+                .set_body_raw(body.clone(), "application/json"),
+        )
+        .mount(dc.server())
+        .await;
+    let t = test_client(dc.client_config())?;
+    let get = call("/rest/api/content");
+    let budget = |max_bytes: u64, max_response_bytes: u64| ReadBudget {
+        max_bytes,
+        max_response_bytes,
+        ..ReadBudget::default()
+    };
+    for (b, want_kind, cut) in [
+        (budget(MIB, 2 * MIB), PostSendKind::FetchCap50MiB, MIB),
+        (budget(3 * MIB, MIB), PostSendKind::ResponseCap32MiB, MIB),
+        (budget(MIB, MIB), PostSendKind::ResponseCap32MiB, MIB),
+    ] {
+        let ctl = FetchControl::new();
+        let out = t
+            .client
+            .get_budget_ctl(&test_cover()?, &get, &b, &ctl)
+            .await;
+        match failure(out)? {
+            FetchFailure::PostSend { kind, received } => {
+                assert_eq!(kind, want_kind, "{b:?}");
+                let n = u64::try_from(received.len())?;
+                assert!(n > cut && n <= cut + TOLERANCE, "{b:?}: {n}");
+            }
+            other => return Err(format!("{b:?}: {other:?}").into()),
+        }
+    }
+    let r = response(
+        t.client
+            .get_budget_ctl(
+                &test_cover()?,
+                &get,
+                &budget(8 * MIB, 8 * MIB),
+                &FetchControl::new(),
+            )
+            .await,
+    )?;
+    assert_eq!(r.body, body.as_bytes());
+    let r = response(
+        t.client
+            .get_ctl(&test_cover()?, &get, &FetchControl::new())
+            .await,
+    )?;
+    assert_eq!(r.body, body.as_bytes());
     Ok(())
 }
 
