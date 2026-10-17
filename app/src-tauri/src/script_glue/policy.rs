@@ -23,7 +23,8 @@ pub enum SpawnerKind {
     /// Windows: the plain AppContainer spawner, whose rerun of the probe met the floor after LPAC
     /// did not (`ProbeReport::lpac_failed`).
     Fallback,
-    /// Windows below the floor: the lockdown-token spawner (M8 Task 11).
+    /// Windows below the floor with no AppContainer worker (no probe worker reached ready): the
+    /// lockdown-token spawner (M8 Task 11, §9.4).
     Degraded,
 }
 
@@ -58,20 +59,26 @@ pub fn admit(
         FloorVerdict::NotMet { .. } if policy.allow_degraded => true,
         FloorVerdict::NotMet { .. } => return Err(UnavailableReason::FloorNotMet),
     };
-    let identity = match &report.identity {
-        Some(identity) => identity.clone(),
-        None if degraded => fallback
-            .filter(|f| Some(f.worker.as_path()) == worker)
-            .and_then(|f| f.identity.clone())
-            .ok_or(UnavailableReason::SpawnFailed)?,
+    // §9.4: a run uses the spawner whose probe workers reached ready (they gave the identity),
+    // also when the floor is `NotMet` (a floor probe was not blocked, or the control re-run
+    // invalidated it): on Windows it keeps the AppContainer. The degraded spawner only when no
+    // probe worker reached ready (AppContainer unavailable: ACEs missing, profile creation
+    // blocked), i.e. exactly when the holder's own record stands in.
+    let (identity, spawner) = match &report.identity {
+        Some(identity) => (identity.clone(), probe_spawner_kind(report)),
+        None if degraded => (
+            fallback
+                .filter(|f| Some(f.worker.as_path()) == worker)
+                .and_then(|f| f.identity.clone())
+                .ok_or(UnavailableReason::SpawnFailed)?,
+            degraded_spawner_kind(),
+        ),
         None => return Err(UnavailableReason::SpawnFailed),
     };
-    let (mode, spawner) = if degraded {
-        (ConfinementMode::Degraded, degraded_spawner_kind())
-    } else if report.lpac_failed.is_some() {
-        (ConfinementMode::Floor, SpawnerKind::Fallback)
+    let mode = if degraded {
+        ConfinementMode::Degraded
     } else {
-        (ConfinementMode::Floor, SpawnerKind::Platform)
+        ConfinementMode::Floor
     };
     Ok(Admission {
         mode,
@@ -84,8 +91,18 @@ pub fn admit(
     })
 }
 
-/// PD-141 (b): Windows has its own degraded spawner; elsewhere "degraded" is the platform
-/// spawner's worker with `applied: false`.
+/// The spawner whose workers produced `report`: the plain AppContainer one when its rerun replaced
+/// the LPAC report (`lpac_failed`), else the platform's.
+fn probe_spawner_kind(report: &ProbeReport) -> SpawnerKind {
+    if report.lpac_failed.is_some() {
+        SpawnerKind::Fallback
+    } else {
+        SpawnerKind::Platform
+    }
+}
+
+/// PD-141 (b), §9.4: when no probe worker reached ready, Windows has its own degraded spawner
+/// (lockdown token); elsewhere "degraded" is the platform spawner's worker with `applied: false`.
 fn degraded_spawner_kind() -> SpawnerKind {
     if cfg!(windows) {
         SpawnerKind::Degraded

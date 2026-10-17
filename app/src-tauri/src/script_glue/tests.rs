@@ -856,20 +856,19 @@ async fn awaits_startup_probe_then_refuses_when_floor_not_met() -> TestResult {
 
 /// PD-141: the degraded toggle covers only a probe-time `NotMet`. (a) the worker's own report is
 /// what the end record gets; (b) an unconfined ready frame under a `Met` report is `FloorNotMet`
-/// with the toggle on; (c) with a `NotMet` report and the toggle on the run starts degraded.
+/// with the toggle on; (c) with a `NotMet` report and the toggle on the run starts degraded, on the
+/// spawner whose probe workers reached ready (§9.4: the lockdown-token spawner only when no
+/// AppContainer worker could start, see the fallback-identity test).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn glue_degraded_policy_uses_degraded_spawner() -> TestResult {
-    bounded(degraded_policy_uses_degraded_spawner()).await
+async fn glue_degraded_policy_keeps_the_probes_spawner() -> TestResult {
+    bounded(degraded_policy_keeps_the_probes_spawner()).await
 }
 
-async fn degraded_policy_uses_degraded_spawner() -> TestResult {
-    let degraded_kind = if cfg!(windows) {
-        SpawnerKind::Degraded
-    } else {
-        SpawnerKind::Platform
-    };
-
-    // (c) NotMet + toggle on: the degraded spawner, an unconfined worker accepted.
+async fn degraded_policy_keeps_the_probes_spawner() -> TestResult {
+    // (c) NotMet + toggle on, the probe workers reached ready (the report has an identity; a floor
+    // probe was not blocked, or the control re-run invalidated it): the same spawner, so a Windows
+    // run keeps its AppContainer; an unconfined worker accepted.
+    let degraded_kind = SpawnerKind::Platform;
     let port = FakePort::new();
     port.set_ready(VERSION, conf(false, "lockdown_token"));
     let g = glue(
