@@ -1720,6 +1720,61 @@ fn s10_unread_results_are_capped() -> TestResult {
     Ok(())
 }
 
+/// Nothing of a run outlives its outcome: the answers queued for a worker that never read them
+/// are released before `RunHandleImpl::wait` answers, not a moment later by the writer thread.
+/// Measured at once, without a settle: the CI failure of the fuzz run above was the queue of
+/// `s10_worker_that_never_reads_stdin_is_killed_at_the_timer` still being freed while the next
+/// fuzz case ran.
+#[test]
+fn s10_queued_answers_are_released_before_the_outcome() -> TestResult {
+    let _serial = serial();
+    let rt = runtime()?;
+    const CALLS: u64 = 12;
+    const ANSWER: usize = 512 * 1024;
+    let sink = TestSink::padded(ANSWER);
+    let seen = Arc::clone(&sink);
+    let (spawner, observed) = fake(move |w| {
+        w.ready()?;
+        w.read()?; // script.run; nothing after it is ever read
+        // One call at a time, each answered (and queued) before the next.
+        for id in 1..=CALLS {
+            w.send(&call_frame(id))?;
+            let started = Instant::now();
+            while u64::from(seen.completed()) < id {
+                if w.observed.is_killed() || started.elapsed() > WAIT_BOUND {
+                    return w.until_killed();
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        w.until_killed()
+    });
+    let base = live();
+    let (outcome, held) = measure(|| {
+        run_to_end(
+            &rt,
+            &spawner,
+            limits_with(|l| l.timeout_s = 2),
+            sink.clone(),
+        )
+    });
+    let left = live() - base;
+    let outcome = outcome?;
+    assert_eq!(outcome.host, HostVerdict::Limit("timeout_s"));
+    assert_eq!(sink.completed(), CALLS as u32, "every call was answered");
+    // The answers were queued (the first one blocks the writer on the full pipe, the rest wait).
+    assert!(
+        held >= (CALLS as usize - 1) * ANSWER,
+        "the host held {held} bytes at most, so the answers were never queued"
+    );
+    assert!(
+        left <= CASE_LEAK_SLACK as isize,
+        "the run's outcome is out while {left} bytes of it are still on the heap"
+    );
+    observed.wait_finished()?;
+    Ok(())
+}
+
 /// T7 hand-off (T3 re-review N-b): frames sent by `toJSON` / `describe` getters can precede the
 /// terminal frame, and a call may still be unanswered when the terminal arrives: all of it is
 /// accepted, the run ends with the result.

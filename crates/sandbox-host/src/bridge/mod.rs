@@ -7,7 +7,9 @@
 //!   against a host blocked writing;
 //! - a **stderr** thread keeps the first 64 KiB and reads and discards the rest;
 //! - a **writer** thread owns stdin and writes the queued frames (`script.run`, call results);
-//!   the bytes queued and not yet written are capped ([`unread_results_cap`]);
+//!   the bytes queued and not yet written are capped ([`unread_results_cap`]); a run's outcome is
+//!   published only after the writer ended (waited for 2 s at most), so the frames a worker
+//!   never read do not outlive the run;
 //! - a **reaper** thread waits for the exit (T6: never on a runtime thread, never dropped);
 //! - a **finisher** thread publishes the run's outcome once the worker is reaped (M8 Task 9, T7
 //!   review m-3): it waits for the reader to reach stdout's EOF while the reader makes progress,
@@ -138,6 +140,10 @@ pub const STDOUT_DRAIN_MAX: Duration = Duration::from_secs(30);
 
 /// How long the outcome waits for the stderr thread after the reap (its pipe is closed by then).
 const STDERR_GRACE: Duration = Duration::from_secs(2);
+/// How long the outcome waits after the reap for the writer thread to end and drop the frames
+/// still queued. The worker's end of stdin is closed by then, so a blocked write fails at once;
+/// only a stdin that something else holds without reading takes this long.
+const WRITER_GRACE: Duration = Duration::from_secs(2);
 /// How long the outcome waits after the reap for the memory watch to end.
 const WATCH_GRACE: Duration = Duration::from_secs(2);
 /// How long the bridge waits for the worker's own exit after its stdout ended, before it kills
@@ -408,10 +414,13 @@ pub fn start_run(
 
     let (frames_tx, frames_rx) = mpsc::channel();
     let queued = Arc::new(AtomicUsize::new(0));
-    if let Err(e) = writer::spawn(stdin, frames_rx, Arc::clone(&queued)) {
-        give_up(kill, exit);
-        return Err(spawn_error(&e));
-    }
+    let writer_ended = match writer::spawn(stdin, frames_rx, Arc::clone(&queued)) {
+        Ok(ended) => ended,
+        Err(e) => {
+            give_up(kill, exit);
+            return Err(spawn_error(&e));
+        }
+    };
 
     let (outcome_tx, outcome) = watch::channel(None);
     let run = Arc::new(Run {
@@ -450,7 +459,7 @@ pub fn start_run(
         .name("sandbox-finish".to_owned())
         .spawn(move || {
             let _lost = LostOnUnwind(&finishing);
-            finishing.finish(&exit, &stderr, memory);
+            finishing.finish(&exit, &stderr, &writer_ended, memory);
         });
     if let Err(e) = finisher {
         // The reaper's receiver went with the closure, so this kill is not retried; the memory
@@ -541,6 +550,8 @@ pub fn compile_run(
 
     let (frames_tx, frames_rx) = mpsc::channel();
     let queued = Arc::new(AtomicUsize::new(0));
+    // The writer's end is not awaited: `compile_run` returns before the reap, and its queue holds
+    // the one request.
     if let Err(e) = writer::spawn(stdin, frames_rx, Arc::clone(&queued)) {
         give_up(kill, exit);
         return Err(spawn_error(&e));
@@ -1078,31 +1089,39 @@ impl Run {
     }
 
     /// The finisher thread (T7 review m-3: the outcome is published from the reap side): waits
-    /// for the reap (the timer kills from `timeout_s` on, the reader after stdout's EOF), stops
-    /// the memory watch (an OS report it already received is recorded first), waits for the
-    /// reader to reach stdout's EOF ([`await_stdout_end`]), then publishes. The run timer stops
-    /// at that.
+    /// for the reap (the timer kills from `timeout_s` on, the reader after stdout's EOF), drops
+    /// the writer's queue, stops the memory watch (an OS report it already received is recorded
+    /// first), waits for the reader to reach stdout's EOF ([`await_stdout_end`]) and for the
+    /// writer thread to end (`writer_ended`, [`WRITER_GRACE`]), then publishes. The run timer
+    /// stops at that.
     fn finish(
         &self,
         exit: &Receiver<io::Result<ExitKind>>,
         stderr: &Receiver<String>,
+        writer_ended: &Receiver<()>,
         memory: Option<RunningWatch>,
     ) {
         // A reaper thread that is gone (`Disconnected`) or a failed reap: the exit is unknown.
         let exit = exit.recv().ok().and_then(Result::ok);
         let reaped_at = Instant::now();
         self.ends.update(|ends| ends.reaped = true);
+        // Nothing reads the worker's stdin any more: no frame is queued from here on, and the
+        // writer ends once it has dropped what is queued (a write blocked on the full pipe failed
+        // when the worker's end closed).
+        self.lock().writer = None;
         let watch_failed = memory.is_some_and(|m| !m.stop(WATCH_GRACE));
         let stdout_ended =
             await_stdout_end(&self.ends, &self.progress, STDOUT_GRACE, STDOUT_DRAIN_MAX);
         let stderr = stderr.recv_timeout(STDERR_GRACE).unwrap_or_default();
+        // The writer never sends: `Disconnected` is its end, `Timeout` a stdin that something
+        // else holds without reading (the frame being written and the queue stay with the thread).
+        let _ = writer_ended.recv_timeout(WRITER_GRACE);
         let mut diag = Vec::new();
         if exit.is_none() {
             diag.push(DIAG_REAP_FAILED);
         }
         let done = {
             let mut inner = self.lock();
-            inner.writer = None;
             if !stdout_ended {
                 inner.stdout_cut = true;
             }
