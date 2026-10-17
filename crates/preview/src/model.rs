@@ -35,7 +35,9 @@ pub const RENDER_VERSIONS: &[(&str, u64)] = &[
     ("render3", 0x18d6_262f_815e_9ad3),
     // M8 Task 18 (Δ5): the script result and error documents. `render4` is M7's (not on this
     // branch); the M7 merge puts it before this entry and re-pins this one over all the goldens.
-    ("render5", 0xa388_29fc_5505_18c2),
+    // Re-pinned in place by the T18 review fix (unmerged and unpushed: the reserved script
+    // sections and the view's h3 heading).
+    ("render5", 0x339f_984b_9c68_f842),
 ];
 
 /// `UpstreamError.error_messages_text` cap (bytes, including the trailing ellipsis).
