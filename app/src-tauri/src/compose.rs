@@ -400,7 +400,7 @@ mod tests {
             .ok_or("the probe report did not reach the runner")?;
         assert_eq!(admitted.mode, ConfinementMode::Floor);
         assert_eq!(admitted.worker_version, "v1");
-        assert_eq!(admitted.probe_report, report);
+        assert_eq!(admitted.probe_report, Some(report));
         deps.audit.shutdown();
         Ok(())
     }

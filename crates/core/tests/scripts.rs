@@ -2307,12 +2307,13 @@ async fn script_started_records_confinement() -> TestResult {
     let (h, runner) = harness(vec![
         ScriptPlan::new(Vec::new(), result_end(json!(1))),
         ScriptPlan::new(Vec::new(), result_end(json!(2))),
+        ScriptPlan::new(Vec::new(), result_end(json!(3))),
     ])
     .await?;
     runner.set_confinement(Some(RunConfinement {
         mode: ConfinementMode::Degraded,
         worker_version: "0.8.0+abc".to_owned(),
-        probe_report: confinement_report(),
+        probe_report: Some(confinement_report()),
     }));
     let id = submit(&h, json!({ "source": SRC })).await?;
     h.queued(&id, 20_000).await.ok_or("never queued")?;
@@ -2326,6 +2327,20 @@ async fn script_started_records_confinement() -> TestResult {
             "worker_version": "0.8.0+abc",
             "probe_report": serde_json::to_value(confinement_report())?,
         })
+    );
+    // Degraded with no probe worker's ready frame (M8 T20 ruling): the record still says
+    // `degraded`, and the probe's report is `null`, never a fabricated one.
+    runner.set_confinement(Some(RunConfinement {
+        mode: ConfinementMode::Degraded,
+        worker_version: "0.8.0+abc".to_owned(),
+        probe_report: None,
+    }));
+    let id = submit(&h, json!({ "source": SRC })).await?;
+    h.queued(&id, 20_000).await.ok_or("never queued")?;
+    let started = record(&h, &id, EventType::SCRIPT_STARTED).await?;
+    assert_eq!(
+        started["confinement"],
+        json!({ "mode": "degraded", "worker_version": "0.8.0+abc", "probe_report": null })
     );
     // A runner that states nothing: the key is absent, never invented.
     runner.set_confinement(None);
@@ -2783,7 +2798,7 @@ async fn degraded_toggle_changed_before_script_started_only_narrows_the_spawn() 
     runner.set_confinement(Some(RunConfinement {
         mode: ConfinementMode::Degraded,
         worker_version: "0.8.0+abc".to_owned(),
-        probe_report: confinement_report(),
+        probe_report: Some(confinement_report()),
     }));
 
     // Revoked: the slot is taken with the toggle on, the off commits before `SCRIPT_STARTED`.

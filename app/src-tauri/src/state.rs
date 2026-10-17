@@ -9,7 +9,7 @@ use atlas_duck_ipc::server::ShutdownSignal;
 use atlas_duck_sandbox_host::probe::{FloorVerdict, ProbeReport};
 use tauri::async_runtime::JoinHandle;
 
-use crate::sandbox_probe::ProbeHolder;
+use crate::sandbox_probe::{ProbeHolder, canonical_worker};
 use crate::serve::{ServeState, ShutdownOutcome};
 use crate::tray_host::TrayHost;
 
@@ -54,7 +54,8 @@ pub struct AppState {
     /// in `APP_START`, M4 reports it in `doctor` (§4.7).
     tray_host: Option<TrayHost>,
     /// The §9.4 probe report; set once by the `atlas-duck-probe` thread. Shared with the script
-    /// glue, which awaits it before its first spawn (M8 Task 20, PD-138).
+    /// glue, which awaits it before its first spawn (M8 Task 20, PD-138). It records the canonical
+    /// worker's identity itself when no probe worker reached ready (M8 T20 ruling).
     pub probe: Arc<ProbeHolder>,
     /// PD-133: the script glue found the sandbox binary replaced since the probe (an upgrade
     /// under the running app): scripts stay refused until restart, and the status line
@@ -74,7 +75,7 @@ impl AppState {
         AppState {
             startup,
             tray_host,
-            probe: Arc::default(),
+            probe: Arc::new(ProbeHolder::for_worker(canonical_worker())),
             update_pending: Arc::default(),
             startup_text: None,
             pending: AtomicU32::new(0),

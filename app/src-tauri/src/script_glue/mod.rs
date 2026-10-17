@@ -6,7 +6,9 @@
 //! Every spawn is admitted by the floor rule ([`policy`], §9.4, PD-141) from the startup probe's
 //! report, which the glue awaits for at most [`PROBE_WAIT`] (PD-138, R10), and from the run
 //! policy core reads before each call (never captured at submit). Before every spawn the binary's
-//! file identity is checked again against the probe's record (PD-133); a mismatch refuses the run
+//! file identity is checked again against the probe's record (PD-133), or, for a degraded run when
+//! no probe worker reached ready, against the record the probe holder made itself when it
+//! resolved (`FallbackIdentity`, M8 T20 ruling); a mismatch refuses the run
 //! as `app_upgraded`, sets the update flag (`updated_restart`), and every later script is refused
 //! the same way until restart. The bridge then checks the spawned worker's ready frame (embedded
 //! version, confinement) before it sends any source.
@@ -51,7 +53,7 @@ use tokio::runtime::Handle;
 
 pub use self::policy::SpawnerKind;
 use crate::diag::fields::{SCRIPT_DIAG_UNLISTED, SCRIPT_GLUE_EVENTS};
-use crate::sandbox_probe::{ProbeHolder, install_dir, sandbox_worker_path};
+use crate::sandbox_probe::{ProbeHolder, canonical_worker};
 
 /// Plan value (PD-138): how long the glue awaits the startup probe's report before a spawn; the
 /// wait sits in `check_available` and counts toward the agent's `--timeout`.
@@ -310,8 +312,7 @@ impl ScriptGlue {
     /// The glue over the real bridge, for the worker next to this executable (§3.4: only the
     /// canonical binary of the install dir). Creates no spawner yet.
     pub fn new(inputs: ScriptInputs) -> ScriptGlue {
-        let worker = install_dir().ok().map(|dir| sandbox_worker_path(&dir));
-        ScriptGlue::with_port(Arc::new(HostBridge::default()), worker, inputs)
+        ScriptGlue::with_port(Arc::new(HostBridge::default()), canonical_worker(), inputs)
     }
 
     /// The glue over `port` for the worker at `worker`.
@@ -353,7 +354,12 @@ impl ScriptGlue {
             tracing::warn!(event = LOG_EVENT_PROBE_PENDING, request_id);
             return Err(UnavailableReason::ProbePending);
         };
-        let admission = policy::admit(report, policy)?;
+        let admission = policy::admit(
+            report,
+            self.inputs.probe.fallback(),
+            self.worker.as_deref(),
+            policy,
+        )?;
         let exe = self.worker.clone().ok_or(UnavailableReason::SpawnFailed)?;
         self.recheck(&admission.expect, &exe, request_id).await?;
         Ok((admission, exe))
@@ -445,7 +451,12 @@ impl ScriptRunner for ScriptGlue {
     }
 
     fn confinement(&self, policy: RunPolicy) -> Option<RunConfinement> {
-        policy::confinement(self.inputs.probe.get(), policy)
+        policy::confinement(
+            self.inputs.probe.get(),
+            self.inputs.probe.fallback(),
+            self.worker.as_deref(),
+            policy,
+        )
     }
 
     async fn start(

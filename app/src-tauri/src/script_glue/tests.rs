@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use atlas_duck_core::{ConfinementMode, RunPolicy};
+use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::sandbox::probe::ProbeId;
 use atlas_duck_ipc::sandbox::script::RawJsonText;
 use atlas_duck_sandbox_host::bridge::{
@@ -23,6 +24,7 @@ use serde_json::json;
 use tokio::sync::{Semaphore, watch};
 
 use super::*;
+use crate::sandbox_probe::FallbackIdentity;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -117,6 +119,34 @@ fn report_for(worker: &Path, floor: FloorVerdict) -> Result<ProbeReport, std::io
     })
 }
 
+/// The startup probe's report when no probe worker sent its ready frame: no identity, no versions,
+/// no confinement report.
+fn bare_report(floor: FloorVerdict) -> ProbeReport {
+    ProbeReport {
+        worker_version: None,
+        engine_version: None,
+        identity: None,
+        confinement: None,
+        threads: None,
+        records: Vec::new(),
+        floor,
+        extra_layers: Vec::new(),
+        control: None,
+        lpac_failed: None,
+    }
+}
+
+/// What the holder must record for `worker` as it is now: its file identity and this build's id.
+fn fallback_now(worker: &Path) -> Result<SandboxBinaryIdentity, std::io::Error> {
+    let (file_id, size, mtime) = file_identity(worker)?;
+    Ok(SandboxBinaryIdentity {
+        file_id,
+        size,
+        mtime,
+        embedded_version: BUILD_ID.to_owned(),
+    })
+}
+
 fn outcome(end: WorkerEnd, host: HostVerdict) -> RunOutcome {
     RunOutcome {
         end,
@@ -183,11 +213,14 @@ struct FakePort {
     compile: Mutex<CompileAnswer>,
     controls: Mutex<Vec<Arc<FakeControl>>>,
     sinks: Mutex<Vec<Arc<dyn HostCallSink>>>,
+    /// The identity each job expected, in order.
+    expected: Mutex<Vec<SandboxBinaryIdentity>>,
 }
 
 impl FakePort {
     fn new() -> Arc<FakePort> {
         Arc::new(FakePort {
+            expected: Mutex::new(Vec::new()),
             seen: Mutex::new(Vec::new()),
             ready: Mutex::new((VERSION.to_owned(), conf(true, "worker"))),
             compile: Mutex::new(CompileAnswer::Verdict(Ok(CompileVerdict::Compiled))),
@@ -216,8 +249,13 @@ impl FakePort {
         lock(&self.sinks).get(n).cloned()
     }
 
+    fn expected(&self) -> Vec<SandboxBinaryIdentity> {
+        lock(&self.expected).clone()
+    }
+
     /// The bridge's `check_ready` (PD-133, PD-141).
     fn check_ready(&self, expect: &ExpectedWorker) -> Result<(), StartRunError> {
+        lock(&self.expected).push(expect.identity.clone());
         let (version, report) = lock(&self.ready).clone();
         if version != expect.identity.embedded_version {
             return Err(StartRunError::IdentityMismatch {
@@ -353,6 +391,22 @@ fn glue(port: &Arc<FakePort>, worker: &Path, report: Option<ProbeReport>) -> Scr
     if let Some(r) = report {
         let _ = inputs.probe.set(r);
     }
+    ScriptGlue::with_port(port.clone(), Some(worker.to_path_buf()), inputs)
+}
+
+/// A glue spawning `worker` whose probe holder records the identity of `holder_worker` when the
+/// report has none (the app's holder records the canonical worker's), resolved with `report`.
+fn glue_recording(
+    port: &Arc<FakePort>,
+    worker: &Path,
+    holder_worker: &Path,
+    report: ProbeReport,
+) -> ScriptGlue {
+    let inputs = ScriptInputs {
+        probe: Arc::new(ProbeHolder::for_worker(Some(holder_worker.to_path_buf()))),
+        ..ScriptInputs::default()
+    };
+    let _ = inputs.probe.set(report);
     ScriptGlue::with_port(port.clone(), Some(worker.to_path_buf()), inputs)
 }
 
@@ -777,11 +831,10 @@ async fn awaits_startup_probe_then_refuses_when_floor_not_met() -> TestResult {
     assert!(g.confinement(off()).is_none());
     assert!(port.seen().is_empty(), "{:?}", port.seen());
 
-    // A report without a recorded identity (no probe worker answered): fail closed even with
-    // degraded allowed.
-    let mut bare = report_for(&worker_file(), not_met())?;
-    bare.identity = None;
-    let g = glue(&port, &worker_file(), Some(bare));
+    // A report without a recorded identity (no probe worker answered) in a holder that records
+    // none itself (no worker path): fail closed even with degraded allowed.
+    let g = glue(&port, &worker_file(), Some(bare_report(not_met())));
+    assert!(g.inputs.probe.fallback().is_none());
     assert_eq!(
         g.check_available(on()).await,
         Err(unavailable(UnavailableReason::SpawnFailed))
@@ -829,7 +882,7 @@ async fn degraded_policy_uses_degraded_spawner() -> TestResult {
     assert_eq!(admitted.worker_version, VERSION);
     assert_eq!(
         admitted.probe_report,
-        conf(false, "probe"),
+        Some(conf(false, "probe")),
         "the probe's report"
     );
     assert_eq!(g.check_available(on()).await, Ok(()));
@@ -926,6 +979,217 @@ async fn degraded_policy_uses_degraded_spawner() -> TestResult {
         "{:?}",
         port.seen()
     );
+    Ok(())
+}
+
+/// M8 T20 ruling (PD-133, PD-141): when no probe worker reached ready (Windows below the floor) the
+/// report has no identity; the holder records the canonical worker's file identity and this
+/// build's id itself, once, when it resolves. A degraded run (toggle on, `NotMet`) is checked
+/// against that record before every spawn, the bridge checks the ready frame's version against
+/// it, and the end record gets the degraded worker's own report; nothing stands in for the
+/// probe's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn glue_degraded_windows_without_probe_identity_records_fallback_identity() -> TestResult {
+    bounded(degraded_without_probe_identity_records_fallback_identity()).await
+}
+
+async fn degraded_without_probe_identity_records_fallback_identity() -> TestResult {
+    let degraded_kind = if cfg!(windows) {
+        SpawnerKind::Degraded
+    } else {
+        SpawnerKind::Platform
+    };
+    let dir = Scratch::new("fallback")?;
+    let worker = dir.file("atlas-duck-sandbox");
+    fs::write(&worker, b"worker")?;
+    let recorded = fallback_now(&worker)?;
+
+    // A report with an identity: the holder records nothing of its own.
+    let port = FakePort::new();
+    let g = glue_recording(&port, &worker, &worker, report_for(&worker, not_met())?);
+    assert!(g.inputs.probe.fallback().is_none());
+
+    // No probe worker reached ready: recorded when the holder resolved.
+    let port = FakePort::new();
+    port.set_ready(BUILD_ID, conf(false, "lockdown_token"));
+    let g = glue_recording(&port, &worker, &worker, bare_report(not_met()));
+    assert_eq!(
+        g.inputs.probe.fallback(),
+        Some(&FallbackIdentity {
+            worker: worker.clone(),
+            identity: Some(recorded.clone()),
+        })
+    );
+    // `SCRIPT_STARTED` says degraded, with this build's id and no probe report (none exists).
+    let admitted = g.confinement(on()).ok_or("no confinement")?;
+    assert_eq!(admitted.mode, ConfinementMode::Degraded);
+    assert_eq!(admitted.worker_version, BUILD_ID);
+    assert_eq!(admitted.probe_report, None);
+    // The toggle off: the floor rule refuses first.
+    assert!(g.confinement(off()).is_none());
+    assert_eq!(
+        g.check_available(off()).await,
+        Err(unavailable(UnavailableReason::FloorNotMet))
+    );
+    assert_eq!(g.check_available(on()).await, Ok(()));
+    assert_eq!(
+        g.compile_check("return 1;", &ScriptLimits::default(), on())
+            .await,
+        Ok(())
+    );
+    let handle = started(&g, spec(on()), GatedCalls::new()).await?;
+    let seen = port.seen();
+    assert!(
+        matches!(
+            seen.as_slice(),
+            [
+                Seen::Compile { spawner: c, accept_unconfined: true, .. },
+                Seen::Start { spawner: s, accept_unconfined: true, .. },
+            ] if *c == degraded_kind && *s == degraded_kind
+        ),
+        "{seen:?}"
+    );
+    // The bridge expects the recorded identity (its ready-frame check is the backstop).
+    assert_eq!(port.expected(), [recorded.clone(), recorded.clone()]);
+    // The end record gets the degraded worker's own ready-frame report.
+    port.control(0)
+        .ok_or("no run")?
+        .finish(outcome(result_end("1")?, HostVerdict::None));
+    tokio::time::timeout(BOUND, handle.wait()).await?;
+    assert_eq!(
+        handle.worker_confinement(),
+        Some(conf(false, "lockdown_token"))
+    );
+    assert!(!g.update_pending());
+
+    // The backstop: a worker whose ready frame names another build is refused as an upgrade.
+    port.set_ready("another-build", conf(false, "lockdown_token"));
+    assert_eq!(
+        start_error(g.start(spec(on()), GatedCalls::new()).await),
+        Some(unavailable(UnavailableReason::AppUpgraded))
+    );
+    assert!(g.update_pending());
+
+    // Recorded once, when the holder resolved, never at a spawn: a binary replaced after that is
+    // a mismatch against the record, and nothing is spawned from it.
+    let dir = Scratch::new("fallback-replaced")?;
+    let worker = dir.file("atlas-duck-sandbox");
+    fs::write(&worker, b"worker")?;
+    let port = FakePort::new();
+    port.set_ready(BUILD_ID, conf(false, "lockdown_token"));
+    let g = glue_recording(&port, &worker, &worker, bare_report(not_met()));
+    replace(&worker)?;
+    assert_eq!(
+        start_error(g.start(spec(on()), GatedCalls::new()).await),
+        Some(unavailable(UnavailableReason::AppUpgraded))
+    );
+    assert!(g.update_pending());
+    assert!(port.seen().is_empty(), "{:?}", port.seen());
+    Ok(())
+}
+
+/// M8 T20 ruling: the holder's own record serves a degraded spawn only. Under a `Met` report
+/// without an identity every spawn is refused (fail closed) whatever the toggle says, and a
+/// record of another path than the one spawned is never used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn glue_met_report_without_probe_identity_refuses() -> TestResult {
+    bounded(met_report_without_probe_identity_refuses()).await
+}
+
+async fn met_report_without_probe_identity_refuses() -> TestResult {
+    let dir = Scratch::new("fallback-met")?;
+    let worker = dir.file("atlas-duck-sandbox");
+    fs::write(&worker, b"worker")?;
+    let port = FakePort::new();
+    port.set_ready(BUILD_ID, conf(true, "worker"));
+    let g = glue_recording(&port, &worker, &worker, bare_report(FloorVerdict::Met));
+    // Recorded (the report has no identity), and still not used.
+    assert!(
+        g.inputs
+            .probe
+            .fallback()
+            .is_some_and(|f| f.identity.is_some())
+    );
+    for policy in [on(), off()] {
+        assert!(g.confinement(policy).is_none());
+        assert_eq!(
+            g.check_available(policy).await,
+            Err(unavailable(UnavailableReason::SpawnFailed))
+        );
+        assert_eq!(
+            g.compile_check("return 1;", &ScriptLimits::default(), policy)
+                .await,
+            Err(CompileFailure::Unavailable(unavailable(
+                UnavailableReason::SpawnFailed
+            )))
+        );
+        assert_eq!(
+            start_error(g.start(spec(policy), GatedCalls::new()).await),
+            Some(unavailable(UnavailableReason::SpawnFailed))
+        );
+    }
+    assert!(port.seen().is_empty(), "{:?}", port.seen());
+
+    // `NotMet` and degraded allowed, but the record is of another path than the spawn's.
+    let other = dir.file("other-sandbox");
+    fs::write(&other, b"worker")?;
+    let port = FakePort::new();
+    port.set_ready(BUILD_ID, conf(false, "lockdown_token"));
+    let g = glue_recording(&port, &worker, &other, bare_report(not_met()));
+    assert!(g.confinement(on()).is_none());
+    assert_eq!(
+        g.check_available(on()).await,
+        Err(unavailable(UnavailableReason::SpawnFailed))
+    );
+    assert_eq!(
+        start_error(g.start(spec(on()), GatedCalls::new()).await),
+        Some(unavailable(UnavailableReason::SpawnFailed))
+    );
+    assert!(port.seen().is_empty(), "{:?}", port.seen());
+    assert!(!g.update_pending());
+    Ok(())
+}
+
+/// M8 T20 ruling: a worker binary whose identity could not be read when the holder resolved is
+/// `SpawnFailed` for every degraded spawn, also once the file is there (never read at a spawn).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn glue_fallback_identity_read_failure_refuses() -> TestResult {
+    bounded(fallback_identity_read_failure_refuses()).await
+}
+
+async fn fallback_identity_read_failure_refuses() -> TestResult {
+    let dir = Scratch::new("fallback-missing")?;
+    let worker = dir.file("atlas-duck-sandbox");
+    let port = FakePort::new();
+    port.set_ready(BUILD_ID, conf(false, "lockdown_token"));
+    let g = glue_recording(&port, &worker, &worker, bare_report(not_met()));
+    assert_eq!(
+        g.inputs.probe.fallback(),
+        Some(&FallbackIdentity {
+            worker: worker.clone(),
+            identity: None,
+        })
+    );
+    // The binary appears after the holder resolved.
+    fs::write(&worker, b"worker")?;
+    assert!(g.confinement(on()).is_none());
+    assert_eq!(
+        g.check_available(on()).await,
+        Err(unavailable(UnavailableReason::SpawnFailed))
+    );
+    assert_eq!(
+        g.compile_check("return 1;", &ScriptLimits::default(), on())
+            .await,
+        Err(CompileFailure::Unavailable(unavailable(
+            UnavailableReason::SpawnFailed
+        )))
+    );
+    assert_eq!(
+        start_error(g.start(spec(on()), GatedCalls::new()).await),
+        Some(unavailable(UnavailableReason::SpawnFailed))
+    );
+    assert!(port.seen().is_empty(), "{:?}", port.seen());
+    assert!(!g.update_pending(), "a read failure is no upgrade");
     Ok(())
 }
 

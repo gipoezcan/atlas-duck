@@ -926,7 +926,8 @@ impl ScriptErrorDetails {
 /// `SCRIPT_STARTED {source, args, limits, queued, confinement?}` (§9.1 step 2): the full source,
 /// so the log can show what ran, and (additive, PD-138) the confinement the run is admitted
 /// under when the runner states it: `{mode, worker_version, probe_report}`, where `probe_report`
-/// is the startup probe's report (the run's worker does not exist yet). It records the slot-time
+/// is the startup probe's report (the run's worker does not exist yet), `null` when no probe
+/// worker sent one (a degraded run on the app's own identity record). It records the slot-time
 /// admission: the spawn may still be narrowed by a later revocation, which a following
 /// `SCRIPT_FAILED {sandbox_unavailable, details.reason: floor_not_met}` records (see
 /// `RunConfinement`).

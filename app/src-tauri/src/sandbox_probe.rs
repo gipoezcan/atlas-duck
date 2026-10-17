@@ -11,8 +11,10 @@ use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use atlas_duck_ipc::build_info::BUILD_ID;
 use atlas_duck_ipc::paths::base_dirs;
 use atlas_duck_ipc::sandbox::probe::ProbeId;
+use atlas_duck_sandbox_host::identity::{SandboxBinaryIdentity, file_identity};
 use atlas_duck_sandbox_host::probe::{
     FloorVerdict, ProbeConfig, ProbeReport, run_probes, run_probes_with_fallback,
 };
@@ -64,29 +66,93 @@ pub enum AceEnsure {}
 /// Reading never blocks; [`ProbeHolder::wait`] awaits the report with a bound.
 #[derive(Debug)]
 pub struct ProbeHolder {
-    report: OnceLock<ProbeReport>,
-    /// Flipped to `true` right after `report` is set.
+    /// The worker binary whose identity is recorded when the report has none
+    /// ([`FallbackIdentity`]); `None`: none is recorded.
+    worker: Option<PathBuf>,
+    resolved: OnceLock<Resolved>,
+    /// Flipped to `true` right after `resolved` is set.
     ready: watch::Sender<bool>,
 }
 
-impl Default for ProbeHolder {
-    fn default() -> Self {
-        ProbeHolder {
-            report: OnceLock::new(),
-            ready: watch::channel(false).0,
+#[derive(Debug)]
+struct Resolved {
+    report: ProbeReport,
+    fallback: Option<FallbackIdentity>,
+}
+
+/// The identity of the worker binary as the app records it itself when no probe worker sent its
+/// ready frame, so the report has no identity (M8 T20 ruling; Windows below the floor): the file
+/// identity of `worker`, read once when the holder resolves (never at a spawn), and this build's
+/// `BUILD_ID` as the embedded version, which the bridge checks against each spawned worker's
+/// ready frame. Only a degraded spawn under a `NotMet` report may use it (`script_glue`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackIdentity {
+    /// The path it was read from: a spawn of any other path cannot use it.
+    pub worker: PathBuf,
+    /// `None`: the file identity could not be read (every spawn that needs it is refused).
+    pub identity: Option<SandboxBinaryIdentity>,
+}
+
+impl FallbackIdentity {
+    /// Reads `worker`'s file identity now (blocking: a `stat`, on Windows an open).
+    pub fn read(worker: &Path) -> FallbackIdentity {
+        let identity =
+            file_identity(worker)
+                .ok()
+                .map(|(file_id, size, mtime)| SandboxBinaryIdentity {
+                    file_id,
+                    size,
+                    mtime,
+                    embedded_version: BUILD_ID.to_owned(),
+                });
+        FallbackIdentity {
+            worker: worker.to_path_buf(),
+            identity,
         }
     }
 }
 
+impl Default for ProbeHolder {
+    fn default() -> Self {
+        ProbeHolder::for_worker(None)
+    }
+}
+
 impl ProbeHolder {
-    /// The report, `None` until the probe has finished.
-    pub fn get(&self) -> Option<&ProbeReport> {
-        self.report.get()
+    /// A holder that records the identity of `worker` when the report it resolves with has none
+    /// (the app passes [`canonical_worker`], the path every script spawn uses).
+    pub fn for_worker(worker: Option<PathBuf>) -> ProbeHolder {
+        ProbeHolder {
+            worker,
+            resolved: OnceLock::new(),
+            ready: watch::channel(false).0,
+        }
     }
 
-    /// Sets the report once; `false` (and the report dropped) when one was set before.
+    /// The report, `None` until the probe has finished.
+    pub fn get(&self) -> Option<&ProbeReport> {
+        self.resolved.get().map(|r| &r.report)
+    }
+
+    /// The identity recorded when the holder resolved with a report without one; `None` before,
+    /// when the report has one, or when the holder has no worker path.
+    pub fn fallback(&self) -> Option<&FallbackIdentity> {
+        self.resolved.get().and_then(|r| r.fallback.as_ref())
+    }
+
+    /// Sets the report once; `false` (and the report dropped) when one was set before. A report
+    /// without an identity gets the worker's [`FallbackIdentity`], read here, before the report
+    /// becomes visible, so a reader never sees the one without the other. Blocking (the probe
+    /// thread calls it).
     pub fn set(&self, report: ProbeReport) -> bool {
-        if self.report.set(report).is_err() {
+        if self.resolved.get().is_some() {
+            return false;
+        }
+        let fallback = match (&report.identity, &self.worker) {
+            (None, Some(worker)) => Some(FallbackIdentity::read(worker)),
+            _ => None,
+        };
+        if self.resolved.set(Resolved { report, fallback }).is_err() {
             return false;
         }
         self.ready.send_replace(true);
@@ -111,6 +177,13 @@ pub fn sandbox_worker_path(install_dir: &Path) -> PathBuf {
         "atlas-duck-sandbox{}",
         std::env::consts::EXE_SUFFIX
     ))
+}
+
+/// `<install_dir>/atlas-duck-sandbox[.exe]` of this executable: the one worker path the probe
+/// holder's fallback identity and every script spawn use (§3.4); `None` when the install dir is
+/// unknown.
+pub fn canonical_worker() -> Option<PathBuf> {
+    install_dir().ok().map(|dir| sandbox_worker_path(&dir))
 }
 
 /// The app's own install directory: the parent of the running executable.

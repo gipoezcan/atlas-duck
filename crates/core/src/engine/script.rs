@@ -183,8 +183,11 @@ pub struct RunConfinement {
     /// The embedded worker version the run expects; the bridge refuses a worker whose ready
     /// frame names another (PD-133).
     pub worker_version: String,
-    /// The startup probe's report, not the run's worker's.
-    pub probe_report: ConfinementReport,
+    /// The startup probe's report, not the run's worker's; `None` (recorded as `null`) when no
+    /// probe worker sent its ready frame and a degraded run is admitted on the identity the app
+    /// recorded itself (M8 T20 ruling): the end record's `worker_confinement` then is the only
+    /// ready-frame report of the trail.
+    pub probe_report: Option<ConfinementReport>,
 }
 
 impl RunConfinement {
