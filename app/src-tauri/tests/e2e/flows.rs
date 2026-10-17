@@ -179,6 +179,100 @@ fn jira(world: &World) -> Result<&MockDc> {
         .ok_or_else(|| "no mock for jira-main".into())
 }
 
+/// The Confluence page of the P-01 `confluence_page_5000_words` scenario, and the short one of
+/// `confluence_page_update_diff`. Neither is the fixture set's `65537`: a `MockDc` answers the first
+/// mount that matches, so the fixture's page would shadow them.
+const WIKI_BIG_PAGE: &str = "65540";
+const WIKI_SMALL_PAGE: &str = "65538";
+/// The short page's storage (version 7, like the fixture page) and the Markdown update that changes
+/// its last two paragraphs.
+const WIKI_SMALL_STORAGE: &str =
+    "<p>Check the build.</p><p>Tag the release.</p><p>Notify the team.</p>";
+const WIKI_SMALL_UPDATE: &str =
+    "Check the build.\n\nTag the release candidate.\n\nNotify the on-call team.";
+
+/// [`jira_world`] plus the Confluence instance `wiki` (P-01's two Confluence scenarios). Each
+/// product has one instance, so the CLI routes `confluence ...` to it without an alias.
+async fn jira_and_wiki_world() -> Result<World> {
+    let mut world = World::new(WorldOpts::default())?;
+    world
+        .provision_store(&[("jira-main", Product::Jira), ("wiki", Product::Confluence)])
+        .await?;
+    Ok(world)
+}
+
+fn wiki(world: &World) -> Result<&MockDc> {
+    world.mock("wiki").ok_or_else(|| "no mock for wiki".into())
+}
+
+/// The fixture page `65537` with a new id and storage body.
+fn wiki_page_json(id: &str, storage: &str) -> Result<String> {
+    let mut v: Value = serde_json::from_str(fixtures::CONFLUENCE_PAGE)?;
+    v["id"] = json!(id);
+    v["body"]["storage"]["value"] = json!(storage);
+    Ok(v.to_string())
+}
+
+/// A storage page of about 5,000 words (§1.4 SC3): per section a heading, four paragraphs and a
+/// bullet list, a table in every sixth section and a code macro in the fifth and the twelfth. From a
+/// fixed seed: no clock, no file I/O, the same page on every run.
+fn page_5000_words() -> String {
+    const WORDS: [&str; 16] = [
+        "release", "build", "deploy", "review", "branch", "merge", "check", "ticket", "owner",
+        "window", "rollback", "monitor", "notes", "stage", "signal", "report",
+    ];
+    fn words(state: &mut u32, n: usize) -> String {
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            *state ^= *state << 13;
+            *state ^= *state >> 17;
+            *state ^= *state << 5;
+            let at = usize::try_from(*state % 16).unwrap_or(0);
+            out.push(WORDS[at]);
+        }
+        out.join(" ")
+    }
+    let mut state: u32 = 0x2545_f491;
+    let mut out = String::new();
+    let mut count = 0usize;
+    let mut section = 0usize;
+    while count < 5000 {
+        section += 1;
+        out.push_str(&format!("<h2>Section {section}</h2>"));
+        for _ in 0..4 {
+            out.push_str(&format!("<p>{}.</p>", words(&mut state, 60)));
+        }
+        out.push_str("<ul>");
+        for _ in 0..5 {
+            out.push_str(&format!("<li>{}</li>", words(&mut state, 8)));
+        }
+        out.push_str("</ul>");
+        count += 2 + 4 * 60 + 5 * 8;
+        if section.is_multiple_of(6) {
+            out.push_str("<table><tbody><tr><th>step</th><th>owner</th><th>state</th></tr>");
+            for _ in 0..3 {
+                out.push_str(&format!(
+                    "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    words(&mut state, 2),
+                    words(&mut state, 1),
+                    words(&mut state, 1)
+                ));
+            }
+            out.push_str("</tbody></table>");
+            count += 15;
+        }
+        if section == 5 || section == 12 {
+            out.push_str(
+                "<ac:structured-macro ac:name=\"code\" ac:schema-version=\"1\">\
+                 <ac:parameter ac:name=\"language\">rust</ac:parameter>\
+                 <ac:plain-text-body><![CDATA[fn main() { println!(\"ok\"); }]]>\
+                 </ac:plain-text-body></ac:structured-macro>",
+            );
+        }
+    }
+    out
+}
+
 /// The three enrichment answers of a `jira.issue.create` in `ABC` with issue type `Bug`, and the
 /// approved POST's `201`.
 async fn mount_create(mock: &MockDc) {
@@ -1161,6 +1255,11 @@ async fn s08(rig: &Rig) -> Result<()> {
     );
     // None of the active content is in the rendered document: no `<link>` at all (the stylesheet is
     // inline), no `<style>` in the body.
+    //
+    // S-08 rule (M7, lead ruling Q15): this sweep opens a Jira issue and stays as it is. Any future
+    // sweep over a Confluence attachment preview allows `img[src^="data:image/"]` (the local
+    // thumbnail the card builds itself, §6.3/§6.4) and still forbids every other `img` and every
+    // other `[src]`.
     for css in [
         "link",
         "body style",
@@ -1679,8 +1778,9 @@ async fn chords(rig: &Rig) -> Result<()> {
 // ---- P-01: first screen under 1 s ----------------------------------------------------------------------
 
 /// P-01 (webview half): from the click on a row's Open to the first table row inside the preview frame
-/// is at most one second, for the three scenarios (`jira.issue.get` default, `jira.search` with 50
-/// rows, `jira.issue.create`). The number includes the driver's round trips; it is printed as
+/// is at most one second, for the five scenarios (`jira.issue.get` default, `jira.search` with 50
+/// rows, `jira.issue.create`; M7: `confluence.page.get` of a 5,000-word page and a small
+/// `confluence.page.update` diff). The number includes the driver's round trips; it is printed as
 /// `P01 <scenario> <ms>` for the evidence table. Thresholds are regression bounds: widen only with a
 /// ledger note.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1688,7 +1788,7 @@ async fn p01_first_screen_under_1s() -> Result<()> {
     if !opted_in("p01_first_screen_under_1s") {
         return Ok(());
     }
-    let world = jira_world().await?;
+    let world = jira_and_wiki_world().await?;
     // A 50-row search page: the fixture set mounted a short one first, so start the mock over.
     let mock = jira(&world)?;
     mock.server().reset().await;
@@ -1704,6 +1804,24 @@ async fn p01_first_screen_under_1s() -> Result<()> {
     )
     .await;
     mount_create(mock).await;
+    // The Confluence pages (the identity GET and the applinks answer come from the fixture set): the
+    // big one is read as Markdown, the short one is updated with `base_version` = its version (7), so
+    // the update card is one enrichment GET and a two-paragraph diff.
+    let wiki_mock = wiki(&world)?;
+    wiki_mock
+        .json(
+            &format!("/rest/api/content/{WIKI_BIG_PAGE}"),
+            200,
+            &wiki_page_json(WIKI_BIG_PAGE, &page_5000_words())?,
+        )
+        .await;
+    wiki_mock
+        .json(
+            &format!("/rest/api/content/{WIKI_SMALL_PAGE}"),
+            200,
+            &wiki_page_json(WIKI_SMALL_PAGE, WIKI_SMALL_STORAGE)?,
+        )
+        .await;
     let rig = Rig::approvals(world).await?;
     let outcome = p01(&rig).await;
     rig.finish("p01", outcome).await
@@ -1711,7 +1829,7 @@ async fn p01_first_screen_under_1s() -> Result<()> {
 
 async fn p01(rig: &Rig) -> Result<()> {
     let wd = &rig.wd;
-    let scenarios: [(&str, &str, Vec<&str>); 3] = [
+    let scenarios: [(&str, &str, Vec<&str>); 5] = [
         (
             "issue_get_default",
             "jira.issue.get",
@@ -1735,6 +1853,25 @@ async fn p01(rig: &Rig) -> Result<()> {
                 "Bug",
                 "--summary",
                 "P-01 create",
+            ],
+        ),
+        (
+            "confluence_page_5000_words",
+            "confluence.page.get",
+            vec!["confluence", "page", "get", WIKI_BIG_PAGE],
+        ),
+        (
+            "confluence_page_update_diff",
+            "confluence.page.update",
+            vec![
+                "confluence",
+                "page",
+                "update",
+                WIKI_SMALL_PAGE,
+                "--base-version",
+                "7",
+                "--body",
+                WIKI_SMALL_UPDATE,
             ],
         ),
     ];
@@ -1971,6 +2108,58 @@ mod tests {
     }
 
     #[test]
+    fn the_wiki_page_fixture_takes_a_new_id_and_storage() {
+        let text = wiki_page_json("65538", "<p>x</p>").unwrap_or_default();
+        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        assert_eq!(v["id"], "65538");
+        assert_eq!(v["body"]["storage"]["value"], "<p>x</p>");
+        // The update's base version is the fixture page's version.
+        assert_eq!(v["version"]["number"], 7);
+    }
+
+    /// The P-01 page: about 5,000 words (the words of the text nodes), two code macros, no mention
+    /// or image (the mock has no user lookup for them), the same page twice.
+    #[test]
+    fn the_5000_word_page_is_deterministic_and_has_its_shape() {
+        let page = page_5000_words();
+        assert_eq!(page, page_5000_words());
+        let mut text = String::new();
+        let mut in_tag = false;
+        for c in page.chars() {
+            match c {
+                '<' => {
+                    in_tag = true;
+                    text.push(' ');
+                }
+                '>' => in_tag = false,
+                _ if !in_tag => text.push(c),
+                _ => {}
+            }
+        }
+        let n = text.split_whitespace().count();
+        assert!((5000..5600).contains(&n), "{n} words");
+        assert_eq!(page.matches("ac:name=\"code\"").count(), 2);
+        assert!(page.contains("<table>") && page.contains("<ul>") && page.contains("<h2>"));
+        assert!(!page.contains("ri:user"));
+    }
+
+    /// The short update changes two of the page's three paragraphs and keeps the first.
+    #[test]
+    fn the_small_update_changes_two_paragraphs() {
+        let old: Vec<&str> = WIKI_SMALL_STORAGE.split("</p>").collect();
+        let new: Vec<&str> = WIKI_SMALL_UPDATE.split("\n\n").collect();
+        assert_eq!(old.len() - 1, new.len());
+        let changed = old
+            .iter()
+            .zip(&new)
+            .filter(|(o, n)| {
+                o.trim_start_matches("<p>").trim_end_matches('.') != n.trim_end_matches('.')
+            })
+            .count();
+        assert_eq!(changed, 2);
+    }
+
+    #[test]
     fn every_payload_is_markup_a_url_scheme_or_a_bidi_override() {
         for p in PAYLOADS {
             assert!(
@@ -2072,8 +2261,11 @@ mod tests {
             let guard = body.find("opted_in(").unwrap_or(usize::MAX);
             let world = body.find("World::new").unwrap_or(usize::MAX);
             let jira_world_call = body.find("jira_world().await").unwrap_or(usize::MAX);
+            let wiki_world_call = body
+                .find("jira_and_wiki_world().await")
+                .unwrap_or(usize::MAX);
             assert!(
-                guard < world.min(jira_world_call),
+                guard < world.min(jira_world_call).min(wiki_world_call),
                 "a flow builds a world before the opt-in guard: {}",
                 rest.lines().next().unwrap_or_default()
             );
