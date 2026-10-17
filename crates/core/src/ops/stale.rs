@@ -7,7 +7,9 @@ use atlas_duck_preview::invisible::escape_for_display;
 use serde_json::Value;
 
 use super::confluence::content_version;
-use super::confluence_ext::{attachment_call, listed_attachments, wants_replace};
+use super::confluence_ext::{
+    ReplaceTarget, attachment_call, listed_attachments, replace_target, wants_replace,
+};
 use super::jira::{field_values_equal, issue_fields_call, transition_calls, transition_facts};
 use super::jira_ext::{
     SPRINT_CLOSED, assignee_call, current_assignee, sprint_call, sprint_facts, sprint_open,
@@ -59,9 +61,9 @@ pub static PAGE_MOVE: StaleRule = StaleRule {
 };
 
 /// `confluence.attachment.upload` with `replace` (T20a, PD-109, §5.4 step 5 "attachment
-/// `version.number` unchanged"): the filename lookup again; exactly one attachment of exactly
-/// that name, the one enrichment found (same id), at the same version. A new attachment
-/// (`replace` absent or false) has no rule: no GET, unchanged.
+/// `version.number` unchanged"): the filename lookup again; exactly one attachment of that name
+/// (exactly, else in another case: the judge's rule), the one enrichment found (same id), at the
+/// same version. A new attachment (`replace` absent or false) has no rule: no GET, unchanged.
 pub static ATTACHMENT_REPLACE: StaleRule = StaleRule {
     plan: attachment_plan,
     judge: attachment_judge,
@@ -228,16 +230,17 @@ fn attachment_judge(ctx: &StaleCtx<'_>, responses: &[Value]) -> StaleVerdict {
     let (Some(was_id), Some(was), Some(listed)) = (was_id, was, listed) else {
         return changed(DELTA_UNREADABLE);
     };
-    let filename = str_param(ctx.params, "filename");
-    let named: Vec<_> = listed.iter().filter(|a| a.title == filename).collect();
-    match named.as_slice() {
-        [] => changed("attachment no longer present"),
-        [now] if now.id != was_id => changed("attachment replaced by another since review"),
-        [now] if now.version == was => StaleVerdict::Unchanged,
-        [now] => changed(&format!(
+    // The judge's own rule (an exact name, else the one case variant, T20a review m-1).
+    match replace_target(&listed, str_param(ctx.params, "filename")) {
+        ReplaceTarget::None => changed("attachment no longer present"),
+        ReplaceTarget::One(now) if now.id != was_id => {
+            changed("attachment replaced by another since review")
+        }
+        ReplaceTarget::One(now) if now.version == was => StaleVerdict::Unchanged,
+        ReplaceTarget::One(now) => changed(&format!(
             "attachment version changed since review (v{was} → v{})",
             now.version
         )),
-        _ => changed("more than one attachment of this name since review"),
+        ReplaceTarget::Ambiguous => changed("more than one attachment of this name since review"),
     }
 }

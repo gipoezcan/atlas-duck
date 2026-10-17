@@ -752,7 +752,8 @@ pub fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: description.map(construct_list),
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden;
+    model.header.hidden_in_preview_bytes =
+        model.header.hidden_in_preview_bytes.saturating_add(hidden);
     model
 }
 
@@ -859,7 +860,8 @@ pub fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: Some(construct_list(wiki)),
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden;
+    model.header.hidden_in_preview_bytes =
+        model.header.hidden_in_preview_bytes.saturating_add(hidden);
     model
 }
 
@@ -955,7 +957,8 @@ pub fn transition_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: comment.map(construct_list),
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden;
+    model.header.hidden_in_preview_bytes =
+        model.header.hidden_in_preview_bytes.saturating_add(hidden);
     model
 }
 
@@ -1154,7 +1157,8 @@ pub fn assign_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: None,
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden;
+    model.header.hidden_in_preview_bytes =
+        model.header.hidden_in_preview_bytes.saturating_add(hidden);
     model
 }
 
@@ -1316,7 +1320,8 @@ pub fn issuelink_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: comment.map(construct_list),
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden;
+    model.header.hidden_in_preview_bytes =
+        model.header.hidden_in_preview_bytes.saturating_add(hidden);
     model
 }
 
@@ -1756,7 +1761,11 @@ pub fn edit_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: None,
         requests,
     };
-    model.header.hidden_in_preview_bytes = diff.headings_cut.saturating_add(cut);
+    model.header.hidden_in_preview_bytes = model
+        .header
+        .hidden_in_preview_bytes
+        .saturating_add(diff.headings_cut)
+        .saturating_add(cut);
     model
 }
 
@@ -1836,7 +1845,8 @@ pub fn worklog_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: comment.map(construct_list),
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden;
+    model.header.hidden_in_preview_bytes =
+        model.header.hidden_in_preview_bytes.saturating_add(hidden);
     model
 }
 
@@ -1894,7 +1904,8 @@ pub fn move_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
             let text = line(&closed_sprint_text(&name), cap, &mut hidden);
             model.body = PreviewBody::enrichment_error(None, &text, None);
             count_card_text(&mut model, [sprint.name.as_str()]);
-            model.header.hidden_in_preview_bytes = hidden;
+            model.header.hidden_in_preview_bytes =
+                model.header.hidden_in_preview_bytes.saturating_add(hidden);
         }
         return model;
     }
@@ -1971,6 +1982,7 @@ pub fn move_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: None,
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden;
+    model.header.hidden_in_preview_bytes =
+        model.header.hidden_in_preview_bytes.saturating_add(hidden);
     model
 }

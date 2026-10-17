@@ -935,7 +935,7 @@ fn edit_card(
         constructs: Some(storage_construct_list(outgoing)),
         requests,
     };
-    model.header.hidden_in_preview_bytes = cut;
+    model.header.hidden_in_preview_bytes = model.header.hidden_in_preview_bytes.saturating_add(cut);
     model
 }
 
@@ -990,7 +990,10 @@ fn conflict_card(
         *base_to_current = to_current.lines;
         *shown_intended = intended.lines;
     }
-    model.header.hidden_in_preview_bytes = cut
+    model.header.hidden_in_preview_bytes = model
+        .header
+        .hidden_in_preview_bytes
+        .saturating_add(cut)
         .saturating_add(base_dropped.bytes)
         .saturating_add(current_dropped.bytes);
     model
@@ -1325,7 +1328,11 @@ pub(crate) fn comment_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: Some(storage_construct_list(&storage)),
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden.saturating_add(cut);
+    model.header.hidden_in_preview_bytes = model
+        .header
+        .hidden_in_preview_bytes
+        .saturating_add(hidden)
+        .saturating_add(cut);
     model
 }
 
@@ -1437,7 +1444,11 @@ pub(crate) fn create_preview(ctx: &PreviewCtx<'_>) -> PreviewModel {
         constructs: Some(storage_construct_list(storage)),
         requests,
     };
-    model.header.hidden_in_preview_bytes = hidden.saturating_add(cut);
+    model.header.hidden_in_preview_bytes = model
+        .header
+        .hidden_in_preview_bytes
+        .saturating_add(hidden)
+        .saturating_add(cut);
     model
 }
 

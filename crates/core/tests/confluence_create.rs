@@ -834,6 +834,61 @@ fn page_create_card_reads_the_sent_request() -> TestResult {
 /// T12b rules: what the render leaves out of storage the agent sends is counted and said; the
 /// server text the card shows beyond the request (space name, parent title) counts into the
 /// §6.4 header.
+/// A second request whose body is no UTF-8 and above 1 MiB: its request view is a digest line,
+/// all of it hidden (Δ2 backstop).
+fn binary_request(len: usize) -> HttpRequestSpec {
+    HttpRequestSpec {
+        index: 1,
+        method: "POST".to_owned(),
+        resolved_url: "https://wiki.example.invalid/wiki/rest/api/content".to_owned(),
+        content_type: Some("application/octet-stream".to_owned()),
+        body: vec![0xff; len],
+    }
+}
+
+/// T20a review I-1 (lead ruling): a near-limit storage body (under the 1 048 576-char `body` cap,
+/// above 1 MiB on the wire) keeps its request section as the exact text sent: the card renders
+/// only the first `PAGE_BODY_CAP` of it, so the request text is where the rest is readable. Only
+/// what the card leaves out counts as hidden, never the whole request.
+#[test]
+fn page_create_near_limit_body_keeps_its_request_text() -> TestResult {
+    // 27 chars, 47 bytes (a two-byte letter).
+    let unit = format!("<p>{}</p>", "\u{fc}".repeat(20));
+    let mut storage = unit.repeat(30_000);
+    storage.push_str("<p>tail-marker-7f3a</p>");
+    assert!(storage.chars().count() < 1_048_576, "under the param cap");
+    let mut p = params(&storage, None);
+    p["body_format"] = json!("storage");
+    let v = staged(&p, &[space_answer(SPACE), lookup(&[])])?.1;
+    let reqs = requests(&p, &v)?;
+    let wire = reqs.first().ok_or("no request")?.body.clone();
+    assert!(
+        (1024 * 1024..4 * 1024 * 1024).contains(&wire.len()),
+        "{} bytes on the wire",
+        wire.len()
+    );
+    let m = preview_of(&p, &v, &reqs)?;
+    let PreviewBody::ContentWrite { requests, .. } = &m.body else {
+        return Err(format!("not the create card: {:?}", m.body).into());
+    };
+    let [view] = requests.as_slice() else {
+        return Err("not one request".into());
+    };
+    match &view.body {
+        atlas_duck_preview::BodyView::Text(t) => {
+            assert_eq!(t.as_bytes(), wire.as_slice());
+            assert!(t.contains("tail-marker-7f3a"), "the tail is readable");
+        }
+        other => return Err(format!("the request text is gone: {other:?}").into()),
+    }
+    let hidden = m.header.hidden_in_preview_bytes;
+    assert!(
+        hidden > 0 && hidden < u64::try_from(wire.len())?,
+        "{hidden}"
+    );
+    Ok(())
+}
+
 #[test]
 fn page_create_card_counts_what_it_hides() -> TestResult {
     let mut p = params(
@@ -858,6 +913,16 @@ fn page_create_card_counts_what_it_hides() -> TestResult {
     );
     let dropped = "title=\"secret hint\"".len() + "<!-- a note for the server -->".len();
     assert_eq!(m.header.hidden_in_preview_bytes, u64::try_from(dropped)?);
+    // T20a review I-1: the card adds its count to what the request views already hide (a body
+    // shown as its digest), never overwrites it.
+    let mut reqs = requests(&p, &v)?;
+    reqs.push(binary_request(1024 * 1024 + 1));
+    let m = preview_of(&p, &v, &reqs)?;
+    assert!(matches!(m.body, PreviewBody::ContentWrite { .. }));
+    assert_eq!(
+        m.header.hidden_in_preview_bytes,
+        u64::try_from(dropped + 1024 * 1024 + 1)?
+    );
 
     // A bidi control in the parent's title (server text) is counted and shown escaped.
     let p = params("x", Some(PARENT_ID));

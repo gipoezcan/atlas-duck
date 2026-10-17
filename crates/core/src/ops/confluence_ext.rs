@@ -892,24 +892,31 @@ const ATTACHMENT_DATA_PATH: &str = "/rest/api/content/{id}/child/attachment/{att
 /// PD-109: one GET (`enrich`) lists the content's attachments of the filename with their
 /// versions. Without `replace`, an attachment of that name (exactly, or differing only in case)
 /// is the collision hold (`Hold::Collision`, Approve disabled, no deny detail applies, §7.4
-/// "attachment already exists"); with `replace`, exactly one attachment of exactly that name is
-/// the one replaced (its id and version are the stale baseline, `stale::ATTACHMENT_REPLACE`),
-/// none is `UnresolvedName {filename, 0}`. `filename` and `replace` are the params an approver
-/// edit re-enriches (`id` is the target param, read-only).
+/// "attachment already exists"); with `replace`, the one attachment of exactly that name, else
+/// the one differing only in case ([`replace_target`]), is the one replaced (its id and version
+/// are the stale baseline, `stale::ATTACHMENT_REPLACE`), none is `UnresolvedName {filename, 0}`.
+/// `filename` and `replace` are the params an approver edit re-enriches (`id` is the target
+/// param, read-only).
 pub static ATTACHMENT_ENRICH: EnrichRule = EnrichRule {
     plan: attachment_plan,
     judge: attachment_judge,
 };
 
+/// `limit` of the attachment lookup (T20a review I-3, the T19 M-5 rule): the page size is ours,
+/// not the server's default, and a full page fails closed (a match may lie beyond it).
+const ATTACHMENT_LOOKUP_LIMIT: u64 = 50;
+
 /// The lookup of the content's attachments named like the `filename` param (a query value
 /// encoded by `build_url`, never spliced into the path), with their versions.
 pub(crate) fn attachment_call(params: &Value) -> GetCall {
+    let limit = ATTACHMENT_LOOKUP_LIMIT.to_string();
     get_call(
         ATTACHMENTS_PATH,
         params,
         &[
             ("filename", str_param(params, "filename")),
             ("expand", "version"),
+            ("limit", limit.as_str()),
         ],
     )
 }
@@ -929,14 +936,24 @@ pub(crate) struct Listed {
 
 /// The attachments of a lookup answer; `None` (fail closed) when it is no list, an entry is not
 /// a current attachment with an id, a title and a version, or a further page may hold more (a
-/// collision could lie beyond it).
+/// collision could lie beyond it): `_links.next`, a `size` or `totalSize` beyond the entries
+/// listed, or a full page (the `limit` sent, or the server's own when smaller).
 pub(crate) fn listed_attachments(answer: &Value) -> Option<Vec<Listed>> {
-    if answer.pointer("/_links/next").is_some() {
+    let results = answer.get("results")?.as_array()?;
+    let count = |key: &str| answer.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let limit = answer
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(ATTACHMENT_LOOKUP_LIMIT, |l| l.min(ATTACHMENT_LOOKUP_LIMIT));
+    let shown = u64::try_from(results.len()).unwrap_or(u64::MAX);
+    if answer.pointer("/_links/next").is_some()
+        || count("size") > shown
+        || count("totalSize") > shown
+        || shown >= limit
+    {
         return None;
     }
-    answer
-        .get("results")?
-        .as_array()?
+    results
         .iter()
         .map(|a| {
             let current =
@@ -961,6 +978,38 @@ fn is_attachment_id(id: &str) -> bool {
 /// Two names Confluence may take for one attachment: equal, or equal ignoring case.
 fn same_name_any_case(a: &str, b: &str) -> bool {
     a == b || a.to_lowercase() == b.to_lowercase()
+}
+
+/// The attachment a replace of a filename targets in a lookup answer.
+pub(crate) enum ReplaceTarget<'a> {
+    None,
+    One(&'a Listed),
+    /// Two of exactly that name, or, with none exact, two that differ from it only in case.
+    Ambiguous,
+}
+
+/// The one attachment of exactly that name, else the one that differs from it only in case
+/// (T20a review m-1, lead ruling: a case-variant collision can be approved as its replace); two
+/// candidates at either step fail closed. The judge and the stale rule share it.
+pub(crate) fn replace_target<'a>(listed: &'a [Listed], filename: &str) -> ReplaceTarget<'a> {
+    fn pick<'a>(found: &[&'a Listed]) -> ReplaceTarget<'a> {
+        match found {
+            [] => ReplaceTarget::None,
+            [one] => ReplaceTarget::One(one),
+            _ => ReplaceTarget::Ambiguous,
+        }
+    }
+    let exact: Vec<&Listed> = listed.iter().filter(|a| a.title == filename).collect();
+    match pick(&exact) {
+        ReplaceTarget::None => {
+            let variants: Vec<&Listed> = listed
+                .iter()
+                .filter(|a| same_name_any_case(&a.title, filename))
+                .collect();
+            pick(&variants)
+        }
+        found => found,
+    }
 }
 
 fn attachment_plan(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichStep {
@@ -1008,26 +1057,18 @@ fn attachment_judge(ctx: &EnrichCtx<'_>, answers: &[Value]) -> EnrichVerdict {
         verdict.summary = Some(facts(existing));
         return verdict;
     }
-    match exact.as_slice() {
-        [] => unresolved(
-            "filename",
-            filename,
-            0,
-            variants
-                .iter()
-                .map(|a| capped(&a.title))
-                .take(MAX_CANDIDATES)
-                .collect(),
-        ),
-        [one] if is_attachment_id(&one.id) => {
+    match replace_target(&listed, filename) {
+        // No case variant either (one would be the target): no candidates to offer.
+        ReplaceTarget::None => unresolved("filename", filename, 0, Vec::new()),
+        ReplaceTarget::One(one) if is_attachment_id(&one.id) => {
             resolved.insert("attachment_id".to_owned(), Value::from(one.id.as_str()));
             let baseline = json!({"attachment_id": one.id, "version": one.version});
             let mut verdict = EnrichVerdict::preview(baseline, resolved);
             verdict.summary = Some(facts(Some(one)));
             verdict
         }
-        // A server id unfit for the path, or two attachments of exactly that name (which one?):
-        // fail closed.
+        // A server id unfit for the path, or two attachments of that name (which one?): fail
+        // closed.
         _ => EnrichVerdict::unusable(),
     }
 }
@@ -1039,6 +1080,37 @@ const CONTENT_BASE64: GeneralPurpose = GeneralPurpose::new(
         .with_decode_padding_mode(DecodePaddingMode::Indifferent)
         .with_decode_allow_trailing_bits(true),
 );
+
+/// T20a review I-2 (lead ruling, plan review I-4): the Request tab's copy of an upload's params,
+/// `content_base64` replaced by `{"content": null, "bytes", "sha256"}` of the decoded file (the
+/// digest line the request view shows; both `null` for content that does not decode), so the
+/// file never reaches the webview through that DTO. `None` for any other op or params without
+/// the key (shown as they are). The executor renders from the real params, and `params_sha256`
+/// covers them.
+pub(crate) fn request_tab_params(op_id: &str, params: &Value) -> Option<Value> {
+    if op_id != "confluence.attachment.upload" {
+        return None;
+    }
+    let map = params.as_object()?;
+    let decoded = map
+        .get("content_base64")?
+        .as_str()
+        .and_then(|c| CONTENT_BASE64.decode(c).ok());
+    let file = json!({
+        "content": null,
+        "bytes": decoded.as_ref().map(Vec::len),
+        "sha256": decoded.as_deref().map(|d| hex::encode(Sha256::digest(d))),
+    });
+    let shown = map.iter().map(|(k, v)| {
+        let v = if k == "content_base64" {
+            file.clone()
+        } else {
+            v.clone()
+        };
+        (k.clone(), v)
+    });
+    Some(Value::Object(shown.collect()))
+}
 
 /// PD-109: the filename goes into the part header as sent (`filename="<name>"`, UTF-8), so a
 /// double quote or a control character (CR, LF, tab, C0, DEL, C1) cannot be written there and is

@@ -687,14 +687,57 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_move() 
     Ok(())
 }
 
-/// I-26 for the attachment stale rule M7 adds (T20a, `stale::ATTACHMENT_REPLACE`): the replace's
-/// stale-check record committed, the crash comes before anything else, and the restart reconciles
-/// it as `outcome_unknown` like the update; nothing was sent before the crash.
+/// I-26 for the attachment stale rule M7 adds (T20a, `stale::ATTACHMENT_REPLACE`): the identity
+/// call's stale-check record committed, the crash comes before anything else (the rule's own
+/// lookup cannot be recorded), and the restart reconciles it as `outcome_unknown` like the update;
+/// nothing was sent before the crash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_replace() -> TestResult {
     let mut h = Harness::confluence().await?;
     let id = queued_attachment_replace(&h).await?;
     crash_after_stale_check(&mut h, &id).await?;
+    assert_listed_unknown(&h, &id, "65537").await?;
+    let t = types(&h, &id).await?;
+    assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
+    let posts = wiki(&h)?
+        .received()
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .count();
+    assert_eq!(posts, 0);
+    Ok(())
+}
+
+/// T20a review m-3: the crash after the record of the rule's own lookup (the second stale-check
+/// fetch, after the identity call) committed, before any other record; the restart reconciles it
+/// as `outcome_unknown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn i26_crash_after_attachment_lookup_is_outcome_unknown_confluence_replace() -> TestResult {
+    let mut h = Harness::confluence().await?;
+    let id = queued_attachment_replace(&h).await?;
+    let freeze = h.plan().freeze_after_nth(EventType::PREVIEW_FETCH, 2);
+    h.approver().approve(&id).map_err(de)?;
+    tripped(&freeze).await?;
+    let fetches: Vec<Value> = h
+        .events(&id)
+        .await?
+        .into_iter()
+        .filter(|(t, _)| *t == EventType::PREVIEW_FETCH)
+        .map(|(_, p)| p)
+        .collect();
+    let [.., identity, lookup] = fetches.as_slice() else {
+        return Err("fewer than two fetches".into());
+    };
+    assert_eq!(identity["purpose"], json!("stale_check"));
+    assert_eq!(lookup["purpose"], json!("stale_check"));
+    let at = lookup["path"].as_str().unwrap_or_default();
+    assert!(at.contains("/child/attachment"), "{at}");
+    assert_eq!(
+        types(&h, &id).await?.last(),
+        Some(&EventType::PREVIEW_FETCH)
+    );
+    h.crash_and_restart().await?;
     assert_listed_unknown(&h, &id, "65537").await?;
     let t = types(&h, &id).await?;
     assert!(t.ends_with(&[EventType::PREVIEW_FETCH, EventType::WRITE_OUTCOME_UNKNOWN]));
@@ -705,13 +748,16 @@ async fn i26_crash_after_stale_check_fetch_is_outcome_unknown_confluence_replace
             .map(|p| (p["request_index"].clone(), p["reason"].clone())),
         Some((json!(0), json!("crash")))
     );
+    // No record lies between this one and the send (`WRITE_APPROVED` came first), and the freeze
+    // stops appends only: the frozen core may still send the POST before the restart, which is
+    // why the restart cannot claim more than `outcome_unknown`. Never twice.
     let posts = wiki(&h)?
         .received()
         .await
         .into_iter()
         .filter(|r| r.method.as_str() == "POST")
         .count();
-    assert_eq!(posts, 0);
+    assert!(posts <= 1, "{posts} POSTs");
     Ok(())
 }
 

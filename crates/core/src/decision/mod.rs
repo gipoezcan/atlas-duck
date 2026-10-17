@@ -69,6 +69,7 @@ use crate::engine::write;
 use crate::engine::{Engine, EntryState, OnAuditFailure, RequestEntry, TransitionError};
 use crate::gate::UiEvent;
 use crate::lifecycle::model::{Event, Hold, Kind, Phase, Rejection, ReleaseItem, is_pending, step};
+use crate::ops::confluence_ext::request_tab_params;
 use crate::ops::{ExecError, MissingField, op_table};
 use crate::payloads::{self, InvalidReason, ReleasedItem, SubmittedDecision};
 use crate::redact::RedactionOp;
@@ -321,7 +322,8 @@ pub struct QueueItem {
 /// What the Approvals window's Request tab shows of a queued request (§5.6): the agent's params,
 /// their hash, the normalized reason and the connection facts. Every string that came from an
 /// agent or from the peer's process is display-escaped here (§6.4), the strings and keys of
-/// `params` included; `params` is JSON the UI renders as text. The peer facts are the OS's, not
+/// `params` included; `params` is JSON the UI renders as text (an upload's `content_base64` as
+/// its size and SHA-256, the content `null`: T20a review I-2). The peer facts are the OS's, not
 /// the agent's: the UI shows them as unverified (§3.1).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RequestDetail {
@@ -1872,7 +1874,10 @@ impl DecisionApi for CoreDecisions {
         in_queue(&self.engine, &e)?;
         let actor = &e.connection;
         Some(RequestDetail {
-            params: e.params().map_or(Value::Null, escape_json),
+            // T20a review I-2: an upload's file is its size and SHA-256 here, never its base64.
+            params: e.params().map_or(Value::Null, |p| {
+                escape_json(request_tab_params(e.spec.id, p).as_ref().unwrap_or(p))
+            }),
             params_sha256: e.params_sha256.clone(),
             reason: e.reason.as_deref().map(escape_for_display),
             submitted_at: e.submitted_at.clone(),

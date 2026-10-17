@@ -479,6 +479,23 @@ fn comment_add_card_counts_what_the_render_drops() -> TestResult {
     // The attribute from its name to the end of its value, and the whole comment (T12b rules).
     let dropped = "title=\"secret hint\"".len() + "<!-- a note for the server -->".len();
     assert_eq!(m.header.hidden_in_preview_bytes, u64::try_from(dropped)?);
+    // T20a review I-1: the card adds its count to what the request views already hide (a second
+    // request, no UTF-8 and above 1 MiB, is shown as its digest), never overwrites it.
+    let extra = 1024 * 1024 + 1;
+    let mut reqs = reqs;
+    reqs.push(HttpRequestSpec {
+        index: 1,
+        method: "POST".to_owned(),
+        resolved_url: "https://wiki.example.invalid/wiki/rest/api/content".to_owned(),
+        content_type: Some("application/octet-stream".to_owned()),
+        body: vec![0xff; extra],
+    });
+    let m = preview_of(&p, &v, &reqs)?;
+    assert!(matches!(m.body, PreviewBody::ContentWrite { .. }));
+    assert_eq!(
+        m.header.hidden_in_preview_bytes,
+        u64::try_from(dropped + extra)?
+    );
     Ok(())
 }
 

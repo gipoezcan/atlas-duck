@@ -1001,7 +1001,10 @@ fn write_model(ctx: &PreviewCtx<'_>, view: &WriteView<'_>) -> PreviewModel {
 /// most this many bytes and no file part; otherwise its one size and SHA-256 line stands for it.
 const PART_SHOWN_MAX_BYTES: usize = 4 * 1024;
 
-/// M7 Δ2 backstop: any other request body above this size is shown as its size and SHA-256 only.
+/// M7 Δ2 backstop (lead ruling on T20a review I-1): a body that is no UTF-8 and above this size
+/// is shown as its size and SHA-256 only, never as base64. A UTF-8 body is text at any size (the
+/// renderer caps it and counts the cut): `page.create`/`page.update` bodies cross 1 MiB below
+/// their param cap, and the request text is their only verbatim view.
 const BODY_SHOWN_MAX_BYTES: usize = 1024 * 1024;
 
 /// The view of one request (§5.4 step 4, M7 Δ2, plan review I-4) and the bytes of its body the
@@ -1009,7 +1012,7 @@ const BODY_SHOWN_MAX_BYTES: usize = 1024 * 1024;
 /// the text envelope as sent (boundary lines, part headers, the parts that are UTF-8 and at most
 /// [`PART_SHOWN_MAX_BYTES`]) with every file part, and every other part, replaced by
 /// [`body_digest_line`]: the preview never carries a file. A multipart body that does not split
-/// exactly into its parts, and any other body above [`BODY_SHOWN_MAX_BYTES`], is a
+/// exactly into its parts, and a body that is no UTF-8 and above [`BODY_SHOWN_MAX_BYTES`], is a
 /// [`BodyView::Digest`] (fail closed: never text, never base64). Anything else is the UTF-8 text,
 /// or base64. `WRITE_APPROVED` and `request_set_hash` still cover the real bytes.
 fn request_view(r: &HttpRequestSpec) -> (RequestView, u64) {
@@ -1045,16 +1048,22 @@ fn body_view(r: &HttpRequestSpec) -> (BodyView, u64) {
             None => digest(),
         };
     }
-    if r.body.len() > BODY_SHOWN_MAX_BYTES {
-        return digest();
-    }
     match std::str::from_utf8(&r.body) {
         Ok(text) => (BodyView::Text(text.to_owned()), 0),
+        Err(_) if r.body.len() > BODY_SHOWN_MAX_BYTES => digest(),
         Err(_) => (
             BodyView::Base64(base64::engine::general_purpose::STANDARD.encode(&r.body)),
             0,
         ),
     }
+}
+
+/// A body the request view does not show as sent (a multipart body, or one that is no UTF-8 and
+/// above [`BODY_SHOWN_MAX_BYTES`]): the Raw tab names its size and SHA-256 too, never its base64
+/// (PD-109, T20a review I-2).
+pub(crate) fn body_shown_as_digest(r: &HttpRequestSpec) -> bool {
+    r.content_type.as_deref().is_some_and(is_multipart)
+        || (r.body.len() > BODY_SHOWN_MAX_BYTES && std::str::from_utf8(&r.body).is_err())
 }
 
 fn len_u64(n: usize) -> u64 {

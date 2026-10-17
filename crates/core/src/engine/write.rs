@@ -67,7 +67,7 @@ use crate::lifecycle::model::{
     is_pending, step,
 };
 use crate::metadata::one_line;
-use crate::ops::generic::write_preview;
+use crate::ops::generic::{self, write_preview};
 use crate::ops::{
     EnrichFailure, EnrichRule, EnrichVerdict, ExecError, ExecPlan, MissingField, PreviewCtx,
     PreviewInput, PreviewModel, StaleCtx, StaleVerdict, WriteView, op_table,
@@ -241,9 +241,41 @@ pub fn list_hash(requests: &[HttpRequestSpec]) -> [u8; 32] {
 }
 
 /// Plan decision: the Raw tab of a write shows the request list exactly as `WRITE_APPROVED`
-/// stores it (`requests_to_json`: index, method, URL, content type, base64 body).
+/// stores it (`requests_to_json`: index, method, URL, content type, base64 body). PD-109 (T20a
+/// review I-2, lead ruling): a body the request view shows as a digest (a multipart file upload,
+/// `generic::body_shown_as_digest`) is named by its hashes only: `body_b64` is `null` beside
+/// `body_bytes` and `body_sha256`, and the list is wrapped as `{request_set_hash, requests}`, so
+/// no base64 of a file reaches the webview through Raw.
 pub fn raw_bytes(requests: &[HttpRequestSpec]) -> Vec<u8> {
-    serde_json::to_vec(&requests_to_json(&records(requests))).unwrap_or_default()
+    if !requests.iter().any(generic::body_shown_as_digest) {
+        return serde_json::to_vec(&requests_to_json(&records(requests))).unwrap_or_default();
+    }
+    let shown: Vec<Value> = requests
+        .iter()
+        .map(|r| {
+            if generic::body_shown_as_digest(r) {
+                json!({
+                    "index": r.index,
+                    "method": r.method,
+                    "url": r.resolved_url,
+                    "content_type": r.content_type,
+                    "body_b64": null,
+                    "body_bytes": r.body.len(),
+                    "body_sha256": payloads::sha256_hex(&r.body),
+                })
+            } else {
+                match requests_to_json(&records(std::slice::from_ref(r))) {
+                    Value::Array(mut one) => one.pop().unwrap_or_default(),
+                    other => other,
+                }
+            }
+        })
+        .collect();
+    let raw = json!({
+        "request_set_hash": hex::encode(list_hash(requests)),
+        "requests": shown,
+    });
+    serde_json::to_vec(&raw).unwrap_or_default()
 }
 
 /// The registry's declared success (§7.2) as the client takes it.

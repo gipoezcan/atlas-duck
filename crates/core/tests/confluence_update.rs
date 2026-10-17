@@ -494,6 +494,52 @@ fn conflict_card_counts_what_it_hides_of_the_server_bodies() -> TestResult {
     Ok(())
 }
 
+/// T20a review I-1: the edit and conflict cards add their counts to what the request views
+/// already hide (a body shown as its digest: here a second request, no UTF-8, above 1 MiB),
+/// never overwrite it.
+#[test]
+fn update_cards_add_to_what_the_request_views_hide() -> TestResult {
+    let extra = 1024 * 1024 + 1;
+    let binary = HttpRequestSpec {
+        index: 1,
+        method: "POST".to_owned(),
+        resolved_url: "https://wiki.example.invalid/wiki/rest/api/content".to_owned(),
+        content_type: Some("application/octet-stream".to_owned()),
+        body: vec![0xff; extra],
+    };
+    let edit = params(7, "<p>a</p><p>b</p>", Some("storage"));
+    let conflict = params(5, "<p>a</p>", Some("storage"));
+    for (p, answers) in [
+        (edit, vec![page(7, "<p>a<!-- note --></p>")]),
+        (
+            conflict,
+            vec![
+                page(6, "<p title=\"hover\">a</p>"),
+                historical(5, "<p>a<!-- note --></p>"),
+            ],
+        ),
+    ] {
+        let (v, plain) = preview(&p, &answers)?;
+        let mut reqs = requests(&p, &v)?;
+        reqs.push(binary.clone());
+        let m = preview_of(&p, &v, &reqs, None)?;
+        assert_eq!(
+            std::mem::discriminant(&m.body),
+            std::mem::discriminant(&plain.body),
+            "the same card"
+        );
+        assert!(matches!(
+            m.body,
+            PreviewBody::EditDiff { .. } | PreviewBody::Conflict { .. }
+        ));
+        assert_eq!(
+            m.header.hidden_in_preview_bytes,
+            plain.header.hidden_in_preview_bytes + extra as u64
+        );
+    }
+    Ok(())
+}
+
 // ---- the edit preview (pure) --------------------------------------------------------------------
 
 /// PD-104: the rendered diff over the Markdown projections of the current and the sent storage,

@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -223,6 +223,8 @@ pub enum ReadFault {
 #[derive(Debug)]
 pub struct Freeze {
     after: EventType,
+    /// Committed appends of `after` still to let through before the one that trips it.
+    skip: AtomicU32,
     tripped: AtomicBool,
     notify: tokio::sync::Notify,
 }
@@ -311,8 +313,15 @@ impl FaultPlan {
     /// [`Freeze`]). Arm it when the test has reached the state it wants to crash in: an earlier
     /// append of the same type would trip it first.
     pub fn freeze_after(&self, t: EventType) -> Arc<Freeze> {
+        self.freeze_after_nth(t, 1)
+    }
+
+    /// Like [`Self::freeze_after`], but the `n`-th (1-based) committed append of `t` from now on
+    /// trips it (T20a review m-3: the second fetch of a stale check, not its identity call).
+    pub fn freeze_after_nth(&self, t: EventType, n: u32) -> Arc<Freeze> {
         let f = Arc::new(Freeze {
             after: t,
+            skip: AtomicU32::new(n.saturating_sub(1)),
             tripped: AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         });
@@ -456,12 +465,19 @@ impl FaultyAudit {
         Ok(())
     }
 
-    /// After a commit of `types`: trips the armed freeze if one of them is its type.
+    /// After a commit of `types`: trips the armed freeze if one of them is its type and no
+    /// appends of it are left to skip.
     fn after_commit(&self, types: &[EventType]) {
         let mut armed = lock(&self.plan.freeze);
-        if armed.as_ref().is_some_and(|f| types.contains(&f.after))
-            && let Some(f) = armed.take()
-        {
+        let due = armed.as_ref().is_some_and(|f| {
+            let n = types.iter().filter(|t| **t == f.after).count();
+            let n = u32::try_from(n).unwrap_or(u32::MAX);
+            n > 0
+                && f.skip
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| s.checked_sub(n))
+                    .is_err()
+        });
+        if due && let Some(f) = armed.take() {
             self.dead.store(true, Ordering::SeqCst);
             f.tripped.store(true, Ordering::SeqCst);
             f.notify.notify_one();

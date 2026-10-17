@@ -23,7 +23,9 @@ use atlas_duck_core::ops::{
 };
 use atlas_duck_core::payloads::InvalidReason;
 use atlas_duck_core::testing::Harness;
-use atlas_duck_core::{BatchFailure, BatchItem, DecisionError, DecisionOutcome, DenyDetails};
+use atlas_duck_core::{
+    BatchFailure, BatchItem, DecisionError, DecisionOutcome, DenyDetails, Edits,
+};
 use atlas_duck_ipc::envelope::{ErrorCode, Status};
 use atlas_duck_preview::{BodyView, Platform, PreviewBody, WarningId, body_digest_line, render};
 use base64::Engine as _;
@@ -298,9 +300,14 @@ fn upload_lookup_plan_is_one_filename_get() -> TestResult {
     );
     assert_eq!(call.params, json!({"id": PAGE_ID}));
     // The filename is a query value (encoded by `build_url`), never spliced into the path.
+    // An explicit page size (T20a review I-3): a full page fails closed below.
     assert_eq!(
         query(call),
-        [("filename", "Bericht ü&x.pdf"), ("expand", "version")]
+        [
+            ("filename", "Bericht ü&x.pdf"),
+            ("expand", "version"),
+            ("limit", "50")
+        ]
     );
     // The edits that re-run it: the filename and `replace` (PD-109); `id` is the target.
     let imp = op_table().get(UPLOAD).ok_or("no OpImpl")?;
@@ -333,14 +340,31 @@ fn upload_collision_judge() -> TestResult {
     let v = verdict(&p, &[])?;
     assert_eq!(v.hold, Hold::Preview, "{v:?}");
     // An answer the judge cannot use fails closed.
+    let mut historical = attachment(ATT_ID, FILENAME, 2);
+    historical["status"] = json!("historical");
+    let mut not_attachment = attachment(ATT_ID, FILENAME, 2);
+    not_attachment["type"] = json!("page");
+    let full_page: Vec<Value> = (0..50)
+        .map(|n| attachment(&format!("att{n}"), &format!("other{n}.txt"), 1))
+        .collect();
     for bad in [
         json!({"size": 0}),
         json!({"results": "x"}),
         json!({"results": [{"title": FILENAME}]}),
         json!({"results": [{"id": ATT_ID, "type": "attachment", "status": "current",
                             "title": FILENAME}]}),
+        // Complete entries that are no current attachment (T20a review m-2).
+        lookup(&[historical]),
+        lookup(&[not_attachment]),
         // A further page that may hold the collision.
         json!({"results": [], "_links": {"next": "/rest/api/content/65537/child/attachment?start=50"}}),
+        // A full page (the `limit` sent, or the server's own), or a count beyond what is listed
+        // (T20a review I-3, the T19 M-5 rule).
+        lookup(&full_page),
+        json!({"results": full_page, "start": 0, "limit": 200, "size": 50}),
+        json!({"results": [attachment("att9", "other.txt", 1)], "start": 0, "limit": 1, "size": 1}),
+        json!({"results": [], "start": 0, "limit": 50, "size": 1}),
+        json!({"results": [], "start": 0, "limit": 50, "size": 0, "totalSize": 3}),
     ] {
         let v = staged(&p, std::slice::from_ref(&bad))?.1;
         assert_eq!(v.hold, Hold::EnrichmentError, "{bad}");
@@ -681,8 +705,10 @@ fn no_file_bytes(s: &str, content: &[u8]) -> TestResult {
     Ok(())
 }
 
-/// Δ2 backstop: any other body above 1 MiB is shown as its size and digest only; a malformed
-/// multipart body is too (fail closed: never shown as text, never as base64).
+/// Δ2 backstop (lead ruling on T20a review I-1): a body that is no UTF-8 and above 1 MiB is shown
+/// as its size and digest only, a smaller one as base64; a UTF-8 body is text at any size (the
+/// renderer caps it and counts the cut); a malformed multipart body is a digest (fail closed:
+/// never shown as text, never as base64).
 #[test]
 fn request_view_digest_backstop() -> TestResult {
     let p = params(FILENAME, TEXT, false, None);
@@ -695,15 +721,21 @@ fn request_view_digest_backstop() -> TestResult {
         body,
     };
     let mib = 1024 * 1024;
-    let at_cap = format!("\"{}\"", "a".repeat(mib - 2)).into_bytes();
-    let over = format!("\"{}\"", "a".repeat(mib - 1)).into_bytes();
+    let over = format!("\"{}\"", "a".repeat(mib)).into_bytes();
+    let binary_at_cap = vec![0xff_u8; mib];
+    let binary_over = vec![0xff_u8; mib + 1];
     let malformed = b"--atlas-duck-x\r\nno header end".to_vec();
     let cases = [
-        (request("application/json", at_cap.clone()), None, 0),
+        (request("application/json", over.clone()), None, 0),
         (
-            request("application/json", over.clone()),
-            Some((over.len() as u64, sha256_hex(&over))),
-            over.len() as u64,
+            request("application/octet-stream", binary_at_cap.clone()),
+            None,
+            0,
+        ),
+        (
+            request("application/octet-stream", binary_over.clone()),
+            Some((binary_over.len() as u64, sha256_hex(&binary_over))),
+            binary_over.len() as u64,
         ),
         (
             request(
@@ -728,10 +760,37 @@ fn request_view_digest_backstop() -> TestResult {
             (BodyView::Digest { bytes, sha256 }, Some((b, h))) => {
                 assert_eq!((*bytes, sha256.as_str()), (b, h.as_str()));
             }
-            (BodyView::Text(t), None) => assert_eq!(t.len(), mib),
+            (BodyView::Text(t), None) => assert_eq!(t.as_bytes(), over.as_slice()),
+            (BodyView::Base64(b), None) => assert_eq!(STANDARD.decode(b)?, binary_at_cap),
             (other, want) => return Err(format!("{other:?} for {want:?}").into()),
         }
         assert_eq!(m.header.hidden_in_preview_bytes, hidden);
+    }
+    Ok(())
+}
+
+/// Design choice 4 (T20a review m-2): the §6.4 counts run over each multipart part, so a bidi
+/// control in the filename or the comment is counted beside a binary file (the whole body is no
+/// UTF-8 and would count nothing).
+#[test]
+fn bidi_in_multipart_parts_is_counted_beside_a_binary_file() -> TestResult {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend([0xff, 0xfe, 0x00, 0x01]);
+    for (filename, comment) in [
+        ("a\u{202E}b.png", None),
+        ("plain.png", Some("see \u{202E}here")),
+    ] {
+        let p = params(filename, &png, false, comment);
+        let v = verdict(&p, &[])?;
+        let r = one_request(&p, &v)?;
+        assert!(std::str::from_utf8(&r.body).is_err(), "a binary body");
+        let m = preview_of(&p, &v, std::slice::from_ref(&r))?;
+        assert_eq!(m.header.bidi_controls, 1, "{filename:?} {comment:?}");
+        assert!(
+            m.warnings.iter().any(|w| w.id == WarningId::BidiControls),
+            "{:?}",
+            m.warnings
+        );
     }
     Ok(())
 }
@@ -936,32 +995,110 @@ async fn upload_replace_uses_attachment_id_data_endpoint() -> TestResult {
     assert_eq!(
         lookups,
         [
-            Some("filename=notes.txt&expand=version".to_owned()),
-            Some("filename=notes.txt&expand=version".to_owned())
+            Some("filename=notes.txt&expand=version&limit=50".to_owned()),
+            Some("filename=notes.txt&expand=version&limit=50".to_owned())
         ]
     );
     Ok(())
 }
 
-/// PD-109: `replace` without an attachment of exactly that name is `UnresolvedName {filename, 0}`
-/// (a case variant is its candidate); the deny hint says "no attachment '<v>' on content <id>".
+/// T20a review m-1 (lead ruling): with `replace`, no attachment of exactly that name but exactly
+/// one that differs only in case is the one replaced (an approver can pick `replace` on a
+/// case-variant collision); two such fail closed; an exact match wins over a case variant.
+#[test]
+fn upload_replace_resolves_one_case_variant() -> TestResult {
+    let p = params(FILENAME, TEXT, true, None);
+    let v = verdict(&p, &[attachment(ATT_ID, "Notes.TXT", 2)])?;
+    assert_eq!(v.hold, Hold::Preview, "{v:?}");
+    assert_eq!(v.baseline, json!({"attachment_id": ATT_ID, "version": 2}));
+    let r = one_request(&p, &v)?;
+    assert_eq!(
+        r.resolved_url,
+        "https://wiki.example.invalid/wiki/rest/api/content/65537/child/attachment/att3001/data"
+    );
+    let v = verdict(
+        &p,
+        &[
+            attachment(ATT_ID, "Notes.TXT", 2),
+            attachment("att3009", "NOTES.txt", 1),
+        ],
+    )?;
+    assert_eq!(v.hold, Hold::EnrichmentError, "two case variants");
+    let v = verdict(
+        &p,
+        &[
+            attachment("att3009", "Notes.TXT", 1),
+            attachment(ATT_ID, FILENAME, 2),
+        ],
+    )?;
+    assert_eq!(v.hold, Hold::Preview, "{v:?}");
+    assert_eq!(v.baseline, json!({"attachment_id": ATT_ID, "version": 2}));
+    Ok(())
+}
+
+/// Report choice 15 / T20a review m-1: the approver's way out of a collision is to edit
+/// `replace: true`. The edit re-runs the lookup, the existing attachment (here one that differs
+/// only in case) becomes the one replaced, and the request is approvable after it is opened; the
+/// stale check finds the same attachment and the bytes go to its `/data` endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collision_way_out_is_an_edit_to_replace() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[attachment(ATT_ID, "Notes.TXT", 2)]).await;
+    let id = queued(&h, params(FILENAME, TEXT, false, Some(COMMENT))).await?;
+    assert!(!h.approver().open(&id).map_err(de)?.preview.approvable);
+    let rev = h.approver().rev(&id).map_err(de)?.counter;
+    let mut set = serde_json::Map::new();
+    set.insert("replace".into(), json!(true));
+    h.approver()
+        .edit(
+            &id,
+            Edits {
+                set,
+                remove: Vec::new(),
+            },
+        )
+        .map_err(de)?;
+    assert!(item_after(&h, &id, rev).await?.approvable);
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert!(preview.approvable);
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 10_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let posts = requests_with(mock, "POST").await;
+    let [sent] = posts.as_slice() else {
+        return Err(format!("{} POSTs", posts.len()).into());
+    };
+    assert_eq!(sent.url.path(), mock.path(DATA_PATH));
+    assert_eq!(
+        purposes(&h, &id).await?,
+        [
+            json!("enrich"),
+            json!("enrich"),
+            json!("stale_check"),
+            json!("stale_check")
+        ]
+    );
+    Ok(())
+}
+
+/// PD-109: `replace` without an attachment of that name (exactly or in another case, see
+/// `upload_replace_resolves_one_case_variant`) is `UnresolvedName {filename, 0}`; the deny hint
+/// says "no attachment '<v>' on content <id>".
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_replace_without_existing_is_unresolved() -> TestResult {
     let p = params(FILENAME, TEXT, true, None);
     let v = verdict(&p, &[])?;
     assert_eq!(v.hold, Hold::UnresolvedName);
     assert_eq!(unresolved_of(&v), Some(("filename", FILENAME, 0, vec![])));
-    let v = verdict(&p, &[attachment(ATT_ID, "Notes.txt", 2)])?;
-    assert_eq!(
-        unresolved_of(&v),
-        Some(("filename", FILENAME, 0, vec!["Notes.txt"]))
-    );
+    let v = verdict(&p, &[attachment(ATT_ID, "other.txt", 2)])?;
+    assert_eq!(unresolved_of(&v), Some(("filename", FILENAME, 0, vec![])));
     assert_eq!(exec(&p, Some(&v)), Err(ExecError::EnrichmentRequired));
 
     for ticked in [false, true] {
         let h = Harness::confluence().await?;
         let mock = wiki(&h)?;
-        upload_server(mock, &[attachment(ATT_ID, "Notes.txt", 2)]).await;
+        upload_server(mock, &[attachment(ATT_ID, "other.txt", 2)]).await;
         let id = queued(&h, p.clone()).await?;
         let preview = h.approver().open(&id).map_err(de)?.preview;
         assert!(!preview.approvable);
@@ -985,7 +1122,7 @@ async fn upload_replace_without_existing_is_unresolved() -> TestResult {
             json!("no attachment 'notes.txt' on content 65537")
         );
         if ticked {
-            assert_eq!(detail(&env, "candidates"), json!(["Notes.txt"]));
+            assert_eq!(detail(&env, "candidates"), json!([]));
         } else {
             assert_eq!(detail(&env, "candidates"), Value::Null);
         }
@@ -1013,7 +1150,14 @@ fn upload_replace_stale_rule() -> TestResult {
         "/rest/api/content/{id}/child/attachment"
     );
     assert_eq!(call.params, json!({"id": PAGE_ID}));
-    assert_eq!(query(call), [("filename", FILENAME), ("expand", "version")]);
+    assert_eq!(
+        query(call),
+        [
+            ("filename", FILENAME),
+            ("expand", "version"),
+            ("limit", "50")
+        ]
+    );
     let changed = |answer: Value| -> Result<String, TestError> {
         match stale(&p, &base, &[answer])?.1 {
             StaleVerdict::Changed { delta } => Ok(delta),
@@ -1032,6 +1176,29 @@ fn upload_replace_stale_rule() -> TestResult {
     assert_eq!(
         changed(json!({"size": 1}))?,
         "the target could not be re-read"
+    );
+    // T20a review m-2: two attachments of that name now (which one would the bytes replace?).
+    assert_eq!(
+        changed(lookup(&[
+            attachment(ATT_ID, FILENAME, 2),
+            attachment("att3009", FILENAME, 2)
+        ]))?,
+        "more than one attachment of this name since review"
+    );
+    // T20a review I-3: a full page may hide a second one: unreadable.
+    let full_page: Vec<Value> = std::iter::once(attachment(ATT_ID, FILENAME, 2))
+        .chain((1..50).map(|n| attachment(&format!("att{n}"), &format!("other{n}.txt"), 1)))
+        .collect();
+    assert_eq!(
+        changed(lookup(&full_page))?,
+        "the target could not be re-read"
+    );
+    // T20a review m-1: the replace of the one case variant re-reads it under the same rule.
+    let (_, verdict) = stale(&p, &base, &[lookup(&[attachment(ATT_ID, "Notes.TXT", 2)])])?;
+    assert_eq!(verdict, StaleVerdict::Unchanged);
+    assert_eq!(
+        changed(lookup(&[attachment(ATT_ID, "Notes.TXT", 3)]))?,
+        "attachment version changed since review (v2 → v3)"
     );
     // A baseline without the attachment fails closed.
     match stale(
@@ -1166,6 +1333,74 @@ async fn upload_over_10mib_rejected_exit2() -> TestResult {
     upload_server(mock, &[]).await;
     let at_cap = vec![b'A'; 10 * 1024 * 1024];
     queued(&h, params(FILENAME, &at_cap, false, None)).await?;
+    Ok(())
+}
+
+/// Plan review I-4 / T20a review I-2 (lead ruling): a 10 MiB upload puts the file into neither
+/// the Request tab's params (`content_base64` is its size and SHA-256, the content `null`) nor
+/// the Raw pages (PD-109: Raw names the hashes, never a base64 of the body); the executor still
+/// sends the real bytes, and Raw's hashes are the ones `WRITE_APPROVED` and the wire carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_tab_and_raw_never_carry_the_file_10mib() -> TestResult {
+    let h = Harness::confluence().await?;
+    let mock = wiki(&h)?;
+    upload_server(mock, &[]).await;
+    let content: Vec<u8> = (0..10 * 1024 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let id = queued(&h, params(FILENAME, &content, false, Some(COMMENT))).await?;
+
+    let detail = h
+        .decisions()
+        .request_detail(&id)
+        .ok_or("no request detail")?;
+    let serialized = serde_json::to_string(&detail)?;
+    assert!(serialized.len() < 4096, "{} bytes", serialized.len());
+    no_file_bytes(&serialized, &content)?;
+    assert_eq!(
+        detail.params["content_base64"],
+        json!({"content": null, "bytes": content.len(), "sha256": sha256_hex(&content)})
+    );
+    assert_eq!(detail.params["filename"], json!(FILENAME));
+    assert_eq!(detail.params["comment"], json!(COMMENT));
+
+    let preview = h.approver().open(&id).map_err(de)?.preview;
+    assert!(
+        preview.raw.total_bytes < 4096,
+        "{} bytes",
+        preview.raw.total_bytes
+    );
+    let rev = h.approver().rev(&id).map_err(de)?;
+    let mut raw = Vec::new();
+    for page in 0..preview.raw.page_count {
+        raw.extend(h.decisions().raw_page(&id, rev, page).map_err(de)?.bytes);
+    }
+    no_file_bytes(&String::from_utf8(raw.clone())?, &content)?;
+    let raw: Value = serde_json::from_slice(&raw)?;
+    let shown = &raw["requests"][0];
+    assert_eq!(shown["body_b64"], Value::Null, "{raw}");
+
+    h.approver().approve(&id).map_err(de)?;
+    let env = h.await_(&id, 20_000).await;
+    assert_eq!(env.status, Status::Succeeded, "{}", env.to_json_line());
+    let posts = requests_with(mock, "POST").await;
+    let [sent] = posts.as_slice() else {
+        return Err(format!("{} POSTs", posts.len()).into());
+    };
+    let boundary = sent
+        .headers
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|ct| ct.strip_prefix("multipart/form-data; boundary="))
+        .ok_or("no multipart content type")?;
+    assert_eq!(parts(&sent.body, boundary)?[0].1, content, "the real bytes");
+    assert_eq!(shown["body_bytes"], json!(sent.body.len()));
+    assert_eq!(shown["body_sha256"], json!(sha256_hex(&sent.body)));
+    let approved = records_of(&h, &id, EventType::WRITE_APPROVED).await?;
+    let [approved] = approved.as_slice() else {
+        return Err("not one WRITE_APPROVED".into());
+    };
+    assert_eq!(raw["request_set_hash"], approved["request_set_hash"]);
     Ok(())
 }
 
