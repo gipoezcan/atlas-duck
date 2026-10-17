@@ -126,6 +126,9 @@ struct Inner {
     plans: VecDeque<ScriptPlan>,
     /// Plans that compiled, waiting for `start`.
     compiled: VecDeque<ScriptPlan>,
+    /// The startup probe said `NotMet` (PD-141): `start` refuses with `FloorNotMet` unless its
+    /// policy allows degraded confinement.
+    degraded_only: bool,
     compile_checks: u32,
     starts: u32,
     specs: Vec<RunSpec>,
@@ -169,6 +172,12 @@ impl FakeScriptRunner {
     /// Makes every later `start` fail with `err`.
     pub fn fail_start(&self, err: RunnerError) {
         self.lock().start_error = Some(err);
+    }
+
+    /// Every later `start` spawns only under a policy that allows degraded confinement, else it
+    /// answers `FloorNotMet` (a probe-time `NotMet`, PD-141; the spawn is where the glue reads it).
+    pub fn require_degraded(&self) {
+        self.lock().degraded_only = true;
     }
 
     /// Makes every later `check_available` fail with `err`.
@@ -280,6 +289,11 @@ impl ScriptRunner for FakeScriptRunner {
             g.specs.push(run.clone());
             if let Some(e) = g.start_error {
                 return Err(e);
+            }
+            if g.degraded_only && !run.policy.allow_degraded {
+                return Err(RunnerError::SandboxUnavailable {
+                    reason: crate::engine::script::UnavailableReason::FloorNotMet,
+                });
             }
             // A run that never had a compile check (a dry run of a runner without plans).
             let plan = g

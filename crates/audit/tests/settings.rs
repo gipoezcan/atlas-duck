@@ -760,6 +760,9 @@ fn unreadable_settings_row_blocks_prune_and_changes() {
     store
         .apply_setting(origin("i1", Some("https://a.example")), Some(confirmed()))
         .expect("origin");
+    store
+        .apply_setting(SettingChange::AllowDegradedScripts(true), Some(confirmed()))
+        .expect("degraded");
     let c = store
         .apply_setting(SettingChange::LegalHold(true), None)
         .expect("hold");
@@ -778,6 +781,8 @@ fn unreadable_settings_row_blocks_prune_and_changes() {
     assert!(store.health().settings_unreadable);
     // Instance policy is withheld while the view is untrusted: nothing counts as confirmed.
     assert!(store.settings().instances.is_empty());
+    // And no security-weakening grant is read from it (PD-141): degraded scripts are off.
+    assert!(!store.settings().allow_degraded_scripts);
     assert!(store.prune(None).is_err());
     assert!(
         store
@@ -785,4 +790,226 @@ fn unreadable_settings_row_blocks_prune_and_changes() {
             .is_err()
     );
     assert!(store.reconcile_config_file(&FilePolicy::default()).is_err());
+}
+
+// ---- M8 Task 15: "Allow scripts with degraded confinement" (PD-141, Δ7) -------------------
+
+/// The `PRUNE` settings snapshots as M2..M7 wrote them (JCS of `Settings::to_json`), pinned as
+/// bytes: a store with the toggle off keeps writing exactly these.
+const PRE_M8_DEFAULT: &str =
+    r#"{"anchor_dir":null,"instances":{},"legal_hold":false,"retention_days":100}"#;
+const PRE_M8_FULL: &str = r#"{"anchor_dir":"D:/anchors","instances":{"i1":{"ca_fingerprint":null,"origin":"https://jira.example","proxy":"direct"}},"legal_hold":true,"retention_days":150}"#;
+
+fn jcs(v: &Value) -> String {
+    String::from_utf8(atlas_duck_ipc::jcs::to_jcs_vec(v).expect("jcs")).expect("utf-8")
+}
+
+/// The `settings` snapshot of the latest `PRUNE`.
+fn prune_snapshot(store: &Store, f: &Fixture) -> Value {
+    let prune = seqs(f, EventType::PRUNE).pop().expect("a PRUNE");
+    payload(store, prune)["settings"].clone()
+}
+
+fn full_settings() -> Settings {
+    let mut v = Settings {
+        retention_days: 150,
+        legal_hold: true,
+        anchor_dir: s("D:/anchors"),
+        ..Settings::default()
+    };
+    v.instances.insert(
+        "i1".into(),
+        InstancePolicy {
+            origin: s("https://jira.example"),
+            ca_fingerprint: None,
+            proxy: s("direct"),
+        },
+    );
+    v
+}
+
+#[test]
+fn allow_degraded_scripts_setting_round_trip_and_prune_snapshot() {
+    let (store, f) = reconciled();
+    assert!(!store.settings().allow_degraded_scripts, "absent = off");
+    // Turning it on is security-weakening (§10.3): refused without the confirmation.
+    needs_confirmation(
+        &store,
+        SettingChange::AllowDegradedScripts(true),
+        "allow_degraded_scripts",
+    );
+    assert!(!store.settings().allow_degraded_scripts);
+    let on = store
+        .apply_setting(SettingChange::AllowDegradedScripts(true), Some(confirmed()))
+        .expect("on");
+    assert_eq!(
+        payload(&store, on.seq),
+        json!({
+            "source": "app", "key": "allow_degraded_scripts", "old": false, "requested": true,
+            "new": true, "applied": true,
+            "confirmed": {"dialog_text_sha256": "07".repeat(32)},
+        })
+    );
+    assert!(store.settings().allow_degraded_scripts);
+    // Setting what is in force is no change.
+    assert!(matches!(
+        store.apply_setting(SettingChange::AllowDegradedScripts(true), Some(confirmed())),
+        Err(AuditError::Invalid(_))
+    ));
+    // It survives a restart (the replay of its row).
+    let store = reopen(&store, &f);
+    assert!(store.settings().allow_degraded_scripts);
+
+    // It survives the pruning of its row: the PRUNE snapshot carries it.
+    store
+        .reconcile_config_file(&FilePolicy::default())
+        .expect("reconcile");
+    for _ in 0..400 {
+        day(&store, &f.clock, 1);
+    }
+    assert!(
+        seqs(&f, EventType::CONFIG_CHANGED).is_empty(),
+        "the toggle's row is pruned"
+    );
+    let snap = prune_snapshot(&store, &f);
+    assert_eq!(snap["allow_degraded_scripts"], json!(true));
+    let parsed = Settings::from_json(&snap).expect("snapshot parses");
+    assert!(parsed.allow_degraded_scripts);
+    assert_eq!(parsed, store.settings());
+    let store = reopen(&store, &f);
+    assert!(store.settings().allow_degraded_scripts);
+    assert!(store.full_verify().is_empty());
+
+    // Turning it off needs no confirmation and is logged like any policy change.
+    let off = store
+        .apply_setting(SettingChange::AllowDegradedScripts(false), None)
+        .expect("off");
+    assert_eq!(
+        payload(&store, off.seq),
+        json!({
+            "source": "app", "key": "allow_degraded_scripts", "old": true, "requested": false,
+            "new": false, "applied": true, "confirmed": null,
+        })
+    );
+    assert!(!store.settings().allow_degraded_scripts);
+    assert!(!reopen(&store, &f).settings().allow_degraded_scripts);
+}
+
+#[test]
+fn pre_m8_prune_snapshot_still_parses() {
+    for (bytes, want) in [
+        (PRE_M8_DEFAULT, Settings::default()),
+        (PRE_M8_FULL, full_settings()),
+    ] {
+        let v: Value = serde_json::from_str(bytes).expect("json");
+        let parsed = Settings::from_json(&v).expect("a pre-M8 snapshot parses");
+        assert_eq!(parsed, want);
+        assert!(!parsed.allow_degraded_scripts, "absent = off");
+    }
+    // A pre-M8 snapshot in a real PRUNE (a store without the key ever set) keeps the view.
+    let (store, f) = reconciled();
+    for _ in 0..105 {
+        day(&store, &f.clock, 1);
+    }
+    assert_eq!(jcs(&prune_snapshot(&store, &f)), PRE_M8_DEFAULT);
+    assert_eq!(reopen(&store, &f).settings(), Settings::default());
+}
+
+#[test]
+fn snapshot_without_the_toggle_is_byte_identical() {
+    // The view itself: the key is written only when the toggle is on.
+    assert_eq!(jcs(&Settings::default().to_json()), PRE_M8_DEFAULT);
+    assert_eq!(jcs(&full_settings().to_json()), PRE_M8_FULL);
+    let on = Settings {
+        allow_degraded_scripts: true,
+        ..Settings::default()
+    };
+    assert_eq!(
+        jcs(&on.to_json()),
+        r#"{"allow_degraded_scripts":true,"anchor_dir":null,"instances":{},"legal_hold":false,"retention_days":100}"#
+    );
+    // A store whose toggle was on and is off again writes the pre-M8 bytes.
+    let (store, f) = reconciled();
+    store
+        .apply_setting(SettingChange::AllowDegradedScripts(true), Some(confirmed()))
+        .expect("on");
+    store
+        .apply_setting(SettingChange::AllowDegradedScripts(false), None)
+        .expect("off");
+    for _ in 0..105 {
+        day(&store, &f.clock, 1);
+    }
+    assert_eq!(jcs(&prune_snapshot(&store, &f)), PRE_M8_DEFAULT);
+}
+
+#[test]
+fn snapshot_with_unknown_extra_key_still_refused() {
+    let base: Value = serde_json::from_str(PRE_M8_DEFAULT).expect("json");
+    let with = |k: &str, v: Value| {
+        let mut j = base.clone();
+        j[k] = v;
+        j
+    };
+    for bad in [
+        // Any other fifth key, with or without the toggle.
+        with("allow_degraded", json!(true)),
+        with("scripts", json!({})),
+        {
+            let mut j = with("allow_degraded_scripts", json!(true));
+            j["extra"] = json!(1);
+            j
+        },
+        // The toggle is a bool.
+        with("allow_degraded_scripts", json!("true")),
+        with("allow_degraded_scripts", json!(1)),
+        with("allow_degraded_scripts", Value::Null),
+        // The toggle never stands in for a required key.
+        {
+            let mut j = with("allow_degraded_scripts", json!(true));
+            j.as_object_mut().expect("object").remove("legal_hold");
+            j
+        },
+    ] {
+        assert!(Settings::from_json(&bad).is_err(), "{bad}");
+    }
+    let off = Settings::from_json(&with("allow_degraded_scripts", json!(false))).expect("off");
+    assert_eq!(off, Settings::default());
+    let on = Settings::from_json(&with("allow_degraded_scripts", json!(true))).expect("on");
+    assert!(on.allow_degraded_scripts);
+}
+
+#[test]
+fn forged_allow_degraded_scripts_config_changed_refused() {
+    let (store, f) = reconciled();
+    let before = head_seq(&store);
+    for p in [
+        json!({"source": "app", "key": "allow_degraded_scripts", "old": false, "new": true, "applied": true}),
+        json!({"source": "file", "key": "allow_degraded_scripts", "old": false, "new": true, "applied": true}),
+        json!({"source": "app", "key": "allow_degraded_scripts", "new": true}),
+        json!({"source": "app", "key": "allow_degraded_scripts", "new": "x", "applied": true}),
+    ] {
+        assert!(
+            matches!(
+                store.append(ev(EventType::CONFIG_CHANGED, None, p.clone())),
+                Err(AuditError::Invalid(_))
+            ),
+            "{p}"
+        );
+    }
+    assert_eq!(head_seq(&store), before);
+    assert!(seqs(&f, EventType::CONFIG_CHANGED).is_empty());
+    // Like every policy key, the only appendable form is a file difference that was not
+    // applied; the overlay ignores it.
+    store
+        .append(ev(
+            EventType::CONFIG_CHANGED,
+            None,
+            json!({"source": "file", "key": "allow_degraded_scripts", "old": false, "new": true, "applied": false}),
+        ))
+        .expect("a not-applied file record");
+    assert!(!store.settings().allow_degraded_scripts);
+    let store = reopen(&store, &f);
+    assert!(!store.settings().allow_degraded_scripts);
+    // The key is on the one policy-key list (the M10 anchor-dir writer reads it, PD-157).
+    assert!(atlas_duck_audit::is_policy_key("allow_degraded_scripts"));
 }

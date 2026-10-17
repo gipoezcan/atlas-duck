@@ -2,8 +2,9 @@
 //! window's limits, attention mode, retention and legal hold, "Prune backlog now" and "Verify
 //! now".
 //!
-//! * **Where a value lives.** Retention and legal hold are audit-authoritative (§8.8): they change
-//!   only through `Store::apply_setting`, which logs `CONFIG_CHANGED` / `LEGAL_HOLD_CHANGED
+//! * **Where a value lives.** Retention, legal hold and "Allow scripts with degraded confinement"
+//!   (M8 Δ6, PD-141; no `config.toml` key) are audit-authoritative (§8.8, L32): they change only
+//!   through `Store::apply_setting`, which logs `CONFIG_CHANGED` / `LEGAL_HOLD_CHANGED
 //!   {source: app}` itself. The limits and the attention mode live in `config.toml` (`[limits]`,
 //!   `[requests]`, `[ui]`, M6 Δ6); a change of them is logged `CONFIG_CHANGED {source: app}`
 //!   here **before** the file is written (audit before effect: a failed append changes nothing).
@@ -11,9 +12,10 @@
 //!   `candidate_cache_mb`, `max_pending_bytes_mb` and `expiry_hours` at the next start (the view
 //!   lists them in `restart_pending` while the file differs from what runs).
 //! * **What needs the native confirmation (§10.3).** Raising any limit, lowering retention,
-//!   lifting the legal hold and "Prune backlog now"; every `Confirm::Ok` becomes an
-//!   `audit::Confirmed` over the dialog text. Lowering a limit, raising retention, setting the
-//!   hold and changing the attention mode are plain records. A `Cancel` of any dialog of one
+//!   lifting the legal hold, allowing degraded script confinement and "Prune backlog now"; every
+//!   `Confirm::Ok` becomes an `audit::Confirmed` over the dialog text. Lowering a limit, raising
+//!   retention, setting the hold, disallowing degraded confinement and changing the attention mode
+//!   are plain records. A `Cancel` of any dialog of one
 //!   `apply` applies none of its changes. No setting here can turn off the audit log, the
 //!   envelope's opacity or a confirmation.
 //! * **Read-only config (§7.7).** A newer-schema or unreadable `config.toml` refuses every
@@ -57,6 +59,9 @@ use crate::validate::check_script_invariants;
 const RAISE_TAIL: &str = "Higher limits let agents fetch more data before you review it.";
 /// plan text (PD-76).
 pub const LIFT_HOLD_TEXT: &str = "Lift the legal hold? Pruning and key destruction resume.";
+/// plan text (PD-141), without its spec citation (T15 review m-1).
+pub const ALLOW_DEGRADED_TEXT: &str = "Allow scripts with degraded confinement? A compromised \
+                                       script worker could then act as your user.";
 /// plan text (PD-76, L37).
 pub const PRUNE_BACKLOG_TEXT: &str =
     "Prune the backlog now? Records beyond the retention period are deleted in one run.";
@@ -71,9 +76,12 @@ pub const INCIDENT_TEXT: &str = "integrity incident: see Audit";
 /// minimum).
 pub const MAX_RETENTION_DAYS: u32 = 36_500;
 /// The most changes one `apply` takes (one per key).
-pub const MAX_CHANGES: usize = 8;
+pub const MAX_CHANGES: usize = 9;
 /// `CONFIG_CHANGED.key` and view name of the script limits change (M8 Δ6, PD-139).
 pub const KEY_SCRIPT_LIMITS: &str = "script_limits";
+/// `CONFIG_CHANGED.key` and view name of the degraded-confinement toggle (M8 Δ6, Δ7, PD-141): the
+/// store's policy key itself, so the two cannot drift (T15 review m-5).
+pub use atlas_duck_audit::KEY_ALLOW_DEGRADED_SCRIPTS;
 /// The longest key `record_app_change` accepts.
 const MAX_APP_KEY_CHARS: usize = 64;
 /// The largest serialized `old` / `new` of `record_app_change`.
@@ -105,6 +113,10 @@ pub enum SettingChangeReq {
     /// `[scripts]`, the §9.4 defaults of the script limits (M8 Δ6, PD-139): the named keys change,
     /// the others stay. Applies at once to runs submitted afterwards.
     ScriptLimits(ScriptLimitsReq),
+    /// "Allow scripts with degraded confinement" (M8 Δ6, PD-141): audit-authoritative, no
+    /// `config.toml` key. On needs the native confirmation, off does not. Applies at once: the
+    /// run policy is read from the store's view before each runner call.
+    AllowDegradedScripts(bool),
 }
 
 /// The eight §9.4 script limits of one change, each `None` = unchanged (M8 Δ6). JSON: an object
@@ -217,6 +229,7 @@ impl SettingChangeReq {
             Self::RetentionDays(_) => KEY_RETENTION_DAYS,
             Self::LegalHold(_) => KEY_LEGAL_HOLD,
             Self::ScriptLimits(_) => KEY_SCRIPT_LIMITS,
+            Self::AllowDegradedScripts(_) => KEY_ALLOW_DEGRADED_SCRIPTS,
         }
     }
 
@@ -231,7 +244,7 @@ impl SettingChangeReq {
             Self::RetentionDays(d) => {
                 (atlas_duck_audit::RETENTION_MIN..=MAX_RETENTION_DAYS).contains(d)
             }
-            Self::AttentionMode(_) | Self::LegalHold(_) => true,
+            Self::AttentionMode(_) | Self::LegalHold(_) | Self::AllowDegradedScripts(_) => true,
             Self::ScriptLimits(r) => return r.validate(),
         };
         if ok {
@@ -243,12 +256,15 @@ impl SettingChangeReq {
 
     /// Lives in `config.toml` (the rest are audit-authoritative).
     fn file_backed(&self) -> bool {
-        !matches!(self, Self::RetentionDays(_) | Self::LegalHold(_))
+        !matches!(
+            self,
+            Self::RetentionDays(_) | Self::LegalHold(_) | Self::AllowDegradedScripts(_)
+        )
     }
 }
 
 /// Every key a `SettingChangeReq` can name (`record_app_change` refuses them).
-const SETTING_KEYS: [&str; 8] = [
+const SETTING_KEYS: [&str; 9] = [
     KEY_JIRA_COMMENTS_CAP,
     KEY_CANDIDATE_CACHE_MB,
     KEY_MAX_PENDING_BYTES_MB,
@@ -257,6 +273,7 @@ const SETTING_KEYS: [&str; 8] = [
     KEY_RETENTION_DAYS,
     KEY_LEGAL_HOLD,
     KEY_SCRIPT_LIMITS,
+    KEY_ALLOW_DEGRADED_SCRIPTS,
 ];
 
 /// The limits as Settings shows them: the comments cap and the script limits in force, and for
@@ -312,6 +329,13 @@ pub struct SettingsView {
     pub legal_hold: bool,
     /// Display only (M10 changes it).
     pub anchor_dir: Option<String>,
+    /// "Allow scripts with degraded confinement" as the audit settings hold it (M8 Δ6, PD-141).
+    ///
+    /// Not on the wire yet, like `limits.script`: the `settings_get` fixture is closed over the
+    /// keys above, so the Settings UI task (Task 24) removes this `skip_serializing` together with
+    /// its fixture regeneration and the TS type.
+    #[serde(skip_serializing)]
+    pub allow_degraded_scripts: bool,
     pub health: StoreHealthView,
     pub config_read_only: Option<ConfigBanner>,
     /// The keys whose `config.toml` value applies at the next start and differs from the running
@@ -573,6 +597,7 @@ struct Current {
     /// The audit settings.
     retention_days: u32,
     legal_hold: bool,
+    allow_degraded_scripts: bool,
     /// In force (live).
     script: ScriptLimits,
     /// The `[scripts]` table is not what is in force: a hand edit not yet started with, or a
@@ -687,6 +712,14 @@ fn plan(req: SettingChangeReq, cur: &Current) -> Option<Planned> {
             let dialog = (!on).then(|| LIFT_HOLD_TEXT.to_owned());
             p(json!(cur.legal_hold), json!(on), dialog)
         }
+        SettingChangeReq::AllowDegradedScripts(on) => {
+            if *on == cur.allow_degraded_scripts {
+                return None;
+            }
+            // §10.3 "enable degraded script confinement"; turning it off is stricter.
+            let dialog = on.then(|| ALLOW_DEGRADED_TEXT.to_owned());
+            p(json!(cur.allow_degraded_scripts), json!(on), dialog)
+        }
         SettingChangeReq::ScriptLimits(r) => {
             // Only what changes is planned, recorded and written; the memory invariants were
             // checked on the resulting set by `apply`.
@@ -749,7 +782,9 @@ fn file_values(req: &SettingChangeReq, live: &ScriptLimits) -> Vec<FileEdit> {
         SettingChangeReq::MaxPendingBytesMb(n) => one(KEY_LIMITS, n.map(int)),
         SettingChangeReq::ExpiryHours(h) => one(KEY_REQUESTS, Some(int(u64::from(*h)))),
         SettingChangeReq::AttentionMode(m) => one(KEY_UI, Some(toml_edit::Value::from(m.as_str()))),
-        SettingChangeReq::RetentionDays(_) | SettingChangeReq::LegalHold(_) => Vec::new(),
+        SettingChangeReq::RetentionDays(_)
+        | SettingChangeReq::LegalHold(_)
+        | SettingChangeReq::AllowDegradedScripts(_) => Vec::new(),
         // The whole resolved set (`apply` checked it against the bounds and both invariants).
         SettingChangeReq::ScriptLimits(r) => script_edits(&r.resolve(live)),
     }
@@ -807,6 +842,9 @@ fn store_change(req: &SettingChangeReq) -> Option<SettingChange> {
     match req {
         SettingChangeReq::RetentionDays(d) => Some(SettingChange::RetentionDays(*d)),
         SettingChangeReq::LegalHold(on) => Some(SettingChange::LegalHold(*on)),
+        SettingChangeReq::AllowDegradedScripts(on) => {
+            Some(SettingChange::AllowDegradedScripts(*on))
+        }
         _ => None,
     }
 }
@@ -928,6 +966,7 @@ impl CoreSettings {
             attention_mode: *lock(&self.attention),
             retention_days: settings.retention_days,
             legal_hold: settings.legal_hold,
+            allow_degraded_scripts: settings.allow_degraded_scripts,
             script,
             script_file_stale: scripts_config(cfg).as_ref() != Ok(&script),
         }
@@ -1103,6 +1142,7 @@ impl SettingsAdmin for CoreSettings {
             retention_days: settings.retention_days,
             legal_hold: settings.legal_hold,
             anchor_dir: settings.anchor_dir,
+            allow_degraded_scripts: settings.allow_degraded_scripts,
             health: health_view(&self.store.health()),
             config_read_only: banner(&cfg),
             restart_pending: self.restart_pending(&cur, &cfg),
@@ -1334,6 +1374,7 @@ mod tests {
             attention_mode: AttentionMode::ShowWithoutActivating,
             retention_days: 100,
             legal_hold: true,
+            allow_degraded_scripts: false,
             script: ScriptLimits::default(),
             script_file_stale: false,
         };

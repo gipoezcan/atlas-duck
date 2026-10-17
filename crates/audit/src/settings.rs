@@ -1,5 +1,6 @@
 //! The audit-authoritative settings (§8.8, §7.7, L32, P5): retention, legal hold, anchor
-//! directory and the per-instance policy (confirmed origin, CA fingerprint, proxy).
+//! directory, the per-instance policy (confirmed origin, CA fingerprint, proxy) and "Allow
+//! scripts with degraded confinement" (M8 Δ7, PD-141).
 //!
 //! They live in the audit log, not in a table. The view is the `settings` snapshot of the
 //! latest retained `PRUNE` (defaults before the first prune) overlaid, in `seq` order, with
@@ -53,6 +54,9 @@ pub struct Settings {
     pub anchor_dir: Option<String>,
     /// Instances without any policy value are absent.
     pub instances: BTreeMap<String, InstancePolicy>,
+    /// "Allow scripts with degraded confinement" (M8 Δ7, PD-141, §9.4): security-weakening,
+    /// on only through a confirmed [`SettingChange::AllowDegradedScripts`]; absent = off.
+    pub allow_degraded_scripts: bool,
 }
 
 impl Default for Settings {
@@ -62,9 +66,14 @@ impl Default for Settings {
             legal_hold: false,
             anchor_dir: None,
             instances: BTreeMap::new(),
+            allow_degraded_scripts: false,
         }
     }
 }
+
+/// The optional fifth key of a settings snapshot and the policy key of its `CONFIG_CHANGED` (M8
+/// Δ7); core's Settings names the change by it too.
+pub const KEY_ALLOW_DEGRADED_SCRIPTS: &str = "allow_degraded_scripts";
 
 const BAD_SNAPSHOT: AuditError = AuditError::Invalid("settings snapshot is malformed");
 
@@ -85,7 +94,8 @@ fn retention_of(v: &Value) -> Result<u32, AuditError> {
 
 impl Settings {
     /// `{anchor_dir, instances: {<id>: {ca_fingerprint, origin, proxy}}, legal_hold,
-    /// retention_days}` (JCS sorts the keys).
+    /// retention_days}` (JCS sorts the keys), plus `allow_degraded_scripts: true` only while it
+    /// is on: with it off the snapshot is byte for byte what M2..M7 wrote.
     pub fn to_json(&self) -> Value {
         let instances: Map<String, Value> = self
             .instances
@@ -101,20 +111,31 @@ impl Settings {
                 )
             })
             .collect();
-        json!({
+        let mut v = json!({
             "anchor_dir": self.anchor_dir,
             "instances": instances,
             "legal_hold": self.legal_hold,
             "retention_days": self.retention_days,
-        })
+        });
+        if self.allow_degraded_scripts
+            && let Value::Object(o) = &mut v
+        {
+            o.insert(KEY_ALLOW_DEGRADED_SCRIPTS.into(), Value::Bool(true));
+        }
+        v
     }
 
-    /// The inverse of [`Settings::to_json`]. Strict: exactly those four keys, a retention of
-    /// at least 92, string-or-null values; anything else is `Invalid` (the caller fails
-    /// closed rather than guess a policy).
+    /// The inverse of [`Settings::to_json`]. Strict: exactly those four keys, plus the optional
+    /// `allow_degraded_scripts` bool (absent = off, so a pre-M8 snapshot parses unchanged), a
+    /// retention of at least 92, string-or-null values; anything else is `Invalid` (the caller
+    /// fails closed rather than guess a policy).
     pub fn from_json(v: &Value) -> Result<Settings, AuditError> {
         let o = v.as_object().ok_or(BAD_SNAPSHOT)?;
-        if o.len() != 4 {
+        let degraded = match o.get(KEY_ALLOW_DEGRADED_SCRIPTS) {
+            None => None,
+            Some(d) => Some(d.as_bool().ok_or(BAD_SNAPSHOT)?),
+        };
+        if o.len() != 4 + usize::from(degraded.is_some()) {
             return Err(BAD_SNAPSHOT);
         }
         let get = |k: &str| o.get(k).ok_or(BAD_SNAPSHOT);
@@ -139,6 +160,7 @@ impl Settings {
             legal_hold: get("legal_hold")?.as_bool().ok_or(BAD_SNAPSHOT)?,
             anchor_dir: opt_string(get("anchor_dir")?)?,
             instances,
+            allow_degraded_scripts: degraded.unwrap_or(false),
         })
     }
 }
@@ -161,6 +183,9 @@ pub enum SettingChange {
         instance_id: String,
         proxy: Option<String>,
     },
+    /// "Allow scripts with degraded confinement" (M8 Δ7, PD-141); on needs the confirmation.
+    /// No config-file value exists for it (R2), so it changes only here.
+    AllowDegradedScripts(bool),
 }
 
 /// What the config file asks for; `None` = the file does not mention the value. `anchor_dir`:
@@ -183,14 +208,17 @@ enum PolicyKey<'a> {
     Retention,
     AnchorDir,
     Instance(&'a str, Field),
+    AllowDegradedScripts,
 }
 
 /// The `CONFIG_CHANGED.key` values that are policy: `retention_days`, `anchor_dir`,
-/// `instance.<id>.origin`, `instance.<id>.ca_fingerprint`, `instance.<id>.proxy`.
+/// `allow_degraded_scripts`, `instance.<id>.origin`, `instance.<id>.ca_fingerprint`,
+/// `instance.<id>.proxy`.
 fn parse_key(key: &str) -> Option<PolicyKey<'_>> {
     match key {
         "retention_days" => return Some(PolicyKey::Retention),
         "anchor_dir" => return Some(PolicyKey::AnchorDir),
+        KEY_ALLOW_DEGRADED_SCRIPTS => return Some(PolicyKey::AllowDegradedScripts),
         _ => {}
     }
     let rest = key.strip_prefix("instance.")?;
@@ -208,7 +236,9 @@ fn parse_key(key: &str) -> Option<PolicyKey<'_>> {
 
 /// Whether `key` names a policy value (callers may append such a `CONFIG_CHANGED` only as a
 /// record of a file difference that was not applied: `source: "file"`, `applied: false`).
-pub(crate) fn is_policy_key(key: &str) -> bool {
+/// The one list of these keys: M10's anchor-dir writer reads it to pick the policy
+/// `CONFIG_CHANGED` records that get an immediate line (§8.5, PD-157).
+pub fn is_policy_key(key: &str) -> bool {
     parse_key(key).is_some()
 }
 
@@ -265,6 +295,9 @@ pub(crate) fn apply_event(
             match key {
                 PolicyKey::Retention => s.retention_days = retention_of(new)?,
                 PolicyKey::AnchorDir => s.anchor_dir = opt_string(new)?,
+                PolicyKey::AllowDegradedScripts => {
+                    s.allow_degraded_scripts = new.as_bool().ok_or(BAD_SNAPSHOT)?;
+                }
                 PolicyKey::Instance(id, field) => {
                     let v = opt_string(new)?;
                     let e = s.instances.entry(id.to_string()).or_default();
@@ -490,6 +523,22 @@ fn plan(s: &Settings, change: &SettingChange) -> Result<Planned, AuditError> {
             proxy,
             false,
         ),
+        SettingChange::AllowDegradedScripts(on) => {
+            if *on == s.allow_degraded_scripts {
+                return Err(unchanged);
+            }
+            Ok(Planned {
+                event_type: EventType::CONFIG_CHANGED,
+                key: Some(KEY_ALLOW_DEGRADED_SCRIPTS.into()),
+                instance_id: None,
+                old: json!(s.allow_degraded_scripts),
+                requested: json!(on),
+                new: json!(on),
+                applied: true,
+                // §10.3 "enable degraded script confinement"; turning it off is stricter.
+                needs_confirmation: on.then_some(KEY_ALLOW_DEGRADED_SCRIPTS),
+            })
+        }
     }
 }
 

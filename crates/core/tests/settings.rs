@@ -6,6 +6,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use atlas_duck_audit::EventType;
 use atlas_duck_core::config::limits::limits_config;
@@ -14,7 +15,9 @@ use atlas_duck_core::config::scripts::{scripts_config, start_limits};
 use atlas_duck_core::config::ui::attention_mode_config;
 use atlas_duck_core::config::{ConfigState, load_config};
 use atlas_duck_core::engine::queue::MIB;
-use atlas_duck_core::settings::{LIFT_HOLD_TEXT, PRUNE_BACKLOG_TEXT, ScriptLimitsReq};
+use atlas_duck_core::settings::{
+    ALLOW_DEGRADED_TEXT, LIFT_HOLD_TEXT, PRUNE_BACKLOG_TEXT, ScriptLimitsReq,
+};
 use atlas_duck_core::testing::Harness;
 use atlas_duck_core::{
     AttentionMode, Confirm, SettingChangeReq, SettingsAdmin, SettingsError, SettingsView,
@@ -28,8 +31,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use SettingChangeReq::{
-    AttentionMode as Mode, CandidateCacheMb, ExpiryHours, JiraCommentsCap, LegalHold,
-    MaxPendingBytesMb, RetentionDays, ScriptLimits as Scripts,
+    AllowDegradedScripts, AttentionMode as Mode, CandidateCacheMb, ExpiryHours, JiraCommentsCap,
+    LegalHold, MaxPendingBytesMb, RetentionDays, ScriptLimits as Scripts,
 };
 
 /// `apply` off the async workers, as the app calls it (PD-13).
@@ -1181,5 +1184,184 @@ fn a_refused_scripts_table_is_logged_at_start() -> TestResult {
         assert!(last.contains("spec defaults"), "{last}");
         assert!(!last.contains("17") && !last.contains("91"), "{last}");
     }
+    Ok(())
+}
+
+// ---- M8 Task 15: "Allow scripts with degraded confinement" (PD-141, Δ6, Δ7) ------------------
+
+/// Whether the policy core reads before each runner call allows degraded confinement.
+fn degraded_policy(h: &Harness) -> bool {
+    h.core().script_policy().allow_degraded
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_needs_native_confirmation_and_logs_config_changed() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    assert!(!view(&s).await?.allow_degraded_scripts, "absent = off");
+    assert!(!degraded_policy(&h));
+    h.confirmer().push(Confirm::Ok);
+    let v = apply(&s, vec![AllowDegradedScripts(true)]).await??;
+    assert_eq!(h.confirmer().texts(), [ALLOW_DEGRADED_TEXT]);
+    assert!(v.allow_degraded_scripts);
+    assert!(degraded_policy(&h), "read fresh from the audit settings");
+    let recs = config_changed(&h, "allow_degraded_scripts").await?;
+    let [r] = recs.as_slice() else {
+        return Err(format!("{} records", recs.len()).into());
+    };
+    assert_eq!(
+        *r,
+        json!({
+            "source": "app", "key": "allow_degraded_scripts", "old": false, "requested": true,
+            "new": true, "applied": true,
+            "confirmed": {"dialog_text_sha256": sha_hex(ALLOW_DEGRADED_TEXT)},
+        })
+    );
+    // Audit-authoritative (L32): the store's view holds it, nothing else.
+    assert!(h.store().settings().allow_degraded_scripts);
+    // Setting what is in force is no change: no dialog, no record.
+    apply(&s, vec![AllowDegradedScripts(true)]).await??;
+    assert_eq!(h.confirmer().texts().len(), 1);
+    assert_eq!(config_changed(&h, "allow_degraded_scripts").await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_cancel_changes_nothing() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let events = h.event_count().await?;
+    h.confirmer().push(Confirm::Cancel);
+    let r = apply(&s, vec![AllowDegradedScripts(true)]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Cancelled));
+    assert_eq!(h.confirmer().texts(), [ALLOW_DEGRADED_TEXT]);
+    assert_eq!(h.event_count().await?, events, "nothing logged");
+    assert!(!view(&s).await?.allow_degraded_scripts);
+    assert!(!degraded_policy(&h));
+    assert!(!h.store().settings().allow_degraded_scripts);
+    // One `Cancel` applies none of the call's changes, the plain ones included.
+    h.confirmer().push(Confirm::Cancel);
+    let r = apply(&s, vec![RetentionDays(150), AllowDegradedScripts(true)]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Cancelled));
+    assert_eq!(h.event_count().await?, events);
+    assert_eq!(view(&s).await?.retention_days, 100);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_off_needs_no_confirmation() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    h.confirmer().push(Confirm::Ok);
+    apply(&s, vec![AllowDegradedScripts(true)]).await??;
+    assert!(degraded_policy(&h));
+    let shown = h.confirmer().texts().len();
+    let v = apply(&s, vec![AllowDegradedScripts(false)]).await??;
+    assert_eq!(
+        h.confirmer().texts().len(),
+        shown,
+        "§10.3: turning it off is stricter"
+    );
+    assert!(!v.allow_degraded_scripts);
+    assert!(!degraded_policy(&h));
+    let recs = config_changed(&h, "allow_degraded_scripts").await?;
+    let off = recs.last().ok_or("no record")?;
+    assert_eq!(
+        *off,
+        json!({
+            "source": "app", "key": "allow_degraded_scripts", "old": true, "requested": false,
+            "new": false, "applied": true, "confirmed": null,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_flipped_while_its_dialog_is_open_is_a_conflict() -> TestResult {
+    let h = Harness::jira().await?;
+    let s = h.core().settings();
+    let inner = s.clone();
+    let once = AtomicBool::new(false);
+    // While this window's dialog is open, another window turns it on first (its own dialog,
+    // answered by the first `Ok`).
+    h.confirmer().set_hook(Arc::new(move |_| {
+        if !once.swap(true, Ordering::SeqCst) {
+            let _ = inner.apply(vec![AllowDegradedScripts(true)]);
+        }
+    }));
+    h.confirmer().push(Confirm::Ok);
+    h.confirmer().push(Confirm::Ok);
+    let r = apply(&s, vec![AllowDegradedScripts(true)]).await?;
+    assert_eq!(r.err(), Some(SettingsError::Conflict));
+    assert_eq!(h.confirmer().texts(), [ALLOW_DEGRADED_TEXT; 2]);
+    assert!(view(&s).await?.allow_degraded_scripts);
+    assert!(degraded_policy(&h));
+    let recs = config_changed(&h, "allow_degraded_scripts").await?;
+    assert_eq!(recs.len(), 1, "only the other window's");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_survives_restart() -> TestResult {
+    let mut h = Harness::jira().await?;
+    h.confirmer().push(Confirm::Ok);
+    apply(&h.core().settings(), vec![AllowDegradedScripts(true)]).await??;
+    h.restart().await?;
+    assert!(view(&h.core().settings()).await?.allow_degraded_scripts);
+    assert!(degraded_policy(&h));
+    apply(&h.core().settings(), vec![AllowDegradedScripts(false)]).await??;
+    h.restart().await?;
+    assert!(!view(&h.core().settings()).await?.allow_degraded_scripts);
+    assert!(!degraded_policy(&h));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn degraded_toggle_has_no_config_file_path() -> TestResult {
+    // A `config.toml` that names the toggle anywhere turns nothing on (R2: no file key).
+    let h = Harness::builder()
+        .jira("jira-main")
+        .extra_config(
+            "[audit]\nallow_degraded_scripts = true\n[scripts]\nallow_degraded_scripts = true\n\
+             [sandbox]\nallow_degraded_scripts = true\n",
+        )
+        .start()
+        .await?;
+    let s = h.core().settings();
+    assert!(!view(&s).await?.allow_degraded_scripts);
+    assert!(!degraded_policy(&h));
+    assert!(
+        config_changed(&h, "allow_degraded_scripts")
+            .await?
+            .is_empty(),
+        "the file is never reconciled into it"
+    );
+    // The change writes no file: `config.toml` stays byte for byte.
+    let before = std::fs::read(h.config_path())?;
+    h.confirmer().push(Confirm::Ok);
+    apply(&s, vec![AllowDegradedScripts(true)]).await??;
+    apply(&s, vec![AllowDegradedScripts(false)]).await??;
+    assert_eq!(std::fs::read(h.config_path())?, before);
+    // Nor is it a key an app-owned record may name.
+    let s2 = s.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        s2.record_app_change("allow_degraded_scripts", json!(false), json!(true))
+    })
+    .await?;
+    assert!(matches!(r, Err(SettingsError::Invalid { .. })), "{r:?}");
+    assert!(!degraded_policy(&h));
+
+    // A read-only `config.toml` refuses every file-backed change, not this one.
+    let h = Harness::builder()
+        .config_text("schema_version = 2\nwritten_by = \"9.1.0\"\n[future]\nkey = 1\n")
+        .start()
+        .await?;
+    let s = h.core().settings();
+    let before = std::fs::read(h.config_path())?;
+    h.confirmer().push(Confirm::Ok);
+    let v = apply(&s, vec![AllowDegradedScripts(true)]).await??;
+    assert!(v.allow_degraded_scripts);
+    assert!(degraded_policy(&h));
+    assert_eq!(std::fs::read(h.config_path())?, before);
     Ok(())
 }

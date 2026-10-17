@@ -841,6 +841,7 @@ fn settings_views() -> Vec<SettingsView> {
             retention_days: 365,
             legal_hold: true,
             anchor_dir: Some("anchors".into()),
+            allow_degraded_scripts: true,
             health: health(true, Some("pruning is 12 days behind")),
             config_read_only: Some(ConfigBanner {
                 kind: "read_only",
@@ -861,6 +862,7 @@ fn settings_views() -> Vec<SettingsView> {
             retention_days: 100,
             legal_hold: false,
             anchor_dir: None,
+            allow_degraded_scripts: false,
             health: health(false, None),
             config_read_only: None,
             restart_pending: vec![],
