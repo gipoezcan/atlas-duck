@@ -403,20 +403,23 @@ impl ScriptGlue {
             }
         }
     }
+}
 
-    /// Logs a bridge refusal (constants only) and names it in core's words.
-    fn refused(&self, e: &StartRunError, request_id: Option<&str>) -> UnavailableReason {
-        match e {
-            StartRunError::IdentityMismatch { what } => {
-                upgraded(&self.inputs.update_pending, *what, request_id);
-            }
-            StartRunError::FloorNotMet => spawn_failed(REASON_FLOOR_NOT_MET, request_id),
-            StartRunError::Spawn(kind) => {
-                tracing::warn!(event = LOG_EVENT_SPAWN_FAILED, reason = ?kind, request_id);
-            }
+/// Logs a bridge refusal (constants only), sets the update flag for an identity mismatch, and
+/// names the refusal in core's words.
+fn refused(
+    update_pending: &AtomicBool,
+    e: &StartRunError,
+    request_id: Option<&str>,
+) -> UnavailableReason {
+    match e {
+        StartRunError::IdentityMismatch { what } => upgraded(update_pending, *what, request_id),
+        StartRunError::FloorNotMet => spawn_failed(REASON_FLOOR_NOT_MET, request_id),
+        StartRunError::Spawn(kind) => {
+            tracing::warn!(event = LOG_EVENT_SPAWN_FAILED, reason = ?kind, request_id);
         }
-        map::unavailable_reason(e)
     }
+    map::unavailable_reason(e)
 }
 
 #[async_trait]
@@ -452,12 +455,26 @@ impl ScriptRunner for ScriptGlue {
         };
         // The bridge bounds the compile itself; this bound also covers the spawn call and holds
         // if the bridge does not answer (PD-135: a compile worker never pins a dry-pool permit).
-        let answer = tokio::time::timeout(deadline, self.port.compile(job))
-            .await
-            .unwrap_or(Ok(CompileVerdict::Timeout));
-        if let Err(e) = &answer {
-            self.refused(e, None);
-        }
+        // On expiry the bridge's call is not dropped: it runs on as its own task, so a refusal
+        // that comes after the deadline (creating the first spawner can take seconds) still sets
+        // the update flag and is logged (T20 review m-3).
+        let port = self.port.clone();
+        let update_pending = self.inputs.update_pending.clone();
+        let call = tokio::spawn(async move {
+            let answer = port.compile(job).await;
+            if let Err(e) = &answer {
+                refused(&update_pending, e, None);
+            }
+            answer
+        });
+        let answer = match tokio::time::timeout(deadline, call).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => {
+                spawn_failed(REASON_BLOCKING_CALL_LOST, None);
+                Err(lost_blocking_call())
+            }
+            Err(_) => Ok(CompileVerdict::Timeout),
+        };
         map::compile_outcome(answer, timeout_s)
     }
 
@@ -516,7 +533,11 @@ impl ScriptRunner for ScriptGlue {
                 end: tokio::sync::OnceCell::new(),
                 worker: OnceLock::new(),
             })),
-            Err(e) => Err(map::runner_error(self.refused(&e, Some(&request_id)))),
+            Err(e) => Err(map::runner_error(refused(
+                &self.inputs.update_pending,
+                &e,
+                Some(&request_id),
+            ))),
         }
     }
 }

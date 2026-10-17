@@ -202,6 +202,8 @@ enum CompileAnswer {
     Verdict(Result<CompileVerdict, StartRunError>),
     /// Never: a compile worker that does not answer.
     Never,
+    /// Answers once the test adds a permit (after the glue's own deadline, say).
+    Gated(Arc<Semaphore>, Result<CompileVerdict, StartRunError>),
 }
 
 /// The fake bridge: records each job and applies the bridge's own ready-frame rule (PD-133,
@@ -284,10 +286,16 @@ impl BridgePort for FakePort {
             deadline: job.deadline,
         });
         self.check_ready(&job.expect)?;
-        let answer = match &*lock(&self.compile) {
-            CompileAnswer::Verdict(v) => Some(v.clone()),
-            CompileAnswer::Never => None,
+        let (gate, answer) = match &*lock(&self.compile) {
+            CompileAnswer::Verdict(v) => (None, Some(v.clone())),
+            CompileAnswer::Never => (None, None),
+            CompileAnswer::Gated(gate, v) => (Some(gate.clone()), Some(v.clone())),
         };
+        if let Some(gate) = gate
+            && let Ok(permit) = gate.acquire().await
+        {
+            permit.forget();
+        }
         match answer {
             Some(v) => v,
             None => std::future::pending().await,
@@ -1243,6 +1251,49 @@ async fn compile_check_has_a_deadline() -> TestResult {
         g.compile_check("return 1;", &ScriptLimits::default(), off())
             .await,
         Err(CompileFailure::Timeout { timeout_s: 10 })
+    );
+    Ok(())
+}
+
+/// T20 review m-3: the glue's compile deadline answers `Timeout` but does not drop the bridge's
+/// call: an answer after it (the first spawner's creation can take seconds on Windows) is still
+/// seen, and a late identity refusal still sets the update flag (PD-133).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn glue_compile_timeout_keeps_a_late_refusal() -> TestResult {
+    bounded(compile_timeout_keeps_a_late_refusal()).await
+}
+
+async fn compile_timeout_keeps_a_late_refusal() -> TestResult {
+    let port = FakePort::new();
+    let gate = Arc::new(Semaphore::new(0));
+    port.set_compile(CompileAnswer::Gated(
+        gate.clone(),
+        Err(StartRunError::IdentityMismatch {
+            what: IdentityPart::EmbeddedVersion,
+        }),
+    ));
+    let g = glue(
+        &port,
+        &worker_file(),
+        Some(report_for(&worker_file(), FloorVerdict::Met)?),
+    );
+    let limits = ScriptLimits {
+        timeout_s: 1,
+        ..ScriptLimits::default()
+    };
+    let answer = tokio::time::timeout(BOUND, g.compile_check("return 1;", &limits, off())).await?;
+    assert_eq!(answer, Err(CompileFailure::Timeout { timeout_s: 1 }));
+    assert!(!g.update_pending(), "no answer yet");
+    // The bridge answers after the deadline: the worker's ready frame names another build.
+    gate.add_permits(1);
+    let waited = Instant::now();
+    while !g.update_pending() && waited.elapsed() < BOUND {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(g.update_pending(), "the late refusal was lost");
+    assert_eq!(
+        g.check_available(off()).await,
+        Err(unavailable(UnavailableReason::AppUpgraded))
     );
     Ok(())
 }
