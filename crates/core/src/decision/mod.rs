@@ -1603,6 +1603,11 @@ fn resolution_message(op: &str, params: &Value, param: &str, value: &str) -> Str
         ("confluence.page.create", "parent") => {
             format!("no page '{value}' in space {}", of("space"))
         }
+        // PD-106: the parent within the page's own space. That space is fetched data (no param
+        // names it), so the text names the page the agent gave instead.
+        ("confluence.page.move", "parent") => {
+            format!("no page '{value}' in the space of page {}", of("id"))
+        }
         // PD-107 (plan text): a reply target that is no comment on this content.
         ("confluence.comment.add", "reply_to") => {
             format!("no comment {value} on content {}", of("content_id"))

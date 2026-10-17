@@ -147,7 +147,7 @@ pub(crate) const PAGE_MOVE_PARAMS: &str = r#"{"$schema":"https://json-schema.org
  "required":["id","parent"],
  "properties":{
   "id":{"type":"string","pattern":"^[0-9]+$"},
-  "parent":{"type":"string","pattern":"^[0-9]+$","description":"New parent page id (same space)."}},
+  "parent":{"type":"string","minLength":1,"maxLength":255,"description":"Parent page id or title (same space); a value of digits only is always a page id."}},
  "examples":[{"id":"123456","parent":"123400"}]}"#;
 
 pub(crate) const COMMENT_ADD_PARAMS: &str = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false,

@@ -461,34 +461,43 @@ fn confluence_table_rules_hold() {
     );
 }
 
-/// Δ4 a (lead ruling Q2, PD-105): the `parent` of `confluence.page.create` is a page id or a
-/// page title (an ambiguous title is the I-35 ambiguous case); empty is refused.
+/// Δ4 a (lead ruling Q2, PD-105, PD-106): the `parent` of `confluence.page.create` and of
+/// `confluence.page.move` is a page id or a page title (an ambiguous title is the I-35 ambiguous
+/// case); empty is refused. Both describe the all-digit rule the same way (T16 review m-6).
 #[test]
 fn parent_schema_accepts_id_and_title() {
-    let spec = get("confluence.page.create").expect("op");
-    let schema = jsonschema::validator_for(&spec.params_schema_json()).expect("schema");
-    let with = |parent: Value| serde_json::json!({"space": "DOC", "title": "T", "body": "b", "parent": parent});
-    let longest = "x".repeat(255);
-    for ok in [
-        "123400",
-        "Release notes",
-        "Notes / 2026 (draft)",
-        longest.as_str(),
-    ] {
-        assert!(schema.is_valid(&with(Value::from(ok))), "{ok}");
+    let create = |parent: Value| serde_json::json!({"space": "DOC", "title": "T", "body": "b", "parent": parent});
+    let move_ = |parent: Value| serde_json::json!({"id": "65537", "parent": parent});
+    let cases: [(&str, &dyn Fn(Value) -> Value); 2] = [
+        ("confluence.page.create", &create),
+        ("confluence.page.move", &move_),
+    ];
+    for (id, with) in cases {
+        let spec = get(id).expect("op");
+        let schema = jsonschema::validator_for(&spec.params_schema_json()).expect("schema");
+        let longest = "x".repeat(255);
+        for ok in [
+            "123400",
+            "Release notes",
+            "Notes / 2026 (draft)",
+            longest.as_str(),
+        ] {
+            assert!(schema.is_valid(&with(Value::from(ok))), "{id}: {ok}");
+        }
+        for bad in [
+            Value::from(""),
+            Value::from("x".repeat(256)),
+            Value::from(123_400),
+            Value::Null,
+        ] {
+            assert!(!schema.is_valid(&with(bad.clone())), "{id}: {bad}");
+        }
+        assert_eq!(
+            spec.params_schema_json()["properties"]["parent"]["description"],
+            "Parent page id or title (same space); a value of digits only is always a page id.",
+            "{id}"
+        );
     }
-    for bad in [
-        Value::from(""),
-        Value::from("x".repeat(256)),
-        Value::from(123_400),
-        Value::Null,
-    ] {
-        assert!(!schema.is_valid(&with(bad.clone())), "{bad}");
-    }
-    assert_eq!(
-        spec.params_schema_json()["properties"]["parent"]["description"],
-        "Parent page id or title (same space); a value of digits only is always a page id."
-    );
 }
 
 /// Δ4 f (PD-100, plan review m-11): `ops describe` shows agents the default release of
